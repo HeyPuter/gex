@@ -20113,3 +20113,71 @@ evidence: the test does `return false` on the first bad check, so everything
 the sub-test would have done afterwards is absent as a consequence. Exactly
 **one** error is genuinely missing. Count what a failure *stops*, before
 reading a gap as a set of defects.
+
+## A storage write is lost, and every instrument hides it
+
+`tests/gl44-browser-sweep.sh` -- 169 probes through a real browser -- came back
+160 PASS, 7 FAIL, 2 SKIP. Six of the failures and both skips are the documented
+expected set (five probe-suite DIFFs, `two-contexts`' deliberate shared-object
+namespace, and the two X11 probes). The seventh is real:
+
+    gl44-ssbo-probe / cross_stage_storage
+      at1=0x8888 at0=0x9999   want=0xa5a5,0x9999
+
+`0x8888` is the **seed**, not a wrong answer: nobody wrote. A fragment shader
+stores `value[1] = 0xa5a5u` while the vertex stage declares the same block and
+only reads it. Native gex_wgpu passes; the browser does not.
+
+The driver's handling of that shape is deliberate and correct as written
+(`gex_wgpu_screen.c:40560`): read-only in the vertex stage and writable in the
+fragment stage is a combination WebGPU refuses across a pass, so the vertex
+side is given a snapshot copy while the fragment side keeps the real buffer.
+`gex_wgpu_fragment_writes_ssbo` is reached only from the vertex group, so the
+fragment binding is the real buffer by construction. Nothing is refused, no
+Dawn validation error is raised, and every shader compiles.
+
+### What it actually depends on
+
+| configuration | result |
+|---|---|
+| the cross-stage draw alone, four ways to synchronise | **passes** |
+| an aliased-storage draw placed before it | the **aliased** draw fails instead |
+| both, behind `gl44-ssbo-probe`'s four earlier storage cases | the cross-stage draw fails |
+| any of the above with **any** `mesaenv=` set | **passes** |
+
+So it is not the cross-stage construct. It passes alone, fails inside a family,
+leaves its siblings untouched, and moves between cases as the order changes --
+which is the signature of a **cache collision or a stale binding**, not a latch
+(a latch takes every case after it). `gl44-cross-stage-ssbo-probe` is that
+experiment, kept because it demonstrates the order dependence in four lines of
+output.
+
+### The part that matters most: the instruments mask it
+
+Passing **any** `mesaenv=` makes it pass -- including a variable the driver
+never reads. `web/src/mesa-gl.js:274` applies host env with a few
+`_malloc`/`HEAPU8.set`/`_gex_gl_setenv`/`_free` calls before `_gex_gl_init`,
+and that alone perturbs it. Every driver diagnostic in this codebase is
+`getenv`-gated, so **none of them can be switched on without also switching
+off the bug**: `GEX_WGPU_ALIAS_TRACE`, `GEX_WGPU_NO_PIPELINE_CACHE`, the layout
+traces, all of them. A run with the instrument enabled is not a measurement of
+this defect, and the first hour of looking at it was spent believing the alias
+trace had told me something.
+
+Two consequences for whoever continues:
+
+- **An inert `mesaenv` is the control.** `GEX_MESA_ENV='GEX_WGPU_NOT_A_REAL_VAR=1'`
+  passes; that is the baseline any instrumented run must be compared against,
+  not the plain run.
+- **The next instrument has to be unconditional**, compiled in rather than
+  env-gated -- and small, because the perturbation that hides this is a handful
+  of allocations. Print the fragment group's SSBO `WGPUBuffer` handle beside
+  the snapshot's on every draw and compare; if they are ever equal, the write
+  is going into the throwaway.
+
+Sensitivity to heap layout also points at the address-keyed caches, which have
+produced a bug here before: the pipeline cache serialises the descriptor and so
+keys on *module addresses*, and `cache_epoch` exists because Dawn hands an
+address straight back once the object behind it is released. The bind group
+cache consults that epoch; whether every buffer path bumps it is the thing to
+check first.
