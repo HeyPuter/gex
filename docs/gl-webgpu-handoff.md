@@ -21047,3 +21047,85 @@ rather than the driver:
 
 The probe is kept because sub-word image formats at unaligned widths had no
 coverage at all, and because it records where not to look.
+
+## The driver leaks GPU memory, about 35 MiB a second
+
+`gex-wgpu-runs-lock-the-machine` records that STK exhausts a 4 GB card and
+reads it as a **working set**: "the driver mirrors every GL buffer into a
+WGPUBuffer, and an STK race holds about 1.93 GB of them (measured)". Measured
+again with a sampled run, it is not a working set. It is **unbounded linear
+growth**:
+
+    t=10s  vram= 511 MiB   rss= 328 MiB
+    t=40s  vram=1735 MiB   rss= 947 MiB
+    t=70s  vram=2596 MiB   rss=1560 MiB
+
+**~35 MiB of VRAM and ~20 MiB of host per second, with no plateau** -- it
+passes the recorded 1.93 GB at about 45 seconds and keeps going. A 4 GB card
+is gone in under two minutes, which is the soft-lock in that note. VRAM
+returns to its 159 MiB idle baseline when the process dies, so it is
+process-scoped rather than a kernel leak.
+
+### What it is not
+
+Three eliminations, each cheap and each worth keeping:
+
+- **Not the core draw or present path.** `glxgears` under the same driver is
+  **flat at 184 MiB** for a minute.
+- **Not the application.** The *same STK race on llvmpipe* is **flat at 408 MiB
+  RSS** across the identical workload. Same frontend, same app, same track --
+  so the driver retains what the application frees.
+- **Not the maps or transfers.** 876,198 maps against 876,180 unmaps, and 19
+  live transfers, over the run that leaked 800 MiB.
+
+### What it is
+
+The driver's own counters, sampled every 30 presents:
+
+    host memory -- 1152 KiB of buffer shadows in 3 buffers        (start)
+    host memory -- 802397 KiB of buffer shadows in 1008 buffers   (~113 presents)
+    of which 800876 KiB never read
+
+and the buffer count climbs perfectly linearly -- 3, 228, 288, 348, ... 1008,
++60 per interval, no plateau. Instrumenting resource lifetime:
+
+    resources created 20179  destroyed 18138  live 2041     (and climbing)
+    live by bind -- bind4:811(592M) bind5:785(588M) bind6:615(595M)
+    live by target -- target0:1038 target2:506
+
+Bind bits 4, 5 and 6 are `VERTEX_BUFFER`, `INDEX_BUFFER` and
+`CONSTANT_BUFFER` -- the driver asks for the union of every usage a GL buffer
+might need, so one buffer carries all three -- and `target0` is `PIPE_BUFFER`.
+**So it is ~1000 live GL buffer objects, averaging ~750 KiB, that the
+application has already deleted.** Each costs its WebGPU buffer in VRAM *and*
+its host shadow, which is why both grow together.
+
+### One genuine leak found and fixed, which is not the whole of it
+
+`gex_wgpu_submit_pending_named` cleared `batch_touched` -- 4096 slots, each
+holding a `pipe_resource` reference and setting `in_batch` on it -- **after** an
+early return:
+
+    gex_wgpu_flush_persistent_maps(ctx);
+    if (!ctx->pending_encoder)
+       return;                       /* the clear is below this */
+
+Taking that path keeps the reference *and* leaves `in_batch` true, so the
+resource is never added again and never reaches the clear either: it leaks for
+the life of the context. The clear is hoisted above the return, which is right
+rather than merely safe -- with no encoder there is nothing recorded, so
+nothing can still need the batch to keep those alive.
+
+**It did not fix the leak**, measured after: VRAM still climbs ~40 MiB/s and
+live resources still grow. So something else holds a buffer reference, and
+that is where the next session should start. What is already ruled out: every
+`pipe_resource *` the context struct holds is fixed-size or a singleton, the
+persistent-map list stores bare pointers rather than references, and transfers
+are balanced. The next instrument is the one not yet built -- a temporary list
+of live resources printing `resource->reference.count`, which separates "the
+driver holds it" from "st/mesa still does".
+
+**This is the most serious reliability defect on record here**: it caps any
+long-running application at under two minutes on a 4 GB card, and the existing
+mitigations (a VRAM guard, a kernel watchdog, a software adapter) are all
+containment rather than repair.
