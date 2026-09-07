@@ -20057,6 +20057,17 @@ be used to force core, and passing `core` is a fatal "Unknown GL context type".
 The profile comes from the ApiType the `KHR-GL44` package declares, which is
 the same source on both paths.
 
+**And the mode itself is now eliminated from source, not just by probe.**
+`KHR-GL44` is registered as `GL44TestPackage`, whose render context type
+defaults to `glu::ContextType(4, 4, glu::PROFILE_CORE)`
+(`gl4cTestPackages.hpp:102`) -- core, and identically so on both paths, since
+both harnesses run the same package. So the first term of the CTS's
+`is_compatibility` is false everywhere, the second (`GL_ARB_compatibility`) is
+measured absent in core on both paths, and the mode it computes is therefore
+**8, `GL_QUAD_STRIP`, in the browser too**. Which this driver rejects
+correctly, through all four transform feedback draw entry points. There is no
+version of the mode story left.
+
 Which leaves the likeliest explanation, and it is not about the mode at all.
 `glGetError` pops **one** error, so the check
 
@@ -20075,6 +20086,17 @@ measured and correct.
 That is the same shape as the two-message trap above and as
 `gl44-xfb-paused-errors`: in this test a failure reported against one call is
 usually owed by an earlier one. Drain and *count*, rather than asking once.
+
+One detail sharpens where to look. The error-stream diff contained **only
+deletions** -- no line appears in the browser that is absent natively -- so the
+browser raises no extra error *inside Mesa*. But a guest-raised error never
+reaches Mesa's output, so a stray error queued by the **guest** would be
+invisible to that diff while still shifting every later check. That is the one
+place a spurious error could hide from every instrument used so far, and the
+guest does raise errors of its own (`GEXGL_SET_ERROR`). The measurement to make
+is a drain-and-count immediately before the failing draw, in the browser --
+which needs a guest trace, so it waits for the browser probe sweep to finish
+rather than rebuilding the guest library underneath a running sweep.
 
 #### MESA_DEBUG only shows errors Mesa raised
 
