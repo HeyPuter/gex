@@ -19139,16 +19139,34 @@ sweep uses one context, so the aliasing is invisible. The shapes that would hit
 it are toolkits creating a second context for a second window or for loading
 resources, and anything relying on context isolation.
 
-**What the fix needs**, in order: send `CONTEXT_CREATE` per guest context
-rather than once; have the host create and track a GL context per guest handle
-and switch on `MAKE_CURRENT`; and make the guest's caches -- `pack_store`,
-`unpack_store`, `buffer_targets`, `vertex_attribs`, `gexgl_ff_arrays`,
-`gexgl_client_texture_unit`, `extension_count` -- follow the switch. Those
-caches can be saved and restored around a switch without touching their access
-sites, which is much cheaper than threading a context pointer through all of
-them, but it is worth nothing until the host side is real. Resetting them on
-`eglMakeCurrent` is *not* a cheap partial fix: a program alternating between
-two contexts would then read defaults instead of the state it left.
+**The latch is load-bearing, so do not start by removing it.** That was my
+first idea and it is wrong. The host treats `CONTEXT_CREATE` as the lifetime
+boundary of a *guest process* and calls `reset_guest_namespace()`, which wipes
+every object-name map -- the comment there explains why, and it is a good
+reason: without it a recycled host name sends queries back carrying another
+process's guest name. So a second `CONTEXT_CREATE` would destroy the first
+context's buffers, textures and programs as the application still held their
+names. Aliasing is bad; that would be worse.
+
+**What the fix actually needs**, in order:
+
+1. A *separate* opcode for "make an additional context", which creates one
+   without resetting the namespace. `CONTEXT_CREATE` has to keep meaning
+   "a new guest process starts here".
+2. Per-context object namespaces on the host, since GL objects belong to a
+   context unless the application asks for sharing -- and `eglCreateContext`'s
+   `share_context` argument then has to be honoured rather than ignored.
+3. A GL context per guest handle on the host, switched on `MAKE_CURRENT`.
+4. The guest's caches -- `pack_store`, `unpack_store`, `buffer_targets`,
+   `vertex_attribs`, `gexgl_ff_arrays`, `gexgl_client_texture_unit`,
+   `extension_count` -- following the switch. These can be saved and restored
+   around a switch without touching their access sites, which is far cheaper
+   than threading a context pointer through all of them. Worth nothing until
+   1-3 exist.
+
+Resetting the caches on `eglMakeCurrent` is *not* a cheap partial fix: a
+program alternating between two contexts would then read defaults instead of
+the state it left, which is a different wrong answer rather than a better one.
 
 The probe is committed expecting 4/6 in the browser, so it will report a DIFF
 in probe-suite until this lands -- the same convention as
