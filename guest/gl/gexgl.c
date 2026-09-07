@@ -1005,8 +1005,26 @@ void *glMapBufferRange(unsigned target, long offset, long length,
        initial contents went that way, and the compute shader reading that
        buffer saw nothing but zeroes. One fetch, on a mapping that lives for
        the program's lifetime. */
-    if (object->map && ((access & 1u) || (access & 0x40u)) && object->map_length)
+    const int fetched =
+        object->map && ((access & 1u) || (access & 0x40u)) && object->map_length;
+    if (fetched)
         glGetBufferSubData(target, offset, length, object->map);
+    /* The shadow starts life here, beside the fetch, holding exactly what the
+       host holds. It cannot be built lazily at the first flush: by then the
+       application has already written through the mapping, so filling it from
+       the mapping would adopt that write as already-sent and the bytes would
+       never travel. Nor can the first flush simply send everything, which is
+       what it used to do -- for a buffer the host has written since the map,
+       that overwrites the host's data with the guest's older copy. Both of
+       those were live bugs on the same afternoon, in opposite directions;
+       having the shadow exist from the start is what makes the diff mean
+       "what the application has changed since the host last agreed". */
+    if (fetched) {
+        free(object->map_sent);
+        object->map_sent = malloc(object->map_length);
+        if (object->map_sent)
+            memcpy(object->map_sent, object->map, object->map_length);
+    }
     return object->map;
 }
 
@@ -1031,6 +1049,34 @@ unsigned char glUnmapBuffer(unsigned target) {
     return 1;
 }
 
+/* Record a span of a mapping as published, so the coherent and barrier
+   diffs do not send it a second time.
+ *
+ * The explicit flushes below send bytes without touching the shadow, which
+ * leaves it claiming the mapping still holds what it held when it was mapped.
+ * Nothing minded while the shadow was only consulted per draw for coherent
+ * mappings -- re-sending identical bytes is wasteful, not wrong. It became
+ * wrong once a *barrier* flushed non-coherent mappings too: by then the GPU
+ * may have written the buffer, and re-sending the application's older bytes
+ * over its output is a lost result rather than a wasted upload. That is
+ * KHR-GL44.buffer_storage.map_persistent_draw, whose GPU-incremented atomic
+ * counter came back holding whatever the application had last written. */
+static void gexgl_record_map_sent(struct buffer_object_state *object,
+                                  size_t offset, size_t length) {
+    if (!object->map || !object->map_length) return;
+    if (offset > object->map_length ||
+        length > object->map_length - offset) return;
+    /* No shadow means the map-time allocation failed. Building one here would
+       have to invent a value for the rest of the mapping, and either choice is
+       a bug: the application's unpublished writes outside this span would be
+       adopted as sent, or the host's data would be queued to be overwritten.
+       Leave it absent and let the flush path's conservative fallback send
+       everything, which loses nothing. */
+    if (!object->map_sent) return;
+    memcpy((unsigned char *)object->map_sent + offset,
+           (const unsigned char *)object->map + offset, length);
+}
+
 void glFlushMappedBufferRange(unsigned target, long offset, long length) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     if (!object || !object->map || offset < 0 || length < 0 ||
@@ -1038,6 +1084,7 @@ void glFlushMappedBufferRange(unsigned target, long offset, long length) {
         (size_t)length > object->map_length - (size_t)offset) return;
     buffer_sub_data_raw(target, (long)(object->map_offset + (size_t)offset), length,
                     (uint8_t *)object->map + offset);
+    gexgl_record_map_sent(object, (size_t)offset, (size_t)length);
 }
 
 /* Declared here, defined with the other round-trip calls further down -- the
@@ -1072,8 +1119,26 @@ void *glMapNamedBufferRange(unsigned buffer, long offset, long length,
        mapping -- see the note in glMapBufferRange. A write-only,
        non-persistent mapping still does not: that would double the cost of
        the streaming case this exists to serve. */
-    if (object->map && ((access & 1u) || (access & 0x40u)) && object->map_length)
+    const int fetched =
+        object->map && ((access & 1u) || (access & 0x40u)) && object->map_length;
+    if (fetched)
         glGetNamedBufferSubData(buffer, offset, length, object->map);
+    /* The shadow starts life here, beside the fetch, holding exactly what the
+       host holds. It cannot be built lazily at the first flush: by then the
+       application has already written through the mapping, so filling it from
+       the mapping would adopt that write as already-sent and the bytes would
+       never travel. Nor can the first flush simply send everything, which is
+       what it used to do -- for a buffer the host has written since the map,
+       that overwrites the host's data with the guest's older copy. Both of
+       those were live bugs on the same afternoon, in opposite directions;
+       having the shadow exist from the start is what makes the diff mean
+       "what the application has changed since the host last agreed". */
+    if (fetched) {
+        free(object->map_sent);
+        object->map_sent = malloc(object->map_length);
+        if (object->map_sent)
+            memcpy(object->map_sent, object->map, object->map_length);
+    }
     return object->map;
 }
 
@@ -1106,6 +1171,7 @@ void glFlushMappedNamedBufferRange(unsigned buffer, long offset, long length) {
         (size_t)length > object->map_length - (size_t)offset) return;
     named_buffer_sub_data_raw(buffer, (long)(object->map_offset + (size_t)offset),
                          length, (uint8_t *)object->map + offset);
+    gexgl_record_map_sent(object, (size_t)offset, (size_t)length);
 }
 
 void glGetNamedBufferPointerv(unsigned buffer, unsigned pname, void **params) {
@@ -2441,22 +2507,30 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
  * region N+1, draws again, and both draws can sit in one unflushed batch.
  * Sending the mapping once at flush time would give the first draw the second
  * region's bytes, which is what second-draw catches. */
-static void gexgl_flush_coherent_maps(void) {
+static void gexgl_flush_mapped_writes(unsigned required) {
     static int disabled = -1;
     if (disabled < 0) disabled = getenv("GEXGL_NO_COHERENT") ? 1 : 0;
     if (disabled) return;
     for (struct buffer_object_state *object = buffer_objects; object;
          object = object->next) {
-        /* Writable, persistent, coherent: 0x2 | 0x40 | 0x80. A persistent
-           mapping without COHERENT is the application's job to flush, and
-           glFlushMappedBufferRange already serves it. */
+        /* `required` is the access bits a mapping must have to be worth
+           sending. The draw path asks for writable-persistent-coherent
+           (0xc2), because a coherent mapping promises visibility with no call
+           at all and every draw could read it. A barrier asks for merely
+           writable-persistent (0x42): the application owes an explicit flush
+           for that one, but MemoryBarrier is a synchronisation point where a
+           real driver needs no transfer -- the mapping *is* the buffer -- so
+           an application that leans on it is right everywhere but here. */
         if (!object->map || !object->map_length ||
-            (object->map_access & 0xc2u) != 0xc2u)
+            (object->map_access & required) != required)
             continue;
         if (!object->map_sent) {
+            /* Only reachable when the allocation at map time failed, since
+               every mapping that gets here was given a shadow there. Nothing
+               is known to have been sent, so send everything: losing the
+               application's writes is the worse of the two errors. */
             object->map_sent = malloc(object->map_length);
             if (!object->map_sent) continue;
-            /* Nothing has been sent, so everything differs. */
             memset(object->map_sent, ~*(const unsigned char *)object->map,
                    object->map_length);
         }
@@ -2514,9 +2588,16 @@ static void gexgl_flush_coherent_maps(void) {
  * carries it too. Both are explicit and rare, so a round trip each is the
  * right price -- this is not on any draw path. */
 static void gexgl_refresh_persistent_reads(void) {
-    /* Guest writes first: a mapping that is both readable and coherent has
-       unsent bytes of its own, and fetching over them would lose them. */
-    gexgl_flush_coherent_maps();
+    /* Guest writes first, or fetching would read over them and lose them.
+       Every writable persistent mapping, not just the coherent ones: a
+       non-coherent mapping written through and then handed to the GPU across
+       a MemoryBarrier reaches the host nowhere else, and the barrier is what
+       KHR-GL44.buffer_storage.map_persistent_draw uses to publish the value
+       it seeds its atomic counter with. Its reset never arrived, so the
+       counter kept climbing across draws and every count after the first was
+       wrong -- which looked like the emulated geometry stage over-invoking
+       until the counts were swept and turned out to be cumulative. */
+    gexgl_flush_mapped_writes(0x42u);
     for (struct buffer_object_state *object = buffer_objects; object;
          object = object->next) {
         /* Readable and persistent: 0x1 | 0x40. A non-persistent read mapping
@@ -2532,6 +2613,12 @@ static void gexgl_refresh_persistent_reads(void) {
         if (object->map_sent)
             memcpy(object->map_sent, object->map, object->map_length);
     }
+}
+
+/* The draw path's flush: coherent mappings only, so its per-draw cost is
+   unchanged by the barrier case above. */
+static void gexgl_flush_coherent_maps(void) {
+    gexgl_flush_mapped_writes(0xc2u);
 }
 
 void glMemoryBarrier(unsigned barriers);

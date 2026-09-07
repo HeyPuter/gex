@@ -19263,3 +19263,152 @@ these four cases.
 Nine hypotheses are now eliminated across these four cases and each elimination
 is recorded, which is the whole point: the next attempt starts from a short
 list rather than the same guesses.
+
+## The 420pack block array: the answer was in the test, not the stages
+
+The stage theory was wrong, and so was every probe that tested it. Compute and
+tessellation joined vertex and geometry as stages that read a bound uniform
+block array correctly -- `gl44-cs-block-array-probe` 7/7 and
+`gl44-tess-block-array-probe` 6/6, both paths, with the data verified by
+weighted sums (17, and 153 split 17/136 so a failure names which half). Eleven
+eliminations, none of them the cause.
+
+Then I opened the CTS source, which settled it in a minute:
+
+```c
+layout(std140, binding = 2) uniform GOKU { vec4 gohan; vec4 goten; } goku[14];
+```
+
+**Fourteen** blocks at bindings 2..15. Every probe I had written used three.
+Three clears any limit; sixteen bindings in one stage does not. Eleven
+hypotheses were the price of not reading the test I was chasing.
+
+The limit that broke it was not the one that looked guilty. The browser
+advertises 114 uniform buffer bindings and 15 vertex blocks, comfortably
+enough. `gl44-block-array-threshold-probe` swept the block count and found a
+cliff with no slope: **ten blocks deliver every vec4, eleven deliver none** --
+linking cleanly, reporting every binding correctly, drawing without error.
+Dawn had been saying why the whole time, in a channel nothing was reading:
+
+```
+The number of dynamic uniform buffers (11) exceeds the maximum
+per-pipeline-layout limit (10).
+```
+
+Every constant buffer is bound with a dynamic offset, because one ring serves
+all of them and only the offset moves per draw -- that is what lets a bind
+group be cached. WebGPU rations those **per pipeline layout**, not per stage,
+so both stages' blocks and the draw parameters spend from one allowance.
+`mesa-gl.js` already asked for thirty-two and `gex_wgpu_native.c`'s comment
+already quoted this very message. Neither read the *granted* figure back: a
+`requiredLimits` request is clamped to the adapter's maximum in silence, this
+adapter's maximum is ten, and the driver went on advertising fifteen blocks
+through `GL_MAX_VERTEX_UNIFORM_BLOCKS`. Two numbers that had to agree with
+nothing connecting them, which is the same shape as most of the defects in this
+document.
+
+The fix reads both dynamic limits into the screen and, past either, bakes the
+offset into the bind group entry. That costs the caching, so it is the cold
+path by construction -- every program that fits keeps the fast one -- and the
+bind group cache compares whole entries, so a baked offset is already part of
+its key. `GEX_WGPU_MAX_DYNAMIC_UNIFORM` and `_STORAGE` force the budget down,
+because the browser grants ten and native twelve, so the fallback would
+otherwise ship unexercised anywhere a native gate can reach.
+
+**KHR-GL44.shading_language_420pack is now 327/329 in the browser, which is
+exactly its native score.** The two that remain fail on both paths. The
+browser-only gap in this family is closed.
+
+### A second defect the same probe found by accident
+
+My first draft indexed the array with a loop counter, and that did not link:
+
+```
+load_ubo slot=0 block=(none) interface=no fields=-1
+```
+
+A dynamically uniform index into a uniform block array is ARB_gpu_shader5 and
+the unroll that serves it was iterating slots 0..N-1, where **neither end was
+right**. The array arrives as a *single* variable at `driver_location` 1 -- no
+array left in the type, no length to read -- so it owns slots 1..14, and slot
+zero is not a block at all. The cap was the device's uniform-buffer count, so
+elements 12..14 were left out too: those slots are good blocks that merely
+spill to storage bindings, and the shader would have read the wrong elements
+had it linked. A refusal was hiding a wrong answer, which is the better order
+to find them in. It now unrolls over the slots the block lookup can answer for,
+which is that lookup's own rule and no new one.
+
+## map_persistent_draw: five components cleared, and two guest bugs fixed
+
+`KHR-GL44.buffer_storage.map_persistent_draw` logs `Contents of ATOMIC_COUNTER
+buffer are invalid`, and reading the browser's `console.error` -- not the CTS
+log -- is what made it tractable at all.
+
+`gl44-persistent-atomic-probe` swept the point count, which mattered more than
+any single number: the counts came back 2, 4, 7, 11, 19, 35 for 1, 2, 3, 4, 8
+and 16 points, and the *deltas* are exactly the right answers. The emulated
+geometry stage was never wrong; **the counter was never reset**, because the
+guest's write through the persistent mapping never reached the host. One wrong
+number would have read as an over-invoking stage, and I would have gone looking
+in the wrong place.
+
+Two real guest bugs behind it, both now fixed:
+
+- The barrier flushed only **coherent** persistent mappings. A non-coherent one
+  is the application's job to flush, which is true of `glFlushMappedBufferRange`
+  and not of `MemoryBarrier`: a real driver needs no transfer there because the
+  mapping *is* the buffer, so an application leaning on it is right everywhere
+  but here. The barrier now flushes any writable persistent mapping; the draw
+  path still asks for coherent only, so its per-draw cost is unchanged.
+- `glFlushMappedBufferRange` sent bytes without updating the shadow, so the
+  shadow went stale the moment an application used the explicit contract.
+  Harmless while the shadow was only consulted per draw -- re-sending identical
+  bytes is wasteful, not wrong -- and **wrong** once a barrier flushed
+  non-coherent mappings too, because by then the GPU may have written the
+  buffer and re-sending the application's older bytes over its output is a lost
+  result. Every publish now records what it published.
+
+The shadow's initial value moved with them. It was set to "everything differs",
+written before persistent mappings were fetched from the host at map time and
+outliving that change; the first flush then sent the whole mapping and
+overwrote whatever the host had put there. A persistently mapped `PIXEL_PACK`
+buffer after `ReadPixels` is exactly that, and
+`map_persistent_read_pixels` caught it within one run of introducing it.
+
+### Where the shadow has to start, which is the whole of it
+
+The third change is one line of placement and it is what actually fixed the
+case. The shadow was built lazily, at the first flush. Fill it from the mapping
+there and you adopt whatever the application has already written as
+*already-sent*, so those bytes never travel -- the initial value of an atomic
+counter went that way and the counter read four instead of eleven. Send
+everything there instead, which is what the code used to do, and you overwrite
+a buffer the host has written since the map -- the `PIXEL_PACK` case above.
+
+Both are live bugs, in opposite directions, and no lazy rule avoids both. The
+shadow has to exist from **map time**, beside the fetch that fills the mapping,
+which is the only moment the guest and the host are known to agree. Then the
+diff means what it is supposed to mean: what the application has changed since
+the host last agreed. Two probes disagreeing about the same code within one
+afternoon is what pinned it -- `gl44-persistent-atomic-probe` wants the write
+sent, `map_persistent_read_pixels` wants it not sent, and only map-time
+initialisation satisfies both.
+
+**KHR-GL44.buffer_storage is now 9/9 in the browser, which is its native
+score.** All five components below were cleared individually first and none of
+them was the cause, but each is permanent coverage that did not exist before:
+
+| component | probe | result |
+|---|---|---|
+| persistent mapping, both directions, both publish routes | `persistent-counter-sweep` | 31/31 |
+| atomic counters in an emulated geometry stage, swept over the draw size | `persistent-counter-sweep` | 31/31 |
+| two counter arrays at one binding, indexed by `gl_PrimitiveIDIn`, with the guard | `gs-counter-array` | 7/7 |
+| dynamic index into a struct array in a UBO read by a geometry shader, plain and persistently mapped | `gs-ubo-dynamic-index` | 7/7 |
+| the GPU half of a coherent mapping, and the explicit-flush contract | `persistent-atomic` | 10/10 |
+
+A note on that last row: I wrote this session's sweep probe *over*
+`gl44-persistent-atomic-probe`, which already existed and covered more than the
+file I replaced it with -- dispatch visibility, the explicit-flush contract, a
+write-only uniform flush. It is restored, the sweep lives under its own name,
+and it was the restored probe that caught the regression above. Check whether a
+probe name is taken before writing one.
