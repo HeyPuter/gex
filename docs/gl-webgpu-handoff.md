@@ -18493,8 +18493,14 @@ samples. `shader_image_load_store` — about 13 of 14 are the storage-format
 list. `compute_shader.resource-texture` and half of `texture_view` — WGSL has
 `texture_multisampled_2d` and `texture_depth_multisampled_2d` and no array
 form, and WebGPU forbids `depthOrArrayLayers > 1` on any multisampled
-texture. The fixable target is `vertex_attrib_binding`, 16 of 30 with llvmpipe
-at 30/30.
+texture.
+
+> **The recommendation that followed here is spent.** It named
+> `vertex_attrib_binding`, "16 of 30 with llvmpipe at 30/30", as the fixable
+> target. It is **26/30** now -- the VAO attribute-state fix closed most of it
+> -- and the four left match native. Re-measure before picking a target from
+> any paragraph in this document: see the note on the family table above, where
+> a 120-case gap turned out to be 8.
 
 ### Two traps the family table set before it could be trusted
 
