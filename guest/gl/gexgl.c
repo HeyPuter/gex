@@ -3745,6 +3745,24 @@ const unsigned char *glGetString(unsigned name) {
        `#version 440` shaders that cannot compile. glxinfo prints it next to
        the real GL version, which is where the disagreement showed. */
     if (name == 0x1F03u) { /* GL_EXTENSIONS */
+        /* A desktop *core* profile removed this query: it is GL_INVALID_ENUM
+           and the answer is NULL. Answering it anyway is not a harmless
+           courtesy -- glu::hasExtension in the CTS picks between this and
+           glGetStringi, and a core context that hands back a string can be
+           read as a compatibility one, which changes which enums a test
+           believes are valid. KHR-GL44.transform_feedback.api_errors_test
+           then asks for an error that is not owed and fails on a correct
+           answer.
+
+           ES and compatibility contexts keep the string, which is what the
+           note below gexgl_extension_string is about: ES has no glGetStringi
+           before 3.0 and applications still reach for this one. */
+        extern int gexgl_egl_context_profile(void);
+        if (egl_api == 0x30A2u /* EGL_OPENGL_API */ &&
+            !gexgl_egl_context_profile()) {
+            GEXGL_SET_ERROR(0x0500u); /* GL_INVALID_ENUM */
+            return NULL;
+        }
         return (const unsigned char *)gexgl_extension_string();
     }
     unsigned slot = name & 7u;

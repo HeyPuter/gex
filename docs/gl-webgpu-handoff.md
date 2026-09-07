@@ -20009,3 +20009,68 @@ work earlier -- so the suspicion is that it accepts `GL_QUAD_STRIP` in a core
 context where GL owes `INVALID_ENUM`. Not yet measured; that is the next step,
 and note it is the same profile question as above, arriving from a second
 direction.
+
+### A core profile was still answering glGetString(GL_EXTENSIONS)
+
+A desktop **core** profile removed the monolithic extension string: the query
+is `GL_INVALID_ENUM` and the answer is `NULL`. The guest answered it anyway, in
+every profile, and its comment explains why -- ES has no `glGetStringi` before
+3.0 and applications still reach for this one, so the guest made the legacy
+form agree with the indexed list rather than with the host.
+
+That is right for ES and for compatibility and wrong for core, and it is not a
+harmless courtesy: `glu::hasExtension` in the CTS chooses between this query
+and `glGetStringi` by version, so a core context that hands back a string can
+be read as a compatibility one -- which changes which enums a test believes are
+valid. The guest already knows both facts it needs (`egl_api` is
+`EGL_OPENGL_API`, and `gexgl_egl_context_profile()` is zero for core), so the
+fix is a two-term guard. **Browser-only, and no native gate could see it** --
+the native reference makes a compatibility context, where the string is owed.
+
+Found by asking a probe for a *core* context, which nothing here had done
+before: every other probe takes the default from `eglCreateContext`, and that
+default is compatibility, so no rule that only core enforces had ever been
+measured. `gl44-core-profile-modes` now asks for one and checks eleven things
+in it. Real-app cost checked rather than assumed: browser STK held 59.70 FPS
+at 99.67% fresh, unchanged.
+
+### What api_errors_test is *not*
+
+That fix did not close `KHR-GL44.transform_feedback.api_errors_test`, which is
+still the family's one browser-only failure at 18/21 against native's 19. It is
+worth recording what has been eliminated, because each of these cost a
+measurement and none of them needs repeating:
+
+| suspected | measured |
+|---|---|
+| driver rejects the wrong primitive modes | correct for `QUAD_STRIP`, `POLYGON`, `QUADS`, `LINES_ADJACENCY` and nonsense, in **both** profiles, on **both** paths |
+| the transform feedback draw entry points skip mode validation | all four reject `QUAD_STRIP` in core, browser included |
+| `GL_ARB_compatibility` advertised in a core context | not advertised, both paths |
+| the legacy extension string flips the CTS's profile test | it was wrong and is now fixed -- and the case did not move, so `glu` is using `glGetStringi` here |
+| the indexed getters swallow an out-of-range error | `glGetIntegeri_v`, `glGetBooleani_v`, `glGetInteger64i_v` all raise `GL_INVALID_VALUE`, both paths |
+| errors are missing from the browser's stream | **a measurement artifact** -- see below |
+
+The remaining candidate is the one term left in the CTS's own
+`is_compatibility`: `contextSupports(contextType, compatibility(3,2))`, which
+reads the context type the CTS *recorded*, not anything the driver reports.
+That is a property of the CTS build and its harness, and the two harnesses use
+two different `glcts` binaries. Neither passes `--deqp-gl-context-type`, so if
+they differ it is in their configuration -- which would make this failure a
+measurement difference rather than a driver defect. That is the next thing to
+check, and it is cheaper than anything above.
+
+#### MESA_DEBUG only shows errors Mesa raised
+
+The tempting instrument here was to diff the error *streams*: the case raises
+57 `Mesa: error:` lines natively and 41 in the browser, and lining them up
+appeared to name three missing calls at once. It named none of them. The guest
+answers many queries locally and raises their errors itself, and an error the
+guest raises never passes through Mesa, so it cannot appear in Mesa's debug
+output -- while `glGetError` still returns it. Two of the three "missing"
+groups were probed directly and are correct on both paths.
+
+Five of the six lines missing at the actual failure point are also not
+evidence: the test does `return false` on the first bad check, so everything
+the sub-test would have done afterwards is absent as a consequence. Exactly
+**one** error is genuinely missing. Count what a failure *stops*, before
+reading a gap as a set of defects.
