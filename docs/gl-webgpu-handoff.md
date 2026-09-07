@@ -20899,3 +20899,62 @@ and the sound version needs `nir_lower_vars_to_ssa` on a clone plus a
 phi-aware taint walk. Getting that subtly wrong is silently wrong geometry, for
 a feature no application here uses, against a decline that is honest and still
 runs the stores.
+
+## What shader_image_load_store's failures actually are
+
+This document says of the native gap: "`shader_image_load_store` -- about 13
+of 14 are the storage-format list." **None of them is.** That claim has now
+been wrong three times in one day about this family, which is worth more
+attention than the individual cases: `basic-allTargets-store-fs`/`-cs` were an
+integer cube sample, `advanced-memory-order-vsfs` and
+`advanced-sync-imageAccess` were read as memory-ordering bugs and were a
+missing binding, and the list below was read as formats.
+
+Diagnosed one at a time, `KHR-GL45.shader_image_load_store` 36/51:
+
+| cases | cause |
+|---|---|
+| `basic-allTargets-loadStoreTCS`, `loadStoreTES`, `atomicTCS` | **13 storage buffers against this native adapter's 10 per stage** -- and the browser grants 16, so these three *pass there*. Native 36/13 against browser 39/10 is exactly this. |
+| `advanced-sync-imageAccess`, `advanced-sync-drawIndirect`, `advanced-sync-bufferUpdate`, `advanced-sso-atomicCounters` | **an unformatted `imageBuffer` in the vertex stage** -- four cases, one cause |
+| `basic-glsl-earlyFragTests`, `early-fragment-tests` | the `early_fragment_tests` wall: WGSL has no attribute and Tint drops the SPIR-V mode |
+| `multiple-uniforms` | wants 17 storage buffers against the browser's 16; the packed route costs one binding per image plus a shared header, so consolidating them is the fix |
+| `non-layered_binding` | a 3D-texture slice bound as a non-layered `image2D` |
+| `advanced-sso-subroutine`, `single-byte_data_alignment` | still undiagnosed |
+
+**Three of the thirteen are not driver work at all**, and that is the useful
+half of this: they are a native-adapter limit the target platform does not
+have. Chasing them natively would have been chasing the desktop Dawn build.
+
+### The four-case cluster, and exactly what it needs
+
+The unformatted-`imageBuffer` gap was attempted twice at the start of this
+session and reverted twice. Both blockers are now located, so the next attempt
+does not have to rediscover them:
+
+1. **`is_packed` must take a buffer image with no format**, recording it as
+   unformatted -- its own comment already says a buffer image is always packed,
+   and the `format != PIPE_FORMAT_NONE` guard contradicts that.
+2. **The format has to be resolved per draw**, in the capture variant and as
+   part of its key, because an unformatted image takes its format from the
+   image unit rather than the shader. *This half was made to work* -- a trace
+   showed `packed=1 unformatted=0x1 resolved[0]=r32_float` and
+   `advanced-sync-drawIndirect` passed with it.
+3. **The capture dispatch has to bind the packed header.** This is what it
+   died on. `gex_wgpu_bind_stage_packed_images` exists and is called for the
+   varying pass, geometry and both tessellation stages -- **not** for the
+   capture dispatch, which builds its layout by hand rather than through
+   `gex_wgpu_bindings` and so never learned the rule. The comment beside its
+   image loop says as much about a *different* rule it also had to be taught
+   separately: "Three sites, one rule; this was the third."
+
+The per-image shape to mirror is small: the header is one **uniform** binding
+emitted once for the group at `packed_bindings[i]`, the data is one
+**storage** binding per slot at `PACKED_IMAGE_DATA_FIRST_BINDING + slot`, and
+`gex_wgpu_packed_image_bind` hands back both buffers plus the size and data
+offset.
+
+**Not attempted a third time here, deliberately.** Four cases of a feature real
+applications do not use, in the path transform feedback depends on, at the end
+of a long session -- and the last two attempts left a silent wrong answer where
+an honest refusal had been. The diagnosis is the deliverable; the fix wants
+fresh context and the full gate cycle.
