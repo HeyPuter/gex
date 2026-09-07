@@ -21020,11 +21020,30 @@ by implementing something:
    encoder is still open, "which is the only window a texture copy can be
    recorded in", so a fragment shader's packed writes do reach the texture.
 
-What is left to check is the *row arithmetic* on the way back: the copy from
-the packed buffer into an `r8uint` texture needs its rows where WebGPU's
-256-byte `bytesPerRow` rule puts them, and the shader's addressing has to use
-the same stride out of the header. A tight row in one and a padded row in the
-other would land every row but the first in the wrong place -- which is exactly
-the shape of a silent wrong answer, and exactly what
-[[measure-rows-in-the-stored-format]] is about. Dumping the destination texture
-after the draw is the next step, not more reading.
+**The row arithmetic is not it either**, which took building the reproducer to
+establish. `gl44-byte-image-copy` copies an `r8ui` image through a fragment
+shader at every dimension the CTS test uses -- 16x16, 16x17, 17x16, 17x17,
+16x18, 18x16, 18x18, 19x19 -- and passes **8/8 on gex_wgpu and on llvmpipe**.
+The widths that are not word multiples are the point of it, and they work.
+
+So the whole suspected area is eliminated: the sub-word store, the copy back,
+and the row stride at unaligned widths are all correct. Whatever
+`single-byte_data_alignment` fails on is in the rest of what that test does,
+not in the packed byte path. **That is where the next attempt should start**,
+and it should not re-check any of the three.
+
+Two mistakes on the way there, both mine and both worth the warning, because
+each made *llvmpipe* fail too -- which is the tell that the harness is wrong
+rather than the driver:
+
+- an image uniform declared without a `binding=` qualifier defaults to unit
+  **0**, so two images were the same one until `glUniform1i` set them;
+- `GL_PACK_ALIGNMENT` and `GL_UNPACK_ALIGNMENT` both default to **4**, so an
+  odd-width `r8ui` row is padded in the client buffer and a tight comparison
+  reports every row after the first as wrong. That alignment is the whole
+  subject of the test the probe came from, which is a fair warning about
+  reproducing a test without reading what it varies -- the dimension list is
+  the test.
+
+The probe is kept because sub-word image formats at unaligned widths had no
+coverage at all, and because it records where not to look.
