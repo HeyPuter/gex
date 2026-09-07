@@ -19495,3 +19495,75 @@ direction each time: it first honoured the mask everywhere, which discarded
 fragments GL keeps, and then ignored it on a framebuffer where GL applies it.
 `gl44-samplemask-one-sample-probe` pins all three cases -- plain, 1x
 multisample, 4x -- so a third version cannot be half right.
+
+## Layered rendering: one fix, and one defect worth more than the fix
+
+`KHR-GL44.geometry_shader` was 129/136 with five of the seven failures in
+layered rendering. Two of those are the multisample-array wall above. The other
+five split into one fix and one open defect.
+
+### The stencil upload had no layer
+
+`glTexSubImage3D` into a `GL_DEPTH32F_STENCIL8` array texture wrote every
+slice's stencil into slice zero. The depth half of the same routine routes by
+layer -- its render pass views `baseArrayLayer = box->z` -- and the stencil half
+goes through `wgpuQueueWriteTexture`, whose `origin.z` was never set. One line.
+
+Worse than misrouted: four slices uploaded 1, 2, 3, 4 all landed on slice zero
+*in order*, so slice zero held 4 and the rest held nothing. A stencil test
+against any of them, slice zero included, rejected everything.
+`layered_framebuffer` 3/4 → 4/4, family 129 → 130.
+
+`gl44-layered-stencil-upload-probe` covers it, and was verified the only way a
+regression test can be: by reverting the line, rebuilding and confirming it
+fails (3/7). My first attempt at that verification ran the build script from the
+wrong directory and silently re-measured the *fixed* binary -- a probe that
+passes before and after proves nothing, and this one nearly shipped that way.
+
+### A computed gl_Layer draws nothing
+
+Left open, and it is the more valuable of the two findings. A geometry shader
+that **computes** its layer renders nothing at all -- not into the wrong layer,
+nothing -- with no GL error, no failed link and no driver message.
+
+The trigger narrowed twice, and both narrowings changed where to look:
+
+```
+no gl_Layer, looped, max_vertices=18   -> correct
+gl_Layer = 0      (literal)            -> correct
+gl_Layer = n - 1  (uniform)            -> correct
+gl_Layer = l      (loop counter)       -> nothing drawn
+```
+
+`max_vertices` is irrelevant. So is being non-constant -- a uniform is the same
+for every primitive and can be hoisted. What breaks it is a layer that
+**differs between the primitives one invocation emits**, which is precisely
+what layered rendering is for: a single-pass cube render emits six primitives
+with six layers. This is three of the six remaining `geometry_shader` failures,
+and it means cube shadow maps and cascade arrays draw nothing.
+
+`gl44-gs-dynamic-layer-probe` renders every case into a **plain single-layer 2D
+framebuffer**, where GL says every primitive lands on the one layer whatever
+`gl_Layer` holds. That removes layered attachments, the per-layer routing and
+the read-back path from the question; what is left is the shader. Rendering into
+a 3D slice, a cube face and an array layer were each confirmed working without a
+geometry shader.
+
+It is asserted, not reported, so it stands as the eighth entry in the probe
+suite's known non-OK list and the first there that is a real defect rather than
+a platform ceiling or the reference being wrong. A ninth entry is still the
+signal that something new broke.
+
+### Two things that sent me the wrong way
+
+The driver printed **"a geometry shader writes gl_Layer; this driver rasterizes
+the bound layer only"** at shader-create time. True when written, false once the
+routing landed, and it appears verbatim in front of a layered draw that renders
+nothing -- it reads exactly like the diagnosis. It is deleted. A latched line
+that outlives what it describes is worse than silence, because silence does not
+send you somewhere.
+
+And the CTS's own comparison message streams `unsigned char` values into its
+log, so they arrive as raw bytes and the XML truncates at the first NUL:
+`Rendered data [` and nothing else. Read those with `od`. It also prints layer
+*zero's* expected values whichever layer failed, so it names the wrong one.
