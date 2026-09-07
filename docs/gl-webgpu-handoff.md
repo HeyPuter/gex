@@ -20050,14 +20050,31 @@ measurement and none of them needs repeating:
 | the indexed getters swallow an out-of-range error | `glGetIntegeri_v`, `glGetBooleani_v`, `glGetInteger64i_v` all raise `GL_INVALID_VALUE`, both paths |
 | errors are missing from the browser's stream | **a measurement artifact** -- see below |
 
-The remaining candidate is the one term left in the CTS's own
-`is_compatibility`: `contextSupports(contextType, compatibility(3,2))`, which
-reads the context type the CTS *recorded*, not anything the driver reports.
-That is a property of the CTS build and its harness, and the two harnesses use
-two different `glcts` binaries. Neither passes `--deqp-gl-context-type`, so if
-they differ it is in their configuration -- which would make this failure a
-measurement difference rather than a driver defect. That is the next thing to
-check, and it is cheaper than anything above.
+One more candidate was eliminated on the way: **`--deqp-gl-context-type` does
+not select a profile.** It names the context *factory* (`egl`, `glx`) --
+`gluRenderContext.cpp:131` looks it up in the factory registry -- so it cannot
+be used to force core, and passing `core` is a fatal "Unknown GL context type".
+The profile comes from the ApiType the `KHR-GL44` package declares, which is
+the same source on both paths.
+
+Which leaves the likeliest explanation, and it is not about the mode at all.
+`glGetError` pops **one** error, so the check
+
+    gl.drawTransformFeedbackInstanced(mode, object, 1);
+    if (GL_INVALID_ENUM != gl.getError()) fail;
+
+fails just as readily when the queue already holds something else, or when the
+draw raises a *different* error first. `glDrawTransformFeedbackInstanced`
+validates more than the mode: with transform feedback still active it owes
+`GL_INVALID_OPERATION`, which would be returned instead of the
+`GL_INVALID_ENUM` the test is looking for. So the thing to establish next is
+**the transform feedback object's state at that call**, and how many errors are
+queued before it -- not what the driver thinks of the enum, which is now
+measured and correct.
+
+That is the same shape as the two-message trap above and as
+`gl44-xfb-paused-errors`: in this test a failure reported against one call is
+usually owed by an earlier one. Drain and *count*, rather than asking once.
 
 #### MESA_DEBUG only shows errors Mesa raised
 
