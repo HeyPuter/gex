@@ -167,6 +167,19 @@ export class MesaGlDevice {
         maxStorageTexturesPerShaderStage: 8,
         maxStorageTexturesInVertexStage: 8,
         maxStorageTexturesInFragmentStage: 8,
+        // Every uniform buffer binding this driver builds has
+        // hasDynamicOffset set -- uniforms are sub-allocated from one ring,
+        // so the offset comes from the draw and the bind group can be cached.
+        // With sixteen uniform buffers per stage asked for above, one
+        // pipeline layout can want thirty-two of them. WebGPU guarantees
+        // eight. The native path asks for thirty-two and this did not ask at
+        // all, so a shader with more than a few uniform blocks could not
+        // build its layout in the browser and could natively.
+        maxDynamicUniformBuffersPerPipelineLayout: 32,
+        // A no-op against WebGPU's default of sixteen, and asked for anyway
+        // so the two request lists can be diffed against each other without
+        // a difference that has to be explained every time.
+        maxSampledTexturesPerShaderStage: 16,
         // Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
         // sample, so any wider attachment set fails on it -- GL 3.2 wants
         // eight draw buffers of whatever format the application chose.
