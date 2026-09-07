@@ -433,6 +433,32 @@ pub mod op {
     pub const GET_ACTIVE_SUBROUTINE_NAME: u32 = 264;
     pub const GET_ACTIVE_SUBROUTINE_UNIFORM_NAME: u32 = 265;
     pub const GET_ACTIVE_SUBROUTINE_UNIFORM_IV: u32 = 266;
+
+    /* Reading fixed-function state back.
+     *
+     * The setters have been here since glxgears needed them; the getters were
+     * never added, and a missing entry point is not a wrong answer -- the
+     * guest's libGL does not export the symbol, so a program that reads this
+     * state fails to link and never starts. tools/gl44_coverage.py cannot see
+     * the gap because it counts the *core* command set and these are
+     * compatibility, and tests/gl-app-sweep.sh cannot either because it runs
+     * the native libGL, where the symbols exist.
+     *
+     * Saving and restoring state around a helper is the usual reason to read
+     * it: query, change, put back.
+     *
+     * Each carries the value count the guest computed, and the host fills
+     * that many and sends them back. Deliberately one table rather than two
+     * -- the state-query pair in gexgl_state_query_components had to agree
+     * between guest and host and silently agreed on a wrong answer for every
+     * pname neither of them listed. */
+    pub const GET_LIGHTFV: u32 = 267;
+    pub const GET_LIGHTIV: u32 = 268;
+    pub const GET_MATERIALFV: u32 = 269;
+    pub const GET_MATERIALIV: u32 = 270;
+    pub const GET_CLIP_PLANE: u32 = 271;
+    pub const GET_TEX_ENVFV: u32 = 272;
+    pub const GET_TEX_ENVIV: u32 = 273;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

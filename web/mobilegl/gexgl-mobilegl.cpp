@@ -240,6 +240,11 @@ enum Op : uint32_t {
     GET_ACTIVE_SUBROUTINE_NAME = 264,
     GET_ACTIVE_SUBROUTINE_UNIFORM_NAME = 265,
     GET_ACTIVE_SUBROUTINE_UNIFORM_IV = 266,
+    /* Reading fixed-function state back; see the cases further down. */
+    GET_LIGHTFV = 267, GET_LIGHTIV = 268,
+    GET_MATERIALFV = 269, GET_MATERIALIV = 270,
+    GET_CLIP_PLANE = 271,
+    GET_TEX_ENVFV = 272, GET_TEX_ENVIV = 273,
 };
 
 struct Reader {
@@ -2708,6 +2713,48 @@ bool one(uint32_t op, Reader& a) {
         const GLdouble l = a.f64(), r = a.f64(), b = a.f64();
         const GLdouble t = a.f64(), n = a.f64(), f = a.f64();
         glFrustum(l, r, b, t, n, f); break;
+    }
+    /* Reading fixed-function state back. The guest sends the value count it
+       computed and this fills that many -- one table rather than two, which
+       is the lesson gexgl_state_query_components taught: a count kept on both
+       sides can agree on a wrong answer. Four is the most any of these takes
+       and a larger count is a malformed command. */
+    case GET_LIGHTFV:
+    case GET_LIGHTIV:
+    case GET_MATERIALFV:
+    case GET_MATERIALIV:
+    case GET_TEX_ENVFV:
+    case GET_TEX_ENVIV: {
+        const GLenum target = a.u32();
+        const GLenum pname = a.u32();
+        const uint32_t count = a.u32();
+        if (count == 0 || count > 4 || !a.ok) return false;
+        const bool integer = op == GET_LIGHTIV || op == GET_MATERIALIV ||
+                             op == GET_TEX_ENVIV;
+        if (integer) {
+            GLint values[4] = {};
+            if (op == GET_LIGHTIV)         glGetLightiv(target, pname, values);
+            else if (op == GET_MATERIALIV) glGetMaterialiv(target, pname, values);
+            else                           glGetTexEnviv(target, pname, values);
+            put_blob(values, count * sizeof(values[0]));
+        } else {
+            GLfloat values[4] = {};
+            if (op == GET_LIGHTFV)         glGetLightfv(target, pname, values);
+            else if (op == GET_MATERIALFV) glGetMaterialfv(target, pname, values);
+            else                           glGetTexEnvfv(target, pname, values);
+            put_blob(values, count * sizeof(values[0]));
+        }
+        break;
+    }
+    case GET_CLIP_PLANE: {
+        const GLenum plane = a.u32();
+        (void)a.u32(); /* no pname; the transport shape is shared */
+        const uint32_t count = a.u32();
+        if (count != 4 || !a.ok) return false;
+        GLdouble equation[4] = {};
+        glGetClipPlane(plane, equation);
+        put_blob(equation, sizeof(equation));
+        break;
     }
     case LIGHTFV:
     case MATERIALFV: {

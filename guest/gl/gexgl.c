@@ -4641,6 +4641,66 @@ void glMaterialfv(unsigned face, unsigned pname, const float *params) {
                   material_parameter_floats(pname));
 }
 
+/* Reading fixed-function state back.
+ *
+ * The setters above have been here since glxgears needed them and the getters
+ * never were -- and a missing entry point is not a wrong answer: the guest's
+ * libGL does not export the symbol, so a program that reads this state fails
+ * to link and never starts. Query, change, put back is the usual reason to
+ * read it.
+ *
+ * Each sends the value count this side computed and the host fills that many.
+ * One table, deliberately: gexgl_state_query_components has to be kept
+ * identical on both sides and silently agreed on a wrong answer for every
+ * pname neither copy listed. */
+static size_t tex_env_floats(unsigned pname) {
+    return pname == 0x2201u /* GL_TEXTURE_ENV_COLOR */ ? 4u : 1u;
+}
+
+static void get_parameter(uint32_t opcode, unsigned target, unsigned pname,
+                          void *out, size_t count, size_t element) {
+    if (!out || !count) return;
+    uint32_t *p = begin(opcode, 3, 0);
+    if (!p) return;
+    p[0] = target;
+    p[1] = pname;
+    p[2] = (uint32_t)count;
+    flush();
+    uint32_t len = 0;
+    const uint8_t *source = reply_blob(&len);
+    if (source && len == count * element) memcpy(out, source, len);
+}
+
+void glGetLightfv(unsigned light, unsigned pname, float *params) {
+    get_parameter(GEXGL_GET_LIGHTFV, light, pname, params,
+                  light_parameter_floats(pname), sizeof(float));
+}
+void glGetLightiv(unsigned light, unsigned pname, int *params) {
+    get_parameter(GEXGL_GET_LIGHTIV, light, pname, params,
+                  light_parameter_floats(pname), sizeof(int));
+}
+void glGetMaterialfv(unsigned face, unsigned pname, float *params) {
+    get_parameter(GEXGL_GET_MATERIALFV, face, pname, params,
+                  material_parameter_floats(pname), sizeof(float));
+}
+void glGetMaterialiv(unsigned face, unsigned pname, int *params) {
+    get_parameter(GEXGL_GET_MATERIALIV, face, pname, params,
+                  material_parameter_floats(pname), sizeof(int));
+}
+void glGetTexEnvfv(unsigned target, unsigned pname, float *params) {
+    get_parameter(GEXGL_GET_TEX_ENVFV, target, pname, params,
+                  tex_env_floats(pname), sizeof(float));
+}
+void glGetTexEnviv(unsigned target, unsigned pname, int *params) {
+    get_parameter(GEXGL_GET_TEX_ENVIV, target, pname, params,
+                  tex_env_floats(pname), sizeof(int));
+}
+/* Four doubles, and no pname: the plane is the only selector. */
+void glGetClipPlane(unsigned plane, double *equation) {
+    get_parameter(GEXGL_GET_CLIP_PLANE, plane, 0u, equation, 4u,
+                  sizeof(double));
+}
+
 /* The rest of the fixed-function set.
  *
  * A missing entry point here is not a missing feature: libGL exports a fixed
