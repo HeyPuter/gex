@@ -176,6 +176,13 @@ export class MesaGlDevice {
         // all, so a shader with more than a few uniform blocks could not
         // build its layout in the browser and could natively.
         maxDynamicUniformBuffersPerPipelineLayout: 32,
+        // The same budget for the blocks that spilled into storage buffers,
+        // which are bound with a dynamic offset for the same reason and
+        // rationed separately. WebGPU guarantees four. Neither figure is a
+        // hard wall any more -- the driver reads back what it was granted and
+        // bakes the offsets in when a program wants more -- but the baked
+        // path gives up the bind group caching, so it is worth asking first.
+        maxDynamicStorageBuffersPerPipelineLayout: 16,
         // A no-op against WebGPU's default of sixteen, and asked for anyway
         // so the two request lists can be diffed against each other without
         // a difference that has to be explained every time.
