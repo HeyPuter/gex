@@ -6,6 +6,39 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* Whether a log line is the suite's own GL call trace rather than something a
+   test chose to say.
+ *
+ * Several cases log every GL call they make -- "glGetError();", "// data =
+ * { 16 }", "glBindBuffer(GL_ARRAY_BUFFER, 0);" -- and at sixteen attributes a
+ * time that is hundreds of lines. They filled the detail ring and pushed out
+ * the one message that mattered, so a failing case reported nothing but its
+ * own trace. KHR-GL44.vertex_attrib_binding.basic-state4 was undiagnosable
+ * for exactly this reason: it says "glVertexAttribDivisor state change check
+ * failed" and none of it reached the terminal.
+ *
+ * Recognised by shape: a result line starts with `//`, and a call line starts
+ * with `gl` plus an upper-case letter **and contains a parenthesis**. That
+ * last clause is not decoration -- several tests name the call they are
+ * complaining about, and "glVertexAttribDivisor state change check failed."
+ * begins exactly like a trace line. Dropping it was how this filter hid the
+ * message it was written to reveal. A call has arguments; prose does not. */
+static int gl_trace_line(const char *text)
+{
+    if (!text)
+        return 1;
+    while (*text == ' ' || *text == '\t')
+        ++text;
+    if (text[0] == '/' && text[1] == '/')
+        return 1;
+    if (text[0] == 'g' && text[1] == 'l' && text[2] >= 'A' && text[2] <= 'Z') {
+        for (const char *p = text; *p; ++p)
+            if (*p == '(')
+                return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char **child_argv = calloc((size_t)argc + 1, sizeof(*child_argv));
@@ -231,6 +264,17 @@ int main(int argc, char **argv)
                 text = joined;
             }
 
+            /* The suite's own GL call trace is not a message and is not
+               counted. Several cases log every call they make, and at sixteen
+               attributes a time that buries everything a test actually said:
+               the census for basic-state4 was nothing but "glGetError();" and
+               "// data = { 0 }", and one glMemoryBarrier line with every
+               barrier bit spelled out took four rows of it. The census exists
+               to fit in a terminal, so what it spends its rows on decides
+               whether it is any use. */
+            if (gl_trace_line(text))
+                continue;
+
             /* Group by the message's *kind*: the CTS appends the format
                combination to almost every one, which would make every message
                distinct and put the census back over the terminal's capacity.
@@ -240,7 +284,7 @@ int main(int argc, char **argv)
             /* Into the ring first: the census below truncates the message at
                its first colon to group by kind, and the part after the colon
                is the half that carries the numbers. */
-            if (current[0]) {
+            if (current[0] && !gl_trace_line(text)) {
                 snprintf(detail[ndetail % DETAIL_KEEP], DETAIL_CHARS, "%s",
                          text);
                 ++ndetail;

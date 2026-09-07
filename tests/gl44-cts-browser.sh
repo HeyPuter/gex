@@ -72,14 +72,30 @@ mv "$CTS_STAGE" "$CTS_PUBLIC"
 # $BUILD/glcts-log-wrapper is written only when the CTS is compiled, and the
 # copy here was five days old while its source had changed. An instrument that
 # does not track its source reports yesterday's answers.
-if [ -n "${GEX_CTS_TOOLCHAIN:-}" ] && [ -x "$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" ]; then
-    "$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" -O2 \
-        "$ROOT/tests/cts/glcts-log-wrapper.c" -o "$BUILD/glcts-log-wrapper" || {
-            echo "could not rebuild the CTS log wrapper" >&2; exit 1; }
+# The default location is the one guest/gl/build.sh uses, because neither
+# GEX_CTS_TOOLCHAIN nor a musl gcc on PATH is the normal state of this machine
+# -- so the two branches below were both false and the wrapper was silently
+# *not* rebuilt. Every edit to glcts-log-wrapper.c was inert, which is exactly
+# what the comment above warns about, arrived at from the other side: the check
+# meant to keep the instrument fresh had a condition nobody satisfied. Say so
+# rather than carry on with a stale one.
+WRAPPER_CC=""
+if [ -n "${GEX_CTS_TOOLCHAIN:-}" ] &&
+   [ -x "$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc" ]; then
+    WRAPPER_CC="$GEX_CTS_TOOLCHAIN/bin/aarch64-linux-musl-gcc"
 elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
-    aarch64-linux-musl-gcc -O2 \
+    WRAPPER_CC="aarch64-linux-musl-gcc"
+elif [ -x "$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc" ]; then
+    WRAPPER_CC="$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc"
+fi
+if [ -n "$WRAPPER_CC" ]; then
+    "$WRAPPER_CC" -O2 \
         "$ROOT/tests/cts/glcts-log-wrapper.c" -o "$BUILD/glcts-log-wrapper" || {
             echo "could not rebuild the CTS log wrapper" >&2; exit 1; }
+elif [ -e "$BUILD/glcts-log-wrapper" ]; then
+    echo "gl44-cts-browser: no musl toolchain, so the log wrapper at" >&2
+    echo "  $BUILD/glcts-log-wrapper is whatever was built last." >&2
+    echo "  Set GEX_CTS_TOOLCHAIN if its output looks out of date." >&2
 fi
 
 # Rebuild that marshaller from the current tree first.
