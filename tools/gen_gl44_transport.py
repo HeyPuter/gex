@@ -393,7 +393,22 @@ BINDABLE_NAME_COMMANDS = {
 
 
 def name_lookup(command_name, namespace, expression):
-    """The host helper that resolves a guest object name for `command_name`."""
+    """The host helper that resolves a guest object name for `command_name`.
+
+    A program name always goes through lookup_program_or_shader. `lookup`
+    collapses two errors GL keeps apart: an unknown name is
+    GL_INVALID_VALUE ("not an object at all") and a *shader* name where a
+    program is wanted is GL_INVALID_OPERATION ("an object of the wrong
+    type"), and mapping both to zero answers whichever error zero happens to
+    earn. The helper returns the real shader name for a shader and a name the
+    host's GL has never generated for an unknown one, so GL raises each error
+    itself. It existed and was used at six of seventy-eight sites.
+
+    Nothing that works changes: a valid program resolves identically and zero
+    stays zero. Only the two error paths move, and they were wrong.
+    """
+    if namespace == "programs":
+        return f"lookup_program_or_shader({expression})"
     fn = ("lookup_bindable" if command_name in BINDABLE_NAME_COMMANDS
           else "lookup")
     return f"{fn}({namespace}, {expression})"
@@ -1827,7 +1842,7 @@ def host_case(command: dict, opcode: int) -> str:
         size_argument = (", (GLsizei)sizeof(values)"
                          if name in BOUNDED_UNIFORM_QUERIES else "")
         return f"""case {opcode}: {{
-    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) {{ a.ok = false; break; }}
     {gl_type} values[16]{{}};
@@ -2127,7 +2142,7 @@ def host_case(command: dict, opcode: int) -> str:
 }}"""
     if name == "glTransformFeedbackVaryings":
         return f"""case {opcode}: {{
-    GLuint program = lookup(programs, a.u32()); GLsizei count = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLsizei count = a.i32();
     GLenum bufferMode = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     /* A negative count is the application's mistake, not a malformed wire.
        GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
@@ -2441,7 +2456,7 @@ def host_case(command: dict, opcode: int) -> str:
                 "    uint32_t components = 1u;",
                 "    if (pname == GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES) {",
                 "        GLint active = 0;",
-                "        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv, lookup(programs, program),",
+                "        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv, lookup_program_or_shader(program),",
                 "                    bufferIndex, GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTERS,",
                 "                    &active);",
                 "        components = active > 0 ? (uint32_t)active : 0u;",
@@ -2449,7 +2464,7 @@ def host_case(command: dict, opcode: int) -> str:
                 "    std::vector<GLint> values(components ? components : 1u, 0);",
                 "    if (components)",
                 "        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv,",
-                "                    lookup(programs, program), bufferIndex, pname,",
+                "                    lookup_program_or_shader(program), bufferIndex, pname,",
                 "                    values.data());",
             ]
         if name in {"glGetVertexAttribiv", "glGetVertexAttribIiv", "glGetVertexAttribIuiv"}:

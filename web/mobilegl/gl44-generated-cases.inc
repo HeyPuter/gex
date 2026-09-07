@@ -2,7 +2,7 @@
 case 1024: {
     GLuint pipeline = a.u32();
     GLuint program = a.u32();
-    GEX_GL_CALL(glActiveShaderProgram, lookup(program_pipelines, pipeline), lookup(programs, program));
+    GEX_GL_CALL(glActiveShaderProgram, lookup(program_pipelines, pipeline), lookup_program_or_shader(program));
     break;
 }
 case 1027: {
@@ -106,7 +106,7 @@ case 1037: {
     GLuint color = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
-    GEX_GL_CALL(glBindFragDataLocation, lookup(programs, program), color, value.c_str());
+    GEX_GL_CALL(glBindFragDataLocation, lookup_program_or_shader(program), color, value.c_str());
     break;
 }
 case 1038: {
@@ -115,7 +115,7 @@ case 1038: {
     GLuint index = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
-    GEX_GL_CALL(glBindFragDataLocationIndexed, lookup(programs, program), colorNumber, index, value.c_str());
+    GEX_GL_CALL(glBindFragDataLocationIndexed, lookup_program_or_shader(program), colorNumber, index, value.c_str());
     break;
 }
 case 1040: {
@@ -1040,7 +1040,7 @@ case 1206: {
     uint32_t components = 1u;
     if (pname == GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES) {
         GLint active = 0;
-        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv, lookup(programs, program),
+        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv, lookup_program_or_shader(program),
                     bufferIndex, GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTERS,
                     &active);
         components = active > 0 ? (uint32_t)active : 0u;
@@ -1048,7 +1048,7 @@ case 1206: {
     std::vector<GLint> values(components ? components : 1u, 0);
     if (components)
         GEX_GL_CALL(glGetActiveAtomicCounterBufferiv,
-                    lookup(programs, program), bufferIndex, pname,
+                    lookup_program_or_shader(program), bufferIndex, pname,
                     values.data());
     put_blob(values.data(), components * sizeof(GLint));
     break;
@@ -1178,14 +1178,14 @@ case 1233: {
     GLuint program = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
-    put_u32((uint32_t)GEX_GL_CALL(glGetFragDataIndex, lookup(programs, program), value.c_str()));
+    put_u32((uint32_t)GEX_GL_CALL(glGetFragDataIndex, lookup_program_or_shader(program), value.c_str()));
     break;
 }
 case 1234: {
     GLuint program = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
-    put_u32((uint32_t)GEX_GL_CALL(glGetFragDataLocation, lookup(programs, program), value.c_str()));
+    put_u32((uint32_t)GEX_GL_CALL(glGetFragDataLocation, lookup_program_or_shader(program), value.c_str()));
     break;
 }
 case 1235: {
@@ -1443,7 +1443,7 @@ case 1265: {
     GLenum pname = a.u32();
     const uint32_t components = 1u;
     GLint values[4]{};
-    GEX_GL_CALL(glGetProgramStageiv, lookup(programs, program), shadertype, pname, values);
+    GEX_GL_CALL(glGetProgramStageiv, lookup_program_or_shader(program), shadertype, pname, values);
     put_blob(values, components * sizeof(GLint));
     break;
 }
@@ -1584,7 +1584,7 @@ case 1288: {
     GLenum shadertype = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
-    put_u32((uint32_t)GEX_GL_CALL(glGetSubroutineIndex, lookup(programs, program), shadertype, value.c_str()));
+    put_u32((uint32_t)GEX_GL_CALL(glGetSubroutineIndex, lookup_program_or_shader(program), shadertype, value.c_str()));
     break;
 }
 case 1289: {
@@ -1592,7 +1592,7 @@ case 1289: {
     GLenum shadertype = a.u32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     std::string value(reinterpret_cast<const char *>(wire), bytes);
-    put_u32((uint32_t)GEX_GL_CALL(glGetSubroutineUniformLocation, lookup(programs, program), shadertype, value.c_str()));
+    put_u32((uint32_t)GEX_GL_CALL(glGetSubroutineUniformLocation, lookup_program_or_shader(program), shadertype, value.c_str()));
     break;
 }
 case 1291: {
@@ -1810,7 +1810,7 @@ case 1313: {
     break;
 }
 case 1314: {
-    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
     GLdouble values[16]{};
@@ -1819,7 +1819,7 @@ case 1314: {
     break;
 }
 case 1317: {
-    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
     GLuint values[16]{};
@@ -1917,7 +1917,7 @@ case 1327: {
     break;
 }
 case 1330: {
-    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
     GLdouble values[16]{};
@@ -1926,7 +1926,7 @@ case 1330: {
     break;
 }
 case 1331: {
-    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
     GLfloat values[16]{};
@@ -1935,7 +1935,7 @@ case 1331: {
     break;
 }
 case 1332: {
-    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
     GLint values[16]{};
@@ -1944,7 +1944,7 @@ case 1332: {
     break;
 }
 case 1333: {
-    GLuint program = lookup(programs, a.u32()); GLint location = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLint location = a.i32();
     uint32_t components = uniform_components(program, location);
     if (components > 16) { a.ok = false; break; }
     GLuint values[16]{};
@@ -2037,7 +2037,7 @@ case 1346: {
 }
 case 1347: {
     GLuint program = a.u32();
-    put_u32((uint32_t)GEX_GL_CALL(glIsProgram, lookup(programs, program)));
+    put_u32((uint32_t)GEX_GL_CALL(glIsProgram, lookup_program_or_shader(program)));
     break;
 }
 case 1348: {
@@ -2317,14 +2317,14 @@ case 1401: {
     GLuint program = a.u32();
     GLenum pname = a.u32();
     GLint value = a.i32();
-    GEX_GL_CALL(glProgramParameteri, lookup(programs, program), pname, value);
+    GEX_GL_CALL(glProgramParameteri, lookup_program_or_shader(program), pname, value);
     break;
 }
 case 1402: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLdouble v0 = a.f64();
-    GEX_GL_CALL(glProgramUniform1d, lookup(programs, program), location, v0);
+    GEX_GL_CALL(glProgramUniform1d, lookup_program_or_shader(program), location, v0);
     break;
 }
 case 1403: {
@@ -2341,14 +2341,14 @@ case 1403: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform1dv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform1dv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1404: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLfloat v0 = a.f32();
-    GEX_GL_CALL(glProgramUniform1f, lookup(programs, program), location, v0);
+    GEX_GL_CALL(glProgramUniform1f, lookup_program_or_shader(program), location, v0);
     break;
 }
 case 1405: {
@@ -2365,14 +2365,14 @@ case 1405: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform1fv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform1fv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1406: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLint v0 = a.i32();
-    GEX_GL_CALL(glProgramUniform1i, lookup(programs, program), location, v0);
+    GEX_GL_CALL(glProgramUniform1i, lookup_program_or_shader(program), location, v0);
     break;
 }
 case 1407: {
@@ -2389,14 +2389,14 @@ case 1407: {
     std::vector<GLint> value_aligned(value_bytes / sizeof(GLint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform1iv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform1iv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1408: {
     GLuint program = a.u32();
     GLint location = a.i32();
     GLuint v0 = a.u32();
-    GEX_GL_CALL(glProgramUniform1ui, lookup(programs, program), location, v0);
+    GEX_GL_CALL(glProgramUniform1ui, lookup_program_or_shader(program), location, v0);
     break;
 }
 case 1409: {
@@ -2413,7 +2413,7 @@ case 1409: {
     std::vector<GLuint> value_aligned(value_bytes / sizeof(GLuint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLuint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform1uiv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform1uiv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1410: {
@@ -2421,7 +2421,7 @@ case 1410: {
     GLint location = a.i32();
     GLdouble v0 = a.f64();
     GLdouble v1 = a.f64();
-    GEX_GL_CALL(glProgramUniform2d, lookup(programs, program), location, v0, v1);
+    GEX_GL_CALL(glProgramUniform2d, lookup_program_or_shader(program), location, v0, v1);
     break;
 }
 case 1411: {
@@ -2438,7 +2438,7 @@ case 1411: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform2dv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform2dv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1412: {
@@ -2446,7 +2446,7 @@ case 1412: {
     GLint location = a.i32();
     GLfloat v0 = a.f32();
     GLfloat v1 = a.f32();
-    GEX_GL_CALL(glProgramUniform2f, lookup(programs, program), location, v0, v1);
+    GEX_GL_CALL(glProgramUniform2f, lookup_program_or_shader(program), location, v0, v1);
     break;
 }
 case 1413: {
@@ -2463,7 +2463,7 @@ case 1413: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform2fv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform2fv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1414: {
@@ -2471,7 +2471,7 @@ case 1414: {
     GLint location = a.i32();
     GLint v0 = a.i32();
     GLint v1 = a.i32();
-    GEX_GL_CALL(glProgramUniform2i, lookup(programs, program), location, v0, v1);
+    GEX_GL_CALL(glProgramUniform2i, lookup_program_or_shader(program), location, v0, v1);
     break;
 }
 case 1415: {
@@ -2488,7 +2488,7 @@ case 1415: {
     std::vector<GLint> value_aligned(value_bytes / sizeof(GLint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform2iv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform2iv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1416: {
@@ -2496,7 +2496,7 @@ case 1416: {
     GLint location = a.i32();
     GLuint v0 = a.u32();
     GLuint v1 = a.u32();
-    GEX_GL_CALL(glProgramUniform2ui, lookup(programs, program), location, v0, v1);
+    GEX_GL_CALL(glProgramUniform2ui, lookup_program_or_shader(program), location, v0, v1);
     break;
 }
 case 1417: {
@@ -2513,7 +2513,7 @@ case 1417: {
     std::vector<GLuint> value_aligned(value_bytes / sizeof(GLuint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLuint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform2uiv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform2uiv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1418: {
@@ -2522,7 +2522,7 @@ case 1418: {
     GLdouble v0 = a.f64();
     GLdouble v1 = a.f64();
     GLdouble v2 = a.f64();
-    GEX_GL_CALL(glProgramUniform3d, lookup(programs, program), location, v0, v1, v2);
+    GEX_GL_CALL(glProgramUniform3d, lookup_program_or_shader(program), location, v0, v1, v2);
     break;
 }
 case 1419: {
@@ -2539,7 +2539,7 @@ case 1419: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform3dv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform3dv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1420: {
@@ -2548,7 +2548,7 @@ case 1420: {
     GLfloat v0 = a.f32();
     GLfloat v1 = a.f32();
     GLfloat v2 = a.f32();
-    GEX_GL_CALL(glProgramUniform3f, lookup(programs, program), location, v0, v1, v2);
+    GEX_GL_CALL(glProgramUniform3f, lookup_program_or_shader(program), location, v0, v1, v2);
     break;
 }
 case 1421: {
@@ -2565,7 +2565,7 @@ case 1421: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform3fv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform3fv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1422: {
@@ -2574,7 +2574,7 @@ case 1422: {
     GLint v0 = a.i32();
     GLint v1 = a.i32();
     GLint v2 = a.i32();
-    GEX_GL_CALL(glProgramUniform3i, lookup(programs, program), location, v0, v1, v2);
+    GEX_GL_CALL(glProgramUniform3i, lookup_program_or_shader(program), location, v0, v1, v2);
     break;
 }
 case 1423: {
@@ -2591,7 +2591,7 @@ case 1423: {
     std::vector<GLint> value_aligned(value_bytes / sizeof(GLint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform3iv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform3iv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1424: {
@@ -2600,7 +2600,7 @@ case 1424: {
     GLuint v0 = a.u32();
     GLuint v1 = a.u32();
     GLuint v2 = a.u32();
-    GEX_GL_CALL(glProgramUniform3ui, lookup(programs, program), location, v0, v1, v2);
+    GEX_GL_CALL(glProgramUniform3ui, lookup_program_or_shader(program), location, v0, v1, v2);
     break;
 }
 case 1425: {
@@ -2617,7 +2617,7 @@ case 1425: {
     std::vector<GLuint> value_aligned(value_bytes / sizeof(GLuint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLuint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform3uiv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform3uiv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1426: {
@@ -2627,7 +2627,7 @@ case 1426: {
     GLdouble v1 = a.f64();
     GLdouble v2 = a.f64();
     GLdouble v3 = a.f64();
-    GEX_GL_CALL(glProgramUniform4d, lookup(programs, program), location, v0, v1, v2, v3);
+    GEX_GL_CALL(glProgramUniform4d, lookup_program_or_shader(program), location, v0, v1, v2, v3);
     break;
 }
 case 1427: {
@@ -2644,7 +2644,7 @@ case 1427: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform4dv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform4dv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1428: {
@@ -2654,7 +2654,7 @@ case 1428: {
     GLfloat v1 = a.f32();
     GLfloat v2 = a.f32();
     GLfloat v3 = a.f32();
-    GEX_GL_CALL(glProgramUniform4f, lookup(programs, program), location, v0, v1, v2, v3);
+    GEX_GL_CALL(glProgramUniform4f, lookup_program_or_shader(program), location, v0, v1, v2, v3);
     break;
 }
 case 1429: {
@@ -2671,7 +2671,7 @@ case 1429: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform4fv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform4fv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1430: {
@@ -2681,7 +2681,7 @@ case 1430: {
     GLint v1 = a.i32();
     GLint v2 = a.i32();
     GLint v3 = a.i32();
-    GEX_GL_CALL(glProgramUniform4i, lookup(programs, program), location, v0, v1, v2, v3);
+    GEX_GL_CALL(glProgramUniform4i, lookup_program_or_shader(program), location, v0, v1, v2, v3);
     break;
 }
 case 1431: {
@@ -2698,7 +2698,7 @@ case 1431: {
     std::vector<GLint> value_aligned(value_bytes / sizeof(GLint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform4iv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform4iv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1432: {
@@ -2708,7 +2708,7 @@ case 1432: {
     GLuint v1 = a.u32();
     GLuint v2 = a.u32();
     GLuint v3 = a.u32();
-    GEX_GL_CALL(glProgramUniform4ui, lookup(programs, program), location, v0, v1, v2, v3);
+    GEX_GL_CALL(glProgramUniform4ui, lookup_program_or_shader(program), location, v0, v1, v2, v3);
     break;
 }
 case 1433: {
@@ -2725,7 +2725,7 @@ case 1433: {
     std::vector<GLuint> value_aligned(value_bytes / sizeof(GLuint));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLuint *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniform4uiv, lookup(programs, program), location, count, value);
+    GEX_GL_CALL(glProgramUniform4uiv, lookup_program_or_shader(program), location, count, value);
     break;
 }
 case 1434: {
@@ -2743,7 +2743,7 @@ case 1434: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix2dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix2dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1435: {
@@ -2761,7 +2761,7 @@ case 1435: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix2fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix2fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1436: {
@@ -2779,7 +2779,7 @@ case 1436: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix2x3dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix2x3dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1437: {
@@ -2797,7 +2797,7 @@ case 1437: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix2x3fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix2x3fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1438: {
@@ -2815,7 +2815,7 @@ case 1438: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix2x4dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix2x4dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1439: {
@@ -2833,7 +2833,7 @@ case 1439: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix2x4fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix2x4fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1440: {
@@ -2851,7 +2851,7 @@ case 1440: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix3dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix3dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1441: {
@@ -2869,7 +2869,7 @@ case 1441: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix3fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix3fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1442: {
@@ -2887,7 +2887,7 @@ case 1442: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix3x2dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix3x2dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1443: {
@@ -2905,7 +2905,7 @@ case 1443: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix3x2fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix3x2fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1444: {
@@ -2923,7 +2923,7 @@ case 1444: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix3x4dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix3x4dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1445: {
@@ -2941,7 +2941,7 @@ case 1445: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix3x4fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix3x4fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1446: {
@@ -2959,7 +2959,7 @@ case 1446: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix4dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix4dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1447: {
@@ -2977,7 +2977,7 @@ case 1447: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix4fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix4fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1448: {
@@ -2995,7 +2995,7 @@ case 1448: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix4x2dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix4x2dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1449: {
@@ -3013,7 +3013,7 @@ case 1449: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix4x2fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix4x2fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1450: {
@@ -3031,7 +3031,7 @@ case 1450: {
     std::vector<GLdouble> value_aligned(value_bytes / sizeof(GLdouble));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLdouble *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix4x3dv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix4x3dv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1451: {
@@ -3049,7 +3049,7 @@ case 1451: {
     std::vector<GLfloat> value_aligned(value_bytes / sizeof(GLfloat));
     if (value_bytes) memcpy(value_aligned.data(), value_wire, value_bytes);
     const GLfloat *value = value_bytes ? value_aligned.data() : nullptr;
-    GEX_GL_CALL(glProgramUniformMatrix4x3fv, lookup(programs, program), location, count, transpose, value);
+    GEX_GL_CALL(glProgramUniformMatrix4x3fv, lookup_program_or_shader(program), location, count, transpose, value);
     break;
 }
 case 1452: {
@@ -3150,7 +3150,7 @@ case 1476: {
     GLuint program = a.u32();
     GLuint storageBlockIndex = a.u32();
     GLuint storageBlockBinding = a.u32();
-    GEX_GL_CALL(glShaderStorageBlockBinding, lookup(programs, program), storageBlockIndex, storageBlockBinding);
+    GEX_GL_CALL(glShaderStorageBlockBinding, lookup_program_or_shader(program), storageBlockIndex, storageBlockBinding);
     break;
 }
 case 1483: {
@@ -3425,7 +3425,7 @@ case 1523: {
     break;
 }
 case 1524: {
-    GLuint program = lookup(programs, a.u32()); GLsizei count = a.i32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLsizei count = a.i32();
     GLenum bufferMode = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
     /* A negative count is the application's mistake, not a malformed wire.
        GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
@@ -3916,12 +3916,12 @@ case 1580: {
     GLuint pipeline = a.u32();
     GLbitfield stages = a.u32();
     GLuint program = a.u32();
-    GEX_GL_CALL(glUseProgramStages, lookup(program_pipelines, pipeline), stages, lookup(programs, program));
+    GEX_GL_CALL(glUseProgramStages, lookup(program_pipelines, pipeline), stages, lookup_program_or_shader(program));
     break;
 }
 case 1581: {
     GLuint program = a.u32();
-    GEX_GL_CALL(glValidateProgram, lookup(programs, program));
+    GEX_GL_CALL(glValidateProgram, lookup_program_or_shader(program));
     break;
 }
 case 1582: {
