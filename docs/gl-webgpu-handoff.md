@@ -21403,10 +21403,27 @@ ranking worth planning from:
 - **1 each, all distinct**: `workgroupBarrier` in non-uniform control flow (a
   WGSL rule); a dynamically indexed uniform block array (`load_ubo
   block-index-const=0` -- the same unroll the sampler arrays already get);
-  a compute texture dimension the driver cannot bind; a non-layered binding of
-  a 3D slice; `single-byte_data_alignment`; an unknown SPIR-V builtin; a
-  missing `@blend_src` pair; sampling in the tessellation control stage;
-  a multisampled array texture.
+  a compute texture dimension the driver cannot bind (`dim 8` with an array,
+  which is `sampler2DMSArray` -- the multisample-array wall again, not a gap);
+  a non-layered binding of a 3D slice; `single-byte_data_alignment`; a missing
+  `@blend_src` pair; a multisampled array texture; and the two decoded below.
+
+**`Tint rejected SPIR-V: unknown SPIR-V builtin: 7`** is **`gl_PrimitiveID`**
+(SPIR-V `BuiltIn` 7 is `PrimitiveId`), in `shader_storage_buffer_object`. WGSL
+has no primitive-id builtin, and the tempting workaround is wrong: emitting
+`gl_VertexIndex / verts_per_prim` as a flat integer output is only right for a
+non-indexed draw, and an indexed one cannot know its primitive from the vertex
+stage at all. The one **exact** route is to force such a draw through the
+primitive-assembly capture path -- the geometry emulation already assembles
+primitives and knows each one's index, so it can emit the id as a flat varying.
+That means routing ordinary draws through compute assembly, so it costs
+performance on any shader that reads the builtin; worth doing only if a real
+application needs it, and no app in the sweep does.
+
+**"cannot sample a texture in the tessellation control stage (a buffer
+texture)"** is the `samplerBuffer` gap, whose real blocker is written up in its
+own section below -- the texel word count is part of the module's variant key
+and these stages have no per-draw variant.
 
 **Nothing here is a cluster of ten any more.** The largest single win available
 is the vertex-atomic capture-back at 3-4 cases; everything else is one or two,
