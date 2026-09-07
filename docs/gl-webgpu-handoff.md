@@ -20812,3 +20812,50 @@ again.
 - The draw path is shared by everything, so: native STK a real scene
   (meangray 67, stdev 17), Blender identical at mean 61 / 336 colours, Krita
   `panels_rmse=0`, browser STK 59.70 FPS at 99.50% fresh.
+
+### An implicit-LOD integer cube sample, when there is one level
+
+`es_31_compatibility.shader_image_load_store.basic-allTargets-store-fs` and
+`-cs` were recorded in this document as the storage-format wall. **They were
+not.** The log says so in one line:
+
+    gex-wgpu: texture lowering refused (an integer cube sample without an
+              explicit LOD)
+    gex-wgpu: dispatch declined (no compute module for this sampler state)
+
+The refusal is narrower than it reads, and the machinery around it is already
+built. An implicit LOD for an integer texture is *served*: the lowering
+computes it from `ddx`/`ddy` of the coordinate scaled by the texture size,
+takes the maximum over the axes and `log2`s it -- the standard formula. What it
+cannot do is apply that to a **cube**, whose coordinate is a three-component
+direction rather than the face UV it is converted to further down.
+
+But the block ends by clamping the LOD to `integer_levels - 1`. **With a single
+level that clamp takes any LOD to zero**, so level zero is the answer whatever
+the derivatives would have said -- which makes allowing it *exact* rather than
+an approximation. That is the whole change, and it is why it is allowed at all:
+a **mipmapped** integer cube sampled with an implicit LOD is still refused, and
+now says so by name.
+
+Two lines, both stating the same fact from opposite ends: the refusal gains
+`&& lower->integer_levels > 1`, and the mip-selection block gains the same
+condition so the derivative math is skipped when it cannot matter. That second
+half is not an optimisation -- it is what lets the cube through, since the
+formula would otherwise run on the wrong channels before being clamped to zero
+anyway.
+
+The level range is already part of the variant key (`first_level` and
+`last_level` per sampler), so the specialisation is correctly keyed without
+adding anything: a mipmapped cube gets a different variant and still refuses.
+
+**`es_31_compatibility` 293/355 -> 295/355, failures 6 -> 4.** With the vertex
+image fix earlier, the family has gone 291 -> 295 and 8 -> 4 failures today.
+The four left are one `early_fragment_tests` wall and the three vertex-atomic
+declines.
+
+`shader_image_load_store` (36/51) and `gpu_shader5` (21/22) are unchanged, so
+nothing else was waiting on this. Gates: probe suite 168 OK with the same seven
+expected, CTS gate at every baseline, browser `image` 15/15,
+`vertex-image-read` 4/4, `ssbo` 7/7, browser STK 58.9-59.6 FPS at 98.3-99.5%
+fresh over three runs, Blender identical at mean 61 / 336 colours, Krita
+`panels_rmse=0`.
