@@ -20342,3 +20342,85 @@ change is **hardening rather than a demonstrated fix**. The probe is kept
 because the failure it looks for has no other symptom -- no validation error,
 no refusal, and the draw succeeds -- and because the next allocator change
 could make it live.
+
+## es_31_compatibility is 291 of 355, not 235, and the gap analysis was stale
+
+The table at the top of this document recorded **es_31_compatibility 235/355**
+against a reference of 355/355, and a section below it broke the 120 failures
+down as "40 cases: a vertex shader that writes a storage buffer ...
+platform-blocked" plus "8: an array of images ... nothing splits an image
+array". **Measured today: 291/355, with 8 failures and 56 not-supported.**
+
+Both halves of that breakdown had been overtaken by later work, and the source
+says so plainly:
+
+- a vertex shader that writes a storage buffer is served --
+  `gex_wgpu_writes_storage` finds the stores, `gex_wgpu_strip_storage_writes`
+  removes them from the copy that rasterises, and the shader is dispatched as
+  compute for its side effects;
+- `gex_wgpu_split_image_arrays` exists and is called.
+
+The lesson is about the table, not the family: its neighbours had visibly moved
+(`geometry_shader` 117 -> 133 of 136, `shading_language_420pack` 47 -> 327 of
+329, `sample_variables` 125 -> 134), which was enough to distrust the row and
+re-run it. **A family score is only evidence on the day it was taken.**
+
+The 8 that remain, all of them:
+
+| case | what it is |
+|---|---|
+| `shader_image_load_store.basic-glsl-earlyFragTests` | the `early_fragment_tests` wall: WGSL has no attribute and Tint drops the SPIR-V mode |
+| `shader_image_load_store.basic-allTargets-store-fs` / `-cs` | a storage format WebGPU will not store to |
+| `shader_image_load_store.advanced-sync-imageAccess` | undiagnosed |
+| `shader_image_load_store.advanced-memory-order-vsfs` | undiagnosed |
+| `shader_storage_buffer_object.basic-atomic-case1/3/4-vsfs` | the vertex-atomic decline, below |
+
+### Why the vertex-atomic decline is not cheap to lift
+
+Those three, and `basic-atomic-case1` and `-case4` in `KHR-GL44
+.shader_storage_buffer_object`, all end at one message:
+
+    draw declined (this vertex shader uses the result of an image or buffer
+    atomic, which the rasterising copy cannot perform; its stores still run,
+    but it may only be drawn with GL_RASTERIZER_DISCARD)
+
+The machinery to lift it looks already present: the strip pass **already**
+substitutes zero for such an atomic and deletes it, and only then marks the
+copy unrasterisable. The `-vsfs` variants need the draw for their *fragment*
+stage's own atomics, so declining it is what loses them. And the shaders look
+harmless -- `gl_Position` is assigned from an input before a long chain of
+atomics that only compare what they returned.
+
+**Two soundness tests were tried and both fail, for the same structural
+reason.** Recorded so the next attempt starts past them:
+
+1. *Does every output store precede the atomics?* No, and it cannot: measured,
+   the output store is in **block 51** and the atomic in **block 0**. Output
+   writes have already been moved to copy-outs at the end.
+2. *Does the store always execute, and is its value settled before every
+   atomic?* Also no. The store's block **does not dominate the end block**,
+   because each early `return` gets its own copy-out, so no single store
+   dominates the exit even though the output is always written on some path.
+   The value is a late `load_deref` of a local temporary rather than the
+   original input, so the value half fails too.
+
+Both are consequences of the shader still being in **pre-SSA local-variable
+form** at this point. A sound test needs `nir_lower_vars_to_ssa` run first and
+then a phi-aware dependence walk -- "can substituting zero change the value any
+output copy-out writes" -- which is a real analysis, not a predicate. Until
+then the refusal stands, and it is the right failure: it is named at the draw,
+it does not latch, and the stores still happen.
+
+## The browser column, re-measured after the cache and transport fixes
+
+Same sixteen families, same order:
+
+| | pass | fail |
+|---|---|---|
+| **total** | **1156** | **37** |
+
+**37 failures, against 39-41 before.** `shader_image_load_store` moved 37 -> 39
+passing, which is the fragment-alias repair and the bind group cache work; no
+family regressed. The four still failing in `shader_storage_buffer_object` are
+`basic-atomic-case1`, `basic-atomic-case4` (the decline above),
+`advanced-switchBuffers` and `advanced-usage-sync`.
