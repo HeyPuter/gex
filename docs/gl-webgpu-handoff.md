@@ -18835,3 +18835,76 @@ looked large were not:
   stages agree by construction. Note before spending the effort that apps use
   clip planes by *writing* them in the vertex shader, which works; reading them
   in a fragment shader is a CTS verification technique.
+
+## The six browser-only CTS failures, and what each one is not
+
+Both sweeps keep per-family logs now, so the browser-only failures cost nothing
+to name -- diff the failing case lists rather than re-running anything:
+
+    N=web/.work/gl44-families/<native-stamp>
+    B=web/.work/gl44-families/<browser-stamp>
+    fails() { awk "/Test case '/{n=\$0} /Fail \(|InternalError/{if(n!=\"\"){
+        gsub(/.*Test case '/,\"\",n); gsub(/'.*/,\"\",n); print n; n=\"\"}}" "$1" |
+        sort -u; }
+    comm -13 <(fails $N/<family>.log) <(fails $B/<family>.log)
+
+A browser-only failure is the most valuable kind: the native driver proves the
+GL semantics work, so it is not a platform wall. Eight became six today.
+
+**Fixed:** `vertex_attrib_binding.negative-bindVertexBuffer` and
+`shader_storage_buffer_object.negative-api-blockBinding`, both the object-name
+collapse (see below).
+
+**Remaining, with the hypotheses already eliminated:**
+
+| case | what it is not |
+| --- | --- |
+| `program_interface_query.invalid-value` | not the `glGetProgramResourceiv` negative-count path; that is fixed and probed 47/47 |
+| `shader_storage_buffer_object.basic-binding` | not indexed binding state; `gl44-binding-state-probe` is 14/14 in the browser |
+| `vertex_attrib_binding.basic-state4` | same -- not the vertex binding queries, they round-trip including the 64-bit offset |
+| `shading_language_420pack.binding_uniform_block_array` | same |
+| `buffer_storage.map_persistent_draw` | not persistent mapping on its own. The case is a *geometry shader* incrementing *two atomic counter buffers* keyed on `gl_PrimitiveIDIn` through a **non-coherent** `GL_MAP_PERSISTENT` mapping. `max_hw_atomic_counters` is 0 here, so those counters lower onto SSBOs in the compute-emulated geometry stage. Three features at once; a probe for it has to build all three |
+| `transform_feedback.api_errors_test` | not yet investigated |
+
+All six fail *silently* -- native passes, browser fails, and no layer prints
+anything -- so each needs a probe that asks its questions separately. That
+technique has worked repeatedly (19 error-semantics questions located three
+divergences in one run) but it is one case per investigation from here.
+
+### The object-name collapse, which was worth more than its case count
+
+`lookup` maps a guest object name the host has never seen to zero. Zero is
+legal for most of these calls -- an unbind, or "no object" -- so an error GL
+owes became a silent success:
+
+* Unknown name where an object is required: GL_INVALID_OPERATION for a bind,
+  GL_INVALID_VALUE for a program query. `lookup_bindable` and
+  `lookup_program_or_shader` both exist for this, substituting a name the
+  host's own GL has never generated so that **GL raises the error itself**
+  rather than the transport guessing which one.
+* A *shader* name where a program is wanted: GL_INVALID_OPERATION, which zero
+  cannot express at all.
+
+They were called at **1 of 9** and **6 of 78** sites respectively. Both are
+applied throughout now.
+
+**Why the native reference could not see it:** the native context is
+*compatibility*, where binding an ungenerated name is legal and creates the
+object; only the core-profile browser owed an error. A probe for this class must
+ask EGL for a core profile explicitly (`EGL_CONTEXT_OPENGL_PROFILE_MASK` bit 1),
+or it asserts the compatibility answer natively and reports the profile as a
+defect.
+
+### And a protocol-width bug the probe found on the way
+
+`glBindVertexBuffers` and `glBindBuffersRange` had **never worked in the
+browser**. A blob of `GLintptr` was sized with `sizeof(guest type)` at one end
+and `sizeof(host type)` at the other -- eight bytes on the aarch64 guest, four
+on the wasm32 host -- so the lengths never agreed, the host set `a.ok = false`,
+and the guest discarded the whole batch: every call silently dropped along with
+everything queued behind it.
+
+The wire width is a property of the protocol and not of either side's ABI.
+`WIRE_ELEMENT_BYTES` in tools/gen_gl44_transport.py declares it once and both
+ends size from it. **Any array of a pointer-sized type crossing this transport
+needs that treatment** -- `sizeof()` on either side is the bug.
