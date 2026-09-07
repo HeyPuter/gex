@@ -20765,3 +20765,50 @@ the fragment group's image loop carries stand-ins for incomplete textures and
 format-class reinterpretation, and that wants making stage-generic rather than
 duplicated. `gex_wgpu_stage_image_view` is already stage-generic and is what
 the vertex *capture* path uses, so it is the right seam.
+
+### Fixed: the vertex group binds a read-only image
+
+The refusal above is gone; the binding exists now. Four things, and the two
+easy-to-miss ones are not the loop:
+
+1. `vertex_group_count` counts `ctx->vs->image_count`.
+2. **Both vertex arrays grew** -- `vertex_layout_entries` and the vertex bind
+   group's `entries` -- from `1 + MAX_SHADER_IMAGES` (packed only) to
+   `3 * MAX_SHADER_IMAGES`, the same reasoning the fragment array already
+   carries: an image is plain or packed, never both, but a packed one takes two
+   bindings. Overrunning those is a **stack overrun, not a validation error**,
+   so it would not have announced itself.
+3. The **draw-params index shifted by `image_count` at both sites**, layout and
+   entries. Missing one silently overlaps two bindings.
+4. A layout entry and a view per image. The layout entry is a **sampled
+   texture**, not a storage one, because Tint lowers a read-only storage image
+   to a plain `texture_2d<T>`; a storage layout against it is rejected by name.
+
+`gex_wgpu_readonly_image_view` is the view half, and it is deliberately a new
+helper rather than a refactor of the fragment loop. Read-only reaches a subset
+of what that loop does -- a stand-in for an incomplete texture, a format-class
+alias, and a view at the *sampled* format -- and the parts it skips are the
+expensive ones: a writable image's storage view, and the
+`gex_wgpu_image_also_sampled` feedback alias, which is gated on
+`access != ReadOnly` and cannot fire. Lifting the subset out leaves the working
+fragment path untouched and gives the next stage that needs one something to
+call.
+
+A non-read-only image reaching that loop is declined by name. It should not
+happen -- WebGPU forbids it outright -- and Dawn would only say the pipeline is
+invalid.
+
+**Measured.** `gl44-vertex-image-read` was written first and confirmed to
+reproduce (llvmpipe `191,0,0`, gex_wgpu `0,255,0` -- the green clear showing
+through -- with the refusal by name). After the fix both give `191,0,0,255`,
+natively and in the browser, and its two reported `gap:` lines are assertions
+again.
+
+- `es_31_compatibility` **291/355 -> 293/355**, failures 8 -> 6.
+- `advanced-memory-order-vsfs` and `advanced-sync-imageAccess`, the two cases
+  that had been read as memory-ordering bugs, both pass.
+- probe suite 168 OK of 175 with the same seven expected; CTS gate at every
+  baseline; browser `ssbo` 7/7 and `image` 15/15.
+- The draw path is shared by everything, so: native STK a real scene
+  (meangray 67, stdev 17), Blender identical at mean 61 / 336 colours, Krita
+  `panels_rmse=0`, browser STK 59.70 FPS at 99.50% fresh.

@@ -16,8 +16,9 @@
  *   a BindGroupLayout for this index  - While validating vertex stage
  *
  * -- and an invalid pipeline poisons the command buffer it is set on, so the
- * whole draw disappears with no GL error at all. The driver declines it by
- * name now, which is the honest version of the same outcome rather than a fix.
+ * whole draw disappears with no GL error at all. **Fixed**: the vertex group
+ * counts and binds a read-only image now, as a sampled texture, which is what
+ * Tint lowers one to.
  *
  * KHR-GL45.es_31_compatibility.shader_image_load_store.advanced-memory-order-vsfs
  * and .advanced-sync-imageAccess are both this, arrived at less directly: the
@@ -115,20 +116,12 @@ int main(void) {
     drain();
     fprintf(stderr, "INFO centre pixel %u,%u,%u,%u (green means the draw was "
             "lost)\n", px[0], px[1], px[2], px[3]);
-    /* Reported, not asserted, while the driver declines this by name.
-       Asserting would pass on llvmpipe and fail on gex_wgpu, which is a
-       permanently red gate for a gap that is already written down -- and a
-       probe that fails for a known missing feature stops working as a
-       regression gate for everything else in it. Promote both to eq() with
-       the fix; the numbers below are what the fix has to produce.
-
-       0.75 * 255 = 191, and the green clear must be gone. */
-    fprintf(stderr, "INFO %-30s red=%u want 180..202%s\n",
-            "gap:vertex_read_reached_fs", px[0],
-            (px[0] > 180 && px[0] < 202) ? "" : "   <-- not arriving");
-    fprintf(stderr, "INFO %-30s green=%u want <60%s\n",
-            "gap:draw_was_not_lost", px[1],
-            px[1] < 60 ? "" : "   <-- the clear is showing through");
+    /* 0.75 * 255 = 191, and the green clear must be gone. These were
+       reported rather than asserted while the driver declined this by name;
+       they are assertions now that the vertex group binds a read-only image.
+       A lost draw leaves the clear, so the pixel is the assertion. */
+    eq("vertex_read_reached_fragment", px[0] > 180 && px[0] < 202, 1);
+    eq("draw_was_not_lost", px[1] < 60, 1);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n",
            cases, passed, cases - passed);
