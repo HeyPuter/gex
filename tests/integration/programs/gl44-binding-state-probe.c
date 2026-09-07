@@ -193,6 +193,49 @@ int main(void) {
     glGetVertexAttribiv(8, 0x8625, &value);
     eq("attrib_integer_type", value, 0x1404 /* GL_INT */);
 
+    /* A fresh vertex array object must start at the defaults, even when the
+     * one before it was configured and deleted.
+     *
+     * This is what the bisection of basic-state4 points at: that case passes
+     * alone and fails once basic-state1..3 have run, with no error latched
+     * anywhere, so something an earlier case set is still visible. Each of
+     * those cases generates a VAO in Setup, configures it, and deletes it in
+     * Cleanup -- and the host's GL is free to hand the same name back for the
+     * next one. If a new object were to inherit the old one's state, every
+     * later case would read leftovers while passing in isolation, which is
+     * exactly the shape observed. */
+    GLuint first = 0; glGenVertexArrays(1, &first);
+    glBindVertexArray(first);
+    glBindVertexBuffer(3, buf, 64, 24);
+    glVertexAttribFormat(9, 2, GL_FLOAT, GL_TRUE, 8);
+    glVertexAttribBinding(9, 3);
+    glVertexBindingDivisor(3, 11);
+    glEnableVertexAttribArray(9);
+    eq("first_vao_configured", drain(), GL_NO_ERROR);
+    glBindVertexArray(0);
+    glDeleteVertexArrays(1, &first);
+    drain();
+
+    GLuint second = 0; glGenVertexArrays(1, &second);
+    glBindVertexArray(second);
+    eq("second_vao_is_clean", drain(), GL_NO_ERROR);
+    glGetVertexAttribiv(9, 0x82D4 /* GL_VERTEX_ATTRIB_BINDING */, &value);
+    eq("fresh_vao_default_binding", value, 9);
+    glGetVertexAttribiv(9, 0x88FE /* ..._ARRAY_DIVISOR */, &value);
+    eq("fresh_vao_default_divisor", value, 0);
+    glGetVertexAttribiv(9, 0x8622 /* ..._ARRAY_ENABLED */, &value);
+    eq("fresh_vao_default_enabled", value, 0);
+    glGetVertexAttribiv(9, 0x8623 /* ..._ARRAY_SIZE */, &value);
+    eq("fresh_vao_default_size", value, 4);
+    glGetVertexAttribiv(9, 0x886A /* ..._ARRAY_NORMALIZED */, &value);
+    eq("fresh_vao_default_normalized", value, 0);
+    glGetVertexAttribiv(9, 0x82D5 /* ..._RELATIVE_OFFSET */, &value);
+    eq("fresh_vao_default_relative_offset", value, 0);
+    glGetIntegeri_v(0x82D6 /* GL_VERTEX_BINDING_DIVISOR */, 3, &value);
+    eq("fresh_vao_default_binding_divisor", value, 0);
+    glGetIntegeri_v(0x8F4F /* GL_VERTEX_BINDING_BUFFER */, 3, &value);
+    eq("fresh_vao_default_binding_buffer", value, 0);
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

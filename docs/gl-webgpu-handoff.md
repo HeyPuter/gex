@@ -19010,9 +19010,21 @@ behind -- and note it is not the 64-bit `basic-inputL-*` failures, which the
 `gl44-binding-state-probe` now covers all sixteen pnames the case verifies --
 every `GL_VERTEX_ATTRIB_ARRAY_*`, `GL_VERTEX_ATTRIB_BINDING`,
 `GL_VERTEX_ATTRIB_RELATIVE_OFFSET` and all four `GL_VERTEX_BINDING_*` -- plus
-the divisor aliasing, at several indices. **31/31 against the reference and
-31/31 in the browser.** The state round-trips correctly, so a future attempt
-should not start there.
+the divisor aliasing, at several indices, **and the VAO lifecycle**: configure
+a vertex array object, delete it, generate another, and check that the new one
+starts at the defaults, since the host's GL is free to hand back the same name.
+**41/41 against the reference and 41/41 in the browser.**
+
+So seven hypotheses are eliminated: not any of the sixteen pnames, not the
+divisor aliasing, not a latched error, not state leaking from a deleted VAO
+into a fresh one, and not the 64-bit `inputL` failures. A future attempt should
+start from what basic-state1..3 *do* that this probe does not replicate --
+they configure many indices and use `glVertexAttribPointer` rather than
+`glVertexAttribFormat` -- and from surfacing the browser-side QPA log, which
+carries the CTS's own message naming the mismatched field and which the harness
+does not currently echo. That last piece of tooling is probably worth more than
+this one case: every silent CTS failure in the browser is currently a "Fail"
+with the reason discarded.
 
 One asymmetry the probe pins down, because expecting otherwise failed against
 the reference before it ever reached the browser: an attribute's
