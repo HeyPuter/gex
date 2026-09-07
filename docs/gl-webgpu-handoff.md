@@ -19825,7 +19825,7 @@ are features with a shape, and the rest are walls.
 | case(s) | cause | shape of the work |
 |---|---|---|
 | `early-fragment-tests`, `basic-glsl-earlyFragTests` | WGSL cannot express `EarlyFragmentTests`; Tint drops the SPIR-V mode | wall |
-| `advanced-sync-imageAccess`, `advanced-sso-atomicCounters` | unformatted `writeonly imageBuffer` in a vertex shader | move the vertex packed-image lowering into a per-draw variant keyed on the resolved format |
+| `advanced-sync-imageAccess`, `advanced-sso-atomicCounters`, `advanced-sync-bufferUpdate`, `advanced-sync-drawIndirect` | unformatted `writeonly imageBuffer` in a vertex shader — **four** cases, not two | move the vertex packed-image lowering into a per-draw variant keyed on the resolved format |
 | `non-layered_binding` | a slice of a **3D** texture as a non-layered `image2D`; WebGPU has no 2D view of a 3D slice | rewrite `image2D` to `image3D` with the bound layer as a constant z, as other image shapes already are |
 | `multiple-uniforms` | the packed route costs one storage binding per image, plus two writable bindings over one buffer | consolidate every packed image into one buffer addressed by the existing per-slot header — which answers both halves |
 | `advanced-sync-bufferUpdate`, `advanced-sync-drawIndirect`, `advanced-memory-order`, `advanced-sso-subroutine`, `single-byte_data_alignment` | not yet diagnosed | — |
@@ -19856,3 +19856,41 @@ Until then the refusal at least names itself, which it did not before -- an
 application saw only "cannot serve an image in the vertex stage" while the
 specific line went to stderr, where nobody reading a *shader compile failure*
 is looking.
+
+### The vertex group carried no packed images at all
+
+Found while diagnosing the above, and independent of it. A vertex shader
+*reading* an `imageBuffer` rendered **nothing**, with `glGetError` clean:
+
+```
+No bind group set at group index 1
+```
+
+WGSL has no buffer storage texture, so an `imageBuffer` is served through a
+storage buffer the shader addresses itself. The fragment group carried bindings
+for those; the vertex group's entry count was uniform blocks, storage blocks,
+buffer textures and the draw parameters, so a shader whose only such binding
+was a packed image asked for a group that was never created. Mirrored from the
+fragment side — one shared read-only header plus one data binding per image,
+after the buffer textures, with the draw parameters' index shifted past them.
+Read-only on both counts, because WGSL forbids a writable storage binding in
+the vertex stage, which is also why only the *read* ever needs binding here: a
+written image's store is stripped from the rasterising copy and performed by a
+compute clone.
+
+`shader_image_load_store` native 35/51 → 36/51, browser 38/51 → 39/51.
+
+**How it was found is the transferable part.** I was part-way through the
+unformatted-imageBuffer work and had lifted its create-time refusal, and the
+draw then produced `Binding doesn't exist in [BindGroupLayoutInternal]`. The
+obvious reading is that my change caused it. It had not: the same errors were
+in the log from *before* the change, belonging to a different program in the
+same test — one with a *formatted* read-only `imageBuffer`. Checking whether a
+symptom predates your change is cheap and it decided the whole direction here;
+without it I would have reverted a sound change and missed a live bug behind
+it.
+
+That unformatted work is reverted for now and remains as described above: it
+needs the packed lowering moved into a per-draw variant, and there is no safe
+partial step, because clearing the refusal alone would pack with a `NONE`
+format instead of failing.
