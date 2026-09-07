@@ -28,7 +28,7 @@ GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 # (tests/graphics-in-browser.sh and the virgl/wayland demos).
 node "$ROOT/web/test/drive.mjs" supertuxkart \
     --query "gl=${GEX_STK_GL:-mesa}" --cmd "$STK_RACE" \
-    --display-fps 55 --display-samples 15 \
+    --display-fps 55 --display-samples "${GEX_STK_SAMPLES:-15}" \
     --wall "${GEX_STK_WALL:-90}" --idle "${GEX_STK_IDLE:-90}" | tee "$LOG"
 
 TIMING=$(grep 'Present timing (' "$LOG" | tail -n 1 || true)
