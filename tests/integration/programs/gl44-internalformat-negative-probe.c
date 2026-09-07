@@ -23,9 +23,19 @@
  * command queued behind it -- and removing it exposed this.
  *
  * The stock system Mesa still has the bug, so this probe has no usable native
- * reference: the reference run segfaults and produces no SUMMARY at all. Gate
- * it with GEX_PROBE_EXPECT, the mechanism gl44-probe.sh already documents for
- * probes whose reference is the thing that fails:
+ * reference: the reference run segfaults and produces no SUMMARY at all.
+ *
+ * tests/gates/probe-suite.sh therefore reports it, correctly and permanently,
+ * as:
+ *
+ *   internalformat-negative DIFF ref=[] gex=[SUMMARY cases=2 passed=2 failed=0]
+ *
+ * That is not noise to be tidied away -- it is the finding. An empty reference
+ * beside a passing driver says the driver survives what the reference does
+ * not. Leave it until the fix reaches a released Mesa.
+ *
+ * For gl44-probe.sh, gate it with GEX_PROBE_EXPECT, the mechanism that script
+ * already documents for probes whose reference is the thing that fails:
  *
  *   GEX_PROBE_EXPECT='SUMMARY cases=2 passed=2 failed=0' \
  *       tests/gl44-probe.sh internalformat-negative
@@ -33,6 +43,7 @@
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
 #include <GL/glcorearb.h>
+#include "gl-procs.h"
 #include <stdio.h>
 
 static int cases, passed;
@@ -63,6 +74,13 @@ int main(void) {
     EGLSurface s = eglCreatePbufferSurface(d, c, sa);
     if (!x || !s || !eglMakeCurrent(d, s, s, x)) return 3;
     fprintf(stderr, "INFO version=%s\n", (const char *)glGetString(GL_VERSION));
+    /* Resolved rather than linked: glGetInternalformati64v is not in Mesa's
+       non-glvnd libGL, so linking it directly made this probe UNLINKABLE
+       against our own build -- the one that has the fix. */
+    if (gex_load_procs() != 0) {
+        printf("SUMMARY cases=0 passed=0 failed=0\n");
+        return 3;
+    }
     drain();
 
     /* Surviving the call at all is the first case. A canary either side of the
