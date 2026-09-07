@@ -20677,3 +20677,50 @@ Gates: probe suite 166 OK of 173 with the same seven expected, CTS gate at
 every baseline, native STK unchanged (meangray 67, stdev 17, 460 colours),
 Krita OK with panels_rmse=0, browser ssbo 7/7 and ubo-min-offset 3/3, browser
 STK 59.90 FPS at 99.67% fresh with no rAF misses.
+
+### Both "memory order" failures are one missing binding
+
+Earlier in this document I recorded `advanced-sync-imageAccess` and
+`advanced-memory-order-vsfs` as correctness bugs "about coherent and memory
+ordering, which is where this driver's structure is most likely to disagree
+with GL". **That was wrong, and wrong in an instructive way**: they are the
+same missing bind group entry, and they looked like a memory-model problem
+because the answer was not wrong, it was *absent*.
+
+Dawn says it plainly once the error is read rather than the symptom:
+
+    The entry-point uses bindings in group 1 but [PipelineLayout] doesn't have
+    a BindGroupLayout for this index
+      - While validating vertex stage
+
+`vertex_group_count` counts uniform blocks, storage blocks, buffer textures and
+packed images -- and **not `image_count`**, which the fragment group does
+count. So a vertex shader still holding a storage-texture image after
+`gex_wgpu_strip_storage_writes` has removed its stores gets no entry for it,
+while the module it compiled to still declares one. Pipeline creation fails,
+and an invalid pipeline **poisons the command buffer it is set on**, so the
+whole draw disappears with no GL error at all. Measured directly:
+
+    vs group=0 (ubo 0 ssbo 0 buftex 0 packed 0 images 1 drawparams 0)
+
+Two lessons worth separating. The first is the one this driver keeps relearning:
+**read the validation error, not the symptom** -- a wrong answer with no error
+is usually an invalid WebGPU object, and a whole missing draw reads as anything
+you like. The second is that a probe reproducing what the test *appears* to
+test proves nothing: `gl44-image-selfread` asks whether an invocation reads
+back its own image store, in both a storage texture and a buffer image, and
+passes 4/4 on gex_wgpu and on llvmpipe. The intra-invocation guarantee was
+never broken.
+
+**What is committed is a named refusal, not the fix.** Any
+`vs->image_count > 0` is broken today -- the layout never provides that binding
+-- so declining by name cannot regress anything, and it converts a silently
+lost draw into one that says why. The es_31 family is unchanged at 291/355,
+probe suite 167 OK with the same seven expected, CTS gate at every baseline.
+
+The fix is to bind them. After the strip the image is read-only, which Tint
+lowers to a **sampled texture**, so the binding is a plain texture view -- but
+the fragment group's image loop carries stand-ins for incomplete textures and
+format-class reinterpretation, and that wants making stage-generic rather than
+duplicated. `gex_wgpu_stage_image_view` is already stage-generic and is what
+the vertex *capture* path uses, so it is the right seam.
