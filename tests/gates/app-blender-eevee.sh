@@ -1,9 +1,32 @@
 #!/bin/sh
 # Blender with the viewport in RENDERED shading (EEVEE), splash dismissed.
-#   blender-eevee.sh <out.png> [settle]  -- driver env from the caller
+#   blender-eevee.sh <out.png> [settle]
 set -u
 out=$1; settle=${2:-45}
 export DISPLAY=${DISPLAY:-:78}
+# The driver, chosen here rather than inherited. This gate used to take the
+# environment from its caller, which reads as a convenience and is a trap:
+# running it directly measures whatever the system libGL points at -- on this
+# machine radeonsi, the real GPU driver -- and produces a perfect Blender
+# screenshot that says nothing about gex_wgpu. It cost two "Blender renders
+# correctly" claims that were about the wrong driver entirely, and the tell was
+# there to be noticed: a driver change that leaves the output byte-identical
+# has probably not been exercised.
+#
+# GEX_REF=1 runs llvmpipe instead, for a reference shot.
+INST=${GEX_INST:-/tmp/gex-mesa-native/inst}
+if [ "${GEX_REF:-0}" = 1 ]; then
+  export LIBGL_ALWAYS_SOFTWARE=1
+  unset LD_LIBRARY_PATH LIBGL_DRIVERS_PATH GALLIUM_DRIVER
+else
+  export LD_LIBRARY_PATH=$INST/lib:$HOME/.cache/gex-dawn-native/pkg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+  export LIBGL_DRIVERS_PATH=$INST/lib/dri
+  export LIBGL_ALWAYS_SOFTWARE=1
+  export GALLIUM_DRIVER=${GALLIUM_DRIVER:-gex_wgpu}
+fi
+# And say so. A gate that reports only image statistics cannot be told apart
+# from the same gate run against the wrong driver.
+echo "driver: $(glxinfo -B 2>/dev/null | sed -n 's/^OpenGL renderer string: //p' | head -1)"
 python3 "$(dirname "$0")/killmatch.py" blender >/dev/null 2>&1
 sleep 2
 EXPR='import bpy
