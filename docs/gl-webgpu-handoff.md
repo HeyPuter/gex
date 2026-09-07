@@ -20721,9 +20721,22 @@ Dawn says it plainly once the error is read rather than the symptom:
 
 `vertex_group_count` counts uniform blocks, storage blocks, buffer textures and
 packed images -- and **not `image_count`**, which the fragment group does
-count. So a vertex shader still holding a storage-texture image after
-`gex_wgpu_strip_storage_writes` has removed its stores gets no entry for it,
-while the module it compiled to still declares one. Pipeline creation fails,
+count. **That omission is deliberate and correct for a written image**, which
+is the part worth getting right: the design is that a vertex shader's image
+variables are *removed* from the rasterising copy rather than marked read-only,
+because the declaration itself is what Tint refuses, and the store rides the
+compute dispatch. So `image_count` is meant to be zero there.
+
+**The gap is narrower: removal only works if the image is dead.** A vertex
+shader that also *reads* its image leaves it live after
+`gex_wgpu_strip_storage_writes` has removed the stores, so it cannot be
+removed, stays declared in the rasterising copy, and then needs a read-only
+binding nothing provides. Both failing cases are reads --
+`advanced-memory-order-vsfs` does an `imageLoad` after its stores, and
+`advanced-sync-imageAccess`'s second draw declares `readonly imageBuffer`. A
+**write-only** vertex image works today, and the section on images in every
+stage should be read as "written vertex images work" rather than "the vertex
+stage works". Pipeline creation fails,
 and an invalid pipeline **poisons the command buffer it is set on**, so the
 whole draw disappears with no GL error at all. Measured directly:
 
@@ -20744,8 +20757,10 @@ never broken.
 lost draw into one that says why. The es_31 family is unchanged at 291/355,
 probe suite 167 OK with the same seven expected, CTS gate at every baseline.
 
-The fix is to bind them. After the strip the image is read-only, which Tint
-lowers to a **sampled texture**, so the binding is a plain texture view -- but
+The fix is to bind the *read* ones -- read-only is the single access mode WGSL
+allows in the vertex stage, and it is what the surviving image is, so the
+write-only path needs no change. Tint lowers a read-only storage image to a
+**sampled texture**, so the binding is a plain texture view -- but
 the fragment group's image loop carries stand-ins for incomplete textures and
 format-class reinterpretation, and that wants making stage-generic rather than
 duplicated. `gex_wgpu_stage_image_view` is already stage-generic and is what
