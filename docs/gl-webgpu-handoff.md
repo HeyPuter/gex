@@ -19242,12 +19242,23 @@ and 4, and a plain block declared at binding 6 must keep 6, unshifted by the
 array. **5/5 against the reference and 5/5 in the browser.**
 
 So the assignment is right and the failure is elsewhere in that case. The
-narrowed hypothesis: it is a `GLSLTestBase`, and its source carries
+hypothesis was that it is a `GLSLTestBase` whose source carries
 `layout(local_size_x = 1 ...)`, `layout(points) in` and `layout(vertices = 1)
 out` -- it runs the same block array through **every** shader stage, including
-geometry and tessellation, which this driver emulates as compute. A probe for
-it needs a block array with an explicit binding inside an emulated stage,
-which is a different and larger test than the one committed here.
+geometry and tessellation, which this driver emulates as compute.
+
+`gl44-gs-block-array-probe` tested that: a three-element block array at
+`binding = 2` read from a *geometry* shader, checking both that the bindings
+are still assigned correctly with a geometry stage in the program and that the
+data arrives. The values are 1, 2 and 3 weighted 1, 2 and 4, so a red channel
+of 17 means all three were read in the right order, 0 means the stage could not
+reach them, and anything else names which one went wrong. **6/6 against the
+reference and 6/6 in the browser**, including the 17.
+
+So the emulated geometry stage handles block arrays correctly too, and that
+hypothesis is gone. What is left of the stage theory is tessellation and
+compute, which the same case also covers. Ten hypotheses eliminated across
+these four cases.
 
 Nine hypotheses are now eliminated across these four cases and each elimination
 is recorded, which is the whole point: the next attempt starts from a short
