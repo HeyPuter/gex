@@ -21251,3 +21251,59 @@ mitigations (a VRAM guard, a kernel watchdog, a software adapter) were all
 containment. They are worth keeping -- the cheap regression detector is the
 `host memory --` line under `GEX_WGPU_PRESENT_LOG=1`, whose buffer count
 climbing is the whole signal and needs no instrumentation to read.
+
+## A format-less imageBuffer, resolved per draw (2026-09-07)
+
+`writeonly uniform imageBuffer` with no format qualifier used to fail to link
+in the vertex stage. **`KHR-GL45.shader_image_load_store` 36/51 -> 39/51**
+native -- three cases where the refusal named two, so it was blocking more
+than it said.
+
+`gex_wgpu_image_is_packed` took buffer images "whatever its format and however
+it is accessed", by its own comment, and then gated on
+`format != PIPE_FORMAT_NONE`. That declined the one shape with nowhere else to
+go: WebGPU has no texel buffer at all, so a buffer image has no sampled
+fallback, and an *unformatted* one has less alternative than a formatted one
+rather than more. GLSL permits the qualifier to be absent only on a write-only
+image, and GL says the store then converts to the image **unit's** format --
+so the format is not unknown, only not known yet.
+
+**Why it could not simply be allowed, and why two earlier attempts were
+reverted.** The packed lowering runs at shader-create against the *recorded*
+format, and the pack math is chosen by that format. Lowering against `NONE`
+therefore wrote a wrong answer where the refusal had at least been honest --
+every texel to word zero. A silent wrong picture is worse than a refusal, which
+is the same judgement as in "crashes hide behind close enough".
+
+So the lowering moves, **for these shaders only**, into
+`gex_wgpu_capture_variant_get` -- which has a `ctx` and therefore the image
+units -- and the resolved formats join the variant's key, because a module
+lowered for one packing cannot serve another. `gex_wgpu_capture_dispatch` binds
+with `variant->packed_resolved[i]` instead of the recorded `NONE`, so the
+shader's packing and the copy-back's unpacking agree on one layout.
+
+**The property that made this safe where two attempts had failed:** everything
+with a known format stays on the create-time path untouched. The deferral is
+gated on a new `packed_unformatted` mask, and for a shader with no packed
+images the added key compares zero against zero. The blast radius is exactly
+the set of shaders refused outright before, so nothing that worked could
+change -- confirmed by `cull_distance` at 202/218 with zero failures, the
+largest user of the same capture path.
+
+**Two notes of my own were stale here and cost an hour.** The handoff recorded
+that `gex_wgpu_capture_dispatch` "never binds the packed image" and puzzled
+over the absence of a Dawn error for the mismatch. It *does* bind them, header
+and data halves -- that landed with the vertex-group packed-image fix -- so
+there was no mismatch and nothing to complain about. **Re-read the code before
+trusting a note that describes it**: this one aged out silently when the
+neighbouring fix landed. The measurement that actually moved things was the
+cheap one -- lift the guard in a throwaway build and print whether the dispatch
+runs at all. It did, on the first draw, with `capture_images.count=0
+packed_count=1`, which said the classification was already right and only the
+format was missing.
+
+**What it did not fix.** The sibling `advanced-sso-atomicCounters` now reaches a
+*different*, pre-existing refusal: a vertex shader that uses the **result** of
+an image atomic, which the rasterising copy cannot perform. Lifting one refusal
+moves the failure to the next one, which is the expected shape and is the
+separate vertex-atomic gap.
