@@ -19567,3 +19567,67 @@ And the CTS's own comparison message streams `unsigned char` values into its
 log, so they arrive as raw bytes and the XML truncates at the first NUL:
 `Rendered data [` and nothing else. Read those with `od`. It also prints layer
 *zero's* expected values whichever layer failed, so it names the wrong one.
+
+### The computed gl_Layer defect: it was never about the layer
+
+Fixed, and the diagnosis I recorded in the section above was wrong in the way
+that matters. The primitives always drew, in the right place. What failed was
+the **varying**: everything declared after `gl_Layer` arrived as zeroes, and
+since the CTS's varyings there are integer "which layer am I" values, that
+reads as layer zero everywhere.
+
+One experiment settled it and should have been the first: a fragment shader
+that *ignores* the varying and writes a constant drew the triangle correctly.
+"Nothing is drawn" and "the colour is wrong" look identical when the colour
+comes from the thing that is broken.
+
+**The cause.** The rasterizing pass's two halves were numbered differently. The
+caller builds the vertex layout by walking the geometry shader's output list,
+skipping the slots the passthrough does not forward, numbering what remains
+consecutively while keeping each one's original byte offset.
+`gex_wgpu_gs_passthrough_nir` declared each input's `driver_location` as the
+**original** slot index. An input binds to an element by driver_location, so
+with outputs `[POS, LAYER, VAR0]` and the layer skipped, the layout held two
+elements and VAR0 asked for element 2 — which nothing feeds. Correct only while
+nothing was skipped, and broken for every slot after the first skip. The
+clip/cull upper half carried the same line.
+
+The predicate is the subtle part: the mapping is built over `skip` alone,
+exactly as the layout loop is. `clip1` is not in `skip`, so it still consumes
+an element index despite declaring no input of its own; leaving that index
+unconsumed is harmless, whereas renumbering past it would put every later slot
+back out of step.
+
+`KHR-GL44.geometry_shader` 130 → **133/136**, all three `layered_rendering`
+cases, and `gl44-gs-dynamic-layer-probe` leaves the probe suite's known non-OK
+list — which is back to seven entries, none of them a defect in this driver.
+
+`GEX_WGPU_GS_LOG=2` was added along the way and is what turned the search: it
+dumps the captured indices and vertex slots, showing the positions were right
+and that the failing shader had *three* output slots where the passing ones had
+two. Captured integer varyings print as ~0.00 when read as floats, so a small
+int looks like zero either way — read the slot count, not the values.
+
+## Where the native CTS stands
+
+Measured 2026-09-07 across sixteen families, fifty failures in total:
+
+| family | pass | fail | note |
+|---|---|---|---|
+| shader_image_load_store | 35 | 14 | mostly the storage-format wall |
+| sample_variables | 125 | 9 | all rgba32f at one sample |
+| texture_view | 3 | 4 | all the multisample-array wall |
+| compute_shader | 38 | 4 | |
+| shader_storage_buffer_object | 120 | 4 | |
+| vertex_attrib_binding | 26 | 4 | 64-bit attributes among them |
+| shader_atomic_counters | 27 | 3 | |
+| program_interface_query | 41 | 2 | |
+| shading_language_420pack | 327 | 2 | equal to the browser |
+| transform_feedback | 19 | 2 | |
+| gpu_shader5 | 21 | 1 | |
+| shader_subroutine | 27 | 1 | |
+| texture_gather, explicit_uniform_location, buffer_storage, cull_distance | 334 | 0 | clean |
+
+Of those fifty, eighteen are known platform walls (the storage formats and the
+multisample array). `geometry_shader` is not in this list's family set and sits
+at 133/136.
