@@ -21469,3 +21469,56 @@ worth more if it also retires the `buftex_words` key.
 and a half-done version -- a collector that records buffer textures nothing
 then lowers -- would trade a clear link error for a Tint rejection further
 away from the cause.
+
+## 64-bit vertex attributes: what the easy-looking route actually costs
+
+Three of `vertex_attrib_binding`'s four failures are `Tint rejected SPIR-V:
+unhandled float width: 64` -- `basic-inputL-case2`, `basic-inputI-case2` and
+`advanced-bindingUpdate`. This looked like the cheapest item on the list and is
+not; the analysis is here so it is not re-derived.
+
+**The good news first, because it removes the hazard I expected.** Mesa
+distinguishes the two GL forms **by pipe format**, in
+`src/mesa/main/varray.c`'s two tables:
+
+- `glVertexAttribPointer(..., GL_DOUBLE, ...)` -> `PIPE_FORMAT_R64*_FLOAT`
+  (the data is double, the shader input is float, GL converts);
+- `glVertexAttribLPointer` / `glVertexAttribLFormat` -> `PIPE_FORMAT_R64*_UINT`
+  ("real double", the shader input is a `dvec`).
+
+So the driver can tell them apart from the element format alone -- no shader
+knowledge, no new variant key. I had assumed the opposite and that assumption
+was the main reason this looked risky.
+
+**The machinery is already here, too.** Exotic vertex formats are fetched raw
+and unpacked in the vertex shader: `gex_wgpu_vertex_unpack_kind` classifies the
+format, `ve->unpack[]` carries a kind per attribute, `gex_wgpu_variant`'s key
+compares `attrib_unpack` by `memcmp`, and
+`gex_wgpu_lower_vertex_attrib_unpack` rewrites the loads. Seven of the eight
+`ARB_vertex_type_2_10_10_10_rev` formats and `R11G11B10F` already go through
+it. Adding `R64` kinds is the obvious extension.
+
+**What stops it is arithmetic, not architecture.** A WebGPU vertex attribute is
+at most 16 bytes. `dvec1`/`dvec2` fit (`Uint32x2`, `Uint32x4`) and would drop
+straight into the unpack mechanism. **`dvec3` and `dvec4` are 24 and 32 bytes**
+and need **two** attributes each -- which the one-kind-per-attribute model does
+not express, and which means synthesizing extra `pipe_vertex_element`s and
+renumbering the shader's locations.
+
+And the cases need exactly that. From
+`gl4cVertexAttribBindingTests.cpp`:
+
+    layout(location = 0) in dvec4 vs_in_attrib[8];
+    glVertexAttribLFormat(0, 4, GL_DOUBLE, 0);
+
+**Eight `dvec4`s is sixteen WebGPU attributes** -- precisely the guaranteed
+maximum, so the split has no headroom at all and any per-draw scratch attribute
+would push it over.
+
+**Verdict: not worth it.** Attribute splitting plus location renumbering, landing
+exactly on the 16-attribute limit, for three CTS cases and no real-world
+demand: fp64 *vertex attributes* are rare even in CAD, which computes in double
+and uploads float, and FreeCAD already renders here. If it is ever wanted, serve
+`dvec1`/`dvec2` through the existing unpack kinds and **decline 3- and
+4-component doubles by name** -- that is exact for what it serves and honest
+about the rest, rather than a partial split that silently reads the wrong words.
