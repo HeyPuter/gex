@@ -18937,24 +18937,49 @@ because such a program does not link today; an ordinary pipeline stays one
 variant. KHR-GL44.cull_distance went from **16 Tint rejections to 0**, native
 and browser both, and its shaders link.
 
-**Its eight `max_culldist_*` cases still fail, on values, and the cause is
-known.** `gex_wgpu_neutralise_cull_distances` runs "after both clones and
-before the module and its variants" and overwrites the cull components with
-1.0 so the rasteriser will not clip on them. The carriers are emitted in an
-interp variant cloned from that already-neutralised shader, so the fragment
-stage reads real clip distances and **1.0 for every cull distance**.
+**And the values, which took a second attempt.** The eight `max_culldist_*`
+cases first still failed: `gex_wgpu_neutralise_cull_distances` runs "after both
+clones and before the module and its variants", overwriting the cull components
+with 1.0 so the rasteriser will not clip on them, and the carriers were emitted
+in an interp variant cloned from that already-neutralised shader -- so the
+fragment stage read real clip distances and **1.0 for every cull distance**.
 
-**Why it is not fixed here.** The carriers would have to be emitted before
-neutralisation, which means they exist at placeholder locations through the
-whole shader-creation pipeline and must then be renumbered or stripped in
-*every* vertex module path -- base, y-flipped, wide-point, buffer-texture,
-integer-sampled and interp. Miss one and that path carries an out-of-range
-`@location` and its pipeline is rejected, in a path that works today. Against
-eight cases, with 194 cull_distance cases passing and real applications using
-clip planes by *writing* them, that is the wrong trade to make without a full
-verification run. `gex_wgpu_compile_nir` looks like a single choke point and is
-not: of its sixteen callers several are the capture path, which must keep the
-real cull values because that is what the cull is decided from.
+I judged fixing that too risky, and the judgment was right about the design I
+had in mind and wrong about the problem. Emitting the carriers earlier seemed
+to require placeholder locations fixed up in *every* vertex module path --
+base, y-flipped, wide-point, buffer-texture, integer-sampled, interp -- where
+missing one leaves an out-of-range `@location` and a rejected pipeline in a
+path that works today.
+
+**The whole risk was the coupling, and the coupling was avoidable.** The
+locations only needed the fragment shader because I assumed they did. Derived
+from *the vertex shader's own outputs* they can be chosen when it is created --
+before neutralisation, the only point where the real cull values still exist --
+and the fragment side computes the identical answer from `ctx->vs`. One answer,
+so nothing to keep in agreement, and no path needs fixing up because the
+carriers are right from the moment they exist. `KHR-GL44.cull_distance`
+**202/218 with zero failures**.
+
+That reasoning is sound because a fragment shader's inputs *are* the vertex
+shader's outputs: an input nothing produces is zeroed by
+`gex_wgpu_drop_unproduced_inputs` and needs no slot, so a location free in the
+producer is free in the consumer.
+
+**When a fix appears to need coordinated changes in six places, suspect the
+coupling before accepting the risk.**
+
+Two things checked rather than assumed. An unread carrier reaching
+`gex_wgpu_fit_varyings`, which narrows a vertex output to the fragment
+shader's declared width, is safe: it guards with `if (!target || target > 4)
+continue`, so a width of zero is skipped and the carrier stays a full vec4.
+And `gex_wgpu_compile_nir` looks like a single choke point for neutralisation
+and is not -- of its sixteen callers several are the capture path, which must
+keep the real cull values because that is what the cull is decided from.
+
+The cost is real and worth knowing: every vertex shader writing clip or cull
+distances now carries two extra vec4 outputs whether or not a fragment shader
+reads them, gated on room under the fifteen-location ceiling. With no room the
+carrier count stays zero and the fragment side declines out loud.
 
 **Two facts worth not rediscovering:**
 
