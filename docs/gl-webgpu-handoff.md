@@ -20283,3 +20283,62 @@ not natively. The native half needs
 
 and the check that costs nothing is comparing the installed library's timestamp
 against the source's before believing any native measurement.
+
+## The cache now holds what its keys name, and the epoch is gone
+
+The buffer fix above was correct and expensive. This replaces it.
+
+**Why the collision was possible at all** -- the part the earlier explanation
+was missing. `gex_wgpu_cached_bind_group`'s own comment states the invariant
+that should make handle reuse harmless:
+
+> each slot holds a reference to its own group, which holds one to everything
+> the key names -- so nothing a live slot names can be freed underneath it
+
+That is **true of native Dawn**, whose C++ objects are refcounted and whose
+bind group AddRefs its entries. It is **false of emdawnwebgpu**, and the source
+says so plainly (`library_webgpu.js`, `wgpuDeviceCreateBindGroup`): each entry
+is built with `WebGPU.getJsObject(bufferPtr)` -- it reads the JS object out and
+builds a descriptor, taking **no reference on the handle**. Handles there are
+`_malloc`'d pointers. So a release frees the pointer back to the wasm heap
+while the JS `GPUBindGroup` keeps the old resource alive, and the next object
+of that size can be malloc'd at the same pointer, match a live key byte for
+byte, and be handed a bind group bound to its predecessor.
+
+That is the whole reason the lost write was browser-only, and without it the
+next reader would follow the comment's argument and conclude the bug was
+impossible.
+
+**So make the invariant true instead of working around it.**
+`gex_wgpu_bg_entries_ref` / `_unref` take the cache's own reference to every
+buffer, sampler and view a slot's key names, and drop them when the slot is
+evicted. Native Dawn already retains internally, so the extra pair costs it
+nothing; in the browser it keeps the handle alive for exactly as long as the
+key names it, which is the entire requirement.
+
+`resource_epoch` is **removed**. With the cache retaining, a handle a live key
+names cannot be freed, so invalidating on resource destroy is unnecessary --
+and this file already measures what such invalidation costs: a comparable bump
+on eviction took the hit rate to **0.0% over 46,987,974 lookups** and cost
+Minecraft about 8% of its frame rate. Verified by measurement, not by argument:
+`gl44-ssbo-probe` is 7/7 in the browser twice **with the epoch gone**, so the
+retain is doing the work the epoch was doing. Browser STK 59.6 / 59.6 / 59.6
+FPS at 99.5 / 99.3 / 99.3% fresh -- back at baseline and far steadier than
+either epoch version, whose runs spread ten times as wide.
+
+### The view half is hardening, and did not reproduce
+
+The same reasoning says the draw path's per-draw image views were exposed: they
+are released as soon as the bind group exists, which under emdawnwebgpu frees a
+pointer a live key still names. `gl44-image-view-reuse` exists for exactly that
+-- six draws identical but for which image is bound, so the only differing part
+of the key is the view handle, asserting every texture ends up written.
+
+**It does not reproduce a failure.** Excluding views from the retain
+deliberately, so that buffers stayed protected and only views were exposed, the
+probe still passed twice. So the mechanism is real in the source but the
+pointer reuse it needs does not happen in this shape, and the view half of this
+change is **hardening rather than a demonstrated fix**. The probe is kept
+because the failure it looks for has no other symptom -- no validation error,
+no refusal, and the draw succeeds -- and because the next allocator change
+could make it live.
