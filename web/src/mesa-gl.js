@@ -158,6 +158,15 @@ export class MesaGlDevice {
         maxStorageBuffersPerShaderStage: 16,
         maxStorageBuffersInVertexStage: 16,
         maxStorageBuffersInFragmentStage: 16,
+        // Shader images. The native path asks for these in
+        // gex_wgpu_native.c and this list did not ask at all, so the browser
+        // got WebGPU's guaranteed *four* per stage where native gets eight --
+        // a limit nobody requested looking exactly like a device wall, which
+        // is the same trap the inter-stage variables were in. A test that
+        // binds an image of every target at once needs more than four.
+        maxStorageTexturesPerShaderStage: 8,
+        maxStorageTexturesInVertexStage: 8,
+        maxStorageTexturesInFragmentStage: 8,
         // Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
         // sample, so any wider attachment set fails on it -- GL 3.2 wants
         // eight draw buffers of whatever format the application chose.
