@@ -20597,3 +20597,52 @@ the fixed gate, which now prints `driver: gex WebGPU (bring-up)`: mean 61, 336
 colours, against radeonsi's 61 and 338, and the screenshot is correct in every
 detail. Near-identical numbers mean something here that they did not before --
 two *different* drivers agreeing, rather than one driver measured twice.
+
+## The first uncapped native performance number
+
+Every app gate here is vsync-capped at 60, so a 6 ms frame and a 1 ms frame
+score identically and **no regression in fixed per-frame cost can be seen at
+all**. There was no uncapped native measurement on record. `glxgears` with
+`vblank_mode=0` is the opposite instrument: 21 draws a frame, so what it
+reports is almost entirely the driver's own overhead.
+
+`tests/gates/perf-gears.sh`, on this machine:
+
+| | FPS | ms/frame |
+|---|---|---|
+| gex_wgpu | 164 | 6.11 |
+| llvmpipe | 2450 | 0.41 |
+
+**It is a relative number and not a verdict.** gex_wgpu renders on the GPU and
+copies the result back for X11 to put on screen; llvmpipe renders straight into
+CPU memory. The two are not doing the same work. What it is good for is
+watching one number over time, and the breakdown beside it:
+
+    2% of wall in draw_vbo, 18% in state calls, 44% in present
+    cache hit rate -- bind groups 100.0% (5), pipelines 100.0% (5)
+    3826 submits for 19998 batched draws;
+        broken by: gex_wgpu_buffer_unmap=2874 gex_wgpu_flush=952
+
+Read that way round, it says the interesting things at once:
+
+- **The caches are perfect** -- 100% on both, so the bind-group retain added
+  earlier costs nothing here.
+- **Draws are cheap**: 6 us each, 2% of the frame.
+- **Present is the single biggest item**, 44% -- about 2.7 ms of a 6.1 ms
+  frame. It is the GPU→CPU copy plus however long the GPU still needed, and it
+  has already been tuned once (`sched_yield` instead of `nanosleep`, which the
+  note beside it says was 43% of Minecraft's frame). Removing it properly means
+  a zero-copy path -- DRI3/dmabuf -- which the browser target does not use at
+  all, so it is a desktop-only feature of real size.
+- **Cost scales weakly with area**: 171 FPS at 100x100, 164 at 300x300, 123 at
+  800x800. So ~5.8 ms is fixed and ~3.6 ns/pixel is the copy. Optimising the
+  copy alone cannot go far.
+- **The batch breaks ~3 times a frame at `buffer_unmap`.** Do not "fix" that
+  without reading `gex_wgpu_batch_conflicts_usage` first: honouring
+  `PIPE_MAP_UNSYNCHRONIZED` there is what once collapsed SuperTuxKart's entire
+  scene to the last object drawn, and the comment explains exactly why the flag
+  cannot be trusted against a batch this driver deferred itself.
+
+**Why this matters even though every app is at 60 FPS**: 6.1 ms of a 16.7 ms
+budget is 2.7x headroom, not comfortable margin, and it is invisible to every
+other gate. This is the number to watch before it becomes a bug report.
