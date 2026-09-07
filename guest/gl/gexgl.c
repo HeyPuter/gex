@@ -2286,6 +2286,89 @@ struct vertex_attrib_state {
 static struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
 static int vertex_attrib_client_count;
 
+/* Vertex attribute arrays belong to the vertex array object, not the context.
+ *
+ * The three pieces above -- the pointers glGetVertexAttribPointerv gives back,
+ * the client-array records the draw path uploads from, and the count that says
+ * whether there are any -- were one flat set per context. GL keeps every one
+ * of them per VAO, so binding a fresh VAO used to show the last one's state:
+ * KHR-GL44.vertex_attrib_binding.basic-state4 makes a new VAO, checks that
+ * every attribute is at its default, and read
+ * `GL_VERTEX_ATTRIB_ARRAY_POINTER(0) is 640 should be 0` -- an offset left
+ * behind by the case before it. It passed alone and failed in its family,
+ * which is what that shape means.
+ *
+ * The live arrays stay the working set and are saved to and loaded from a slot
+ * on each bind, which is how the guest already handles per-context state. A
+ * demand-created list rather than a fixed table, as buffer objects are: an
+ * application may have hundreds of these and a cap would put the same bug back
+ * for whatever came last. */
+struct gexgl_vao_state {
+    unsigned name;
+    void *pointers[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+    struct vertex_attrib_state attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+    int client_count;
+    struct gexgl_vao_state *next;
+};
+static struct gexgl_vao_state *gexgl_vaos;
+static unsigned gexgl_current_vao;   /* 0 is the default VAO, which is real */
+
+static struct gexgl_vao_state *gexgl_vao(unsigned name, int create) {
+    struct gexgl_vao_state *vao = gexgl_vaos;
+    while (vao) {
+        if (vao->name == name) return vao;
+        vao = vao->next;
+    }
+    if (!create) return NULL;
+    vao = calloc(1, sizeof(*vao));
+    if (!vao) return NULL;
+    vao->name = name;   /* name 0 included: the default VAO has state too */
+    vao->next = gexgl_vaos;
+    gexgl_vaos = vao;
+    return vao;
+}
+
+static void gexgl_vao_switch_to(unsigned name) {
+    if (name == gexgl_current_vao)
+        return;
+    struct gexgl_vao_state *from = gexgl_vao(gexgl_current_vao, 1);
+    if (from) {
+        memcpy(from->pointers, vertex_attrib_pointers, sizeof(from->pointers));
+        memcpy(from->attribs, vertex_attribs, sizeof(from->attribs));
+        from->client_count = vertex_attrib_client_count;
+    }
+    struct gexgl_vao_state *to = gexgl_vao(name, 1);
+    if (to) {
+        memcpy(vertex_attrib_pointers, to->pointers,
+               sizeof(vertex_attrib_pointers));
+        memcpy(vertex_attribs, to->attribs, sizeof(vertex_attribs));
+        vertex_attrib_client_count = to->client_count;
+    } else {
+        /* The allocation failed. Defaults are the honest answer for a VAO
+           whose state could not be kept, and better than the previous one's. */
+        memset(vertex_attrib_pointers, 0, sizeof(vertex_attrib_pointers));
+        memset(vertex_attribs, 0, sizeof(vertex_attribs));
+        vertex_attrib_client_count = 0;
+    }
+    gexgl_current_vao = name;
+}
+
+static void gexgl_vao_forget(unsigned name) {
+    struct gexgl_vao_state **link = &gexgl_vaos;
+    while (*link) {
+        if ((*link)->name == name && name != 0) {
+            struct gexgl_vao_state *gone = *link;
+            *link = gone->next;
+            free(gone);
+            continue;
+        }
+        link = &(*link)->next;
+    }
+    /* GL reverts to the default VAO when the bound one is deleted. */
+    if (name == gexgl_current_vao && name != 0)
+        gexgl_vao_switch_to(0);
+}
+
 /* The fixed-function vertex arrays.
  *
  * glVertexPointer and its siblings are how every pre-VBO GL program submits
@@ -2778,8 +2861,15 @@ void glDeleteVertexArrays(int n, const unsigned *names) {
     if (!p) return;
     p[0] = (uint32_t)n;
     for (int i = 0; i < n; i++) p[1 + i] = names[i];
+    /* After the command is queued, so a failed `begin` leaves both sides
+       agreeing that nothing happened. */
+    for (int i = 0; i < n; i++) gexgl_vao_forget(names[i]);
 }
-void glBindVertexArray(unsigned name) { CMD1(GEXGL_BIND_VERTEX_ARRAY, name); }
+void glBindVertexArray(unsigned name) {
+    /* The attribute state follows the object; see gexgl_vao_switch_to. */
+    gexgl_vao_switch_to(name);
+    CMD1(GEXGL_BIND_VERTEX_ARRAY, name);
+}
 
 void glGenTextures(int n, unsigned *out) {
     uint32_t *p = begin(GEXGL_GEN_TEXTURES, 1 + (size_t)n, 0);
