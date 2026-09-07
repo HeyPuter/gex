@@ -19217,3 +19217,38 @@ second *unshared* context reaches any of it.
 The probe stays in the tree failing that one case on purpose, with
 `GEX_PROBE_EXPECT` in its header. It will move the moment either half changes
 -- up if object isolation lands, down if the state isolation regresses.
+
+## All four remaining browser-only cases log nothing
+
+`QPA-SAID` surfaces the CTS's own message for a failing case, and none of these
+four write one:
+
+    program_interface_query.invalid-value        fixed (bufSize wire)
+    shader_storage_buffer_object.basic-binding   fixed (indexed getters)
+    vertex_attrib_binding.basic-state4           logs nothing
+    buffer_storage.map_persistent_draw           logs nothing
+    shading_language_420pack.binding_uniform_block_array   logs nothing
+    transform_feedback.api_errors_test           logs nothing
+
+So the instrument does not help *these*; its value is for the next silent
+failure whose case does log, which is most of them. Worth stating plainly
+rather than counting it as a win here.
+
+### binding_uniform_block_array: the binding rule is not the problem
+
+`gl44-block-array-binding-probe` asks the rule directly -- `layout(std140,
+binding = 2) uniform GOKU { ... } goku[3]` must give its elements bindings 2, 3
+and 4, and a plain block declared at binding 6 must keep 6, unshifted by the
+array. **5/5 against the reference and 5/5 in the browser.**
+
+So the assignment is right and the failure is elsewhere in that case. The
+narrowed hypothesis: it is a `GLSLTestBase`, and its source carries
+`layout(local_size_x = 1 ...)`, `layout(points) in` and `layout(vertices = 1)
+out` -- it runs the same block array through **every** shader stage, including
+geometry and tessellation, which this driver emulates as compute. A probe for
+it needs a block array with an explicit binding inside an emulated stage,
+which is a different and larger test than the one committed here.
+
+Nine hypotheses are now eliminated across these four cases and each elimination
+is recorded, which is the whole point: the next attempt starts from a short
+list rather than the same guesses.
