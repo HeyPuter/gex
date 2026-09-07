@@ -1561,9 +1561,14 @@ int glGetProgramResourceLocationIndex(unsigned program, unsigned programInterfac
 }
 void glGetProgramResourceName(unsigned program, unsigned programInterface, unsigned index, int bufSize,
                               int *length, char *name) {
-    uint32_t *a = begin(1263, 3, 0);
+    /* bufSize travels. It used to be clamped here and never sent, and the
+       host substituted its own buffer size -- so GL never saw the caller's
+       value and a negative one, which GL_INVALID_VALUE is owed for, raised
+       nothing at all. */
+    uint32_t *a = begin(1263, 4, 0);
     if (!a) return;
     a[0] = program; a[1] = programInterface; a[2] = index;
+    a[3] = (uint32_t)bufSize;
     flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     uint32_t copy = bytes;

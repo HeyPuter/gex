@@ -1136,6 +1136,11 @@ case 1228: {
     const uint32_t components = gexgl_state_query_components(target);
     GLdouble values[4]{};
     GEX_GL_CALL(glGetDoublei_v, target, index, values);
+    if (components) {
+        GLuint named = (GLuint)values[0];
+        if (binding_query_object(target, &named))
+            values[0] = (GLdouble)named;
+    }
     put_blob(values, components * sizeof(GLdouble));
     break;
 }
@@ -1158,6 +1163,11 @@ case 1231: {
     const uint32_t components = gexgl_state_query_components(target);
     GLfloat values[4]{};
     GEX_GL_CALL(glGetFloati_v, target, index, values);
+    if (components) {
+        GLuint named = (GLuint)values[0];
+        if (binding_query_object(target, &named))
+            values[0] = (GLfloat)named;
+    }
     put_blob(values, components * sizeof(GLfloat));
     break;
 }
@@ -1389,6 +1399,7 @@ case 1262: {
 }
 case 1263: {
     GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
+    const GLsizei bufSize = a.i32();
     /* Sizing the buffer is this transport's own business, and a helper query
        it makes on its own behalf must not leave a GL error behind for the
        application to find. GL_MAX_NAME_LENGTH is invalid for the two buffer
@@ -1401,8 +1412,17 @@ case 1263: {
     if (interface != GL_ATOMIC_COUNTER_BUFFER &&
         interface != GL_TRANSFORM_FEEDBACK_BUFFER)
         glGetProgramInterfaceiv(program, interface, GL_MAX_NAME_LENGTH, &maximum);
-    std::vector<GLchar> value(std::max(maximum, 1)); GLsizei length = 0;
-    glGetProgramResourceName(program, interface, index, value.size(), &length, value.data());
+    /* The caller's bufSize, not ours. Substituting the local buffer's size
+       hid the GL_INVALID_VALUE a negative one earns -- the transport answered
+       a question the application had not asked. Bounded by the queried
+       maximum for the positive case, so a large request cannot size an
+       allocation here, and truncation below that is preserved because GL
+       never writes more than the name it has. */
+    const GLsizei room =
+        bufSize > 0 ? std::min<GLsizei>(bufSize, std::max(maximum, 1)) : 0;
+    std::vector<GLchar> value((size_t)std::max<GLsizei>(room, 1)); GLsizei length = 0;
+    glGetProgramResourceName(program, interface, index,
+                             bufSize < 0 ? bufSize : room, &length, value.data());
     put_blob(value.data(), std::max(length, 0));
     break;
 }

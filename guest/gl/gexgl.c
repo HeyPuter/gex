@@ -2645,6 +2645,30 @@ void glVertexAttribDivisor(unsigned index, unsigned divisor) {
         vertex_attribs[index].divisor = divisor;
     CMD2(GEXGL_VERTEX_ATTRIB_DIVISOR, index, divisor);
 }
+
+/* A note, because the fix that suggests itself here is wrong.
+ *
+ * The cached divisors above size a client array's upload, and only
+ * glVertexAttribDivisor maintains them. The separate-format API can change the
+ * same state -- GL defines glVertexAttribDivisor(i, d) as
+ * glVertexAttribBinding(i, i) plus glVertexBindingDivisor(i, d) -- and this
+ * side tracks no binding state, so after glVertexBindingDivisor the cache can
+ * be stale.
+ *
+ * Clearing it on those calls looks like the safe answer and is not. `needed`
+ * below is ceil(instances / divisor) for an instanced attribute, and an
+ * application that instances an attribute provides only that many elements --
+ * so uploading the full vertex count instead reads past the array it was
+ * given. Both directions are out of bounds: too large a divisor under-uploads
+ * and the draw reads past the upload, too small a one over-reads the
+ * application's own memory, and the second is the guest's address space.
+ *
+ * That hazard already exists for an attribute instanced only through
+ * glVertexBindingDivisor, where the cache reads zero today. Fixing it properly
+ * means tracking the attribute-to-binding map and the per-binding divisors on
+ * this side, so the upload is sized from what GL actually says. Not guessed
+ * at, and not "conservatively" cleared, because there is no conservative
+ * direction. */
 void glVertexAttrib4f(unsigned index, float x, float y, float z, float w) {
     uint32_t *p=begin(GEXGL_VERTEX_ATTRIB_4F,5,0); if(!p)return;
     p[0]=index; memcpy(&p[1],&x,4); memcpy(&p[2],&y,4);

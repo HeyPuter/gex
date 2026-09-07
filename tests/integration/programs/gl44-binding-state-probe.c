@@ -119,6 +119,35 @@ int main(void) {
     glGetInteger64i_v(0x8A2A /* GL_UNIFORM_BUFFER_SIZE */, 1, &wide);
     eq("ubo_size", (long long)wide, 1024);
 
+    /* The divisors, and the aliasing between the two ways to set them.
+     *
+     * GL defines glVertexAttribDivisor(i, d) as equivalent to
+     * glVertexAttribBinding(i, i) followed by glVertexBindingDivisor(i, d) --
+     * so it changes the attribute's *binding* as well as that binding's
+     * divisor, and an attribute's divisor is read *through* whichever binding
+     * it points at. KHR-GL44.vertex_attrib_binding.basic-state4 checks
+     * exactly this and fails in the browser only. The earlier cases above
+     * asked for divisor zero and so could not see it. */
+    glVertexBindingDivisor(3, 5);
+    eq("binding_divisor_set_directly", (glGetIntegeri_v(0x82D6, 3, &value),
+                                        (long long)value), 5);
+
+    glVertexAttribDivisor(4, 9);
+    glGetIntegeri_v(0x82D6 /* GL_VERTEX_BINDING_DIVISOR */, 4, &value);
+    eq("attrib_divisor_sets_binding_divisor", value, 9);
+    glGetVertexAttribiv(4, 0x88FE /* GL_VERTEX_ATTRIB_ARRAY_DIVISOR */, &value);
+    eq("attrib_divisor_reads_back", value, 9);
+    glGetVertexAttribiv(4, 0x82D4 /* GL_VERTEX_ATTRIB_BINDING */, &value);
+    eq("attrib_divisor_sets_binding", value, 4);
+
+    /* And the read-through: attribute 2 points at binding 5, so its divisor
+       is binding 5's, whoever set it. */
+    glVertexAttribBinding(2, 5);
+    glVertexBindingDivisor(5, 7);
+    drain();
+    glGetVertexAttribiv(2, 0x88FE, &value);
+    eq("attrib_divisor_follows_its_binding", value, 7);
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

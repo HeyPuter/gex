@@ -1637,9 +1637,14 @@ def _guest_function(command: dict, opcode: int) -> str:
     if name == "glGetProgramResourceName":
         return f"""void {name}(unsigned program, unsigned programInterface, unsigned index, int bufSize,
                               int *length, char *name) {{
-    uint32_t *a = begin({opcode}, 3, 0);
+    /* bufSize travels. It used to be clamped here and never sent, and the
+       host substituted its own buffer size -- so GL never saw the caller's
+       value and a negative one, which GL_INVALID_VALUE is owed for, raised
+       nothing at all. */
+    uint32_t *a = begin({opcode}, 4, 0);
     if (!a) return;
     a[0] = program; a[1] = programInterface; a[2] = index;
+    a[3] = (uint32_t)bufSize;
     flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
     uint32_t copy = bytes;
@@ -2303,6 +2308,7 @@ def host_case(command: dict, opcode: int) -> str:
     if name == "glGetProgramResourceName":
         return f"""case {opcode}: {{
     GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
+    const GLsizei bufSize = a.i32();
     /* Sizing the buffer is this transport's own business, and a helper query
        it makes on its own behalf must not leave a GL error behind for the
        application to find. GL_MAX_NAME_LENGTH is invalid for the two buffer
@@ -2315,8 +2321,17 @@ def host_case(command: dict, opcode: int) -> str:
     if (interface != GL_ATOMIC_COUNTER_BUFFER &&
         interface != GL_TRANSFORM_FEEDBACK_BUFFER)
         glGetProgramInterfaceiv(program, interface, GL_MAX_NAME_LENGTH, &maximum);
-    std::vector<GLchar> value(std::max(maximum, 1)); GLsizei length = 0;
-    glGetProgramResourceName(program, interface, index, value.size(), &length, value.data());
+    /* The caller's bufSize, not ours. Substituting the local buffer's size
+       hid the GL_INVALID_VALUE a negative one earns -- the transport answered
+       a question the application had not asked. Bounded by the queried
+       maximum for the positive case, so a large request cannot size an
+       allocation here, and truncation below that is preserved because GL
+       never writes more than the name it has. */
+    const GLsizei room =
+        bufSize > 0 ? std::min<GLsizei>(bufSize, std::max(maximum, 1)) : 0;
+    std::vector<GLchar> value((size_t)std::max<GLsizei>(room, 1)); GLsizei length = 0;
+    glGetProgramResourceName(program, interface, index,
+                             bufSize < 0 ? bufSize : room, &length, value.data());
     put_blob(value.data(), std::max(length, 0));
     break;
 }}"""
@@ -2430,15 +2445,27 @@ def host_case(command: dict, opcode: int) -> str:
         # for anything else, so it is already right, and running a boolean
         # through the name map would turn GL_TRUE into whichever object the
         # host happened to number one.
-        if name in {"glGetFloatv", "glGetDoublev", "glGetInteger64v"}:
+        # The indexed forms belong here too, and were missed when the
+        # non-indexed ones were fixed: KHR-GL44.shader_storage_buffer_object's
+        # basic-binding reads a binding through glGetIntegerv, glGetInteger64v,
+        # glGetFloatv, glGetDoublev *and* glGetBooleanv, and its CheckIndexed
+        # does the same with the indexed forms -- so glGetFloati_v and
+        # glGetDoublei_v of GL_SHADER_STORAGE_BUFFER_BINDING were handing back
+        # the host's own buffer number.
+        #
+        # The first parameter is named `pname` on the non-indexed calls and
+        # `target` on the indexed ones, so the name comes from the command.
+        if name in {"glGetFloatv", "glGetDoublev", "glGetInteger64v",
+                    "glGetFloati_v", "glGetDoublei_v"}:
             # Only when the pname actually names an object. Converting
             # unconditionally destroyed every float answer whose first
             # component was not integral -- glGetFloatv(GL_CURRENT_COLOR)
             # with red 0.25 came back 0, and GL_LINE_WIDTH 0.5 would have
             # come back 0 too. gl44-matrix-query-probe caught it.
+            state_param = command["params"][0]["name"]
             lines += ["    if (components) {",
                       "        GLuint named = (GLuint)values[0];",
-                      "        if (binding_query_object(pname, &named))",
+                      f"        if (binding_query_object({state_param}, &named))",
                       f"            values[0] = ({output_type})named;",
                       "    }"]
         # GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES is an
