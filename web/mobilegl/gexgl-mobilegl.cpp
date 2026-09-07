@@ -1611,7 +1611,7 @@ bool one(uint32_t op, Reader& a) {
     case GET_ACTIVE_SUBROUTINE_NAME:
     case GET_ACTIVE_SUBROUTINE_UNIFORM_NAME: {
         const bool uniform_name = op == GET_ACTIVE_SUBROUTINE_UNIFORM_NAME;
-        const GLuint program = lookup(programs, a.u32());
+        const GLuint program = lookup_program_or_shader(a.u32());
         const GLenum shadertype = a.u32();
         const GLuint index = a.u32();
         GLint longest = 0;
@@ -1636,7 +1636,7 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case GET_ACTIVE_SUBROUTINE_UNIFORM_IV: {
-        const GLuint program = lookup(programs, a.u32());
+        const GLuint program = lookup_program_or_shader(a.u32());
         const GLenum shadertype = a.u32();
         const GLuint index = a.u32();
         const GLenum pname = a.u32();
@@ -1732,7 +1732,7 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case GET_PROGRAM_BINARY: {
-        const GLuint program = lookup(programs, a.u32());
+        const GLuint program = lookup_program_or_shader(a.u32());
         const GLsizei bufSize = a.i32();
         GLint length = 0;
         GEX_GL_CALL(glGetProgramiv, program, GL_PROGRAM_BINARY_LENGTH, &length);
@@ -1756,7 +1756,7 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case PROGRAM_BINARY: {
-        const GLuint program = lookup(programs, a.u32());
+        const GLuint program = lookup_program_or_shader(a.u32());
         const GLenum format = a.u32();
         uint32_t bytes = 0;
         const uint8_t* wire = a.blob(bytes);
@@ -2197,13 +2197,13 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case CREATE_PROGRAM: { uint32_t g = a.u32(); programs[g] = glCreateProgram(); break; }
-    case ATTACH_SHADER: { GLuint p = lookup(programs, a.u32()); glAttachShader(p, lookup(shaders, a.u32())); break; }
-    case DETACH_SHADER: { GLuint p = lookup(programs, a.u32()); glDetachShader(p, lookup(shaders, a.u32())); break; }
-    case BIND_ATTRIB_LOCATION: { GLuint p = lookup(programs, a.u32()); GLuint i = a.u32(); std::string n = a.string(); glBindAttribLocation(p, i, n.c_str()); break; }
-    case LINK_PROGRAM: glLinkProgram(lookup(programs, a.u32())); break;
+    case ATTACH_SHADER: { GLuint p = lookup_program_or_shader(a.u32()); glAttachShader(p, lookup(shaders, a.u32())); break; }
+    case DETACH_SHADER: { GLuint p = lookup_program_or_shader(a.u32()); glDetachShader(p, lookup(shaders, a.u32())); break; }
+    case BIND_ATTRIB_LOCATION: { GLuint p = lookup_program_or_shader(a.u32()); GLuint i = a.u32(); std::string n = a.string(); glBindAttribLocation(p, i, n.c_str()); break; }
+    case LINK_PROGRAM: glLinkProgram(lookup_program_or_shader(a.u32())); break;
     case USE_PROGRAM: {
         const uint32_t next = a.u32();
-        glUseProgram(lookup(programs, next));
+        glUseProgram(lookup_program_or_shader(next));
         const uint32_t previous = current_guest_program;
         current_guest_program = next;
         if (previous != next && delete_pending_programs.erase(previous) != 0) {
@@ -2221,12 +2221,12 @@ bool one(uint32_t op, Reader& a) {
         }
         break;
     }
-    case GET_UNIFORM_LOCATION: { GLuint p = lookup(programs, a.u32()); std::string n = a.string(); put_u32(glGetUniformLocation(p, n.c_str())); break; }
-    case GET_ATTRIB_LOCATION: { GLuint p = lookup(programs, a.u32()); std::string n = a.string(); put_u32(glGetAttribLocation(p, n.c_str())); break; }
-    case GET_UNIFORM_BLOCK_INDEX: { GLuint p = lookup(programs, a.u32()); std::string n = a.string(); put_u32(glGetUniformBlockIndex(p, n.c_str())); break; }
-    case UNIFORM_BLOCK_BINDING: { GLuint p = lookup(programs, a.u32()); GLuint i = a.u32(); glUniformBlockBinding(p, i, a.u32()); break; }
+    case GET_UNIFORM_LOCATION: { GLuint p = lookup_program_or_shader(a.u32()); std::string n = a.string(); put_u32(glGetUniformLocation(p, n.c_str())); break; }
+    case GET_ATTRIB_LOCATION: { GLuint p = lookup_program_or_shader(a.u32()); std::string n = a.string(); put_u32(glGetAttribLocation(p, n.c_str())); break; }
+    case GET_UNIFORM_BLOCK_INDEX: { GLuint p = lookup_program_or_shader(a.u32()); std::string n = a.string(); put_u32(glGetUniformBlockIndex(p, n.c_str())); break; }
+    case UNIFORM_BLOCK_BINDING: { GLuint p = lookup_program_or_shader(a.u32()); GLuint i = a.u32(); glUniformBlockBinding(p, i, a.u32()); break; }
     case GET_ATTACHED_SHADERS: {
-        uint32_t gp = a.u32(), max_count = a.u32(); GLuint p = lookup(programs, gp);
+        uint32_t gp = a.u32(), max_count = a.u32(); GLuint p = lookup_program_or_shader(gp);
         std::vector<GLuint> ids(max_count); GLsizei count = 0;
         glGetAttachedShaders(p, max_count, &count, ids.data());
         put_u32(count);
@@ -2258,7 +2258,7 @@ bool one(uint32_t op, Reader& a) {
         put_u32(v); break;
     }
     case GET_PROGRAM_IV: {
-        GLuint p = lookup(programs, a.u32()); GLenum q = a.u32();
+        GLuint p = lookup_program_or_shader(a.u32()); GLenum q = a.u32();
         /* Three for GL_COMPUTE_WORK_GROUP_SIZE, one for every other program
            property; the guest reads the same number back. */
         const int words = q == GL_COMPUTE_WORK_GROUP_SIZE ? 3 : 1;
@@ -2273,7 +2273,7 @@ bool one(uint32_t op, Reader& a) {
         std::vector<char> out(std::max(n, 1)); GLsizei got = 0; glGetShaderInfoLog(s, out.size(), &got, out.data()); put_blob(out.data(), got); break;
     }
     case GET_PROGRAM_INFO_LOG: {
-        GLuint p = lookup(programs, a.u32()); GLint n = 0; glGetProgramiv(p, GL_INFO_LOG_LENGTH, &n);
+        GLuint p = lookup_program_or_shader(a.u32()); GLint n = 0; glGetProgramiv(p, GL_INFO_LOG_LENGTH, &n);
         std::vector<char> out(std::max(n, 1)); GLsizei got = 0; glGetProgramInfoLog(p, out.size(), &got, out.data()); put_blob(out.data(), got); break;
     }
     case UNIFORM_1I: { GLint l=a.i32(), x=a.i32(); glUniform1i(l,x); break; }
@@ -2291,7 +2291,7 @@ bool one(uint32_t op, Reader& a) {
     case GET_ACTIVE_UNIFORM:
     case GET_ACTIVE_ATTRIB:
     case GET_TRANSFORM_FEEDBACK_VARYING: {
-        GLuint program = lookup(programs, a.u32()); GLuint index = a.u32();
+        GLuint program = lookup_program_or_shader(a.u32()); GLuint index = a.u32();
         GLenum length_query = op == GET_ACTIVE_UNIFORM
             ? GL_ACTIVE_UNIFORM_MAX_LENGTH
             : op == GET_ACTIVE_ATTRIB
@@ -2307,7 +2307,7 @@ bool one(uint32_t op, Reader& a) {
     }
     case GET_ACTIVE_UNIFORM_NAME:
     case GET_ACTIVE_UNIFORM_BLOCK_NAME: {
-        GLuint program = lookup(programs, a.u32()); GLuint index = a.u32();
+        GLuint program = lookup_program_or_shader(a.u32()); GLuint index = a.u32();
         GLint max_len = 0;
         glGetProgramiv(program,
                        op == GET_ACTIVE_UNIFORM_NAME
@@ -2323,7 +2323,7 @@ bool one(uint32_t op, Reader& a) {
         put_blob(name.data(), length); break;
     }
     case GET_ACTIVE_UNIFORM_BLOCKIV: {
-        GLuint program = lookup(programs, a.u32());
+        GLuint program = lookup_program_or_shader(a.u32());
         GLuint index = a.u32();
         GLenum pname = a.u32();
         /* Only one query returns more than a single integer, and its length is
@@ -2337,7 +2337,7 @@ bool one(uint32_t op, Reader& a) {
         put_blob(params.data(), std::max(count, 0) * sizeof(GLint)); break;
     }
     case GET_ACTIVE_UNIFORMSIV: {
-        GLuint program = lookup(programs, a.u32());
+        GLuint program = lookup_program_or_shader(a.u32());
         GLenum pname = a.u32();
         uint32_t bytes = 0;
         const uint8_t* raw = a.blob(bytes);
@@ -2349,7 +2349,7 @@ bool one(uint32_t op, Reader& a) {
         put_blob(params.data(), (size_t)count * sizeof(GLint)); break;
     }
     case GET_UNIFORM_INDICES: {
-        GLuint program = lookup(programs, a.u32());
+        GLuint program = lookup_program_or_shader(a.u32());
         const GLsizei count = (GLsizei)a.u32();
         uint32_t bytes = 0;
         const uint8_t* raw = a.blob(bytes);
