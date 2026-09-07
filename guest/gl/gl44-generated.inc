@@ -54,8 +54,16 @@ void glBindBufferRange(unsigned target, unsigned index, unsigned buffer, long of
 }
 void glBindBuffersBase(unsigned target, unsigned first, int count, const unsigned *names) {
     if (count > 0) bind_generic_buffer(target, names ? names[count - 1] : 0u);
-    if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*names)) return;
-    size_t blob_len = names ? (size_t)count * sizeof(*names) : 0;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && (size_t)count > UINT32_MAX / sizeof(*names)) return;
+    size_t blob_len = (count > 0 && names) ? (size_t)count * sizeof(*names) : 0;
     uint32_t *a = begin(1035, 3, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(target);
@@ -68,12 +76,21 @@ void glBindBuffersRange(unsigned target, unsigned first, int count, const unsign
                          const long *sizes) {
     if (count > 0 && (!buffers || (offsets && sizes)))
         bind_generic_buffer(target, buffers ? buffers[count - 1] : 0u);
-    if (count < 0 || (buffers && (!offsets || !sizes))) return;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && buffers && (!offsets || !sizes)) return;
     size_t per_item = sizeof(*buffers) + sizeof(*offsets) + sizeof(*sizes);
-    if ((size_t)count > (UINT32_MAX - 12u) / per_item) return;
-    size_t names_bytes = buffers ? (size_t)count * sizeof(*buffers) : 0;
-    size_t offsets_bytes = buffers ? (size_t)count * sizeof(*offsets) : 0;
-    size_t third_bytes = buffers ? (size_t)count * sizeof(*sizes) : 0;
+    if (count > 0 && (size_t)count > (UINT32_MAX - 12u) / per_item) return;
+    const int has_arrays = count > 0 && buffers != 0;
+    size_t names_bytes = has_arrays ? (size_t)count * sizeof(*buffers) : 0;
+    size_t offsets_bytes = has_arrays ? (size_t)count * sizeof(*offsets) : 0;
+    size_t third_bytes = has_arrays ? (size_t)count * sizeof(*sizes) : 0;
     size_t tail = 12 + ((names_bytes + 3) & ~3u) +
                   ((offsets_bytes + 3) & ~3u) + ((third_bytes + 3) & ~3u);
     uint32_t *a = begin(1036, 3, tail);
@@ -116,8 +133,16 @@ void glBindImageTexture(unsigned unit, unsigned texture, int level, unsigned cha
     packet[at++] = (uint32_t)(format);
 }
 void glBindImageTextures(unsigned first, int count, const unsigned *names) {
-    if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*names)) return;
-    size_t blob_len = names ? (size_t)count * sizeof(*names) : 0;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && (size_t)count > UINT32_MAX / sizeof(*names)) return;
+    size_t blob_len = (count > 0 && names) ? (size_t)count * sizeof(*names) : 0;
     uint32_t *a = begin(1041, 2, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(first);
@@ -131,8 +156,16 @@ void glBindProgramPipeline(unsigned pipeline) {
     packet[at++] = (uint32_t)(pipeline);
 }
 void glBindSamplers(unsigned first, int count, const unsigned *samplers) {
-    if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*samplers)) return;
-    size_t blob_len = samplers ? (size_t)count * sizeof(*samplers) : 0;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && (size_t)count > UINT32_MAX / sizeof(*samplers)) return;
+    size_t blob_len = (count > 0 && samplers) ? (size_t)count * sizeof(*samplers) : 0;
     uint32_t *a = begin(1045, 2, 4 + blob_len);
     if (!a) return;
     a[0] = first; a[1] = (uint32_t)count; put_blob(a + 2, samplers, blob_len);
@@ -145,8 +178,16 @@ void glBindTextureUnit(unsigned unit, unsigned texture) {
     packet[at++] = (uint32_t)(texture);
 }
 void glBindTextures(unsigned first, int count, const unsigned *names) {
-    if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*names)) return;
-    size_t blob_len = names ? (size_t)count * sizeof(*names) : 0;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && (size_t)count > UINT32_MAX / sizeof(*names)) return;
+    size_t blob_len = (count > 0 && names) ? (size_t)count * sizeof(*names) : 0;
     uint32_t *a = begin(1048, 2, 4 + blob_len);
     if (!a) return;
     a[0] = (uint32_t)(first);
@@ -168,12 +209,21 @@ void glBindVertexBuffer(unsigned bindingindex, unsigned buffer, long offset, int
 void glBindVertexBuffers(unsigned first, int count, const unsigned *buffers,
                          const long *offsets,
                          const int *strides) {
-    if (count < 0 || (buffers && (!offsets || !strides))) return;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && buffers && (!offsets || !strides)) return;
     size_t per_item = sizeof(*buffers) + sizeof(*offsets) + sizeof(*strides);
-    if ((size_t)count > (UINT32_MAX - 12u) / per_item) return;
-    size_t names_bytes = buffers ? (size_t)count * sizeof(*buffers) : 0;
-    size_t offsets_bytes = buffers ? (size_t)count * sizeof(*offsets) : 0;
-    size_t third_bytes = buffers ? (size_t)count * sizeof(*strides) : 0;
+    if (count > 0 && (size_t)count > (UINT32_MAX - 12u) / per_item) return;
+    const int has_arrays = count > 0 && buffers != 0;
+    size_t names_bytes = has_arrays ? (size_t)count * sizeof(*buffers) : 0;
+    size_t offsets_bytes = has_arrays ? (size_t)count * sizeof(*offsets) : 0;
+    size_t third_bytes = has_arrays ? (size_t)count * sizeof(*strides) : 0;
     size_t tail = 12 + ((names_bytes + 3) & ~3u) +
                   ((offsets_bytes + 3) & ~3u) + ((third_bytes + 3) & ~3u);
     uint32_t *a = begin(1052, 2, tail);
@@ -1275,23 +1325,41 @@ void glGetIntegeri_v(unsigned target, unsigned index, int *data) {
 }
 void glGetInternalformati64v(unsigned target, unsigned internalformat, unsigned pname,
                                   int count, long long *params) {
-    if (count < 0 || count > 4096) return;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 4096) return;
     uint32_t *a = begin(1242, 4, 0);
     if (!a) return;
     a[0] = target; a[1] = internalformat; a[2] = pname; a[3] = (uint32_t)count;
     flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (params && source && bytes <= (uint32_t)count * sizeof(*params)) memcpy(params, source, bytes);
+    if (count > 0 && params && source && bytes <= (uint32_t)count * sizeof(*params))
+        memcpy(params, source, bytes);
 }
 void glGetInternalformativ(unsigned target, unsigned internalformat, unsigned pname,
                                   int count, int *params) {
-    if (count < 0 || count > 4096) return;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 4096) return;
     uint32_t *a = begin(1243, 4, 0);
     if (!a) return;
     a[0] = target; a[1] = internalformat; a[2] = pname; a[3] = (uint32_t)count;
     flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (params && source && bytes <= (uint32_t)count * sizeof(*params)) memcpy(params, source, bytes);
+    if (count > 0 && params && source && bytes <= (uint32_t)count * sizeof(*params))
+        memcpy(params, source, bytes);
 }
 void glGetMultisamplefv(unsigned pname, unsigned index, float *val) {
     uint32_t *a = begin(1244, 2, 0);
@@ -2422,9 +2490,17 @@ void glMultiDrawArraysIndirect(unsigned mode, const void *indirect, int drawcoun
 }
 void glMultiDrawElements(unsigned mode, const int *count, unsigned type, const void *const *indices, int drawcount) {
     gexgl_flush_coherent_maps();
-    if (drawcount < 0 || (drawcount > 0 && !(count && indices))) return;
-    if ((size_t)drawcount > UINT32_MAX / 12u) return;
-    size_t blob_len = (size_t)drawcount * 12u;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (drawcount > 0 && !(count && indices)) return;
+    if (drawcount > 0 && (size_t)drawcount > UINT32_MAX / 12u) return;
+    size_t blob_len = drawcount > 0 ? (size_t)drawcount * 12u : 0;
     uint32_t *a = begin(1369, 3, 4 + blob_len);
     if (!a) return;
     a[0] = mode; a[1] = type; a[2] = (uint32_t)drawcount; a[3] = (uint32_t)blob_len;
@@ -2437,9 +2513,17 @@ void glMultiDrawElements(unsigned mode, const int *count, unsigned type, const v
 }
 void glMultiDrawElementsBaseVertex(unsigned mode, const int *count, unsigned type, const void *const *indices, int drawcount, const int *basevertex) {
     gexgl_flush_coherent_maps();
-    if (drawcount < 0 || (drawcount > 0 && !(count && indices && basevertex))) return;
-    if ((size_t)drawcount > UINT32_MAX / 16u) return;
-    size_t blob_len = (size_t)drawcount * 16u;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (drawcount > 0 && !(count && indices && basevertex)) return;
+    if (drawcount > 0 && (size_t)drawcount > UINT32_MAX / 16u) return;
+    size_t blob_len = drawcount > 0 ? (size_t)drawcount * 16u : 0;
     uint32_t *a = begin(1370, 3, 4 + blob_len);
     if (!a) return;
     a[0] = mode; a[1] = type; a[2] = (uint32_t)drawcount; a[3] = (uint32_t)blob_len;

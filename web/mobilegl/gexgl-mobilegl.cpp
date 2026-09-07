@@ -1700,7 +1700,16 @@ bool one(uint32_t op, Reader& a) {
         /* A compressed region's size is not derivable from the format here, so
            the guest's bufSize is the allocation -- bounded, because it is used
            to size a host vector. */
-        if (bufSize < 0 || bufSize > (1 << 26)) { a.ok = false; break; }
+        /* A negative count is the application's mistake, not a malformed
+           wire: GL owes an error for it, and failing the batch instead
+           discarded every command queued behind this one and reported
+           nothing. Pass it through and let GL raise it. */
+        if (bufSize < 0) {
+            GEX_GL_CALL(glGetCompressedTextureSubImage, texture, level,
+                        x, y, z, w, h, d, bufSize, nullptr);
+            break;
+        }
+        if (bufSize > (1 << 26)) { a.ok = false; break; }
         std::vector<uint8_t> image((size_t)bufSize, 0);
         GEX_GL_CALL(glGetCompressedTextureSubImage, texture, level, x, y, z, w,
                     h, d, bufSize, image.data());
@@ -1762,9 +1771,17 @@ bool one(uint32_t op, Reader& a) {
         const GLsizei width = a.i32(), height = a.i32();
         uint32_t bytes = 0;
         const uint8_t* wire = a.blob(bytes);
-        if (numAttachments < 0 || bytes != (uint32_t)numAttachments * 4u) {
-            a.ok = false; break;
+        /* A negative count is the application's mistake, not a malformed
+           wire: GL owes an error for it, and failing the batch instead
+           discarded every command queued behind this one and reported
+           nothing. Pass it through and let GL raise it. */
+        if (numAttachments < 0) {
+            if (bytes != 0) { a.ok = false; break; }
+            GEX_GL_CALL(glInvalidateSubFramebuffer, target, numAttachments,
+                        nullptr, x, y, width, height);
+            break;
         }
+        if (bytes != (uint32_t)numAttachments * 4u) { a.ok = false; break; }
         std::vector<GLenum> attachments((size_t)numAttachments);
         if (bytes) std::memcpy(attachments.data(), wire, bytes);
         GEX_GL_CALL(glInvalidateSubFramebuffer, target, numAttachments,
@@ -1778,7 +1795,17 @@ bool one(uint32_t op, Reader& a) {
         const bool have_buffers = a.u32() != 0;
         uint32_t bytes = 0;
         const uint8_t* wire = a.blob(bytes);
-        if (count < 0 || bytes != (uint32_t)count * 16u) { a.ok = false; break; }
+        /* A negative count is the application's mistake, not a malformed
+           wire: GL owes an error for it, and failing the batch instead
+           discarded every command queued behind this one and reported
+           nothing. Pass it through and let GL raise it. */
+        if (count < 0) {
+            if (bytes != 0) { a.ok = false; break; }
+            GEX_GL_CALL(glVertexArrayVertexBuffers, vaobj, first, count,
+                        nullptr, nullptr, nullptr);
+            break;
+        }
+        if (bytes != (uint32_t)count * 16u) { a.ok = false; break; }
         if (!have_buffers) {
             /* GL's unbind form: a null array detaches the whole range. */
             GEX_GL_CALL(glVertexArrayVertexBuffers, vaobj, first, count,
@@ -1810,9 +1837,17 @@ bool one(uint32_t op, Reader& a) {
         const GLsizei width = a.i32(), height = a.i32();
         uint32_t bytes = 0;
         const uint8_t* wire = a.blob(bytes);
-        if (numAttachments < 0 || bytes != (uint32_t)numAttachments * 4u) {
-            a.ok = false; break;
+        /* A negative count is the application's mistake, not a malformed
+           wire: GL owes an error for it, and failing the batch instead
+           discarded every command queued behind this one and reported
+           nothing. Pass it through and let GL raise it. */
+        if (numAttachments < 0) {
+            if (bytes != 0) { a.ok = false; break; }
+            GEX_GL_CALL(glInvalidateNamedFramebufferSubData, fb, numAttachments,
+                        nullptr, x, y, width, height);
+            break;
         }
+        if (bytes != (uint32_t)numAttachments * 4u) { a.ok = false; break; }
         std::vector<GLenum> attachments((size_t)numAttachments);
         if (bytes) std::memcpy(attachments.data(), wire, bytes);
         GEX_GL_CALL(glInvalidateNamedFramebufferSubData, fb, numAttachments,
@@ -1832,9 +1867,15 @@ bool one(uint32_t op, Reader& a) {
         /* The same 256 MiB ceiling the bound form uses: the reply is built in
            host memory before it is sent, so an absurd size is a way to exhaust
            it rather than a request to honour. */
-        if (offset < 0 || size < 0 || (uint64_t)size > (1u << 28)) {
-            a.ok = false; break;
+        /* A negative count is the application's mistake, not a malformed
+           wire: GL owes an error for it, and failing the batch instead
+           discarded every command queued behind this one and reported
+           nothing. Pass it through and let GL raise it. */
+        if (offset < 0 || size < 0) {
+            GEX_GL_CALL(glGetNamedBufferSubData, buffer, offset, size, nullptr);
+            break;
         }
+        if ((uint64_t)size > (1u << 28)) { a.ok = false; break; }
         std::vector<uint8_t> value((size_t)size);
         GEX_GL_CALL(glGetNamedBufferSubData, buffer, offset, size, value.data());
         put_blob(value.data(), value.size());

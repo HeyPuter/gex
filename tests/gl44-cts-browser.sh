@@ -199,6 +199,17 @@ HARNESS_OUTPUT=$(mktemp /tmp/gex-glcts-browser.XXXXXX)
 # between them.
 EXTRA_QUERY=
 for q in ${GEX_CTS_QUERY:-}; do
+    # GEX_CTS_QUERY carries page flags; the case filter is GEX_CTS_CASE. Naming
+    # the wrong one is a quiet way to measure nothing: the filter reaches the
+    # page as a dead URL parameter, the default single case runs, and 1/1
+    # passed reads exactly like a family that passed. Refuse instead.
+    case "$q" in
+        *KHR-GL*|*GTF-GL*|*dEQP*)
+            echo "gl44-cts-browser: '$q' is a case name, and GEX_CTS_QUERY is" >&2
+            echo "  for page flags -- the case filter is GEX_CTS_CASE. Passing" >&2
+            echo "  it here runs the default case only, which looks like a pass." >&2
+            exit 2 ;;
+    esac
     EXTRA_QUERY="$EXTRA_QUERY --query $q"
 done
 set +e

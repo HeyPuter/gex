@@ -18611,3 +18611,101 @@ been made here twice now. And nothing else may touch the GPU while it runs:
 the sweep says so, and separately, `meson install` during *any* sweep replaces
 the native oracle a probe is compared against, which manufactures a regression
 in a probe that has no rendering in it.
+
+## A bad argument must not destroy the batch
+
+`KHR-GL44.program_interface_query.invalid-value` failed in the browser and
+passed natively, and the CTS said only `Fail`. The log had one line that
+mattered, from the host:
+
+```
+gexgl: opcode 1264 ran out of arguments; the batch carrying it is discarded
+```
+
+Opcode 1264 is `glGetProgramResourceiv`. The case calls it with a negative
+`propCount` to check that GL raises `GL_INVALID_VALUE`. The transport treated
+that as a malformed wire packet, set `a.ok = false`, and the guest then threw
+away every queued byte -- including commands the application had made that had
+nothing to do with the bad one, and the `PRESENT` that ends the frame. The
+application saw neither the error the specification owes it nor any sign that
+its other work had evaporated.
+
+The same mistake was in **21 places, at three layers**:
+
+* **12 generated host cases** refused the batch on a negative count.
+* **4 hand-written host cases** did the same: `glVertexArrayVertexBuffers`,
+  `glGetNamedBufferSubData`, `glGetCompressedTextureSubImage`, and both
+  `glInvalidate*FramebufferSubData` forms.
+* **10 generated guest entry points and 4 hand-written ones** returned
+  *silently* instead, so the command never reached the host at all and no
+  error was ever raised. This is worse than the host version and completely
+  invisible: no error, no effect, no message.
+
+`glMultiDrawArrays` had the right shape all along and was the model for the
+rest:
+
+```c
+if (drawcount < 0) {
+    if (bytes != 0) { a.ok = false; break; }   /* a wire that lies: still fatal */
+    glMultiDrawArrays(mode, nullptr, nullptr, drawcount);   /* GL raises it */
+    break;
+}
+```
+
+The rule the transport now follows: **only a wire that contradicts itself may
+fail the batch.** A blob whose length disagrees with its own declared count is
+a transport fault. A negative count is the *application's* error, GL owes it a
+specific one, and only the host has a GL context to raise it in. The guest must
+not answer on GL's behalf -- and must not guess, either: native Mesa answers
+`GL_INVALID_OPERATION` for all four multi-bind entry points where the
+specification reads `GL_INVALID_VALUE`, so forwarding is the only way the
+browser and the native reference agree by construction.
+
+`tests/integration/programs/gl44-negative-count-probe.c` covers 17 commands.
+It asks two questions per command, and the second is the one nothing else in
+the suite asks:
+
+1. does GL raise an error at all?
+2. **is the connection still carrying commands afterwards?**
+
+(2) is what a destroyed batch looks like from inside the application, and it is
+checked with a round trip the host must answer, plus a real draw at the end
+that reads state bound before the first bad call.
+
+### Mesa's own stack overflow, which this exposed
+
+With the transport no longer refusing these calls, `glGetInternalformati64v`
+with a negative `bufSize` **segfaults**, in Mesa, upstream:
+
+```c
+GLsizei realSize = MIN2(bufSize, 16);   /* -1 */
+unsigned i;
+for (i = 0; i < realSize; i++)          /* -1 promotes to ~4 billion */
+    params32[i] = -1;                   /* a 16-element stack array */
+```
+
+`_mesa_GetInternalformativ`, called just below, does raise `GL_INVALID_VALUE`
+for a negative `bufSize` -- but the seeding loop runs first. Fixed in our tree
+by clamping `realSize`; stock Mesa 26.1.6 still dies, which is why
+`gl44-internalformat-negative-probe` documents that it has no usable native
+reference and needs `GEX_PROBE_EXPECT`.
+
+This matters more here than to an ordinary GL client: the host decodes a
+command stream produced by a *sandboxed* guest, so a guest could reach a stack
+overflow in the host by asking for it. The transport's old refusal was hiding
+it by accident.
+
+### Still to do
+
+Nine guest entry points keep the silent-drop shape, each needing its host side
+checked at the same time: `glShaderBinary`, `glShaderSource`,
+`glGetProgramBinary`, `glGetUniformIndices`, `glDebugMessageControl`,
+`glReadnPixels`, `glGetnTexImage`, `glGetnCompressedTexImage`,
+`glGetTextureSubImage`. The two `*_raw` buffer helpers keep theirs on purpose:
+they carry the driver's own write-back, and their validated entry points latch
+`GL_INVALID_VALUE` already.
+
+The pixel-layout family (`glTexSubImage*`, `glReadPixels` and friends) also
+fails the batch on a negative width or height, but there the blob length and
+the computed layout genuinely have to agree, so the two concerns are tangled
+and it needs separate thought rather than the same edit.

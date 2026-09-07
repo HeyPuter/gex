@@ -130,10 +130,17 @@ else
          "module is already staged (run web/build-mesa-wasm.sh)" >&2
 fi
 
+# libGL.so.1 as well as the ES pair. guest/gl/build.sh produces all three as
+# byte-identical copies of one object, but this staged only two -- so a probe
+# run left libGL.so.1 behind at whatever the last full web/build-assets.sh had
+# produced. A probe gate could then go green against a guest driver that no GLX
+# application would ever load, and did: the negative-count fix passed here
+# while the libGL.so.1 next to it was eighteen minutes stale.
 for tree in "$ROOT/web/public" "$ROOT/web/dist"; do
     cp "$WORK/probe" "$tree/fs/gl44-$NAME-probe"
     cp "$WORK/guest-gl/libGLESv2.so.2" "$tree/fs/libGLESv2.so.2"
     cp "$WORK/guest-gl/libEGL.so.1" "$tree/fs/libEGL.so.1"
+    cp "$WORK/guest-gl/libGL.so.1" "$tree/fs/libGL.so.1"
 done
 
 # GEX_GUEST_ENV=NAME=VALUE reaches the guest process as an environment

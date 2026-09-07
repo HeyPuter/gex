@@ -1113,11 +1113,14 @@ void glGetNamedBufferPointerv(unsigned buffer, unsigned pname, void **params) {
 void glVertexArrayVertexBuffers(unsigned vaobj, unsigned first, int count,
                                 const unsigned *buffers, const long *offsets,
                                 const int *strides) {
-    if (count < 0) return;
+    /* A negative count belongs to GL, and only the host has a GL context to
+       raise the error in. Returning here left the application with no error
+       and no effect. Forward it; the guards below are ours and apply to a
+       count that is positive. */
     /* GL says a NULL buffers array unbinds the range; offsets and strides are
        then ignored. Anything else with a missing array is a caller error. */
     if (count > 0 && buffers && (!offsets || !strides)) return;
-    const size_t entries = (size_t)count;
+    const size_t entries = count > 0 ? (size_t)count : 0u;
     if (entries > (UINT32_MAX - 8u) / 16u) return;
     const size_t blob = entries * 16u;
     uint32_t *p = begin(GEXGL_VERTEX_ARRAY_VERTEX_BUFFERS, 4, 4 + blob);
@@ -1141,8 +1144,12 @@ void glVertexArrayVertexBuffers(unsigned vaobj, unsigned first, int count,
 void glInvalidateNamedFramebufferSubData(unsigned framebuffer, int numAttachments,
                                          const unsigned *attachments, int x, int y,
                                          int width, int height) {
-    if (numAttachments < 0 || (numAttachments > 0 && !attachments)) return;
-    const size_t entries = (size_t)numAttachments;
+    /* A negative count belongs to GL, and only the host has a GL context to
+       raise the error in. Returning here left the application with no error
+       and no effect. Forward it; the guards below are ours and apply to a
+       count that is positive. */
+    if (numAttachments > 0 && !attachments) return;
+    const size_t entries = numAttachments > 0 ? (size_t)numAttachments : 0u;
     if (entries > (UINT32_MAX - 8u) / 4u) return;
     const size_t blob = entries * 4u;
     uint32_t *p = begin(GEXGL_INVALIDATE_NAMED_FRAMEBUFFER_SUB_DATA, 6, 4 + blob);
@@ -1399,8 +1406,12 @@ void glProgramBinary(unsigned program, unsigned binaryFormat,
 void glInvalidateSubFramebuffer(unsigned target, int numAttachments,
                                 const unsigned *attachments, int x, int y,
                                 int width, int height) {
-    if (numAttachments < 0 || (numAttachments > 0 && !attachments)) return;
-    const size_t entries = (size_t)numAttachments;
+    /* A negative count belongs to GL, and only the host has a GL context to
+       raise the error in. Returning here left the application with no error
+       and no effect. Forward it; the guards below are ours and apply to a
+       count that is positive. */
+    if (numAttachments > 0 && !attachments) return;
+    const size_t entries = numAttachments > 0 ? (size_t)numAttachments : 0u;
     if (entries > (UINT32_MAX - 8u) / 4u) return;
     const size_t blob = entries * 4u;
     uint32_t *p = begin(GEXGL_INVALIDATE_SUB_FRAMEBUFFER, 6, 4 + blob);
@@ -2074,7 +2085,9 @@ void glGetTextureSubImage(unsigned texture, int level, int x, int y, int z,
 void glGetCompressedTextureSubImage(unsigned texture, int level, int x, int y,
                                     int z, int w, int h, int d, int bufSize,
                                     void *pixels) {
-    if (bufSize < 0) return;
+    /* A negative argument belongs to GL, and only the host has a GL context
+       to raise the error in. Returning here left the application with no
+       error and no effect. */
     const int pbo = bound_buffer(0x88EBu) != 0;
     uint32_t *p = begin(GEXGL_GET_COMPRESSED_TEXTURE_SUB_IMAGE, 12, 0);
     if (!p) return;
@@ -3026,7 +3039,10 @@ unsigned glCheckNamedFramebufferStatus(unsigned framebuffer, unsigned target) {
 
 void glGetNamedBufferSubData(unsigned buffer, long offset, long size,
                              void *data) {
-    if (offset < 0 || size < 0) return;
+    /* A negative argument belongs to GL, and only the host has a GL context
+       to raise the error in. Returning here left the application with no
+       error and no effect. */
+
     uint32_t *p = begin(GEXGL_GET_NAMED_BUFFER_SUB_DATA, 5, 0);
     if (!p) return;
     const uint64_t off = (uint64_t)offset, bytes = (uint64_t)size;

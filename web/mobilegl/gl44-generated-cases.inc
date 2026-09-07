@@ -44,7 +44,18 @@ case 1035: {
     GLsizei count = a.i32();
     uint32_t bytes = 0;
     const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (bytes && bytes != (uint32_t)count * sizeof(GLuint))) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {
+        if (bytes != 0) { a.ok = false; break; }
+        GEX_GL_CALL(glBindBuffersBase, target, first, count, nullptr);
+        break;
+    }
+    if (bytes && bytes != (uint32_t)count * sizeof(GLuint)) { a.ok = false; break; }
     std::vector<GLuint> host((size_t)std::max(count, 0), 0);
     if (bytes) {
         for (GLsizei i = 0; i < count; ++i) {
@@ -112,7 +123,18 @@ case 1041: {
     GLsizei count = a.i32();
     uint32_t bytes = 0;
     const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (bytes && bytes != (uint32_t)count * sizeof(GLuint))) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {
+        if (bytes != 0) { a.ok = false; break; }
+        GEX_GL_CALL(glBindImageTextures, first, count, nullptr);
+        break;
+    }
+    if (bytes && bytes != (uint32_t)count * sizeof(GLuint)) { a.ok = false; break; }
     std::vector<GLuint> host((size_t)std::max(count, 0), 0);
     if (bytes) {
         for (GLsizei i = 0; i < count; ++i) {
@@ -131,7 +153,18 @@ case 1042: {
 case 1045: {
     GLuint first = a.u32(); GLsizei count = a.i32(); uint32_t bytes = 0;
     const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (bytes && bytes != (uint32_t)count * sizeof(GLuint))) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {
+        if (bytes != 0) { a.ok = false; break; }
+        GEX_GL_CALL(glBindSamplers, first, count, nullptr);
+        break;
+    }
+    if (bytes && bytes != (uint32_t)count * sizeof(GLuint)) { a.ok = false; break; }
     std::vector<GLuint> names((size_t)count, 0);
     if (bytes) {
         const GLuint *guest = reinterpret_cast<const GLuint *>(wire);
@@ -151,7 +184,18 @@ case 1048: {
     GLsizei count = a.i32();
     uint32_t bytes = 0;
     const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (bytes && bytes != (uint32_t)count * sizeof(GLuint))) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {
+        if (bytes != 0) { a.ok = false; break; }
+        GEX_GL_CALL(glBindTextures, first, count, nullptr);
+        break;
+    }
+    if (bytes && bytes != (uint32_t)count * sizeof(GLuint)) { a.ok = false; break; }
     std::vector<GLuint> host((size_t)std::max(count, 0), 0);
     if (bytes) {
         for (GLsizei i = 0; i < count; ++i) {
@@ -1024,7 +1068,17 @@ case 1221: {
 }
 case 1223: {
     GLenum target = a.u32(); GLintptr offset = (GLintptr)a.u64(); GLsizeiptr size = (GLsizeiptr)a.u64();
-    if (offset < 0 || size < 0 || (uint64_t)size > (1u << 28)) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (offset < 0 || size < 0) {
+        glGetBufferSubData(target, offset, size, nullptr);
+        break;
+    }
+    if ((uint64_t)size > (1u << 28)) { a.ok = false; break; }
     std::vector<uint8_t> value((size_t)size); glGetBufferSubData(target, offset, size, value.data());
     put_blob(value.data(), value.size());
     break;
@@ -1183,7 +1237,19 @@ case 1240: {
 }
 case 1242: {
     GLenum target = a.u32(), internalformat = a.u32(), pname = a.u32(); GLsizei count = a.i32();
-    if (count < 0 || count > 4096) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {
+        GEX_GL_CALL(glGetInternalformati64v, target, internalformat, pname, count, nullptr);
+        break;
+    }
+    /* An upper bound is a wire guard: these queries return a handful of
+       values, and a huge count is a corrupt packet, not a GL error. */
+    if (count > 4096) { a.ok = false; break; }
     std::vector<GLint64> values((size_t)count, 0);
     GEX_GL_CALL(glGetInternalformati64v, target, internalformat, pname, count, values.data());
     put_blob(values.data(), values.size() * sizeof(GLint64));
@@ -1191,7 +1257,19 @@ case 1242: {
 }
 case 1243: {
     GLenum target = a.u32(), internalformat = a.u32(), pname = a.u32(); GLsizei count = a.i32();
-    if (count < 0 || count > 4096) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {
+        GEX_GL_CALL(glGetInternalformativ, target, internalformat, pname, count, nullptr);
+        break;
+    }
+    /* An upper bound is a wire guard: these queries return a handful of
+       values, and a huge count is a corrupt packet, not a GL error. */
+    if (count > 4096) { a.ok = false; break; }
     std::vector<GLint> values((size_t)count, 0);
     GEX_GL_CALL(glGetInternalformativ, target, internalformat, pname, count, values.data());
     put_blob(values.data(), values.size() * sizeof(GLint));
@@ -1259,7 +1337,7 @@ case 1251: {
     break;
 }
 case 1257: {
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(), pname = a.u32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(), pname = a.u32();
     GLint value = 0; glGetProgramInterfaceiv(program, interface, pname, &value); put_u32((uint32_t)value);
     break;
 }
@@ -1273,33 +1351,63 @@ case 1259: {
     break;
 }
 case 1260: {
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
     put_u32((uint32_t)glGetProgramResourceIndex(program, interface, resourceName.c_str()));
     break;
 }
 case 1261: {
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
     put_u32((uint32_t)glGetProgramResourceLocation(program, interface, resourceName.c_str()));
     break;
 }
 case 1262: {
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
     put_u32((uint32_t)glGetProgramResourceLocationIndex(program, interface, resourceName.c_str()));
     break;
 }
 case 1263: {
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
-    GLint maximum = 0; glGetProgramInterfaceiv(program, interface, GL_MAX_NAME_LENGTH, &maximum);
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
+    /* Sizing the buffer is this transport's own business, and a helper query
+       it makes on its own behalf must not leave a GL error behind for the
+       application to find. GL_MAX_NAME_LENGTH is invalid for the two buffer
+       interfaces, so asking anyway raised GL_INVALID_OPERATION and that is
+       what the caller saw -- masking the GL_INVALID_ENUM that
+       glGetProgramResourceName itself owes for those interfaces. Not asking
+       is better than asking and draining: draining would also swallow an
+       error the application had not collected yet. */
+    GLint maximum = 0;
+    if (interface != GL_ATOMIC_COUNTER_BUFFER &&
+        interface != GL_TRANSFORM_FEEDBACK_BUFFER)
+        glGetProgramInterfaceiv(program, interface, GL_MAX_NAME_LENGTH, &maximum);
     std::vector<GLchar> value(std::max(maximum, 1)); GLsizei length = 0;
     glGetProgramResourceName(program, interface, index, value.size(), &length, value.data());
     put_blob(value.data(), std::max(length, 0));
     break;
 }
 case 1264: {
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
     GLsizei propCount = a.i32(), bufSize = a.i32(); uint32_t propBytes = 0;
     const uint8_t *propWire = a.blob(propBytes);
-    if (propCount < 0 || bufSize < 0 || propBytes != (uint32_t)propCount * sizeof(GLenum)) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (propCount < 0 || bufSize < 0) {
+        /* A real destination, not nullptr: _mesa_GetProgramResourceiv returns
+           silently on `!params`, before it reaches the propCount check, so
+           passing nullptr here loses the GL_INVALID_VALUE the call owes. */
+        GLint scratch[1] = {0};
+        GLsizei length = 0;
+        glGetProgramResourceiv(program, interface, index, propCount,
+                               propBytes ? reinterpret_cast<const GLenum *>(propWire) : nullptr,
+                               bufSize, &length, scratch);
+        put_u32(0u);
+        put_blob(scratch, 0u);
+        break;
+    }
+    if (propBytes != (uint32_t)propCount * sizeof(GLenum)) { a.ok = false; break; }
     const GLenum *props = reinterpret_cast<const GLenum *>(propWire);
     std::vector<GLint> values(bufSize); GLsizei length = 0;
     glGetProgramResourceiv(program, interface, index, propCount, props, bufSize, &length, values.data());
@@ -1989,7 +2097,18 @@ case 1368: {
 case 1369: {
     GLenum mode = a.u32(), type = a.u32(); GLsizei drawcount = a.i32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
-    if (drawcount < 0 || (uint64_t)drawcount * 12u != bytes) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (drawcount < 0) {
+        if (bytes != 0) { a.ok = false; break; }
+        glMultiDrawElements(mode, nullptr, type, nullptr, drawcount);
+        break;
+    }
+    if ((uint64_t)drawcount * 12u != bytes) { a.ok = false; break; }
     std::vector<GLsizei> counts((size_t)drawcount);
     std::vector<const void *> indices((size_t)drawcount);
     for (GLsizei i = 0; i < drawcount; i++) {
@@ -2003,7 +2122,18 @@ case 1369: {
 case 1370: {
     GLenum mode = a.u32(), type = a.u32(); GLsizei drawcount = a.i32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
-    if (drawcount < 0 || (uint64_t)drawcount * 16u != bytes) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (drawcount < 0) {
+        if (bytes != 0) { a.ok = false; break; }
+        glMultiDrawElementsBaseVertex(mode, nullptr, type, nullptr, drawcount, nullptr);
+        break;
+    }
+    if ((uint64_t)drawcount * 16u != bytes) { a.ok = false; break; }
     std::vector<GLsizei> counts((size_t)drawcount);
     std::vector<const void *> indices((size_t)drawcount); std::vector<GLint> basevertices((size_t)drawcount);
     for (GLsizei i = 0; i < drawcount; i++) {
@@ -3275,7 +3405,18 @@ case 1523: {
 case 1524: {
     GLuint program = lookup(programs, a.u32()); GLsizei count = a.i32();
     GLenum bufferMode = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (count && !wire)) { a.ok = false; break; }
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {
+        if (bytes != 0) { a.ok = false; break; }
+        GEX_GL_CALL(glTransformFeedbackVaryings, program, count, nullptr, bufferMode);
+        break;
+    }
+    if (count && !wire) { a.ok = false; break; }
     std::vector<const GLchar *> varyings; varyings.reserve((size_t)count);
     const char *at = reinterpret_cast<const char *>(wire);
     size_t left = bytes;

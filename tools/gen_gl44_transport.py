@@ -1165,12 +1165,21 @@ def _guest_function(command: dict, opcode: int) -> str:
         return f"""void {name}({prefix}unsigned first, int count, const unsigned *buffers,
                          const {TYPE_INFO[second_type][0]} *offsets,
                          const {TYPE_INFO[third_type][0]} *{third_name}) {{
-    if (count < 0 || (buffers && (!offsets || !{third_name}))) return;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && buffers && (!offsets || !{third_name})) return;
     size_t per_item = sizeof(*buffers) + sizeof(*offsets) + sizeof(*{third_name});
-    if ((size_t)count > (UINT32_MAX - 12u) / per_item) return;
-    size_t names_bytes = buffers ? (size_t)count * sizeof(*buffers) : 0;
-    size_t offsets_bytes = buffers ? (size_t)count * sizeof(*offsets) : 0;
-    size_t third_bytes = buffers ? (size_t)count * sizeof(*{third_name}) : 0;
+    if (count > 0 && (size_t)count > (UINT32_MAX - 12u) / per_item) return;
+    const int has_arrays = count > 0 && buffers != 0;
+    size_t names_bytes = has_arrays ? (size_t)count * sizeof(*buffers) : 0;
+    size_t offsets_bytes = has_arrays ? (size_t)count * sizeof(*offsets) : 0;
+    size_t third_bytes = has_arrays ? (size_t)count * sizeof(*{third_name}) : 0;
     size_t tail = 12 + ((names_bytes + 3) & ~3u) +
                   ((offsets_bytes + 3) & ~3u) + ((third_bytes + 3) & ~3u);
     uint32_t *a = begin({opcode}, {scalar_words}, tail);
@@ -1195,8 +1204,16 @@ def _guest_function(command: dict, opcode: int) -> str:
 """
     if name == "glBindSamplers":
         return f"""void {name}(unsigned first, int count, const unsigned *samplers) {{
-    if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*samplers)) return;
-    size_t blob_len = samplers ? (size_t)count * sizeof(*samplers) : 0;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && (size_t)count > UINT32_MAX / sizeof(*samplers)) return;
+    size_t blob_len = (count > 0 && samplers) ? (size_t)count * sizeof(*samplers) : 0;
     uint32_t *a = begin({opcode}, 2, 4 + blob_len);
     if (!a) return;
     a[0] = first; a[1] = (uint32_t)count; put_blob(a + 2, samplers, blob_len);
@@ -1215,8 +1232,16 @@ def _guest_function(command: dict, opcode: int) -> str:
             writes.append(f"    a[{at}] = {encode.format(name=param['name'])};")
             at += 1
         return f"""void {name}({', '.join(declarations)}) {{
-    if (count < 0 || (size_t)count > UINT32_MAX / sizeof(*names)) return;
-    size_t blob_len = names ? (size_t)count * sizeof(*names) : 0;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 0 && (size_t)count > UINT32_MAX / sizeof(*names)) return;
+    size_t blob_len = (count > 0 && names) ? (size_t)count * sizeof(*names) : 0;
     uint32_t *a = begin({opcode}, {len(scalars)}, 4 + blob_len);
     if (!a) return;
 {chr(10).join(writes)}
@@ -1242,13 +1267,22 @@ def _guest_function(command: dict, opcode: int) -> str:
         c_type = "long long" if name.endswith("i64v") else "int"
         return f"""void {name}(unsigned target, unsigned internalformat, unsigned pname,
                                   int count, {c_type} *params) {{
-    if (count < 0 || count > 4096) return;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (count > 4096) return;
     uint32_t *a = begin({opcode}, 4, 0);
     if (!a) return;
     a[0] = target; a[1] = internalformat; a[2] = pname; a[3] = (uint32_t)count;
     flush();
     uint32_t bytes = 0; const uint8_t *source = reply_blob(&bytes);
-    if (params && source && bytes <= (uint32_t)count * sizeof(*params)) memcpy(params, source, bytes);
+    if (count > 0 && params && source && bytes <= (uint32_t)count * sizeof(*params))
+        memcpy(params, source, bytes);
 }}
 """
     if name == "glGetMultisamplefv":
@@ -1307,9 +1341,17 @@ def _guest_function(command: dict, opcode: int) -> str:
                       if with_base else "")
         stride = 16 if with_base else 12
         return f"""void {name}({declaration}) {{
-    if (drawcount < 0 || (drawcount > 0 && !({required}))) return;
-    if ((size_t)drawcount > UINT32_MAX / {stride}u) return;
-    size_t blob_len = (size_t)drawcount * {stride}u;
+    /* A negative count is GL's to reject, and only the host has a GL context
+       to reject it in. Returning here left the application with no error and
+       no effect -- the worst of both -- and latching one locally would have to
+       guess which: native Mesa answers GL_INVALID_OPERATION for the multi-bind
+       entry points where the specification reads GL_INVALID_VALUE. So forward
+       it, with no array, and let the same Mesa that answers natively answer
+       here. The overflow guards below are still ours, and only meaningful for
+       a count that is positive. */
+    if (drawcount > 0 && !({required})) return;
+    if (drawcount > 0 && (size_t)drawcount > UINT32_MAX / {stride}u) return;
+    size_t blob_len = drawcount > 0 ? (size_t)drawcount * {stride}u : 0;
     uint32_t *a = begin({opcode}, 3, 4 + blob_len);
     if (!a) return;
     a[0] = mode; a[1] = type; a[2] = (uint32_t)drawcount; a[3] = (uint32_t)blob_len;
@@ -1783,7 +1825,18 @@ def host_case(command: dict, opcode: int) -> str:
         return f"""case {opcode}: {{
     GLuint first = a.u32(); GLsizei count = a.i32(); uint32_t bytes = 0;
     const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (bytes && bytes != (uint32_t)count * sizeof(GLuint))) {{ a.ok = false; break; }}
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {{
+        if (bytes != 0) {{ a.ok = false; break; }}
+        GEX_GL_CALL(glBindSamplers, first, count, nullptr);
+        break;
+    }}
+    if (bytes && bytes != (uint32_t)count * sizeof(GLuint)) {{ a.ok = false; break; }}
     std::vector<GLuint> names((size_t)count, 0);
     if (bytes) {{
         const GLuint *guest = reinterpret_cast<const GLuint *>(wire);
@@ -1801,7 +1854,18 @@ def host_case(command: dict, opcode: int) -> str:
 {chr(10).join(reads)}
     uint32_t bytes = 0;
     const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (bytes && bytes != (uint32_t)count * sizeof(GLuint))) {{ a.ok = false; break; }}
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {{
+        if (bytes != 0) {{ a.ok = false; break; }}
+        GEX_GL_CALL({name}, {", ".join(call_args)}, nullptr);
+        break;
+    }}
+    if (bytes && bytes != (uint32_t)count * sizeof(GLuint)) {{ a.ok = false; break; }}
     std::vector<GLuint> host((size_t)std::max(count, 0), 0);
     if (bytes) {{
         for (GLsizei i = 0; i < count; ++i) {{
@@ -1834,7 +1898,19 @@ def host_case(command: dict, opcode: int) -> str:
         output_type = "GLint64" if name.endswith("i64v") else "GLint"
         return f"""case {opcode}: {{
     GLenum target = a.u32(), internalformat = a.u32(), pname = a.u32(); GLsizei count = a.i32();
-    if (count < 0 || count > 4096) {{ a.ok = false; break; }}
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {{
+        GEX_GL_CALL({name}, target, internalformat, pname, count, nullptr);
+        break;
+    }}
+    /* An upper bound is a wire guard: these queries return a handful of
+       values, and a huge count is a corrupt packet, not a GL error. */
+    if (count > 4096) {{ a.ok = false; break; }}
     std::vector<{output_type}> values((size_t)count, 0);
     GEX_GL_CALL({name}, target, internalformat, pname, count, values.data());
     put_blob(values.data(), values.size() * sizeof({output_type}));
@@ -1897,7 +1973,18 @@ def host_case(command: dict, opcode: int) -> str:
         return f"""case {opcode}: {{
     GLenum mode = a.u32(), type = a.u32(); GLsizei drawcount = a.i32();
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
-    if (drawcount < 0 || (uint64_t)drawcount * {stride}u != bytes) {{ a.ok = false; break; }}
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (drawcount < 0) {{
+        if (bytes != 0) {{ a.ok = false; break; }}
+        {name}(mode, nullptr, type, nullptr, drawcount{", nullptr" if with_base else ""});
+        break;
+    }}
+    if ((uint64_t)drawcount * {stride}u != bytes) {{ a.ok = false; break; }}
     std::vector<GLsizei> counts((size_t)drawcount);
     std::vector<const void *> indices((size_t)drawcount);{base_declarations}
     for (GLsizei i = 0; i < drawcount; i++) {{
@@ -1960,7 +2047,18 @@ def host_case(command: dict, opcode: int) -> str:
         return f"""case {opcode}: {{
     GLuint program = lookup(programs, a.u32()); GLsizei count = a.i32();
     GLenum bufferMode = a.u32(); uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
-    if (count < 0 || (count && !wire)) {{ a.ok = false; break; }}
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (count < 0) {{
+        if (bytes != 0) {{ a.ok = false; break; }}
+        GEX_GL_CALL(glTransformFeedbackVaryings, program, count, nullptr, bufferMode);
+        break;
+    }}
+    if (count && !wire) {{ a.ok = false; break; }}
     std::vector<const GLchar *> varyings; varyings.reserve((size_t)count);
     const char *at = reinterpret_cast<const char *>(wire);
     size_t left = bytes;
@@ -2045,7 +2143,17 @@ def host_case(command: dict, opcode: int) -> str:
     if name == "glGetBufferSubData":
         return f"""case {opcode}: {{
     GLenum target = a.u32(); GLintptr offset = (GLintptr)a.u64(); GLsizeiptr size = (GLsizeiptr)a.u64();
-    if (offset < 0 || size < 0 || (uint64_t)size > (1u << 28)) {{ a.ok = false; break; }}
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (offset < 0 || size < 0) {{
+        glGetBufferSubData(target, offset, size, nullptr);
+        break;
+    }}
+    if ((uint64_t)size > (1u << 28)) {{ a.ok = false; break; }}
     std::vector<uint8_t> value((size_t)size); glGetBufferSubData(target, offset, size, value.data());
     put_blob(value.data(), value.size());
     break;
@@ -2076,22 +2184,40 @@ def host_case(command: dict, opcode: int) -> str:
     put_blob(value, components * sizeof(value[0]));
     break;
 }}"""
+    # These take a program name, and use lookup_program_or_shader rather than
+    # lookup(programs, ...) so a *shader* name produces the error GL owes. GL
+    # distinguishes "not an object at all", which is GL_INVALID_VALUE, from "a
+    # valid object of the wrong type", which is GL_INVALID_OPERATION, and
+    # mapping every unknown name to zero collapses the second into the first.
+    # KHR-GL44.program_interface_query's invalid-operation case is exactly
+    # that distinction, and it failed only in the browser.
     if name == "glGetProgramInterfaceiv":
         return f"""case {opcode}: {{
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(), pname = a.u32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(), pname = a.u32();
     GLint value = 0; glGetProgramInterfaceiv(program, interface, pname, &value); put_u32((uint32_t)value);
     break;
 }}"""
     if name in PROGRAM_NAMED_QUERIES:
         return f"""case {opcode}: {{
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); std::string resourceName = a.string();
     put_u32((uint32_t){name}(program, interface, resourceName.c_str()));
     break;
 }}"""
     if name == "glGetProgramResourceName":
         return f"""case {opcode}: {{
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
-    GLint maximum = 0; glGetProgramInterfaceiv(program, interface, GL_MAX_NAME_LENGTH, &maximum);
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
+    /* Sizing the buffer is this transport's own business, and a helper query
+       it makes on its own behalf must not leave a GL error behind for the
+       application to find. GL_MAX_NAME_LENGTH is invalid for the two buffer
+       interfaces, so asking anyway raised GL_INVALID_OPERATION and that is
+       what the caller saw -- masking the GL_INVALID_ENUM that
+       glGetProgramResourceName itself owes for those interfaces. Not asking
+       is better than asking and draining: draining would also swallow an
+       error the application had not collected yet. */
+    GLint maximum = 0;
+    if (interface != GL_ATOMIC_COUNTER_BUFFER &&
+        interface != GL_TRANSFORM_FEEDBACK_BUFFER)
+        glGetProgramInterfaceiv(program, interface, GL_MAX_NAME_LENGTH, &maximum);
     std::vector<GLchar> value(std::max(maximum, 1)); GLsizei length = 0;
     glGetProgramResourceName(program, interface, index, value.size(), &length, value.data());
     put_blob(value.data(), std::max(length, 0));
@@ -2099,10 +2225,29 @@ def host_case(command: dict, opcode: int) -> str:
 }}"""
     if name == "glGetProgramResourceiv":
         return f"""case {opcode}: {{
-    GLuint program = lookup(programs, a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
+    GLuint program = lookup_program_or_shader(a.u32()); GLenum interface = a.u32(); GLuint index = a.u32();
     GLsizei propCount = a.i32(), bufSize = a.i32(); uint32_t propBytes = 0;
     const uint8_t *propWire = a.blob(propBytes);
-    if (propCount < 0 || bufSize < 0 || propBytes != (uint32_t)propCount * sizeof(GLenum)) {{ a.ok = false; break; }}
+    /* A negative count is the application's mistake, not a malformed wire.
+       GL owes GL_INVALID_VALUE for it, so pass it through and let the error be
+       raised where the application can read it. Failing the batch instead
+       discarded every command queued behind this one -- including the PRESENT
+       that ends the frame -- and told the application nothing.
+       glMultiDrawArrays has had this shape all along; these had not. */
+    if (propCount < 0 || bufSize < 0) {{
+        /* A real destination, not nullptr: _mesa_GetProgramResourceiv returns
+           silently on `!params`, before it reaches the propCount check, so
+           passing nullptr here loses the GL_INVALID_VALUE the call owes. */
+        GLint scratch[1] = {{0}};
+        GLsizei length = 0;
+        glGetProgramResourceiv(program, interface, index, propCount,
+                               propBytes ? reinterpret_cast<const GLenum *>(propWire) : nullptr,
+                               bufSize, &length, scratch);
+        put_u32(0u);
+        put_blob(scratch, 0u);
+        break;
+    }}
+    if (propBytes != (uint32_t)propCount * sizeof(GLenum)) {{ a.ok = false; break; }}
     const GLenum *props = reinterpret_cast<const GLenum *>(propWire);
     std::vector<GLint> values(bufSize); GLsizei length = 0;
     glGetProgramResourceiv(program, interface, index, propCount, props, bufSize, &length, values.data());
