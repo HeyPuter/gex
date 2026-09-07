@@ -21116,16 +21116,77 @@ the life of the context. The clear is hoisted above the return, which is right
 rather than merely safe -- with no encoder there is nothing recorded, so
 nothing can still need the batch to keep those alive.
 
-**It did not fix the leak**, measured after: VRAM still climbs ~40 MiB/s and
-live resources still grow. So something else holds a buffer reference, and
-that is where the next session should start. What is already ruled out: every
-`pipe_resource *` the context struct holds is fixed-size or a singleton, the
-persistent-map list stores bare pointers rather than references, and transfers
-are balanced. The next instrument is the one not yet built -- a temporary list
-of live resources printing `resource->reference.count`, which separates "the
-driver holds it" from "st/mesa still does".
+**It did not fix the leak**: VRAM still climbed ~40 MiB/s afterwards. It was
+a real leak on a real path, just not this one.
 
-**This is the most serious reliability defect on record here**: it caps any
-long-running application at under two minutes on a 4 GB card, and the existing
-mitigations (a VRAM guard, a kernel watchdog, a software adapter) are all
-containment rather than repair.
+### The leak: `u_vbuf` kept one release slot for three writers
+
+**Fixed. VRAM is flat at 481 MiB across a 70-second run** where it previously
+went 511 -> 1735 -> 2596 MiB, and the driver's buffer shadows dropped from
+802,397 KiB in 1008 buffers to 2,653 KiB in 227.
+
+**It was not in this driver.** `u_upload_alloc` hands its previous upload slab
+back to the caller through an out-parameter, and **always writes that slot --
+including `NULL` when it did not have to allocate**:
+
+    u_upload_release_buffer(upload);
+    *releasebuf = upload->buffer;     /* the caller now owns this */
+    upload->buffer = NULL;
+
+`u_vbuf` declares *one* `releasebuf` for a whole draw and has three writers
+into it: `u_vbuf_translate_buffers` runs once per translated buffer type, and
+the multi-draw loop runs the whole thing again per draw. Whichever call wrote
+last decided what the release at the end of `u_vbuf_draw_vbo` saw; every other
+slab was dropped on the floor. Each is a megabyte of device memory plus a host
+shadow -- which is exactly why VRAM and RSS grew in step. `u_vbuf_upload_buffers`
+had the same defect in the other direction: it *assigned* `*release_count`
+rather than accumulating, so a multi-draw kept only the last call's buffers,
+and its two `PIPE_ERROR_OUT_OF_MEMORY` returns published nothing at all.
+
+The fix drains the slot before it is overwritten, accumulates the count and
+publishes it on the error paths, and moves the release inside the multi-draw
+loop -- which is where it belonged anyway: the draw is recorded by then, and
+anything the driver still uses holds its own reference.
+
+**Why every comparison against another driver said "not a driver bug".**
+`u_vbuf` is only instantiated for a driver that *declines* a vertex format.
+llvmpipe accepts all of them, so it never runs this code -- which is the whole
+of the "the same STK race is flat on llvmpipe" asymmetry that pointed away
+from the real cause for weeks. **Shared code that only we walk is invisible to
+a cross-driver comparison**, and that is the general lesson: the asymmetry
+proved the path was ours, not that the *code* was.
+
+### How it was found, since the counters never named it
+
+Counters said 20179 resources created, 18138 destroyed, 2041 live, and could
+not say by whom. Three steps, each killing a hypothesis:
+
+1. **An intrusive list of live resources**, linked at create and unlinked at
+   destroy. Enumeration, not a count -- everything below needs the objects.
+2. **For each live resource, scan the context struct's own words for a pointer
+   to it.** The context is one contiguous allocation, so this is a dozen lines
+   and it is exhaustive over the driver's own state. Seven resources were held.
+   **1322 were held by nothing the driver could name** -- which is the finding
+   that turned the search outward.
+3. **A `backtrace()` stored at create**, printed for the largest orphans, run
+   through `addr2line`. It named `u_vbuf_translate_buffers` ->
+   `u_upload_alloc_buffer` outright.
+
+**Three instrument traps, all self-inflicted, all worth avoiding:**
+
+- **"Which line last took a reference" named `batch_touch`**, which touches
+  nearly every resource every frame and is therefore the last taker of
+  everything, including what it released correctly. A "who touched it last"
+  signal is worthless wherever something touches everything.
+- **The live list's own `live_next`/`live_prev` are pointers to resources**, so
+  the scan cheerfully reported all 1322 as held by another resource, at a
+  constant offset. Exclude the instrument's own fields from the instrument.
+- **Pick orphans by size, not by age.** The oldest were 0-KiB startup
+  singletons; the set that grows was the megabyte ones.
+
+**This had been the most serious reliability defect on record here**: it capped
+any long-running application at under two minutes on a 4 GB card, and the
+mitigations (a VRAM guard, a kernel watchdog, a software adapter) were all
+containment. They are worth keeping -- the cheap regression detector is the
+`host memory --` line under `GEX_WGPU_PRESENT_LOG=1`, whose buffer count
+climbing is the whole signal and needs no instrumentation to read.
