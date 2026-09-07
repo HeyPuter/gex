@@ -19412,3 +19412,86 @@ file I replaced it with -- dispatch visibility, the explicit-flush contract, a
 write-only uniform flush. It is restored, the sweep lives under its own name,
 and it was the restored probe that caught the regression above. Check whether a
 probe name is taken before writing one.
+
+## Samples: two bugs, and two fixes that were worse than the bug
+
+`glGetInternalformativ` advertised 4x multisampling for `GL_RGBA32F` and
+`glTexStorage2DMultisample` then refused it. An application that asks what it
+may have and is handed a number it cannot use has nowhere to go, and
+`KHR-GL44.texture_view` is one such application: it queries `GL_SAMPLES` for
+`GL_RGBA32F`, passes the answer straight back, and fails.
+
+The driver was not the one lying. `is_format_supported` has excluded every
+32-bit-per-component format from multisampling since it was written -- WebGPU
+offers none for them -- but `st_QuerySamplesForFormat` pads its answer:
+
+```c
+if (format != PIPE_FORMAT_NONE || i == min_max_samples)
+```
+
+so `MAX_COLOR_TEXTURE_SAMPLES` is reported for every renderable format whether
+the driver accepts it or not. Right for hardware whose multisampling does not
+vary by format, which is nearly all of it; wrong here. `caps->exact_sample_counts`
+(default false, only this driver sets it) skips the padding.
+
+**The win turned out not to be the one I was aiming at.** `texture_view` did
+not move -- its failures are the multisample-array wall below. What moved was
+`KHR-GL44.sample_variables`: **27 failures to 9, with its 125 passes
+untouched**, because eighteen cases had been failing on an allocation of a
+count they had been promised and now skip as unsupported instead. Telling the
+truth turned eighteen failures into honest skips without rendering anything
+differently.
+
+### The two attempts that were worse
+
+Lifting the padding leaves `GL_RGBA32F` reporting a single count of 1, and 1
+did not allocate either, because `st_cb_texture.c` bumps a one-sample request
+to two before searching upward:
+
+```c
+if (ctx->Const.MaxSamples > 1 && num_samples == 1)
+    num_samples = 2;   /* don't try 1 with drivers that support real msaa */
+```
+
+Both attempts to deal with that were worse than leaving it alone, and both were
+**measured, not reasoned about**:
+
+- Gating the bump on the same cap took `sample_variables` from 125 passed / 27
+  failed to **97 passed / 37 failed**. Twenty-eight passes lost.
+- Keeping the bump and retrying at the requested count when the search fails
+  made the run **ABORT** after 145 of 190 cases.
+
+Both are reverted. The bump prefers real multisampling to a single sample,
+applications get a supported count either way, and none of it was the defect.
+The consequence to accept is that `GL_RGBA32F` still reports one count that
+will not allocate -- and that 1 is not the driver's claim: st substitutes it
+when a driver reports none. So `gl44-multisample-advertise-probe` asserts only
+counts *above* one, 7/7 on both paths, and reports the substituted 1 rather
+than asserting it, which keeps the probe suite's expected-difference list
+meaning what it says.
+
+**A measurement note that nearly cost me the diagnosis.** Those four runs came
+back 190, 190, **145** and 190 cases. The 145 was the abort, and its rate --
+117 of 145, 80.7% -- reads as the best of the four. Count `Test case` lines
+before comparing anything.
+
+### The sample mask, gated on the wrong thing
+
+The second bug, found while probing the first. GL performs the multisample
+fragment operations -- where `gl_SampleMask` is ANDed into coverage -- when
+`SAMPLE_BUFFERS` is one, and `SAMPLE_BUFFERS` is one whenever the
+framebuffer's attachments are multisample. That is a different question from
+how many samples they have: a texture from `glTexImage2DMultisample` with
+`samples=1` **is** multisample and must honour the mask.
+
+The predicate was `ctx->fb_samples <= 1`, and `fb_samples` is
+`MAX2(1, nr_samples)` -- it folds zero and one together, so a one-sample
+multisample framebuffer ignored the mask. The comment above it had said
+`SAMPLE_BUFFERS` all along; only the code disagreed. `ctx->fb_multisample`
+reads the raw `nr_samples` before that `MAX2`.
+
+This is the *second* time this predicate has been wrong, in the opposite
+direction each time: it first honoured the mask everywhere, which discarded
+fragments GL keeps, and then ignored it on a framebuffer where GL applies it.
+`gl44-samplemask-one-sample-probe` pins all three cases -- plain, 1x
+multisample, 4x -- so a third version cannot be half right.
