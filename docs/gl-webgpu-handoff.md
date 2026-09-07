@@ -19154,8 +19154,20 @@ names. Aliasing is bad; that would be worse.
    without resetting the namespace. `CONTEXT_CREATE` has to keep meaning
    "a new guest process starts here".
 2. Per-context object namespaces on the host, since GL objects belong to a
-   context unless the application asks for sharing -- and `eglCreateContext`'s
-   `share_context` argument then has to be honoured rather than ignored.
+   context unless the application asks for sharing. The host's maps are
+   globals and `reset_guest_namespace()` already enumerates them, so they can
+   be *swapped* on a context switch rather than threaded through the ~200
+   lookup sites -- the same trick as the guest caches.
+
+   **This step can break programs that work today, which is the trap.**
+   `eglCreateContext`'s `share_context` argument is currently ignored, and
+   because every context aliases one namespace, *sharing works by accident* --
+   a toolkit that creates a second context sharing the first's objects gets
+   exactly what it asked for. Give each context its own namespace without
+   honouring `share_context` and those programs break, having previously been
+   fine. Qt is the named example in this project's own notes. So step 2 is
+   really "per-context namespaces **and** shared-namespace aliasing when the
+   application asks", and the second half is not optional.
 3. A GL context per guest handle on the host, switched on `MAKE_CURRENT`.
 4. The guest's caches -- `pack_store`, `unpack_store`, `buffer_targets`,
    `vertex_attribs`, `gexgl_ff_arrays`, `gexgl_client_texture_unit`,
