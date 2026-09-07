@@ -98,10 +98,30 @@ int main(void) {
             fprintf(stderr, "%d%s", samples[i], i + 1 < want ? "," : "");
         fprintf(stderr, "%s\n", want ? "" : "(none)");
 
-        /* Every advertised count must allocate. Highest first, which is what
-           the CTS uses and the one most likely to be over-promised. */
-        int refused = 0;
+        /* Every advertised count *above one* must allocate. One is excluded
+           because it is not a claim the driver makes: st_QuerySamplesForFormat
+           substitutes a single count of 1 when the driver reports none at all,
+           so a format that cannot be multisampled comes back saying "1"
+           whatever the driver said. Whether that 1 then allocates depends on
+           st bumping a one-sample request to two and searching upward, which
+           is a separate question from whether this driver over-promises --
+           and the one the probe is for. Reported below either way. */
+        int refused = 0, forced_one = 0;
         for (GLint i = 0; i < want; ++i) {
+            if (samples[i] <= 1) {
+                GLuint one = 0;
+                glGenTextures(1, &one);
+                glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, one);
+                glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 1,
+                                          fmt->token, 16, 16, GL_TRUE);
+                forced_one = drain() == GL_NO_ERROR ? 1 : -1;
+                glDeleteTextures(1, &one);
+                drain();
+                fprintf(stderr, "INFO   %s the fallback count of 1 %s\n",
+                        fmt->name, forced_one == 1 ? "allocates"
+                                                   : "is refused");
+                continue;
+            }
             GLuint tex = 0;
             glGenTextures(1, &tex);
             glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, tex);
