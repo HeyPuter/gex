@@ -4607,7 +4607,15 @@ static size_t material_parameter_floats(unsigned pname) {
     switch (pname) {
     case 0x1600: return 4;   /* GL_EMISSION */
     case 0x1601: return 1;   /* GL_SHININESS */
-    case 0x1602: return 3;   /* GL_AMBIENT_AND_DIFFUSE is 4; COLOR_INDEXES 3 */
+    /* GL_AMBIENT_AND_DIFFUSE is 0x1602 and takes four; GL_COLOR_INDEXES is
+       0x1603 and takes three. This said three for 0x1602 -- and the comment
+       beside it said which was which, so the note was right and the code
+       disagreed with it. glMaterialfv(face, GL_AMBIENT_AND_DIFFUSE, rgba) is
+       how fixed-function content colours a lit object, and it sent three
+       floats: the host fills a zeroed array with the count it is given, so
+       every such material came out with an alpha of zero. */
+    case 0x1602: return 4;   /* GL_AMBIENT_AND_DIFFUSE */
+    case 0x1603: return 3;   /* GL_COLOR_INDEXES */
     case 0x1200: case 0x1201: case 0x1202: return 4;
     default: return 4;
     }
