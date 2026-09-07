@@ -19710,3 +19710,56 @@ either -- declining the draw loses the rendering too, and over-applying side
 effects is the lesser wrong. What it is now is *not silent*: one line naming
 the request and what is lost, so the two cases it costs are explicable from the
 driver's own output rather than looking like an image-store bug.
+
+### The pipeline cache could be handed a deleted shader's address
+
+The render pipeline cache keys on the *serialised bytes* of the descriptor,
+which is deliberate: a field left out of an enumerated key returns the wrong
+pipeline, while a byte that varies for no reason only costs a miss. But
+serialising keeps every field's **value**, not any object's **identity**. The
+descriptor names the shader modules by address, and Dawn hands an address
+straight back once the module behind it is released -- so a program compiled
+after another is deleted can land on the same addresses, match a cached key
+byte for byte, and be given a pipeline built from the deleted shader.
+
+`cache_epoch` already exists for exactly this, and sampler views, sampler
+states and grown buffers already bump it with that reasoning written down. Two
+things were missing: deleting a shader did not bump it, and **the pipeline
+cache did not consult it at all**, so even the existing bumps protected only
+the bind group cache.
+
+How it presented: one case of `shading_language_420pack` failed in the browser
+while its five siblings passed *in the same run*, and passed both alone and as
+its own subfamily (31/31). That shape -- fails in the family, passes in
+isolation, siblings unaffected -- is a cache collision rather than the latch it
+first resembles. `GEX_WGPU_NO_PIPELINE_CACHE=1` made the whole family match
+native, which named the cache in one run; the switch existing is the only
+reason this was cheap. **Browser 326/329 -> 327/329, equal to native.**
+
+Two other browser-only gaps were *not* this -- `transform_feedback` 18/21 and
+`vertex_attrib_binding` 25/30 against native's 19 and 26 -- and remain open.
+
+## The browser column, which is the one that matters
+
+Measured 2026-09-07 over the same sixteen families as the native table above,
+after the day's fixes. **41 failures against native's 50**, and the browser is
+the target:
+
+| family | pass | fail | note |
+|---|---|---|---|
+| shader_image_load_store | 37 | 12 | 2 are early_fragment_tests; 1 browser-only |
+| vertex_attrib_binding | 25 | 5 | one worse than native, cause unknown |
+| compute_shader | 38 | 4 | same as native |
+| shader_storage_buffer_object | 120 | 4 | same as native |
+| texture_view | 3 | 4 | all the multisample-array wall |
+| transform_feedback | 18 | 3 | one worse than native, cause unknown |
+| shading_language_420pack | 327 | 2 | equal to native after the cache fix |
+| program_interface_query | 41 | 2 | same as native |
+| shader_atomic_counters | 28 | 2 | *better* than native's 27/3 |
+| gpu_shader5, shader_subroutine | 48 | 2 | same as native |
+| sample_variables | 134 | 0 | closed today |
+| texture_gather, explicit_uniform_location, buffer_storage, cull_distance | 334 | 0 | clean |
+
+The browser beats native in three families and trails in two. Where it trails
+is worth more than where it leads: those are *our* bugs in the transport or the
+JS layer, which no native gate can see.
