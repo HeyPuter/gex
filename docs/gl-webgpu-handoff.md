@@ -18908,3 +18908,61 @@ The wire width is a property of the protocol and not of either side's ABI.
 `WIRE_ELEMENT_BYTES` in tools/gen_gl44_transport.py declares it once and both
 ends size from it. **Any array of a pointer-sized type crossing this transport
 needs that treatment** -- `sizeof()` on either side is the bug.
+
+## A fragment shader reading gl_ClipDistance: linking fixed, values not
+
+WGSL has clip distances only as a vertex **output** and forbids array-typed
+inter-stage IO, so a fragment shader reading `gl_ClipDistance` or
+`gl_CullDistance` cannot be expressed at all. Tint reports
+
+    no matching call to 'bitcast<f32>(array<f32, 8>)'
+
+which names *its own* failed workaround: disassembling the rejected module
+shows **no `OpBitcast` anywhere** in what we emitted, just a Fragment entry
+point with `BuiltIn ClipDistance` as an input array. The module is refused, so
+the **program fails to link** -- the application dies rather than drawing
+something wrong, which makes this worse than an ordinary conformance gap.
+
+**Fixed.** The distances are ordinary interpolated floats, so they travel as
+ordinary varyings: up to eight in two vec4s. The two stages agree on where
+without either being told, because both call
+
+    gex_wgpu_free_varying_locations(ctx, n, out)
+
+with the same context -- the generalisation of the search
+`gex_wgpu_point_coord_location` already did for one location. The real
+clip-distance outputs are untouched, so the rasteriser still clips by them.
+Everything is gated on `fs->reads_clip_dist`, which no working shader has,
+because such a program does not link today; an ordinary pipeline stays one
+variant. KHR-GL44.cull_distance went from **16 Tint rejections to 0**, native
+and browser both, and its shaders link.
+
+**Its eight `max_culldist_*` cases still fail, on values, and the cause is
+known.** `gex_wgpu_neutralise_cull_distances` runs "after both clones and
+before the module and its variants" and overwrites the cull components with
+1.0 so the rasteriser will not clip on them. The carriers are emitted in an
+interp variant cloned from that already-neutralised shader, so the fragment
+stage reads real clip distances and **1.0 for every cull distance**.
+
+**Why it is not fixed here.** The carriers would have to be emitted before
+neutralisation, which means they exist at placeholder locations through the
+whole shader-creation pipeline and must then be renumbered or stripped in
+*every* vertex module path -- base, y-flipped, wide-point, buffer-texture,
+integer-sampled and interp. Miss one and that path carries an out-of-range
+`@location` and its pipeline is rejected, in a path that works today. Against
+eight cases, with 194 cull_distance cases passing and real applications using
+clip planes by *writing* them, that is the wrong trade to make without a full
+verification run. `gex_wgpu_compile_nir` looks like a single choke point and is
+not: of its sixteen callers several are the capture path, which must keep the
+real cull values because that is what the cull is decided from.
+
+**Two facts worth not rediscovering:**
+
+* `GEX_WGPU_CLIP_LOG=1` prints the fragment input's shape. For these cases it
+  is one merged eight-element array at `CLIP_DIST0` with `clip_size=2
+  cull_size=6` -- Mesa has already resolved `gl_CullDistance[i]` to merged
+  index `2+i`, so a fragment-side mapping that adds the cull base again is
+  wrong.
+* Mesa merges the two arrays into `CLIP_DIST0` when there are more than four
+  distances between them; when it splits them, `CLIP_DIST1` holds components
+  four and up at its **own** index zero.
