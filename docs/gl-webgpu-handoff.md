@@ -19736,8 +19736,10 @@ first resembles. `GEX_WGPU_NO_PIPELINE_CACHE=1` made the whole family match
 native, which named the cache in one run; the switch existing is the only
 reason this was cheap. **Browser 326/329 -> 327/329, equal to native.**
 
-Two other browser-only gaps were *not* this -- `transform_feedback` 18/21 and
-`vertex_attrib_binding` 25/30 against native's 19 and 26 -- and remain open.
+Two other browser-only gaps were *not* this. `vertex_attrib_binding` is fixed
+below; `transform_feedback` 18/21 against native's 19 remains open, and its
+failing case is `api_errors_test`, already narrowed to one assertion earlier in
+this document.
 
 ## The browser column, which is the one that matters
 
@@ -19748,7 +19750,7 @@ the target:
 | family | pass | fail | note |
 |---|---|---|---|
 | shader_image_load_store | 37 | 12 | 2 are early_fragment_tests; 1 browser-only |
-| vertex_attrib_binding | 25 | 5 | one worse than native, cause unknown |
+| vertex_attrib_binding | 26 | 4 | equal to native after the VAO fix below |
 | compute_shader | 38 | 4 | same as native |
 | shader_storage_buffer_object | 120 | 4 | same as native |
 | texture_view | 3 | 4 | all the multisample-array wall |
@@ -19763,3 +19765,53 @@ the target:
 The browser beats native in three families and trails in two. Where it trails
 is worth more than where it leads: those are *our* bugs in the transport or the
 JS layer, which no native gate can see.
+
+### Attribute state belongs to the VAO, not the context
+
+Three pieces of guest state were one flat set per context: the pointers
+`glGetVertexAttribPointerv` gives back, the client-array records the draw path
+uploads from, and the count of them. GL keeps every one **per vertex array
+object**, so binding a fresh VAO showed the previous one's state.
+`vertex_attrib_binding.basic-state4` read
+
+```
+GL_VERTEX_ATTRIB_ARRAY_POINTER(0) is 640 should be 0
+```
+
+-- an offset left behind by the case before it. It passed alone, passed in its
+own subfamily, and failed in the family: leaked state rather than a wrong call.
+Browser 25/30 -> **26/30**, equal to native.
+
+Browser-only for a reason worth remembering: the pointer is the one piece of
+attribute state the guest *must* answer itself, because a client array's
+pointer is guest memory the host is never told about. So it is also the piece
+most likely to be kept in the wrong place -- check it first when VAO state
+looks wrong. The live arrays are now saved to and loaded from a slot on each
+bind, in a demand-created list rather than a fixed table: an application may
+have hundreds of VAOs and a cap would put the bug back for whatever came last.
+
+### The instrument was reporting nothing, twice over
+
+Getting that one line took fixing the CTS log wrapper, which had two faults,
+the first hiding the second.
+
+**It was never being rebuilt.** `tests/gl44-cts-browser.sh` rebuilds it from
+source on every run -- its own comment says "an instrument that does not track
+its source reports yesterday's answers" -- but only if `GEX_CTS_TOOLCHAIN` is
+set or a musl gcc is on `PATH`, and on this machine *neither* is: the toolchain
+lives where `guest/gl/build.sh` defaults to. Both branches were false, the
+stale binary was used, and **every edit I made to the wrapper was inert**,
+including two attempts at the fix below that appeared to do nothing. The
+default is added, and it now says so when it cannot rebuild.
+
+**Its census counted the suite's own GL call trace.** Several cases log every
+call they make, and the census is sized to fit a terminal -- the harness
+captures a reflowing screen buffer -- so for `basic-state4` it spent every row
+on `glGetError();` and `// data = { 0 }`, with a single `glMemoryBarrier` line
+listing every barrier bit taking four rows by itself.
+
+Recognising trace lines took two goes, and the failure is instructive: a call
+line starts with `gl` plus an upper-case letter -- but so does
+*"glVertexAttribDivisor state change check failed."*, which is prose. Dropping
+it is how the first filter hid the very message it was written to reveal. **A
+call has parentheses; prose does not.**
