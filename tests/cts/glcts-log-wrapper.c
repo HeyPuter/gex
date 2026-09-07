@@ -88,6 +88,25 @@ int main(int argc, char **argv)
            into a guess. Counted here from the QPA log, which is complete, and
            printed twice so at least one copy survives the capture. */
         unsigned long total_pass = 0, total_fail = 0, total_skip = 0;
+        /* The messages the current case logged, kept until its result is
+           known.
+           
+           dEQP's <Result> body is a one-word verdict for most families --
+           "Fail", and nothing else -- while the sentence that says *what*
+           mismatched is a <Text> the case wrote earlier. Those were being
+           folded into the sweep-wide census by kind and never attached to the
+           case that failed, so a silent failure in a browser reported "Fail"
+           with its reason discarded. Four browser-only cases each cost
+           several probe cycles to characterise for want of this, and one of
+           them has had seven hypotheses eliminated without the CTS's own
+           answer ever being read.
+           
+           A ring, and printed only for a failure, because these are the
+           majority of the log's volume and a passing sweep must stay
+           readable. */
+        enum { DETAIL_KEEP = 6, DETAIL_CHARS = 240 };
+        static char detail[DETAIL_KEEP][DETAIL_CHARS];
+        unsigned ndetail = 0;
         puts("QPA-BEGIN");
         while (getline(&line, &capacity, log) >= 0) {
             static const char marker[] = "#beginTestCaseResult ";
@@ -96,6 +115,7 @@ int main(int argc, char **argv)
                 char *nl = strchr(path, '\n');
                 if (nl) *nl = '\0';
                 snprintf(current, sizeof(current), "%s", path);
+                ndetail = 0;
                 continue;
             }
             char *status = strstr(line, "StatusCode=\"");
@@ -128,6 +148,15 @@ int main(int argc, char **argv)
                         while (*body == ' ') ++body;
                         if (*body) printf("QPA-WHY    %s: %s\n", current, body);
                     }
+                    /* And what the case itself said, oldest first. This is
+                       the line that names the mismatched field. */
+                    const unsigned kept = ndetail < DETAIL_KEEP
+                        ? ndetail : DETAIL_KEEP;
+                    const unsigned first = ndetail < DETAIL_KEEP
+                        ? 0 : ndetail % DETAIL_KEEP;
+                    for (unsigned k = 0; k < kept; ++k)
+                        printf("QPA-SAID   %s: %s\n", current,
+                               detail[(first + k) % DETAIL_KEEP]);
                 }
                 /* Tally both halves of the name separately. */
                 char split[512];
@@ -208,6 +237,14 @@ int main(int argc, char **argv)
                The harness captures a screen buffer rather than a pipe -- it
                reflows, and lines are simply lost -- so a census only means
                anything if it is small enough to fit. */
+            /* Into the ring first: the census below truncates the message at
+               its first colon to group by kind, and the part after the colon
+               is the half that carries the numbers. */
+            if (current[0]) {
+                snprintf(detail[ndetail % DETAIL_KEEP], DETAIL_CHARS, "%s",
+                         text);
+                ++ndetail;
+            }
             const char *full = text;
             char key[160];
             snprintf(key, sizeof(key), "%s", text);

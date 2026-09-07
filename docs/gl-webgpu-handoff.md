@@ -19059,3 +19059,63 @@ fails there only, silently, with no driver message. The same Mesa runs on both
 sides, so this is more likely a difference between native Dawn and the
 browser's WebGPU than driver logic -- diagnosing it means comparing rendered
 output for that one case, and it is one case out of 218.
+
+## The CTS's own reason, surfaced
+
+`tests/cts/glcts-log-wrapper.c` printed `QPA-WHY <case>: <the Result body>`,
+and for most families dEQP's Result body is one word -- "Fail". The sentence
+that says *what* mismatched is a `<Text>` the case logged earlier, and those
+were folded into the sweep-wide census by kind and never attached to the case
+that failed. So every silent browser CTS failure arrived as "Fail" with its
+reason discarded, which is why four browser-only cases each cost several probe
+cycles to characterise.
+
+It now keeps a six-deep ring of the current case's messages and prints them,
+oldest first, **only for a failure**:
+
+    QPA-WHY    KHR-GL44.fake.case_one: Fail
+    QPA-SAID   KHR-GL44.fake.case_one: glVertexAttribDivisor state change check failed.
+    QPA-SAID   KHR-GL44.fake.case_one: VERTEX_BINDING_DIVISOR is 7 should be 3
+
+Only for failures because these messages are most of the log's volume and a
+passing sweep has to stay readable. The ring is recorded before the census
+truncates the message at its first colon, which is where the numbers live.
+
+Worth knowing: `basic-state4` and `transform_feedback.api_errors_test` log
+*nothing* before failing, so this does not help those two. It will name the
+reason for any case that does, which is most of them.
+
+## Two browser-only failures are order-dependent
+
+    basic-state4                                  alone: pass   in basic-state*: fail
+    cull_distance functional_test_item_7_...       alone: 8/0    in the family: 1 fail
+
+Both pass in isolation and fail inside their family, in the browser only.
+`transform_feedback.api_errors_test` fails alone, so it is a different problem.
+
+**A mechanism that looks right and is not.** The guest's state caches --
+`pack_store`, `unpack_store`, `buffer_targets`, `vertex_attribs`,
+`gexgl_ff_arrays`, `gexgl_client_texture_unit`, `extension_count` -- are
+process-global statics, and `eglDestroyContext` is a no-op, so a new context
+inherits the previous one's cached state. That is a real latent bug (see
+below), but it does **not** explain these two: counting the driver's "context
+requested" lines across a four-case run gives **one** context. dEQP reuses a
+single context per family, so there is no teardown between cases and nothing
+that should have been reset.
+
+Eight hypotheses are now eliminated for basic-state4 -- none of the sixteen
+state pnames, not the divisor aliasing, not a latched error, not VAO-lifecycle
+leakage, not the 64-bit failures, not context teardown. What is left is that
+some state basic-state1..3 sets is reported wrongly only once set, and the
+case logs nothing to say which.
+
+### The latent bug it turned up
+
+Independent of the above: with the caches process-global and
+`eglDestroyContext` a no-op, an application that uses **more than one GL
+context** gets one context's cached pixel-store, buffer-binding and
+vertex-attribute state while another is current. Per-context storage is the
+correct fix; resetting on `eglMakeCurrent` is not, because a program switching
+between two contexts would then read defaults instead of the state it left.
+Toolkits that create a second context, and programs that recreate theirs on
+resize, are the shapes that would hit it.
