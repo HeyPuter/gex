@@ -21307,3 +21307,107 @@ format was missing.
 an image atomic, which the rasterising copy cannot perform. Lifting one refusal
 moves the failure to the next one, which is the expected shape and is the
 separate vertex-atomic gap.
+
+## Where the native path's time goes, and why it is not the product's (2026-09-07)
+
+Measured with `GEX_WGPU_TIMING=1` on glxgears, so this does not have to be
+re-derived:
+
+    168.4 frames/s, 3537 draws/s, 21 draws/frame,
+    2% of wall in draw_vbo, 0% in state calls, 43% in present
+    40000 draws, 235 ms in draw_vbo (6 us/draw: pipeline 1, views 1,
+    begin 1, setters 1, rest 1 -- everything else 0)
+
+**The draw path is not the bottleneck and has no headroom worth chasing**: six
+microseconds a draw, two per cent of wall, with every sub-bucket at or below a
+microsecond. A perf idea that starts "make draws cheaper" is arguing about 2%.
+
+**The 43% in present is a native-path artefact.** Presenting to an X11 window
+here means a GPU-to-CPU readback and an image put; the browser presents through
+a canvas texture and does no readback at all. So that number says nothing about
+the product, and optimising it -- double-buffering the readback, say -- would
+buy the development path only. Browser SuperTuxKart already makes its frame
+budget with room to spare (59.7 FPS, 99.67% fresh, 2 rAF misses), which is the
+measurement that counts.
+
+**The submit-break counters point somewhere real but expensive.** The gate
+reports 7635 submits for 39997 batched draws, 5731 of the breaks attributed to
+`gex_wgpu_buffer_unmap`. Those are correct: a write map of a buffer the pending
+batch reads must not overwrite it, and the note in
+`gex_wgpu_batch_conflicts_usage` records the SuperTuxKart scene collapse that
+came of skipping the check. The real answer is **buffer renaming** -- on a
+`DISCARD_WHOLE_RESOURCE` map, allocate a fresh `WGPUBuffer` and leave the old
+one alive for the recorded draws, so nothing has to be flushed. That is a
+genuine improvement and a genuine piece of work: it needs a deferred-release
+list keyed to the batch, and it invalidates cached bind groups for the resource.
+Not attempted; recorded so the next attempt starts from the measurement rather
+than from the idea.
+
+## The 16-family native score, re-measured (2026-09-07)
+
+`GEX_CTS_NATIVE=1 GEX_CTS_PREFIX=KHR-GL45 tests/gl44-cts-families.sh`, so the
+next session plans against a number that is a day old rather than a month:
+
+    compute_shader                  38   4   0
+    shader_image_load_store         39  10   2
+    shader_atomic_counters          28   3   0
+    texture_gather                  75   0   0
+    texture_view                     3   4   0
+    program_interface_query         41   2   0
+    explicit_uniform_location       48   0   0
+    shader_storage_buffer_object   121   3   0
+    vertex_attrib_binding           26   4   0
+    buffer_storage                   9   0   0
+    shading_language_420pack       327   2   0
+    gpu_shader5                     21   1   0
+    transform_feedback              19   2   0
+    shader_subroutine               27   1   0
+    sample_variables               134   0  56
+    cull_distance                  202   0  16
+    TOTAL                         1158  36  74
+
+**All 36 failures, grouped by the driver's own refusal**, which is the only
+ranking worth planning from:
+
+- **3-4 -- a vertex shader using the *result* of an image or buffer atomic.**
+  The single biggest cause, and the one that blocks the other half of the
+  format-less imageBuffer work. The design is deliberate: the rasterising copy
+  has the atomic rewritten to zero and the shader is marked unrasterisable, so
+  a draw that would rasterise it is declined by name rather than drawn wrong.
+  **The exact fix is available and is not "close enough":** the compute clone
+  already performs the atomic for real, so it could *record its result per
+  vertex* into the capture buffer and the rasterising copy could read that back
+  instead of performing it. Both copies share the shader's control flow, so the
+  recorded value is consistent on every path. Bounded by one capture slot per
+  atomic site per vertex.
+- **2 -- two capture bindings writable over one range.** The aliasing decline,
+  in the capture path.
+- **4 -- adapter limits, and they are real.** `GEX_WGPU_LIMIT_TRACE` says the
+  adapter reports **10 storage buffers per stage** (vertex 10, fragment 10)
+  against our request of 16, and **32 colour bytes per sample** against our
+  request of 64. Asking is already done -- this is not another
+  "ask for the limit". Past them needs the packed-image consolidation (N images
+  into one buffer addressed by the existing per-slot header, so N+1 bindings
+  become 2), which is architectural.
+- **4 -- `texture_view`, all of it the multisampled array texture WGSL has no
+  type for.** A platform wall.
+- **3 -- 64-bit vertex attributes** (`vertex_attrib_binding`'s `inputL` and
+  `advanced-bindingUpdate`): Tint refuses `unhandled float width: 64`. st hands
+  us `PIPE_FORMAT_R64*_FLOAT` unsplit, and serving it exactly means declaring
+  each attribute as `Uint32x2`/`Uint32x4` pairs -- `dvec3`/`dvec4` need two
+  WebGPU attributes each -- plus a NIR pass packing two 32-bit loads into the
+  double. Truncating to float instead would be a silent precision lie, so it is
+  that or nothing. **Low real-world value**: fp64 *vertex attributes* are rare
+  even in CAD, which computes in double and uploads float, and FreeCAD already
+  renders.
+- **1 each, all distinct**: `workgroupBarrier` in non-uniform control flow (a
+  WGSL rule); a dynamically indexed uniform block array (`load_ubo
+  block-index-const=0` -- the same unroll the sampler arrays already get);
+  a compute texture dimension the driver cannot bind; a non-layered binding of
+  a 3D slice; `single-byte_data_alignment`; an unknown SPIR-V builtin; a
+  missing `@blend_src` pair; sampling in the tessellation control stage;
+  a multisampled array texture.
+
+**Nothing here is a cluster of ten any more.** The largest single win available
+is the vertex-atomic capture-back at 3-4 cases; everything else is one or two,
+or a platform wall.
