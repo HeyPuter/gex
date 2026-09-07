@@ -20991,3 +20991,40 @@ Gates: probe suite 168 OK with the same seven expected -- no false positive
 from the new check -- `shader_image_load_store` unchanged at 36/51, CTS gate at
 every baseline, browser `image` 15/15, Blender identical at mean 61 / 336
 colours, Krita `panels_rmse=0`, browser STK 59.90 FPS at 99.83% fresh.
+
+### single-byte_data_alignment: two causes ruled out
+
+The last undiagnosed case in the family, and it fails with **no driver message
+at all** -- a silent wrong answer. Traced with `GEX_WGPU_IMAGE_TRACE=1`, the
+classification is:
+
+    gex-imgslot: 'u_destination_image' fmt=r8_uint location=0 access=W
+    gex-imgslot: 'u_source_image'      fmt=r8_uint location=1 access=R
+    gex-shstate: stage=4 images=1 packed=1
+
+So the write-only destination goes through the **packed** route -- WebGPU has no
+`r8uint` storage texture -- while the read-only source is an ordinary sampled
+texture, which `r8uint` is allowed to be. Both are served, which is why nothing
+is refused.
+
+**Two obvious causes are not it.** Both were checked in the source rather than
+by implementing something:
+
+1. **The sub-word store is not a lost read-modify-write.** Several byte texels
+   share a 32-bit word, and the lowering already knows: it clears the texel's
+   field with an `iand` and sets it with an `ior`, two atomics, "which touch no
+   other texel's bits and so need no ordering between them". The load side
+   shifts and masks to match. This is written and correct.
+2. **The copy-back is not missing.** `gex_wgpu_end_pass` calls
+   `gex_wgpu_flush_packed_images` after closing the render pass and while the
+   encoder is still open, "which is the only window a texture copy can be
+   recorded in", so a fragment shader's packed writes do reach the texture.
+
+What is left to check is the *row arithmetic* on the way back: the copy from
+the packed buffer into an `r8uint` texture needs its rows where WebGPU's
+256-byte `bytesPerRow` rule puts them, and the shader's addressing has to use
+the same stride out of the header. A tight row in one and a padded row in the
+other would land every row but the first in the wrong place -- which is exactly
+the shape of a silent wrong answer, and exactly what
+[[measure-rows-in-the-stored-format]] is about. Dumping the destination texture
+after the draw is the next step, not more reading.
