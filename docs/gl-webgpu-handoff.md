@@ -18489,3 +18489,125 @@ against, mid-run — which produced a `point-parameter FAIL` in an otherwise
 clean sweep, for a pure state probe with no rendering in it that passes 10 of
 10 when run again. A probe that fails in a sweep and passes alone is
 contamination until proven otherwise.
+
+## Three count tables, and the one next door (2026-09-06)
+
+A glGet pname that returns several values, carried as one. Silent every time:
+the caller's array keeps whatever it held and no GL error is raised. Three of
+these in one pass, all found by reading rather than by a failure.
+
+`GL_COMPUTE_WORK_GROUP_SIZE` is three integers. dEQP checks it in the *setup*
+of its compute cases, so simple-compute, one-work-group and dispatch-indirect
+failed before their bodies ran.
+
+`GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES` is one index per
+active atomic counter. Every other property that call returns is a single
+integer, so it was declared single-valued and only the first index crossed.
+
+The compatibility profile's multi-valued state was absent from the component
+table entirely, so `glGetFloatv(GL_MODELVIEW_MATRIX, m)` carried a single
+float. Also the projection and texture matrices and their transposed
+spellings, the current colour and raster state, fog colour, light-model
+ambient, accumulation clear value, current normal, point distance attenuation
+and the map grid domains.
+
+### The structural point
+
+That table exists **twice** -- `gexgl_state_query_components` in
+`guest/gl/gexgl.c` and `integer_query_components` in `web/mobilegl` -- and the
+two must agree exactly, because the guest sizes the reply it will accept from
+its own copy. They did agree. On one, for every pname neither had.
+
+**A disagreement between two tables is loud; a shared omission is invisible.**
+So the way to audit that pair is to ask what is missing from both, not to diff
+them against each other. Anything new should send the count from one side
+instead: the fixed-function getters added in the same pass do that, and the
+setters already did.
+
+### And the table next door
+
+While reading those, `material_parameter_floats` had
+
+    case 0x1602: return 3;   /* GL_AMBIENT_AND_DIFFUSE is 4; COLOR_INDEXES 3 */
+
+`GL_AMBIENT_AND_DIFFUSE` is 0x1602 and takes four; `GL_COLOR_INDEXES` is
+0x1603 and takes three, and was not listed at all. The note beside the line
+was right and the code did the opposite. `glMaterialfv(face,
+GL_AMBIENT_AND_DIFFUSE, rgba)` is how fixed-function content colours a lit
+object, and it sent three floats -- the host fills a zeroed array with the
+count it is handed, so every such material rendered with an alpha of zero.
+
+**When you fix a count table, read its neighbours.** This one sat between two
+that had just been corrected for the same class of mistake.
+
+## A regression, and the two accidents that caught it (2026-09-06)
+
+The binding-name translation added earlier the same day converted the first
+component of *every* float state query through GLuint:
+
+    values[0] = (GLfloat)binding_query_external(pname, (GLuint)values[0]);
+
+Harmless for an integer binding. For `GL_CURRENT_COLOR`'s red 0.25 it
+truncated to 0, and `GL_LINE_WIDTH` 0.5 and `GL_BLEND_COLOR` would have gone
+the same way. A 126-probe browser sweep passed clean over it, because no
+existing probe read float state with a fractional first component.
+`binding_query_object` now reports whether the pname names an object at all
+and leaves the value untouched when it does not.
+
+Neither thing that surfaced it was design.
+
+`gl44-matrix-query-probe` **skipped** in the browser, and the pass was
+checked rather than taken. `GL_CONTEXT_PROFILE_MASK` answered the core bit
+unconditionally, so a context created with
+`EGL_CONTEXT_OPENGL_PROFILE_MASK` set to compatibility -- and one that gets
+compatibility by default, which is every application naming no version --
+reported core while the host's `GL_VERSION` said "Compatibility Profile". The
+two contradicted each other, and an application deciding whether fixed
+function exists reads the mask. Only once that was fixed did the probe run in
+the browser at all, and only then did the float truncation appear.
+
+And an earlier "pass" was the *stale driver*: `build-assets` had been
+redirected to `/dev/null` and its failure went unseen. **Silencing a build is
+how you come to test the wrong binary.**
+
+The regression's own gate went into `gl44-binding-query-probe`, on
+`GL_COLOR_CLEAR_VALUE` and `GL_LINE_WIDTH`, because those are core-profile
+queries: the probe that caught it needs a compatibility context and could
+never have guarded this.
+
+## Fixed-function state can be read back (2026-09-06)
+
+Seven entry points that did not exist: `glGetLightfv`/`iv`,
+`glGetMaterialfv`/`iv`, `glGetClipPlane`, `glGetTexEnvfv`/`iv`. The setters
+have been here since glxgears needed them.
+
+A missing entry point is not a wrong answer. The guest's `libGL` did not
+export the symbol, so a program that reads this state failed to link and never
+started -- a failure no rendering test can see. Both instruments were blind for
+defensible reasons: `tools/gl44_coverage.py` reports 653 of 653 and is right,
+because it counts the *core* command set; and `tests/gl-app-sweep.sh` runs the
+*native* libGL, where the symbols exist. **So the sweep can be clean across
+336 programs while a class of program cannot start in the browser at all.**
+
+`glGetTexGenfv` is still absent. Nothing needed it; the pattern above is what
+to copy if something does.
+
+## The app sweep, clean (2026-09-06)
+
+336 installed GL programs, each run against gex_wgpu and against the
+reference. **One `differs`**: `eglinfo`, which enumerates EGL platforms rather
+than rendering anything, and where *ours* succeeds while the reference exits
+non-zero -- the difference is the known absence of Wayland and GBM platforms
+in the native build. No other verdict mismatch. Six crashes, all compositors
+and Wayland clients (`hyprland`, `muffin`, `weston-simple-*`) that need a seat
+and DRM the harness does not provide, and all crashing identically on the
+reference.
+
+Zero driver-caused differences and zero driver-caused crashes.
+
+Two cautions about running it. The `differs` column is written `YES`, and a
+monitor testing for `yes` reports a vacuous clean sweep -- that mistake has
+been made here twice now. And nothing else may touch the GPU while it runs:
+the sweep says so, and separately, `meson install` during *any* sweep replaces
+the native oracle a probe is compared against, which manufactures a regression
+in a probe that has no rendering in it.
