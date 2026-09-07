@@ -20551,3 +20551,49 @@ things in one file, so reading each one is the work.
 **The general rule: when a cap gets looser, grep for the old value as a
 literal.** Asking the adapter for a limit is step one; following it into every
 check that assumed the old answer is step two.
+
+## Krita runs, and three more applications nothing had tested
+
+Four real desktop applications were installed on this machine and covered by
+**nothing**: `krita`, `gimp`, `inkscape` and `obs`. The app sweep's list is
+built from binaries that link `libGL` directly, and Krita and OBS reach GL
+through Qt, so they were never in it; the candidate gate had never been given
+them either. That is a gap in the *list*, not in the driver, and it is the kind
+worth looking for -- the sweep's 341 entries are mesa-demos and piglit-style
+tests, and four real applications are worth more per GPU-minute than another
+hundred of those.
+
+All four reach the driver and **none of them is refused anything**:
+
+| app | driver lines | refusals |
+|---|---|---|
+| krita | 56 | 0 |
+| gimp | 21 | 0 |
+| inkscape | 21 | 0 |
+| obs | 21 | 0 |
+
+Twenty-one is the startup format-query baseline -- a context created and little
+else, which is what GIMP and Inkscape do because they draw their canvases
+through cairo, and what OBS does with no scene configured. Krita's 56 is real
+work, so it got a gate of its own.
+
+**`tests/gates/app-krita.sh` photographs Krita with a document open**, which is
+what puts its OpenGL canvas on screen. It renders correctly: the full UI, the
+canvas showing the document, the Advanced Color Selector's HSV wheel and
+triangle, layer thumbnails, and a status bar agreeing with the file. Zero
+refusals over 56 driver lines.
+
+Krita is a named target rather than an arbitrary pick: its layer blend modes
+**are** `KHR_blend_equation_advanced`, which this driver serves through the
+colour-attachment snapshot. Exercising those specifically -- several layers
+with different blend modes -- is the obvious next step, since the gate as it
+stands only proves the canvas draws.
+
+### And Blender, measured properly this time
+
+The Blender gate took its driver from the caller, so two runs earlier in this
+session measured **radeonsi** and said nothing about gex_wgpu. Re-run through
+the fixed gate, which now prints `driver: gex WebGPU (bring-up)`: mean 61, 336
+colours, against radeonsi's 61 and 338, and the screenshot is correct in every
+detail. Near-identical numbers mean something here that they did not before --
+two *different* drivers agreeing, rather than one driver measured twice.

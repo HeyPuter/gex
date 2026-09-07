@@ -47,4 +47,16 @@ run dolphin-emu          15 dolphin-emu
 run cemu                 15 cemu
 run sunshine             10 sunshine
 run hello_xr             10 hello_xr -g OpenGL
+# Four real desktop applications that were installed here and tested by
+# nothing: not in the app sweep's list, which is built from binaries that link
+# libGL directly, and Krita and OBS reach GL through Qt and so do not. They are
+# the shape that matters most -- a toolkit creating a context, a canvas, and
+# blend modes -- and they need longer than the demos above to get a context up.
+#
+# Krita is a named target: KHR_blend_equation_advanced, which this driver
+# serves through the colour-attachment snapshot, *is* its layer blend modes.
+run krita                25 krita --nosplash
+run gimp                 25 gimp -s -f --no-shm
+run inkscape             20 inkscape
+run obs                  20 obs --minimize-to-tray
 echo DONE >> "$OUT/results.txt"
