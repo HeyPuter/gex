@@ -60,5 +60,16 @@ was missing was everything that drives them.
   compositor or a file, which is why the broad sweep in `tests/gl-app-sweep.sh`
   skips them.
 
+- `soak.sh [seconds] [stk|gears]` — does a long run stay flat? Verdict is on
+  the **slope**, not the peak: it samples the run's second half against its
+  first, so start-up allocation is not counted as growth, and a large steady
+  working set passes while a small persistent climb fails. This is the only
+  gate here that measures growth over *time*. Everything else runs for tens of
+  seconds and asks whether the answer is right — which is why all of it passed
+  while the driver leaked ~35 MiB of VRAM a second and capped every
+  application at under two minutes on a 4 GB card. `GEX_SOAK_GROWTH_MIB`
+  (default 64) is the budget; it refuses to start on a card that is already
+  loaded, because that measures the desktop rather than the driver.
+
 `run-native.sh` and `killmatch.py` are helpers the others use. Read the top of
 each script: they carry the reasons for what look like arbitrary choices.

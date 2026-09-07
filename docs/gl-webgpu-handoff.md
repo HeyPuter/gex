@@ -18060,12 +18060,39 @@ Five probes cover it -- `dsa` (20 cases), `debug`, `sso`, `robustness`, and
 
 #### The browser sweep
 
-`tests/gl44-browser-sweep.sh` runs every probe through chromium. After all of
-the above: **123 PASS of 129, and no real failures.** Two are deliberate skips
-(`glx-context`, `window-present` -- the aarch64-musl toolchain has no GLX or
-X11 headers), one is platform-blocked (`group-vote`), two are the driver
-beating the llvmpipe oracle (`quad`, `image-noformat-fs`), and one is the
-known `texture-sampler` DIFF. The previous run had eight, two of them real.
+`tests/gl44-browser-sweep.sh` runs every probe through chromium. **Re-measured
+2026-09-07: 171 PASS of 175, and the four that are not PASS are all platform
+facts** -- two deliberate skips (`glx-context`, `window-present`; the
+aarch64-musl toolchain has no GLX or X11 headers) and two expected failures,
+`group-vote` (platform-blocked) and `texture-sampler` (llvmpipe offers a 2x
+sample count, WebGPU core has 1 and 4, so one entry is the right answer and
+the number legitimately varies by adapter).
+
+**Three of the old FAILs were the gate, not the driver.** `quad` and
+`image-noformat-fs` are cases where the *oracle* fails, so the gate stopped at
+"native Mesa run did not pass" and **never ran them through the browser at
+all** -- they had sat in the FAIL column as things to remember rather than
+things measured. `internalformat-negative` was worse: the native reference is
+*stock* Mesa, which dies on the very case being tested, so the expectation
+fell back to the last line it managed to print -- a version string the browser
+can never match. All three now pass, honestly: `quad` 6/6, `image-noformat-fs`
+2/2, `internalformat-negative` 2/2, every case PASS.
+
+The fix is that each such probe **declares its own expectation in its C
+header**, in the shape `GEX_PROBE_EXPECT='SUMMARY ...'`, and
+`tests/gl44-probe.sh` reads it back with `sed`. One place, next to the reason
+for it, rather than a table in the gate that a new probe silently misses.
+Declare one only where the correct answer is that the probe fully passes and
+the reference is what fails, or where a failing case is deliberate
+(`two-contexts` at 7/8). **Never to pin a device-dependent value** --
+`texture-sampler` is deliberately left failing for exactly that reason.
+
+The earlier count in this section was 123 of 129, which is why the numbers
+moved: the suite has grown to 175 probes since.
+
+**A gate that reports FAIL for a passing probe is worse than no gate**: it
+teaches you to skim the FAIL column, and then a real regression hides among
+the names you have learned to ignore.
 
 ### The keyring was holding the browser (2026-09-06)
 
@@ -21201,6 +21228,22 @@ class is closed rather than merely patched in one place. The ones st owns
 falls behind `work_counter` -- a correct deferred queue, bounded by the work
 unit. `u_primconvert` releases its own inline. u_vbuf was the only one that
 kept a single slot for several writers.
+
+### The gate that would have caught it: `tests/gates/soak.sh`
+
+Nothing here measured growth over *time*. Probes, CTS families, app
+screenshots and FPS all run for tens of seconds and ask whether the answer is
+right -- and a leak is right at every instant and wrong by the minute, so the
+whole suite passed while every application was capped at under two minutes.
+
+    tests/gates/soak.sh [seconds] [stk|gears]
+
+Its verdict is on the **slope, not the peak**: it samples the run's second half
+against its first, so start-up allocation is not counted as growth, a large
+steady working set passes, and a small persistent climb fails.
+`GEX_SOAK_GROWTH_MIB` (default 64) is the budget. It refuses to start on a card
+that is already loaded, for the reason `drive.mjs` does -- that would measure
+the desktop rather than the driver.
 
 **This had been the most serious reliability defect on record here**: it capped
 any long-running application at under two minutes on a 4 GB card, and the

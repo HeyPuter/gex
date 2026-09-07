@@ -59,7 +59,28 @@ EXPECT=$(grep -oE 'SUMMARY cases=[0-9]+( passed=[0-9]+)? failed=0' "$WORK/mesa.l
 # answer here.
 #
 #   GEX_PROBE_EXPECT='SUMMARY cases=2 passed=2 failed=0' #     tests/gl44-probe.sh image-noformat-fs
-[ -n "${GEX_PROBE_EXPECT:-}" ] && EXPECT=$GEX_PROBE_EXPECT
+#
+# A probe that needs the override **declares it in its own header**, in that
+# exact shape, and this reads it back -- so the expectation lives in one place
+# next to the reason for it, rather than in a table here that a new probe
+# silently misses. Precedence: the environment, then the probe's own
+# declaration, then whatever the native run reported.
+#
+# Without this the sweep reported FAIL for a probe that passed. The native
+# reference for gl44-internalformat-negative is *stock* Mesa, which dies on
+# the case being tested, so EXPECT fell back to the last line it managed to
+# print -- a version string -- and the browser could never match it. A gate
+# that says FAIL for a passing probe teaches you to skim the FAIL column.
+#
+# Declare one only where the correct answer is that the probe fully passes and
+# the *reference* is what fails (image-noformat-fs, quad), or where a failing
+# case is deliberate (two-contexts). Never to pin a device-dependent value:
+# texture-sampler reports one sample count in the browser against llvmpipe's
+# two, and freezing that would turn a real native-vs-browser signal into a
+# permanent green.
+DECLARED=$(sed -n "s/.*GEX_PROBE_EXPECT='\([^']*\)'.*/\1/p" "$SOURCE" | head -1)
+if [ -n "$DECLARED" ]; then EXPECT=$DECLARED; fi
+if [ -n "${GEX_PROBE_EXPECT:-}" ]; then EXPECT=$GEX_PROBE_EXPECT; fi
 # Not every probe prints a SUMMARY -- gl44-state-probe ends with its own
 # marker line instead. Falling back to the last line the native run produced
 # keeps the gate generic rather than needing a pattern per probe.
@@ -75,6 +96,14 @@ if [ -z "$EXPECT" ]; then
     esac
 fi
 echo "expecting: $EXPECT"
+# Any failing case is a failure -- except where the expectation itself names
+# the failures that are correct (gl44-two-contexts expects failed=1, because
+# GL genuinely refuses part of what it asks). Contradicting the --want with
+# the --fail would make such a probe unpassable.
+case $EXPECT in
+    *failed=0) FAIL_PATTERN='SUMMARY .*failed=[1-9]|FATAL' ;;
+    *) FAIL_PATTERN='FATAL' ;;
+esac
 
 # A probe that needs GLX or Xlib cannot be built for the guest here, and that
 # is about this machine rather than about the driver: the guest's libGL really
@@ -186,5 +215,5 @@ node "$ROOT/web/test/drive.mjs" gears --allow-errors \
     --query "${GEX_GL_QUERY:-gl=mesa}" \
     --query "glclient=/fs/gl44-$NAME-probe" \
     $GUEST_ENV_ARGS \
-    --want "$EXPECT" --fail 'SUMMARY .*failed=[1-9]|FATAL' \
+    --want "$EXPECT" --fail "$FAIL_PATTERN" \
     --wall 120 --idle 60

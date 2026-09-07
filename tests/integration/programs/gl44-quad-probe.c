@@ -39,6 +39,16 @@
  *
  * Fixed-function on purpose: GL_QUADS does not exist in a core profile, so
  * this is the state real legacy programs put the driver in.
+ *
+ * Because llvmpipe -- the gate's default oracle -- is the one that is wrong
+ * here, the expectation is declared rather than measured from it, and
+ * tests/gl44-probe.sh reads this line back:
+ *
+ *   GEX_PROBE_EXPECT='SUMMARY cases=6 passed=6 failed=0'
+ *
+ * Without it the browser gate stopped at "native Mesa run did not pass" and
+ * this probe sat permanently in the sweep's FAIL column, never actually
+ * having been run through the browser at all.
  */
 #include <EGL/egl.h>
 #include <GL/gl.h>

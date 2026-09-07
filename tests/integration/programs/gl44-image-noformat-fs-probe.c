@@ -27,6 +27,15 @@
  * went nowhere. radeonsi returns 0.75 for both, as this driver does, and that
  * is the tie-breaker: a format-less store to a single-channel float unit is a
  * bug in llvmpipe rather than an unreasonable thing for a probe to ask.
+ *
+ * Because the reference is what fails, the gate cannot form its expectation
+ * from the native run -- it declares it here instead, and tests/gl44-probe.sh
+ * reads this line back:
+ *
+ *   GEX_PROBE_EXPECT='SUMMARY cases=2 passed=2 failed=0'
+ *
+ * Without it this probe sat permanently in the browser sweep's FAIL column as
+ * something to remember rather than something measured.
  */
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
