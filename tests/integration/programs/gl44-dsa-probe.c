@@ -26,6 +26,7 @@
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
 #include <GL/glcorearb.h>
+#include "gl-procs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +67,9 @@ int main(void) {
     NEED(context != EGL_NO_CONTEXT, "eglCreateContext");
     NEED(surface != EGL_NO_SURFACE, "eglCreatePbufferSurface");
     NEED(eglMakeCurrent(display, surface, surface, context), "eglMakeCurrent");
+    /* Resolved, not linked: see gl-procs.h. Without this the probe cannot run
+       against our own libGL at all. */
+    if (gex_load_procs() != 0) return 3;
 
     /* The version the engine would branch on. */
     GLint major = 0, minor = 0;

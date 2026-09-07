@@ -34,6 +34,7 @@
 #include <EGL/egl.h>
 #include <GL/gl.h>
 #include <GL/glext.h>
+#include "gl-procs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -108,6 +109,9 @@ int main(void) {
                                                  surface_attributes);
     if (context == EGL_NO_CONTEXT || surface == EGL_NO_SURFACE ||
         !eglMakeCurrent(display, surface, surface, context)) return 2;
+    /* Resolved, not linked: see gl-procs.h. Without this the probe cannot run
+       against our own libGL at all. */
+    if (gex_load_procs() != 0) return 3;
 
     const int have = have_extension("GL_ARB_buffer_storage");
     fprintf(stderr, "INFO version=%s buffer_storage=%d\n",

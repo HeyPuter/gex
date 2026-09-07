@@ -10,6 +10,7 @@
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
 #include <GL/glcorearb.h>
+#include "gl-procs.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -50,6 +51,9 @@ int main(void) {
     EGLSurface surface = eglCreatePbufferSurface(display, config, surface_attributes);
     NEED(context != EGL_NO_CONTEXT && surface != EGL_NO_SURFACE, "context/surface");
     NEED(eglMakeCurrent(display, surface, surface, context), "eglMakeCurrent");
+    /* Resolved, not linked: see gl-procs.h. Without this the probe cannot run
+       against our own libGL at all. */
+    if (gex_load_procs() != 0) return 3;
 
     /* A reset status is the one call an application polls per frame under
      * robustness. GL_NO_ERROR is the answer when nothing has been lost. */

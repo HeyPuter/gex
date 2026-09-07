@@ -143,6 +143,18 @@ for tree in "$ROOT/web/public" "$ROOT/web/dist"; do
     cp "$WORK/guest-gl/libGL.so.1" "$tree/fs/libGL.so.1"
 done
 
+# The glibc guest driver is a separate build -- the packaged desktop
+# applications are Debian, while the probes and gears are musl -- and this gate
+# only builds the musl one. So a probe can pass against a freshly built driver
+# while Blender and FreeCAD next door load a stale one. Building both here
+# would slow every probe run, so say it instead of hiding it.
+GLIBC_GL="$ROOT/web/public/fs/glibc/libGL.so.1"
+if [ -f "$GLIBC_GL" ] && [ "$ROOT/web/public/fs/libGL.so.1" -nt "$GLIBC_GL" ]; then
+    echo "note: web/public/fs/glibc/ is older than the driver just staged." >&2
+    echo "  The packaged desktop apps load that one -- run web/build-assets.sh" >&2
+    echo "  before trusting an app gate." >&2
+fi
+
 # GEX_GUEST_ENV=NAME=VALUE reaches the guest process as an environment
 # variable -- GEXGL_EXTENSION_TRACE=1 is the one worth knowing about, which
 # lists the host extensions the guest declines to repeat. Deliberately
