@@ -20181,3 +20181,52 @@ keys on *module addresses*, and `cache_epoch` exists because Dawn hands an
 address straight back once the object behind it is released. The bind group
 cache consults that epoch; whether every buffer path bumps it is the thing to
 check first.
+
+### The cause: resource destruction never bumped the epoch
+
+`cache_epoch` exists because Dawn hands an address straight back once the
+object behind it is released, and both caches key on the **serialised bytes**
+of their descriptors -- which name objects by address. It was bumped in four
+places: `gex_wgpu_delete_shader_state`, `gex_wgpu_sampler_view_destroy`,
+`gex_wgpu_delete_sampler_state` and `gex_wgpu_grow_buffer_for_block`.
+
+**`gex_wgpu_resource_destroy` was not one of them.** It releases the texture,
+the render-target scratch, its staging buffer and the buffer, and bumped
+nothing. So a buffer created after another was destroyed could land on the same
+address, match a cached bind group key byte for byte, and be handed a bind
+group built from the buffer that was already gone -- and the shader's store
+went into it. Exactly the hazard already written down for shader modules, one
+object type over.
+
+That is the whole explanation of the shape:
+
+- **Order-dependent**, because it needs a destroy-then-create at one address.
+  `gl44-ssbo-probe` deletes its buffer at the end of every case.
+- **Moved between cases** as the order changed, because which allocation reuses
+  which address moves with it.
+- **Cured by any heap perturbation**, including reading one environment
+  variable, because that changes the addresses.
+- **Browser-only**, because native Dawn's allocator does not hand the same
+  address back at the same moment.
+- **Silent**: the bind group is perfectly valid, so Dawn raises nothing. It is
+  just the wrong buffer.
+
+`gl44-ssbo-probe` is 7/7 in the browser again.
+
+#### One epoch was too blunt, and the gate said so
+
+Bumping `cache_epoch` from `resource_destroy` also invalidated every cached
+**pipeline**, and browser STK measured 59.7 -> 58.9 FPS and 99.6% -> 98.4%
+fresh across three runs each. A render pipeline descriptor names shader modules
+and pipeline state and **never a buffer or a texture**, so releasing a resource
+cannot make a cached pipeline wrong; rebuilding them all was pure cost.
+
+So there is a second counter, `resource_epoch`, which only the bind group cache
+consults (as `cache_epoch + resource_epoch`). Everything that bumped
+`cache_epoch` before still invalidates both, which keeps the conservative
+behaviour where it was already correct. Three runs after separating: 59.3, 59.6,
+58.6 FPS at 99.0%, 99.3%, 97.7% fresh -- most of the cost recovered, and any
+residual is inside this gate's own spread, which is as wide as the difference.
+Bind groups naming a destroyed resource still have to be rebuilt; narrowing
+that further would mean evicting only the slots that name it, which costs a
+scan per destroy and is worth measuring before assuming it is cheaper.
