@@ -20472,3 +20472,39 @@ tighter packing is worth the churn there.
 Gates: probe suite 165 OK of 172 with the same seven expected, CTS gate at
 every baseline, Alacritty exact against llvmpipe, Blender identical
 (mean 61, 338 colours), native STK a real scene (meangray 67, stdev 17).
+
+### The other three es_31 failures, diagnosed
+
+Two of the eight were recorded as undiagnosed and one as a format question.
+All three are now named, which is worth more than it sounds: two of them are
+not what they looked like.
+
+**`shader_storage_buffer_object.advanced-usage-sync` is a WGSL wall.** It fails
+with
+
+    Tint rejected SPIR-V: error: unknown SPIR-V builtin: 7
+
+SPIR-V builtin 7 is `PrimitiveId`, and the test's *fragment* shader calls
+`ModifyFS(gl_PrimitiveID)`. **WGSL has no `primitive_id` builtin**, and unlike
+`gl_Layer` or `gl_ViewportIndex` this one cannot be routed through a flat
+varying in general: the vertex stage would have to know its own *sequence
+number* within the draw, and WebGPU's `vertex_index` is the index **value** for
+an indexed draw, not a counter. So it is emulatable only for non-indexed
+independent primitives, which is not the same feature.
+
+Note it is only the fragment stage that is stuck. `gl_PrimitiveID` written by a
+geometry shader already works, because that stage is emulated as compute and
+the value travels as an ordinary output -- six CTS files use the builtin and
+this is the one shape that fails.
+
+**`shader_image_load_store.advanced-sync-imageAccess` and
+`advanced-memory-order-vsfs` are neither walls nor refusals.** Both run with no
+rejection, no decline and no GL error, and produce the wrong answer -- so they
+are correctness bugs, in the one area where this driver's structure is most
+likely to be wrong about GL's rules: `coherent` and memory ordering. WGSL has
+no `coherent`, and vertex-stage side effects are performed by a *separate
+compute dispatch* before the draw, which is a different order from the one GL
+describes. Worth attacking as a memory-model question rather than as two cases.
+
+**`basic-allTargets-store-fs` / `-cs`** remain the storage-format question:
+a format WebGPU will not store to. See the storage-format wall section.
