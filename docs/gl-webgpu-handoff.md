@@ -21411,3 +21411,44 @@ ranking worth planning from:
 **Nothing here is a cluster of ten any more.** The largest single win available
 is the vertex-atomic capture-back at 3-4 cases; everything else is one or two,
 or a platform wall.
+
+## Buffer textures in the compute-emulated stages: the real blocker (2026-09-07)
+
+`gex_wgpu_collect_stage_textures` refuses a `samplerBuffer` with "a buffer
+texture", and that refusal costs a **real** case: one of
+`shading_language_420pack`'s two failures is a tessellation control shader
+that does nothing more exotic than sample one --
+
+    cannot sample a texture in the tessellation control stage (a buffer texture)
+
+**It looks like wiring, and it is not.** Attempted and reverted. The struct
+gained the four `buftex_*` fields, the collector filled them instead of
+refusing, and the build was clean -- and then the actual blocker showed up:
+`gex_wgpu_apply_buffer_textures` needs a **per-slot texel word count**, which
+comes from the *bound sampler view* rather than from the shader (a
+`samplerBuffer` yields a vec4 whatever the format is). The graphics and compute
+stages therefore carry it **in the module's variant key** --
+`cached->buftex_words`, compared by `memcmp` -- and rebuild the module per
+draw when it changes.
+
+The geometry and tessellation stages have no such per-draw variant: their
+modules are built once at shader-create, where no view is bound and the word
+count cannot be known. So serving buffer textures there means giving those
+three stages a variant mechanism keyed on the bound formats, not calling two
+more helpers. The original comment ("more than this pair of helpers does") was
+right and this is the specific reason.
+
+**Two ways to close it, neither cheap:**
+1. give gs/tcs/tes a per-draw module variant keyed on `buftex_words`, the way
+   the fragment and vertex stages already have one; or
+2. resolve the format *in* the shader from a header block, the way the packed
+   images do -- which removes the word count from the key entirely and would
+   simplify the graphics stages too.
+
+(2) is the better shape and the larger change. Worth one case on its own;
+worth more if it also retires the `buftex_words` key.
+
+**What was left in place:** nothing. The refusal is honest, names its reason,
+and a half-done version -- a collector that records buffer textures nothing
+then lowers -- would trade a clear link error for a Tint rejection further
+away from the cause.
