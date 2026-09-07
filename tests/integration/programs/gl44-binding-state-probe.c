@@ -148,6 +148,51 @@ int main(void) {
     glGetVertexAttribiv(2, 0x88FE, &value);
     eq("attrib_divisor_follows_its_binding", value, 7);
 
+    /* Every attribute pname KHR-GL44.vertex_attrib_binding.basic-state4
+     * verifies, because it compares whole state structs and any one wrong
+     * field fails the case. Several of these read *through* the attribute's
+     * binding rather than from the attribute -- the stride and the buffer are
+     * the binding's, the same way the divisor is -- which is the part a
+     * transport can get wrong while every direct query looks right. */
+    glBindVertexBuffer(6, buf, 128, 32);
+    glVertexAttribFormat(7, 3, GL_FLOAT, GL_FALSE, 16);
+    glVertexAttribBinding(7, 6);
+    eq("through_binding_setup_is_clean", drain(), GL_NO_ERROR);
+
+    /* Not the binding's stride, which is the asymmetry worth pinning down:
+       the *buffer* follows the attribute's binding and the *stride* does not.
+       glVertexAttribFormat takes no stride, so the attribute's own stays zero,
+       and only glVertexAttribPointer sets it. Expecting 32 here failed against
+       the reference before it ever reached the browser -- which is the probe
+       catching my misreading of GL rather than a defect in the driver. */
+    glGetVertexAttribiv(7, 0x8624 /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */, &value);
+    eq("attrib_stride_is_its_own_not_the_bindings", value, 0);
+    glGetVertexAttribiv(7, 0x889F /* ..._ARRAY_BUFFER_BINDING */, &value);
+    eq("attrib_buffer_is_the_bindings", value, (long long)buf);
+    glGetVertexAttribiv(7, 0x8623 /* ..._ARRAY_SIZE */, &value);
+    eq("attrib_size", value, 3);
+    glGetVertexAttribiv(7, 0x8625 /* ..._ARRAY_TYPE */, &value);
+    eq("attrib_type", value, 0x1406 /* GL_FLOAT */);
+    glGetVertexAttribiv(7, 0x886A /* ..._ARRAY_NORMALIZED */, &value);
+    eq("attrib_normalized", value, 0);
+    glGetVertexAttribiv(7, 0x88FD /* ..._ARRAY_INTEGER */, &value);
+    eq("attrib_integer", value, 0);
+    glGetVertexAttribiv(7, 0x874E /* ..._ARRAY_LONG */, &value);
+    eq("attrib_long", value, 0);
+    glGetVertexAttribiv(7, 0x8622 /* ..._ARRAY_ENABLED */, &value);
+    eq("attrib_enabled", value, 0);
+    glGetVertexAttribiv(7, 0x82D5 /* ..._RELATIVE_OFFSET */, &value);
+    eq("attrib_relative_offset_again", value, 16);
+
+    /* An integer format, so INTEGER reads back set rather than always zero. */
+    glVertexAttribIFormat(8, 2, GL_INT, 4);
+    glVertexAttribBinding(8, 6);
+    drain();
+    glGetVertexAttribiv(8, 0x88FD, &value);
+    eq("attrib_integer_when_set", value, 1);
+    glGetVertexAttribiv(8, 0x8625, &value);
+    eq("attrib_integer_type", value, 0x1404 /* GL_INT */);
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

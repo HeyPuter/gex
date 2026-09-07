@@ -18991,3 +18991,59 @@ carrier count stays zero and the fragment side declines out loud.
 * Mesa merges the two arrays into `CLIP_DIST0` when there are more than four
   distances between them; when it splits them, `CLIP_DIST1` holds components
   four and up at its **own** index zero.
+
+## basic-state4 is order-dependent, which is most of the answer
+
+`KHR-GL44.vertex_attrib_binding.basic-state4` fails in the browser and passes
+natively, silently, and six hypotheses about *what state it reads wrongly*
+turned out to be wrong. It reads nothing wrongly:
+
+    GEX_CTS_CASE='...basic-state4'        pass=1 fail=0    passes alone
+    GEX_CTS_CASE='...basic-state*'        pass=3 fail=1    fails after state1-3
+    GEX_CTS_CASE='...basic-*'             pass=18 fail=4   same
+
+**It passes on its own and fails when any of basic-state1..3 has run first.**
+So the question is not which pname is wrong but what an earlier case leaves
+behind -- and note it is not the 64-bit `basic-inputL-*` failures, which the
+`basic-state*` run excludes.
+
+`gl44-binding-state-probe` now covers all sixteen pnames the case verifies --
+every `GL_VERTEX_ATTRIB_ARRAY_*`, `GL_VERTEX_ATTRIB_BINDING`,
+`GL_VERTEX_ATTRIB_RELATIVE_OFFSET` and all four `GL_VERTEX_BINDING_*` -- plus
+the divisor aliasing, at several indices. **31/31 against the reference and
+31/31 in the browser.** The state round-trips correctly, so a future attempt
+should not start there.
+
+One asymmetry the probe pins down, because expecting otherwise failed against
+the reference before it ever reached the browser: an attribute's
+`GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING` follows its *binding*, and its
+`GL_VERTEX_ATTRIB_ARRAY_STRIDE` does **not** -- `glVertexAttribFormat` takes no
+stride, so the attribute's own stays zero and only `glVertexAttribPointer` sets
+it.
+
+### A candidate, and why it is not applied here
+
+`BIND_FRAMEBUFFER`, `BIND_RENDERBUFFER`, `BIND_SAMPLER` and
+`BIND_VERTEX_ARRAY` are the last hand-written sites still using plain
+`lookup`, which maps a name the host has never seen to zero -- and for a bind,
+zero is a legal unbind, so `GL_INVALID_OPERATION` becomes a silent success.
+That class was closed everywhere else today (`lookup_bindable` at 9 sites,
+`lookup_program_or_shader` at 78 generated and 21 hand-written).
+
+It is left alone deliberately. `glBindVertexArray` is on every draw path, and
+switching it turns a silent-but-working bind into an error for any path that
+produces a guest VAO name the host has not registered. Verifying that no such
+path exists -- `GEN_VERTEX_ARRAYS`, `glCreateVertexArrays` and every alias --
+is the work, and it is not the same size as the four-line change it looks
+like. Whether it is even basic-state4's cause is unknown; the bisection above
+says the cause is cross-case state, which this would only explain if a
+*deleted* VAO's name were being rebound.
+
+## One browser-only cull_distance case remains
+
+After the clip-distance carriers, `cull_distance` is 202/0 natively and
+**201/1** in the browser: `functional_test_item_7_primitive_mode_triangles_*`
+fails there only, silently, with no driver message. The same Mesa runs on both
+sides, so this is more likely a difference between native Dawn and the
+browser's WebGPU than driver logic -- diagnosing it means comparing rendered
+output for that one case, and it is one case out of 218.
