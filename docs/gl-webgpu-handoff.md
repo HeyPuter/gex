@@ -21184,6 +21184,24 @@ not say by whom. Three steps, each killing a hypothesis:
 - **Pick orphans by size, not by age.** The oldest were 0-KiB startup
   singletons; the set that grows was the megabyte ones.
 
+**This is an upstream Mesa bug, not ours, and it is worth reporting.** The
+three defects are all in `src/gallium/auxiliary/util/u_vbuf.c`, which every
+Gallium driver that declines a vertex format runs -- freedreno, lima, v3d,
+nouveau, r300, i915 among them. Any of those leaks an upload slab per draw
+wherever two translations or two draws land in one `u_vbuf_draw_vbo`. Nothing
+about the bug is specific to WebGPU; we only noticed because our slabs cost
+device memory *and* a host shadow, so the growth was twice as visible.
+Reporting it is a decision for the repository owner, not something to do from
+here.
+
+**Every other `u_upload_alloc` caller was audited and is correct**, so this
+class is closed rather than merely patched in one place. The ones st owns
+(`st_atom_constbuf`, `st_draw`, `st_pbo`, `st_cb_drawtex`) hand the slab to
+`st_add_releasebuf`, a `util_dynarray` that prunes whenever `release_counter`
+falls behind `work_counter` -- a correct deferred queue, bounded by the work
+unit. `u_primconvert` releases its own inline. u_vbuf was the only one that
+kept a single slot for several writers.
+
 **This had been the most serious reliability defect on record here**: it capped
 any long-running application at under two minutes on a 4 GB card, and the
 mitigations (a VRAM guard, a kernel watchdog, a software adapter) were all
