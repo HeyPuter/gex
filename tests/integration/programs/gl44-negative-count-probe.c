@@ -26,6 +26,12 @@
 #include <GL/glcorearb.h>
 #include <stdio.h>
 #include <string.h>
+/* glGetInternalformativ, glGetNamedBufferSubData,
+   glInvalidateNamedFramebufferSubData and glVertexArrayVertexBuffers are not
+   in Mesa's non-glvnd libGL at all, so linking them directly made this probe
+   UNLINKABLE against our own native build -- it could only ever run in the
+   browser and against the system's glvnd libGL. */
+#include "gl-procs.h"
 
 static int cases, passed;
 
@@ -89,6 +95,11 @@ int main(void) {
     EGLSurface s = eglCreatePbufferSurface(d, c, sa);
     if (!x || !s || !eglMakeCurrent(d, s, s, x)) return 3;
     fprintf(stderr, "INFO version=%s\n", (const char *)glGetString(GL_VERSION));
+    if (gex_load_procs() != 0) {
+        fprintf(stderr, "INFO entry points unresolved; not measuring\n");
+        printf("SUMMARY cases=0 passed=0 failed=0\n");
+        return 3;
+    }
 
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vs, 1, &vs_src, NULL); glCompileShader(vs);
@@ -180,6 +191,43 @@ int main(void) {
     glVertexArrayVertexBuffers(vaobj, 0, -1, NULL, NULL, NULL);
     check_negative("vertex_array_vertex_buffers", drain());
     glBindVertexArray(0);
+
+    /* The five the guest answers for itself. It joins the caller's shader
+       fragments and uniform-name arrays into one string, and handles
+       glDebugMessageControl entirely locally, so the host never sees the count
+       the application passed -- there is nothing to forward. These latch
+       GL_INVALID_VALUE in the guest, which is safe only because the reference
+       agrees: native Mesa raises exactly that for all five.
+
+       The four robustness readbacks are deliberately absent, and this is the
+       reason: native Mesa raises *nothing* for a negative bufSize on
+       glReadnPixels, glGetnTexImage, glGetnCompressedTexImage and
+       glGetTextureSubImage. The guest's silence already matches the reference
+       there, so there was never a defect to fix, and asserting an error would
+       be asserting against the only authority available. */
+    GLuint sh = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(sh, -1, &vs_src, NULL);
+    check_negative("shader_source", drain());
+    GLuint shader_names[1] = { sh };
+    char binary_scratch[64];
+    glShaderBinary(-1, shader_names, 0, binary_scratch, 0);
+    check_negative("shader_binary_count", drain());
+    glShaderBinary(1, shader_names, 0, binary_scratch, -1);
+    check_negative("shader_binary_length", drain());
+
+    GLint binary_length = 0; GLenum binary_format = 0;
+    glGetProgramBinary(prog, -1, &binary_length, &binary_format, binary_scratch);
+    check_negative("get_program_binary", drain());
+
+    const char *uniform_names[1] = { "scale" };
+    GLuint uniform_indices[1] = { 0 };
+    glGetUniformIndices(prog, -1, uniform_names, uniform_indices);
+    check_negative("get_uniform_indices", drain());
+
+    GLuint debug_ids[1] = { 0 };
+    glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, -1,
+                          debug_ids, GL_TRUE);
+    check_negative("debug_message_control", drain());
 
     /* Having survived all of that, the connection must still be able to do
        real work -- not merely answer a query. A draw that reads the buffer

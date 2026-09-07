@@ -18695,14 +18695,43 @@ command stream produced by a *sandboxed* guest, so a guest could reach a stack
 overflow in the host by asking for it. The transport's old refusal was hiding
 it by accident.
 
-### Still to do
+### The remaining nine, and what the reference said about them
 
-Nine guest entry points keep the silent-drop shape, each needing its host side
-checked at the same time: `glShaderBinary`, `glShaderSource`,
-`glGetProgramBinary`, `glGetUniformIndices`, `glDebugMessageControl`,
-`glReadnPixels`, `glGetnTexImage`, `glGetnCompressedTexImage`,
-`glGetTextureSubImage`. The two `*_raw` buffer helpers keep theirs on purpose:
-they carry the driver's own write-back, and their validated entry points latch
+Nine guest entry points still had the silent-drop shape, and asking the
+reference what each one owes split them cleanly in half. Native Mesa raises:
+
+| entry point | negative argument |
+| --- | --- |
+| `glShaderSource`, `glShaderBinary` (count and length) | `GL_INVALID_VALUE` |
+| `glGetProgramBinary`, `glGetUniformIndices` | `GL_INVALID_VALUE` |
+| `glDebugMessageControl` | `GL_INVALID_VALUE` |
+| `glReadnPixels`, `glGetnTexImage` | **nothing** |
+| `glGetnCompressedTexImage`, `glGetTextureSubImage` | **nothing** |
+
+So four of the nine were never defects. Mesa does not check `bufSize` for sign
+on the robustness readbacks, the guest's silence already matched the reference,
+and asserting an error there would have been asserting against the only
+authority available. This entry is the correction: the list above originally
+called all nine outstanding work.
+
+The other five are fixed, but *not* by forwarding. Each is a call the guest
+answers for itself -- it joins the caller's shader fragments or uniform-name
+arrays into a single string, or in `glDebugMessageControl`'s case handles the
+call entirely locally -- so the host never sees the count the application
+passed and could not raise the error for it. They latch `GL_INVALID_VALUE` in
+the guest with the `GEXGL_SET_ERROR` helper that four buffer entry points
+already used.
+
+Latching locally is only safe because the reference agrees on *which* error
+for all five. It would not have been safe for the multi-bind family, where
+Mesa answers `GL_INVALID_OPERATION` against the specification's
+`GL_INVALID_VALUE` -- guess there and the browser and the native reference
+disagree by construction. The rule: **the guest may answer for GL only where
+the guest is already the authority for that call, and only where the reference
+has been asked.**
+
+The two `*_raw` buffer helpers keep their silent guard on purpose: they carry
+the driver's own write-back, and their validated entry points latch
 `GL_INVALID_VALUE` already.
 
 The pixel-layout family (`glTexSubImage*`, `glReadPixels` and friends) also

@@ -56,6 +56,15 @@
 #include "gexgl.h"
 #include "gexgl-pixel.h"
 
+/* The error latch, declared before anything that could raise one. Its
+   definition lives with glGetError much further down, but entry points that
+   latch GL's errors are scattered throughout -- including well above that
+   point -- and a macro defined halfway down the file is a link error waiting
+   for the next one added above it, which is exactly how it failed. */
+static void gexgl_set_error(unsigned error);
+static void gexgl_set_error_at(unsigned error, const char *who);
+#define GEXGL_SET_ERROR(e) gexgl_set_error_at((e), __func__)
+
 /* ---------------------------------------------------------------- the ring */
 
 /* GEXGL_MAGIC and GEXGL_SUBMIT are generated into gexgl.h from the Rust
@@ -483,7 +492,14 @@ void glBlendBarrier(void) { CMD0(GEXGL_BLEND_BARRIER); }
    because that is what the host's reader already understands. */
 void glShaderBinary(int count, const unsigned *shaders, unsigned format,
                     const void *binary, int length) {
-    if (count < 0 || length < 0) return;
+    /* Latched here, not forwarded: this entry point is one the guest answers
+       for itself -- it joins the caller's fragments, or handles the call
+       entirely locally -- so the host never sees the count the application
+       passed and could not raise the error for it. Safe to answer locally
+       only because the reference agrees on which error: native Mesa raises
+       GL_INVALID_VALUE for all of these, unlike the multi-bind entry points
+       where it answers GL_INVALID_OPERATION against the specification. */
+    if (count < 0 || length < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     if (count > 0 && !shaders) return;
     if (length > 0 && !binary) return;
     size_t names = (size_t)count * 4u;
@@ -559,9 +575,8 @@ void glPixelStorei(unsigned p, int v) {
    otherwise invisible: the application sees the code with nothing to say
    where it came from, and the CTS reports it against whichever case happened
    to check next. */
-static void gexgl_set_error(unsigned error);
-static void gexgl_set_error_at(unsigned error, const char *who);
-#define GEXGL_SET_ERROR(e) gexgl_set_error_at((e), __func__)
+/* Declared at the top of the file: every entry point that latches an error
+   needs these, and half of them appear above this point. */
 /* Both halves of the persistent-mapping traffic, defined with the draw path
    further down and called from glFinish above it. */
 static void gexgl_flush_coherent_maps(void);
@@ -1197,7 +1212,15 @@ void glShaderSource(unsigned shader, int count, const char *const *strings,
                     const int *lengths) {
     /* GL takes an array of fragments; the host wants one string, so they are
        joined here rather than sending the array. */
-    if (count < 0 || (count > 0 && !strings)) return;
+    /* Latched here, not forwarded: this entry point is one the guest answers
+       for itself -- it joins the caller's fragments, or handles the call
+       entirely locally -- so the host never sees the count the application
+       passed and could not raise the error for it. Safe to answer locally
+       only because the reference agrees on which error: native Mesa raises
+       GL_INVALID_VALUE for all of these, unlike the multi-bind entry points
+       where it answers GL_INVALID_OPERATION against the specification. */
+    if (count < 0) { GEXGL_SET_ERROR(0x0501u); return; }
+    if (count > 0 && !strings) return;
     size_t total = 0;
     for (int i = 0; i < count; i++) {
         size_t n;
@@ -1376,7 +1399,14 @@ void glGetProgramPipelineInfoLog(unsigned pipeline, int bufSize, int *length,
 void glGetProgramBinary(unsigned program, int bufSize, int *length,
                         unsigned *binaryFormat, void *binary) {
     if (length) *length = 0;
-    if (bufSize < 0) return;
+    /* Latched here, not forwarded: this entry point is one the guest answers
+       for itself -- it joins the caller's fragments, or handles the call
+       entirely locally -- so the host never sees the count the application
+       passed and could not raise the error for it. Safe to answer locally
+       only because the reference agrees on which error: native Mesa raises
+       GL_INVALID_VALUE for all of these, unlike the multi-bind entry points
+       where it answers GL_INVALID_OPERATION against the specification. */
+    if (bufSize < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     uint32_t *p = begin(GEXGL_GET_PROGRAM_BINARY, 2, 0);
     if (!p) return;
     p[0] = program;
@@ -1692,7 +1722,15 @@ void glGetActiveUniformsiv(unsigned program, int count,
 void glGetUniformIndices(unsigned program, int count,
                          const char *const *names, unsigned *indices) {
     size_t total = 0;
-    if (count < 0 || (count > 0 && !names)) return;
+    /* Latched here, not forwarded: this entry point is one the guest answers
+       for itself -- it joins the caller's fragments, or handles the call
+       entirely locally -- so the host never sees the count the application
+       passed and could not raise the error for it. Safe to answer locally
+       only because the reference agrees on which error: native Mesa raises
+       GL_INVALID_VALUE for all of these, unlike the multi-bind entry points
+       where it answers GL_INVALID_OPERATION against the specification. */
+    if (count < 0) { GEXGL_SET_ERROR(0x0501u); return; }
+    if (count > 0 && !names) return;
     for (int i = 0; i < count; ++i) {
         if (!names[i]) return;
         if (!gexgl_size_add(total, strlen(names[i]) + 1, &total)) return;
@@ -1823,7 +1861,14 @@ void glDebugMessageCallback(gexgl_debug_proc callback, const void *user) {
 void glDebugMessageControl(unsigned source, unsigned type, unsigned severity,
                            int count, const unsigned *ids, unsigned char enabled) {
     (void)source; (void)type; (void)severity; (void)ids;
-    if (count < 0) return;
+    /* Latched here, not forwarded: this entry point is one the guest answers
+       for itself -- it joins the caller's fragments, or handles the call
+       entirely locally -- so the host never sees the count the application
+       passed and could not raise the error for it. Safe to answer locally
+       only because the reference agrees on which error: native Mesa raises
+       GL_INVALID_VALUE for all of these, unlike the multi-bind entry points
+       where it answers GL_INVALID_OPERATION against the specification. */
+    if (count < 0) { GEXGL_SET_ERROR(0x0501u); return; }
     /* A control call naming no ids and GL_DONT_CARE throughout is the global
        switch, and that one is honoured. */
     if (count == 0 && source == 0x1100u && type == 0x1100u && severity == 0x1100u)
