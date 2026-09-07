@@ -19615,7 +19615,7 @@ Measured 2026-09-07 across sixteen families, fifty failures in total:
 | family | pass | fail | note |
 |---|---|---|---|
 | shader_image_load_store | 35 | 14 | mostly the storage-format wall |
-| sample_variables | 125 | 9 | all rgba32f at one sample |
+| ~~sample_variables~~ | **134** | **0** | closed; see below |
 | texture_view | 3 | 4 | all the multisample-array wall |
 | compute_shader | 38 | 4 | |
 | shader_storage_buffer_object | 120 | 4 | |
@@ -19629,5 +19629,44 @@ Measured 2026-09-07 across sixteen families, fifty failures in total:
 | texture_gather, explicit_uniform_location, buffer_storage, cull_distance | 334 | 0 | clean |
 
 Of those fifty, eighteen are known platform walls (the storage formats and the
-multisample array). `geometry_shader` is not in this list's family set and sits
-at 133/136.
+multisample array), and nine more have since been closed — see below.
+`geometry_shader` is not in this list's family set and sits at 133/136.
+
+### A one-sample multisample texture is an ordinary texture
+
+`sampler2DMS` naming a texture with a single sample read **zero**, silently:
+the slot was declared unusable and its sampler removed from the shader. That
+was all nine of `sample_variables`' remaining failures, every one `rgba32f` --
+which is no coincidence. WebGPU multisamples no 32-bit-per-component format at
+any count, so **one sample is the only count those formats have**, and the CTS
+resolves its results by sampling exactly such a texture.
+
+`glTexStorage2DMultisample` takes `samples=1` and this is legal GL. WebGPU has
+no matching binding, so the declaration is rewritten to match the texture
+rather than the texture refused -- exact, not approximate, since with one
+sample sample zero is the only sample. **125 passed / 9 failed -> 134 passed /
+0 failed.**
+
+It needed five pieces and each failed differently, which is the useful part:
+the instruction (`txf` takes an explicit level `txf_ms` has none of, so one
+must be *added*); the **variable's** type, which is what the emitter reads --
+and by variant time the combined samplers are split, so it is a *texture* type
+and checking for a sampler matched nothing; `nir_fixup_deref_types`, because
+NIR validates a deref against its variable and changing the variable alone
+aborts the process; the per-draw binding check, comparing the view against the
+*base* declaration and declining a mismatch the variant had removed; and the
+layout's sample type, unfilterable for a multisampled declaration where a
+demoted slot must state the view's own format.
+
+Two keys had to be exactly right, and both were wrong first:
+
+- **The texture unit, not the binding.** `driver_location` is the unit;
+  `binding` is `2*unit`. Keying on the binding works for unit 0 *by luck* and
+  fails everywhere else -- my first probe used unit 0, passed, and the CTS
+  still failed. Tint names it: `Image Operand Sample is required for operation
+  on multi-sampled image`.
+- **`nr_samples == 1` exactly, never `MAX2(1, nr_samples)`.** A resource
+  carries 0 when it is not a multisample target, and a `sampler2DMS` pointed at
+  one is invalid GL that must stay refused. Folding them cost seven passing
+  cases -- and as an *order-dependent* failure, because the compile error
+  latched the context, so cases that pass alone failed in their family.
