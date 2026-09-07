@@ -18738,3 +18738,100 @@ The pixel-layout family (`glTexSubImage*`, `glReadPixels` and friends) also
 fails the batch on a negative width or height, but there the blob length and
 the computed layout genuinely have to agree, so the two concerns are tangled
 and it needs separate thought rather than the same edit.
+
+## The transform-feedback capture was the hidden cause of a vertex-input family
+
+`KHR-GL44.vertex_attrib_binding` sat at 16/30 against llvmpipe's 30/30, and the
+cause I had recorded -- "an attribute wider than its stride, and 64-bit
+attributes" -- was mostly wrong. **The CTS reads the attributes it is testing
+back through transform feedback**: its whole `BasicInputBase` ends in
+`glDrawArraysInstanced` plus `glTransformFeedbackVaryings`. So most of the
+failures were in the capture path, not the vertex-input path. 16/30 -> 26/30
+from three fixes.
+
+### The two vertex-format tables had nothing connecting them
+
+The capture path runs the vertex shader as compute and fetches attributes
+itself, so it needs an unpacker for every format. Its own comment claimed
+"every other format is translated by u_vbuf before it reaches the driver" --
+but **u_vbuf translates only what the driver declines, and
+`is_format_supported` answers for the render path**, which accepts far more.
+Anything in the gap arrives untranslated at a path that cannot read it.
+
+Extracting both sets and diffing them gave 25 unpackable against 40
+advertised. The symptom of that gap was a transform feedback that silently
+recorded nothing.
+
+`gex_wgpu_check_capture_formats` now walks every pipe format at screen setup
+and names any the render path takes that the capture cannot read. It is silent
+when they agree, so it runs unconditionally, and it would have caught both of
+the gaps found here on their first run. **When two tables in this driver have
+to agree, wire a check between them** -- they are four thousand lines apart and
+nothing else will notice.
+
+### Half floats have no NIR route here
+
+The first attempt at the new conversions reached for `nir_unpack_half_2x16` and
+`nir_format_unpack_11f11f10f`. A comment six thousand lines away in the same
+file says plainly that every NIR route to a half ends in a 16-bit type Tint's
+SPIR-V reader has none of, and that `gex_wgpu_small_float_to_float` exists for
+exactly this. Use it -- for halves and for `R11G11B10_FLOAT`'s three unsigned
+floats of two different shapes sharing a word.
+
+### An attribute may run past its own stride
+
+GL allows a stride smaller than the attribute, so consecutive vertices overlap
+and share components -- five of these cases do it deliberately with a `vec3` at
+stride 4. WebGPU rejects the layout and `create_vertex_elements_state` refused
+it, but **a refusal there is not a refusal**: cso binds the NULL and the next
+draw has no vertex layout at all, so nothing renders and nothing says so.
+`u_vbuf` gains a `vertex_attrib_within_stride` cap and repacks, which it
+already did correctly for every other reason it translates. Free here: the
+4-byte alignment cap already keeps u_vbuf permanently in its fallback path.
+
+### Instanced capture was refused for nothing
+
+The shader side always modelled instances -- `gex_wgpu_capture_vertex_slot`
+takes the invocation modulo `VERTS_PER_INSTANCE` and
+`gex_wgpu_capture_instance` divides by it, and the slot table's own comment
+says it holds one instance's worth however many there are. The dispatch simply
+never set the parameter or grew the invocation count, and two other compute
+paths in the file already do both.
+
+### Four of five capture refusals said nothing
+
+Only the format site had an `fprintf`, so a case failed with `failed=1` and no
+reason -- two whole CTS runs to learn it was a vertex layout that never bound.
+All five now report through `gex_wgpu_capture_decline` under
+`GEX_WGPU_XFB_DEBUG`.
+
+And when grepping for what remains, **grep for the message kinds first**:
+
+    grep -ohE 'gex-wgpu: [a-z][a-z0-9 _-]{6,55}' <log> | sed 's/[0-9]\+/N/g' |
+      sort | uniq -c | sort -rn
+
+Listing three known prefixes and missing a fourth is how an hour went into
+hypothesising a cause the log had already stated.
+
+### What the numbers actually were
+
+Native across sixteen families went 1124/87/56 to 1137/78/56. Two clusters that
+looked large were not:
+
+* `KHR-GL45.direct_state_access` 316/371 -> 317/371. Its 54 failures were read
+  as the format gap because those were the messages in its log; they came from
+  one case. Of the remaining 53, **30 are multisampled 2D *array* textures** --
+  WGSL has no `texture_multisampled_2d_array` -- and **12 more are 32-bit
+  per-component multisample**, which WebGPU excludes from multisampling
+  entirely and which this driver already declines correctly. The fixable
+  remainder is about eight.
+* `cull_distance`'s eight failures are one cause: a **fragment shader reading
+  `gl_ClipDistance`**. Our SPIR-V is correct and contains no bitcast at all --
+  `bitcast<f32>(array<f32, 8>)` is *Tint's* failed attempt to express a
+  fragment-stage ClipDistance input, because WGSL has clip distances only as a
+  vertex output. Fixing it means carrying the values as ordinary varyings, for
+  which `gex_wgpu_point_coord_location` is the established pattern: it scans
+  both stages' effective @locations and hands back a free one, so the two
+  stages agree by construction. Note before spending the effort that apps use
+  clip planes by *writing* them in the vertex shader, which works; reading them
+  in a fragment shader is a CTS verification technique.

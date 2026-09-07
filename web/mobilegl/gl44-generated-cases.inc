@@ -35,7 +35,7 @@ case 1034: {
     GLuint buffer = a.u32();
     GLintptr offset = a.i64();
     GLsizeiptr size = a.i64();
-    GEX_GL_CALL(glBindBufferRange, target, index, lookup(buffers, buffer), offset, size);
+    GEX_GL_CALL(glBindBufferRange, target, index, lookup_bindable(buffers, buffer), offset, size);
     break;
 }
 case 1035: {
@@ -60,7 +60,7 @@ case 1035: {
     if (bytes) {
         for (GLsizei i = 0; i < count; ++i) {
             GLuint guest = 0; memcpy(&guest, wire + (size_t)i * sizeof(guest), sizeof(guest));
-            host[(size_t)i] = lookup(buffers, guest);
+            host[(size_t)i] = lookup_bindable(buffers, guest);
         }
     }
     GEX_GL_CALL(glBindBuffersBase, target, first, count, bytes ? host.data() : nullptr);
@@ -72,19 +72,30 @@ case 1036: {
     const uint8_t *name_wire = a.blob(name_bytes);
     const uint8_t *offset_wire = a.blob(offset_bytes);
     const uint8_t *third_wire = a.blob(third_bytes);
-    if (count < 0 || (name_bytes && (name_bytes != (uint32_t)count * sizeof(GLuint) ||
-        offset_bytes != (uint32_t)count * sizeof(GLintptr) ||
-        third_bytes != (uint32_t)count * sizeof(GLsizeiptr))) ||
+    if (count < 0 || (name_bytes && (name_bytes != (uint32_t)count * 4u ||
+        offset_bytes != (uint32_t)count * 8u ||
+        third_bytes != (uint32_t)count * 8u)) ||
         (!name_bytes && (offset_bytes || third_bytes))) { a.ok = false; break; }
     std::vector<GLuint> names((size_t)std::max(count, 0));
     std::vector<GLintptr> offsets((size_t)std::max(count, 0));
     std::vector<GLsizeiptr> sizes((size_t)std::max(count, 0));
     for (GLsizei i = 0; name_bytes && i < count; ++i) {
         GLuint guest = 0; memcpy(&guest, name_wire + (size_t)i * 4, 4);
-        names[(size_t)i] = lookup(buffers, guest);
+        names[(size_t)i] = lookup_bindable(buffers, guest);
     }
-    if (offset_bytes) memcpy(offsets.data(), offset_wire, offset_bytes);
-    if (third_bytes) memcpy(sizes.data(), third_wire, third_bytes);
+    /* Element by element, at the wire width and not the host's: a memcpy of
+       the whole blob assumed the two agreed, and for a pointer-sized element
+       they do not. Signed intermediates so a negative stride survives. */
+    for (GLsizei i = 0; offset_bytes && i < count; ++i) {
+        int64_t value = 0;
+        memcpy(&value, offset_wire + (size_t)i * 8u, 8);
+        offsets[(size_t)i] = (GLintptr)value;
+    }
+    for (GLsizei i = 0; third_bytes && i < count; ++i) {
+        int64_t value = 0;
+        memcpy(&value, third_wire + (size_t)i * 8u, 8);
+        sizes[(size_t)i] = (GLsizeiptr)value;
+    }
     GEX_GL_CALL(glBindBuffersRange, target, first, count, name_bytes ? names.data() : nullptr,
                 name_bytes ? offsets.data() : nullptr,
                 name_bytes ? sizes.data() : nullptr);
@@ -139,7 +150,7 @@ case 1041: {
     if (bytes) {
         for (GLsizei i = 0; i < count; ++i) {
             GLuint guest = 0; memcpy(&guest, wire + (size_t)i * sizeof(guest), sizeof(guest));
-            host[(size_t)i] = lookup(textures, guest);
+            host[(size_t)i] = lookup_bindable(textures, guest);
         }
     }
     GEX_GL_CALL(glBindImageTextures, first, count, bytes ? host.data() : nullptr);
@@ -168,7 +179,7 @@ case 1045: {
     std::vector<GLuint> names((size_t)count, 0);
     if (bytes) {
         const GLuint *guest = reinterpret_cast<const GLuint *>(wire);
-        for (GLsizei i = 0; i < count; ++i) names[(size_t)i] = lookup(samplers, guest[i]);
+        for (GLsizei i = 0; i < count; ++i) names[(size_t)i] = lookup_bindable(samplers, guest[i]);
     }
     glBindSamplers(first, count, bytes ? names.data() : nullptr);
     break;
@@ -200,7 +211,7 @@ case 1048: {
     if (bytes) {
         for (GLsizei i = 0; i < count; ++i) {
             GLuint guest = 0; memcpy(&guest, wire + (size_t)i * sizeof(guest), sizeof(guest));
-            host[(size_t)i] = lookup(textures, guest);
+            host[(size_t)i] = lookup_bindable(textures, guest);
         }
     }
     GEX_GL_CALL(glBindTextures, first, count, bytes ? host.data() : nullptr);
@@ -211,7 +222,7 @@ case 1051: {
     GLuint buffer = a.u32();
     GLintptr offset = a.i64();
     GLsizei stride = a.i32();
-    GEX_GL_CALL(glBindVertexBuffer, bindingindex, lookup(buffers, buffer), offset, stride);
+    GEX_GL_CALL(glBindVertexBuffer, bindingindex, lookup_bindable(buffers, buffer), offset, stride);
     break;
 }
 case 1052: {
@@ -220,19 +231,30 @@ case 1052: {
     const uint8_t *name_wire = a.blob(name_bytes);
     const uint8_t *offset_wire = a.blob(offset_bytes);
     const uint8_t *third_wire = a.blob(third_bytes);
-    if (count < 0 || (name_bytes && (name_bytes != (uint32_t)count * sizeof(GLuint) ||
-        offset_bytes != (uint32_t)count * sizeof(GLintptr) ||
-        third_bytes != (uint32_t)count * sizeof(GLsizei))) ||
+    if (count < 0 || (name_bytes && (name_bytes != (uint32_t)count * 4u ||
+        offset_bytes != (uint32_t)count * 8u ||
+        third_bytes != (uint32_t)count * 4u)) ||
         (!name_bytes && (offset_bytes || third_bytes))) { a.ok = false; break; }
     std::vector<GLuint> names((size_t)std::max(count, 0));
     std::vector<GLintptr> offsets((size_t)std::max(count, 0));
     std::vector<GLsizei> strides((size_t)std::max(count, 0));
     for (GLsizei i = 0; name_bytes && i < count; ++i) {
         GLuint guest = 0; memcpy(&guest, name_wire + (size_t)i * 4, 4);
-        names[(size_t)i] = lookup(buffers, guest);
+        names[(size_t)i] = lookup_bindable(buffers, guest);
     }
-    if (offset_bytes) memcpy(offsets.data(), offset_wire, offset_bytes);
-    if (third_bytes) memcpy(strides.data(), third_wire, third_bytes);
+    /* Element by element, at the wire width and not the host's: a memcpy of
+       the whole blob assumed the two agreed, and for a pointer-sized element
+       they do not. Signed intermediates so a negative stride survives. */
+    for (GLsizei i = 0; offset_bytes && i < count; ++i) {
+        int64_t value = 0;
+        memcpy(&value, offset_wire + (size_t)i * 8u, 8);
+        offsets[(size_t)i] = (GLintptr)value;
+    }
+    for (GLsizei i = 0; third_bytes && i < count; ++i) {
+        int32_t value = 0;
+        memcpy(&value, third_wire + (size_t)i * 4u, 4);
+        strides[(size_t)i] = (GLsizei)value;
+    }
     GEX_GL_CALL(glBindVertexBuffers, first, count, name_bytes ? names.data() : nullptr,
                 name_bytes ? offsets.data() : nullptr,
                 name_bytes ? strides.data() : nullptr);

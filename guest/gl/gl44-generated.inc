@@ -88,9 +88,11 @@ void glBindBuffersRange(unsigned target, unsigned first, int count, const unsign
     size_t per_item = sizeof(*buffers) + sizeof(*offsets) + sizeof(*sizes);
     if (count > 0 && (size_t)count > (UINT32_MAX - 12u) / per_item) return;
     const int has_arrays = count > 0 && buffers != 0;
-    size_t names_bytes = has_arrays ? (size_t)count * sizeof(*buffers) : 0;
-    size_t offsets_bytes = has_arrays ? (size_t)count * sizeof(*offsets) : 0;
-    size_t third_bytes = has_arrays ? (size_t)count * sizeof(*sizes) : 0;
+    /* Sized by the protocol, not by this side's ABI: the host is wasm32 and
+       its GLintptr is half the width of the guest's. */
+    size_t names_bytes = has_arrays ? (size_t)count * 4u : 0;
+    size_t offsets_bytes = has_arrays ? (size_t)count * 8u : 0;
+    size_t third_bytes = has_arrays ? (size_t)count * 8u : 0;
     size_t tail = 12 + ((names_bytes + 3) & ~3u) +
                   ((offsets_bytes + 3) & ~3u) + ((third_bytes + 3) & ~3u);
     uint32_t *a = begin(1036, 3, tail);
@@ -221,9 +223,11 @@ void glBindVertexBuffers(unsigned first, int count, const unsigned *buffers,
     size_t per_item = sizeof(*buffers) + sizeof(*offsets) + sizeof(*strides);
     if (count > 0 && (size_t)count > (UINT32_MAX - 12u) / per_item) return;
     const int has_arrays = count > 0 && buffers != 0;
-    size_t names_bytes = has_arrays ? (size_t)count * sizeof(*buffers) : 0;
-    size_t offsets_bytes = has_arrays ? (size_t)count * sizeof(*offsets) : 0;
-    size_t third_bytes = has_arrays ? (size_t)count * sizeof(*strides) : 0;
+    /* Sized by the protocol, not by this side's ABI: the host is wasm32 and
+       its GLintptr is half the width of the guest's. */
+    size_t names_bytes = has_arrays ? (size_t)count * 4u : 0;
+    size_t offsets_bytes = has_arrays ? (size_t)count * 8u : 0;
+    size_t third_bytes = has_arrays ? (size_t)count * 4u : 0;
     size_t tail = 12 + ((names_bytes + 3) & ~3u) +
                   ((offsets_bytes + 3) & ~3u) + ((third_bytes + 3) & ~3u);
     uint32_t *a = begin(1052, 2, tail);

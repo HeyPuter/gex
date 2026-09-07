@@ -340,6 +340,65 @@ STRING_RETURN_COMMANDS = {
 
 # Guest GLuint names are not MobileGL's names. Each object-bearing parameter
 # names the host map through which it must be resolved before the GL call.
+# Binding a name the application never generated is GL_INVALID_OPERATION in a
+# core profile, and `lookup` maps an unknown name to zero -- which is a legal
+# *unbind*, so the error became a silent success. The host has had
+# lookup_bindable for this since KHR-GL32.buffer_objects.gen_buffers, with a
+# sentinel name the host's own GL has never generated so that GL raises the
+# error itself rather than the transport guessing at it; it was used at exactly
+# one site, glBindBuffer, and none of the generated ones.
+#
+# That is what KHR-GL44.vertex_attrib_binding.negative-bindVertexBuffer failed
+# on, in the browser only: the native reference is a compatibility context,
+# where binding an ungenerated name is legal, so only the core-profile browser
+# owed the error and only the browser was silent about it.
+#
+# Bind calls only. A DSA call has the same rule and is deliberately left alone
+# until it is measured rather than assumed.
+# How wide one element of an array is *on the wire*.
+#
+# The guest is always aarch64, where GLintptr and GLsizeiptr are eight bytes;
+# the host is wasm32, where they are four. A blob of them was sized with
+# sizeof(host type) at the host and sizeof(guest type) at the guest, so the two
+# never agreed: the host's length check failed, set a.ok = false, and the guest
+# then discarded the whole batch. glBindVertexBuffers and glBindBuffersRange
+# have therefore never worked in the browser -- every call silently dropped,
+# along with every command queued behind it.
+#
+# The wire width is a property of the protocol, not of either side's ABI, so it
+# is declared here and both ends use it.
+WIRE_ELEMENT_BYTES = {
+    "GLintptr": 8,
+    "GLsizeiptr": 8,
+    "GLint64": 8,
+    "GLuint64": 8,
+}
+
+
+def wire_bytes(ctype):
+    """Bytes one `ctype` element occupies on the wire."""
+    return WIRE_ELEMENT_BYTES.get(ctype, 4)
+
+
+BINDABLE_NAME_COMMANDS = {
+    "glBindBufferRange",
+    "glBindBuffersBase",
+    "glBindBuffersRange",
+    "glBindVertexBuffer",
+    "glBindVertexBuffers",
+    "glBindTextures",
+    "glBindSamplers",
+    "glBindImageTextures",
+}
+
+
+def name_lookup(command_name, namespace, expression):
+    """The host helper that resolves a guest object name for `command_name`."""
+    fn = ("lookup_bindable" if command_name in BINDABLE_NAME_COMMANDS
+          else "lookup")
+    return f"{fn}({namespace}, {expression})"
+
+
 OBJECT_COMMANDS = {
     "glBindImageTexture": {"texture": "textures"},
     "glCopyImageSubData": {"srcName": "textures", "dstName": "textures"},
@@ -1156,6 +1215,8 @@ def _guest_function(command: dict, opcode: int) -> str:
 """
     if name in PARALLEL_BIND_COMMANDS:
         second_type, third_type = PARALLEL_BIND_COMMANDS[name]
+        second_wire = wire_bytes(second_type)
+        third_wire = wire_bytes(third_type)
         prefix = "unsigned target, " if name == "glBindBuffersRange" else ""
         third_name = "sizes" if name == "glBindBuffersRange" else "strides"
         scalar_words = 3 if name == "glBindBuffersRange" else 2
@@ -1177,9 +1238,11 @@ def _guest_function(command: dict, opcode: int) -> str:
     size_t per_item = sizeof(*buffers) + sizeof(*offsets) + sizeof(*{third_name});
     if (count > 0 && (size_t)count > (UINT32_MAX - 12u) / per_item) return;
     const int has_arrays = count > 0 && buffers != 0;
-    size_t names_bytes = has_arrays ? (size_t)count * sizeof(*buffers) : 0;
-    size_t offsets_bytes = has_arrays ? (size_t)count * sizeof(*offsets) : 0;
-    size_t third_bytes = has_arrays ? (size_t)count * sizeof(*{third_name}) : 0;
+    /* Sized by the protocol, not by this side's ABI: the host is wasm32 and
+       its GLintptr is half the width of the guest's. */
+    size_t names_bytes = has_arrays ? (size_t)count * 4u : 0;
+    size_t offsets_bytes = has_arrays ? (size_t)count * {second_wire}u : 0;
+    size_t third_bytes = has_arrays ? (size_t)count * {third_wire}u : 0;
     size_t tail = 12 + ((names_bytes + 3) & ~3u) +
                   ((offsets_bytes + 3) & ~3u) + ((third_bytes + 3) & ~3u);
     uint32_t *a = begin({opcode}, {scalar_words}, tail);
@@ -1747,7 +1810,8 @@ def host_case(command: dict, opcode: int) -> str:
             pname, ty = param["name"], param["type"]
             reads.append(f"    {ty} {pname} = a.{TYPE_INFO[ty][1]}();")
             namespace = OBJECT_COMMANDS.get(name, {}).get(pname)
-            calls.append(f"lookup({namespace}, {pname})" if namespace else pname)
+            calls.append(name_lookup(name, namespace, pname)
+                         if namespace else pname)
         reply_call = f"put_u32((uint32_t)GEX_GL_CALL({name}, {', '.join(calls + ['value.c_str()'])}));" if name in STRING_RETURN_COMMANDS else f"GEX_GL_CALL({name}, {', '.join(calls + ['value.c_str()'])});"
         return f"""case {opcode}: {{
 {chr(10).join(reads)}
@@ -1779,7 +1843,8 @@ def host_case(command: dict, opcode: int) -> str:
             pname, ty = param["name"], param["type"]
             reads.append(f"    {ty} {pname} = a.{TYPE_INFO[ty][1]}();")
             namespace = OBJECT_COMMANDS.get(name, {}).get(pname)
-            calls.append(f"lookup({namespace}, {pname})" if namespace else pname)
+            calls.append(name_lookup(name, namespace, pname)
+                         if namespace else pname)
         return f"""case {opcode}: {{
 {chr(10).join(reads)}
     uint32_t bytes = 0; const uint8_t *wire = a.blob(bytes);
@@ -1792,6 +1857,10 @@ def host_case(command: dict, opcode: int) -> str:
 }}"""
     if name in PARALLEL_BIND_COMMANDS:
         second_type, third_type = PARALLEL_BIND_COMMANDS[name]
+        second_wire = wire_bytes(second_type)
+        third_wire = wire_bytes(third_type)
+        second_wire_bits = second_wire * 8
+        third_wire_bits = third_wire * 8
         third_name = "sizes" if name == "glBindBuffersRange" else "strides"
         prefix_read = ("    GLenum target = a.u32(); GLuint first = a.u32(); GLsizei count = a.i32();"
                        if name == "glBindBuffersRange" else
@@ -1803,19 +1872,30 @@ def host_case(command: dict, opcode: int) -> str:
     const uint8_t *name_wire = a.blob(name_bytes);
     const uint8_t *offset_wire = a.blob(offset_bytes);
     const uint8_t *third_wire = a.blob(third_bytes);
-    if (count < 0 || (name_bytes && (name_bytes != (uint32_t)count * sizeof(GLuint) ||
-        offset_bytes != (uint32_t)count * sizeof({second_type}) ||
-        third_bytes != (uint32_t)count * sizeof({third_type}))) ||
+    if (count < 0 || (name_bytes && (name_bytes != (uint32_t)count * 4u ||
+        offset_bytes != (uint32_t)count * {second_wire}u ||
+        third_bytes != (uint32_t)count * {third_wire}u)) ||
         (!name_bytes && (offset_bytes || third_bytes))) {{ a.ok = false; break; }}
     std::vector<GLuint> names((size_t)std::max(count, 0));
     std::vector<{second_type}> offsets((size_t)std::max(count, 0));
     std::vector<{third_type}> {third_name}((size_t)std::max(count, 0));
     for (GLsizei i = 0; name_bytes && i < count; ++i) {{
         GLuint guest = 0; memcpy(&guest, name_wire + (size_t)i * 4, 4);
-        names[(size_t)i] = lookup(buffers, guest);
+        names[(size_t)i] = lookup_bindable(buffers, guest);
     }}
-    if (offset_bytes) memcpy(offsets.data(), offset_wire, offset_bytes);
-    if (third_bytes) memcpy({third_name}.data(), third_wire, third_bytes);
+    /* Element by element, at the wire width and not the host's: a memcpy of
+       the whole blob assumed the two agreed, and for a pointer-sized element
+       they do not. Signed intermediates so a negative stride survives. */
+    for (GLsizei i = 0; offset_bytes && i < count; ++i) {{
+        int{second_wire_bits}_t value = 0;
+        memcpy(&value, offset_wire + (size_t)i * {second_wire}u, {second_wire});
+        offsets[(size_t)i] = ({second_type})value;
+    }}
+    for (GLsizei i = 0; third_bytes && i < count; ++i) {{
+        int{third_wire_bits}_t value = 0;
+        memcpy(&value, third_wire + (size_t)i * {third_wire}u, {third_wire});
+        {third_name}[(size_t)i] = ({third_type})value;
+    }}
     GEX_GL_CALL({name}, {call_prefix}, name_bytes ? names.data() : nullptr,
                 name_bytes ? offsets.data() : nullptr,
                 name_bytes ? {third_name}.data() : nullptr);
@@ -1840,13 +1920,15 @@ def host_case(command: dict, opcode: int) -> str:
     std::vector<GLuint> names((size_t)count, 0);
     if (bytes) {{
         const GLuint *guest = reinterpret_cast<const GLuint *>(wire);
-        for (GLsizei i = 0; i < count; ++i) names[(size_t)i] = lookup(samplers, guest[i]);
+        for (GLsizei i = 0; i < count; ++i) names[(size_t)i] = lookup_bindable(samplers, guest[i]);
     }}
     glBindSamplers(first, count, bytes ? names.data() : nullptr);
     break;
 }}"""
     if name in MULTI_BIND_NAME_ARRAYS:
         namespace = MULTI_BIND_NAME_ARRAYS[name]
+        lookup_fn = ("lookup_bindable" if name in BINDABLE_NAME_COMMANDS
+                     else "lookup")
         scalars = command["params"][:-1]
         reads = [f"    {p['type']} {p['name']} = a.{TYPE_INFO[p['type']][1]}();" for p in scalars]
         call_args = [p["name"] for p in scalars]
@@ -1870,7 +1952,7 @@ def host_case(command: dict, opcode: int) -> str:
     if (bytes) {{
         for (GLsizei i = 0; i < count; ++i) {{
             GLuint guest = 0; memcpy(&guest, wire + (size_t)i * sizeof(guest), sizeof(guest));
-            host[(size_t)i] = lookup({namespace}, guest);
+            host[(size_t)i] = {lookup_fn}({namespace}, guest);
         }}
     }}
     GEX_GL_CALL({name}, {', '.join(call_args)}, bytes ? host.data() : nullptr);
@@ -2264,7 +2346,8 @@ def host_case(command: dict, opcode: int) -> str:
             param_name, ty = param["name"], param["type"]
             lines.append(f"    {ty} {param_name} = a.{TYPE_INFO[ty][1]}();")
             namespace = OBJECT_COMMANDS.get(name, {}).get(param_name)
-            call_names.append(f"lookup({namespace}, {param_name})" if namespace else param_name)
+            call_names.append(name_lookup(name, namespace, param_name)
+                              if namespace else param_name)
         components = output_component_expression(RESOURCE_OUTPUT_QUERIES[name])
         output_type = output["type"]
         lines.append(f"    const uint32_t components = {components};")
@@ -2390,7 +2473,8 @@ def host_case(command: dict, opcode: int) -> str:
             # needed until glCompressedTextureSubImage2D arrived.
             namespace = OBJECT_COMMANDS.get(command["name"], {}).get(param_name)
             scalar_names.append(
-                f"lookup({namespace}, {param_name})" if namespace else param_name)
+                name_lookup(command["name"], namespace, param_name)
+                if namespace else param_name)
         pointer = command["params"][-1]
         pointer_name = pointer["name"]
         length = pointer["length"]
@@ -2453,7 +2537,8 @@ def host_case(command: dict, opcode: int) -> str:
         reader = TYPE_INFO[ty][1]
         lines.append(f"    {ty} {local_name} = a.{reader}();")
         namespace = OBJECT_COMMANDS.get(command["name"], {}).get(name)
-        names.append(f"lookup({namespace}, {local_name})" if namespace else local_name)
+        names.append(name_lookup(command["name"], namespace, local_name)
+                     if namespace else local_name)
     call = f"GEX_GL_CALL({command['name']}, {', '.join(names)})"
     if command["name"] in RETURN_COMMANDS:
         lines.append(f"    put_u32((uint32_t){call});")

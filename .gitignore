@@ -7,6 +7,11 @@ web/public/gex/
 web/public/rootfs/
 web/public/closure/
 /web/public/fs/glcts
+# The CTS runner is staged under a content-hash name, and the exact-path rule
+# above did not match it -- so `git add -A web/public/fs` swept a 71.6 MB build
+# artefact into cc7c2ea. The class is hex-suffixed; glcts-log-wrapper-* is a
+# real tracked file and starts with a letter, so it stays out of this.
+/web/public/fs/glcts-[0-9a-f][0-9a-f]*
 __pycache__/
 
 # Scratch and build caches
