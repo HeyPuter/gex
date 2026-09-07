@@ -21369,7 +21369,24 @@ next session plans against a number that is a day old rather than a month:
 **All 36 failures, grouped by the driver's own refusal**, which is the only
 ranking worth planning from:
 
-- **3-4 -- a vertex shader using the *result* of an image or buffer atomic.**
+- **At least 3 and plausibly 7 -- a vertex shader using the *result* of an
+  image or buffer atomic.** The count in this bullet was "3-4" and that was
+  derived from a latching message, which is exactly the mistake
+  `latching-message-undercounts` records: the refusal is behind
+  `static bool said`, so it prints **once per family process** and one line can
+  stand for every case in the family. It appears in three families, first
+  under `shader_atomic_counters.advanced-usage-multi-stage`,
+  `shader_storage_buffer_object.basic-atomic-case1` and
+  `shader_image_load_store.advanced-sso-atomicCounters`; those families carry
+  3, 3 and 10 failures. The other named atomic cases --
+  `shader_storage_buffer_object.basic-atomic-case4` and
+  `shader_subroutine.ssbo_atomic_image_load_store` -- are the same shape by
+  name.
+
+  **Measure it before planning against it**, by de-latching that one message or
+  by running the candidate cases one at a time. If it really is 7 this is a
+  fifth of every remaining failure and by far the largest single win, which
+  changes the case for building the capture-back described below.
   The single biggest cause, and the one that blocks the other half of the
   format-less imageBuffer work. The design is deliberate: the rasterising copy
   has the atomic rewritten to zero and the shader is marked unrasterisable, so
