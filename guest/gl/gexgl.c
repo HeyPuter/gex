@@ -3691,8 +3691,23 @@ void glGetIntegerv(unsigned pname, int *out) {
         if (out) out[0] = 0;
         return;
     }
+    /* Defined with the other EGL state below this point; the profile mask
+       query is the only thing above it that needs it. */
+    extern int gexgl_egl_context_profile(void);
     if (pname == 0x9126u) { /* GL_CONTEXT_PROFILE_MASK */
-        if (out) out[0] = egl_api == 0x30A2u ? 1 : 0; /* GL_CONTEXT_CORE_PROFILE_BIT */
+        /* Whichever profile was actually asked for. This answered the core
+           bit unconditionally, so a context created with
+           EGL_CONTEXT_OPENGL_PROFILE_MASK set to compatibility -- and one
+           that got compatibility by default, which is every application that
+           names no version -- reported core while glGetString(GL_VERSION)
+           from the host said "Compatibility Profile". The two contradicted
+           each other, and an application deciding whether fixed function is
+           available reads this one. gl44-matrix-query-probe refused to test
+           anything on the strength of it, which is how it was found. */
+        if (out)
+            out[0] = egl_api != 0x30A2u ? 0
+                   : gexgl_egl_context_profile() ? 2 /* COMPATIBILITY_BIT */
+                                                 : 1; /* CORE_BIT */
         return;
     }
     /* Sized from the pname before the request goes out, for two reasons.
@@ -3738,6 +3753,43 @@ static size_t gexgl_state_query_components(unsigned pname) {
     case 0x91BEu: /* GL_MAX_COMPUTE_WORK_GROUP_COUNT */
     case 0x91BFu: /* GL_MAX_COMPUTE_WORK_GROUP_SIZE */
         return 3;
+    /* The compatibility profile's own multi-valued state. This table and the
+       host's are one table in two places -- they have to agree exactly, or
+       the reply is the wrong length and the guest drops it whole -- and
+       neither had any of these, so they agreed on the wrong answer: one.
+       glGetFloatv(GL_MODELVIEW_MATRIX, m) carried a single float and left the
+       caller's other fifteen as they were, with no error. A GLX context is a
+       compatibility context and fixed-function software reads its matrices
+       back constantly. */
+    case 0x0BA6u: /* GL_MODELVIEW_MATRIX */
+    case 0x0BA7u: /* GL_PROJECTION_MATRIX */
+    case 0x0BA8u: /* GL_TEXTURE_MATRIX */
+    case 0x80B1u: /* GL_COLOR_MATRIX */
+    /* And the transposed spellings GL 1.3 added beside them, which are the
+       same sixteen values the other way up. */
+    case 0x84E3u: /* GL_TRANSPOSE_MODELVIEW_MATRIX */
+    case 0x84E4u: /* GL_TRANSPOSE_PROJECTION_MATRIX */
+    case 0x84E5u: /* GL_TRANSPOSE_TEXTURE_MATRIX */
+    case 0x84E6u: /* GL_TRANSPOSE_COLOR_MATRIX */
+        return 16;
+    case 0x0B00u: /* GL_CURRENT_COLOR */
+    case 0x8459u: /* GL_CURRENT_SECONDARY_COLOR */
+    case 0x0B03u: /* GL_CURRENT_TEXTURE_COORDS */
+    case 0x0B04u: /* GL_CURRENT_RASTER_COLOR */
+    case 0x0B07u: /* GL_CURRENT_RASTER_POSITION */
+    case 0x0B06u: /* GL_CURRENT_RASTER_TEXTURE_COORDS */
+    case 0x845Fu: /* GL_CURRENT_RASTER_SECONDARY_COLOR */
+    case 0x0B66u: /* GL_FOG_COLOR */
+    case 0x0B53u: /* GL_LIGHT_MODEL_AMBIENT */
+    case 0x0B80u: /* GL_ACCUM_CLEAR_VALUE */
+    case 0x0DD2u: /* GL_MAP2_GRID_DOMAIN */
+        return 4;
+    case 0x0B02u: /* GL_CURRENT_NORMAL */
+    case 0x8129u: /* GL_POINT_DISTANCE_ATTENUATION */
+        return 3;
+    case 0x0DD0u: /* GL_MAP1_GRID_DOMAIN */
+    case 0x0DD3u: /* GL_MAP2_GRID_SEGMENTS */
+        return 2;
     case 0x0B70u: /* GL_DEPTH_RANGE */
     case 0x0D3Au: /* GL_MAX_VIEWPORT_DIMS */
     case 0x846Du: /* GL_ALIASED_POINT_SIZE_RANGE */
@@ -3907,6 +3959,8 @@ static int egl_context_minor;
  * never creates one has every draw dropped by st before the driver sees it.
  * glmark2 swapped 1910 frames and issued exactly zero draws that way. */
 static int egl_context_profile;
+/* Read by glGetIntegerv(GL_CONTEXT_PROFILE_MASK), which sits above this. */
+int gexgl_egl_context_profile(void) { return egl_context_profile; }
 
 /* What the application handed eglGetDisplay, and which platform it named.
  *

@@ -971,10 +971,20 @@ case 1206: {
     GLuint program = a.u32();
     GLuint bufferIndex = a.u32();
     GLenum pname = a.u32();
-    const uint32_t components = 1u;
-    GLint values[4]{};
-    GEX_GL_CALL(glGetActiveAtomicCounterBufferiv, lookup(programs, program), bufferIndex, pname, values);
-    put_blob(values, components * sizeof(GLint));
+    uint32_t components = 1u;
+    if (pname == GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES) {
+        GLint active = 0;
+        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv, lookup(programs, program),
+                    bufferIndex, GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTERS,
+                    &active);
+        components = active > 0 ? (uint32_t)active : 0u;
+    }
+    std::vector<GLint> values(components ? components : 1u, 0);
+    if (components)
+        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv,
+                    lookup(programs, program), bufferIndex, pname,
+                    values.data());
+    put_blob(values.data(), components * sizeof(GLint));
     break;
 }
 case 1218: {
@@ -1058,8 +1068,11 @@ case 1229: {
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLdouble> values(components);
     if (components) GEX_GL_CALL(glGetDoublev, pname, values.data());
-    if (components)
-        values[0] = (GLdouble)binding_query_external(pname, (GLuint)values[0]);
+    if (components) {
+        GLuint named = (GLuint)values[0];
+        if (binding_query_object(pname, &named))
+            values[0] = (GLdouble)named;
+    }
     put_blob(values.data(), components * sizeof(GLdouble));
     break;
 }
@@ -1077,8 +1090,11 @@ case 1232: {
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLfloat> values(components);
     if (components) GEX_GL_CALL(glGetFloatv, pname, values.data());
-    if (components)
-        values[0] = (GLfloat)binding_query_external(pname, (GLuint)values[0]);
+    if (components) {
+        GLuint named = (GLuint)values[0];
+        if (binding_query_object(pname, &named))
+            values[0] = (GLfloat)named;
+    }
     put_blob(values.data(), components * sizeof(GLfloat));
     break;
 }
@@ -1131,7 +1147,10 @@ case 1238: {
     const unsigned components =
         (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
     glGetInteger64i_v(target, index, value);
-    value[0] = (GLint64)binding_query_external(target, (GLuint)value[0]);
+    {
+        GLuint named = (GLuint)value[0];
+        if (binding_query_object(target, &named)) value[0] = (GLint64)named;
+    }
     put_blob(value, components * sizeof(value[0]));
     break;
 }
@@ -1140,8 +1159,11 @@ case 1239: {
     const uint32_t components = gexgl_state_query_components(pname);
     std::vector<GLint64> values(components);
     if (components) GEX_GL_CALL(glGetInteger64v, pname, values.data());
-    if (components)
-        values[0] = (GLint64)binding_query_external(pname, (GLuint)values[0]);
+    if (components) {
+        GLuint named = (GLuint)values[0];
+        if (binding_query_object(pname, &named))
+            values[0] = (GLint64)named;
+    }
     put_blob(values.data(), components * sizeof(GLint64));
     break;
 }
@@ -1151,7 +1173,10 @@ case 1240: {
     const unsigned components =
         (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
     glGetIntegeri_v(target, index, value);
-    value[0] = (GLint)binding_query_external(target, (GLuint)value[0]);
+    {
+        GLuint named = (GLuint)value[0];
+        if (binding_query_object(target, &named)) value[0] = (GLint)named;
+    }
     if (target == GL_IMAGE_BINDING_NAME) value[0] = external_name(textures, (GLuint)value[0]);
     put_blob(value, components * sizeof(value[0]));
     break;

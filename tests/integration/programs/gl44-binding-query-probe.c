@@ -142,6 +142,33 @@ int main(void) {
         while (glGetError() != GL_NO_ERROR) {}
     }
 
+    /* A float query whose first component is not a whole number.
+     *
+     * The name translation above has to be conditional on the pname. When it
+     * was not, the first component of every float answer went through GLuint
+     * on its way back: glGetFloatv(GL_COLOR_CLEAR_VALUE) with red 0.25 came
+     * back 0, and so would GL_LINE_WIDTH 0.5. These are core-profile queries,
+     * which is the point of testing them here -- the probe that first caught
+     * it needed a compatibility context and so could not have gated this. */
+    {
+        glClearColor(0.25f, 0.5f, 0.75f, 1.0f);
+        GLfloat clear[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
+        glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+        fprintf(stderr, "INFO clear_value=%g,%g,%g,%g want=0.25,0.5,0.75,1\n",
+                (double)clear[0], (double)clear[1], (double)clear[2],
+                (double)clear[3]);
+        result("float_query_keeps_fraction",
+               clear[0] > 0.24f && clear[0] < 0.26f && clear[1] > 0.49f &&
+               clear[2] > 0.74f && clear[3] > 0.99f);
+
+        glLineWidth(1.0f);
+        GLfloat width = -1.0f;
+        glGetFloatv(GL_LINE_WIDTH, &width);
+        fprintf(stderr, "INFO line_width=%g want=1\n", (double)width);
+        result("line_width_query", width > 0.99f && width < 1.01f);
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

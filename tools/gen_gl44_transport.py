@@ -908,6 +908,23 @@ def guest_function(command: dict, opcode: int) -> str:
         text = (text[:close] +
                 "    gexgl_client_mapped_barrier(barriers);\n" + text[close:])
 
+    if command["name"] == "glGetActiveAtomicCounterBufferiv":
+        # The array pname, matching the host above. Every other pname this
+        # call takes is one integer, so the generated shape demands exactly
+        # four bytes back and would drop a longer reply on the floor.
+        text = text.replace(
+            "    const size_t expected = (size_t)1u * sizeof(*params);",
+            "    /* GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES is one\n"
+            "       index per active atomic counter, not one integer. */\n"
+            "    const int indices = pname == 0x92C6u;\n"
+            "    const size_t expected = (size_t)1u * sizeof(*params);")
+        text = text.replace(
+            "    if (params && source && reply_len == expected)\n"
+            "        memcpy(params, source, expected);",
+            "    if (params && source && (indices ? reply_len > 0\n"
+            "                                     : reply_len == expected))\n"
+            "        memcpy(params, source, indices ? reply_len : expected);")
+
     if command["name"] in STORAGE_FLAG_QUERIES:
         which, cast = STORAGE_FLAG_QUERIES[command["name"]]
         brace = text.index("{\n") + 2
@@ -2052,7 +2069,10 @@ def host_case(command: dict, opcode: int) -> str:
     const unsigned components =
         (target == GL_VIEWPORT || target == GL_SCISSOR_BOX) ? 4u : 1u;
     {name}(target, index, value);
-    value[0] = ({value_type})binding_query_external(target, (GLuint)value[0]);{image_translation}
+    {{
+        GLuint named = (GLuint)value[0];
+        if (binding_query_object(target, &named)) value[0] = ({value_type})named;
+    }}{image_translation}
     put_blob(value, components * sizeof(value[0]));
     break;
 }}"""
@@ -2109,6 +2129,10 @@ def host_case(command: dict, opcode: int) -> str:
         else:
             lines += [f"    {output_type} values[4]{{}};",
                       f"    GEX_GL_CALL({name}, {', '.join(call_names + ['values'])});"]
+        if name == "glGetActiveAtomicCounterBufferiv":
+            # Re-emitted below against the vector; drop the fixed-array call.
+            lines = [l for l in lines if f"GEX_GL_CALL({name}," not in l]
+
         # The DSA form needs exactly what the bound form below needs: a name
         # returned to the guest has to be in the guest's numbering. The two
         # differ only in how the framebuffer is identified, so they share the
@@ -2164,12 +2188,49 @@ def host_case(command: dict, opcode: int) -> str:
         # through the name map would turn GL_TRUE into whichever object the
         # host happened to number one.
         if name in {"glGetFloatv", "glGetDoublev", "glGetInteger64v"}:
-            lines += ["    if (components)",
-                      f"        values[0] = ({output_type})binding_query_external(pname, (GLuint)values[0]);"]
+            # Only when the pname actually names an object. Converting
+            # unconditionally destroyed every float answer whose first
+            # component was not integral -- glGetFloatv(GL_CURRENT_COLOR)
+            # with red 0.25 came back 0, and GL_LINE_WIDTH 0.5 would have
+            # come back 0 too. gl44-matrix-query-probe caught it.
+            lines += ["    if (components) {",
+                      "        GLuint named = (GLuint)values[0];",
+                      "        if (binding_query_object(pname, &named))",
+                      f"            values[0] = ({output_type})named;",
+                      "    }"]
+        # GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES is an
+        # *array*: one index per active atomic counter in the buffer. Every
+        # other pname this call takes is a single integer, so it was declared
+        # single-valued and only the first index ever crossed -- the rest of
+        # the caller's array kept whatever was in it, with no error. The same
+        # shape as GL_COMPUTE_WORK_GROUP_SIZE, and the last one of it in the
+        # generated surface: every other query here is single-valued for every
+        # pname GL defines.
+        if name == "glGetActiveAtomicCounterBufferiv":
+            lines = [l for l in lines if "const uint32_t components" not in l
+                     and "GLint values[4]{};" not in l]
+            lines += [
+                "    uint32_t components = 1u;",
+                "    if (pname == GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES) {",
+                "        GLint active = 0;",
+                "        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv, lookup(programs, program),",
+                "                    bufferIndex, GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTERS,",
+                "                    &active);",
+                "        components = active > 0 ? (uint32_t)active : 0u;",
+                "    }",
+                "    std::vector<GLint> values(components ? components : 1u, 0);",
+                "    if (components)",
+                "        GEX_GL_CALL(glGetActiveAtomicCounterBufferiv,",
+                "                    lookup(programs, program), bufferIndex, pname,",
+                "                    values.data());",
+            ]
         if name in {"glGetVertexAttribiv", "glGetVertexAttribIiv", "glGetVertexAttribIuiv"}:
             lines += ["    if (pname == GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING)",
                       f"        values[0] = ({output_type})external_name(buffers, (GLuint)values[0]);"]
-        value_pointer = "values.data()" if RESOURCE_OUTPUT_QUERIES[name] == "state" else "values"
+        value_pointer = ("values.data()"
+                         if RESOURCE_OUTPUT_QUERIES[name] == "state"
+                         or name == "glGetActiveAtomicCounterBufferiv"
+                         else "values")
         lines += [f"    put_blob({value_pointer}, components * sizeof({output_type}));",
                   "    break;", "}"]
         return "\n".join(lines)

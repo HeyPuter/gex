@@ -1206,8 +1206,13 @@ GLuint lookup_program_or_shader(uint32_t name) {
     if (shader != shaders.end()) return shader->second;
     return GEXGL_UNGENERATED_NAME;
 }
-/* Declared here and defined below the maps it needs. */
-uint32_t binding_query_external(GLenum pname, GLuint name);
+/* Declared here and defined below the maps it needs.
+   Returns false for a pname that is not an object name, leaving *name
+   untouched -- the caller must not convert the value at all in that case.
+   It used to return the translated name and let the caller cast, which
+   destroyed every *float* answer whose first component was not integral:
+   glGetFloatv(GL_CURRENT_COLOR) with red 0.25 came back 0. */
+bool binding_query_object(GLenum pname, GLuint *name);
 
 uint32_t external_name(const std::unordered_map<uint32_t, GLuint>& map, GLuint name) {
     if (!name) return 0;
@@ -1268,8 +1273,7 @@ void reset_guest_namespace() {
 }
 /* Which of glGetIntegerv's answers is an object name, and whose. Anything not
    listed is a number in its own right and passes through. */
-uint32_t binding_query_external(GLenum pname, GLuint name) {
-    if (!name) return 0;
+bool binding_query_object(GLenum pname, GLuint *name) {
     switch (pname) {
     case GL_ARRAY_BUFFER_BINDING:
     case GL_ELEMENT_ARRAY_BUFFER_BINDING:
@@ -1285,7 +1289,7 @@ uint32_t binding_query_external(GLenum pname, GLuint name) {
     case GL_DRAW_INDIRECT_BUFFER_BINDING:
     case GL_QUERY_BUFFER_BINDING:
     case GL_TEXTURE_BUFFER_BINDING:
-        return external_name(buffers, name);
+        *name = *name ? external_name(buffers, *name) : 0u; return true;
     case GL_TEXTURE_BINDING_1D:
     case GL_TEXTURE_BINDING_2D:
     case GL_TEXTURE_BINDING_3D:
@@ -1297,29 +1301,29 @@ uint32_t binding_query_external(GLenum pname, GLuint name) {
     case GL_TEXTURE_BINDING_BUFFER:
     case GL_TEXTURE_BINDING_2D_MULTISAMPLE:
     case GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY:
-        return external_name(textures, name);
+        *name = *name ? external_name(textures, *name) : 0u; return true;
     case GL_CURRENT_PROGRAM:
-        return external_name(programs, name);
+        *name = *name ? external_name(programs, *name) : 0u; return true;
     case GL_PROGRAM_PIPELINE_BINDING:
-        return external_name(program_pipelines, name);
+        *name = *name ? external_name(program_pipelines, *name) : 0u; return true;
     case GL_VERTEX_ARRAY_BINDING:
-        return external_name(vertex_arrays, name);
+        *name = *name ? external_name(vertex_arrays, *name) : 0u; return true;
     case GL_DRAW_FRAMEBUFFER_BINDING:   /* and GL_FRAMEBUFFER_BINDING */
     case GL_READ_FRAMEBUFFER_BINDING:
-        return external_name(framebuffers, name);
+        *name = *name ? external_name(framebuffers, *name) : 0u; return true;
     case GL_RENDERBUFFER_BINDING:
-        return external_name(renderbuffers, name);
+        *name = *name ? external_name(renderbuffers, *name) : 0u; return true;
     case GL_SAMPLER_BINDING:
-        return external_name(samplers, name);
+        *name = *name ? external_name(samplers, *name) : 0u; return true;
     case GL_TRANSFORM_FEEDBACK_BINDING:
-        return external_name(transform_feedbacks, name);
+        *name = *name ? external_name(transform_feedbacks, *name) : 0u; return true;
     /* Indexed, and asked through glGetIntegeri_v: the buffer attached to a
        vertex binding point. The four indexed buffer bindings beside it were
        translated and this was not. */
     case GL_VERTEX_BINDING_BUFFER:
-        return external_name(buffers, name);
+        *name = *name ? external_name(buffers, *name) : 0u; return true;
     default:
-        return name;
+        return false;
     }
 }
 
@@ -1343,6 +1347,41 @@ size_t integer_query_components(GLenum pname) {
     case GL_MAX_COMPUTE_WORK_GROUP_COUNT:
     case GL_MAX_COMPUTE_WORK_GROUP_SIZE:
         return 3;
+    /* The compatibility profile's own multi-valued state, which was absent
+       and so fell through to one. A GLX context is a compatibility context,
+       and fixed-function software reads its matrices back constantly:
+       glGetFloatv(GL_MODELVIEW_MATRIX, m) transported a single float and left
+       the caller's other fifteen holding whatever they held before, with no
+       error anywhere. The matrices are the expensive half of the mistake; the
+       colours and the current vertex state are the same shape. */
+    case GL_MODELVIEW_MATRIX:
+    case GL_PROJECTION_MATRIX:
+    case GL_TEXTURE_MATRIX:
+    case GL_COLOR_MATRIX:
+    /* And the transposed spellings GL 1.3 added beside them. */
+    case GL_TRANSPOSE_MODELVIEW_MATRIX:
+    case GL_TRANSPOSE_PROJECTION_MATRIX:
+    case GL_TRANSPOSE_TEXTURE_MATRIX:
+    case GL_TRANSPOSE_COLOR_MATRIX:
+        return 16;
+    case GL_CURRENT_COLOR:
+    case GL_CURRENT_SECONDARY_COLOR:
+    case GL_CURRENT_TEXTURE_COORDS:
+    case GL_CURRENT_RASTER_COLOR:
+    case GL_CURRENT_RASTER_POSITION:
+    case GL_CURRENT_RASTER_TEXTURE_COORDS:
+    case GL_CURRENT_RASTER_SECONDARY_COLOR:
+    case GL_FOG_COLOR:
+    case GL_LIGHT_MODEL_AMBIENT:
+    case GL_ACCUM_CLEAR_VALUE:
+    case GL_MAP2_GRID_DOMAIN:
+        return 4;
+    case GL_CURRENT_NORMAL:
+    case GL_POINT_DISTANCE_ATTENUATION:
+        return 3;
+    case GL_MAP1_GRID_DOMAIN:
+    case GL_MAP2_GRID_SEGMENTS:
+        return 2;
     case GL_COMPRESSED_TEXTURE_FORMATS: {
         GLint count = 0;
         glGetIntegerv(GL_NUM_COMPRESSED_TEXTURE_FORMATS, &count);
@@ -2602,8 +2641,11 @@ bool one(uint32_t op, Reader& a) {
            it only shows once deleting objects has pushed them apart, which is
            why it went unseen. Reading a binding, changing it and putting it
            back is what every toolkit sharing a context does. */
-        if (!values.empty())
-            values[0] = (GLint)binding_query_external(pname, (GLuint)values[0]);
+        if (!values.empty()) {
+            GLuint named = (GLuint)values[0];
+            if (binding_query_object(pname, &named))
+                values[0] = (GLint)named;
+        }
         put_blob(values.data(), values.size() * sizeof(values[0]));
         break;
     }

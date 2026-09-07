@@ -976,6 +976,9 @@ void glGenerateTextureMipmap(unsigned texture) {
     packet[at++] = (uint32_t)(texture);
 }
 void glGetActiveAtomicCounterBufferiv(unsigned program, unsigned bufferIndex, unsigned pname, int *params) {
+    /* GL_ATOMIC_COUNTER_BUFFER_ACTIVE_ATOMIC_COUNTER_INDICES is one
+       index per active atomic counter, not one integer. */
+    const int indices = pname == 0x92C6u;
     const size_t expected = (size_t)1u * sizeof(*params);
     uint32_t *packet = begin(1206, 3, 0);
     if (!packet) return;
@@ -985,8 +988,9 @@ void glGetActiveAtomicCounterBufferiv(unsigned program, unsigned bufferIndex, un
     packet[at++] = (uint32_t)(pname);
     flush();
     uint32_t reply_len = 0; const uint8_t *source = reply_blob(&reply_len);
-    if (params && source && reply_len == expected)
-        memcpy(params, source, expected);
+    if (params && source && (indices ? reply_len > 0
+                                     : reply_len == expected))
+        memcpy(params, source, indices ? reply_len : expected);
 }
 void glGetBooleani_v(unsigned target, unsigned index, unsigned char *data) {
     const size_t expected = (size_t)gexgl_state_query_components(target) * sizeof(*data);
