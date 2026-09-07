@@ -20646,3 +20646,34 @@ Read that way round, it says the interesting things at once:
 **Why this matters even though every app is at 60 FPS**: 6.1 ms of a 16.7 ms
 budget is 2.7x headroom, not comfortable margin, and it is invisible to every
 other gate. This is the number to watch before it becomes a bug report.
+
+### One readback buffer instead of one per frame
+
+`texture_map(PIPE_MAP_READ)` created a WebGPU buffer and released it again on
+every call, and **presentation goes through that path once a frame** -- so an
+ordinary windowed application allocated and freed a whole framebuffer's worth
+of buffer per frame purely to copy out of.
+
+It is cached on the screen now, grow-only: a window that gets bigger
+reallocates once, one that gets smaller keeps the larger buffer, which is the
+cheaper mistake.
+
+**Safe because the readback is strictly intra-call**, which is the property to
+check before believing that: the path `memcpy`s the mapped range into
+`transfer->data` -- a CPU allocation -- and only then unmaps. Nothing holds the
+staging buffer across a call, so a second transfer opened while the first is
+still alive cannot collide with it. `gex_wgpu_blit` is the case that would have
+found this: it maps two textures at once, but as `PIPE_MAP_READ` and
+`PIPE_MAP_WRITE`, and only the read path stages.
+
+**Worth 164 -> 168 FPS on `perf-gears.sh`, 6.11 -> 5.94 ms/frame.** That is
+2.8%, which is small and honest: present went 44% -> 43% of the frame, so the
+allocation was never the expensive part of it -- the GPU→CPU copy and the wait
+are. It is kept because removing a per-frame allocation of that size is
+strictly better and because it removes handle churn, which is the same class of
+hazard as the bind-group key collision earlier in this document.
+
+Gates: probe suite 166 OK of 173 with the same seven expected, CTS gate at
+every baseline, native STK unchanged (meangray 67, stdev 17, 460 colours),
+Krita OK with panels_rmse=0, browser ssbo 7/7 and ubo-min-offset 3/3, browser
+STK 59.90 FPS at 99.67% fresh with no rAF misses.
