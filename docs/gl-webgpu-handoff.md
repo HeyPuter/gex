@@ -19183,3 +19183,37 @@ the state it left, which is a different wrong answer rather than a better one.
 The probe is committed expecting 4/6 in the browser, so it will report a DIFF
 in probe-suite until this lands -- the same convention as
 gl44-internalformat-negative. It is the acceptance test for the fix.
+
+## What is left of multi-context: objects, not state
+
+`gl44-two-contexts-probe` is **8/8 against the reference and 7/8 in the
+browser**. The six state cases and the two-handles case pass; the one failure
+is `unshared_context_cannot_see_the_buffer`.
+
+Both contexts in the probe are created with `EGL_NO_CONTEXT` as their share
+context, so GL says they have separate object namespaces. This transport shares
+objects between every context, because `CONTEXT_ADD` always creates its host
+context sharing the first's -- deliberately, since `share_context` is not
+honoured and a toolkit that asked for sharing has been getting it by accident.
+
+**Why this is left, having fixed the state half.** The guest allocates guest
+object names from one global counter, so an unshared second context gets fresh
+names and never *collides* with the first. The visible wrongness is only that
+it can see and use the other context's objects, which is rarely what a program
+depends on. The state half was the one that mattered: *any* two contexts saw
+each other's pixel store, buffer bindings and vertex layout, whether they asked
+to share or not.
+
+**What implementing it would take.** `reset_guest_namespace()` already
+enumerates the host's maps -- programs, shaders, buffers, queries,
+transform_feedbacks, program_pipelines, textures, samplers, framebuffers,
+renderbuffers, vertex_arrays -- so they can be *swapped* on a context switch
+exactly as the guest's caches are, and no `lookup()` site changes. Then
+`CONTEXT_ADD` needs a `shared` flag from the guest's `share` argument: shared
+contexts keep aliasing one namespace (so nothing that works today changes) and
+unshared ones get their own. The gate stays as tight as the state fix's: only a
+second *unshared* context reaches any of it.
+
+The probe stays in the tree failing that one case on purpose, with
+`GEX_PROBE_EXPECT` in its header. It will move the moment either half changes
+-- up if object isolation lands, down if the state isolation regresses.

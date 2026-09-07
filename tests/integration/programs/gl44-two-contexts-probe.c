@@ -14,6 +14,18 @@
  *
  * The reference is the oracle here: native Mesa gives real per-context state,
  * so whatever it answers is what GL requires.
+ *
+ * **Expected result: 8/8 against the reference, 7/8 in the browser.** The one
+ * failure is `unshared_context_cannot_see_the_buffer` and it is a known,
+ * documented gap rather than a regression -- see the tail of this file and
+ * docs/gl-webgpu-handoff.md. Gate it with
+ *
+ *   GEX_PROBE_EXPECT='SUMMARY cases=8 passed=7 failed=1' \
+ *       tests/gl44-probe.sh two-contexts
+ *
+ * and it will fail the moment either half changes: if object isolation is
+ * implemented the count goes up, and if per-context *state* regresses it goes
+ * down. That is the point of leaving it here failing.
  */
 #define GL_GLEXT_PROTOTYPES 1
 #include <EGL/egl.h>
@@ -79,6 +91,35 @@ int main(void) {
     eq("first_context_kept_its_pack", value, 1);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &value);
     eq("first_context_kept_its_binding", value, (long long)buf);
+
+    /* And the objects, which is a different question from the state above.
+     *
+     * Both contexts here were created with EGL_NO_CONTEXT as their share
+     * context, so GL says they have separate object namespaces: a buffer
+     * generated in one is not a buffer in the other. This transport shares
+     * objects between every context on purpose -- eglCreateContext's `share`
+     * argument is not honoured, and because contexts used to alias one
+     * namespace entirely, a toolkit that asked for sharing has been getting
+     * it, so separating them without implementing sharing would break those
+     * programs.
+     *
+     * These cases therefore describe what GL requires and what this driver
+     * does not do yet. The reference answers them; the browser is expected
+     * not to. */
+    if (!eglMakeCurrent(d, s, s, second)) return 3;
+    const GLboolean known = glIsBuffer(buf);
+    ++cases; if (!known) ++passed;
+    fprintf(stderr, "INFO %-40s got=%d want=0\n",
+            "unshared_context_cannot_see_the_buffer", (int)known);
+    printf("CASE unshared_context_cannot_see_the_buffer %s\n",
+           !known ? "PASS" : "FAIL");
+
+    /* A name generated in each must be able to differ, which it cannot while
+       one namespace serves both. */
+    GLuint own = 0; glGenBuffers(1, &own);
+    glBindBuffer(GL_ARRAY_BUFFER, own);
+    glBufferData(GL_ARRAY_BUFFER, 32, NULL, GL_STATIC_DRAW);
+    eq("second_context_can_make_its_own", drain(), GL_NO_ERROR);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
