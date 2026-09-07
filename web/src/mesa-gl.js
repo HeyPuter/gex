@@ -211,6 +211,22 @@ export class MesaGlDevice {
         maxTextureDimension3D: 2048,
         maxTextureArrayLayers: 2048,
       };
+      // The alignment limits run the other way: *lower* is better and the
+      // default is the worst allowed, so these clamp up to a floor rather
+      // than down to a ceiling. WebGPU will not grant below 32.
+      //
+      // Worth asking for the same reason as everything above. The 256 default
+      // is reported straight through to GL as
+      // UNIFORM_BUFFER_OFFSET_ALIGNMENT and
+      // SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, so every glBindBufferRange
+      // offset an application chooses has to be a multiple of it -- and one
+      // that packs tighter than that, which is ordinary, gets
+      // GL_INVALID_VALUE for a binding the hardware would have taken. Native
+      // Dawn offers 4 for both and grants the 32 floor.
+      const wantLow = {
+        minUniformBufferOffsetAlignment: 32,
+        minStorageBufferOffsetAlignment: 32,
+      };
       const requiredLimits = {};
       const short = [];
       for (const [limit, wanted] of Object.entries(want)) {
@@ -218,6 +234,15 @@ export class MesaGlDevice {
         if (typeof available === 'number' && available > 0) {
           requiredLimits[limit] = Math.min(available, wanted);
           if (available < wanted) short.push(`${limit} ${available}<${wanted}`);
+        } else {
+          short.push(`${limit} absent`);
+        }
+      }
+      for (const [limit, floor] of Object.entries(wantLow)) {
+        const available = adapter.limits[limit];
+        if (typeof available === 'number' && available > 0) {
+          requiredLimits[limit] = Math.max(available, floor);
+          if (available > floor) short.push(`${limit} ${available}>${floor}`);
         } else {
           short.push(`${limit} absent`);
         }

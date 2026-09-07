@@ -20424,3 +20424,51 @@ passing, which is the fragment-alias repair and the bind group cache work; no
 family regressed. The four still failing in `shader_storage_buffer_object` are
 `basic-atomic-case1`, `basic-atomic-case4` (the decline above),
 `advanced-switchBuffers` and `advanced-usage-sync`.
+
+## Nobody asked for the buffer offset alignment, so it was 256
+
+`KHR-GL45.shader_storage_buffer_object.advanced-switchBuffers` failed on one
+line, which is the whole story:
+
+    Mesa: error: GL_INVALID_VALUE in glBindBufferRange(offset misaligned 128/256)
+
+The test binds at 128-byte strides. `caps->shader_buffer_offset_alignment` and
+`caps->constant_buffer_offset_alignment` were both **hardcoded to 256**, which
+is WebGPU's *default* `minStorageBufferOffsetAlignment` /
+`minUniformBufferOffsetAlignment` -- and the driver never asked the adapter for
+anything better. **The adapter offers 4 for both.**
+
+This is the third time in this file that a limit nobody requested looked
+exactly like a device wall, and the request lists already say so twice in their
+own comments. The difference here is the direction: these are *alignment* class
+limits, where **lower is better** and the default is the worst allowed, so the
+existing request machinery -- `GEX_WANT`, and the browser's `Math.min(available,
+wanted)` loop -- clamps the wrong way round. Both paths now have a counterpart
+(`GEX_WANT_LOW`, `wantLow`) that clamps *up* to WebGPU's floor of 32 instead.
+
+It is not only a conformance case. The reported alignment is what every
+`glBindBufferRange` offset must be a multiple of, so an application that packs
+its uniform or storage bindings at 64 or 128 bytes -- which is ordinary --
+was told `GL_INVALID_VALUE` for a binding the hardware would have taken.
+
+**Granted 32 natively**, and `advanced-switchBuffers` passes;
+`shader_storage_buffer_object` went **120/124 to 121/124**.
+
+**The browser is unchanged, because its adapter really does cap at 256.** That
+is now visible rather than invisible -- the short-of-wanted line reports
+`minUniformBufferOffsetAlignment 256>32, minStorageBufferOffsetAlignment
+256>32`, so the next reader can see the request was made and refused rather
+than wondering whether it was made at all. Chromium appears to expose the
+spec default here regardless of the hardware underneath.
+
+The limit trace also reports both alignments now, adapter and granted, since
+the whole question was invisible in it: `GEX_WGPU_LIMIT_TRACE=1` prints
+`buffer offset alignment uniform N storage N` on each side.
+
+Internal alignment is left at 256 where the driver picks its own offsets (the
+constant ring). Over-aligning is always legal, and nothing measured says the
+tighter packing is worth the churn there.
+
+Gates: probe suite 165 OK of 172 with the same seven expected, CTS gate at
+every baseline, Alacritty exact against llvmpipe, Blender identical
+(mean 61, 338 colours), native STK a real scene (meangray 67, stdev 17).
