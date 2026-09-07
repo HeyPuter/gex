@@ -1,7 +1,7 @@
 #!/bin/sh
 # Does a long run stay flat? A soak gate for resource growth.
 #
-#   soak.sh [seconds] [app]
+#   soak.sh [seconds] [stk|gears|browser]
 #
 # This gate exists because nothing else here measured *growth over time*. The
 # whole suite -- probes, CTS families, app screenshots, FPS -- runs for tens of
@@ -30,6 +30,53 @@ VRAM_SYSFS=${GEX_VRAM_SYSFS:-/sys/class/drm/card1/device/mem_info_vram_used}
 # genuinely growing scene may still be filling caches.
 BUDGET=${GEX_SOAK_GROWTH_MIB:-64}
 
+# The browser is its own shape: there is no one process to measure, and
+# chromium's RSS grows for harness reasons that have nothing to do with the
+# driver (it keeps one browser alive across runs, so a day of gates never
+# shrinks it -- see docs/gl-webgpu-handoff.md). VRAM is the honest signal
+# there, and it is the one the leak moved.
+if [ "$app" = browser ]; then
+  start_vram=$(( $(cat "$VRAM_SYSFS") / 1048576 ))
+  if [ "$start_vram" -gt "${GEX_SOAK_MAX_START_MIB:-600}" ]; then
+    echo "soak: GPU already at ${start_vram} MiB; run this on an idle card"
+    exit 2
+  fi
+  log=$(mktemp); trap 'rm -f "$log"' EXIT
+  # Long enough that a leak of even a few MiB a second is unmistakable, and
+  # the harness's own VRAM guard still aborts if one runs away.
+  ( GEX_STK_WALL=$((secs + 60)) GEX_STK_IDLE=$((secs + 60)) \
+      timeout -s KILL $((secs + 180)) \
+      "$(dirname "$0")/../stk-webgpu-fps.sh" >"$log" 2>&1 & )
+  sleep 30    # page load, guest boot and STK's own start-up
+  i=0; first_v=0; last_v=0; peak_v=0; half=$((secs / 20)); [ "$half" -lt 2 ] && half=2
+  while [ "$i" -lt "$((half * 2))" ]; do
+    sleep 10
+    i=$((i + 1))
+    v=$(( $(cat "$VRAM_SYSFS") / 1048576 ))
+    [ "$v" -gt "$peak_v" ] && peak_v=$v
+    printf 't=%3ds vram=%4sMiB\n' "$((i * 10 + 30))" "$v"
+    [ "$i" -eq "$half" ] && first_v=$v
+    last_v=$v
+  done
+  # Let the harness finish and print its verdict; it outlives the sampling by
+  # however long the page took to come up.
+  waited=0
+  while [ "$waited" -lt 180 ] && ! grep -q 'STK real-present gate' "$log"; do
+    sleep 5
+    waited=$((waited + 5))
+  done
+  gv=$((last_v - first_v))
+  printf 'soak browser %ss: vram %+dMiB over the second half (peak %dMiB, budget %dMiB)\n' \
+    "$secs" "$gv" "$peak_v" "$BUDGET"
+  grep -q 'STK real-present gate' "$log" && grep 'STK real-present gate' "$log"
+  if [ "$gv" -gt "$BUDGET" ]; then
+    echo "soak FAIL -- still growing at the end of the run"
+    exit 1
+  fi
+  echo "soak PASS -- flat"
+  exit 0
+fi
+
 case $app in
   stk)
     bin=supertuxkart
@@ -39,7 +86,7 @@ case $app in
       --disable-animated-characters --disable-motion-blur --disable-mlaa \
       --disable-ssao --disable-ibl --shadows=0 --anisotropic=0 ;;
   gears) bin=glxgears; set -- ;;
-  *) echo "soak: unknown app '$app' (stk, gears)" >&2; exit 2 ;;
+  *) echo "soak: unknown app '$app' (stk, gears, browser)" >&2; exit 2 ;;
 esac
 command -v "$bin" >/dev/null 2>&1 || { echo "soak: $bin not installed"; exit 2; }
 
