@@ -14706,6 +14706,32 @@ failure it replaces.**
 
 ### Where the CTS stands, and what is worth doing next
 
+> **STALE. Every row below has been overtaken; do not plan against it.** It is
+> kept because the prose around it refers to it, and because it is the exact
+> artifact that nearly cost a large piece of work: its
+> `es_31_compatibility 235/355` was read as a 120-case gap and re-measuring
+> found **8**. A family score is only evidence on the day it was taken.
+>
+> The numbers below that have since been re-measured, newest first:
+>
+> | family | this table | measured 2026-09-07 |
+> |---|---|---|
+> | `es_31_compatibility` | 235/355 | **291/355** (8 fail, listed later) |
+> | `gpu_shader_fp64` | 558/659 | **658/659** |
+> | `shader_storage_buffer_object` | 78/124 | **121/124** |
+> | `shading_language_420pack` | 47/329 | **327/329** |
+> | `direct_state_access` | 288/371 | **317/371** (42 of 54 are walls) |
+> | `cull_distance` | 145/218 | **202/218**, 0 failing |
+> | `sample_variables` | 125/190 | **134**, 0 failing |
+> | `geometry_shader` | 117/136 | **133/136** |
+> | `texture_view` | -- | 3/7, all the multisample-array wall |
+>
+> Re-run before trusting any row: `tests/gl-cts-native.sh
+> --deqp-case='KHR-GL45.<family>.*'` for one, `tests/gl44-cts-families.sh` for
+> the browser column over sixteen. Confirm the prefix first -- a family that
+> does not exist under the one asked for answers "0 pass 0 fail", which reads
+> exactly like a clean family.
+
 Measured against llvmpipe, with the reference number where it was taken:
 
     family                        gex        llvmpipe
