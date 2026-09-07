@@ -19815,3 +19815,44 @@ line starts with `gl` plus an upper-case letter -- but so does
 *"glVertexAttribDivisor state change check failed."*, which is prose. Dropping
 it is how the first filter hid the very message it was written to reveal. **A
 call has parentheses; prose does not.**
+
+## What is left in shader_image_load_store, case by case
+
+The family is browser 38/51, native 35/51, and after this session's work every
+one of the eleven common failures has a named cause. None is a mystery; three
+are features with a shape, and the rest are walls.
+
+| case(s) | cause | shape of the work |
+|---|---|---|
+| `early-fragment-tests`, `basic-glsl-earlyFragTests` | WGSL cannot express `EarlyFragmentTests`; Tint drops the SPIR-V mode | wall |
+| `advanced-sync-imageAccess`, `advanced-sso-atomicCounters` | unformatted `writeonly imageBuffer` in a vertex shader | move the vertex packed-image lowering into a per-draw variant keyed on the resolved format |
+| `non-layered_binding` | a slice of a **3D** texture as a non-layered `image2D`; WebGPU has no 2D view of a 3D slice | rewrite `image2D` to `image3D` with the bound layer as a constant z, as other image shapes already are |
+| `multiple-uniforms` | the packed route costs one storage binding per image, plus two writable bindings over one buffer | consolidate every packed image into one buffer addressed by the existing per-slot header — which answers both halves |
+| `advanced-sync-bufferUpdate`, `advanced-sync-drawIndirect`, `advanced-memory-order`, `advanced-sso-subroutine`, `single-byte_data_alignment` | not yet diagnosed | — |
+
+The three tessellation cases (`basic-allTargets-loadStoreTCS`, `loadStoreTES`,
+`atomicTCS`) are **not** in that list: they are the native adapter's
+ten-storage-buffer limit and pass in the browser.
+
+### An unformatted imageBuffer, and why there is no partial fix
+
+`gex_wgpu_image_is_packed` already takes buffer images -- "whatever its format
+and however it is accessed", per its own comment, because WebGPU has no texel
+buffer at all and there is no sampled fallback -- but it is gated on
+`format != PIPE_FORMAT_NONE`, which contradicts that reasoning: an
+*unformatted* buffer image has **less** alternative, not more. GLSL permits the
+missing qualifier only on a write-only image, and the format then comes from
+the image *unit*. `gex_wgpu_resolve_unformatted_images` does exactly that
+resolution and is called **only from the compute dispatch path**, so a graphics
+stage reaches the shape check and is refused.
+
+Clearing the refusal alone is worse than the refusal: the packed *lowering* is
+applied to `shader->capture_nir` at create time, so a `NONE` format would pack
+wrongly instead of failing. The whole of the work is moving that lowering into
+a per-draw variant, which is what the fragment stage already does for
+`unformatted_images`.
+
+Until then the refusal at least names itself, which it did not before -- an
+application saw only "cannot serve an image in the vertex stage" while the
+specific line went to stderr, where nobody reading a *shader compile failure*
+is looking.
