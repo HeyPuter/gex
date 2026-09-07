@@ -44,14 +44,32 @@ if [ "$app" = browser ]; then
   log=$(mktemp); trap 'rm -f "$log"' EXIT
   # Long enough that a leak of even a few MiB a second is unmistakable, and
   # the harness's own VRAM guard still aborts if one runs away.
-  ( GEX_STK_WALL=$((secs + 60)) GEX_STK_IDLE=$((secs + 60)) \
-      timeout -s KILL $((secs + 180)) \
+  # The harness stops as soon as it has `--display-samples` one-second
+  # samples, so the wall alone does not lengthen a run: ask for one sample a
+  # second for the whole soak. Getting this wrong is not a short run, it is a
+  # run that ends and leaves the loop below sampling an idle card -- which
+  # then reports "flat" while measuring nothing at all.
+  # Ask for more samples than the soak will use, so the workload outlives the
+  # measurement rather than ending exactly as it closes -- which the liveness
+  # check below rightly called a failure the first time this ran.
+  ( GEX_STK_SAMPLES=$((secs + 30)) GEX_STK_WALL=$((secs + 180)) \
+      GEX_STK_IDLE=$((secs + 180)) \
+      timeout -s KILL $((secs + 300)) \
       "$(dirname "$0")/../stk-webgpu-fps.sh" >"$log" 2>&1 & )
   sleep 30    # page load, guest boot and STK's own start-up
   i=0; first_v=0; last_v=0; peak_v=0; half=$((secs / 20)); [ "$half" -lt 2 ] && half=2
   while [ "$i" -lt "$((half * 2))" ]; do
     sleep 10
     i=$((i + 1))
+    # Is the run still going? A soak whose workload exited half way through
+    # samples an idle card and calls the result flat, which is the worst
+    # answer a gate can give: confidently wrong. Checked every sample.
+    if ! pgrep -f '[d]rive\.mjs' >/dev/null 2>&1; then
+      printf 'soak browser: the run ended after %ds of a %ds soak\n' \
+        "$((i * 10 + 30))" "$((half * 20 + 30))"
+      echo "soak FAIL -- the workload did not last the soak; nothing was measured"
+      exit 1
+    fi
     v=$(( $(cat "$VRAM_SYSFS") / 1048576 ))
     [ "$v" -gt "$peak_v" ] && peak_v=$v
     printf 't=%3ds vram=%4sMiB\n' "$((i * 10 + 30))" "$v"
@@ -61,7 +79,7 @@ if [ "$app" = browser ]; then
   # Let the harness finish and print its verdict; it outlives the sampling by
   # however long the page took to come up.
   waited=0
-  while [ "$waited" -lt 180 ] && ! grep -q 'STK real-present gate' "$log"; do
+  while [ "$waited" -lt 90 ] && ! grep -q 'STK real-present gate' "$log"; do
     sleep 5
     waited=$((waited + 5))
   done
