@@ -20865,3 +20865,37 @@ expected, CTS gate at every baseline, browser `image` 15/15,
 `vertex-image-read` 4/4, `ssbo` 7/7, browser STK 58.9-59.6 FPS at 98.3-99.5%
 fresh over three runs, Blender identical at mean 61 / 336 colours, Krita
 `panels_rmse=0`.
+
+### Where the two columns stand after the day's fixes
+
+Re-measured after the vertex-image and integer-cube fixes:
+
+| column | pass | fail | skip |
+|---|---|---|---|
+| the sixteen `KHR-GL44` families, browser | 1156 | 37 | 74 |
+| `KHR-GL45.es_31_compatibility`, browser | **295** | **4** | 56 |
+| `KHR-GL45.es_31_compatibility`, native | **295** | **4** | 56 |
+
+Two things worth reading off that rather than inferring:
+
+**The sixteen-family total did not move**, and that is not a disappointment --
+it is a statement about the list. Every family in it is `KHR-GL44`, and both of
+today's conformance fixes landed in `es_31_compatibility`, which is
+`KHR-GL45` and not in it. The `KHR-GL44.shader_image_load_store` failures are
+the storage-format and `early_fragment_tests` walls, so they were never going
+to move; the *nested* copies of those tests under `es_31_compatibility` are the
+ones that did. A measurement that covers sixteen families is not a measurement
+of the driver.
+
+**The browser matches native exactly on es_31**, 295/4/56 against 295/4/56.
+That is the confirmation that mattered: the two fixes are in shared driver code
+rather than in anything the native path does differently, and the browser is
+the target. Neither needed a browser-specific change, and neither regressed one.
+
+The four left in that family are one `early_fragment_tests` wall and the three
+`basic-atomic-*-vsfs` vertex-atomic declines, which are deliberately deferred
+-- lifting them means *proving* a substituted atomic result is unobservable,
+and the sound version needs `nir_lower_vars_to_ssa` on a clone plus a
+phi-aware taint walk. Getting that subtly wrong is silently wrong geometry, for
+a feature no application here uses, against a decline that is honest and still
+runs the stores.
