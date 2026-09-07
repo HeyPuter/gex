@@ -19628,6 +19628,21 @@ Measured 2026-09-07 across sixteen families, fifty failures in total:
 | shader_subroutine | 27 | 1 | |
 | texture_gather, explicit_uniform_location, buffer_storage, cull_distance | 334 | 0 | clean |
 
+**That table overstates driver defects, and by more than a little.** Three of
+`shader_image_load_store`'s fourteen -- `basic-allTargets-loadStoreTCS`,
+`loadStoreTES` and `atomicTCS` -- are the **native adapter's** limit, not the
+driver's: it grants ten storage buffers per shader stage and the tessellation
+dispatch wants thirteen, so the driver declines with
+`dispatch declined (13 storage buffers, the device takes 10 per stage)`. The
+browser's adapter grants sixteen and passes all three. The same family also has
+one failure the other way -- `basic-allFormats-load` fails in the browser and
+passes natively -- so the family stands at native 35/51, browser 37/51, with
+eleven failing on both.
+
+**Measure a family on both paths before deciding what to work on**, and prefer
+the browser column: it is the target, and a native-only failure may be nothing
+but this machine's adapter.
+
 Of those fifty, eighteen are known platform walls (the storage formats and the
 multisample array), and nine more have since been closed — see below.
 `geometry_shader` is not in this list's family set and sits at 133/136.
@@ -19670,3 +19685,28 @@ Two keys had to be exactly right, and both were wrong first:
   one is invalid GL that must stay refused. Folding them cost seven passing
   cases -- and as an *order-dependent* failure, because the compile error
   latched the context, so cases that pass alone failed in their family.
+
+### early_fragment_tests cannot be asked for
+
+`layout(early_fragment_tests) in` runs the depth and stencil tests before the
+shader, so a fragment they kill performs none of the shader's side effects.
+Here the tests happen either way and the colour is right either way -- measured
+directly: a depth-failing fragment's colour *is* discarded. The only observable
+difference is whether a killed fragment's image stores, image atomics and
+storage writes happen. They do, and should not.
+
+There is no way to request it. SPIR-V has the `EarlyFragmentTests` execution
+mode and NIR carries the request in `info.fs.early_fragment_tests`, so the
+driver knows -- but the module reaches Dawn as **WGSL**, which has no attribute
+for it, and the round trip through Tint drops it whatever the SPIR-V said.
+WebGPU's own rule is the inverse of what is wanted: an implementation may test
+early only when the shader has *no* side effects, exactly the case where it
+would not matter.
+
+Deliberately not emulated: a depth-attachment snapshot compared in the shader
+is exact only where nothing writes depth during the draw, and approximating the
+rest is how this driver has produced its worst bugs. Deliberately not refused
+either -- declining the draw loses the rendering too, and over-applying side
+effects is the lesser wrong. What it is now is *not silent*: one line naming
+the request and what is lost, so the two cases it costs are explicable from the
+driver's own output rather than looking like an image-store bug.
