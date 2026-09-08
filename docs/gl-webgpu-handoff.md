@@ -21397,6 +21397,26 @@ ranking worth planning from:
   instead of performing it. Both copies share the shader's control flow, so the
   recorded value is consistent on every path. Bounded by one capture slot per
   atomic site per vertex.
+
+  **The blocking design question is settled: it is exact for a non-indexed draw
+  and genuinely ambiguous for an indexed one.** The compute clone's index is
+  `gex_wgpu_capture_vertex_slot` -- the *dispatch invocation* modulo
+  verts-per-instance -- while the rasterising copy has `gl_VertexIndex`. For a
+  non-indexed draw those differ by a constant the parameters already carry
+  (`slot == gl_VertexIndex - FIRST_VERTEX`), so the read-back is exact. For an
+  **indexed** draw `gex_wgpu_capture_vertex` resolves the slot through an index
+  table, and the map is not invertible: a reused vertex occupies several slots,
+  so the clone performs the atomic once per slot while the rasteriser's vertex
+  shader may be invoked once per *unique* vertex. GL leaves the invocation
+  count for a reused index implementation-defined, so there is no single right
+  value to read back.
+
+  **So build it for non-indexed draws and keep declining indexed ones by
+  name.** That is exact where it is served and honest where it is not, which is
+  the same shape as every other partial capability here -- and it removes the
+  silent-wrongness risk that was the reason not to start. Verify it with a
+  probe that checks a *named* atomic result per vertex, not merely that the
+  draw happened.
 - **2 -- two capture bindings writable over one range.** The aliasing decline,
   in the capture path.
 - **4 -- adapter limits, and they are real.** `GEX_WGPU_LIMIT_TRACE` says the
