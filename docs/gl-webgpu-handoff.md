@@ -22214,3 +22214,45 @@ that predicate; multisampling stays 2D-only.
 3. **This was unreachable by every other gate.** 336 applications, 180 probes
    and twenty CTS families never called `glTexImage1D` with a depth format.
    Breadth found what depth could not.
+
+## shader_multisample_interpolation: 45/109, and the cause is two opcodes
+
+The largest non-wall failure cluster found so far: **46 failures and 18
+skips** of 109 cases, in a family never measured here. One driver message
+names all of it:
+
+    Tint rejected SPIR-V: error: unhandled GLSL.std.450 instruction 77
+    Tint rejected SPIR-V: error: unhandled GLSL.std.450 instruction 78
+
+**77 is `InterpolateAtSample`, 78 is `InterpolateAtOffset`** -- GLSL 4.00's
+`interpolateAtSample()` and `interpolateAtOffset()`. `InterpolateAtCentroid`
+is 76 and does not appear, so that one is already served.
+
+**WGSL has the *attribute* but not the *function*.** It can declare a fragment
+input `@interpolate(perspective, sample)` or `centroid`, which fixes the
+interpolation for the whole variable, and it has no way to interpolate a given
+input at an arbitrary sample index or at an arbitrary offset at the point of
+use. There is also no barycentric builtin to emulate it with -- no
+`@builtin(barycentric)` -- so the primitive's vertex values are not reachable
+from the fragment stage. For an arbitrary offset this is a genuine wall.
+
+**But a real subset is expressible, and it is the common one.**
+`interpolateAtSample(v, gl_SampleID)` -- interpolating at the sample being
+shaded, which is what a multisample shader usually wants -- is exactly
+`@interpolate(perspective, sample)` on `v` plus a plain read. That is exact,
+not an approximation. Likewise `interpolateAtOffset(v, vec2(0))` is the
+pixel-centre value. So the shape of the fix is the driver's usual one: serve
+the derivable cases, decline the rest **by name** rather than letting Tint
+reject the module with an opcode number.
+
+Two cautions from what is already recorded here. Per-sample interpolation
+interacts with `no-spirv-sampling-on-outputs` -- a per-sample *vertex output*
+cannot be expressed, so the qualifier has to be applied to the fragment input
+alone. And declaring an input `@interpolate(..., sample)` changes how it is
+interpolated for **every** read of it, so a shader that reads `v` both plainly
+and through `interpolateAtSample` cannot have both from one declaration; that
+case needs two inputs or a decline.
+
+**How much it is worth is unmeasured**: 46 cases fail, an unknown share of
+them for the arbitrary-offset reason that cannot be served. Count the cases
+that use only `interpolateAtSample` with the current sample before estimating.
