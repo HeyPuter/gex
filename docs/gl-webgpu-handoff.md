@@ -22572,3 +22572,34 @@ prescribes -- *"declaring the texture as texture_depth_2d in the module -- a
 variant, since it depends on the bound view"* -- applied per slot, and only
 for slots with no sampling op at all, rather than a global emitter flag. The
 two sides have to change together or not at all.
+
+## Where the CTS stands, 37 families measured
+
+Taking the most recent run of each family that has ever been measured:
+
+```
+                                    pass    fail   skip
+37 families                         8910     214    409
+runnable pass rate                             97.65%
+```
+
+Read that with two caveats. A few rows come from **partial** runs --
+`texture_swizzle` at 364/109/152 was killed part-way through and its failures
+have never been grouped -- and `family-scores-go-stale` applies to all of
+them: a documented gap of 120 cases turned out to be 8 when it was re-run. Any
+of these worth planning against should be re-measured first.
+
+Clean families, for what not to re-check: `shaders` 2396/2397,
+`constant_expressions` 1392/1392, `pixelstoragemodes` 896/896, `shaders30`
+651/651, `shader_bitfield_operation` 324/324, `cull_distance` 202/202,
+`texture_repeat_mode` 162/162, `copy_image` 148/148, `sample_variables`
+134/134, `blend_equation_advanced` 87/88, `negative_texture_lookup_functions`
+90/90, `clear_tex_image` 78/78, `texture_gather` 75/75, `draw_indirect` 70/70,
+`explicit_uniform_location` 48/48, `internalformat` 39/39,
+`layout_location` 35/35, `texture_border_clamp` 32/32.
+
+The largest remaining clusters, each with its cause already named above:
+`texture_swizzle` (never grouped), `direct_state_access` 36,
+`shader_multisample_interpolation` 20 (all `interpolateAtOffset`),
+`shader_image_load_store` 10, `texture_cube_map_array` 8,
+`shader_image_size` 6 (all `gl_PrimitiveID`).
