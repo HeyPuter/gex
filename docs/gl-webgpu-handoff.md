@@ -23039,3 +23039,48 @@ passes `[1,0]` and fails `[0.8,0.2]`. It matches llvmpipe exactly on all four.
 `viewport_array`'s remaining three: `scissor_clear` wants a geometry shader the
 driver has not built for the viewport-array path ("requires geometry NIR"), and
 `draw_multiple_layers` and `scissor` fail with no message at all.
+
+## Routing by the pair, not one or the other
+
+`viewport_array` 14/17 -> **16/17**. Both remaining silent failures were one
+sentence in the geometry-stage dispatch:
+
+> Viewport routing wins if a shader writes both, because it has already
+> redrawn the list and sorted it.
+
+A shader writing both `gl_ViewportIndex` and `gl_Layer` had its layer dropped.
+`viewport_array.scissor` and `draw_multiple_layers` both write the two from
+`gl_InvocationID` across sixteen invocations, so all sixteen quads landed on
+one layer -- and that shape is not unusual: it is **how a cube map or a shadow
+cascade is drawn in one pass.**
+
+The router now reads the layer slot too, keys each triangle by the pair, sorts
+by it, and emits one draw per run of equal keys, installing the viewport, its
+scissor and the attachment layer for the length of each. A run is contiguous by
+construction, so it costs one qsort and no second pass.
+
+It **subsumes** the old behaviour rather than sitting beside it: with no layer
+to route the key's layer half is zero throughout and the sort degenerates to
+the viewport sort. The layer-only router stays for a shader that writes
+`gl_Layer` alone. The sort is stable within a run, so primitives keep their
+emitted order -- which is what decides the result where they overlap.
+
+Worth noting how these two were found: both failed with **no driver message at
+all**, which is its own category. The route in was the test's class hierarchy
+-- `Scissor` derives from `DrawMultipleLayers`, which named the shape -- and
+then the driver's own comment admitted the limitation in as many words. A
+grep for what the driver says about itself found this faster than any probe
+would have.
+
+`viewport_array`'s last failure is `scissor_clear`: it wants a geometry shader
+the driver has not built for this path ("requires geometry NIR").
+
+### Regression sweep
+
+Every draw-path family re-measured after this turn's three changes
+(draw parameters, depth range, paired routing) and unchanged:
+`tessellation_shader` 139/0/1, `transform_feedback` 19/2, `cull_distance`
+202/0/16, `sample_variables` 134/0/56, `draw_indirect` 70/0,
+`shader_draw_parameters_tests` 13/0, `geometry_shader` 136/136. Probe suite
+177 OK. STK and Blender byte-identical at 467 and 336 colours. Reverse-Z
+verified in the browser as well as natively, 4/4 with the same values.
