@@ -21775,3 +21775,51 @@ plausibly a *second* cause behind failures otherwise attributed to the
 vertex-atomic read-back gap -- two independent bugs in the same cases. Fixing
 the read-back alone would leave those cases failing on the count, which would
 read as the read-back not working.
+
+## The atomic-result replay landed, and what the two attempts cost (2026-09-07)
+
+`gl44-vertex-atomic-result` 2/3 -> **3/3**; `shader_storage_buffer_object`
+121/124 -> **122/124**. A vertex shader that uses the *result* of a storage
+atomic is now rasterised from a capture of itself instead of having its draw
+declined.
+
+Nothing new had to be built. `gex_wgpu_line_varyings` gives the layout
+(position plus every varying the fragment shader reads),
+`gex_wgpu_flat_replay_get(..., 0, false)` gives the plain per-vertex
+passthrough -- an all-zero flat mask makes every slot read buffer zero at its
+own offset, which that function's own comment states -- and the varying
+capture supplies the compute half.
+
+**Two details decided it, and each cost an attempt.**
+
+1. **The capture must come from the pre-strip clone**, `replay_nir` rather than
+   `varying_nir`. This one was written down before the attempt and was right.
+2. **Its storage blocks must be bound writable.** `ssbo_readonly_mask`
+   describes the *stripped* shader, where nothing writes the block any more,
+   so it reads read-only -- while the replay module declares `read_write`. The
+   comment on that mask already said what follows: "the bind group simply
+   fails to build and the draw reads zeros". The first attempt hit exactly
+   that, and it presented as **the capture pass doing nothing at all** -- zero
+   increments -- rather than as a mismatched access flag. Pass a zero mask.
+
+**What found it was printing the module, not editing it.** One guarded
+diagnostic reported `storage ops=1 failed=0`, the SSBO variable at
+`set=1 binding=32`, and `vs->ssbo_count=1 bindings[0]=32`. That the module
+*had* the atomic, and that the binding numbers *agreed*, eliminated every
+other candidate at once and left the access flag as the only difference. Two
+edits had gone on guessing before that; the diagnostic cost one build. Same
+lesson as the flat-strip fix earlier the same day, where a trace that printed
+*nothing* was the finding.
+
+**Ordering matters as much as the bindings.** The replay runs *before* the
+provoking-vertex rewrite, on the draw the application issued. Running it after
+ran the side effects twice -- once at the rewrite site against four vertices,
+again in the replay's capture against the rewritten six -- which the probe
+caught as a counter reading ten. The replay's own passthrough draw re-enters
+`draw_vbo` and picks up the rewrite for itself, so a flat varying still gets
+GL's provoking vertex.
+
+**Still declined by name**, and `shader_atomic_counters`' three remaining
+cases are the first of these: transform feedback recording (which would need
+both captures at once), another stage bound, instanced, per-instance
+attributes, or a vertex shader that samples.
