@@ -21623,6 +21623,14 @@ and these stages have no per-draw variant.
 is the vertex-atomic capture-back at 3-4 cases; everything else is one or two,
 or a platform wall.
 
+**But "36 failures" is the total for *these sixteen families only*, and saying
+it without that qualifier was misleading -- including in my own summaries.**
+`tessellation_shader` alone is about 140 cases and is **not** in the list
+above; the note on it records 132/140, so roughly eight more failures sit
+outside this tally. The families here were chosen because they were the ones
+being worked on, not because they are exhaustive. Before quoting a total
+again, either widen the list or say which families it covers.
+
 ## Buffer textures in the compute-emulated stages: the real blocker (2026-09-07)
 
 `gex_wgpu_collect_stage_textures` refuses a `samplerBuffer` with "a buffer
