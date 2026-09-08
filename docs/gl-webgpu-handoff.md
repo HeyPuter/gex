@@ -23656,7 +23656,7 @@ over a texture with no comparison mode** -- both above.
 | --- | --- | --- |
 | `texture_barrier_ARB` | 0/4 | native colour budget; the browser has it |
 | `draw_buffers` | 0/1 | native colour budget |
-| `shading_language_420pack` | 328/1 | `samplerBuffer` in a compute-emulated stage: `gex_wgpu_collect_stage_textures` refuses a buffer texture by name. The compute path has the whole machinery (`buftex_count`, `gex_wgpu_apply_buffer_textures`, which already takes a stage and picks the descriptor set); this is the same shape as the integer-sampler gap and wants collection, a variant key on the bound texel width, and a binding from the stage's sampler views |
+| `shading_language_420pack` | **329/0** | fixed -- see below |
 | `sync`, `texture_lod_bias`, `map_buffer_alignment` | | wrong results with no driver message; not investigated |
 | `vertex_attrib_64bit` | 2/4 | double vertex attributes |
 | `clip_control` | 7/8 | `clip_control.errors`, a negative test |
@@ -23666,6 +23666,43 @@ over a texture with no comparison mode** -- both above.
 And five that are entirely unsupported rather than failing:
 `texture_filter_minmax_tests` 5 notsup, `shader_ballot_tests` 4,
 `shader_viewport_layer_array` 3, `post_depth_coverage_tests` 2.
+
+### samplerBuffer in the compute-emulated stages, and what it exposed
+
+`gex_wgpu_collect_stage_textures` refused a buffer texture by name, with the
+comment that serving one from a compute-emulated stage was "more than this pair
+of helpers does". That failed the **link** for any program declaring a
+`samplerBuffer` in a geometry or tessellation stage. Same shape as the
+integer-sampler gap: the compute stage already had the whole mechanism.
+
+Recorded on `gex_wgpu_stage_textures` now, with the lowering applied in all
+four variant paths against the bound texel widths -- bound state, so they join
+each variant's key -- and the binding appended in `gex_wgpu_bind_textures_from`,
+the one place all four already share. Two things to get right:
+
+- **The descriptor set comes from the stage argument.**
+  `gex_wgpu_apply_buffer_textures` and `gex_wgpu_apply_packed_images` both pick
+  it that way, and these stages bind their textures into group *zero* like the
+  compute stage. Naming the real GL stage put the block in set 2, and Dawn said
+  so.
+- **A NULL base module now has two reasons, not one.** The geometry error check
+  tested only integer sampling, so a shader that had deliberately not built a
+  base module was reported as "could not compile the geometry compute module".
+
+**It also exposed two latent Dawn errors in the imageBuffer fix from earlier
+the same day**, on a path that had never executed before it: the packed-image
+lowering was handed `MESA_SHADER_VERTEX` in the *varying* variant, which is a
+compute dispatch (set 1 against a set-0 binding); and
+`gex_wgpu_bind_stage_packed_images` never set `readonly_mask`, so a read-only
+packed image was declared `var<storage, read>` and bound writable -- nothing
+had reached it, the varying variant's images being read-only after the
+storage-write strip.
+
+Both invalidated the command buffer **while the tests passed**. A lost submit
+need not change the pixels a case looks at, so the verdict cannot see it. The
+only thing that could was `grep -c 'WebGPU error'` on the family log, compared
+against a log from before the change; see
+[[a-passing-test-can-still-poison]]. That count is zero now.
 
 ### Leads with causes named
 
