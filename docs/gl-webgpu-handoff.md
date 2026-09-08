@@ -21439,6 +21439,31 @@ ranking worth planning from:
   **This is now the top conformance item**: up to eight of thirty-six remaining
   failures, every one of them reachable by the exact route, with the objection
   that deferred it resolved.
+
+  **How to number the atomics, which is the part that can go silently wrong.**
+  The two copies must agree on which recorded slot belongs to which atomic. The
+  obvious mechanism does **not** work: `nir_instr::pass_flags` looks made for
+  it and `nir_clone.c` never copies it, so a number stamped before the clone is
+  not there afterwards -- a silent mis-numbering, exactly what the design is
+  meant to rule out. Checked rather than assumed.
+
+  What does work is a **shared numbering function run on both copies** with the
+  same predicate. The clone is exact at the moment it is taken, and the only
+  pass that touches `capture_nir` in between --
+  `gex_wgpu_apply_packed_images` -- replaces image intrinsics *in place*
+  without reordering the SSBO atomics, so a walk that counts only qualifying
+  atomics sees them in the same relative order in both. **Compare the two
+  counts and decline if they differ**, which turns any future divergence into
+  the honest refusal that exists today rather than a wrong picture.
+
+  **Scope it to SSBO atomics.** `shader_storage_buffer_object.basic-atomic-case1`
+  is representative: a chain of `if (atomicExchange(g_uint_out[gl_VertexID],
+  ...) != 0u) return;`, so the results gate *control flow*. Both copies take
+  the same branches, and an atomic skipped by an early return leaves its slot
+  unwritten in the clone and unread in the raster copy -- consistent by
+  construction. Mesa lowers atomic counters to SSBO atomics, so this scope also
+  covers the `shader_atomic_counters` candidates; image atomics can keep the
+  decline.
 - **2 -- two capture bindings writable over one range.** The aliasing decline,
   in the capture path.
 - **4 -- adapter limits, and they are real.** `GEX_WGPU_LIMIT_TRACE` says the
