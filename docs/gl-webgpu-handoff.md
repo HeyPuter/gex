@@ -23302,6 +23302,65 @@ program **as well as** the right value, because a shader that fails to link and
 one that links and reads zero are indistinguishable from the pixel alone.
 3/3 now against 1/3 before, natively and in the browser.
 
+### The limits family, and which shortfalls are ours
+
+`KHR-GL45.limits` had never been scored. It is **135/140**, and it is worth
+scoring because it does not build shaders -- it queries each limit, compares it
+against GL's required minimum, and compares it against the matching GLSL
+builtin. So every failure is a number this driver advertises that GL says is
+too small, which is exactly the class an application trusts and then breaks on.
+
+Measured with a throwaway that prints each one beside its minimum:
+
+| limit | reported | GL wants |
+| --- | --- | --- |
+| `MAX_FRAGMENT_INPUT_COMPONENTS` | 124 | 128 |
+| `MAX_GEOMETRY_OUTPUT_COMPONENTS` | 116 | 128 |
+| `MAX_TESS_CONTROL_INPUT_COMPONENTS` | 116 | 128 |
+| `MAX_TESS_EVALUATION_OUTPUT_COMPONENTS` | 116 | 128 |
+| `MAX_VERTEX_STREAMS` | 1 | 4 |
+
+124 is `4 x 31`, the adapter's `maxInterStageShaderVariables`; 116 is
+`4 x 29`, `maxVertexAttributes - 1`. Each number names its own cause.
+
+**Fixed: the control shader's inputs.** They were left on the rasterized
+count with the stages that really are rasterized, and they are not one: they
+come from the vertex shader's *capture buffer*, written by a compute pass, with
+no attribute slot anywhere in the path. That is the same reasoning that had
+already raised the evaluation shader's inputs to 128. The vertex stage's output
+limit stays at 124 and does not have to agree -- a vertex shader may be
+rasterized instead, so its outputs are inter-stage bounded whether or not a
+control shader is bound, and GL keeps producer and consumer limits separate for
+that reason.
+
+**Platform: the fragment stage's inputs.** 4 x 31 is what the adapter gives.
+Packing 128 components into 31 locations is not possible, and `GEX_WANT`
+already asks for 32 and is clamped.
+
+**A lead, not attempted: the geometry and evaluation stages' outputs.** Both
+hand their varyings to the generated passthrough vertex shader, which reads
+them back as vertex **attributes** -- so `maxVertexAttributes - 1` bounds them,
+and the `- 1` is real (point expansion needs a free attribute for its corner
+offsets). The fix is to make the passthrough read that buffer as a *storage
+buffer* indexed by vertex index instead: the data is already in a buffer, and
+this would drop the vertex layout, the skip-compaction mapping between output
+slots and elements, and the "no free vertex attribute" failure with it.
+
+It is not attempted here because that path is small, load-bearing and carries
+several recorded fixes (the compaction mapping alone was a geometry shader
+losing every varying declared after `gl_Layer`), and the reward is two limits
+cases plus a ceiling few shaders reach -- 29 vec4 outputs from one geometry
+stage. Worth doing when something real asks.
+
+**`MAX_VERTEX_STREAMS`** is 1 against GL 4.0's 4. Multiple streams mean a
+geometry shader emitting to four transform-feedback streams; since the stage is
+already a compute pass writing buffers, four sets of buffers is the shape, with
+the rasterized draw taking stream 0. Rare in applications, so also parked.
+
+`blend_equation_advanced`, scored at the same time, is **87/88** with the
+remaining one unsupported -- so KHR_blend_equation_advanced works, which is
+what Krita's and Blender's layer blend modes go through.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
