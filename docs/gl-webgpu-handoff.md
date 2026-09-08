@@ -23434,6 +23434,57 @@ is a slow family because it walks a format matrix.
   a gather's footprint is ambiguous. The comment on
   `gex_wgpu_tex_offset_is_dynamic` already says so for the constant case.
 
+### 78% of every submit ordered nothing
+
+SuperTuxKart made **54382 queue submits for 120000 draws** -- about two draws
+per submit -- and the submit-cause table said `gex_wgpu_buffer_unmap=42481`,
+78% of them. About fourteen batch breaks a frame.
+
+The question was which map flags were behind them, and the answer was
+*counted*, not guessed: a histogram keyed on `transfer->usage`, printed beside
+the submit causes, said **`0x1: 42481`**. Every one was `PIPE_MAP_READ` alone.
+
+A read-only map writes nothing. What the submit at unmap orders is the *upload*
+unmap performs against draws already recorded into the batch -- and
+`transfer->staged_write` is set only for a map **without** `PIPE_MAP_READ`, so
+for a read map there is no upload and nothing to order. Read ordering happens
+at *map* time, where it belongs: `gex_wgpu_buffer_map` submits for a
+`PIPE_MAP_READ` map when the resource has actually been written by the GPU.
+
+So the submit was pure waste, and skipping it where the map cannot write:
+
+| | before | after |
+| --- | --- | --- |
+| SuperTuxKart | 81.9 FPS | **158.4 FPS** |
+| STK draws/s | 3357 | 6494 |
+| STK submits | 54382 / 120k draws | 22144 / 260k draws |
+| STK wall in state calls | 33% | 4% |
+| glxgears | 169.4 FPS, 5.90 ms | **212.9 FPS, 4.70 ms** |
+| gears submits | 11445 | 2857 (one flush a frame, nothing else) |
+
+The 33% → 4% is the tell: those submits were being charged to "state calls",
+which is why no amount of looking at `draw_vbo` -- 5% of wall, `submit 0
+us/draw` -- would ever have found them. **The per-draw timing breakdown cannot
+see a submit forced from outside the draw path.** The submit-cause table can,
+and the usage histogram is what turns it into a fix.
+
+Because this removes a synchronisation point, the correctness evidence is
+worth stating: probe-suite 185 OK with the non-OK set unchanged, cts-gate at or
+above every baseline, Blender's screenshot **byte-identical** to the pre-change
+one, STK and Minecraft unchanged in metrics and correct on inspection, and the
+four browser probes that exercise read maps -- `map-readwrite`, `compute-map`,
+`query-buffer`, `vertex-ssbo-read` -- all passing against their native oracles.
+
+The histogram stays. It is printed beside the submit causes rather than only in
+the teardown report, because every gate here measures an application by killing
+it and the teardown report was therefore empty for exactly the runs that
+matter.
+
+**What is left:** `gex_wgpu_flush` is now most of what remains (12519 of 22144
+in STK, and all 2857 in gears -- one per frame, which is the swap and cannot go
+away). `gex_wgpu_buffer_subdata` at 6246 is the next largest, and
+`gex_wgpu_blit` at 2946 after it. Neither has been looked at.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
