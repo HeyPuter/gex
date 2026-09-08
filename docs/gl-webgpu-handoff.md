@@ -23657,7 +23657,9 @@ over a texture with no comparison mode** -- both above.
 | `texture_barrier_ARB` | 0/4 | native colour budget; the browser has it |
 | `draw_buffers` | 0/1 | native colour budget |
 | `shading_language_420pack` | **329/0** | fixed -- see below |
-| `sync`, `texture_lod_bias`, `map_buffer_alignment` | | wrong results with no driver message; not investigated |
+| `sync` | **1/1** | fixed -- a read-only persistent mapping was uploaded over the GPU's writes; see below |
+| `texture_lod_bias` | 0/1 | a *vertex-stage* mip blend: `sum(0.031496)` wanted `246 8 0` and got `255 0 0`, i.e. level 0 with no blend into level 1. WebGPU allows only a **non-filtering** sampler in the vertex stage, so `mipmapFilter` is Nearest there and a fractional LOD cannot blend. Emulating it means two `textureSampleLevel` calls and a `mix` on the fraction; one case, so recorded |
+| `map_buffer_alignment` | 1/1 | the pointer alignment is now kept by construction, and is *not* what the remaining case objects to -- it walks sixteen storage-flag combinations. Guarded by `gl44-map-alignment-probe` |
 | `vertex_attrib_64bit` | 2/4 | double vertex attributes |
 | `clip_control` | 7/8 | `clip_control.errors`, a negative test |
 | `texture_size_promotion` | 0/1 | `glTexImage2DMultisample(samples=3)`; dEQP turns the honest refusal into an InternalError. See [[dont-pad-the-sample-counts]] |
@@ -23703,6 +23705,40 @@ need not change the pixels a case looks at, so the verdict cannot see it. The
 only thing that could was `grep -c 'WebGPU error'` on the family log, compared
 against a log from before the change; see
 [[a-passing-test-can-still-poison]]. That count is zero now.
+
+### A read-only persistent mapping was uploaded over the GPU's writes
+
+`KHR-GL45.sync.flush_commands` read `[0, 0]` against a reference of
+`[3, 1415927]` and the driver said nothing. The test maps a buffer
+`READ|PERSISTENT|COHERENT`, copies into it with `glCopyNamedBufferSubData`,
+waits on a fence and reads the mapping -- **the standard asynchronous
+read-back idiom**.
+
+`GEX_WGPU_PERSIST_LOG` showed it in three lines:
+
+    PERSIST map res=... usage=0x301 bind=0x0 size=16
+    PERSIST upload res=... [0,16) of 16
+    PERSIST refresh res=... size=16
+
+An **upload**, and then the refresh. `gex_wgpu_flush_persistent_maps` sent the
+CPU shadow over the buffer the copy had just written, and the read-back
+returned what had been uploaded: zeros.
+
+The upload was reached because the copy sets `gpu_written`, which routes the
+buffer down the *diff* path, where a freshly allocated `persistent_sent` is
+deliberately seeded to "everything differs" -- so the whole zeroed shadow went
+out. But no upload should have happened at all: a mapping without
+`PIPE_MAP_WRITE` is one the application cannot write and has nothing to
+publish. Every read-only persistent mapping in the driver was having its shadow
+pushed over the device's writes at every flush.
+
+`sync` 0/1 → **1/1**, with `buffer_storage` still 9/0 so the write direction is
+intact.
+
+**How to find the next one of these:** the failure had no driver message at
+all, and the instrument that named it in three lines was a log that already
+existed. When a family fails with nothing in the log, look for the env-gated
+trace for whatever subsystem the test exercises before adding one.
 
 ### Leads with causes named
 
