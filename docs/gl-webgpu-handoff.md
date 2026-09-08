@@ -22683,3 +22683,50 @@ Storage buffers were raised to 24 (`GEX_WGPU_MAX_SHADER_BUFFERS`) at the same
 time and that one *is* a real adapter maximum -- 10 native, 16 browser -- so
 `shader_image_load_store.multiple-uniforms` at seventeen stays refused on both.
 Three of that family's ten failures are the native 10 and pass in the browser.
+
+### Measured on the browser, which is the target
+
+- `direct_state_access.framebuffers_draw_buffers`: **fail -> pass**, on the
+  attachment-budget ask alone.
+- `shader_image_load_store.basic-allTargets-loadStoreTCS`: **passes** in the
+  browser and fails natively -- it wants 13 storage buffers, the native
+  adapter grants 10 and the browser 16. Three of that family's ten failures
+  are that same native ceiling.
+- `shader_image_load_store.multiple-uniforms` wants **17** and the browser
+  adapter's real maximum is 16, so it is refused on both. Raising the ask to 24
+  did not change it, which is how the 16 was confirmed as the adapter's.
+- `texture_border_clamp`: **31/32** in the browser against 32/32 natively. The
+  one difference is `Texture3DRGBA8Linear` -- the *linear* 3D variant, browser
+  only, while every nearest variant now passes on both. Same code path, so it
+  is a precision or `textureDimensions` difference rather than the boundary
+  logic that was just fixed.
+- `shader_multisample_interpolation` **cannot be run as a family in the
+  browser** yet, and not for a driver reason: the guest arena gives up on the
+  CTS binary with "a single 128 MiB allocation takes a span of its own from the
+  arena, which never gives one back (in translate_runtime, syscall 221, 4
+  refills so far)" at 2.2 GiB of Chrome RSS. `gl44-sample-interp-probe` covers
+  the same ground in the browser and matches native byte for byte.
+- STK in the browser is unchanged by the budget rise: **59.6 FPS, 99.67%
+  fresh, rAF p50 and p95 both 16.67 ms**, ~20k real draws per sample.
+
+### Where the multisampled-array wall actually bites
+
+One place, and it is worth knowing before anyone builds the emulation:
+
+```
+gex-wgpu: shader rejected: gex_wgpu a multisampled array texture,
+          which WGSL has no type for
+```
+
+No resource refusal precedes it -- the allocation is not what fails. WGSL has
+`texture_multisampled_2d` and no array form, so the *declaration* is the wall.
+
+That suggests the cheaper of the two designs is worth testing first: keep the
+array texture and give the shader **per-layer 2D views**, unrolling the layer
+index the way `wgsl-has-no-resource-arrays` already unrolls sampler arrays.
+Rendering already selects a layer per pass. Only if Dawn refuses to create a
+multisampled array texture at all does this need the tiling fallback -- one
+wide multisampled 2D texture holding the layers side by side, with
+`texelFetch(ivec3(x,y,l),s)` rewritten to `texelFetch(ivec2(x + l*W, y), s)`
+and the per-layer viewport offset by `l*W`. Establish which of the two applies
+before writing either.
