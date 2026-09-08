@@ -83,5 +83,16 @@ run hello_xr             10 hello_xr -g OpenGL
 run krita                25 krita --nosplash
 run gimp                 25 gimp -s -f --no-shm
 run inkscape             20 inkscape
-run obs                  20 obs --minimize-to-tray
+# OBS needs two things the others do not, and both were mistaken for defects
+# once each.  Its config directory records a crash marker, and every SIGKILL
+# this harness delivers leaves one, so the *next* run opens the "did not
+# properly shut down" dialog instead of a preview and reports NO-DRIVER: give
+# it a throwaway XDG_CONFIG_HOME.  And --minimize-to-tray compiles zero
+# shaders, because with no window there is no preview to render, which reads
+# as NO-RENDER.  Verified 2026-09-08: window visible and a fresh config, it
+# compiles five shaders with no refusals and its frame is *pixel-identical* to
+# llvmpipe outside the CPU-percentage readout.
+OBSCFG=$(mktemp -d "${TMPDIR:-/tmp}/gex-obscfg.XXXXXX")
+XDG_CONFIG_HOME=$OBSCFG run obs 25 obs --disable-updater
+rm -rf "$OBSCFG"
 echo DONE >> "$OUT/results.txt"
