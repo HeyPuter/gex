@@ -22983,3 +22983,59 @@ can see, and the value is wrong between a correct array and the word written
 from it. The next step is the pipeline-key cleanup above -- to get a quiet
 valgrind -- and then a watchpoint on the `entry_points` buffer word rather than
 more printf, which is precisely what perturbs it.
+
+## Two guards that read as one thing and meant another
+
+### A reissued indirect command carries its own draw parameters
+
+`shader_draw_parameters_tests` 9/13 -> **13/13**. All four failures were
+`MultiDraw*Indirect*` and all four were one guard.
+
+`gl_BaseVertex`, `gl_BaseInstance` and `gl_DrawID` were captured only at
+`ctx->draw_depth == 0`, because the restart and multi-draw *splits* re-enter
+the draw path with `index_bias` folded into the indices and taking their
+values would report zero for a base vertex the application had set.
+
+**An indirect resolution is not a split.** `util_draw_indirect` maps the
+argument buffer and reissues each command one level down, and those are the
+application's own draws. With commands `{5,1,1,0} {4,1,0,0} {3,1,0,1}` the
+third has `baseInstance = 1` and should sit lower on screen; `gl_BaseInstance`
+stayed 0 for all three, so it drew over the second and the point that should
+have been green came back cyan -- green over blue.
+
+That is `nesting-depth-is-not-the-invariant` a second time, in a different
+feature: the divisor expansion had the same guard for the same reason. I
+checked the other three `draw_depth == 0` sites and they are all correct for an
+indirect resolution -- the conditional render is evaluated once for the whole
+draw, the sampler-view refresh already happened outside, and counting a
+multi-draw as one draw is deliberate.
+
+### An inverted depth range is reverse-Z
+
+`viewport_array` 13/17 -> 14/17, and worth more than the case:
+`glDepthRange(n, f)` with `n > f` is how reverse-Z is written and modern
+renderers use it routinely. It was declined twice over.
+
+GL's window depth is `(f-n)/2 * z_ndc + (n+f)/2`, so an inverted range is a
+negative slope and WebGPU's viewport requires `minDepth <= maxDepth`. Sorting
+the range and negating clip z is exactly equivalent: at `[f, n]` WebGPU gives
+`z_w = f + z01' * (n - f)`, and the wanted `n + z01 * (f - n)` is
+`f + (1 - z01) * (n - f)`, so `z01' = 1 - z01`, which is `z' = -z`.
+
+- `set_viewport_states` refused a negative `scale[2]` beside the negative
+  `scale[0]` that genuinely cannot come from GL. It took the **state**, so
+  every later draw ran with the previous viewport.
+- `gex_wgpu_lower_viewport_transform` already folds x and y into the vertex
+  shader; it folds z the same way now.
+- **And the array it reads was four floats while the pass read six.** Out of
+  bounds it found zero, which flattens clip z to the middle of the range -- so
+  *every* inverted range came back 0.5, whatever it was. Two different ranges
+  answering the same number is what named it; a single range would have looked
+  like an ordinary sign error.
+
+`gl44-depth-range-probe` pins four ranges for that reason: a sign-only fix
+passes `[1,0]` and fails `[0.8,0.2]`. It matches llvmpipe exactly on all four.
+
+`viewport_array`'s remaining three: `scissor_clear` wants a geometry shader the
+driver has not built for the viewport-array path ("requires geometry NIR"), and
+`draw_multiple_layers` and `scissor` fail with no message at all.
