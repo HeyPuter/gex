@@ -22503,3 +22503,51 @@ result through, so the next step is the test's own sampling shader.
   driver already routes `gl_Layer` by viewport for the writing side.
 - **`packed_depth_stencil`** 23/25, both failures an invalid render pipeline
   inside a `u_blitter` depth-stencil blit.
+
+## A query-only shadow sampler is classified as nothing
+
+`texture_cube_map_array` is 17/27, and **six of its eight failures are one
+cause**: every `texture_size_*_sh` case, one per stage, each a `textureSize`
+on a `samplerCubeArrayShadow`.
+
+```
+None of the supported sample types (UnfilterableFloat|Depth) of [Texture ...]
+Expected entry layout: {sampleType: TextureSampleType::Float,
+                        viewDimension: TextureViewDimension::CubeArray}
+```
+
+The driver classifies each slot's sample type from the *sampling ops*, and
+deliberately skips `txs`/`query_levels`/`texture_samples` -- correctly, because
+`textureSize` returns an ivec2 and says nothing about the texture's own type.
+That skip is what keeps Blender's `workbench_resolve` family linking, per the
+comment there. But a slot whose **only** use is a query then matches no case
+at all and keeps the default, `Float` -- and against a bound `z32_float` view
+WebGPU refuses the bind group, so the draw is declined by name.
+
+**The declaration knows the answer** (`glsl_sampler_type_is_shadow` on the
+variable's type) and agrees with the ops wherever both have an opinion, since
+GLSL cannot sample a shadow sampler without a comparison. That much is sound.
+
+**What does not work is fixing only one side.** Tint infers WGSL's
+`texture_depth_*` from a comparison *use*, not from the type, so the module
+still declares `texture_cube_array<f32>`. Marking the layout `Depth` from the
+declaration alone just moves the mismatch:
+
+```
+The shader's texture sample type (TextureSampleType::Float) isn't compatible
+with the layout's texture sample type
+```
+
+Setting SPIR-V's `Depth` operand in ntv to fix the module half -- it is
+hardcoded `false` in `get_bare_image_type`, which is why Tint never sees it --
+makes Tint emit the depth texture but produces `sampled image must have float
+component type` on eleven further shaders, almost certainly where the driver's
+own integer-cube or swizzle lowering has rewritten a shadow sampler into an
+integer load while the variable kept its shadow type. Tried and reverted: the
+score stayed at 17/27 and only the messages moved.
+
+So this needs what the comment beside the depth-filtering decline already
+prescribes -- *"declaring the texture as texture_depth_2d in the module -- a
+variant, since it depends on the bound view"* -- applied per slot, and only
+for slots with no sampling op at all, rather than a global emitter flag. The
+two sides have to change together or not at all.
