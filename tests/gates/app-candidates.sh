@@ -46,12 +46,22 @@ run() {  # run <name> <seconds> <cmd...>
   #
   # `timeout -s KILL` kills the process it started and nothing else, so an
   # application that forks and lets its parent exit is reparented to init and
-  # runs on. sunshine does exactly that: one left behind here burned 152% CPU
-  # for an hour and was still running long after the sweep finished, which
-  # quietly wrecked every timing measurement taken afterwards -- perf-gears
-  # read 180 FPS against a 212 baseline and the cause looked like the change
-  # under test. A correctness gate does not care; a benchmark does, and
-  # nothing in the output said an application was still running.
+  # runs on. That is a real gap and this closes it.
+  #
+  # **The instance originally cited here was a misdiagnosis, and the
+  # correction is the more useful lesson.** A `sunshine` at 152% CPU with
+  # ppid 1, started within a minute of a run of this script, was called a
+  # leftover and killed. `systemctl is-active sunshine` says **active**: it
+  # is a service the user runs, a service also has ppid 1 and the same
+  # command line, and the "new" sunshine that appeared minutes later was
+  # systemd restarting it. So no leak from this script has ever actually been
+  # observed.
+  #
+  # The reap is kept anyway, because the mechanism below is right where the
+  # judgement call was wrong: it snapshots matching pids *before* the run and
+  # kills only what is new, so a service already running is skipped and a
+  # genuine fork-and-exit is not. Prefer that to deciding by hand -- checking
+  # `systemctl is-active` and the start time is what should have happened.
   for pid in $(gex_pids_of "$base" "$binary"); do
     case $before in
       *" $pid "*) : ;;                    # already there; not ours
