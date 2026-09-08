@@ -23787,6 +23787,53 @@ the w it divides is the w the pipeline rasterises with.
 deliberately-asserted gap in the probe suite, which now stands at **188 OK with
 five DIFF**, every one of them the reference failing or a platform block.
 
+### 3935 cases are skips, not silent failures
+
+Four families had been *assumed* all-skip and never scored, which is 3935
+cases — more than a fifth of the suite — resting on an assumption:
+
+| family | cases | result |
+| --- | --- | --- |
+| `fragment_shading_rate` | 1067 | 0/0/**1067 skip** |
+| `sparse_texture_tests` | 1089 | 0/0/**1089 skip** |
+| `sparse_texture2_tests` | 1204 | 0/0/**1204 skip** |
+| `sparse_texture_clamp_tests` | 575 | 0/0/**575 skip** |
+
+Every one skips, so nothing is failing quietly in there. Worth having measured
+rather than assumed: the run takes a couple of minutes, and "these are all
+skips" was otherwise a claim with nothing behind it.
+
+### Three cases in two families are one construct: 64-bit shader I/O
+
+`vertex_attrib_64bit` is 2/4, and both failures are
+
+    Program link error: Tint rejected SPIR-V: error: unhandled float width: 64
+
+which is a `dvec` **vertex input**. The driver's 64-bit machinery covers four
+constructs — ALU, register, phi and undef ([[sixty-four-bit-is-four-constructs]])
+— plus memory access. An **I/O variable** is a fifth that none of those
+lowerings reaches, and it is the same construct as `gpu_shader_fp64.varyings`,
+which is a 64-bit *output*. So `vertex_attrib_64bit.vao`,
+`vertex_attrib_64bit.limits_test` and `fp64.varyings` are **one cause**, not
+three.
+
+Serving the vertex-input half has a template: a format WebGPU has no vertex
+format for is already fetched as raw `Uint32` and reassembled in the shader
+(`gex_wgpu_vertex_unpack_kind`, `gex_wgpu_lower_vertex_attrib_unpack`, which is
+how the seven 2_10_10_10_REV formats and 10F_11F_11F_REV work). A `double` and
+a `dvec2` fit that pattern directly, as `Uint32x2` and `Uint32x4` reassembled
+with `pack_64_2x32`.
+
+**What makes it more than a small job** is that the CTS uses all four widths:
+`dvec3` and `dvec4` need six and eight `uint32` components, past `Uint32x4`, so
+each needs *two* vertex elements — element splitting, which that machinery does
+not do. A partial fix covering `double` and `dvec2` would not move either case.
+
+Left alone for now: two cases, and `double` vertex attributes are rare in
+practice because GPUs handle them slowly, so applications convert on the CPU.
+Recorded because the *unification* is the useful part — anyone picking up
+`fp64.varyings` is picking up these two as well.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
