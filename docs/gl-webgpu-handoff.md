@@ -22292,3 +22292,105 @@ and it would take `gpu_shader_fp64` to 659/659; the other three need attribute
 splitting at the limit and are not worth it. Reading them as one item -- which
 the shared error message invites -- would either overestimate the work or
 underestimate it, depending on which end you started from.
+
+## Per-sample interpolation: three GL constructs, one mechanism
+
+`shader_multisample_interpolation` was **45/109**, and its 46 failures looked
+like three separate features. They were one, and the family is now **71/109**
+with 18 honest skips -- 71 of 91 runnable.
+
+The three constructs:
+
+```
+sample in vec4 v                               the qualifier
+interpolateAtSample(v, gl_SampleID)            the current sample
+interpolateAtOffset(v, gl_SamplePosition-0.5)  the current sample, again
+```
+
+The third is worth spelling out, because it does not look like the second.
+`gl_SamplePosition` is the sample's position within the pixel with the
+lower-left corner at zero, so `gl_SamplePosition - 0.5` is its offset from the
+centre -- and the centre is what `interpolateAtOffset` measures from.
+Interpolating at that offset **is** interpolating at that sample. All three
+reduce exactly to `@interpolate(perspective, sample)` plus an ordinary read,
+with no approximation anywhere.
+
+`llvmpipe` settles it: `gl44-sample-interp-probe` reads the four samples of one
+pixel separately and all three forms return **151, 183, 135, 167** -- byte
+identical -- while `interpolateAtCentroid` returns their average, 159, at every
+sample. That is the reference the driver now matches for the first two.
+
+### Why the qualifier had been given up
+
+WebGPU requires the two stages to declare the same interpolation *sampling*
+and SPIR-V cannot say it on the vertex side: `SpvDecorationCentroid` and
+`SpvDecorationSample` are defined for fragment inputs, a pre-fragment output
+carrying them is not valid SPIR-V, and Tint drops them. So the fragment entry
+point got `@interpolate(perspective, sample)`, the vertex output struct got
+nothing, and the mismatched pipeline invalidated the command buffer -- losing
+every draw batched with it.
+
+The driver's answer had been to strip the qualifier from the fragment input.
+That made the pipeline valid and the answer wrong, in the quietest possible
+way: a `sample in` varying read the pixel centre, which is *the same value at
+every sample*, and nothing said so. It is invisible to anything that checks
+only the resolved average, which is why a probe that reads each sample
+separately was the thing that had to be built first.
+
+**The agreement is now written into the WGSL text after Tint**, by
+`gex_wgpu_wgsl_add_output_sampling` -- the last point at which both sides are
+visible and still editable. Two things keep that edit narrow enough to trust:
+
+- The location Tint prints is `var->data.driver_location`, the same number on
+  both sides. That is what makes `@location` match at all today.
+- The edit must stay **inside the output struct**. A vertex shader's own
+  attributes are `@location` too, on the entry point's parameters, and
+  `@location(0) pos_param` collides textually with the `@location(0)` of the
+  first varying. The output struct is the one containing
+  `@builtin(position)`, which is how the helper finds it.
+
+### Ordering: the record is what the vertex side agrees with
+
+`gex_wgpu_lower_sample_interp` promotes a varying to `sample`, and it has to
+run **before** `varying_aux` is recorded, not after. Run after, the record said
+"centre", the vertex output was left undecorated, the fragment input carried
+`Sample` anyway, and the mismatched pipeline dropped the draw -- so the probe
+read back the **clear colour** rather than a wrong colour. A dropped draw and
+an unimplemented feature look identical from the read-back, and the 200 lines
+between the two sites are the whole difference.
+
+### interpolateAtOffset is left, and the reason is the optimiser
+
+The `at_offset` groups are the remaining 20 failures. The narrow matcher does
+not reach the shape st delivers, and that is not a matter of trying harder.
+st lowers `gl_SamplePosition` before the driver sees it:
+`nir_lower_wpos_ytransform`'s `lower_load_sample_pos` replaces it with
+`vec2(pos.x, ffma(pos.y, scale, max(neg_scale, 0)))`, where `scale` and
+`neg_scale` are channels of the `gl_FbWposYTransform` uniform -- the y flip
+between GL's lower-left origin and WebGPU's upper-left. Then
+`nir_opt_algebraic` **reassociates the `- 0.5` into that arithmetic**: the y
+component of the offset arrives with `fmul` outermost, not `fadd`. Matching it
+would mean matching the optimiser's output rather than one pass's.
+
+The route that serves it in *general* is worth recording, because it is exact
+rather than a first-order guess: carry `v/w` and `1/w` as two
+`@interpolate(linear)` varyings, both linear in screen space, and evaluate
+either at an arbitrary offset as `centre + o.x*dpdx + o.y*dpdy`. The quotient
+is the perspective-correct value at that offset. It also serves an arbitrary
+`interpolateAtSample` index. It costs a second varying slot per varying so
+read and it edits the vertex stage, which is why it was not done alongside the
+narrow case.
+
+### A compile failure is not a broken device
+
+`interpolateAtCentroid` already worked and was reported as a **failure**,
+because `interpolateAtSample` had been compiled first and called `gex_fail` on
+the context. A shader Tint will not accept is one shader; the decline path
+beside it -- which the caller already reads as "do not draw this" -- was the
+right shape all along. This is the same lesson as `a-refusal-must-not-latch`
+and `a-latch-costs-every-case-after-it`, found once more in a site that
+survived both sweeps because a *compile* failure reads as fatal.
+
+Removing it also needed care: `gex_wgpu_compile_nir` owns the NIR it is handed
+and frees it on both paths, so the `ralloc_free` added beside the decline was a
+double free and tripped ralloc's canary.
