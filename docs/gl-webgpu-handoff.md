@@ -24179,3 +24179,62 @@ unless you check `$?`.
 **`(settle: finished)` is not a pass.** It says the settle phase ended, not
 that the goal matched. It appears on a failing run too.
 
+
+## The three 64-bit I/O cases are all *vertex inputs* (2026-09-08)
+
+This file has them as "64-bit shader **I/O**" — one construct spanning
+`vertex_attrib_64bit.vao`, `.limits_test` and `gpu_shader_fp64.fp64.varyings`.
+Measured today, the unification is real but narrower, and the narrowing is what
+changes the work: **all three fail on a 64-bit vertex *input*, and the varying
+half needs nothing at all.**
+
+The evidence, from dumping every I/O variable of every shader those tests
+compile:
+
+- The vertex stage's **outputs** are already `vec4` at VARYING_SLOT_VAR0 and
+  up. Mesa and the GLSL linker deliver 32-bit varyings on their own; there is
+  no 64-bit output left to split. That is true even in the test named
+  `varyings`.
+- What survives is `dvec4` **inputs**, one deref each — so they are read, not
+  dead leftovers. Every failure is `unhandled float width: 64` reported for
+  the **vertex** shader.
+
+And the rejected SPIR-V (the driver dumps it; reassemble the `SPIRVHEX` lines
+and run `spirv-dis`) shows how little is left:
+
+    %_ptr_Input_v4double = OpTypePointer Input %v4double
+    %222 = OpLoad %v4double %attribute_0
+    %223 = OpCompositeExtract %double %222 0
+    %225 = OpBitcast %ulong %223
+    %227 = OpBitcast %v2uint %225
+
+**Every** use is an immediate bitcast to a uint pair. `nir_lower_int64` has
+already done its work; nothing is computed in 64 bits. The variable and its
+load are the whole problem.
+
+**So the remaining work is exactly two pieces**, and the second is the one
+that makes it more than a NIR pass:
+
+1. Split the `dvec` input variable into `uvec4` halves and rebuild each double
+   with `pack_64_2x32_split`. No consumer needs rewriting — the pack folds
+   against the bitcasts above, which is the same contract `nir_lower_int64`
+   relies on. **This costs no locations**: GL already reserves two slots per
+   double-width attribute, and the rejected module decorates its `dvec4`
+   inputs `Location 0, 2, 4, 6`.
+2. Split the **vertex element**, so one GL attribute feeds two WebGPU
+   attributes — `Uint32x4` at offset 0 and offset 16 for a `dvec4`. This is
+   the draw-path half, it touches the layout every draw builds, and it is why
+   the job is not small.
+
+**Do not write the varyings-only pass.** I wrote it, built it, and it fires on
+nothing, because of the first bullet above — 179 lines of dead code with a
+latent bug in it (it created the 32-bit halves before checking whether the
+original had any derefs to rewrite, so a variable with none would keep its
+64-bit type *and* gain unused halves). Reverted. Testing it against a
+side-prefix install — `meson install --destdir /tmp/gex-side`, then
+`GEX_INST=/tmp/gex-side/tmp/gex-mesa-native/inst` — is how to try something
+like this without disturbing a sweep that is using the real prefix.
+
+Still worth doing only for the three cases; `double` vertex attributes are
+rare in practice because GPUs handle them slowly, so applications convert on
+the CPU.
