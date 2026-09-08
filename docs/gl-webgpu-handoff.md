@@ -23084,3 +23084,70 @@ Every draw-path family re-measured after this turn's three changes
 `shader_draw_parameters_tests` 13/0, `geometry_shader` 136/136. Probe suite
 177 OK. STK and Blender byte-identical at 467 and 336 colours. Reverse-Z
 verified in the browser as well as natively, 4/4 with the same values.
+
+## Seventeen more families, and two whole ones failing
+
+39 pass / 9 fail / 14 skip across seventeen newly measured families. Clean:
+`shader_group_vote` 5/5, `buffer_objects` 5/5, `texture_buffer_size_clamping`
+4/4, `texture_query_lod` 3/3, `polygon_offset_clamp` 3/3,
+`parallel_shader_compile` 3/3, `indirect_parameters_tests` 3/3,
+`gpu_shader5_gl` 3/3, `clip_distance` 3/3, `transform_feedback3` 2/2.
+`texture_filter_minmax_tests`, `shader_ballot_tests` and
+`shader_viewport_layer_array` are all skip -- extensions not advertised.
+
+Two families failed *entirely*, which is a different signal from a stray case.
+
+### texture_barrier 0/4 natively, 4/4 in the browser
+
+This looked like the feedback-loop snapshot going stale. WebGPU forbids
+sampling a texture that is also a colour attachment, so the driver samples a
+snapshot instead -- and `glTextureBarrier` is precisely the API that makes
+such a read *defined*, so a snapshot cached from before a barrier would return
+exactly the stale texels the barrier promises against.
+
+**It is already right.** `gl44-texture-barrier-probe` accumulates a named
+amount per pass -- 40, then +60, then +60 -- so a stale snapshot shows up as a
+value short by a whole pass rather than as garbage. llvmpipe and this driver
+both read 40 / 100 / 160.
+
+The four failures are the *native adapter's* 32-byte colour attachment budget
+("colour target 4 dropped"), and the browser offers 128: **texture_barrier is
+4/4 there.** No driver defect among them. This is now the third family whose
+native failures are that budget, so a native-only failure with that message
+should be checked against the browser before it is investigated.
+
+One thing the probe cost a run to learn: Mesa's own libGL exports only
+`glTextureBarrierNV`, so linking the core 4.5 name fails to resolve at the
+first call. The guest libGL does export it, and any real application reaches it
+through a loader -- so the probe uses `eglGetProcAddress`.
+
+### framebuffer_blit 0/3, and it is ours
+
+0/3 in the browser too, so not an adapter limit. **1/3 now.**
+
+WebGPU's resolve is narrow -- one mip level, matching formats, and no integer
+format at all, since averaging samples is what a resolve is and there is no
+defined average of two integers -- and outside that the driver refused, leaving
+the destination holding whatever it already had. Silently.
+
+u_blitter does all of it, as a textured draw that fetches the samples itself,
+and it already implements GL's rule for the integer case: copy sample zero
+rather than average. So a refused resolve now falls through to a draw.
+`multisampled_to_singlesampled_blit_color_config_test` is a resolve from
+r8_unorm to b8g8r8a8_unorm, refused for the format pair and now drawn.
+
+The decline-rather-than-latch distinction there is load-bearing and worth not
+undoing: latching made it GL_OUT_OF_MEMORY from the next glReadPixels, which
+dEQP treats as fatal, and that once ended the mustpass run 864 cases in.
+
+### Leads with causes named
+
+- `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: the
+  depth resolve reads all zeros (`depth read z16_unorm ... bytes 0000`).
+- `framebuffer_blit.scissor_blit`: reaches u_blitter with `scissor=1` and comes
+  out wrong, so the scissor is not surviving the blitter's own state.
+- `shader_texture_image_samples_tests.texture_functional_test`: "Binding
+  multisampled flag (0) doesn't match the layout's multisampled flag (1)".
+- `shader_atomic_counter_ops_tests.ShaderAtomicCounterOpsAdditionSubstraction`:
+  "Binding doesn't exist in [BindGroupLayoutInternal]" for @group(1)
+  @binding(32).
