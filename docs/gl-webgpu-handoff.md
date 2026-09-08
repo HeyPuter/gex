@@ -22090,3 +22090,43 @@ the four component limits and the four-component inter-stage shortfall. The
 pattern is worth naming: this driver reports GL 4.6, and `KHR-GL45.limits` is
 the only thing in the suite that checks whether the numbers behind that claim
 are actually there.
+
+## Newly measured families, consolidated (2026-09-07)
+
+Four families that had never been run here, plus one corrected. This is the
+table to extend rather than re-deriving from the notes above.
+
+    family                        score      failures, by cause
+    limits                       135/140     5 -- every one a cap we advertise
+                                             below the GL 4.5 minimum, not a
+                                             behaviour bug. 3 of the 5 are the
+                                             16-varying vertex-attribute cap,
+                                             1 the 31 inter-stage variables,
+                                             1 the missing vertex streams
+    direct_state_access          334/371    36 -- 30 of them the multisampled
+                                             array texture, one case per
+                                             internal format; 6 others
+    tessellation_shader          139/140     1 -- max_in_out_attributes, and
+                                             not our defect. **Corrected from
+                                             a note that said 132/140**
+    shader_bitfield_operation    324/324     none
+    copy_image                   unmeasured  killed after 25 minutes; it is
+                                             GPU-sync-bound at ~34% CPU, not
+                                             hung. Needs its own run
+
+**What this changes about the picture.** Before today the tally was "36
+failures across sixteen families", quoted without the qualifier. Adding four
+families moves it to **42 across twenty**, of which:
+
+ - **30 are one platform wall** (multisampled array textures, which with
+   `texture_view`'s four is 34 cases and the largest single cause on record);
+ - **5 are cap honesty**, not behaviour, and three of those five have a
+   designed fix;
+ - **1 is not ours** (`max_in_out_attributes`);
+ - and one family of 324 cases was already perfect.
+
+So the surface is both better and worse than the old number suggested: fewer
+distinct defects, and a much larger share concentrated in two or three known
+walls. Still roughly 18,000 cases unmeasured, which is where the next
+measurements should go -- **compile-shaped families first**, since they cost
+seconds per hundred where readback-shaped ones cost minutes.
