@@ -23140,12 +23140,84 @@ The decline-rather-than-latch distinction there is load-bearing and worth not
 undoing: latching made it GL_OUT_OF_MEMORY from the next glReadPixels, which
 dEQP treats as fatal, and that once ended the mustpass run 864 cases in.
 
+### A depth-only pass had no fragment shader, and depth24 was 16 bits
+
+`scissor_blit` was the thread, and neither defect on it was the one named.
+
+The scissor was never the problem: the case's *colour* was correct in all four
+quadrants and its **depth** was 0.5 where 0.25 was wanted. 0.5 is where NDC
+zero lands in a [0, 1] depth range, and NDC zero is where u_blitter puts its
+quad -- so the quad's interpolated z was reaching the attachment and the
+depth-fetch shader's `gl_FragDepth` was not.
+
+Because the pipeline had no fragment stage at all. `pipeline_desc.fragment`
+was set to NULL whenever there were no colour attachments, on the stated
+theory that a zero-target fragment state "is the kind of thing that gets
+rejected". It is not -- the driver's own depth-copy pipelines at
+`gex_wgpu_depth_upload_pipeline` have been built with `targetCount = 0` since
+they were written, which is the kind of contradiction worth grepping for
+before believing a comment. What the NULL actually cost was everything else a
+fragment shader does on a depth-only pass: `gl_FragDepth`, **discard**, and
+side effects, on every such pass in every application. An alpha-tested shadow
+caster -- foliage, a fence, chain-link -- was casting a solid shadow.
+
+WebGPU does require the targets to account for every output the module
+declares, and GL allows writing `gl_FragColor` with no colour buffer bound
+(the write is discarded), so `gex_wgpu_drop_color_outputs` takes the colour
+stores out in a variant keyed on `drop_color`.
+
+**Then the failure moved**, the way a lifted refusal does. Depth came back
+0.250004 against an expected 0.25 -- and 0.250004 is `16384/65535`, exactly
+z16_unorm. st/mesa's candidate list for `GL_DEPTH_COMPONENT24` *and* for the
+unsized `GL_DEPTH_COMPONENT` is `Z24X8, X8Z24, Z16_UNORM, Z24_S8, S8_Z24`
+(`DEFAULT_DEPTH_FORMATS`), and neither 24-bit spelling was in the format
+table -- so the third entry won, for every application that asks for a
+default depth buffer, at 1/256 of the resolution it requested.
+
+Nothing failed. The framebuffer was complete, depth tested and wrote and read
+back, and `GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE` answered 16 to anyone who
+asked. What reaches the screen is z-fighting on coplanar geometry and banding
+in anything that reconstructs position from depth.
+
+`Z24X8_UNORM` now maps to `Depth24Plus`. It is not buffer-copyable, exactly
+like `Depth24PlusStencil8`'s depth aspect, so it takes the same draw-based
+transfer path through `gex_wgpu_write_depth`/`gex_wgpu_read_depth` -- and it
+already had an upload pipeline slot waiting for it. Only `Z24X8` is claimed:
+it comes first in st's list, and `X8Z24` spells its depth in the high 24 bits.
+
+`tests/integration/programs/gl44-depth-precision-probe.c` holds the line, and
+asks both halves -- the attachment query, which is what an application
+branches on, and a `gl_FragDepth` round trip, which is what it actually gets.
+The two can disagree.
+
+Verified in the browser as well as natively, with identical numbers
+(`bits=24 err=2.980e-08`), after rebuilding the wasm driver **and** the
+bundle: the first browser run reported the old behaviour throughout and looked
+like the fix had simply not worked.
+
+**And the diagnostic that hid all of this**: `blit sent to u_blitter` was
+guarded by a single `static bool`. A `glBlitFramebuffer` of
+COLOR|DEPTH|STENCIL arrives as separate blits, so the colour one was announced
+and the rest were invisible -- which is why the case read as a colour bug for
+so long. It is keyed on the blit's shape now.
+
+The remaining `scissor_blit` failure is **stencil**, and it is structural:
+u_blitter needs `PIPE_CAP_SHADER_STENCIL_EXPORT` for the stencil aspect, WGSL
+has no stencil output, and without the cap `util_blitter_blit_generic` sets
+`dst_has_stencil = false` and blits the depth alone -- silently. Serving it
+means the bit-plane trick: nine draws, one to zero the box and eight with
+`stencilWriteMask = 1 << k` and `passOp = Replace`, discarding where the
+source's bit k is clear. Worth doing only if something real asks; a scissored
+or scaled *stencil* blit is rare, and the unscaled unscissored one already
+works through the whole-subresource copy.
+
 ### Leads with causes named
 
-- `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: the
-  depth resolve reads all zeros (`depth read z16_unorm ... bytes 0000`).
-- `framebuffer_blit.scissor_blit`: reaches u_blitter with `scissor=1` and comes
-  out wrong, so the scissor is not surviving the blitter's own state.
+- `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
+  "the depth resolve reads all zeros"; it is not that any more. It now reads
+  the right value to 24-bit precision and fails on the test's own float32
+  epsilon, so what is left is a precision question, not a missing resolve.
+- `framebuffer_blit.scissor_blit`: stencil, see above -- not the scissor.
 - `shader_texture_image_samples_tests.texture_functional_test`: "Binding
   multisampled flag (0) doesn't match the layout's multisampled flag (1)".
 - `shader_atomic_counter_ops_tests.ShaderAtomicCounterOpsAdditionSubstraction`:
