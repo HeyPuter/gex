@@ -1,5 +1,7 @@
 #!/bin/sh
-# Browser benchmark gate for the stock STK -> gex-gl -> MobileGL -> WebGPU path.
+# Browser benchmark gate for the stock STK -> gex-gl -> Mesa/gex_wgpu -> WebGPU
+# path. (This line used to say MobileGL. It has not been that path for a long
+# time and MobileGL cannot be selected at all any more; see the note below.)
 # It runs an ordinary unbounded race and stops from the browser harness. STK's
 # profile mode counts simulation steps rather than eglSwapBuffers and is not a
 # valid measurement of real canvas presents.
@@ -21,10 +23,19 @@ GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 # diagnostics then describes code that is no longer in the tree. Copy into both
 # web/public/gex and web/dist/gex.
 #
-# WARNING: MobileGL does NOT render SuperTuxKart -- it is broken for this
-# workload, so a run with the default backend measures presentation of a frame
-# that has nothing in it. `GEX_STK_GL=mesa` is the path under development and
-# the one worth gating. The only working reference renderer for STK is virgl
+# The backend is `mesa` and there is no longer another option. MobileGL is
+# **disabled in the page**: `MobileGlDevice.create()` always throws, and
+# `?gl=mobilegl` is ignored with a warning rather than honoured, so
+# `GEX_STK_GL` cannot reach it and setting it to anything else measures
+# nothing useful. The knob is kept only so a future backend has a place to go.
+#
+# This warning used to read "a run with the default backend measures
+# presentation of a frame that has nothing in it", which was true when the
+# default was MobileGL and has been inverted ever since the default became
+# mesa -- it invited exactly the conclusion that this gate cannot be trusted,
+# or worse, that MobileGL is the thing to try. It is not: it never renders
+# SuperTuxKart, it is broken for this workload, and it is not a comparison
+# either. The only working reference renderer for STK is virgl
 # (tests/graphics-in-browser.sh and the virgl/wayland demos).
 node "$ROOT/web/test/drive.mjs" supertuxkart \
     --query "gl=${GEX_STK_GL:-mesa}" --cmd "$STK_RACE" \
