@@ -23614,16 +23614,42 @@ derivation depends on is not stable underneath it. There are half a dozen
 recorded fixes in that area; adding a second consumer of the numbering is not
 where to start.
 
-The right route is to send the draw through the **geometry stage**. That
-emulation already computes the primitive number exactly, for every topology and
-for indexed draws (`gex_wgpu_gs_builtin`), so serving this means generating a
-passthrough geometry shader that writes `gl_PrimitiveIDIn` into
-`VARYING_SLOT_PRIMITIVE_ID` and carrying that slot through the passthrough
-vertex shader -- it is excluded from the varying collection today
-(`gex_wgpu_varying_slot_carried`). It costs the whole compute-emulated path for
-the draw, which is the right trade for a feature this rare, and it reuses
-machinery that is already tested. Six cases, and rare in applications, so it is
-recorded rather than built.
+**Priced twice, wrong twice**, so here is what it actually costs.
+
+The first estimate was "route the draw through the geometry stage", whose
+emulation already computes the primitive number for every topology and for
+indexed draws (`gex_wgpu_gs_builtin`). That needs a *generated passthrough
+geometry shader* -- new machinery -- plus carrying `VARYING_SLOT_PRIMITIVE_ID`
+through the passthrough vertex shader, from which it is excluded today.
+
+The second looked cheaper: every vertex can derive the id from its own vertex
+index, and for a **list** topology the integer division makes all of a
+primitive's vertices agree -- so the flat provoking-vertex convention, which
+this driver otherwise rewrites index lists for, does not enter into it. But it
+needs the draw to be a list *and* de-indexed, because WebGPU's `vertex_index`
+is the index **value** for an indexed draw, not a sequence number. And the
+de-index step is **not cleanly reusable**: it lives inside the wide-point path,
+woven together with `ctx->point_gather_*` state and a list of preconditions
+(index width 2 or 4, no primitive restart, no instancing, whole-dword strides).
+Reusing it means generalising that path; duplicating it means duplicating the
+preconditions.
+
+So: four integration points, one of them entangled, plus a forced topology
+conversion, for six cases of a feature that is rare in GL applications.
+Recorded rather than built -- and recorded *with the reason*, so it is not
+priced optimistically a third time.
+
+`gl44-primitive-id-probe` is the standing reproduction. It asserts `links` as a
+case of its own, separately from the values, because a program that will not
+link and one that links and reads a wrong id are different failures and only
+one of them stops an application starting. 4/4 on llvmpipe, 0/4 here, so it
+shows in the probe suite as a **deliberate** difference -- the lifecycle
+`sample-interp` had while it asserted `interpolateAtOffset`, which is what made
+that fix confirmable the moment the identity was understood.
+
+Its geometry is worth one line: the first attempt drew thin right triangles and
+sampled their narrow end, and **llvmpipe read zeros**. A probe whose reference
+fails is measuring its own geometry, not the driver.
 
 The two `shading_language_420pack` failures are `binding_samplers_texture_type_buffer`
 and `binding_images_texture_type_buffer` -- explicit bindings on buffer
