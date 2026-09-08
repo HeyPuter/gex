@@ -22166,3 +22166,51 @@ attributes these to whatever subsystem the test happens to exercise -- atomic
 counters, direct state access, deferred shading -- when the cause is one
 adapter number. Any case whose native log carries "the attachments exceed"
 should be re-run in the browser before anyone works on it.
+
+## A 1D depth texture aborted the application (2026-09-07)
+
+The most serious defect found by measuring, and it was hiding behind a family
+that produced **no result at all**.
+
+`KHR-GL45.texture_swizzle` reported NORESULT after fifteen minutes. Not a
+timeout -- the log's last line is:
+
+    Test case 'KHR-GL45.texture_swizzle.functional_format_idx_63_target_idx_0'..
+    glcts: teximage.c:3017: _mesa_choose_texture_format:
+           Assertion `f != MESA_FORMAT_NONE' failed.
+
+**One case killed the process and took the other 696 with it.** Reproduced in
+isolation with a core dump, so it is the combination and not accumulated
+state.
+
+A backtrace gives the call exactly -- `internalFormat=33189`
+(`GL_DEPTH_COMPONENT16`), `target=3552` (`GL_TEXTURE_1D`), `dims=1`:
+
+    glTexImage1D(GL_TEXTURE_1D, 0, GL_DEPTH_COMPONENT16, 1, 0,
+                 GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, NULL)
+
+which is legal GL. The driver's `depth_target_ok` allowed 2D, RECT, 2D_ARRAY,
+CUBE and CUBE_ARRAY and **not 1D**, so every depth format was declined for the
+target, `st_ChooseTextureFormat` returned `MESA_FORMAT_NONE`, and Mesa asserts
+on that rather than raising a GL error. The process dies inside glTexImage1D.
+
+**Serving it costs nothing**, which is what makes the refusal indefensible
+rather than merely conservative: this driver already creates every non-3D
+texture as `WGPUTextureDimension_2D`, so a 1D depth texture is a 2D one a
+single row tall -- exactly how the sampled path already treats 1D colour
+textures. Fixed by adding `PIPE_TEXTURE_1D` and `PIPE_TEXTURE_1D_ARRAY` to
+that predicate; multisampling stays 2D-only.
+
+**Three lessons, and the first is the one that generalises.**
+
+1. **A refusal a frontend cannot express is not a refusal, it is a crash.**
+   `is_format_supported` looks like a place where saying "no" is always safe.
+   It is not: st assumes *some* format can be chosen for any legal
+   internalFormat, and asserts when none can. Same shape as
+   `a-create-refusal-fails-the-link` one layer up.
+2. **NORESULT is not "slow", and it is not nothing.** A family that reports no
+   score may be reporting the worst thing in the suite. Read the tail of its
+   log before re-running it.
+3. **This was unreachable by every other gate.** 336 applications, 180 probes
+   and twenty CTS families never called `glTexImage1D` with a depth format.
+   Breadth found what depth could not.
