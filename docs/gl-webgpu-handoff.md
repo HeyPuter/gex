@@ -22925,3 +22925,61 @@ And five `texture_cube_map_array` `texture_size_*` cases remain because the
 vertex, geometry, tessellation and compute stages collect their textures
 through `gex_wgpu_collect_stage_textures` rather than the fragment path, so the
 query-only lowering has to be repeated there.
+
+## The caches were keyed on struct padding
+
+valgrind counted **214 uses of uninitialised values in one CTS case**, and
+every one was a cache hashing a WebGPU descriptor struct as raw bytes.
+`WGPUBindGroupEntry` and friends have padding between their members, every one
+of them is built by assigning a compound literal, and a compound literal's
+padding is unspecified. Two logically identical entry arrays could therefore
+hash differently, or compare unequal, on padding alone.
+
+**Only a false miss can come of that** -- it costs a bind group, never a wrong
+one -- which is why it survived this long. The reason to fix it is that 214
+errors bury everything else valgrind has to say, and valgrind is the tool the
+remaining class of bug needs.
+
+The bind group cache now hashes and compares field by field, and stores field
+by field into a zeroed slot so the ref-counting walk reads values rather than
+padding. One trap on the way: the first attempt used a *struct* as the hash
+key, which has padding of its own and put the whole thing straight back where
+it started.
+
+**214 -> 130.** The remainder is the same class one layer along:
+`gex_wgpu_pipeline_key` serialises whole descriptor structs by `sizeof`, and
+those are copies of descriptors the driver built with compound literals.
+Fixing it means serialising `WGPURenderPipelineDescriptor` field by field --
+bounded but not small, and worth doing before the next hunt that needs
+valgrind. Same benign failure mode.
+
+No regressions: probe suite byte-identical at 176 OK, `perf-gears.sh` at
+5.92 ms/frame against a 6.11 ms baseline, both caches at 100%.
+
+### layout_binding: ntv emits invalid SPIR-V, and it is not memory
+
+Two cases, `image2D_layout_binding_imageLoad_{Fragment,Vertex}Shader`, on a
+shader of `layout(binding=N, rgba8) readonly uniform image2D` plus `imageLoad`.
+What is established:
+
+- The module really is invalid. **`spirv-val` says so independently**, not just
+  Tint: "The following forward referenced IDs have not been defined".
+- The bad ID is in `OpEntryPoint`'s interface list, which should name only
+  `%outColor`, and it is **garbage that changes every run** (1176644216,
+  1298840744, 1298680680, 3406205864).
+- ntv's interface array is *correct* at the point of the call -- traced as
+  `n=1: 8`, and 8 is `outColor` -- and the word written into the buffer is
+  garbage immediately afterwards.
+- **Adding the trace makes the bug disappear.** With instrumentation in place
+  all four compiles come out correct; with it removed the failure returns.
+  That is `mesaenv-masks-the-bug` in a different guise.
+- valgrind reproduces the failure and reports **nothing in the compile path**.
+  All 130 remaining errors are in draw-path caches.
+- One run aborted outright, and `spirv_buffer_emit_word` asserts
+  `num_words < room`, so a buffer overrun does happen at least sometimes.
+
+So it is order- or layout-dependent, is not uninitialised memory that valgrind
+can see, and the value is wrong between a correct array and the word written
+from it. The next step is the pipeline-key cleanup above -- to get a quiet
+valgrind -- and then a watchpoint on the `entry_points` buffer word rather than
+more printf, which is precisely what perturbs it.
