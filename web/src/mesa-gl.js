@@ -155,6 +155,15 @@ export class MesaGlDevice {
         // and sizes the GL limit from that, so asking here is the whole of
         // it; the clamp below keeps the request inside the adapter.
         maxInterStageShaderVariables: 32,
+        // Vertex attributes. WebGPU's guarantee is sixteen and this had never
+        // asked for more, which is a ceiling on the *passthrough*
+        // rasterisation of a geometry or tessellation draw: every varying the
+        // emulated stage produces arrives as a vertex attribute. The native
+        // adapter offers thirty, and raising the ask took
+        // geometry_shader to 136/136 and tessellation_shader to no failures
+        // at all -- after two hardcoded sixteens elsewhere were made to
+        // follow it.
+        maxVertexAttributes: 32,
         // 24 is GEX_WGPU_MAX_SHADER_BUFFERS, the driver's own array bound, so
         // there is nothing to gain by asking for more and nothing to lose by
         // asking for this much: Math.min below clamps to the adapter.
