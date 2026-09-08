@@ -23621,6 +23621,52 @@ and `binding_images_texture_type_buffer` -- explicit bindings on buffer
 textures and buffer images -- plus
 `built_in_assignment_testing_gl_MaxProgramTexelOffset`. Not investigated.
 
+### Forty small families scored, and three fixes out of them
+
+The long tail had never been measured. Forty families, about 120 cases, a few
+minutes: **`constant_expressions` 1392/0, `texture_repeat_mode` 162/0**, and of
+the forty small ones most are clean. What they turned up:
+
+**Fixed: primitive restart on the list topologies.**
+`primitive_restart.restart_mode` failed on `GL_LINES` and `GL_TRIANGLES` and
+passed POINTS, LINE_STRIP, LINE_LOOP, TRIANGLE_STRIP and TRIANGLE_FAN -- *with
+the same indices*. **A list-only failure is the signature of primitive-stride
+arithmetic.** `gex_wgpu_draw_provoking_last` trims the count to whole
+primitives before rewriting the index list, which it must (u_indices' generated
+translators walk off the end of a ragged count), but a restart index is not a
+vertex: `{4, 3, RESTART, 4, 0}` is five indices, `u_trim_pipe_prim` rounds five
+down to four for a two-vertex primitive, the last index is dropped and the
+second line vanishes. A strip has no stride to round to. It defers to the
+restart split now, which reissues restart-free ranges with the flag cleared --
+the same deferral the adjacency path a few lines below already does.
+
+Reached only by a draw with a flat varying, that being what makes the provoking
+vertex observable, so the cost was any application using restart with
+`GL_LINES`/`GL_TRIANGLES` under flat shading, silently losing the last
+primitive of every range. `gl44-prim-restart-list-probe` guards it, and checks
+the *incomplete* run as well as the complete one, because a driver that draws
+the unfinished primitive passes one and fails the other.
+
+**Fixed: an imageBuffer in the vertex capture path** and **a shadow sampler
+over a texture with no comparison mode** -- both above.
+
+**Still open, with causes:**
+
+| family | | cause |
+| --- | --- | --- |
+| `texture_barrier_ARB` | 0/4 | native colour budget; the browser has it |
+| `draw_buffers` | 0/1 | native colour budget |
+| `shading_language_420pack` | 328/1 | `samplerBuffer` in a compute-emulated stage: `gex_wgpu_collect_stage_textures` refuses a buffer texture by name. The compute path has the whole machinery (`buftex_count`, `gex_wgpu_apply_buffer_textures`, which already takes a stage and picks the descriptor set); this is the same shape as the integer-sampler gap and wants collection, a variant key on the bound texel width, and a binding from the stage's sampler views |
+| `sync`, `texture_lod_bias`, `map_buffer_alignment` | | wrong results with no driver message; not investigated |
+| `vertex_attrib_64bit` | 2/4 | double vertex attributes |
+| `clip_control` | 7/8 | `clip_control.errors`, a negative test |
+| `texture_size_promotion` | 0/1 | `glTexImage2DMultisample(samples=3)`; dEQP turns the honest refusal into an InternalError. See [[dont-pad-the-sample-counts]] |
+| `incomplete_texture_access` | 0/1 | the draw happens now; the *value* an incomplete texture reads back is still wrong |
+
+And five that are entirely unsupported rather than failing:
+`texture_filter_minmax_tests` 5 notsup, `shader_ballot_tests` 4,
+`shader_viewport_layer_array` 3, `post_depth_coverage_tests` 2.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
