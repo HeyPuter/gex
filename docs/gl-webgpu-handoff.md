@@ -23485,6 +23485,59 @@ in STK, and all 2857 in gears -- one per frame, which is the swap and cannot go
 away). `gex_wgpu_buffer_subdata` at 6246 is the next largest, and
 `gex_wgpu_blit` at 2946 after it. Neither has been looked at.
 
+### EEVEE's viewport, and the silent drop behind the latch
+
+Blender's EEVEE viewport was stuck on "Compiling EEVEE engine shaders" with an
+unshaded cube. That was not a shader-throughput problem -- only 24 shaders had
+compiled, 2010 ms total -- it was a **latched context**, and the log after the
+latch said "draw refused (context already failed)" about everything.
+
+**The latch.** `if (!pass) { gex_fail(ctx); }` in `draw_vbo_inner` was the 23rd
+site killing the context for something the device survived, against a doctrine
+already written down beside `gex_wgpu_declined`. It declines now and names the
+framebuffer it could not build.
+
+**What that revealed.** The message came back with `reuse=1`, which is the
+whole diagnosis. `reuse` is decided early because it gates building the
+attachment views -- two to three microseconds a draw to make and release
+unused. Between that decision and the begin, the driver may record an image
+alias (`gex_wgpu_image_alias`) or a storage-buffer snapshot
+(`gex_wgpu_alias_snapshot_now`), and **both must close the open pass**, because
+a copy cannot be recorded inside one. The draw then reached the begin with
+nothing to reuse and no views built, and dropped itself.
+
+Not EEVEE-specific: any draw that aliases an image or snapshots a storage
+buffer while reusing a pass was lost. EEVEE does it every frame, so its *scene*
+pass vanished every frame while the UI, which aliases nothing, drew normally --
+a black viewport with a correct grid and gizmos over it, which reads as "EEVEE
+does not work" rather than as a dropped draw.
+
+Fixed by running such a draw again. The second pass finds `pending_pass` NULL,
+so `reuse` is false, the views are built and the pass begins; the alias work it
+repeats is idempotent. Once only, so a pass WebGPU genuinely will not begin
+still declines.
+
+**The instrument that mattered** was ruling out the obvious. Dawn raises a
+validation error and returns an *invalid* object rather than NULL
+([[dawn-does-not-return-null]]), so a NULL `beginRenderPass` is something else
+-- and with no Dawn message in the log there was nothing to go on. A descriptor
+dump at the begin site printed **nothing**, which proved the call was never
+made, which is what pointed at `reuse`. The dump stays.
+
+**EEVEE's three remaining blockers**, all named:
+
+1. Three compute shaders Tint rejects: `'workgroupBarrier' must only be called
+   from uniform control flow`.
+2. `r16g16_unorm` viewed over an `r32_float` texture -- both as a sampler view
+   and as an image alias. WebGPU has no `rg16unorm`, so the format is promoted
+   to an 8-byte backing while the texture underneath is 4, and no view or byte
+   copy bridges that. `rg16uint` *is* four bytes and exists; serving the
+   reinterpretation through it with the unorm conversion in the shader is the
+   shape of the fix, and it is the same machinery the packed images use.
+3. `colour target 4 dropped: the attachments exceed 32 bytes per sample` --
+   the native adapter's ceiling. The browser grants 128, so this one is not a
+   blocker there; see [[eevee-blocked-on-attachment-budget]].
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
