@@ -22475,7 +22475,8 @@ The arithmetic was already per-axis; it needed a spatial count. A 2D array's
 layer is deliberately *not* bordered -- GL selects it rather than wrapping it
 -- so only a 3D texture gets the third axis.
 
-The four `Texture3D*` cases still fail and the CTS names the case exactly:
+**All four `Texture3D*` cases are fixed too, and by something else entirely
+-- the family is 32/32.** The CTS named the case exactly:
 
 ```
 Wrong value for layer (6) at point (x,y) = (128,128), component (0)
@@ -22484,10 +22485,30 @@ Expected value [255]  Result value [0]
 
 Layer 6 of a depth-6 texture is outside in r, so it must read the border --
 and it is the **only** layer that can reveal the border colour, which is why
-the other seven rendered images match the reference pixel for pixel. The
-lowering is reached and correct for it (`s=1 t=1 r=1 dim=3D coords=3
-spatial=3 colour=255,255,255,255`) and its swizzle tail carries the bordered
-result through, so the next step is the test's own sampling shader.
+the other seven rendered images matched the reference pixel for pixel.
+
+The lowering was reached and correct (`s=1 t=1 r=1 dim=3D coords=3 spatial=3`)
+and its swizzle tail carried the bordered result through, so the answer was in
+the test's own arithmetic: the CTS drives the third axis with `index / depth`,
+not with a texel centre, so layer 6 of a depth-6 texture is **exactly 1.0**.
+
+A nearest sample picks texel `floor(c * size)`, which at `c == 1.0` is `size`
+-- one past the end, so outside. Both nearest border paths tested `1.0 < c`
+and called it inside, reading the clamped edge texel instead of the border.
+The fix is `>=`.
+
+Two things about how this hid are worth keeping:
+
+- **The Linear variants passed throughout.** That was the tell and it was
+  sitting in the results the whole time: the linear path computes a weight
+  ramp from the texture size and handles the boundary continuously, with no
+  comparison to get wrong. When one filter mode passes and the other fails on
+  the same axis, the bug is in whatever only one of them does.
+- **`gl44-border-3d-probe` passed on both drivers until it was pinned to the
+  CTS's own coordinate.** The r axis was already right for every value a probe
+  would naturally try, `(depth + 0.5) / depth` included. A probe that invents
+  its own inputs tests the implementation's idea of the boundary, not the
+  specification's.
 
 ### Still open, with the cause named
 
