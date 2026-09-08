@@ -23527,7 +23527,28 @@ made, which is what pointed at `reuse`. The dump stays.
 **EEVEE's three remaining blockers**, all named:
 
 1. Three compute shaders Tint rejects: `'workgroupBarrier' must only be called
-   from uniform control flow`.
+   from uniform control flow`. **Diagnosed from the rejected SPIR-V**, which
+   the driver dumps as hex -- reassemble it and run `spirv-dis`. All five
+   barriers in the shader sit inside a selection, and the outermost one's
+   condition is a load from `tilemaps_buf`, a genuine SSBO (EEVEE's shadow
+   tilemaps); the module also declares a real `uniform_0` in the Uniform
+   address space, so this is **not** the driver spilling a uniform block into
+   a storage binding ([[address-space-decides-the-sweep]]) -- that was the
+   first thing to rule out, and it is ruled out.
+
+   So EEVEE writes `if (tilemaps_buf[i] == 0) { ... barrier(); ... }`. GLSL
+   allows that when the value is uniform across the workgroup, which it is --
+   it is indexed by workgroup id. Tint's uniformity analysis is *static* and
+   treats any load from `var<storage>` as non-uniform, so it cannot know.
+
+   The textbook repair is to hoist the barrier out of the conditional, which is
+   semantics-preserving for valid GLSL:
+   `if (c) { A; barrier(); B; }` becomes `if (c) { A; } barrier(); if (c) { B; }`.
+   It does **not** generalise here: one of the five barriers is inside a *loop*
+   inside the selection, and a barrier cannot be hoisted out of a loop at all.
+   A wall of the same kind as [[early-fragment-tests-is-a-wall]], and worth
+   knowing because the pattern is not EEVEE's alone -- any GPU-driven renderer
+   guards workgroup work on a buffer it filled earlier.
 2. `r16g16_unorm` viewed over an `r32_float` texture -- both as a sampler view
    and as an image alias. WebGPU has no `rg16unorm`, so the format is promoted
    to an 8-byte backing while the texture underneath is 4, and no view or byte
