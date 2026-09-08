@@ -21823,3 +21823,43 @@ GL's provoking vertex.
 cases are the first of these: transform feedback recording (which would need
 both captures at once), another stage bound, instanced, per-instance
 attributes, or a vertex shader that samples.
+
+## The atomic families, fully accounted (2026-09-07)
+
+`shader_storage_buffer_object` **121 -> 123/124** across two commits: the
+replay itself took `basic-atomic-case4`, and letting a *geometry* stage serve
+the same shader took `basic-atomic-case1`.
+
+**The geometry half had a bug of its own, independent of any replay.** That
+stage's vertex capture is built from `varying_nir`, which is post-strip, so a
+vertex shader whose atomic result was rewritten to zero handed the geometry
+shader **zeros** for varyings the real shader computed. It would have drawn
+the wrong picture with or without a replay. It now takes the pre-strip clone
+whenever `raster_invalid` is set.
+
+And the draw never reached that stage: the `raster_invalid` check sits ahead of
+the geometry branch, so it tried the replay, was declined "another stage is
+bound", and dropped -- the stage that could have handled it was never asked.
+
+**Every remaining failure in these families is now named:**
+
+- `shader_storage_buffer_object.advanced-usage-sync` -- 1, still open.
+- `shader_atomic_counters.advanced-usage-multi-stage` and
+  `-switch-programs` -- 2, `replay declined (transform feedback is
+  recording)`. Serving these needs one pass to write both the stream-output
+  buffers and the full varying record, since running the two captures
+  separately would perform every atomic twice.
+- `shader_atomic_counters.advanced-usage-many-counters` -- **not an atomic
+  problem at all**: `colour target 4 dropped: the attachments exceed 32 bytes
+  per sample`. That is the native adapter's budget, and the browser grants 64
+  -- measured, the browser passes it, so this family is **29/31 in the browser
+  against 28/31 native**.
+
+**And the browser is behind by one elsewhere in the same family**:
+`advanced-switchBuffers` fails there and passes natively, which no native gate
+can see. Whether it is new is unmeasured -- there was no browser baseline for
+this family before today. Worth a look, and worth remembering that the two
+columns disagree in *both* directions.
+
+Tessellation keeps declining by name. The substitution would be identical to
+the geometry one, but it runs five passes and nothing measured needs it.
