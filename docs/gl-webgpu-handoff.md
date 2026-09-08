@@ -21623,13 +21623,27 @@ and these stages have no per-draw variant.
 is the vertex-atomic capture-back at 3-4 cases; everything else is one or two,
 or a platform wall.
 
-**But "36 failures" is the total for *these sixteen families only*, and saying
-it without that qualifier was misleading -- including in my own summaries.**
-`tessellation_shader` alone is about 140 cases and is **not** in the list
-above; the note on it records 132/140, so roughly eight more failures sit
-outside this tally. The families here were chosen because they were the ones
-being worked on, not because they are exhaustive. Before quoting a total
-again, either widen the list or say which families it covers.
+**"36 failures" is the total for *these sixteen families only*, and saying it
+without that qualifier was misleading -- including in my own summaries.** The
+families here were chosen because they were being worked on, not because they
+are exhaustive. Before quoting a total, either widen the list or say which
+families it covers.
+
+**And the family I reached for as the counter-example proves the point twice
+over.** `tessellation_shader` is not in the sixteen, and the note on it records
+132/140 -- so I wrote that "roughly eight more failures sit outside this
+tally". **Measured 2026-09-07 it is 139/140**, and the one failure is
+`tessellation_shader_tessellation.max_in_out_attributes`, already established
+as not a defect of ours (see `max-in-out-attributes-is-not-ours`: the capture
+is exactly right, element for element). So the honest total across seventeen
+families is **37, of which one is a known non-defect** -- and the correction I
+made an hour earlier was itself read off a stale note. `family-scores-go-stale`
+applies to the notes in this document as much as to anything else: **the run
+is cheap, the note is not evidence.**
+
+It is not a fast run, though: about 140 cases took some twenty-five minutes,
+with `tessellation_shader_point_mode.points_verification` alone taking
+minutes. Budget for that rather than assuming a stall.
 
 ## Buffer textures in the compute-emulated stages: the real blocker (2026-09-07)
 
