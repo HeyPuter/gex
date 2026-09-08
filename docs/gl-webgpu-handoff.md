@@ -23949,6 +23949,17 @@ is 31 variables natively (28 in the browser) where GL wants 32. Only the
 *control* shader's outputs escape a rasterized interface, which is why that one
 reached 128 and these cannot.
 
+**And in the browser it went the other way: 116 → 112.** Measured, via
+`tests/gl44-probe.sh limits`. The browser grants 30 vertex attributes but only
+28 inter-stage variables, so following the inter-stage count *lowered* the
+advertised number there. That is the right outcome and worth saying plainly
+rather than filing under improvement: 116 was a number the browser could not
+honour, and a shader declaring 29 geometry outputs used to link and then fail
+at pipeline creation. It now fails at link, with a reason. The same four
+`limits` cases are SHORT in the browser either way, and all three
+component limits read one number there — `4 x 28` — so the browser has one
+wall behind three shortfalls exactly as native does, just standing closer.
+
 So `limits` is still 136/4 — but three of those four now name one platform
 ceiling instead of two unrelated ones, and the driver no longer has an
 attribute ceiling in a path that has nothing to do with attributes. **A wall
