@@ -21581,3 +21581,46 @@ and uploads float, and FreeCAD already renders here. If it is ever wanted, serve
 `dvec1`/`dvec2` through the existing unpack kinds and **decline 3- and
 4-component doubles by name** -- that is exact for what it serves and honest
 about the rest, rather than a partial split that silently reads the wrong words.
+
+## A flat strip runs a vertex shader's side effects too many times (2026-09-07)
+
+**Open, newly found, and measured.** A vertex shader with side effects, drawn
+as a `GL_TRIANGLE_STRIP` with a **flat** varying, executes its atomics and
+stores **once per assembled primitive vertex rather than once per input
+vertex**. GL runs a vertex shader once per vertex for `glDrawArrays`, so this
+is observably wrong wherever the count matters.
+
+Measured with `tests/integration/programs/gl44-vertex-atomic-result-probe.c`
+on a four-vertex strip whose vertex shader does one `atomicAdd`:
+
+    flat varying:    counter incremented 6 times, results 1,5,4,3
+    smooth varying:  counter incremented 4 times, results 1,2,3,4   (correct)
+
+Six is two triangles times three vertices. The `flat` varying is the whole
+trigger, and swapping it for a smooth one is the control.
+
+**The mechanism.** WGSL's flat interpolation takes the *first* vertex; GL's
+default convention is the last. `gex_wgpu_draw_provoking_last` therefore
+rewrites the draw through `u_indices`, which turns a strip into an indexed
+**list** -- four vertices become six indices -- and re-issues it. For an
+ordinary shader that is invisible and correct. For one with side effects the
+invocation count is *observable*, and it went up by half. The SSBO store
+indexed by `gl_VertexID` also wrote the shared vertices twice, which is why
+the recorded results were 1,5,4,3 rather than a permutation of 1..4.
+
+**A first fix attempt failed and was reverted; the reason is worth knowing.**
+The plan was to run the side-effect dispatch at the rewrite site, on the draw
+the application actually issued, and skip it on the replay by testing
+`ctx->provoking_rewritten`. That made it **worse -- ten increments, so both
+dispatches ran** -- which means the flag is not set the way that site assumes
+during the replay. `provoking_rewritten` is set and cleared around the
+re-issue in `gex_wgpu_draw_provoking_last` (two sites), so understand which
+of those covers the nested `draw_vbo` before trying again. The tree is back to
+the six-count behaviour rather than carrying a half-fix.
+
+**Why it matters beyond the probe.** The `shader_atomic_counters`
+`advanced-usage-*` cases draw strips and check counter values, so this is
+plausibly a *second* cause behind failures otherwise attributed to the
+vertex-atomic read-back gap -- two independent bugs in the same cases. Fixing
+the read-back alone would leave those cases failing on the count, which would
+read as the read-back not working.
