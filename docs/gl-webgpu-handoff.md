@@ -23740,6 +23740,53 @@ all, and the instrument that named it in three lines was a log that already
 existed. When a family fails with nothing in the log, look for the env-gated
 trace for whatever subsystem the test exercises before adding one.
 
+### interpolateAtOffset, exactly, with one extra varying
+
+WGSL has no `interpolateAtOffset`, so it reached Tint as
+`OpInterpolateAtOffset` and the shader was refused -- 20 of
+`shader_multisample_interpolation`'s cases, the largest single conformance gap
+that was left.
+
+The identity needs no approximation. A perspective-interpolated varying is
+`v(p) = A(p)/B(p)` with `A = Σ(v_i/w_i · b_i)` and `B = Σ(b_i/w_i)` over
+screen-space barycentrics, so **A and B are linear in screen space while v is
+not.** The fragment shader already has v at the centre; give it B as well, as a
+`noperspective` varying carrying `1/w`, and then
+
+    A      = v * B                          (exactly v/w at this pixel)
+    A(p+o) = A + o.x*dFdx(A) + o.y*dFdy(A)
+    B(p+o) = B + o.x*dFdx(B) + o.y*dFdy(B)
+    v(p+o) = A(p+o) / B(p+o)
+
+with **exact** derivatives, because a quad difference of a linear function *is*
+its derivative.
+
+**Checked before any of it was written**, which is the part worth copying: a
+hand-written GLSL version of the identity, compared against llvmpipe's own
+`interpolateAtOffset` on a quad whose w runs 1 to 4, gives zero error at every
+offset. The route recorded here previously called for `v/w` *and* `1/w` per
+attribute; `1/w` does not depend on which varying is being asked about, so one
+varying serves the whole shader, and establishing that on llvmpipe cost minutes
+against a build that would have cost hours.
+
+A flat varying takes no interpolation and a noperspective one is already
+linear, so both are handled directly -- the identity would be *wrong* on them,
+not merely slower.
+
+**The slot agreement** is `gex_wgpu_inv_w_location`, which both stages call
+with the same context. It asks for `carriers + 1` locations and takes the last,
+which cannot be a clip-distance carrier however the free-location scan counts
+them: two helpers each asking for "one free location" are each told about the
+first one and collide. The vertex half is emitted in the interp variant *after*
+`gex_wgpu_fit_varyings` -- that trims outputs to the widths the fragment shader
+reads and would trim this straight back out -- and before the viewport fold, so
+the w it divides is the w the pipeline rasterises with.
+
+`shader_multisample_interpolation` **71/20 → 91/0**, and `gl44-sample-interp`
+4/6 → 6/6, natively and in the browser. That was the last
+deliberately-asserted gap in the probe suite, which now stands at **188 OK with
+five DIFF**, every one of them the reference failing or a platform block.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
