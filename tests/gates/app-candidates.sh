@@ -15,10 +15,49 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=${GALLIUM_DRIVER:-gex_wgpu}
 export vblank_mode=0
 VID=$(ls ~/Videos/*.mp4 2>/dev/null | head -1)
+# Every pid that could be this application: an exact process name, or a
+# command line beginning with its resolved path.
+gex_pids_of() {  # gex_pids_of <basename> <path>
+  { pgrep -x -- "$1" 2>/dev/null; pgrep -f -- "^$2" 2>/dev/null; } |
+    sort -u
+}
+
 run() {  # run <name> <seconds> <cmd...>
   local name=$1 secs=$2; shift 2
   local log="$OUT/$name.log"
+  # Which processes of this binary already existed, so the reap below cannot
+  # touch one the user was already running. pkill has no age filter and a
+  # blanket match would; this is the difference between clearing our leftover
+  # and killing somebody's editor.
+  local binary=$1
+  case $binary in
+    /*) : ;;
+     *) binary=$(command -v "$binary" 2>/dev/null || echo "$binary") ;;
+  esac
+  # Both spellings, because a process's own command line may be either. The
+  # `run` calls below use bare names, so most survivors appear as `obs ...`;
+  # sunshine re-execs itself and appears as `/usr/bin/sunshine ...`. Matching
+  # only one of the two found sunshine and would have missed the rest.
+  local base
+  base=$(basename -- "$binary")
+  local before=" $(gex_pids_of "$base" "$binary" | tr '\n' ' ')"
   timeout -s KILL "$secs" "$@" >"$log" 2>&1; local rc=$?
+  # And reap whatever outlived it.
+  #
+  # `timeout -s KILL` kills the process it started and nothing else, so an
+  # application that forks and lets its parent exit is reparented to init and
+  # runs on. sunshine does exactly that: one left behind here burned 152% CPU
+  # for an hour and was still running long after the sweep finished, which
+  # quietly wrecked every timing measurement taken afterwards -- perf-gears
+  # read 180 FPS against a 212 baseline and the cause looked like the change
+  # under test. A correctness gate does not care; a benchmark does, and
+  # nothing in the output said an application was still running.
+  for pid in $(gex_pids_of "$base" "$binary"); do
+    case $before in
+      *" $pid "*) : ;;                    # already there; not ours
+      *) kill -KILL "$pid" 2>/dev/null || true ;;
+    esac
+  done
   # Not the startup format probe. Every context asks the driver which formats
   # are renderable and prints a "render target refused" line for each one that
   # is not -- fifteen of them, every run, for every application. Counting

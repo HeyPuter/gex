@@ -20,14 +20,52 @@
 #     `failed=`. Compare case *counts* with the oracle, which this does.
 #
 # About forty seconds a probe with a warm chromium, so roughly an hour and a
-# half for the set. Do not edit the tree while it runs: every probe rebuilds
-# the guest driver, so a half-finished change is compiled mid-sweep and the
-# failures that follow look like a mass regression rather than a build error.
+# half for the set.
+#
+# It rebuilds each probe's guest *binary* and the guest libGL, and **copies**
+# an already-built host wasm module. It does not build that module. This
+# comment used to claim "every probe rebuilds the guest driver", which is
+# false and had the consequence backwards twice over: editing the driver
+# mid-sweep does not corrupt the run, and running a sweep after editing
+# without web/build-mesa-wasm.sh silently measures the *old* driver.
+#
+# That happened on 2026-09-08. A full sweep reported 191 PASS and 4 FAIL
+# against a driver three commits behind; three of the four "failures" were the
+# staleness and vanished on a rebuild. gl44-probe.sh had said so all along --
+# "gex_wgpu_screen.c is newer than the staged host module" appeared in **195
+# of the 197** per-probe logs and in none of this script's own output, because
+# each probe's stderr goes to its own file. An instrument nobody sees is not
+# an instrument.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-/tmp/gl44-browser-sweep}
 mkdir -p "$OUT"
 : > "$OUT/results.tsv"
+
+# So the check happens once, here, where it is visible -- and refuses rather
+# than warns. Two hours of verdicts against the wrong driver is worse than
+# stopping: every PASS is meaningless and every FAIL sends someone after a bug
+# that is not there. GEX_ALLOW_STALE=1 for the case where measuring the older
+# driver is the point.
+MESA_BUILD=${GEX_MESA_WASM_OUT:-${TMPDIR:-/tmp}/gex-mesa-wasm}/build/src/gallium/targets/gex-wasm
+STAGED=$MESA_BUILD/gex-wgpu-replay.wasm
+DRIVER_SRC=$ROOT/third_party/mesa/src/gallium/drivers/gex_wgpu
+if [ "${GEX_ALLOW_STALE:-0}" != 1 ]; then
+    if [ ! -f "$STAGED" ]; then
+        echo "no host wasm module at $STAGED -- run web/build-mesa-wasm.sh" >&2
+        exit 2
+    fi
+    for src in "$DRIVER_SRC"/gex_wgpu_screen.c "$DRIVER_SRC"/gex_wgpu_native.c; do
+        [ -f "$src" ] || continue
+        if [ "$src" -nt "$STAGED" ]; then
+            echo "$(basename "$src") is newer than the staged host module." >&2
+            echo "Run web/build-mesa-wasm.sh (and, for the page, cd web &&" \
+                 "npm run build) first, or GEX_ALLOW_STALE=1 to sweep the" \
+                 "older driver deliberately." >&2
+            exit 2
+        fi
+    done
+fi
 
 for source in "$ROOT"/tests/integration/programs/gl44-*-probe.c; do
     name=$(basename "$source" | sed 's|^gl44-||; s|-probe\.c$||')
