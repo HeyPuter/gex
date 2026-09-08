@@ -22130,3 +22130,39 @@ distinct defects, and a much larger share concentrated in two or three known
 walls. Still roughly 18,000 cases unmeasured, which is where the next
 measurements should go -- **compile-shaped families first**, since they cost
 seconds per hundred where readback-shaped ones cost minutes.
+
+## The attachment byte budget is a second native-only wall (2026-09-07)
+
+Worth naming alongside the multisample-array wall, because it is now
+implicated in several unrelated-looking failures and it **differs between the
+two paths**.
+
+The native adapter grants **32 bytes per sample** of colour attachment; the
+browser grants **64**. An rgba8 target costs 8, not 4 (see
+`webgpu-attachment-byte-budget`), so native carries **four** rgba8 attachments
+and the browser eight. GL advertises `GL_MAX_COLOR_ATTACHMENTS` 8 either way --
+`GEX_WGPU_MAX_COLOR_TARGETS` is 8 -- so a test that attaches the advertised
+maximum fits in the browser and does not fit natively, and the driver says so:
+
+    colour target 4 dropped: the attachments exceed 32 bytes per sample
+
+**Confirmed cases:** `shader_atomic_counters.advanced-usage-many-counters`
+fails natively with exactly that message and **passes in the browser** --
+measured, which is why that family is 29/31 there against 28/31 native.
+
+**Predicted, not yet verified:**
+`direct_state_access.framebuffers_draw_buffers` reads
+`GL_MAX_COLOR_ATTACHMENTS`, creates that many renderbuffers, attaches all of
+them and draws. On 32 bytes it cannot have eight rgba8 targets. So it should
+fail natively for the same reason and **pass in the browser** -- a cheap
+prediction to test, and if it holds, the case needs no driver work at all.
+
+**And this is the same shape as the fifth colour target that blocks Blender's
+EEVEE viewport natively while working in the browser.** So the budget is worth,
+at minimum: one atomic-counters case, probably one DSA case, and EEVEE.
+
+**The lesson for the accounting**: a failure list taken only from native runs
+attributes these to whatever subsystem the test happens to exercise -- atomic
+counters, direct state access, deferred shading -- when the cause is one
+adapter number. Any case whose native log carries "the attachments exceed"
+should be re-run in the browser before anyone works on it.
