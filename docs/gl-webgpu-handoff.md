@@ -23312,16 +23312,27 @@ too small, which is exactly the class an application trusts and then breaks on.
 
 Measured with a throwaway that prints each one beside its minimum:
 
-| limit | reported | GL wants |
-| --- | --- | --- |
-| `MAX_FRAGMENT_INPUT_COMPONENTS` | 124 | 128 |
-| `MAX_GEOMETRY_OUTPUT_COMPONENTS` | 116 | 128 |
-| `MAX_TESS_CONTROL_INPUT_COMPONENTS` | 116 | 128 |
-| `MAX_TESS_EVALUATION_OUTPUT_COMPONENTS` | 116 | 128 |
-| `MAX_VERTEX_STREAMS` | 1 | 4 |
+| limit | native | browser | GL wants |
+| --- | --- | --- | --- |
+| `MAX_FRAGMENT_INPUT_COMPONENTS` | 124 | 112 | 128 |
+| `MAX_GEOMETRY_OUTPUT_COMPONENTS` | 116 | 116 | 128 |
+| `MAX_TESS_CONTROL_INPUT_COMPONENTS` | 116 | 116 | 128 |
+| `MAX_TESS_EVALUATION_OUTPUT_COMPONENTS` | 116 | 116 | 128 |
+| `MAX_VERTEX_STREAMS` | 1 | 1 | 4 |
 
-124 is `4 x 31`, the adapter's `maxInterStageShaderVariables`; 116 is
-`4 x 29`, `maxVertexAttributes - 1`. Each number names its own cause.
+124 is `4 x 31`, the adapter's `maxInterStageShaderVariables`; 112 is `4 x 28`,
+the browser's; 116 is `4 x 29`, `maxVertexAttributes - 1`. Each number names
+its own cause.
+
+**The browser column was measured, not assumed, and it is not what I guessed.**
+I expected 16 vertex attributes there and a 60-component geometry ceiling; the
+browser grants 30 attributes, the same as native, so the only limit that
+differs between the two platforms is the fragment stage's inputs. That matters
+because it is the whole argument for the passthrough rewrite below: had the
+browser really been at 60, this would be an urgent ceiling on any geometry
+shader with more than fifteen varyings. It is not. Measure the browser before
+sizing a fix to it -- see [[browser-probes-find-what-native-cannot]] for the
+same instrument used the other way round.
 
 **Fixed: the control shader's inputs.** They were left on the rasterized
 count with the stages that really are rasterized, and they are not one: they
@@ -23360,6 +23371,68 @@ the rasterized draw taking stream 0. Rare in applications, so also parked.
 `blend_equation_advanced`, scored at the same time, is **87/88** with the
 remaining one unsupported -- so KHR_blend_equation_advanced works, which is
 what Krita's and Blender's layer blend modes go through.
+
+### A diagnostic that latches per process undercounts per shape
+
+`static bool said` is the idiom throughout the driver and it is right for a
+message that says one thing. It is wrong for one carrying a format, a slot or
+a size, and 27 of the file's 92 latches print three or more such values.
+
+The cost is not hypothetical. `blit sent to u_blitter` was one of them, and a
+`glBlitFramebuffer` of COLOR|DEPTH|STENCIL arrives as *separate blits* -- so
+the colour one was announced and the rest were invisible, and
+`framebuffer_blit.scissor_blit` was read as a colour defect while its colour
+was already correct and its depth was writing 0.5 everywhere.
+
+`GEX_SAY_ONCE_PER(shape) { ... }` replaces the idiom where a single GL call
+fans out: it keeps sixteen shape hashes per site, and a seventeenth simply
+prints, because going quiet is the failure being fixed. Applied to the blit,
+copy and resolve neighbourhood -- the places one call demonstrably reaches once
+per aspect -- rather than to all 27, which would be churn without evidence.
+
+**How to choose:** convert a site when one GL entry point can reach it more
+than once with different values. Leave it when the message says one thing, and
+leave it when the reader is `tests/gates/sweep-causes.sh`, which normalises
+numbers away and counts *programs* -- per-process latching is exactly right
+there.
+
+### Four families scored, and none is a problem
+
+`gpu_shader_fp64` is **658/659**: the only failure is `fp64.varyings`, i.e.
+double-precision *varyings*. The 64-bit machinery here covers four constructs
+(ALU, register, phi, undef) plus memory access, and a varying is a fifth that
+none of those lowerings reaches. Left alone: a `double` varying is rare in
+applications, which pack into `uint` pairs by hand when they need it, and the
+rest of fp64 -- every builtin, every conversion, the uniform and buffer paths
+-- works.
+
+`es_31_compatibility` is **297/2/56**, and both failures are already-named
+structural ones rather than anything new:
+`shader_image_load_store.basic-glsl-earlyFragTests` is
+[[early-fragment-tests-is-a-wall]], and
+`shader_storage_buffer_object.basic-atomic-case3-vsfs` is a vertex shader that
+*uses the result* of a buffer atomic -- the split that serves vertex storage
+writes (dispatch as compute for the side effects, rasterize with the stores
+stripped) cannot serve one, because the rasterized copy would need the value
+the atomic returned.
+
+`copy_image` was scored to 33 of 324 before being stopped for a rebuild, with
+zero failures in that prefix. Worth finishing when there is a spare window; it
+is a slow family because it walks a format matrix.
+
+`gpu_shader5` is 21/2, and both failures are named rather than fixed:
+
+- `precise_qualifier`. ntv **does** emit `SpvDecorationNoContraction` for an
+  exact ALU op, so `precise` reaches SPIR-V intact -- and Tint has nothing in
+  WGSL to carry it into, so it is dropped and the downstream compiler may fuse
+  after all. A platform wall of the same kind as [[tint-has-no-16-bit-types]],
+  not a driver bug.
+- `texture_gather_offset_depth_clamp_edge`. A *dynamic* gather offset is
+  folded into the coordinate (Mesa's own lowering, because Tint rejects the
+  SPIR-V `Offset` operand and accepts only `ConstOffset`), and that folding
+  divides by the texture size and lands on a texel boundary -- precisely where
+  a gather's footprint is ambiguous. The comment on
+  `gex_wgpu_tex_offset_is_dynamic` already says so for the constant case.
 
 ### Leads with causes named
 
