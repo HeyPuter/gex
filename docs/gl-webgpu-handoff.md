@@ -24285,5 +24285,12 @@ intermittency has another cause; **I did not settle it.**
   its own merits; it is not this bug.**
 
 Also noticed while reading: `gex_wgpu_capture_dispatch` hardcodes
-`texture.multisampled = false` for its capture images, the same shape as the
-compute-sampler defect fixed today. Untested, no case attributed to it.
+`texture.multisampled = false` for its capture images, which looks like the
+same shape as the compute-sampler defect fixed today. **It is not a defect** --
+checked rather than left as a lead, because a false lead costs the next person
+an afternoon. The driver sets no multisample-image capability, so
+`GL_MAX_IMAGE_SAMPLES` is 0 (the CTS says so in as many words:
+`image_functional_test` reports `NotSupported (GL_MAX_IMAGE_SAMPLES == 0)`),
+and an application therefore cannot create a multisampled image binding at
+all. The hardcoded false is correct by construction. It would need revisiting
+only alongside multisampled image support, which is a separate feature.
