@@ -22053,3 +22053,40 @@ should be much faster per case.
 merits** -- if a real application did what `copy_image` does per frame, it
 would inherit those syncs. Not chased yet; recorded so the slowness is not
 mistaken for a hang the way `tessellation_shader_point_mode` nearly was.
+
+## MAX_VERTEX_STREAMS: the claim is inherited, not chosen
+
+`limits.max_vertex_streams` fails because we report **1** where GL 4.5 wants
+**4**, and tracing where each half of that comes from is worth doing before
+anyone "fixes" it.
+
+The driver never sets `caps.max_vertex_streams` at all, so it is zero and
+`st_extensions.c` reports `MAX2(1, screen->caps.max_vertex_streams)` -- one.
+That part is honest: multiple transform-feedback vertex streams are not
+implemented.
+
+But `ARB_transform_feedback3`, whose whole point is four streams, is exposed
+anyway -- because st gates it on a *different* capability:
+
+    EXT_CAP(ARB_transform_feedback3, stream_output_interleave_buffers);
+
+and this driver sets `stream_output_interleave_buffers = true`, which it
+should: interleaving stream-output into buffers is a capability it really has.
+So the inconsistent claim is **inherited from st's gate**, not chosen here, and
+it cannot be retracted by flipping that cap without giving up a capability that
+works and is unrelated.
+
+**Which leaves two honest options and one wrong one.** Implementing streams
+(`layout(stream = N) out` on a geometry shader, each stream to its own buffer
+set) is the real fix and is substantial. Accepting the gap and recording it --
+as here -- is the other. Setting
+`stream_output_interleave_buffers = false` to make the extension bit go away is
+the wrong one: it would drop a working capability to tidy a claim, and
+`limits.max_vertex_streams` would still fail, because that case reads the
+*limit*, not the extension.
+
+**This is the third place where the reported version outruns the caps**, after
+the four component limits and the four-component inter-stage shortfall. The
+pattern is worth naming: this driver reports GL 4.6, and `KHR-GL45.limits` is
+the only thing in the suite that checks whether the numbers behind that claim
+are actually there.
