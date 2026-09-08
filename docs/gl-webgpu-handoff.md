@@ -23559,6 +23559,68 @@ made, which is what pointed at `reuse`. The dump stays.
    the native adapter's ceiling. The browser grants 128, so this one is not a
    blocker there; see [[eevee-blocked-on-attachment-budget]].
 
+**So: EEVEE is not reachable, and the reason is (1).** All three have to be
+fixed for the viewport to render, and (1) is a WGSL wall with no general
+repair -- the hoist does not survive a barrier inside a loop. Fixing (2) alone
+buys nothing *for EEVEE*, which is worth writing down because (2) looks like
+the tractable one and is the one a session will reach for.
+
+(2) is also the same architectural problem as the unformatted-image lead above:
+whether an image is served packed or as a storage texture is decided at
+shader-create, and the deciding state -- the bound view's format -- is
+per-draw. The `packed_resolved` key on the capture variant defers the packed
+*format* per draw, but nothing defers the packed *decision*, and that is what
+both cases need. Two leads, one refactor; worth pricing as one piece of work
+rather than two, and worth doing for the general class rather than for EEVEE.
+
+The drop instrument now proves the scope: EEVEE's 96 real drops are four
+counts of sixteen chaining from (2) plus sixteen legitimate zero-count
+sub-draws, and SuperTuxKart, Krita and Minecraft have **none**.
+
+### Four more families, and gl_PrimitiveID in a fragment shader
+
+`constant_expressions` **1392/0** and `texture_repeat_mode` **162/0** are
+perfect. `shading_language_420pack` is 327/2 and `shader_image_size` 32/6/36.
+
+`shader_image_size`'s six failures are all the `-fs-` variants of `basic-nonMS`
+and `advanced-nonMS`, across float, int and uint -- one cause, and it is not
+`imageSize` at all. The rejected SPIR-V (reassembled from the driver's hex dump
+and disassembled) says `OpDecorate %gl_PrimitiveID BuiltIn PrimitiveId`, and
+the shader uses it as the slot to store each primitive's answer into:
+
+    imageStore(g_result, ivec2(gl_PrimitiveID, 0), ivec4(imageSize(...)));
+
+WGSL has no primitive id, so Tint answers "unknown SPIR-V builtin: 7" -- an
+opaque message plus a hex dump naming nothing. It is refused by name now. The
+outcome is unchanged (the shader still does not compile); the log says which GL
+feature is missing instead of which SPIR-V opcode number.
+
+**And the route, which is worth writing down because the obvious one is
+wrong.** Deriving the primitive id in the vertex shader from
+`@builtin(vertex_index)` works only for a non-indexed draw -- WebGPU gives an
+indexed draw the index *value* there, not a sequence number -- and it collides
+with the provoking-vertex machinery, which rewrites the index list precisely so
+that flat varyings take GL's last-vertex value, so the sequence number such a
+derivation depends on is not stable underneath it. There are half a dozen
+recorded fixes in that area; adding a second consumer of the numbering is not
+where to start.
+
+The right route is to send the draw through the **geometry stage**. That
+emulation already computes the primitive number exactly, for every topology and
+for indexed draws (`gex_wgpu_gs_builtin`), so serving this means generating a
+passthrough geometry shader that writes `gl_PrimitiveIDIn` into
+`VARYING_SLOT_PRIMITIVE_ID` and carrying that slot through the passthrough
+vertex shader -- it is excluded from the varying collection today
+(`gex_wgpu_varying_slot_carried`). It costs the whole compute-emulated path for
+the draw, which is the right trade for a feature this rare, and it reuses
+machinery that is already tested. Six cases, and rare in applications, so it is
+recorded rather than built.
+
+The two `shading_language_420pack` failures are `binding_samplers_texture_type_buffer`
+and `binding_images_texture_type_buffer` -- explicit bindings on buffer
+textures and buffer images -- plus
+`built_in_assignment_testing_gl_MaxProgramTexelOffset`. Not investigated.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
