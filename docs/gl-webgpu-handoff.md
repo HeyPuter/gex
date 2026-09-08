@@ -22024,3 +22024,32 @@ families as the gate, and should not be attempted alongside anything else.
 `MAX_FRAGMENT_INPUT_COMPONENTS` at 124 is **not** in scope: that is the
 adapter's 31 inter-stage variables, four components short of GL's 32 vec4,
 with nothing left to ask for.
+
+## What a family costs to measure (2026-09-07)
+
+Roughly 18,000 of the suite's ~19,700 cases have never been run here, so the
+cost of measuring matters as much as what it finds. Observed:
+
+    limits                    140 cases    ~90 seconds
+    direct_state_access       371 cases    ~7 minutes
+    tessellation_shader       140 cases    ~25 minutes
+    copy_image                324 cases    >19 minutes and counting
+
+**The spread is 40x per case, and it is not about case count.** `copy_image`
+runs at about 34% CPU -- 6:30 of processor time in 19 minutes of wall -- so it
+is waiting on the GPU, not computing. That fits what these cases do: a copy
+followed by a readback, and a readback here submits and waits. Format-class
+copies go through a texture -> buffer -> texture round trip (see
+`format-class-views-work`), which is several syncs per case.
+
+**So budget by shape, not by size.** A family of state queries or negative
+tests runs in seconds per hundred; one that reads pixels back per case runs in
+minutes per hundred. `packed_pixels` (4732 cases) and `pixelstoragemodes`
+(896) are both readback-shaped and should be expected to take hours, while
+`shaders` (2397) and `constant_expressions` (1392) are compile-shaped and
+should be much faster per case.
+
+**And a family that takes minutes per case is worth a second look on its own
+merits** -- if a real application did what `copy_image` does per frame, it
+would inherit those syncs. Not chased yet; recorded so the slowness is not
+mistaken for a hang the way `tessellation_shader_point_mode` nearly was.
