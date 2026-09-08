@@ -24077,7 +24077,25 @@ rotation inside a group of `verts` leaves the quotient alone. That is the
 objection this file raised against the derivation, and it does not hold once
 the draw is a de-indexed list.
 
-**What is left, and it is one job not two.** A strip cannot derive it -- its
+**Stage two is done too (same day), so the "what is left" below is now
+history — kept because its reasoning is what the fix followed.** The probe is
+**4/4** and has left the probe suite's non-OK list entirely; the strip's
+coverage is 432 of 576 pixels, 144 per id, identical to llvmpipe. The defect
+was a shared variable: the point expansion clears `point_gather_mask` at the
+top of every draw and again when it declines to expand, and the de-indexed
+redraw is a *nested* draw, so it cleared the mask the outer call had just set.
+`deindex_gather_mask` is held apart for that reason.
+
+Two wrong theories went first and both were cheap to kill by measuring: a
+stale `glBufferData` read (disproved by a fresh-process strip-only program,
+which failed identically) and wrong generated indices (disproved by dumping
+them — `0 1 2 | 2 1 3 | 2 3 4`, a correct PV_LAST expansion). What found it was
+reading **coverage** rather than the sampled value: 0 of 576 pixels lit says
+the draw did not happen, which is a different investigation from a wrong id.
+Dawn then named the cause in one line — "requires a larger buffer (72) than
+the bound buffer size (40)".
+
+**What was left, and it is one job not two.** A strip cannot derive it -- its
 vertex n belongs to primitives n-2, n-1 and n, so no function of one vertex
 names one primitive -- and nor can an indexed draw, where WebGPU hands the
 vertex stage the index *value* rather than a sequence number. Both reduce to
