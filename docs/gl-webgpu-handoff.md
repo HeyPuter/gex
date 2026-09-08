@@ -21940,3 +21940,42 @@ cases of a roughly 19,700-case suite. `packed_pixels` alone is 4732 cases,
 run here. Measuring an unmeasured family cost ninety seconds and produced a
 complete diagnosis; that is a better rate than any amount of re-reasoning
 about the families already known.
+
+## KHR-GL45.direct_state_access: 334/371, and 30 of 36 are one wall (2026-09-07)
+
+Another family never measured here. Its 36 failures are **not 36 problems**,
+and the shape of them is only visible if you look past the pass rate:
+
+    334  Pass (Pass)
+     31  InternalError (Error)     <-- the test itself erroring, not a wrong answer
+      5  Fail (Fail)
+
+Grepping for `Fail` finds five and misses thirty-one. **The CTS's own summary
+line is the count to trust** -- `Failed: 36/371` -- and the verdict histogram
+is the next thing to look at, because `InternalError` and `Fail` mean
+different things: the first is the test hitting an unexpected GL error, which
+usually has one cause for many cases.
+
+It did here. **Thirty of the thirty-one are
+`textures_storage_multisample_3d_*`** -- `GL_TEXTURE_2D_MULTISAMPLE_ARRAY`,
+one case per internal format. That is the multisampled array texture WGSL has
+no type for, already recorded as the whole of `texture_view`'s four failures.
+So that single platform wall is worth **at least thirty-four cases**, which
+makes it the largest identified cause in this project's accounting -- larger
+than the vertex-atomic gap that occupied several passes today.
+
+The remaining six, which are separate questions:
+
+    framebuffers_texture_layer_attachment      (InternalError)
+    queries_functional                         (Fail)
+    framebuffers_draw_buffers                  (Fail)
+    framebuffers_blit                          (Fail)
+    renderbuffers_storage_multisample          (Fail)  -- probably multisample too
+    vertex_arrays_enable_disable_attributes    (Fail)
+
+**A note on the log's `error:` lines.** The family log carries messages like
+`GL_INVALID_ENUM in glClearBufferfv(buffer=GL_STENCIL)` and
+`GL_INVALID_ENUM in glCheckNamedFramebufferStatus(invalid target GL_TRUE)`.
+Those are the driver correctly logging errors that *negative* tests
+deliberately provoke -- they are not failures, and reading them as a list of
+defects would waste a pass.
