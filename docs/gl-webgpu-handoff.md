@@ -21979,3 +21979,48 @@ The remaining six, which are separate questions:
 Those are the driver correctly logging errors that *negative* tests
 deliberately provoke -- they are not failures, and reading them as a list of
 defects would waste a pass.
+
+## Lifting the 16-varying cap: read the capture as storage, not attributes
+
+The concrete change behind three of `limits`' five failures, and probably
+`tessellation_shader`'s only one. Written down because the reading is done and
+the change is not.
+
+**Why the cap exists.** `GEX_WGPU_MAX_VARYINGS` is 16, so the compute-emulated
+stages advertise 64 components where GL 4.5 wants 128. It is 16 because
+`gex_wgpu_gs_passthrough_nir` declares **one `nir_var_shader_in` per varying**
+-- `in->data.location = VERT_ATTRIB_GENERIC0 + i` -- so each varying costs a
+*vertex attribute*, and WebGPU guarantees sixteen of those. The constraint is
+recorded on the passthrough already; what was not obvious is that it is the
+sole reason for the component limits.
+
+**The change.** The capture is *already* a storage buffer -- created
+`PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_SHADER_BUFFER`, where the vertex-buffer
+half exists only so the passthrough can fetch through vertex input. Replace
+those inputs with loads from the same buffer at
+`gl_VertexIndex * stride + i * 16`, and the attribute budget stops applying:
+
+ - `gex_wgpu_gs_passthrough_nir` declares one storage block instead of N
+   inputs, and reads each slot with a word load;
+ - the rasterising pass binds the capture to the vertex stage as a storage
+   buffer rather than as vertex buffer zero, and `passthrough_elements`
+   becomes empty -- a non-indexed draw needs no vertex buffer at all, and
+   `gl_VertexIndex` still counts;
+ - `GEX_WGPU_MAX_VARYINGS` can then be 32, and the advertised component limits
+   with it.
+
+**What it is worth**: `limits`' `max_geometry_output_components`,
+`max_tess_control_input_components` and
+`max_tess_evaluation_output_components`, plus
+`tessellation_shader_tessellation.max_in_out_attributes` -- and, beyond the
+CTS, any real shader carrying more than sixteen varyings through a geometry or
+tessellation stage, which today is refused rather than slow.
+
+**What it risks**, and it is not small: this is the rasterising half of every
+geometry and tessellation draw -- the path behind `geometry_shader` 133/136 and
+`tessellation_shader` 139/140. It wants its own focused pass with those two
+families as the gate, and should not be attempted alongside anything else.
+
+`MAX_FRAGMENT_INPUT_COMPONENTS` at 124 is **not** in scope: that is the
+adapter's 31 inter-stage variables, four components short of GL's 32 vec4,
+with nothing left to ask for.
