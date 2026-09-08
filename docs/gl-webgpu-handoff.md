@@ -22840,3 +22840,88 @@ mechanism (the probe fetches every sample by index and matches). What the test
 does that the probe does not is render *from an input texture* into the
 multisampled framebuffer and then resolve through an auxiliary framebuffer of
 its own; that pair is where to look next, not at the tiling.
+
+## Seventeen more families, and a limit nobody asked for
+
+Newly measured, ~600 cases. Clean: `geometry_shader` **136/136**,
+`texture_query_levels` **13/13**, `multi_bind` 17/17, `sample_shading` 13/13,
+`shaders44` 12/12, `shaders45` 7/7, `aggressive_optimizations` 12/12,
+`sepshaderobjs` 8/8, `draw_elements_base_vertex_tests` 11/11,
+`tessellation_shader` 139/140 with the last an honest skip.
+`ext_texture_shadow_lod` is all skip -- the extension is not advertised.
+
+### maxVertexAttributes was never requested
+
+Not "asked for and refused" -- **absent from both request lists**, so the
+device granted WebGPU's guaranteed sixteen while the adapter offers **thirty**.
+Nothing printed a shortfall, because a shortfall is `available < wanted` and
+there was no `wanted`. That is the gap in the `granted-equals-asked` tell:
+check the limit is *in* the list before comparing.
+
+It is the ceiling on the *passthrough* rasterisation of an emulated geometry or
+tessellation stage -- every varying the stage produces arrives as a vertex
+attribute -- and the source said so: "a different limit that this driver does
+not raise".
+
+Asking was a third of the work. The rest was two numbers that used to agree
+with sixteen:
+
+- `caps->max_inputs`/`max_outputs` for the emulated stages now follow
+  `screen->max_raster_varyings`, which is granted **minus one**. The one is
+  held back for the wide-point expansion: a point wider than a pixel is six
+  vertices with the corner offsets in an attribute of their own, so a stage
+  filling every attribute leaves the expansion nothing. The advertised limit is
+  what a test then *uses*, so claiming one less claims what works rather than a
+  number that degrades at the top of its range.
+- `gex_wgpu_point_corner_location` searched locations 0..15 with a literal 16.
+  This was the last case standing, and the symptom was a printed reason nothing
+  could act on: "points drawn one pixel wide (no free vertex attribute)".
+
+`geometry_shader` 135/136 -> 136/136; `tessellation_shader`'s remaining failure
+became a skip.
+
+### A slot only ever asked about needs no binding
+
+`textureSize`, `textureQueryLevels` and `textureSamples` say nothing about a
+texture's type, so the sample-type classification skips them -- and a slot
+whose *only* use is a query then matched no case and kept the default, Float.
+Against a depth view that is a refused bind group and a declined draw. Every
+`*Shadow_test` in `texture_query_levels` was one line of `textureQueryLevels`
+and nothing else.
+
+Both one-sided fixes were already known not to work (see the section above on
+the shadow sampler). The answer is that the binding is unnecessary: every
+answer is a property of the bound view, so `gex_wgpu_lower_query_only` bakes
+them in -- the size shifted by the queried level and clamped at one, since the
+level need not be constant -- and the declaration falls out as dead code.
+
+**The part that is easy to miss**: the binding validation and the bind group
+read the *base* shader's recorded slots, which a variant removing a variable
+does not change. A query-only slot has to be reported through the existing
+`omitted` mask, or the module has no texture and the draw is still declined for
+the one it used to have -- naming a slot nothing samples.
+
+`texture_query_levels` 7/13 -> **13/13**.
+
+### Three leads, each with its cause named
+
+- **`viewport_array` 13/17.** All four failures are one WebGPU rule: `The
+  depth stencil attachment [Depth32Float 128x128] size does not match the size
+  of the other attachments' base plane (width: 16, height: 2)`. GL makes a
+  framebuffer with differently-sized attachments complete and renders to the
+  intersection; WebGPU requires them equal. Deciding what to do about the
+  larger attachment is the whole question -- dropping it loses depth testing,
+  and a view cannot be cropped.
+- **`layout_binding` 19/21.** Both failures are
+  `image2D_layout_binding_imageLoad_{Fragment,Vertex}Shader`, and the message
+  is **malformed SPIR-V from ntv**: "The following forward referenced IDs have
+  not been defined:" -- with an empty list, which is its own clue.
+- **`shader_draw_parameters_tests` 9/13.** All four are `MultiDraw*Indirect*`,
+  so `gl_DrawID` across a multi-draw indirect. The driver resolves indirect
+  draws on the CPU and reissues them one at a time; `drawid_offset` is what
+  has to survive that.
+
+And five `texture_cube_map_array` `texture_size_*` cases remain because the
+vertex, geometry, tessellation and compute stages collect their textures
+through `gex_wgpu_collect_stage_textures` rather than the fragment path, so the
+query-only lowering has to be repeated there.
