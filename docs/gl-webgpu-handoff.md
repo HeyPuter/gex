@@ -24050,3 +24050,72 @@ behind it ([[lifting-a-refusal-moves-the-failure]]), so it was measured: a
 points-out geometry shader writing `gl_PointSize = 9.0` lights 9 pixels across
 the centre for one instance and for two, matching llvmpipe exactly. Nothing
 latched.
+
+## gl_PrimitiveID in a fragment shader, stage one (2026-09-08)
+
+This file priced this twice and parked it twice, both times at "route the draw
+through the geometry stage, which already computes one". There is a cheaper
+route and the probe's own header had already named it, which is worth recording
+as a lesson about where to look: **the reproduction knew more than the
+handoff.**
+
+WGSL has no primitive id, so the slot GL names for it is no help either --
+VARYING_SLOT_PRIMITIVE_ID becomes @location(26) under ntv's rule, past every
+adapter's inter-stage ceiling. It is carried on an ordinary **flat integer
+varying** instead, on a location both stages derive from the same context. That
+is the mechanism gl_PointCoord and the clip-distance carriers already use, and
+the index convention `gex_wgpu_inv_w_location` established: clip carriers
+first, then interpolateAtOffset's 1/w, then this. Asking for all of them at
+once is what keeps two features that are both in use off the same slot.
+
+**Where the value comes from, and why one shape works.** For a *list* topology
+on a de-indexed draw every vertex of a primitive shares
+`gl_VertexID / verts_per_prim`, so the vertex shader derives it with a divide.
+The provoking-vertex rewrite does not disturb that: it permutes vertices
+*within* a primitive so a flat varying takes GL's last-vertex value, and a
+rotation inside a group of `verts` leaves the quotient alone. That is the
+objection this file raised against the derivation, and it does not hold once
+the draw is a de-indexed list.
+
+**What is left, and it is one job not two.** A strip cannot derive it -- its
+vertex n belongs to primitives n-2, n-1 and n, so no function of one vertex
+names one primitive -- and nor can an indexed draw, where WebGPU hands the
+vertex stage the index *value* rather than a sequence number. Both reduce to
+**de-indexing the draw into a list**, which is a generalisation of
+`gex_wgpu_gather_indexed_vertices`: read the index list (or generate the
+strip's), gather every vertex buffer through it, and redraw non-indexed with
+the list topology. The gather does exactly this today for the point expansion
+and is only point-specific in its bookkeeping (`point_gather_*`) and in
+flipping `stepMode` to instance, which a general de-index would not do.
+
+Those two read **id 0** until then, and that falls out of existing machinery
+rather than a second mechanism: the carrier has no producer, so
+`gex_wgpu_drop_unproduced_inputs` zeroes it. Relocating the fragment input
+*before* that pass is what makes the whole thing work -- after it, the drop
+replaces the reads with a constant while the input is still at
+VARYING_SLOT_PRIMITIVE_ID, so the id would read 0 even on the draws that *can*
+supply it.
+
+Measured: `KHR-GL45.shader_image_size` **32/6/36 → 38/0/36** (all six failures
+were "unknown SPIR-V builtin: 7" at link), `gl44-primitive-id-probe` **0/4 →
+2/4**, probe suite 189 OK with its seven known non-OK lines and no eighth.
+
+**Note for whoever finishes it**: an application that reads gl_PrimitiveID on
+*indexed* geometry -- which is most real geometry -- now runs and draws with id
+0, where before it did not run at all. That is a large improvement and an
+incomplete feature at the same time, and the second half is worth doing for
+that reason rather than for the two probe cases.
+
+### The defect behind it, which is a standing trap in this file
+
+`gex_wgpu_fragment_module` has **two** early returns that hand back
+`fs->module`, and that is NULL for a shader whose base module was deferred. A
+new variant reason has to appear in **both** lists. Missing them, the
+`triangles` case built no variant, returned NULL, and the draw vanished with no
+message at all -- while the two *fallback* cases worked, because a zeroed
+carrier sets `unproduced` and that was already in the list. So the feature
+looked half-broken in the shape least likely to point at the cause.
+
+The comment above the first of those returns already warns about exactly this,
+for `gl_SamplePosition`. It is now the third feature to hit it. **Grep for
+`return fs->module` before adding a variant reason.**
