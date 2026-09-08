@@ -21885,3 +21885,58 @@ columns disagree in *both* directions.
 
 Tessellation keeps declining by name. The substitution would be identical to
 the geometry one, but it runs five passes and nothing measured needs it.
+
+## KHR-GL45.limits: 135/140, and all five failures are one query away (2026-09-07)
+
+A family that had **never been measured**, and it runs in under ninety
+seconds. Its five failures are silent -- no refusal, no rejected shader -- and
+they map **one to one** onto the five limits this driver advertises *below* GL
+4.5's required minimum. Queried directly against llvmpipe as the control:
+
+    limit                                   ours   GL 4.5   llvmpipe
+    MAX_FRAGMENT_INPUT_COMPONENTS            124     128        128
+    MAX_GEOMETRY_OUTPUT_COMPONENTS            64     128        128
+    MAX_TESS_CONTROL_INPUT_COMPONENTS         64     128        128
+    MAX_TESS_EVALUATION_OUTPUT_COMPONENTS     64     128        128
+    MAX_VERTEX_STREAMS                         1       4          4
+
+and the failing cases are `max_fragment_input_components`,
+`max_geometry_output_components`, `max_tess_control_input_components`,
+`max_tess_evaluation_output_components`, `max_vertex_streams`. Nothing else in
+the family fails. So this family is not testing behaviour at all -- it is
+reading back what we advertise -- and the whole of it is a **cap honesty**
+question rather than five separate bugs.
+
+**Two different causes underneath, and only one is a platform wall.**
+
+`124` is WebGPU's inter-stage variable count: the adapter offers **31**, we ask
+for 31, and 31 x 4 = 124. GL wants 32 vec4. Four components short of the
+minimum, with nothing to ask for -- a real wall.
+
+`64` is **ours**: 16 varyings x 4, `GEX_WGPU_MAX_VARYINGS`. It is 16 because the
+compute-emulated stages rasterise through a generated **passthrough vertex
+shader that reads each varying as a vertex attribute**, and WebGPU guarantees
+sixteen vertex attributes. That is the constraint recorded on the passthrough
+already. So it is a wall of our own construction, and there is a way through
+it: have the passthrough read its varyings from a **storage buffer indexed by
+vertex index** instead of through vertex attributes. The capture is already a
+storage buffer -- the passthrough is the only reason it is also bound as a
+vertex buffer. That would lift the emulated stages to 32 varyings, take three
+of these five cases, and plausibly also
+`tessellation_shader_tessellation.max_in_out_attributes`, the one failure in
+that family.
+
+`MAX_VERTEX_STREAMS` at 1 is a feature gap rather than a limit: multiple
+transform-feedback vertex streams are not implemented.
+
+**And the honest awkwardness worth stating**: the driver reports GL 4.6 while
+advertising four limits below the 4.5 minimum. Mesa does not gate the version
+on them, so nothing catches it but this family -- which is exactly why an
+unmeasured family is worse than a failing one.
+
+**The general point**: the sixteen families tallied earlier are about 1268
+cases of a roughly 19,700-case suite. `packed_pixels` alone is 4732 cases,
+`shaders` 2397, `constant_expressions` 1392, and none of them has ever been
+run here. Measuring an unmeasured family cost ninety seconds and produced a
+complete diagnosis; that is a better rate than any amount of re-reasoning
+about the families already known.
