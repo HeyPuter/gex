@@ -22603,3 +22603,83 @@ The largest remaining clusters, each with its cause already named above:
 `shader_multisample_interpolation` 20 (all `interpolateAtOffset`),
 `shader_image_load_store` 10, `texture_cube_map_array` 8,
 `shader_image_size` 6 (all `gl_PrimitiveID`).
+
+## Most of what is left is a platform gap, not a defect
+
+Two families accounted for 145 of the 214 recorded failures. Grouping them
+properly changes what the roadmap should say about both.
+
+### texture_swizzle: 109 failures, 0 defects
+
+The failures form an exact grid once decoded against the test's own target and
+format tables:
+
+```
+target 8 (2D_MULTISAMPLE_ARRAY)   62 failures -- every format
+target 7 (2D_MULTISAMPLE)         27 failures -- format-dependent
+targets 0-4 (1D/2D/3D/1DArray/2DArray)  20 -- exactly four formats
+```
+
+- **Target 8** is `GL_TEXTURE_2D_MULTISAMPLE_ARRAY`. WebGPU has no multisampled
+  array texture, which `multisample-array-is-the-wall` already records.
+- **Target 7's** 27 formats are exactly the ones WebGPU cannot multisample: all
+  SNORM, all 16-bit unorm (WebGPU has none at all), all 32-bit float, all
+  32-bit integer. The 35 that pass are exactly the multisample-capable set. The
+  driver says so honestly -- `glTexImage2DMultisample(format/samplecount not
+  supported)` -- and the test fails rather than skipping.
+- **The four formats** are the 8-bit SNORMs (R8, RG8, RGB8, RGBA8_SNORM) while
+  all four 16-bit SNORMs pass. The test *renders into* them and WebGPU's snorm
+  formats have no RENDER_ATTACHMENT capability:
+  `GL_INVALID_FRAMEBUFFER_OPERATION in glClear(incomplete framebuffer)`.
+  Sampling snorm8 -- the normal-map case applications actually care about --
+  works.
+
+So none of the 109 is a driver bug. **Do not plan work against this family.**
+
+### direct_state_access: 36 failures, 6 defects
+
+The per-family log is not a reliable record here: it holds 335 `Pass` lines and
+5 `Fail` lines for a run the CTS's own totals put at 334/36. The qpa is the
+authority, and it says **31 `InternalError`** -- the test threw rather than
+compared -- of which **30 are `textures_storage_multisample_3d_*`**, the same
+multisampled-array wall. The test creates the texture, renders into it, samples
+it with `sampler2DMSArray` and resolves, so it needs the whole feature.
+
+That leaves six: `framebuffers_texture_layer_attachment` (InternalError),
+`queries_functional`, `framebuffers_blit`, `renderbuffers_storage_multisample`
+(a `Multiple aspects (Depth|Stencil)` view bound as a sampled texture),
+`vertex_arrays_enable_disable_attributes` (the native adapter's 10 storage
+buffers), and `framebuffers_draw_buffers` -- now **fixed in the browser**, see
+below.
+
+**Read StatusCode from the qpa, not `Fail` lines from the log.** An
+`InternalError` is a thrown test, counts as a failure, and prints no verdict
+line the log grep will find.
+
+### The multisampled-array wall is 96 cases
+
+62 (`texture_swizzle` target 8) + 30 (`direct_state_access`) + 4
+(`texture_view`) -- by far the largest single cluster in the suite, and the one
+thing worth building if conformance is the goal. A multisampled array of L
+layers is L multisampled 2D textures; the driver already redraws per layer for
+layered rendering and already unrolls dynamic sampler indices, so both halves
+have precedent. `sampler2DMSArray`'s texelFetch would unroll over layers.
+
+### Ask for the limit, again
+
+`maxColorAttachmentBytesPerSample` was requested at 64 and granted 64 -- which
+reads like an adapter ceiling and is not one. 64 is simply one tier above
+WebGPU's default 32; GL's worst case is eight draw buffers of RGBA32F, or 128.
+The browser adapter offers at least that, and raising the ask turns
+`framebuffers_draw_buffers` from fail to pass in the browser.
+
+**The tell is that granted exactly equalled asked**, and the request code's own
+shortfall list stays silent in that case by construction -- it only reports
+`available < wanted`. Both times this limit family has bitten, that equality
+was the clue. Native is genuinely capped: `adapter colour bytes/sample 32
+(asked 32)`.
+
+Storage buffers were raised to 24 (`GEX_WGPU_MAX_SHADER_BUFFERS`) at the same
+time and that one *is* a real adapter maximum -- 10 native, 16 browser -- so
+`shader_image_load_store.multiple-uniforms` at seventeen stays refused on both.
+Three of that family's ten failures are the native 10 and pass in the browser.
