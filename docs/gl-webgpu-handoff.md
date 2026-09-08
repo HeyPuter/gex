@@ -24015,3 +24015,38 @@ region's mean difference is exactly zero. Its two offset black rectangles are
 OBS's own preview compositing and appear identically on the reference, which is
 worth stating because that is exactly the shape one would otherwise open an
 investigation into.
+
+#### The rest of the rewrite paths, swept
+
+Having found one, I checked every place this driver turns one draw into
+another — `grep -n '= \*info;'` finds them all, seventeen sites — and the
+answer is that the overdraw was the only one. Recorded so the search does not
+have to be repeated:
+
+| site | what it rewrites | instancing |
+| --- | --- | --- |
+| geometry raster | capture → indexed draw | **was wrong**, now `= 1` |
+| tessellation raster | capture → indexed draw | **was wrong**, now `= 1` |
+| wide/smooth/stippled lines | segments → instanced quads | sets it explicitly (`= segments`), and the caller gates on `instance_count <= 1` |
+| flat-unfilled replay | capture → LINES | declines `instance_count > 1` |
+| clipped-outline replay | capture → LINES | same decline |
+| atomic-result replay | capture → passthrough | declines `instance_count > 1` |
+| provoking-vertex rewrite | re-indexes | inherits, and should: same geometry |
+| `u_indices` conversion | re-indexes | inherits, and should |
+| unfilled polygon rewrite | re-indexes | inherits, and should |
+| index widening | re-indexes | inherits, and should |
+
+The distinction that decides it: a rewrite that only **re-indexes** the same
+geometry must keep `instance_count`, because the draw still has N instances of
+the rewritten list. A rewrite that **replays from a capture** must not, because
+the capture already unrolled them. Only the two emulated stages both replay
+from a capture *and* accept instanced draws, which is why they were the only
+two that could have the bug.
+
+One consequence to check rather than assume: the fix makes the wide-point
+expansion **newly reachable** for an instanced geometry draw, since it declines
+`instance_count > 1` and now sees 1. A lifted refusal can expose whatever was
+behind it ([[lifting-a-refusal-moves-the-failure]]), so it was measured: a
+points-out geometry shader writing `gl_PointSize = 9.0` lights 9 pixels across
+the centre for one instance and for two, matching llvmpipe exactly. Nothing
+latched.
