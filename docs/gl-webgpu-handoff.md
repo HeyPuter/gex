@@ -21608,15 +21608,31 @@ invocation count is *observable*, and it went up by half. The SSBO store
 indexed by `gl_VertexID` also wrote the shared vertices twice, which is why
 the recorded results were 1,5,4,3 rather than a permutation of 1..4.
 
-**A first fix attempt failed and was reverted; the reason is worth knowing.**
-The plan was to run the side-effect dispatch at the rewrite site, on the draw
-the application actually issued, and skip it on the replay by testing
-`ctx->provoking_rewritten`. That made it **worse -- ten increments, so both
-dispatches ran** -- which means the flag is not set the way that site assumes
-during the replay. `provoking_rewritten` is set and cleared around the
-re-issue in `gex_wgpu_draw_provoking_last` (two sites), so understand which
-of those covers the nested `draw_vbo` before trying again. The tree is back to
-the six-count behaviour rather than carrying a half-fix.
+**Fixed.** The side effects now run at the rewrite site, against the count the
+application asked for, and the dispatch sites skip the replay. Transform
+feedback is exempt from the skip because it records *primitives*, so the
+assembled list is exactly what it should see. After: four increments and
+1,2,3,4, matching the smooth-varying control.
+
+**There are three dispatch sites and the first attempt skipped the wrong
+one.** The skip went on the main side-effect dispatch -- and an
+*unrasterisable* shader never reaches it, because the declined-draw path
+returns first. So the rewrite-site dispatch was added on top of a nested one
+that still ran, and the count went from six to **ten**. `provoking_rewritten`
+was never the problem; it is set correctly around both re-issue points.
+
+**What settled it was a one-line trace that printed nothing.** Instrumenting
+the main dispatch produced no output at all while the counter still read
+thirteen, which said the work was coming through a site I had not considered.
+Guessing which of three sites runs cost an attempt and a revert; printing it
+cost one build. When several paths can do the same work, instrument before
+editing -- and treat *silence* from the instrument as the finding.
+
+**It is not a second cause behind the atomic-counter failures**, which was the
+hypothesis. `shader_atomic_counters` 28/31, `shader_storage_buffer_object`
+121/124, `transform_feedback` 19/21 and `shader_subroutine` 27/28 are all
+unchanged, so those cases fail on the read-back gap alone. This is another
+correctness fix that moves no score and is caught only by a probe.
 
 **Why it matters beyond the probe.** The `shader_atomic_counters`
 `advanced-usage-*` cases draw strips and check counter values, so this is
