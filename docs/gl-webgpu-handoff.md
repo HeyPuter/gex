@@ -22795,7 +22795,45 @@ Scores: `texture_view` 3/7 -> **5/7**, `texture_swizzle`'s 2DMSArray group
 throwing -- **InternalError to Fail**, so they run and compare now instead of
 dying on `glTextureStorage3DMultisample`.
 
-Those 30 still fail on values, and three hypotheses are already eliminated:
+### It is finished: two more bugs, both about coordinates
+
+**`gl_FragCoord` belongs to the tile, not the wide texture.** The viewport
+moves with the tile, so the fragment shader really does run at the wide
+texture's coordinates and `gl_FragCoord` reports them -- and the CTS indexes a
+*non-tiled* input texture with it:
+
+```glsl
+texelFetch(texture_input, ivec3(gl_FragCoord.xy, texture_layer), 0)
+```
+
+so layer 2 read texels 4..5 of an input two texels wide. Not a conformance
+detail: any application rendering into a layer of a multisampled array and
+reading `gl_FragCoord` sees the same shift.
+`gex_wgpu_lower_frag_coord_tile` subtracts it, as a variant keyed on the
+offset, handling both shapes `gl_FragCoord` arrives in. That took
+`direct_state_access`'s 30 cases from **0/30 to 15/30**.
+
+**A one-layer multisampled array is tiled too.** Conditioning the tiling on
+`array_size > 1` reads like an obvious short-circuit and became a bug the
+moment the shader side keyed on the *declaration* rather than the binding: a
+shader declaring `sampler2DMSArray` over a one-layer texture was flattened
+against a resource that said "not tiled", so the geometry came back all zeros
+and `textureSize` answered `(0, 0, 0)`. A single layer needs no tiling -- the
+allocation is byte for byte what it was -- but every consumer needs the
+bookkeeping. `texture_swizzle` uses a depth of exactly 1, so this was most of
+that group: **5/71 -> 35/71**, which is precisely what the non-array 2DMS
+group scores. The array dimension now costs nothing.
+
+Final scores: `direct_state_access` **349/370**, `texture_view` **5/7**,
+`texture_swizzle`'s 2DMSArray group **35/71**. Every remaining failure in the
+multisample groups is a format WebGPU cannot multisample, the same set
+documented for target 7. `gl44-ms-array-probe` is 6/6 -- the sixth case being
+a view swizzle, which a later pass applies over the instruction the flattening
+rewrote and could quietly have lost.
+
+Superseded: what follows was written before those two fixes. Three hypotheses
+were eliminated first, and they are still worth knowing as the things it was
+*not*:
 it is not the geometry (the probe passes at the CTS's own 2x3x4), not the
 layered-rendering offset (fixed, unchanged result), and not the sampling
 mechanism (the probe fetches every sample by index and matches). What the test

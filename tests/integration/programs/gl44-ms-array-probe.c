@@ -283,6 +283,46 @@ int main(void)
                sampled[1] > 120 && sampled[1] < 138 &&
                sampled[2] > 180 && sampled[2] < 200 && sampled[3] > 250);
 
+    /* A view swizzle on top, which is what KHR-GL45.texture_swizzle's
+     * 2DMSArray group checks and what a flattened fetch could quietly lose:
+     * the swizzle is applied by a later pass, over the instruction this one
+     * rewrote. R <- ALPHA, so the red channel must read the alpha the draw
+     * wrote (1.0), not the red (0.25). */
+    unsigned char swizzled[4] = {0};
+    int swz = 0;
+    if (draw_prog && read_prog) {
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, ms_tex);
+        glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_TEXTURE_SWIZZLE_R,
+                        GL_ALPHA);
+        GLuint flat_tex = 0, flat_fbo = 0;
+        glGenTextures(1, &flat_tex);
+        glBindTexture(GL_TEXTURE_2D, flat_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SIDE, SIDE, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, NULL);
+        glGenFramebuffers(1, &flat_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, flat_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, flat_tex, 0);
+        glViewport(0, 0, SIDE, SIDE);
+        glUseProgram(read_prog);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, ms_tex);
+        glUniform1i(glGetUniformLocation(read_prog, "src"), 0);
+        glUniform1i(glGetUniformLocation(read_prog, "layer"), 1);
+        glBindBuffer(GL_ARRAY_BUFFER, quad);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                     swizzled);
+        swz = glGetError() == GL_NO_ERROR;
+        glTexParameteri(GL_TEXTURE_2D_MULTISAMPLE_ARRAY, GL_TEXTURE_SWIZZLE_R,
+                        GL_RED);
+    }
+    fprintf(stderr, "INFO swizzled=%u,%u,%u,%u ok=%d\n", swizzled[0],
+            swizzled[1], swizzled[2], swizzled[3], swz);
+    result("view_swizzle_survives_flatten", swz && swizzled[0] > 250);
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return 0;
