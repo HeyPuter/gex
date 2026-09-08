@@ -21474,6 +21474,30 @@ ranking worth planning from:
   `gex_wgpu_flat_replay_get` with no edge derivation, plus routing the
   `raster_invalid` draw to it instead of `GEX_DRAW_DROP()`.
 
+  **But not from the varying capture as it stands, and this one would have
+  wasted the whole attempt.** The unfilled replay reads a capture produced by
+  `gex_wgpu_varying_variant_get`, whose module comes from
+  `shader->varying_nir` -- and that clone is taken at line 12059, *after* the
+  strip at 12050. **Its atomics are already rewritten to zero.** Replaying it
+  would rasterise zeros, `result_reaches_raster` would still fail, and it
+  would read as "the replay does not work" rather than "the replay replayed
+  the wrong shader". The existing comment says why it is post-strip: for a
+  geometry or tessellation draw the capture dispatch does the stores, and the
+  varying pass must not do them twice.
+
+  So the shape is: for a `raster_invalid` vertex shader on a draw with no
+  geometry, tessellation or feedback bound, take the varying clone **before**
+  the strip, and let that one pass be *both* the side-effect pass and the
+  capture -- which means the separate capture dispatch must **not** also run
+  for it, or every store happens twice. Then rasterise the captured outputs
+  through the passthrough. Exact, and it reuses two tested mechanisms rather
+  than adding a third.
+
+  **Three silent-failure modes have now been found in this design before
+  writing any of it** -- the indexed-draw slot ambiguity, `pass_flags` not
+  surviving the clone, and this. Each would have produced a plausible wrong
+  answer rather than an error, and each cost one grep.
+
   The acceptance test is already in the tree and already measures the right
   thing: `gl44-vertex-atomic-result` stands at 2 of 3, failing only
   `result_reaches_raster`.
