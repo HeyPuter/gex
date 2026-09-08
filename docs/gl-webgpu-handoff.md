@@ -21417,6 +21417,28 @@ ranking worth planning from:
   silent-wrongness risk that was the reason not to start. Verify it with a
   probe that checks a *named* atomic result per vertex, not merely that the
   draw happened.
+
+  **And the indexed limitation costs nothing for these cases, which was worth
+  checking rather than assuming.** Counting draw calls in the four CTS files
+  that carry the eight candidates:
+
+      gl4cShaderAtomicCountersTests.cpp       20 arrays,  0 elements
+      gl4cShaderStorageBufferObjectTests.cpp  41 arrays,  0 elements
+      gl4cShaderSubroutineTests.cpp            5 arrays,  0 elements
+      gl4cShaderImageLoadStoreTests.cpp       53 arrays, 10 elements
+
+  Three of the four contain **no indexed draw at all**, and the one candidate
+  in the fourth (`advanced-sso-atomicCounters`) draws with
+  `glDrawArraysInstancedBaseInstance` -- instanced, but not indexed. So the
+  exact path serves **all eight**. The instancing is already handled on the
+  clone's side by the `% verts_per_instance` in
+  `gex_wgpu_capture_vertex_slot`, and the rasterising copy has
+  `gl_InstanceIndex`, so the full index is
+  `instance * verts_per_instance + (gl_VertexIndex - FIRST_VERTEX)`.
+
+  **This is now the top conformance item**: up to eight of thirty-six remaining
+  failures, every one of them reachable by the exact route, with the objection
+  that deferred it resolved.
 - **2 -- two capture bindings writable over one range.** The aliasing decline,
   in the capture path.
 - **4 -- adapter limits, and they are real.** `GEX_WGPU_LIMIT_TRACE` says the
