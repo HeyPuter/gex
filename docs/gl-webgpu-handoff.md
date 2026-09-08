@@ -24238,3 +24238,52 @@ like this without disturbing a sweep that is using the real prefix.
 Still worth doing only for the three cases; `double` vertex attributes are
 rare in practice because GPUs handle them slowly, so applications convert on
 the CPU.
+
+## The atomic-counter lead, part-diagnosed (2026-09-08)
+
+`shader_atomic_counter_ops_tests` is **3/4**, and the failing case is
+`AdditionSubstraction` alone — MinMax, Bitwise and Exchange pass. The lead in
+this file records its cause as "Binding doesn't exist in
+[BindGroupLayoutInternal] for @group(1) @binding(32)". What that turned out to
+be is worth writing down, because two of my three hypotheses were wrong and
+the third is unfinished.
+
+**The reproducible failure is the return value**, not the binding:
+
+    Result of atomic operation return value was different than expected
+    (atomicCounterAdd)
+
+which is the shape `raster_invalid` and the atomic-result replay exist for: a
+vertex shader that *uses* what a storage atomic returned has no rasterising
+form, so the driver keeps a pre-strip clone (`replay_nir`), rewrites the
+result to zero in the rasterising copy, and replays the real one as compute.
+The wrong value means the replay's answer is not reaching the draw.
+
+**The binding error is intermittent.** It appears on some runs and not others
+against the *same* binary — I have three consecutive runs with none and two
+with one. So it is order- or allocation-dependent, which is the cache-collision
+shape [[pipeline-cache-keys-on-addresses]] describes, except that memory says
+the class is browser-only because emdawnwebgpu takes no reference on a handle.
+This is native. Either that reasoning has a native counterpart or the
+intermittency has another cause; **I did not settle it.**
+
+**Two hypotheses I killed, so nobody repeats them:**
+
+- *A shader-module label changed the outcome.* It does not. I added labels,
+  measured "0 binding errors" three times, then "1" twice without them, and
+  nearly recorded a causal claim. Counting **all** `WebGPU error` lines
+  instead of grepping for the message text showed **3 in both builds** — the
+  errors were always there. The A/B was luck on both sides, and the check that
+  caught it is the one [[a-passing-test-can-still-poison]] already prescribes.
+- *A dispatch fails to bind the shader's own storage blocks.* Of six
+  vertex-capture dispatches, only `gs_draw` and `atomic_replay_draw` call
+  `gex_wgpu_bind_stage_ssbos`; `line_draw`, `tess_draw`, `capture_positions`
+  and `flat_unfilled_draw` do not. That looks like
+  [[the-helper-exists-and-nobody-calls-it]] and may well be a real latent gap
+  — but none of those four is the failing dispatch here, and the side-effect
+  capture (`gex_wgpu_capture_dispatch`) *does* bind them. **Worth auditing on
+  its own merits; it is not this bug.**
+
+Also noticed while reading: `gex_wgpu_capture_dispatch` hardcodes
+`texture.multisampled = false` for its capture images, the same shape as the
+compute-sampler defect fixed today. Untested, no case attributed to it.
