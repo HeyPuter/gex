@@ -22,6 +22,14 @@
  *   `last_wins`       after the loops, one more rebind and draw, to catch a
  *                     rebind that is only applied on the *next* draw rather
  *                     than this one -- an off-by-one in the state flush
+ *   `rebind_vertex`   the same three rebinds with the block read in the
+ *                     **vertex** stage instead of the fragment one. This is
+ *                     the shape switchBuffers actually has -- its shader
+ *                     reads the quad's *positions* out of the block, which is
+ *                     why a stale binding leaves the quadrant black rather
+ *                     than the wrong colour -- and the two stages bind
+ *                     storage through different groups, so passing one says
+ *                     nothing about the other
  *
  * Each draw reads its value into the colour target and is read back
  * immediately, so a wrong answer names which draw was wrong rather than
@@ -42,6 +50,51 @@ static void result(const char *name, int ok) {
     ++cases;
     if (ok) ++passed;
     printf("CASE %s %s\n", name, ok ? "PASS" : "FAIL");
+}
+
+/* The same read, moved to the vertex stage and carried across flat. */
+static GLuint build_vertex_read(void) {
+    static const char *vs_src =
+        "#version 430 core\n"
+        "layout(std430, binding = 0) buffer Src { uint v[4]; } s;\n"
+        "flat out uint seen;\n"
+        "void main() {\n"
+        "  seen = s.v[0];\n"
+        "  vec2 p = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0,\n"
+        "                (gl_VertexID & 2) == 0 ? -1.0 : 1.0);\n"
+        "  gl_Position = vec4(p, 0.0, 1.0);\n"
+        "}\n";
+    static const char *fs_src =
+        "#version 430 core\n"
+        "flat in uint seen;\n"
+        "out vec4 colour;\n"
+        "void main() { colour = vec4(float(seen) / 255.0, 0, 0, 1); }\n";
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &vs_src, NULL);
+    glCompileShader(vs);
+    GLint ok = 0;
+    glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[900] = {0};
+        glGetShaderInfoLog(vs, sizeof(log) - 1, NULL, log);
+        fprintf(stderr, "INFO vertex-read vs compile: %s\n", log);
+        return 0;
+    }
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &fs_src, NULL);
+    glCompileShader(fs);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[900] = {0};
+        glGetProgramInfoLog(prog, sizeof(log) - 1, NULL, log);
+        fprintf(stderr, "INFO vertex-read link: %s\n", log);
+        return 0;
+    }
+    return prog;
 }
 
 static GLuint build(void) {
@@ -187,6 +240,34 @@ int main(void) {
     fprintf(stderr, "INFO last got=%u want=30 err=0x%04x\n", last,
             (unsigned)glGetError());
     result("last_wins", last == 30);
+
+    /* And the shape switchBuffers has: the block read in the vertex stage.
+     * The two stages bind storage through different groups, so the cases
+     * above passing says nothing about this one. */
+    GLuint vprog = build_vertex_read();
+    int vertex_ok = 0;
+    if (vprog) {
+        glUseProgram(vprog);
+        vertex_ok = 1;
+        for (int i = 0; i < 3; ++i) {
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bufs[i]);
+            const unsigned got = draw_and_read();
+            const unsigned want = 30u * (i + 1);
+            fprintf(stderr, "INFO vertex buffer %d got=%u want=%u\n", i, got,
+                    want);
+            if (got != want) vertex_ok = 0;
+        }
+        for (int i = 0; i < 3; ++i) {
+            glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, one,
+                              (GLintptr)i * STRIDE, 16);
+            const unsigned got = draw_and_read();
+            const unsigned want = 40u * (i + 1);
+            fprintf(stderr, "INFO vertex range %d got=%u want=%u\n", i, got,
+                    want);
+            if (got != want) vertex_ok = 0;
+        }
+    }
+    result("rebind_vertex", vertex_ok);
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
