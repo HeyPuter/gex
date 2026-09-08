@@ -21493,6 +21493,52 @@ ranking worth planning from:
   through the passthrough. Exact, and it reuses two tested mechanisms rather
   than adding a third.
 
+  ### First implementation attempt: reverted, and where it got to
+
+  **The plumbing works; the capture pass performs no side effects.** Written,
+  routed and reverted 2026-09-07. The scaffolding it needs is committed
+  separately and is behaviour-neutral, so a second attempt starts from there
+  rather than from nothing.
+
+  What was built: `gex_wgpu_atomic_replay_draw`, modelled on
+  `gex_wgpu_flat_unfilled_draw`, using `gex_wgpu_line_varyings` for the layout
+  (position plus every varying the fragment shader reads -- general despite the
+  name), `gex_wgpu_flat_replay_get(ctx, &varyings, 0, false)` for the
+  passthrough (**flat mask zero is the plain per-vertex table**: every slot
+  reads buffer zero at its own offset, which the comment on that function
+  states outright), and `gex_wgpu_varying_variant_get(..., replay=true)` for
+  the compute module.
+
+  **It is reached and it runs.** `GEX_WGPU_REPLAY_LOG` prints
+  `atomic-result replay verts=4 record=32 slots=2 mode=5` on a four-vertex
+  strip, so the layout, the passthrough, the capture buffer and the replay
+  draw are all in place.
+
+  **But the capture pass executes nothing.** The counter does not move at all
+  -- zero increments where four are expected -- and the recorded SSBO slots
+  keep their pre-draw values. Binding the vertex shader's own storage blocks
+  into descriptor set one (`gex_wgpu_bind_stage_ssbos`, which the capture
+  dispatch does and the unfilled replay never needed because a plain vertex
+  shader has none) did **not** change it. So the cause is upstream of the
+  bindings.
+
+  **Do not guess the next step -- look at the module.** The remaining
+  candidates are all visible in the emitted code: whether the atomic survives
+  `gex_wgpu_varying_variant_get`'s lowering chain at all
+  (`gex_wgpu_capture_input`, `gex_wgpu_capture_builtin`, the varying stores,
+  `nir_lower_returns`, `nir_lower_global_vars_to_local`,
+  `nir_lower_vars_to_ssa`, `nir_opt_dce`), and whether `state.failed` is set so
+  the builder returns a module built from a half-lowered shader. Dump the
+  variant's NIR and its WGSL before changing anything, the way
+  `once-per-process-diagnostics-break-ab` prescribes for rejected SPIR-V.
+
+  **And note the routing hazard the attempt exposed.** Because the replay
+  returns true and drops the draw, it *replaces* the capture dispatch -- so
+  when its own pass does nothing, the side effects are lost as well as the
+  picture. That is strictly worse than declining. Any second attempt must
+  either verify the capture pass ran or keep the dispatch as a fallback; the
+  probe's `side_effect_happened` case is what catches it, and it did.
+
   **Three silent-failure modes have now been found in this design before
   writing any of it** -- the indexed-draw slot ambiguity, `pass_flags` not
   surviving the clone, and this. Each would have produced a plausible wrong
