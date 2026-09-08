@@ -4912,6 +4912,15 @@ fail and are not defects.
 
 `packed_pixels` (4732 cases) and `shaders` (2397) have not been swept yet.
 
+> **Superseded.** Both were swept later: `shaders` is 2388/8 and
+> `packed_pixels` passes whole -- see "`packed_pixels` passes, all 4732 cases"
+> further down, and the re-score on 2026-09-08. This line is left in place
+> because deleting it would hide the trap: it was read as current a week
+> later, and a partial run that had been abandoned on a bad time estimate was
+> taken as evidence the family was still unmeasured. **When a section says a
+> family is unmeasured, search the file for the family name before believing
+> it** -- a later section may already have answered.
+
 ### `texture_swizzle`: vertex-stage integer sampling
 
 Not a swizzle bug at all. The failures are `Failed to link program`, and
@@ -23833,6 +23842,27 @@ Left alone for now: two cases, and `double` vertex attributes are rare in
 practice because GPUs handle them slowly, so applications convert on the CPU.
 Recorded because the *unification* is the useful part — anyone picking up
 `fp64.varyings` is picking up these two as well.
+
+### What the families cost to run, measured
+
+Two estimates in this file were wrong in opposite directions, and both changed
+what got worked on, so here are the measured rates:
+
+| family | rate | whole family |
+| --- | --- | --- |
+| `packed_pixels.rectangle` | ~36 cases/s | 1578 cases in ~45 s |
+| `packed_pixels.varied_rectangle` | ~1 case/s | ~26 min |
+| `copy_image` | **~78 s/case** | ~7 hours |
+
+`packed_pixels` had been written off at "5.6 hours" from a partial run's rate.
+The rate is not uniform across a family -- `rectangle` is forty times faster
+per case than `varied_rectangle` -- so extrapolating a whole family from its
+first two hundred cases is unsound in either direction. Sample the *subgroups*.
+
+`copy_image` genuinely is prohibitive: ten cases in 783 seconds, with zero
+failures in the 43 measured across two attempts. It walks a format matrix
+against 2D-array and renderbuffer targets. Worth finishing only unattended,
+and it is the one family in the suite that deserves the label.
 
 ### Leads with causes named
 
