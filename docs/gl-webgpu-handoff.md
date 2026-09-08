@@ -23266,6 +23266,42 @@ inside a compute-emulated tessellation stage, "sampled image must have float
 component type", which is the same shape `deferred_integer_sampling` handles
 for the graphics stages.
 
+### Integer samplers in the tessellation stages
+
+Behind the `stencil_texturing` decline was a second defect, and it is the more
+general one: neither tessellation stage could sample an integer texture.
+
+WGSL cannot sample one, so the driver replaces the sample with a fetch that
+applies the wrap, filter, swizzle and level range itself -- all bound state,
+which is why the module has to be a per-draw variant rather than something the
+base module carries. The graphics stages have that (`deferred_integer_sampling`)
+and so does the geometry stage (`gex_wgpu_gs_module`). The two tessellation
+stages did not, and they failed differently, which is worth knowing because
+only one of them is visible from a pixel:
+
+- the **control** shader was rejected at *link* time. A base module cannot
+  compile -- "sampled image must have float component type" -- and a failure in
+  `create_tcs_state` refuses the whole shader, so `GL_LINK_STATUS` came back
+  false and an application that checks it stops there. No draw, no pixel, no
+  message beyond the link log.
+- the **evaluation** shader linked and then declined every draw, for the same
+  compile failure one level down. It read zero.
+
+The control stage now keeps its NIR and has a variant list, mirroring the
+geometry stage; the evaluation stage already had variants keyed on the
+producer's layouts, so the texture key joins them there. Neither key is looked
+at for a shader that samples no integer texture.
+
+The geometry path's key comparison and fill are now
+`gex_wgpu_texture_keys_match`/`_fill`, shared by all three -- it was written
+longhand once and was about to be written twice more; see
+[[the-helper-exists-and-nobody-calls-it]].
+
+`gl44-stage-integer-sampler-probe` asks all three stages and checks for a live
+program **as well as** the right value, because a shader that fails to link and
+one that links and reads zero are indistinguishable from the pixel alone.
+3/3 now against 1/3 before, natively and in the browser.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
