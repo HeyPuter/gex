@@ -22394,3 +22394,35 @@ survived both sweeps because a *compile* failure reads as fatal.
 Removing it also needed care: `gex_wgpu_compile_nir` owns the NIR it is handed
 and frees it on both paths, so the `ralloc_free` added beside the decline was a
 double free and tripped ralloc's canary.
+
+## shaders and shaders30: 3048 cases, one defect
+
+Two families measured for the first time. `shaders30` is **651/651**.
+`shaders` was **2388/2397** and is now **2396/2397**, the remaining case an
+honest `NotSupported` (`shader_integer_mix.prototypes`).
+
+All nine failures were one message -- `Tint rejected SPIR-V: error: unresolved
+call target 'isNan'` -- across all eight
+`shaders.struct.local.{basic,nested}_{not_,}equal` cases, in both stages.
+
+**The struct comparison was not the cause.** ntv recognises `x != x` as a NaN
+test and emits `OpIsNan` for it, and comparing two structs whose members hold
+the same values is precisely what leaves CSE with a single SSA value on both
+sides of the member comparison. So a construct with no NaN anywhere in it
+compiled to a NaN test, and WGSL has no `isNan` builtin -- it was removed from
+the language -- while Tint's reader emits a call to one anyway.
+
+The recognition is an optimisation, not a semantic requirement, and that is
+what makes the fix a one-liner rather than a lowering pass: an **ordered**
+float comparison is already false when either operand is NaN, so
+`OpFOrdEqual(x, x)` is exactly `!isnan(x)` and `OpFUnordNotEqual(x, x)` is
+exactly `isnan(x)`. The new `avoid_spv_isnan` flag takes ntv's general path,
+which costs one instruction and says the same thing. zink keeps the
+optimisation.
+
+Worth noting as a search pattern: this defect was invisible from the failing
+test's *name*. Nothing about "struct equality" suggests NaN, and a fix aimed
+at struct comparison -- lowering aggregate `==` component-wise, say -- would
+have been wasted work on a path that was already correct. The Tint message
+named the real construct, and grouping the eight failures by message rather
+than by test name is what made it one item instead of eight.
