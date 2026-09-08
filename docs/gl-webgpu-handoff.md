@@ -22256,3 +22256,39 @@ case needs two inputs or a decline.
 **How much it is worth is unmeasured**: 46 cases fail, an unknown share of
 them for the arbitrary-offset reason that cannot be served. Count the cases
 that use only `interpolateAtSample` with the current sample before estimating.
+
+## The fifth 64-bit construct is a variable, not an operation (2026-09-07)
+
+`gpu_shader_fp64` measures **658/659**, and its single failure names something
+that unifies two findings kept apart until now.
+
+`gpu_shader_fp64.fp64.varyings` fails with
+
+    Tint rejected SPIR-V: error: unhandled float width: 64
+
+which is the *same* message as `vertex_attrib_binding`'s three `inputL`
+failures. `sixty-four-bit-is-four-constructs` records that this driver's
+64-bit lowering covers **ALU, register, phi and undef** -- all of them
+*operations*. Both remaining fp64 failures in everything measured so far are
+the fifth construct: a 64-bit **shader in/out variable**, which no
+arithmetic lowering can reach because there is no arithmetic to rewrite.
+
+**And the varying half is the tractable one.** GL requires a double varying to
+be `flat` -- there is no interpolation of doubles -- so splitting a `dvec`
+varying into two 32-bit uint varyings and repacking in the consumer is
+**exact**, not an approximation. The driver already carries a value across two
+varying slots elsewhere: the merged clip/cull array spans two, per
+`merged-clip-cull-array-spans-two-slots`. The budget is the inter-stage
+variable count, 31, and a dvec4 costs two slots -- so a shader with a handful
+of double varyings fits comfortably.
+
+That is unlike the **attribute** half, which is blocked by arithmetic that does
+not fit: a `dvec3`/`dvec4` needs two *vertex attributes* each, the CTS cases
+use eight `dvec4`s, and sixteen attributes is exactly WebGPU's guarantee with
+no headroom (see the 64-bit vertex attribute section above).
+
+**So the two look identical in the log and are not the same job.** One case,
+and it would take `gpu_shader_fp64` to 659/659; the other three need attribute
+splitting at the limit and are not worth it. Reading them as one item -- which
+the shared error message invites -- would either overestimate the work or
+underestimate it, depending on which end you started from.
