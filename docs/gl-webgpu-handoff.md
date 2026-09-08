@@ -23357,6 +23357,12 @@ that reason.
 Packing 128 components into 31 locations is not possible, and `GEX_WANT`
 already asks for 32 and is clamped.
 
+**Done 2026-09-08 — and the reward below was overstated. See "The emulated
+stages' passthrough reads records as storage" at the end of this file: the
+three behavioural wins are real, but it is 116 → 124, not 128, and neither
+limits case moved. The paragraph is kept because its reasoning about *why* the
+attribute bound existed is still the right description of the old code.**
+
 **A lead, not attempted: the geometry and evaluation stages' outputs.** Both
 hand their varyings to the generated passthrough vertex shader, which reads
 them back as vertex **attributes** -- so `maxVertexAttributes - 1` bounds them,
@@ -23902,3 +23908,99 @@ and it is the one family in the suite that deserves the label.
 - `shader_atomic_counter_ops_tests.ShaderAtomicCounterOpsAdditionSubstraction`:
   "Binding doesn't exist in [BindGroupLayoutInternal]" for @group(1)
   @binding(32).
+
+## The emulated stages' passthrough reads records as storage (2026-09-08)
+
+This was the last item in this file's "parked, with its shape" list, and it is
+done. The rationale, the four defects behind it and the measured outcome are in
+the commit and beside `GEX_WGPU_PASSTHROUGH_BINDING`; what belongs here is what
+it did and did *not* buy, because the price in that parked note was wrong.
+
+A geometry or evaluation shader is emulated as a compute pass writing a record
+buffer, rasterized by a generated passthrough vertex shader. That shader read
+the buffer as a **vertex buffer** — one vec4 attribute per varying at a fixed
+stride — and now reads it as read-only **storage**, indexed by `gl_VertexID`,
+which WebGPU gives an indexed draw as the index *value*: the same number the
+fixed-function fetch used to scale by the stride.
+
+**What it bought.**
+
+- The output count stops being bounded by vertex attributes.
+  `MAX_GEOMETRY_OUTPUT_COMPONENTS` and `MAX_TESS_EVALUATION_OUTPUT_COMPONENTS`
+  were 116, which is `4 x (maxVertexAttributes - 1)`. They are **124** now,
+  which is `4 x maxInterStageShaderVariables` — the same number, and now the
+  same *cause*, as `MAX_FRAGMENT_INPUT_COMPONENTS`.
+- Wide points stop degrading. A passthrough with no attributes leaves every
+  one free for the point expansion's corner buffer, so
+  "points drawn one pixel wide (no free vertex attribute)" is gone. That
+  needed de-indexing the **records** the way `gex_wgpu_gather_indexed_vertices`
+  already de-indexes vertex buffers, since the rasterizing draw is indexed.
+- The vertex layout and its slot-compaction mapping are gone from both stages.
+  A skipped slot used to renumber every element after it, and getting that
+  wrong silently dropped every varying declared after a `gl_Layer` write. That
+  bug is no longer expressible.
+
+**What it did not buy, and the estimate that was wrong.** The parked note said
+"two cases plus 116 → 128". It is 116 → **124**, and the two `limits` cases
+still fail. The reason is structural rather than incidental: the geometry and
+evaluation stages' outputs go through the passthrough to the *fragment* stage,
+so they occupy a rasterized interface however they arrived, and that interface
+is 31 variables natively (28 in the browser) where GL wants 32. Only the
+*control* shader's outputs escape a rasterized interface, which is why that one
+reached 128 and these cannot.
+
+So `limits` is still 136/4 — but three of those four now name one platform
+ceiling instead of two unrelated ones, and the driver no longer has an
+attribute ceiling in a path that has nothing to do with attributes. **A wall
+named correctly is worth more than a wall moved**, and that is the honest
+summary of this change's conformance value. Its real value is the two
+behavioural wins and the machinery deleted.
+
+The flat-unfilled replay still reads attributes and must: its trick is two
+vertex buffers over one capture at two offsets, so flat varyings come from the
+provoking vertex's record while the position comes from the edge's own. There
+is no single record index to look up there.
+
+### And an overdraw the refactor put me next to
+
+Working in that path turned up something older and worse. Both emulated stages
+unroll instancing into their capture — the index list covers every instance —
+and then the rasterizing draw did `raster = *info` and never reset
+`instance_count`. Every instance's geometry was drawn `instances` times.
+
+Two instances of a triangle each writing 0.25 read **1.0** where llvmpipe reads
+0.5. Fixed with one line in each path.
+
+**Nothing in the suite could see it**, and that is the part to remember. The
+extra copies land exactly on top of the originals, so opaque geometry in the
+same place is indistinguishable from one copy: `gl44-gs-topology-probe`'s
+`instanced` case passes either way, and so do `geometry_shader` 136/136,
+`tessellation_shader` and `cull_distance`. Additive blending is what separates
+them — `glBlendFunc(GL_ONE, GL_ONE)` with a fixed 0.25 per fragment makes the
+pixel *count the draws*. `gl44-gs-instanced-blend-probe` is the guard, and I
+verified it by disabling each half of the fix in turn and confirming the
+matching two cases failed.
+
+Generalisation worth carrying: whenever this driver rewrites one draw into
+another, ask which fields of `pipe_draw_info` the new draw should *not*
+inherit. `instance_count`, `start_instance` and `index_bias` all mean something
+different once the geometry has been captured. And **a path that replays or
+expands geometry needs at least one blended case**, because an overdraw is
+invisible to every opaque test in the suite.
+
+### OBS is the sixth verified real application
+
+Not a driver finding, but it was sitting in `app-candidates.sh` reported as
+NO-DRIVER, and both reasons were the harness. OBS records a crash marker in its
+config directory and *every* `timeout -s KILL` the script delivers leaves one,
+so the next run opened the "did not properly shut down" dialog; it gets a
+throwaway `XDG_CONFIG_HOME` now. And `--minimize-to-tray` compiled zero shaders
+because with no window there is no preview to render.
+
+With its window visible and a fresh config it compiles five shaders with no
+refusals, reports `4.6 (Core Profile) ... shading language 4.60`, and its frame
+differs from llvmpipe's by 106 pixels — the `CPU: n%` readout. The preview
+region's mean difference is exactly zero. Its two offset black rectangles are
+OBS's own preview compositing and appear identically on the reference, which is
+worth stating because that is exactly the shape one would otherwise open an
+investigation into.
