@@ -23211,6 +23211,61 @@ source's bit k is clear. Worth doing only if something real asks; a scissored
 or scaled *stencil* blit is rare, and the unscaled unscissored one already
 works through the whole-subresource copy.
 
+### The fourth stencil spelling, and an unformatted image that must not be packed
+
+Two findings from the depth/stencil families, one landed and one deliberately
+not.
+
+**Landed.** Gallium spells the stencil aspect of a packed depth-stencil
+texture as a separate stencil-only format, and there are *four* of them --
+`X24S8_UINT`, `S8X24_UINT`, `X32_S8X24_UINT` and plain `S8_UINT`, which is
+exactly what `util_format_stencil_only` can return.
+`gex_wgpu_is_stencil_only_format` listed three. So ARB_stencil_texturing
+worked on depth24-stencil8 and was refused outright on depth32float-stencil8:
+
+    sampler view refused (shape or format) format=x32_s8x24_uint
+    texture=z32_float_s8x24_uint
+
+Three of four is the shape to grep for; see
+[[the-helper-exists-and-nobody-calls-it]]. No CTS case moved --
+`packed_depth_stencil` is 23/2 either way -- so the guard is
+`gl44-stencil-texture-probe`, which asks both packed formats because the
+asymmetry is invisible from either one alone.
+
+**Not landed, and worth reading before trying it.** `gex_wgpu_image_is_packed`
+returns false for an unformatted image that is not a buffer, one line away
+from the buffer branch that handles the same situation. The obvious fix is to
+make them agree -- GLSL permits an absent format qualifier only on a
+write-only image, the format comes from the image *unit* at draw time, and
+`packed_unformatted` already exists to resolve it there. It was tried and
+measured: `shader_image_load_store` went **39 to 36**.
+
+The first guess was the storage-buffer budget -- a packed image costs one
+storage buffer plus a shared header, and this adapter takes ten per stage, and
+two of the new failures did say so. A budget test that only packed when the
+whole image set would fit was written, and did not restore the three cases.
+
+The actual cause is worse. `advanced-sso-simple` declares the same four images
+**twice**, once `rgba32f` and once with no qualifier -- and rgba32f *is* a
+WebGPU storage format. Packing only the unformatted declaration gives one
+image two representations at once: writes land in a storage buffer while reads
+come from the storage texture, and nothing carries them across. Wrong results,
+not declines, which is why the budget looked like the answer.
+
+Serving it properly means deciding packed-or-not **per draw**, from the format
+the unit resolves to, so an image whose format turns out to be storable keeps
+the storage texture and stays consistent with every other declaration of it.
+That is a module variant, because which path an image takes decides its
+bindings, and there is no precedent for one: a buffer image is always packed,
+so only its *format* has ever needed per-draw resolution.
+
+What it costs meanwhile is `KHR-GL45.stencil_texturing`, which writes stencil
+through a write-only `uimage2D` backed by r8ui -- a format WebGPU cannot
+store. Behind that decline is a second one already visible: an integer sampler
+inside a compute-emulated tessellation stage, "sampled image must have float
+component type", which is the same shape `deferred_integer_sampling` handles
+for the graphics stages.
+
 ### Leads with causes named
 
 - `framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test`: was
