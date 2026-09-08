@@ -21440,6 +21440,46 @@ ranking worth planning from:
   failures, every one of them reachable by the exact route, with the objection
   that deferred it resolved.
 
+  ### Better: replay the capture, and the numbering problem disappears
+
+  **Found 2026-09-07, and it supersedes the per-atomic record design below.**
+  The driver already captures a plain vertex shader's outputs and rasterises
+  from that capture with a generated passthrough: `gex_wgpu_flat_replay` is,
+  by its own comment, "the passthrough vertex shader and element table that
+  redraw an unfilled polygon's edges **from a capture of the vertex shader's
+  output**", built by `gex_wgpu_flat_replay_get` and driven from
+  `gex_wgpu_flat_unfilled_draw`.
+
+  So an unrasterisable vertex shader does not need its atomic re-run at all.
+  The compute clone already computes everything correctly -- atomics, stores,
+  control flow -- and already writes the outputs. Rasterising from those
+  recorded outputs is **exact**, because they are literally what the vertex
+  shader produced.
+
+  **Why this is the better design:**
+  - **no numbering** -- nothing has to agree about which slot belongs to which
+    atomic, so the whole `pass_flags`/re-walk problem below is moot;
+  - **every atomic kind** -- image, SSBO, counter, swap: the clone runs the
+    real shader, so the mechanism is indifferent to what is in it;
+  - **indexed draws too** -- `gex_wgpu_capture_vertex` already resolves the
+    slot through the index table, which is what made the read-back design
+    ambiguous for them. Replaying the capture has no such ambiguity, so the
+    "non-indexed only" restriction goes away;
+  - **the cost is already paid** -- the capture dispatch runs for these shaders
+    today; only the passthrough draw is new.
+
+  **What has to be built** is narrower than the unfilled case it borrows from:
+  that one derives *edges* and lerps along them, while this needs the original
+  topology drawn straight from slot i for vertex i. So it is
+  `gex_wgpu_flat_replay_get` with no edge derivation, plus routing the
+  `raster_invalid` draw to it instead of `GEX_DRAW_DROP()`.
+
+  The acceptance test is already in the tree and already measures the right
+  thing: `gl44-vertex-atomic-result` stands at 2 of 3, failing only
+  `result_reaches_raster`.
+
+  **The per-atomic record design, kept for its analysis rather than as a plan.**
+
   **How to number the atomics, which is the part that can go silently wrong.**
   The two copies must agree on which recorded slot belongs to which atomic. The
   obvious mechanism does **not** work: `nir_instr::pass_flags` looks made for
