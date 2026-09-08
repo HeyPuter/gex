@@ -155,9 +155,18 @@ export class MesaGlDevice {
         // and sizes the GL limit from that, so asking here is the whole of
         // it; the clamp below keeps the request inside the adapter.
         maxInterStageShaderVariables: 32,
-        maxStorageBuffersPerShaderStage: 16,
-        maxStorageBuffersInVertexStage: 16,
-        maxStorageBuffersInFragmentStage: 16,
+        // 24 is GEX_WGPU_MAX_SHADER_BUFFERS, the driver's own array bound, so
+        // there is nothing to gain by asking for more and nothing to lose by
+        // asking for this much: Math.min below clamps to the adapter.
+        //
+        // Asking for 16 got exactly 16 and
+        // shader_image_load_store.multiple-uniforms still failed with
+        // "17 storage buffers, the device takes 16 per stage" -- the ask was
+        // the constraint, not the adapter. Images share this ration with
+        // storage blocks, which is how a shader reaches seventeen.
+        maxStorageBuffersPerShaderStage: 24,
+        maxStorageBuffersInVertexStage: 24,
+        maxStorageBuffersInFragmentStage: 24,
         // Shader images. The native path asks for these in
         // gex_wgpu_native.c and this list did not ask at all, so the browser
         // got WebGPU's guaranteed *four* per stage where native gets eight --
@@ -190,7 +199,18 @@ export class MesaGlDevice {
         // Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
         // sample, so any wider attachment set fails on it -- GL 3.2 wants
         // eight draw buffers of whatever format the application chose.
-        maxColorAttachmentBytesPerSample: 64,
+        //
+        // 128, not 64, because that is GL's actual worst case: eight draw
+        // buffers of RGBA32F at sixteen bytes each. Asking for 64 got 64 --
+        // the adapter was never the constraint -- and
+        // direct_state_access.framebuffers_draw_buffers still lost its fifth
+        // target, in the browser as well as natively:
+        //
+        //   colour target 4 dropped: the attachments exceed 64 bytes per sample
+        //
+        // The Math.min below still clamps to whatever the adapter really
+        // offers, so this asks for GL's requirement and takes what it can get.
+        maxColorAttachmentBytesPerSample: 128,
         // Compute, which the native path has asked for since GL compute
         // landed and this one did not: st/mesa gates ARB_compute_shader behind
         // a granted maxComputeInvocationsPerWorkgroup of 1024 and WebGPU's
