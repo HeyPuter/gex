@@ -22426,3 +22426,80 @@ at struct comparison -- lowering aggregate `==` component-wise, say -- would
 have been wasted work on a path that was already correct. The Tint message
 named the real construct, and grouping the eight failures by message rather
 than by test name is what made it one item instead of eight.
+
+## Nine more families, and what grouping by message found
+
+555 cases across nine previously unmeasured families. Four are clean:
+`layout_location` 35/35, `clear_tex_image` 78/78, `texture_repeat_mode`
+162/162, `internalformat` 39/52 with 13 honest skips.
+
+The 25 failures held **no driver refusal message at all** -- every one was a
+wrong result or a rejected command buffer, not a decline. That is a different
+category from the usual sweep and it is worth checking for on its own: a
+refusal is loud and a wrong answer is not.
+
+### draw_indirect: an indirect draw cannot know its instance count yet
+
+68/70 -> **70/70**. Both failures lost their entire command buffer:
+
+```
+Instance range (first: 0, count: 4) requires a larger buffer (64)
+than the bound buffer size (32) of the vertex buffer
+```
+
+`glVertexAttribDivisor(2, 3)` with four instances reads only elements 0 and 1,
+both in bounds. WebGPU's stepMode advances one element per instance and has no
+divisor, so the buffer has to be de-interleaved first --
+`gex_wgpu_expand_instance_divisors` does exactly that, and was never reached.
+
+Its guard was `draw_depth == 0`, "the outermost draw", protecting against the
+restart and multi-draw splits indexing an already-expanded buffer by
+`i / divisor` twice. **For an indirect draw the outermost level is the wrong
+place to ask**: the instance count is in the argument buffer, so
+`info->instance_count` is still one there, the expansion declines, and the
+resolved draw `util_draw_indirect` reissues arrives one level down -- where the
+depth test refused to expand at all.
+
+The guard is now "nothing above us expanded", and only a *successful*
+expansion closes the door: a level that declined because it could not yet know
+the count leaves a deeper one free to try.
+
+### texture_border_clamp: the lowering served one shape out of three
+
+25/32 -> **28/32**. `gex_wgpu_lower_nearest_border_instr` accepted only
+non-array 2D and returned `false` for everything else -- not through
+`gex_tex_lower_fail`, so nothing was logged and `CLAMP_TO_BORDER` silently
+became a clamp to edge. That was all seven failures.
+
+The arithmetic was already per-axis; it needed a spatial count. A 2D array's
+layer is deliberately *not* bordered -- GL selects it rather than wrapping it
+-- so only a 3D texture gets the third axis.
+
+The four `Texture3D*` cases still fail and the CTS names the case exactly:
+
+```
+Wrong value for layer (6) at point (x,y) = (128,128), component (0)
+Expected value [255]  Result value [0]
+```
+
+Layer 6 of a depth-6 texture is outside in r, so it must read the border --
+and it is the **only** layer that can reveal the border colour, which is why
+the other seven rendered images match the reference pixel for pixel. The
+lowering is reached and correct for it (`s=1 t=1 r=1 dim=3D coords=3
+spatial=3 colour=255,255,255,255`) and its swizzle tail carries the bordered
+result through, so the next step is the test's own sampling shader.
+
+### Still open, with the cause named
+
+- **`shader_image_size`** 32/74, 6 failures, all `unknown SPIR-V builtin: 7`.
+  Builtin 7 is `PrimitiveId`: the fragment-stage cases index their result
+  image by `gl_PrimitiveID`, and WGSL has no such builtin. Serving it means
+  synthesising a per-vertex primitive-index attribute for the draw and
+  carrying it as a flat varying -- exact for every primitive type and for
+  indexed draws, which a vertex-shader formula is not, because `gl_VertexIndex`
+  is the index *value* and not the element position.
+- **`texture_cube_map_array`** 17/27, one case on `unknown SPIR-V builtin: 9`
+  (`Layer`, read in a fragment shader) -- the same shape of gap, and the
+  driver already routes `gl_Layer` by viewport for the writing side.
+- **`packed_depth_stencil`** 23/25, both failures an invalid render pipeline
+  inside a `u_blitter` depth-stencil blit.
