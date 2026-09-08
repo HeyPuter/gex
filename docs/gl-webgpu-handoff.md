@@ -22730,3 +22730,75 @@ wide multisampled 2D texture holding the layers side by side, with
 `texelFetch(ivec3(x,y,l),s)` rewritten to `texelFetch(ivec2(x + l*W, y), s)`
 and the per-layer viewport offset by `l*W`. Establish which of the two applies
 before writing either.
+
+## Multisampled array textures work, tiled side by side
+
+The 96-case wall is built. `GL_TEXTURE_2D_MULTISAMPLE_ARRAY` is held as one
+multisampled 2D texture `L * width` across, with layer `l` at `x + l * width`.
+
+**The design was forced, and knowing which way took one measurement.** The
+cheap emulation -- keep the array texture, give the shader per-layer 2D views
+-- needs an array texture to view, and Dawn will not make one:
+
+```
+The depthOrArrayLayers (3) of a multisampled texture is not 1.
+```
+
+Getting that answer needed the shader refusal out of the way first, because it
+fired before anything touched the allocation: `gl44-ms-array-probe` never
+mentions `sampler2DMSArray` for exactly that reason. Tiling turns out to be
+the better design anyway -- one binding rather than one per layer, a *dynamic*
+layer index costing an add rather than an unrolled switch, and none of the
+sixteen-sampled-texture budget spent on layers.
+
+Six places know about it, and the list is worth keeping because it is short:
+
+| where | what |
+|---|---|
+| creation | one wide texture, one array layer; refused honestly when `L * width` passes the device maximum |
+| attachment | `baseArrayLayer` 0 always -- the layer moves into the viewport |
+| viewport/scissor | one place, after both are in GL's tile-relative coordinates. The **scissor-disabled** branch wants the tile, not the attachment, or a draw writes across every layer |
+| clear | `loadOp` covers a whole view and a view cannot be a sub-rectangle, so u_blitter's scissored draw-clear is used instead |
+| resolve | same argument for `resolveTarget`; u_blitter's textured resolve instead |
+| shaders | `gex_wgpu_flatten_ms_array` rewrites the coordinate and the declaration, in **both** the fragment and the vertex variant |
+
+Three things made the shader half reachable at all, and each announced itself
+as something else first:
+
+- The base module cannot exist for such a shader -- the tile width comes from
+  the bound texture -- so `ms_array_slots` joins `deferred_integer_sampling`.
+  Until it did, the blitter's own resolve shader was rejected at *creation*
+  and the draw refused with "no fragment shader".
+- The variant must then *always* be built, or `plain` is NULL and the draw
+  vanishes with nothing said.
+- The binding check derived the view's dimension from the Gallium target and
+  declined every draw with "view dimension differs from the shader's". A tiled
+  array is 2D everywhere WebGPU can see it: the descriptor, the module, and
+  that comparison.
+
+And one latent bug fixed beside it: the geometry stage's layered rendering
+advances `ctx->color_layers[]` itself rather than going through
+`set_framebuffer_state`, so anything derived from the layer has to be derived
+again there. Every layer of a layered draw would have written over layer
+zero's tile.
+
+### What the probe proves, and what is still open
+
+`gl44-ms-array-probe` is 5/5 on both drivers with identical values: creation
+and framebuffer completeness, per-layer clear isolation (0.5/0.25/0.75 reading
+back 128/64/191 and not each other's), and -- the half a clear-and-resolve
+cannot reach -- a real draw into one layer followed by a `sampler2DMSArray`
+`texelFetch` of each of its four samples by index.
+
+Scores: `texture_view` 3/7 -> **5/7**, `texture_swizzle`'s 2DMSArray group
+0 -> **5**, and `direct_state_access`'s 30 `storage_multisample_3d` cases stop
+throwing -- **InternalError to Fail**, so they run and compare now instead of
+dying on `glTextureStorage3DMultisample`.
+
+Those 30 still fail on values, and three hypotheses are already eliminated:
+it is not the geometry (the probe passes at the CTS's own 2x3x4), not the
+layered-rendering offset (fixed, unchanged result), and not the sampling
+mechanism (the probe fetches every sample by index and matches). What the test
+does that the probe does not is render *from an input texture* into the
+multisampled framebuffer and then resolve through an auxiliary framebuffer of
+its own; that pair is where to look next, not at the tiling.
