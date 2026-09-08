@@ -24137,3 +24137,45 @@ looked half-broken in the shape least likely to point at the cause.
 The comment above the first of those returns already warns about exactly this,
 for `gl_SamplePosition`. It is now the third feature to hit it. **Grep for
 `return fs->module` before adding a variant reason.**
+
+## The browser path, swept whole (2026-09-08)
+
+`tests/gl44-browser-sweep.sh` against the driver in the tree:
+
+    193 PASS   2 FAIL   2 SKIP   (197 probes)
+
+Both failures are platform facts and both have native twins, so **nothing in
+the browser fails that does not also differ natively**:
+
+- `group-vote` — the invocation group is one invocation, so
+  `allInvocationsEqual` on mixed data answers true where a wider ballot
+  answers false. The oracle reports `all_same=0`, the guest `all_same=1`. The
+  probe exists to say so.
+- `texture-sampler` — `GL_NUM_SAMPLE_COUNTS` for an RGBA8 renderbuffer:
+  llvmpipe answers 2 with `{8, 4}` and `GL_MAX_SAMPLES=8`; gex answers 1 with
+  `{4}` and `MAX_SAMPLES=4`, because **WebGPU offers `sampleCount` 1 or 4 and
+  nothing else**. Measured on both drivers today; this had been an unexplained
+  expected-DIFF for weeks and is now closed. Neither driver is wrong.
+
+The two skips (`glx-context`, `window-present`) need GLX/X11 headers the
+aarch64-musl guest toolchain has not got — about this machine, not the driver.
+
+**This is the widest statement available about the browser path**, which is the
+product: it exercises the JS binding layer and the guest marshaller, neither of
+which any native gate touches, and it compares case *counts* with the native
+oracle so a probe that measured nothing cannot read as a pass.
+
+### Two ways I read a verdict off the wrong line getting here
+
+Both worth knowing, because the harness output invites both.
+
+**The oracle's summary is printed unprefixed; the guest's is prefixed `>`.** I
+ran four probes individually to check a fix and reported three of them fixed on
+the strength of unprefixed `CASE ... PASS` lines — which were the *native
+oracle's*. `group-vote` was 2/3 in the guest throughout. The exit status is the
+verdict; the sweep's `results.tsv` records it and an individual run does not
+unless you check `$?`.
+
+**`(settle: finished)` is not a pass.** It says the settle phase ended, not
+that the goal matched. It appears on a failing run too.
+
