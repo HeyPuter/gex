@@ -24973,3 +24973,110 @@ and both earned their keep the same day: the regression run caught the probe
 count moving and said "CHANGED got=196 expected=195 -- read each before
 deciding it is a regression", which is exactly the failure mode a remembered
 number produces.
+
+## glClipControl was accepted and ignored (2026-09-14)
+
+The twenty-family re-score's second find, and the one most likely to matter to
+a real application.
+
+`KHR-GL45.clip_control` was **7/1**, failing only `depth_mode_zero_to_one`.
+The cause is one line: `nir_lower_clip_halfz` ran on **every** vertex shader.
+
+GL's default clip space runs z from -1 to 1 and WebGPU's runs 0 to 1, so the
+default needs converting. `glClipControl(..., GL_ZERO_TO_ONE)` says the shader
+already writes z in [0, 1] and the conversion must not happen — and running it
+anyway transforms twice:
+
+    clip z 0.50  ->  depth 0.750   (want 0.500)
+    clip z 0.25  ->  depth 0.625   (want 0.250)
+
+which is `(z + 1) / 2` applied again. Silent: no error, no refusal, every
+fragment at the wrong depth. **GL_ZERO_TO_ONE is half of reverse-Z**, which is
+how a modern renderer gets usable depth precision at distance, so this is not
+a conformance curiosity — it is the shape of "the scene z-fights" or "distant
+geometry vanishes".
+
+Gallium carries the mode as `rasterizer->clip_halfz`; the driver advertised
+`caps->clip_halfz` and *accepted* the state in `gex_wgpu_create_rasterizer`'s
+supported list while nothing read it. **Accepting a state and ignoring it is
+the silent shape**, and it is worth grepping that supported list for others:
+every field in it is a promise.
+
+The fix keys a vertex variant on the mode, as the y-flip and viewport fold
+already do. `clip_control` is **8/0**.
+
+### Two instruments fired, and one of them found a second bug
+
+`gex_wgpu_say_no_base_module` exists to print "vertex stage has no base module
+and no variant reason" with the list of reasons. It fired twice during this:
+
+- once for `clip_halfz`, because setting `plain = NULL` without adding the
+  flag to the early-out's condition returns NULL and **drops the draw** — the
+  probe showed depth at the clear value, which is what "nothing drew" looks
+  like;
+- once for `has_double_inputs`, the 64-bit deferral added this morning, which
+  had the *same* omission from the *same* condition and had been shipping
+  since. It named it in one run.
+
+The list now prints `doubles=` too. Anything added to the deferral list needs
+adding to the variant-reason list, and this is the instrument that says so.
+
+## 64-bit attributes: the upper half had no location (2026-09-14)
+
+Three more cases, and a correction to this morning's account.
+
+st gives a `dvec3` or `dvec4` **two** vertex elements — the second at offset
++ 16 — but only one shader *variable*, so `glsl_count_attribute_slots` reports
+one slot, `vertex_element_location[1]` stays `0xff`, and the attribute loop
+skipped it. The module declares both halves, because the lowering creates the
+second `uvec4` at `driver_location + 1`. Result:
+
+    Vertex attribute slot N used in ShaderModule is not present in the VertexState
+
+The upper half now takes the previous element's location plus one — the slot
+GL already reserved — and **the element's own format**. That last part is the
+correction: synthesising the attribute from the shader's component count was
+tried and is wrong, because **Mesa pads a `dvec3` input to four components**.
+The shader says four, the layout asks for sixteen bytes out of an eight-byte
+tail, and WebGPU rejects it by name. The element says `r32g32_uint`, which is
+right, and it was there all along.
+
+`gl44-double-attrib-probe` is the instrument, and `dvec3` is the case the CTS
+does not have — it failed while `dvec2` and `dvec4` passed.
+
+The capture fetches them now as well: two words per component packed with
+`pack_64_2x32_split`, gated on the capture layout carrying the component
+count. It declined before, so transform feedback of a double attribute
+recorded nothing.
+
+    vertex_attrib_binding   26/4 -> 29/1
+    gpu_shader_fp64        658/1 -> 659/0
+    vertex_attrib_64bit      2/4 -> 3/4
+
+`vao` is the one left, and it is a different shape: "slot 9 not present" on a
+layout with many attributes, most likely a `dmat`, which occupies several
+locations and whose element numbering this does not yet follow.
+
+## The exported-symbol gap (2026-09-14)
+
+Measured while writing the two probes above, because both tripped over it:
+
+    ours: 1369 gl* symbols   glvnd's libGL: 3470
+
+The missing set includes `glClipControl`, `glVertexAttribLPointer`,
+`glTextureBarrier` and **the whole direct-state-access family** —
+`glBindTextureUnit`, `glBlitNamedFramebuffer`, `glClearNamedFramebuffer*`,
+`glCompressedTextureSubImage*`. An application that *links* any of them dies
+at load with "undefined symbol".
+
+This is the standard Linux GL ABI rather than a driver gap: libGL guarantees
+GL 1.2 and everything else goes through `getProcAddress`, which is what GLEW,
+glad, GLFW and Qt all do. glvnd's libGL exports every name regardless, which
+is why nothing notices on an ordinary system.
+
+**Where it bites**: `/tmp/glapps.txt` is built from binaries that link libGL
+directly, so anything there using a 4.x entry point by name will not start —
+and the failure looks nothing like a driver problem. The probe suite already
+reports this class as `UNLINKABLE`, which is how `program-query-value` is
+listed. If an application fails to start with "undefined symbol: glSomething",
+this is it.
