@@ -25537,3 +25537,39 @@ multi-stream change touches the common single-stream path. It should lower to
 byte-identical output there — `gs->streams` is 1, the per-stream base folds to
 a constant zero, the buffers multiply by one — and if `cts_geometry_shader`
 drops from 136/0, that assumption is where to look before anything else.
+
+## The eighth application: GTK4/GSK (2026-09-14)
+
+`tests/gates/app-gtk4.sh` passes. **rmse 50.7 against llvmpipe with 0% of
+pixels differing by more than 12%**, on a 256x256 scene exercising a linear
+gradient, a rounded clip, a blur, an opacity group and a 30-degree rotate —
+all of which render correctly.
+
+This is a workload none of the other seven have: GSK does not issue GL calls
+the way an application does, it builds a tree of render nodes and compiles it
+into passes with offscreen targets for anything it cannot draw directly. It is
+the renderer behind every modern GNOME application.
+
+It is also the **strongest** gate here, and not because of GTK:
+`gtk4-rendernode-tool render` takes a scene file and writes a PNG, so there is
+no window to photograph, no animation and no settle time. The two runs compare
+the same frame by construction. Every other app gate spends most of its
+tolerance on not being sure of that — hence this one's much tighter threshold,
+and hence it being unaffected by a live desktop session, which is what let it
+run while the user's browser was open.
+
+**Two things it got wrong first, both worth keeping in mind for the next gate
+of this shape:**
+
+- **The renderer's name is not stable.** GTK 4.22 calls it `gl`;
+  `--renderer=opengl` is answered with `No renderer named "opengl"` and
+  produces no image *on either side*. The gate now asks the tool for the names
+  it accepts — it prints them when it rejects one — instead of guessing.
+- **The fallback check fired on the proof it was looking for.** It grepped the
+  log for `cairo`, and the refusal message *lists* the available renderers,
+  cairo among them. So a run that never reached GL was reported as "GTK fell
+  back to cairo" — right conclusion, wrong evidence, and it would have been
+  wrong the other way round on a real fallback. It now looks for
+  `Failed to create renderer`, and leans on the fact that `--renderer=` is a
+  refusal and not a preference: an image produced is an image produced by that
+  renderer.

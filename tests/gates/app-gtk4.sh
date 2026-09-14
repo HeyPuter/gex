@@ -107,18 +107,42 @@ nodes=$(awk '/^Number of nodes:/{print $4}' "$work/info.txt")
 run() {  # run <png> <label> [env...]
   png=$1; label=$2; shift 2
   rm -f "$png"
-  env "$@" GSK_RENDERER=opengl GSK_DEBUG=renderer \
-      timeout -s KILL 120 gtk4-rendernode-tool render --renderer=opengl \
+  env "$@" GSK_RENDERER=$RENDERER GSK_DEBUG=renderer \
+      timeout -s KILL 120 gtk4-rendernode-tool render --renderer=$RENDERER \
       "$work/scene.node" "$png" > "$work/$label.log" 2>&1
   status=$?
   if [ $status -ne 0 ] && grep -qi "unknown option\|unrecognized option" "$work/$label.log"; then
-    env "$@" GSK_RENDERER=opengl GSK_DEBUG=renderer \
+    env "$@" GSK_RENDERER=$RENDERER GSK_DEBUG=renderer \
         timeout -s KILL 120 gtk4-rendernode-tool render \
         "$work/scene.node" "$png" > "$work/$label.log" 2>&1
     status=$?
   fi
   echo "  $label exit=$status $( [ -s "$png" ] && echo "wrote $(stat -c%s "$png") bytes" || echo "NO IMAGE" )"
 }
+
+# The GL renderer's *name*, which is not stable across GTK versions: 4.22
+# calls it `gl` and answers `--renderer=opengl` with "No renderer named", so
+# the first version of this gate produced no image on either side. The tool
+# prints the names it accepts when it rejects one, so ask it rather than
+# guessing -- and keep the answer in a variable so the failure below can say
+# what was available.
+RENDERER=${GEX_GSK_RENDERER:-}
+if [ -z "$RENDERER" ]; then
+  gtk4-rendernode-tool render --renderer=gex-no-such-renderer \
+      "$work/scene.node" /dev/null > "$work/names.log" 2>&1
+  for cand in gl opengl ngl; do
+    if grep -qx "  $cand" "$work/names.log" 2>/dev/null; then
+      RENDERER=$cand; break
+    fi
+  done
+fi
+[ -n "$RENDERER" ] || {
+  echo "gtk4: this GTK has no GL renderer under any name I know."
+  echo "  It offered:"; sed -n '/Possible values/,$p' "$work/names.log" |
+      sed 's/^/  /' | head -8
+  echo "  Set GEX_GSK_RENDERER=<name> to override."
+  exit 2; }
+echo "gtk4: GSK renderer '$RENDERER'"
 
 echo "gtk4: rendering under llvmpipe (reference)"
 run "$ref" ref LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
@@ -127,19 +151,21 @@ run "$out" gex LD_LIBRARY_PATH=$INST/lib:$HOME/.cache/gex-dawn-native/pkg/lib \
     LIBGL_DRIVERS_PATH=$INST/lib/dri LIBGL_ALWAYS_SOFTWARE=1 \
     GALLIUM_DRIVER=gex_wgpu
 
-# The control. A cairo fallback on the gex side means the driver was never
-# exercised; say so as a failure rather than reporting a clean comparison.
-if grep -qi "cairo" "$work/gex.log" 2>/dev/null; then
-  echo "gtk4 FAILED: GTK fell back to the cairo renderer, so this driver"
-  echo "  drew nothing. The comparison below would have passed regardless."
-  sed 's/^/    /' "$work/gex.log" | head -10
+# The control. `--renderer=$RENDERER` is not a preference: the tool refuses
+# outright rather than falling back, so a run that produced an image produced
+# it with that renderer. What has to be checked is that it did not refuse.
+#
+# Grepping the log for "cairo" was the first attempt and it was wrong in the
+# way that matters: the refusal message *lists* the available renderers, cairo
+# among them, so the check fired on the very output proving GL was never
+# reached -- and called it a cairo fallback. Look for the refusal itself.
+if grep -q "Failed to create renderer" "$work/gex.log" 2>/dev/null; then
+  echo "gtk4 FAILED: GTK would not create the '$RENDERER' renderer, so this"
+  echo "  driver drew nothing. The comparison below would have passed"
+  echo "  regardless of what the driver does."
+  sed 's/^/    /' "$work/gex.log" | grep -v "^    gex-wgpu" | head -8
   exit 1
 fi
-grep -qiE "opengl|ngl|gl renderer" "$work/gex.log" 2>/dev/null || {
-  echo "gtk4: could not confirm from the log which renderer ran, so this"
-  echo "  cannot be called a pass. Log follows:"
-  sed 's/^/    /' "$work/gex.log" | head -10
-  exit 2; }
 
 [ -s "$out" ] || { echo "gtk4 FAILED: no image from gex_wgpu"; exit 1; }
 [ -s "$ref" ] || { echo "gtk4: no reference image, nothing to compare"; exit 2; }
