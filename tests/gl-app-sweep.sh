@@ -58,6 +58,12 @@ export GALLIUM_DRIVER=${GALLIUM_DRIVER:-gex_wgpu}
 # application's process group is killed, and a GLUT program that reads window
 # properties then dies with BadWindow -- an X error that looks nothing like
 # GL and which read, across a whole sweep, as though the driver had collapsed.
+# "Nothing else may touch the GPU while it runs" is in this file's header and
+# was never checked. A leftover headless chromium slowed the sister harness,
+# gl-app-compare.sh, by 30x -- 13 seconds a program to 6.5 minutes -- with no
+# symptom but the clock.
+. "$(dirname "$0")/gates/gpu-exclusive.sh"
+gex_require_idle_gpu "gl-app-sweep" || exit 2
 bash "$(dirname "$0")/ensure-display.sh" >/dev/null 2>&1 || true
 xdpyinfo >/dev/null 2>&1 || { echo "no X display at $DISPLAY" >&2; exit 2; }
 xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q "window id" || \
