@@ -25573,3 +25573,84 @@ of this shape:**
   `Failed to create renderer`, and leans on the fact that `--renderer=` is a
   refusal and not a preference: an image produced is an image produced by that
   renderer.
+
+## `vertex_attrib_64bit.vao`: `dual_slot` is not the only 64-bit shape (2026-09-14)
+
+"Slot 9 not present in the VertexState" is fixed. The cause was not any of the
+three things guessed at from reading — and the thing that settled it in one
+run was an instrument that **already existed and nobody had called**:
+`GEX_WGPU_VS_STATE_LOG=1`, which dumps every vertex element beside the
+location it was given.
+
+```
+el4 -> @location(4)   off=64  fmt=16 dual=0 dbl=4
+el5 -> @location(255) off=80  fmt=14 dual=0 dbl=0
+el6 -> @location(6)   off=88  fmt=16 dual=0 dbl=4
+el7 -> @location(255) off=104 fmt=14 dual=0 dbl=0
+el8 -> @location(8)   off=112 fmt=16 dual=0 dbl=4
+el9 -> @location(255) off=128 fmt=14 dual=0 dbl=0
+```
+
+`255` is `0xff`, "no location". Elements 5, 7 and 9 are the **upper halves**
+of the 64-bit attributes at 4, 6 and 8 — sixteen bytes each, sixteen bytes
+apart, one `dvec4` per pair. The draw path has a fallback that gives such an
+element its predecessor's location plus one, and it was gated on
+`elements[i - 1].dual_slot`. **Every one of these has `dual_slot` clear.**
+
+So `dual_slot` is *one* of the shapes st produces for a 64-bit attribute, not
+the only one: here the two halves arrive as two separate elements with the
+flag clear on both. The fallback bailed, locations 5/7/9 were never supplied,
+and the module — which declares `gex_attrib4_hi`, `gex_attrib6_hi`,
+`gex_attrib8_hi` at exactly those locations — had inputs nothing fed. That is
+a **pipeline validation error, so it takes the whole command buffer**, not
+just this draw.
+
+Fixed by also accepting the shader's own component count: an input of three or
+four doubles is lowered into two `uvec4`s, so an element following it with no
+location of its own is its second half.
+
+**The case still fails, and now for a reason worth having.** No WebGPU errors
+at all; the failure is a data mismatch, and a very regular one:
+
+```
+dmat3  expected [10..18]  got [1..9]
+dvec2  expected [2, 3]    got [0, 1]
+double expected [7]       got [1]
+```
+
+Every attribute reads **one vertex behind** what the test expects for batch 0
+— the `int` and the `float` as much as the `dmat3`. That uniformity is the
+lead: a per-attribute layout error cannot shift an `int` and a `dmat3` by the
+same one vertex, so the shift is in **where the draw starts**, not in how any
+attribute is fetched. Look at the draw's `start` / `index_bias` handling
+before looking at anything 64-bit.
+
+Not a `first` offset either: both `glDrawArrays` calls pass `0`. What the
+test *does* do is call `glVertexAttribDivisor` on **every** attribute, and
+`executeTest(draw_call, instanced, zero_vertex_attrib_divisor)` runs four
+combinations of (arrays vs elements) x (instanced vs not). Establishing which
+of the four is off is the first thing to do.
+
+**A divisor split between the halves was the obvious suspect and the dump
+rules it out for at least one variant:** all fifteen elements come through
+with `div=0` (`create velems n=15 -> buf0(div=0) x15`), so for the
+zero-divisor combination the two halves of each `dvec3` share a step mode and
+a buffer slot. It is still worth checking on the *non*-zero-divisor
+combinations, where an upper-half element whose `instance_divisor` does not
+match its lower half would put the halves in different slots with different
+step modes — the dump prints `div=` per element, so one run answers it.
+
+But since the values are already wrong with every divisor at zero, start with
+the plainest question instead: with 15 elements all in one buffer at stride
+172, is each element's `src_offset` the one GL asked for? The dump prints
+`off=` beside each, and the test's own offsets are computed in `initBuffers`
+from `m_bo_1_offset_matrix` and friends.
+
+**And the instrument that should have caught this earlier is still blind.**
+The dump prints `inputs 0x7d5f supplied 0x7d5f missing 0x0` for this shader —
+bit 9 is not in `inputs` at all, so the driver's own "did the vertex state
+feed every declared location" check could not see the very mismatch Dawn
+rejected. `vertex_locations` is built from the unlowered shader and does not
+include the halves `gex_wgpu_lower_vertex_attrib_double` adds. Until it does,
+`missing` is not trustworthy for any shader with a 64-bit input, and the
+message it prints is reassuring rather than useful.

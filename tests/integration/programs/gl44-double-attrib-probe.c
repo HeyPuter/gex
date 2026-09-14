@@ -278,6 +278,86 @@ static void run_pair_case(const char *name, const char *ok_src,
     while (glGetError() != GL_NO_ERROR) { }
 }
 
+/* A `dmat3` followed by another attribute, with the locations the linker
+ * chose rather than any this file assumed.
+ *
+ * This is the shape KHR-GL45.vertex_attrib_64bit.vao uses -- it declares
+ * `dmat3`, `double`, `dvec2`, `float`, `int`, `dmat4x2` and `float` with no
+ * location qualifiers at all -- and it is the shape where the driver's
+ * element-to-location table can drift: a dmat3's three dvec3 columns occupy
+ * *six* slots but only three vertex elements, so anything that advances an
+ * element index once per slot is one attribute out by the time it reaches
+ * whatever follows. The failure that motivates this reads
+ * "slot 9 not present in the VertexState".
+ *
+ * The locations are queried, not declared. Twice already a case here has
+ * asserted a layout instead of asking for one and ended up measuring its own
+ * setup, so this asks -- and prints what it was told. */
+static void run_matrix_then_case(const char *name)
+{
+    static const char *src =
+        "in dmat3 m;\n"
+        "in float tail;\n"
+        "bool ok() {\n"
+        "  return abs(m[0].x - 1.5lf) < 1.0e-12lf\n"
+        "      && abs(m[0].z + 2.25lf) < 1.0e-12lf\n"
+        "      && abs(m[1].y - 4.5lf) < 1.0e-12lf\n"
+        "      && abs(m[2].x - 7.5lf) < 1.0e-12lf\n"
+        "      && abs(m[2].z - 9.5lf) < 1.0e-12lf\n"
+        "      && abs(tail - 0.75) < 1.0e-5;\n"
+        "}\n";
+    GLuint prog = build(src, NULL, 0);
+    if (!prog) { result(name, 0, "link failed"); return; }
+    glUseProgram(prog);
+    const GLint at_m = glGetAttribLocation(prog, "m");
+    const GLint at_tail = glGetAttribLocation(prog, "tail");
+    if (at_m < 0 || at_tail < 0) {
+        char why[96];
+        snprintf(why, sizeof(why), "m=%d tail=%d (an input was optimised out)",
+                 at_m, at_tail);
+        result(name, 0, why);
+        glDeleteProgram(prog);
+        return;
+    }
+    /* Nine doubles for the matrix, then one float, per vertex. */
+    struct { double m[9]; float tail; float pad[3]; } v[4];
+    static const double col[9] = {1.5, -0.5, -2.25, 3.5, 4.5, 5.5,
+                                  7.5, 8.5, 9.5};
+    for (unsigned i = 0; i < 4; ++i) {
+        memcpy(v[i].m, col, sizeof(col));
+        v[i].tail = 0.75f;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(v), v, GL_STATIC_DRAW);
+    /* Columns at consecutive locations from `at_m`; each is a dvec3. */
+    for (unsigned c = 0; c < 3; ++c) {
+        glEnableVertexAttribArray((GLuint)at_m + c);
+        attrib_lpointer((GLuint)at_m + c, 3, GL_DOUBLE, (GLsizei)sizeof(v[0]),
+                        (const void *)(size_t)(c * 3 * sizeof(double)));
+    }
+    glEnableVertexAttribArray((GLuint)at_tail);
+    glVertexAttribPointer((GLuint)at_tail, 1, GL_FLOAT, GL_FALSE,
+                          (GLsizei)sizeof(v[0]),
+                          (const void *)(size_t)(9 * sizeof(double)));
+
+    const GLfloat clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glClearBufferfv(GL_COLOR, 0, clear);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glFinish();
+    unsigned char px[4] = {0};
+    glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    char detail[180];
+    snprintf(detail, sizeof(detail),
+             "rgb=%u,%u,%u m=%d tail=%d err=0x%04x", px[0], px[1], px[2],
+             at_m, at_tail, (unsigned)glGetError());
+    result(name, is_tint(px), detail);
+    for (unsigned c = 0; c < 3; ++c)
+        glDisableVertexAttribArray((GLuint)at_m + c);
+    glDisableVertexAttribArray((GLuint)at_tail);
+    glDeleteProgram(prog);
+    while (glGetError() != GL_NO_ERROR) { }
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -325,6 +405,7 @@ int main(void)
     run_case("dvec4", ok_dvec4, 4);
     run_pair_case("two_dvec4", ok_two_dvec4, 2);
     run_pair_case("dmat2x4", ok_dmat2x4, 1);
+    run_matrix_then_case("dmat3_then_float");
 
     /* 4. The same attribute, read by a shader whose output is recorded with
      *    transform feedback. That runs the vertex stage as a *compute*
