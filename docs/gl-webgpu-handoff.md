@@ -24556,3 +24556,36 @@ Both cost a build each and would cost the next probe the same:
 And one that cost only a reference run: an outline sampled on the viewport's
 own edge row is ambiguous, llvmpipe draws nothing there, and the case fails on
 the *reference*. Inset the geometry and read the sample row off a dump.
+
+## 64-bit vertex inputs: the second half has never been reached (2026-09-14)
+
+Re-measured before picking the item up, and one sentence in the earlier
+section is an assumption rather than a measurement.
+
+`KHR-GL45.vertex_attrib_64bit` is **2/4**. Both failures are the same line:
+
+    gex-wgpu: vertex shader rejected (int_sampled=0x0):
+      Tint rejected SPIR-V: error: unhandled float width: 64
+
+and they are at **link** time. `GEX_WGPU_VS_STATE_LOG=1` prints nothing for
+either case -- no draw is ever issued, because the program does not link -- so
+the draw path's half of the job, which the earlier section calls "the
+draw-path half, and it is why the job is not small", **has never run**. Its
+cost is unknown rather than large.
+
+What is certain about it: `gex_wgpu_vertex_format` has no 64-bit entry at all,
+so whatever `pipe_format` st presents for `glVertexAttribLPointer` is refused
+today and the element state goes with it. Whether u_vbuf translates it first
+-- as it does for several other formats this driver declines -- is exactly the
+thing that cannot be known until a program with a `dvec` input links.
+
+**So the order is: make the shader compile first, then look.** The estimate
+"all-or-nothing, both halves or neither" may still be right, but it should be
+re-derived after the first half rather than inherited. And the first half is
+the one with a template already written
+(`gex_wgpu_lower_vertex_attrib_unpack`, which rewrites an input variable's
+type and narrows its load; the 64-bit version needs *two* `uvec4` variables
+per `dvec3`/`dvec4`, at locations L and L+1, which GL already reserves).
+
+Still low priority on its own merits -- two cases, and applications convert
+doubles on the CPU because GPUs handle them slowly.
