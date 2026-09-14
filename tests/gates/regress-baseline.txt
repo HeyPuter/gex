@@ -8,8 +8,9 @@
 # instrument is tests/gl44-browser-sweep.sh.
 
 # Native probe suite: probes whose SUMMARY matches llvmpipe's.
-# Last measured 2026-09-14, after the draw-parameters fix.
-probe_suite_ok 195
+# Last measured 2026-09-14, after the colour-attachment byte-cost fix
+# (gl44-attachment-budget-probe is the one it added).
+probe_suite_ok 196
 
 # The probes that legitimately differ from llvmpipe, by name rather than by
 # count -- a count stays right when one known exception is fixed and a new one
@@ -41,3 +42,7 @@ cts_cull_distance 202/0
 cts_shader_storage_buffer_object 124/0
 cts_shader_atomic_counter_ops_tests 4/0
 cts_transform_feedback 19/2
+# 0/4 until 2026-09-14. Eight R32UI attachments, each also sampled; the driver
+# charged every four-byte format eight bytes per sample instead of four, so
+# four of the eight were silently dropped and never written.
+cts_texture_barrier 4/0

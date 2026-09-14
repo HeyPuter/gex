@@ -24707,3 +24707,67 @@ the command line to a known frame. VLC took twenty minutes once the codec was
 right; Kdenlive took an hour and is still not verified. A hand-written project
 file is not a shortcut either -- the MLT XML this gate first generated stalled
 Kdenlive on its *splash screen*, on both drivers, for as long as it was given.
+
+## texture_barrier was 0/4 and the barrier was never the problem (2026-09-14)
+
+A twenty-family re-score found `KHR-GL45.texture_barrier` at **0/4** — an
+entire family, and nothing else in the suite or the app sweep pointed at it.
+It is now **4/4**, and what was wrong is worth recording because the family's
+name sent every reading of it in the wrong direction.
+
+The test attaches **eight R32UI textures, each also bound as a sampler**, and
+draws. WebGPU bounds the combined bytes per sample across colour attachments,
+and this driver charged *every four-byte format eight bytes*. Eight R32UI
+targets therefore came to 64 against a budget of 32, and the driver dropped
+the last four before any draw — so four of the eight textures were never
+written and kept whatever they held.
+
+**The cost of a format is not its size.** `rgba8unorm` costs eight and
+`r32uint` costs four, and both are four bytes wide. The spec's rule is by
+channel count as much as by width, so the table is now spelled out rather than
+derived from `util_format_get_blocksize`. Two four-byte four-channel forms
+still need separating — `rgba8` and `rgb10a2` — and the component count cannot
+do it; the first channel's *width* does.
+
+### Why it read as a barrier defect for so long
+
+`gl44-texture-barrier-probe` existed and passed. It uses one RGBA8 attachment,
+which is inside any budget, so it exercised the barrier machinery — correctly,
+and it was correct — and never the accounting. The family's four cases all
+failed at `verifyTextureData`, which says only "the pixels are wrong".
+
+The new probe is `gl44-attachment-budget-probe`, and it is deliberately a
+*separate* probe rather than more cases in the barrier one: the defect is
+about how many attachments fit, not about barriers, and a probe that mixes
+the two would have a name that misleads the next reader the same way.
+
+It checks **every** attachment, not one. Checking one passes on a driver that
+drops the rest, which is the entire failure being measured. And it keeps a
+`four_rgba8` case alongside `eight_r32ui`: an "accounting fix" that charged
+rgba8 four instead of eight would pass the new case and break that one, by
+building a pipeline WebGPU rejects.
+
+### A near-miss worth more than the fix
+
+Writing that probe, I first put it in `gl44-texture-barrier-probe.c` — which
+**already existed**, with three cases of its own, and the Write reported "has
+been updated successfully" rather than "created". That is the tell, and I read
+past it. `check-for-an-existing-probe-first` is the memory for this and it did
+not fire because I grepped the probe list for `barrier`'s neighbours and not
+for `barrier`.
+
+It was recovered from git with no loss because the file was committed. The
+general rule: **`git status` on the probe directory before writing a probe**,
+and treat "updated" in a Write result as a stop sign.
+
+### And a note on the missing entry point
+
+`glTextureBarrier` is declared in Mesa's `ARB_texture_barrier.xml` as an
+**alias** of `TextureBarrierNV`, and an alias gets no entry in
+`static_data.py` — so this non-glvnd `libGL.so.1` exports
+`glTextureBarrierNV` and not `glTextureBarrier`. A program that *links* the
+core name dies at load with "undefined symbol". That is upstream Mesa's shape
+rather than this driver's, and the CTS does not trip over it because dEQP
+resolves every GL function dynamically — but it is the same class the probe
+suite reports as UNLINKABLE for `glGetProgramResourceLocationIndex`, and it is
+worth knowing that an application linking it directly would not start.
