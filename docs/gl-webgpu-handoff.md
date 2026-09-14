@@ -24463,3 +24463,28 @@ Cost is a gather pass and three times the records for such a draw, which is
 the right trade for a construct this rare. Nothing in the CTS or the app sweep
 currently points at it; the probe is the only thing that does, and it is
 committed so the next attempt has a target.
+
+**Done the same afternoon**, and it was the hour the shape above predicted --
+the three pieces all existed, and what took the time was the three things in
+the way rather than the mechanism:
+
+- the de-index refused a draw with **no vertex elements**, which is every
+  emulated-stage rasterization, since they are attributeless and read records;
+- its gate excluded `tess_rasterizing`, written back when the stages did
+  compute the number themselves. It is now excluded by
+  `passthrough_has_primitive_id` instead -- set by whichever stage built the
+  record -- which says the thing that actually matters: a geometry shader's
+  `gl_PrimitiveID` is a value the *shader* chose and need not resemble any
+  primitive count, so deriving one must not overwrite it;
+- and `point_records_gathered` is cleared at the top of the **nested** draw,
+  so the outer call's gather was forgotten and the passthrough would have read
+  the indexed records in de-indexed order. That is exactly the trap
+  `deindex_gather_mask` already existed for, and `deindex_records_gathered`
+  now sits beside it. Worth noting as a pattern: **any state the de-index sets
+  before reissuing the draw needs a twin**, because the nested call re-runs
+  every reset the outer one did.
+
+`gl44-primitive-id-stages-probe` is 4/4 natively and in the browser, with ids
+1,2,3 matching llvmpipe exactly. `tessellation_shader` 139/0/1,
+`geometry_shader` 136/0, `cull_distance` 202/0/16 unchanged; native probe
+suite 194 OK.
