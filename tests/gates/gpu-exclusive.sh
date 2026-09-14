@@ -33,8 +33,16 @@ gex_require_idle_gpu() {
         [ -z "$gex_n" ] && gex_n=0
         [ "$gex_n" -gt 0 ] && gex_busy="$gex_busy $gex_name($gex_n)"
     done
-    # The browser harness's own server, which holds a chromium open.
-    pgrep -f 'drive\.mjs' >/dev/null 2>&1 && gex_busy="$gex_busy drive.mjs"
+    # No `pgrep -f` here, and that is deliberate. A pattern match against full
+    # command lines finds *this guard's own shell*, whose command line
+    # contains the pattern -- so the check fired on an idle machine and the
+    # message named a process that was the caller. pgrep-f-matches-the-waiter
+    # is an old lesson and it caught me writing a new instance of it.
+    #
+    # `pgrep -x` above matches the process *name*, which cannot match a shell
+    # running a script that mentions it. And a listening harness server is not
+    # a GPU consumer in any case: it holds a chromium open, and the chromium
+    # is what this checks for.
 
     [ -z "$gex_busy" ] && return 0
 
