@@ -25481,3 +25481,44 @@ Also fixed here, found in the same lines: the `counted = true` beside
 was not — the `-Wmisleading-indentation` shape that has already cost this file
 once ([[inserting-before-an-unbraced-if]]). Braced; the warning count is now
 zero.
+
+## The queued driver work, and how to attribute a regression (2026-09-14)
+
+Five independent changes are sitting uncommitted in the mesa submodule —
+568 insertions over 103 hunks — because the app comparison held the GPU for
+the whole session. All five are syntax-clean with no new warnings (the total
+went 5 → 4; the misleading-indentation one is gone). None has been run.
+
+That is a lot to verify at once, so each was written with the probe that
+isolates it. Run them in this order and a regression names itself:
+
+| change | isolated by |
+| --- | --- |
+| four vertex streams (ARB_transform_feedback3) | `gl44-vertex-streams-probe`, and `cts_transform_feedback` / `cts_geometry_shader` must hold |
+| `GL_PRIMITIVES_GENERATED` under `layout(invocations=N)` | `gl44-gs-feedback-probe` → `generated_instanced` |
+| the atomic replay's slot table for indexed draws | `gl44-vertex-atomic-result-probe` → `indexed_slots` |
+| one occlusion slot per query | `gl44-conditional-render-probe` → `two-queries-pending`, then `KHR-GL45.compute_shader.conditional-dispatching` |
+| bracing the unguarded `counted = true` | no probe; it is a warning fix whose only behavioural change is that a query with no query set answers zero instead of refusing |
+
+**The sequence:**
+
+```
+tests/gates/regress.sh                      # build, install, probes, 9 families
+tests/gates/probe-diff.sh vertex-streams gs-feedback \
+                          vertex-atomic-result conditional-render
+tests/gates/app-gtk4.sh /tmp/gtk4.png       # the eighth app, never yet run
+```
+
+`regress.sh` builds *and installs*, which matters: every native gate reads
+`$INST` and a build that does not install leaves them measuring the previous
+binary. It checks that for you now.
+
+**Baselines that must move when this lands**, and only then: `probe_suite_ok`
+gains `vertex-streams`, and the four probes above gain cases. Raise a baseline
+in the commit that earns it, never ahead of it.
+
+**The one thing to be suspicious of first** if the geometry families move: the
+multi-stream change touches the common single-stream path. It should lower to
+byte-identical output there — `gs->streams` is 1, the per-stream base folds to
+a constant zero, the buffers multiply by one — and if `cts_geometry_shader`
+drops from 136/0, that assumption is where to look before anything else.
