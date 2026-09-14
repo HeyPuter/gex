@@ -52,10 +52,14 @@ static int have_extension(const char *want) {
 static GLuint build(void) {
     static const char *vs =
         "#version 330 core\n"
+        /* The clip-space z, so the depth-test cases below can put the quad
+         * in front of or behind the cleared depth. Zero for every other
+         * case, which is what it was before. */
+        "uniform float zdepth;\n"
         "void main() {\n"
         "  vec2 p = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0,\n"
         "                (gl_VertexID & 2) == 0 ? -1.0 : 1.0);\n"
-        "  gl_Position = vec4(p, 0.0, 1.0);\n"
+        "  gl_Position = vec4(p, zdepth, 1.0);\n"
         "}\n";
     static const char *fs =
         "#version 330 core\n"
@@ -87,7 +91,9 @@ int main(void) {
     if (!eglChooseConfig(display, config_attributes, &config, 1, &config_count)
         || config_count < 1) return 2;
     const EGLint context_attributes[] = {
-        EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3, EGL_NONE,
+        /* 4.3, not 3.3: the dispatch case below needs compute. Conditional
+         * render itself is GL 3.0 and the draw cases would run either way. */
+        EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 3, EGL_NONE,
     };
     const EGLint surface_attributes[] = {EGL_WIDTH, SIDE, EGL_HEIGHT, SIDE,
                                          EGL_NONE};
@@ -110,7 +116,7 @@ int main(void) {
             glGetString(GL_VERSION), inverted, barrier,
             resolved_texture_barrier != NULL);
 
-    GLuint colour = 0, fbo = 0, vao = 0;
+    GLuint colour = 0, fbo = 0, vao = 0, zbuf = 0;
     glGenTextures(1, &colour);
     glBindTexture(GL_TEXTURE_2D, colour);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, SIDE, SIDE, 0, GL_RGBA,
@@ -121,6 +127,14 @@ int main(void) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                            colour, 0);
+    /* A depth attachment, for the ANY_SAMPLES_PASSED cases at the end. The
+     * earlier cases never enable the depth test, so it changes nothing for
+     * them. */
+    glGenRenderbuffers(1, &zbuf);
+    glBindRenderbuffer(GL_RENDERBUFFER, zbuf);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, SIDE, SIDE);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                              GL_RENDERBUFFER, zbuf);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         return 2;
     glViewport(0, 0, SIDE, SIDE);
@@ -130,6 +144,7 @@ int main(void) {
     if (!program) return 2;
     glUseProgram(program);
     const GLint tint = glGetUniformLocation(program, "tint");
+    const GLint depth_at = glGetUniformLocation(program, "zdepth");
 
     /* A query that counts samples, run either over a full-screen draw (it
      * passes) or with an empty scissor (it does not). */
@@ -198,6 +213,165 @@ int main(void) {
     } else {
         fprintf(stderr, "INFO texture-barrier skipped (ext=%d entry=%d)\n",
                 barrier, resolved_texture_barrier != NULL);
+    }
+
+    /* glClear and glDispatchCompute are governed by conditional render too --
+     * GL lists both among the commands glBeginConditionalRender discards --
+     * and neither asked. The driver consulted the predicate in its draw and
+     * blit paths and nowhere else, so a clear or a dispatch inside a failed
+     * conditional happened anyway.
+     *
+     * Both are checked in *both* senses. A case that only tests the skip
+     * passes on a driver that never performs the command at all, which is a
+     * different defect wearing the same result. */
+    {
+        GLuint query = 0;
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            const int predicate_passes = pass == 1;
+            glGenQueries(1, &query);
+            glBeginQuery(GL_SAMPLES_PASSED, query);
+            if (!predicate_passes) {
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(0, 0, 0, 0);
+            }
+            glUniform4f(tint, 1, 0, 0, 1);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glDisable(GL_SCISSOR_TEST);
+            glEndQuery(GL_SAMPLES_PASSED);
+
+            /* Red outside the conditional; the clear inside asks for green. */
+            glClearColor(1, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glBeginConditionalRender(query, GL_QUERY_WAIT);
+            glClearColor(0, 1, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glEndConditionalRender();
+            glFinish();
+
+            unsigned char px[4] = {0};
+            glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            const GLenum error = glGetError();
+            const int green = px[1] > 200 && px[0] < 60;
+            fprintf(stderr, "INFO clear-%s got=%u,%u,%u want_green=%d err=0x%04x\n",
+                    predicate_passes ? "passes" : "fails", px[0], px[1], px[2],
+                    predicate_passes, (unsigned)error);
+            result(predicate_passes ? "clear-passes" : "clear-fails",
+                   error == GL_NO_ERROR && green == predicate_passes);
+            glDeleteQueries(1, &query);
+        }
+    }
+
+    {
+        static const char *cs_src =
+            "#version 430 core\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(std430, binding = 0) buffer Out { uint v; } o;\n"
+            "void main() { o.v = 0xabcdu; }\n";
+        GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+        glShaderSource(cs, 1, &cs_src, NULL);
+        glCompileShader(cs);
+        GLint ok = 0;
+        glGetShaderiv(cs, GL_COMPILE_STATUS, &ok);
+        GLuint cprog = 0;
+        if (ok) {
+            cprog = glCreateProgram();
+            glAttachShader(cprog, cs);
+            glLinkProgram(cprog);
+            glGetProgramiv(cprog, GL_LINK_STATUS, &ok);
+        }
+        if (!ok) {
+            char log[600] = {0};
+            glGetShaderInfoLog(cs, sizeof(log) - 1, NULL, log);
+            fprintf(stderr, "INFO dispatch skipped (compute unavailable): %s\n",
+                    log);
+        } else {
+            GLuint ssbo = 0;
+            glGenBuffers(1, &ssbo);
+            for (unsigned pass = 0; pass < 2; ++pass) {
+                const int predicate_passes = pass == 1;
+                GLuint query = 0;
+                glGenQueries(1, &query);
+                glUseProgram(program);
+                glBeginQuery(GL_SAMPLES_PASSED, query);
+                if (!predicate_passes) {
+                    glEnable(GL_SCISSOR_TEST);
+                    glScissor(0, 0, 0, 0);
+                }
+                glUniform4f(tint, 1, 0, 0, 1);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glDisable(GL_SCISSOR_TEST);
+                glEndQuery(GL_SAMPLES_PASSED);
+
+                const GLuint seed = 0u;
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof seed, &seed,
+                             GL_DYNAMIC_COPY);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+                glUseProgram(cprog);
+                glBeginConditionalRender(query, GL_QUERY_WAIT);
+                glDispatchCompute(1, 1, 1);
+                glEndConditionalRender();
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                glFinish();
+
+                GLuint got = 0xffffffffu;
+                glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof got,
+                                   &got);
+                const GLenum error = glGetError();
+                const GLuint want = predicate_passes ? 0xabcdu : 0u;
+                fprintf(stderr,
+                        "INFO dispatch-%s got=0x%04x want=0x%04x err=0x%04x\n",
+                        predicate_passes ? "passes" : "fails", got, want,
+                        (unsigned)error);
+                result(predicate_passes ? "dispatch-passes" : "dispatch-fails",
+                       error == GL_NO_ERROR && got == want);
+                glDeleteQueries(1, &query);
+                glUseProgram(program);
+            }
+        }
+    }
+
+    /* GL_ANY_SAMPLES_PASSED with the *depth test* as the discriminator, which
+     * is the shape KHR-GL45.compute_shader.conditional-dispatching uses and
+     * the one the cases above do not: they make a query fail with an empty
+     * scissor, and a scissor rejects fragments before the depth test ever
+     * runs.
+     *
+     * That case still fails with conditional render working, and the driver's
+     * own GEX_WGPU_CONDRENDER_LOG says why -- *both* of its queries come back
+     * zero, so the quad that should pass the depth test recorded no samples
+     * either. Either the predicate query type or the depth test is wrong, and
+     * these two cases separate them from everything already covered. */
+    {
+        GLuint query = 0;
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            const int should_pass = pass == 1;
+            /* Depth cleared to 0.5; the quad is drawn nearer or further. */
+            glClearDepth(0.5);
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glGenQueries(1, &query);
+            glBeginQuery(GL_ANY_SAMPLES_PASSED, query);
+            glUniform4f(tint, 1, 0, 0, 1);
+            glUniform1f(depth_at, should_pass ? -0.5f : 0.5f);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glEndQuery(GL_ANY_SAMPLES_PASSED);
+            glUniform1f(depth_at, 0.0f);
+
+            GLuint any = 0xffffu;
+            glGetQueryObjectuiv(query, GL_QUERY_RESULT, &any);
+            const GLenum error = glGetError();
+            fprintf(stderr,
+                    "INFO any-samples-%s got=%u want=%u err=0x%04x\n",
+                    should_pass ? "visible" : "occluded", any,
+                    (unsigned)should_pass, (unsigned)error);
+            result(should_pass ? "any-samples-visible" : "any-samples-occluded",
+                   error == GL_NO_ERROR && (any != 0) == should_pass);
+            glDeleteQueries(1, &query);
+        }
+        glDisable(GL_DEPTH_TEST);
     }
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
