@@ -8,9 +8,9 @@
 # instrument is tests/gl44-browser-sweep.sh.
 
 # Native probe suite: probes whose SUMMARY matches llvmpipe's.
-# Last measured 2026-09-14, after the colour-attachment byte-cost fix
-# (gl44-attachment-budget-probe is the one it added).
-probe_suite_ok 196
+# Last measured 2026-09-14, after the clip-control and 64-bit-attribute
+# fixes (gl44-clip-control-probe and gl44-double-attrib-probe added).
+probe_suite_ok 198
 
 # The probes that legitimately differ from llvmpipe, by name rather than by
 # count -- a count stays right when one known exception is fixed and a new one
@@ -46,3 +46,9 @@ cts_transform_feedback 19/2
 # charged every four-byte format eight bytes per sample instead of four, so
 # four of the eight were silently dropped and never written.
 cts_texture_barrier 4/0
+# 7/1 until 2026-09-14: GL_ZERO_TO_ONE was accepted and ignored, so every
+# fragment of a reverse-Z draw landed at the wrong depth.
+cts_clip_control 8/0
+# 26/4 until 2026-09-14. Two of the four were basic-inputL-*, the 64-bit
+# attribute cases; the third was the upper half having no shader location.
+cts_vertex_attrib_binding 29/1
