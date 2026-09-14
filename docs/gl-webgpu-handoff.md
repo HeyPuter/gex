@@ -25654,3 +25654,38 @@ rejected. `vertex_locations` is built from the unlowered shader and does not
 include the halves `gex_wgpu_lower_vertex_attrib_double` adds. Until it does,
 `missing` is not trustworthy for any shader with a 64-bit input, and the
 message it prints is reassuring rather than useful.
+
+## The ninth application: Qt Quick (2026-09-14)
+
+`tests/gates/app-qtquick.sh` passes. **rmse 62.0 against llvmpipe with 0% of
+pixels differing by more than 12%**, and identical image means, on a scene
+covering a gradient fill, a rounded-rectangle shader, an opacity group and a
+rotation.
+
+The renderer is new even though Qt is not: Qt Quick keeps a retained scene
+graph and batches it into draw calls through its own shader pipeline (RHI).
+Qt **Widgets** — which Krita and FreeCAD already cover — go through none of
+that.
+
+Like the GTK4 gate it renders to a **file**: QML's `grabToImage` hands back the
+rendered item, so the scene draws, saves itself and quits. No window to
+photograph, no animation, no settle time, and therefore usable on a busy
+desktop — which is how both of these got verified while the user's browser
+was open and every timing-based gate was untrustworthy.
+
+**Its control is a direct one, and it was tested by making it fail.** Qt Quick
+falls back to a `software` backend when it cannot get a GL context, and that
+backend never calls this driver at all. So the gate requires the gex run's log
+to contain driver output — if the driver ran, it said so. Forcing
+`QT_QUICK_BACKEND=software` makes both sides produce **byte-identical** images
+(5659 bytes each), which sails through any pixel comparison; the control
+catches it and fails the gate. A control that has not been made to fire is not
+known to work, and this one now has been.
+
+Two gotchas for anyone extending it:
+
+- `grabToImage` in `Component.onCompleted` returns nothing — there is no frame
+  yet — and the scene then never quits, so it presents as a timeout rather
+  than an error. It runs off a short `Timer` instead.
+- QML reads no environment, and `qml6 -- args` did not deliver an argument
+  cleanly, so the output path is substituted into the scene file per run.

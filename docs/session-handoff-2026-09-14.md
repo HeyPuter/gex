@@ -110,9 +110,15 @@ calls this driver. Both sides would then match and the gate would pass having
 tested nothing. It greps each run's log and fails on a fallback — and fails,
 rather than passing, when it cannot tell which renderer ran.
 
-Still uncovered after this: **Qt Quick** (`qmlscene6` is installed; Kdenlive
-stalls on its own startup, a different one may not) and a **game engine other
-than STK's**.
+**Qt Quick is covered too**, as the ninth — `tests/gates/app-qtquick.sh`,
+rmse 62.0 with no pixel differing by more than 12%, via QML's `grabToImage`
+rather than `qmlscene6`'s window. Both of these render to a file, which is why
+they could be verified on a machine whose desktop was in use.
+
+Still uncovered: a **game engine other than STK's**. Prefer one that can be
+driven to a file; that property is worth more than the engine's popularity,
+because a photographed gate spends most of its tolerance proving the two runs
+caught the same frame.
 
 ### 2. `vertex_attrib_64bit.vao` — the item as written is already done
 
