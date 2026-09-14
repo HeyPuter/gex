@@ -24589,3 +24589,58 @@ per `dvec3`/`dvec4`, at locations L and L+1, which GL already reserves).
 
 Still low priority on its own merits -- two cases, and applications convert
 doubles on the CPU because GPUs handle them slowly.
+
+## copy_image closed, the browser swept, and 64-bit inputs draw (2026-09-14)
+
+Three results, and two of them close short-term items.
+
+### copy_image: 324/324
+
+The one family the list called prohibitive -- "~78 seconds per case,
+measured, ~7 hours, unattended only" -- ran clean end to end. **324 passed, 0
+failed, 0 not-supported.** It cost about five and a half hours of wall clock
+sharing the machine with a browser sweep, and it found nothing, which is
+exactly the result that makes it worth having run once and not again. Short-
+term item 7 is done; drop it from the list rather than re-scheduling it.
+
+### The browser: 197 PASS / 2 FAIL / 2 SKIP
+
+Up from 193/2/2, the extra passes being the three probes added today. **Both
+failures are the same two as before and both are platform facts with native
+twins**: `group-vote` (the invocation group is one invocation) and
+`texture-sampler` (WebGPU offers `sampleCount` 1 or 4 and nothing else). The
+two skips are the GLX probes, which need an X connection the browser has no
+form of.
+
+So a day of driver changes -- labels everywhere, the capture storage blocks,
+`gl_PrimitiveID` through tessellation, the draw parameters -- cost the browser
+path nothing and gained it three probes' worth of coverage.
+
+### 64-bit vertex inputs: 2/4 to 3/4, and the estimate was wrong in a useful way
+
+The note above this one said the draw-path half "has never run" and its cost
+was unknown. Measured: **it is small.** st presents a double attribute as
+*one* element, `r32g32b32a32_uint` with `dual_slot` set, meaning "and another
+sixteen bytes at +16" -- so accepting `dual_slot` and emitting a second
+WebGPU attribute at `offset + 16`, `location + 1` is the whole of it. The
+width comes from the shader rather than the element, because the element says
+`r32g32b32a32_uint` whatever the declaration was and a `dvec3` is six words.
+
+**And lifting the refusal moved the failure into an abort.** With the shader
+linking, the transform-feedback capture reached a `dvec4` load for the first
+time; `gex_wgpu_capture_fetch` returns 32-bit words, so every consumer was
+left doing `unpack_64_2x32_split_x` on a 32-bit source, which `nir_validate`
+catches and **kills the process** on. A link error at least leaves the
+application alive. It declines by name now.
+
+That is [[lifting-a-refusal-moves-the-failure]] with a sharper edge than
+usual, and the general form is worth keeping: **when a refusal is lifted,
+check what the newly reachable path does with the construct before believing
+the score.** The score went 2/4 to 3/4 either way; the difference between the
+two versions was whether the application survived.
+
+`vao` is the one case left and it wants the capture to fetch eight words and
+pack per component, which also needs `gex_wgpu_capture_layout` to carry the
+element's component count -- the element's own format does not say it. Still
+not worth doing on its own merits; recorded so the next attempt starts from
+the right place.
