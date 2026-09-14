@@ -139,6 +139,11 @@ Do not spend time on these without new information. Each was measured.
   *three* of the four `limits` shortfalls on each platform.
 - **The 32-byte colour budget** is **native only** — the browser grants at
   least 128. Re-run a family in the browser before investigating one.
+- **Ten storage buffers per shader stage** is native only too — the browser
+  grants **16**. All three of `shader_image_load_store`'s tessellation-image
+  cases decline natively on "13 storage buffers, the device takes 10 per
+  stage" and pass 1/1 in the browser. The same caution applies: **re-run a
+  declined-on-a-limit family in the browser before treating it as work.**
 - **`sampleCount` 1 or 4 and nothing else**, which is why `GL_MAX_SAMPLES` is 4.
 
 ---

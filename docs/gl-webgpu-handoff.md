@@ -24882,9 +24882,39 @@ one buffer — the comment at `GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING`
 records that WebGPU refuses a read-only and a writable binding over the same
 buffer, which is why the header is a separate buffer and must stay one.
 
-This is the biggest single-construct pool left outside `direct_state_access`,
-and it is not only three CTS cases: any shader with many images in a
-compute-emulated stage hits the same ceiling.
+### Correction, measured an hour later: this is **native-only**, and the
+### estimate above is wrong twice
+
+Both corrections matter more than the lead did.
+
+**The browser passes all three cases.** It grants `storage/stage 16` where
+this adapter grants 10 — `device limits uniform/stage 12 storage/vertex 16
+storage/stage 16` from the page's own log — so 13 fits and the construct
+works:
+
+    basic-allTargets-loadStoreTCS   QPA-TOTAL pass=1 fail=0 skip=0
+    basic-allTargets-atomicTCS      QPA-TOTAL pass=1 fail=0 skip=0
+    basic-allTargets-loadStoreTES   QPA-TOTAL pass=1 fail=0 skip=0
+
+The browser is the path that counts. This belongs with the 32-byte colour
+budget in *walls that are not ours* — a native-adapter limit with no browser
+twin — not at the top of a work list.
+
+**And "the addressing already exists, so it is contained" was wrong.** The
+packed buffer belongs to the **resource**, not to the image slot:
+`gex->packed_image_buffer` is cached per texture and two image units on one
+texture are bound disjoint slice ranges of it, which is what makes the copy in
+and the copy back out per-resource bookkeeping. Consolidating across *different
+textures* moves that ownership to the draw, which means copying every bound
+image in and out on every draw that binds one — on a path where the cost of a
+copy-in is already noted as "a pass break per draw". `BASE_BYTES` makes the
+*shader* side free; it says nothing about the driver side, and I wrote the
+estimate from the half I had read.
+
+So: not worth building for three CTS cases that already pass where it counts.
+If it is ever built, it is for a native application that binds more than five
+packed images in an emulated stage, and the thing to measure first is whether
+one exists.
 
 ## Retrospective, first three hours of the week-long session (2026-09-14)
 
