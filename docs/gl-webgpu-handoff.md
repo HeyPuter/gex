@@ -24837,3 +24837,51 @@ capture work as `vertex_attrib_64bit.vao` and named by the driver:
 `sample_variables` 134/0/56 is worth a look at the *skips* rather than the
 failures: 56 is a lot of "not supported" and nobody has checked whether they
 are honest.
+
+## shader_image_load_store 39/10, grouped — and one lead with its shape (2026-09-14)
+
+The eleven named failures group into four things, which is worth more than the
+number:
+
+| | cases | |
+| --- | --- | --- |
+| `early-fragment-tests`, `basic-glsl-earlyFragTests` | 2 | the known WGSL wall; Tint drops the attribute. Not ours. |
+| `basic-allTargets-{atomicTCS,loadStoreTCS,loadStoreTES}` | 3 | **images in the tessellation stages**, and the driver names the cause exactly |
+| `advanced-sso-{atomicCounters,subroutine}` | 2 | separate shader objects; not looked at |
+| `multiple-uniforms`, `non-layered_binding`, `uniform-limits`, `single-byte_data_alignment` | 4 | assorted; the last has its own section and five eliminated causes |
+
+### The tessellation-image three, and why they are one binding short
+
+    gex-wgpu: dispatch declined (13 storage buffers, the device takes 10 per stage)
+    gex-wgpu:   group 0 storage bindings: 0 1 2 3 4 136 137 138 139 140 141 142 143
+    gex-wgpu: declined at gex_wgpu_tess_draw:36748
+
+Five of the driver's own — the capture's params, index table, varying output
+and records — plus **eight packed-image data buffers**, one per image. The
+device offers ten.
+
+**It is a real wall and not a missing ask**, which was checked rather than
+assumed: `GEX_WGPU_LIMIT_TRACE=1` reports `storage buffers/stage 10 (asked
+10)` with the adapter's own maximum also 10, and the driver already asks for
+24. `ask-for-the-limit` does not apply here; what has to shrink is the
+driver's own consumption.
+
+**The eight can become one, and the addressing for it is already written.**
+`GEX_WGPU_PACKED_IMAGE_BASE_BYTES` is a per-image byte offset *within its
+binding*, read by the shader at `gex_wgpu_packed_image_base` and already used
+for buffer images, whose view offset cannot be a 256-aligned binding offset.
+A single scratch buffer holding all of an invocation's packed images, each at
+its own base, is one storage binding instead of eight — 5 + 1 + 1 (the shared
+header) = 7, inside the ten.
+
+What that costs: the allocation has to be sized across all the images rather
+than per image, the texture-to-buffer copies in and out need the offset, and
+the shader lowering has to emit one binding number rather than
+`DATA_FIRST_BINDING + slot`. What it must not do is put two *bindings* over
+one buffer — the comment at `GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING`
+records that WebGPU refuses a read-only and a writable binding over the same
+buffer, which is why the header is a separate buffer and must stay one.
+
+This is the biggest single-construct pool left outside `direct_state_access`,
+and it is not only three CTS cases: any shader with many images in a
+compute-emulated stage hits the same ceiling.
