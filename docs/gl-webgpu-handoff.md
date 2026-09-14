@@ -25443,22 +25443,38 @@ only one query ever exists. The new `two-queries-pending` case in
 then both read, with **different** expected answers (visible, then occluded)
 so that a driver returning one value for both fails whichever value it picks.
 
-**The fix, not yet written.** Give each query its own slot: a query set of N
-(32 is ample), a slot assigned at `glBeginQuery`, `BeginOcclusionQuery(pass,
-query->slot)`, and `ResolveQuerySet(set, query->slot, 1, ...)` at read time,
-evicting by resolving eagerly if the ring wraps while a query is still
-pending. Resolving eagerly at `glEndQuery` instead would also be correct and
-is a third of the work, but it puts a stall on every `glEndQuery` — and
-occlusion queries are issued in bulk by exactly the applications this driver
-is for, so that trades a correctness bug for a performance one.
+**The fix, written and syntax-checked, not yet run.** Each query gets its own
+slot: a set of 32, a slot claimed at `glBeginQuery`,
+`BeginOcclusionQuery(pass, query->slot)`, and a resolve of that one slot at
+read time. The cursor rotates, and a slot whose query has been counted but not
+yet read is read back *before* being handed out again — its value is still
+correct at that moment and will not be once the slot is rewritten. A query
+that is read frees its slot, so the ordinary begin-read-begin-read pattern
+never evicts anything.
 
-**One hazard to check while doing it**, found in the same read: the pass
-descriptor only carries `occlusionQuerySet` when a query was active *at the
-moment the pass began*. A query that begins while a pass is already open would
-call `BeginOcclusionQuery` on a pass with no set attached, which is a
-validation error and takes the command buffer. Whether that is reachable
-depends on the batching rules; it needs an answer before the slot change goes
-in, not after.
+Resolving eagerly at `glEndQuery` would also be correct and is a third of the
+work, but it puts a stall on **every** `glEndQuery`, and occlusion queries are
+issued in bulk by exactly the applications this driver is for — that trades a
+correctness bug for a performance one. With 32 slots the stall is paid only by
+the thirty-third outstanding query.
+
+Three places had to agree and did not before: the set's `count`, the slot the
+pass writes, and the slot the resolve reads. `destroy_query` clears the
+ownership table too, or the eviction path would read back through a freed
+query.
+
+**A hazard I raised in the same read, and then settled: it does not exist.**
+The pass descriptor only carries `occlusionQuerySet` when a query was active
+at the moment the pass *began*, and `glBeginQuery` does not close an open
+pass — so a query beginning mid-pass looked like it would call
+`BeginOcclusionQuery` on a pass with no set, which is a validation error that
+takes the command buffer. It cannot happen: `reuse` is computed as
+`!counting_now && ...`, so a draw with an occlusion query active never reuses
+the open pass and always begins a fresh one with the set attached. The
+comment beside it says so, and this time the code agrees with the comment.
+
+Recorded rather than deleted because "is this reachable?" is the question the
+slot change would otherwise have to ask again, and the answer took one grep.
 
 Also fixed here, found in the same lines: the `counted = true` beside
 `BeginOcclusionQuery` was indented as though guarded by `if (counting)` and
