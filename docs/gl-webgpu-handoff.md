@@ -25186,10 +25186,25 @@ sub-case that the shader's `so_mask` still names. That is where to start.
 
 ## Four vertex streams, and a query that under-counted (2026-09-14)
 
-> **Written and syntax-checked, not yet run.** The app comparison held the
-> GPU for the whole session this landed in. Everything below describes what
-> the code does, traced by hand against `gl44-vertex-streams-probe`; none of
-> it is a measurement. Check the probe before trusting the claims.
+> **Measured 2026-09-14: `gl44-vertex-streams-probe` is 6/6**, matching
+> llvmpipe, and the values match what the design below predicts —
+> `two_streams` returns `buf0=100,101,102` and
+> `buf1=200,300,201,301,202,302`, which is stream 1's two-per-invocation
+> interleave in draw order. `stream_one_only` leaves buffer 0 at its sentinel,
+> so streams are not being collapsed into stream zero.
+>
+> Two defects turned up between writing and passing, both invisible to
+> reading:
+>
+> - **`create_query` never recorded the query's `index`** for the *counted*
+>   types. Only the occlusion branch set it, so every
+>   `glBeginQueryIndexed(GL_PRIMITIVES_GENERATED, 1, q)` produced a query that
+>   claimed to be stream 0's — and then collected stream 0's primitives and
+>   reported 3 where 6 was right. Harmless for as long as every count went to
+>   stream zero, which is exactly how it survived.
+> - A **probe** bug: `stream_one_only` declared an output it never wrote, so
+>   GLSL eliminated it and the link failed with "Transform feedback varying a
+>   undeclared". It failed on llvmpipe too, which is the tell.
 
 `GL_MAX_VERTEX_STREAMS` was **1**. GL 4.0 requires at least 4, and this driver
 advertises 4.6 — so the limit sat below its own floor. The cause was not a

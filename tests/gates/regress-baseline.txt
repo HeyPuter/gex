@@ -10,7 +10,7 @@
 # Native probe suite: probes whose SUMMARY matches llvmpipe's.
 # Last measured 2026-09-14, after the clip-control and 64-bit-attribute
 # fixes (gl44-clip-control-probe and gl44-double-attrib-probe added).
-probe_suite_ok 198
+probe_suite_ok 199
 
 # The probes that legitimately differ from llvmpipe, by name rather than by
 # count -- a count stays right when one known exception is fixed and a new one
@@ -41,7 +41,11 @@ cts_geometry_shader 136/0
 cts_cull_distance 202/0
 cts_shader_storage_buffer_object 124/0
 cts_shader_atomic_counter_ops_tests 4/0
-cts_transform_feedback 19/2
+# 19/2 until 2026-09-14. GL_MAX_VERTEX_STREAMS was 1 -- below the 4 GL 4.0
+# requires -- because the driver never set the cap and st clamps an unset one
+# with MAX2(1, 0). With four streams served, draw_xfb_stream_test runs.
+# draw_xfb_test is the one left.
+cts_transform_feedback 20/1
 # 0/4 until 2026-09-14. Eight R32UI attachments, each also sampled; the driver
 # charged every four-byte format eight bytes per sample instead of four, so
 # four of the eight were silently dropped and never written.
