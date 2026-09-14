@@ -374,6 +374,59 @@ int main(void) {
         glDisable(GL_DEPTH_TEST);
     }
 
+    /* Two occlusion queries outstanding at once, which is what
+     * KHR-GL45.compute_shader.conditional-dispatching actually does and what
+     * every case above avoids: each of those reads its result before starting
+     * the next query, so only ever one query exists at a time.
+     *
+     * The CTS begins a query, draws a quad that passes the depth test, ends
+     * it, begins a second, draws one that fails, ends it -- and only *then*
+     * reads the first. A driver holding one shared occlusion slot and
+     * resolving it lazily gives the first query whatever the second left
+     * there, so both come back zero and the conditional render that follows
+     * discards work it should have run.
+     *
+     * The two reads are deliberately after both queries have ended, and the
+     * expected answers differ (visible then occluded), so a driver that
+     * returns the same value for both fails whichever way that value goes. */
+    {
+        GLuint pair[2] = {0, 0};
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_TRUE);
+        glClearDepth(0.5);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glGenQueries(2, pair);
+
+        /* Nearer than the cleared depth: passes, and writes -0.5. */
+        glBeginQuery(GL_ANY_SAMPLES_PASSED, pair[0]);
+        glUniform4f(tint, 1, 0, 0, 1);
+        glUniform1f(depth_at, -0.5f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glEndQuery(GL_ANY_SAMPLES_PASSED);
+
+        /* Behind what the first draw just wrote: no sample survives. */
+        glBeginQuery(GL_ANY_SAMPLES_PASSED, pair[1]);
+        glUniform1f(depth_at, 0.5f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glEndQuery(GL_ANY_SAMPLES_PASSED);
+        glUniform1f(depth_at, 0.0f);
+
+        GLuint first = 0xffffu, second = 0xffffu;
+        glGetQueryObjectuiv(pair[0], GL_QUERY_RESULT, &first);
+        glGetQueryObjectuiv(pair[1], GL_QUERY_RESULT, &second);
+        const GLenum error = glGetError();
+        fprintf(stderr,
+                "INFO two-queries-pending first=%u (want nonzero) "
+                "second=%u (want 0) err=0x%04x\n", first, second,
+                (unsigned)error);
+        result("two-queries-pending",
+               error == GL_NO_ERROR && first != 0 && second == 0);
+        glDeleteQueries(2, pair);
+        glDisable(GL_DEPTH_TEST);
+    }
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

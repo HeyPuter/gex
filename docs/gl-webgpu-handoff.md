@@ -25406,3 +25406,62 @@ should be bound twice.
 
 So this item is closed. The class that remains open is the capture layout
 itself, and the fix for that is the helper, not another audit.
+
+## `conditional-dispatching`: one occlusion slot, resolved too late (2026-09-14)
+
+The open lead read: *"both `GL_ANY_SAMPLES_PASSED` queries return zero, yet the
+new probe cases pass in isolation"*, with the two candidates being the query
+type and the depth test. **It is neither.** Reading the CTS source and the
+driver's resolve path settles it.
+
+`KHR-GL45.compute_shader.conditional-dispatching` does this:
+
+```
+glBeginQuery(ANY_SAMPLES_PASSED, q[0]);  draw at depth 0.0;  glEndQuery(...)
+glBeginQuery(ANY_SAMPLES_PASSED, q[1]);  draw at depth 0.5;  glEndQuery(...)
+glBeginConditionalRender(q[0], GL_QUERY_WAIT);   <-- reads q[0] only now
+```
+
+Two queries are outstanding at once, and the first is read only after the
+second has ended. This driver has **one** occlusion slot —
+`set_desc.count = 1` — and resolves it **lazily**, at
+`glGetQueryObject`/predicate time, from that one shared slot. So `q[0]`'s read
+resolves whatever `q[1]` left there: zero, because the second draw failed the
+depth test. Both queries come back zero, the conditional render takes the
+wrong branch, and the dispatch that should have run is discarded.
+
+The hazard was already half-known — the `counted` flag exists precisely
+because *"resolving the shared slot would report the previous query's
+total"* — but the guard only covers a query that **no pass carried**. Two
+queries that were each genuinely counted still share the one slot, and the
+earlier one loses.
+
+**Why every existing case passes.** All the `any-samples-*` cases, and the
+scissor-based ones, read each result *before* starting the next query, so
+only one query ever exists. The new `two-queries-pending` case in
+`gl44-conditional-render-probe` is the CTS's shape: two queries, both ended,
+then both read, with **different** expected answers (visible, then occluded)
+so that a driver returning one value for both fails whichever value it picks.
+
+**The fix, not yet written.** Give each query its own slot: a query set of N
+(32 is ample), a slot assigned at `glBeginQuery`, `BeginOcclusionQuery(pass,
+query->slot)`, and `ResolveQuerySet(set, query->slot, 1, ...)` at read time,
+evicting by resolving eagerly if the ring wraps while a query is still
+pending. Resolving eagerly at `glEndQuery` instead would also be correct and
+is a third of the work, but it puts a stall on every `glEndQuery` — and
+occlusion queries are issued in bulk by exactly the applications this driver
+is for, so that trades a correctness bug for a performance one.
+
+**One hazard to check while doing it**, found in the same read: the pass
+descriptor only carries `occlusionQuerySet` when a query was active *at the
+moment the pass began*. A query that begins while a pass is already open would
+call `BeginOcclusionQuery` on a pass with no set attached, which is a
+validation error and takes the command buffer. Whether that is reachable
+depends on the batching rules; it needs an answer before the slot change goes
+in, not after.
+
+Also fixed here, found in the same lines: the `counted = true` beside
+`BeginOcclusionQuery` was indented as though guarded by `if (counting)` and
+was not — the `-Wmisleading-indentation` shape that has already cost this file
+once ([[inserting-before-an-unbraced-if]]). Braced; the warning count is now
+zero.
