@@ -121,9 +121,14 @@ static const char *ok_dvec4 =
  * advancing the vertex-element index in step, which is only the same walk
  * when every element is one slot wide.
  *
- * `dmat2x4` is the same shape arriving as one variable: two columns of dvec4,
- * occupying locations 0 and 2, for which st/mesa creates one vertex element
- * per *column* and not one per slot. */
+ * `dmat2x4` is the same shape arriving as one variable -- and its columns go
+ * at locations 0 and **1**, not 0 and 2. The "a dvec4 consumes two locations"
+ * rule separates distinct variables; a matrix's columns are consecutive. This
+ * case bound its second column at 2 to begin with and drew nothing on
+ * llvmpipe as well as here, which is what a case measuring its own setup
+ * looks like: the second column was simply never supplied. The `a=`/`b=`/`m=`
+ * numbers in each INFO line are printed so that assumption is visible rather
+ * than implied. */
 static const char *ok_two_dvec4 =
     "layout(location = 0) in dvec4 a;\n"
     "layout(location = 2) in dvec4 b;\n"
@@ -224,7 +229,8 @@ static void run_case(const char *name, const char *ok_src, unsigned comps)
  * locations 0 and 2. Both halves are checked, so binding the second at the
  * wrong location -- or reading the first one twice -- leaves the quad
  * untinted rather than coincidentally right. */
-static void run_pair_case(const char *name, const char *ok_src)
+static void run_pair_case(const char *name, const char *ok_src,
+                          GLuint second)
 {
     double data[4 * 8];
     const double want[8] = {FINE, 42.5, -7.25, FINE, 3.5, -9.75, 0.125, 256.0};
@@ -236,8 +242,8 @@ static void run_pair_case(const char *name, const char *ok_src)
                  GL_STATIC_DRAW);
     glEnableVertexAttribArray(0);
     attrib_lpointer(0, 4, GL_DOUBLE, (GLsizei)(8 * sizeof(double)), NULL);
-    glEnableVertexAttribArray(2);
-    attrib_lpointer(2, 4, GL_DOUBLE, (GLsizei)(8 * sizeof(double)),
+    glEnableVertexAttribArray(second);
+    attrib_lpointer(second, 4, GL_DOUBLE, (GLsizei)(8 * sizeof(double)),
                     (const void *)(4 * sizeof(double)));
 
     GLuint prog = build(ok_src, NULL, 0);
@@ -247,12 +253,28 @@ static void run_pair_case(const char *name, const char *ok_src)
     glFinish();
     unsigned char px[4] = {0};
     glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    char detail[160];
-    snprintf(detail, sizeof(detail), "rgb=%u,%u,%u prog=%u err=0x%04x", px[0],
-             px[1], px[2], prog, (unsigned)glGetError());
+    /* Where the linker actually put the inputs.
+     *
+     * Both cases here bind locations 0 and 2, because a dvec4 consumes two
+     * locations and so a second one -- or a matrix's second column -- belongs
+     * at 2. `two_dvec4` passes everywhere, so that much is right for separate
+     * variables. `dmat2x4` draws nothing on *both* this driver and llvmpipe,
+     * which means the case is failing for a reason they share, and the first
+     * thing to rule out is this assumption: if the columns are not at 0 and 2
+     * then the case is measuring its own setup and not either driver. */
+    char where[64] = "";
+    if (prog) {
+        const GLint at_a = glGetAttribLocation(prog, "a");
+        const GLint at_b = glGetAttribLocation(prog, "b");
+        const GLint at_m = glGetAttribLocation(prog, "m");
+        snprintf(where, sizeof(where), " a=%d b=%d m=%d", at_a, at_b, at_m);
+    }
+    char detail[200];
+    snprintf(detail, sizeof(detail), "rgb=%u,%u,%u prog=%u err=0x%04x%s", px[0],
+             px[1], px[2], prog, (unsigned)glGetError(), where);
     result(name, prog && is_tint(px), detail);
     glDeleteProgram(prog);
-    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(second);
     while (glGetError() != GL_NO_ERROR) { }
 }
 
@@ -301,8 +323,8 @@ int main(void)
     run_case("dvec2", ok_dvec2, 2);
     run_case("dvec3", ok_dvec3, 3);
     run_case("dvec4", ok_dvec4, 4);
-    run_pair_case("two_dvec4", ok_two_dvec4);
-    run_pair_case("dmat2x4", ok_dmat2x4);
+    run_pair_case("two_dvec4", ok_two_dvec4, 2);
+    run_pair_case("dmat2x4", ok_dmat2x4, 1);
 
     /* 4. The same attribute, read by a shader whose output is recorded with
      *    transform feedback. That runs the vertex stage as a *compute*

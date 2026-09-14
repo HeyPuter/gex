@@ -136,12 +136,28 @@ takes **two** slots, and st/mesa creates one vertex element per *column* of a
 matrix rather than one per slot — so for a `dmat2x4` the elements are 0 and 1
 while the slots are 0..3, and element 1 gets location 1 where it should get 2.
 
-Unverified: this is where reading ran out, and it wants a measurement.
-`gl44-double-attrib-probe` now has the two cases that decide it —
-`two_dvec4` (two separate inputs at locations 0 and 2) and `dmat2x4` (the same
-shape arriving as one variable). Every pre-existing case declares a single
-input at location 0, which cannot catch a wrong location because there is
-nothing after it to collide with.
+**Measured 2026-09-14, and the hypothesis above is wrong.** `two_dvec4` —
+two separate `dvec4` inputs at locations 0 and 2, which is exactly the
+two-slots-per-element case the walk was supposed to mishandle — **passes**,
+on this driver and on llvmpipe. So the element↔slot walk is fine for separate
+attributes and the reasoning above does not hold.
+
+`dmat2x4` also passes, on both, once the case stopped being wrong: it bound
+the matrix's second column at location **2**, and a matrix's columns are
+**consecutive** — 0 and 1. The "a dvec4 consumes two locations" rule separates
+distinct variables, which is why `two_dvec4` really does want 0 and 2 and the
+matrix does not. Bound at 1, llvmpipe and this driver both tint the quad;
+bound at 2, neither does, because the second column was simply never supplied.
+`gl44-double-attrib-probe` is 6/6 on both now and prints the locations
+`glGetAttribLocation` reports, so the assumption is visible instead of
+implied.
+
+**So neither half of the 64-bit path is broken, and this item no longer has a
+known defect behind it.** `vertex_attrib_64bit.vao` still fails with "slot 9
+not present", and what that case does differently from anything now covered is
+unknown — start by reading the case, not the driver. Twice now the recorded
+hypothesis here has been wrong, and both times the probe that would have
+settled it took ten minutes to write.
 
 ### 3. `MAX_VERTEX_STREAMS` 1 → 4 — implemented, not yet run
 

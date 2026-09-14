@@ -253,6 +253,13 @@ int main(void)
             "layout(stream = 0) out float a;\n"
             "layout(stream = 1) out float b;\n"
             "void main() {\n"
+            /* `a` is written but never emitted. Writing it is not
+             * decoration: an output a shader only declares is eliminated
+             * before linking, and glTransformFeedbackVaryings then fails
+             * the link with "Transform feedback varying a undeclared" --
+             * which failed this case on the *reference* too, so it was
+             * measuring GLSL elimination rather than stream routing. */
+            "  a = -1.0;\n"
             "  b = 500.0 + float(gl_PrimitiveIDIn);\n"
             "  EmitStreamVertex(1); EndStreamPrimitive(1);\n"
             "}\n";
