@@ -24771,3 +24771,69 @@ rather than this driver's, and the CTS does not trip over it because dEQP
 resolves every GL function dynamically — but it is the same class the probe
 suite reports as UNLINKABLE for `glGetProgramResourceLocationIndex`, and it is
 worth knowing that an application linking it directly would not start.
+
+## The twenty-family re-score, and where the work is now (2026-09-14)
+
+Family scores go stale, so twenty were re-run in one sweep. The table, native,
+KHR-GL45:
+
+    compute_shader               38/4     texture_barrier           0/4 -> 4/4
+    shader_image_load_store      39/10/2  direct_state_access     349/21
+    shader_atomic_counters       28/3     clip_control               7/1
+    texture_gather               75/0     gpu_shader5               21/1
+    texture_view                  5/2     shader_subroutine         27/1
+    program_interface_query      43/0     buffer_storage             9/0
+    explicit_uniform_location    48/0     shading_language_420pack 329/0
+    shader_storage_buffer_object 124/0    sample_variables         134/0/56
+    vertex_attrib_binding        26/4     transform_feedback        19/2
+    framebuffer_blit              1/2     get_texture_sub_image      2/0
+
+`texture_barrier` was the find and is closed (above). The rest, in the order
+they are worth picking up:
+
+### `direct_state_access` 349/21 -- 14 of them are one construct
+
+All 14 named failures are `textures_storage_multisample_3d_*`, and the
+decline message now diagnoses them outright:
+
+    declared slot 0 type 3 dim 2 bound_dim 3 ms_tile 0 samples 1 target 7
+
+They are **one-sample multisample arrays**. The device will not multisample
+those formats (r32f, rg32i, rgb32ui, rgba16ui_unorm and the rest of the wide
+ones), so the resource comes back at one sample; the tiling that turns a
+multisampled array into one wide 2D texture is gated on `samples > 1` and does
+not fire; and `gex_wgpu_flatten_ms_array` rewrote the shader to 2D anyway,
+because it keys on the *declaration*. The two halves disagree and every draw
+is declined.
+
+**The obvious fix is worse and has been tried.** Extending the gate to
+`nr_samples >= 1` stops the decline and the draw then fails validation:
+
+    The shader's binding dimension (TextureViewDimension::e2D) doesn't match
+    the layout's binding dimension (TextureViewDimension::e2DArray)
+
+A decline loses one draw; an invalid pipeline invalidates the command buffer
+and loses every draw batched with it. So a **third** place still disagrees
+about the dimension — the bind group layout — and finding it is the work. The
+condition is commented with all of this in `resource_create`.
+
+### `shader_image_load_store` 39/10/2 -- the next largest pool
+
+Not yet grouped by cause. Worth doing first, since ten in one family is the
+biggest remaining cluster and image load/store is a construct real applications
+use.
+
+### The rest are ones and twos
+
+`clip_control`, `gpu_shader5`, `shader_subroutine` at one each,
+`texture_view` and `framebuffer_blit` at two, `compute_shader` at four,
+`shader_atomic_counters` at three, `vertex_attrib_binding` at four — of which
+two are `basic-inputL-*`, the 64-bit attribute cases, blocked on the same
+capture work as `vertex_attrib_64bit.vao` and named by the driver:
+
+    transform feedback records nothing for this draw
+    (no capture variant; first attribute is r32g32b32a32_uint)
+
+`sample_variables` 134/0/56 is worth a look at the *skips* rather than the
+failures: 56 is a lot of "not supported" and nobody has checked whether they
+are honest.
