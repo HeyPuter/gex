@@ -72,6 +72,13 @@ REF2=${GEX_COMPARE_REF2:-}
 # floor of zero is exactly what a benchmark produces. Off by default because
 # it is another run per program.
 LOAD=${GEX_COMPARE_LOAD:-}
+# "Nothing else may touch the GPU while this runs" is three lines up in this
+# file's header and was never checked. Two leftover headless chromium
+# processes from an earlier probe run -- forty-eight minutes old, idle -- took
+# this from 13 seconds a program to 6.5 minutes, with no symptom but the
+# clock. An estimated 37 hours instead of 75 minutes.
+. "$(dirname "$0")/gates/gpu-exclusive.sh"
+gex_require_idle_gpu "gl-app-compare" || exit 2
 export DISPLAY=${GEX_DISPLAY:-:77}
 
 [ -d "$INST/lib/dri" ] || { echo "no driver at $INST/lib/dri" >&2; exit 2; }
