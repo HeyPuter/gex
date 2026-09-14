@@ -24413,3 +24413,53 @@ along the viewport's own bottom and left rows, where line rasterisation is
 ambiguous -- llvmpipe drew nothing there and the case failed *on the
 reference*. The geometry is inset now, and the sample row was read off a dump
 of the reference rather than derived.
+
+## gl_PrimitiveID through the emulated stages is narrower than recorded (2026-09-14)
+
+The short-term list's item 4 said "a draw *through* a geometry or
+tessellation shader still reads **0**, because those stages leave the carrier
+unwritten". Measured today with
+`tests/integration/programs/gl44-primitive-id-stages-probe.c`, that is half
+wrong, and the half that is right is one path rather than two:
+
+    geometry          1,2,3   PASS   (gl_PrimitiveID = gl_PrimitiveIDIn)
+    geometry_offset   8,18,28 PASS   (gl_PrimitiveIDIn * 10 + 7)
+    tessellation      1,1,1   FAIL   <- the whole of what is left
+    tess_geometry     1,2,3   PASS
+
+llvmpipe passes all four. The geometry stage already works, including a shader
+that writes an id bearing no relation to any primitive count -- which is the
+case that proves the value comes from the shader's write and not from a
+vertex-numbering coincidence. A geometry shader that writes `gl_PrimitiveID`
+declares it as an *output variable*, `gex_wgpu_collect_varyings` takes every
+output variable, so it is already a slot in the record and the passthrough
+already forwards it. And it works *after* a tessellation stage too.
+
+**What is left is tessellation with no geometry shader**, and the reason it is
+not plumbing is worth writing down before anyone estimates it again:
+
+The tessellation output is **indexed**. `tess_vertices` holds the generated
+vertices and `tess_indices` references them, and the passthrough reads its
+record by `gl_VertexID`, which for an indexed draw is the *index value*. Two
+triangles sharing a generated vertex therefore share one record, so there is
+no per-vertex slot that can name one primitive -- the same reason the plain
+path has `gex_wgpu_deindex_for_primitive_id` at all. Adding a
+VARYING_SLOT_PRIMITIVE_ID slot to `tes->outputs` does not work; whichever
+triangle wrote last would win.
+
+The shape that does work, and its pieces already exist:
+
+- de-index the tessellation output when `ctx->fs->reads_primitive_id` --
+  gather `tess_vertices` through `tess_indices` into a record buffer with one
+  record per *index*, which is exactly what
+  `gex_wgpu_gather_indexed_vertices` already does for the wide-point path
+  (`ctx->point_gathered_records`);
+- draw it non-indexed, so `gl_VertexID` is the record number again;
+- and then no new slot is needed at all: the passthrough can derive the id
+  with the same divide `gex_wgpu_emit_primitive_id` uses, because the record
+  order is the primitive order.
+
+Cost is a gather pass and three times the records for such a draw, which is
+the right trade for a construct this rare. Nothing in the CTS or the app sweep
+currently points at it; the probe is the only thing that does, and it is
+committed so the next attempt has a target.
