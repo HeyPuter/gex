@@ -25183,3 +25183,226 @@ with different sizes. Two transform-feedback binding points over overlapping
 ranges is an error GL raises at `glBeginTransformFeedback`, so the next
 question is whether the second target is *stale* — a leftover from an earlier
 sub-case that the shader's `so_mask` still names. That is where to start.
+
+## Four vertex streams, and a query that under-counted (2026-09-14)
+
+> **Written and syntax-checked, not yet run.** The app comparison held the
+> GPU for the whole session this landed in. Everything below describes what
+> the code does, traced by hand against `gl44-vertex-streams-probe`; none of
+> it is a measurement. Check the probe before trusting the claims.
+
+`GL_MAX_VERTEX_STREAMS` was **1**. GL 4.0 requires at least 4, and this driver
+advertises 4.6 — so the limit sat below its own floor. The cause was not a
+decision: the driver never set `caps->max_vertex_streams` at all, and
+`st_extensions.c` clamps an unset cap with `MAX2(1, 0)`. Alongside it, the
+geometry path refused outright:
+
+    gex_wgpu geometry shaders may only write stream zero
+
+### What made it tractable
+
+GLSL forbids multiple streams with any output primitive but points. So the
+whole strip-assembly problem — winding alternation, a triangle closing over
+the previous two vertices — **cannot arise** on a multi-stream shader. Each
+emitted vertex is its own primitive.
+
+The second simplification is that streams do not need their own buffers. This
+dispatch already spends five of the ten storage bindings the device grants,
+and four streams' worth would not fit. Instead the three geometry buffers are
+**partitioned**: one equal span per stream, stream zero first. That last
+detail is what makes the rasterizing draw need no change whatsoever — it only
+ever reads stream zero, which still begins at offset zero.
+
+The span is a draw-time number, so it arrives in two params the block already
+had spare (`GEX_WGPU_GS_PARAM_STREAM_VERTS`, `..._PRIMS`). A single-stream
+shader lowers to *exactly* what it lowered to before: the base for stream zero
+is a constant zero, folded away.
+
+### The pieces
+
+- `nir_lower_gs_intrinsics_per_stream`, which the driver was passing `0` for.
+  Without it the emitted-vertex counter on the intrinsic is one total across
+  every stream, so stream 1's first vertex writes at whatever index stream 0
+  had reached. Gated on `streams > 1`, so one stream keeps the cheaper
+  lowering.
+- Per-stream strip state and per-stream primitive counts. Each stream closes
+  primitives independently, and `EndStreamPrimitive` names which.
+- The scan restarts per stream — a prefix sum carried across them would place
+  stream 1's first primitive after all of stream 0's. Counts are `prims` wide
+  per stream, offsets one wider, because the scan writes each stream's grand
+  total one past its own end.
+- The compaction dispatches once per stream, binding **only** the targets
+  `xfb->buffer_to_stream` assigns to it. A dispatch given another stream's
+  buffer would compact into it.
+- Queries became per `(slot, stream)`. They were one per slot, so a second
+  `glBeginQueryIndexed` on another stream failed as though one were already
+  active — and `query_add` skipped any query with a non-zero index outright,
+  which was *true* of a driver that only wrote stream zero.
+
+`max_vertices` is a total across streams, so a span per stream over-allocates
+when a shader splits its budget. That is deliberate: always sufficient, and
+the alternative is a per-stream vertex count GLSL does not give us.
+
+### The defect found on the way
+
+`GL_PRIMITIVES_GENERATED` under-reported for an **instanced** geometry shader
+— `layout(invocations = N)` — whenever nothing was being captured. The
+query-only path scanned `runs` entries (`prims * invocations`) and then read
+the grand total at `prims`, which is a running subtotal one Nth of the way in.
+Four invocations over three points reported 3 instead of 12.
+
+It survived because the capture path passes the same value to both calls and
+was always right, and every existing feedback case binds a buffer. The new
+`generated_instanced` case in `gl44-gs-feedback-probe` is the first that runs
+the query-only path at all.
+
+### Probe
+
+`gl44-vertex-streams-probe` — six cases. The one that matters most is
+`stream_one_only`: a shader emitting on stream 1 alone, with stream 0's buffer
+armed with a sentinel. A driver that accepts multi-stream and routes every
+stream into stream zero looks *successful* from the draw's side — geometry
+appears, feedback buffers fill — and only the per-stream contents show it.
+A limit check alone cannot see that, which is why the probe was written before
+the implementation rather than after it.
+
+## The one-sample multisample-array lead, narrowed to a composition (2026-09-14)
+
+The 14 `textures_storage_multisample_3d_*` failures in
+`KHR-GL45.direct_state_access` were left with "a third place still disagrees
+about the dimension, and finding it is the work". Reading, not running,
+narrowed it — and ruled out the obvious candidate.
+
+**Not the layout's source.** `shader->texture_dimensions[]` is already
+`WGPUTextureViewDimension_2D` for a multisampled array: the declaration is
+rewritten at shader *creation*, because a tiled array is genuinely held as one
+wide multisampled 2D texture. That is why the 96-case multisample-array family
+works. So the layout and the flattened module agree by construction, and the
+naive fix — "make the layout consult the variant's `tiled_ms_slots`" — is
+answering a question that is already answered.
+
+**What is actually unaccounted for is the composition of two rewrites.** A
+one-sample multisample array is eligible for *both*:
+
+- `demoted_ms_slots` — the bound texture has one sample, so the multisampled
+  declaration is rewritten to an ordinary one.
+- `tiled_ms_slots` — the array layers are side by side, so the fetches are
+  rewritten to index one wide texture.
+
+Each is handled. Nothing handles both at once, and they disagree about what
+the declaration ends up being: demotion turns `sampler2DMSArray` into an
+array sampler (2DArray), while the creation-time rewrite already recorded 2D
+for the layout. That is the shape that produces
+
+    The shader's binding dimension (TextureViewDimension::e2D) doesn't
+    match the layout's binding dimension (TextureViewDimension::e2DArray)
+
+**Supporting evidence, and the cheapest next step.** The draw path computes a
+local `demoted_ms_slots` (and passes it to the layout builder) but has **no
+`tiled_ms_slots` local at all** — that one is computed only inside variant
+selection and stored on the variant. So the two rewrites are not even visible
+in the same scope, which is consistent with nobody having had to reconcile
+them.
+
+Next step is a measurement, not more reading: force tiling for one-sample
+arrays and print `demoted_ms_slots`, `tiled_ms_slots` and the layout's
+dimension for the failing slot in one line. Whether demotion fires *together*
+with tiling is the fact that decides the fix, and it is one run away.
+Re-reading the code further will not settle it — this section is already the
+end of what reading can establish.
+
+## The capture-path class, audited by diff (2026-09-14)
+
+Seven sites build a `gex_wgpu_capture_layout`, and they are near-identical
+copies of the same fifteen lines. That is what makes this a *class*: a fix
+applied to one is applied to one of seven, which is how the capture SSBOs and
+the draw parameters each went missing from four of them.
+
+Rather than read them in sequence, I extracted all seven and diffed them
+against each other. Every difference is then either deliberate or a defect,
+and there are few enough to judge one by one. Two were worth looking at:
+
+**`gex_wgpu_capture_positions` — deliberate.** It takes a vertex *range*
+(`low`, `high - low + 1`) rather than a draw, so indexing by
+`first + invocation` is its contract; its callers resolve indices before
+calling it.
+
+**`gex_wgpu_atomic_replay_draw` — a real defect, fix written but not yet run.** It never set
+`layout.index_table`, so it inherited the `memset`'s zero, and its caller
+guards `num_draws == 1 && !indirect` but **not `info->index_size`**. An
+indexed draw whose vertex shader uses the result of an atomic therefore
+captured vertex `first + invocation` instead of `index[...]`. Two things were
+wrong at once: the picture, since the rasterizing pass draws those records
+de-indexed, and — the one that matters — the **atomics themselves**, which
+this path exists to perform and which ran against the wrong vertices. Nothing
+downstream can notice: every value written is a plausible one.
+
+Fixed by giving it the slot table every sibling already builds, and by taking
+`draw->start` out of `FIRST_VERTEX` when a table carries it.
+
+This is the third instance of the same shape. The comment on the line
+capture's table records the second: *"Without this the rewrite took
+non-indexed draws only, so glLineWidth, GL_LINE_SMOOTH and GL_LINE_STIPPLE
+silently did nothing for any indexed line draw."*
+
+**Instrument.** `gl44-vertex-atomic-result-probe` had three cases and all
+three used `glDrawArrays` — its own header says the read-back "is exact for a
+non-indexed draw", so the gap was known and simply never covered. The new
+`indexed_slots` case draws indices 4..7 into an eight-slot output: the right
+answer writes the upper four and leaves the lower four at their filler, the
+wrong one does exactly the opposite. Positions come from the low two bits, so
+both index sets cover the viewport and the *picture* cannot be what
+distinguishes them — which is the point, because the picture is the half that
+was never the real damage.
+
+**Worth doing next:** these seven blocks should be one helper. The audit is
+repeatable (extract, diff, judge) but it only finds what has already gone
+wrong; a single `gex_wgpu_capture_layout_from_context()` would stop the class
+existing. Held back only because it touches seven draw paths at once and
+wants its own test cycle.
+
+### Two more classes swept the same way, both clean
+
+Recorded because a negative result is worth exactly as much as a positive one
+here, and re-running these costs an hour.
+
+**Every sampled-texture bind group layout entry** (13 sites) was checked for
+whether it sets all three fields that must agree with the module —
+`sampleType`, `viewDimension`, `multisampled`. A layout that disagrees with
+its shader is an invalid pipeline, which takes the whole command buffer.
+Only two sites omit `multisampled`, `gex_wgpu_depth_upload_pipeline` and
+`gex_wgpu_depth_resolve_pipeline`, and both are internal helpers whose own
+WGSL declares `texture_depth_2d` — so false is right and they agree. The
+compute path's omission, which is the one that would have mattered, was
+already found and fixed earlier (`shader_texture_image_samples_tests`).
+
+**The decline sets of the eight capture paths**, diffed against each other on
+the theory that a guard present in most and absent from one is the shape of
+the atomic-replay bug. Everything it surfaced is deliberate:
+`capture_positions` takes a vertex range rather than a draw;
+`flat_unfilled_draw` receives already-resolved `edges` from its caller and
+never reads an index buffer itself; `gs_draw` and `tess_draw` handle
+instancing rather than declining it. The one real omission this technique
+found is the one above.
+
+### The emulated stages, swept and symmetric (2026-09-14)
+
+The short-term list said the remaining place to look for the silent class was
+"the emulated stages' own equivalents" of the capture-path defects. Swept the
+same way — count every `gex_wgpu_bind_*` call in `gex_wgpu_gs_draw` against
+`gex_wgpu_tess_draw` — and they are symmetric:
+
+| helper | gs_draw | tess_draw |
+| --- | --- | --- |
+| `bind_stage_textures` / `_images` / `_packed_images` / `_ssbos` | 1 | **2** |
+| `bind_constants` | 2 | **3** |
+| `bind_varying_ssbos` / `_textures` | 1 | 1 |
+
+Two rather than one is the right answer, not a discrepancy: tessellation
+emulates *two* stages, so each per-stage helper is called for the control
+shader and again for the evaluation shader, while the `varying_*` pair belongs
+to the single vertex capture that feeds both. Nothing is bound once that
+should be bound twice.
+
+So this item is closed. The class that remains open is the capture layout
+itself, and the fix for that is the helper, not another audit.

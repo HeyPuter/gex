@@ -227,6 +227,81 @@ int main(void) {
     }
     result("distinct_per_vertex", distinct_ok);
 
+    /* The same read-back for an **indexed** draw, which the comment at the
+     * top of this file says is the case the slot arithmetic is not exact for
+     * -- and which every case above avoids by using glDrawArrays.
+     *
+     * The compute clone performs the atomics, so it is the clone's
+     * gl_VertexID that decides which slot each result lands in. GL says that
+     * is the *index value*; a clone that walks 0..count-1 instead reads a
+     * different set of vertices entirely, and nothing downstream can notice
+     * because every value it writes is a plausible one.
+     *
+     * So: eight slots, drawn with indices 4..7. The right answer writes the
+     * upper four and leaves the lower four at their filler; the wrong one
+     * does the exact opposite, which no rounding or ordering can confuse.
+     * Positions come from the low two bits, so both sets of indices cover the
+     * viewport and the picture cannot be what distinguishes them. */
+    GLuint out8 = 0, ebo = 0;
+    glGenBuffers(1, &out8);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, out8);
+    const unsigned blank8[8] = {77u, 77u, 77u, 77u, 77u, 77u, 77u, 77u};
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(blank8), blank8,
+                 GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, out8);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(reset), reset,
+                 GL_DYNAMIC_COPY);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(reset), reset,
+                 GL_DYNAMIC_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+
+    static const GLuint indices[4] = {4u, 5u, 6u, 7u};
+    glGenBuffers(1, &ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices,
+                 GL_STATIC_DRAW);
+
+    static const char *vs_indexed =
+        "#version 430 core\n"
+        "layout(std430, binding = 0) buffer Counter { uint n; } c;\n"
+        "layout(std430, binding = 1) buffer Out { uint v[8]; } o;\n"
+        "flat out uint seen;\n"
+        "void main() {\n"
+        "  uint got = atomicAdd(c.n, 1u);\n"
+        "  seen = got;\n"
+        "  o.v[gl_VertexID] = got + 1u;\n"
+        "  vec2 p = vec2((gl_VertexID & 1) == 0 ? -1.0 : 1.0,\n"
+        "                (gl_VertexID & 2) == 0 ? -1.0 : 1.0);\n"
+        "  gl_Position = vec4(p, 0.0, 1.0);\n"
+        "}\n";
+    GLuint prog3 = build(vs_indexed, fs_src);
+    int indexed_ok = 0;
+    unsigned eight[8] = {0};
+    if (prog3) {
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(prog3);
+        glDrawElements(GL_TRIANGLE_STRIP, 4, GL_UNSIGNED_INT, NULL);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                        GL_BUFFER_UPDATE_BARRIER_BIT);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, out8);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(eight), eight);
+        int upper = 1, lower = 1;
+        unsigned seen_mask = 0;
+        for (int i = 4; i < 8; ++i) {
+            if (eight[i] < 1 || eight[i] > 4) upper = 0;
+            else seen_mask |= 1u << eight[i];
+        }
+        for (int i = 0; i < 4; ++i)
+            if (eight[i] != 77u) lower = 0;
+        indexed_ok = upper && lower && seen_mask == 0x1eu;
+    }
+    fprintf(stderr, "INFO indexed lower=%u,%u,%u,%u (want 77 each) "
+            "upper=%u,%u,%u,%u (want 1..4)\n", eight[0], eight[1], eight[2],
+            eight[3], eight[4], eight[5], eight[6], eight[7]);
+    result("indexed_slots", indexed_ok);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return 0;

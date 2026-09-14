@@ -94,35 +94,86 @@ All pushed: mesa → `wink/gex-wgpu`, repo → `origin/gl-on-webgpu`.
 
 ## Short-term goals — what to pick up next
 
-### 1. An eighth application
+### 1. An eighth application — chosen, written, not yet run
 
-The highest-value item, because goal 1 is the product. Pick for the *renderer*:
-what is not yet covered is a Qt Quick application (Kdenlive stalls on its own
-startup — a different one may not), a GTK4/GSK application, and a game engine
-other than STK's. Prefer one drivable from the command line to a known frame.
+**GTK4/GSK**, via `tests/gates/app-gtk4.sh`. `gtk4-rendernode-tool render`
+takes a scene file and writes a PNG, so unlike every other app gate there is
+**no window to photograph, no animation and no settle time** — the two runs
+compare the same frame by construction, which is why its tolerance is tighter
+than the photographed gates'. The workload is new too: a retained scene graph
+that GSK compiles into passes with offscreen targets, rather than an
+application issuing GL calls.
 
-### 2. Finish the 64-bit capture, or close the item
+The control that makes it able to fail: `GSK_RENDERER` is a *request*, and
+GTK's fallback is the **cairo** renderer, which draws on the CPU and never
+calls this driver. Both sides would then match and the gate would pass having
+tested nothing. It greps each run's log and fails on a fallback — and fails,
+rather than passing, when it cannot tell which renderer ran.
 
-`vertex_attrib_64bit.vao` is the one case left and it wants the transform
-feedback capture to fetch eight words and pack per component — which needs
-`gex_wgpu_capture_layout` to carry the element's *component count*, because
-the element's own format says `r32g32b32a32_uint` whatever the declaration
-was. Small, now that the shader half is in. Still low priority on its own
-merits: applications convert doubles on the CPU.
+Still uncovered after this: **Qt Quick** (`qmlscene6` is installed; Kdenlive
+stalls on its own startup, a different one may not) and a **game engine other
+than STK's**.
 
-### 3. `MAX_VERTEX_STREAMS` 1 → 4
+### 2. `vertex_attrib_64bit.vao` — the item as written is already done
 
-The only untouched item from the previous list. GL 4.0 asks for four. The
-geometry stage is already a compute pass writing buffers, so four sets of
-buffers is the shape, with the rasterized draw taking stream 0. Rare in
-applications; parked with its shape written down.
+**Do not start from this item's old description.** It asked for the capture to
+"fetch eight words and pack per component"; `gex_wgpu_capture_input` already
+does exactly that — `layout->doubles[element]` carries the component count,
+all seven capture sites fill it, and the fetch reads two words per component
+and `nir_pack_64_2x32_split`s them. Both halves are in.
+
+What is actually left is in the **rasterizing** path, and it is a different
+defect. The failure is `slot 9 not present in the VertexState`, which is a
+pipeline validation error: the module declares a `@location` the vertex state
+does not offer. The location table is built by walking a variable's *slots*
+and advancing the vertex-element index in step:
+
+    const unsigned element = var->data.driver_location + slot;
+    const unsigned location = base_location + slot;
+
+which is only the same walk when every element is one slot wide. A `dvec4`
+takes **two** slots, and st/mesa creates one vertex element per *column* of a
+matrix rather than one per slot — so for a `dmat2x4` the elements are 0 and 1
+while the slots are 0..3, and element 1 gets location 1 where it should get 2.
+
+Unverified: this is where reading ran out, and it wants a measurement.
+`gl44-double-attrib-probe` now has the two cases that decide it —
+`two_dvec4` (two separate inputs at locations 0 and 2) and `dmat2x4` (the same
+shape arriving as one variable). Every pre-existing case declares a single
+input at location 0, which cannot catch a wrong location because there is
+nothing after it to collide with.
+
+### 3. `MAX_VERTEX_STREAMS` 1 → 4 — implemented, not yet run
+
+Done in the driver; awaiting a test cycle. **The shape written down here was
+wrong**, and worth correcting because it is the kind of guess that turns into
+a plan: "four sets of buffers" does not fit — this dispatch already spends
+five of the ten storage bindings the device grants. The three geometry buffers
+are **partitioned** instead, one span per stream, stream zero first, so the
+rasterizing draw (which only ever reads stream zero) needs no change at all.
+
+The cause was also not what the item implies. Nothing refused to implement it:
+the driver simply never set `caps->max_vertex_streams`, and `st` clamps an
+unset cap with `MAX2(1, 0)`. See `gl44-vertex-streams-probe`, and the
+handoff's own section for the two bugs found writing it.
 
 ### 4. Keep hunting the silent class
 
-`capture-paths-are-a-class` names what is covered and what is not. Audited and
-already correct: textures, images, packed images, uniform blocks and buffer
-textures, for the vertex captures *and* the emulated stages. The places left to
-look are the emulated stages' own equivalents of the three defects found today.
+`capture-paths-are-a-class` names what is covered and what is not. **The method
+that works is diffing the copies**, not reading them in turn: the seven capture
+sites are near-identical, so extracting all seven and diffing them makes every
+difference either deliberate or a defect, with few enough to judge one by one.
+That found the atomic-replay path capturing the wrong vertices for any indexed
+draw — wrong picture, and wrong *atomics*, which is what that path exists for.
+
+Swept clean the same way and recorded so they are not re-swept: all thirteen
+sampled-texture bind group layout entries, and the decline sets of the eight
+capture paths.
+
+The standing item is now the **refactor**: those seven blocks want to be one
+`gex_wgpu_capture_layout_from_context()`. An audit finds what has already gone
+wrong; only the helper stops the next one. Held back because it touches seven
+draw paths at once and wants its own test cycle.
 
 ---
 

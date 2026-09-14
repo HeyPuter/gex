@@ -253,6 +253,49 @@ int main(void) {
                         got[0] == 1.0f && got[1] == 3.0f &&
                         got[2] == -999.0f);
 
+    /* GL_PRIMITIVES_GENERATED with `layout(invocations = N)` and *nothing
+     * being captured*. Every case above binds a feedback buffer, and the
+     * driver's capture path and its query-only path are different code --
+     * the query-only one summed the per-invocation counts over all
+     * `primitives * invocations` runs but then read the grand total at
+     * `primitives`, which is a running subtotal a quarter of the way in.
+     *
+     * Four invocations over three points is twelve primitives; the subtotal
+     * the bug returns is three. No rounding or off-by-one reaches from one
+     * to the other, and turning the query off is not an option either --
+     * this is the only case here that runs the query-only path at all. */
+    GLuint instanced = build(
+        "#version 400 core\n"
+        "layout(points, invocations = 4) in;\n"
+        "layout(points, max_vertices = 1) out;\n"
+        "out float tag;\n"
+        "void main() {\n"
+        "  tag = float(gl_PrimitiveIDIn * 10 + gl_InvocationID);\n"
+        "  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n"
+        "  EmitVertex();\n"
+        "  EndPrimitive();\n"
+        "}\n", "tag");
+    GLuint spun = 0;
+    if (instanced) {
+        GLuint query = 0;
+        glGenQueries(1, &query);
+        glEnable(GL_RASTERIZER_DISCARD);
+        glUseProgram(instanced);
+        /* No glBeginTransformFeedback: the point is the path taken when
+         * nothing is recorded. */
+        glBeginQuery(GL_PRIMITIVES_GENERATED, query);
+        glDrawArrays(GL_POINTS, 0, 3);
+        glEndQuery(GL_PRIMITIVES_GENERATED);
+        glGetQueryObjectuiv(query, GL_QUERY_RESULT, &spun);
+        glDisable(GL_RASTERIZER_DISCARD);
+        glDeleteQueries(1, &query);
+    }
+    error = glGetError();
+    fprintf(stderr, "INFO generated_instanced=%u want=12 err=0x%04x\n", spun,
+            (unsigned)error);
+    result("generated_instanced",
+           instanced && error == GL_NO_ERROR && spun == 12);
+
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed,
            cases - passed);
     return cases == passed ? 0 : 1;

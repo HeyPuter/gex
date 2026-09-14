@@ -112,6 +112,38 @@ static const char *ok_dvec4 =
     "      && abs(a.w - (1.0lf + 1.0lf / 1073741824.0lf)) < 1.0e-12lf;\n"
     "}\n";
 
+/* Two 64-bit attributes, and a matrix that *is* two of them.
+ *
+ * Every case above declares a single input at location 0, which cannot catch
+ * a wrong location: there is nothing after it to collide with. A dvec4 takes
+ * **two** attribute slots, so a second one belongs at location 2 -- and the
+ * driver builds its @location numbers by walking a variable's slots and
+ * advancing the vertex-element index in step, which is only the same walk
+ * when every element is one slot wide.
+ *
+ * `dmat2x4` is the same shape arriving as one variable: two columns of dvec4,
+ * occupying locations 0 and 2, for which st/mesa creates one vertex element
+ * per *column* and not one per slot. */
+static const char *ok_two_dvec4 =
+    "layout(location = 0) in dvec4 a;\n"
+    "layout(location = 2) in dvec4 b;\n"
+    "bool ok() {\n"
+    "  return abs(a.x - (1.0lf + 1.0lf / 1073741824.0lf)) < 1.0e-12lf\n"
+    "      && abs(a.w - (1.0lf + 1.0lf / 1073741824.0lf)) < 1.0e-12lf\n"
+    "      && abs(b.x - 3.5lf) < 1.0e-12lf\n"
+    "      && abs(b.y + 9.75lf) < 1.0e-12lf\n"
+    "      && abs(b.w - 256.0lf) < 1.0e-12lf;\n"
+    "}\n";
+static const char *ok_dmat2x4 =
+    "layout(location = 0) in dmat2x4 m;\n"
+    "bool ok() {\n"
+    "  return abs(m[0].x - (1.0lf + 1.0lf / 1073741824.0lf)) < 1.0e-12lf\n"
+    "      && abs(m[0].w - (1.0lf + 1.0lf / 1073741824.0lf)) < 1.0e-12lf\n"
+    "      && abs(m[1].x - 3.5lf) < 1.0e-12lf\n"
+    "      && abs(m[1].y + 9.75lf) < 1.0e-12lf\n"
+    "      && abs(m[1].w - 256.0lf) < 1.0e-12lf;\n"
+    "}\n";
+
 static GLuint build(const char *ok_src, const char *const *varying,
                     unsigned varyings)
 {
@@ -188,6 +220,42 @@ static void run_case(const char *name, const char *ok_src, unsigned comps)
     while (glGetError() != GL_NO_ERROR) { }
 }
 
+/* One case with two dvec4 attributes: eight doubles a vertex, bound at
+ * locations 0 and 2. Both halves are checked, so binding the second at the
+ * wrong location -- or reading the first one twice -- leaves the quad
+ * untinted rather than coincidentally right. */
+static void run_pair_case(const char *name, const char *ok_src)
+{
+    double data[4 * 8];
+    const double want[8] = {FINE, 42.5, -7.25, FINE, 3.5, -9.75, 0.125, 256.0};
+    for (unsigned v = 0; v < 4; ++v)
+        for (unsigned c = 0; c < 8; ++c)
+            data[v * 8 + c] = want[c];
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(data), data,
+                 GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    attrib_lpointer(0, 4, GL_DOUBLE, (GLsizei)(8 * sizeof(double)), NULL);
+    glEnableVertexAttribArray(2);
+    attrib_lpointer(2, 4, GL_DOUBLE, (GLsizei)(8 * sizeof(double)),
+                    (const void *)(4 * sizeof(double)));
+
+    GLuint prog = build(ok_src, NULL, 0);
+    const GLfloat clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glClearBufferfv(GL_COLOR, 0, clear);
+    if (prog) { glUseProgram(prog); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); }
+    glFinish();
+    unsigned char px[4] = {0};
+    glReadPixels(SIDE / 2, SIDE / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    char detail[160];
+    snprintf(detail, sizeof(detail), "rgb=%u,%u,%u prog=%u err=0x%04x", px[0],
+             px[1], px[2], prog, (unsigned)glGetError());
+    result(name, prog && is_tint(px), detail);
+    glDeleteProgram(prog);
+    glDisableVertexAttribArray(2);
+    while (glGetError() != GL_NO_ERROR) { }
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -233,6 +301,8 @@ int main(void)
     run_case("dvec2", ok_dvec2, 2);
     run_case("dvec3", ok_dvec3, 3);
     run_case("dvec4", ok_dvec4, 4);
+    run_pair_case("two_dvec4", ok_two_dvec4);
+    run_pair_case("dmat2x4", ok_dmat2x4);
 
     /* 4. The same attribute, read by a shader whose output is recorded with
      *    transform feedback. That runs the vertex stage as a *compute*
