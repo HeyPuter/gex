@@ -56,3 +56,11 @@ cts_clip_control 8/0
 # 26/4 until 2026-09-14. Two of the four were basic-inputL-*, the 64-bit
 # attribute cases; the third was the upper half having no shader location.
 cts_vertex_attrib_binding 29/1
+# Added 2026-09-14, both newly scored and both dependent on this session's
+# MAX_VERTEX_STREAMS 1 -> 4: five of the overflow family's thirteen cases are
+# multi-stream, and transform_feedback3 is the ARB_transform_feedback3 family
+# outright. The overflow family read 7/8 before the two overflow query targets
+# were given separate slots -- a ResourceError was ending it five cases early,
+# so the "8" was cases *attempted*, not cases present.
+cts_transform_feedback_overflow_query_ARB 13/0
+cts_transform_feedback3 3/0

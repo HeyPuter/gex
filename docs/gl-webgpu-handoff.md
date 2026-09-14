@@ -25499,10 +25499,19 @@ zero.
 
 ## The queued driver work, and how to attribute a regression (2026-09-14)
 
-Five independent changes are sitting uncommitted in the mesa submodule —
+> **All of this landed.** The five changes below were verified together and
+> are in `f2d32ee55ce`; the table's value now is as a worked example of
+> pairing each change with the probe that isolates it, which is what made a
+> 568-line batch safe to verify in one pass. What it caught: the multi-stream
+> probe came back 3/6 where the others were clean, which pointed straight at
+> the query path rather than at the stream partitioning — `create_query` never
+> recorded `index` for the counted query types. Reading had not found that in
+> an hour; the per-probe split found it in one run.
+
+Five independent changes were sitting uncommitted in the mesa submodule —
 568 insertions over 103 hunks — because the app comparison held the GPU for
-the whole session. All five are syntax-clean with no new warnings (the total
-went 5 → 4; the misleading-indentation one is gone). None has been run.
+most of the session. All five were syntax-clean with no new warnings (the
+total went 5 → 4; the misleading-indentation one is gone).
 
 That is a lot to verify at once, so each was written with the probe that
 isolates it. Run them in this order and a regression names itself:
@@ -25528,9 +25537,10 @@ tests/gates/app-gtk4.sh /tmp/gtk4.png       # the eighth app, never yet run
 `$INST` and a build that does not install leaves them measuring the previous
 binary. It checks that for you now.
 
-**Baselines that must move when this lands**, and only then: `probe_suite_ok`
-gains `vertex-streams`, and the four probes above gain cases. Raise a baseline
-in the commit that earns it, never ahead of it.
+**Baselines that moved when it landed:** `probe_suite_ok` 198 → 199 and
+`cts_transform_feedback` 19/2 → **20/1** — `draw_xfb_stream_test` runs once
+there is more than one stream. Raised in the commit that earned them, which is
+the rule.
 
 **The one thing to be suspicious of first** if the geometry families move: the
 multi-stream change touches the common single-stream path. It should lower to
@@ -25646,6 +25656,21 @@ the plainest question instead: with 15 elements all in one buffer at stride
 `off=` beside each, and the test's own offsets are computed in `initBuffers`
 from `m_bo_1_offset_matrix` and friends.
 
+**The discriminator to run first.** `verifyXFBData` does not check the four
+combinations the same way — for an indexed draw it reads the captured record
+at `m_bo_index_data[n_batch]` rather than at `n_batch`:
+
+    const unsigned int xfb_index = is_indiced ? m_bo_index_data[n_batch]
+                                              : n_batch;
+
+So the indexed and non-indexed variants assert *different orderings* of the
+same capture. Run the four separately and see which report mismatches: if only
+the indexed ones do, the question is what order this driver's transform
+feedback writes records in for an indexed draw — and several paths here
+de-index a draw before capturing it, which is exactly the kind of thing that
+preserves the values and permutes them. If all four fail equally, the
+ordering is innocent and the fetch offsets are the place to look.
+
 **And the instrument that should have caught this earlier is still blind.**
 The dump prints `inputs 0x7d5f supplied 0x7d5f missing 0x0` for this shader —
 bit 9 is not in `inputs` at all, so the driver's own "did the vertex state
@@ -25689,3 +25714,82 @@ Two gotchas for anyone extending it:
   than an error. It runs off a short `Timer` instead.
 - QML reads no environment, and `qml6 -- args` did not deliver an argument
   cleanly, so the output path is substituted into the scene file per run.
+
+## Two GL query targets sharing one slot: 7/8 to 13/13 (2026-09-14)
+
+`KHR-GL45.transform_feedback_overflow_query_ARB` was **7/8 and stopped there**
+— eight of its thirteen cases ran at all. It is **13/13** now.
+
+The visible failure was `basic-single-stream-interleaved-attribs` reporting
+`ResourceError (glGetIntegerv() failed: GL_OUT_OF_MEMORY)`. That is the shape
+worth recognising: dEQP escalates a ResourceError beyond the case, so the five
+cases after it never ran. A single silent refusal cost more than it appeared
+to.
+
+**The cause.** `GL_TRANSFORM_FEEDBACK_OVERFLOW` (any stream) and
+`GL_TRANSFORM_FEEDBACK_STREAM_OVERFLOW` (one stream) are **distinct GL query
+targets and may be active at the same time** — and the `basic-*` cases run
+both together precisely to check them against each other. `gex_wgpu_query_slot`
+mapped both to one `GEX_WGPU_QUERY_OVERFLOW` slot, so the second
+`glBeginQuery` found the slot occupied and returned false. **st turns a false
+from `begin_query` into `GL_OUT_OF_MEMORY`**, which is what dEQP saw.
+
+Split into `GEX_WGPU_QUERY_OVERFLOW` and `GEX_WGPU_QUERY_OVERFLOW_ANY`, with
+one `gex_wgpu_query_overflow()` helper feeding both so the three producers
+cannot drift: the per-stream target hears about its own stream, the any-stream
+target about every stream.
+
+**Two silent refusals in the query path now speak**, and finding this took
+both. `create_query` and `begin_query` each returned a bare NULL/false, and
+each becomes `GL_OUT_OF_MEMORY` from `glBeginQuery` with nothing on stderr —
+the same shape that once ended a 16843-case mustpass run 31 cases in. They now
+name the pipe query type, the index and the reason. The message that solved
+this was:
+
+    gex-wgpu: glBeginQuery refused: pipe type 9 index 0 (a query of this type
+    is already active on this stream). st turns this into GL_OUT_OF_MEMORY.
+
+**Also newly scored, and it needed this morning's four streams:**
+`KHR-GL45.transform_feedback3` is **3/3**. The overflow family's
+`multiple-streams-one-buffer-per-stream` and
+`multiple-streams-multiple-buffer-per-stream` cases are multi-stream too, so
+five of the thirteen depend on `MAX_VERTEX_STREAMS` being 4.
+
+Both families are in `regress-baseline.txt` now, so neither can quietly
+regress.
+
+### The same audit over every query target: one collapse left (2026-09-14)
+
+Having found the overflow pair sharing a slot, the obvious next question is
+whether any other GL query target does. Mapping GL 4.6's targets onto
+`gex_wgpu_query_slot`:
+
+| GL target | our slot |
+| --- | --- |
+| `SAMPLES_PASSED`, `ANY_SAMPLES_PASSED`, `ANY_SAMPLES_PASSED_CONSERVATIVE` | **all three → `OCCLUSION`** |
+| `PRIMITIVES_GENERATED` | `GENERATED` |
+| `TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN` | `EMITTED` |
+| `TRANSFORM_FEEDBACK_OVERFLOW` | `OVERFLOW_ANY` *(split today)* |
+| `TRANSFORM_FEEDBACK_STREAM_OVERFLOW` | `OVERFLOW` *(split today)* |
+| `TIME_ELAPSED`, `TIMESTAMP` | no slot — they return before the slot check |
+
+So **three occlusion targets still share one slot**, and GL's "a query of this
+target is already active" error is per *target*: a program may legally run
+`GL_SAMPLES_PASSED` and `GL_ANY_SAMPLES_PASSED` at the same time, and this
+driver would refuse the second — `GL_OUT_OF_MEMORY`, and potentially the same
+ResourceError that cost five cases in the overflow family.
+
+**It is not the same fix, and that is why it is written down rather than
+done.** The overflow pair only ever needed two counters. These three want the
+render pass to write two occlusion results for the same draws, and a pass
+carries one `beginOcclusionQuery` at a time — so serving them properly means
+either a second pass or deriving both from one count
+(`ANY_SAMPLES_PASSED` is `SAMPLES_PASSED != 0`, and the conservative variant
+may over-report, so one count can legitimately answer all three *when the
+query ranges coincide*). Ranges that do not coincide need real work.
+
+**Measure before building any of it.** No test is yet known to run two
+occlusion targets at once — `direct_state_access.queries_*` and
+`conditional_render_inverted` both *mention* several targets but appear to
+drive them one at a time. Score those two families first; if nothing exercises
+the overlap, this belongs in "walls that are not ours" rather than on a list.

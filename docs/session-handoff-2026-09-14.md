@@ -94,7 +94,7 @@ All pushed: mesa → `wink/gex-wgpu`, repo → `origin/gl-on-webgpu`.
 
 ## Short-term goals — what to pick up next
 
-### 1. An eighth application — chosen, written, not yet run
+### 1. Applications eight and nine — both verified
 
 **GTK4/GSK**, via `tests/gates/app-gtk4.sh`. `gtk4-rendernode-tool render`
 takes a scene file and writes a PNG, so unlike every other app gate there is
@@ -120,7 +120,7 @@ driven to a file; that property is worth more than the engine's popularity,
 because a photographed gate spends most of its tolerance proving the two runs
 caught the same frame.
 
-### 2. `vertex_attrib_64bit.vao` — the item as written is already done
+### 2. `vertex_attrib_64bit.vao` — half fixed, and still failing
 
 **Do not start from this item's old description.** It asked for the capture to
 "fetch eight words and pack per component"; `gex_wgpu_capture_input` already
@@ -158,14 +158,26 @@ bound at 2, neither does, because the second column was simply never supplied.
 `glGetAttribLocation` reports, so the assumption is visible instead of
 implied.
 
-**So neither half of the 64-bit path is broken, and this item no longer has a
-known defect behind it.** `vertex_attrib_64bit.vao` still fails with "slot 9
-not present", and what that case does differently from anything now covered is
-unknown — start by reading the case, not the driver. Twice now the recorded
-hypothesis here has been wrong, and both times the probe that would have
-settled it took ten minutes to write.
+**Neither of those is broken, so the defect was elsewhere — and it was found,
+by running the case with `GEX_WGPU_VS_STATE_LOG=1` rather than by reading.**
+The upper-half fallback was gated on `elements[i-1].dual_slot`, and this test
+delivers a 64-bit attribute's two halves as *separate elements with the flag
+clear on both*; locations 5, 7 and 9 were never supplied while the module
+declared them. That was a pipeline validation error, which takes the whole
+command buffer. Fixed.
 
-### 3. `MAX_VERTEX_STREAMS` 1 → 4 — implemented, not yet run
+**The case still fails**, now on data with no WebGPU errors at all: every
+attribute reads one vertex behind. The handoff section has the evidence, what
+it rules out (`first` is 0; divisors are 0 in the logged variant) and the
+discriminator to run next — `verifyXFBData` checks indexed and non-indexed
+draws against *different* orderings, so which of the four combinations fails
+decides where to look.
+
+**Four recorded hypotheses here have now been wrong.** Each was settled in one
+run by an instrument. Reach for `GEX_WGPU_*_LOG` before reading driver
+source — `grep -o 'GEX_WGPU_[A-Z_]*LOG'` lists them.
+
+### 3. `MAX_VERTEX_STREAMS` 1 → 4 — done
 
 Done in the driver; awaiting a test cycle. **The shape written down here was
 wrong**, and worth correcting because it is the kind of guess that turns into
@@ -222,6 +234,20 @@ Do not spend time on these without new information. Each was measured.
 ---
 
 ## How to not lose a day
+
+0. **Waiting on a long run: use a background command that *exits*, not a
+   `tail -f`.** A watch on a log file never ends by itself, so it stays armed
+   until its timeout and leaves a `tail` running long after the thing it was
+   watching finished — four of them accumulated in one session here, the
+   oldest 43 minutes past its job. For a single "tell me when this is done",
+   run the work itself in the background; it notifies on exit. Keep a log
+   watch only when you genuinely want an event per line, and stop it when the
+   job ends.
+
+   And when counting the leftovers, `pgrep -fc 'tail -f ...'` counts *itself*
+   — it said 5 where `ps | grep` showed 1. The same trap as
+   `pgrep-f-matches-the-waiter`, and it is remarkably easy to walk into while
+   writing the cleanup for it.
 
 The traps this session actually hit, worst first.
 
