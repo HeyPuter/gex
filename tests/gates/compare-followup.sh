@@ -44,7 +44,22 @@ gex_require_idle_gpu "compare-followup" || exit 2
 # is built by scanning for binaries that link libGL and nothing promises they
 # all live in one directory.
 cand=$(mktemp)
-awk -F'\t' 'NR>1 && $2 != "-" {print $2"\t"$1}' "$IN/results.tsv" \
+# Ranked by how far each row stands **above its own animation floor**, not by
+# raw RMSE. The first pass already measures `self` -- the same driver twice --
+# and on this corpus the largest raw numbers are mostly animated programs
+# diverging from themselves just as much: `clear-repeat` scored rmse 0.254
+# against self 0.549, and would have taken one of these slots while telling us
+# nothing. A deterministic row (self 0) keeps its full score, which is what
+# puts the real candidates at the top.
+#
+# Rows whose self is missing ("-") are treated as a zero floor: unmeasured is
+# not the same as zero, but ranking them as if animated would hide a row that
+# was never given the control run.
+awk -F'\t' 'NR>1 && $2 != "-" {
+       floor = ($3 == "-" || $3 == "") ? 0 : $3
+       above = $2 - floor
+       if (above > 0) printf "%.9f\t%s\n", above, $1
+     }' "$IN/results.tsv" \
     | sort -gr | head -n "$COUNT" | cut -f2 > "$cand.names"
 while read -r name; do
     grep -m1 -E "/${name}\$" "$LIST" || echo "  (not in $LIST): $name" >&2
