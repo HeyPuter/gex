@@ -24885,3 +24885,61 @@ buffer, which is why the header is a separate buffer and must stay one.
 This is the biggest single-construct pool left outside `direct_state_access`,
 and it is not only three CTS cases: any shader with many images in a
 compute-emulated stage hits the same ceiling.
+
+## Retrospective, first three hours of the week-long session (2026-09-14)
+
+Everything below is committed and pushed; nothing is in flight. The record is
+above; this is what the *process* cost and what to do differently.
+
+### Where time went that it should not have
+
+**Kdenlive, about fifty minutes, for an inconclusive result.** The driver
+question was answered at roughly the twenty-minute mark, when the llvmpipe
+reference stalled on the identical welcome screen — that is the moment the
+evidence stopped supporting more work on it, and I spent another half hour on
+GUI automation anyway. VLC, chosen for being drivable from a command line to a
+known frame, took twenty minutes start to finish and is verified.
+
+The rule that follows is in the new session handoff: **for an application gate,
+pick one that reaches a known frame without a click.** The gate and the lesson
+are both kept, so it is not wasted, but it was the one lead pursued past its
+evidence.
+
+**A relative `cd` that failed, three times.** `cd third_party/...` in a
+compound command, from a shell whose directory had already moved, then
+`./web/build-mesa-native.sh` — which prints "No such file or directory" and
+matches none of the usual `grep -iE ' error|FAILED'` filters. Each time the
+result was a test run against the *previous* binary, twice producing a
+"result" I nearly believed. Two fixes: absolute paths in every `cd`, and the
+build script now checks its own install (below).
+
+**Overwriting an existing probe.** `gl44-texture-barrier-probe.c` already
+existed with three cases and a fresh one was written over it. Recovered
+intact from git. The tell was in the tool output — "has been **updated**
+successfully" rather than "created" — and the grep that would have caught it
+searched the probe list for the subject's *neighbours* and never for the
+subject.
+
+### What the ms-array attempt was worth
+
+Changing the multisample-array tiling gate, finding it worse, and reverting
+cost about twenty minutes and produced the sharpest lead of the afternoon: the
+exact validation message, the fact that a *third* place disagrees about the
+dimension, and a comment in the code that stops the next person repeating it.
+That is the shape a negative result should have.
+
+### Tooling, from the same three hours
+
+`web/build-mesa-native.sh` now verifies its own install: it refuses if nothing
+landed in `$OUT/inst`, refuses if the driver source is newer than the
+installed library, and prints the installed path with its timestamp. Every
+caller wanted that check and none of them had it, which is what made the
+stale-install failure possible at all — and it checks `libgallium-*.so`, not
+`libdril_dri.so`, which is a stub whose timestamp made clean builds read as
+stale.
+
+`tests/gates/regress.sh` and its baseline file were the other tooling output,
+and both earned their keep the same day: the regression run caught the probe
+count moving and said "CHANGED got=196 expected=195 -- read each before
+deciding it is a regression", which is exactly the failure mode a remembered
+number produces.

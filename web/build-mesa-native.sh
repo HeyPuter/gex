@@ -90,5 +90,25 @@ if [ -d "$OUT/inst/lib" ] && [ -e "$OUT/inst/lib/libGL.so.1" ]; then
     done
 fi
 
-echo "built: $OUT"
-find "$OUT" -name "libgallium_dri.so" -o -name "libGL.so*" | head -5
+# Did the driver actually move? Every caller wants this and none of them
+# checked it, so three times in one afternoon a build ran against a stale
+# install or did not run at all -- the second happening whenever this script
+# was invoked from a directory where `./web/build-mesa-native.sh` does not
+# resolve, which prints "No such file or directory" and matches none of the
+# usual `grep -iE ' error|FAILED'` filters.
+#
+# Checking libgallium-*.so and not libdril_dri.so: the latter is a stub that
+# needs only libm and libc, and reading *its* timestamp made several clean
+# builds look stale.
+DRIVER=$(ls "$OUT"/inst/lib/libgallium-*.so 2>/dev/null | head -1)
+SRC=$ROOT/third_party/mesa/src/gallium/drivers/gex_wgpu/gex_wgpu_screen.c
+if [ -z "$DRIVER" ]; then
+    echo "BUILD PROBLEM: nothing installed at $OUT/inst/lib/libgallium-*.so" >&2
+    exit 1
+fi
+if [ "$SRC" -nt "$DRIVER" ]; then
+    echo "BUILD PROBLEM: $SRC is newer than the installed driver -- the" >&2
+    echo "  install did not happen, and every gate reads the installed one." >&2
+    exit 1
+fi
+echo "built and installed: $DRIVER ($(date -r "$DRIVER" '+%Y-%m-%d %H:%M:%S'))"
