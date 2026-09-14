@@ -24488,3 +24488,71 @@ the way rather than the mechanism:
 1,2,3 matching llvmpipe exactly. `tessellation_shader` 139/0/1,
 `geometry_shader` 136/0, `cull_distance` 202/0/16 unchanged; native probe
 suite 194 OK.
+
+## The capture paths are a class, not three bugs (2026-09-14)
+
+Three defects in one afternoon, all the same shape, and the shape is worth
+naming because a fourth is likely and the search for it is cheap.
+
+**A vertex shader replayed as compute is not the shader the draw declared.**
+Six paths do that replay -- the geometry, tessellation, wide-line and
+flat-unfilled vertex captures, the standalone position capture, and the
+atomic-result replay -- plus the transform-feedback side-effect capture. Each
+builds a *clone* of the vertex shader, lowers it into a compute stage, and
+binds groups of its own. Anything the rasterizing path gives the shader has to
+be given again, by hand, seven times. What was missing:
+
+| | shape | how it showed |
+| --- | --- | --- |
+| application storage blocks | **loud** | module declares `@group(1) @binding(32)`, layout does not; invalid pipeline takes the command buffer and every draw in it |
+| `gl_PrimitiveID` after tessellation | quiet | reads 0 |
+| `gl_BaseVertex`, `gl_DrawID` | quiet | reads 0, or reads the capture's own first slot |
+
+The loud one is the easy one: it names itself once the layouts are labelled.
+The quiet ones are the expensive ones, and **both had an answer already
+written that was wrong**, which is what kept them invisible:
+`gex_wgpu_capture_builtin` mapped `load_base_vertex` to
+`GEX_WGPU_PARAM_FIRST_VERTEX` (a different number) and `load_draw_id` to the
+immediate zero. An answer that is always available and sometimes wrong is
+worse than no answer at all -- with no answer, Tint refuses the module and
+someone finds out.
+
+### How to look for the fourth
+
+The list of things a vertex shader can read is short, and each is one probe
+case through one capture path. Covered now, with the probe that covers it:
+
+- storage blocks -- `gl44-capture-ssbo-probe` (7 cases, HEAD scored 1/7)
+- `gl_PrimitiveID` -- `gl44-primitive-id-stages-probe`
+- `gl_BaseVertex` / `gl_BaseInstance` / `gl_DrawID` --
+  `gl44-capture-drawparams-probe` (7 cases, HEAD scored 2/7)
+- textures, images, packed images -- `gex_wgpu_bind_varying_textures`, which
+  every one of the six already calls, and which exists *because* this class
+  was noticed once before
+- uniform blocks -- `gex_wgpu_bind_constants`, likewise all six
+
+Not covered, and the places to look next: **buffer textures**
+(`samplerBuffer`) through a capture, `gl_ClipDistance` read back, and the
+compute-emulated stages' own equivalents (a geometry or evaluation shader
+reading any of the above, rather than the vertex shader feeding it).
+
+### Two probe traps, both of which produced a false PASS first
+
+Both cost a build each and would cost the next probe the same:
+
+1. **A sized storage block never reaches the emitter.** The access is lowered
+   to a `load_ssbo` carrying a block number and the *variable* dies, so the
+   module declares no binding and there is nothing to mismatch. The first
+   `capture-ssbo` probe used `vec4 at[4]` and passed against the broken
+   driver. An **unsized** array plus `.length()` keeps the variable alive.
+2. **A value that is already the default cannot be measured.** The first
+   `draw_id` case shifted command 1 off the bottom of the viewport, so an id
+   stuck at 0 drew it exactly on top of command 0 and the sampled pixel was
+   identical either way. The first `cull_distance` case culled nothing, so
+   losing the capture dispatch left the driver drawing everything -- which is
+   the right picture. **Make the wrong answer move something**, and read both
+   the place it should be and the place it should not.
+
+And one that cost only a reference run: an outline sampled on the viewport's
+own edge row is ambiguous, llvmpipe draws nothing there, and the case fails on
+the *reference*. Inset the geometry and read the sample row off a dump.
