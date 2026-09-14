@@ -25113,3 +25113,73 @@ repeated:
 
 So the rule stands — **every field in that list is a promise** — and the list
 currently keeps all of them but the one platform cannot.
+
+## Conditional render governed draws and blits only (2026-09-14)
+
+`gex_wgpu_render_cond_passes` existed, was correct, and was consulted in
+exactly two places: `gex_wgpu_draw_vbo` and `gex_wgpu_blit`. GL lists more
+commands than that as discarded by an active conditional render — **`glClear`
+and `glDispatchCompute` among them** — and neither asked.
+
+So a clear or a dispatch inside a failed `glBeginConditionalRender` happened
+anyway. Same shape as `clip_halfz`: the capability advertised, the hook
+implemented, and one of the commands it governs never wired up.
+
+`gl44-conditional-render-probe` gained four cases and they are **both senses
+each**, which matters: a case that only checks the skip passes on a driver
+that never performs the command at all.
+
+    before  clear-fails FAIL  dispatch-fails FAIL      (7/9)
+    after   all four PASS                              (11/11)
+
+Three sites, because `pipe_context::clear` carries no `render_condition_enabled`
+flag the way `clear_render_target` and `clear_depth_stencil` do — st does not
+check, so the driver must. Patching only the two that *have* the flag left
+`glClear` itself unconditional, which the probe caught by still failing
+`clear-fails` after `dispatch-fails` had started passing.
+
+**And a stale comment was most of why this survived.** Sitting directly above
+the `(void)render_condition_enabled` was:
+
+> this driver implements no set_render_condition, so none can be active
+
+True when written, false from the moment `gex_wgpu_render_condition` was
+added. A stale premise is worse than no comment: it explains away the very
+thing that needs doing, and it reads as a decision rather than an omission.
+
+### What it did not fix
+
+`KHR-GL45.compute_shader.conditional-dispatching` still fails, and the cause
+is now known to be elsewhere. `GEX_WGPU_CONDRENDER_LOG=1` shows the predicate
+consulted twice and **both** of its queries returning zero — so the quad that
+should have passed the depth test recorded no samples either. The probe's two
+new `any-samples-*` cases drive `GL_ANY_SAMPLES_PASSED` with the depth test as
+the discriminator, exactly that shape, and **pass**. So it is not the query
+type and not the depth test in isolation; the test's own sequence does
+something neither covers.
+
+## Two things the transform-feedback capture binds too widely (2026-09-14)
+
+`KHR-GL45.texture_view.view_classes` declines with
+
+    draw declined (capture binding 17 [0..384) and capture binding 16 [0..192)
+    are both writable over one range of the same buffer)
+
+The ranges in that message are new, and they are how it was diagnosed. The
+message used to name only the bindings, which cannot distinguish "GL really
+asked for two overlapping ranges" from "the driver bound more than each
+needed" — and it *was* the latter, once: each stream-output target bound the
+**whole buffer at offset zero** and put its base in the shader's parameters,
+because a storage binding offset must be 256-aligned and GL promises four. Any
+two targets on one buffer collided whatever GL had asked for.
+
+Fixed: each target binds from its own base rounded down to 256, with the
+remainder kept in the parameters, and sized to its own range rather than the
+allocation. `transform_feedback` stays 19/2.
+
+**It does not fix `view_classes`**, and the new message is why that is now a
+fact rather than a guess: both bindings really do start at 0, on one buffer,
+with different sizes. Two transform-feedback binding points over overlapping
+ranges is an error GL raises at `glBeginTransformFeedback`, so the next
+question is whether the second target is *stale* — a leftover from an earlier
+sub-case that the shader's `so_mask` still names. That is where to start.
