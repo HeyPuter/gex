@@ -36,6 +36,7 @@ EMDAWN=${GEX_EMDAWN_DIR:-$ROOT/web/.work/emdawnwebgpu-v20250428.134257/emdawnweb
 
 if [ ! -f "$OUT/build.ninja" ]; then
     meson setup "$OUT" "$ROOT/third_party/mesa" \
+        --prefix "$OUT/inst" \
         --buildtype=release \
         -Dgallium-drivers=gex_wgpu,softpipe \
         -Dvulkan-drivers= \
@@ -48,6 +49,22 @@ if [ ! -f "$OUT/build.ninja" ]; then
         -Dbuild-tests=false
 fi
 ninja -C "$OUT"
+# Installed, not merely built.
+#
+# Every native gate -- tests/gl-cts-native.sh, the app gates, the probe
+# suite -- reads $OUT/inst, and this script used to stop at ninja. The build
+# directory's driver was fresh and the installed one was whatever the last
+# manual `ninja install` had left, so a rebuild "succeeded" and the run under
+# it measured the *old* driver. It reads as a fix that did nothing, which is
+# the most expensive kind of wrong answer: the next move is to doubt the fix
+# rather than the build. Checking the timestamp of $OUT/inst/lib/dri against
+# the source is what caught it, and doing the install here is what stops it
+# coming back.
+#
+# --prefix above matters for the same reason: without it a fresh setup
+# defaults to /usr/local and the install silently goes somewhere no gate
+# looks (or fails on permissions).
+ninja -C "$OUT" install >/dev/null
 
 # Aliases for the names a dlopen-based toolkit asks for.
 #

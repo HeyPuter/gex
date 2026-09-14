@@ -24294,3 +24294,122 @@ an afternoon. The driver sets no multisample-image capability, so
 and an application therefore cannot create a multisampled image binding at
 all. The hardcoded false is correct by construction. It would need revisiting
 only alongside multisampled image support, which is a separate feature.
+
+## Labels found what a month of reading did not (2026-09-14)
+
+The short-term list's first item was "label the pipelines and bind group
+layouts too", estimated small. It was small, and it closed the second item --
+the atomic-counter lead -- in a single run. Writing down why, because the
+sequence is reusable and two of its steps were nearly recorded wrong.
+
+### The label
+
+`gex_wgpu_compile_nir` already named the shader modules. The other half of
+every message did not:
+
+    Binding doesn't exist in [BindGroupLayoutInternal (unlabeled)].
+     - ... the entry-point's declaration for @group(1) @binding(32) matches ...
+    [Invalid ComputePipeline (unlabeled)] is invalid.
+
+Everything that creates a bind group layout, a pipeline layout, a bind group
+or a pipeline now passes a label. For the fifteen dispatches that go through
+`gex_wgpu_dispatch` that is a `what` string per call site; for the main draw
+it is `draw VS:GLSL0/FS:GLSL1`, built from a new `name[24]` on
+`struct gex_wgpu_shader`. Three things made it free of risk:
+
+- **`gex_wgpu_pipeline_key` already clears `head.label` before hashing**, so a
+  per-draw stack buffer cannot turn every cache lookup into a miss. Whoever
+  wrote that anticipated this.
+- The bind group and layout caches key on *entries*, not on the label, so a
+  shared layout keeps the name of whichever pass built it first. Approximate,
+  and said so in a comment.
+- Every label buffer is a local, because `WGPUStringView` does not own its
+  bytes and each create call copies during the call.
+
+The same run then read:
+
+    Binding doesn't exist in [BindGroupLayoutInternal "tess vs capture g1"].
+
+### What it was
+
+Binding 32 is `GEX_WGPU_SSBO_FIRST_BINDING` -- application storage block slot
+zero. The failing dispatch is `gex_wgpu_tess_draw`'s **vertex capture**, which
+is one of the four listed under short-term item 3 as never calling
+`gex_wgpu_bind_stage_ssbos`. That item said it "needs a probe to become real
+rather than a fix on suspicion". It was real, and the CTS had been reaching it
+all along through an atomic counter -- reporting a *wrong return value*, which
+is why every reading of it pointed at the atomic-result replay instead.
+
+The fix is not to add the missing call four times. The shader's own
+`ssbo_readonly_mask` is the wrong table here: the capture module is built from
+a *post-strip* clone for an ordinary draw and a *pre-strip* clone for a
+replay, and the strip changes whether a block is written -- so two modules
+from one shader disagree about the access, and a layout that disagrees with
+the module's `var<storage, read>` is rejected outright. So the variant now
+reads its own table off the NIR it compiles
+(`gex_wgpu_collect_module_ssbos`), and one helper,
+`gex_wgpu_bind_varying_ssbos`, serves all six dispatches. The trace confirmed
+the mask matters: the failing dispatch carries `count=2 readonly=0x3`, and the
+pre-existing geometry bind hardcoded mask 0.
+
+### Two ways this nearly got recorded wrong
+
+**The build script never installed.** `web/build-mesa-native.sh` ran `ninja`
+and stopped; every native gate reads `$OUT/inst`, which only a manual
+`ninja install` had ever filled. The first labelled run printed
+`(unlabeled)` because it was running a driver from thirteen minutes earlier.
+The script now installs, and `meson setup` passes `--prefix "$OUT/inst"` so a
+fresh tree does not default to `/usr/local`. Checking
+`inst/lib/libgallium-26.3.0-devel.so`'s timestamp is the test -- not
+`libdril_dri.so`, which is a stub.
+
+**The first A/B said the fix was not causal.** A `getenv` at the top of
+`gex_wgpu_bind_varying_ssbos` disabled all six sites, including the two that
+bound correctly *before* the change -- so "off" was a third behaviour, not
+HEAD's, and it passed 4/4. What settled it:
+
+- pristine HEAD built into a side prefix
+  (`GEX_MESA_NATIVE_OUT=/tmp/gex-mesa-head`, then `GEX_INST=...`):
+  **3/4, deterministic over five runs, 3 `WebGPU error` lines counted whole**
+- a **labels-only** build -- the labels with the struct field and the SSBO
+  work reverted: **3/4, same three errors, same message but naming the pass**.
+  That is the proof the diagnostic is inert.
+- the fix: **4/4, 0 errors, deterministic over five runs**
+- the switch rewritten to name *one* site (`strstr(pass_name, skip)`):
+  skipping the tessellation bind alone reproduces HEAD exactly.
+
+`GEX_WGPU_SSBO_TRACE=1` and the per-site `GEX_WGPU_NO_CAPTURE_SSBO=<substring>`
+are both kept.
+
+### The instrument
+
+`tests/integration/programs/gl44-capture-ssbo-probe.c` -- a vertex shader
+reading a storage block, drawn through every path that replays the vertex
+stage as compute: `plain`, `geometry`, `tessellation`, `wide_lines`,
+`flat_unfilled`, `cull_distance`, `write_through`. Scores:
+
+    llvmpipe reference   7/7
+    gex_wgpu HEAD        1/7      -- every capture path lost its draw
+    gex_wgpu fixed       7/7
+
+Each case is verified by knocking out its own bind site, and two of them took
+a second attempt to become real, which is the reusable part:
+
+- **A sized block does not reach the emitter.** The first version used
+  `vec4 at[4]` and passed against HEAD, because the access is lowered to a
+  `load_ssbo` carrying a block number and the *variable* dies -- so the module
+  never declares the binding and there is nothing to mismatch. An **unsized**
+  array plus `.length()` keeps the variable alive. `gl44-vertex-ssbo-read`
+  already says this about its own `length` case; it applies to any probe that
+  needs a block to survive into the module.
+- **Nothing culled means nothing to lose.** The `cull_distance` case first set
+  every distance positive, and passed on HEAD: losing the capture dispatch
+  leaves the driver drawing everything, which is the right picture when
+  nothing should be culled. It now draws two triangles and culls one, and
+  checks both the survivor and the absence.
+
+Also worth keeping: the first version of the probe put its triangle's outline
+along the viewport's own bottom and left rows, where line rasterisation is
+ambiguous -- llvmpipe drew nothing there and the case failed *on the
+reference*. The geometry is inset now, and the sample row was read off a dump
+of the reference rather than derived.
