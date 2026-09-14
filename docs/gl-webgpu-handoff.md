@@ -24644,3 +24644,66 @@ pack per component, which also needs `gex_wgpu_capture_layout` to carry the
 element's component count -- the element's own format does not say it. Still
 not worth doing on its own merits; recorded so the next attempt starts from
 the right place.
+
+## VLC is the seventh verified application (2026-09-14)
+
+Photographed against llvmpipe on the same display, playing video:
+
+    vlc driver lines=37 refusals=0
+    vlc rmse=83.4817 worst_pixels_over_12pct=0%
+    vlc OK
+
+**RMSE 0.13%, and not one pixel differs by more than 12%.** The gate is
+`tests/gates/app-vlc.sh`.
+
+It is worth having because of the workload, not the application. VLC's `gl`
+output uploads YUV planes as textures *every frame* and converts them to RGB
+in a fragment shader -- a streaming-upload path. The other six do not have one
+between them: STK, Minecraft and Blender draw scenes, Krita and FreeCAD draw
+interfaces, OBS composites with a renderer of its own. This is the first
+verified application whose per-frame cost is texture upload and colour
+conversion rather than geometry.
+
+Three things about the gate that were each a wrong answer first:
+
+- **Every frame of the clip is identical.** The two runs are photographed at
+  the same wall-clock offset, not the same frame, so moving content would
+  compare the decoder's timing rather than the driver's rendering. A still
+  image looped for twenty seconds makes any frame the right frame.
+- **`--loop`, or the clip has finished.** A twenty-second clip is over by the
+  time a thirty-second settle elapses, and what gets photographed is VLC's
+  idle cone on black -- which compares *clean* between the two drivers and
+  passes while proving nothing.
+- **VP8, because this VLC has no libavcodec plugin.** Its codec directory
+  holds theora, vpx, dav1d, jpeg and png and nothing else; H.264 and MJPEG
+  both come back "Codec ... is not supported" and leave the same idle cone.
+  The gate greps the log for that phrase rather than trusting the picture.
+
+### Kdenlive, attempted the same afternoon, and what it cost
+
+Kdenlive was the first candidate -- Qt Quick is a renderer none of the six
+exercise -- and it **reaches the driver cleanly**: 38 driver lines, zero
+refusals, seventeen Qt Quick shaders compiled, a depth clear. What it does not
+do is reach its editor window in this environment, and that is Kdenlive's
+startup rather than the driver: it stops in exactly the same place on
+llvmpipe.
+
+Three dialogs stand in the way. A first-run Quick Setup wizard (seeded away by
+writing the running version into a config directory of the gate's own -- read
+from `kdenlive --version`, never hardcoded, or it breaks on the next release
+with a symptom that looks like a hang). A welcome screen with a "Kdenlive
+crashed on last start" banner, which is always there because every gate run
+ends in SIGKILL. And a Project Settings dialog behind "New Project".
+
+`tests/gates/app-kdenlive.sh` is committed and handles the first; it exits
+**2, INCONCLUSIVE** rather than giving a verdict without the editor. That
+matters: the two runs stopped on differently *sized* welcome screens -- the
+crash banner is fifty pixels tall -- and the RMSE of a 425x450 against a
+425x500 was 24681, printed as "rendering differs from llvmpipe". A driver
+accusation with nothing behind it is worse than no answer.
+
+**The lesson for the eighth application**: pick one that can be driven from
+the command line to a known frame. VLC took twenty minutes once the codec was
+right; Kdenlive took an hour and is still not verified. A hand-written project
+file is not a shortcut either -- the MLT XML this gate first generated stalled
+Kdenlive on its *splash screen*, on both drivers, for as long as it was given.
