@@ -25080,3 +25080,36 @@ and the failure looks nothing like a driver problem. The probe suite already
 reports this class as `UNLINKABLE`, which is how `program-query-value` is
 listed. If an application fails to start with "undefined symbol: glSomething",
 this is it.
+
+## The "accepted and ignored" audit: clip_halfz was the only one (2026-09-14)
+
+`clip_halfz` was copied into `create_rasterizer`'s `supported` list and never
+read, which is what made `glClipControl(GL_ZERO_TO_ONE)` silently wrong. That
+is a *class* of bug, so the whole list was audited — every
+`supported.X = state->X` across the rasterizer, blend, depth-stencil and
+sampler states, checked for whether anything reads `X` again.
+
+**Nothing else is in the same position.** Recording that so the audit is not
+repeated:
+
+- `depth_clamp` is covered indirectly. The driver reads `depth_clip_near`
+  instead, turning it into WebGPU's `unclippedDepth`, and refuses the state
+  when the device lacks the feature — which is also what `caps->depth_clip_disable`
+  is gated on. Gallium's separate `depth_clamp` field has nothing left to say.
+- `border_color_format` and `border_color_is_integer` look unread in that list
+  and are read directly from `state->border_color` where the sampler is built,
+  integer path included.
+- `multisample` — GL_MULTISAMPLE's enable — is genuinely ignored and genuinely
+  **unrepresentable**: WebGPU fixes a pipeline's sample count and requires it
+  to match the attachment, so "rasterize single-sampled into a multisampled
+  target" has no form. Applications that disable it get smoother edges than GL
+  specifies. A wall, not a gap.
+- `rasterization_stream` is the `MAX_VERTEX_STREAMS` item, and accepting it is
+  correct while the driver advertises one stream: stream 0 is the only one an
+  application can name.
+- `bottom_edge_rule`, `half_pixel_center`, `line_last_pixel`,
+  `line_rectangular`, `point_line_tri_clip`, `point_quad_rasterization` are
+  D3D-era or GL-constant fields that st never varies for a GL context.
+
+So the rule stands — **every field in that list is a promise** — and the list
+currently keeps all of them but the one platform cannot.
