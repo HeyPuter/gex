@@ -1,0 +1,43 @@
+# Baselines for tests/gates/regress.sh. One `key expected` per line.
+#
+# Raise a baseline in the same commit that earns it, so the diff says which
+# change moved it. A number here is a *measurement with a date*, not a target:
+# if one moves and the change is an improvement, edit this file and say so.
+#
+# All native. The browser has different limits and different numbers; its
+# instrument is tests/gl44-browser-sweep.sh.
+
+# Native probe suite: probes whose SUMMARY matches llvmpipe's.
+# Last measured 2026-09-14, after the draw-parameters fix.
+probe_suite_ok 195
+
+# The probes that legitimately differ from llvmpipe, by name rather than by
+# count -- a count stays right when one known exception is fixed and a new one
+# appears on the same run.
+#
+#   group-vote            the invocation group is one invocation (platform)
+#   image-noformat-fs     we pass and llvmpipe does not
+#   internalformat-negative  llvmpipe produces no SUMMARY line at all
+#   program-query-value   UNLINKABLE: needs glGetProgramResourceLocationIndex
+#                         through getProcAddress
+#   quad                  we pass and llvmpipe does not
+#   texture-sampler       WebGPU offers sampleCount 1 or 4 and nothing else
+probe_expected_diff group-vote
+probe_expected_diff image-noformat-fs
+probe_expected_diff internalformat-negative
+probe_expected_diff program-query-value
+probe_expected_diff quad
+probe_expected_diff texture-sampler
+
+# CTS families, as pass/fail under KHR-GL45. Skips are not counted: a skip is
+# an honest "not supported" and moves for reasons that are not regressions.
+#
+# These six are the ones the capture and emulated-stage paths run through, so
+# they are what a change to those paths has to be checked against. They are not
+# the whole suite -- tests/gl44-cts-families.sh takes any list.
+cts_tessellation_shader 139/0
+cts_geometry_shader 136/0
+cts_cull_distance 202/0
+cts_shader_storage_buffer_object 124/0
+cts_shader_atomic_counter_ops_tests 4/0
+cts_transform_feedback 19/2
