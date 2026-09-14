@@ -64,3 +64,6 @@ cts_vertex_attrib_binding 29/1
 # so the "8" was cases *attempted*, not cases present.
 cts_transform_feedback_overflow_query_ARB 13/0
 cts_transform_feedback3 3/0
+# Added 2026-09-14 alongside the occlusion-slot work: two cases covering the
+# inverted conditional-render modes, which share the occlusion path.
+cts_conditional_render_inverted 2/0

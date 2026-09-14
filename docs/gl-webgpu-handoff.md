@@ -25793,3 +25793,38 @@ occlusion targets at once — `direct_state_access.queries_*` and
 `conditional_render_inverted` both *mention* several targets but appear to
 drive them one at a time. Score those two families first; if nothing exercises
 the overlap, this belongs in "walls that are not ours" rather than on a list.
+
+### The two occlusion families, scored — and one A/B worth the five minutes
+
+`KHR-GL45.conditional_render_inverted` is **2/2** and is in the baseline now.
+
+`KHR-GL45.direct_state_access.queries*` is **4/5**: `queries_functional`
+fails. It is **not in the baseline**, because `regress.sh` builds its pattern
+as `KHR-GL45.<key>.*` and the cases are `queries_functional`,
+`queries_creation` and so on — underscores, not a subgroup — so the key cannot
+name them. Score it by hand with `--deqp-case='KHR-GL45.direct_state_access.queries*'`.
+
+**It is a pre-existing failure, and that was worth establishing rather than
+assuming.** Eight of today's driver changes touch the query path, so an
+unattributed failure in a query family is exactly the thing not to leave. The
+A/B was cheap: check out the session-start `gex_wgpu_screen.c` alone
+
+    git -C third_party/mesa checkout 63a5b093353 -- .../gex_wgpu_screen.c
+
+rebuild, run the one family, restore. **4/5 there too** — identical. Five
+minutes, one file, no worktree, and the conclusion is not a judgement call.
+(Then rebuild, and *confirm which driver you are on* — the overflow family at
+13/13 only happens with the new one.)
+
+`queries_functional` logs **nothing** on failure: the qpa body is a duration
+and `<Result StatusCode="Fail">`, with no Text at all. It walks every query
+target writing results through `glGetQueryBufferObject*` and ANDs the
+comparisons together, so any one wrong value fails the case anonymously.
+Diagnosing it means bisecting `s_targets[]` by hand or instrumenting the
+driver's result path — start by checking which targets it covers that
+`gl44-query-buffer-probe` does not.
+
+**And the occlusion collapse above is not exercised by either family** — no
+`glBeginQuery refused` line appeared in either run. That is what keeps the
+three-occlusion-targets-one-slot issue in "written down" rather than on a
+list.
