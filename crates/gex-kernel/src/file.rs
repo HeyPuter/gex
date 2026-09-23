@@ -9,7 +9,7 @@
 use crate::errno::{Errno, SysResult};
 use crate::pipe::Pipe;
 use crate::vfs::{DirEntry, FileHandle, FileType, Metadata};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A shared open-file description.
@@ -27,6 +27,12 @@ pub struct OpenFile {
     dir_cache: Mutex<Option<Vec<DirEntry>>>,
     pub readable: bool,
     pub writable: bool,
+    /// A cross-Worker shared-memory backing id (browser), or 0. Set when this
+    /// descriptor's file was passed over a socket and must stay coherent across
+    /// Workers (Wine's client<->wineserver shared memory). `sync_shared_maps`
+    /// routes a mapping of a tagged file through the global store instead of the
+    /// per-Worker backing file, so the writer's updates reach every reader.
+    pub global_sync: AtomicI32,
     /// A path to unlink when the last descriptor to this file closes. Set for
     /// `O_TMPFILE`: Linux makes such a file nameless at once, but gex keeps it
     /// named (`.gex-tmpfile-*`) so the `linkat("/proc/self/fd/N", target,
@@ -53,8 +59,19 @@ impl OpenFile {
             dir_cache: Mutex::new(None),
             readable,
             writable,
+            global_sync: AtomicI32::new(0),
             unlink_on_close: None,
         })
+    }
+
+    /// The cross-Worker shared backing id, or 0.
+    pub fn global_sync(&self) -> i32 {
+        self.global_sync.load(Ordering::Acquire)
+    }
+
+    /// Tag this description with a cross-Worker shared backing id.
+    pub fn set_global_sync(&self, id: i32) {
+        self.global_sync.store(id, Ordering::Release);
     }
 
     /// An `O_TMPFILE` descriptor: named at `path` while open, unlinked when the
@@ -76,6 +93,7 @@ impl OpenFile {
             dir_cache: Mutex::new(None),
             readable,
             writable,
+            global_sync: AtomicI32::new(0),
         })
     }
 
@@ -260,7 +278,7 @@ impl FdTable {
         let idx = match slot {
             Some(i) => i,
             None => {
-                if self.entries.len() >= 4096 {
+                if self.entries.len() >= 65536 {
                     return Err(Errno::EMFILE);
                 }
                 self.entries.push(None);

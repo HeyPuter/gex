@@ -3231,6 +3231,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         gex_xlate::translate_runtime(
             data,
             pc,
+            data.len(),
             &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
             page_table,
@@ -3660,6 +3661,7 @@ fn recompile_object(
             map.start,
             map.end,
             seeds,
+            data.len(),
             &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
             &|a| known.contains(&a),
             page_table,

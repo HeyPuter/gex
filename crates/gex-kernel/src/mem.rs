@@ -10,7 +10,7 @@
 //! the *kernel* performs on the guest's behalf does check them.
 
 use crate::errno::{Errno, SysResult};
-use gex_abi::{MMAP_AUTO_TOP, MMAP_BOTTOM, MMAP_TOP};
+use gex_abi::{GUEST_LIMIT, MMAP_AUTO_TOP, MMAP_BOTTOM, MMAP_TOP};
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -145,6 +145,25 @@ impl MemoryMap {
 
     /// Hand out arena addresses bottom-up, for a host whose memory must be
     /// allocated up to whatever it hands out.
+    /// Force the host memory to reach `end`, bypassing the arena-chunk
+    /// shortcut [`Self::ensure_backed`] takes. The kernel calls this right
+    /// before it writes into a freshly placed *committed* mapping: an address
+    /// handed out from the bottom-up allocator can sit inside an arena chunk
+    /// that is tracked but not actually backed -- a fresh `execve`'s cursor can
+    /// point past live memory while another process (a 64-bit Wine that grew
+    /// the shared memory to 2 GiB for KUSER_SHARED_DATA) sets the high-water
+    /// mark. Zeroing such a range walks off the end of the wasm memory and
+    /// takes an OOB trap that surfaces as EFAULT. `back` is idempotent -- it
+    /// grows only when the memory falls short -- so this is a cheap no-op in
+    /// the common case. Returns false only when the engine refuses to grow.
+    pub fn back_through(&mut self, end: u64) -> bool {
+        match self.back {
+            Some(back) => back(end),
+            None => true,
+        }
+    }
+
+
     pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> bool) {
         self.take = Some(take);
         self.back = Some(back);
@@ -468,7 +487,31 @@ impl MemoryMap {
             // stacks against whatever ceiling it finds, so the ceiling it
             // finds has to be the reach, or it maps code gex cannot run.
             if end > MMAP_TOP {
-                return Err(Errno::ENOMEM);
+                // Above the dispatch reach. What to report depends on whether the
+                // address is still WITHIN the backable wasm memory:
+                //
+                // * `[MMAP_TOP, GUEST_LIMIT)` with `MAP_FIXED_NOREPLACE` -> `EEXIST`
+                //   ("this address is taken"), so Wine's reservation loop (and
+                //   `try_map_free_area`, and `RtlCreateHeap`'s backing) steps to a
+                //   lower candidate INSIDE the reach. Returning ENOMEM here made
+                //   the loop give up -> a null process heap -> winemine deadlocked
+                //   on a critical section living in that null heap.
+                //
+                // * At/above `GUEST_LIMIT` (or any plain `MAP_FIXED`) -> `ENOMEM`.
+                //   `get_host_addr_space_limit` probes from 2^63 DOWN with
+                //   `MAP_FIXED_NOREPLACE`, halving on ENOMEM and STOPPING on EEXIST
+                //   to find the real ceiling: EEXIST there would stop it at 2^63
+                //   and it would believe the space is ~2^64, then size a 32 GiB
+                //   `pages_vprot` table gex cannot back. ENOMEM keeps it probing
+                //   down to the backable range. A plain `MAP_FIXED` above the
+                //   reach has nothing to relocate onto either way.
+                let noreplace =
+                    flags & flags::FIXED_NOREPLACE != 0 && flags & flags::FIXED == 0;
+                return Err(if noreplace && end <= GUEST_LIMIT {
+                    Errno::EEXIST
+                } else {
+                    Errno::ENOMEM
+                });
             }
             // `MAP_FIXED_NOREPLACE` must not disturb anything already there:
             // fail if the range overlaps a mapping or the runtime's own
@@ -492,6 +535,23 @@ impl MemoryMap {
             // moves Wine's reservation a little higher, which is harmless.
             let hits_shim = addr < gex_abi::MMAP_BOTTOM && end > gex_abi::STACK_TOP;
             let hits_reserved = addr < gex_abi::RESERVE_FLOOR || hits_shim;
+            // The program break must keep room to grow. Linux gives it that room
+            // by keeping the mmap area far above the executable; gex's packed low
+            // layout puts ld.so, the stack and the arena only a few MiB up, and a
+            // 64-bit Wine's `reserve_area(0x10000, 0x40000000)` then walls the
+            // break in with a NOREPLACE reservation directly above it. wineboot's
+            // break at 0x4a3800 was left ~240 KiB of headroom: every larger `brk`
+            // came back unchanged (`brk_grow` refuses to cross a mapping), glibc's
+            // early brk-only allocations failed, and `RtlCreateHeap` died with
+            // that break address leaking out as a bogus NTSTATUS (0x4a3800) -- the
+            // null process heap that deadlocked winemine's startup. Report the
+            // break's growth gap, up to the stack, as taken to a NOREPLACE probe
+            // (the shim gap just above it already is), so Wine's reservation
+            // steps past it and `brk` keeps its room. NOREPLACE only: a program
+            // that explicitly `MAP_FIXED`s here is deliberate and keeps its
+            // current behaviour.
+            let brk_gap_end = gex_abi::STACK_TOP.min(gex_abi::BRK_TOP);
+            let hits_brk_gap = addr < brk_gap_end && end > self.brk_cur;
             // `MAP_FIXED_NOREPLACE` must not disturb anything already there.
             // Linux fails it over *any* existing mapping, PROT_NONE included,
             // and that failure is load-bearing for a multithreaded guest: Wine
@@ -518,7 +578,7 @@ impl MemoryMap {
                 .any(|v| v.start < end && v.end > addr && v.prot == 0);
             let committing = prot != 0;
             let conflict = over_real || (!committing && over_reservation);
-            if noreplace && (conflict || hits_reserved) {
+            if noreplace && (conflict || hits_reserved || hits_brk_gap) {
                 return Err(Errno::EEXIST);
             }
             // A plain `MAP_FIXED` into the shim's gap would clip straight over

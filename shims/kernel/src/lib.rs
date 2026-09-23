@@ -1079,6 +1079,13 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     // that ended -- "why did the terminal think its shell died" needs the pid.
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     procs().exit(pid, status);
+    // Wake every parked Worker so a parent sleeping in `wait4` re-checks and
+    // reaps this child. Without it, a parent that only `wait4`s (no pipe read to
+    // wake it) sleeps forever once the exiting Worker is the last thing running
+    // -- exactly the winemine deadlock: pid 2 parks on wait4(pid 6) while pid 6,
+    // the wineserver launcher, daemonizes and exits with no I/O back to pid 2.
+    // A pipe close already wakes via `k_wake`; a bare exit did not.
+    k_wake();
 }
 
 /// Collect a finished child of `ppid`. Zero if none is ready. `want` is a
@@ -1300,6 +1307,110 @@ fn pipes() -> &'static std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pip
     static PIPES: OnceLock<std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::pipe::Pipe>>>> =
         OnceLock::new();
     PIPES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Every cross-Worker shared memfd, by id (index+1; 0 means none). A memfd's
+/// own `Vec` is a Worker's private memory, so passing one over a socket used to
+/// freeze a content snapshot -- which broke Wine's client<->wineserver shared
+/// memory. These live here, in the one global-kernel memory every Worker's
+/// module instantiates against, so a `MemFd` naming an id in any Worker reads
+/// and writes the same bytes. Kept plain (no global routing of their own) --
+/// they ARE the backing.
+fn gmemfds() -> &'static std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::unix::MemFd>>> {
+    note_panics();
+    static M: OnceLock<std::sync::Mutex<Vec<std::sync::Arc<gex_kernel::unix::MemFd>>>> =
+        OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn gmemfd_at(id: i32) -> Option<std::sync::Arc<gex_kernel::unix::MemFd>> {
+    if id <= 0 {
+        return None;
+    }
+    gmemfds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get((id - 1) as usize)
+        .cloned()
+}
+
+/// Make a shared memfd, returning its id (>0). `name_at`/`name_len` name it in
+/// the caller's memory.
+#[no_mangle]
+pub extern "C" fn k_memfd_create(name_at: u32, name_len: u32) -> i32 {
+    let mut nb = vec![0u8; name_len as usize];
+    if name_len > 0 {
+        unsafe { gex_kmem::pull_checked(nb.as_mut_ptr(), name_at, name_len) };
+    }
+    let name = String::from_utf8_lossy(&nb).into_owned();
+    let mut t = gmemfds().lock().unwrap_or_else(|e| e.into_inner());
+    t.push(std::sync::Arc::new(gex_kernel::unix::MemFd::new(&name)));
+    t.len() as i32
+}
+
+/// Read up to `len` bytes at `offset` from shared memfd `id` into the caller's
+/// memory at `at`. Returns bytes read, or a negative errno.
+#[no_mangle]
+pub extern "C" fn k_memfd_read(id: i32, offset: u64, at: u32, len: u32) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    let Some(m) = gmemfd_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    match m.read_at(offset, &mut buf) {
+        Ok(n) => {
+            let n = n as usize;
+            if n > 0 {
+                unsafe { gex_kmem::push_checked(at, buf.as_ptr(), n as u32) };
+            }
+            n as i32
+        }
+        Err(e) => -e.0,
+    }
+}
+
+/// Write `len` bytes from the caller's memory at `at` to shared memfd `id` at
+/// `offset`, growing as needed. Returns bytes written, or a negative errno.
+#[no_mangle]
+pub extern "C" fn k_memfd_write(id: i32, offset: u64, at: u32, len: u32) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    let Some(m) = gmemfd_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    match m.write_at(offset, &buf) {
+        Ok(n) => n as i32,
+        Err(e) => -e.0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_memfd_len(id: i32) -> i64 {
+    match gmemfd_at(id) {
+        Some(m) => m.len() as i64,
+        None => -9,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_memfd_truncate(id: i32, len: u64) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    let Some(m) = gmemfd_at(id) else { return -9 };
+    match m.truncate(len) {
+        Ok(()) => 0,
+        Err(e) => -e.0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn k_memfd_seals_get(id: i32) -> u32 {
+    gmemfd_at(id).map(|m| m.seals()).unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn k_memfd_seals_add(id: i32, add: u32) {
+    if let Some(m) = gmemfd_at(id) {
+        let _ = m.add_seals(add);
+    }
 }
 
 /// Which pipe ends each process still holds, so a process that dies without
@@ -2302,6 +2413,32 @@ pub extern "C" fn k_sock_read(id: i32, at: u32, len: u32) -> i32 {
     }
 }
 
+/// A futex-like wake key for a socket pipe, distinct from any guest futex
+/// address (a guest word lives below 4 GiB; this sets a high bit). A socket
+/// pair's two ends share their pipes (A.tx == B.rx), so a writer wakes
+/// `pipe_key(tx.id)` and the peer's lone reader parks on `pipe_key(rx.id)` --
+/// the same pipe, the same key -- instead of the global `k_wake` thundering
+/// herd that woke every parked Worker on every socket write. A zero pipe id
+/// (not connected) yields 0, which the shim treats as "no precise key".
+pub fn pipe_key(pipe_id: u64) -> u64 {
+    if pipe_id == 0 {
+        0
+    } else {
+        0x4000_0000_0000_0000u64 | pipe_id
+    }
+}
+
+/// The precise wake key a lone reader of socket `id` should park on: the key of
+/// the pipe it receives from. A writer on the peer wakes exactly this. 0 if the
+/// socket is missing or not connected -- then the shim keeps the global wait.
+#[no_mangle]
+pub extern "C" fn k_sock_rxkey(id: i32) -> u64 {
+    match sock_at(id) {
+        Some(s) => pipe_key(s.rx_pipe_id()),
+        None => 0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn k_sock_write(id: i32, at: u32, len: u32) -> i32 {
     let Some(s) = sock_at(id) else { return -9 };
@@ -2311,12 +2448,69 @@ pub extern "C" fn k_sock_write(id: i32, at: u32, len: u32) -> i32 {
     }
     match s.send(&buf) {
         Ok(n) => {
-            // Bytes for whoever is reading, who may be parked. Same reason as
-            // `k_sock_connect`: the host has no syscall path to wake for it.
+            // Bytes for whoever is reading, who may be parked. Wake a precise
+            // reader parked on this pipe's key (the peer's rx pipe is this tx
+            // pipe -- no thundering herd), and still bump the global counter for
+            // poll/select waiters.
+            let key = pipe_key(s.tx_pipe_id());
+            if key != 0 {
+                k_futex_wake(key);
+            }
             k_wake();
             n as i32
         }
         Err(e) => -e.0,
+    }
+}
+
+/// Queue a serialized `SCM_RIGHTS` batch for the far end of socket `id`. The
+/// descriptors themselves cannot cross (their `Arc<OpenFile>` vtable belongs to
+/// the sending Worker's module), so they travel as ids the receiver rebuilds.
+#[no_mangle]
+pub extern "C" fn k_sock_send_fds(id: i32, at: u32, len: u32) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    let mut buf = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
+    }
+    match s.send_fd_bytes(buf) {
+        Ok(_) => {
+            // A parked reader may be waiting on exactly this.
+            let key = pipe_key(s.tx_pipe_id());
+            if key != 0 {
+                k_futex_wake(key);
+            }
+            k_wake();
+            0
+        }
+        Err(e) => -e.0,
+    }
+}
+
+/// Take the next serialized `SCM_RIGHTS` batch on socket `id` into the caller's
+/// memory at `at` (room `cap`). Returns its length, or 0 when none is waiting.
+#[no_mangle]
+pub extern "C" fn k_sock_recv_fds(id: i32, at: u32, cap: u32) -> i32 {
+    let Some(s) = sock_at(id) else { return -9 };
+    // If the next batch will not fit, do NOT pop it: report the length it needs
+    // so the caller grows its buffer and calls again. Truncating a batch (an
+    // 'm' memfd section wine hands a new process can exceed any fixed buffer)
+    // makes it rebuild to zero descriptors, losing the fd -- wineserver then
+    // fails process creation with STATUS_TOO_MANY_OPENED_FILES.
+    if let Some(len) = s.peek_fd_len() {
+        if len > cap as usize {
+            return len as i32;
+        }
+    }
+    match s.recv_fd_bytes() {
+        Some(bytes) => {
+            let n = bytes.len().min(cap as usize);
+            if n > 0 {
+                unsafe { gex_kmem::push_checked(at, bytes.as_ptr(), n as u32) };
+            }
+            n as i32
+        }
+        None => 0,
     }
 }
 
@@ -2333,6 +2527,12 @@ pub extern "C" fn k_sock_writable(id: i32) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn k_sock_hup(id: i32) -> i32 {
+    use gex_kernel::vfs::FileHandle;
+    sock_at(id).is_some_and(|s| s.poll_hup()) as i32
+}
+
+#[no_mangle]
 pub extern "C" fn k_sock_available(id: i32) -> i32 {
     use gex_kernel::vfs::FileHandle;
     sock_at(id).map_or(0, |s| s.available().unwrap_or(0) as i32)
@@ -2342,9 +2542,101 @@ pub extern "C" fn k_sock_available(id: i32) -> i32 {
 /// of file, so a process whose Worker exits still releases its peer.
 #[no_mangle]
 pub extern "C" fn k_sock_close(id: i32) {
-    let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(slot) = t.get_mut(id as usize) {
-        *slot = None;
+    let taken = {
+        let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
+        t.get_mut(id as usize).and_then(|slot| slot.take())
+    };
+    let Some(s) = taken else { return };
+    // If this was the last id naming the socket, dropping it closes the
+    // transmit pipe and the peer reads EOF -- a peer that may be parked on
+    // exactly that pipe's key (wineserver waiting to learn a client died).
+    // Wake it, precisely and globally, the way a write would.
+    let key = pipe_key(s.tx_pipe_id());
+    let last = std::sync::Arc::strong_count(&s) == 1;
+    drop(s);
+    if last {
+        if key != 0 {
+            k_futex_wake(key);
+        }
+        k_wake();
+    }
+}
+
+/// A connected pair, both ends kept here: writes the two ids to the caller's
+/// memory at `out` (two little-endian `i32`s). Returns 0, or a negated errno.
+/// Either end may be handed to another Worker over `SCM_RIGHTS` -- a pair in
+/// one process's own memory never could.
+#[no_mangle]
+pub extern "C" fn k_sock_socketpair(out: u32) -> i32 {
+    let (a, b) = UnixSocket::pair();
+    let ia = keep(a);
+    let ib = keep(b);
+    let ids = [ia, ib];
+    unsafe { gex_kmem::push_checked(out, ids.as_ptr() as *const u8, 8) };
+    0
+}
+
+/// Clone the end at `id` into a fresh id, both naming the same socket. This is
+/// `SCM_RIGHTS` dup semantics: the receiver gets its own reference, so the
+/// sender closing its end leaves the crossed one open. Returns the new id, or
+/// `-EBADF`.
+#[no_mangle]
+pub extern "C" fn k_sock_dup(id: i32) -> i32 {
+    match sock_at(id) {
+        Some(s) => keep(s),
+        None => -9,
+    }
+}
+
+/// TEMP diagnostic: this end's tx and rx pipe ids packed as (tx << 20 | rx),
+/// or -1 if the id names no socket. Two ends of one socketpair have crossed
+/// pipes: A.tx == B.rx and A.rx == B.tx. Lets a process confirm a peering the
+/// SCM/fork path was supposed to preserve.
+#[no_mangle]
+pub extern "C" fn k_sock_pipes(id: i32) -> i64 {
+    match sock_at(id) {
+        Some(s) => ((s.tx_pipe_id() as i64) << 20) | (s.rx_pipe_id() as i64 & 0xf_ffff),
+        None => -1,
+    }
+}
+
+/// TEMP diagnostic: bytes queued in this end's transmit pipe (what the peer
+/// would read). -1 if the id names no socket.
+#[no_mangle]
+pub extern "C" fn k_sock_tx_len(id: i32) -> i64 {
+    match sock_at(id) {
+        Some(s) => s.tx_available() as i64,
+        None => -1,
+    }
+}
+
+/// TEMP diagnostic: a single shared atomic. One Worker stores, another loads.
+/// If the loader sees the stored value, this module's statics are shared across
+/// Workers; if it reads 0, the two are on separate kernel state.
+static PROBE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+#[no_mangle]
+pub extern "C" fn k_probe_set(v: i64) {
+    PROBE.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+#[no_mangle]
+pub extern "C" fn k_probe_get() -> i64 {
+    PROBE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// TEMP diagnostic: a shared monotonic sequence for cross-Worker event order.
+static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[no_mangle]
+pub extern "C" fn k_seq() -> i64 {
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as i64
+}
+
+/// TEMP diagnostic: the tx/rx pipe object addresses of a global socket, packed
+/// (tx << 32 | rx). Same address across two ends means one shared pipe.
+#[no_mangle]
+pub extern "C" fn k_sock_pipe_addrs(id: i32) -> i64 {
+    match sock_at(id) {
+        Some(s) => (((s.tx_pipe_addr() & 0xffff_ffff) << 32) | (s.rx_pipe_addr() & 0xffff_ffff)) as i64,
+        None => -1,
     }
 }
 

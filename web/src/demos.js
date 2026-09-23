@@ -1579,11 +1579,40 @@ const SESSION_APPS = [
     label: 'WineMine \u2014 Windows Minesweeper through Wine (x86-64)',
     kind: 'wl',
     rootfs: '/rootfs/wine.tar',
-    cmd: '/usr/lib/wine/wine64 /root/.wine/drive_c/windows/system32/winemine.exe',
+    // An AOT closure covering dash (pid 1), the wine64/wineserver64 loaders, and
+    // -- via `--with-lib` -- ntdll.so and the unix backends ld.so brings in for
+    // them. Wine spawns its PE subprocesses by re-exec'ing wine64 in a forked
+    // child (start.exe -> wineboot), and without the closure that child
+    // re-translates wine64/ntdll from scratch, missing wineserver's process-init
+    // window -> the process object is killed (c00000e5) and the window never
+    // appears. With the closure those loaders arrive already translated, so the
+    // child comes up inside the window. `closureBuildNumbered` (set by the wl
+    // launcher when a closure is present) numbers slots at the build's numbers so
+    // the forked child's dispatch matches. `?closure=0` forces the translator.
+    closure: () => archAsset('/closure/wine'),
+    closureImage: '/bin/sh',
+    // A Windows path, not the unix path: given a unix path to a GUI exe wine
+    // relaunches it through a `start.exe` PE subprocess, and spawning child PEs
+    // is a separate bring-up problem; a Windows path loads winemine.exe directly
+    // as the main image.
+    cmd: "/usr/lib/wine/wine64 'c:\\windows\\system32\\winemine.exe'",
     env: 'export WINELOADER=/usr/lib/wine/wine64\n'
       + 'export WINESERVER=/usr/lib/wine/wineserver64\n'
       + 'export WINEPREFIX=/root/.wine\n'
-      + 'export WINEDEBUG=-all\n'
+      + 'export WINEDEBUG=+server,warn+heap,+virtual,+timestamp\n'
+      // wineserver refuses a server directory others can reach, and the curated
+      // rootfs ships /run/user/0/wine world-accessible after gex's tar drops its
+      // mode. Lock it to 0700. (Do NOT override XDG_RUNTIME_DIR: the session put
+      // the compositor's wayland socket under its own XDG_RUNTIME_DIR, and wine's
+      // wayland driver must find it there, or winemine has no display and exits.)
+      + 'mkdir -p /run/user/0/wine\n'
+      + 'chmod 700 /run/user /run/user/0 /run/user/0/wine\n'
+      // The prefix is already fully initialized (system.reg/user.reg present),
+      // but there is no wine-install timestamp to compare against, so wine would
+      // run wineboot on every start to "update" it. `disable` in the prefix
+      // timestamp is wine's documented way to skip that -- wineboot's PE
+      // subprocess spawn is a separate bring-up problem and unnecessary here.
+      + 'echo disable > /root/.wine/.update-timestamp\n'
       // The curated rootfs has no /etc/ld.so.cache, so glibc's loader only
       // searches /lib and /usr/lib. Point it at the multiarch triplet dirs
       // where libunwind/libwayland/libxkbcommon live, plus Wine's unix libs.
@@ -1841,6 +1870,7 @@ function sessionScript(chosen, {
     }
   }
   s += 'echo "gex: session up"\n';
+  s += 'sleep 90 &\n'; // TEST HOLD: keep pid 1 alive so detached PE (winemine) has time
   s += 'wait\n';
   return s;
 }
@@ -2123,11 +2153,18 @@ const compositor = {
         const image = chosen.find((a) => a.rootfs)?.rootfs || this.rootfs;
         const tree = await ctx.rootfs(archAsset(qp.get('wlrootfs') || image));
         const files = { ...tree.files };
+        const symlinks = {};
         for (const [path, target] of Object.entries(tree.links)) {
           const abs = rootfsLinkTarget(path, target);
           if (files[abs]) {
             files[path] = files[abs];
             if (tree.modes?.[abs] !== undefined) tree.modes[path] = tree.modes[abs];
+          } else {
+            // A link whose target is not a bundled file -- a directory, above
+            // all Wine's `dosdevices/c: -> ../drive_c`. Copying cannot express
+            // it, so install it as a real symlink the guest VFS follows;
+            // without it no `c:\...` path resolves and no Windows program runs.
+            symlinks[path] = target;
           }
         }
         for (const [path, target] of Object.entries(tree.hard ?? {})) {
@@ -2174,14 +2211,43 @@ const compositor = {
           }
         }
         files['/session.sh'] = new TextEncoder().encode(script);
+
+        // A per-app AOT closure, when a single chosen app carries one (WineMine:
+        // dash + the wine64/wineserver64 loaders + ntdll.so and the unix
+        // backends). pid 1 is /bin/sh running session.sh, so the manifest is
+        // checked against that image. Only when one app is chosen: two closures
+        // cannot both pin the same addresses, and the win is a single-client
+        // one anyway. `?closure=0` forces the runtime translator.
+        let sessionClosure = null;
+        const closureApp = chosen.length === 1 ? chosen[0] : null;
+        const closurePath = closureApp &&
+          (typeof closureApp.closure === 'function' ? closureApp.closure() : closureApp.closure);
+        if (closurePath && qp.get('closure') !== '0') {
+          ctx.busy('loading the closure');
+          const { loadClosure } = await import('./closure.js');
+          try {
+            sessionClosure = await loadClosure(closurePath, {
+              image: closureApp.closureImage || '/bin/sh',
+              log: (s) => console.debug(`[gex] ${s}`),
+            });
+          } catch (e) {
+            console.debug(`[gex] no ${closureApp.id} closure: ${e.message}`);
+          }
+        }
         ctx.idle();
         rule(ctx, `graphics rootfs — ${Object.keys(files).length} files, ${chosen.length} apps`);
+        if (sessionClosure) {
+          ctx.term.writeln(
+            ctx.ansi.dim(`closure: ${sessionClosure.libs.length} libraries, translated ahead of time`),
+          );
+        }
         ctx.status('running');
         const { status } = await ctx.runProgram(ctx.term, {
           elf: files['/bin/sh'],
           files,
           dirs: tree.dirs,
           modes: tree.modes,
+          symlinks,
           args: ['/bin/sh', '/session.sh'],
           cwd: '/',
           tty: true,
@@ -2194,6 +2260,13 @@ const compositor = {
           wl: wlCanvas,
           wlInput: wlCanvas,
           hostX,
+          closure: sessionClosure,
+          // Number the closure's slots at the build's numbers. A single-client
+          // session does not need the per-process demand allocator's small-table
+          // win, and build numbering is what lets a forked-exec child (wine's PE
+          // spawns) reuse the parent's already-translated loader modules. See
+          // runProgram / runtime.js.
+          closureBuildNumbered: !!sessionClosure,
           heartbeat: Number(qp.get('heartbeat')) || 0,
         });
         const ms = (performance.now() - t0).toFixed(0);

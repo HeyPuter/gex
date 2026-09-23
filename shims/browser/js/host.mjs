@@ -359,7 +359,7 @@ export class ProcessHost {
         }
         const msg = this.#pending.get(pid);
         this.#pending.delete(pid);
-        console.debug(`[host] pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
+        console.error(`[wmtrace] host pid ${pid}: ready, ${msg ? `sending ${msg.kind}` : 'NOTHING HELD'}`);
         if (msg) {
           // Awaited: compiling the shim cannot be synchronous in a browser.
           this.#shimModule().then((shimMod) => {
@@ -425,6 +425,7 @@ export class ProcessHost {
         break;
       }
       case 'fork': {
+        console.error(`[wmtrace] host got fork child=${m.child?.pid} from=${pid}`);
         const c = m.child?.forkCost;
         if (c) {
           const hop1 = Math.round(performance.timeOrigin + performance.now() - c.sentAt);
@@ -438,7 +439,10 @@ export class ProcessHost {
         this.#forked++;
         this.#onFork(m.child, pid);
         // Started and let run -- nobody waits for a child.
-        this.#spawn(m.child.pid, { kind: 'adopt', child: m.child }).catch((e) => {
+        this.#spawn(m.child.pid, { kind: 'adopt', child: m.child }).then(() => {
+          console.error(`[wmtrace] host pid ${m.child.pid}: spawn resolved (running)`);
+        }).catch((e) => {
+          console.error(`[wmtrace] host pid ${m.child.pid}: spawn FAILED ${e.message}`);
           this.#onOutput(2, `gex: process ${m.child.pid} failed: ${e.message}\n`, pid);
           // As an event too: this is caught, so no `error` fires and a harness
           // may miss the line above. See task 146.

@@ -512,6 +512,14 @@ pub struct Kernel {
     pub epolls: std::collections::HashMap<usize, Arc<unix::EpollSet>>,
     /// And for anonymous shared files, which have seals.
     pub memfds: std::collections::HashMap<usize, Arc<unix::MemFd>>,
+    /// Received cross-Worker SCM_RIGHTS descriptors a recvmsg rebuilt but that
+    /// did not fit the caller's control buffer this call. Keyed by the socket
+    /// fd, delivered FIFO on its following recvmsg -- the cross-Worker analogue
+    /// of the in-process stream leaving unread descriptors queued. Without this
+    /// the overflow was rebuilt then dropped by write_scm_rights, so a server
+    /// that reads fds one-per-recvmsg (wineserver) lost every fd after the
+    /// first in a batch and failed process creation with TOO_MANY_OPENED_FILES.
+    pub scm_overflow: std::collections::HashMap<i32, std::collections::VecDeque<Arc<OpenFile>>>,
     /// Which unix socket answers to which path. Shared system-wide, because
     /// a server and its clients are different processes and the whole point
     /// of a named socket is that they find each other by name.
@@ -1095,6 +1103,7 @@ impl Kernel {
             remote_sockets: Default::default(),
             epolls: Default::default(),
             memfds: Default::default(),
+            scm_overflow: Default::default(),
             socket_names: Arc::new(unix::SocketNames::new()),
             host_names: Arc::new(unix::SocketNames::new()),
             file_locks: Arc::new(unix::FileLocks::new()),
@@ -1137,6 +1146,28 @@ impl Kernel {
     /// Drop the descriptors marked close-on-exec.
     pub fn close_on_exec(&mut self) {
         self.fds.close_on_exec();
+        self.prune_remote_sockets();
+    }
+
+    /// Forget the cross-Worker socket ends no descriptor names any more.
+    /// `remote_sockets` holds a second `Arc` to every `RemoteUnix` so
+    /// `sendmsg`/`recvmsg`/`accept` can find them by handle, and that reference
+    /// kept a CLOSED socket's global id alive until the process exited -- so its
+    /// peer never read EOF when the last descriptor went (wineserver learns a
+    /// client died only from that HUP). Called after any bulk close; `sys_close`
+    /// handles its one descriptor directly.
+    pub fn prune_remote_sockets(&mut self) {
+        if self.remote_sockets.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<usize> = self
+            .fds
+            .entries()
+            .into_iter()
+            .filter(|(_, f, _)| f.handle.remote_unix_id().is_some())
+            .map(|(_, f, _)| Arc::as_ptr(&f.handle) as *const () as usize)
+            .collect();
+        self.remote_sockets.retain(|k, _| live.contains(k));
     }
 
     /// Everything `execve` can fail at before the point of no return.
@@ -1324,6 +1355,7 @@ impl Kernel {
             remote_sockets: self.remote_sockets.clone(),
             epolls: self.epolls.clone(),
             memfds: self.memfds.clone(),
+            scm_overflow: Default::default(),
             // Named sockets are system-wide: a forked child must still be
             // able to reach a server its parent could.
             socket_names: Arc::clone(&self.socket_names),
@@ -1562,6 +1594,9 @@ impl Kernel {
                     if self.trace {
                         eprintln!("[gex:{}] execve({path:?}, {} args)", self.pid, argv.len());
                     }
+                    let a0 = argv.get(1).cloned().unwrap_or_default();
+                    let a1 = argv.get(2).cloned().unwrap_or_default();
+                    crate::klog(&format!("[proc] pid={} execve {} argv1={:.40} argv2={:.40}", self.pid, path, a0, a1));
                     SyscallOutcome::Exec { path, argv, envp }
                 }
                 Err(e) => {
@@ -1603,6 +1638,7 @@ impl Kernel {
             if flags & clone_flags::THREAD == 0 {
                 let pid = self.procs.spawn(self.pid);
                 let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
+                crate::klog(&format!("[proc] pid={} clone3(flags={:#x}) -> new pid {}", self.pid, flags, pid));
                 return SyscallOutcome::SpawnProcess {
                     pid,
                     child_stack: sp,
@@ -1638,6 +1674,7 @@ impl Kernel {
                     a[0], a[1]
                 );
             }
+            crate::klog(&format!("[proc] pid={} clone(flags={:#x}) -> new pid {}", self.pid, a[0], pid));
             return SyscallOutcome::SpawnProcess {
                 pid,
                 child_stack: a[1],
@@ -1724,9 +1761,13 @@ impl Kernel {
                 if self.trace {
                     eprintln!("[gex:{}] exit_group({exit})", self.pid);
                 }
+                crate::klog(&format!("[proc] pid={} exit_group({})", self.pid, exit));
                 return SyscallOutcome::Exit(*exit);
             }
         };
+        if self.pid == 10 {
+            crate::klog(&format!("[sc10] nr={} a0={:#x} a1={:#x} a2={:#x} -> ret={:#x}", n, a[0], a[1], a[2], ret));
+        }
         // A PROT_NONE mmap is Wine's reserve_area probing the low 2 GiB one
         // step at a time -- thousands of them, and each traced line is a Worker
         // round-trip that both floods the log and slows the guest ~100x, so a
@@ -1812,7 +1853,7 @@ impl Kernel {
                 Some(BlockOp::SigSuspend { restore_mask })
             }
             nr::CONNECT => {
-                let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
+                let bytes = m.read_owned(a[1], (a[2] as usize).min(128)).ok()?;
                 let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
                 let file = self.fds.get(a[0] as i32).ok()?;
                 let socket = self.socket_of(a[0] as i32).ok()?;
@@ -2262,7 +2303,13 @@ impl Kernel {
                 }
                 Ok(result)
             }
-            nr::MMAP => self.sys_mmap(m, a),
+            nr::MMAP => {
+                let r = self.sys_mmap(m, a);
+                if self.pid == 10 && a[1] == 0x10000 {
+                    crate::klog(&format!("[hres] addr={:#x} prot={:#x} flags={:#x} fd={} -> {:?}", a[0], a[2], a[3], a[4] as i32, r.as_ref().map(|v| format!("{v:#x}")).map_err(|e| *e)));
+                }
+                r
+            }
             nr::MUNMAP => {
                 let flushed = self.flush_shared(m, a[0], a[1]);
                 self.shared_maps
@@ -2280,7 +2327,24 @@ impl Kernel {
                 if (a[2] as u32) & crate::mem::prot::EXEC == 0 {
                     self.retire_code(a[0], a[1]);
                 }
-                self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0)
+                // Committing a reservation (giving it a real prot) must back
+                // the pages in the wasm linear memory, exactly as `mmap` does:
+                // otherwise the VMA reads R+X but the memory was never grown to
+                // cover it, and a guest access -- its own code, even -- lands
+                // on unbacked space. Wine reserves a module's whole range
+                // PROT_NONE, then `mprotect`s each section to its real prot;
+                // without this the sections stay unbacked. winemine jumped into
+                // ntdll mapped this way near the 4 GiB top and the translator
+                // read empty bytes and wedged. Idempotent when already backed.
+                self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).and_then(|_| {
+                    if (a[2] as u32) & 0x7 != 0 {
+                        let end = a[0].saturating_add(crate::mem::page_align_up(a[1]));
+                        if !self.mem.back_through(end) {
+                            return Err(Errno::ENOMEM);
+                        }
+                    }
+                    Ok(0)
+                })
             }
             nr::MADVISE => self.sys_madvise(m, a[0], a[1], a[2] as u32),
 
@@ -2352,7 +2416,17 @@ impl Kernel {
             // treat the socket as broken.
             nr::SETSOCKOPT => Ok(0),
             nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
-            nr::SHUTDOWN => self.fds.get(a[0] as i32).map(|_| 0),
+            nr::SHUTDOWN => self.fds.get(a[0] as i32).map(|h| {
+                // `how`: SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2. Shutting the write
+                // side closes the peer's read side (EOF), which is what makes
+                // its `poll`/`epoll` report POLLHUP -- wine's sock_check_pollhup
+                // self-test and wineserver's client-death detection both need
+                // it. A bare SHUT_RD has no peer-visible effect here.
+                if a[1] != 0 {
+                    h.handle.shutdown_write();
+                }
+                0
+            }),
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends
             // and gives up if that fails.
@@ -2413,7 +2487,7 @@ impl Kernel {
             nr::TIMES => self.sys_times(m, a[0]),
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
-            nr::PRLIMIT64 => self.sys_prlimit(m, a[2], a[3]),
+            nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
@@ -2813,9 +2887,9 @@ impl Kernel {
         // Straight out of the guest's memory: a guest address is already a
         // linear-memory offset, so the bytes are a slice and a copy would be
         // pure overhead.
-        let data = m.read(buf, len as usize)?;
+        let data = m.read_owned(buf, len as usize)?;
         let file = self.fds.get(fd)?;
-        file.write(data)
+        file.write(&data)
     }
 
     fn sys_read(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
@@ -2823,6 +2897,16 @@ impl Kernel {
         // picks the length and a copy would allocate that much on every call.
         // Capped at 16 MiB.
         let len = len.min(1 << 24) as usize;
+        // A WoW64 guest reads into buffers on its >2 GiB stack; `read_mut`
+        // cannot borrow the high half, so fill a temp and `write` it (reaching
+        // the high half via HI_MEM). Low buffers keep the zero-copy path.
+        // Without this the read EFAULTs and ntdll turns that into c0000005.
+        if m.is_high(buf, len) {
+            let mut tmp = vec![0u8; len];
+            let n = self.fds.get(fd)?.read(&mut tmp)?;
+            m.write(buf, &tmp[..n as usize])?;
+            return Ok(n);
+        }
         let dst = m.read_mut(buf, len)?;
         self.fds.get(fd)?.read(dst)
     }
@@ -2837,12 +2921,18 @@ impl Kernel {
     ) -> SysResult {
         // As `sys_read`: the guest's buffer is the destination already.
         let len = len.min(1 << 24) as usize;
+        if m.is_high(buf, len) {
+            let mut tmp = vec![0u8; len];
+            let n = self.fds.get(fd)?.pread(off, &mut tmp)?;
+            m.write(buf, &tmp[..n as usize])?;
+            return Ok(n);
+        }
         let dst = m.read_mut(buf, len)?;
         self.fds.get(fd)?.pread(off, dst)
     }
 
     fn sys_pwrite(&mut self, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
-        let data = m.read(buf, len as usize)?.to_vec();
+        let data = m.read_owned(buf, len as usize)?;
         self.fds.get(fd)?.pwrite(off, &data)
     }
 
@@ -2988,13 +3078,13 @@ impl Kernel {
             if len == 0 {
                 continue;
             }
-            let data = match m.read(base, len as usize) {
+            let data = match m.read_owned(base, len as usize) {
                 Ok(d) => d,
                 // Same rule as below: bytes already accepted have to be
                 // reported, or the caller sends them twice.
                 Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
             };
-            let n = match file.write(data) {
+            let n = match file.write(&data) {
                 Ok(n) => n,
                 // A pipe or socket that has filled up answers `EAGAIN`. If
                 // earlier vectors were already accepted, the call has
@@ -3436,22 +3526,14 @@ impl Kernel {
         }
         let cloexec = flags & oflags::O_CLOEXEC != 0;
         let read_end = OpenFile::new(
-            Arc::new(crate::pipe::RemotePipeEnd {
-                id,
-                write: false,
-                remote: r,
-            }),
+            Arc::new(crate::pipe::RemotePipeEnd::new(id, false, r)),
             format!("pipe:[{id}]"),
             flags | oflags::O_RDONLY,
             true,
             false,
         );
         let write_end = OpenFile::new(
-            Arc::new(crate::pipe::RemotePipeEnd {
-                id,
-                write: true,
-                remote: r,
-            }),
+            Arc::new(crate::pipe::RemotePipeEnd::new(id, true, r)),
             format!("pipe:[{id}]"),
             flags | oflags::O_WRONLY,
             false,
@@ -3777,7 +3859,7 @@ impl Kernel {
                 // The same shape in the other direction: the caller gave a
                 // kernel-sized structure, so reading past it would read the
                 // caller's stack.
-                let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
+                let src = m.read_owned(arg, KERNEL_TERMIOS)?;
                 if req == TCSETSF {
                     tty.flush(tty::TCIFLUSH);
                 }
@@ -3798,7 +3880,7 @@ impl Kernel {
                 Ok(0)
             }
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
-                let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
+                let src = m.read_owned(arg, KERNEL_TERMIOS)?;
                 if req == TCSETSF2 {
                     tty.flush(tty::TCIFLUSH);
                 }
@@ -3821,7 +3903,7 @@ impl Kernel {
                 Ok(0)
             }
             TCSETA | TCSETAW | TCSETAF => {
-                let src = m.read(arg, 16)?.to_vec();
+                let src = m.read_owned(arg, 16)?;
                 let mut t = tty.termios();
                 t[0..2].copy_from_slice(&src[0..2]);
                 t[2..4].fill(0);
@@ -3844,7 +3926,7 @@ impl Kernel {
                 Ok(0)
             }
             TIOCSLCKTRMIOS => {
-                let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
+                let src = m.read_owned(arg, KERNEL_TERMIOS)?;
                 tty.set_locked_termios(&src);
                 Ok(0)
             }
@@ -3862,7 +3944,7 @@ impl Kernel {
             // does a terminal multiplexer telling its children how big their
             // pane is. Everyone in the foreground group hears about it.
             TIOCSWINSZ => {
-                let ws = m.read(arg, 8)?.to_vec();
+                let ws = m.read_owned(arg, 8)?;
                 let g = |n: usize| u16::from_le_bytes([ws[n], ws[n + 1]]);
                 if tty.set_winsize((g(0), g(2), g(4), g(6))) {
                     self.signal_foreground(crate::signal::sig::SIGWINCH);
@@ -3979,7 +4061,7 @@ impl Kernel {
             // be escaped from -- Linux now wants `CAP_SYS_ADMIN` for it. Here
             // there is one terminal and one person at it.
             TIOCSTI => {
-                let b = m.read(arg, 1)?.to_vec();
+                let b = m.read_owned(arg, 1)?;
                 tty.push(&b);
                 Ok(0)
             }
@@ -4343,8 +4425,8 @@ impl Kernel {
             if from >= to {
                 continue;
             }
-            let bytes = m.read(from, (to - from) as usize)?;
-            map.file.pwrite(map.offset + (from - map.start), bytes)?;
+            let bytes = m.read_owned(from, (to - from) as usize)?;
+            map.file.pwrite(map.offset + (from - map.start), &bytes)?;
         }
         Ok(())
     }
@@ -4379,7 +4461,7 @@ impl Kernel {
         // tens of KiB; a Wayland buffer is far larger.
         const SYNC_MAX: u64 = 512 * 1024;
         for i in 0..self.shared_maps.len() {
-            let (start, len, offset, writable, file) = {
+            let (start, len, offset, writable, file, gid) = {
                 let map = &self.shared_maps[i];
                 // The KUSER_SHARED_DATA page (fixed at 0x7ffe0000) is a special
                 // per-process page gex sets up and patches (its SystemCall bit);
@@ -4397,11 +4479,32 @@ impl Kernel {
                     map.offset,
                     map.writable,
                     Arc::clone(&map.file),
+                    map.file.global_sync(),
                 )
             };
+            // A cross-Worker shared region (Wine's wineserver memory, passed over
+            // a socket): its bytes live in the global kernel, not this Worker's
+            // backing file, so the writer's updates reach every reader. The
+            // writer flushes its guest copy into the shared store; a reader
+            // refreshes its guest copy from it. Same single-writer discipline as
+            // below, one memory further out.
+            if gid != 0 {
+                if let Some(b) = crate::memfd_backing() {
+                    if writable {
+                        if let Ok(bytes) = m.read_owned(start, len as usize) {
+                            (b.write)(gid, offset, &bytes);
+                        }
+                    } else {
+                        let mut tmp = vec![0u8; len as usize];
+                        let n = (b.read)(gid, offset, &mut tmp);
+                        let _ = m.write(start, &tmp[..n]);
+                    }
+                    continue;
+                }
+            }
             if writable {
-                if let Ok(bytes) = m.read(start, len as usize) {
-                    let _ = file.pwrite(offset, bytes);
+                if let Ok(bytes) = m.read_owned(start, len as usize) {
+                    let _ = file.pwrite(offset, &bytes);
                 }
             } else {
                 let mut tmp = vec![0u8; len as usize];
@@ -4612,7 +4715,7 @@ impl Kernel {
             .mremap(addr, old_len, new_len, flags & MREMAP_MAYMOVE != 0)?;
         if moved {
             let keep = old_len.min(new_len) as usize;
-            let bytes = m.read(addr, keep)?.to_vec();
+            let bytes = m.read_owned(addr, keep)?;
             m.write(dst, &bytes)?;
             // The grown tail at the new location is fresh anonymous memory,
             // which Linux exposes as zero -- but `dst` may be a reused hole
@@ -4678,6 +4781,7 @@ impl Kernel {
     fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let (addr, len, prot_bits, flags, fd, offset) =
             (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
+        let _ = (fd, offset);
         if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
             // A private file mapping is an eager copy, which is exactly
             // correct and needs no page faults (PLAN §7.4).
@@ -4710,6 +4814,13 @@ impl Kernel {
             )?;
             let mut tmp = vec![0u8; len as usize];
             let n = file.pread(offset, &mut tmp)? as usize;
+            // A committed file mapping is written here (eager copy); make sure
+            // the placed range is backed first, for the same reason the
+            // anonymous path below does -- an address from a tracked-but-unbacked
+            // arena chunk would fault the `zero`/`write` off the end of memory.
+            if prot_bits != 0 && !self.mem.back_through(start + len_aligned) {
+                return Err(Errno::ENOMEM);
+            }
             m.zero(start, len_aligned as usize)?;
             m.write(start, &tmp[..n])?;
             // KUSER_SHARED_DATA.SystemCall (offset 0x308) tells Wine's PE
@@ -4789,6 +4900,16 @@ impl Kernel {
         // browser crash: a 26 MiB PROT_NONE reservation at 0xd000000, zeroed
         // past the 245 MiB live memory.
         if prot_bits != 0 {
+            // The bottom-up allocator can return an address inside an arena
+            // chunk that is tracked but not actually backed (a fresh `execve`
+            // whose cursor points past live memory, while another process grew
+            // the shared memory's high-water mark). Guarantee the pages exist
+            // before touching them, or `zero` walks off the end of the wasm
+            // memory and faults -- winemine's wineserver `/bin/sh` child failed
+            // its libc `mmap(0, 0x2000)` this way. Idempotent when already backed.
+            if !self.mem.back_through(start + crate::mem::page_align_up(len)) {
+                return Err(Errno::ENOMEM);
+            }
             m.zero(start, crate::mem::page_align_up(len) as usize)?;
         }
         Ok(start)
@@ -4998,6 +5119,22 @@ impl Kernel {
         Ok(())
     }
 
+    /// Like `install_remote_unix`, but allocate the descriptor rather than take
+    /// a given one -- for `socketpair`, which has no fd yet.
+    fn insert_remote_unix(
+        &mut self,
+        sock: Arc<unix::RemoteUnix>,
+        flags: u64,
+        cloexec: bool,
+    ) -> SysResult {
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        let fd = self.fds.insert(file, cloexec)?;
+        self.remote_sockets.insert(key, sock);
+        Ok(fd)
+    }
+
     /// Put a unix socket in the descriptor table.
     fn install_unix(
         &mut self,
@@ -5022,7 +5159,7 @@ impl Kernel {
         if addr == 0 || len < 2 {
             return Err(Errno::EINVAL);
         }
-        let bytes = m.read(addr, (len as usize).min(110))?;
+        let bytes = m.read_owned(addr, (len as usize).min(110))?;
         let path = &bytes[2..];
         if path.first() == Some(&0) {
             let end = path.len();
@@ -5065,12 +5202,22 @@ impl Kernel {
     /// unrelated file.
     fn sys_close(&mut self, fd: i32) -> SysResult {
         let file = self.fds.get(fd)?;
+        // Any cross-Worker SCM descriptors stashed for this fd number die with
+        // it, so a reused fd number never inherits them.
+        self.scm_overflow.remove(&fd);
         let key = Arc::as_ptr(&file) as *const () as usize;
         self.fds.close(fd)?;
         // One reference in the table is gone; `file` is the other. Anything
         // above that is another descriptor.
         if Arc::strong_count(&file) == 1 {
             self.file_locks.release(key);
+            // The last descriptor to a cross-Worker socket end: drop the lookup
+            // table's reference too, so the `RemoteUnix` goes and its global id
+            // is released now, not at exit (see `prune_remote_sockets`).
+            if file.handle.remote_unix_id().is_some() {
+                let hk = Arc::as_ptr(&file.handle) as *const () as usize;
+                self.remote_sockets.remove(&hk);
+            }
             // Last descriptor to an O_TMPFILE: drop its name. If a `linkat` gave
             // it another (the atomic-write idiom), that name keeps the inode.
             if let Some(tp) = &file.unlink_on_close {
@@ -5091,6 +5238,7 @@ impl Kernel {
         }
         self.fds
             .close_range(first as u32, last as u32, flags & CLOSE_RANGE_CLOEXEC != 0);
+        self.prune_remote_sockets();
         Ok(0)
     }
 
@@ -5318,12 +5466,32 @@ impl Kernel {
         if domain != AF_UNIX {
             return Err(Errno::EAFNOSUPPORT);
         }
-        let (a, b) = unix::UnixSocket::pair();
         let nonblock = ty & SOCK_NONBLOCK != 0;
-        a.set_nonblocking(nonblock);
-        b.set_nonblocking(nonblock);
         let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
         let cloexec = ty & SOCK_CLOEXEC != 0;
+        // In the global kernel when there is one: either end may be handed to
+        // another process over `SCM_RIGHTS` (wine passes a new process its
+        // wineserver socket this way), and a pair in this Worker's own memory
+        // could never cross.
+        if let Some(r) = self.unix_remote {
+            let mut ids = [0i32; 2];
+            let rc = (r.socketpair)(ids.as_mut_ptr() as u32);
+            if rc < 0 {
+                return Err(Errno(-rc));
+            }
+            let ra = Arc::new(unix::RemoteUnix::new(ids[0], false, None, r));
+            let rb = Arc::new(unix::RemoteUnix::new(ids[1], false, None, r));
+            ra.set_nonblocking(nonblock);
+            rb.set_nonblocking(nonblock);
+            let fa = self.insert_remote_unix(ra, flags, cloexec)?;
+            let fb = self.insert_remote_unix(rb, flags, cloexec)?;
+            m.write_u32(out, fa as u32)?;
+            m.write_u32(out + 4, fb as u32)?;
+            return Ok(0);
+        }
+        let (a, b) = unix::UnixSocket::pair();
+        a.set_nonblocking(nonblock);
+        b.set_nonblocking(nonblock);
         let fa = self.install_unix(a, flags, cloexec)?;
         let fb = self.install_unix(b, flags, cloexec)?;
         m.write_u32(out, fa as u32)?;
@@ -5457,7 +5625,7 @@ impl Kernel {
     }
 
     fn sys_connect(&mut self, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
-        let bytes = m.read(addr, (len as usize).min(128))?.to_vec();
+        let bytes = m.read_owned(addr, (len as usize).min(128))?;
         let (ip, port) = net::parse_sockaddr(&bytes)?;
         let sock = self.socket_of(fd)?;
         match sock.connect(ip, port) {
@@ -5476,13 +5644,13 @@ impl Kernel {
     ) -> SysResult {
         if dest != 0 {
             if let Ok(sock) = self.socket_of(fd) {
-                let bytes = m.read(dest, 16)?.to_vec();
+                let bytes = m.read_owned(dest, 16)?;
                 if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
                     sock.set_peer(ip, port);
                 }
             }
         }
-        let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
+        let data = m.read_owned(buf, (len as usize).min(1 << 22))?;
         self.fds.get(fd)?.write(&data)
     }
 
@@ -5642,6 +5810,307 @@ impl Kernel {
         Ok(cmsg_len)
     }
 
+    /// Serialize `SCM_RIGHTS` descriptors for a socket whose far end is in
+    /// another Worker: the `Arc<OpenFile>`s cannot cross (their vtable belongs
+    /// to this module), so the ones the receiver can rebuild travel as a binary
+    /// batch. Pipe ends cross by id (wine's client request/reply pipes); a
+    /// memfd crosses as a content snapshot (the tiny KUSER_SHARED_DATA page
+    /// wineserver hands each process). Other kinds are dropped.
+    fn serialize_scm_fds(&self, files: &[Arc<OpenFile>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for f in files {
+            if let Some(id) = f
+                .path
+                .strip_prefix("pipe:[")
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                out.push(b'p');
+                out.extend_from_slice(&id.to_le_bytes());
+                out.push(f.writable as u8);
+                out.extend_from_slice(&f.flags().to_le_bytes());
+                // Hold an in-flight reference on this pipe end, exactly as the
+                // socket case below `dup`s one: an `SCM_RIGHTS` message travels
+                // asynchronously here (the receiver is another Worker that may
+                // not exist yet -- wine's wineserver hands a not-yet-forked new
+                // process its request pipe this way), and without a reference
+                // the sender closing its own end drops the last one, the peer
+                // reads EOF, and wineserver kills the new process (c00000e5).
+                // `rebuild_scm_fds` adopts this reference rather than opening
+                // its own, so the count transfers cleanly to the receiver.
+                if let Some(r) = self.pipes {
+                    // A pid-less in-flight hold: the sender (this process) also
+                    // closes its own copy right after, and a pid-charged hold
+                    // here would be the SAME pid and cancel against that close,
+                    // leaving the queued end unreferenced (see `ref_end`).
+                    (r.ref_end)(id, f.writable as i32);
+                }
+            } else if let (Some(id), Some(r)) = (f.handle.remote_unix_id(), self.unix_remote) {
+                // A unix socket end (wine hands a new process its wineserver
+                // socket over `SCM_RIGHTS`). `SCM_RIGHTS` gives the receiver its
+                // own reference, so `dup` a fresh id naming the same global
+                // socket; the sender closing its own end then leaves the crossed
+                // one open.
+                let dup = (r.dup)(id);
+                if dup < 0 {
+                    continue;
+                }
+                out.push(b's');
+                out.extend_from_slice(&dup.to_le_bytes());
+                out.extend_from_slice(&f.flags().to_le_bytes());
+            } else {
+                // Anything else small and readable crosses as a content
+                // snapshot the receiver re-creates as a memfd: a memfd proper,
+                // and the tiny temp file wineserver hands out for
+                // KUSER_SHARED_DATA (`server_get_shared_memory_fd`, not a memfd
+                // on this build). Skip what cannot be pread (a socket) or is too
+                // big to copy sensibly.
+                // Size the buffer to the file: wine maps the PE image of every
+                // new process into a section it passes this way, and those
+                // exceed a fixed 256 KiB cap -- a truncated image fails to load
+                // with STATUS_INVALID_IMAGE_FORMAT (c000007b). Bound it
+                // generously so a stray huge fd still cannot blow up the batch.
+                const CAP: usize = 64 * 1024 * 1024;
+                let size = f
+                    .handle
+                    .metadata()
+                    .map(|md| md.size as usize)
+                    .unwrap_or(256 * 1024)
+                    .clamp(4096, CAP);
+                let mut content = vec![0u8; size];
+                let n = match f.pread(0, &mut content) {
+                    Ok(n) => n as usize,
+                    Err(_) => {
+                        // Not pread-able: a device stream (/dev/stdout), a
+                        // directory (the child's cwd) -- fds wine hands a new
+                        // process. Pass them BY PATH so the receiver re-opens the
+                        // same object rather than DROPPING the fd. A dropped fd
+                        // desyncs the SCM fd count wine pairs against its request,
+                        // so wineserver's 16-entry received-fd cache lookup for
+                        // start.exe's fds misses and it returns
+                        // STATUS_TOO_MANY_OPENED_FILES (c000011f, no window).
+                        // Anything without a real filesystem path (a bare local
+                        // socketpair end) still cannot cross and is dropped.
+                        if f.path.starts_with('/') {
+                            let pb = f.path.as_bytes();
+                            out.push(b'P');
+                            out.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+                            out.extend_from_slice(pb);
+                            out.extend_from_slice(&f.flags().to_le_bytes());
+                        }
+                        continue;
+                    }
+                };
+                content.truncate(n);
+                let name = f.path.rsplit('/').next().unwrap_or("fd").as_bytes();
+                // A shared-memory region the sender has mapped MAP_SHARED (Wine's
+                // wineserver session/desktop memory) must stay COHERENT across
+                // Workers, not freeze at this snapshot: give it a global backing
+                // in the shared kernel and pass the ID, so the receiver's reads
+                // and `sync_shared_maps` see the sender's later writes. Only
+                // regions the sender itself mapped shared qualify -- that admits
+                // the wineserver's shared memory and the small per-process USD
+                // page (which `sync_shared_maps` then leaves alone by address),
+                // but NOT the big PE image sections a new process is handed
+                // (those the sender never maps), which stay a one-shot snapshot
+                // and out of the global store. Off unless the browser installed a
+                // backing; native shares the one `Arc<MemFd>` and needs none.
+                let shared_mapped = crate::memfd_backing().is_some()
+                    && self
+                        .shared_maps
+                        .iter()
+                        .any(|s| Arc::ptr_eq(&s.file, f));
+                let gid = if shared_mapped {
+                    let id = f.global_sync();
+                    if id != 0 {
+                        id
+                    } else if let Some(b) = crate::memfd_backing() {
+                        let nm = String::from_utf8_lossy(name);
+                        let id = (b.create)(&nm);
+                        if id > 0 {
+                            if !content.is_empty() {
+                                (b.write)(id, 0, &content);
+                            }
+                            f.set_global_sync(id);
+                        }
+                        id.max(0)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                if gid > 0 {
+                    // 'M': a globally-backed shared memfd. The receiver adopts
+                    // the id rather than a private copy.
+                    out.push(b'M');
+                    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    out.extend_from_slice(name);
+                    out.extend_from_slice(&gid.to_le_bytes());
+                    out.extend_from_slice(&f.flags().to_le_bytes());
+                } else {
+                    out.push(b'm');
+                    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                    out.extend_from_slice(name);
+                    out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&content);
+                    out.extend_from_slice(&f.flags().to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebuild the descriptors a [`Self::serialize_scm_fds`] batch names, as
+    /// this process's own `OpenFile`s. Returned for `write_scm_rights`.
+    fn rebuild_scm_fds(&mut self, bytes: &[u8]) -> Vec<Arc<OpenFile>> {
+        let mut out = Vec::new();
+        let mut p = 0usize;
+        let u16at = |b: &[u8], p: usize| -> Option<u16> {
+            b.get(p..p + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+        };
+        let u32at = |b: &[u8], p: usize| -> Option<u32> {
+            b.get(p..p + 4)
+                .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        };
+        let i32at = |b: &[u8], p: usize| -> Option<i32> {
+            b.get(p..p + 4)
+                .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        };
+        let u64at = |b: &[u8], p: usize| -> Option<u64> {
+            b.get(p..p + 8).map(|s| {
+                u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+            })
+        };
+        while p < bytes.len() {
+            match bytes[p] {
+                b'p' => {
+                    p += 1;
+                    let (Some(id), Some(write), Some(flags)) =
+                        (i32at(bytes, p), bytes.get(p + 4).copied(), u64at(bytes, p + 5))
+                    else {
+                        break;
+                    };
+                    p += 4 + 1 + 8;
+                    let Some(r) = self.pipes else { continue };
+                    let write = write != 0;
+                    // Take this process's own reference on the end, then release
+                    // the pid-less in-flight hold `serialize_scm_fds` placed:
+                    // the count transfers cleanly from the queued message to
+                    // this process, so a fork+exec of an unrelated child that
+                    // inherits and closes this end can no longer drive the count
+                    // to zero while this process is still using it.
+                    (r.open_end)(id, write as i32);
+                    (r.unref_end)(id, write as i32);
+                    let handle = Arc::new(crate::pipe::RemotePipeEnd::new(id, write, r));
+                    out.push(OpenFile::new(
+                        handle,
+                        format!("pipe:[{id}]"),
+                        flags,
+                        !write,
+                        write,
+                    ));
+                }
+                b's' => {
+                    p += 1;
+                    let (Some(id), Some(flags)) = (i32at(bytes, p), u64at(bytes, p + 4))
+                    else {
+                        break;
+                    };
+                    p += 4 + 8;
+                    let Some(r) = self.unix_remote else { continue };
+                    // The id already names a live global socket the sender
+                    // `dup`ed for us; adopt it as this process's own end.
+                    let sock = Arc::new(crate::unix::RemoteUnix::new(id, false, None, r));
+                    let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+                    let key = Arc::as_ptr(&handle) as *const () as usize;
+                    let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+                    self.remote_sockets.insert(key, sock);
+                    out.push(file);
+                }
+                b'P' => {
+                    p += 1;
+                    let Some(plen) = u16at(bytes, p) else { break };
+                    p += 2;
+                    let Some(pathb) = bytes.get(p..p + plen as usize) else { break };
+                    let path = String::from_utf8_lossy(pathb).into_owned();
+                    p += plen as usize;
+                    let Some(flags) = u64at(bytes, p) else { break };
+                    p += 8;
+                    // Re-open the path in this process's VFS (a device stream or
+                    // directory wine passes a new process; see serialize_scm_fds).
+                    if let Ok(handle) = self.vfs.open(&path, flags & oflags::ACCMODE, 0) {
+                        let acc = flags & oflags::ACCMODE;
+                        let readable = acc == oflags::O_RDONLY || acc == oflags::O_RDWR;
+                        let writable = acc == oflags::O_WRONLY || acc == oflags::O_RDWR;
+                        out.push(OpenFile::new(handle, path, flags, readable, writable));
+                    } else {
+                        // Keep the fd COUNT in step even if the re-open fails, or
+                        // wine's request/fd pairing desyncs again. A /dev/null
+                        // stand-in is harmless for the stdio/cwd fds this is for.
+                        if let Ok(handle) = self.vfs.open("/dev/null", 0, 0) {
+                            out.push(OpenFile::new(handle, path, flags, true, true));
+                        }
+                    }
+                }
+                b'M' => {
+                    // A globally-backed shared memfd (see serialize_scm_fds).
+                    // Reference the shared store by id rather than copying bytes,
+                    // so this Worker sees the writer's updates.
+                    p += 1;
+                    let Some(nlen) = u16at(bytes, p) else { break };
+                    p += 2;
+                    let Some(name) = bytes.get(p..p + nlen as usize) else {
+                        break;
+                    };
+                    let name = String::from_utf8_lossy(name).into_owned();
+                    p += nlen as usize;
+                    let Some(gid) = u32at(bytes, p) else { break };
+                    let gid = gid as i32;
+                    p += 4;
+                    let Some(flags) = u64at(bytes, p) else { break };
+                    p += 8;
+                    let memfd = Arc::new(crate::unix::MemFd::new(&name));
+                    memfd.attach_global(gid);
+                    let handle: Arc<dyn crate::vfs::FileHandle> = memfd.clone();
+                    let key = Arc::as_ptr(&handle) as *const () as usize;
+                    let file = OpenFile::new(handle, format!("/memfd:{name}"), flags, true, true);
+                    file.set_global_sync(gid);
+                    self.memfds.insert(key, memfd);
+                    out.push(file);
+                }
+                b'm' => {
+                    p += 1;
+                    let Some(nlen) = u16at(bytes, p) else { break };
+                    p += 2;
+                    let Some(name) = bytes.get(p..p + nlen as usize) else {
+                        break;
+                    };
+                    let name = String::from_utf8_lossy(name).into_owned();
+                    p += nlen as usize;
+                    let Some(clen) = u32at(bytes, p) else { break };
+                    p += 4;
+                    let Some(content) = bytes.get(p..p + clen as usize) else {
+                        break;
+                    };
+                    let content = content.to_vec();
+                    p += clen as usize;
+                    let Some(flags) = u64at(bytes, p) else { break };
+                    p += 8;
+                    let memfd = Arc::new(crate::unix::MemFd::new(&name));
+                    memfd.load(&content);
+                    let handle: Arc<dyn crate::vfs::FileHandle> = memfd.clone();
+                    let key = Arc::as_ptr(&handle) as *const () as usize;
+                    let file = OpenFile::new(handle, format!("/memfd:{name}"), flags, true, true);
+                    self.memfds.insert(key, memfd);
+                    out.push(file);
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
     /// `sendmsg`, which is how glibc writes to a socket, and the only way to
     /// pass a descriptor to another process.
     fn sys_sendmsg(&mut self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
@@ -5650,7 +6119,7 @@ impl Kernel {
         let name = m.read_u64(msg)?;
         if name != 0 {
             if let Ok(sock) = self.socket_of(fd) {
-                let bytes = m.read(name, 16)?.to_vec();
+                let bytes = m.read_owned(name, 16)?;
                 if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
                     sock.set_peer(ip, port);
                 }
@@ -5663,7 +6132,7 @@ impl Kernel {
             let base = m.read_u64(iov + i * 16)?;
             let len = m.read_u64(iov + i * 16 + 8)? as usize;
             if len > 0 {
-                data.extend_from_slice(m.read(base, len.min(1 << 22))?);
+                data.extend_from_slice(&m.read_owned(base, len.min(1 << 22))?);
             }
         }
         // Ancillary data, which for a unix socket may be descriptors. Staged
@@ -5675,7 +6144,25 @@ impl Kernel {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
                 sock.stage_send(files);
+            } else if let Ok(rsock) = self.remote_unix_of(fd) {
+                // The far end is in another Worker: the descriptors travel as a
+                // serialized batch the receiver rebuilds (cross-Worker
+                // SCM_RIGHTS -- wineserver handing the wine client its pipes).
+                let files = self.read_scm_rights(m, control, controllen)?;
+                let bytes = self.serialize_scm_fds(&files);
+                if !bytes.is_empty() {
+                    rsock.send_fds(&bytes)?;
+                }
             }
+        }
+        if data.len() <= 200 {
+            let h = self.fds.get(fd).ok();
+            let dbg = h.as_ref().map(|x| format!("{:?}", x.handle)).unwrap_or_default();
+            let rid = h.as_ref().and_then(|x| x.handle.remote_id());
+            let ruid = h.as_ref().and_then(|x| x.handle.remote_unix_id());
+            let mut hx=String::new();
+            for b in data.iter().take(12){ hx.push_str(&format!("{:02x}",b)); }
+            crate::klog(&format!("[sm] pid={} fd={} len={} d={} rid={:?} ruid={:?} h={:.90}", self.pid, fd, data.len(), hx, rid, ruid, dbg));
         }
         self.fds.get(fd)?.write(&data)
     }
@@ -5753,6 +6240,56 @@ impl Kernel {
             0
         };
         let unix_sock = self.unix_of(fd).ok();
+        // For a socket whose far end is in another Worker, pull any serialized
+        // SCM_RIGHTS batch it sent BEFORE reading data: wineserver hands the
+        // client the KUSER_SHARED_DATA fd as an ancillary-only message (no data
+        // bytes), and an empty stream read would otherwise return EAGAIN and
+        // abort before the descriptors were delivered.
+        let mut received: Vec<Arc<OpenFile>> = Vec::new();
+        if unix_sock.is_none() && room > 0 {
+            // Descriptors a previous recvmsg on this fd rebuilt but could not
+            // fit in that call's control buffer come first, in order.
+            if let Some(stash) = self.scm_overflow.get_mut(&fd) {
+                while received.len() < room {
+                    match stash.pop_front() {
+                        Some(f) => received.push(f),
+                        None => break,
+                    }
+                }
+                if stash.is_empty() {
+                    self.scm_overflow.remove(&fd);
+                }
+            }
+            if received.len() < room {
+                if let Ok(rsock) = self.remote_unix_of(fd) {
+                    let mut buf = vec![0u8; 256 * 1024];
+                    if let Ok(mut n) = rsock.recv_fds(&mut buf) {
+                        // A batch bigger than the buffer is left queued and its
+                        // true length reported: grow and pull it whole. A
+                        // truncated memfd batch (a >256 KiB section wine passes
+                        // a new process) rebuilds to no descriptors, losing the
+                        // fd -> wineserver STATUS_TOO_MANY_OPENED_FILES.
+                        if n as usize > buf.len() {
+                            buf = vec![0u8; n as usize];
+                            n = rsock.recv_fds(&mut buf).unwrap_or(0);
+                        }
+                        if n > 0 && n as usize <= buf.len() {
+                            let mut batch = self.rebuild_scm_fds(&buf[..n as usize]);
+                            // Deliver only what the caller left room for; keep
+                            // the rest for its next recvmsg. A server that reads
+                            // one fd per recvmsg (wineserver) would otherwise
+                            // have the whole over-long batch dropped by
+                            // write_scm_rights and lose every fd but the first.
+                            let take = (room - received.len()).min(batch.len());
+                            received.extend(batch.drain(..take));
+                            if !batch.is_empty() {
+                                self.scm_overflow.entry(fd).or_default().extend(batch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut total = 0u64;
         for i in 0..iovlen.min(1024) {
             let base = m.read_u64(iov + i * 16)?;
@@ -5763,7 +6300,13 @@ impl Kernel {
             let mut tmp = vec![0u8; len.min(1 << 22)];
             let n = match &unix_sock {
                 Some(sock) => sock.recv(&mut tmp, room, peek)?,
-                None => self.fds.get(fd)?.read(&mut tmp)?,
+                None => match self.fds.get(fd)?.read(&mut tmp) {
+                    Ok(n) => n,
+                    // Descriptors arrived with no data of their own: deliver
+                    // them now with a zero-byte read rather than blocking.
+                    Err(_) if !received.is_empty() => break,
+                    Err(e) => return Err(e),
+                },
             };
             m.write(base, &tmp[..n as usize])?;
             total += n;
@@ -5773,7 +6316,9 @@ impl Kernel {
                 break;
             }
         }
-        let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
+        if let Some(s) = &unix_sock {
+            received = s.take_received();
+        }
         let written = self.write_scm_rights(m, control, controllen, received)?;
         m.write_u64(msg + 40, written)?;
         Ok(total)
@@ -6057,10 +6602,20 @@ impl Kernel {
         Ok(len as u64)
     }
 
-    fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
+    fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
+        // RLIMIT_NOFILE (7): a real, finite pair. wineserver sizes its own fd
+        // accounting from this and, given RLIM_INFINITY for the hard limit,
+        // returns STATUS_TOO_MANY_OPENED_FILES creating a child process
+        // (winemine's start.exe). Report the descriptor-table ceiling instead.
+        const RLIMIT_NOFILE: u64 = 7;
         if old != 0 {
-            m.write_u64(old, 8 * 1024 * 1024)?;
-            m.write_u64(old + 8, u64::MAX)?;
+            if resource == RLIMIT_NOFILE {
+                m.write_u64(old, 65536)?;
+                m.write_u64(old + 8, 65536)?;
+            } else {
+                m.write_u64(old, 8 * 1024 * 1024)?;
+                m.write_u64(old + 8, u64::MAX)?;
+            }
         }
         let _ = new;
         Ok(0)

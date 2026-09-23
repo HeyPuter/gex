@@ -132,7 +132,16 @@ pub const MMAP_TOP: u64 = DISPATCH_MAX_PAGES * DISPATCH_PAGE;
 /// against `MMAP_TOP` would land on it (the whole space is only 2 GiB here),
 /// so the automatic allocator stops a little short. `MAP_FIXED` still reaches
 /// `MMAP_TOP`.
-pub const MMAP_AUTO_TOP: u64 = MMAP_TOP - 0x0010_0000;
+// On x86, MMAP_TOP is 4 GiB so WoW64's dispatch directory can reach a 32-bit
+// thunk's whole space -- but a Windows *user* address space is only 2 GiB, and
+// the wasm linear memory must be allocated contiguously up to the highest
+// address any mapping uses. An unhinted mmap placed near 4 GiB (Wine maps the
+// ntdll PE this way) forces a ~4 GiB backing that the browser cannot grow to,
+// and the guest's own code there reads as unbacked -- winemine wedged exactly
+// so. Keep automatic placement inside the 2 GiB user range, just below the
+// shared user-data page at 0x7ffe0000, so it stays backable; MAP_FIXED still
+// reaches MMAP_TOP for the USD and any real high fixed mapping.
+pub const MMAP_AUTO_TOP: u64 = if X86 { 0x7ffe_0000 } else { MMAP_TOP - 0x0010_0000 };
 
 /// Lowest address the mmap allocator will hand out, and the bottom of the
 /// region that grows.
@@ -391,7 +400,18 @@ pub const DISPATCH_DIR: u64 = RESERVED_END;
 /// process needs — its win32u shared memory sits just under 4 GiB, and modules
 /// and stacks land wherever Wine's layout (its `limit_4g`) puts them, all now
 /// within reach and dispatchable.
-pub const DISPATCH_MAX_PAGES: u64 = 0x7_FFF8;
+// On x86 the reach (and so MMAP_TOP) is capped at 3 GiB, not 4 GiB: the wasm
+// linear memory is contiguous and cannot be grown to back an address near
+// 4 GiB in the browser, yet 64-bit Wine places its modules (ntdll.dll and the
+// rest) near the top of the address space -- at ~4 GiB they are mapped but
+// unbackable, and the guest's own code there reads as empty and wedges
+// (winemine). Capping at 3 GiB makes gex reject a placement above it, so Wine
+// relocates the module into the backable range; it pairs with the rootfs
+// ntdll.so `limit_4g` patch (2 GiB), leaving the WoW64 low half [0,2 GiB) and
+// high half [2 GiB,3 GiB) -- Wine's own split scaled to a 3 GiB ceiling. 0x60000
+// entries * 8 KiB/entry = a 3 GiB reach; the ~1.5 MiB directory still ends below
+// EXEC_BASE. aarch64 keeps the full ~4 GiB reach.
+pub const DISPATCH_MAX_PAGES: u64 = if X86 { 0x6_0000 } else { 0x7_FFF8 };
 
 /// Size of the directory in bytes.
 pub const DISPATCH_DIR_BYTES: u64 = DISPATCH_MAX_PAGES * 4;

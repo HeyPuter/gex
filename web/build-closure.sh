@@ -60,6 +60,15 @@ for w in "$@"; do
     fi
 done
 
+# GEX_WITH_LIBS (comma-separated guest paths): shared libraries no root reaches
+# through DT_NEEDED but a run loads anyway -- wine's ntdll.so and its unix
+# backends. `--with-lib` places and pins them like a dependency rather than
+# emitting a dead PIE_BASE image, so a forked-exec child reuses the built module
+# instead of re-translating (the wineserver-init-window miss).
+for w in $(printf '%s' "${GEX_WITH_LIBS:-}" | tr ',' ' '); do
+    withs="$withs --with-lib $sysroot$w"
+done
+
 # `GEX_ARCH=x86`: the x86-64 translator, and the closure lands under
 # `closure/x86/` beside the AArch64 ones (the page picks by `?arch=`).
 if [ "${GEX_ARCH:-}" = "x86" ]; then

@@ -29,6 +29,12 @@ struct Stream {
     /// Descriptors in flight, each tagged with the absolute byte offset it was
     /// sent at (from connection start, so draining `bytes` does not disturb it).
     fds: VecDeque<(u64, Arc<OpenFile>)>,
+    /// Descriptors passed over a socket whose two ends are in different Workers,
+    /// where an `Arc<OpenFile>` cannot cross (its vtable belongs to the sending
+    /// module). Each is a serialized batch the receiving process rebuilds into
+    /// its own `OpenFile`s -- how `SCM_RIGHTS` works between Workers (wineserver
+    /// hands the wine client its request pipes this way).
+    fd_msgs: VecDeque<Vec<u8>>,
     /// Total bytes ever written to this direction.
     written: u64,
     /// Total bytes ever read from it.
@@ -37,12 +43,59 @@ struct Stream {
     closed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Pipe {
+    /// A process-wide unique id. A socket pair's two ends share their two
+    /// pipes (A.tx == B.rx), so this id is a rendezvous both ends compute the
+    /// same: a writer wakes `pipe_key(tx.id)` and the peer's reader parks on
+    /// `pipe_key(rx.id)` -- the same pipe, the same key -- instead of the
+    /// global thundering-herd wake. Never zero, so 0 can mean "no pipe".
+    id: u64,
     state: Mutex<Stream>,
 }
 
+static NEXT_PIPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Default for Pipe {
+    fn default() -> Pipe {
+        Pipe {
+            id: NEXT_PIPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            state: Mutex::new(Stream::default()),
+        }
+    }
+}
+
 impl Pipe {
+    /// Queue a serialized descriptor batch for the far end (a cross-Worker
+    /// `SCM_RIGHTS` message). A plain FIFO: the receiver pulls it on the
+    /// `recvmsg` that follows, which is the order wine's handshake uses.
+    fn push_fd_msg(&self, bytes: Vec<u8>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fd_msgs
+            .push_back(bytes);
+    }
+
+    fn pop_fd_msg(&self) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fd_msgs
+            .pop_front()
+    }
+
+    /// Length of the next queued descriptor batch, without consuming it -- so a
+    /// reader can size its buffer before popping a batch too big to truncate.
+    fn peek_fd_msg_len(&self) -> Option<usize> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fd_msgs
+            .front()
+            .map(|m| m.len())
+    }
+
     fn send(&self, buf: &[u8], fds: Vec<Arc<OpenFile>>) -> SysResult {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.closed {
@@ -320,6 +373,37 @@ impl UnixSocket {
         std::mem::take(&mut *self.pending_recv.lock().unwrap())
     }
 
+    /// Send a serialized descriptor batch to the far end (cross-Worker
+    /// `SCM_RIGHTS`, where the descriptors travel as ids the receiver rebuilds).
+    pub fn send_fd_bytes(&self, bytes: Vec<u8>) -> SysResult {
+        let role = self.role.lock().unwrap();
+        let Role::Connected { tx, .. } = &*role else {
+            return Err(Errno::ENOTCONN);
+        };
+        tx.push_fd_msg(bytes);
+        Ok(0)
+    }
+
+    /// Take the next serialized descriptor batch the far end sent, if any.
+    pub fn recv_fd_bytes(&self) -> Option<Vec<u8>> {
+        let role = self.role.lock().unwrap();
+        let Role::Connected { rx, .. } = &*role else {
+            return None;
+        };
+        rx.pop_fd_msg()
+    }
+
+    /// Length of the next queued `SCM_RIGHTS` batch, without popping it, so the
+    /// receiver can grow an undersized buffer rather than truncate the batch
+    /// (a truncated memfd batch rebuilds to no descriptors and is lost).
+    pub fn peek_fd_len(&self) -> Option<usize> {
+        let role = self.role.lock().unwrap();
+        let Role::Connected { rx, .. } = &*role else {
+            return None;
+        };
+        rx.peek_fd_msg_len()
+    }
+
     /// Read, keeping any descriptors for [`Self::take_received`].
     pub fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> SysResult {
         let role = self.role.lock().unwrap();
@@ -345,6 +429,51 @@ impl UnixSocket {
     pub fn shutdown(&self) {
         if let Role::Connected { tx, .. } = &*self.role.lock().unwrap() {
             tx.close();
+        }
+    }
+
+    /// The id of the pipe this socket reads from (0 if not connected). A peer's
+    /// writer wakes this same id via [`Self::tx_pipe_id`], so a lone reader can
+    /// park precisely on it. See [`Pipe::id`].
+    pub fn rx_pipe_id(&self) -> u64 {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { rx, .. } => rx.id,
+            _ => 0,
+        }
+    }
+
+    /// The id of the pipe this socket writes to (0 if not connected); equals the
+    /// peer's `rx_pipe_id`.
+    pub fn tx_pipe_id(&self) -> u64 {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { tx, .. } => tx.id,
+            _ => 0,
+        }
+    }
+
+    /// TEMP diagnostic: bytes queued in this end's *transmit* pipe -- what the
+    /// peer would read. A write that returns n but leaves this at 0 (while the
+    /// peer also reads 0) means the two ends do not share the pipe they should.
+    pub fn tx_available(&self) -> u64 {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { tx, .. } => tx.available(),
+            _ => 0,
+        }
+    }
+
+    /// TEMP diagnostic: the heap address of this end's tx/rx pipe objects, so
+    /// two ends can be checked for actually sharing one `Arc<Pipe>` (same
+    /// address) versus two objects that merely carry the same id.
+    pub fn tx_pipe_addr(&self) -> u64 {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { tx, .. } => Arc::as_ptr(tx) as *const () as usize as u64,
+            _ => 0,
+        }
+    }
+    pub fn rx_pipe_addr(&self) -> u64 {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { rx, .. } => Arc::as_ptr(rx) as *const () as usize as u64,
+            _ => 0,
         }
     }
 }
@@ -438,6 +567,10 @@ impl FileHandle for UnixSocket {
             Role::Connected { rx, .. } => rx.closed(),
             _ => false,
         }
+    }
+
+    fn shutdown_write(&self) {
+        self.shutdown();
     }
 }
 
@@ -691,6 +824,13 @@ pub struct MemFd {
     /// read off the end, and an ignored seal hands back the guarantee without
     /// the safety.
     seals: Mutex<u32>,
+    /// A cross-Worker global backing id (browser), or 0 for a private `Vec`.
+    /// When set, every method routes to the global kernel's shared store
+    /// (`crate::MemFdBacking`) so this memfd and any other naming the same id --
+    /// in another Worker -- read and write the same bytes. This is what makes
+    /// Wine's client<->wineserver shared memory coherent across Workers; a
+    /// private `Vec` per Worker made a passed memfd a frozen snapshot.
+    global: std::sync::atomic::AtomicI32,
 }
 
 /// `F_ADD_SEALS` bits.
@@ -710,10 +850,64 @@ impl MemFd {
             name: name.to_string(),
             data: Mutex::new(Vec::new()),
             seals: Mutex::new(0),
+            global: std::sync::atomic::AtomicI32::new(0),
         }
     }
 
+    /// The global backing id, or 0 for a private `Vec`.
+    pub fn global_id(&self) -> i32 {
+        self.global.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Adopt an existing global backing id (the receiving side of a cross-Worker
+    /// pass, which already knows the id its peer registered).
+    pub fn attach_global(&self, id: i32) {
+        self.global.store(id, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Move this memfd's bytes into the global kernel's shared store and route
+    /// through it from now on, so a Worker that adopts the same id sees this
+    /// Worker's writes. Returns the global id, or 0 when no backing is installed
+    /// (native) -- callers then fall back to snapshotting the content.
+    pub fn promote_global(&self) -> i32 {
+        let existing = self.global_id();
+        if existing != 0 {
+            return existing;
+        }
+        let Some(b) = crate::memfd_backing() else { return 0 };
+        let id = (b.create)(&self.name);
+        if id <= 0 {
+            return 0;
+        }
+        // Seed the shared store with the current contents and seals, then switch
+        // over. Order matters: publish the bytes before the id, so no other
+        // side routes to an empty store.
+        let data = self.data.lock().unwrap();
+        if !data.is_empty() {
+            (b.write)(id, 0, &data);
+        }
+        let seals = *self.seals.lock().unwrap();
+        if seals != 0 {
+            (b.seals_add)(id, seals);
+        }
+        drop(data);
+        self.global.store(id, std::sync::atomic::Ordering::Release);
+        id
+    }
+
+    /// The backing to use, and its id, when routed globally.
+    fn routed(&self) -> Option<(&'static crate::MemFdBacking, i32)> {
+        let id = self.global_id();
+        if id == 0 {
+            return None;
+        }
+        crate::memfd_backing().map(|b| (b, id))
+    }
+
     pub fn seals(&self) -> u32 {
+        if let Some((b, id)) = self.routed() {
+            return (b.seals_get)(id);
+        }
         *self.seals.lock().unwrap()
     }
 
@@ -722,6 +916,13 @@ impl MemFd {
     pub fn add_seals(&self, add: u32) -> SysResult {
         if add & !seal::ALL != 0 {
             return Err(Errno::EINVAL);
+        }
+        if let Some((b, id)) = self.routed() {
+            if (b.seals_get)(id) & seal::SEAL != 0 {
+                return Err(Errno::EPERM);
+            }
+            (b.seals_add)(id, add);
+            return Ok(0);
         }
         let mut held = self.seals.lock().unwrap();
         if *held & seal::SEAL != 0 {
@@ -733,6 +934,16 @@ impl MemFd {
 
     /// Make sure the file is at least this long, for `fallocate`.
     pub fn reserve(&self, upto: u64) -> SysResult {
+        if let Some((b, id)) = self.routed() {
+            if upto <= (b.len)(id) {
+                return Ok(0);
+            }
+            if (b.seals_get)(id) & seal::GROW != 0 {
+                return Err(Errno::EPERM);
+            }
+            (b.truncate)(id, upto);
+            return Ok(0);
+        }
         let seals = self.seals();
         let mut data = self.data.lock().unwrap();
         if (upto as usize) <= data.len() {
@@ -746,16 +957,51 @@ impl MemFd {
     }
 
     pub fn len(&self) -> u64 {
+        if let Some((b, id)) = self.routed() {
+            return (b.len)(id);
+        }
         self.data.lock().unwrap().len() as u64
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// A copy of the current contents, for passing a small memfd across a
+    /// cross-Worker socket where the backing `Vec` cannot be shared (the USD
+    /// page wineserver hands each process). Prefer `promote_global` for a memfd
+    /// that must stay coherent after the pass; this frozen copy is for the ones
+    /// that are genuinely per-process (the KUSER_SHARED_DATA page).
+    pub fn snapshot(&self) -> Vec<u8> {
+        if let Some((b, id)) = self.routed() {
+            let n = (b.len)(id) as usize;
+            let mut out = vec![0u8; n];
+            let got = (b.read)(id, 0, &mut out);
+            out.truncate(got);
+            return out;
+        }
+        self.data.lock().unwrap().clone()
+    }
+
+    /// Replace the contents, for the receiving side of that pass.
+    pub fn load(&self, bytes: &[u8]) {
+        if let Some((b, id)) = self.routed() {
+            (b.truncate)(id, bytes.len() as u64);
+            if !bytes.is_empty() {
+                (b.write)(id, 0, bytes);
+            }
+            return;
+        }
+        *self.data.lock().unwrap() = bytes.to_vec();
+    }
 }
 
 impl FileHandle for MemFd {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        if let Some((b, id)) = self.routed() {
+            let n = (b.read)(id, offset, buf);
+            return Ok(n as u64);
+        }
         let data = self.data.lock().unwrap();
         let start = (offset as usize).min(data.len());
         let n = buf.len().min(data.len() - start);
@@ -767,6 +1013,13 @@ impl FileHandle for MemFd {
         let seals = self.seals();
         if seals & (seal::WRITE | seal::FUTURE_WRITE) != 0 {
             return Err(Errno::EPERM);
+        }
+        if let Some((b, id)) = self.routed() {
+            if seals & seal::GROW != 0 && offset + buf.len() as u64 > (b.len)(id) {
+                return Err(Errno::EPERM);
+            }
+            let n = (b.write)(id, offset, buf);
+            return Ok(n as u64);
         }
         let mut data = self.data.lock().unwrap();
         let start = offset as usize;
@@ -782,6 +1035,17 @@ impl FileHandle for MemFd {
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let seals = self.seals();
+        if let Some((b, id)) = self.routed() {
+            let cur = (b.len)(id);
+            if len < cur && seals & seal::SHRINK != 0 {
+                return Err(Errno::EPERM);
+            }
+            if len > cur && seals & seal::GROW != 0 {
+                return Err(Errno::EPERM);
+            }
+            (b.truncate)(id, len);
+            return Ok(());
+        }
         let mut data = self.data.lock().unwrap();
         let len = len as usize;
         if len < data.len() && seals & seal::SHRINK != 0 {
@@ -1066,9 +1330,31 @@ pub struct Remote {
     pub readable: extern "C" fn(id: i32) -> i32,
     pub writable: extern "C" fn(id: i32) -> i32,
     pub available: extern "C" fn(id: i32) -> i32,
+    /// Whether the peer has closed its end (our receive pipe is at EOF). This
+    /// is how wineserver, across a Worker boundary, learns a Wine process died
+    /// and marks its process object signalled; without it the server's waiters
+    /// (a parent's `get_new_process_info`) hang. See `FileHandle::poll_hup`.
+    pub hup: extern "C" fn(id: i32) -> i32,
     pub close: extern "C" fn(id: i32),
     pub shutdown: extern "C" fn(id: i32),
     pub exists: extern "C" fn(path: u32, path_len: u32) -> i32,
+    /// Queue a serialized `SCM_RIGHTS` batch for the far end. `at`/`len` name
+    /// the bytes in the caller's memory. Returns 0, or a negated errno.
+    pub send_fds: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
+    /// Take the next serialized `SCM_RIGHTS` batch into the caller's memory at
+    /// `at` (room `cap`). Returns its length, 0 if none, or a negated errno.
+    pub recv_fds: extern "C" fn(id: i32, at: u32, cap: u32) -> i32,
+    /// Make a connected pair in the global kernel and write the two ids (each
+    /// an `i32`) to the caller's memory at `out`. Returns 0, or a negated
+    /// errno. A socketpair whose ends may cross Workers (wine passes one to
+    /// wineserver over `SCM_RIGHTS`) must live here, not in one process's
+    /// memory.
+    pub socketpair: extern "C" fn(out: u32) -> i32,
+    /// Clone the end at `id` into a fresh id, both naming the same global
+    /// socket -- `SCM_RIGHTS` hands the receiver an independent reference, so
+    /// the sender closing its own end must not close the crossed one. Returns
+    /// the new id, or a negated errno.
+    pub dup: extern "C" fn(id: i32) -> i32,
 }
 
 /// One end of a socket in the global kernel.
@@ -1082,6 +1368,10 @@ pub struct RemoteUnix {
     pub peer: Option<String>,
     pub remote: Remote,
     nonblocking: AtomicBool,
+    /// Whether this reference's global id has been given back (`release`), so
+    /// `Drop` does not close it twice -- a slot freed twice could by then name
+    /// a socket some other Worker just created.
+    released: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteUnix {
@@ -1107,6 +1397,20 @@ impl RemoteUnix {
             peer,
             remote,
             nonblocking: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Give back this reference's id in the global kernel -- one reference of
+    /// possibly several naming the same socket (a fork or `SCM_RIGHTS` `dup`s a
+    /// fresh id for the receiver). The socket itself, and the EOF its peer
+    /// reads, go with the LAST id, exactly like `close(2)` on a shared socket.
+    /// Never a `shutdown`: that would sever the end for every other holder --
+    /// Wine's double-fork intermediate exiting would cut the grandchild's
+    /// wineserver connection out from under it. Idempotent; `Drop` calls it.
+    pub fn release(&self) {
+        if !self.released.swap(true, Ordering::AcqRel) {
+            (self.remote.close)(self.id);
         }
     }
 
@@ -1140,15 +1444,37 @@ impl RemoteUnix {
     pub fn bound_path(&self) -> Option<String> {
         self.peer.clone()
     }
+
+    /// Send a serialized `SCM_RIGHTS` batch (bytes in this module's memory) to
+    /// the far end, through the global kernel.
+    pub fn send_fds(&self, bytes: &[u8]) -> SysResult {
+        match (self.remote.send_fds)(self.id, bytes.as_ptr() as u32, bytes.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
+
+    /// Take the next serialized `SCM_RIGHTS` batch into `buf`; returns its
+    /// length, or 0 when none is waiting.
+    pub fn recv_fds(&self, buf: &mut [u8]) -> SysResult {
+        match (self.remote.recv_fds)(self.id, buf.as_mut_ptr() as u32, buf.len() as u32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n)),
+        }
+    }
 }
 
 impl Drop for RemoteUnix {
     fn drop(&mut self) {
-        (self.remote.close)(self.id);
+        self.release();
     }
 }
 
 impl crate::vfs::FileHandle for RemoteUnix {
+    fn remote_unix_id(&self) -> Option<i32> {
+        Some(self.id)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.listening {
             return Err(Errno::ENOTCONN);
@@ -1194,6 +1520,17 @@ impl crate::vfs::FileHandle for RemoteUnix {
 
     fn poll_writable(&self) -> bool {
         self.listening || (self.remote.writable)(self.id) != 0
+    }
+
+    fn poll_hup(&self) -> bool {
+        // A listener never reports HUP; a connected end asks the global kernel
+        // whether its receive pipe hit EOF (the peer closed). Mirrors the local
+        // `UnixSocket::poll_hup`, across the Worker boundary.
+        !self.listening && (self.remote.hup)(self.id) != 0
+    }
+
+    fn shutdown_write(&self) {
+        self.shutdown();
     }
 
     fn available(&self) -> Option<u64> {

@@ -540,11 +540,13 @@ async function handle(msg) {
         msg.child.uid = msg.uid ?? msg.opts?.uid;
         msg.child.gid = msg.gid ?? msg.opts?.gid;
       }
+      console.error(`[wmtrace] worker pid ${msg.child?.pid}: adoptProcess start`);
       entry = await gex.adoptProcess(msg.shim, msg.guest, msg.child, {
         ...msg,
         closure: msg.closure ?? (await closureModules(msg.closureCount ?? 0)),
         wantLibrary,
       });
+      console.error(`[wmtrace] worker pid ${msg.child?.pid}: adoptProcess done entry=0x${(entry??0n).toString(16)}, entering run`);
     } else {
       entry = await gex.load(
         msg.shim,
@@ -610,6 +612,7 @@ async function handle(msg) {
     // wayland closures need (the demand path's streaming interaction corrupts
     // their dispatch); on keeps tables small across a many-fork run like apt.
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
+    if (msg.globalSlots !== undefined) ex.gex_set_global_slots?.(msg.globalSlots);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
     if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
     if (msg.spGuard) ex.gex_set_sp_guard?.(1);

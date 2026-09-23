@@ -724,6 +724,7 @@ pub fn translate_object(
     lo: u64,
     hi: u64,
     seeds: &[u64],
+    data_limit: usize,
     executable: &(dyn Fn(u64) -> bool + Sync),
     known: &(dyn Fn(u64) -> bool + Sync),
     page_table: PageTable,
@@ -739,7 +740,7 @@ pub fn translate_object(
     let mut scanned: Vec<u64> = Vec::new();
     let seeds = if seeds.is_empty() {
         arch::sweep(
-            &|pc, buf| fetch_code_bytes(memory, executable, pc, buf),
+            &|pc, buf| fetch_code_bytes(memory, data_limit, executable, pc, buf),
             lo,
             hi,
             &[],
@@ -754,6 +755,7 @@ pub fn translate_object(
         memory,
         lo,
         seeds,
+        data_limit,
         executable,
         known,
         limits,
@@ -876,6 +878,7 @@ fn emit_modules(
 pub fn translate_runtime(
     memory: &[u8],
     entry: u64,
+    data_limit: usize,
     executable: &(dyn Fn(u64) -> bool + Sync),
     known: &(dyn Fn(u64) -> bool + Sync),
     page_table: PageTable,
@@ -888,6 +891,7 @@ pub fn translate_runtime(
         memory,
         entry,
         &[entry],
+        data_limit,
         executable,
         known,
         page_table,
@@ -906,6 +910,7 @@ fn translate_seeded(
     memory: &[u8],
     entry: u64,
     seeds: &[u64],
+    data_limit: usize,
     executable: &(dyn Fn(u64) -> bool + Sync),
     known: &(dyn Fn(u64) -> bool + Sync),
     page_table: PageTable,
@@ -915,7 +920,7 @@ fn translate_seeded(
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
     let (mut blocks, mut stats) = discover(
-        memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
+        memory, entry, seeds, data_limit, executable, known, limits, max_blocks, intrinsics,
     );
     // A dispatch slot spans more bytes than an instruction (x86-64): every
     // block already translated that shares a slot with one of these has to be
@@ -929,11 +934,11 @@ fn translate_seeded(
             let a = blocks[i].start;
             let lo = a & !(span - 1);
             for b in lo..lo + span {
-                if b != a && !have.contains(&b) && known(b) && fetchable(memory, executable, b) {
+                if b != a && !have.contains(&b) && known(b) && fetchable(memory, data_limit, executable, b) {
                     have.insert(b);
                     let (blk, _) = match intrinsics.get(&b) {
                         Some(&k) => (intrinsic::block(b, k), None),
-                        None => lift_one(b, memory, executable, limits),
+                        None => lift_one(b, memory, executable, limits, data_limit),
                     };
                     stats.blocks += 1;
                     blocks.push(blk);
@@ -957,6 +962,7 @@ fn discover(
     memory: &[u8],
     entry: u64,
     seeds: &[u64],
+    data_limit: usize,
     executable: &(dyn Fn(u64) -> bool + Sync),
     known: &(dyn Fn(u64) -> bool + Sync),
     limits: BlockLimits,
@@ -997,7 +1003,7 @@ fn discover(
                 // Not lifted at all, so discovery never walks into the
                 // function's body and the module never carries it.
                 Some(&k) => (intrinsic::block(a, k), None),
-                None => lift_one(a, memory, executable, limits),
+                None => lift_one(a, memory, executable, limits, data_limit),
             }
         });
 
@@ -1028,7 +1034,7 @@ fn discover(
                 // indirect-branch target, and dispatch needs a block starting
                 // exactly there. Entering the containing block would re-run
                 // the instructions before it.
-                if fetchable(memory, executable, succ)
+                if fetchable(memory, data_limit, executable, succ)
                     && !seen.contains(&succ)
                     // Never re-translate something the table already answers
                     // for; the existing entry may be a tier-2 region.
@@ -1051,11 +1057,52 @@ fn discover(
     (collected, stats)
 }
 
+/// Reads guest memory above the 2 GiB view slice. The shim registers it (it
+/// may use raw pointers; this crate forbids `unsafe`). Unset off wasm and
+/// until the shim installs it -- [`read_guest`] falls back to the slice, which
+/// is the whole memory natively and never asks for the high half there.
+pub static HI_READ: std::sync::OnceLock<fn(u64, &mut [u8])> = std::sync::OnceLock::new();
+
+/// Register the shim's high-memory read helper. Idempotent; the first wins.
+pub fn set_hi_read(f: fn(u64, &mut [u8])) {
+    let _ = HI_READ.set(f);
+}
+
+/// Copy `n` bytes of guest memory at offset `off` into `dst`.
+///
+/// On wasm the `memory` view slice tops out at 2 GiB (`isize::MAX`), but a
+/// WoW64 guest maps code and data up to ~4 GiB -- Wine places the 64-bit
+/// `ntdll.dll` near the top of a 3 GiB address space. Bytes past the view are
+/// reached through the shim's [`HI_READ`] hook, exactly as the kernel reaches
+/// its high half through `HI_MEM`. The caller guarantees `off..off+n` is
+/// within backed memory (bounded by `data_limit`).
+#[inline]
+fn read_guest(memory: &[u8], off: usize, n: usize, dst: &mut [u8]) {
+    if off.saturating_add(n) > memory.len() {
+        if let Some(hi) = HI_READ.get() {
+            hi(off as u64, &mut dst[..n]);
+            return;
+        }
+    }
+    dst[..n].copy_from_slice(&memory[off..off + n]);
+}
+
+/// Read a little-endian unsigned integer of `bytes` (1/2/4/8) from guest
+/// memory at offset `off`, reaching past the 2 GiB view on wasm. See
+/// [`read_guest`].
+#[inline]
+fn read_guest_uint(memory: &[u8], off: usize, bytes: u32) -> u64 {
+    let mut b = [0u8; 8];
+    read_guest(memory, off, bytes as usize, &mut b[..bytes as usize]);
+    u64::from_le_bytes(b)
+}
+
 /// Whether `pc` holds an instruction this translation may read.
-fn fetchable(memory: &[u8], executable: &(dyn Fn(u64) -> bool + Sync), pc: u64) -> bool {
+fn fetchable(memory: &[u8], data_limit: usize, executable: &(dyn Fn(u64) -> bool + Sync), pc: u64) -> bool {
+    let _ = memory;
     pc % INST_ALIGN == 0
         && executable(pc)
-        && pc as usize + INST_ALIGN as usize <= memory.len()
+        && pc as usize + INST_ALIGN as usize <= data_limit
 }
 
 /// Copy the instruction bytes at `pc` out of live memory, stopping at the
@@ -1063,15 +1110,16 @@ fn fetchable(memory: &[u8], executable: &(dyn Fn(u64) -> bool + Sync), pc: u64) 
 /// of a mapping.
 fn fetch_code_bytes(
     memory: &[u8],
+    data_limit: usize,
     executable: &(dyn Fn(u64) -> bool + Sync),
     pc: u64,
     buf: &mut arch::FetchBuf,
 ) -> usize {
-    if !fetchable(memory, executable, pc) {
+    if !fetchable(memory, data_limit, executable, pc) {
         return 0;
     }
     let off = pc as usize;
-    let mut n = (memory.len() - off).min(16);
+    let mut n = (data_limit.saturating_sub(off)).min(16);
     // The first `INST_ALIGN` bytes are known executable; check the rest.
     let mut k = INST_ALIGN as usize;
     while k < n {
@@ -1081,7 +1129,7 @@ fn fetch_code_bytes(
         }
         k += 1;
     }
-    buf[..n].copy_from_slice(&memory[off..off + n]);
+    read_guest(memory, off, n, &mut buf[..n]);
     n
 }
 
@@ -1164,31 +1212,33 @@ fn lift_one(
     memory: &[u8],
     executable: &(dyn Fn(u64) -> bool + Sync),
     limits: BlockLimits,
+    data_limit: usize,
 ) -> (Block, Option<u64>) {
-    let fetch = |pc: u64, buf: &mut arch::FetchBuf| fetch_code_bytes(memory, executable, pc, buf);
+    let fetch = |pc: u64, buf: &mut arch::FetchBuf| fetch_code_bytes(memory, data_limit, executable, pc, buf);
     let mut block = lift_block(fetch, addr, limits);
     pass::optimize(&mut block);
     if is_volatile(addr) {
         let lo = addr as usize;
-        let hi = (block.end as usize).max(lo + 1).min(lo + GUARD_MAX).min(memory.len());
+        let hi = (block.end as usize).max(lo + 1).min(lo + GUARD_MAX).min(data_limit);
         if hi > lo {
-            block.guard = Some(memory[lo..hi].to_vec());
+            let mut g = vec![0u8; hi - lo];
+            read_guest(memory, lo, hi - lo, &mut g);
+            block.guard = Some(g);
         }
     }
     let folded = match block.term {
         Term::Indirect { target, .. } => {
             let mut probe = block.clone();
+            // `data_limit` (live backed memory), not `memory.len()` (= GUEST_LIMIT,
+            // the whole nameable range): folding an indirect target reads a
+            // jump-table/GOT slot, and a wild or unbacked pointer below
+            // GUEST_LIMIT would read past real memory and fault the wasm memory.
             pass::const_fold_with_memory(&mut probe, &|a, bytes| {
                 let off = a as usize;
-                if off + bytes as usize > memory.len() {
+                if off.saturating_add(bytes as usize) > data_limit {
                     return None;
                 }
-                Some(match bytes {
-                    1 => memory[off] as u64,
-                    2 => u16::from_le_bytes(memory[off..off + 2].try_into().unwrap()) as u64,
-                    4 => u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()) as u64,
-                    _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
-                })
+                Some(read_guest_uint(memory, off, bytes))
             });
             pass::const_value(&probe, target)
         }
@@ -1261,6 +1311,7 @@ mod tests {
             &memory,
             base,
             &seeds,
+            memory.len(),
             &|x| x >= base && x < base + span,
             &|_| false,
             BlockLimits::default(),

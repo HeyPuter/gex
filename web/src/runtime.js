@@ -316,6 +316,14 @@ async function loadKernel() {
       // arrive.
       module: await WebAssembly.compile(bytes),
       memory: new WebAssembly.Memory({ initial: 2048, maximum: 65536, shared: true }),
+      // Serializes every Worker's kernel-module instantiate against the one
+      // shared memory. Concurrent `WebAssembly.instantiate` of this module
+      // (each re-runs its active data segments into the SAME SharedArrayBuffer)
+      // can wedge the engine -- and because the engine serializes instantiate
+      // globally, one stuck instantiate then blocks every later one in any
+      // Worker. A rapid fork burst hits it (wine's wineboot double-fork:
+      // pid->pid8->pid9, both attaching at once). One tiny SAB, one lock word.
+      lock: new SharedArrayBuffer(8),
     };
   } catch {
     kernelSpec = false;
@@ -362,6 +370,9 @@ export async function runProgram(
     dirs = [],
     // Which bundled files are executable; see `untar`.
     modes = {},
+    // Symlinks the rootfs contains, `{ linkPath: target }`, installed as real
+    // links (a link to a directory cannot be resolved to a file copy).
+    symlinks = {},
     /// `KEY=VALUE` strings for pid 1. Empty takes the shim's default.
     env = [],
     args,
@@ -414,9 +425,11 @@ export async function runProgram(
     // `apt-get update` dead at its 77th process. Bulk recompilation only ever
     // helped a run that is long *and* library-bound, and it is one query
     // parameter away for such a run: `?recompile=8192`.
-    recompileObjects = typeof globalThis.GEX_RECOMPILE_OBJECTS === 'number'
-      ? globalThis.GEX_RECOMPILE_OBJECTS
-      : 0,
+    recompileObjects = flag('recompile')
+      ? Number(flag('recompile'))
+      : (typeof globalThis.GEX_RECOMPILE_OBJECTS === 'number'
+        ? globalThis.GEX_RECOMPILE_OBJECTS
+        : 0),
     // A closure built ahead of time by `gexc build --closure`: the image
     // module, every library beside it, and the layout they were placed at.
     closure = null,
@@ -707,6 +720,14 @@ export async function runProgram(
         flag('claimpages') != null
           ? (flag('claimpages') === '0' ? 0 : 1)
           : (closureBuildNumbered ? 0 : undefined),
+      // `?globalslots=1`: number identity-backed pages from ONE system-wide
+      // sequence so a forked-exec child (wine's PE spawns) reuses its parent's
+      // compiled wine64/ntdll instead of recompiling. In `extra` for every
+      // Worker. Opt-in per demo (the winemine demo requests it).
+      globalSlots:
+        flag('globalslots') != null
+          ? (flag('globalslots') === '0' ? 0 : 1)
+          : undefined,
       // `?intrinsicmask=N` enables only some substitution families, to bisect
       // which one corrupts memory: bit0=memcpy, bit1=memset, bit2=memcmp.
       // In `extra` so every process gets it.
@@ -779,11 +800,23 @@ export async function runProgram(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, env, pins: closure?.pins,
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, symlinks, env, pins: closure?.pins,
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.
         stracePid: globalThis.GEX_STRACE_PID || undefined,
+        // `?traceblocks=1` + `?traceblockspid=N`: per-block pc+register trace,
+        // scoped to one process (a whole session's is unusable). The one tool
+        // that shows what ran between two syscalls when a process lands wild.
+        traceBlocks: flag('traceblocks') ? 1 : undefined,
+        traceBlocksPid: flag('traceblockspid') ? Number(flag('traceblockspid')) : undefined,
+        // `?coherentloads=1`: emit guest scalar loads/stores as atomic wasm, so
+        // a torn 64-bit pointer read/write across Wine's sibling-thread Workers
+        // cannot hand one a half-updated value (the winemine child-spawn race).
+        coherentLoads: flag('coherentloads') ? 1 : undefined,
+        // `?watchmem=0xADDR`: report every change to the 8 bytes at ADDR (with
+        // the value and rough when), to catch what corrupts a pointer slot.
+        watchMem: flag('watchmem') || undefined,
         heartbeat: globalThis.GEX_HEARTBEAT || undefined, enterlog: globalThis.GEX_ENTERLOG || undefined,
         // Which program pid 1 is, so its own text gets a code identity and a
         // second process can reuse what the first translated of it.

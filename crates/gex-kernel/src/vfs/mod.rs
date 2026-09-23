@@ -131,6 +131,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn remote_id(&self) -> Option<i32> {
         None
     }
+    /// The global-kernel socket id, when this handle is a `RemoteUnix` (a unix
+    /// socket whose two ends live in two Workers). `serialize_scm_fds` needs it
+    /// to pass a socketpair end across `SCM_RIGHTS`, which `remote_id` (a file
+    /// id) must not be conflated with. `None` for everything that is not one.
+    fn remote_unix_id(&self) -> Option<i32> {
+        None
+    }
     /// List a directory. Only directories implement this.
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)
@@ -175,6 +182,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn poll_hup(&self) -> bool {
         false
     }
+
+    /// Shut the write side of a stream socket: the peer's receive side hits EOF
+    /// and its `poll_hup` starts reporting `POLLHUP`. Default no-op (non-socket
+    /// handles have nothing to shut). Wine's wineserver runs a startup self-test
+    /// (`sock_check_pollhup`) that shuts one end of a socketpair and polls the
+    /// other for `POLLHUP`; without this it logs an error and falls back to a
+    /// poll mode that misbehaves under gex.
+    fn shutdown_write(&self) {}
 
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that

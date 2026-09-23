@@ -110,6 +110,18 @@ export async function start() {
   // function it happened in -- the only thing that says which of the shim's own
   // functions was running when the fault is in the shim, not translated code.
   if (params.get('debug')) globalThis.GEX_TRAP_STACK = 1;
+  // `?trapstack=1`: keep the engine wasm-frame stack for a trap WITHOUT the
+  // `?debug` write-mirror flood, so the fault stays the same one we are chasing.
+  if (params.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
+  // `?strace=1` / `?stracepid=N`: narrate syscalls (the browser's --strace), to
+  // diff a browser-only failure against the native trace.
+  if (params.get('strace')) globalThis.GEX_STRACE = 1;
+  // `?heartbeat=N`: every N ms, each process logs where its guest pc is -- a
+  // low-frequency probe (won't mask a timing race the way per-syscall klogs do)
+  // that reveals a process spinning at one pc (e.g. a fork-of-fork dispatch-miss
+  // loop). See fork-of-fork-dispatch-loop.
+  if (params.get('heartbeat')) globalThis.GEX_HEARTBEAT = Number(params.get('heartbeat'));
+  if (params.has('stracepid')) globalThis.GEX_STRACE_PID = Number(params.get('stracepid'));
   // A page cannot open a TCP socket, so the network is carried over Wisp.
   let network = null;
   if (params.get('wisp')) {

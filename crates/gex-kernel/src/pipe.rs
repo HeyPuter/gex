@@ -323,6 +323,16 @@ pub struct Remote {
     pub last_message: extern "C" fn(id: i32, at: u32, cap: u32) -> i32,
     /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
     pub close_end: extern "C" fn(id: i32, write: i32),
+    /// Hold / release an end with NO owning process -- the reference an
+    /// in-flight `SCM_RIGHTS` message keeps while it waits in a socket's queue
+    /// for a receiver that may not exist yet. Unlike `open_end`/`close_end`
+    /// these are not charged to a pid, so the sender closing its own copy
+    /// cannot cancel the in-flight hold (both would be the sender's pid and
+    /// would net to nothing -- exactly the bug that EOF'd a Wine process's
+    /// request pipe the instant its forked child exec'd). The receiver converts
+    /// the hold into its own `open_end` and calls `unref_end` to release it.
+    pub ref_end: extern "C" fn(id: i32, write: i32),
+    pub unref_end: extern "C" fn(id: i32, write: i32),
     /// Read into, or write out of, an address in the caller's memory.
     pub read: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
     pub write: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
@@ -337,6 +347,24 @@ pub struct RemotePipeEnd {
     pub id: i32,
     pub write: bool,
     pub remote: Remote,
+    /// Set once this end has given back its descriptor to the global kernel, so
+    /// `shutdown_write` and `Drop` -- both of which run at exit-time teardown --
+    /// close the end at most ONCE. `close_end` is a reference-count decrement,
+    /// not idempotent, so closing twice under-counts the writers and makes a
+    /// reader see a false EOF while another holder is still alive. That is what
+    /// EOF'd a Wine process's request pipe the instant its forked child exec'd.
+    shut: std::sync::atomic::AtomicBool,
+}
+
+impl RemotePipeEnd {
+    pub fn new(id: i32, write: bool, remote: Remote) -> RemotePipeEnd {
+        RemotePipeEnd {
+            id,
+            write,
+            remote,
+            shut: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl std::fmt::Debug for RemotePipeEnd {
@@ -352,7 +380,9 @@ impl std::fmt::Debug for RemotePipeEnd {
 
 impl Drop for RemotePipeEnd {
     fn drop(&mut self) {
-        (self.remote.close_end)(self.id, self.write as i32);
+        if !self.shut.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            (self.remote.close_end)(self.id, self.write as i32);
+        }
     }
 }
 
@@ -416,6 +446,19 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         // between the claim and the write. Short writes are carried by the
         // syscall layer instead.
         None
+    }
+
+    /// Close this end's write side so a reader on the far end sees EOF. The
+    /// write end of a daemonize/readiness pipe (wineserver's launcher forks the
+    /// daemon, closes its own write end, and reads until the daemon closes the
+    /// other -- the daemon exiting is the "ready"/"gone" signal). `Drop` closes
+    /// it too, but a process leaving by a trap or via the shim's explicit
+    /// exit-time teardown does not run `Drop` reliably, so a reader would hang
+    /// forever. Same fix as sockets (`shutdown_write`). No-op for a read end.
+    fn shutdown_write(&self) {
+        if self.write && !self.shut.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            (self.remote.close_end)(self.id, 1);
+        }
     }
 
     fn debug_state(&self) -> String {

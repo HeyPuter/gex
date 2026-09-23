@@ -73,6 +73,11 @@ const DEMOS = {
   // `--wllit` reads back from its framebuffer. The terminal line only says the
   // shell got that far.
   compositor: { want: /gex: session up/ },
+  // winemine (Windows Minesweeper via Wine, x86-64 guest) runs as a client of
+  // the `compositor` session demo, selected with `?apps=winemine`. Success is
+  // the compositor publishing a surface; pair with --wllit for the pixel
+  // readback that proves the window is actually drawn, not just mapped.
+  winemine: { demo: 'compositor', query: 'apps=winemine&arch=x86', want: /published [1-9]\d* surface/, settle: 'finished' },
   // glxgears under Xwayland, GL through virgl (same success bar as `virgl`):
   // a frame rate AND a lit texture presented. `lit=0` is drew-nothing.
   wayland: {

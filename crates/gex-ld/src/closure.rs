@@ -98,6 +98,23 @@ pub fn resolve_all(
     read: &dyn Fn(&str) -> Option<Vec<u8>>,
     place: &mut dyn FnMut(&str, u64) -> u64,
 ) -> Result<Closure, LoadError> {
+    resolve_all_with(roots, Vec::new(), read, place)
+}
+
+/// As `resolve_all`, plus `placed`: libraries named by full path that no root
+/// reaches through `DT_NEEDED` because they are loaded some other way -- wine's
+/// `ntdll.so` and its unix backends, which the tiny `wine64` loader arranges
+/// for `ld.so` to bring in rather than declaring as a dependency. They enter as
+/// depth-1 objects: placed at their own address and pinned like any dependency
+/// (NOT at `PIE_BASE` like a root/image), so a process that loads one at run
+/// time lands on the pinned base and reuses the built module. Their own
+/// `DT_NEEDED` is followed like a root's.
+pub fn resolve_all_with(
+    roots: Vec<(Image, String)>,
+    placed: Vec<(Image, String)>,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+    place: &mut dyn FnMut(&str, u64) -> u64,
+) -> Result<Closure, LoadError> {
     let mut out = Closure::default();
     let mut seen: HashSet<String> = HashSet::new();
     // Name -> (asked by, depth), in the order they were first named. A
@@ -132,6 +149,33 @@ pub fn resolve_all(
             image: exe,
             span: exe_span,
             depth: 0,
+        });
+    }
+
+    // Explicit placed libraries: already loaded at their placed base by the
+    // caller, so they arrive pinned (depth 1) rather than at `PIE_BASE`. Their
+    // dependencies (libunwind for ntdll.so) go on the same queue as a root's.
+    for (lib, lib_path) in placed {
+        for n in &lib.needed {
+            queue.push((n.clone(), lib_path.clone(), 2));
+        }
+        if !lib.runpath.is_empty() {
+            runpath_of.insert(lib_path.clone(), expand_origin(&lib.runpath, &lib_path));
+        }
+        let fresh = seen.insert(lib_path.clone());
+        if let Some(s) = &lib.soname {
+            seen.insert(s.clone());
+        }
+        if !fresh {
+            continue;
+        }
+        let span = lib.brk.saturating_sub(lib.bias);
+        out.objects.push(Object {
+            path: lib_path.clone(),
+            name: lib.soname.clone().unwrap_or_else(|| basename(&lib_path).to_string()),
+            image: lib,
+            span,
+            depth: 1,
         });
     }
 

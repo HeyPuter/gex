@@ -85,6 +85,7 @@ fn main() {
             lo,
             hi,
             &mut seeds,
+            memory.len(),
             &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
             &|_| false,
             gex_xlate::PageTable::default(),
@@ -117,6 +118,7 @@ fn main() {
     let (unit, stats) = gex_xlate::translate_runtime(
         &memory,
         addr,
+        memory.len(),
         &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
         &|_| false,
         gex_xlate::PageTable::default(),

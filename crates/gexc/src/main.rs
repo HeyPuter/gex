@@ -387,6 +387,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     // library, instantiated by the first branch that lands in it.
     let mut shared_image = false;
     let mut also: Vec<String> = Vec::new();
+    let mut also_libs: Vec<String> = Vec::new();
     let mut sysroot: Option<String> = None;
     let mut profile: Vec<u64> = Vec::new();
     let mut i = 0;
@@ -428,6 +429,18 @@ fn cmd_build(args: &[String]) -> Result<()> {
             "--with" => {
                 i += 1;
                 also.push(args.get(i).context("--with needs a path")?.clone());
+            }
+            // A shared library named by full path that no root reaches through
+            // `DT_NEEDED`, but a run loads anyway (wine's `ntdll.so` and its
+            // unix backends: the `wine64` loader is a stub that has `ld.so`
+            // bring them in without declaring them). Placed and pinned like a
+            // dependency, NOT emitted as a `PIE_BASE` image the way `--with`'s
+            // executables are -- an image for a library nothing execs is dead,
+            // and the run re-translates the library from scratch, which for
+            // `ntdll.so` is exactly the wineserver-init-window miss.
+            "--with-lib" => {
+                i += 1;
+                also_libs.push(args.get(i).context("--with-lib needs a path")?.clone());
             }
             "--with-dir" => {
                 i += 1;
@@ -476,8 +489,8 @@ fn cmd_build(args: &[String]) -> Result<()> {
 
     if closure {
         return build_closure(
-            &path, &also, sysroot.as_deref(), &out, exhaustive, &exhaustive_for, shared_memory,
-            no_validate, shared_image, &profile,
+            &path, &also, &also_libs, sysroot.as_deref(), &out, exhaustive, &exhaustive_for,
+            shared_memory, no_validate, shared_image, &profile,
         );
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
@@ -577,6 +590,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
 fn build_closure(
     path: &str,
     also: &[String],
+    also_libs: &[String],
     sysroot: Option<&str>,
     out: &str,
     exhaustive: bool,
@@ -586,7 +600,7 @@ fn build_closure(
     shared_image: bool,
     profile: &[u64],
 ) -> Result<()> {
-    let (closure, interp) = closure_of_all(path, also, sysroot)?;
+    let (closure, interp) = closure_of_all(path, also, also_libs, sysroot)?;
     // Sorted once so each object can binary-search its slice of reached PCs.
     let mut profile_sorted = profile.to_vec();
     profile_sorted.sort_unstable();
@@ -910,7 +924,7 @@ fn closure_of(
     path: &str,
     sysroot: Option<&str>,
 ) -> Result<(gex_ld::closure::Closure, Option<String>)> {
-    closure_of_all(path, &[], sysroot)
+    closure_of_all(path, &[], &[], sysroot)
 }
 
 /// As [`closure_of`], plus the helpers the program forks.
@@ -922,6 +936,7 @@ fn closure_of(
 fn closure_of_all(
     path: &str,
     also: &[String],
+    also_libs: &[String],
     sysroot: Option<&str>,
 ) -> Result<(gex_ld::closure::Closure, Option<String>)> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
@@ -976,8 +991,41 @@ fn closure_of_all(
         };
         roots.push((img, gp));
     }
+    // Explicit placed libraries (`--with-lib`): loaded at a placed base so they
+    // come out pinned like a dependency, not as a `PIE_BASE` image. Probe the
+    // span at zero, ask the placer for a base, then load there.
+    let mut placed = Vec::new();
+    for l in also_libs {
+        let lb = match std::fs::read(l) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gexc: skipping placed lib {l}: {e}");
+                continue;
+            }
+        };
+        let gp = match sysroot {
+            Some(r) => l.strip_prefix(r.trim_end_matches('/')).unwrap_or(l).to_string(),
+            None => l.clone(),
+        };
+        let probe = match gex_ld::elf::load(&lb, 0) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("gexc: skipping placed lib {l}: {e:?}");
+                continue;
+            }
+        };
+        let base = place(&gp, probe.brk);
+        let img = match gex_ld::elf::load(&lb, base) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("gexc: skipping placed lib {l}: {e:?}");
+                continue;
+            }
+        };
+        placed.push((img, gp));
+    }
     Ok((
-        gex_ld::closure::resolve_all(roots, &read, &mut place)?,
+        gex_ld::closure::resolve_all_with(roots, placed, &read, &mut place)?,
         interp,
     ))
 }

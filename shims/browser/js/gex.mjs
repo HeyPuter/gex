@@ -880,7 +880,7 @@ export class Gex {
       // Each of these is called through `?.` at its use site so a shim that
       // predates it still loads -- which is how a stale runtime turns into a
       // silent wrong answer (no `gex_chmod` leaves every file 0644).
-      'gex_chmod', 'gex_add_dir', 'gex_add_env',
+      'gex_chmod', 'gex_add_dir', 'gex_add_env', 'gex_add_symlink',
       'gex_paused_for_input', 'gex_paused_for_net', 'gex_paused_for_host',
       'gex_park', 'gex_resume_pc',
       'gex_resume_ctx', 'gex_exit_code', 'gex_jit_pending_len',
@@ -916,12 +916,15 @@ export class Gex {
       // syscalls is more output than a page survives.
       stracePid: opts.stracePid,
       tty: opts.tty, uid: opts.uid, gid: opts.gid,
-      traceBlocks: opts.traceBlocks, traceMisses: opts.traceMisses, checkSp: opts.checkSp,
+      traceBlocks: opts.traceBlocks, traceBlocksPid: opts.traceBlocksPid,
+      traceMisses: opts.traceMisses, checkSp: opts.checkSp,
+      coherentLoads: opts.coherentLoads,
       watchMem: opts.watchMem,
       noIntrinsics: opts.noIntrinsics, intrinsicMask: opts.intrinsicMask,
     };
     syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
+    if (opts.coherentLoads) this.#shim.exports.gex_set_coherent_loads?.(1);
     // How many of an object's stored units one miss may take.
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
     // Keep what the guest's dynamic linker produces, and start the next process
@@ -964,6 +967,20 @@ export class Gex {
       this.#bytes().set(p, pp);
       this.#shim.exports.gex_add_dir?.(pp, p.length);
       free?.(pp, p.length);
+    }
+    // Symlinks, as real links the guest VFS follows -- not resolved to a copy
+    // of the target, which silently dropped links to a directory (Wine's
+    // `dosdevices/c: -> ../drive_c`, without which no `c:\...` path resolves).
+    for (const [path, target] of Object.entries(opts.symlinks ?? {})) {
+      const p = enc.encode(path);
+      const t = enc.encode(target);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      const tp = this.#shim.exports.gex_alloc(t.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#bytes().set(t, tp);
+      this.#shim.exports.gex_add_symlink?.(pp, p.length, tp, t.length);
+      free?.(pp, p.length);
+      free?.(tp, t.length);
     }
     // Which of them are executable: the VFS makes every file 0644 and the tar's
     // mode did not travel with its bytes, so programs read as not executable.
@@ -1084,7 +1101,7 @@ export class Gex {
     // See `slotsNeeded`.
     const truly = Math.max(m.need >>> 0, slotsNeeded(m.meta));
     if (!m.meta || !m.meta.length || !e.gex_add_lazy_module) {
-      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-nometa');
+      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-nometa', null, m.key);
       return;
     }
     const gp = e.gex_alloc(m.meta.length) >>> 0;
@@ -1092,11 +1109,11 @@ export class Gex {
     const need = e.gex_add_lazy_module(gp, m.meta.length) >>> 0;
     e.gex_free?.(gp, m.meta.length);
     if (!need) {
-      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-noneed');
+      await this.#installModule(m.mod, truly, 64, m.meta, 'adopt-noneed', null, m.key);
       return;
     }
     this.#growTables(Math.max(need, truly), 'adopt');
-    this.#lazyInherited.push({ mod: m.mod, need: truly, inst: null, meta: m.meta });
+    this.#lazyInherited.push({ mod: m.mod, need: truly, inst: null, meta: m.meta, key: m.key });
   }
 
   /**
@@ -1235,6 +1252,7 @@ export class Gex {
     // Narrate one page's directory writes, in every process. See #136.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     }
+    _at('devices set, building imports');
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
@@ -1248,7 +1266,8 @@ export class Gex {
       safepoint: e.gex_safepoint,
       fma: e.gex_fma,
     };
-    const tGuest = performance.now();
+const tGuest = performance.now();
+    _at(`about to ${guestWasm instanceof WebAssembly.Module ? 'instantiate' : 'compile+instantiate'} guest`);
     this.#guest = await WebAssembly.instantiate(
       guestWasm instanceof WebAssembly.Module ? guestWasm : await WebAssembly.compile(guestWasm),
       { gex: this.#imports },
@@ -1286,7 +1305,19 @@ export class Gex {
       const prot = Number(dv.getBigUint64(scratch + 16, true));
       // `prot` travels with the bytes: the child rebuilds its memory *map* from
       // these, and a map is not recoverable from the memory it describes.
-      if (end > start) out.push({ at: start, end, prot, bytes: this.#bytes().slice(start, end) });
+      //
+      // Skip a PROT_NONE region's BYTES: it is an address-space reservation
+      // (wine reserves ~1.5 GiB up front), unreadable by the guest and all
+      // zeros, so copying it is pointless -- and copying it is RUINOUS: the
+      // child's `writeSparse` scans every page of it word by word (a ~1.5 GiB
+      // scan = minutes in JS), which is exactly where a forked child's Worker
+      // was stalling and never running (winemine's start.exe grandchild). The
+      // reservation is still re-established from the VMA map (`#vmaBlob` carries
+      // every VMA, prot included); the child's fresh memory is already zero, and
+      // a later commit into it backs pages then. So send the map, not the void.
+      if (end > start && prot !== 0) {
+        out.push({ at: start, end, prot, bytes: this.#bytes().slice(start, end) });
+      }
     }
     e.gex_free?.(scratch, 24);
     // A checksum per region, so the child can say whether what it runs on is
@@ -1343,19 +1374,62 @@ export class Gex {
    * process memory (memory 1, how it copies bytes in and out). Nothing without
    * a `kernel` in the constructor options: one process needs no such table.
    */
+  // A cross-Worker lock (one word in a shared buffer) so only one Worker
+  // instantiates the kernel module against the shared memory at a time. Async
+  // so it never blocks the Worker's event loop: `Atomics.waitAsync` yields
+  // until the holder releases. See `#startKernel` and runtime.js.
+  static async #kernelInstantiateLock(sab) {
+    const a = new Int32Array(sab);
+    for (;;) {
+      if (Atomics.compareExchange(a, 0, 0, 1) === 0) return;
+      // Yield until the holder releases. `waitAsync` where it exists, a
+      // macrotask otherwise (older engines) -- both retry the CAS on wake.
+      if (typeof Atomics.waitAsync === 'function') {
+        const r = Atomics.waitAsync(a, 0, 1);
+        if (r.async) await r.value;
+      } else {
+        await new Promise((res) => setTimeout(res, 0));
+      }
+    }
+  }
+
+  static #kernelInstantiateUnlock(sab) {
+    const a = new Int32Array(sab);
+    Atomics.store(a, 0, 0);
+    Atomics.notify(a, 0, 1);
+  }
+
   async #startKernel() {
     const _k = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[kernel] ${s}`); };
     if (!this.#kernelSpec || this.#kernel) { _k(`skip (spec=${!!this.#kernelSpec} kernel=${!!this.#kernel})`); return; }
-    const { module, memory, stackTop } = this.#kernelSpec;
+    const { module, memory, stackTop, lock } = this.#kernelSpec;
     _k(`compile (isModule=${module instanceof WebAssembly.Module} stackTop=0x${(stackTop>>>0).toString(16)})`);
     const mod = module instanceof WebAssembly.Module
       ? module
       : await WebAssembly.compile(module);
-    _k('instantiate');
-    const inst = await WebAssembly.instantiate(mod, {
-      env: { memory, process: this.#memory },
-    });
-    _k('instantiated');
+    // One Worker at a time instantiates the kernel module against the shared
+    // memory: two doing it at once (each re-running the module's active data
+    // segments into the SAME SharedArrayBuffer) can deadlock the engine, and
+    // since instantiate is serialized engine-wide, that stuck call then wedges
+    // every later instantiate in any Worker. wine's wineboot double-fork spawns
+    // two Workers that attach at the same instant and hit it. See runtime.js.
+    // Serialize just this kernel-module instantiate against the shared memory:
+    // concurrent instantiates of it (each re-runs data segments into the one
+    // SharedArrayBuffer) can wedge the engine-global instantiate under a fork
+    // burst (wine's wineboot double-fork). Scoped tight -- only the instantiate,
+    // which does not block -- so it cannot deadlock the way wrapping all of
+    // attach() (which parks in #catchUp) did. See runtime.js `kernelSpec.lock`.
+    let inst;
+    if (lock) await Gex.#kernelInstantiateLock(lock);
+    try {
+      _k('instantiate');
+      inst = await WebAssembly.instantiate(mod, {
+        env: { memory, process: this.#memory },
+      });
+      _k('instantiated');
+    } finally {
+      if (lock) Gex.#kernelInstantiateUnlock(lock);
+    }
     // The stack, before anything is called. Each Worker's `__stack_pointer` is
     // a per-instance global that wasm-ld inits to the same address in shared
     // memory, so two Workers in the kernel would overwrite each other's locals.
@@ -1559,7 +1633,16 @@ export class Gex {
     step('copying the image');
     // Grow to cover the parent's mapped regions before writing a byte, or the
     // copy throws `RangeError: offset is out of bounds` above the initial size.
-    this.#growTo(child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0));
+    const growTarget = child.image.reduce((n, r) => Math.max(n, r.at + r.bytes.byteLength), 0);
+    step(`growing memory to 0x${growTarget.toString(16)} (have 0x${this.#memory.buffer.byteLength.toString(16)})`);
+    this.#growTo(growTarget);
+    step(`memory grown to 0x${this.#memory.buffer.byteLength.toString(16)}`);
+    {
+      const sizes = child.image.map((r) => r.bytes.byteLength).sort((a, b) => b - a);
+      const total = sizes.reduce((n, x) => n + x, 0);
+      step(`image ${child.image.length} regions, total ${(total/1048576).toFixed(1)}MiB, `
+        + `top3 ${sizes.slice(0,3).map((x)=>(x/1048576).toFixed(1)).join('/')}MiB`);
+    }
     const u8 = this.#bytes();
     // `?forkskip=N`: leave any region larger than N MiB uncopied.
     //
@@ -1591,6 +1674,7 @@ export class Gex {
     this.#forkCopied = copied;
     this.#forkSkipped = skipped;
     this.#forkZeros = zeros;
+    step(`wrote ${copied} bytes across ${child.image.length} regions`);
     // Checked here, before anything else writes to this memory: the check
     // further down runs after the child has rewritten the low region itself,
     // so it cannot tell a damaged copy from a deliberate rewrite. This one can.
@@ -1668,7 +1752,9 @@ export class Gex {
     if (o.strace || (o.stracePid && o.stracePid === child.pid)) e.gex_set_trace(1);
     if (o.heartbeat && (!o.stracePid || o.stracePid === child.pid))
       e.gex_set_heartbeat?.(BigInt(o.heartbeat));
-    if (o.traceBlocks) e.gex_set_trace_blocks?.(1);
+    if (o.coherentLoads) e.gex_set_coherent_loads?.(1);
+    if (o.traceBlocks && (!o.traceBlocksPid || o.traceBlocksPid === child.pid))
+      e.gex_set_trace_blocks?.(1);
     if (o.watchMem) e.gex_set_watch_mem?.(BigInt(o.watchMem));
     if (o.traceMisses) e.gex_set_trace_misses?.(1);
     if (o.checkSp) e.gex_set_check_sp?.(1);
@@ -1796,9 +1882,29 @@ export class Gex {
       need = Math.max(need, (child.slots ?? 0) >>> 0);
     }
     if (need) this.#growTables(need, 'a1806');
+    // The miss-stub span must exist in table 0 before the guest runs: an
+    // unclaimed page dispatches through table 0 at its page offset to reach the
+    // stub, and under global slot numbering (`?globalslots`) a process can
+    // claim no page in table 0 at all (the shared counter is already past
+    // table 0 when it starts), so it would never grow table 0 and a legitimate
+    // miss would trap out of bounds. Cheap and harmless when table 0 is grown
+    // anyway. `#reach` fills with the stub at table 0 slot 0.
+    this.#reach(0, SLOTS_PER_PAGE);
     // Kept, not dropped: a child that stays wants them after all, and by then
     // its parent's Worker may be gone. See `#maybeAdopt`.
     this.#inherited = child.modules ?? [];
+    // Content-key the inherited modules into `#sharedModules` too. `#inherited`
+    // is dropped on execve (its per-page directory belongs to the old program),
+    // but `#sharedModules` is content-keyed and survives -- so a child that
+    // execs the SAME loader (every wine PE spawn re-execs wine64) meets its own
+    // identical ntdll/wine64 pages already compiled, on the JIT miss path,
+    // instead of recompiling thousands of modules and missing wine's
+    // process-init window (the wineboot c00000e5 / no-window blocker).
+    for (const m of this.#inherited) {
+      if (m.key !== undefined && m.mod instanceof WebAssembly.Module && !this.#sharedModules.has(m.key)) {
+        this.#sharedModules.set(m.key, m.mod);
+      }
+    }
     // Eager (adoptAfterTraps <= 0): install all inherited modules before the
     // child runs. Kept for comparison against the deferred path, which starts
     // with empty tables and meets the parent's code through the miss path.
@@ -2124,7 +2230,7 @@ export class Gex {
       // Keep a sibling's compiled Module when we have it, so the on-demand
       // instantiate skips the compile too; otherwise the raw bytes. The push
       // order matches `gex_add_lazy_module`'s ordinal (both count from 0 here).
-      this.#lazyInherited.push({ mod: this.#sharedModules.get(moduleContentKey(bytes)) ?? bytes, need, inst: null, meta });
+      this.#lazyInherited.push({ mod: this.#sharedModules.get(moduleContentKey(bytes)) ?? bytes, need, inst: null, meta, key: moduleContentKey(bytes) });
       lazy++;
     }
     if (globalThis.GEX_ATTACH_TRACE && (lazy || eager)) {
@@ -2209,7 +2315,8 @@ export class Gex {
     // stack trace per trap that nothing here reads -- hundreds of thousands of
     // them for a program with contended locks.
     const limit = Error.stackTraceLimit;
-    if (!globalThis.__gexKeepTrace) Error.stackTraceLimit = 0;
+    if (globalThis.GEX_TRAP_STACK) Error.stackTraceLimit = 40;
+    else if (!globalThis.__gexKeepTrace) Error.stackTraceLimit = 0;
     try {
       return await this.#runLoop(entry, startCtx);
     } finally {
@@ -2335,6 +2442,9 @@ export class Gex {
           // address crossed -- a stack whose mmap did not grow the memory, or a
           // wild pointer beyond it.
           try {
+            // The trap TYPE: "memory access out of bounds" (backing/OOB) vs
+            // "table index is out of bounds" (dispatch) vs "unreachable" (abort).
+            console.error(`[trap] err: ${err && err.message ? err.message : err}`);
             console.error(`[trap] linear memory grown to ${(this.#memory.buffer.byteLength / (1024 * 1024)) | 0} MiB (0x${this.#memory.buffer.byteLength.toString(16)})`);
             // Guest pc + registers at the fault, read from the live ctx (x86 GPRs
             // map to x-slots in encoding order: rax0 rcx1 rdx2 rbx3 rsp4 rbp5 rsi6 rdi7).
@@ -2344,6 +2454,55 @@ export class Gex {
                 const dv = new DataView(this.#memory.buffer);
                 const g = (o) => dv.getBigUint64(ca + o, true).toString(16);
                 console.error(`[trap] pc=0x${g(256)} rax=0x${g(0)} rcx=0x${g(8)} rdx=0x${g(16)} rbx=0x${g(24)} rsp=0x${g(32)} rbp=0x${g(40)} rsi=0x${g(48)} rdi=0x${g(56)}`);
+                // 16 guest bytes at the fault pc -- decode the faulting insn.
+                try {
+                  const pcv = Number(dv.getBigUint64(ca + 256, true));
+                  const b = [];
+                  for (let i = 0; i < 48; i++) b.push(dv.getUint8(pcv + i).toString(16).padStart(2, '0'));
+                  console.error(`[trap] bytes@pc(48): ${b.join(' ')}`);
+                  const ret = Number(dv.getBigUint64(Number(dv.getBigUint64(ca + 32, true)), true));
+                  const rb = [];
+                  for (let i = -8; i < 24; i++) rb.push(dv.getUint8(ret + i).toString(16).padStart(2, '0'));
+                  console.error(`[trap] ret=0x${ret.toString(16)} bytes@ret-8(32): ${rb.join(' ')}`);
+                } catch (be) { console.error('[trap] bytes@pc unreadable', be.message); }
+                // fs_base / tpidr live in the high ctx slots -- a wild fs base
+                // makes the `mov rdx, fs:[0x28]` canary read fault. Dump them.
+                try {
+                  console.error(`[trap] fs/tls slots: g280=0x${g(280)} g288=0x${g(288)} g296=0x${g(296)} g304=0x${g(304)} g312=0x${g(312)} g320=0x${g(320)}`);
+                } catch (fe) { console.error('[trap] fs slots unreadable', fe.message); }
+                // The stack at rsp -- return addresses that led here -- and a
+                // scan for where the wild pc value itself is stored (a GOT slot
+                // a lazy resolve wrote a bad pointer into). Crash-only.
+                try {
+                  const badpc = dv.getBigUint64(ca + 256, true);
+                  const rsp = Number(dv.getBigUint64(ca + 32, true));
+                  const stk = [];
+                  for (let i = 0; i < 20; i++) {
+                    stk.push('0x' + dv.getBigUint64(rsp + i * 8, true).toString(16));
+                  }
+                  console.error(`[trap] stack@rsp: ${stk.join(' ')}`);
+                  const u64 = new BigUint64Array(this.#memory.buffer);
+                  const cap = Math.min(u64.length, 0x60000000 / 8);
+                  const found = [];
+                  for (let i = 0; i < cap && found.length < 16; i++) {
+                    if (u64[i] === badpc) found.push(i * 8);
+                  }
+                  console.error(`[trap] wild pc 0x${badpc.toString(16)} stored at: ${found.map((a) => '0x' + a.toString(16)).join(' ')}`);
+                  // Neighbours of the first hit: if adjacent pointer slots ALSO
+                  // carry the 0x10000000 high dword, the high-32 corruption is
+                  // systematic (a reloc / 64-bit-store bug), not one slot.
+                  if (found.length) {
+                    const base = found[0];
+                    const near = [];
+                    for (let k = -6; k <= 6; k++) {
+                      const a = base + k * 8;
+                      if (a >= 0 && a + 8 <= this.#memory.buffer.byteLength) {
+                        near.push(`${k === 0 ? '*' : ''}0x${dv.getBigUint64(a, true).toString(16)}`);
+                      }
+                    }
+                    console.error(`[trap] neighbours of 0x${base.toString(16)}: ${near.join(' ')}`);
+                  }
+                } catch (e2) { console.error('[trap] stack/scan failed', e2.message); }
               }
             } catch (er) { console.error('[trap] reg dump failed', er.message); }
           } catch {}
@@ -2867,7 +3026,12 @@ export class Gex {
     const check = globalThis.GEX_CHECK_INSTALL || (typeof process !== 'undefined' && process.env?.GEX_CHECK_INSTALL);
     const bytes = this.#bytes().slice(ptr, ptr + len);
     const key = moduleContentKey(bytes);
-    await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878');
+    // Reuse an already-compiled module of the same content if one exists --
+    // from a sibling thread OR, since `#sharedModules` is now seeded from the
+    // inherited set, from a parent whose loader this child re-exec'd. Skips
+    // `WebAssembly.compile`, the dominant cost of a fresh wine PE spawn.
+    const cached = key ? this.#sharedModules.get(key) : undefined;
+    await this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'jit2878', cached, key);
     e.gex_jit_installed();
     if (check && e.gex_miss_pc && e.gex_dispatch_slot && (e.gex_jit_pending_len() >>> 0) === 0) {
       try {
@@ -2911,11 +3075,11 @@ export class Gex {
    * or another did and this one catches up): a thread that installed them
    * differently would dispatch to different code.
    */
-  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null) {
+  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, key = null) {
     const t0 = performance.now();
     this.#installs++;
     try {
-      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled);
+      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled, key);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -2927,7 +3091,7 @@ export class Gex {
    * turned out not to be what a run costs: each process installs thousands of
    * shared modules, and compiling and instantiating those was uncounted.
    */
-  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null) {
+  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, key = null) {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tg = performance.now();
@@ -2950,18 +3114,40 @@ export class Gex {
     // A `precompiled` Module (a sibling Worker's, relayed by the host) skips the
     // compile entirely; otherwise compile the bytes (or use them if already a
     // Module). Same registry bytes either way, so the Module is interchangeable.
-    const mod = precompiled instanceof WebAssembly.Module
-      ? precompiled
-      : bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
+    let mod;
+    if (precompiled instanceof WebAssembly.Module) {
+      mod = precompiled;
+    } else if (bytes instanceof WebAssembly.Module) {
+      mod = bytes;
+    } else if (bytes.byteLength <= (4 << 20)) {
+      // Synchronous compile for a small JIT unit. `await WebAssembly.compile`
+      // can leave its promise unsettled inside a freshly ADOPTED child's run
+      // loop -- the wineboot double-fork grandchild hung here forever on a 99 KB
+      // module its Worker never resolved, so it never ran and wineboot failed
+      // (c00000e5, no window). A small module compiles in a few ms, so doing it
+      // synchronously costs nothing and cannot starve. Large modules (Mesa-
+      // sized) still compile async below, where blocking the thread would hurt.
+      mod = new WebAssembly.Module(bytes);
+    } else {
+      mod = await WebAssembly.compile(bytes);
+    }
     this.#compileMs += performance.now() - tc;
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must
     // instantiate all of them. The section is in the bytes; keeping it is a
     // parse.
+    // The content key travels with the module so a forked-then-exec child can
+    // re-key it into `#sharedModules` (which survives the exec that drops
+    // `#inherited`), letting the child reuse a self-exec'd program's already
+    // compiled code -- wine's PE spawns exec the SAME wine64 loader, so this is
+    // where wineboot/winemine stop recompiling ntdll from scratch and beat the
+    // wineserver's process-init window.
+    const ckey = key ?? (bytes instanceof Uint8Array ? moduleContentKey(bytes) : undefined);
     this.#compiled.push({
       mod,
       need,
       meta: bytes instanceof Uint8Array ? metadataSection(bytes) : undefined,
+      key: ckey,
     });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];

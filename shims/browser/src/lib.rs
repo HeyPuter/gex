@@ -205,6 +205,10 @@ extern "C" {
     /// the blanket wake every syscall fires does not wake an idle condvar
     /// waiter. Returns 0 woken, 1 already moved, 2 timed out. See `k_park_futex`.
     fn k_park_futex(addr: u64, gen: u32, ns: i64) -> i32;
+    /// The precise wake key a lone reader of socket `id` should park on (the
+    /// pipe it receives from); 0 if not a connected socket. A peer's writer
+    /// wakes exactly this key, so the reader leaves the global thundering herd.
+    fn k_sock_rxkey(id: i32) -> u64;
     fn k_spawn(ppid: i32) -> i32;
     fn k_exit(pid: i32, status: i32);
     fn k_reap(pid: i32);
@@ -284,6 +288,18 @@ extern "C" {
     fn k_tty_flush(which: i32) -> i32;
     fn k_tty_queued() -> i32;
     fn k_tty_push(at: u32, len: u32) -> i32;
+    /// A cross-Worker shared memfd store in the global kernel. A memfd passed
+    /// over a socket used to freeze a content snapshot (a `MemFd`'s `Vec` is a
+    /// Worker's private memory); these keep the bytes in the one shared memory
+    /// so Wine's client and wineserver see each other's writes. See
+    /// `gex_kernel::set_memfd_backing` and `register_memfd_backing`.
+    fn k_memfd_create(name_at: u32, name_len: u32) -> i32;
+    fn k_memfd_read(id: i32, offset: u64, at: u32, len: u32) -> i32;
+    fn k_memfd_write(id: i32, offset: u64, at: u32, len: u32) -> i32;
+    fn k_memfd_len(id: i32) -> i64;
+    fn k_memfd_truncate(id: i32, len: u64) -> i32;
+    fn k_memfd_seals_get(id: i32) -> u32;
+    fn k_memfd_seals_add(id: i32, add: u32);
     /// Slots nobody else will be given, and the mark that keeps runtime
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
@@ -376,9 +392,20 @@ extern "C" {
     fn k_sock_readable(id: i32) -> i32;
     fn k_sock_writable(id: i32) -> i32;
     fn k_sock_available(id: i32) -> i32;
+    fn k_sock_hup(id: i32) -> i32;
     fn k_sock_close(id: i32);
     fn k_sock_shutdown(id: i32);
     fn k_sock_exists(path: u32, path_len: u32) -> i32;
+    fn k_sock_send_fds(id: i32, at: u32, len: u32) -> i32;
+    fn k_sock_recv_fds(id: i32, at: u32, cap: u32) -> i32;
+    fn k_sock_socketpair(out: u32) -> i32;
+    fn k_sock_dup(id: i32) -> i32;
+    fn k_sock_pipes(id: i32) -> i64;
+    fn k_sock_tx_len(id: i32) -> i64;
+    fn k_probe_set(v: i64);
+    fn k_probe_get() -> i64;
+    fn k_seq() -> i64;
+    fn k_sock_pipe_addrs(id: i32) -> i64;
 
     // The GPU's client numbers. One renderer, one canvas, and every drawing
     // process a client of it -- so the number cannot come from a table each
@@ -740,6 +767,16 @@ extern "C" fn rp_close_end(id: i32, write: i32) {
     unsafe { k_pipe_close_end(id, write, my_pid()) }
     pipe_note("close", id, write);
 }
+/// The pid a cross-Worker in-flight `SCM_RIGHTS` pipe reference is charged to:
+/// a sentinel no process ever answers as, so `k_pipe_forget` (called only with
+/// real pids) never releases it and the sender's own `close` cannot cancel it.
+const INFLIGHT_PID: i32 = i32::MIN;
+extern "C" fn rp_ref_end(id: i32, write: i32) {
+    unsafe { k_pipe_open_end(id, write, INFLIGHT_PID) }
+}
+extern "C" fn rp_unref_end(id: i32, write: i32) {
+    unsafe { k_pipe_close_end(id, write, INFLIGHT_PID) }
+}
 extern "C" fn rp_read(id: i32, at: u32, len: u32) -> i32 {
     unsafe { k_pipe_read(id, at, len) }
 }
@@ -872,6 +909,8 @@ fn global_pipes() -> Option<gex_kernel::pipe::Remote> {
         writes: rp_writes,
         last_message: rp_last_message,
         close_end: rp_close_end,
+        ref_end: rp_ref_end,
+        unref_end: rp_unref_end,
         read: rp_read,
         write: rp_write,
         readable: rp_readable,
@@ -1043,6 +1082,9 @@ extern "C" fn rs_writable(id: i32) -> i32 {
 extern "C" fn rs_available(id: i32) -> i32 {
     unsafe { k_sock_available(id) }
 }
+extern "C" fn rs_hup(id: i32) -> i32 {
+    unsafe { k_sock_hup(id) }
+}
 extern "C" fn rs_close(id: i32) {
     unsafe { k_sock_close(id) }
 }
@@ -1051,6 +1093,18 @@ extern "C" fn rs_shutdown(id: i32) {
 }
 extern "C" fn rs_exists(path: u32, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
+}
+extern "C" fn rs_send_fds(id: i32, at: u32, len: u32) -> i32 {
+    unsafe { k_sock_send_fds(id, at, len) }
+}
+extern "C" fn rs_recv_fds(id: i32, at: u32, cap: u32) -> i32 {
+    unsafe { k_sock_recv_fds(id, at, cap) }
+}
+extern "C" fn rs_socketpair(out: u32) -> i32 {
+    unsafe { k_sock_socketpair(out) }
+}
+extern "C" fn rs_dup(id: i32) -> i32 {
+    unsafe { k_sock_dup(id) }
 }
 
 /// Where a unix socket's two ends live, when there is a global kernel to put
@@ -1069,9 +1123,14 @@ fn global_sockets() -> Option<gex_kernel::unix::Remote> {
         readable: rs_readable,
         writable: rs_writable,
         available: rs_available,
+        hup: rs_hup,
         close: rs_close,
         shutdown: rs_shutdown,
         exists: rs_exists,
+        send_fds: rs_send_fds,
+        recv_fds: rs_recv_fds,
+        socketpair: rs_socketpair,
+        dup: rs_dup,
     })
 }
 
@@ -1118,6 +1177,7 @@ fn install_bundle_remote() {
     FILES.0.borrow_mut().clear();
     DIRS.0.borrow_mut().clear();
     MODES.0.borrow_mut().clear();
+    SYMLINKS.0.borrow_mut().clear();
     if unsafe { k_fs_populated() } == 0 {
         unsafe { k_fs_populate_done() };
     }
@@ -1241,6 +1301,19 @@ fn mount_devices(
 ) {
     let mut devfs = gex_kernel::vfs::DevFs::new();
     devfs.add("tty", Arc::new(Tty));
+    // The standard streams as devfs nodes, which real Linux has (as symlinks to
+    // /proc/self/fd/N). Two reasons they must exist by PATH here: a guest that
+    // opens "/dev/stderr" directly, and -- the load-bearing one -- cross-Worker
+    // SCM. `serialize_scm_fds` passes a non-preadable fd whose path starts with
+    // "/" by PATH ('P'), and the receiver reopens it; without these nodes the
+    // console fd a parent hands a child over SCM (Wine's `run_wineboot` passes
+    // fd 2 to wineboot as hStdError via `wine_server_fd_to_handle(2)`) fails to
+    // reopen, leaving the forked child with a dead stderr -- invisible, and a
+    // broken handle Wine may then choke on. A fresh `Console` in the receiver
+    // writes to the same host console, which is what the sender's fd meant.
+    devfs.add("stdin", Arc::clone(&*STDIN) as Arc<dyn FileHandle>);
+    devfs.add("stdout", Arc::new(Console { fd: 1 }));
+    devfs.add("stderr", Arc::new(Console { fd: 2 }));
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
@@ -1625,12 +1698,24 @@ fn grow_memory_to(end: u64) -> bool {
     // signature). Off by default; on, the memory reaches the floor once.
     let target = if pregrow() { end.max(768 * 1024 * 1024) } else { end };
     if target <= have {
+        // Already big enough -- but publish the authoritative top anyway, since
+        // the kernel's own `memory.size` read can lag this one (see
+        // GUEST_MEM_TOP): a would-be-OOB guest write then checks against a stale
+        // low bound and faults on memory that is really backed.
+        gex_kernel::GUEST_MEM_TOP.fetch_max(have, std::sync::atomic::Ordering::Relaxed);
         return true;
     }
     // A megabyte at a time past what was asked for: `memory.grow` may copy, so
     // a guest mapping a page at a time should not pay per page.
     let want = (target - have).div_ceil(PAGE).max(16);
-    warch::memory_grow(0, want as usize) != usize::MAX
+    if warch::memory_grow(0, want as usize) == usize::MAX {
+        return false;
+    }
+    // Record the new top from a fresh read, so the kernel's `limit()` never
+    // bounds a guest access against a stale-low `memory.size`.
+    let now = warch::memory_size(0) as u64 * PAGE;
+    gex_kernel::GUEST_MEM_TOP.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 static PREGROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1835,6 +1920,14 @@ fn arena_take(len: u64) -> Option<u64> {
     } else {
         cur
     };
+    // Skip any region a prior `execve` reserved: the talc heap owns live spans
+    // up where the arena had climbed before the cursor was reset low, and
+    // handing one to a guest mapping corrupts the heap. Bounded: RESERVED holds
+    // a handful of runs and each bump strictly increases `at`.
+    let mut at = at;
+    while let Some(re) = reserved_bump(at, len) {
+        at = re;
+    }
     let end = at.checked_add(len)?;
     if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
@@ -1992,6 +2085,122 @@ fn arena_grow(len: u64) -> u64 {
 /// one it owns, and that needs the old end. Zero means nothing claimed yet.
 static HEAP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The talc heap's owned spans, merged into contiguous runs (talc extends, so a
+/// run grows in place; a non-abutting claim starts a new run). `execve`
+/// snapshots these into RESERVED before resetting the arena cursor beneath them.
+/// Fixed capacity; a run that would overflow it folds into the last so nothing
+/// live goes unrecorded (it over-reserves a gap at worst, never under-reserves).
+const TALC_RUNS_MAX: usize = 32;
+static TALC_RUNS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); TALC_RUNS_MAX] = {
+    const Z: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+        (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+    [Z; TALC_RUNS_MAX]
+};
+
+/// Note a talc span [start, end): extend the run it abuts, else open a new one.
+/// Serialised by the heap lock that already guards every acquire, so plain
+/// load/store on the atomics is enough.
+fn record_talc_run(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    // Extend an abutting run at either edge.
+    for slot in TALC_RUNS.iter() {
+        let e = slot.1.load(std::sync::atomic::Ordering::Relaxed);
+        if e == 0 {
+            continue;
+        }
+        let sstart = slot.0.load(std::sync::atomic::Ordering::Relaxed);
+        if start <= e && end >= sstart {
+            if start < sstart {
+                slot.0.store(start, std::sync::atomic::Ordering::Relaxed);
+            }
+            if end > e {
+                slot.1.store(end, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+    }
+    // A new run.
+    for slot in TALC_RUNS.iter() {
+        if slot.1.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            slot.0.store(start, std::sync::atomic::Ordering::Relaxed);
+            slot.1.store(end, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+    // Full: fold into the last slot so a live span is never dropped.
+    let last = &TALC_RUNS[TALC_RUNS_MAX - 1];
+    last.0.fetch_min(start, std::sync::atomic::Ordering::Relaxed);
+    last.1.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Copy every currently-owned talc run into RESERVED, so the arena skips them
+/// after `execve` resets the cursor below them.
+fn reserve_talc_runs() {
+    for slot in TALC_RUNS.iter() {
+        let e = slot.1.load(std::sync::atomic::Ordering::Relaxed);
+        if e != 0 {
+            reserve_region(slot.0.load(std::sync::atomic::Ordering::Relaxed), e);
+        }
+    }
+}
+
+/// Regions the talc heap owned when an `execve` reset the arena cursor below
+/// them. The reset (see the exec path) moves `ARENA_NEXT` down to `ARENA_BOTTOM`
+/// so the fresh guest image maps into backed low memory -- but the shim's talc
+/// heap persists with live spans up where the pre-exec arena had climbed (a
+/// forked child adopted at ~2 GiB heaps up there). Without recording them, the
+/// guest arena re-climbs and hands one of those live spans out to a guest
+/// mapping, whose writes corrupt talc's free list -> a later `talc::allocate`
+/// faults "memory access out of bounds". `arena_take` skips any span listed
+/// here. Fixed capacity: an exec adds at most one, and a process execs a
+/// handful of times.
+const RESERVED_MAX: usize = 32;
+static RESERVED: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); RESERVED_MAX] = {
+    const Z: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+        (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+    [Z; RESERVED_MAX]
+};
+
+/// Record [start, end) as off-limits to the growing arena. Called from the exec
+/// path with the talc heap's live span before the cursor is reset beneath it.
+fn reserve_region(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    for slot in RESERVED.iter() {
+        if slot.1.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && slot
+                .1
+                .compare_exchange(0, end, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+        {
+            slot.0.store(start, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// If [at, at+len) overlaps any reserved region, return that region's end (so
+/// the caller can retry above it); else None.
+fn reserved_bump(at: u64, len: u64) -> Option<u64> {
+    let end = at.saturating_add(len);
+    let mut bump = None;
+    for slot in RESERVED.iter() {
+        let re = slot.1.load(std::sync::atomic::Ordering::Relaxed);
+        if re == 0 {
+            continue;
+        }
+        let rs = slot.0.load(std::sync::atomic::Ordering::Relaxed);
+        // Overlap of [at, end) with [rs, re).
+        if at < re && rs < end {
+            bump = Some(bump.map_or(re, |b: u64| b.max(re)));
+        }
+    }
+    bump
+}
+
 unsafe impl talc::source::Source for ShimRegion {
     fn acquire<B: talc::base::binning::Binning>(
         talc: &mut talc::base::Talc<Self, B>,
@@ -2097,6 +2306,32 @@ unsafe impl talc::source::Source for ShimRegion {
             }
         }
         let base = arena_take(len).ok_or(())? as *mut u8;
+        // Record this span as talc-owned, merging with the current run when it
+        // abuts (talc extends contiguously). `execve` snapshots these runs into
+        // RESERVED before it resets the arena cursor beneath them, so the guest
+        // arena never re-hands-out a live heap span. Warn if a span is somehow
+        // not backed -- that would be a genuine arena bug, not this one.
+        {
+            let top = warch::memory_size(0) as u64 * 65536;
+            let bend = base as u64 + len;
+            if bend > top {
+                use core::fmt::Write as _;
+                struct Buf([u8; 160], usize);
+                impl core::fmt::Write for Buf {
+                    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                        let room = self.0.len() - self.1;
+                        let k = s.len().min(room);
+                        self.0[self.1..self.1 + k].copy_from_slice(&s.as_bytes()[..k]);
+                        self.1 += k; Ok(())
+                    }
+                }
+                let mut b = Buf([0; 160], 0);
+                let _ = write!(b, "[acq] UNBACKED span base={:#x} len={:#x} top={:#x}\n",
+                    base as u64, len, top);
+                unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+            }
+            record_talc_run(base as u64, bend);
+        }
         // Extend the last span when this one abuts it, rather than claiming a
         // separate one: talc cannot serve a request larger than any single span
         // from two adjacent ones, so a doubling buffer would otherwise strand
@@ -2376,6 +2611,74 @@ fn guest_bytes() -> &'static mut [u8] {
     // `memory.size` live on every access. See `GuestMem::limit`.
     let len = std::hint::black_box(GUEST_LIMIT as usize);
     unsafe { std::slice::from_raw_parts_mut(p, len) }
+}
+
+/// Write into guest memory above the 2 GiB `GuestMem` view slice (a WoW64
+/// process maps and the kernel must touch memory up to 4 GiB, which no safe
+/// wasm32 slice can span). The kernel calls this via [`gex_kernel::HI_MEM`]
+/// only after bounds-checking `addr..addr+data.len()` against the live memory
+/// top, so the range is backed. A guest address is its linear-memory offset,
+/// hence its pointer value; the slice is `data.len()`-sized (< `isize::MAX`).
+fn hi_write(addr: u64, data: &[u8]) {
+    let p = std::ptr::with_exposed_provenance_mut::<u8>(addr as usize);
+    // SAFETY: `addr..addr+data.len()` was range-checked backed by the caller;
+    // the exposed provenance is the whole guest memory (see `guest_bytes`).
+    unsafe { std::slice::from_raw_parts_mut(p, data.len()) }.copy_from_slice(data);
+}
+
+/// Zero guest memory above the 2 GiB view slice. See [`hi_write`].
+fn hi_zero(addr: u64, len: usize) {
+    let p = std::ptr::with_exposed_provenance_mut::<u8>(addr as usize);
+    // SAFETY: as `hi_write`.
+    unsafe { std::slice::from_raw_parts_mut(p, len) }.fill(0);
+}
+
+/// Read guest memory above the 2 GiB view slice into `buf`. See [`hi_write`].
+fn hi_read(addr: u64, buf: &mut [u8]) {
+    let p = std::ptr::with_exposed_provenance::<u8>(addr as usize);
+    // SAFETY: `addr..addr+buf.len()` was range-checked backed by the caller;
+    // the exposed provenance is the whole guest memory (see `guest_bytes`).
+    buf.copy_from_slice(unsafe { std::slice::from_raw_parts(p, buf.len()) });
+}
+
+/// Register [`hi_write`]/[`hi_zero`] with the kernel. Idempotent.
+fn register_hi_mem() {
+    gex_kernel::set_hi_mem(gex_kernel::HiMem { write: hi_write, zero: hi_zero, read: hi_read });
+    // The runtime translator reads guest code through the same 2 GiB view and
+    // must reach a module mapped above it (Wine's 64-bit ntdll at ~3 GiB).
+    gex_xlate::set_hi_read(hi_read);
+    gex_kernel::set_klog(|s| warn_line(s));
+    gex_kernel::set_kseq(|| unsafe { k_seq() as u64 });
+    gex_kernel::set_sock_txlen(|id| unsafe { k_sock_tx_len(id) });
+    register_memfd_backing();
+}
+
+/// Route a `MemFd`'s bytes to the global kernel's cross-Worker store, so a memfd
+/// shared over a socket stays coherent (Wine's client<->wineserver memory)
+/// instead of freezing a snapshot. The store lives in the one shared memory; the
+/// `k_memfd_*` imports move bytes between it and this Worker's guest memory (a
+/// Rust slice here IS process memory, so its pointer is a valid guest address).
+fn register_memfd_backing() {
+    gex_kernel::set_memfd_backing(gex_kernel::MemFdBacking {
+        create: |name| unsafe { k_memfd_create(name.as_ptr() as u32, name.len() as u32) },
+        read: |id, offset, buf| {
+            let n = unsafe { k_memfd_read(id, offset, buf.as_mut_ptr() as u32, buf.len() as u32) };
+            if n < 0 { 0 } else { n as usize }
+        },
+        write: |id, offset, buf| {
+            let n = unsafe { k_memfd_write(id, offset, buf.as_ptr() as u32, buf.len() as u32) };
+            if n < 0 { 0 } else { n as usize }
+        },
+        len: |id| {
+            let n = unsafe { k_memfd_len(id) };
+            if n < 0 { 0 } else { n as u64 }
+        },
+        truncate: |id, len| unsafe {
+            let _ = k_memfd_truncate(id, len);
+        },
+        seals_get: |id| unsafe { k_memfd_seals_get(id) },
+        seals_add: |id, add| unsafe { k_memfd_seals_add(id, add) },
+    });
 }
 
 /// Write to the guest's stderr -- in a page, the only channel the shim has to
@@ -3381,6 +3684,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // This host's memory has to be allocated up to whatever the map hands
     // out, so the map asks before it hands anything out.
     kernel.mem.grows_on_demand(arena_grow, arena_back);
+    register_hi_mem();
     // The table every process shares, when the host has wired one up. This
     // process is the first, so it keeps the pid the kernel gave it -- the
     // global table's `INIT_PID` is the same 1.
@@ -3735,6 +4039,31 @@ pub extern "C" fn gex_add_dir(path: u32, path_len: u32) {
     DIRS.0.borrow_mut().push(name.to_string());
 }
 
+/// A symlink the bundle contains. The JS rootfs builder used to resolve links
+/// by copying the target's bytes, which silently dropped a link to a DIRECTORY
+/// (Wine's `dosdevices/c: -> ../drive_c`) -- so `c:\...` paths could not
+/// resolve and no Windows program could be found. Installed as a real symlink
+/// the guest VFS follows.
+#[no_mangle]
+pub extern "C" fn gex_add_symlink(path: u32, path_len: u32, target: u32, target_len: u32) {
+    let (Ok(name), Ok(tgt)) = (
+        std::str::from_utf8(shim_slice(path, path_len)),
+        std::str::from_utf8(shim_slice(target, target_len)),
+    ) else {
+        return;
+    };
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_symlink(target, target_len, path, path_len) };
+        }
+        return;
+    }
+    SYMLINKS
+        .0
+        .borrow_mut()
+        .push((tgt.to_string(), name.to_string()));
+}
+
 /// The directory the closure's modules published, kept so an `execve` can have
 /// it back. `do_exec` clears the guest's dispatch directory (right for
 /// per-program translations), but a closure's modules are still in the
@@ -3854,6 +4183,9 @@ static FILES: SingleThreaded<Bundle> = SingleThreaded(const { RefCell::new(Vec::
 /// Directories bundled by the page. See `gex_add_dir`: an empty one has no
 /// file to carry it and would otherwise not exist in the guest at all.
 static DIRS: SingleThreaded<Vec<String>> = SingleThreaded(const { RefCell::new(Vec::new()) });
+/// Staged `(target, link_path)` symlinks for the no-global-kernel path.
+static SYMLINKS: SingleThreaded<Vec<(String, String)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
 
 /// The environment the page wants pid 1 to start with, if it says. Empty
 /// means the default below in `gex_load`.
@@ -3904,6 +4236,10 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
     // And the modes, after the files exist to carry them.
     for (name, mode) in std::mem::take(&mut *MODES.0.borrow_mut()) {
         let _ = gex_kernel::vfs::FileSystem::chmod(root, &name, mode);
+    }
+    // Symlinks last: the target may be a directory that only now exists.
+    for (target, path) in std::mem::take(&mut *SYMLINKS.0.borrow_mut()) {
+        let _ = gex_kernel::vfs::FileSystem::symlink(root, &target, &path);
     }
 }
 
@@ -4295,6 +4631,91 @@ fn claim_pages() -> bool {
     CLAIM_PAGES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Cross-process deterministic slot numbering (`?globalslots=1`). Off by
+/// default -- it changes the dispatch numbering, so it is opt-in per demo.
+///
+/// Under it, every page an identity-backed mapping covers (a library, an
+/// image) is numbered from ONE system-wide sequence and recorded in the
+/// shared_slot map, so the SAME page gets the SAME dispatch base in every
+/// process. That is what lets a forked-then-exec'd child (wine's PE spawns
+/// re-exec wine64) reuse its parent's already-compiled ntdll/wine64 modules
+/// instead of recompiling them and missing wineserver's process-init window
+/// (the wineboot c00000e5 blocker). Non-identity pages get a fresh global
+/// slot each. Everything lands in table 0 (a wine session lifts a few
+/// thousand pages, far under one table's 10M-slot capacity). Kept opt-in
+/// because global numbering makes a process's table as long as the highest
+/// global slot it touches, so a many-process demo that touched a late slot
+/// would grow a large table -- fine for a bounded wine session, not a blanket
+/// default.
+static GLOBAL_SLOTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_global_slots(on: i32) {
+    if on != 0 {
+        // Keep base 0 (the miss-stub sentinel) and the reserved miss span out
+        // of the allocator before any page is numbered from it.
+        unsafe { k_slot_floor(gex_abi::MISS_SLOTS) };
+    }
+    GLOBAL_SLOTS.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn global_slots() -> bool {
+    GLOBAL_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number a page from the system-wide sequence (see `GLOBAL_SLOTS`). An
+/// identity-backed page reuses the base recorded for its `(page, identity)`;
+/// the first process to reach it allocates and records one, and the rest --
+/// including a forked-exec child running the same loader -- adopt it, so their
+/// lifted bytes match and the compiled module is reusable across processes.
+/// Ensures `page` is numbered from the system-wide sequence and returns its
+/// packed dispatch entry (table + base). Idempotent: a set directory word is
+/// returned as-is. The global slot spans tables (its `/ per_table` is the table
+/// index), so a wine session that lifts more than one table's worth of pages is
+/// spread across tables rather than overflowing one.
+fn claim_page_entry_global(page: u64) -> u32 {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    if page >= gex_abi::DISPATCH_MAX_PAGES { return 0; }
+    let addr = (gex_abi::DISPATCH_DIR + page * 4) as usize;
+    let dir = unsafe {
+        &*(std::ptr::with_exposed_provenance::<u32>(addr)
+            as *const std::sync::atomic::AtomicU32)
+    };
+    let existing = dir.load(Acquire);
+    if existing != 0 {
+        return existing;
+    }
+    let ident = with_host(|h| page_identity(h, page * gex_abi::DISPATCH_PAGE));
+    let g = if let Some(key) = ident {
+        let rec = unsafe { k_slot_get(page, key) };
+        if rec != 0 {
+            rec as u64
+        } else {
+            let b = unsafe { k_slot_alloc(gex_abi::SLOTS_PER_PAGE) };
+            unsafe { k_slot_put(page, key, b as u32) };
+            b
+        }
+    } else {
+        unsafe { k_slot_alloc(gex_abi::SLOTS_PER_PAGE) }
+    };
+    let per_table =
+        (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE;
+    let table = (g / per_table) as usize;
+    let base_in = (g % per_table) as u32;
+    let entry = gex_abi::dispatch_entry(table, base_in);
+    match dir.compare_exchange(0, entry, AcqRel, Acquire) {
+        Ok(_) => {
+            with_host(|h| {
+                h.jit.page_table.assign(page, entry);
+                CLOSURE_DIRS.0.borrow_mut().push((page, entry));
+            });
+            entry
+        }
+        Err(won) => won,
+    }
+}
+
 /// Libraries whose slots are claimed a page at a time: the big ones `gexc`
 /// gives passive element segments and a fill helper. A small one writes its
 /// slots at instantiation and keeps its build numbering.
@@ -4317,6 +4738,13 @@ static CLOSURE_TABLE: SingleThreaded<std::collections::BTreeMap<u64, u32>> =
 /// closure library's.
 #[no_mangle]
 pub extern "C" fn gex_page_table(page: u64) -> i32 {
+    // Global deterministic numbering (see `GLOBAL_SLOTS`): the page's table is
+    // whatever its system-wide slot falls in. `claim_page_entry_global` is
+    // idempotent, so asking here and again in `gex_claim_page` gives the same
+    // entry.
+    if global_slots() {
+        return gex_abi::dispatch_entry_table(claim_page_entry_global(page)) as i32;
+    }
     if !claim_pages() {
         return -1;
     }
@@ -4415,6 +4843,9 @@ pub extern "C" fn gex_claimed_slots(i: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_claim_page(page: u64) -> u32 {
     use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    if global_slots() {
+        return gex_abi::dispatch_entry_base(claim_page_entry_global(page));
+    }
     let table = match gex_page_table(page) {
         t if t >= 0 => t as usize,
         _ => return 0,
@@ -4423,6 +4854,7 @@ pub extern "C" fn gex_claim_page(page: u64) -> u32 {
     // address space starts at linear address 0 (see `guest_bytes`), so the
     // guest address is the native address; `with_exposed_provenance` keeps LLVM
     // from folding it to a null-derived pointer.
+    if page >= gex_abi::DISPATCH_MAX_PAGES { return 0; }
     let addr = (gex_abi::DISPATCH_DIR + page * 4) as usize;
     let dir = unsafe {
         &*(std::ptr::with_exposed_provenance::<u32>(addr)
@@ -4968,6 +5400,30 @@ fn wait_needs_page(t: &Thread, kernel: &gex_kernel::Kernel) -> bool {
 /// something ready, or when the bound passes and the page should have its
 /// stack back. Everything that was hard about finishing a parked call stays
 /// in the one place that already did it correctly.
+/// The precise generation slot this Worker's thread should park on instead of
+/// the global wake counter, with the generation sampled now. A futex waiter
+/// parks on its futex's slot; a thread blocked reading a single cross-Worker
+/// socket parks on that socket's receive-pipe key, so a busy sibling's
+/// every-syscall wake no longer wakes it -- only a real write to its pipe (the
+/// peer wakes exactly that key), or the bounded deadline for signals and page
+/// work. `None` (keep the global counter) for any other wait, or a socket with
+/// no precise key: a local pipe, a listener, an unconnected end.
+fn precise_wait_target(h: &Host) -> Option<(u64, u32)> {
+    match h.threads.get(cur()).map(|t| &t.waiting) {
+        Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
+        Some(Waiting::Read(handle)) => {
+            let id = handle.remote_unix_id()?;
+            let key = unsafe { k_sock_rxkey(id) };
+            if key == 0 {
+                None
+            } else {
+                Some((key, unsafe { k_futex_gen(key) }))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn park_until_ready() {
     if unsafe { k_present() } == 0 {
         return;
@@ -5003,14 +5459,12 @@ fn park_until_ready() {
         // futex is all its thread waits on. `.get`, not `[]`: a scheduler that
         // left `cur` past the end must fall back to the global wait, not panic.
         let (ready, futex) = with_host(|h| {
+            // The precise wait target, sampled BEFORE the readiness check so a
+            // wake landing during the check moves the generation and is caught
+            // rather than slept through.
+            let futex = precise_wait_target(h);
             let sig = any_signal(h);
             let ready = h.threads.iter().any(|t| thread_ready(t, now, sig));
-            let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
-                Some(Waiting::Futex { parked, wake_gen, .. }) => {
-                    Some((parked.addr(), *wake_gen))
-                }
-                _ => None,
-            };
             (ready, futex)
         });
         if ready {
@@ -5068,10 +5522,7 @@ pub extern "C" fn gex_park(max_ms: u32) -> i32 {
                 _ => None,
             })
             .min();
-        let futex = match h.threads.get(cur()).map(|t| &t.waiting) {
-            Some(Waiting::Futex { parked, wake_gen, .. }) => Some((parked.addr(), *wake_gen)),
-            _ => None,
-        };
+        let futex = precise_wait_target(h);
         (soonest, futex)
     });
     if let Some(at) = soonest {
@@ -6262,10 +6713,28 @@ fn stage_fork_fds(h: &Host, child: i32) {
                 ));
                 continue;
             }
-            name = format!("#{dup}");
+            // Keep the path after the id so the child's descriptor knows the
+            // name it was opened as -- `fchdir` (wineserver's config-dir switch)
+            // and /proc/self/fd need it, and a remote-id-only fd carried none.
+            name = format!("#{dup} {}", file.path);
+        } else if let Some(id) = file.handle.remote_unix_id() {
+            // A unix socket whose two ends live in the global kernel: wine's
+            // wineserver connection, which the parent forks a child to exec a
+            // PE with (wineboot, start.exe). Hand the child its own reference so
+            // the parent closing its copy does not close the child's, and mark
+            // it `#s<id>` so the child rebuilds a `RemoteUnix` rather than
+            // trying to reopen a name that a socket does not have.
+            let dup = unsafe { k_sock_dup(id) };
+            if dup < 0 {
+                warn_line(&format!(
+                    "gex: fork could not hand socket fd {fd} to pid {child}\n"
+                ));
+                continue;
+            }
+            name = format!("#s{dup}");
         } else if !file.path.starts_with('/') {
-            // Not a path, not a pipe, and not the terminal: a socket. Nothing
-            // here can rebuild that from a name.
+            // Not a path, not a pipe, not a socket, not the terminal: nothing
+            // here can rebuild it from a name.
             continue;
         }
         out.push_str(&format!(
@@ -6366,11 +6835,7 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                 let write = flags & gex_kernel::fs::oflags::ACCMODE
                     != gex_kernel::fs::oflags::O_RDONLY;
                 gex_kernel::file::OpenFile::new(
-                    Arc::new(gex_kernel::pipe::RemotePipeEnd {
-                        id,
-                        write,
-                        remote: r,
-                    }),
+                    Arc::new(gex_kernel::pipe::RemotePipeEnd::new(id, write, r)),
                     path.to_string(),
                     flags,
                     !write,
@@ -6386,15 +6851,32 @@ pub extern "C" fn gex_adopt_fds(ptr: u32, len: u32) -> i32 {
                     true,
                     true,
                 )
-            } else if let Some(id) = path.strip_prefix('#').and_then(|v| v.parse::<i32>().ok()) {
+            } else if let Some(idstr) = path.strip_prefix("#s") {
+                // A unix socket the parent `dup`ed for us in the global kernel
+                // (`stage_fork_fds`). The id already names a live end; adopt it
+                // as this child's own, and register it so `sendmsg`/`recvmsg`
+                // fd-passing and `accept` can find it (plain read/write reach
+                // the handle directly and would work without this).
+                let Some(id) = idstr.parse::<i32>().ok() else { continue };
+                let Some(r) = global_sockets() else { continue };
+                let sock = Arc::new(gex_kernel::unix::RemoteUnix::new(id, false, None, r));
+                let handle: Arc<dyn FileHandle> = sock.clone();
+                let key = Arc::as_ptr(&handle) as *const () as usize;
+                h.kernel.remote_sockets.insert(key, sock);
+                gex_kernel::file::OpenFile::new(handle, "socket".to_string(), flags, true, true)
+            } else if let Some(rest) = path.strip_prefix('#') {
                 // An id the parent already asked the global kernel to
                 // duplicate, so this file is the parent's file whatever has
-                // happened to its name since.
+                // happened to its name since. The path follows the id (space
+                // separated) so the descriptor keeps the name it was opened as
+                // -- `fchdir` and /proc/self/fd need it.
+                let (idstr, realpath) = rest.split_once(' ').unwrap_or((rest, ""));
+                let Some(id) = idstr.parse::<i32>().ok() else { continue };
                 let Some(root) = global_root() else { continue };
                 let acc = flags & gex_kernel::fs::oflags::ACCMODE;
                 let f = gex_kernel::file::OpenFile::new(
                     gex_kernel::vfs::remote::adopt(root.remote(), id),
-                    String::new(),
+                    realpath.to_string(),
                     flags,
                     acc != gex_kernel::fs::oflags::O_WRONLY,
                     acc != gex_kernel::fs::oflags::O_RDONLY,
@@ -6781,6 +7263,7 @@ pub extern "C" fn gex_adopt_child(
     kernel.uid = unsafe { IDENTITY.0 };
     kernel.gid = unsafe { IDENTITY.1 };
     kernel.mem.grows_on_demand(arena_grow, arena_back);
+    register_hi_mem();
     // The shared process table, so the parent's `wait4` finds a child it can no
     // longer see: the child publishes its exit into a table both Workers call
     // into, and the parent parked on exactly that.
@@ -6918,6 +7401,30 @@ pub extern "C" fn gex_adopt_vma(start: i64, end: i64, prot: i32) {
     });
 }
 
+/// Exit-time socket teardown, for `exit_process` and the crash path alike. A
+/// socket local to this Worker gets its write side shut so its peer (in this
+/// same Worker, by construction) reads EOF now; a cross-Worker socket has its
+/// global id released -- never shut, since other processes may hold ids naming
+/// the same socket (see `RemoteUnix::release`). Every `RemoteUnix` this process
+/// can reach is released explicitly because `Drop` is unreliable at exit: an
+/// `Arc` may sit in both the fd table and `remote_sockets`, or in a thread's
+/// wait state, and a trap does not unwind.
+fn release_sockets(h: &mut Host) {
+    use gex_kernel::vfs::FileHandle;
+    for (_, f, _) in h.kernel.fds.entries() {
+        if f.handle.remote_unix_id().is_some() {
+            continue;
+        }
+        f.handle.shutdown_write();
+    }
+    for sock in h.kernel.remote_sockets.values() {
+        sock.release();
+    }
+    // A `RemoteUnix` in the fd table but not in `remote_sockets` (none is
+    // expected, but the table below is cleared next anyway) is released by
+    // `Drop` when the table goes.
+}
+
 /// End the running process. Always returns 2: this Worker ran one process and
 /// there is nothing to hand the stack to.
 ///
@@ -6941,6 +7448,27 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     // so nothing is dropped, and a pipe end between two Workers lives in the
     // global kernel and only learns of a close from `Drop` -- otherwise the
     // reader waits forever for an EOF nobody sends.
+    // EOF every socket's peer explicitly before dropping the tables. A
+    // cross-Worker socket lives in the global kernel and its peer only learns
+    // of a close through the EOF a `shutdown`/`Drop` sends -- but `Drop` here is
+    // unreliable (an `Arc` may be held in both the fd table and
+    // `remote_sockets`, or elsewhere), so nothing guaranteed reached the peer.
+    // wineserver learns a client died ONLY from the resulting POLLHUP, then
+    // marks that process's object signalled and wakes its waiters; without it a
+    // `WaitForSingleObject` on the dead process's handle -- winemine waiting for
+    // the wineboot it spawned -- hangs forever. Shut the write side of every
+    // LOCAL socket the process holds so the peer sees end-of-file now,
+    // deterministically. A cross-Worker socket is different: its global id is
+    // one reference among possibly several to the same socket (a fork, or an
+    // `SCM_RIGHTS` pass, `dup`s a fresh id for the receiver), and a `shutdown`
+    // would sever it for every holder. Wine's double-fork intermediate exits
+    // holding the socketpair end it forked the real PE process with; shutting
+    // it made that grandchild's wineserver connection one-way (server->child
+    // bytes already queued still arrived, every child->server write was
+    // dropped), so init_first_thread never reached the server and every Wine
+    // PE child died silently. Release the id instead: the LAST id going is
+    // what closes the socket and EOFs the peer, as `close(2)` does.
+    release_sockets(h);
     h.kernel.fds = gex_kernel::file::FdTable::new();
     h.kernel.remote_sockets.clear();
     // And anything the table did not account for: a guest leaving by a trap
@@ -7022,6 +7550,23 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.brk()).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    register_hi_mem();
+    // Reset the arena cursor to the low backed region. In the shared-memory
+    // build every process sees the whole system's `memory.size` high-water, so
+    // without this a process that execs after a 64-bit Wine grew the memory to
+    // ~2 GiB (KUSER_SHARED_DATA) starts its arena up at 2 GiB and its first
+    // small anon `mmap` lands above the backed top -- the zero-fill then faults
+    // EFAULT ("cannot create shared object descriptor" from ld.so), which took
+    // down wineserver's `/bin/sh`. A fresh image inherits nothing, so its arena
+    // belongs at ARENA_BOTTOM, in memory that is already backed.
+    // Before dropping the cursor beneath the talc heap's live spans, record
+    // them so the guest arena that re-climbs from ARENA_BOTTOM never hands one
+    // out. Without this, a 64-bit Wine that heaps up to ~2 GiB and then execs
+    // (wineserver's helpers) has its heap span re-handed to a guest mapping,
+    // whose writes corrupt talc's free list -> a later allocate faults OOB.
+    reserve_talc_runs();
+    ARENA_NEXT.store(gex_abi::ARENA_BOTTOM, std::sync::atomic::Ordering::Release);
+    ADOPTED_TOP.store(0, std::sync::atomic::Ordering::Release);
     {
         // The live memory size, not `guest_bytes().len()` (which is the whole
         // 4 GiB nameable range): the fill must stay inside what actually exists.
@@ -7265,7 +7810,46 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     }
     if let Some(l) = &restored {
         write_u64(data, c + ctx::TPIDR, l.tpidr);
+    } else {
+        // A loaded image must NOT inherit the parent's thread pointer (`FS`
+        // base = TPIDR). A real `execve` resets the segment bases; keeping the
+        // parent's let a forked child read the parent's TLS.
+        write_u64(data, c + ctx::TPIDR, 0);
     }
+    // The `GS` base (TPIDRRO on x86-64) is the Windows TEB pointer; a real exec
+    // clears the segment bases, so a loaded image must not keep the parent's.
+    //
+    // A fork+exec Wine child (wineboot --init, start.exe, ...) re-establishes
+    // its 64-bit TEB at the SAME fixed address 0x7ffc0000 and REUSES that page
+    // rather than re-mapping it. gex's exec keeps the memory the fork copied and
+    // does not clear the arena (0x7ffc0000 is above `ARENA_BOTTOM`), so the page
+    // still holds the PARENT's TEB -- in particular a stale
+    // `ClientId.UniqueThread` (TEB+0x48). Before `init_first_thread` assigns its
+    // own tid, the child reads that with `GetCurrentThreadId()` and tags its
+    // wineserver reply/wait pipes with the parent's tid; wineserver's
+    // `receive_fd` then finds a thread in the WRONG process -> "bad thread id"
+    // -> the child loses its reply channel and is killed, and the parent
+    // deadlocks on a null process heap. A real execve gives fresh zeroed memory
+    // and the tid reads 0, so `receive_fd` credits the process's first thread.
+    //
+    // Zero the stale `ClientId` (UniqueProcess+UniqueThread) to match. Guarded
+    // two ways so no non-Wine exec is touched: (1) the address must be inside
+    // the live backed memory -- an early small exec (`/bin/sleep`) leaves
+    // 0x7ffc0000 unbacked, and reading it would fault; (2) offset 0x30 must hold
+    // the TEB self-pointer (`NtTib.Self == 0x7ffc0000`), which only a real TEB
+    // does -- a non-Wine process whose stack happens to reach here will not.
+    {
+        const TEB: usize = 0x7ffc_0000;
+        let live = warch::memory_size(0) as usize * 65536;
+        if TEB + 0x50 <= live.min(data.len()) {
+            let self_ptr = u64::from_le_bytes(data[TEB + 0x30..TEB + 0x38].try_into().unwrap());
+            if self_ptr == TEB as u64 {
+                write_u64(data, TEB + 0x40, 0); // ClientId.UniqueProcess
+                write_u64(data, TEB + 0x48, 0); // ClientId.UniqueThread
+            }
+        }
+    }
+    write_u64(data, c + ctx::TPIDRRO, 0);
     // `sp` is the stack just built, not the recorded one: the two are the
     // same address by construction -- see `BLOB_RESERVE` -- and the argv on
     // it is this process's.
@@ -7712,6 +8296,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
 
     h.kernel.mem = gex_kernel::mem::MemoryMap::new(brk);
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
+    register_hi_mem();
     // One read per file, not per mapping: a library is four mappings (text,
     // rodata, relro, data), and re-reading `libc.so.6` for each is wasteful.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -8914,14 +9499,27 @@ fn finish_parked(
             // claim a fresh span. Counting refills against the syscall in
             // flight put almost all of them in nr 63. `sys_read` had the same
             // shape and was fixed with it. See task 140.
-            let dst = gm.read_mut(*buf, *len)?;
-            handle.read_at(0, dst)
+            // A WoW64 guest's stack lives above the 2 GiB view slice, so its
+            // read buffer cannot be borrowed as a `&mut [u8]` -- fill a temp and
+            // `write` it (which reaches the high half via HI_MEM). Without this
+            // the parked wineserver reply read EFAULTs and ntdll turns that into
+            // STATUS_ACCESS_VIOLATION (c0000005). Low buffers keep zero-copy.
+            if gm.is_high(*buf, *len) {
+                let mut tmp = vec![0u8; *len];
+                let n = handle.read_at(0, &mut tmp)?;
+                gm.write(*buf, &tmp[..n as usize])?;
+                Ok(n)
+            } else {
+                let dst = gm.read_mut(*buf, *len)?;
+                handle.read_at(0, dst)
+            }
         }
         gex_kernel::BlockOp::WriteStream { handle, buf, len } => {
             // One turn's worth; the scheduler brings the thread back while
             // anything is left, because the descriptor stays unwritable until
-            // the reader has drained.
-            let data = gm.read(*buf, *len)?.to_vec();
+            // the reader has drained. `read_owned` reaches a >2 GiB source
+            // buffer (a WoW64 guest's stack) through HI_MEM; `read` would EFAULT.
+            let data = gm.read_owned(*buf, *len)?;
             handle.write_at(0, &data)
         }
         // `accept` is finished by the kernel, which is the only thing with a
@@ -9513,6 +10111,33 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
         let it = ns / 100; // InterruptTime: 100 ns units
         let ms = ns / 1_000_000; // TickCount: milliseconds
         let mut gm = GuestMem::new(guest_bytes());
+        // DIAG (winemine null-dispatcher): sample the syscall dispatcher pointer
+        // at 0x7ffe1000 and the SystemCall flag at 0x7ffe0308. ntdll's syscall
+        // stubs do `call *0x7ffe1000` when the flag is set; if the pointer is 0
+        // the guest branches to null. Log the first transitions per value.
+        {
+            // Keep the KUSER_SHARED_DATA.SystemCall flag (0x7ffe0308 bit 0) in
+            // step with the syscall dispatcher pointer at 0x7ffe1000. ntdll's
+            // syscall stubs do `testb $1,0x7ffe0308; jne .; syscall; ...; ret;
+            // call *0x7ffe1000`: when the flag is set they call the dispatcher.
+            // gex must keep the flag set (it cannot trap a raw Windows `syscall`
+            // -- its number would collide with a Linux one), but wine writes the
+            // dispatcher partway through init, and forcing the flag on before
+            // then leaves a window where a stub does `call *0` and branches to
+            // null (winemine's loader hit exactly this). So gate the flag on the
+            // dispatcher being present: set bit 0 once 0x7ffe1000 is non-zero,
+            // clear it while the dispatcher is still 0 (the normal pre-setup
+            // state, where no Windows syscall stub runs -- early wine uses direct
+            // unix calls). Only bit 0 is touched; the rest of the byte is left.
+            let disp = gm.read_u64(0x7ffe_1000).unwrap_or(0);
+            if let Ok(byte) = gm.read_u64(0x7ffe_0308) {
+                let cur = byte as u8;
+                let want = if disp != 0 { cur | 1 } else { cur & !1 };
+                if want != cur {
+                    let _ = gm.write(0x7ffe_0308, &[want]);
+                }
+            }
+        }
         // Each field is a KSYSTEM_TIME { LowPart, High1Time, High2Time }; write
         // High2 first then Low then High1 so a torn read (High1 != High2) is
         // retried, never accepted.
@@ -9784,6 +10409,7 @@ pub extern "C" fn gex_my_pid() -> i32 {
 pub extern "C" fn gex_dispatch_miss(ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+
     // The code this thread is about to run is decoded in the mode its code
     // segment says (a WoW64 thread crosses between 32- and 64-bit code).
     {
@@ -9867,6 +10493,67 @@ pub extern "C" fn gex_dispatch_miss(ctx: i32, pc: i64) -> i32 {
             let stack: Vec<String> = (0..8)
                 .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
                 .collect();
+            // A symbolized call chain: scan the stack for words that point into
+            // an executable mapping -- those are return addresses -- and name
+            // each (object + offset). The topmost is the block that made the
+            // wild branch, which `LAST_SOURCE` cannot show when the recorded
+            // source is stale. Zero cost off the crash path: this runs once,
+            // here, when the guest has already faulted.
+            let chain: Vec<String> = (0..64u64)
+                .filter_map(|i| {
+                    let v = gm.read_u64(sp + i * 8).unwrap_or(0);
+                    let exec = h.kernel.mem.vmas().iter().any(|vm| {
+                        vm.prot & gex_kernel::mem::prot::EXEC != 0 && v >= vm.start && v < vm.end
+                    });
+                    exec.then(|| format!("{:#x}({})", v, object_off_at(h, v)))
+                })
+                .take(6)
+                .collect();
+            // Its own line: the crash line above is already near the host
+            // console's per-line cap, and a truncated call chain is no chain.
+            warn_line(&format!(
+                "[gex] SIGSEGV call-chain pid {}: {}\n",
+                h.kernel.pid,
+                chain.join(" <- "),
+            ));
+            // Where the wild target value itself is STORED in guest memory:
+            // if it sits in a library's writable data (a GOT slot), the lazy
+            // resolver wrote a bad pointer there, and naming the object+offset
+            // says which symbol's slot was corrupted. Scan writable, non-exec,
+            // file-backed regions only (that is where a GOT is) and cap the
+            // work. Crash-only, so it perturbs nothing.
+            {
+                let mut hits: Vec<String> = Vec::new();
+                let vmas: Vec<(u64, u64, u32, bool)> = h
+                    .kernel
+                    .mem
+                    .vmas()
+                    .iter()
+                    .map(|v| (v.start, v.end, v.prot, !v.name.is_empty()))
+                    .collect();
+                for (start, end, prot, named) in vmas {
+                    if hits.len() >= 8 {
+                        break;
+                    }
+                    let writable = prot & gex_kernel::mem::prot::WRITE != 0;
+                    let exec = prot & gex_kernel::mem::prot::EXEC != 0;
+                    if !writable || exec || !named || end - start > 0x400000 {
+                        continue;
+                    }
+                    let mut a = start;
+                    while a + 8 <= end && hits.len() < 8 {
+                        if gm.read_u64(a).unwrap_or(0) == pc {
+                            hits.push(format!("{:#x}({})", a, object_off_at(h, a)));
+                        }
+                        a += 8;
+                    }
+                }
+                warn_line(&format!(
+                    "[gex] SIGSEGV bad-ptr stored at pid {}: [{}]\n",
+                    h.kernel.pid,
+                    hits.join(", "),
+                ));
+            }
             warn_line(&format!(
                 "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}) from block {src:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
                 h.kernel.pid,
@@ -10292,9 +10979,19 @@ pub extern "C" fn gex_dispatch_miss(ctx: i32, pc: i64) -> i32 {
                 .collect(),
         );
         phase(11);
+    // Bound the code slice to the live BACKED memory, not `guest_bytes().len()`
+    // (= GUEST_LIMIT, the whole ~4 GiB nameable range). The translator's
+    // `fetch_code_bytes` and `const_fold_with_memory` clamp their raw reads to
+    // `memory.len()`; handed the full range they read past the backed edge --
+    // an EXEC vma extending beyond backed memory, or an indirect target's
+    // jump-table/GOT slot in an unbacked page -- and take a wasm "memory access
+    // out of bounds" (klock held, in the lift). This was winemine's wineserver
+    // crash. Clamping keeps every lift read inside real memory.
+    let live = ((warch::memory_size(0) as u64 * 65536).max(gex_kernel::GUEST_MEM_TOP.load(std::sync::atomic::Ordering::Relaxed)) as usize).min(gex_abi::GUEST_LIMIT as usize);
     let (unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
             pc,
+            live,
             &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
             &|a| known.contains(&a),
             h.jit.page_table.clone(),
@@ -10315,6 +11012,14 @@ pub extern "C" fn gex_dispatch_miss(ctx: i32, pc: i64) -> i32 {
             warn_line(&format!(
                 "[trace] translate pc=0x10f6d24 blocks={} exec={} covers_page_10f6={} exec_regions={}\n",
                 stats.blocks, ok, has_block, exec.len(),
+            ));
+        }
+        if pc >= 0xbfc30000 && pc < 0xc000_0000 {
+            let ok = exec.iter().any(|(s, e)| pc >= *s && pc + 4 <= *e);
+            warn_line(&format!(
+                "[nt-xlate] pc={pc:#x} blocks={} can_exec={ok} known={} live={live:#x} covered={:?}\n",
+                stats.blocks, h.jit.translated.contains(&pc),
+                unit.covered.iter().take(6).map(|(p, _)| format!("{p:#x}")).collect::<Vec<_>>(),
             ));
         }
         if stats.blocks == 0 {
@@ -10711,11 +11416,14 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
     // the object path's time goes unaccounted.
     let object_started = now_ns();
     phase(12);
+    // Live backed memory, not the full GUEST_LIMIT range -- see translate_runtime.
+    let live = ((warch::memory_size(0) as u64 * 65536).max(gex_kernel::GUEST_MEM_TOP.load(std::sync::atomic::Ordering::Relaxed)) as usize).min(gex_abi::GUEST_LIMIT as usize);
     let (modules, stats) = gex_xlate::translate_object(
         guest_bytes(),
         map.start,
         map.end,
         &seeds,
+        live,
         &|a| exec.iter().any(|(s, e)| a >= *s && a + 4 <= *e),
         &|a| known.contains(&a),
         page_table,
@@ -11677,7 +12385,21 @@ pub extern "C" fn gex_abandon(code: i32) {
         if h.exit.is_some() {
             return;
         }
-        trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
+        // Record the exit FIRST, before any cleanup that might itself fault.
+        // A crashed child reaches here from a trap; the fd/pipe teardown below
+        // can touch broken state and trap again, and this runs in a `catch`
+        // that swallows it -- so if `procs.exit` came last it could be skipped,
+        // leaving the parent's `wait4` parked on a child that never reports its
+        // status (exactly winemine's pid 2 hung on wait4 of the wineboot it
+        // spawned). Recorded first, the parent always reaps even if the rest of
+        // the teardown fails.
+        h.kernel.procs.exit(pid, code);
+        // EOF every socket peer explicitly (as `exit_process` does): a crashed
+        // child must still hang up its wineserver connection so the server sees
+        // POLLHUP and marks this process's object signalled -- otherwise a
+        // WaitForSingleObject on it hangs. Drop alone is unreliable here. Same
+        // terms as `exit_process`: local sockets shut, cross-Worker ids released.
+        release_sockets(h);
         // The descriptors, on the same terms as `exit_process`: a status alone
         // ends a `wait4` and nothing else. A parent reading a dead child's pipe
         // -- which is every `$(...)`, and every apt method -- is not waiting on
@@ -11695,7 +12417,6 @@ pub extern "C" fn gex_abandon(code: i32) {
                 k_pty_forget(pid);
             }
         }
-        h.kernel.procs.exit(pid, code);
     });
 }
 

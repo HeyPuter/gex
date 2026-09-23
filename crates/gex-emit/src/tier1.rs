@@ -632,7 +632,7 @@ impl<'a> Emitter<'a> {
                 if target <= from {
                     self.emit_safepoint(target);
                 }
-                self.jump_to_constant(target);
+                self.jump_to_constant(target, from);
             }
         }
     }
@@ -1173,7 +1173,11 @@ impl<'a> Emitter<'a> {
                 self.push(*val);
                 let align = bytes.trailing_zeros();
                 if *bytes == 16 {
-                    self.f.simd_mem(simd::V128_STORE, align, static_off);
+                    if coherent_loads() {
+                        self.emit_coherent_vstore128(static_off);
+                    } else {
+                        self.f.simd_mem(simd::V128_STORE, align, static_off);
+                    }
                 } else {
                     let sub = match bytes {
                         1 => simd::V128_STORE8_LANE,
@@ -1629,9 +1633,30 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_result(val_type(ty));
-        // unaligned: plain load (handles signed natively)
-        self.f.local_get(a);
-        self.f.load(load_op(ty, sz, signed), alogp, static_off);
+        if matches!(sz, MemSz::B8) {
+            // Unaligned 8-byte (pointer/size) load made coherent by assembling
+            // eight *atomic* byte loads -- reads exactly [E, E+8) (never the
+            // adjacent words a split-into-two-i64 would touch, so it can't fault
+            // an unbacked neighbour page), and an atomic byte load is not
+            // V8-hoistable across gex's fence, so no stale pointer/size leaks.
+            // result = b0 | b1<<8 | ... | b7<<56.
+            let bl = atomic_load_op(Ty::I32, MemSz::B1);
+            for i in 0u32..8 {
+                self.f.local_get(a);
+                self.f.atomic(bl, 0, static_off + i);
+                self.f.byte(0xad); // i64.extend_i32_u
+                if i != 0 {
+                    self.f.i64_const((8 * i) as i64);
+                    self.f.byte(0x86); // i64.shl
+                    self.f.byte(0x84); // i64.or  (accumulate with running value)
+                }
+            }
+        } else {
+            // Smaller unaligned access: plain load (cannot hold a full pointer,
+            // and a byte-wise atomic assembly here is not worth the code size).
+            self.f.local_get(a);
+            self.f.load(load_op(ty, sz, signed), alogp, static_off);
+        }
         self.f.else_();
         // aligned: atomic (unsigned) load, then sign-extend if needed
         self.f.local_get(a);
@@ -1663,10 +1688,29 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_void();
-        // unaligned: plain store
-        self.f.local_get(a);
-        self.f.local_get(v);
-        self.f.store(store_op(ty, sz), alogp, static_off);
+        if matches!(sz, MemSz::B8) {
+            // Unaligned 8-byte store made coherent via eight *atomic* byte
+            // stores (the store counterpart of emit_coherent_load's B8 branch):
+            // reads/writes exactly [E, E+8), and each atomic byte store is
+            // ordered against gex's fence, so the value another thread later
+            // acquire-loads is never a stale/hoisted plain store.
+            let bs = atomic_store_op(Ty::I32, MemSz::B1);
+            for i in 0u32..8 {
+                self.f.local_get(a);
+                self.f.local_get(v);
+                if i != 0 {
+                    self.f.i64_const((8 * i) as i64);
+                    self.f.byte(0x88); // i64.shr_u
+                }
+                self.f.byte(0xa7); // i32.wrap_i64 (store8 uses the low byte)
+                self.f.atomic(bs, 0, static_off + i);
+            }
+        } else {
+            // Smaller unaligned store: plain (cannot hold a full pointer).
+            self.f.local_get(a);
+            self.f.local_get(v);
+            self.f.store(store_op(ty, sz), alogp, static_off);
+        }
         self.f.else_();
         // aligned: atomic store
         self.f.local_get(a);
@@ -2202,8 +2246,12 @@ impl<'a> Emitter<'a> {
         let align = bytes.trailing_zeros();
         match bytes {
             16 => {
-                let off = self.emit_address(addr, offset);
-                self.f.simd_mem(simd::V128_LOAD, align, off);
+                if coherent_loads() {
+                    self.emit_coherent_vload128(addr, offset);
+                } else {
+                    let off = self.emit_address(addr, offset);
+                    self.f.simd_mem(simd::V128_LOAD, align, off);
+                }
             }
             8 => {
                 let off = self.emit_address(addr, offset);
@@ -2226,6 +2274,109 @@ impl<'a> Emitter<'a> {
                 self.f.simd_mem_lane(sub, align, off, 0);
             }
         }
+    }
+
+    /// A 16-byte vector load made coherent for `coherent_loads`: when the
+    /// address is 16-aligned, two atomic `i64` loads combined into a `v128`;
+    /// a plain `v128.load` otherwise. A plain SIMD load can be hoisted/CSE'd by
+    /// V8 across a guest fence and read a stale pointer (the winemine wild-value
+    /// faults); an atomic load cannot be reordered. 16-alignment makes both the
+    /// low and the high halves 8-aligned, which the atomic `i64` load requires.
+    fn emit_coherent_vload128(&mut self, addr: Value, offset: i64) {
+        let off = self.emit_address(addr, offset);
+        let a = self.alloc(Ty::I32);
+        self.f.local_set(a);
+        // (a + off) & 7 -- nonzero iff not 8-aligned. 8-alignment is all the two
+        // atomic i64 loads (at off and off+8) need; requiring 16 would send every
+        // 8-aligned `movdqu` (the common pointer-bearing memcpy) to the plain,
+        // V8-hoistable path and leak a stale pointer.
+        self.f.local_get(a);
+        self.f.i32_const(off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.i32_const(7);
+        self.f.byte(0x71); // i32.and
+        self.f.if_result(ValType::V128);
+        // sub-8-aligned: assemble the 16 bytes from atomic BYTE loads (an atomic
+        // i64 here would trap on the misalignment; a plain v128 load is
+        // V8-hoistable and leaks a stale pointer -- the last uncovered coherence
+        // gap, which wine's unaligned SSE memcpy of a {ptr,size} struct hits).
+        // Reads exactly [E, E+16); each half is b0|b1<<8|...|b7<<56.
+        let bl = atomic_load_op(Ty::I32, MemSz::B1);
+        for half in 0..2u32 {
+            for i in 0..8u32 {
+                self.f.local_get(a);
+                self.f.atomic(bl, 0, off + half * 8 + i);
+                self.f.byte(0xad); // i64.extend_i32_u
+                if i != 0 {
+                    self.f.i64_const((8 * i) as i64);
+                    self.f.byte(0x86); // i64.shl
+                    self.f.byte(0x84); // i64.or
+                }
+            }
+            if half == 0 {
+                self.f.simd(simd::I64X2_SPLAT);
+            } else {
+                self.f.simd_lane(simd::I64X2_REPLACE_LANE, 1);
+            }
+        }
+        self.f.else_();
+        // aligned: [atomic i64 @off, atomic i64 @off+8] assembled into a v128.
+        self.f.local_get(a);
+        self.f.atomic(atomic_load_op(Ty::I64, MemSz::B8), 3, off);
+        self.f.simd(simd::I64X2_SPLAT);
+        self.f.local_get(a);
+        self.f.atomic(atomic_load_op(Ty::I64, MemSz::B8), 3, off + 8);
+        self.f.simd_lane(simd::I64X2_REPLACE_LANE, 1);
+        self.f.end();
+    }
+
+    /// The store counterpart of [`Self::emit_coherent_vload128`]. Stack holds
+    /// `[addr, val]`. Aligned: two atomic `i64` stores (each guest pointer sits
+    /// wholly in one 8-byte half, so per-pointer publication stays atomic --
+    /// x86 does not make a 128-bit SSE store atomic anyway); plain otherwise.
+    fn emit_coherent_vstore128(&mut self, off: u32) {
+        let v = self.alloc(Ty::V128);
+        self.f.local_set(v);
+        let a = self.alloc(Ty::I32);
+        self.f.local_set(a);
+        self.f.local_get(a);
+        self.f.i32_const(off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.i32_const(7);
+        self.f.byte(0x71); // i32.and
+        self.f.if_void();
+        // sub-8-aligned: sixteen *atomic* byte stores (the store counterpart of
+        // emit_coherent_vload128's sub-8 branch) -- a plain v128 store here is
+        // V8-reorderable and leaks; an atomic i64 would trap on the alignment.
+        // Each half is the i64 lane's bytes, low byte first.
+        let bs = atomic_store_op(Ty::I32, MemSz::B1);
+        for half in 0..2u32 {
+            let lane = self.alloc(Ty::I64);
+            self.f.local_get(v);
+            self.f.simd_lane(simd::I64X2_EXTRACT_LANE, half as u8);
+            self.f.local_set(lane);
+            for i in 0..8u32 {
+                self.f.local_get(a);
+                self.f.local_get(lane);
+                if i != 0 {
+                    self.f.i64_const((8 * i) as i64);
+                    self.f.byte(0x88); // i64.shr_u
+                }
+                self.f.byte(0xa7); // i32.wrap_i64
+                self.f.atomic(bs, 0, off + half * 8 + i);
+            }
+        }
+        self.f.else_();
+        // aligned: two atomic i64 stores, low half then high.
+        self.f.local_get(a);
+        self.f.local_get(v);
+        self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
+        self.f.atomic(atomic_store_op(Ty::I64, MemSz::B8), 3, off);
+        self.f.local_get(a);
+        self.f.local_get(v);
+        self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 1);
+        self.f.atomic(atomic_store_op(Ty::I64, MemSz::B8), 3, off + 8);
+        self.f.end();
     }
 
     fn type_of(&self, v: Value) -> Ty {
@@ -2545,7 +2696,7 @@ impl<'a> Emitter<'a> {
                 if target <= block.start {
                     self.emit_safepoint(target);
                 }
-                self.jump_to_constant(target);
+                self.jump_to_constant(target, block.start);
             }
             Term::Branch {
                 cond,
@@ -2566,7 +2717,7 @@ impl<'a> Emitter<'a> {
                         if taken <= block.start {
                             self.emit_safepoint(taken);
                         }
-                        self.jump_to_constant(taken);
+                        self.jump_to_constant(taken, block.start);
                     }
                     self.f.end();
                     if not_taken == block.start {
@@ -2577,7 +2728,7 @@ impl<'a> Emitter<'a> {
                         if not_taken <= block.start {
                             self.emit_safepoint(not_taken);
                         }
-                        self.jump_to_constant(not_taken);
+                        self.jump_to_constant(not_taken, block.start);
                     }
                     return;
                 }
@@ -2591,12 +2742,12 @@ impl<'a> Emitter<'a> {
                 if taken <= block.start {
                     self.emit_safepoint(taken);
                 }
-                self.jump_to_constant(taken);
+                self.jump_to_constant(taken, block.start);
                 self.f.end();
                 if not_taken <= block.start {
                     self.emit_safepoint(not_taken);
                 }
-                self.jump_to_constant(not_taken);
+                self.jump_to_constant(not_taken, block.start);
             }
             Term::Indirect { target, .. } => {
                 self.push(target);
@@ -2644,7 +2795,7 @@ impl<'a> Emitter<'a> {
                 self.f.i64_const((block.end - gex_abi::SYSCALL_INST_BYTES) as i64);
                 self.f.call(self.cx.syscall);
                 self.invalidate();
-                self.jump_to_constant(next);
+                self.jump_to_constant(next, block.start);
             }
             Term::Illegal { raw, pc } => {
                 self.flush();
@@ -2786,19 +2937,41 @@ impl<'a> Emitter<'a> {
         self.f.local_get(self.ctx_local);
         self.f.i64_const(pc as i64);
         self.f.call(self.cx.safepoint);
-        self.jump_to_constant(pc);
+        self.jump_to_constant(pc, pc);
         self.f.end();
     }
 
     /// Transfer control to a statically known guest address.
-    fn jump_to_constant(&mut self, target: u64) {
+    ///
+    /// `from` is the address of the block making the jump. A same-module target
+    /// is normally reached by a baked direct call (`return_call_local`), which
+    /// is faster than a table lookup. But that call bakes in the callee's
+    /// wasm-function index at lift time, and a page can be re-lifted with fresh
+    /// function indices while a caller in another page keeps the stale one --
+    /// which then lands in the wrong block (a WoW64 mode switch invalidates the
+    /// target page mid-run; a cross-page direct call into it ran a mid-instruction
+    /// neighbour). So a direct call is only safe when caller and callee share a
+    /// dispatch page: an invalidation retires the whole page, re-lifting both
+    /// together. A cross-page target goes through the table, which re-resolves
+    /// the current function at run time.
+    fn jump_to_constant(&mut self, target: u64, from: u64) {
         // TEST(GEX_NO_DIRECT_JUMP): force every branch through the dispatch
-        // table, so a same-module target is looked up (and its PC stored) the
-        // way a cross-module one is. Native only -- `env` always fails on wasm,
-        // so the shim keeps direct calls; set it for the closure build to tell a
-        // direct-jump fault from a dispatch one.
+        // table. Native only -- `env` always fails on wasm, so the shim keeps
+        // direct calls; set it for the closure build to tell a direct-jump fault
+        // from a dispatch one.
         static NO_DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let no_direct = *NO_DIRECT.get_or_init(|| std::env::var_os("GEX_NO_DIRECT_JUMP").is_some());
+        // A baked direct call (`return_call_local`) freezes the callee's
+        // wasm-function index at lift time. On x86 a page can be re-lifted with
+        // fresh indices while a caller keeps the stale one -- a WoW64 mode
+        // switch (`iret`/`int 0x80`) invalidates a target block mid-run, and a
+        // later direct call into it then lands in the wrong (mid-instruction)
+        // block. The re-lift is not page-atomic, so even a same-page caller can
+        // go stale; the only safe choice is the table, which re-resolves the
+        // current function at run time. AArch64 does not do this mode switching,
+        // so it keeps the faster direct call.
+        let no_direct = no_direct || gex_abi::X86;
+        let _ = from;
         if !no_direct {
             if let Some(&func) = self.cx.blocks.get(&target) {
                 // The callee checks `LAST_TARGET` against its own address
