@@ -48,6 +48,37 @@ fn sp_reg() -> GuestReg {
 /// return address the call pushed.
 const RET_SP_DELTA: u64 = if gex_abi::X86 { 8 } else { 0 };
 
+/// The recursion-depth guard (`docs/function-tier.md` §7). `depth` is an
+/// estimate, in bytes, of the engine stack the C frames below this one in
+/// the nest use; a function whose own frame would take it past this budget
+/// leaves for its own entry instead of running, which unwinds the nest and
+/// restarts it at zero from the dispatch root. `GEX_CGEN_STACK_BUDGET`
+/// overrides it, for measurement. Engines: wasmtime's `max_wasm_stack` is
+/// 512 KiB, V8's whole stack about 984 KiB.
+pub const STACK_BUDGET: u32 = 384 << 10;
+
+fn stack_budget() -> u32 {
+    std::env::var("GEX_CGEN_STACK_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STACK_BUDGET)
+}
+
+/// A function's frame, estimated from the registers it keeps in locals: the
+/// wasm locals clang ends up with measured up to ~2.5x the register bytes
+/// (coremark, x86-64), plus the engine's spill slots and frame header.
+fn frame_weight(regs: &FnRegs) -> u32 {
+    let bytes: u32 = regs
+        .used
+        .iter()
+        .map(|r| if r.ty() == gex_ir::Ty::V128 { 16 } else { 8 })
+        .sum();
+    64 + 3 * bytes
+}
+
+/// What the indirect-call helper's own frame adds.
+const CALL_KNOWN_WEIGHT: u32 = 32;
+
 /// Local loop iterations between safepoint polls (tier-1's `loop_poll`).
 const LOOP_POLL: i32 = 1024;
 
@@ -57,6 +88,8 @@ pub struct FnUnit {
     bodies: String,
     /// Whether any function here calls through `CALL_KNOWN`.
     pub uses_call_known: bool,
+    /// The frame weight of the function being emitted (`frame_weight`).
+    weight: u32,
 }
 
 impl Default for FnUnit {
@@ -71,6 +104,7 @@ impl FnUnit {
             protos: BTreeSet::new(),
             bodies: String::new(),
             uses_call_known: false,
+            weight: 0,
         }
     }
 
@@ -87,15 +121,26 @@ impl FnUnit {
         regs.clean_spills = clean_spills();
         let dirty = if regs.clean_spills { dirty_in(f) } else { Vec::new() };
         let used: Vec<GuestReg> = regs.used.iter().copied().collect();
+        self.weight = frame_weight(&regs);
         e.func_regs = Some(regs);
         let mut calls: BTreeSet<u64> = BTreeSet::new();
 
         let name = body_name(f.entry);
-        let _ = writeln!(self.bodies, "void {name}(int ctx) {{");
+        let _ = writeln!(self.bodies, "void {name}(int ctx, int32_t depth) {{");
         for r in &used {
             let _ = writeln!(self.bodies, "  {} {};", emit::cty(r.ty()), reg_name(*r));
         }
         let _ = writeln!(self.bodies, "  int32_t poll = {LOOP_POLL};");
+        // The recursion-depth guard, before anything is loaded: every caller
+        // wrote everything back before calling, so leaving for this
+        // function's own entry here is exactly the caller leaving for it.
+        let _ = writeln!(
+            self.bodies,
+            "  if (__builtin_expect(depth > {}, 0)) {{ GEX_C64({}u) = 0x{:x}ull; return; }}",
+            stack_budget().saturating_sub(self.weight),
+            ctx::PC,
+            f.entry
+        );
         e.load_regs(&used);
         // Block 0 is the entry and comes first, so control falls into it.
         for (i, b) in f.blocks.iter().enumerate() {
@@ -119,7 +164,7 @@ impl FnUnit {
         if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
             r.target_check();
         }
-        r.line(format!("{name}(ctx);"));
+        r.line(format!("{name}(ctx, 0);"));
         r.line(format!("const uint64_t tgt = GEX_C64({}u);", ctx::PC));
         r.safepoint("tgt");
         r.dispatch("tgt");
@@ -196,7 +241,7 @@ impl FnUnit {
                 match callee {
                     Callee::Direct(t) if known.contains(t) => {
                         calls.insert(*t);
-                        e.line(format!("  {}(ctx);", body_name(*t)));
+                        e.line(format!("  {}(ctx, depth + {});", body_name(*t), self.weight));
                     }
                     Callee::Direct(t) => {
                         // Not ours: the rest of this function runs in tier-1.
@@ -206,7 +251,10 @@ impl FnUnit {
                     Callee::Indirect(v) => {
                         self.uses_call_known = true;
                         let t = e.v(*v);
-                        e.line(format!("  if (!{CALL_KNOWN}(ctx, {t})) {{"));
+                        e.line(format!(
+                            "  if (!{CALL_KNOWN}(ctx, {t}, depth + {})) {{",
+                            self.weight + CALL_KNOWN_WEIGHT
+                        ));
                         e.store_pc(&t);
                         e.line("    return;");
                         e.line("  }");
@@ -231,7 +279,7 @@ impl FnUnit {
                 Callee::Direct(t) if known.contains(t) => {
                     calls.insert(*t);
                     e.flush();
-                    e.line(format!("GEX_MUSTTAIL return {}(ctx);", body_name(*t)));
+                    e.line(format!("GEX_MUSTTAIL return {}(ctx, depth);", body_name(*t)));
                 }
                 Callee::Direct(t) => leave(e, &format!("0x{t:x}ull")),
                 Callee::Indirect(v) => {
@@ -271,9 +319,9 @@ impl FnUnit {
     pub fn source(&self) -> String {
         let mut s = String::from("#include \"gex_abi.h\"\n\n");
         for a in &self.protos {
-            let _ = writeln!(s, "void {}(int ctx);", body_name(*a));
+            let _ = writeln!(s, "void {}(int ctx, int32_t depth);", body_name(*a));
         }
-        let _ = writeln!(s, "int {CALL_KNOWN}(int ctx, uint64_t target);\n");
+        let _ = writeln!(s, "int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth);\n");
         s.push_str(&self.bodies);
         s
     }
@@ -285,12 +333,12 @@ impl FnUnit {
 pub fn call_known_source(entries: &[u64]) -> String {
     let mut s = String::from("#include \"gex_abi.h\"\n\n");
     for a in entries {
-        let _ = writeln!(s, "void {}(int ctx);", body_name(*a));
+        let _ = writeln!(s, "void {}(int ctx, int32_t depth);", body_name(*a));
     }
-    let _ = writeln!(s, "\nint {CALL_KNOWN}(int ctx, uint64_t target) {{");
+    let _ = writeln!(s, "\nint {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth) {{");
     s.push_str("  switch (target) {\n");
     for a in entries {
-        let _ = writeln!(s, "  case 0x{a:x}ull: {}(ctx); return 1;", body_name(*a));
+        let _ = writeln!(s, "  case 0x{a:x}ull: {}(ctx, depth); return 1;", body_name(*a));
     }
     s.push_str("  default: return 0;\n  }\n}\n");
     s

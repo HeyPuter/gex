@@ -258,10 +258,46 @@ path, but the return check is needed anyway for `longjmp`, and C cannot catch
 Wasm exceptions without C++ EH — S7 measures exceptions against the explicit
 flag for its landing pads, and may switch this path over if it wins).
 
-Stack depth: nesting follows guest call depth inside the function tier.
-Deep guest recursion is bounded by the engine's wasm stack (wasmtime's
-`max_wasm_stack`, V8's ~1 MB) rather than the guest's 8 MiB. Measure on
-`ack`/`fib`/`tree` in Phase B; an overflow is a trap, which the host reports.
+### 7.1 The recursion-depth guard
+
+Nesting follows guest call depth inside the function tier, so without a
+bound deep guest recursion would be limited by the engine's stack rather than
+the guest's 8 MiB: 100,000 frames of the soundness corpus's `deep_recursion`
+exhaust wasmtime (`max_wasm_stack`, 512 KiB: ~5,000 frames of that function)
+and V8 (~984 KiB: "Maximum call stack size exceeded" at ~5,500). So the
+nest's stack use is bounded, with the same leave-by-returning mechanism:
+
+* `F_body` takes a second parameter, `depth`: an estimate, in bytes, of the
+  engine stack the C frames below it in this nest use. The root calls
+  `F_body(ctx, 0)`; a call passes `depth + W(F)`, where `W(F)` is the
+  caller's frame estimate (`64 + 3 ×` the bytes of the registers it keeps in
+  locals; clang's wasm locals measured up to ~2.5× those bytes on coremark,
+  and the rest covers the engine's spill slots and frame header). A guest
+  tail call (`musttail`) passes `depth` unchanged: the frame is replaced.
+  An indirect call through the entry `switch` adds that helper's frame too.
+* `F_body`'s first statement, before any register is loaded: if
+  `depth > BUDGET − W(F)`, set `ctx::PC = F` and return. Every caller wrote
+  everything back before the call, so this is exactly "the caller left for
+  F" (§7): the caller's return check fails (PC is F, not its return
+  address), it returns, and so does every frame of the nest; the root
+  dispatches on `ctx::PC = F`, which enters `F_entry` and starts a new nest
+  at depth 0. The frames that were unwound finish in tier-1 when their
+  callees return into them (their return addresses are real guest state).
+* It needs no context field and no `gex-abi` change: the depth lives in a
+  wasm parameter, so it is per nest by construction. The StopExecution
+  unwind discards it with the rest of the wasm stack, and a nest the host
+  starts afresh (the root after `resume_at`, a nested guest loop) starts at
+  zero, with its own budget on top of whatever stack its caller used.
+* `BUDGET` is 384 KiB of estimate (`GEX_CGEN_STACK_BUDGET` overrides it).
+  The estimate is conservative against both engines: `deep_recursion`'s
+  function (AArch64) is estimated at 304 bytes and uses ~100 (wasmtime) and
+  ~180 (V8), so a nest holds ~1,290 of its frames where either engine holds
+  ~5,000.
+  Cost: one compare on entry, one add per call; no memory traffic.
+
+Recursion deeper than the budget therefore runs as a sequence of nests of
+bounded depth, each unwound by returning, with the unwound frames' remaining
+work in tier-1.
 
 ## 8. Build and flags
 
