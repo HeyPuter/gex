@@ -1,0 +1,292 @@
+# The function tier: GIR → C → clang → wasm, inside gex modules
+
+Stream S3 of the pewasm merge (`docs/merge-plan.md` §4, §6 M2, §8). This note
+fixes the mechanics before the bulk of the code: how clang-built code shares
+gex's memory and tables, how it reads the context, how it keeps tier-1's
+memory semantics, and how it leaves and re-enters code it does not own.
+
+Two phases:
+
+* **Phase A (blocks).** Every tier-1 block becomes one C function with the
+  uniform `(ctx)` signature, chained with `musttail`. Same GIR, same
+  write-backs, same safepoints as tier-1; only the code generator differs.
+  It proves the plumbing and prices clang against gex's own emitter on
+  identical input.
+* **Phase B (functions).** One C function per recovered guest function (S2's
+  function IR): registers and flags as C locals across blocks, written back
+  only where §4.1 of the merge plan requires.
+
+## 1. Where the code lives: spliced into the tier-1 module
+
+The function tier does not produce a second kind of module. For a translation
+unit (an image, or later a closure object) it:
+
+1. builds the ordinary tier-1 module from the blocks, exactly as today
+   (`ModuleBuilder`, any `Linkage`);
+2. emits C for the same blocks (Phase B: for the functions that own them),
+   compiles it with `clang --target=wasm32` and links it with `wasm-ld` into a
+   standalone module whose imports are gex's host functions (`gex.syscall`,
+   …), the memory (`env.memory`), and one synthetic function,
+   `gexc.dispatch : (i32) -> ()`;
+3. **splices** that module into the tier-1 module (`gex-cgen::splice`, on
+   `wasmparser` + `wasm-encoder`'s reencoder, both already in the lockfile):
+   * clang's function types and bodies are appended, with function indices
+     remapped; its host imports are resolved by `(module, name)` against the
+     tier-1 module's own imports, and its memory against memory 0;
+   * `gexc.dispatch` becomes a local function that does exactly what tier-1's
+     `emit_dispatch_tail_call` does (records `LAST_TARGET`/`LAST_SOURCE`,
+     two-level directory lookup, `br_table` over the eight dispatch tables,
+     `return_call_indirect`), reading the target from `ctx::PC`;
+   * each block the C side owns is retargeted: its tier-1 body is replaced by
+     `local.get 0; return_call $c_fn`, and the element-segment entries naming
+     it are pointed at `$c_fn` directly, so dispatch pays nothing extra.
+     Trampolines (x86-64 shared slots) and `enter` reach it through the stub.
+
+The result has *the same* imports, exports, tables, element layout, data
+segments and `gex.meta` as the tier-1 module it came from. So both hosts
+install it with no change at all: wasmtime (`shims/native`, via
+`gex_xlate::translate_image` when `Options::cgen` is set) and the browser (a
+`gexc build --cgen` module is loaded like any `gexc build` module). A `Shared`
+module keeps importing the tables and the memory; an `Own` one keeps defining
+them. Blocks the C side does not own (Phase B: interior entries, anything
+S2's function IR does not cover) keep their tier-1 bodies in the same module,
+which is what "both tiers coexist per address" (merge plan §2) means
+concretely.
+
+Alternatives rejected:
+
+* *A second module the host instantiates beside the tier-1 one.* Every host
+  (wasmtime, the browser shim, the Worker-per-thread instantiation, the
+  demand-fill machinery) would need to learn about it, and every C→tier-1
+  transfer would be a cross-instance tail call.
+* *wasm-ld producing the whole gex module.* It cannot express gex's element
+  layout (per-page segments at slots fixed by the `PageTable`, passive
+  segments with `gexfill*` helpers) or its eight tables.
+* *Dispatch written in C* (`__builtin_wasm_table_get` on `__funcref` tables).
+  Clang lowers a funcref call through a private table, not a
+  `return_call_indirect` into the dispatch tables. The synthetic import keeps
+  the C side free of table plumbing.
+
+The splice **fails loudly** (a build error naming the function) if the linked
+C module has anything the splice cannot place: a data segment, a global
+access (clang's `__stack_pointer` included, §4), a table of its own, a
+`call` (not `return_call`) to a C block function or to `gexc.dispatch` in
+Phase A, or an import it cannot resolve (e.g. a `memmove` libcall).
+
+## 2. The context, through a header generated from gex-abi
+
+`gex-cgen` writes `gex_abi.h` from `gex_abi` itself (a Rust function, so the
+header cannot drift): every `ctx::*` offset, `ctx::SIZE`, `GUEST_LIMIT`,
+`POISON_ADDR`, the dispatch constants, the import signatures with
+`import_module("gex")`/`import_name(...)` attributes, and the memory
+helpers below. A unit test compiles the header and checks a few offsets
+through `_Static_assert` against values printed from Rust.
+
+C functions take `int ctx` (wasm `i32`, the same ABI tier-1 and the shims
+use) and address fields as `*(u64u *)(GEX_CTXP(ctx) + GEX_CTX_PC)`, where
+`GEX_CTXP` casts to `char *`. Offsets are constants on a pointer, so they
+fold into the access's memarg offset. The flags follow tier-1's layout: one
+byte each, four packed into one `i32` store when all four are cached.
+
+## 3. Guest memory: tier-1's semantics exactly
+
+Guest VA is the linear-memory offset, and a C pointer *is* a linear-memory
+offset in wasm32, so a guest access is a plain C access through a pointer
+typed `__attribute__((aligned(1), may_alias))`. Compiled with
+`-fno-strict-aliasing -fno-delete-null-pointer-checks` (guest address 0 is an
+address, not UB) and `-ffp-contract=off`.
+
+The effective address follows `tier1::emit_address` case by case:
+
+| GIR access | tier-1 | C |
+| --- | --- | --- |
+| constant address | folded; `≥ GUEST_LIMIT` → `POISON_ADDR` | the same constant |
+| `base + off`, `0 ≤ off ≤ 0xffff` | guard(base), `off` in the memarg (33-bit sum, cannot wrap) | `(char *)G(base) + off`, where `G` steers to **`GUEST_LIMIT`** |
+| `0xffff < off ≤ max_static` (AArch64 only) | as above | `e = G(base) + off` in 64 bits; `e ≥ 2^32` → `POISON_ADDR` |
+| anything else (negative, x86-64 displacements > 64 KiB) | guard(base + off) | `G(base + off)` |
+
+The one deliberate difference is in the middle row: C steers a bad base to
+`GUEST_LIMIT` rather than `POISON_ADDR`. With `POISON_ADDR`, correctness would
+depend on clang folding `off` into the memarg (it does, for `inbounds nuw`
+GEPs, but that is an optimisation and not a promise); an unfolded `i32.add`
+would wrap `0xfffffff0 + 16` to address 0 and read low memory instead of
+trapping. From `GUEST_LIMIT`, `off ≤ 0xffff` plus any access size stays below
+2^32 and above the memory's end, so the access traps whether or not the add is
+folded. Both trap; the host sees the same fault. Bulk operations (`MemCopy`,
+`MemFill`, `StrOp`, `MemCmp`) have no static offset and use `POISON_ADDR` as
+tier-1 does, keeping its length clamp bit for bit (the clamp's behaviour on a
+poisoned base depends on the constant).
+
+Ordering: plain GIR accesses are plain C accesses — clang may reorder and
+merge them exactly as far as V8/Cranelift may reorder tier-1's plain wasm
+accesses (guest data races stay races, PLAN §5.8). `Order::SeqCst` and the
+RMW/CAS expressions use `__atomic_*`/`__sync_val_compare_and_swap` on
+naturally typed pointers, which lower to the same wasm atomics tier-1 emits,
+misalignment trap included. `Fence` is `__atomic_thread_fence(SEQ_CST)`.
+`MemCopy`/`MemFill` are `__builtin_memmove`/`__builtin_memset`, lowered to
+`memory.copy`/`memory.fill` under `-mbulk-memory` (a residual libcall is an
+unresolved import, so the splice fails loudly rather than miscompiling).
+
+Floating point goes through `__builtin_bit_cast`; min/max, saturating
+truncation, nearest and the SIMD ops use the `__builtin_wasm_*` builtins and
+`wasm_simd128.h`, which map one-to-one onto the instructions tier-1 emits.
+FMA reuses tier-1's exact algorithms (`fma.rs`): round-to-odd for `f32`,
+guarded Dekker for `f64` with the `gex.fma` import as its fallback. Nothing
+is left to libm.
+
+## 4. clang's shadow stack
+
+Guest memory *is* the linear memory, and `wasm-ld` places its stack (and
+`__stack_pointer`'s initial value) at low addresses — inside gex's reserved
+region, where the thread contexts live. A spill there would corrupt a
+context silently. So:
+
+* the emitted C never takes the address of a local, never uses arrays,
+  structs by value, varargs or `alloca`; every value is a scalar or a `v128_t`,
+  and wasm locals are unlimited, so LLVM has no reason to touch the shadow
+  stack;
+* this is **checked on every build**: the splice rejects any C function that
+  reads or writes any global (the only globals `wasm-ld` defines are
+  `__stack_pointer` and TLS bookkeeping) and any module with a data segment,
+  naming the offender. No build can ship a function that uses the region.
+
+Fallback if a future pass needs a real C stack (a large promoted frame, say):
+wasm globals are per instance, and gex instantiates the module once per thread
+(Worker per thread), so `__stack_pointer` is already per thread; it only needs
+an initial value naming a reserved per-thread region. That region is a
+`gex-abi` change (carved beside each context or below each guest stack) and
+goes through the coordinator. Not built; the check above keeps it from being
+needed silently.
+
+## 5. Syscalls and safepoints from C
+
+The C side calls the same imports with the same arguments at the same points
+as tier-1:
+
+* **Syscall** (`Term::Syscall`, `HostFunc::Syscall`): write back every dirty
+  cached register, store `ctx::PC = next`, call `gex.syscall(ctx, svc_pc)`,
+  forget every cached register (reload lazily), continue at `next`.
+* **Safepoint**: the `ctx::SAFEPOINT_COUNTER` countdown on backward direct
+  branches and on every indirect branch, calling `gex.safepoint(ctx, pc)` when
+  it expires, with the registers written back first. Not read back
+  afterwards, as in tier-1: the host only changes guest state on a path that
+  does not return (it traps out with `StopExecution`/`resume_at` and
+  re-enters through `enter`).
+* Other clobbering host calls (`illegal`, `breakpoint`, `sysreg_write`) the
+  same way; `cache_op`, `sysreg_read` and `fma` do not flush.
+
+In Phase A no C frame ever nests (every transfer is a tail call, which the
+splice verifies), so fork, execve, thread migration and signal delivery see
+exactly tier-1's flat stack.
+
+In Phase B C frames nest (a guest call is a wasm call). The host's existing
+escape — trap out of the whole wasm stack and resume from `ctx` — is then
+correct **provided every frame's state is architectural at every call that can
+reach a syscall or safepoint**. Phase B's baseline scheme guarantees that
+without landing pads: at every call it writes back all dirty registers (and
+the return address is real guest state, x30 or the pushed slot), and after
+every call it reloads. Registers stay in locals across *blocks* and *loops*,
+not across calls. Landing pads (S7) become necessary exactly when a pass keeps
+state in locals across a call (callee-saved registers, promoted stack slots);
+the `may_unwind` summaries then decide where.
+
+## 6. Tail calls
+
+Every function the C side registers or chains to has the C type
+`void f(int ctx)`, i.e. wasm `(i32) -> ()`, identical to tier-1's block type,
+so `__attribute__((musttail))` is always legal (clang requires identical
+signatures) and lowers to `return_call` under `-mtail-call`. Unknown or
+computed targets store `ctx::PC` and `musttail` into `gexc_dispatch(ctx)`,
+which the splice turns into the dispatch function of §1. Observed with clang
+22: a cycle of `musttail` among functions of one translation unit becomes a
+loop after inlining, so Phase A already gets some loop formation for free (the
+context traffic stays, since the stores are to memory).
+
+## 7. Calls into code the function tier does not own
+
+The proposed rule: "a call or jump to non-function-tier code writes back all
+state and tail-calls into dispatch, so the caller's continuation runs in
+tier-1". The continuation-in-tier-1 half is right; the tail-call half breaks
+once frames nest.
+
+Take H (C) calling F (C) with a wasm call, and F calling unknown G. If F
+tail-calls dispatch, F's frame becomes G's tier-1 chain, but H's frame (and
+the root below it) stays on the wasm stack. G returns into F's interior
+(tier-1), F returns into H's interior (tier-1), and the program carries on in
+tier-1 with H's frame stranded underneath; tier-1 chains never return, so it
+is never popped. If the loop that calls F now runs in tier-1, every iteration
+enters F through dispatch, nests, calls G and strands another frame: unbounded
+wasm stack growth. So the rule is:
+
+> **Leaving the function tier unwinds the C nest by returning.** The leaving
+> function writes back all state, sets `ctx::PC` to the target, and *returns*.
+> Every C call site checks after the call (the §4.2 return check: `ctx::PC` is
+> the return address the caller set up, `SP` is back where it was); on a
+> mismatch it returns too, with nothing to write back (under §5's baseline
+> scheme it wrote everything back before the call and has executed nothing
+> since). The nest root then tail-calls dispatch on `ctx::PC`.
+
+Each function-tier function therefore has two forms:
+
+* `F_body(ctx)`: the code. A guest `ret` writes back, sets `PC` to the return
+  address and *returns*; so does any exit to unknown code. C callers call
+  this with a wasm call and apply the return check.
+* `F_entry(ctx)`: registered in the dispatch table with the uniform signature
+  (§4.1.2). `F_body(ctx); musttail gexc_dispatch(ctx);` — it is the nest root:
+  whatever made `F_body` return (a real return, `longjmp`, an exit to tier-1),
+  `ctx::PC` says where to go next, and the root goes there flat.
+
+This is pewasm's pending-jump trampoline (`recomp_jmp_pending` +
+`recomp_run_pending`) with the pending flag replaced by the PC comparison,
+and it is the same mechanism as §4.2's return check, so it costs nothing extra:
+one compare per call site. It handles `longjmp` (the `ret` into setjmp's frame
+fails every check on the way down and resumes there in tier-1), `ret` used as
+a computed jump, and coroutine stack switches the same way.
+
+Guest tail calls (`b G` to another function's entry) are C `musttail`
+`G_body(ctx)`: G returns to F's caller, whose check sees its own return
+address. Indirect calls (`blr`) compare the target against the module's
+function entries (a `switch`, lowered to compares or a `br_table`) and call
+the matching `_body`; anything else leaves as above. That is the slow path
+pewasm's inline dispatch-cache probe and profile-guided devirtualization
+later speed up; it is priced before being optimised.
+
+Alternatives considered: tail-calling dispatch in place (strands frames, as
+above); a nested wasm call into tier-1 that waits for it to return (tier-1
+never returns); a Wasm exception to unwind the nest (zero cost on the normal
+path, but the return check is needed anyway for `longjmp`, and C cannot catch
+Wasm exceptions without C++ EH — S7 measures exceptions against the explicit
+flag for its landing pads, and may switch this path over if it wins).
+
+Stack depth: nesting follows guest call depth inside the function tier.
+Deep guest recursion is bounded by the engine's wasm stack (wasmtime's
+`max_wasm_stack`, V8's ~1 MB) rather than the guest's 8 MiB. Measure on
+`ack`/`fib`/`tree` in Phase B; an overflow is a trap, which the host reports.
+
+## 8. Build and flags
+
+* `gexc build --cgen …` and `gexc run --cgen …` set `gex_xlate::Options::cgen`
+  (part of the cache key, since `Options` is hashed through `Debug`).
+  `translate_image` then routes through `gex-cgen`. Runtime translation stays
+  tier-1.
+* Toolchain: `$GEX_CLANG`/`$GEX_WASM_LD` or `clang`/`wasm-ld` on `PATH`,
+  clang ≥ 20 for wasm32. Missing tools are a build error, never a silent
+  tier-1 fallback.
+* `clang --target=wasm32 -O2 -mtail-call -msimd128 -matomics -mbulk-memory
+  -mnontrapping-fptoint -msign-ext -fno-strict-aliasing
+  -fno-delete-null-pointer-checks -ffp-contract=off -ffreestanding -nostdlib`,
+  one translation unit per slice of the block list so clang runs in parallel;
+  `wasm-ld --no-entry --import-memory --shared-memory --allow-undefined
+  --export=<every C entry>`. Content-addressed object caching (pewasm's
+  `build.py`) comes later.
+* `GEX_CGEN_KEEP=<dir>` keeps the generated C, objects and the linked module
+  for inspection.
+
+## 9. Not handled yet (Phase B, before S7)
+
+* Landing pads and `gex_unwind` (S7). The baseline scheme does not need them
+  for correctness (§5), only for passes that keep state in locals across calls.
+* Interior entries, undiscovered code, runtime-modified code: tier-1 (the
+  splice leaves those blocks' tier-1 bodies in place).
+* Invalidation when a function's pages change (the x86-64 `guard` bytes):
+  a guarded block is not given to the function tier.
