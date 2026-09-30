@@ -5271,7 +5271,13 @@ fn count_syscall() {
         let at = h.threads[cur()].kstate.ctx_addr;
         let n = gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(!0);
         // Canonical, so the census and the ring name x86-64 calls too.
-        if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n }
+        if gex_abi::X86 {
+            gex_kernel::x86::canonical_number(n)
+        } else if gex_abi::PPC {
+            gex_kernel::ppc::canonical_number(n)
+        } else {
+            n
+        }
     });
     let (a0, a1) = with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
@@ -5351,7 +5357,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
         let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
-        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
+        let n = if gex_abi::X86 {
+            gex_kernel::x86::canonical_number(n)
+        } else if gex_abi::PPC {
+            gex_kernel::ppc::canonical_number(n)
+        } else {
+            n
+        };
         SYSCALL_NR.store(n, std::sync::atomic::Ordering::Relaxed);
         // And a select's arguments, to read the answer back from the guest's
         // own sets afterwards.
@@ -5380,7 +5392,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // the number canonicalised so the names below match on x86-64 too.
         let g = |i: usize| gm.read_u64(base + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
         let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(0);
-        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
+        let n = if gex_abi::X86 {
+            gex_kernel::x86::canonical_number(n)
+        } else if gex_abi::PPC {
+            gex_kernel::ppc::canonical_number(n)
+        } else {
+            n
+        };
         let who = cur();
         // The path, for calls whose meaning is which file: `execve(0x2805ef70)`
         // says a program ran but not which. `openat`'s path is arg 1, the rest
@@ -5424,6 +5442,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         let ret = if gex_abi::X86 {
             gm.read_u64(gm.read_u64(base + ctx::SP as u64).unwrap_or(0))
                 .unwrap_or(0)
+        } else if gex_abi::PPC {
+            gm.read_u32(base + ctx::PPC_LR as u64).unwrap_or(0) as u64
         } else {
             gm.read_u64(base + ctx::x(30) as u64).unwrap_or(0)
         };
@@ -5514,7 +5534,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             .unwrap_or(!0);
         // The raw number: `SNAP_SYSCALL` is compared raw; the proc-snapshot
         // question wants the canonical one.
-        let canonical = if gex_abi::X86 { gex_kernel::x86::canonical_number(nr) } else { nr };
+        let canonical = if gex_abi::X86 {
+            gex_kernel::x86::canonical_number(nr)
+        } else if gex_abi::PPC {
+            gex_kernel::ppc::canonical_number(nr)
+        } else {
+            nr
+        };
         if !gex_kernel::skips_proc_snapshot(canonical) {
             let st = Arc::clone(&h.proc_state);
             h.kernel.refresh_proc(&st.0);
@@ -6729,7 +6755,9 @@ pub extern "C" fn gex_adopt_child(
             let _ = gm.write_u64(ctx_addr + ctx::SP as u64, sp as u64);
         }
         if tls != 0 {
-            let _ = gm.write_u64(ctx_addr + ctx::TPIDR as u64, tls as u64);
+            // PowerPC's thread pointer is r2.
+            let slot = if gex_abi::PPC { ctx::x(2) } else { ctx::TPIDR };
+            let _ = gm.write_u64(ctx_addr + slot as u64, tls as u64);
         }
         // A monitor is per-thread and the child's starts clear.
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
@@ -7361,6 +7389,9 @@ const SNAP_SYSCALL: u64 = 0x6765_7801;
 /// takes `_dl_fini` in `rdx`; `rax` is free.)
 const SNAP_STUB_CODE: &[u8] = if gex_abi::X86 {
     &[0xb8, 0x01, 0x78, 0x65, 0x67, 0x0f, 0x05]
+} else if gex_abi::PPC {
+    // lis 0, 0x6765 ; ori 0, 0, 0x7801 ; sc
+    &[0x3c, 0x00, 0x67, 0x65, 0x60, 0x00, 0x78, 0x01, 0x44, 0x00, 0x00, 0x02]
 } else {
     &[0x28, 0x00, 0x8f, 0xd2, 0xa8, 0xec, 0xac, 0xf2, 0x01, 0x00, 0x00, 0xd4]
 };
@@ -9349,6 +9380,20 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
 }
 #[no_mangle]
 pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
+    // PowerPC: a non-default FPSCR rounding mode, which wasm arithmetic cannot
+    // honour, and mffs under GEX_FP_STRICT=1 (docs/ppc.md §8). Both fail
+    // loudly, as an illegal instruction would.
+    if gex_abi::PPC
+        && ((reg == gex_kernel::ppc::SYSREG_FPSCR_RN && val != 0)
+            || reg == gex_kernel::ppc::SYSREG_MFFS_STRICT)
+    {
+        trace_line(&format!(
+            "gex: {} at pc={_pc:#x} (FPSCR={val:#x}); gex computes round-to-nearest only and no FP exception flags\n",
+            if reg == gex_kernel::ppc::SYSREG_MFFS_STRICT { "mffs under GEX_FP_STRICT" } else { "non-default FP rounding mode" },
+        ));
+        with_host(|h| set_exit(h, 128 + 4));
+        trap();
+    }
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
     // four results go back into the context.
     if reg == gex_kernel::x86::SYSREG_CPUID {

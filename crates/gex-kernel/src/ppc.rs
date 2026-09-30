@@ -259,7 +259,7 @@ pub fn finish(post: PpcPost, r: u64) -> u64 {
 /// The canonical number of a raw ppc call, for tests and traces.
 pub fn canonical_number(n: u64) -> u64 {
     let mut a = [0u64; 6];
-    let mut buf = vec![0u8; 0x1000];
+    let mut buf = [0u8; 0x200];
     let mut m = GuestMem::new(&mut buf);
     translate(n, &mut a, &mut m, 0x100, 0x100).0
 }
