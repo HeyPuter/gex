@@ -151,6 +151,11 @@ pub struct RecoverStats {
     /// Bytes inside symbol extents, and how many some block covers.
     pub symbol_bytes: u64,
     pub symbol_bytes_covered: u64,
+    /// Bytes inside FDE ranges, and how many some block covers: the same
+    /// for a stripped binary, whose unwind tables still bound every
+    /// compiled function.
+    pub fde_bytes: u64,
+    pub fde_bytes_covered: u64,
     /// Switches recovered: proved complete, and best effort.
     pub switches_complete: usize,
     pub switches_partial: usize,
@@ -926,10 +931,8 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
                 continue;
             }
             let starts_todo: Vec<u64> = todo.iter().map(|t| t.0).collect();
-            let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, &|c| {
-                sums.as_ref()
-                    .map_or(gex_ir::ssa::CallEffect::UNKNOWN, |s| s.call_effect(c))
-            });
+            let extent = starts.get(&f.entry).and_then(|i| i.end).map(|e| (f.entry, e));
+            let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, sums.as_ref(), extent);
             for ((_, t), (_, a)) in found.into_iter().zip(todo) {
                 match t {
                     Some(t) => {
@@ -1040,9 +1043,8 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
         }
         let starts_todo: Vec<u64> = todo.iter().map(|t| t.0).collect();
         let s = sums.as_ref().unwrap();
-        let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, &|c| {
-            s.call_effect(c)
-        });
+        let extent = starts.get(&f.entry).and_then(|i| i.end).map(|e| (f.entry, e));
+        let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, Some(s), extent);
         for ((_, t), (_, a)) in found.into_iter().zip(todo) {
             match t {
                 Some(t) => {
@@ -1163,7 +1165,16 @@ fn stats(
             _ => merged.push((a, b)),
         }
     }
-    let mut ext: Vec<(u64, u64)> = sym.iter().filter(|(a, e)| e > a).map(|(&a, &e)| (a, e)).collect();
+    let ext: Vec<(u64, u64)> = sym.iter().filter(|(a, e)| e > a).map(|(&a, &e)| (a, e)).collect();
+    (s.symbol_bytes, s.symbol_bytes_covered) = covered_bytes(ext, &merged);
+    let ext: Vec<(u64, u64)> = fdes.iter().filter(|f| f.end > f.start).map(|f| (f.start, f.end)).collect();
+    (s.fde_bytes, s.fde_bytes_covered) = covered_bytes(ext, &merged);
+    s
+}
+
+/// Bytes in the union of `ext`, and how many of them the sorted, disjoint
+/// ranges `merged` cover.
+fn covered_bytes(mut ext: Vec<(u64, u64)>, merged: &[(u64, u64)]) -> (u64, u64) {
     ext.sort_unstable();
     let mut ext_m: Vec<(u64, u64)> = Vec::new();
     for (a, b) in ext {
@@ -1172,18 +1183,25 @@ fn stats(
             _ => ext_m.push((a, b)),
         }
     }
+    let (mut total, mut covered) = (0, 0);
     for &(a, b) in &ext_m {
-        s.symbol_bytes += b - a;
-        // Overlap with merged coverage.
+        total += b - a;
         let i = merged.partition_point(|m| m.1 <= a);
         for m in &merged[i..] {
             if m.0 >= b {
                 break;
             }
-            s.symbol_bytes_covered += m.1.min(b) - m.0.max(a);
+            covered += m.1.min(b) - m.0.max(a);
         }
     }
-    s
+    (total, covered)
+}
+
+/// SSA construction for this guest: [`gex_ir::ssa::to_ssa_sp`] with the
+/// guest's stack pointer ([`arch::SP_REG`]), so a callee's
+/// [`Summary::sp_delta`] carries the stack pointer across its calls.
+pub fn to_ssa(f: &Function, call: &dyn Fn(Callee) -> gex_ir::ssa::CallEffect) -> Function {
+    gex_ir::ssa::to_ssa_sp(f, call, arch::SP_REG)
 }
 
 /// The value a register holds according to a block's writes, for tests.

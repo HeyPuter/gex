@@ -24,9 +24,24 @@
 //! an address the analysis cannot place kills the slots of the caller's
 //! frame always, and this function's own slots only once the frame has
 //! *escaped* (a frame address was stored to memory, passed to a callee that
-//! uses that register as an address, or handed to a syscall). A callee's
+//! uses that register as an address or may store it
+//! ([`Summary::escaping_inputs`]), or handed to a syscall). A callee's
 //! writes above its entry stack pointer ([`Summary::caller_frame_writes`])
-//! kill exactly the slots they cover.
+//! kill exactly the slots they cover. Nothing is kept below the stack
+//! pointer less the red zone (x86-64's 128 bytes; none on AArch64), where a
+//! signal frame may land at any time, nor below the stack pointer at a call
+//! (the callee's frame). A reload narrower than 8 bytes gives the stored
+//! value's low bytes, extended, never the entry value itself.
+//!
+//! Where values go is tracked as well: every entry register a value was
+//! computed from is in its taint, so a value that reaches memory other code
+//! can read (anything but this function's own unescaped frame), the kernel
+//! (for the few syscalls that keep a pointer, or any syscall not known to
+//! be harmless) or unknown code makes its taint [`Summary::escaping_inputs`],
+//! and what reaches an output register at a return makes
+//! [`Summary::output_sources`]. A caller uses both: a frame address in an
+//! escaping input lets its frame escape, and a callee's outputs are tainted
+//! by the caller's values in its output sources only.
 //!
 //! # Fixpoint
 //!
@@ -38,7 +53,7 @@
 //! that has not converged after [`MAX_ITERATIONS`] is set to
 //! [`Summary::unknown`].
 
-use crate::arch::SYSCALL_NR;
+use crate::arch::{SP_REG, SYSCALL_NR};
 use crate::func::Program;
 use gex_ir::func::*;
 use gex_ir::ssa::CallEffect;
@@ -73,6 +88,12 @@ impl Summaries {
         self.map.get(&a).cloned().unwrap_or_else(Summary::unknown)
     }
 
+    /// `f` in SSA form, with these summaries standing in for its calls
+    /// and the guest's stack pointer ([`crate::func::to_ssa`]).
+    pub fn to_ssa(&self, f: &Function) -> Function {
+        crate::func::to_ssa(f, &|c| self.call_effect(c))
+    }
+
     /// What a call does to registers, for [`gex_ir::ssa::to_ssa`].
     pub fn call_effect(&self, c: Callee) -> CallEffect {
         match c {
@@ -99,13 +120,15 @@ pub fn describe(s: &Summary) -> String {
     .map(|(_, n)| *n)
     .collect();
     format!(
-        "in={:?} stack_in={:?} preserved={:?} sp_delta={:?} caller_writes={:?} addr_in={:?} [{}]",
+        "in={:?} stack_in={:?} preserved={:?} sp_delta={:?} caller_writes={:?} addr_in={:?} escapes={:?} out_src={:?} [{}]",
         s.inputs,
         s.stack_inputs,
         s.preserved,
         s.sp_delta,
         s.caller_frame_writes,
         s.addr_inputs,
+        s.escaping_inputs,
+        s.output_sources,
         flags.join(" ")
     )
 }
@@ -131,7 +154,8 @@ struct AV {
     taint: RegSet,
 }
 
-const SP: usize = 31;
+/// [`SP_REG`]'s index ([`reg_index`]).
+const SP: usize = if gex_abi::X86 { 4 } else { 31 };
 
 impl AV {
     fn konst(c: u64) -> AV {
@@ -152,7 +176,7 @@ impl AV {
         }
     }
     fn frame(self) -> bool {
-        self.taint.contains(GuestReg::Sp)
+        self.taint.contains(SP_REG)
     }
     /// Offset from the entry stack pointer, if this is exactly one.
     fn sp_off(self) -> Option<i64> {
@@ -230,6 +254,17 @@ impl St {
         }
     }
 
+    /// The lowest stack offset a slot may be kept at: the stack pointer less
+    /// the red zone (x86-64's 128 bytes the kernel's signal delivery skips;
+    /// AArch64 has none). Everything when the stack pointer is not known.
+    fn floor(&self) -> i64 {
+        let red = if gex_abi::X86 { 128 } else { 0 };
+        match self.regs[SP].sp_off() {
+            Some(o) => o - red,
+            None => i64::MAX,
+        }
+    }
+
     /// Forget slots overlapping `[lo, hi)`.
     fn kill(&mut self, lo: i64, hi: i64) {
         let dead: Vec<i64> = self
@@ -266,6 +301,23 @@ impl St {
 // Per-function analysis
 // ---------------------------------------------------------------------------
 
+/// The frame's address has escaped: from here on other code may read (and
+/// write) it, so whatever its slots hold escapes too.
+fn escape(st: &mut St, acc: &mut Acc) {
+    st.escaped = true;
+    for (_, v) in st.slots.values() {
+        acc.escapes = acc.escapes.union(v.taint);
+    }
+}
+
+/// Every value the registers hold may be read by other code (a clobbering
+/// host call, a signal).
+fn escape_regs(st: &St, acc: &mut Acc) {
+    for r in &st.regs {
+        acc.escapes = acc.escapes.union(r.taint);
+    }
+}
+
 /// What the walk accumulates besides the per-point states.
 struct Acc {
     inputs: RegSet,
@@ -277,10 +329,17 @@ struct Acc {
     unknown_callee: bool,
     reads_ra: bool,
     leaks_sp: bool,
+    /// Entry registers whose values may be put where other code reads them.
+    escapes: RegSet,
+    /// Entry registers whose values may reach an output register.
+    out_src: RegSet,
     /// Per return path: (registers preserved on it, sp delta if known).
     exits: Vec<(RegSet, Option<i64>)>,
     /// Some path leaves to code nothing is known about.
     unknown_exit: bool,
+    /// Per block: ends in an unresolved jump taken with the frame torn
+    /// down (stack pointer and return address as on entry).
+    torn_down: Vec<bool>,
 }
 
 /// Registers the kernel reads for a syscall, and those it may change.
@@ -322,6 +381,19 @@ fn benign_syscall(nr: u64) -> bool {
     }
 }
 
+/// Of the syscalls [`benign_syscall`] lists, those whose kernel side keeps
+/// a pointer it is handed after returning: `set_tid_address`,
+/// `set_robust_list`. Their arguments escape; the others' do not (the
+/// kernel copies what they point at, or writes through it before
+/// returning). Every other syscall's arguments escape.
+fn syscall_keeps_args(nr: u64) -> bool {
+    if gex_abi::X86 {
+        matches!(nr, 218 | 273)
+    } else {
+        matches!(nr, 96 | 99)
+    }
+}
+
 struct Ctx<'a> {
     sums: &'a HashMap<u64, Summary>,
 }
@@ -338,6 +410,11 @@ impl Ctx<'_> {
 /// Evaluate the statements of one block, updating `st`; returns the
 /// abstract value of every value the block defines.
 fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
+    // A join may have brought slots of an unescaped path into an escaped
+    // frame.
+    if st.escaped {
+        escape(st, acc);
+    }
     let mut vals: HashMap<Value, AV> = HashMap::new();
     let get = |vals: &HashMap<Value, AV>, v: Value| {
         vals.get(&v).copied().unwrap_or(AV::top(RegSet::EMPTY))
@@ -350,13 +427,18 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
             }
             Stmt::WriteReg { reg, val } => {
                 let av = get(&vals, *val);
-                if *reg == GuestReg::Sp && av.sp_off().is_none() && !av.frame() {
+                if *reg == SP_REG && av.sp_off().is_none() && !av.frame() {
                     // The stack pointer set from something not derived from
                     // it: a stack switch (longjmp, setcontext, coroutines).
                     acc.may_unwind = true;
                 }
                 st.regs[reg_index(*reg)] = av;
                 st.written.insert(*reg);
+                if *reg == SP_REG {
+                    // Below the stack pointer (and its red zone), a signal
+                    // frame may land at any moment.
+                    st.kill(i64::MIN, st.floor());
+                }
             }
             Stmt::Store {
                 addr, offset, val, sz, ..
@@ -379,6 +461,7 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
                 for a in args {
                     let av = get(&vals, *a);
                     note_addr(acc, av);
+                    acc.escapes = acc.escapes.union(av.taint);
                 }
                 host(st, acc, *func);
             }
@@ -393,6 +476,10 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
                 // Reads of unknown length from the caller's frame.
                 if d.frame() || s_.frame() {
                     acc.stack_inputs = Slots::Unknown;
+                }
+                // Whatever the frame holds may be copied anywhere.
+                if s_.frame() && matches!(s, Stmt::MemCopy { .. }) {
+                    escape_slots(st, acc);
                 }
                 if let Stmt::MemCmp { dst: out, .. } = s {
                     vals.insert(*out, AV::top(RegSet::EMPTY));
@@ -423,6 +510,9 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
                 if d.frame() || s_.frame() {
                     acc.stack_inputs = Slots::Unknown;
                 }
+                if s_.frame() && matches!(kind, gex_ir::StrKind::Movs) {
+                    escape_slots(st, acc);
+                }
                 for o in [out_count, out_dst, out_src, out_a, out_b] {
                     vals.insert(*o, AV::top(d.taint.union(s_.taint)));
                 }
@@ -433,9 +523,16 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
     vals
 }
 
+/// The slots' values may be copied somewhere other code reads.
+fn escape_slots(st: &St, acc: &mut Acc) {
+    for (_, v) in st.slots.values() {
+        acc.escapes = acc.escapes.union(v.taint);
+    }
+}
+
 /// An address operand: its entry-register inputs become `addr_inputs`.
 fn note_addr(acc: &mut Acc, a: AV) {
-    acc.addr_inputs = acc.addr_inputs.union(a.taint.minus(RegSet::of(&[GuestReg::Sp])));
+    acc.addr_inputs = acc.addr_inputs.union(a.taint.minus(RegSet::of(&[SP_REG])));
     if a.is_ra() {
         acc.reads_ra = true;
     }
@@ -465,7 +562,16 @@ fn bulk_write(st: &mut St, acc: &mut Acc, d: AV) {
 fn store(st: &mut St, acc: &mut Acc, a: AV, offset: i64, bytes: u32, v: AV) {
     note_addr(acc, a);
     if v.frame() {
-        st.escaped = true;
+        escape(st, acc);
+    }
+    // The value escapes unless it goes into this function's own frame while
+    // nobody else can read that.
+    let private = match a.sp_off() {
+        Some(o) => !st.escaped && o + offset + bytes as i64 <= 0,
+        None => false,
+    };
+    if !private {
+        acc.escapes = acc.escapes.union(v.taint);
     }
     if v.is_ra() && a.sp_off().is_none() {
         acc.reads_ra = true;
@@ -474,7 +580,9 @@ fn store(st: &mut St, acc: &mut Acc, a: AV, offset: i64, bytes: u32, v: AV) {
         Some(o) => {
             let at = o + offset;
             st.kill(at, at + bytes as i64);
-            st.slots.insert(at, (bytes, v));
+            if at >= st.floor() {
+                st.slots.insert(at, (bytes, v));
+            }
             if at + bytes as i64 > 0 {
                 acc.caller_frame_writes = acc.caller_frame_writes.add(at.max(0), at + bytes as i64);
             }
@@ -494,12 +602,13 @@ fn host(st: &mut St, acc: &mut Acc, func: HostFunc) {
         acc.may_unwind = true;
     }
     if func.clobbers_guest_state() {
+        escape_regs(st, acc);
+        escape(st, acc);
         for r in st.regs.iter_mut() {
             *r = AV::top(RegSet::EMPTY);
         }
         acc.inputs = acc.inputs.union(RegSet::ALL.minus(st.written));
         st.unknown_store();
-        st.escaped = true;
     }
 }
 
@@ -515,6 +624,10 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
             st.regs[reg_index(r)]
         }
         Expr::Bin { op, ty, a, b } => {
+            // `xor eax, eax`: no longer depends on anything.
+            if a == b && matches!(op, BinOp::Xor | BinOp::Sub) {
+                return AV::konst(0);
+            }
             let (x, y) = (get(a), get(b));
             if x.is_ra() || y.is_ra() {
                 acc.reads_ra = true;
@@ -535,21 +648,21 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
                             taint,
                         }
                     }
-                    (_, Ex::Const(p), Ex::Const(q)) => {
-                        let mut known = vec![None; (a.0.max(b.0) + 1) as usize];
-                        known[a.0 as usize] = Some(p);
-                        known[b.0 as usize] = Some(q);
-                        if let Some(c) = gex_ir::pass::eval_expr(e, &known) {
-                            return AV::konst(c);
-                        }
-                    }
                     _ => {}
                 }
+            }
+            if let Some(c) = fold_consts(e, &get) {
+                return AV::konst(c);
             }
             AV::top(taint)
         }
         Expr::Load {
-            addr, offset, sz, ..
+            addr,
+            offset,
+            sz,
+            signed,
+            ty,
+            ..
         } => {
             let a = get(addr);
             note_addr(acc, a);
@@ -561,7 +674,21 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
                         acc.stack_inputs = acc.stack_inputs.add(at.max(0), at + n as i64);
                     }
                     match st.slots.get(&at) {
-                        Some(&(m, v)) if m == n => v,
+                        Some(&(m, v)) if m == n && n == 8 => v,
+                        // A narrower reload is the stored value's low bytes,
+                        // extended: not the entry value it came from.
+                        Some(&(m, v)) if m == n => match v.ex {
+                            Ex::Const(c) => {
+                                let sh = 64 - 8 * n;
+                                let x = if signed {
+                                    (((c << sh) as i64) >> sh) as u64
+                                } else {
+                                    (c << sh) >> sh
+                                };
+                                AV::konst(x & ty.mask())
+                            }
+                            _ => AV::top(v.taint),
+                        },
                         _ => AV::top(RegSet::EMPTY),
                     }
                 }
@@ -596,11 +723,15 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
         Expr::HostCall { func, ref args, .. } => {
             for a in args {
                 note_addr(acc, get(*a));
+                acc.escapes = acc.escapes.union(get(*a).taint);
             }
             host(st, acc, func);
             AV::top(RegSet::EMPTY)
         }
         _ => {
+            if let Some(c) = fold_consts(e, &get) {
+                return AV::konst(c);
+            }
             let mut t = RegSet::EMPTY;
             let mut ra = false;
             e.for_each_use(|u| {
@@ -616,6 +747,14 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
     }
 }
 
+/// A pure scalar expression whose operands are all constants, folded.
+fn fold_consts(e: &Expr, get: &dyn Fn(Value) -> AV) -> Option<u64> {
+    crate::jumptable::eval_with(e, &mut |u| match get(u).ex {
+        Ex::Const(c) => Some(c),
+        _ => None,
+    })
+}
+
 /// Apply a call's effect to the state at the call. Returns false when the
 /// callee never returns (the continuation is dead).
 fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
@@ -625,20 +764,38 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
     // and a frame address in one lets the frame escape to it.
     for r in s.addr_inputs.iter() {
         let v = st.regs[reg_index(r)];
-        acc.addr_inputs = acc.addr_inputs.union(v.taint.minus(RegSet::of(&[GuestReg::Sp])));
+        acc.addr_inputs = acc.addr_inputs.union(v.taint.minus(RegSet::of(&[SP_REG])));
         if v.frame() {
-            st.escaped = true;
+            escape(st, acc);
         }
         if v.is_ra() {
             acc.reads_ra = true;
         }
     }
     if s.leaks_sp() {
-        st.escaped = true;
+        escape(st, acc);
+    }
+    // Registers whose values it may store where others read them: ours
+    // escape with them, and a frame address among them lets the frame
+    // escape. (The callee's own stack pointer is its frame, not ours:
+    // `leaks_sp` above covers that.)
+    for r in s.escaping_inputs.iter() {
+        if r == SP_REG {
+            continue;
+        }
+        let v = st.regs[reg_index(r)];
+        acc.escapes = acc.escapes.union(v.taint);
+        if v.frame() {
+            escape(st, acc);
+        }
     }
     // The callee's stack accesses relative to its entry sp, which is ours
-    // at the call.
+    // at the call; its own frame (and red zone) is below that.
     let sp = st.regs[SP];
+    match sp.sp_off() {
+        Some(o) => st.kill(i64::MIN, o),
+        None => st.slots.clear(),
+    }
     match sp.sp_off() {
         Some(o) => {
             let shift_in = s.stack_inputs.shift(o);
@@ -678,11 +835,12 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
     if !s.may_return {
         return false;
     }
-    // Outputs: derived from anything the callee read, except its own stack
-    // pointer (a callee handing back its caller's frame is `leaks_sp`).
+    // Outputs: derived from what flows into the callee's outputs, except
+    // its own stack pointer (a callee handing back its caller's frame is
+    // `leaks_sp`).
     let mut t = RegSet::EMPTY;
-    for r in s.inputs.iter() {
-        if r != GuestReg::Sp {
+    for r in s.output_sources.iter() {
+        if r != SP_REG {
             t = t.union(st.regs[reg_index(r)].taint);
         }
     }
@@ -700,7 +858,7 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
     }
     st.regs[SP] = match new_sp {
         Some(v) => v,
-        None if s.preserved.contains(GuestReg::Sp) => sp,
+        None if s.preserved.contains(SP_REG) => sp,
         None => AV::top(sp.taint),
     };
     true
@@ -716,8 +874,19 @@ fn unknown_exit(acc: &mut Acc, st: &St) {
     acc.may_leave_pending = true;
     acc.unknown_callee = true;
     acc.unknown_exit = true;
+    acc.escapes = RegSet::ALL;
+    acc.out_src = RegSet::ALL;
     if st.escaped || st.regs.iter().enumerate().any(|(i, r)| i != SP && r.frame()) {
         acc.leaks_sp = true;
+    }
+}
+
+/// A return path: what the registers that changed were computed from.
+fn output_flow(st: &St, acc: &mut Acc) {
+    for (i, r) in st.regs.iter().enumerate() {
+        if i != SP && r.ex != Ex::Entry(i as u8, 0) {
+            acc.out_src = acc.out_src.union(r.taint);
+        }
     }
 }
 
@@ -734,6 +903,58 @@ fn unchanged(st: &St) -> RegSet {
 
 /// Analyse one function given the current summaries.
 fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
+    analyze_fn_rec(f, ctx, None)
+}
+
+/// Values of memory-form `f` that are the same constant on every
+/// execution, by the same abstract interpretation the summaries use: through
+/// stack slots nothing else can write, and across calls whose summaries
+/// (from `sums`, when given) preserve the register or slot. Value numbers
+/// are those of `f`, which [`gex_ir::ssa::to_ssa`] keeps for every
+/// statement it does not remove.
+pub fn known_values(f: &Function, sums: Option<&Summaries>) -> HashMap<Value, u64> {
+    let empty = HashMap::new();
+    let ctx = Ctx {
+        sums: sums.map_or(&empty, |s| &s.map),
+    };
+    let mut rec: Vec<HashMap<Value, AV>> = vec![HashMap::new(); f.blocks.len()];
+    analyze_fn_rec(f, &ctx, Some(&mut rec));
+    let mut out = HashMap::new();
+    for vals in rec {
+        for (v, av) in vals {
+            if let Ex::Const(c) = av.ex {
+                out.insert(v, c);
+            }
+        }
+    }
+    out
+}
+
+/// The unresolved indirect jumps of `f` (by the jump's address) taken with
+/// the frame torn down: the stack pointer and the return address are what
+/// they were on entry, as in a tail call through a pointer (a PLT stub, a
+/// virtual call after the epilogue). A leaf function's unresolved jump
+/// table has the same shape, so this is a description, not a verdict: the
+/// jumps stay [`FTerm::Unresolved`].
+pub fn frame_torn_down(f: &Function, sums: &Summaries) -> Vec<u64> {
+    let ctx = Ctx { sums: &sums.map };
+    let mut acc_out = Vec::new();
+    analyze_fn_full(f, &ctx, None, Some(&mut acc_out));
+    acc_out
+}
+
+/// [`analyze_fn`], optionally recording every value's abstract value on
+/// the last (fixpoint) visit of its block.
+fn analyze_fn_rec(f: &Function, ctx: &Ctx, record: Option<&mut Vec<HashMap<Value, AV>>>) -> Summary {
+    analyze_fn_full(f, ctx, record, None)
+}
+
+fn analyze_fn_full(
+    f: &Function,
+    ctx: &Ctx,
+    mut record: Option<&mut Vec<HashMap<Value, AV>>>,
+    torn: Option<&mut Vec<u64>>,
+) -> Summary {
     let n = f.blocks.len();
     let mut acc = Acc {
         inputs: RegSet::EMPTY,
@@ -745,6 +966,9 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
         unknown_callee: false,
         reads_ra: false,
         leaks_sp: false,
+        escapes: RegSet::EMPTY,
+        out_src: RegSet::EMPTY,
+        torn_down: vec![false; n],
         exits: Vec::new(),
         unknown_exit: false,
     };
@@ -758,6 +982,23 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
     // Worklist by RPO position, so loops settle before what follows them.
     let mut work: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     work.insert(order[0]);
+    // Values claimed for every execution must also hold when code outside
+    // enters at an interior entry, in any state. (A summary describes calls
+    // to the primary entry only, so it leaves them out.)
+    if record.is_some() {
+        for e in f.entry_blocks().into_iter().skip(1) {
+            let mut any = St::entry();
+            for r in any.regs.iter_mut() {
+                *r = AV::top(RegSet::EMPTY);
+            }
+            any.slots.clear();
+            any.escaped = true;
+            state_in[e.index()] = Some(any);
+            if order[e.index()] != usize::MAX {
+                work.insert(order[e.index()]);
+            }
+        }
+    }
     let mut visits = vec![0u32; n];
     // Exits are recorded on the final visit of each block only: collect
     // them per block and overwrite on revisit.
@@ -780,6 +1021,9 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
         }
         let blk = f.block(b);
         let vals = run_block(blk, &mut st, &mut acc);
+        if let Some(r) = record.as_deref_mut() {
+            r[bi] = vals.clone();
+        }
         let get = |v: Value| vals.get(&v).copied().unwrap_or(AV::top(RegSet::EMPTY));
         exits_of[bi] = None;
         unknown_of[bi] = false;
@@ -842,6 +1086,7 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
                         if after.regs.iter().enumerate().any(|(i, r)| i != SP && r.frame()) {
                             acc.leaks_sp = true;
                         }
+                        output_flow(&after, &mut acc);
                     }
                 }
             }
@@ -857,11 +1102,18 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
                 }
                 let d = st.regs[SP].sp_off();
                 exits_of[bi] = Some((unchanged(&st), d));
+                output_flow(&st, &mut acc);
                 if st.regs.iter().enumerate().any(|(i, r)| i != SP && r.frame() && r.sp_off().is_none_or(|o| o >= 0)) {
                     acc.leaks_sp = true;
                 }
             }
             FTerm::Unresolved { target } => {
+                acc.torn_down[bi] = st.regs[SP].sp_off() == Some(0)
+                    && if gex_abi::X86 {
+                        st.slots.get(&0).is_some_and(|&(n, v)| n == 8 && v.ex == Ex::RetAddr)
+                    } else {
+                        st.regs[30].ex == Ex::Entry(30, 0)
+                    };
                 note_addr(&mut acc, get(*target));
                 unknown_exit(&mut acc, &st);
                 unknown_of[bi] = true;
@@ -877,11 +1129,18 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
                 // Pointer arguments: the kernel may write through them.
                 let frame_arg = reads.iter().any(|r| after.regs[reg_index(r)].frame());
                 if frame_arg {
-                    after.escaped = true;
+                    escape(&mut after, &mut acc);
                 }
+                // The kernel may keep what it is handed (set_tid_address,
+                // set_robust_list, and whatever a syscall not known to be
+                // harmless does).
+                let keeps = nr.map_or(true, |nr| !benign_syscall(nr) || syscall_keeps_args(nr));
                 for r in reads.iter() {
                     let v = after.regs[reg_index(r)];
-                    acc.addr_inputs = acc.addr_inputs.union(v.taint.minus(RegSet::of(&[GuestReg::Sp])));
+                    acc.addr_inputs = acc.addr_inputs.union(v.taint.minus(RegSet::of(&[SP_REG])));
+                    if keeps {
+                        acc.escapes = acc.escapes.union(v.taint);
+                    }
                 }
                 after.unknown_store();
                 match nr {
@@ -891,7 +1150,9 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
                         }
                     }
                     _ => {
+                        // A signal handler sees every register.
                         acc.may_unwind = true;
+                        escape_regs(&after, &mut acc);
                         for r in after.regs.iter_mut() {
                             *r = AV::top(RegSet::EMPTY);
                         }
@@ -919,6 +1180,13 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
         }
     }
     acc.exits = exits_of.into_iter().flatten().collect();
+    if let Some(t) = torn {
+        for (bi, &on) in acc.torn_down.iter().enumerate() {
+            if on {
+                t.push(f.blocks[bi].term_pc);
+            }
+        }
+    }
     let unknown_exit = acc.unknown_exit || unknown_of.iter().any(|&u| u);
 
     let may_return = !acc.exits.is_empty() || unknown_exit;
@@ -940,6 +1208,8 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
         sp_delta,
         caller_frame_writes: acc.caller_frame_writes,
         addr_inputs: acc.addr_inputs,
+        escaping_inputs: acc.escapes,
+        output_sources: acc.out_src,
         may_return,
         may_unwind: acc.may_unwind,
         may_leave_pending: acc.may_leave_pending,
@@ -948,6 +1218,7 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
     };
     if !may_return {
         s.outputs = RegSet::EMPTY;
+        s.output_sources = RegSet::EMPTY;
     }
     s.set_leaks_sp(acc.leaks_sp);
     s
@@ -962,11 +1233,11 @@ trait LeaksSp {
 
 impl LeaksSp for Summary {
     fn leaks_sp(&self) -> bool {
-        self.addr_inputs.contains(GuestReg::Sp)
+        self.addr_inputs.contains(SP_REG)
     }
     fn set_leaks_sp(&mut self, on: bool) {
         if on {
-            self.addr_inputs.insert(GuestReg::Sp);
+            self.addr_inputs.insert(SP_REG);
         }
     }
 }

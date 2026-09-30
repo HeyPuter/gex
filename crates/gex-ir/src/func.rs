@@ -1203,6 +1203,18 @@ pub struct Summary {
     /// caller's frame boundary) escape: stores it, returns something
     /// derived from it, or saves it as `setjmp` does.
     pub addr_inputs: RegSet,
+    /// Registers whose entry values the function (or a callee) may put
+    /// where other code can read them: memory other than its own frame
+    /// while that frame has not escaped, the kernel, or unknown code. A
+    /// caller whose frame address sits in one of these at a call has let
+    /// its frame escape, as with `addr_inputs`.
+    pub escaping_inputs: RegSet,
+    /// Registers whose entry values may flow into a register that differs
+    /// at return (an output), not counting a register saved and restored in
+    /// place. What a caller's value in one of these may reach through the
+    /// call's outputs; `sp` here means something derived from the entry
+    /// stack pointer may be returned.
+    pub output_sources: RegSet,
     /// Some path returns to the caller.
     pub may_return: bool,
     /// May reach an event that needs every function-tier frame unwound
@@ -1236,6 +1248,8 @@ impl Summary {
             sp_delta: None,
             caller_frame_writes: Slots::Unknown,
             addr_inputs: RegSet::ALL,
+            escaping_inputs: RegSet::ALL,
+            output_sources: RegSet::ALL,
             may_return: true,
             may_unwind: true,
             may_leave_pending: true,
@@ -1256,6 +1270,8 @@ impl Summary {
             sp_delta: None,
             caller_frame_writes: Slots::None,
             addr_inputs: RegSet::EMPTY,
+            escaping_inputs: RegSet::EMPTY,
+            output_sources: RegSet::EMPTY,
             may_return: false,
             may_unwind: false,
             may_leave_pending: false,

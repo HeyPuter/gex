@@ -23,26 +23,38 @@
 //! Anything else stays [`FTerm::Unresolved`]: never guessed.
 
 use crate::func::{Code, Table};
+use crate::summary::Summaries;
 use gex_ir::func::*;
-use gex_ir::ssa::{to_ssa, CallEffect};
-use gex_ir::{pass, BinOp, CmpOp, Expr, GuestReg, Stmt, Ty, Value};
+use crate::func::to_ssa;
+use gex_ir::ssa::CallEffect;
+use gex_ir::{pass, BinOp, CmpOp, Expr, Stmt, Ty, Value};
 use std::collections::HashMap;
 
 /// Resolve the jump tables ending the blocks at `blocks` (each ends in
-/// [`FTerm::Unresolved`]) of memory-form `f`.
+/// [`FTerm::Unresolved`]) of memory-form `f`. `sums`, when there are any,
+/// stand in for its calls. `extent` is the function's extent from the
+/// symbol table or its FDE, which bounds a best-effort table that has no
+/// bound check (see [`resolve_unbounded`]).
 pub fn resolve_all(
     f: &Function,
     blocks: &[u64],
     code: &Code,
     max: u32,
-    call: &dyn Fn(Callee) -> CallEffect,
+    sums: Option<&Summaries>,
+    extent: Option<(u64, u64)>,
 ) -> Vec<(u64, Option<Table>)> {
-    let ssa = to_ssa(f, call);
-    let defs = Defs::new(&ssa);
+    let call = |c: Callee| sums.map_or(CallEffect::UNKNOWN, |s| s.call_effect(c));
+    let ssa = to_ssa(f, &call);
+    let known = crate::summary::known_values(f, sums);
+    let defs = Defs::new(&ssa, known);
     let preds = ssa.preds();
     blocks
         .iter()
-        .map(|&a| (a, resolve_one(&ssa, &defs, &preds, a, code, max)))
+        .map(|&a| {
+            let t = resolve_one(&ssa, &defs, &preds, a, code, max)
+                .or_else(|| extent.and_then(|x| resolve_unbounded(&ssa, &defs, a, code, max, x)));
+            (a, t)
+        })
         .collect()
 }
 
@@ -53,10 +65,17 @@ struct Defs<'a> {
     params: HashMap<Value, Vec<Value>>,
     /// Where each statement-defined value is: (block, statement index).
     loc: HashMap<Value, (BlockId, usize)>,
+    /// Memo for [`fold`].
+    folded: std::cell::RefCell<HashMap<Value, Option<u64>>>,
+    /// Set when [`fold`] hit its depth limit.
+    cut: std::cell::Cell<bool>,
+    /// Values the abstract interpretation proves constant
+    /// ([`crate::summary::known_values`]).
+    known: HashMap<Value, u64>,
 }
 
 impl<'a> Defs<'a> {
-    fn new(f: &'a Function) -> Defs<'a> {
+    fn new(f: &'a Function, known: HashMap<Value, u64>) -> Defs<'a> {
         let mut expr = HashMap::new();
         let mut params: HashMap<Value, Vec<Value>> = HashMap::new();
         let mut loc = HashMap::new();
@@ -73,35 +92,72 @@ impl<'a> Defs<'a> {
                 }
             }
         }
-        Defs { expr, params, loc }
+        Defs {
+            expr,
+            params,
+            loc,
+            folded: Default::default(),
+            cut: Default::default(),
+            known,
+        }
     }
+}
+
+/// Evaluate a pure scalar expression given each operand's value from
+/// `get`; `None` when an operand is unknown or the expression is not pure
+/// scalar arithmetic. Operands are renumbered locally, so the folder's
+/// table is as long as the operand list rather than the function.
+pub(crate) fn eval_with(e: &Expr, get: &mut dyn FnMut(Value) -> Option<u64>) -> Option<u64> {
+    let mut local = Stmt::Def {
+        dst: Value(u32::MAX),
+        expr: e.clone(),
+    };
+    let mut known: Vec<Option<u64>> = Vec::new();
+    let mut ok = true;
+    for_each_use_mut(&mut local, |u| {
+        if ok {
+            let x = get(*u);
+            ok &= x.is_some();
+            known.push(x);
+        }
+        *u = Value(known.len().saturating_sub(1) as u32);
+    });
+    if !ok {
+        return None;
+    }
+    let Stmt::Def { expr, .. } = &local else {
+        unreachable!()
+    };
+    pass::eval_expr(expr, &known)
 }
 
 /// The constant a value folds to with no inputs, if any.
 fn fold(defs: &Defs, v: Value, depth: u32) -> Option<u64> {
     if depth > 32 {
+        defs.cut.set(true);
         return None;
+    }
+    if let Some(&c) = defs.folded.borrow().get(&v) {
+        return c;
+    }
+    if let Some(&c) = defs.known.get(&v) {
+        return Some(c);
     }
     let e = defs.expr.get(&v)?;
-    let mut known: Vec<Option<u64>> = Vec::new();
-    let mut ok = true;
-    e.for_each_use(|u| {
-        let c = fold(defs, u, depth + 1);
-        if c.is_none() {
-            ok = false;
-        }
-        if known.len() <= u.0 as usize {
-            known.resize(u.0 as usize + 1, None);
-        }
-        known[u.0 as usize] = c;
-    });
-    if !ok {
-        return None;
+    let outer = defs.cut.replace(false);
+    let r = if matches!(e, Expr::Load { .. }) {
+        None
+    } else {
+        eval_with(e, &mut |u| fold(defs, u, depth + 1))
+    };
+    // A failure the depth limit caused is not remembered: from nearer the
+    // root it may succeed.
+    let cut = defs.cut.get();
+    if r.is_some() || !cut {
+        defs.folded.borrow_mut().insert(v, r);
     }
-    if matches!(e, Expr::Load { .. }) {
-        return None;
-    }
-    pass::eval_expr(e, &known)
+    defs.cut.set(outer || cut);
+    r
 }
 
 fn swap(op: CmpOp) -> CmpOp {
@@ -425,10 +481,6 @@ fn range_of(
                 _ => full(ty),
             }
         }
-        Expr::Select { a, b, ty, .. } => match (r(a), r(b)) {
-            (Some((al, ah)), Some((bl, bh))) => Some((al.min(bl), ah.max(bh))),
-            _ => full(ty),
-        },
         ref other => full(other.ty()),
     }
 }
@@ -566,6 +618,9 @@ impl Eval<'_, '_> {
         r
     }
     fn compute(&mut self, v: Value, depth: u32) -> Option<u64> {
+        if let Some(&c) = self.defs.known.get(&v) {
+            return Some(c);
+        }
         let Some(&e) = self.defs.expr.get(&v) else {
             return self.param(v, depth);
         };
@@ -591,17 +646,7 @@ impl Eval<'_, '_> {
             };
             return Some(x & ty.mask());
         }
-        let mut known: Vec<Option<u64>> = Vec::new();
-        let mut ops: Vec<Value> = Vec::new();
-        e.for_each_use(|u| ops.push(u));
-        for u in ops {
-            let c = self.eval(u, depth + 1)?;
-            if known.len() <= u.0 as usize {
-                known.resize(u.0 as usize + 1, None);
-            }
-            known[u.0 as usize] = Some(c);
-        }
-        pass::eval_expr(e, &known)
+        eval_with(e, &mut |u| self.eval(u, depth + 1))
     }
 }
 
@@ -931,7 +976,6 @@ fn with_bound_from(
         Some(Expr::ReadReg(r)) => Some(*r),
         _ => None,
     });
-    let _ = GuestReg::Sp;
     Some(Table {
         cases,
         table: JumpTable {
@@ -940,6 +984,95 @@ fn with_bound_from(
             count: (hi - lo) as u32 + 1,
             index,
             complete: exact && !writable,
+        },
+    })
+}
+
+/// A jump through a table with no bound check anywhere the resolver can
+/// see: the compiler knew the index's range from elsewhere (an enum held in
+/// a global, a value range proved in another function). The cases are
+/// read best effort and the table is always **partial**, so the backend
+/// keeps the default edge: entries are read from index 0 while the table
+/// stays in read-only memory, moves by a fixed stride, and every target is
+/// code inside the function's `extent` (from the symbol table or its FDE).
+/// At least two entries must qualify.
+fn resolve_unbounded(
+    f: &Function,
+    defs: &Defs,
+    at: u64,
+    code: &Code,
+    max: u32,
+    extent: (u64, u64),
+) -> Option<Table> {
+    let b = f.block_at(at)?;
+    let FTerm::Unresolved { target } = f.block(b).term else {
+        return None;
+    };
+    let inside = |t: u64| t >= extent.0 && t < extent.1 && code.is_code(t);
+    let eval_at = |x: Value, k: u64| -> Option<(u64, Vec<(u64, u32)>, bool)> {
+        let mut ev = Eval {
+            defs,
+            code,
+            memo: HashMap::new(),
+            loads: Vec::new(),
+            writable: false,
+            assumed: false,
+        };
+        ev.memo.insert(x, Some(k));
+        let t = ev.eval(target, 0)?;
+        Some((t, ev.loads, ev.writable))
+    };
+    // The index: the nearest value feeding the target that is not a
+    // constant and makes the target a table read at indexes 0 and 1.
+    let mut seen = std::collections::HashSet::new();
+    let mut work = std::collections::VecDeque::from([target]);
+    let mut index = None;
+    while let Some(v) = work.pop_front() {
+        if !seen.insert(v) || seen.len() > 64 {
+            continue;
+        }
+        if v != target && fold(defs, v, 0).is_none() {
+            if let (Some((t0, l0, w0)), Some((t1, l1, w1))) = (eval_at(v, 0), eval_at(v, 1)) {
+                let moved = l0.iter().zip(&l1).find(|(a, b)| a.0 != b.0).map(|(a, b)| (a.0, b.0.wrapping_sub(a.0)));
+                if let Some((base, stride @ (1 | 2 | 4 | 8))) = moved {
+                    if inside(t0) && inside(t1) && !w0 && !w1 {
+                        index = Some((v, base, stride));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(e) = defs.expr.get(&v) {
+            e.for_each_use(|u| work.push_back(u));
+        }
+    }
+    let (x, base, stride) = index?;
+    let mut cases = Vec::new();
+    for k in 0..max as u64 {
+        let Some((t, loads, writable)) = eval_at(x, k) else { break };
+        // Still the same table: its entry moves by the stride.
+        let entry = base.wrapping_add(k * stride);
+        if writable || !inside(t) || !loads.iter().any(|l| l.0 == entry) {
+            break;
+        }
+        cases.push(t);
+    }
+    if cases.len() < 2 {
+        return None;
+    }
+    let index_reg = match defs.expr.get(&x) {
+        Some(Expr::ReadReg(r)) => Some(*r),
+        _ => None,
+    };
+    let count = cases.len() as u32;
+    Some(Table {
+        cases,
+        table: JumpTable {
+            base,
+            entry_bytes: stride as u32,
+            count,
+            index: index_reg,
+            complete: false,
         },
     })
 }

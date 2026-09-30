@@ -120,8 +120,20 @@ fn local_sets(b: &FBlock) -> (RegSet, RegSet) {
 
 /// Convert a memory-form function to SSA form. `call` says what each call
 /// preserves; pass `|_| CallEffect::UNKNOWN` when nothing is known.
+///
+/// The stack pointer is taken to be [`GuestReg::Sp`] (AArch64). An x86-64
+/// function keeps `rsp` in `X(4)`: use [`to_ssa_sp`] with that register, or
+/// [`CallEffect::sp_delta`] is applied to a register the code never uses
+/// and `rsp` is re-read after every call (sound, but less precise).
 pub fn to_ssa(f: &Function, call: &dyn Fn(Callee) -> CallEffect) -> Function {
+    to_ssa_sp(f, call, GuestReg::Sp)
+}
+
+/// [`to_ssa`] with the guest's stack-pointer register given: `sp` is the
+/// register a call's [`CallEffect::sp_delta`] applies to.
+pub fn to_ssa_sp(f: &Function, call: &dyn Fn(Callee) -> CallEffect, sp: GuestReg) -> Function {
     assert_eq!(f.form, Form::Memory, "to_ssa expects a memory-form function");
+    let spi = reg_index(sp);
     let mut f = f.clone();
     split_continuations(&mut f);
     let n = f.blocks.len();
@@ -165,7 +177,7 @@ pub fn to_ssa(f: &Function, call: &dyn Fn(Callee) -> CallEffect) -> Function {
             if let Some(eff) = effects[b.index()] {
                 out = out.inter(eff.preserved);
                 if eff.sp_delta.is_some() {
-                    out = out.union(live_in_sp(&f, blk, &live_in));
+                    out = out.union(live_in_sp(blk, &live_in, sp));
                 }
             }
             let (uses, kills) = local[b.index()];
@@ -223,7 +235,7 @@ pub fn to_ssa(f: &Function, call: &dyn Fn(Callee) -> CallEffect) -> Function {
             for s in f.block(b).succs() {
                 for i in 0..N_REGS {
                     let r = reg_of_index(i);
-                    if !eff.preserved.contains(r) || r == GuestReg::Sp {
+                    if !eff.preserved.contains(r) || r == sp {
                         def_blocks[i].push(s);
                     }
                 }
@@ -289,16 +301,16 @@ pub fn to_ssa(f: &Function, call: &dyn Fn(Callee) -> CallEffect) -> Function {
                 // Crossing a call or a syscall: what it does not preserve
                 // must be re-read.
                 if let Some(eff) = effects[p.index()] {
-                    let sp = s[31];
+                    let spv0 = s[spi];
                     for i in 0..N_REGS {
                         if !eff.preserved.contains(reg_of_index(i)) {
                             s[i] = None;
                         }
                     }
-                    s[31] = None;
-                    if let (Some(d), Some(spv)) = (eff.sp_delta, sp) {
+                    s[spi] = None;
+                    if let (Some(d), Some(spv)) = (eff.sp_delta, spv0) {
                         if d == 0 {
-                            s[31] = Some(spv);
+                            s[spi] = Some(spv);
                         } else {
                             let pc = f.block(b).start;
                             let c = f.fresh();
@@ -325,7 +337,7 @@ pub fn to_ssa(f: &Function, call: &dyn Fn(Callee) -> CallEffect) -> Function {
                             );
                             blk.pcs.insert(0, pc);
                             blk.pcs.insert(0, pc);
-                            s[31] = Some(sum);
+                            s[spi] = Some(sum);
                         }
                     }
                 }
@@ -457,14 +469,13 @@ pub fn to_ssa(f: &Function, call: &dyn Fn(Callee) -> CallEffect) -> Function {
 /// The stack pointer is live into a call's continuation whenever the
 /// continuation reads it, if the call's effect on it is known (it is then
 /// computed from the value before the call rather than re-read).
-fn live_in_sp(f: &Function, blk: &FBlock, live_in: &[RegSet]) -> RegSet {
+fn live_in_sp(blk: &FBlock, live_in: &[RegSet], sp: GuestReg) -> RegSet {
     let mut out = RegSet::EMPTY;
     for s in blk.succs() {
-        if live_in[s.index()].contains(GuestReg::Sp) {
-            out.insert(GuestReg::Sp);
+        if live_in[s.index()].contains(sp) {
+            out.insert(sp);
         }
     }
-    let _ = f;
     out
 }
 
