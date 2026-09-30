@@ -428,7 +428,9 @@ dependencies = [
 name = "gex-difffuzz"
 version = "0.0.1"
 dependencies = [
+ "gex-ir",
  "gex-isa",
+ "gex-lift",
 ]
 
 [[package]]
