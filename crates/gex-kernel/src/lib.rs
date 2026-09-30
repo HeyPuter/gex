@@ -29,6 +29,7 @@ pub mod tty;
 pub mod vfs;
 pub mod unix;
 pub mod x86;
+pub mod i386;
 
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};

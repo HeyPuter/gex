@@ -463,6 +463,15 @@ pub struct Kernel {
     pub retry_recvmsg: Option<(i32, u64, u64)>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
+    /// A 32-bit (i386) process: its code runs in compatibility mode, it
+    /// enters with `int 0x80`, and its numbering and structures are the i386
+    /// ones (see `crate::i386`). Set at exec from the image's class,
+    /// inherited across fork.
+    pub compat: bool,
+    /// The i386 process entered through the non-rt `sigreturn` (119), whose
+    /// frame is laid out differently from `rt_sigreturn`'s. Set at entry,
+    /// consumed by `sigreturn`.
+    pub sigreturn_legacy: bool,
     /// When this process began, on the guest's clock, so it can be asked how
     /// much time it has used. See [`Kernel::cpu_nanos`].
     ///
@@ -1049,6 +1058,8 @@ impl Kernel {
             place: None,
             armed_place: None,
             armed_pin: None,
+            compat: false,
+            sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
@@ -1196,6 +1207,8 @@ impl Kernel {
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let bytes_to_string = |b: Vec<u8>| String::from_utf8(b).map_err(|_| Errno::EINVAL);
         let path = bytes_to_string(m.read_cstr(a[0], 4096)?)?;
+        // A 32-bit process hands over vectors of 32-bit pointers.
+        let compat = self.compat;
         let read_vec = |mut p: u64| -> Result<Vec<String>, Errno> {
             let mut out = Vec::new();
             // A bound, because the vector is the guest's and its terminator
@@ -1204,12 +1217,12 @@ impl Kernel {
                 if p == 0 {
                     break;
                 }
-                let ptr = m.read_u64(p)?;
+                let ptr = if compat { m.read_u32(p)? as u64 } else { m.read_u64(p)? };
                 if ptr == 0 {
                     break;
                 }
                 out.push(bytes_to_string(m.read_cstr(ptr, 4096)?)?);
-                p += 8;
+                p += if compat { 4 } else { 8 };
             }
             Ok(out)
         };
@@ -1269,6 +1282,8 @@ impl Kernel {
             place: self.place.clone(),
             armed_place: None,
             armed_pin: None,
+            compat: self.compat,
+            sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
@@ -1339,7 +1354,10 @@ impl Kernel {
         m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
         m.write_u64(child + ctx::TID as u64, tid as u64)?;
         if flags & clone_flags::SETTLS != 0 {
-            m.write_u64(child + ctx::TPIDR as u64, tls)?;
+            // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
+            // one's base into %fs.
+            let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
+            m.write_u64(child + slot as u64, tls)?;
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
             m.write_u32(parent_tid, tid as u32)?;
@@ -1380,14 +1398,22 @@ impl Kernel {
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
-        let mut a: [u64; 6] = [
-            self.arg(m, 0),
-            self.arg(m, 1),
-            self.arg(m, 2),
-            self.arg(m, 3),
-            self.arg(m, 4),
-            self.arg(m, 5),
-        ];
+        let mut a: [u64; 6] = if self.compat {
+            let mut a = [0u64; 6];
+            for (i, slot) in crate::i386::ARG_SLOTS.iter().enumerate() {
+                a[i] = m.read_u64(self.ctx_addr + *slot as u64).unwrap_or(0) & 0xffff_ffff;
+            }
+            a
+        } else {
+            [
+                self.arg(m, 0),
+                self.arg(m, 1),
+                self.arg(m, 2),
+                self.arg(m, 3),
+                self.arg(m, 4),
+                self.arg(m, 5),
+            ]
+        };
         // The number's register doubles as the result register on x86-64, so
         // keep the raw number where a host can read it after the fact.
         if gex_abi::X86 {
@@ -1395,7 +1421,19 @@ impl Kernel {
         }
         // An x86-64 guest's numbering is translated to the canonical one, and
         // its legacy calls rewritten into the `*at`/extended forms.
-        let n = if gex_abi::X86 {
+        let mut post = crate::i386::Post::None;
+        let n = if gex_abi::X86 && self.compat {
+            let (n, p) = crate::i386::translate(
+                raw & 0xffff_ffff,
+                &mut a,
+                m,
+                self.ctx_addr + ctx::SCRATCH as u64,
+                self.ctx_addr,
+            );
+            post = p;
+            self.sigreturn_legacy = (raw & 0xffff_ffff) == crate::i386::raw::SIGRETURN;
+            n
+        } else if gex_abi::X86 {
             crate::x86::translate(
                 raw,
                 &mut a,
@@ -1602,6 +1640,15 @@ impl Kernel {
             return SyscallOutcome::Blocking(op);
         }
 
+        if self.trace && n == u64::MAX {
+            // The raw number, since the canonical one below says only "unknown".
+            eprintln!(
+                "[gex:{}] raw syscall {} ({}) has no canonical form",
+                self.pid,
+                raw & 0xffff_ffff,
+                if self.compat { "i386" } else { "native" }
+            );
+        }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
         let outcome = if gex_abi::X86 && n == crate::x86::UNKNOWN {
@@ -1618,7 +1665,10 @@ impl Kernel {
             self.dispatch(m, n, a)
         };
         let ret = match &outcome {
-            Ok(r) => encode(*r),
+            Ok(r) => match r {
+                Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
+                _ => encode(*r),
+            },
             Err(exit) => {
                 if self.trace {
                     eprintln!("[gex:{}] exit_group({exit})", self.pid);
@@ -2388,19 +2438,37 @@ impl Kernel {
         if signo == 0 || signo > signal::sig::MAX {
             return Err(Errno::EINVAL);
         }
+        // The i386 struct sigaction is { u32 handler; u32 flags; u32 restorer;
+        // u64 mask }, 20 bytes.
         if old != 0 {
             let a = self.signals.action(signo);
-            m.write_u64(old, a.handler)?;
-            m.write_u64(old + 8, a.flags)?;
-            m.write_u64(old + 16, a.restorer)?;
-            m.write_u64(old + 24, a.mask)?;
+            if self.compat {
+                m.write_u32(old, a.handler as u32)?;
+                m.write_u32(old + 4, a.flags as u32)?;
+                m.write_u32(old + 8, a.restorer as u32)?;
+                m.write_u64(old + 12, a.mask)?;
+            } else {
+                m.write_u64(old, a.handler)?;
+                m.write_u64(old + 8, a.flags)?;
+                m.write_u64(old + 16, a.restorer)?;
+                m.write_u64(old + 24, a.mask)?;
+            }
         }
         if act != 0 {
-            let a = SigAction {
-                handler: m.read_u64(act)?,
-                flags: m.read_u64(act + 8)?,
-                restorer: m.read_u64(act + 16)?,
-                mask: m.read_u64(act + 24)?,
+            let a = if self.compat {
+                SigAction {
+                    handler: m.read_u32(act)? as u64,
+                    flags: m.read_u32(act + 4)? as u64,
+                    restorer: m.read_u32(act + 8)? as u64,
+                    mask: m.read_u64(act + 12)?,
+                }
+            } else {
+                SigAction {
+                    handler: m.read_u64(act)?,
+                    flags: m.read_u64(act + 8)?,
+                    restorer: m.read_u64(act + 16)?,
+                    mask: m.read_u64(act + 24)?,
+                }
             };
             self.signals.set_action(signo, a)?;
         }
@@ -2460,17 +2528,32 @@ impl Kernel {
     }
 
     fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
+        // The 32-bit stack_t is { u32 sp; i32 flags; u32 size }.
         if old != 0 {
             let a = self.signals.alt_stack;
-            m.write_u64(old, a.sp)?;
-            m.write_u32(old + 8, a.flags)?;
-            m.write_u64(old + 16, a.size)?;
+            if self.compat {
+                m.write_u32(old, a.sp as u32)?;
+                m.write_u32(old + 4, a.flags)?;
+                m.write_u32(old + 8, a.size as u32)?;
+            } else {
+                m.write_u64(old, a.sp)?;
+                m.write_u32(old + 8, a.flags)?;
+                m.write_u64(old + 16, a.size)?;
+            }
         }
         if new != 0 {
-            self.signals.alt_stack = SigAltStack {
-                sp: m.read_u64(new)?,
-                flags: m.read_u32(new + 8)?,
-                size: m.read_u64(new + 16)?,
+            self.signals.alt_stack = if self.compat {
+                SigAltStack {
+                    sp: m.read_u32(new)? as u64,
+                    flags: m.read_u32(new + 4)?,
+                    size: m.read_u32(new + 8)? as u64,
+                }
+            } else {
+                SigAltStack {
+                    sp: m.read_u64(new)?,
+                    flags: m.read_u32(new + 8)?,
+                    size: m.read_u64(new + 16)?,
+                }
             };
         }
         Ok(0)
@@ -2487,7 +2570,7 @@ impl Kernel {
         if !self.signals.has_pending() {
             return Delivery::None;
         }
-        signal::dispatch(&mut self.signals, m, self.ctx_addr).unwrap_or(Delivery::None)
+        signal::dispatch(&mut self.signals, m, self.ctx_addr, self.compat).unwrap_or(Delivery::None)
     }
 
     /// Move signals other processes have sent into this one's pending set.
@@ -2560,7 +2643,14 @@ impl Kernel {
                 core: true,
             };
         }
-        match signal::setup_frame(&mut self.signals, m, self.ctx_addr, signo, fault_address) {
+        match signal::setup_frame(
+            &mut self.signals,
+            m,
+            self.ctx_addr,
+            signo,
+            fault_address,
+            self.compat,
+        ) {
             Ok(resume) => Delivery::Resume(resume),
             Err(_) => Delivery::Terminate {
                 signal: signo,
@@ -2571,7 +2661,8 @@ impl Kernel {
 
     /// Restore the context a handler frame captured.
     pub fn sigreturn(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
-        signal::sigreturn(&mut self.signals, m, self.ctx_addr)
+        let legacy = std::mem::replace(&mut self.sigreturn_legacy, false);
+        signal::sigreturn(&mut self.signals, m, self.ctx_addr, self.compat, legacy)
     }
 
     // -- path helpers --------------------------------------------------------
@@ -2738,20 +2829,31 @@ impl Kernel {
         Ok(copied)
     }
 
-    fn read_iovecs(m: &GuestMem<'_>, iov: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
+    fn read_iovecs(
+        m: &GuestMem<'_>,
+        iov: u64,
+        count: u64,
+        compat: bool,
+    ) -> Result<Vec<(u64, u64)>, Errno> {
         if count > 1024 {
             return Err(Errno::EINVAL);
         }
-        let mut out = Vec::with_capacity(count as usize);
+        let mut v = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let base = iov + i * 16;
-            out.push((m.read_u64(base)?, m.read_u64(base + 8)?));
+            // A 32-bit process's iovec is two 32-bit words.
+            if compat {
+                let base = iov + i * 8;
+                v.push((m.read_u32(base)? as u64, m.read_u32(base + 4)? as u64));
+            } else {
+                let base = iov + i * 16;
+                v.push((m.read_u64(base)?, m.read_u64(base + 8)?));
+            }
         }
-        Ok(out)
+        Ok(v)
     }
 
     fn sys_writev(&mut self, m: &GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        let vecs = Self::read_iovecs(m, iov, count)?;
+        let vecs = Self::read_iovecs(m, iov, count, self.compat)?;
         let file = self.fds.get(fd)?;
         let mut total = 0u64;
         for (base, len) in vecs {
@@ -2785,7 +2887,7 @@ impl Kernel {
     }
 
     fn sys_readv(&mut self, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        let vecs = Self::read_iovecs(m, iov, count)?;
+        let vecs = Self::read_iovecs(m, iov, count, self.compat)?;
         let file = self.fds.get(fd)?;
         let mut total = 0u64;
         for (base, len) in vecs {
@@ -3306,7 +3408,7 @@ impl Kernel {
 
     fn sys_fstat(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
         let md = self.fds.get(fd)?.metadata()?;
-        m.write(buf, &Self::stat_from(&md).encode())?;
+        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
         Ok(0)
     }
 
@@ -3329,7 +3431,7 @@ impl Kernel {
             self.vfs.metadata(&p)
         };
         let md = md?;
-        m.write(buf, &Self::stat_from(&md).encode())?;
+        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
         Ok(0)
     }
 
@@ -5499,7 +5601,7 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            gex_abi::ARCH_NAME,
+            if self.compat { "i686" } else { gex_abi::ARCH_NAME },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];

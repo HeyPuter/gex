@@ -347,6 +347,8 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
         format!("{xlate:?}").into_bytes(),
+        // The same bytes mean different instructions in 32-bit mode.
+        vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
         // different symbol tables translate differently.
         (image.symbols.len() as u64).to_le_bytes().into(),
@@ -406,6 +408,12 @@ fn run_program_with(
     inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
     let image = &program.exe;
+    // Before anything is translated: a 32-bit (i386) program's code is
+    // decoded in compatibility mode, and the kernel below speaks its ABI.
+    // One setting per host process -- the native runner keeps one translator
+    // for every guest process, so a mixed tree is not supported here (the
+    // browser has a shim per process).
+    gex_xlate::set_compat(program.compat());
 
     // A profile records where a previous run went, feeding `extra_entries` so
     // discovery reaches entry points static analysis cannot. It changes the
@@ -618,6 +626,12 @@ fn run_program_with(
         envp: opts.env.clone(),
         ..kernel
     };
+    // A 32-bit (i386) program: the kernel speaks its ABI and the translator
+    // decodes its code in compatibility mode, for this process and the ones
+    // it forks. One setting per host process: the native runner keeps one
+    // translator for every guest process, so a mixed tree is not supported
+    // here (the browser has a shim per process).
+    kernel.compat = program.compat();
     // Mounts survive an exec, so they are only established for a new process.
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;

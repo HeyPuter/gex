@@ -3,7 +3,11 @@
 use std::fmt;
 
 // ELF constants, named as in `elf.h`.
+const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
+/// `e_machine` of an i386 executable: the 32-bit program an x86-64 guest
+/// kernel runs in compatibility mode.
+const EM_386: u16 = 3;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
@@ -184,6 +188,7 @@ pub struct DynSym {
 pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> Image {
     Image {
         bias: 0,
+        class32: false,
         entry,
         segments: Vec::new(),
         phdr_vaddr,
@@ -212,6 +217,9 @@ pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> 
 pub struct Image {
     /// Load bias applied to every `p_vaddr` (zero for `ET_EXEC`).
     pub bias: u64,
+    /// A 32-bit (ELFCLASS32, i386) image: its code is decoded in
+    /// compatibility mode and its initial stack laid out with 4-byte words.
+    pub class32: bool,
     /// Guest entry point, already biased.
     pub entry: u64,
     pub segments: Vec<Segment>,
@@ -314,11 +322,19 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     if &data[0..4] != b"\x7fELF" {
         return Err(LoadError::NotElf);
     }
-    if r.u8(4)? != ELFCLASS64 || r.u8(5)? != ELFDATA2LSB {
+    if r.u8(5)? != ELFDATA2LSB {
         return Err(LoadError::NotElf64Le);
     }
+    // A 32-bit i386 image is accepted on the x86-64 guest only: it runs in
+    // the same process model as everything else, in compatibility mode.
+    let class32 = match r.u8(4)? {
+        ELFCLASS64 => false,
+        ELFCLASS32 if gex_abi::X86 => true,
+        _ => return Err(LoadError::NotElf64Le),
+    };
     let e_type = r.u16(16)?;
-    if r.u16(18)? != EM_GUEST {
+    let machine = r.u16(18)?;
+    if machine != if class32 { EM_386 } else { EM_GUEST } {
         return Err(LoadError::NotAarch64);
     }
     let pie = match e_type {
@@ -328,13 +344,29 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     };
     let bias = if pie { pie_base } else { 0 };
 
-    let e_entry = r.u64(24)?;
-    let e_phoff = r.u64(32)? as usize;
-    let e_shoff = r.u64(40)? as usize;
-    let e_phentsize = r.u16(54)? as usize;
-    let e_phnum = r.u16(56)? as usize;
-    let e_shentsize = r.u16(58)? as usize;
-    let e_shnum = r.u16(60)? as usize;
+    // The two header layouts differ only in the width of their address and
+    // offset fields.
+    let (e_entry, e_phoff, e_shoff, e_phentsize, e_phnum, e_shentsize, e_shnum) = if class32 {
+        (
+            r.u32(24)? as u64,
+            r.u32(28)? as usize,
+            r.u32(32)? as usize,
+            r.u16(42)? as usize,
+            r.u16(44)? as usize,
+            r.u16(46)? as usize,
+            r.u16(48)? as usize,
+        )
+    } else {
+        (
+            r.u64(24)?,
+            r.u64(32)? as usize,
+            r.u64(40)? as usize,
+            r.u16(54)? as usize,
+            r.u16(56)? as usize,
+            r.u16(58)? as usize,
+            r.u16(60)? as usize,
+        )
+    };
 
     let mut segments = Vec::new();
     let mut brk = 0u64;
@@ -349,16 +381,32 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     for i in 0..e_phnum {
         let off = e_phoff + i * e_phentsize;
         let p_type = r.u32(off)?;
-        let p_flags = r.u32(off + 4)?;
-        let p_offset = r.u64(off + 8)? as usize;
-        let p_vaddr = r.u64(off + 16)?;
-        let p_filesz = r.u64(off + 32)?;
-        let p_memsz = r.u64(off + 40)?;
+        // Elf32_Phdr: type, offset, vaddr, paddr, filesz, memsz, flags, align.
+        // Elf64_Phdr: type, flags, offset, vaddr, paddr, filesz, memsz, align.
+        let (p_flags, p_offset, p_vaddr, p_filesz, p_memsz, p_align) = if class32 {
+            (
+                r.u32(off + 24)?,
+                r.u32(off + 4)? as usize,
+                r.u32(off + 8)? as u64,
+                r.u32(off + 16)? as u64,
+                r.u32(off + 20)? as u64,
+                r.u32(off + 28)? as u64,
+            )
+        } else {
+            (
+                r.u32(off + 4)?,
+                r.u64(off + 8)? as usize,
+                r.u64(off + 16)?,
+                r.u64(off + 32)?,
+                r.u64(off + 40)?,
+                r.u64(off + 48)?,
+            )
+        };
 
         match p_type {
             PT_INTERP => interp = Some(r.cstr(p_offset)),
             PT_DYNAMIC => dynamic = Some((p_vaddr + bias, p_memsz)),
-            PT_TLS => tls = Some((p_vaddr + bias, p_filesz, p_memsz, r.u64(off + 48)?)),
+            PT_TLS => tls = Some((p_vaddr + bias, p_filesz, p_memsz, p_align)),
             PT_LOAD => {
                 let vaddr = p_vaddr + bias;
                 if vaddr.checked_add(p_memsz).is_none() || vaddr + p_memsz >= gex_abi::GUEST_LIMIT {
@@ -404,6 +452,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
 
     let mut image = Image {
         bias,
+        class32,
         entry: e_entry + bias,
         segments,
         phdr_vaddr,
@@ -427,7 +476,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         runpath: Vec::new(),
     };
 
-    if let Some((dyn_vaddr, dyn_size)) = dynamic {
+    if let (Some((dyn_vaddr, dyn_size)), false) = (dynamic, class32) {
         apply_relative_relocations(&mut image, dyn_vaddr, dyn_size);
         image.named_relocs = read_named_relocs(&image, dyn_vaddr, dyn_size);
         let (syms, relocs, inits) = read_dynamic(&image, dyn_vaddr, dyn_size);
@@ -436,8 +485,14 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         image.init_array = inits;
         read_needed(&mut image, dyn_vaddr, dyn_size);
     }
-    image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
-    image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
+    // The dynamic section and the section tables are read in their 64-bit
+    // layouts; a 32-bit image keeps only what its program headers say. Its
+    // programs are static (or Wine's, whose PE loader is not ours), so no
+    // relocation or symbol is lost that anything here would use.
+    if !class32 {
+        image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
+        image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
+    }
     Ok(image)
 }
 

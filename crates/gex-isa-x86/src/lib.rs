@@ -26,6 +26,38 @@ pub use decode::decode;
 /// Longest legal x86 instruction.
 pub const MAX_INST_BYTES: usize = 15;
 
+/// The processor mode the bytes are decoded in. gex runs a 64-bit Linux
+/// process, but a code segment inside it may be a 32-bit one -- a WoW64
+/// Wine's guest, or an i386 program -- and the same opcode bytes mean
+/// different things there: no REX, 32-bit default operand and stack widths,
+/// `mod=00 r/m=101` an absolute disp32 rather than RIP-relative, and every
+/// effective address wrapped at 32 bits.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// 64-bit long mode.
+    Long,
+    /// 32-bit compatibility (legacy protected) mode.
+    Compat,
+}
+
+static MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Set the mode every following `decode` uses. One per process: a whole
+/// i386 program is Compat; a mixed WoW64 process will need the mode carried
+/// per code segment, which is why `decode_in` exists beside `decode`.
+pub fn set_mode(m: Mode) {
+    MODE.store(m as u8, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process-wide mode `decode` assumes.
+pub fn mode() -> Mode {
+    if MODE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        Mode::Long
+    } else {
+        Mode::Compat
+    }
+}
+
 /// Operand width.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum Width {
