@@ -432,6 +432,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-difffuzz-x86"
+version = "0.0.1"
+
+[[package]]
 name = "gex-emit"
 version = "0.0.1"
 dependencies = [
@@ -467,6 +471,10 @@ version = "0.0.1"
 
 [[package]]
 name = "gex-isa"
+version = "0.0.1"
+
+[[package]]
+name = "gex-isa-x86"
 version = "0.0.1"
 
 [[package]]
@@ -507,6 +515,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-lift-x86"
+version = "0.0.1"
+dependencies = [
+ "gex-abi",
+ "gex-ir",
+ "gex-isa-x86",
+]
+
+[[package]]
 name = "gex-mem"
 version = "0.0.1"
 dependencies = [
@@ -524,7 +541,6 @@ dependencies = [
  "gex-gpu",
  "gex-kernel",
  "gex-ld",
- "gex-lift",
  "gex-mem",
  "gex-virgl",
  "gex-wayland",
@@ -548,8 +564,10 @@ dependencies = [
  "gex-emit",
  "gex-ir",
  "gex-isa",
+ "gex-isa-x86",
  "gex-ld",
  "gex-lift",
+ "gex-lift-x86",
 ]
 
 [[package]]
@@ -568,9 +586,7 @@ dependencies = [
  "gex-abi",
  "gex-emit",
  "gex-ir",
- "gex-isa",
  "gex-ld",
- "gex-lift",
  "gex-native",
  "gex-xlate",
 ]

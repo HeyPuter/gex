@@ -1,0 +1,11 @@
+[package]
+name = "gex-lift-x86"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "x86-64 instruction semantics in GIR for gex"
+
+[dependencies]
+gex-abi = { workspace = true }
+gex-ir = { workspace = true }
+gex-isa-x86 = { workspace = true }

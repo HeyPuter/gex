@@ -1,0 +1,8 @@
+[package]
+name = "gex-isa-x86"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "x86-64 instruction decoder for gex"
+
+[dependencies]
