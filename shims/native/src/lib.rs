@@ -1415,8 +1415,12 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
             }
             // Through the table, so this process's own children -- if any are
-            // still running -- become init's rather than being lost.
-            procs.exit(pid, code);
+            // still running -- become init's rather than being lost. The table
+            // publishes into the same cell `wait4` collects from, so it gets
+            // the kernel's encoding: handing it `code` and correcting the cell
+            // afterwards let a parent parked in `wait4` read `exit 7` as a
+            // death by signal 7 ("Bus error") in between.
+            procs.exit(pid, wstatus);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
             done.notify_all();
