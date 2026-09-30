@@ -1368,7 +1368,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // `fork` returns zero in the child, and a clone that named a stack
         // starts on it.
         let mut gm = GuestMem::new(dst);
-        let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+        let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if req.child_stack != 0 {
             let _ = gm.write_u64(ctx_addr + ctx::SP as u64, req.child_stack);
         }

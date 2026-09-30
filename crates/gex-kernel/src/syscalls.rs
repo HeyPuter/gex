@@ -189,6 +189,20 @@ pub mod nr {
 }
 
 /// `*at` calls use this to mean "relative to the current directory".
+/// Hand a system call's result back to the guest: `x0`, or `rax` (both
+/// `x(0)`), or on PowerPC r3 with an error as a positive errno and CR0.SO
+/// set (docs/ppc.md §6). `ret` is the kernel's own convention, `-errno` for
+/// a failure. Every place a result is written goes through here.
+pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), Errno> {
+    if gex_abi::PPC {
+        let err = (-4095..0).contains(&(ret as i64));
+        let v = if err { (ret as i64).wrapping_neg() as u64 } else { ret & 0xffff_ffff };
+        m.write_u64(ctx_addr + ctx::SYSCALL_RET as u64, v)?;
+        return m.write(ctx_addr + (ctx::PPC_CR + 3) as u64, &[err as u8]);
+    }
+    m.write_u64(ctx_addr + ctx::x(0) as u64, ret)
+}
+
 const AT_FDCWD: i32 = -100;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -1350,7 +1364,7 @@ impl Kernel {
             let v = m.read_u64(parent + off as u64)?;
             m.write_u64(child + off as u64, v)?;
         }
-        m.write_u64(child + ctx::x(0) as u64, 0)?;
+        set_result(m, child, 0)?;
         m.write_u64(child + ctx::SP as u64, child_stack)?;
         m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
         m.write_u64(child + ctx::TID as u64, tid as u64)?;
@@ -1490,7 +1504,7 @@ impl Kernel {
                 // CAD_OFF, CAD_ON, SW_SUSPEND, KEXEC: nothing to do, and a
                 // failure would be reported by an init that can carry on.
                 _ => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, 0);
+                    let _ = set_result(m, self.ctx_addr, 0);
                     return SyscallOutcome::Continue;
                 }
             };
@@ -1509,7 +1523,7 @@ impl Kernel {
                     SyscallOutcome::Exec { path, argv, envp }
                 }
                 Err(e) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
                     SyscallOutcome::Continue
                 }
             };
@@ -1539,14 +1553,14 @@ impl Kernel {
                 Some(t) => t,
                 None => {
                     let _ =
-                        m.write_u64(self.ctx_addr + ctx::x(0) as u64, Errno::EFAULT.as_return());
+                        set_result(m, self.ctx_addr, Errno::EFAULT.as_return());
                     return SyscallOutcome::Continue;
                 }
             };
             let sp = stack.wrapping_add(stack_size);
             if flags & clone_flags::THREAD == 0 {
                 let pid = self.procs.spawn(self.pid);
-                let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
+                let _ = set_result(m, self.ctx_addr, pid as u64);
                 return SyscallOutcome::SpawnProcess {
                     pid,
                     child_stack: sp,
@@ -1556,7 +1570,7 @@ impl Kernel {
             let ca = [flags, sp, parent_tid, tls, child_tid, 0];
             return match self.sys_clone(m, ca) {
                 Ok(req) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, req.tid as u64);
+                    let _ = set_result(m, self.ctx_addr, req.tid as u64);
                     SyscallOutcome::SpawnThread {
                         ctx_addr: req.ctx_addr,
                         tid: req.tid,
@@ -1564,7 +1578,7 @@ impl Kernel {
                     }
                 }
                 Err(e) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
                     SyscallOutcome::Continue
                 }
             };
@@ -1575,7 +1589,7 @@ impl Kernel {
             let pid = self.procs.spawn(self.pid);
             // The parent sees the child's pid; the child sees zero, which the
             // host writes into the copy it makes.
-            let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
+            let _ = set_result(m, self.ctx_addr, pid as u64);
             if self.trace {
                 eprintln!(
                     "[gex] clone(flags={:#x}, stack={:#x}) = {pid} (new process)",
@@ -1591,7 +1605,7 @@ impl Kernel {
         if n == nr::CLONE {
             return match self.sys_clone(m, a) {
                 Ok(req) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, req.tid as u64);
+                    let _ = set_result(m, self.ctx_addr, req.tid as u64);
                     if self.trace {
                         eprintln!("[gex:{}] clone(...) = {} (new thread)", self.pid, req.tid);
                     }
@@ -1602,7 +1616,7 @@ impl Kernel {
                     }
                 }
                 Err(e) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
                     if self.trace {
                         eprintln!("[gex:{}] clone(...) = {}", self.pid, -(e.0 as i64));
                     }
@@ -1689,7 +1703,7 @@ impl Kernel {
                 ret as i64
             );
         }
-        let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
+        let _ = set_result(m, self.ctx_addr, ret);
 
         // A syscall boundary is a safepoint: the context is complete, so a
         // pending signal can be delivered precisely here.
@@ -2023,7 +2037,7 @@ impl Kernel {
         // signal that ended the wait, leaving it pending forever.
         let suspended = self.restore_sigmask.take();
         let ret = encode(r);
-        let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
+        let _ = set_result(m, self.ctx_addr, ret);
         if let Some(mask) = suspended {
             self.signals.suspend_restore = Some(mask);
         }

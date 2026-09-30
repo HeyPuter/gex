@@ -5978,8 +5978,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     // cannot place. `ENOEXEC` is what the guest expects.
                     let mut gm = GuestMem::new(guest_bytes());
                     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
-                    let _ = gm.write_u64(
-                        ctx_addr + ctx::x(0) as u64,
+                    let _ = gex_kernel::syscalls::set_result(
+                        &mut gm,
+                        ctx_addr,
                         Errno::ENOEXEC.as_return(),
                     );
                     0
@@ -6721,7 +6722,7 @@ pub extern "C" fn gex_adopt_child(
     {
         let mut gm = GuestMem::new(guest_bytes());
         // What `fork` returns in the child.
-        let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+        let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if sp != 0 {
             // `posix_spawn` clones onto a stack it allocated; a plain `fork`
             // passes zero and keeps the parent's.
@@ -8746,7 +8747,7 @@ fn schedule() -> i32 {
                     h.kernel.pid,
                 ));
                 let mut gm = GuestMem::new(guest_bytes());
-                let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+                let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
                 ftx_note(!0, 0, 0, t.pc, t.kstate.tid);
             }
             let (mut pc, kstate) = (t.pc, t.kstate.clone());
