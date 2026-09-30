@@ -169,22 +169,58 @@ A replacement serves a guest function with a user wasm function. In
 {
   "replace": [
     { "object": "ack", "sha256": "sha256:3c1f...", "symbol": "ack",
-      "export": "my_ack", "abi": "c" }
+      "export": "my_ack", "abi": "c" },
+    { "import": "getenv", "object": "gzip", "export": "my_getenv" },
+    { "library": "libSDL2-2.0.so.0", "wasm": "user/sdl2.wasm", "prefix": "" }
   ]
 }
 ```
 
+Each entry names what it replaces in exactly one of four ways:
+
+| Target | Binds | Staleness check |
+| --- | --- | --- |
+| `"symbol": "f"` | the function `f` defines in `object`, at its definition: direct calls, PLT calls through the GOT, pointers, tail calls | `sha256` (the object) and `bytes` (the function), each if given |
+| `"offset": "0x...", "size": "0x..."` | the function at that link-time address of `object`, for a stripped object | `bytes` required, `sha256` if given |
+| `"import": "f"` | `object`'s PLT stub for `f` (every object's, with no `object`): only that importer's calls; the definition is untouched | `sha256` if given |
+| `"library": "libX.so"` | every function the library exports, each served by the module's export of the same name (after `prefix`) | `sha256` if given |
+
 | Field | Meaning |
 | --- | --- |
-| `object` | The object defining the function: its guest path, or its file name when that is unambiguous. |
-| `sha256` | The object's hash (from `gex-project.json`). Required. If the object changes, the build fails and names the stale replacement instead of binding it to a function that may have changed. |
-| `symbol` | The function's symbol. It must name exactly one function in the object's text. |
-| `export` | The wasm function (default: `symbol`). |
+| `object` | The object: its guest path, file name or soname. |
+| `sha256` | The object's hash, from `gex-project.json`. If the object changes, the build fails and names the stale replacement instead of binding it to a function that may have changed. |
+| `bytes` | `sha256:` of the replaced function's own bytes (`[address, address + size)`, `size` from the symbol table or the entry). Catches a changed function in a changed object, and keeps an `offset` from binding to whatever moved there. |
+| `export` | The wasm function (default: the symbol; `fn_<offset>` for an offset). |
+| `prefix` | For a library: what the module's export names start with. |
 | `wasm` | The module, relative to the project (default `build/user.wasm`, which `build.sh` compiles from `user/src/*.c`). Any producer's module works if it meets the rules below. |
 | `abi` | `"c"` (default) or `"ctx"`. |
 
-**How it is bound.** The build puts `Intrinsic::Replace(id)` at the symbol's
-address, which generalises gex's `memcpy`-style intrinsics
+`gexc eject override <project> <object> <symbol|0xoffset> [--size N]`
+prints a checked entry, with both hashes filled in:
+
+```text
+$ gexc eject override . ack 0x1011720 --size 0x60
+{
+  "object": "ack",
+  "sha256": "sha256:723b0a60...",
+  "offset": "0x1011720",
+  "size": "0x60",
+  "bytes": "sha256:934f6a41...",
+  "export": "fn_1011720",
+  "abi": "c"
+}
+```
+
+**Swapping a whole library.** `{"library": "libsq.so"}` binds every
+function the library exports. A function the module does not provide is
+bound to a placeholder that stops the run naming it, when (and only when) it
+is called, like pewasm's aborting import placeholders; the build lists them.
+An IFUNC export fails the build (its address is a resolver). The library
+itself is still loaded, so `ld.so` resolves against it and its initialisers
+run; none of its exported functions' code does.
+
+**How it is bound.** The build puts `Intrinsic::Replace(id)` at the bound
+address (the definition, or for an import the PLT stub), which generalises gex's `memcpy`-style intrinsics
 (`gex-xlate/src/intrinsic.rs`) from a fixed set of wasm instructions to any
 user function. That block is one host call, `sysreg_write(pc,
 REPLACE_SYSREG, id)`, and a return. So every way of reaching the address runs
@@ -243,6 +279,8 @@ freestanding.
 | corpus `ack 3` | the program's `ack` | `"c"` | 8 | same `result`; kernel 79 ms → 9 ms (AArch64) |
 | corpus `strings 3` | musl's `strtol` (and its alias `strtoll`) | `"ctx"`, writes `*endptr` itself | 720,000 | same `result` |
 | host `gzip -9` (x86-64, dynamic glibc) | glibc's `getenv`, called through gzip's PLT | `"c"` | 2 | same bytes |
+| a program linked against `libsq.so` (x86-64) | the whole library (`sq`, `cube`; `unused_fn` left missing) | `"c"` | 10 + 10 | 2310 → 2330; dropping `cube` from the module stops the run at its first call, naming it |
+| the same | only the program's import of `sq` | `"c"` | 10 | 2320 |
 
 The first:
 
@@ -273,10 +311,9 @@ uint32_t my_ack_calls(void) { return calls; }
   static program the session also ran works (its image module is found by
   identity); an exec'd *dynamic* program gets no closure modules, so its
   interpreter's first block misses loudly.
-- **Replacements are by definition, not by import.** A replacement names the
-  object that defines the function. Replacing an import of an object that is
-  not in the closure (a whole library swapped out, as the Noita port swaps
-  SDL2) needs PLT-slot binding: v1.
+- **Import binding is PLT stubs.** A call through the GOT without a PLT
+  (`-fno-plt`) or a function pointer loaded from the GOT is not an import
+  binding's; bind the definition (or the library) for those.
 - **One ISA per gexc**, as everywhere in gex: eject a session with the gexc
   that ran it (`gexc` for AArch64, the `x86` build for x86-64 and i386).
 - **The runtime is the whole gexc.** Syscalls, subsystems and the translator

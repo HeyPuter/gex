@@ -194,6 +194,28 @@ fn eject_build_run_and_replace() {
     assert_eq!(r.replacements[0].addr, BASE + CODE + program().1);
     assert_eq!(run::run(&p, &flags).unwrap(), Exit::Status(42));
 
+    // The same function by offset, with the hash of its bytes: what
+    // `gexc eject override` prints for a stripped object.
+    let off = BASE + CODE + program().1;
+    let entry = build::describe(&p, "prog", &format!("{off:#x}"), Some(program().0.len() as u64 - program().1))
+        .unwrap()
+        .replace(&format!("\"fn_{off:x}\""), "\"add\"")
+        .replace("\"abi\"", "\"wasm\": \"user/add.wasm\", \"abi\"");
+    std::fs::write(p.join("user/eject.json"), format!("{{\"replace\": [{entry}]}}")).unwrap();
+    let r = build::build(&p).unwrap();
+    assert_eq!((r.replacements[0].kind.as_str(), r.replacements[0].addr), ("offset", off));
+    assert_eq!(run::run(&p, &flags).unwrap(), Exit::Status(42));
+    // A function whose bytes changed is reported, not bound.
+    let hash = entry.split("\"bytes\": \"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    std::fs::write(
+        p.join("user/eject.json"),
+        format!("{{\"replace\": [{}]}}", entry.replace(&hash, "sha256:00")),
+    )
+    .unwrap();
+    let e = format!("{:#}", build::build(&p).unwrap_err());
+    assert!(e.contains("stale") && e.contains(&hash), "{e}");
+    std::fs::write(p.join("user/eject.json"), &config).unwrap();
+
     // A re-eject keeps user/ and drops the build.
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
     assert_eq!(std::fs::read_to_string(p.join("user/eject.json")).unwrap(), config);

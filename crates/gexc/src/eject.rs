@@ -12,6 +12,11 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build]
                                    and a launcher (docs/eject.md)
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
+  gexc eject override <project> <object> <symbol|0xoffset> [--size N]
+                                   print a user/eject.json replacement entry
+                                   for a function, with the object's hash and
+                                   the function's bytes' hash, so a changed
+                                   binary is reported instead of mis-bound
   gexc eject run <project> [--jit-fallback] [--strace] [--verbose] [--] [args...]
                                    run it natively (the project's run.sh); code
                                    the build never saw fails loudly unless
@@ -54,6 +59,30 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 flags.args = Some(rest);
             }
             Ok(Some(gex_eject::run::run(&dir, &flags)?))
+        }
+        Some("override") => {
+            // gexc eject override <project> <object> <symbol|0xoffset> [--size N]
+            let mut pos = Vec::new();
+            let mut size = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--size" {
+                    i += 1;
+                    let v = args.get(i).context("--size needs a number")?;
+                    size = Some(match v.strip_prefix("0x") {
+                        Some(h) => u64::from_str_radix(h, 16)?,
+                        None => v.parse()?,
+                    });
+                } else {
+                    pos.push(args[i].clone());
+                }
+                i += 1;
+            }
+            let [dir, object, what] = pos.as_slice() else {
+                bail!("gexc eject override <project> <object> <symbol|0xoffset> [--size N]");
+            };
+            print!("{}", gex_eject::build::describe(std::path::Path::new(dir), object, what, size)?);
+            Ok(None)
         }
         Some("decompile") => bail!("gexc eject decompile: not yet (eject v1, with the function tier)"),
         Some(_) => {
@@ -116,7 +145,8 @@ fn build(dir: &std::path::Path) -> Result<()> {
     for i in &r.images {
         eprintln!("  {:<40} {:>7} blocks {:>7} KiB  {}", i.path, i.blocks, i.bytes / 1024, i.module);
     }
-    for x in &r.replacements {
+    let missing = r.replacements.iter().filter(|x| x.missing).count();
+    for x in r.replacements.iter().filter(|x| !x.missing) {
         eprintln!(
             "  replace {} at {:#x} with {}:{} ({}, {})",
             x.symbol,
@@ -125,6 +155,13 @@ fn build(dir: &std::path::Path) -> Result<()> {
             x.export,
             x.abi.name(),
             x.sig
+        );
+    }
+    if missing > 0 {
+        eprintln!(
+            "  {missing} functions of replaced libraries have no replacement and fail loudly if \
+             called: {}",
+            r.replacements.iter().filter(|x| x.missing).map(|x| x.symbol.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
     if r.illegal_blocks > 0 {

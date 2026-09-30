@@ -48,6 +48,7 @@ pub fn aot(dir: &Path, manifest: &BuildManifest) -> Aot {
             symbol: r.symbol.clone(),
             addr: r.addr,
             calls: Default::default(),
+            missing: r.missing,
         });
     }
     aot.modules = modules.iter().map(|m| dir.join(m)).collect();
@@ -116,7 +117,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
     };
     let (exit, _) = gex_native::run_program(&program, &opts, &gex_xlate::Options::default())?;
     if flags.verbose {
-        for r in &aot.replacements {
+        for r in aot.replacements.iter().filter(|r| r.calls.load(std::sync::atomic::Ordering::Relaxed) > 0 || !r.missing) {
             eprintln!(
                 "[gex-eject] {} at {:#x} -> {}: {} calls",
                 r.symbol,

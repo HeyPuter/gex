@@ -87,6 +87,9 @@ pub struct Replacement {
     pub addr: u64,
     /// How many times it ran, over every thread and process of the run.
     pub calls: Arc<std::sync::atomic::AtomicU64>,
+    /// A function of a replaced library the module does not provide: calling
+    /// it stops the run, naming it (pewasm's aborting placeholder).
+    pub missing: bool,
 }
 
 /// What an ejected project gives the runtime. See the module comment.
@@ -331,6 +334,18 @@ const FP_ARGS: u8 = 8;
 /// report. Everything wrong is an error: a replacement that half-works is the
 /// silent misbehaviour this exists to avoid.
 pub fn check_replacement(wasm: &[u8], name: &str, abi: Abi) -> Result<String> {
+    ReplacementModule::inspect(wasm)?.check(name, abi)
+}
+
+/// A replacement module, checked once: that it can run here, and what it
+/// exports. [`ReplacementModule::check`] then checks each export a build
+/// binds, without compiling the module again for each.
+pub struct ReplacementModule {
+    module: Module,
+}
+
+impl ReplacementModule {
+    pub fn inspect(wasm: &[u8]) -> Result<ReplacementModule> {
     let engine = Engine::new(&engine_config()).context("creating a wasm engine")?;
     let module = Module::new(&engine, wasm).context("not a valid wasm module for this runtime")?;
     let mut imports_memory = false;
@@ -375,6 +390,17 @@ pub fn check_replacement(wasm: &[u8], name: &str, abi: Abi) -> Result<String> {
             ),
         }
     }
+        Ok(ReplacementModule { module })
+    }
+
+    /// Whether the module exports a function called `name`.
+    pub fn has(&self, name: &str) -> bool {
+        self.module.exports().any(|e| e.name() == name && matches!(e.ty(), ExternType::Func(_)))
+    }
+
+    /// Check that `name` is an export `abi` can call; its signature.
+    pub fn check(&self, name: &str, abi: Abi) -> Result<String> {
+    let module = &self.module;
     let ty = module
         .exports()
         .find(|e| e.name() == name)
@@ -429,6 +455,7 @@ pub fn check_replacement(wasm: &[u8], name: &str, abi: Abi) -> Result<String> {
         }
     }
     Ok(sig)
+    }
 }
 
 /// The engine features translated code and replacements both need.
@@ -443,7 +470,8 @@ fn engine_config() -> wasmtime::Config {
 
 /// Replacement instances in one store (one guest thread).
 pub(crate) struct StoreRepl {
-    funcs: Vec<Func>,
+    /// By replacement id; `None` for a missing one.
+    funcs: Vec<Option<Func>>,
 }
 
 /// The stack top for replacement code on the thread whose context is at
@@ -486,10 +514,14 @@ fn instantiate(caller: &mut Caller<'_, HostState>, aot: &Aot) -> Result<StoreRep
     }
     let mut funcs = Vec::new();
     for r in &aot.replacements {
+        if r.missing {
+            funcs.push(None);
+            continue;
+        }
         let f = instances[r.module]
             .get_func(&mut *caller, &r.export)
             .ok_or_else(|| anyhow!("{} exports no `{}`", aot.modules[r.module].display(), r.export))?;
-        funcs.push(f);
+        funcs.push(Some(f));
     }
     Ok(StoreRepl { funcs })
 }
@@ -510,11 +542,25 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
         .get(id as usize)
         .ok_or_else(|| anyhow!("replacement #{id} at {pc:#x} is not in {}", aot.label))?;
     r.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if r.missing {
+        caller.data_mut().exit = Some(super::Exit::Signal {
+            signal: super::signal::SIGSEGV,
+            pc,
+            detail: format!(
+                "gex-eject: {} (at {pc:#x}) belongs to a library {} replaced, and the \
+                 replacement module has no `{}`: add it and rebuild",
+                r.symbol, aot.label, r.export
+            ),
+            internal: true,
+        });
+        return Err(super::StopExecution.into());
+    }
     if caller.data().repl.is_none() {
         let s = instantiate(caller, &aot)?;
         caller.data_mut().repl = Some(s);
     }
-    let func = caller.data().repl.as_ref().unwrap().funcs[id as usize];
+    let func = caller.data().repl.as_ref().unwrap().funcs[id as usize]
+        .ok_or_else(|| anyhow!("internal: replacement #{id} has no function"))?;
     let memory = caller
         .data()
         .memory
