@@ -16,6 +16,8 @@
 pub mod bitmap;
 pub mod blit;
 pub mod dc;
+pub mod region;
+pub mod surface;
 
 use super::user::{handle_ret, window::Rect, R64};
 use super::{off, st, sysno, Call, Status, R};
@@ -108,6 +110,9 @@ pub struct Gdi {
     free: Vec<u32>,
     /// DC_ATTR slots: guest memory handed out one DC at a time.
     pub attr_pool: Vec<u64>,
+    /// GetSysColorBrush's brushes, made on first use; like stock objects
+    /// they cannot be deleted.
+    pub sys_brushes: HashMap<u32, u32>,
 }
 
 impl Default for Gdi {
@@ -119,6 +124,7 @@ impl Default for Gdi {
             next_unused: FIRST_HANDLE,
             free: Vec::new(),
             attr_pool: Vec::new(),
+            sys_brushes: HashMap::new(),
         }
     }
 }
@@ -304,6 +310,7 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtGdiGetDCObject => dc::nt_gdi_get_dc_object(c),
         n::NtGdiGetDeviceCaps => dc::nt_gdi_get_device_caps(c),
         n::NtGdiGetDCDword => dc::nt_gdi_get_dc_dword(c),
+        n::NtGdiGetAndSetDCDword => dc::nt_gdi_get_and_set_dc_dword(c),
         n::NtGdiSaveDC => dc::nt_gdi_save_dc(c),
         n::NtGdiRestoreDC => dc::nt_gdi_restore_dc(c),
         n::NtGdiStretchDIBitsInternal => blit::nt_gdi_stretch_dibits_internal(c),
@@ -314,8 +321,41 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtGdiGetPixel => blit::nt_gdi_get_pixel(c),
         n::NtGdiSetPixel => blit::nt_gdi_set_pixel(c),
         n::NtGdiFlush => Ok(1),
+        // Transforms are read from the DC_ATTR at each draw.
+        n::NtGdiComputeXformCoefficients => Ok(1),
+        n::NtGdiCreateRectRgn => region::nt_gdi_create_rect_rgn(c),
+        n::NtGdiSetRectRgn => region::nt_gdi_set_rect_rgn(c),
+        n::NtGdiGetRgnBox => region::nt_gdi_get_rgn_box(c),
+        n::NtGdiCombineRgn => region::nt_gdi_combine_rgn(c),
+        n::NtGdiOffsetRgn => region::nt_gdi_offset_rgn(c),
+        n::NtGdiEqualRgn => region::nt_gdi_equal_rgn(c),
+        n::NtGdiPtInRegion => region::nt_gdi_pt_in_region(c),
+        n::NtGdiGetRegionData => region::nt_gdi_get_region_data(c),
+        n::NtGdiExtCreateRegion => region::nt_gdi_ext_create_region(c),
+        n::NtGdiGetAppClipBox => region::nt_gdi_get_app_clip_box(c),
+        n::NtGdiExtSelectClipRgn => region::nt_gdi_ext_select_clip_rgn(c),
+        n::NtGdiIntersectClipRect => region::nt_gdi_intersect_clip_rect(c),
+        n::NtGdiExcludeClipRect => region::nt_gdi_exclude_clip_rect(c),
+        n::NtGdiOffsetClipRgn => region::nt_gdi_offset_clip_rgn(c),
+        n::NtGdiGetRandomRgn => region::nt_gdi_get_random_rgn(c),
+        n::NtGdiFillRgn => region::nt_gdi_fill_rgn(c),
         nr => Err(c.unimplemented(&format!("win32u {} ({nr:#x})", super::syscall_name(nr)))),
     }
+}
+
+/// GetSysColorBrush(index): a solid brush of the system color, kept.
+pub fn sys_color_brush(c: &mut Call<'_>, index: u32) -> R<u32> {
+    ensure_init(c)?;
+    if index > 30 {
+        return Ok(0);
+    }
+    if let Some(&h) = c.p.gdi.lock().unwrap().sys_brushes.get(&index) {
+        return Ok(h);
+    }
+    let color = super::user::sysparams::sys_color(index as i32);
+    let h = alloc(c, Obj::Brush(Brush { style: 0, color, hatch: 0, pattern: None }))?;
+    c.p.gdi.lock().unwrap().sys_brushes.insert(index, h);
+    Ok(h)
 }
 
 /// `NtGdiCreateSolidBrush(color, brush)`.
@@ -360,7 +400,7 @@ fn nt_gdi_delete_object_app(c: &mut Call<'_>) -> R64 {
             None => return Ok(0),
         }
     };
-    if idx < FIRST_HANDLE + 24 {
+    if idx < FIRST_HANDLE + 24 || c.p.gdi.lock().unwrap().sys_brushes.values().any(|&b| b & 0xffff == idx) {
         return Ok(1);
     }
     // A DC selected into nothing goes; a bitmap selected into a DC stays

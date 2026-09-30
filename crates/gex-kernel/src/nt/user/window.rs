@@ -187,6 +187,16 @@ pub struct Window {
     pub dpi_context: u32,
     pub menu: u64,
     pub destroying: bool,
+    /// What needs repainting, in client coordinates (empty: nothing), and
+    /// whether WM_ERASEBKGND is still owed for it ([`super::paint`]).
+    pub update: Rect,
+    pub erase: bool,
+    /// RedrawWindow(RDW_INTERNALPAINT): a WM_PAINT without an update region.
+    pub internal_paint: bool,
+    /// A top-level window's surface: a GDI bitmap handle, 0 until drawn to.
+    pub surface: u32,
+    /// The window's own DC (CS_OWNDC), 0 until asked for.
+    pub own_dc: u32,
 }
 
 /// The window `hwnd` names (a full or a 16-bit handle).
@@ -333,6 +343,11 @@ fn create_bare(u: &mut User, class_proc: usize, parent: u32, rect: Rect, style: 
             dpi_context: 0,
             menu: 0,
             destroying: false,
+            update: Rect::default(),
+            erase: false,
+            internal_paint: false,
+            surface: 0,
+            own_dc: 0,
         },
     );
     if let Some(p) = u.windows.get_mut(&parent) {
@@ -522,6 +537,11 @@ pub fn nt_user_create_window_ex(c: &mut Call<'_>) -> R64 {
                 dpi_context: 0,
                 menu: if child { 0 } else { menu },
                 destroying: false,
+                update: Rect::default(),
+                erase: false,
+                internal_paint: false,
+                surface: 0,
+                own_dc: 0,
             },
         );
         if let Some(p) = u.windows.get_mut(&parent) {
@@ -711,6 +731,8 @@ pub fn destroy_window(c: &mut Call<'_>, hwnd: u32) -> R<()> {
     if is_window(c, hwnd) {
         winproc::send_message(c, hwnd, wm::NCDESTROY, 0, 0, Pack::None)?;
     }
+    let (surface, own_dc) = c.p.user.lock().unwrap().windows.get(&hwnd).map(|w| (w.surface, w.own_dc)).unwrap_or((0, 0));
+    super::paint::window_destroyed(c, surface, own_dc)?;
     let mut u = c.p.user.lock().unwrap();
     if let Some(w) = u.windows.remove(&hwnd) {
         if let Some(p) = u.windows.get_mut(&w.parent) {
@@ -897,6 +919,13 @@ pub fn set_window_pos(c: &mut Call<'_>, hwnd: u32, after: u32, x: i32, y: i32, c
         }
     }
     let _ = parent;
+    // What became visible or changed size is repainted whole.
+    let now_visible = c.p.user.lock().unwrap().windows.get(&hwnd).is_some_and(|w| w.style & ws::VISIBLE != 0);
+    if now_visible
+        && (flags & swp::SHOWWINDOW != 0 || (flags & swp::NOREDRAW == 0 && (new_wr.width(), new_wr.height()) != (old_wr.width(), old_wr.height())))
+    {
+        super::paint::window_exposed(c, hwnd);
+    }
     // Activation.
     if flags & (swp::NOACTIVATE | swp::HIDEWINDOW) == 0 && style & ws::CHILD == 0 {
         set_active_window(c, hwnd, false)?;

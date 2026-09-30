@@ -12,6 +12,7 @@ pub struct Saved {
     brush: u32,
     pen: u32,
     font: u32,
+    clip: Option<Vec<Rect>>,
 }
 
 #[derive(Clone, Debug)]
@@ -28,8 +29,8 @@ pub struct Dc {
     pub pen: u32,
     pub font: u32,
     pub palette: u32,
-    /// The clip rectangle (device coordinates), if any.
-    pub clip: Option<Rect>,
+    /// The clip region (device coordinates, disjoint rectangles), if any.
+    pub clip: Option<Vec<Rect>>,
     pub saved: Vec<Saved>,
     /// The pixel format a window DC's window was given (SetPixelFormat).
     pub pixel_format: i32,
@@ -278,10 +279,55 @@ pub fn nt_gdi_get_dc_dword(c: &mut Call<'_>) -> R64 {
         8 => c.g.u16(a!(ROP_MODE))? as u32,
         9 => c.g.u32(a!(TEXT_COLOR))?,
         10 => d.memory as u32,    // NtGdiIsMemDC
-        11 => (!d.memory) as u32, // NtGdiHasOpenGL: window and display DCs
+        11 => 1,                  // NtGdiHasOpenGL: memory and display DCs alike
         _ => return Err(c.unimplemented(&format!("NtGdiGetDCDword method {method}"))),
     };
     c.g.out32(out, v)?;
+    Ok(1)
+}
+
+/// `NtGdiGetAndSetDCDword(hdc, method, value, *prev)`.
+pub fn nt_gdi_get_and_set_dc_dword(c: &mut Call<'_>) -> R64 {
+    let (hdc, method, value, prev_p) = (c.a32(0), c.a32(1), c.a32(2), c.a(3));
+    let Some(Obj::Dc(d)) = get(c, hdc) else { return Ok(0) };
+    let abi = c.p.abi;
+    macro_rules! a {
+        ($f:ident) => {
+            d.attr + off!(abi, dc_attr::$f)
+        };
+    }
+    let prev = match method {
+        8 => {
+            // SetMapMode: only MM_TEXT, whose extents are 1:1.
+            let prev = c.g.u32(a!(MAP_MODE))?;
+            if value != 1 {
+                return Err(c.unimplemented(&format!("SetMapMode({value})")));
+            }
+            c.g.w32(a!(MAP_MODE), 1)?;
+            for f in [a!(WND_EXT), a!(WND_EXT) + 4, a!(VPORT_EXT), a!(VPORT_EXT) + 4] {
+                c.g.w32(f, 1)?;
+            }
+            prev
+        }
+        100 => c.g.u32(a!(BACKGROUND_COLOR)).and_then(|p| c.g.w32(a!(BACKGROUND_COLOR), value).map(|_| p))?,
+        101 => c.g.u16(a!(BACKGROUND_MODE)).and_then(|p| c.g.w16(a!(BACKGROUND_MODE), value as u16).map(|_| p as u32))?,
+        102 => c.g.u32(a!(TEXT_COLOR)).and_then(|p| c.g.w32(a!(TEXT_COLOR), value).map(|_| p))?,
+        103 => c.g.u32(a!(BRUSH_COLOR)).and_then(|p| c.g.w32(a!(BRUSH_COLOR), value).map(|_| p))?,
+        104 => c.g.u32(a!(PEN_COLOR)).and_then(|p| c.g.w32(a!(PEN_COLOR), value).map(|_| p))?,
+        105 => {
+            if value != 1 {
+                return Err(c.unimplemented("SetGraphicsMode(GM_ADVANCED)"));
+            }
+            c.g.u32(a!(GRAPHICS_MODE))?
+        }
+        106 => c.g.u16(a!(ROP_MODE)).and_then(|p| c.g.w16(a!(ROP_MODE), value as u16).map(|_| p as u32))?,
+        107 => c.g.u16(a!(TEXT_ALIGN)).and_then(|p| c.g.w16(a!(TEXT_ALIGN), value as u16).map(|_| p as u32))?,
+        _ => return Err(c.unimplemented(&format!("NtGdiGetAndSetDCDword method {method}"))),
+    };
+    if prev_p == 0 {
+        return Ok(0);
+    }
+    c.g.w32(prev_p, prev)?;
     Ok(1)
 }
 
@@ -293,7 +339,7 @@ pub fn nt_gdi_save_dc(c: &mut Call<'_>) -> R64 {
     let attr = c.g.bytes(d.attr, size)?;
     let level = with_obj(c, hdc, |o| {
         let Obj::Dc(d) = o else { return 0 };
-        d.saved.push(Saved { attr, bitmap: d.bitmap, brush: d.brush, pen: d.pen, font: d.font });
+        d.saved.push(Saved { attr, bitmap: d.bitmap, brush: d.brush, pen: d.pen, font: d.font, clip: d.clip.clone() });
         d.saved.len()
     })
     .unwrap_or(0);
@@ -319,6 +365,7 @@ pub fn nt_gdi_restore_dc(c: &mut Call<'_>) -> R64 {
         d.brush = s.brush;
         d.pen = s.pen;
         d.font = s.font;
+        d.clip = s.clip.clone();
         Some(s)
     })
     .flatten();

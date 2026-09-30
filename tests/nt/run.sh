@@ -68,6 +68,7 @@ for arch in x64 x86; do
     check $arch/cxx 0 "$allok" "$b/cxx.exe"
     # N4: USER without a display.
     check $arch/user_win 0 "$allok" "$b/user_win.exe"
+    check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" "$b/exitproc.exe"
     # Ends in the top-level exception filter, which exits with 77.
     check $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$b/seh.exe"

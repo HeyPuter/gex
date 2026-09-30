@@ -3,7 +3,7 @@
 //!
 //! Messages with no default action return 0, as on Windows. Messages whose
 //! default action gex does not perform yet fail loudly (the non-client mouse
-//! handling, the system menu, painting until GDI lands).
+//! handling, the system menu).
 
 use super::window::{self, wm, ws, Rect};
 use super::winproc::Pack;
@@ -174,9 +174,10 @@ pub fn default_window_proc(c: &mut Call<'_>, h: u32, msg: u32, wparam: u64, lpar
         0x0055 => Ok(2), // WM_NOTIFYFORMAT: NFR_UNICODE
         0x0281..=0x0291 => Ok(0), // WM_IME_*
         0x0200..=0x020e => Ok(0), // client-area mouse messages
-        wm::ERASEBKGND | wm::PAINT | wm::NCPAINT => {
-            Err(c.unimplemented(&format!("DefWindowProc message {msg:#x} (painting needs GDI)")))
-        }
+        wm::ERASEBKGND => super::paint::default_erase(c, hwnd, wparam as u32),
+        wm::PAINT => super::paint::default_paint(c, hwnd),
+        // The compositor draws window frames (§6a.1).
+        wm::NCPAINT => Ok(0),
         0x0112 => {
             // WM_SYSCOMMAND: SC_CLOSE sends WM_CLOSE.
             if wparam & 0xfff0 == 0xf060 {

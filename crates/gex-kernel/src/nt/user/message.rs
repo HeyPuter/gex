@@ -110,6 +110,14 @@ fn wake(c: &mut Call<'_>, tid: u32) {
     }
 }
 
+/// Tell thread `tid` a window of its needs painting.
+pub fn wake_for_paint(c: &mut Call<'_>, tid: u32) {
+    c.p.user.lock().unwrap().thread(tid).queue.changed |= qs::PAINT;
+    if tid != c.t.tid {
+        wake(c, tid);
+    }
+}
+
 /// Post to the queue of `tid`.
 pub fn post_to_thread(c: &mut Call<'_>, tid: u32, m: Msg) {
     {
@@ -278,6 +286,22 @@ pub fn peek(c: &mut Call<'_>, hwnd: u32, first: u32, last: u32, flags: u32) -> R
             return Ok(Some(Msg { hwnd: 0, msg: wm::QUIT, wparam: code, lparam: 0, time, pt: q.last_pos }));
         }
     }
+    // WM_PAINT: after posted messages, before timers. It stays until the
+    // window is validated; removing it only clears an internal paint.
+    if mask & qs::PAINT != 0 && (first == 0 && last == 0 || (first..=last).contains(&wm::PAINT)) {
+        let filter = if hwnd == 0xffff_ffff { None } else { Some(hwnd) };
+        if let Some(h) = filter.and_then(|f| super::paint::window_to_paint(&u, tid, f)) {
+            if remove {
+                if let Some(w) = u.windows.get_mut(&h) {
+                    w.internal_paint = false;
+                }
+            }
+            let q = &mut u.thread(tid).queue;
+            q.last_time = time;
+            return Ok(Some(Msg { hwnd: h, msg: wm::PAINT, wparam: 0, lparam: 0, time, pt: q.last_pos }));
+        }
+    }
+    let q = &mut u.thread(tid).queue;
     if mask & qs::TIMER != 0 {
         let msg_for = |t: &Timer| Msg {
             hwnd: t.hwnd,
@@ -331,9 +355,10 @@ fn queue_ready(c: &Call<'_>, mask: u32, changed_only: bool) -> bool {
         }
         return false;
     }
-    (mask & qs::SENDMESSAGE != 0 && !q.sent.is_empty())
+    let ready = (mask & qs::SENDMESSAGE != 0 && !q.sent.is_empty())
         || (mask & (qs::POSTMESSAGE | qs::ALLPOSTMESSAGE) != 0 && (!q.posted.is_empty() || q.quit.is_some()))
-        || (mask & qs::TIMER != 0 && q.timers.iter().any(|t| t.due <= now))
+        || (mask & qs::TIMER != 0 && q.timers.iter().any(|t| t.due <= now));
+    ready || (mask & qs::PAINT != 0 && super::paint::window_to_paint(&u, tid, 0).is_some())
 }
 
 fn write_msg(c: &mut Call<'_>, p: u64, m: &Msg) -> R<()> {
@@ -452,6 +477,10 @@ pub fn nt_user_get_queue_status(c: &mut Call<'_>) -> R64 {
     if q.timers.iter().any(|t| t.due <= now) {
         have |= qs::TIMER;
     }
+    if super::paint::window_to_paint(&u, tid, 0).is_some() {
+        have |= qs::PAINT;
+    }
+    let q = &mut u.thread(tid).queue;
     let changed = q.changed & flags;
     q.changed &= !flags;
     Ok((((have & flags) << 16) | changed) as u64)

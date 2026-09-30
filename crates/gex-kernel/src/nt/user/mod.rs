@@ -14,6 +14,7 @@
 pub mod class;
 pub mod defwnd;
 pub mod message;
+pub mod paint;
 pub mod sysparams;
 pub mod window;
 pub mod winproc;
@@ -441,6 +442,21 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtUserSetMessageExtraInfo => message::nt_user_set_message_extra_info(c),
         n::NtUserReplyMessage => message::nt_user_reply_message(c),
         n::NtUserNotifyWinEvent => Ok(0),
+        n::NtUserGetDC => paint::nt_user_get_dc(c),
+        n::NtUserGetDCEx => paint::nt_user_get_dc_ex(c),
+        n::NtUserGetWindowDC => paint::nt_user_get_window_dc(c),
+        n::NtUserReleaseDC => paint::nt_user_release_dc(c),
+        n::NtUserWindowFromDC => paint::nt_user_window_from_dc(c),
+        n::NtUserBeginPaint => paint::nt_user_begin_paint(c),
+        n::NtUserEndPaint => paint::nt_user_end_paint(c),
+        n::NtUserInvalidateRect => paint::nt_user_invalidate_rect(c),
+        n::NtUserValidateRect => paint::nt_user_validate_rect(c),
+        n::NtUserInvalidateRgn => paint::nt_user_invalidate_rgn(c),
+        n::NtUserValidateRgn => paint::nt_user_validate_rgn(c),
+        n::NtUserGetUpdateRect => paint::nt_user_get_update_rect(c),
+        n::NtUserGetUpdateRgn => paint::nt_user_get_update_rgn(c),
+        n::NtUserRedrawWindow => paint::nt_user_redraw_window(c),
+        n::NtUserExcludeUpdateRgn => paint::nt_user_exclude_update_rgn(c),
         nr if super::syscall_name(nr).starts_with("NtGdi") => super::gdi::dispatch(c),
         nr => Err(c.unimplemented(&format!("win32u {} ({nr:#x})", super::syscall_name(nr)))),
     }
@@ -482,6 +498,8 @@ fn call_one_param(c: &mut Call<'_>) -> R64 {
         }
         // GetSysColor
         6 => Ok(sysparams::sys_color(arg as i32) as u64),
+        // GetSysColorBrush
+        7 => Ok(handle_ret(crate::nt::gdi::sys_color_brush(c, arg as u32)?)),
         // GetSystemMetrics
         9 => Ok(sysparams::system_metrics(c, arg as i32) as i32 as i64 as u64),
         // SetThreadDpiAwarenessContext

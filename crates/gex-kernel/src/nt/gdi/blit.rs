@@ -3,40 +3,132 @@
 //! the dib engine's blits, one pixel at a time for now).
 
 use super::super::user::{window::Rect, R64};
+use super::dc::Dc;
+use super::{region, surface};
 use super::bitmap::{self, Bitmap};
 use super::{get, Obj};
 use crate::nt::{off, Call, Status, R};
 
-/// Where a DC draws: its bitmap (memory DCs) and the offset of its origin.
+/// Where a DC draws: its bitmap (a memory DC's, or a window's surface), the
+/// logical-to-bitmap offset, and the rectangles it may touch (bitmap
+/// coordinates).
 struct Target {
     bm: Bitmap,
-    /// Device origin in the bitmap (window DCs inside a surface).
     dx: i32,
     dy: i32,
-    clip: Rect,
+    clip: Vec<Rect>,
     attr: u64,
     brush: u32,
     mono: bool,
 }
 
-fn target(c: &mut Call<'_>, hdc: u32) -> R<Option<Target>> {
-    let Some(Obj::Dc(d)) = get(c, hdc) else { return Ok(None) };
-    if !d.memory {
-        return Err(c.unimplemented("drawing to a window or display DC (window surfaces are not built yet)"));
-    }
-    let Some(Obj::Bitmap(bm)) = get(c, d.bitmap) else { return Ok(None) };
-    let map_mode = c.g.u32(d.attr + off!(c.p.abi, dc_attr::MAP_MODE))?;
+/// The logical-to-device offset of a DC in MM_TEXT, from its DC_ATTR.
+pub fn logical_offset(c: &mut Call<'_>, attr: u64) -> R<(i32, i32)> {
+    let abi = c.p.abi;
+    let map_mode = c.g.u32(attr + off!(abi, dc_attr::MAP_MODE))?;
     if map_mode != 1 {
         return Err(c.unimplemented(&format!("drawing with map mode {map_mode}")));
     }
-    let abi = c.p.abi;
-    let wx = c.g.u32(d.attr + off!(abi, dc_attr::WND_ORG))? as i32;
-    let wy = c.g.u32(d.attr + off!(abi, dc_attr::WND_ORG) + 4)? as i32;
-    let vx = c.g.u32(d.attr + off!(abi, dc_attr::VPORT_ORG))? as i32;
-    let vy = c.g.u32(d.attr + off!(abi, dc_attr::VPORT_ORG) + 4)? as i32;
+    let wx = c.g.u32(attr + off!(abi, dc_attr::WND_ORG))? as i32;
+    let wy = c.g.u32(attr + off!(abi, dc_attr::WND_ORG) + 4)? as i32;
+    let vx = c.g.u32(attr + off!(abi, dc_attr::VPORT_ORG))? as i32;
+    let vy = c.g.u32(attr + off!(abi, dc_attr::VPORT_ORG) + 4)? as i32;
+    Ok((vx - wx, vy - wy))
+}
+
+/// Where a DC's device coordinates are: the visible rectangles (device
+/// coordinates), the device origin in its bitmap, the origin on the screen,
+/// and for a window DC the top-level window and surface size.
+struct Placement {
+    vis: Vec<Rect>,
+    origin: (i32, i32),
+    screen: (i32, i32),
+    window: Option<(u32, (i32, i32))>,
+}
+
+fn placement(c: &mut Call<'_>, d: &Dc) -> R<Placement> {
+    if d.memory {
+        let (w, h) = match get(c, d.bitmap) {
+            Some(Obj::Bitmap(b)) => (b.width, b.height),
+            _ => (1, 1),
+        };
+        return Ok(Placement { vis: vec![Rect { left: 0, top: 0, right: w, bottom: h }], origin: (0, 0), screen: (0, 0), window: None });
+    }
+    match surface::geometry(c, d.hwnd, d.whole_window) {
+        Some(g) => Ok(Placement {
+            vis: g.vis.iter().map(|r| r.offset(-g.origin.0, -g.origin.1)).collect(),
+            origin: g.origin,
+            screen: g.screen,
+            window: Some((g.toplevel, g.size)),
+        }),
+        // The screen itself: the display DC and the desktop window's.
+        None => Ok(Placement {
+            vis: vec![Rect { left: 0, top: 0, right: 1920, bottom: 1080 }],
+            origin: (0, 0),
+            screen: (0, 0),
+            window: None,
+        }),
+    }
+}
+
+/// What a DC may draw on, in its device coordinates: the visible area
+/// intersected with its clip region.
+pub fn device_area(c: &mut Call<'_>, hdc: u32) -> R<Option<Vec<Rect>>> {
+    let Some(Obj::Dc(d)) = get(c, hdc) else { return Ok(None) };
+    let p = placement(c, &d)?;
+    Ok(Some(match &d.clip {
+        Some(cl) => region::intersect(&p.vis, cl),
+        None => p.vis,
+    }))
+}
+
+/// A DC's device origin on the screen.
+pub fn screen_origin(c: &mut Call<'_>, hdc: u32) -> R<(i32, i32)> {
+    let Some(Obj::Dc(d)) = get(c, hdc) else { return Ok((0, 0)) };
+    Ok(placement(c, &d)?.screen)
+}
+
+fn target(c: &mut Call<'_>, hdc: u32) -> R<Option<Target>> {
+    target_ex(c, hdc, true)
+}
+
+/// `clipped`: honor the DC's clip region, or only its visible area (what
+/// GetPixel reads from).
+fn target_ex(c: &mut Call<'_>, hdc: u32, clipped: bool) -> R<Option<Target>> {
+    let Some(Obj::Dc(d)) = get(c, hdc) else { return Ok(None) };
+    let p = placement(c, &d)?;
+    let bm = if d.memory {
+        let Some(Obj::Bitmap(bm)) = get(c, d.bitmap) else { return Ok(None) };
+        bm
+    } else {
+        match p.window {
+            Some((top, size)) => surface::surface(c, top, size)?,
+            None => return Err(c.unimplemented("drawing to the screen (a display or desktop DC)")),
+        }
+    };
+    let (lx, ly) = logical_offset(c, d.attr)?;
+    let area = match &d.clip {
+        Some(cl) if clipped => region::intersect(&p.vis, cl),
+        _ => p.vis,
+    };
     let full = Rect { left: 0, top: 0, right: bm.width, bottom: bm.height };
-    let clip = d.clip.map(|r| r.intersect(&full)).unwrap_or(full);
-    Ok(Some(Target { mono: bm.bpp == 1, bm, dx: vx - wx, dy: vy - wy, clip, attr: d.attr, brush: d.brush }))
+    let clip = area.iter().map(|r| r.offset(p.origin.0, p.origin.1).intersect(&full)).filter(|r| !r.is_empty()).collect();
+    Ok(Some(Target {
+        mono: bm.bpp == 1,
+        bm,
+        dx: p.origin.0 + lx,
+        dy: p.origin.1 + ly,
+        clip,
+        attr: d.attr,
+        brush: d.brush,
+    }))
+}
+
+/// Fill `r` (logical) with `brush` through `hdc`, as FillRect does.
+pub fn fill_rect(c: &mut Call<'_>, hdc: u32, r: &Rect, brush: u32) -> R<()> {
+    let Some(mut t) = target(c, hdc)? else { return Ok(()) };
+    t.brush = brush;
+    blit(c, &t, r.left, r.top, r.width(), r.height(), None, 0, 0, 0, 0, 0x00f0_0021)
 }
 
 /// The pattern color at device (x, y), or `None` for a null brush.
@@ -44,6 +136,7 @@ struct Pattern {
     solid: Option<u32>,
     bitmap: Option<Bitmap>,
     org: (i32, i32),
+    mono_colors: Option<(u32, u32)>,
 }
 
 fn pattern(c: &mut Call<'_>, t: &Target) -> R<Pattern> {
@@ -54,19 +147,20 @@ fn pattern(c: &mut Call<'_>, t: &Target) -> R<Pattern> {
         Some(Obj::Brush(b)) => match b.style {
             0 => {
                 let color = if t.brush == dc_brush { c.g.u32(t.attr + off!(abi, dc_attr::BRUSH_COLOR))? } else { b.color };
-                Ok(Pattern { solid: Some(colorref_to_rgb(color)), bitmap: None, org })
+                Ok(Pattern { solid: Some(colorref_to_rgb(color)), bitmap: None, org, mono_colors: None })
             }
-            1 => Ok(Pattern { solid: None, bitmap: None, org }),
+            1 => Ok(Pattern { solid: None, bitmap: None, org, mono_colors: None }),
             3 => {
                 let bm = match b.pattern.and_then(|p| get(c, p)) {
                     Some(Obj::Bitmap(bm)) => bm,
-                    _ => return Ok(Pattern { solid: None, bitmap: None, org }),
+                    _ => return Ok(Pattern { solid: None, bitmap: None, org, mono_colors: None }),
                 };
-                Ok(Pattern { solid: None, bitmap: Some(bm), org })
+                let mono_colors = if bm.bpp == 1 && bm.dib.is_none() { Some(dc_colors(c, t.attr)?) } else { None };
+                Ok(Pattern { solid: None, bitmap: Some(bm), org, mono_colors })
             }
             s => Err(c.unimplemented(&format!("drawing with brush style {s}"))),
         },
-        _ => Ok(Pattern { solid: None, bitmap: None, org }),
+        _ => Ok(Pattern { solid: None, bitmap: None, org, mono_colors: None }),
     }
 }
 
@@ -78,7 +172,19 @@ impl Pattern {
         let b = self.bitmap.as_ref()?;
         let px = (x - self.org.0).rem_euclid(b.width.max(1));
         let py = (y - self.org.1).rem_euclid(b.height.max(1));
-        Some(b.get(c, px, py))
+        let v = b.get(c, px, py);
+        // A monochrome pattern draws 0 bits in the text color and 1 bits in
+        // the background color.
+        Some(match self.mono_colors {
+            Some((fg, bg)) => {
+                if v != 0 {
+                    bg
+                } else {
+                    fg
+                }
+            }
+            None => v,
+        })
     }
 }
 
@@ -139,55 +245,55 @@ fn blit(c: &mut Call<'_>, t: &Target, xd: i32, yd: i32, wd: i32, hd: i32, src: O
     }
     let (x0, x1) = if wd < 0 { (xd + wd, xd) } else { (xd, xd + wd) };
     let (y0, y1) = if hd < 0 { (yd + hd, yd) } else { (yd, yd + hd) };
-    let area = Rect { left: x0 + t.dx, top: y0 + t.dy, right: x1 + t.dx, bottom: y1 + t.dy }.intersect(&t.clip);
-    if area.is_empty() {
-        return Ok(());
-    }
+    let dest = Rect { left: x0 + t.dx, top: y0 + t.dy, right: x1 + t.dx, bottom: y1 + t.dy };
     let (awd, ahd) = (wd.abs().max(1), hd.abs().max(1));
-    for y in area.top..area.bottom {
-        for x in area.left..area.right {
-            let s = match src {
-                Some(s) if uses_source(code) => {
-                    // Position within the destination rectangle, then the
-                    // matching source pixel.
-                    let mut fx = x - t.dx - x0;
-                    let mut fy = y - t.dy - y0;
-                    if wd < 0 {
-                        fx = awd - 1 - fx;
-                    }
-                    if hd < 0 {
-                        fy = ahd - 1 - fy;
-                    }
-                    let sx = xs + (fx as i64 * ws as i64 / awd as i64) as i32 + s.dx;
-                    let sy = ys + (fy as i64 * hs as i64 / ahd as i64) as i32 + s.dy;
-                    if sx < 0 || sy < 0 || sx >= s.bm.width || sy >= s.bm.height {
-                        continue;
-                    }
-                    let v = s.bm.get(c, sx, sy);
-                    match (s.mono_colors, s.to_mono_bk) {
-                        (Some((fg, bg)), _) => {
-                            if v != 0 {
-                                bg
-                            } else {
-                                fg
-                            }
+    for cl in &t.clip {
+        let area = dest.intersect(cl);
+        for y in area.top..area.bottom {
+            for x in area.left..area.right {
+                let s = match src {
+                    Some(s) if uses_source(code) => {
+                        // Position within the destination rectangle, then the
+                        // matching source pixel.
+                        let mut fx = x - t.dx - x0;
+                        let mut fy = y - t.dy - y0;
+                        if wd < 0 {
+                            fx = awd - 1 - fx;
                         }
-                        (None, Some(bk)) => {
-                            if v == bk {
-                                0xffffff
-                            } else {
-                                0
-                            }
+                        if hd < 0 {
+                            fy = ahd - 1 - fy;
                         }
-                        _ => v,
+                        let sx = xs + (fx as i64 * ws as i64 / awd as i64) as i32 + s.dx;
+                        let sy = ys + (fy as i64 * hs as i64 / ahd as i64) as i32 + s.dy;
+                        if sx < 0 || sy < 0 || sx >= s.bm.width || sy >= s.bm.height {
+                            continue;
+                        }
+                        let v = s.bm.get(c, sx, sy);
+                        match (s.mono_colors, s.to_mono_bk) {
+                            (Some((fg, bg)), _) => {
+                                if v != 0 {
+                                    bg
+                                } else {
+                                    fg
+                                }
+                            }
+                            (None, Some(bk)) => {
+                                if v == bk {
+                                    0xffffff
+                                } else {
+                                    0
+                                }
+                            }
+                            _ => v,
+                        }
                     }
-                }
-                _ => 0,
-            };
-            let p = pat.as_ref().and_then(|p| p.at(c, x, y)).unwrap_or(0);
-            let d = t.bm.get(c, x, y);
-            let r = rop3(code, p, s, d);
-            t.bm.set(c, x, y, r);
+                    _ => 0,
+                };
+                let p = pat.as_ref().and_then(|p| p.at(c, x, y)).unwrap_or(0);
+                let d = t.bm.get(c, x, y);
+                let r = rop3(code, p, s, d);
+                t.bm.set(c, x, y, r);
+            }
         }
     }
     Ok(())
@@ -292,9 +398,9 @@ pub fn nt_gdi_set_dibits_to_device_internal(c: &mut Call<'_>) -> R64 {
 /// `NtGdiGetPixel(hdc, x, y)`: a COLORREF, or CLR_INVALID.
 pub fn nt_gdi_get_pixel(c: &mut Call<'_>) -> R64 {
     let (hdc, x, y) = (c.a32(0), c.a32(1) as i32, c.a32(2) as i32);
-    let Some(t) = target(c, hdc)? else { return Ok(0xffff_ffff) };
+    let Some(t) = target_ex(c, hdc, false)? else { return Ok(0xffff_ffff) };
     let (px, py) = (x + t.dx, y + t.dy);
-    if px < t.clip.left || py < t.clip.top || px >= t.clip.right || py >= t.clip.bottom {
+    if !t.clip.iter().any(|r| px >= r.left && py >= r.top && px < r.right && py < r.bottom) {
         return Ok(0xffff_ffff);
     }
     Ok(rgb_to_colorref(t.bm.get(c, px, py)) as u64)
@@ -305,7 +411,7 @@ pub fn nt_gdi_set_pixel(c: &mut Call<'_>) -> R64 {
     let (hdc, x, y, color) = (c.a32(0), c.a32(1) as i32, c.a32(2) as i32, c.a32(3));
     let Some(t) = target(c, hdc)? else { return Ok(0xffff_ffff) };
     let (px, py) = (x + t.dx, y + t.dy);
-    if px < t.clip.left || py < t.clip.top || px >= t.clip.right || py >= t.clip.bottom {
+    if !t.clip.iter().any(|r| px >= r.left && py >= r.top && px < r.right && py < r.bottom) {
         return Ok(0xffff_ffff);
     }
     t.bm.set(c, px, py, colorref_to_rgb(color));
