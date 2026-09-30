@@ -94,7 +94,7 @@ python3 "$ROOT/tools/gl44_coverage.py" \
 # Resource query replies must be length-delimited and copied only after the
 # generated guest verifies the exact pname-dependent output size. A raw host
 # pointer or unconditional four-component memcpy would corrupt scalar callers.
-python3 - "$ROOT/guest/gl/gl44-generated.inc" "$ROOT/web/mobilegl/gl44-generated-cases.inc" <<'PY'
+python3 - "$ROOT/guest/gl/gl44-generated.inc" "$ROOT/web/mesa/gl44-generated-cases.inc" <<'PY'
 import pathlib, sys
 guest = pathlib.Path(sys.argv[1]).read_text()
 host = pathlib.Path(sys.argv[2]).read_text()
@@ -135,7 +135,7 @@ fi
 # Reader methods mutate the packet cursor. Calling more than one as separate
 # C++ arguments makes decoding depend on the compiler's argument order.
 if grep -Eq 'gl[A-Za-z0-9_]+\([^;]*a\.(u32|i32|f32|u64|i64|f64)\([^)]*\)[^;]*a\.(u32|i32|f32|u64|i64|f64)\(' \
-    "$ROOT/web/mobilegl/gexgl-mobilegl.cpp"; then
+    "$ROOT/web/mesa/gexgl-mesa.cpp"; then
     echo "unsafe host decode: assign Reader results before making a GL call" >&2
     exit 1
 fi
