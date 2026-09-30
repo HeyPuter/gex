@@ -181,6 +181,20 @@ The host reads the regions back when a thread or process ends, and on demand:
 - `GEX_PROFILE_EVERY=<seconds>` rewrites the files periodically;
 - creating `DIR/dump` rewrites them once.
 
+**Cost** (preliminary; 2026-09-30, native `gexc run`, tier-1 with a warm
+cache, CPU time of the whole run, three paired rounds per program at S1's
+default scales, `eh` at 4; load average 40-70 from other work, so the
+null test's spread is the noise floor):
+
+| Guest | Programs | Recording / plain, geomean | Range | Null test (plain / plain) |
+| --- | --- | --- | --- | --- |
+| AArch64 | 29 (`bits` fails in tier-1 either way) | 1.50× | 0.94-2.06× | 0.99× (0.79-1.03) |
+| x86-64 | 30 | 1.35× | 0.92-1.86× | 1.00× (0.94-1.06) |
+
+Call-heavy code costs most (`calls` 2.06×, `eh` 1.97×): every call pushes
+the shadow stack and every return checks it. Recording does not change
+program output: all 59 runs printed the same result as without it.
+
 **Limitations:**
 
 - **Tier-1 only.** Profiling together with the function tier (`--cgen`) is
@@ -188,5 +202,9 @@ The host reads the regions back when a thread or process ends, and on demand:
 - **Native host only.** The browser shim does not yet provide `gex.profile`,
   so a profiled module fails to instantiate there. `merge` of profiled units
   is not supported.
+- **Linux programs only.** `--record` on a PE program is refused.
+- A module without counters (an AOT module built without profiling, or any
+  future non-tier-1 code) is refused at instantiation while recording, rather
+  than leaving silent holes in the counts.
 - **Instrumentation shapes the translation.** With profiling off, modules are
   byte-identical to a build without this code.
