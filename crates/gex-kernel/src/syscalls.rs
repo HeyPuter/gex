@@ -1978,17 +1978,29 @@ impl Kernel {
             }
             nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
                 // `clock_nanosleep` puts the request in a[2]; `nanosleep` in
-                // a[0]. Neither clock nor the absolute-time flag is modelled.
+                // a[0]. `None` leaves the call to `sys_nanosleep`, which
+                // answers at once: EINVAL for a malformed request, 0 for
+                // one with nothing left to wait for.
                 let req = if n == nr::NANOSLEEP { a[0] } else { a[2] };
                 if req == 0 {
                     return None;
                 }
-                let secs = m.read_u64(req).ok()?;
+                let secs = m.read_u64(req).ok()? as i64;
                 let nanos = m.read_u64(req + 8).ok()?;
-                Some(BlockOp::Sleep(std::time::Duration::new(
-                    secs.min(60),
-                    (nanos % 1_000_000_000) as u32,
-                )))
+                if secs < 0 || nanos >= 1_000_000_000 {
+                    return None;
+                }
+                let mut wait = secs as u128 * 1_000_000_000 + nanos as u128;
+                // TIMER_ABSTIME: a deadline on the clock, not a duration. It
+                // was slept as a duration, so every absolute sleep lasted the
+                // 60 s cap below.
+                const TIMER_ABSTIME: u64 = 1;
+                if n == nr::CLOCK_NANOSLEEP && a[1] & TIMER_ABSTIME != 0 {
+                    wait = wait.checked_sub(self.clock_nanos(a[0])).filter(|&w| w > 0)?;
+                }
+                // Capped, as before: a longer sleep returns early.
+                let wait = wait.min(60_000_000_000) as u64;
+                Some(BlockOp::Sleep(std::time::Duration::from_nanos(wait)))
             }
             _ => None,
         }
@@ -5660,14 +5672,27 @@ impl Kernel {
 
     fn sys_nanosleep(&mut self, m: &GuestMem<'_>, req: u64) -> SysResult {
         if req == 0 {
-            return Ok(0);
+            return Err(Errno::EFAULT);
         }
-        let secs = m.read_u64(req)?;
+        let secs = m.read_u64(req)? as i64;
         let nanos = m.read_u64(req + 8)?;
-        let _ = (secs, nanos);
+        if secs < 0 || nanos >= 1_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
         // The sleep itself is `BlockOp::Sleep`, run by the host with the
-        // kernel unlocked; reaching here means a zero request.
+        // kernel unlocked; reaching here means nothing to wait for: a zero
+        // request, or a deadline already past.
         Ok(0)
+    }
+
+    /// Now on `clk`, in nanoseconds, as `clock_gettime` would answer it.
+    fn clock_nanos(&mut self, clk: u64) -> u128 {
+        const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+        const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+        match clk {
+            CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => self.cpu_nanos(),
+            _ => self.now_nanos(),
+        }
     }
 
     /// How much time this process has used, in nanoseconds: wall clock since
@@ -6106,6 +6131,42 @@ mod tests {
         k.vfs.mount("/", Arc::new(TmpFs::new()));
         k.vfs.mount("/dev", Arc::new(crate::vfs::DevFs::new()));
         (mem, k)
+    }
+
+    /// What `clock_nanosleep` turns into: a sleep of the time left for an
+    /// absolute deadline (none if it has passed), EINVAL for a malformed
+    /// request instead of a sleep.
+    #[test]
+    fn clock_nanosleep_honours_absolute_deadlines() {
+        let (mut mem, mut k) = setup();
+        let at = 0x2000u64;
+        let ask = |k: &mut Kernel, mem: &mut Vec<u8>, flags: u64, secs: i64, nanos: u64| {
+            mem[at as usize..at as usize + 8].copy_from_slice(&secs.to_le_bytes());
+            mem[at as usize + 8..at as usize + 16].copy_from_slice(&nanos.to_le_bytes());
+            let m = GuestMem::new(mem);
+            let op = k.blocking_op(&m, nr::CLOCK_NANOSLEEP, [1, flags, at, 0, 0, 0]);
+            let now = match op {
+                None => Some(k.sys_nanosleep(&m, at)),
+                Some(_) => None,
+            };
+            (op, now)
+        };
+        let now = k.now_nanos() as i64 / 1_000_000_000;
+        // Relative: slept as given.
+        match ask(&mut k, &mut mem, 0, 0, 5_000_000) {
+            (Some(BlockOp::Sleep(d)), _) => assert_eq!(d, std::time::Duration::from_millis(5)),
+            other => panic!("{other:?}"),
+        }
+        // Absolute, two seconds ahead: about two seconds, not the 60 s cap.
+        match ask(&mut k, &mut mem, 1, now + 2, 0) {
+            (Some(BlockOp::Sleep(d)), _) => assert!(d <= std::time::Duration::from_secs(2), "{d:?}"),
+            other => panic!("{other:?}"),
+        }
+        // Absolute and already past: returns at once.
+        assert!(matches!(ask(&mut k, &mut mem, 1, now - 5, 0), (None, Some(Ok(0)))));
+        // Malformed: EINVAL, not a sleep.
+        assert!(matches!(ask(&mut k, &mut mem, 0, -1, 0), (None, Some(Err(Errno::EINVAL)))));
+        assert!(matches!(ask(&mut k, &mut mem, 0, 0, 1_000_000_000), (None, Some(Err(Errno::EINVAL)))));
     }
 
     /// The terminal, as a program sees it through `ioctl`.
