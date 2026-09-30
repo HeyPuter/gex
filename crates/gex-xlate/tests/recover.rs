@@ -70,6 +70,7 @@ fn image(segments: Vec<Segment>, code: (u64, u64), symbols: Vec<Symbol>) -> Imag
         irelative: Vec::new(),
         pie: false,
         interp: None,
+        class32: false,
     }
 }
 

@@ -291,6 +291,7 @@ fn same_run(a: &Function, b: &Function, call: &dyn Fn(Callee) -> CallEffect, sp:
             call,
             sp,
             max_steps: 200,
+            syscall: None,
         };
         let x = interp::run(a, seed, &m);
         let y = interp::run(b, seed, &m);
@@ -429,4 +430,71 @@ fn ssa_carries_a_non_default_stack_pointer_across_calls() {
     let d = to_ssa(&f, &|_| eff);
     d.verify().unwrap();
     same_run(&f, &d, &|_| eff, x(4));
+}
+
+/// x0 / x1 with the x86 #DE check: `trap` when the divisor is zero.
+fn guarded_div() -> Function {
+    let mut t = F::new(0x4000);
+    let b0 = t.block(0x4000);
+    let a = t.read(b0, x(0));
+    let d = t.read(b0, x(1));
+    let z = t.def(b0, Expr::ConstI64(0));
+    let c = t.def(
+        b0,
+        Expr::Cmp {
+            op: CmpOp::Eq,
+            ty: Ty::I64,
+            a: d,
+            b: z,
+        },
+    );
+    t.f.block_mut(b0).push(
+        0x4004,
+        Stmt::Trap {
+            cond: c,
+            pc: 0x4004,
+            code: -4,
+        },
+    );
+    let q = t.def(
+        b0,
+        Expr::Bin {
+            op: BinOp::DivU,
+            ty: Ty::I64,
+            a,
+            b: d,
+        },
+    );
+    t.write(b0, x(0), q);
+    let lr = t.read(b0, x(30));
+    t.term(b0, FTerm::Return { target: lr });
+    t.f
+}
+
+#[test]
+fn a_trap_prints_parses_and_is_taken_only_when_its_condition_holds() {
+    let f = guarded_div();
+    f.verify().unwrap();
+    roundtrip(&f);
+    assert!(text::print(&f).contains("trap v3 0x4004 -4"), "{}", text::print(&f));
+    let eff = effect(&f.blocks[0].stmts[4]);
+    assert!(eff.trap && eff.reads_all_state() && eff.mem.is_empty() && !eff.is_pure());
+    let s = to_ssa(&f, &|_| CallEffect::UNKNOWN);
+    s.verify().unwrap();
+    roundtrip(&s);
+    same_run(&f, &s, &|_| CallEffect::UNKNOWN, GuestReg::Sp);
+    let m = interp::Model {
+        call: &|_| CallEffect::UNKNOWN,
+        sp: GuestReg::Sp,
+        max_steps: 10,
+        syscall: None,
+    };
+    let mut regs = interp::initial_regs(1, GuestReg::Sp);
+    regs[reg_index(x(1))] = 0;
+    assert_eq!(interp::run_from(&f, 1, regs.clone(), &m).stop, interp::Stop::Fault(0x4004, -4));
+    regs[reg_index(x(1))] = 3;
+    regs[reg_index(x(0))] = 12;
+    let o = interp::run_from(&f, 1, regs, &m);
+    assert!(matches!(o.stop, interp::Stop::Return(_)));
+    assert_eq!(o.regs[reg_index(x(0))], 4);
 }

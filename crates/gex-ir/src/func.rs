@@ -796,6 +796,7 @@ pub fn for_each_use_mut(s: &mut Stmt, mut f: impl FnMut(&mut Value)) {
             f(val);
         }
         Stmt::HostCall { args, .. } => args.iter_mut().for_each(f),
+        Stmt::Trap { cond, .. } => f(cond),
         Stmt::MemCopy { dst, src, len } => {
             f(dst);
             f(src);
@@ -893,6 +894,10 @@ pub struct Effect {
     /// A host call; when [`HostFunc::clobbers_guest_state`], it may read and
     /// write every register and all of memory.
     pub host: Option<HostFunc>,
+    /// A conditional fault ([`Stmt::Trap`]): when taken, it reads every
+    /// register (the context must be exact) and control may unwind; when
+    /// not, it does nothing. No memory effect.
+    pub trap: bool,
 }
 
 impl Effect {
@@ -903,6 +908,13 @@ impl Effect {
             && self.reads_reg.is_none()
             && self.writes_reg.is_none()
             && self.host.is_none()
+            && !self.trap
+    }
+
+    /// Reads every register: a host call that may clobber guest state, or a
+    /// trap that may be taken.
+    pub fn reads_all_state(&self) -> bool {
+        self.trap || self.clobbers_all()
     }
 
     /// May read or write any guest state (a syscall-like host call).
@@ -975,6 +987,7 @@ pub fn effect(s: &Stmt) -> Effect {
             ..
         } => e.mem.push(wr(*addr, *offset, Some(*bytes), Order::Relaxed)),
         Stmt::HostCall { func, .. } => e.host = Some(*func),
+        Stmt::Trap { .. } => e.trap = true,
         Stmt::MemCopy { dst, src, .. } => {
             e.mem.push(rd(*src, 0, None, Order::Relaxed));
             e.mem.push(wr(*dst, 0, None, Order::Relaxed));

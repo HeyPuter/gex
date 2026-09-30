@@ -15,6 +15,9 @@
 //! or one of [`Function::entries`]) starts with each parameter set to the
 //! context's value of its register.
 //!
+//! A [`Stmt::Trap`] needs nothing here: it reads every register when
+//! taken, and since every `WriteReg` is kept the context is exact at it.
+//!
 //! Construction is Cytron et al.'s: parameters at the iterated dominance
 //! frontier of each register's definitions, pruned by liveness, then renamed
 //! along the dominator tree, then trivial parameters removed.
