@@ -28,3 +28,5 @@ wasmtime = { version = "27", default-features = false, features = ["cranelift", 
 [features]
 # Host an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]
+# Host a 32-bit big-endian PowerPC guest (docs/ppc.md).
+ppc = ["gex-abi/ppc", "gex-xlate/ppc", "gex-kernel/ppc"]

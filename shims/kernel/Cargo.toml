@@ -14,3 +14,5 @@ gex-kernel.workspace = true
 [features]
 # Serve an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-kernel/x86"]
+# Host a 32-bit big-endian PowerPC guest (docs/ppc.md).
+ppc = ["gex-abi/ppc", "gex-kernel/ppc"]
