@@ -364,6 +364,33 @@ impl MemoryMap {
             origin,
         });
         self.vmas.sort_by_key(|v| v.start);
+        self.merge_adjacent();
+    }
+
+    /// Fold touching anonymous mappings with the same permissions and name
+    /// into one, as Linux does. A program that reserves address space a
+    /// chunk at a time otherwise leaves thousands of VMAs, which every
+    /// placement scans and `/proc/self/maps` lists line by line (Wine
+    /// re-parses that file with `sscanf`). Only mappings with no `code` or
+    /// `origin` qualify: those identities are keyed on the exact span.
+    fn merge_adjacent(&mut self) {
+        let mut i = 0;
+        while i + 1 < self.vmas.len() {
+            let (a, b) = (&self.vmas[i], &self.vmas[i + 1]);
+            if a.end == b.start
+                && a.prot == b.prot
+                && a.name == b.name
+                && a.code.is_none()
+                && b.code.is_none()
+                && a.origin.is_none()
+                && b.origin.is_none()
+            {
+                self.vmas[i].end = self.vmas[i + 1].end;
+                self.vmas.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// `brk(0)` reports the break; `brk(addr)` moves it and returns the new
@@ -827,6 +854,27 @@ mod tests {
         assert!(next < high && next > first, "{next:#x}");
         assert!(next + 0x10_0000 <= theirs || next >= theirs + 0x10_0000, "{next:#x} overlaps {theirs:#x}");
         assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the arena grew");
+    }
+
+    #[test]
+    fn touching_anonymous_mappings_merge() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let anon = flags::ANONYMOUS | flags::PRIVATE | flags::FIXED;
+        let base = 0x2000_0000;
+        for i in 0..8 {
+            m.mmap(base + i * 0x1000, 0x1000, 0, anon, "").unwrap();
+        }
+        assert_eq!(m.vmas().len(), 1, "{:?}", m.vmas());
+        assert_eq!((m.vmas()[0].start, m.vmas()[0].end), (base, base + 0x8000));
+        // A different permission, or a file's bytes, stay separate.
+        m.mmap(base + 0x8000, 0x1000, prot::READ, anon, "").unwrap();
+        m.mmap_from(base + 0x9000, 0x1000, 0, anon, "", Some(("f".into(), 0))).unwrap();
+        m.mmap(base + 0xa000, 0x1000, 0, anon, "").unwrap();
+        assert_eq!(m.vmas().len(), 4);
+        // Unmapping from the middle of a merged mapping still splits it.
+        m.unmap(base + 0x2000, 0x1000).unwrap();
+        assert_eq!(m.vmas().len(), 5);
+        assert!(m.check_access(base + 0x8000, 0x1000, prot::READ));
     }
 
     #[test]
