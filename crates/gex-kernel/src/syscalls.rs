@@ -4553,8 +4553,9 @@ impl Kernel {
         if let Some((path, base)) = pinned {
             self.pin_landed.push((path, base, start));
         }
-        // Anonymous memory is defined to read as zero.
-        m.zero(start, crate::mem::page_align_up(len) as usize)?;
+        // Anonymous memory is defined to read as zero. Pages that already
+        // are stay untouched, so a large reservation costs no memory.
+        m.zero_dirty(start, crate::mem::page_align_up(len) as usize)?;
         Ok(start)
     }
 
