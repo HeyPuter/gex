@@ -42,6 +42,7 @@ pub use arch::{lift_block, BlockLimits};
 use gex_abi::INST_ALIGN;
 
 pub mod intrinsic;
+pub mod profile;
 pub use intrinsic::Intrinsic;
 
 pub mod ehframe;
@@ -643,7 +644,20 @@ fn image_builder(image: &Image, opts: &Options) -> ModuleBuilder {
     builder
 }
 
+/// Why `opts` cannot be built, if it cannot: the function tier with
+/// profiling on (`GEX_PROFILE`, `--record`). The C side carries no
+/// profiling hooks, so its counts would be lost without a word.
+pub fn cgen_conflict(cgen: bool, profiling: bool) -> Option<&'static str> {
+    (cgen && profiling).then_some(
+        "the function tier (--cgen) cannot be built with profiling on (GEX_PROFILE=1, --record): \
+         its C code is not instrumented, so the profile would silently lose everything it runs",
+    )
+}
+
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
+    if let Some(why) = cgen_conflict(opts.cgen, profile::enabled()) {
+        panic!("{why}");
+    }
     let (collected, mut stats) = image_blocks(image, opts);
     let mut builder = image_builder(image, opts);
     let mut cgen: Vec<(Block, u32)> = Vec::new();
@@ -1224,6 +1238,13 @@ fn lift_one(
 
 #[cfg(all(test, not(feature = "x86")))]
 mod tests {
+    #[test]
+    fn cgen_refuses_profiling() {
+        assert!(super::cgen_conflict(true, true).is_some());
+        assert!(super::cgen_conflict(true, false).is_none());
+        assert!(super::cgen_conflict(false, true).is_none());
+    }
+
     use super::*;
     use gex_ld::elf::Segment;
 

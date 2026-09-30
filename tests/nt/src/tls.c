@@ -1,6 +1,6 @@
 /* Thread-local storage: TlsAlloc slots, the image's own .tls data
  * (__declspec(thread)) in every thread, and FLS callbacks at thread exit.
- * gex-nt-cc: clang --target=x86_64-w64-mingw32 -fms-extensions -fuse-ld=lld */
+ * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>

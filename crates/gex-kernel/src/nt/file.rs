@@ -120,6 +120,17 @@ pub fn nt_to_target(c: &Call<'_>, nt: &[u16]) -> R<Target> {
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
         let root = drive_root(c, b[0]).ok_or(Status(st::OBJECT_PATH_NOT_FOUND))?;
         let tail = rest[2..].replace('\\', "/");
+        // A 32-bit process sees syswow64 as its system32: gex presents a
+        // 32-bit Windows to it (docs/nt-layer.md §8).
+        let tail = if c.p.abi == super::Abi::P32 && b[0].eq_ignore_ascii_case(&b'C') {
+            let l = tail.to_ascii_lowercase();
+            match l.strip_prefix("/windows/system32") {
+                Some(r) if r.is_empty() || r.starts_with('/') => format!("/windows/syswow64{}", &tail["/windows/system32".len()..]),
+                _ => tail,
+            }
+        } else {
+            tail
+        };
         let tail = tail.trim_start_matches('/');
         return Ok(Target::Path(if tail.is_empty() {
             if root.is_empty() { "/".into() } else { root }
