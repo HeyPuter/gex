@@ -48,6 +48,7 @@ pub mod ehframe;
 pub mod func;
 pub mod jumptable;
 pub mod summary;
+pub mod validate;
 
 /// Knobs for a translation run.
 #[derive(Clone, Debug)]

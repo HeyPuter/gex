@@ -81,12 +81,15 @@ usage:
                                    text a whole-program build would face
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
-  gexc funcs  <elf> [--at ADDR] [--ir] [--ssa] [--check] [--list]
+  gexc funcs  <elf> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list]
                                    recover functions (CFGs, jump tables,
                                    call-graph summaries) and report them.
                                    --ir prints function-level GIR, --ssa in
                                    SSA form; --check verifies every function
-                                   and round-trips its text form
+                                   and round-trips its text form, and runs
+                                   each N times (default 8) on the GIR
+                                   interpreter: SSA against memory form, and
+                                   its summary's claims
 
 run options:
   --strace        trace every syscall on stderr
@@ -1157,6 +1160,7 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
     let mut at = None;
     let (mut ir, mut ssa, mut check, mut list) = (false, false, false, false);
     let mut show_uncovered = false;
+    let mut runs: u64 = 8;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1171,6 +1175,10 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
             "--check" => check = true,
             "--list" => list = true,
             "--uncovered" => show_uncovered = true,
+            "--run" => {
+                i += 1;
+                runs = args.get(i).context("--run needs a count")?.parse().context("--run expects a number")?;
+            }
             other => path = Some(other.to_string()),
         }
         i += 1;
@@ -1205,8 +1213,18 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         st.symbol_bytes
     );
     eprintln!(
-        "switches {} complete, {} partial; {} unresolved indirect jumps; {} noreturn calls; {} interior entries",
-        st.switches_complete, st.switches_partial, st.unresolved, st.noreturn_calls, st.interior_entries
+        "fde bytes covered {:.2}% of {}",
+        pct(st.fde_bytes_covered, st.fde_bytes),
+        st.fde_bytes
+    );
+    let torn: usize = prog
+        .functions
+        .values()
+        .map(|f| gex_xlate::summary::frame_torn_down(f, &sums).len())
+        .sum();
+    eprintln!(
+        "switches {} complete, {} partial; {} unresolved indirect jumps ({} with the frame torn down); {} noreturn calls; {} interior entries",
+        st.switches_complete, st.switches_partial, st.unresolved, torn, st.noreturn_calls, st.interior_entries
     );
     eprintln!(
         "summaries: {} SCCs, {} recursive, max {} iterations, {} not converged; {} functions with unknown callees",
@@ -1243,6 +1261,7 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         }
     }
     let mut bad = 0usize;
+    let mut vrep = gex_xlate::validate::Report::default();
     for (&a, f) in &prog.functions {
         if at.is_some_and(|x| x != a) {
             continue;
@@ -1261,7 +1280,7 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
             );
         }
         let ssa_f = if ssa || check {
-            Some(gex_ir::ssa::to_ssa(f, &|c| sums.call_effect(c)))
+            Some(sums.to_ssa(f))
         } else {
             None
         };
@@ -1286,7 +1305,24 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
                     eprintln!("{a:#x} {:?} form: {e}", g.form);
                 }
             }
+            if runs > 0 {
+                gex_xlate::validate::check_function(a, f, &sums, runs, 2000, &mut vrep);
+            }
         }
+    }
+    if check && runs > 0 {
+        eprintln!(
+            "run: {} functions, {} runs ({} to an exit the interpreter models, {} returns checked against summaries), {} failures",
+            vrep.functions,
+            vrep.runs,
+            vrep.runs_complete,
+            vrep.returns_checked,
+            vrep.failures.len()
+        );
+        for f in vrep.failures.iter().take(40) {
+            eprintln!("  {f}");
+        }
+        bad += vrep.failures.len();
     }
     if check {
         eprintln!("check: {bad} failures");
