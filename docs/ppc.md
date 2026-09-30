@@ -345,10 +345,9 @@ after a call (the main path, fork/clone's child, the blocking completions in
 both shims) call it. That is a one-line change each, and identical code off
 ppc.
 
-**Syscall restart:** `ERESTARTSYS` handling reuses the kernel's existing
-path. The resume PC minus `SYSCALL_INST_BYTES` is the `sc`, and r3 must hold
-the original first argument again. ppc Linux keeps it in `orig_gpr3`; gex
-saves it in the context's `LAST_SYSCALL`-adjacent slot before the call.
+**Syscall restart:** gex's kernel doesn't restart system calls on any guest,
+since an interrupted call returns `EINTR`. The context reserves
+`ctx::PPC_ORIG_R3` (Linux's `orig_gpr3`) for the day it does.
 
 ---
 
@@ -438,8 +437,9 @@ SIGILL at its own PC.
     zero, and saturate: NaN gives 0x80000000, and out-of-range values give
     the nearest bound. That is wasm's `trunc_sat` plus a NaN select.
   - The result is written to the FPR's low word. The high word is undefined
-    by the architecture, and gex writes 0xFFF80000 as the 750 and QEMU do.
-    The fuzzer compares only the low word.
+    by the architecture. gex writes what QEMU (the oracle) writes: the
+    result's sign extension, and zero for a NaN (checked with a probe
+    program under `qemu-ppc`).
   - `fcfid` and `fctid*` are 64-bit-implementation instructions and fail
     loudly.
   - `frsp` rounds to single in the current mode.
@@ -453,10 +453,12 @@ SIGILL at its own PC.
     and the next arithmetic instruction lifted in a block that reads a
     non-default mode fails loudly. That check is one byte test at block
     entry, emitted only in blocks that contain FP arithmetic.
-  - The sticky exception bits, FR/FI and FPRF are **not computed**: `mffs`
-    returns them as they were last written (normally zero). This is the same
-    fidelity gap as the AArch64 guest's FPSR and x86-64's MXCSR flags, and is
-    documented rather than silently different.
+  - The sticky exception bits, FR/FI and FPRF are **not computed**. `mffs`
+    returns the bits gex maintains: RN, NI, the enables, and any bit the
+    program wrote itself with `mtfsf`/`mtfsfi`/`mtfsb1`, so `feraiseexcept`
+    followed by `fetestexcept` round-trips. The hardware-computed status
+    bits read as 0. `GEX_FP_STRICT=1` makes `mffs` fail loudly instead. See
+    §8.1.
   - Enabling FP exceptions (`prctl(PR_SET_FPEXC)`, `MSR[FE0,FE1]`) fails
     loudly.
 - **Estimates:** `fres` and `frsqrte` have implementation-specific results
@@ -470,6 +472,27 @@ SIGILL at its own PC.
   produces the negative one. So an invalid operation's NaN may differ in sign
   and payload (PLAN §7 "NaN payloads"). The fuzzer compares NaN-ness, not
   payload.
+
+### 8.1 The FP status gap, on every gex guest
+
+No gex guest computes the IEEE exception flags. Doing so would cost a check
+after every FP operation, since wasm reports none of them. One gap, three
+spellings:
+
+| guest | register | what reads as zero | readers |
+| --- | --- | --- | --- |
+| AArch64 | FPSR | IOC, DZC, OFC, UFC, IXC, IDC, QC | `mrs x, fpsr` (`fetestexcept`) |
+| x86-64, i386 | MXCSR, x87 SW | IE, DE, ZE, OE, UE, PE; the x87 exception bits | `stmxcsr`, `fnstsw` |
+| PowerPC | FPSCR | FX, FEX, VX*, OX, UX, ZX, XX, FR, FI, FPRF | `mffs` |
+
+The control half is kept exactly on all three: rounding mode, enables, and
+what the program wrote.
+
+A program asking "was that inexact?" is told no. The soundness-style test
+`tests/ppc/fp-status.sh` keeps the gap visible: `fetestexcept(FE_INEXACT)`
+after `1.0/3.0` reads 1 under `qemu-ppc` and 0 under gex, and the test is
+marked xfail with this reason. On PowerPC, `GEX_FP_STRICT=1` turns the read
+itself into a loud failure.
 
 ---
 
@@ -540,18 +563,38 @@ SIGILL at its own PC.
 
 ---
 
-## 12. Status
+## 12. Merge notes
+
+When this branch meets S2's function IR and S3's C backend, which are not on
+merge/main yet, every exhaustive match over GIR needs arms for:
+
+- `UnOp::Bswap`/`Bswap16`: the rotate/shift lowerings in
+  `gex-emit/src/tier1.rs::emit_bswap`, and `__builtin_bswap32`/`16`/`64` in C;
+- the PowerPC `GuestReg`s: `R`, `Lr`, `Ctr`, `Cr`, `So`, `Ov`, `Ca`,
+  `XerBc`, `Fpscr`, `F`, with their context slots in `gex_abi::ctx::PPC_*`;
+- `I32` memory addresses (§2.4).
+
+Nothing else in GIR changed.
+
+---
+
+## 13. Status
 
 | milestone | state |
 | --- | --- |
 | toolchain: sysroot and `cc.sh` | done: musl 1.2.5 + compiler-rt 21.1.8 builtins, `-mcpu=ppc`, no vector instructions; hello runs under `qemu-ppc` |
-| P1.1 decoder, disassembler, objdump diff | — |
-| P1.2 static hello under `gexc run` | — |
-| P1.3 corpus checksums, diff-fuzz-ppc green | — |
+| P1.1 decoder, disassembler, objdump diff | done: 0 mismatches over the sysroot's libc.a and compiler-rt (128,633 words) and 200,000 random words |
+| P1.2 static hello under `gexc run` | done |
+| P1.3 corpus checksums, diff-fuzz-ppc green | corpus 30/30 under the native shim (result lines equal to qemu-ppc and x86-64); diff-fuzz-ppc green: int 2,000, cr 1,000, branch 1,000, mem 1,000, fp 3,000 cases. Tier-1 timing through the browser shim: pending |
 | P1.4 FP complete, atomics, signals, threads, soundness corpus | — |
 | P1.5 browser shim builds | — |
 
 Found on the way:
+
+- diff-fuzz-ppc found a bug in gex-emit's inline software FMA, shared by
+  every guest. An exact zero result lost its sign: `fma(0, -1, -0)` gave +0,
+  where IEEE says -0. It is fixed in its own commit, independent of this
+  work.
 
 - zig 0.16 *can* provide libc for `powerpc-linux-musleabihf` (hard-float
   EABI, the same ABI for everything here). It also brings libc++, which the
