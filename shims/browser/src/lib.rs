@@ -9284,6 +9284,15 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         with_host(|h| set_exit(h, 128 + 11));
         trap();
     }
+    // An x87 exception the control word unmasks: gex does not deliver
+    // them, so the process dies of SIGFPE, saying so.
+    if raw == gex_abi::imports::BRK_X87_EXCEPTION {
+        trace_line(&format!(
+            "gex: unmasked x87 floating-point exception at pc={pc:#x}; gex does not deliver x87 exceptions (SIGFPE)\n"
+        ));
+        with_host(|h| set_exit(h, 128 + 8));
+        trap();
+    }
     // The stack-pointer check borrows this import rather than adding one, so an
     // older shim still links. Names the object, since the block that *writes* a
     // bad `sp` is elsewhere from the one that dies on it.

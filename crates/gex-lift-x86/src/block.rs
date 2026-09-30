@@ -101,10 +101,11 @@ mod tests {
     /// The x87's arithmetic goes to the host (which computes it in 80-bit
     /// extended precision), each instruction with its operands encoded in
     /// the `x87op` word: here `fmulp st(1), st` (de c9) is FMUL on
-    /// `st(1) op= st(0)` with one pop, and `fstp qword [rax]` (dd 18) is FST
-    /// to double followed by the guest's own store.
+    /// `st(1) op= st(0)` with one pop. The conversion that follows, `fstp
+    /// qword [rax]` (dd 18), is lowered inline: no host call, one 8-byte
+    /// store.
     #[test]
-    fn x87_arithmetic_goes_to_the_host_in_extended_precision() {
+    fn x87_arithmetic_goes_to_the_host_and_conversions_stay_inline() {
         use crate::x87op;
         // fmulp st(1), st ; fstp qword [rax] ; ret
         let b = lift_block(bytes(0x1000, &[0xde, 0xc9, 0xdd, 0x18, 0xc3]), 0x1000, BlockLimits::default());
@@ -127,10 +128,12 @@ mod tests {
             .collect();
         assert_eq!(
             words,
-            vec![
-                x87op::FMUL | x87op::FORM_STI_ST0 << x87op::FORM_SHIFT | 1 << x87op::I_SHIFT | 1 << x87op::POP_SHIFT,
-                x87op::FST | x87op::MEM_F64 << x87op::MEM_SHIFT,
-            ],
+            vec![x87op::FMUL | x87op::FORM_STI_ST0 << x87op::FORM_SHIFT | 1 << x87op::I_SHIFT | 1 << x87op::POP_SHIFT],
+            "{}",
+            print::block(&b)
+        );
+        assert!(
+            b.stmts.iter().any(|s| matches!(s, Stmt::Store { sz: gex_ir::MemSz::B8, .. })),
             "{}",
             print::block(&b)
         );
