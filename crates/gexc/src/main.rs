@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod eject;
 mod nt_run;
 mod pe_info;
 
@@ -45,6 +46,10 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "eject" => match eject::cmd_eject(&argv[2..])? {
+            Some(exit) => Ok(report_exit(&exit, false)),
+            None => Ok(ExitCode::SUCCESS),
+        },
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
@@ -89,6 +94,7 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
+{}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
 
@@ -159,7 +165,8 @@ run options:
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
                   path the guest can resolve",
-        pe_info::USAGE
+        pe_info::USAGE,
+        eject::USAGE
     );
 }
 
