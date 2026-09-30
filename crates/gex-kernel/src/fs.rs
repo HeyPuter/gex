@@ -59,6 +59,30 @@ impl Stat {
     /// 144 on x86-64, where `st_nlink` widens to 64 bits and precedes
     /// `st_mode` and `st_blksize` is 64 bits.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_for(false)
+    }
+
+    /// As [`Stat::encode`], or the i386 `struct stat64` (96 bytes, packed to
+    /// 4-byte alignment) for a 32-bit process.
+    pub fn encode_for(&self, compat: bool) -> Vec<u8> {
+        if compat {
+            let mut b = vec![0u8; 96];
+            b[0..8].copy_from_slice(&self.dev.to_le_bytes());
+            b[12..16].copy_from_slice(&(self.ino as u32).to_le_bytes());
+            b[16..20].copy_from_slice(&self.mode.to_le_bytes());
+            b[20..24].copy_from_slice(&self.nlink.to_le_bytes());
+            b[24..28].copy_from_slice(&self.uid.to_le_bytes());
+            b[28..32].copy_from_slice(&self.gid.to_le_bytes());
+            b[32..40].copy_from_slice(&self.rdev.to_le_bytes());
+            b[44..52].copy_from_slice(&self.size.to_le_bytes());
+            b[52..56].copy_from_slice(&(self.blksize as u32).to_le_bytes());
+            b[56..64].copy_from_slice(&(self.blocks as u64).to_le_bytes());
+            for off in [64usize, 72, 80] {
+                b[off..off + 4].copy_from_slice(&(self.mtime as u32).to_le_bytes());
+            }
+            b[88..96].copy_from_slice(&self.ino.to_le_bytes());
+            return b;
+        }
         if gex_abi::X86 {
             let mut b = vec![0u8; 144];
             b[0..8].copy_from_slice(&self.dev.to_le_bytes());

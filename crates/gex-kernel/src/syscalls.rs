@@ -463,6 +463,15 @@ pub struct Kernel {
     pub retry_recvmsg: Option<(i32, u64, u64)>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
+    /// A 32-bit (i386) process: its code runs in compatibility mode, it
+    /// enters with `int 0x80`, and its numbering and structures are the i386
+    /// ones (see `crate::i386`). Set at exec from the image's class,
+    /// inherited across fork.
+    pub compat: bool,
+    /// The i386 process entered through the non-rt `sigreturn` (119), whose
+    /// frame is laid out differently from `rt_sigreturn`'s. Set at entry,
+    /// consumed by `sigreturn`.
+    pub sigreturn_legacy: bool,
     /// When this process began, on the guest's clock, so it can be asked how
     /// much time it has used. See [`Kernel::cpu_nanos`].
     ///
@@ -481,8 +490,6 @@ pub struct Kernel {
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
-    /// The same trick for unix sockets, which are a different concrete type.
-    pub unix_sockets: std::collections::HashMap<usize, Arc<unix::UnixSocket>>,
     /// The same, for the ones that live in the global kernel. Two tables
     /// rather than a trait object because the calls that need the concrete
     /// type -- `accept`, `has_pending`, descriptor passing -- are exactly the
@@ -754,6 +761,11 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     // stored "not writable" never moved once the reader drained the buffer.
     if p.events & POLLOUT != 0 && p.writable && h.poll_writable() {
         r |= POLLOUT;
+    }
+    // Never masked by `events`, as on Linux.
+    const POLLHUP: u16 = 0x010;
+    if h.poll_hup() {
+        r |= POLLHUP;
     }
     r
 }
@@ -1049,6 +1061,8 @@ impl Kernel {
             place: None,
             armed_place: None,
             armed_pin: None,
+            compat: false,
+            sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
@@ -1058,7 +1072,6 @@ impl Kernel {
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             sockets: Default::default(),
-            unix_sockets: Default::default(),
             remote_sockets: Default::default(),
             epolls: Default::default(),
             memfds: Default::default(),
@@ -1196,6 +1209,8 @@ impl Kernel {
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let bytes_to_string = |b: Vec<u8>| String::from_utf8(b).map_err(|_| Errno::EINVAL);
         let path = bytes_to_string(m.read_cstr(a[0], 4096)?)?;
+        // A 32-bit process hands over vectors of 32-bit pointers.
+        let compat = self.compat;
         let read_vec = |mut p: u64| -> Result<Vec<String>, Errno> {
             let mut out = Vec::new();
             // A bound, because the vector is the guest's and its terminator
@@ -1204,12 +1219,12 @@ impl Kernel {
                 if p == 0 {
                     break;
                 }
-                let ptr = m.read_u64(p)?;
+                let ptr = if compat { m.read_u32(p)? as u64 } else { m.read_u64(p)? };
                 if ptr == 0 {
                     break;
                 }
                 out.push(bytes_to_string(m.read_cstr(ptr, 4096)?)?);
-                p += 8;
+                p += if compat { 4 } else { 8 };
             }
             Ok(out)
         };
@@ -1269,6 +1284,8 @@ impl Kernel {
             place: self.place.clone(),
             armed_place: None,
             armed_pin: None,
+            compat: self.compat,
+            sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
             new_code: Vec::new(),
@@ -1278,7 +1295,6 @@ impl Kernel {
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             sockets: self.sockets.clone(),
-            unix_sockets: self.unix_sockets.clone(),
             remote_sockets: self.remote_sockets.clone(),
             epolls: self.epolls.clone(),
             memfds: self.memfds.clone(),
@@ -1339,7 +1355,10 @@ impl Kernel {
         m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
         m.write_u64(child + ctx::TID as u64, tid as u64)?;
         if flags & clone_flags::SETTLS != 0 {
-            m.write_u64(child + ctx::TPIDR as u64, tls)?;
+            // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
+            // one's base into %fs.
+            let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
+            m.write_u64(child + slot as u64, tls)?;
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
             m.write_u32(parent_tid, tid as u32)?;
@@ -1380,14 +1399,22 @@ impl Kernel {
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
-        let mut a: [u64; 6] = [
-            self.arg(m, 0),
-            self.arg(m, 1),
-            self.arg(m, 2),
-            self.arg(m, 3),
-            self.arg(m, 4),
-            self.arg(m, 5),
-        ];
+        let mut a: [u64; 6] = if self.compat {
+            let mut a = [0u64; 6];
+            for (i, slot) in crate::i386::ARG_SLOTS.iter().enumerate() {
+                a[i] = m.read_u64(self.ctx_addr + *slot as u64).unwrap_or(0) & 0xffff_ffff;
+            }
+            a
+        } else {
+            [
+                self.arg(m, 0),
+                self.arg(m, 1),
+                self.arg(m, 2),
+                self.arg(m, 3),
+                self.arg(m, 4),
+                self.arg(m, 5),
+            ]
+        };
         // The number's register doubles as the result register on x86-64, so
         // keep the raw number where a host can read it after the fact.
         if gex_abi::X86 {
@@ -1395,7 +1422,19 @@ impl Kernel {
         }
         // An x86-64 guest's numbering is translated to the canonical one, and
         // its legacy calls rewritten into the `*at`/extended forms.
-        let n = if gex_abi::X86 {
+        let mut post = crate::i386::Post::None;
+        let n = if gex_abi::X86 && self.compat {
+            let (n, p) = crate::i386::translate(
+                raw & 0xffff_ffff,
+                &mut a,
+                m,
+                self.ctx_addr + ctx::SCRATCH as u64,
+                self.ctx_addr,
+            );
+            post = p;
+            self.sigreturn_legacy = (raw & 0xffff_ffff) == crate::i386::raw::SIGRETURN;
+            n
+        } else if gex_abi::X86 {
             crate::x86::translate(
                 raw,
                 &mut a,
@@ -1602,6 +1641,15 @@ impl Kernel {
             return SyscallOutcome::Blocking(op);
         }
 
+        if self.trace && n == u64::MAX {
+            // The raw number, since the canonical one below says only "unknown".
+            eprintln!(
+                "[gex:{}] raw syscall {} ({}) has no canonical form",
+                self.pid,
+                raw & 0xffff_ffff,
+                if self.compat { "i386" } else { "native" }
+            );
+        }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
         let outcome = if gex_abi::X86 && n == crate::x86::UNKNOWN {
@@ -1618,7 +1666,10 @@ impl Kernel {
             self.dispatch(m, n, a)
         };
         let ret = match &outcome {
-            Ok(r) => encode(*r),
+            Ok(r) => match r {
+                Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
+                _ => encode(*r),
+            },
             Err(exit) => {
                 if self.trace {
                     eprintln!("[gex:{}] exit_group({exit})", self.pid);
@@ -1923,17 +1974,29 @@ impl Kernel {
             }
             nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
                 // `clock_nanosleep` puts the request in a[2]; `nanosleep` in
-                // a[0]. Neither clock nor the absolute-time flag is modelled.
+                // a[0]. `None` leaves the call to `sys_nanosleep`, which
+                // answers at once: EINVAL for a malformed request, 0 for
+                // one with nothing left to wait for.
                 let req = if n == nr::NANOSLEEP { a[0] } else { a[2] };
                 if req == 0 {
                     return None;
                 }
-                let secs = m.read_u64(req).ok()?;
+                let secs = m.read_u64(req).ok()? as i64;
                 let nanos = m.read_u64(req + 8).ok()?;
-                Some(BlockOp::Sleep(std::time::Duration::new(
-                    secs.min(60),
-                    (nanos % 1_000_000_000) as u32,
-                )))
+                if secs < 0 || nanos >= 1_000_000_000 {
+                    return None;
+                }
+                let mut wait = secs as u128 * 1_000_000_000 + nanos as u128;
+                // TIMER_ABSTIME: a deadline on the clock, not a duration. It
+                // was slept as a duration, so every absolute sleep lasted the
+                // 60 s cap below.
+                const TIMER_ABSTIME: u64 = 1;
+                if n == nr::CLOCK_NANOSLEEP && a[1] & TIMER_ABSTIME != 0 {
+                    wait = wait.checked_sub(self.clock_nanos(a[0])).filter(|&w| w > 0)?;
+                }
+                // Capped, as before: a longer sleep returns early.
+                let wait = wait.min(60_000_000_000) as u64;
+                Some(BlockOp::Sleep(std::time::Duration::from_nanos(wait)))
             }
             _ => None,
         }
@@ -2388,19 +2451,37 @@ impl Kernel {
         if signo == 0 || signo > signal::sig::MAX {
             return Err(Errno::EINVAL);
         }
+        // The i386 struct sigaction is { u32 handler; u32 flags; u32 restorer;
+        // u64 mask }, 20 bytes.
         if old != 0 {
             let a = self.signals.action(signo);
-            m.write_u64(old, a.handler)?;
-            m.write_u64(old + 8, a.flags)?;
-            m.write_u64(old + 16, a.restorer)?;
-            m.write_u64(old + 24, a.mask)?;
+            if self.compat {
+                m.write_u32(old, a.handler as u32)?;
+                m.write_u32(old + 4, a.flags as u32)?;
+                m.write_u32(old + 8, a.restorer as u32)?;
+                m.write_u64(old + 12, a.mask)?;
+            } else {
+                m.write_u64(old, a.handler)?;
+                m.write_u64(old + 8, a.flags)?;
+                m.write_u64(old + 16, a.restorer)?;
+                m.write_u64(old + 24, a.mask)?;
+            }
         }
         if act != 0 {
-            let a = SigAction {
-                handler: m.read_u64(act)?,
-                flags: m.read_u64(act + 8)?,
-                restorer: m.read_u64(act + 16)?,
-                mask: m.read_u64(act + 24)?,
+            let a = if self.compat {
+                SigAction {
+                    handler: m.read_u32(act)? as u64,
+                    flags: m.read_u32(act + 4)? as u64,
+                    restorer: m.read_u32(act + 8)? as u64,
+                    mask: m.read_u64(act + 12)?,
+                }
+            } else {
+                SigAction {
+                    handler: m.read_u64(act)?,
+                    flags: m.read_u64(act + 8)?,
+                    restorer: m.read_u64(act + 16)?,
+                    mask: m.read_u64(act + 24)?,
+                }
             };
             self.signals.set_action(signo, a)?;
         }
@@ -2460,17 +2541,32 @@ impl Kernel {
     }
 
     fn sys_sigaltstack(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
+        // The 32-bit stack_t is { u32 sp; i32 flags; u32 size }.
         if old != 0 {
             let a = self.signals.alt_stack;
-            m.write_u64(old, a.sp)?;
-            m.write_u32(old + 8, a.flags)?;
-            m.write_u64(old + 16, a.size)?;
+            if self.compat {
+                m.write_u32(old, a.sp as u32)?;
+                m.write_u32(old + 4, a.flags)?;
+                m.write_u32(old + 8, a.size as u32)?;
+            } else {
+                m.write_u64(old, a.sp)?;
+                m.write_u32(old + 8, a.flags)?;
+                m.write_u64(old + 16, a.size)?;
+            }
         }
         if new != 0 {
-            self.signals.alt_stack = SigAltStack {
-                sp: m.read_u64(new)?,
-                flags: m.read_u32(new + 8)?,
-                size: m.read_u64(new + 16)?,
+            self.signals.alt_stack = if self.compat {
+                SigAltStack {
+                    sp: m.read_u32(new)? as u64,
+                    flags: m.read_u32(new + 4)?,
+                    size: m.read_u32(new + 8)? as u64,
+                }
+            } else {
+                SigAltStack {
+                    sp: m.read_u64(new)?,
+                    flags: m.read_u32(new + 8)?,
+                    size: m.read_u64(new + 16)?,
+                }
             };
         }
         Ok(0)
@@ -2487,7 +2583,7 @@ impl Kernel {
         if !self.signals.has_pending() {
             return Delivery::None;
         }
-        signal::dispatch(&mut self.signals, m, self.ctx_addr).unwrap_or(Delivery::None)
+        signal::dispatch(&mut self.signals, m, self.ctx_addr, self.compat).unwrap_or(Delivery::None)
     }
 
     /// Move signals other processes have sent into this one's pending set.
@@ -2560,7 +2656,14 @@ impl Kernel {
                 core: true,
             };
         }
-        match signal::setup_frame(&mut self.signals, m, self.ctx_addr, signo, fault_address) {
+        match signal::setup_frame(
+            &mut self.signals,
+            m,
+            self.ctx_addr,
+            signo,
+            fault_address,
+            self.compat,
+        ) {
             Ok(resume) => Delivery::Resume(resume),
             Err(_) => Delivery::Terminate {
                 signal: signo,
@@ -2571,7 +2674,8 @@ impl Kernel {
 
     /// Restore the context a handler frame captured.
     pub fn sigreturn(&mut self, m: &mut GuestMem<'_>) -> Result<u64, Errno> {
-        signal::sigreturn(&mut self.signals, m, self.ctx_addr)
+        let legacy = std::mem::replace(&mut self.sigreturn_legacy, false);
+        signal::sigreturn(&mut self.signals, m, self.ctx_addr, self.compat, legacy)
     }
 
     // -- path helpers --------------------------------------------------------
@@ -2738,20 +2842,31 @@ impl Kernel {
         Ok(copied)
     }
 
-    fn read_iovecs(m: &GuestMem<'_>, iov: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
+    fn read_iovecs(
+        m: &GuestMem<'_>,
+        iov: u64,
+        count: u64,
+        compat: bool,
+    ) -> Result<Vec<(u64, u64)>, Errno> {
         if count > 1024 {
             return Err(Errno::EINVAL);
         }
-        let mut out = Vec::with_capacity(count as usize);
+        let mut v = Vec::with_capacity(count as usize);
         for i in 0..count {
-            let base = iov + i * 16;
-            out.push((m.read_u64(base)?, m.read_u64(base + 8)?));
+            // A 32-bit process's iovec is two 32-bit words.
+            if compat {
+                let base = iov + i * 8;
+                v.push((m.read_u32(base)? as u64, m.read_u32(base + 4)? as u64));
+            } else {
+                let base = iov + i * 16;
+                v.push((m.read_u64(base)?, m.read_u64(base + 8)?));
+            }
         }
-        Ok(out)
+        Ok(v)
     }
 
     fn sys_writev(&mut self, m: &GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        let vecs = Self::read_iovecs(m, iov, count)?;
+        let vecs = Self::read_iovecs(m, iov, count, self.compat)?;
         let file = self.fds.get(fd)?;
         let mut total = 0u64;
         for (base, len) in vecs {
@@ -2785,7 +2900,7 @@ impl Kernel {
     }
 
     fn sys_readv(&mut self, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
-        let vecs = Self::read_iovecs(m, iov, count)?;
+        let vecs = Self::read_iovecs(m, iov, count, self.compat)?;
         let file = self.fds.get(fd)?;
         let mut total = 0u64;
         for (base, len) in vecs {
@@ -3306,7 +3421,7 @@ impl Kernel {
 
     fn sys_fstat(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
         let md = self.fds.get(fd)?.metadata()?;
-        m.write(buf, &Self::stat_from(&md).encode())?;
+        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
         Ok(0)
     }
 
@@ -3329,7 +3444,7 @@ impl Kernel {
             self.vfs.metadata(&p)
         };
         let md = md?;
-        m.write(buf, &Self::stat_from(&md).encode())?;
+        m.write(buf, &Self::stat_from(&md).encode_for(self.compat))?;
         Ok(0)
     }
 
@@ -4451,8 +4566,9 @@ impl Kernel {
         if let Some((path, base)) = pinned {
             self.pin_landed.push((path, base, start));
         }
-        // Anonymous memory is defined to read as zero.
-        m.zero(start, crate::mem::page_align_up(len) as usize)?;
+        // Anonymous memory is defined to read as zero. Pages that already
+        // are stay untouched, so a large reservation costs no memory.
+        m.zero_dirty(start, crate::mem::page_align_up(len) as usize)?;
         Ok(start)
     }
 
@@ -4620,11 +4736,13 @@ impl Kernel {
         Ok(fd)
     }
 
-    /// The unix socket behind a descriptor, if it is one.
+    /// The unix socket behind a descriptor, if it is one. Asked of the
+    /// handle itself: a per-process table of the sockets this process made
+    /// did not know one that arrived over `SCM_RIGHTS`, so sending or
+    /// receiving descriptors through it silently carried none.
     fn unix_of(&self, fd: i32) -> Result<Arc<unix::UnixSocket>, Errno> {
         let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.unix_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        Arc::clone(&file.handle).as_unix_socket().ok_or(Errno::ENOTSOCK)
     }
 
     /// The same for a socket that lives in the global kernel.
@@ -4656,15 +4774,10 @@ impl Kernel {
         Ok(())
     }
 
-    /// Put a unix socket in the descriptor table and remember the concrete
-    /// type, the way `sys_socket` does for an internet one.
+    /// Put a unix socket in the descriptor table.
     fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
-        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
-        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
-        let fd = self.fds.insert(file, cloexec)?;
-        self.unix_sockets.insert(key, sock);
-        Ok(fd)
+        let file = OpenFile::new(sock, "socket".to_string(), flags, true, true);
+        self.fds.insert(file, cloexec)
     }
 
     /// The path out of a `struct sockaddr_un`: a two-byte family then up to
@@ -5499,7 +5612,7 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            gex_abi::ARCH_NAME,
+            if self.compat { "i686" } else { gex_abi::ARCH_NAME },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
@@ -5552,14 +5665,27 @@ impl Kernel {
 
     fn sys_nanosleep(&mut self, m: &GuestMem<'_>, req: u64) -> SysResult {
         if req == 0 {
-            return Ok(0);
+            return Err(Errno::EFAULT);
         }
-        let secs = m.read_u64(req)?;
+        let secs = m.read_u64(req)? as i64;
         let nanos = m.read_u64(req + 8)?;
-        let _ = (secs, nanos);
+        if secs < 0 || nanos >= 1_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
         // The sleep itself is `BlockOp::Sleep`, run by the host with the
-        // kernel unlocked; reaching here means a zero request.
+        // kernel unlocked; reaching here means nothing to wait for: a zero
+        // request, or a deadline already past.
         Ok(0)
+    }
+
+    /// Now on `clk`, in nanoseconds, as `clock_gettime` would answer it.
+    fn clock_nanos(&mut self, clk: u64) -> u128 {
+        const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+        const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+        match clk {
+            CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => self.cpu_nanos(),
+            _ => self.now_nanos(),
+        }
     }
 
     /// How much time this process has used, in nanoseconds: wall clock since
@@ -5601,11 +5727,29 @@ impl Kernel {
         if buf == 0 {
             return Err(Errno::EFAULT);
         }
-        m.zero(buf, 112)?;
-        m.write_u64(buf, 1000)?; // uptime
-        m.write_u64(buf + 40, 4 * 1024 * 1024 * 1024)?; // totalram
-        m.write_u64(buf + 48, 2 * 1024 * 1024 * 1024)?; // freeram
-        m.write_u32(buf + 96, 1)?; // procs
+        // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
+        // bufferram, totalswap, freeswap, procs (u16), totalhigh, freehigh,
+        // mem_unit. The 64-bit layout has 8-byte longs (112 bytes); the i386
+        // one 4-byte longs (64 bytes), where 4 GiB does not fit and memory
+        // is counted in pages through mem_unit. glibc's qsort asks sysconf
+        // for the physical pages once a sort has 256 elements, and its
+        // caller's frame is exactly this struct's size: the wide layout in a
+        // 32-bit process overwrote the stack canary.
+        if self.compat {
+            m.zero(buf, 64)?;
+            m.write_u32(buf, 1000)?; // uptime
+            m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
+            m.write_u32(buf + 20, 1 << 19)?; // freeram
+            m.write(buf + 40, &1u16.to_le_bytes())?; // procs
+            m.write_u32(buf + 52, 4096)?; // mem_unit
+        } else {
+            m.zero(buf, 112)?;
+            m.write_u64(buf, 1000)?; // uptime
+            m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
+            m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
+            m.write(buf + 80, &1u16.to_le_bytes())?; // procs
+            m.write_u32(buf + 104, 1)?; // mem_unit
+        }
         Ok(0)
     }
 
@@ -5980,6 +6124,67 @@ mod tests {
         k.vfs.mount("/", Arc::new(TmpFs::new()));
         k.vfs.mount("/dev", Arc::new(crate::vfs::DevFs::new()));
         (mem, k)
+    }
+
+    /// A unix socket that arrived over SCM_RIGHTS is placed straight in the
+    /// descriptor table, never through `install_unix`; it must still be one
+    /// to the calls that pass descriptors. (A per-process side table made it
+    /// ENOTSOCK there, and `sendmsg`/`recvmsg` then carried no descriptors.)
+    #[test]
+    fn a_received_unix_socket_is_still_a_unix_socket() {
+        let (_mem, mut k) = setup();
+        let (a, _b) = unix::UnixSocket::pair();
+        let fd = k
+            .fds
+            .insert(OpenFile::new(a.clone(), "socket".into(), 0, true, true), false)
+            .unwrap() as i32;
+        assert!(Arc::ptr_eq(&k.unix_of(fd).unwrap(), &a));
+        // Anything else is not.
+        let r = Arc::new(Pipe::new());
+        let pfd = k
+            .fds
+            .insert(
+                OpenFile::new(Arc::new(crate::file::PipeEnd { pipe: r, write: false }), "pipe".into(), 0, true, false),
+                false,
+            )
+            .unwrap() as i32;
+        assert_eq!(k.unix_of(pfd).err(), Some(Errno::ENOTSOCK));
+    }
+
+    /// What `clock_nanosleep` turns into: a sleep of the time left for an
+    /// absolute deadline (none if it has passed), EINVAL for a malformed
+    /// request instead of a sleep.
+    #[test]
+    fn clock_nanosleep_honours_absolute_deadlines() {
+        let (mut mem, mut k) = setup();
+        let at = 0x2000u64;
+        let ask = |k: &mut Kernel, mem: &mut Vec<u8>, flags: u64, secs: i64, nanos: u64| {
+            mem[at as usize..at as usize + 8].copy_from_slice(&secs.to_le_bytes());
+            mem[at as usize + 8..at as usize + 16].copy_from_slice(&nanos.to_le_bytes());
+            let m = GuestMem::new(mem);
+            let op = k.blocking_op(&m, nr::CLOCK_NANOSLEEP, [1, flags, at, 0, 0, 0]);
+            let now = match op {
+                None => Some(k.sys_nanosleep(&m, at)),
+                Some(_) => None,
+            };
+            (op, now)
+        };
+        let now = k.now_nanos() as i64 / 1_000_000_000;
+        // Relative: slept as given.
+        match ask(&mut k, &mut mem, 0, 0, 5_000_000) {
+            (Some(BlockOp::Sleep(d)), _) => assert_eq!(d, std::time::Duration::from_millis(5)),
+            other => panic!("{other:?}"),
+        }
+        // Absolute, two seconds ahead: about two seconds, not the 60 s cap.
+        match ask(&mut k, &mut mem, 1, now + 2, 0) {
+            (Some(BlockOp::Sleep(d)), _) => assert!(d <= std::time::Duration::from_secs(2), "{d:?}"),
+            other => panic!("{other:?}"),
+        }
+        // Absolute and already past: returns at once.
+        assert!(matches!(ask(&mut k, &mut mem, 1, now - 5, 0), (None, Some(Ok(0)))));
+        // Malformed: EINVAL, not a sleep.
+        assert!(matches!(ask(&mut k, &mut mem, 0, -1, 0), (None, Some(Err(Errno::EINVAL)))));
+        assert!(matches!(ask(&mut k, &mut mem, 0, 0, 1_000_000_000), (None, Some(Err(Errno::EINVAL)))));
     }
 
     /// The terminal, as a program sees it through `ioctl`.

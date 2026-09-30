@@ -518,6 +518,16 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
                 }
             }
             Stmt::Fence => {}
+            Stmt::Trap { .. } => {
+                // Taken, it hands the exact context to a signal handler,
+                // which may leave by longjmp: every register is read and
+                // may escape. Not taken, nothing happens, so the state
+                // carries on unchanged. (Like an illegal instruction, a
+                // handler that resumes the frame elsewhere is not modelled.)
+                acc.may_unwind = true;
+                acc.inputs = acc.inputs.union(RegSet::ALL.minus(st.written));
+                escape_regs(st, acc);
+            }
         }
     }
     vals

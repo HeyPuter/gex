@@ -2,20 +2,30 @@
 //! opcode maps, ModRM/SIB, x87, and enough VEX/EVEX to know an instruction's
 //! length.
 
+use crate::Mode;
 use crate::*;
 
 /// Decode the instruction at the start of `bytes`, which lies at guest
 /// address `pc`. `bytes` may be shorter than 15; a sequence the slice cuts
 /// short decodes as `Unknown` of length 1.
 pub fn decode(bytes: &[u8], pc: u64) -> Inst {
+    decode_in(crate::mode(), bytes, pc)
+}
+
+/// Decode in an explicit mode (see [`crate::Mode`]).
+pub fn decode_in(mode: Mode, bytes: &[u8], pc: u64) -> Inst {
     let mut d = Decoder {
         b: bytes,
         pos: 0,
         pc,
+        mode,
         rex: 0,
         has_rex: false,
         op16: false,
-        addr32: false,
+        // In compatibility mode every address is 32 bits wide; the flag is
+        // what makes the lifter wrap the arithmetic, so it is on from the
+        // start there and 0x67 (16-bit addressing) is refused.
+        addr32: mode == Mode::Compat,
         seg: None,
         rep: Rep::None,
         lock: false,
@@ -67,6 +77,7 @@ enum Mand {
 }
 
 struct Decoder<'a> {
+    mode: Mode,
     b: &'a [u8],
     pos: usize,
     pc: u64,
@@ -151,7 +162,7 @@ impl<'a> Decoder<'a> {
 
     /// Operand width for the ordinary `v`-sized operations.
     fn wv(&self) -> Width {
-        if self.rex_w() {
+        if self.mode == Mode::Long && self.rex_w() {
             Width::Q
         } else if self.op16 {
             Width::W
@@ -165,7 +176,26 @@ impl<'a> Decoder<'a> {
         if self.op16 {
             Width::W
         } else {
+            self.wa()
+        }
+    }
+    /// The address width: the size of a pushed return address, of `ret`'s
+    /// pop, and of an indirect branch target.
+    fn wa(&self) -> Width {
+        if self.mode == Mode::Compat {
+            Width::D
+        } else {
             Width::Q
+        }
+    }
+    /// A branch target computed from a relative displacement, wrapped to the
+    /// address width.
+    fn rel_target(&self, rel: i64) -> i64 {
+        let t = (self.pc as i64).wrapping_add(self.pos as i64).wrapping_add(rel);
+        if self.mode == Mode::Compat {
+            t & 0xffff_ffff
+        } else {
+            t
         }
     }
     /// The `z`-sized immediate: 16 or 32 bits, sign-extended.
@@ -244,7 +274,8 @@ impl<'a> Decoder<'a> {
                 mem.base = Some(base3 | (self.rex_b() << 3));
             }
         } else if rm3 == 5 && md == 0 {
-            mem.rip = true;
+            // RIP-relative in long mode; a plain absolute disp32 in 32-bit code.
+            mem.rip = self.mode == Mode::Long;
             mem.disp = self.i32()?;
         } else {
             mem.base = Some(rm3 | (self.rex_b() << 3));
@@ -360,14 +391,20 @@ impl<'a> Decoder<'a> {
                         self.mand = Mand::P66;
                     }
                 }
-                0x67 => self.addr32 = true,
+                0x67 => {
+                    if self.mode == Mode::Compat {
+                        // 16-bit addressing: nothing gex runs uses it.
+                        return Err(());
+                    }
+                    self.addr32 = true;
+                }
                 0x26 => self.seg = Some(Seg::Es),
                 0x2e => self.seg = Some(Seg::Cs),
                 0x36 => self.seg = Some(Seg::Ss),
                 0x3e => self.seg = Some(Seg::Ds),
                 0x64 => self.seg = Some(Seg::Fs),
                 0x65 => self.seg = Some(Seg::Gs),
-                0x40..=0x4f => {
+                0x40..=0x4f if self.mode == Mode::Long => {
                     // REX must be the last prefix; if another prefix follows
                     // it, the REX is dropped and prefix parsing continues.
                     match self.peek() {
@@ -437,8 +474,26 @@ impl<'a> Decoder<'a> {
                     }
                 });
             }
+            // push/pop of a segment register: 32-bit code only.
+            0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f if self.mode == Mode::Compat => {
+                let seg = match op >> 3 {
+                    0 => Seg::Es,
+                    1 => Seg::Cs,
+                    2 => Seg::Ss,
+                    _ => Seg::Ds,
+                };
+                let o = if op & 1 == 0 { Op::Push } else { Op::Pop };
+                return Ok(self.i1(o, Width::D, Operand::Reg(Reg::Seg(seg))));
+            }
             0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f | 0x27 | 0x2f | 0x37 | 0x3f => {
                 return Ok(self.i0(Op::Undefined, Width::D))
+            }
+            // inc/dec r32 -- in long mode these bytes are REX and never reach
+            // here.
+            0x40..=0x4f => {
+                let w = self.wv();
+                let o = if op < 0x48 { Op::Inc } else { Op::Dec };
+                return Ok(self.i1(o, w, self.gp(op & 7, w)));
             }
             0x50..=0x57 => {
                 let w = self.w64();
@@ -449,6 +504,9 @@ impl<'a> Decoder<'a> {
                 return Ok(self.i1(Op::Pop, w, self.gp((op & 7) | (self.rex_b() << 3), w)));
             }
             0x63 => {
+                if self.mode == Mode::Compat {
+                    return Ok(self.unk()); // arpl
+                }
                 // movsxd r64, r/m32 (with REX.W); without it a plain 32-bit mov.
                 let w = self.wv();
                 let m = self.modrm()?;
@@ -475,8 +533,8 @@ impl<'a> Decoder<'a> {
             0x6c..=0x6f => return Ok(self.unk()), // ins/outs
             0x70..=0x7f => {
                 let rel = self.i8()?;
-                let target = (self.pc as i64).wrapping_add(self.pos as i64).wrapping_add(rel);
-                return Ok(self.i1(Op::Jcc(Cond(op & 15)), Width::Q, Operand::Imm(target)));
+                let target = self.rel_target(rel);
+                return Ok(self.i1(Op::Jcc(Cond(op & 15)), self.wa(), Operand::Imm(target)));
             }
             0x80 | 0x81 | 0x83 => {
                 let w = if op == 0x80 { Width::B } else { self.wv() };
@@ -573,6 +631,10 @@ impl<'a> Decoder<'a> {
                 let w = if op & 1 == 0 { Width::B } else { self.wv() };
                 let addr = if self.addr32 { self.i32()? & 0xffff_ffff } else { self.u64()? };
                 let mut mem = Mem::abs(addr);
+                // A 32-bit moffs with a segment is `seg_base + disp32` wrapped
+                // at 32 bits: TLS lives *below* %gs on i386, so the offset is
+                // usually negative.
+                mem.addr32 = self.addr32;
                 mem.seg = match self.seg {
                     Some(Seg::Fs) | Some(Seg::Gs) => self.seg,
                     _ => None,
@@ -623,9 +685,9 @@ impl<'a> Decoder<'a> {
             }
             0xc2 => {
                 let imm = self.u16()? as i64;
-                return Ok(self.i1(Op::Ret, Width::Q, Operand::Imm(imm)));
+                return Ok(self.i1(Op::Ret, self.wa(), Operand::Imm(imm)));
             }
-            0xc3 => return Ok(self.i0(Op::Ret, Width::Q)),
+            0xc3 => return Ok(self.i0(Op::Ret, self.wa())),
             0xc6 | 0xc7 => {
                 let w = if op == 0xc6 { Width::B } else { self.wv() };
                 let m = self.modrm()?;
@@ -638,7 +700,7 @@ impl<'a> Decoder<'a> {
             0xc8 => {
                 let size = self.u16()? as i64;
                 let nest = self.u8()? as i64;
-                return Ok(self.i2(Op::Enter, Width::Q, Operand::Imm(size), Operand::Imm(nest)));
+                return Ok(self.i2(Op::Enter, self.wa(), Operand::Imm(size), Operand::Imm(nest)));
             }
             0xc9 => return Ok(self.i0(Op::Leave, self.w64())),
             0xcc => return Ok(self.i0(Op::Int3, Width::D)),
@@ -649,7 +711,7 @@ impl<'a> Decoder<'a> {
             0xd8..=0xdf => return self.x87(op),
             0xe0..=0xe3 => {
                 let rel = self.i8()?;
-                let target = (self.pc as i64).wrapping_add(self.pos as i64).wrapping_add(rel);
+                let target = self.rel_target(rel);
                 let o = match op {
                     0xe0 => Op::Loopne,
                     0xe1 => Op::Loope,
@@ -662,14 +724,14 @@ impl<'a> Decoder<'a> {
             }
             0xe8 | 0xe9 => {
                 let rel = self.i32()?;
-                let target = (self.pc as i64).wrapping_add(self.pos as i64).wrapping_add(rel);
+                let target = self.rel_target(rel);
                 let o = if op == 0xe8 { Op::Call } else { Op::Jmp };
-                return Ok(self.i1(o, Width::Q, Operand::Imm(target)));
+                return Ok(self.i1(o, self.wa(), Operand::Imm(target)));
             }
             0xeb => {
                 let rel = self.i8()?;
-                let target = (self.pc as i64).wrapping_add(self.pos as i64).wrapping_add(rel);
-                return Ok(self.i1(Op::Jmp, Width::Q, Operand::Imm(target)));
+                let target = self.rel_target(rel);
+                return Ok(self.i1(Op::Jmp, self.wa(), Operand::Imm(target)));
             }
             0xf1 => return Ok(self.i0(Op::Int, Width::D)),
             0xf4 => return Ok(self.i0(Op::Hlt, Width::D)),
@@ -716,8 +778,8 @@ impl<'a> Decoder<'a> {
                         let w = self.wv();
                         self.i1(Op::Dec, w, self.e(&m, w))
                     }
-                    2 => self.i1(Op::Call, Width::Q, self.e(&m, Width::Q)),
-                    4 => self.i1(Op::Jmp, Width::Q, self.e(&m, Width::Q)),
+                    2 => self.i1(Op::Call, self.wa(), self.e(&m, self.wa())),
+                    4 => self.i1(Op::Jmp, self.wa(), self.e(&m, self.wa())),
                     6 => {
                         let w = self.w64();
                         self.i1(Op::Push, w, self.e(&m, w))
@@ -726,6 +788,16 @@ impl<'a> Decoder<'a> {
                     _ => self.unk(),
                 });
             }
+            // In 32-bit code c4/c5 are VEX only when the next byte has mod=11;
+            // otherwise they are les/lds, and 62 is bound -- none of which
+            // compiled code uses.
+            0xc4 | 0xc5 if self.mode == Mode::Compat => {
+                return match self.peek() {
+                    Some(b) if b >= 0xc0 => self.vex(op),
+                    _ => Ok(self.unk()),
+                };
+            }
+            0x62 if self.mode == Mode::Compat => return Ok(self.unk()),
             0xc4 | 0xc5 => return self.vex(op),
             0x62 => return self.evex(),
             _ => {}
@@ -790,8 +862,8 @@ impl<'a> Decoder<'a> {
             }
             0x80..=0x8f => {
                 let rel = self.i32()?;
-                let target = (self.pc as i64).wrapping_add(self.pos as i64).wrapping_add(rel);
-                return Ok(self.i1(Op::Jcc(Cond(op & 15)), Width::Q, Operand::Imm(target)));
+                let target = self.rel_target(rel);
+                return Ok(self.i1(Op::Jcc(Cond(op & 15)), self.wa(), Operand::Imm(target)));
             }
             0x90..=0x9f => {
                 let m = self.modrm()?;

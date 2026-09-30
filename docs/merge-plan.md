@@ -34,6 +34,9 @@ work; its "Direction" section, §12 and §16 were updated for this merge).
 | Ejected builds and code nobody has seen | Fail loudly by default, as pewasm does. Including a JIT fallback (the lifter plus the tier-1 emitter) is a per-build flag. |
 | Windows programs | A native NT-syscall and win32u layer in gex-kernel, with Wine's PE DLLs unchanged on top. Plus per-DLL native redirects for hot paths (opengl32, dsound, dinput, CRT). Not a wholesale port of pewasm's Win32 host. |
 | Profiles | Guest-level, keyed by (object content hash, offset). A profile only ever changes speed, never correctness. |
+| Win32u callbacks (win32u calling user32 in the middle of a syscall) | **A nested guest loop** (option (a) in `docs/nt-layer-scope.md` §7). The kernel handler re-enters the execution loop recursively. Windows has no fork/exec, so gex's flat-stack invariants aren't at risk. Same nesting model as the function tier. |
+| Wine version | Pin **Wine 11.15** and vendor its PE DLLs. win32u sub-codes, callback ids and the shared-memory layouts are tied to one release. |
+| 32-bit Windows syscalls | Implement the 32-bit NT ABI thunks natively in gex-kernel, rather than running Wine's wow64 DLLs. |
 
 ---
 
@@ -294,7 +297,9 @@ soundness corpus, and whichever demos it touches.
 - **`--jit-fallback`** (off by default): ship the lifter and the tier-1
   emitter, so unseen code gets translated instead of trapping.
 
-### M6: Windows programs (5–8 days, can run in parallel with M3–M5)
+### M6: Windows programs (10–14 days, can run in parallel with M3–M5)
+
+Scoped in `docs/nt-layer-scope.md` (stream S8). Noita + winemine + a small GUI program need 68 of Wine's 270 NT syscalls, 98 of its 484 win32u calls and 122 of its 308 wineserver requests. The estimate is ~21–29k lines of new Rust for Noita and ~31–42k with winemine and notepad (gex-kernel is 17.5k today), so the original 5–8 days was too low. Build it in the order that doc's §8 recommends: x64 console → threads, sync, exceptions → 32-bit ABI → USER core + minimal GDI for Noita's menu → rest of Noita → winemine → notepad. Noita's GL goes through opengl32's unixlib, not the NT boundary, so the opengl32 redirect covers it. The helper processes (services, winedevice, plugplay, rpcss, explorer) aren't needed if the redirects and stubs are done right.
 
 - **PE loading in gex-ld:** relocations, imports, delay imports, exports,
   TLS callbacks, resources, forwarded exports. The logic can be ported from

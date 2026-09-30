@@ -85,6 +85,19 @@ mod tests {
         }
     }
 
+    /// `fpatan` (d9 f3) is handed to the host rather than raising SIGILL:
+    /// i386 musl's `atan2` is this one instruction.
+    #[test]
+    fn x87_transcendentals_go_to_the_host() {
+        // fpatan ; ret
+        let b = lift_block(bytes(0x1000, &[0xd9, 0xf3, 0xc3]), 0x1000, BlockLimits::default());
+        assert!(matches!(b.term, Term::Indirect { is_ret: true, .. }), "{}", print::block(&b));
+        assert!(b.stmts.iter().any(|s| matches!(
+            s,
+            Stmt::HostCall { func: gex_ir::HostFunc::SysRegWrite, .. }
+        )));
+    }
+
     #[test]
     fn straight_line_ends_at_ret() {
         // mov eax, 1 ; mov ecx, 2 ; ret

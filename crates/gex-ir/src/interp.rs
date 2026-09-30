@@ -38,6 +38,9 @@ pub enum Stop {
     Leave(u64),
     /// Reached an illegal instruction.
     Illegal(u64),
+    /// A [`Stmt::Trap`] was taken: the instruction at this pc faulted with
+    /// this code.
+    Fault(u64, i32),
     /// Ran for the step budget without leaving.
     Budget,
     /// Hit something the interpreter does not model, at this guest pc.
@@ -249,6 +252,11 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
                     }
                 }
                 Stmt::Fence => {}
+                Stmt::Trap { cond, pc, code } => match get(&vals, *cond) {
+                    Some(0) => {}
+                    Some(_) => finish!(Stop::Fault(*pc, *code)),
+                    None => finish!(unsupported()),
+                },
                 _ => finish!(unsupported()),
             }
         }

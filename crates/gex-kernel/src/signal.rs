@@ -137,6 +137,11 @@ pub struct Signals {
     pub alt_stack: SigAltStack,
     /// Set while a handler runs, so `rt_sigreturn` knows a frame exists.
     pub in_handler: bool,
+    /// The i386 frame most recently set up was the non-rt `sigframe` (a
+    /// handler without `SA_SIGINFO`), whose `sigreturn` reads a different
+    /// layout. Decided where the frame is written, because the return may
+    /// arrive through the host trampoline as well as through `int 0x80`.
+    pub legacy_frame: bool,
     /// The mask a signal frame should record instead of the current one.
     ///
     /// `rt_sigsuspend` runs with a caller-chosen mask and must restore the old
@@ -167,6 +172,7 @@ impl Signals {
             suspend_restore: None,
             alt_stack: self.alt_stack,
             in_handler: false,
+            legacy_frame: false,
         }
     }
 
@@ -208,6 +214,7 @@ impl Signals {
             suspend_restore: None,
             alt_stack: SigAltStack::default(),
             in_handler: false,
+            legacy_frame: false,
         }
     }
 
@@ -375,7 +382,11 @@ pub fn setup_frame(
     ctx_addr: u64,
     signal: u32,
     fault_address: u64,
+    compat: bool,
 ) -> Result<u64, Errno> {
+    if gex_abi::X86 && compat {
+        return setup_frame_i386(signals, m, ctx_addr, signal, fault_address);
+    }
     if gex_abi::X86 {
         return setup_frame_x86(signals, m, ctx_addr, signal, fault_address);
     }
@@ -604,6 +615,254 @@ fn sigreturn_x86(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> 
     Ok(pc)
 }
 
+/// The i386 signal frames (`arch/x86/ia32/ia32_signal.c`). Every field is a
+/// 32-bit word; the frame sits on the 32-bit stack and the handler is entered
+/// as if called, with `esp` at the return address.
+///
+/// `struct sigcontext_ia32` (88 bytes):
+///   gs fs es ds (selector words) | edi esi ebp esp ebx edx ecx eax | trapno
+///   err | eip cs eflags esp_at_signal ss | fpstate oldmask cr2
+/// `struct sigframe_ia32`: pretcode sig sigcontext extramask retcode
+/// `struct rt_sigframe_ia32`: pretcode sig pinfo puc siginfo(128) ucontext
+///   where ucontext is uc_flags uc_link uc_stack(12) uc_mcontext(88)
+///   uc_sigmask(8).
+mod iframe {
+    pub const SC_GS: u64 = 0;
+    pub const SC_FS: u64 = 4;
+    pub const SC_ES: u64 = 8;
+    pub const SC_DS: u64 = 12;
+    /// edi esi ebp esp ebx edx ecx eax, as context register numbers.
+    pub const GPR_ORDER: [u8; 8] = [7, 6, 5, 4, 3, 2, 1, 0];
+    pub const SC_GPRS: u64 = 16;
+    pub const SC_TRAPNO: u64 = 48;
+    pub const SC_ERR: u64 = 52;
+    pub const SC_EIP: u64 = 56;
+    pub const SC_CS: u64 = 60;
+    pub const SC_EFLAGS: u64 = 64;
+    pub const SC_ESP_AT_SIGNAL: u64 = 68;
+    pub const SC_SS: u64 = 72;
+    pub const SC_FPSTATE: u64 = 76;
+    pub const SC_OLDMASK: u64 = 80;
+    pub const SC_CR2: u64 = 84;
+    pub const SC_SIZE: u64 = 88;
+
+    // sigframe_ia32
+    pub const SF_SIG: u64 = 4;
+    pub const SF_SC: u64 = 8;
+    pub const SF_EXTRAMASK: u64 = SF_SC + SC_SIZE; // 96
+    pub const SF_SIZE: u64 = 112;
+
+    // rt_sigframe_ia32
+    pub const RT_SIG: u64 = 4;
+    pub const RT_PINFO: u64 = 8;
+    pub const RT_PUC: u64 = 12;
+    pub const RT_INFO: u64 = 16;
+    pub const RT_UC: u64 = 144;
+    pub const UC_STACK: u64 = 8;
+    pub const UC_MCONTEXT: u64 = 20;
+    pub const UC_SIGMASK: u64 = UC_MCONTEXT + SC_SIZE; // 108
+    pub const RT_SIZE: u64 = 272;
+
+    /// `struct _fpstate_ia32` with an fxsave image: the legacy words first,
+    /// `magic` at 110, then the fxsave environment (mxcsr at 136) and the
+    /// xmm registers at 272.
+    pub const FPSTATE_SIZE: usize = 624;
+    pub const FP_MXCSR: u64 = 136;
+    pub const FP_XMM: u64 = 272;
+
+    pub const USER32_CS: u32 = 0x23;
+    pub const USER_DS: u32 = 0x2b;
+    /// The TLS entry glibc's i386 port loads into %gs: GDT entry 6, RPL 3.
+    pub const GS_TLS: u32 = 0x33;
+}
+
+fn setup_frame_i386(
+    signals: &mut Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    signal: u32,
+    fault_address: u64,
+) -> Result<u64, Errno> {
+    let action = signals.action(signal);
+    let sp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
+    let rt = action.flags & sa::SIGINFO != 0;
+    signals.legacy_frame = !rt;
+
+    let on_alt = action.flags & sa::ONSTACK != 0 && signals.alt_stack.size > 0;
+    let base = if on_alt {
+        let alt = &signals.alt_stack;
+        let top = alt.sp + alt.size;
+        if sp > alt.sp && sp <= top {
+            sp
+        } else {
+            top
+        }
+    } else {
+        sp
+    };
+
+    // The FP image above the frame, then the frame such that `esp + 4` is
+    // 16-byte aligned on handler entry, as after a `call`.
+    let fpstate = (base - iframe::FPSTATE_SIZE as u64) & !63;
+    let size = if rt { iframe::RT_SIZE } else { iframe::SF_SIZE };
+    let frame_addr = ((fpstate - size) & !0xf) - 4;
+    m.zero(frame_addr, size as usize)?;
+    m.zero(fpstate, iframe::FPSTATE_SIZE)?;
+
+    let ret = if action.flags & sa::RESTORER != 0 && action.restorer != 0 {
+        action.restorer
+    } else {
+        SIGRETURN_TRAMPOLINE
+    };
+    m.write_u32(frame_addr, ret as u32)?;
+
+    let sc = if rt {
+        m.write_u32(frame_addr + iframe::RT_SIG, signal)?;
+        let info = frame_addr + iframe::RT_INFO;
+        let uc = frame_addr + iframe::RT_UC;
+        m.write_u32(frame_addr + iframe::RT_PINFO, info as u32)?;
+        m.write_u32(frame_addr + iframe::RT_PUC, uc as u32)?;
+        m.write_u32(info, signal)?;
+        m.write_u32(info + 8, fault_code(signal))?;
+        if matches!(
+            signal,
+            sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE
+        ) {
+            m.write_u32(info + 12, fault_address as u32)?;
+        }
+        m.write_u32(uc, 0)?;
+        m.write_u32(uc + 4, 0)?;
+        m.write_u32(uc + iframe::UC_STACK, signals.alt_stack.sp as u32)?;
+        m.write_u32(uc + iframe::UC_STACK + 4, signals.alt_stack.flags)?;
+        m.write_u32(uc + iframe::UC_STACK + 8, signals.alt_stack.size as u32)?;
+        m.write_u64(
+            uc + iframe::UC_SIGMASK,
+            signals.suspend_restore.take().unwrap_or(signals.blocked),
+        )?;
+        uc + iframe::UC_MCONTEXT
+    } else {
+        m.write_u32(frame_addr + iframe::SF_SIG, signal)?;
+        let mask = signals.suspend_restore.take().unwrap_or(signals.blocked);
+        m.write_u32(frame_addr + iframe::SF_EXTRAMASK, (mask >> 32) as u32)?;
+        frame_addr + iframe::SF_SC
+    };
+
+    m.write_u32(sc + iframe::SC_GS, iframe::GS_TLS)?;
+    m.write_u32(sc + iframe::SC_FS, 0)?;
+    m.write_u32(sc + iframe::SC_ES, iframe::USER_DS)?;
+    m.write_u32(sc + iframe::SC_DS, iframe::USER_DS)?;
+    for (i, reg) in iframe::GPR_ORDER.iter().enumerate() {
+        let v = m.read_u64(ctx_addr + ctx::x(*reg) as u64)?;
+        m.write_u32(sc + iframe::SC_GPRS + i as u64 * 4, v as u32)?;
+    }
+    let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
+    m.write_u32(sc + iframe::SC_TRAPNO, if signal == sig::SIGSEGV { 14 } else { 0 })?;
+    m.write_u32(sc + iframe::SC_ERR, 0)?;
+    m.write_u32(sc + iframe::SC_EIP, pc as u32)?;
+    m.write_u32(sc + iframe::SC_CS, iframe::USER32_CS)?;
+    m.write_u32(sc + iframe::SC_EFLAGS, read_rflags(m, ctx_addr)? as u32)?;
+    m.write_u32(sc + iframe::SC_ESP_AT_SIGNAL, sp as u32)?;
+    m.write_u32(sc + iframe::SC_SS, iframe::USER_DS)?;
+    m.write_u32(sc + iframe::SC_FPSTATE, fpstate as u32)?;
+    m.write_u32(sc + iframe::SC_OLDMASK, signals.blocked as u32)?;
+    m.write_u32(sc + iframe::SC_CR2, fault_address as u32)?;
+
+    // The FP image: x87 control word, MXCSR and the eight xmm registers.
+    m.write_u32(fpstate, m.read_u32(ctx_addr + ctx::X87_CW as u64)? & 0xffff)?;
+    m.write_u32(fpstate + iframe::FP_MXCSR, m.read_u32(ctx_addr + ctx::MXCSR as u64)?)?;
+    for n in 0..8u8 {
+        for half in 0..2u64 {
+            let v = m.read_u64(ctx_addr + ctx::v(n) as u64 + half * 8)?;
+            m.write_u64(fpstate + iframe::FP_XMM + n as u64 * 16 + half * 8, v)?;
+        }
+    }
+
+    signals.blocked |= action.mask;
+    if action.flags & sa::NODEFER == 0 {
+        signals.blocked |= bit(signal);
+    }
+    signals.pending &= !bit(signal);
+    signals.in_handler = true;
+    if action.flags & sa::RESETHAND != 0 {
+        let _ = signals.set_action(signal, SigAction::default());
+    }
+
+    if std::env::var_os("GEX_SIGTRACE").is_some() {
+        eprintln!(
+            "[sig] i386 frame for {signal}: rt={rt} frame=0x{frame_addr:x} sc=0x{sc:x} fpstate=0x{fpstate:x} \
+             handler=0x{:x} restorer=0x{:x} flags=0x{:x} interrupted pc=0x{pc:x} esp=0x{sp:x}",
+            action.handler, action.restorer, action.flags
+        );
+    }
+    // esp = frame; eax = signo; for an rt frame edx = &info and ecx = &uc.
+    m.write_u64(ctx_addr + ctx::SP as u64, frame_addr)?;
+    m.write_u64(ctx_addr + ctx::x(0) as u64, signal as u64)?;
+    if rt {
+        m.write_u64(ctx_addr + ctx::x(2) as u64, frame_addr + iframe::RT_INFO)?;
+        m.write_u64(ctx_addr + ctx::x(1) as u64, frame_addr + iframe::RT_UC)?;
+    } else {
+        m.write_u64(ctx_addr + ctx::x(2) as u64, 0)?;
+        m.write_u64(ctx_addr + ctx::x(1) as u64, 0)?;
+    }
+    m.write_u64(ctx_addr + ctx::PC as u64, action.handler)?;
+    Ok(action.handler)
+}
+
+/// The i386 `sigreturn` (legacy: the restorer popped the return address and
+/// `sig`, so the frame is two words below `esp`) and `rt_sigreturn` (one
+/// word below).
+fn sigreturn_i386(
+    signals: &mut Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    legacy: bool,
+) -> Result<u64, Errno> {
+    let esp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
+    let (sc, mask) = if legacy {
+        let frame_addr = esp - 8;
+        let sc = frame_addr + iframe::SF_SC;
+        let lo = m.read_u32(sc + iframe::SC_OLDMASK)? as u64;
+        let hi = m.read_u32(frame_addr + iframe::SF_EXTRAMASK)? as u64;
+        (sc, lo | (hi << 32))
+    } else {
+        let frame_addr = esp - 4;
+        let uc = frame_addr + iframe::RT_UC;
+        (uc + iframe::UC_MCONTEXT, m.read_u64(uc + iframe::UC_SIGMASK)?)
+    };
+    if std::env::var_os("GEX_SIGTRACE").is_some() {
+        let words: Vec<String> = (0..8)
+            .map(|i| format!("{:08x}", m.read_u32(esp - 8 + i * 4).unwrap_or(0)))
+            .collect();
+        eprintln!(
+            "[sig] i386 sigreturn legacy={legacy} esp=0x{esp:x} sc=0x{sc:x} eip=0x{:x} words@esp-8: {}",
+            m.read_u32(sc + iframe::SC_EIP).unwrap_or(0),
+            words.join(" ")
+        );
+    }
+    for (i, reg) in iframe::GPR_ORDER.iter().enumerate() {
+        let v = m.read_u32(sc + iframe::SC_GPRS + i as u64 * 4)? as u64;
+        m.write_u64(ctx_addr + ctx::x(*reg) as u64, v)?;
+    }
+    let pc = m.read_u32(sc + iframe::SC_EIP)? as u64;
+    m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
+    write_rflags(m, ctx_addr, m.read_u32(sc + iframe::SC_EFLAGS)? as u64)?;
+    let fpstate = m.read_u32(sc + iframe::SC_FPSTATE)? as u64;
+    if fpstate != 0 {
+        if let Ok(mxcsr) = m.read_u32(fpstate + iframe::FP_MXCSR) {
+            m.write_u32(ctx_addr + ctx::MXCSR as u64, mxcsr)?;
+            for n in 0..8u8 {
+                for half in 0..2u64 {
+                    let v = m.read_u64(fpstate + iframe::FP_XMM + n as u64 * 16 + half * 8)?;
+                    m.write_u64(ctx_addr + ctx::v(n) as u64 + half * 8, v)?;
+                }
+            }
+        }
+    }
+    signals.blocked = mask;
+    signals.in_handler = false;
+    Ok(pc)
+}
+
 /// RFLAGS from the context's flag bytes: CF, PF, AF, ZF, SF, DF, OF in their
 /// architectural bits, plus the always-set bit 1 and IF.
 fn read_rflags(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
@@ -637,7 +896,21 @@ fn write_rflags(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), Errno
 }
 
 /// Restore the context a handler frame captured. Returns the resume address.
-pub fn sigreturn(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
+/// `compat` selects the i386 frames, and `legacy` the non-rt `sigreturn`
+/// form of those (a handler installed without `SA_SIGINFO`).
+pub fn sigreturn(
+    signals: &mut Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    compat: bool,
+    legacy: bool,
+) -> Result<u64, Errno> {
+    if gex_abi::X86 && compat {
+        // The frame's own kind decides; the entry number is a cross-check.
+        let _ = legacy;
+        let kind = signals.legacy_frame;
+        return sigreturn_i386(signals, m, ctx_addr, kind);
+    }
     if gex_abi::X86 {
         return sigreturn_x86(signals, m, ctx_addr);
     }
@@ -668,6 +941,7 @@ pub fn dispatch(
     signals: &mut Signals,
     m: &mut GuestMem<'_>,
     ctx_addr: u64,
+    compat: bool,
 ) -> Result<Delivery, Errno> {
     let Some(signal) = signals.next_deliverable() else {
         return Ok(Delivery::None);
@@ -698,7 +972,7 @@ pub fn dispatch(
             },
         });
     }
-    let resume = setup_frame(signals, m, ctx_addr, signal, 0)?;
+    let resume = setup_frame(signals, m, ctx_addr, signal, 0, compat)?;
     Ok(Delivery::Resume(resume))
 }
 
@@ -791,7 +1065,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         s.raise(sig::SIGTERM);
         assert_eq!(
-            dispatch(&mut s, &mut m, CTX).unwrap(),
+            dispatch(&mut s, &mut m, CTX, false).unwrap(),
             Delivery::Terminate {
                 signal: sig::SIGTERM,
                 core: false
@@ -812,7 +1086,7 @@ mod tests {
         )
         .unwrap();
         s.raise(sig::SIGUSR1);
-        assert_eq!(dispatch(&mut s, &mut m, CTX).unwrap(), Delivery::None);
+        assert_eq!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::None);
         assert!(!s.has_pending());
     }
 
@@ -821,7 +1095,7 @@ mod tests {
         let (mut buf, mut s) = setup();
         let mut m = GuestMem::new(&mut buf);
         s.raise(sig::SIGCHLD);
-        assert_eq!(dispatch(&mut s, &mut m, CTX).unwrap(), Delivery::None);
+        assert_eq!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::None);
     }
 
     #[test]
@@ -838,7 +1112,7 @@ mod tests {
         .unwrap();
         s.raise(sig::SIGUSR1);
 
-        let d = dispatch(&mut s, &mut m, CTX).unwrap();
+        let d = dispatch(&mut s, &mut m, CTX, false).unwrap();
         assert_eq!(d, Delivery::Resume(0x400500));
         // The handler sees its arguments and a return path.
         assert_eq!(
@@ -858,7 +1132,7 @@ mod tests {
         assert_eq!(handler_sp % 16, 0);
 
         // Returning restores everything the frame captured.
-        let resume = sigreturn(&mut s, &mut m, CTX).unwrap();
+        let resume = sigreturn(&mut s, &mut m, CTX, false, false).unwrap();
         assert_eq!(resume, 0x400100);
         assert_eq!(m.read_u64(CTX + ctx::SP as u64).unwrap(), 0x40000);
         assert_eq!(m.read_u64(CTX + ctx::x(5) as u64).unwrap(), 0x1005);
@@ -881,11 +1155,11 @@ mod tests {
         )
         .unwrap();
         s.raise(sig::SIGUSR1);
-        dispatch(&mut s, &mut m, CTX).unwrap();
+        dispatch(&mut s, &mut m, CTX, false).unwrap();
         // The handler runs with whatever flags it likes.
         m.write_u32(CTX + ctx::NZCV as u64, ctx::pack_nzcv(0, 1, 0, 0))
             .unwrap();
-        sigreturn(&mut s, &mut m, CTX).unwrap();
+        sigreturn(&mut s, &mut m, CTX, false, false).unwrap();
         let (n, z, c, _) = ctx::unpack_nzcv(m.read_u32(CTX + ctx::NZCV as u64).unwrap());
         assert_eq!((n, z, c), (1, 0, 1));
     }
@@ -904,7 +1178,7 @@ mod tests {
         )
         .unwrap();
         s.raise(sig::SIGUSR1);
-        dispatch(&mut s, &mut m, CTX).unwrap();
+        dispatch(&mut s, &mut m, CTX, false).unwrap();
         assert_eq!(s.action(sig::SIGUSR1).handler, SIG_DFL);
     }
 
@@ -927,7 +1201,7 @@ mod tests {
         )
         .unwrap();
         s.raise(sig::SIGSEGV);
-        dispatch(&mut s, &mut m, CTX).unwrap();
+        dispatch(&mut s, &mut m, CTX, false).unwrap();
         let sp = m.read_u64(CTX + ctx::SP as u64).unwrap();
         assert!(
             sp > 0x60000 && sp <= 0x68000,
@@ -951,7 +1225,7 @@ mod tests {
             s.raise(n);
         }
         assert_eq!(
-            dispatch(&mut s, &mut m, CTX).unwrap(),
+            dispatch(&mut s, &mut m, CTX, false).unwrap(),
             Delivery::Resume(0x400000 + sig::SIGUSR1 as u64)
         );
     }

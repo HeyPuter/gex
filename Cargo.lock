@@ -428,7 +428,9 @@ dependencies = [
 name = "gex-difffuzz"
 version = "0.0.1"
 dependencies = [
+ "gex-ir",
  "gex-isa",
+ "gex-lift",
 ]
 
 [[package]]
@@ -482,6 +484,7 @@ name = "gex-kernel"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "gex-ld",
 ]
 
 [[package]]
@@ -503,6 +506,7 @@ version = "0.0.1"
 dependencies = [
  "gex-abi",
  "gex-xlate",
+ "serde_json",
 ]
 
 [[package]]
@@ -537,8 +541,10 @@ dependencies = [
  "anyhow",
  "gex-abi",
  "gex-cache",
+ "gex-emit",
  "gex-gl",
  "gex-gpu",
+ "gex-ir",
  "gex-kernel",
  "gex-ld",
  "gex-mem",
@@ -586,6 +592,7 @@ dependencies = [
  "gex-abi",
  "gex-emit",
  "gex-ir",
+ "gex-kernel",
  "gex-ld",
  "gex-native",
  "gex-xlate",

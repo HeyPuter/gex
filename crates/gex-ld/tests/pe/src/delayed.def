@@ -1,0 +1,4 @@
+LIBRARY delayed.dll
+EXPORTS
+  d_mul
+  d_neg

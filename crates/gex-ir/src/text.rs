@@ -425,6 +425,7 @@ pub fn stmt(s: &Stmt) -> String {
             v(*val)
         ),
         Stmt::HostCall { func, args } => format!("host {} {}", tok(func), vs(args)),
+        Stmt::Trap { cond, pc, code } => format!("trap {} {:#x} {}", v(*cond), pc, code),
         Stmt::VStore {
             addr,
             offset,
@@ -1052,6 +1053,16 @@ fn parse_stmt(k: &mut Toks) -> Result<Stmt, String> {
             func: k.e(&HOSTS)?,
             args: k.vals()?,
         },
+        "trap" => {
+            let cond = k.val()?;
+            let pc = k.num()?;
+            let code = k.int()?;
+            Stmt::Trap {
+                cond,
+                pc,
+                code: i32::try_from(code).map_err(|_| k.err(format!("trap code {code} out of range")))?,
+            }
+        }
         "vstore" => {
             let bytes = k.u32()?;
             let addr = k.val()?;

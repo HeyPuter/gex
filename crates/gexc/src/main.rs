@@ -14,6 +14,9 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod nt_run;
+mod pe_info;
+
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap. A closure module for `ld.so` is only correct at the
 /// address the host's loader uses, and it uses this one.
@@ -40,6 +43,8 @@ fn real_main() -> Result<ExitCode> {
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "funcs" => cmd_funcs(&argv[2..]),
@@ -79,6 +84,12 @@ usage:
                                    every object reached through DT_NEEDED,
                                    where it would be placed, and how much
                                    text a whole-program build would face
+{}
+  gexc profile merge -o OUT IN...  combine profiles (gexc run --record); objects
+                                   match by content hash, so libc's counts from
+                                   different programs add up (--split DIR:
+                                   one file per object instead of -o)
+  gexc profile show [--top N] IN   summarise a profile
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
   gexc funcs  <elf> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list]
@@ -147,10 +158,18 @@ run options:
   --lazy          discover only from the entry point, leaving the rest to
                   runtime translation; much faster to start on a big binary
   --no-cache      do not reuse compiled modules between runs
+  --record DIR    write an execution profile (DIR/profile.json) and a
+                  session manifest (DIR/session.json) at exit: exact block
+                  and call counts, top-4 indirect targets, unexpected
+                  returns, interior entries, syscalls per function, the
+                  objects loaded, files opened. GEX_PROFILE=1 does the same
+                  into $GEX_PROFILE_OUT (default ./gex-profile). Formats:
+                  docs/profile-format.md
   --cwd DIR       start in this guest directory
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
-                  path the guest can resolve"
+                  path the guest can resolve",
+        pe_info::USAGE
     );
 }
 
@@ -163,6 +182,8 @@ struct RunArgs {
     opts: RunOptions,
     xlate: Options,
     jit: bool,
+    /// A Windows program's staged Wine prefix. See `nt_run`.
+    wine_prefix: Option<String>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
@@ -175,6 +196,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut no_jit = false;
     let mut lazy = false;
     let mut argv0: Option<String> = None;
+    let mut wine_prefix: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -266,10 +288,19 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let v = args.get(i).context("--cwd needs a directory")?;
                 opts.cwd = Some(v.clone());
             }
+            "--record" => {
+                i += 1;
+                let v = args.get(i).context("--record needs a directory")?;
+                opts.record = Some(v.into());
+            }
             "--argv0" => {
                 i += 1;
                 let v = args.get(i).context("--argv0 needs a name")?;
                 argv0 = Some(v.clone());
+            }
+            "--wine-prefix" => {
+                i += 1;
+                wine_prefix = Some(args.get(i).context("--wine-prefix needs a directory")?.clone());
             }
             "--env" => {
                 i += 1;
@@ -282,6 +313,16 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         i += 1;
     }
     let path = path.context("expected a program to run")?;
+    // `GEX_PROFILE=1` is `--record $GEX_PROFILE_OUT`.
+    if opts.record.is_none()
+        && std::env::var("GEX_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0")
+    {
+        opts.record = Some(
+            std::env::var("GEX_PROFILE_OUT")
+                .unwrap_or_else(|_| "gex-profile".to_string())
+                .into(),
+        );
+    }
     Ok(RunArgs {
         path,
         argv0,
@@ -293,12 +334,21 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             ..Options::default()
         },
         jit: !no_jit,
+        wine_prefix,
     })
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: Wine's PE DLLs on gex's NT layer.
+        if ra.opts.record.is_some() {
+            bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
+        }
+        let exit = nt_run::run(&ra, &bytes)?;
+        return Ok(report_exit(&exit, ra.opts.verbose));
+    }
     // Resolved through the guest's namespace (the sysroot when given), so a
     // program links against its own root's libraries, not the host's.
     let sysroot = ra.opts.sysroot.clone();
@@ -331,9 +381,23 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     }
 
     ra.opts.jit = ra.jit;
+    if ra.opts.record.is_some() {
+        gex_native::profile::set_exe_host_path(ra.path.clone().into());
+    }
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
-    match &exit {
-        Exit::Status(c) => Ok(ExitCode::from((*c & 0xff) as u8)),
+    if let Some(dir) = gex_native::profile::finish(&exit)? {
+        if ra.opts.verbose {
+            eprintln!("[gex] profile and session manifest written to {}", dir.display());
+        }
+    }
+    Ok(report_exit(&exit, ra.opts.verbose))
+}
+
+/// The exit status a shell sees for a guest's exit, with a message when gex
+/// itself failed.
+fn report_exit(exit: &Exit, verbose: bool) -> ExitCode {
+    match exit {
+        Exit::Status(c) => ExitCode::from((*c & 0xff) as u8),
         Exit::Signal {
             signal,
             pc,
@@ -347,10 +411,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
                 // (the only way to stop a running guest), so say which side
                 // failed rather than let it read as "terminated by signal 11".
                 eprintln!("gexc: gex failed at guest pc=0x{pc:x}: {detail}");
-            } else if ra.opts.verbose {
+            } else if verbose {
                 eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
             }
-            Ok(ExitCode::from((exit.code() & 0xff) as u8))
+            ExitCode::from((exit.code() & 0xff) as u8)
         }
     }
 }
@@ -1015,6 +1079,10 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     }
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: its closure is DLLs, found beside it.
+        return pe_info::cmd_pe_info(args);
+    }
 
     // Guest paths resolve inside the sysroot, as they would when the program
     // runs. Without one there is nowhere to look.
@@ -1141,6 +1209,10 @@ fn cmd_ir(args: &[String]) -> Result<()> {
     }
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: its closure is DLLs, found beside it.
+        return pe_info::cmd_pe_info(args);
+    }
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     let at = at.unwrap_or(image.entry);
 
@@ -1331,4 +1403,89 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `gexc profile merge|show`: work with profiles `gexc run --record` wrote.
+fn cmd_profile(args: &[String]) -> Result<()> {
+    use gex_xlate::profile::Profile;
+    gex_native::profile::use_kernel_syscall_names();
+    let read = |p: &str| -> Result<Profile> {
+        let text = std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?;
+        Profile::from_json(&text).map_err(|e| anyhow::anyhow!("{p}: {e}"))
+    };
+    match args.first().map(String::as_str) {
+        Some("merge") => {
+            let mut out: Option<String> = None;
+            let mut split: Option<String> = None;
+            let mut inputs = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-o" => {
+                        i += 1;
+                        out = Some(args.get(i).context("-o needs a path")?.clone());
+                    }
+                    "--split" => {
+                        i += 1;
+                        split = Some(args.get(i).context("--split needs a directory")?.clone());
+                    }
+                    other => inputs.push(other.to_string()),
+                }
+                i += 1;
+            }
+            if inputs.is_empty() {
+                bail!("profile merge: no input profiles");
+            }
+            if out.is_none() && split.is_none() {
+                bail!("profile merge: give -o OUT or --split DIR");
+            }
+            let mut acc = Profile::default();
+            for p in &inputs {
+                acc.merge(&read(p)?).map_err(|e| anyhow::anyhow!("{p}: {e}"))?;
+            }
+            if let Some(o) = &out {
+                std::fs::write(o, acc.to_json()).with_context(|| format!("writing {o}"))?;
+                eprintln!("{o}: {} objects from {} profiles", acc.objects.len(), inputs.len());
+            }
+            if let Some(dir) = &split {
+                // One file per object, named by its hash, merged into whatever
+                // the directory already holds: a store every program adds to.
+                std::fs::create_dir_all(dir).with_context(|| format!("creating {dir}"))?;
+                for id in acc.objects.keys() {
+                    if id == gex_xlate::profile::ANON {
+                        continue;
+                    }
+                    let file = format!("{dir}/{}.json", id.replace(':', "-"));
+                    let mut one = acc.only(id);
+                    if std::path::Path::new(&file).exists() {
+                        let mut old = read(&file)?;
+                        old.merge(&one).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
+                        one = old;
+                    }
+                    std::fs::write(&file, one.to_json()).with_context(|| format!("writing {file}"))?;
+                }
+                eprintln!("{dir}: {} objects", acc.objects.len());
+            }
+            Ok(())
+        }
+        Some("show") => {
+            let mut top = 15;
+            let mut input = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--top" => {
+                        i += 1;
+                        top = args.get(i).context("--top needs a number")?.parse()?;
+                    }
+                    other => input = Some(other.to_string()),
+                }
+                i += 1;
+            }
+            let p = read(&input.context("profile show: which profile?")?)?;
+            print!("{}", p.summary(top));
+            Ok(())
+        }
+        _ => bail!("usage: gexc profile merge (-o OUT | --split DIR) IN... | gexc profile show [--top N] IN"),
+    }
 }
