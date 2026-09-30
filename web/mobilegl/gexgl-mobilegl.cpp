@@ -181,6 +181,12 @@ enum Op : uint32_t {
     BEGIN = 173, END = 174, VERTEX3F = 175, NORMAL3F = 176,
     SHADE_MODEL = 177, LIGHTFV = 178, MATERIALFV = 179, GEN_LISTS = 180,
     NEW_LIST = 181, END_LIST = 182, CALL_LIST = 183, DELETE_LISTS = 184,
+    /* Protocol 11: client arrays and fixed-function matrices. */
+    ENABLE_CLIENT_STATE = 185, DISABLE_CLIENT_STATE = 186,
+    VERTEX_POINTER = 187, COLOR_POINTER = 188, TEX_COORD_POINTER = 189,
+    CLIENT_ACTIVE_TEXTURE = 190, ORTHO = 191, SCALEF = 192,
+    LOAD_MATRIXF = 193, MULT_MATRIXF = 194, COLOR4F = 195, TEX_ENVI = 196,
+    ALPHA_FUNC = 197,
 };
 
 struct Reader {
@@ -2592,6 +2598,52 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case GEN_LISTS: put_u32(glGenLists(a.i32())); break;
+    /* Protocol 11. The array pointers are offsets into the bound
+     * GL_ARRAY_BUFFER, as VERTEX_ATTRIB_POINTER's are. */
+    case ENABLE_CLIENT_STATE: glEnableClientState(a.u32()); break;
+    case DISABLE_CLIENT_STATE: glDisableClientState(a.u32()); break;
+    case VERTEX_POINTER:
+    case COLOR_POINTER:
+    case TEX_COORD_POINTER: {
+        const GLint size = a.i32(); const GLenum type = a.u32(); const GLsizei stride = a.i32();
+        const uintptr_t off = static_cast<uintptr_t>(a.u64());
+        if (!a.ok) return false;
+        void *p = reinterpret_cast<void*>(off);
+        if (op == VERTEX_POINTER) glVertexPointer(size, type, stride, p);
+        else if (op == COLOR_POINTER) glColorPointer(size, type, stride, p);
+        else glTexCoordPointer(size, type, stride, p);
+        break;
+    }
+    case CLIENT_ACTIVE_TEXTURE: glClientActiveTexture(a.u32()); break;
+    case ORTHO: {
+        const GLdouble l = a.f64(), r = a.f64(), b = a.f64();
+        const GLdouble t = a.f64(), n = a.f64(), f = a.f64();
+        glOrtho(l, r, b, t, n, f); break;
+    }
+    case SCALEF: {
+        const GLfloat x = a.f32(), y = a.f32(), z = a.f32();
+        glScalef(x, y, z); break;
+    }
+    case LOAD_MATRIXF:
+    case MULT_MATRIXF: {
+        GLfloat m[16];
+        for (int i = 0; i < 16; ++i) m[i] = a.f32();
+        if (!a.ok) return false;
+        if (op == LOAD_MATRIXF) glLoadMatrixf(m); else glMultMatrixf(m);
+        break;
+    }
+    case COLOR4F: {
+        const GLfloat r = a.f32(), g = a.f32(), b = a.f32(), al = a.f32();
+        glColor4f(r, g, b, al); break;
+    }
+    case TEX_ENVI: {
+        const GLenum target = a.u32(), pname = a.u32(); const GLint param = a.i32();
+        glTexEnvi(target, pname, param); break;
+    }
+    case ALPHA_FUNC: {
+        const GLenum func = a.u32(); const GLfloat ref = a.f32();
+        glAlphaFunc(func, ref); break;
+    }
 #include "gl44-generated-cases.inc"
     default:
         /* Named, once. A command the host does not know aborts the whole
