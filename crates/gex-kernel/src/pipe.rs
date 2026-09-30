@@ -223,6 +223,11 @@ impl Pipe {
         !s.buf.is_empty() || s.writers == 0
     }
 
+    /// True when every write end is closed.
+    pub fn hung_up(&self) -> bool {
+        self.state.lock().unwrap().writers == 0
+    }
+
     /// True when a writer would not block.
     pub fn writable(&self) -> bool {
         let s = self.state.lock().unwrap();
@@ -253,6 +258,22 @@ mod tests {
         assert_eq!(p.read(&mut buf).unwrap(), 2);
         // Drained and no writers: end of file, not a block.
         assert_eq!(p.read(&mut buf).unwrap(), 0);
+    }
+
+    /// The read end polls as hung up once the last writer is gone, with
+    /// data still in it or not; the write end never does.
+    #[test]
+    fn the_read_end_hangs_up_with_its_last_writer() {
+        use crate::file::PipeEnd;
+        use crate::vfs::FileHandle;
+        let p = Arc::new(Pipe::new());
+        let r = PipeEnd { pipe: Arc::clone(&p), write: false };
+        let w = PipeEnd { pipe: Arc::clone(&p), write: true };
+        p.write(b"x").unwrap();
+        assert!(!r.poll_hup());
+        p.close_end(true);
+        assert!(r.poll_hup() && r.poll_readable());
+        assert!(!w.poll_hup());
     }
 
     #[test]

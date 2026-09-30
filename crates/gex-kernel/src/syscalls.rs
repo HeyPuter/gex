@@ -764,6 +764,11 @@ pub fn poll_revents(p: &PollFd) -> u16 {
     if p.events & POLLOUT != 0 && p.writable && h.poll_writable() {
         r |= POLLOUT;
     }
+    // Never masked by `events`, as on Linux.
+    const POLLHUP: u16 = 0x010;
+    if h.poll_hup() {
+        r |= POLLHUP;
+    }
     r
 }
 

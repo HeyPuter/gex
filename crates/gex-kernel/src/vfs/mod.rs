@@ -167,6 +167,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         true
     }
 
+    /// Whether the other end has hung up: a pipe with no writers left, a
+    /// stream socket shut down in both directions (its peer closed).
+    /// `poll` and `epoll` report `POLLHUP` for it whether or not it was
+    /// asked for, as Linux does; a server learns that a client died this way.
+    fn poll_hup(&self) -> bool {
+        false
+    }
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.
