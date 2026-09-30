@@ -2723,7 +2723,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::Breakpoint, pc as u64);
+                return nt::fault(&mut caller, nt::Fault::from_brk(imm), pc as u64);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with

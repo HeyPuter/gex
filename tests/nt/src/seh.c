@@ -2,9 +2,12 @@
  * parameters, nested handlers and unwinding, continuing from a vectored
  * handler, processor exceptions (int3, ud2, executing data), and an
  * unhandled exception reaching the top-level filter.
+ * `seh.exe traps`: divide errors and `hlt` instead (EXCEPTION_INT_DIVIDE_BY_ZERO,
+ * EXCEPTION_INT_OVERFLOW, EXCEPTION_PRIV_INSTRUCTION), then exits.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 static int failures;
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok" : "FAIL", name); if (!ok_) failures++; } while (0)
@@ -75,6 +78,37 @@ __attribute__((noinline)) static void do_int3(void) { __debugbreak(); __asm__ vo
 __attribute__((noinline)) static void do_ud2(void) { __builtin_trap(); }
 #endif
 
+/* Processor traps, each in a function of its own. */
+__attribute__((noinline)) static void do_div0(void) {
+    __asm__ volatile("xorl %%edx, %%edx\n\tmovl $1, %%eax\n\txorl %%ecx, %%ecx\n\tdivl %%ecx" ::: "eax", "ecx", "edx");
+}
+__attribute__((noinline)) static void do_idiv_overflow(void) {
+    __asm__ volatile("movl $0x80000000, %%eax\n\tcltd\n\tmovl $-1, %%ecx\n\tidivl %%ecx" ::: "eax", "ecx", "edx");
+}
+__attribute__((noinline)) static void do_hlt(void) { __asm__ volatile("hlt"); }
+
+static int traps(void) {
+#ifdef __x86_64__
+    DWORD code = 0;
+    __try { do_div0(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    CHECK("div by zero is EXCEPTION_INT_DIVIDE_BY_ZERO", code == EXCEPTION_INT_DIVIDE_BY_ZERO);
+    code = 0;
+    __try { do_idiv_overflow(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    /* Windows reports a quotient overflow as EXCEPTION_INT_OVERFLOW (native
+     * Wine says INT_DIVIDE_BY_ZERO: Linux gives it FPE_INTDIV). */
+    CHECK("INT_MIN / -1 is EXCEPTION_INT_OVERFLOW", code == EXCEPTION_INT_OVERFLOW);
+    code = 0;
+    __try { do_hlt(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    CHECK("hlt is EXCEPTION_PRIV_INSTRUCTION", code == EXCEPTION_PRIV_INSTRUCTION);
+#else
+    CHECK("div by zero is EXCEPTION_INT_DIVIDE_BY_ZERO", guarded_call(do_div0) == 1 && caught_code == EXCEPTION_INT_DIVIDE_BY_ZERO);
+    CHECK("INT_MIN / -1 is EXCEPTION_INT_OVERFLOW", guarded_call(do_idiv_overflow) == 1 && caught_code == EXCEPTION_INT_OVERFLOW);
+    CHECK("hlt is EXCEPTION_PRIV_INSTRUCTION", guarded_call(do_hlt) == 1 && caught_code == EXCEPTION_PRIV_INSTRUCTION);
+#endif
+    printf("%d failures\n", failures);
+    return failures;
+}
+
 static volatile LONG vectored_calls;
 static LONG CALLBACK vectored(EXCEPTION_POINTERS *e) {
     if (e->ExceptionRecord->ExceptionCode != 0xe0005678) return EXCEPTION_CONTINUE_SEARCH;
@@ -90,7 +124,8 @@ static LONG WINAPI top_filter(EXCEPTION_POINTERS *e) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "traps")) return traps();
 #ifdef __x86_64__
     int caught = 0;
     __try { RaiseException(0xe0000001, 0, 0, 0); } __except (GetExceptionCode() == 0xe0000001) { caught = 1; }

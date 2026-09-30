@@ -161,6 +161,26 @@ pub(crate) enum Fault {
     Illegal,
     /// A branch to memory that is not executable.
     NotExecutable,
+    /// x86 #DE from a zero divisor (`Stmt::Trap`, `BRK_DIVIDE_BY_ZERO`).
+    DivideByZero,
+    /// x86 #DE from a quotient too wide (`BRK_DIVIDE_OVERFLOW`).
+    DivideOverflow,
+    /// A privileged instruction such as `hlt` (`BRK_GENERAL_PROTECTION`).
+    Privileged,
+}
+
+impl Fault {
+    /// The fault a `breakpoint` import's immediate stands for: the
+    /// `Stmt::Trap` codes, or an `int3`.
+    pub(crate) fn from_brk(imm: i32) -> Fault {
+        use gex_abi::imports as i;
+        match imm {
+            i::BRK_DIVIDE_BY_ZERO => Fault::DivideByZero,
+            i::BRK_DIVIDE_OVERFLOW => Fault::DivideOverflow,
+            i::BRK_GENERAL_PROTECTION => Fault::Privileged,
+            _ => Fault::Breakpoint,
+        }
+    }
 }
 
 /// Deliver `fault` at `pc` to the guest as an NT exception, as Wine's signal
@@ -177,6 +197,11 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
         Fault::Illegal => (st::ILLEGAL_INSTRUCTION, pc, vec![]),
         // EXCEPTION_EXECUTE_FAULT at the target.
         Fault::NotExecutable => (st::ACCESS_VIOLATION, pc, vec![8, pc]),
+        // Windows reports #DE as these two, and `hlt` in user mode as a
+        // privileged instruction, all at the faulting instruction.
+        Fault::DivideByZero => (st::INTEGER_DIVIDE_BY_ZERO, pc, vec![]),
+        Fault::DivideOverflow => (st::INTEGER_OVERFLOW, pc, vec![]),
+        Fault::Privileged => (st::PRIVILEGED_INSTRUCTION, pc, vec![]),
     };
     let outcome = nt::hardware_exception(&p, &state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {

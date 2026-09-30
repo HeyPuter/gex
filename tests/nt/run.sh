@@ -75,6 +75,9 @@ for arch in x64 x86; do
     # implement yet (x87 stream S14).
     [ $arch = x86 ] && seh=(xfail "fnsave in RtlCaptureContext")
     "${seh[@]}" $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$b/seh.exe"
+    # Divide errors and hlt: the lifter's div/idiv do not raise #DE yet
+    # (S14); hlt raises a general-protection trap.
+    xfail "div/idiv #DE traps (S14)" $arch/seh-traps 0 "$allok" "$b/seh.exe" traps
 done
 # gex-ld's PE fixtures.
 check pe-x64/hello 0 "Hello from x64 PE!" "$fx/x64/hello.exe"
