@@ -5703,11 +5703,29 @@ impl Kernel {
         if buf == 0 {
             return Err(Errno::EFAULT);
         }
-        m.zero(buf, 112)?;
-        m.write_u64(buf, 1000)?; // uptime
-        m.write_u64(buf + 40, 4 * 1024 * 1024 * 1024)?; // totalram
-        m.write_u64(buf + 48, 2 * 1024 * 1024 * 1024)?; // freeram
-        m.write_u32(buf + 96, 1)?; // procs
+        // struct sysinfo: uptime, loads[3], totalram, freeram, sharedram,
+        // bufferram, totalswap, freeswap, procs (u16), totalhigh, freehigh,
+        // mem_unit. The 64-bit layout has 8-byte longs (112 bytes); the i386
+        // one 4-byte longs (64 bytes), where 4 GiB does not fit and memory
+        // is counted in pages through mem_unit. glibc's qsort asks sysconf
+        // for the physical pages once a sort has 256 elements, and its
+        // caller's frame is exactly this struct's size: the wide layout in a
+        // 32-bit process overwrote the stack canary.
+        if self.compat {
+            m.zero(buf, 64)?;
+            m.write_u32(buf, 1000)?; // uptime
+            m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
+            m.write_u32(buf + 20, 1 << 19)?; // freeram
+            m.write(buf + 40, &1u16.to_le_bytes())?; // procs
+            m.write_u32(buf + 52, 4096)?; // mem_unit
+        } else {
+            m.zero(buf, 112)?;
+            m.write_u64(buf, 1000)?; // uptime
+            m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
+            m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
+            m.write(buf + 80, &1u16.to_le_bytes())?; // procs
+            m.write_u32(buf + 104, 1)?; // mem_unit
+        }
         Ok(0)
     }
 
