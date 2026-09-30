@@ -2557,6 +2557,65 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// Lane-wise multiply keeping the low half of each product, as `mul`
+    /// and `mla` want.
+    ///
+    /// wasm has no `i8x16.mul`, so byte lanes are multiplied as halfwords:
+    /// the low byte of a 16-bit product depends only on the low bytes of its
+    /// factors, which makes `i16x8.mul(a, b)` right in the even bytes. The odd
+    /// bytes come from `(a >> 8) * (b & 0xff00)`, whose low byte is zero and
+    /// whose high byte is the odd product mod 256.
+    fn vmul(&mut self, lane: VLane, a: Value, b: Value) -> Value {
+        if lane != VLane::I8 {
+            return self.b.def(Expr::VLaneBin {
+                op: VLaneBinOp::Mul,
+                lane,
+                a,
+                b,
+            });
+        }
+        let even = self.b.def(Expr::VLaneBin {
+            op: VLaneBinOp::Mul,
+            lane: VLane::I16,
+            a,
+            b,
+        });
+        let eight = self.b.const_i32(8);
+        let a_hi = self.b.def(Expr::VShift {
+            op: VShiftOp::ShrU,
+            lane: VLane::I16,
+            a,
+            amount: eight,
+        });
+        let mut odd_bytes = [0u8; 16];
+        for i in (1..16).step_by(2) {
+            odd_bytes[i] = 0xff;
+        }
+        let hi_mask = self.b.def(Expr::VConst(Box::new(odd_bytes)));
+        let b_hi = self.b.def(Expr::VBin {
+            op: VBinOp::And,
+            a: b,
+            b: hi_mask,
+        });
+        let odd = self.b.def(Expr::VLaneBin {
+            op: VLaneBinOp::Mul,
+            lane: VLane::I16,
+            a: a_hi,
+            b: b_hi,
+        });
+        // `even & ~0xff00`, then merge in the odd bytes.
+        let even_lo = self.b.def(Expr::VBin {
+            op: VBinOp::AndNot,
+            a: even,
+            b: hi_mask,
+        });
+        self.b.def(Expr::VBin {
+            op: VBinOp::Or,
+            a: even_lo,
+            b: odd,
+        })
+    }
+
     /// Restrict a result to the lanes the arrangement actually writes.
     ///
     /// A 64-bit form zeroes the register's upper half; a scalar form zeroes
@@ -2611,6 +2670,8 @@ impl<'a> Lifter<'a> {
             VOp3::Sub | VOp3::FSub => simple(VLaneBinOp::Sub),
             // `fmulx` shares this lowering: it differs only for zero times
             // infinity, which gex does not model. See README's fidelity notes.
+            // Byte lanes have no wasm multiply; see `vmul`.
+            VOp3::Mul if lane == VLane::I8 => None,
             VOp3::Mul | VOp3::FMul | VOp3::FMulx => simple(VLaneBinOp::Mul),
             VOp3::FDiv => simple(VLaneBinOp::Div),
             VOp3::SMax => simple(VLaneBinOp::MaxS),
@@ -2791,15 +2852,15 @@ impl<'a> Lifter<'a> {
         }
 
         match op {
+            VOp3::Mul => {
+                let r = self.vmul(lane, a, b);
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
             // Multiply-accumulate reads the destination as a third operand.
             VOp3::Mla | VOp3::Mls | VOp3::FMla | VOp3::FMls => {
                 let acc = self.b.read(GuestReg::V128(vd.0));
-                let prod = self.b.def(Expr::VLaneBin {
-                    op: VLaneBinOp::Mul,
-                    lane,
-                    a,
-                    b,
-                });
+                let prod = self.vmul(lane, a, b);
                 let add = matches!(op, VOp3::Mla | VOp3::FMla);
                 // The floating-point forms are fused on hardware; wasm has no
                 // vector FMA, so the product is rounded first (PLAN §5.7).
@@ -3067,6 +3128,43 @@ impl<'a> Lifter<'a> {
                     lane,
                     a: ones,
                     b: denom,
+                });
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
+            // Reverse the bits of every byte: look each nibble up reversed
+            // and swap the halves. Each `swizzle` index is below 16, so no
+            // lane is zeroed by the lookup.
+            VOp2::Rbit => {
+                let rev4 = |n: u8| (n & 1) << 3 | (n & 2) << 1 | (n & 4) >> 1 | (n & 8) >> 3;
+                let mut low_table = [0u8; 16];
+                let mut high_table = [0u8; 16];
+                for n in 0..16u8 {
+                    // The low nibble, reversed, becomes the high one.
+                    low_table[n as usize] = rev4(n) << 4;
+                    high_table[n as usize] = rev4(n);
+                }
+                let nibble = self.b.def(Expr::VConst(Box::new([0x0f; 16])));
+                let lo = self.b.def(Expr::VBin {
+                    op: VBinOp::And,
+                    a,
+                    b: nibble,
+                });
+                let four = self.b.const_i32(4);
+                let hi = self.b.def(Expr::VShift {
+                    op: VShiftOp::ShrU,
+                    lane: VLane::I8,
+                    a,
+                    amount: four,
+                });
+                let lt = self.b.def(Expr::VConst(Box::new(low_table)));
+                let ht = self.b.def(Expr::VConst(Box::new(high_table)));
+                let from_lo = self.b.def(Expr::VSwizzle { a: lt, idx: lo });
+                let from_hi = self.b.def(Expr::VSwizzle { a: ht, idx: hi });
+                let r = self.b.def(Expr::VBin {
+                    op: VBinOp::Or,
+                    a: from_lo,
+                    b: from_hi,
                 });
                 self.commit_vector(vd, arr, r);
                 Flow::Next
