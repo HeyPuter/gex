@@ -247,15 +247,6 @@ fn pick_bits_wide(rng: &mut Rng) -> u32 {
     }
 }
 
-/// 32/64-bit widths, only 32 in 32-bit mode.
-fn pick_bits_dq(rng: &mut Rng) -> u32 {
-    if bits32() {
-        32
-    } else {
-        [32, 64][rng.below(2) as usize]
-    }
-}
-
 /// The address width: what `lea` and register-indirect operands use.
 fn abits() -> u32 {
     if bits32() { 32 } else { 64 }
@@ -319,8 +310,12 @@ fn gen(rng: &mut Rng) -> Candidate {
                 _ => NONE,
             };
             // A zero count leaves everything unchanged, including flags from
-            // earlier instructions: compare nothing then.
-            let mask = if count == "0" { NONE } else { mask };
+            // earlier instructions: compare nothing then. The count is masked
+            // to 5 bits (6 for a 64-bit operand) first, so `sar dx, 32` is a
+            // zero count too, and its flags are whatever an earlier `div` left
+            // undefined.
+            let masked = count.parse::<u32>().ok().map(|n| n & if bits == 64 { 63 } else { 31 });
+            let mask = if masked == Some(0) { NONE } else { mask };
             c(text, "shift", mask)
         }
         40..=44 => {
@@ -352,13 +347,14 @@ fn gen(rng: &mut Rng) -> Candidate {
             let sname = reg_name(s, bits);
             let setup = match bits {
                 8 => format!("or {sname}, 1\n    movzx eax, al\n    "),
-                16 => format!("or {sname}, 1\n    xor edx, edx\n    "),
-                32 => format!("or {sname}, 1\n    xor edx, edx\n    "),
                 _ => format!("or {sname}, 1\n    xor edx, edx\n    "),
             };
-            // A signed division of a positive dividend by any non-zero
-            // divisor cannot overflow at these widths.
-            let text = format!("{setup}{op} {sname}");
+            // An unsigned division of a high half of zero cannot overflow. A
+            // signed one can: 255 / 1 does not fit in an int8. Halving the
+            // low half leaves a dividend below the quotient's signed range,
+            // which division by any non-zero divisor, -1 included, keeps.
+            let halve = if signed { format!("shr {}, 1\n    ", reg_name(0, bits.max(16))) } else { String::new() };
+            let text = format!("{setup}{halve}{op} {sname}");
             c(text, "div", NONE)
         }
         49..=55 => {
@@ -518,6 +514,8 @@ fn gen_sse(rng: &mut Rng) -> Candidate {
         36 => format!("pminsw {d}, {s}"),
         37 => format!("pmovmskb {}, {s}", reg_name(g, 32)),
         38 => format!("movd {d}, {}", reg_name(g, 32)),
+        // No 64-bit GPR in 32-bit code: `movd` is the form there.
+        _ if bits32() => format!("movd {}, {s}", reg_name(g, 32)),
         _ => format!("movq {}, {s}", reg_name(g, 64)),
     };
     // Float forms, chosen by another draw so the integer ones stay frequent.
@@ -535,9 +533,9 @@ fn gen_sse(rng: &mut Rng) -> Candidate {
             9 => format!("xorps {d}, {s}"),
             10 => format!("cmpps {d}, {s}, {}", rng.below(8)),
             11 => format!("cmpsd {d}, {s}, {}", rng.below(8)),
-            12 => format!("cvtsi2sd {d}, {}", reg_name(g, 64)),
+            12 => format!("cvtsi2sd {d}, {}", reg_name(g, abits())),
             13 => format!("cvtsi2ss {d}, {}", reg_name(g, 32)),
-            14 => format!("cvttsd2si {}, {d}", reg_name(g, 64)),
+            14 => format!("cvttsd2si {}, {d}", reg_name(g, abits())),
             15 => format!("cvtsd2ss {d}, {s}"),
             16 => format!("cvtss2sd {d}, {}", m32(rng)),
             17 => format!("cvtps2pd {d}, {s}"),
