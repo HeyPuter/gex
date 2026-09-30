@@ -6,7 +6,16 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 src=$here/src
-pewasm=${PEWASM:-$here/../../../../../../pewasm}
+# pewasm's checkout sits beside gex's (or beside the worktree's parent).
+pewasm=${PEWASM:-}
+if [ -z "$pewasm" ]; then
+    d=$here
+    while [ "$d" != / ]; do
+        d=$(dirname "$d")
+        if [ -f "$d/pewasm/pewasm.py" ]; then pewasm=$d/pewasm; break; fi
+    done
+fi
+[ -n "$pewasm" ] || { echo "pewasm checkout not found; set PEWASM" >&2; exit 1; }
 out=$here/bin
 rm -rf "$out"
 mkdir -p "$out/x86" "$out/x64"
