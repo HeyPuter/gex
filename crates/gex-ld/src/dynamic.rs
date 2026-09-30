@@ -157,6 +157,9 @@ mod tests {
         let phnum = if interp.is_some() { 2 } else { 1 };
         let phoff = 64usize;
         let interp_off = phoff + phnum * 56;
+        // An ET_EXEC sits at its own address, which must be above gex's
+        // reserved low region; an ET_DYN is linked at zero.
+        let base = if e_type == 2 { gex_abi::EXEC_BASE } else { 0 };
         let mut v = vec![0u8; 0x2000];
         v[0..4].copy_from_slice(b"\x7fELF");
         v[4] = 2; // ELFCLASS64
@@ -164,7 +167,7 @@ mod tests {
         v[6] = 1; // version
         v[16..18].copy_from_slice(&e_type.to_le_bytes());
         v[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
-        v[24..32].copy_from_slice(&0x1000u64.to_le_bytes()); // e_entry
+        v[24..32].copy_from_slice(&(base + 0x1000).to_le_bytes()); // e_entry
         v[32..40].copy_from_slice(&(phoff as u64).to_le_bytes());
         v[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
         v[56..58].copy_from_slice(&(phnum as u16).to_le_bytes());
@@ -174,7 +177,7 @@ mod tests {
         v[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
         v[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
         v[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
-        v[p + 16..p + 24].copy_from_slice(&0u64.to_le_bytes()); // p_vaddr
+        v[p + 16..p + 24].copy_from_slice(&base.to_le_bytes()); // p_vaddr
         v[p + 32..p + 40].copy_from_slice(&0x2000u64.to_le_bytes()); // p_filesz
         v[p + 40..p + 48].copy_from_slice(&0x2000u64.to_le_bytes()); // p_memsz
 

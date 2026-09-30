@@ -88,6 +88,13 @@ pub enum LoadError {
         second_start: u64,
         second_end: u64,
     },
+    /// A segment lies in the runtime's own low region: the thread contexts
+    /// and the dispatch directory, below [`gex_abi::DISPATCH_DIR_END`]. A
+    /// fixed-address image there would overwrite them.
+    InRuntimeRegion {
+        vaddr: u64,
+        size: u64,
+    },
     Malformed(&'static str),
 }
 
@@ -115,6 +122,14 @@ impl fmt::Display for LoadError {
                 f,
                 "ELF mappings overlap: 0x{first_start:x}..0x{first_end:x} and \
                  0x{second_start:x}..0x{second_end:x}"
+            ),
+            LoadError::InRuntimeRegion { vaddr, size } => write!(
+                f,
+                "segment at 0x{vaddr:x} (0x{size:x} bytes) lies in gex's reserved low region \
+                 (below 0x{:x}: thread contexts and the dispatch directory); relink the \
+                 program higher, e.g. with -Wl,--image-base=0x{:x}",
+                gex_abi::DISPATCH_DIR_END,
+                gex_abi::PIE_BASE
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
         }
@@ -411,6 +426,15 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
                 let vaddr = p_vaddr + bias;
                 if vaddr.checked_add(p_memsz).is_none() || vaddr + p_memsz >= gex_abi::GUEST_LIMIT {
                     return Err(LoadError::SegmentOutOfRange {
+                        vaddr,
+                        size: p_memsz,
+                    });
+                }
+                // lld links a static i386 executable at 0x10000 by default,
+                // which is where gex keeps its contexts and dispatch
+                // directory. Refuse it rather than load over them.
+                if p_memsz != 0 && vaddr < gex_abi::DISPATCH_DIR_END {
+                    return Err(LoadError::InRuntimeRegion {
                         vaddr,
                         size: p_memsz,
                     });
@@ -977,5 +1001,39 @@ mod tests {
     fn rejects_non_elf() {
         assert_eq!(load(&[0; 64], 0).unwrap_err(), LoadError::NotElf);
         assert_eq!(load(&[0; 8], 0).unwrap_err(), LoadError::TooShort);
+    }
+
+    /// An `ET_EXEC` with one executable `PT_LOAD` at `vaddr`.
+    fn exec_at(vaddr: u64) -> Vec<u8> {
+        let mut v = vec![0u8; 0x1000];
+        v[0..4].copy_from_slice(b"\x7fELF");
+        v[4] = 2; // ELFCLASS64
+        v[5] = 1; // little endian
+        v[6] = 1;
+        v[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        v[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
+        v[24..32].copy_from_slice(&vaddr.to_le_bytes()); // e_entry
+        v[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        v[54..56].copy_from_slice(&56u16.to_le_bytes());
+        v[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let p = 64;
+        v[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        v[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        v[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes());
+        v[p + 32..p + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+        v[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+        v
+    }
+
+    /// lld's default base for a static i386 executable is 0x10000, inside
+    /// the contexts and dispatch directory: refused, not loaded over them.
+    #[test]
+    fn a_fixed_image_in_the_runtime_region_is_refused() {
+        assert_eq!(
+            load(&exec_at(0x10000), 0).unwrap_err(),
+            LoadError::InRuntimeRegion { vaddr: 0x10000, size: 0x1000 }
+        );
+        assert!(load(&exec_at(gex_abi::DISPATCH_DIR_END - 0x1000), 0).is_err());
+        assert!(load(&exec_at(gex_abi::EXEC_BASE), 0).is_ok());
     }
 }
