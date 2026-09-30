@@ -80,15 +80,14 @@ fn frame_weight(regs: &FnRegs) -> u32 {
 /// write back beyond every dirty non-flag register.
 const NEED_DEFS: &str = "#define NEED_FLAGS 1u\n#define NEED_ALL 0xffffffffu\n\n";
 
-/// The flag registers of the guest.
-const FLAG_REGS: [GuestReg; 6] = [
-    GuestReg::N,
-    GuestReg::Z,
-    GuestReg::C,
-    GuestReg::V,
-    GuestReg::P,
-    GuestReg::A,
-];
+/// The flag registers of the guest (AArch64 has no P and A: a liveness set
+/// that says they are live, because an exit reads "everything", must not make
+/// a caller ask for flags).
+const FLAG_REGS: &[GuestReg] = if gex_abi::X86 {
+    &[GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V, GuestReg::P, GuestReg::A]
+} else {
+    &[GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V]
+};
 
 /// What the indirect-call helper's own frame adds.
 const CALL_KNOWN_WEIGHT: u32 = 32;
@@ -371,7 +370,7 @@ impl FnUnit {
                 // continuation (believed not to return).
                 let (need_back, ret_arg) = match ret {
                     Some(r) if live_writebacks() => {
-                        let fl = !self.live[r.to.index()].inter(RegSet::of(&FLAG_REGS)).is_empty();
+                        let fl = !self.live[r.to.index()].inter(RegSet::of(FLAG_REGS)).is_empty();
                         (if fl { "NEED_ALL" } else { "0" }, format!("0x{ret_pc:x}ull"))
                     }
                     Some(_) | None => ("NEED_ALL", format!("0x{ret_pc:x}ull")),
@@ -697,7 +696,7 @@ fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
 
 /// Every register but the flags.
 fn non_flags() -> RegSet {
-    RegSet::ALL.minus(RegSet::of(&FLAG_REGS))
+    RegSet::ALL.minus(RegSet::of(FLAG_REGS))
 }
 
 /// Stack every non-trap-free function keeps free below the budget for a
