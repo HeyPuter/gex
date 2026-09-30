@@ -12,6 +12,7 @@ use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod gl;
+pub mod nt;
 pub mod virgl;
 pub mod wayland;
 
@@ -197,6 +198,8 @@ struct HostState {
     pending_exec: Option<ExecRequest>,
     /// Raised past wasmtime's defaults. See [`store_limits`].
     store_limits: wasmtime::StoreLimits,
+    /// Set for a Windows process: every `syscall` is an NT call. See `nt`.
+    nt: Option<Arc<gex_kernel::nt::Process>>,
 }
 
 /// What a process-creating `clone` asked for.
@@ -250,6 +253,8 @@ struct SpawnContext {
     virgl: Option<virgl::VirglDevice>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
     limits: gex_xlate::BlockLimits,
+    /// The NT process, for a Windows program's threads. See `nt`.
+    nt: Option<Arc<gex_kernel::nt::Process>>,
 }
 
 /// Runtime translation state belonging to one store (PLAN §6.2, M3).
@@ -384,7 +389,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
-    run_program_with(program, opts, xlate, None)
+    run_program_with(program, opts, xlate, None, None)
 }
 
 /// What survives an `execve`: the kernel, the process table, and the host-side
@@ -404,6 +409,7 @@ fn run_program_with(
     opts: &RunOptions,
     xlate: &Options,
     inherited: Option<Inherited>,
+    nt_setup: Option<&nt::NtSetup>,
 ) -> Result<(Exit, Stats)> {
     let image = &program.exe;
 
@@ -682,6 +688,7 @@ fn run_program_with(
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
+            nt: None,
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -746,18 +753,24 @@ fn run_program_with(
         });
     }
 
-    place_image(
-        &mut store,
-        memory.clone(),
-        program,
-        opts,
-        Identity {
-            uid,
-            gid,
-            interp_base: program.interp_base(),
-            entry_hook: 0,
-        },
-    )?;
+    let entry = match nt_setup {
+        Some(setup) => nt::boot(&mut store, memory.clone(), setup)?,
+        None => {
+            place_image(
+                &mut store,
+                memory.clone(),
+                program,
+                opts,
+                Identity {
+                    uid,
+                    gid,
+                    interp_base: program.interp_base(),
+                    entry_hook: 0,
+                },
+            )?;
+            program.entry()
+        }
+    };
 
     // Publish the image's page-directory entries, without which none of its
     // blocks are reachable through the table.
@@ -797,6 +810,7 @@ fn run_program_with(
         proc_state: Arc::clone(&store.data().proc_state),
         jit_shared: store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)),
         limits: xlate.limits,
+        nt: store.data().nt.clone(),
     });
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
@@ -828,7 +842,7 @@ fn run_program_with(
         }
     }
 
-    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
+    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, entry)?;
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
         let kernel = take_kernel(&spawn);
@@ -1361,6 +1375,8 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // exactly what the import is for.
         jit_shared: cx.jit_shared.clone(),
         limits: cx.limits,
+        // Windows has no fork: only a Linux process gets here.
+        nt: None,
     });
     let status = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
@@ -1431,6 +1447,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
+            nt: cx.nt.clone(),
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -1549,6 +1566,7 @@ fn exec_program(
             wayland,
             virgl,
         }),
+        None,
     )
 }
 
@@ -1572,6 +1590,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
+            nt: cx.nt.clone(),
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -2244,6 +2263,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+            if caller.data().nt.is_some() {
+                return nt::syscall_import(&mut caller, pc as u64);
+            }
             // Every thread shares the dispatch directory (guest memory) but has
             // its own table, filled only when its own store installs a
             // translation. So a thread can be told to call slot N while its

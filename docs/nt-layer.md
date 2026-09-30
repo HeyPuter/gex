@@ -291,6 +291,17 @@ manifest (§8) says which version the DLLs are.
   the Worker's timer in the browser) with Wine's high-part/low-part/high2
   protocol, so a guest spinning on `GetTickCount` without syscalls still sees
   time pass.
+  - *Native* (`shims/native/src/nt.rs`): a host thread calls
+    `nt::sysinfo::usd_tick` every millisecond until the process ends.
+  - *Browser* (not built yet): the same `usd_tick`, compiled into the
+    kernel's wasm and exported, is called from a timer in the process's
+    coordinating Worker (`setInterval`, which a Worker clamps to ~4 ms), and
+    also at the entry of every NT syscall, so a program that makes syscalls
+    always reads fresh time. A guest spinning without syscalls sees time
+    move in steps of 4 ms or more, which is still finer than Windows' own
+    15.6 ms tick. The writes are plain stores into the `SharedArrayBuffer`.
+    The high2/low/high1 store order is what lets a reader detect a torn
+    read, exactly as on Windows.
 - **PEB / TEB / `RTL_USER_PROCESS_PARAMETERS`**, both pointer sizes (§1.3).
 - **Later, for win32u:** `peb->GdiSharedHandleTable` (`GDI_SHARED_MEMORY`),
   per-DC `DC_ATTR`, `peb->KernelCallbackTable` (read, not written), and
