@@ -212,6 +212,15 @@ pub fn mnemonic(i: &Inst) -> String {
         Int3 => "int3".into(),
         Int => "int".into(),
         Hlt => "hlt".into(),
+        Privileged(op) => match op {
+            0x6c | 0x6d => "ins",
+            0x6e | 0x6f => "outs",
+            0xe4 | 0xe5 | 0xec | 0xed => "in",
+            0xe6 | 0xe7 | 0xee | 0xef => "out",
+            0xfa => "cli",
+            _ => "sti",
+        }
+        .into(),
         Nop => "nop".into(),
         Endbr => "endbr64".into(),
         Pause => "pause".into(),
