@@ -2153,7 +2153,7 @@ impl Kernel {
             // call is still better than refusing it -- apt sets the time on
             // a file it has just downloaded, and treats the failure as a
             // failure of the download.
-            nr::UTIMENSAT => self.sys_utimensat(m, a[0] as i32, a[1], a[3] as u32),
+            nr::UTIMENSAT => self.sys_utimensat(m, a[0] as i32, a[1], a[2], a[3] as u32),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
             nr::UMASK => {
@@ -4112,22 +4112,47 @@ impl Kernel {
 
     /// `utimensat(dirfd, path, times, flags)`: set a file's timestamps.
     ///
-    /// gex does not persist file times, but must still answer honestly for
-    /// *existence*: a NULL path validates the descriptor (`futimens`); a real
-    /// path must resolve or the call is `ENOENT`. A blanket `Ok(0)` broke
-    /// `touch`, which creates a file only when `utimensat` fails.
-    fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
+    /// gex keeps one time per file, the modification time (`stat` reports
+    /// it for all three), so the access time in `times` is checked and
+    /// dropped. `times` NULL or `UTIME_NOW` means now; `UTIME_OMIT` leaves
+    /// the time alone. A missing path is `ENOENT`, which `touch` relies on
+    /// to create the file. A NULL path is `futimens` on `dirfd`, whose
+    /// descriptor is validated; its time is not kept (an open file's name
+    /// is not tracked).
+    fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, times: u64, flags: u32) -> SysResult {
         const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        const UTIME_NOW: u64 = (1 << 30) - 1;
+        const UTIME_OMIT: u64 = (1 << 30) - 2;
+        // The modification time to set, if any.
+        let mtime = if times == 0 {
+            Some((self.clock)().0 as i64)
+        } else {
+            for t in [times, times + 16] {
+                let ns = m.read_u64(t + 8)?;
+                if ns >= 1_000_000_000 && ns != UTIME_NOW && ns != UTIME_OMIT {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            match m.read_u64(times + 24)? {
+                UTIME_OMIT => None,
+                UTIME_NOW => Some((self.clock)().0 as i64),
+                _ => Some(m.read_u64(times + 16)? as i64),
+            }
+        };
         if path == 0 {
             // futimens: the "path" is really the open descriptor in `dirfd`.
             self.fds.get(dirfd)?;
             return Ok(0);
         }
         let p = self.at_path(m, dirfd, path)?;
-        if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            self.vfs.metadata_nofollow(&p)?;
-        } else {
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        if follow {
             self.vfs.metadata(&p)?;
+        } else {
+            self.vfs.metadata_nofollow(&p)?;
+        }
+        if let Some(t) = mtime {
+            self.vfs.set_mtime(&p, t, follow)?;
         }
         Ok(0)
     }

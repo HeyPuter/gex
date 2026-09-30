@@ -297,6 +297,12 @@ pub trait FileSystem: Send + Sync {
         let _ = (path, mode);
         Ok(())
     }
+    /// Set a file's modification time (seconds since the epoch), for
+    /// `utimensat`. Filesystems that keep no times accept it and do nothing.
+    fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
+        let _ = (path, secs);
+        Ok(())
+    }
 
     /// A second name for the same file. `EPERM` is what Linux says for a
     /// filesystem that has no hard links, which is the honest default.
@@ -469,6 +475,29 @@ impl Vfs {
     pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.chmod(&rel, mode)
+    }
+
+    /// Set the modification time of `path`, following a final symlink when
+    /// `follow` (as `utimensat` does without `AT_SYMLINK_NOFOLLOW`).
+    pub fn set_mtime(&self, path: &str, secs: i64, follow: bool) -> Result<(), Errno> {
+        let mut current = normalize(path, &self.cwd);
+        for _ in 0..40 {
+            let (fs, rel) = self.resolve(&current)?;
+            match fs.read_link(&rel) {
+                Ok(target) if follow => {
+                    current = if target.starts_with('/') {
+                        normalize(&target, "/")
+                    } else {
+                        normalize(&target, &parent_of(&current))
+                    };
+                }
+                _ => {
+                    fs.metadata(&rel)?;
+                    return fs.set_mtime(&rel, secs);
+                }
+            }
+        }
+        Err(Errno::ELOOP)
     }
 
     /// `link`. Both names must be on one filesystem, as they must on Linux:
