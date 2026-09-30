@@ -656,8 +656,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     }
     let mut module = builder.finish();
     if opts.cgen {
-        let symbols: Vec<u64> = image.symbols.iter().filter(|s| !s.ifunc).map(|s| s.value).collect();
-        module.wasm = cgen_splice(&module.wasm, &cgen, &symbols);
+        module.wasm = cgen_splice(&module.wasm, &cgen, image, opts);
     }
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
@@ -667,16 +666,34 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 /// failure: a build that asked for the function tier must not quietly ship
 /// tier-1.
 #[cfg(feature = "cgen")]
-fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], symbols: &[u64]) -> Vec<u8> {
+fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Options) -> Vec<u8> {
     let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
-    match gex_cgen::build(wasm, &refs, symbols) {
+    let standin = gex_cgen::use_standin().unwrap_or_else(|e| panic!("function tier (--cgen): {e:#}"));
+    let functions = if standin {
+        gex_cgen::Functions::StandIn {
+            symbols: image.symbols.iter().filter(|s| !s.ifunc).map(|s| s.value).collect(),
+        }
+    } else {
+        // S2's recovery. No ELF bytes reach here, so no `.eh_frame` seeds:
+        // symbols, the entry, relocations and call targets still seed it.
+        let ropts = func::RecoverOptions {
+            limits: opts.limits,
+            ..Default::default()
+        };
+        let prog = func::recover(image, None, &ropts);
+        gex_cgen::Functions::Recovered {
+            functions: prog.functions.into_values().collect(),
+            intrinsics: opts.intrinsics.keys().copied().collect(),
+        }
+    };
+    match gex_cgen::build(wasm, &refs, functions) {
         Ok((w, _)) => w,
         Err(e) => panic!("function tier (--cgen): {e:#}"),
     }
 }
 
 #[cfg(not(feature = "cgen"))]
-fn cgen_splice(_: &[u8], _: &[(Block, u32)], _: &[u64]) -> Vec<u8> {
+fn cgen_splice(_: &[u8], _: &[(Block, u32)], _: &Image, _: &Options) -> Vec<u8> {
     panic!("Options::cgen is set, but gex-xlate was built without the `cgen` feature")
 }
 

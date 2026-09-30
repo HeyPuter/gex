@@ -13,6 +13,7 @@ pub mod splice;
 pub mod toolchain;
 
 use anyhow::{Context, Result};
+use gex_ir::func::Function;
 use gex_ir::Block;
 use std::collections::HashSet;
 
@@ -37,17 +38,41 @@ pub fn tier() -> Result<Tier> {
     }
 }
 
+/// Where Phase B's functions come from.
+pub enum Functions {
+    /// S2's recovery (`gex_xlate::func::recover`), in memory form.
+    /// `intrinsics` are the entries tier-1 serves with a host builtin
+    /// (`gex_xlate::intrinsic`): those functions are re-formed from their
+    /// tier-1 block, so C callers get the builtin rather than the lifted loop.
+    Recovered {
+        functions: Vec<Function>,
+        intrinsics: Vec<u64>,
+    },
+    /// The stand-in in `recover.rs`, from the tier-1 blocks and the symbol
+    /// addresses (biased). Kept for comparison (`GEX_CGEN_RECOVER=standin`).
+    StandIn { symbols: Vec<u64> },
+}
+
+/// `GEX_CGEN_RECOVER=standin` selects [`Functions::StandIn`]; S2's recovery
+/// is the default.
+pub fn use_standin() -> Result<bool> {
+    match std::env::var("GEX_CGEN_RECOVER").as_deref() {
+        Ok("standin") => Ok(true),
+        Ok("s2") | Err(_) => Ok(false),
+        Ok(other) => anyhow::bail!("GEX_CGEN_RECOVER={other}: want `s2` or `standin`"),
+    }
+}
+
 /// Build the function-tier version of a tier-1 module.
 ///
 /// `tier1` is the module `ModuleBuilder` produced from `blocks`, and each
 /// block comes with the function index `ModuleBuilder::reserve` gave it.
-/// `symbols` are the image's function symbol addresses (biased), which seed
-/// function recovery. The result has the tier-1 module's exact interface.
-pub fn build(tier1: &[u8], blocks: &[(&Block, u32)], symbols: &[u64]) -> Result<(Vec<u8>, SpliceStats)> {
+/// The result has the tier-1 module's exact interface.
+pub fn build(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions) -> Result<(Vec<u8>, SpliceStats)> {
     emit::check_environment()?;
     match tier()? {
         Tier::Blocks => build_blocks(tier1, blocks),
-        Tier::Functions => build_functions(tier1, blocks, symbols),
+        Tier::Functions => build_functions(tier1, blocks, functions),
     }
 }
 
@@ -77,17 +102,44 @@ fn compile_and_link(units: Vec<(String, String)>, exports: &[String]) -> Result<
     Ok((std::fs::read(&linked)?, dir))
 }
 
-/// Phase B: whole functions (`func.rs`), recovered by the stand-in in
-/// `recover.rs` until S2's recovery lands.
-fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], symbols: &[u64]) -> Result<(Vec<u8>, SpliceStats)> {
+/// Phase B: whole functions (`func.rs`).
+fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions) -> Result<(Vec<u8>, SpliceStats)> {
     let index: std::collections::HashMap<u64, u32> =
         blocks.iter().map(|(b, f)| (b.start, *f)).collect();
     let refs: Vec<&Block> = blocks.iter().map(|(b, _)| *b).collect();
-    let guarded: HashSet<u64> = refs.iter().filter(|b| b.guard.is_some()).map(|b| b.start).collect();
-    let mut funcs = recover::functions(&refs, symbols);
-    // A function with a self-modification guard anywhere stays tier-1: the C
-    // side checks no code bytes.
-    funcs.retain(|f| !f.blocks.iter().any(|b| !b.synthetic && guarded.contains(&b.start)));
+    let mut funcs = match functions {
+        Functions::StandIn { symbols } => recover::functions(&refs, &symbols),
+        Functions::Recovered {
+            mut functions,
+            intrinsics,
+        } => {
+            let by_addr: std::collections::HashMap<u64, &Block> =
+                refs.iter().map(|b| (b.start, *b)).collect();
+            let intrinsics: HashSet<u64> = intrinsics.into_iter().collect();
+            for f in &mut functions {
+                if intrinsics.contains(&f.entry) {
+                    if let Some(b) = by_addr.get(&f.entry) {
+                        // One block: the builtin, then the `ret`.
+                        let mut one = recover::functions(&[*b], &[f.entry]);
+                        *f = one.pop().expect("an entry block forms a function");
+                    }
+                }
+            }
+            functions.retain(|f| f.form == gex_ir::func::Form::Memory);
+            functions
+        }
+    };
+    // A function sharing a page with a block that has a self-modification
+    // guard stays tier-1: the C side checks no code bytes. (Pages, not
+    // exact ranges: coarser, and immune to overlapping x86 blocks.)
+    let pages = |lo: u64, hi: u64| (lo >> 12)..=(hi.max(lo + 1) - 1) >> 12;
+    let guarded: HashSet<u64> = refs
+        .iter()
+        .filter(|b| b.guard.is_some())
+        .flat_map(|b| pages(b.start, b.end))
+        .collect();
+    let overlaps = |lo: u64, hi: u64| pages(lo, hi).any(|p| guarded.contains(&p));
+    funcs.retain(|f| !f.blocks.iter().any(|b| !b.synthetic && overlaps(b.start, b.end)));
     for f in &funcs {
         f.verify()
             .map_err(|e| anyhow::anyhow!("recovered function {:#x} is malformed: {e}", f.entry))?;
@@ -108,7 +160,13 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], symbols: &[u64]) -> R
     units.push(("call_known.c".into(), func::call_known_source(&entries)));
     let exports: Vec<String> = entries.iter().map(|a| func::entry_name(*a)).collect();
     let (cwasm, dir) = compile_and_link(units, &exports)?;
-    let pairs: Vec<(u64, u32)> = entries.iter().map(|a| (*a, index[a])).collect();
+    // Registered in dispatch: the entries tier-1 also has a block for. The
+    // others (tier-1 found no block there) are reached only by C calls; a
+    // dispatch to them goes to the runtime's own translation.
+    let pairs: Vec<(u64, u32)> = entries
+        .iter()
+        .filter_map(|a| index.get(a).map(|f| (*a, *f)))
+        .collect();
     let (wasm, stats) = splice::splice(tier1, &cwasm, &pairs, &func::entry_name, false)?;
     if std::env::var_os("GEX_CGEN_KEEP").is_some() {
         std::fs::write(dir.path.join("spliced.wasm"), &wasm)?;
