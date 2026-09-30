@@ -546,20 +546,15 @@ impl<'a> Lifter<'a> {
                 let (addr, off) = self.addr(&m);
                 let addr = self.offset_addr(addr, off);
                 let store = matches!(i.op, Op::Fnstenv | Op::Fnsave);
-                if i.op == Op::Frstor {
-                    self.x87_env(addr, false);
-                }
-                if store {
-                    self.x87_env(addr, true);
-                }
-                if i.op == Op::Fldenv {
-                    self.x87_env(addr, false);
-                }
-                // `fnsave`/`frstor`: the registers follow the 28-byte
-                // environment, 10 bytes each, in stack order.
+                // A 16-bit operand size selects the 14-byte environment.
+                let wide = i.width != Width::W;
+                self.x87_env(addr, store, wide);
+                // `fnsave`/`frstor`: the registers follow the environment
+                // (108- or 94-byte image), 10 bytes each, in stack order.
                 if matches!(i.op, Op::Fnsave | Op::Frstor) {
+                    let env = if wide { 28 } else { 14 };
                     for n in 0..8u8 {
-                        let off = 28 + 10 * n as i64;
+                        let off = env + 10 * n as i64;
                         if i.op == Op::Fnsave {
                             let v = self.ld_st(n);
                             self.st_ext(addr, off, v);
@@ -653,9 +648,20 @@ impl<'a> Lifter<'a> {
     /// also masks every exception in the live control word, which
     /// `feholdexcept` relies on. Tags here are one valid bit per
     /// register; the tag word is two bits per register, 11 = empty.
-    fn x87_env(&mut self, addr: Value, store: bool) {
+    ///
+    /// With a 16-bit operand size (`wide` false) the image is the 14-byte
+    /// one: the same fields, two bytes each.
+    fn x87_env(&mut self, addr: Value, store: bool, wide: bool) {
+        let stride: i64 = if wide { 4 } else { 2 };
+        // Field `n` of the image; the 32-bit layout's upper halves read as
+        // ones (they are reserved).
         let st32 = |this: &mut Self, offset: i64, val: Value| {
-            this.b.stmt(Stmt::Store { addr, offset, val, sz: MemSz::B4, order: Order::Relaxed });
+            let n = offset / 4;
+            if wide {
+                this.b.stmt(Stmt::Store { addr, offset, val, sz: MemSz::B4, order: Order::Relaxed });
+            } else {
+                this.b.stmt(Stmt::Store { addr, offset: n * 2, val, sz: MemSz::B2, order: Order::Relaxed });
+            }
         };
         if store {
             let cw = self.b.read(GuestReg::X87Cw);
@@ -697,11 +703,14 @@ impl<'a> Lifter<'a> {
             let tw = self.b.bin(BinOp::Xor, Ty::I32, x, all);
             let twv = self.b.bin(BinOp::Or, Ty::I32, tw, hi);
             st32(self, 8, twv);
+            // The last instruction's and operand's addresses and opcode:
+            // gex does not track them and stores zero. The data selector's
+            // reserved upper half reads as ones, like the others'.
             let zero = self.k32(0);
             st32(self, 12, zero);
             st32(self, 16, zero);
             st32(self, 20, zero);
-            st32(self, 24, zero);
+            st32(self, 24, hi);
             // Then mask all exceptions.
             let m3f = self.k32(0x3f);
             let cw2 = self.b.bin(BinOp::Or, Ty::I32, cw, m3f);
@@ -712,7 +721,7 @@ impl<'a> Lifter<'a> {
             };
             let cw = ld16(self, 0);
             self.b.write(GuestReg::X87Cw, cw);
-            let sw = ld16(self, 4);
+            let sw = ld16(self, stride);
             let eleven = self.k32(11);
             let t = self.b.bin(BinOp::ShrU, Ty::I32, sw, eleven);
             let seven = self.k32(7);
@@ -723,7 +732,7 @@ impl<'a> Lifter<'a> {
             self.b.write(GuestReg::X87Sw, sw);
             // Tag word -> valid bits: a register is valid when its two
             // tag bits are not both set. Compress the even bits to 8.
-            let tw = ld16(self, 8);
+            let tw = ld16(self, 2 * stride);
             let one = self.k32(1);
             let hi1 = self.b.bin(BinOp::ShrU, Ty::I32, tw, one);
             let both = self.b.bin(BinOp::And, Ty::I32, tw, hi1);
