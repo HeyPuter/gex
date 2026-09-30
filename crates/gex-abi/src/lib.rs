@@ -15,11 +15,79 @@
 /// so one binary serves one guest.
 pub const X86: bool = cfg!(feature = "x86");
 
+/// True when this build targets a 32-bit big-endian PowerPC guest (the `ppc`
+/// cargo feature; docs/ppc.md).
+pub const PPC: bool = cfg!(feature = "ppc");
+
+#[cfg(all(feature = "x86", feature = "ppc"))]
+compile_error!("gex-abi: the `x86` and `ppc` guests are mutually exclusive");
+
 /// The guest architecture's name as Linux spells it (`uname -m`, `AT_PLATFORM`).
-pub const ARCH_NAME: &str = if X86 { "x86_64" } else { "aarch64" };
+pub const ARCH_NAME: &str = if X86 {
+    "x86_64"
+} else if PPC {
+    "ppc"
+} else {
+    "aarch64"
+};
 
 /// The ELF `e_machine` of a guest object.
-pub const ELF_MACHINE: u16 = if X86 { 62 } else { 183 };
+pub const ELF_MACHINE: u16 = if X86 {
+    62
+} else if PPC {
+    20
+} else {
+    183
+};
+
+// ---------------------------------------------------------------------------
+// Guest byte order
+// ---------------------------------------------------------------------------
+
+/// True when the guest is big-endian. Guest memory holds its bytes in the
+/// guest's order, so a multi-byte guest value is swapped on its way in and
+/// out; the runtime's own structures below [`GUEST_ORDER_FROM`] are always
+/// little-endian, since translated code reads them with native wasm loads.
+pub const BIG_ENDIAN: bool = PPC;
+
+/// The lowest address holding guest-ordered data. Everything below (thread
+/// contexts, the kernel's per-thread scratch, the dispatch directory) is the
+/// runtime's and little-endian; no guest mapping is ever placed there (the
+/// kernel's `mem::hits_runtime` refuses it), so an address says which order
+/// its bytes are in.
+pub const GUEST_ORDER_FROM: u64 = DISPATCH_DIR_END;
+
+/// Whether the bytes at `addr` are in big-endian (guest) order.
+#[inline(always)]
+pub const fn is_guest_be(addr: u64) -> bool {
+    BIG_ENDIAN && addr >= GUEST_ORDER_FROM
+}
+
+/// Conversion between a guest value and the bytes guest memory holds for it,
+/// in the guest's byte order. With a little-endian guest these are exactly
+/// `to_le_bytes`/`from_le_bytes`.
+pub trait GuestEndian: Sized + Copy {
+    type Bytes;
+    fn to_ge_bytes(self) -> Self::Bytes;
+    fn from_ge_bytes(b: Self::Bytes) -> Self;
+}
+
+macro_rules! guest_endian {
+    ($($t:ty),*) => {$(
+        impl GuestEndian for $t {
+            type Bytes = [u8; core::mem::size_of::<$t>()];
+            #[inline(always)]
+            fn to_ge_bytes(self) -> Self::Bytes {
+                if BIG_ENDIAN { self.to_be_bytes() } else { self.to_le_bytes() }
+            }
+            #[inline(always)]
+            fn from_ge_bytes(b: Self::Bytes) -> Self {
+                if BIG_ENDIAN { <$t>::from_be_bytes(b) } else { <$t>::from_le_bytes(b) }
+            }
+        }
+    )*};
+}
+guest_endian!(u16, i16, u32, i32, u64, i64);
 
 /// Log2 of the guest's instruction alignment: A64 instructions are 4-byte
 /// aligned words, x86-64 instructions start on any byte.
@@ -167,7 +235,13 @@ pub mod ctx {
     /// Stack pointer. On x86-64 the stack pointer is an ordinary GPR (`rsp`,
     /// `x(4)`), so this names that slot and the kernel's every use of `SP`
     /// reads the right register.
-    pub const SP: usize = if super::X86 { x(4) } else { 31 * 8 };
+    pub const SP: usize = if super::X86 {
+        x(4)
+    } else if super::PPC {
+        x(1)
+    } else {
+        31 * 8
+    };
     /// Program counter. Only meaningful at block boundaries and safepoints.
     pub const PC: usize = 32 * 8;
 
@@ -282,28 +356,60 @@ pub mod ctx {
     /// `poll` becomes `ppoll` with a timespec that has to live somewhere).
     pub const SCRATCH: usize = X87 + 12 * 8;
 
+    /// PowerPC only: the area after `v31` (where x86-64 keeps its x87
+    /// stack). The 32 condition-register bits, one byte each: bit `4f + k` is
+    /// field `f`'s LT, GT, EQ, SO for `k` = 0..3.
+    pub const PPC_CR: usize = V + 32 * 16;
+    /// Link and count registers, 32 bits each.
+    pub const PPC_LR: usize = PPC_CR + 32;
+    pub const PPC_CTR: usize = PPC_CR + 36;
+    /// XER's summary overflow, overflow and carry, one byte each (0 or 1),
+    /// and its byte count (bits 25–31, for `lswx`/`stswx`).
+    pub const PPC_SO: usize = PPC_CR + 40;
+    pub const PPC_OV: usize = PPC_CR + 41;
+    pub const PPC_CA: usize = PPC_CR + 42;
+    pub const PPC_XER_BC: usize = PPC_CR + 43;
+    /// The FPSCR, 32 bits.
+    pub const PPC_FPSCR: usize = PPC_CR + 44;
+    /// r3 as a system call found it, for restarting one (Linux's `orig_gpr3`).
+    pub const PPC_ORIG_R3: usize = PPC_CR + 48;
+    /// PowerPC's FPRs are `v0`–`v31`'s low eight bytes, as f64 bit patterns.
+    pub const fn f(n: u8) -> usize {
+        v(n)
+    }
+
     /// Total size of the context structure, rounded up. The x87 stack and
-    /// the scratch area are x86-64's; an AArch64 context ends with `v31`.
-    pub const SIZE: usize = if super::X86 { SCRATCH + 64 } else { V + 32 * 16 };
+    /// the scratch area are x86-64's, and PowerPC's registers and scratch
+    /// share that space; an AArch64 context ends with `v31`.
+    pub const SIZE: usize = if super::X86 || super::PPC {
+        SCRATCH + 64
+    } else {
+        V + 32 * 16
+    };
 
     /// Where the guest puts a system-call number: `x8`, or `rax` (`x(0)` in
-    /// gex's numbering of x86-64 registers, which is the hardware's).
-    pub const SYSCALL_NR: usize = if super::X86 { x(0) } else { x(8) };
+    /// gex's numbering of x86-64 registers, which is the hardware's), or
+    /// PowerPC's `r0`.
+    pub const SYSCALL_NR: usize = if super::X86 || super::PPC { x(0) } else { x(8) };
     /// Where the six system-call arguments arrive: `x0`–`x5`, or
-    /// `rdi, rsi, rdx, r10, r8, r9`.
+    /// `rdi, rsi, rdx, r10, r8, r9`, or `r3`–`r8`.
     pub const SYSCALL_ARGS: [usize; 6] = if super::X86 {
         [x(7), x(6), x(2), x(10), x(8), x(9)]
+    } else if super::PPC {
+        [x(3), x(4), x(5), x(6), x(7), x(8)]
     } else {
         [x(0), x(1), x(2), x(3), x(4), x(5)]
     };
-    /// Where a system call's result goes: `x0` on both (`rax` is `x(0)`).
-    pub const SYSCALL_RET: usize = x(0);
+    /// Where a system call's result goes: `x0` (`rax` is `x(0)`), or `r3`.
+    pub const SYSCALL_RET: usize = if super::PPC { x(3) } else { x(0) };
 
     /// The first argument register of the guest's C calling convention
-    /// (`x0`, or `rdi`), and the next two. What a library-function intrinsic
-    /// reads its arguments from.
+    /// (`x0`, or `rdi`, or `r3`), and the next two. What a library-function
+    /// intrinsic reads its arguments from.
     pub const CALL_ARGS: [usize; 3] = if super::X86 {
         [x(7), x(6), x(2)]
+    } else if super::PPC {
+        [x(3), x(4), x(5)]
     } else {
         [x(0), x(1), x(2)]
     };
@@ -597,7 +703,9 @@ mod tests {
         assert!(ctx::V >= ctx::LAST_SYSCALL + 8);
         assert!(ctx::X87 == ctx::v(31) + 16);
         assert!(!X86 || ctx::SIZE >= ctx::SCRATCH + 64);
-        assert!(X86 || ctx::SIZE == ctx::v(31) + 16);
+        assert!(X86 || PPC || ctx::SIZE == ctx::v(31) + 16);
+        // PowerPC's registers fit between `v31` and the scratch area.
+        assert!(ctx::PPC_ORIG_R3 + 8 <= ctx::SCRATCH);
         assert!(ctx::SIZE % 8 == 0);
         // The vector slots must be 16-byte aligned for `v128` accesses.
         assert!(ctx::V % 16 == 0);
