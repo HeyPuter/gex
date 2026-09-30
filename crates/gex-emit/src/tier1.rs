@@ -2580,12 +2580,21 @@ impl<'a> Emitter<'a> {
         self.f.byte(0xa0);
         self.f.local_set(t);
 
-        // The one rounding.
-        self.f.local_get(s);
+        // The one rounding, `s + (t + e)` -- or `s` itself when the
+        // correction is zero, which keeps the sign of an exact zero (see
+        // `fma::fma_soft`).
         self.f.local_get(t);
         self.f.local_get(e);
         self.f.byte(0xa0);
+        self.f.local_set(tmp); // t + e
+        self.f.local_get(s);
+        self.f.local_get(s);
+        self.f.local_get(tmp);
         self.f.byte(0xa0);
+        self.f.local_get(tmp);
+        self.f64_const(0.0);
+        self.f.byte(0x61); // f64.eq
+        self.f.select();
     }
 
     fn host_call_inline(&mut self, func: HostFunc, args: &[Value]) {

@@ -42,8 +42,15 @@ pub fn fma_soft(a: f64, b: f64, c: f64) -> f64 {
     let bb = s - p;
     let t = (p - (s - bb)) + (c - bb);
 
-    // The one rounding.
-    s + (t + e)
+    // The one rounding. When the correction is zero, `s` is the exact
+    // result, sign of zero included: adding a +0 correction would turn the
+    // -0 of `(-0) + (-0)` (say `0 * -1 + -0`) into +0.
+    let te = t + e;
+    if te == 0.0 {
+        s
+    } else {
+        s + te
+    }
 }
 
 /// The single-precision case needs neither Dekker nor a guard: the product of
@@ -70,6 +77,25 @@ pub fn fmaf_soft(a: f32, b: f32, c: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An exactly-zero result keeps IEEE's sign: -0 when the product and the
+    /// addend are both -0, +0 when they cancel. Found by the PowerPC
+    /// differential fuzzer (`fmsub` with a -0 product).
+    #[test]
+    fn zero_results_have_the_right_sign() {
+        for (a, b, c) in [
+            (0.0f64, -1.0, -0.0),
+            (-0.0, 1.0, -0.0),
+            (1.0, -0.0, -0.0),
+            (0.0, 1.0, -0.0),
+            (-0.0, -0.0, -0.0),
+            (2.0, 3.0, -6.0),
+            (-2.0, 3.0, 6.0),
+        ] {
+            let (s, h) = (fma_soft(a, b, c), a.mul_add(b, c));
+            assert_eq!(s.to_bits(), h.to_bits(), "fma({a}, {b}, {c})");
+        }
+    }
 
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
