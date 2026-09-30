@@ -178,17 +178,54 @@ impl MemoryMap {
             .unwrap_or(MMAP_BOTTOM)
     }
 
-    /// Make sure the host's memory reaches `end`, for a mapping placed at an
-    /// address the guest chose (MAP_FIXED or an honoured hint) which may be
-    /// above anything the arena has claimed -- a pthread stack, commonly.
-    fn ensure_backed(&mut self, end: u64) -> Result<(), Errno> {
-        let Some(take) = self.take else {
-            return Ok(());
-        };
-        if self.arena.iter().any(|&(_, e)| end <= e) {
+    /// Whether `[start, end)` lies in this map's own spans of the arena. The
+    /// spans are sorted and disjoint (the cursor only climbs).
+    fn in_arena(&self, start: u64, end: u64) -> bool {
+        let mut at = start;
+        for &(lo, hi) in &self.arena {
+            if hi <= at {
+                continue;
+            }
+            if lo > at {
+                return false;
+            }
+            at = hi;
+            if at >= end {
+                return true;
+            }
+        }
+        at >= end
+    }
+
+    /// Make `[start, end)` this process's to map, for a mapping at an address
+    /// the guest chose (MAP_FIXED, an honoured hint, an mremap growing in
+    /// place): backed, and not memory the runtime holds.
+    ///
+    /// Natively everything is. In the browser the arena above
+    /// [`gex_abi::ARENA_BOTTOM`] is shared with the shim's own heap through
+    /// one cursor, so a range there must lie in this map's spans, or above
+    /// the cursor, which `back` then moves past it. Below `ARENA_BOTTOM` is
+    /// the guest's fixed layout and the placement window, which the heap
+    /// never takes from. A range the heap has a span in is ENOMEM: honouring
+    /// it put a guest mapping over the shim's heap, and a program whose
+    /// malloc passed mmap hints (musl built by zig) trapped in the shim after
+    /// a hundred or so large allocations.
+    fn claim(&mut self, start: u64, end: u64) -> Result<(), Errno> {
+        if self.take.is_none() {
             return Ok(());
         }
-        let _ = take;
+        let floor = gex_abi::ARENA_BOTTOM;
+        let ours = |m: &Self| end <= floor || m.in_arena(start.max(floor), end);
+        if ours(self) {
+            // Below the floor the memory may still need growing (the
+            // placement window lies above what a process starts with).
+            if end <= floor {
+                if let Some(back) = self.back {
+                    back(end).ok_or(Errno::ENOMEM)?;
+                }
+            }
+            return Ok(());
+        }
         let Some(back) = self.back.filter(|_| end <= MMAP_TOP) else {
             return Err(Errno::ENOMEM);
         };
@@ -200,13 +237,18 @@ impl MemoryMap {
         // memory again. Without this a MAP_FIXED high up (a pinned library,
         // a thread stack placed by hint) stranded everything between the old
         // cursor and itself.
+        let prev = prev.max(floor);
         if prev < end {
             match self.arena.last_mut() {
                 Some(last) if last.1 == prev => last.1 = end,
                 _ => self.arena.push((prev, end)),
             }
         }
-        Ok(())
+        if ours(self) {
+            Ok(())
+        } else {
+            Err(Errno::ENOMEM)
+        }
     }
 
     /// How much of the top of the arena is free: the bytes between the highest
@@ -483,7 +525,7 @@ impl MemoryMap {
                 return Err(Errno::ENOMEM);
             }
             // MAP_FIXED replaces whatever was there.
-            self.ensure_backed(end)?;
+            self.claim(addr, end)?;
             self.unmap(addr, len)?;
             self.insert_from(addr, end, prot, name, origin);
             return Ok(addr);
@@ -496,7 +538,7 @@ impl MemoryMap {
             if end <= GUEST_LIMIT
                 && self.is_free(addr, end)
                 && !hits_runtime(addr, end)
-                && self.ensure_backed(end).is_ok()
+                && self.claim(addr, end).is_ok()
             {
                 self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
@@ -589,7 +631,11 @@ impl MemoryMap {
             return Ok((addr, false));
         }
         let grown = addr + new_len;
-        if grown <= GUEST_LIMIT && self.is_free(addr + old_len, grown) && !hits_runtime(addr + old_len, grown) {
+        if grown <= GUEST_LIMIT
+            && self.is_free(addr + old_len, grown)
+            && !hits_runtime(addr + old_len, grown)
+            && self.claim(addr + old_len, grown).is_ok()
+        {
             self.insert(addr + old_len, grown, v.prot, &v.name);
             return Ok((addr, false));
         }
@@ -875,6 +921,50 @@ mod tests {
         m.unmap(base + 0x2000, 0x1000).unwrap();
         assert_eq!(m.vmas().len(), 5);
         assert!(m.check_access(base + 0x8000, 0x1000, prot::READ));
+    }
+
+    /// The arena is shared with the shim's heap through one cursor. A hint,
+    /// MAP_FIXED or in-place mremap into a span the heap took must not put a
+    /// guest mapping over it: musl (as zig builds it) passes mmap hints, and
+    /// a benchmark's hundredth large malloc trapped inside the browser shim.
+    #[test]
+    fn a_placed_mapping_never_lands_in_the_runtimes_heap() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let a = m.mmap(0, 0x10_0000, 3, anon, "a").unwrap();
+        let a_top = a + 0x80_0000; // the kernel claims a CHUNK at a time
+        // The heap takes the next span; the kernel's next claim lands above.
+        let heap = take(0x100_0000);
+        assert_eq!(heap, a_top);
+        let b = m.mmap(0, 0x90_0000, 3, anon, "b").unwrap();
+        assert!(b >= heap + 0x100_0000);
+        let inside = heap + 0x1000;
+        // A hint there is ignored; the mapping goes somewhere that is ours.
+        let h = m.mmap(inside, 0x2000, 3, anon, "h").unwrap();
+        assert!(h + 0x2000 <= heap || h >= heap + 0x100_0000, "hint honoured in the heap: {h:#x}");
+        // MAP_FIXED there is refused.
+        assert_eq!(m.mmap(inside, 0x2000, 3, anon | flags::FIXED, "f"), Err(Errno::ENOMEM));
+        // A mapping at the top of the kernel's first span does not grow in
+        // place into the heap span above it.
+        let edge = m.mmap(a_top - 0x1000, 0x1000, 3, anon | flags::FIXED, "e").unwrap();
+        let (moved_to, moved) = m.mremap(edge, 0x1000, 0x3000, true).unwrap();
+        assert!(moved && (moved_to + 0x3000 <= heap || moved_to >= heap + 0x100_0000), "{moved_to:#x}");
+        assert_eq!(m.mremap(moved_to, 0x3000, 0x3000, false), Ok((moved_to, false)));
+        // Within its own spans a hint is still honoured.
+        let own = a + 0x20_0000;
+        assert_eq!(m.mmap(own, 0x1000, 3, anon, "o"), Ok(own));
+        // Below the arena (the placement window) is the guest's.
+        let placed = gex_abi::PLACE_BOTTOM + 0x1000;
+        assert_eq!(m.mmap(placed, 0x1000, 3, anon | flags::FIXED, "p"), Ok(placed));
     }
 
     #[test]
