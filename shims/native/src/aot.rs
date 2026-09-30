@@ -94,6 +94,11 @@ pub struct Replacement {
 pub struct Aot {
     /// Image identity ([`image_identity`]) to the prebuilt module's wasm.
     pub images: HashMap<String, PathBuf>,
+    /// For a dynamically linked program (by its image identity), the modules
+    /// of the rest of its closure: the interpreter and the libraries, each
+    /// built for the base `RunOptions::pins` places it at. Installed before
+    /// the program starts.
+    pub shared: HashMap<String, Vec<PathBuf>>,
     /// Replacement modules' wasm files.
     pub modules: Vec<PathBuf>,
     /// By id, the number the build put in each `Replace` block.
@@ -109,6 +114,7 @@ impl std::fmt::Debug for Aot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Aot")
             .field("images", &self.images)
+            .field("shared", &self.shared)
             .field("modules", &self.modules)
             .field("replacements", &self.replacements)
             .field("label", &self.label)
@@ -220,6 +226,15 @@ pub(crate) fn image_module(
             image.entry
         )
     })?;
+    load_module(engine, cache, path)
+}
+
+/// A prebuilt module and its metadata, compiled through the cache.
+fn load_module(
+    engine: &Engine,
+    cache: Option<(&std::path::Path, &str)>,
+    path: &std::path::Path,
+) -> Result<(Module, gex_xlate::Metadata)> {
     let wasm = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let meta = read_metadata(&wasm)
         .ok_or_else(|| anyhow!("{} carries no gex metadata; rebuild the project", path.display()))?;
@@ -234,6 +249,57 @@ pub(crate) fn image_module(
         None => Module::new(engine, &wasm).with_context(|| format!("compiling {}", path.display()))?,
     };
     Ok((module, meta))
+}
+
+/// The rest of a dynamically linked program's closure, compiled; empty for
+/// a static one.
+pub(crate) fn shared_modules(
+    aot: &Aot,
+    engine: &Engine,
+    cache: Option<(&std::path::Path, &str)>,
+    image: &Image,
+) -> Result<Vec<(Module, gex_xlate::Metadata)>> {
+    let Some(paths) = aot.shared.get(&image_identity(image)) else {
+        return Ok(Vec::new());
+    };
+    paths.iter().map(|p| load_module(engine, cache, p)).collect()
+}
+
+/// Install a program's prebuilt closure modules into the runtime's registry
+/// and this store, as if runtime translation had produced them: threads and
+/// forked children replay the registry, so they get them too.
+pub(crate) fn install_shared(
+    store: &mut wasmtime::Store<HostState>,
+    units: Vec<(Module, gex_xlate::Metadata)>,
+) -> Result<()> {
+    let shared = std::sync::Arc::clone(
+        &store
+            .data()
+            .jit
+            .as_ref()
+            .ok_or_else(|| anyhow!("an ejected closure needs the runtime's module registry"))?
+            .shared,
+    );
+    for (module, meta) in units {
+        let page_table = gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot);
+        let unit = Arc::new(super::CompiledUnit {
+            module,
+            exported_blocks: Vec::new(),
+            dir_entries: meta.dir_entries.clone(),
+            table_slots: meta.table_slots,
+            page_table: page_table.clone(),
+        });
+        {
+            let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let mut merged = sh.page_table.clone();
+            merged.merge(&page_table);
+            sh.page_table = merged;
+            sh.registry.push(Arc::clone(&unit));
+        }
+        super::install_unit(&mut *store, &unit)?;
+        store.data_mut().jit.as_mut().unwrap().replayed += 1;
+    }
+    Ok(())
 }
 
 /// Record the replacement region in the process's memory map, so the guest's
@@ -527,15 +593,21 @@ pub(crate) fn unseen_code(caller: &mut Caller<'_, HostState>, pc: u64) -> Option
             .find(|v| v.start <= pc && pc < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0)
             .map(|v| (v.name.clone(), pc - v.start))
     })?;
-    Some(match name {
-        (n, off) if !n.is_empty() && !n.starts_with('[') => format!(
-            "gex-eject: code at {pc:#x} ({n} + {off:#x}) was not translated when {} was \
+    let place = match name {
+        // gex's loader names the program's (and interpreter's) segments so.
+        (n, _) if n == "[image]" => Some("in the program's image".to_string()),
+        (n, off) if !n.is_empty() && !n.starts_with('[') => Some(format!("{n} + {off:#x}")),
+        _ => None,
+    };
+    Some(match place {
+        Some(place) => format!(
+            "gex-eject: code at {pc:#x} ({place}) was not translated when {} was \
              built: the recorded session never reached it and discovery did not find it. \
-             Record a session that reaches it and re-eject, set \"coverage\": \"exhaustive\" \
+             Record a session that reaches it and re-eject, set \"coverage\" to \"static\" or \"exhaustive\" \
              in user/eject.json, or run with --jit-fallback",
             aot.label
         ),
-        _ => format!(
+        None => format!(
             "gex-eject: code at {pc:#x} is in an anonymous mapping: code the program made \
              at run time, which {} cannot have built. It runs only with --jit-fallback",
             aot.label

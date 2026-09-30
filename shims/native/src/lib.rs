@@ -787,10 +787,20 @@ fn run_program_with(
     // translation.
     let tables = dispatch_tables(&mut store, &instance)?;
     let table = tables[0];
+    // An ejected dynamically linked program's interpreter and libraries,
+    // built ahead of time: they go in through the same registry runtime
+    // translation uses, so it has to exist even with that off.
+    let aot_shared = match &opts.aot {
+        Some(aot) => {
+            let dir = use_cache.then(gex_cache::cache_dir).flatten();
+            aot::shared_modules(aot, &engine, dir.as_deref().map(|d| (d, build.as_str())), image)?
+        }
+        None => Vec::new(),
+    };
     // The machinery here installs a translated module into this store. The
     // miss handler is one user; static object recompilation is another.
     // `--no-jit` turns off the miss handler, not this.
-    if opts.jit || opts.recompile_objects {
+    if opts.jit || opts.recompile_objects || !aot_shared.is_empty() {
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot),
@@ -808,6 +818,9 @@ fn run_program_with(
             replayed: 0,
             limits: xlate.limits,
         });
+    }
+    if !aot_shared.is_empty() {
+        aot::install_shared(&mut store, aot_shared)?;
     }
 
     let entry = match nt_setup {
