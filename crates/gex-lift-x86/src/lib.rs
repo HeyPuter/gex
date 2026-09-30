@@ -37,7 +37,8 @@ pub mod sysreg {
     pub const X87: i32 = -101;
 }
 
-/// The x87 operations [`sysreg::X87`] carries. `gex_kernel::x86::x87op`
+/// The x87 operations [`sysreg::X87`] carries: an operation code in the low
+/// byte and its operands in the fields below. `gex_kernel::x86::x87op`
 /// serves them and must agree.
 pub mod x87op {
     pub const F2XM1: u64 = 1;
@@ -51,6 +52,57 @@ pub mod x87op {
     pub const FSIN: u64 = 9;
     pub const FCOS: u64 = 10;
     pub const FSINCOS: u64 = 11;
+    /// Arithmetic: operands and destination from the form, reversed by `REV`.
+    pub const FADD: u64 = 20;
+    pub const FMUL: u64 = 21;
+    pub const FSUB: u64 = 22;
+    pub const FDIV: u64 = 23;
+    /// Compare `st0` with the form's other operand; C0/C2/C3, or ZF/PF/CF
+    /// in `X87_TMP` with `TO_EFLAGS`.
+    pub const FCOM: u64 = 24;
+    pub const FTST: u64 = 25;
+    pub const FSQRT: u64 = 26;
+    pub const FRNDINT: u64 = 27;
+    pub const FSCALE: u64 = 28;
+    /// Push the memory operand in `X87_TMP`, converted from its format.
+    pub const FLD: u64 = 29;
+    /// Convert `st0` to the memory format into `X87_TMP` (no pop).
+    pub const FST: u64 = 30;
+    pub const FXAM: u64 = 31;
+    /// Push constant `K` (`fld1`, `fldl2t`, `fldl2e`, `fldpi`, `fldlg2`,
+    /// `fldln2`, `fldz`).
+    pub const FLDCONST: u64 = 32;
+
+    /// `st(i)`, 3 bits.
+    pub const I_SHIFT: u32 = 8;
+    /// Operand form, 2 bits.
+    pub const FORM_SHIFT: u32 = 11;
+    /// `st0 op= memory operand (X87_TMP)`.
+    pub const FORM_MEM: u64 = 0;
+    /// `st0 op= st(i)`.
+    pub const FORM_ST0_STI: u64 = 1;
+    /// `st(i) op= st0`.
+    pub const FORM_STI_ST0: u64 = 2;
+    /// Pops afterwards, 2 bits.
+    pub const POP_SHIFT: u32 = 13;
+    /// Swap the operands (`fsubr`, `fdivr`).
+    pub const REV: u64 = 1 << 15;
+    /// Memory format, 3 bits.
+    pub const MEM_SHIFT: u32 = 16;
+    pub const MEM_F32: u64 = 0;
+    pub const MEM_F64: u64 = 1;
+    pub const MEM_F80: u64 = 2;
+    pub const MEM_I16: u64 = 3;
+    pub const MEM_I32: u64 = 4;
+    pub const MEM_I64: u64 = 5;
+    /// `fisttp`: convert toward zero.
+    pub const TRUNC: u64 = 1 << 19;
+    /// `fucom`: only an SNaN raises IE.
+    pub const QUIET: u64 = 1 << 20;
+    /// `fcomi`: the result goes to EFLAGS, not the condition codes.
+    pub const TO_EFLAGS: u64 = 1 << 21;
+    /// Constant index, 3 bits.
+    pub const K_SHIFT: u32 = 24;
 }
 
 /// What the condition flags hold, when a branch can ask about the operands
@@ -2538,11 +2590,9 @@ impl<'a> Lifter<'a> {
         Flow::Next
     }
 
-    /// `fxsave`/`fxrstor` and the `xsave` family: save/restore the SSE state
-    /// (MXCSR and the sixteen xmm registers) in the architectural layout. The
-    /// x87 part of the area is written as empty; guests use these to spill
-    /// vector state across signal handlers and `setjmp`, not to move x87
-    /// values.
+    /// `fxsave`/`fxrstor` and the `xsave` family: save/restore the x87 and
+    /// SSE state (control and status words, tags, the eight x87 registers,
+    /// MXCSR and the sixteen xmm registers) in the architectural layout.
     fn fxsave(&mut self, i: &Inst) -> Flow {
         let Operand::Mem(m) = i.op0() else {
             return Flow::End(Term::Illegal {
@@ -2554,8 +2604,8 @@ impl<'a> Lifter<'a> {
         let addr = self.offset_addr(addr, offset);
         let save = matches!(i.op, Op::Fxsave | Op::Xsave);
         if save {
-            // FCW=0x37f, FSW=0, FTW=0 (abridged: all empty), MXCSR at 24,
-            // MXCSR_MASK at 28.
+            // FCW, FSW, the abridged FTW and the eight x87 registers, then
+            // MXCSR at 24 and MXCSR_MASK at 28.
             let fcw = self.b.read(GuestReg::X87Cw);
             self.b.stmt(Stmt::Store {
                 addr,
@@ -2564,21 +2614,7 @@ impl<'a> Lifter<'a> {
                 sz: MemSz::B2,
                 order: Order::Relaxed,
             });
-            let zero = self.k32(0);
-            self.b.stmt(Stmt::Store {
-                addr,
-                offset: 2,
-                val: zero,
-                sz: MemSz::B2,
-                order: Order::Relaxed,
-            });
-            self.b.stmt(Stmt::Store {
-                addr,
-                offset: 4,
-                val: zero,
-                sz: MemSz::B4,
-                order: Order::Relaxed,
-            });
+            self.x87_fxsave(addr, true);
             let mxcsr = self.b.read(GuestReg::Mxcsr);
             self.b.stmt(Stmt::Store {
                 addr,
@@ -2625,6 +2661,7 @@ impl<'a> Lifter<'a> {
                 order: Order::Relaxed,
             });
             self.b.write(GuestReg::X87Cw, fcw);
+            self.x87_fxsave(addr, false);
             let mxcsr = self.b.def(Expr::Load {
                 addr,
                 offset: 24,

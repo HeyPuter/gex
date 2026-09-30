@@ -565,7 +565,7 @@ fn gen_x87(rng: &mut Rng) -> Candidate {
     let a = OUT_SCRATCH + rng.below(20) as usize * 8;
     let b = OUT_SCRATCH + 160 + rng.below(20) as usize * 8;
     let out = OUT_SCRATCH + 352 + rng.below(16) as usize * 8;
-    let text = match rng.below(10) {
+    let text = match rng.below(14) {
         0 => format!("fld QWORD PTR [{bb}+{a}]\n    fld QWORD PTR [{bb}+{b}]\n    faddp st(1), st\n    fstp QWORD PTR [{bb}+{out}]"),
         1 => format!("fld QWORD PTR [{bb}+{a}]\n    fld QWORD PTR [{bb}+{b}]\n    fsubrp st(1), st\n    fstp QWORD PTR [{bb}+{out}]"),
         2 => format!("fld QWORD PTR [{bb}+{a}]\n    fld QWORD PTR [{bb}+{b}]\n    fmulp st(1), st\n    fstp QWORD PTR [{bb}+{out}]"),
@@ -575,8 +575,71 @@ fn gen_x87(rng: &mut Rng) -> Candidate {
         6 => format!("fild QWORD PTR [{bb}+{a}]\n    fstp QWORD PTR [{bb}+{out}]"),
         7 => format!("fld QWORD PTR [{bb}+{a}]\n    fld QWORD PTR [{bb}+{b}]\n    fxch st(1)\n    fstp QWORD PTR [{bb}+{out}]\n    fstp QWORD PTR [{bb}+{out}]"),
         8 => format!("fld QWORD PTR [{bb}+{a}]\n    fld QWORD PTR [{bb}+{b}]\n    fucomip st, st(1)\n    fstp st(0)\n    setb al\n    sete cl\n    setp dl"),
-        _ => format!("fld1\n    fldz\n    faddp st(1), st\n    fstp QWORD PTR [{bb}+{out}]"),
+        9 => format!("fld1\n    fldz\n    faddp st(1), st\n    fstp QWORD PTR [{bb}+{out}]"),
+        // Extended precision: raw 80-bit operands from the buffer (every
+        // encoding, unsupported ones included), any precision and rounding
+        // control, results stored whole, and the status word (exception
+        // flags, condition codes, C1) read back into ax.
+        _ => return gen_x87_ext(rng),
     };
+    Candidate { text, class: "x87", flag_mask: NONE }
+}
+
+fn gen_x87_ext(rng: &mut Rng) -> Candidate {
+    let bb = base();
+    let a = OUT_SCRATCH + rng.below(20) as usize * 8;
+    let b = OUT_SCRATCH + 160 + rng.below(20) as usize * 8;
+    // 16-byte result slots, so an 80-bit store fits.
+    let out = OUT_SCRATCH + 352 + rng.below(8) as usize * 16;
+    let cw = 0x7f | (rng.below(4) as u32) << 8 | (rng.below(4) as u32) << 10;
+    // Load operand one: 80-bit from the buffer, or a double.
+    let ld = |rng: &mut Rng, at: usize| -> String {
+        if rng.below(3) == 0 {
+            format!("fld QWORD PTR [{bb}+{at}]")
+        } else {
+            format!("fld TBYTE PTR [{bb}+{at}]")
+        }
+    };
+    let set_cw = format!("mov WORD PTR [{bb}+{out}], {cw:#x}\n    fldcw WORD PTR [{bb}+{out}]\n    fnclex");
+    let restore = format!("mov WORD PTR [{bb}+{out}+12], 0x37f\n    fldcw WORD PTR [{bb}+{out}+12]");
+    let body = match rng.below(10) {
+        0 => {
+            let op = ["faddp", "fsubp", "fsubrp", "fmulp", "fdivp", "fdivrp"][rng.below(6) as usize];
+            format!("{}\n    {}\n    {op} st(1), st\n    fnstsw ax\n    fstp TBYTE PTR [{bb}+{out}]", ld(rng, a), ld(rng, b))
+        }
+        1 => {
+            let op = ["fadd", "fsub", "fsubr", "fmul", "fdiv", "fdivr"][rng.below(6) as usize];
+            let m = ["QWORD", "DWORD"][rng.below(2) as usize];
+            format!("{}\n    {op} {m} PTR [{bb}+{b}]\n    fnstsw ax\n    fstp TBYTE PTR [{bb}+{out}]", ld(rng, a))
+        }
+        2 => {
+            let op = ["fsqrt", "frndint", "fchs", "fabs"][rng.below(4) as usize];
+            format!("{}\n    {op}\n    fnstsw ax\n    fstp TBYTE PTR [{bb}+{out}]", ld(rng, a))
+        }
+        3 => {
+            let (op, m) = [("fistp", "WORD"), ("fistp", "DWORD"), ("fistp", "QWORD"), ("fisttp", "WORD"), ("fisttp", "DWORD"), ("fisttp", "QWORD")][rng.below(6) as usize];
+            format!("{}\n    {op} {m} PTR [{bb}+{out}]\n    fnstsw ax", ld(rng, a))
+        }
+        4 => {
+            let m = ["QWORD", "DWORD"][rng.below(2) as usize];
+            format!("{}\n    fstp {m} PTR [{bb}+{out}]\n    fnstsw ax", ld(rng, a))
+        }
+        5 => {
+            let op = ["fprem", "fprem1", "fscale"][rng.below(3) as usize];
+            format!("{}\n    {}\n    {op}\n    fnstsw ax\n    fstp TBYTE PTR [{bb}+{out}]\n    fstp st(0)", ld(rng, b), ld(rng, a))
+        }
+        6 => {
+            let op = ["fcompp", "fucompp"][rng.below(2) as usize];
+            format!("{}\n    {}\n    {op}\n    fnstsw ax", ld(rng, b), ld(rng, a))
+        }
+        7 => format!("{}\n    fxam\n    fnstsw ax\n    fstp st(0)", ld(rng, a)),
+        8 => {
+            let op = ["fld1", "fldl2t", "fldl2e", "fldpi", "fldlg2", "fldln2", "fldz"][rng.below(7) as usize];
+            format!("{op}\n    fstp TBYTE PTR [{bb}+{out}]")
+        }
+        _ => format!("fild QWORD PTR [{bb}+{a}]\n    fild DWORD PTR [{bb}+{b}]\n    fmulp st(1), st\n    fnstsw ax\n    fstp TBYTE PTR [{bb}+{out}]"),
+    };
+    let text = format!("{set_cw}\n    {body}\n    {restore}");
     Candidate { text, class: "x87", flag_mask: NONE }
 }
 
