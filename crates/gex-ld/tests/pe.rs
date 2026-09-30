@@ -315,13 +315,22 @@ fn a_taken_preferred_base_rebases() {
     assert!(va >= b.base && va < b.end());
 }
 
-/// `pack` rebases even images whose preferred base would do.
+/// Packing (the default) rebases even images whose preferred base would do.
 #[test]
 fn pack_keeps_everything_low() {
-    let layout = PeLayout { pack: true, ..Default::default() };
+    assert!(PeLayout::default().pack);
+    let p = pe::load_closure(&fixture("x86/uses.exe"), &pe::HostFiles, &PeOptions::default()).unwrap();
+    assert!(p.modules.iter().all(|m| m.end() <= 0x0100_0000), "{:?}", p.occupied());
+}
+
+/// Without packing, a relocatable image whose preferred base fits stays there.
+#[test]
+fn no_pack_honours_preferred_bases_that_fit() {
+    let layout = PeLayout { pack: false, ..Default::default() };
     let p = pe::load_closure(&fixture("x86/uses.exe"), &pe::HostFiles, &PeOptions { layout, ..Default::default() })
         .unwrap();
-    assert!(p.modules.iter().all(|m| m.end() <= 0x0100_0000), "{:?}", p.occupied());
+    let b = find(&p, "libb.dll");
+    assert!(!b.rebased && b.base == b.pe.preferred_base, "{:#x}", b.base);
 }
 
 fn import_descriptor(pe: &pe::PeImage, dll: &str) -> usize {

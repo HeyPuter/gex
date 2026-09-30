@@ -18,9 +18,11 @@ pub const USAGE: &str = "\
                                                      from disk after all
                                    --no-delay-dlls   do not load delay-
                                                      imported DLLs
-                                   --pack            rebase every relocatable
-                                                     image low, even when its
-                                                     preferred base fits
+                                   --no-pack         keep a relocatable image
+                                                     at its preferred base
+                                                     when it fits (the default
+                                                     packs everything low, as
+                                                     the NT layer does)
                                    --base NAME=ADDR  pin a module's base
                                    --brief           counts, not symbol lists
                                    (`gexc closure` on a PE image does this too)";
@@ -43,7 +45,7 @@ pub fn cmd_pe_info(args: &[String]) -> Result<()> {
                 opts.native_dlls.insert(pe::normalize_dll(&value("--native-dll")?));
             }
             "--no-delay-dlls" => opts.skip_delay_dlls = true,
-            "--pack" => opts.layout.pack = true,
+            "--no-pack" => opts.layout.pack = false,
             "--brief" => brief = true,
             "--base" => {
                 let v = value("--base")?;
@@ -319,7 +321,7 @@ mod tests {
     #[test]
     fn options_parse_and_errors_name_the_file() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        cmd_pe_info(&args(&[&fixture("x86/uses.exe"), "--brief", "--pack", "--base", "libb=0x2000000"])).unwrap();
+        cmd_pe_info(&args(&[&fixture("x86/uses.exe"), "--brief", "--no-pack", "--base", "libb=0x2000000"])).unwrap();
         let e = cmd_pe_info(&args(&[&fixture("x64/highbase-fixed.exe")])).unwrap_err();
         assert!(format!("{e:#}").contains("highbase-fixed.exe: PE placement"), "{e:#}");
         assert!(cmd_pe_info(&args(&["--bogus"])).is_err());
