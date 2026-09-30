@@ -272,6 +272,20 @@ impl FileSystem for HostFs {
         .map_err(|e| Errno::from_io(&e))
     }
 
+    fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let t = if secs >= 0 {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+        } else {
+            std::time::UNIX_EPOCH - std::time::Duration::from_secs(secs.unsigned_abs())
+        };
+        let f = std::fs::File::open(self.host_path(path)?).map_err(|e| Errno::from_io(&e))?;
+        f.set_times(std::fs::FileTimes::new().set_modified(t).set_accessed(t))
+            .map_err(|e| Errno::from_io(&e))
+    }
+
     fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
