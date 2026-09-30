@@ -61,7 +61,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
         bail!("the project is for {} guests and this gexc runs {} guests", project.isa, gex_abi::ARCH_NAME);
     }
     let manifest = BuildManifest::load(dir)?;
-    let modules: Vec<String> = manifest.replacements.iter().map(|r| r.module.clone()).collect();
+    let modules: Vec<String> = manifest.replacements.iter().filter(|r| !r.missing).map(|r| r.module.clone()).collect();
     if inputs_id(dir, &modules)? != manifest.inputs {
         bail!(
             "{} changed since it was built (gex-project.json, user/eject.json or a replacement \

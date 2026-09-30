@@ -34,3 +34,4 @@ pub mod plt;
 pub mod project;
 pub mod run;
 pub mod templates;
+pub mod web;

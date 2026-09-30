@@ -91,7 +91,11 @@ pub fn inputs_id(dir: &Path, modules: &[String]) -> Result<String> {
     };
     add(PROJECT_FILE, &std::fs::read(dir.join(PROJECT_FILE)).with_context(|| format!("reading {PROJECT_FILE}"))?);
     add(CONFIG_FILE, &std::fs::read(dir.join(CONFIG_FILE)).unwrap_or_default());
-    let mut modules = modules.to_vec();
+    // With each module's web build, when there is one.
+    let mut modules: Vec<String> = modules
+        .iter()
+        .flat_map(|m| [m.clone(), crate::web::web_module(dir, m)])
+        .collect();
     modules.sort();
     modules.dedup();
     for m in &modules {
@@ -231,6 +235,9 @@ impl BuildManifest {
 
 #[derive(Debug, Default)]
 pub struct BuildReport {
+    /// The web build: its modules' size, or why there is none. `None` when
+    /// the project has no browser runtime.
+    pub web: Option<std::result::Result<u64, String>>,
     pub images: Vec<BuiltImage>,
     pub replacements: Vec<BuiltReplacement>,
     pub illegal_blocks: usize,
@@ -594,6 +601,131 @@ fn copy_tree(from: &Path, to: &Path, count: &mut usize) -> Result<()> {
     Ok(())
 }
 
+/// Everything translation needs, for the native and the web module sets.
+struct Translation<'a> {
+    dir: &'a Path,
+    project: &'a Project,
+    placed: &'a [Placed],
+    profile: Option<&'a gex_xlate::profile::Profile>,
+    config: &'a Config,
+    intrinsics: &'a HashMap<u64, Intrinsic>,
+}
+
+impl Translation<'_> {
+    /// Translate every object into `out` (relative to the project): the
+    /// native set, or (`web`) the browser shim's. Returns the modules, the
+    /// libraries' pins and the count of blocks ending in SIGILL.
+    fn translate(&self, out: &str, web: bool) -> Result<(Vec<BuiltImage>, Vec<(String, u64)>, usize)> {
+        // The program's closure is numbered as one: its image owns the memory and
+        // tables, and every other object's slots continue where the last one's
+        // stopped. Other executables (programs the session exec'd) are images of
+        // their own.
+        let main = self.placed
+            .iter()
+            .position(|p| p.obj.path == self.project.program.exe && p.obj.role == "exe")
+            .ok_or_else(|| anyhow!("the project's program {} is not among its objects", self.project.program.exe))?;
+        let mut order: Vec<usize> = vec![main];
+        order.extend((0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role != "exe"));
+        let others: Vec<usize> = (0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role == "exe").collect();
+        let main_identity = gex_native::aot::image_identity(&self.placed[main].image);
+
+        let mut images = Vec::new();
+        let mut illegal = 0;
+        let mut pins = Vec::new();
+        let mut first_slot = 0u64;
+        for (n, &i) in order.iter().chain(others.iter()).enumerate() {
+            let p = &self.placed[i];
+            let o = &p.obj;
+            let in_closure = n < order.len();
+            // The browser runs a dynamic program's closure the way gex's own
+            // pages do (`gexc build --closure --shared-image`): every object
+            // is a demand-filled library module, including the executable, and
+            // the process starts from a seed module. An image module writing
+            // its slots at instantiation does not mix with the pages the shim
+            // numbers for itself.
+            let shared_image = web && order.len() > 1;
+            let own = !shared_image && (n == 0 || !in_closure);
+            let mut image = p.image.clone();
+            gex_xlate::set_compat(image.class32);
+            if !own {
+                // Apply its own RELATIVE relocations first, so the pointer scan
+                // follows them into the code they name (as `gexc build --closure`).
+                gex_ld::elf::apply_own_relative(&mut image);
+            }
+            let (tlo, thi) = image.text_range;
+            let seeds: Vec<u64> = self
+                .profile
+                .and_then(|pr| pr.objects.get(&o.id))
+                .map(|op| {
+                    op.blocks
+                        .keys()
+                        .map(|off| off.wrapping_add(image.bias))
+                        .filter(|a| *a >= tlo && *a < thi)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // `profile`: the reached blocks and their pages, and nothing followed
+            // off them onto fresh pages (the profile-guided closure build's
+            // rule). `static` adds discovery from the symbols and the data.
+            // A session recorded without a profile says nothing about what ran:
+            // then `profile` is `static`.
+            let profile_only = self.config.coverage == Coverage::Profile && self.profile.is_some();
+            let opts = Options {
+                exhaustive: self.config.coverage == Coverage::Exhaustive,
+                lazy: profile_only,
+                scan_pointers: !profile_only,
+                seeds_only: profile_only,
+                extra_entries: seeds,
+                complete_pages: self.config.coverage != Coverage::Exhaustive,
+                intrinsics: self.intrinsics
+                    .iter()
+                    .filter(|(a, _)| **a >= tlo && **a < thi)
+                    .map(|(a, k)| (*a, *k))
+                    .collect(),
+                // The browser's single-Worker shim takes a plain memory, and
+                // fills a library's pages on demand from passive segments.
+                shared_memory: !web,
+                demand_fill: web && !own,
+                linkage: if own { gex_xlate::Linkage::Own } else { gex_xlate::Linkage::Shared },
+                first_slot: if own || n == 0 { 0 } else { first_slot },
+                ..Options::default()
+            };
+            let (modules, stats) = gex_xlate::translate_image_split(&image, &opts, gex_xlate::MAX_FUNCS_PER_MODULE);
+            if in_closure {
+                first_slot = modules.last().map_or(first_slot, |m| m.metadata().next_slot);
+            }
+            let name = o.path.rsplit('/').next().unwrap_or("image");
+            let hex = o.id.trim_start_matches("sha256:");
+            let identity = if in_closure { main_identity.clone() } else { gex_native::aot::image_identity(&image) };
+            for (part, module) in modules.iter().enumerate() {
+                gex_native::validate_module(&module.wasm)
+                    .with_context(|| format!("the translation of {} is not valid wasm", o.path))?;
+                let rel = if modules.len() == 1 {
+                    format!("{out}/{name}-{}.wasm", &hex[..12.min(hex.len())])
+                } else {
+                    format!("{out}/{name}-{}.p{part}.wasm", &hex[..12.min(hex.len())])
+                };
+                std::fs::write(self.dir.join(&rel), &module.wasm).with_context(|| format!("writing {rel}"))?;
+                images.push(BuiltImage {
+                    kind: if own { "image" } else { "shared" }.to_string(),
+                    identity: identity.clone(),
+                    base: image.bias,
+                    module: rel,
+                    object: o.id.clone(),
+                    path: o.path.clone(),
+                    blocks: if part == 0 { stats.blocks as u64 } else { 0 },
+                    bytes: module.wasm.len() as u64,
+                });
+            }
+            illegal += stats.illegal_blocks;
+            if o.role == "library" {
+                pins.push((o.path.clone(), image.bias));
+            }
+        }
+        Ok((images, pins, illegal))
+    }
+}
+
 pub fn build(dir: &Path) -> Result<BuildReport> {
     let project = Project::load(dir)?;
     if project.isa != gex_abi::ARCH_NAME {
@@ -640,101 +772,11 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     // Then the user's replacements over them.
     intrinsics.extend(replaced);
 
-    // The program's closure is numbered as one: its image owns the memory and
-    // tables, and every other object's slots continue where the last one's
-    // stopped. Other executables (programs the session exec'd) are images of
-    // their own.
-    let main = placed
-        .iter()
-        .position(|p| p.obj.path == project.program.exe && p.obj.role == "exe")
-        .ok_or_else(|| anyhow!("the project's program {} is not among its objects", project.program.exe))?;
-    let mut order: Vec<usize> = vec![main];
-    order.extend((0..placed.len()).filter(|&i| i != main && placed[i].obj.role != "exe"));
-    let others: Vec<usize> = (0..placed.len()).filter(|&i| i != main && placed[i].obj.role == "exe").collect();
-    let main_identity = gex_native::aot::image_identity(&placed[main].image);
-
     let mut report = BuildReport::default();
-    let mut pins = Vec::new();
-    let mut first_slot = 0u64;
-    for (n, &i) in order.iter().chain(others.iter()).enumerate() {
-        let p = &placed[i];
-        let o = &p.obj;
-        let in_closure = n < order.len();
-        let own = n == 0 || !in_closure;
-        let mut image = p.image.clone();
-        gex_xlate::set_compat(image.class32);
-        if !own {
-            // Apply its own RELATIVE relocations first, so the pointer scan
-            // follows them into the code they name (as `gexc build --closure`).
-            gex_ld::elf::apply_own_relative(&mut image);
-        }
-        let (tlo, thi) = image.text_range;
-        let seeds: Vec<u64> = profile
-            .as_ref()
-            .and_then(|pr| pr.objects.get(&o.id))
-            .map(|op| {
-                op.blocks
-                    .keys()
-                    .map(|off| off.wrapping_add(image.bias))
-                    .filter(|a| *a >= tlo && *a < thi)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // `profile`: the reached blocks and their pages, and nothing followed
-        // off them onto fresh pages (the profile-guided closure build's
-        // rule). `static` adds discovery from the symbols and the data.
-        // A session recorded without a profile says nothing about what ran:
-        // then `profile` is `static`.
-        let profile_only = config.coverage == Coverage::Profile && profile.is_some();
-        let opts = Options {
-            exhaustive: config.coverage == Coverage::Exhaustive,
-            lazy: profile_only,
-            scan_pointers: !profile_only,
-            seeds_only: profile_only,
-            extra_entries: seeds,
-            complete_pages: config.coverage != Coverage::Exhaustive,
-            intrinsics: intrinsics
-                .iter()
-                .filter(|(a, _)| **a >= tlo && **a < thi)
-                .map(|(a, k)| (*a, *k))
-                .collect(),
-            shared_memory: true,
-            linkage: if own { gex_xlate::Linkage::Own } else { gex_xlate::Linkage::Shared },
-            first_slot: if own { 0 } else { first_slot },
-            ..Options::default()
-        };
-        let (modules, stats) = gex_xlate::translate_image_split(&image, &opts, gex_xlate::MAX_FUNCS_PER_MODULE);
-        if in_closure {
-            first_slot = modules.last().map_or(first_slot, |m| m.metadata().next_slot);
-        }
-        let name = o.path.rsplit('/').next().unwrap_or("image");
-        let hex = o.id.trim_start_matches("sha256:");
-        let identity = if in_closure { main_identity.clone() } else { gex_native::aot::image_identity(&image) };
-        for (part, module) in modules.iter().enumerate() {
-            gex_native::validate_module(&module.wasm)
-                .with_context(|| format!("the translation of {} is not valid wasm", o.path))?;
-            let rel = if modules.len() == 1 {
-                format!("build/modules/{name}-{}.wasm", &hex[..12.min(hex.len())])
-            } else {
-                format!("build/modules/{name}-{}.p{part}.wasm", &hex[..12.min(hex.len())])
-            };
-            std::fs::write(dir.join(&rel), &module.wasm).with_context(|| format!("writing {rel}"))?;
-            report.images.push(BuiltImage {
-                kind: if own { "image" } else { "shared" }.to_string(),
-                identity: identity.clone(),
-                base: image.bias,
-                module: rel,
-                object: o.id.clone(),
-                path: o.path.clone(),
-                blocks: if part == 0 { stats.blocks as u64 } else { 0 },
-                bytes: module.wasm.len() as u64,
-            });
-        }
-        report.illegal_blocks += stats.illegal_blocks;
-        if o.role == "library" {
-            pins.push((o.path.clone(), image.bias));
-        }
-    }
+    let t = Translation { dir, project: &project, placed: &placed, profile: profile.as_ref(), config: &config, intrinsics: &intrinsics };
+    let (images, pins, illegal) = t.translate("build/modules", false)?;
+    report.images = images;
+    report.illegal_blocks = illegal;
 
     // The guest's filesystem: what the session read, then the user's files.
     let mut n = 0;
@@ -744,6 +786,36 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         copy_tree(&user_files, &out.join("rootfs"), &mut n)?;
     }
     report.rootfs_files = n;
+
+    // The web build, when the project has the browser runtime.
+    report.web = if dir.join(crate::web::SHIM).exists() {
+        let web_dir = dir.join("build/web");
+        if web_dir.exists() {
+            std::fs::remove_dir_all(&web_dir).with_context(|| format!("removing {}", web_dir.display()))?;
+        }
+        std::fs::create_dir_all(&web_dir)?;
+        match crate::web::unsupported(&project) {
+            Some(why) => {
+                crate::web::unsupported_manifest(dir, &why)?;
+                Some(Err(why))
+            }
+            None => {
+                for r in replacements.iter().filter(|r| !r.missing) {
+                    crate::web::check_module(dir, &r.module, &r.export, r.abi)?;
+                }
+                let (images, _, _) = t.translate("build/web", true)?;
+                let spans: Vec<(String, u64, u64)> = placed
+                    .iter()
+                    .filter(|p| p.obj.role == "library")
+                    .map(|p| (p.obj.path.clone(), p.image.bias, p.image.brk - p.image.bias))
+                    .collect();
+                crate::web::manifest(dir, &project, &images, &spans, &replacements)?;
+                Some(Ok(images.iter().map(|i| i.bytes).sum()))
+            }
+        }
+    } else {
+        None
+    };
 
     let modules: Vec<String> = replacements.iter().filter(|r| !r.missing).map(|r| r.module.clone()).collect();
     let manifest = BuildManifest {

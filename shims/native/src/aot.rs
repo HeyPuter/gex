@@ -19,13 +19,14 @@
 //! A replacement is ordinary wasm32 code (clang, or any producer) that
 //! imports the guest's memory as `env.memory`. Because a guest address *is* a
 //! linear-memory offset, a guest pointer is a C pointer to it: no translation.
-//! Its own data and stacks need somewhere the guest will never map, and
-//! `[STACK_TOP, MMAP_BOTTOM)` is that: `gex_kernel::mem::hits_runtime` keeps
-//! guest mappings out of it (the browser shim keeps its own stack and data
-//! there; natively it is otherwise unused). The first [`REPL_DATA_BYTES`] hold
-//! the module's data and heap (link it with `--global-base=` [`REPL_BASE`]);
-//! the rest is one [`REPL_STACK_BYTES`] stack per guest thread, by context
-//! slot. The region is recorded as a mapping so `fork` copies it.
+//! Its own data and stacks need somewhere nothing else uses, natively *and* in
+//! the browser (where the shim keeps its stack and data in
+//! `[STACK_TOP, MMAP_BOTTOM)`). Above [`gex_abi::MMAP_TOP`] is that: the guest
+//! is never given an address there and the browser's arena never claims one.
+//! The first [`REPL_DATA_BYTES`] of [`REPL_BASE`] hold the module's data and
+//! heap (link it with `--global-base=` [`REPL_BASE`]); after them come
+//! [`REPL_THREADS`] stacks of [`REPL_STACK_BYTES`], one per guest thread by
+//! context slot. The region is recorded as a mapping so `fork` copies it.
 
 use super::{read_u64, write_u64, HostState};
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,13 +39,16 @@ use wasmtime::{Caller, Engine, ExternType, Func, Linker, Module, Mutability, Val
 
 /// Where replacement modules' data begins: link them with this as
 /// `--global-base`.
-pub const REPL_BASE: u64 = gex_abi::STACK_TOP;
+pub const REPL_BASE: u64 = 0xF000_0000;
 /// Bytes for a replacement module's data and heap.
 pub const REPL_DATA_BYTES: u64 = 8 << 20;
-/// End of the whole replacement region.
-pub const REPL_END: u64 = gex_abi::MMAP_BOTTOM;
 /// One guest thread's stack for replacement code.
 pub const REPL_STACK_BYTES: u64 = 128 << 10;
+/// How many guest threads can run replacement code.
+pub const REPL_THREADS: u64 = 64;
+/// End of the whole replacement region.
+pub const REPL_END: u64 = REPL_BASE + REPL_DATA_BYTES + REPL_THREADS * REPL_STACK_BYTES;
+const _: () = assert!(REPL_BASE >= gex_abi::MMAP_TOP && REPL_END <= gex_abi::GUEST_MEM_BYTES);
 
 /// How a replacement takes its arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -346,16 +350,26 @@ pub struct ReplacementModule {
 
 impl ReplacementModule {
     pub fn inspect(wasm: &[u8]) -> Result<ReplacementModule> {
+        Self::inspect_for(wasm, true)
+    }
+
+    /// As [`Self::inspect`], for a host whose guest memory is `shared` or
+    /// not: the browser's single-Worker shim has a plain one, and a module
+    /// importing a shared memory will not link to it (nor the reverse).
+    pub fn inspect_for(wasm: &[u8], shared: bool) -> Result<ReplacementModule> {
     let engine = Engine::new(&engine_config()).context("creating a wasm engine")?;
     let module = Module::new(&engine, wasm).context("not a valid wasm module for this runtime")?;
     let mut imports_memory = false;
     for imp in module.imports() {
         match (imp.module(), imp.name(), imp.ty()) {
             ("env", "memory", ExternType::Memory(m)) => {
-                if !m.is_shared() {
+                if m.is_shared() != shared {
                     bail!(
-                        "it imports env.memory unshared; gex's guest memory is shared \
-                         (link with --shared-memory and compile with -matomics -mbulk-memory)"
+                        "it imports env.memory {}, and this host's guest memory is {} (the \
+                         native runtime's is shared: link with --shared-memory; the browser's \
+                         single-Worker shim's is not: link without it)",
+                        if m.is_shared() { "shared" } else { "unshared" },
+                        if shared { "shared" } else { "not" }
                     );
                 }
                 if m.maximum().unwrap_or(0) < gex_abi::GUEST_MEM_PAGES {
@@ -479,14 +493,10 @@ pub(crate) struct StoreRepl {
 fn stack_top(ctx_addr: u64) -> Result<u64> {
     let stride = (ctx::SIZE as u64 + 63) & !63;
     let slot = ctx_addr.saturating_sub(gex_abi::RESERVED_BASE) / stride;
-    let top = REPL_END - slot * REPL_STACK_BYTES;
-    if top < REPL_BASE + REPL_DATA_BYTES + REPL_STACK_BYTES {
-        bail!(
-            "guest thread slot {slot} has no replacement stack: the region holds {} threads",
-            (REPL_END - REPL_BASE - REPL_DATA_BYTES) / REPL_STACK_BYTES
-        );
+    if slot >= REPL_THREADS {
+        bail!("guest thread slot {slot} has no replacement stack: the region holds {REPL_THREADS} threads");
     }
-    Ok(top)
+    Ok(REPL_BASE + REPL_DATA_BYTES + (slot + 1) * REPL_STACK_BYTES)
 }
 
 /// Instantiate the project's replacement modules in this store.

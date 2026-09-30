@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use gex_native::Exit;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build]
+pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--web-shim gex_browser.wasm]
                                    write a standalone project from a session
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
@@ -89,6 +89,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let mut record = None;
             let mut out = None;
             let mut then_build = false;
+            let mut web_shim = None;
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -97,6 +98,10 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                         out = Some(PathBuf::from(args.get(i).context("--out needs a directory")?));
                     }
                     "--build" => then_build = true,
+                    "--web-shim" => {
+                        i += 1;
+                        web_shim = Some(PathBuf::from(args.get(i).context("--web-shim needs gex_browser.wasm")?));
+                    }
                     o if o.starts_with('-') => bail!("gexc eject: unknown option {o}"),
                     r => {
                         if record.replace(PathBuf::from(r)).is_some() {
@@ -115,6 +120,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 &gex_eject::eject::EjectOptions {
                     runtime,
                     runtime_build: gex_cache::build_fingerprint(),
+                    web_shim,
                 },
             )?;
             eprintln!(
@@ -127,6 +133,9 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 s.outputs,
                 if s.kept_user { "; user/ kept" } else { "" }
             );
+            if !s.web {
+                eprintln!("  no web build: give --web-shim <gex_browser.wasm> for run.mjs and index.html");
+            }
             eprintln!(
                 "  the project holds the program's own code and the files it read; \
                  distributing it is subject to their licences"
@@ -169,6 +178,11 @@ fn build(dir: &std::path::Path) -> Result<()> {
             "  {} blocks end in an instruction gex cannot execute yet; reaching one raises SIGILL",
             r.illegal_blocks
         );
+    }
+    match &r.web {
+        Some(Ok(bytes)) => eprintln!("  web build: {} KiB in build/web (node run.mjs, or serve index.html)", bytes / 1024),
+        Some(Err(why)) => eprintln!("  no web build: {why}"),
+        None => {}
     }
     eprintln!("{}: built ({} files in build/rootfs)", dir.display(), r.rootfs_files);
     Ok(())

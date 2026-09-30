@@ -1,0 +1,407 @@
+//! The web build of a project: the browser shim (gex's runtime compiled to
+//! wasm) running the same program, in Node (`run.mjs`) or a page
+//! (`index.html`).
+//!
+//! An eject given `--web-shim` copies the shim into `runtime/web/`, beside the
+//! `gex.mjs` its gexc was built with. `build.sh` then also translates the
+//! program for it into `build/web/` and writes `build/web/manifest.json`,
+//! which says everything the launcher (`runtime/web/eject.mjs`) needs: the
+//! modules, the files, the arguments, the replacements and the guest ABI they
+//! are called with.
+//!
+//! v1 runs a single process with a single thread (gex's single-Worker path,
+//! with a plain memory): a session that forked or started threads gets a
+//! manifest that says so, and the launcher refuses it.
+
+use crate::build::{BuiltImage, BuiltReplacement};
+use crate::json::{self, obj, Json};
+use crate::project::{rootfs_rel, Project};
+use anyhow::{anyhow, Context, Result};
+use gex_abi::ctx;
+use gex_native::aot::{Abi, REPL_BASE, REPL_DATA_BYTES, REPL_END, REPL_STACK_BYTES};
+use std::path::Path;
+
+pub const SHIM: &str = "runtime/web/gex_browser.wasm";
+pub const MANIFEST: &str = "build/web/manifest.json";
+
+/// The browser runtime's JavaScript, as built into this gexc.
+pub const GEX_MJS: &str = include_str!("../../../shims/browser/js/gex.mjs");
+
+/// Why this project cannot have a web build, if it cannot.
+pub fn unsupported(project: &Project) -> Option<String> {
+    if project.processes > 1 {
+        Some(format!(
+            "the recorded session ran {} processes; the web build runs one (gex's single-Worker path)",
+            project.processes
+        ))
+    } else if project.threads > 1 {
+        Some(format!(
+            "the recorded session ran {} threads; the web build runs one (gex's single-Worker path, \
+             with a plain memory)",
+            project.threads
+        ))
+    } else {
+        None
+    }
+}
+
+/// The replacement module the web build uses for a native one: its
+/// `.web.wasm` sibling (linked for a plain memory, which `build.sh` makes),
+/// else the same file.
+pub fn web_module(dir: &Path, module: &str) -> String {
+    let web = module.strip_suffix(".wasm").map(|m| format!("{m}.web.wasm"));
+    match web {
+        Some(w) if dir.join(&w).exists() => w,
+        _ => module.to_string(),
+    }
+}
+
+fn files(dir: &Path) -> Result<(Vec<(String, String)>, Vec<(String, u64)>, Vec<String>)> {
+    let root = dir.join("build/rootfs");
+    let (mut files, mut modes, mut dirs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&d)
+            .with_context(|| format!("reading {}", d.display()))?
+            .collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        if entries.is_empty() && d != root {
+            dirs.push(format!("/{}", d.strip_prefix(&root)?.display()));
+        }
+        for e in entries {
+            let p = e.path();
+            let meta = std::fs::metadata(&p).with_context(|| format!("reading {}", p.display()))?;
+            if meta.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let guest = format!("/{}", p.strip_prefix(&root)?.display());
+            let rel = p.strip_prefix(dir)?.display().to_string();
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 != 0 {
+                modes.push((guest.clone(), 0o755));
+            }
+            files.push((guest, rel));
+        }
+    }
+    files.sort();
+    dirs.sort();
+    Ok((files, modes, dirs))
+}
+
+/// Write `build/web/manifest.json`, for a build whose web modules are
+/// `images` and whose replacements are `repl`.
+pub fn manifest(
+    dir: &Path,
+    project: &Project,
+    images: &[BuiltImage],
+    pins: &[(String, u64, u64)],
+    repl: &[BuiltReplacement],
+) -> Result<()> {
+    // A static program's image module owns the memory and tables. A dynamic
+    // one's objects are all library modules (see `Translation::translate`),
+    // started from a seed module that translates nothing.
+    let own = images.iter().find(|i| i.kind == "image" && i.path == project.program.exe);
+    let (module, closure, image_module): (String, Vec<&String>, Json) = match own {
+        Some(i) => (
+            i.module.clone(),
+            images.iter().filter(|x| x.kind == "shared" && x.identity == i.identity).map(|x| &x.module).collect(),
+            Json::Null,
+        ),
+        None => {
+            let seed = "build/web/seed.wasm";
+            std::fs::write(dir.join(seed), gex_xlate::seed_module(false).wasm)
+                .with_context(|| format!("writing {seed}"))?;
+            let img = images
+                .iter()
+                .find(|x| x.path == project.program.exe)
+                .ok_or_else(|| anyhow!("internal: no web module for {}", project.program.exe))?;
+            (
+                seed.to_string(),
+                images.iter().filter(|x| x.kind == "shared").map(|x| &x.module).collect(),
+                json::s(&img.module),
+            )
+        }
+    };
+    let (files, modes, dirs) = files(dir)?;
+    let int_args: &[u8] = if gex_abi::X86 { &[7, 6, 2, 1, 8, 9] } else { &[0, 1, 2, 3, 4, 5, 6, 7] };
+    let exe_file = format!("build/{}", rootfs_rel(&project.program.exe)?.display());
+    let m = obj(vec![
+        ("format", json::s("gex-eject-web")),
+        ("version", json::n(1)),
+        ("arch", json::s(gex_abi::ARCH_NAME)),
+        ("shim", json::s(SHIM)),
+        ("module", json::s(&module)),
+        ("closure", json::strs(closure)),
+        ("image_module", image_module),
+        ("exe", json::s(&project.program.exe)),
+        ("exe_file", json::s(exe_file)),
+        ("argv", json::strs(&project.program.argv)),
+        ("env", json::strs(&project.program.env)),
+        ("cwd", json::opt(project.program.cwd.as_ref())),
+        ("dirs", json::strs(&dirs)),
+        ("files", Json::Obj(files.into_iter().map(|(g, r)| (g, json::s(r))).collect())),
+        ("modes", Json::Obj(modes.into_iter().map(|(g, m)| (g, json::n(m))).collect())),
+        (
+            "pins",
+            Json::Obj(
+                pins.iter()
+                    .map(|(p, base, span)| (p.clone(), obj(vec![("base", json::n(*base)), ("span", json::n(*span))])))
+                    .collect(),
+            ),
+        ),
+        (
+            "replacements",
+            Json::Arr(
+                repl.iter()
+                    .map(|r| {
+                        obj(vec![
+                            ("id", json::n(u64::from(r.id))),
+                            ("module", json::s(web_module(dir, &r.module))),
+                            ("export", json::s(&r.export)),
+                            ("abi", json::s(r.abi.name())),
+                            ("sig", json::s(&r.sig)),
+                            ("symbol", json::s(&r.symbol)),
+                            ("missing", json::b(r.missing)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "guest_abi",
+            obj(vec![
+                ("int_args", Json::Arr(int_args.iter().map(|r| json::n(ctx::x(*r) as u64)).collect())),
+                ("fp_args", Json::Arr((0..8u8).map(|v| json::n(ctx::v(v) as u64)).collect())),
+                ("ret", json::n(ctx::x(0) as u64)),
+                ("fret", json::n(ctx::v(0) as u64)),
+            ]),
+        ),
+        (
+            "region",
+            obj(vec![
+                ("end", json::n(REPL_END)),
+                // The single Worker is thread slot 0.
+                ("stack_top", json::n(REPL_BASE + REPL_DATA_BYTES + REPL_STACK_BYTES)),
+            ]),
+        ),
+    ]);
+    std::fs::write(dir.join(MANIFEST), json::write(&m)).with_context(|| format!("writing {MANIFEST}"))
+}
+
+/// The manifest of a project that has no web build, saying why.
+pub fn unsupported_manifest(dir: &Path, why: &str) -> Result<()> {
+    std::fs::create_dir_all(dir.join("build/web"))?;
+    let m = obj(vec![("format", json::s("gex-eject-web")), ("version", json::n(1)), ("unsupported", json::s(why))]);
+    std::fs::write(dir.join(MANIFEST), json::write(&m)).with_context(|| format!("writing {MANIFEST}"))
+}
+
+/// Check a replacement's web module links to the browser's plain memory.
+pub fn check_module(dir: &Path, module: &str, export: &str, abi: Abi) -> Result<()> {
+    let w = web_module(dir, module);
+    let bytes = std::fs::read(dir.join(&w)).with_context(|| format!("reading {w}"))?;
+    gex_native::aot::ReplacementModule::inspect_for(&bytes, false)
+        .and_then(|m| m.check(export, abi))
+        .with_context(|| format!("{w}, for the web build"))?;
+    Ok(())
+}
+
+/// `runtime/web/eject.mjs`: the launcher, shared by Node and the page.
+pub const EJECT_MJS: &str = r#"// Generated by `gexc eject`: run an ejected project on gex's browser runtime.
+// Shared by run.mjs (Node) and index.html (a page); `read(path)` fetches a
+// project file as bytes either way. See docs/eject.md in gex.
+import { Gex, Env, metadataSection } from './gex.mjs';
+
+export async function launch(m, read, { args = null, write, jitFallback = false, strace = false } = {}) {
+  if (m.unsupported) throw new Error(`gex-eject: this project has no web build: ${m.unsupported}`);
+  if (m.arch === 'x86_64') globalThis.GEX_ARCH = 'x86';
+  class Out extends Env {
+    // A copy: `bytes` may view the guest's memory, which moves on before an
+    // asynchronous writer (Node's stdout on a pipe) has sent it.
+    write(fd, bytes) { write(fd, bytes.slice()); }
+  }
+  const gex = new Gex(new Out());
+  const files = {};
+  for (const [guest, rel] of Object.entries(m.files)) files[guest] = await read(rel);
+  // Each library as the page sends one: its metadata, the compiled module,
+  // and for the program's own module the program it is the image of.
+  const closure = [];
+  for (const rel of m.closure) {
+    const bytes = await read(rel);
+    closure.push({
+      meta: metadataSection(bytes),
+      mod: await WebAssembly.compile(bytes),
+      program: rel === m.image_module ? m.exe : undefined,
+    });
+  }
+  const pins = {};
+  for (const [p, { base, span }] of Object.entries(m.pins)) pins[p] = { base, span };
+  const argv = args ? [m.argv[0] ?? m.exe, ...args] : m.argv;
+  const replace = m.replacements.length ? await replacer(m, read) : undefined;
+  const entry = await gex.load(await read(m.shim), await read(m.module), await read(m.exe_file), files, argv, {
+    cwd: m.cwd, env: m.env, dirs: m.dirs, modes: m.modes, pins, closure, program: m.exe, exe: m.exe,
+    jit: jitFallback ? undefined : false, replace, strace,
+  });
+  return await gex.run(entry);
+}
+
+// Library replacements: the user's wasm, in the guest's memory, called with
+// the guest's argument registers (see gen/gex_replace.h).
+async function replacer(m, read) {
+  const compiled = {};
+  for (const r of m.replacements) {
+    if (!r.missing && !compiled[r.module]) compiled[r.module] = await WebAssembly.compile(await read(r.module));
+  }
+  let funcs = null;
+  const sigOf = (s) => {
+    const [, p, q] = s.match(/^\((.*)\) -> \((.*)\)$/);
+    return { params: p ? p.split(', ') : [], results: q ? q.split(', ') : [] };
+  };
+  const sigs = m.replacements.map((r) => (r.abi === 'c' && !r.missing ? sigOf(r.sig) : null));
+  return (ctx, pc, id, memory) => {
+    const r = m.replacements[id];
+    if (!r) throw new Error(`gex-eject: replacement #${id} at ${pc} is not in this build`);
+    if (r.missing) {
+      throw new Error(`gex-eject: ${r.symbol} belongs to a replaced library, and ${r.module} has no \`${r.export}\`: add it and rebuild`);
+    }
+    if (!funcs) {
+      // The region is above everything the guest and the shim's arena use;
+      // grown into only now, after the shim's arena has placed itself.
+      const need = m.region.end - memory.buffer.byteLength;
+      if (need > 0) memory.grow(Math.ceil(need / 65536));
+      const inst = {};
+      for (const [path, mod] of Object.entries(compiled)) {
+        const i = new WebAssembly.Instance(mod, { env: { memory } });
+        if (i.exports.__stack_pointer) i.exports.__stack_pointer.value = m.region.stack_top | 0;
+        inst[path] = i;
+      }
+      funcs = m.replacements.map((x) => (x.missing ? null : inst[x.module].exports[x.export]));
+    }
+    const f = funcs[id];
+    if (r.abi === 'ctx') {
+      f(ctx);
+      return;
+    }
+    const dv = new DataView(memory.buffer);
+    const a = m.guest_abi;
+    let ni = 0, nf = 0;
+    const args = sigs[id].params.map((t) => {
+      if (t === 'i32' || t === 'i64') {
+        const v = dv.getBigUint64(ctx + a.int_args[ni++], true);
+        return t === 'i32' ? Number(BigInt.asIntN(32, v)) : BigInt.asIntN(64, v);
+      }
+      const off = ctx + a.fp_args[nf++];
+      return t === 'f32' ? dv.getFloat32(off, true) : dv.getFloat64(off, true);
+    });
+    const res = f(...args);
+    const out = new DataView(memory.buffer);
+    switch (sigs[id].results[0]) {
+      case 'i32': out.setBigUint64(ctx + a.ret, BigInt(res >>> 0), true); break;
+      case 'i64': out.setBigUint64(ctx + a.ret, BigInt.asUintN(64, BigInt(res)), true); break;
+      case 'f32': out.setBigUint64(ctx + a.fret + 8, 0n, true); out.setBigUint64(ctx + a.fret, 0n, true); out.setFloat32(ctx + a.fret, res, true); break;
+      case 'f64': out.setBigUint64(ctx + a.fret + 8, 0n, true); out.setFloat64(ctx + a.fret, res, true); break;
+      default: break;
+    }
+  };
+}
+"#;
+
+/// `run.mjs`: the Node launcher.
+pub const RUN_MJS: &str = r#"#!/usr/bin/env node
+// Run this ejected project on gex's browser runtime, under Node. Generated by
+// `gexc eject`.
+//
+//   node run.mjs [--jit-fallback] [--strace] [--] [ARGS...]
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const opts = { write: (fd, b) => (fd === 2 ? process.stderr : process.stdout).write(b) };
+let av = process.argv.slice(2);
+while (av.length && av[0].startsWith('--')) {
+  const f = av.shift();
+  if (f === '--') break;
+  else if (f === '--jit-fallback') opts.jitFallback = true;
+  else if (f === '--strace') opts.strace = true;
+  else { console.error(`run.mjs: unknown option ${f}`); process.exit(2); }
+}
+if (av.length || process.argv.includes('--')) opts.args = av;
+let m;
+try {
+  m = JSON.parse(readFileSync(join(here, 'build/web/manifest.json'), 'utf8'));
+} catch (e) {
+  console.error(`run.mjs: no web build (${e.message}); run ./build.sh`);
+  process.exit(1);
+}
+const { launch } = await import(pathToFileURL(join(here, 'runtime/web/eject.mjs')));
+const read = async (p) => new Uint8Array(readFileSync(join(here, p)));
+try {
+  process.exitCode = await launch(m, read, opts);
+} catch (e) {
+  console.error(`run.mjs: ${e.message}`);
+  process.exitCode = 1;
+}
+"#;
+
+/// `serve.mjs`: a static server for the page. gex's runtime needs
+/// `SharedArrayBuffer`, so the page must be cross-origin isolated (the two
+/// headers below); a plain static server is not enough.
+pub const SERVE_MJS: &str = r#"#!/usr/bin/env node
+// Serve this ejected project's page (index.html) with the headers gex's
+// runtime needs (cross-origin isolation, for SharedArrayBuffer). Generated by
+// `gexc eject`.   node serve.mjs [port]      then open http://localhost:PORT/
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { dirname, extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const port = Number(process.argv[2] ?? 8000);
+const types = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript',
+  '.json': 'application/json', '.wasm': 'application/wasm' };
+createServer(async (req, res) => {
+  const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname));
+  if (path.includes('..')) { res.writeHead(403).end(); return; }
+  try {
+    const body = await readFile(join(here, path === '/' ? 'index.html' : path));
+    res.writeHead(200, {
+      'Content-Type': types[extname(path)] ?? 'application/octet-stream',
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    });
+    res.end(body);
+  } catch {
+    res.writeHead(404).end();
+  }
+}).listen(port, () => console.log(`http://localhost:${port}/`));
+"#;
+
+/// `index.html`: the page. Serve it with `serve.mjs`; arguments come from
+/// `?args=a,b`, and `?jit` turns on the JIT fallback.
+pub const INDEX_HTML: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>gex-eject</title>
+<style>body { font: 14px monospace; margin: 1em; } pre { white-space: pre-wrap; }</style>
+<pre id="out"></pre>
+<script type="module">
+  import { launch } from './runtime/web/eject.mjs';
+  const out = document.getElementById('out');
+  const dec = [new TextDecoder(), new TextDecoder(), new TextDecoder()];
+  const write = (fd, b) => out.append(dec[fd === 2 ? 2 : 1].decode(b, { stream: true }));
+  const read = async (p) => {
+    const r = await fetch(p);
+    if (!r.ok) throw new Error(`fetching ${p}: ${r.status}`);
+    return new Uint8Array(await r.arrayBuffer());
+  };
+  const q = new URLSearchParams(location.search);
+  try {
+    const m = await (await fetch('build/web/manifest.json')).json();
+    const args = q.has('args') ? q.get('args').split(',').filter((a) => a) : null;
+    const status = await launch(m, read, { args, write, jitFallback: q.has('jit') });
+    out.append(`\n[exit ${status}]\n`);
+  } catch (e) {
+    out.append(`\n${e.message}\n`);
+  }
+</script>
+"#;
