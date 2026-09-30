@@ -1135,6 +1135,15 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             }
             // The narrowing forms name the wider source arrangement.
             if matches!(op, VOp2::Xtn | VOp2::SqXtn | VOp2::UqXtn | VOp2::SqXtun) {
+                if arr.scalar {
+                    return format!(
+                        "{m} {}{}, {}{}",
+                        lane_letter(arr.lane_bytes),
+                        vd.0,
+                        lane_letter(arr.lane_bytes * 2),
+                        vn.0
+                    );
+                }
                 let wide = VArr {
                     lane_bytes: arr.lane_bytes * 2,
                     q: true,

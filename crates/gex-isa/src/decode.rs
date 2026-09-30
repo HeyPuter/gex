@@ -1347,6 +1347,19 @@ fn decode_simd_fp(raw: u32) -> Inst {
     {
         let cmode = bits(raw, 15, 12);
         let imm8 = (bits(raw, 18, 16) << 5) | bits(raw, 9, 5);
+        // `o2` (bit 11) set is only the half-precision `fmov` (FEAT_FP16,
+        // which gex does not implement); every other encoding with it is
+        // unallocated. So is the 64-bit `fmov` without Q: there is no `.1d`.
+        if bit(raw, 11) == 1 {
+            return if cmode == 0b1111 && u == 0 {
+                Inst::Unknown { raw }
+            } else {
+                Inst::Undefined { raw }
+            };
+        }
+        if cmode == 0b1111 && u == 1 && !q {
+            return Inst::Undefined { raw };
+        }
         // An odd `cmode` below 1100 is `orr`/`bic` with the immediate, not a
         // move: it reads the destination. Checked before the move expansion,
         // which rejects these.
@@ -1450,6 +1463,10 @@ fn decode_simd_fp(raw: u32) -> Inst {
         }
         // Permute: 0 Q 001110 size 0 Rm 0 opcode 10 Rn Rd
         if bit(raw, 21) == 0 && bit(raw, 15) == 0 && bits(raw, 11, 10) == 0b10 {
+            // The permutes all have U clear; U set is unallocated.
+            if u == 1 {
+                return Inst::Undefined { raw };
+            }
             let op = match bits(raw, 14, 12) {
                 0b001 => VPermOp::Uzp1,
                 0b010 => VPermOp::Trn1,
@@ -1462,6 +1479,10 @@ fn decode_simd_fp(raw: u32) -> Inst {
             let Some(lane_bytes) = lane_from_size(bits(raw, 23, 22)) else {
                 return Inst::Undefined { raw };
             };
+            // No `.1d` arrangement.
+            if lane_bytes == 8 && !q {
+                return Inst::Undefined { raw };
+            }
             return Inst::VPermute {
                 op,
                 arr: VArr {
@@ -1505,6 +1526,8 @@ fn decode_simd_fp(raw: u32) -> Inst {
 /// so they reuse the vector decoders with a scalar arrangement. `None` falls
 /// through to the floating-point decoder.
 fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
+    // Only some of the vector operations have a scalar form; the rest of the
+    // scalar encoding space is unallocated.
     let scalarise = |mut inst: Inst| -> Inst {
         match &mut inst {
             Inst::VThreeSame { arr, .. }
@@ -1512,7 +1535,11 @@ fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
             | Inst::VShiftImm { arr, .. } => arr.scalar = true,
             _ => {}
         }
-        inst
+        if scalar_form_exists(&inst) {
+            inst
+        } else {
+            Inst::Undefined { raw }
+        }
     };
 
     // Shift by immediate: 01 U 111110 immh immb opcode 1 Rn Rd
@@ -1586,6 +1613,76 @@ fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
     None
 }
 
+/// Whether a scalarised vector instruction is one the Advanced SIMD scalar
+/// groups define (Arm ARM C4.1.95: scalar three same, two-register misc and
+/// shift by immediate). Most integer members exist only on doublewords.
+fn scalar_form_exists(inst: &Inst) -> bool {
+    match *inst {
+        Inst::VThreeSame { op, arr, .. } => match op {
+            VOp3::SqAdd | VOp3::UqAdd | VOp3::SqSub | VOp3::UqSub => true,
+            VOp3::CmGt
+            | VOp3::CmGe
+            | VOp3::CmHi
+            | VOp3::CmHs
+            | VOp3::SShl
+            | VOp3::UShl
+            | VOp3::Add
+            | VOp3::Sub
+            | VOp3::CmTst
+            | VOp3::CmEq => arr.lane_bytes == 8,
+            VOp3::FMulx
+            | VOp3::FCmEq
+            | VOp3::FCmGe
+            | VOp3::FCmGt
+            | VOp3::FRecps
+            | VOp3::FRSqrts
+            | VOp3::FAbd => true,
+            _ => false,
+        },
+        Inst::VTwoMisc { op, arr, .. } => match op {
+            VOp2::CmEqZero
+            | VOp2::CmGtZero
+            | VOp2::CmGeZero
+            | VOp2::CmLtZero
+            | VOp2::CmLeZero
+            | VOp2::Abs
+            | VOp2::Neg => arr.lane_bytes == 8,
+            VOp2::SqXtn | VOp2::UqXtn | VOp2::SqXtun => true,
+            VOp2::FCmEqZero
+            | VOp2::FCmGtZero
+            | VOp2::FCmGeZero
+            | VOp2::FCmLtZero
+            | VOp2::FCmLeZero
+            | VOp2::FcvtNs
+            | VOp2::FcvtNu
+            | VOp2::FcvtPs
+            | VOp2::FcvtPu
+            | VOp2::FcvtMs
+            | VOp2::FcvtMu
+            | VOp2::FcvtZs
+            | VOp2::FcvtZu
+            | VOp2::FcvtAs
+            | VOp2::FcvtAu
+            | VOp2::Scvtf
+            | VOp2::Ucvtf
+            | VOp2::FRecpe
+            | VOp2::FRSqrtE => true,
+            _ => false,
+        },
+        Inst::VShiftImm { op, arr, .. } => match op {
+            VShiftImmOp::Scvtf
+            | VShiftImmOp::Ucvtf
+            | VShiftImmOp::Fcvtzs
+            | VShiftImmOp::Fcvtzu => true,
+            VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
+                false
+            }
+            _ => arr.lane_bytes == 8,
+        },
+        _ => true,
+    }
+}
+
 /// Lane width in bytes from a two-bit `size` field.
 fn lane_from_size(size: u32) -> Option<u32> {
     match size {
@@ -1600,20 +1697,45 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32, scalar: bool) -> Inst {
     let imm5 = bits(raw, 20, 16);
     let imm4 = bits(raw, 14, 11);
 
+    // INS (element): `op` is 1 and imm4 holds the source lane index, so any
+    // imm4 is valid -- including the values that mean `smov`/`umov`/`ins
+    // (general)` when `op` is 0. Only the 128-bit form exists.
+    if u == 1 {
+        if !q || scalar {
+            return Inst::Undefined { raw };
+        }
+        let Some((lane_bytes, dst)) = decode_lane(imm5) else {
+            return Inst::Undefined { raw };
+        };
+        let shift = lane_bytes.trailing_zeros();
+        return Inst::VInsElement {
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            lane_bytes,
+            dst_index: dst,
+            src_index: imm4 >> shift,
+        };
+    }
+
     // Lane moves between a general register and a vector.
     // imm4: 0011 = INS (general), 0101 = SMOV, 0111 = UMOV.
     if matches!(imm4, 0b0011 | 0b0101 | 0b0111) {
         let Some((lane_bytes, lane)) = decode_lane(imm5) else {
             return Inst::Undefined { raw };
         };
-        // All of DUP, INS (general), SMOV and UMOV have op == 0; only
-        // INS (element) sets it.
-        if u != 0 {
-            return Inst::Unknown { raw };
-        }
         let to_vector = imm4 == 0b0011;
         let signed = imm4 == 0b0101;
-        if !to_vector && lane_bytes == 8 && !q {
+        // Allocated widths: `ins` only with Q set; `umov` to a W register
+        // from b/h/s lanes or to an X register from a d lane; `smov` to a W
+        // register from b/h lanes or to an X register from b/h/s lanes.
+        let allocated = if to_vector {
+            q
+        } else if signed {
+            lane_bytes < if q { 8 } else { 4 }
+        } else {
+            (lane_bytes == 8) == q
+        };
+        if !allocated {
             return Inst::Undefined { raw };
         }
         // For `ins` the source register's width follows the element, not Q,
@@ -1645,20 +1767,6 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32, scalar: bool) -> Inst {
             } else {
                 bits(raw, 9, 5) as u8
             }),
-        };
-    }
-    // INS (element): `op` is 1 and imm4 holds the source lane index.
-    if u == 1 {
-        let Some((lane_bytes, dst)) = decode_lane(imm5) else {
-            return Inst::Undefined { raw };
-        };
-        let shift = lane_bytes.trailing_zeros();
-        return Inst::VInsElement {
-            vd: VReg(bits(raw, 4, 0) as u8),
-            vn: VReg(bits(raw, 9, 5) as u8),
-            lane_bytes,
-            dst_index: dst,
-            src_index: imm4 >> shift,
         };
     }
     match imm4 {
@@ -1839,6 +1947,10 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
             (1, 0b11111, false) => VOp3::FDiv,
             _ => return Inst::Unknown { raw },
         };
+        // No `.1d` arrangement.
+        if lane_bytes == 8 && !q {
+            return Inst::Undefined { raw };
+        }
         return Inst::VThreeSame {
             op,
             arr: VArr {
@@ -1893,9 +2005,30 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
         (0b10101, _) => VOp3::UMinP,
         _ => return Inst::Unknown { raw },
     };
-    // Doubleword lanes exist only for add, sub, the comparisons and the
-    // saturating forms.
-    if lane_bytes == 8 && matches!(op, VOp3::Mul | VOp3::Mla | VOp3::Mls) {
+    // Doubleword lanes exist only for add, sub, the comparisons, the
+    // register shifts and the saturating forms, and only in the 128-bit
+    // register (the scalar decoder passes `q` set).
+    if lane_bytes == 8
+        && (!q
+            || !matches!(
+                op,
+                VOp3::Add
+                    | VOp3::Sub
+                    | VOp3::CmEq
+                    | VOp3::CmGt
+                    | VOp3::CmGe
+                    | VOp3::CmHi
+                    | VOp3::CmHs
+                    | VOp3::CmTst
+                    | VOp3::SShl
+                    | VOp3::UShl
+                    | VOp3::SqAdd
+                    | VOp3::UqAdd
+                    | VOp3::SqSub
+                    | VOp3::UqSub
+                    | VOp3::AddP
+            ))
+    {
         return Inst::Undefined { raw };
     }
     Inst::VThreeSame {
@@ -1968,6 +2101,10 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
             (0b11111, _, true) => VOp2::FSqrt,
             _ => return Inst::Unknown { raw },
         };
+        // No `.1d` arrangement.
+        if lane_bytes == 8 && !q {
+            return Inst::Undefined { raw };
+        }
         return Inst::VTwoMisc {
             op,
             arr: VArr {
@@ -1981,6 +2118,28 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         };
     }
 
+    // `cnt`, `not` and `rbit` share opcode 00101 and take their operation
+    // from `size`; all three work on bytes, and the other sizes are
+    // unallocated.
+    if opcode == 0b00101 {
+        let op = match (u, size) {
+            (0, 0b00) => VOp2::Cnt,
+            (1, 0b00) => VOp2::Not,
+            (1, 0b01) => VOp2::Rbit,
+            _ => return Inst::Undefined { raw },
+        };
+        return Inst::VTwoMisc {
+            op,
+            arr: VArr {
+                lane_bytes: 1,
+                q,
+                float: false,
+                scalar: false,
+            },
+            vd,
+            vn,
+        };
+    }
     let Some(lane_bytes) = lane_from_size(size) else {
         return Inst::Undefined { raw };
     };
@@ -1994,9 +2153,6 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         (0b00110, _) => VOp2::Uadalp,
         (0b00100, 0) => VOp2::Cls,
         (0b00100, _) => VOp2::Clz,
-        (0b00101, 0) => VOp2::Cnt,
-        (0b00101, _) if size == 0b00 => VOp2::Not,
-        (0b00101, _) => VOp2::Rbit,
         (0b01000, 0) => VOp2::CmGtZero,
         (0b01000, _) => VOp2::CmGeZero,
         (0b01001, 0) => VOp2::CmEqZero,
@@ -2021,6 +2177,24 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         _ => u32::MAX,
     };
     if lane_bytes >= group {
+        return Inst::Undefined { raw };
+    }
+    // Doubleword elements: only the compares, `abs` and `neg` have them, and
+    // only in the 128-bit register. The narrowing and pairwise forms would
+    // need 128-bit elements on one side.
+    if lane_bytes == 8
+        && (!q
+            || !matches!(
+                op,
+                VOp2::CmEqZero
+                    | VOp2::CmGtZero
+                    | VOp2::CmGeZero
+                    | VOp2::CmLtZero
+                    | VOp2::CmLeZero
+                    | VOp2::Abs
+                    | VOp2::Neg
+            ))
+    {
         return Inst::Undefined { raw };
     }
     Inst::VTwoMisc {
@@ -2142,6 +2316,18 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         op,
         VShiftImmOp::Scvtf | VShiftImmOp::Ucvtf | VShiftImmOp::Fcvtzs | VShiftImmOp::Fcvtzu
     ) && esize < 32
+    {
+        return Inst::Undefined { raw };
+    }
+    // The widening and narrowing forms would need 128-bit elements, and a
+    // doubleword element needs the 128-bit register (there is no `.1d`
+    // vector form; the scalar decoder passes `q` set).
+    if lane_bytes == 8
+        && (!q
+            || matches!(
+                op,
+                VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn
+            ))
     {
         return Inst::Undefined { raw };
     }
