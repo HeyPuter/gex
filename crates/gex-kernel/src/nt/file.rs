@@ -727,9 +727,9 @@ pub fn nt_query_volume_information_file(c: &mut Call<'_>) -> R {
         4 => {
             need(8)?;
             let (ty, ch) = match f.kind {
-                FileKind::Disk => (7u32, 0u32),   // FILE_DEVICE_DISK
-                FileKind::Console => (0x50, 0),   // FILE_DEVICE_CONSOLE
-                FileKind::Null => (0x15, 0),      // FILE_DEVICE_NULL
+                FileKind::Disk => (7u32, 0u32), // FILE_DEVICE_DISK
+                FileKind::Console => (std_device_type(&f), 0),
+                FileKind::Null => (0x15, 0), // FILE_DEVICE_NULL
             };
             c.g.w32(buf, ty)?;
             c.g.w32(buf + 4, ch)?;
@@ -762,6 +762,18 @@ pub fn nt_query_volume_information_file(c: &mut Call<'_>) -> R {
     };
     c.g.iosb(iosb, st::SUCCESS, info)?;
     Ok(st::SUCCESS)
+}
+
+/// The device type of a standard stream, from what the gex fd really is,
+/// as Wine's `get_device_info` reports a Unix fd: a character device is
+/// `FILE_DEVICE_UNKNOWN`, a pipe `FILE_DEVICE_NAMED_PIPE`, anything else a
+/// disk. There is no console driver, so a stream is never a console.
+fn std_device_type(f: &NtFile) -> u32 {
+    match f.handle.metadata().map(|m| m.file_type) {
+        Ok(FileType::CharDevice) => 0x22,
+        Ok(FileType::Fifo) | Ok(FileType::Socket) => 0x11,
+        _ => 7,
+    }
 }
 
 /// Windows file-name matching, with the DOS wildcards `<`, `>` and `"`.
@@ -900,15 +912,46 @@ pub fn nt_query_directory_file(c: &mut Call<'_>) -> R {
     Ok(st::SUCCESS)
 }
 
-/// `NtFsControlFile`: no file-system controls are provided yet.
+const FSCTL_GET_OBJECT_ID: u32 = 0x9009c;
+const FILE_DEVICE_CONSOLE: u32 = 0x50;
+
+/// `NtFsControlFile(handle, event, apc, apc_ctx, iosb, code, in, in_len,
+/// out, out_len)`.
 pub fn nt_fs_control_file(c: &mut Call<'_>) -> R {
-    let code = c.a32(5);
-    Err(c.unimplemented(&format!("NtFsControlFile code {code:#x}")))
+    let (h, event, apc, iosb, code, out, out_len) = (c.a32(0), c.a32(1), c.a(2), c.a(4), c.a32(5), c.a(8), c.a32(9));
+    let f = get_file(c, h)?;
+    match code {
+        // FILE_OBJECTID_BUFFER: an id that is the same for two names of one
+        // file (the loader uses it to spot a DLL loaded twice). Wine uses
+        // st_dev and st_ino; gex's VFS has the inode.
+        FSCTL_GET_OBJECT_ID => {
+            if out_len < 64 {
+                return Err(Status(st::BUFFER_TOO_SMALL));
+            }
+            let md = f.handle.metadata()?;
+            c.g.zero(out, 64)?;
+            c.g.w64(out, 0x6765_7876_6673)?; // "gexvfs": the one device
+            c.g.w64(out + 8, md.ino)?;
+            complete_io(c, event, apc, iosb, st::SUCCESS, 64)?;
+            Ok(st::SUCCESS)
+        }
+        _ => Err(c.unimplemented(&format!("NtFsControlFile code {code:#x}"))),
+    }
 }
 
-/// `NtDeviceIoControlFile`: no devices are provided yet.
+/// `NtDeviceIoControlFile(handle, event, apc, apc_ctx, iosb, code, in,
+/// in_len, out, out_len)`.
 pub fn nt_device_io_control_file(c: &mut Call<'_>) -> R {
-    let code = c.a32(5);
+    let (h, code) = (c.a32(0), c.a32(5));
+    let f = get_file(c, h)?;
+    // A console-driver request on a stream that is not a console (gex has no
+    // console driver): wineserver's `default_fd_ioctl` answers a plain fd
+    // with STATUS_NOT_SUPPORTED, which is how kernelbase learns that
+    // `GetConsoleMode` does not apply.
+    let _ = &f;
+    if code >> 16 == FILE_DEVICE_CONSOLE {
+        return Err(Status(st::NOT_SUPPORTED));
+    }
     Err(c.unimplemented(&format!("NtDeviceIoControlFile code {code:#x}")))
 }
 

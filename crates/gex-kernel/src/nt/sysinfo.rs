@@ -223,6 +223,29 @@ fn query_system(c: &mut Call<'_>, class: u32, buf: u64, len: u64, ret: u64) -> R
             c.g.wptr(buf, if c.p.abi == Abi::P64 { 0xffff_8000_0000_0000 } else { 0x8000_0000 })?;
             ps
         }
+        // SystemDynamicTimeZoneInformation: UTC, gex's only time zone
+        // (RTL_DYNAMIC_TIME_ZONE_INFORMATION: bias, standard name[32] and
+        // date and bias, daylight name[32] and date and bias, key name[128],
+        // dynamic-daylight-disabled).
+        102 => {
+            let size = 432u64;
+            need(len, size)?;
+            c.g.zero(buf, size as usize)?;
+            let name = to_w("Coordinated Universal Time");
+            c.g.write_wchars(buf + 4, &name)?;
+            c.g.write_wchars(buf + 88, &name)?;
+            c.g.write_wchars(buf + 172, &to_w("UTC"))?;
+            size
+        }
+        // SystemWineVersionInformation: version, build, sysname, release.
+        1000 => {
+            let s = b"11.15\0wine-11.15 (gex)\0Linux\0gex\0";
+            c.g.write(buf, &s[..(len as usize).min(s.len())])?;
+            if len < s.len() as u64 {
+                return Err(Status(st::INFO_LENGTH_MISMATCH));
+            }
+            s.len() as u64 - 1
+        }
         // SystemKernelDebuggerInformation: no debugger.
         35 => {
             need(len, 2)?;
