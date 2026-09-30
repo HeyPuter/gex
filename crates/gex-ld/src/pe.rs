@@ -1468,7 +1468,9 @@ pub const SYSTEM_DLLS: &[&str] = &[
     "sspicli.dll", "bcrypt.dll", "ncrypt.dll", "crypt32.dll", "wintrust.dll", "setupapi.dll",
     "cfgmgr32.dll", "hid.dll", "psapi.dll", "dbghelp.dll", "userenv.dll", "powrprof.dll",
     "winspool.drv", "mpr.dll", "avrt.dll", "mfplat.dll", "mfreadwrite.dll", "mf.dll",
-    "normaliz.dll", "msimg32.dll", "usp10.dll",
+    "normaliz.dll", "msimg32.dll", "usp10.dll", "msacm32.dll", "msvfw32.dll", "avifil32.dll",
+    "olepro32.dll", "oledlg.dll", "wtsapi32.dll", "credui.dll", "dwrite.dll", "d2d1.dll",
+    "windowscodecs.dll", "propsys.dll", "mmdevapi.dll", "ksuser.dll", "dciman32.dll",
 ];
 
 /// Whether a DLL is a system DLL (see [`SYSTEM_DLLS`]), including the
