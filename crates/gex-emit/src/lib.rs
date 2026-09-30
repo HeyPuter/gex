@@ -10,6 +10,7 @@ pub mod merge;
 pub mod module;
 pub mod fma;
 pub mod par;
+pub mod profile;
 pub mod region;
 pub mod tier1;
 pub mod wasm;

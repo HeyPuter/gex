@@ -370,6 +370,49 @@ impl FuncBody {
         self.memarg(align_log2, offset);
     }
 
+    /// A load from memory `mem` (multi-memory). Memory 0 encodes exactly as
+    /// [`Self::load`] does.
+    pub fn load_m(&mut self, opcode: u8, align_log2: u32, mem: u32, offset: u32) {
+        self.byte(opcode);
+        self.memarg_m(align_log2, mem, offset);
+    }
+
+    /// A store to memory `mem` (multi-memory).
+    pub fn store_m(&mut self, opcode: u8, align_log2: u32, mem: u32, offset: u32) {
+        self.byte(opcode);
+        self.memarg_m(align_log2, mem, offset);
+    }
+
+    /// A memory argument naming a memory: bit 6 of the alignment field says
+    /// an index follows.
+    fn memarg_m(&mut self, align_log2: u32, mem: u32, offset: u32) {
+        if mem == 0 {
+            self.memarg(align_log2, offset);
+        } else {
+            self.u32(align_log2 | 0x40);
+            self.u32(mem);
+            self.u32(offset);
+        }
+    }
+
+    pub fn global_get(&mut self, idx: u32) {
+        self.byte(op::GLOBAL_GET);
+        self.u32(idx);
+    }
+
+    pub fn global_set(&mut self, idx: u32) {
+        self.byte(op::GLOBAL_SET);
+        self.u32(idx);
+    }
+
+    /// `memory.init seg mem`: copy from a passive data segment.
+    pub fn memory_init(&mut self, seg: u32, mem: u32) {
+        self.byte(op::MISC_PREFIX);
+        self.u32(8);
+        self.u32(seg);
+        self.u32(mem);
+    }
+
     /// Emit an atomic instruction (0xFE prefix) with a memory argument.
     pub fn atomic(&mut self, sub: u32, align_log2: u32, offset: u32) {
         self.byte(op::ATOMIC_PREFIX);
@@ -556,6 +599,11 @@ pub struct Module {
     exports: Vec<(String, ExportKind, u32)>,
     elements: Vec<ElementSegment>,
     data: Vec<DataSegment>,
+    /// Passive data segments, numbered before the active ones (indices
+    /// `0..passive.len()`), for `memory.init`.
+    passive: Vec<Vec<u8>>,
+    /// Defined globals: type, mutability and an integer initialiser.
+    globals: Vec<(ValType, bool, i64)>,
     start: Option<u32>,
 }
 
@@ -931,6 +979,19 @@ impl Module {
         self.data.push(seg);
     }
 
+    /// Add a passive data segment, returning its index. Passive segments are
+    /// numbered first, so the index is fixed whatever active data follows.
+    pub fn passive_data(&mut self, bytes: Vec<u8>) -> u32 {
+        self.passive.push(bytes);
+        self.passive.len() as u32 - 1
+    }
+
+    /// Define a global (none are imported), returning its index.
+    pub fn add_global(&mut self, ty: ValType, mutable: bool, init: i64) -> u32 {
+        self.globals.push((ty, mutable, init));
+        self.globals.len() as u32 - 1
+    }
+
     pub fn set_start(&mut self, func: u32) {
         self.start = Some(func);
     }
@@ -1035,6 +1096,28 @@ impl Module {
             section(&mut out, 5, &s);
         }
 
+        // 6: globals
+        if !self.globals.is_empty() {
+            let mut s = Vec::new();
+            write_u32(&mut s, self.globals.len() as u32);
+            for (ty, mutable, init) in &self.globals {
+                s.push(ty.byte());
+                s.push(*mutable as u8);
+                match ty {
+                    ValType::I64 => {
+                        s.push(op::I64_CONST);
+                        write_i64(&mut s, *init);
+                    }
+                    _ => {
+                        s.push(op::I32_CONST);
+                        write_i32(&mut s, *init as i32);
+                    }
+                }
+                s.push(op::END);
+            }
+            section(&mut out, 6, &s);
+        }
+
         // 7: exports
         if !self.exports.is_empty() {
             let mut s = Vec::new();
@@ -1089,6 +1172,14 @@ impl Module {
             section(&mut out, 9, &s);
         }
 
+        // 12: data count, required before the code once `memory.init` names a
+        // segment. Only a module with passive data has one.
+        if !self.passive.is_empty() {
+            let mut s = Vec::new();
+            write_u32(&mut s, (self.passive.len() + self.data.len()) as u32);
+            section(&mut out, 12, &s);
+        }
+
         // 10: code
         let mut code_relocs: Vec<u32> = Vec::new();
         if !self.bodies.is_empty() {
@@ -1108,9 +1199,14 @@ impl Module {
         }
 
         // 11: data
-        if !self.data.is_empty() {
+        if !self.data.is_empty() || !self.passive.is_empty() {
             let mut s = Vec::new();
-            write_u32(&mut s, self.data.len() as u32);
+            write_u32(&mut s, (self.passive.len() + self.data.len()) as u32);
+            for p in &self.passive {
+                s.push(0x01); // passive
+                write_u32(&mut s, p.len() as u32);
+                s.extend_from_slice(p);
+            }
             // The offset of an active data segment is a constant expression
             // typed by the memory it lands in.
             for d in &self.data {

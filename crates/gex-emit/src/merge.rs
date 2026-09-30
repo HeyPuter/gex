@@ -182,6 +182,12 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
         return Some(units[0].to_vec());
     }
     let parsed: Vec<Vec<(u8, &[u8])>> = units.iter().map(|u| sections(u)).collect::<Option<_>>()?;
+    // A profiled unit (`crate::profile`) carries a global and a data-count
+    // section of its own, and its region descriptors; concatenating those is
+    // not implemented, so refuse rather than produce a wrong module.
+    if parsed.iter().any(|p| p.iter().any(|(id, _)| *id == 6 || *id == 12)) {
+        return None;
+    }
     let n_imports = import_funcs(&parsed[0]);
     for p in &parsed[1..] {
         if import_funcs(p) != n_imports {

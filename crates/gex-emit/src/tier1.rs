@@ -124,6 +124,9 @@ pub struct Context<'a> {
     pub blocks: &'a HashMap<u64, u32>,
     /// Guest address -> the block's GIR, for growing a region around a loop.
     pub gir: &'a HashMap<u64, &'a Block>,
+    /// Profiling instrumentation for this module, when it is on (see
+    /// `crate::profile`). `None` emits exactly what an unprofiled build does.
+    pub profile: Option<&'a crate::profile::Emit>,
 }
 
 
@@ -597,6 +600,7 @@ impl<'a> Emitter<'a> {
         self.value_const = vec![None; n];
         self.value_ty = vec![Ty::I64; n];
         let last_use = compute_last_use(block);
+        self.prof_entry(block);
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
             for (v, &lu) in last_use.iter().enumerate() {
@@ -638,6 +642,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn region_terminator(&mut self, block: &Block) {
+        self.prof_direct_call(block);
         match block.term {
             Term::Goto { target } => self.region_goto(target, block.start),
             Term::Branch {
@@ -647,6 +652,7 @@ impl<'a> Emitter<'a> {
             } => {
                 self.push(cond);
                 self.f.if_void();
+                self.prof_taken(block);
                 // One more block is open inside the `if`.
                 if let Some(st) = self.region.as_mut() {
                     st.depth += 1;
@@ -688,6 +694,7 @@ impl<'a> Emitter<'a> {
             self.f.loop_void();
             self.loop_depth = Some(0);
         }
+        self.prof_entry(block);
 
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
@@ -1164,6 +1171,21 @@ impl<'a> Emitter<'a> {
             }
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
+            }
+            Stmt::Trap { cond, pc, code } => {
+                // Only the faulting path writes the registers back, so they
+                // stay dirty for the path that carries on.
+                self.push(*cond);
+                self.f.if_void();
+                self.flush_conditional();
+                self.store_pc(*pc);
+                self.f.local_get(self.ctx_local);
+                self.f.i64_const(*pc as i64);
+                self.f.i32_const(*code);
+                self.f.call(self.cx.breakpoint);
+                // The host raises the fault and never returns.
+                self.f.unreachable();
+                self.f.end();
             }
             Stmt::VStore {
                 addr,
@@ -2534,7 +2556,72 @@ impl<'a> Emitter<'a> {
 
     // -- terminators -------------------------------------------------------
 
+    // -- profiling (crate::profile; all no-ops unless it is on) --------------
+
+    /// The profile record of `block`, when this module is profiled.
+    fn prof_rec(&self, block: &Block) -> Option<(&'a crate::profile::Emit, u32)> {
+        let e = self.cx.profile?;
+        e.records.get(&block.start).map(|&r| (e, r))
+    }
+
+    /// At the top of a block's body: count the entry, and its kind.
+    fn prof_entry(&mut self, block: &Block) {
+        if let Some((e, rec)) = self.prof_rec(block) {
+            crate::profile::emit_block_entry(&mut self.f, e, block.start, rec);
+        }
+    }
+
+    /// A direct call (`bl`, `call rel`): push the shadow frame and announce
+    /// the callee. Indirect calls do the same in [`Self::prof_indirect`].
+    fn prof_direct_call(&mut self, block: &Block) {
+        let (Some((e, _)), Some(ret), Term::Goto { target }) =
+            (self.prof_rec(block), block.call_return, &block.term)
+        else {
+            return;
+        };
+        self.f.i64_const(ret as i64);
+        self.f.i64_const(*target as i64);
+        self.f.call(e.f_call);
+    }
+
+    /// Inside a conditional branch's taken arm.
+    fn prof_taken(&mut self, block: &Block) {
+        if let Some((e, rec)) = self.prof_rec(block) {
+            crate::profile::emit_count(&mut self.f, e.base_global, rec + crate::profile::REC_TAKEN);
+        }
+    }
+
+    /// An indirect branch, its target in `scratch_i64`: a return is checked
+    /// against the shadow stack, anything else counts its target.
+    fn prof_indirect(&mut self, block: &Block) {
+        let Some((e, rec)) = self.prof_rec(block) else {
+            return;
+        };
+        let Term::Indirect { is_ret, .. } = block.term else {
+            return;
+        };
+        self.f.i32_const(rec as i32);
+        self.f.local_get(self.scratch_i64);
+        if is_ret {
+            self.f.call(e.f_ret);
+            return;
+        }
+        let kind = if block.call_return.is_some() {
+            crate::profile::KIND_CALL
+        } else {
+            crate::profile::KIND_JUMP
+        };
+        self.f.i32_const(kind);
+        self.f.call(e.f_indirect);
+        if let Some(ret) = block.call_return {
+            self.f.i64_const(ret as i64);
+            self.f.local_get(self.scratch_i64);
+            self.f.call(e.f_call);
+        }
+    }
+
     fn terminator(&mut self, block: &Block) {
+        self.prof_direct_call(block);
         match block.term {
             Term::Goto { target } => {
                 if self.loop_depth.is_some() {
@@ -2560,6 +2647,7 @@ impl<'a> Emitter<'a> {
                     // pays for a flush.
                     self.push(cond);
                     self.f.if_void();
+                    self.prof_taken(block);
                     if taken == block.start {
                         self.emit_loop_safepoint(taken);
                         self.f.br(depth + 1);
@@ -2590,6 +2678,7 @@ impl<'a> Emitter<'a> {
                 // loop's exit test costs nothing extra.
                 self.push(cond);
                 self.f.if_void();
+                self.prof_taken(block);
                 if taken <= block.start {
                     self.emit_safepoint(taken);
                 }
@@ -2603,6 +2692,7 @@ impl<'a> Emitter<'a> {
             Term::Indirect { target, .. } => {
                 self.push(target);
                 self.f.local_set(self.scratch_i64);
+                self.prof_indirect(block);
                 // The context PC must be exact before a possible dispatch
                 // miss, since that is the only place the target is recorded.
                 self.f.local_get(self.ctx_local);
@@ -3326,8 +3416,13 @@ fn lane_cvt_op(op: VCvtOp, from: VLane) -> u32 {
         (VCvtOp::ExtendHigh { signed: false }, _) => 0xca,
         (VCvtOp::NarrowSat { signed: true }, VLane::I16) => 0x65,
         (VCvtOp::NarrowSat { signed: false }, VLane::I16) => 0x66,
-        (VCvtOp::NarrowSat { signed: true }, _) => 0x85,
-        (VCvtOp::NarrowSat { signed: false }, _) => 0x86,
+        (VCvtOp::NarrowSat { signed: true }, VLane::I32) => 0x85,
+        (VCvtOp::NarrowSat { signed: false }, VLane::I32) => 0x86,
+        // wasm narrows only i16 and i32 lanes; the lifter clamps doublewords
+        // itself.
+        (VCvtOp::NarrowSat { .. }, _) => {
+            panic!("no wasm SIMD conversion for {op:?} from {from:?}")
+        }
     }
 }
 

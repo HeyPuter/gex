@@ -475,6 +475,23 @@ pub mod imports {
     /// host prints the pc and a few registers and RETURNS.
     pub const BRK_TRACE: i32 = -3;
 
+    /// Not a `brk`: a `Stmt::Trap` for an integer division by zero (x86
+    /// `div`/`idiv`, #DE). The host raises it and does not return: SIGFPE
+    /// with `FPE_INTDIV` for a Linux guest, EXCEPTION_INT_DIVIDE_BY_ZERO for
+    /// a Windows one.
+    pub const BRK_DIVIDE_BY_ZERO: i32 = -4;
+
+    /// Not a `brk`: a `Stmt::Trap` for an integer division whose quotient
+    /// does not fit (x86 #DE: `INT_MIN / -1`, or any quotient too wide for
+    /// the destination). Linux reports it as SIGFPE with `FPE_INTDIV`, the
+    /// same as a zero divisor; Windows as EXCEPTION_INT_OVERFLOW.
+    pub const BRK_DIVIDE_OVERFLOW: i32 = -5;
+
+    /// Not a `brk`: a `Stmt::Trap` for a general-protection fault, such as
+    /// a privileged instruction (x86 `hlt`) in user mode. Linux reports it
+    /// as SIGSEGV at the instruction.
+    pub const BRK_GENERAL_PROTECTION: i32 = -6;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";

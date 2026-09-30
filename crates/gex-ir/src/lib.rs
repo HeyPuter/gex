@@ -817,6 +817,22 @@ pub enum Stmt {
     },
     /// A host call whose result is discarded.
     HostCall { func: HostFunc, args: Vec<Value> },
+    /// A conditional guest fault: when the `I32` `cond` is nonzero, the
+    /// instruction at `pc` faults with reason `code` (a negative
+    /// `gex_abi::imports::BRK_*` code, such as `BRK_DIVIDE_BY_ZERO`) and
+    /// control does not come back to this block. When `cond` is zero it does
+    /// nothing.
+    ///
+    /// At the fault the architectural state is exact: every guest register
+    /// written earlier in the block (and nothing written later) is in the
+    /// context, and `PC` holds `pc`, because the host delivers a signal or
+    /// an exception from that state. So for an analysis a `Trap` reads every
+    /// register: it is a may-unwind point (a function summary must assume
+    /// control can leave here), and a backend that keeps registers in locals
+    /// must write them all back on the faulting path. Tier-1 lowers it to
+    /// `if cond { write back; store pc; breakpoint(ctx, pc, code) }`, the
+    /// host raising the fault from `breakpoint`.
+    Trap { cond: Value, pc: u64, code: i32 },
     /// Store the low `bytes` bytes of a vector to guest memory.
     VStore {
         addr: Value,
@@ -909,6 +925,7 @@ impl Stmt {
                 f(*val);
             }
             Stmt::HostCall { args, .. } => args.iter().copied().for_each(f),
+            Stmt::Trap { cond, .. } => f(*cond),
             Stmt::VStore { addr, val, .. } => {
                 f(*addr);
                 f(*val);
@@ -954,6 +971,7 @@ impl Stmt {
             Stmt::WriteReg { .. } => true,
             Stmt::Store { .. }
             | Stmt::HostCall { .. }
+            | Stmt::Trap { .. }
             | Stmt::VStore { .. }
             | Stmt::MemCopy { .. }
             | Stmt::MemFill { .. }

@@ -12,6 +12,7 @@ use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod gl;
+pub mod profile;
 pub mod nt;
 pub mod virgl;
 pub mod wayland;
@@ -69,6 +70,7 @@ const SAFEPOINT_INTERVAL: i32 = 1024;
 pub mod signal {
     pub const SIGILL: i32 = 4;
     pub const SIGTRAP: i32 = 5;
+    pub const SIGFPE: i32 = 8;
     pub const SIGSEGV: i32 = 11;
     pub const SIGSYS: i32 = 31;
 }
@@ -129,6 +131,9 @@ pub struct RunOptions {
     /// Guest directory to start in. Without one the guest inherits the host's
     /// working directory, or `/` when a sysroot is mounted.
     pub cwd: Option<String>,
+    /// Record a profile and a session manifest into this directory (see
+    /// `profile`). Tier-1 code only.
+    pub record: Option<std::path::PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -161,6 +166,7 @@ impl Default for RunOptions {
             // On by default: half a minute vs half a second on SQLite; a miss
             // costs only the write.
             cache: true,
+            record: None,
         }
     }
 }
@@ -198,6 +204,8 @@ struct HostState {
     pending_exec: Option<ExecRequest>,
     /// Raised past wasmtime's defaults. See [`store_limits`].
     store_limits: wasmtime::StoreLimits,
+    /// This store's profile counters, when recording. See `profile`.
+    prof: Option<profile::StoreProf>,
     /// Set for a Windows process: every `syscall` is an NT call. See `nt`.
     nt: Option<Arc<gex_kernel::nt::Process>>,
 }
@@ -253,6 +261,8 @@ struct SpawnContext {
     virgl: Option<virgl::VirglDevice>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
     limits: gex_xlate::BlockLimits,
+    /// Where this process's objects are, for naming profile counts.
+    prof_proc: Option<Arc<profile::ProcProf>>,
     /// The NT process, for a Windows program's threads. See `nt`.
     nt: Option<Arc<gex_kernel::nt::Process>>,
 }
@@ -374,6 +384,8 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     config.wasm_tail_call(true);
     config.wasm_threads(true);
     config.wasm_bulk_memory(true);
+    // The profile counters are a second memory (`profile`).
+    config.wasm_multi_memory(true);
     let engine = Engine::new(&config).context("creating the wasm engine")?;
     Module::validate(&engine, wasm)
 }
@@ -427,7 +439,12 @@ fn run_program_with(
     //
     // A build that cannot identify itself must not use the cache: reusing
     // another build's compiled code would serve stale translations.
-    let build = gex_cache::build_fingerprint();
+    if let Some(dir) = &opts.record {
+        profile::start(dir.clone(), opts)?;
+    }
+    // Profiled modules differ from plain ones, so they are cached apart.
+    let build = gex_cache::build_fingerprint()
+        .map(|b| if profile::active() { format!("{b}+profile") } else { b });
     let use_cache = opts.cache && build.is_some();
     let build = build.unwrap_or_default();
     let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
@@ -455,6 +472,8 @@ fn run_program_with(
     config.wasm_tail_call(true);
     config.wasm_threads(true);
     config.wasm_bulk_memory(true);
+    // The profile counters are a second memory (`profile`).
+    config.wasm_multi_memory(true);
     // gex's output is already optimised; Cranelift only adds register
     // allocation and peepholes, whose time dominates on a large program (half
     // a minute to compile SQLite vs under two seconds to translate).
@@ -683,6 +702,7 @@ fn run_program_with(
         v
     }));
     let tid = kernel.pid;
+    let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
 
     let mut store = Store::new(
         &engine,
@@ -702,6 +722,7 @@ fn run_program_with(
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
+            prof: None,
             nt: None,
         },
     );
@@ -724,10 +745,12 @@ fn run_program_with(
     )
     .context("creating the guest's shared memory")?;
     linker.define(&mut store, IMPORT_MODULE, exports::MEMORY, shared.clone())?;
+    profile::link(&mut linker, &mut store, &prof_proc)?;
 
     let instance = linker
         .instantiate(&mut store, &module)
         .context("instantiating the translated module")?;
+    profile::attach(&mut store, &instance)?;
     if opts.verbose {
         eprintln!(
             "[gex] instantiated in {:.2}s",
@@ -824,6 +847,7 @@ fn run_program_with(
         proc_state: Arc::clone(&store.data().proc_state),
         jit_shared: store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)),
         limits: xlate.limits,
+        prof_proc: prof_proc.clone(),
         nt: store.data().nt.clone(),
     });
     store.data_mut().spawn = Some(Arc::clone(&spawn));
@@ -857,6 +881,7 @@ fn run_program_with(
     }
 
     let stopped = run_thread_loop(&mut store, &instance, ctx_addr, entry)?;
+    profile::harvest(&mut store)?;
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
         let kernel = take_kernel(&spawn);
@@ -1396,6 +1421,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // exactly what the import is for.
         jit_shared: cx.jit_shared.clone(),
         limits: cx.limits,
+        prof_proc: profile::fork_process(&cx.prof_proc),
         // Windows has no fork: only a Linux process gets here.
         nt: None,
     });
@@ -1472,6 +1498,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
+            prof: None,
             nt: cx.nt.clone(),
         },
     );
@@ -1486,9 +1513,11 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
         exports::MEMORY,
         cx.memory.shared().clone(),
     )?;
+    profile::link(&mut linker, &mut store, &cx.prof_proc)?;
     let instance = linker
         .instantiate(&mut store, &cx.image_module)
         .context("instantiating the image module for a child process")?;
+    profile::attach(&mut store, &instance)?;
     let tables = dispatch_tables(&mut store, &instance)?;
     let table = tables[0];
     if let Some(shared) = &cx.jit_shared {
@@ -1504,7 +1533,9 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
         });
     }
     catch_up_table(&mut store)?;
-    match run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)? {
+    let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
+    profile::harvest(&mut store)?;
+    match stopped {
         Stopped::Exited(exit) => {
             stop_other_threads(&cx, false);
             Ok(exit)
@@ -1615,6 +1646,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             pending_fork: None,
             pending_exec: None,
             store_limits: store_limits(),
+            prof: None,
             nt: cx.nt.clone(),
         },
     );
@@ -1629,9 +1661,12 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
         exports::MEMORY,
         cx.memory.shared().clone(),
     )?;
+    profile::new_thread();
+    profile::link(&mut linker, &mut store, &cx.prof_proc)?;
     let instance = linker
         .instantiate(&mut store, &cx.image_module)
         .context("instantiating the image module for a new thread")?;
+    profile::attach(&mut store, &instance)?;
     let tables = dispatch_tables(&mut store, &instance)?;
     let table = tables[0];
     if let Some(shared) = &cx.jit_shared {
@@ -1656,7 +1691,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
         let data = cx.memory.bytes();
         read_u64(data, (thread.ctx_addr + ctx::PC as u64) as usize)
     };
-    if let Stopped::Exec(_) = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)? {
+    let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
+    profile::harvest(&mut store)?;
+    if let Stopped::Exec(_) = stopped {
         bail!("execve from a non-main thread is not supported");
     }
     Ok(())
@@ -2303,6 +2340,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .memory
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            // Profiling: count the call against its function (S6).
+            profile::syscall_enter(&mut caller, &GuestMem::new(memory.bytes()), pc as u64);
             let data = memory.bytes();
             let state = caller.data_mut();
             // A thread that loops on a blocking syscall -- a condition
@@ -2390,6 +2429,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             } else {
                 outcome
             };
+            profile::syscall_exit(caller.data_mut(), memory.bytes());
             // The compositor runs here, between one syscall and the next. A
             // client writes a request and then waits for the reply, and the
             // write is a syscall, so by the time it waits the reply is
@@ -2415,6 +2455,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let mapped: Vec<gex_kernel::CodeMap> = caller
                 .data_mut()
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
+            profile::note_mapped(caller.data_mut(), &mapped);
+            profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
                 // Which seeds depend on whether the runtime translator is
@@ -2683,6 +2725,60 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if caller.data().nt.is_some() {
                 return nt::fault(&mut caller, nt::Fault::Breakpoint, pc as u64);
             }
+            // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
+            // divisor and a quotient overflow alike, as SIGFPE with
+            // FPE_INTDIV at the dividing instruction.
+            if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO || imm == gex_abi::imports::BRK_DIVIDE_OVERFLOW {
+                let pc = pc as u64;
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let state = caller.data_mut();
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGFPE as u32, pc, pc)) {
+                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    _ => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGFPE,
+                            pc,
+                            detail: format!(
+                                "integer divide {} at 0x{pc:x}",
+                                if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO { "by zero" } else { "overflow" }
+                            ),
+                            internal: false,
+                        })
+                    }
+                }
+                return Err(StopExecution.into());
+            }
+            // A general-protection fault (a privileged instruction in user
+            // mode): SIGSEGV at the instruction.
+            if imm == gex_abi::imports::BRK_GENERAL_PROTECTION {
+                let pc = pc as u64;
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let state = caller.data_mut();
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, 0)) {
+                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    _ => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc,
+                            detail: format!("general protection fault (privileged instruction) at 0x{pc:x}"),
+                            internal: false,
+                        })
+                    }
+                }
+                return Err(StopExecution.into());
+            }
             caller.data_mut().exit = Some(Exit::Signal {
                 signal: signal::SIGTRAP,
                 pc: pc as u64,
@@ -2814,6 +2910,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = caller.data().sampler.clone() {
                 s.sample(pc as u64);
             }
+            profile::poll(&mut caller)?;
             // Same reason as the syscall hook: a loop that never calls the
             // kernel still reaches a back-edge, and this is where it does.
             catch_up_in_caller(&mut caller)?;
@@ -3165,9 +3262,17 @@ fn install_unit(
             *t,
         )?;
     }
+    let proc = cx
+        .as_context()
+        .data()
+        .spawn
+        .as_ref()
+        .and_then(|s| s.prof_proc.clone());
+    profile::link(&mut linker, cx.as_context_mut(), &proc)?;
     let instance = linker
         .instantiate(cx.as_context_mut(), &unit.module)
         .context("instantiating a runtime-translated module")?;
+    profile::attach(cx.as_context_mut(), &instance)?;
 
     // The module carries element segments for the table it imports, so
     // instantiating it already filled its slots. Writing the directory is

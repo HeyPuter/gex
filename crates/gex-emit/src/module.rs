@@ -539,6 +539,22 @@ pub struct ModuleBuilder {
 
     /// Blocks to export by name, for a shared-linkage module.
     exports_by_addr: Vec<(u64, u32)>,
+    /// Profiling instrumentation (`crate::profile`), when it was on as this
+    /// module was started: the helper functions and the region-base global.
+    /// `None` leaves the module exactly as it would be without profiling.
+    profile: Option<ProfileFns>,
+}
+
+/// The helpers a profiled module defines. See `crate::profile`.
+#[derive(Clone, Copy)]
+struct ProfileFns {
+    global: u32,
+    f_entry: u32,
+    f_indirect: u32,
+    f_ret: u32,
+    f_call: u32,
+    f_size: u32,
+    f_init: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -660,6 +676,12 @@ impl ModuleBuilder {
             GUEST_MEM_PAGES,
             shared_memory,
         );
+        // Profiling: a second memory, the host's, per store (memory index 1,
+        // since the guest's memory is the first memory import).
+        let profiling = crate::profile::enabled();
+        if profiling {
+            m.import_memory(IMPORT_MODULE, crate::profile::MEMORY_IMPORT, 1, 65536, false);
+        }
         if linkage == Linkage::Shared {
             // The tables come from the image module, so this one's blocks
             // dispatch through the same slots. All are imported even if this
@@ -690,7 +712,31 @@ impl ModuleBuilder {
             linkage,
             exports_by_addr: Vec::new(),
             demand_fill: false,
+            profile: None,
         };
+
+        if profiling {
+            let i32_ = ValType::I32;
+            let i64_ = ValType::I64;
+            let t_entry = b.m.func_type(FuncType::new(vec![i32_], vec![]));
+            let t_ind = b.m.func_type(FuncType::new(vec![i32_, i64_, i32_], vec![]));
+            let t_ret = b.m.func_type(FuncType::new(vec![i32_, i64_], vec![]));
+            let t_call = b.m.func_type(FuncType::new(vec![i64_, i64_], vec![]));
+            let t_size = b.m.func_type(FuncType::new(vec![], vec![i32_]));
+            let global = b.m.add_global(ValType::I32, true, 0);
+            let fns = ProfileFns {
+                global,
+                f_entry: b.m.declare_func(t_entry),
+                f_indirect: b.m.declare_func(t_ind),
+                f_ret: b.m.declare_func(t_ret),
+                f_call: b.m.declare_func(t_call),
+                f_size: b.m.declare_func(t_size),
+                f_init: b.m.declare_func(t_entry),
+            };
+            b.m.export(crate::profile::EXPORT_SIZE, ExportKind::Func, fns.f_size);
+            b.m.export(crate::profile::EXPORT_INIT, ExportKind::Func, fns.f_init);
+            b.profile = Some(fns);
+        }
 
         let stub_body = b.build_miss_stub();
         b.m.define_func(miss_stub, stub_body);
@@ -762,6 +808,29 @@ impl ModuleBuilder {
     pub fn finish(mut self) -> TranslatedModule {
         let timing = std::env::var_os("GEX_TIMING").is_some();
         let started = crate::par::Stopwatch::start();
+        // The profile region: one record per block, laid out in the order the
+        // blocks were added, and the helpers that read and write it.
+        let profile_emit = self.profile.map(|p| {
+            let region = crate::profile::layout(self.pending.iter().map(|(b, _)| b));
+            let seg = self.m.passive_data(region.init.clone());
+            self.m.define_func(p.f_entry, crate::profile::body_entry(p.global));
+            self.m.define_func(p.f_indirect, crate::profile::body_indirect(p.global));
+            self.m.define_func(p.f_ret, crate::profile::body_ret(p.global));
+            self.m.define_func(p.f_call, crate::profile::body_call());
+            self.m.define_func(p.f_size, crate::profile::body_size(region.size));
+            self.m.define_func(
+                p.f_init,
+                crate::profile::body_init(p.global, seg, region.init.len() as u32),
+            );
+            crate::profile::Emit {
+                base_global: p.global,
+                f_entry: p.f_entry,
+                f_indirect: p.f_indirect,
+                f_ret: p.f_ret,
+                f_call: p.f_call,
+                records: region.records,
+            }
+        });
         let compiled: Vec<(u32, (Vec<u8>, Vec<u32>))> = {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
@@ -778,6 +847,7 @@ impl ModuleBuilder {
                 block_ty: self.block_ty,
                 blocks: &self.blocks,
                 gir: &gir,
+                profile: profile_emit.as_ref(),
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.
