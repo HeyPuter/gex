@@ -593,6 +593,8 @@ impl<'a> Lifter<'a> {
                 let s = self.rd(rt);
                 let b = self.rd(rb);
                 let r = match i.op {
+                    // `mr` (or rA, rS, rS) and its `and` twin are a copy.
+                    And | Or if rt == rb => s,
                     And => self.bin(BinOp::And, s, b),
                     Or => self.bin(BinOp::Or, s, b),
                     Xor => self.bin(BinOp::Xor, s, b),
