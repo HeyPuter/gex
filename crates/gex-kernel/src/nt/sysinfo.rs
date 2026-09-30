@@ -644,3 +644,14 @@ pub fn nt_query_license_value(c: &mut Call<'_>) -> R {
 
 #[allow(dead_code)]
 fn _unused(_: &Process) {}
+
+/// `NtWow64IsProcessorFeaturePresent(feature)`: a BOOLEAN, from
+/// `KUSER_SHARED_DATA.ProcessorFeatures` (i386 ntdll asks this way).
+pub fn nt_wow64_is_processor_feature_present(c: &mut Call<'_>) -> R {
+    use super::layout::x64::kuser_shared_data as u;
+    let f = c.a32(0) as u64;
+    if f >= 64 {
+        return Ok(0);
+    }
+    Ok(c.g.u8(super::USD + u::PROCESSORFEATURES + f)? as u32)
+}

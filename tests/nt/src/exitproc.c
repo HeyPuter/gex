@@ -1,6 +1,6 @@
 /* ExitProcess from a secondary thread while the main thread waits: the
  * process ends with that thread's code, after atexit handlers run.
- * gex-nt-cc: clang --target=x86_64-w64-mingw32 -fms-extensions -fuse-ld=lld */
+ * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>

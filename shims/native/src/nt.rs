@@ -45,7 +45,10 @@ pub fn clocks() -> nt::Clocks {
 pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Result<(Exit, Stats)> {
     // Nothing is translated ahead of time: Wine's loader maps every image
     // itself, so all code arrives through the runtime translator.
-    let program = Program { exe: gex_ld::elf::headers_only(0, 0, 0, 0), interp: None };
+    let mut exe = gex_ld::elf::headers_only(0, 0, 0, 0);
+    // A PE32 program's code is decoded in i386 compatibility mode (S4).
+    exe.class32 = setup.abi == nt::Abi::P32;
+    let program = Program { exe, interp: None };
     let mut opts = opts.clone();
     opts.jit = true;
     run_program_with(&program, &opts, xlate, None, Some(setup))

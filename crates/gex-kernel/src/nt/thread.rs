@@ -138,26 +138,7 @@ pub fn save_context64(g: &mut G<'_>, cx: u64, at: u64, rip: u64) -> R<()> {
     }
     g.w64(at + RIP, rip)?;
     // FltSave (XSAVE_FORMAT): x87 as 80-bit, stack-relative; SSE registers.
-    let f = at + FLTSAVE;
-    let cw = g.u16(cx + ctx::X87_CW as u64)?;
-    let top = g.u32(cx + ctx::X87_TOP as u64)? & 7;
-    let sw = g.u16(cx + ctx::X87_SW as u64)? & !(7 << 11) | (top as u16) << 11;
-    let tags = g.u16(cx + ctx::X87_TAGS as u64)? as u8;
-    g.w16(f, cw)?;
-    g.w16(f + 2, sw)?;
-    g.w8(f + 4, tags)?;
-    g.w32(f + 0x18, mxcsr)?;
-    g.w32(f + 0x1c, 0xffff)?;
-    for i in 0..8u64 {
-        let phys = (top as u64 + i) & 7;
-        let v = x87_read_f80(g, cx, phys)?;
-        g.write(f + 0x20 + 16 * i, &v)?;
-    }
-    for i in 0..16u8 {
-        let v = g.bytes(cx + ctx::v(i) as u64, 16)?;
-        g.write(f + 0xa0 + 16 * i as u64, &v)?;
-    }
-    Ok(())
+    save_fxsave(g, cx, at + FLTSAVE, 16)
 }
 
 /// Load an x86-64 CONTEXT at `at` into the gex context at `cx`, honouring its
@@ -175,26 +156,7 @@ pub fn load_context64(g: &mut G<'_>, cx: u64, at: u64) -> R<Option<u64>> {
         }
     }
     if flags & FLOATING_POINT == FLOATING_POINT {
-        let f = at + FLTSAVE;
-        let mxcsr = g.u32(at + MXCSR)?;
-        g.w32(cx + ctx::MXCSR as u64, mxcsr)?;
-        let cw = g.u16(f)?;
-        let sw = g.u16(f + 2)?;
-        let tags = g.u8(f + 4)?;
-        let top = ((sw >> 11) & 7) as u64;
-        g.w16(cx + ctx::X87_CW as u64, cw)?;
-        g.w16(cx + ctx::X87_SW as u64, sw & !(7 << 11))?;
-        g.w32(cx + ctx::X87_TOP as u64, top as u32)?;
-        g.w16(cx + ctx::X87_TAGS as u64, tags as u16)?;
-        for i in 0..8u64 {
-            let b = g.bytes(f + 0x20 + 16 * i, 10)?;
-            let phys = (top + i) & 7;
-            x87_write_f80(g, cx, phys, &b)?;
-        }
-        for i in 0..16u8 {
-            let v = g.bytes(f + 0xa0 + 16 * i as u64, 16)?;
-            g.write(cx + ctx::v(i) as u64, &v)?;
-        }
+        load_fxsave(g, cx, at + FLTSAVE, 16)?;
     }
     if flags & CONTROL == CONTROL {
         let rsp = g.u64(at + RSP)?;
@@ -208,35 +170,286 @@ pub fn load_context64(g: &mut G<'_>, cx: u64, at: u64) -> R<Option<u64>> {
     Ok(None)
 }
 
-/// Initialise `CONTEXT_EX` after a context without extended state.
-fn init_context_ex(g: &mut G<'_>, context: u64) -> R<()> {
-    let x = context + amd64::CONTEXT_EX;
-    let neg = (-(amd64::SIZE as i32)) as u32;
-    g.w32(x, neg)?; // All.Offset
-    g.w32(x + 4, amd64::SIZE as u32 + 24)?; // All.Length
-    g.w32(x + 8, neg)?; // Legacy.Offset
-    g.w32(x + 12, amd64::SIZE as u32)?; // Legacy.Length
-    g.w32(x + 16, 0)?; // XState.Offset
-    g.w32(x + 20, 25) // XState.Length
+// ---------------------------------------------------------------------------
+// The i386 CONTEXT (winnt.h): FLOATING_SAVE_AREA, then segments, integer
+// and control registers, then the FXSAVE image as `ExtendedRegisters`.
+// ---------------------------------------------------------------------------
+
+pub mod i386 {
+    pub const SIZE: u64 = 0x2cc;
+    pub const CONTEXT_FLAGS: u64 = 0x00;
+    pub const FLOATSAVE: u64 = 0x1c;
+    pub const SEG_GS: u64 = 0x8c;
+    pub const SEG_FS: u64 = 0x90;
+    pub const SEG_ES: u64 = 0x94;
+    pub const SEG_DS: u64 = 0x98;
+    pub const EDI: u64 = 0x9c;
+    pub const ESI: u64 = 0xa0;
+    pub const EBX: u64 = 0xa4;
+    pub const EDX: u64 = 0xa8;
+    pub const ECX: u64 = 0xac;
+    pub const EAX: u64 = 0xb0;
+    pub const EBP: u64 = 0xb4;
+    pub const EIP: u64 = 0xb8;
+    pub const SEG_CS: u64 = 0xbc;
+    pub const EFLAGS: u64 = 0xc0;
+    pub const ESP: u64 = 0xc4;
+    pub const SEG_SS: u64 = 0xc8;
+    pub const EXTENDED: u64 = 0xcc;
+
+    pub const CONTEXT_I386: u32 = 0x0001_0000;
+    pub const CONTROL: u32 = CONTEXT_I386 | 0x1;
+    pub const INTEGER: u32 = CONTEXT_I386 | 0x2;
+    pub const SEGMENTS: u32 = CONTEXT_I386 | 0x4;
+    pub const FLOATING_POINT: u32 = CONTEXT_I386 | 0x8;
+    pub const DEBUG_REGISTERS: u32 = CONTEXT_I386 | 0x10;
+    pub const EXTENDED_REGISTERS: u32 = CONTEXT_I386 | 0x20;
+    pub const FULL: u32 = CONTROL | INTEGER | SEGMENTS;
+
+    /// Wine's i386 selectors.
+    pub const CS: u16 = 0x23;
+    pub const DS: u16 = 0x2b;
+    pub const FS: u16 = 0x63;
+
+    /// gex register number (hardware order: eax ecx edx ebx esp ebp esi edi)
+    /// → CONTEXT offset.
+    pub const GPR: [u64; 8] = [EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI];
+
+    /// Size of an `EXCEPTION_RECORD`.
+    pub const RECORD_SIZE: u64 = 0x50;
 }
 
-fn need_p64(c: &Call<'_>, what: &str) -> R<()> {
-    if c.p.abi != Abi::P64 {
-        return Err(c.unimplemented(&format!("{what} for a 32-bit process (N3)")));
+/// The FXSAVE image of the gex context's x87 and SSE state at `f` (the
+/// x86-64 CONTEXT's `FltSave` and the i386 CONTEXT's `ExtendedRegisters`
+/// have this layout). `xmm` registers are written.
+fn save_fxsave(g: &mut G<'_>, cx: u64, f: u64, xmm: u8) -> R<()> {
+    let mxcsr = g.u32(cx + ctx::MXCSR as u64)?;
+    let cw = g.u16(cx + ctx::X87_CW as u64)?;
+    let top = g.u32(cx + ctx::X87_TOP as u64)? & 7;
+    let sw = g.u16(cx + ctx::X87_SW as u64)? & !(7 << 11) | (top as u16) << 11;
+    let tags = g.u16(cx + ctx::X87_TAGS as u64)? as u8;
+    g.w16(f, cw)?;
+    g.w16(f + 2, sw)?;
+    g.w8(f + 4, tags)?;
+    g.w32(f + 0x18, mxcsr)?;
+    g.w32(f + 0x1c, 0xffff)?;
+    for i in 0..8u64 {
+        let phys = (top as u64 + i) & 7;
+        let v = x87_read_f80(g, cx, phys)?;
+        g.write(f + 0x20 + 16 * i, &v)?;
+    }
+    for i in 0..xmm {
+        let v = g.bytes(cx + ctx::v(i) as u64, 16)?;
+        g.write(f + 0xa0 + 16 * i as u64, &v)?;
     }
     Ok(())
 }
 
+/// The inverse of [`save_fxsave`].
+fn load_fxsave(g: &mut G<'_>, cx: u64, f: u64, xmm: u8) -> R<()> {
+    let mxcsr = g.u32(f + 0x18)?;
+    g.w32(cx + ctx::MXCSR as u64, mxcsr)?;
+    let cw = g.u16(f)?;
+    let sw = g.u16(f + 2)?;
+    let tags = g.u8(f + 4)?;
+    let top = ((sw >> 11) & 7) as u64;
+    g.w16(cx + ctx::X87_CW as u64, cw)?;
+    g.w16(cx + ctx::X87_SW as u64, sw & !(7 << 11))?;
+    g.w32(cx + ctx::X87_TOP as u64, top as u32)?;
+    g.w16(cx + ctx::X87_TAGS as u64, tags as u16)?;
+    for i in 0..8u64 {
+        let b = g.bytes(f + 0x20 + 16 * i, 10)?;
+        x87_write_f80(g, cx, (top + i) & 7, &b)?;
+    }
+    for i in 0..xmm {
+        let v = g.bytes(f + 0xa0 + 16 * i as u64, 16)?;
+        g.write(cx + ctx::v(i) as u64, &v)?;
+    }
+    Ok(())
+}
+
+/// The gex register state of a 32-bit thread as an i386 CONTEXT at `at`
+/// (`CONTEXT_FULL | FLOATING_POINT | EXTENDED_REGISTERS`).
+pub fn save_context32(g: &mut G<'_>, cx: u64, at: u64, eip: u64) -> R<()> {
+    use i386::*;
+    g.zero(at, SIZE as usize)?;
+    g.w32(at + CONTEXT_FLAGS, FULL | FLOATING_POINT | EXTENDED_REGISTERS)?;
+    for (i, &o) in GPR.iter().enumerate() {
+        let v = g.u64(cx + ctx::x(i as u8) as u64)?;
+        g.w32(at + o, v as u32)?;
+    }
+    g.w32(at + EIP, eip as u32)?;
+    let fl = read_eflags(g, cx)?;
+    g.w32(at + EFLAGS, fl)?;
+    g.w32(at + SEG_CS, CS as u32)?;
+    for o in [SEG_DS, SEG_ES, SEG_SS] {
+        g.w32(at + o, DS as u32)?;
+    }
+    g.w32(at + SEG_FS, FS as u32)?;
+    // FLOATING_SAVE_AREA (FNSAVE layout): control, status, full tag word,
+    // then the eight registers in stack order, 10 bytes each.
+    let f = at + FLOATSAVE;
+    let cw = g.u16(cx + ctx::X87_CW as u64)?;
+    let top = g.u32(cx + ctx::X87_TOP as u64)? & 7;
+    let sw = g.u16(cx + ctx::X87_SW as u64)? & !(7 << 11) | (top as u16) << 11;
+    let valid = g.u16(cx + ctx::X87_TAGS as u64)? as u8;
+    let mut tw = 0u32;
+    for phys in 0..8 {
+        if valid & (1 << phys) == 0 {
+            tw |= 3 << (2 * phys);
+        }
+    }
+    g.w32(f, 0xffff_0000 | cw as u32)?;
+    g.w32(f + 4, 0xffff_0000 | sw as u32)?;
+    g.w32(f + 8, 0xffff_0000 | tw)?;
+    for i in 0..8u64 {
+        let v = x87_read_f80(g, cx, (top as u64 + i) & 7)?;
+        g.write(f + 0x1c + 10 * i, &v)?;
+    }
+    save_fxsave(g, cx, at + EXTENDED, 8)
+}
+
+/// Load an i386 CONTEXT at `at` into the gex context at `cx`, honouring its
+/// flags. Returns the new eip (or `None` without `CONTEXT_CONTROL`).
+pub fn load_context32(g: &mut G<'_>, cx: u64, at: u64) -> R<Option<u64>> {
+    use i386::*;
+    let flags = g.u32(at + CONTEXT_FLAGS)?;
+    if flags & INTEGER == INTEGER {
+        for (i, &o) in GPR.iter().enumerate() {
+            if o == ESP || o == EBP {
+                continue;
+            }
+            let v = g.u32(at + o)?;
+            g.w64(cx + ctx::x(i as u8) as u64, v as u64)?;
+        }
+    }
+    if flags & EXTENDED_REGISTERS == EXTENDED_REGISTERS {
+        load_fxsave(g, cx, at + EXTENDED, 8)?;
+    } else if flags & FLOATING_POINT == FLOATING_POINT {
+        let f = at + FLOATSAVE;
+        let cw = g.u32(f)? as u16;
+        let sw = g.u32(f + 4)? as u16;
+        let tw = g.u32(f + 8)?;
+        let top = ((sw >> 11) & 7) as u64;
+        let mut valid = 0u16;
+        for phys in 0..8 {
+            if (tw >> (2 * phys)) & 3 != 3 {
+                valid |= 1 << phys;
+            }
+        }
+        g.w16(cx + ctx::X87_CW as u64, cw)?;
+        g.w16(cx + ctx::X87_SW as u64, sw & !(7 << 11))?;
+        g.w32(cx + ctx::X87_TOP as u64, top as u32)?;
+        g.w16(cx + ctx::X87_TAGS as u64, valid)?;
+        for i in 0..8u64 {
+            let b = g.bytes(f + 0x1c + 10 * i, 10)?;
+            x87_write_f80(g, cx, (top + i) & 7, &b)?;
+        }
+    }
+    if flags & CONTROL == CONTROL {
+        let esp = g.u32(at + ESP)?;
+        let ebp = g.u32(at + EBP)?;
+        g.w64(cx + ctx::x(4) as u64, esp as u64)?;
+        g.w64(cx + ctx::x(5) as u64, ebp as u64)?;
+        let fl = g.u32(at + EFLAGS)?;
+        write_eflags(g, cx, fl)?;
+        let eip = g.u32(at + EIP)? as u64;
+        g.w64(cx + ctx::PC as u64, eip)?;
+        return Ok(Some(eip));
+    }
+    Ok(None)
+}
+
+/// The size of a CONTEXT for the ABI.
+fn context_size(abi: Abi) -> u64 {
+    match abi {
+        Abi::P64 => amd64::SIZE,
+        Abi::P32 => i386::SIZE,
+    }
+}
+
+/// The thread's state as a CONTEXT of the process's ABI at `at`.
+pub fn save_context(g: &mut G<'_>, cx: u64, at: u64, pc: u64) -> R<()> {
+    match g.abi {
+        Abi::P64 => save_context64(g, cx, at, pc),
+        Abi::P32 => save_context32(g, cx, at, pc),
+    }
+}
+
+/// Load a CONTEXT of the process's ABI; the new pc if it had one.
+pub fn load_context(g: &mut G<'_>, cx: u64, at: u64) -> R<Option<u64>> {
+    match g.abi {
+        Abi::P64 => load_context64(g, cx, at),
+        Abi::P32 => load_context32(g, cx, at),
+    }
+}
+
+/// Set a CONTEXT's stack pointer and result register.
+fn context_set(g: &mut G<'_>, at: u64, sp: Option<u64>, ax: Option<u64>) -> R<()> {
+    match g.abi {
+        Abi::P64 => {
+            if let Some(v) = sp {
+                g.w64(at + amd64::RSP, v)?;
+            }
+            if let Some(v) = ax {
+                g.w64(at + amd64::RAX, v)?;
+            }
+        }
+        Abi::P32 => {
+            if let Some(v) = sp {
+                g.w32(at + i386::ESP, v as u32)?;
+            }
+            if let Some(v) = ax {
+                g.w32(at + i386::EAX, v as u32)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn context_pc(g: &G<'_>, at: u64) -> R<u64> {
+    match g.abi {
+        Abi::P64 => g.u64(at + amd64::RIP),
+        Abi::P32 => g.u32(at + i386::EIP).map(u64::from),
+    }
+}
+
+fn context_sp(g: &G<'_>, at: u64) -> R<u64> {
+    match g.abi {
+        Abi::P64 => g.u64(at + amd64::RSP),
+        Abi::P32 => g.u32(at + i386::ESP).map(u64::from),
+    }
+}
+
+fn set_context_pc(g: &mut G<'_>, at: u64, pc: u64) -> R<()> {
+    match g.abi {
+        Abi::P64 => g.w64(at + amd64::RIP, pc),
+        Abi::P32 => g.w32(at + i386::EIP, pc as u32),
+    }
+}
+
+/// Initialise `CONTEXT_EX` after a context without extended state (Wine's
+/// `context_init_xstate(context, NULL)`).
+fn init_context_ex(g: &mut G<'_>, context: u64) -> R<()> {
+    let size = context_size(g.abi);
+    let x = context + size;
+    let neg = (-(size as i32)) as u32;
+    g.w32(x, neg)?; // All.Offset
+    g.w32(x + 4, size as u32 + 24)?; // All.Length
+    g.w32(x + 8, neg)?; // Legacy.Offset
+    g.w32(x + 12, size as u32)?; // Legacy.Length
+    g.w32(x + 16, 0)?; // XState.Offset
+    g.w32(x + 20, 25) // XState.Length
+}
+
 /// `NtContinue(context, alertable)`.
 pub fn nt_continue(c: &mut Call<'_>) -> R {
-    need_p64(c, "NtContinue")?;
     let (at, alertable) = (c.a(0), c.a32(1) & 0xff != 0);
     continue_to(c, at, alertable)
 }
 
 /// `NtContinueEx(context, KCONTINUE_ARGUMENT * or BOOLEAN)`.
 pub fn nt_continue_ex(c: &mut Call<'_>) -> R {
-    need_p64(c, "NtContinueEx")?;
     let (at, arg) = (c.a(0), c.a(1));
     // A pointer to KCONTINUE_ARGUMENT {type, flags, reserved}, or a small
     // BOOLEAN, as Wine accepts.
@@ -251,62 +464,84 @@ pub fn nt_continue_ex(c: &mut Call<'_>) -> R {
 
 fn continue_to(c: &mut Call<'_>, at: u64, alertable: bool) -> R {
     let cx = c.t.ctx_addr;
-    let rip = load_context64(&mut c.g, cx, at)?;
-    let rip = match rip {
+    let pc = match load_context(&mut c.g, cx, at)? {
         Some(r) => r,
         None => c.g.u64(cx + ctx::PC as u64)?,
     };
+    c.outcome = Some(Outcome::Resume(pc));
     if alertable && !c.t.apcs.lock().unwrap().is_empty() {
         // Deliver on top of the context just loaded.
-        c.outcome = Some(Outcome::Resume(rip));
-        deliver_apc_at(c, rip, st::SUCCESS, false)?;
-        return Ok(st::SUCCESS);
+        deliver_apc_at(c, pc, st::SUCCESS, false)?;
     }
-    c.outcome = Some(Outcome::Resume(rip));
     Ok(st::SUCCESS)
 }
 
 /// Dispatch an exception into the guest: `KiUserExceptionDispatcher` with
 /// the context and record on the stack (Wine's `exc_stack_layout`).
-pub fn dispatch_exception64(c: &mut Call<'_>, rec: &[u8], context: u64) -> R<()> {
+pub fn dispatch_exception(c: &mut Call<'_>, rec: &[u8], context: u64) -> R<()> {
     let cx = c.t.ctx_addr;
-    let rsp = c.g.u64(context + amd64::RSP)?;
-    let stack = (rsp - 0x5c0) & !63;
-    let ctx_bytes = c.g.bytes(context, amd64::SIZE as usize)?;
-    c.g.write(stack, &ctx_bytes)?;
-    init_context_ex(&mut c.g, stack)?;
-    c.g.write(stack + 0x4f0, rec)?;
-    // EXCEPTION_BREAKPOINT reports the int3's own address.
+    let abi = c.p.abi;
+    let sp = context_sp(&c.g, context)?;
+    let size = context_size(abi);
+    let ctx_bytes = c.g.bytes(context, size as usize)?;
     let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
+    let (frame, ctx_at) = match abi {
+        Abi::P64 => {
+            let frame = (sp - 0x5c0) & !63;
+            c.g.write(frame, &ctx_bytes)?;
+            c.g.write(frame + 0x4f0, rec)?;
+            (frame, frame)
+        }
+        // rec_ptr, context_ptr, EXCEPTION_RECORD, CONTEXT, CONTEXT_EX.
+        Abi::P32 => {
+            let frame = (sp - 0x340) & !63;
+            c.g.w32(frame, (frame + 8) as u32)?;
+            c.g.w32(frame + 4, (frame + 0x58) as u32)?;
+            c.g.write(frame + 8, rec)?;
+            c.g.write(frame + 0x58, &ctx_bytes)?;
+            (frame, frame + 0x58)
+        }
+    };
+    init_context_ex(&mut c.g, ctx_at)?;
+    // EXCEPTION_BREAKPOINT reports the int3's own address.
     if code == st::BREAKPOINT {
-        let rip = c.g.u64(stack + amd64::RIP)?;
-        c.g.w64(stack + amd64::RIP, rip.wrapping_sub(1))?;
+        let pc = context_pc(&c.g, ctx_at)?;
+        set_context_pc(&mut c.g, ctx_at, pc.wrapping_sub(1))?;
     }
-    let rip = c.g.u64(stack + amd64::RIP)?;
-    c.g.w64(stack + 0x590, rip)?; // machine_frame.rip
-    c.g.w64(stack + 0x590 + 24, rsp)?; // machine_frame.rsp
+    if abi == Abi::P64 {
+        let pc = context_pc(&c.g, ctx_at)?;
+        c.g.w64(frame + 0x590, pc)?; // machine_frame.rip
+        c.g.w64(frame + 0x590 + 24, sp)?; // machine_frame.rsp
+    }
     // Load the context as the thread's state (the dispatcher reads it back
-    // from the stack), then point rsp at the frame.
-    load_context64(&mut c.g, cx, context)?;
-    c.g.w64(cx + ctx::x(4) as u64, stack)?;
+    // from the stack), then point the stack at the frame.
+    load_context(&mut c.g, cx, context)?;
+    c.g.w64(cx + ctx::x(4) as u64, frame)?;
     let entry = c.p.ntdll.lock().unwrap().ki_user_exception_dispatcher;
     c.g.w64(cx + ctx::PC as u64, entry)?;
     c.outcome = Some(Outcome::Resume(entry));
     Ok(())
 }
 
+/// Size of an `EXCEPTION_RECORD` for the ABI.
+pub fn record_size(abi: Abi) -> u64 {
+    match abi {
+        Abi::P64 => 0x98,
+        Abi::P32 => i386::RECORD_SIZE,
+    }
+}
+
 /// `NtRaiseException(record, context, first_chance)`.
 pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
-    need_p64(c, "NtRaiseException")?;
     let (rec_p, context, first) = (c.a(0), c.a(1), c.a32(2) & 0xff != 0);
-    let rec = c.g.bytes(rec_p, 0x98)?;
+    let rec = c.g.bytes(rec_p, record_size(c.p.abi) as usize)?;
     if first {
-        dispatch_exception64(c, &rec, context)?;
+        dispatch_exception(c, &rec, context)?;
         return Ok(st::SUCCESS);
     }
     // Second chance: nothing handled it. Wine terminates the process.
     let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
-    let addr = u64::from_le_bytes(rec[16..24].try_into().unwrap());
+    let addr = c.g.ptr(rec_p + 2 * 4 + c.g.psize())?;
     eprintln!("gex-nt: unhandled exception {code:#010x} at {addr:#x}; ending the process");
     terminate_process(c, code);
     Ok(st::SUCCESS)
@@ -316,44 +551,66 @@ pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
 /// as a CONTEXT at `at`.
 fn save_after_syscall(c: &mut Call<'_>, at: u64, status: u32) -> R<u64> {
     let cx = c.t.ctx_addr;
-    let rip = c.g.u64(cx + ctx::PC as u64)?;
-    save_context64(&mut c.g, cx, at, rip)?;
-    c.g.w64(at + amd64::RAX, status as u64)?;
-    Ok(rip)
+    let pc = c.g.u64(cx + ctx::PC as u64)?;
+    save_context(&mut c.g, cx, at, pc)?;
+    context_set(&mut c.g, at, None, Some(status as u64))?;
+    Ok(pc)
 }
 
 /// Deliver one queued user APC: `KiUserApcDispatcher` with Wine's
 /// `apc_stack_layout`. The interrupted state is the syscall's return with
 /// `STATUS_USER_APC`.
 pub fn deliver_apc(c: &mut Call<'_>) -> R<()> {
-    need_p64(c, "APC delivery")?;
     let cx = c.t.ctx_addr;
-    let rip = c.g.u64(cx + ctx::PC as u64)?;
-    deliver_apc_at(c, rip, st::USER_APC, true)
+    let pc = c.g.u64(cx + ctx::PC as u64)?;
+    deliver_apc_at(c, pc, st::USER_APC, true)
 }
 
-fn deliver_apc_at(c: &mut Call<'_>, rip: u64, status: u32, after_syscall: bool) -> R<()> {
+fn deliver_apc_at(c: &mut Call<'_>, pc: u64, status: u32, after_syscall: bool) -> R<()> {
     let Some(apc) = c.t.apcs.lock().unwrap().pop_front() else { return Ok(()) };
     let cx = c.t.ctx_addr;
-    let rsp = c.g.u64(cx + ctx::x(4) as u64)?;
-    let stack = (rsp & !15) - 0x560;
+    let sp = c.g.u64(cx + ctx::x(4) as u64)?;
+    let (frame, ctx_at) = match c.p.abi {
+        Abi::P64 => {
+            let frame = (sp & !15) - 0x560;
+            (frame, frame)
+        }
+        // func, arg1-3, alertable, CONTEXT, CONTEXT_EX, unk[4].
+        Abi::P32 => {
+            let frame = (sp & !3) - 0x308;
+            (frame, frame + 0x14)
+        }
+    };
     if after_syscall {
-        save_after_syscall(c, stack, status)?;
+        save_after_syscall(c, ctx_at, status)?;
     } else {
-        save_context64(&mut c.g, cx, stack, rip)?;
+        save_context(&mut c.g, cx, ctx_at, pc)?;
     }
-    init_context_ex(&mut c.g, stack)?;
-    // continue_arg: KCONTINUE_RESUME, TEST_ALERT | DELIVER_APC.
-    c.g.zero(stack + 0x4f0, 0x18)?;
-    c.g.w32(stack + 0x4f4, 0x1 | 0x2)?;
-    c.g.w64(stack + amd64::P1HOME, apc.args[0])?;
-    c.g.w64(stack + amd64::P1HOME + 8, apc.args[1])?;
-    c.g.w64(stack + amd64::P1HOME + 16, apc.args[2])?;
-    c.g.w64(stack + amd64::P1HOME + 24, apc.func)?;
-    let saved_rip = c.g.u64(stack + amd64::RIP)?;
-    c.g.w64(stack + 0x530, saved_rip)?;
-    c.g.w64(stack + 0x530 + 24, rsp)?;
-    c.g.w64(cx + ctx::x(4) as u64, stack)?;
+    // The interrupted stack pointer is the caller's, above the frame.
+    init_context_ex(&mut c.g, ctx_at)?;
+    match c.p.abi {
+        Abi::P64 => {
+            // continue_arg: KCONTINUE_RESUME, TEST_ALERT | DELIVER_APC.
+            c.g.zero(frame + 0x4f0, 0x18)?;
+            c.g.w32(frame + 0x4f4, 0x1 | 0x2)?;
+            c.g.w64(frame + amd64::P1HOME, apc.args[0])?;
+            c.g.w64(frame + amd64::P1HOME + 8, apc.args[1])?;
+            c.g.w64(frame + amd64::P1HOME + 16, apc.args[2])?;
+            c.g.w64(frame + amd64::P1HOME + 24, apc.func)?;
+            let saved = c.g.u64(frame + amd64::RIP)?;
+            c.g.w64(frame + 0x530, saved)?;
+            c.g.w64(frame + 0x530 + 24, sp)?;
+        }
+        Abi::P32 => {
+            c.g.w32(frame, apc.func as u32)?;
+            c.g.w32(frame + 4, apc.args[0] as u32)?;
+            c.g.w32(frame + 8, apc.args[1] as u32)?;
+            c.g.w32(frame + 12, apc.args[2] as u32)?;
+            c.g.w32(frame + 16, 1)?; // alertable
+            c.g.zero(frame + 0x2f8, 16)?;
+        }
+    }
+    c.g.w64(cx + ctx::x(4) as u64, frame)?;
     let entry = c.p.ntdll.lock().unwrap().ki_user_apc_dispatcher;
     c.g.w64(cx + ctx::PC as u64, entry)?;
     c.outcome = Some(Outcome::Resume(entry));
@@ -485,6 +742,11 @@ pub fn create_thread_state(
     g.wptr(tl, tl)?;
     g.wptr(tl + g.psize(), tl)?;
     g.w32(t!(CURRENTLOCALE), 0x409)?;
+    if abi == Abi::P32 {
+        // i386 ntdll's NtQueryInformationProcess stub calls through
+        // `%fs:WOW32Reserved`, which Wine points at its syscall dispatcher.
+        g.w32(t!(WOW32RESERVED), super::boot::tramp::SYSCALL_DISPATCHER_32 as u32)?;
+    }
     if abi == Abi::P64 {
         // The TEB32 Wine keeps beside every TEB64.
         let t32 = teb + 0x2000;
@@ -546,7 +808,37 @@ pub fn init_start_frame(p: &Process, g: &mut G<'_>, t: &Thread, entry: u64, arg:
             g.w64(cx + ctx::PC as u64, n.ldr_initialize_thunk)?;
             g.w64(cx + ctx::GS_BASE as u64, t.teb)?;
         }
-        Abi::P32 => return Err(p.unimplemented("starting a 32-bit thread (N3)")),
+        // Wine's i386 `init_syscall_frame`: a CONTEXT below the stack top
+        // starting RtlUserThreadStart with eax = entry, ebx = arg, then
+        // `LdrInitializeThunk(context, 0, 0, 0)` called with a dummy return
+        // address.
+        Abi::P32 => {
+            use i386::*;
+            let esp0 = t.stack.1 - 16;
+            let context = (esp0 & !3) - SIZE;
+            g.zero(context, SIZE as usize)?;
+            g.w32(context + CONTEXT_FLAGS, FULL | FLOATING_POINT | EXTENDED_REGISTERS)?;
+            g.w32(context + EAX, entry as u32)?;
+            g.w32(context + EBX, arg as u32)?;
+            g.w32(context + ESP, esp0 as u32)?;
+            g.w32(context + EIP, n.rtl_user_thread_start as u32)?;
+            g.w32(context + SEG_CS, CS as u32)?;
+            for o in [SEG_DS, SEG_ES, SEG_SS] {
+                g.w32(context + o, DS as u32)?;
+            }
+            g.w32(context + SEG_FS, FS as u32)?;
+            g.w32(context + EFLAGS, 0x202)?;
+            g.w32(context + FLOATSAVE, 0x27f)?;
+            g.w16(context + EXTENDED, 0x27f)?;
+            g.w32(context + EXTENDED + 0x18, 0x1f80)?;
+            let sp = context - 20;
+            g.w32(sp, 0xdead_babe)?;
+            g.w32(sp + 4, context as u32)?;
+            g.zero(sp + 8, 12)?;
+            g.w64(cx + ctx::x(4) as u64, sp)?;
+            g.w64(cx + ctx::PC as u64, n.ldr_initialize_thunk)?;
+            g.w64(cx + ctx::FS_BASE as u64, t.teb)?;
+        }
     }
     g.w64(cx + ctx::TID as u64, t.gex_tid as u64)?;
     g.w32(cx + ctx::SAFEPOINT_COUNTER as u64, 1024)?;
@@ -916,59 +1208,70 @@ pub fn nt_open_process(c: &mut Call<'_>) -> R {
     Ok(st::SUCCESS)
 }
 
-/// `NtGetContextThread(handle, context)`, for the calling thread.
+/// `NtGetContextThread(handle, context)`, for the calling thread: the parts
+/// `ContextFlags` asks for, as the state after this syscall returns.
 pub fn nt_get_context_thread(c: &mut Call<'_>) -> R {
-    need_p64(c, "NtGetContextThread")?;
     let (h, at) = (c.a32(0), c.a(1));
     let t = get_thread(c, h)?;
     if !Arc::ptr_eq(&t, &c.t) {
         return Err(c.unimplemented("NtGetContextThread on another thread"));
     }
-    let flags = c.g.u32(at + amd64::CONTEXT_FLAGS)?;
+    let abi = c.p.abi;
+    let flags = c.g.u32(at)?;
+    let size = context_size(abi);
     let tmp = {
-        // Capture into a scratch copy, then copy the parts asked for.
+        // Capture into a scratch copy below the stack, then copy the parts
+        // asked for.
         let cx = c.t.ctx_addr;
-        let rip = c.g.u64(cx + ctx::PC as u64)?;
-        let mut tmp = vec![0u8; amd64::SIZE as usize];
-        let rsp = c.g.u64(cx + ctx::x(4) as u64)?;
-        let scratch = (rsp - 0x1000 - amd64::SIZE) & !63;
-        save_context64(&mut c.g, cx, scratch, rip)?;
-        c.g.w64(scratch + amd64::RAX, st::SUCCESS as u64)?;
-        tmp.copy_from_slice(&c.g.bytes(scratch, amd64::SIZE as usize)?);
-        tmp
+        let sp = c.g.u64(cx + ctx::x(4) as u64)?;
+        let scratch = (sp - 0x1000 - size) & !63;
+        save_after_syscall(c, scratch, st::SUCCESS)?;
+        c.g.bytes(scratch, size as usize)?
     };
-    let copy = |c: &mut Call<'_>, from: u64, to: u64| c.g.write(at + from, &tmp[from as usize..to as usize]);
-    if flags & amd64::CONTROL == amd64::CONTROL {
-        copy(c, amd64::SEG_CS, amd64::SEG_CS + 2)?;
-        copy(c, amd64::SEG_SS, amd64::EFLAGS + 4)?;
-        copy(c, amd64::RSP, amd64::RSP + 8)?;
-        copy(c, amd64::RIP, amd64::RIP + 8)?;
-    }
-    if flags & amd64::INTEGER == amd64::INTEGER {
-        copy(c, amd64::RAX, amd64::RSP)?;
-        copy(c, amd64::RSP + 8, amd64::RIP)?;
-    }
-    if flags & amd64::SEGMENTS == amd64::SEGMENTS {
-        copy(c, amd64::SEG_DS, amd64::SEG_SS)?;
-    }
-    if flags & amd64::FLOATING_POINT == amd64::FLOATING_POINT {
-        copy(c, amd64::MXCSR, amd64::MXCSR + 4)?;
-        copy(c, amd64::FLTSAVE, amd64::FLTSAVE + 512)?;
+    // (flag, [start, end) ranges) per ABI.
+    let parts: Vec<(u32, Vec<(u64, u64)>)> = match abi {
+        Abi::P64 => {
+            use amd64::*;
+            vec![
+                (CONTROL, vec![(SEG_CS, SEG_CS + 2), (SEG_SS, EFLAGS + 4), (RSP, RSP + 8), (RIP, RIP + 8)]),
+                (INTEGER, vec![(RAX, RSP), (RSP + 8, RIP)]),
+                (SEGMENTS, vec![(SEG_DS, SEG_SS)]),
+                (FLOATING_POINT, vec![(MXCSR, MXCSR + 4), (FLTSAVE, FLTSAVE + 512)]),
+            ]
+        }
+        Abi::P32 => {
+            use i386::*;
+            vec![
+                (CONTROL, vec![(EBP, SEG_SS + 4)]),
+                (INTEGER, vec![(EDI, EBP)]),
+                (SEGMENTS, vec![(SEG_GS, EDI)]),
+                (FLOATING_POINT, vec![(FLOATSAVE, SEG_GS)]),
+                (EXTENDED_REGISTERS, vec![(EXTENDED, SIZE)]),
+                // No debug registers: zeros.
+                (DEBUG_REGISTERS, vec![(4, FLOATSAVE)]),
+            ]
+        }
+    };
+    for (flag, ranges) in parts {
+        if flags & flag == flag {
+            for (from, to) in ranges {
+                c.g.write(at + from, &tmp[from as usize..to as usize])?;
+            }
+        }
     }
     Ok(st::SUCCESS)
 }
 
 /// `NtSetContextThread(handle, context)`, for the calling thread.
 pub fn nt_set_context_thread(c: &mut Call<'_>) -> R {
-    need_p64(c, "NtSetContextThread")?;
     let (h, at) = (c.a32(0), c.a(1));
     let t = get_thread(c, h)?;
     if !Arc::ptr_eq(&t, &c.t) {
         return Err(c.unimplemented("NtSetContextThread on another thread"));
     }
     let cx = c.t.ctx_addr;
-    if let Some(rip) = load_context64(&mut c.g, cx, at)? {
-        c.outcome = Some(Outcome::Resume(rip));
+    if let Some(pc) = load_context(&mut c.g, cx, at)? {
+        c.outcome = Some(Outcome::Resume(pc));
     }
     Ok(st::SUCCESS)
 }

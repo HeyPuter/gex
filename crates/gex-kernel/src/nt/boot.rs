@@ -37,6 +37,15 @@ pub mod tramp {
     /// reach it while `USD.SystemCall` is 0; if anything does, it reports
     /// itself: `mov eax, BAD_DISPATCH; syscall; ud2`.
     pub const SYSCALL_DISPATCHER_64: u64 = TRAMPOLINES + 0x20;
+    /// `__wine_syscall_dispatcher` for i386 (docs/nt-layer.md §7): the stub
+    /// did `mov eax, id; call __wine_syscall`, which jumps here, so the
+    /// arguments are above two return addresses: `int 0x80; ret`.
+    pub const SYSCALL_DISPATCHER_32: u64 = TRAMPOLINES + 0x40;
+    /// `__wine_unix_call_dispatcher` for i386, a stdcall of (handle: u64,
+    /// code, args). The inner `call` gives it the syscall stubs' stack shape
+    /// (two return addresses above the arguments):
+    /// `mov eax, UNIX_CALL; call 1f; ret 16; 1: int 0x80; ret`.
+    pub const UNIX_CALL_32: u64 = TRAMPOLINES + 0x60;
 }
 
 fn trampoline_page() -> Vec<u8> {
@@ -49,6 +58,12 @@ fn trampoline_page() -> Vec<u8> {
     put(&mut page, tramp::UNIX_CALL_64, &[0x4c, 0x8b, 0xd1, 0xb8, n[0], n[1], n[2], n[3], 0x0f, 0x05, 0xc3]);
     let b = super::gex_nr::BAD_DISPATCH.to_le_bytes();
     put(&mut page, tramp::SYSCALL_DISPATCHER_64, &[0xb8, b[0], b[1], b[2], b[3], 0x0f, 0x05, 0x0f, 0x0b]);
+    put(&mut page, tramp::SYSCALL_DISPATCHER_32, &[0xcd, 0x80, 0xc3]);
+    put(
+        &mut page,
+        tramp::UNIX_CALL_32,
+        &[0xb8, n[0], n[1], n[2], n[3], 0xe8, 0x03, 0x00, 0x00, 0x00, 0xc2, 0x10, 0x00, 0xcd, 0x80, 0xc3],
+    );
     page
 }
 
@@ -160,9 +175,6 @@ fn ntdll_exports(img: &PeImage, base: u64) -> Result<(NtdllEntries, [u64; 3]), S
 /// registers are already in its gex context (slot 0).
 pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<'_>) -> Result<u64, String> {
     let abi = p.abi;
-    if abi != Abi::P64 {
-        return Err("32-bit (PE32) programs need the i386 NT ABI (milestone N3), not built yet".into());
-    }
     let sysdir = if abi == Abi::P64 { "system32" } else { "syswow64" };
     let sys = format!("{}/drive_c/windows/{sysdir}", p.cfg.prefix);
 
@@ -203,8 +215,12 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
         section::map_image(p, k, &mut g, &ntdll, 0, &ntdll_path, &ntdll_nt).map_err(st_err("mapping ntdll.dll"))?;
     let (entries, [p_sysdisp, p_unixdisp, p_unixhandle]) = ntdll_exports(&ntdll, ntdll_base)?;
     let w = |g: &mut G<'_>, a: u64, v: u64| g.wptr(a, v).map_err(st_err("writing ntdll's variables"));
-    w(&mut g, p_sysdisp, tramp::SYSCALL_DISPATCHER_64)?;
-    w(&mut g, p_unixdisp, tramp::UNIX_CALL_64)?;
+    let (sysdisp, unixdisp) = match abi {
+        Abi::P64 => (tramp::SYSCALL_DISPATCHER_64, tramp::UNIX_CALL_64),
+        Abi::P32 => (tramp::SYSCALL_DISPATCHER_32, tramp::UNIX_CALL_32),
+    };
+    w(&mut g, p_sysdisp, sysdisp)?;
+    w(&mut g, p_unixdisp, unixdisp)?;
     g.w64(p_unixhandle, super::unixcall::NTDLL_HANDLE).map_err(st_err("writing __wine_unixlib_handle"))?;
     *p.ntdll.lock().unwrap() = entries;
 

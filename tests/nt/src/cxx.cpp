@@ -1,6 +1,6 @@
 // C++ exceptions through the x64 SEH unwinder (libgcc/libunwind on
 // RtlUnwindEx), destructors during unwinding, rethrow, and threads.
-// gex-nt-cc: x86_64-w64-mingw32-g++ -static
+// gex-nt-cc: ARCH-w64-mingw32-g++ -static
 #include <cstdio>
 #include <stdexcept>
 #include <string>

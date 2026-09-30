@@ -82,7 +82,11 @@ pub fn load_unix_lib(c: &mut Call<'_>, class: u32, addr: u64, buf: u64, len: u64
 
 /// The gex-private `UNIX_CALL` syscall: `(handle, code, args)`.
 pub fn dispatch(c: &mut Call<'_>) -> R {
-    let (handle, code, args) = (c.a(0), c.a32(1), c.a(2));
+    // i386: the handle is a 64-bit stdcall argument, two stack slots.
+    let (handle, code, args) = match c.p.abi {
+        Abi::P64 => (c.a(0), c.a32(1), c.a(2)),
+        Abi::P32 => (c.a(0) | c.a(1) << 32, c.a32(2), c.a(3)),
+    };
     if handle == NTDLL_HANDLE {
         return ntdll(c, code, args);
     }

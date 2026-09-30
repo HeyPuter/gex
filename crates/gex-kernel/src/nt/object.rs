@@ -66,6 +66,9 @@ impl Default for Handles {
 /// `NtCurrentProcess()` and `NtCurrentThread()`.
 pub const CURRENT_PROCESS: u32 = 0xffff_ffff;
 pub const CURRENT_THREAD: u32 = 0xffff_fffe;
+pub const CURRENT_PROCESS_TOKEN: u32 = 0xffff_fffc;
+pub const CURRENT_THREAD_TOKEN: u32 = 0xffff_fffb;
+pub const CURRENT_THREAD_EFFECTIVE_TOKEN: u32 = 0xffff_fffa;
 
 impl Handles {
     pub fn insert(&mut self, obj: Obj, access: u32) -> u32 {
@@ -103,6 +106,10 @@ pub fn resolve(c: &Call<'_>, h: u32) -> R<Obj> {
     match h {
         CURRENT_PROCESS => Ok(Obj::Process),
         CURRENT_THREAD => Ok(Obj::Thread(Arc::clone(&c.t))),
+        // GetCurrentProcessToken, GetCurrentThreadToken,
+        // GetCurrentThreadEffectiveToken: no thread impersonates, so all
+        // three are the process's token.
+        CURRENT_PROCESS_TOKEN | CURRENT_THREAD_TOKEN | CURRENT_THREAD_EFFECTIVE_TOKEN => Ok(Obj::Token),
         _ => c
             .p
             .st

@@ -1,7 +1,7 @@
 /* User APCs: queued to this thread and to another, delivered only in
  * alertable waits (SleepEx, WaitForSingleObjectEx), and alertable waits that
  * return WAIT_IO_COMPLETION.
- * gex-nt-cc: clang --target=x86_64-w64-mingw32 -fms-extensions -fuse-ld=lld */
+ * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
 
