@@ -368,6 +368,8 @@ pub struct Process {
     pub sync_id: u64,
     pub unix: unixcall::Registry,
     pub atoms: Mutex<sysinfo::Atoms>,
+    /// Threads blocked on keyed events.
+    pub keyed: Mutex<sync::Keyed>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
@@ -430,6 +432,7 @@ impl Process {
             sync_id: 1,
             unix: unixcall::Registry::default(),
             atoms: Mutex::new(Default::default()),
+            keyed: Mutex::new(Default::default()),
             kill_list: Mutex::new(Vec::new()),
         }
     }
@@ -570,6 +573,54 @@ pub fn syscall_name(nr: u32) -> String {
     }
 }
 
+/// A processor exception in translated code (`int3`, an instruction gex
+/// cannot run, a branch to memory that is not executable), delivered as an
+/// NT exception the way Wine's signal handlers do: a CONTEXT of the faulting
+/// state and a record, then `KiUserExceptionDispatcher`. `rip` is the pc the
+/// context reports (after the `int3` for a breakpoint, which the dispatch
+/// adjusts); `info` fills `ExceptionInformation`.
+pub fn hardware_exception(
+    p: &Arc<Process>,
+    kernel: &Mutex<Kernel>,
+    data: &mut [u8],
+    ctx_addr: u64,
+    code: u32,
+    rip: u64,
+    info: &[u64],
+) -> Outcome {
+    let g = G::new(data, p.abi);
+    let Some(t) = p.thread_by_ctx(ctx_addr) else {
+        eprintln!("gex-nt: exception {code:#x} in a thread the NT layer does not know (ctx {ctx_addr:#x})");
+        return Outcome::Exit(code);
+    };
+    if p.abi != Abi::P64 {
+        eprintln!("gex-nt: exception {code:#x} at {rip:#x} in a 32-bit process (N3)");
+        return Outcome::Exit(code);
+    }
+    let mut c = Call { p, t, kernel, g, nr: 0, pc: rip, outcome: None };
+    let r = (|| -> R<()> {
+        let rsp = c.g.u64(ctx_addr + ctx::x(4) as u64)?;
+        let context = ((rsp - 0x5c0) & !63) - 0x600;
+        thread::save_context64(&mut c.g, ctx_addr, context, rip)?;
+        let mut rec = vec![0u8; 0x98];
+        rec[0..4].copy_from_slice(&code.to_le_bytes());
+        let addr = if code == st::BREAKPOINT { rip - 1 } else { rip };
+        rec[16..24].copy_from_slice(&addr.to_le_bytes());
+        rec[24..28].copy_from_slice(&(info.len() as u32).to_le_bytes());
+        for (i, v) in info.iter().enumerate() {
+            rec[32 + 8 * i..40 + 8 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        thread::dispatch_exception64(&mut c, &rec, context)
+    })();
+    match (r, c.outcome.take()) {
+        (Ok(()), Some(o)) => o,
+        (r, _) => {
+            eprintln!("gex-nt: could not dispatch exception {code:#x} at {rip:#x}: {r:?}");
+            Outcome::Exit(code)
+        }
+    }
+}
+
 /// Handle one syscall from an NT process. `data` is the whole guest memory.
 pub fn syscall(p: &Arc<Process>, kernel: &Mutex<Kernel>, data: &mut [u8], ctx_addr: u64, pc: u64) -> Outcome {
     let abi = p.abi;
@@ -597,7 +648,16 @@ pub fn syscall(p: &Arc<Process>, kernel: &Mutex<Kernel>, data: &mut [u8], ctx_ad
         eprintln!("[nt:{:x}] {} -> {status:#010x}", c.t.tid, c.name());
     }
     if UNIMPLEMENTED_STRICT.load(Ordering::Relaxed) {
+        // The whole process ends, not just this thread: the others notice at
+        // their next syscall, or are woken from a wait to notice.
+        let mut c = c;
+        thread::terminate_process(&mut c, st::NOT_IMPLEMENTED);
         return Outcome::Exit(st::NOT_IMPLEMENTED);
+    }
+    // Another thread ended the process while this call ran (a wait woken
+    // for the purpose returns here).
+    if p.terminating.load(Ordering::Acquire) && !matches!(c.outcome, Some(Outcome::Exit(_))) {
+        return Outcome::Exit(p.exit_code.load(Ordering::Acquire));
     }
     match c.outcome.take() {
         Some(o @ (Outcome::Resume(_) | Outcome::Exit(_) | Outcome::ThreadExit | Outcome::CallbackReturn)) => o,
@@ -634,6 +694,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtDuplicateObject => object::nt_duplicate_object(c),
         n::NtOpenDirectoryObject => object::nt_open_directory_object(c),
         n::NtQueryObject => object::nt_query_object(c),
+        n::NtSetInformationObject => object::nt_set_information_object(c),
         n::NtOpenSymbolicLinkObject => object::nt_open_symbolic_link_object(c),
         // -- files -----------------------------------------------------------
         n::NtCreateFile => file::nt_create_file(c),
@@ -673,11 +734,14 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtOpenSemaphore => sync::nt_open_semaphore(c),
         n::NtReleaseSemaphore => sync::nt_release_semaphore(c),
         n::NtCreateKeyedEvent => sync::nt_create_keyed_event(c),
+        n::NtWaitForKeyedEvent => sync::nt_wait_for_keyed_event(c),
+        n::NtReleaseKeyedEvent => sync::nt_release_keyed_event(c),
         n::NtWaitForSingleObject => sync::nt_wait_for_single_object(c),
         n::NtWaitForMultipleObjects => sync::nt_wait_for_multiple_objects(c),
         n::NtSignalAndWaitForSingleObject => sync::nt_signal_and_wait_for_single_object(c),
         n::NtWaitForAlertByThreadId => sync::nt_wait_for_alert_by_thread_id(c),
         n::NtAlertThreadByThreadId => sync::nt_alert_thread_by_thread_id(c),
+        n::NtAlertMultipleThreadByThreadId => sync::nt_alert_multiple_thread_by_thread_id(c),
         n::NtDelayExecution => sync::nt_delay_execution(c),
         n::NtYieldExecution => sync::nt_yield_execution(c),
         n::NtTestAlert => thread::nt_test_alert(c),

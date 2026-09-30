@@ -320,13 +320,62 @@ pub fn nt_wait_for_alert_by_thread_id(c: &mut Call<'_>) -> R {
     }
 }
 
+/// Alert thread `tid`. A thread that has already exited has nobody left to
+/// wake; Wine's table answers that the same way, since its entries outlive
+/// their threads.
+fn alert(c: &mut Call<'_>, tid: u32) {
+    if let Some(t) = c.p.thread_by_tid(tid) {
+        t.alerted.store(true, std::sync::atomic::Ordering::Release);
+        wake_thread(c, &t);
+    }
+}
+
 /// `NtAlertThreadByThreadId(tid)`.
 pub fn nt_alert_thread_by_thread_id(c: &mut Call<'_>) -> R {
     let tid = c.a32(0);
-    let t = c.p.thread_by_tid(tid).ok_or(Status(st::INVALID_CID))?;
-    t.alerted.store(true, std::sync::atomic::Ordering::Release);
-    wake_thread(c, &t);
+    alert(c, tid);
     Ok(st::SUCCESS)
+}
+
+/// `NtAlertMultipleThreadByThreadId(tids, count, unk1, unk2)`: what
+/// `WakeAllConditionVariable` and `WakeByAddressAll` use.
+pub fn nt_alert_multiple_thread_by_thread_id(c: &mut Call<'_>) -> R {
+    let (tp, n, u1, u2) = (c.a(0), c.a32(1), c.a(2), c.a(3));
+    if u1 != 0 || u2 != 0 {
+        return Err(c.unimplemented("NtAlertMultipleThreadByThreadId with its unknown arguments set"));
+    }
+    let ps = c.g.psize();
+    let mut tids = Vec::with_capacity(n as usize);
+    for i in 0..n as u64 {
+        tids.push(c.g.ptr(tp + i * ps)? as u32);
+    }
+    for tid in tids {
+        alert(c, tid);
+    }
+    Ok(st::SUCCESS)
+}
+
+/// A thread ended: every mutant it owns is abandoned, and its waiters get
+/// `WAIT_ABANDONED`.
+pub fn abandon_mutants(c: &mut Call<'_>, tid: u32) {
+    let ids: Vec<u64> = {
+        let mut core = c.p.sync.lock().unwrap();
+        let mut ids = Vec::new();
+        for (&id, s) in core.states.iter_mut() {
+            if let SState::Mutant { owner, count, abandoned } = s {
+                if *owner == tid {
+                    *owner = 0;
+                    *count = 0;
+                    *abandoned = true;
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    };
+    for id in ids {
+        changed(c, id);
+    }
 }
 
 /// `NtDelayExecution(alertable, timeout)`.
@@ -582,11 +631,119 @@ pub fn nt_release_semaphore(c: &mut Call<'_>) -> R {
     Ok(st::SUCCESS)
 }
 
-/// `NtCreateKeyedEvent(*handle, access, attr, flags)`. Creating one is
-/// supported; waiting on one (`NtWaitForKeyedEvent`) is not yet.
+/// `NtCreateKeyedEvent(*handle, access, attr, flags)`. The object is only an
+/// id for [`Keyed`]; waiting on its handle directly never completes, as on
+/// Windows.
 pub fn nt_create_keyed_event(c: &mut Call<'_>) -> R {
     let (hp, access, attr) = (c.a(0), c.a32(1), c.a(2));
     create(c, hp, access, attr, SyncKind::KeyedEvent, SState::Never)
+}
+
+// ---------------------------------------------------------------------------
+// Keyed events: a release and a wait on the same key pair up, whichever
+// comes first blocking until the other arrives.
+// ---------------------------------------------------------------------------
+
+/// One thread blocked in `NtWaitForKeyedEvent` or `NtReleaseKeyedEvent`.
+#[derive(Debug)]
+pub struct KeyedParty {
+    release: bool,
+    thread: Arc<Thread>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Blocked parties by (keyed event id, key). Id 0 is the process's default
+/// keyed event, which a NULL handle names (Wine's `keyed_event`).
+#[derive(Default, Debug)]
+pub struct Keyed {
+    parties: HashMap<(u64, u64), std::collections::VecDeque<KeyedParty>>,
+}
+
+fn keyed(c: &mut Call<'_>, release: bool) -> R {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (h, key, alertable, tp) = (c.a32(0), c.a(1), c.a32(2) & 0xff != 0, c.a(3));
+    if key & 1 != 0 {
+        return Err(Status(st::INVALID_PARAMETER_1));
+    }
+    let id = if h == 0 {
+        0
+    } else {
+        match object::resolve(c, h)? {
+            Obj::Sync(s) if s.kind == SyncKind::KeyedEvent => s.id,
+            _ => return Err(Status(st::OBJECT_TYPE_MISMATCH)),
+        }
+    };
+    let d = deadline(c, tp)?;
+    let t = Arc::clone(&c.t);
+    let done = Arc::new(AtomicBool::new(false));
+    // Pair with a party of the other kind already waiting, or queue.
+    let partner = {
+        let mut k = c.p.keyed.lock().unwrap();
+        let q = k.parties.entry((id, key)).or_default();
+        match q.iter().position(|p| p.release != release) {
+            Some(i) => q.remove(i),
+            None => {
+                let _ = c.g.w32(t.word, 0);
+                q.push_back(KeyedParty { release, thread: Arc::clone(&t), done: Arc::clone(&done) });
+                None
+            }
+        }
+    };
+    if let Some(p) = partner {
+        p.done.store(true, Ordering::Release);
+        wake_thread(c, &p.thread);
+        return Ok(st::SUCCESS);
+    }
+    let unqueue = |c: &mut Call<'_>| -> bool {
+        // False if a partner took this party meanwhile.
+        let mut k = c.p.keyed.lock().unwrap();
+        let Some(q) = k.parties.get_mut(&(id, key)) else { return false };
+        match q.iter().position(|p| Arc::ptr_eq(&p.done, &done)) {
+            Some(i) => {
+                q.remove(i);
+                true
+            }
+            None => false,
+        }
+    };
+    loop {
+        if done.load(Ordering::Acquire) {
+            return Ok(st::SUCCESS);
+        }
+        if alertable && !t.apcs.lock().unwrap().is_empty() && unqueue(c) {
+            super::thread::deliver_apc(c)?;
+            return Ok(st::USER_APC);
+        }
+        if c.p.terminating.load(Ordering::Relaxed) {
+            unqueue(c);
+            return Err(Status(st::THREAD_IS_TERMINATING));
+        }
+        let timeout = match d {
+            None => None,
+            Some(d) => {
+                let now = (c.p.clocks.mono_ns)();
+                if now >= d {
+                    if unqueue(c) {
+                        return Ok(st::TIMEOUT);
+                    }
+                    continue;
+                }
+                Some(Duration::from_nanos(d - now))
+            }
+        };
+        sleep_on_word(c, &t, timeout);
+        let _ = c.g.w32(t.word, 0);
+    }
+}
+
+/// `NtWaitForKeyedEvent(handle, key, alertable, timeout)`.
+pub fn nt_wait_for_keyed_event(c: &mut Call<'_>) -> R {
+    keyed(c, false)
+}
+
+/// `NtReleaseKeyedEvent(handle, key, alertable, timeout)`.
+pub fn nt_release_keyed_event(c: &mut Call<'_>) -> R {
+    keyed(c, true)
 }
 
 /// A thread or process ended: signal waiters on it.

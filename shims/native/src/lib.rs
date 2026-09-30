@@ -2540,6 +2540,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(StopExecution.into())
                 }
                 Ok(false) => {
+                    if caller.data().nt.is_some() {
+                        return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
+                    }
                     // A wild branch is nearly always a bad return address or
                     // function pointer: say where the last indirect branch
                     // was aimed and what the stack holds, so the caller can
@@ -2595,6 +2598,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::ILLEGAL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> Result<()> {
+            if caller.data().nt.is_some() {
+                return nt::fault(&mut caller, nt::Fault::Illegal, pc as u64);
+            }
             let pc = pc as u64;
             let raw = raw as u32;
             let memory = caller
@@ -2666,6 +2672,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 }
                 return Ok(());
+            }
+            if caller.data().nt.is_some() {
+                return nt::fault(&mut caller, nt::Fault::Breakpoint, pc as u64);
             }
             caller.data_mut().exit = Some(Exit::Signal {
                 signal: signal::SIGTRAP,
