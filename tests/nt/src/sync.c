@@ -2,7 +2,7 @@
  * several objects, timeouts, and the futex-based primitives Wine builds on
  * NtWaitForAlertByThreadId: critical sections, SRW locks, condition
  * variables, WaitOnAddress, one-time init. Prints one line per check.
- * gex-nt-cc: clang --target=x86_64-w64-mingw32 -fms-extensions -fuse-ld=lld -lsynchronization */
+ * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld -lsynchronization */
 #include <windows.h>
 #include <stdio.h>
 

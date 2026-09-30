@@ -11,6 +11,7 @@ TEB ClientId.UniqueThread
 TEB ThreadLocalStoragePointer
 TEB Peb
 TEB LastErrorValue
+TEB WOW32Reserved
 TEB CurrentLocale
 TEB ActivationContextStack
 TEB ActivationContextStack.FrameListCache

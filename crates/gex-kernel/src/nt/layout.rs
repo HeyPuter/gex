@@ -13,6 +13,7 @@ pub mod x64 {
         pub const THREADLOCALSTORAGEPOINTER: u64 = 0x58;
         pub const PEB: u64 = 0x60;
         pub const LASTERRORVALUE: u64 = 0x68;
+        pub const WOW32RESERVED: u64 = 0x100;
         pub const CURRENTLOCALE: u64 = 0x108;
         pub const ACTIVATIONCONTEXTSTACK: u64 = 0x290;
         pub const ACTIVATIONCONTEXTSTACK_FRAMELISTCACHE: u64 = 0x298;
@@ -247,6 +248,7 @@ pub mod x86 {
         pub const THREADLOCALSTORAGEPOINTER: u64 = 0x2c;
         pub const PEB: u64 = 0x30;
         pub const LASTERRORVALUE: u64 = 0x34;
+        pub const WOW32RESERVED: u64 = 0xc0;
         pub const CURRENTLOCALE: u64 = 0xc4;
         pub const ACTIVATIONCONTEXTSTACK: u64 = 0x184;
         pub const ACTIVATIONCONTEXTSTACK_FRAMELISTCACHE: u64 = 0x188;

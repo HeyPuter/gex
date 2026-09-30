@@ -562,6 +562,11 @@ impl<'a> Call<'a> {
 }
 
 pub fn syscall_name(nr: u32) -> String {
+    match nr {
+        gex_nr::UNIX_CALL => return "__wine_unix_call".into(),
+        gex_nr::BAD_DISPATCH => return "__wine_syscall_dispatcher".into(),
+        _ => {}
+    }
     let (table, base, label) = if nr < 0x1000 {
         (&sysno::NTDLL_TABLE[..], 0, "ntdll")
     } else {
@@ -593,24 +598,36 @@ pub fn hardware_exception(
         eprintln!("gex-nt: exception {code:#x} in a thread the NT layer does not know (ctx {ctx_addr:#x})");
         return Outcome::Exit(code);
     };
-    if p.abi != Abi::P64 {
-        eprintln!("gex-nt: exception {code:#x} at {rip:#x} in a 32-bit process (N3)");
-        return Outcome::Exit(code);
+    let abi = p.abi;
+    if p.cfg.trace {
+        let r = |o: usize| g.u64(ctx_addr + o as u64).unwrap_or(0);
+        eprintln!(
+            "[nt:{:x}] exception {code:#010x} at {rip:#x} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
+            t.tid,
+            r(ctx::x(4)),
+            r(ctx::LAST_TARGET),
+            r(ctx::LAST_SOURCE)
+        );
     }
     let mut c = Call { p, t, kernel, g, nr: 0, pc: rip, outcome: None };
     let r = (|| -> R<()> {
-        let rsp = c.g.u64(ctx_addr + ctx::x(4) as u64)?;
-        let context = ((rsp - 0x5c0) & !63) - 0x600;
-        thread::save_context64(&mut c.g, ctx_addr, context, rip)?;
-        let mut rec = vec![0u8; 0x98];
-        rec[0..4].copy_from_slice(&code.to_le_bytes());
+        let sp = c.g.u64(ctx_addr + ctx::x(4) as u64)?;
+        let context = ((sp - 0x5c0) & !63) - 0x600;
+        thread::save_context(&mut c.g, ctx_addr, context, rip)?;
+        // EXCEPTION_RECORD: code, flags, record, address, parameter count,
+        // parameters, with pointer-sized fields for the ABI.
+        let ps = abi.ptr_size() as usize;
+        let mut rec = vec![0u8; thread::record_size(abi) as usize];
+        let mut put = |at: usize, v: u64, n: usize| rec[at..at + n].copy_from_slice(&v.to_le_bytes()[..n]);
+        put(0, code as u64, 4);
         let addr = if code == st::BREAKPOINT { rip - 1 } else { rip };
-        rec[16..24].copy_from_slice(&addr.to_le_bytes());
-        rec[24..28].copy_from_slice(&(info.len() as u32).to_le_bytes());
+        put(8 + ps, addr, ps);
+        put(8 + 2 * ps, info.len() as u64, 4);
+        let params = if abi == Abi::P64 { 32 } else { 0x14 };
         for (i, v) in info.iter().enumerate() {
-            rec[32 + 8 * i..40 + 8 * i].copy_from_slice(&v.to_le_bytes());
+            put(params + ps * i, *v, ps);
         }
-        thread::dispatch_exception64(&mut c, &rec, context)
+        thread::dispatch_exception(&mut c, &rec, context)
     })();
     match (r, c.outcome.take()) {
         (Ok(()), Some(o)) => o,
@@ -785,6 +802,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtQueryInformationAtom => sysinfo::nt_query_information_atom(c),
         n::NtAllocateLocallyUniqueId => sysinfo::nt_allocate_locally_unique_id(c),
         n::NtQueryLicenseValue => sysinfo::nt_query_license_value(c),
+        n::NtWow64IsProcessorFeaturePresent => sysinfo::nt_wow64_is_processor_feature_present(c),
         n::NtTraceControl => Err(Status(st::NOT_SUPPORTED)).inspect_err(|_| {
             c.p.unimplemented("NtTraceControl (event tracing)");
         }),
