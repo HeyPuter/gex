@@ -70,11 +70,7 @@ for arch in x64 x86; do
     check $arch/user_win 0 "$allok" "$b/user_win.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" "$b/exitproc.exe"
     # Ends in the top-level exception filter, which exits with 77.
-    seh=(check)
-    # i386 RtlCaptureContext uses fnsave, which the x86 lifter does not
-    # implement yet (x87 stream S14).
-    [ $arch = x86 ] && seh=(xfail "fnsave in RtlCaptureContext")
-    "${seh[@]}" $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$b/seh.exe"
+    check $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$b/seh.exe"
     # Divide errors and hlt: the lifter's div/idiv do not raise #DE yet
     # (S14); hlt raises a general-protection trap.
     xfail "div/idiv #DE traps (S14)" $arch/seh-traps 0 "$allok" "$b/seh.exe" traps
