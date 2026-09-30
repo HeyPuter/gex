@@ -820,6 +820,18 @@ fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bool> {
 /// `.eh_frame`); `summary` gives callee effects to the jump-table resolver
 /// when summaries exist (the second pass, see [`crate::summary::analyze`]).
 pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
+    if image.class32 {
+        // i386 code has 4-byte return addresses and pointers and another
+        // syscall ABI; recovery and summaries assume x86-64's. Nothing is
+        // recovered, so all of it stays tier-1's.
+        eprintln!("gex-xlate: function recovery does not handle i386 code yet; recovering nothing");
+        return Program {
+            functions: BTreeMap::new(),
+            starts: BTreeMap::new(),
+            noreturn: BTreeSet::new(),
+            stats: RecoverStats::default(),
+        };
+    }
     let code = Code::new(image);
     let (mut starts, fdes) = seeds(&code, elf, opts.scan_data);
     let mut lifter = Lifter {
