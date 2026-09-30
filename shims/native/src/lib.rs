@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod lockstep;
 use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_kernel::mem::prot;
@@ -2279,6 +2280,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .read_u64(state.thread.ctx_addr + ctx::x(8) as u64)
                 .unwrap_or(!0);
             watch_check(&gm, pc as u64, state.thread.tid);
+            lockstep::log_entry(&gm, state.thread.ctx_addr, state.thread.tid, pc as u64);
+            if lockstep::fake_syscall(&mut gm, state.thread.ctx_addr) {
+                lockstep::log_result(&gm, state.thread.ctx_addr, state.thread.tid);
+                return Ok(());
+            }
             // A guest that is about to kill itself is the last moment its
             // state means anything. `abort` unwinds nothing, so by the time
             // the process is gone there is no way to ask where it was.
@@ -2385,6 +2391,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     // and it will pick the object up a block at a time.
                     eprintln!("gex: could not recompile {}: {e:#}", m.path);
                 }
+            }
+            {
+                let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
+                lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
             }
             let state = caller.data_mut();
             match outcome {
@@ -2645,6 +2655,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // CNTVCT_EL0. Served from the host clock at the frequency the
                 // guest was told (CNTFRQ), which keeps its arithmetic exact.
                 -3 => {
+                    if let Some(c) = lockstep::counter() {
+                        return c;
+                    }
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default();
