@@ -55,6 +55,27 @@ pub struct Stat {
 }
 
 impl Stat {
+    /// PowerPC's 32-bit `struct stat64` (104 bytes, big-endian): no padding
+    /// after `st_dev`, a 64-bit `st_ino` second, 32-bit times.
+    fn encode_ppc(&self) -> Vec<u8> {
+        use gex_abi::GuestEndian;
+        let mut b = vec![0u8; 104];
+        b[0..8].copy_from_slice(&self.dev.to_ge_bytes());
+        b[8..16].copy_from_slice(&self.ino.to_ge_bytes());
+        b[16..20].copy_from_slice(&self.mode.to_ge_bytes());
+        b[20..24].copy_from_slice(&self.nlink.to_ge_bytes());
+        b[24..28].copy_from_slice(&self.uid.to_ge_bytes());
+        b[28..32].copy_from_slice(&self.gid.to_ge_bytes());
+        b[32..40].copy_from_slice(&self.rdev.to_ge_bytes());
+        b[48..56].copy_from_slice(&self.size.to_ge_bytes());
+        b[56..60].copy_from_slice(&self.blksize.to_ge_bytes());
+        b[64..72].copy_from_slice(&self.blocks.to_ge_bytes());
+        for off in [72usize, 80, 88] {
+            b[off..off + 4].copy_from_slice(&(self.mtime as u32).to_ge_bytes());
+        }
+        b
+    }
+
     /// Serialise into the guest kernel's `struct stat`: 128 bytes on aarch64,
     /// 144 on x86-64, where `st_nlink` widens to 64 bits and precedes
     /// `st_mode` and `st_blksize` is 64 bits.
@@ -65,6 +86,9 @@ impl Stat {
     /// As [`Stat::encode`], or the i386 `struct stat64` (96 bytes, packed to
     /// 4-byte alignment) for a 32-bit process.
     pub fn encode_for(&self, compat: bool) -> Vec<u8> {
+        if gex_abi::PPC {
+            return self.encode_ppc();
+        }
         if compat {
             let mut b = vec![0u8; 96];
             b[0..8].copy_from_slice(&self.dev.to_le_bytes());

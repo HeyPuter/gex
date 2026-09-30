@@ -189,7 +189,6 @@ pub mod nr {
     pub const NOOP_OK: u64 = 0x1004;
 }
 
-/// `*at` calls use this to mean "relative to the current directory".
 /// Hand a system call's result back to the guest: `x0`, or `rax` (both
 /// `x(0)`), or on PowerPC r3 with an error as a positive errno and CR0.SO
 /// set (docs/ppc.md §6). `ret` is the kernel's own convention, `-errno` for
@@ -204,6 +203,7 @@ pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), E
     m.write_u64(ctx_addr + ctx::x(0) as u64, ret)
 }
 
+/// `*at` calls use this to mean "relative to the current directory".
 const AT_FDCWD: i32 = -100;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -1372,7 +1372,14 @@ impl Kernel {
         if flags & clone_flags::SETTLS != 0 {
             // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
             // one's base into %fs.
-            let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
+            // PowerPC's thread pointer is r2.
+            let slot = if gex_abi::PPC {
+                ctx::x(2)
+            } else if self.compat {
+                ctx::TPIDRRO
+            } else {
+                ctx::TPIDR
+            };
             m.write_u64(child + slot as u64, tls)?;
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
@@ -1414,7 +1421,7 @@ impl Kernel {
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
-        let mut a: [u64; 6] = if self.compat {
+        let mut a: [u64; 6] = if self.compat && !gex_abi::PPC {
             let mut a = [0u64; 6];
             for (i, slot) in crate::i386::ARG_SLOTS.iter().enumerate() {
                 a[i] = m.read_u64(self.ctx_addr + *slot as u64).unwrap_or(0) & 0xffff_ffff;
@@ -1438,7 +1445,19 @@ impl Kernel {
         // An x86-64 guest's numbering is translated to the canonical one, and
         // its legacy calls rewritten into the `*at`/extended forms.
         let mut post = crate::i386::Post::None;
-        let n = if gex_abi::X86 && self.compat {
+        let mut ppc_post = crate::ppc::PpcPost::None;
+        let n = if gex_abi::PPC {
+            let (n, p, pp) = crate::ppc::translate(
+                raw & 0xffff_ffff,
+                &mut a,
+                m,
+                self.ctx_addr + ctx::SCRATCH as u64,
+                self.ctx_addr,
+            );
+            post = p;
+            ppc_post = pp;
+            n
+        } else if gex_abi::X86 && self.compat {
             let (n, p) = crate::i386::translate(
                 raw & 0xffff_ffff,
                 &mut a,
@@ -1667,7 +1686,7 @@ impl Kernel {
         }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
-        let outcome = if gex_abi::X86 && n == crate::x86::UNKNOWN {
+        let outcome = if (gex_abi::X86 || gex_abi::PPC) && n == crate::x86::UNKNOWN {
             let before = self.unimplemented.len();
             let r = self.dispatch(m, n, a);
             if self.unimplemented.len() > before {
@@ -1683,6 +1702,9 @@ impl Kernel {
         let ret = match &outcome {
             Ok(r) => match r {
                 Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
+                Ok(v) if ppc_post != crate::ppc::PpcPost::None => {
+                    encode(Ok(crate::ppc::finish(ppc_post, *v)))
+                }
                 _ => encode(*r),
             },
             Err(exit) => {
@@ -2071,11 +2093,11 @@ impl Kernel {
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
             // issuing one raw falls through to ENOSYS below.
-            nr::DUP2 if gex_abi::X86 => self.sys_dup2(a[0] as i32, a[1] as i32),
-            nr::TIME if gex_abi::X86 => self.sys_time(m, a[0]),
-            nr::ALARM if gex_abi::X86 => self.sys_alarm(m, a[0]),
+            nr::DUP2 if gex_abi::X86 || gex_abi::PPC => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::TIME if gex_abi::X86 || gex_abi::PPC => self.sys_time(m, a[0]),
+            nr::ALARM if gex_abi::X86 || gex_abi::PPC => self.sys_alarm(m, a[0]),
             nr::ARCH_PRCTL if gex_abi::X86 => self.sys_arch_prctl(m, a[0], a[1]),
-            nr::NOOP_OK if gex_abi::X86 => Ok(0),
+            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC => Ok(0),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -5627,7 +5649,7 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            if self.compat { "i686" } else { gex_abi::ARCH_NAME },
+            if self.compat && !gex_abi::PPC { "i686" } else { gex_abi::ARCH_NAME },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
