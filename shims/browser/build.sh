@@ -52,7 +52,21 @@ LINK="-C link-arg=--import-memory \
 #
 # Not the default because counting charges every allocation and free, and the
 # runtime translator allocates constantly.
+# `GEX_ARCH=x86` builds the shim (its lifter, its kernel ABI) for an x86-64
+# guest, into `.x86`-infixed artefacts beside the AArch64 ones. The kernel
+# and seed get the same infix; the page picks a set with `?arch=x86`.
+INFIX=""
+ARCH_FEAT=""
+TSUF=""
+GEXC=target/release/gexc
+if [ "${GEX_ARCH:-}" = "x86" ]; then
+    INFIX=".x86"
+    ARCH_FEAT="x86"
+    TSUF="-x86"
+    GEXC=target/x86/release/gexc
+fi
 FEATURES=""
+[ -n "$ARCH_FEAT" ] && FEATURES="--features $ARCH_FEAT"
 # And the same list for the shared build below, which takes `shared-memory`
 # as well and so cannot reuse the `--features` string verbatim.
 #
@@ -62,11 +76,13 @@ FEATURES=""
 # artefact everything runs. The build even said "heap counters on", about the
 # wrong file.
 EXTRA=""
-[ -n "${GEX_HEAP_COUNTERS:-}" ] && { FEATURES="--features heap-counters"; EXTRA=",heap-counters"; }
+[ -n "$ARCH_FEAT" ] && EXTRA=",$ARCH_FEAT"
+[ -n "${GEX_HEAP_COUNTERS:-}" ] && { FEATURES="--features heap-counters${ARCH_FEAT:+,$ARCH_FEAT}"; EXTRA="$EXTRA,heap-counters"; }
 
-OUT=target/wasm32-unknown-unknown/release/gex_browser.wasm
-RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release $FEATURES
-echo "shims/browser: $(stat -c%s "$OUT") bytes${FEATURES:+ (heap counters on)}"
+OUT=target/wasm32-unknown-unknown$TSUF/release/gex_browser.wasm
+RUSTFLAGS="$LINK" cargo build -p gex-browser --target wasm32-unknown-unknown --release $FEATURES --target-dir target${TSUF:+/x86-browser}
+[ -n "$TSUF" ] && OUT=target/x86-browser/wasm32-unknown-unknown/release/gex_browser.wasm
+echo "shims/browser: $(stat -c%s "$OUT") bytes${ARCH_FEAT:+ ($ARCH_FEAT)}${GEX_HEAP_COUNTERS:+ (heap counters on)}"
 
 # Install it where *everything* loads it from, and check it before anything
 # does.
@@ -106,7 +122,7 @@ fi
 if [ -x shims/kernel/build.sh ]; then
     if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
         echo "  kernel: NOT rebuilt (no nightly toolchain) -- imports may not match"
-    elif kerr=$(shims/kernel/build.sh 2>&1); then
+    elif kerr=$(GEX_ARCH="${GEX_ARCH:-}" shims/kernel/build.sh 2>&1); then
         echo "  kernel: rebuilt alongside the shim"
     else
         echo "$kerr" | grep -E "^(error|warning: unused)" -A 6 || echo "$kerr" | tail -20
@@ -120,12 +136,12 @@ fi
 # wedged. Adding one kernel function and rebuilding only the shim cost exactly
 # that, against a kernel seven hours stale; giving one an extra parameter cost
 # it again, against a check that compared names only.
-if [ -f "$PUB/gex_kernel.plain.wasm" ] \
-   && ! node shims/browser/js/check-kernel.mjs "$OUT" "$PUB/gex_kernel.plain.wasm"; then
+if [ -f "$PUB/gex_kernel$INFIX.plain.wasm" ] \
+   && ! node shims/browser/js/check-kernel.mjs "$OUT" "$PUB/gex_kernel$INFIX.plain.wasm"; then
     echo "shims/browser: NOT installed -- the kernel check failed" >&2
     exit 1
 fi
-cp "$OUT" "$PUB/gex_browser.wasm"
+cp "$OUT" "$PUB/gex_browser$INFIX.wasm"
 
 # And the same shim against a *shared* memory, when the toolchain can build
 # one. Two binaries rather than one because a memory import's `shared` flag is
@@ -145,21 +161,22 @@ cp "$OUT" "$PUB/gex_browser.wasm"
 # same way, which is `-Z build-std`. `GEX_NO_SHARED_MEMORY=1` skips it, and a
 # machine without nightly simply does not get the second binary.
 if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | grep -q nightly; then
-    SHARED=target/wasm32-unknown-unknown/release/gex_browser.shared.wasm
+    SHARED=target/wasm32-unknown-unknown/release/gex_browser$INFIX.shared.wasm
     if RUSTFLAGS="$LINK \
         -C link-arg=--shared-memory \
         -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
         cargo +nightly build -p gex-browser --target wasm32-unknown-unknown \
           --release -Z build-std=std,panic_abort --features "shared-memory$EXTRA" \
-          --target-dir target/shared >/dev/null 2>&1; then
-        cp target/shared/wasm32-unknown-unknown/release/gex_browser.wasm "$SHARED"
+          --target-dir target/shared$TSUF >/dev/null 2>&1; then
+        mkdir -p target/wasm32-unknown-unknown/release
+        cp target/shared$TSUF/wasm32-unknown-unknown/release/gex_browser.wasm "$SHARED"
         # And where the page can fetch it.
         #
         # It was built and left in `target/` for as long as the shared build
         # has existed, so the one artifact that lets a guest thread be a
         # Worker was the one artifact the site could not load. The page ran
         # every thread inline instead and nothing said so.
-        cp "$SHARED" "$PUB/gex_browser.shared.wasm"
+        cp "$SHARED" "$PUB/gex_browser$INFIX.shared.wasm"
         echo "shims/browser: $(stat -c%s "$SHARED") bytes (shared memory)"
     else
         # Loudly, and with the reason.
@@ -176,7 +193,7 @@ if [ -z "${GEX_NO_SHARED_MEMORY:-}" ] && rustup toolchain list 2>/dev/null | gre
             -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
             cargo +nightly build -p gex-browser --target wasm32-unknown-unknown \
               --release -Z build-std=std,panic_abort --features "shared-memory$EXTRA" \
-              --target-dir target/shared 2>&1 | grep -E "^error|error:" | head -5
+              --target-dir target/shared$TSUF 2>&1 | grep -E "^error|error:" | head -5
         echo "shims/browser: (if that is 'can't find crate for std', install rust-src)"
     fi
 fi
@@ -193,9 +210,13 @@ fi
 # does not help; `gexc` has to be rebuilt.
 #
 # Cheap: the seed translates nothing and is under two kilobytes.
-cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
-target/release/gexc seed -o web/public/gex/seed.wasm --no-shared-memory >/dev/null
-target/release/gexc seed -o web/public/gex/seed.shared.wasm >/dev/null
+if [ -n "$ARCH_FEAT" ]; then
+    cargo build --release -p gexc --features x86 --target-dir target/x86 2>&1 | grep -E "^error" && exit 1
+else
+    cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
+fi
+$GEXC seed -o web/public/gex/seed$INFIX.wasm --no-shared-memory >/dev/null
+$GEXC seed -o web/public/gex/seed$INFIX.shared.wasm >/dev/null
 echo "  seed: rebuilt from this emitter"
 
 # And the site, which is a copy of public/ and will otherwise keep serving

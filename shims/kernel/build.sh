@@ -20,7 +20,17 @@ cd "$(dirname "$0")/../.."
 # a module built without it will not accept one, whatever its size. That is
 # also what makes the atomics in here real -- the counter and the note are
 # written by different Workers at the same time.
-OUT=target/shared-kernel/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm
+# `GEX_ARCH=x86` builds the kernel for an x86-64 guest (syscall ABI, struct
+# layouts, signal frame) into `.x86`-infixed artefacts beside the AArch64 ones.
+ARCH_FEATURES=""
+INFIX=""
+TDIR=target/shared-kernel
+if [ "${GEX_ARCH:-}" = "x86" ]; then
+    ARCH_FEATURES="--features x86"
+    INFIX=".x86"
+    TDIR=target/shared-kernel-x86
+fi
+OUT=$TDIR/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm
 # A shared memory carries its maximum in its *type*, so the host's memory and
 # this module must agree on it exactly. The linker defaults the maximum to the
 # initial, which would freeze the kernel at its own data size; this is the
@@ -43,7 +53,7 @@ RUSTFLAGS="-C link-arg=--import-memory \
   -C link-arg=--export=__stack_pointer \
   -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
   cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
-    --release -Z build-std=std,panic_abort --target-dir target/shared-kernel
+    --release -Z build-std=std,panic_abort --target-dir $TDIR $ARCH_FEATURES
 # Twice, differing only in whether the *process* memory it reaches into is
 # shared. Its own memory is always shared -- that is the point of it. But a
 # process is shared only between its threads, and a process that is one Worker
@@ -67,8 +77,8 @@ RUSTFLAGS="-C link-arg=--import-memory \
 #
 # A Worker still hands over the guest's memory, which is far larger than one
 # page and satisfies the minimum as it always did.
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.wasm env process 1 1
-node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel.plain.wasm env process 1 0
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel$INFIX.wasm env process 1 1
+node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel$INFIX.plain.wasm env process 1 0
 
 # And the site, which is a copy of public/ and will otherwise keep serving
 # the module that was here a moment ago.

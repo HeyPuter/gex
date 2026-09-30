@@ -67,6 +67,26 @@ function forkTransfer(child) {
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
 import { Gex, Env, utf8 } from './gex.mjs';
+// GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
+if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
+  Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
+}
+
+// Under a block trace at node, keep the trace (the shim's `debug` channel,
+// console.debug -> stdout) on the same stream as the syscall log and the crash
+// report (stderr): two streams interleave arbitrarily and the stdout tail is
+// lost when the process is killed, which hides the very blocks before a crash.
+if (typeof process !== 'undefined' && (process.env?.GEX_TRACE_BLOCKS || process.env?.GEX_SYNC_CONSOLE)) {
+  // Synchronous, too: a Worker's console goes through the main thread
+  // asynchronously, and the megabytes a crashing process traces just before
+  // it is killed never arrive -- the one stretch the trace is for.
+  const fs = await import('node:fs');
+  const sync = (...a) => {
+    try { fs.writeSync(2, a.map((x) => (typeof x === 'string' ? x : String(x))).join(' ') + '\n'); } catch {}
+  };
+  console.error = sync;
+  console.debug = sync;
+}
 
 const port = await channel();
 
@@ -581,6 +601,8 @@ async function handle(msg) {
     if (msg.trace) ex.gex_set_trace?.(1);
     if (msg.wholePage ?? msg.opts?.wholePage) Gex.wholePage = true;
     if (msg.traceMisses) ex.gex_set_trace_misses?.(1);
+    if (msg.traceBlocks) ex.gex_set_trace_blocks?.(1);
+    if (msg.watchMem) ex.gex_set_watch_mem?.(BigInt(msg.watchMem));
     if (msg.checkSp) ex.gex_set_check_sp?.(1);
     // Per-process page numbering on (1, the default) or off (0). Off publishes
     // closure dir entries at the build's slot numbers, which the profile-guided

@@ -11,11 +11,13 @@ path = "src/main.rs"
 
 [dependencies]
 gex-abi.workspace = true
-gex-isa.workspace = true
 gex-ir.workspace = true
-gex-lift.workspace = true
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel"] }
 gex-emit.workspace = true
 gex-native.workspace = true
 anyhow = "1"
+
+[features]
+# Build a gexc for x86-64 guests. See `gex_abi::X86`.
+x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86"]

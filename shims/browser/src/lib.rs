@@ -402,6 +402,41 @@ fn slot_space_top() -> u64 {
 /// process); the mark is raised above them so nothing translated at runtime
 /// lands there; everything after is drawn in kernel-issued chunks, so one
 /// process can install a module another translated without slot collisions.
+/// The code identity of every non-writable mapping with one, as `(start, end,
+/// hasher after the object id, file offset)`: what `page_identity` computes,
+/// prepared so the page table's identity hooks -- which run inside a
+/// translation, with the host borrowed -- can finish the key for a page without
+/// the host. Refreshed before each translation (`refresh_ident_snapshot`).
+static IDENT_SNAPSHOT: SingleThreaded<Vec<(u64, u64, std::collections::hash_map::DefaultHasher, u64, String)>> =
+    SingleThreaded(RefCell::new(Vec::new()));
+
+fn refresh_ident_snapshot(h: &Host) {
+    use std::hash::Hash;
+    let mut snap = Vec::new();
+    for v in h.kernel.mem.vmas().iter() {
+        if v.prot & gex_kernel::mem::prot::WRITE != 0 {
+            continue;
+        }
+        let Some((id, off)) = v.code.as_ref() else { continue };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut hasher);
+        snap.push((v.start, v.end, hasher, *off, id.clone()));
+    }
+    *IDENT_SNAPSHOT.0.borrow_mut() = snap;
+}
+
+/// `page_identity` for a page number, from the snapshot, with the object id
+/// for narration.
+fn snapshot_page_key(page: u64) -> Option<(u64, String)> {
+    use std::hash::{Hash, Hasher};
+    let addr = page * gex_abi::DISPATCH_PAGE;
+    let snap = IDENT_SNAPSHOT.0.borrow();
+    let (start, _, hasher, off, id) = snap.iter().find(|(s, e, _, _, _)| addr >= *s && addr < *e)?;
+    let mut hs = hasher.clone();
+    (off + (addr - start)).hash(&mut hs);
+    Some((hs.finish(), id.clone()))
+}
+
 fn shared_page_table(
     entries: &[(u64, u32)],
     next_slot: u64,
@@ -413,6 +448,36 @@ fn shared_page_table(
     // SAFETY: both take scalars and borrow nothing from this side.
     if unsafe { k_present() } == 0 {
         return table;
+    }
+    // Pages numbered by identity, so every process gives a library page the
+    // same base and the units they store are interchangeable. See `Identity`.
+    // x86-64 only: its byte-granular code makes two processes' numberings
+    // diverge within a few misses; AArch64 keeps its established numbering.
+    if gex_abi::X86 {
+    table.set_identity(std::sync::Arc::new(gex_xlate::Identity {
+        adopt: Box::new(|page| {
+            let (key, id) = snapshot_page_key(page)?;
+            // SAFETY: a lookup in the kernel's own memory, borrowing nothing here.
+            let base = unsafe { k_slot_get(page, key) };
+            if tracing() && base != 0 {
+                trace_line(&format!(
+                    "[gex] page {page:#x} adopts base {base:#x} by identity {id:?} key {key:#x}\n"
+                ));
+            }
+            (base != 0).then_some(base)
+        }),
+        publish: Box::new(|page, entry| {
+            if let Some((key, id)) = snapshot_page_key(page) {
+                if tracing() {
+                    trace_line(&format!(
+                        "[gex] page {page:#x} publishes base {entry:#x} as identity {id:?} key {key:#x}\n"
+                    ));
+                }
+                // SAFETY: as above.
+                unsafe { k_slot_put(page, key, entry) };
+            }
+        }),
+    }));
     }
     unsafe { k_slot_floor(next_slot) };
     table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
@@ -3454,12 +3519,19 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     );
 
     let c = gex_abi::ctx_addr(0) as usize;
+    // Registers first, then the stack pointer: on x86-64 `SP` is one of them.
+    for i in 0..31u8 {
+        write_u64(data, c + ctx::x(i), 0);
+    }
     write_u64(data, c + ctx::SP, layout.sp);
     write_u64(data, c + ctx::PC, program.entry());
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
-    for i in 0..31u8 {
-        write_u64(data, c + ctx::x(i), 0);
+    // The x87 control word and MXCSR at their power-on defaults. (`MXCSR` is
+    // A64's `FPCR` slot, which starts at zero.)
+    if gex_abi::X86 {
+        data[c + ctx::X87_CW..c + ctx::X87_CW + 4].copy_from_slice(&0x37fu32.to_le_bytes());
+        data[c + ctx::MXCSR..c + ctx::MXCSR + 4].copy_from_slice(&0x1f80u32.to_le_bytes());
     }
     if hook != 0 {
         snap_arm(&mut kernel, snap_key_1, &program.exe, program.interp_base());
@@ -5187,14 +5259,16 @@ fn count_syscall() {
     let nr = with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
         let at = h.threads[cur()].kstate.ctx_addr;
-        gm.read_u64(at + ctx::x(8) as u64).unwrap_or(!0)
+        let n = gm.read_u64(at + ctx::SYSCALL_NR as u64).unwrap_or(!0);
+        // Canonical, so the census and the ring name x86-64 calls too.
+        if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n }
     });
     let (a0, a1) = with_host(|h| {
         let gm = GuestMem::new(guest_bytes());
         let at = h.threads[cur()].kstate.ctx_addr;
         (
-            gm.read_u64(at + ctx::x(0) as u64).unwrap_or(0),
-            gm.read_u64(at + ctx::x(1) as u64).unwrap_or(0),
+            gm.read_u64(at + ctx::SYSCALL_ARGS[0] as u64).unwrap_or(0),
+            gm.read_u64(at + ctx::SYSCALL_ARGS[1] as u64).unwrap_or(0),
         )
     });
     let total = unsafe {
@@ -5266,7 +5340,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
-        let n = gm.read_u64(base + ctx::x(8) as u64).unwrap_or(u64::MAX);
+        let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
+        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
         SYSCALL_NR.store(n, std::sync::atomic::Ordering::Relaxed);
         // And a select's arguments, to read the answer back from the guest's
         // own sets afterwards.
@@ -5291,8 +5366,11 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if tracing() {
         let gm = GuestMem::new(guest_bytes());
         let base = with_host(|h| h.threads[cur()].kstate.ctx_addr);
-        let g = |i: usize| gm.read_u64(base + ctx::x(i as u8) as u64).unwrap_or(0);
-        let n = g(8);
+        // The number and arguments where this architecture's ABI puts them;
+        // the number canonicalised so the names below match on x86-64 too.
+        let g = |i: usize| gm.read_u64(base + ctx::SYSCALL_ARGS[i] as u64).unwrap_or(0);
+        let n = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(0);
+        let n = if gex_abi::X86 { gex_kernel::x86::canonical_number(n) } else { n };
         let who = cur();
         // The path, for calls whose meaning is which file: `execve(0x2805ef70)`
         // says a program ran but not which. `openat`'s path is arg 1, the rest
@@ -5331,15 +5409,29 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // syscall. Pins a busy-wait to the code doing it -- gtk3-demo's
         // native-wayland stall spins the main thread on time()/gettimeofday and
         // only the caller says which lock/condition it is polling.
-        let caller = with_host(|h| object_off_at(h, g(30)));
+        // On x86-64 the return address is the word at rsp, not a register
+        // (`g` indexes the six argument slots; 30 would be out of bounds).
+        let ret = if gex_abi::X86 {
+            gm.read_u64(gm.read_u64(base + ctx::SP as u64).unwrap_or(0))
+                .unwrap_or(0)
+        } else {
+            gm.read_u64(base + ctx::x(30) as u64).unwrap_or(0)
+        };
+        let caller = with_host(|h| object_off_at(h, ret));
+        // An unknown call shows its raw number: "unknown" alone cannot be looked up.
+        let raw_nr = gm.read_u64(base + ctx::SYSCALL_NR as u64).unwrap_or(u64::MAX);
+        let name = match gex_kernel::syscalls::syscall_name(n) {
+            "unknown" => format!("unknown#{raw_nr}"),
+            s => s.to_string(),
+        };
         warn_line(&format!(
             "[gex:{whose_pid}] t{who} pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){}{obj} <-{}  ...\n",
-            gex_kernel::syscalls::syscall_name(n),
+            name,
             g(0),
             g(1),
             g(2),
             named.map_or(String::new(), |p| format!(" \"{p}\"")),
-            if caller.is_empty() { format!("{:#x}", g(30)) } else { caller },
+            if caller.is_empty() { format!("{ret:#x}") } else { caller },
         ));
         // For a gather write, what the kernel sees at each iovec: a mismatch
         // with the guest means they disagree about the memory they share.
@@ -5356,12 +5448,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         }
     }
     count_syscall();
+    watch_mem("syscall");
     // Recorded before the kernel is taken, and readable without taking it: a
     // crash inside a syscall leaves the kernel borrowed, so this one number is
     // what survives to narrow a crash to a single handler.
     LAST_SYSCALL.store(
         GuestMem::new(guest_bytes())
-            .read_u64(ctx as u32 as u64 + ctx::x(8) as u64)
+            .read_u64(ctx as u32 as u64 + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0) as u32,
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -5407,9 +5500,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // Rebuilding the proc snapshot costs more than most syscalls, and only
         // a handful can observe it, so the rest skip it.
         let nr = gm
-            .read_u64(kstate.ctx_addr + ctx::x(8) as u64)
+            .read_u64(kstate.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
-        if !gex_kernel::skips_proc_snapshot(nr) {
+        // The raw number: `SNAP_SYSCALL` is compared raw; the proc-snapshot
+        // question wants the canonical one.
+        let canonical = if gex_abi::X86 { gex_kernel::x86::canonical_number(nr) } else { nr };
+        if !gex_kernel::skips_proc_snapshot(canonical) {
             let st = Arc::clone(&h.proc_state);
             h.kernel.refresh_proc(&st.0);
         }
@@ -5744,7 +5840,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // The stack goes back so the host can see the record and
                 // start the Worker, exactly as a `fork` does. The parent
                 // resumes where it was: `clone` returns the tid to it.
-                set_resume(pc as u64 + 4);
+                set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
                 1
             }
@@ -5832,7 +5928,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     gex_kernel::BlockOp::SigSuspend { .. } => Waiting::Runnable,
                 };
                 let t = &mut h.threads[cur()];
-                t.pc = pc as u64 + 4;
+                t.pc = pc as u64 + gex_abi::SYSCALL_INST_BYTES;
                 t.waiting = waiting;
                 t.blocked_on = Some(op);
                 3
@@ -5847,7 +5943,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // is a copy of this memory that must be taken now, when the
                 // stack comes back. Letting the parent run on first copied it
                 // several syscalls later, with a context already saved over.
-                set_resume(pc as u64 + 4);
+                set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
                 1
             }
@@ -5919,7 +6015,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // is a real re-entry that must go out through JS.
         let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
         if picked == 1
-            && resume() == Some(pc as u64 + 4)
+            && resume() == Some(pc as u64 + gex_abi::SYSCALL_INST_BYTES)
             && resume_ctx().unwrap_or(here) == here
         {
             set_resume_none();
@@ -6050,7 +6146,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
     // The parent carries straight on, keeping its memory, threads and tables:
     // the child is a separate Worker and will not use them.
-    h.threads[cur()].pc = pc + 4;
+    h.threads[cur()].pc = pc + gex_abi::SYSCALL_INST_BYTES;
     h.threads[cur()].waiting = Waiting::Runnable;
     h.threads[cur()].blocked_on = None;
 
@@ -6065,7 +6161,7 @@ fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) 
     // fresh kernel starts at `/`, so hand it the parent's cwd to apply in
     // `gex_adopt_child`, or `sh -c 'cd d; make'` builds in the wrong place.
     *FORK_CWD.0.borrow_mut() = h.kernel.vfs.cwd.clone();
-    FORK[1].store(pc + 4, std::sync::atomic::Ordering::Relaxed);
+    FORK[1].store(pc + gex_abi::SYSCALL_INST_BYTES, std::sync::atomic::Ordering::Relaxed);
     FORK[2].store(ctx_addr, std::sync::atomic::Ordering::Relaxed);
     FORK[3].store(child_stack, std::sync::atomic::Ordering::Relaxed);
     FORK[4].store(tls.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
@@ -7020,11 +7116,28 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     FILL_ASKED.0.borrow_mut().clear();
     FILL_FAILED.0.borrow_mut().clear();
     SERVED_PAGE.0.borrow_mut().clear();
+    // And the modules inherited from the parent: they cover the PARENT's pages.
+    // The new program's image sits at the same PIE base, so a page number the
+    // parent's image had is now another program's code; a fill answered from
+    // the inherited module would run the old program's block there (x86 qt6ct
+    // exec'd from dash ran dash's `_init` in qt6ct's address space).
+    if gex_abi::X86 {
+        LAZY_OWNER.0.borrow_mut().clear();
+    }
     // Slots already handed out are never reused, so allocation carries on from
     // the high-water mark. No entries, so `usize::MAX` ("nothing with active
     // segments to place") is true whatever the new program turns out to be.
     h.jit.page_table = shared_page_table(&[], h.jit.page_table.slots(), usize::MAX);
     h.jit.translated.clear();
+    // And whatever was queued for the host to install: a fork copies the
+    // parent's queue, and a module of the OLD program installed after this
+    // point publishes its pages -- the old program's bases for the new
+    // program's addresses (`install-done` wrote dash's base for qt6ct's
+    // `_init` page; the block there was dash's).
+    if gex_abi::X86 {
+        h.jit.pending.clear();
+        publish_pending(h);
+    }
     // Except the closure's: those modules are still in the dispatch tables
     // (`execve` rebuilds the image, not the wasm instance), so the new program
     // gets every library the build covered for nothing. See `CLOSURE_DIRS`.
@@ -7205,13 +7318,19 @@ const SNAP_STUB: u64 = gex_abi::STACK_TOP;
 /// Linux has assigned on aarch64, so no guest can reach it by accident.
 const SNAP_SYSCALL: u64 = 0x6765_7801;
 
-/// `movz x8, #0x7801` / `movk x8, #0x6765, lsl #16` / `svc #0`.
+/// `movz x8, #0x7801` / `movk x8, #0x6765, lsl #16` / `svc #0`, or on
+/// x86-64 `mov eax, 0x67657801` / `syscall`.
 ///
-/// Three instructions and no registers touched but `x8`, which is
-/// caller-saved and which `_start` does not read -- so `x0`, holding the
-/// address of `_dl_fini` that glibc's `__libc_start_main` will register with
-/// `atexit`, arrives at the entry exactly as the linker left it.
-const SNAP_STUB_CODE: [u32; 3] = [0xd28f0028, 0xf2aceca8, 0xd4000001];
+/// No registers touched but the syscall-number one, which is caller-saved
+/// and which `_start` does not read -- so `x0`/`rdx`, holding the address of
+/// `_dl_fini` that glibc's `__libc_start_main` will register with `atexit`,
+/// arrives at the entry exactly as the linker left it. (On x86-64 `_start`
+/// takes `_dl_fini` in `rdx`; `rax` is free.)
+const SNAP_STUB_CODE: &[u8] = if gex_abi::X86 {
+    &[0xb8, 0x01, 0x78, 0x65, 0x67, 0x0f, 0x05]
+} else {
+    &[0x28, 0x00, 0x8f, 0xd2, 0xa8, 0xec, 0xac, 0xf2, 0x01, 0x00, 0x00, 0xd4]
+};
 
 /// Whether to keep the linked image of a program and start the next process
 /// of it from the result.
@@ -7334,9 +7453,7 @@ fn snap_arm(kernel: &mut Kernel, key: u64, exe: &gex_ld::Image, interp_base: u64
     let entry = exe.entry;
     let data = guest_bytes();
     let at = SNAP_STUB as usize;
-    for (i, w) in SNAP_STUB_CODE.iter().enumerate() {
-        data[at + i * 4..at + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
-    }
+    data[at..at + SNAP_STUB_CODE.len()].copy_from_slice(SNAP_STUB_CODE);
     kernel.mem.insert_loaded(
         SNAP_STUB,
         SNAP_STUB + 4096,
@@ -9012,8 +9129,49 @@ pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
     with_host(|h| set_exit(h, 128 + 4));
     trap();
 }
+/// `log2` of the guest bytes one dispatch slot spans (`gex_abi::DISPATCH_SHIFT`).
+/// The glue's slot arithmetic asks rather than assumes, so one `gex.mjs`
+/// serves both shims.
+#[no_mangle]
+pub extern "C" fn gex_inst_align_shift() -> i32 {
+    gex_abi::DISPATCH_SHIFT as i32
+}
+
+/// The per-block register trace (`GEX_TRACE_BLOCKS` natively): every block
+/// translated after this call starts by reporting its pc and registers to the
+/// debug console. Enormous; pipe it to `tail`. The one tool that shows what ran
+/// between two syscalls when the guest lands somewhere wild.
+#[no_mangle]
+pub extern "C" fn gex_set_trace_blocks(on: i32) {
+    gex_xlate::set_trace_blocks(on != 0);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
+    if raw == gex_abi::imports::BRK_TRACE {
+        let line = with_host(|h| {
+            let gm = GuestMem::new(guest_bytes());
+            let c = h.threads[cur()].kstate.ctx_addr;
+            let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
+            if gex_abi::X86 {
+                format!(
+                    "[trace] t{} pc={:#x} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}\n",
+                    cur(), pc as u64,
+                    r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7),
+                    r(8), r(9), r(10), r(11), r(12), r(13), r(14), r(15)
+                )
+            } else {
+                let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+                format!(
+                    "[trace] t{} pc={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x} x19={:#x} x20={:#x} x29={:#x} x30={:#x} sp={sp:#x}\n",
+                    cur(), pc as u64,
+                    r(0), r(1), r(2), r(3), r(8), r(19), r(20), r(29), r(30)
+                )
+            }
+        });
+        trace_line(&line);
+        return;
+    }
     // A diagnostic breakpoint planted at a chosen guest pc: dump the live
     // registers (x30 names the caller) and RETURN so the block runs on. Pointed
     // at __stack_chk_fail, it deterministically names the smashed function --
@@ -9143,7 +9301,14 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     }
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_write(_ctx: i32, _pc: i64, _reg: i32, _val: i64) {}
+pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
+    // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
+    // four results go back into the context.
+    if reg == gex_kernel::x86::SYSREG_CPUID {
+        let mut gm = GuestMem::new(guest_bytes());
+        gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, val as u64);
+    }
+}
 
 /// Cache maintenance. Only `dc zva` does anything, and it must: the lifter
 /// reports a 64-byte block through `DCZID_EL0` and musl's `memset` zeroes whole
@@ -9154,6 +9319,15 @@ static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
+    if op == gex_abi::cache_op::SLOT_CONFLICT {
+        // A block entered for a neighbour sharing its slot: forget the
+        // neighbour so the miss that follows lifts it (with this block as a
+        // mate) into a trampoline. See `gex_abi::DISPATCH_SHIFT`.
+        with_host(|h| {
+            h.jit.translated.remove(&(addr as u64));
+        });
+        return;
+    }
     if op == gex_abi::cache_op::IC_INVALIDATE {
         // Self-modifying / JIT-generated guest code (PCRE2's regex JIT does this)
         // wrote new machine code to a page it had already run, and is flushing
@@ -9258,7 +9432,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
         // single heartbeat sample prints whichever pc was current, which for a
         // loop is the same few addresses and says nothing about the work.
         unsafe {
-            let slot = (pc as u64 as usize >> 2) % HOT_SLOTS;
+            let slot = (pc as u64 as usize >> gex_abi::DISPATCH_SHIFT) % HOT_SLOTS;
             if HOT_PC[slot] == pc as u64 {
                 HOT_N[slot] += 1;
             } else if HOT_N[slot] == 0 {
@@ -9407,9 +9581,53 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// translated ahead of time, and the rest arrives here as needed. The shim
 /// lifts and encodes but cannot compile, so it leaves the module behind and
 /// traps out for JS to instantiate before resuming at the address that missed.
+/// The pc of the most recent dispatch miss, for the host's install check.
+static LAST_MISS_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A guest address to watch (`GEX_WATCH_MEM`): its 8 bytes are re-read at every
+/// syscall and dispatch miss, and a change is reported with what ran between.
+/// For "who wrote this word": a GOT slot that turns into code bytes, say.
+static WATCH_MEM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WATCH_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_set_watch_mem(addr: i64) {
+    WATCH_MEM.store(addr as u64, std::sync::atomic::Ordering::Relaxed);
+    WATCH_LAST.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn watch_mem(where_: &str) {
+    let addr = WATCH_MEM.load(std::sync::atomic::Ordering::Relaxed);
+    if addr == 0 {
+        return;
+    }
+    let now = GuestMem::new(guest_bytes()).read_u64(addr).unwrap_or(u64::MAX - 1);
+    let last = WATCH_LAST.swap(now, std::sync::atomic::Ordering::Relaxed);
+    if now != last {
+        warn_line(&format!(
+            "[watch] pid {} [{addr:#x}] = {now:#x} (was {last:#x}) at {where_}, last syscall {}\n",
+            my_pid(),
+            LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
+        ));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gex_miss_pc() -> i64 {
+    LAST_MISS_PC.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+/// This process's pid, from the static every syscall refreshes.
+#[no_mangle]
+pub extern "C" fn gex_my_pid() -> i32 {
+    my_pid()
+}
+
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
+    LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+    watch_mem("miss");
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
         // did not come back from, and a line printed after never appears.
@@ -9464,6 +9682,40 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         let _ = resumed;
         trap();
     }
+    // A branch to memory nothing executable is mapped at: a bad return
+    // address or function pointer. Said before any slot arithmetic, because a
+    // wild `pc` makes a wild directory index, and a shim trap on that reads as
+    // a runtime bug where the guest's own crash is the story.
+    let wild = gex_abi::X86 && with_host(|h| {
+        !h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && pc >= v.start && pc < v.end)
+    });
+    if wild {
+        with_host(|h| {
+            let gm = GuestMem::new(guest_bytes());
+            let c = h.threads[cur()].kstate.ctx_addr;
+            let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
+            let src = gm.read_u64(c + ctx::LAST_SOURCE as u64).unwrap_or(0);
+            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+            let stack: Vec<String> = (0..8)
+                .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
+                .collect();
+            warn_line(&format!(
+                "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}) from block {src:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
+                h.kernel.pid,
+                cur(),
+                object_off_at(h, last),
+                object_off_at(h, src),
+                stack.join(", "),
+                LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
+            ));
+            set_exit(h, 128 + 11);
+        });
+        trap();
+    }
     // Which of this object's functions the backend serves itself, before either
     // path translates anything.
     note_intrinsics(pc);
@@ -9477,7 +9729,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // while a second ask for one span would loop for ever.
         let page = gex_abi::dispatch_page(pc);
         let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
-        let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
+        let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
         let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
         let key = page * spans as u64 + (from / width) as u64;
         // Under KLOCK: `FILL_ASKED` is a `SingleThreaded<RefCell<BTreeSet>>`, and
@@ -9530,7 +9782,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         } else {
             let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
             let page = gex_abi::dispatch_page(pc);
-            let from = ((pc & 0xfff) >> 2) as u32 & !(width - 1);
+            let from = ((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1);
             let spans = gex_abi::SLOTS_PER_PAGE as u32 / width;
             let key = page * spans as u64 + (from / width) as u64;
             if with_host(|_| FILL_ASKED.0.borrow().contains(&key)) { 2 } else { 3 }
@@ -9576,7 +9828,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             .filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
             .map(|v| (v.start, v.end))
             .collect();
-        if !exec.iter().any(|(a, b)| pc >= *a && pc + 4 <= *b) {
+        if !exec.iter().any(|(a, b)| pc >= *a && pc + gex_abi::INST_ALIGN <= *b) {
             return false;
         }
         // Before anything is translated: if this page's code has been
@@ -9713,6 +9965,32 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     if whole { usize::MAX } else { per_miss },
                     SERVE_MAX_BYTES,
                 );
+                // Only modules whose every page base agrees with this process's
+                // numbering (or names a page not numbered here yet). A module is
+                // written at the bases the process that BUILT it gave its pages;
+                // where this process gave the same page a different base, its
+                // blocks would land in slots that mean another page here --
+                // over a block this process already wrote, or under a directory
+                // entry that dispatches into it as something else. That is the
+                // x86 pipeline wild branch (`ls | cat`): 4096 slots a page makes
+                // two processes' numberings diverge in a few misses.
+                let before = ready.len();
+                let ready: Vec<_> = ready
+                    .into_iter()
+                    .filter(|(_, _, d, _)| {
+                        !gex_abi::X86 || d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
+                            Some(have) => have == *b,
+                            None => true,
+                        })
+                    })
+                    .collect();
+                if tracing() && ready.len() != before {
+                    trace_line(&format!(
+                        "[gex] serve: {} of {} stored module(s) number a page differently here, not taken\n",
+                        before - ready.len(),
+                        before
+                    ));
+                }
                 if !ready.is_empty() {
                     if tracing() {
                         trace_line(&format!(
@@ -9733,10 +10011,43 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         // Every page they cover, before the install: install
                         // asks the shim which slot each block belongs in, and
                         // the answer comes from here.
+                        //
+                        // Only pages whose code HERE is what the stored unit
+                        // was built from: a libc unit's blocks run into the
+                        // program that called it, so its covered pages include
+                        // the image pages of the process that built it -- another
+                        // program at the same PIE base (dash's `_init` page
+                        // served into qt6ct). The identity map says which base a
+                        // (page, identity) has; a page whose identity here does
+                        // not name this base is another program's, and the
+                        // entry is dropped (its blocks land in slots nothing
+                        // dispatches to).
+                        let mut keep: Vec<(u64, u32)> = Vec::new();
                         for (p, b) in d {
-                            h.jit.page_table.assign(*p, *b);
+                            if !gex_abi::X86 {
+                                h.jit.page_table.assign(*p, *b);
+                                keep.push((*p, *b));
+                                continue;
+                            }
+                            let same = page_identity(h, *p * gex_abi::DISPATCH_PAGE)
+                                // SAFETY: a lookup in the kernel's memory, borrowing nothing here.
+                                .map_or(false, |k| unsafe { k_slot_get(*p, k) } == *b);
+                            if !same {
+                                if tracing() {
+                                    trace_line(&format!(
+                                        "[gex] serve: page {p:#x} base {b:#x} is another program's here, entry dropped\n"
+                                    ));
+                                }
+                                continue;
+                            }
+                            // Only pages this process has not numbered: see
+                            // `gex_jit_installed` for why a second base is fatal.
+                            if h.jit.page_table.lookup(*p).is_none() {
+                                h.jit.page_table.assign(*p, *b);
+                            }
+                            keep.push((*p, *b));
                         }
-                        dirs.extend_from_slice(d);
+                        dirs.extend_from_slice(&keep);
                         h.jit.reuse_served += 1;
                     }
                     // Does any of this answer the block that faulted? A unit
@@ -9789,7 +10100,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 // dpkg-deb/xz half of the debian-deb/lzma crash). The serve path
                 // above is what installs a shared module; until it has, leave
                 // the page at the miss stub so it translates locally instead.
-                if !h.jit.installed_mods.is_empty() {
+                if !h.jit.installed_mods.is_empty()
+                    && (!gex_abi::X86 || h.jit.page_table.lookup(page).is_none())
+                {
                     if let Some(base) = shared_slot(h, page, key) {
                         h.jit.page_table.assign(page, base);
                         // And the guest's directory, which `execve` cleared: only
@@ -9805,6 +10118,24 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         let started = now_ns();
         let known = std::mem::take(&mut h.jit.translated);
+        // x86-64: what the page table's identity hooks answer from, as of now,
+        // and which pages are a JIT's (writable and executable), so their
+        // blocks carry a self-modifying-code guard. See `Block::guard`.
+        if gex_abi::X86 {
+        refresh_ident_snapshot(h);
+        gex_xlate::set_volatile_ranges(
+            h.kernel
+                .mem
+                .vmas()
+                .iter()
+                .filter(|v| {
+                    v.prot & gex_kernel::mem::prot::EXEC != 0
+                        && v.prot & gex_kernel::mem::prot::WRITE != 0
+                })
+                .map(|v| (v.start, v.end))
+                .collect(),
+        );
+        }
         phase(11);
     let (unit, stats) = gex_xlate::translate_runtime(
             guest_bytes(),
@@ -9824,7 +10155,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         );
         h.jit.translated = known;
         if pc == 0x10f6d24 {
-            let ok = exec.iter().any(|(s, e)| pc >= *s && pc + 4 <= *e);
+            let ok = exec.iter().any(|(s, e)| pc >= *s && pc + gex_abi::INST_ALIGN <= *e);
             let has_block = unit.covered.iter().any(|(p, _)| *p == 0x10f6);
             warn_line(&format!(
                 "[trace] translate pc=0x10f6d24 blocks={} exec={} covers_page_10f6={} exec_regions={}\n",
@@ -9945,6 +10276,19 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         h.jit.compiles += 1;
         h.jit.nanos += now_ns().saturating_sub(started);
         if tracing() {
+            // Whether the block that faulted is in what was built, and at which
+            // slot the builder placed it: a unit without it means the resume
+            // misses again; a unit with it at a slot the directory does not
+            // name means the resume runs something else.
+            let has = unit.exported_blocks.iter().any(|(a, _)| *a == pc);
+            let entry = h.jit.page_table.lookup(page).unwrap_or(0);
+            trace_line(&format!(
+                "[gex]   unit has block at pc={pc:#x}: {has}; page entry t{} base {} -> slot {}; blocks {:?}\n",
+                gex_abi::dispatch_entry_table(entry),
+                gex_abi::dispatch_entry_base(entry),
+                gex_abi::dispatch_index(pc, entry),
+                unit.exported_blocks.iter().take(12).map(|(a, _)| format!("{a:#x}")).collect::<Vec<_>>(),
+            ));
             trace_line(&format!(
                 "[gex]   translated {} blocks in {} ms, {} vmas, {} slots, {} pages\n",
                 stats.blocks,
@@ -10689,7 +11033,7 @@ fn object_seeds(map: &gex_kernel::CodeMap) -> Vec<u64> {
                 continue;
             }
             let v = u64::from_le_bytes(chunk.try_into().unwrap());
-            if v >= lo && v < hi && v % 4 == 0 {
+            if v >= lo && v < hi && v % gex_abi::INST_ALIGN == 0 {
                 seeds.push(v.wrapping_add(bias));
             }
         }
@@ -11014,6 +11358,24 @@ pub extern "C" fn gex_jit_installed() {
         };
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in done.dirs {
+            // A page has ONE base per process. A served module built elsewhere
+            // names its own bases; where this process already numbered the page
+            // (and wrote blocks at that base), pointing the directory at the
+            // served base strands those blocks and dispatches through slots
+            // that may hold anything -- the two-bases-per-page wild branch the
+            // x86 pipeline runs hit (`ls | cat`: 4096 slots a page made it
+            // common). The served blocks on such a page are simply unreachable;
+            // a miss there lifts locally, at the base the process has.
+            if gex_abi::X86 {
+                match h.jit.page_table.lookup(page) {
+                    Some(have) if have != base => {
+                        dir_note(page, have, "install-done-kept-local");
+                        continue;
+                    }
+                    None => h.jit.page_table.assign(page, base),
+                    _ => {}
+                }
+            }
             dir_note(page, base, "install-done");
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
         }
@@ -11106,6 +11468,22 @@ pub extern "C" fn gex_dump_state() {
         // held, not on the page the pc is in -- which is why a report built
         // from `dispatch_page(pc)` kept describing an entry that was
         // perfectly in range while the branch was somewhere else entirely.
+        if gex_abi::X86 {
+            // Every GPR: with variable-length instructions and no link
+            // register, which value went wild is not guessable from a few.
+            const NAMES: [&str; 16] = [
+                "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+                "r12", "r13", "r14", "r15",
+            ];
+            for (i, name) in NAMES.iter().enumerate() {
+                let a = r(i as u8);
+                warn_line(&format!("gex:   {name}={a:#x} in {}\n", where_is(a)));
+            }
+            let fs = gm.read_u64(c + ctx::FS_BASE as u64).unwrap_or(0);
+            let last = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
+            warn_line(&format!("gex:   fs_base={fs:#x} in {}  last_target={last:#x} in {}\n", where_is(fs), where_is(last)));
+            return;
+        }
         for (name, a) in [
             ("sp", sp),
             ("x0", r(0)),

@@ -15,6 +15,10 @@ import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSyn
 import { basename, dirname, join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { ProcessHost } from './host.mjs';
+// `GEX_ARCH=x86` runs the x86-64 guest: the `.x86`-infixed shim and kernel
+// (see shims/browser/build.sh), and `globalThis.GEX_ARCH` for the glue.
+const ARCH_INFIX = process.env.GEX_ARCH === 'x86' ? '.x86' : '';
+if (process.env.GEX_ARCH === 'x86') globalThis.GEX_ARCH = 'x86';
 
 // The host runs on the main thread; give it the attach-trace flag too so
 // thread spawn/adopt timing is visible from the host side, not just the Worker.
@@ -126,8 +130,8 @@ function readStdin() {
 const SHARED = !!process.env.GEX_SHARED;
 const shimWasm = readFileSync(
   new URL(
-    SHARED ? '../../../web/public/gex/gex_browser.shared.wasm'
-           : '../../../web/public/gex/gex_browser.wasm',
+    SHARED ? `../../../web/public/gex/gex_browser${ARCH_INFIX}.shared.wasm`
+           : `../../../web/public/gex/gex_browser${ARCH_INFIX}.wasm`,
     import.meta.url,
   ),
 );
@@ -139,8 +143,8 @@ const shimWasm = readFileSync(
 let kernel = null;
 try {
   const path = new URL(
-    SHARED ? '../../../web/public/gex/gex_kernel.wasm'
-           : '../../../web/public/gex/gex_kernel.plain.wasm',
+    SHARED ? `../../../web/public/gex/gex_kernel${ARCH_INFIX}.wasm`
+           : `../../../web/public/gex/gex_kernel${ARCH_INFIX}.plain.wasm`,
     import.meta.url,
   );
   kernel = {
@@ -258,6 +262,9 @@ const host = new ProcessHost({
     // narrowed to a few seconds of guest time.
     trace: !!process.env.GEX_TRACE,
     traceMisses: !!process.env.GEX_TRACE_MISSES,
+    // GEX_TRACE_BLOCKS: the per-block register trace, as natively.
+    traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
+    watchMem: process.env.GEX_WATCH_MEM || undefined,
     // GEX_CHECK_SP checks `sp` at the top of every block: a corrupt `sp` is
     // invisible until dereferenced, so this names the block that arrives with
     // the bad value, not the one that dies on it. See #73.
@@ -371,6 +378,18 @@ const host = new ProcessHost({
 });
 
 let status;
+// GEX_MEMSTATS=<seconds>: report process memory every so often -- the whole
+// process (every Worker) in `rss`, this isolate's wasm memories in
+// `arrayBuffers` -- to see what a run's footprint is made of.
+if (process.env.GEX_MEMSTATS) {
+  const every = Number(process.env.GEX_MEMSTATS) * 1000 || 10000;
+  const t0 = Date.now();
+  setInterval(() => {
+    const m = process.memoryUsage();
+    const mib = (n) => (n / 1048576).toFixed(0);
+    process.stderr.write(`[memstats] t=${((Date.now() - t0) / 1000).toFixed(0)}s rss=${mib(m.rss)}MiB heap=${mib(m.heapUsed)}MiB external=${mib(m.external)}MiB arrayBuffers=${mib(m.arrayBuffers)}MiB\n`);
+  }, every).unref();
+}
 try {
   status = await host.start({
     elf,
@@ -378,6 +397,14 @@ try {
     args,
     opts: {
       strace,
+      // The debugging switches, in the run's own options as well as the boot
+      // message: `opts` is what a fork record carries to a child's Worker.
+      traceBlocks: !!process.env.GEX_TRACE_BLOCKS,
+      traceMisses: !!process.env.GEX_TRACE_MISSES,
+      checkSp: !!process.env.GEX_CHECK_SP,
+      watchMem: process.env.GEX_WATCH_MEM || undefined,
+      noIntrinsics: !!process.env.GEX_NO_INTRINSICS,
+      intrinsicMask: process.env.GEX_INTRINSIC_MASK ? Number(process.env.GEX_INTRINSIC_MASK) : undefined,
       // The suite compares this run against QEMU on the same machine, and QEMU
       // reports the real user.
       uid: process.getuid?.(),
