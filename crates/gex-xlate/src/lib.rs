@@ -681,9 +681,11 @@ fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Optio
             ..Default::default()
         };
         let prog = func::recover(image, None, &ropts);
+        let summaries = summary::analyze(&prog).map;
         gex_cgen::Functions::Recovered {
             functions: prog.functions.into_values().collect(),
             intrinsics: opts.intrinsics.keys().copied().collect(),
+            summaries,
         }
     };
     match gex_cgen::build(wasm, &refs, functions) {

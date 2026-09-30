@@ -13,7 +13,8 @@ pub mod splice;
 pub mod toolchain;
 
 use anyhow::{Context, Result};
-use gex_ir::func::Function;
+use gex_ir::func::{Function, Summary};
+use std::collections::HashMap;
 use gex_ir::Block;
 use std::collections::HashSet;
 
@@ -47,6 +48,8 @@ pub enum Functions {
     Recovered {
         functions: Vec<Function>,
         intrinsics: Vec<u64>,
+        /// S2's call-graph summaries, by entry.
+        summaries: HashMap<u64, Summary>,
     },
     /// The stand-in in `recover.rs`, from the tier-1 blocks and the symbol
     /// addresses (biased). Kept for comparison (`GEX_CGEN_RECOVER=standin`).
@@ -107,12 +110,15 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
     let index: std::collections::HashMap<u64, u32> =
         blocks.iter().map(|(b, f)| (b.start, *f)).collect();
     let refs: Vec<&Block> = blocks.iter().map(|(b, _)| *b).collect();
+    let mut sums: HashMap<u64, Summary> = HashMap::new();
     let mut funcs = match functions {
         Functions::StandIn { symbols } => recover::functions(&refs, &symbols),
         Functions::Recovered {
             mut functions,
             intrinsics,
+            summaries,
         } => {
+            sums = summaries;
             let by_addr: std::collections::HashMap<u64, &Block> =
                 refs.iter().map(|b| (b.start, *b)).collect();
             let intrinsics: HashSet<u64> = intrinsics.into_iter().collect();
@@ -148,13 +154,35 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
     let jobs = toolchain::jobs();
     let per = funcs.len().div_ceil(jobs * 4).max(16);
     let mut units = Vec::new();
+    let mut stats = func::FnStats::default();
     for (k, chunk) in funcs.chunks(per).enumerate() {
         let mut u = func::FnUnit::new();
         for f in chunk {
-            u.add(f, &known)
+            u.add(f, &known, &sums)
                 .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
         }
+        stats.merge(&u.stats);
         units.push((format!("unit{k:04}.c"), u.source()));
+    }
+    if std::env::var_os("GEX_CGEN_STATS").is_some() {
+        let mut leaves: Vec<(u64, usize)> = stats.leaves.iter().map(|(a, n)| (*a, *n)).collect();
+        leaves.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
+        eprintln!(
+            "[cgen] {} functions, {} blocks; calls: {} known, {} indirect, {} leaving; \
+             tail calls: {} known; {} switches, {} unresolved jumps, {} returns",
+            stats.functions,
+            stats.blocks,
+            stats.calls_known,
+            stats.calls_indirect,
+            stats.leaves.values().sum::<usize>(),
+            stats.tail_known,
+            stats.switches,
+            stats.unresolved,
+            stats.returns
+        );
+        for (a, n) in leaves.iter().take(20) {
+            eprintln!("[cgen]   leaves for {a:#x} at {n} sites");
+        }
     }
     let entries: Vec<u64> = funcs.iter().map(|f| f.entry).collect();
     units.push(("call_known.c".into(), func::call_known_source(&entries)));

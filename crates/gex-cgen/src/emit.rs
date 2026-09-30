@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Result};
 use gex_abi::{ctx, GUEST_LIMIT};
+use gex_ir::func::RegSet;
 use gex_ir::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write;
@@ -291,26 +292,47 @@ impl<'a> Emitter<'a> {
         self.regs = dirty.iter().map(|r| (*r, true)).collect();
     }
 
+    /// Pricing only (`GEX_CGEN_EXP=NOFLAGWB`): treat the flags as clean, so
+    /// the next write-back skips them.
+    pub(crate) fn forget_flags(&mut self) {
+        self.regs.retain(|r, _| !r.is_flag());
+    }
+
     /// A write-back on a conditional path: the stores happen, but the
     /// emitter keeps believing the registers are dirty.
     pub(crate) fn flush_keep(&mut self) {
-        self.flush_inner(true);
+        self.flush_inner(true, None);
+    }
+
+    /// Function mode: `flush_keep`, storing only registers in `live`.
+    pub(crate) fn flush_keep_live(&mut self, live: RegSet) {
+        self.flush_inner(true, Some(live));
     }
 
     pub(crate) fn flush(&mut self) {
-        self.flush_inner(false);
+        self.flush_inner(false, None);
     }
 
-    fn flush_inner(&mut self, keep_dirty: bool) {
+    /// Function mode: `flush`, storing only registers in `live`. The others
+    /// are forgotten (treated as clean from here on): nothing reads them
+    /// before they are written again.
+    pub(crate) fn flush_live(&mut self, live: RegSet) {
+        self.flush_inner(false, Some(live));
+    }
+
+    fn flush_inner(&mut self, keep_dirty: bool, live: Option<RegSet>) {
         if let Some(fr) = &self.func_regs {
             // Clean-spill elision: only what may differ from the context on
             // some path to here (`func::dirty_in`); otherwise everything the
             // function writes anywhere.
-            let w: Vec<GuestReg> = if fr.clean_spills {
+            let mut w: Vec<GuestReg> = if fr.clean_spills {
                 self.regs.iter().filter(|(_, d)| **d).map(|(r, _)| *r).collect()
             } else {
                 fr.written.iter().copied().collect()
             };
+            if let Some(l) = live {
+                w.retain(|r| l.contains(*r));
+            }
             let loaded = fr.used.clone();
             self.store_regs(&w, &loaded);
             if !keep_dirty {
