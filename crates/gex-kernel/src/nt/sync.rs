@@ -148,7 +148,7 @@ pub fn deadline(c: &Call<'_>, p: u64) -> R<Option<u64>> {
 }
 
 /// The sync-core id and a fresh state for a waitable handle.
-fn wait_id(c: &Call<'_>, h: u32) -> R<u64> {
+pub fn wait_id(c: &Call<'_>, h: u32) -> R<u64> {
     match object::resolve(c, h)? {
         Obj::Sync(s) => Ok(s.id),
         Obj::Thread(t) => Ok(t.sync_id),
@@ -164,6 +164,21 @@ const ALWAYS_ID: u64 = 0;
 /// Wait for `ids`. Returns `WAIT_0 + i`, `ABANDONED + i`, `TIMEOUT`,
 /// `USER_APC` or `ALERTED`.
 pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline: Option<u64>) -> R {
+    wait_ex(c, ids, all, alertable, deadline, None)
+}
+
+/// [`wait`], also ending with `WAIT_0 + ids.len()` when `extra` says so (a
+/// message queue with input, for `MsgWaitForMultipleObjectsEx`). `extra` is
+/// asked after the objects, with no lock held; whatever makes it true must
+/// wake the thread's word afterwards.
+pub fn wait_ex(
+    c: &mut Call<'_>,
+    ids: &[u64],
+    all: bool,
+    alertable: bool,
+    deadline: Option<u64>,
+    extra: Option<&dyn Fn(&Call<'_>) -> bool>,
+) -> R {
     let me = c.t.tid;
     let t = Arc::clone(&c.t);
     {
@@ -171,11 +186,20 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
         core.states.entry(ALWAYS_ID).or_insert(SState::Always);
         core.states.entry(c.p.sync_id).or_insert(SState::Never);
     }
+    let unregister = |c: &Call<'_>| {
+        let mut core = c.p.sync.lock().unwrap();
+        for &id in ids {
+            core.unregister(id, &t);
+        }
+    };
     loop {
+        // Cleared before anything is checked: whatever becomes true after a
+        // check sets it again, so the sleep below cannot miss it.
+        let _ = c.g.w32(t.word, 0);
         {
             let mut core = c.p.sync.lock().unwrap();
             if all {
-                if ids.iter().all(|&id| core.signalled(id, me)) {
+                if !ids.is_empty() && ids.iter().all(|&id| core.signalled(id, me)) {
                     let mut abandoned = false;
                     for &id in ids {
                         abandoned |= core.consume(id, me);
@@ -190,19 +214,20 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
                 }
                 return Ok(if abandoned { st::ABANDONED } else { st::WAIT_0 } + i as u32);
             }
-            if alertable && !t.apcs.lock().unwrap().is_empty() {
-                for &id in ids {
-                    core.unregister(id, &t);
-                }
-                return Ok(st::USER_APC);
-            }
             for &id in ids {
                 core.register(id, &t);
             }
-            // Cleared under the lock: a signal after this sets it again.
-            let _ = c.g.w32(t.word, 0);
+        }
+        if extra.is_some_and(|f| f(c)) {
+            unregister(c);
+            return Ok(st::WAIT_0 + ids.len() as u32);
+        }
+        if alertable && !t.apcs.lock().unwrap().is_empty() {
+            unregister(c);
+            return Ok(st::USER_APC);
         }
         if c.p.terminating.load(std::sync::atomic::Ordering::Relaxed) {
+            unregister(c);
             return Err(Status(st::THREAD_IS_TERMINATING));
         }
         let timeout = match deadline {
@@ -210,10 +235,7 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
             Some(d) => {
                 let now = (c.p.clocks.mono_ns)();
                 if now >= d {
-                    let mut core = c.p.sync.lock().unwrap();
-                    for &id in ids {
-                        core.unregister(id, &t);
-                    }
+                    unregister(c);
                     return Ok(st::TIMEOUT);
                 }
                 Some(Duration::from_nanos(d - now))
@@ -224,7 +246,7 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
 }
 
 /// Sleep on `t`'s wait word while it reads 0, until woken or `timeout`.
-fn sleep_on_word(c: &Call<'_>, t: &Thread, timeout: Option<Duration>) {
+pub fn sleep_on_word(c: &Call<'_>, t: &Thread, timeout: Option<Duration>) {
     let g = &c.g;
     let word = t.word;
     // A bounded slice even for "forever", so a process that is ending is

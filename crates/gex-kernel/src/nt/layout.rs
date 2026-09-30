@@ -31,6 +31,7 @@ pub mod x64 {
         pub const FLSSLOTS: u64 = 0x17c8;
         pub const SAMETEBFLAGS: u64 = 0x17ee;
         pub const WOWTEBOFFSET: u64 = 0x180c;
+        pub const WIN32CLIENTINFO: u64 = 0x800;
         pub const SIZEOF: u64 = 0x1838;
     }
     pub mod peb {
@@ -231,6 +232,96 @@ pub mod x64 {
         pub const XSTATE: u64 = 0x3d8;
         pub const SIZEOF: u64 = 0x738;
     }
+    pub mod struct_ntuser_thread_info {
+        pub const MSG_SOURCE: u64 = 0x0;
+        pub const RECURSION_COUNT: u64 = 0x8;
+        pub const DPI_CONTEXT: u64 = 0xc;
+        pub const CLIENT_IMM: u64 = 0x10;
+        pub const WMCHAR_DATA: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x20;
+    }
+    pub mod struct_win_proc_params {
+        pub const FUNC: u64 = 0x0;
+        pub const HWND: u64 = 0x8;
+        pub const MSG: u64 = 0x10;
+        pub const WPARAM: u64 = 0x18;
+        pub const LPARAM: u64 = 0x20;
+        pub const ANSI: u64 = 0x28;
+        pub const ANSI_DST: u64 = 0x2c;
+        pub const MAPPING: u64 = 0x30;
+        pub const DPI_CONTEXT: u64 = 0x34;
+        pub const PROCA: u64 = 0x38;
+        pub const PROCW: u64 = 0x40;
+        pub const SIZEOF: u64 = 0x48;
+    }
+    pub mod createstructw {
+        pub const LPCREATEPARAMS: u64 = 0x0;
+        pub const HINSTANCE: u64 = 0x8;
+        pub const HMENU: u64 = 0x10;
+        pub const HWNDPARENT: u64 = 0x18;
+        pub const CY: u64 = 0x20;
+        pub const CX: u64 = 0x24;
+        pub const Y: u64 = 0x28;
+        pub const X: u64 = 0x2c;
+        pub const STYLE: u64 = 0x30;
+        pub const LPSZNAME: u64 = 0x38;
+        pub const LPSZCLASS: u64 = 0x40;
+        pub const DWEXSTYLE: u64 = 0x48;
+        pub const SIZEOF: u64 = 0x50;
+    }
+    pub mod msg {
+        pub const HWND: u64 = 0x0;
+        pub const MESSAGE: u64 = 0x8;
+        pub const WPARAM: u64 = 0x10;
+        pub const LPARAM: u64 = 0x18;
+        pub const TIME: u64 = 0x20;
+        pub const PT: u64 = 0x24;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod wndclassexw {
+        pub const CBSIZE: u64 = 0x0;
+        pub const STYLE: u64 = 0x4;
+        pub const LPFNWNDPROC: u64 = 0x8;
+        pub const CBCLSEXTRA: u64 = 0x10;
+        pub const CBWNDEXTRA: u64 = 0x14;
+        pub const HINSTANCE: u64 = 0x18;
+        pub const HICON: u64 = 0x20;
+        pub const HCURSOR: u64 = 0x28;
+        pub const HBRBACKGROUND: u64 = 0x30;
+        pub const LPSZMENUNAME: u64 = 0x38;
+        pub const LPSZCLASSNAME: u64 = 0x40;
+        pub const HICONSM: u64 = 0x48;
+        pub const SIZEOF: u64 = 0x50;
+    }
+    pub mod windowpos {
+        pub const HWND: u64 = 0x0;
+        pub const HWNDINSERTAFTER: u64 = 0x8;
+        pub const X: u64 = 0x10;
+        pub const Y: u64 = 0x14;
+        pub const CX: u64 = 0x18;
+        pub const CY: u64 = 0x1c;
+        pub const FLAGS: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod nccalcsize_params {
+        pub const RGRC: u64 = 0x0;
+        pub const LPPOS: u64 = 0x30;
+        pub const SIZEOF: u64 = 0x38;
+    }
+    pub mod minmaxinfo {
+        pub const PTRESERVED: u64 = 0x0;
+        pub const PTMAXSIZE: u64 = 0x8;
+        pub const PTMAXPOSITION: u64 = 0x10;
+        pub const PTMINTRACKSIZE: u64 = 0x18;
+        pub const PTMAXTRACKSIZE: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod paintstruct {
+        pub const HDC: u64 = 0x0;
+        pub const FERASE: u64 = 0x8;
+        pub const RCPAINT: u64 = 0xc;
+        pub const SIZEOF: u64 = 0x48;
+    }
     pub mod context {
         pub const SIZEOF: u64 = 0x4d0;
     }
@@ -266,6 +357,7 @@ pub mod x86 {
         pub const FLSSLOTS: u64 = 0xfb4;
         pub const SAMETEBFLAGS: u64 = 0xfca;
         pub const WOWTEBOFFSET: u64 = 0xfdc;
+        pub const WIN32CLIENTINFO: u64 = 0x6cc;
         pub const SIZEOF: u64 = 0x1000;
     }
     pub mod peb {
@@ -465,6 +557,96 @@ pub mod x86 {
         pub const ACTIVEGROUPCOUNT: u64 = 0x3c4;
         pub const XSTATE: u64 = 0x3d8;
         pub const SIZEOF: u64 = 0x738;
+    }
+    pub mod struct_ntuser_thread_info {
+        pub const MSG_SOURCE: u64 = 0x0;
+        pub const RECURSION_COUNT: u64 = 0x8;
+        pub const DPI_CONTEXT: u64 = 0xc;
+        pub const CLIENT_IMM: u64 = 0x10;
+        pub const WMCHAR_DATA: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x20;
+    }
+    pub mod struct_win_proc_params {
+        pub const FUNC: u64 = 0x0;
+        pub const HWND: u64 = 0x4;
+        pub const MSG: u64 = 0x8;
+        pub const WPARAM: u64 = 0xc;
+        pub const LPARAM: u64 = 0x10;
+        pub const ANSI: u64 = 0x14;
+        pub const ANSI_DST: u64 = 0x18;
+        pub const MAPPING: u64 = 0x1c;
+        pub const DPI_CONTEXT: u64 = 0x20;
+        pub const PROCA: u64 = 0x24;
+        pub const PROCW: u64 = 0x28;
+        pub const SIZEOF: u64 = 0x2c;
+    }
+    pub mod createstructw {
+        pub const LPCREATEPARAMS: u64 = 0x0;
+        pub const HINSTANCE: u64 = 0x4;
+        pub const HMENU: u64 = 0x8;
+        pub const HWNDPARENT: u64 = 0xc;
+        pub const CY: u64 = 0x10;
+        pub const CX: u64 = 0x14;
+        pub const Y: u64 = 0x18;
+        pub const X: u64 = 0x1c;
+        pub const STYLE: u64 = 0x20;
+        pub const LPSZNAME: u64 = 0x24;
+        pub const LPSZCLASS: u64 = 0x28;
+        pub const DWEXSTYLE: u64 = 0x2c;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod msg {
+        pub const HWND: u64 = 0x0;
+        pub const MESSAGE: u64 = 0x4;
+        pub const WPARAM: u64 = 0x8;
+        pub const LPARAM: u64 = 0xc;
+        pub const TIME: u64 = 0x10;
+        pub const PT: u64 = 0x14;
+        pub const SIZEOF: u64 = 0x1c;
+    }
+    pub mod wndclassexw {
+        pub const CBSIZE: u64 = 0x0;
+        pub const STYLE: u64 = 0x4;
+        pub const LPFNWNDPROC: u64 = 0x8;
+        pub const CBCLSEXTRA: u64 = 0xc;
+        pub const CBWNDEXTRA: u64 = 0x10;
+        pub const HINSTANCE: u64 = 0x14;
+        pub const HICON: u64 = 0x18;
+        pub const HCURSOR: u64 = 0x1c;
+        pub const HBRBACKGROUND: u64 = 0x20;
+        pub const LPSZMENUNAME: u64 = 0x24;
+        pub const LPSZCLASSNAME: u64 = 0x28;
+        pub const HICONSM: u64 = 0x2c;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod windowpos {
+        pub const HWND: u64 = 0x0;
+        pub const HWNDINSERTAFTER: u64 = 0x4;
+        pub const X: u64 = 0x8;
+        pub const Y: u64 = 0xc;
+        pub const CX: u64 = 0x10;
+        pub const CY: u64 = 0x14;
+        pub const FLAGS: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x1c;
+    }
+    pub mod nccalcsize_params {
+        pub const RGRC: u64 = 0x0;
+        pub const LPPOS: u64 = 0x30;
+        pub const SIZEOF: u64 = 0x34;
+    }
+    pub mod minmaxinfo {
+        pub const PTRESERVED: u64 = 0x0;
+        pub const PTMAXSIZE: u64 = 0x8;
+        pub const PTMAXPOSITION: u64 = 0x10;
+        pub const PTMINTRACKSIZE: u64 = 0x18;
+        pub const PTMAXTRACKSIZE: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod paintstruct {
+        pub const HDC: u64 = 0x0;
+        pub const FERASE: u64 = 0x4;
+        pub const RCPAINT: u64 = 0x8;
+        pub const SIZEOF: u64 = 0x40;
     }
     pub mod context {
         pub const SIZEOF: u64 = 0x2cc;

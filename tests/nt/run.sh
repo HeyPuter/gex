@@ -66,6 +66,8 @@ for arch in x64 x86; do
     check $arch/apc 0 "$allok" "$b/apc.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
     check $arch/cxx 0 "$allok" "$b/cxx.exe"
+    # N4: USER without a display.
+    check $arch/user_win 0 "$allok" "$b/user_win.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" "$b/exitproc.exe"
     # Ends in the top-level exception filter, which exits with 77.
     seh=(check)

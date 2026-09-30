@@ -27,6 +27,9 @@ pub const DEGRADES: &[&str] = &[
     "kerberos.dll",
     "msv1_0.dll",
     "netapi32.dll",
+    // win32u's PE side makes no unix calls (everything is a syscall); its
+    // DllMain asks only because winecrt0 always does.
+    "win32u.dll",
 ];
 
 #[derive(Default, Debug)]

@@ -557,7 +557,7 @@ pub fn nt_add_atom(c: &mut Call<'_>) -> R {
         None => {
             let key = lower(&name);
             let mut t = c.p.atoms.lock().unwrap();
-            match t.names.iter_mut().position(|(n, _)| lower(n) == key) {
+            match t.names.iter_mut().position(|(n, u)| *u > 0 && lower(n) == key) {
                 Some(i) => {
                     t.names[i].1 += 1;
                     MAXINTATOM + i as u32
@@ -575,6 +575,27 @@ pub fn nt_add_atom(c: &mut Call<'_>) -> R {
     Ok(st::SUCCESS)
 }
 
+/// `NtDeleteAtom(atom)`: drop a reference; the last one frees the name.
+pub fn nt_delete_atom(c: &mut Call<'_>) -> R {
+    let atom = c.a32(0) & 0xffff;
+    if atom < MAXINTATOM {
+        return Ok(st::SUCCESS);
+    }
+    let mut t = c.p.atoms.lock().unwrap();
+    match t.names.get_mut((atom - MAXINTATOM) as usize) {
+        Some(e) if e.1 > 0 => {
+            e.1 -= 1;
+            if e.1 == 0 {
+                // The slot stays (atoms are indices); an empty name matches
+                // nothing.
+                e.0.clear();
+            }
+            Ok(st::SUCCESS)
+        }
+        _ => Err(Status(st::INVALID_HANDLE)),
+    }
+}
+
 /// `NtFindAtom(name, len, *atom)`.
 pub fn nt_find_atom(c: &mut Call<'_>) -> R {
     let (np, len, ap) = (c.a(0), c.a32(1) as u64, c.a(2));
@@ -584,7 +605,7 @@ pub fn nt_find_atom(c: &mut Call<'_>) -> R {
         None => {
             let key = lower(&name);
             let t = c.p.atoms.lock().unwrap();
-            let i = t.names.iter().position(|(n, _)| lower(n) == key).ok_or(Status(st::OBJECT_NAME_NOT_FOUND))?;
+            let i = t.names.iter().position(|(n, u)| *u > 0 && lower(n) == key).ok_or(Status(st::OBJECT_NAME_NOT_FOUND))?;
             MAXINTATOM + i as u32
         }
     };
