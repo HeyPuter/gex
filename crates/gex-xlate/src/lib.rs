@@ -44,6 +44,11 @@ use gex_abi::INST_ALIGN;
 pub mod intrinsic;
 pub use intrinsic::Intrinsic;
 
+pub mod ehframe;
+pub mod func;
+pub mod jumptable;
+pub mod summary;
+
 /// Knobs for a translation run.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -196,7 +201,7 @@ impl<'a> CodeView<'a> {
     }
 
 
-    fn is_executable(&self, addr: u64) -> bool {
+    pub fn is_executable(&self, addr: u64) -> bool {
         // Section flags, not `PF_X`: a segment's executable bit also covers
         // the string tables and relocations mapped alongside the code, which
         // discovery would otherwise disassemble into SIGILL blocks.
