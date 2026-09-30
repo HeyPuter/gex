@@ -151,6 +151,7 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
             .map_err(|e| anyhow::anyhow!("recovered function {:#x} is malformed: {e}", f.entry))?;
     }
     let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+    let trapfree = func::trap_free(&funcs, &sums);
     let jobs = toolchain::jobs();
     let per = funcs.len().div_ceil(jobs * 4).max(16);
     let mut units = Vec::new();
@@ -158,7 +159,7 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
     for (k, chunk) in funcs.chunks(per).enumerate() {
         let mut u = func::FnUnit::new();
         for f in chunk {
-            u.add(f, &known, &sums)
+            u.add(f, &known, &sums, &trapfree)
                 .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
         }
         stats.merge(&u.stats);
@@ -168,11 +169,13 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
         let mut leaves: Vec<(u64, usize)> = stats.leaves.iter().map(|(a, n)| (*a, *n)).collect();
         leaves.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
         eprintln!(
-            "[cgen] {} functions, {} blocks; calls: {} known, {} indirect, {} leaving; \
-             tail calls: {} known; {} switches, {} unresolved jumps, {} returns",
+            "[cgen] {} functions ({} trap-free), {} blocks; calls: {} known ({} to trap-free), \
+             {} indirect, {} leaving; tail calls: {} known; {} switches, {} unresolved jumps, {} returns",
             stats.functions,
+            trapfree.len(),
             stats.blocks,
             stats.calls_known,
+            stats.calls_trapfree,
             stats.calls_indirect,
             stats.leaves.values().sum::<usize>(),
             stats.tail_known,

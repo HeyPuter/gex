@@ -396,6 +396,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Function mode: `invalidate`, except for registers known to hold what
+    /// their locals already hold (a summarised callee's preserved set).
+    pub(crate) fn invalidate_except(&mut self, keep: RegSet) {
+        if let Some(fr) = &self.func_regs {
+            let u: Vec<GuestReg> = fr.used.iter().copied().filter(|r| !keep.contains(*r)).collect();
+            self.load_regs(&u);
+            self.regs.clear();
+            return;
+        }
+        self.regs.clear();
+    }
+
     pub(crate) fn invalidate(&mut self) {
         if let Some(fr) = &self.func_regs {
             let u: Vec<GuestReg> = fr.used.iter().copied().collect();

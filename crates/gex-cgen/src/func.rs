@@ -76,6 +76,20 @@ fn frame_weight(regs: &FnRegs) -> u32 {
     64 + 3 * bytes
 }
 
+/// The `need` bits a caller passes: what the callee's expected return must
+/// write back beyond every dirty non-flag register.
+const NEED_DEFS: &str = "#define NEED_FLAGS 1u\n#define NEED_ALL 0xffffffffu\n\n";
+
+/// The flag registers of the guest.
+const FLAG_REGS: [GuestReg; 6] = [
+    GuestReg::N,
+    GuestReg::Z,
+    GuestReg::C,
+    GuestReg::V,
+    GuestReg::P,
+    GuestReg::A,
+];
+
 /// What the indirect-call helper's own frame adds.
 const CALL_KNOWN_WEIGHT: u32 = 32;
 
@@ -106,6 +120,8 @@ pub struct FnStats {
     pub blocks: usize,
     pub calls_known: usize,
     pub calls_indirect: usize,
+    /// Known calls whose callee is trap-free (liveness-limited write-back).
+    pub calls_trapfree: usize,
     pub tail_known: usize,
     pub switches: usize,
     pub unresolved: usize,
@@ -120,6 +136,7 @@ impl FnStats {
         self.blocks += o.blocks;
         self.calls_known += o.calls_known;
         self.calls_indirect += o.calls_indirect;
+        self.calls_trapfree += o.calls_trapfree;
         self.tail_known += o.tail_known;
         self.switches += o.switches;
         self.unresolved += o.unresolved;
@@ -165,7 +182,16 @@ impl FnUnit {
 
     /// Add `f`. `known` is every function entry with a C body in this module;
     /// `sums` are S2's call-graph summaries, by entry (may be empty).
-    pub fn add(&mut self, f: &Function, known: &HashSet<u64>, sums: &HashMap<u64, Summary>) -> Result<()> {
+    ///
+    /// `trapfree` maps the trap-free functions (`trap_free`) to their
+    /// subtree's stack estimate.
+    pub fn add(
+        &mut self,
+        f: &Function,
+        known: &HashSet<u64>,
+        sums: &HashMap<u64, Summary>,
+        trapfree: &HashMap<u64, u32>,
+    ) -> Result<()> {
         if f.form != Form::Memory {
             bail!("function {:#x}: only memory form is supported", f.entry);
         }
@@ -185,7 +211,7 @@ impl FnUnit {
         self.stats.functions += 1;
         self.stats.blocks += f.blocks.iter().filter(|b| !b.synthetic).count();
         let name = body_name(f.entry);
-        let _ = writeln!(self.bodies, "void {name}(int ctx, int32_t depth) {{");
+        let _ = writeln!(self.bodies, "int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{");
         for r in &used {
             let _ = writeln!(self.bodies, "  {} {};", emit::cty(r.ty()), reg_name(*r));
         }
@@ -193,14 +219,23 @@ impl FnUnit {
         // The recursion-depth guard, before anything is loaded: every caller
         // wrote everything back before calling, so leaving for this
         // function's own entry here is exactly the caller leaving for it.
-        let _ = writeln!(
-            self.bodies,
-            "  if (__builtin_expect(depth > {}, 0)) {{ GEX_C64({}u) = 0x{:x}ull; return; }}",
-            stack_budget().saturating_sub(self.weight),
-            ctx::PC,
-            f.entry
-        );
+        // A trap-free function has none (its caller may not have written
+        // everything back, and it must not leave): its whole subtree fits in
+        // the reserve every other function keeps below the budget.
+        if !trapfree.contains_key(&f.entry) {
+            let _ = writeln!(
+                self.bodies,
+                "  if (__builtin_expect(depth > {}, 0)) {{ GEX_C64({}u) = 0x{:x}ull; return 0; }}",
+                stack_budget().saturating_sub(self.weight + TRAPFREE_RESERVE),
+                ctx::PC,
+                f.entry
+            );
+        }
         e.load_regs(&used);
+        // The stack pointer on entry: a return is the one the caller
+        // expects when it goes to `ret` with SP back here (plus the popped
+        // return address on x86-64).
+        e.line(format!("const uint64_t sp0 = {};", reg_name(sp_reg())));
         // Block 0 is the entry and comes first, so control falls into it.
         for (i, b) in f.blocks.iter().enumerate() {
             e.line(format!("L{i}: {{"));
@@ -210,7 +245,7 @@ impl FnUnit {
             for s in &b.stmts {
                 e.stmt(s)?;
             }
-            self.term(&mut e, f, i, known, sums, &mut calls)?;
+            self.term(&mut e, f, i, known, sums, trapfree, &mut calls)?;
             e.line("}");
         }
         self.bodies.push_str(&e.take_output());
@@ -223,7 +258,10 @@ impl FnUnit {
         if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
             r.target_check();
         }
-        r.line(format!("{name}(ctx, 0);"));
+        // No caller to predict: `ret` is an address no code has, so a
+        // return writes everything back and sets PC; should the guest really
+        // return there, PC says so and dispatch faults as tier-1's would.
+        r.line(format!("if ({name}(ctx, 0, NEED_ALL, ~0ull)) GEX_C64({}u) = ~0ull;", ctx::PC));
         r.line(format!("const uint64_t tgt = GEX_C64({}u);", ctx::PC));
         r.safepoint("tgt");
         r.dispatch("tgt");
@@ -242,6 +280,7 @@ impl FnUnit {
         i: usize,
         known: &HashSet<u64>,
         sums: &HashMap<u64, Summary>,
+        trapfree: &HashMap<u64, u32>,
         calls: &mut BTreeSet<u64>,
     ) -> Result<()> {
         let b = &f.blocks[i];
@@ -257,9 +296,10 @@ impl FnUnit {
             if !to.synthetic && to.start <= b.start {
                 e.line("if (--poll <= 0) {");
                 e.line("  poll = 1024;");
-                // Only what the loop head may read: the host resumes there
-                // (in tier-1) if it acts at this safepoint.
-                e.flush_keep_live(live[edge.to.index()]);
+                // Every dirty register, as tier-1 has them at a safepoint;
+                // the flags only when the loop head may read one (tier-1's
+                // dead-flag elimination leaves dead flags stale too).
+                e.flush_keep_live(non_flags().union(live[edge.to.index()]));
                 e.store_pc(&format!("0x{:x}ull", to.start));
                 e.line(format!("  gex_safepoint(ctx, 0x{:x}ll);", to.start));
                 e.line("}");
@@ -270,7 +310,7 @@ impl FnUnit {
         let leave = |e: &mut Emitter<'_>, pc: &str| {
             e.flush();
             e.store_pc(pc);
-            e.line("return;");
+            e.line("return 0;");
         };
         match &b.term {
             FTerm::Jump(edge) => goto(e, edge),
@@ -304,14 +344,38 @@ impl FnUnit {
                 // A known callee with a summary needs its inputs; the
                 // continuation needs what is live there. Anything else may
                 // read everything.
+                //
+                // Registers other than flags are limited by liveness only for
+                // a trap-free callee (`trap_free`): nothing the host observes
+                // or resumes from can happen before it returns. Otherwise
+                // every dirty register is written back, so the context is
+                // what tier-1's would be wherever the host looks.
                 let need = match (callee, ret) {
                     (Callee::Direct(t), Some(r)) if known.contains(t) => match sums.get(t) {
-                        Some(sm) => sm.inputs.union(live[r.to.index()]).union(RegSet::of(&[sp_reg()])),
+                        Some(sm) => {
+                            let n = sm.inputs.union(live[r.to.index()]).union(RegSet::of(&[sp_reg()]));
+                            if trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
+                                self.stats.calls_trapfree += 1;
+                                n
+                            } else {
+                                n.union(non_flags())
+                            }
+                        }
                         None => RegSet::ALL,
                     },
                     _ => RegSet::ALL,
                 };
                 e.flush_live(need);
+                // What the callee must hand back: the flags only if the
+                // continuation reads one; everything when there is no
+                // continuation (believed not to return).
+                let (need_back, ret_arg) = match ret {
+                    Some(r) if live_writebacks() => {
+                        let fl = !self.live[r.to.index()].inter(RegSet::of(&FLAG_REGS)).is_empty();
+                        (if fl { "NEED_ALL" } else { "0" }, format!("0x{ret_pc:x}ull"))
+                    }
+                    Some(_) | None => ("NEED_ALL", format!("0x{ret_pc:x}ull")),
+                };
                 e.line(format!(
                     "{{ const uint64_t sp_want = {spn} + {RET_SP_DELTA}ull;"
                 ));
@@ -319,46 +383,58 @@ impl FnUnit {
                     Callee::Direct(t) if known.contains(t) => {
                         calls.insert(*t);
                         self.stats.calls_known += 1;
-                        e.line(format!("  {}(ctx, depth + {});", body_name(*t), self.weight));
+                        e.line(format!(
+                            "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) return 0;",
+                            body_name(*t),
+                            self.weight
+                        ));
                     }
                     Callee::Direct(t) => {
                         *self.stats.leaves.entry(*t).or_default() += 1;
                         // Not ours: the rest of this function runs in tier-1.
                         e.store_pc(&format!("0x{t:x}ull"));
-                        e.line("  return;");
+                        e.line("  return 0;");
                     }
                     Callee::Indirect(v) => {
                         self.uses_call_known = true;
                         self.stats.calls_indirect += 1;
                         let t = e.v(*v);
                         e.line(format!(
-                            "  if (!{CALL_KNOWN}(ctx, {t}, depth + {})) {{",
+                            "  int rk = {CALL_KNOWN}(ctx, {t}, depth + {}, {need_back}, {ret_arg});",
                             self.weight + CALL_KNOWN_WEIGHT
                         ));
+                        e.line("  if (rk < 0) {");
                         e.store_pc(&t);
-                        e.line("    return;");
+                        e.line("    return 0;");
                         e.line("  }");
+                        e.line("  if (!rk) return 0;");
                     }
                 }
-                // The return check; everything the callee left is in ctx.
-                // `GEX_CGEN_MUTATE=NORETCHECK` drops it: a deliberate
-                // miscompilation, for the soundness corpus's mutation check.
-                if !mutate("NORETCHECK") {
-                    e.line(format!(
-                        "  if (GEX_C64({}u) != 0x{ret_pc:x}ull || GEX_C64({}u) != sp_want) return;",
-                        ctx::PC,
-                        ctx::SP
-                    ));
-                } else {
-                    e.line("  (void)sp_want;");
-                }
+                // The return check is the callee's result: 1 when it returned
+                // to `ret_pc` with SP back (it wrote back what the
+                // continuation reads), 0 when control went anywhere else
+                // (everything written back, PC set): then leave too.
+                e.line("  (void)sp_want;");
                 e.line("}");
-                e.invalidate();
+                // A summarised callee that returned as expected left its
+                // preserved registers as they were: no reload.
+                match callee {
+                    Callee::Direct(t) if known.contains(t) && live_writebacks() => {
+                        match sums.get(t) {
+                            Some(sm) => e.invalidate_except(sm.preserved.minus(RegSet::of(&[sp_reg()]))),
+                            None => e.invalidate(),
+                        }
+                    }
+                    _ => e.invalidate(),
+                }
                 match ret {
                     Some(edge) => goto(e, edge),
-                    // Believed not to return, and it did: leave to where it
-                    // returned (PC is already there).
-                    None => e.line("return;"),
+                    // Believed not to return, and it did: leave to the
+                    // return address, with everything written back.
+                    None => {
+                        e.store_pc(&format!("0x{ret_pc:x}ull"));
+                        e.line("return 0;");
+                    }
                 }
             }
             FTerm::TailCall { callee } => match callee {
@@ -372,7 +448,10 @@ impl FnUnit {
                     if exp("NORETPOLL") {
                         e.safepoint(&format!("0x{t:x}ull"));
                     }
-                    e.line(format!("GEX_MUSTTAIL return {}(ctx, depth);", body_name(*t)));
+                    // A tail call does not pass through a loop back-edge or
+                    // the root, so it polls (returns no longer do).
+                    e.safepoint(&format!("0x{t:x}ull"));
+                    e.line(format!("GEX_MUSTTAIL return {}(ctx, depth, need, ret);", body_name(*t)));
                 }
                 Callee::Direct(t) => {
                     *self.stats.leaves.entry(*t).or_default() += 1;
@@ -392,15 +471,33 @@ impl FnUnit {
                 // tier-1 polls on every indirect branch; so does this, with
                 // everything already written back and PC set.
                 let t = e.v(*target);
-                if exp("NOFLAGWB") && matches!(b.term, FTerm::Return { .. }) {
-                    e.forget_flags();
+                if matches!(b.term, FTerm::Return { .. }) {
+                    // The return the caller expects: write back what its
+                    // continuation may read (everything but the flags, and
+                    // the flags when `need` says so) and report success;
+                    // the caller carries on without looking at the context.
+                    // `GEX_CGEN_MUTATE=NORETCHECK` skips the check.
+                    let spn = reg_name(sp_reg());
+                    if mutate("NORETCHECK") {
+                        e.line("if (1) {");
+                    } else {
+                        e.line(format!(
+                            "if (__builtin_expect({t} == ret && {spn} == sp0 + {RET_SP_DELTA}ull, 1)) {{"
+                        ));
+                    }
+                    let flags: Vec<GuestReg> = FLAG_REGS.to_vec();
+                    e.flush_keep_live(RegSet::ALL.minus(RegSet::of(&flags)));
+                    e.line("  if (need & NEED_FLAGS) {");
+                    e.flush_keep_live(RegSet::of(&flags));
+                    e.line("  }");
+                    e.line("  return 1;");
+                    e.line("}");
                 }
+                // Anywhere else: everything written back, PC set; the callers
+                // unwind and the root polls and dispatches.
                 e.flush();
                 e.store_pc(&t);
-                if !exp("NORETPOLL") {
-                    e.safepoint(&t);
-                }
-                e.line("return;");
+                e.line("return 0;");
             }
             FTerm::Syscall { next_pc, next } => {
                 e.flush();
@@ -409,7 +506,7 @@ impl FnUnit {
                 e.invalidate();
                 match next {
                     Some(edge) => goto(e, edge),
-                    None => e.line("return;"),
+                    None => e.line("return 0;"),
                 }
             }
             FTerm::Illegal { raw, pc } => {
@@ -424,10 +521,11 @@ impl FnUnit {
 
     pub fn source(&self) -> String {
         let mut s = String::from("#include \"gex_abi.h\"\n\n");
+        s.push_str(NEED_DEFS);
         for a in &self.protos {
-            let _ = writeln!(s, "void {}(int ctx, int32_t depth);", body_name(*a));
+            let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
         }
-        let _ = writeln!(s, "int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth);\n");
+        let _ = writeln!(s, "int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n");
         s.push_str(&self.bodies);
         s
     }
@@ -439,14 +537,14 @@ impl FnUnit {
 pub fn call_known_source(entries: &[u64]) -> String {
     let mut s = String::from("#include \"gex_abi.h\"\n\n");
     for a in entries {
-        let _ = writeln!(s, "void {}(int ctx, int32_t depth);", body_name(*a));
+        let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
     }
-    let _ = writeln!(s, "\nint {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth) {{");
+    let _ = writeln!(s, "\nint {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret) {{");
     s.push_str("  switch (target) {\n");
     for a in entries {
-        let _ = writeln!(s, "  case 0x{a:x}ull: {}(ctx, depth); return 1;", body_name(*a));
+        let _ = writeln!(s, "  case 0x{a:x}ull: return {}(ctx, depth, need, ret);", body_name(*a));
     }
-    s.push_str("  default: return 0;\n  }\n}\n");
+    s.push_str("  default: return -1;\n  }\n}\n");
     s
 }
 
@@ -595,4 +693,95 @@ fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
         }
     }
     live
+}
+
+/// Every register but the flags.
+fn non_flags() -> RegSet {
+    RegSet::ALL.minus(RegSet::of(&FLAG_REGS))
+}
+
+/// Stack every non-trap-free function keeps free below the budget for a
+/// trap-free subtree, which has no depth guard of its own.
+pub const TRAPFREE_RESERVE: u32 = 64 << 10;
+
+/// The trap-free functions, with the stack estimate of their whole subtree.
+///
+/// Trap-free: once called, the function returns to its caller without
+/// anything the host could observe or resume from: no syscall, no safepoint
+/// (no backward edge, no tail call), no clobbering host call, no exit that
+/// leaves the function tier (unresolved or incomplete-switch jumps,
+/// indirect calls, calls to anything but trap-free functions), no illegal
+/// instruction, and not recursive. S2's summary must also say it cannot
+/// unwind, leave pending or reach unknown code. Its callers then write back
+/// only what it reads and what their continuation reads: registers they
+/// hold dead in locals are never seen by anyone. Its subtree must fit in
+/// `TRAPFREE_RESERVE`, since it has no depth guard.
+pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u64, u32> {
+    let by_entry: HashMap<u64, &Function> = funcs.iter().map(|f| (f.entry, f)).collect();
+    // Local conditions, and the direct callees.
+    let mut cand: HashMap<u64, (u32, Vec<u64>)> = HashMap::new();
+    'f: for f in funcs {
+        let Some(sm) = sums.get(&f.entry) else { continue };
+        if sm.may_unwind || sm.may_leave_pending || sm.unknown_callee {
+            continue;
+        }
+        let mut callees = Vec::new();
+        for b in &f.blocks {
+            if b.stmts.iter().any(emit::clobbers) {
+                continue 'f;
+            }
+            let backward = |e: &Edge| {
+                let to = &f.blocks[e.to.index()];
+                !to.synthetic && to.start <= b.start
+            };
+            match &b.term {
+                FTerm::Jump(e) if !backward(e) => {}
+                FTerm::Branch {
+                    taken, not_taken, ..
+                } if !backward(taken) && !backward(not_taken) => {}
+                FTerm::Switch { cases, table, .. }
+                    if table.complete && !cases.iter().any(|(_, e)| backward(e)) => {}
+                FTerm::Call {
+                    callee: Callee::Direct(t),
+                    ret: Some(r),
+                    ..
+                } if by_entry.contains_key(t) && !backward(r) => callees.push(*t),
+                FTerm::Return { .. } => {}
+                _ => continue 'f,
+            }
+        }
+        cand.insert(f.entry, (frame_weight(&registers(f)), callees));
+    }
+    // Callees trap-free too, no recursion, bounded stack: a depth-first
+    // walk that memoises the subtree's stack and treats a cycle as failure.
+    fn visit(
+        a: u64,
+        cand: &HashMap<u64, (u32, Vec<u64>)>,
+        memo: &mut HashMap<u64, Option<u32>>,
+        onstack: &mut HashSet<u64>,
+    ) -> Option<u32> {
+        if let Some(m) = memo.get(&a) {
+            return *m;
+        }
+        if !onstack.insert(a) {
+            return None; // recursion
+        }
+        let r = cand.get(&a).and_then(|(w, callees)| {
+            let mut deepest = 0u32;
+            for c in callees {
+                deepest = deepest.max(visit(*c, cand, memo, onstack)? + CALL_KNOWN_WEIGHT);
+            }
+            Some(w + deepest).filter(|n| *n <= TRAPFREE_RESERVE)
+        });
+        onstack.remove(&a);
+        memo.insert(a, r);
+        r
+    }
+    let mut memo = HashMap::new();
+    let mut onstack = HashSet::new();
+    let keys: Vec<u64> = cand.keys().copied().collect();
+    for a in keys {
+        visit(a, &cand, &mut memo, &mut onstack);
+    }
+    memo.into_iter().filter_map(|(a, n)| n.map(|n| (a, n))).collect()
 }
