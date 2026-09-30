@@ -281,3 +281,47 @@ pub fn report(prog: &PeProgram, brief: bool) -> String {
     }
     o
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(rel: &str) -> String {
+        format!("{}/../gex-ld/tests/pe/bin/{rel}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    #[test]
+    fn the_report_shows_layout_imports_exports_tls_and_delay_imports() {
+        let prog = pe::load_closure(&fixture("x64/uses.exe"), &pe::HostFiles, &PeOptions::default()).unwrap();
+        let r = report(&prog, false);
+        for want in [
+            "PE32+ AMD64",
+            "preferred 0x140000000 REBASED  executable",
+            "delay-loaded by uses.exe",
+            "relocations: 45 (HIGHLOW 0, DIR64 45",
+            "liba.dll!a_fwd_b -> 0x",
+            "(via liba.dll!a_fwd_b)",
+            "liba.dll!#7 -> 0x",
+            "[system] kernel32.dll!HeapAlloc (via liba.dll!a_heap)",
+            "#7     (by ordinal only) 0x",
+            "#9     a_fwd_ord -> forwarder libb.#3",
+            "delayed.dll!d_mul thunk 0x",
+            "TLS: index 0x",
+            "10/\"GREETING\"/1033",
+            ".pdata: ",
+            "placeholders (0x300000-0x400000, 16 bytes each):",
+        ] {
+            assert!(r.contains(want), "no {want:?} in:\n{r}");
+        }
+        assert!(!r.contains("missing DLLs"));
+    }
+
+    #[test]
+    fn options_parse_and_errors_name_the_file() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        cmd_pe_info(&args(&[&fixture("x86/uses.exe"), "--brief", "--pack", "--base", "libb=0x2000000"])).unwrap();
+        let e = cmd_pe_info(&args(&[&fixture("x64/highbase-fixed.exe")])).unwrap_err();
+        assert!(format!("{e:#}").contains("highbase-fixed.exe: PE placement"), "{e:#}");
+        assert!(cmd_pe_info(&args(&["--bogus"])).is_err());
+    }
+}
