@@ -1788,6 +1788,11 @@ fn decode_simd_copy(raw: u32, q: bool, u: u32, scalar: bool) -> Inst {
             let Some((lane_bytes, index)) = decode_lane(imm5) else {
                 return Inst::Undefined { raw };
             };
+            // No `.1d` vector arrangement (the scalar `mov d0, v1.d[1]` is
+            // the scalar group's, which passes `q` set).
+            if lane_bytes == 8 && !q && !scalar {
+                return Inst::Undefined { raw };
+            }
             Inst::VDupElement {
                 vd: VReg(bits(raw, 4, 0) as u8),
                 vn: VReg(bits(raw, 9, 5) as u8),
