@@ -1099,14 +1099,15 @@ fn cmd_disasm(args: &[String]) -> Result<()> {
         if !seg.executable {
             continue;
         }
-        for (i, word) in seg.bytes.chunks_exact(4).enumerate() {
-            let pc = seg.vaddr + (i * 4) as u64;
+        let mut off = 0usize;
+        while off < seg.bytes.len() {
+            let pc = seg.vaddr + off as u64;
             if let Some(sym) = symbols.iter().find(|s| s.value == pc) {
                 println!("\n{:016x} <{}>:", pc, sym.name);
             }
-            let raw = u32::from_le_bytes(word.try_into().unwrap());
-            let inst = gex_isa::decode(raw, pc);
-            println!("{pc:8x}:\t{raw:08x}\t{}", gex_isa::fmt::disasm(&inst, pc));
+            let (text, len) = gex_xlate::arch::disasm(&seg.bytes[off..], pc);
+            println!("{pc:8x}:\t{text}");
+            off += len;
         }
     }
     Ok(())
@@ -1134,7 +1135,11 @@ fn cmd_ir(args: &[String]) -> Result<()> {
     let at = at.unwrap_or(image.entry);
 
     let view = gex_xlate::CodeView::new(&image);
-    let block = gex_lift::lift_block(|pc| view.fetch(pc), at, gex_lift::BlockLimits::default());
+    let block = gex_xlate::lift_block(
+        |pc, buf| view.fetch(pc, buf),
+        at,
+        gex_xlate::BlockLimits::default(),
+    );
     print!("{}", gex_ir::print::block(&block));
     Ok(())
 }

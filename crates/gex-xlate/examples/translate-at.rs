@@ -3,6 +3,10 @@
 //!
 //!   cargo run --release -p gex-xlate --example translate-at -- <elf> <addr> [max-blocks]
 //!
+//! `TRANSLATE_AT_DUMP=<dir>` also writes the modules there (`m<i>.wasm`, or
+//! `rt.wasm` for one address), to compare one translator's output with
+//! another's byte for byte.
+//!
 //! The browser has no ahead-of-time step, so every block arrives through
 //! `translate_runtime`, which starts from one address in live memory and
 //! follows only what it reaches -- a different path than `translate_image`.
@@ -100,6 +104,9 @@ fn main() {
             began.elapsed().as_secs_f64()
         );
         for (i, m) in modules.iter().enumerate() {
+            if let Some(d) = std::env::var_os("TRANSLATE_AT_DUMP") {
+                std::fs::write(std::path::Path::new(&d).join(format!("m{i}.wasm")), &m.wasm).expect("write the module");
+            }
             println!(
                 "  module {i}: {} KiB, {} table slots, {} pages claimed, {} exported blocks",
                 m.wasm.len() / 1024,
@@ -125,6 +132,9 @@ fn main() {
         false,
         &Default::default(),
     );
+    if let Some(d) = std::env::var_os("TRANSLATE_AT_DUMP") {
+        std::fs::write(std::path::Path::new(&d).join("rt.wasm"), &unit.wasm).expect("write the module");
+    }
     println!(
         "{} blocks, {} instructions, {} KiB of wasm, in {:.2}s",
         stats.blocks,

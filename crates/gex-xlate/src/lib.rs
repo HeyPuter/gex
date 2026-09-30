@@ -22,6 +22,7 @@
 pub use gex_emit::merge;
 pub use gex_emit::module::Linkage;
 pub use gex_emit::module::Refill;
+pub use gex_emit::module::Identity;
 pub use gex_emit::module::Metadata;
 /// Turn the per-block stack-pointer check on, for a host with no environment
 /// to read `GEX_CHECK_SP` from. See `gex_emit::tier1::set_check_sp`.
@@ -34,8 +35,11 @@ pub use gex_emit::TranslatedModule;
 use gex_emit::ModuleBuilder;
 use gex_ir::{pass, Block, Term};
 use gex_ld::Image;
-use gex_lift::{lift_block, BlockLimits};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+pub mod arch;
+pub use arch::{lift_block, BlockLimits};
+use gex_abi::INST_ALIGN;
 
 pub mod intrinsic;
 pub use intrinsic::Intrinsic;
@@ -156,24 +160,41 @@ impl<'a> CodeView<'a> {
         CodeView { image }
     }
 
-    /// Fetch the instruction word at `pc`, if it lies in executable memory.
-    pub fn fetch(&self, pc: u64) -> Option<u32> {
-        if !pc.is_multiple_of(4) {
-            return None;
+    /// Copy the instruction bytes at `pc` into `buf`, if it lies in
+    /// executable memory, returning how many were available (up to 16).
+    pub fn fetch(&self, pc: u64, buf: &mut arch::FetchBuf) -> usize {
+        if !pc.is_multiple_of(INST_ALIGN) {
+            return 0;
         }
         for seg in &self.image.segments {
             if !seg.executable {
                 continue;
             }
-            if pc >= seg.vaddr && pc + 4 <= seg.vaddr + seg.bytes.len() as u64 {
+            if pc >= seg.vaddr && pc < seg.vaddr + seg.bytes.len() as u64 {
                 let off = (pc - seg.vaddr) as usize;
-                return Some(u32::from_le_bytes(
-                    seg.bytes[off..off + 4].try_into().unwrap(),
-                ));
+                let n = (seg.bytes.len() - off).min(16);
+                buf[..n].copy_from_slice(&seg.bytes[off..off + n]);
+                return n;
             }
         }
-        None
+        0
     }
+
+    /// Fetch gated on the *section* flags, so a block never runs off the end
+    /// of a code section into the tables mapped beside it.
+    pub fn fetch_code(&self, pc: u64, buf: &mut arch::FetchBuf) -> usize {
+        if !self.is_executable(pc) {
+            return 0;
+        }
+        let n = self.fetch(pc, buf);
+        // Trim to the executable span: the bytes past it are not code.
+        let mut k = INST_ALIGN as usize;
+        while k < n && self.is_executable(pc + k as u64) {
+            k += 1;
+        }
+        n.min(k)
+    }
+
 
     fn is_executable(&self, addr: u64) -> bool {
         // Section flags, not `PF_X`: a segment's executable bit also covers
@@ -355,7 +376,7 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
     }
     if !opts.lazy {
         for sym in &image.symbols {
-            if view.is_executable(sym.value) && sym.value % 4 == 0 {
+            if view.is_executable(sym.value) && sym.value % INST_ALIGN == 0 {
                 worklist.insert(sym.value);
             }
         }
@@ -374,7 +395,7 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
                     continue;
                 }
                 let v = u64::from_le_bytes(chunk.try_into().unwrap());
-                if v % 4 == 0 && view.is_executable(v) {
+                if v % INST_ALIGN == 0 && view.is_executable(v) {
                     worklist.insert(v);
                 }
             }
@@ -403,45 +424,14 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
             if !seg.executable {
                 continue;
             }
-            let mut page: [Option<u64>; 32] = [None; 32];
-            let end = seg.vaddr + seg.bytes.len() as u64;
-            let mut a = seg.vaddr;
-            while a + 4 <= end {
-                if !view.is_executable(a) {
-                    page = [None; 32];
-                    a += 4;
-                    continue;
-                }
-                let off = (a - seg.vaddr) as usize;
-                let raw = u32::from_le_bytes(seg.bytes[off..off + 4].try_into().unwrap());
-                match gex_isa::decode(raw, a) {
-                    gex_isa::Inst::Adrp { rd: gex_isa::RegSel::Gp(r), target } => {
-                        page[r as usize] = Some(target);
-                    }
-                    gex_isa::Inst::Adr { target, .. } => {
-                        if target % 4 == 0 && view.is_executable(target) {
-                            worklist.insert(target);
-                        }
-                    }
-                    gex_isa::Inst::AddSubImm {
-                        op: gex_isa::AddOp::Add,
-                        rd: gex_isa::RegSel::Gp(rd),
-                        rn: gex_isa::RegSel::Gp(rn),
-                        imm,
-                        ..
-                    } => {
-                        if let Some(p) = page[rn as usize] {
-                            let target = p.wrapping_add(imm);
-                            if target % 4 == 0 && view.is_executable(target) {
-                                worklist.insert(target);
-                            }
-                        }
-                        page[rd as usize] = None;
-                    }
-                    _ => {}
-                }
-                a += 4;
-            }
+            arch::scan_code_pointers(
+                &seg.bytes,
+                seg.vaddr,
+                &|a| view.is_executable(a),
+                &mut |t| {
+                    worklist.insert(t);
+                },
+            );
         }
         stats.discovered_from_data += worklist.len() - before_code;
     }
@@ -453,30 +443,25 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
                 continue;
             }
             let end = seg.vaddr + seg.bytes.len() as u64;
-            let mut a = seg.vaddr;
-            while a + 4 <= end {
-                // Skip addresses that are not really instructions: an
-                // executable segment is full of padding and literal pools, and
-                // for a shared library also holds string tables, relocations
-                // and `.rodata`. `is_executable` uses the section flags to say
-                // which bytes are code. Skipping the rest keeps exhaustive mode
-                // affordable (three quarters of the slots on a static musl
-                // binary) and avoids folding a `.rodata` block over a real
-                // entry point's slot -- the bug in #46 that broke `apt` on libc.
-                if !view.is_executable(a) {
-                    a += 4;
-                    continue;
-                }
-                match view.fetch(a).map(|raw| gex_isa::decode(raw, a)) {
-                    Some(gex_isa::Inst::Unknown { .. })
-                    | Some(gex_isa::Inst::Undefined { .. })
-                    | None => {}
-                    Some(_) => {
-                        worklist.insert(a);
-                    }
-                }
-                a += 4;
-            }
+            // Skip addresses that are not really instructions: an executable
+            // segment is full of padding and literal pools, and for a shared
+            // library also holds string tables, relocations and `.rodata`.
+            // `is_executable` (behind `fetch_code`) uses the section flags to
+            // say which bytes are code. Skipping the rest keeps exhaustive
+            // mode affordable (three quarters of the slots on a static musl
+            // binary) and avoids folding a `.rodata` block over a real entry
+            // point's slot -- the bug in #46 that broke `apt` on libc. The
+            // entries found so far anchor the sweep (see `arch::sweep`).
+            let anchors: Vec<u64> = worklist.range(seg.vaddr..end).copied().collect();
+            let mut found: Vec<u64> = Vec::new();
+            arch::sweep(
+                &|pc, buf| view.fetch_code(pc, buf),
+                seg.vaddr,
+                end,
+                &anchors,
+                &mut |a| found.push(a),
+            );
+            worklist.extend(found);
         }
         stats.discovered_exhaustively = worklist.len().saturating_sub(before);
     }
@@ -512,11 +497,7 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
             // closure and the runtime disagree, and the closure lifts blocks the
             // runtime never would. This is the closure-only corruption `gpgv`
             // hit verifying an EdDSA signature.
-            let mut block = lift_block(
-                |pc| if view.is_executable(pc) { view.fetch(pc) } else { None },
-                addr,
-                opts.limits,
-            );
+            let mut block = lift_block(|pc, buf| view.fetch_code(pc, buf), addr, opts.limits);
             pass::optimize(&mut block);
             block
         });
@@ -524,7 +505,7 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
         let mut next: Vec<u64> = Vec::new();
         for block in lifted {
             stats.blocks += 1;
-            stats.instructions += ((block.end - block.start) / 4) as usize;
+            stats.instructions += ((block.end - block.start) / INST_ALIGN) as usize;
             if matches!(block.term, Term::Illegal { .. }) {
                 stats.illegal_blocks += 1;
                 // Name the instruction so the gap can be closed: a block that
@@ -579,21 +560,28 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
         let touched: std::collections::BTreeSet<u64> =
             collected.iter().map(|b| b.start & !0xfff).collect();
         let mut fill: Vec<u64> = Vec::new();
+        // The blocks already on a page anchor its sweep, so on x86-64 the
+        // gaps are filled from real instruction boundaries rather than from
+        // every byte.
+        let mut anchors: Vec<u64> = collected.iter().map(|b| b.start).collect();
+        anchors.sort_unstable();
         for &pg in &touched {
-            let mut a = pg;
-            while a < pg + 0x1000 {
-                if !seen.contains(&a) && view.is_executable(a) {
-                    if let Some(raw) = view.fetch(a) {
-                        if !matches!(
-                            gex_isa::decode(raw, a),
-                            gex_isa::Inst::Unknown { .. } | gex_isa::Inst::Undefined { .. }
-                        ) {
-                            seen.insert(a);
-                            fill.push(a);
-                        }
-                    }
+            let lo = anchors.partition_point(|&a| a < pg);
+            let hi = anchors.partition_point(|&a| a < pg + 0x1000);
+            let page_anchors = &anchors[lo..hi];
+            let mut found: Vec<u64> = Vec::new();
+            arch::sweep(
+                &|pc, buf| view.fetch_code(pc, buf),
+                pg,
+                pg + 0x1000,
+                page_anchors,
+                &mut |a| found.push(a),
+            );
+            for a in found {
+                if !seen.contains(&a) {
+                    seen.insert(a);
+                    fill.push(a);
                 }
-                a += 4;
             }
         }
         fill.sort_unstable();
@@ -601,17 +589,13 @@ fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
             if let Some(&k) = opts.intrinsics.get(&addr) {
                 return intrinsic::block(addr, k);
             }
-            let mut block = lift_block(
-                |pc| if view.is_executable(pc) { view.fetch(pc) } else { None },
-                addr,
-                opts.limits,
-            );
+            let mut block = lift_block(|pc, buf| view.fetch_code(pc, buf), addr, opts.limits);
             pass::optimize(&mut block);
             block
         });
         for block in lifted {
             stats.blocks += 1;
-            stats.instructions += ((block.end - block.start) / 4) as usize;
+            stats.instructions += ((block.end - block.start) / INST_ALIGN) as usize;
             collected.push(block);
         }
     }
@@ -748,22 +732,13 @@ pub fn translate_object(
     // here: an executable segment is full of padding and literal pools.
     let mut scanned: Vec<u64> = Vec::new();
     let seeds = if seeds.is_empty() {
-        let mut a = lo;
-        while a + 4 <= hi {
-            if executable(a) {
-                let off = a as usize;
-                if off + 4 <= memory.len() {
-                    let raw = u32::from_le_bytes(memory[off..off + 4].try_into().unwrap());
-                    if !matches!(
-                        gex_isa::decode(raw, a),
-                        gex_isa::Inst::Unknown { .. } | gex_isa::Inst::Undefined { .. }
-                    ) {
-                        scanned.push(a);
-                    }
-                }
-            }
-            a += 4;
-        }
+        arch::sweep(
+            &|pc, buf| fetch_code_bytes(memory, executable, pc, buf),
+            lo,
+            hi,
+            &[],
+            &mut |a| scanned.push(a),
+        );
         &scanned[..]
     } else {
         seeds
@@ -933,9 +908,34 @@ fn translate_seeded(
     shared_memory: bool,
     intrinsics: &HashMap<u64, Intrinsic>,
 ) -> (TranslatedModule, Stats) {
-    let (blocks, mut stats) = discover(
+    let (mut blocks, mut stats) = discover(
         memory, entry, seeds, executable, known, limits, max_blocks, intrinsics,
     );
+    // A dispatch slot spans more bytes than an instruction (x86-64): every
+    // block already translated that shares a slot with one of these has to be
+    // in the same module, or this module's slot write would hide it. Lift
+    // those again here; the slot then gets a trampoline covering all of them.
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        let span = 1u64 << gex_abi::DISPATCH_SHIFT;
+        let mut have: HashSet<u64> = blocks.iter().map(|b| b.start).collect();
+        let mut i = 0;
+        while i < blocks.len() {
+            let a = blocks[i].start;
+            let lo = a & !(span - 1);
+            for b in lo..lo + span {
+                if b != a && !have.contains(&b) && known(b) && fetchable(memory, executable, b) {
+                    have.insert(b);
+                    let (blk, _) = match intrinsics.get(&b) {
+                        Some(&k) => (intrinsic::block(b, k), None),
+                        None => lift_one(b, memory, executable, limits),
+                    };
+                    stats.blocks += 1;
+                    blocks.push(blk);
+                }
+            }
+            i += 1;
+        }
+    }
     let mut modules = emit_modules(blocks, entry, page_table, shared_memory, false, usize::MAX);
     let module = modules.pop().expect("an unbounded budget emits one module");
     stats.wasm_bytes = module.wasm.len();
@@ -981,27 +981,31 @@ fn discover(
             match intrinsics.get(&a) {
                 // Not lifted at all, so discovery never walks into the
                 // function's body and the module never carries it.
-                Some(&k) => intrinsic::block(a, k),
+                Some(&k) => (intrinsic::block(a, k), None),
                 None => lift_one(a, memory, executable, limits),
             }
         });
 
         let mut next: Vec<u64> = Vec::new();
-        for block in lifted {
+        for (block, folded) in lifted {
             stats.blocks += 1;
-            stats.instructions += ((block.end - block.start) / 4) as usize;
+            stats.instructions += ((block.end - block.start) / INST_ALIGN) as usize;
             if matches!(block.term, Term::Illegal { .. }) {
                 stats.illegal_blocks += 1;
             }
 
-            // A computed branch whose target folded to a constant is worth
-            // following: that is every cross-object call in a dynamic program.
+            // A computed branch whose target folds to a constant through
+            // memory is worth following: that is every cross-object call in
+            // a dynamic program. Folded on a scratch copy, never in the block
+            // that is emitted: memory read at translation time is a guess
+            // about the future -- a GOT slot lazily bound later, a global a
+            // store has not reached yet -- and code that bakes it in is wrong
+            // the moment it changes. Discovery can afford a wrong guess (an
+            // unneeded block); execution cannot.
             let mut targets: Vec<u64> = block.successors().chain(block.call_return).collect();
-            if let Term::Indirect { target, .. } = block.term {
-                if let Some(t) = pass::const_value(&block, target) {
-                    stats.discovered_from_data += 1;
-                    targets.push(t);
-                }
+            if let Some(t) = folded {
+                stats.discovered_from_data += 1;
+                targets.push(t);
             }
             for succ in targets {
                 // Deliberately *not* skipping an address inside a block
@@ -1034,28 +1038,76 @@ fn discover(
 
 /// Whether `pc` holds an instruction this translation may read.
 fn fetchable(memory: &[u8], executable: &(dyn Fn(u64) -> bool + Sync), pc: u64) -> bool {
-    pc % 4 == 0 && executable(pc) && pc as usize + 4 <= memory.len()
+    pc % INST_ALIGN == 0
+        && executable(pc)
+        && pc as usize + INST_ALIGN as usize <= memory.len()
 }
 
-/// Lift one block, with the folding that makes a PLT's indirect branch a
-/// discoverable target.
+/// Copy the instruction bytes at `pc` out of live memory, stopping at the
+/// first byte that is not executable, so a block never decodes past the end
+/// of a mapping.
+fn fetch_code_bytes(
+    memory: &[u8],
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    pc: u64,
+    buf: &mut arch::FetchBuf,
+) -> usize {
+    if !fetchable(memory, executable, pc) {
+        return 0;
+    }
+    let off = pc as usize;
+    let mut n = (memory.len() - off).min(16);
+    // The first `INST_ALIGN` bytes are known executable; check the rest.
+    let mut k = INST_ALIGN as usize;
+    while k < n {
+        if !executable(pc + k as u64) {
+            n = k;
+            break;
+        }
+        k += 1;
+    }
+    buf[..n].copy_from_slice(&memory[off..off + n]);
+    n
+}
+
+/// Lift one block, and separately work out where its indirect branch (if
+/// any) points *right now* by folding through memory, so a PLT's `br`/`jmp`
+/// through a GOT slot becomes a target discovery can follow.
+///
+/// The folding happens on a scratch copy. The block returned for emission
+/// reads memory at run time like any other: what a slot holds at translation
+/// time is not what it holds later (lazy binding, a store this translation
+/// ran ahead of), and the dispatch table, not the guess, decides the target.
+/// Address ranges that are writable AND executable right now: a JIT's code
+/// area. Blocks lifted from them carry a byte guard (see `Block::guard`). The
+/// host refreshes this before each translation.
+static VOLATILE_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn set_volatile_ranges(ranges: Vec<(u64, u64)>) {
+    *VOLATILE_RANGES.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
+}
+
+fn is_volatile(addr: u64) -> bool {
+    VOLATILE_RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(s, e)| addr >= *s && addr < *e)
+}
+
+/// The most bytes a guard compares: a block longer than this is guarded on
+/// its head only, which still catches a JIT reusing the region.
+const GUARD_MAX: usize = 256;
+
 fn lift_one(
     addr: u64,
     memory: &[u8],
     executable: &(dyn Fn(u64) -> bool + Sync),
     limits: BlockLimits,
-) -> Block {
-    let fetch = |pc: u64| -> Option<u32> {
-        if !fetchable(memory, executable, pc) {
-            return None;
-        }
-        let off = pc as usize;
-        Some(u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()))
-    };
+) -> (Block, Option<u64>) {
+    let fetch = |pc: u64, buf: &mut arch::FetchBuf| fetch_code_bytes(memory, executable, pc, buf);
     let mut block = lift_block(fetch, addr, limits);
-    // Folded through memory before the ordinary passes, so a PLT's GOT load
-    // becomes a constant and its `br` becomes a target discovery can follow.
-    pass::const_fold_with_memory(&mut block, &|a, bytes| {
+    let read = |a: u64, bytes: u32| -> Option<u64> {
         let off = a as usize;
         if off + bytes as usize > memory.len() {
             return None;
@@ -1066,12 +1118,43 @@ fn lift_one(
             4 => u32::from_le_bytes(memory[off..off + 4].try_into().unwrap()) as u64,
             _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
         })
-    });
+    };
+    if !gex_abi::X86 {
+        // A64: folded through memory before the ordinary passes, so a PLT's
+        // GOT load becomes a constant and its `br` becomes a target discovery
+        // can follow.
+        pass::const_fold_with_memory(&mut block, &read);
+        pass::optimize(&mut block);
+        let folded = match block.term {
+            Term::Indirect { target, .. } => pass::const_value(&block, target),
+            _ => None,
+        };
+        return (block, folded);
+    }
     pass::optimize(&mut block);
-    block
+    // Self-modifying code with no flush instruction to announce it.
+    if is_volatile(addr) {
+        let lo = addr as usize;
+        let hi = (block.end as usize).max(lo + 1).min(lo + GUARD_MAX).min(memory.len());
+        if hi > lo {
+            block.guard = Some(memory[lo..hi].to_vec());
+        }
+    }
+    // x86-64: folded on a scratch copy only, never in the emitted block --
+    // memory read at translation time is a guess about the future (a GOT slot
+    // bound later), and code that bakes it in is wrong once it changes.
+    let folded = match block.term {
+        Term::Indirect { target, .. } => {
+            let mut probe = block.clone();
+            pass::const_fold_with_memory(&mut probe, &read);
+            pass::const_value(&probe, target)
+        }
+        _ => None,
+    };
+    (block, folded)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "x86")))]
 mod tests {
     use super::*;
     use gex_ld::elf::Segment;
@@ -1225,3 +1308,4 @@ mod tests {
         assert!(!m.wasm.is_empty());
     }
 }
+pub use gex_emit::set_trace_blocks;
