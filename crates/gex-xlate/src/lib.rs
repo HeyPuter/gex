@@ -111,6 +111,10 @@ pub struct Options {
     /// continue where the last stopped, so their blocks do not claim the same
     /// slots and overwrite one another.
     pub first_slot: u64,
+    /// Build the function tier: every block also as C, compiled by clang and
+    /// spliced into the tier-1 module (`gex-cgen`, docs/function-tier.md).
+    /// Needs the `cgen` feature; runtime translation stays tier-1.
+    pub cgen: bool,
 }
 
 impl Default for Options {
@@ -130,6 +134,7 @@ impl Default for Options {
             demand_fill: false,
             linkage: Linkage::Own,
             first_slot: 0,
+            cgen: false,
         }
     }
 }
@@ -636,13 +641,37 @@ fn image_builder(image: &Image, opts: &Options) -> ModuleBuilder {
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
     let (collected, mut stats) = image_blocks(image, opts);
     let mut builder = image_builder(image, opts);
+    let mut cgen: Vec<(Block, u32)> = Vec::new();
     for block in collected {
-        builder.reserve(block.start);
+        let f = builder.reserve(block.start);
+        if opts.cgen {
+            cgen.push((block.clone(), f));
+        }
         builder.add_block(block);
     }
-    let module = builder.finish();
+    let mut module = builder.finish();
+    if opts.cgen {
+        module.wasm = cgen_splice(&module.wasm, &cgen);
+    }
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
+}
+
+/// The function tier's version of a tier-1 module (`Options::cgen`). Loud on
+/// failure: a build that asked for the function tier must not quietly ship
+/// tier-1.
+#[cfg(feature = "cgen")]
+fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)]) -> Vec<u8> {
+    let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
+    match gex_cgen::build(wasm, &refs) {
+        Ok((w, _)) => w,
+        Err(e) => panic!("function tier (--cgen): {e:#}"),
+    }
+}
+
+#[cfg(not(feature = "cgen"))]
+fn cgen_splice(_: &[u8], _: &[(Block, u32)]) -> Vec<u8> {
+    panic!("Options::cgen is set, but gex-xlate was built without the `cgen` feature")
 }
 
 /// Like [`translate_image`], but emits SEVERAL modules when the object has more
