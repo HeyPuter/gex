@@ -352,6 +352,8 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
         format!("{xlate:?}").into_bytes(),
+        // The same bytes mean different instructions in 32-bit mode.
+        vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
         // different symbol tables translate differently.
         (image.symbols.len() as u64).to_le_bytes().into(),
@@ -412,6 +414,12 @@ fn run_program_with(
     nt_setup: Option<&nt::NtSetup>,
 ) -> Result<(Exit, Stats)> {
     let image = &program.exe;
+    // Before anything is translated: a 32-bit (i386) program's code is
+    // decoded in compatibility mode, and the kernel below speaks its ABI.
+    // One setting per host process -- the native runner keeps one translator
+    // for every guest process, so a mixed tree is not supported here (the
+    // browser has a shim per process).
+    gex_xlate::set_compat(program.compat());
 
     // A profile records where a previous run went, feeding `extra_entries` so
     // discovery reaches entry points static analysis cannot. It changes the
@@ -624,6 +632,12 @@ fn run_program_with(
         envp: opts.env.clone(),
         ..kernel
     };
+    // A 32-bit (i386) program: the kernel speaks its ABI and the translator
+    // decodes its code in compatibility mode, for this process and the ones
+    // it forks. One setting per host process: the native runner keeps one
+    // translator for every guest process, so a mixed tree is not supported
+    // here (the browser has a shim per process).
+    kernel.compat = program.compat();
     // Mounts survive an exec, so they are only established for a new process.
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
@@ -1417,8 +1431,12 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
             }
             // Through the table, so this process's own children -- if any are
-            // still running -- become init's rather than being lost.
-            procs.exit(pid, code);
+            // still running -- become init's rather than being lost. The table
+            // publishes into the same cell `wait4` collects from, so it gets
+            // the kernel's encoding: handing it `code` and correcting the cell
+            // afterwards let a parent parked in `wait4` read `exit 7` as a
+            // death by signal 7 ("Bus error") in between.
+            procs.exit(pid, wstatus);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
             done.notify_all();
@@ -2703,6 +2721,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let data = memory.bytes();
                 let mut gm = GuestMem::new(data);
                 gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, v as u64);
+            }
+            // An x87 transcendental or remainder, computed on the register
+            // stack in the context.
+            if reg == gex_kernel::x86::SYSREG_X87 {
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, v as u64);
             }
             Ok(())
         },

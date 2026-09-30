@@ -157,7 +157,11 @@ async function boot(ctx) {
   document.getElementById('boot').disabled = true;
   ctx.busy('fetching root filesystem');
   try {
-    const tree = await ctx.rootfs(archAsset('/rootfs/busybox.tar'));
+    // `?image=busybox32` boots the i386 image on the x86 guest: the same
+    // busybox as a 32-bit program, run in compatibility mode. Its closure is
+    // the 64-bit one's, so none is loaded for it.
+    const image = new URLSearchParams(location.search).get('image');
+    const tree = await ctx.rootfs(archAsset(image ? `/rootfs/${image}.tar` : '/rootfs/busybox.tar'));
     const files = { ...tree.files };
     // A symlink becomes a copy of the target's bytes, and the mode must travel
     // with them: without it `/bin/sh` (a symlink to dash) has no execute bit
@@ -188,7 +192,7 @@ async function boot(ctx) {
     // be, differing from it only by `ld.so`.
     ctx.busy('loading the closure');
     const { loadClosure } = await import('./closure.js');
-    const wantClosure = new URLSearchParams(location.search).get('closure') !== '0';
+    const wantClosure = new URLSearchParams(location.search).get('closure') !== '0' && !image;
     let closure = null;
     try {
       closure = !wantClosure ? null : await loadClosure(archAsset('/closure/busybox'), {
