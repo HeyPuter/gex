@@ -1198,7 +1198,10 @@ pub struct Summary {
     pub caller_frame_writes: Slots,
     /// Registers whose entry values the function (or a callee) may use to
     /// form a memory address. A caller whose frame address sits in one of
-    /// these at a call has let its frame escape to the callee.
+    /// these at a call has let its frame escape to the callee. `sp` is in
+    /// the set only when the function lets its entry stack pointer (its
+    /// caller's frame boundary) escape: stores it, returns something
+    /// derived from it, or saves it as `setjmp` does.
     pub addr_inputs: RegSet,
     /// Some path returns to the caller.
     pub may_return: bool,

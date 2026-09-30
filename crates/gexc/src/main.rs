@@ -42,6 +42,7 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "funcs" => cmd_funcs(&argv[2..]),
         "-h" | "--help" | "help" => {
             usage();
             Ok(ExitCode::SUCCESS)
@@ -80,6 +81,12 @@ usage:
                                    text a whole-program build would face
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
+  gexc funcs  <elf> [--at ADDR] [--ir] [--ssa] [--check] [--list]
+                                   recover functions (CFGs, jump tables,
+                                   call-graph summaries) and report them.
+                                   --ir prints function-level GIR, --ssa in
+                                   SSA form; --check verifies every function
+                                   and round-trips its text form
 
 run options:
   --strace        trace every syscall on stderr
@@ -1155,4 +1162,150 @@ fn cmd_ir(args: &[String]) -> Result<()> {
     );
     print!("{}", gex_ir::print::block(&block));
     Ok(())
+}
+
+/// `gexc funcs`: function recovery, for inspection. See `gex_xlate::func`.
+fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
+    let mut path = None;
+    let mut at = None;
+    let (mut ir, mut ssa, mut check, mut list) = (false, false, false, false);
+    let mut show_uncovered = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--at" => {
+                i += 1;
+                let v = args.get(i).context("--at needs an address")?;
+                let v = v.strip_prefix("0x").unwrap_or(v);
+                at = Some(u64::from_str_radix(v, 16).context("--at expects hex")?);
+            }
+            "--ir" => ir = true,
+            "--ssa" => ssa = true,
+            "--check" => check = true,
+            "--list" => list = true,
+            "--uncovered" => show_uncovered = true,
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected an input ELF")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let t0 = std::time::Instant::now();
+    let prog = gex_xlate::func::recover(&image, Some(&bytes), &Default::default());
+    let t_rec = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let sums = gex_xlate::summary::analyze(&prog);
+    let t_sum = t1.elapsed();
+    let st = &prog.stats;
+    let pct = |a: u64, b: u64| if b == 0 { 100.0 } else { 100.0 * a as f64 / b as f64 };
+    eprintln!(
+        "functions {}  blocks {}  rounds {}  ({:.2}s recovery, {:.2}s summaries)",
+        st.functions,
+        st.blocks,
+        st.rounds,
+        t_rec.as_secs_f64(),
+        t_sum.as_secs_f64()
+    );
+    eprintln!(
+        "symbols {}/{} found ({:.2}%)  fdes {}/{}  symbol bytes covered {:.2}% of {}",
+        st.symbols_found,
+        st.symbols,
+        pct(st.symbols_found as u64, st.symbols as u64),
+        st.fdes_found,
+        st.fdes,
+        pct(st.symbol_bytes_covered, st.symbol_bytes),
+        st.symbol_bytes
+    );
+    eprintln!(
+        "switches {} complete, {} partial; {} unresolved indirect jumps; {} noreturn calls; {} interior entries",
+        st.switches_complete, st.switches_partial, st.unresolved, st.noreturn_calls, st.interior_entries
+    );
+    eprintln!(
+        "summaries: {} SCCs, {} recursive, max {} iterations, {} not converged; {} functions with unknown callees",
+        sums.stats.sccs,
+        sums.stats.recursive_sccs,
+        sums.stats.max_iterations,
+        sums.stats.unconverged,
+        sums.stats.unknown
+    );
+    let missing: Vec<(&u64, &gex_xlate::func::StartInfo)> = prog
+        .starts
+        .iter()
+        .filter(|(a, s)| s.has(gex_xlate::func::Source::Symbol) && !prog.functions.contains_key(a))
+        .collect();
+    for (a, s) in missing.iter().take(20) {
+        eprintln!("  missing symbol {a:#x} {}", s.name.as_deref().unwrap_or("?"));
+    }
+    if show_uncovered {
+        let view = gex_xlate::CodeView::new(&image);
+        for (lo, hi, sym) in gex_xlate::func::uncovered(&prog) {
+            let name = prog.starts[&sym].name.as_deref().unwrap_or("?");
+            println!("uncovered {lo:#x}..{hi:#x} in {name} ({sym:#x})");
+            let mut pc = lo;
+            while pc < hi {
+                let mut buf = [0u8; 16];
+                let n = view.fetch(pc, &mut buf);
+                if n == 0 {
+                    break;
+                }
+                let (text, len) = gex_xlate::arch::disasm(&buf[..n], pc);
+                println!("    {pc:#x}: {text}");
+                pc += len as u64;
+            }
+        }
+    }
+    let mut bad = 0usize;
+    for (&a, f) in &prog.functions {
+        if at.is_some_and(|x| x != a) {
+            continue;
+        }
+        let summ = sums.get(a);
+        if list || at.is_some() {
+            let srcs: Vec<String> = prog.starts[&a].sources().iter().map(|s| format!("{s:?}")).collect();
+            println!(
+                "{a:#x} {} blocks={} calls={} entries={} [{}] {}",
+                f.name.as_deref().unwrap_or("-"),
+                f.blocks.len(),
+                f.call_sites().len(),
+                f.entries.len(),
+                srcs.join(","),
+                gex_xlate::summary::describe(&summ)
+            );
+        }
+        let ssa_f = if ssa || check {
+            Some(gex_ir::ssa::to_ssa(f, &|c| sums.call_effect(c)))
+        } else {
+            None
+        };
+        if ir {
+            print!("{}", gex_ir::text::print(f));
+        }
+        if ssa {
+            print!("{}", gex_ir::text::print(ssa_f.as_ref().unwrap()));
+        }
+        if check {
+            for g in [f, ssa_f.as_ref().unwrap()] {
+                let r = g.verify().and_then(|_| {
+                    let t = gex_ir::text::print(g);
+                    let back = gex_ir::text::parse(&t)?;
+                    if &back != g {
+                        return Err("text round trip changed the function".into());
+                    }
+                    Ok(())
+                });
+                if let Err(e) = r {
+                    bad += 1;
+                    eprintln!("{a:#x} {:?} form: {e}", g.form);
+                }
+            }
+        }
+    }
+    if check {
+        eprintln!("check: {bad} failures");
+        if bad > 0 {
+            return Ok(ExitCode::from(1));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
