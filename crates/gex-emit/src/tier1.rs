@@ -1172,6 +1172,21 @@ impl<'a> Emitter<'a> {
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
             }
+            Stmt::Trap { cond, pc, code } => {
+                // Only the faulting path writes the registers back, so they
+                // stay dirty for the path that carries on.
+                self.push(*cond);
+                self.f.if_void();
+                self.flush_conditional();
+                self.store_pc(*pc);
+                self.f.local_get(self.ctx_local);
+                self.f.i64_const(*pc as i64);
+                self.f.i32_const(*code);
+                self.f.call(self.cx.breakpoint);
+                // The host raises the fault and never returns.
+                self.f.unreachable();
+                self.f.end();
+            }
             Stmt::VStore {
                 addr,
                 offset,
@@ -3401,8 +3416,13 @@ fn lane_cvt_op(op: VCvtOp, from: VLane) -> u32 {
         (VCvtOp::ExtendHigh { signed: false }, _) => 0xca,
         (VCvtOp::NarrowSat { signed: true }, VLane::I16) => 0x65,
         (VCvtOp::NarrowSat { signed: false }, VLane::I16) => 0x66,
-        (VCvtOp::NarrowSat { signed: true }, _) => 0x85,
-        (VCvtOp::NarrowSat { signed: false }, _) => 0x86,
+        (VCvtOp::NarrowSat { signed: true }, VLane::I32) => 0x85,
+        (VCvtOp::NarrowSat { signed: false }, VLane::I32) => 0x86,
+        // wasm narrows only i16 and i32 lanes; the lifter clamps doublewords
+        // itself.
+        (VCvtOp::NarrowSat { .. }, _) => {
+            panic!("no wasm SIMD conversion for {op:?} from {from:?}")
+        }
     }
 }
 

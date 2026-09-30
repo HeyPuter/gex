@@ -1331,6 +1331,9 @@ pub enum VOp2 {
     UqXtn,
     /// Narrow signed lanes to unsigned lanes, saturating negative values to 0.
     SqXtun,
+    /// Widen each lane to twice its width and shift left by the original
+    /// width (`shll`/`shll2`); the arrangement names the source lanes.
+    Shll,
 }
 
 /// The three-different group's operations, named for what they do to the
