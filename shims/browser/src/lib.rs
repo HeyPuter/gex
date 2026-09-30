@@ -9347,7 +9347,17 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     }
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
+pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
+    // A gex-eject library replacement (`Intrinsic::Replace`). This shim has no
+    // replacement modules to run it with (eject v0 runs them natively only),
+    // and returning would carry on as if the replaced function had run.
+    if reg == gex_xlate::intrinsic::REPLACE_SYSREG {
+        panic!(
+            "gex: replacement #{val} (the function at {:#x}) cannot run in the browser shim; \
+             run the ejected project natively",
+            pc as u64
+        );
+    }
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
     // four results go back into the context.
     if reg == gex_kernel::x86::SYSREG_CPUID {
@@ -10787,6 +10797,8 @@ fn note_intrinsics(addr: u64) {
                 gex_xlate::Intrinsic::MemCmp => 4,
                 gex_xlate::Intrinsic::MemPCpy => 8,
                 gex_xlate::Intrinsic::MemMove => 16,
+                // Never recognised by name, so never reaches this scan.
+                gex_xlate::Intrinsic::Replace(_) => 0,
             };
             if mask & bit == 0 {
                 continue;
