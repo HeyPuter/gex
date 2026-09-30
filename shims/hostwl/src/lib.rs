@@ -95,6 +95,7 @@ impl FileHandle for Pipe {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 

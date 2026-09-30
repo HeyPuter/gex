@@ -330,6 +330,7 @@ impl FileHandle for Socket {
             ino: 3,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 

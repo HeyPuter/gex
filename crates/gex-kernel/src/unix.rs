@@ -342,6 +342,7 @@ impl FileHandle for UnixSocket {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 
@@ -747,6 +748,7 @@ impl FileHandle for MemFd {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 }
@@ -968,6 +970,7 @@ impl FileHandle for EpollSet {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 }
@@ -1116,6 +1119,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
             ino: 0,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 

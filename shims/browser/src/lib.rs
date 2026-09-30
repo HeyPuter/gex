@@ -1206,6 +1206,7 @@ impl FileHandle for StdinQueue {
             ino: 2,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 
@@ -1358,6 +1359,7 @@ impl FileHandle for Tty {
             ino: 3,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 
@@ -1418,6 +1420,7 @@ impl FileHandle for Console {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 

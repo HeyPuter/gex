@@ -51,6 +51,7 @@ impl FileHandle for Generated {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         })
     }
 }
@@ -191,6 +192,7 @@ impl FileSystem for ProcFs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             });
         }
         match path.as_str() {
@@ -202,6 +204,7 @@ impl FileSystem for ProcFs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             }),
             _ => Err(Errno::ENOENT),
         }

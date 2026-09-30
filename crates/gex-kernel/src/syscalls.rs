@@ -3233,7 +3233,11 @@ impl Kernel {
             blksize: 4096,
             blocks: (md.size as i64 + 511) / 512,
             mtime: md.mtime,
-            rdev: if md.file_type == FileType::CharDevice {
+            // What the node says, or for a character device that does not,
+            // a pseudo-terminal's number (136:0).
+            rdev: if md.rdev != 0 {
+                md.rdev
+            } else if md.file_type == FileType::CharDevice {
                 0x8800
             } else {
                 0

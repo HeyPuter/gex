@@ -80,6 +80,7 @@ fn convert(md: &std::fs::Metadata) -> Metadata {
         ino: md.ino(),
         mtime: md.mtime(),
         nlink: md.nlink() as u32,
+        rdev: 0,
     }
 }
 

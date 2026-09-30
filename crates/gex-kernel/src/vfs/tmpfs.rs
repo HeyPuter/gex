@@ -225,6 +225,7 @@ impl FileHandle for TmpHandle {
                 ino: file.ino,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             });
         }
         let inner = self.inner.lock().unwrap();
@@ -238,6 +239,7 @@ impl FileHandle for TmpHandle {
                 mtime: 0,
                 // Every name that maps to this inode is a hard link to it.
                 nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
+                rdev: 0,
             }),
             Some(Node::Dir) => Ok(Metadata {
                 ino,
@@ -251,6 +253,7 @@ impl FileHandle for TmpHandle {
                 ino,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             }),
             Some(Node::Socket) => Ok(Metadata {
                 file_type: FileType::Socket,
@@ -259,6 +262,7 @@ impl FileHandle for TmpHandle {
                 ino,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             }),
             None => Err(Errno::ENOENT),
         }

@@ -72,6 +72,10 @@ pub struct Metadata {
     /// Hard-link count, reported as `st_nlink`. A file with one name is 1; a
     /// directory is `2 + immediate subdirectories`.
     pub nlink: u32,
+    /// `st_rdev`: the device a character or block device node names, in
+    /// Linux's `makedev` encoding. Zero where the node does not say; `stat`
+    /// then reports a character device as a pseudo-terminal (136:0).
+    pub rdev: u64,
 }
 
 impl Metadata {
@@ -83,6 +87,7 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 1,
+            rdev: 0,
         }
     }
     pub fn dir() -> Metadata {
@@ -93,6 +98,7 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 2,
+            rdev: 0,
         }
     }
 }
@@ -409,6 +415,7 @@ impl Vfs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
+                rdev: 0,
             });
         }
         fs.metadata(&rel)
