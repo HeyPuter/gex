@@ -49,8 +49,13 @@ fn parse_c(wasm: &[u8]) -> Result<CModule<'_>> {
         bodies: Vec::new(),
         exports: HashMap::new(),
     };
+    let mut c_memories = 0u32;
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
+            Payload::MemorySection(r) if r.count() > 0 => bail!(
+                "the C module defines {} memories of its own; it must import the guest's only",
+                r.count()
+            ),
             Payload::TypeSection(r) => {
                 for t in r.into_iter_err_on_gc_types() {
                     m.types.push(t?);
@@ -63,7 +68,17 @@ fn parse_c(wasm: &[u8]) -> Result<CModule<'_>> {
                         TypeRef::Func(t) => {
                             m.func_imports.push((i.module.to_string(), i.name.to_string(), t))
                         }
-                        TypeRef::Memory(_) => {}
+                        TypeRef::Memory(_) => {
+                            c_memories += 1;
+                            if c_memories > 1 {
+                                bail!(
+                                    "the C module imports more than one memory ({}.{}); the \
+                                     splice maps exactly one onto the guest memory",
+                                    i.module,
+                                    i.name
+                                );
+                            }
+                        }
                         other => bail!(
                             "the C module imports {}.{} ({other:?}); only functions and the \
                              memory can be spliced",
