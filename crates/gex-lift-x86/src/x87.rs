@@ -471,7 +471,7 @@ impl<'a> Lifter<'a> {
             }
             Op::Fldcw => {
                 let v = self.rd(i.op0(), Width::W);
-                self.b.write(GuestReg::X87Cw, v);
+                self.x87_set_cw(v);
             }
             Op::Fnstcw => {
                 let v = self.b.read(GuestReg::X87Cw);
@@ -571,6 +571,17 @@ impl<'a> Lifter<'a> {
             _ => return self.illegal_x87(),
         }
         Flow::Next
+    }
+
+    /// Load the control word as the hardware keeps it: bits 7 and 13-15
+    /// read back as zero, reserved bit 6 as one (`fldcw 0x23f` stores
+    /// 0x27f).
+    pub(crate) fn x87_set_cw(&mut self, v: Value) {
+        let keep = self.k32(0x1f3f);
+        let v = self.b.bin(BinOp::And, Ty::I32, v, keep);
+        let one = self.k32(0x40);
+        let v = self.b.bin(BinOp::Or, Ty::I32, v, one);
+        self.b.write(GuestReg::X87Cw, v);
     }
 
     /// `fninit`'s state: control word 0x37f, status and tags clear, TOP 0.
@@ -720,7 +731,7 @@ impl<'a> Lifter<'a> {
                 this.b.def(Expr::Load { addr, offset, sz: MemSz::B2, signed: false, ty: Ty::I32, order: Order::Relaxed })
             };
             let cw = ld16(self, 0);
-            self.b.write(GuestReg::X87Cw, cw);
+            self.x87_set_cw(cw);
             let sw = ld16(self, stride);
             let eleven = self.k32(11);
             let t = self.b.bin(BinOp::ShrU, Ty::I32, sw, eleven);

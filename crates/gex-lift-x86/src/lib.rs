@@ -2727,7 +2727,7 @@ impl<'a> Lifter<'a> {
                 ty: Ty::I32,
                 order: Order::Relaxed,
             });
-            self.b.write(GuestReg::X87Cw, fcw);
+            self.x87_set_cw(fcw);
             self.x87_fxsave(addr, false);
             let mxcsr = self.b.def(Expr::Load {
                 addr,
