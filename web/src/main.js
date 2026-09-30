@@ -240,8 +240,21 @@ for (const [event, describe] of [
     await harness();
     return;
   }
+  // `?arch=x86` runs the x86-64 guest: a different shim, seed, kernel and set
+  // of rootfs/closure assets (see `runtime.js`). Read before anything fetches.
+  {
+    const arch = new URLSearchParams(location.search).get('arch');
+    if (arch === 'x86' || arch === 'x64' || arch === 'x86_64' || arch === 'amd64') globalThis.GEX_ARCH = 'x86';
+  }
   ui.engine.textContent = navigator.userAgent.includes('Firefox') ? 'spidermonkey' : 'v8';
-  term.writeln(ansi.bold('gex') + ansi.dim(' — AArch64 Linux programs, recompiled to WebAssembly'));
+  const archName = globalThis.GEX_ARCH === 'x86' ? 'x86-64' : 'AArch64';
+  if (globalThis.GEX_ARCH === 'x86') {
+    // The static page copy names the default guest; retitle it for x86-64.
+    document.title = document.title.replace('AArch64', archName);
+    for (const p of document.querySelectorAll('header.site-header p'))
+      p.textContent = p.textContent.replace('AArch64', archName);
+  }
+  term.writeln(ansi.bold('gex') + ansi.dim(` — ${archName} Linux programs, recompiled to WebAssembly`));
   term.writeln('');
   busy('fetching the runtime');
   try {
