@@ -238,7 +238,7 @@ fn eval_cmp(op: CmpOp, ty: Ty, a: u64, b: u64) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// The four condition flags, as a bitmask.
-pub const ALL_FLAGS: u8 = 0b1111;
+pub const ALL_FLAGS: u8 = 0b111_1111;
 
 /// Bit position of a flag in an [`ALL_FLAGS`] mask.
 fn flag_bit(r: GuestReg) -> Option<u8> {
@@ -247,16 +247,27 @@ fn flag_bit(r: GuestReg) -> Option<u8> {
         GuestReg::Z => Some(2),
         GuestReg::C => Some(4),
         GuestReg::V => Some(8),
+        GuestReg::P => Some(16),
+        GuestReg::A => Some(32),
+        GuestReg::D => Some(64),
         _ => None,
     }
 }
 
 /// Turn a mask back into the registers it names.
 pub fn flags_of_mask(mask: u8) -> Vec<GuestReg> {
-    [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V]
-        .into_iter()
-        .filter(|r| mask & flag_bit(*r).unwrap() != 0)
-        .collect()
+    [
+        GuestReg::N,
+        GuestReg::Z,
+        GuestReg::C,
+        GuestReg::V,
+        GuestReg::P,
+        GuestReg::A,
+        GuestReg::D,
+    ]
+    .into_iter()
+    .filter(|r| mask & flag_bit(*r).unwrap() != 0)
+    .collect()
 }
 
 /// A block's effect on the flags: which it reads before writing (`use`), and

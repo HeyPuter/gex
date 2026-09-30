@@ -45,6 +45,11 @@ pub fn grow(entry: u64, gir: &HashMap<u64, &Block>, limit: usize) -> Option<Regi
         if b.stmts.iter().any(crate::tier1::clobbers_guest_state) {
             return None;
         }
+        // A guarded block checks its bytes on entry; inside a region it would
+        // be entered without the check.
+        if b.guard.is_some() {
+            return None;
+        }
         Some(b)
     };
 

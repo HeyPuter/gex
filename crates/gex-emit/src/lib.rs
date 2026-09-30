@@ -15,3 +15,4 @@ pub mod tier1;
 pub mod wasm;
 
 pub use module::{ModuleBuilder, PageTable, TranslatedModule};
+pub use tier1::set_trace_blocks;

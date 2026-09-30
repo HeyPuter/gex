@@ -104,6 +104,26 @@ pub struct PageTable {
     /// closures own tables 0..3 and the run translates into 4..7.
     highs: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
     refill: Option<std::sync::Arc<Refill>>,
+    /// Number pages by identity: see [`Identity`].
+    identity: Option<std::sync::Arc<Identity>>,
+}
+
+/// One base per page *identity*, system-wide.
+///
+/// Two processes translating the same library page must give it the same base,
+/// or a unit one built and the other adopts writes its blocks into slots that
+/// mean another page there. `adopt(page)` asks the system-wide map for the base
+/// an earlier process gave this page (by its code identity); `publish(page,
+/// entry)` records the base this table just allocated, first writer winning.
+pub struct Identity {
+    pub adopt: Box<dyn Fn(u64) -> Option<u32> + Send + Sync>,
+    pub publish: Box<dyn Fn(u64, u32) + Send + Sync>,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Identity")
+    }
 }
 
 /// A source of slot numbers no other page table will hand out.
@@ -179,6 +199,16 @@ impl PageTable {
         if let Some(&b) = self.pages.get(&page) {
             return b;
         }
+        // The base another process already gave this page's code, if any: the
+        // one thing that keeps two processes' numberings compatible.
+        if let Some(id) = self.identity.clone() {
+            if let Some(entry) = (id.adopt)(page) {
+                if entry != 0 {
+                    self.assign(page, entry);
+                    return entry;
+                }
+            }
+        }
         let v = self.take_slots();
         let entry = gex_abi::dispatch_entry(
             (v / Self::SLOTS_PER_TABLE) as usize,
@@ -190,7 +220,15 @@ impl PageTable {
             std::sync::atomic::Ordering::SeqCst,
         );
         self.note_virtual(v);
+        if let Some(id) = &self.identity {
+            (id.publish)(page, entry);
+        }
         entry
+    }
+
+    /// Number pages by identity from now on. See [`Identity`].
+    pub fn set_identity(&mut self, identity: std::sync::Arc<Identity>) {
+        self.identity = Some(identity);
     }
 
     /// Record that virtual slot `v` and the page above it are wanted, so the
@@ -374,6 +412,7 @@ impl PageTable {
                     .collect(),
             ),
             refill: None,
+            identity: None,
         };
         // The mark says where allocation carries on, so the table holding it
         // has to be long enough for the page it will hand out next.
@@ -563,7 +602,11 @@ impl ModuleBuilder {
         page_table: PageTable,
         shared_memory: bool,
     ) -> ModuleBuilder {
-        assert_eq!(text_base % 4, 0, "text base must be instruction-aligned");
+        assert_eq!(
+            text_base % gex_abi::INST_ALIGN,
+            0,
+            "text base must be instruction-aligned"
+        );
         let _ = text_size;
 
         let mut m = Module::new();
@@ -799,6 +842,10 @@ impl ModuleBuilder {
                 // overwrite the ones they own, so a branch elsewhere asks the
                 // host to translate rather than trapping.
                 let mut funcs = vec![self.miss_stub; table_slots as usize];
+                // Blocks by slot, so a slot several blocks start in (x86-64's
+                // 4-byte slots) gets a trampoline rather than the last writer.
+                let mut by_slot: std::collections::BTreeMap<u64, Vec<(u64, u32)>> =
+                    std::collections::BTreeMap::new();
                 for (&addr, &f) in &self.blocks {
                     let page = dispatch_page(addr);
                     if let Some(entry) = self.page_table.lookup(page) {
@@ -808,8 +855,16 @@ impl ModuleBuilder {
                         debug_assert_eq!(gex_abi::dispatch_entry_table(entry), 0);
                         let idx = gex_abi::dispatch_index(addr, entry);
                         if (idx as usize) < funcs.len() {
-                            funcs[idx as usize] = f;
+                            by_slot.entry(idx).or_default().push((addr, f));
                         }
+                    }
+                }
+                for (idx, mut members) in by_slot {
+                    if members.len() == 1 {
+                        funcs[idx as usize] = members[0].1;
+                    } else {
+                        members.sort_by_key(|(a, _)| *a);
+                        funcs[idx as usize] = self.trampoline(&members);
                     }
                 }
                 self.m.element(ElementSegment {
@@ -862,6 +917,28 @@ impl ModuleBuilder {
                     let table = gex_abi::dispatch_entry_table(entry) as u32;
                     blocks.sort_by_key(|(a, _)| *a);
                     let slot = |addr: u64| gex_abi::dispatch_index(addr, entry);
+                    // Several blocks in one slot (x86-64, where a slot spans 4
+                    // bytes): the slot gets a trampoline that dispatches on
+                    // `ctx::LAST_TARGET`, the exact address every dispatch
+                    // records before it calls. The list becomes one entry per
+                    // slot, keyed by the first address in it.
+                    let mut merged: Vec<(u64, u32)> = Vec::with_capacity(blocks.len());
+                    let mut i = 0;
+                    while i < blocks.len() {
+                        let s0 = slot(blocks[i].0);
+                        let mut j = i + 1;
+                        while j < blocks.len() && slot(blocks[j].0) == s0 {
+                            j += 1;
+                        }
+                        if j - i == 1 {
+                            merged.push(blocks[i]);
+                        } else {
+                            let t = self.trampoline(&blocks[i..j]);
+                            merged.push((blocks[i].0, t));
+                        }
+                        i = j;
+                    }
+                    let blocks = merged;
                     let page_base = (entry & gex_abi::DISPATCH_SLOT_MASK) as u32;
                     if passive {
                         // One `[first,last]` segment for a closure page, this
@@ -976,6 +1053,34 @@ impl ModuleBuilder {
     /// It reads the PC the branching code recorded in the context, hands it
     /// to the host, and tail-calls whatever slot the host returns. In M0 the
     /// host always raises an error; from M3 it translates and patches.
+    /// A function for a dispatch slot that several blocks start in: compare
+    /// `ctx::LAST_TARGET` (what the dispatcher recorded) with each block's
+    /// address and tail-call the match; anything else is a miss.
+    fn trampoline(&mut self, members: &[(u64, u32)]) -> u32 {
+        let idx = self.m.declare_func(self.block_ty);
+        let mut f = FuncBody::new(1);
+        let t = f.add_local(ValType::I64);
+        f.local_get(0);
+        f.load(0x29, 3, ctx::LAST_TARGET as u32);
+        f.local_set(t);
+        for (addr, func) in members {
+            f.local_get(t);
+            f.i64_const(*addr as i64);
+            f.byte(0x51); // i64.eq
+            f.if_void();
+            f.local_get(0);
+            f.return_call_local(*func);
+            f.end();
+        }
+        f.local_get(0);
+        f.return_call_local(self.miss_stub);
+        // With its relocs: the merger renumbers functions, and a tail call
+        // that kept its old index would land on a function of another type.
+        let (body, relocs) = f.finish_with_relocs();
+        self.m.define_func_with_relocs(idx, body, relocs);
+        idx
+    }
+
     fn build_miss_stub(&self) -> Vec<u8> {
         let mut f = FuncBody::new(1);
         f.local_get(0); // ctx argument for the eventual target
@@ -992,10 +1097,16 @@ impl ModuleBuilder {
         let mut f = FuncBody::new(2);
         let page = f.add_local(ValType::I64);
 
-        // Record the entry PC so a miss inside `enter` reports it correctly.
+        // Record the entry PC so a miss inside `enter` reports it correctly,
+        // and the exact target for a shared slot's trampoline (x86-64).
         f.local_get(0);
         f.local_get(1);
         f.store(0x37, 3, ctx::PC as u32);
+        if gex_abi::X86 {
+            f.local_get(0);
+            f.local_get(1);
+            f.store(0x37, 3, ctx::LAST_TARGET as u32);
+        }
 
         let entry = f.add_local(ValType::I32);
         let index = f.add_local(ValType::I32);
@@ -1031,8 +1142,10 @@ impl ModuleBuilder {
         f.local_get(1);
         f.i64_const((DISPATCH_PAGE - 1) as i64);
         f.byte(0x83); // i64.and
-        f.i64_const(2);
-        f.byte(0x88); // i64.shr_u
+        if gex_abi::DISPATCH_SHIFT != 0 {
+            f.i64_const(gex_abi::DISPATCH_SHIFT as i64);
+            f.byte(0x88); // i64.shr_u
+        }
         f.byte(0xa7); // i32.wrap_i64
         f.byte(0x6a); // i32.add
         f.local_set(index);
