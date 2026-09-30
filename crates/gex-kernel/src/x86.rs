@@ -19,6 +19,26 @@ pub const UNKNOWN: u64 = u64::MAX;
 /// (`gex_lift_x86::sysreg::CPUID`; the two must agree).
 pub const SYSREG_CPUID: i32 = -100;
 
+/// The pseudo system register the lifter writes to have an x87 instruction
+/// computed here (`gex_lift_x86::sysreg::X87`; the two must agree). See
+/// [`serve_x87`].
+pub const SYSREG_X87: i32 = -101;
+
+/// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`).
+pub mod x87op {
+    pub const F2XM1: u64 = 1;
+    pub const FYL2X: u64 = 2;
+    pub const FYL2XP1: u64 = 3;
+    pub const FPTAN: u64 = 4;
+    pub const FPATAN: u64 = 5;
+    pub const FXTRACT: u64 = 6;
+    pub const FPREM: u64 = 7;
+    pub const FPREM1: u64 = 8;
+    pub const FSIN: u64 = 9;
+    pub const FCOS: u64 = 10;
+    pub const FSINCOS: u64 = 11;
+}
+
 const AT_FDCWD: u64 = (-100i64) as u64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
@@ -585,6 +605,187 @@ pub fn serve_cpuid(m: &mut GuestMem<'_>, ctx_addr: u64, value: u64) {
     }
 }
 
+/// The x87 register stack as the lifter keeps it in the context: eight
+/// doubles addressed physically, `TOP`, one valid bit per register, and the
+/// status word's condition codes.
+struct X87<'m, 'a> {
+    m: &'m mut GuestMem<'a>,
+    ctx: u64,
+}
+
+impl X87<'_, '_> {
+    const C0: u16 = 1 << 8;
+    const C1: u16 = 1 << 9;
+    const C2: u16 = 1 << 10;
+    const C3: u16 = 1 << 14;
+
+    fn top(&self) -> u32 {
+        self.m.read_u32(self.ctx + gex_abi::ctx::X87_TOP as u64).unwrap_or(0) & 7
+    }
+    fn slot(&self, i: u32) -> u64 {
+        self.ctx + gex_abi::ctx::X87 as u64 + (((self.top() + i) & 7) as u64) * 8
+    }
+    fn st(&self, i: u32) -> f64 {
+        f64::from_bits(self.m.read_u64(self.slot(i)).unwrap_or(0))
+    }
+    fn set_st(&mut self, i: u32, v: f64) {
+        let a = self.slot(i);
+        let _ = self.m.write_u64(a, v.to_bits());
+    }
+    fn tags(&self) -> u32 {
+        self.m.read_u32(self.ctx + gex_abi::ctx::X87_TAGS as u64).unwrap_or(0)
+    }
+    fn set_tags(&mut self, t: u32) {
+        let _ = self.m.write_u32(self.ctx + gex_abi::ctx::X87_TAGS as u64, t & 0xff);
+    }
+    fn set_top(&mut self, t: u32) {
+        let _ = self.m.write_u32(self.ctx + gex_abi::ctx::X87_TOP as u64, t & 7);
+    }
+    fn push(&mut self, v: f64) {
+        let t = (self.top() + 7) & 7;
+        self.set_top(t);
+        self.set_st(0, v);
+        let tags = self.tags() | 1 << t;
+        self.set_tags(tags);
+    }
+    fn pop(&mut self) {
+        let t = self.top();
+        let tags = self.tags() & !(1 << t);
+        self.set_tags(tags);
+        self.set_top(t + 1);
+    }
+    /// Replace the condition codes (C0..C3) with `cc`.
+    fn set_cc(&mut self, cc: u16) {
+        let a = self.ctx + gex_abi::ctx::X87_SW as u64;
+        let sw = self.m.read(a, 2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
+        let sw = (sw & !(Self::C0 | Self::C1 | Self::C2 | Self::C3)) | cc;
+        let _ = self.m.write(a, &sw.to_le_bytes());
+    }
+    /// The condition codes `fprem`/`fprem1` report: C2 clear (the reduction
+    /// is complete; doubles never need the partial steps), and the quotient's
+    /// three low bits in C0 (bit 2), C3 (bit 1) and C1 (bit 0).
+    fn quotient_cc(q: u64) -> u16 {
+        let mut cc = 0;
+        if q & 4 != 0 {
+            cc |= Self::C0;
+        }
+        if q & 2 != 0 {
+            cc |= Self::C3;
+        }
+        if q & 1 != 0 {
+            cc |= Self::C1;
+        }
+        cc
+    }
+}
+
+/// `x` and the magnitude of `x / y`'s quotient under `fmod`'s truncation, or
+/// under IEEE round-to-nearest-even for `nearest` (`fprem1`, C's
+/// `remainder`). The quotient is exact while it fits a double's mantissa,
+/// which is all its low three bits are ever asked for.
+fn x87_remainder(x: f64, y: f64, nearest: bool) -> (f64, u64) {
+    let r = x % y;
+    if !r.is_finite() || y == 0.0 || !x.is_finite() {
+        return (f64::NAN, 0);
+    }
+    let q = ((x - r) / y).abs();
+    let q = if q < 9.007_199_254_740_992e15 { q as u64 } else { 0 };
+    if !nearest {
+        return (r, q);
+    }
+    let (ar, half) = (r.abs(), y.abs() / 2.0);
+    if ar > half || (ar == half && q & 1 == 1) {
+        // Exact: |r| lies within [|y|/2, |y|] (Sterbenz).
+        (r - y.abs().copysign(r), q + 1)
+    } else {
+        (r, q)
+    }
+}
+
+/// Serve an x87 instruction the translated code handed over through
+/// `sysreg_write` (see [`x87op`]). Computed in double precision, like the
+/// rest of gex's x87; the operand-range rule of `fsin`/`fcos`/`fptan`
+/// (|x| < 2^63, else C2 is set and the operand is left alone) is kept.
+pub fn serve_x87(m: &mut GuestMem<'_>, ctx_addr: u64, op: u64) {
+    let mut x = X87 { m, ctx: ctx_addr };
+    let in_range = |v: f64| v.abs() < 9.223_372_036_854_775_808e18;
+    match op {
+        x87op::F2XM1 => {
+            let v = x.st(0);
+            x.set_st(0, (v * std::f64::consts::LN_2).exp_m1());
+            x.set_cc(0);
+        }
+        x87op::FYL2X => {
+            let (a, b) = (x.st(0), x.st(1));
+            x.set_st(1, b * a.log2());
+            x.pop();
+            x.set_cc(0);
+        }
+        x87op::FYL2XP1 => {
+            let (a, b) = (x.st(0), x.st(1));
+            x.set_st(1, b * (a.ln_1p() / std::f64::consts::LN_2));
+            x.pop();
+            x.set_cc(0);
+        }
+        x87op::FPATAN => {
+            let (a, b) = (x.st(0), x.st(1));
+            x.set_st(1, b.atan2(a));
+            x.pop();
+            x.set_cc(0);
+        }
+        x87op::FPTAN | x87op::FSIN | x87op::FCOS | x87op::FSINCOS => {
+            let v = x.st(0);
+            if !in_range(v) && v.is_finite() {
+                x.set_cc(X87::C2);
+                return;
+            }
+            match op {
+                x87op::FPTAN => {
+                    x.set_st(0, v.tan());
+                    x.push(1.0);
+                }
+                x87op::FSIN => x.set_st(0, v.sin()),
+                x87op::FCOS => x.set_st(0, v.cos()),
+                _ => {
+                    x.set_st(0, v.sin());
+                    x.push(v.cos());
+                }
+            }
+            x.set_cc(0);
+        }
+        x87op::FXTRACT => {
+            // st0 becomes the unbiased exponent, and the significand, in
+            // [1, 2) with st0's sign, is pushed on top of it.
+            let v = x.st(0);
+            let (exp, sig) = if v == 0.0 {
+                (f64::NEG_INFINITY, v)
+            } else if v.is_nan() {
+                (v, v)
+            } else if v.is_infinite() {
+                (f64::INFINITY, v)
+            } else {
+                // Normalise a subnormal first, so the exponent field is real.
+                let (v2, adj) = if v.abs() < f64::MIN_POSITIVE { (v * 2f64.powi(64), 64) } else { (v, 0) };
+                let bits = v2.to_bits();
+                let e = ((bits >> 52) & 0x7ff) as i64 - 1023 - adj;
+                let s = f64::from_bits((bits & !(0x7ffu64 << 52)) | (1023u64 << 52));
+                (e as f64, s)
+            };
+            x.set_st(0, exp);
+            x.push(sig);
+            x.set_cc(0);
+        }
+        x87op::FPREM | x87op::FPREM1 => {
+            let (a, b) = (x.st(0), x.st(1));
+            let (r, q) = x87_remainder(a, b, op == x87op::FPREM1);
+            x.set_st(0, r);
+            x.set_cc(X87::quotient_cc(q));
+        }
+        // Only the lifter writes this register, with one of the codes above.
+        _ => panic!("sysreg_write: unknown x87 operation {op}"),
+    }
+}
+
 /// `/proc/cpuinfo` for the processor [`cpuid`] describes.
 pub const CPUINFO: &str = concat!(
     "processor\t: 0\n",
@@ -609,3 +810,80 @@ pub const CPUINFO: &str = concat!(
     "cache_alignment\t: 64\n",
     "address sizes\t: 48 bits physical, 48 bits virtual\n\n",
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gex_abi::ctx;
+
+    const CTX: u64 = 0x1000;
+
+    /// A context whose x87 stack holds `vals`, `vals[0]` in st0.
+    fn stack(buf: &mut [u8], vals: &[f64]) {
+        let mut m = GuestMem::new(buf);
+        let top = (8 - vals.len() as u32) & 7;
+        m.write_u32(CTX + ctx::X87_TOP as u64, top).unwrap();
+        let mut tags = 0u32;
+        for (i, v) in vals.iter().enumerate() {
+            let phys = (top + i as u32) & 7;
+            m.write_u64(CTX + ctx::X87 as u64 + phys as u64 * 8, v.to_bits()).unwrap();
+            tags |= 1 << phys;
+        }
+        m.write_u32(CTX + ctx::X87_TAGS as u64, tags).unwrap();
+    }
+
+    fn run(vals: &[f64], op: u64) -> (Vec<f64>, u16) {
+        let mut buf = vec![0u8; 0x4000];
+        stack(&mut buf, vals);
+        let mut m = GuestMem::new(&mut buf);
+        serve_x87(&mut m, CTX, op);
+        let top = m.read_u32(CTX + ctx::X87_TOP as u64).unwrap() & 7;
+        let tags = m.read_u32(CTX + ctx::X87_TAGS as u64).unwrap();
+        let mut out = Vec::new();
+        for i in 0..8 {
+            let phys = (top + i) & 7;
+            if tags & (1 << phys) == 0 {
+                break;
+            }
+            out.push(f64::from_bits(m.read_u64(CTX + ctx::X87 as u64 + phys as u64 * 8).unwrap()));
+        }
+        let sw = u16::from_le_bytes(m.read(CTX + ctx::X87_SW as u64, 2).unwrap().try_into().unwrap());
+        (out, sw)
+    }
+
+    #[test]
+    fn x87_transcendentals_push_and_pop_like_the_hardware() {
+        // fpatan: st1 = atan2(st1, st0), pop.
+        assert_eq!(run(&[1.0, 1.0], x87op::FPATAN).0, vec![1f64.atan2(1.0)]);
+        // fyl2x: st1 = st1 * log2(st0), pop.
+        assert_eq!(run(&[8.0, 3.0], x87op::FYL2X).0, vec![9.0]);
+        // f2xm1 in place.
+        assert_eq!(run(&[1.0], x87op::F2XM1).0, vec![1.0]);
+        // fptan pushes 1.0; fsincos leaves cos on top of sin.
+        assert_eq!(run(&[0.5], x87op::FPTAN).0, vec![1.0, 0.5f64.tan()]);
+        assert_eq!(run(&[0.5], x87op::FSINCOS).0, vec![0.5f64.cos(), 0.5f64.sin()]);
+        // Out of range: C2 set, operand untouched.
+        let (v, sw) = run(&[1e19], x87op::FSIN);
+        assert_eq!((v, sw & (1 << 10)), (vec![1e19], 1 << 10));
+        // fxtract: significand on top of the exponent.
+        assert_eq!(run(&[-12.0], x87op::FXTRACT).0, vec![-1.5, 3.0]);
+        assert_eq!(run(&[0.0], x87op::FXTRACT).0, vec![0.0, f64::NEG_INFINITY]);
+        assert_eq!(run(&[f64::MIN_POSITIVE / 4.0], x87op::FXTRACT).0, vec![1.0, -1024.0]);
+    }
+
+    #[test]
+    fn x87_remainders_report_the_quotient_bits() {
+        // 7 / 2: fprem truncates (q = 3, r = 1); fprem1 rounds to even
+        // (q = 4, r = -1). C0 = q bit 2, C3 = bit 1, C1 = bit 0; C2 clear.
+        let (c0, c1, c3) = (1u16 << 8, 1u16 << 9, 1u16 << 14);
+        let (v, sw) = run(&[7.0, 2.0], x87op::FPREM);
+        assert_eq!(v, vec![1.0, 2.0]);
+        assert_eq!(sw & (c0 | c1 | c3 | 1 << 10), c3 | c1);
+        let (v, sw) = run(&[7.0, 2.0], x87op::FPREM1);
+        assert_eq!(v, vec![-1.0, 2.0]);
+        assert_eq!(sw & (c0 | c1 | c3 | 1 << 10), c0);
+        // Signs follow the dividend.
+        assert_eq!(run(&[-7.5, 2.0], x87op::FPREM).0, vec![-1.5, 2.0]);
+        assert!(run(&[1.0, 0.0], x87op::FPREM).0[0].is_nan());
+    }
+}

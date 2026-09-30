@@ -31,6 +31,26 @@ pub mod sysreg {
     /// `cpuid`: written with `eax | ecx << 32`; the host fills
     /// `eax`, `ebx`, `ecx`, `edx` in the context.
     pub const CPUID: i32 = -100;
+    /// An x87 instruction the host computes: written with an [`super::x87op`]
+    /// code; the host reads and updates the register stack, `TOP`, the tags
+    /// and the condition codes in the context.
+    pub const X87: i32 = -101;
+}
+
+/// The x87 operations [`sysreg::X87`] carries. `gex_kernel::x86::x87op`
+/// serves them and must agree.
+pub mod x87op {
+    pub const F2XM1: u64 = 1;
+    pub const FYL2X: u64 = 2;
+    pub const FYL2XP1: u64 = 3;
+    pub const FPTAN: u64 = 4;
+    pub const FPATAN: u64 = 5;
+    pub const FXTRACT: u64 = 6;
+    pub const FPREM: u64 = 7;
+    pub const FPREM1: u64 = 8;
+    pub const FSIN: u64 = 9;
+    pub const FCOS: u64 = 10;
+    pub const FSINCOS: u64 = 11;
 }
 
 /// What the condition flags hold, when a branch can ask about the operands

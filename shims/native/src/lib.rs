@@ -2687,6 +2687,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let mut gm = GuestMem::new(data);
                 gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, v as u64);
             }
+            // An x87 transcendental or remainder, computed on the register
+            // stack in the context.
+            if reg == gex_kernel::x86::SYSREG_X87 {
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, v as u64);
+            }
             Ok(())
         },
     )?;

@@ -9353,6 +9353,12 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
         let mut gm = GuestMem::new(guest_bytes());
         gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, val as u64);
     }
+    // An x87 transcendental or remainder, computed on the register stack in
+    // the context.
+    if reg == gex_kernel::x86::SYSREG_X87 {
+        let mut gm = GuestMem::new(guest_bytes());
+        gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, val as u64);
+    }
 }
 
 /// Cache maintenance. Only `dc zva` does anything, and it must: the lifter
