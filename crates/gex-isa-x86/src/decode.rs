@@ -1763,6 +1763,11 @@ impl<'a> Decoder<'a> {
                 // fbld / fbstp (packed BCD) and the reserved slots.
                 _ => return Ok(self.unk()),
             };
+            // The environment's image has a 16-bit form (14 bytes, 94 for
+            // fnsave), which the operand-size prefix selects.
+            if matches!(o, Op::Fldenv | Op::Fnstenv | Op::Frstor | Op::Fnsave) && self.op16 {
+                return Ok(self.i1(o, Width::W, mem));
+            }
             return Ok(fm(self, o));
         }
         let o = match (op, r) {
