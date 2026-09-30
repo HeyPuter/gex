@@ -79,9 +79,9 @@ which keeps translations cacheable per (content, address).
   base, which is the bottom of the allocator's range.
 - `NtMapViewOfSection` returns `STATUS_IMAGE_NOT_AT_BASE` for a moved image,
   exactly as Wine does; the PE loader already handles that code.
-- `gexc pe-info`/`closure` should model the same thing, so gex-ld's
-  `PeLayout::default()` should flip to `pack: true`. That is S5's file; I have
-  not changed it (the NT layer passes `pack: true` itself).
+- `gexc pe-info`/`closure` model the same thing: gex-ld's
+  `PeLayout::default()` packs (`pack: true`, the coordinator's decision);
+  `--no-pack` honours preferred bases that fit.
 
 ### 1.3 The initial thread, and entering PE ntdll
 
