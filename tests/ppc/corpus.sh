@@ -35,7 +35,7 @@ for n in $names; do
     elf=$out/$n
     if [ $cxx = yes ]; then
         tc="zig c++ powerpc-linux-musleabihf"
-        zig c++ -target powerpc-linux-musleabihf -mcpu=ppc -O2 -static -ffp-contract=off \
+        zig c++ -target powerpc-linux-musleabihf -mcpu=ppc -O2 -static -ffp-contract=off -Wl,--image-base=0x1000000 \
             -o "$elf" "$src" -lm 2>"$out/$n.build.log" || { echo "$n: BUILD FAILED ($tc)"; fail=$((fail+1)); continue; }
     else
         tc="clang+sysroot"
