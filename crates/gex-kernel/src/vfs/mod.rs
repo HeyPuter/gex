@@ -175,6 +175,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// This handle as a unix socket, when it is one: the syscalls that need
+    /// the concrete type (descriptor passing, `listen`, `accept`) recover it
+    /// from the handle, whichever process made it.
+    fn as_unix_socket(self: Arc<Self>) -> Option<Arc<crate::unix::UnixSocket>> {
+        None
+    }
+
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that
     /// the fd number and path cannot show.

@@ -334,6 +334,10 @@ impl Drop for UnixSocket {
 }
 
 impl FileHandle for UnixSocket {
+    fn as_unix_socket(self: Arc<Self>) -> Option<Arc<UnixSocket>> {
+        Some(self)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         self.recv(buf, 0, false)
     }

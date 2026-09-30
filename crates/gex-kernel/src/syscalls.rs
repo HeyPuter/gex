@@ -490,8 +490,6 @@ pub struct Kernel {
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
-    /// The same trick for unix sockets, which are a different concrete type.
-    pub unix_sockets: std::collections::HashMap<usize, Arc<unix::UnixSocket>>,
     /// The same, for the ones that live in the global kernel. Two tables
     /// rather than a trait object because the calls that need the concrete
     /// type -- `accept`, `has_pending`, descriptor passing -- are exactly the
@@ -1074,7 +1072,6 @@ impl Kernel {
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             sockets: Default::default(),
-            unix_sockets: Default::default(),
             remote_sockets: Default::default(),
             epolls: Default::default(),
             memfds: Default::default(),
@@ -1298,7 +1295,6 @@ impl Kernel {
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             sockets: self.sockets.clone(),
-            unix_sockets: self.unix_sockets.clone(),
             remote_sockets: self.remote_sockets.clone(),
             epolls: self.epolls.clone(),
             memfds: self.memfds.clone(),
@@ -4740,11 +4736,13 @@ impl Kernel {
         Ok(fd)
     }
 
-    /// The unix socket behind a descriptor, if it is one.
+    /// The unix socket behind a descriptor, if it is one. Asked of the
+    /// handle itself: a per-process table of the sockets this process made
+    /// did not know one that arrived over `SCM_RIGHTS`, so sending or
+    /// receiving descriptors through it silently carried none.
     fn unix_of(&self, fd: i32) -> Result<Arc<unix::UnixSocket>, Errno> {
         let file = self.fds.get(fd)?;
-        let key = Arc::as_ptr(&file.handle) as *const () as usize;
-        self.unix_sockets.get(&key).cloned().ok_or(Errno::ENOTSOCK)
+        Arc::clone(&file.handle).as_unix_socket().ok_or(Errno::ENOTSOCK)
     }
 
     /// The same for a socket that lives in the global kernel.
@@ -4776,15 +4774,10 @@ impl Kernel {
         Ok(())
     }
 
-    /// Put a unix socket in the descriptor table and remember the concrete
-    /// type, the way `sys_socket` does for an internet one.
+    /// Put a unix socket in the descriptor table.
     fn install_unix(&mut self, sock: Arc<unix::UnixSocket>, flags: u64, cloexec: bool) -> SysResult {
-        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
-        let key = Arc::as_ptr(&handle) as *const () as usize;
-        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
-        let fd = self.fds.insert(file, cloexec)?;
-        self.unix_sockets.insert(key, sock);
-        Ok(fd)
+        let file = OpenFile::new(sock, "socket".to_string(), flags, true, true);
+        self.fds.insert(file, cloexec)
     }
 
     /// The path out of a `struct sockaddr_un`: a two-byte family then up to
@@ -6131,6 +6124,31 @@ mod tests {
         k.vfs.mount("/", Arc::new(TmpFs::new()));
         k.vfs.mount("/dev", Arc::new(crate::vfs::DevFs::new()));
         (mem, k)
+    }
+
+    /// A unix socket that arrived over SCM_RIGHTS is placed straight in the
+    /// descriptor table, never through `install_unix`; it must still be one
+    /// to the calls that pass descriptors. (A per-process side table made it
+    /// ENOTSOCK there, and `sendmsg`/`recvmsg` then carried no descriptors.)
+    #[test]
+    fn a_received_unix_socket_is_still_a_unix_socket() {
+        let (_mem, mut k) = setup();
+        let (a, _b) = unix::UnixSocket::pair();
+        let fd = k
+            .fds
+            .insert(OpenFile::new(a.clone(), "socket".into(), 0, true, true), false)
+            .unwrap() as i32;
+        assert!(Arc::ptr_eq(&k.unix_of(fd).unwrap(), &a));
+        // Anything else is not.
+        let r = Arc::new(Pipe::new());
+        let pfd = k
+            .fds
+            .insert(
+                OpenFile::new(Arc::new(crate::file::PipeEnd { pipe: r, write: false }), "pipe".into(), 0, true, false),
+                false,
+            )
+            .unwrap() as i32;
+        assert_eq!(k.unix_of(pfd).err(), Some(Errno::ENOTSOCK));
     }
 
     /// What `clock_nanosleep` turns into: a sleep of the time left for an
