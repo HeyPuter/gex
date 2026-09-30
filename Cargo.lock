@@ -425,6 +425,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-cgen"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "gex-abi",
+ "gex-emit",
+ "gex-ir",
+ "wasm-encoder",
+ "wasmparser",
+]
+
+[[package]]
 name = "gex-difffuzz"
 version = "0.0.1"
 dependencies = [
@@ -561,6 +573,7 @@ name = "gex-xlate"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "gex-cgen",
  "gex-emit",
  "gex-ir",
  "gex-isa",
