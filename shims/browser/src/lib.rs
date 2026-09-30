@@ -1952,12 +1952,15 @@ fn arena_take(len: u64) -> Option<u64> {
 /// For a mapping the guest placed itself (`MAP_FIXED` or an honoured hint): the
 /// range is the guest's, and the heap takes from the same cursor, so the cursor
 /// must not stay below it.
-fn arena_back(end: u64) -> bool {
+///
+/// Answers where the cursor stood before, so the kernel can keep the bytes it
+/// stepped over as arena of its own (see `MemoryMap::grows_on_demand`), or
+/// `None` when the memory would not grow.
+fn arena_back(end: u64) -> Option<u64> {
     if !grow_memory_to(end) {
-        return false;
+        return None;
     }
-    ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
-    true
+    Some(ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// What the kernel's memory map calls to claim a span of arena.
@@ -7693,9 +7696,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         let from_file = snap_read_u32(raw, &mut p)? == 1;
         // The memory must reach the mapping before anything is written into it:
         // a restored process starts with only the fixed low layout.
-        if !arena_back(end) {
-            return None;
-        }
+        arena_back(end)?;
         if from_file {
             let path = snap_read_str(raw, &mut p)?;
             let off = snap_read_u64(raw, &mut p)?;

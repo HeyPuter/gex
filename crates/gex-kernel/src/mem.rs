@@ -99,7 +99,12 @@ pub struct MemoryMap {
     take: Option<fn(u64) -> u64>,
     /// Make the host's memory reach an address, for a mapping the guest
     /// placed itself rather than one the arena handed out.
-    back: Option<fn(u64) -> bool>,
+    ///
+    /// It answers where the shared cursor stood before (`None` when the memory
+    /// would not grow). The cursor only moves up, atomically, so the bytes
+    /// between that and `end` are this map's alone, and are recorded as arena
+    /// for later mappings to use.
+    back: Option<fn(u64) -> Option<u64>>,
     /// Bumped by every change to the map. `/proc/self/maps` is derived from the
     /// tree; a counter lets a cached rendering be reused unchanged instead of
     /// reformatting on every read (measured half of an X server's time in
@@ -156,7 +161,7 @@ impl MemoryMap {
 
     /// Hand out arena addresses bottom-up, for a host whose memory must be
     /// allocated up to whatever it hands out.
-    pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> bool) {
+    pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> Option<u64>) {
         self.take = Some(take);
         self.back = Some(back);
         self.arena.clear();
@@ -184,10 +189,24 @@ impl MemoryMap {
             return Ok(());
         }
         let _ = take;
-        match self.back {
-            Some(back) if end <= MMAP_TOP && back(end) => Ok(()),
-            _ => Err(Errno::ENOMEM),
+        let Some(back) = self.back.filter(|_| end <= MMAP_TOP) else {
+            return Err(Errno::ENOMEM);
+        };
+        let Some(prev) = back(end) else {
+            return Err(Errno::ENOMEM);
+        };
+        // What the cursor stepped over is backed now and nobody else's:
+        // arena, so the next mapping lands in it rather than growing the
+        // memory again. Without this a MAP_FIXED high up (a pinned library,
+        // a thread stack placed by hint) stranded everything between the old
+        // cursor and itself.
+        if prev < end {
+            match self.arena.last_mut() {
+                Some(last) if last.1 == prev => last.1 = end,
+                _ => self.arena.push((prev, end)),
+            }
         }
+        Ok(())
     }
 
     /// How much of the top of the arena is free: the bytes between the highest
@@ -686,8 +705,8 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(_end: u64) -> bool {
-            true
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
 
@@ -777,6 +796,37 @@ mod tests {
         // Right above the directory and at the arena's bottom is fine.
         assert!(m.mmap(gex_abi::DISPATCH_DIR_END, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "ok").is_ok());
         assert!(m.mmap(MMAP_BOTTOM, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "ok").is_ok());
+    }
+
+    /// A MAP_FIXED above the arena moves the shared cursor past it; the
+    /// bytes it stepped over are this map's, and the next mapping uses them
+    /// instead of claiming more.
+    #[test]
+    fn memory_backed_for_a_fixed_mapping_is_reused() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let first = m.mmap(0, 0x1000, 3, anon, "a").unwrap();
+        // Someone else sharing the cursor (the shim's heap) claims a span.
+        let theirs = take(0x10_0000);
+        let high = 0x2000_0000;
+        assert_eq!(m.mmap(high, 0x1000, 3, anon | flags::FIXED, "high"), Ok(high));
+        let cursor = NEXT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(cursor, high + 0x1000);
+        // The next ordinary mapping comes from below the fixed one, and not
+        // from the span the other user took.
+        let next = m.mmap(0, 0x10_0000, 3, anon, "b").unwrap();
+        assert!(next < high && next > first, "{next:#x}");
+        assert!(next + 0x10_0000 <= theirs || next >= theirs + 0x10_0000, "{next:#x} overlaps {theirs:#x}");
+        assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the arena grew");
     }
 
     #[test]
