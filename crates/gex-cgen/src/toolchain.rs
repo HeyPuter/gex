@@ -109,6 +109,7 @@ pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 }
                 let mut cmd = Command::new(clang());
                 cmd.args(CFLAGS)
+                    .args(extra_cflags())
                     .arg("-I")
                     .arg(dir)
                     .arg("-c")
@@ -155,4 +156,12 @@ pub fn link(dir: &Path, objs: &[PathBuf], exports: &[String], out: &Path) -> Res
     .arg("-o")
     .arg(out);
     run(&mut cmd, "wasm-ld")
+}
+
+/// `GEX_CGEN_CFLAGS`: extra clang flags, for pricing code-generation choices
+/// (not part of any cache key: build with `--no-cache` when using it).
+fn extra_cflags() -> Vec<String> {
+    std::env::var("GEX_CGEN_CFLAGS")
+        .map(|v| v.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
 }
