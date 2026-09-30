@@ -6,3 +6,9 @@ license.workspace = true
 description = "Shared layout contract between gex's compiler, kernel and runtime"
 
 [dependencies]
+
+[features]
+# Guest architecture. Default is AArch64; `x86` selects x86-64. A build-time
+# choice because the instruction alignment (dispatch slot granularity) and the
+# syscall register convention are constants the emitter, kernel and shims bake in.
+x86 = []
