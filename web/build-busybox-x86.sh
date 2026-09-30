@@ -8,13 +8,25 @@ set -eu
 cd "$(dirname "$0")"
 MIRROR="${GEX_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 SUITE="${GEX_DEBIAN_SUITE:-bookworm}"
-WORK="${TMPDIR:-/tmp}/gex-busybox-x86"
+# `GEX_BITS=32` builds the i386 image instead -- Debian's static i386 busybox
+# in the same layout, as `rootfs/x86/busybox32.tar` -- the gate for the
+# guest's 32-bit compatibility mode.
+BITS="${GEX_BITS:-64}"
+if [ "$BITS" = 32 ]; then
+    DEB_ARCH=i386
+    OUT_NAME=busybox32.tar
+    WORK="${TMPDIR:-/tmp}/gex-busybox-i386"
+else
+    DEB_ARCH=amd64
+    OUT_NAME=busybox.tar
+    WORK="${TMPDIR:-/tmp}/gex-busybox-x86"
+fi
 PUB="$(pwd)/public"
 GEXC="${GEXC:-$(cd .. && pwd)/target/x86/release/gexc}"
 mkdir -p "$WORK" "$PUB/rootfs/x86"
 if [ ! -f "$WORK/busybox" ]; then
-    echo "fetching busybox-static (amd64)..."
-    curl -fsSL "$MIRROR/dists/$SUITE/main/binary-amd64/Packages.gz" | gunzip -c \
+    echo "fetching busybox-static ($DEB_ARCH)..."
+    curl -fsSL "$MIRROR/dists/$SUITE/main/binary-$DEB_ARCH/Packages.gz" | gunzip -c \
         | awk '/^Package: busybox-static$/{p=1} p&&/^Filename:/{print $2; exit}' > "$WORK/filename"
     curl -fsSL "$MIRROR/$(cat "$WORK/filename")" -o "$WORK/bb.deb"
     (cd "$WORK" && rm -rf x && mkdir x && cd x && ar x ../bb.deb && tar -xf data.tar.*)
@@ -43,8 +55,8 @@ cat > "$R/root/hello.c" <<'EOP'
 #include <stdio.h>
 int main(void) { puts("a file that came with the rootfs"); return 0; }
 EOP
-tar -C "$R" -cf "$PUB/rootfs/x86/busybox.tar" .
-echo "  $PUB/rootfs/x86/busybox.tar: $(du -h "$PUB/rootfs/x86/busybox.tar" | cut -f1)"
+tar -C "$R" -cf "$PUB/rootfs/x86/$OUT_NAME" .
+echo "  $PUB/rootfs/x86/$OUT_NAME: $(du -h "$PUB/rootfs/x86/$OUT_NAME" | cut -f1)"
 # A smoke test of the binary under the x86-64 gexc, when one is built.
 if [ -x "$GEXC" ]; then
     "$GEXC" run "$BB" echo "busybox under gex: ok" || echo "  (gexc smoke test failed)"
