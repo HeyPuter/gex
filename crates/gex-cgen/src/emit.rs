@@ -36,6 +36,13 @@ pub fn check_environment() -> Result<()> {
     Ok(())
 }
 
+fn ballast() -> usize {
+    std::env::var("GEX_CGEN_BALLAST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 fn no_guard() -> bool {
     std::env::var_os("GEX_UNSAFE_NO_GUARD").is_some()
 }
@@ -160,6 +167,8 @@ pub(crate) struct FnRegs {
     pub used: BTreeSet<GuestReg>,
     /// Written anywhere: stored back before control can leave.
     pub written: BTreeSet<GuestReg>,
+    /// Store only the registers that may be dirty at each write-back.
+    pub clean_spills: bool,
 }
 
 pub(crate) struct Emitter<'a> {
@@ -277,15 +286,36 @@ impl<'a> Emitter<'a> {
         self.regs.insert(r, true);
     }
 
+    /// Function mode: the registers that may differ from the context here.
+    pub(crate) fn set_dirty(&mut self, dirty: &BTreeSet<GuestReg>) {
+        self.regs = dirty.iter().map(|r| (*r, true)).collect();
+    }
+
+    /// A write-back on a conditional path: the stores happen, but the
+    /// emitter keeps believing the registers are dirty.
+    pub(crate) fn flush_keep(&mut self) {
+        self.flush_inner(true);
+    }
+
     pub(crate) fn flush(&mut self) {
         self.flush_inner(false);
     }
 
     fn flush_inner(&mut self, keep_dirty: bool) {
         if let Some(fr) = &self.func_regs {
-            let w: Vec<GuestReg> = fr.written.iter().copied().collect();
+            // Clean-spill elision: only what may differ from the context on
+            // some path to here (`func::dirty_in`); otherwise everything the
+            // function writes anywhere.
+            let w: Vec<GuestReg> = if fr.clean_spills {
+                self.regs.iter().filter(|(_, d)| **d).map(|(r, _)| *r).collect()
+            } else {
+                fr.written.iter().copied().collect()
+            };
             let loaded = fr.used.clone();
             self.store_regs(&w, &loaded);
+            if !keep_dirty {
+                self.regs.clear();
+            }
             return;
         }
         let mut dirty: Vec<GuestReg> = self
@@ -348,6 +378,7 @@ impl<'a> Emitter<'a> {
         if let Some(fr) = &self.func_regs {
             let u: Vec<GuestReg> = fr.used.iter().copied().collect();
             self.load_regs(&u);
+            self.regs.clear();
             return;
         }
         self.regs.clear();
@@ -376,6 +407,15 @@ impl<'a> Emitter<'a> {
     /// Function mode: store `regs` from their locals, packing the flags the
     /// way tier-1 does when all four are loaded.
     fn store_regs(&mut self, regs: &[GuestReg], loaded: &BTreeSet<GuestReg>) {
+        // `GEX_CGEN_BALLAST=N`: N more stores at every write-back, into a slot
+        // nothing reads, to price the write-back traffic before optimising it
+        // (the OPTIMIZATIONS-MISSING.md method: a store cannot be deleted).
+        for i in 0..ballast() {
+            self.line(format!(
+                "*(volatile uint64_t *)(GEX_CTXP(ctx) + {}u) = {i}u;",
+                ctx::BALLAST
+            ));
+        }
         let mut regs: Vec<GuestReg> = regs.to_vec();
         regs.sort_by_key(|r| reg_offset(*r));
         let flags = [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V];
@@ -386,8 +426,14 @@ impl<'a> Emitter<'a> {
                 ctx::NZCV
             ));
         }
+        // `GEX_CGEN_MUTATE_NOWB=<n>`: never write x<n> back. A deliberate
+        // miscompilation, to check that the lockstep check catches one.
+        let skip = std::env::var("GEX_CGEN_MUTATE_NOWB")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .map(GuestReg::X);
         for r in regs {
-            if r == GuestReg::CtxAddr || (packed && flags.contains(&r)) {
+            if r == GuestReg::CtxAddr || (packed && flags.contains(&r)) || Some(r) == skip {
                 continue;
             }
             let off = reg_offset(r);
@@ -1446,4 +1492,17 @@ pub fn lane_bin_name(op: VLaneBinOp, lane: VLane) -> Result<String> {
 /// The intrinsic `lane_un` names, for the opcode test.
 pub fn lane_un_name(op: VLaneUnOp, lane: VLane) -> Result<String> {
     lane_un(op, lane)
+}
+
+/// Whether a statement is a host call that can change guest state, so the
+/// function tier writes back before it and reloads after.
+pub(crate) fn clobbers(s: &Stmt) -> bool {
+    match s {
+        Stmt::HostCall { func, .. } => func.clobbers_guest_state(),
+        Stmt::Def {
+            expr: Expr::HostCall { func, .. },
+            ..
+        } => func.clobbers_guest_state(),
+        _ => false,
+    }
 }

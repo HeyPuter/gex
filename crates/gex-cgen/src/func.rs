@@ -83,7 +83,9 @@ impl FnUnit {
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
         e.resize(f.n_values as usize);
-        let regs = registers(f);
+        let mut regs = registers(f);
+        regs.clean_spills = clean_spills();
+        let dirty = if regs.clean_spills { dirty_in(f) } else { Vec::new() };
         let used: Vec<GuestReg> = regs.used.iter().copied().collect();
         e.func_regs = Some(regs);
         let mut calls: BTreeSet<u64> = BTreeSet::new();
@@ -98,6 +100,9 @@ impl FnUnit {
         // Block 0 is the entry and comes first, so control falls into it.
         for (i, b) in f.blocks.iter().enumerate() {
             e.line(format!("L{i}: {{"));
+            if let Some(d) = dirty.get(i) {
+                e.set_dirty(d);
+            }
             for s in &b.stmts {
                 e.stmt(s)?;
             }
@@ -146,7 +151,7 @@ impl FnUnit {
             if !to.synthetic && to.start <= b.start {
                 e.line("if (--poll <= 0) {");
                 e.line("  poll = 1024;");
-                e.flush();
+                e.flush_keep();
                 e.store_pc(&format!("0x{:x}ull", to.start));
                 e.line(format!("  gex_safepoint(ctx, 0x{:x}ll);", to.start));
                 e.line("}");
@@ -314,5 +319,62 @@ fn registers(f: &Function) -> FnRegs {
             }
         }
     }
-    FnRegs { used, written }
+    FnRegs {
+        used,
+        written,
+        clean_spills: false,
+    }
+}
+
+/// Clean-spill elision (pewasm's `opt_spill`, optimization-plan §16) is on
+/// unless `GEX_CGEN_CLEAN=0`.
+fn clean_spills() -> bool {
+    std::env::var("GEX_CGEN_CLEAN").as_deref() != Ok("0")
+}
+
+/// For each block, the registers that may differ from the context on entry:
+/// a forward may-analysis. A write makes a register dirty; a write-back
+/// followed by a reload (a call, a syscall, a clobbering host call) makes
+/// everything clean; the entry starts clean, having just loaded everything.
+fn dirty_in(f: &Function) -> Vec<BTreeSet<GuestReg>> {
+    let n = f.blocks.len();
+    let mut inn: Vec<Option<BTreeSet<GuestReg>>> = vec![None; n];
+    inn[0] = Some(BTreeSet::new());
+    let order = f.rpo();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &id in &order {
+            let Some(mut d) = inn[id.index()].clone() else { continue };
+            let b = &f.blocks[id.index()];
+            for s in &b.stmts {
+                match s {
+                    Stmt::WriteReg { reg, .. } => {
+                        d.insert(*reg);
+                    }
+                    _ if emit::clobbers(s) => d.clear(),
+                    _ => {}
+                }
+            }
+            if matches!(b.term, FTerm::Call { .. } | FTerm::Syscall { .. }) {
+                d.clear();
+            }
+            for s in b.succs() {
+                let slot = &mut inn[s.index()];
+                let merged = match slot {
+                    Some(old) => {
+                        let u: BTreeSet<GuestReg> = old.union(&d).copied().collect();
+                        if u.len() == old.len() {
+                            continue;
+                        }
+                        u
+                    }
+                    None => d.clone(),
+                };
+                *slot = Some(merged);
+                changed = true;
+            }
+        }
+    }
+    inn.into_iter().map(|d| d.unwrap_or_default()).collect()
 }
