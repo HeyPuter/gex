@@ -1,6 +1,7 @@
 /* Structured exceptions: __try/__except and __finally, RaiseException with
  * parameters, nested handlers and unwinding, continuing from a vectored
- * handler, and an unhandled exception reaching the top-level filter.
+ * handler, processor exceptions (int3, ud2, executing data), and an
+ * unhandled exception reaching the top-level filter.
  * gex-nt-cc: clang --target=x86_64-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
@@ -23,6 +24,13 @@ __attribute__((noinline)) static void inner(void) {
         finally_ran = 1;
     }
 }
+
+/* In functions of their own: an instruction that ends a __try block's code
+ * can fall outside the block's scope range (clang ends it at the last
+ * call), so the handler is found in the caller, as it would be for any
+ * faulting callee. */
+__attribute__((noinline)) static void do_int3(void) { __debugbreak(); __asm__ volatile("nop"); }
+__attribute__((noinline)) static void do_ud2(void) { __builtin_trap(); }
 
 static volatile LONG vectored_calls;
 static LONG CALLBACK vectored(EXCEPTION_POINTERS *e) {
@@ -60,6 +68,22 @@ int main(void) {
     RaiseException(0xe0005678, 0, 0, 0);
     CHECK("vectored handler continues execution", vectored_calls == 2);
     RemoveVectoredExceptionHandler(h);
+
+    DWORD code = 0;
+    __try { do_int3(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    CHECK("int3 is EXCEPTION_BREAKPOINT", code == EXCEPTION_BREAKPOINT);
+    code = 0;
+    __try { do_ud2(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    CHECK("ud2 is EXCEPTION_ILLEGAL_INSTRUCTION", code == EXCEPTION_ILLEGAL_INSTRUCTION);
+    static unsigned char data_bytes[16] = {0xc3};
+    ULONG_PTR kind = 0, where = 0;
+    code = 0;
+    __try { ((void (*)(void))(void *)data_bytes)(); }
+    __except (code = GetExceptionCode(),
+              kind = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[0],
+              where = GetExceptionInformation()->ExceptionRecord->ExceptionInformation[1],
+              EXCEPTION_EXECUTE_HANDLER) {}
+    CHECK("executing data is an access violation", code == EXCEPTION_ACCESS_VIOLATION && kind == 8 && where == (ULONG_PTR)data_bytes);
 
     SetUnhandledExceptionFilter(top_filter);
     RaiseException(0xe00000ff, EXCEPTION_NONCONTINUABLE, 0, 0);

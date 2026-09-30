@@ -573,6 +573,54 @@ pub fn syscall_name(nr: u32) -> String {
     }
 }
 
+/// A processor exception in translated code (`int3`, an instruction gex
+/// cannot run, a branch to memory that is not executable), delivered as an
+/// NT exception the way Wine's signal handlers do: a CONTEXT of the faulting
+/// state and a record, then `KiUserExceptionDispatcher`. `rip` is the pc the
+/// context reports (after the `int3` for a breakpoint, which the dispatch
+/// adjusts); `info` fills `ExceptionInformation`.
+pub fn hardware_exception(
+    p: &Arc<Process>,
+    kernel: &Mutex<Kernel>,
+    data: &mut [u8],
+    ctx_addr: u64,
+    code: u32,
+    rip: u64,
+    info: &[u64],
+) -> Outcome {
+    let g = G::new(data, p.abi);
+    let Some(t) = p.thread_by_ctx(ctx_addr) else {
+        eprintln!("gex-nt: exception {code:#x} in a thread the NT layer does not know (ctx {ctx_addr:#x})");
+        return Outcome::Exit(code);
+    };
+    if p.abi != Abi::P64 {
+        eprintln!("gex-nt: exception {code:#x} at {rip:#x} in a 32-bit process (N3)");
+        return Outcome::Exit(code);
+    }
+    let mut c = Call { p, t, kernel, g, nr: 0, pc: rip, outcome: None };
+    let r = (|| -> R<()> {
+        let rsp = c.g.u64(ctx_addr + ctx::x(4) as u64)?;
+        let context = ((rsp - 0x5c0) & !63) - 0x600;
+        thread::save_context64(&mut c.g, ctx_addr, context, rip)?;
+        let mut rec = vec![0u8; 0x98];
+        rec[0..4].copy_from_slice(&code.to_le_bytes());
+        let addr = if code == st::BREAKPOINT { rip - 1 } else { rip };
+        rec[16..24].copy_from_slice(&addr.to_le_bytes());
+        rec[24..28].copy_from_slice(&(info.len() as u32).to_le_bytes());
+        for (i, v) in info.iter().enumerate() {
+            rec[32 + 8 * i..40 + 8 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        thread::dispatch_exception64(&mut c, &rec, context)
+    })();
+    match (r, c.outcome.take()) {
+        (Ok(()), Some(o)) => o,
+        (r, _) => {
+            eprintln!("gex-nt: could not dispatch exception {code:#x} at {rip:#x}: {r:?}");
+            Outcome::Exit(code)
+        }
+    }
+}
+
 /// Handle one syscall from an NT process. `data` is the whole guest memory.
 pub fn syscall(p: &Arc<Process>, kernel: &Mutex<Kernel>, data: &mut [u8], ctx_addr: u64, pc: u64) -> Outcome {
     let abi = p.abi;

@@ -130,3 +130,38 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         }
     }
 }
+
+/// A processor exception in an NT process's translated code.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fault {
+    /// `int3`; the pc is the instruction's own address.
+    Breakpoint,
+    /// An instruction gex does not implement (`ud2` included).
+    Illegal,
+    /// A branch to memory that is not executable.
+    NotExecutable,
+}
+
+/// Deliver `fault` at `pc` to the guest as an NT exception, as Wine's signal
+/// handlers do. Returns the StopExecution that redirects the thread into
+/// `KiUserExceptionDispatcher`.
+pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -> Result<()> {
+    use nt::st;
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let state = caller.data_mut();
+    let p = Arc::clone(state.nt.as_ref().expect("an NT fault in a Linux process"));
+    let (code, rip, info): (u32, u64, Vec<u64>) = match fault {
+        // The context's rip is after the int3, as hardware leaves it.
+        Fault::Breakpoint => (st::BREAKPOINT, pc + 1, vec![0]),
+        Fault::Illegal => (st::ILLEGAL_INSTRUCTION, pc, vec![]),
+        // EXCEPTION_EXECUTE_FAULT at the target.
+        Fault::NotExecutable => (st::ACCESS_VIOLATION, pc, vec![8, pc]),
+    };
+    let outcome = nt::hardware_exception(&p, &state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
+    match outcome {
+        nt::Outcome::Resume(target) => state.resume_at = Some(target),
+        nt::Outcome::Exit(code) => state.exit = Some(Exit::Status(code as i32)),
+        other => bail!("gex-nt: unexpected outcome {other:?} from exception dispatch"),
+    }
+    Err(StopExecution.into())
+}
