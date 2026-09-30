@@ -29,6 +29,7 @@ pub mod timerfd;
 pub mod tty;
 pub mod vfs;
 pub mod unix;
+pub mod f80;
 pub mod x86;
 pub mod i386;
 pub mod ppc;

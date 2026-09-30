@@ -337,24 +337,31 @@ pub mod ctx {
     /// first sixteen are `xmm0`–`xmm15`.
     pub const V: usize = 48 * 8;
 
-    /// x86-64 only: the x87 register stack, eight 64-bit slots holding each
-    /// `ST(i)` (physical register `R(i)`, not stack-relative) as a double.
-    /// gex computes the x87 in double precision, not the architectural 80-bit
-    /// extended format; guests observe that as reduced `long double` precision.
+    /// x86-64 only: the x87 register stack, eight 16-byte slots holding each
+    /// physical register `R(i)` (not stack-relative) in the 80-bit extended
+    /// format, laid out as `fxsave` does: the 64-bit significand with its
+    /// explicit integer bit at +0, the sign and exponent word at +8, six
+    /// bytes of padding.
     pub const X87: usize = V + 32 * 16;
     /// x87 `TOP` (0..7), the physical register `ST(0)` names.
-    pub const X87_TOP: usize = X87 + 8 * 8;
-    /// x87 control word, as `fldcw`/`fnstcw` see it.
+    pub const X87_TOP: usize = X87 + 8 * 16;
+    /// x87 control word, as `fldcw`/`fnstcw` see it. Each of these x87
+    /// words has a 4-byte slot of its own: translated code moves them as
+    /// 32-bit values.
     pub const X87_CW: usize = X87_TOP + 4;
-    /// x87 status word, less `TOP` and the condition codes the lifter derives.
-    pub const X87_SW: usize = X87_CW + 2;
+    /// x87 status word, less `TOP` (which lives in `X87_TOP`).
+    pub const X87_SW: usize = X87_CW + 4;
     /// One bit per physical register: 1 means valid (tag word derived).
-    pub const X87_TAGS: usize = X87_SW + 2;
+    pub const X87_TAGS: usize = X87_SW + 4;
+    /// 16 bytes through which an x87 memory operand passes to and from the
+    /// host, which computes the x87's arithmetic (`gex_kernel::f80`): raw
+    /// bits at +0, and for the 80-bit format the sign and exponent at +8.
+    pub const X87_TMP: usize = X87_TAGS + 4;
 
     /// A 64-byte per-thread scratch area the kernel may use for structures it
     /// must materialise in guest memory on the guest's behalf (an x86-64
     /// `poll` becomes `ppoll` with a timespec that has to live somewhere).
-    pub const SCRATCH: usize = X87 + 12 * 8;
+    pub const SCRATCH: usize = X87_TMP + 16;
 
     /// PowerPC only: the area after `v31` (where x86-64 keeps its x87
     /// stack). The 32 condition-register bits, one byte each: bit `4f + k` is
@@ -581,6 +588,23 @@ pub mod imports {
     /// host prints the pc and a few registers and RETURNS.
     pub const BRK_TRACE: i32 = -3;
 
+    /// Not a `brk`: a `Stmt::Trap` for an integer division by zero (x86
+    /// `div`/`idiv`, #DE). The host raises it and does not return: SIGFPE
+    /// with `FPE_INTDIV` for a Linux guest, EXCEPTION_INT_DIVIDE_BY_ZERO for
+    /// a Windows one.
+    pub const BRK_DIVIDE_BY_ZERO: i32 = -4;
+
+    /// Not a `brk`: a `Stmt::Trap` for an integer division whose quotient
+    /// does not fit (x86 #DE: `INT_MIN / -1`, or any quotient too wide for
+    /// the destination). Linux reports it as SIGFPE with `FPE_INTDIV`, the
+    /// same as a zero divisor; Windows as EXCEPTION_INT_OVERFLOW.
+    pub const BRK_DIVIDE_OVERFLOW: i32 = -5;
+
+    /// Not a `brk`: a `Stmt::Trap` for a general-protection fault, such as
+    /// a privileged instruction (x86 `hlt`) in user mode. Linux reports it
+    /// as SIGSEGV at the instruction.
+    pub const BRK_GENERAL_PROTECTION: i32 = -6;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";
@@ -702,6 +726,7 @@ mod tests {
         assert!(ctx::TPIDR > ctx::VF);
         assert!(ctx::V >= ctx::LAST_SYSCALL + 8);
         assert!(ctx::X87 == ctx::v(31) + 16);
+        assert!(ctx::X87 % 16 == 0 && ctx::X87_TMP % 16 == 0);
         assert!(!X86 || ctx::SIZE >= ctx::SCRATCH + 64);
         assert!(X86 || PPC || ctx::SIZE == ctx::v(31) + 16);
         // PowerPC's registers fit between `v31` and the scratch area.

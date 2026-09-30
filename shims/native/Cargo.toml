@@ -8,6 +8,7 @@ description = "Native host for gex: wasmtime engine plus the kernel bindings"
 [dependencies]
 gex-abi.workspace = true
 gex-cache.workspace = true
+gex-emit.workspace = true
 gex-mem.workspace = true
 gex-kernel.workspace = true
 gex-wayland.workspace = true
@@ -30,3 +31,7 @@ wasmtime = { version = "27", default-features = false, features = ["cranelift", 
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]
 # Host a 32-bit big-endian PowerPC guest (docs/ppc.md).
 ppc = ["gex-abi/ppc", "gex-xlate/ppc", "gex-kernel/ppc"]
+
+[dev-dependencies]
+gex-ir.workspace = true
+gex-emit.workspace = true

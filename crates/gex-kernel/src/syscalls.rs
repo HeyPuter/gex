@@ -4526,6 +4526,23 @@ impl Kernel {
             let len_aligned = crate::mem::page_align_up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
+            // A loader that maps an object's first segment straight from the
+            // file, spanning the whole object (glibc 2.35 and later), rather
+            // than reserving anonymous memory first: that mapping takes the
+            // pin armed when the object was opened, the same way.
+            let mut addr = addr;
+            let mut pinned = None;
+            if addr == 0 && flags & crate::mem::flags::FIXED == 0 {
+                if let Some((path, base)) = self.armed_pin.take() {
+                    if path.rsplit('/').next() == name.rsplit('/').next() {
+                        self.armed_place = None;
+                        addr = base;
+                        pinned = Some((path, base));
+                    } else {
+                        self.armed_pin = Some((path, base));
+                    }
+                }
+            }
             // A second `MAP_SHARED` of the same open file must see the first
             // one's writes, so hand back the same pages -- a Wayland client
             // maps a buffer and sends the descriptor, and the next mapper must
@@ -4550,6 +4567,9 @@ impl Kernel {
                 &name,
                 Some((name.clone(), offset)),
             )?;
+            if let Some((path, base)) = pinned {
+                self.pin_landed.push((path, base, start));
+            }
             let mut tmp = vec![0u8; len as usize];
             let n = file.pread(offset, &mut tmp)? as usize;
             m.zero(start, len_aligned as usize)?;

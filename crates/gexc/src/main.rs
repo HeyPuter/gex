@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod eject;
 mod nt_run;
 mod pe_info;
 
@@ -45,6 +46,10 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "eject" => match eject::cmd_eject(&argv[2..])? {
+            Some(exit) => Ok(report_exit(&exit, false)),
+            None => Ok(ExitCode::SUCCESS),
+        },
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
@@ -89,6 +94,7 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
+{}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
 
@@ -159,7 +165,8 @@ run options:
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
                   path the guest can resolve",
-        pe_info::USAGE
+        pe_info::USAGE,
+        eject::USAGE
     );
 }
 
@@ -546,6 +553,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    // A 32-bit (i386) program's code must be decoded in compatibility mode,
+    // exactly as the runtime path does before translating (`run_program_with`).
+    gex_xlate::set_compat(image.class32);
     let (module, stats) = gex_xlate::translate_image(
         &image,
         &Options {
@@ -651,6 +661,19 @@ fn build_closure(
     profile: &[u64],
 ) -> Result<()> {
     let (closure, interp) = closure_of_all(path, also, sysroot)?;
+    // One decoding mode for the whole closure, taken from the executable: a
+    // 32-bit (i386) program is 32-bit throughout, and a closure that mixes
+    // classes cannot be translated in one mode.
+    let class32 = closure.objects.first().map(|o| o.image.class32).unwrap_or(false);
+    if let Some(o) = closure.objects.iter().find(|o| o.image.class32 != class32) {
+        anyhow::bail!(
+            "{}: a {}-bit object in a {}-bit program's closure",
+            o.path,
+            if o.image.class32 { 32 } else { 64 },
+            if class32 { 32 } else { 64 }
+        );
+    }
+    gex_xlate::set_compat(class32);
     // Sorted once so each object can binary-search its slice of reached PCs.
     let mut profile_sorted = profile.to_vec();
     profile_sorted.sort_unstable();

@@ -9297,6 +9297,25 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         }
         return;
     }
+    // A divide error (`Stmt::Trap`): x86 #DE, SIGFPE on Linux. This shim
+    // does not deliver synchronous faults to a guest handler (as with
+    // SIGILL); the process dies of the signal.
+    if raw == gex_abi::imports::BRK_DIVIDE_BY_ZERO || raw == gex_abi::imports::BRK_DIVIDE_OVERFLOW {
+        trace_line(&format!(
+            "gex: integer divide {} at pc={:#x} (SIGFPE)\n",
+            if raw == gex_abi::imports::BRK_DIVIDE_BY_ZERO { "by zero" } else { "overflow" },
+            pc
+        ));
+        with_host(|h| set_exit(h, 128 + 8));
+        trap();
+    }
+    // A general-protection fault (a privileged instruction in user mode):
+    // SIGSEGV on Linux, fatal here.
+    if raw == gex_abi::imports::BRK_GENERAL_PROTECTION {
+        trace_line(&format!("gex: general protection fault at pc={pc:#x} (SIGSEGV)\n"));
+        with_host(|h| set_exit(h, 128 + 11));
+        trap();
+    }
     // The stack-pointer check borrows this import rather than adding one, so an
     // older shim still links. Names the object, since the block that *writes* a
     // bad `sp` is elsewhere from the one that dies on it.
@@ -9379,7 +9398,17 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     }
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
+pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
+    // A gex-eject library replacement (`Intrinsic::Replace`). This shim has no
+    // replacement modules to run it with (eject v0 runs them natively only),
+    // and returning would carry on as if the replaced function had run.
+    if reg == gex_xlate::intrinsic::REPLACE_SYSREG {
+        panic!(
+            "gex: replacement #{val} (the function at {:#x}) cannot run in the browser shim; \
+             run the ejected project natively",
+            pc as u64
+        );
+    }
     // PowerPC: a non-default FPSCR rounding mode, which wasm arithmetic cannot
     // honour, and mffs under GEX_FP_STRICT=1 (docs/ppc.md §8). Both fail
     // loudly, as an illegal instruction would.
@@ -9388,7 +9417,7 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
             || reg == gex_kernel::ppc::SYSREG_MFFS_STRICT)
     {
         trace_line(&format!(
-            "gex: {} at pc={_pc:#x} (FPSCR={val:#x}); gex computes round-to-nearest only and no FP exception flags\n",
+            "gex: {} at pc={pc:#x} (FPSCR={val:#x}); gex computes round-to-nearest only and no FP exception flags\n",
             if reg == gex_kernel::ppc::SYSREG_MFFS_STRICT { "mffs under GEX_FP_STRICT" } else { "non-default FP rounding mode" },
         ));
         with_host(|h| set_exit(h, 128 + 4));
@@ -10833,6 +10862,8 @@ fn note_intrinsics(addr: u64) {
                 gex_xlate::Intrinsic::MemCmp => 4,
                 gex_xlate::Intrinsic::MemPCpy => 8,
                 gex_xlate::Intrinsic::MemMove => 16,
+                // Never recognised by name, so never reaches this scan.
+                gex_xlate::Intrinsic::Replace(_) => 0,
             };
             if mask & bit == 0 {
                 continue;

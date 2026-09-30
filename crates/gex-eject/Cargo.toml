@@ -1,0 +1,19 @@
+[package]
+name = "gex-eject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gex-eject: turn a recorded gex session into a standalone, customizable project"
+
+[dependencies]
+gex-abi.workspace = true
+gex-ld.workspace = true
+gex-xlate = { workspace = true, features = ["parallel"] }
+gex-emit.workspace = true
+gex-cache.workspace = true
+gex-native.workspace = true
+anyhow = "1"
+
+[features]
+# For an x86-64 guest. See `gex_abi::X86`.
+x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86"]

@@ -11,3 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 gex-isa.workspace = true
+gex-ir.workspace = true
+gex-lift.workspace = true

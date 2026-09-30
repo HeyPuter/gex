@@ -360,6 +360,9 @@ pub enum Op {
     Int3,
     Int,
     Hlt,
+    /// An I/O-privileged instruction, #GP in user mode (IOPL 0): `cli`,
+    /// `sti`, `in`, `out`, `ins`, `outs`. Carries the opcode byte.
+    Privileged(u8),
     Nop,
     Endbr,
     Pause,

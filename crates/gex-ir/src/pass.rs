@@ -304,6 +304,11 @@ pub fn flag_effects(block: &Block) -> (u8, u8) {
             } if func.clobbers_guest_state() => {
                 uses = ALL_FLAGS;
             }
+            // A fault hands the whole state to the host: every flag not yet
+            // written in this block is read from the block's entry.
+            Stmt::Trap { .. } => {
+                uses |= ALL_FLAGS & !defs;
+            }
             _ => {}
         }
     }
@@ -363,6 +368,8 @@ pub fn dead_store_elim_with(block: &mut Block, dead_out: &[GuestReg]) {
             Stmt::HostCall { func, .. } if func.clobbers_guest_state() => {
                 overwritten.clear();
             }
+            // A register written before a fault is observable in it.
+            Stmt::Trap { .. } => overwritten.clear(),
             _ => {}
         }
     }
@@ -452,6 +459,31 @@ pub fn stats(block: &Block) -> Stats {
 
 #[cfg(test)]
 mod tests {
+
+    /// A register written before a `Trap` is part of the state the fault
+    /// reports, so it survives even when a later write would kill it; and
+    /// the flags the block has not yet written count as read there.
+    #[test]
+    fn a_trap_reads_the_whole_state() {
+        let mut b = Builder::new(0x1000);
+        let k = b.const_i64(7);
+        b.write(GuestReg::X(2), k);
+        let c = b.const_i32(1);
+        b.stmt(Stmt::Trap { cond: c, pc: 0x1000, code: -4 });
+        let k2 = b.const_i64(8);
+        b.write(GuestReg::X(2), k2);
+        let mut block = b.finish(Term::Goto { target: 0x1004 });
+        dead_store_elim(&mut block);
+        let writes = block
+            .stmts
+            .iter()
+            .filter(|s| matches!(s, Stmt::WriteReg { reg: GuestReg::X(2), .. }))
+            .count();
+        assert_eq!(writes, 2, "{}", crate::print::block(&block));
+        let (uses, _) = flag_effects(&block);
+        assert_eq!(uses, ALL_FLAGS);
+    }
+
     use super::*;
 
     #[test]
