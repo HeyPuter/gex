@@ -1156,6 +1156,7 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
     let mut path = None;
     let mut at = None;
     let (mut ir, mut ssa, mut check, mut list) = (false, false, false, false);
+    let mut show_uncovered = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1169,6 +1170,7 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
             "--ssa" => ssa = true,
             "--check" => check = true,
             "--list" => list = true,
+            "--uncovered" => show_uncovered = true,
             other => path = Some(other.to_string()),
         }
         i += 1;
@@ -1221,6 +1223,24 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         .collect();
     for (a, s) in missing.iter().take(20) {
         eprintln!("  missing symbol {a:#x} {}", s.name.as_deref().unwrap_or("?"));
+    }
+    if show_uncovered {
+        let view = gex_xlate::CodeView::new(&image);
+        for (lo, hi, sym) in gex_xlate::func::uncovered(&prog) {
+            let name = prog.starts[&sym].name.as_deref().unwrap_or("?");
+            println!("uncovered {lo:#x}..{hi:#x} in {name} ({sym:#x})");
+            let mut pc = lo;
+            while pc < hi {
+                let mut buf = [0u8; 16];
+                let n = view.fetch(pc, &mut buf);
+                if n == 0 {
+                    break;
+                }
+                let (text, len) = gex_xlate::arch::disasm(&buf[..n], pc);
+                println!("    {pc:#x}: {text}");
+                pc += len as u64;
+            }
+        }
     }
     let mut bad = 0usize;
     for (&a, f) in &prog.functions {

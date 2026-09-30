@@ -88,6 +88,8 @@ pub struct StartInfo {
     pub name: Option<String>,
     /// The extent the symbol table or an FDE gives, when either does.
     pub end: Option<u64>,
+    /// For a landing pad: the function whose FDE names it.
+    pub pad_of: Option<u64>,
 }
 
 impl StartInfo {
@@ -96,6 +98,9 @@ impl StartInfo {
     }
     pub fn add(&mut self, s: Source) {
         self.sources |= s.bit();
+    }
+    pub fn remove(&mut self, s: Source) {
+        self.sources &= !s.bit();
     }
     pub fn sources(&self) -> Vec<Source> {
         Source::ALL.iter().copied().filter(|&s| self.has(s)).collect()
@@ -115,6 +120,8 @@ pub struct RecoverOptions {
     pub max_table: u32,
     /// Scan data for untyped code pointers (weak starts).
     pub scan_data: bool,
+    /// Times to retry unresolved jump tables with call-graph summaries.
+    pub summary_passes: usize,
 }
 
 impl Default for RecoverOptions {
@@ -124,6 +131,7 @@ impl Default for RecoverOptions {
             max_rounds: 8,
             max_table: 4096,
             scan_data: true,
+            summary_passes: 3,
         }
     }
 }
@@ -256,6 +264,9 @@ pub fn seeds(
         if let Some(l) = f.lsda {
             for lp in ehframe::landing_pads(image, l, f.start) {
                 add(&mut starts, lp, Source::LandingPad);
+                if code.is_code(lp) {
+                    starts.get_mut(&lp).unwrap().pad_of = Some(f.start);
+                }
             }
         }
     }
@@ -542,7 +553,7 @@ fn discover(
                 ret: Some(internal(classify(r), &mut succ)),
             },
             (Term::Indirect { target, is_ret: true }, None) => DTerm::Return(target),
-            (Term::Indirect { target, is_ret: false }, None) => match facts.tables.get(&pc) {
+            (Term::Indirect { target, is_ret: false }, None) => match facts.tables.get(&l.term_pc) {
                 Some(t) => {
                     let mut cases: Vec<(u64, Tgt)> = t
                         .cases
@@ -818,6 +829,14 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
     let mut failed_tables: HashSet<u64> = HashSet::new();
     let mut functions: BTreeMap<u64, Function>;
     let mut rounds = 0;
+    // Callee summaries, once there are any: a jump table whose base sits in
+    // a callee-saved register across calls resolves only when the calls are
+    // known to preserve it. Summaries only get more precise as tables
+    // resolve, so a table resolved with earlier ones stays valid.
+    let mut sums: Option<crate::summary::Summaries> = None;
+    let mut pass = 0;
+    'passes: loop {
+    let pass_rounds = rounds;
     loop {
         rounds += 1;
         // Discover every strong start, adding call targets as they appear.
@@ -895,20 +914,23 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
 
         // Jump tables, on SSA.
         for f in functions.values() {
-            let todo: Vec<u64> = f
+            // Keyed by the jump instruction, which survives block splits.
+            let todo: Vec<(u64, u64)> = f
                 .blocks
                 .iter()
                 .filter(|b| matches!(b.term, FTerm::Unresolved { .. }))
-                .map(|b| b.start)
-                .filter(|a| !tables.contains_key(a) && !failed_tables.contains(a))
+                .map(|b| (b.start, b.term_pc))
+                .filter(|(_, j)| !tables.contains_key(j) && !failed_tables.contains(j))
                 .collect();
             if todo.is_empty() {
                 continue;
             }
-            let found = crate::jumptable::resolve_all(f, &todo, &code, opts.max_table, &|_| {
-                gex_ir::ssa::CallEffect::UNKNOWN
+            let starts_todo: Vec<u64> = todo.iter().map(|t| t.0).collect();
+            let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, &|c| {
+                sums.as_ref()
+                    .map_or(gex_ir::ssa::CallEffect::UNKNOWN, |s| s.call_effect(c))
             });
-            for (a, t) in found {
+            for ((_, t), (_, a)) in found.into_iter().zip(todo) {
                 match t {
                     Some(t) => {
                         tables.insert(a, t);
@@ -921,6 +943,19 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
             }
         }
 
+        // A weak start promoted to a function because nothing covered it
+        // goes back to weak once a jump table claims it as a case (an
+        // absolute table's entries are data pointers).
+        {
+            let cases: HashSet<u64> = tables.values().flat_map(|t| t.cases.iter().copied()).collect();
+            for (a, st) in starts.iter_mut() {
+                if st.has(Source::Orphan) && cases.contains(a) {
+                    st.remove(Source::Orphan);
+                    changed = true;
+                }
+            }
+        }
+
         // Weak starts: interior entries of the functions covering them, or
         // functions of their own when nothing does. Only once the rest has
         // settled: a jump-table case is uncovered until its table resolves,
@@ -929,16 +964,32 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
             let covered = coverage_index(&functions);
             let case_targets: HashSet<u64> =
                 tables.values().flat_map(|t| t.cases.iter().copied()).collect();
-            let weak: Vec<(u64, bool)> = starts
+            // The code inside a switch's own block: `adr x10, .` anchors a
+            // relative table there, and is not an entry anyone takes.
+            let switch_blocks: Vec<(u64, u64)> = functions
+                .values()
+                .flat_map(|f| f.blocks.iter())
+                .filter(|b| matches!(b.term, FTerm::Switch { .. }) && !b.synthetic)
+                .map(|b| (b.start, b.end))
+                .collect();
+            let in_switch = |a: u64| switch_blocks.iter().any(|&(s, e)| a > s && a < e);
+            let weak: Vec<(u64, bool, Option<u64>)> = starts
                 .iter()
                 .filter(|(_, s)| !s.strong())
-                .map(|(&a, s)| (a, s.has(Source::CodePtr) || s.has(Source::LandingPad)))
+                .map(|(&a, s)| (a, s.has(Source::CodePtr) || s.has(Source::LandingPad), s.pad_of))
                 .collect();
-            for (w, typed) in weak {
-                if case_targets.contains(&w) {
+            for (w, typed, pad_of) in weak {
+                if case_targets.contains(&w) || in_switch(w) {
                     continue;
                 }
-                let owners = covered.owners(w);
+                let mut owners = covered.owners(w);
+                // A landing pad belongs to the function whose FDE names it,
+                // even though no branch there reaches it.
+                if let Some(o) = pad_of.filter(|o| functions.contains_key(o)) {
+                    if !owners.contains(&o) {
+                        owners.push(o);
+                    }
+                }
                 if owners.is_empty() {
                     if plausible_start(&code, w, typed) {
                         starts.get_mut(&w).unwrap().add(Source::Orphan);
@@ -959,9 +1010,54 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
             }
         }
 
-        if !changed || rounds >= opts.max_rounds {
+        if !changed || rounds - pass_rounds >= opts.max_rounds {
             break;
         }
+    }
+    // Retry what is still unresolved with callee summaries.
+    let unresolved = functions
+        .values()
+        .flat_map(|f| f.blocks.iter())
+        .any(|b| matches!(b.term, FTerm::Unresolved { .. }));
+    if pass >= opts.summary_passes || !unresolved {
+        break 'passes;
+    }
+    sums = Some(crate::summary::analyze_functions(&functions));
+    failed_tables.clear();
+    pass += 1;
+    // Only another pass if the retry finds something: run the resolver
+    // alone first.
+    let mut found_any = false;
+    for f in functions.values() {
+        let todo: Vec<(u64, u64)> = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.term, FTerm::Unresolved { .. }))
+            .map(|b| (b.start, b.term_pc))
+            .collect();
+        if todo.is_empty() {
+            continue;
+        }
+        let starts_todo: Vec<u64> = todo.iter().map(|t| t.0).collect();
+        let s = sums.as_ref().unwrap();
+        let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, &|c| {
+            s.call_effect(c)
+        });
+        for ((_, t), (_, a)) in found.into_iter().zip(todo) {
+            match t {
+                Some(t) => {
+                    tables.insert(a, t);
+                    found_any = true;
+                }
+                None => {
+                    failed_tables.insert(a);
+                }
+            }
+        }
+    }
+    if !found_any {
+        break 'passes;
+    }
     }
 
     let stats = stats(&functions, &starts, &fdes, rounds);
@@ -1115,4 +1211,39 @@ pub fn is_const(f: &Function, v: Value) -> Option<u64> {
         }
     }
     None
+}
+
+/// Byte ranges inside symbol extents that no recovered block covers, with
+/// the symbol's start, for finding what recovery missed.
+pub fn uncovered(prog: &Program) -> Vec<(u64, u64, u64)> {
+    let cov = coverage_index(&prog.functions);
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for &(a, b, _) in &cov.ranges {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let mut out = Vec::new();
+    for (&a, s) in &prog.starts {
+        if !s.has(Source::Symbol) {
+            continue;
+        }
+        let Some(e) = s.end else { continue };
+        let mut at = a;
+        let i = merged.partition_point(|m| m.1 <= a);
+        for m in &merged[i..] {
+            if m.0 >= e {
+                break;
+            }
+            if m.0 > at {
+                out.push((at, m.0, a));
+            }
+            at = at.max(m.1);
+        }
+        if at < e {
+            out.push((at, e, a));
+        }
+    }
+    out
 }
