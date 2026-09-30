@@ -116,6 +116,20 @@ static LONG CALLBACK vectored(EXCEPTION_POINTERS *e) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+__attribute__((noinline)) static int raise_keeps_control_words(int pad) {
+    volatile char *room = __builtin_alloca(pad + 1);
+    room[0] = 0;
+    unsigned short cw = 0x0c7f, cw_after;
+    unsigned int mxcsr = 0x7f80, mxcsr_after, mxcsr_before;
+    __asm__ volatile("stmxcsr %0" : "=m"(mxcsr_before));
+    __asm__ volatile("fldcw %0; ldmxcsr %1" :: "m"(cw), "m"(mxcsr));
+    RaiseException(0xe0005678, 0, 0, 0);
+    __asm__ volatile("fnstcw %0; stmxcsr %1" : "=m"(cw_after), "=m"(mxcsr_after));
+    cw = 0x027f;
+    __asm__ volatile("fldcw %0; ldmxcsr %1" :: "m"(cw), "m"(mxcsr_before));
+    return (cw_after & ~0x40) == 0x0c3f && mxcsr_after == 0x7f80;
+}
+
 static LONG WINAPI top_filter(EXCEPTION_POINTERS *e) {
     printf("top-level filter saw %08lx\n", e->ExceptionRecord->ExceptionCode);
     printf("%d failures\n", failures);
@@ -154,6 +168,12 @@ int main(int argc, char **argv) {
     RaiseException(0xe0005678, 0, 0, 0);
     RaiseException(0xe0005678, 0, 0, 0);
     CHECK("vectored handler continues execution", vectored_calls == 2);
+    /* Continuing restores the FPU control words the raise captured, at
+     * every stack alignment (the dispatcher's frame overlaps the CONTEXT
+     * RtlRaiseException keeps below the caller's stack). */
+    int kept = 1;
+    for (int pad = 0; pad < 64; pad += 4) kept &= raise_keeps_control_words(pad);
+    CHECK("continuing keeps the x87 and SSE control words", kept);
     RemoveVectoredExceptionHandler(h);
 
 #ifdef __x86_64__

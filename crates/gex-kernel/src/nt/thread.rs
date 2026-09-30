@@ -482,7 +482,9 @@ pub fn dispatch_exception(c: &mut Call<'_>, rec: &[u8], context: u64) -> R<()> {
     }
     // Load the context as the thread's state (the dispatcher reads it back
     // from the stack), then point the stack at the frame.
-    load_context(&mut c.g, cx, context)?;
+    // From the copy: the frame can overlap the caller's CONTEXT, which
+    // lives below its own stack pointer (RtlRaiseException's frame).
+    load_context(&mut c.g, cx, ctx_at)?;
     c.g.w64(cx + ctx::x(4) as u64, frame)?;
     let entry = c.p.ntdll.lock().unwrap().ki_user_exception_dispatcher;
     c.g.w64(cx + ctx::PC as u64, entry)?;
@@ -502,6 +504,23 @@ pub fn record_size(abi: Abi) -> u64 {
 pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
     let (rec_p, context, first) = (c.a(0), c.a(1), c.a32(2) & 0xff != 0);
     let rec = c.g.bytes(rec_p, record_size(c.p.abi) as usize)?;
+    if c.p.cfg.trace {
+        let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
+        let addr = c.g.ptr(rec_p + 2 * 4 + c.g.psize())?;
+        eprintln!("[nt:{:x}] NtRaiseException {code:#010x} at {}", c.t.tid, c.p.describe_addr(addr));
+        // The frame-pointer chain, to see who raised it.
+        if c.p.abi == Abi::P32 {
+            let mut bp = c.g.u32(context + i386::EBP)? as u64;
+            for _ in 0..12 {
+                let (Ok(next), Ok(ret)) = (c.g.u32(bp), c.g.u32(bp + 4)) else { break };
+                eprintln!("[nt:{:x}]   frame {bp:#x}: {}", c.t.tid, c.p.describe_addr(ret as u64));
+                if next as u64 <= bp {
+                    break;
+                }
+                bp = next as u64;
+            }
+        }
+    }
     if first {
         dispatch_exception(c, &rec, context)?;
         return Ok(st::SUCCESS);

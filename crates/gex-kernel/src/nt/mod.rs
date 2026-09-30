@@ -448,6 +448,19 @@ impl Process {
         }
     }
 
+    /// `addr` as `module+offset` when it is inside a mapped image, for
+    /// traces.
+    pub fn describe_addr(&self, addr: u64) -> String {
+        let st = self.st.lock().unwrap();
+        match st.images.range(..=addr).next_back() {
+            Some((_, v)) if addr < v.base + v.size => {
+                let name = v.path.rsplit(['/', '\\']).next().unwrap_or(&v.path);
+                format!("{addr:#x} ({name}+{:#x})", addr - v.base)
+            }
+            _ => format!("{addr:#x}"),
+        }
+    }
+
     pub fn new_sync_id(&self) -> u64 {
         self.next_sync_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -638,8 +651,9 @@ pub fn hardware_exception(
     if p.cfg.trace {
         let r = |o: usize| g.u64(ctx_addr + o as u64).unwrap_or(0);
         eprintln!(
-            "[nt:{:x}] exception {code:#010x} at {rip:#x} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
+            "[nt:{:x}] exception {code:#010x} at {} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
             t.tid,
+            p.describe_addr(rip),
             r(ctx::x(4)),
             r(ctx::LAST_TARGET),
             r(ctx::LAST_SOURCE)
