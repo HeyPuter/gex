@@ -9,6 +9,7 @@
 //! implementation serves a host passthrough, an in-memory root and the
 //! synthetic `/proc` without the syscall layer knowing which is which.
 
+use gex_abi::GuestEndian;
 use crate::errno::{encode, Errno, SysResult};
 use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
@@ -3404,10 +3405,10 @@ impl Kernel {
         // `struct statx` is 256 bytes and mostly reserved.
         let mut out = [0u8; 256];
         let put32 = |o: &mut [u8; 256], at: usize, v: u32| {
-            o[at..at + 4].copy_from_slice(&v.to_le_bytes())
+            o[at..at + 4].copy_from_slice(&v.to_ge_bytes())
         };
         let put64 = |o: &mut [u8; 256], at: usize, v: u64| {
-            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
+            o[at..at + 8].copy_from_slice(&v.to_ge_bytes())
         };
         // What is filled in. The caller asks for a mask and the kernel says
         // which parts it actually answered; claiming everything but the
@@ -3418,7 +3419,7 @@ impl Kernel {
         put32(&mut out, 16, st.nlink as u32);
         put32(&mut out, 20, self.uid);
         put32(&mut out, 24, self.gid);
-        out[28..30].copy_from_slice(&(st.mode as u16).to_le_bytes());
+        out[28..30].copy_from_slice(&(st.mode as u16).to_ge_bytes());
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
         put64(&mut out, 48, st.blocks as u64);
@@ -3739,10 +3740,10 @@ impl Kernel {
             TIOCGWINSZ => {
                 let (rows, cols, x, y) = tty.winsize();
                 let mut ws = [0u8; 8];
-                ws[0..2].copy_from_slice(&rows.to_le_bytes());
-                ws[2..4].copy_from_slice(&cols.to_le_bytes());
-                ws[4..6].copy_from_slice(&x.to_le_bytes());
-                ws[6..8].copy_from_slice(&y.to_le_bytes());
+                ws[0..2].copy_from_slice(&rows.to_ge_bytes());
+                ws[2..4].copy_from_slice(&cols.to_ge_bytes());
+                ws[4..6].copy_from_slice(&x.to_ge_bytes());
+                ws[6..8].copy_from_slice(&y.to_ge_bytes());
                 m.write(arg, &ws)?;
                 Ok(0)
             }
@@ -3751,7 +3752,7 @@ impl Kernel {
             // pane is. Everyone in the foreground group hears about it.
             TIOCSWINSZ => {
                 let ws = m.read(arg, 8)?.to_vec();
-                let g = |n: usize| u16::from_le_bytes([ws[n], ws[n + 1]]);
+                let g = |n: usize| u16::from_ge_bytes([ws[n], ws[n + 1]]);
                 if tty.set_winsize((g(0), g(2), g(4), g(6))) {
                     self.signal_foreground(crate::signal::sig::SIGWINCH);
                 }
@@ -4827,7 +4828,7 @@ impl Kernel {
         const AF_UNIX: u16 = 1;
         if addr != 0 {
             let mut buf = vec![0u8; 110];
-            buf[..2].copy_from_slice(&AF_UNIX.to_le_bytes());
+            buf[..2].copy_from_slice(&AF_UNIX.to_ge_bytes());
             let raw = path.as_bytes();
             let n = raw.len().min(107);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
@@ -5754,14 +5755,14 @@ impl Kernel {
             m.write_u32(buf, 1000)?; // uptime
             m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
             m.write_u32(buf + 20, 1 << 19)?; // freeram
-            m.write(buf + 40, &1u16.to_le_bytes())?; // procs
+            m.write(buf + 40, &1u16.to_ge_bytes())?; // procs
             m.write_u32(buf + 52, 4096)?; // mem_unit
         } else {
             m.zero(buf, 112)?;
             m.write_u64(buf, 1000)?; // uptime
             m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
             m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
-            m.write(buf + 80, &1u16.to_le_bytes())?; // procs
+            m.write(buf + 80, &1u16.to_ge_bytes())?; // procs
             m.write_u32(buf + 104, 1)?; // mem_unit
         }
         Ok(0)

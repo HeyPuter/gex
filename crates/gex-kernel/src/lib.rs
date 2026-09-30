@@ -158,22 +158,37 @@ impl<'a> GuestMem<'a> {
         Ok(())
     }
 
+    // The typed accessors read and write guest memory in the guest's byte
+    // order, and the runtime's own structures below
+    // `gex_abi::GUEST_ORDER_FROM` (thread contexts, the kernel's scratch, the
+    // dispatch directory) in the host's: see `gex_abi::is_guest_be`. With a
+    // little-endian guest both are little-endian and these are the plain
+    // conversions.
+
     pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
-        let b = self.read(addr, 8)?;
-        Ok(u64::from_le_bytes(b.try_into().unwrap()))
+        let b: [u8; 8] = self.read(addr, 8)?.try_into().unwrap();
+        Ok(if gex_abi::is_guest_be(addr) { u64::from_be_bytes(b) } else { u64::from_le_bytes(b) })
     }
 
     pub fn write_u64(&mut self, addr: u64, v: u64) -> Result<(), Errno> {
-        self.write(addr, &v.to_le_bytes())
+        if gex_abi::is_guest_be(addr) {
+            self.write(addr, &v.to_be_bytes())
+        } else {
+            self.write(addr, &v.to_le_bytes())
+        }
     }
 
     pub fn read_u32(&self, addr: u64) -> Result<u32, Errno> {
-        let b = self.read(addr, 4)?;
-        Ok(u32::from_le_bytes(b.try_into().unwrap()))
+        let b: [u8; 4] = self.read(addr, 4)?.try_into().unwrap();
+        Ok(if gex_abi::is_guest_be(addr) { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) })
     }
 
     pub fn write_u32(&mut self, addr: u64, v: u32) -> Result<(), Errno> {
-        self.write(addr, &v.to_le_bytes())
+        if gex_abi::is_guest_be(addr) {
+            self.write(addr, &v.to_be_bytes())
+        } else {
+            self.write(addr, &v.to_le_bytes())
+        }
     }
 
     /// Read a NUL-terminated guest string, bounded by `max` bytes.
@@ -198,6 +213,40 @@ impl<'a> GuestMem<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte-order rule (docs/ppc.md §3): the runtime's own structures
+    /// below `GUEST_ORDER_FROM` are little-endian on every guest, guest
+    /// memory above it is in the guest's order.
+    #[test]
+    fn typed_accessors_follow_the_guest_order_line() {
+        let line = gex_abi::GUEST_ORDER_FROM;
+        let mut buf = vec![0u8; line as usize + 0x100];
+        let mut m = GuestMem::new(&mut buf);
+        m.write_u32(0x1000, 0x1122_3344).unwrap();
+        m.write_u32(line, 0x1122_3344).unwrap();
+        assert_eq!(m.read(0x1000, 4).unwrap(), &[0x44, 0x33, 0x22, 0x11]);
+        let above = if gex_abi::BIG_ENDIAN { [0x11, 0x22, 0x33, 0x44] } else { [0x44, 0x33, 0x22, 0x11] };
+        assert_eq!(m.read(line, 4).unwrap(), &above);
+        assert_eq!(m.read_u32(line).unwrap(), 0x1122_3344);
+        m.write_u64(line + 8, 0x0102_0304_0506_0708).unwrap();
+        assert_eq!(m.read_u64(line + 8).unwrap(), 0x0102_0304_0506_0708);
+    }
+
+    /// No guest mapping is ever placed below the line, so no guest-visible
+    /// structure can be read with the runtime's byte order.
+    #[test]
+    fn nothing_guest_visible_lives_below_the_order_line() {
+        let line = gex_abi::GUEST_ORDER_FROM;
+        assert!(mem::hits_runtime(0x1000, 0x2000));
+        assert!(mem::hits_runtime(line - 0x1000, line));
+        assert!(!mem::hits_runtime(line, line + 0x1000));
+        let mut map = mem::MemoryMap::new(gex_abi::PIE_BASE);
+        let fixed = mem::flags::FIXED | mem::flags::PRIVATE | mem::flags::ANONYMOUS;
+        assert!(map.mmap(0x10_0000, 0x1000, mem::prot::READ, fixed, "low").is_err());
+        let any = mem::flags::PRIVATE | mem::flags::ANONYMOUS;
+        let a = map.mmap(0, 0x1000, mem::prot::READ, any, "anon").unwrap();
+        assert!(a >= line);
+    }
 
     /// Every byte of the range reads as zero afterwards, whichever pages were
     /// dirty, including a range that starts and ends mid-page.
