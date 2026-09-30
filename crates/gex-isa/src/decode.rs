@@ -2164,6 +2164,7 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         (0b10010, _) => VOp2::SqXtun,
         (0b10100, 0) => VOp2::SqXtn,
         (0b10100, _) => VOp2::UqXtn,
+        (0b10011, 1) => VOp2::Shll,
         _ => return Inst::Unknown { raw },
     };
     // The reverse family reverses elements within a fixed-width group, so an

@@ -3415,6 +3415,36 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
+            // Widen (either extension: the extended bits are shifted out)
+            // and shift left by the source lane width; `shll2` reads the
+            // upper half.
+            VOp2::Shll => {
+                let widened = self.b.def(Expr::VCvt {
+                    op: if arr.q {
+                        VCvtOp::ExtendHigh { signed: false }
+                    } else {
+                        VCvtOp::ExtendLow { signed: false }
+                    },
+                    from: lane,
+                    a,
+                    b: None,
+                });
+                let wide = VArr {
+                    lane_bytes: arr.lane_bytes * 2,
+                    q: true,
+                    float: false,
+                    scalar: false,
+                };
+                let amount = self.b.const_i32(arr.lane_bytes * 8);
+                let r = self.b.def(Expr::VShift {
+                    op: VShiftOp::Shl,
+                    lane: Self::lane_of(wide),
+                    a: widened,
+                    amount,
+                });
+                self.b.write(GuestReg::V128(vd.0), r);
+                Flow::Next
+            }
             // Narrowing writes the low half of the destination, or the high
             // half for the `2` forms; both are byte permutations of the
             // truncated lanes.
