@@ -105,6 +105,18 @@ fn f80_to_f64(b: &[u8]) -> f64 {
     sign * (m as f64) * 2f64.powi(e - 16383 - 63)
 }
 
+/// x87 register `phys` (physical, not stack-relative) of the gex context at
+/// `cx`, in the 80-bit format a CONTEXT holds. gex keeps x87 registers as
+/// f64 today; this pair is the one place that knows (S14 will make them
+/// 80-bit).
+fn x87_read_f80(g: &G<'_>, cx: u64, phys: u64) -> R<[u8; 10]> {
+    Ok(f64_to_f80(f64::from_bits(g.u64(cx + ctx::X87 as u64 + 8 * phys)?)))
+}
+
+fn x87_write_f80(g: &mut G<'_>, cx: u64, phys: u64, v: &[u8]) -> R<()> {
+    g.w64(cx + ctx::X87 as u64 + 8 * phys, f80_to_f64(v).to_bits())
+}
+
 /// The gex register state of the thread at `cx` as an x86-64 CONTEXT at `at`
 /// (`CONTEXT_FULL | CONTEXT_SEGMENTS`). `rip` is where it resumes.
 pub fn save_context64(g: &mut G<'_>, cx: u64, at: u64, rip: u64) -> R<()> {
@@ -138,8 +150,8 @@ pub fn save_context64(g: &mut G<'_>, cx: u64, at: u64, rip: u64) -> R<()> {
     g.w32(f + 0x1c, 0xffff)?;
     for i in 0..8u64 {
         let phys = (top as u64 + i) & 7;
-        let v = f64::from_bits(g.u64(cx + ctx::X87 as u64 + 8 * phys)?);
-        g.write(f + 0x20 + 16 * i, &f64_to_f80(v))?;
+        let v = x87_read_f80(g, cx, phys)?;
+        g.write(f + 0x20 + 16 * i, &v)?;
     }
     for i in 0..16u8 {
         let v = g.bytes(cx + ctx::v(i) as u64, 16)?;
@@ -177,7 +189,7 @@ pub fn load_context64(g: &mut G<'_>, cx: u64, at: u64) -> R<Option<u64>> {
         for i in 0..8u64 {
             let b = g.bytes(f + 0x20 + 16 * i, 10)?;
             let phys = (top + i) & 7;
-            g.w64(cx + ctx::X87 as u64 + 8 * phys, f80_to_f64(&b).to_bits())?;
+            x87_write_f80(g, cx, phys, &b)?;
         }
         for i in 0..16u8 {
             let v = g.bytes(f + 0xa0 + 16 * i as u64, 16)?;
@@ -646,6 +658,7 @@ pub fn nt_resume_thread(c: &mut Call<'_>) -> R {
 pub fn exit_thread(c: &mut Call<'_>, code: u32) {
     let t = Arc::clone(&c.t);
     *t.exit_code.lock().unwrap() = Some(code);
+    sync::abandon_mutants(c, t.tid);
     sync::signal_done(c, t.sync_id);
     c.p.remove_thread(&t);
     {
@@ -846,6 +859,34 @@ pub fn nt_set_information_thread(c: &mut Call<'_>) -> R {
         // hiding from a debugger that isn't there. Accepting them is what a
         // scheduler without them would do.
         2 | 3 | 4 | 13 | 14 | 17 | 31 | 49 => Ok(st::SUCCESS),
+        // ThreadZeroTlsCell: `TlsFree` clears the slot in every thread
+        // (Wine's `virtual_clear_tls_index`).
+        10 => {
+            if !Arc::ptr_eq(&get_thread(c, h)?, &c.t) {
+                return Err(c.unimplemented("ThreadZeroTlsCell on another thread"));
+            }
+            if _len != 4 {
+                return Err(Status(st::INVALID_PARAMETER));
+            }
+            let index = c.g.u32(_buf)? as u64;
+            let abi = c.p.abi;
+            let ps = c.g.psize();
+            let tebs: Vec<u64> = c.p.threads.read().unwrap().by_tid.values().map(|t| t.teb).collect();
+            if index >= 64 + 1024 {
+                return Err(Status(st::INVALID_PARAMETER));
+            }
+            for teb in tebs {
+                if index < 64 {
+                    c.g.wptr(teb + off!(abi, teb::TLSSLOTS) + index * ps, 0)?;
+                } else {
+                    let exp = c.g.ptr(teb + off!(abi, teb::TLSEXPANSIONSLOTS))?;
+                    if exp != 0 {
+                        c.g.wptr(exp + (index - 64) * ps, 0)?;
+                    }
+                }
+            }
+            Ok(st::SUCCESS)
+        }
         // ThreadQuerySetWin32StartAddress, ThreadDescription, ThreadWineNativeThreadName:
         // names and labels for debuggers.
         9 | 38 | 1100 => Ok(st::SUCCESS),

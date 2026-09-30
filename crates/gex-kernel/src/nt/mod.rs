@@ -368,6 +368,8 @@ pub struct Process {
     pub sync_id: u64,
     pub unix: unixcall::Registry,
     pub atoms: Mutex<sysinfo::Atoms>,
+    /// Threads blocked on keyed events.
+    pub keyed: Mutex<sync::Keyed>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
@@ -430,6 +432,7 @@ impl Process {
             sync_id: 1,
             unix: unixcall::Registry::default(),
             atoms: Mutex::new(Default::default()),
+            keyed: Mutex::new(Default::default()),
             kill_list: Mutex::new(Vec::new()),
         }
     }
@@ -597,7 +600,16 @@ pub fn syscall(p: &Arc<Process>, kernel: &Mutex<Kernel>, data: &mut [u8], ctx_ad
         eprintln!("[nt:{:x}] {} -> {status:#010x}", c.t.tid, c.name());
     }
     if UNIMPLEMENTED_STRICT.load(Ordering::Relaxed) {
+        // The whole process ends, not just this thread: the others notice at
+        // their next syscall, or are woken from a wait to notice.
+        let mut c = c;
+        thread::terminate_process(&mut c, st::NOT_IMPLEMENTED);
         return Outcome::Exit(st::NOT_IMPLEMENTED);
+    }
+    // Another thread ended the process while this call ran (a wait woken
+    // for the purpose returns here).
+    if p.terminating.load(Ordering::Acquire) && !matches!(c.outcome, Some(Outcome::Exit(_))) {
+        return Outcome::Exit(p.exit_code.load(Ordering::Acquire));
     }
     match c.outcome.take() {
         Some(o @ (Outcome::Resume(_) | Outcome::Exit(_) | Outcome::ThreadExit | Outcome::CallbackReturn)) => o,
@@ -634,6 +646,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtDuplicateObject => object::nt_duplicate_object(c),
         n::NtOpenDirectoryObject => object::nt_open_directory_object(c),
         n::NtQueryObject => object::nt_query_object(c),
+        n::NtSetInformationObject => object::nt_set_information_object(c),
         n::NtOpenSymbolicLinkObject => object::nt_open_symbolic_link_object(c),
         // -- files -----------------------------------------------------------
         n::NtCreateFile => file::nt_create_file(c),
@@ -673,11 +686,14 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtOpenSemaphore => sync::nt_open_semaphore(c),
         n::NtReleaseSemaphore => sync::nt_release_semaphore(c),
         n::NtCreateKeyedEvent => sync::nt_create_keyed_event(c),
+        n::NtWaitForKeyedEvent => sync::nt_wait_for_keyed_event(c),
+        n::NtReleaseKeyedEvent => sync::nt_release_keyed_event(c),
         n::NtWaitForSingleObject => sync::nt_wait_for_single_object(c),
         n::NtWaitForMultipleObjects => sync::nt_wait_for_multiple_objects(c),
         n::NtSignalAndWaitForSingleObject => sync::nt_signal_and_wait_for_single_object(c),
         n::NtWaitForAlertByThreadId => sync::nt_wait_for_alert_by_thread_id(c),
         n::NtAlertThreadByThreadId => sync::nt_alert_thread_by_thread_id(c),
+        n::NtAlertMultipleThreadByThreadId => sync::nt_alert_multiple_thread_by_thread_id(c),
         n::NtDelayExecution => sync::nt_delay_execution(c),
         n::NtYieldExecution => sync::nt_yield_execution(c),
         n::NtTestAlert => thread::nt_test_alert(c),

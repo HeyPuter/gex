@@ -43,6 +43,8 @@ impl Obj {
 pub struct Entry {
     pub obj: Obj,
     pub access: u32,
+    /// `OBJECT_DATA_INFORMATION`: inherit (bit 0), protect-from-close (bit 1).
+    pub flags: u8,
 }
 
 /// A process's handle table. Handles are multiples of 4, as on Windows.
@@ -72,12 +74,16 @@ impl Handles {
             self.next += 4;
             h
         });
-        self.map.insert(h, Entry { obj, access });
+        self.map.insert(h, Entry { obj, access, flags: 0 });
         h
     }
 
     pub fn get(&self, h: u32) -> Option<&Entry> {
         self.map.get(&h)
+    }
+
+    pub fn get_mut(&mut self, h: u32) -> Option<&mut Entry> {
+        self.map.get_mut(&h)
     }
 
     pub fn remove(&mut self, h: u32) -> Option<Entry> {
@@ -125,7 +131,13 @@ pub fn nt_close(c: &mut Call<'_>) -> R {
     if h == CURRENT_PROCESS || h == CURRENT_THREAD {
         return Ok(st::SUCCESS);
     }
-    let e = c.p.st.lock().unwrap().handles.remove(h).ok_or(Status(st::INVALID_HANDLE))?;
+    let e = {
+        let mut stl = c.p.st.lock().unwrap();
+        if stl.handles.get(h).is_some_and(|e| e.flags & 2 != 0) {
+            return Err(Status(st::HANDLE_NOT_CLOSABLE));
+        }
+        stl.handles.remove(h).ok_or(Status(st::INVALID_HANDLE))?
+    };
     closed(c, &e.obj);
     Ok(st::SUCCESS)
 }
@@ -276,6 +288,35 @@ pub fn nt_query_object(c: &mut Call<'_>) -> R {
             let _ = us;
             Ok(st::SUCCESS)
         }
+        // ObjectDataInformation: BOOLEAN inherit, BOOLEAN protect-from-close.
+        4 => {
+            if len < 2 {
+                return Err(Status(st::INFO_LENGTH_MISMATCH));
+            }
+            let f = c.p.st.lock().unwrap().handles.get(h).map(|e| e.flags).unwrap_or(0);
+            c.g.w8(buf, f & 1)?;
+            c.g.w8(buf + 1, (f >> 1) & 1)?;
+            c.g.out32(ret, 2)?;
+            Ok(st::SUCCESS)
+        }
         _ => Err(c.unimplemented(&format!("NtQueryObject class {class}"))),
+    }
+}
+
+/// `NtSetInformationObject(handle, class, buffer, len)`.
+pub fn nt_set_information_object(c: &mut Call<'_>) -> R {
+    let (h, class, buf, len) = (c.a32(0), c.a32(1), c.a(2), c.a32(3));
+    match class {
+        // ObjectDataInformation
+        4 => {
+            if len < 2 {
+                return Err(Status(st::INFO_LENGTH_MISMATCH));
+            }
+            let f = (c.g.u8(buf)? != 0) as u8 | ((c.g.u8(buf + 1)? != 0) as u8) << 1;
+            let mut stl = c.p.st.lock().unwrap();
+            stl.handles.get_mut(h).ok_or(Status(st::INVALID_HANDLE))?.flags = f;
+            Ok(st::SUCCESS)
+        }
+        _ => Err(c.unimplemented(&format!("NtSetInformationObject class {class}"))),
     }
 }

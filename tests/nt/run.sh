@@ -48,6 +48,14 @@ check pe-msvc 9 "msvc" "$fx/x64/msvc.exe"
 check pe-highbase 0 "tiny" "$fx/x64/highbase.exe"
 check pe-uses 0 "229 [0-9A-F]{16} 11" "$fx/x64/uses.exe"
 check pe-threads 0 "" "$fx/x64/threads.exe"
+# N2: every line "ok ...", then "0 failures".
+allok="(ok [^$nl]*$nl)+0 failures"
+check sync 0 "$allok" "$here/bin/sync.exe"
+check apc 0 "$allok" "$here/bin/apc.exe"
+check tls 0 "$allok" "$here/bin/tls.exe"
+check cxx 0 "$allok" "$here/bin/cxx.exe"
+# Ends in the top-level exception filter, which exits with 77.
+check seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$here/bin/seh.exe"
 
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
