@@ -7078,7 +7078,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
 
     // What the auxiliary vector says about the executable: from the image
     // when one was loaded, and from the recording when one was restored.
-    let facts = match (&program, &restored) {
+    let mut facts = match (&program, &restored) {
         (Some(p), _) => gex_ld::elf::headers_only(
             p.exe.phdr_vaddr,
             p.exe.phentsize,
@@ -7088,6 +7088,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         (None, Some(l)) => gex_ld::elf::headers_only(l.phdr, l.phent, l.phnum, l.entry),
         (None, None) => return 0,
     };
+    // A 32-bit program's stack is laid out with 4-byte words; the recorded
+    // (closure) images are 64-bit ones.
+    if let Some(p) = &program {
+        facts.class32 = p.exe.class32;
+    }
     let interp_base = match (&program, &restored) {
         (Some(p), _) => p.interp_base(),
         (None, Some(l)) => l.interp_base,
@@ -9165,6 +9170,22 @@ pub extern "C" fn gex_inst_align_shift() -> i32 {
 /// translated after this call starts by reporting its pc and registers to the
 /// debug console. Enormous; pipe it to `tail`. The one tool that shows what ran
 /// between two syscalls when the guest lands somewhere wild.
+/// Whether this process is a 32-bit (i386) one, for the JS side to carry to
+/// the Worker a fork child or a new thread runs in: each Worker has its own
+/// shim instance, whose decoder mode starts out 64-bit.
+#[no_mangle]
+pub extern "C" fn gex_compat() -> i32 {
+    with_host(|h| h.kernel.compat) as i32
+}
+
+/// The other half: said in the child's or thread's Worker once its kernel
+/// state has been adopted, before any block is translated there.
+#[no_mangle]
+pub extern "C" fn gex_set_compat(on: i32) {
+    with_host(|h| h.kernel.compat = on != 0);
+    gex_xlate::set_compat(on != 0);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_set_trace_blocks(on: i32) {
     gex_xlate::set_trace_blocks(on != 0);
