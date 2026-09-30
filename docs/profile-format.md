@@ -94,8 +94,14 @@ Numbers are unsigned decimal. A reader rejects any other `format` or
 - **`syscalls`**, one row per `(syscall instruction, enclosing function,
   number)`:
   - `off` is the `svc`/`syscall` instruction.
-  - `func` is the callee of the innermost call on the shadow stack: the
-    function containing the instruction, or `null` if unknown.
+  - `func` is the callee of the innermost call on the shadow stack, or
+    `null` when the stack is empty. That is the function containing the
+    instruction, except after a tail call or a PLT stub: a call through the
+    PLT names the stub, and the libc wrapper it jumped to is only visible
+    from `off`.
+  - `name` is informational (gex-kernel's table, which also names gex's
+    private numbers for x86-only calls such as `arch_prctl`); `nr` is the
+    key.
   - `nr` is the canonical (AArch64 generic) number. An x86-64 guest's numbers
     are translated first.
 

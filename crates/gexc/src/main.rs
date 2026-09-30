@@ -1196,6 +1196,7 @@ fn cmd_ir(args: &[String]) -> Result<()> {
 /// `gexc profile merge|show`: work with profiles `gexc run --record` wrote.
 fn cmd_profile(args: &[String]) -> Result<()> {
     use gex_xlate::profile::Profile;
+    gex_native::profile::use_kernel_syscall_names();
     let read = |p: &str| -> Result<Profile> {
         let text = std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?;
         Profile::from_json(&text).map_err(|e| anyhow::anyhow!("{p}: {e}"))

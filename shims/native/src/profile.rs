@@ -79,10 +79,17 @@ pub struct StoreProf {
     pending: Option<(u64, String, u64, u64)>,
 }
 
+/// Name syscalls in written profiles and manifests with the kernel's full
+/// table, which also names gex's private numbers for x86-only calls.
+pub fn use_kernel_syscall_names() {
+    gex_xlate::profile::set_syscall_namer(gex_kernel::syscalls::syscall_name);
+}
+
 /// Start recording into `out`. Idempotent: the first call wins.
 pub fn start(out: PathBuf, opts: &crate::RunOptions) -> Result<()> {
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
     gex_xlate::profile::set_enabled(true);
+    use_kernel_syscall_names();
     let session = Session {
         isa: gex_abi::ARCH_NAME.to_string(),
         argv: opts.args.clone(),

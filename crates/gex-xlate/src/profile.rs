@@ -867,12 +867,24 @@ fn nums(v: &Json, n: usize) -> Option<Vec<u64>> {
     a.iter().take(n).map(Json::as_u64).collect()
 }
 
+static SYSCALL_NAMER: std::sync::OnceLock<fn(u64) -> &'static str> = std::sync::OnceLock::new();
+
+/// Name syscalls with the kernel's full table from now on. The first call wins.
+pub fn set_syscall_namer(namer: fn(u64) -> &'static str) {
+    let _ = SYSCALL_NAMER.set(namer);
+}
+
 /// The canonical (AArch64 generic) name of a syscall number, for readers.
 /// Numbers in profiles and manifests are canonical: an x86-64 guest's are
 /// translated before counting.
 pub fn syscall_name(nr: u64) -> &'static str {
-    // A small table of the common ones; `gex-kernel` has the full set, but
-    // this crate does not depend on it. Unknown numbers print as "?".
+    if let Some(namer) = SYSCALL_NAMER.get() {
+        return namer(nr);
+    }
+    // A small table of the common ones; `gex-kernel` has the full set (and
+    // gex's private numbers for x86-only calls), but this crate does not
+    // depend on it, so a host installs it with `set_syscall_namer`. Unknown
+    // numbers print as "?".
     match nr {
         17 => "getcwd",
         23 => "dup",
