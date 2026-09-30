@@ -546,6 +546,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    // A 32-bit (i386) program's code must be decoded in compatibility mode,
+    // exactly as the runtime path does before translating (`run_program_with`).
+    gex_xlate::set_compat(image.class32);
     let (module, stats) = gex_xlate::translate_image(
         &image,
         &Options {
@@ -651,6 +654,19 @@ fn build_closure(
     profile: &[u64],
 ) -> Result<()> {
     let (closure, interp) = closure_of_all(path, also, sysroot)?;
+    // One decoding mode for the whole closure, taken from the executable: a
+    // 32-bit (i386) program is 32-bit throughout, and a closure that mixes
+    // classes cannot be translated in one mode.
+    let class32 = closure.objects.first().map(|o| o.image.class32).unwrap_or(false);
+    if let Some(o) = closure.objects.iter().find(|o| o.image.class32 != class32) {
+        anyhow::bail!(
+            "{}: a {}-bit object in a {}-bit program's closure",
+            o.path,
+            if o.image.class32 { 32 } else { 64 },
+            if class32 { 32 } else { 64 }
+        );
+    }
+    gex_xlate::set_compat(class32);
     // Sorted once so each object can binary-search its slice of reached PCs.
     let mut profile_sorted = profile.to_vec();
     profile_sorted.sort_unstable();
