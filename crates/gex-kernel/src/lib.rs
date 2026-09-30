@@ -28,6 +28,7 @@ pub mod timerfd;
 pub mod tty;
 pub mod vfs;
 pub mod unix;
+pub mod x86;
 
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};

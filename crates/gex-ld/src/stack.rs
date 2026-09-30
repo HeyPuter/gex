@@ -46,7 +46,12 @@ pub mod auxv {
 /// Deterministic by design: because every gex process sees the same value,
 /// `gexc` can pre-run ifunc resolvers at build time and prebind the winner
 /// (PLAN §6.4). The set is ARMv8.0 plus the extensions the lifter implements.
-pub const HWCAP: u64 = {
+pub const HWCAP: u64 = if gex_abi::X86 {
+    // x86-64: the CPUID.1:EDX feature word. FPU, TSC, CX8, CMOV, CLFSH, MMX,
+    // FXSR, SSE, SSE2 -- the baseline every x86-64 has, and what the `cpuid`
+    // host handler reports too (they must agree: glibc's resolvers read both).
+    (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 19) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26)
+} else {
     const HWCAP_FP: u64 = 1 << 0;
     const HWCAP_ASIMD: u64 = 1 << 1;
     const HWCAP_CPUID: u64 = 1 << 11;
@@ -134,7 +139,8 @@ pub fn build_initial_stack(
     let random_off = blob.len();
     blob.extend_from_slice(&random);
     let platform_off = blob.len();
-    blob.extend_from_slice(b"aarch64\0");
+    blob.extend_from_slice(gex_abi::ARCH_NAME.as_bytes());
+    blob.push(0);
     let mut offsets_argv = Vec::with_capacity(args.len());
     let mut offsets_env = Vec::with_capacity(env.len());
 

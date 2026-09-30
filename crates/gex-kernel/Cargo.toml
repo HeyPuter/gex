@@ -7,3 +7,7 @@ description = "gex-kernel: the userspace Linux personality"
 
 [dependencies]
 gex-abi.workspace = true
+
+[features]
+# Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.
+x86 = ["gex-abi/x86"]

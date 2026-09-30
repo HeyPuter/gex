@@ -52,15 +52,25 @@ impl Closure {
     }
 }
 
-/// The directories `ld.so` looks in, after any `DT_RUNPATH`.
-///
-/// aarch64 only, because that is the only guest architecture there is.
-const DEFAULT_DIRS: &[&str] = &[
-    "/lib/aarch64-linux-gnu",
-    "/usr/lib/aarch64-linux-gnu",
-    "/lib",
-    "/usr/lib",
-];
+/// The directories `ld.so` looks in, after any `DT_RUNPATH`: Debian's
+/// multiarch directories for the guest architecture, then the classic pair.
+pub const DEFAULT_DIRS: &[&str] = if gex_abi::X86 {
+    &[
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib64",
+        "/usr/lib64",
+        "/lib",
+        "/usr/lib",
+    ]
+} else {
+    &[
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/lib",
+        "/usr/lib",
+    ]
+};
 
 /// Resolve a program's closure.
 ///

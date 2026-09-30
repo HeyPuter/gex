@@ -157,7 +157,7 @@ mod tests {
         v[5] = 1; // little endian
         v[6] = 1; // version
         v[16..18].copy_from_slice(&e_type.to_le_bytes());
-        v[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        v[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
         v[24..32].copy_from_slice(&0x1000u64.to_le_bytes()); // e_entry
         v[32..40].copy_from_slice(&(phoff as u64).to_le_bytes());
         v[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize

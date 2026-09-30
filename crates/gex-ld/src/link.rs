@@ -21,16 +21,13 @@ use std::collections::HashMap;
 // The relocation types an aarch64 program actually contains. Anything else is
 // reported rather than ignored: a relocation nobody applied is a word the
 // guest will read as zero, and the failure lands far away from the cause.
-const R_AARCH64_ABS64: u32 = 257;
-const R_AARCH64_COPY: u32 = 1024;
-const R_AARCH64_GLOB_DAT: u32 = 1025;
-const R_AARCH64_JUMP_SLOT: u32 = 1026;
-const R_AARCH64_RELATIVE: u32 = 1027;
-const R_AARCH64_TLS_TPREL64: u32 = 1030;
-const R_AARCH64_TLSDESC: u32 = 1031;
-const R_AARCH64_IRELATIVE: u32 = 1032;
-const R_AARCH64_TLS_DTPMOD64: u32 = 1028;
-const R_AARCH64_TLS_DTPREL64: u32 = 1029;
+use crate::elf::reloc::{
+    ABS64 as R_AARCH64_ABS64, COPY as R_AARCH64_COPY, GLOB_DAT as R_AARCH64_GLOB_DAT,
+    IRELATIVE as R_AARCH64_IRELATIVE, JUMP_SLOT as R_AARCH64_JUMP_SLOT,
+    RELATIVE as R_AARCH64_RELATIVE, TLSDESC as R_AARCH64_TLSDESC,
+    TLS_DTPMOD64 as R_AARCH64_TLS_DTPMOD64, TLS_DTPREL64 as R_AARCH64_TLS_DTPREL64,
+    TLS_TPREL64 as R_AARCH64_TLS_TPREL64,
+};
 
 /// One object of a linked program.
 pub struct Object {
@@ -135,15 +132,23 @@ pub fn link(
     // aarch64 is variant I: the thread pointer points at the thread control
     // block and each module's block sits above it, so an offset is positive
     // and the first block starts after two pointers of reserved header.
-    let mut tls_size = 16u64;
+    // x86-64 is variant II: the blocks sit *below* the thread pointer, each
+    // module's block ending where the previous one begins, so an offset is
+    // negative (stored here as the wrapping `u64` the relocation wants).
+    let mut tls_size = if gex_abi::X86 { 0u64 } else { 16u64 };
     let mut tls_align = 8u64;
     for o in objects.iter_mut() {
         let Some((_, _, memsz, align)) = o.image.tls else { continue };
         let align = align.max(1);
         tls_align = tls_align.max(align);
-        tls_size = (tls_size + align - 1) / align * align;
-        o.tls_offset = Some(tls_size);
-        tls_size += memsz;
+        if gex_abi::X86 {
+            tls_size = (tls_size + memsz + align - 1) / align * align;
+            o.tls_offset = Some(tls_size.wrapping_neg());
+        } else {
+            tls_size = (tls_size + align - 1) / align * align;
+            o.tls_offset = Some(tls_size);
+            tls_size += memsz;
+        }
     }
 
     // One symbol table across every object, in load order, so the first
@@ -327,16 +332,7 @@ fn find(
             dirs.push(d.clone());
         }
     }
-    dirs.extend(
-        [
-            "/lib/aarch64-linux-gnu",
-            "/usr/lib/aarch64-linux-gnu",
-            "/lib",
-            "/usr/lib",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
+    dirs.extend(crate::closure::DEFAULT_DIRS.iter().map(|s| s.to_string()));
     for d in dirs {
         let p = format!("{}/{name}", d.trim_end_matches('/'));
         if let Some(b) = read(&p) {

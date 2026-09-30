@@ -118,6 +118,7 @@ impl ProcFs {
             )
             .as_bytes()
             .to_vec(),
+            "cpuinfo" if gex_abi::X86 => crate::x86::CPUINFO.as_bytes().to_vec(),
             "cpuinfo" => concat!(
                 "processor\t: 0\n",
                 "BogoMIPS\t: 100.00\n",

@@ -7,7 +7,8 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
-const EM_AARCH64: u16 = 183;
+/// The guest architecture's `e_machine`.
+const EM_GUEST: u16 = gex_abi::ELF_MACHINE;
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -42,10 +43,24 @@ const DT_INIT_ARRAY: i64 = 25;
 const DT_INIT_ARRAYSZ: i64 = 27;
 const DT_INIT: i64 = 12;
 
-const R_AARCH64_RELATIVE: u32 = 1027;
-const R_AARCH64_IRELATIVE: u32 = 1032;
-const R_AARCH64_GLOB_DAT: u32 = 1025;
-const R_AARCH64_JUMP_SLOT: u32 = 1026;
+/// Relocation types, for whichever guest architecture this build targets.
+/// The loader only ever needs the handful below; the names are the generic
+/// ones both ABIs share.
+pub mod reloc {
+    use gex_abi::X86;
+    pub const ABS64: u32 = if X86 { 1 } else { 257 };
+    pub const COPY: u32 = if X86 { 5 } else { 1024 };
+    pub const GLOB_DAT: u32 = if X86 { 6 } else { 1025 };
+    pub const JUMP_SLOT: u32 = if X86 { 7 } else { 1026 };
+    pub const RELATIVE: u32 = if X86 { 8 } else { 1027 };
+    pub const TLS_DTPMOD64: u32 = if X86 { 16 } else { 1028 };
+    pub const TLS_DTPREL64: u32 = if X86 { 17 } else { 1029 };
+    pub const TLS_TPREL64: u32 = if X86 { 18 } else { 1030 };
+    pub const TLSDESC: u32 = if X86 { 36 } else { 1031 };
+    pub const IRELATIVE: u32 = if X86 { 37 } else { 1032 };
+}
+use reloc::{GLOB_DAT as R_AARCH64_GLOB_DAT, IRELATIVE as R_AARCH64_IRELATIVE,
+    JUMP_SLOT as R_AARCH64_JUMP_SLOT, RELATIVE as R_AARCH64_RELATIVE};
 
 /// Why an image could not be loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +93,7 @@ impl fmt::Display for LoadError {
             LoadError::TooShort => write!(f, "file is too short to be an ELF image"),
             LoadError::NotElf => write!(f, "not an ELF file (bad magic)"),
             LoadError::NotElf64Le => write!(f, "not a 64-bit little-endian ELF file"),
-            LoadError::NotAarch64 => write!(f, "not an aarch64 ELF file"),
+            LoadError::NotAarch64 => write!(f, "not an {} ELF file", gex_abi::ARCH_NAME),
             LoadError::UnsupportedType(t) => write!(f, "unsupported ELF type {t}"),
             LoadError::NeedsInterpreter(p) => {
                 write!(f, "could not load the interpreter {p}")
@@ -303,7 +318,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         return Err(LoadError::NotElf64Le);
     }
     let e_type = r.u16(16)?;
-    if r.u16(18)? != EM_AARCH64 {
+    if r.u16(18)? != EM_GUEST {
         return Err(LoadError::NotAarch64);
     }
     let pie = match e_type {
