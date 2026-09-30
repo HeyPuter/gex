@@ -134,6 +134,8 @@ run options:
                   every program shares, and a closure built for one program
                   holds only the libc paths that program walks
   --no-jit        no runtime translation; implies --exhaustive
+  --cgen          the function tier: compile the program's blocks as C with
+                  clang (needs clang and wasm-ld; docs/function-tier.md)
   --lazy          discover only from the entry point, leaving the rest to
                   runtime translation; much faster to start on a big binary
   --no-cache      do not reuse compiled modules between runs
@@ -164,6 +166,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut exhaustive = false;
     let mut no_jit = false;
     let mut lazy = false;
+    let mut cgen = false;
     let mut argv0: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -250,6 +253,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             }
             "--no-jit" => no_jit = true,
             "--lazy" => lazy = true,
+            "--cgen" => cgen = true,
             "--no-cache" => opts.cache = false,
             "--cwd" => {
                 i += 1;
@@ -280,6 +284,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         xlate: Options {
             exhaustive: exhaustive || no_jit,
             lazy: lazy && !no_jit,
+            cgen,
             ..Options::default()
         },
         jit: !no_jit,
@@ -389,6 +394,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut also: Vec<String> = Vec::new();
     let mut sysroot: Option<String> = None;
     let mut profile: Vec<u64> = Vec::new();
+    let mut cgen = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -442,6 +448,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
                 also.extend(found);
             }
             "--shared-image" => shared_image = true,
+            // The function tier: the blocks as C, through clang, spliced into
+            // the module (docs/function-tier.md).
+            "--cgen" => cgen = true,
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
@@ -475,6 +484,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let out = out.unwrap_or_else(|| format!("{path}.wasm"));
 
     if closure {
+        if cgen {
+            bail!("--cgen does not handle --closure builds yet");
+        }
         return build_closure(
             &path, &also, sysroot.as_deref(), &out, exhaustive, &exhaustive_for, shared_memory,
             no_validate, shared_image, &profile,
@@ -487,6 +499,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
         &Options {
             exhaustive,
             shared_memory,
+            cgen,
             ..Options::default()
         },
     );
