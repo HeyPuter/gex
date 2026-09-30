@@ -14,6 +14,8 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod pe_info;
+
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap. A closure module for `ld.so` is only correct at the
 /// address the host's loader uses, and it uses this one.
@@ -40,6 +42,7 @@ fn real_main() -> Result<ExitCode> {
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
@@ -78,6 +81,7 @@ usage:
                                    every object reached through DT_NEEDED,
                                    where it would be placed, and how much
                                    text a whole-program build would face
+{}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
 
@@ -140,7 +144,8 @@ run options:
   --cwd DIR       start in this guest directory
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
-                  path the guest can resolve"
+                  path the guest can resolve",
+        pe_info::USAGE
     );
 }
 
@@ -1005,6 +1010,10 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     }
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: its closure is DLLs, found beside it.
+        return pe_info::cmd_pe_info(args);
+    }
 
     // Guest paths resolve inside the sysroot, as they would when the program
     // runs. Without one there is nowhere to look.
@@ -1131,6 +1140,10 @@ fn cmd_ir(args: &[String]) -> Result<()> {
     }
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: its closure is DLLs, found beside it.
+        return pe_info::cmd_pe_info(args);
+    }
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     let at = at.unwrap_or(image.entry);
 

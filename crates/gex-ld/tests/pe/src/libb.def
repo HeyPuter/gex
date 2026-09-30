@@ -1,0 +1,5 @@
+LIBRARY libb.dll
+EXPORTS
+  b_value @1
+  b_second @2
+  b_hidden @3 NONAME

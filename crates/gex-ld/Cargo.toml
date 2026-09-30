@@ -10,3 +10,5 @@ gex-abi.workspace = true
 
 [dev-dependencies]
 gex-xlate.workspace = true
+# Reads pewasm's project.json in the PE comparison test.
+serde_json = "1"
