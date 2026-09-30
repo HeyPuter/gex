@@ -208,6 +208,9 @@ fn eval_un(op: UnOp, ty: Ty, a: u64) -> u64 {
         (UnOp::Popcnt, _) => a.count_ones() as u64,
         (UnOp::Not, _) => !a,
         (UnOp::Neg, _) => 0u64.wrapping_sub(a),
+        (UnOp::Bswap, Ty::I32) => (a as u32).swap_bytes() as u64,
+        (UnOp::Bswap, _) => a.swap_bytes(),
+        (UnOp::Bswap16, _) => (a as u16).swap_bytes() as u64,
     }
 }
 
