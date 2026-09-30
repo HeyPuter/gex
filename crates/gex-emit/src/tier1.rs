@@ -1165,6 +1165,21 @@ impl<'a> Emitter<'a> {
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
             }
+            Stmt::Trap { cond, pc, code } => {
+                // Only the faulting path writes the registers back, so they
+                // stay dirty for the path that carries on.
+                self.push(*cond);
+                self.f.if_void();
+                self.flush_conditional();
+                self.store_pc(*pc);
+                self.f.local_get(self.ctx_local);
+                self.f.i64_const(*pc as i64);
+                self.f.i32_const(*code);
+                self.f.call(self.cx.breakpoint);
+                // The host raises the fault and never returns.
+                self.f.unreachable();
+                self.f.end();
+            }
             Stmt::VStore {
                 addr,
                 offset,
