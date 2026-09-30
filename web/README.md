@@ -1,41 +1,42 @@
 # Browser demo
 
-The SuperTuxKart demo uses the direct compatibility graphics path:
+The SuperTuxKart demo uses the direct graphics path:
 
 ```text
-stock application -> guest libGL/libEGL marshaller -> MobileGL -> WebGPU
+stock application -> guest libGL/libEGL marshaller -> gex-gl wire
+    -> web/mesa/gexgl-mesa.cpp -> Mesa st/mesa -> Gallium driver
 ```
 
-It does not run virglrenderer or guest Mesa. Those remain available for the
-separate legacy virgl demos; the direct path intercepts the standard library
-ABI, so STK and other desktop applications require no source modification.
+It does not run guest Mesa. The direct path intercepts the standard library
+ABI, so STK and other desktop applications require no source modification; the
+guest's GL calls cross to the page and run on Mesa compiled to wasm. Which
+Gallium driver Mesa runs on is chosen with `?glbackend=`:
 
-MobileGL is pinned as `third_party/mobilegl-webgpu` and patched at build time.
-The WebGPU fork is unfinished and, candidly, much of this backend is not written
-well: important GL invariants are missing from cache keys, unsupported calls
-silently poison whole WebGPU command buffers, and several formats, framebuffer
-operations, and texture types remain unimplemented despite advertising desktop
-OpenGL 3.3. Treat it as an experimental compatibility layer, not a conformant GL
-implementation.
-Keeping the changes in `web/mobilegl-*.patch` makes those local fixes explicit
-and leaves the upstream checkout reproducible.
+- `virgl` (the default for desktop applications): Mesa's virgl encoder, decoded
+  by virglrenderer on the page's WebGL 2.
+- `wgpu`: the gex_wgpu driver, straight onto the browser's WebGPU. This is the
+  driver under development; `?gl=mesa` on the gears demo and the gl44 gates
+  select it.
 
-Build the direct WebGPU renderer, then publish the assets:
+The separate legacy virgl demos run guest Mesa with virglrenderer on WebGL and
+do not use this path.
+
+Build the Mesa modules, then publish the assets:
 
 ```sh
-git submodule update --init --recursive third_party/mobilegl-webgpu
-web/build-mobilegl-wasm.sh
+git submodule update --init third_party/mesa
+web/build-mesa-wasm.sh          # gex-wgpu-replay (needs emdawnwebgpu and Tint)
+web/build-mesa-virgl-wasm.sh    # gex-virgl-replay
 (cd web && npm run assets)
 ```
 
-The first WebGPU build compiles the fork's pinned Tint and glslang trees and is
-substantially slower than subsequent incremental builds. SuperTuxKart selects
-`gexmobilegl-webgpu.mjs`; the virgl demos continue to use their own renderer.
+The first `build-mesa-wasm.sh` run builds Tint (`web/tint/build-tint.sh`) and is
+substantially slower than subsequent incremental builds.
 
 ## OpenGL 4.4 validation
 
-The complete 543-command core-4.4 loader surface and the currently transported
-and WebGPU-backed subsets have a structural gate:
+The complete 543-command core-4.4 command surface and the guest library's
+coverage of it have a structural gate:
 
 ```sh
 tests/gl44-layer.sh
@@ -51,7 +52,7 @@ tests/gl44-cts-browser.sh
 ```
 
 The second command runs a real `KHR-GL44` case through the persistent browser
-and direct MobileGL/WebGPU path. `GEX_CTS_CASE=KHR-GL44.…` selects another case;
+and the Mesa/gex_wgpu path. `GEX_CTS_CASE=KHR-GL44.…` selects another case;
 the growing pass list, rather than symbol coverage or an advertised version
 string, is the compliance measure.
 
@@ -69,6 +70,4 @@ distinct WebGPU canvas frames over the final ten seconds. It requires at least
 59.8 real presents per second, 99.5% fresh-frame coverage, and no more than one
 missed animation tick. The game can produce frames faster than the browser can
 display them, so its own `Average FPS` is diagnostic rather than the pass/fail
-metric. A four-snapshot MobileGL presentation queue decouples guest production
-from browser animation timing; this costs about 4.7 MiB at 640x480 and can add
-roughly 40 ms of queueing latency when the guest runs near 95 FPS.
+metric.
