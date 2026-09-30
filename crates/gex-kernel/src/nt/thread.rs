@@ -67,54 +67,21 @@ fn write_eflags(g: &mut G<'_>, cx: u64, f: u32) -> R<()> {
     Ok(())
 }
 
-/// An f64 as the x87's 80-bit extended format.
-fn f64_to_f80(v: f64) -> [u8; 10] {
-    let bits = v.to_bits();
-    let sign = (bits >> 63) as u16;
-    let exp = ((bits >> 52) & 0x7ff) as i32;
-    let frac = bits & ((1 << 52) - 1);
-    let (e80, m80): (u16, u64) = if exp == 0 && frac == 0 {
-        (0, 0)
-    } else if exp == 0x7ff {
-        (0x7fff, (1 << 63) | (frac << 11))
-    } else if exp == 0 {
-        // Denormal double: normalise.
-        let shift = frac.leading_zeros() - 11;
-        let m = frac << (shift + 11);
-        ((1 - 1023 + 16383 - shift as i32) as u16, m)
-    } else {
-        ((exp - 1023 + 16383) as u16, (1 << 63) | (frac << 11))
-    };
-    let mut out = [0u8; 10];
-    out[..8].copy_from_slice(&m80.to_le_bytes());
-    out[8..].copy_from_slice(&((sign << 15) | e80).to_le_bytes());
-    out
-}
-
-fn f80_to_f64(b: &[u8]) -> f64 {
-    let m = u64::from_le_bytes(b[..8].try_into().unwrap());
-    let se = u16::from_le_bytes([b[8], b[9]]);
-    let sign = if se & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let e = (se & 0x7fff) as i32;
-    if e == 0 && m == 0 {
-        return 0.0 * sign;
-    }
-    if e == 0x7fff {
-        return if m << 1 == 0 { sign * f64::INFINITY } else { f64::NAN };
-    }
-    sign * (m as f64) * 2f64.powi(e - 16383 - 63)
-}
-
 /// x87 register `phys` (physical, not stack-relative) of the gex context at
-/// `cx`, in the 80-bit format a CONTEXT holds. gex keeps x87 registers as
-/// f64 today; this pair is the one place that knows (S14 will make them
-/// 80-bit).
+/// `cx`, in the 80-bit format a CONTEXT holds. gex keeps each register as a
+/// 16-byte fxsave-style slot (significand at +0, sign|exponent at +8), so the
+/// first 10 bytes are exactly the 80-bit value.
 fn x87_read_f80(g: &G<'_>, cx: u64, phys: u64) -> R<[u8; 10]> {
-    Ok(f64_to_f80(f64::from_bits(g.u64(cx + ctx::X87 as u64 + 8 * phys)?)))
+    let b = g.bytes(cx + ctx::X87 as u64 + 16 * phys, 10)?;
+    let mut v = [0u8; 10];
+    v.copy_from_slice(&b);
+    Ok(v)
 }
 
 fn x87_write_f80(g: &mut G<'_>, cx: u64, phys: u64, v: &[u8]) -> R<()> {
-    g.w64(cx + ctx::X87 as u64 + 8 * phys, f80_to_f64(v).to_bits())
+    let a = cx + ctx::X87 as u64 + 16 * phys;
+    g.write(a, &v[..10])?;
+    g.write(a + 10, &[0u8; 6])
 }
 
 /// The gex register state of the thread at `cx` as an x86-64 CONTEXT at `at`
@@ -253,10 +220,10 @@ fn load_fxsave(g: &mut G<'_>, cx: u64, f: u64, xmm: u8) -> R<()> {
     let sw = g.u16(f + 2)?;
     let tags = g.u8(f + 4)?;
     let top = ((sw >> 11) & 7) as u64;
-    g.w16(cx + ctx::X87_CW as u64, cw)?;
-    g.w16(cx + ctx::X87_SW as u64, sw & !(7 << 11))?;
+    g.w32(cx + ctx::X87_CW as u64, cw as u32)?;
+    g.w32(cx + ctx::X87_SW as u64, (sw & !(7 << 11)) as u32)?;
     g.w32(cx + ctx::X87_TOP as u64, top as u32)?;
-    g.w16(cx + ctx::X87_TAGS as u64, tags as u16)?;
+    g.w32(cx + ctx::X87_TAGS as u64, tags as u32)?;
     for i in 0..8u64 {
         let b = g.bytes(f + 0x20 + 16 * i, 10)?;
         x87_write_f80(g, cx, (top + i) & 7, &b)?;
@@ -337,10 +304,10 @@ pub fn load_context32(g: &mut G<'_>, cx: u64, at: u64) -> R<Option<u64>> {
                 valid |= 1 << phys;
             }
         }
-        g.w16(cx + ctx::X87_CW as u64, cw)?;
-        g.w16(cx + ctx::X87_SW as u64, sw & !(7 << 11))?;
+        g.w32(cx + ctx::X87_CW as u64, cw as u32)?;
+        g.w32(cx + ctx::X87_SW as u64, (sw & !(7 << 11)) as u32)?;
         g.w32(cx + ctx::X87_TOP as u64, top as u32)?;
-        g.w16(cx + ctx::X87_TAGS as u64, valid)?;
+        g.w32(cx + ctx::X87_TAGS as u64, valid as u32)?;
         for i in 0..8u64 {
             let b = g.bytes(f + 0x1c + 10 * i, 10)?;
             x87_write_f80(g, cx, (top + i) & 7, &b)?;
@@ -842,7 +809,7 @@ pub fn init_start_frame(p: &Process, g: &mut G<'_>, t: &Thread, entry: u64, arg:
     }
     g.w64(cx + ctx::TID as u64, t.gex_tid as u64)?;
     g.w32(cx + ctx::SAFEPOINT_COUNTER as u64, 1024)?;
-    g.w16(cx + ctx::X87_CW as u64, 0x27f)?;
+    g.w32(cx + ctx::X87_CW as u64, 0x27f)?;
     g.w32(cx + ctx::MXCSR as u64, 0x1f80)?;
     Ok(())
 }

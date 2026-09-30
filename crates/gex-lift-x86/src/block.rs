@@ -98,6 +98,44 @@ mod tests {
         )));
     }
 
+    /// The x87's arithmetic goes to the host (which computes it in 80-bit
+    /// extended precision), each instruction with its operands encoded in
+    /// the `x87op` word: here `fmulp st(1), st` (de c9) is FMUL on
+    /// `st(1) op= st(0)` with one pop, and `fstp qword [rax]` (dd 18) is FST
+    /// to double followed by the guest's own store.
+    #[test]
+    fn x87_arithmetic_goes_to_the_host_in_extended_precision() {
+        use crate::x87op;
+        // fmulp st(1), st ; fstp qword [rax] ; ret
+        let b = lift_block(bytes(0x1000, &[0xde, 0xc9, 0xdd, 0x18, 0xc3]), 0x1000, BlockLimits::default());
+        let words: Vec<u64> = b
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::HostCall { func: gex_ir::HostFunc::SysRegWrite, args } => Some(args[2]),
+                _ => None,
+            })
+            .map(|v| {
+                b.stmts
+                    .iter()
+                    .find_map(|s| match s {
+                        Stmt::Def { dst, expr: gex_ir::Expr::ConstI64(k) } if *dst == v => Some(*k as u64),
+                        _ => None,
+                    })
+                    .expect("constant x87op word")
+            })
+            .collect();
+        assert_eq!(
+            words,
+            vec![
+                x87op::FMUL | x87op::FORM_STI_ST0 << x87op::FORM_SHIFT | 1 << x87op::I_SHIFT | 1 << x87op::POP_SHIFT,
+                x87op::FST | x87op::MEM_F64 << x87op::MEM_SHIFT,
+            ],
+            "{}",
+            print::block(&b)
+        );
+    }
+
     #[test]
     fn straight_line_ends_at_ret() {
         // mov eax, 1 ; mov ecx, 2 ; ret
