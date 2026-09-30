@@ -681,6 +681,8 @@ fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
                         expr: Expr::ReadReg(r),
                         ..
                     } => l.insert(*r),
+                    // A trap reads everything (on its faulting path).
+                    Stmt::Trap { .. } => l = RegSet::ALL,
                     _ if emit::clobbers(s) => l = RegSet::ALL,
                     _ => {}
                 }
@@ -726,7 +728,7 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
         }
         let mut callees = Vec::new();
         for b in &f.blocks {
-            if b.stmts.iter().any(emit::clobbers) {
+            if b.stmts.iter().any(|s| emit::clobbers(s) || matches!(s, Stmt::Trap { .. })) {
                 continue 'f;
             }
             let backward = |e: &Edge| {

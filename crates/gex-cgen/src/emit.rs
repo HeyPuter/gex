@@ -568,6 +568,19 @@ impl<'a> Emitter<'a> {
                     self.line(format!("*({ut} *)({p}) = ({nt}){v};"));
                 }
             }
+            Stmt::Trap { cond, pc, code } => {
+                // tier-1's lowering: only the faulting path writes back
+                // (everything, flags too: the host raises a signal from this
+                // state), so the registers stay dirty for the path that
+                // carries on.
+                let c = self.v(*cond);
+                self.line(format!("if (__builtin_expect({c} != 0, 0)) {{"));
+                self.flush_keep();
+                self.store_pc(&format!("0x{pc:x}ull"));
+                self.line(format!("  gex_breakpoint(ctx, 0x{pc:x}ll, (int32_t){code});"));
+                self.line("  __builtin_unreachable();");
+                self.line("}");
+            }
             Stmt::HostCall { func, args } => {
                 let call = self.host_call_expr(*func, args)?;
                 if func.clobbers_guest_state() {
