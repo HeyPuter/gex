@@ -455,6 +455,9 @@ pub struct Kernel {
     /// splits: the host waits for a connection to arrive, and the work
     /// happens back here.
     pub retry_accept: Option<(i32, u64, u64, u64)>,
+    /// A write parked as a blocking operation: its `EPIPE`, when it comes
+    /// back through `finish_blocking`, raises SIGPIPE as a direct one does.
+    pub write_blocked: bool,
     /// A `recvmsg` on a blocking socket with nothing to read: the fd and the
     /// `msghdr`, re-run once the socket becomes readable. Like `retry_accept`,
     /// the real work waits for the kernel lock (the msghdr may carry
@@ -621,6 +624,21 @@ pub const ITIMER_PROF: usize = 2;
 /// panics there -- so the browser host passes its own, and everything else
 /// gets [`system_clock`].
 pub type ClockFn = fn() -> (u64, u32);
+
+/// Whether an `EPIPE` from syscall `n` also raises SIGPIPE, as Linux does
+/// for a write to a pipe or stream socket with no reader -- except a `send`
+/// with `MSG_NOSIGNAL`. (A shell pipeline's `yes | head` ends with the
+/// writer killed by it; without it the writer sees EPIPE and complains.)
+fn raises_sigpipe(n: u64, a: &[u64; 6]) -> bool {
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    match n {
+        nr::WRITE | nr::WRITEV | nr::PWRITE64 | nr::SENDFILE => true,
+        nr::SENDTO => a[3] & MSG_NOSIGNAL == 0,
+        nr::SENDMSG => a[2] & MSG_NOSIGNAL == 0,
+        nr::SENDMMSG => a[3] & MSG_NOSIGNAL == 0,
+        _ => false,
+    }
+}
 
 /// Read a `struct timeval` -- seconds then microseconds -- as nanoseconds.
 fn read_timeval(m: &GuestMem<'_>, at: u64) -> Result<u128, Errno> {
@@ -1054,6 +1072,7 @@ impl Kernel {
             clock: system_clock,
             itimers: [None; 3],
             retry_accept: None,
+            write_blocked: false,
             retry_recvmsg: None,
             restore_sigmask: None,
             started: 0,
@@ -1274,6 +1293,7 @@ impl Kernel {
             // A fork does not inherit its parent's timers.
             itimers: [None; 3],
             retry_accept: None,
+            write_blocked: false,
             retry_recvmsg: None,
             restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
@@ -1638,6 +1658,7 @@ impl Kernel {
                     eprintln!("[gex:{}] {} blocking", self.pid, syscall_name(n));
                 }
             }
+            self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
             return SyscallOutcome::Blocking(op);
         }
 
@@ -1665,6 +1686,11 @@ impl Kernel {
         } else {
             self.dispatch(m, n, a)
         };
+        if let Ok(Err(Errno::EPIPE)) = &outcome {
+            if raises_sigpipe(n, &a) {
+                self.signals.raise(crate::signal::sig::SIGPIPE);
+            }
+        }
         let ret = match &outcome {
             Ok(r) => match r {
                 Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
@@ -2022,6 +2048,9 @@ impl Kernel {
         // has to carry it -- restoring it here instead would block the very
         // signal that ended the wait, leaving it pending forever.
         let suspended = self.restore_sigmask.take();
+        if std::mem::take(&mut self.write_blocked) && r == Err(Errno::EPIPE) {
+            self.signals.raise(crate::signal::sig::SIGPIPE);
+        }
         let ret = encode(r);
         let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
         if let Some(mask) = suspended {
