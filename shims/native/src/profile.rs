@@ -634,6 +634,7 @@ mod tests {
             brk: base + 0x1000,
             text_range: (base, base + len),
             tls: None,
+            class32: false,
             symbols: Vec::new(),
             named_relocs: Vec::new(),
             relocs: Vec::new(),
