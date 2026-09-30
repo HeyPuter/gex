@@ -224,6 +224,7 @@ pub fn splice(
     let mut t_imports: HashMap<(String, String), (u32, u32)> = HashMap::new();
     let mut t_nimp = 0u32;
     let mut t_ndef = 0u32;
+    let mut t_memories = 0u32;
     for payload in Parser::new(0).parse_all(tier1) {
         match payload? {
             Payload::TypeSection(r) => {
@@ -238,11 +239,21 @@ pub fn splice(
                         t_imports.insert((i.module.to_string(), i.name.to_string()), (t_nimp, t));
                         t_nimp += 1;
                     }
+                    if let TypeRef::Memory(_) = i.ty {
+                        t_memories += 1;
+                    }
                 }
             }
             Payload::FunctionSection(r) => t_ndef = r.count(),
+            Payload::MemorySection(r) => t_memories += r.count(),
             _ => {}
         }
+    }
+    if t_memories != 1 {
+        bail!(
+            "the tier-1 module has {t_memories} memories; the splice handles exactly one \
+             (profiling and --cgen do not mix yet)"
+        );
     }
     let block_ty = t_types
         .iter()

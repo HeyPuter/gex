@@ -651,7 +651,8 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     }
     let mut module = builder.finish();
     if opts.cgen {
-        module.wasm = cgen_splice(&module.wasm, &cgen);
+        let symbols: Vec<u64> = image.symbols.iter().filter(|s| !s.ifunc).map(|s| s.value).collect();
+        module.wasm = cgen_splice(&module.wasm, &cgen, &symbols);
     }
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
@@ -661,16 +662,16 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 /// failure: a build that asked for the function tier must not quietly ship
 /// tier-1.
 #[cfg(feature = "cgen")]
-fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)]) -> Vec<u8> {
+fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], symbols: &[u64]) -> Vec<u8> {
     let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
-    match gex_cgen::build(wasm, &refs) {
+    match gex_cgen::build(wasm, &refs, symbols) {
         Ok((w, _)) => w,
         Err(e) => panic!("function tier (--cgen): {e:#}"),
     }
 }
 
 #[cfg(not(feature = "cgen"))]
-fn cgen_splice(_: &[u8], _: &[(Block, u32)]) -> Vec<u8> {
+fn cgen_splice(_: &[u8], _: &[(Block, u32)], _: &[u64]) -> Vec<u8> {
     panic!("Options::cgen is set, but gex-xlate was built without the `cgen` feature")
 }
 

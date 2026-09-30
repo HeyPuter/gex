@@ -40,7 +40,7 @@ fn no_guard() -> bool {
     std::env::var_os("GEX_UNSAFE_NO_GUARD").is_some()
 }
 
-fn cty(ty: Ty) -> &'static str {
+pub(crate) fn cty(ty: Ty) -> &'static str {
     match ty {
         Ty::I32 => "uint32_t",
         Ty::I64 => "uint64_t",
@@ -48,7 +48,7 @@ fn cty(ty: Ty) -> &'static str {
     }
 }
 
-fn reg_name(r: GuestReg) -> String {
+pub(crate) fn reg_name(r: GuestReg) -> String {
     match r {
         GuestReg::X(n) => format!("r_x{n}"),
         GuestReg::V128(n) => format!("r_v{n}"),
@@ -76,7 +76,7 @@ fn reg_name(r: GuestReg) -> String {
 }
 
 /// `tier1::Emitter::reg_offset`.
-fn reg_offset(r: GuestReg) -> usize {
+pub(crate) fn reg_offset(r: GuestReg) -> usize {
     match r {
         GuestReg::X(n) => ctx::x(n),
         GuestReg::V128(n) => ctx::v(n),
@@ -152,8 +152,20 @@ impl Unit {
     }
 }
 
-struct Emitter<'a> {
+/// Function mode (Phase B): every register the function touches is a C
+/// local for the whole function, loaded at entry and after anything that may
+/// change guest state, and written back at every point control can leave.
+pub(crate) struct FnRegs {
+    /// Read or written anywhere: loaded on entry and reloaded after calls.
+    pub used: BTreeSet<GuestReg>,
+    /// Written anywhere: stored back before control can leave.
+    pub written: BTreeSet<GuestReg>,
+}
+
+pub(crate) struct Emitter<'a> {
     block: &'a Block,
+    /// Set in function mode; `None` for tier-1-style blocks.
+    pub(crate) func_regs: Option<FnRegs>,
     owned: &'a HashSet<u64>,
     out: String,
     /// Cached registers and whether each is dirty (tier-1's `regs`).
@@ -172,10 +184,11 @@ struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
-    fn new(block: &'a Block, owned: &'a HashSet<u64>) -> Emitter<'a> {
+    pub(crate) fn new(block: &'a Block, owned: &'a HashSet<u64>) -> Emitter<'a> {
         let n = block.n_values as usize;
         Emitter {
             block,
+            func_regs: None,
             owned,
             out: String::new(),
             regs: BTreeMap::new(),
@@ -188,18 +201,31 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn line(&mut self, s: impl AsRef<str>) {
+    /// Size the per-value tables for `n` values (function mode numbers
+    /// values across the whole function).
+    pub(crate) fn resize(&mut self, n: usize) {
+        self.value_ty = vec![Ty::I64; n];
+        self.value_const = vec![None; n];
+        self.value_half = vec![false; n];
+    }
+
+    /// The C emitted so far, leaving the emitter empty.
+    pub(crate) fn take_output(&mut self) -> String {
+        std::mem::take(&mut self.out)
+    }
+
+    pub(crate) fn line(&mut self, s: impl AsRef<str>) {
         self.out.push_str("  ");
         self.out.push_str(s.as_ref());
         self.out.push('\n');
     }
 
-    fn fresh(&mut self) -> String {
+    pub(crate) fn fresh(&mut self) -> String {
         self.tmp += 1;
         format!("t{}", self.tmp)
     }
 
-    fn v(&self, v: Value) -> String {
+    pub(crate) fn v(&self, v: Value) -> String {
         format!("v{}", v.0)
     }
 
@@ -221,6 +247,9 @@ impl<'a> Emitter<'a> {
 
     fn reg(&mut self, r: GuestReg) -> String {
         let name = reg_name(r);
+        if self.func_regs.is_some() {
+            return name;
+        }
         if self.regs.contains_key(&r) {
             return name;
         }
@@ -248,11 +277,17 @@ impl<'a> Emitter<'a> {
         self.regs.insert(r, true);
     }
 
-    fn flush(&mut self) {
+    pub(crate) fn flush(&mut self) {
         self.flush_inner(false);
     }
 
     fn flush_inner(&mut self, keep_dirty: bool) {
+        if let Some(fr) = &self.func_regs {
+            let w: Vec<GuestReg> = fr.written.iter().copied().collect();
+            let loaded = fr.used.clone();
+            self.store_regs(&w, &loaded);
+            return;
+        }
         let mut dirty: Vec<GuestReg> = self
             .regs
             .iter()
@@ -309,11 +344,67 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
+        if let Some(fr) = &self.func_regs {
+            let u: Vec<GuestReg> = fr.used.iter().copied().collect();
+            self.load_regs(&u);
+            return;
+        }
         self.regs.clear();
     }
 
-    fn store_pc(&mut self, pc: &str) {
+    /// Function mode: load `regs` from the context into their locals.
+    pub(crate) fn load_regs(&mut self, regs: &[GuestReg]) {
+        for &r in regs {
+            let off = reg_offset(r);
+            let name = reg_name(r);
+            let load = if r == GuestReg::CtxAddr {
+                "(uint64_t)(uint32_t)ctx".to_string()
+            } else if r.is_flag() {
+                format!("GEX_C8({off}u)")
+            } else {
+                match r.ty() {
+                    Ty::I32 => format!("GEX_C32({off}u)"),
+                    Ty::I64 => format!("GEX_C64({off}u)"),
+                    Ty::V128 => format!("GEX_CV({off}u)"),
+                }
+            };
+            self.line(format!("{name} = {load};"));
+        }
+    }
+
+    /// Function mode: store `regs` from their locals, packing the flags the
+    /// way tier-1 does when all four are loaded.
+    fn store_regs(&mut self, regs: &[GuestReg], loaded: &BTreeSet<GuestReg>) {
+        let mut regs: Vec<GuestReg> = regs.to_vec();
+        regs.sort_by_key(|r| reg_offset(*r));
+        let flags = [GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V];
+        let packed = flags.iter().all(|r| loaded.contains(r)) && flags.iter().any(|r| regs.contains(r));
+        if packed {
+            self.line(format!(
+                "GEX_C32({}u) = f_n | (f_z << 8) | (f_c << 16) | (f_v << 24);",
+                ctx::NZCV
+            ));
+        }
+        for r in regs {
+            if r == GuestReg::CtxAddr || (packed && flags.contains(&r)) {
+                continue;
+            }
+            let off = reg_offset(r);
+            let name = reg_name(r);
+            if r.is_flag() {
+                self.line(format!("GEX_C8({off}u) = (uint8_t){name};"));
+            } else {
+                match r.ty() {
+                    Ty::I32 => self.line(format!("GEX_C32({off}u) = {name};")),
+                    Ty::I64 => self.line(format!("GEX_C64({off}u) = {name};")),
+                    Ty::V128 => self.line(format!("GEX_CV_SET({off}u, {name});")),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn store_pc(&mut self, pc: &str) {
         self.line(format!("GEX_C64({}u) = {pc};", ctx::PC));
     }
 
@@ -361,7 +452,7 @@ impl<'a> Emitter<'a> {
 
     // -- statements -------------------------------------------------------
 
-    fn stmt(&mut self, s: &Stmt) -> Result<()> {
+    pub(crate) fn stmt(&mut self, s: &Stmt) -> Result<()> {
         match s {
             Stmt::Def { dst, expr } => self.def(*dst, expr)?,
             Stmt::WriteReg { reg, val } => {
@@ -1128,7 +1219,7 @@ impl<'a> Emitter<'a> {
 
     // -- control flow (tier-1's `terminator`, `jump_to_constant`) -----------
 
-    fn safepoint(&mut self, pc: &str) {
+    pub(crate) fn safepoint(&mut self, pc: &str) {
         let c = ctx::SAFEPOINT_COUNTER;
         self.line(format!(
             "{{ int32_t sc = (int32_t)GEX_C32({c}u) - 1; GEX_C32({c}u) = (uint32_t)sc; \
@@ -1138,7 +1229,7 @@ impl<'a> Emitter<'a> {
 
     /// Tail-call dispatch on `target` (tier-1's `emit_dispatch_tail_call`,
     /// whose stores this makes before handing over).
-    fn dispatch(&mut self, target: &str) {
+    pub(crate) fn dispatch(&mut self, target: &str) {
         self.line(format!("GEX_C64({}u) = {target};", ctx::LAST_TARGET));
         if gex_abi::X86 {
             self.line(format!(
@@ -1165,7 +1256,7 @@ impl<'a> Emitter<'a> {
 
     /// x86-64: a slot covers four bytes, so a block can be entered for a
     /// neighbour's address (tier-1's `emit_target_check`).
-    fn target_check(&mut self) {
+    pub(crate) fn target_check(&mut self) {
         let start = self.block.start;
         let lt = ctx::LAST_TARGET;
         self.line(format!("if (GEX_C64({lt}u) != 0x{start:x}ull) {{"));
