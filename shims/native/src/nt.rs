@@ -116,7 +116,18 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
             Err(StopExecution.into())
         }
         nt::Outcome::ThreadExit => {
-            state.exit = Some(Exit::Status(0));
+            // The main thread's host thread is the process's: when it ends
+            // first (ExitThread, or a kill from another thread's
+            // ExitProcess), it waits for the process to end and reports the
+            // process's exit code, as Windows does.
+            if ctx_addr == gex_abi::ctx_addr(0) {
+                while !p.terminating.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                state.exit = Some(Exit::Status(p.exit_code.load(std::sync::atomic::Ordering::Acquire) as i32));
+            } else {
+                state.exit = Some(Exit::Status(0));
+            }
             Err(StopExecution.into())
         }
         nt::Outcome::SpawnThread { ctx_addr: child, gex_tid } => {

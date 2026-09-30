@@ -11,6 +11,8 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 gexc=${1:-$root/target/release/gexc}
+# Absolute: each case runs in its program's directory.
+case $gexc in /*) ;; *) gexc=$PWD/$gexc ;; esac
 fx=$root/crates/gex-ld/tests/pe/bin
 [ -x "$gexc" ] || { echo "no gexc at $gexc" >&2; exit 2; }
 prefix=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
@@ -54,6 +56,7 @@ check sync 0 "$allok" "$here/bin/sync.exe"
 check apc 0 "$allok" "$here/bin/apc.exe"
 check tls 0 "$allok" "$here/bin/tls.exe"
 check cxx 0 "$allok" "$here/bin/cxx.exe"
+check exitproc 33 "worker exiting${nl}atexit ran" "$here/bin/exitproc.exe"
 # Ends in the top-level exception filter, which exits with 77.
 check seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$here/bin/seh.exe"
 
