@@ -1,11 +1,10 @@
 #!/bin/sh
-# Structural gates for the direct OpenGL 4.4 -> WebGPU implementation.
+# Structural gates for the guest's OpenGL 4.4 transport.
 #
 # This is intentionally not called a conformance test. It proves that every
-# core command is represented in the pinned Khronos model, that MobileGL's
-# frontend loader recognizes that complete surface, and that transport/backend
-# coverage never falls below the last reviewed baseline. Semantic conformance
-# is covered by separate execution tests as command families land.
+# core command is represented in the pinned Khronos model and that the guest
+# library's coverage never falls below the last reviewed baseline. Semantic
+# conformance is covered by separate execution tests as command families land.
 set -eu
 
 ROOT="$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)"
@@ -88,8 +87,7 @@ PY
 
 python3 "$ROOT/tools/gl44_coverage.py" \
     --guest "$DRIVER/libGLESv2.so.2" \
-    --mobilegl "$ROOT/third_party/mobilegl-webgpu" \
-    --require loader --min-guest 515 --min-backend 37
+    --min-guest 515
 
 # Resource query replies must be length-delimited and copied only after the
 # generated guest verifies the exact pname-dependent output size. A raw host

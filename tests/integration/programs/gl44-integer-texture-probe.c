@@ -72,31 +72,6 @@ int main(void) {
     CHECK(linked, "program link");
     glUseProgram(program);
 
-    /* Integer filtered sampling is not lowered yet. It must fail at link on the
-     * WebGPU backend instead of claiming success and silently dropping every draw. */
-    const char *renderer = (const char *)glGetString(GL_RENDERER);
-    if (renderer && strstr(renderer, "DirectWebGPU")) {
-        const char *implicit_fragment_source =
-            "#version 440 core\n"
-            "layout(binding=0) uniform usampler2D source_texture;\n"
-            "layout(location=0) out vec4 color;\n"
-            "void main(){color=vec4(texture(source_texture,vec2(0.5)))/255.0;}\n";
-        GLuint implicit_program = glCreateProgram();
-        GLuint implicit_fragment = compile_shader(GL_FRAGMENT_SHADER, implicit_fragment_source);
-        glAttachShader(implicit_program, vertex_shader);
-        glAttachShader(implicit_program, implicit_fragment);
-        glLinkProgram(implicit_program);
-        GLint implicit_linked = GL_TRUE;
-        glGetProgramiv(implicit_program, GL_LINK_STATUS, &implicit_linked);
-        char implicit_log[4096] = {0};
-        glGetProgramInfoLog(implicit_program, sizeof(implicit_log), NULL, implicit_log);
-        CHECK(implicit_linked == GL_FALSE, "unsupported integer texture() reports link failure");
-        CHECK(strstr(implicit_log, "SPIR-V to WGSL translation failed") != NULL,
-              "backend translation failure reaches program info log");
-        glDeleteProgram(implicit_program);
-        glDeleteShader(implicit_fragment);
-    }
-
     GLuint source_texture = 0;
     glGenTextures(1, &source_texture);
     glActiveTexture(GL_TEXTURE0);

@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""Measure command routing in the independently testable layers of gex's GL path.
+"""Measure OpenGL 4.4 core command routing in the guest's GL library.
 
 The command list comes from Khronos' generated glcorearb.h in the pinned
-MobileGL checkout.  An entry point is not counted merely because a header
-declares it: the guest shared object must export it, MobileGL must return it
-from GetProcAddress, and backend operations must have a non-null DirectWebGPU
-function-table slot.
+OpenGL-Registry checkout.  A command counts when the guest shared object
+exports it, which is what an application's dlsym or GetProcAddress finds.
 
-This is deliberately *not* a conformance metric.  Exporting a command, returning
-it from GetProcAddress, or wiring a backend slot says nothing about validation,
-state semantics, output pixels, synchronization, or memory safety.  In
-particular, the backend table contains only the operations MobileGL chose to
-delegate and may wire intentional no-ops, so its percentage is a wiring audit
-over that table rather than coverage of OpenGL.
+This is deliberately *not* a conformance metric.  Exporting a command says
+nothing about validation, state semantics, output pixels, synchronization, or
+memory safety.  On the host, every command the wire carries runs through
+Mesa's st/mesa frontend.
 """
 
 from __future__ import annotations
@@ -67,33 +63,24 @@ def main() -> int:
         default=root / "web/public/fs/libGLESv2.so.2",
         help="built guest libGLES shared object inspected with nm -D",
     )
+    parser.add_argument(
+        "--registry",
+        type=pathlib.Path,
+        default=root / "third_party/opengl-registry",
+        help="OpenGL-Registry checkout providing api/GL/glcorearb.h",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--min-guest", type=int, default=0)
-    parser.add_argument("--min-backend", type=int, default=0)
-    parser.add_argument(
-        "--mobilegl",
-        type=pathlib.Path,
-        default=root / "third_party/mobilegl-webgpu",
-        help="effective MobileGL source tree to inspect",
-    )
-    parser.add_argument(
-        "--backend-patch",
-        type=pathlib.Path,
-        action="append",
-        default=[],
-        help="ordered patch contributing DirectWebGPU function-table wiring",
-    )
     parser.add_argument(
         "--require",
-        choices=("guest", "loader", "frontend", "backend", "all"),
+        choices=("guest",),
         action="append",
         default=[],
-        help="fail unless the selected layer covers every required command",
+        help="fail unless the guest exports every required command",
     )
     args = parser.parse_args()
 
-    mobilegl = args.mobilegl.resolve()
-    header = (mobilegl / "include/GL/glcorearb.h").read_text()
+    header = (args.registry.resolve() / "api/GL/glcorearb.h").read_text()
     by_version = version_commands(header)
     required = set().union(*by_version.values())
 
@@ -101,70 +88,12 @@ def main() -> int:
         parser.error(f"guest library does not exist: {args.guest}")
     guest = dynamic_exports(args.guest)
 
-    getproc_source = (mobilegl / "MobileGL/MG_Impl/GetProcAddress.cpp").read_text()
-    loader = set(re.findall(r"GETPROC\((gl[A-Z]\w+)", getproc_source))
-    definitions_source = (
-        mobilegl / "MobileGL/MG_Impl/GLImpl/Exporting/Definitions.cpp"
-    ).read_text()
-    frontend_stubs = {
-        "gl" + name
-        for name in re.findall(
-            r"DECLARE_GL_FUNCTION_STUB_HEAD\([^,\n]+,\s*(\w+)", definitions_source
-        )
-    }
-    frontend = loader - frontend_stubs
-
-    table_source = (mobilegl / "MobileGL/MG_Backend/BackendObject.h").read_text()
-    backend_fields = set(re.findall(r"\(\*(\w+)\)\s*\(", table_source))
-    direct_source = (
-        mobilegl / "MobileGL/MG_Backend/DirectWebGPU/BackendObject_DirectWebGPU.cpp"
-    ).read_text()
-    backend_wired = set(re.findall(r"\.GL\.(\w+)\s*=", direct_source))
-    direct_path = "b/MobileGL/MG_Backend/DirectWebGPU/BackendObject_DirectWebGPU.cpp"
-    for patch_path in args.backend_patch:
-        if not patch_path.is_file():
-            parser.error(f"backend patch does not exist: {patch_path}")
-        in_direct_file = False
-        for line in patch_path.read_text().splitlines():
-            if line.startswith("diff --git "):
-                in_direct_file = line.split()[-1] == direct_path
-                continue
-            if not in_direct_file or line.startswith(("+++", "---")):
-                continue
-            match = re.search(r"\.GL\.(\w+)\s*=", line[1:])
-            if not match:
-                continue
-            if line.startswith("+"):
-                backend_wired.add(match.group(1))
-            elif line.startswith("-"):
-                backend_wired.discard(match.group(1))
-    backend_required = {name[2:] for name in required if name[2:] in backend_fields}
-
     layers = {
         "guest": {
             "covered": len(required & guest),
             "required": len(required),
             "percent": percent(len(required & guest), len(required)),
             "missing": sorted(required - guest),
-        },
-        "frontend": {
-            "covered": len(required & frontend),
-            "required": len(required),
-            "percent": percent(len(required & frontend), len(required)),
-            "missing": sorted(required - frontend),
-        },
-        "loader": {
-            "covered": len(required & loader),
-            "required": len(required),
-            "percent": percent(len(required & loader), len(required)),
-            "missing": sorted(required - loader),
-        },
-        "backend": {
-            "covered": len(backend_required & backend_wired),
-            "required": len(backend_required),
-            "percent": percent(len(backend_required & backend_wired), len(backend_required)),
-            "missing": sorted("gl" + name for name in backend_required - backend_wired),
-            "meaning": "DirectWebGPU function-table wiring only; no-op and semantically incomplete slots count",
         },
     }
     cumulative: set[str] = set()
@@ -174,12 +103,10 @@ def main() -> int:
         versions[version] = {
             "required": len(cumulative),
             "guest": len(cumulative & guest),
-                "frontend": len(cumulative & frontend),
-                "loader": len(cumulative & loader),
         }
     report = {
         "target": "OpenGL 4.4 core command routing (not conformance)",
-        "registry": "third_party/mobilegl-webgpu/include/GL/glcorearb.h",
+        "registry": "third_party/opengl-registry/api/GL/glcorearb.h",
         "commands": len(required),
         "layers": layers,
         "versions": versions,
@@ -194,22 +121,13 @@ def main() -> int:
                 f"{name:8} {layer['covered']:3}/{layer['required']:3} "
                 f"({layer['percent']:5.1f}%)  missing={len(layer['missing'])}"
             )
-        print("cumulative transport coverage by core version:")
+        print("cumulative guest coverage by core version:")
         for version, row in versions.items():
-            print(
-                f"  {version:3} guest={row['guest']:3}/{row['required']:3} "
-                f"frontend={row['frontend']:3}/{row['required']:3} "
-                f"loader={row['loader']:3}/{row['required']:3}"
-            )
+            print(f"  {version:3} guest={row['guest']:3}/{row['required']:3}")
 
-    required_layers = set(args.require)
-    if "all" in required_layers:
-        required_layers = set(layers)
-    failed = [name for name in required_layers if layers[name]["missing"]]
+    failed = [name for name in set(args.require) if layers[name]["missing"]]
     if layers["guest"]["covered"] < args.min_guest:
         failed.append(f"guest<{args.min_guest}")
-    if layers["backend"]["covered"] < args.min_backend:
-        failed.append(f"backend<{args.min_backend}")
     if failed:
         print("incomplete required layers: " + ", ".join(sorted(failed)), file=sys.stderr)
         return 1

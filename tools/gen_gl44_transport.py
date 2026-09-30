@@ -290,7 +290,7 @@ STRING_RETURN_COMMANDS = {
     "glGetSubroutineUniformLocation": "GLint",
 }
 
-# Guest GLuint names are not MobileGL's names. Each object-bearing parameter
+# Guest GLuint names are not the host GL's names. Each object-bearing parameter
 # names the host map through which it must be resolved before the GL call.
 OBJECT_COMMANDS = {
     "glBindImageTexture": {"texture": "textures"},

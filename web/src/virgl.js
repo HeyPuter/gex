@@ -3,11 +3,10 @@
 // The guest runs Debian's own Mesa with its Gallium `virgl` driver, which
 // speaks the vtest protocol over a UNIX socket. `shims/browser/src/virgl.rs`
 // serves that socket and hands the bytes here; here hands them to
-// virglrenderer compiled to wasm. The default build targets WebGL 2; the
-// compatibility build routes its desktop GL calls through MobileGL to WebGPU.
-// It is a second module -- a copy in, a copy out, the canvas
-// -- so virglrenderer allocates in its own heap and never in the guest's
-// address space, which the shim shares to read syscall buffers directly.
+// virglrenderer compiled to wasm, on WebGL 2. It is a second module -- a copy
+// in, a copy out, the canvas -- so virglrenderer allocates in its own heap and
+// never in the guest's address space, which the shim shares to read syscall
+// buffers directly.
 
 /**
  * Load the renderer's emscripten glue. It is a build artifact in `public/`, so
@@ -26,30 +25,6 @@ async function loadGlue(url) {
   } finally {
     URL.revokeObjectURL(blob);
   }
-}
-
-async function webGpuDeviceFor(url) {
-  if (!url.includes('webgpu')) return null;
-  if (!navigator.gpu) throw new Error('this browser does not expose WebGPU');
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-  if (!adapter) throw new Error('WebGPU did not provide an adapter');
-  const optional = [
-    'rg11b10ufloat-renderable',
-    'float32-filterable',
-    'texture-compression-bc',
-  ]
-    .filter((feature) => adapter.features.has(feature));
-  const requiredLimits = {};
-  // WebGPU's portable default is only 32 bytes/sample across all color
-  // attachments. Desktop GL exposes eight render targets, and MobileGL must
-  // sometimes materialize all of them for a shader even when the application
-  // routes some outputs to GL_NONE. Ask for the adapter's advertised budget
-  // instead of silently accepting the smaller default device limit.
-  if (adapter.limits.maxColorAttachmentBytesPerSample > 32) {
-    requiredLimits.maxColorAttachmentBytesPerSample =
-      adapter.limits.maxColorAttachmentBytesPerSample;
-  }
-  return adapter.requestDevice({ requiredFeatures: optional, requiredLimits });
 }
 
 export class VirglRenderer {
@@ -92,7 +67,6 @@ export class VirglRenderer {
       return r;
     }
     try {
-      const webGpuDevice = await webGpuDeviceFor(url);
       const Module = await loadGlue(url);
       r.#module = await Module({
         // Where the renderer's own wasm is, said rather than inferred. The
@@ -103,13 +77,8 @@ export class VirglRenderer {
         // return value beyond "no", so this is the only diagnostic there is.
         printErr: (s) => (onLog ? onLog(s) : console.warn('[virgl]', s)),
         print: (s) => (onLog ? onLog(s) : console.log('[virgl]', s)),
-        dumpWgsl: globalThis.__gexDumpWgsl ||
-          Number(new URLSearchParams(location.search).get('dumpwgsl')) || 0,
-        ...(webGpuDevice ? { preinitializedWebGPUDevice: webGpuDevice } : {}),
       });
-      r.#pump = webGpuDevice
-        ? WebAssembly.promising(r.#module._gex_virgl_pump)
-        : r.#module._gex_virgl_pump;
+      r.#pump = r.#module._gex_virgl_pump;
       const offscreen =
         typeof OffscreenCanvas === 'function' && canvas instanceof OffscreenCanvas;
       // `preserve` overrides the guess: a canvas the browser composites can
@@ -162,7 +131,6 @@ export class VirglRenderer {
       canvas: offscreen,
       url,
       stats: this.#stats.buffer,
-      dumpWgsl: Number(new URLSearchParams(location.search).get('dumpwgsl')) || 0,
     }, [offscreen]);
     try {
       await ready;

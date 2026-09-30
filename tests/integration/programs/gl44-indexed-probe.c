@@ -64,7 +64,7 @@ int main(void) {
     CHECK(eglMakeCurrent(display, surface, surface, context), "eglMakeCurrent");
 
     /* Consume a name in another namespace. A binding query must return the
-       guest's buffer name, not MobileGL's independently allocated name. */
+       guest's buffer name, not the host's independently allocated name. */
     GLuint shader = glCreateShader(GL_VERTEX_SHADER);
     CHECK(shader != 0, "shader name allocation");
 
