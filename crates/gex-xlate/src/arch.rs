@@ -394,6 +394,14 @@ pub struct Lifted {
     pub term_pc: u64,
 }
 
+/// The guest's stack pointer: `sp` on AArch64, `rsp` (`X(4)`) on x86-64,
+/// whose lifter leaves [`gex_ir::GuestReg::Sp`] unused.
+pub const SP_REG: gex_ir::GuestReg = if gex_abi::X86 {
+    gex_ir::GuestReg::X(4)
+} else {
+    gex_ir::GuestReg::Sp
+};
+
 /// The register holding the syscall number.
 pub const SYSCALL_NR: gex_ir::GuestReg = gex_ir::GuestReg::X(if gex_abi::X86 { 0 } else { 8 });
 
