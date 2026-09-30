@@ -127,6 +127,68 @@ mod imp {
         }
     }
 
+    /// Lift one block for function-level GIR: like [`lift_block`], but
+    /// keeping which instruction every statement came from, running no
+    /// optimisation (so nothing moves between instructions), and stopping
+    /// before any instruction `stop` names other than the first.
+    pub fn lift_insts(
+        fetch: &dyn Fn(u64, &mut FetchBuf) -> usize,
+        start: u64,
+        limits: BlockLimits,
+        stop: &dyn Fn(u64) -> bool,
+    ) -> Lifted {
+        use gex_ir::{Builder, Term};
+        use gex_lift::{FlagSource, Flow, Lifter};
+        let mut b = Builder::new(start);
+        let mut pcs: Vec<u64> = Vec::new();
+        let mut insts: Vec<u64> = Vec::new();
+        let mut pc = start;
+        let mut term = None;
+        let mut term_pc = start;
+        let mut flags = FlagSource::Unknown;
+        for _ in 0..limits.max_insts {
+            if pc != start && stop(pc) {
+                break;
+            }
+            let mut buf = [0u8; 16];
+            if pc % 4 != 0 || fetch(pc, &mut buf) < 4 {
+                term = Some(Term::Illegal { raw: 0, pc });
+                term_pc = pc;
+                break;
+            }
+            let raw = u32::from_le_bytes(buf[..4].try_into().unwrap());
+            let inst = gex_isa::decode(raw, pc);
+            let mark = b.mark();
+            let mut l = Lifter::new(&mut b).with_raw(raw).with_flags(flags);
+            let flow = l.lift(&inst, pc);
+            flags = l.flags();
+            if b.has_inexpressible(mark) {
+                b.rewind(mark);
+                term = Some(Term::Illegal { raw, pc });
+                term_pc = pc;
+                break;
+            }
+            pcs.resize(b.mark(), pc);
+            insts.push(pc);
+            term_pc = pc;
+            pc += 4;
+            b.end_at(pc);
+            if let Flow::End(t) = flow {
+                term = Some(t);
+                break;
+            }
+        }
+        let fell = term.is_none();
+        let block = b.finish(term.unwrap_or(Term::Goto { target: pc }));
+        pcs.truncate(block.stmts.len());
+        Lifted {
+            block,
+            pcs,
+            insts,
+            term_pc: if fell { pc } else { term_pc },
+        }
+    }
+
     /// Disassemble one instruction: its text and length.
     pub fn disasm(bytes: &[u8], pc: u64) -> (String, usize) {
         if bytes.len() < 4 {
@@ -241,6 +303,66 @@ mod imp {
         }
     }
 
+    /// See the A64 version.
+    pub fn lift_insts(
+        fetch: &dyn Fn(u64, &mut FetchBuf) -> usize,
+        start: u64,
+        limits: BlockLimits,
+        stop: &dyn Fn(u64) -> bool,
+    ) -> Lifted {
+        use gex_ir::{Builder, Term};
+        use gex_lift_x86::{FlagSource, Flow, Lifter};
+        let mut b = Builder::new(start);
+        let mut pcs: Vec<u64> = Vec::new();
+        let mut insts: Vec<u64> = Vec::new();
+        let mut pc = start;
+        let mut term = None;
+        let mut term_pc = start;
+        let mut flags = FlagSource::Unknown;
+        for _ in 0..limits.max_insts {
+            if pc != start && stop(pc) {
+                break;
+            }
+            let mut buf = [0u8; 16];
+            let n = fetch(pc, &mut buf).min(gex_isa_x86::MAX_INST_BYTES);
+            if n == 0 {
+                term = Some(Term::Illegal { raw: 0, pc });
+                term_pc = pc;
+                break;
+            }
+            let inst = gex_isa_x86::decode(&buf[..n], pc);
+            let raw = u32::from_le_bytes(buf[..4].try_into().unwrap());
+            let mark = b.mark();
+            let mut l = Lifter::new(&mut b, flags, raw);
+            let flow = l.lift(&inst, pc);
+            flags = l.flags();
+            if b.has_inexpressible(mark) {
+                b.rewind(mark);
+                term = Some(Term::Illegal { raw, pc });
+                term_pc = pc;
+                break;
+            }
+            pcs.resize(b.mark(), pc);
+            insts.push(pc);
+            term_pc = pc;
+            pc += inst.len as u64;
+            b.end_at(pc);
+            if let Flow::End(t) = flow {
+                term = Some(t);
+                break;
+            }
+        }
+        let fell = term.is_none();
+        let block = b.finish(term.unwrap_or(Term::Goto { target: pc }));
+        pcs.truncate(block.stmts.len());
+        Lifted {
+            block,
+            pcs,
+            insts,
+            term_pc: if fell { pc } else { term_pc },
+        }
+    }
+
     pub fn disasm(bytes: &[u8], pc: u64) -> (String, usize) {
         let inst = gex_isa_x86::decode(bytes, pc);
         let n = inst.len as usize;
@@ -257,3 +379,38 @@ mod imp {
 }
 
 pub use imp::*;
+
+/// A block lifted for function-level GIR by `lift_insts`.
+#[derive(Clone)]
+pub struct Lifted {
+    /// The lifted block, unoptimised.
+    pub block: Block,
+    /// The instruction each statement of `block` came from.
+    pub pcs: Vec<u64>,
+    /// Every instruction lifted, in order.
+    pub insts: Vec<u64>,
+    /// The instruction that ended the block, or the fall-through address
+    /// when the block was cut short.
+    pub term_pc: u64,
+}
+
+/// The guest's stack pointer: `sp` on AArch64, `rsp` (`X(4)`) on x86-64,
+/// whose lifter leaves [`gex_ir::GuestReg::Sp`] unused.
+pub const SP_REG: gex_ir::GuestReg = if gex_abi::X86 {
+    gex_ir::GuestReg::X(4)
+} else {
+    gex_ir::GuestReg::Sp
+};
+
+/// The register holding the syscall number.
+pub const SYSCALL_NR: gex_ir::GuestReg = gex_ir::GuestReg::X(if gex_abi::X86 { 0 } else { 8 });
+
+/// Syscalls that never return to the next instruction: `exit`,
+/// `exit_group`, `rt_sigreturn`.
+pub fn syscall_never_returns(nr: u64) -> bool {
+    if gex_abi::X86 {
+        matches!(nr, 60 | 231 | 15)
+    } else {
+        matches!(nr, 93 | 94 | 139)
+    }
+}
