@@ -72,6 +72,7 @@ mod ffi {
             ctx: EGLContext,
         ) -> EGLBoolean;
         pub fn eglGetError() -> EGLint;
+        pub fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> EGLBoolean;
     }
 
     #[link(name = "GLESv2")]
@@ -189,6 +190,27 @@ mod ffi {
             pixels: *const c_void,
         );
 
+        pub fn glGenFramebuffers(n: GLsizei, names: *mut GLuint);
+        pub fn glDeleteFramebuffers(n: GLsizei, names: *const GLuint);
+        pub fn glBindFramebuffer(target: GLenum, name: GLuint);
+        pub fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
+        pub fn glFramebufferTexture2D(
+            target: GLenum,
+            attachment: GLenum,
+            textarget: GLenum,
+            texture: GLuint,
+            level: GLint,
+        );
+        pub fn glDeleteRenderbuffers(n: GLsizei, names: *const GLuint);
+        pub fn glBindRenderbuffer(target: GLenum, name: GLuint);
+        pub fn glRenderbufferStorage(target: GLenum, internal: GLenum, width: GLsizei, height: GLsizei);
+        pub fn glFramebufferRenderbuffer(
+            target: GLenum,
+            attachment: GLenum,
+            rb_target: GLenum,
+            renderbuffer: GLuint,
+        );
+
         pub fn glDrawArrays(mode: GLenum, first: GLint, count: GLsizei);
         pub fn glDrawElements(mode: GLenum, count: GLsizei, ty: GLenum, indices: *const c_void);
         #[allow(clippy::too_many_arguments)]
@@ -221,6 +243,61 @@ const EGL_BLUE_SIZE: EGLint = 0x3022;
 const EGL_ALPHA_SIZE: EGLint = 0x3021;
 const EGL_DEPTH_SIZE: EGLint = 0x3025;
 const EGL_CONTEXT_CLIENT_VERSION: EGLint = 0x3098;
+const EGL_OPENGL_API: EGLenum = 0x30A2;
+const EGL_OPENGL_BIT: EGLint = 0x0008;
+const EGL_STENCIL_SIZE: EGLint = 0x3026;
+const EGL_CONTEXT_MAJOR_VERSION: EGLint = 0x3098;
+const EGL_CONTEXT_MINOR_VERSION: EGLint = 0x30FB;
+const EGL_CONTEXT_OPENGL_PROFILE_MASK: EGLint = 0x30FD;
+const EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT: EGLint = 0x2;
+
+/// Desktop GL's fixed-function entry points, which libGLESv2 does not
+/// export: looked up through EGL once a desktop context exists.
+macro_rules! compat_table {
+    ($($name:ident: fn($($arg:ty),*) $(-> $ret:ty)?;)*) => {
+        #[allow(non_snake_case)]
+        struct Compat {
+            $($name: unsafe extern "C" fn($($arg),*) $(-> $ret)?,)*
+        }
+        impl Compat {
+            /// `None` if any entry point is missing.
+            unsafe fn load() -> Option<Compat> {
+                Some(Compat {
+                    $($name: {
+                        let n = CString::new(stringify!($name)).unwrap();
+                        let p = eglGetProcAddress(n.as_ptr());
+                        if p.is_null() {
+                            return None;
+                        }
+                        std::mem::transmute::<*mut c_void, unsafe extern "C" fn($($arg),*) $(-> $ret)?>(p)
+                    },)*
+                })
+            }
+        }
+    };
+}
+
+compat_table! {
+    glMatrixMode: fn(GLenum);
+    glLoadIdentity: fn();
+    glPushMatrix: fn();
+    glPopMatrix: fn();
+    glTranslatef: fn(GLfloat, GLfloat, GLfloat);
+    glRotatef: fn(GLfloat, GLfloat, GLfloat, GLfloat);
+    glFrustum: fn(f64, f64, f64, f64, f64, f64);
+    glBegin: fn(GLenum);
+    glEnd: fn();
+    glVertex3f: fn(GLfloat, GLfloat, GLfloat);
+    glNormal3f: fn(GLfloat, GLfloat, GLfloat);
+    glShadeModel: fn(GLenum);
+    glLightfv: fn(GLenum, GLenum, *const GLfloat);
+    glMaterialfv: fn(GLenum, GLenum, *const GLfloat);
+    glGenLists: fn(GLsizei) -> GLuint;
+    glNewList: fn(GLuint, GLenum);
+    glEndList: fn();
+    glCallList: fn(GLuint);
+    glDeleteLists: fn(GLuint, GLsizei);
+}
 
 /// Guest object names to the host's, for the kinds GL insists on naming.
 #[derive(Default)]
@@ -345,7 +422,9 @@ pub struct Gl {
     height: i32,
     /// Which thread the context is current on, so it is only moved when needed.
     current_on: Option<std::thread::ThreadId>,
-    /// Read once at startup; the answer never changes.
+    /// Fixed function, once the context is a desktop one.
+    compat: Option<Compat>,
+    /// Read when the context is made; the answer never changes after.
     pub vendor: String,
     pub renderer: String,
     pub version: String,
@@ -472,6 +551,7 @@ impl Gl {
                 current_on: Some(std::thread::current().id()),
                 width,
                 height,
+                compat: None,
                 vendor: gl_string(0x1F00),
                 renderer: gl_string(0x1F01),
                 version: gl_string(0x1F02),
@@ -501,6 +581,90 @@ impl Gl {
             self.height = height;
         }
         Ok(())
+    }
+
+    /// Replace the startup GLES context with a desktop OpenGL one of the
+    /// compatibility profile, for a guest that asked for desktop GL (a WGL or
+    /// GLX program). The surface keeps its size; names start over, as they
+    /// would for a new context.
+    ///
+    /// `major` 0 asks for the highest version the host offers; a
+    /// compatibility context of an older version is a valid answer to any
+    /// request for 2.x or 3.0, so those are not passed on.
+    fn become_desktop(&mut self, major: u32, minor: u32) -> Result<(), String> {
+        unsafe {
+            if eglBindAPI(EGL_OPENGL_API) == 0 {
+                return Err(format!("no desktop OpenGL in EGL: {:#x}", eglGetError()));
+            }
+            let attrs = [
+                EGL_SURFACE_TYPE,
+                EGL_PBUFFER_BIT,
+                EGL_RENDERABLE_TYPE,
+                EGL_OPENGL_BIT,
+                EGL_RED_SIZE,
+                8,
+                EGL_GREEN_SIZE,
+                8,
+                EGL_BLUE_SIZE,
+                8,
+                EGL_ALPHA_SIZE,
+                8,
+                EGL_DEPTH_SIZE,
+                24,
+                EGL_STENCIL_SIZE,
+                8,
+                EGL_NONE,
+            ];
+            let mut config: EGLConfig = std::ptr::null_mut();
+            let mut num = 0;
+            if eglChooseConfig(self.display, attrs.as_ptr(), &mut config, 1, &mut num) == 0 || num < 1 {
+                eglBindAPI(EGL_OPENGL_ES_API);
+                return Err("no desktop OpenGL EGL config".into());
+            }
+            let mut ctx_attrs = vec![
+                EGL_CONTEXT_OPENGL_PROFILE_MASK,
+                EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
+            ];
+            if major > 3 || (major == 3 && minor > 0) {
+                ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MAJOR_VERSION, major as EGLint]);
+                ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MINOR_VERSION, minor as EGLint]);
+            }
+            ctx_attrs.push(EGL_NONE);
+            let context = eglCreateContext(self.display, config, std::ptr::null_mut(), ctx_attrs.as_ptr());
+            if context.is_null() {
+                eglBindAPI(EGL_OPENGL_ES_API);
+                return Err(format!("no desktop OpenGL context: {:#x}", eglGetError()));
+            }
+            let pb = [EGL_WIDTH, self.width, EGL_HEIGHT, self.height, EGL_NONE];
+            let surface = eglCreatePbufferSurface(self.display, config, pb.as_ptr());
+            if surface.is_null() {
+                eglDestroyContext(self.display, context);
+                eglBindAPI(EGL_OPENGL_ES_API);
+                return Err(format!("no desktop pbuffer: {:#x}", eglGetError()));
+            }
+            if eglMakeCurrent(self.display, surface, surface, context) == 0 {
+                return Err(format!("makeCurrent failed: {:#x}", eglGetError()));
+            }
+            eglDestroySurface(self.display, self.surface);
+            eglDestroyContext(self.display, self.context);
+            self.surface = surface;
+            self.context = context;
+            self.config = config;
+            self.names = Names::default();
+            self.pack_store = PixelStore::default();
+            self.unpack_store = PixelStore::default();
+            self.current_on = Some(std::thread::current().id());
+            self.compat = Compat::load();
+            self.vendor = gl_string(0x1F00);
+            self.renderer = gl_string(0x1F01);
+            self.version = gl_string(0x1F02);
+        }
+        Ok(())
+    }
+
+    /// Whether the context is a desktop one (fixed function available).
+    pub fn is_desktop(&self) -> bool {
+        self.compat.is_some()
     }
 
     pub fn size(&self) -> (i32, i32) {
@@ -565,16 +729,19 @@ impl Gl {
         unsafe {
             match opcode {
                 op::CONTEXT_CREATE => {
-                    // This host brings up one GLES context at startup, so the
-                    // requested API is read and not acted on. It must still be
-                    // consumed: the decoders reject a command whose payload it
-                    // did not use, which is what keeps a version mismatch from
-                    // looking like a valid stream.
-                    let (Some(_api), Some(_major), Some(_minor)) =
+                    // This host brings up a GLES context at startup; a guest
+                    // that asks for desktop GL gets a desktop compatibility
+                    // context in its place.
+                    let (Some(api), Some(major), Some(minor)) =
                         (a.u32(), a.u32(), a.u32())
                     else {
                         return true;
                     };
+                    if api == crate::proto::client_api::DESKTOP && self.compat.is_none() {
+                        if let Err(e) = self.become_desktop(major, minor) {
+                            eprintln!("gex-gl: {e}; staying on OpenGL ES");
+                        }
+                    }
                     reply.blob(self.vendor.as_bytes());
                     reply.blob(self.renderer.as_bytes());
                     reply.blob(self.version.as_bytes());
@@ -1079,6 +1246,136 @@ impl Gl {
                 op::GET_ERROR => {
                     reply.u32(glGetError());
                 }
+
+                // Framebuffers. As for buffers and textures the guest picks
+                // the names, which binding accepts.
+                op::GEN_FRAMEBUFFERS | op::GEN_RENDERBUFFERS => {}
+                op::DELETE_FRAMEBUFFERS | op::DELETE_RENDERBUFFERS => {
+                    let n = a.u32().unwrap_or(0);
+                    let names: Vec<GLuint> = (0..n).filter_map(|_| a.u32()).collect();
+                    if opcode == op::DELETE_FRAMEBUFFERS {
+                        glDeleteFramebuffers(names.len() as GLsizei, names.as_ptr());
+                    } else {
+                        glDeleteRenderbuffers(names.len() as GLsizei, names.as_ptr());
+                    }
+                }
+                op::BIND_FRAMEBUFFER => {
+                    if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
+                        glBindFramebuffer(t, n);
+                    }
+                }
+                op::BIND_RENDERBUFFER => {
+                    if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
+                        glBindRenderbuffer(t, n);
+                    }
+                }
+                op::CHECK_FRAMEBUFFER_STATUS => {
+                    let Some(t) = a.u32() else { return true };
+                    reply.u32(glCheckFramebufferStatus(t));
+                }
+                op::FRAMEBUFFER_TEXTURE_2D => {
+                    let (Some(t), Some(att), Some(tt), Some(tex), Some(level)) =
+                        (a.u32(), a.u32(), a.u32(), a.u32(), a.i32())
+                    else {
+                        return true;
+                    };
+                    glFramebufferTexture2D(t, att, tt, tex, level);
+                }
+                op::FRAMEBUFFER_RENDERBUFFER => {
+                    let (Some(t), Some(att), Some(rt), Some(rb)) = (a.u32(), a.u32(), a.u32(), a.u32()) else {
+                        return true;
+                    };
+                    glFramebufferRenderbuffer(t, att, rt, rb);
+                }
+                op::RENDERBUFFER_STORAGE => {
+                    let (Some(t), Some(f), Some(w), Some(h)) = (a.u32(), a.u32(), a.i32(), a.i32()) else {
+                        return true;
+                    };
+                    glRenderbufferStorage(t, f, w, h);
+                }
+
+                // Fixed function: only in a desktop context.
+                op::MATRIX_MODE..=op::DELETE_LISTS => {
+                    let Some(f) = &self.compat else { return false };
+                    match opcode {
+                        op::MATRIX_MODE => {
+                            let Some(m) = a.u32() else { return true };
+                            (f.glMatrixMode)(m);
+                        }
+                        op::LOAD_IDENTITY => (f.glLoadIdentity)(),
+                        op::PUSH_MATRIX => (f.glPushMatrix)(),
+                        op::POP_MATRIX => (f.glPopMatrix)(),
+                        op::TRANSLATEF => {
+                            let (Some(x), Some(y), Some(z)) = (a.f32(), a.f32(), a.f32()) else { return true };
+                            (f.glTranslatef)(x, y, z);
+                        }
+                        op::ROTATEF => {
+                            let (Some(g), Some(x), Some(y), Some(z)) = (a.f32(), a.f32(), a.f32(), a.f32()) else {
+                                return true;
+                            };
+                            (f.glRotatef)(g, x, y, z);
+                        }
+                        op::FRUSTUM => {
+                            let v: Vec<f64> = (0..6).filter_map(|_| a.f64()).collect();
+                            if v.len() != 6 {
+                                return true;
+                            }
+                            (f.glFrustum)(v[0], v[1], v[2], v[3], v[4], v[5]);
+                        }
+                        op::BEGIN => {
+                            let Some(m) = a.u32() else { return true };
+                            (f.glBegin)(m);
+                        }
+                        op::END => (f.glEnd)(),
+                        op::VERTEX3F | op::NORMAL3F => {
+                            let (Some(x), Some(y), Some(z)) = (a.f32(), a.f32(), a.f32()) else { return true };
+                            if opcode == op::VERTEX3F {
+                                (f.glVertex3f)(x, y, z);
+                            } else {
+                                (f.glNormal3f)(x, y, z);
+                            }
+                        }
+                        op::SHADE_MODEL => {
+                            let Some(m) = a.u32() else { return true };
+                            (f.glShadeModel)(m);
+                        }
+                        op::LIGHTFV | op::MATERIALFV => {
+                            let (Some(target), Some(pname), Some(count)) = (a.u32(), a.u32(), a.u32()) else {
+                                return true;
+                            };
+                            if count > 4 {
+                                return true;
+                            }
+                            let mut v = [0f32; 4];
+                            for x in v.iter_mut().take(count as usize) {
+                                *x = a.f32().unwrap_or(0.0);
+                            }
+                            if opcode == op::LIGHTFV {
+                                (f.glLightfv)(target, pname, v.as_ptr());
+                            } else {
+                                (f.glMaterialfv)(target, pname, v.as_ptr());
+                            }
+                        }
+                        op::GEN_LISTS => {
+                            let Some(n) = a.i32() else { return true };
+                            reply.u32((f.glGenLists)(n));
+                        }
+                        op::NEW_LIST => {
+                            let (Some(l), Some(m)) = (a.u32(), a.u32()) else { return true };
+                            (f.glNewList)(l, m);
+                        }
+                        op::END_LIST => (f.glEndList)(),
+                        op::CALL_LIST => {
+                            let Some(l) = a.u32() else { return true };
+                            (f.glCallList)(l);
+                        }
+                        op::DELETE_LISTS => {
+                            let (Some(l), Some(n)) = (a.u32(), a.i32()) else { return true };
+                            (f.glDeleteLists)(l, n);
+                        }
+                        _ => return false,
+                    }
+                }
                 _ => return false,
             }
         }
@@ -1284,5 +1581,118 @@ mod tests {
         let (_, status, ran) = gl.run(b.bytes());
         assert_eq!(status, error::BAD_OPCODE);
         assert_eq!(ran, 1, "it stopped where it stopped understanding");
+    }
+
+    /// Read a 16x16 RGBA readback's pixel (bottom-up rows).
+    fn pixel16(pixels: &[u8], x: usize, y: usize) -> (u8, u8, u8, u8) {
+        let o = (y * 16 + x) * 4;
+        (pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3])
+    }
+
+    fn read_back(b: &mut Batch) {
+        b.cmd(op::READ_PIXELS, &[0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0]);
+    }
+
+    /// A guest asking for desktop GL gets a compatibility context: immediate
+    /// mode, the matrix stack and display lists all run.
+    #[test]
+    fn a_desktop_context_runs_fixed_function() {
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        const GL_PROJECTION: u32 = 0x1701;
+        const GL_MODELVIEW: u32 = 0x1700;
+        const GL_COMPILE: u32 = 0x1300;
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 2, 1]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        if !gl.is_desktop() {
+            eprintln!("skipping: the host has no desktop OpenGL");
+            return;
+        }
+        let r = reply.bytes();
+        let mut at = 0;
+        let _vendor = read_blob(r, &mut at);
+        let _renderer = read_blob(r, &mut at);
+        let version = String::from_utf8(read_blob(r, &mut at)).unwrap();
+        assert!(!version.starts_with("OpenGL ES"), "a desktop version: {version}");
+
+        let mut b = Batch::new();
+        b.cmd(op::MATRIX_MODE, &[GL_PROJECTION]);
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::MATRIX_MODE, &[GL_MODELVIEW]);
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        // The left half, compiled into a list and called; the current color
+        // is white.
+        b.cmd(op::GEN_LISTS, &[1]);
+        b.cmd(op::NEW_LIST, &[1, GL_COMPILE]);
+        b.cmd(op::BEGIN, &[GL_TRIANGLES]);
+        for (x, y) in [(-1.0f32, -1.0f32), (0.0, -1.0), (0.0, 1.0), (-1.0, -1.0), (0.0, 1.0), (-1.0, 1.0)] {
+            b.cmd(op::VERTEX3F, &[x.to_bits(), y.to_bits(), 0]);
+        }
+        b.cmd(op::END, &[]);
+        b.cmd(op::END_LIST, &[]);
+        b.cmd(op::CALL_LIST, &[1]);
+        read_back(&mut b);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        let r = reply.bytes();
+        let mut at = 0;
+        let list = read_u32(r, &mut at);
+        assert_ne!(list, 0, "a display list was made");
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(pixel16(&px, 3, 8), (255, 255, 255, 255), "inside the quad");
+        assert_eq!(pixel16(&px, 12, 8), (0, 0, 0, 255), "outside it");
+    }
+
+    /// Rendering into a texture through a framebuffer object, with names the
+    /// guest chose.
+    #[test]
+    fn a_framebuffer_object_renders_to_a_texture() {
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        const GL_TEXTURE_2D: u32 = 0x0DE1;
+        const GL_FRAMEBUFFER: u32 = 0x8D40;
+        const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+        let mut b = Batch::new();
+        b.cmd(op::GEN_TEXTURES, &[1, 5]);
+        b.cmd(op::BIND_TEXTURE, &[GL_TEXTURE_2D, 5]);
+        b.raw(op::TEX_IMAGE_2D, &[GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0, 0], &[]);
+        b.cmd(op::GEN_FRAMEBUFFERS, &[1, 6]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 6]);
+        b.cmd(op::FRAMEBUFFER_TEXTURE_2D, &[GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 5, 0]);
+        b.cmd(op::CHECK_FRAMEBUFFER_STATUS, &[GL_FRAMEBUFFER]);
+        b.cmd(op::VIEWPORT, &[0, 0, 16, 16]);
+        b.cmd(op::CLEAR_COLOR, &[1.0f32.to_bits(), 0, 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        read_back(&mut b);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 0]);
+        b.cmd(op::DELETE_FRAMEBUFFERS, &[1, 6]);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        assert_eq!(read_u32(r, &mut at), GL_FRAMEBUFFER_COMPLETE);
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(pixel16(&px, 7, 7), (255, 0, 0, 255), "the clear went to the texture");
     }
 }
