@@ -549,6 +549,20 @@ fn run_program_with(
         .and_then(|a| std::fs::canonicalize(a).ok())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| opts.args.first().cloned().unwrap_or_default());
+    // A program inside the sysroot is named by its guest path: the host path
+    // leads nowhere in the guest's namespace, and glibc's `$ORIGIN` handling
+    // asserts on what it reads back through /proc/self/exe.
+    let exe_path = match opts
+        .sysroot
+        .as_deref()
+        .and_then(|r| std::fs::canonicalize(r).ok())
+        .and_then(|r| exe_path.strip_prefix(r.to_string_lossy().as_ref()).map(str::to_string))
+    {
+        Some(rest) if !rest.is_empty() => {
+            if rest.starts_with('/') { rest } else { format!("/{rest}") }
+        }
+        _ => exe_path,
+    };
     let fresh = inherited.is_none();
     // Taken before the kernel is moved out, because the setup below uses them
     // to decide whether to build a device or keep the one already bound.
@@ -566,7 +580,8 @@ fn run_program_with(
             // other part of the kernel is what exec is defined to keep.
             k.mem = gex_kernel::mem::MemoryMap::new(image.brk);
             k.ctx_addr = ctx_addr;
-            k.exe_path = exe_path.clone();
+            // `exec_program` already named the file it loaded, as a guest path;
+            // argv[0] (all `exe_path` has here) may be a bare `wc`.
             k.argv = opts.args.clone();
             k.envp = opts.env.clone();
             k.live_threads = 1;
@@ -1511,6 +1526,14 @@ fn exec_program(
     kernel.close_on_exec();
     // And the handlers, which are addresses in the image being replaced.
     kernel.signals.exec();
+    // `/proc/self/exe` is the file just loaded, by its guest path -- not
+    // argv[0], which for a busybox applet run through `$PATH` is a bare `wc`
+    // (and glibc's `$ORIGIN` handling asserts on a relative link).
+    kernel.exe_path = if req.path.starts_with('/') {
+        req.path.clone()
+    } else {
+        format!("{}/{}", kernel.vfs.cwd.trim_end_matches('/'), req.path)
+    };
     let opts = RunOptions {
         args: req.argv,
         env: req.envp,
