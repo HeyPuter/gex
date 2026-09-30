@@ -27,6 +27,9 @@ pub mod flags {
     pub const SHARED: u64 = 0x01;
     pub const PRIVATE: u64 = 0x02;
     pub const FIXED: u64 = 0x10;
+    /// `MAP_FIXED_NOREPLACE`: at exactly this address, but fail with `EEXIST`
+    /// rather than replace anything already mapped there.
+    pub const FIXED_NOREPLACE: u64 = 0x100000;
     pub const ANONYMOUS: u64 = 0x20;
     pub const NORESERVE: u64 = 0x4000;
     pub const STACK: u64 = 0x20000;
@@ -102,6 +105,20 @@ pub struct MemoryMap {
     /// reformatting on every read (measured half of an X server's time in
     /// `core::fmt` before this).
     generation: u64,
+}
+
+/// Whether `[start, end)` touches guest memory the runtime owns but no VMA
+/// records, so `is_free` would call it free:
+///
+/// - below [`gex_abi::DISPATCH_DIR_END`]: the thread contexts and the dispatch
+///   directory. A guest mapping there wipes directory entries, and a hot block
+///   then misses forever.
+/// - `[STACK_TOP, MMAP_BOTTOM)`, the gap between the guest's stack and the
+///   arena: in the browser the shim shares the guest's memory and keeps its
+///   own stack and data there. Natively it is only unused, and refusing it
+///   moves a guest's mapping elsewhere, which is harmless.
+pub fn hits_runtime(start: u64, end: u64) -> bool {
+    start < gex_abi::DISPATCH_DIR_END || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
 }
 
 pub fn page_align_up(v: u64) -> u64 {
@@ -397,12 +414,26 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
 
-        if flags & flags::FIXED != 0 {
+        if flags & (flags::FIXED | flags::FIXED_NOREPLACE) != 0 {
             if !addr.is_multiple_of(PAGE_SIZE) {
                 return Err(Errno::EINVAL);
             }
             let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
             if end > GUEST_LIMIT {
+                return Err(Errno::ENOMEM);
+            }
+            // `MAP_FIXED_NOREPLACE` (which wins over `MAP_FIXED`, as on
+            // Linux) fails over any existing mapping, a PROT_NONE
+            // reservation included: a program that probes for free address
+            // space with it (Wine does, for every thread's stack) must not be
+            // told that a taken range is free. The runtime's own regions
+            // count as taken.
+            if flags & flags::FIXED_NOREPLACE != 0 && (!self.is_free(addr, end) || hits_runtime(addr, end)) {
+                return Err(Errno::EEXIST);
+            }
+            // A plain `MAP_FIXED` replaces the guest's mappings, never the
+            // runtime's.
+            if hits_runtime(addr, end) {
                 return Err(Errno::ENOMEM);
             }
             // MAP_FIXED replaces whatever was there.
@@ -412,10 +443,15 @@ impl MemoryMap {
             return Ok(addr);
         }
 
-        // An address hint is honoured when the range happens to be free.
+        // An address hint is honoured when the range happens to be free, and
+        // is not the runtime's.
         if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
-            if end <= GUEST_LIMIT && self.is_free(addr, end) && self.ensure_backed(end).is_ok() {
+            if end <= GUEST_LIMIT
+                && self.is_free(addr, end)
+                && !hits_runtime(addr, end)
+                && self.ensure_backed(end).is_ok()
+            {
                 self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
             }
@@ -507,7 +543,7 @@ impl MemoryMap {
             return Ok((addr, false));
         }
         let grown = addr + new_len;
-        if grown <= GUEST_LIMIT && self.is_free(addr + old_len, grown) {
+        if grown <= GUEST_LIMIT && self.is_free(addr + old_len, grown) && !hits_runtime(addr + old_len, grown) {
             self.insert(addr + old_len, grown, v.prot, &v.name);
             return Ok((addr, false));
         }
@@ -690,6 +726,57 @@ mod tests {
         for k in kept {
             assert_eq!(k % HEAP, 0);
         }
+    }
+
+    /// `MAP_FIXED_NOREPLACE` refuses any existing mapping, reservations
+    /// included, and succeeds on free space.
+    #[test]
+    fn fixed_noreplace_refuses_any_existing_mapping() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let base = 0x2000_0000;
+        m.mmap(base, 0x4000, 0, anon | flags::FIXED, "reserved").unwrap();
+        for prot in [0, prot::READ | prot::WRITE] {
+            assert_eq!(
+                m.mmap(base + 0x1000, 0x1000, prot, anon | flags::FIXED_NOREPLACE, "x"),
+                Err(Errno::EEXIST),
+                "NOREPLACE over a reservation, prot {prot}"
+            );
+            // And with MAP_FIXED as well: NOREPLACE wins.
+            assert_eq!(
+                m.mmap(base + 0x3000, 0x2000, prot, anon | flags::FIXED | flags::FIXED_NOREPLACE, "x"),
+                Err(Errno::EEXIST),
+            );
+        }
+        assert_eq!(m.mmap(base + 0x4000, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "x"), Ok(base + 0x4000));
+        // Plain MAP_FIXED still replaces the guest's own mapping.
+        assert_eq!(m.mmap(base, 0x1000, 3, anon | flags::FIXED, "y"), Ok(base));
+    }
+
+    /// The contexts and dispatch directory below `DISPATCH_DIR_END`, and the
+    /// gap the browser shim lives in above the stack, are not free space,
+    /// though no VMA records them.
+    #[test]
+    fn the_runtime_regions_are_not_free_space() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let gap = gex_abi::STACK_TOP + 0x30_0000;
+        assert!(gap + 0x1000 <= MMAP_BOTTOM);
+        for at in [0x10000, gex_abi::DISPATCH_DIR_END - 0x1000, gap] {
+            assert_eq!(m.mmap(at, 0x1000, 0, anon | flags::FIXED_NOREPLACE, "r"), Err(Errno::EEXIST), "{at:#x}");
+            assert_eq!(m.mmap(at, 0x1000, 3, anon | flags::FIXED, "f"), Err(Errno::ENOMEM), "{at:#x}");
+            // A hint there is not honoured: the allocator places it instead.
+            let got = m.mmap(at, 0x1000, 3, anon, "h").unwrap();
+            assert!(!hits_runtime(got, got + 0x1000), "hint {at:#x} honoured at {got:#x}");
+        }
+        // A range that only straddles into the region is refused too.
+        assert_eq!(
+            m.mmap(gex_abi::STACK_TOP - 0x1000, 0x2000, 3, anon | flags::FIXED, "s"),
+            Err(Errno::ENOMEM)
+        );
+        // Right above the directory and at the arena's bottom is fine.
+        assert!(m.mmap(gex_abi::DISPATCH_DIR_END, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "ok").is_ok());
+        assert!(m.mmap(MMAP_BOTTOM, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "ok").is_ok());
     }
 
     #[test]
