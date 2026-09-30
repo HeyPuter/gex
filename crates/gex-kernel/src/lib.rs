@@ -18,6 +18,7 @@ pub mod fs;
 pub mod futex;
 pub mod mem;
 pub mod net;
+pub mod nt;
 pub mod pipe;
 pub mod proc;
 pub mod pty;

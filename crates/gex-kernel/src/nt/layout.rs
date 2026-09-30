@@ -201,6 +201,35 @@ pub mod x64 {
         pub const NUMBEROFPROCESSORS: u64 = 0x38;
         pub const SIZEOF: u64 = 0x40;
     }
+    pub mod kuser_shared_data {
+        pub const TICKCOUNTLOWDEPRECATED: u64 = 0x0;
+        pub const TICKCOUNTMULTIPLIER: u64 = 0x4;
+        pub const INTERRUPTTIME: u64 = 0x8;
+        pub const SYSTEMTIME: u64 = 0x14;
+        pub const TIMEZONEBIAS: u64 = 0x20;
+        pub const IMAGENUMBERLOW: u64 = 0x2c;
+        pub const IMAGENUMBERHIGH: u64 = 0x2e;
+        pub const NTSYSTEMROOT: u64 = 0x30;
+        pub const LARGEPAGEMINIMUM: u64 = 0x244;
+        pub const NTBUILDNUMBER: u64 = 0x260;
+        pub const NTPRODUCTTYPE: u64 = 0x264;
+        pub const PRODUCTTYPEISVALID: u64 = 0x268;
+        pub const NATIVEPROCESSORARCHITECTURE: u64 = 0x26a;
+        pub const NTMAJORVERSION: u64 = 0x26c;
+        pub const NTMINORVERSION: u64 = 0x270;
+        pub const PROCESSORFEATURES: u64 = 0x274;
+        pub const SUITEMASK: u64 = 0x2d0;
+        pub const NXSUPPORTPOLICY: u64 = 0x2d5;
+        pub const NUMBEROFPHYSICALPAGES: u64 = 0x2e8;
+        pub const QPCFREQUENCY: u64 = 0x300;
+        pub const SYSTEMCALL: u64 = 0x308;
+        pub const TICKCOUNT: u64 = 0x320;
+        pub const COOKIE: u64 = 0x330;
+        pub const ACTIVEPROCESSORCOUNT: u64 = 0x3c0;
+        pub const ACTIVEGROUPCOUNT: u64 = 0x3c4;
+        pub const XSTATE: u64 = 0x3d8;
+        pub const SIZEOF: u64 = 0x738;
+    }
     pub mod context {
         pub const SIZEOF: u64 = 0x4d0;
     }
@@ -405,6 +434,35 @@ pub mod x86 {
         pub const ACTIVEPROCESSORSAFFINITYMASK: u64 = 0x24;
         pub const NUMBEROFPROCESSORS: u64 = 0x28;
         pub const SIZEOF: u64 = 0x2c;
+    }
+    pub mod kuser_shared_data {
+        pub const TICKCOUNTLOWDEPRECATED: u64 = 0x0;
+        pub const TICKCOUNTMULTIPLIER: u64 = 0x4;
+        pub const INTERRUPTTIME: u64 = 0x8;
+        pub const SYSTEMTIME: u64 = 0x14;
+        pub const TIMEZONEBIAS: u64 = 0x20;
+        pub const IMAGENUMBERLOW: u64 = 0x2c;
+        pub const IMAGENUMBERHIGH: u64 = 0x2e;
+        pub const NTSYSTEMROOT: u64 = 0x30;
+        pub const LARGEPAGEMINIMUM: u64 = 0x244;
+        pub const NTBUILDNUMBER: u64 = 0x260;
+        pub const NTPRODUCTTYPE: u64 = 0x264;
+        pub const PRODUCTTYPEISVALID: u64 = 0x268;
+        pub const NATIVEPROCESSORARCHITECTURE: u64 = 0x26a;
+        pub const NTMAJORVERSION: u64 = 0x26c;
+        pub const NTMINORVERSION: u64 = 0x270;
+        pub const PROCESSORFEATURES: u64 = 0x274;
+        pub const SUITEMASK: u64 = 0x2d0;
+        pub const NXSUPPORTPOLICY: u64 = 0x2d5;
+        pub const NUMBEROFPHYSICALPAGES: u64 = 0x2e8;
+        pub const QPCFREQUENCY: u64 = 0x300;
+        pub const SYSTEMCALL: u64 = 0x308;
+        pub const TICKCOUNT: u64 = 0x320;
+        pub const COOKIE: u64 = 0x330;
+        pub const ACTIVEPROCESSORCOUNT: u64 = 0x3c0;
+        pub const ACTIVEGROUPCOUNT: u64 = 0x3c4;
+        pub const XSTATE: u64 = 0x3d8;
+        pub const SIZEOF: u64 = 0x738;
     }
     pub mod context {
         pub const SIZEOF: u64 = 0x2cc;
