@@ -284,3 +284,149 @@ fn regset_indices_are_a_bijection() {
     assert_eq!(s.iter().collect::<Vec<_>>(), vec![x(0), GuestReg::Sp, GuestReg::N]);
     assert_eq!(RegSet::ALL.len(), N_REGS);
 }
+
+fn same_run(a: &Function, b: &Function, call: &dyn Fn(Callee) -> CallEffect, sp: GuestReg) {
+    for seed in 0..32u64 {
+        let m = interp::Model {
+            call,
+            sp,
+            max_steps: 200,
+        };
+        let x = interp::run(a, seed, &m);
+        let y = interp::run(b, seed, &m);
+        assert!(!matches!(x.stop, interp::Stop::Unsupported(_)), "{:?}", x.stop);
+        assert_eq!(x, y, "seed {seed}:\n{}\n{}", text::print(a), text::print(b));
+    }
+}
+
+#[test]
+fn ssa_runs_like_memory_form() {
+    let keep = CallEffect {
+        preserved: RegSet::of(&[x(19), GuestReg::Sp]),
+        sp_delta: Some(0),
+    };
+    for f in [diamond(), call_loop()] {
+        for eff in [CallEffect::UNKNOWN, keep] {
+            let s = to_ssa(&f, &|_| eff);
+            same_run(&f, &s, &|_| eff, GuestReg::Sp);
+        }
+    }
+}
+
+/// x86-64 shape: `rsp` is X(4); a call pushes the return address and the
+/// callee pops it (`sp_delta` +8). The value spilled below the stack pointer
+/// is reloaded after the call through the computed stack pointer.
+fn x86_spill_around_call() -> Function {
+    let mut t = F::new(0x3000);
+    let b0 = t.block(0x3000);
+    let after = t.block(0x3010);
+    let sp = t.read(b0, x(4));
+    let m16 = t.def(b0, Expr::ConstI64(-16i64 as u64));
+    let frame = t.def(
+        b0,
+        Expr::Bin {
+            op: BinOp::Add,
+            ty: Ty::I64,
+            a: sp,
+            b: m16,
+        },
+    );
+    t.write(b0, x(4), frame);
+    let v = t.read(b0, x(3));
+    let pc = t.f.block(b0).start;
+    t.f.block_mut(b0).push(
+        pc,
+        Stmt::Store {
+            addr: frame,
+            offset: 8,
+            val: v,
+            sz: MemSz::B8,
+            order: Order::Relaxed,
+        },
+    );
+    let m8 = t.def(b0, Expr::ConstI64(-8i64 as u64));
+    let pushed = t.def(
+        b0,
+        Expr::Bin {
+            op: BinOp::Add,
+            ty: Ty::I64,
+            a: frame,
+            b: m8,
+        },
+    );
+    let ra = t.def(b0, Expr::ConstI64(0x3010));
+    t.f.block_mut(b0).push(
+        pc,
+        Stmt::Store {
+            addr: pushed,
+            offset: 0,
+            val: ra,
+            sz: MemSz::B8,
+            order: Order::Relaxed,
+        },
+    );
+    t.write(b0, x(4), pushed);
+    t.term(
+        b0,
+        FTerm::Call {
+            callee: Callee::Direct(0x9000),
+            ret_pc: 0x3010,
+            ret: Some(Edge::to(after)),
+        },
+    );
+    let sp2 = t.read(after, x(4));
+    let back = t.def(
+        after,
+        Expr::Load {
+            addr: sp2,
+            offset: 8,
+            sz: MemSz::B8,
+            signed: false,
+            ty: Ty::I64,
+            order: Order::Relaxed,
+        },
+    );
+    t.write(after, x(0), back);
+    let r = t.def(
+        after,
+        Expr::Load {
+            addr: sp2,
+            offset: 16,
+            sz: MemSz::B8,
+            signed: false,
+            ty: Ty::I64,
+            order: Order::Relaxed,
+        },
+    );
+    t.term(after, FTerm::Return { target: r });
+    t.f
+}
+
+#[test]
+fn ssa_carries_a_non_default_stack_pointer_across_calls() {
+    let f = x86_spill_around_call();
+    f.verify().unwrap();
+    let eff = CallEffect {
+        preserved: RegSet::EMPTY,
+        sp_delta: Some(8),
+    };
+    let s = ssa::to_ssa_sp(&f, &|_| eff, x(4));
+    s.verify().unwrap_or_else(|e| panic!("{e}\n{}", text::print(&s)));
+    roundtrip(&s);
+    // rsp is computed after the call, not re-read.
+    let after = s.block_at(0x3010).unwrap();
+    assert!(
+        !s.block(after)
+            .stmts
+            .iter()
+            .any(|st| matches!(st, Stmt::Def { expr: Expr::ReadReg(r), .. } if *r == x(4))),
+        "{}",
+        text::print(&s)
+    );
+    same_run(&f, &s, &|_| eff, x(4));
+    // With the AArch64 default, rsp is an ordinary register: re-read, and
+    // still equivalent.
+    let d = to_ssa(&f, &|_| eff);
+    d.verify().unwrap();
+    same_run(&f, &d, &|_| eff, x(4));
+}
