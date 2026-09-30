@@ -28,10 +28,13 @@
 //! `DYNAMIC_BASE` flag; see [`PeImage::relocatable`]) is refused, naming its
 //! preferred base.
 //!
-//! [`PeLayout::pack`] rebases every relocatable image into that low packing
-//! even when its preferred base would fit. Linear memory has to exist up to
-//! the highest touched address, so a DLL that prefers 0x6xxx_xxxx costs every
-//! process ~1.7 GiB; packing avoids that at the price of relocating.
+//! [`PeLayout::pack`] (the default) rebases every relocatable image into that
+//! low packing even when its preferred base would fit. Linear memory has to
+//! exist up to the highest touched address, so a DLL that prefers 0x6xxx_xxxx
+//! would cost every process ~1.7 GiB; packing avoids that at the price of
+//! relocating. It is also what the NT layer does when Wine's loader maps an
+//! image (docs/nt-layer.md §1.2), so the two agree. `pack: false` honours
+//! preferred bases that fit.
 //!
 //! # Placeholder imports
 //!
@@ -1349,7 +1352,7 @@ pub struct PeLayout {
     /// Ranges no image may overlap.
     pub reserved: Vec<(u64, u64)>,
     /// Rebase every relocatable image into the low packing, even when its
-    /// preferred base would fit.
+    /// preferred base would fit. On by default; see the module docs.
     pub pack: bool,
     /// Fixed bases by lower-case module name. A pinned image goes exactly
     /// there, the floor, ceiling and reserved ranges notwithstanding (only
@@ -1364,7 +1367,7 @@ impl Default for PeLayout {
             floor: gex_abi::EXEC_BASE,
             ceiling: gex_abi::MMAP_TOP,
             reserved: vec![(gex_abi::STACK_TOP - gex_abi::STACK_SIZE, gex_abi::STACK_TOP)],
-            pack: false,
+            pack: true,
             pins: BTreeMap::new(),
         }
     }

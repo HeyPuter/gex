@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod nt_run;
 mod pe_info;
 
 /// Where the dynamic linker is placed, well above a PIE executable so their
@@ -171,6 +172,8 @@ struct RunArgs {
     opts: RunOptions,
     xlate: Options,
     jit: bool,
+    /// A Windows program's staged Wine prefix. See `nt_run`.
+    wine_prefix: Option<String>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
@@ -183,6 +186,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut no_jit = false;
     let mut lazy = false;
     let mut argv0: Option<String> = None;
+    let mut wine_prefix: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -284,6 +288,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let v = args.get(i).context("--argv0 needs a name")?;
                 argv0 = Some(v.clone());
             }
+            "--wine-prefix" => {
+                i += 1;
+                wine_prefix = Some(args.get(i).context("--wine-prefix needs a directory")?.clone());
+            }
             "--env" => {
                 i += 1;
                 let v = args.get(i).context("--env needs an argument")?;
@@ -316,12 +324,21 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             ..Options::default()
         },
         jit: !no_jit,
+        wine_prefix,
     })
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: Wine's PE DLLs on gex's NT layer.
+        if ra.opts.record.is_some() {
+            bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
+        }
+        let exit = nt_run::run(&ra, &bytes)?;
+        return Ok(report_exit(&exit, ra.opts.verbose));
+    }
     // Resolved through the guest's namespace (the sysroot when given), so a
     // program links against its own root's libraries, not the host's.
     let sysroot = ra.opts.sysroot.clone();
@@ -363,8 +380,14 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
             eprintln!("[gex] profile and session manifest written to {}", dir.display());
         }
     }
-    match &exit {
-        Exit::Status(c) => Ok(ExitCode::from((*c & 0xff) as u8)),
+    Ok(report_exit(&exit, ra.opts.verbose))
+}
+
+/// The exit status a shell sees for a guest's exit, with a message when gex
+/// itself failed.
+fn report_exit(exit: &Exit, verbose: bool) -> ExitCode {
+    match exit {
+        Exit::Status(c) => ExitCode::from((*c & 0xff) as u8),
         Exit::Signal {
             signal,
             pc,
@@ -378,10 +401,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
                 // (the only way to stop a running guest), so say which side
                 // failed rather than let it read as "terminated by signal 11".
                 eprintln!("gexc: gex failed at guest pc=0x{pc:x}: {detail}");
-            } else if ra.opts.verbose {
+            } else if verbose {
                 eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
             }
-            Ok(ExitCode::from((exit.code() & 0xff) as u8))
+            ExitCode::from((exit.code() & 0xff) as u8)
         }
     }
 }

@@ -13,6 +13,7 @@ use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod gl;
 pub mod profile;
+pub mod nt;
 pub mod virgl;
 pub mod wayland;
 
@@ -204,6 +205,8 @@ struct HostState {
     store_limits: wasmtime::StoreLimits,
     /// This store's profile counters, when recording. See `profile`.
     prof: Option<profile::StoreProf>,
+    /// Set for a Windows process: every `syscall` is an NT call. See `nt`.
+    nt: Option<Arc<gex_kernel::nt::Process>>,
 }
 
 /// What a process-creating `clone` asked for.
@@ -259,6 +262,8 @@ struct SpawnContext {
     limits: gex_xlate::BlockLimits,
     /// Where this process's objects are, for naming profile counts.
     prof_proc: Option<Arc<profile::ProcProf>>,
+    /// The NT process, for a Windows program's threads. See `nt`.
+    nt: Option<Arc<gex_kernel::nt::Process>>,
 }
 
 /// Runtime translation state belonging to one store (PLAN §6.2, M3).
@@ -356,6 +361,8 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
         format!("{xlate:?}").into_bytes(),
+        // The same bytes mean different instructions in 32-bit mode.
+        vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
         // different symbol tables translate differently.
         (image.symbols.len() as u64).to_le_bytes().into(),
@@ -395,7 +402,7 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
-    run_program_with(program, opts, xlate, None)
+    run_program_with(program, opts, xlate, None, None)
 }
 
 /// What survives an `execve`: the kernel, the process table, and the host-side
@@ -415,8 +422,15 @@ fn run_program_with(
     opts: &RunOptions,
     xlate: &Options,
     inherited: Option<Inherited>,
+    nt_setup: Option<&nt::NtSetup>,
 ) -> Result<(Exit, Stats)> {
     let image = &program.exe;
+    // Before anything is translated: a 32-bit (i386) program's code is
+    // decoded in compatibility mode, and the kernel below speaks its ABI.
+    // One setting per host process -- the native runner keeps one translator
+    // for every guest process, so a mixed tree is not supported here (the
+    // browser has a shim per process).
+    gex_xlate::set_compat(program.compat());
 
     // A profile records where a previous run went, feeding `extra_entries` so
     // discovery reaches entry points static analysis cannot. It changes the
@@ -636,6 +650,12 @@ fn run_program_with(
         envp: opts.env.clone(),
         ..kernel
     };
+    // A 32-bit (i386) program: the kernel speaks its ABI and the translator
+    // decodes its code in compatibility mode, for this process and the ones
+    // it forks. One setting per host process: the native runner keeps one
+    // translator for every guest process, so a mixed tree is not supported
+    // here (the browser has a shim per process).
+    kernel.compat = program.compat();
     // Mounts survive an exec, so they are only established for a new process.
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
@@ -702,6 +722,7 @@ fn run_program_with(
             pending_exec: None,
             store_limits: store_limits(),
             prof: None,
+            nt: None,
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -768,18 +789,24 @@ fn run_program_with(
         });
     }
 
-    place_image(
-        &mut store,
-        memory.clone(),
-        program,
-        opts,
-        Identity {
-            uid,
-            gid,
-            interp_base: program.interp_base(),
-            entry_hook: 0,
-        },
-    )?;
+    let entry = match nt_setup {
+        Some(setup) => nt::boot(&mut store, memory.clone(), setup)?,
+        None => {
+            place_image(
+                &mut store,
+                memory.clone(),
+                program,
+                opts,
+                Identity {
+                    uid,
+                    gid,
+                    interp_base: program.interp_base(),
+                    entry_hook: 0,
+                },
+            )?;
+            program.entry()
+        }
+    };
 
     // Publish the image's page-directory entries, without which none of its
     // blocks are reachable through the table.
@@ -820,6 +847,7 @@ fn run_program_with(
         jit_shared: store.data().jit.as_ref().map(|j| Arc::clone(&j.shared)),
         limits: xlate.limits,
         prof_proc: prof_proc.clone(),
+        nt: store.data().nt.clone(),
     });
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
@@ -851,7 +879,7 @@ fn run_program_with(
         }
     }
 
-    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, program.entry())?;
+    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, entry)?;
     profile::harvest(&mut store)?;
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
@@ -1386,6 +1414,8 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         jit_shared: cx.jit_shared.clone(),
         limits: cx.limits,
         prof_proc: profile::fork_process(&cx.prof_proc),
+        // Windows has no fork: only a Linux process gets here.
+        nt: None,
     });
     let status = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
@@ -1426,8 +1456,12 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
             }
             // Through the table, so this process's own children -- if any are
-            // still running -- become init's rather than being lost.
-            procs.exit(pid, code);
+            // still running -- become init's rather than being lost. The table
+            // publishes into the same cell `wait4` collects from, so it gets
+            // the kernel's encoding: handing it `code` and correcting the cell
+            // afterwards let a parent parked in `wait4` read `exit 7` as a
+            // death by signal 7 ("Bus error") in between.
+            procs.exit(pid, wstatus);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
             done.notify_all();
@@ -1457,6 +1491,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             pending_exec: None,
             store_limits: store_limits(),
             prof: None,
+            nt: cx.nt.clone(),
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -1579,6 +1614,7 @@ fn exec_program(
             wayland,
             virgl,
         }),
+        None,
     )
 }
 
@@ -1603,6 +1639,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             pending_exec: None,
             store_limits: store_limits(),
             prof: None,
+            nt: cx.nt.clone(),
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -2280,6 +2317,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+            if caller.data().nt.is_some() {
+                return nt::syscall_import(&mut caller, pc as u64);
+            }
             // Every thread shares the dispatch directory (guest memory) but has
             // its own table, filled only when its own store installs a
             // translation. So a thread can be told to call slot N while its
@@ -2713,6 +2753,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let data = memory.bytes();
                 let mut gm = GuestMem::new(data);
                 gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, v as u64);
+            }
+            // An x87 transcendental or remainder, computed on the register
+            // stack in the context.
+            if reg == gex_kernel::x86::SYSREG_X87 {
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, v as u64);
             }
             Ok(())
         },

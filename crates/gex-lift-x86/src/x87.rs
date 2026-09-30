@@ -6,9 +6,8 @@
 //! format; a guest sees `long double` with 53 bits of mantissa. Loads and
 //! stores of the 80-bit memory format convert at the boundary.
 //!
-//! Transcendental instructions (`fsin`, `fyl2x`, …) have no wasm form and
-//! end the block with SIGILL; they are rare outside `libm`'s `long double`
-//! entry points.
+//! Transcendental and remainder instructions (`fsin`, `fyl2x`, `fprem`, …)
+//! have no wasm form; the host computes them (see [`crate::x87op`]).
 
 use crate::{Flow, Lifter, FlagSource};
 use gex_abi::ctx;
@@ -806,6 +805,11 @@ impl<'a> Lifter<'a> {
                 let r = self.b.select(c, b, a, Ty::I64);
                 self.st_st(0, r);
             }
+            // The transcendental and remainder instructions have no wasm
+            // form: the host computes them on the register stack in the
+            // context (`gex_kernel::x86::serve_x87`), pushes and pops
+            // included. i386 musl's libm is built on them (`atan2`, `log`,
+            // `exp`, `fmod`, `remquo` are x87 assembly there).
             Op::F2xm1
             | Op::Fyl2x
             | Op::Fptan
@@ -816,9 +820,29 @@ impl<'a> Lifter<'a> {
             | Op::Fyl2xp1
             | Op::Fsincos
             | Op::Fsin
-            | Op::Fcos
-            | Op::Frstor
-            | Op::Fnsave => return self.illegal_x87(),
+            | Op::Fcos => {
+                let op = match i.op {
+                    Op::F2xm1 => crate::x87op::F2XM1,
+                    Op::Fyl2x => crate::x87op::FYL2X,
+                    Op::Fptan => crate::x87op::FPTAN,
+                    Op::Fpatan => crate::x87op::FPATAN,
+                    Op::Fxtract => crate::x87op::FXTRACT,
+                    Op::Fprem1 => crate::x87op::FPREM1,
+                    Op::Fprem => crate::x87op::FPREM,
+                    Op::Fyl2xp1 => crate::x87op::FYL2XP1,
+                    Op::Fsincos => crate::x87op::FSINCOS,
+                    Op::Fsin => crate::x87op::FSIN,
+                    _ => crate::x87op::FCOS,
+                };
+                let pcv = self.k64(self.pc);
+                let id = self.k32(crate::sysreg::X87 as u32);
+                let v = self.k64(op);
+                self.b.stmt(Stmt::HostCall {
+                    func: HostFunc::SysRegWrite,
+                    args: vec![pcv, id, v],
+                });
+            }
+            Op::Frstor | Op::Fnsave => return self.illegal_x87(),
             // The x87 environment, 28 bytes in the 32-bit protected-mode
             // layout glibc's fenv.h expects: control word, status word, tag
             // word, then the instruction/operand pointers (stored as zero, as

@@ -18,6 +18,7 @@ pub mod fs;
 pub mod futex;
 pub mod mem;
 pub mod net;
+pub mod nt;
 pub mod pipe;
 pub mod proc;
 pub mod pty;
@@ -29,6 +30,7 @@ pub mod tty;
 pub mod vfs;
 pub mod unix;
 pub mod x86;
+pub mod i386;
 
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};
@@ -138,6 +140,24 @@ impl<'a> GuestMem<'a> {
         Ok(())
     }
 
+    /// As [`Self::zero`], writing only the 4 KiB pages that are not zero
+    /// already. For fresh anonymous memory: reading a page the host never
+    /// touched costs no memory, writing it commits it, so a large
+    /// reservation zeroed with `zero` cost its whole size in resident memory
+    /// (a 1 GiB `PROT_NONE` mmap took ~1 GiB of RSS natively).
+    pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
+        let r = self.range(addr, len)?;
+        for page in self.view_mut()[r].chunks_mut(4096) {
+            // OR-folded 64 bytes at a time, which vectorises: this scan is
+            // the whole cost for the common case of a clean page.
+            let clean = page.chunks(64).all(|c| c.iter().fold(0u8, |a, &b| a | b) == 0);
+            if !clean {
+                page.fill(0);
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_u64(&self, addr: u64) -> Result<u64, Errno> {
         let b = self.read(addr, 8)?;
         Ok(u64::from_le_bytes(b.try_into().unwrap()))
@@ -172,5 +192,32 @@ impl<'a> GuestMem<'a> {
             Some(n) => Ok(slice[..n].to_vec()),
             None => Err(Errno::ENAMETOOLONG),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every byte of the range reads as zero afterwards, whichever pages were
+    /// dirty, including a range that starts and ends mid-page.
+    #[test]
+    fn zero_dirty_zeroes_what_was_written() {
+        let mut buf = vec![0u8; 0x6000];
+        buf[0x1000] = 1;
+        buf[0x2fff] = 2;
+        buf[0x3800] = 3;
+        buf[0x5fff] = 4;
+        let mut m = GuestMem::new(&mut buf);
+        m.zero_dirty(0x1000, 0x4000).unwrap();
+        assert!(m.read(0x1000, 0x4000).unwrap().iter().all(|&b| b == 0));
+        // Outside the range is left alone.
+        assert_eq!(m.read(0x5fff, 1).unwrap()[0], 4);
+        let mut buf = vec![7u8; 0x3000];
+        let mut m = GuestMem::new(&mut buf);
+        m.zero_dirty(0x800, 0x1000).unwrap();
+        let b = m.read(0, 0x3000).unwrap();
+        assert!(b[0x800..0x1800].iter().all(|&x| x == 0));
+        assert!(b[..0x800].iter().chain(&b[0x1800..]).all(|&x| x == 7));
     }
 }
