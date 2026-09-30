@@ -96,19 +96,23 @@ pub fn get_winproc(u: &User, proc_: u64, ansi: bool) -> u64 {
 /// entries are 64-bit on every ABI.
 pub fn nt_user_initialize_client_pfn_arrays(c: &mut Call<'_>) -> R64 {
     let (pa, pw, workers, module) = (c.a(0), c.a(1), c.a(2), c.a(3));
+    let ps = c.p.abi.ptr_size() as u64;
     let mut procs = vec![(0u64, 0u64); NB_PROCS];
     for (i, p) in procs.iter_mut().enumerate() {
-        *p = (c.g.u64(pa + 8 * i as u64)?, c.g.u64(pw + 8 * i as u64)?);
+        *p = (c.g.ptr(pa + ps * i as u64)?, c.g.ptr(pw + ps * i as u64)?);
     }
     let mut w = [0u64; NB_WORKERS];
     for (i, v) in w.iter_mut().enumerate() {
-        *v = c.g.u64(workers + 8 * i as u64)?;
+        *v = c.g.ptr(workers + ps * i as u64)?;
     }
     let mut u = c.p.user.lock().unwrap();
     u.winprocs[..NB_PROCS].copy_from_slice(&procs);
     u.workers = w;
     u.user32 = module;
     u.initialized = true;
+    drop(u);
+    // win32u's init_user sets up GDI here too (gdi_init).
+    crate::nt::gdi::ensure_init(c)?;
     Ok(0)
 }
 

@@ -19,6 +19,7 @@
 
 pub mod boot;
 pub mod file;
+pub mod gdi;
 pub mod layout;
 pub mod object;
 pub mod reg;
@@ -376,6 +377,8 @@ pub struct Process {
     pub keyed: Mutex<sync::Keyed>,
     /// USER: windows, classes, message queues (win32u).
     pub user: Mutex<user::User>,
+    /// GDI: objects, DCs and the shared handle table (win32u).
+    pub gdi: Mutex<gdi::Gdi>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
@@ -440,6 +443,7 @@ impl Process {
             atoms: Mutex::new(Default::default()),
             keyed: Mutex::new(Default::default()),
             user: Mutex::new(user::User::new()),
+            gdi: Mutex::new(Default::default()),
             kill_list: Mutex::new(Vec::new()),
         }
     }

@@ -441,6 +441,7 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtUserSetMessageExtraInfo => message::nt_user_set_message_extra_info(c),
         n::NtUserReplyMessage => message::nt_user_reply_message(c),
         n::NtUserNotifyWinEvent => Ok(0),
+        nr if super::syscall_name(nr).starts_with("NtGdi") => super::gdi::dispatch(c),
         nr => Err(c.unimplemented(&format!("win32u {} ({nr:#x})", super::syscall_name(nr)))),
     }
 }

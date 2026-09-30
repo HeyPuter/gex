@@ -473,6 +473,29 @@ pub fn map_readonly_copy(c: &mut Call<'_>, data: &[u8], name: &str) -> R<u64> {
     Ok(base)
 }
 
+/// A committed read-write private region from the NT allocator, for memory
+/// win32u hands the program (GDI's shared table, DC_ATTRs, bitmap bits).
+pub fn alloc_private(c: &mut Call<'_>, size: u64, name: &str) -> R<u64> {
+    use super::vm::{self, page_prot, Kind};
+    let size = (size.max(1) + vm::PAGE - 1) & !(vm::PAGE - 1);
+    let limit = if c.p.abi == super::Abi::P32 { 0x8000_0000 } else { vm::ALLOC_HIGH };
+    let base = {
+        let mut stl = c.p.st.lock().unwrap();
+        let b = stl.vm.find_free((size + vm::GRANULE - 1) & !(vm::GRANULE - 1), false, limit)
+            .ok_or(Status(st::NO_MEMORY))?;
+        stl.vm.reserve(b, size, page_prot::READWRITE, true, Kind::Private, name);
+        b
+    };
+    vm::after_change(c, base, base + size, &[(base, base + size)])?;
+    Ok(base)
+}
+
+/// Release a region from `alloc_private`.
+pub fn free_private(c: &mut Call<'_>, base: u64) -> R<()> {
+    let r = c.p.st.lock().unwrap().vm.remove(base).ok_or(Status(st::MEMORY_NOT_ALLOCATED))?;
+    super::vm::after_change(c, r.base, r.end(), &[])
+}
+
 /// `NtInitializeNlsFiles(*ptr, *lcid, *size)`: `locale.nls`.
 pub fn nt_initialize_nls_files(c: &mut Call<'_>) -> R {
     let (pp, lp, sp) = (c.a(0), c.a(1), c.a(2));
