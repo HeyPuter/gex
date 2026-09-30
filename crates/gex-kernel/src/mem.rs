@@ -348,6 +348,17 @@ impl MemoryMap {
         }
         let grew = (new > self.brk_cur).then_some((self.brk_cur, new));
         if let Some((from, to)) = grew {
+            // Linux will not grow the break into an existing mapping: it
+            // leaves the break where it was and returns it, and libc's
+            // allocator falls back to mmap. Without this the break grows
+            // straight over an mmap and a heap object aliases whatever was
+            // mapped there (Wine reserves address space just above the heap).
+            // The heap's own records are not in the way: a shrink leaves the
+            // pages above the break recorded, and growing back over them is
+            // what the break is for.
+            if self.vmas.iter().any(|v| v.start < to && v.end > from && v.name != "[heap]") {
+                return (self.brk_cur, None);
+            }
             self.insert(from, to, prot::READ | prot::WRITE, "[heap]");
         }
         self.brk_cur = new;
@@ -691,6 +702,22 @@ mod tests {
         assert_eq!(m.brk(0x40_1000), 0x40_1000);
         // Below the start is refused, reported as "no change".
         assert_eq!(m.brk(0x10), 0x40_1000);
+    }
+
+    /// The break stops at a mapping, as on Linux, but not at its own pages: a
+    /// shrink leaves them recorded and growing back over them must work
+    /// (glibc trims the heap top and grows it again all the time).
+    #[test]
+    fn brk_stops_at_a_mapping_but_not_at_its_own_heap() {
+        let mut m = MemoryMap::new(0x40_1000);
+        assert_eq!(m.brk(0x40_3000), 0x40_3000);
+        assert_eq!(m.brk(0x40_1000), 0x40_1000);
+        assert_eq!(m.brk(0x40_4000), 0x40_4000, "regrowing over the trimmed heap");
+        m.mmap(0x40_6000, 0x1000, prot::READ, flags::FIXED | flags::ANONYMOUS, "reserved")
+            .unwrap();
+        assert_eq!(m.brk(0x40_8000), 0x40_4000, "the break must not grow over a mapping");
+        assert_eq!(m.brk(0), 0x40_4000);
+        assert_eq!(m.brk(0x40_6000), 0x40_6000, "up to the mapping is fine");
     }
 
     #[test]
