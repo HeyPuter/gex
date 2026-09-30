@@ -72,6 +72,11 @@ enum Patch {
 struct Case {
     name: String,
     exe: PathBuf,
+    /// Run pewasm's loader (`load_modules` and `prepare_images`) directly
+    /// instead of `pewasm.py`, which would go on to lift the whole program:
+    /// for the large real programs named in `GEX_PEWASM_EXTRA`. The exe is
+    /// used where it is, unpatched.
+    direct: bool,
     patch: Patch,
     extra: Vec<PathBuf>,
     /// Both loaders must refuse it; pewasm's message contains this.
@@ -92,6 +97,7 @@ fn cases() -> Vec<Case> {
             let mut c = Case {
                 name: format!("{arch}-{stem}"),
                 exe: exe.clone(),
+                direct: false,
                 patch: Patch::None,
                 extra: Vec::new(),
                 expect_failure: None,
@@ -105,6 +111,18 @@ fn cases() -> Vec<Case> {
             }
             out.push(c);
         }
+    }
+    // Real programs, when asked for: `GEX_PEWASM_EXTRA=/path/a.exe:/path/b.exe`.
+    for p in std::env::var("GEX_PEWASM_EXTRA").unwrap_or_default().split(':').filter(|p| !p.is_empty()) {
+        let exe = PathBuf::from(p);
+        out.push(Case {
+            name: format!("extra-{}", exe.file_stem().unwrap().to_string_lossy()),
+            exe,
+            direct: true,
+            patch: Patch::None,
+            extra: Vec::new(),
+            expect_failure: None,
+        });
     }
     out
 }
@@ -133,6 +151,24 @@ fn hex(v: &Value) -> u64 {
 fn compare(pewasm: &Path, work: &Path, case: &Case) -> Vec<String> {
     let mut diffs = Vec::new();
     let dir = work.join(&case.name);
+    if case.direct {
+        let out = dir.join("pewasm");
+        std::fs::create_dir_all(out.join("images")).unwrap();
+        let script = format!(
+            "import sys, pathlib\nsys.path[:0] = [{pw:?}, {tools:?}]\nimport pewasm as P\n\
+             mods = P.load_modules(pathlib.Path({exe:?}).resolve(), [])\n\
+             P.prepare_images(mods, pathlib.Path({out:?}), 64, 8)\n",
+            pw = pewasm.to_string_lossy(),
+            tools = pewasm.join("tools").to_string_lossy(),
+            exe = case.exe.to_string_lossy(),
+            out = out.to_string_lossy(),
+        );
+        let r = Command::new(pewasm.join(".venv/bin/python")).args(["-c", &script]).output().unwrap();
+        if !r.status.success() {
+            return vec![format!("pewasm's loader failed: {}", String::from_utf8_lossy(&r.stderr))];
+        }
+        return compare_output(case, &case.exe, &out, None, PeOptions::default());
+    }
     let input = dir.join("in");
     std::fs::create_dir_all(&input).unwrap();
     // The exe's directory is searched for DLLs, so bring the DLLs along.
@@ -157,7 +193,7 @@ fn compare(pewasm: &Path, work: &Path, case: &Case) -> Vec<String> {
     let r = cmd.output().unwrap();
     let stderr = String::from_utf8_lossy(&r.stderr).into_owned();
 
-    let mut opts = PeOptions {
+    let opts = PeOptions {
         extra_dlls: extra.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         ..Default::default()
     };
@@ -170,6 +206,19 @@ fn compare(pewasm: &Path, work: &Path, case: &Case) -> Vec<String> {
         }
         return diffs;
     }
+    compare_output(case, &exe, &out, Some(&r), opts)
+}
+
+/// Compares pewasm's output directory with gex's load of `exe`. `run` is the
+/// `pewasm.py` process, when there was one.
+fn compare_output(
+    case: &Case,
+    exe: &Path,
+    out: &Path,
+    run: Option<&std::process::Output>,
+    mut opts: PeOptions,
+) -> Vec<String> {
+    let mut diffs = Vec::new();
     // pewasm writes images/module*.json once loading and placement are done,
     // before lifting and runtime generation. A failure after that point is
     // not about loading: it is reported as a note, and the images compared.
@@ -178,13 +227,14 @@ fn compare(pewasm: &Path, work: &Path, case: &Case) -> Vec<String> {
         .take_while(|p| p.exists())
         .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
         .collect();
-    if !r.status.success() {
+    let stderr = run.map(|r| String::from_utf8_lossy(&r.stderr).into_owned()).unwrap_or_default();
+    if run.is_some_and(|r| !r.status.success()) {
         if metas.is_empty() || stderr.contains("PEWASM:") {
             return vec![format!("pewasm failed: {stderr}")];
         }
         let last = stderr.lines().last().unwrap_or("");
         eprintln!("{}: note: pewasm failed after writing its images ({last}); comparing those", case.name);
-    } else {
+    } else if run.is_some() {
         // The report's module list must agree with the images.
         let project: Value = serde_json::from_slice(&std::fs::read(out.join("project.json")).unwrap()).unwrap();
         let listed: Vec<(String, u64)> = project["modules"]
