@@ -23,11 +23,18 @@ pub const BUILD_FILE: &str = "build/build.json";
 const FORMAT: &str = "gex-eject-build";
 const VERSION: u64 = 1;
 
-/// One translated program image.
+/// One translated module: a program image, or a part of a dynamic
+/// program's closure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuiltImage {
-    /// `gex_native::aot::image_identity` of the loaded image.
+    /// `image`: a program's own module, looked up by `identity`. `shared`: a
+    /// module of the closure of the program whose identity is `identity`
+    /// (its interpreter or a library), installed before it starts.
+    pub kind: String,
+    /// `gex_native::aot::image_identity` of the program's loaded image.
     pub identity: String,
+    /// Where the object is placed: its load bias.
+    pub base: u64,
     /// Relative to the project.
     pub module: String,
     /// The object it was built from.
@@ -59,6 +66,8 @@ pub struct BuildManifest {
     pub inputs: String,
     pub images: Vec<BuiltImage>,
     pub replacements: Vec<BuiltReplacement>,
+    /// Where each library must be placed, by guest path: `RunOptions::pins`.
+    pub pins: Vec<(String, u64)>,
 }
 
 /// The hash of everything a build is made from that a user can change
@@ -96,7 +105,9 @@ impl BuildManifest {
                         .iter()
                         .map(|i| {
                             obj(vec![
+                                ("kind", json::s(&i.kind)),
                                 ("identity", json::s(&i.identity)),
+                                ("base", json::s(format!("{:#x}", i.base))),
                                 ("module", json::s(&i.module)),
                                 ("object", json::s(&i.object)),
                                 ("path", json::s(&i.path)),
@@ -127,6 +138,15 @@ impl BuildManifest {
                         .collect(),
                 ),
             ),
+            (
+                "pins",
+                Json::Arr(
+                    self.pins
+                        .iter()
+                        .map(|(p, b)| obj(vec![("path", json::s(p)), ("base", json::s(format!("{b:#x}")))]))
+                        .collect(),
+                ),
+            ),
         ]))
     }
 
@@ -145,10 +165,16 @@ impl BuildManifest {
         let num = |x: &Json, k: &str| -> Result<u64> {
             field(x, k, what)?.as_u64().ok_or_else(|| anyhow!("{what}: \"{k}\" is not a number"))
         };
+        let hex = |x: &Json, k: &str| -> Result<u64> {
+            let v = str_field(x, k, what)?;
+            u64::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|_| anyhow!("{what}: bad {k} {v}"))
+        };
         let mut images = Vec::new();
         for i in arr("images")? {
             images.push(BuiltImage {
+                kind: str_field(&i, "kind", what)?,
                 identity: str_field(&i, "identity", what)?,
+                base: hex(&i, "base")?,
                 module: str_field(&i, "module", what)?,
                 object: str_field(&i, "object", what)?,
                 path: str_field(&i, "path", what)?,
@@ -158,7 +184,6 @@ impl BuildManifest {
         }
         let mut replacements = Vec::new();
         for r in arr("replacements")? {
-            let addr = str_field(&r, "addr", what)?;
             replacements.push(BuiltReplacement {
                 id: num(&r, "id")? as u32,
                 module: str_field(&r, "module", what)?,
@@ -166,15 +191,19 @@ impl BuildManifest {
                 abi: Abi::parse(&str_field(&r, "abi", what)?).ok_or_else(|| anyhow!("{what}: bad abi"))?,
                 object: str_field(&r, "object", what)?,
                 symbol: str_field(&r, "symbol", what)?,
-                addr: u64::from_str_radix(addr.trim_start_matches("0x"), 16)
-                    .map_err(|_| anyhow!("{what}: bad addr {addr}"))?,
+                addr: hex(&r, "addr")?,
                 sig: str_field(&r, "sig", what)?,
             });
+        }
+        let mut pins = Vec::new();
+        for p in arr("pins")? {
+            pins.push((str_field(&p, "path", what)?, hex(&p, "base")?));
         }
         Ok(BuildManifest {
             inputs: str_field(&v, "inputs", what)?,
             images,
             replacements,
+            pins,
         })
     }
 
@@ -237,11 +266,43 @@ fn find_object<'a>(project: &'a Project, name: &str) -> Result<&'a Object> {
     }
 }
 
-/// Load an object as the runtime will: an executable at `PIE_BASE`.
-fn load_image(dir: &Path, o: &Object) -> Result<gex_ld::Image> {
-    let p = dir.join(rootfs_rel(&o.path)?);
-    let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
-    gex_ld::elf::load(&bytes, gex_abi::PIE_BASE).map_err(|e| anyhow!("loading {}: {e:?}", o.path))
+/// An object loaded where the run will place it.
+struct Placed {
+    obj: Object,
+    image: gex_ld::Image,
+}
+
+/// Place every object as the run will: executables at `PIE_BASE` (gex's
+/// loader), the interpreter at `INTERP_BASE` (likewise), and libraries up
+/// from `MMAP_BOTTOM` in the session's order, each at a base the run pins
+/// with `RunOptions::pins`. The same rule as `gexc build --closure`.
+fn layout(dir: &Path, project: &Project) -> Result<Vec<Placed>> {
+    const SLACK: u64 = 0x10000;
+    let mut next = gex_abi::MMAP_BOTTOM;
+    let mut out = Vec::new();
+    for o in &project.objects {
+        let p = dir.join(rootfs_rel(&o.path)?);
+        let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+        let load = |base: u64| gex_ld::elf::load(&bytes, base).map_err(|e| anyhow!("loading {}: {e:?}", o.path));
+        let image = match o.role.as_str() {
+            "exe" => load(gex_abi::PIE_BASE)?,
+            "interp" => load(gex_abi::INTERP_BASE)?,
+            "library" => {
+                // Measured by loading it once at the bottom (not at zero,
+                // which gex-ld refuses as the runtime's region).
+                let span = load(gex_abi::MMAP_BOTTOM)?.brk - gex_abi::MMAP_BOTTOM;
+                let base = (next + SLACK - 1) & !(SLACK - 1);
+                next = base + ((span + SLACK - 1) & !(SLACK - 1)) + SLACK;
+                if next > gex_abi::PLACE_TOP {
+                    bail!("the closure does not fit below {:#x}", gex_abi::PLACE_TOP);
+                }
+                load(base)?
+            }
+            r => bail!("{}: unknown object role {r:?}", o.path),
+        };
+        out.push(Placed { obj: o.clone(), image });
+    }
+    Ok(out)
 }
 
 /// Resolve and check every replacement. Returns them numbered, and the
@@ -249,6 +310,7 @@ fn load_image(dir: &Path, o: &Object) -> Result<gex_ld::Image> {
 fn bind_replacements(
     dir: &Path,
     project: &Project,
+    placed: &[Placed],
     config: &Config,
 ) -> Result<(Vec<BuiltReplacement>, HashMap<String, HashMap<u64, Intrinsic>>)> {
     let mut out = Vec::new();
@@ -266,16 +328,17 @@ fn bind_replacements(
                 o.id
             );
         }
-        if o.role != "exe" {
-            bail!("{what}: {} is a {}; eject v0 replaces functions in executables only", o.path, o.role);
-        }
-        let image = load_image(dir, o)?;
+        let image = &placed
+            .iter()
+            .find(|p| p.obj.path == o.path)
+            .ok_or_else(|| anyhow!("internal: {} was not placed", o.path))?
+            .image;
         let (tlo, thi) = image.text_range;
         let mut addrs: Vec<u64> = image
             .symbols
             .iter()
             .filter(|s| s.name == *symbol && !s.ifunc)
-            .map(|s| s.value.wrapping_add(image.bias))
+            .map(|s| s.value)
             .filter(|a| *a >= tlo && *a < thi)
             .collect();
         addrs.sort_unstable();
@@ -359,16 +422,6 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     }
     let (config, _) = Config::load(dir)?;
     verify_rootfs(dir, &project)?;
-    if let Some(o) = project.objects.iter().find(|o| o.role != "exe") {
-        bail!(
-            "{} is dynamically linked ({} is its {}): eject v0 builds statically linked \
-             programs only",
-            project.program.exe,
-            o.path,
-            o.role
-        );
-    }
-
     // What the session ran, per object, to seed discovery with.
     let profile = match std::fs::read_to_string(dir.join("session/profile.json")) {
         Ok(t) => Some(gex_xlate::profile::Profile::from_json(&t).map_err(|e| anyhow!("session/profile.json: {e}"))?),
@@ -376,7 +429,8 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         Err(e) => return Err(anyhow!("reading session/profile.json: {e}")),
     };
 
-    let (replacements, mut replaced) = bind_replacements(dir, &project, &config)?;
+    let placed = layout(dir, &project)?;
+    let (replacements, mut replaced) = bind_replacements(dir, &project, &placed, &config)?;
 
     let out = dir.join("build");
     let modules_dir = out.join("modules");
@@ -388,16 +442,14 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     let _ = std::fs::remove_file(dir.join(BUILD_FILE));
     std::fs::create_dir_all(&modules_dir).with_context(|| format!("creating {}", modules_dir.display()))?;
 
-    let mut report = BuildReport::default();
-    for o in project.objects.iter().filter(|o| o.role == "exe") {
-        let image = load_image(dir, o)?;
-        gex_xlate::set_compat(image.class32);
-        // gex's own library intrinsics, as a closure build and the runtime
-        // translator use them, then the user's replacements over them.
-        let (tlo, thi) = image.text_range;
-        let mut intrinsics: HashMap<u64, Intrinsic> = HashMap::new();
-        for s in &image.symbols {
-            let a = s.value.wrapping_add(image.bias);
+    // gex's own library intrinsics (the `mem*` functions), by placed address
+    // over the whole closure since a call resolves to another object's
+    // definition, as a closure build and the runtime translator use them.
+    let mut intrinsics: HashMap<u64, Intrinsic> = HashMap::new();
+    for p in &placed {
+        let (tlo, thi) = p.image.text_range;
+        for s in &p.image.symbols {
+            let a = s.value; // gex-ld biases symbol values
             if s.ifunc || a < tlo || a >= thi {
                 continue;
             }
@@ -405,10 +457,44 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                 intrinsics.insert(a, k);
             }
         }
-        intrinsics.extend(replaced.remove(&o.id).unwrap_or_default());
+    }
+    // Then the user's replacements over them.
+    for m in replaced.drain().map(|(_, m)| m) {
+        intrinsics.extend(m);
+    }
+
+    // The program's closure is numbered as one: its image owns the memory and
+    // tables, and every other object's slots continue where the last one's
+    // stopped. Other executables (programs the session exec'd) are images of
+    // their own.
+    let main = placed
+        .iter()
+        .position(|p| p.obj.path == project.program.exe && p.obj.role == "exe")
+        .ok_or_else(|| anyhow!("the project's program {} is not among its objects", project.program.exe))?;
+    let mut order: Vec<usize> = vec![main];
+    order.extend((0..placed.len()).filter(|&i| i != main && placed[i].obj.role != "exe"));
+    let others: Vec<usize> = (0..placed.len()).filter(|&i| i != main && placed[i].obj.role == "exe").collect();
+    let main_identity = gex_native::aot::image_identity(&placed[main].image);
+
+    let mut report = BuildReport::default();
+    let mut pins = Vec::new();
+    let mut first_slot = 0u64;
+    for (n, &i) in order.iter().chain(others.iter()).enumerate() {
+        let p = &placed[i];
+        let o = &p.obj;
+        let in_closure = n < order.len();
+        let own = n == 0 || !in_closure;
+        let mut image = p.image.clone();
+        gex_xlate::set_compat(image.class32);
+        if !own {
+            // Apply its own RELATIVE relocations first, so the pointer scan
+            // follows them into the code they name (as `gexc build --closure`).
+            gex_ld::elf::apply_own_relative(&mut image);
+        }
+        let (tlo, thi) = image.text_range;
         let seeds: Vec<u64> = profile
             .as_ref()
-            .and_then(|p| p.objects.get(&o.id))
+            .and_then(|pr| pr.objects.get(&o.id))
             .map(|op| {
                 op.blocks
                     .keys()
@@ -417,32 +503,60 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                     .collect()
             })
             .unwrap_or_default();
+        // `profile`: the reached blocks and their pages, and nothing followed
+        // off them onto fresh pages (the profile-guided closure build's
+        // rule). `static` adds discovery from the symbols and the data.
+        // A session recorded without a profile says nothing about what ran:
+        // then `profile` is `static`.
+        let profile_only = config.coverage == Coverage::Profile && profile.is_some();
         let opts = Options {
             exhaustive: config.coverage == Coverage::Exhaustive,
+            lazy: profile_only,
+            scan_pointers: !profile_only,
+            seeds_only: profile_only,
             extra_entries: seeds,
-            complete_pages: config.coverage == Coverage::Profile,
-            intrinsics,
+            complete_pages: config.coverage != Coverage::Exhaustive,
+            intrinsics: intrinsics
+                .iter()
+                .filter(|(a, _)| **a >= tlo && **a < thi)
+                .map(|(a, k)| (*a, *k))
+                .collect(),
             shared_memory: true,
+            linkage: if own { gex_xlate::Linkage::Own } else { gex_xlate::Linkage::Shared },
+            first_slot: if own { 0 } else { first_slot },
             ..Options::default()
         };
-        let (module, stats) = gex_xlate::translate_image(&image, &opts);
-        gex_native::validate_module(&module.wasm).with_context(|| format!("the translation of {} is not valid wasm", o.path))?;
+        let (modules, stats) = gex_xlate::translate_image_split(&image, &opts, gex_xlate::MAX_FUNCS_PER_MODULE);
+        if in_closure {
+            first_slot = modules.last().map_or(first_slot, |m| m.metadata().next_slot);
+        }
         let name = o.path.rsplit('/').next().unwrap_or("image");
         let hex = o.id.trim_start_matches("sha256:");
-        let rel = format!("build/modules/{name}-{}.wasm", &hex[..12.min(hex.len())]);
-        std::fs::write(dir.join(&rel), &module.wasm).with_context(|| format!("writing {rel}"))?;
+        let identity = if in_closure { main_identity.clone() } else { gex_native::aot::image_identity(&image) };
+        for (part, module) in modules.iter().enumerate() {
+            gex_native::validate_module(&module.wasm)
+                .with_context(|| format!("the translation of {} is not valid wasm", o.path))?;
+            let rel = if modules.len() == 1 {
+                format!("build/modules/{name}-{}.wasm", &hex[..12.min(hex.len())])
+            } else {
+                format!("build/modules/{name}-{}.p{part}.wasm", &hex[..12.min(hex.len())])
+            };
+            std::fs::write(dir.join(&rel), &module.wasm).with_context(|| format!("writing {rel}"))?;
+            report.images.push(BuiltImage {
+                kind: if own { "image" } else { "shared" }.to_string(),
+                identity: identity.clone(),
+                base: image.bias,
+                module: rel,
+                object: o.id.clone(),
+                path: o.path.clone(),
+                blocks: if part == 0 { stats.blocks as u64 } else { 0 },
+                bytes: module.wasm.len() as u64,
+            });
+        }
         report.illegal_blocks += stats.illegal_blocks;
-        report.images.push(BuiltImage {
-            identity: gex_native::aot::image_identity(&image),
-            module: rel,
-            object: o.id.clone(),
-            path: o.path.clone(),
-            blocks: stats.blocks as u64,
-            bytes: module.wasm.len() as u64,
-        });
-    }
-    if !replaced.is_empty() {
-        bail!("internal: replacements bound to objects that were not built");
+        if o.role == "library" {
+            pins.push((o.path.clone(), image.bias));
+        }
     }
 
     // The guest's filesystem: what the session read, then the user's files.
@@ -459,6 +573,7 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         inputs: inputs_id(dir, &modules)?,
         images: report.images.clone(),
         replacements: replacements.clone(),
+        pins,
     };
     std::fs::write(dir.join(BUILD_FILE), manifest.to_json()).with_context(|| format!("writing {BUILD_FILE}"))?;
     report.replacements = replacements;

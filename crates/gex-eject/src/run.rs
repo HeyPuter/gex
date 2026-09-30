@@ -24,7 +24,11 @@ pub struct RunFlags {
 pub fn aot(dir: &Path, manifest: &BuildManifest) -> Aot {
     let mut aot = Aot::new(format!("the ejected project {}", dir.display()));
     for i in &manifest.images {
-        aot.images.insert(i.identity.clone(), dir.join(&i.module));
+        if i.kind == "shared" {
+            aot.shared.entry(i.identity.clone()).or_default().push(dir.join(&i.module));
+        } else {
+            aot.images.insert(i.identity.clone(), dir.join(&i.module));
+        }
     }
     let mut modules: Vec<String> = Vec::new();
     for r in &manifest.replacements {
@@ -105,6 +109,9 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
         cwd: project.program.cwd.clone(),
         jit: flags.jit_fallback,
         aot: Some(Arc::clone(&aot)),
+        // A dynamic program's libraries go where their modules were built for.
+        pins: manifest.pins.iter().cloned().collect(),
+        report_pins: flags.verbose,
         ..RunOptions::default()
     };
     let (exit, _) = gex_native::run_program(&program, &opts, &gex_xlate::Options::default())?;

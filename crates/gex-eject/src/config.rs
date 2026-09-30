@@ -13,9 +13,13 @@ pub const USER_WASM: &str = "build/user.wasm";
 /// How much of each object the build translates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coverage {
-    /// What discovery finds from the symbols and data, plus every block the
-    /// recorded session ran, with every page they touch made whole.
+    /// Every block the recorded session ran, with every page they touch made
+    /// whole: exactly what was seen. An object the session never ran code in
+    /// gets its entry point only.
     Profile,
+    /// [`Coverage::Profile`], plus what discovery finds from the symbol table
+    /// and the data. Bigger, and it covers paths other inputs take.
+    Static,
     /// Every decodable address. Bigger; nothing static can be missed.
     Exhaustive,
 }
@@ -64,7 +68,7 @@ pub fn template() -> String {
                 "Your settings; gexc eject never rewrites this file. \"replace\" lists guest \
                  functions served by your wasm (see docs/eject.md), e.g. {\"object\": \"prog\", \
                  \"sha256\": \"sha256:...\", \"symbol\": \"strlen\", \"export\": \"my_strlen\", \
-                 \"abi\": \"c\"}. \"coverage\" is \"profile\" or \"exhaustive\". \"args\" \
+                 \"abi\": \"c\"}. \"coverage\" is \"profile\" (what the session ran), \"static\" (and what discovery finds) or \"exhaustive\". \"args\" \
                  replaces the recorded arguments.",
             ),
         ),
@@ -116,8 +120,9 @@ impl Config {
         }
         c.coverage = match opt_str(&v, "coverage").as_deref() {
             None | Some("profile") => Coverage::Profile,
+            Some("static") => Coverage::Static,
             Some("exhaustive") => Coverage::Exhaustive,
-            Some(o) => bail!("{what}: coverage \"{o}\" is not \"profile\" or \"exhaustive\""),
+            Some(o) => bail!("{what}: coverage \"{o}\" is not \"profile\", \"static\" or \"exhaustive\""),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,

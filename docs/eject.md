@@ -87,20 +87,40 @@ hashes are checked.
 2. runs `runtime/gexc eject build .`, which
    - checks `rootfs/` against `gex-project.json`;
    - binds and checks every replacement (below);
-   - translates each program image into a tier-1 module
-     (`build/modules/NAME-HASH.wasm`) with gex's library intrinsics (the
-     `mem*` functions) and the replacements;
+   - places the closure (below) and translates each object into a tier-1
+     module (`build/modules/NAME-HASH.wasm`) with gex's library intrinsics
+     (the `mem*` functions) and the replacements;
    - copies `rootfs/` and `user/files/` into `build/rootfs/`;
    - writes `build/build.json`, including a hash of everything a user can
      change (`gex-project.json`, `user/eject.json`, replacement modules).
 
 **Coverage** (`user/eject.json` `"coverage"`):
 
-- `"profile"` (default): what discovery finds from the symbol table and the
-  data, plus every block the recorded session ran (`profile.json`), with every
-  page those touch translated whole.
-- `"exhaustive"`: every decodable address. Bigger, and nothing reachable by a
-  static path can be missing.
+- `"profile"` (default): every block the recorded session ran
+  (`profile.json`), with every page those touch translated whole, and
+  nothing followed off them onto fresh pages: what was seen. An object the
+  session ran no code in gets its entry point only. Without a
+  `profile.json` this is `"static"`.
+- `"static"`: `"profile"` plus what discovery finds from the symbol table and
+  the data. Covers paths other inputs take.
+- `"exhaustive"`: every decodable address.
+
+Measured on the host's dynamically linked gzip (x86-64, glibc): `"static"`
+translated 342,515 blocks of libc into a 168 MB module that took Cranelift
+7 CPU-minutes; `"profile"` translated 45,591 (24 MB). The corpus kernels and
+a static gzip run the same under both. A static gzip ejected from a `-9`
+compression still compresses at `-1` (same pages), and fails loudly at `-d`.
+
+**Dynamically linked programs.** The closure is placed the way `gexc build
+--closure` places one: the executable at `PIE_BASE`, the interpreter at
+`INTERP_BASE` (both where gex's loader puts them), and the libraries up from
+`MMAP_BOTTOM` in the session's order, 64 KiB aligned. The program's module
+owns the memory and dispatch tables, and every other object's module
+continues its slot numbering. At run time the libraries are pinned
+(`RunOptions::pins`, as `gexc run --pin`), and their modules are installed
+into the runtime's module registry before the program starts, so threads and
+forked children get them too. A pin that does not land is reported under
+`--verbose`; code at the wrong address then misses loudly.
 
 ## Running
 
@@ -122,11 +142,15 @@ segments), never from translation.
 branch to code the build does not have fails loudly:
 
 ```text
-gexc: gex failed at guest pc=0x...: gex-eject: code at 0x... (/path + 0x...) was not
-translated when the ejected project ... was built: the recorded session never reached
-it and discovery did not find it. Record a session that reaches it and re-eject, set
-"coverage": "exhaustive" in user/eject.json, or run with --jit-fallback
+gexc: gex failed at guest pc=0x102382c: gex-eject: code at 0x102382c (in the program's
+image) was not translated when the ejected project ... was built: the recorded session
+never reached it and discovery did not find it. Record a session that reaches it and
+re-eject, set "coverage" to "static" or "exhaustive" in user/eject.json, or run with
+--jit-fallback
 ```
+
+Code the program generates at run time (an anonymous executable mapping) is
+reported as such: only `--jit-fallback` can run it.
 
 Likewise a program the project has no module for (an `execve` of a program
 the session did not run) fails naming it, and a project changed since its
@@ -212,7 +236,15 @@ clang --target=wasm32 -O2 -nostdlib -ffreestanding -fvisibility=default -matomic
 `USER_CFLAGS` and `USER_LDFLAGS` add to it. There is no libc: the code is
 freestanding.
 
-**Example.** Replace the corpus's `ack` kernel's recursive function:
+**Examples**, all run on both guests unless noted:
+
+| Program | Replaced | ABI | Calls | Output |
+| --- | --- | --- | --- | --- |
+| corpus `ack 3` | the program's `ack` | `"c"` | 8 | same `result`; kernel 79 ms → 9 ms (AArch64) |
+| corpus `strings 3` | musl's `strtol` (and its alias `strtoll`) | `"ctx"`, writes `*endptr` itself | 720,000 | same `result` |
+| host `gzip -9` (x86-64, dynamic glibc) | glibc's `getenv`, called through gzip's PLT | `"c"` | 2 | same bytes |
+
+The first:
 
 ```c
 /* user/src/ack.c */
@@ -237,10 +269,14 @@ uint32_t my_ack_calls(void) { return calls; }
 
 ## Limits of v0
 
-- **Statically linked programs only.** The build refuses an object whose role
-  is `interp` or `library`. A dynamic program needs the closure placed at
-  pinned bases and its libraries' modules installed up front.
-- **Replacements are of functions defined in an executable.**
+- **Dynamic linking for the recorded program only.** An `execve` of a
+  static program the session also ran works (its image module is found by
+  identity); an exec'd *dynamic* program gets no closure modules, so its
+  interpreter's first block misses loudly.
+- **Replacements are by definition, not by import.** A replacement names the
+  object that defines the function. Replacing an import of an object that is
+  not in the closure (a whole library swapped out, as the Noita port swaps
+  SDL2) needs PLT-slot binding: v1.
 - **One ISA per gexc**, as everywhere in gex: eject a session with the gexc
   that ran it (`gexc` for AArch64, the `x86` build for x86-64 and i386).
 - **The runtime is the whole gexc.** Syscalls, subsystems and the translator
