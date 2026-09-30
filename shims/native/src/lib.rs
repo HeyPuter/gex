@@ -11,6 +11,7 @@ use gex_kernel::{BlockOp, GuestMem, Kernel, KernelProcSource, ProcState, Syscall
 use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
+pub mod aot;
 pub mod gl;
 pub mod profile;
 pub mod nt;
@@ -133,6 +134,10 @@ pub struct RunOptions {
     /// Record a profile and a session manifest into this directory (see
     /// `profile`). Tier-1 code only.
     pub record: Option<std::path::PathBuf>,
+    /// An ejected project's prebuilt modules and library replacements (see
+    /// `aot`). With it, an image is never translated: its module comes from
+    /// the project, or the run fails.
+    pub aot: Option<Arc<aot::Aot>>,
 }
 
 impl Default for RunOptions {
@@ -166,6 +171,7 @@ impl Default for RunOptions {
             // costs only the write.
             cache: true,
             record: None,
+            aot: None,
         }
     }
 }
@@ -207,6 +213,9 @@ struct HostState {
     prof: Option<profile::StoreProf>,
     /// Set for a Windows process: every `syscall` is an NT call. See `nt`.
     nt: Option<Arc<gex_kernel::nt::Process>>,
+    /// This store's instances of an ejected project's replacement modules,
+    /// made on the first call. See `aot`.
+    repl: Option<aot::StoreRepl>,
 }
 
 /// What a process-creating `clone` asked for.
@@ -508,7 +517,12 @@ fn run_program_with(
         (m, s)
     };
 
-    let (module, meta) = match use_cache.then(gex_cache::cache_dir).flatten() {
+    let (module, meta) = if let Some(aot) = &opts.aot {
+        // An ejected project: the image was translated when it was built.
+        let dir = use_cache.then(gex_cache::cache_dir).flatten();
+        aot::image_module(aot, &engine, dir.as_deref().map(|d| (d, build.as_str())), image)?
+    } else {
+        match use_cache.then(gex_cache::cache_dir).flatten() {
         Some(dir) => {
             let key = cache_key(image, xlate, &build);
             let mut built: Option<Stats> = None;
@@ -539,6 +553,7 @@ fn run_program_with(
                 Module::new(&engine, &m.wasm).context("validating translated wasm")?,
                 meta,
             )
+        }
         }
     };
     if stats.blocks == 0 {
@@ -656,6 +671,11 @@ fn run_program_with(
     // translator for every guest process, so a mixed tree is not supported
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
+    // An ejected project's replacement code has its own region. Recorded for
+    // each new address space, an exec's included.
+    if let Some(aot) = &opts.aot {
+        aot::reserve_region(&mut kernel, aot);
+    }
     // Mounts survive an exec, so they are only established for a new process.
     if fresh {
         mount_filesystems(&mut kernel, opts, Arc::clone(&proc_state))?;
@@ -723,6 +743,7 @@ fn run_program_with(
             store_limits: store_limits(),
             prof: None,
             nt: None,
+            repl: None,
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -1492,6 +1513,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             store_limits: store_limits(),
             prof: None,
             nt: cx.nt.clone(),
+            repl: None,
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -1640,6 +1662,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             store_limits: store_limits(),
             prof: None,
             nt: cx.nt.clone(),
+            repl: None,
         },
     );
     // Without this the store keeps wasmtime's default of ten thousand
@@ -2584,6 +2607,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     if caller.data().nt.is_some() {
                         return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
                     }
+                    // Code an ejected project was built without: say so,
+                    // rather than let it read as the guest's own crash.
+                    if let Some(detail) = aot::unseen_code(&mut caller, pc) {
+                        caller.data_mut().exit = Some(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc,
+                            detail,
+                            internal: true,
+                        });
+                        return Err(StopExecution.into());
+                    }
                     // A wild branch is nearly always a bad return address or
                     // function pointer: say where the last indirect branch
                     // was aimed and what the stack holds, so the caller can
@@ -2750,7 +2784,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SYSREG_WRITE,
-        |caller: Caller<'_, HostState>, ctx: i32, _pc: i64, reg: i32, v: i64| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, reg: i32, v: i64| -> Result<()> {
+            // A function an ejected project replaced (`Intrinsic::Replace`).
+            if reg == gex_xlate::intrinsic::REPLACE_SYSREG {
+                return aot::call(&mut caller, ctx, pc as u64, v as u64);
+            }
             // The x86-64 lifter routes `cpuid` here: the leaf and subleaf come
             // in `v`, the four results go back into the context.
             if reg == gex_kernel::x86::SYSREG_CPUID {
