@@ -837,6 +837,18 @@ impl<'a> Emitter<'a> {
             GuestReg::X87Tags => ctx::X87_TAGS,
             // Not a slot: read as the context's own address. Never stored.
             GuestReg::CtxAddr => 0,
+            // PowerPC: a GPR is the low word of the 64-bit slot (the context
+            // is little-endian), an FPR the low eight bytes of a vector slot.
+            GuestReg::R(n) => ctx::x(n),
+            GuestReg::F(n) => ctx::f(n),
+            GuestReg::Lr => ctx::PPC_LR,
+            GuestReg::Ctr => ctx::PPC_CTR,
+            GuestReg::Cr(n) => ctx::PPC_CR + n as usize,
+            GuestReg::So => ctx::PPC_SO,
+            GuestReg::Ov => ctx::PPC_OV,
+            GuestReg::Ca => ctx::PPC_CA,
+            GuestReg::XerBc => ctx::PPC_XER_BC,
+            GuestReg::Fpscr => ctx::PPC_FPSCR,
         }) as u32
     }
 
@@ -1070,6 +1082,24 @@ impl<'a> Emitter<'a> {
     /// makes the access trap and become SIGSEGV rather than silently aliasing
     /// low memory.
     fn emit_address(&mut self, addr: Value, offset: i64) -> u32 {
+        // A 32-bit guest's effective address (PowerPC): already wrapped by the
+        // guest's own arithmetic, and below 2^32, so it needs no guard -- an
+        // address at or past `GUEST_LIMIT` is past the end of memory and traps
+        // there. A small non-negative displacement rides as the static offset
+        // (docs/ppc.md §2.4); anything else is added first, wrapping.
+        if gex_abi::PPC && self.type_of(addr) == Ty::I32 {
+            if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
+                self.f.i32_const((c as u32).wrapping_add(offset as u32) as i32);
+                return 0;
+            }
+            self.push(addr);
+            if (0..=0xffff).contains(&offset) {
+                return offset as u32;
+            }
+            self.f.i32_const(offset as i32);
+            self.f.byte(0x6a); // i32.add
+            return 0;
+        }
         // Constant addresses are extremely common (literal pools, absolute
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
@@ -1804,6 +1834,10 @@ impl<'a> Emitter<'a> {
                     self.push(*a);
                     self.f.byte(if *ty == Ty::I32 { 0x69 } else { 0x7b });
                 }
+                UnOp::Bswap | UnOp::Bswap16 => {
+                    self.push(*a);
+                    self.emit_bswap(*op, *ty);
+                }
             },
             Expr::Cmp { op, ty, a, b } => {
                 self.push(*a);
@@ -2134,6 +2168,65 @@ impl<'a> Emitter<'a> {
     }
 
     /// Reinterpret the integer bit pattern on top of the stack as a float.
+    /// Reverse the bytes of the value on the stack (docs/ppc.md §2.2). Wasm
+    /// has no byte swap: 32 bits is two rotates, two masks and an or; 16 bits
+    /// two shifts, two masks and an or; 64 bits a `pshufb`-shaped swizzle,
+    /// which beats the eleven-op scalar sequence and its two 64-bit masks.
+    fn emit_bswap(&mut self, op: UnOp, ty: Ty) {
+        const I32_AND: u8 = 0x71;
+        const I32_OR: u8 = 0x72;
+        const I32_SHL: u8 = 0x74;
+        const I32_SHR_U: u8 = 0x76;
+        const I32_ROTL: u8 = 0x77;
+        const I32_ROTR: u8 = 0x78;
+        match (op, ty) {
+            (UnOp::Bswap, Ty::I32) => {
+                let t = self.scratch_i32;
+                self.f.local_tee(t);
+                self.f.i32_const(8);
+                self.f.byte(I32_ROTL);
+                self.f.i32_const(0x00ff_00ff);
+                self.f.byte(I32_AND);
+                self.f.local_get(t);
+                self.f.i32_const(8);
+                self.f.byte(I32_ROTR);
+                self.f.i32_const(0xff00_ff00u32 as i32);
+                self.f.byte(I32_AND);
+                self.f.byte(I32_OR);
+            }
+            (UnOp::Bswap16, Ty::I32) => {
+                let t = self.scratch_i32;
+                self.f.local_tee(t);
+                self.f.i32_const(0xff);
+                self.f.byte(I32_AND);
+                self.f.i32_const(8);
+                self.f.byte(I32_SHL);
+                self.f.local_get(t);
+                self.f.i32_const(8);
+                self.f.byte(I32_SHR_U);
+                self.f.i32_const(0xff);
+                self.f.byte(I32_AND);
+                self.f.byte(I32_OR);
+            }
+            (UnOp::Bswap, Ty::I64) => {
+                self.f.simd(simd::I64X2_SPLAT);
+                let mut idx = [0u8; 16];
+                for (i, b) in idx.iter_mut().enumerate() {
+                    *b = if i < 8 { 7 - i as u8 } else { i as u8 };
+                }
+                self.f.v128_const(&idx);
+                self.f.simd(simd::I8X16_SWIZZLE);
+                self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
+            }
+            (UnOp::Bswap16, Ty::I64) => {
+                self.f.byte(code::I32_WRAP_I64);
+                self.emit_bswap(UnOp::Bswap16, Ty::I32);
+                self.f.byte(code::I64_EXTEND_I32_U);
+            }
+            _ => unreachable!("byte swap of a {ty:?}"),
+        }
+    }
+
     fn reinterpret_to_fp(&mut self, double: bool) {
         // f64.reinterpret_i64 / f32.reinterpret_i32
         self.f.byte(if double { 0xbf } else { 0xbe });
