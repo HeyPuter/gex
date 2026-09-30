@@ -474,6 +474,10 @@ name = "gex-isa"
 version = "0.0.1"
 
 [[package]]
+name = "gex-isa-ppc"
+version = "0.0.1"
+
+[[package]]
 name = "gex-isa-x86"
 version = "0.0.1"
 
