@@ -1,5 +1,5 @@
 //! The guest architecture behind the translator: the decoder and lifter pair
-//! the `x86` cargo feature selects. Everything else in this crate is written
+//! the `x86` or `ppc` cargo feature selects. Everything else in this crate is written
 //! against these few functions, so it never names an instruction set.
 
 use gex_ir::Block;
@@ -8,7 +8,7 @@ use gex_ir::Block;
 /// adapter reads one word from it.
 pub type FetchBuf = [u8; 16];
 
-#[cfg(not(feature = "x86"))]
+#[cfg(not(any(feature = "x86", feature = "ppc")))]
 mod imp {
     use super::*;
     pub use gex_lift::BlockLimits;
@@ -253,6 +253,118 @@ mod imp {
             format!("{hex:<30}\t{}", gex_isa_x86::fmt::disasm(&inst, pc)),
             n.max(1),
         )
+    }
+}
+
+/// 32-bit big-endian PowerPC (docs/ppc.md): fixed 4-byte words, stored
+/// big-endian in guest memory.
+#[cfg(feature = "ppc")]
+mod imp {
+    use super::*;
+    pub use gex_lift_ppc::BlockLimits;
+
+    fn word(bytes: &[u8]) -> u32 {
+        u32::from_be_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    pub fn lift_block(
+        fetch: impl Fn(u64, &mut FetchBuf) -> usize,
+        start: u64,
+        limits: BlockLimits,
+    ) -> Block {
+        gex_lift_ppc::lift_block(
+            |pc| {
+                if pc % 4 != 0 {
+                    return None;
+                }
+                let mut buf = [0u8; 16];
+                if fetch(pc, &mut buf) >= 4 {
+                    Some(word(&buf))
+                } else {
+                    None
+                }
+            },
+            start,
+            limits,
+        )
+    }
+
+    pub fn decodable(bytes: &[u8], pc: u64) -> bool {
+        bytes.len() >= 4
+            && pc % 4 == 0
+            && gex_isa_ppc::decode(word(bytes), pc).op != gex_isa_ppc::Op::Unknown
+    }
+
+    /// `lis rX, hi` then `addi rY, rX, lo` (or `ori`): the absolute-address
+    /// idiom of 32-bit code, which is how a function whose address is taken
+    /// shows up. Over-seeding is safe; `is_exec` rejects data.
+    pub fn scan_code_pointers(
+        bytes: &[u8],
+        vaddr: u64,
+        is_exec: &dyn Fn(u64) -> bool,
+        seed: &mut dyn FnMut(u64),
+    ) {
+        use gex_isa_ppc::Op;
+        let mut hi: [Option<u32>; 32] = [None; 32];
+        let end = vaddr + bytes.len() as u64;
+        let mut a = vaddr;
+        while a + 4 <= end {
+            if !is_exec(a) {
+                hi = [None; 32];
+                a += 4;
+                continue;
+            }
+            let off = (a - vaddr) as usize;
+            let i = gex_isa_ppc::decode(word(&bytes[off..]), a);
+            match i.op {
+                Op::Addis if i.ra() == 0 => hi[i.rt() as usize] = Some((i.simm() as u32) << 16),
+                Op::Addi | Op::Ori if i.ra() != 0 || i.op == Op::Ori => {
+                    let (src, dst) = if i.op == Op::Ori { (i.rt(), i.ra()) } else { (i.ra(), i.rt()) };
+                    if let Some(h) = hi[src as usize] {
+                        let t = if i.op == Op::Ori {
+                            h | i.uimm()
+                        } else {
+                            h.wrapping_add(i.simm() as u32)
+                        } as u64;
+                        if t % 4 == 0 && is_exec(t) {
+                            seed(t);
+                        }
+                    }
+                    hi[dst as usize] = None;
+                }
+                _ => {}
+            }
+            a += 4;
+        }
+    }
+
+    /// Every candidate instruction start in `[lo, hi)`: every aligned word
+    /// that decodes.
+    pub fn sweep(
+        fetch: &dyn Fn(u64, &mut FetchBuf) -> usize,
+        lo: u64,
+        hi: u64,
+        _anchors: &[u64],
+        emit: &mut dyn FnMut(u64),
+    ) {
+        let mut a = lo & !3;
+        while a < hi {
+            let mut buf = [0u8; 16];
+            let n = fetch(a, &mut buf);
+            if n > 0 && decodable(&buf[..n], a) {
+                emit(a);
+            }
+            a += 4;
+        }
+    }
+
+    pub fn disasm(bytes: &[u8], pc: u64) -> (String, usize) {
+        if bytes.len() < 4 {
+            return ("(truncated)".into(), bytes.len().max(1));
+        }
+        let raw = word(bytes);
+        let inst = gex_isa_ppc::decode(raw, pc);
+        (format!("{raw:08x}\t{}", gex_isa_ppc::fmt::disasm(&inst, pc)), 4)
     }
 }
 

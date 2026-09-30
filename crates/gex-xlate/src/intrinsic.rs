@@ -80,6 +80,9 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
 /// do it, and return through `x30`. Registers a real implementation would
 /// clobber are left alone, which the procedure call standard permits.
 pub fn block(addr: u64, which: Intrinsic) -> Block {
+    if gex_abi::PPC {
+        return block_ppc(addr, which);
+    }
     let mut b = Builder::new(addr);
     // The C calling convention's first three argument registers: x0-x2, or
     // rdi/rsi/rdx. `ctx::CALL_ARGS` gives their context offsets.
@@ -139,6 +142,48 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
     } else {
         b.read(GuestReg::X(30))
     };
+    b.finish(Term::Indirect {
+        target,
+        is_ret: true,
+    })
+}
+
+/// [`block`] for 32-bit PowerPC: the SysV arguments in r3-r5 (32-bit), the
+/// result in r3, the return through LR. `memcpy`, `memmove` and `memset`
+/// return their first argument, which r3 already holds.
+fn block_ppc(addr: u64, which: Intrinsic) -> Block {
+    let mut b = Builder::new(addr);
+    let dst = b.read(GuestReg::R(3));
+    let src = b.read(GuestReg::R(4));
+    let len32 = b.read(GuestReg::R(5));
+    // The bulk statements take their length and fill value as `I64`s.
+    let len = b.extend(len32, false);
+    match which {
+        Intrinsic::MemCpy | Intrinsic::MemMove => b.stmt(Stmt::MemCopy { dst, src, len }),
+        Intrinsic::MemPCpy => {
+            b.stmt(Stmt::MemCopy { dst, src, len });
+            let end = b.bin(BinOp::Add, Ty::I32, dst, len32);
+            b.write(GuestReg::R(3), end);
+        }
+        Intrinsic::MemSet => {
+            let val = b.extend(src, false);
+            b.stmt(Stmt::MemFill { dst, val, len })
+        }
+        Intrinsic::MemCmp => {
+            let r = b.fresh();
+            b.stmt(Stmt::MemCmp {
+                dst: r,
+                a: dst,
+                b: src,
+                len,
+            });
+            b.write(GuestReg::R(3), r);
+        }
+    }
+    let lr = b.read(GuestReg::Lr);
+    let mask = b.const_i32(!3);
+    let lr = b.bin(BinOp::And, Ty::I32, lr, mask);
+    let target = b.extend(lr, false);
     b.finish(Term::Indirect {
         target,
         is_ret: true,

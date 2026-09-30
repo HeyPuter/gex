@@ -1134,7 +1134,7 @@ fn lift_one(
             _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
         })
     };
-    if !gex_abi::X86 {
+    if !gex_abi::X86 && !gex_abi::PPC {
         // A64: folded through memory before the ordinary passes, so a PLT's
         // GOT load becomes a constant and its `br` becomes a target discovery
         // can follow.
@@ -1155,7 +1155,9 @@ fn lift_one(
             block.guard = Some(memory[lo..hi].to_vec());
         }
     }
-    // x86-64: folded on a scratch copy only, never in the emitted block --
+    // x86-64 and PowerPC: folded on a scratch copy only, never in the
+    // emitted block (32-bit PowerPC code addresses its globals absolutely,
+    // `lis`/`lwz`, so a folded load would bake in a variable's value) --
     // memory read at translation time is a guess about the future (a GOT slot
     // bound later), and code that bakes it in is wrong once it changes.
     let folded = match block.term {
@@ -1169,7 +1171,7 @@ fn lift_one(
     (block, folded)
 }
 
-#[cfg(all(test, not(feature = "x86")))]
+#[cfg(all(test, not(any(feature = "x86", feature = "ppc"))))]
 mod tests {
     use super::*;
     use gex_ld::elf::Segment;
