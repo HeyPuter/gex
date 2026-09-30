@@ -401,3 +401,26 @@ fn clr_images_fail_loudly() {
     let e = pe::parse(&bytes).unwrap_err();
     assert!(e.to_string().contains(".NET/CLR"), "{e}");
 }
+
+/// With no `.reloc`, an image moves only if it was linked `DYNAMIC_BASE`
+/// (linkers omit an empty `.reloc`); otherwise a needed move fails loudly.
+#[test]
+fn no_reloc_directory_moves_only_when_dynamic_base() {
+    let mut bytes = std::fs::read(fixture("x64/msvc.exe")).unwrap();
+    let img = pe::parse(&bytes).unwrap();
+    assert_eq!(img.preferred_base, 0x1_4000_0000);
+    let dd = img.opt_offset + 112 + pe::dir::BASERELOC * 8;
+    bytes[dd..dd + 8].fill(0);
+    let img = pe::parse(&bytes).unwrap();
+    assert!(img.relocs.is_empty() && img.dll_characteristics & pe::DLLCHAR_DYNAMIC_BASE != 0);
+    assert!(img.relocatable());
+    img.map(gex_abi::EXEC_BASE).unwrap();
+    let dc = img.opt_offset + 70;
+    let v = u16::from_le_bytes([bytes[dc], bytes[dc + 1]]) & !pe::DLLCHAR_DYNAMIC_BASE;
+    bytes[dc..dc + 2].copy_from_slice(&v.to_le_bytes());
+    let img = pe::parse(&bytes).unwrap();
+    assert!(!img.relocatable());
+    let e = img.map(gex_abi::EXEC_BASE).unwrap_err();
+    assert_eq!(e.kind, PeErrorKind::Layout);
+    assert!(e.to_string().contains("not linked /DYNAMICBASE"), "{e}");
+}

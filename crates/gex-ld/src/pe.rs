@@ -825,7 +825,7 @@ impl PeImage {
                 // Some linkers pad the directory with an empty block.
                 break;
             }
-            if len < 8 || len % 2 != 0 || off + len > block.len() {
+            if len < 8 || !len.is_multiple_of(2) || off + len > block.len() {
                 return Err(PeError::malformed(format!(
                     "base-relocation block at {:#x} has size {len:#x}",
                     rva as usize + off
@@ -1248,7 +1248,7 @@ impl PeImage {
     /// applied, and the optional header's `ImageBase` updated. Imports are
     /// left as they are in the file.
     pub fn map(&self, base: u64) -> Result<Vec<u8>> {
-        if base % IMAGE_ALIGN != 0 {
+        if !base.is_multiple_of(IMAGE_ALIGN) {
             return Err(PeError::layout(format!("base {base:#x} is not 64 KiB aligned")));
         }
         if !self.is64 && base + self.image_size as u64 > 1 << 32 {
