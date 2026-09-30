@@ -291,6 +291,7 @@ fn same_run(a: &Function, b: &Function, call: &dyn Fn(Callee) -> CallEffect, sp:
             call,
             sp,
             max_steps: 200,
+            syscall: None,
         };
         let x = interp::run(a, seed, &m);
         let y = interp::run(b, seed, &m);
@@ -486,6 +487,7 @@ fn a_trap_prints_parses_and_is_taken_only_when_its_condition_holds() {
         call: &|_| CallEffect::UNKNOWN,
         sp: GuestReg::Sp,
         max_steps: 10,
+        syscall: None,
     };
     let mut regs = interp::initial_regs(1, GuestReg::Sp);
     regs[reg_index(x(1))] = 0;

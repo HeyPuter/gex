@@ -79,18 +79,27 @@ pub fn check_function(
 ) {
     rep.functions += 1;
     let call = |c: Callee| sums.call_effect(c);
+    // Syscalls as the summaries model them.
+    let nr = reg_index(crate::arch::SYSCALL_NR);
+    let syscall = |regs: &[u64]| crate::summary::syscall_effect(Some(regs[nr]));
     let m = Model {
         call: &call,
         sp: SP_REG,
         max_steps,
+        syscall: Some(&syscall),
     };
     let ssa = sums.to_ssa(f);
     let own = sums.get(a);
     let spi = reg_index(SP_REG);
     let name = f.name.as_deref().unwrap_or("-");
-    let fail = |rep: &mut Report, what: String| {
-        if rep.failures.len() < 200 {
+    // A few lines per function, so one bad function hides no other.
+    let mut mine = 0;
+    let mut fail = |rep: &mut Report, what: String| {
+        mine += 1;
+        if mine <= 4 {
             rep.failures.push(format!("{a:#x} {name}: {what}"));
+        } else if mine == 5 {
+            rep.failures.push(format!("{a:#x} {name}: (more)"));
         }
     };
     for seed in 0..seeds {

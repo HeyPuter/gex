@@ -16,8 +16,9 @@
 //! the register and a per-run counter, and moves the stack pointer by the
 //! effect's `sp_delta` (or clobbers it). Both runs see the same model, so a
 //! form that relies on a preserved register surviving a call is checked
-//! against exactly that assumption. Syscalls are modelled as calls that
-//! preserve nothing. A modelled callee reads and writes no memory.
+//! against exactly that assumption. Syscalls are modelled as calls that do
+//! the model's `syscall` says (by default, preserve nothing). A modelled
+//! callee reads and writes no memory.
 //!
 //! Memory nobody wrote reads as a hash of its address and the seed, so it is
 //! the same in every run with that seed whatever the registers hold. Only
@@ -71,6 +72,9 @@ pub struct Model<'a> {
     pub sp: GuestReg,
     /// Lifted blocks executed before stopping with [`Stop::Budget`].
     pub max_steps: usize,
+    /// What a syscall does to the registers, given the registers at the
+    /// syscall; `None` is [`CallEffect::UNKNOWN`].
+    pub syscall: Option<&'a dyn Fn(&[u64]) -> CallEffect>,
 }
 
 /// Deterministic pseudo-random bits from a key.
@@ -298,7 +302,8 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
             }
             FTerm::Syscall { next, .. } => {
                 calls += 1;
-                havoc(&mut regs, CallEffect::UNKNOWN, seed ^ 0x5ca11, calls, spi);
+                let eff = m.syscall.map_or(CallEffect::UNKNOWN, |s| s(&regs));
+                havoc(&mut regs, eff, seed ^ 0x5ca11, calls, spi);
                 match next {
                     Some(e) => (e.to, edge_args(e, &vals)),
                     None => finish!(Stop::Leave(pc)),

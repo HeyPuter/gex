@@ -394,6 +394,20 @@ fn syscall_keeps_args(nr: u64) -> bool {
     }
 }
 
+/// What the analysis assumes a syscall does to the registers, given its
+/// number when known: one on the [`benign_syscall`] list changes only the
+/// kernel's documented result and scratch registers and returns with the
+/// stack pointer unchanged; any other may change everything.
+pub fn syscall_effect(nr: Option<u64>) -> CallEffect {
+    match nr {
+        Some(nr) if benign_syscall(nr) => CallEffect {
+            preserved: RegSet::ALL.minus(syscall_regs().1),
+            sp_delta: Some(0),
+        },
+        _ => CallEffect::UNKNOWN,
+    }
+}
+
 struct Ctx<'a> {
     sums: &'a HashMap<u64, Summary>,
 }
