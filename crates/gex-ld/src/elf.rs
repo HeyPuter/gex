@@ -8,6 +8,9 @@ const ELFCLASS64: u8 = 2;
 /// `e_machine` of an i386 executable: the 32-bit program an x86-64 guest
 /// kernel runs in compatibility mode.
 const EM_386: u16 = 3;
+const ELFDATA2MSB: u8 = 2;
+/// 32-bit PowerPC, the only image the `ppc` build loads.
+const EM_PPC: u16 = 20;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
@@ -292,6 +295,8 @@ pub struct Image {
 
 struct Reader<'a> {
     data: &'a [u8],
+    /// A big-endian (`ELFDATA2MSB`) image: PowerPC's.
+    be: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -300,17 +305,18 @@ impl<'a> Reader<'a> {
     }
     fn u16(&self, off: usize) -> Result<u16, LoadError> {
         let b = self.data.get(off..off + 2).ok_or(LoadError::TooShort)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
+        let b = [b[0], b[1]];
+        Ok(if self.be { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) })
     }
     fn u32(&self, off: usize) -> Result<u32, LoadError> {
         let b = self.data.get(off..off + 4).ok_or(LoadError::TooShort)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        let b = [b[0], b[1], b[2], b[3]];
+        Ok(if self.be { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) })
     }
     fn u64(&self, off: usize) -> Result<u64, LoadError> {
         let b = self.data.get(off..off + 8).ok_or(LoadError::TooShort)?;
-        Ok(u64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        let b = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+        Ok(if self.be { u64::from_be_bytes(b) } else { u64::from_le_bytes(b) })
     }
     fn slice(&self, off: usize, len: usize) -> Result<&'a [u8], LoadError> {
         self.data.get(off..off + len).ok_or(LoadError::TooShort)
@@ -330,26 +336,39 @@ impl<'a> Reader<'a> {
 /// `pie_base` is the load bias used for `ET_DYN` images; `ET_EXEC` images are
 /// placed at their own `p_vaddr`s.
 pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
-    let r = Reader { data };
+    // The PowerPC guest is big-endian throughout; every other one is little.
+    let r = Reader {
+        data,
+        be: gex_abi::BIG_ENDIAN,
+    };
     if data.len() < 64 {
         return Err(LoadError::TooShort);
     }
     if &data[0..4] != b"\x7fELF" {
         return Err(LoadError::NotElf);
     }
-    if r.u8(5)? != ELFDATA2LSB {
+    let order = if gex_abi::BIG_ENDIAN { ELFDATA2MSB } else { ELFDATA2LSB };
+    if r.u8(5)? != order {
         return Err(LoadError::NotElf64Le);
     }
     // A 32-bit i386 image is accepted on the x86-64 guest only: it runs in
-    // the same process model as everything else, in compatibility mode.
+    // the same process model as everything else, in compatibility mode. The
+    // PowerPC guest is 32-bit only.
     let class32 = match r.u8(4)? {
-        ELFCLASS64 => false,
-        ELFCLASS32 if gex_abi::X86 => true,
+        ELFCLASS64 if !gex_abi::PPC => false,
+        ELFCLASS32 if gex_abi::X86 || gex_abi::PPC => true,
         _ => return Err(LoadError::NotElf64Le),
     };
     let e_type = r.u16(16)?;
     let machine = r.u16(18)?;
-    if machine != if class32 { EM_386 } else { EM_GUEST } {
+    let want = if gex_abi::PPC {
+        EM_PPC
+    } else if class32 {
+        EM_386
+    } else {
+        EM_GUEST
+    };
+    if machine != want {
         return Err(LoadError::NotAarch64);
     }
     let pie = match e_type {
@@ -516,6 +535,9 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     if !class32 {
         image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
         image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
+    } else if gex_abi::PPC {
+        image.symbols = read_symbols32(&r, e_shoff, e_shentsize, e_shnum, bias);
+        image.code = read_code_sections32(&r, e_shoff, e_shentsize, e_shnum, bias);
     }
     Ok(image)
 }
@@ -930,6 +952,92 @@ fn read_code_sections(
         }
     }
     merged
+}
+
+/// [`read_code_sections`] for an `ELFCLASS32` image (`Elf32_Shdr`).
+fn read_code_sections32(
+    r: &Reader<'_>,
+    e_shoff: usize,
+    e_shentsize: usize,
+    e_shnum: usize,
+    bias: u64,
+) -> Vec<(u64, u64)> {
+    const SHF_EXECINSTR: u32 = 0x4;
+    const SHT_NOBITS: u32 = 8;
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    if e_shoff == 0 || e_shnum == 0 {
+        return out;
+    }
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        let (Ok(sh_type), Ok(sh_flags), Ok(sh_addr), Ok(sh_size)) =
+            (r.u32(off + 4), r.u32(off + 8), r.u32(off + 12), r.u32(off + 20))
+        else {
+            continue;
+        };
+        if sh_flags & SHF_EXECINSTR == 0 || sh_type == SHT_NOBITS || sh_size == 0 || sh_addr == 0 {
+            continue;
+        }
+        out.push((sh_addr as u64 + bias, (sh_addr + sh_size) as u64 + bias));
+    }
+    out.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in out {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// [`read_symbols`] for an `ELFCLASS32` image (`Elf32_Shdr`, `Elf32_Sym`).
+fn read_symbols32(
+    r: &Reader<'_>,
+    e_shoff: usize,
+    e_shentsize: usize,
+    e_shnum: usize,
+    bias: u64,
+) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    if e_shoff == 0 || e_shnum == 0 {
+        return out;
+    }
+    for i in 0..e_shnum {
+        let off = e_shoff + i * e_shentsize;
+        let Ok(sh_type) = r.u32(off + 4) else { continue };
+        if sh_type != SHT_SYMTAB && sh_type != SHT_DYNSYM {
+            continue;
+        }
+        let (Ok(sh_offset), Ok(sh_size), Ok(sh_link), Ok(sh_entsize)) =
+            (r.u32(off + 16), r.u32(off + 20), r.u32(off + 24), r.u32(off + 36))
+        else {
+            continue;
+        };
+        if sh_entsize == 0 {
+            continue;
+        }
+        let str_off = r.u32(e_shoff + sh_link as usize * e_shentsize + 16).unwrap_or(0) as usize;
+        for k in 0..(sh_size / sh_entsize) as usize {
+            let so = sh_offset as usize + k * sh_entsize as usize;
+            let (Ok(st_name), Ok(st_value), Ok(st_size), Ok(st_info)) =
+                (r.u32(so), r.u32(so + 4), r.u32(so + 8), r.u8(so + 12))
+            else {
+                continue;
+            };
+            let kind = st_info & 0xf;
+            if (kind != STT_FUNC && kind != STT_GNU_IFUNC) || st_value == 0 {
+                continue;
+            }
+            out.push(Symbol {
+                name: r.cstr(str_off + st_name as usize),
+                value: st_value as u64 + bias,
+                size: st_size as u64,
+                ifunc: kind == STT_GNU_IFUNC,
+            });
+        }
+    }
+    out
 }
 
 fn read_symbols(
