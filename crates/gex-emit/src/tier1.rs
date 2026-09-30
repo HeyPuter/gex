@@ -3326,8 +3326,13 @@ fn lane_cvt_op(op: VCvtOp, from: VLane) -> u32 {
         (VCvtOp::ExtendHigh { signed: false }, _) => 0xca,
         (VCvtOp::NarrowSat { signed: true }, VLane::I16) => 0x65,
         (VCvtOp::NarrowSat { signed: false }, VLane::I16) => 0x66,
-        (VCvtOp::NarrowSat { signed: true }, _) => 0x85,
-        (VCvtOp::NarrowSat { signed: false }, _) => 0x86,
+        (VCvtOp::NarrowSat { signed: true }, VLane::I32) => 0x85,
+        (VCvtOp::NarrowSat { signed: false }, VLane::I32) => 0x86,
+        // wasm narrows only i16 and i32 lanes; the lifter clamps doublewords
+        // itself.
+        (VCvtOp::NarrowSat { .. }, _) => {
+            panic!("no wasm SIMD conversion for {op:?} from {from:?}")
+        }
     }
 }
 
