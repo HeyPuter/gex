@@ -39,6 +39,8 @@ struct CModule<'a> {
     funcs: Vec<u32>,
     bodies: Vec<wasmparser::FunctionBody<'a>>,
     exports: HashMap<String, u32>,
+    /// Function names from wasm-ld's name section, when it kept one.
+    names: HashMap<u32, String>,
 }
 
 fn parse_c(wasm: &[u8]) -> Result<CModule<'_>> {
@@ -48,6 +50,7 @@ fn parse_c(wasm: &[u8]) -> Result<CModule<'_>> {
         funcs: Vec::new(),
         bodies: Vec::new(),
         exports: HashMap::new(),
+        names: HashMap::new(),
     };
     let mut c_memories = 0u32;
     for payload in Parser::new(0).parse_all(wasm) {
@@ -102,6 +105,16 @@ fn parse_c(wasm: &[u8]) -> Result<CModule<'_>> {
                 }
             }
             Payload::CodeSectionEntry(b) => m.bodies.push(b),
+            Payload::CustomSection(r) if r.name() == "name" => {
+                let reader = wasmparser::NameSectionReader::new(wasmparser::BinaryReader::new(r.data(), r.data_offset()));
+                for n in reader.flatten() {
+                    if let wasmparser::Name::Function(map) = n {
+                        for naming in map.into_iter().flatten() {
+                            m.names.insert(naming.index, naming.name.to_string());
+                        }
+                    }
+                }
+            }
             Payload::DataSection(r) => {
                 if r.count() > 0 {
                     bail!(
@@ -424,6 +437,9 @@ pub fn splice(
                 }
             }
             Payload::CustomSection(r) => {
+                if r.name() == "name" && names_wanted() {
+                    continue; // replaced by ours, below
+                }
                 if r.name() == gex_emit::wasm::RELOC_SECTION {
                     // Offsets into bodies this splice rewrote: stale, and a
                     // spliced module is never merged.
@@ -450,6 +466,19 @@ pub fn splice(
     }
     if t_ndef == 0 || t_def_seen != t_ndef {
         bail!("the tier-1 module's code section was not where it was expected");
+    }
+    if names_wanted() {
+        // `GEX_CGEN_NAMES=1`: name the dispatch function and the C functions,
+        // so an engine profile (`node --cpu-prof`) can say where time goes.
+        let mut fnames = wasm_encoder::NameMap::new();
+        fnames.append(dispatch_idx, "gexc_dispatch");
+        for (k, f) in reach.iter().enumerate() {
+            let n = c.names.get(f).cloned().unwrap_or_else(|| c_name(*f));
+            fnames.append(dispatch_idx + 1 + k as u32, &n);
+        }
+        let mut names = wasm_encoder::NameSection::new();
+        names.functions(&fnames);
+        out.section(&names);
     }
     Ok((out.finish(), stats))
 }
@@ -527,4 +556,8 @@ fn dispatch_function(block_ty: u32) -> Function {
     }
     f.instruction(&I::End);
     f
+}
+
+fn names_wanted() -> bool {
+    std::env::var_os("GEX_CGEN_NAMES").is_some()
 }
