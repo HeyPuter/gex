@@ -2772,6 +2772,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 return Err(StopExecution.into());
             }
+            // An x87 exception the control word unmasks: not delivered, so
+            // the process dies of SIGFPE, saying so.
+            if imm == gex_abi::imports::BRK_X87_EXCEPTION {
+                caller.data_mut().exit = Some(Exit::Signal {
+                    signal: signal::SIGFPE,
+                    pc: pc as u64,
+                    detail: format!("unmasked x87 floating-point exception at 0x{pc:x}; gex does not deliver x87 exceptions"),
+                    internal: true,
+                });
+                return Err(StopExecution.into());
+            }
             caller.data_mut().exit = Some(Exit::Signal {
                 signal: signal::SIGTRAP,
                 pc: pc as u64,

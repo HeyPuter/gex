@@ -20,6 +20,7 @@ use gex_isa_x86::{Cond, Inst, Mem, Op, Operand, Reg, Rep, Seg, Width};
 mod block;
 mod sse;
 mod x87;
+mod x87conv;
 pub use block::{lift_block, BlockLimits};
 
 /// Pseudo system-register codes passed to the `sysreg_read`/`sysreg_write`
