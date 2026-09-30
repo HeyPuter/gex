@@ -70,6 +70,7 @@ const SAFEPOINT_INTERVAL: i32 = 1024;
 pub mod signal {
     pub const SIGILL: i32 = 4;
     pub const SIGTRAP: i32 = 5;
+    pub const SIGFPE: i32 = 8;
     pub const SIGSEGV: i32 = 11;
     pub const SIGSYS: i32 = 31;
 }
@@ -2716,6 +2717,60 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             if caller.data().nt.is_some() {
                 return nt::fault(&mut caller, nt::Fault::Breakpoint, pc as u64);
+            }
+            // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
+            // divisor and a quotient overflow alike, as SIGFPE with
+            // FPE_INTDIV at the dividing instruction.
+            if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO || imm == gex_abi::imports::BRK_DIVIDE_OVERFLOW {
+                let pc = pc as u64;
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let state = caller.data_mut();
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGFPE as u32, pc, pc)) {
+                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    _ => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGFPE,
+                            pc,
+                            detail: format!(
+                                "integer divide {} at 0x{pc:x}",
+                                if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO { "by zero" } else { "overflow" }
+                            ),
+                            internal: false,
+                        })
+                    }
+                }
+                return Err(StopExecution.into());
+            }
+            // A general-protection fault (a privileged instruction in user
+            // mode): SIGSEGV at the instruction.
+            if imm == gex_abi::imports::BRK_GENERAL_PROTECTION {
+                let pc = pc as u64;
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let state = caller.data_mut();
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, 0)) {
+                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    _ => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc,
+                            detail: format!("general protection fault (privileged instruction) at 0x{pc:x}"),
+                            internal: false,
+                        })
+                    }
+                }
+                return Err(StopExecution.into());
             }
             caller.data_mut().exit = Some(Exit::Signal {
                 signal: signal::SIGTRAP,

@@ -9265,6 +9265,25 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         }
         return;
     }
+    // A divide error (`Stmt::Trap`): x86 #DE, SIGFPE on Linux. This shim
+    // does not deliver synchronous faults to a guest handler (as with
+    // SIGILL); the process dies of the signal.
+    if raw == gex_abi::imports::BRK_DIVIDE_BY_ZERO || raw == gex_abi::imports::BRK_DIVIDE_OVERFLOW {
+        trace_line(&format!(
+            "gex: integer divide {} at pc={:#x} (SIGFPE)\n",
+            if raw == gex_abi::imports::BRK_DIVIDE_BY_ZERO { "by zero" } else { "overflow" },
+            pc
+        ));
+        with_host(|h| set_exit(h, 128 + 8));
+        trap();
+    }
+    // A general-protection fault (a privileged instruction in user mode):
+    // SIGSEGV on Linux, fatal here.
+    if raw == gex_abi::imports::BRK_GENERAL_PROTECTION {
+        trace_line(&format!("gex: general protection fault at pc={pc:#x} (SIGSEGV)\n"));
+        with_host(|h| set_exit(h, 128 + 11));
+        trap();
+    }
     // The stack-pointer check borrows this import rather than adding one, so an
     // older shim still links. Names the object, since the block that *writes* a
     // bad `sp` is elsewhere from the one that dies on it.
