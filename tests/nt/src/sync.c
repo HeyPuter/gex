@@ -159,6 +159,22 @@ int main(void) {
     WaitForMultipleObjects(4, ts, TRUE, INFINITE);
     CHECK("InitOnceExecuteOnce", once_runs == 1);
 
+    /* Waitable timers */
+    HANDLE wt = CreateWaitableTimerW(0, FALSE, 0);
+    LARGE_INTEGER due = {.QuadPart = -500000}; /* 50 ms */
+    t0 = GetTickCount64();
+    CHECK("SetWaitableTimer", SetWaitableTimer(wt, &due, 0, 0, 0, FALSE));
+    CHECK("timer not yet", WaitForSingleObject(wt, 0) == WAIT_TIMEOUT);
+    CHECK("timer fires", WaitForSingleObject(wt, 5000) == WAIT_OBJECT_0 && GetTickCount64() - t0 >= 40);
+    CHECK("synchronization timer resets", WaitForSingleObject(wt, 0) == WAIT_TIMEOUT);
+    due.QuadPart = -100000;
+    SetWaitableTimer(wt, &due, 10, 0, 0, FALSE);
+    int fired = 0;
+    for (int i = 0; i < 3; i++) fired += WaitForSingleObject(wt, 2000) == WAIT_OBJECT_0;
+    CHECK("periodic timer", fired == 3);
+    CHECK("CancelWaitableTimer", CancelWaitableTimer(wt) && WaitForSingleObject(wt, 50) == WAIT_TIMEOUT);
+    CloseHandle(wt);
+
     /* Sleep and clocks */
     LARGE_INTEGER f, q0, q1;
     QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0);

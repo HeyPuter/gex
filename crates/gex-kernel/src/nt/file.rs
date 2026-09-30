@@ -223,6 +223,18 @@ fn wants_write(access: u32) -> bool {
 
 /// Open or create. Returns the file and the `IO_STATUS_BLOCK` information.
 fn open(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, options: u32) -> R<(Arc<NtFile>, u64)> {
+    let r = open_inner(c, nt, access, disposition, options);
+    if c.p.cfg.trace {
+        let s = match &r {
+            Ok(_) => "ok".to_string(),
+            Err(e) => format!("{:#010x}", e.0),
+        };
+        eprintln!("[nt:{:x}]   {} {:?} -> {s}", c.t.tid, c.name(), wstr(nt));
+    }
+    r
+}
+
+fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, options: u32) -> R<(Arc<NtFile>, u64)> {
     let target = nt_to_target(c, nt)?;
     let path = match target {
         Target::Null => {

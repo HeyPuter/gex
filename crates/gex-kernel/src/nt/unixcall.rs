@@ -16,21 +16,17 @@ use std::sync::Mutex;
 /// ntdll's own unixlib handle.
 pub const NTDLL_HANDLE: u64 = 1;
 
-/// DLLs whose PE side copes with having no Unix side (the census's list for
-/// Noita: networking and crypto report "nothing available").
+/// DLLs whose PE side copes with having no Unix side: they get
+/// `STATUS_DLL_NOT_FOUND`.
 pub const DEGRADES: &[&str] = &[
-    "ws2_32.dll",
-    "secur32.dll",
-    "crypt32.dll",
-    "bcrypt.dll",
-    "dnsapi.dll",
-    "kerberos.dll",
-    "msv1_0.dll",
-    "netapi32.dll",
     // win32u's PE side makes no unix calls (everything is a syscall); its
     // DllMain asks only because winecrt0 always does.
     "win32u.dll",
 ];
+
+/// DLLs with a Unix side implemented here, and their ids (the handle is
+/// `(id << 16) | 1`).
+const NATIVE: &[(&str, u64)] = &[("ws2_32.dll", 2)];
 
 #[derive(Default, Debug)]
 pub struct Registry {
@@ -71,14 +67,22 @@ pub fn load_unix_lib(c: &mut Call<'_>, class: u32, addr: u64, buf: u64, len: u64
     if len != ps {
         return Err(Status(st::INFO_LENGTH_MISMATCH));
     }
-    let _ = buf;
     let name = {
         let stl = c.p.st.lock().unwrap();
         stl.images.get(&addr).map(|v| v.path.rsplit('/').next().unwrap_or(&v.path).to_ascii_lowercase())
     };
     let Some(name) = name else { return Err(Status(st::INVALID_HANDLE)) };
+    if c.p.cfg.trace {
+        eprintln!("[nt:{:x}]   MemoryWineLoadUnixLib {name}", c.t.tid);
+    }
     if DEGRADES.contains(&name.as_str()) {
         return Err(Status(st::DLL_NOT_FOUND));
+    }
+    if let Some(&(_, id)) = NATIVE.iter().find(|(n, _)| *n == name) {
+        let handle = id << 16 | 1;
+        c.p.unix.libs.lock().unwrap().insert(handle, name);
+        c.g.w64(buf, handle)?;
+        return Ok(st::SUCCESS);
     }
     Err(c.unimplemented(&format!("the Unix side of {name} (MemoryWineLoadUnixLib)")))
 }
@@ -95,6 +99,7 @@ pub fn dispatch(c: &mut Call<'_>) -> R {
     }
     let lib = c.p.unix.libs.lock().unwrap().get(&handle).cloned();
     match lib {
+        Some(name) if name == "ws2_32.dll" => ws2_32(c, code, args),
         Some(name) => Err(c.unimplemented(&format!("{name} unix call {code}"))),
         None => Err(c.unimplemented(&format!("unix call {code} on unknown handle {handle:#x}"))),
     }
@@ -129,5 +134,48 @@ fn ntdll(c: &mut Call<'_>, code: u32, args: u64) -> R {
             Err(c.unimplemented(&format!("ntdll unix call {} (there is no wineserver)", NAMES[code as usize])))
         }
         _ => Err(c.unimplemented(&format!("ntdll unix call {code}"))),
+    }
+}
+
+/// ws2_32's Unix side: name resolution (sockets themselves go through AFD).
+/// gex has no network name service: the host name is "gex", and lookups of
+/// names find nothing, as on a machine without DNS. Numeric and local
+/// lookups are not implemented yet and say so.
+fn ws2_32(c: &mut Call<'_>, code: u32, args: u64) -> R {
+    const WSAEFAULT: u32 = 10014;
+    const WSAHOST_NOT_FOUND: u32 = 11001;
+    const WSANO_DATA: u32 = 11004;
+    let ps = c.g.psize();
+    let lookup = |c: &mut Call<'_>, name_p: u64, what: &str| -> R {
+        let name = if name_p == 0 { Vec::new() } else { super::user::read_strz(&c.g, name_p)? };
+        let s = String::from_utf8_lossy(&name).to_ascii_lowercase();
+        if s.is_empty() || s == "localhost" || s == "gex" || s.parse::<std::net::IpAddr>().is_ok() {
+            return Err(c.unimplemented(&format!("ws2_32 {what} of {s:?} (local or numeric)")));
+        }
+        Ok(WSAHOST_NOT_FOUND)
+    };
+    match code {
+        // getaddrinfo { node, service, hints, info, size* }
+        0 => {
+            let node = c.g.ptr(args)?;
+            lookup(c, node, "getaddrinfo")
+        }
+        // gethostbyaddr: no reverse lookups.
+        1 => Ok(WSANO_DATA),
+        // gethostbyname { name, host, size* }
+        2 => {
+            let name = c.g.ptr(args)?;
+            lookup(c, name, "gethostbyname")
+        }
+        // gethostname { name, size }
+        3 => {
+            let (p, size) = (c.g.ptr(args)?, c.g.u32(args + ps)?);
+            if size < 4 {
+                return Ok(WSAEFAULT);
+            }
+            c.g.write(p, b"gex\0")?;
+            Ok(0)
+        }
+        _ => Err(c.unimplemented(&format!("ws2_32 unix call {code}"))),
     }
 }

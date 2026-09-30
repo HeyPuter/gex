@@ -1436,6 +1436,12 @@ pub fn nt_query_information_process(c: &mut Call<'_>) -> R {
             c.g.w32(buf, 1)?;
             4
         }
+        // ProcessAffinityMask: every processor gex reports.
+        21 => {
+            need(ps)?;
+            c.g.wptr(buf, (1u64 << super::sysinfo::PROCESSORS) - 1)?;
+            ps
+        }
         // ProcessHandleCount
         20 => {
             need(4)?;
