@@ -6,8 +6,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod func;
 pub mod pass;
 pub mod print;
+pub mod ssa;
+pub mod text;
 
 use std::fmt;
 
