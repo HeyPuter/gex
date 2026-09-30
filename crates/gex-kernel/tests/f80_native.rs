@@ -440,7 +440,7 @@ fn fprem_matches_the_hardware() {
         let (mut a, b, cw) = (rng.f80(), rng.f80(), rng.cw());
         if rng.next() % 2 == 0 {
             // Exponents close enough for a complete reduction, sometimes.
-            a.se = (a.se & 0x8000) | (b.se & 0x7fff).wrapping_add((rng.next() % 90) as u16 - 10);
+            a.se = (a.se & 0x8000) | (b.se & 0x7fff).wrapping_add(((rng.next() % 90) as u16).wrapping_sub(10));
         }
         for nearest in [false, true] {
             let (want, wsw) = if nearest { n_prem1(a, b, cw) } else { n_prem(a, b, cw) };

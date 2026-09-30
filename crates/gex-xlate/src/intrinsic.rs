@@ -39,7 +39,27 @@ pub enum Intrinsic {
     /// stronger contract satisfies them too. The odd one out: no wasm
     /// instruction backs it, so the backend emits a loop (see `recognise`).
     MemCmp,
+    /// A user-supplied replacement (`gex-eject`'s library replacement): the
+    /// function becomes one host call, `sysreg_write(pc, REPLACE_SYSREG, id)`,
+    /// and a return. The host runs replacement `id` (a wasm function the
+    /// ejected project was built with) against the context, which reads its
+    /// arguments from the guest's argument registers and writes its result
+    /// back, and then the block returns to the caller as the function would.
+    ///
+    /// Never produced by [`recognise`]: an eject build puts it in
+    /// [`crate::Options::intrinsics`] at the address of the symbol it
+    /// replaces, so every way of reaching that address -- a direct call, a
+    /// PLT stub through its resolved GOT slot, a function pointer -- runs the
+    /// replacement.
+    Replace(u32),
 }
+
+/// The `sysreg_write` register number a [`Intrinsic::Replace`] block passes.
+/// Negative like gex's other private numbers (`-1`..`-10` on AArch64, `-100`
+/// and `-101` on x86-64), and far from them. A host that does not know it
+/// must fail loudly rather than ignore it: the function it stands for did not
+/// run.
+pub const REPLACE_SYSREG: i32 = -200;
 
 /// The intrinsic a symbol names, if it names one. Matches both the public name
 /// and glibc's private `__memcpy_*` implementations, since on aarch64 the
@@ -112,6 +132,15 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
             // a signed 64-bit value sees the sign.
             let wide = b.extend(r, true);
             b.write(GuestReg::X(0), wide);
+        }
+        Intrinsic::Replace(id) => {
+            let pc = b.const_i64(addr);
+            let reg = b.const_i32(REPLACE_SYSREG as u32);
+            let id = b.const_i64(u64::from(id));
+            b.stmt(Stmt::HostCall {
+                func: HostFunc::SysRegWrite,
+                args: vec![pc, reg, id],
+            });
         }
     }
     // `memcpy`, `memmove` and `memset` return their first argument. On
@@ -211,6 +240,36 @@ mod tests {
             .stmts
             .iter()
             .any(|s| matches!(s, Stmt::WriteReg { reg: GuestReg::X(0), .. })));
+    }
+
+    #[test]
+    fn a_replacement_is_one_host_call_and_a_return() {
+        let b = block(0x1000, Intrinsic::Replace(7));
+        let calls: Vec<_> = b
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::HostCall { func, args } => Some((*func, args.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, vec![(HostFunc::SysRegWrite, 3)]);
+        assert!(matches!(b.term, Term::Indirect { is_ret: true, .. }));
+        // The replacement writes the result itself; the block writes no
+        // register but the stack pointer x86-64's return pops.
+        let writes: Vec<_> = b
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::WriteReg { reg, .. } => Some(*reg),
+                _ => None,
+            })
+            .collect();
+        if gex_abi::X86 {
+            assert_eq!(writes, vec![GuestReg::X(4)]);
+        } else {
+            assert!(writes.is_empty());
+        }
     }
 
     #[test]

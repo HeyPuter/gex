@@ -21,6 +21,7 @@ members = [
     "crates/gex-gpu",
     "crates/gex-gl",
     "crates/gex-virgl",
+    "crates/gex-eject",
     "crates/gexc",
     "shims/browser",
     "shims/hostwl",
@@ -57,6 +58,7 @@ gex-xlate = { path = "crates/gex-xlate" }
 gex-ld = { path = "crates/gex-ld" }
 gex-kernel = { path = "crates/gex-kernel" }
 gex-native = { path = "shims/native" }
+gex-eject = { path = "crates/gex-eject" }
 
 [profile.release]
 opt-level = 3

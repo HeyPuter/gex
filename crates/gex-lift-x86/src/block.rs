@@ -136,6 +136,54 @@ mod tests {
         );
     }
 
+    /// `div`/`idiv` fault before writing anything: a Trap for a zero
+    /// divisor, then one for an overflowing quotient, then the writes.
+    #[test]
+    fn division_traps_before_it_writes() {
+        // div ecx ; ret
+        let b = lift_block(bytes(0x1000, &[0xf7, 0xf1, 0xc3]), 0x1000, BlockLimits::default());
+        let traps: Vec<(usize, i32)> = b
+            .stmts
+            .iter()
+            .enumerate()
+            .filter_map(|(n, s)| match s {
+                Stmt::Trap { code, pc, .. } if *pc == 0x1000 => Some((n, *code)),
+                _ => None,
+            })
+            .collect();
+        let codes: Vec<i32> = traps.iter().map(|t| t.1).collect();
+        assert_eq!(
+            codes,
+            vec![gex_abi::imports::BRK_DIVIDE_BY_ZERO, gex_abi::imports::BRK_DIVIDE_OVERFLOW],
+            "{}",
+            print::block(&b)
+        );
+        let first_write = b
+            .stmts
+            .iter()
+            .position(|s| matches!(s, Stmt::WriteReg { reg: gex_ir::GuestReg::X(0 | 2), .. }))
+            .unwrap();
+        assert!(traps.iter().all(|t| t.0 < first_write), "{}", print::block(&b));
+    }
+
+    /// `hlt` in user mode is a general-protection fault (SIGSEGV on Linux),
+    /// raised unconditionally; so are cli/sti and in/out.
+    #[test]
+    fn privileged_instructions_fault() {
+        for code in [&[0xf4u8][..], &[0xfa], &[0xfb], &[0xe4, 0x60], &[0xee], &[0x6c]] {
+            let b = lift_block(bytes(0x1000, code), 0x1000, BlockLimits::default());
+            assert!(
+                b.stmts.iter().any(|s| matches!(
+                    s,
+                    Stmt::Trap { code: gex_abi::imports::BRK_GENERAL_PROTECTION, pc: 0x1000, .. }
+                )),
+                "{code:x?}: {}",
+                print::block(&b)
+            );
+            assert_eq!(b.end, 0x1000 + code.len() as u64);
+        }
+    }
+
     #[test]
     fn straight_line_ends_at_ret() {
         // mov eax, 1 ; mov ecx, 2 ; ret
