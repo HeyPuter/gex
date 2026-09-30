@@ -42,6 +42,7 @@ pub use arch::{lift_block, BlockLimits};
 use gex_abi::INST_ALIGN;
 
 pub mod intrinsic;
+pub mod profile;
 pub use intrinsic::Intrinsic;
 
 /// Knobs for a translation run.
