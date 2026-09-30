@@ -181,14 +181,60 @@ exactly tier-1's flat stack.
 
 In Phase B C frames nest (a guest call is a wasm call). The host's existing
 escape — trap out of the whole wasm stack and resume from `ctx` — is then
-correct **provided every frame's state is architectural at every call that can
-reach a syscall or safepoint**. Phase B's baseline scheme guarantees that
-without landing pads: at every call it writes back all dirty registers (and
-the return address is real guest state, x30 or the pushed slot), and after
-every call it reloads. Registers stay in locals across *blocks* and *loops*,
-not across calls. Landing pads (S7) become necessary exactly when a pass keeps
-state in locals across a call (callee-saved registers, promoted stack slots);
-the `may_unwind` summaries then decide where.
+correct **provided every frame's state is architectural at every point the
+host can act on**. Phase B guarantees that without landing pads. Registers
+and flags are C locals across the whole function (loaded at entry, reloaded
+after every call and clobbering host call), and write-backs follow one
+invariant.
+
+### 5.1 The write-back invariant
+
+> **At every host-visible point — a syscall, a safepoint, a clobbering host
+> call, a trap, a return to dispatch — all *live* architectural state is
+> exact in the context. Flags that no continuation reads are unspecified,
+> exactly as tier-1's dead-flag elimination already allows.**
+
+Concretely (`func.rs`):
+
+* Only registers that may differ from the context are stored (clean-spill
+  elision: `dirty_in`, a forward may-analysis; a call, syscall or clobbering
+  host call makes everything clean again, since everything is reloaded).
+* Every exit that leaves the function (return to dispatch, tail call,
+  syscall, unknown or indirect call, unresolved jump, switch default) and
+  every safepoint write back **every dirty register**, flags excepted: the
+  flags are written only where they may be read (`live_in`, a backward
+  liveness over the function; at a safepoint, the loop head's live set).
+* A call to a function-tier callee writes back every dirty non-flag
+  register, plus the flags the callee's summary reads or the continuation
+  reads — unless the callee is **trap-free** (`trap_free`): S2's summary
+  says it cannot unwind, leave pending or reach unknown code, and it has no
+  syscall, no safepoint (no backward edge, no tail call), no clobbering host
+  call, no exit from the tier, no indirect call and no recursion, and calls
+  only trap-free functions. Nothing the host observes or resumes from can
+  happen before a trap-free callee returns, so its callers store only what
+  it reads plus what their continuation reads. 15% of the known call sites
+  of the Tier 0 kernels (AArch64) qualify, 19% of the functions.
+* A summarised callee's `preserved` registers are not reloaded after it
+  returns as expected.
+* A guest `ret` that goes where the caller expects writes back every dirty
+  non-flag register, and the flags only if the caller's continuation reads
+  one (§7, predicted returns).
+
+The one theoretical exposure: a signal handler reading its `ucontext`, or an
+NT `CONTEXT` capture, can see stale dead flags. Tier-1 shows the same today.
+
+Validation (`crates/gex-cgen/tools/lockstep-gate`, part of Gate B and of
+every later pass's gate) compares against tier-1 syscall by syscall twice:
+(a) the default build with the flags left out (`lockstep --ignore-flags`),
+and (b) `GEX_CGEN_LIVE=0`, which writes every flag back at every exit,
+compared exactly. A divergence in (a), or in a non-flag register in (b), is a
+bug. `GEX_CGEN_MUTATE=IGNOREUNWIND` (every summarised callee treated as
+trap-free) and `=NORETCHECK` (every return treated as expected) are the
+mutations that show the rules are needed.
+
+Landing pads (S7) become necessary exactly when a pass keeps live state in
+locals across a call that is not trap-free (callee-saved registers, promoted
+stack slots); the `may_unwind` summaries then decide where.
 
 ## 6. Tail calls
 
@@ -197,7 +243,10 @@ Every function the C side registers or chains to has the C type
 so `__attribute__((musttail))` is always legal (clang requires identical
 signatures) and lowers to `return_call` under `-mtail-call`. Unknown or
 computed targets store `ctx::PC` and `musttail` into `gexc_dispatch(ctx)`,
-which the splice turns into the dispatch function of §1. Observed with clang
+which the splice turns into the dispatch function of §1. (Phase B's bodies
+share one internal signature of their own, `int f(ctx, depth, need, ret)`,
+so `musttail` between them is equally legal; only `F_entry` has the uniform
+one.) Observed with clang
 22: a cycle of `musttail` among functions of one translation unit becomes a
 loop after inlining, so Phase A already gets some loop formation for free (the
 context traffic stays, since the stores are to memory).
@@ -228,24 +277,40 @@ wasm stack growth. So the rule is:
 
 Each function-tier function therefore has two forms:
 
-* `F_body(ctx)`: the code. A guest `ret` writes back, sets `PC` to the return
-  address and *returns*; so does any exit to unknown code. C callers call
-  this with a wasm call and apply the return check.
+* `int F_body(ctx, depth, need, ret)`: the code. C callers call it with a
+  wasm call. `ret` is the return address the caller set up (in x30, or the
+  slot the x86-64 `call` pushed); `need` says whether the caller's
+  continuation reads a flag; `depth` is §7.1's.
 * `F_entry(ctx)`: registered in the dispatch table with the uniform signature
-  (§4.1.2). `F_body(ctx); musttail gexc_dispatch(ctx);` — it is the nest root:
-  whatever made `F_body` return (a real return, `longjmp`, an exit to tier-1),
-  `ctx::PC` says where to go next, and the root goes there flat.
+  (§4.1.2). `F_body(ctx, 0, all, ~0); musttail gexc_dispatch(ctx);` — it is
+  the nest root: whatever made `F_body` return (a real return, `longjmp`, an
+  exit to tier-1), `ctx::PC` says where to go next, and the root polls and
+  goes there flat.
+
+**Predicted returns.** The return check lives in the callee, which knows
+both halves of it: a guest `ret` whose target is `ret` with SP back at its
+entry value (plus the popped slot on x86-64) is the return the caller
+expects. The callee writes back every dirty non-flag register (and the flags
+if `need` asks) and returns **1**: the caller carries on without reading the
+context. Any other exit — an unexpected return target, a tail call or jump to
+code the tier does not own, a switch default, an unresolved jump, the depth
+guard — writes back everything, sets `ctx::PC`, and returns **0**; every C
+caller then returns 0 too, with nothing to write back, and the root
+dispatches on `ctx::PC`. A return stores no PC and does not poll: every
+dynamic cycle still passes a loop back-edge, a known tail call (which polls)
+or the root (which polls).
 
 This is pewasm's pending-jump trampoline (`recomp_jmp_pending` +
-`recomp_run_pending`) with the pending flag replaced by the PC comparison,
-and it is the same mechanism as §4.2's return check, so it costs nothing extra:
-one compare per call site. It handles `longjmp` (the `ret` into setjmp's frame
-fails every check on the way down and resumes there in tier-1), `ret` used as
-a computed jump, and coroutine stack switches the same way.
+`recomp_run_pending`) with the pending flag replaced by the callee's
+prediction, and it is §4.2's return check, moved to where it is cheapest:
+one compare in the callee, one test of the result in the caller. It handles
+`longjmp` (the `ret` into setjmp's frame is not the one expected, so every
+frame on the way down returns 0 and the root resumes there in tier-1), `ret`
+used as a computed jump, and coroutine stack switches the same way.
 
 Guest tail calls (`b G` to another function's entry) are C `musttail`
-`G_body(ctx)`: G returns to F's caller, whose check sees its own return
-address. Indirect calls (`blr`) compare the target against the module's
+`G_body(ctx, depth, need, ret)`: G returns to F's caller with F's
+prediction. Indirect calls (`blr`) compare the target against the module's
 function entries (a `switch`, lowered to compares or a `br_table`) and call
 the matching `_body`; anything else leaves as above. That is the slow path
 pewasm's inline dispatch-cache probe and profile-guided devirtualization
@@ -267,19 +332,20 @@ exhaust wasmtime (`max_wasm_stack`, 512 KiB: ~5,000 frames of that function)
 and V8 (~984 KiB: "Maximum call stack size exceeded" at ~5,500). So the
 nest's stack use is bounded, with the same leave-by-returning mechanism:
 
-* `F_body` takes a second parameter, `depth`: an estimate, in bytes, of the
-  engine stack the C frames below it in this nest use. The root calls
-  `F_body(ctx, 0)`; a call passes `depth + W(F)`, where `W(F)` is the
+* `F_body`'s `depth` parameter is an estimate, in bytes, of the
+  engine stack the C frames below it in this nest use. The root passes 0;
+  a call passes `depth + W(F)`, where `W(F)` is the
   caller's frame estimate (`64 + 3 ×` the bytes of the registers it keeps in
   locals; clang's wasm locals measured up to ~2.5× those bytes on coremark,
   and the rest covers the engine's spill slots and frame header). A guest
   tail call (`musttail`) passes `depth` unchanged: the frame is replaced.
   An indirect call through the entry `switch` adds that helper's frame too.
 * `F_body`'s first statement, before any register is loaded: if
-  `depth > BUDGET − W(F)`, set `ctx::PC = F` and return. Every caller wrote
-  everything back before the call, so this is exactly "the caller left for
-  F" (§7): the caller's return check fails (PC is F, not its return
-  address), it returns, and so does every frame of the nest; the root
+  `depth > BUDGET − RESERVE − W(F)`, set `ctx::PC = F` and return 0. Every
+  caller of a function with a guard wrote everything back before the call
+  (§5.1: a function with a guard is not trap-free), so this is exactly "the
+  caller left for F" (§7): the caller returns 0, and so does every frame of
+  the nest; the root
   dispatches on `ctx::PC = F`, which enters `F_entry` and starts a new nest
   at depth 0. The frames that were unwound finish in tier-1 when their
   callees return into them (their return addresses are real guest state).
@@ -288,12 +354,18 @@ nest's stack use is bounded, with the same leave-by-returning mechanism:
   unwind discards it with the rest of the wasm stack, and a nest the host
   starts afresh (the root after `resume_at`, a nested guest loop) starts at
   zero, with its own budget on top of whatever stack its caller used.
+* Trap-free functions (§5.1) have no guard: their callers need not have
+  written everything back, so they must not leave. They are not recursive,
+  and a trap-free function's whole subtree must fit in `RESERVE` (64 KiB of
+  estimate), which every guarded function keeps free below the budget.
 * `BUDGET` is 384 KiB of estimate (`GEX_CGEN_STACK_BUDGET` overrides it).
   The estimate is conservative against both engines: `deep_recursion`'s
   function (AArch64) is estimated at 304 bytes and uses ~100 (wasmtime) and
   ~180 (V8), so a nest holds ~1,290 of its frames where either engine holds
   ~5,000.
   Cost: one compare on entry, one add per call; no memory traffic.
+  `GEX_CGEN_STACK_BUDGET=<huge>` is the mutation: `deep_recursion` then
+  exhausts the engine's stack again.
 
 Recursion deeper than the budget therefore runs as a sequence of nests of
 bounded depth, each unwound by returning, with the unwound frames' remaining
@@ -320,9 +392,29 @@ work in tier-1.
 
 ## 9. Not handled yet (Phase B, before S7)
 
-* Landing pads and `gex_unwind` (S7). The baseline scheme does not need them
-  for correctness (§5), only for passes that keep state in locals across calls.
+* Landing pads and `gex_unwind` (S7). The write-back invariant (§5.1) does
+  not need them, only passes that keep live state in locals across calls
+  that are not trap-free.
 * Interior entries, undiscovered code, runtime-modified code: tier-1 (the
   splice leaves those blocks' tier-1 bodies in place).
 * Invalidation when a function's pages change (the x86-64 `guard` bytes):
   a guarded block is not given to the function tier.
+
+## 10. Where Phase B's functions come from
+
+`translate_image` runs S2's recovery (`gex_xlate::func::recover`) and its
+call-graph summaries (`summary::analyze`) on the image and hands gex-cgen the
+memory-form functions and the summaries. Jump tables are in-function
+`switch`es (their default leaves). Functions whose entry tier-1 serves with a
+host builtin (`intrinsic`: memcpy and friends) are re-formed from that
+tier-1 block, so C callers get the builtin. A function sharing a page with a
+block that has a self-modification guard stays tier-1. Only entries tier-1
+also has a block for are registered in dispatch; the others are reached by C
+calls only. No ELF bytes reach `translate_image`, so `.eh_frame` does not
+seed recovery there yet (symbols, relocations and call targets do).
+`GEX_CGEN_RECOVER=standin` keeps the earlier stand-in (`recover.rs`: symbols
+and call targets, no jump tables), for comparison. `GEX_CGEN_STATS=1` prints
+what the emitted functions do at their exits.
+
+Profiling (`GEX_PROFILE=1`, `gexc run --record`) and the function tier are
+refused together, loudly: the C code carries no profiling hooks.
