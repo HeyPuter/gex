@@ -27,6 +27,16 @@ use wasmtime::{AsContextMut, Memory, MemoryType};
 /// The recorder for this run, when recording.
 static RECORDER: OnceLock<Arc<Recorder>> = OnceLock::new();
 
+/// Where the first program was read from on the host, as the driver knows
+/// it. The guest-visible path the kernel reports for it is derived from
+/// argv[0] and may not lead back to the same file.
+static EXE_HOST_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Tell the recorder which host file the first program was loaded from.
+pub fn set_exe_host_path(path: PathBuf) {
+    *EXE_HOST_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+
 /// Everything folded in so far.
 pub struct Recorder {
     out: PathBuf,
@@ -65,8 +75,8 @@ pub struct StoreProf {
     proc: Arc<ProcProf>,
     /// `(syscall pc, enclosing function, canonical nr)` -> count.
     syscalls: HashMap<(u64, Option<u64>, u64), u64>,
-    /// An open/openat/execve in flight: `(canonical nr, path, flags)`.
-    pending: Option<(u64, String, u64)>,
+    /// An open/openat/execve in flight: `(canonical nr, path, flags, dirfd)`.
+    pending: Option<(u64, String, u64, u64)>,
 }
 
 /// Start recording into `out`. Idempotent: the first call wins.
@@ -161,7 +171,21 @@ pub fn new_process(
     }
     let mut pl = proc.placements.lock().unwrap_or_else(|e| e.into_inner());
     for (path, image, role) in images {
-        let Some(fid) = file_id(&mut st, kernel, &path, role) else {
+        // The file must be the one the image came from: its entry point,
+        // biased, is the image's. Otherwise try the driver's host path.
+        let matches = |fid: &FileId| {
+            elf_entry(&fid.head).map(|e| e.wrapping_add(image.bias)) == Some(image.entry)
+        };
+        let mut fid = file_id(&mut st, kernel, &path, role).filter(|f| matches(f));
+        if fid.is_none() && role == "exe" {
+            let host = EXE_HOST_PATH.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(bytes) = host.as_ref().and_then(|h| std::fs::read(h).ok()) {
+                let host = host.map(|h| h.to_string_lossy().into_owned());
+                fid = Some(register(&mut st, &path, &bytes, role, host)).filter(|f| matches(f));
+            }
+        }
+        let Some(fid) = fid else {
+            eprintln!("gex: profile: cannot identify {role} {path}; its code is recorded as anonymous");
             continue;
         };
         st.profile.note_path(&fid.id, &path);
@@ -198,28 +222,47 @@ fn file_id(st: &mut RecState, kernel: &gex_kernel::Kernel, path: &str, role: &st
         return v.clone();
     }
     let got = kernel.read_file(path).map(|bytes| {
-        let mut h = gex_cache::sha256::Sha256::new();
-        h.update(&bytes);
-        let id = format!("sha256:{}", gex_cache::sha256::hex(&h.finish()));
         let host_path = st
             .session
             .sysroot
             .as_ref()
             .map(|r| format!("{}/{}", r.trim_end_matches('/'), path.trim_start_matches('/')));
-        st.session.add_object(ObjectEntry {
-            id: id.clone(),
-            path: path.to_string(),
-            host_path,
-            size: bytes.len() as u64,
-            role: role.to_string(),
-        });
-        FileId {
-            id,
-            head: bytes[..bytes.len().min(1 << 16)].to_vec(),
-        }
+        register(st, path, &bytes, role, host_path)
     });
     st.ids.insert(path.to_string(), got.clone());
     got
+}
+
+/// Hash a file's bytes and add it to the session's objects.
+fn register(st: &mut RecState, path: &str, bytes: &[u8], role: &str, host_path: Option<String>) -> FileId {
+    let mut h = gex_cache::sha256::Sha256::new();
+    h.update(bytes);
+    let id = format!("sha256:{}", gex_cache::sha256::hex(&h.finish()));
+    st.session.add_object(ObjectEntry {
+        id: id.clone(),
+        path: path.to_string(),
+        host_path,
+        size: bytes.len() as u64,
+        role: role.to_string(),
+    });
+    let fid = FileId {
+        id,
+        head: bytes[..bytes.len().min(1 << 16)].to_vec(),
+    };
+    st.ids.insert(path.to_string(), Some(fid.clone()));
+    fid
+}
+
+/// `e_entry` of an ELF file.
+fn elf_entry(head: &[u8]) -> Option<u64> {
+    if head.get(..4)? != b"\x7fELF" {
+        return None;
+    }
+    if *head.get(4)? == 2 {
+        Some(u64::from_le_bytes(head.get(0x18..0x20)?.try_into().ok()?))
+    } else {
+        Some(u32::from_le_bytes(head.get(0x18..0x1c)?.try_into().ok()?) as u64)
+    }
 }
 
 /// Name every file-backed executable mapping the kernel has now.
@@ -416,15 +459,7 @@ pub fn syscall_enter(
             _ => None,
         }
     };
-    sp.pending = named.and_then(|(ptr, flags, dirfd)| {
-        let path = read_cstr(gm, ptr)?;
-        let path = if path.starts_with('/') || dirfd == AT_FDCWD {
-            path
-        } else {
-            format!("<fd {}>/{path}", dirfd as i64)
-        };
-        Some((nr, path, flags))
-    });
+    sp.pending = named.and_then(|(ptr, flags, dirfd)| Some((nr, read_cstr(gm, ptr)?, flags, dirfd)));
 }
 
 /// After a syscall: record the outcome of a pending open.
@@ -432,7 +467,7 @@ pub fn syscall_exit(state: &mut HostState, data: &[u8]) {
     let (Some(rec), Some(sp)) = (recorder(), state.prof.as_mut()) else {
         return;
     };
-    let Some((nr, path, flags)) = sp.pending.take() else {
+    let Some((nr, path, flags, dirfd)) = sp.pending.take() else {
         return;
     };
     let ctx_addr = state.thread.ctx_addr as usize + gex_abi::ctx::SYSCALL_RET;
@@ -440,11 +475,23 @@ pub fn syscall_exit(state: &mut HostState, data: &[u8]) {
         .get(ctx_addr..ctx_addr + 8)
         .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
         .unwrap_or(0);
-    let path = if path.starts_with('/') || path.starts_with('<') {
+    // Relative paths are made absolute against the directory they were
+    // relative to, as the kernel saw it.
+    let path = if path.starts_with('/') {
         path
     } else {
-        let cwd = state.with_kernel(|k| k.vfs.cwd.clone());
-        format!("{}/{path}", cwd.trim_end_matches('/'))
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let dir = state.with_kernel(|k| {
+            if dirfd == AT_FDCWD {
+                Some(k.vfs.cwd.clone())
+            } else {
+                k.fds.get(dirfd as i32).ok().map(|f| f.path.clone())
+            }
+        });
+        match dir {
+            Some(d) => format!("{}/{path}", d.trim_end_matches('/')),
+            None => format!("<fd {}>/{path}", dirfd as i64),
+        }
     };
     let mut st = rec.state.lock().unwrap_or_else(|e| e.into_inner());
     let f = st.session.files.entry(path.clone()).or_insert_with(|| FileEntry {
@@ -526,7 +573,7 @@ pub fn finish(exit: &crate::Exit) -> Result<Option<PathBuf>> {
     Ok(Some(rec.out.clone()))
 }
 
-#[cfg(all(test, not(feature = "x86")))]
+#[cfg(test)]
 mod tests {
     use gex_ld::elf::{Image, Segment};
 
@@ -535,18 +582,29 @@ mod tests {
     #[test]
     fn records_calls_returns_and_syscalls() {
         let base = 0x40_0000u64;
-        let code: [u32; 6] = [
-            0xd2800000, // movz x0, #0
-            0x94000004, // bl f
-            0x94000003, // bl f
-            0xd2800bc8, // movz x8, #94
-            0xd4000001, // svc #0
-            0xd65f03c0, // f: ret
-        ];
-        let mut bytes = Vec::new();
-        for w in code {
-            bytes.extend_from_slice(&w.to_le_bytes());
-        }
+        let (bytes, f_off): (Vec<u8>, u64) = if gex_abi::X86 {
+            (
+                vec![
+                    0xe8, 14, 0, 0, 0, // call f
+                    0xe8, 9, 0, 0, 0, // call f
+                    0xb8, 231, 0, 0, 0, // mov eax, 231 (exit_group)
+                    0x31, 0xff, // xor edi, edi
+                    0x0f, 0x05, // syscall
+                    0xc3, // f: ret
+                ],
+                19,
+            )
+        } else {
+            let code: [u32; 6] = [
+                0xd2800000, // movz x0, #0
+                0x94000004, // bl f
+                0x94000003, // bl f
+                0xd2800bc8, // movz x8, #94
+                0xd4000001, // svc #0
+                0xd65f03c0, // f: ret
+            ];
+            (code.iter().flat_map(|w| w.to_le_bytes()).collect(), 20)
+        };
         let len = bytes.len() as u64;
         let image = Image {
             soname: None,
@@ -594,9 +652,9 @@ mod tests {
         let p = gex_xlate::profile::Profile::from_json(&text).unwrap();
         // No file behind the image, so its code is anonymous, by address.
         let o = &p.objects[gex_xlate::profile::ANON];
-        let f = &o.blocks[&(base + 20)];
+        let f = &o.blocks[&(base + f_off)];
         assert_eq!((f.n, f.call), (2, 2), "{text}");
-        let r = &o.returns[&(base + 20)];
+        let r = &o.returns[&(base + f_off)];
         assert_eq!((r.expected, r.unexpected), (2, 0), "{text}");
         let sys: u64 = o.syscalls.iter().filter(|((_, _, nr), _)| *nr == 94).map(|(_, n)| n).sum();
         assert_eq!(sys, 1, "{text}");

@@ -354,6 +354,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     }
 
     ra.opts.jit = ra.jit;
+    if ra.opts.record.is_some() {
+        gex_native::profile::set_exe_host_path(ra.path.clone().into());
+    }
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
     if let Some(dir) = gex_native::profile::finish(&exit)? {
         if ra.opts.verbose {

@@ -132,15 +132,22 @@ Numbers are unsigned decimal. A reader rejects any other `format` or
 - **`objects`** is the loaded closure: the executable, the interpreter, and
   every file-backed executable mapping (libraries, including `dlopen`ed ones).
   - Paths are guest paths.
-  - `host_path` is where gex read the file from, when a sysroot is in use.
+  - `host_path` is where gex read the file from: under the sysroot when one is
+    in use, or the path the driver was given for the first program when its
+    guest path does not lead back to the same file.
+  - An object is only named when the file's entry point matches the loaded
+    image's. Otherwise gex warns and records its code under `anon`.
 - **`programs`** lists the first program and every `execve`, in order, with
   its argv and environment.
 - **`syscalls`** are canonical numbers with counts, over the whole process
   tree.
 - **`files`** lists every path passed to `open`, `openat`, `creat` or
   `execve`:
-  - Relative paths are resolved against the working directory.
-  - A path relative to another descriptor is written `<fd N>/path`.
+  - Relative paths are made absolute against the working directory, or
+    against the directory descriptor an `openat` named, as the kernel saw
+    them at the time.
+  - Only when that descriptor has no known path is it written
+    `<fd N>/path`.
   - Failed opens are kept (with the last `errno`), because a program that
     probes for a missing file needs it to stay missing.
 
