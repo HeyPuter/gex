@@ -297,6 +297,19 @@ compat_table! {
     glEndList: fn();
     glCallList: fn(GLuint);
     glDeleteLists: fn(GLuint, GLsizei);
+    glEnableClientState: fn(GLenum);
+    glDisableClientState: fn(GLenum);
+    glVertexPointer: fn(GLint, GLenum, GLsizei, *const c_void);
+    glColorPointer: fn(GLint, GLenum, GLsizei, *const c_void);
+    glTexCoordPointer: fn(GLint, GLenum, GLsizei, *const c_void);
+    glClientActiveTexture: fn(GLenum);
+    glOrtho: fn(f64, f64, f64, f64, f64, f64);
+    glScalef: fn(GLfloat, GLfloat, GLfloat);
+    glLoadMatrixf: fn(*const GLfloat);
+    glMultMatrixf: fn(*const GLfloat);
+    glColor4f: fn(GLfloat, GLfloat, GLfloat, GLfloat);
+    glTexEnvi: fn(GLenum, GLenum, GLint);
+    glAlphaFunc: fn(GLenum, GLfloat);
 }
 
 /// Guest object names to the host's, for the kinds GL insists on naming.
@@ -1295,7 +1308,7 @@ impl Gl {
                 }
 
                 // Fixed function: only in a desktop context.
-                op::MATRIX_MODE..=op::DELETE_LISTS => {
+                op::MATRIX_MODE..=op::ALPHA_FUNC => {
                     let Some(f) = &self.compat else { return false };
                     match opcode {
                         op::MATRIX_MODE => {
@@ -1372,6 +1385,66 @@ impl Gl {
                         op::DELETE_LISTS => {
                             let (Some(l), Some(n)) = (a.u32(), a.i32()) else { return true };
                             (f.glDeleteLists)(l, n);
+                        }
+                        op::ENABLE_CLIENT_STATE | op::DISABLE_CLIENT_STATE => {
+                            let Some(cap) = a.u32() else { return true };
+                            if opcode == op::ENABLE_CLIENT_STATE {
+                                (f.glEnableClientState)(cap);
+                            } else {
+                                (f.glDisableClientState)(cap);
+                            }
+                        }
+                        op::VERTEX_POINTER | op::COLOR_POINTER | op::TEX_COORD_POINTER => {
+                            let (Some(size), Some(ty), Some(stride), Some(offset)) = (a.i32(), a.u32(), a.i32(), a.u64())
+                            else {
+                                return true;
+                            };
+                            let p = offset as usize as *const c_void;
+                            match opcode {
+                                op::VERTEX_POINTER => (f.glVertexPointer)(size, ty, stride, p),
+                                op::COLOR_POINTER => (f.glColorPointer)(size, ty, stride, p),
+                                _ => (f.glTexCoordPointer)(size, ty, stride, p),
+                            }
+                        }
+                        op::CLIENT_ACTIVE_TEXTURE => {
+                            let Some(u) = a.u32() else { return true };
+                            (f.glClientActiveTexture)(u);
+                        }
+                        op::ORTHO => {
+                            let v: Vec<f64> = (0..6).filter_map(|_| a.f64()).collect();
+                            if v.len() != 6 {
+                                return true;
+                            }
+                            (f.glOrtho)(v[0], v[1], v[2], v[3], v[4], v[5]);
+                        }
+                        op::SCALEF => {
+                            let (Some(x), Some(y), Some(z)) = (a.f32(), a.f32(), a.f32()) else { return true };
+                            (f.glScalef)(x, y, z);
+                        }
+                        op::LOAD_MATRIXF | op::MULT_MATRIXF => {
+                            let m: Vec<f32> = (0..16).filter_map(|_| a.f32()).collect();
+                            if m.len() != 16 {
+                                return true;
+                            }
+                            if opcode == op::LOAD_MATRIXF {
+                                (f.glLoadMatrixf)(m.as_ptr());
+                            } else {
+                                (f.glMultMatrixf)(m.as_ptr());
+                            }
+                        }
+                        op::COLOR4F => {
+                            let (Some(r), Some(g), Some(b2), Some(al)) = (a.f32(), a.f32(), a.f32(), a.f32()) else {
+                                return true;
+                            };
+                            (f.glColor4f)(r, g, b2, al);
+                        }
+                        op::TEX_ENVI => {
+                            let (Some(t), Some(pn), Some(v)) = (a.u32(), a.u32(), a.i32()) else { return true };
+                            (f.glTexEnvi)(t, pn, v);
+                        }
+                        op::ALPHA_FUNC => {
+                            let (Some(func), Some(r)) = (a.u32(), a.f32()) else { return true };
+                            (f.glAlphaFunc)(func, r);
                         }
                         _ => return false,
                     }
@@ -1694,5 +1767,115 @@ mod tests {
         let px = read_blob(r, &mut at);
         assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
         assert_eq!(pixel16(&px, 7, 7), (255, 0, 0, 255), "the clear went to the texture");
+    }
+
+    /// Protocol 11: client arrays from a buffer, an orthographic projection
+    /// and scaling, a loaded matrix, the current color and the alpha test.
+    #[test]
+    fn protocol_11_client_arrays_and_fixed_function_matrices() {
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        const GL_PROJECTION: u32 = 0x1701;
+        const GL_MODELVIEW: u32 = 0x1700;
+        const GL_VERTEX_ARRAY: u32 = 0x8074;
+        const GL_COLOR_ARRAY: u32 = 0x8076;
+        const GL_TEXTURE_COORD_ARRAY: u32 = 0x8078;
+        const GL_TEXTURE0: u32 = 0x84C0;
+        const GL_TEXTURE_ENV: u32 = 0x2300;
+        const GL_TEXTURE_ENV_MODE: u32 = 0x2200;
+        const GL_MODULATE: u32 = 0x2100;
+        const GL_ALPHA_TEST: u32 = 0x0BC0;
+        const GL_GREATER: u32 = 0x0204;
+        const GL_QUADS: u32 = 0x0007;
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 2, 1]);
+        let _ = gl.run(b.bytes());
+        if !gl.is_desktop() {
+            eprintln!("skipping: the host has no desktop OpenGL");
+            return;
+        }
+        let f = |v: f32| v.to_bits();
+        let d = |v: f64| Batch::words64(v.to_bits());
+        let mut ortho = Vec::new();
+        for v in [0.0, 16.0, 0.0, 16.0, -1.0, 1.0] {
+            ortho.extend_from_slice(&d(v));
+        }
+        // A quad over x 0..4 (scaled by 2 to 0..8), all rows, in red.
+        let mut bytes = Vec::new();
+        for (x, y) in [(0.0f32, 0.0f32), (4.0, 0.0), (4.0, 16.0), (0.0, 16.0)] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
+        }
+        for _ in 0..4 {
+            bytes.extend_from_slice(&[255, 0, 0, 255]);
+        }
+        let mut b = Batch::new();
+        b.cmd(op::MATRIX_MODE, &[GL_PROJECTION]);
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::ORTHO, &ortho);
+        b.cmd(op::MATRIX_MODE, &[GL_MODELVIEW]);
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::SCALEF, &[f(2.0), f(1.0), f(1.0)]);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, f(1.0)]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::GEN_BUFFERS, &[1, 9]);
+        b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 9]);
+        b.raw(op::BUFFER_DATA, &[GL_ARRAY_BUFFER, GL_STATIC_DRAW, bytes.len() as u32, 0, 1, bytes.len() as u32], &bytes);
+        b.cmd(op::ENABLE_CLIENT_STATE, &[GL_VERTEX_ARRAY]);
+        b.cmd(op::ENABLE_CLIENT_STATE, &[GL_COLOR_ARRAY]);
+        b.cmd(op::VERTEX_POINTER, &[2, GL_FLOAT, 8, 0, 0]);
+        b.cmd(op::COLOR_POINTER, &[4, GL_UNSIGNED_BYTE, 4, 32, 0]);
+        b.cmd(op::CLIENT_ACTIVE_TEXTURE, &[GL_TEXTURE0]);
+        b.cmd(op::TEX_COORD_POINTER, &[2, GL_FLOAT, 8, 0, 0]);
+        b.cmd(op::DISABLE_CLIENT_STATE, &[GL_TEXTURE_COORD_ARRAY]);
+        b.cmd(op::DRAW_ARRAYS, &[GL_QUADS, 0, 4]);
+        b.cmd(op::DISABLE_CLIENT_STATE, &[GL_COLOR_ARRAY]);
+        b.cmd(op::DISABLE_CLIENT_STATE, &[GL_VERTEX_ARRAY]);
+        // Immediate mode in the current color, placed by a loaded matrix:
+        // the identity translated by +12 in x, then multiplied by identity.
+        let mut m = [0f32; 16];
+        m[0] = 1.0;
+        m[5] = 1.0;
+        m[10] = 1.0;
+        m[15] = 1.0;
+        let ident: Vec<u32> = m.iter().map(|v| v.to_bits()).collect();
+        m[12] = 12.0;
+        let moved: Vec<u32> = m.iter().map(|v| v.to_bits()).collect();
+        b.cmd(op::LOAD_MATRIXF, &moved);
+        b.cmd(op::MULT_MATRIXF, &ident);
+        b.cmd(op::TEX_ENVI, &[GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE]);
+        b.cmd(op::COLOR4F, &[0, f(1.0), 0, f(1.0)]);
+        b.cmd(op::BEGIN, &[GL_QUADS]);
+        for (x, y) in [(0.0f32, 0.0f32), (4.0, 0.0), (4.0, 16.0), (0.0, 16.0)] {
+            b.cmd(op::VERTEX3F, &[f(x), f(y), 0]);
+        }
+        b.cmd(op::END, &[]);
+        // The alpha test drops a translucent quad drawn over everything.
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::ENABLE, &[GL_ALPHA_TEST]);
+        b.cmd(op::ALPHA_FUNC, &[GL_GREATER, f(0.5)]);
+        b.cmd(op::COLOR4F, &[f(1.0), f(1.0), f(1.0), f(0.25)]);
+        b.cmd(op::BEGIN, &[GL_QUADS]);
+        for (x, y) in [(0.0f32, 0.0f32), (16.0, 0.0), (16.0, 16.0), (0.0, 16.0)] {
+            b.cmd(op::VERTEX3F, &[f(x), f(y), 0]);
+        }
+        b.cmd(op::END, &[]);
+        read_back(&mut b);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        let r = reply.bytes();
+        let mut at = 0;
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(pixel16(&px, 3, 8), (255, 0, 0, 255), "the client-array quad, scaled");
+        assert_eq!(pixel16(&px, 9, 8), (0, 0, 0, 255), "nothing between");
+        assert_eq!(pixel16(&px, 14, 8), (0, 255, 0, 255), "the immediate quad, moved by the loaded matrix");
     }
 }
