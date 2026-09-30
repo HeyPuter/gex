@@ -264,4 +264,21 @@ else
     echo "skipping the gears: no cross compiler or no GLES2 headers"
 fi
 
+# The same for the x86-64 guest (`?arch=x86`): served from fs/x86/, with an
+# x86_64 musl toolchain beside the aarch64 one (musl.cc's x86_64-linux-musl-cross).
+X86_TOOLCHAIN="${GEX_X86_TOOLCHAIN:-$HOME/toolchains/x86_64-linux-musl-cross}"
+X86_CC="$X86_TOOLCHAIN/bin/x86_64-linux-musl-gcc"
+if [ -x "$X86_CC" ] && [ -d /usr/include/GLES2 ]; then
+    echo "building the x86-64 gears and GL driver..."
+    mkdir -p "$PUB/fs/x86" "$WORK/glinc"
+    GEX_CC="$X86_CC" "$ROOT/guest/gl/build.sh" "$WORK/gldriver-x86" >/dev/null
+    cp -r /usr/include/EGL /usr/include/GLES2 /usr/include/KHR "$WORK/glinc/" 2>/dev/null || true
+    "$X86_CC" -O2 -o "$PUB/fs/x86/gles-gears" "$ROOT/tests/integration/programs/gles-gears.c" \
+        -I "$WORK/glinc" -L "$WORK/gldriver-x86" -lEGL -lGLESv2 -lm
+    cp "$WORK/gldriver-x86/libGLESv2.so.2" "$WORK/gldriver-x86/libEGL.so.1" "$PUB/fs/x86/"
+    cp "$X86_TOOLCHAIN/x86_64-linux-musl/lib/libc.so" "$PUB/fs/x86/ld-musl-x86_64.so.1"
+else
+    echo "skipping the x86-64 gears: no x86_64 musl cross compiler"
+fi
+
 echo "done"
