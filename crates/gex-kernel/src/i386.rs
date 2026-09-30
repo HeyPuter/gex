@@ -637,6 +637,19 @@ pub fn translate(
             a[0] = sext(a[0]);
             nr::UTIMENSAT
         }
+        x::UTIMENSAT => {
+            // utimensat(dirfd, path, &timespec32[2], flags): both times
+            // widened into scratch. UTIME_NOW and UTIME_OMIT are small
+            // positive nanosecond values and survive the widening.
+            a[0] = sext(a[0]);
+            if a[2] != 0 {
+                let p = a[2];
+                widen_time(m, p, scratch, 1);
+                widen_time(m, p + 8, scratch + 16, 1);
+                a[2] = scratch;
+            }
+            nr::UTIMENSAT
+        }
         x::MMAP2 => {
             // mmap2(addr, len, prot, flags, fd, pgoff)
             a[4] = sext(a[4]);
@@ -943,3 +956,48 @@ pub const ARG_SLOTS: [usize; 6] = [
     gex_abi::ctx::x(7),
     gex_abi::ctx::x(5),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCRATCH: u64 = 0x2000;
+
+    fn tr(n: u64, mut a: [u64; 6], buf: &mut [u8]) -> (u64, [u64; 6]) {
+        let mut m = GuestMem::new(buf);
+        let (n, _) = translate(n, &mut a, &mut m, SCRATCH, 0x1000);
+        (n, a)
+    }
+
+    #[test]
+    fn utimensat_widens_both_32_bit_timespecs() {
+        let mut buf = vec![0u8; 0x4000];
+        {
+            let mut m = GuestMem::new(&mut buf);
+            // { 5, UTIME_OMIT }, { -1, 7 }
+            for (i, v) in [5u32, 0x3fff_fffe, u32::MAX, 7].iter().enumerate() {
+                m.write_u32(0x3000 + i as u64 * 4, *v).unwrap();
+            }
+        }
+        let (n, a) = tr(raw::UTIMENSAT, [0xffff_ff9c, 0x3100, 0x3000, 0x100, 0, 0], &mut buf);
+        assert_eq!(n, nr::UTIMENSAT);
+        assert_eq!(a[..4], [AT_FDCWD, 0x3100, SCRATCH, 0x100]);
+        let m = GuestMem::new(&mut buf);
+        let words: Vec<u64> = (0..4).map(|i| m.read_u64(SCRATCH + i * 8).unwrap()).collect();
+        assert_eq!(words, vec![5, 0x3fff_fffe, u64::MAX, 7]);
+        // A null times pointer stays null ("now").
+        let mut buf = vec![0u8; 0x4000];
+        assert_eq!(tr(raw::UTIMENSAT, [3, 0x3100, 0, 0, 0, 0], &mut buf).1[2], 0);
+    }
+
+    #[test]
+    fn split_offsets_are_joined() {
+        let mut buf = vec![0u8; 0x4000];
+        // mmap2's last argument is in pages.
+        let (n, a) = tr(raw::MMAP2, [0, 0x1000, 3, 0x22, 0xffff_ffff, 0x10], &mut buf);
+        assert_eq!((n, a[4], a[5]), (nr::MMAP, u64::MAX, 0x10000));
+        // pread64(fd, buf, n, lo, hi)
+        let (n, a) = tr(raw::PREAD64, [3, 0x3000, 16, 0x2000, 1, 0], &mut buf);
+        assert_eq!((n, a[3]), (nr::PREAD64, 0x1_0000_2000));
+    }
+}
