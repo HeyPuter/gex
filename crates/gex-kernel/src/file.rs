@@ -429,6 +429,11 @@ impl FileHandle for PipeEnd {
         !self.write || self.pipe.writable()
     }
 
+    /// The read end hangs up when the last writer is gone, data or not.
+    fn poll_hup(&self) -> bool {
+        !self.write && self.pipe.hung_up()
+    }
+
     fn write_room(&self) -> Option<u64> {
         self.write.then(|| self.pipe.room() as u64)
     }

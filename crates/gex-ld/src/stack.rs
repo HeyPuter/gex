@@ -139,7 +139,11 @@ pub fn build_initial_stack(
     let random_off = blob.len();
     blob.extend_from_slice(&random);
     let platform_off = blob.len();
-    blob.extend_from_slice(gex_abi::ARCH_NAME.as_bytes());
+    // The word size of the vectors below, and the name a 32-bit program
+    // expects to find in AT_PLATFORM.
+    let ws: u64 = if image.class32 { 4 } else { 8 };
+    let platform: &str = if image.class32 { "i686" } else { gex_abi::ARCH_NAME };
+    blob.extend_from_slice(platform.as_bytes());
     blob.push(0);
     let mut offsets_argv = Vec::with_capacity(args.len());
     let mut offsets_env = Vec::with_capacity(env.len());
@@ -195,7 +199,7 @@ pub fn build_initial_stack(
 
     // words = argc + argv + NULL + envp + NULL + 2*auxv
     let n_words = 1 + args.len() + 1 + env.len() + 1 + 2 * auxv_pairs.len();
-    let vector_bytes = n_words as u64 * 8;
+    let vector_bytes = n_words as u64 * ws;
     // `sp` must be 16-byte aligned at entry, and stays put when it can.
     let sp = if fits && vector_bytes <= VECTOR_RESERVE {
         blob_addr - VECTOR_RESERVE
@@ -222,8 +226,12 @@ pub fn build_initial_stack(
     let low = sp;
     let mut bytes = vec![0u8; (blob_addr + blob.len() as u64 - low) as usize];
     for (i, w) in words.iter().enumerate() {
-        let off = i * 8;
-        bytes[off..off + 8].copy_from_slice(&w.to_le_bytes());
+        let off = i * ws as usize;
+        if image.class32 {
+            bytes[off..off + 4].copy_from_slice(&(*w as u32).to_le_bytes());
+        } else {
+            bytes[off..off + 8].copy_from_slice(&w.to_le_bytes());
+        }
     }
     let blob_off = (blob_addr - low) as usize;
     bytes[blob_off..blob_off + blob.len()].copy_from_slice(&blob);
@@ -238,6 +246,7 @@ mod tests {
 
     fn dummy_image() -> Image {
         Image {
+            class32: false,
             soname: None,
             needed: Vec::new(),
             runpath: Vec::new(),

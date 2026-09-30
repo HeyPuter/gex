@@ -14,6 +14,9 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod nt_run;
+mod pe_info;
+
 /// Where the dynamic linker is placed, well above a PIE executable so their
 /// mappings cannot overlap. A closure module for `ld.so` is only correct at the
 /// address the host's loader uses, and it uses this one.
@@ -40,6 +43,7 @@ fn real_main() -> Result<ExitCode> {
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "funcs" => cmd_funcs(&argv[2..]),
@@ -79,6 +83,7 @@ usage:
                                    every object reached through DT_NEEDED,
                                    where it would be placed, and how much
                                    text a whole-program build would face
+{}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
   gexc funcs  <elf> [--at ADDR] [--ir] [--ssa] [--check] [--list]
@@ -149,7 +154,8 @@ run options:
   --cwd DIR       start in this guest directory
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
-                  path the guest can resolve"
+                  path the guest can resolve",
+        pe_info::USAGE
     );
 }
 
@@ -162,6 +168,8 @@ struct RunArgs {
     opts: RunOptions,
     xlate: Options,
     jit: bool,
+    /// A Windows program's staged Wine prefix. See `nt_run`.
+    wine_prefix: Option<String>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
@@ -175,6 +183,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut lazy = false;
     let mut cgen = false;
     let mut argv0: Option<String> = None;
+    let mut wine_prefix: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -272,6 +281,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let v = args.get(i).context("--argv0 needs a name")?;
                 argv0 = Some(v.clone());
             }
+            "--wine-prefix" => {
+                i += 1;
+                wine_prefix = Some(args.get(i).context("--wine-prefix needs a directory")?.clone());
+            }
             "--env" => {
                 i += 1;
                 let v = args.get(i).context("--env needs an argument")?;
@@ -295,12 +308,18 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             ..Options::default()
         },
         jit: !no_jit,
+        wine_prefix,
     })
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: Wine's PE DLLs on gex's NT layer.
+        let exit = nt_run::run(&ra, &bytes)?;
+        return Ok(report_exit(&exit, ra.opts.verbose));
+    }
     // Resolved through the guest's namespace (the sysroot when given), so a
     // program links against its own root's libraries, not the host's.
     let sysroot = ra.opts.sysroot.clone();
@@ -334,8 +353,14 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
 
     ra.opts.jit = ra.jit;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
-    match &exit {
-        Exit::Status(c) => Ok(ExitCode::from((*c & 0xff) as u8)),
+    Ok(report_exit(&exit, ra.opts.verbose))
+}
+
+/// The exit status a shell sees for a guest's exit, with a message when gex
+/// itself failed.
+fn report_exit(exit: &Exit, verbose: bool) -> ExitCode {
+    match exit {
+        Exit::Status(c) => ExitCode::from((*c & 0xff) as u8),
         Exit::Signal {
             signal,
             pc,
@@ -349,10 +374,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
                 // (the only way to stop a running guest), so say which side
                 // failed rather than let it read as "terminated by signal 11".
                 eprintln!("gexc: gex failed at guest pc=0x{pc:x}: {detail}");
-            } else if ra.opts.verbose {
+            } else if verbose {
                 eprintln!("gexc: guest terminated by signal {signal} at pc=0x{pc:x}: {detail}");
             }
-            Ok(ExitCode::from((exit.code() & 0xff) as u8))
+            ExitCode::from((exit.code() & 0xff) as u8)
         }
     }
 }
@@ -1025,6 +1050,10 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     }
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: its closure is DLLs, found beside it.
+        return pe_info::cmd_pe_info(args);
+    }
 
     // Guest paths resolve inside the sysroot, as they would when the program
     // runs. Without one there is nowhere to look.
@@ -1151,6 +1180,10 @@ fn cmd_ir(args: &[String]) -> Result<()> {
     }
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        // A Windows program: its closure is DLLs, found beside it.
+        return pe_info::cmd_pe_info(args);
+    }
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     let at = at.unwrap_or(image.entry);
 

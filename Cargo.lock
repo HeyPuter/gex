@@ -494,6 +494,7 @@ name = "gex-kernel"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "gex-ld",
 ]
 
 [[package]]
@@ -515,6 +516,7 @@ version = "0.0.1"
 dependencies = [
  "gex-abi",
  "gex-xlate",
+ "serde_json",
 ]
 
 [[package]]
@@ -599,6 +601,7 @@ dependencies = [
  "gex-abi",
  "gex-emit",
  "gex-ir",
+ "gex-kernel",
  "gex-ld",
  "gex-native",
  "gex-xlate",

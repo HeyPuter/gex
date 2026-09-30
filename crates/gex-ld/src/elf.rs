@@ -3,7 +3,11 @@
 use std::fmt;
 
 // ELF constants, named as in `elf.h`.
+const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
+/// `e_machine` of an i386 executable: the 32-bit program an x86-64 guest
+/// kernel runs in compatibility mode.
+const EM_386: u16 = 3;
 const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
@@ -84,6 +88,13 @@ pub enum LoadError {
         second_start: u64,
         second_end: u64,
     },
+    /// A segment lies in the runtime's own low region: the thread contexts
+    /// and the dispatch directory, below [`gex_abi::DISPATCH_DIR_END`]. A
+    /// fixed-address image there would overwrite them.
+    InRuntimeRegion {
+        vaddr: u64,
+        size: u64,
+    },
     Malformed(&'static str),
 }
 
@@ -111,6 +122,14 @@ impl fmt::Display for LoadError {
                 f,
                 "ELF mappings overlap: 0x{first_start:x}..0x{first_end:x} and \
                  0x{second_start:x}..0x{second_end:x}"
+            ),
+            LoadError::InRuntimeRegion { vaddr, size } => write!(
+                f,
+                "segment at 0x{vaddr:x} (0x{size:x} bytes) lies in gex's reserved low region \
+                 (below 0x{:x}: thread contexts and the dispatch directory); relink the \
+                 program higher, e.g. with -Wl,--image-base=0x{:x}",
+                gex_abi::DISPATCH_DIR_END,
+                gex_abi::PIE_BASE
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
         }
@@ -184,6 +203,7 @@ pub struct DynSym {
 pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> Image {
     Image {
         bias: 0,
+        class32: false,
         entry,
         segments: Vec::new(),
         phdr_vaddr,
@@ -212,6 +232,9 @@ pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> 
 pub struct Image {
     /// Load bias applied to every `p_vaddr` (zero for `ET_EXEC`).
     pub bias: u64,
+    /// A 32-bit (ELFCLASS32, i386) image: its code is decoded in
+    /// compatibility mode and its initial stack laid out with 4-byte words.
+    pub class32: bool,
     /// Guest entry point, already biased.
     pub entry: u64,
     pub segments: Vec<Segment>,
@@ -314,11 +337,19 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     if &data[0..4] != b"\x7fELF" {
         return Err(LoadError::NotElf);
     }
-    if r.u8(4)? != ELFCLASS64 || r.u8(5)? != ELFDATA2LSB {
+    if r.u8(5)? != ELFDATA2LSB {
         return Err(LoadError::NotElf64Le);
     }
+    // A 32-bit i386 image is accepted on the x86-64 guest only: it runs in
+    // the same process model as everything else, in compatibility mode.
+    let class32 = match r.u8(4)? {
+        ELFCLASS64 => false,
+        ELFCLASS32 if gex_abi::X86 => true,
+        _ => return Err(LoadError::NotElf64Le),
+    };
     let e_type = r.u16(16)?;
-    if r.u16(18)? != EM_GUEST {
+    let machine = r.u16(18)?;
+    if machine != if class32 { EM_386 } else { EM_GUEST } {
         return Err(LoadError::NotAarch64);
     }
     let pie = match e_type {
@@ -328,13 +359,29 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     };
     let bias = if pie { pie_base } else { 0 };
 
-    let e_entry = r.u64(24)?;
-    let e_phoff = r.u64(32)? as usize;
-    let e_shoff = r.u64(40)? as usize;
-    let e_phentsize = r.u16(54)? as usize;
-    let e_phnum = r.u16(56)? as usize;
-    let e_shentsize = r.u16(58)? as usize;
-    let e_shnum = r.u16(60)? as usize;
+    // The two header layouts differ only in the width of their address and
+    // offset fields.
+    let (e_entry, e_phoff, e_shoff, e_phentsize, e_phnum, e_shentsize, e_shnum) = if class32 {
+        (
+            r.u32(24)? as u64,
+            r.u32(28)? as usize,
+            r.u32(32)? as usize,
+            r.u16(42)? as usize,
+            r.u16(44)? as usize,
+            r.u16(46)? as usize,
+            r.u16(48)? as usize,
+        )
+    } else {
+        (
+            r.u64(24)?,
+            r.u64(32)? as usize,
+            r.u64(40)? as usize,
+            r.u16(54)? as usize,
+            r.u16(56)? as usize,
+            r.u16(58)? as usize,
+            r.u16(60)? as usize,
+        )
+    };
 
     let mut segments = Vec::new();
     let mut brk = 0u64;
@@ -349,20 +396,45 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     for i in 0..e_phnum {
         let off = e_phoff + i * e_phentsize;
         let p_type = r.u32(off)?;
-        let p_flags = r.u32(off + 4)?;
-        let p_offset = r.u64(off + 8)? as usize;
-        let p_vaddr = r.u64(off + 16)?;
-        let p_filesz = r.u64(off + 32)?;
-        let p_memsz = r.u64(off + 40)?;
+        // Elf32_Phdr: type, offset, vaddr, paddr, filesz, memsz, flags, align.
+        // Elf64_Phdr: type, flags, offset, vaddr, paddr, filesz, memsz, align.
+        let (p_flags, p_offset, p_vaddr, p_filesz, p_memsz, p_align) = if class32 {
+            (
+                r.u32(off + 24)?,
+                r.u32(off + 4)? as usize,
+                r.u32(off + 8)? as u64,
+                r.u32(off + 16)? as u64,
+                r.u32(off + 20)? as u64,
+                r.u32(off + 28)? as u64,
+            )
+        } else {
+            (
+                r.u32(off + 4)?,
+                r.u64(off + 8)? as usize,
+                r.u64(off + 16)?,
+                r.u64(off + 32)?,
+                r.u64(off + 40)?,
+                r.u64(off + 48)?,
+            )
+        };
 
         match p_type {
             PT_INTERP => interp = Some(r.cstr(p_offset)),
             PT_DYNAMIC => dynamic = Some((p_vaddr + bias, p_memsz)),
-            PT_TLS => tls = Some((p_vaddr + bias, p_filesz, p_memsz, r.u64(off + 48)?)),
+            PT_TLS => tls = Some((p_vaddr + bias, p_filesz, p_memsz, p_align)),
             PT_LOAD => {
                 let vaddr = p_vaddr + bias;
                 if vaddr.checked_add(p_memsz).is_none() || vaddr + p_memsz >= gex_abi::GUEST_LIMIT {
                     return Err(LoadError::SegmentOutOfRange {
+                        vaddr,
+                        size: p_memsz,
+                    });
+                }
+                // lld links a static i386 executable at 0x10000 by default,
+                // which is where gex keeps its contexts and dispatch
+                // directory. Refuse it rather than load over them.
+                if p_memsz != 0 && vaddr < gex_abi::DISPATCH_DIR_END {
+                    return Err(LoadError::InRuntimeRegion {
                         vaddr,
                         size: p_memsz,
                     });
@@ -404,6 +476,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
 
     let mut image = Image {
         bias,
+        class32,
         entry: e_entry + bias,
         segments,
         phdr_vaddr,
@@ -427,7 +500,7 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         runpath: Vec::new(),
     };
 
-    if let Some((dyn_vaddr, dyn_size)) = dynamic {
+    if let (Some((dyn_vaddr, dyn_size)), false) = (dynamic, class32) {
         apply_relative_relocations(&mut image, dyn_vaddr, dyn_size);
         image.named_relocs = read_named_relocs(&image, dyn_vaddr, dyn_size);
         let (syms, relocs, inits) = read_dynamic(&image, dyn_vaddr, dyn_size);
@@ -436,8 +509,14 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         image.init_array = inits;
         read_needed(&mut image, dyn_vaddr, dyn_size);
     }
-    image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
-    image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
+    // The dynamic section and the section tables are read in their 64-bit
+    // layouts; a 32-bit image keeps only what its program headers say. Its
+    // programs are static (or Wine's, whose PE loader is not ours), so no
+    // relocation or symbol is lost that anything here would use.
+    if !class32 {
+        image.symbols = read_symbols(&r, e_shoff, e_shentsize, e_shnum, bias);
+        image.code = read_code_sections(&r, e_shoff, e_shentsize, e_shnum, bias);
+    }
     Ok(image)
 }
 
@@ -922,5 +1001,39 @@ mod tests {
     fn rejects_non_elf() {
         assert_eq!(load(&[0; 64], 0).unwrap_err(), LoadError::NotElf);
         assert_eq!(load(&[0; 8], 0).unwrap_err(), LoadError::TooShort);
+    }
+
+    /// An `ET_EXEC` with one executable `PT_LOAD` at `vaddr`.
+    fn exec_at(vaddr: u64) -> Vec<u8> {
+        let mut v = vec![0u8; 0x1000];
+        v[0..4].copy_from_slice(b"\x7fELF");
+        v[4] = 2; // ELFCLASS64
+        v[5] = 1; // little endian
+        v[6] = 1;
+        v[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        v[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
+        v[24..32].copy_from_slice(&vaddr.to_le_bytes()); // e_entry
+        v[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        v[54..56].copy_from_slice(&56u16.to_le_bytes());
+        v[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let p = 64;
+        v[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        v[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        v[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes());
+        v[p + 32..p + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+        v[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+        v
+    }
+
+    /// lld's default base for a static i386 executable is 0x10000, inside
+    /// the contexts and dispatch directory: refused, not loaded over them.
+    #[test]
+    fn a_fixed_image_in_the_runtime_region_is_refused() {
+        assert_eq!(
+            load(&exec_at(0x10000), 0).unwrap_err(),
+            LoadError::InRuntimeRegion { vaddr: 0x10000, size: 0x1000 }
+        );
+        assert!(load(&exec_at(gex_abi::DISPATCH_DIR_END - 0x1000), 0).is_err());
+        assert!(load(&exec_at(gex_abi::EXEC_BASE), 0).is_ok());
     }
 }

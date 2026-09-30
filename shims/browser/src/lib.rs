@@ -1952,12 +1952,15 @@ fn arena_take(len: u64) -> Option<u64> {
 /// For a mapping the guest placed itself (`MAP_FIXED` or an honoured hint): the
 /// range is the guest's, and the heap takes from the same cursor, so the cursor
 /// must not stay below it.
-fn arena_back(end: u64) -> bool {
+///
+/// Answers where the cursor stood before, so the kernel can keep the bytes it
+/// stepped over as arena of its own (see `MemoryMap::grows_on_demand`), or
+/// `None` when the memory would not grow.
+fn arena_back(end: u64) -> Option<u64> {
     if !grow_memory_to(end) {
-        return false;
+        return None;
     }
-    ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
-    true
+    Some(ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// What the kernel's memory map calls to claim a span of arena.
@@ -3350,6 +3353,10 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     };
 
     let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    // A 32-bit (i386) program: i386 ABI in the kernel, compatibility-mode
+    // decoding in the translator.
+    kernel.compat = program.compat();
+    gex_xlate::set_compat(program.compat());
     PROCESS_STARTED.store(now_ns(), std::sync::atomic::Ordering::Relaxed);
     // And the same for the first process, which opens its console before it
     // makes a syscall. See the note beside the other one.
@@ -7012,6 +7019,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.exe_path = path.to_string();
     h.kernel.argv = argv.to_vec();
     h.kernel.envp = envp.to_vec();
+    if let Some(p) = program.as_ref() {
+        h.kernel.compat = p.compat();
+        gex_xlate::set_compat(p.compat());
+    }
     h.kernel.live_threads = 1;
     h.kernel.next_ctx_slot = 1;
     // Signal handlers do not survive an exec; the mask does.
@@ -7070,7 +7081,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
 
     // What the auxiliary vector says about the executable: from the image
     // when one was loaded, and from the recording when one was restored.
-    let facts = match (&program, &restored) {
+    let mut facts = match (&program, &restored) {
         (Some(p), _) => gex_ld::elf::headers_only(
             p.exe.phdr_vaddr,
             p.exe.phentsize,
@@ -7080,6 +7091,11 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         (None, Some(l)) => gex_ld::elf::headers_only(l.phdr, l.phent, l.phnum, l.entry),
         (None, None) => return 0,
     };
+    // A 32-bit program's stack is laid out with 4-byte words; the recorded
+    // (closure) images are 64-bit ones.
+    if let Some(p) = &program {
+        facts.class32 = p.exe.class32;
+    }
     let interp_base = match (&program, &restored) {
         (Some(p), _) => p.interp_base(),
         (None, Some(l)) => l.interp_base,
@@ -7680,9 +7696,7 @@ fn snap_put(h: &mut Host, raw: &[u8]) -> Option<LinkedImage> {
         let from_file = snap_read_u32(raw, &mut p)? == 1;
         // The memory must reach the mapping before anything is written into it:
         // a restored process starts with only the fixed low layout.
-        if !arena_back(end) {
-            return None;
-        }
+        arena_back(end)?;
         if from_file {
             let path = snap_read_str(raw, &mut p)?;
             let off = snap_read_u64(raw, &mut p)?;
@@ -9157,6 +9171,22 @@ pub extern "C" fn gex_inst_align_shift() -> i32 {
 /// translated after this call starts by reporting its pc and registers to the
 /// debug console. Enormous; pipe it to `tail`. The one tool that shows what ran
 /// between two syscalls when the guest lands somewhere wild.
+/// Whether this process is a 32-bit (i386) one, for the JS side to carry to
+/// the Worker a fork child or a new thread runs in: each Worker has its own
+/// shim instance, whose decoder mode starts out 64-bit.
+#[no_mangle]
+pub extern "C" fn gex_compat() -> i32 {
+    with_host(|h| h.kernel.compat) as i32
+}
+
+/// The other half: said in the child's or thread's Worker once its kernel
+/// state has been adopted, before any block is translated there.
+#[no_mangle]
+pub extern "C" fn gex_set_compat(on: i32) {
+    with_host(|h| h.kernel.compat = on != 0);
+    gex_xlate::set_compat(on != 0);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_set_trace_blocks(on: i32) {
     gex_xlate::set_trace_blocks(on != 0);
@@ -9323,6 +9353,12 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
     if reg == gex_kernel::x86::SYSREG_CPUID {
         let mut gm = GuestMem::new(guest_bytes());
         gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, val as u64);
+    }
+    // An x87 transcendental or remainder, computed on the register stack in
+    // the context.
+    if reg == gex_kernel::x86::SYSREG_X87 {
+        let mut gm = GuestMem::new(guest_bytes());
+        gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, val as u64);
     }
 }
 

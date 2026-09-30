@@ -1137,6 +1137,20 @@ fn fetch_code_bytes(
 /// host refreshes this before each translation.
 static VOLATILE_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// Whether the code this translator sees is 32-bit (i386 compatibility
+/// mode). One setting per process: a 32-bit program is 32-bit throughout.
+/// On the AArch64 guest there is no such mode and this is a no-op.
+pub fn set_compat(compat: bool) {
+    #[cfg(feature = "x86")]
+    gex_isa_x86::set_mode(if compat {
+        gex_isa_x86::Mode::Compat
+    } else {
+        gex_isa_x86::Mode::Long
+    });
+    #[cfg(not(feature = "x86"))]
+    let _ = compat;
+}
+
 pub fn set_volatile_ranges(ranges: Vec<(u64, u64)>) {
     *VOLATILE_RANGES.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
 }
@@ -1220,6 +1234,7 @@ mod tests {
         }
         let len = bytes.len() as u64;
         Image {
+            class32: false,
             soname: None,
             needed: Vec::new(),
             runpath: Vec::new(),

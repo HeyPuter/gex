@@ -16,6 +16,7 @@ gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel", "cgen"] }
 gex-emit.workspace = true
 gex-native.workspace = true
+gex-kernel.workspace = true
 anyhow = "1"
 
 [features]

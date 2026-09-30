@@ -27,6 +27,9 @@ pub mod flags {
     pub const SHARED: u64 = 0x01;
     pub const PRIVATE: u64 = 0x02;
     pub const FIXED: u64 = 0x10;
+    /// `MAP_FIXED_NOREPLACE`: at exactly this address, but fail with `EEXIST`
+    /// rather than replace anything already mapped there.
+    pub const FIXED_NOREPLACE: u64 = 0x100000;
     pub const ANONYMOUS: u64 = 0x20;
     pub const NORESERVE: u64 = 0x4000;
     pub const STACK: u64 = 0x20000;
@@ -96,12 +99,31 @@ pub struct MemoryMap {
     take: Option<fn(u64) -> u64>,
     /// Make the host's memory reach an address, for a mapping the guest
     /// placed itself rather than one the arena handed out.
-    back: Option<fn(u64) -> bool>,
+    ///
+    /// It answers where the shared cursor stood before (`None` when the memory
+    /// would not grow). The cursor only moves up, atomically, so the bytes
+    /// between that and `end` are this map's alone, and are recorded as arena
+    /// for later mappings to use.
+    back: Option<fn(u64) -> Option<u64>>,
     /// Bumped by every change to the map. `/proc/self/maps` is derived from the
     /// tree; a counter lets a cached rendering be reused unchanged instead of
     /// reformatting on every read (measured half of an X server's time in
     /// `core::fmt` before this).
     generation: u64,
+}
+
+/// Whether `[start, end)` touches guest memory the runtime owns but no VMA
+/// records, so `is_free` would call it free:
+///
+/// - below [`gex_abi::DISPATCH_DIR_END`]: the thread contexts and the dispatch
+///   directory. A guest mapping there wipes directory entries, and a hot block
+///   then misses forever.
+/// - `[STACK_TOP, MMAP_BOTTOM)`, the gap between the guest's stack and the
+///   arena: in the browser the shim shares the guest's memory and keeps its
+///   own stack and data there. Natively it is only unused, and refusing it
+///   moves a guest's mapping elsewhere, which is harmless.
+pub fn hits_runtime(start: u64, end: u64) -> bool {
+    start < gex_abi::DISPATCH_DIR_END || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
 }
 
 pub fn page_align_up(v: u64) -> u64 {
@@ -139,7 +161,7 @@ impl MemoryMap {
 
     /// Hand out arena addresses bottom-up, for a host whose memory must be
     /// allocated up to whatever it hands out.
-    pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> bool) {
+    pub fn grows_on_demand(&mut self, take: fn(u64) -> u64, back: fn(u64) -> Option<u64>) {
         self.take = Some(take);
         self.back = Some(back);
         self.arena.clear();
@@ -156,20 +178,76 @@ impl MemoryMap {
             .unwrap_or(MMAP_BOTTOM)
     }
 
-    /// Make sure the host's memory reaches `end`, for a mapping placed at an
-    /// address the guest chose (MAP_FIXED or an honoured hint) which may be
-    /// above anything the arena has claimed -- a pthread stack, commonly.
-    fn ensure_backed(&mut self, end: u64) -> Result<(), Errno> {
-        let Some(take) = self.take else {
-            return Ok(());
-        };
-        if self.arena.iter().any(|&(_, e)| end <= e) {
+    /// Whether `[start, end)` lies in this map's own spans of the arena. The
+    /// spans are sorted and disjoint (the cursor only climbs).
+    fn in_arena(&self, start: u64, end: u64) -> bool {
+        let mut at = start;
+        for &(lo, hi) in &self.arena {
+            if hi <= at {
+                continue;
+            }
+            if lo > at {
+                return false;
+            }
+            at = hi;
+            if at >= end {
+                return true;
+            }
+        }
+        at >= end
+    }
+
+    /// Make `[start, end)` this process's to map, for a mapping at an address
+    /// the guest chose (MAP_FIXED, an honoured hint, an mremap growing in
+    /// place): backed, and not memory the runtime holds.
+    ///
+    /// Natively everything is. In the browser the arena above
+    /// [`gex_abi::ARENA_BOTTOM`] is shared with the shim's own heap through
+    /// one cursor, so a range there must lie in this map's spans, or above
+    /// the cursor, which `back` then moves past it. Below `ARENA_BOTTOM` is
+    /// the guest's fixed layout and the placement window, which the heap
+    /// never takes from. A range the heap has a span in is ENOMEM: honouring
+    /// it put a guest mapping over the shim's heap, and a program whose
+    /// malloc passed mmap hints (musl built by zig) trapped in the shim after
+    /// a hundred or so large allocations.
+    fn claim(&mut self, start: u64, end: u64) -> Result<(), Errno> {
+        if self.take.is_none() {
             return Ok(());
         }
-        let _ = take;
-        match self.back {
-            Some(back) if end <= MMAP_TOP && back(end) => Ok(()),
-            _ => Err(Errno::ENOMEM),
+        let floor = gex_abi::ARENA_BOTTOM;
+        let ours = |m: &Self| end <= floor || m.in_arena(start.max(floor), end);
+        if ours(self) {
+            // Below the floor the memory may still need growing (the
+            // placement window lies above what a process starts with).
+            if end <= floor {
+                if let Some(back) = self.back {
+                    back(end).ok_or(Errno::ENOMEM)?;
+                }
+            }
+            return Ok(());
+        }
+        let Some(back) = self.back.filter(|_| end <= MMAP_TOP) else {
+            return Err(Errno::ENOMEM);
+        };
+        let Some(prev) = back(end) else {
+            return Err(Errno::ENOMEM);
+        };
+        // What the cursor stepped over is backed now and nobody else's:
+        // arena, so the next mapping lands in it rather than growing the
+        // memory again. Without this a MAP_FIXED high up (a pinned library,
+        // a thread stack placed by hint) stranded everything between the old
+        // cursor and itself.
+        let prev = prev.max(floor);
+        if prev < end {
+            match self.arena.last_mut() {
+                Some(last) if last.1 == prev => last.1 = end,
+                _ => self.arena.push((prev, end)),
+            }
+        }
+        if ours(self) {
+            Ok(())
+        } else {
+            Err(Errno::ENOMEM)
         }
     }
 
@@ -328,6 +406,33 @@ impl MemoryMap {
             origin,
         });
         self.vmas.sort_by_key(|v| v.start);
+        self.merge_adjacent();
+    }
+
+    /// Fold touching anonymous mappings with the same permissions and name
+    /// into one, as Linux does. A program that reserves address space a
+    /// chunk at a time otherwise leaves thousands of VMAs, which every
+    /// placement scans and `/proc/self/maps` lists line by line (Wine
+    /// re-parses that file with `sscanf`). Only mappings with no `code` or
+    /// `origin` qualify: those identities are keyed on the exact span.
+    fn merge_adjacent(&mut self) {
+        let mut i = 0;
+        while i + 1 < self.vmas.len() {
+            let (a, b) = (&self.vmas[i], &self.vmas[i + 1]);
+            if a.end == b.start
+                && a.prot == b.prot
+                && a.name == b.name
+                && a.code.is_none()
+                && b.code.is_none()
+                && a.origin.is_none()
+                && b.origin.is_none()
+            {
+                self.vmas[i].end = self.vmas[i + 1].end;
+                self.vmas.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// `brk(0)` reports the break; `brk(addr)` moves it and returns the new
@@ -397,7 +502,7 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
 
-        if flags & flags::FIXED != 0 {
+        if flags & (flags::FIXED | flags::FIXED_NOREPLACE) != 0 {
             if !addr.is_multiple_of(PAGE_SIZE) {
                 return Err(Errno::EINVAL);
             }
@@ -405,17 +510,36 @@ impl MemoryMap {
             if end > GUEST_LIMIT {
                 return Err(Errno::ENOMEM);
             }
+            // `MAP_FIXED_NOREPLACE` (which wins over `MAP_FIXED`, as on
+            // Linux) fails over any existing mapping, a PROT_NONE
+            // reservation included: a program that probes for free address
+            // space with it (Wine does, for every thread's stack) must not be
+            // told that a taken range is free. The runtime's own regions
+            // count as taken.
+            if flags & flags::FIXED_NOREPLACE != 0 && (!self.is_free(addr, end) || hits_runtime(addr, end)) {
+                return Err(Errno::EEXIST);
+            }
+            // A plain `MAP_FIXED` replaces the guest's mappings, never the
+            // runtime's.
+            if hits_runtime(addr, end) {
+                return Err(Errno::ENOMEM);
+            }
             // MAP_FIXED replaces whatever was there.
-            self.ensure_backed(end)?;
+            self.claim(addr, end)?;
             self.unmap(addr, len)?;
             self.insert_from(addr, end, prot, name, origin);
             return Ok(addr);
         }
 
-        // An address hint is honoured when the range happens to be free.
+        // An address hint is honoured when the range happens to be free, and
+        // is not the runtime's.
         if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
-            if end <= GUEST_LIMIT && self.is_free(addr, end) && self.ensure_backed(end).is_ok() {
+            if end <= GUEST_LIMIT
+                && self.is_free(addr, end)
+                && !hits_runtime(addr, end)
+                && self.claim(addr, end).is_ok()
+            {
                 self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
             }
@@ -507,7 +631,11 @@ impl MemoryMap {
             return Ok((addr, false));
         }
         let grown = addr + new_len;
-        if grown <= GUEST_LIMIT && self.is_free(addr + old_len, grown) {
+        if grown <= GUEST_LIMIT
+            && self.is_free(addr + old_len, grown)
+            && !hits_runtime(addr + old_len, grown)
+            && self.claim(addr + old_len, grown).is_ok()
+        {
             self.insert(addr + old_len, grown, v.prot, &v.name);
             return Ok((addr, false));
         }
@@ -650,8 +778,8 @@ mod tests {
         fn take(len: u64) -> u64 {
             NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
         }
-        fn back(_end: u64) -> bool {
-            true
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
         }
         NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
 
@@ -690,6 +818,153 @@ mod tests {
         for k in kept {
             assert_eq!(k % HEAP, 0);
         }
+    }
+
+    /// `MAP_FIXED_NOREPLACE` refuses any existing mapping, reservations
+    /// included, and succeeds on free space.
+    #[test]
+    fn fixed_noreplace_refuses_any_existing_mapping() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let base = 0x2000_0000;
+        m.mmap(base, 0x4000, 0, anon | flags::FIXED, "reserved").unwrap();
+        for prot in [0, prot::READ | prot::WRITE] {
+            assert_eq!(
+                m.mmap(base + 0x1000, 0x1000, prot, anon | flags::FIXED_NOREPLACE, "x"),
+                Err(Errno::EEXIST),
+                "NOREPLACE over a reservation, prot {prot}"
+            );
+            // And with MAP_FIXED as well: NOREPLACE wins.
+            assert_eq!(
+                m.mmap(base + 0x3000, 0x2000, prot, anon | flags::FIXED | flags::FIXED_NOREPLACE, "x"),
+                Err(Errno::EEXIST),
+            );
+        }
+        assert_eq!(m.mmap(base + 0x4000, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "x"), Ok(base + 0x4000));
+        // Plain MAP_FIXED still replaces the guest's own mapping.
+        assert_eq!(m.mmap(base, 0x1000, 3, anon | flags::FIXED, "y"), Ok(base));
+    }
+
+    /// The contexts and dispatch directory below `DISPATCH_DIR_END`, and the
+    /// gap the browser shim lives in above the stack, are not free space,
+    /// though no VMA records them.
+    #[test]
+    fn the_runtime_regions_are_not_free_space() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let gap = gex_abi::STACK_TOP + 0x30_0000;
+        assert!(gap + 0x1000 <= MMAP_BOTTOM);
+        for at in [0x10000, gex_abi::DISPATCH_DIR_END - 0x1000, gap] {
+            assert_eq!(m.mmap(at, 0x1000, 0, anon | flags::FIXED_NOREPLACE, "r"), Err(Errno::EEXIST), "{at:#x}");
+            assert_eq!(m.mmap(at, 0x1000, 3, anon | flags::FIXED, "f"), Err(Errno::ENOMEM), "{at:#x}");
+            // A hint there is not honoured: the allocator places it instead.
+            let got = m.mmap(at, 0x1000, 3, anon, "h").unwrap();
+            assert!(!hits_runtime(got, got + 0x1000), "hint {at:#x} honoured at {got:#x}");
+        }
+        // A range that only straddles into the region is refused too.
+        assert_eq!(
+            m.mmap(gex_abi::STACK_TOP - 0x1000, 0x2000, 3, anon | flags::FIXED, "s"),
+            Err(Errno::ENOMEM)
+        );
+        // Right above the directory and at the arena's bottom is fine.
+        assert!(m.mmap(gex_abi::DISPATCH_DIR_END, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "ok").is_ok());
+        assert!(m.mmap(MMAP_BOTTOM, 0x1000, 3, anon | flags::FIXED_NOREPLACE, "ok").is_ok());
+    }
+
+    /// A MAP_FIXED above the arena moves the shared cursor past it; the
+    /// bytes it stepped over are this map's, and the next mapping uses them
+    /// instead of claiming more.
+    #[test]
+    fn memory_backed_for_a_fixed_mapping_is_reused() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let first = m.mmap(0, 0x1000, 3, anon, "a").unwrap();
+        // Someone else sharing the cursor (the shim's heap) claims a span.
+        let theirs = take(0x10_0000);
+        let high = 0x2000_0000;
+        assert_eq!(m.mmap(high, 0x1000, 3, anon | flags::FIXED, "high"), Ok(high));
+        let cursor = NEXT.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(cursor, high + 0x1000);
+        // The next ordinary mapping comes from below the fixed one, and not
+        // from the span the other user took.
+        let next = m.mmap(0, 0x10_0000, 3, anon, "b").unwrap();
+        assert!(next < high && next > first, "{next:#x}");
+        assert!(next + 0x10_0000 <= theirs || next >= theirs + 0x10_0000, "{next:#x} overlaps {theirs:#x}");
+        assert_eq!(NEXT.load(std::sync::atomic::Ordering::SeqCst), cursor, "the arena grew");
+    }
+
+    #[test]
+    fn touching_anonymous_mappings_merge() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let anon = flags::ANONYMOUS | flags::PRIVATE | flags::FIXED;
+        let base = 0x2000_0000;
+        for i in 0..8 {
+            m.mmap(base + i * 0x1000, 0x1000, 0, anon, "").unwrap();
+        }
+        assert_eq!(m.vmas().len(), 1, "{:?}", m.vmas());
+        assert_eq!((m.vmas()[0].start, m.vmas()[0].end), (base, base + 0x8000));
+        // A different permission, or a file's bytes, stay separate.
+        m.mmap(base + 0x8000, 0x1000, prot::READ, anon, "").unwrap();
+        m.mmap_from(base + 0x9000, 0x1000, 0, anon, "", Some(("f".into(), 0))).unwrap();
+        m.mmap(base + 0xa000, 0x1000, 0, anon, "").unwrap();
+        assert_eq!(m.vmas().len(), 4);
+        // Unmapping from the middle of a merged mapping still splits it.
+        m.unmap(base + 0x2000, 0x1000).unwrap();
+        assert_eq!(m.vmas().len(), 5);
+        assert!(m.check_access(base + 0x8000, 0x1000, prot::READ));
+    }
+
+    /// The arena is shared with the shim's heap through one cursor. A hint,
+    /// MAP_FIXED or in-place mremap into a span the heap took must not put a
+    /// guest mapping over it: musl (as zig builds it) passes mmap hints, and
+    /// a benchmark's hundredth large malloc trapped inside the browser shim.
+    #[test]
+    fn a_placed_mapping_never_lands_in_the_runtimes_heap() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        NEXT.store(0x1000_0000, std::sync::atomic::Ordering::SeqCst);
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        let anon = flags::ANONYMOUS | flags::PRIVATE;
+        let a = m.mmap(0, 0x10_0000, 3, anon, "a").unwrap();
+        let a_top = a + 0x80_0000; // the kernel claims a CHUNK at a time
+        // The heap takes the next span; the kernel's next claim lands above.
+        let heap = take(0x100_0000);
+        assert_eq!(heap, a_top);
+        let b = m.mmap(0, 0x90_0000, 3, anon, "b").unwrap();
+        assert!(b >= heap + 0x100_0000);
+        let inside = heap + 0x1000;
+        // A hint there is ignored; the mapping goes somewhere that is ours.
+        let h = m.mmap(inside, 0x2000, 3, anon, "h").unwrap();
+        assert!(h + 0x2000 <= heap || h >= heap + 0x100_0000, "hint honoured in the heap: {h:#x}");
+        // MAP_FIXED there is refused.
+        assert_eq!(m.mmap(inside, 0x2000, 3, anon | flags::FIXED, "f"), Err(Errno::ENOMEM));
+        // A mapping at the top of the kernel's first span does not grow in
+        // place into the heap span above it.
+        let edge = m.mmap(a_top - 0x1000, 0x1000, 3, anon | flags::FIXED, "e").unwrap();
+        let (moved_to, moved) = m.mremap(edge, 0x1000, 0x3000, true).unwrap();
+        assert!(moved && (moved_to + 0x3000 <= heap || moved_to >= heap + 0x100_0000), "{moved_to:#x}");
+        assert_eq!(m.mremap(moved_to, 0x3000, 0x3000, false), Ok((moved_to, false)));
+        // Within its own spans a hint is still honoured.
+        let own = a + 0x20_0000;
+        assert_eq!(m.mmap(own, 0x1000, 3, anon, "o"), Ok(own));
+        // Below the arena (the placement window) is the guest's.
+        let placed = gex_abi::PLACE_BOTTOM + 0x1000;
+        assert_eq!(m.mmap(placed, 0x1000, 3, anon | flags::FIXED, "p"), Ok(placed));
     }
 
     #[test]

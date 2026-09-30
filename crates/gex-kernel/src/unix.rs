@@ -117,6 +117,10 @@ impl Pipe {
     fn close(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
+
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
 }
 
 /// What a socket is at the moment.
@@ -316,16 +320,24 @@ impl UnixSocket {
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        // The far end must see end-of-file, or a reader waits forever.
+        // The far end must see end-of-file, or a reader waits forever; and
+        // nobody reads what it sends any more, so its writes fail with EPIPE
+        // rather than filling a buffer and then blocking for good. Both
+        // directions closed is also what makes it poll as hung up.
         if let Ok(role) = self.role.lock() {
-            if let Role::Connected { tx, .. } = &*role {
+            if let Role::Connected { tx, rx, .. } = &*role {
                 tx.close();
+                rx.close();
             }
         }
     }
 }
 
 impl FileHandle for UnixSocket {
+    fn as_unix_socket(self: Arc<Self>) -> Option<Arc<UnixSocket>> {
+        Some(self)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         self.recv(buf, 0, false)
     }
@@ -376,6 +388,15 @@ impl FileHandle for UnixSocket {
             Role::Connected { rx, tx, .. } => {
                 format!("connected rx={} tx={}", rx.available(), tx.available())
             }
+        }
+    }
+
+    /// Hung up once both directions are shut: the peer closed (which shuts
+    /// both), or each end shut down its writing side.
+    fn poll_hup(&self) -> bool {
+        match &*self.role.lock().unwrap() {
+            Role::Connected { rx, tx, .. } => rx.is_closed() && tx.is_closed(),
+            _ => false,
         }
     }
 
@@ -485,6 +506,39 @@ mod tests {
 
     fn open_file(handle: Arc<dyn FileHandle>) -> Arc<OpenFile> {
         OpenFile::new(handle, "/test".into(), 0, true, true)
+    }
+
+    /// A peer that closes hangs the connection up: POLLHUP (unasked-for) on
+    /// the survivor, which still reads what was left and then end-of-file,
+    /// and whose writes fail with EPIPE instead of filling a buffer nobody
+    /// reads. A half-close is not a hang-up until both halves are shut.
+    #[test]
+    fn a_closed_peer_hangs_up() {
+        use crate::syscalls::{poll_revents, PollFd};
+        let pollfd = |h: &Arc<UnixSocket>, events: u16| PollFd {
+            addr: 0,
+            fd: 3,
+            events,
+            handle: Some(Arc::clone(h) as Arc<dyn FileHandle>),
+            writable: true,
+        };
+        let (a, b) = UnixSocket::pair();
+        b.send(b"last").unwrap();
+        assert_eq!(poll_revents(&pollfd(&a, 0)), 0);
+        drop(b);
+        assert!(a.poll_hup());
+        assert_eq!(poll_revents(&pollfd(&a, 0)), 0x010);
+        assert_eq!(poll_revents(&pollfd(&a, 0x001)), 0x011);
+        let mut buf = [0u8; 8];
+        assert_eq!(a.recv(&mut buf, 0, false).unwrap(), 4);
+        assert_eq!(a.recv(&mut buf, 0, false).unwrap(), 0);
+        assert_eq!(a.send(b"x"), Err(Errno::EPIPE));
+
+        let (a, b) = UnixSocket::pair();
+        a.shutdown();
+        assert!(!a.poll_hup() && !b.poll_hup(), "one half shut is not a hang-up");
+        b.shutdown();
+        assert!(a.poll_hup() && b.poll_hup());
     }
 
     #[test]

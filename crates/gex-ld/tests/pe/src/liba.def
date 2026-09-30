@@ -1,0 +1,8 @@
+LIBRARY liba.dll
+EXPORTS
+  a_add @5
+  a_counter @6 DATA
+  a_ord @7 NONAME
+  a_fwd_b = libb.b_value @8
+  a_fwd_ord = "libb.#3" @9
+  a_heap = kernel32.HeapAlloc @10

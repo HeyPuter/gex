@@ -1629,6 +1629,7 @@ export class Gex {
       child.tls,
       child.brk ?? 0n,
     );
+    if (child.compat) e.gex_set_compat?.(1);
     step(`kernel built, entry 0x${entry.toString(16)}, ${live()} non-zero bytes in the context`);
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
@@ -1810,7 +1811,14 @@ export class Gex {
     if (!e.gex_thread_pending) return;
     const tid = e.gex_thread_pending();
     if (!tid) return;
-    const thread = { tid, ctx: e.gex_thread_ctx(), pc: e.gex_thread_pc(), memory: this.#memory };
+    const thread = {
+      tid,
+      ctx: e.gex_thread_ctx(),
+      pc: e.gex_thread_pc(),
+      memory: this.#memory,
+      // A thread of a 32-bit process decodes in compatibility mode too.
+      compat: e.gex_compat?.() ?? 0,
+    };
     if (globalThis.GEX_ATTACH_TRACE) console.error(`[spawn] #drainThread posting tid ${tid} (t=${Date.now()})`);
     e.gex_thread_taken();
     // A thread needs a memory two Workers can both hold. Posting a non-shared
@@ -1849,6 +1857,7 @@ export class Gex {
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
     if (!entry) throw new Error(`this process has no thread ${thread.tid}`);
+    if (thread.compat) this.#shim.exports.gex_set_compat?.(1);
     _t(`adopted, catchUp (${(this.#shim.exports.gex_module_count?.()>>>0)} modules)`);
     // A spawned thread runs almost none of the process's modules, so registering
     // them lazily (instance on the branch that wants it) skips compiling and
@@ -1876,6 +1885,9 @@ export class Gex {
       ctx: e.gex_fork_ctx(),
       sp: e.gex_fork_sp(),
       tls: e.gex_fork_tls(),
+      // A 32-bit process forks a 32-bit child; its Worker's shim must decode
+      // in compatibility mode from the first block.
+      compat: e.gex_compat?.() ?? 0,
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
