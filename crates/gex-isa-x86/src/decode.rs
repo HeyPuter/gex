@@ -709,6 +709,19 @@ impl<'a> Decoder<'a> {
                 let n = self.u8()? as i64;
                 return Ok(self.i1(Op::Int, Width::D, Operand::Imm(n)));
             }
+            0xd7 => {
+                // xlat: al = [seg:(e/r)bx + zero-extended al]. The operand
+                // carries the segment override and the address size; the
+                // lifter adds al.
+                let mut mem = Mem::abs(0);
+                mem.base = Some(3);
+                mem.addr32 = self.addr32;
+                mem.seg = match self.seg {
+                    Some(Seg::Fs) | Some(Seg::Gs) => self.seg,
+                    _ => None,
+                };
+                return Ok(self.i1(Op::Xlat, Width::B, Operand::Mem(mem)));
+            }
             0xd8..=0xdf => return self.x87(op),
             0xe0..=0xe3 => {
                 let rel = self.i8()?;

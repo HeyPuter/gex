@@ -702,7 +702,38 @@ impl<'a> Lifter<'a> {
             // `int1` (f1), and `int 0x80` from 64-bit code (Linux's ia32
             // system-call emulation), are not implemented.
             Op::Int if i.ops[0] != Some(Operand::Imm(3)) => Flow::End(Term::Illegal { raw: self.raw, pc }),
-            Op::Unknown | Op::Undefined | Op::Xlat => Flow::End(Term::Illegal { raw: self.raw, pc }),
+            Op::Unknown | Op::Undefined => Flow::End(Term::Illegal { raw: self.raw, pc }),
+            Op::Xlat => {
+                // al = [seg:(e/r)bx + zx(al)]: the table index is added
+                // before 32-bit address arithmetic wraps.
+                let Operand::Mem(mut m) = i.op0() else { unreachable!() };
+                let al = self.rd_reg(Reg::Gp(0, Width::B));
+                let al = self.b.extend(al, false);
+                let rbx = self.rd64(3);
+                let base = self.b.bin(BinOp::Add, Ty::I64, rbx, al);
+                // Reuse the operand's segment and address-size handling with
+                // the sum as a base: a scratch register would clobber the
+                // guest's, so the address is formed here instead.
+                m.base = None;
+                let (seg_part, off) = self.addr(&m);
+                let sum = self.b.bin(BinOp::Add, Ty::I64, base, seg_part);
+                let sum = if m.addr32 {
+                    let w32 = self.b.wrap(sum);
+                    self.b.extend(w32, false)
+                } else {
+                    sum
+                };
+                let v = self.b.def(Expr::Load {
+                    addr: sum,
+                    offset: off,
+                    sz: MemSz::B1,
+                    signed: false,
+                    ty: Ty::I32,
+                    order: Order::Relaxed,
+                });
+                self.wr_reg(Reg::Gp(0, Width::B), v);
+                Flow::Next
+            }
             Op::Nop | Op::Endbr | Op::Pause | Op::Prefetch | Op::Fwait | Op::Clflush => Flow::Next,
             Op::Fence => {
                 self.b.stmt(Stmt::Fence);
