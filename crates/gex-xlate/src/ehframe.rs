@@ -27,6 +27,13 @@ pub struct Section {
     pub offset: u64,
     pub size: u64,
     pub nobits: bool,
+    /// `SHT_*`.
+    pub ty: u32,
+    /// `SHF_EXECINSTR`.
+    pub exec: bool,
+    /// `sh_link` and `sh_entsize`, for symbol tables.
+    pub link: u32,
+    pub entsize: u64,
 }
 
 fn u16_at(d: &[u8], o: usize) -> Option<u16> {
@@ -39,8 +46,12 @@ fn u64_at(d: &[u8], o: usize) -> Option<u64> {
     Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?))
 }
 
-/// The section headers of an ELF64 file, empty when there are none.
+/// The section headers of an ELF file (ELF64 or ELF32), empty when there
+/// are none.
 pub fn sections(elf: &[u8]) -> Vec<Section> {
+    if elf.get(4) == Some(&1) {
+        return sections32(elf);
+    }
     let mut out = Vec::new();
     let (Some(shoff), Some(shentsize), Some(shnum), Some(shstrndx)) = (
         u64_at(elf, 0x28),
@@ -77,16 +88,117 @@ pub fn sections(elf: &[u8]) -> Vec<Section> {
             offset,
             size,
             nobits: ty == 8,
+            ty,
+            exec: u64_at(elf, h + 8).unwrap_or(0) & 4 != 0,
+            link: u32_at(elf, h + 40).unwrap_or(0),
+            entsize: u64_at(elf, h + 56).unwrap_or(0),
         });
     }
     out
 }
 
+/// [`sections`] for ELF32.
+fn sections32(elf: &[u8]) -> Vec<Section> {
+    let mut out = Vec::new();
+    let (Some(shoff), Some(shentsize), Some(shnum), Some(shstrndx)) = (
+        u32_at(elf, 0x20),
+        u16_at(elf, 0x2e),
+        u16_at(elf, 0x30),
+        u16_at(elf, 0x32),
+    ) else {
+        return out;
+    };
+    if shoff == 0 || shentsize < 40 {
+        return out;
+    }
+    let hdr = |i: usize| shoff as usize + i * shentsize as usize;
+    let strtab = u32_at(elf, hdr(shstrndx as usize) + 16).unwrap_or(0) as usize;
+    for i in 0..shnum as usize {
+        let h = hdr(i);
+        let (Some(name), Some(ty), Some(addr), Some(offset), Some(size)) = (
+            u32_at(elf, h),
+            u32_at(elf, h + 4),
+            u32_at(elf, h + 12),
+            u32_at(elf, h + 16),
+            u32_at(elf, h + 20),
+        ) else {
+            continue;
+        };
+        let n = strtab + name as usize;
+        let end = elf[n.min(elf.len())..]
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(elf.len(), |p| n + p);
+        out.push(Section {
+            name: String::from_utf8_lossy(&elf[n.min(elf.len())..end]).into_owned(),
+            addr: addr as u64,
+            offset: offset as u64,
+            size: size as u64,
+            nobits: ty == 8,
+            ty,
+            exec: u32_at(elf, h + 8).unwrap_or(0) & 4 != 0,
+            link: u32_at(elf, h + 24).unwrap_or(0),
+            entsize: u32_at(elf, h + 36).unwrap_or(0) as u64,
+        });
+    }
+    out
+}
+
+/// The function symbols (`STT_FUNC`, `STT_GNU_IFUNC`) of an ELF32 file's
+/// `.symtab` and `.dynsym`, biased. gex-ld reads symbol tables in their
+/// 64-bit layout only.
+pub fn symbols32(elf: &[u8], bias: u64) -> Vec<gex_ld::elf::Symbol> {
+    let secs = sections(elf);
+    let mut out = Vec::new();
+    for s in &secs {
+        if !(s.ty == 2 || s.ty == 11) || s.entsize < 16 {
+            continue;
+        }
+        let Some(strs) = secs.get(s.link as usize) else { continue };
+        for k in 0..(s.size / s.entsize) as usize {
+            let o = s.offset as usize + k * s.entsize as usize;
+            let (Some(name), Some(value), Some(size), Some(&info)) =
+                (u32_at(elf, o), u32_at(elf, o + 4), u32_at(elf, o + 8), elf.get(o + 12))
+            else {
+                continue;
+            };
+            let kind = info & 0xf;
+            if (kind != 2 && kind != 10) || value == 0 {
+                continue;
+            }
+            let n = strs.offset as usize + name as usize;
+            let end = elf[n.min(elf.len())..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(elf.len(), |p| n + p);
+            out.push(gex_ld::elf::Symbol {
+                name: String::from_utf8_lossy(&elf[n.min(elf.len())..end]).into_owned(),
+                value: value as u64 + bias,
+                size: size as u64,
+                ifunc: kind == 10,
+            });
+        }
+    }
+    out
+}
+
+/// The address ranges of an ELF file's executable sections, biased.
+pub fn code_ranges(elf: &[u8], bias: u64) -> Vec<(u64, u64)> {
+    sections(elf)
+        .iter()
+        .filter(|s| s.exec && !s.nobits && s.addr != 0 && s.size > 0)
+        .map(|s| (s.addr + bias, s.addr + bias + s.size))
+        .collect()
+}
+
 /// A cursor over encoded DWARF data, `base` being the address of `d[0]`.
+/// `wide` is a 64-bit object: `DW_EH_PE_absptr` is 8 bytes, and addresses
+/// do not wrap at 32 bits.
 struct Cur<'a> {
     d: &'a [u8],
     pos: usize,
     base: u64,
+    wide: bool,
 }
 
 impl Cur<'_> {
@@ -139,7 +251,7 @@ impl Cur<'_> {
         }
         let at = self.base.wrapping_add(self.pos as u64);
         let raw = match enc & 0x0f {
-            0x00 => self.fixed(8)?,
+            0x00 => self.fixed(if self.wide { 8 } else { 4 })?,
             0x01 => self.uleb()?,
             0x02 => self.fixed(2)?,
             0x03 => self.fixed(4)?,
@@ -159,7 +271,7 @@ impl Cur<'_> {
         if enc & 0x80 != 0 {
             return None;
         }
-        Some(v)
+        Some(if self.wide { v } else { v & 0xffff_ffff })
     }
 }
 
@@ -174,11 +286,12 @@ pub fn fdes(elf: &[u8], bias: u64) -> Vec<Fde> {
     let Some(d) = elf.get(sec.offset as usize..(sec.offset + sec.size) as usize) else {
         return Vec::new();
     };
-    parse_eh_frame(d, sec.addr.wrapping_add(bias))
+    parse_eh_frame(d, sec.addr.wrapping_add(bias), elf.get(4) != Some(&1))
 }
 
 /// Parse `.eh_frame` bytes that live at guest address `base`.
-pub fn parse_eh_frame(d: &[u8], base: u64) -> Vec<Fde> {
+/// `wide`: a 64-bit object (see [`Cur`]).
+pub fn parse_eh_frame(d: &[u8], base: u64, wide: bool) -> Vec<Fde> {
     #[derive(Clone, Copy)]
     struct Cie {
         fde_enc: u8,
@@ -187,7 +300,7 @@ pub fn parse_eh_frame(d: &[u8], base: u64) -> Vec<Fde> {
     }
     let mut cies: std::collections::HashMap<usize, Option<Cie>> = Default::default();
     let parse_cie = |at: usize| -> Option<Cie> {
-        let mut c = Cur { d, pos: at, base };
+        let mut c = Cur { d, pos: at, base, wide };
         let len = c.fixed(4)?;
         if len == 0xffff_ffff {
             return None;
@@ -237,7 +350,7 @@ pub fn parse_eh_frame(d: &[u8], base: u64) -> Vec<Fde> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + 4 <= d.len() {
-        let mut c = Cur { d, pos, base };
+        let mut c = Cur { d, pos, base, wide };
         let Some(len) = c.fixed(4) else { break };
         if len == 0 {
             break;
@@ -293,7 +406,12 @@ pub fn landing_pads(image: &Image, lsda: u64, func: u64) -> Vec<u64> {
         return out;
     };
     let d = &seg.bytes[(lsda - seg.vaddr) as usize..];
-    let mut c = Cur { d, pos: 0, base: lsda };
+    let mut c = Cur {
+        d,
+        pos: 0,
+        base: lsda,
+        wide: !image.class32,
+    };
     let Some(lp_enc) = c.u8() else { return out };
     let lpstart = if lp_enc != 0xff {
         match c.ptr(lp_enc) {
@@ -356,7 +474,7 @@ mod tests {
         d.extend_from_slice(&(fde.len() as u32).to_le_bytes());
         d.extend_from_slice(&fde);
         d.extend_from_slice(&0u32.to_le_bytes());
-        let fdes = parse_eh_frame(&d, base);
+        let fdes = parse_eh_frame(&d, base, true);
         assert_eq!(
             fdes,
             vec![Fde {
