@@ -1138,9 +1138,54 @@ impl<'a> Lifter<'a> {
                 self.flags_sub(acc, old, r, w, None, false);
                 Flow::Next
             }
+            Op::CmpxchgNb if w != Width::Q => {
+                // cmpxchg8b: edx:eax against [m], replaced with ecx:ebx -- one
+                // 64-bit atomic compare-exchange. It has to be: a lock-free
+                // list's head is a pointer and a counter swapped together
+                // (Windows' SLIST_HEADER, Noita's job queues), and the two
+                // halves loaded and stored separately -- stored back even when
+                // unequal -- lose other threads' pushes and pops and hand out
+                // torn pointers.
+                let Operand::Mem(m) = i.op0() else {
+                    return Flow::End(Term::Illegal { raw: self.raw, pc });
+                };
+                let (addr, offset) = self.addr(&m);
+                let addr = self.offset_addr(addr, offset);
+                let pair = |s: &mut Self, hi: u8, lo: u8| {
+                    let h = s.rd_reg(Reg::Gp(hi, Width::D));
+                    let l = s.rd_reg(Reg::Gp(lo, Width::D));
+                    let h = s.b.extend(h, false);
+                    let l = s.b.extend(l, false);
+                    let k = s.k64(32);
+                    let h = s.b.bin(BinOp::Shl, Ty::I64, h, k);
+                    s.b.bin(BinOp::Or, Ty::I64, h, l)
+                };
+                let expected = pair(self, RDX, RAX);
+                let replacement = pair(self, RCX, 3);
+                let old = self.b.def(Expr::CmpXchg {
+                    addr,
+                    expected,
+                    replacement,
+                    sz: mem_sz(Width::Q),
+                    ty: Ty::I64,
+                });
+                let eq = self.b.cmp(CmpOp::Eq, Ty::I64, old, expected);
+                // Equal, edx:eax already hold the old value; unequal, they
+                // receive it.
+                let lo = self.b.wrap(old);
+                let k = self.k64(32);
+                let hi = self.b.bin(BinOp::ShrU, Ty::I64, old, k);
+                let hi = self.b.wrap(hi);
+                self.wr_reg(Reg::Gp(RAX, Width::D), lo);
+                self.wr_reg(Reg::Gp(RDX, Width::D), hi);
+                self.write_flag(GuestReg::Z, eq);
+                self.flags = FlagSource::Unknown;
+                Flow::Next
+            }
             Op::CmpxchgNb => {
-                // cmpxchg8b/16b: rdx:rax against [m]; replace with rcx:rbx.
-                // Not atomic across the two halves.
+                // cmpxchg16b: rdx:rax against [m]; replace with rcx:rbx.
+                // Not atomic across the two halves: wasm has no 128-bit
+                // atomics. (x64 Windows' SLIST_HEADER is this; see above.)
                 let Operand::Mem(m) = i.op0() else {
                     return Flow::End(Term::Illegal { raw: self.raw, pc });
                 };
