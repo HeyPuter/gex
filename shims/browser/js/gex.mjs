@@ -197,6 +197,11 @@ export class Env {
   }
   /** Nanoseconds since an arbitrary epoch. */
   now() { return BigInt(Math.round(performance.now() * 1e6)); }
+  /**
+   * Block until everything `write` has been handed is delivered. Called just
+   * before the process's exit is published. Synchronous output needs nothing.
+   */
+  drainOutput() {}
 
   /**
    * Called when every guest thread is waiting for input. Resolve once some has
@@ -765,6 +770,7 @@ export class Gex {
           ).replace(/\n$/, ''),
         ),
         now: () => this.#env.now(),
+        drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
         net_open: () => (this.#net ? this.#net.open() : 0),
@@ -969,6 +975,17 @@ export class Gex {
       }
       free?.(pp, p.length);
       free?.(dp, d.length);
+    }
+    // The bundle's file times (seconds since the epoch), as the host had them:
+    // a program that records one -- gzip's header, make's rebuild test --
+    // sees what it would natively rather than 1970.
+    for (const [path, secs] of Object.entries(opts.mtimes ?? {})) {
+      if (!this.#shim.exports.gex_set_mtime) break;
+      const p = enc.encode(path);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#shim.exports.gex_set_mtime(pp, p.length, BigInt(Math.trunc(secs)));
+      free?.(pp, p.length);
     }
 
     // Which program the image module was built from, so the shim can refuse to

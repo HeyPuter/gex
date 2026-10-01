@@ -56,9 +56,13 @@ pub fn web_module(dir: &Path, module: &str) -> String {
     }
 }
 
-fn files(dir: &Path) -> Result<(Vec<(String, String)>, Vec<(String, u64)>, Vec<String>)> {
+type Files = (Vec<(String, String)>, Vec<(String, u64)>, Vec<String>, Vec<(String, u64)>);
+
+/// The rootfs as the launcher bundles it: `(guest, project-relative)` files,
+/// executable modes, empty directories, and every file's mtime.
+fn files(dir: &Path) -> Result<Files> {
     let root = dir.join("build/rootfs");
-    let (mut files, mut modes, mut dirs) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut files, mut modes, mut dirs, mut mtimes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut stack = vec![root.clone()];
     while let Some(d) = stack.pop() {
         let mut entries: Vec<_> = std::fs::read_dir(&d)
@@ -81,12 +85,16 @@ fn files(dir: &Path) -> Result<(Vec<(String, String)>, Vec<(String, u64)>, Vec<S
             if meta.permissions().mode() & 0o111 != 0 {
                 modes.push((guest.clone(), 0o755));
             }
+            // Kept by the eject and the build from the files the session read.
+            use std::os::unix::fs::MetadataExt;
+            mtimes.push((guest.clone(), meta.mtime().max(0) as u64));
             files.push((guest, rel));
         }
     }
     files.sort();
     dirs.sort();
-    Ok((files, modes, dirs))
+    mtimes.sort();
+    Ok((files, modes, dirs, mtimes))
 }
 
 /// Write `build/web/manifest.json`, for a build whose web modules are
@@ -125,7 +133,7 @@ pub fn manifest(
             )
         }
     };
-    let (files, modes, dirs) = files(dir)?;
+    let (files, modes, dirs, mtimes) = files(dir)?;
     let int_args: &[u8] = if gex_abi::X86 { &[7, 6, 2, 1, 8, 9] } else { &[0, 1, 2, 3, 4, 5, 6, 7] };
     let exe_file = format!("build/{}", rootfs_rel(&project.program.exe)?.display());
     let m = obj(vec![
@@ -145,6 +153,7 @@ pub fn manifest(
         ("dirs", json::strs(&dirs)),
         ("files", Json::Obj(files.into_iter().map(|(g, r)| (g, json::s(r))).collect())),
         ("modes", Json::Obj(modes.into_iter().map(|(g, m)| (g, json::n(m))).collect())),
+        ("mtimes", Json::Obj(mtimes.into_iter().map(|(g, t)| (g, json::n(t))).collect())),
         (
             "pins",
             Json::Obj(
@@ -264,7 +273,7 @@ export async function launch(m, read, { args = null, write, jitFallback = false,
     };
   }
   const entry = await gex.load(await read(m.shim), await read(m.module), await read(m.exe_file), files, argv, {
-    cwd: m.cwd, env: m.env, dirs: m.dirs, modes: m.modes, pins, closure, program: m.exe, exe: m.exe,
+    cwd: m.cwd, env: m.env, dirs: m.dirs, modes: m.modes, mtimes: m.mtimes ?? {}, pins, closure, program: m.exe, exe: m.exe,
     jit: jitFallback || m.jit_fallback ? undefined : false, replace, syscallGuard, strace,
   });
   return await gex.run(entry);
