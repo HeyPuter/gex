@@ -250,6 +250,22 @@ pub fn set_trap_pc(pc: u64) {
     TRAP_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// More pcs for the same breakpoint, beside [`set_trap_pc`]'s: to watch a
+/// call and its return together.
+static TRAP_PCS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+pub fn add_trap_pc(pc: u64) {
+    for s in &TRAP_PCS {
+        if s.compare_exchange(0, pc, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+fn is_trap_pc(pc: u64) -> bool {
+    trap_pc() == pc || TRAP_PCS.iter().any(|s| s.load(std::sync::atomic::Ordering::Relaxed) == pc)
+}
+
 /// `GEX_TRACE_BLOCKS`: plant a trace point at every block entry, so the host
 /// can print the path a guest takes. A diagnostic for a run that ends
 /// somewhere it should not, with no other record of how it got there. Costs
@@ -301,7 +317,7 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if check_sp() {
         e.emit_sp_check(block.start);
     }
-    if trap_pc() == block.start {
+    if is_trap_pc(block.start) {
         e.emit_trap_pc(block.start);
     }
     if trace_blocks() {
@@ -322,7 +338,7 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     if check_sp() {
         e.emit_sp_check(block.start);
     }
-    if trap_pc() == block.start {
+    if is_trap_pc(block.start) {
         e.emit_trap_pc(block.start);
     }
     if trace_blocks() {

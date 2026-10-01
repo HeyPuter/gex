@@ -9445,6 +9445,12 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         trace_line(&line);
         return;
     }
+    // GEX_NT_TRAP_PCS: noted in the thread's ring, silently.
+    #[cfg(feature = "shared-memory")]
+    if nt::active() && raw == gex_abi::imports::BRK_TRAP_PC {
+        nt::trap_note(_ctx as u32 as u64, pc as u64);
+        return;
+    }
     // In a Windows process every other breakpoint is a processor exception
     // the program may handle (`int3`, #DE, `hlt`).
     if nt::active() && raw != gex_abi::imports::BRK_TRAP_PC {

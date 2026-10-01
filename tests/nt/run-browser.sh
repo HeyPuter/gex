@@ -51,6 +51,9 @@ for arch in ${ARCHES:-x64 x86}; do
     b=$root/tests/nt/bin/$arch
     check $arch/hello_args 42 "hello from a Windows program with 3 args${nl}arg 1: a${nl}arg 2: b c" $arch "$b/hello_args.exe" a "b c"
     check $arch/sync 0 "$allok" $arch "$b/sync.exe"
+    # Locks under contention. x86 only: x64's SList is cmpxchg16b, which
+    # gex still does in two halves (wasm has no 16-byte atomic).
+    [ $arch = x86 ] && check $arch/mtx 0 "$allok" $arch "$b/mtx.exe"
     check $arch/apc 0 "$allok" $arch "$b/apc.exe"
     check $arch/tls 0 "$allok" $arch "$b/tls.exe"
     check $arch/cxx 0 "$allok" $arch "$b/cxx.exe"

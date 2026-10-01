@@ -257,6 +257,8 @@ const host = new ProcessHost({
     // (instance on first branch) instead of installing them all up front.
     lazyThread: !!process.env.GEX_LAZY_THREAD,
     debugExit: !!process.env.GEX_DEBUG_EXIT,
+    // GEX_TRAP_STACK: a trap's wasm frames, without GEX_DEBUG_EXIT's mirroring.
+    trapStack: process.env.GEX_TRAP_STACK ? 1 : undefined,
     // GEX_HEARTBEAT: say where the guest is every N safepoints and every 200
     // dispatch misses, so a slow run can be told from a stuck one.
     heartbeat: process.env.GEX_HEARTBEAT ? Number(process.env.GEX_HEARTBEAT) : 0,

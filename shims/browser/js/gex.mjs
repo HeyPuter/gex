@@ -2095,7 +2095,21 @@ export class Gex {
       // metadata and table-need computation the install does regardless.
       const key = moduleContentKey(bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
-      await this.#installModule(bytes, need, 64, null, 'jit2049', cached);
+      let who = 'jit2049';
+      if (globalThis.GEX_DUMP_WHERE ?? true) who = `jit2049-${i}-at-${ptr.toString(16)}`;
+      try {
+        await this.#installModule(bytes, need, 64, null, who, cached);
+      } catch (err) {
+        if (err instanceof WebAssembly.CompileError) {
+          e.gex_nt_where?.(ptr | 0, len | 0);
+          // And whether the registry's copy is still what was read.
+          const now = this.#bytes().slice(ptr, ptr + len);
+          let diff = 0;
+          for (let j = 0; j < len; j++) if (now[j] !== bytes[j]) diff++;
+          console.error(`[gex] module ${i} at 0x${ptr.toString(16)}+0x${len.toString(16)}: ${diff} bytes differ from the copy compiled`);
+        }
+        throw err;
+      }
       if (cached) { reused++; continue; }
       // Newly compiled here: hand it to the host to relay to siblings, and keep
       // it so this Worker does not compile it twice either.
@@ -3060,10 +3074,25 @@ export class Gex {
     // A `precompiled` Module (a sibling Worker's, relayed by the host) skips the
     // compile entirely; otherwise compile the bytes (or use them if already a
     // Module). Same registry bytes either way, so the Module is interchangeable.
-    const mod = precompiled instanceof WebAssembly.Module
-      ? precompiled
-      : bytes instanceof WebAssembly.Module ? bytes
-        : sync ? new WebAssembly.Module(bytes) : await WebAssembly.compile(bytes);
+    let mod;
+    try {
+      mod = precompiled instanceof WebAssembly.Module
+        ? precompiled
+        : bytes instanceof WebAssembly.Module ? bytes
+          : sync ? new WebAssembly.Module(bytes) : await WebAssembly.compile(bytes);
+    } catch (err) {
+      // The engine refused a translation: hand its bytes to whoever serves
+      // the page (tests/nt's harness keeps them), synchronously, since the
+      // Worker may be about to die. Best effort.
+      if (bytes instanceof Uint8Array && err instanceof WebAssembly.CompileError) {
+        try {
+          const x = new XMLHttpRequest();
+          x.open('POST', `/__gex_dump?name=${encodeURIComponent(who)}`, false);
+          x.send(bytes.slice());
+        } catch {}
+      }
+      throw err;
+    }
     this.#compileMs += performance.now() - tc;
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must
