@@ -547,6 +547,7 @@ fn an_x87_operation_prints_parses_is_pure_and_runs_exactly() {
         sp: GuestReg::Sp,
         max_steps: 10,
         syscall: None,
+        narrow: false,
     };
     // 1/3 to 64 bits, stored as a double rounding to nearest: inexact,
     // rounded down (C1 clear).
