@@ -865,6 +865,18 @@ fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bool> {
 /// `.eh_frame`); `summary` gives callee effects to the jump-table resolver
 /// when summaries exist (the second pass, see [`crate::summary::analyze`]).
 pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
+    // A PowerPC image is 32-bit, with registers the function IR does not
+    // index (`func::reg_index`). Nothing is recovered, so all of it stays
+    // tier-1's.
+    if gex_abi::PPC {
+        eprintln!("gex-xlate: function recovery does not handle PowerPC code yet; recovering nothing");
+        return Program {
+            functions: BTreeMap::new(),
+            starts: BTreeMap::new(),
+            noreturn: BTreeSet::new(),
+            stats: RecoverStats::default(),
+        };
+    }
     // i386 code decodes in compatibility mode; the setting is per process
     // (one program), and summaries read it back ([`arch::compat`]).
     if image.class32 != arch::compat() {

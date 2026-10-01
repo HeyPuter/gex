@@ -4,6 +4,7 @@
 //! resolved against the mount table by longest prefix, so a guest sees one
 //! namespace regardless of which backend answers.
 
+use gex_abi::GuestEndian;
 use crate::errno::{Errno, SysResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -610,9 +611,9 @@ pub fn encode_dirents(entries: &[DirEntry], start: usize, buf_len: usize) -> (Ve
             break;
         }
         let mut rec = vec![0u8; reclen];
-        rec[0..8].copy_from_slice(&e.ino.to_le_bytes());
-        rec[8..16].copy_from_slice(&((i + 1) as i64).to_le_bytes());
-        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        rec[0..8].copy_from_slice(&e.ino.to_ge_bytes());
+        rec[8..16].copy_from_slice(&((i + 1) as i64).to_ge_bytes());
+        rec[16..18].copy_from_slice(&(reclen as u16).to_ge_bytes());
         rec[18] = e.file_type.dirent_type();
         rec[19..19 + name.len()].copy_from_slice(name);
         out.extend_from_slice(&rec);
@@ -675,7 +676,7 @@ mod tests {
         let (buf, n) = encode_dirents(&entries, 0, 4096);
         assert_eq!(n, 2);
         // Each record is 8-byte aligned and self-describing.
-        let reclen = u16::from_le_bytes(buf[16..18].try_into().unwrap()) as usize;
+        let reclen = u16::from_ge_bytes(buf[16..18].try_into().unwrap()) as usize;
         assert_eq!(reclen % 8, 0);
         assert_eq!(buf[18], FileType::Directory.dirent_type());
         assert_eq!(&buf[19..20], b".");

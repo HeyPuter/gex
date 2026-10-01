@@ -446,6 +446,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-difffuzz-ppc"
+version = "0.0.1"
+dependencies = [
+ "gex-isa-ppc",
+]
+
+[[package]]
 name = "gex-difffuzz-x86"
 version = "0.0.1"
 
@@ -510,6 +517,10 @@ name = "gex-isa"
 version = "0.0.1"
 
 [[package]]
+name = "gex-isa-ppc"
+version = "0.0.1"
+
+[[package]]
 name = "gex-isa-x86"
 version = "0.0.1"
 
@@ -552,6 +563,15 @@ dependencies = [
  "gex-abi",
  "gex-ir",
  "gex-isa",
+]
+
+[[package]]
+name = "gex-lift-ppc"
+version = "0.0.1"
+dependencies = [
+ "gex-abi",
+ "gex-ir",
+ "gex-isa-ppc",
 ]
 
 [[package]]
@@ -607,9 +627,11 @@ dependencies = [
  "gex-emit",
  "gex-ir",
  "gex-isa",
+ "gex-isa-ppc",
  "gex-isa-x86",
  "gex-ld",
  "gex-lift",
+ "gex-lift-ppc",
  "gex-lift-x86",
 ]
 

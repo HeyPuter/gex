@@ -12,6 +12,7 @@
 //! name against it; when the guest connects to that address the name comes
 //! back and the host is asked for a stream to it.
 
+use gex_abi::GuestEndian;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -404,7 +405,7 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Result<(u32, u16), Errno> {
     if bytes.len() < 8 {
         return Err(Errno::EINVAL);
     }
-    let family = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let family = u16::from_ge_bytes([bytes[0], bytes[1]]);
     if family != 2 {
         return Err(Errno::EAFNOSUPPORT);
     }
@@ -416,7 +417,7 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Result<(u32, u16), Errno> {
 /// Write a `sockaddr_in`.
 pub fn build_sockaddr(addr: u32, port: u16) -> [u8; 16] {
     let mut out = [0u8; 16];
-    out[0..2].copy_from_slice(&2u16.to_le_bytes());
+    out[0..2].copy_from_slice(&2u16.to_ge_bytes());
     out[2..4].copy_from_slice(&port.to_be_bytes());
     out[4..8].copy_from_slice(&addr.to_be_bytes());
     out

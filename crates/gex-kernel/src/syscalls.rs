@@ -9,6 +9,7 @@
 //! implementation serves a host passthrough, an in-memory root and the
 //! synthetic `/proc` without the syscall layer knowing which is which.
 
+use gex_abi::GuestEndian;
 use crate::errno::{encode, Errno, SysResult};
 use crate::file::{FdTable, OpenFile, PipeEnd};
 use crate::fs::{oflags, Stat};
@@ -186,6 +187,20 @@ pub mod nr {
     /// Advisory calls a guest may issue and never checks: `fadvise64`,
     /// `readahead`, `mlock`... Answered with success and nothing done.
     pub const NOOP_OK: u64 = 0x1004;
+}
+
+/// Hand a system call's result back to the guest: `x0`, or `rax` (both
+/// `x(0)`), or on PowerPC r3 with an error as a positive errno and CR0.SO
+/// set (docs/ppc.md §6). `ret` is the kernel's own convention, `-errno` for
+/// a failure. Every place a result is written goes through here.
+pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), Errno> {
+    if gex_abi::PPC {
+        let err = (-4095..0).contains(&(ret as i64));
+        let v = if err { (ret as i64).wrapping_neg() as u64 } else { ret & 0xffff_ffff };
+        m.write_u64(ctx_addr + ctx::SYSCALL_RET as u64, v)?;
+        return m.write(ctx_addr + (ctx::PPC_CR + 3) as u64, &[err as u8]);
+    }
+    m.write_u64(ctx_addr + ctx::x(0) as u64, ret)
 }
 
 /// `*at` calls use this to mean "relative to the current directory".
@@ -883,7 +898,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                     continue;
                 }
                 for w in 0..words.min(16) {
-                    m.write_u64(set + (w as u64) * 8, out[i][w])?;
+                    m.write_bits64(set + (w as u64) * 8, out[i][w])?;
                     per[i] += out[i][w].count_ones() as u64;
                     ready += out[i][w].count_ones() as u64;
                 }
@@ -901,7 +916,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
             // caller that passed the set expects it cleared.
             if *exceptfds != 0 {
                 for w in 0..words.min(16) {
-                    m.write_u64(*exceptfds + (w as u64) * 8, 0)?;
+                    m.write_bits64(*exceptfds + (w as u64) * 8, 0)?;
                 }
             }
             Ok(ready)
@@ -1370,14 +1385,21 @@ impl Kernel {
             let v = m.read_u64(parent + off as u64)?;
             m.write_u64(child + off as u64, v)?;
         }
-        m.write_u64(child + ctx::x(0) as u64, 0)?;
+        set_result(m, child, 0)?;
         m.write_u64(child + ctx::SP as u64, child_stack)?;
         m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
         m.write_u64(child + ctx::TID as u64, tid as u64)?;
         if flags & clone_flags::SETTLS != 0 {
             // A 32-bit thread's TLS descriptor is loaded into %gs, a 64-bit
             // one's base into %fs.
-            let slot = if self.compat { ctx::TPIDRRO } else { ctx::TPIDR };
+            // PowerPC's thread pointer is r2.
+            let slot = if gex_abi::PPC {
+                ctx::x(2)
+            } else if self.compat {
+                ctx::TPIDRRO
+            } else {
+                ctx::TPIDR
+            };
             m.write_u64(child + slot as u64, tls)?;
         }
         if flags & clone_flags::PARENT_SETTID != 0 && parent_tid != 0 {
@@ -1419,7 +1441,7 @@ impl Kernel {
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
-        let mut a: [u64; 6] = if self.compat {
+        let mut a: [u64; 6] = if self.compat && !gex_abi::PPC {
             let mut a = [0u64; 6];
             for (i, slot) in crate::i386::ARG_SLOTS.iter().enumerate() {
                 a[i] = m.read_u64(self.ctx_addr + *slot as u64).unwrap_or(0) & 0xffff_ffff;
@@ -1443,7 +1465,19 @@ impl Kernel {
         // An x86-64 guest's numbering is translated to the canonical one, and
         // its legacy calls rewritten into the `*at`/extended forms.
         let mut post = crate::i386::Post::None;
-        let n = if gex_abi::X86 && self.compat {
+        let mut ppc_post = crate::ppc::PpcPost::None;
+        let n = if gex_abi::PPC {
+            let (n, p, pp) = crate::ppc::translate(
+                raw & 0xffff_ffff,
+                &mut a,
+                m,
+                self.ctx_addr + ctx::SCRATCH as u64,
+                self.ctx_addr,
+            );
+            post = p;
+            ppc_post = pp;
+            n
+        } else if gex_abi::X86 && self.compat {
             let (n, p) = crate::i386::translate(
                 raw & 0xffff_ffff,
                 &mut a,
@@ -1510,7 +1544,7 @@ impl Kernel {
                 // CAD_OFF, CAD_ON, SW_SUSPEND, KEXEC: nothing to do, and a
                 // failure would be reported by an init that can carry on.
                 _ => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, 0);
+                    let _ = set_result(m, self.ctx_addr, 0);
                     return SyscallOutcome::Continue;
                 }
             };
@@ -1529,7 +1563,7 @@ impl Kernel {
                     SyscallOutcome::Exec { path, argv, envp }
                 }
                 Err(e) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
                     SyscallOutcome::Continue
                 }
             };
@@ -1559,14 +1593,14 @@ impl Kernel {
                 Some(t) => t,
                 None => {
                     let _ =
-                        m.write_u64(self.ctx_addr + ctx::x(0) as u64, Errno::EFAULT.as_return());
+                        set_result(m, self.ctx_addr, Errno::EFAULT.as_return());
                     return SyscallOutcome::Continue;
                 }
             };
             let sp = stack.wrapping_add(stack_size);
             if flags & clone_flags::THREAD == 0 {
                 let pid = self.procs.spawn(self.pid);
-                let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
+                let _ = set_result(m, self.ctx_addr, pid as u64);
                 return SyscallOutcome::SpawnProcess {
                     pid,
                     child_stack: sp,
@@ -1576,7 +1610,7 @@ impl Kernel {
             let ca = [flags, sp, parent_tid, tls, child_tid, 0];
             return match self.sys_clone(m, ca) {
                 Ok(req) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, req.tid as u64);
+                    let _ = set_result(m, self.ctx_addr, req.tid as u64);
                     SyscallOutcome::SpawnThread {
                         ctx_addr: req.ctx_addr,
                         tid: req.tid,
@@ -1584,7 +1618,7 @@ impl Kernel {
                     }
                 }
                 Err(e) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
                     SyscallOutcome::Continue
                 }
             };
@@ -1595,7 +1629,7 @@ impl Kernel {
             let pid = self.procs.spawn(self.pid);
             // The parent sees the child's pid; the child sees zero, which the
             // host writes into the copy it makes.
-            let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, pid as u64);
+            let _ = set_result(m, self.ctx_addr, pid as u64);
             if self.trace {
                 eprintln!(
                     "[gex] clone(flags={:#x}, stack={:#x}) = {pid} (new process)",
@@ -1611,7 +1645,7 @@ impl Kernel {
         if n == nr::CLONE {
             return match self.sys_clone(m, a) {
                 Ok(req) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, req.tid as u64);
+                    let _ = set_result(m, self.ctx_addr, req.tid as u64);
                     if self.trace {
                         eprintln!("[gex:{}] clone(...) = {} (new thread)", self.pid, req.tid);
                     }
@@ -1622,7 +1656,7 @@ impl Kernel {
                     }
                 }
                 Err(e) => {
-                    let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, e.as_return());
+                    let _ = set_result(m, self.ctx_addr, e.as_return());
                     if self.trace {
                         eprintln!("[gex:{}] clone(...) = {}", self.pid, -(e.0 as i64));
                     }
@@ -1673,7 +1707,7 @@ impl Kernel {
         }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
-        let outcome = if gex_abi::X86 && n == crate::x86::UNKNOWN {
+        let outcome = if (gex_abi::X86 || gex_abi::PPC) && n == crate::x86::UNKNOWN {
             let before = self.unimplemented.len();
             let r = self.dispatch(m, n, a);
             if self.unimplemented.len() > before {
@@ -1694,6 +1728,9 @@ impl Kernel {
         let ret = match &outcome {
             Ok(r) => match r {
                 Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
+                Ok(v) if ppc_post != crate::ppc::PpcPost::None => {
+                    encode(Ok(crate::ppc::finish(ppc_post, *v)))
+                }
                 _ => encode(*r),
             },
             Err(exit) => {
@@ -1715,7 +1752,7 @@ impl Kernel {
                 ret as i64
             );
         }
-        let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
+        let _ = set_result(m, self.ctx_addr, ret);
 
         // A syscall boundary is a safepoint: the context is complete, so a
         // pending signal can be delivered precisely here.
@@ -1745,7 +1782,7 @@ impl Kernel {
             // seconds and then reported success: musl saw `ENOSYS` and spun,
             // 1.6 million syscalls' worth, until the child ended by itself.
             nr::RT_SIGSUSPEND => {
-                let want = m.read_u64(a[0]).ok()?;
+                let want = m.read_bits64(a[0]).ok()?;
                 let restore_mask = self.signals.blocked;
                 // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or
                 // anywhere else.
@@ -2052,7 +2089,7 @@ impl Kernel {
             self.signals.raise(crate::signal::sig::SIGPIPE);
         }
         let ret = encode(r);
-        let _ = m.write_u64(self.ctx_addr + ctx::x(0) as u64, ret);
+        let _ = set_result(m, self.ctx_addr, ret);
         if let Some(mask) = suspended {
             self.signals.suspend_restore = Some(mask);
         }
@@ -2085,11 +2122,11 @@ impl Kernel {
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
             // issuing one raw falls through to ENOSYS below.
-            nr::DUP2 if gex_abi::X86 => self.sys_dup2(a[0] as i32, a[1] as i32),
-            nr::TIME if gex_abi::X86 => self.sys_time(m, a[0]),
-            nr::ALARM if gex_abi::X86 => self.sys_alarm(m, a[0]),
+            nr::DUP2 if gex_abi::X86 || gex_abi::PPC => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::TIME if gex_abi::X86 || gex_abi::PPC => self.sys_time(m, a[0]),
+            nr::ALARM if gex_abi::X86 || gex_abi::PPC => self.sys_alarm(m, a[0]),
             nr::ARCH_PRCTL if gex_abi::X86 => self.sys_arch_prctl(m, a[0], a[1]),
-            nr::NOOP_OK if gex_abi::X86 => Ok(0),
+            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC => Ok(0),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -2488,12 +2525,12 @@ impl Kernel {
                 m.write_u32(old, a.handler as u32)?;
                 m.write_u32(old + 4, a.flags as u32)?;
                 m.write_u32(old + 8, a.restorer as u32)?;
-                m.write_u64(old + 12, a.mask)?;
+                m.write_bits64(old + 12, a.mask)?;
             } else {
                 m.write_u64(old, a.handler)?;
                 m.write_u64(old + 8, a.flags)?;
                 m.write_u64(old + 16, a.restorer)?;
-                m.write_u64(old + 24, a.mask)?;
+                m.write_bits64(old + 24, a.mask)?;
             }
         }
         if act != 0 {
@@ -2502,14 +2539,14 @@ impl Kernel {
                     handler: m.read_u32(act)? as u64,
                     flags: m.read_u32(act + 4)? as u64,
                     restorer: m.read_u32(act + 8)? as u64,
-                    mask: m.read_u64(act + 12)?,
+                    mask: m.read_bits64(act + 12)?,
                 }
             } else {
                 SigAction {
                     handler: m.read_u64(act)?,
                     flags: m.read_u64(act + 8)?,
                     restorer: m.read_u64(act + 16)?,
-                    mask: m.read_u64(act + 24)?,
+                    mask: m.read_bits64(act + 24)?,
                 }
             };
             self.signals.set_action(signo, a)?;
@@ -2522,7 +2559,7 @@ impl Kernel {
     /// `signal-1` set, which is exactly the shape `Signals::pending` holds.
     fn sys_rt_sigpending(&self, m: &mut GuestMem<'_>, set: u64) -> SysResult {
         if set != 0 {
-            m.write_u64(set, self.signals.pending_raw())?;
+            m.write_bits64(set, self.signals.pending_raw())?;
         }
         Ok(0)
     }
@@ -2551,10 +2588,10 @@ impl Kernel {
         const SIG_UNBLOCK: u32 = 1;
         const SIG_SETMASK: u32 = 2;
         if old != 0 {
-            m.write_u64(old, self.signals.blocked)?;
+            m.write_bits64(old, self.signals.blocked)?;
         }
         if set != 0 {
-            let mask = m.read_u64(set)?;
+            let mask = m.read_bits64(set)?;
             self.signals.blocked = match how {
                 SIG_BLOCK => self.signals.blocked | mask,
                 SIG_UNBLOCK => self.signals.blocked & !mask,
@@ -3419,10 +3456,10 @@ impl Kernel {
         // `struct statx` is 256 bytes and mostly reserved.
         let mut out = [0u8; 256];
         let put32 = |o: &mut [u8; 256], at: usize, v: u32| {
-            o[at..at + 4].copy_from_slice(&v.to_le_bytes())
+            o[at..at + 4].copy_from_slice(&v.to_ge_bytes())
         };
         let put64 = |o: &mut [u8; 256], at: usize, v: u64| {
-            o[at..at + 8].copy_from_slice(&v.to_le_bytes())
+            o[at..at + 8].copy_from_slice(&v.to_ge_bytes())
         };
         // What is filled in. The caller asks for a mask and the kernel says
         // which parts it actually answered; claiming everything but the
@@ -3433,7 +3470,7 @@ impl Kernel {
         put32(&mut out, 16, st.nlink as u32);
         put32(&mut out, 20, self.uid);
         put32(&mut out, 24, self.gid);
-        out[28..30].copy_from_slice(&(st.mode as u16).to_le_bytes());
+        out[28..30].copy_from_slice(&(st.mode as u16).to_ge_bytes());
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
         put64(&mut out, 48, st.blocks as u64);
@@ -3754,10 +3791,10 @@ impl Kernel {
             TIOCGWINSZ => {
                 let (rows, cols, x, y) = tty.winsize();
                 let mut ws = [0u8; 8];
-                ws[0..2].copy_from_slice(&rows.to_le_bytes());
-                ws[2..4].copy_from_slice(&cols.to_le_bytes());
-                ws[4..6].copy_from_slice(&x.to_le_bytes());
-                ws[6..8].copy_from_slice(&y.to_le_bytes());
+                ws[0..2].copy_from_slice(&rows.to_ge_bytes());
+                ws[2..4].copy_from_slice(&cols.to_ge_bytes());
+                ws[4..6].copy_from_slice(&x.to_ge_bytes());
+                ws[6..8].copy_from_slice(&y.to_ge_bytes());
                 m.write(arg, &ws)?;
                 Ok(0)
             }
@@ -3766,7 +3803,7 @@ impl Kernel {
             // pane is. Everyone in the foreground group hears about it.
             TIOCSWINSZ => {
                 let ws = m.read(arg, 8)?.to_vec();
-                let g = |n: usize| u16::from_le_bytes([ws[n], ws[n + 1]]);
+                let g = |n: usize| u16::from_ge_bytes([ws[n], ws[n + 1]]);
                 if tty.set_winsize((g(0), g(2), g(4), g(6))) {
                     self.signal_foreground(crate::signal::sig::SIGWINCH);
                 }
@@ -4215,7 +4252,7 @@ impl Kernel {
                 continue;
             }
             for w in 0..(nfds as usize).div_ceil(64) {
-                let word = m.read_u64(set + (w as u64) * 8).ok()?;
+                let word = m.read_bits64(set + (w as u64) * 8).ok()?;
                 if word == 0 {
                     continue;
                 }
@@ -4740,7 +4777,7 @@ impl Kernel {
     /// not implemented: a caller that asks to wait gets `EAGAIN`, which suits
     /// every caller seen so far (draining blocked signals, not sleeping).
     fn sys_rt_sigtimedwait(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let set = if a[0] == 0 { 0 } else { m.read_u64(a[0])? };
+        let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
         match self.signals.take_pending_in(set) {
             Some(signal) => {
                 // A `siginfo_t` the caller can read the number out of: si_signo,
@@ -4887,7 +4924,7 @@ impl Kernel {
         const AF_UNIX: u16 = 1;
         if addr != 0 {
             let mut buf = vec![0u8; 110];
-            buf[..2].copy_from_slice(&AF_UNIX.to_le_bytes());
+            buf[..2].copy_from_slice(&AF_UNIX.to_ge_bytes());
             let raw = path.as_bytes();
             let n = raw.len().min(107);
             buf[2..2 + n].copy_from_slice(&raw[..n]);
@@ -5686,7 +5723,7 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            if self.compat { "i686" } else { gex_abi::ARCH_NAME },
+            if self.compat && !gex_abi::PPC { "i686" } else { gex_abi::ARCH_NAME },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
@@ -5814,14 +5851,14 @@ impl Kernel {
             m.write_u32(buf, 1000)?; // uptime
             m.write_u32(buf + 16, 1 << 20)?; // totalram: 4 GiB in pages
             m.write_u32(buf + 20, 1 << 19)?; // freeram
-            m.write(buf + 40, &1u16.to_le_bytes())?; // procs
+            m.write(buf + 40, &1u16.to_ge_bytes())?; // procs
             m.write_u32(buf + 52, 4096)?; // mem_unit
         } else {
             m.zero(buf, 112)?;
             m.write_u64(buf, 1000)?; // uptime
             m.write_u64(buf + 32, 4 * 1024 * 1024 * 1024)?; // totalram
             m.write_u64(buf + 40, 2 * 1024 * 1024 * 1024)?; // freeram
-            m.write(buf + 80, &1u16.to_le_bytes())?; // procs
+            m.write(buf + 80, &1u16.to_ge_bytes())?; // procs
             m.write_u32(buf + 104, 1)?; // mem_unit
         }
         Ok(0)
@@ -6409,6 +6446,13 @@ mod tests {
     fn set_args(m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, args: &[u64]) {
         let raw = if gex_abi::X86 {
             (0..512).rev().find(|&r| crate::x86::canonical_number(r) == n).unwrap_or(n)
+        } else if gex_abi::PPC {
+            // `_llseek` (140) also reaches LSEEK, with its own arguments.
+            if n == nr::LSEEK {
+                crate::ppc::raw::LSEEK
+            } else {
+                (0..512).rev().find(|&r| crate::ppc::canonical_number(r) == n).unwrap_or(n)
+            }
         } else {
             n
         };
@@ -6420,7 +6464,12 @@ mod tests {
     }
 
     fn ret(m: &GuestMem<'_>, ctx_addr: u64) -> i64 {
-        m.read_u64(ctx_addr + ctx::x(0) as u64).unwrap() as i64
+        let v = m.read_u64(ctx_addr + ctx::SYSCALL_RET as u64).unwrap() as i64;
+        // PowerPC: a positive errno, flagged by CR0.SO (`set_result`).
+        if gex_abi::PPC && m.read(ctx_addr + (ctx::PPC_CR + 3) as u64, 1).unwrap()[0] != 0 {
+            return -v;
+        }
+        v
     }
 
     fn put_str(m: &mut GuestMem<'_>, addr: u64, s: &str) {
@@ -6636,6 +6685,11 @@ mod tests {
     /// `MSG_PEEK` leaves the bytes for the next read.
     #[test]
     fn recvmsg_flags() {
+        // A 32-bit guest's msghdr is not read yet (i386's gap too), so the
+        // call is ENOSYS there.
+        if gex_abi::PPC {
+            return;
+        }
         const MSG_PEEK: u64 = 0x2;
         const MSG_DONTWAIT: u64 = 0x40;
         let (mut buf, mut k) = setup();

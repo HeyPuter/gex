@@ -1447,12 +1447,14 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // `fork` returns zero in the child, and a clone that named a stack
         // starts on it.
         let mut gm = GuestMem::new(dst);
-        let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, 0);
+        let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if req.child_stack != 0 {
             let _ = gm.write_u64(ctx_addr + ctx::SP as u64, req.child_stack);
         }
         if let Some(tls) = req.tls {
-            let _ = gm.write_u64(ctx_addr + ctx::TPIDR as u64, tls);
+            // PowerPC's thread pointer is r2.
+            let slot = if gex_abi::PPC { ctx::x(2) } else { ctx::TPIDR };
+            let _ = gm.write_u64(ctx_addr + slot as u64, tls);
         }
         // A monitor is per-thread; the child's starts clear.
         let _ = gm.write_u64(ctx_addr + ctx::MON_SIZE as u64, 0);
@@ -2939,6 +2941,19 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let data = memory.bytes();
                 let mut gm = GuestMem::new(data);
                 gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, v as u64);
+            }
+            // PowerPC: an FPSCR rounding mode other than round-to-nearest,
+            // which wasm arithmetic cannot honour, and `mffs` under
+            // GEX_FP_STRICT=1 (docs/ppc.md §8). Both fail loudly.
+            if gex_abi::PPC && reg == gex_kernel::ppc::SYSREG_FPSCR_RN && v != 0 {
+                return Err(anyhow!(
+                    "guest set a non-default FP rounding mode (FPSCR={v:#x}); gex computes only round-to-nearest"
+                ));
+            }
+            if gex_abi::PPC && reg == gex_kernel::ppc::SYSREG_MFFS_STRICT {
+                return Err(anyhow!(
+                    "GEX_FP_STRICT: mffs reads FPSCR exception bits gex does not compute"
+                ));
             }
             // An x87 transcendental or remainder, computed on the register
             // stack in the context.

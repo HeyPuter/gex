@@ -14,6 +14,7 @@
 //! [`poll_readable`]: crate::vfs::FileHandle::poll_readable
 //! [`ClockFn`]: crate::syscalls::ClockFn
 
+use gex_abi::GuestEndian;
 use crate::errno::{Errno, SysResult};
 use crate::syscalls::ClockFn;
 use crate::vfs::{FileHandle, FileType, Metadata};
@@ -128,7 +129,7 @@ impl FileHandle for TimerFd {
             // counts only ticks after this one.
             s.next = s.next.saturating_add(n.saturating_mul(s.interval));
         }
-        buf[..8].copy_from_slice(&n.to_le_bytes());
+        buf[..8].copy_from_slice(&n.to_ge_bytes());
         Ok(8)
     }
 
@@ -184,7 +185,7 @@ mod tests {
     fn read(t: &TimerFd) -> Result<u64, Errno> {
         let mut b = [0u8; 8];
         t.read_at(0, &mut b)?;
-        Ok(u64::from_le_bytes(b))
+        Ok(u64::from_ge_bytes(b))
     }
 
     #[test]

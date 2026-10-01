@@ -598,6 +598,10 @@ mod tests {
     /// both times by a call, and both returns go where their call said.
     #[test]
     fn records_calls_returns_and_syscalls() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let base = 0x40_0000u64;
         let (bytes, f_off): (Vec<u8>, u64) = if gex_abi::X86 {
             (

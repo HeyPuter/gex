@@ -1059,6 +1059,18 @@ pub fn reg_index(r: GuestReg) -> usize {
         GuestReg::X87Sw => 80,
         GuestReg::X87Tags => 81,
         GuestReg::CtxAddr => 82,
+        // Function recovery refuses 32-bit images (`gex_xlate::func::recover`),
+        // PowerPC's included, so its registers never reach a function.
+        GuestReg::R(_)
+        | GuestReg::Lr
+        | GuestReg::Ctr
+        | GuestReg::Cr(_)
+        | GuestReg::So
+        | GuestReg::Ov
+        | GuestReg::Ca
+        | GuestReg::XerBc
+        | GuestReg::Fpscr
+        | GuestReg::F(_) => unreachable!("function IR does not serve PowerPC ({r:?})"),
     }
 }
 
