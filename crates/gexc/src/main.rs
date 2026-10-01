@@ -1337,10 +1337,13 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         pct(st.symbol_bytes_covered, st.symbol_bytes),
         st.symbol_bytes
     );
+    let (cb, cc) = gex_xlate::func::code_coverage(&prog, &image.code);
     eprintln!(
-        "fde bytes covered {:.2}% of {}",
+        "fde bytes covered {:.2}% of {}  code bytes covered {:.2}% of {}",
         pct(st.fde_bytes_covered, st.fde_bytes),
-        st.fde_bytes
+        st.fde_bytes,
+        pct(cc, cb),
+        cb
     );
     let torn: usize = prog
         .functions

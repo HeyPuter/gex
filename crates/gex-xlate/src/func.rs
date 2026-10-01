@@ -1535,7 +1535,8 @@ pub fn is_const(f: &Function, v: Value) -> Option<u64> {
 /// Coverage against an outside list of function starts (another tool's, a
 /// symbol table recovery could not read): how many of `truth` are starts of
 /// recovered functions, how many are covered by a block at all, and bytes
-/// of the extents `[start, next start)` (clipped to the code) covered.
+/// of the extents `[start, next start)` (within one code range) covered.
+/// The last start of each code range has no known end and is left out.
 /// Returns `(starts, functions, inside a block, bytes, bytes covered)`.
 pub fn truth_coverage(prog: &Program, code: &[(u64, u64)], truth: &[u64]) -> (usize, usize, usize, u64, u64) {
     let mut t: Vec<u64> = truth.to_vec();
@@ -1558,13 +1559,26 @@ pub fn truth_coverage(prog: &Program, code: &[(u64, u64)], truth: &[u64]) -> (us
     let mut ext = Vec::new();
     for (i, &a) in t.iter().enumerate() {
         let Some(&(_, hi)) = code.iter().find(|&&(lo, hi)| a >= lo && a < hi) else { continue };
-        let e = t.get(i + 1).copied().unwrap_or(hi).min(hi);
-        if e > a {
-            ext.push((a, e));
+        match t.get(i + 1) {
+            Some(&e) if e <= hi && e > a => ext.push((a, e)),
+            _ => {}
         }
     }
     let (bytes, covered) = covered_bytes(ext, &merged);
     (t.len(), funcs, within, bytes, covered)
+}
+
+/// Bytes of the code ranges, and how many recovered blocks cover.
+pub fn code_coverage(prog: &Program, code: &[(u64, u64)]) -> (u64, u64) {
+    let cov = coverage_index(&prog.functions);
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for &(a, b, _) in &cov.ranges {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    covered_bytes(code.to_vec(), &merged)
 }
 
 /// Byte ranges inside symbol extents that no recovered block covers, with

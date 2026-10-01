@@ -63,6 +63,10 @@ use std::collections::{BTreeMap, HashMap};
 /// Iterations of one SCC before giving up on it (setting it unknown).
 pub const MAX_ITERATIONS: usize = 64;
 
+/// Iterations of one SCC after which a slot range still changing is widened
+/// to unknown.
+pub const WIDEN_AFTER: usize = 16;
+
 /// The summaries of a whole program.
 pub struct Summaries {
     pub map: HashMap<u64, Summary>,
@@ -1576,13 +1580,26 @@ pub fn analyze_functions(functions: &BTreeMap<u64, Function>) -> Summaries {
             iters += 1;
             let mut changed = false;
             for &a in &comp {
-                let s = analyze_fn(
+                let mut s = analyze_fn(
                     &functions[&a],
                     &Ctx {
                         sums: &map,
                         trust_frame: false,
                     },
                 );
+                // Slot ranges have no height bound (a tail-call cycle that
+                // moves the stack pointer reads one more byte each time
+                // round): widen one still growing to unknown.
+                if iters > WIDEN_AFTER {
+                    if let Some(old) = map.get(&a) {
+                        if old.stack_inputs != s.stack_inputs {
+                            s.stack_inputs = Slots::Unknown;
+                        }
+                        if old.caller_frame_writes != s.caller_frame_writes {
+                            s.caller_frame_writes = Slots::Unknown;
+                        }
+                    }
+                }
                 if map.get(&a) != Some(&s) {
                     map.insert(a, s);
                     changed = true;
