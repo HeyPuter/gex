@@ -702,7 +702,38 @@ impl<'a> Lifter<'a> {
             // `int1` (f1), and `int 0x80` from 64-bit code (Linux's ia32
             // system-call emulation), are not implemented.
             Op::Int if i.ops[0] != Some(Operand::Imm(3)) => Flow::End(Term::Illegal { raw: self.raw, pc }),
-            Op::Unknown | Op::Undefined | Op::Xlat => Flow::End(Term::Illegal { raw: self.raw, pc }),
+            Op::Unknown | Op::Undefined => Flow::End(Term::Illegal { raw: self.raw, pc }),
+            Op::Xlat => {
+                // al = [seg:(e/r)bx + zx(al)]: the table index is added
+                // before 32-bit address arithmetic wraps.
+                let Operand::Mem(mut m) = i.op0() else { unreachable!() };
+                let al = self.rd_reg(Reg::Gp(0, Width::B));
+                let al = self.b.extend(al, false);
+                let rbx = self.rd64(3);
+                let base = self.b.bin(BinOp::Add, Ty::I64, rbx, al);
+                // Reuse the operand's segment and address-size handling with
+                // the sum as a base: a scratch register would clobber the
+                // guest's, so the address is formed here instead.
+                m.base = None;
+                let (seg_part, off) = self.addr(&m);
+                let sum = self.b.bin(BinOp::Add, Ty::I64, base, seg_part);
+                let sum = if m.addr32 {
+                    let w32 = self.b.wrap(sum);
+                    self.b.extend(w32, false)
+                } else {
+                    sum
+                };
+                let v = self.b.def(Expr::Load {
+                    addr: sum,
+                    offset: off,
+                    sz: MemSz::B1,
+                    signed: false,
+                    ty: Ty::I32,
+                    order: Order::Relaxed,
+                });
+                self.wr_reg(Reg::Gp(0, Width::B), v);
+                Flow::Next
+            }
             Op::Nop | Op::Endbr | Op::Pause | Op::Prefetch | Op::Fwait | Op::Clflush => Flow::Next,
             Op::Fence => {
                 self.b.stmt(Stmt::Fence);
@@ -1400,6 +1431,18 @@ impl<'a> Lifter<'a> {
                 let o = self.b.bin(BinOp::ShrU, Ty::I32, v, eleven);
                 let o = self.b.bin(BinOp::And, Ty::I32, o, one);
                 self.write_flag(GuestReg::V, o);
+                // AC (18) and ID (21) are kept for the next pushf; the other
+                // system flags (IF, IOPL, ...) cannot be changed in user mode.
+                let mask = self.k32(0x24_0000);
+                let sys = self.b.bin(BinOp::And, Ty::I32, v, mask);
+                let base = self.b.read(GuestReg::CtxAddr);
+                self.b.stmt(Stmt::Store {
+                    addr: base,
+                    offset: gex_abi::ctx::EFLAGS_SYS as i64,
+                    val: sys,
+                    sz: MemSz::B4,
+                    order: Order::Relaxed,
+                });
                 Flow::Next
             }
 
@@ -2486,7 +2529,18 @@ impl<'a> Lifter<'a> {
         let v = self.b.bin(BinOp::Or, Ty::I32, lo, d);
         let v = self.b.bin(BinOp::Or, Ty::I32, v, o);
         let ifl = self.k32(0x200);
-        self.b.bin(BinOp::Or, Ty::I32, v, ifl)
+        let v = self.b.bin(BinOp::Or, Ty::I32, v, ifl);
+        // AC and ID, as the last popf left them (ctx::EFLAGS_SYS).
+        let base = self.b.read(GuestReg::CtxAddr);
+        let sys = self.b.def(Expr::Load {
+            addr: base,
+            offset: gex_abi::ctx::EFLAGS_SYS as i64,
+            sz: MemSz::B4,
+            signed: false,
+            ty: Ty::I32,
+            order: Order::Relaxed,
+        });
+        self.b.bin(BinOp::Or, Ty::I32, v, sys)
     }
 
     /// Set CF, PF, AF, ZF, SF from the low byte of `v`.

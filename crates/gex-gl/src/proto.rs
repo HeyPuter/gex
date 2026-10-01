@@ -17,7 +17,7 @@
 pub const MAGIC: u32 = 0x4758_4547;
 /// Version of the command ABI. A guest and host must agree before any opcode
 /// is decoded; generated opcode policy changes require incrementing this.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The fixed header at the start of the shared buffer. `repr(C)` for the C
 /// guest half; every field 32 bits, 32 bytes total.
@@ -413,6 +413,13 @@ pub mod op {
     pub const TEX_ENVI: u32 = 196;
     /// `{ func, ref as float }` -- glAlphaFunc.
     pub const ALPHA_FUNC: u32 = 197;
+
+    /* Protocol 12: the attribute stack, which Noita's gameplay renderer
+     * wraps passes in. */
+    /// `{ mask }` -- glPushAttrib.
+    pub const PUSH_ATTRIB: u32 = 198;
+    /// `{}` -- glPopAttrib.
+    pub const POP_ATTRIB: u32 = 199;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

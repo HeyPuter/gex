@@ -185,7 +185,9 @@ pub fn wait_id(c: &Call<'_>, h: u32) -> R<u64> {
         Obj::Sync(s) => Ok(s.id),
         Obj::Thread(t) => Ok(t.sync_id),
         Obj::Process => Ok(c.p.sync_id),
-        Obj::File(_) => Ok(ALWAYS_ID),
+        // A directory with a change notification armed waits for a change;
+        // other files complete their I/O synchronously.
+        Obj::File(f) => Ok(f.notify.lock().unwrap().map(|(id, _)| id).unwrap_or(ALWAYS_ID)),
         _ => Err(Status(st::OBJECT_TYPE_MISMATCH)),
     }
 }
@@ -555,6 +557,20 @@ fn set_event(c: &mut Call<'_>, s: &SyncObj, to: bool) -> R<bool> {
         changed(c, s.id);
     }
     Ok(prev)
+}
+
+/// Set or reset a manual-reset state by id (a directory's change
+/// notification).
+pub fn set_state(c: &mut Call<'_>, id: u64, to: bool) {
+    {
+        let mut core = c.p.sync.lock().unwrap();
+        if let Some(SState::Event { set, .. }) = core.states.get_mut(&id) {
+            *set = to;
+        }
+    }
+    if to {
+        changed(c, id);
+    }
 }
 
 /// Set the event behind a handle (I/O completion).

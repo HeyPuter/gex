@@ -101,5 +101,17 @@ if [ "$bad" -gt 0 ]; then
     echo "nt-stage-wine: $bad problem(s); is the host's Wine $VERSION?" >&2
     exit 1
 fi
+# The profile wineboot would make for the user gexc names (WINEUSERNAME
+# "gex", see crates/gexc/src/nt_run.rs): programs expect its folders, the
+# temporary directory above all, to exist.
+for d in "AppData/Local/Temp" "AppData/LocalLow" "AppData/Roaming" Desktop Documents Downloads \
+    Music Pictures Videos "Saved Games" Favorites Links Contacts Searches; do
+    mkdir -p "$PREFIX/drive_c/users/gex/$d"
+done
+for d in Desktop Documents Downloads Music Pictures Videos; do
+    mkdir -p "$PREFIX/drive_c/users/Public/$d"
+done
+mkdir -p "$PREFIX/drive_c/ProgramData" "$PREFIX/drive_c/Program Files" "$PREFIX/drive_c/Program Files (x86)" \
+    "$PREFIX/drive_c/windows/temp"
 echo "$VERSION" >"$PREFIX/.wine-version"
 echo "staged $n files for Wine $VERSION in $PREFIX"

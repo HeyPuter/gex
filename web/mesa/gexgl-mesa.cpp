@@ -185,6 +185,8 @@ enum Op : uint32_t {
     CLIENT_ACTIVE_TEXTURE = 190, ORTHO = 191, SCALEF = 192,
     LOAD_MATRIXF = 193, MULT_MATRIXF = 194, COLOR4F = 195, TEX_ENVI = 196,
     ALPHA_FUNC = 197,
+    /* Protocol 12: the attribute stack. */
+    PUSH_ATTRIB = 198, POP_ATTRIB = 199,
 };
 
 struct Reader {
@@ -2561,6 +2563,8 @@ bool one(uint32_t op, Reader& a) {
         const GLenum func = a.u32(); const GLfloat ref = a.f32();
         glAlphaFunc(func, ref); break;
     }
+    case PUSH_ATTRIB: glPushAttrib(a.u32()); break;
+    case POP_ATTRIB: glPopAttrib(); break;
 #include "gl44-generated-cases.inc"
     default:
         /* Named, once. A command the host does not know aborts the whole

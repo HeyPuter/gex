@@ -190,6 +190,13 @@ pub mod ctx {
     pub const AF: usize = NZCV + 5;
     pub const DF: usize = NZCV + 6;
 
+    /// x86 only: the EFLAGS system bits user code can toggle, in place as a
+    /// 32-bit value: AC (bit 18) and ID (bit 21). `popf` stores them and
+    /// `pushf` gives them back, which is how a program tests for `cpuid`
+    /// (it flips ID) or for a 486 (it flips AC). Stored only: gex does not
+    /// check alignment when AC is set.
+    pub const EFLAGS_SYS: usize = 34 * 8;
+
     /// Pack four 0/1 flags into the slot (and [`unpack_nzcv`] to reverse), so
     /// the packing lives in one place.
     #[inline]

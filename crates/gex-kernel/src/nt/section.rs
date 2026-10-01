@@ -22,8 +22,9 @@ pub const SEC_FILE: u32 = 0x0080_0000;
 #[derive(Debug)]
 pub enum SecKind {
     Image { pe: Arc<PeImage>, path: String, nt_path: Vec<u16> },
-    /// A data file mapped as a copy.
-    File { data: Arc<Vec<u8>>, nt_path: Vec<u16> },
+    /// A data file mapped as a copy. `file` is kept for a writable section,
+    /// whose views are written back to it (see [`FileView`]).
+    File { data: Arc<Vec<u8>>, nt_path: Vec<u16>, file: Option<Arc<dyn crate::vfs::FileHandle>> },
     /// Pagefile-backed memory.
     Anon,
 }
@@ -37,6 +38,46 @@ pub struct Section {
     /// Views mapped so far (an anonymous section's second view can't alias
     /// the first in gex's flat memory).
     pub views: Mutex<Vec<u64>>,
+}
+
+/// A writable view of a file-backed section. gex has no shared page cache,
+/// so the view is a copy: what the program wrote goes back to the file when
+/// the view is flushed or unmapped, or the process ends.
+#[derive(Clone)]
+pub struct FileView {
+    pub file: Arc<dyn crate::vfs::FileHandle>,
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl std::fmt::Debug for FileView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FileView({:#x}+{:#x})", self.offset, self.len)
+    }
+}
+
+/// Write view `base` back to its file.
+pub fn write_back(c: &mut Call<'_>, base: u64) -> R<()> {
+    let v = c.p.st.lock().unwrap().file_views.get(&base).cloned();
+    let Some(v) = v else { return Ok(()) };
+    let data = c.g.bytes(base, v.len as usize)?;
+    let mut done = 0;
+    while done < data.len() {
+        let n = v.file.write_at(v.offset + done as u64, &data[done..]).map_err(|_| Status(st::UNSUCCESSFUL))? as usize;
+        if n == 0 {
+            return Err(Status(st::DISK_FULL));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+/// Write every writable file view back (the process is ending).
+pub fn write_back_all(c: &mut Call<'_>) {
+    let bases: Vec<u64> = c.p.st.lock().unwrap().file_views.keys().copied().collect();
+    for b in bases {
+        let _ = write_back(c, b);
+    }
 }
 
 /// A mapped image, for the queries that ask about one.
@@ -240,10 +281,22 @@ pub fn nt_create_section(c: &mut Call<'_>) -> R {
     } else if file != 0 {
         let (data, _path, nt_path) = read_file_handle(c, file)?;
         let size = want_size.filter(|&s| s != 0).unwrap_or(data.len() as u64);
-        if size > data.len() as u64 && prot & (page_prot::READWRITE | page_prot::EXECUTE_READWRITE) == 0 {
+        let writable = prot & (page_prot::READWRITE | page_prot::EXECUTE_READWRITE) != 0;
+        if size > data.len() as u64 && !writable {
             return Err(Status(st::SECTION_TOO_BIG_STATUS));
         }
-        Section { kind: SecKind::File { data, nt_path }, size, prot, attrs, views: Mutex::new(Vec::new()) }
+        let handle = if writable {
+            let f = super::file::get_file(c, file)?;
+            // A writable section larger than its file extends the file, as
+            // on Windows.
+            if size > data.len() as u64 {
+                f.handle.write_at(size - 1, &[0]).map_err(|_| Status(st::DISK_FULL))?;
+            }
+            Some(Arc::clone(&f.handle))
+        } else {
+            None
+        };
+        Section { kind: SecKind::File { data, nt_path, file: handle }, size, prot, attrs, views: Mutex::new(Vec::new()) }
     } else {
         let size = want_size.ok_or(Status(st::INVALID_PARAMETER_4))?;
         if size == 0 {
@@ -329,14 +382,20 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
             }
             let writable = prot & (page_prot::READWRITE | page_prot::EXECUTE_READWRITE) != 0;
             {
-                let views = sec.views.lock().unwrap();
+                // Views since unmapped no longer count.
+                let mut views = sec.views.lock().unwrap();
+                {
+                    let stl = c.p.st.lock().unwrap();
+                    views.retain(|&b| stl.vm.find(b).is_some_and(|r| r.base == b && r.kind == Kind::Mapped));
+                }
                 if !views.is_empty() && writable {
                     return Err(c.unimplemented("a second writable view of one section (views can't alias in gex)"));
                 }
             }
-            if writable && matches!(sec.kind, SecKind::File { .. }) && sec.prot & (page_prot::READWRITE | page_prot::EXECUTE_READWRITE) != 0 {
-                return Err(c.unimplemented("a writable view of a file-backed section (no write-back)"));
-            }
+            let write_back_to = match &sec.kind {
+                SecKind::File { file: Some(f), .. } if writable => Some(Arc::clone(f)),
+                _ => None,
+            };
             let _ = alloc_type;
             let size_pg = align_up(size, PAGE);
             let mut stl = c.p.st.lock().unwrap();
@@ -362,12 +421,32 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
             });
             drop(stl);
             c.g.zero(base, size_pg as usize)?;
-            if let SecKind::File { data, .. } = &sec.kind {
-                let from = (offset as usize).min(data.len());
-                let to = ((offset + size) as usize).min(data.len());
-                c.g.write(base, &data[from..to])?;
+            match &sec.kind {
+                // A writable section's file has what earlier views wrote
+                // back: read it now rather than the section's snapshot.
+                SecKind::File { file: Some(f), .. } => {
+                    let mut buf = vec![0u8; size as usize];
+                    let mut done = 0;
+                    while done < buf.len() {
+                        let n = f.read_at(offset + done as u64, &mut buf[done..]).map_err(|_| Status(st::UNSUCCESSFUL))? as usize;
+                        if n == 0 {
+                            break;
+                        }
+                        done += n;
+                    }
+                    c.g.write(base, &buf[..done])?;
+                }
+                SecKind::File { data, .. } => {
+                    let from = (offset as usize).min(data.len());
+                    let to = ((offset + size) as usize).min(data.len());
+                    c.g.write(base, &data[from..to])?;
+                }
+                _ => {}
             }
             vm::after_change(c, base, base + size_pg, &[])?;
+            if let Some(file) = write_back_to {
+                c.p.st.lock().unwrap().file_views.insert(base, FileView { file, offset, len: size });
+            }
             sec.views.lock().unwrap().push(base);
             c.g.wptr(base_p, base)?;
             c.g.wptr(size_p, size_pg)?;
@@ -398,11 +477,18 @@ pub fn nt_map_view_of_section_ex(c: &mut Call<'_>) -> R {
 }
 
 fn unmap(c: &mut Call<'_>, addr: u64) -> R {
+    let base = {
+        let stl = c.p.st.lock().unwrap();
+        let r = stl.vm.find(addr).cloned().ok_or(Status(st::NOT_MAPPED_VIEW))?;
+        if r.kind == Kind::Private {
+            return Err(Status(st::NOT_MAPPED_VIEW));
+        }
+        r.base
+    };
+    write_back(c, base)?;
     let mut stl = c.p.st.lock().unwrap();
+    stl.file_views.remove(&base);
     let r = stl.vm.find(addr).cloned().ok_or(Status(st::NOT_MAPPED_VIEW))?;
-    if r.kind == Kind::Private {
-        return Err(Status(st::NOT_MAPPED_VIEW));
-    }
     stl.vm.remove(r.base);
     stl.images.remove(&r.base);
     drop(stl);
@@ -546,4 +632,29 @@ pub fn query_image_information(c: &mut Call<'_>, addr: u64, buf: u64, len: u64, 
 fn _names(n: &[u16]) -> String {
     let _ = to_w("");
     wstr(n)
+}
+
+/// `NtFlushVirtualMemory(process, *addr, *size, iosb)`: a writable file
+/// view's contents go back to the file.
+pub fn nt_flush_virtual_memory(c: &mut Call<'_>) -> R {
+    vm::check_process(c, c.a(0))?;
+    let (addr_p, size_p, iosb) = (c.a(1), c.a(2), c.a(3));
+    let addr = c.g.ptr(addr_p)?;
+    let base = {
+        let stl = c.p.st.lock().unwrap();
+        let r = stl.vm.find(addr).cloned().ok_or(Status(st::NOT_MAPPED_VIEW))?;
+        if r.kind == Kind::Private {
+            return Err(Status(st::NOT_MAPPED_VIEW));
+        }
+        r.base
+    };
+    write_back(c, base)?;
+    let len = c.p.st.lock().unwrap().file_views.get(&base).map(|v| v.len).unwrap_or(0);
+    c.g.wptr(addr_p, base)?;
+    c.g.wptr(size_p, align_up(len, PAGE))?;
+    if iosb != 0 {
+        c.g.wptr(iosb, 0)?;
+        c.g.wptr(iosb + c.g.psize(), 0)?;
+    }
+    Ok(st::SUCCESS)
 }
