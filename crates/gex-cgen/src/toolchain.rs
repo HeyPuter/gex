@@ -100,6 +100,52 @@ pub fn jobs() -> usize {
         .max(1)
 }
 
+/// `clang --version`, for object-cache keys.
+pub fn clang_version() -> Result<String> {
+    let out = Command::new(clang())
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running {} --version; is it installed?", clang()))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The flags every unit is compiled with, as one string, for cache keys.
+pub fn cflags_key() -> String {
+    let mut v: Vec<String> = CFLAGS.iter().map(|s| s.to_string()).collect();
+    v.extend(extra_cflags());
+    v.join(" ")
+}
+
+/// Precompile `dir/gex_abi.h` with the units' flags; returns the `.pch`.
+pub fn precompile_header(dir: &Path) -> Result<PathBuf> {
+    let pch = dir.join("gex_abi.h.pch");
+    let mut cmd = Command::new(clang());
+    cmd.args(CFLAGS)
+        .args(extra_cflags())
+        .arg("-x")
+        .arg("c-header")
+        .arg(dir.join("gex_abi.h"))
+        .arg("-o")
+        .arg(&pch);
+    run(&mut cmd, "clang (precompiling gex_abi.h)")?;
+    Ok(pch)
+}
+
+/// Compile one unit to `obj` (written beside it first, then renamed, so a
+/// killed build leaves no truncated object in a cache).
+pub fn compile_one(dir: &Path, src: &Path, obj: &Path, pch: Option<&Path>) -> Result<()> {
+    let tmp = obj.with_extension(format!("o.tmp-{}", std::process::id()));
+    let mut cmd = Command::new(clang());
+    cmd.args(CFLAGS).args(extra_cflags()).arg("-I").arg(dir);
+    if let Some(p) = pch {
+        cmd.arg("-include-pch").arg(p);
+    }
+    cmd.arg("-c").arg(src).arg("-o").arg(&tmp);
+    run(&mut cmd, &format!("clang on {}", src.display()))?;
+    std::fs::rename(&tmp, obj)?;
+    Ok(())
+}
+
 /// Compile every `.c` in `sources` to an object beside it, in parallel.
 pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let objs: Vec<PathBuf> = sources.iter().map(|s| s.with_extension("o")).collect();

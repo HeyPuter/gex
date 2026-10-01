@@ -222,6 +222,23 @@ impl FnUnit {
     ///
     /// `trapfree` maps the trap-free functions (`trap_free`) to their
     /// subtree's stack estimate.
+    /// A body for `entry` that only leaves for it (PC = entry, return 0), so
+    /// the nest unwinds and tier-1 runs the function: for a function whose C
+    /// cannot be spliced (clang gave it a shadow stack). Its callers wrote
+    /// everything back before the call, as for any function that is not
+    /// trap-free, so it must not be one.
+    pub fn add_leave_stub(&mut self, entry: u64) {
+        let st = self.storage();
+        let _ = writeln!(
+            self.bodies,
+            "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{\n  \
+             (void)depth; (void)need; (void)ret;\n  GEX_C64({}u) = 0x{entry:x}ull;\n  return 0;\n}}\n",
+            body_name(entry),
+            ctx::PC
+        );
+        self.protos.insert(entry);
+    }
+
     pub fn add(
         &mut self,
         f: &Function,
@@ -714,6 +731,15 @@ impl FnUnit {
         Ok(())
     }
 
+    /// Bytes of C bodies emitted so far.
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+
     pub fn source(&self) -> String {
         let mut s = String::from("#include \"gex_abi.h\"\n\n");
         s.push_str(NEED_DEFS);
@@ -741,6 +767,50 @@ pub fn call_known_source(entries: &[u64]) -> String {
         let _ = writeln!(s, "  case 0x{a:x}ull: return {}(ctx, depth, need, ret);", body_name(*a));
     }
     s.push_str("  default: return -1;\n  }\n}\n");
+    s
+}
+
+/// [`call_known_source`] for many entries: clang takes minutes over one
+/// `switch` of a hundred thousand cases, so the entries are cut into chunks
+/// of [`CALL_KNOWN_CHUNK`], each a small function with its own `switch`, and
+/// the helper picks the chunk by a balanced tree of comparisons.
+pub const CALL_KNOWN_CHUNK: usize = 1024;
+
+pub fn call_known_source_chunked(entries: &[u64]) -> String {
+    if entries.len() <= CALL_KNOWN_CHUNK {
+        return call_known_source(entries);
+    }
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable();
+    let chunks: Vec<&[u64]> = sorted.chunks(CALL_KNOWN_CHUNK).collect();
+    let mut s = String::from("#include \"gex_abi.h\"\n\n");
+    for a in &sorted {
+        let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
+    }
+    for (k, c) in chunks.iter().enumerate() {
+        let _ = writeln!(s, "\nstatic int ck_{k}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret) {{");
+        s.push_str("  switch (target) {\n");
+        for a in c.iter() {
+            let _ = writeln!(s, "  case 0x{a:x}ull: return {}(ctx, depth, need, ret);", body_name(*a));
+        }
+        s.push_str("  default: return -1;\n  }\n}\n");
+    }
+    // A chunk is picked by its first entry: chunk k holds [first[k], first[k+1]).
+    fn tree(s: &mut String, chunks: &[&[u64]], lo: usize, hi: usize, indent: usize) {
+        let pad = "  ".repeat(indent);
+        if hi - lo == 1 {
+            let _ = writeln!(s, "{pad}return ck_{lo}(ctx, target, depth, need, ret);");
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        let _ = writeln!(s, "{pad}if (target < 0x{:x}ull) {{", chunks[mid][0]);
+        tree(s, chunks, lo, mid, indent + 1);
+        let _ = writeln!(s, "{pad}}}");
+        tree(s, chunks, mid, hi, indent);
+    }
+    let _ = writeln!(s, "\nint {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret) {{");
+    tree(&mut s, &chunks, 0, chunks.len(), 1);
+    s.push_str("}\n");
     s
 }
 

@@ -155,6 +155,25 @@ fn native_machine(abi: Abi) -> u16 {
     }
 }
 
+/// An image view the NT layer just mapped (relocated, its bytes written),
+/// for a host that wants to know: the function tier builds a unit for it
+/// (gex-cgen). See [`set_image_mapped_hook`].
+pub struct MappedImage<'a> {
+    pub path: &'a str,
+    pub base: u64,
+    pub pe: &'a Arc<PeImage>,
+}
+
+type ImageMappedHook = Box<dyn Fn(&MappedImage<'_>) + Send + Sync>;
+static IMAGE_MAPPED: std::sync::OnceLock<ImageMappedHook> = std::sync::OnceLock::new();
+
+/// Have `f` called after every image view is mapped. Once per host process;
+/// with none set (the default) mapping is unchanged. `f` runs with the
+/// process's locks held: it must only record what it is told.
+pub fn set_image_mapped_hook(f: impl Fn(&MappedImage<'_>) + Send + Sync + 'static) {
+    let _ = IMAGE_MAPPED.set(Box::new(f));
+}
+
 /// Map an image. `want` is a caller-chosen base (0 for "choose").
 /// Returns the base and the status (`SUCCESS`, or
 /// `IMAGE_MACHINE_TYPE_MISMATCH` for another architecture's image).
@@ -223,6 +242,9 @@ pub fn map_image(
         k.retired_code.push((base, base + size));
     }
     let status = if img.machine != native_machine(p.abi) { st::IMAGE_MACHINE_TYPE_MISMATCH } else { st::SUCCESS };
+    if let Some(hook) = IMAGE_MAPPED.get() {
+        hook(&MappedImage { path, base, pe: img });
+    }
     Ok((base, status))
 }
 
