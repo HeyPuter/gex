@@ -49,6 +49,18 @@ const EARLY = Symbol('gex.early');
 
 export class ProcessHost {
   #makeWorker; #shim; #guest; #kernel; #extra;
+  /// Per Worker, a shared counter of the output messages this host has
+  /// delivered. A Worker about to publish its process's exit waits until the
+  /// count reaches what it sent (see `drainOutput` in worker.mjs): output from
+  /// different Workers crosses different ports, which nothing orders, so a
+  /// parent that waited for its child could otherwise print first.
+  #outputAcks = new WeakMap();
+  #outputAck(w) {
+    if (typeof SharedArrayBuffer === 'undefined') return undefined;
+    const a = new Int32Array(new SharedArrayBuffer(4));
+    this.#outputAcks.set(w, a);
+    return a.buffer;
+  }
   #onOutput; #onFork; #onExit; #readStdin; #onOther;
   #workers = new Map();
   #pending = new Map();
@@ -374,6 +386,7 @@ export class ProcessHost {
             // the guest, so it has to know when it has them all.
             closureCount: (closure ?? []).length,
             ...msg,
+            outputAck: this.#outputAck(w),
             kernelStack: this.#nextKernelStack(pid),
             // Compiled once here, not from bytes in every Worker.
             shim: shimMod,
@@ -403,9 +416,16 @@ export class ProcessHost {
       case 'kernelStacks':
         this.#stacks = m;
         break;
-      case 'output':
+      case 'output': {
         this.#onOutput(m.fd, m.text, pid, m);
+        // Delivered: the Worker may now let its exit be seen.
+        const a = this.#outputAcks.get(w);
+        if (a) {
+          Atomics.add(a, 0, 1);
+          Atomics.notify(a, 0);
+        }
         break;
+      }
       case 'compiledModule': {
         // A Worker compiled a module with content key `m.key`. Remember it for this process
         // and relay it to the process's other live Workers so none recompiles
@@ -483,6 +503,7 @@ export class ProcessHost {
             ...extra,
             closureCount: (this.#extra?.closure ?? []).length,
             kind: 'thread',
+            outputAck: this.#outputAck(w2),
             tid: m.thread.tid,
             // `ctx` and `pc` are forwarded explicitly: `adoptThread` re-derives
             // `pc`, but a dropped `ctx` became NaN -> 0, so every guest thread
