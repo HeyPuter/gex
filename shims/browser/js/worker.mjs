@@ -265,7 +265,32 @@ async function handle(msg) {
 
   // Everything the guest writes goes back to whoever started this, posted
   // rather than accumulated so a long run says what it is doing as it runs.
+  // How many output messages this Worker has posted, and how many the host
+  // says it has delivered (a shared counter it bumps per message).
+  let outputSent = 0;
+  const outputAck = msg.outputAck ? new Int32Array(msg.outputAck) : null;
   class WorkerEnv extends Env {
+    /**
+     * Wait until the host has delivered everything this Worker wrote: called
+     * by the shim just before its process's exit becomes visible to a
+     * waiter, so a parent that `wait`s for a child and then prints cannot
+     * overtake the child's last output (they cross different ports).
+     * Bounded, so a host that has gone away does not hang the exit.
+     */
+    drainOutput() {
+      if (!outputAck) return;
+      const deadline = Date.now() + 10000;
+      for (;;) {
+        const got = Atomics.load(outputAck, 0);
+        if (got >= outputSent) return;
+        const left = deadline - Date.now();
+        if (left <= 0) {
+          console.error(`[gex] exit: the host delivered ${got} of ${outputSent} output messages in 10s; exiting anyway`);
+          return;
+        }
+        Atomics.wait(outputAck, 0, got, Math.min(left, 100));
+      }
+    }
     write(fd, bytes) {
       // Copied: `bytes` is a view on the memory the guest is still running in.
       if (msg.debugExit) {
@@ -275,6 +300,7 @@ async function handle(msg) {
       }
       // A page wants text; a command line wants the bytes: `gzip -c` writes a
       // deflate stream that a UTF-8 round trip would fill with U+FFFD.
+      outputSent++;
       port.post(
         msg.rawOutput
           ? { kind: 'output', fd, bytes: bytes.slice(), lflag: lastLflag }

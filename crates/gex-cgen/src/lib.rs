@@ -157,9 +157,6 @@ fn build_functions(
         .collect();
     let overlaps = |lo: u64, hi: u64| pages(lo, hi).any(|p| guarded.contains(&p));
     funcs.retain(|f| !f.blocks.iter().any(|b| !b.synthetic && overlaps(b.start, b.end)));
-    // Statements without a C lowering yet (Stmt::X87): the function stays
-    // tier-1, as a guarded one does.
-    funcs.retain(|f| !f.blocks.iter().any(|b| emit::has_unlowered(&b.stmts)));
     for f in &funcs {
         f.verify()
             .map_err(|e| anyhow::anyhow!("recovered function {:#x} is malformed: {e}", f.entry))?;
@@ -229,7 +226,7 @@ fn build_blocks(tier1: &[u8], blocks: &[(&Block, u32)]) -> Result<(Vec<u8>, Spli
     // A block with a self-modification guard stays tier-1 (§9 of the note).
     let owned: Vec<(&Block, u32)> = blocks
         .iter()
-        .filter(|(b, _)| b.guard.is_none() && !emit::has_unlowered(&b.stmts))
+        .filter(|(b, _)| b.guard.is_none())
         .copied()
         .collect();
     let owned_set: HashSet<u64> = owned.iter().map(|(b, _)| b.start).collect();

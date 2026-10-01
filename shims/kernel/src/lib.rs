@@ -2128,6 +2128,20 @@ pub extern "C" fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
     as_unit(rootfs().chmod(&path_of(path, path_len), mode))
 }
 
+/// A path's modification time: `utimensat`, or a bundle's file times.
+#[no_mangle]
+pub extern "C" fn k_fs_set_mtime(path: u32, path_len: u32, secs: i64) -> i32 {
+    as_unit(rootfs().set_mtime(&path_of(path, path_len), secs))
+}
+
+/// An open file's modification time. This module has no clock, so a process
+/// that writes stamps the file with its own (see `vfs::remote::Remote::touch`).
+#[no_mangle]
+pub extern "C" fn k_fs_touch(handle: i32, secs: i64) -> i32 {
+    let Some(h) = handle_at(handle) else { return -9 };
+    as_unit(h.set_mtime(secs))
+}
+
 /// A symlink's target is text, not a path, so it uses `path_of_raw`: `path_of`
 /// strips leading slashes (right for the name being created, wrong for what an
 /// absolute-path target says, which would then resolve against the link's own

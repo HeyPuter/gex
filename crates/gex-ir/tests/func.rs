@@ -292,6 +292,7 @@ fn same_run(a: &Function, b: &Function, call: &dyn Fn(Callee) -> CallEffect, sp:
             sp,
             max_steps: 200,
             syscall: None,
+            narrow: false,
         };
         let x = interp::run(a, seed, &m);
         let y = interp::run(b, seed, &m);
@@ -488,6 +489,7 @@ fn a_trap_prints_parses_and_is_taken_only_when_its_condition_holds() {
         sp: GuestReg::Sp,
         max_steps: 10,
         syscall: None,
+        narrow: false,
     };
     let mut regs = interp::initial_regs(1, GuestReg::Sp);
     regs[reg_index(x(1))] = 0;
@@ -545,6 +547,7 @@ fn an_x87_operation_prints_parses_is_pure_and_runs_exactly() {
         sp: GuestReg::Sp,
         max_steps: 10,
         syscall: None,
+        narrow: false,
     };
     // 1/3 to 64 bits, stored as a double rounding to nearest: inexact,
     // rounded down (C1 clear).
@@ -556,4 +559,61 @@ fn an_x87_operation_prints_parses_is_pure_and_runs_exactly() {
     assert!(matches!(o.stop, interp::Stop::Return(_)));
     assert_eq!(o.regs[reg_index(x(0))], (1.0f64 / 3.0).to_bits());
     assert_eq!(o.regs[reg_index(x(1))], 0x20); // PE
+}
+
+/// The arithmetic and compare operations print, parse back and run as
+/// gex_f80 computes them.
+#[test]
+fn x87_arithmetic_and_compares_round_trip_and_run() {
+    let mut t = F::new(0x6000);
+    let b0 = t.block(0x6000);
+    let sig = t.read(b0, x(0));
+    let se64 = t.read(b0, x(1));
+    let se = t.def(b0, Expr::Wrap(se64));
+    let cw = t.def(b0, Expr::ConstI32(0x37f));
+    let outs: Vec<Value> = (0..3).map(|_| t.f.fresh()).collect();
+    t.f.block_mut(b0).push(
+        0x6004,
+        Stmt::X87 {
+            op: X87Op::Arith(X87Arith::Div),
+            args: vec![sig, se, sig, se, cw],
+            outs: outs.clone(),
+        },
+    );
+    let c: Vec<Value> = (0..2).map(|_| t.f.fresh()).collect();
+    t.f.block_mut(b0).push(
+        0x6008,
+        Stmt::X87 {
+            op: X87Op::Compare { quiet: true },
+            args: vec![sig, se, outs[0], outs[1]],
+            outs: c.clone(),
+        },
+    );
+    t.write(b0, x(0), outs[0]);
+    let e = t.def(b0, Expr::Extend { a: outs[1], signed: false });
+    t.write(b0, x(1), e);
+    let cc = t.def(b0, Expr::Extend { a: c[0], signed: false });
+    t.write(b0, x(2), cc);
+    let lr = t.read(b0, x(30));
+    t.term(b0, FTerm::Return { target: lr });
+    let f = t.f;
+    f.verify().unwrap();
+    roundtrip(&f);
+    let txt = text::print(&f);
+    assert!(txt.contains("= x87 div") && txt.contains("= x87 ucom"), "{txt}");
+    let m = interp::Model {
+        call: &|_| CallEffect::UNKNOWN,
+        sp: GuestReg::Sp,
+        max_steps: 10,
+        syscall: None,
+        narrow: false,
+    };
+    // 3 / 3 = 1, and 3 compares greater than 1 (no condition bits).
+    let mut regs = interp::initial_regs(1, GuestReg::Sp);
+    regs[reg_index(x(0))] = 0xc000_0000_0000_0000;
+    regs[reg_index(x(1))] = 0x4000;
+    let o = interp::run_from(&f, 1, regs, &m);
+    assert_eq!(o.regs[reg_index(x(0))], 1 << 63);
+    assert_eq!(o.regs[reg_index(x(1))], 0x3fff);
+    assert_eq!(o.regs[reg_index(x(2))], 0);
 }

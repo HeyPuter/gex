@@ -75,6 +75,9 @@ pub struct Model<'a> {
     /// What a syscall does to the registers, given the registers at the
     /// syscall; `None` is [`CallEffect::UNKNOWN`].
     pub syscall: Option<&'a dyn Fn(&[u64]) -> CallEffect>,
+    /// i386 code: every general register holds a zero-extended 32-bit
+    /// value, including what a modelled call leaves in one.
+    pub narrow: bool,
 }
 
 /// Deterministic pseudo-random bits from a key.
@@ -94,6 +97,32 @@ fn in_range(r: GuestReg, v: u64) -> u64 {
         Ty::I32 => v & 0xffff_ffff,
         _ => v,
     }
+}
+
+/// [`in_range`], and for i386 code (`narrow`) general registers are
+/// zero-extended 32-bit values.
+fn in_range_for(r: GuestReg, v: u64, narrow: bool) -> u64 {
+    match r {
+        GuestReg::X(_) if narrow => v & 0xffff_ffff,
+        _ => in_range(r, v),
+    }
+}
+
+/// [`initial_regs`] for i386 code: 32-bit general registers and a stack
+/// pointer below 3 GiB.
+pub fn initial_regs32(seed: u64, sp: GuestReg) -> Vec<u64> {
+    let mut regs: Vec<u64> = initial_regs(seed, sp)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| in_range_for(reg_of_index(i), v, true))
+        .collect();
+    regs[reg_index(sp)] = 0xbf00_0000 + (mix(seed) & 0xfff0);
+    regs
+}
+
+/// [`perturb`] for i386 code when `narrow`.
+pub fn perturb_for(r: GuestReg, v: u64, narrow: bool) -> u64 {
+    in_range_for(r, perturb(r, v), narrow)
 }
 
 /// The registers a run with `seed` starts with: pseudo-random, with the
@@ -261,13 +290,31 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
                     let Some(a) = a else {
                         finish!(unsupported());
                     };
-                    let (sig, se, cw) = (a[0], a[1] as u16, a[2] as u16);
-                    let (r, sw) = match *op {
-                        X87Op::Narrow { single } => gex_f80::narrow_op(sig, se, cw, single),
-                        X87Op::ToInt { bits, trunc } => gex_f80::to_int_op(sig, se, cw, bits, trunc),
+                    let f = |i: usize| gex_f80::F80 {
+                        sig: a[i],
+                        se: a[i + 1] as u16,
                     };
-                    vals.insert(outs[0], r);
-                    vals.insert(outs[1], sw as u64);
+                    let r: Vec<u64> = match *op {
+                        X87Op::Narrow { single } => {
+                            let (r, sw) = gex_f80::narrow_op(a[0], a[1] as u16, a[2] as u16, single);
+                            vec![r, sw as u64]
+                        }
+                        X87Op::ToInt { bits, trunc } => {
+                            let (r, sw) = gex_f80::to_int_op(a[0], a[1] as u16, a[2] as u16, bits, trunc);
+                            vec![r, sw as u64]
+                        }
+                        X87Op::Arith(k) => {
+                            let (r, sw) = gex_f80::arith_op(k as u8, f(0), f(2), a[4] as u16);
+                            vec![r.sig, r.se as u64, sw as u64]
+                        }
+                        X87Op::Compare { quiet } => {
+                            let (cc, sw) = gex_f80::compare_op(f(0), f(2), quiet);
+                            vec![cc as u64, sw as u64]
+                        }
+                    };
+                    for (o, v) in outs.iter().zip(r) {
+                        vals.insert(*o, v);
+                    }
                 }
                 Stmt::Trap { cond, pc, code } => match get(&vals, *cond) {
                     Some(0) => {}
@@ -307,7 +354,7 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
             }
             FTerm::Call { callee, ret, .. } => {
                 calls += 1;
-                havoc(&mut regs, (m.call)(*callee), seed ^ callee_key(*callee, &vals), calls, spi);
+                havoc(&mut regs, (m.call)(*callee), seed ^ callee_key(*callee, &vals), calls, spi, m.narrow);
                 match ret {
                     Some(e) => (e.to, edge_args(e, &vals)),
                     None => finish!(Stop::Leave(pc)),
@@ -316,7 +363,7 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
             FTerm::Syscall { next, .. } => {
                 calls += 1;
                 let eff = m.syscall.map_or(CallEffect::UNKNOWN, |s| s(&regs));
-                havoc(&mut regs, eff, seed ^ 0x5ca11, calls, spi);
+                havoc(&mut regs, eff, seed ^ 0x5ca11, calls, spi, m.narrow);
                 match next {
                     Some(e) => (e.to, edge_args(e, &vals)),
                     None => finish!(Stop::Leave(pc)),
@@ -342,19 +389,19 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
 }
 
 /// What a modelled call does to the registers.
-fn havoc(regs: &mut [u64], eff: CallEffect, site: u64, calls: u64, spi: usize) {
+fn havoc(regs: &mut [u64], eff: CallEffect, site: u64, calls: u64, spi: usize, narrow: bool) {
     for i in 0..N_REGS {
         let r = reg_of_index(i);
         if i == spi || eff.preserved.contains(r) {
             continue;
         }
-        regs[i] = in_range(r, mix(site ^ (calls << 20) ^ ((i as u64) << 8)));
+        regs[i] = in_range_for(r, mix(site ^ (calls << 20) ^ ((i as u64) << 8)), narrow);
     }
     let sp = reg_of_index(spi);
     regs[spi] = match eff.sp_delta {
         Some(d) => regs[spi].wrapping_add(d as u64),
         None if eff.preserved.contains(sp) => regs[spi],
-        None => mix(site ^ calls ^ 0x5b),
+        None => in_range_for(sp, mix(site ^ calls ^ 0x5b), narrow),
     };
 }
 

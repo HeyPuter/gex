@@ -390,12 +390,28 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 /// Cheap next to translating, so `gexc build` does it every time; catches
 /// lifter bugs wasmtime would otherwise only reject deep into a module.
 /// The `x87` import's work: `gex_ir::X87Op::code` decoded onto
-/// `gex_f80`'s pure operations.
-fn x87_op(op: i32, sig: u64, se: u16, cw: u16) -> (u64, u32) {
+/// `gex_f80`'s pure operations. Returns (the first result, the sign and
+/// exponent of an extended result, the status-word bits).
+pub fn x87_op(op: i32, a_sig: u64, a_se: u16, b_sig: u64, b_se: u16, cw: u16) -> (u64, u32, u32) {
+    use gex_kernel::f80::{self, F80};
+    let (a, b) = (F80 { sig: a_sig, se: a_se }, F80 { sig: b_sig, se: b_se });
     match op {
-        1 => gex_kernel::f80::narrow_op(sig, se, cw, true),
-        2 => gex_kernel::f80::narrow_op(sig, se, cw, false),
-        _ if op & 0x100 != 0 => gex_kernel::f80::to_int_op(sig, se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0),
+        1 | 2 => {
+            let (r, sw) = f80::narrow_op(a_sig, a_se, cw, op == 1);
+            (r, 0, sw)
+        }
+        _ if op & 0xf00 == 0x100 => {
+            let (r, sw) = f80::to_int_op(a_sig, a_se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0);
+            (r, 0, sw)
+        }
+        _ if op & 0xf00 == 0x200 => {
+            let (r, sw) = f80::arith_op((op & 3) as u8, a, b, cw);
+            (r.sig, r.se as u32, sw)
+        }
+        _ if op & 0xf00 == 0x300 => {
+            let (cc, sw) = f80::compare_op(a, b, op & 1 != 0);
+            (cc as u64, 0, sw)
+        }
         _ => panic!("x87 import: unknown operation {op:#x}"),
     }
 }
@@ -3006,16 +3022,25 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::X87,
-        |caller: Caller<'_, HostState>, ctx: i32, op: i32, sig: i64, se: i32, cw: i32| -> Result<i64> {
-            let (r, sw) = x87_op(op, sig as u64, se as u16, cw as u16);
+        |caller: Caller<'_, HostState>,
+         ctx: i32,
+         op: i32,
+         a_sig: i64,
+         a_se: i32,
+         b_sig: i64,
+         b_se: i32,
+         cw: i32|
+         -> Result<i64> {
+            let (r, se, sw) = x87_op(op, a_sig as u64, a_se as u16, b_sig as u64, b_se as u16, cw as u16);
             let memory = caller
                 .data()
                 .memory
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
             let data = memory.bytes();
-            let at = ctx as u32 as usize + ctx::X87_TMP + 12;
-            data[at..at + 4].copy_from_slice(&sw.to_le_bytes());
+            let at = ctx as u32 as usize + ctx::X87_TMP + 8;
+            data[at..at + 4].copy_from_slice(&se.to_le_bytes());
+            data[at + 4..at + 8].copy_from_slice(&sw.to_le_bytes());
             Ok(r as i64)
         },
     )?;
