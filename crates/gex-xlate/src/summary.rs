@@ -1471,6 +1471,34 @@ impl LeaksSp for Summary {
 // The call graph fixpoint
 // ---------------------------------------------------------------------------
 
+/// The least summary at least as general as both: what may happen in either,
+/// what holds in both.
+fn join_summaries(a: &Summary, b: &Summary) -> Summary {
+    let preserved = a.preserved.inter(b.preserved);
+    Summary {
+        inputs: a.inputs.union(b.inputs),
+        stack_inputs: a.stack_inputs.join(b.stack_inputs),
+        outputs: a.outputs.union(b.outputs),
+        preserved,
+        sp_delta: if a.sp_delta == b.sp_delta || !a.may_return {
+            b.sp_delta
+        } else if !b.may_return {
+            a.sp_delta
+        } else {
+            None
+        },
+        caller_frame_writes: a.caller_frame_writes.join(b.caller_frame_writes),
+        addr_inputs: a.addr_inputs.union(b.addr_inputs),
+        escaping_inputs: a.escaping_inputs.union(b.escaping_inputs),
+        output_sources: a.output_sources.union(b.output_sources),
+        may_return: a.may_return || b.may_return,
+        may_unwind: a.may_unwind || b.may_unwind,
+        may_leave_pending: a.may_leave_pending || b.may_leave_pending,
+        unknown_callee: a.unknown_callee || b.unknown_callee,
+        reads_return_address: a.reads_return_address || b.reads_return_address,
+    }
+}
+
 /// Tarjan's SCCs, returned callees-first (reverse topological order of the
 /// call graph).
 fn sccs(nodes: &[u64], edges: &HashMap<u64, Vec<u64>>) -> Vec<Vec<u64>> {
@@ -1587,6 +1615,17 @@ pub fn analyze_functions(functions: &BTreeMap<u64, Function>) -> Summaries {
                         trust_frame: false,
                     },
                 );
+                // Only climb: the analysis of one function is not monotone
+                // in its callees' summaries (whether a callee preserves a
+                // register decides whether that register's taint counts),
+                // so a cycle can alternate. Joining with the last iterate
+                // makes the sequence ascend, and its limit over-approximates
+                // every iterate.
+                if recursive {
+                    if let Some(old) = map.get(&a) {
+                        s = join_summaries(old, &s);
+                    }
+                }
                 // Slot ranges have no height bound (a tail-call cycle that
                 // moves the stack pointer reads one more byte each time
                 // round): widen one still growing to unknown.
