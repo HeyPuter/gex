@@ -681,6 +681,26 @@ Worker, so a thread must be one). Hooks in `lib.rs`, each a line or two:
   guest that polls the tick count in a loop passes a safepoint.
 - The NT layer's diagnostics go to the console through `nt::set_log`
   (`eprintln!` writes nowhere on wasm32-unknown-unknown).
+- The display, when the page brought a compositor (`gex_set_wl`): `WlDisplay`
+  publishes every visible top-level window as a toplevel record in this
+  process's block of the scene arena (`wl_publish`, the same records
+  `crate::wl` writes; client 1, surface = the window handle, XRGB8888 at the
+  surface's guest address, which the compositor reads in place), and
+  `poll_input` decodes this process's input ring (`wl_poll_input`, shared
+  memory) into `NtDisplayEvent`s, which `message::peek` turns into hardware
+  input. The compositor places and decorates the windows; coordinates are
+  surface-local either way. A configure that does not change the size (the
+  compositor sends one on every focus change) is dropped.
+- `/dev/gex-gl` is the shim's `GlDevice`, the one Linux guests use: the
+  opengl32 unixlib's submits go through `gl_submit` to the page's GL host
+  (`MesaGlDevice` in the compositor's worker with `gl: 'compositor'`).
+
+The page is `web/nt.html` (`web/src/nt-page.js`): it fetches a tar holding a
+prefix under `/wine` and the program, and runs it through `runProgram` with
+the canvas as the compositor's output. `tests/nt/browser-gui.mjs` drives it in
+headless Chromium (its own vite dev server and browser, software GL):
+`window.exe`'s window is checked by pixels, a click and Escape by what the
+program prints.
 
 **One kernel.** The process's `Kernel` is the one in the shim's `Host`, and
 the NT layer reaches it only through `HostKernel`, whose `lock_kernel` takes
@@ -694,9 +714,11 @@ layer never holds the kernel across a callback or a wait (natively that
 would deadlock on the `Mutex`), so `KLock`'s per-Worker re-entrancy never
 sees two live borrows.
 
-Not yet in the browser: retiring translations of code that is unmapped
-(the lists are drained and dropped; Wine rarely unloads a DLL), opengl32
-over `/dev/gex-gl`, and the display (§6a).
+Code that goes away (an unmapped image, a protection change -- LuaJIT
+rewrites its machine code in place) loses its translations as natively: the
+pages leave the shared page table and their dispatch-directory entries go
+back to the miss stub, so the next branch from any Worker re-lifts what is
+there now.
 
 Milestones (from the S12 brief): **N1** x64 console hello through Wine's PE
 ntdll/kernelbase/kernel32/msvcrt; **N2** threads, sync, SEH; **N3** the 32-bit

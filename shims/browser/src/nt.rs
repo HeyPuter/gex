@@ -100,6 +100,10 @@ mod imp {
         /// Monotonic nanoseconds (`performance.now()`): the page's `now` is
         /// `Date.now()`, a millisecond clock that can step.
         fn mono_ns() -> i64;
+        /// The compositor's scene for this process (see `crate::wl`).
+        fn wl_publish(ptr: u32, count: u32);
+        /// This process's compositor input ring (see `crate::wl`).
+        fn wl_poll_input(ptr: u32, max: u32) -> u32;
     }
 
     /// The process, once booted. In the shim's statics, which every Worker
@@ -256,10 +260,130 @@ mod imp {
         p.reserve_host(host_lo, host_hi, "[gex-shim]");
         let req = nt::boot::BootRequest { exe_path: &exe_path, args: args.get(1..).unwrap_or(&[]) };
         let pc = nt::boot::boot(&p, k, guest_bytes(), &req).map_err(|e| format!("starting {exe_path}: {e}"))?;
+        // The page's compositor, when it brought one: windows become its
+        // toplevels and its input comes back as hardware input.
+        if crate::wl::have_wl() {
+            *p.display_host.lock().unwrap() = Some(Arc::new(WlDisplay::default()));
+        }
         if PROCESS.set(p).is_err() {
             return Err("this Worker has already booted a Windows process".into());
         }
         Ok(pc)
+    }
+
+    /// The browser's display (docs/nt-layer.md §6a.1): every top-level
+    /// window is a toplevel in the page's compositor, published as a scene
+    /// record whose pixels the compositor reads in place out of the shared
+    /// memory (the window surface is a 32 bpp BGRX bitmap, `wl_shm`'s
+    /// XRGB8888). The compositor places and decorates the windows itself;
+    /// input arrives in surface coordinates, which is what the NT side
+    /// wants.
+    #[derive(Default)]
+    struct WlDisplay {
+        windows: std::sync::Mutex<std::collections::BTreeMap<u32, (nt::display::NtSurface, u32)>>,
+    }
+
+    /// Words in a scene record and an input event: `REC` and `EV` in
+    /// `crate::wl` and `wl-bridge.mjs`.
+    const REC: usize = 28;
+    const EV: usize = 8;
+    /// The client number NT windows go by in this process's block. A Windows
+    /// process has no Wayland clients of its own, so there is nobody to
+    /// share it with.
+    const NT_CLIENT: u32 = 1;
+    /// `wl_shm`'s XRGB8888: B, G, R, X in memory order.
+    const XRGB8888: i32 = 1;
+
+    impl WlDisplay {
+        fn flush(&self, windows: &std::collections::BTreeMap<u32, (nt::display::NtSurface, u32)>) {
+            let mut scene: Vec<i32> = Vec::with_capacity(windows.len() * REC);
+            for (s, serial) in windows.values().take(64) {
+                let base = scene.len();
+                scene.resize(base + REC, 0);
+                let r = &mut scene[base..];
+                r[0] = NT_CLIENT as i32;
+                r[1] = s.id as i32;
+                r[2] = 1; // toplevel
+                r[4] = s.x;
+                r[5] = s.y;
+                r[6] = s.width;
+                r[7] = s.height;
+                r[8] = s.addr as u32 as i32;
+                r[9] = s.stride as i32;
+                r[10] = XRGB8888;
+                r[11] = *serial as i32;
+                let (l, t, rt, b) = s.damage;
+                r[12] = l;
+                r[13] = t;
+                r[14] = rt - l;
+                r[15] = b - t;
+                let mut n = s.title.len().min(32);
+                while n > 0 && !s.title.is_char_boundary(n) {
+                    n -= 1;
+                }
+                for (i, chunk) in s.title.as_bytes()[..n].chunks(4).enumerate() {
+                    let mut w = [0u8; 4];
+                    w[..chunk.len()].copy_from_slice(chunk);
+                    r[18 + i] = i32::from_le_bytes(w);
+                }
+            }
+            // SAFETY: the import reads `count` records at the pointer and keeps
+            // none of them.
+            unsafe { wl_publish(scene.as_ptr() as u32, (scene.len() / REC) as u32) };
+        }
+    }
+
+    impl nt::display::NtDisplay for WlDisplay {
+        fn publish(&self, _mem: &GuestMem<'_>, surface: &nt::display::NtSurface) {
+            let mut w = self.windows.lock().unwrap();
+            let serial = w.get(&surface.id).map_or(1, |(_, n)| n.wrapping_add(1));
+            w.insert(surface.id, (surface.clone(), serial));
+            self.flush(&w);
+        }
+
+        fn remove(&self, id: u32) {
+            let mut w = self.windows.lock().unwrap();
+            if w.remove(&id).is_some() {
+                self.flush(&w);
+            }
+        }
+
+        fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {
+            use nt::display::NtDisplayEvent as E;
+            let mut raw = [0i32; 64 * EV];
+            // SAFETY: the import writes at most 64 records into the buffer.
+            let n = (unsafe { wl_poll_input(raw.as_mut_ptr() as u32, 64) } as usize).min(64);
+            let mut out = Vec::new();
+            for q in raw[..n * EV].chunks(EV) {
+                let (client, window) = (q[5] as u32, q[6] as u32);
+                if client != NT_CLIENT {
+                    continue;
+                }
+                out.push(match q[0] {
+                    0 => E::Motion { window, x: q[1], y: q[2] },
+                    1 => E::Button { window, button: q[1] as u32, pressed: q[2] != 0 },
+                    // Wayland's ten units a wheel notch, positive downwards;
+                    // Windows' 120 a notch, positive away from the user.
+                    2 => E::Axis { window, axis: q[1] as u32, value: -q[2] * 12 },
+                    3 => E::Key { window, code: q[1] as u32, pressed: q[2] != 0 },
+                    6 if window != 0 => E::Focus { window },
+                    // Only a real resize: the compositor configures on every
+                    // focus change too, with the size the window already has.
+                    7 => {
+                        let same = self.windows.lock().unwrap().get(&window).is_some_and(|(s, _)| {
+                            s.width == q[1] && s.height == q[2]
+                        });
+                        if same {
+                            continue;
+                        }
+                        E::Configure { window, width: q[1], height: q[2] }
+                    }
+                    8 => E::Close { window },
+                    _ => continue,
+                });
+            }
+            out
+        }
     }
 
     /// Bring `KUSER_SHARED_DATA`'s clocks up to date, at most once a
@@ -322,12 +446,16 @@ mod imp {
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
         tick();
-        // Code that went away keeps its translations here: the browser has
-        // no retirement yet (docs/nt-layer.md §10.2). The lists are drained
-        // so they do not grow.
+        // Code that went away (an unmapped image, a protection change: LuaJIT
+        // rewrites its machine code in place) loses its translations, as
+        // natively. NT images are never statically recompiled, so newly mapped
+        // code needs nothing.
         with_host(|h| {
-            h.kernel.retired_code.clear();
+            let retired = std::mem::take(&mut h.kernel.retired_code);
             h.kernel.new_code.clear();
+            if !retired.is_empty() {
+                retire(h, &retired);
+            }
         });
         let resume_pc = || GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         match outcome {
@@ -376,6 +504,31 @@ mod imp {
             // The result is with the thread; trapping here ends the innermost
             // nested loop, which asks `gex_nt_callback_done`.
             nt::Outcome::CallbackReturn => trap(),
+        }
+    }
+
+    /// Forget every translation in `ranges`, the browser's
+    /// `retire_translations`: the pages leave the shared page table and their
+    /// directory entries go back to the miss stub, so the next branch there
+    /// (from any Worker) lifts what is there now into fresh slots. The old
+    /// slots are left behind, unreachable.
+    fn retire(h: &mut crate::Host, ranges: &[(u64, u64)]) {
+        use std::sync::atomic::AtomicU32;
+        for &(start, end) in ranges {
+            if end <= start {
+                continue;
+            }
+            h.jit.translated.retain(|a| *a < start || *a >= end);
+            for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
+                if page >= gex_abi::DISPATCH_MAX_PAGES {
+                    break;
+                }
+                h.jit.page_table.forget(page);
+                let at = gex_abi::DISPATCH_DIR + page * 4;
+                // SAFETY: the directory is in the shared memory, four-byte
+                // aligned, and every Worker's dispatch reads it as a word.
+                unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
+            }
         }
     }
 
