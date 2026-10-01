@@ -702,6 +702,7 @@ impl Function {
 pub fn for_each_def(s: &Stmt, mut f: impl FnMut(Value)) {
     match s {
         Stmt::Def { dst, .. } | Stmt::MemCmp { dst, .. } => f(*dst),
+        Stmt::X87 { outs, .. } => outs.iter().copied().for_each(f),
         Stmt::StrOp {
             out_count,
             out_dst,
@@ -796,6 +797,7 @@ pub fn for_each_use_mut(s: &mut Stmt, mut f: impl FnMut(&mut Value)) {
             f(val);
         }
         Stmt::HostCall { args, .. } => args.iter_mut().for_each(f),
+        Stmt::X87 { args, .. } => args.iter_mut().for_each(f),
         Stmt::Trap { cond, .. } => f(cond),
         Stmt::MemCopy { dst, src, len } => {
             f(dst);
@@ -834,6 +836,7 @@ pub fn for_each_use_mut(s: &mut Stmt, mut f: impl FnMut(&mut Value)) {
 pub fn for_each_def_mut(s: &mut Stmt, mut f: impl FnMut(&mut Value)) {
     match s {
         Stmt::Def { dst, .. } | Stmt::MemCmp { dst, .. } => f(dst),
+        Stmt::X87 { outs, .. } => outs.iter_mut().for_each(f),
         Stmt::StrOp {
             out_count,
             out_dst,
@@ -987,6 +990,8 @@ pub fn effect(s: &Stmt) -> Effect {
             ..
         } => e.mem.push(wr(*addr, *offset, Some(*bytes), Order::Relaxed)),
         Stmt::HostCall { func, .. } => e.host = Some(*func),
+        // Pure: no effect beyond the values it defines.
+        Stmt::X87 { .. } => {}
         Stmt::Trap { .. } => e.trap = true,
         Stmt::MemCopy { dst, src, .. } => {
             e.mem.push(rd(*src, 0, None, Order::Relaxed));

@@ -5,9 +5,9 @@
 #   tests/gl44-cts-sweep.sh [family ...]
 #
 # GEX_CTS_MODULE and GEX_CTS_MUSTPASS choose the GL version, and
-# GEX_CTS_BACKEND chooses which host backend executes the guest's stream --
-# `mesa` for Mesa on the gex_wgpu Gallium driver, MobileGL otherwise. For a
-# GL 3.2 sweep of the Mesa backend:
+# GEX_CTS_BACKEND chooses which host backend executes the guest's stream;
+# `mesa`, Mesa on the gex_wgpu Gallium driver, is the default and the only one
+# (see tests/gl44-cts-browser.sh). For a GL 3.2 sweep:
 #
 #   GEX_CTS_BACKEND=mesa GEX_CTS_MODULE=KHR-GL32 \
 #   GEX_CTS_MUSTPASS=.../mustpass/gl/khronos_mustpass/main/gl32-main.txt \

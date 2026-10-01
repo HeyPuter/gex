@@ -2,9 +2,12 @@
  * parameters, nested handlers and unwinding, continuing from a vectored
  * handler, processor exceptions (int3, ud2, executing data), and an
  * unhandled exception reaching the top-level filter.
+ * `seh.exe traps`: divide errors and `hlt` instead (EXCEPTION_INT_DIVIDE_BY_ZERO,
+ * EXCEPTION_INT_OVERFLOW, EXCEPTION_PRIV_INSTRUCTION), then exits.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 static int failures;
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok" : "FAIL", name); if (!ok_) failures++; } while (0)
@@ -75,11 +78,56 @@ __attribute__((noinline)) static void do_int3(void) { __debugbreak(); __asm__ vo
 __attribute__((noinline)) static void do_ud2(void) { __builtin_trap(); }
 #endif
 
+/* Processor traps, each in a function of its own. */
+__attribute__((noinline)) static void do_div0(void) {
+    __asm__ volatile("xorl %%edx, %%edx\n\tmovl $1, %%eax\n\txorl %%ecx, %%ecx\n\tdivl %%ecx" ::: "eax", "ecx", "edx");
+}
+__attribute__((noinline)) static void do_idiv_overflow(void) {
+    __asm__ volatile("movl $0x80000000, %%eax\n\tcltd\n\tmovl $-1, %%ecx\n\tidivl %%ecx" ::: "eax", "ecx", "edx");
+}
+__attribute__((noinline)) static void do_hlt(void) { __asm__ volatile("hlt"); }
+
+static int traps(void) {
+#ifdef __x86_64__
+    DWORD code = 0;
+    __try { do_div0(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    CHECK("div by zero is EXCEPTION_INT_DIVIDE_BY_ZERO", code == EXCEPTION_INT_DIVIDE_BY_ZERO);
+    code = 0;
+    __try { do_idiv_overflow(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    /* Windows reports a quotient overflow as EXCEPTION_INT_OVERFLOW (native
+     * Wine says INT_DIVIDE_BY_ZERO: Linux gives it FPE_INTDIV). */
+    CHECK("INT_MIN / -1 is EXCEPTION_INT_OVERFLOW", code == EXCEPTION_INT_OVERFLOW);
+    code = 0;
+    __try { do_hlt(); } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    CHECK("hlt is EXCEPTION_PRIV_INSTRUCTION", code == EXCEPTION_PRIV_INSTRUCTION);
+#else
+    CHECK("div by zero is EXCEPTION_INT_DIVIDE_BY_ZERO", guarded_call(do_div0) == 1 && caught_code == EXCEPTION_INT_DIVIDE_BY_ZERO);
+    CHECK("INT_MIN / -1 is EXCEPTION_INT_OVERFLOW", guarded_call(do_idiv_overflow) == 1 && caught_code == EXCEPTION_INT_OVERFLOW);
+    CHECK("hlt is EXCEPTION_PRIV_INSTRUCTION", guarded_call(do_hlt) == 1 && caught_code == EXCEPTION_PRIV_INSTRUCTION);
+#endif
+    printf("%d failures\n", failures);
+    return failures;
+}
+
 static volatile LONG vectored_calls;
 static LONG CALLBACK vectored(EXCEPTION_POINTERS *e) {
     if (e->ExceptionRecord->ExceptionCode != 0xe0005678) return EXCEPTION_CONTINUE_SEARCH;
     InterlockedIncrement(&vectored_calls);
     return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+__attribute__((noinline)) static int raise_keeps_control_words(int pad) {
+    volatile char *room = __builtin_alloca(pad + 1);
+    room[0] = 0;
+    unsigned short cw = 0x0c7f, cw_after;
+    unsigned int mxcsr = 0x7f80, mxcsr_after, mxcsr_before;
+    __asm__ volatile("stmxcsr %0" : "=m"(mxcsr_before));
+    __asm__ volatile("fldcw %0; ldmxcsr %1" :: "m"(cw), "m"(mxcsr));
+    RaiseException(0xe0005678, 0, 0, 0);
+    __asm__ volatile("fnstcw %0; stmxcsr %1" : "=m"(cw_after), "=m"(mxcsr_after));
+    cw = 0x027f;
+    __asm__ volatile("fldcw %0; ldmxcsr %1" :: "m"(cw), "m"(mxcsr_before));
+    return (cw_after & ~0x40) == 0x0c3f && mxcsr_after == 0x7f80;
 }
 
 static LONG WINAPI top_filter(EXCEPTION_POINTERS *e) {
@@ -90,7 +138,8 @@ static LONG WINAPI top_filter(EXCEPTION_POINTERS *e) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "traps")) return traps();
 #ifdef __x86_64__
     int caught = 0;
     __try { RaiseException(0xe0000001, 0, 0, 0); } __except (GetExceptionCode() == 0xe0000001) { caught = 1; }
@@ -119,6 +168,12 @@ int main(void) {
     RaiseException(0xe0005678, 0, 0, 0);
     RaiseException(0xe0005678, 0, 0, 0);
     CHECK("vectored handler continues execution", vectored_calls == 2);
+    /* Continuing restores the FPU control words the raise captured, at
+     * every stack alignment (the dispatcher's frame overlaps the CONTEXT
+     * RtlRaiseException keeps below the caller's stack). */
+    int kept = 1;
+    for (int pad = 0; pad < 64; pad += 4) kept &= raise_keeps_control_words(pad);
+    CHECK("continuing keeps the x87 and SSE control words", kept);
     RemoveVectoredExceptionHandler(h);
 
 #ifdef __x86_64__

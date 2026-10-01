@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "OpenGL ES passthrough: a guest's GL calls, run on the host's GL"
 
+[features]
+# The native host renderer (`host`), which links the host's EGL and GLES.
+# Off for users that only need the protocol, such as the NT layer's
+# opengl32, so they gain no native link dependencies.
+default = ["host"]
+host = []
+
 [dependencies]
 
 # The host half links against the host's own GL. There is nothing to build on

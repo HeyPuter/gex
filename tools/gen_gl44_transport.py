@@ -290,7 +290,7 @@ STRING_RETURN_COMMANDS = {
     "glGetSubroutineUniformLocation": "GLint",
 }
 
-# Guest GLuint names are not MobileGL's names. Each object-bearing parameter
+# Guest GLuint names are not the host GL's names. Each object-bearing parameter
 # names the host map through which it must be resolved before the GL call.
 OBJECT_COMMANDS = {
     "glBindImageTexture": {"texture": "textures"},
@@ -1705,7 +1705,7 @@ def main() -> int:
         host += host_case(command, opcodes[command["name"]]) + "\n"
     outputs = {
         root / "guest/gl/gl44-generated.inc": guest,
-        root / "web/mobilegl/gl44-generated-cases.inc": host,
+        root / "web/mesa/gl44-generated-cases.inc": host,
     }
     if args.check:
         stale = [str(path.relative_to(root)) for path, value in outputs.items()

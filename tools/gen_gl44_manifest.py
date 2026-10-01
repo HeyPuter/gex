@@ -76,9 +76,9 @@ def main() -> int:
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
 
-    mobilegl = root / "third_party/mobilegl-webgpu"
-    registry_path = root / "third_party/opengl-registry/xml/gl.xml"
-    by_version = version_commands((mobilegl / "include/GL/glcorearb.h").read_text())
+    registry_root = root / "third_party/opengl-registry"
+    registry_path = registry_root / "xml/gl.xml"
+    by_version = version_commands((registry_root / "api/GL/glcorearb.h").read_text())
     introduced = {}
     for major, minor in VERSIONS:
         version = f"{major}.{minor}"

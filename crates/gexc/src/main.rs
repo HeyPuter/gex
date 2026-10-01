@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod eject;
 mod nt_run;
 mod pe_info;
 
@@ -45,6 +46,10 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "eject" => match eject::cmd_eject(&argv[2..])? {
+            Some(exit) => Ok(report_exit(&exit, false)),
+            None => Ok(ExitCode::SUCCESS),
+        },
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "funcs" => cmd_funcs(&argv[2..]),
@@ -90,6 +95,7 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
+{}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
   gexc funcs  <elf|pe> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list] [--base HEX]
@@ -169,7 +175,8 @@ run options:
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
                   path the guest can resolve",
-        pe_info::USAGE
+        pe_info::USAGE,
+        eject::USAGE
     );
 }
 
@@ -556,6 +563,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    // A 32-bit (i386) program's code must be decoded in compatibility mode,
+    // exactly as the runtime path does before translating (`run_program_with`).
+    gex_xlate::set_compat(image.class32);
     let (module, stats) = gex_xlate::translate_image(
         &image,
         &Options {
@@ -661,6 +671,19 @@ fn build_closure(
     profile: &[u64],
 ) -> Result<()> {
     let (closure, interp) = closure_of_all(path, also, sysroot)?;
+    // One decoding mode for the whole closure, taken from the executable: a
+    // 32-bit (i386) program is 32-bit throughout, and a closure that mixes
+    // classes cannot be translated in one mode.
+    let class32 = closure.objects.first().map(|o| o.image.class32).unwrap_or(false);
+    if let Some(o) = closure.objects.iter().find(|o| o.image.class32 != class32) {
+        anyhow::bail!(
+            "{}: a {}-bit object in a {}-bit program's closure",
+            o.path,
+            if o.image.class32 { 32 } else { 64 },
+            if class32 { 32 } else { 64 }
+        );
+    }
+    gex_xlate::set_compat(class32);
     // Sorted once so each object can binary-search its slice of reached PCs.
     let mut profile_sorted = profile.to_vec();
     profile_sorted.sort_unstable();
@@ -760,27 +783,7 @@ fn build_closure(
     // an EdDSA signature only ever appeared with a closure). Global, because a
     // call resolves to another object's definition; keyed by biased address,
     // which is where the block for that function is discovered.
-    let mut intrinsics: std::collections::HashMap<u64, gex_xlate::Intrinsic> =
-        std::collections::HashMap::new();
-    for o in &closure.objects {
-        let (tlo, thi) = o.image.text_range;
-        for s in &o.image.symbols {
-            if s.ifunc {
-                continue;
-            }
-            // Defined, and in this object's own text: an undefined/imported
-            // `memcpy` has no address here (it resolves to libc's definition),
-            // and the executables all share `PIE_BASE`, so an out-of-text entry
-            // would collide across them.
-            let addr = s.value.wrapping_add(o.image.bias);
-            if addr < tlo || addr >= thi {
-                continue;
-            }
-            if let Some(kind) = gex_xlate::intrinsic::recognise(&s.name) {
-                intrinsics.insert(addr, kind);
-            }
-        }
-    }
+    let intrinsics = closure_intrinsics(&closure.objects);
     for (n, o) in ordered.into_iter().enumerate() {
         let skipped = skip.iter().any(|w| o.name.starts_with(w.as_str()));
         // This object's slice of the reached-PC profile, when one was given. The
@@ -959,6 +962,34 @@ fn build_closure(
         pin_file,
     );
     Ok(())
+}
+
+/// Every object's `mem*` functions, by placed address. See `build_closure`.
+fn closure_intrinsics(
+    objects: &[gex_ld::closure::Object],
+) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
+    let mut intrinsics = std::collections::HashMap::new();
+    for o in objects {
+        let (tlo, thi) = o.image.text_range;
+        for s in &o.image.symbols {
+            if s.ifunc {
+                continue;
+            }
+            // Defined, and in this object's own text: an undefined/imported
+            // `memcpy` has no address here (it resolves to libc's definition),
+            // and the executables all share `PIE_BASE`, so an out-of-text entry
+            // would collide across them. `value` is already biased: gex-ld
+            // adds the load bias when it reads the symbol table.
+            let addr = s.value;
+            if addr < tlo || addr >= thi {
+                continue;
+            }
+            if let Some(kind) = gex_xlate::intrinsic::recognise(&s.name) {
+                intrinsics.insert(addr, kind);
+            }
+        }
+    }
+    intrinsics
 }
 
 /// Whether a file name is a dynamic linker.
@@ -1548,5 +1579,58 @@ fn cmd_profile(args: &[String]) -> Result<()> {
             Ok(())
         }
         _ => bail!("usage: gexc profile merge (-o OUT | --split DIR) IN... | gexc profile show [--top N] IN"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A library's `memcpy`, placed at a base: the intrinsic goes at the
+    /// address it is loaded at, not that plus the base again (which is
+    /// outside its text, so it was silently dropped).
+    #[test]
+    fn a_placed_librarys_memcpy_is_found_where_it_is() {
+        let base = gex_abi::MMAP_BOTTOM;
+        let at = base + 0x100;
+        let image = gex_ld::Image {
+            soname: None,
+            needed: Vec::new(),
+            runpath: Vec::new(),
+            bias: base,
+            entry: base,
+            code: vec![(base, base + 0x1000)],
+            segments: Vec::new(),
+            phdr_vaddr: base,
+            phentsize: 56,
+            phnum: 0,
+            brk: base + 0x1000,
+            text_range: (base, base + 0x1000),
+            tls: None,
+            class32: false,
+            symbols: vec![gex_ld::Symbol {
+                name: "memcpy".into(),
+                value: at,
+                size: 16,
+                ifunc: false,
+            }],
+            named_relocs: Vec::new(),
+            relocs: Vec::new(),
+            init_array: Vec::new(),
+            dynsyms: Vec::new(),
+            irelative: Vec::new(),
+            pie: true,
+            interp: None,
+        };
+        let objects = vec![gex_ld::closure::Object {
+            path: "/lib/libc.so".into(),
+            name: "libc.so".into(),
+            image,
+            span: 0x1000,
+            depth: 1,
+        }];
+        let got = closure_intrinsics(&objects);
+        assert_eq!(got.get(&at), Some(&gex_xlate::Intrinsic::MemCpy));
+        assert_eq!(got.len(), 1);
     }
 }

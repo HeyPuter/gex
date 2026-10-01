@@ -11,9 +11,12 @@ static int failures;
 static volatile LONG ran, order[8], norder;
 static void CALLBACK apc(ULONG_PTR arg) { InterlockedIncrement(&ran); order[InterlockedIncrement(&norder) - 1] = (LONG)arg; }
 
-static HANDLE never;
+static HANDLE never, started;
 static volatile DWORD waiter_result;
 static DWORD WINAPI waiter(void *p) {
+    /* An APC queued before the thread has started runs during its startup
+     * instead, so the wait must be reached first. */
+    SetEvent(started);
     waiter_result = WaitForSingleObjectEx(never, 5000, TRUE);
     return 0;
 }
@@ -28,7 +31,9 @@ int main(void) {
     CHECK("an alertable wait with nothing queued times out", SleepEx(10, TRUE) == 0);
 
     never = CreateEventW(0, TRUE, FALSE, 0);
+    started = CreateEventW(0, TRUE, FALSE, 0);
     HANDLE th = CreateThread(0, 0, waiter, 0, 0, 0);
+    WaitForSingleObject(started, INFINITE);
     Sleep(30);
     QueueUserAPC(apc, th, 3);
     WaitForSingleObject(th, INFINITE);

@@ -285,6 +285,19 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
                     }
                 }
                 Stmt::Fence => {}
+                Stmt::X87 { op, args, outs } => {
+                    let a: Option<Vec<u64>> = args.iter().map(|v| get(&vals, *v)).collect();
+                    let Some(a) = a else {
+                        finish!(unsupported());
+                    };
+                    let (sig, se, cw) = (a[0], a[1] as u16, a[2] as u16);
+                    let (r, sw) = match *op {
+                        X87Op::Narrow { single } => gex_f80::narrow_op(sig, se, cw, single),
+                        X87Op::ToInt { bits, trunc } => gex_f80::to_int_op(sig, se, cw, bits, trunc),
+                    };
+                    vals.insert(outs[0], r);
+                    vals.insert(outs[1], sw as u64);
+                }
                 Stmt::Trap { cond, pc, code } => match get(&vals, *cond) {
                     Some(0) => {}
                     Some(_) => finish!(Stop::Fault(*pc, *code)),

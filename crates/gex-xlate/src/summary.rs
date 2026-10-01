@@ -616,6 +616,18 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
                 }
             }
             Stmt::Fence => {}
+            // Pure arithmetic on its arguments: no register, memory or
+            // control effect; its outputs are unknown values carrying the
+            // arguments' taint.
+            Stmt::X87 { args, outs, .. } => {
+                let mut taint = RegSet::EMPTY;
+                for a in args {
+                    taint = taint.union(get(&vals, *a).taint);
+                }
+                for o in outs {
+                    vals.insert(*o, AV::top(taint));
+                }
+            }
             Stmt::Trap { .. } => {
                 st.kill(i64::MIN, st.floor());
                 // Taken, it hands the exact context to a signal handler,

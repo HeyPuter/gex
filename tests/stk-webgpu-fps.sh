@@ -1,5 +1,5 @@
 #!/bin/sh
-# Browser benchmark gate for the stock STK -> gex-gl -> MobileGL -> WebGPU path.
+# Browser benchmark gate for the stock STK -> gex-gl -> Mesa -> WebGPU path.
 # It runs an ordinary unbounded race and stops from the browser harness. STK's
 # profile mode counts simulation steps rather than eglSwapBuffers and is not a
 # valid measurement of real canvas presents.
@@ -21,10 +21,7 @@ GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 # diagnostics then describes code that is no longer in the tree. Copy into both
 # web/public/gex and web/dist/gex.
 #
-# WARNING: MobileGL does NOT render SuperTuxKart -- it is broken for this
-# workload, so a run with the default backend measures presentation of a frame
-# that has nothing in it. `GEX_STK_GL=mesa` is the path under development and
-# the one worth gating. The only working reference renderer for STK is virgl
+# The only working reference renderer for STK is virgl
 # (tests/graphics-in-browser.sh and the virgl/wayland demos).
 node "$ROOT/web/test/drive.mjs" supertuxkart \
     --query "gl=${GEX_STK_GL:-mesa}" --cmd "$STK_RACE" \

@@ -6,3 +6,5 @@ license.workspace = true
 description = "GIR: gex's SSA IR for binary translation"
 
 [dependencies]
+# The x87's arithmetic, for the interpreter's `Stmt::X87`.
+gex-f80.workspace = true

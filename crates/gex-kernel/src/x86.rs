@@ -9,7 +9,9 @@
 //! `poll` → `ppoll` with a timespec in the thread's scratch area) so the rest
 //! of the kernel never sees them.
 
+use crate::f80::{self, F80};
 use crate::GuestMem;
+use gex_abi::ctx;
 use crate::syscalls::nr;
 
 /// A raw number with no canonical equivalent. Dispatch answers `ENOSYS`.
@@ -24,7 +26,8 @@ pub const SYSREG_CPUID: i32 = -100;
 /// [`serve_x87`].
 pub const SYSREG_X87: i32 = -101;
 
-/// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`).
+/// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
+/// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {
     pub const F2XM1: u64 = 1;
     pub const FYL2X: u64 = 2;
@@ -37,6 +40,38 @@ pub mod x87op {
     pub const FSIN: u64 = 9;
     pub const FCOS: u64 = 10;
     pub const FSINCOS: u64 = 11;
+    pub const FADD: u64 = 20;
+    pub const FMUL: u64 = 21;
+    pub const FSUB: u64 = 22;
+    pub const FDIV: u64 = 23;
+    pub const FCOM: u64 = 24;
+    pub const FTST: u64 = 25;
+    pub const FSQRT: u64 = 26;
+    pub const FRNDINT: u64 = 27;
+    pub const FSCALE: u64 = 28;
+    pub const FLD: u64 = 29;
+    pub const FST: u64 = 30;
+    pub const FXAM: u64 = 31;
+    pub const FLDCONST: u64 = 32;
+
+    pub const I_SHIFT: u32 = 8;
+    pub const FORM_SHIFT: u32 = 11;
+    pub const FORM_MEM: u64 = 0;
+    pub const FORM_ST0_STI: u64 = 1;
+    pub const FORM_STI_ST0: u64 = 2;
+    pub const POP_SHIFT: u32 = 13;
+    pub const REV: u64 = 1 << 15;
+    pub const MEM_SHIFT: u32 = 16;
+    pub const MEM_F32: u64 = 0;
+    pub const MEM_F64: u64 = 1;
+    pub const MEM_F80: u64 = 2;
+    pub const MEM_I16: u64 = 3;
+    pub const MEM_I32: u64 = 4;
+    pub const MEM_I64: u64 = 5;
+    pub const TRUNC: u64 = 1 << 19;
+    pub const QUIET: u64 = 1 << 20;
+    pub const TO_EFLAGS: u64 = 1 << 21;
+    pub const K_SHIFT: u32 = 24;
 }
 
 const AT_FDCWD: u64 = (-100i64) as u64;
@@ -606,8 +641,8 @@ pub fn serve_cpuid(m: &mut GuestMem<'_>, ctx_addr: u64, value: u64) {
 }
 
 /// The x87 register stack as the lifter keeps it in the context: eight
-/// doubles addressed physically, `TOP`, one valid bit per register, and the
-/// status word's condition codes.
+/// 80-bit registers addressed physically, `TOP`, one valid bit per register,
+/// the control and status words, and the `X87_TMP` operand slot.
 struct X87<'m, 'a> {
     m: &'m mut GuestMem<'a>,
     ctx: u64,
@@ -619,30 +654,56 @@ impl X87<'_, '_> {
     const C2: u16 = 1 << 10;
     const C3: u16 = 1 << 14;
 
+    fn word(&self, off: usize) -> u32 {
+        self.m.read_u32(self.ctx + off as u64).unwrap_or(0)
+    }
+    fn set_word(&mut self, off: usize, v: u32) {
+        let _ = self.m.write_u32(self.ctx + off as u64, v);
+    }
     fn top(&self) -> u32 {
-        self.m.read_u32(self.ctx + gex_abi::ctx::X87_TOP as u64).unwrap_or(0) & 7
+        self.word(ctx::X87_TOP) & 7
+    }
+    fn phys(&self, i: u32) -> u32 {
+        (self.top() + i) & 7
     }
     fn slot(&self, i: u32) -> u64 {
-        self.ctx + gex_abi::ctx::X87 as u64 + (((self.top() + i) & 7) as u64) * 8
+        self.ctx + ctx::X87 as u64 + self.phys(i) as u64 * 16
     }
-    fn st(&self, i: u32) -> f64 {
-        f64::from_bits(self.m.read_u64(self.slot(i)).unwrap_or(0))
-    }
-    fn set_st(&mut self, i: u32, v: f64) {
+    fn st(&self, i: u32) -> F80 {
         let a = self.slot(i);
-        let _ = self.m.write_u64(a, v.to_bits());
+        F80 {
+            sig: self.m.read_u64(a).unwrap_or(0),
+            se: self.word(ctx::X87 + self.phys(i) as usize * 16 + 8) as u16,
+        }
+    }
+    fn set_st(&mut self, i: u32, v: F80) {
+        let a = self.slot(i);
+        let _ = self.m.write_u64(a, v.sig);
+        let _ = self.m.write(a + 8, &v.se.to_le_bytes());
+    }
+    fn empty(&self, i: u32) -> bool {
+        self.tags() & 1 << self.phys(i) == 0
     }
     fn tags(&self) -> u32 {
-        self.m.read_u32(self.ctx + gex_abi::ctx::X87_TAGS as u64).unwrap_or(0)
+        self.word(ctx::X87_TAGS)
     }
     fn set_tags(&mut self, t: u32) {
-        let _ = self.m.write_u32(self.ctx + gex_abi::ctx::X87_TAGS as u64, t & 0xff);
+        self.set_word(ctx::X87_TAGS, t & 0xff);
     }
     fn set_top(&mut self, t: u32) {
-        let _ = self.m.write_u32(self.ctx + gex_abi::ctx::X87_TOP as u64, t & 7);
+        self.set_word(ctx::X87_TOP, t & 7);
     }
-    fn push(&mut self, v: f64) {
+    /// Push `v`; onto a full register that is a stack overflow, which
+    /// pushes the indefinite instead.
+    fn push(&mut self, env: &mut f80::Env, v: F80) {
         let t = (self.top() + 7) & 7;
+        let v = if self.tags() & 1 << t != 0 {
+            env.flags |= f80::IE | f80::SF;
+            env.c1 = true;
+            F80::INDEFINITE
+        } else {
+            v
+        };
         self.set_top(t);
         self.set_st(0, v);
         let tags = self.tags() | 1 << t;
@@ -654,17 +715,58 @@ impl X87<'_, '_> {
         self.set_tags(tags);
         self.set_top(t + 1);
     }
+    /// Read `st(i)`, or raise a stack underflow if it is empty.
+    fn operand(&self, env: &mut f80::Env, i: u32) -> Option<F80> {
+        if self.empty(i) {
+            env.flags |= f80::IE | f80::SF;
+            None
+        } else {
+            Some(self.st(i))
+        }
+    }
+    fn tmp(&self) -> F80 {
+        F80 {
+            sig: self.m.read_u64(self.ctx + ctx::X87_TMP as u64).unwrap_or(0),
+            se: self.word(ctx::X87_TMP + 8) as u16,
+        }
+    }
+    fn set_tmp(&mut self, v: F80) {
+        let a = self.ctx + ctx::X87_TMP as u64;
+        let _ = self.m.write_u64(a, v.sig);
+        let _ = self.m.write(a + 8, &v.se.to_le_bytes());
+    }
     /// Replace the condition codes (C0..C3) with `cc`.
     fn set_cc(&mut self, cc: u16) {
-        let a = self.ctx + gex_abi::ctx::X87_SW as u64;
-        let sw = self.m.read(a, 2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
+        let sw = self.word(ctx::X87_SW) as u16;
         let sw = (sw & !(Self::C0 | Self::C1 | Self::C2 | Self::C3)) | cc;
-        let _ = self.m.write(a, &sw.to_le_bytes());
+        self.set_word(ctx::X87_SW, sw as u32);
     }
-    /// The condition codes `fprem`/`fprem1` report: C2 clear (the reduction
-    /// is complete; doubles never need the partial steps), and the quotient's
-    /// three low bits in C0 (bit 2), C3 (bit 1) and C1 (bit 0).
-    fn quotient_cc(q: u64) -> u16 {
+    /// Fold an operation's exceptions into the status word and set C1 as
+    /// the round-up (or stack-fault direction) indicator.
+    fn finish(&mut self, env: &f80::Env) {
+        let mut sw = self.word(ctx::X87_SW) as u16;
+        sw = (sw & !Self::C1) | env.flags | if env.c1 { Self::C1 } else { 0 };
+        let cw = self.word(ctx::X87_CW) as u16;
+        let unmasked = env.flags & !cw & 0x3f;
+        if unmasked != 0 {
+            // A real x87 would now set ES and B and fault at the next
+            // waiting instruction; gex delivers no x87 exceptions.
+            panic!(
+                "x87: unmasked floating-point exception (status {:#06x}, control word {cw:#06x}); \
+                 gex does not deliver x87 exceptions",
+                env.flags
+            );
+        }
+        self.set_word(ctx::X87_SW, sw as u32);
+    }
+    /// The condition codes `fprem`/`fprem1` report: the quotient's three low
+    /// bits in C0 (bit 2), C3 (bit 1) and C1 (bit 0); or C2 alone while the
+    /// reduction is incomplete.
+    fn quotient_cc(q: u8, complete: bool) -> u16 {
+        if !complete {
+            // The hardware clears the quotient bits of a partial reduction.
+            return Self::C2;
+        }
         let mut cc = 0;
         if q & 4 != 0 {
             cc |= Self::C0;
@@ -679,111 +781,225 @@ impl X87<'_, '_> {
     }
 }
 
-/// `x` and the magnitude of `x / y`'s quotient under `fmod`'s truncation, or
-/// under IEEE round-to-nearest-even for `nearest` (`fprem1`, C's
-/// `remainder`). The quotient is exact while it fits a double's mantissa,
-/// which is all its low three bits are ever asked for.
-fn x87_remainder(x: f64, y: f64, nearest: bool) -> (f64, u64) {
-    let r = x % y;
-    if !r.is_finite() || y == 0.0 || !x.is_finite() {
-        return (f64::NAN, 0);
-    }
-    let q = ((x - r) / y).abs();
-    let q = if q < 9.007_199_254_740_992e15 { q as u64 } else { 0 };
-    if !nearest {
-        return (r, q);
-    }
-    let (ar, half) = (r.abs(), y.abs() / 2.0);
-    if ar > half || (ar == half && q & 1 == 1) {
-        // Exact: |r| lies within [|y|/2, |y|] (Sterbenz).
-        (r - y.abs().copysign(r), q + 1)
-    } else {
-        (r, q)
-    }
+fn x87_mem(op: u64) -> Option<f80::Mem> {
+    Some(match (op >> x87op::MEM_SHIFT) & 7 {
+        x87op::MEM_F32 => f80::Mem::F32,
+        x87op::MEM_F64 => f80::Mem::F64,
+        x87op::MEM_I16 => f80::Mem::I16,
+        x87op::MEM_I32 => f80::Mem::I32,
+        x87op::MEM_I64 => f80::Mem::I64,
+        _ => return None, // MEM_F80: the raw register format
+    })
 }
 
 /// Serve an x87 instruction the translated code handed over through
-/// `sysreg_write` (see [`x87op`]). Computed in double precision, like the
-/// rest of gex's x87; the operand-range rule of `fsin`/`fcos`/`fptan`
-/// (|x| < 2^63, else C2 is set and the operand is left alone) is kept.
+/// `sysreg_write`: an [`x87op`] word. The arithmetic is exact
+/// (`crate::f80`): precision and rounding control, the exception flags, C1,
+/// stack faults. The transcendental instructions are computed in double
+/// precision and widened, which is not what an x87 returns bit for bit; the
+/// operand-range rule of `fsin`/`fcos`/`fptan` (|x| < 2^63, else C2 is set
+/// and the operand is left alone) is kept.
 pub fn serve_x87(m: &mut GuestMem<'_>, ctx_addr: u64, op: u64) {
     let mut x = X87 { m, ctx: ctx_addr };
+    let mut env = f80::Env::from_cw(x.word(ctx::X87_CW) as u16);
+    let i = ((op >> x87op::I_SHIFT) & 7) as u32;
+    let pops = (op >> x87op::POP_SHIFT) & 3;
     let in_range = |v: f64| v.abs() < 9.223_372_036_854_775_808e18;
-    match op {
+    let dbl = |v: F80| f80::to_f64(v);
+    let ext = |v: f64| f80::from_f64(v);
+    match op & 0xff {
+        x87op::FADD | x87op::FMUL | x87op::FSUB | x87op::FDIV => {
+            let form = (op >> x87op::FORM_SHIFT) & 3;
+            let st0 = x.operand(&mut env, 0);
+            let (a, b, dst) = match form {
+                x87op::FORM_MEM => {
+                    let raw = x.tmp().sig;
+                    let mem = x87_mem(op).unwrap_or(f80::Mem::F64);
+                    let v = f80::load(&mut env, raw, mem);
+                    (st0, Some(v), 0)
+                }
+                x87op::FORM_ST0_STI => (st0, x.operand(&mut env, i), 0),
+                _ => (x.operand(&mut env, i), st0, i),
+            };
+            let (a, b) = if op & x87op::REV != 0 { (b, a) } else { (a, b) };
+            let r = match (a, b) {
+                (Some(a), Some(b)) => match op & 0xff {
+                    x87op::FADD => f80::add(&mut env, a, b, false),
+                    x87op::FSUB => f80::add(&mut env, a, b, true),
+                    x87op::FMUL => f80::mul(&mut env, a, b),
+                    _ => f80::div(&mut env, a, b),
+                },
+                _ => {
+                    env.c1 = false;
+                    F80::INDEFINITE
+                }
+            };
+            x.set_st(dst, r);
+            for _ in 0..pops {
+                x.pop();
+            }
+        }
+        x87op::FCOM | x87op::FTST => {
+            let a = x.operand(&mut env, 0);
+            let b = if op & 0xff == x87op::FTST {
+                Some(F80::ZERO)
+            } else if (op >> x87op::FORM_SHIFT) & 3 == x87op::FORM_MEM {
+                let mem = x87_mem(op).unwrap_or(f80::Mem::F64);
+                Some(f80::load(&mut env, x.tmp().sig, mem))
+            } else {
+                x.operand(&mut env, i)
+            };
+            let r = match (a, b) {
+                (Some(a), Some(b)) => f80::compare(&mut env, a, b, op & x87op::QUIET != 0),
+                _ => f80::Cmp::Unordered,
+            };
+            env.c1 = false;
+            if op & x87op::TO_EFLAGS != 0 {
+                // ZF, PF, CF in bits 0-2.
+                let f: u32 = match r {
+                    f80::Cmp::Greater => 0,
+                    f80::Cmp::Less => 4,
+                    f80::Cmp::Equal => 1,
+                    f80::Cmp::Unordered => 7,
+                };
+                x.set_word(ctx::X87_TMP, f);
+            } else {
+                x.set_cc(match r {
+                    f80::Cmp::Greater => 0,
+                    f80::Cmp::Less => X87::C0,
+                    f80::Cmp::Equal => X87::C3,
+                    f80::Cmp::Unordered => X87::C0 | X87::C2 | X87::C3,
+                });
+            }
+            for _ in 0..pops {
+                x.pop();
+            }
+        }
+        x87op::FSQRT | x87op::FRNDINT => {
+            let r = match x.operand(&mut env, 0) {
+                Some(a) if op & 0xff == x87op::FSQRT => f80::sqrt(&mut env, a),
+                Some(a) => f80::round_int(&mut env, a, false),
+                None => F80::INDEFINITE,
+            };
+            x.set_st(0, r);
+        }
+        x87op::FSCALE => {
+            let r = match (x.operand(&mut env, 0), x.operand(&mut env, 1)) {
+                (Some(a), Some(b)) => f80::scale(&mut env, a, b),
+                _ => F80::INDEFINITE,
+            };
+            x.set_st(0, r);
+        }
+        x87op::FLD => {
+            let v = match x87_mem(op) {
+                Some(mem) => f80::load(&mut env, x.tmp().sig, mem),
+                None => x.tmp(),
+            };
+            x.push(&mut env, v);
+        }
+        x87op::FST => {
+            let v = x.operand(&mut env, 0).unwrap_or(F80::INDEFINITE);
+            let empty = x.empty(0);
+            match x87_mem(op) {
+                Some(mem) => {
+                    let raw = if empty {
+                        f80::store(&mut env, F80::INDEFINITE, mem, false) // IE already set
+                    } else {
+                        f80::store(&mut env, v, mem, op & x87op::TRUNC != 0)
+                    };
+                    x.set_tmp(F80 { sig: raw, se: 0 });
+                }
+                None => {
+                    env.c1 = false;
+                    x.set_tmp(v)
+                }
+            }
+            if empty {
+                env.c1 = false;
+            }
+        }
+        x87op::FXAM => {
+            let cc = f80::examine(x.st(0), x.empty(0));
+            x.set_cc(cc);
+            return; // no exceptions; C1 is the sign
+        }
+        x87op::FLDCONST => {
+            let v = f80::constant(&env, ((op >> x87op::K_SHIFT) & 7) as u32);
+            env.c1 = false;
+            x.push(&mut env, v);
+        }
+        x87op::FXTRACT => {
+            let (e, s) = match x.operand(&mut env, 0) {
+                Some(a) => f80::extract(&mut env, a),
+                None => (F80::INDEFINITE, F80::INDEFINITE),
+            };
+            x.set_st(0, e);
+            x.push(&mut env, s);
+        }
+        x87op::FPREM | x87op::FPREM1 => {
+            let (r, q, complete) = match (x.operand(&mut env, 0), x.operand(&mut env, 1)) {
+                (Some(a), Some(b)) => f80::rem(&mut env, a, b, op & 0xff == x87op::FPREM1),
+                _ => (F80::INDEFINITE, 0, true),
+            };
+            x.set_st(0, r);
+            if r.se & 0x7fff == 0x7fff && r.sig << 1 != 0 {
+                // A NaN result (an invalid operand or a NaN one): the
+                // hardware clears C2 and C1 and leaves C0 and C3 alone.
+                let sw = x.word(ctx::X87_SW) as u16 & !X87::C2;
+                x.set_word(ctx::X87_SW, sw as u32);
+                env.c1 = false;
+            } else {
+                x.set_cc(X87::quotient_cc(q, complete));
+                env.c1 = complete && q & 1 != 0;
+            }
+        }
         x87op::F2XM1 => {
-            let v = x.st(0);
-            x.set_st(0, (v * std::f64::consts::LN_2).exp_m1());
+            let v = dbl(x.st(0));
+            x.set_st(0, ext((v * std::f64::consts::LN_2).exp_m1()));
             x.set_cc(0);
         }
         x87op::FYL2X => {
-            let (a, b) = (x.st(0), x.st(1));
-            x.set_st(1, b * a.log2());
+            let (a, b) = (dbl(x.st(0)), dbl(x.st(1)));
+            x.set_st(1, ext(b * a.log2()));
             x.pop();
             x.set_cc(0);
         }
         x87op::FYL2XP1 => {
-            let (a, b) = (x.st(0), x.st(1));
-            x.set_st(1, b * (a.ln_1p() / std::f64::consts::LN_2));
+            let (a, b) = (dbl(x.st(0)), dbl(x.st(1)));
+            x.set_st(1, ext(b * (a.ln_1p() / std::f64::consts::LN_2)));
             x.pop();
             x.set_cc(0);
         }
         x87op::FPATAN => {
-            let (a, b) = (x.st(0), x.st(1));
-            x.set_st(1, b.atan2(a));
+            let (a, b) = (dbl(x.st(0)), dbl(x.st(1)));
+            x.set_st(1, ext(b.atan2(a)));
             x.pop();
             x.set_cc(0);
         }
         x87op::FPTAN | x87op::FSIN | x87op::FCOS | x87op::FSINCOS => {
-            let v = x.st(0);
+            let v = dbl(x.st(0));
             if !in_range(v) && v.is_finite() {
                 x.set_cc(X87::C2);
                 return;
             }
-            match op {
+            match op & 0xff {
                 x87op::FPTAN => {
-                    x.set_st(0, v.tan());
-                    x.push(1.0);
+                    x.set_st(0, ext(v.tan()));
+                    x.push(&mut env, F80::ONE);
                 }
-                x87op::FSIN => x.set_st(0, v.sin()),
-                x87op::FCOS => x.set_st(0, v.cos()),
+                x87op::FSIN => x.set_st(0, ext(v.sin())),
+                x87op::FCOS => x.set_st(0, ext(v.cos())),
                 _ => {
-                    x.set_st(0, v.sin());
-                    x.push(v.cos());
+                    x.set_st(0, ext(v.sin()));
+                    x.push(&mut env, ext(v.cos()));
                 }
             }
             x.set_cc(0);
         }
-        x87op::FXTRACT => {
-            // st0 becomes the unbiased exponent, and the significand, in
-            // [1, 2) with st0's sign, is pushed on top of it.
-            let v = x.st(0);
-            let (exp, sig) = if v == 0.0 {
-                (f64::NEG_INFINITY, v)
-            } else if v.is_nan() {
-                (v, v)
-            } else if v.is_infinite() {
-                (f64::INFINITY, v)
-            } else {
-                // Normalise a subnormal first, so the exponent field is real.
-                let (v2, adj) = if v.abs() < f64::MIN_POSITIVE { (v * 2f64.powi(64), 64) } else { (v, 0) };
-                let bits = v2.to_bits();
-                let e = ((bits >> 52) & 0x7ff) as i64 - 1023 - adj;
-                let s = f64::from_bits((bits & !(0x7ffu64 << 52)) | (1023u64 << 52));
-                (e as f64, s)
-            };
-            x.set_st(0, exp);
-            x.push(sig);
-            x.set_cc(0);
-        }
-        x87op::FPREM | x87op::FPREM1 => {
-            let (a, b) = (x.st(0), x.st(1));
-            let (r, q) = x87_remainder(a, b, op == x87op::FPREM1);
-            x.set_st(0, r);
-            x.set_cc(X87::quotient_cc(q));
-        }
         // Only the lifter writes this register, with one of the codes above.
-        _ => panic!("sysreg_write: unknown x87 operation {op}"),
+        _ => panic!("sysreg_write: unknown x87 operation {op:#x}"),
     }
+    x.finish(&env);
 }
 
 /// `/proc/cpuinfo` for the processor [`cpuid`] describes.
@@ -823,10 +1039,14 @@ mod tests {
         let mut m = GuestMem::new(buf);
         let top = (8 - vals.len() as u32) & 7;
         m.write_u32(CTX + ctx::X87_TOP as u64, top).unwrap();
+        // Linux's initial control word: everything masked, 64-bit precision.
+        m.write_u32(CTX + ctx::X87_CW as u64, 0x37f).unwrap();
         let mut tags = 0u32;
         for (i, v) in vals.iter().enumerate() {
             let phys = (top + i as u32) & 7;
-            m.write_u64(CTX + ctx::X87 as u64 + phys as u64 * 8, v.to_bits()).unwrap();
+            let e = crate::f80::from_f64(*v);
+            m.write_u64(CTX + ctx::X87 as u64 + phys as u64 * 16, e.sig).unwrap();
+            m.write(CTX + ctx::X87 as u64 + phys as u64 * 16 + 8, &e.se.to_le_bytes()).unwrap();
             tags |= 1 << phys;
         }
         m.write_u32(CTX + ctx::X87_TAGS as u64, tags).unwrap();
@@ -845,7 +1065,10 @@ mod tests {
             if tags & (1 << phys) == 0 {
                 break;
             }
-            out.push(f64::from_bits(m.read_u64(CTX + ctx::X87 as u64 + phys as u64 * 8).unwrap()));
+            let a = CTX + ctx::X87 as u64 + phys as u64 * 16;
+            let sig = m.read_u64(a).unwrap();
+            let se = u16::from_le_bytes(m.read(a + 8, 2).unwrap().try_into().unwrap());
+            out.push(crate::f80::to_f64(crate::f80::F80 { sig, se }));
         }
         let sw = u16::from_le_bytes(m.read(CTX + ctx::X87_SW as u64, 2).unwrap().try_into().unwrap());
         (out, sw)

@@ -20,6 +20,7 @@ use gex_isa_x86::{Cond, Inst, Mem, Op, Operand, Reg, Rep, Seg, Width};
 mod block;
 mod sse;
 mod x87;
+mod x87conv;
 pub use block::{lift_block, BlockLimits};
 
 /// Pseudo system-register codes passed to the `sysreg_read`/`sysreg_write`
@@ -37,7 +38,8 @@ pub mod sysreg {
     pub const X87: i32 = -101;
 }
 
-/// The x87 operations [`sysreg::X87`] carries. `gex_kernel::x86::x87op`
+/// The x87 operations [`sysreg::X87`] carries: an operation code in the low
+/// byte and its operands in the fields below. `gex_kernel::x86::x87op`
 /// serves them and must agree.
 pub mod x87op {
     pub const F2XM1: u64 = 1;
@@ -51,6 +53,57 @@ pub mod x87op {
     pub const FSIN: u64 = 9;
     pub const FCOS: u64 = 10;
     pub const FSINCOS: u64 = 11;
+    /// Arithmetic: operands and destination from the form, reversed by `REV`.
+    pub const FADD: u64 = 20;
+    pub const FMUL: u64 = 21;
+    pub const FSUB: u64 = 22;
+    pub const FDIV: u64 = 23;
+    /// Compare `st0` with the form's other operand; C0/C2/C3, or ZF/PF/CF
+    /// in `X87_TMP` with `TO_EFLAGS`.
+    pub const FCOM: u64 = 24;
+    pub const FTST: u64 = 25;
+    pub const FSQRT: u64 = 26;
+    pub const FRNDINT: u64 = 27;
+    pub const FSCALE: u64 = 28;
+    /// Push the memory operand in `X87_TMP`, converted from its format.
+    pub const FLD: u64 = 29;
+    /// Convert `st0` to the memory format into `X87_TMP` (no pop).
+    pub const FST: u64 = 30;
+    pub const FXAM: u64 = 31;
+    /// Push constant `K` (`fld1`, `fldl2t`, `fldl2e`, `fldpi`, `fldlg2`,
+    /// `fldln2`, `fldz`).
+    pub const FLDCONST: u64 = 32;
+
+    /// `st(i)`, 3 bits.
+    pub const I_SHIFT: u32 = 8;
+    /// Operand form, 2 bits.
+    pub const FORM_SHIFT: u32 = 11;
+    /// `st0 op= memory operand (X87_TMP)`.
+    pub const FORM_MEM: u64 = 0;
+    /// `st0 op= st(i)`.
+    pub const FORM_ST0_STI: u64 = 1;
+    /// `st(i) op= st0`.
+    pub const FORM_STI_ST0: u64 = 2;
+    /// Pops afterwards, 2 bits.
+    pub const POP_SHIFT: u32 = 13;
+    /// Swap the operands (`fsubr`, `fdivr`).
+    pub const REV: u64 = 1 << 15;
+    /// Memory format, 3 bits.
+    pub const MEM_SHIFT: u32 = 16;
+    pub const MEM_F32: u64 = 0;
+    pub const MEM_F64: u64 = 1;
+    pub const MEM_F80: u64 = 2;
+    pub const MEM_I16: u64 = 3;
+    pub const MEM_I32: u64 = 4;
+    pub const MEM_I64: u64 = 5;
+    /// `fisttp`: convert toward zero.
+    pub const TRUNC: u64 = 1 << 19;
+    /// `fucom`: only an SNaN raises IE.
+    pub const QUIET: u64 = 1 << 20;
+    /// `fcomi`: the result goes to EFLAGS, not the condition codes.
+    pub const TO_EFLAGS: u64 = 1 << 21;
+    /// Constant index, 3 bits.
+    pub const K_SHIFT: u32 = 24;
 }
 
 /// What the condition flags hold, when a branch can ask about the operands
@@ -634,9 +687,22 @@ impl<'a> Lifter<'a> {
             Op::Int if i.ops[0] == Some(Operand::Imm(0x80)) && self.wa() == Width::D => {
                 Flow::End(Term::Syscall { next })
             }
-            Op::Unknown | Op::Undefined | Op::Hlt | Op::Int | Op::Xlat => {
+            // A privileged instruction in user mode (hlt, cli/sti, in/out,
+            // ins/outs), and a software interrupt through a gate user code
+            // may not use: #GP, which Linux delivers as SIGSEGV. (musl's
+            // `a_crash` is `hlt`.)
+            Op::Hlt | Op::Privileged(_) | Op::Int
+                if i.op != Op::Int
+                    || matches!(i.ops[0], Some(Operand::Imm(n)) if n != 3 && n != 0x80) =>
+            {
+                let yes = self.k32(1);
+                self.trap_if(yes, gex_abi::imports::BRK_GENERAL_PROTECTION);
                 Flow::End(Term::Illegal { raw: self.raw, pc })
             }
+            // `int1` (f1), and `int 0x80` from 64-bit code (Linux's ia32
+            // system-call emulation), are not implemented.
+            Op::Int if i.ops[0] != Some(Operand::Imm(3)) => Flow::End(Term::Illegal { raw: self.raw, pc }),
+            Op::Unknown | Op::Undefined | Op::Xlat => Flow::End(Term::Illegal { raw: self.raw, pc }),
             Op::Nop | Op::Endbr | Op::Pause | Op::Prefetch | Op::Fwait | Op::Clflush => Flow::Next,
             Op::Fence => {
                 self.b.stmt(Stmt::Fence);
@@ -1221,7 +1287,9 @@ impl<'a> Lifter<'a> {
                 self.wr64(R11, fl);
                 Flow::End(Term::Syscall { next })
             }
-            Op::Int3 => {
+            // `int $3` (cd 03) is a breakpoint like int3; its gate is open
+            // to user code.
+            Op::Int3 | Op::Int if i.op == Op::Int3 || i.ops[0] == Some(Operand::Imm(3)) => {
                 let pcv = self.k64(pc);
                 let immv = self.k32(3);
                 self.b.stmt(Stmt::HostCall {
@@ -1697,14 +1765,38 @@ impl<'a> Lifter<'a> {
     /// overflow raise #DE, which Linux delivers as SIGFPE; here that is an
     /// `Illegal` terminator guarded at run time, so the block is split: the
     /// division happens only when safe.
+    /// Fault the current instruction with `code` when `cond` holds.
+    fn trap_if(&mut self, cond: Value, code: i32) {
+        self.b.stmt(Stmt::Trap {
+            cond,
+            pc: self.pc,
+            code,
+        });
+    }
+
+    /// `quotient` (signed, in `ty`) does not fit a `w`-bit signed result.
+    fn quotient_overflows_signed(&mut self, q: Value, ty: Ty, w: Width) -> Value {
+        let half = 1u64 << (w.bits() - 1);
+        let bias = self.k(ty, half);
+        let biased = self.b.bin(BinOp::Add, ty, q, bias);
+        let span = self.k(ty, 2 * half - 1);
+        self.b.cmp(CmpOp::GtU, ty, biased, span)
+    }
+
     fn div(&mut self, s: Operand, w: Width, signed: bool) -> Flow {
         let ty = ty_of(w);
         let sv = self.rd(s, w);
         let sv = self.narrow(sv, w);
-        // wasm traps on /0 and INT_MIN/-1 where x86 raises #DE. Rather than a
-        // block split, guard the divisor: divide by 1 in the bad case and
-        // leave the (undefined-on-hardware) result; a program that divides
-        // by zero gets garbage instead of SIGFPE. Recorded as a known gap.
+        // x86 raises #DE for a zero divisor and for a quotient too wide for
+        // the destination; both fault before any register changes. The
+        // divisions themselves still guard the divisor, since wasm traps on
+        // /0 and INT_MIN/-1: the values they compute on the faulting path
+        // are never written.
+        {
+            let zero = self.k(ty, 0);
+            let is_zero = self.b.cmp(CmpOp::Eq, ty, sv, zero);
+            self.trap_if(is_zero, gex_abi::imports::BRK_DIVIDE_BY_ZERO);
+        }
         match w {
             Width::B => {
                 let ax = self.rd_reg(Reg::Gp(RAX, Width::W));
@@ -1716,6 +1808,13 @@ impl<'a> Lifter<'a> {
                 let d = self.safe_divisor(d, Ty::I32, signed.then_some(n));
                 let q = self.b.bin(if signed { BinOp::DivS } else { BinOp::DivU }, Ty::I32, n, d);
                 let r = self.b.bin(if signed { BinOp::RemS } else { BinOp::RemU }, Ty::I32, n, d);
+                let over = if signed {
+                    self.quotient_overflows_signed(q, Ty::I32, Width::B)
+                } else {
+                    let ff = self.k32(0xff);
+                    self.b.cmp(CmpOp::GtU, Ty::I32, q, ff)
+                };
+                self.trap_if(over, gex_abi::imports::BRK_DIVIDE_OVERFLOW);
                 let q = self.narrow(q, Width::B);
                 let r = self.narrow(r, Width::B);
                 let eight = self.k32(8);
@@ -1750,6 +1849,15 @@ impl<'a> Lifter<'a> {
                 let d = self.safe_divisor(d, Ty::I64, signed.then_some(n));
                 let q = self.b.bin(if signed { BinOp::DivS } else { BinOp::DivU }, Ty::I64, n, d);
                 let r = self.b.bin(if signed { BinOp::RemS } else { BinOp::RemU }, Ty::I64, n, d);
+                // The 64-bit quotient is exact (a signed MIN / -1 comes out
+                // as MIN, itself out of range), so range-check it.
+                let over = if signed {
+                    self.quotient_overflows_signed(q, Ty::I64, w)
+                } else {
+                    let max = self.k64((1u64 << w.bits()) - 1);
+                    self.b.cmp(CmpOp::GtU, Ty::I64, q, max)
+                };
+                self.trap_if(over, gex_abi::imports::BRK_DIVIDE_OVERFLOW);
                 let q = self.b.wrap(q);
                 let r = self.b.wrap(r);
                 let q = self.narrow(q, w);
@@ -1775,12 +1883,24 @@ impl<'a> Lifter<'a> {
                     let ad = self.b.bin(BinOp::Sub, Ty::I64, ad, dsign);
                     let (q, r) = self.divlu(ahi, alo, ad);
                     let qsign = self.b.bin(BinOp::Xor, Ty::I64, nsign, dsign);
+                    // The magnitude must fit: below 2^64 (|hi| < |d|), and
+                    // at most 2^63 - 1, or 2^63 for a negative quotient.
+                    let wide = self.b.cmp(CmpOp::GeU, Ty::I64, ahi, ad);
+                    let one = self.k64(1);
+                    let neg = self.b.bin(BinOp::And, Ty::I64, qsign, one);
+                    let lim = self.k64((1u64 << 63) - 1);
+                    let lim = self.b.bin(BinOp::Add, Ty::I64, lim, neg);
+                    let big = self.b.cmp(CmpOp::GtU, Ty::I64, q, lim);
+                    let over = self.b.bin(BinOp::Or, Ty::I32, wide, big);
+                    self.trap_if(over, gex_abi::imports::BRK_DIVIDE_OVERFLOW);
                     let q = self.b.bin(BinOp::Xor, Ty::I64, q, qsign);
                     let q = self.b.bin(BinOp::Sub, Ty::I64, q, qsign);
                     let r = self.b.bin(BinOp::Xor, Ty::I64, r, nsign);
                     let r = self.b.bin(BinOp::Sub, Ty::I64, r, nsign);
                     (q, r)
                 } else {
+                    let over = self.b.cmp(CmpOp::GeU, Ty::I64, hi, d);
+                    self.trap_if(over, gex_abi::imports::BRK_DIVIDE_OVERFLOW);
                     self.divlu(hi, lo, d)
                 };
                 self.wr64(RAX, q);
@@ -1810,8 +1930,8 @@ impl<'a> Lifter<'a> {
     /// `(quotient, remainder)`. Hacker's Delight's `divlu` (two 32-bit digit
     /// steps on a normalised divisor, each with its at-most-two corrections
     /// unrolled), so it is straight-line code the IR can express. When
-    /// `u1 >= v` the hardware raises #DE; here the low 64 bits of the
-    /// quotient come out and the run continues.
+    /// `u1 >= v` the hardware raises #DE, which the caller's `Stmt::Trap`
+    /// does before anything this computes is written.
     fn divlu(&mut self, u1: Value, u0: Value, v: Value) -> (Value, Value) {
         let ty = Ty::I64;
         let k32 = self.k64(32);
@@ -2538,11 +2658,9 @@ impl<'a> Lifter<'a> {
         Flow::Next
     }
 
-    /// `fxsave`/`fxrstor` and the `xsave` family: save/restore the SSE state
-    /// (MXCSR and the sixteen xmm registers) in the architectural layout. The
-    /// x87 part of the area is written as empty; guests use these to spill
-    /// vector state across signal handlers and `setjmp`, not to move x87
-    /// values.
+    /// `fxsave`/`fxrstor` and the `xsave` family: save/restore the x87 and
+    /// SSE state (control and status words, tags, the eight x87 registers,
+    /// MXCSR and the sixteen xmm registers) in the architectural layout.
     fn fxsave(&mut self, i: &Inst) -> Flow {
         let Operand::Mem(m) = i.op0() else {
             return Flow::End(Term::Illegal {
@@ -2554,8 +2672,8 @@ impl<'a> Lifter<'a> {
         let addr = self.offset_addr(addr, offset);
         let save = matches!(i.op, Op::Fxsave | Op::Xsave);
         if save {
-            // FCW=0x37f, FSW=0, FTW=0 (abridged: all empty), MXCSR at 24,
-            // MXCSR_MASK at 28.
+            // FCW, FSW, the abridged FTW and the eight x87 registers, then
+            // MXCSR at 24 and MXCSR_MASK at 28.
             let fcw = self.b.read(GuestReg::X87Cw);
             self.b.stmt(Stmt::Store {
                 addr,
@@ -2564,21 +2682,7 @@ impl<'a> Lifter<'a> {
                 sz: MemSz::B2,
                 order: Order::Relaxed,
             });
-            let zero = self.k32(0);
-            self.b.stmt(Stmt::Store {
-                addr,
-                offset: 2,
-                val: zero,
-                sz: MemSz::B2,
-                order: Order::Relaxed,
-            });
-            self.b.stmt(Stmt::Store {
-                addr,
-                offset: 4,
-                val: zero,
-                sz: MemSz::B4,
-                order: Order::Relaxed,
-            });
+            self.x87_fxsave(addr, true);
             let mxcsr = self.b.read(GuestReg::Mxcsr);
             self.b.stmt(Stmt::Store {
                 addr,
@@ -2624,7 +2728,8 @@ impl<'a> Lifter<'a> {
                 ty: Ty::I32,
                 order: Order::Relaxed,
             });
-            self.b.write(GuestReg::X87Cw, fcw);
+            self.x87_set_cw(fcw);
+            self.x87_fxsave(addr, false);
             let mxcsr = self.b.def(Expr::Load {
                 addr,
                 offset: 24,

@@ -425,6 +425,93 @@ image to point at a slot.
 
 ---
 
+## 6a. How a window reaches the screen
+
+A Windows program's top-level windows go to the compositor gex already has
+for Linux programs (`gex-wayland`), as surfaces the NT layer publishes
+itself. GL goes through opengl32's unixlib onto gex's existing GL device.
+
+### 6a.1 Windows as compositor surfaces
+
+- **The surface.** Each top-level window owns a *window surface*: a 32 bpp
+  BGRA DIB in guest memory, allocated and owned by the NT layer (Wine's
+  `window_surface`), sized to the window. GDI output to the window, `BitBlt`
+  and `StretchDIBits`, `BeginPaint` and the non-client area are all drawn
+  into it by the NT layer's GDI (§10 `win32u/gdi`). Child windows are clipped
+  regions of their top-level window's surface, as in Wine.
+- **Publishing.** A flush (end of `BeginPaint`/`EndPaint`, `UpdateWindow`,
+  a GDI flush, or at the latest the next message wait) hands the compositor
+  `(window id, address, stride, width, height, damage, title, position)`.
+  That is exactly what the compositor's scene records already carry for a
+  Wayland client's shm buffer: pixels are never copied, only described.
+  - *Browser:* the NT layer writes those records into the process's block of
+    the `wl-bridge` arena (`wl_publish`), as `shims/browser/src/wl.rs` does
+    for Wayland clients and `shims/hostwl` does for Xwayland. The compositor
+    worker uploads damaged rows from guest memory and draws decorations.
+  - *Native:* the same records go to `gex_gpu::Compositor` or to PPM files
+    (`--wayland-out`), which is what the tests compare.
+  - Both hosts implement one small trait the NT layer calls
+    (`NtDisplay::publish`, `NtDisplay::remove`); the NT layer knows nothing
+    about Wayland.
+- **Input.** The compositor's input ring for the process (motion, button,
+  axis, key, modifiers, focus, configure, close, already hit-tested to a
+  window) is drained by the NT layer at every message wait and peek. Events
+  become hardware messages in the owning thread's queue: `WM_MOUSEMOVE`,
+  `WM_xBUTTONDOWN`, `WM_KEYDOWN` with evdev→VK/scan code mapping on the fixed
+  US layout, focus and activation, `WM_SIZE` from configure, `WM_CLOSE`
+  from close. The key state tables (`GetKeyState`/`GetAsyncKeyState`)
+  follow.
+- **Why not a guest Wayland client.** winewayland.drv would run a Wayland
+  client inside the process, with wineserver-shaped shared memory. The NT
+  layer already owns the window tree and the pixels, so describing them to
+  the compositor directly removes a protocol and a copy.
+
+### 6a.2 GL: opengl32's unixlib onto gex-gl
+
+Noita renders with desktop GL (2.1 compatibility, GLSL 110, fixed function,
+client arrays) through opengl32, whose PE side calls `__wine_unix_call` for
+every GL and WGL function (3,095 functions; each params struct starts with
+`TEB *`, the result last). **Decision: implement opengl32's unixlib in the
+NT layer by encoding each call into gex-gl's wire protocol** (`crates/gex-gl`),
+the transport Linux guests' GL already uses, and let the existing device run
+it:
+- natively, `gex-gl`'s host executor on the host's GL;
+- in the browser, `MesaGlDevice`: mesa-wink's `gex_wgpu` gallium driver, a
+  separate emscripten module on WebGPU, presenting to its own canvas that the
+  compositor shows for an `F_EXTERNAL` surface.
+
+WGL maps onto the protocol's context and surface opcodes:
+`get_pixel_formats` reports one or two RGBA8/D24S8 formats;
+`wglCreateContextAttribsARB` is `CONTEXT_CREATE` (desktop API, compatibility
+2.1 unless the attributes ask for more); `wglMakeContextCurrentARB` makes
+it current and attaches the window's drawable (`SURFACE_ATTACH` with the
+window's surface id, marking it external); `wglSwapBuffers` is `PRESENT`.
+The per-function table (params layout per ABI → opcode, and, for functions
+taking pointers, how much memory each pointer covers) is generated from
+Wine's `opengl32/unixlib.h` and the generator behind `guest/gl`'s
+`gl44-generated.inc`; the pointer sizes are the same knowledge `gexgl.c`
+already encodes for Linux guests. Calls batch in the ring and are flushed at
+sync points (a query, a map, `glFinish`, a present), so most GL calls cost one
+unix call and an encode.
+
+**Rejected: Mesa in-process, as pewasm's `host_wgl.c` does.** That links
+mesa-wink into the same module as the program, which worked because pewasm
+was one emscripten module. In gex the kernel and shim are Rust
+(`wasm32-unknown-unknown`) and Mesa is already a separate emscripten module
+behind the gex-gl wire. Putting Mesa in-process would mean:
+- a second copy of Mesa (tens of MB of wasm) in the shim;
+- emscripten and JSPI inside the kernel's module;
+- a second GL path to maintain beside the Linux one.
+
+What it would buy is avoiding the encode/decode, and a later fast path gets
+that anyway: a direct host import for GL calls from the unixlib trampoline
+(§9) without changing the protocol. pewasm's `host_wgl.c` is still the
+reference for WGL semantics (pixel formats, context attributes, swap
+pacing) and for which client-array ranges Noita touches.
+
+**Rejected: a win32u `opengl_driver_funcs` backend.** That interface lives
+inside Wine's unix opengl32, which gex does not run.
+
 ## 7. The 32-bit NT ABI (PE32, Noita)
 
 gex implements the i386 NT syscalls directly instead of running Wine's

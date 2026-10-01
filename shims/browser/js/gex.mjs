@@ -894,6 +894,12 @@ export class Gex {
     };
     syncSlotShift(this.#shim.exports);
     if (opts.strace) this.#shim.exports.gex_set_trace(1);
+    // An ejected project without a JIT fallback: a miss on code its build
+    // never saw fails loudly instead of translating.
+    if (opts.jit === false) {
+      if (!this.#shim.exports.gex_set_jit) throw new Error('this gex runtime cannot turn translation off');
+      this.#shim.exports.gex_set_jit(0);
+    }
     // How many of an object's stored units one miss may take.
     if (opts.perMiss) this.#shim.exports.gex_set_per_miss?.(opts.perMiss);
     // Keep what the guest's dynamic linker produces, and start the next process
@@ -975,6 +981,16 @@ export class Gex {
       this.#shim.exports.gex_set_image_program(bp, b.length);
       free?.(bp, b.length);
     }
+    // The program's own path, when the embedder knows it (an ejected
+    // project): what `/proc/self/exe` says, whatever argv[0] is.
+    if (opts.exe) {
+      if (!this.#shim.exports.gex_set_exe) throw new Error('this gex runtime cannot be told the program path');
+      const b = enc.encode(opts.exe);
+      const bp = this.#shim.exports.gex_alloc(b.length) >>> 0;
+      this.#bytes().set(b, bp);
+      this.#shim.exports.gex_set_exe(bp, b.length);
+      free?.(bp, b.length);
+    }
     const pin = this.#shim.exports.gex_pin_object;
     for (const [path, where] of Object.entries(opts.pins ?? {})) {
       if (!pin) break;
@@ -1019,15 +1035,29 @@ export class Gex {
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
-      syscall: e.gex_syscall,
+      // An embedder may vet each system call first (an ejected project's
+      // allow-list); it throws to stop the run.
+      syscall: opts.syscallGuard
+        ? (ctx, pc) => {
+          opts.syscallGuard(ctx >>> 0, pc, this.#memory);
+          return e.gex_syscall(ctx, pc);
+        }
+        : e.gex_syscall,
       dispatch_miss: e.gex_dispatch_miss,
       illegal: e.gex_illegal,
       breakpoint: e.gex_breakpoint,
       sysreg_read: e.gex_sysreg_read,
-      sysreg_write: e.gex_sysreg_write,
+      // An ejected project's library replacements (`Intrinsic::Replace`,
+      // sysreg -200) are served by the embedder; everything else by the shim.
+      sysreg_write: opts.replace
+        ? (ctx, pc, reg, v) => (reg === -200
+          ? opts.replace(ctx >>> 0, pc, Number(v), this.#memory)
+          : e.gex_sysreg_write(ctx, pc, reg, v))
+        : e.gex_sysreg_write,
       cache_op: e.gex_cache_op,
       safepoint: e.gex_safepoint,
       fma: e.gex_fma,
+      x87: e.gex_x87,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(
@@ -1219,6 +1249,7 @@ export class Gex {
       cache_op: e.gex_cache_op,
       safepoint: e.gex_safepoint,
       fma: e.gex_fma,
+      x87: e.gex_x87,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(

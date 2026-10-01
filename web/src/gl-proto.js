@@ -180,10 +180,23 @@ export const op = {
     END_LIST: 182,
     CALL_LIST: 183,
     DELETE_LISTS: 184,
+    ENABLE_CLIENT_STATE: 185,
+    DISABLE_CLIENT_STATE: 186,
+    VERTEX_POINTER: 187,
+    COLOR_POINTER: 188,
+    TEX_COORD_POINTER: 189,
+    CLIENT_ACTIVE_TEXTURE: 190,
+    ORTHO: 191,
+    SCALEF: 192,
+    LOAD_MATRIXF: 193,
+    MULT_MATRIXF: 194,
+    COLOR4F: 195,
+    TEX_ENVI: 196,
+    ALPHA_FUNC: 197,
 };
 
 export const MAGIC = 0x47584547;
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 export const HEADER_BYTES = 32;
 
 export const error = {

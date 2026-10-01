@@ -3,7 +3,7 @@
 //! A bounded ring buffer with the blocking rules Linux specifies: a read on
 //! an empty pipe waits until data arrives or every writer is gone, a write to
 //! a full pipe waits for room, and a write with no readers left returns
-//! `EPIPE` (gex does not raise SIGPIPE here, so the guest sees the error).
+//! `EPIPE`; the syscall layer raises SIGPIPE for it, as Linux does.
 //!
 //! Blocking uses a condition variable, which works because a guest thread is
 //! a real host thread (PLAN §2.5). The browser runtime blocks the same way
@@ -129,7 +129,7 @@ impl Pipe {
         let mut written = 0usize;
         loop {
             if s.readers == 0 {
-                // Linux also raises SIGPIPE; gex does not, so the guest sees EPIPE.
+                // EPIPE; the syscall layer raises SIGPIPE with it, as Linux does.
                 s.broken += 1;
                 return if written > 0 {
                     Ok(written as u64)
