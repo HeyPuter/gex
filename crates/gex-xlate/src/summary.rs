@@ -320,7 +320,10 @@ impl St {
     /// A store nobody can place: the caller's frame may be hit always, this
     /// frame only once it has escaped.
     fn unknown_store(&mut self) {
-        if self.escaped && !self.trust_frame {
+        if self.trust_frame {
+            // Optimistic: a pointer nobody derived from the stack pointer
+            // does not point into a frame.
+        } else if self.escaped {
             self.slots.clear();
         } else {
             self.kill(0, i64::MAX);
