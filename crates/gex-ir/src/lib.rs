@@ -821,6 +821,25 @@ pub enum Stmt {
     },
     /// A host call whose result is discarded.
     HostCall { func: HostFunc, args: Vec<Value> },
+    /// An x87 operation, computed exactly as the hardware computes it
+    /// (`gex_f80` is the reference, tested against the hardware):
+    /// `outs` are defined from `args`, both as [`X87Op`] lists them.
+    ///
+    /// Pure: it reads only its arguments and writes only its outputs -- no
+    /// guest register, no memory, no fault -- so an analysis treats it as a
+    /// definition of several values, and it may be deleted when none of them
+    /// is used. The lifter keeps what surrounds it (the register stack, the
+    /// status word, the unmasked-exception check) outside it.
+    ///
+    /// A backend lowers it to a fast path for the common operands and falls
+    /// back, for the rest, to the same exact algorithm: tier-1 calls the
+    /// `x87` host import, which is pure too (it neither reads nor writes
+    /// cached guest state, so no flush); gex-cgen calls a C helper.
+    X87 {
+        op: X87Op,
+        args: Vec<Value>,
+        outs: Vec<Value>,
+    },
     /// A conditional guest fault: when the `I32` `cond` is nonzero, the
     /// instruction at `pc` faults with reason `code` (a negative
     /// `gex_abi::imports::BRK_*` code, such as `BRK_DIVIDE_BY_ZERO`) and
@@ -894,6 +913,48 @@ pub enum Stmt {
     },
 }
 
+/// What a [`Stmt::X87`] computes. Every operation's last output is an
+/// `I32` of status-word bits: the exception flags it raised (IE, DE, ZE, OE,
+/// UE, PE in bits 0-5) and C1 in bit 9.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum X87Op {
+    /// `fst`/`fstp` to single (`single`) or double: the register's value
+    /// rounded by the control word's RC to the format.
+    /// Args: significand `I64`, sign and exponent `I32`, control word `I32`.
+    /// Outs: the format's raw bits `I64` (zero-extended), flags.
+    Narrow { single: bool },
+    /// `fist`/`fistp` (by RC) or `fisttp` (`trunc`) to a `bits`-bit integer
+    /// (16, 32 or 64); out of range, the integer indefinite with IE.
+    /// Args: as `Narrow`. Outs: the integer `I64` (the low `bits` matter),
+    /// flags.
+    ToInt { bits: u8, trunc: bool },
+}
+
+impl X87Op {
+    /// The types of the operation's arguments.
+    pub fn arg_types(self) -> &'static [Ty] {
+        match self {
+            X87Op::Narrow { .. } | X87Op::ToInt { .. } => &[Ty::I64, Ty::I32, Ty::I32],
+        }
+    }
+
+    /// The types of the operation's outputs.
+    pub fn out_types(self) -> &'static [Ty] {
+        match self {
+            X87Op::Narrow { .. } | X87Op::ToInt { .. } => &[Ty::I64, Ty::I32],
+        }
+    }
+
+    /// The code the `x87` host import takes for this operation.
+    pub fn code(self) -> i32 {
+        match self {
+            X87Op::Narrow { single: true } => 1,
+            X87Op::Narrow { single: false } => 2,
+            X87Op::ToInt { bits, trunc } => 0x10 | (bits as i32) << 1 | trunc as i32,
+        }
+    }
+}
+
 /// Which string instruction a [`Stmt::StrOp`] repeats.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum StrKind {
@@ -929,6 +990,7 @@ impl Stmt {
                 f(*val);
             }
             Stmt::HostCall { args, .. } => args.iter().copied().for_each(f),
+            Stmt::X87 { args, .. } => args.iter().copied().for_each(f),
             Stmt::Trap { cond, .. } => f(*cond),
             Stmt::VStore { addr, val, .. } => {
                 f(*addr);
@@ -972,6 +1034,7 @@ impl Stmt {
     pub fn has_side_effects(&self) -> bool {
         match self {
             Stmt::Def { expr, .. } => !expr.is_pure(),
+            Stmt::X87 { .. } => false,
             Stmt::WriteReg { .. } => true,
             Stmt::Store { .. }
             | Stmt::HostCall { .. }
@@ -1105,6 +1168,18 @@ impl Builder {
 
     pub fn stmt(&mut self, s: Stmt) {
         self.block.stmts.push(s);
+    }
+
+    /// Emit a [`Stmt::X87`] and return its outputs.
+    pub fn x87(&mut self, op: X87Op, args: Vec<Value>) -> Vec<Value> {
+        debug_assert_eq!(args.len(), op.arg_types().len());
+        let outs: Vec<Value> = op.out_types().iter().map(|_| self.fresh()).collect();
+        self.block.stmts.push(Stmt::X87 {
+            op,
+            args,
+            outs: outs.clone(),
+        });
+        outs
     }
 
     pub fn const_i32(&mut self, v: u32) -> Value {

@@ -1172,6 +1172,7 @@ impl<'a> Emitter<'a> {
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
             }
+            Stmt::X87 { .. } => unreachable!("Stmt::X87 is lowered from the following commit; nothing emits it yet"),
             Stmt::Trap { cond, pc, code } => {
                 // Only the faulting path writes the registers back, so they
                 // stay dirty for the path that carries on.

@@ -498,3 +498,62 @@ fn a_trap_prints_parses_and_is_taken_only_when_its_condition_holds() {
     assert!(matches!(o.stop, interp::Stop::Return(_)));
     assert_eq!(o.regs[reg_index(x(0))], 4);
 }
+
+/// `fstp qword` of an extended value in x0 (significand) and x1 (sign and
+/// exponent) under the control word in x2: the double to x0, the status
+/// bits to x1.
+fn x87_narrow() -> Function {
+    let mut t = F::new(0x5000);
+    let b0 = t.block(0x5000);
+    let sig = t.read(b0, x(0));
+    let se64 = t.read(b0, x(1));
+    let se = t.def(b0, Expr::Wrap(se64));
+    let cw64 = t.read(b0, x(2));
+    let cw = t.def(b0, Expr::Wrap(cw64));
+    let bits = t.f.fresh();
+    let flags = t.f.fresh();
+    t.f.block_mut(b0).push(
+        0x5004,
+        Stmt::X87 {
+            op: X87Op::Narrow { single: false },
+            args: vec![sig, se, cw],
+            outs: vec![bits, flags],
+        },
+    );
+    t.write(b0, x(0), bits);
+    let f64 = t.def(b0, Expr::Extend { a: flags, signed: false });
+    t.write(b0, x(1), f64);
+    let lr = t.read(b0, x(30));
+    t.term(b0, FTerm::Return { target: lr });
+    t.f
+}
+
+#[test]
+fn an_x87_operation_prints_parses_is_pure_and_runs_exactly() {
+    let f = x87_narrow();
+    f.verify().unwrap();
+    roundtrip(&f);
+    assert!(text::print(&f).contains("= x87 narrow64"), "{}", text::print(&f));
+    let eff = effect(&f.blocks[0].stmts[5]);
+    assert!(eff.is_pure(), "{eff:?}");
+    let s = to_ssa(&f, &|_| CallEffect::UNKNOWN);
+    s.verify().unwrap();
+    roundtrip(&s);
+    same_run(&f, &s, &|_| CallEffect::UNKNOWN, GuestReg::Sp);
+    let m = interp::Model {
+        call: &|_| CallEffect::UNKNOWN,
+        sp: GuestReg::Sp,
+        max_steps: 10,
+        syscall: None,
+    };
+    // 1/3 to 64 bits, stored as a double rounding to nearest: inexact,
+    // rounded down (C1 clear).
+    let mut regs = interp::initial_regs(1, GuestReg::Sp);
+    regs[reg_index(x(0))] = 0xaaaa_aaaa_aaaa_aaab;
+    regs[reg_index(x(1))] = 0x3ffd;
+    regs[reg_index(x(2))] = 0x37f;
+    let o = interp::run_from(&f, 1, regs, &m);
+    assert!(matches!(o.stop, interp::Stop::Return(_)));
+    assert_eq!(o.regs[reg_index(x(0))], (1.0f64 / 3.0).to_bits());
+    assert_eq!(o.regs[reg_index(x(1))], 0x20); // PE
+}

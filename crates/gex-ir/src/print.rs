@@ -217,6 +217,9 @@ pub fn block(b: &Block) -> String {
             Stmt::HostCall { func, args } => {
                 let _ = writeln!(s, "  hostcall {func:?}({args:?})");
             }
+            Stmt::X87 { op, args, outs } => {
+                let _ = writeln!(s, "  {outs:?} = x87 {op:?}({args:?})");
+            }
             Stmt::Trap { cond, pc, code } => {
                 let _ = writeln!(s, "  trap if {cond:?} at 0x{pc:x} code {code}");
             }
