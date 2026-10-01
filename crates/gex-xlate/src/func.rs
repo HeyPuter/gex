@@ -56,17 +56,26 @@ pub enum Source {
     /// A weak start no recovered function covers, promoted to a function
     /// of its own.
     Orphan,
+    /// A PE import thunk: `jmp [IAT slot]`.
+    ImportThunk,
+    /// A PE base relocation whose target is code (weak: in a PE32 every
+    /// absolute address is relocated, jump-table cases and labels inside
+    /// functions included).
+    PeReloc,
 }
 
 impl Source {
     /// Strong sources bound functions; weak ones only fill gaps.
     pub fn strong(self) -> bool {
-        !matches!(self, Source::DataPtr | Source::CodePtr | Source::LandingPad)
+        !matches!(
+            self,
+            Source::DataPtr | Source::CodePtr | Source::LandingPad | Source::PeReloc
+        )
     }
     fn bit(self) -> u16 {
         1 << self as u16
     }
-    pub const ALL: [Source; 10] = [
+    pub const ALL: [Source; 12] = [
         Source::Entry,
         Source::Symbol,
         Source::EhFrame,
@@ -77,6 +86,8 @@ impl Source {
         Source::CodePtr,
         Source::LandingPad,
         Source::Orphan,
+        Source::ImportThunk,
+        Source::PeReloc,
     ];
 }
 
@@ -189,6 +200,9 @@ pub struct Program {
 pub struct Code<'a> {
     pub image: &'a Image,
     view: CodeView<'a>,
+    /// Executable sections read from the file when the loader did not
+    /// (ELF32): they bound code more tightly than the segments.
+    ranges: Vec<(u64, u64)>,
 }
 
 impl<'a> Code<'a> {
@@ -196,13 +210,30 @@ impl<'a> Code<'a> {
         Code {
             image,
             view: CodeView::new(image),
+            ranges: Vec::new(),
         }
+    }
+    /// [`Code::new`], taking the executable sections from the raw file when
+    /// the image has none.
+    pub fn with_elf(image: &'a Image, elf: Option<&[u8]>) -> Code<'a> {
+        let mut c = Code::new(image);
+        if image.code.is_empty() {
+            if let Some(d) = elf {
+                c.ranges = ehframe::code_ranges(d, image.bias);
+            }
+        }
+        c
     }
     pub fn fetch(&self, pc: u64, buf: &mut FetchBuf) -> usize {
         self.view.fetch_code(pc, buf)
     }
     pub fn is_code(&self, a: u64) -> bool {
-        a % INST_ALIGN == 0 && self.view.is_executable(a)
+        a % INST_ALIGN == 0
+            && if self.ranges.is_empty() {
+                self.view.is_executable(a)
+            } else {
+                self.ranges.iter().any(|&(lo, hi)| a >= lo && a < hi)
+            }
     }
     /// `bytes` little-endian bytes at `addr`, and whether the segment holding
     /// them is writable (its contents could change at run time).
@@ -241,7 +272,12 @@ pub fn seeds(
     if image.entry != image.bias {
         add(&mut starts, image.entry, Source::Entry);
     }
-    for sym in &image.symbols {
+    // gex-ld reads ELF64 symbol tables only.
+    let syms32 = match elf {
+        Some(d) if image.class32 && image.symbols.is_empty() => ehframe::symbols32(d, image.bias),
+        _ => Vec::new(),
+    };
+    for sym in image.symbols.iter().chain(&syms32) {
         if !code.is_code(sym.value) {
             continue;
         }
@@ -298,13 +334,15 @@ pub fn seeds(
             if seg.executable {
                 continue;
             }
-            for (i, chunk) in seg.bytes.chunks_exact(8).enumerate() {
-                let at = seg.vaddr + (i * 8) as u64;
-                if at % 8 != 0 {
+            let w = arch::ptr_bytes() as usize;
+            for (i, chunk) in seg.bytes.chunks_exact(w).enumerate() {
+                let at = seg.vaddr + (i * w) as u64;
+                if at % w as u64 != 0 {
                     continue;
                 }
-                let v = u64::from_le_bytes(chunk.try_into().unwrap());
-                add(&mut starts, v, Source::DataPtr);
+                let mut b = [0u8; 8];
+                b[..w].copy_from_slice(chunk);
+                add(&mut starts, u64::from_le_bytes(b), Source::DataPtr);
             }
         }
         for seg in &image.segments {
@@ -433,7 +471,10 @@ pub struct Table {
 struct Facts<'a> {
     starts: &'a BTreeMap<u64, StartInfo>,
     noreturn: &'a BTreeSet<u64>,
-    tables: &'a HashMap<u64, Table>,
+    /// Resolved tables by (function, jump instruction): a table is proved
+    /// in the context of one function (its bound check dominates there),
+    /// and code two functions share may be entered differently in each.
+    tables: &'a HashMap<(u64, u64), Table>,
     /// Extra block leaders per function (interior entries).
     leaders: &'a HashMap<u64, BTreeSet<u64>>,
 }
@@ -523,6 +564,10 @@ fn discover(
             t
         };
         let term = match (b.term.clone(), b.call_return) {
+            // `call 1f; 1: pop %ebx`, i386 PIC code's way to read its own
+            // address: the call pushed the return address, and control
+            // just continues. Not a call, and not a function start.
+            (Term::Goto { target }, Some(r)) if target == r => DTerm::Jump(internal(classify(r), &mut succ)),
             (Term::Goto { target }, Some(r)) => {
                 calls.push(target);
                 let returns = !facts.noreturn.contains(&target);
@@ -558,7 +603,7 @@ fn discover(
                 ret: Some(internal(classify(r), &mut succ)),
             },
             (Term::Indirect { target, is_ret: true }, None) => DTerm::Return(target),
-            (Term::Indirect { target, is_ret: false }, None) => match facts.tables.get(&l.term_pc) {
+            (Term::Indirect { target, is_ret: false }, None) => match facts.tables.get(&(start, l.term_pc)) {
                 Some(t) => {
                     let mut cases: Vec<(u64, Tgt)> = t
                         .cases
@@ -820,11 +865,13 @@ fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bool> {
 /// `.eh_frame`); `summary` gives callee effects to the jump-table resolver
 /// when summaries exist (the second pass, see [`crate::summary::analyze`]).
 pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
-    if image.class32 {
-        // i386 code has 4-byte return addresses and pointers and another
-        // syscall ABI; recovery and summaries assume x86-64's. Nothing is
-        // recovered, so all of it stays tier-1's.
-        eprintln!("gex-xlate: function recovery does not handle i386 code yet; recovering nothing");
+    // i386 code decodes in compatibility mode; the setting is per process
+    // (one program), and summaries read it back ([`arch::compat`]).
+    if image.class32 != arch::compat() {
+        crate::set_compat(image.class32);
+    }
+    if image.class32 && !gex_abi::X86 {
+        eprintln!("gex-xlate: an i386 image needs the x86 build; recovering nothing");
         return Program {
             functions: BTreeMap::new(),
             starts: BTreeMap::new(),
@@ -832,18 +879,234 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
             stats: RecoverStats::default(),
         };
     }
-    let code = Code::new(image);
-    let (mut starts, fdes) = seeds(&code, elf, opts.scan_data);
+    let code = Code::with_elf(image, elf);
+    let (starts, fdes) = seeds(&code, elf, opts.scan_data);
+    recover_seeded(&code, starts, fdes, opts)
+}
+
+/// Seeds of a PE module beyond what [`seeds`] finds in any image, and its
+/// `.pdata` ranges, which play the part of `.eh_frame` FDEs.
+pub struct PeSeeds {
+    pub starts: Vec<(u64, Source)>,
+    pub fdes: Vec<ehframe::Fde>,
+}
+
+/// A PE image as recovery input: placed at `base` (relocated if it moves),
+/// as an [`Image`] with one segment per section, its executable sections as
+/// the code, its exports as symbols, and PE32 marked i386
+/// ([`Image::class32`]); plus the seeds only a PE has: the entry point, TLS
+/// callbacks, base relocations whose target is code, and `.pdata`.
+pub fn pe_input(pe: &gex_ld::pe::PeImage, base: u64) -> Result<(Image, PeSeeds), String> {
+    let img = pe.map(base).map_err(|e| e.to_string())?;
+    let segments = pe.segments(base, &img);
+    let code: Vec<(u64, u64)> = pe
+        .sections
+        .iter()
+        .filter(|s| s.executable() && s.vsize.max(s.raw_size) > 0)
+        .map(|s| (base + s.rva as u64, base + s.rva as u64 + s.vsize.max(s.raw_size) as u64))
+        .collect();
+    let text_range = (
+        code.iter().map(|c| c.0).min().unwrap_or(base),
+        code.iter().map(|c| c.1).max().unwrap_or(base),
+    );
+    let mut symbols = Vec::new();
+    for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+        let name = e.names.first().cloned().unwrap_or_else(|| format!("#{}", e.ordinal));
+        symbols.push(gex_ld::Symbol {
+            name,
+            value: base + e.rva as u64,
+            size: 0,
+            ifunc: false,
+        });
+    }
+    let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { base };
+    let image = Image {
+        soname: None,
+        needed: Vec::new(),
+        runpath: Vec::new(),
+        bias: base,
+        entry,
+        code,
+        segments,
+        phdr_vaddr: base,
+        phentsize: 0,
+        phnum: 0,
+        brk: base + pe.image_size as u64,
+        text_range,
+        tls: None,
+        symbols,
+        named_relocs: Vec::new(),
+        relocs: Vec::new(),
+        init_array: Vec::new(),
+        dynsyms: Vec::new(),
+        irelative: Vec::new(),
+        pie: false,
+        interp: None,
+        class32: !pe.is64,
+    };
+    let ptr = if pe.is64 { 8 } else { 4 };
+    let word = |va: u64| -> Option<u64> {
+        let o = va.checked_sub(base)? as usize;
+        let b = img.get(o..o + ptr)?;
+        let mut w = [0u8; 8];
+        w[..ptr].copy_from_slice(b);
+        Some(u64::from_le_bytes(w))
+    };
+    let mut starts = Vec::new();
+    if pe.entry_rva != 0 {
+        starts.push((entry, Source::Entry));
+    }
+    // TLS callbacks: a null-terminated array of pointers (relocated).
+    if let Some(t) = &pe.tls {
+        if t.callbacks_va != 0 {
+            let mut at = t.callbacks_va.wrapping_sub(pe.preferred_base).wrapping_add(base);
+            for _ in 0..256 {
+                match word(at) {
+                    Some(0) | None => break,
+                    Some(cb) => starts.push((cb, Source::InitArray)),
+                }
+                at += ptr as u64;
+            }
+        }
+    }
+    // Every relocated word that points into code is a code pointer
+    // something takes: a function, a jump-table case, a handler.
+    for r in &pe.relocs {
+        if r.kind == gex_ld::pe::rel::ABSOLUTE {
+            continue;
+        }
+        if let Some(t) = word(base + r.rva as u64) {
+            starts.push((t, Source::PeReloc));
+        }
+    }
+    // Import thunks: `jmp [slot]` (PE32: `ff 25` and the slot's address;
+    // PE32+: `ff 25` and its displacement from the next instruction) for a
+    // slot of an IAT. Code jumps to them from everywhere, and a start keeps
+    // them from being copied into every function that does.
+    let mut iat: Vec<(u64, u64)> = Vec::new();
+    for d in &pe.imports {
+        for sym in &d.symbols {
+            iat.push((base + sym.iat_rva as u64, base + sym.iat_rva as u64 + ptr as u64));
+        }
+    }
+    for d in &pe.delay_imports {
+        for sym in &d.symbols {
+            iat.push((base + sym.iat_rva as u64, base + sym.iat_rva as u64 + ptr as u64));
+        }
+    }
+    iat.sort_unstable();
+    let in_iat = |a: u64| {
+        let i = iat.partition_point(|r| r.1 <= a);
+        iat.get(i).is_some_and(|r| r.0 <= a)
+    };
+    for sec in pe.sections.iter().filter(|s| s.executable()) {
+        let lo = sec.rva as usize;
+        let hi = (lo + sec.vsize.max(sec.raw_size) as usize).min(img.len());
+        let mut o = lo;
+        while o + 6 <= hi {
+            if img[o] == 0xff && img[o + 1] == 0x25 {
+                let d = u32::from_le_bytes(img[o + 2..o + 6].try_into().unwrap());
+                let slot = if pe.is64 {
+                    (base + o as u64 + 6).wrapping_add(d as i32 as i64 as u64)
+                } else {
+                    d as u64
+                };
+                if in_iat(slot) {
+                    starts.push((base + o as u64, Source::ImportThunk));
+                }
+            }
+            o += 1;
+        }
+    }
+    let mut fdes: Vec<ehframe::Fde> = pe
+        .pdata
+        .iter()
+        .filter(|f| f.end_rva > f.begin_rva)
+        .map(|f| ehframe::Fde {
+            start: base + f.begin_rva as u64,
+            end: base + f.end_rva as u64,
+            lsda: None,
+        })
+        .collect();
+    // MinGW keeps DWARF CFI in an `.eh_frame` section.
+    if let Some(s) = pe.sections.iter().find(|s| pe_section_name(pe, &s.name) == ".eh_frame") {
+        let lo = s.rva as usize;
+        let hi = (lo + s.vsize.max(s.raw_size) as usize).min(img.len());
+        if lo < hi {
+            fdes.extend(ehframe::parse_eh_frame(&img[lo..hi], base + s.rva as u64, pe.is64));
+        }
+    }
+    Ok((image, PeSeeds { starts, fdes }))
+}
+
+/// A PE section's name, with a long name (`/N`: an offset into the COFF
+/// string table, which MinGW uses for `.eh_frame` and the debug sections)
+/// looked up.
+fn pe_section_name(pe: &gex_ld::pe::PeImage, raw: &str) -> String {
+    let Some(off) = raw.strip_prefix('/').and_then(|n| n.parse::<usize>().ok()) else {
+        return raw.to_string();
+    };
+    let d = &pe.data;
+    let rd32 = |o: usize| d.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    let Some(lfanew) = rd32(0x3c) else { return raw.to_string() };
+    let (Some(symtab), Some(nsyms)) = (rd32(lfanew + 12), rd32(lfanew + 16)) else {
+        return raw.to_string();
+    };
+    let at = symtab + nsyms * 18 + off;
+    match d.get(at..) {
+        Some(rest) if symtab != 0 => {
+            let n = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+            String::from_utf8_lossy(&rest[..n]).into_owned()
+        }
+        _ => raw.to_string(),
+    }
+}
+
+/// [`recover`] for a PE module from [`pe_input`].
+pub fn recover_pe(image: &Image, extra: &PeSeeds, opts: &RecoverOptions) -> Program {
+    if image.class32 != arch::compat() {
+        crate::set_compat(image.class32);
+    }
+    let code = Code::with_elf(image, None);
+    let (mut starts, mut fdes) = seeds(&code, None, opts.scan_data);
+    for &(a, src) in &extra.starts {
+        if code.is_code(a) {
+            starts.entry(a).or_default().add(src);
+        }
+    }
+    for f in &extra.fdes {
+        if code.is_code(f.start) {
+            let e = starts.entry(f.start).or_default();
+            e.add(Source::EhFrame);
+            e.end = Some(e.end.unwrap_or(0).max(f.end));
+        }
+    }
+    fdes.extend(extra.fdes.iter().cloned());
+    recover_seeded(&code, starts, fdes, opts)
+}
+
+/// Recovery from seeds: the fixpoint of discovery, noreturn, jump tables
+/// and interior entries.
+fn recover_seeded(
+    code: &Code,
+    mut starts: BTreeMap<u64, StartInfo>,
+    fdes: Vec<ehframe::Fde>,
+    opts: &RecoverOptions,
+) -> Program {
     let mut lifter = Lifter {
         code: &code,
         limits: opts.limits,
         cache: HashMap::new(),
     };
     let mut noreturn: BTreeSet<u64> = BTreeSet::new();
-    let mut tables: HashMap<u64, Table> = HashMap::new();
+    let mut tables: HashMap<(u64, u64), Table> = HashMap::new();
     let mut leaders: HashMap<u64, BTreeSet<u64>> = HashMap::new();
     let mut entries: HashMap<u64, Vec<u64>> = HashMap::new();
-    let mut failed_tables: HashSet<u64> = HashSet::new();
+    let mut failed_tables: HashSet<(u64, u64)> = HashSet::new();
+    // Orphans a table claimed (made weak again), and those then promoted
+    // again, which stay functions.
+    let mut demoted: HashSet<u64> = HashSet::new();
+    let mut pinned: HashSet<u64> = HashSet::new();
     let mut functions: BTreeMap<u64, Function>;
     let mut rounds = 0;
     // Callee summaries, once there are any: a jump table whose base sits in
@@ -931,13 +1194,14 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
 
         // Jump tables, on SSA.
         for f in functions.values() {
-            // Keyed by the jump instruction, which survives block splits.
+            // Keyed by (function, jump instruction): the jump survives block
+            // splits.
             let todo: Vec<(u64, u64)> = f
                 .blocks
                 .iter()
                 .filter(|b| matches!(b.term, FTerm::Unresolved { .. }))
                 .map(|b| (b.start, b.term_pc))
-                .filter(|(_, j)| !tables.contains_key(j) && !failed_tables.contains(j))
+                .filter(|(_, j)| !tables.contains_key(&(f.entry, *j)) && !failed_tables.contains(&(f.entry, *j)))
                 .collect();
             if todo.is_empty() {
                 continue;
@@ -948,11 +1212,11 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
             for ((_, t), (_, a)) in found.into_iter().zip(todo) {
                 match t {
                     Some(t) => {
-                        tables.insert(a, t);
+                        tables.insert((f.entry, a), t);
                         changed = true;
                     }
                     None => {
-                        failed_tables.insert(a);
+                        failed_tables.insert((f.entry, a));
                     }
                 }
             }
@@ -962,10 +1226,11 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
         // goes back to weak once a jump table claims it as a case (an
         // absolute table's entries are data pointers).
         {
-            let cases: HashSet<u64> = tables.values().flat_map(|t| t.cases.iter().copied()).collect();
+            let cases = switch_cases(&functions);
             for (a, st) in starts.iter_mut() {
-                if st.has(Source::Orphan) && cases.contains(a) {
+                if st.has(Source::Orphan) && cases.contains(a) && !pinned.contains(a) {
                     st.remove(Source::Orphan);
+                    demoted.insert(*a);
                     changed = true;
                 }
             }
@@ -977,8 +1242,7 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
         // and an absolute table's entries are data pointers to it.
         if !changed {
             let covered = coverage_index(&functions);
-            let case_targets: HashSet<u64> =
-                tables.values().flat_map(|t| t.cases.iter().copied()).collect();
+            let case_targets = switch_cases(&functions);
             // The code inside a switch's own block: `adr x10, .` anchors a
             // relative table there, and is not an entry anyone takes.
             let switch_blocks: Vec<(u64, u64)> = functions
@@ -991,7 +1255,10 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
             let weak: Vec<(u64, bool, Option<u64>)> = starts
                 .iter()
                 .filter(|(_, s)| !s.strong())
-                .map(|(&a, s)| (a, s.has(Source::CodePtr) || s.has(Source::LandingPad), s.pad_of))
+                .map(|(&a, s)| {
+                    let typed = s.has(Source::CodePtr) || s.has(Source::LandingPad) || s.has(Source::PeReloc);
+                    (a, typed, s.pad_of)
+                })
                 .collect();
             for (w, typed, pad_of) in weak {
                 if case_targets.contains(&w) || in_switch(w) {
@@ -1008,6 +1275,13 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
                 if owners.is_empty() {
                     if plausible_start(&code, w, typed) {
                         starts.get_mut(&w).unwrap().add(Source::Orphan);
+                        // Promoted again after a demotion: the table that
+                        // claims it only resolves while it is a function
+                        // (as one, it splits a loop off the switch). Keep it
+                        // one, or the two would alternate for ever.
+                        if demoted.contains(&w) {
+                            pinned.insert(w);
+                        }
                         changed = true;
                     }
                     continue;
@@ -1060,11 +1334,11 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
         for ((_, t), (_, a)) in found.into_iter().zip(todo) {
             match t {
                 Some(t) => {
-                    tables.insert(a, t);
+                    tables.insert((f.entry, a), t);
                     found_any = true;
                 }
                 None => {
-                    failed_tables.insert(a);
+                    failed_tables.insert((f.entry, a));
                 }
             }
         }
@@ -1081,6 +1355,21 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
         noreturn,
         stats,
     }
+}
+
+/// Every case address of the switches the functions have now. (Not the
+/// table cache: a table of a function that has since changed shape or gone
+/// claims nothing.)
+fn switch_cases(functions: &BTreeMap<u64, Function>) -> HashSet<u64> {
+    functions
+        .values()
+        .flat_map(|f| f.blocks.iter())
+        .filter_map(|b| match &b.term {
+            FTerm::Switch { cases, .. } => Some(cases.iter().map(|c| c.0)),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// Whether an uncovered weak start is worth a function of its own: its
@@ -1241,6 +1530,55 @@ pub fn is_const(f: &Function, v: Value) -> Option<u64> {
         }
     }
     None
+}
+
+/// Coverage against an outside list of function starts (another tool's, a
+/// symbol table recovery could not read): how many of `truth` are starts of
+/// recovered functions, how many are covered by a block at all, and bytes
+/// of the extents `[start, next start)` (within one code range) covered.
+/// The last start of each code range has no known end and is left out.
+/// Returns `(starts, functions, inside a block, bytes, bytes covered)`.
+pub fn truth_coverage(prog: &Program, code: &[(u64, u64)], truth: &[u64]) -> (usize, usize, usize, u64, u64) {
+    let mut t: Vec<u64> = truth.to_vec();
+    t.sort_unstable();
+    t.dedup();
+    let cov = coverage_index(&prog.functions);
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for &(a, b, _) in &cov.ranges {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let inside = |a: u64| {
+        let i = merged.partition_point(|m| m.1 <= a);
+        merged.get(i).is_some_and(|m| m.0 <= a)
+    };
+    let funcs = t.iter().filter(|a| prog.functions.contains_key(a)).count();
+    let within = t.iter().filter(|&&a| inside(a)).count();
+    let mut ext = Vec::new();
+    for (i, &a) in t.iter().enumerate() {
+        let Some(&(_, hi)) = code.iter().find(|&&(lo, hi)| a >= lo && a < hi) else { continue };
+        match t.get(i + 1) {
+            Some(&e) if e <= hi && e > a => ext.push((a, e)),
+            _ => {}
+        }
+    }
+    let (bytes, covered) = covered_bytes(ext, &merged);
+    (t.len(), funcs, within, bytes, covered)
+}
+
+/// Bytes of the code ranges, and how many recovered blocks cover.
+pub fn code_coverage(prog: &Program, code: &[(u64, u64)]) -> (u64, u64) {
+    let cov = coverage_index(&prog.functions);
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for &(a, b, _) in &cov.ranges {
+        match merged.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    covered_bytes(code.to_vec(), &merged)
 }
 
 /// Byte ranges inside symbol extents that no recovered block covers, with

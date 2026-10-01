@@ -98,7 +98,7 @@ usage:
 {}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
-  gexc funcs  <elf> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list]
+  gexc funcs  <elf|pe> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list] [--base HEX]
                                    recover functions (CFGs, jump tables,
                                    call-graph summaries) and report them.
                                    --ir prints function-level GIR, --ssa in
@@ -364,7 +364,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
 /// a plain build and `gexc run` serve them with the host builtins, as closure
 /// builds and the browser's runtime translator do, so every path agrees on
 /// what those functions are.
+///
+/// Not for 32-bit (i386) images: `intrinsic::block` reads the 64-bit
+/// register arguments and pops an 8-byte return address, while i386 cdecl
+/// passes them on the stack.
 fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
+    if image.class32 {
+        return Default::default();
+    }
     let (tlo, thi) = image.text_range;
     image
         .symbols
@@ -1317,7 +1324,10 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
     let mut at = None;
     let (mut ir, mut ssa, mut check, mut list) = (false, false, false, false);
     let mut show_uncovered = false;
+    let mut show_unresolved = false;
     let mut runs: u64 = 8;
+    let mut pe_base: Option<u64> = None;
+    let mut truth: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1332,9 +1342,19 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
             "--check" => check = true,
             "--list" => list = true,
             "--uncovered" => show_uncovered = true,
+            "--unresolved" => show_unresolved = true,
             "--run" => {
                 i += 1;
                 runs = args.get(i).context("--run needs a count")?.parse().context("--run expects a number")?;
+            }
+            "--truth" => {
+                i += 1;
+                truth = Some(args.get(i).context("--truth needs a file")?.clone());
+            }
+            "--base" => {
+                i += 1;
+                let v = args.get(i).context("--base needs an address")?;
+                pe_base = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16).context("--base expects hex")?);
             }
             other => path = Some(other.to_string()),
         }
@@ -1342,9 +1362,18 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
     }
     let path = path.context("expected an input ELF")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
-    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     let t0 = std::time::Instant::now();
-    let prog = gex_xlate::func::recover(&image, Some(&bytes), &Default::default());
+    let (image, prog) = if gex_ld::pe::is_pe(&bytes) {
+        let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        let base = pe_base.unwrap_or(pe.preferred_base);
+        let (image, extra) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        let prog = gex_xlate::func::recover_pe(&image, &extra, &Default::default());
+        (image, prog)
+    } else {
+        let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+        let prog = gex_xlate::func::recover(&image, Some(&bytes), &Default::default());
+        (image, prog)
+    };
     let t_rec = t0.elapsed();
     let t1 = std::time::Instant::now();
     let sums = gex_xlate::summary::analyze(&prog);
@@ -1369,10 +1398,13 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         pct(st.symbol_bytes_covered, st.symbol_bytes),
         st.symbol_bytes
     );
+    let (cb, cc) = gex_xlate::func::code_coverage(&prog, &image.code);
     eprintln!(
-        "fde bytes covered {:.2}% of {}",
+        "fde bytes covered {:.2}% of {}  code bytes covered {:.2}% of {}",
         pct(st.fde_bytes_covered, st.fde_bytes),
-        st.fde_bytes
+        st.fde_bytes,
+        pct(cc, cb),
+        cb
     );
     let torn: usize = prog
         .functions
@@ -1391,6 +1423,24 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
         sums.stats.unconverged,
         sums.stats.unknown
     );
+    if let Some(t) = &truth {
+        let text = std::fs::read_to_string(t).with_context(|| format!("reading {t}"))?;
+        let starts: Vec<u64> = text
+            .split_whitespace()
+            .filter_map(|w| u64::from_str_radix(w.trim_start_matches("0x"), 16).ok())
+            .collect();
+        let (n, f, inside, bytes, cov) = gex_xlate::func::truth_coverage(&prog, &image.code, &starts);
+        eprintln!(
+            "truth {t}: {f}/{n} starts are functions ({:.2}%), {inside} inside a block ({:.2}%); bytes covered {:.2}% of {bytes}",
+            pct(f as u64, n as u64),
+            pct(inside as u64, n as u64),
+            pct(cov, bytes)
+        );
+    }
+    if !sums.stats.unconverged_members.is_empty() {
+        let m: Vec<String> = sums.stats.unconverged_members.iter().take(20).map(|a| format!("{a:#x}")).collect();
+        eprintln!("  not converged: {}", m.join(" "));
+    }
     let missing: Vec<(&u64, &gex_xlate::func::StartInfo)> = prog
         .starts
         .iter()
@@ -1416,6 +1466,27 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
                 pc += len as u64;
             }
         }
+    }
+    if show_unresolved {
+        for f in prog.functions.values() {
+            let torn = gex_xlate::summary::frame_torn_down(f, &sums);
+            for b in &f.blocks {
+                if matches!(b.term, gex_ir::func::FTerm::Unresolved { .. }) {
+                    let shape = if torn.contains(&b.term_pc) { "torn-down" } else { "-" };
+                    println!("unresolved {:#x} in {:#x} {shape}", b.term_pc, f.entry);
+                }
+            }
+        }
+    }
+    if let Some(a) = at.filter(|a| !prog.functions.contains_key(a)) {
+        let src = prog.starts.get(&a).map(|s| s.sources());
+        let owners: Vec<String> = prog
+            .functions
+            .values()
+            .filter(|f| f.blocks.iter().any(|b| !b.synthetic && b.insts.contains(&a)))
+            .map(|f| format!("{:#x}", f.entry))
+            .collect();
+        println!("{a:#x} is not a function; seeds {src:?}; inside {}", owners.join(" "));
     }
     let mut bad = 0usize;
     let mut vrep = gex_xlate::validate::Report::default();

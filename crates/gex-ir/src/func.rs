@@ -1196,6 +1196,11 @@ pub struct Summary {
     /// Registers and flags whose entry value may be read (before being
     /// written) by the function or its callees.
     pub inputs: RegSet,
+    /// Registers and flags written on every path that returns (by the
+    /// function or a callee): after a call, what the caller reads of these
+    /// is the callee's result, not the caller's own entry value. A must-set:
+    /// empty when anything is unknown.
+    pub always_written: RegSet,
     /// Stack bytes, relative to the entry stack pointer, the function may
     /// read from its caller's frame (stack arguments; on x86-64 the return
     /// address at offset 0).
@@ -1260,6 +1265,7 @@ impl Summary {
     pub fn unknown() -> Summary {
         Summary {
             inputs: RegSet::ALL,
+            always_written: RegSet::EMPTY,
             stack_inputs: Slots::Unknown,
             outputs: RegSet::ALL,
             preserved: RegSet::EMPTY,
@@ -1282,6 +1288,7 @@ impl Summary {
     pub fn bottom() -> Summary {
         Summary {
             inputs: RegSet::EMPTY,
+            always_written: RegSet::ALL,
             stack_inputs: Slots::None,
             outputs: RegSet::EMPTY,
             preserved: RegSet::ALL,
