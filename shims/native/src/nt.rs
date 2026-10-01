@@ -167,6 +167,9 @@ pub(crate) enum Fault {
     DivideOverflow,
     /// A privileged instruction such as `hlt` (`BRK_GENERAL_PROTECTION`).
     Privileged,
+    /// An unmasked x87 exception (`BRK_X87_EXCEPTION`), which gex does not
+    /// deliver: the process ends, loudly.
+    X87,
 }
 
 impl Fault {
@@ -178,6 +181,7 @@ impl Fault {
             i::BRK_DIVIDE_BY_ZERO => Fault::DivideByZero,
             i::BRK_DIVIDE_OVERFLOW => Fault::DivideOverflow,
             i::BRK_GENERAL_PROTECTION => Fault::Privileged,
+            i::BRK_X87_EXCEPTION => Fault::X87,
             _ => Fault::Breakpoint,
         }
     }
@@ -191,6 +195,16 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let state = caller.data_mut();
     let p = Arc::clone(state.nt.as_ref().expect("an NT fault in a Linux process"));
+    if let Fault::X87 = fault {
+        eprintln!("gex-nt: an unmasked x87 exception at {pc:#x}: gex does not deliver x87 exceptions; ending the process");
+        state.exit = Some(Exit::Signal {
+            signal: 8,
+            pc,
+            detail: "unmasked x87 exception (not delivered by gex)".into(),
+            internal: true,
+        });
+        return Err(StopExecution.into());
+    }
     let (code, rip, info): (u32, u64, Vec<u64>) = match fault {
         // The context's rip is after the int3, as hardware leaves it.
         Fault::Breakpoint => (st::BREAKPOINT, pc + 1, vec![0]),
@@ -202,6 +216,7 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
         Fault::DivideByZero => (st::INTEGER_DIVIDE_BY_ZERO, pc, vec![]),
         Fault::DivideOverflow => (st::INTEGER_OVERFLOW, pc, vec![]),
         Fault::Privileged => (st::PRIVILEGED_INSTRUCTION, pc, vec![]),
+        Fault::X87 => unreachable!(),
     };
     let outcome = nt::hardware_exception(&p, &state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {
