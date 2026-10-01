@@ -43,7 +43,7 @@ gex-wayland = { path = "crates/gex-wayland" }
 gex-xwm = { path = "crates/gex-xwm" }
 gex-virgl = { path = "crates/gex-virgl" }
 gex-gpu = { path = "crates/gex-gpu" }
-gex-gl = { path = "crates/gex-gl" }
+gex-gl = { path = "crates/gex-gl", default-features = false }
 gex-isa = { path = "crates/gex-isa" }
 gex-isa-x86 = { path = "crates/gex-isa-x86" }
 gex-ir = { path = "crates/gex-ir" }

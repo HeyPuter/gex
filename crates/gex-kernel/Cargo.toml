@@ -9,6 +9,8 @@ description = "gex-kernel: the userspace Linux personality"
 gex-abi.workspace = true
 # PE parsing and mapping for the NT personality (docs/nt-layer.md §1.1).
 gex-ld.workspace = true
+# The GL wire protocol, for the NT layer's opengl32 (not the host renderer).
+gex-gl.workspace = true
 
 [features]
 # Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.
