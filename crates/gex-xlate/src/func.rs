@@ -822,9 +822,13 @@ fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bool> {
 pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Program {
     if image.class32 {
         // i386 code has 4-byte return addresses and pointers and another
-        // syscall ABI; recovery and summaries assume x86-64's. Nothing is
-        // recovered, so all of it stays tier-1's.
-        eprintln!("gex-xlate: function recovery does not handle i386 code yet; recovering nothing");
+        // syscall ABI; recovery and summaries assume x86-64's (and AArch64's).
+        // A PowerPC image is 32-bit too, with registers the function IR does
+        // not index. Nothing is recovered, so all of it stays tier-1's.
+        eprintln!(
+            "gex-xlate: function recovery does not handle {} code yet; recovering nothing",
+            if gex_abi::PPC { "PowerPC" } else { "i386" }
+        );
         return Program {
             functions: BTreeMap::new(),
             starts: BTreeMap::new(),
