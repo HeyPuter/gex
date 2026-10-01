@@ -77,6 +77,8 @@ pub struct SummaryStats {
     pub max_iterations: usize,
     /// SCCs that did not converge and were set to unknown.
     pub unconverged: usize,
+    /// Their members.
+    pub unconverged_members: Vec<u64>,
     /// Functions whose summary has `unknown_callee`.
     pub unknown: usize,
 }
@@ -142,7 +144,11 @@ enum Ex {
     Const(u64),
     /// Entry value of register (by [`reg_index`]) plus an offset.
     Entry(u8, i64),
-    /// x86-64: the return address, as loaded from the entry stack pointer.
+    /// The low 32 bits of the entry value of register `r` plus an offset,
+    /// as an `I32`: what `wrap` makes of `Entry` (a 32-bit register read,
+    /// every address i386 code forms). The offset is kept in `i32` range.
+    Low(u8, i64),
+    /// x86: the return address, as loaded from the entry stack pointer.
     RetAddr,
     Top,
 }
@@ -156,6 +162,20 @@ struct AV {
 
 /// [`SP_REG`]'s index ([`reg_index`]).
 const SP: usize = if gex_abi::X86 { 4 } else { 31 };
+
+/// An offset from an entry value, as the guest computes it. In i386 code
+/// every register holds a zero-extended 32-bit value and 32-bit address
+/// arithmetic wraps, so `Entry` values are compared modulo 2^32: an offset
+/// is kept in `i32` range. (A stack pointer whose frame straddles address
+/// zero or 4 GiB is the one case this would equate wrongly, and the lifter
+/// itself addresses such a push differently from the CPU.)
+fn norm(o: i64) -> i64 {
+    if crate::arch::compat() {
+        o as i32 as i64
+    } else {
+        o
+    }
+}
 
 impl AV {
     fn konst(c: u64) -> AV {
@@ -211,6 +231,10 @@ struct St {
     written: RegSet,
     /// The frame's address has escaped.
     escaped: bool,
+    /// Optimistic mode ([`known_values_trusting_frame`]): this function's
+    /// own slots survive an escaped frame, as if no one wrote the frame
+    /// through a pointer it was handed.
+    trust_frame: bool,
 }
 
 impl St {
@@ -220,7 +244,7 @@ impl St {
             slots.insert(
                 0,
                 (
-                    8,
+                    crate::arch::ptr_bytes(),
                     AV {
                         ex: Ex::RetAddr,
                         taint: RegSet::EMPTY,
@@ -233,6 +257,7 @@ impl St {
             slots,
             written: RegSet::EMPTY,
             escaped: false,
+            trust_frame: false,
         }
     }
 
@@ -251,6 +276,7 @@ impl St {
             slots,
             written: self.written.inter(o.written),
             escaped: self.escaped || o.escaped,
+            trust_frame: self.trust_frame,
         }
     }
 
@@ -258,7 +284,8 @@ impl St {
     /// the red zone (x86-64's 128 bytes the kernel's signal delivery skips;
     /// AArch64 has none). Everything when the stack pointer is not known.
     fn floor(&self) -> i64 {
-        let red = if gex_abi::X86 { 128 } else { 0 };
+        // The x86-64 psABI's red zone; i386 has none.
+        let red = if gex_abi::X86 && !crate::arch::compat() { 128 } else { 0 };
         match self.regs[SP].sp_off() {
             Some(o) => o - red,
             None => i64::MAX,
@@ -289,7 +316,7 @@ impl St {
     /// A store nobody can place: the caller's frame may be hit always, this
     /// frame only once it has escaped.
     fn unknown_store(&mut self) {
-        if self.escaped {
+        if self.escaped && !self.trust_frame {
             self.slots.clear();
         } else {
             self.kill(0, i64::MAX);
@@ -345,7 +372,13 @@ struct Acc {
 /// Registers the kernel reads for a syscall, and those it may change.
 fn syscall_regs() -> (RegSet, RegSet) {
     use GuestReg::X;
-    if gex_abi::X86 {
+    if crate::arch::compat() {
+        // int 0x80: eax, then ebx ecx edx esi edi ebp; clobbers eax.
+        (
+            RegSet::of(&[X(0), X(3), X(1), X(2), X(6), X(7), X(5)]),
+            RegSet::of(&[X(0)]),
+        )
+    } else if gex_abi::X86 {
         // rdi rsi rdx r10 r8 r9, rax; clobbers rax rcx r11.
         (
             RegSet::of(&[X(7), X(6), X(2), X(10), X(8), X(9), X(0)]),
@@ -364,7 +397,17 @@ fn syscall_regs() -> (RegSet, RegSet) {
 /// time, futexes, signal masks. Anything else (fork, clone, execve,
 /// rt_sigreturn, kill, and everything not listed) may unwind.
 fn benign_syscall(nr: u64) -> bool {
-    if gex_abi::X86 {
+    if crate::arch::compat() {
+        // The same calls by their i386 numbers (plus the 32-bit variants:
+        // mmap2, _llseek, stat64, fcntl64, clock_gettime64, ...).
+        matches!(
+            nr,
+            1 | 3..=6 | 19 | 20 | 33 | 45 | 54 | 55 | 60 | 63 | 64 | 78 | 90 | 91 | 106..=108
+                | 122 | 125 | 140 | 145 | 146 | 158 | 162 | 168 | 174 | 175 | 183 | 192
+                | 195..=202 | 219..=221 | 224 | 240 | 243 | 252 | 258 | 265..=267 | 295
+                | 300 | 311 | 340 | 355 | 383 | 403 | 406 | 407
+        )
+    } else if gex_abi::X86 {
         matches!(
             nr,
             0..=14 | 16..=22 | 24 | 25 | 28 | 32 | 33 | 35 | 39 | 60 | 63 | 72 | 79 | 89 | 96
@@ -387,7 +430,11 @@ fn benign_syscall(nr: u64) -> bool {
 /// kernel copies what they point at, or writes through it before
 /// returning). Every other syscall's arguments escape.
 fn syscall_keeps_args(nr: u64) -> bool {
-    if gex_abi::X86 {
+    if crate::arch::compat() {
+        // set_tid_address, set_robust_list, set_thread_area (the kernel
+        // keeps the TLS base the descriptor names).
+        matches!(nr, 258 | 311 | 243)
+    } else if gex_abi::X86 {
         matches!(nr, 218 | 273)
     } else {
         matches!(nr, 96 | 99)
@@ -410,14 +457,47 @@ pub fn syscall_effect(nr: Option<u64>) -> CallEffect {
 
 struct Ctx<'a> {
     sums: &'a HashMap<u64, Summary>,
+    /// See [`St::trust_frame`]. Never for summaries.
+    trust_frame: bool,
 }
 
 impl Ctx<'_> {
     fn callee(&self, c: Callee) -> Summary {
-        match c {
-            Callee::Direct(a) => self.sums.get(&a).cloned().unwrap_or_else(Summary::unknown),
-            Callee::Indirect(_) => Summary::unknown(),
+        let s = match c {
+            Callee::Direct(a) => self.sums.get(&a).cloned(),
+            Callee::Indirect(_) => None,
+        };
+        match s {
+            Some(s) if !(self.trust_frame && s.unknown_callee) => s,
+            _ if self.trust_frame => abi_callee(),
+            _ => Summary::unknown(),
         }
+    }
+}
+
+/// Optimistic mode only: a callee nothing is known about, assumed to keep
+/// the platform ABI (callee-saved registers survive; the stack pointer moves
+/// by the return address it pops, except on i386 where stdcall callees pop
+/// their arguments too) and to leave this frame alone.
+fn abi_callee() -> Summary {
+    use GuestReg::X;
+    let (saved, delta) = if crate::arch::compat() {
+        (RegSet::of(&[X(3), X(5), X(6), X(7)]), None)
+    } else if gex_abi::X86 {
+        (RegSet::of(&[X(3), X(5), X(12), X(13), X(14), X(15)]), Some(8))
+    } else {
+        let mut s = RegSet::of(&[GuestReg::Sp]);
+        for r in 19..=29 {
+            s.insert(X(r));
+        }
+        (s, Some(0))
+    };
+    Summary {
+        preserved: saved,
+        outputs: RegSet::ALL.minus(saved),
+        sp_delta: delta,
+        caller_frame_writes: Slots::None,
+        ..Summary::unknown()
     }
 }
 
@@ -433,7 +513,15 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
     let get = |vals: &HashMap<Value, AV>, v: Value| {
         vals.get(&v).copied().unwrap_or(AV::top(RegSet::EMPTY))
     };
-    for s in &b.stmts {
+    let mut at_pc = None;
+    for (s, &pc) in b.stmts.iter().zip(&b.pcs) {
+        // Between instructions, a signal frame may land below the stack
+        // pointer (and its red zone). Within one (`push`: store, then move
+        // the stack pointer) nothing can.
+        if at_pc != Some(pc) {
+            st.kill(i64::MIN, st.floor());
+            at_pc = Some(pc);
+        }
         match s {
             Stmt::Def { dst, expr } => {
                 let av = eval(expr, &vals, st, acc);
@@ -448,11 +536,7 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
                 }
                 st.regs[reg_index(*reg)] = av;
                 st.written.insert(*reg);
-                if *reg == SP_REG {
-                    // Below the stack pointer (and its red zone), a signal
-                    // frame may land at any moment.
-                    st.kill(i64::MIN, st.floor());
-                }
+
             }
             Stmt::Store {
                 addr, offset, val, sz, ..
@@ -533,6 +617,7 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
             }
             Stmt::Fence => {}
             Stmt::Trap { .. } => {
+                st.kill(i64::MIN, st.floor());
                 // Taken, it hands the exact context to a signal handler,
                 // which may leave by longjmp: every register is read and
                 // may escape. Not taken, nothing happens, so the state
@@ -544,6 +629,8 @@ fn run_block(b: &FBlock, st: &mut St, acc: &mut Acc) -> HashMap<Value, AV> {
             }
         }
     }
+    // The block's last instruction is done too.
+    st.kill(i64::MIN, st.floor());
     vals
 }
 
@@ -574,7 +661,9 @@ fn bulk_write(st: &mut St, acc: &mut Acc, d: AV) {
         }
         None => {
             if d.frame() {
-                st.slots.clear();
+                if !st.trust_frame {
+                    st.slots.clear();
+                }
                 acc.caller_frame_writes = Slots::Unknown;
             } else {
                 st.unknown_store();
@@ -604,16 +693,17 @@ fn store(st: &mut St, acc: &mut Acc, a: AV, offset: i64, bytes: u32, v: AV) {
         Some(o) => {
             let at = o + offset;
             st.kill(at, at + bytes as i64);
-            if at >= st.floor() {
-                st.slots.insert(at, (bytes, v));
-            }
+            st.slots.insert(at, (bytes, v));
             if at + bytes as i64 > 0 {
                 acc.caller_frame_writes = acc.caller_frame_writes.add(at.max(0), at + bytes as i64);
             }
         }
         None if a.frame() => {
-            // Somewhere in the frame, not placed: anywhere in it.
-            st.slots.clear();
+            // Somewhere in the frame, not placed: anywhere in it (unless
+            // optimistic: an indexed store stays inside its own array).
+            if !st.trust_frame {
+                st.slots.clear();
+            }
             acc.caller_frame_writes = Slots::Unknown;
         }
         None => st.unknown_store(),
@@ -653,6 +743,14 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
                 return AV::konst(0);
             }
             let (x, y) = (get(a), get(b));
+            // The same exact value twice (two reads of an unchanged
+            // register): `xor r32, r32` reads it twice.
+            if matches!(op, BinOp::Xor | BinOp::Sub)
+                && x.ex == y.ex
+                && matches!(x.ex, Ex::Entry(..) | Ex::Low(..))
+            {
+                return AV::konst(0);
+            }
             if x.is_ra() || y.is_ra() {
                 acc.reads_ra = true;
             }
@@ -662,13 +760,31 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
                     (BinOp::Add, Ex::Entry(r, o), Ex::Const(c))
                     | (BinOp::Add, Ex::Const(c), Ex::Entry(r, o)) => {
                         return AV {
-                            ex: Ex::Entry(r, o.wrapping_add(c as i64)),
+                            ex: Ex::Entry(r, norm(o.wrapping_add(c as i64))),
                             taint,
                         }
                     }
                     (BinOp::Sub, Ex::Entry(r, o), Ex::Const(c)) => {
                         return AV {
-                            ex: Ex::Entry(r, o.wrapping_sub(c as i64)),
+                            ex: Ex::Entry(r, norm(o.wrapping_sub(c as i64))),
+                            taint,
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // 32-bit arithmetic on a register's low half.
+                match (op, x.ex, y.ex) {
+                    (BinOp::Add, Ex::Low(r, o), Ex::Const(c))
+                    | (BinOp::Add, Ex::Const(c), Ex::Low(r, o)) => {
+                        return AV {
+                            ex: Ex::Low(r, o.wrapping_add(c as u32 as i32 as i64) as i32 as i64),
+                            taint,
+                        }
+                    }
+                    (BinOp::Sub, Ex::Low(r, o), Ex::Const(c)) => {
+                        return AV {
+                            ex: Ex::Low(r, o.wrapping_sub(c as u32 as i32 as i64) as i32 as i64),
                             taint,
                         }
                     }
@@ -699,6 +815,27 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
                     }
                     match st.slots.get(&at) {
                         Some(&(m, v)) if m == n && n == 8 => v,
+                        // A 32-bit reload of a register's value.
+                        Some(&(4, v)) if n == 4 => match (v.ex, ty) {
+                            (Ex::Entry(r, o) | Ex::Low(r, o), Ty::I32) => AV {
+                                ex: Ex::Low(r, o as i32 as i64),
+                                taint: v.taint,
+                            },
+                            (Ex::Entry(r, o) | Ex::Low(r, o), _)
+                                if !signed && crate::arch::compat() =>
+                            {
+                                AV {
+                                    ex: Ex::Entry(r, o as i32 as i64),
+                                    taint: v.taint,
+                                }
+                            }
+                            (Ex::RetAddr, _) if crate::arch::compat() && !signed => v,
+                            (Ex::Const(c), _) => {
+                                let x = if signed { c as u32 as i32 as i64 as u64 } else { c & 0xffff_ffff };
+                                AV::konst(x & ty.mask())
+                            }
+                            _ => AV::top(v.taint),
+                        },
                         // A narrower reload is the stored value's low bytes,
                         // extended: not the entry value it came from.
                         Some(&(m, v)) if m == n => match v.ex {
@@ -722,6 +859,32 @@ fn eval(e: &Expr, vals: &HashMap<Value, AV>, st: &mut St, acc: &mut Acc) -> AV {
                     }
                     AV::top(RegSet::EMPTY)
                 }
+            }
+        }
+        Expr::Wrap(a) => {
+            let x = get(a);
+            match x.ex {
+                Ex::Entry(r, o) => AV {
+                    ex: Ex::Low(r, o as i32 as i64),
+                    taint: x.taint,
+                },
+                // i386: the return address is a 32-bit value already.
+                Ex::RetAddr if crate::arch::compat() => x,
+                Ex::Const(c) => AV::konst(c & 0xffff_ffff),
+                _ => AV::top(x.taint),
+            }
+        }
+        Expr::Extend { a, signed: false } => {
+            let x = get(a);
+            match x.ex {
+                // i386 registers are zero-extended 32-bit values.
+                Ex::Low(r, o) if crate::arch::compat() => AV {
+                    ex: Ex::Entry(r, o),
+                    taint: x.taint,
+                },
+                Ex::RetAddr if crate::arch::compat() => x,
+                Ex::Const(c) => AV::konst(c & 0xffff_ffff),
+                _ => AV::top(x.taint),
             }
         }
         Expr::VLoad { addr, .. } => {
@@ -818,6 +981,7 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
     let sp = st.regs[SP];
     match sp.sp_off() {
         Some(o) => st.kill(i64::MIN, o),
+        None if st.trust_frame => {}
         None => st.slots.clear(),
     }
     match sp.sp_off() {
@@ -850,7 +1014,7 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
             }
         }
     }
-    if st.escaped {
+    if st.escaped && !st.trust_frame {
         st.slots.clear();
     }
     acc.may_unwind |= s.may_unwind;
@@ -937,9 +1101,23 @@ fn analyze_fn(f: &Function, ctx: &Ctx) -> Summary {
 /// are those of `f`, which [`gex_ir::ssa::to_ssa`] keeps for every
 /// statement it does not remove.
 pub fn known_values(f: &Function, sums: Option<&Summaries>) -> HashMap<Value, u64> {
+    known_values_mode(f, sums, false)
+}
+
+/// [`known_values`] assuming no code writes this function's frame through
+/// a pointer to it that escaped: what the compiler assumes of a slot it
+/// spilled a value to and never takes the address of. Not sound (a callee
+/// handed `&local` could write past it), so a result relying on it must be
+/// marked best effort: the jump-table resolver makes such a table partial.
+pub fn known_values_trusting_frame(f: &Function, sums: Option<&Summaries>) -> HashMap<Value, u64> {
+    known_values_mode(f, sums, true)
+}
+
+fn known_values_mode(f: &Function, sums: Option<&Summaries>, trust_frame: bool) -> HashMap<Value, u64> {
     let empty = HashMap::new();
     let ctx = Ctx {
         sums: sums.map_or(&empty, |s| &s.map),
+        trust_frame,
     };
     let mut rec: Vec<HashMap<Value, AV>> = vec![HashMap::new(); f.blocks.len()];
     analyze_fn_rec(f, &ctx, Some(&mut rec));
@@ -961,7 +1139,10 @@ pub fn known_values(f: &Function, sums: Option<&Summaries>) -> HashMap<Value, u6
 /// table has the same shape, so this is a description, not a verdict: the
 /// jumps stay [`FTerm::Unresolved`].
 pub fn frame_torn_down(f: &Function, sums: &Summaries) -> Vec<u64> {
-    let ctx = Ctx { sums: &sums.map };
+    let ctx = Ctx {
+        sums: &sums.map,
+        trust_frame: false,
+    };
     let mut acc_out = Vec::new();
     analyze_fn_full(f, &ctx, None, Some(&mut acc_out));
     acc_out
@@ -1002,7 +1183,10 @@ fn analyze_fn_full(
         order[b.index()] = i;
     }
     let mut state_in: Vec<Option<St>> = vec![None; n];
-    state_in[0] = Some(St::entry());
+    state_in[0] = Some(St {
+        trust_frame: ctx.trust_frame,
+        ..St::entry()
+    });
     // Worklist by RPO position, so loops settle before what follows them.
     let mut work: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     work.insert(order[0]);
@@ -1017,6 +1201,7 @@ fn analyze_fn_full(
             }
             any.slots.clear();
             any.escaped = true;
+            any.trust_frame = ctx.trust_frame;
             state_in[e.index()] = Some(any);
             if order[e.index()] != usize::MAX {
                 work.insert(order[e.index()]);
@@ -1134,7 +1319,7 @@ fn analyze_fn_full(
             FTerm::Unresolved { target } => {
                 acc.torn_down[bi] = st.regs[SP].sp_off() == Some(0)
                     && if gex_abi::X86 {
-                        st.slots.get(&0).is_some_and(|&(n, v)| n == 8 && v.ex == Ex::RetAddr)
+                        st.slots.get(&0).is_some_and(|&(n, v)| n == crate::arch::ptr_bytes() && v.ex == Ex::RetAddr)
                     } else {
                         st.regs[30].ex == Ex::Entry(30, 0)
                     };
@@ -1379,7 +1564,13 @@ pub fn analyze_functions(functions: &BTreeMap<u64, Function>) -> Summaries {
             iters += 1;
             let mut changed = false;
             for &a in &comp {
-                let s = analyze_fn(&functions[&a], &Ctx { sums: &map });
+                let s = analyze_fn(
+                    &functions[&a],
+                    &Ctx {
+                        sums: &map,
+                        trust_frame: false,
+                    },
+                );
                 if map.get(&a) != Some(&s) {
                     map.insert(a, s);
                     changed = true;
@@ -1390,6 +1581,7 @@ pub fn analyze_functions(functions: &BTreeMap<u64, Function>) -> Summaries {
             }
             if iters >= MAX_ITERATIONS {
                 stats.unconverged += 1;
+                stats.unconverged_members.extend(comp.iter().copied());
                 for &a in &comp {
                     map.insert(a, Summary::unknown());
                 }
