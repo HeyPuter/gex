@@ -19,13 +19,14 @@
 //! A replacement is ordinary wasm32 code (clang, or any producer) that
 //! imports the guest's memory as `env.memory`. Because a guest address *is* a
 //! linear-memory offset, a guest pointer is a C pointer to it: no translation.
-//! Its own data and stacks need somewhere the guest will never map, and
-//! `[STACK_TOP, MMAP_BOTTOM)` is that: `gex_kernel::mem::hits_runtime` keeps
-//! guest mappings out of it (the browser shim keeps its own stack and data
-//! there; natively it is otherwise unused). The first [`REPL_DATA_BYTES`] hold
-//! the module's data and heap (link it with `--global-base=` [`REPL_BASE`]);
-//! the rest is one [`REPL_STACK_BYTES`] stack per guest thread, by context
-//! slot. The region is recorded as a mapping so `fork` copies it.
+//! Its own data and stacks need somewhere nothing else uses, natively *and* in
+//! the browser (where the shim keeps its stack and data in
+//! `[STACK_TOP, MMAP_BOTTOM)`). Above [`gex_abi::MMAP_TOP`] is that: the guest
+//! is never given an address there and the browser's arena never claims one.
+//! The first [`REPL_DATA_BYTES`] of [`REPL_BASE`] hold the module's data and
+//! heap (link it with `--global-base=` [`REPL_BASE`]); after them come
+//! [`REPL_THREADS`] stacks of [`REPL_STACK_BYTES`], one per guest thread by
+//! context slot. The region is recorded as a mapping so `fork` copies it.
 
 use super::{read_u64, write_u64, HostState};
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,13 +39,16 @@ use wasmtime::{Caller, Engine, ExternType, Func, Linker, Module, Mutability, Val
 
 /// Where replacement modules' data begins: link them with this as
 /// `--global-base`.
-pub const REPL_BASE: u64 = gex_abi::STACK_TOP;
+pub const REPL_BASE: u64 = 0xF000_0000;
 /// Bytes for a replacement module's data and heap.
 pub const REPL_DATA_BYTES: u64 = 8 << 20;
-/// End of the whole replacement region.
-pub const REPL_END: u64 = gex_abi::MMAP_BOTTOM;
 /// One guest thread's stack for replacement code.
 pub const REPL_STACK_BYTES: u64 = 128 << 10;
+/// How many guest threads can run replacement code.
+pub const REPL_THREADS: u64 = 64;
+/// End of the whole replacement region.
+pub const REPL_END: u64 = REPL_BASE + REPL_DATA_BYTES + REPL_THREADS * REPL_STACK_BYTES;
+const _: () = assert!(REPL_BASE >= gex_abi::MMAP_TOP && REPL_END <= gex_abi::GUEST_MEM_BYTES);
 
 /// How a replacement takes its arguments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,6 +91,9 @@ pub struct Replacement {
     pub addr: u64,
     /// How many times it ran, over every thread and process of the run.
     pub calls: Arc<std::sync::atomic::AtomicU64>,
+    /// A function of a replaced library the module does not provide: calling
+    /// it stops the run, naming it (pewasm's aborting placeholder).
+    pub missing: bool,
 }
 
 /// What an ejected project gives the runtime. See the module comment.
@@ -105,6 +112,12 @@ pub struct Aot {
     pub replacements: Vec<Replacement>,
     /// The project, for messages.
     pub label: String,
+    /// The system calls the program may make, by canonical number (as the
+    /// session manifest counts them). Any other stops the run, naming it.
+    /// `None` allows everything.
+    pub syscalls: Option<std::collections::HashSet<u64>>,
+    /// The recorded session never forked: a fork stops the run.
+    pub single_process: bool,
     /// Replacement modules compiled for an engine. An `execve` builds a new
     /// engine, and a module belongs to the engine that compiled it.
     compiled: Mutex<Vec<(Engine, Arc<Vec<Module>>)>>,
@@ -118,6 +131,8 @@ impl std::fmt::Debug for Aot {
             .field("modules", &self.modules)
             .field("replacements", &self.replacements)
             .field("label", &self.label)
+            .field("syscalls", &self.syscalls.as_ref().map(|s| s.len()))
+            .field("single_process", &self.single_process)
             .finish()
     }
 }
@@ -331,16 +346,38 @@ const FP_ARGS: u8 = 8;
 /// report. Everything wrong is an error: a replacement that half-works is the
 /// silent misbehaviour this exists to avoid.
 pub fn check_replacement(wasm: &[u8], name: &str, abi: Abi) -> Result<String> {
+    ReplacementModule::inspect(wasm)?.check(name, abi)
+}
+
+/// A replacement module, checked once: that it can run here, and what it
+/// exports. [`ReplacementModule::check`] then checks each export a build
+/// binds, without compiling the module again for each.
+pub struct ReplacementModule {
+    module: Module,
+}
+
+impl ReplacementModule {
+    pub fn inspect(wasm: &[u8]) -> Result<ReplacementModule> {
+        Self::inspect_for(wasm, true)
+    }
+
+    /// As [`Self::inspect`], for a host whose guest memory is `shared` or
+    /// not: the browser's single-Worker shim has a plain one, and a module
+    /// importing a shared memory will not link to it (nor the reverse).
+    pub fn inspect_for(wasm: &[u8], shared: bool) -> Result<ReplacementModule> {
     let engine = Engine::new(&engine_config()).context("creating a wasm engine")?;
     let module = Module::new(&engine, wasm).context("not a valid wasm module for this runtime")?;
     let mut imports_memory = false;
     for imp in module.imports() {
         match (imp.module(), imp.name(), imp.ty()) {
             ("env", "memory", ExternType::Memory(m)) => {
-                if !m.is_shared() {
+                if m.is_shared() != shared {
                     bail!(
-                        "it imports env.memory unshared; gex's guest memory is shared \
-                         (link with --shared-memory and compile with -matomics -mbulk-memory)"
+                        "it imports env.memory {}, and this host's guest memory is {} (the \
+                         native runtime's is shared: link with --shared-memory; the browser's \
+                         single-Worker shim's is not: link without it)",
+                        if m.is_shared() { "shared" } else { "unshared" },
+                        if shared { "shared" } else { "not" }
                     );
                 }
                 if m.maximum().unwrap_or(0) < gex_abi::GUEST_MEM_PAGES {
@@ -375,6 +412,17 @@ pub fn check_replacement(wasm: &[u8], name: &str, abi: Abi) -> Result<String> {
             ),
         }
     }
+        Ok(ReplacementModule { module })
+    }
+
+    /// Whether the module exports a function called `name`.
+    pub fn has(&self, name: &str) -> bool {
+        self.module.exports().any(|e| e.name() == name && matches!(e.ty(), ExternType::Func(_)))
+    }
+
+    /// Check that `name` is an export `abi` can call; its signature.
+    pub fn check(&self, name: &str, abi: Abi) -> Result<String> {
+    let module = &self.module;
     let ty = module
         .exports()
         .find(|e| e.name() == name)
@@ -429,6 +477,7 @@ pub fn check_replacement(wasm: &[u8], name: &str, abi: Abi) -> Result<String> {
         }
     }
     Ok(sig)
+    }
 }
 
 /// The engine features translated code and replacements both need.
@@ -443,7 +492,8 @@ fn engine_config() -> wasmtime::Config {
 
 /// Replacement instances in one store (one guest thread).
 pub(crate) struct StoreRepl {
-    funcs: Vec<Func>,
+    /// By replacement id; `None` for a missing one.
+    funcs: Vec<Option<Func>>,
 }
 
 /// The stack top for replacement code on the thread whose context is at
@@ -451,14 +501,10 @@ pub(crate) struct StoreRepl {
 fn stack_top(ctx_addr: u64) -> Result<u64> {
     let stride = (ctx::SIZE as u64 + 63) & !63;
     let slot = ctx_addr.saturating_sub(gex_abi::RESERVED_BASE) / stride;
-    let top = REPL_END - slot * REPL_STACK_BYTES;
-    if top < REPL_BASE + REPL_DATA_BYTES + REPL_STACK_BYTES {
-        bail!(
-            "guest thread slot {slot} has no replacement stack: the region holds {} threads",
-            (REPL_END - REPL_BASE - REPL_DATA_BYTES) / REPL_STACK_BYTES
-        );
+    if slot >= REPL_THREADS {
+        bail!("guest thread slot {slot} has no replacement stack: the region holds {REPL_THREADS} threads");
     }
-    Ok(top)
+    Ok(REPL_BASE + REPL_DATA_BYTES + (slot + 1) * REPL_STACK_BYTES)
 }
 
 /// Instantiate the project's replacement modules in this store.
@@ -486,10 +532,14 @@ fn instantiate(caller: &mut Caller<'_, HostState>, aot: &Aot) -> Result<StoreRep
     }
     let mut funcs = Vec::new();
     for r in &aot.replacements {
+        if r.missing {
+            funcs.push(None);
+            continue;
+        }
         let f = instances[r.module]
             .get_func(&mut *caller, &r.export)
             .ok_or_else(|| anyhow!("{} exports no `{}`", aot.modules[r.module].display(), r.export))?;
-        funcs.push(f);
+        funcs.push(Some(f));
     }
     Ok(StoreRepl { funcs })
 }
@@ -510,11 +560,25 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
         .get(id as usize)
         .ok_or_else(|| anyhow!("replacement #{id} at {pc:#x} is not in {}", aot.label))?;
     r.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if r.missing {
+        caller.data_mut().exit = Some(super::Exit::Signal {
+            signal: super::signal::SIGSEGV,
+            pc,
+            detail: format!(
+                "gex-eject: {} (at {pc:#x}) belongs to a library {} replaced, and the \
+                 replacement module has no `{}`: add it and rebuild",
+                r.symbol, aot.label, r.export
+            ),
+            internal: true,
+        });
+        return Err(super::StopExecution.into());
+    }
     if caller.data().repl.is_none() {
         let s = instantiate(caller, &aot)?;
         caller.data_mut().repl = Some(s);
     }
-    let func = caller.data().repl.as_ref().unwrap().funcs[id as usize];
+    let func = caller.data().repl.as_ref().unwrap().funcs[id as usize]
+        .ok_or_else(|| anyhow!("internal: replacement #{id} has no function"))?;
     let memory = caller
         .data()
         .memory
@@ -577,6 +641,45 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
         }
     }
     Ok(())
+}
+
+/// The system-call allow-list: `Some` when the call about to be made is not
+/// on it, having stopped the run.
+pub(crate) fn check_syscall(caller: &mut Caller<'_, HostState>, pc: u64) -> Option<Result<()>> {
+    let aot = caller.data().spawn.as_ref().and_then(|s| s.opts.aot.clone())?;
+    let allowed = aot.syscalls.as_ref()?;
+    let memory = caller.data().memory.clone()?;
+    let ctx_addr = caller.data().thread.ctx_addr as usize;
+    let raw = read_u64(memory.bytes(), ctx_addr + ctx::SYSCALL_NR);
+    let nr = if gex_abi::X86 { gex_kernel::x86::canonical_number(raw) } else { raw };
+    if allowed.contains(&nr) {
+        return None;
+    }
+    super::profile::use_kernel_syscall_names();
+    caller.data_mut().exit = Some(super::Exit::Signal {
+        signal: super::signal::SIGSYS,
+        pc,
+        detail: format!(
+            "gex-eject: system call {} ({nr}) was never made by the session {} was ejected \
+             from, and its runtime allows only those. Record a session that makes it, or add \
+             it to \"allow_syscalls\" in user/eject.json",
+            gex_xlate::profile::syscall_name(nr),
+            aot.label
+        ),
+        internal: true,
+    });
+    Some(Err(super::StopExecution.into()))
+}
+
+/// The guest's own system-call numbers that stand for the canonical ones in
+/// `allowed`: what a host that sees raw numbers (the browser's) checks.
+pub fn raw_syscalls(allowed: &std::collections::HashSet<u64>) -> Vec<u64> {
+    if !gex_abi::X86 {
+        let mut v: Vec<u64> = allowed.iter().copied().collect();
+        v.sort_unstable();
+        return v;
+    }
+    (0..1024u64).filter(|raw| allowed.contains(&gex_kernel::x86::canonical_number(*raw))).collect()
 }
 
 /// Why a dispatch miss happened, when an ejected project without a JIT

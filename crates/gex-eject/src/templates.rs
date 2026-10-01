@@ -15,7 +15,8 @@ pub fn build_sh() -> String {
 #   2. runtime/gexc eject build: translate the program's objects into
 #      build/modules, check every replacement in user/eject.json against the
 #      objects' hashes and symbols, and assemble build/rootfs (rootfs/ plus
-#      user/files/).
+#      user/files/), and with a browser runtime (runtime/web), the web build
+#      in build/web for run.mjs and index.html.
 #
 # Environment: CLANG (default clang), USER_CFLAGS, USER_LDFLAGS.
 set -eu
@@ -24,16 +25,25 @@ mkdir -p "$HERE/build"
 set -- "$HERE"/user/src/*.c
 if [ -e "$1" ]; then
     # Replacement code shares the guest's memory: its data and heap go at
-    # {base:#x} (the runtime's region the guest never maps; {data} MiB), and
-    # the runtime gives each guest thread its own stack there.
+    # {base:#x} (above everything the guest and the runtime use; {data} MiB),
+    # and the runtime gives each guest thread its own stack after them.
     ${{CLANG:-clang}} --target=wasm32 -O2 -nostdlib -ffreestanding -fvisibility=default -matomics -mbulk-memory \
         -I"$HERE/gen" ${{USER_CFLAGS:-}} \
         -Wl,--no-entry -Wl,--export-dynamic -Wl,--import-memory -Wl,--shared-memory \
         -Wl,--max-memory={max} -Wl,--global-base={base} \
         -Wl,--export=__stack_pointer -Wl,--export=__heap_base ${{USER_LDFLAGS:-}} \
         -o "$HERE/build/user.wasm" "$@"
+    # And for the browser's single-Worker shim, whose memory is not shared.
+    if [ -e "$HERE/runtime/web/gex_browser.wasm" ]; then
+        ${{CLANG:-clang}} --target=wasm32 -O2 -nostdlib -ffreestanding -fvisibility=default -mbulk-memory \
+            -I"$HERE/gen" ${{USER_CFLAGS:-}} \
+            -Wl,--no-entry -Wl,--export-dynamic -Wl,--import-memory \
+            -Wl,--max-memory={max} -Wl,--global-base={base} \
+            -Wl,--export=__stack_pointer -Wl,--export=__heap_base ${{USER_LDFLAGS:-}} \
+            -o "$HERE/build/user.web.wasm" "$@"
+    fi
 else
-    rm -f "$HERE/build/user.wasm"
+    rm -f "$HERE/build/user.wasm" "$HERE/build/user.web.wasm"
 fi
 exec "$HERE/runtime/gexc" eject build "$HERE"
 "#,

@@ -223,6 +223,32 @@ fn query_system(c: &mut Call<'_>, class: u32, buf: u64, len: u64, ret: u64) -> R
             c.g.wptr(buf, if c.p.abi == Abi::P64 { 0xffff_8000_0000_0000 } else { 0x8000_0000 })?;
             ps
         }
+        // SystemInterruptInformation: per processor, six counters. Wine
+        // returns random bytes (programs use them as entropy); these are
+        // pseudorandom and deterministic, as gex's /dev/random is.
+        23 => {
+            let size = 24 * PROCESSORS as u64;
+            need(len, size)?;
+            let mut x: u64 = 0x2545_f491_4f6c_dd1d ^ c.p.clocks.filetime();
+            for i in 0..size / 8 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                c.g.w64(buf + 8 * i, x)?;
+            }
+            size
+        }
+        // SystemCurrentTimeZoneInformation: RTL_TIME_ZONE_INFORMATION, the
+        // first 172 bytes of class 102's answer (UTC).
+        44 => {
+            let size = 172u64;
+            need(len, size)?;
+            c.g.zero(buf, size as usize)?;
+            let name = to_w("Coordinated Universal Time");
+            c.g.write_wchars(buf + 4, &name)?;
+            c.g.write_wchars(buf + 88, &name)?;
+            size
+        }
         // SystemDynamicTimeZoneInformation: UTC, gex's only time zone
         // (RTL_DYNAMIC_TIME_ZONE_INFORMATION: bias, standard name[32] and
         // date and bias, daylight name[32] and date and bias, key name[128],
@@ -246,6 +272,15 @@ fn query_system(c: &mut Call<'_>, class: u32, buf: u64, len: u64, ret: u64) -> R
             }
             s.len() as u64 - 1
         }
+        // SystemLogicalProcessorInformation
+        73 => {
+            let n = logical_processor_info(c, buf, len);
+            if n.is_err() {
+                let size = off!(c.p.abi, system_logical_processor_information::SIZEOF) * topology().len() as u64;
+                c.g.out32(ret, size as u32)?;
+            }
+            n?
+        }
         // SystemKernelDebuggerInformation: no debugger.
         35 => {
             need(len, 2)?;
@@ -259,11 +294,136 @@ fn query_system(c: &mut Call<'_>, class: u32, buf: u64, len: u64, ret: u64) -> R
     })
 }
 
+/// The processor topology gex reports: [`PROCESSORS`] cores of one thread
+/// each in one package, one NUMA node and one group, each core with a
+/// 32 KiB L1 data and instruction cache and a 256 KiB L2, and a shared 4 MiB
+/// L3 (the caches `cpuid` leaf 4 describes, with the L1i and L3 filled in).
+/// `(relationship, mask, cache (level, assoc, line, size, type))`.
+fn topology() -> Vec<(u32, u64, Option<(u8, u8, u16, u32, u32)>)> {
+    const CORE: u32 = 0;
+    const NUMA: u32 = 1;
+    const CACHE: u32 = 2;
+    const PACKAGE: u32 = 3;
+    let all = (1u64 << PROCESSORS) - 1;
+    let mut v = Vec::new();
+    for i in 0..PROCESSORS {
+        let m = 1u64 << i;
+        v.push((CORE, m, None));
+        v.push((CACHE, m, Some((1, 8, 64, 32 << 10, 2)))); // L1 data
+        v.push((CACHE, m, Some((1, 8, 64, 32 << 10, 1)))); // L1 instruction
+        v.push((CACHE, m, Some((2, 8, 64, 256 << 10, 0)))); // L2 unified
+    }
+    v.push((CACHE, all, Some((3, 16, 64, 4 << 20, 0))));
+    v.push((PACKAGE, all, None));
+    v.push((NUMA, all, None));
+    v
+}
+
+/// `SystemLogicalProcessorInformation`: SYSTEM_LOGICAL_PROCESSOR_INFORMATION[].
+fn logical_processor_info(c: &mut Call<'_>, buf: u64, len: u64) -> R<u64> {
+    let abi = c.p.abi;
+    let size = off!(abi, system_logical_processor_information::SIZEOF);
+    let recs = topology();
+    let need = size * recs.len() as u64;
+    if len < need {
+        return Err(Status(st::INFO_LENGTH_MISMATCH));
+    }
+    for (i, (rel, mask, cache)) in recs.iter().enumerate() {
+        let at = buf + i as u64 * size;
+        c.g.zero(at, size as usize)?;
+        c.g.wptr(at, *mask)?;
+        c.g.w32(at + off!(abi, system_logical_processor_information::RELATIONSHIP), *rel)?;
+        let u = at + off!(abi, system_logical_processor_information::PROCESSORCORE);
+        if let Some((level, assoc, line, sz, ty)) = cache {
+            c.g.w8(u, *level)?;
+            c.g.w8(u + 1, *assoc)?;
+            c.g.w16(u + 2, *line)?;
+            c.g.w32(u + 4, *sz)?;
+            c.g.w32(u + 8, *ty)?;
+        }
+    }
+    Ok(need)
+}
+
+/// `SystemLogicalProcessorInformationEx` for `filter` (a relationship, or
+/// 0xffff for all).
+fn logical_processor_info_ex(c: &mut Call<'_>, filter: u32, buf: u64, len: u64, ret: u64) -> R<u64> {
+    let abi = c.p.abi;
+    let base = off!(abi, system_logical_processor_information_ex::PROCESSOR);
+    let mut recs: Vec<(u32, u64, Option<(u8, u8, u16, u32, u32)>)> = topology();
+    recs.push((4, (1u64 << PROCESSORS) - 1, None)); // RelationGroup
+    let recs: Vec<_> = recs.into_iter().filter(|r| filter == 0xffff || r.0 == filter).collect();
+    let size_of = |rel: u32| -> u64 {
+        base + match rel {
+            0 | 3 => off!(abi, processor_relationship::SIZEOF),
+            1 => off!(abi, numa_node_relationship::SIZEOF),
+            2 => off!(abi, cache_relationship::SIZEOF),
+            _ => off!(abi, group_relationship::SIZEOF),
+        }
+    };
+    let need: u64 = recs.iter().map(|r| size_of(r.0)).sum();
+    c.g.out32(ret, need as u32)?;
+    if len < need {
+        return Err(Status(st::INFO_LENGTH_MISMATCH));
+    }
+    let mut at = buf;
+    for (rel, mask, cache) in &recs {
+        let size = size_of(*rel);
+        c.g.zero(at, size as usize)?;
+        c.g.w32(at, *rel)?;
+        c.g.w32(at + 4, size as u32)?;
+        let u = at + base;
+        let affinity = |c: &mut Call<'_>, ga: u64| -> R<()> { c.g.wptr(ga + off!(abi, group_affinity::MASK), *mask) };
+        match rel {
+            0 | 3 => {
+                c.g.w16(u + off!(abi, processor_relationship::GROUPCOUNT), 1)?;
+                affinity(c, u + off!(abi, processor_relationship::GROUPMASK))?;
+            }
+            1 => {
+                c.g.w16(u + off!(abi, numa_node_relationship::GROUPCOUNT), 1)?;
+                affinity(c, u + off!(abi, numa_node_relationship::GROUPMASK))?;
+            }
+            2 => {
+                let (level, assoc, line, sz, ty) = cache.unwrap();
+                c.g.w8(u + off!(abi, cache_relationship::LEVEL), level)?;
+                c.g.w8(u + off!(abi, cache_relationship::ASSOCIATIVITY), assoc)?;
+                c.g.w16(u + off!(abi, cache_relationship::LINESIZE), line)?;
+                c.g.w32(u + off!(abi, cache_relationship::CACHESIZE), sz)?;
+                c.g.w32(u + off!(abi, cache_relationship::TYPE), ty)?;
+                c.g.w16(u + off!(abi, cache_relationship::GROUPCOUNT), 1)?;
+                affinity(c, u + off!(abi, cache_relationship::GROUPMASK))?;
+            }
+            _ => {
+                c.g.w16(u + off!(abi, group_relationship::MAXIMUMGROUPCOUNT), 1)?;
+                c.g.w16(u + off!(abi, group_relationship::ACTIVEGROUPCOUNT), 1)?;
+                let gi = u + off!(abi, group_relationship::GROUPINFO);
+                c.g.w8(gi + off!(abi, processor_group_info::MAXIMUMPROCESSORCOUNT), PROCESSORS as u8)?;
+                c.g.w8(gi + off!(abi, processor_group_info::ACTIVEPROCESSORCOUNT), PROCESSORS as u8)?;
+                c.g.wptr(gi + off!(abi, processor_group_info::ACTIVEPROCESSORMASK), *mask)?;
+            }
+        }
+        at += size;
+    }
+    Ok(need)
+}
+
 /// `NtQuerySystemInformationEx(class, query, query_len, buffer, len,
 /// *ret_len)`.
 pub fn nt_query_system_information_ex(c: &mut Call<'_>) -> R {
-    let (class, _q, _ql, _buf, _len, _ret) = (c.a32(0), c.a(1), c.a32(2), c.a(3), c.a32(4), c.a(5));
-    Err(c.unimplemented(&format!("NtQuerySystemInformationEx class {class}")))
+    let (class, q, ql, buf, len, ret) = (c.a32(0), c.a(1), c.a32(2), c.a(3), c.a32(4) as u64, c.a(5));
+    match class {
+        // SystemLogicalProcessorInformationEx: the query is the
+        // LOGICAL_PROCESSOR_RELATIONSHIP wanted.
+        107 => {
+            if ql < 4 {
+                return Err(Status(st::INVALID_PARAMETER));
+            }
+            let filter = c.g.u32(q)?;
+            logical_processor_info_ex(c, filter, buf, len, ret)?;
+            Ok(st::SUCCESS)
+        }
+        _ => Err(c.unimplemented(&format!("NtQuerySystemInformationEx class {class}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +497,29 @@ pub fn map_readonly_copy(c: &mut Call<'_>, data: &[u8], name: &str) -> R<u64> {
     c.g.write(base, data)?;
     vm::after_change(c, base, base + size, &[])?;
     Ok(base)
+}
+
+/// A committed read-write private region from the NT allocator, for memory
+/// win32u hands the program (GDI's shared table, DC_ATTRs, bitmap bits).
+pub fn alloc_private(c: &mut Call<'_>, size: u64, name: &str) -> R<u64> {
+    use super::vm::{self, page_prot, Kind};
+    let size = (size.max(1) + vm::PAGE - 1) & !(vm::PAGE - 1);
+    let limit = if c.p.abi == super::Abi::P32 { 0x8000_0000 } else { vm::ALLOC_HIGH };
+    let base = {
+        let mut stl = c.p.st.lock().unwrap();
+        let b = stl.vm.find_free((size + vm::GRANULE - 1) & !(vm::GRANULE - 1), false, limit)
+            .ok_or(Status(st::NO_MEMORY))?;
+        stl.vm.reserve(b, size, page_prot::READWRITE, true, Kind::Private, name);
+        b
+    };
+    vm::after_change(c, base, base + size, &[(base, base + size)])?;
+    Ok(base)
+}
+
+/// Release a region from `alloc_private`.
+pub fn free_private(c: &mut Call<'_>, base: u64) -> R<()> {
+    let r = c.p.st.lock().unwrap().vm.remove(base).ok_or(Status(st::MEMORY_NOT_ALLOCATED))?;
+    super::vm::after_change(c, r.base, r.end(), &[])
 }
 
 /// `NtInitializeNlsFiles(*ptr, *lcid, *size)`: `locale.nls`.
@@ -557,7 +740,7 @@ pub fn nt_add_atom(c: &mut Call<'_>) -> R {
         None => {
             let key = lower(&name);
             let mut t = c.p.atoms.lock().unwrap();
-            match t.names.iter_mut().position(|(n, _)| lower(n) == key) {
+            match t.names.iter_mut().position(|(n, u)| *u > 0 && lower(n) == key) {
                 Some(i) => {
                     t.names[i].1 += 1;
                     MAXINTATOM + i as u32
@@ -575,6 +758,27 @@ pub fn nt_add_atom(c: &mut Call<'_>) -> R {
     Ok(st::SUCCESS)
 }
 
+/// `NtDeleteAtom(atom)`: drop a reference; the last one frees the name.
+pub fn nt_delete_atom(c: &mut Call<'_>) -> R {
+    let atom = c.a32(0) & 0xffff;
+    if atom < MAXINTATOM {
+        return Ok(st::SUCCESS);
+    }
+    let mut t = c.p.atoms.lock().unwrap();
+    match t.names.get_mut((atom - MAXINTATOM) as usize) {
+        Some(e) if e.1 > 0 => {
+            e.1 -= 1;
+            if e.1 == 0 {
+                // The slot stays (atoms are indices); an empty name matches
+                // nothing.
+                e.0.clear();
+            }
+            Ok(st::SUCCESS)
+        }
+        _ => Err(Status(st::INVALID_HANDLE)),
+    }
+}
+
 /// `NtFindAtom(name, len, *atom)`.
 pub fn nt_find_atom(c: &mut Call<'_>) -> R {
     let (np, len, ap) = (c.a(0), c.a32(1) as u64, c.a(2));
@@ -584,7 +788,7 @@ pub fn nt_find_atom(c: &mut Call<'_>) -> R {
         None => {
             let key = lower(&name);
             let t = c.p.atoms.lock().unwrap();
-            let i = t.names.iter().position(|(n, _)| lower(n) == key).ok_or(Status(st::OBJECT_NAME_NOT_FOUND))?;
+            let i = t.names.iter().position(|(n, u)| *u > 0 && lower(n) == key).ok_or(Status(st::OBJECT_NAME_NOT_FOUND))?;
             MAXINTATOM + i as u32
         }
     };

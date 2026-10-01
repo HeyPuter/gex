@@ -170,6 +170,7 @@ fn eject_build_run_and_replace() {
     let opts = eject::EjectOptions {
         runtime: std::env::current_exe().unwrap(),
         runtime_build: None,
+        web_shim: None,
     };
     let (p, p2) = (tmp.join("p"), tmp.join("p2"));
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
@@ -178,6 +179,18 @@ fn eject_build_run_and_replace() {
 
     build::build(&p).unwrap();
     let flags = run::RunFlags::default();
+    // The session made no system calls, so the ejected runtime allows none:
+    // its exit_group is refused, by name.
+    match run::run(&p, &flags).unwrap() {
+        Exit::Signal { signal: 31, detail, internal: true, .. } => assert!(detail.contains("exit_group"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+    // As the real session would have it.
+    let mut session = session;
+    session.syscalls.insert(94, 1); // exit_group, canonical
+    std::fs::write(tmp.join("rec/session.json"), session.to_json()).unwrap();
+    eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
+    build::build(&p).unwrap();
     assert_eq!(run::run(&p, &flags).unwrap(), Exit::Status(38));
 
     // Replace `f` with wasm that adds.
@@ -193,6 +206,28 @@ fn eject_build_run_and_replace() {
     assert_eq!(r.replacements.len(), 1);
     assert_eq!(r.replacements[0].addr, BASE + CODE + program().1);
     assert_eq!(run::run(&p, &flags).unwrap(), Exit::Status(42));
+
+    // The same function by offset, with the hash of its bytes: what
+    // `gexc eject override` prints for a stripped object.
+    let off = BASE + CODE + program().1;
+    let entry = build::describe(&p, "prog", &format!("{off:#x}"), Some(program().0.len() as u64 - program().1))
+        .unwrap()
+        .replace(&format!("\"fn_{off:x}\""), "\"add\"")
+        .replace("\"abi\"", "\"wasm\": \"user/add.wasm\", \"abi\"");
+    std::fs::write(p.join("user/eject.json"), format!("{{\"replace\": [{entry}]}}")).unwrap();
+    let r = build::build(&p).unwrap();
+    assert_eq!((r.replacements[0].kind.as_str(), r.replacements[0].addr), ("offset", off));
+    assert_eq!(run::run(&p, &flags).unwrap(), Exit::Status(42));
+    // A function whose bytes changed is reported, not bound.
+    let hash = entry.split("\"bytes\": \"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    std::fs::write(
+        p.join("user/eject.json"),
+        format!("{{\"replace\": [{}]}}", entry.replace(&hash, "sha256:00")),
+    )
+    .unwrap();
+    let e = format!("{:#}", build::build(&p).unwrap_err());
+    assert!(e.contains("stale") && e.contains(&hash), "{e}");
+    std::fs::write(p.join("user/eject.json"), &config).unwrap();
 
     // A re-eject keeps user/ and drops the build.
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();

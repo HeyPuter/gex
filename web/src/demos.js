@@ -429,9 +429,8 @@ const gears = {
 
   async enter(ctx) {
     const query = new URLSearchParams(location.search);
-    const directWebGpu = query.get('webgpu') === '1' || query.get('gl') === 'mobilegl';
     // The Mesa path: same guest, same wire protocol, but st/mesa and the
-    // gex_wgpu Gallium driver below the decoder instead of MobileGL.
+    // gex_wgpu Gallium driver below the decoder instead of the page's WebGL.
     const mesaWebGpu = query.get('webgpu') === 'mesa' || query.get('gl') === 'mesa';
     const { GlDevice } = await import('./gl.js');
 
@@ -448,13 +447,6 @@ const gears = {
 
     let gl;
     if (mesaWebGpu) {
-      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
-        canvas, mesaBackend(query, 'es', 'wgpu'));
-    } else if (directWebGpu) {
-      // This used to be an unconditional MobileGL construction, so a demo
-      // marked directGl ran the broken backend with nothing said about it.
-      console.warn('[gex] MobileGL was requested and ignored: it is disabled ' +
-                   'with no override. Running Mesa instead.');
       gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
         canvas, mesaBackend(query, 'es', 'wgpu'));
     } else {
@@ -671,13 +663,10 @@ const virglGears = {
         // No compositor in this demo: its GL owns the canvas, so the device
         // stays here whatever a session would do.
         if (usesDirectGl(demo)) {
-          renderer = await createDirectGlDevice(canvas, runOptions.gl ?? demo.gl ?? null);
+          renderer = await createDirectGlDevice(canvas);
         } else {
           const { VirglRenderer } = await import('./virgl.js');
-          const rendererUrl = new URLSearchParams(location.search).get('webgpu')
-            ? '/gex/gexvirgl-webgpu.mjs'
-            : (demo.renderer || '/gex/gexvirgl.mjs');
-          renderer = await VirglRenderer.create(canvas, rendererUrl);
+          renderer = await VirglRenderer.create(canvas, demo.renderer || '/gex/gexvirgl.mjs');
         }
         if (renderer && !renderer.ok) {
           throw new Error(`the renderer would not start: ${renderer.error}`);
@@ -1043,13 +1032,10 @@ const waylandGears = {
         if (glInCompositor) {
           // The runtime starts it once the compositor's worker exists.
         } else if (usesDirectGl(demo)) {
-          renderer = await createDirectGlDevice(canvas, runOptions.gl ?? demo.gl ?? null);
+          renderer = await createDirectGlDevice(canvas);
         } else {
           const { VirglRenderer } = await import('./virgl.js');
-          const rendererUrl = new URLSearchParams(location.search).get('webgpu')
-            ? '/gex/gexvirgl-webgpu.mjs'
-            : (demo.renderer || '/gex/gexvirgl.mjs');
-          renderer = await VirglRenderer.create(canvas, rendererUrl);
+          renderer = await VirglRenderer.create(canvas, demo.renderer || '/gex/gexvirgl.mjs');
         }
         if (renderer && !renderer.ok) {
           throw new Error(`the renderer would not start: ${renderer.error}`);
@@ -1417,21 +1403,10 @@ const stkProfileValue = Number(new URLSearchParams(location.search).get('stkprof
 // profile), while accepting an explicit duration for longer stable samples.
 // Which backend a directGl demo renders through.
 //
-// !!! MobileGL DOES NOT RENDER SuperTuxKart. It is fully broken for this
-// !!! demo -- not partially, not "renders the loading screen". Do not reach
-// !!! for it as a reference, a control, or a differential baseline when
-// !!! debugging the Mesa path: a comparison against it proves nothing, and
-// !!! any conclusion of the form "MobileGL renders X so the bug is
-// !!! Mesa-specific" is unsound. This has been mistakenly relied on before.
-// !!!
-// !!! The ONLY working reference path for STK is virgl (the `virgl` /
-// !!! `wayland` demos, GALLIUM_DRIVER=virpipe -> virglrenderer). If you need
-// !!! to know what a correct frame looks like, or whether the application
-// !!! itself reaches a given state, use virgl -- not MobileGL.
-//
-// `?gl=mesa` selects st/mesa plus the gex_wgpu Gallium driver below the same
-// wire protocol. Mesa is the path under active development and the one that
-// matters.
+// There is one: Mesa (st/mesa) below gex's wire decoder, on the Gallium
+// driver `?glbackend=` picks (see mesaBackend). The reference path for a
+// correct SuperTuxKart frame is virgl -- the `virgl` / `wayland` demos,
+// GALLIUM_DRIVER=virpipe -> virglrenderer -- or `?gl=virgl` on this one.
 /* Whether this demo sends its GL straight to a host backend rather than
  * through virglrenderer.
  *
@@ -1464,24 +1439,8 @@ function usesDirectGl(demo) {
   return !!(demo.directGl || forced);
 }
 
-async function createDirectGlDevice(canvas, backend = null) {
+async function createDirectGlDevice(canvas) {
   const query = new URLSearchParams(location.search);
-  // `backend` is a per-action choice (the SuperTuxKart buttons); the query
-  // string stays the override so an existing harness invocation keeps working
-  // and so a backend can be forced onto a demo that does not offer a button.
-  // `?gl=mobilegl` is no longer an escape hatch on its own -- it also needs
-  // the unlock token, for the reason below.
-  // Always Mesa. MobileGL used to be the fallthrough here, which is how
-  // `?webgpu=1` -- every gl44 probe gate's default -- silently ran the broken
-  // backend and produced results that looked like Mesa's. It is now
-  // unreachable rather than merely non-default, so a stale URL or bookmark
-  // that still asks for it says so and gets Mesa instead of quietly
-  // rendering something whose results mean nothing.
-  const { MobileGlDevice } = await import('./mobilegl.js');
-  if (MobileGlDevice.requested(query) || backend === 'mobilegl') {
-    console.warn('[gex] MobileGL was requested and ignored: it is disabled ' +
-                 'with no override. Running Mesa instead.');
-  }
   const { MesaGlDevice } = await import('./mesa-gl.js');
   // Which Gallium driver Mesa runs on. `virgl` is the default because it is
   // the path that already draws these applications correctly and quickly:
@@ -1506,8 +1465,8 @@ const supertuxkart = {
   title: 'SuperTuxKart on Xwayland',
   blurb:
     'Run the stock AArch64 SuperTuxKart package through gex-wayland and Xwayland, with ' +
-    'its OpenGL calls sent directly to WebGPU in this browser -- through MobileGL, or ' +
-    'through st/mesa and the gex_wgpu Gallium driver.',
+    'its OpenGL calls run by st/mesa in this browser, on the gex_wgpu Gallium driver ' +
+    'or on virglrenderer.',
   network: false,
   // Match STK's framebuffer, Xwayland's advertised output, and the displayed
   // canvas one-for-one instead of rendering tiny and stretching in CSS.
@@ -1528,17 +1487,12 @@ const supertuxkart = {
   client: stkLaunch,
   intro: [
     'SuperTuxKart is running as an AArch64 X11 application inside this page:',
-    'Xwayland -> gex-wayland; OpenGL -> gex-gl -> the chosen backend -> browser WebGPU.',
+    'Xwayland -> gex-wayland; OpenGL -> gex-gl -> Mesa in this page -> WebGL or WebGPU.',
   ],
   hint: 'SuperTuxKart and Xwayland rendering straight to WebGPU',
-  // Mesa is primary because it is the path that is meant to work. The MobileGL
-  // button is kept only so the backend switch stays exercised -- it is KNOWN
-  // BROKEN for this demo and renders nothing. Do not treat it as a fallback,
-  // and do not "verify" a Mesa bug by checking whether MobileGL shows it.
   // For a known-good reference frame, run the virgl/wayland demos instead.
   actions: (start) => {
-    const run = (gl) => start(300, {
-      gl,
+    const run = () => start(300, {
       client: stkLaunch,
       noTimeout: true,
       // Hidden profile runs preserve the application's own logfile after an
@@ -1548,8 +1502,7 @@ const supertuxkart = {
         : '',
     });
     return [
-      { label: 'Run on Mesa', primary: true, onClick: () => run('mesa') },
-      { label: 'Run on MobileGL (broken)', onClick: () => run('mobilegl') },
+      { label: 'Run on Mesa', primary: true, onClick: () => run() },
     ];
   },
   enter: waylandGears.enter,

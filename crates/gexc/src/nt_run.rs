@@ -49,6 +49,9 @@ fn environment(extra: &[String]) -> Vec<(String, String)> {
         ("TEMP", "C:\\users\\gex\\AppData\\Local\\Temp"),
         ("TMP", "C:\\users\\gex\\AppData\\Local\\Temp"),
         ("USERNAME", "gex"),
+        // What Wine's GetUserNameW reads (its loader sets it from the Unix
+        // user); shell32 builds profile paths from it.
+        ("WINEUSERNAME", "gex"),
         ("USERPROFILE", "C:\\users\\gex"),
         ("windir", "C:\\windows"),
     ]

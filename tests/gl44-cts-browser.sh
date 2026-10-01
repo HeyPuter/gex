@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run one pinned Khronos OpenGL 4.4 CTS case through the persistent real-browser
-# MobileGL/WebGPU path. Override GEX_CTS_CASE to grow the proven case set.
+# Mesa/WebGPU path. Override GEX_CTS_CASE to grow the proven case set.
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
@@ -19,9 +19,7 @@ fi
 }
 
 # Which host GL backend executes the guest's stream. `mesa` -- Mesa's frontend
-# on the gex_wgpu Gallium driver -- is the only accepted value. MobileGL used
-# to be the default here; it is disabled everywhere now, so asking for it is an
-# error rather than a silently different conformance answer.
+# on the gex_wgpu Gallium driver -- is the only one there is.
 case ${GEX_CTS_BACKEND:-mesa} in
     mesa)
         BACKEND_QUERY='gl=mesa'

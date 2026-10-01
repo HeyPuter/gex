@@ -55,7 +55,7 @@ fi
 echo "expecting: $EXPECT"
 
 GEX_CC="$GUEST_CC" "$ROOT/guest/gl/build.sh" "$WORK/guest-gl" >/dev/null
-"$GUEST_CC" -O2 -Wall -Wextra -I"$ROOT/third_party/mobilegl-webgpu/include" \
+"$GUEST_CC" -O2 -Wall -Wextra -I"$ROOT/third_party/mesa/include" \
     -o "$WORK/probe" "$SOURCE" "$WORK/guest-gl/libGLESv2.so.2"
 # Refresh the host-side Mesa module too, not just the guest binary.
 #

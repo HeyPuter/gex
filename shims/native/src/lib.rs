@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod lockstep;
 use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::{ctx, exports, imports, GUEST_MEM_PAGES, IMPORT_MODULE};
 use gex_kernel::mem::prot;
@@ -1311,29 +1312,7 @@ fn run_thread_loop(
                 .spawn
                 .clone()
                 .ok_or_else(|| anyhow!("clone with no spawn context"))?;
-            // Detached: a guest thread is joined through its own futex, not
-            // through the host's handle, and `exit_group` ends the process
-            // whatever its threads are doing.
-            cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let running = Arc::clone(&cx.running);
-            std::thread::Builder::new()
-                .name(format!("gex-tid-{}", child.tid))
-                .spawn(move || {
-                    if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
-                        eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                        // A thread that fails takes its process with it, as on
-                        // Linux: otherwise the other threads sit in a futex
-                        // forever and every descriptor it holds stays open.
-                        stop_other_threads(&cx, false);
-                        cx.kernel
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .fds
-                            .close_all();
-                    }
-                    running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                })
-                .context("spawning a guest thread")?;
+            start_guest_thread(cx, child)?;
         }
         if let Some(req) = store.data_mut().pending_exec.take() {
             return Ok(Stopped::Exec(req));
@@ -1372,6 +1351,35 @@ fn run_thread_loop(
     }
 }
 
+/// Start a host thread for a guest thread a `clone` (or an NT thread
+/// creation) asked for. Called between guest calls, where nothing is borrowed.
+fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
+    // Detached: a guest thread is joined through its own futex, not
+    // through the host's handle, and `exit_group` ends the process
+    // whatever its threads are doing.
+    cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let running = Arc::clone(&cx.running);
+    std::thread::Builder::new()
+        .name(format!("gex-tid-{}", child.tid))
+        .spawn(move || {
+            if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
+                eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                // A thread that fails takes its process with it, as on
+                // Linux: otherwise the other threads sit in a futex
+                // forever and every descriptor it holds stays open.
+                stop_other_threads(&cx, false);
+                cx.kernel
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .fds
+                    .close_all();
+            }
+            running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        })
+        .context("spawning a guest thread")?;
+    Ok(())
+}
+
 /// Build and start a child process.
 ///
 /// A forked child is the same program at the same addresses, so it reuses
@@ -1380,6 +1388,15 @@ fn run_thread_loop(
 /// space per process, no copy-on-write, since wasm cannot fault on a write.
 fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     let pid = req.pid;
+    if let Some(aot) = store.data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
+        if aot.single_process {
+            bail!(
+                "gex-eject: the program forked, and the session {} was ejected from never did: \
+                 its runtime is single-process. Record a session that forks",
+                aot.label
+            );
+        }
+    }
     let cx = store
         .data()
         .spawn
@@ -2384,6 +2401,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if caller.data().nt.is_some() {
                 return nt::syscall_import(&mut caller, pc as u64);
             }
+            // An ejected project's runtime allows only the recorded calls.
+            if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
+                return stop;
+            }
             // Every thread shares the dispatch directory (guest memory) but has
             // its own table, filled only when its own store installs a
             // translation. So a thread can be told to call slot N while its
@@ -2421,6 +2442,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .read_u64(state.thread.ctx_addr + ctx::x(8) as u64)
                 .unwrap_or(!0);
             watch_check(&gm, pc as u64, state.thread.tid);
+            lockstep::log_entry(&gm, state.thread.ctx_addr, state.thread.tid, pc as u64);
+            if lockstep::fake_syscall(&mut gm, state.thread.ctx_addr) {
+                lockstep::log_result(&gm, state.thread.ctx_addr, state.thread.tid);
+                return Ok(());
+            }
             // A guest that is about to kill itself is the last moment its
             // state means anything. `abort` unwinds nothing, so by the time
             // the process is gone there is no way to ask where it was.
@@ -2530,6 +2556,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     // and it will pick the object up a block at a time.
                     eprintln!("gex: could not recompile {}: {e:#}", m.path);
                 }
+            }
+            {
+                let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
+                lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
             }
             let state = caller.data_mut();
             match outcome {
@@ -2790,7 +2820,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::Breakpoint, pc as u64);
+                return nt::fault(&mut caller, nt::Fault::from_brk(imm), pc as u64);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with
@@ -2875,6 +2905,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // CNTVCT_EL0. Served from the host clock at the frequency the
                 // guest was told (CNTFRQ), which keeps its arithmetic exact.
                 -3 => {
+                    if let Some(c) = lockstep::counter() {
+                        return c;
+                    }
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default();

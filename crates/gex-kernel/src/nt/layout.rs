@@ -31,6 +31,7 @@ pub mod x64 {
         pub const FLSSLOTS: u64 = 0x17c8;
         pub const SAMETEBFLAGS: u64 = 0x17ee;
         pub const WOWTEBOFFSET: u64 = 0x180c;
+        pub const WIN32CLIENTINFO: u64 = 0x800;
         pub const SIZEOF: u64 = 0x1838;
     }
     pub mod peb {
@@ -231,6 +232,230 @@ pub mod x64 {
         pub const XSTATE: u64 = 0x3d8;
         pub const SIZEOF: u64 = 0x738;
     }
+    pub mod struct_ntuser_thread_info {
+        pub const MSG_SOURCE: u64 = 0x0;
+        pub const RECURSION_COUNT: u64 = 0x8;
+        pub const DPI_CONTEXT: u64 = 0xc;
+        pub const CLIENT_IMM: u64 = 0x10;
+        pub const WMCHAR_DATA: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x20;
+    }
+    pub mod struct_win_proc_params {
+        pub const FUNC: u64 = 0x0;
+        pub const HWND: u64 = 0x8;
+        pub const MSG: u64 = 0x10;
+        pub const WPARAM: u64 = 0x18;
+        pub const LPARAM: u64 = 0x20;
+        pub const ANSI: u64 = 0x28;
+        pub const ANSI_DST: u64 = 0x2c;
+        pub const MAPPING: u64 = 0x30;
+        pub const DPI_CONTEXT: u64 = 0x34;
+        pub const PROCA: u64 = 0x38;
+        pub const PROCW: u64 = 0x40;
+        pub const SIZEOF: u64 = 0x48;
+    }
+    pub mod createstructw {
+        pub const LPCREATEPARAMS: u64 = 0x0;
+        pub const HINSTANCE: u64 = 0x8;
+        pub const HMENU: u64 = 0x10;
+        pub const HWNDPARENT: u64 = 0x18;
+        pub const CY: u64 = 0x20;
+        pub const CX: u64 = 0x24;
+        pub const Y: u64 = 0x28;
+        pub const X: u64 = 0x2c;
+        pub const STYLE: u64 = 0x30;
+        pub const LPSZNAME: u64 = 0x38;
+        pub const LPSZCLASS: u64 = 0x40;
+        pub const DWEXSTYLE: u64 = 0x48;
+        pub const SIZEOF: u64 = 0x50;
+    }
+    pub mod msg {
+        pub const HWND: u64 = 0x0;
+        pub const MESSAGE: u64 = 0x8;
+        pub const WPARAM: u64 = 0x10;
+        pub const LPARAM: u64 = 0x18;
+        pub const TIME: u64 = 0x20;
+        pub const PT: u64 = 0x24;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod wndclassexw {
+        pub const CBSIZE: u64 = 0x0;
+        pub const STYLE: u64 = 0x4;
+        pub const LPFNWNDPROC: u64 = 0x8;
+        pub const CBCLSEXTRA: u64 = 0x10;
+        pub const CBWNDEXTRA: u64 = 0x14;
+        pub const HINSTANCE: u64 = 0x18;
+        pub const HICON: u64 = 0x20;
+        pub const HCURSOR: u64 = 0x28;
+        pub const HBRBACKGROUND: u64 = 0x30;
+        pub const LPSZMENUNAME: u64 = 0x38;
+        pub const LPSZCLASSNAME: u64 = 0x40;
+        pub const HICONSM: u64 = 0x48;
+        pub const SIZEOF: u64 = 0x50;
+    }
+    pub mod windowpos {
+        pub const HWND: u64 = 0x0;
+        pub const HWNDINSERTAFTER: u64 = 0x8;
+        pub const X: u64 = 0x10;
+        pub const Y: u64 = 0x14;
+        pub const CX: u64 = 0x18;
+        pub const CY: u64 = 0x1c;
+        pub const FLAGS: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod nccalcsize_params {
+        pub const RGRC: u64 = 0x0;
+        pub const LPPOS: u64 = 0x30;
+        pub const SIZEOF: u64 = 0x38;
+    }
+    pub mod minmaxinfo {
+        pub const PTRESERVED: u64 = 0x0;
+        pub const PTMAXSIZE: u64 = 0x8;
+        pub const PTMAXPOSITION: u64 = 0x10;
+        pub const PTMINTRACKSIZE: u64 = 0x18;
+        pub const PTMAXTRACKSIZE: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod paintstruct {
+        pub const HDC: u64 = 0x0;
+        pub const FERASE: u64 = 0x8;
+        pub const RCPAINT: u64 = 0xc;
+        pub const SIZEOF: u64 = 0x48;
+    }
+    pub mod system_logical_processor_information_ex {
+        pub const RELATIONSHIP: u64 = 0x0;
+        pub const SIZE: u64 = 0x4;
+        pub const PROCESSOR: u64 = 0x8;
+        pub const SIZEOF: u64 = 0x50;
+    }
+    pub mod processor_relationship {
+        pub const FLAGS: u64 = 0x0;
+        pub const GROUPCOUNT: u64 = 0x16;
+        pub const GROUPMASK: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod numa_node_relationship {
+        pub const NODENUMBER: u64 = 0x0;
+        pub const GROUPCOUNT: u64 = 0x16;
+        pub const GROUPMASK: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod cache_relationship {
+        pub const LEVEL: u64 = 0x0;
+        pub const ASSOCIATIVITY: u64 = 0x1;
+        pub const LINESIZE: u64 = 0x2;
+        pub const CACHESIZE: u64 = 0x4;
+        pub const TYPE: u64 = 0x8;
+        pub const GROUPCOUNT: u64 = 0x1e;
+        pub const GROUPMASK: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod group_relationship {
+        pub const MAXIMUMGROUPCOUNT: u64 = 0x0;
+        pub const ACTIVEGROUPCOUNT: u64 = 0x2;
+        pub const GROUPINFO: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x48;
+    }
+    pub mod processor_group_info {
+        pub const MAXIMUMPROCESSORCOUNT: u64 = 0x0;
+        pub const ACTIVEPROCESSORCOUNT: u64 = 0x1;
+        pub const ACTIVEPROCESSORMASK: u64 = 0x28;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod group_affinity {
+        pub const MASK: u64 = 0x0;
+        pub const GROUP: u64 = 0x8;
+        pub const SIZEOF: u64 = 0x10;
+    }
+    pub mod system_logical_processor_information {
+        pub const PROCESSORMASK: u64 = 0x0;
+        pub const RELATIONSHIP: u64 = 0x8;
+        pub const PROCESSORCORE: u64 = 0x10;
+        pub const SIZEOF: u64 = 0x20;
+    }
+    pub mod dc_attr {
+        pub const HDC: u64 = 0x0;
+        pub const DISABLED: u64 = 0x4;
+        pub const SAVE_LEVEL: u64 = 0x8;
+        pub const BACKGROUND_COLOR: u64 = 0xc;
+        pub const BRUSH_COLOR: u64 = 0x10;
+        pub const PEN_COLOR: u64 = 0x14;
+        pub const TEXT_COLOR: u64 = 0x18;
+        pub const CUR_POS: u64 = 0x1c;
+        pub const GRAPHICS_MODE: u64 = 0x24;
+        pub const ARC_DIRECTION: u64 = 0x28;
+        pub const LAYOUT: u64 = 0x2c;
+        pub const TEXT_ALIGN: u64 = 0x30;
+        pub const BACKGROUND_MODE: u64 = 0x32;
+        pub const POLY_FILL_MODE: u64 = 0x34;
+        pub const ROP_MODE: u64 = 0x36;
+        pub const REL_ABS_MODE: u64 = 0x38;
+        pub const STRETCH_BLT_MODE: u64 = 0x3a;
+        pub const MAP_MODE: u64 = 0x3c;
+        pub const CHAR_EXTRA: u64 = 0x40;
+        pub const MAPPER_FLAGS: u64 = 0x44;
+        pub const VIS_RECT: u64 = 0x48;
+        pub const MITER_LIMIT: u64 = 0x58;
+        pub const BRUSH_ORG: u64 = 0x5c;
+        pub const WND_ORG: u64 = 0x64;
+        pub const WND_EXT: u64 = 0x6c;
+        pub const VPORT_ORG: u64 = 0x74;
+        pub const VPORT_EXT: u64 = 0x7c;
+        pub const VIRTUAL_RES: u64 = 0x84;
+        pub const VIRTUAL_SIZE: u64 = 0x8c;
+        pub const FONT_CODE_PAGE: u64 = 0x94;
+        pub const SIZEOF: u64 = 0xc0;
+    }
+    pub mod gdi_handle_entry {
+        pub const OBJECT: u64 = 0x0;
+        pub const OWNER: u64 = 0x8;
+        pub const UNIQUE: u64 = 0xc;
+        pub const TYPE: u64 = 0xe;
+        pub const FLAGS: u64 = 0xf;
+        pub const USERPOINTER: u64 = 0x10;
+        pub const SIZEOF: u64 = 0x18;
+    }
+    pub mod bitmapinfoheader {
+        pub const BISIZE: u64 = 0x0;
+        pub const BIWIDTH: u64 = 0x4;
+        pub const BIHEIGHT: u64 = 0x8;
+        pub const BIPLANES: u64 = 0xc;
+        pub const BIBITCOUNT: u64 = 0xe;
+        pub const BICOMPRESSION: u64 = 0x10;
+        pub const BISIZEIMAGE: u64 = 0x14;
+        pub const BICLRUSED: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod bitmap {
+        pub const BMTYPE: u64 = 0x0;
+        pub const BMWIDTH: u64 = 0x4;
+        pub const BMHEIGHT: u64 = 0x8;
+        pub const BMWIDTHBYTES: u64 = 0xc;
+        pub const BMPLANES: u64 = 0x10;
+        pub const BMBITSPIXEL: u64 = 0x12;
+        pub const BMBITS: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x20;
+    }
+    pub mod dibsection {
+        pub const DSBM: u64 = 0x0;
+        pub const DSBMIH: u64 = 0x20;
+        pub const DSBITFIELDS: u64 = 0x48;
+        pub const DSHSECTION: u64 = 0x58;
+        pub const DSOFFSET: u64 = 0x60;
+        pub const SIZEOF: u64 = 0x68;
+    }
+    pub mod logbrush {
+        pub const LBSTYLE: u64 = 0x0;
+        pub const LBCOLOR: u64 = 0x4;
+        pub const LBHATCH: u64 = 0x8;
+        pub const SIZEOF: u64 = 0x10;
+    }
+    pub mod logpen {
+        pub const LOPNSTYLE: u64 = 0x0;
+        pub const LOPNWIDTH: u64 = 0x4;
+        pub const LOPNCOLOR: u64 = 0xc;
+        pub const SIZEOF: u64 = 0x10;
+    }
     pub mod context {
         pub const SIZEOF: u64 = 0x4d0;
     }
@@ -266,6 +491,7 @@ pub mod x86 {
         pub const FLSSLOTS: u64 = 0xfb4;
         pub const SAMETEBFLAGS: u64 = 0xfca;
         pub const WOWTEBOFFSET: u64 = 0xfdc;
+        pub const WIN32CLIENTINFO: u64 = 0x6cc;
         pub const SIZEOF: u64 = 0x1000;
     }
     pub mod peb {
@@ -465,6 +691,230 @@ pub mod x86 {
         pub const ACTIVEGROUPCOUNT: u64 = 0x3c4;
         pub const XSTATE: u64 = 0x3d8;
         pub const SIZEOF: u64 = 0x738;
+    }
+    pub mod struct_ntuser_thread_info {
+        pub const MSG_SOURCE: u64 = 0x0;
+        pub const RECURSION_COUNT: u64 = 0x8;
+        pub const DPI_CONTEXT: u64 = 0xc;
+        pub const CLIENT_IMM: u64 = 0x10;
+        pub const WMCHAR_DATA: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x20;
+    }
+    pub mod struct_win_proc_params {
+        pub const FUNC: u64 = 0x0;
+        pub const HWND: u64 = 0x4;
+        pub const MSG: u64 = 0x8;
+        pub const WPARAM: u64 = 0xc;
+        pub const LPARAM: u64 = 0x10;
+        pub const ANSI: u64 = 0x14;
+        pub const ANSI_DST: u64 = 0x18;
+        pub const MAPPING: u64 = 0x1c;
+        pub const DPI_CONTEXT: u64 = 0x20;
+        pub const PROCA: u64 = 0x24;
+        pub const PROCW: u64 = 0x28;
+        pub const SIZEOF: u64 = 0x2c;
+    }
+    pub mod createstructw {
+        pub const LPCREATEPARAMS: u64 = 0x0;
+        pub const HINSTANCE: u64 = 0x4;
+        pub const HMENU: u64 = 0x8;
+        pub const HWNDPARENT: u64 = 0xc;
+        pub const CY: u64 = 0x10;
+        pub const CX: u64 = 0x14;
+        pub const Y: u64 = 0x18;
+        pub const X: u64 = 0x1c;
+        pub const STYLE: u64 = 0x20;
+        pub const LPSZNAME: u64 = 0x24;
+        pub const LPSZCLASS: u64 = 0x28;
+        pub const DWEXSTYLE: u64 = 0x2c;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod msg {
+        pub const HWND: u64 = 0x0;
+        pub const MESSAGE: u64 = 0x4;
+        pub const WPARAM: u64 = 0x8;
+        pub const LPARAM: u64 = 0xc;
+        pub const TIME: u64 = 0x10;
+        pub const PT: u64 = 0x14;
+        pub const SIZEOF: u64 = 0x1c;
+    }
+    pub mod wndclassexw {
+        pub const CBSIZE: u64 = 0x0;
+        pub const STYLE: u64 = 0x4;
+        pub const LPFNWNDPROC: u64 = 0x8;
+        pub const CBCLSEXTRA: u64 = 0xc;
+        pub const CBWNDEXTRA: u64 = 0x10;
+        pub const HINSTANCE: u64 = 0x14;
+        pub const HICON: u64 = 0x18;
+        pub const HCURSOR: u64 = 0x1c;
+        pub const HBRBACKGROUND: u64 = 0x20;
+        pub const LPSZMENUNAME: u64 = 0x24;
+        pub const LPSZCLASSNAME: u64 = 0x28;
+        pub const HICONSM: u64 = 0x2c;
+        pub const SIZEOF: u64 = 0x30;
+    }
+    pub mod windowpos {
+        pub const HWND: u64 = 0x0;
+        pub const HWNDINSERTAFTER: u64 = 0x4;
+        pub const X: u64 = 0x8;
+        pub const Y: u64 = 0xc;
+        pub const CX: u64 = 0x10;
+        pub const CY: u64 = 0x14;
+        pub const FLAGS: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x1c;
+    }
+    pub mod nccalcsize_params {
+        pub const RGRC: u64 = 0x0;
+        pub const LPPOS: u64 = 0x30;
+        pub const SIZEOF: u64 = 0x34;
+    }
+    pub mod minmaxinfo {
+        pub const PTRESERVED: u64 = 0x0;
+        pub const PTMAXSIZE: u64 = 0x8;
+        pub const PTMAXPOSITION: u64 = 0x10;
+        pub const PTMINTRACKSIZE: u64 = 0x18;
+        pub const PTMAXTRACKSIZE: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod paintstruct {
+        pub const HDC: u64 = 0x0;
+        pub const FERASE: u64 = 0x4;
+        pub const RCPAINT: u64 = 0x8;
+        pub const SIZEOF: u64 = 0x40;
+    }
+    pub mod system_logical_processor_information_ex {
+        pub const RELATIONSHIP: u64 = 0x0;
+        pub const SIZE: u64 = 0x4;
+        pub const PROCESSOR: u64 = 0x8;
+        pub const SIZEOF: u64 = 0x4c;
+    }
+    pub mod processor_relationship {
+        pub const FLAGS: u64 = 0x0;
+        pub const GROUPCOUNT: u64 = 0x16;
+        pub const GROUPMASK: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x24;
+    }
+    pub mod numa_node_relationship {
+        pub const NODENUMBER: u64 = 0x0;
+        pub const GROUPCOUNT: u64 = 0x16;
+        pub const GROUPMASK: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x24;
+    }
+    pub mod cache_relationship {
+        pub const LEVEL: u64 = 0x0;
+        pub const ASSOCIATIVITY: u64 = 0x1;
+        pub const LINESIZE: u64 = 0x2;
+        pub const CACHESIZE: u64 = 0x4;
+        pub const TYPE: u64 = 0x8;
+        pub const GROUPCOUNT: u64 = 0x1e;
+        pub const GROUPMASK: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x2c;
+    }
+    pub mod group_relationship {
+        pub const MAXIMUMGROUPCOUNT: u64 = 0x0;
+        pub const ACTIVEGROUPCOUNT: u64 = 0x2;
+        pub const GROUPINFO: u64 = 0x18;
+        pub const SIZEOF: u64 = 0x44;
+    }
+    pub mod processor_group_info {
+        pub const MAXIMUMPROCESSORCOUNT: u64 = 0x0;
+        pub const ACTIVEPROCESSORCOUNT: u64 = 0x1;
+        pub const ACTIVEPROCESSORMASK: u64 = 0x28;
+        pub const SIZEOF: u64 = 0x2c;
+    }
+    pub mod group_affinity {
+        pub const MASK: u64 = 0x0;
+        pub const GROUP: u64 = 0x4;
+        pub const SIZEOF: u64 = 0xc;
+    }
+    pub mod system_logical_processor_information {
+        pub const PROCESSORMASK: u64 = 0x0;
+        pub const RELATIONSHIP: u64 = 0x4;
+        pub const PROCESSORCORE: u64 = 0x8;
+        pub const SIZEOF: u64 = 0x18;
+    }
+    pub mod dc_attr {
+        pub const HDC: u64 = 0x0;
+        pub const DISABLED: u64 = 0x4;
+        pub const SAVE_LEVEL: u64 = 0x8;
+        pub const BACKGROUND_COLOR: u64 = 0xc;
+        pub const BRUSH_COLOR: u64 = 0x10;
+        pub const PEN_COLOR: u64 = 0x14;
+        pub const TEXT_COLOR: u64 = 0x18;
+        pub const CUR_POS: u64 = 0x1c;
+        pub const GRAPHICS_MODE: u64 = 0x24;
+        pub const ARC_DIRECTION: u64 = 0x28;
+        pub const LAYOUT: u64 = 0x2c;
+        pub const TEXT_ALIGN: u64 = 0x30;
+        pub const BACKGROUND_MODE: u64 = 0x32;
+        pub const POLY_FILL_MODE: u64 = 0x34;
+        pub const ROP_MODE: u64 = 0x36;
+        pub const REL_ABS_MODE: u64 = 0x38;
+        pub const STRETCH_BLT_MODE: u64 = 0x3a;
+        pub const MAP_MODE: u64 = 0x3c;
+        pub const CHAR_EXTRA: u64 = 0x40;
+        pub const MAPPER_FLAGS: u64 = 0x44;
+        pub const VIS_RECT: u64 = 0x48;
+        pub const MITER_LIMIT: u64 = 0x58;
+        pub const BRUSH_ORG: u64 = 0x5c;
+        pub const WND_ORG: u64 = 0x64;
+        pub const WND_EXT: u64 = 0x6c;
+        pub const VPORT_ORG: u64 = 0x74;
+        pub const VPORT_EXT: u64 = 0x7c;
+        pub const VIRTUAL_RES: u64 = 0x84;
+        pub const VIRTUAL_SIZE: u64 = 0x8c;
+        pub const FONT_CODE_PAGE: u64 = 0x94;
+        pub const SIZEOF: u64 = 0xc0;
+    }
+    pub mod gdi_handle_entry {
+        pub const OBJECT: u64 = 0x0;
+        pub const OWNER: u64 = 0x8;
+        pub const UNIQUE: u64 = 0xc;
+        pub const TYPE: u64 = 0xe;
+        pub const FLAGS: u64 = 0xf;
+        pub const USERPOINTER: u64 = 0x10;
+        pub const SIZEOF: u64 = 0x18;
+    }
+    pub mod bitmapinfoheader {
+        pub const BISIZE: u64 = 0x0;
+        pub const BIWIDTH: u64 = 0x4;
+        pub const BIHEIGHT: u64 = 0x8;
+        pub const BIPLANES: u64 = 0xc;
+        pub const BIBITCOUNT: u64 = 0xe;
+        pub const BICOMPRESSION: u64 = 0x10;
+        pub const BISIZEIMAGE: u64 = 0x14;
+        pub const BICLRUSED: u64 = 0x20;
+        pub const SIZEOF: u64 = 0x28;
+    }
+    pub mod bitmap {
+        pub const BMTYPE: u64 = 0x0;
+        pub const BMWIDTH: u64 = 0x4;
+        pub const BMHEIGHT: u64 = 0x8;
+        pub const BMWIDTHBYTES: u64 = 0xc;
+        pub const BMPLANES: u64 = 0x10;
+        pub const BMBITSPIXEL: u64 = 0x12;
+        pub const BMBITS: u64 = 0x14;
+        pub const SIZEOF: u64 = 0x18;
+    }
+    pub mod dibsection {
+        pub const DSBM: u64 = 0x0;
+        pub const DSBMIH: u64 = 0x18;
+        pub const DSBITFIELDS: u64 = 0x40;
+        pub const DSHSECTION: u64 = 0x4c;
+        pub const DSOFFSET: u64 = 0x50;
+        pub const SIZEOF: u64 = 0x54;
+    }
+    pub mod logbrush {
+        pub const LBSTYLE: u64 = 0x0;
+        pub const LBCOLOR: u64 = 0x4;
+        pub const LBHATCH: u64 = 0x8;
+        pub const SIZEOF: u64 = 0xc;
+    }
+    pub mod logpen {
+        pub const LOPNSTYLE: u64 = 0x0;
+        pub const LOPNWIDTH: u64 = 0x4;
+        pub const LOPNCOLOR: u64 = 0xc;
+        pub const SIZEOF: u64 = 0x10;
     }
     pub mod context {
         pub const SIZEOF: u64 = 0x2cc;

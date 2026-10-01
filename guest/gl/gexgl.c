@@ -1640,10 +1640,10 @@ static const char *gexgl_extension_string(void);
 
 const unsigned char *glGetString(unsigned name) {
     /* GL_SHADING_LANGUAGE_VERSION is asked of the host like every other
-       string. It used to be answered here with the literal "4.40 MobileGL
-       WebGPU", which was three things wrong at once: it named a backend that
-       is gone, it claimed a language version the context does not have -- the
-       host reports 3.30 -- and an application that believes it writes
+       string. It used to be answered here with a fixed "4.40 ..." string,
+       which was three things wrong at once: it named a backend that is gone,
+       it claimed a language version the context does not have -- the host
+       reports 3.30 -- and an application that believes it writes
        `#version 440` shaders that cannot compile. glxinfo prints it next to
        the real GL version, which is where the disagreement showed. */
     if (name == 0x1F03u) { /* GL_EXTENSIONS */
@@ -1672,7 +1672,6 @@ const unsigned char *glGetString(unsigned name) {
 /* Extensions answered here rather than by the host, so they are claimed
    whatever the host reports. */
 static const char *const gexgl_local_extensions[] = {
-    "GL_MOBILEGL_webgpu",
     /* CTS requests a lose-context-on-reset context and consequently
        calls glGetGraphicsResetStatus after every 4.4 case. */
     "GL_KHR_robustness",

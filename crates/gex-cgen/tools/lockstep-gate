@@ -1,0 +1,56 @@
+#!/bin/sh
+# The function tier's lockstep gate: both comparisons against tier-1, for
+# every ELF given (docs/function-tier.md §5.1). Part of Gate B and of every
+# later pass's gate.
+#
+#   lockstep-gate --gexc PATH [--jobs N] ELF...
+#
+#   (a) the default build, flags left out of the comparison (--ignore-flags):
+#       dead flags are unspecified at host-visible points;
+#   (b) GEX_CGEN_LIVE=0, which writes every flag back everywhere, compared
+#       exactly.
+#
+# Prints one line per ELF and mode; exits 1 if anything diverges. A
+# divergence in (a), or in a non-flag register in (b), is a bug.
+set -u
+here=$(dirname "$0")
+gexc=""
+jobs=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gexc) gexc=$2; shift 2 ;;
+        --jobs) jobs=$2; shift 2 ;;
+        --) shift; break ;;
+        -*) echo "lockstep-gate: unknown option $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+[ -n "$gexc" ] && [ $# -gt 0 ] || { echo "usage: lockstep-gate --gexc PATH [--jobs N] ELF..." >&2; exit 2; }
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+one() {
+    mode=$1 elf=$2
+    name=$(basename "$elf")
+    case $mode in
+        a) r=$("$here/lockstep" --gexc "$gexc" --ignore-flags "$elf" 2>&1) ;;
+        b) r=$(GEX_CGEN_LIVE=0 "$here/lockstep" --gexc "$gexc" "$elf" 2>&1) ;;
+    esac
+    s=$?
+    printf '%s (%s): %s\n' "$name" "$mode" "$(printf '%s' "$r" | tr '\n' ' ' | cut -c1-400)" > "$out/$name.$mode"
+    [ $s -eq 0 ] || touch "$out/fail"
+}
+n=0
+for elf in "$@"; do
+    for mode in a b; do
+        one "$mode" "$elf" &
+        n=$((n + 1))
+        if [ $n -ge "$jobs" ]; then wait; n=0; fi
+    done
+done
+wait
+cat "$out"/*.a "$out"/*.b 2>/dev/null | sort
+if [ -e "$out/fail" ]; then
+    echo "lockstep-gate: DIVERGED"
+    exit 1
+fi
+echo "lockstep-gate: all $# programs agree in both modes"

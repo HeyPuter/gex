@@ -9,7 +9,7 @@
 //! Every check fails the build rather than warn: a changed object, a stale
 //! replacement, a symbol that is not there, a wasm export of the wrong type.
 
-use crate::config::{Config, Coverage, Replace, CONFIG_FILE};
+use crate::config::{Config, Coverage, Replace, Target, CONFIG_FILE};
 use crate::eject::sha256;
 use crate::json::{self, field, obj, str_field, Json};
 use crate::project::{rootfs_rel, Object, Project, PROJECT_FILE};
@@ -49,6 +49,14 @@ pub struct BuiltImage {
 pub struct BuiltReplacement {
     /// Its number in the `Replace` block.
     pub id: u32,
+    /// The `user/eject.json` entry it came from (one entry can bind many:
+    /// a library, an import of every object).
+    pub rule: u32,
+    /// `symbol`, `offset`, `import` or `library`.
+    pub kind: String,
+    /// A replaced library's function the module does not provide: it fails
+    /// loudly when called. `module` and `export` name what was looked for.
+    pub missing: bool,
     /// Relative to the project.
     pub module: String,
     pub export: String,
@@ -83,7 +91,11 @@ pub fn inputs_id(dir: &Path, modules: &[String]) -> Result<String> {
     };
     add(PROJECT_FILE, &std::fs::read(dir.join(PROJECT_FILE)).with_context(|| format!("reading {PROJECT_FILE}"))?);
     add(CONFIG_FILE, &std::fs::read(dir.join(CONFIG_FILE)).unwrap_or_default());
-    let mut modules = modules.to_vec();
+    // With each module's web build, when there is one.
+    let mut modules: Vec<String> = modules
+        .iter()
+        .flat_map(|m| [m.clone(), crate::web::web_module(dir, m)])
+        .collect();
     modules.sort();
     modules.dedup();
     for m in &modules {
@@ -126,6 +138,9 @@ impl BuildManifest {
                         .map(|r| {
                             obj(vec![
                                 ("id", json::n(u64::from(r.id))),
+                                ("rule", json::n(u64::from(r.rule))),
+                                ("kind", json::s(&r.kind)),
+                                ("missing", json::b(r.missing)),
                                 ("module", json::s(&r.module)),
                                 ("export", json::s(&r.export)),
                                 ("abi", json::s(r.abi.name())),
@@ -186,6 +201,9 @@ impl BuildManifest {
         for r in arr("replacements")? {
             replacements.push(BuiltReplacement {
                 id: num(&r, "id")? as u32,
+                rule: num(&r, "rule")? as u32,
+                kind: str_field(&r, "kind", what)?,
+                missing: field(&r, "missing", what)?.as_bool().unwrap_or(false),
                 module: str_field(&r, "module", what)?,
                 export: str_field(&r, "export", what)?,
                 abi: Abi::parse(&str_field(&r, "abi", what)?).ok_or_else(|| anyhow!("{what}: bad abi"))?,
@@ -217,6 +235,9 @@ impl BuildManifest {
 
 #[derive(Debug, Default)]
 pub struct BuildReport {
+    /// The web build: its modules' size, or why there is none. `None` when
+    /// the project has no browser runtime.
+    pub web: Option<std::result::Result<u64, String>>,
     pub images: Vec<BuiltImage>,
     pub replacements: Vec<BuiltReplacement>,
     pub illegal_blocks: usize,
@@ -247,20 +268,19 @@ fn verify_rootfs(dir: &Path, project: &Project) -> Result<()> {
 
 /// The object a replacement names: by guest path, or by file name when that
 /// is unambiguous.
-fn find_object<'a>(project: &'a Project, name: &str) -> Result<&'a Object> {
-    if let Some(o) = project.objects.iter().find(|o| o.path == name) {
+fn find_object<'a>(placed: &'a [Placed], name: &str) -> Result<&'a Placed> {
+    if let Some(o) = placed.iter().find(|p| p.obj.path == name) {
         return Ok(o);
     }
-    let by_name: Vec<&Object> = project
-        .objects
+    let by_name: Vec<&Placed> = placed
         .iter()
-        .filter(|o| o.path.rsplit('/').next() == Some(name))
+        .filter(|p| p.obj.path.rsplit('/').next() == Some(name) || p.image.soname.as_deref() == Some(name))
         .collect();
     match by_name.as_slice() {
         [o] => Ok(o),
         [] => bail!(
             "no object named {name:?} (the project's objects: {})",
-            project.objects.iter().map(|o| o.path.as_str()).collect::<Vec<_>>().join(", ")
+            placed.iter().map(|p| p.obj.path.as_str()).collect::<Vec<_>>().join(", ")
         ),
         _ => bail!("{name:?} names several objects; give its guest path"),
     }
@@ -305,85 +325,251 @@ fn layout(dir: &Path, project: &Project) -> Result<Vec<Placed>> {
     Ok(out)
 }
 
+/// The bytes of an image at `[addr, addr + len)`, if they are all loaded.
+fn code_bytes(image: &gex_ld::Image, addr: u64, len: u64) -> Option<&[u8]> {
+    image.segments.iter().find_map(|s| {
+        let off = addr.checked_sub(s.vaddr)? as usize;
+        s.bytes.get(off..off.checked_add(len as usize)?)
+    })
+}
+
+/// `sha256:` of a function's bytes, as `bytes` in a replacement names it.
+pub fn function_hash(image: &gex_ld::Image, addr: u64, size: u64) -> Result<String> {
+    if size == 0 {
+        bail!("the function at {addr:#x} has no size (give one)");
+    }
+    let b = code_bytes(image, addr, size)
+        .ok_or_else(|| anyhow!("[{addr:#x}, {:#x}) is not all in the object's loaded bytes", addr + size))?;
+    Ok(sha256(b))
+}
+
+/// The unique function a symbol names in a placed image: `(address, size)`.
+fn symbol_in(p: &Placed, symbol: &str) -> Result<(u64, u64)> {
+    let (tlo, thi) = p.image.text_range;
+    let mut found: Vec<(u64, u64, bool)> = p
+        .image
+        .symbols
+        .iter()
+        .filter(|s| s.name == symbol)
+        .map(|s| (s.value, s.size, s.ifunc)) // gex-ld biases symbol values
+        .filter(|(a, _, _)| *a >= tlo && *a < thi)
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    match found.as_slice() {
+        [(a, n, false)] => Ok((*a, *n)),
+        [(_, _, true)] => bail!(
+            "`{symbol}` in {} is an IFUNC (its address is a resolver, not the function): replace \
+             its import, or the implementation the resolver picks",
+            p.obj.path
+        ),
+        [] => bail!("{} defines no function `{symbol}` (is it stripped? use \"offset\")", p.obj.path),
+        _ => bail!("{} defines `{symbol}` at several addresses", p.obj.path),
+    }
+}
+
 /// Resolve and check every replacement. Returns them numbered, and the
-/// replacement blocks per object id.
+/// replacement block for each placed address.
 fn bind_replacements(
     dir: &Path,
-    project: &Project,
     placed: &[Placed],
     config: &Config,
-) -> Result<(Vec<BuiltReplacement>, HashMap<String, HashMap<u64, Intrinsic>>)> {
-    let mut out = Vec::new();
-    let mut per_object: HashMap<String, HashMap<u64, Intrinsic>> = HashMap::new();
-    let mut checked: HashMap<(String, String, Abi), String> = HashMap::new();
+) -> Result<(Vec<BuiltReplacement>, HashMap<u64, Intrinsic>)> {
+    let mut out: Vec<BuiltReplacement> = Vec::new();
+    let mut at: HashMap<u64, (u32, String)> = HashMap::new();
+    let mut modules: HashMap<String, gex_native::aot::ReplacementModule> = HashMap::new();
     for (i, r) in config.replace.iter().enumerate() {
-        let Replace { object, sha256: want, symbol, wasm, export, abi } = r;
-        let what = format!("{CONFIG_FILE}: replace[{i}] ({symbol} in {object})");
-        let o = find_object(project, object).with_context(|| what.clone())?;
-        if &o.id != want {
-            bail!(
-                "{what} is stale: it was written for {want}, and the project's {} is now {}. \
-                 Check the replacement still fits and update its \"sha256\"",
-                o.path,
-                o.id
-            );
-        }
-        let image = &placed
-            .iter()
-            .find(|p| p.obj.path == o.path)
-            .ok_or_else(|| anyhow!("internal: {} was not placed", o.path))?
-            .image;
-        let (tlo, thi) = image.text_range;
-        let mut addrs: Vec<u64> = image
-            .symbols
-            .iter()
-            .filter(|s| s.name == *symbol && !s.ifunc)
-            .map(|s| s.value)
-            .filter(|a| *a >= tlo && *a < thi)
-            .collect();
-        addrs.sort_unstable();
-        addrs.dedup();
-        let addr = match addrs.as_slice() {
-            [a] => *a,
-            [] => bail!("{what}: {} defines no function `{symbol}` (is it stripped?)", o.path),
-            _ => bail!("{what}: {} defines `{symbol}` at several addresses", o.path),
+        let Replace { object, sha256: want, bytes, target, wasm, export, abi } = r;
+        let what = match target {
+            Target::Symbol(n) => format!("{CONFIG_FILE}: replace[{i}] ({n} in {object})"),
+            Target::Offset { offset, .. } => format!("{CONFIG_FILE}: replace[{i}] ({object} + {offset:#x})"),
+            Target::Import(n) if object.is_empty() => format!("{CONFIG_FILE}: replace[{i}] (every import of {n})"),
+            Target::Import(n) => format!("{CONFIG_FILE}: replace[{i}] ({object}'s import of {n})"),
+            Target::Library { .. } => format!("{CONFIG_FILE}: replace[{i}] (the library {object})"),
         };
-        let map = per_object.entry(o.id.clone()).or_default();
-        if let Some(Intrinsic::Replace(other)) = map.get(&addr) {
-            bail!("{what}: {:#x} is already replaced by replace[{other}]", addr);
-        }
-        let module_path = dir.join(wasm);
-        let bytes = std::fs::read(&module_path).with_context(|| {
-            if wasm == crate::config::USER_WASM {
-                format!("{what}: no {wasm}; build.sh compiles user/src/*.c into it")
-            } else {
-                format!("{what}: reading {wasm}")
-            }
-        })?;
-        let key = (wasm.clone(), export.clone(), *abi);
-        let sig = match checked.get(&key) {
-            Some(s) => s.clone(),
+        let module = match modules.get(wasm) {
+            Some(m) => m,
             None => {
-                let s = gex_native::aot::check_replacement(&bytes, export, *abi)
-                    .with_context(|| format!("{what}: {wasm}"))?;
-                checked.insert(key, s.clone());
-                s
+                let b = std::fs::read(dir.join(wasm)).with_context(|| {
+                    if wasm == crate::config::USER_WASM {
+                        format!("{what}: no {wasm}; build.sh compiles user/src/*.c into it")
+                    } else {
+                        format!("{what}: reading {wasm}")
+                    }
+                })?;
+                let m = gex_native::aot::ReplacementModule::inspect(&b).with_context(|| format!("{what}: {wasm}"))?;
+                modules.entry(wasm.clone()).or_insert(m)
             }
         };
-        let id = i as u32;
-        map.insert(addr, Intrinsic::Replace(id));
-        out.push(BuiltReplacement {
-            id,
-            module: wasm.clone(),
-            export: export.clone(),
-            abi: *abi,
-            object: o.id.clone(),
-            symbol: symbol.clone(),
-            addr,
-            sig,
-        });
+        // The object(s), each checked against the hash it was written for.
+        let objs: Vec<&Placed> = if object.is_empty() {
+            if want.is_some() {
+                bail!("{what}: a \"sha256\" needs the \"object\" it is the hash of");
+            }
+            placed.iter().collect()
+        } else {
+            let p = find_object(placed, object).with_context(|| what.clone())?;
+            if let Some(want) = want {
+                if *want != p.obj.id {
+                    bail!(
+                        "{what} is stale: it was written for {want}, and the project's {} is now {}. \
+                         Check the replacement still fits and update its \"sha256\"",
+                        p.obj.path,
+                        p.obj.id
+                    );
+                }
+            }
+            vec![p]
+        };
+        // `(object, address, name, export, missing)` to bind.
+        let mut binds: Vec<(&Placed, u64, String, String, bool)> = Vec::new();
+        match target {
+            Target::Symbol(_) | Target::Offset { .. } => {
+                let p = objs[0];
+                let (addr, size, name) = match target {
+                    Target::Symbol(n) => {
+                        let (a, sz) = symbol_in(p, n).with_context(|| what.clone())?;
+                        (a, sz, n.clone())
+                    }
+                    Target::Offset { offset, size } => {
+                        let a = offset.wrapping_add(p.image.bias);
+                        let (tlo, thi) = p.image.text_range;
+                        if a < tlo || a >= thi {
+                            bail!("{what}: {offset:#x} is not in {}'s text", p.obj.path);
+                        }
+                        (a, *size, format!("{}+{offset:#x}", p.obj.path.rsplit('/').next().unwrap_or("")))
+                    }
+                    _ => unreachable!(),
+                };
+                if let Some(want) = bytes {
+                    let got = function_hash(&p.image, addr, size).with_context(|| what.clone())?;
+                    if &got != want {
+                        bail!(
+                            "{what} is stale: the function's bytes are now {got}, not the {want} it \
+                             was written for. Check the replacement still fits and update \"bytes\""
+                        );
+                    }
+                }
+                binds.push((p, addr, name, export.clone(), false));
+            }
+            Target::Import(n) => {
+                if bytes.is_some() {
+                    bail!("{what}: \"bytes\" names a function's code; an import has none");
+                }
+                for p in &objs {
+                    for (a, name) in crate::plt::stubs(&p.image) {
+                        if &name == n {
+                            binds.push((p, a, format!("{}'s import of {n}", p.obj.path), export.clone(), false));
+                        }
+                    }
+                }
+                if binds.is_empty() {
+                    bail!("{what}: no PLT stub calls {n} (a call through the GOT without a PLT is not caught)");
+                }
+            }
+            Target::Library { prefix } => {
+                if bytes.is_some() {
+                    bail!("{what}: \"bytes\" names one function's code, not a library's");
+                }
+                let p = objs[0];
+                if p.obj.role != "library" {
+                    bail!("{what}: {} is the {}, not a library", p.obj.path, p.obj.role);
+                }
+                let (tlo, thi) = p.image.text_range;
+                let mut ifuncs = Vec::new();
+                let mut seen = std::collections::BTreeSet::new();
+                for d in p.image.dynsyms.iter().filter(|d| !d.undefined && d.value != 0) {
+                    let a = d.value.wrapping_add(p.image.bias);
+                    if a < tlo || a >= thi || !seen.insert(a) {
+                        continue;
+                    }
+                    if p.image.symbols.iter().any(|s| s.value == a && s.ifunc) {
+                        ifuncs.push(d.name.clone());
+                        continue;
+                    }
+                    let e = format!("{prefix}{}", d.name);
+                    let missing = !module.has(&e);
+                    binds.push((p, a, d.name.clone(), e, missing));
+                }
+                if !ifuncs.is_empty() {
+                    bail!("{what}: {} exports IFUNCs ({}), which a library replacement cannot bind", p.obj.path, ifuncs.join(", "));
+                }
+                if binds.iter().all(|b| b.4) {
+                    bail!("{what}: {wasm} provides none of {}'s {} functions", p.obj.path, binds.len());
+                }
+            }
+        }
+        for (p, addr, name, exp, missing) in binds {
+            let sig = if missing { String::new() } else { module.check(&exp, *abi).with_context(|| format!("{what}: {wasm}"))? };
+            if let Some((other, oname)) = at.get(&addr) {
+                bail!("{what}: {name} at {addr:#x} is already replaced ({oname}, by replace[{other}])");
+            }
+            at.insert(addr, (i as u32, name.clone()));
+            out.push(BuiltReplacement {
+                id: out.len() as u32,
+                rule: i as u32,
+                kind: match target {
+                    Target::Symbol(_) => "symbol",
+                    Target::Offset { .. } => "offset",
+                    Target::Import(_) => "import",
+                    Target::Library { .. } => "library",
+                }
+                .to_string(),
+                missing,
+                module: wasm.clone(),
+                export: exp,
+                abi: *abi,
+                object: p.obj.id.clone(),
+                symbol: name,
+                addr,
+                sig,
+            });
+        }
     }
-    Ok((out, per_object))
+    let map = out.iter().map(|r| (r.addr, Intrinsic::Replace(r.id))).collect();
+    Ok((out, map))
+}
+
+/// A checked `user/eject.json` entry for a function: its object's hash and
+/// its bytes' hash filled in. `what` is a symbol or a `0x` link-time offset.
+pub fn describe(dir: &Path, object: &str, what: &str, size: Option<u64>) -> Result<String> {
+    let project = Project::load(dir)?;
+    let placed = layout(dir, &project)?;
+    let p = find_object(&placed, object)?;
+    let name = p.obj.path.rsplit('/').next().unwrap_or(&p.obj.path).to_string();
+    let (kv, addr, size) = if let Some(h) = what.strip_prefix("0x") {
+        let off = u64::from_str_radix(h, 16).map_err(|_| anyhow!("{what} is not a hex offset"))?;
+        let addr = off.wrapping_add(p.image.bias);
+        let size = match size {
+            Some(s) => s,
+            None => p
+                .image
+                .symbols
+                .iter()
+                .find(|s| s.value == addr && s.size > 0)
+                .map(|s| s.size)
+                .ok_or_else(|| anyhow!("no symbol gives the size of the function at {what}: pass --size"))?,
+        };
+        (
+            vec![("offset", json::s(format!("{off:#x}"))), ("size", json::s(format!("{size:#x}")))],
+            addr,
+            size,
+        )
+    } else {
+        let (a, sz) = symbol_in(p, what)?;
+        let sz = size.unwrap_or(sz);
+        (vec![("symbol", json::s(what))], a, sz)
+    };
+    let mut fields = vec![("object", json::s(&name)), ("sha256", json::s(&p.obj.id))];
+    fields.extend(kv);
+    fields.push(("bytes", json::s(function_hash(&p.image, addr, size)?)));
+    let export = match what.strip_prefix("0x") {
+        Some(h) => format!("fn_{h}"),
+        None => what.to_string(),
+    };
+    fields.push(("export", json::s(export)));
+    fields.push(("abi", json::s("c")));
+    Ok(json::write(&obj(fields)))
 }
 
 fn copy_tree(from: &Path, to: &Path, count: &mut usize) -> Result<()> {
@@ -415,6 +601,131 @@ fn copy_tree(from: &Path, to: &Path, count: &mut usize) -> Result<()> {
     Ok(())
 }
 
+/// Everything translation needs, for the native and the web module sets.
+struct Translation<'a> {
+    dir: &'a Path,
+    project: &'a Project,
+    placed: &'a [Placed],
+    profile: Option<&'a gex_xlate::profile::Profile>,
+    config: &'a Config,
+    intrinsics: &'a HashMap<u64, Intrinsic>,
+}
+
+impl Translation<'_> {
+    /// Translate every object into `out` (relative to the project): the
+    /// native set, or (`web`) the browser shim's. Returns the modules, the
+    /// libraries' pins and the count of blocks ending in SIGILL.
+    fn translate(&self, out: &str, web: bool) -> Result<(Vec<BuiltImage>, Vec<(String, u64)>, usize)> {
+        // The program's closure is numbered as one: its image owns the memory and
+        // tables, and every other object's slots continue where the last one's
+        // stopped. Other executables (programs the session exec'd) are images of
+        // their own.
+        let main = self.placed
+            .iter()
+            .position(|p| p.obj.path == self.project.program.exe && p.obj.role == "exe")
+            .ok_or_else(|| anyhow!("the project's program {} is not among its objects", self.project.program.exe))?;
+        let mut order: Vec<usize> = vec![main];
+        order.extend((0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role != "exe"));
+        let others: Vec<usize> = (0..self.placed.len()).filter(|&i| i != main && self.placed[i].obj.role == "exe").collect();
+        let main_identity = gex_native::aot::image_identity(&self.placed[main].image);
+
+        let mut images = Vec::new();
+        let mut illegal = 0;
+        let mut pins = Vec::new();
+        let mut first_slot = 0u64;
+        for (n, &i) in order.iter().chain(others.iter()).enumerate() {
+            let p = &self.placed[i];
+            let o = &p.obj;
+            let in_closure = n < order.len();
+            // The browser runs a dynamic program's closure the way gex's own
+            // pages do (`gexc build --closure --shared-image`): every object
+            // is a demand-filled library module, including the executable, and
+            // the process starts from a seed module. An image module writing
+            // its slots at instantiation does not mix with the pages the shim
+            // numbers for itself.
+            let shared_image = web && order.len() > 1;
+            let own = !shared_image && (n == 0 || !in_closure);
+            let mut image = p.image.clone();
+            gex_xlate::set_compat(image.class32);
+            if !own {
+                // Apply its own RELATIVE relocations first, so the pointer scan
+                // follows them into the code they name (as `gexc build --closure`).
+                gex_ld::elf::apply_own_relative(&mut image);
+            }
+            let (tlo, thi) = image.text_range;
+            let seeds: Vec<u64> = self
+                .profile
+                .and_then(|pr| pr.objects.get(&o.id))
+                .map(|op| {
+                    op.blocks
+                        .keys()
+                        .map(|off| off.wrapping_add(image.bias))
+                        .filter(|a| *a >= tlo && *a < thi)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // `profile`: the reached blocks and their pages, and nothing followed
+            // off them onto fresh pages (the profile-guided closure build's
+            // rule). `static` adds discovery from the symbols and the data.
+            // A session recorded without a profile says nothing about what ran:
+            // then `profile` is `static`.
+            let profile_only = self.config.coverage == Coverage::Profile && self.profile.is_some();
+            let opts = Options {
+                exhaustive: self.config.coverage == Coverage::Exhaustive,
+                lazy: profile_only,
+                scan_pointers: !profile_only,
+                seeds_only: profile_only,
+                extra_entries: seeds,
+                complete_pages: self.config.coverage != Coverage::Exhaustive,
+                intrinsics: self.intrinsics
+                    .iter()
+                    .filter(|(a, _)| **a >= tlo && **a < thi)
+                    .map(|(a, k)| (*a, *k))
+                    .collect(),
+                // The browser's single-Worker shim takes a plain memory, and
+                // fills a library's pages on demand from passive segments.
+                shared_memory: !web,
+                demand_fill: web && !own,
+                linkage: if own { gex_xlate::Linkage::Own } else { gex_xlate::Linkage::Shared },
+                first_slot: if own || n == 0 { 0 } else { first_slot },
+                ..Options::default()
+            };
+            let (modules, stats) = gex_xlate::translate_image_split(&image, &opts, gex_xlate::MAX_FUNCS_PER_MODULE);
+            if in_closure {
+                first_slot = modules.last().map_or(first_slot, |m| m.metadata().next_slot);
+            }
+            let name = o.path.rsplit('/').next().unwrap_or("image");
+            let hex = o.id.trim_start_matches("sha256:");
+            let identity = if in_closure { main_identity.clone() } else { gex_native::aot::image_identity(&image) };
+            for (part, module) in modules.iter().enumerate() {
+                gex_native::validate_module(&module.wasm)
+                    .with_context(|| format!("the translation of {} is not valid wasm", o.path))?;
+                let rel = if modules.len() == 1 {
+                    format!("{out}/{name}-{}.wasm", &hex[..12.min(hex.len())])
+                } else {
+                    format!("{out}/{name}-{}.p{part}.wasm", &hex[..12.min(hex.len())])
+                };
+                std::fs::write(self.dir.join(&rel), &module.wasm).with_context(|| format!("writing {rel}"))?;
+                images.push(BuiltImage {
+                    kind: if own { "image" } else { "shared" }.to_string(),
+                    identity: identity.clone(),
+                    base: image.bias,
+                    module: rel,
+                    object: o.id.clone(),
+                    path: o.path.clone(),
+                    blocks: if part == 0 { stats.blocks as u64 } else { 0 },
+                    bytes: module.wasm.len() as u64,
+                });
+            }
+            illegal += stats.illegal_blocks;
+            if o.role == "library" {
+                pins.push((o.path.clone(), image.bias));
+            }
+        }
+        Ok((images, pins, illegal))
+    }
+}
+
 pub fn build(dir: &Path) -> Result<BuildReport> {
     let project = Project::load(dir)?;
     if project.isa != gex_abi::ARCH_NAME {
@@ -430,7 +741,7 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     };
 
     let placed = layout(dir, &project)?;
-    let (replacements, mut replaced) = bind_replacements(dir, &project, &placed, &config)?;
+    let (replacements, replaced) = bind_replacements(dir, &placed, &config)?;
 
     let out = dir.join("build");
     let modules_dir = out.join("modules");
@@ -459,105 +770,13 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         }
     }
     // Then the user's replacements over them.
-    for m in replaced.drain().map(|(_, m)| m) {
-        intrinsics.extend(m);
-    }
-
-    // The program's closure is numbered as one: its image owns the memory and
-    // tables, and every other object's slots continue where the last one's
-    // stopped. Other executables (programs the session exec'd) are images of
-    // their own.
-    let main = placed
-        .iter()
-        .position(|p| p.obj.path == project.program.exe && p.obj.role == "exe")
-        .ok_or_else(|| anyhow!("the project's program {} is not among its objects", project.program.exe))?;
-    let mut order: Vec<usize> = vec![main];
-    order.extend((0..placed.len()).filter(|&i| i != main && placed[i].obj.role != "exe"));
-    let others: Vec<usize> = (0..placed.len()).filter(|&i| i != main && placed[i].obj.role == "exe").collect();
-    let main_identity = gex_native::aot::image_identity(&placed[main].image);
+    intrinsics.extend(replaced);
 
     let mut report = BuildReport::default();
-    let mut pins = Vec::new();
-    let mut first_slot = 0u64;
-    for (n, &i) in order.iter().chain(others.iter()).enumerate() {
-        let p = &placed[i];
-        let o = &p.obj;
-        let in_closure = n < order.len();
-        let own = n == 0 || !in_closure;
-        let mut image = p.image.clone();
-        gex_xlate::set_compat(image.class32);
-        if !own {
-            // Apply its own RELATIVE relocations first, so the pointer scan
-            // follows them into the code they name (as `gexc build --closure`).
-            gex_ld::elf::apply_own_relative(&mut image);
-        }
-        let (tlo, thi) = image.text_range;
-        let seeds: Vec<u64> = profile
-            .as_ref()
-            .and_then(|pr| pr.objects.get(&o.id))
-            .map(|op| {
-                op.blocks
-                    .keys()
-                    .map(|off| off.wrapping_add(image.bias))
-                    .filter(|a| *a >= tlo && *a < thi)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // `profile`: the reached blocks and their pages, and nothing followed
-        // off them onto fresh pages (the profile-guided closure build's
-        // rule). `static` adds discovery from the symbols and the data.
-        // A session recorded without a profile says nothing about what ran:
-        // then `profile` is `static`.
-        let profile_only = config.coverage == Coverage::Profile && profile.is_some();
-        let opts = Options {
-            exhaustive: config.coverage == Coverage::Exhaustive,
-            lazy: profile_only,
-            scan_pointers: !profile_only,
-            seeds_only: profile_only,
-            extra_entries: seeds,
-            complete_pages: config.coverage != Coverage::Exhaustive,
-            intrinsics: intrinsics
-                .iter()
-                .filter(|(a, _)| **a >= tlo && **a < thi)
-                .map(|(a, k)| (*a, *k))
-                .collect(),
-            shared_memory: true,
-            linkage: if own { gex_xlate::Linkage::Own } else { gex_xlate::Linkage::Shared },
-            first_slot: if own { 0 } else { first_slot },
-            ..Options::default()
-        };
-        let (modules, stats) = gex_xlate::translate_image_split(&image, &opts, gex_xlate::MAX_FUNCS_PER_MODULE);
-        if in_closure {
-            first_slot = modules.last().map_or(first_slot, |m| m.metadata().next_slot);
-        }
-        let name = o.path.rsplit('/').next().unwrap_or("image");
-        let hex = o.id.trim_start_matches("sha256:");
-        let identity = if in_closure { main_identity.clone() } else { gex_native::aot::image_identity(&image) };
-        for (part, module) in modules.iter().enumerate() {
-            gex_native::validate_module(&module.wasm)
-                .with_context(|| format!("the translation of {} is not valid wasm", o.path))?;
-            let rel = if modules.len() == 1 {
-                format!("build/modules/{name}-{}.wasm", &hex[..12.min(hex.len())])
-            } else {
-                format!("build/modules/{name}-{}.p{part}.wasm", &hex[..12.min(hex.len())])
-            };
-            std::fs::write(dir.join(&rel), &module.wasm).with_context(|| format!("writing {rel}"))?;
-            report.images.push(BuiltImage {
-                kind: if own { "image" } else { "shared" }.to_string(),
-                identity: identity.clone(),
-                base: image.bias,
-                module: rel,
-                object: o.id.clone(),
-                path: o.path.clone(),
-                blocks: if part == 0 { stats.blocks as u64 } else { 0 },
-                bytes: module.wasm.len() as u64,
-            });
-        }
-        report.illegal_blocks += stats.illegal_blocks;
-        if o.role == "library" {
-            pins.push((o.path.clone(), image.bias));
-        }
-    }
+    let t = Translation { dir, project: &project, placed: &placed, profile: profile.as_ref(), config: &config, intrinsics: &intrinsics };
+    let (images, pins, illegal) = t.translate("build/modules", false)?;
+    report.images = images;
+    report.illegal_blocks = illegal;
 
     // The guest's filesystem: what the session read, then the user's files.
     let mut n = 0;
@@ -568,7 +787,38 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     }
     report.rootfs_files = n;
 
-    let modules: Vec<String> = replacements.iter().map(|r| r.module.clone()).collect();
+    // The web build, when the project has the browser runtime.
+    report.web = if dir.join(crate::web::SHIM).exists() {
+        let web_dir = dir.join("build/web");
+        if web_dir.exists() {
+            std::fs::remove_dir_all(&web_dir).with_context(|| format!("removing {}", web_dir.display()))?;
+        }
+        std::fs::create_dir_all(&web_dir)?;
+        match crate::web::unsupported(&project) {
+            Some(why) => {
+                crate::web::unsupported_manifest(dir, &why)?;
+                Some(Err(why))
+            }
+            None => {
+                for r in replacements.iter().filter(|r| !r.missing) {
+                    crate::web::check_module(dir, &r.module, &r.export, r.abi)?;
+                }
+                let (images, _, _) = t.translate("build/web", true)?;
+                let spans: Vec<(String, u64, u64)> = placed
+                    .iter()
+                    .filter(|p| p.obj.role == "library")
+                    .map(|p| (p.obj.path.clone(), p.image.bias, p.image.brk - p.image.bias))
+                    .collect();
+                let allowed = crate::run::allowed_syscalls(dir, &config)?;
+                crate::web::manifest(dir, &project, &images, &spans, &replacements, allowed.as_ref(), config.jit_fallback)?;
+                Some(Ok(images.iter().map(|i| i.bytes).sum()))
+            }
+        }
+    } else {
+        None
+    };
+
+    let modules: Vec<String> = replacements.iter().filter(|r| !r.missing).map(|r| r.module.clone()).collect();
     let manifest = BuildManifest {
         inputs: inputs_id(dir, &modules)?,
         images: report.images.clone(),

@@ -17,7 +17,7 @@
 pub const MAGIC: u32 = 0x4758_4547;
 /// Version of the command ABI. A guest and host must agree before any opcode
 /// is decoded; generated opcode policy changes require incrementing this.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The fixed header at the start of the shared buffer. `repr(C)` for the C
 /// guest half; every field 32 bits, 32 bytes total.
@@ -379,6 +379,40 @@ pub mod op {
     pub const END_LIST: u32 = 182;
     pub const CALL_LIST: u32 = 183;
     pub const DELETE_LISTS: u32 = 184;
+
+    /* Fixed function, protocol 11: client-side vertex arrays and the matrix
+     * and color calls programs written for OpenGL 1.x-2.x make every frame
+     * (Noita's renderer, through Wine's opengl32). The array pointers are
+     * offsets into the bound GL_ARRAY_BUFFER, as for VERTEX_ATTRIB_POINTER:
+     * a guest with the data in client memory uploads it to a buffer of its
+     * own before the draw. */
+    /// `{ cap }` -- glEnableClientState.
+    pub const ENABLE_CLIENT_STATE: u32 = 185;
+    /// `{ cap }` -- glDisableClientState.
+    pub const DISABLE_CLIENT_STATE: u32 = 186;
+    /// `{ size, type, stride, offset:u64 }` -- glVertexPointer.
+    pub const VERTEX_POINTER: u32 = 187;
+    /// `{ size, type, stride, offset:u64 }` -- glColorPointer.
+    pub const COLOR_POINTER: u32 = 188;
+    /// `{ size, type, stride, offset:u64 }` -- glTexCoordPointer, for the
+    /// client active texture unit.
+    pub const TEX_COORD_POINTER: u32 = 189;
+    /// `{ unit }` -- glClientActiveTexture.
+    pub const CLIENT_ACTIVE_TEXTURE: u32 = 190;
+    /// `{ left, right, bottom, top, near, far }` as doubles, two words each.
+    pub const ORTHO: u32 = 191;
+    /// `{ x, y, z }` as floats.
+    pub const SCALEF: u32 = 192;
+    /// `{ m[16] }` as floats, column-major.
+    pub const LOAD_MATRIXF: u32 = 193;
+    /// `{ m[16] }` as floats, column-major.
+    pub const MULT_MATRIXF: u32 = 194;
+    /// `{ r, g, b, a }` as floats.
+    pub const COLOR4F: u32 = 195;
+    /// `{ target, pname, param }` -- glTexEnvi.
+    pub const TEX_ENVI: u32 = 196;
+    /// `{ func, ref as float }` -- glAlphaFunc.
+    pub const ALPHA_FUNC: u32 = 197;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,
