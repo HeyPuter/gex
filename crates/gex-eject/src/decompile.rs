@@ -99,7 +99,7 @@ pub fn decompile(dir: &Path, object: &str, what: &str, size: Option<u64>, callee
     // Recovery and summaries, as the function tier does them for this
     // object (with its `.eh_frame`, which a build from bytes has).
     let elf = std::fs::read(dir.join(crate::project::rootfs_rel(&p.obj.path)?))?;
-    gex_xlate::set_compat(false);
+    gex_xlate::set_compat(p.image.class32);
     let mut image = p.image.clone();
     if p.obj.role != "exe" {
         gex_ld::elf::apply_own_relative(&mut image);
@@ -144,7 +144,7 @@ pub fn decompile(dir: &Path, object: &str, what: &str, size: Option<u64>, callee
     }
     let funcs: Vec<Function> = set.iter().map(|a| by_entry[a].clone()).collect();
     let export = format!("decompiled_{}", ident(&name));
-    let body = gex_cgen::standalone::standalone(&funcs, &[(addr, export.clone())], &sums)
+    let body = gex_cgen::standalone::standalone(&funcs, &[(addr, export.clone())], &sums, p.image.class32)
         .with_context(|| format!("emitting C for {name}"))?;
 
     let objname = p.obj.path.rsplit('/').next().unwrap_or(&p.obj.path).to_string();

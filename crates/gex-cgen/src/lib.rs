@@ -120,11 +120,17 @@ pub fn select(
 /// `tier1` is the module `ModuleBuilder` produced from `blocks`, and each
 /// block comes with the function index `ModuleBuilder::reserve` gave it.
 /// The result has the tier-1 module's exact interface.
-pub fn build(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions) -> Result<(Vec<u8>, SpliceStats)> {
+/// `class32` is an i386 program in compatibility mode (x86 builds only).
+pub fn build(
+    tier1: &[u8],
+    blocks: &[(&Block, u32)],
+    functions: Functions,
+    class32: bool,
+) -> Result<(Vec<u8>, SpliceStats)> {
     emit::check_environment()?;
     match tier()? {
         Tier::Blocks => build_blocks(tier1, blocks),
-        Tier::Functions => build_functions(tier1, blocks, functions),
+        Tier::Functions => build_functions(tier1, blocks, functions, class32),
     }
 }
 
@@ -155,13 +161,18 @@ fn compile_and_link(units: Vec<(String, String)>, exports: &[String]) -> Result<
 }
 
 /// Phase B: whole functions (`func.rs`).
-fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions) -> Result<(Vec<u8>, SpliceStats)> {
+fn build_functions(
+    tier1: &[u8],
+    blocks: &[(&Block, u32)],
+    functions: Functions,
+    class32: bool,
+) -> Result<(Vec<u8>, SpliceStats)> {
     let index: std::collections::HashMap<u64, u32> =
         blocks.iter().map(|(b, f)| (b.start, *f)).collect();
     let refs: Vec<&Block> = blocks.iter().map(|(b, _)| *b).collect();
     let mut sums: HashMap<u64, Summary> = HashMap::new();
     let guarded = guarded_pages(&refs);
-    let funcs = match functions {
+    let mut funcs = match functions {
         Functions::StandIn { symbols } => select(recover::functions(&refs, &symbols), &HashMap::new(), &guarded)?,
         Functions::Recovered {
             functions,
@@ -178,48 +189,80 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
             select(functions, &blocks, &guarded)?
         }
     };
-    let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
-    let trapfree = func::trap_free(&funcs, &sums);
-    let jobs = toolchain::jobs();
-    let per = funcs.len().div_ceil(jobs * 4).max(16);
-    let mut units = Vec::new();
-    let mut stats = func::FnStats::default();
-    for (k, chunk) in funcs.chunks(per).enumerate() {
-        let mut u = func::FnUnit::new();
-        for f in chunk {
-            u.add(f, &known, &sums, &trapfree)
-                .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
+    // Emit, compile and link; a function clang compiled to use its shadow
+    // stack (which the splice cannot give it, docs/function-tier.md §4) is
+    // dropped -- it stays tier-1 -- and the rest are built again.
+    let mut dropped: HashSet<u64> = HashSet::new();
+    let (cwasm, dir, entries) = loop {
+        let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
+        let trapfree = func::trap_free(&funcs, &sums);
+        let jobs = toolchain::jobs();
+        let per = funcs.len().div_ceil(jobs * 4).max(16);
+        let mut units = Vec::new();
+        let mut stats = func::FnStats::default();
+        for (k, chunk) in funcs.chunks(per).enumerate() {
+            let mut u = func::FnUnit::new();
+            u.set_class32(class32);
+            for f in chunk {
+                u.add(f, &known, &sums, &trapfree)
+                    .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
+            }
+            stats.merge(&u.stats);
+            units.push((format!("unit{k:04}.c"), u.source()));
         }
-        stats.merge(&u.stats);
-        units.push((format!("unit{k:04}.c"), u.source()));
-    }
-    if std::env::var_os("GEX_CGEN_STATS").is_some() {
-        let mut leaves: Vec<(u64, usize)> = stats.leaves.iter().map(|(a, n)| (*a, *n)).collect();
-        leaves.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
-        eprintln!(
-            "[cgen] {} functions ({} trap-free), {} blocks; calls: {} known ({} to trap-free), \
-             {} indirect, {} leaving; tail calls: {} known; {} switches, {} loops outlined, {} unresolved jumps, {} returns",
-            stats.functions,
-            trapfree.len(),
-            stats.blocks,
-            stats.calls_known,
-            stats.calls_trapfree,
-            stats.calls_indirect,
-            stats.leaves.values().sum::<usize>(),
-            stats.tail_known,
-            stats.switches,
-            stats.loops_outlined,
-            stats.unresolved,
-            stats.returns
-        );
-        for (a, n) in leaves.iter().take(20) {
-            eprintln!("[cgen]   leaves for {a:#x} at {n} sites");
+        if std::env::var_os("GEX_CGEN_STATS").is_some() {
+            let mut leaves: Vec<(u64, usize)> = stats.leaves.iter().map(|(a, n)| (*a, *n)).collect();
+            leaves.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
+            eprintln!(
+                "[cgen] {} functions ({} trap-free), {} blocks; calls: {} known ({} to trap-free), \
+                 {} indirect, {} leaving; tail calls: {} known; {} switches, {} loops outlined, {} unresolved jumps, {} returns",
+                stats.functions,
+                trapfree.len(),
+                stats.blocks,
+                stats.calls_known,
+                stats.calls_trapfree,
+                stats.calls_indirect,
+                stats.leaves.values().sum::<usize>(),
+                stats.tail_known,
+                stats.switches,
+                stats.loops_outlined,
+                stats.unresolved,
+                stats.returns
+            );
+            for (a, n) in leaves.iter().take(20) {
+                eprintln!("[cgen]   leaves for {a:#x} at {n} sites");
+            }
         }
-    }
-    let entries: Vec<u64> = funcs.iter().map(|f| f.entry).collect();
-    units.push(("call_known.c".into(), func::call_known_source(&entries)));
-    let exports: Vec<String> = entries.iter().map(|a| func::entry_name(*a)).collect();
-    let (cwasm, dir) = compile_and_link(units, &exports)?;
+        let entries: Vec<u64> = funcs.iter().map(|f| f.entry).collect();
+        units.push(("call_known.c".into(), func::call_known_source(&entries)));
+        let exports: Vec<String> = entries.iter().map(|a| func::entry_name(*a)).collect();
+        let (cwasm, dir) = compile_and_link(units, &exports)?;
+        let users = splice::unspliceable_users(&cwasm)?;
+        if !users.is_empty() && std::env::var_os("GEX_CGEN_NODROP").is_some() {
+            anyhow::bail!("GEX_CGEN_NODROP: unspliceable C functions {users:?}");
+        }
+        if users.is_empty() {
+            break (cwasm, dir, entries);
+        }
+        let mut more = Vec::new();
+        for n in &users {
+            match func::guest_entry_of(n) {
+                Some(a) => more.push(a),
+                None => anyhow::bail!(
+                    "C function {n} uses clang's shadow stack and belongs to no \
+                     guest function; the function tier cannot splice it (docs/function-tier.md §4)"
+                ),
+            }
+        }
+        if more.iter().all(|a| dropped.contains(a)) || dropped.len() > 64 {
+            anyhow::bail!("the shadow-stack users {users:?} remain after dropping their functions");
+        }
+        if std::env::var_os("GEX_CGEN_STATS").is_some() {
+            eprintln!("[cgen] left to tier-1 (clang wanted a shadow stack): {more:x?}");
+        }
+        dropped.extend(more);
+        funcs.retain(|f| !dropped.contains(&f.entry));
+    };
     // Registered in dispatch: the entries tier-1 also has a block for. The
     // others (tier-1 found no block there) are reached only by C calls; a
     // dispatch to them goes to the runtime's own translation.

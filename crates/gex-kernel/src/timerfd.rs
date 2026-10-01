@@ -170,17 +170,19 @@ impl FileHandle for TimerFd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::cell::Cell;
 
     // A clock the test drives by hand. `ClockFn` is a bare `fn` pointer, so the
-    // "current time" lives in a static the closure-free function reads.
-    static CLOCK_NS: AtomicU64 = AtomicU64::new(0);
+    // "current time" lives in a thread-local the closure-free function reads:
+    // thread-local, because the test harness runs these tests in parallel and
+    // a shared static let one test move another's clock.
+    thread_local!(static CLOCK_NS: Cell<u64> = const { Cell::new(0) });
     fn test_clock() -> (u64, u32) {
-        let ns = CLOCK_NS.load(Ordering::Relaxed);
+        let ns = CLOCK_NS.with(|c| c.get());
         (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
     }
     fn set_now(ns: u64) {
-        CLOCK_NS.store(ns, Ordering::Relaxed);
+        CLOCK_NS.with(|c| c.set(ns));
     }
     fn read(t: &TimerFd) -> Result<u64, Errno> {
         let mut b = [0u8; 8];
