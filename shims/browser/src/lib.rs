@@ -10909,6 +10909,12 @@ fn note_intrinsics(addr: u64) {
     if !unsafe { INTRINSICS_ON } {
         return;
     }
+    // Not in a 32-bit (i386) process: the intrinsic block reads the 64-bit
+    // register arguments and pops an 8-byte return address, and i386 cdecl
+    // passes them on the stack.
+    if with_host(|h| h.kernel.compat) {
+        return;
+    }
     let Some((path, start)) = with_host(|h| {
         let v = h.kernel.mem.vmas().iter().find(|v| {
             addr >= v.start && addr < v.end && v.prot & gex_kernel::mem::prot::EXEC != 0

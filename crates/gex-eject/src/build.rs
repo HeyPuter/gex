@@ -406,6 +406,12 @@ fn bind_replacements(
         if *abi == Abi::Entry && !matches!(target, Target::Symbol(_) | Target::Offset { .. }) {
             bail!("{what}: the \"entry\" ABI replaces a function by \"symbol\" or \"offset\"");
         }
+        // Replacement blocks take the 64-bit calling convention (arguments
+        // in registers, an 8-byte return address); an i386 object's cdecl is
+        // not that, so binding one there would call it with garbage.
+        if let Some(p) = placed.iter().find(|p| p.image.class32 && (object.is_empty() || p.obj.path == *object || p.obj.path.rsplit('/').next() == Some(object.as_str()))) {
+            bail!("{what}: {} is 32-bit (i386) code, which replacements do not support yet", p.obj.path);
+        }
         // The object(s), each checked against the hash it was written for.
         let objs: Vec<&Placed> = if object.is_empty() {
             if want.is_some() {
@@ -769,6 +775,12 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
     // definition, as a closure build and the runtime translator use them.
     let mut intrinsics: HashMap<u64, Intrinsic> = HashMap::new();
     for p in &placed {
+        // Not for 32-bit (i386) objects: the intrinsic block reads the 64-bit
+        // register arguments and pops an 8-byte return address, and i386
+        // cdecl passes them on the stack.
+        if p.image.class32 {
+            continue;
+        }
         let (tlo, thi) = p.image.text_range;
         for s in &p.image.symbols {
             let a = s.value; // gex-ld biases symbol values
