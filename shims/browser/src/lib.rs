@@ -56,6 +56,11 @@ extern "C" {
     fn warn(ptr: u32, len: u32);
     /// Nanoseconds since an arbitrary epoch.
     fn now() -> i64;
+    /// Block until the host has delivered every `write` so far. Called just
+    /// before this process's exit is published: output from different
+    /// processes reaches the host by different routes, so without it a parent
+    /// that waited for this process could print before its last output.
+    fn drain_output();
 
     // The network. A page cannot open a socket, so each of these asks JS, which
     // has a Wisp connection to a proxy. All non-blocking: only the kernel can
@@ -6989,7 +6994,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
             }
         }
     }
-    h.kernel.procs.exit(pid, code);
+    publish_exit(h, pid, code);
     // Nothing to hand the stack to: other processes are other Workers already
     // running, and the parent's `wait4` finds the status in the shared table.
     if tracing() {
@@ -11752,8 +11757,20 @@ pub extern "C" fn gex_abandon(code: i32) {
                 k_pty_forget(pid);
             }
         }
-        h.kernel.procs.exit(pid, code);
+        publish_exit(h, pid, code);
     });
+}
+
+/// Make this process's exit visible to its parent (`wait4`, `waitid`,
+/// `SIGCHLD`), after everything it wrote has reached the host. Output from
+/// different processes reaches the host by different routes (a Worker's
+/// messages, which nothing orders against another Worker's), so a parent that
+/// waited for this process could otherwise print before this process's last
+/// output did.
+fn publish_exit(h: &mut Host, pid: i32, status: i32) {
+    // SAFETY: no arguments; the host only waits for its own deliveries.
+    unsafe { drain_output() };
+    h.kernel.procs.exit(pid, status);
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.
@@ -11782,7 +11799,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         let pid = my_pid();
         with_host(|h| {
             if h.exit.is_none() {
-                h.kernel.procs.exit(pid, status);
+                publish_exit(h, pid, status);
             }
         });
         return 0;
@@ -11798,7 +11815,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
             0
         }
     };
-    with_host(|h| h.kernel.procs.exit(pid, status));
+    with_host(|h| publish_exit(h, pid, status));
     warn_line(&format!(
         "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
     ));

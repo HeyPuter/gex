@@ -197,6 +197,11 @@ export class Env {
   }
   /** Nanoseconds since an arbitrary epoch. */
   now() { return BigInt(Math.round(performance.now() * 1e6)); }
+  /**
+   * Block until everything `write` has been handed is delivered. Called just
+   * before the process's exit is published. Synchronous output needs nothing.
+   */
+  drainOutput() {}
 
   /**
    * Called when every guest thread is waiting for input. Resolve once some has
@@ -765,6 +770,7 @@ export class Gex {
           ).replace(/\n$/, ''),
         ),
         now: () => this.#env.now(),
+        drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
         net_open: () => (this.#net ? this.#net.open() : 0),
