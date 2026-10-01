@@ -880,7 +880,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                     continue;
                 }
                 for w in 0..words.min(16) {
-                    m.write_u64(set + (w as u64) * 8, out[i][w])?;
+                    m.write_bits64(set + (w as u64) * 8, out[i][w])?;
                     per[i] += out[i][w].count_ones() as u64;
                     ready += out[i][w].count_ones() as u64;
                 }
@@ -898,7 +898,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
             // caller that passed the set expects it cleared.
             if *exceptfds != 0 {
                 for w in 0..words.min(16) {
-                    m.write_u64(*exceptfds + (w as u64) * 8, 0)?;
+                    m.write_bits64(*exceptfds + (w as u64) * 8, 0)?;
                 }
             }
             Ok(ready)
@@ -1756,7 +1756,7 @@ impl Kernel {
             // seconds and then reported success: musl saw `ENOSYS` and spun,
             // 1.6 million syscalls' worth, until the child ended by itself.
             nr::RT_SIGSUSPEND => {
-                let want = m.read_u64(a[0]).ok()?;
+                let want = m.read_bits64(a[0]).ok()?;
                 let restore_mask = self.signals.blocked;
                 // Neither `SIGKILL` nor `SIGSTOP` can be blocked, here or
                 // anywhere else.
@@ -2496,12 +2496,12 @@ impl Kernel {
                 m.write_u32(old, a.handler as u32)?;
                 m.write_u32(old + 4, a.flags as u32)?;
                 m.write_u32(old + 8, a.restorer as u32)?;
-                m.write_u64(old + 12, a.mask)?;
+                m.write_bits64(old + 12, a.mask)?;
             } else {
                 m.write_u64(old, a.handler)?;
                 m.write_u64(old + 8, a.flags)?;
                 m.write_u64(old + 16, a.restorer)?;
-                m.write_u64(old + 24, a.mask)?;
+                m.write_bits64(old + 24, a.mask)?;
             }
         }
         if act != 0 {
@@ -2510,14 +2510,14 @@ impl Kernel {
                     handler: m.read_u32(act)? as u64,
                     flags: m.read_u32(act + 4)? as u64,
                     restorer: m.read_u32(act + 8)? as u64,
-                    mask: m.read_u64(act + 12)?,
+                    mask: m.read_bits64(act + 12)?,
                 }
             } else {
                 SigAction {
                     handler: m.read_u64(act)?,
                     flags: m.read_u64(act + 8)?,
                     restorer: m.read_u64(act + 16)?,
-                    mask: m.read_u64(act + 24)?,
+                    mask: m.read_bits64(act + 24)?,
                 }
             };
             self.signals.set_action(signo, a)?;
@@ -2530,7 +2530,7 @@ impl Kernel {
     /// `signal-1` set, which is exactly the shape `Signals::pending` holds.
     fn sys_rt_sigpending(&self, m: &mut GuestMem<'_>, set: u64) -> SysResult {
         if set != 0 {
-            m.write_u64(set, self.signals.pending_raw())?;
+            m.write_bits64(set, self.signals.pending_raw())?;
         }
         Ok(0)
     }
@@ -2559,10 +2559,10 @@ impl Kernel {
         const SIG_UNBLOCK: u32 = 1;
         const SIG_SETMASK: u32 = 2;
         if old != 0 {
-            m.write_u64(old, self.signals.blocked)?;
+            m.write_bits64(old, self.signals.blocked)?;
         }
         if set != 0 {
-            let mask = m.read_u64(set)?;
+            let mask = m.read_bits64(set)?;
             self.signals.blocked = match how {
                 SIG_BLOCK => self.signals.blocked | mask,
                 SIG_UNBLOCK => self.signals.blocked & !mask,
@@ -4198,7 +4198,7 @@ impl Kernel {
                 continue;
             }
             for w in 0..(nfds as usize).div_ceil(64) {
-                let word = m.read_u64(set + (w as u64) * 8).ok()?;
+                let word = m.read_bits64(set + (w as u64) * 8).ok()?;
                 if word == 0 {
                     continue;
                 }
@@ -4723,7 +4723,7 @@ impl Kernel {
     /// not implemented: a caller that asks to wait gets `EAGAIN`, which suits
     /// every caller seen so far (draining blocked signals, not sleeping).
     fn sys_rt_sigtimedwait(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let set = if a[0] == 0 { 0 } else { m.read_u64(a[0])? };
+        let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
         match self.signals.take_pending_in(set) {
             Some(signal) => {
                 // A `siginfo_t` the caller can read the number out of: si_signo,

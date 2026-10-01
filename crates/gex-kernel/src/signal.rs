@@ -1113,7 +1113,7 @@ fn setup_frame_ppc(
     m.write_u32(uc + UC_STACK + 8, signals.alt_stack.size as u32)?;
     let mc = uc + UC_MCONTEXT;
     m.write_u32(uc + UC_REGS, mc as u32)?;
-    m.write_u64(uc + UC_SIGMASK, signals.suspend_restore.take().unwrap_or(signals.blocked))?;
+    m.write_bits64(uc + UC_SIGMASK, signals.suspend_restore.take().unwrap_or(signals.blocked))?;
 
     let g = |i: u64| mc + i * 4;
     for n in 0..32u8 {
@@ -1178,7 +1178,7 @@ fn sigreturn_ppc(signals: &mut Signals, m: &mut GuestMem<'_>, ctx_addr: u64) -> 
     let sp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
     let frame = sp + CALLER;
     let uc = frame + UC;
-    let mask = m.read_u64(uc + UC_SIGMASK)?;
+    let mask = m.read_bits64(uc + UC_SIGMASK)?;
     let mc = m.read_u32(uc + UC_REGS)? as u64;
     let g = |i: u64| mc + i * 4;
     for n in 0..32u8 {

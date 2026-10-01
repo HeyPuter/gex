@@ -193,6 +193,27 @@ impl<'a> GuestMem<'a> {
         }
     }
 
+    /// 64 bits of a guest bitmap made of C `long`s: a `sigset_t`, an
+    /// `fd_set` word. Bit `n` is signal `n + 1` or descriptor `n`. On a
+    /// 64-bit or little-endian guest that is one `u64`; a 32-bit big-endian
+    /// guest stores two words, the one holding bits 0-31 first.
+    pub fn read_bits64(&self, addr: u64) -> Result<u64, Errno> {
+        if gex_abi::BIG_ENDIAN {
+            let lo = self.read_u32(addr)? as u64;
+            let hi = self.read_u32(addr + 4)? as u64;
+            return Ok(lo | (hi << 32));
+        }
+        self.read_u64(addr)
+    }
+
+    pub fn write_bits64(&mut self, addr: u64, v: u64) -> Result<(), Errno> {
+        if gex_abi::BIG_ENDIAN {
+            self.write_u32(addr, v as u32)?;
+            return self.write_u32(addr + 4, (v >> 32) as u32);
+        }
+        self.write_u64(addr, v)
+    }
+
     /// Read a NUL-terminated guest string, bounded by `max` bytes.
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
         let start = addr as usize;
