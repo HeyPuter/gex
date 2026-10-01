@@ -51,6 +51,12 @@ pub struct Remote {
     /// Not read -- only stat'd: Xvfb binds `/tmp/.X11-unix/X0` and its startup
     /// script waits for that path to exist before launching a client.
     pub mksocket: extern "C" fn(path: u32, path_len: u32) -> i32,
+    /// Set a path's modification time (`utimensat`, a bundle's file times).
+    pub set_mtime: extern "C" fn(path: u32, path_len: u32, secs: i64) -> i32,
+    /// Set an open file's modification time. The global kernel has no clock
+    /// of its own, so a write's time is the writing process's: it stamps the
+    /// file after each write.
+    pub touch: extern "C" fn(handle: i32, secs: i64) -> i32,
 }
 
 /// Serialised [`Metadata`] size. Both modules compile this file so they agree,
@@ -189,6 +195,10 @@ impl FileSystem for RemoteFs {
         let p = path.as_bytes();
         let (a, n) = at(p);
         let h = ok((self.remote.open)(a, n, flags, mode))?;
+        // Created or truncated: written now, by this process's clock.
+        if flags & (crate::fs::oflags::O_CREAT | crate::fs::oflags::O_TRUNC) != 0 {
+            (self.remote.touch)(h, super::tmpfs::now());
+        }
         Ok(Arc::new(RemoteHandle {
             id: h,
             remote: self.remote,
@@ -242,6 +252,11 @@ impl FileSystem for RemoteFs {
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (a, n) = at(path.as_bytes());
         ok((self.remote.chmod)(a, n, mode)).map(|_| ())
+    }
+
+    fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
+        let (a, n) = at(path.as_bytes());
+        ok((self.remote.set_mtime)(a, n, secs)).map(|_| ())
     }
 
     fn link(&self, from: &str, to: &str) -> Result<(), Errno> {
@@ -309,7 +324,14 @@ impl FileHandle for RemoteHandle {
             buf.as_ptr() as u32,
             buf.len() as u32,
         ))?;
+        if n > 0 {
+            (self.remote.touch)(self.id, super::tmpfs::now());
+        }
         Ok(n as u64)
+    }
+
+    fn set_mtime(&self, secs: i64) -> Result<(), Errno> {
+        ok((self.remote.touch)(self.id, secs)).map(|_| ())
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -336,6 +358,8 @@ impl FileHandle for RemoteHandle {
     }
 
     fn truncate(&self, len: u64) -> Result<(), Errno> {
-        ok((self.remote.truncate)(self.id, len)).map(|_| ())
+        ok((self.remote.truncate)(self.id, len))?;
+        (self.remote.touch)(self.id, super::tmpfs::now());
+        Ok(())
     }
 }

@@ -161,6 +161,8 @@ run options:
                   every program shares, and a closure built for one program
                   holds only the libc paths that program walks
   --no-jit        no runtime translation; implies --exhaustive
+  --cgen          the function tier: compile the program's blocks as C with
+                  clang (needs clang and wasm-ld; docs/function-tier.md)
   --lazy          discover only from the entry point, leaving the rest to
                   runtime translation; much faster to start on a big binary
   --no-cache      do not reuse compiled modules between runs
@@ -202,6 +204,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut exhaustive = false;
     let mut no_jit = false;
     let mut lazy = false;
+    let mut cgen = false;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
     let mut i = 0;
@@ -289,6 +292,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             }
             "--no-jit" => no_jit = true,
             "--lazy" => lazy = true,
+            "--cgen" => cgen = true,
             "--no-cache" => opts.cache = false,
             "--cwd" => {
                 i += 1;
@@ -330,6 +334,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 .into(),
         );
     }
+    // The function tier's C code carries no profiling instrumentation: a
+    // recorded run would lose every count in it without a word.
+    if cgen && opts.record.is_some() {
+        bail!(
+            "--cgen cannot be combined with --record or GEX_PROFILE=1: the function tier's \
+             C code is not instrumented, so the profile would silently miss everything it runs \
+             (record with tier-1, then build with --cgen)"
+        );
+    }
     Ok(RunArgs {
         path,
         argv0,
@@ -338,11 +351,27 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         xlate: Options {
             exhaustive: exhaustive || no_jit,
             lazy: lazy && !no_jit,
+            cgen,
             ..Options::default()
         },
         jit: !no_jit,
         wine_prefix,
     })
+}
+
+/// The memcpy/memmove/memset/mempcpy definitions in `image`'s own text, by
+/// address (`Symbol::value` is already biased), for `Options::intrinsics`:
+/// a plain build and `gexc run` serve them with the host builtins, as closure
+/// builds and the browser's runtime translator do, so every path agrees on
+/// what those functions are.
+fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
+    let (tlo, thi) = image.text_range;
+    image
+        .symbols
+        .iter()
+        .filter(|s| !s.ifunc && s.value >= tlo && s.value < thi)
+        .filter_map(|s| gex_xlate::intrinsic::recognise(&s.name).map(|k| (s.value, k)))
+        .collect()
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
@@ -367,6 +396,13 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         std::fs::read(host).ok()
     })
     .with_context(|| format!("loading {}", ra.path))?;
+    if let Some(why) = gex_xlate::cgen_refuses_image(ra.xlate.cgen, program.exe.class32) {
+        bail!("{}: {why}", ra.path);
+    }
+    ra.xlate.intrinsics = image_intrinsics(&program.exe);
+    if let Some(i) = &program.interp {
+        ra.xlate.intrinsics.extend(image_intrinsics(i));
+    }
 
     // argv[0] is the path as invoked, then whatever followed. Under a sysroot
     // that host path may mean nothing to the guest, so it can be overridden.
@@ -470,6 +506,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut also: Vec<String> = Vec::new();
     let mut sysroot: Option<String> = None;
     let mut profile: Vec<u64> = Vec::new();
+    let mut cgen = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -523,6 +560,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
                 also.extend(found);
             }
             "--shared-image" => shared_image = true,
+            // The function tier: the blocks as C, through clang, spliced into
+            // the module (docs/function-tier.md).
+            "--cgen" => cgen = true,
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
@@ -556,6 +596,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let out = out.unwrap_or_else(|| format!("{path}.wasm"));
 
     if closure {
+        if cgen {
+            bail!("--cgen does not handle --closure builds yet");
+        }
         return build_closure(
             &path, &also, sysroot.as_deref(), &out, exhaustive, &exhaustive_for, shared_memory,
             no_validate, shared_image, &profile,
@@ -566,11 +609,16 @@ fn cmd_build(args: &[String]) -> Result<()> {
     // A 32-bit (i386) program's code must be decoded in compatibility mode,
     // exactly as the runtime path does before translating (`run_program_with`).
     gex_xlate::set_compat(image.class32);
+    if let Some(why) = gex_xlate::cgen_refuses_image(cgen, image.class32) {
+        bail!("{path}: {why}");
+    }
     let (module, stats) = gex_xlate::translate_image(
         &image,
         &Options {
             exhaustive,
             shared_memory,
+            cgen,
+            intrinsics: image_intrinsics(&image),
             ..Options::default()
         },
     );
@@ -1518,6 +1566,22 @@ fn cmd_profile(args: &[String]) -> Result<()> {
             Ok(())
         }
         _ => bail!("usage: gexc profile merge (-o OUT | --split DIR) IN... | gexc profile show [--top N] IN"),
+    }
+}
+
+#[cfg(test)]
+mod cgen_profile_tests {
+    use super::parse_run_args;
+
+    #[test]
+    fn cgen_with_record_fails_loudly() {
+        let args: Vec<String> = ["--cgen", "--record", "/tmp/x", "prog"].iter().map(|s| s.to_string()).collect();
+        let err = parse_run_args(&args).err().expect("--cgen with --record must be refused");
+        assert!(format!("{err}").contains("--record"), "{err}");
+        let ok: Vec<String> = ["--cgen", "prog"].iter().map(|s| s.to_string()).collect();
+        if std::env::var_os("GEX_PROFILE").is_none() {
+            assert!(parse_run_args(&ok).is_ok());
+        }
     }
 }
 
