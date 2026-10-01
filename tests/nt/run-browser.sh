@@ -58,6 +58,8 @@ for arch in ${ARCHES:-x64 x86}; do
     check $arch/gdi 0 "$allok" $arch "$b/gdi.exe"
     check $arch/input 0 "$allok" $arch "$b/input.exe"
     check $arch/filemap 0 "$allok" $arch "$b/filemap.exe"
+    # Code written, rewritten and reallocated at run time (a JIT).
+    check $arch/jitcode 0 "$allok" $arch "$b/jitcode.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" $arch "$b/exitproc.exe"
     check $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" $arch "$b/seh.exe"
     check $arch/seh-traps 0 "$allok" $arch "$b/seh.exe" traps

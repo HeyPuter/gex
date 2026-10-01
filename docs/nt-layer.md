@@ -694,9 +694,11 @@ layer never holds the kernel across a callback or a wait (natively that
 would deadlock on the `Mutex`), so `KLock`'s per-Worker re-entrancy never
 sees two live borrows.
 
-Not yet in the browser: retiring translations of code that is unmapped
-(the lists are drained and dropped; Wine rarely unloads a DLL), opengl32
-over `/dev/gex-gl`, and the display (§6a).
+Code that goes away (an unmapped image, a protection change -- LuaJIT
+rewrites its machine code in place) loses its translations as natively: the
+pages leave the shared page table and their dispatch-directory entries go
+back to the miss stub, so the next branch from any Worker re-lifts what is
+there now.
 
 Milestones (from the S12 brief): **N1** x64 console hello through Wine's PE
 ntdll/kernelbase/kernel32/msvcrt; **N2** threads, sync, SEH; **N3** the 32-bit

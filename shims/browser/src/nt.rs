@@ -322,12 +322,16 @@ mod imp {
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
         tick();
-        // Code that went away keeps its translations here: the browser has
-        // no retirement yet (docs/nt-layer.md §10.2). The lists are drained
-        // so they do not grow.
+        // Code that went away (an unmapped image, a protection change: LuaJIT
+        // rewrites its machine code in place) loses its translations, as
+        // natively. NT images are never statically recompiled, so newly mapped
+        // code needs nothing.
         with_host(|h| {
-            h.kernel.retired_code.clear();
+            let retired = std::mem::take(&mut h.kernel.retired_code);
             h.kernel.new_code.clear();
+            if !retired.is_empty() {
+                retire(h, &retired);
+            }
         });
         let resume_pc = || GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         match outcome {
@@ -376,6 +380,31 @@ mod imp {
             // The result is with the thread; trapping here ends the innermost
             // nested loop, which asks `gex_nt_callback_done`.
             nt::Outcome::CallbackReturn => trap(),
+        }
+    }
+
+    /// Forget every translation in `ranges`, the browser's
+    /// `retire_translations`: the pages leave the shared page table and their
+    /// directory entries go back to the miss stub, so the next branch there
+    /// (from any Worker) lifts what is there now into fresh slots. The old
+    /// slots are left behind, unreachable.
+    fn retire(h: &mut crate::Host, ranges: &[(u64, u64)]) {
+        use std::sync::atomic::AtomicU32;
+        for &(start, end) in ranges {
+            if end <= start {
+                continue;
+            }
+            h.jit.translated.retain(|a| *a < start || *a >= end);
+            for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
+                if page >= gex_abi::DISPATCH_MAX_PAGES {
+                    break;
+                }
+                h.jit.page_table.forget(page);
+                let at = gex_abi::DISPATCH_DIR + page * 4;
+                // SAFETY: the directory is in the shared memory, four-byte
+                // aligned, and every Worker's dispatch reads it as a word.
+                unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
+            }
         }
     }
 
