@@ -50,7 +50,6 @@ self.onmessage = async ({ data: m }) => {
   try {
     if (m.kind === 'init') {
       stats = new Int32Array(m.stats);
-      globalThis.__gexDumpWgsl = m.dumpWgsl || 0;
       // Emscripten resolves the C selector "#gex-gl" through document even
       // for an OffscreenCanvas. Supply the one selector this worker owns.
       globalThis.document = { querySelector: () => m.canvas };

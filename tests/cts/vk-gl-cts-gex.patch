@@ -55,4 +55,4 @@ index 0000000..288e9b4
 +# the exact same one-object EGL/GLES marshaller that the browser guest loads.
 +set(DEQP_PLATFORM_LIBRARIES "${GEX_GUEST_GL_LIBRARY}" dl pthread)
 +add_definitions(-DDEQP_OPENGL_LIBRARY_PATH="libGLESv2.so.2")
-+include_directories("${CMAKE_SOURCE_DIR}/../mobilegl-webgpu/include")
++include_directories("${CMAKE_SOURCE_DIR}/../mesa/include")
