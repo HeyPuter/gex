@@ -291,13 +291,31 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
                     let Some(a) = a else {
                         finish!(unsupported());
                     };
-                    let (sig, se, cw) = (a[0], a[1] as u16, a[2] as u16);
-                    let (r, sw) = match *op {
-                        X87Op::Narrow { single } => gex_f80::narrow_op(sig, se, cw, single),
-                        X87Op::ToInt { bits, trunc } => gex_f80::to_int_op(sig, se, cw, bits, trunc),
+                    let f = |i: usize| gex_f80::F80 {
+                        sig: a[i],
+                        se: a[i + 1] as u16,
                     };
-                    vals.insert(outs[0], r);
-                    vals.insert(outs[1], sw as u64);
+                    let r: Vec<u64> = match *op {
+                        X87Op::Narrow { single } => {
+                            let (r, sw) = gex_f80::narrow_op(a[0], a[1] as u16, a[2] as u16, single);
+                            vec![r, sw as u64]
+                        }
+                        X87Op::ToInt { bits, trunc } => {
+                            let (r, sw) = gex_f80::to_int_op(a[0], a[1] as u16, a[2] as u16, bits, trunc);
+                            vec![r, sw as u64]
+                        }
+                        X87Op::Arith(k) => {
+                            let (r, sw) = gex_f80::arith_op(k as u8, f(0), f(2), a[4] as u16);
+                            vec![r.sig, r.se as u64, sw as u64]
+                        }
+                        X87Op::Compare { quiet } => {
+                            let (cc, sw) = gex_f80::compare_op(f(0), f(2), quiet);
+                            vec![cc as u64, sw as u64]
+                        }
+                    };
+                    for (o, v) in outs.iter().zip(r) {
+                        vals.insert(*o, v);
+                    }
                 }
                 Stmt::Trap { cond, pc, code } => match get(&vals, *cond) {
                     Some(0) => {}

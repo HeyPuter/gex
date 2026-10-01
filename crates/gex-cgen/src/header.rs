@@ -60,6 +60,7 @@ pub fn header() -> String {
         ("X87_CW", ctx::X87_CW),
         ("X87_SW", ctx::X87_SW),
         ("X87_TAGS", ctx::X87_TAGS),
+        ("X87_TMP", ctx::X87_TMP),
         ("SCRATCH", ctx::SCRATCH),
         ("SIZE", ctx::SIZE),
     ];
@@ -88,6 +89,13 @@ pub fn header() -> String {
     decl(w, imports::CACHE_OP, "void", "gex_cache_op", "int ctx, int64_t pc, int32_t op, int64_t addr");
     decl(w, imports::FMA, "int64_t", "gex_fma", "int ctx, int64_t a, int64_t b, int64_t c, int32_t dbl");
     decl(w, imports::SAFEPOINT, "void", "gex_safepoint", "int ctx, int64_t pc");
+    decl(
+        w,
+        imports::X87,
+        "int64_t",
+        "gex_x87",
+        "int ctx, int32_t op, int64_t a_sig, int32_t a_se, int64_t b_sig, int32_t b_se, int32_t cw",
+    );
     let _ = writeln!(
         w,
         "/* Tail-called with ctx.LAST_TARGET holding the target; the splice replaces\n   \
@@ -101,9 +109,13 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_FMA_SAFE_LO {}ull", gex_emit::fma::SAFE_LO);
     let _ = writeln!(w, "#define GEX_FMA_SAFE_HI {}ull", gex_emit::fma::SAFE_HI);
     w.push_str(BODY_HELPERS);
+    w.push_str(X87_HELPERS);
     w.push_str("#endif\n");
     h
 }
+
+/// The x87 helpers, `Stmt::X87`'s lowering (see `emit.rs`).
+const X87_HELPERS: &str = include_str!("../runtime/x87.h");
 
 const BODY_TYPES: &str = r#"
 /* Unaligned, alias-everything views of guest memory: a guest access is a
