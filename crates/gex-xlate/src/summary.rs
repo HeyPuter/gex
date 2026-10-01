@@ -1011,7 +1011,10 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
                 acc.stack_inputs = Slots::Unknown;
             }
             let w = s.caller_frame_writes.shift(o);
-            st.kill_slots(w);
+            // Optimistic mode: a callee leaves its caller's frame alone.
+            if !(st.trust_frame && w == Slots::Unknown) {
+                st.kill_slots(w);
+            }
             match w {
                 Slots::Range(a, b) if b > 0 => {
                     acc.caller_frame_writes = acc.caller_frame_writes.add(a.max(0), b)
@@ -1051,7 +1054,10 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
             t = t.union(st.regs[reg_index(r)].taint);
         }
     }
-    let new_sp = match (sp.sp_off(), s.sp_delta) {
+    // Optimistic mode: a callee whose stack effect is not known keeps the
+    // ABI's (pops its return address; not on i386, where stdcall pops more).
+    let delta = s.sp_delta.or(if st.trust_frame { abi_callee().sp_delta } else { None });
+    let new_sp = match (sp.sp_off(), delta) {
         (Some(o), Some(d)) => Some(AV {
             ex: Ex::Entry(SP as u8, o + d),
             taint: sp.taint,
@@ -1158,9 +1164,11 @@ fn known_values_mode(f: &Function, sums: Option<&Summaries>, trust_frame: bool) 
 /// table has the same shape, so this is a description, not a verdict: the
 /// jumps stay [`FTerm::Unresolved`].
 pub fn frame_torn_down(f: &Function, sums: &Summaries) -> Vec<u64> {
+    // A description, so the optimistic mode: a saved return address
+    // reloaded after a call to unknown code still counts.
     let ctx = Ctx {
         sums: &sums.map,
-        trust_frame: false,
+        trust_frame: true,
     };
     let mut acc_out = Vec::new();
     analyze_fn_full(f, &ctx, None, Some(&mut acc_out));

@@ -868,6 +868,32 @@ fn resolve_one(
     let FTerm::Unresolved { target } = f.block(b).term else {
         return None;
     };
+    // 0. A target the same on every execution (`adr x3, f; ...; br x3`): a
+    // switch of one case, complete when nothing assumed or writable fed it.
+    {
+        let mut ev = Eval {
+            defs,
+            code,
+            memo: HashMap::new(),
+            loads: Vec::new(),
+            writable: false,
+            assumed: false,
+        };
+        if let Some(t) = ev.eval(target, 0) {
+            if code.is_code(t) {
+                return Some(Table {
+                    cases: vec![t],
+                    table: JumpTable {
+                        base: ev.loads.first().map_or(t, |l| l.0),
+                        entry_bytes: 0,
+                        count: 1,
+                        index: None,
+                        complete: !ev.writable && !ev.assumed,
+                    },
+                });
+            }
+        }
+    }
     // 1. The bound check: the first dominating bound the target depends on.
     let bs = bounds(f, defs, preds, b);
     if std::env::var_os("GEX_JT_DEBUG").is_some() {
