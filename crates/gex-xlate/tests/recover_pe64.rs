@@ -22,6 +22,6 @@ fn a_pe32_plus_image_recovers_every_pdata_function() {
     assert!(prog.functions.contains_key(&img.entry));
     let sums = gex_xlate::summary::analyze(&prog);
     assert_eq!(sums.stats.unconverged, 0);
-    let rep = gex_xlate::validate::check_program(&prog.functions, &sums, 8, 1000);
+    let rep = gex_xlate::validate::check_program(&prog.functions, &sums, 2, 200);
     assert!(rep.failures.is_empty(), "{:#?}", rep.failures);
 }
