@@ -54,9 +54,18 @@ layout, the same for PE32 and PE32+ processes:
 | `0x0030_0000–0x003e_0000` | **host-call slots**: gex-ld's placeholder range and format (16-byte entries). A jump to an entry reaches the dispatch-miss path; the NT layer routes it to a registered native function (a per-DLL redirect) or fails loudly with the entry's `DLL!name`. |
 | `0x003e_0000–0x003f_0000` | NT kernel data, runtime-owned: per-thread wait words (§3.3) |
 | `0x003f_0000–0x0040_0000` | **NT trampolines**: a page of real x86 code gex writes at boot, mapped read+execute (the unix-call dispatcher, the i386 syscall dispatcher, the callback-return stub) |
-| `0x0040_0000–0x8000_0000` | the NT allocator's range: images, `NtAllocateVirtualMemory`, stacks, TEBs, PEB, heaps |
+| `0x0040_0000–0x7fff_0000` | the NT allocator's range: images, `NtAllocateVirtualMemory`, stacks, TEBs, PEB, heaps (the top is Windows' `MmHighestUserAddress + 1`) |
 | `0x7ffe_0000–0x7ffe_1000` | `KUSER_SHARED_DATA` (fixed by the Windows ABI, carved out of the range above) |
-| `0x8000_0000–0xffff_0000` | unused for now; later only data allocations of `LARGEADDRESSAWARE` programs |
+| `0x8000_0000–0xffff_0000` | natively unused (later: data allocations of `LARGEADDRESSAWARE` programs); in the browser, the shim's heap (§10.2) |
+
+In the browser the shim shares this address space with the guest. Its stack
+and data are at fixed addresses (`0x0580_0000`–`__heap_base`) and its heap
+has taken an arena span or two by the time a program loads, so boot reserves
+`STACK_TOP - STACK_SIZE` (0x0500_0000) up to the heap's cursor as a
+`[gex-shim]` region the allocator never hands out, grows the memory to 2 GiB
+at once (KUSER_SHARED_DATA and the top-down PEB/TEBs reach the top anyway),
+and moves the heap's cursor to 0x8000_0000 with its ceiling at the top of
+the memory. Noita's exe (0x40_0000, 13 MiB) is well below the reservation.
 
 **The allocator** is bottom-up first fit at 64 KiB granularity, as Windows'
 `NtAllocateVirtualMemory(NULL)` is, and as gex wants: in the browser linear
@@ -373,6 +382,43 @@ Callbacks nest to any depth: each level is one host frame plus one wasm
   (merge plan §4) never matters here. Thread migration between Workers is not
   done for NT processes.
 
+**The browser (§10.2).** The `syscall` import is the shim's `gex_syscall`,
+called from translated code; the nested level is a JS import,
+`gex_env.nt_callback(ctx, pc)`, which runs a synchronous copy of the run
+loop (`Gex.#ntCallback`) on the same Worker: `enter(ctx, pc)`, and on each
+trap the same housekeeping as the outer loop (a wanted slot filled, pending
+translations compiled with `new WebAssembly.Module` and installed, the
+Worker's tables caught up, a staged thread posted), then re-enter at
+`gex_resume_pc`. It ends when `gex_nt_callback_done(ctx)` says the thread
+holds a callback result. The shim's frames below the import are live, so
+after a trap the loop puts `__stack_pointer` back to its value at entry,
+never to the Worker's base. Nothing may yield: there is a wasm frame below.
+
+**Blocking waits inside a callback.** An NT wait blocks the calling thread
+where it is, natively and in the browser alike: `nt::sync` parks on the
+process's `FutexTable` (a condition variable; in the shared-memory build
+that is `memory.atomic.wait32` on the Worker), with the kernel lock *not*
+held. A wait inside a window procedure is therefore an ordinary blocked
+Worker, however deep the nesting. What that means:
+- Another thread wakes it the same way at any depth: the waker's
+  `notify` reaches the Worker's `wait32` directly, with no event loop
+  involved.
+- The blocked Worker's event loop does not turn, at the outer level or
+  nested. Nothing an NT process needs may arrive on it: thread start and
+  module sharing are posted *from* the Worker, and sibling translations
+  arrive through the shared registry (caught up at the next trap). Display
+  input must come the same way, through shared memory polled at a message
+  peek (`wl_poll_input`, §6a), never as a message to the Worker. So a wait
+  in a callback cannot deadlock on the page.
+- A wait can never be satisfied by a callback on the *same* thread (a
+  thread runs one level at a time), exactly as on Windows; cross-thread
+  `SendMessage` is the receiver's to dispatch (above).
+- A wait that needs a message (`MsgWaitForMultipleObjects`) is woken by the
+  queue's wake word, which `PostMessage` bumps. Input from the page is only
+  seen at the next peek, so it ends such a wait only through the wait's own
+  timeout; games pump with `PeekMessage` every frame, so this costs nothing
+  there.
+
 **Cost.** One `enter` and one trap-unwind per callback, ~µs. The census shows
 ~2k callbacks in a Noita session, so this is noise; the function tier's
 unwinding (merge plan §4.2) is the same mechanism.
@@ -605,9 +651,74 @@ From the census (Noita): `NtQueryPerformanceCounter` 44%, the futex pair 33%,
 | `sysinfo.rs` | system information, time, locale, NLS |
 | `unixcall.rs` | §6 |
 
-Shim hooks (`shims/native`): the `nt` field on the host state, the branch in
-the `syscall` import, the `NtHost` implementation (including the nested
-loop), the USD ticker, and `run_nt_program`. `gexc run` sends a PE file there.
+### 10.1 Native host (`shims/native/src/nt.rs`)
+
+The `nt` field on the host state, the branch in the `syscall` import, the
+`NtHost` implementation (including the nested loop), the USD ticker thread,
+and `run_nt_program`. `gexc run` sends a PE file there. The kernel is the
+process's `Arc<Mutex<Kernel>>`; the NT layer takes it through
+`nt::KernelCell`, implemented for `Mutex<Kernel>`.
+
+### 10.2 Browser host (`shims/browser/src/nt.rs`)
+
+The same layer in a page, shared-memory build only (an NT wait blocks its
+Worker, so a thread must be one). Hooks in `lib.rs`, each a line or two:
+- `gex_load`: a PE is not placed; once the kernel is built, `nt::boot` splits
+  the address space with the shim (§1.2), builds the `nt::Process` from the
+  page's environment list (`GEX_WINE_PREFIX`, default `/wine`;
+  `GEX_NT_TRACE`, `GEX_NT_STRICT`, `GEX_NT_TIME_SCALE`; every other entry
+  overrides the Windows environment) and calls `nt::boot::boot`.
+- `gex_syscall`: first thing, before the kernel is taken, an NT process's
+  call goes to `nt::syscall`, which maps the `Outcome` onto the shim's resume
+  slot and trap (a spawned thread is staged like a Linux `clone`, so the
+  host gives it a Worker; the main thread's `ThreadExit` waits for the
+  process, as natively).
+- `gex_breakpoint`, `gex_illegal` and the dispatch miss's not-executable
+  branch: `nt::fault` → `nt::hardware_exception`.
+- `gex_safepoint` and every NT syscall (entry and exit): `nt::tick`, which
+  updates KUSER_SHARED_DATA at most once a millisecond from a
+  `performance.now()` clock. There is no thread to spare for a ticker; a
+  guest that polls the tick count in a loop passes a safepoint.
+- The NT layer's diagnostics go to the console through `nt::set_log`
+  (`eprintln!` writes nowhere on wasm32-unknown-unknown).
+- The display, when the page brought a compositor (`gex_set_wl`): `WlDisplay`
+  publishes every visible top-level window as a toplevel record in this
+  process's block of the scene arena (`wl_publish`, the same records
+  `crate::wl` writes; client 1, surface = the window handle, XRGB8888 at the
+  surface's guest address, which the compositor reads in place), and
+  `poll_input` decodes this process's input ring (`wl_poll_input`, shared
+  memory) into `NtDisplayEvent`s, which `message::peek` turns into hardware
+  input. The compositor places and decorates the windows; coordinates are
+  surface-local either way. A configure that does not change the size (the
+  compositor sends one on every focus change) is dropped.
+- `/dev/gex-gl` is the shim's `GlDevice`, the one Linux guests use: the
+  opengl32 unixlib's submits go through `gl_submit` to the page's GL host
+  (`MesaGlDevice` in the compositor's worker with `gl: 'compositor'`).
+
+The page is `web/nt.html` (`web/src/nt-page.js`): it fetches a tar holding a
+prefix under `/wine` and the program, and runs it through `runProgram` with
+the canvas as the compositor's output. `tests/nt/browser-gui.mjs` drives it in
+headless Chromium (its own vite dev server and browser, software GL):
+`window.exe`'s window is checked by pixels, a click and Escape by what the
+program prints.
+
+**One kernel.** The process's `Kernel` is the one in the shim's `Host`, and
+the NT layer reaches it only through `HostKernel`, whose `lock_kernel` takes
+the shim's kernel lock (`KLock`) -- the lock `with_host` takes for every
+other path: the dispatch-miss translator reading the memory map, the
+scheduler and compositor pump, devices (`/dev/gex-gl`), signals and timers
+(none in an NT process), the nested callback loop's exports. There is no
+second copy of the kernel and no unlocked reference to it: the NT side's
+own state is in `nt::Process` behind its own locks, as natively. The NT
+layer never holds the kernel across a callback or a wait (natively that
+would deadlock on the `Mutex`), so `KLock`'s per-Worker re-entrancy never
+sees two live borrows.
+
+Code that goes away (an unmapped image, a protection change -- LuaJIT
+rewrites its machine code in place) loses its translations as natively: the
+pages leave the shared page table and their dispatch-directory entries go
+back to the miss stub, so the next branch from any Worker re-lifts what is
+there now.
 
 Milestones (from the S12 brief): **N1** x64 console hello through Wine's PE
 ntdll/kernelbase/kernel32/msvcrt; **N2** threads, sync, SEH; **N3** the 32-bit

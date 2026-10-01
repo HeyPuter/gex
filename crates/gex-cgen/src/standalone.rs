@@ -25,11 +25,13 @@ use std::fmt::Write;
 /// One translation unit holding `funcs` (C bodies for each, calls between
 /// them staying in C) and an exported entry for each of `roots`, as
 /// `(function entry, export name)`. `funcs` are what [`crate::select`] kept,
-/// so the C is the function tier's own; `sums` are S2's summaries, by entry.
+/// so the C is the function tier's own; `sums` are S2's summaries, by entry;
+/// `class32` says the guest is a 32-bit image (i386), as for the tier's units.
 pub fn standalone(
     funcs: &[Function],
     roots: &[(u64, String)],
     sums: &HashMap<u64, Summary>,
+    class32: bool,
 ) -> Result<String> {
     let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
     for (r, name) in roots {
@@ -39,6 +41,7 @@ pub fn standalone(
     }
     let trapfree = func::trap_free(funcs, sums);
     let mut u = FnUnit::new_standalone();
+    u.set_class32(class32);
     for f in funcs {
         u.add(f, &known, sums, &trapfree)
             .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;

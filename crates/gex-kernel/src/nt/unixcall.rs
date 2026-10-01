@@ -73,7 +73,7 @@ pub fn load_unix_lib(c: &mut Call<'_>, class: u32, addr: u64, buf: u64, len: u64
     };
     let Some(name) = name else { return Err(Status(st::INVALID_HANDLE)) };
     if c.p.cfg.trace {
-        eprintln!("[nt:{:x}]   MemoryWineLoadUnixLib {name}", c.t.tid);
+        crate::nt_log!("[nt:{:x}]   MemoryWineLoadUnixLib {name}", c.t.tid);
     }
     if DEGRADES.contains(&name.as_str()) {
         return Err(Status(st::DLL_NOT_FOUND));
@@ -121,8 +121,7 @@ fn ntdll(c: &mut Call<'_>, code: u32, args: u64) -> R {
             let s = c.g.ptr(args)?;
             let n = c.g.u32(args + if p64 { 8 } else { 4 })? as usize;
             let bytes = c.g.bytes(s, n)?;
-            use std::io::Write;
-            let _ = std::io::stderr().write_all(&bytes);
+            super::log_raw(&bytes);
             Ok(n as u32)
         }
         // `LONGLONG *`: the precise system time.

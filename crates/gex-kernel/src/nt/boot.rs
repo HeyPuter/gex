@@ -75,6 +75,39 @@ pub struct BootRequest<'a> {
     pub args: &'a [String],
 }
 
+/// The Windows environment Wine's prefix would give a program (user `gex`),
+/// before a host's overrides.
+pub fn default_environment() -> Vec<(String, String)> {
+    [
+        ("ALLUSERSPROFILE", "C:\\ProgramData"),
+        ("APPDATA", "C:\\users\\gex\\AppData\\Roaming"),
+        ("COMPUTERNAME", "GEX"),
+        ("ComSpec", "C:\\windows\\system32\\cmd.exe"),
+        ("LOCALAPPDATA", "C:\\users\\gex\\AppData\\Local"),
+        ("NUMBER_OF_PROCESSORS", "4"),
+        ("OS", "Windows_NT"),
+        ("PATH", "C:\\windows\\system32;C:\\windows;C:\\windows\\system32\\wbem"),
+        ("PATHEXT", ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"),
+        ("PROCESSOR_ARCHITECTURE", "AMD64"),
+        ("ProgramData", "C:\\ProgramData"),
+        ("ProgramFiles", "C:\\Program Files"),
+        ("PUBLIC", "C:\\users\\Public"),
+        ("SystemDrive", "C:"),
+        ("SystemRoot", "C:\\windows"),
+        ("TEMP", "C:\\users\\gex\\AppData\\Local\\Temp"),
+        ("TMP", "C:\\users\\gex\\AppData\\Local\\Temp"),
+        ("USERNAME", "gex"),
+        // What Wine's GetUserNameW reads (its loader sets it from the Unix
+        // user); shell32 builds profile paths from it.
+        ("WINEUSERNAME", "gex"),
+        ("USERPROFILE", "C:\\users\\gex"),
+        ("windir", "C:\\windows"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
 /// The PE ABI of an executable's bytes, or `None` if it is not one gex runs.
 pub fn exe_abi(bytes: &[u8]) -> Option<Abi> {
     let img = pe::parse(bytes).ok()?;
@@ -354,10 +387,10 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
     super::thread::init_start_frame(p, &mut g, &t, entry, peb).map_err(st_err("building the initial frame"))?;
     let pc = g.u64(t.ctx_addr + gex_abi::ctx::PC as u64).map_err(st_err("reading the start pc"))?;
     if std::env::var_os("GEX_NT_STATS").is_some() {
-        eprintln!("gex-nt: exe {} at {exe_base:#x}", req.exe_path);
+        crate::nt_log!("gex-nt: exe {} at {exe_base:#x}", req.exe_path);
     }
     if p.cfg.trace {
-        eprintln!(
+        crate::nt_log!(
             "[nt] boot: {} at {exe_base:#x}, ntdll at {ntdll_base:#x}, peb {peb:#x}, teb {:#x}, entering {pc:#x}",
             req.exe_path, t.teb
         );

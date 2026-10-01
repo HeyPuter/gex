@@ -565,7 +565,7 @@ fn parse_script(s: &str) -> Vec<(u64, Action)> {
     for item in s.split(';').filter(|x| !x.trim().is_empty()) {
         let mut parts = item.splitn(3, ':');
         let (Some(f), Some(a)) = (parts.next().and_then(num), parts.next()) else {
-            eprintln!("gex-nt: GEX_NT_INPUT: cannot read {item:?}");
+            crate::nt_log!("gex-nt: GEX_NT_INPUT: cannot read {item:?}");
             continue;
         };
         let arg = parts.next().unwrap_or("");
@@ -592,7 +592,7 @@ fn parse_script(s: &str) -> Vec<(u64, Action)> {
             }
             ("keydown", _, Some(k)) => out.push((f, Action::KeyDown(k as u8))),
             ("keyup", _, Some(k)) => out.push((f, Action::KeyUp(k as u8))),
-            _ => eprintln!("gex-nt: GEX_NT_INPUT: cannot read {item:?}"),
+            _ => crate::nt_log!("gex-nt: GEX_NT_INPUT: cannot read {item:?}"),
         }
     }
     out
