@@ -1030,3 +1030,31 @@ pub fn to_int_op(sig: u64, se: u16, cw: u16, bits: u8, trunc: bool) -> (u64, u32
     let v = store(&mut env, F80 { sig, se }, m, trunc);
     (v, sw_bits(&env))
 }
+
+/// The arithmetic `X87Op::Arith` names: 0 add, 1 subtract, 2 multiply,
+/// 3 divide.
+pub fn arith_op(k: u8, a: F80, b: F80, cw: u16) -> (F80, u32) {
+    let mut env = Env::from_cw(cw);
+    let r = match k {
+        0 => add(&mut env, a, b, false),
+        1 => add(&mut env, a, b, true),
+        2 => mul(&mut env, a, b),
+        _ => div(&mut env, a, b),
+    };
+    (r, sw_bits(&env))
+}
+
+/// `fcom` (`quiet` false) or `fucom` as one pure function --
+/// `X87Op::Compare`: the condition codes as status-word bits (C0 for less,
+/// C3 for equal, C0|C2|C3 unordered, none for greater) and the exception
+/// flags (C1 clear).
+pub fn compare_op(a: F80, b: F80, quiet: bool) -> (u32, u32) {
+    let mut env = Env::from_cw(0x37f);
+    let cc = match compare(&mut env, a, b, quiet) {
+        Cmp::Greater => 0,
+        Cmp::Less => 1 << 8,
+        Cmp::Equal => 1 << 14,
+        Cmp::Unordered => 1 << 8 | 1 << 10 | 1 << 14,
+    };
+    (cc, sw_bits(&env))
+}

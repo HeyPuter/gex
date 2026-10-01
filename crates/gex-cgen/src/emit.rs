@@ -643,12 +643,48 @@ impl<'a> Emitter<'a> {
                 self.line("}");
             }
             Stmt::Fence => self.line("__atomic_thread_fence(__ATOMIC_SEQ_CST);"),
-            // Not lowered yet (S14 adds the C helpers): code containing one
-            // stays tier-1 (`has_unlowered`), so reaching here is a bug.
-            Stmt::X87 { op, .. } => bail!("Stmt::X87 ({op:?}) has no C lowering yet"),
+            Stmt::X87 { op, args, outs } => self.x87(*op, args, outs),
             Stmt::StrOp { .. } => self.strop(s)?,
         }
         Ok(())
+    }
+
+    /// A `Stmt::X87`: a call to its `runtime/x87.h` helper, which returns
+    /// the first output and leaves the others in the context, where the
+    /// import leaves them.
+    fn x87(&mut self, op: X87Op, args: &[Value], outs: &[Value]) {
+        let a: Vec<String> = args.iter().map(|v| self.v(*v)).collect();
+        for (o, ty) in outs.iter().zip(op.out_types()) {
+            self.value_ty[o.0 as usize] = *ty;
+        }
+        let o: Vec<String> = outs.iter().map(|v| self.v(*v)).collect();
+        let first = match op {
+            X87Op::Narrow { single } => format!(
+                "gex_x87_narrow(ctx, {}, (uint32_t){}, (uint32_t){}, {})",
+                a[0], a[1], a[2], single as u32
+            ),
+            X87Op::ToInt { bits, trunc } => format!(
+                "gex_x87_toint(ctx, {}, (uint32_t){}, (uint32_t){}, {bits}, {})",
+                a[0], a[1], a[2], trunc as u32
+            ),
+            X87Op::Arith(k) => format!(
+                "gex_x87_arith(ctx, {}, {}, (uint32_t){}, {}, (uint32_t){}, (uint32_t){})",
+                k as u32, a[0], a[1], a[2], a[3], a[4]
+            ),
+            X87Op::Compare { quiet } => format!(
+                "gex_x87_compare(ctx, {}, {}, (uint32_t){}, {}, (uint32_t){})",
+                quiet as u32, a[0], a[1], a[2], a[3]
+            ),
+        };
+        let ty0 = cty(op.out_types()[0]);
+        self.line(format!("{ty0} {} = ({ty0}){first};", o[0]));
+        match op {
+            X87Op::Arith(_) => {
+                self.line(format!("uint32_t {} = GEX_C32(GEX_X87_SE);", o[1]));
+                self.line(format!("uint32_t {} = GEX_C32(GEX_X87_SW);", o[2]));
+            }
+            _ => self.line(format!("uint32_t {} = GEX_C32(GEX_X87_SW);", o[1])),
+        }
     }
 
     /// `tier1::clamp_len` for one base: `n = min(n, GUEST_LIMIT - base)`.
@@ -1557,8 +1593,3 @@ pub(crate) fn clobbers(s: &Stmt) -> bool {
     }
 }
 
-/// Whether `stmts` contain a statement gex-cgen cannot lower yet; such a
-/// block, or a function containing one, stays tier-1.
-pub(crate) fn has_unlowered(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| matches!(s, Stmt::X87 { .. }))
-}

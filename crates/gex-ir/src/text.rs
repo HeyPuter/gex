@@ -987,11 +987,20 @@ fn parse_expr(k: &mut Toks) -> Result<Expr, String> {
 }
 
 /// The text form of an [`X87Op`]: `narrow32`, `narrow64`, `toint16` ..
-/// `toint64`, `trunc16` .. `trunc64`.
+/// `toint64`, `trunc16` .. `trunc64`, `add`, `sub`, `mul`, `div`, `com`,
+/// `ucom`.
 fn x87_tok(op: X87Op) -> String {
     match op {
         X87Op::Narrow { single } => format!("narrow{}", if single { 32 } else { 64 }),
         X87Op::ToInt { bits, trunc } => format!("{}{bits}", if trunc { "trunc" } else { "toint" }),
+        X87Op::Arith(k) => match k {
+            X87Arith::Add => "add",
+            X87Arith::Sub => "sub",
+            X87Arith::Mul => "mul",
+            X87Arith::Div => "div",
+        }
+        .into(),
+        X87Op::Compare { quiet } => if quiet { "ucom" } else { "com" }.into(),
     }
 }
 
@@ -999,6 +1008,12 @@ fn parse_x87(t: &str) -> Option<X87Op> {
     Some(match t {
         "narrow32" => X87Op::Narrow { single: true },
         "narrow64" => X87Op::Narrow { single: false },
+        "add" => X87Op::Arith(X87Arith::Add),
+        "sub" => X87Op::Arith(X87Arith::Sub),
+        "mul" => X87Op::Arith(X87Arith::Mul),
+        "div" => X87Op::Arith(X87Arith::Div),
+        "com" => X87Op::Compare { quiet: false },
+        "ucom" => X87Op::Compare { quiet: true },
         _ => {
             let (trunc, n) = if let Some(n) = t.strip_prefix("trunc") {
                 (true, n)
