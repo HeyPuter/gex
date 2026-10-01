@@ -346,6 +346,10 @@ mod tests {
 
     #[test]
     fn an_override_dispatches_where_it_left_the_pc() {
+        // On PowerPC an eject override is illegal (no replacement ABI there).
+        if gex_abi::PPC {
+            return;
+        }
         let b = block(0x1000, Intrinsic::Override(3));
         assert!(b.stmts.iter().any(|s| matches!(s, Stmt::HostCall { func: HostFunc::SysRegWrite, .. })));
         // No register is written: the override did the return itself.
