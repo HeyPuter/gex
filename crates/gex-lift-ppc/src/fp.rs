@@ -54,12 +54,16 @@ impl<'a> Lifter<'a> {
             dst_wide: false,
             a,
         });
-        self.b.def(Expr::FpCvt {
+        let d = self.b.def(Expr::FpCvt {
             kind: FpConvert::FpToFp,
             src_wide: false,
             dst_wide: true,
             a: s,
-        })
+        });
+        // An exact single: storing it with stfs is the f32 just computed (a
+        // NaN wasm arithmetic made is quiet, which the extraction keeps).
+        self.st.single_word.insert(d, s);
+        d
     }
 
     /// `lfs`'s conversion of a single-format word to double format. For
@@ -83,7 +87,9 @@ impl<'a> Lifter<'a> {
         let manual = self.bin64c(BinOp::Or, manual, EXP);
         let e = self.binc(BinOp::And, w, 0x7f80_0000);
         let special = self.cmpc(CmpOp::Eq, e, 0x7f80_0000);
-        self.b.select(special, manual, promoted, Ty::I64)
+        let d = self.b.select(special, manual, promoted, Ty::I64);
+        self.st.single_word.insert(d, w);
+        d
     }
 
     /// `stfs`'s conversion of a double to a single-format word: the
@@ -170,7 +176,10 @@ impl<'a> Lifter<'a> {
             }
             Stfs | Stfsu | Stfsx | Stfsux => {
                 let x = self.rdf(rt);
-                let w = self.double_to_single(x);
+                let w = match self.st.single_word.get(&x) {
+                    Some(&w) => w,
+                    None => self.double_to_single(x),
+                };
                 self.store(addr, off, MemSz::B4, w, false);
             }
             Stfd | Stfdu | Stfdx | Stfdux => {

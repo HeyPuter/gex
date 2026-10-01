@@ -68,6 +68,11 @@ pub struct BlockState {
     gpr: [Option<Value>; 32],
     fpr: [Option<Value>; 32],
     swapped: std::collections::HashMap<Value, (Value, MemSz)>,
+    /// For each double this block made from a single (an `lfs`, or a
+    /// single-precision result rounded through `f32`), the single-format
+    /// word it came from: `stfs` of it stores that word, which is exactly
+    /// the architecture's conversion back (a NaN's payload included).
+    pub(crate) single_word: std::collections::HashMap<Value, Value>,
 }
 
 impl BlockState {
