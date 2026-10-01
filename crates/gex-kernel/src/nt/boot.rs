@@ -227,6 +227,16 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
 
     let mut g = G::new(mem, abi);
 
+    // The staged layout, before anything is placed (`section::Layout`).
+    let layout_path = format!("{}/{}", p.cfg.prefix, section::LAYOUT_FILE);
+    if let Ok(text) = read_file(k, &layout_path) {
+        let wine = read_file(k, &format!("{}/.wine-version", p.cfg.prefix)).unwrap_or_default();
+        let layout = section::Layout::parse(&String::from_utf8_lossy(&text), &p.cfg.prefix, &String::from_utf8_lossy(&wine))?;
+        let mut stl = p.st.lock().unwrap();
+        stl.vm.reserved = layout.ranges_under(&sys);
+        stl.layout = Some(Arc::new(layout));
+    }
+
     // The program first, so an image that cannot move gets its base.
     let exe_bytes = read_file(k, req.exe_path)?;
     let exe = Arc::new(pe::parse(&exe_bytes).map_err(|e| format!("{}: {e}", req.exe_path))?);

@@ -440,6 +440,8 @@ pub struct State {
     pub images: std::collections::BTreeMap<u64, section::ImageView>,
     /// Writable views of file-backed sections, by base, to write back.
     pub file_views: std::collections::BTreeMap<u64, section::FileView>,
+    /// The prefix's staged image layout, if it has one (`section::Layout`).
+    pub layout: Option<std::sync::Arc<section::Layout>>,
 }
 
 /// Where per-thread wait words live (docs/nt-layer.md §1.2).
@@ -473,6 +475,7 @@ impl Process {
                 vm: vm::Vm::new(),
                 images: Default::default(),
                 file_views: Default::default(),
+                layout: None,
             }),
             threads: RwLock::new(Threads::default()),
             sync: Mutex::new(sync::SyncCore::default()),

@@ -11,6 +11,7 @@ use super::object::Obj;
 use super::vm::{self, page_prot, Kind, PAGE};
 use super::{off, st, to_w, wstr, Abi, Call, Process, Status, G, R};
 use gex_ld::pe::{self, PeImage};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub const SEC_IMAGE: u32 = 0x0100_0000;
@@ -177,6 +178,134 @@ pub fn set_image_mapped_hook(f: impl Fn(&MappedImage<'_>) + Send + Sync + 'stati
 /// Map an image. `want` is a caller-chosen base (0 for "choose").
 /// Returns the base and the status (`SUCCESS`, or
 /// `IMAGE_MACHINE_TYPE_MISMATCH` for another architecture's image).
+/// The prefix's staged image layout (`PREFIX/gex-layout`, written by `gexc
+/// cgen-prefix`): a fixed base for each core Wine DLL, so the function-tier
+/// unit built for it at staging matches wherever a program loads it. Most
+/// Wine DLLs prefer the same base (0x1000_0000, or 0x1_8000_0000 above a
+/// wasm32 guest), so without it their bases follow each program's load order.
+///
+/// ```text
+/// gex-layout 1
+/// wine 11.15
+/// <base> <size> <sha256> <path in the prefix>
+/// ```
+#[derive(Debug, Default)]
+pub struct Layout {
+    /// Lower-cased guest path -> (base, size).
+    bases: HashMap<String, (u64, u64)>,
+}
+
+/// The layout file's name in the prefix and its first line.
+pub const LAYOUT_FILE: &str = "gex-layout";
+pub const LAYOUT_VERSION: &str = "gex-layout 1";
+
+/// Layout images that could not get their base (the range was taken), for
+/// `GEX_NT_STATS`.
+pub static LAYOUT_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Layout {
+    /// Parse `text` for a prefix at `prefix` staged with Wine `wine`. A
+    /// layout from another format or Wine release is refused: its bases
+    /// name DLLs that are no longer the ones staged.
+    pub fn parse(text: &str, prefix: &str, wine: &str) -> Result<Layout, String> {
+        let mut lines = text.lines();
+        if lines.next() != Some(LAYOUT_VERSION) {
+            return Err(format!("{prefix}/{LAYOUT_FILE} is not a {LAYOUT_VERSION} file; stage the prefix again (tools/nt-stage-wine.sh)"));
+        }
+        match lines.next().and_then(|l| l.strip_prefix("wine ")) {
+            Some(v) if v.trim() == wine.trim() => {}
+            other => {
+                return Err(format!(
+                    "{prefix}/{LAYOUT_FILE} was written for Wine {other:?}, the prefix is Wine {wine}; stage it again"
+                ))
+            }
+        }
+        let mut bases = HashMap::new();
+        for l in lines {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let [base, size, _sha, rel] = f[..] else {
+                return Err(format!("{prefix}/{LAYOUT_FILE}: bad line {l:?}"));
+            };
+            let hex = |v: &str| u64::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|_| format!("{prefix}/{LAYOUT_FILE}: bad number in {l:?}"));
+            bases.insert(format!("{prefix}/{rel}").to_ascii_lowercase(), (hex(base)?, hex(size)?));
+        }
+        Ok(Layout { bases })
+    }
+
+    /// The ranges of the images under `dir` (one architecture's DLL
+    /// directory: a process only ever maps one set).
+    pub fn ranges_under(&self, dir: &str) -> Vec<(u64, u64)> {
+        let dir = dir.to_ascii_lowercase();
+        let mut v: Vec<(u64, u64)> =
+            self.bases.iter().filter(|(p, _)| p.starts_with(&dir)).map(|(_, &(b, n))| (b, b + n)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn base_of(&self, path: &str) -> Option<(u64, u64)> {
+        self.bases.get(&path.to_ascii_lowercase()).copied()
+    }
+}
+
+/// One image of a planned layout: `(path in the prefix, base, size, sha256)`.
+pub type LayoutEntry = (String, u64, u64, String);
+
+/// Plan bases for one architecture's core DLLs (`gexc cgen-prefix`): an image
+/// whose preferred base is its own (no other DLL in its directory prefers it)
+/// and fits keeps it, as Wine's ntdll, kernel32, kernelbase and opengl32 do;
+/// the rest are packed downward from just below the lowest kept one, in name
+/// order, on 64 KiB boundaries. `images` is `(path, preferred base, size,
+/// sha256, preferred base unique)`.
+pub fn plan_layout(images: &[(String, u64, u64, String, bool)]) -> Vec<LayoutEntry> {
+    let span = |b: u64, n: u64| (b, b + align_up(n, vm::GRANULE));
+    let mut kept: Vec<(u64, u64)> = Vec::new();
+    let mut out: Vec<LayoutEntry> = Vec::new();
+    let mut rest: Vec<&(String, u64, u64, String, bool)> = Vec::new();
+    for im in images {
+        let (b, e) = span(im.1, im.2);
+        let fits = im.4 && b >= vm::ALLOC_LOW && e <= vm::ALLOC_HIGH && b % vm::GRANULE == 0;
+        if fits && !kept.iter().any(|&(kb, ke)| kb < e && b < ke) {
+            kept.push((b, e));
+            out.push((im.0.clone(), im.1, im.2, im.3.clone()));
+        } else {
+            rest.push(im);
+        }
+    }
+    rest.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut top = kept.iter().map(|&(b, _)| b).min().unwrap_or(0x7a80_0000);
+    for im in rest {
+        let n = align_up(im.2, vm::GRANULE);
+        top -= n;
+        out.push((im.0.clone(), top, im.2, im.3.clone()));
+    }
+    out.sort_by_key(|e| e.1);
+    out
+}
+
+/// The text of a layout file for Wine `wine` ([`Layout::parse`] reads it).
+pub fn render_layout(entries: &[LayoutEntry], wine: &str) -> String {
+    let mut s = format!("{LAYOUT_VERSION}\nwine {}\n", wine.trim());
+    for (rel, b, n, sha) in entries {
+        s.push_str(&format!("{b:#x} {n:#x} {sha} {rel}\n"));
+    }
+    s
+}
+
+/// Where a relocatable image goes: its layout base when the layout names it
+/// and the range is free, else the first free range.
+fn relocatable_base(stl: &super::State, path: &str, size: u64) -> R<u64> {
+    if let Some((b, n)) = stl.layout.as_ref().and_then(|l| l.base_of(path)) {
+        if n >= size && stl.vm.is_free(b, b + size) {
+            return Ok(b);
+        }
+        LAYOUT_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var_os("GEX_TRACE").is_some() {
+            crate::nt_log!("gex-nt: {path} could not get its layout base {b:#x} (taken); placed elsewhere, so its prebuilt unit does not apply");
+        }
+    }
+    stl.vm.find_free(align_up(size, vm::GRANULE), false, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))
+}
+
 pub fn map_image(
     p: &Process,
     k: &mut crate::Kernel,
@@ -200,7 +329,7 @@ pub fn map_image(
         }
         b
     } else {
-        stl.vm.find_free(align_up(size, vm::GRANULE), false, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))?
+        relocatable_base(&stl, path, size)?
     };
     let bytes = img.map(base).map_err(|e| {
         crate::nt_log!("gex-nt: mapping {path} at {base:#x}: {e}");
@@ -236,6 +365,9 @@ pub fn map_image(
         base,
         ImageView { base, size, pe: Arc::clone(img), path: path.to_string(), nt_path: nt_path.to_vec() },
     );
+    if std::env::var_os("GEX_NT_TRACE_IMAGES").is_some() {
+        crate::nt_log!("gex-nt: image {path} at {base:#x}+{size:#x}");
+    }
     g.zero(base, size as usize)?;
     g.write(base, &bytes)?;
     if stl.vm.mirror(&mut k.mem, base, base + size) {

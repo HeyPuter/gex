@@ -100,6 +100,10 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
     Ok(pc)
 }
 
+fn layout_misses() -> u64 {
+    nt::section::LAYOUT_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The native display (§6a.1): every published frame composites the
 /// visible top-level windows at their screen positions, cropped to their
 /// bounding box, into `PREFIX-NNNNN.ppm`. A file is what a test compares and
@@ -210,8 +214,8 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         m.read_u32(a).ok()
                     });
                     match value {
-                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} {}", start.elapsed().as_millis(), crate::jit_stats::line()),
-                        None => eprintln!("gex-nt: stats t={} presents={presents} {}", start.elapsed().as_millis(), crate::jit_stats::line()),
+                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
+                        None => eprintln!("gex-nt: stats t={} presents={presents} layout_miss={} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
                     }
                     // With --sample, the hottest guest back-edges of the last
                     // 30 s, by module, so a run that never exits can still be
