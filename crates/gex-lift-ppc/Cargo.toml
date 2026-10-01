@@ -1,0 +1,11 @@
+[package]
+name = "gex-lift-ppc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "32-bit PowerPC instruction semantics for gex, expressed in GIR"
+
+[dependencies]
+gex-isa-ppc.workspace = true
+gex-ir.workspace = true
+gex-abi.workspace = true

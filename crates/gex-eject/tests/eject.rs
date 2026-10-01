@@ -131,6 +131,52 @@ fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     out
 }
 
+/// Decompile `f`, compile it as the project's build.sh would, bind it, and
+/// build. False (skipped) without clang and wasm-ld.
+fn decompile_round_trip(p: &Path, id: &str) -> bool {
+    let have = |t: &str| std::process::Command::new(t).arg("--version").output().is_ok_and(|o| o.status.success());
+    if !have("clang") || !have("wasm-ld") {
+        eprintln!("skip: decompile round trip needs clang and wasm-ld");
+        return false;
+    }
+    let d = gex_eject::decompile::decompile(p, "prog", "f", None, false, false).unwrap();
+    assert!(d.entry.contains("\"abi\": \"entry\""), "{}", d.entry);
+    assert!(d.entry.contains(id));
+    let c = p.join(&d.file);
+    let src = std::fs::read_to_string(&c).unwrap();
+    assert!(src.contains("decompiled_f(int ctx)") && !src.contains("gexc_dispatch(ctx)"), "{src}");
+    let obj = p.join("build/f.o");
+    std::fs::create_dir_all(p.join("build")).unwrap();
+    let ok = std::process::Command::new("clang")
+        .args(gex_cgen::toolchain::CFLAGS)
+        .arg("-fvisibility=default")
+        .arg(format!("-I{}", p.join("gen").display()))
+        .arg("-c")
+        .arg(&c)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .unwrap();
+    assert!(ok.success(), "clang failed on the decompiled C");
+    let ok = std::process::Command::new("wasm-ld")
+        .args(["--no-entry", "--export-dynamic", "--import-memory", "--shared-memory"])
+        .arg(format!("--max-memory={}", gex_abi::GUEST_MEM_BYTES))
+        .arg(format!("--global-base={}", gex_native::aot::REPL_BASE))
+        .arg("--export=__stack_pointer")
+        .arg("-o")
+        .arg(p.join("build/user.wasm"))
+        .arg(&obj)
+        .status()
+        .unwrap();
+    assert!(ok.success(), "wasm-ld failed on the decompiled C");
+    std::fs::write(p.join("user/eject.json"), format!("{{\"replace\": [{}]}}", d.entry)).unwrap();
+    let r = build::build(p).unwrap();
+    assert_eq!(r.replacements[0].abi, gex_native::aot::Abi::Entry);
+    // Not twice: the file is the user's now.
+    assert!(gex_eject::decompile::decompile(p, "prog", "f", None, false, false).is_err());
+    true
+}
+
 #[test]
 fn eject_build_run_and_replace() {
     let tmp = std::env::temp_dir().join(format!("gex-eject-test-{}", std::process::id()));
@@ -227,6 +273,13 @@ fn eject_build_run_and_replace() {
     .unwrap();
     let e = format!("{:#}", build::build(&p).unwrap_err());
     assert!(e.contains("stale") && e.contains(&hash), "{e}");
+    std::fs::write(p.join("user/eject.json"), &config).unwrap();
+
+    // Decompiled: the function tier's C for `f`, compiled as build.sh does
+    // and bound with the entry ABI, behaves exactly as `f` (40 - 2).
+    if decompile_round_trip(&p, &id) {
+        assert_eq!(run::run(&p, &flags).unwrap(), Exit::Status(38));
+    }
     std::fs::write(p.join("user/eject.json"), &config).unwrap();
 
     // A re-eject keeps user/ and drops the build.

@@ -17,6 +17,10 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    for a function, with the object's hash and
                                    the function's bytes' hash, so a changed
                                    binary is reported instead of mis-bound
+  gexc eject decompile <project> <object> <symbol|0xoffset> [--size N] [--callees] [--force]
+                                   write the function tier's C for a function
+                                   into user/src/ as an editable override
+                                   (\"entry\" ABI), and print its eject.json entry
   gexc eject run <project> [--jit-fallback] [--strace] [--verbose] [--] [args...]
                                    run it natively (the project's run.sh); code
                                    the build never saw fails loudly unless
@@ -84,7 +88,41 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             print!("{}", gex_eject::build::describe(std::path::Path::new(dir), object, what, size)?);
             Ok(None)
         }
-        Some("decompile") => bail!("gexc eject decompile: not yet (eject v1, with the function tier)"),
+        Some("decompile") => {
+            // gexc eject decompile <project> <object> <symbol|0xoffset> [--size N] [--callees] [--force]
+            let mut pos = Vec::new();
+            let (mut size, mut callees, mut force) = (None, false, false);
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--size" => {
+                        i += 1;
+                        let v = args.get(i).context("--size needs a number")?;
+                        size = Some(match v.strip_prefix("0x") {
+                            Some(h) => u64::from_str_radix(h, 16)?,
+                            None => v.parse()?,
+                        });
+                    }
+                    "--callees" => callees = true,
+                    "--force" => force = true,
+                    o if o.starts_with("--") => bail!("gexc eject decompile: unknown option {o}"),
+                    _ => pos.push(args[i].clone()),
+                }
+                i += 1;
+            }
+            let [dir, object, what] = pos.as_slice() else {
+                bail!("gexc eject decompile <project> <object> <symbol|0xoffset> [--size N] [--callees] [--force]");
+            };
+            let d = gex_eject::decompile::decompile(std::path::Path::new(dir), object, what, size, callees, force)?;
+            eprintln!(
+                "{}: {} function{} of C; bind it in user/eject.json with:",
+                d.file,
+                d.functions,
+                if d.functions == 1 { "" } else { "s" }
+            );
+            print!("{}", d.entry);
+            Ok(None)
+        }
         Some(_) => {
             let mut record = None;
             let mut out = None;

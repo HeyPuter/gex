@@ -256,7 +256,10 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         .enumerate()
         .map(|(i, b)| (b.start, i))
         .collect();
-    let effects: Vec<(u8, u8)> = blocks.iter().map(pass::flag_effects).collect();
+    let effects: Vec<(u64, u64)> = blocks.iter().map(pass::flag_effects).collect();
+    // The guest's own flags; the masks carry every guest's, and a block of
+    // one guest never names another's.
+    let all = if gex_abi::PPC { pass::PPC_FLAGS } else { pass::ALL_FLAGS };
 
     // Successors as block indices in one flat array, resolved once: the
     // fixpoint walks them every round, so a fresh `Vec` and hash lookup per
@@ -287,12 +290,12 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         &succ_of[succ_at[i] as usize..succ_at[i + 1] as usize]
     };
 
-    let mut live_in = vec![0u8; blocks.len()];
+    let mut live_in = vec![0u64; blocks.len()];
     loop {
         let mut changed = false;
         for i in 0..blocks.len() {
             let live_out = if opaque[i] {
-                pass::ALL_FLAGS
+                all
             } else {
                 succs_of(i)
                     .iter()
@@ -312,7 +315,7 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
 
     // What each block may drop, settled before anything is rewritten, so the
     // rewrite reads nothing that another thread is changing.
-    let dead: Vec<u8> = (0..blocks.len())
+    let dead: Vec<u64> = (0..blocks.len())
         .map(|i| {
             if opaque[i] {
                 return 0;
@@ -320,7 +323,7 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
             let live_out = succs_of(i)
                 .iter()
                 .fold(0, |a, &s| a | live_in[s as usize]);
-            pass::ALL_FLAGS & !live_out
+            all & !live_out
         })
         .collect();
 
@@ -1204,7 +1207,7 @@ fn lift_one(
             _ => u64::from_le_bytes(memory[off..off + 8].try_into().unwrap()),
         })
     };
-    if !gex_abi::X86 {
+    if !gex_abi::X86 && !gex_abi::PPC {
         // A64: folded through memory before the ordinary passes, so a PLT's
         // GOT load becomes a constant and its `br` becomes a target discovery
         // can follow.
@@ -1225,7 +1228,9 @@ fn lift_one(
             block.guard = Some(memory[lo..hi].to_vec());
         }
     }
-    // x86-64: folded on a scratch copy only, never in the emitted block --
+    // x86-64 and PowerPC: folded on a scratch copy only, never in the
+    // emitted block (32-bit PowerPC code addresses its globals absolutely,
+    // `lis`/`lwz`, so a folded load would bake in a variable's value) --
     // memory read at translation time is a guess about the future (a GOT slot
     // bound later), and code that bakes it in is wrong once it changes.
     let folded = match block.term {
@@ -1239,7 +1244,7 @@ fn lift_one(
     (block, folded)
 }
 
-#[cfg(all(test, not(feature = "x86")))]
+#[cfg(all(test, not(any(feature = "x86", feature = "ppc"))))]
 mod tests {
     #[test]
     fn cgen_refuses_profiling() {

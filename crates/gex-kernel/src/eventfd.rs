@@ -10,6 +10,7 @@
 //! [`poll_readable`]: crate::vfs::FileHandle::poll_readable
 //! [`poll_writable`]: crate::vfs::FileHandle::poll_writable
 
+use gex_abi::GuestEndian;
 use crate::errno::{Errno, SysResult};
 use crate::vfs::{FileHandle, FileType, Metadata};
 use std::sync::Mutex;
@@ -62,7 +63,7 @@ impl FileHandle for EventFd {
         } else {
             std::mem::replace(&mut *c, 0)
         };
-        buf[..8].copy_from_slice(&val.to_le_bytes());
+        buf[..8].copy_from_slice(&val.to_ge_bytes());
         Ok(8)
     }
 
@@ -70,7 +71,7 @@ impl FileHandle for EventFd {
         if buf.len() < 8 {
             return Err(Errno::EINVAL);
         }
-        let val = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let val = u64::from_ge_bytes(buf[..8].try_into().unwrap());
         // `u64::MAX` is the one value a write may never carry -- Linux uses it
         // as the "would block forever" sentinel and rejects it outright.
         if val == u64::MAX {
@@ -124,11 +125,11 @@ mod tests {
     fn read(e: &EventFd) -> Result<u64, Errno> {
         let mut buf = [0u8; 8];
         e.read_at(0, &mut buf)?;
-        Ok(u64::from_le_bytes(buf))
+        Ok(u64::from_ge_bytes(buf))
     }
 
     fn write(e: &EventFd, v: u64) -> SysResult {
-        e.write_at(0, &v.to_le_bytes())
+        e.write_at(0, &v.to_ge_bytes())
     }
 
     #[test]

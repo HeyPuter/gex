@@ -232,7 +232,7 @@ function pointer, a tail call. None of the original function's code runs
 (entries into its middle, which a normal program never makes, still reach the
 original blocks).
 
-**The two ABIs.**
+**The three ABIs.**
 
 - `"c"`: an ordinary C function, typed by its wasm signature. The runtime
   passes the guest's integer argument registers (`x0`-`x7`, or `rdi`, `rsi`,
@@ -245,6 +245,20 @@ original blocks).
   the macros in `gen/gex_replace.h` (`GEX_ARG(c, i)`, `GEX_RET(c)`,
   `GEX_SP(c)`, `GEX_STACK_ARG(c, i)`, `GEX_FARG_F64(c, i)`, ...). It must not
   return for the guest: the block does that after it.
+- `"entry"`: `void f(int ctx)` that *is* the function, its return included:
+  on return, the context's PC says where the guest goes next, and the block
+  (`Intrinsic::Override`) dispatches there. What `gexc eject decompile`
+  writes (below). Only for a function bound by `symbol` or `offset`.
+
+Any replacement module may import, besides `env.memory`, the `gex.*` host
+functions translated code calls (`syscall`, `safepoint`, `sysreg_read`,
+`sysreg_write`, `cache_op`, `fma`, `illegal`, `breakpoint`,
+`dispatch_miss`, as `gen/gex_abi.h` declares them). They are the very
+functions the guest's own modules get, so the syscall allow-list applies to
+them too; a host call that stops the guest (an exit, a fork, a signal)
+unwinds through the replacement exactly as through translated code, which
+is sound when the replacement left the context architectural first, as the
+function tier's C does.
 
 **Memory.** A guest address is a linear-memory offset, so a guest pointer is
 a C pointer (`GEX_PTR(addr)` for a 64-bit value). The replacement runs in the
@@ -265,17 +279,20 @@ grown to cover it at the first replacement call.
 - If it imports memory, it exports a mutable i32 `__stack_pointer`.
 - The export exists and has a type the ABI can call.
 
-`build.sh` compiles with:
+`build.sh` compiles each `user/src/*.c` with the function tier's flags
+(`gex_cgen::toolchain::CFLAGS`: `--target=wasm32 -O2 -mtail-call -msimd128
+-matomics -mbulk-memory ... -ffreestanding -nostdlib`) plus
+`-fvisibility=default -Igen`, and links twice:
 
 ```sh
-clang --target=wasm32 -O2 -nostdlib -ffreestanding -fvisibility=default -matomics -mbulk-memory -Igen \
-  -Wl,--no-entry -Wl,--export-dynamic -Wl,--import-memory -Wl,--shared-memory \
-  -Wl,--max-memory=4294901760 -Wl,--global-base=4026531840 \
-  -Wl,--export=__stack_pointer -Wl,--export=__heap_base
+wasm-ld --no-entry --export-dynamic --import-memory --max-memory=4294901760 \
+  --global-base=4026531840 --export=__stack_pointer --export=__heap_base \
+  --shared-memory -o build/user.wasm build/obj/*.o     # native
+  ...             -o build/user.web.wasm build/obj/*.o # the web build's plain memory
 ```
 
-`USER_CFLAGS` and `USER_LDFLAGS` add to it. There is no libc: the code is
-freestanding.
+`USER_CFLAGS` (clang) and `USER_LDFLAGS` (wasm-ld) add to it. There is no
+libc: the code is freestanding.
 
 **Examples**, all run on both guests unless noted:
 
@@ -303,6 +320,51 @@ uint32_t my_ack(uint32_t m, uint32_t n) {
 }
 uint32_t my_ack_calls(void) { return calls; }
 ```
+
+## Decompiling a function
+
+```sh
+gexc eject decompile <project> <object> <symbol|0xoffset> [--size N] [--callees] [--force]
+```
+
+writes the function tier's C for a guest function into
+`user/src/decompiled_<name>.c` and prints the `user/eject.json` entry that
+binds it (with the object's hash and the function's bytes' hash, so a changed
+binary reports the override as stale):
+
+```text
+$ gexc eject decompile . ack ack
+user/src/decompiled_ack.c: 1 function of C; bind it in user/eject.json with:
+{ "object": "ack", "sha256": "sha256:723b...", "symbol": "ack",
+  "bytes": "sha256:60bd...", "export": "decompiled_ack", "abi": "entry" }
+```
+
+- **The C** is exactly what the function tier (`gex-cgen`, Phase B) emits for
+  the function, from the same recovery (`gex_xlate::func::recover`, with the
+  object's `.eh_frame`), summaries and filters (`gex_cgen::select`), as one
+  standalone unit (`gex_cgen::standalone`): guest registers are C locals,
+  guest memory goes through `gen/gex_abi.h`'s helpers (the tier-1 bounds
+  semantics), system calls and safepoints through the `gex.*` host
+  functions. Its export, `decompiled_<name>(int ctx)`, is bound with the
+  `"entry"` ABI.
+- **It round-trips:** unmodified and bound, it gives the original's output
+  (natively and in the web build). Checked on both 64-bit guests: corpus
+  `ack` (ack), `qsort` (qsort with `--callees`, kernel with `--callees`:
+  the whole tree including the libc it calls), `strings` (kernel with
+  `--callees`), and gzip (`longest_match`, 468,088 calls; `updcrc`;
+  `deflate` with `--callees`: 114 functions on AArch64, 74 on x86-64).
+- **What it does not hold, it leaves** as the function tier does: a call to
+  a function not in the file writes every register back, sets PC to the
+  callee and returns; the rest of the function then runs as the original
+  translated code once the callee returns into it. So an edit after such a
+  call does not take effect. `--callees` puts every function it reaches by
+  direct call (that the tier takes) into the file too, so those calls stay
+  in C. Indirect calls go through the file's own `gex_call_known` and leave
+  when the target is not in it.
+- **Refused, loudly:** a function recovery did not find, one the tier does not
+  take (self-modifying pages, x87 statements with no C lowering yet), and
+  32-bit (i386) code.
+- The file is yours: decompile refuses to overwrite it without `--force`.
 
 ## The web build (Node and the browser)
 
@@ -409,6 +471,6 @@ guest had since overwritten.
 - v1 (M5): overrides by offset with a bytes hash and stale detection;
   import and whole-library binding; the web build and launchers; the
   runtime-level slim runtime; `--jit-fallback` (off by default).
-- Waiting: `gexc eject decompile <fn>` (the function tier's C for a
-  function, once S3's function tier is integrated) and gex-kernel feature
-  gating.
+- `gexc eject decompile` (M5 item 5): the function tier's C as an editable
+  override (the `"entry"` ABI).
+- Waiting: gex-kernel feature gating.

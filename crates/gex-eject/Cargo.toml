@@ -12,6 +12,8 @@ gex-xlate = { workspace = true, features = ["parallel"] }
 gex-emit.workspace = true
 gex-cache.workspace = true
 gex-native.workspace = true
+gex-cgen.workspace = true
+gex-ir.workspace = true
 anyhow = "1"
 
 [features]

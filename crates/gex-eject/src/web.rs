@@ -292,7 +292,9 @@ async function replacer(m, read) {
     return { params: p ? p.split(', ') : [], results: q ? q.split(', ') : [] };
   };
   const sigs = m.replacements.map((r) => (r.abi === 'c' && !r.missing ? sigOf(r.sig) : null));
-  return (ctx, pc, id, memory) => {
+  // `imports` are the gex.* host functions the guest's own modules get: a
+  // decompiled function (the "entry" ABI) calls them as translated code does.
+  return (ctx, pc, id, memory, imports) => {
     const r = m.replacements[id];
     if (!r) throw new Error(`gex-eject: replacement #${id} at ${pc} is not in this build`);
     if (r.missing) {
@@ -305,14 +307,14 @@ async function replacer(m, read) {
       if (need > 0) memory.grow(Math.ceil(need / 65536));
       const inst = {};
       for (const [path, mod] of Object.entries(compiled)) {
-        const i = new WebAssembly.Instance(mod, { env: { memory } });
+        const i = new WebAssembly.Instance(mod, { env: { memory }, gex: imports ?? {} });
         if (i.exports.__stack_pointer) i.exports.__stack_pointer.value = m.region.stack_top | 0;
         inst[path] = i;
       }
       funcs = m.replacements.map((x) => (x.missing ? null : inst[x.module].exports[x.export]));
     }
     const f = funcs[id];
-    if (r.abi === 'ctx') {
+    if (r.abi === 'ctx' || r.abi === 'entry') {
       f(ctx);
       return;
     }

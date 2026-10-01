@@ -71,6 +71,11 @@ pub const CURRENT_THREAD_TOKEN: u32 = 0xffff_fffb;
 pub const CURRENT_THREAD_EFFECTIVE_TOKEN: u32 = 0xffff_fffa;
 
 impl Handles {
+    /// Every open object.
+    pub fn entries(&self) -> impl Iterator<Item = &Obj> {
+        self.map.values().map(|e| &e.obj)
+    }
+
     pub fn insert(&mut self, obj: Obj, access: u32) -> u32 {
         let h = self.free.pop().unwrap_or_else(|| {
             let h = self.next;
@@ -123,11 +128,14 @@ pub fn resolve(c: &Call<'_>, h: u32) -> R<Obj> {
 }
 
 /// Close-time work for an object whose last handle just went.
-fn closed(c: &Call<'_>, obj: &Obj) {
+fn closed(c: &mut Call<'_>, obj: &Obj) {
     if let Obj::File(f) = obj {
         let still = c.p.st.lock().unwrap().handles.file_still_open(f);
         if !still {
             super::file::on_last_close(&mut c.kernel(), f);
+            if f.delete_on_close.load(std::sync::atomic::Ordering::Relaxed) {
+                super::file::changed_path(c, &f.path);
+            }
         }
     }
 }

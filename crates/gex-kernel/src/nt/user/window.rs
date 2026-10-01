@@ -732,6 +732,9 @@ pub fn destroy_window(c: &mut Call<'_>, hwnd: u32) -> R<()> {
         winproc::send_message(c, hwnd, wm::NCDESTROY, 0, 0, Pack::None)?;
     }
     let (surface, own_dc) = c.p.user.lock().unwrap().windows.get(&hwnd).map(|w| (w.surface, w.own_dc)).unwrap_or((0, 0));
+    if surface != 0 {
+        crate::nt::display::remove(c, hwnd);
+    }
     super::paint::window_destroyed(c, surface, own_dc)?;
     let mut u = c.p.user.lock().unwrap();
     if let Some(w) = u.windows.remove(&hwnd) {
@@ -919,6 +922,11 @@ pub fn set_window_pos(c: &mut Call<'_>, hwnd: u32, after: u32, x: i32, y: i32, c
         }
     }
     let _ = parent;
+    // A shown window that moved goes to the display at its new place.
+    let has_surface = c.p.user.lock().unwrap().windows.get(&hwnd).is_some_and(|w| w.surface != 0 && w.style & ws::VISIBLE != 0);
+    if has_surface && flags & swp::NOMOVE == 0 {
+        crate::nt::display::publish(c, hwnd);
+    }
     // What became visible or changed size is repainted whole.
     let now_visible = c.p.user.lock().unwrap().windows.get(&hwnd).is_some_and(|w| w.style & ws::VISIBLE != 0);
     if now_visible
@@ -931,6 +939,7 @@ pub fn set_window_pos(c: &mut Call<'_>, hwnd: u32, after: u32, x: i32, y: i32, c
         set_active_window(c, hwnd, false)?;
     }
     if flags & swp::HIDEWINDOW != 0 {
+        crate::nt::display::remove(c, hwnd);
         let active = c.p.user.lock().unwrap().threads.get(&c.t.tid).map(|t| t.active).unwrap_or(0);
         if active == hwnd {
             set_active_window(c, 0, false)?;

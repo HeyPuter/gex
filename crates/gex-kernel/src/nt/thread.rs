@@ -1031,6 +1031,7 @@ pub fn nt_terminate_thread(c: &mut Call<'_>) -> R {
 
 /// End the process with `code`.
 pub fn terminate_process(c: &mut Call<'_>, code: u32) {
+    super::section::write_back_all(c);
     c.p.exit_code.store(code, Ordering::Release);
     c.p.terminating.store(true, Ordering::Release);
     wake_everyone(c);

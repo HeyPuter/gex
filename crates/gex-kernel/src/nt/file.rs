@@ -27,6 +27,12 @@ pub struct NtFile {
     pub delete_on_close: AtomicBool,
     /// Directory enumeration state for `NtQueryDirectoryFile`.
     pub dir: Mutex<Option<DirScan>>,
+    /// A change notification armed on this directory (FindFirstChange-
+    /// Notification): the sync id of the manual-reset state that waits on
+    /// the handle see, and whether the subtree counts.
+    pub notify: Mutex<Option<(u64, bool)>>,
+    /// Where a rename moved the file (`path` is where it was opened).
+    pub moved_to: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +261,8 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
                 kind: FileKind::Null,
                 delete_on_close: AtomicBool::new(false),
                 dir: Mutex::new(None),
+                notify: Mutex::new(None),
+                moved_to: Mutex::new(None),
             };
             return Ok((Arc::new(f), 1));
         }
@@ -317,6 +325,7 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
         _ => return Err(Status(st::INVALID_PARAMETER)),
     }
     let creating_dir = !exists && options & opt::DIRECTORY_FILE != 0;
+    let creating = !exists && (creating_dir || flags & oflags::O_CREAT != 0);
     let handle = {
         let k = c.kernel();
         if creating_dir {
@@ -339,7 +348,12 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
         kind: FileKind::Disk,
         delete_on_close: AtomicBool::new(options & opt::DELETE_ON_CLOSE != 0),
         dir: Mutex::new(None),
+        notify: Mutex::new(None),
+        moved_to: Mutex::new(None),
     };
+    if creating || info == 0 || info == 3 {
+        changed_path(c, &f.path);
+    }
     Ok((Arc::new(f), info))
 }
 
@@ -470,6 +484,9 @@ pub fn nt_write_file(c: &mut Call<'_>) -> R {
             n
         }
     };
+    if f.kind == FileKind::Disk {
+        changed_path(c, &f.path);
+    }
     complete_io(c, event, apc, iosb, st::SUCCESS, n as u64)?;
     Ok(st::SUCCESS)
 }
@@ -680,13 +697,104 @@ pub fn nt_set_information_file(c: &mut Call<'_>) -> R {
                 return Err(Status(st::INFO_LENGTH_MISMATCH));
             }
             f.handle.truncate(c.g.u64(buf)?)?;
+            changed_path(c, &f.path);
         }
         // FileAllocationInformation: advisory; the size does not change.
         19 => {}
+        // FileRenameInformation { ReplaceIfExists, RootDirectory,
+        // FileNameLength, FileName[] }
+        10 => {
+            let ps = c.p.abi.ptr_size();
+            let replace = c.g.u8(buf)? != 0;
+            let root = c.g.ptr(buf + ps)? as u32;
+            let n = c.g.u32(buf + 2 * ps)? as usize;
+            let name = c.g.wchars(buf + 2 * ps + 4, n / 2)?;
+            let nt = full_nt_name(c, root, &name)?;
+            let to = match nt_to_target(c, &nt)? {
+                Target::Path(p) => p,
+                _ => return Err(Status(st::OBJECT_PATH_NOT_FOUND)),
+            };
+            let from = f.moved_to.lock().unwrap().clone().unwrap_or_else(|| f.path.clone());
+            let dest = match resolve_ci(c, &to) {
+                Ok(existing) => {
+                    if !replace {
+                        return Err(Status(st::OBJECT_NAME_COLLISION));
+                    }
+                    existing
+                }
+                Err(true) => {
+                    // The parent exists; keep the new leaf name as given.
+                    let (parent, leaf) = to.rsplit_once('/').unwrap_or(("", &to));
+                    let parent = resolve_ci(c, if parent.is_empty() { "/" } else { parent }).map_err(|_| Status(st::OBJECT_PATH_NOT_FOUND))?;
+                    format!("{}/{leaf}", parent.trim_end_matches('/'))
+                }
+                Err(false) => return Err(Status(st::OBJECT_PATH_NOT_FOUND)),
+            };
+            c.kernel().vfs.rename(&from, &dest)?;
+            *f.moved_to.lock().unwrap() = Some(dest.clone());
+            changed_path(c, &from);
+            changed_path(c, &dest);
+        }
         _ => return Err(c.unimplemented(&format!("NtSetInformationFile class {class}"))),
     }
     c.g.iosb(iosb, st::SUCCESS, 0)?;
     Ok(st::SUCCESS)
+}
+
+/// Signal the change notifications armed on directories that contain
+/// `path` (its parent, or any ancestor for a subtree watch). Only changes
+/// this process makes through these calls are seen: gex has no host file
+/// change source.
+pub fn changed_path(c: &mut Call<'_>, path: &str) {
+    let watches: Vec<(u64, String, bool)> = {
+        let stl = c.p.st.lock().unwrap();
+        stl.handles
+            .entries()
+            .filter_map(|o| match o {
+                Obj::File(f) => f.notify.lock().unwrap().map(|(id, sub)| (id, f.path.clone(), sub)),
+                _ => None,
+            })
+            .collect()
+    };
+    let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    for (id, dir, subtree) in watches {
+        let dir = dir.trim_end_matches('/');
+        let hit = parent == dir || (subtree && path.starts_with(&format!("{dir}/")));
+        if hit {
+            super::sync::set_state(c, id, true);
+        }
+    }
+}
+
+/// `NtNotifyChangeDirectoryFile(dir, event, apc, ctx, iosb, buffer, len,
+/// filter, subtree)`: the form FindFirst/NextChangeNotification use (no
+/// event, APC or buffer), which arms the directory handle itself; it becomes
+/// signalled on the next change ([`changed_path`]).
+pub fn nt_notify_change_directory_file(c: &mut Call<'_>) -> R {
+    let (h, event, apc, buf, subtree) = (c.a32(0), c.a32(1), c.a(2), c.a(5), c.a32(8) & 0xff != 0);
+    let f = get_file(c, h)?;
+    if !f.is_dir {
+        return Err(Status(st::INVALID_PARAMETER));
+    }
+    if event != 0 || apc != 0 || buf != 0 {
+        return Err(c.unimplemented("NtNotifyChangeDirectoryFile with an event, APC or buffer (ReadDirectoryChangesW)"));
+    }
+    let mut n = f.notify.lock().unwrap();
+    match *n {
+        // Re-armed (FindNextChangeNotification): unsignalled until the next
+        // change.
+        Some((id, _)) => {
+            *n = Some((id, subtree));
+            drop(n);
+            super::sync::set_state(c, id, false);
+        }
+        None => {
+            let id = c.p.new_sync_id();
+            c.p.sync.lock().unwrap().states.insert(id, super::sync::SState::Event { set: false, manual: true });
+            *n = Some((id, subtree));
+        }
+    }
+    Ok(st::PENDING)
 }
 
 /// `NtQueryAttributesFile(attr, FILE_BASIC_INFORMATION *)`.
@@ -995,7 +1103,8 @@ pub fn nt_flush_buffers_file(c: &mut Call<'_>) -> R {
 /// Close-time work for a file: delete-on-close.
 pub fn on_last_close(k: &mut crate::Kernel, f: &NtFile) {
     if f.delete_on_close.load(Ordering::Relaxed) && f.kind == FileKind::Disk {
-        let _ = if f.is_dir { k.vfs.rmdir(&f.path) } else { k.vfs.unlink(&f.path) };
+        let path = f.moved_to.lock().unwrap().clone().unwrap_or_else(|| f.path.clone());
+        let _ = if f.is_dir { k.vfs.rmdir(&path) } else { k.vfs.unlink(&path) };
     }
 }
 
@@ -1016,6 +1125,8 @@ pub fn console_file(k: &crate::Kernel, fd: i32, access: u32) -> Option<Arc<NtFil
         kind: FileKind::Console,
         delete_on_close: AtomicBool::new(false),
         dir: Mutex::new(None),
+        notify: Mutex::new(None),
+        moved_to: Mutex::new(None),
     }))
 }
 

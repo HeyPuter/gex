@@ -52,6 +52,12 @@ pub enum Intrinsic {
     /// PLT stub through its resolved GOT slot, a function pointer -- runs the
     /// replacement.
     Replace(u32),
+    /// A user-supplied override of the whole function (`gex-eject`'s "entry"
+    /// ABI, which `gexc eject decompile` writes): the host runs it, and it
+    /// does everything the function would, its return included, leaving the
+    /// context's PC where the guest goes next. The block is the host call and
+    /// a dispatch on that PC.
+    Override(u32),
 }
 
 /// The `sysreg_write` register number a [`Intrinsic::Replace`] block passes.
@@ -100,6 +106,9 @@ pub fn recognise(name: &str) -> Option<Intrinsic> {
 /// do it, and return through `x30`. Registers a real implementation would
 /// clobber are left alone, which the procedure call standard permits.
 pub fn block(addr: u64, which: Intrinsic) -> Block {
+    if gex_abi::PPC {
+        return block_ppc(addr, which);
+    }
     let mut b = Builder::new(addr);
     // The C calling convention's first three argument registers: x0-x2, or
     // rdi/rsi/rdx. `ctx::CALL_ARGS` gives their context offsets.
@@ -133,7 +142,7 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
             let wide = b.extend(r, true);
             b.write(GuestReg::X(0), wide);
         }
-        Intrinsic::Replace(id) => {
+        Intrinsic::Replace(id) | Intrinsic::Override(id) => {
             let pc = b.const_i64(addr);
             let reg = b.const_i32(REPLACE_SYSREG as u32);
             let id = b.const_i64(u64::from(id));
@@ -149,6 +158,14 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
     // value (`g_strdup`, `stpcpy`, ...) reads whatever rax held.
     if gex_abi::X86 && matches!(which, Intrinsic::MemCpy | Intrinsic::MemMove | Intrinsic::MemSet) {
         b.write(GuestReg::X(0), dst);
+    }
+    // An override returned (or left) itself: go where it says.
+    if let Intrinsic::Override(_) = which {
+        let target = b.read(GuestReg::Pc);
+        return b.finish(Term::Indirect {
+            target,
+            is_ret: true,
+        });
     }
     // Return: through the link register, or by popping the return address.
     let target = if gex_abi::X86 {
@@ -168,6 +185,53 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
     } else {
         b.read(GuestReg::X(30))
     };
+    b.finish(Term::Indirect {
+        target,
+        is_ret: true,
+    })
+}
+
+/// [`block`] for 32-bit PowerPC: the SysV arguments in r3-r5 (32-bit), the
+/// result in r3, the return through LR. `memcpy`, `memmove` and `memset`
+/// return their first argument, which r3 already holds.
+fn block_ppc(addr: u64, which: Intrinsic) -> Block {
+    let mut b = Builder::new(addr);
+    let dst = b.read(GuestReg::R(3));
+    let src = b.read(GuestReg::R(4));
+    let len32 = b.read(GuestReg::R(5));
+    // The bulk statements take their length and fill value as `I64`s.
+    let len = b.extend(len32, false);
+    match which {
+        Intrinsic::MemCpy | Intrinsic::MemMove => b.stmt(Stmt::MemCopy { dst, src, len }),
+        Intrinsic::MemPCpy => {
+            b.stmt(Stmt::MemCopy { dst, src, len });
+            let end = b.bin(BinOp::Add, Ty::I32, dst, len32);
+            b.write(GuestReg::R(3), end);
+        }
+        Intrinsic::MemSet => {
+            let val = b.extend(src, false);
+            b.stmt(Stmt::MemFill { dst, val, len })
+        }
+        Intrinsic::MemCmp => {
+            let r = b.fresh();
+            b.stmt(Stmt::MemCmp {
+                dst: r,
+                a: dst,
+                b: src,
+                len,
+            });
+            b.write(GuestReg::R(3), r);
+        }
+        // gex-eject's replacements speak the AArch64 and x86-64 calling
+        // conventions only; on PowerPC the function did not run, so say so.
+        Intrinsic::Replace(_) | Intrinsic::Override(_) => {
+            return b.finish(Term::Illegal { raw: 0, pc: addr })
+        }
+    }
+    let lr = b.read(GuestReg::Lr);
+    let mask = b.const_i32(!3);
+    let lr = b.bin(BinOp::And, Ty::I32, lr, mask);
+    let target = b.extend(lr, false);
     b.finish(Term::Indirect {
         target,
         is_ret: true,
@@ -234,6 +298,10 @@ mod tests {
 
     #[test]
     fn memcmp_writes_its_answer_to_x0() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let b = block(0x1000, Intrinsic::MemCmp);
         assert!(b.stmts.iter().any(|s| matches!(s, Stmt::MemCmp { .. })));
         assert!(b
@@ -244,6 +312,10 @@ mod tests {
 
     #[test]
     fn a_replacement_is_one_host_call_and_a_return() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let b = block(0x1000, Intrinsic::Replace(7));
         let calls: Vec<_> = b
             .stmts
@@ -273,7 +345,25 @@ mod tests {
     }
 
     #[test]
+    fn an_override_dispatches_where_it_left_the_pc() {
+        // On PowerPC an eject override is illegal (no replacement ABI there).
+        if gex_abi::PPC {
+            return;
+        }
+        let b = block(0x1000, Intrinsic::Override(3));
+        assert!(b.stmts.iter().any(|s| matches!(s, Stmt::HostCall { func: HostFunc::SysRegWrite, .. })));
+        // No register is written: the override did the return itself.
+        assert!(!b.stmts.iter().any(|s| matches!(s, Stmt::WriteReg { .. })));
+        assert!(b.stmts.iter().any(|s| matches!(s, Stmt::Def { expr: Expr::ReadReg(GuestReg::Pc), .. })));
+        assert!(matches!(b.term, Term::Indirect { is_ret: true, .. }));
+    }
+
+    #[test]
     fn mempcpy_returns_the_end() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let b = block(0x1000, Intrinsic::MemPCpy);
         assert!(b
             .stmts

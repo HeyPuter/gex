@@ -33,6 +33,10 @@ pub mod auxv {
     pub const AT_PLATFORM: u64 = 15;
     pub const AT_HWCAP: u64 = 16;
     pub const AT_CLKTCK: u64 = 17;
+    /// PowerPC's cache-block sizes, which glibc's `memset` reads to use `dcbz`.
+    pub const AT_DCACHEBSIZE: u64 = 19;
+    pub const AT_ICACHEBSIZE: u64 = 20;
+    pub const AT_UCACHEBSIZE: u64 = 21;
     pub const AT_SECURE: u64 = 23;
     pub const AT_RANDOM: u64 = 25;
     pub const AT_HWCAP2: u64 = 26;
@@ -46,7 +50,12 @@ pub mod auxv {
 /// Deterministic by design: because every gex process sees the same value,
 /// `gexc` can pre-run ifunc resolvers at build time and prebind the winner
 /// (PLAN §6.4). The set is ARMv8.0 plus the extensions the lifter implements.
-pub const HWCAP: u64 = if gex_abi::X86 {
+pub const HWCAP: u64 = if gex_abi::PPC {
+    // PPC_FEATURE_32 | PPC_FEATURE_HAS_FPU | PPC_FEATURE_HAS_MMU: a 750-class
+    // CPU, and no ALTIVEC, so a libc that dispatches on it never picks a
+    // vector routine (docs/ppc.md §5).
+    0x8000_0000 | 0x0800_0000 | 0x0400_0000
+} else if gex_abi::X86 {
     // x86-64: the CPUID.1:EDX feature word. FPU, TSC, CX8, CMOV, CLFSH, MMX,
     // FXSR, SSE, SSE2 -- the baseline every x86-64 has, and what the `cpuid`
     // host handler reports too (they must agree: glibc's resolvers read both).
@@ -142,7 +151,13 @@ pub fn build_initial_stack(
     // The word size of the vectors below, and the name a 32-bit program
     // expects to find in AT_PLATFORM.
     let ws: u64 = if image.class32 { 4 } else { 8 };
-    let platform: &str = if image.class32 { "i686" } else { gex_abi::ARCH_NAME };
+    let platform: &str = if gex_abi::PPC {
+        "ppc750"
+    } else if image.class32 {
+        "i686"
+    } else {
+        gex_abi::ARCH_NAME
+    };
     blob.extend_from_slice(platform.as_bytes());
     blob.push(0);
     let mut offsets_argv = Vec::with_capacity(args.len());
@@ -171,7 +186,7 @@ pub fn build_initial_stack(
         (stack_top - blob.len() as u64) & !0xf
     };
 
-    let auxv_pairs: Vec<(u64, u64)> = vec![
+    let mut auxv_pairs: Vec<(u64, u64)> = vec![
         (auxv::AT_PHDR, image.phdr_vaddr),
         (auxv::AT_PHENT, image.phentsize),
         (auxv::AT_PHNUM, image.phnum),
@@ -196,6 +211,13 @@ pub fn build_initial_stack(
         (auxv::AT_MINSIGSTKSZ, 4096),
         (auxv::AT_NULL, 0),
     ];
+    if gex_abi::PPC {
+        // 32-byte cache blocks, as a 750's; `dcbz` zeroes this many.
+        let at = auxv_pairs.len() - 1;
+        for tag in [auxv::AT_DCACHEBSIZE, auxv::AT_ICACHEBSIZE, auxv::AT_UCACHEBSIZE] {
+            auxv_pairs.insert(at, (tag, 32));
+        }
+    }
 
     // words = argc + argv + NULL + envp + NULL + 2*auxv
     let n_words = 1 + args.len() + 1 + env.len() + 1 + 2 * auxv_pairs.len();
@@ -227,10 +249,12 @@ pub fn build_initial_stack(
     let mut bytes = vec![0u8; (blob_addr + blob.len() as u64 - low) as usize];
     for (i, w) in words.iter().enumerate() {
         let off = i * ws as usize;
+        // Guest byte order: big-endian words on PowerPC.
+        use gex_abi::GuestEndian;
         if image.class32 {
-            bytes[off..off + 4].copy_from_slice(&(*w as u32).to_le_bytes());
+            bytes[off..off + 4].copy_from_slice(&(*w as u32).to_ge_bytes());
         } else {
-            bytes[off..off + 8].copy_from_slice(&w.to_le_bytes());
+            bytes[off..off + 8].copy_from_slice(&w.to_ge_bytes());
         }
     }
     let blob_off = (blob_addr - low) as usize;
@@ -298,6 +322,10 @@ mod tests {
 
     #[test]
     fn argc_argv_envp_and_auxv_are_reachable() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let args = vec!["prog".to_string(), "one".to_string()];
         let env = vec!["A=1".to_string()];
         let l = build_initial_stack(

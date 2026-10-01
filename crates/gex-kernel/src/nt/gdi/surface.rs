@@ -131,6 +131,7 @@ pub fn release_window(c: &mut Call<'_>, surface: u32, own_dc: u32) -> R<()> {
     Ok(())
 }
 
-/// Hand a top-level window's surface to the display. There is no display
-/// side yet (§6a.1 NtDisplay), so this is where it will hook in.
-pub fn flush(_c: &mut Call<'_>, _toplevel: u32) {}
+/// Hand a top-level window's surface to the display (§6a.1).
+pub fn flush(c: &mut Call<'_>, toplevel: u32) {
+    crate::nt::display::publish(c, toplevel);
+}

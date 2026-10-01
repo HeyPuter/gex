@@ -464,7 +464,7 @@ fn map_nls(c: &mut Call<'_>, file: &str, section_name: Option<&str>) -> R<(u64, 
             let size = data.len() as u64;
             let nt_path = to_w(&format!("\\??\\C:\\windows\\system32\\{file}"));
             let s = Arc::new(Section {
-                kind: SecKind::File { data: Arc::new(data), nt_path },
+                kind: SecKind::File { data: Arc::new(data), nt_path, file: None },
                 size,
                 prot: super::vm::page_prot::READONLY,
                 attrs: super::section::SEC_COMMIT,

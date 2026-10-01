@@ -193,10 +193,12 @@ export const op = {
     COLOR4F: 195,
     TEX_ENVI: 196,
     ALPHA_FUNC: 197,
+    PUSH_ATTRIB: 198,
+    POP_ATTRIB: 199,
 };
 
 export const MAGIC = 0x47584547;
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 export const HEADER_BYTES = 32;
 
 export const error = {
