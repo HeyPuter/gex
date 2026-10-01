@@ -654,7 +654,7 @@ impl ModuleBuilder {
             vec![ValType::I64],
         ));
         let t_x87 = m.func_type(FuncType::new(
-            vec![p, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
+            vec![p, ValType::I32, ValType::I64, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
             vec![ValType::I64],
         ));
 

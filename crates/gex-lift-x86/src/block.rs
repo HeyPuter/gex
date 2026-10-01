@@ -98,37 +98,26 @@ mod tests {
         )));
     }
 
-    /// The x87's arithmetic goes to the host (which computes it in 80-bit
-    /// extended precision), each instruction with its operands encoded in
-    /// the `x87op` word: here `fmulp st(1), st` (de c9) is FMUL on
-    /// `st(1) op= st(0)` with one pop. The conversion that follows, `fstp
-    /// qword [rax]` (dd 18), is lowered inline: no host call, one 8-byte
+    /// The x87's arithmetic and its rounding stores are pure `Stmt::X87`s,
+    /// never a state-flushing host call: `fmulp st(1), st` (de c9) is one
+    /// `Arith(Mul)`, `fstp qword [rax]` (dd 18) one `Narrow` and an 8-byte
     /// store.
     #[test]
-    fn x87_arithmetic_goes_to_the_host_and_conversions_stay_inline() {
-        use crate::x87op;
+    fn x87_arithmetic_and_stores_are_pure_operations() {
+        use gex_ir::{X87Arith, X87Op};
         // fmulp st(1), st ; fstp qword [rax] ; ret
         let b = lift_block(bytes(0x1000, &[0xde, 0xc9, 0xdd, 0x18, 0xc3]), 0x1000, BlockLimits::default());
-        let words: Vec<u64> = b
+        let ops: Vec<X87Op> = b
             .stmts
             .iter()
             .filter_map(|s| match s {
-                Stmt::HostCall { func: gex_ir::HostFunc::SysRegWrite, args } => Some(args[2]),
+                Stmt::X87 { op, .. } => Some(*op),
                 _ => None,
             })
-            .map(|v| {
-                b.stmts
-                    .iter()
-                    .find_map(|s| match s {
-                        Stmt::Def { dst, expr: gex_ir::Expr::ConstI64(k) } if *dst == v => Some(*k as u64),
-                        _ => None,
-                    })
-                    .expect("constant x87op word")
-            })
             .collect();
-        assert_eq!(
-            words,
-            vec![x87op::FMUL | x87op::FORM_STI_ST0 << x87op::FORM_SHIFT | 1 << x87op::I_SHIFT | 1 << x87op::POP_SHIFT],
+        assert_eq!(ops, vec![X87Op::Arith(X87Arith::Mul), X87Op::Narrow { single: false }], "{}", print::block(&b));
+        assert!(
+            !b.stmts.iter().any(|s| matches!(s, Stmt::HostCall { .. })),
             "{}",
             print::block(&b)
         );
