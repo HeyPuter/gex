@@ -170,7 +170,7 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
         leaves.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
         eprintln!(
             "[cgen] {} functions ({} trap-free), {} blocks; calls: {} known ({} to trap-free), \
-             {} indirect, {} leaving; tail calls: {} known; {} switches, {} unresolved jumps, {} returns",
+             {} indirect, {} leaving; tail calls: {} known; {} switches, {} loops outlined, {} unresolved jumps, {} returns",
             stats.functions,
             trapfree.len(),
             stats.blocks,
@@ -180,6 +180,7 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
             stats.leaves.values().sum::<usize>(),
             stats.tail_known,
             stats.switches,
+            stats.loops_outlined,
             stats.unresolved,
             stats.returns
         );

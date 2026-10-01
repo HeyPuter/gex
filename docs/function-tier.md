@@ -371,6 +371,54 @@ Recursion deeper than the budget therefore runs as a sequence of nests of
 bounded depth, each unwound by returning, with the unwound frames' remaining
 work in tier-1.
 
+### 7.2 Loops are outlined: there is no OSR for wasm
+
+V8 (and SpiderMonkey) never move a running wasm frame onto optimised code:
+dynamic tiering compiles a hot function with TurboFan in the background and
+installs it for the *next* call. A loop that runs for the whole of one call
+of a function entered once — a `main` with the kernel inlined into it, a
+game's main loop — stays in Liftoff for the whole run. Measured on gx64
+`array` (kernel-us): tier-1 244 ms, function tier 316 ms with the default
+flags; 135 ms and 100 ms with `--no-liftoff`. ga64 `matmul`: 389 ms against
+191 ms. (Tier-1 escapes it partly: its loops are separate functions that are
+re-entered, though each still runs a whole loop in one call.)
+
+So every **outermost natural loop** also gets a function of its own,
+`static __attribute__((noinline)) int l_<F>_<k>(ctx, depth, need, ret, sp0)`,
+over the same registers (loaded on entry). The body keeps its inline copy of
+the loop, and the first 1024 trips run there; only when the poll countdown
+expires at the loop's back-edge does the body hand over:
+
+```
+<write back every dirty register>; safepoint;
+do r = l_F_k(ctx, depth + W(F), need, ret, sp0); while (r == LOOP_CHUNK);
+if (r <= 1) return r;          /* returned (1) or left (0), as F would */
+<reload>; switch (r) { case LOOP_EXIT + b: goto L<b>; ... }
+```
+
+Short loops in frequently called functions therefore pay nothing (an eager
+version that always called the loop function cost fib 1.32x and gx64 ack
+1.89x on CPU time), and long ones get re-entry.
+
+* The loop's own back-edge ends a **chunk** when the poll countdown expires:
+  everything written back, the safepoint as usual, `return LOOP_CHUNK`. Every
+  1024 back-edges is therefore a fresh call, which picks up optimised code
+  once the engine has it; the cost is one write-back and one reload per
+  chunk.
+* Leaving the loop writes back every dirty register and returns
+  `LOOP_EXIT + b`, where `b` is the block the body resumes at.
+* A guest `ret` inside the loop is the function's predicted return (§7): the
+  loop function has `ret`, `need` and the entry SP, and returns 1 or 0
+  exactly as the body would. Every other exit (tier leave, depth guard in a
+  callee) returns 0 through it.
+* A guest tail call inside a loop is an ordinary call there (a loop
+  function's signature is not the bodies', so no `musttail`).
+* Inner loops stay inside their outer loop's function, polling as before.
+* Functions with irreducible control flow (a backward edge whose target does
+  not dominate its source) are not outlined: outlining needs the header to
+  be the only way into the loop.
+* `GEX_CGEN_OUTLINE=0` turns it off.
+
 ## 8. Build and flags
 
 * `gexc build --cgen …` and `gexc run --cgen …` set `gex_xlate::Options::cgen`

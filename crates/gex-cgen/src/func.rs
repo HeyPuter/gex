@@ -78,7 +78,8 @@ fn frame_weight(regs: &FnRegs) -> u32 {
 
 /// The `need` bits a caller passes: what the callee's expected return must
 /// write back beyond every dirty non-flag register.
-const NEED_DEFS: &str = "#define NEED_FLAGS 1u\n#define NEED_ALL 0xffffffffu\n\n";
+const NEED_DEFS: &str = "#define NEED_FLAGS 1u\n#define NEED_ALL 0xffffffffu\n\
+    #define LOOP_CHUNK 2\n#define LOOP_EXIT 3\n\n";
 
 /// The flag registers of the guest (AArch64 has no P and A: a liveness set
 /// that says they are live, because an exit reads "everything", must not make
@@ -123,6 +124,7 @@ pub struct FnStats {
     pub calls_trapfree: usize,
     pub tail_known: usize,
     pub switches: usize,
+    pub loops_outlined: usize,
     pub unresolved: usize,
     pub returns: usize,
     /// Direct calls and tail calls that leave the function tier, by target.
@@ -138,6 +140,7 @@ impl FnStats {
         self.calls_trapfree += o.calls_trapfree;
         self.tail_known += o.tail_known;
         self.switches += o.switches;
+        self.loops_outlined += o.loops_outlined;
         self.unresolved += o.unresolved;
         self.returns += o.returns;
         for (a, n) in &o.leaves {
@@ -210,11 +213,13 @@ impl FnUnit {
         self.stats.functions += 1;
         self.stats.blocks += f.blocks.iter().filter(|b| !b.synthetic).count();
         let name = body_name(f.entry);
-        let _ = writeln!(self.bodies, "int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{");
+        // The body's head, kept aside: its loop functions go first.
+        let mut fhead = String::new();
+        let _ = writeln!(fhead, "int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{");
         for r in &used {
-            let _ = writeln!(self.bodies, "  {} {};", emit::cty(r.ty()), reg_name(*r));
+            let _ = writeln!(fhead, "  {} {};", emit::cty(r.ty()), reg_name(*r));
         }
-        let _ = writeln!(self.bodies, "  int32_t poll = {LOOP_POLL};");
+        let _ = writeln!(fhead, "  int32_t poll = {LOOP_POLL};");
         // The recursion-depth guard, before anything is loaded: every caller
         // wrote everything back before calling, so leaving for this
         // function's own entry here is exactly the caller leaving for it.
@@ -223,7 +228,7 @@ impl FnUnit {
         // the reserve every other function keeps below the budget.
         if !trapfree.contains_key(&f.entry) {
             let _ = writeln!(
-                self.bodies,
+                fhead,
                 "  if (__builtin_expect(depth > {}, 0)) {{ GEX_C64({}u) = 0x{:x}ull; return 0; }}",
                 stack_budget().saturating_sub(self.weight + TRAPFREE_RESERVE),
                 ctx::PC,
@@ -235,6 +240,51 @@ impl FnUnit {
         // expects when it goes to `ret` with SP back here (plus the popped
         // return address on x86-64).
         e.line(format!("const uint64_t sp0 = {};", reg_name(sp_reg())));
+        // Outermost loops become functions of their own (`outer_loops`,
+        // docs/function-tier.md §7.2), emitted before this one.
+        let loops = if outline_loops() { outer_loops(f) } else { Vec::new() };
+        for (k, lp) in loops.iter().enumerate() {
+            self.stats.loops_outlined += 1;
+            let lname = loop_name(f.entry, k);
+            let mut le = Emitter::new(&dummy, &owned);
+            le.resize(f.n_values as usize);
+            let mut lregs = registers(f);
+            lregs.clean_spills = clean_spills();
+            le.func_regs = Some(lregs);
+            let mut head = String::new();
+            let _ = writeln!(
+                head,
+                "static __attribute__((noinline)) int {lname}(int ctx, int32_t depth, uint32_t need, uint64_t ret, uint64_t sp0) {{"
+            );
+            for r in &used {
+                let _ = writeln!(head, "  {} {};", emit::cty(r.ty()), reg_name(*r));
+            }
+            let _ = writeln!(head, "  int32_t poll = {LOOP_POLL};");
+            le.load_regs(&used);
+            le.line(format!("goto L{};", lp.header));
+            let scope = Scope { body: &lp.body, header: lp.header };
+            for (i, bl) in f.blocks.iter().enumerate() {
+                if !lp.body.contains(&i) {
+                    continue;
+                }
+                le.line(format!("L{i}: {{"));
+                if let Some(d) = dirty.get(i) {
+                    le.set_dirty(d);
+                }
+                for st in &bl.stmts {
+                    le.stmt(st)?;
+                }
+                self.term(&mut le, f, i, known, sums, trapfree, &mut calls, Some(&scope), None)?;
+                le.line("}");
+            }
+            // Every path above ends in a goto or a return.
+            le.line("__builtin_unreachable();");
+            self.bodies.push_str(&head);
+            self.bodies.push_str(&le.take_output());
+            self.bodies.push_str("}\n\n");
+        }
+
+        self.bodies.push_str(&fhead);
         // Block 0 is the entry and comes first, so control falls into it.
         for (i, b) in f.blocks.iter().enumerate() {
             e.line(format!("L{i}: {{"));
@@ -244,7 +294,8 @@ impl FnUnit {
             for s in &b.stmts {
                 e.stmt(s)?;
             }
-            self.term(&mut e, f, i, known, sums, trapfree, &mut calls)?;
+            let heads = Heads { loops: &loops, fname: f.entry, used: &used };
+            self.term(&mut e, f, i, known, sums, trapfree, &mut calls, None, Some(&heads))?;
             e.line("}");
         }
         self.bodies.push_str(&e.take_output());
@@ -281,14 +332,72 @@ impl FnUnit {
         sums: &HashMap<u64, Summary>,
         trapfree: &HashMap<u64, u32>,
         calls: &mut BTreeSet<u64>,
+        scope: Option<&Scope<'_>>,
+        heads: Option<&Heads<'_>>,
     ) -> Result<()> {
         let b = &f.blocks[i];
         let live = &self.live;
+        let self_weight = self.weight;
         let goto = |e: &mut Emitter<'_>, edge: &Edge| {
             if !edge.args.is_empty() {
                 unreachable!("memory form has no edge arguments");
             }
             let to = &f.blocks[edge.to.index()];
+            if let Some(h) = heads {
+                let t = edge.to.index();
+                if let Some((k, lp)) = h.loops.iter().enumerate().find(|(_, lp)| lp.header == t) {
+                    if lp.body.contains(&i) && !to.synthetic && to.start <= b.start {
+                        // An outermost loop's back-edge in the body itself: the
+                        // first 1024 trips run here; a loop that keeps going
+                        // moves to its loop function, a fresh call per chunk
+                        // (§7.2), and the body resumes where it leaves.
+                        e.line("if (--poll <= 0) {");
+                        e.line("  poll = 1024;");
+                        e.flush_keep();
+                        e.store_pc(&format!("0x{:x}ull", to.start));
+                        e.line(format!("  gex_safepoint(ctx, 0x{:x}ll);", to.start));
+                        e.line("  int lr;");
+                        e.line(format!(
+                            "  do lr = {}(ctx, depth + {}, need, ret, sp0); while (lr == LOOP_CHUNK);",
+                            loop_name(h.fname, k),
+                            self_weight
+                        ));
+                        e.line("  if (lr <= 1) return lr;");
+                        e.load_regs(h.used);
+                        e.line("  switch (lr) {");
+                        for x in &lp.exits {
+                            e.line(format!("  case LOOP_EXIT + {x}: goto L{x};"));
+                        }
+                        e.line("  }");
+                        e.line("  __builtin_unreachable();");
+                        e.line("}");
+                        e.line(format!("goto L{t};"));
+                        return;
+                    }
+                }
+            }
+            if let Some(sc) = scope {
+                let t = edge.to.index();
+                if !sc.body.contains(&t) {
+                    // Leaving the loop: everything back to the context, and
+                    // the function carries on at `t`.
+                    e.flush_keep();
+                    e.line(format!("return LOOP_EXIT + {t};"));
+                    return;
+                }
+                if t == sc.header && !to.synthetic && to.start <= b.start {
+                    // The loop's own back-edge: a chunk ends here when the
+                    // countdown expires (after the safepoint, as ever).
+                    e.line("if (--poll <= 0) {");
+                    e.flush_keep();
+                    e.store_pc(&format!("0x{:x}ull", to.start));
+                    e.line(format!("  gex_safepoint(ctx, 0x{:x}ll);", to.start));
+                    e.line("  return LOOP_CHUNK;");
+                    e.line("}");
+                    e.line(format!("goto L{t};"));
+                    return;
+                }
+            }
             // tier-1's rule for a backward branch: poll. Here the countdown is
             // a local (tier-1's fused loops do the same) and the slow path
             // writes everything back, since the host may deliver a signal.
@@ -450,7 +559,13 @@ impl FnUnit {
                     // A tail call does not pass through a loop back-edge or
                     // the root, so it polls (returns no longer do).
                     e.safepoint(&format!("0x{t:x}ull"));
-                    e.line(format!("GEX_MUSTTAIL return {}(ctx, depth, need, ret);", body_name(*t)));
+                    if scope.is_some() {
+                        // A loop function's signature is not the bodies':
+                        // an ordinary call (one more frame) instead.
+                        e.line(format!("return {}(ctx, depth + {}, need, ret);", body_name(*t), self.weight));
+                    } else {
+                        e.line(format!("GEX_MUSTTAIL return {}(ctx, depth, need, ret);", body_name(*t)));
+                    }
                 }
                 Callee::Direct(t) => {
                     *self.stats.leaves.entry(*t).or_default() += 1;
@@ -785,4 +900,121 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
         visit(a, &cand, &mut memo, &mut onstack);
     }
     memo.into_iter().filter_map(|(a, n)| n.map(|n| (a, n))).collect()
+}
+
+/// Outlining outermost loops is on unless `GEX_CGEN_OUTLINE=0`.
+fn outline_loops() -> bool {
+    std::env::var("GEX_CGEN_OUTLINE").as_deref() != Ok("0")
+}
+
+fn loop_name(entry: u64, k: usize) -> String {
+    format!("l_{entry:x}_{k}")
+}
+
+/// The body's view of its outlined loops.
+pub(crate) struct Heads<'a> {
+    loops: &'a [Loop],
+    fname: u64,
+    used: &'a [GuestReg],
+}
+
+/// The blocks a loop function emits.
+pub(crate) struct Scope<'a> {
+    body: &'a BTreeSet<usize>,
+    header: usize,
+}
+
+/// An outermost natural loop: its header, its blocks, and the blocks outside
+/// it that its edges reach.
+struct Loop {
+    header: usize,
+    body: BTreeSet<usize>,
+    exits: BTreeSet<usize>,
+}
+
+/// The outermost natural loops of `f`, for outlining (docs/function-tier.md
+/// §7.2): V8 never replaces a running frame's baseline code, so a loop that
+/// runs for the whole of one call of a function called once (a `main`)
+/// would never reach optimised code. Outlined, each chunk of iterations is a
+/// new call. None when the CFG has a backward edge that is not a natural
+/// loop's (irreducible): outlining needs the header to be the only way in.
+fn outer_loops(f: &Function) -> Vec<Loop> {
+    let n = f.blocks.len();
+    let idom = f.idoms();
+    let dominates = |h: usize, mut b: usize| -> bool {
+        loop {
+            if b == h {
+                return true;
+            }
+            match idom[b] {
+                Some(d) => b = d.index(),
+                None => return false,
+            }
+        }
+    };
+    let preds = f.preds();
+    let reachable: HashSet<usize> = f.rpo().iter().map(|b| b.index()).collect();
+    let mut by_header: std::collections::BTreeMap<usize, BTreeSet<usize>> = Default::default();
+    for (i, b) in f.blocks.iter().enumerate() {
+        if !reachable.contains(&i) {
+            continue;
+        }
+        for s in b.succs() {
+            let h = s.index();
+            if !dominates(h, i) {
+                // Not a natural back-edge; a retreating edge in RPO would be
+                // irreducible. Checked below by containment instead.
+                continue;
+            }
+            // Natural loop of i -> h.
+            let body = by_header.entry(h).or_default();
+            body.insert(h);
+            // Everything that reaches the latch without passing the header.
+            let mut work = vec![i];
+            while let Some(x) = work.pop() {
+                if x == h {
+                    continue; // a self-loop's latch is its header
+                }
+                body.insert(x);
+                for p in &preds[x] {
+                    if !body.contains(&p.index()) && reachable.contains(&p.index()) {
+                        work.push(p.index());
+                    }
+                }
+            }
+        }
+    }
+    // Irreducible control flow (a cycle with no dominating header): leave
+    // the function alone.
+    let order: HashMap<usize, usize> = f.rpo().iter().enumerate().map(|(k, b)| (b.index(), k)).collect();
+    for (i, b) in f.blocks.iter().enumerate() {
+        let Some(&oi) = order.get(&i) else { continue };
+        for s in b.succs() {
+            if let Some(&os) = order.get(&s.index()) {
+                if os <= oi && !dominates(s.index(), i) {
+                    return Vec::new();
+                }
+            }
+        }
+    }
+    // Outermost: a header no other loop's body contains.
+    let headers: Vec<usize> = by_header.keys().copied().collect();
+    let mut out = Vec::new();
+    for &h in &headers {
+        if headers.iter().any(|&o| o != h && by_header[&o].contains(&h)) {
+            continue;
+        }
+        let body = by_header[&h].clone();
+        let mut exits = BTreeSet::new();
+        for &bi in &body {
+            for s in f.blocks[bi].succs() {
+                if !body.contains(&s.index()) {
+                    exits.insert(s.index());
+                }
+            }
+        }
+        out.push(Loop { header: h, body, exits });
+    }
+    let _ = n;
+    out
 }
