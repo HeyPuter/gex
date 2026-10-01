@@ -542,6 +542,11 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     } else if gex_abi::PPC {
         image.symbols = read_symbols32(&r, e_shoff, e_shentsize, e_shnum, bias);
         image.code = read_code_sections32(&r, e_shoff, e_shentsize, e_shnum, bias);
+    } else {
+        // i386: the function symbols, for function recovery (the function
+        // tier) and names. The code sections stay unread, so what tier-1
+        // discovers is unchanged.
+        image.symbols = read_symbols32(&r, e_shoff, e_shentsize, e_shnum, bias);
     }
     Ok(image)
 }
