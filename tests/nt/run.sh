@@ -66,13 +66,16 @@ for arch in x64 x86; do
     check $arch/apc 0 "$allok" "$b/apc.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
     check $arch/cxx 0 "$allok" "$b/cxx.exe"
+    # N4: USER without a display.
+    check $arch/user_win 0 "$allok" "$b/user_win.exe"
+    check $arch/gdi 0 "$allok" "$b/gdi.exe"
+    check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" "$b/exitproc.exe"
     # Ends in the top-level exception filter, which exits with 77.
-    seh=(check)
-    # i386 RtlCaptureContext uses fnsave, which the x86 lifter does not
-    # implement yet (x87 stream S14).
-    [ $arch = x86 ] && seh=(xfail "fnsave in RtlCaptureContext")
-    "${seh[@]}" $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$b/seh.exe"
+    check $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$b/seh.exe"
+    # Divide errors and hlt: the lifter's div/idiv do not raise #DE yet
+    # (S14); hlt raises a general-protection trap.
+    xfail "div/idiv #DE traps (S14)" $arch/seh-traps 0 "$allok" "$b/seh.exe" traps
 done
 # gex-ld's PE fixtures.
 check pe-x64/hello 0 "Hello from x64 PE!" "$fx/x64/hello.exe"

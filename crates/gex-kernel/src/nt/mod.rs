@@ -19,8 +19,10 @@
 
 pub mod boot;
 pub mod file;
+pub mod gdi;
 pub mod layout;
 pub mod object;
+pub mod opengl;
 pub mod reg;
 pub mod section;
 pub mod status;
@@ -29,6 +31,7 @@ pub mod sysinfo;
 pub mod sysno;
 pub mod thread;
 pub mod unixcall;
+pub mod user;
 pub mod vm;
 
 use crate::futex::FutexTable;
@@ -318,6 +321,9 @@ pub struct Thread {
     pub suspend: AtomicU32,
     /// Nesting depth of user-mode callbacks (`KeUserModeCallback`).
     pub callback_depth: AtomicU32,
+    /// What the innermost callback returned (`NtCallbackReturn`'s status and
+    /// data), until [`thread::user_callback`] takes it.
+    pub callback_result: Mutex<Option<(u32, Vec<u8>)>>,
 }
 
 /// Where the process's files come from.
@@ -370,6 +376,12 @@ pub struct Process {
     pub atoms: Mutex<sysinfo::Atoms>,
     /// Threads blocked on keyed events.
     pub keyed: Mutex<sync::Keyed>,
+    /// USER: windows, classes, message queues (win32u).
+    pub user: Mutex<user::User>,
+    /// GDI: objects, DCs and the shared handle table (win32u).
+    pub gdi: Mutex<gdi::Gdi>,
+    /// opengl32's Unix side: contexts and the GL command ring.
+    pub gl: Mutex<opengl::State>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
@@ -433,7 +445,23 @@ impl Process {
             unix: unixcall::Registry::default(),
             atoms: Mutex::new(Default::default()),
             keyed: Mutex::new(Default::default()),
+            user: Mutex::new(user::User::new()),
+            gdi: Mutex::new(Default::default()),
+            gl: Mutex::new(Default::default()),
             kill_list: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `addr` as `module+offset` when it is inside a mapped image, for
+    /// traces.
+    pub fn describe_addr(&self, addr: u64) -> String {
+        let st = self.st.lock().unwrap();
+        match st.images.range(..=addr).next_back() {
+            Some((_, v)) if addr < v.base + v.size => {
+                let name = v.path.rsplit(['/', '\\']).next().unwrap_or(&v.path);
+                format!("{addr:#x} ({name}+{:#x})", addr - v.base)
+            }
+            _ => format!("{addr:#x}"),
         }
     }
 
@@ -502,6 +530,27 @@ pub enum Outcome {
     CallbackReturn,
 }
 
+/// What the host provides the NT layer beyond memory and the kernel: running
+/// guest code on the calling thread, for user-mode callbacks
+/// (docs/nt-layer.md §5).
+pub trait NtHost {
+    /// Run the calling thread's guest code from its current context (the
+    /// pc in its gex context) until it issues `NtCallbackReturn`. `Err` means
+    /// the thread or the process is ending, or the run failed; the host has
+    /// recorded why.
+    fn run_callback(&mut self) -> Result<(), ()>;
+}
+
+/// A host that cannot run guest code (processor exceptions, tests).
+pub struct NoHost;
+
+impl NtHost for NoHost {
+    fn run_callback(&mut self) -> Result<(), ()> {
+        eprintln!("gex-nt: a user-mode callback where the host cannot run one");
+        Err(())
+    }
+}
+
 /// One syscall being handled.
 pub struct Call<'a> {
     pub p: &'a Arc<Process>,
@@ -512,6 +561,10 @@ pub struct Call<'a> {
     pub pc: u64,
     /// Set by a handler that wants something other than "return a status".
     pub outcome: Option<Outcome>,
+    /// A full-width result for `rax` (win32u calls return handles and
+    /// LRESULTs, not NTSTATUS).
+    pub ret64: Option<u64>,
+    pub host: &'a mut dyn NtHost,
 }
 
 impl<'a> Call<'a> {
@@ -602,14 +655,15 @@ pub fn hardware_exception(
     if p.cfg.trace {
         let r = |o: usize| g.u64(ctx_addr + o as u64).unwrap_or(0);
         eprintln!(
-            "[nt:{:x}] exception {code:#010x} at {rip:#x} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
+            "[nt:{:x}] exception {code:#010x} at {} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
             t.tid,
+            p.describe_addr(rip),
             r(ctx::x(4)),
             r(ctx::LAST_TARGET),
             r(ctx::LAST_SOURCE)
         );
     }
-    let mut c = Call { p, t, kernel, g, nr: 0, pc: rip, outcome: None };
+    let mut c = Call { p, t, kernel, g, nr: 0, pc: rip, outcome: None, ret64: None, host: &mut NoHost };
     let r = (|| -> R<()> {
         let sp = c.g.u64(ctx_addr + ctx::x(4) as u64)?;
         let context = ((sp - 0x5c0) & !63) - 0x600;
@@ -639,7 +693,14 @@ pub fn hardware_exception(
 }
 
 /// Handle one syscall from an NT process. `data` is the whole guest memory.
-pub fn syscall(p: &Arc<Process>, kernel: &Mutex<Kernel>, data: &mut [u8], ctx_addr: u64, pc: u64) -> Outcome {
+pub fn syscall(
+    p: &Arc<Process>,
+    kernel: &Mutex<Kernel>,
+    data: &mut [u8],
+    ctx_addr: u64,
+    pc: u64,
+    host: &mut dyn NtHost,
+) -> Outcome {
     let abi = p.abi;
     let g = G::new(data, abi);
     let nr = g.u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) as u32;
@@ -651,11 +712,11 @@ pub fn syscall(p: &Arc<Process>, kernel: &Mutex<Kernel>, data: &mut [u8], ctx_ad
         return Outcome::Exit(p.exit_code.load(Ordering::Acquire));
     }
     if p.kill_list.lock().unwrap().contains(&t.tid) {
-        let mut c = Call { p, t, kernel, g, nr, pc, outcome: None };
+        let mut c = Call { p, t, kernel, g, nr, pc, outcome: None, ret64: None, host };
         thread::exit_thread(&mut c, p.exit_code.load(Ordering::Acquire));
         return Outcome::ThreadExit;
     }
-    let mut c = Call { p, t, kernel, g, nr, pc, outcome: None };
+    let mut c = Call { p, t, kernel, g, nr, pc, outcome: None, ret64: None, host };
     let r = dispatch(&mut c);
     let status = match r {
         Ok(s) => s,
@@ -680,8 +741,9 @@ pub fn syscall(p: &Arc<Process>, kernel: &Mutex<Kernel>, data: &mut [u8], ctx_ad
         Some(o @ (Outcome::Resume(_) | Outcome::Exit(_) | Outcome::ThreadExit | Outcome::CallbackReturn)) => o,
         other => {
             // NTSTATUS is 32 bits; the upper half of rax is zero, as after
-            // Wine's `movl %eax` return.
-            let _ = c.g.w64(ctx_addr + ctx::x(0) as u64, status as u64);
+            // Wine's `movl %eax` return. win32u calls return their own value.
+            let v = c.ret64.unwrap_or(status as u64);
+            let _ = c.g.w64(ctx_addr + ctx::x(0) as u64, v);
             other.unwrap_or(Outcome::Continue)
         }
     }
@@ -751,6 +813,11 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtOpenSemaphore => sync::nt_open_semaphore(c),
         n::NtReleaseSemaphore => sync::nt_release_semaphore(c),
         n::NtCreateKeyedEvent => sync::nt_create_keyed_event(c),
+        n::NtCreateTimer => sync::nt_create_timer(c),
+        n::NtOpenTimer => sync::nt_open_timer(c),
+        n::NtSetTimer => sync::nt_set_timer(c),
+        n::NtCancelTimer => sync::nt_cancel_timer(c),
+        n::NtQueryTimer => sync::nt_query_timer(c),
         n::NtWaitForKeyedEvent => sync::nt_wait_for_keyed_event(c),
         n::NtReleaseKeyedEvent => sync::nt_release_keyed_event(c),
         n::NtWaitForSingleObject => sync::nt_wait_for_single_object(c),
@@ -799,6 +866,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtSetTimerResolution => sysinfo::nt_set_timer_resolution(c),
         n::NtAddAtom => sysinfo::nt_add_atom(c),
         n::NtFindAtom => sysinfo::nt_find_atom(c),
+        n::NtDeleteAtom => sysinfo::nt_delete_atom(c),
         n::NtQueryInformationAtom => sysinfo::nt_query_information_atom(c),
         n::NtAllocateLocallyUniqueId => sysinfo::nt_allocate_locally_unique_id(c),
         n::NtQueryLicenseValue => sysinfo::nt_query_license_value(c),
@@ -808,8 +876,11 @@ fn dispatch(c: &mut Call<'_>) -> R {
         }),
         gex_nr::UNIX_CALL => unixcall::dispatch(c),
         gex_nr::BAD_DISPATCH => Err(c.unimplemented("a call through __wine_syscall_dispatcher on x86-64")),
-        nr if nr >= 0x1000 && nr < 0x2000 => {
-            Err(c.unimplemented(&format!("win32u {} ({nr:#x})", syscall_name(nr))))
+        nr if (0x1000..0x2000).contains(&nr) => {
+            // A failed win32u call returns 0, with any last error already set.
+            let v = user::dispatch(c).unwrap_or(0);
+            c.ret64 = Some(v);
+            Ok(v as u32)
         }
         nr => Err(c.unimplemented(&format!("{} ({nr:#x})", syscall_name(nr)))),
     }

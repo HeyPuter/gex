@@ -14,7 +14,7 @@ gex-kernel.workspace = true
 gex-wayland.workspace = true
 gex-virgl.workspace = true
 gex-gpu.workspace = true
-gex-gl.workspace = true
+gex-gl = { workspace = true, features = ["host"] }
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel"] }
 

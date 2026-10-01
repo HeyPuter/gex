@@ -96,7 +96,14 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let p = Arc::clone(state.nt.as_ref().expect("an NT syscall in a Linux process"));
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
-    let outcome = nt::syscall(&p, &kernel, memory.bytes(), ctx_addr, pc);
+    let outcome = {
+        let mut host = CallerHost { caller: &mut *caller, p: &p };
+        nt::syscall(&p, &kernel, memory.bytes(), ctx_addr, pc, &mut host)
+    };
+    // A callback inside that syscall may have ended the process or failed.
+    if caller.data().exit.is_some() {
+        return Err(StopExecution.into());
+    }
     // Code that went away (an unmapped image, a protection change) loses its
     // translations. NT images are never statically recompiled, so newly
     // mapped code needs nothing here.
@@ -139,9 +146,9 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
             state.resume_at = Some(resume_pc());
             Err(StopExecution.into())
         }
-        nt::Outcome::CallbackReturn => {
-            bail!("gex-nt: NtCallbackReturn, but the nested guest loop for user-mode callbacks is not built yet (N4)")
-        }
+        // The result is with the thread; unwinding here ends the innermost
+        // nested loop (`CallerHost::run_callback`).
+        nt::Outcome::CallbackReturn => Err(StopExecution.into()),
     }
 }
 
@@ -154,6 +161,26 @@ pub(crate) enum Fault {
     Illegal,
     /// A branch to memory that is not executable.
     NotExecutable,
+    /// x86 #DE from a zero divisor (`Stmt::Trap`, `BRK_DIVIDE_BY_ZERO`).
+    DivideByZero,
+    /// x86 #DE from a quotient too wide (`BRK_DIVIDE_OVERFLOW`).
+    DivideOverflow,
+    /// A privileged instruction such as `hlt` (`BRK_GENERAL_PROTECTION`).
+    Privileged,
+}
+
+impl Fault {
+    /// The fault a `breakpoint` import's immediate stands for: the
+    /// `Stmt::Trap` codes, or an `int3`.
+    pub(crate) fn from_brk(imm: i32) -> Fault {
+        use gex_abi::imports as i;
+        match imm {
+            i::BRK_DIVIDE_BY_ZERO => Fault::DivideByZero,
+            i::BRK_DIVIDE_OVERFLOW => Fault::DivideOverflow,
+            i::BRK_GENERAL_PROTECTION => Fault::Privileged,
+            _ => Fault::Breakpoint,
+        }
+    }
 }
 
 /// Deliver `fault` at `pc` to the guest as an NT exception, as Wine's signal
@@ -170,6 +197,11 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
         Fault::Illegal => (st::ILLEGAL_INSTRUCTION, pc, vec![]),
         // EXCEPTION_EXECUTE_FAULT at the target.
         Fault::NotExecutable => (st::ACCESS_VIOLATION, pc, vec![8, pc]),
+        // Windows reports #DE as these two, and `hlt` in user mode as a
+        // privileged instruction, all at the faulting instruction.
+        Fault::DivideByZero => (st::INTEGER_DIVIDE_BY_ZERO, pc, vec![]),
+        Fault::DivideOverflow => (st::INTEGER_OVERFLOW, pc, vec![]),
+        Fault::Privileged => (st::PRIVILEGED_INSTRUCTION, pc, vec![]),
     };
     let outcome = nt::hardware_exception(&p, &state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {
@@ -178,4 +210,75 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
         other => bail!("gex-nt: unexpected outcome {other:?} from exception dispatch"),
     }
     Err(StopExecution.into())
+}
+
+/// Runs user-mode callbacks for the NT layer: a nested guest loop on the
+/// calling thread, inside the `syscall` import (docs/nt-layer.md §5).
+struct CallerHost<'a, 'b> {
+    caller: &'a mut Caller<'b, HostState>,
+    p: &'a Arc<nt::Process>,
+}
+
+impl nt::NtHost for CallerHost<'_, '_> {
+    fn run_callback(&mut self) -> std::result::Result<(), ()> {
+        match nested_loop(self.caller, self.p) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Recorded as a failure of the process, which the outer
+                // syscall import notices on return.
+                let state = self.caller.data_mut();
+                if state.exit.is_none() {
+                    eprintln!("gex-nt: a user-mode callback failed: {e:#}");
+                    state.exit = Some(Exit::Signal {
+                        signal: signal::SIGSEGV,
+                        pc: 0,
+                        detail: format!("user-mode callback: {e:#}"),
+                        internal: true,
+                    });
+                }
+                Err(())
+            }
+        }
+    }
+}
+
+/// The same loop as `run_thread_loop`, one level down: re-enter translated
+/// code at the context's pc, follow redirects, and stop at the thread's
+/// `NtCallbackReturn`.
+fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Result<()> {
+    let enter = caller
+        .get_export(exports::ENTER)
+        .and_then(Extern::into_func)
+        .ok_or_else(|| anyhow!("the calling module does not export `enter`"))?;
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let thread = p.thread_by_ctx(ctx_addr).ok_or_else(|| anyhow!("a callback on a thread the NT layer does not know"))?;
+    let mut pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    loop {
+        let result = enter.call(&mut *caller, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut []);
+        if let Some(child) = caller.data_mut().pending_spawn.take() {
+            let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
+            start_guest_thread(cx, child)?;
+        }
+        let e = match result {
+            Ok(()) => bail!("guest code returned out of a user-mode callback"),
+            Err(e) => e,
+        };
+        if thread.callback_result.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        if let Some(next) = caller.data_mut().resume_at.take() {
+            pc = next;
+            continue;
+        }
+        if caller.data().exit.is_some() {
+            bail!("the thread ended inside a user-mode callback");
+        }
+        if is_stale_table_trap(&e) {
+            catch_up_in_caller(caller)?;
+            pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+            continue;
+        }
+        return Err(e);
+    }
 }

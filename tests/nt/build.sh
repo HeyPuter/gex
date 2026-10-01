@@ -14,6 +14,8 @@ for arch in x64 x86; do
     for c in "$here"/src/*.c "$here"/src/*.cpp; do
         n=$(basename "${c%.*}")
         cc=$(sed -n 's/^.*gex-nt-cc: *//p' "$c" | sed "s/ARCH/$triple/g")
-        ${cc:-$triple-w64-mingw32-gcc} -O2 -s -o "$here/bin/$arch/$n.exe" "$c"
+        # No timestamp in the PE header, so a rebuild of an unchanged source
+        # produces the same file.
+        ${cc:-$triple-w64-mingw32-gcc} -O2 -s -Wl,--no-insert-timestamp -o "$here/bin/$arch/$n.exe" "$c"
     done
 done

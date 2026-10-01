@@ -505,6 +505,7 @@ version = "0.0.1"
 dependencies = [
  "gex-abi",
  "gex-f80",
+ "gex-gl",
  "gex-ld",
 ]
 

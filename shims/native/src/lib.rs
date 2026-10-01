@@ -1295,29 +1295,7 @@ fn run_thread_loop(
                 .spawn
                 .clone()
                 .ok_or_else(|| anyhow!("clone with no spawn context"))?;
-            // Detached: a guest thread is joined through its own futex, not
-            // through the host's handle, and `exit_group` ends the process
-            // whatever its threads are doing.
-            cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let running = Arc::clone(&cx.running);
-            std::thread::Builder::new()
-                .name(format!("gex-tid-{}", child.tid))
-                .spawn(move || {
-                    if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
-                        eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                        // A thread that fails takes its process with it, as on
-                        // Linux: otherwise the other threads sit in a futex
-                        // forever and every descriptor it holds stays open.
-                        stop_other_threads(&cx, false);
-                        cx.kernel
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .fds
-                            .close_all();
-                    }
-                    running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                })
-                .context("spawning a guest thread")?;
+            start_guest_thread(cx, child)?;
         }
         if let Some(req) = store.data_mut().pending_exec.take() {
             return Ok(Stopped::Exec(req));
@@ -1354,6 +1332,35 @@ fn run_thread_loop(
             }
         }
     }
+}
+
+/// Start a host thread for a guest thread a `clone` (or an NT thread
+/// creation) asked for. Called between guest calls, where nothing is borrowed.
+fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
+    // Detached: a guest thread is joined through its own futex, not
+    // through the host's handle, and `exit_group` ends the process
+    // whatever its threads are doing.
+    cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let running = Arc::clone(&cx.running);
+    std::thread::Builder::new()
+        .name(format!("gex-tid-{}", child.tid))
+        .spawn(move || {
+            if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
+                eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                // A thread that fails takes its process with it, as on
+                // Linux: otherwise the other threads sit in a futex
+                // forever and every descriptor it holds stays open.
+                stop_other_threads(&cx, false);
+                cx.kernel
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .fds
+                    .close_all();
+            }
+            running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        })
+        .context("spawning a guest thread")?;
+    Ok(())
 }
 
 /// Build and start a child process.
@@ -2787,7 +2794,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::Breakpoint, pc as u64);
+                return nt::fault(&mut caller, nt::Fault::from_brk(imm), pc as u64);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with
