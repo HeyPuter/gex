@@ -92,7 +92,8 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
         *p.display_host.lock().unwrap() = Some(Arc::new(PpmDisplay::new(out)));
     }
     store.data_mut().nt = Some(Arc::clone(&p));
-    start_ticker(memory, Arc::downgrade(&p));
+    let sampler = store.data().sampler.clone();
+    start_ticker(memory, Arc::downgrade(&p), sampler);
     Ok(pc)
 }
 
@@ -174,7 +175,7 @@ impl nt::display::NtDisplay for PpmDisplay {
 /// Advance `KUSER_SHARED_DATA`'s clocks every millisecond for as long as the
 /// process exists, so a guest polling `GetTickCount` without syscalls sees
 /// time pass (docs/nt-layer.md §4).
-fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>) {
+fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, sampler: Option<Arc<Sampler>>) {
     let stats = std::env::var_os("GEX_NT_STATS").is_some();
     let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
         let (addr, deref) = match v.strip_suffix('*') {
@@ -208,6 +209,17 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>) {
                     match value {
                         Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v}", start.elapsed().as_millis()),
                         None => eprintln!("gex-nt: stats t={} presents={presents}", start.elapsed().as_millis()),
+                    }
+                    // With --sample, the hottest guest back-edges of the last
+                    // 30 s, by module, so a run that never exits can still be
+                    // profiled.
+                    if let Some(s) = sampler.as_ref().filter(|_| next_stats.as_secs() % 30 == 0) {
+                        let counts = std::mem::take(&mut *s.counts.lock().unwrap_or_else(|e| e.into_inner()));
+                        let mut v: Vec<(u64, u64)> = counts.into_iter().collect();
+                        v.sort_by(|a, b| b.1.cmp(&a.1));
+                        for (pc, n) in v.into_iter().take(12) {
+                            eprintln!("gex-nt: hot {n} {}", p.describe_addr(pc));
+                        }
                     }
                 }
             }
