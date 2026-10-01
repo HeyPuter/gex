@@ -111,7 +111,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
         verbose: flags.verbose,
         sysroot: Some(root),
         cwd: project.program.cwd.clone(),
-        jit: flags.jit_fallback,
+        jit: flags.jit_fallback || config.jit_fallback,
         aot: Some(Arc::clone(&aot)),
         // A dynamic program's libraries go where their modules were built for.
         pins: manifest.pins.iter().cloned().collect(),

@@ -98,6 +98,7 @@ pub fn manifest(
     pins: &[(String, u64, u64)],
     repl: &[BuiltReplacement],
     syscalls: Option<&std::collections::HashSet<u64>>,
+    jit_fallback: bool,
 ) -> Result<()> {
     // A static program's image module owns the memory and tables. A dynamic
     // one's objects are all library modules (see `Translation::translate`),
@@ -131,6 +132,7 @@ pub fn manifest(
         ("format", json::s("gex-eject-web")),
         ("version", json::n(1)),
         ("arch", json::s(gex_abi::ARCH_NAME)),
+        ("jit_fallback", json::b(jit_fallback)),
         ("shim", json::s(SHIM)),
         ("module", json::s(&module)),
         ("closure", json::strs(closure)),
@@ -263,7 +265,7 @@ export async function launch(m, read, { args = null, write, jitFallback = false,
   }
   const entry = await gex.load(await read(m.shim), await read(m.module), await read(m.exe_file), files, argv, {
     cwd: m.cwd, env: m.env, dirs: m.dirs, modes: m.modes, pins, closure, program: m.exe, exe: m.exe,
-    jit: jitFallback ? undefined : false, replace, syscallGuard, strace,
+    jit: jitFallback || m.jit_fallback ? undefined : false, replace, syscallGuard, strace,
   });
   return await gex.run(entry);
 }

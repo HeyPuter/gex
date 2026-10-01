@@ -74,6 +74,10 @@ pub struct Config {
     pub all_syscalls: bool,
     /// System calls allowed besides the recorded ones, by name or number.
     pub allow_syscalls: Vec<String>,
+    /// Translate code the build never saw instead of failing on it, for
+    /// every run of this build (default off; a run can ask with
+    /// `--jit-fallback`).
+    pub jit_fallback: bool,
 }
 
 impl Default for Config {
@@ -84,6 +88,7 @@ impl Default for Config {
             args: None,
             all_syscalls: false,
             allow_syscalls: Vec::new(),
+            jit_fallback: false,
         }
     }
 }
@@ -99,7 +104,8 @@ pub fn template() -> String {
                  \"symbol\": \"strlen\", \"export\": \"my_strlen\", \"abi\": \"c\"}, or by \"offset\", \
                  \"import\" or \"library\"; `gexc eject override` prints a checked entry. \"coverage\" is \"profile\" (what the session ran), \"static\" (and what discovery finds) or \"exhaustive\". \"args\" \
                  replaces the recorded arguments. \"syscalls\": \"recorded\" allows only the system \
-                 calls the session made (\"all\": any); \"allow_syscalls\" adds some by name.",
+                 calls the session made (\"all\": any); \"allow_syscalls\" adds some by name. \"jit_fallback\": true translates code the build \
+                 never saw instead of failing on it.",
             ),
         ),
         ("replace", Json::Arr(Vec::new())),
@@ -107,6 +113,7 @@ pub fn template() -> String {
         ("args", Json::Null),
         ("syscalls", json::s("recorded")),
         ("allow_syscalls", Json::Arr(Vec::new())),
+        ("jit_fallback", json::b(false)),
     ]))
 }
 
@@ -118,7 +125,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "coverage" | "args" | "syscalls" | "allow_syscalls") {
+            if !matches!(k.as_str(), "about" | "replace" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -208,6 +215,11 @@ impl Config {
             Some(o) => bail!("{what}: syscalls \"{o}\" is not \"recorded\" or \"all\""),
         };
         c.allow_syscalls = json::str_list(&v, "allow_syscalls", what)?;
+        c.jit_fallback = match v.get("jit_fallback") {
+            None | Some(Json::Null) => false,
+            Some(Json::Bool(b)) => *b,
+            Some(_) => bail!("{what}: jit_fallback is not true or false"),
+        };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,
             Some(_) => Some(json::str_list(&v, "args", what)?),

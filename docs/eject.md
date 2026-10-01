@@ -157,8 +157,11 @@ the session did not run) fails naming it, and a project changed since its
 build (`user/eject.json`, a replacement module) refuses to run until
 `build.sh` has been run again.
 
-`--jit-fallback` ships nothing new in v0: the runtime is the full gexc, so it
-just turns runtime translation back on.
+`--jit-fallback` (on a run), or `"jit_fallback": true` in `user/eject.json`
+(for every run of the build, native and web), turns runtime translation back
+on. It is off by default. Both runtimes already contain the translator, so
+it ships nothing extra yet; with gex-kernel's feature gating it becomes what
+decides whether the translator ships.
 
 ## Library replacement
 

@@ -810,7 +810,7 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                     .map(|p| (p.obj.path.clone(), p.image.bias, p.image.brk - p.image.bias))
                     .collect();
                 let allowed = crate::run::allowed_syscalls(dir, &config)?;
-                crate::web::manifest(dir, &project, &images, &spans, &replacements, allowed.as_ref())?;
+                crate::web::manifest(dir, &project, &images, &spans, &replacements, allowed.as_ref(), config.jit_fallback)?;
                 Some(Ok(images.iter().map(|i| i.bytes).sum()))
             }
         }
