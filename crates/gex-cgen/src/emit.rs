@@ -643,6 +643,9 @@ impl<'a> Emitter<'a> {
                 self.line("}");
             }
             Stmt::Fence => self.line("__atomic_thread_fence(__ATOMIC_SEQ_CST);"),
+            // Not lowered yet (S14 adds the C helpers): code containing one
+            // stays tier-1 (`has_unlowered`), so reaching here is a bug.
+            Stmt::X87 { op, .. } => bail!("Stmt::X87 ({op:?}) has no C lowering yet"),
             Stmt::StrOp { .. } => self.strop(s)?,
         }
         Ok(())
@@ -1552,4 +1555,10 @@ pub(crate) fn clobbers(s: &Stmt) -> bool {
         } => func.clobbers_guest_state(),
         _ => false,
     }
+}
+
+/// Whether `stmts` contain a statement gex-cgen cannot lower yet; such a
+/// block, or a function containing one, stays tier-1.
+pub(crate) fn has_unlowered(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| matches!(s, Stmt::X87 { .. }))
 }
