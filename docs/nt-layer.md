@@ -681,6 +681,26 @@ Worker, so a thread must be one). Hooks in `lib.rs`, each a line or two:
   guest that polls the tick count in a loop passes a safepoint.
 - The NT layer's diagnostics go to the console through `nt::set_log`
   (`eprintln!` writes nowhere on wasm32-unknown-unknown).
+- The display, when the page brought a compositor (`gex_set_wl`): `WlDisplay`
+  publishes every visible top-level window as a toplevel record in this
+  process's block of the scene arena (`wl_publish`, the same records
+  `crate::wl` writes; client 1, surface = the window handle, XRGB8888 at the
+  surface's guest address, which the compositor reads in place), and
+  `poll_input` decodes this process's input ring (`wl_poll_input`, shared
+  memory) into `NtDisplayEvent`s, which `message::peek` turns into hardware
+  input. The compositor places and decorates the windows; coordinates are
+  surface-local either way. A configure that does not change the size (the
+  compositor sends one on every focus change) is dropped.
+- `/dev/gex-gl` is the shim's `GlDevice`, the one Linux guests use: the
+  opengl32 unixlib's submits go through `gl_submit` to the page's GL host
+  (`MesaGlDevice` in the compositor's worker with `gl: 'compositor'`).
+
+The page is `web/nt.html` (`web/src/nt-page.js`): it fetches a tar holding a
+prefix under `/wine` and the program, and runs it through `runProgram` with
+the canvas as the compositor's output. `tests/nt/browser-gui.mjs` drives it in
+headless Chromium (its own vite dev server and browser, software GL):
+`window.exe`'s window is checked by pixels, a click and Escape by what the
+program prints.
 
 **One kernel.** The process's `Kernel` is the one in the shim's `Host`, and
 the NT layer reaches it only through `HostKernel`, whose `lock_kernel` takes

@@ -71,6 +71,8 @@ for arch in x64 x86; do
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
+    # A window that paints and runs a message loop (tests/nt/browser-gui.mjs shows it).
+    check $arch/window 0 "shown${nl}bye" "$b/window.exe" 0
     # Code written, rewritten and reallocated at run time (a JIT).
     check $arch/jitcode 0 "$allok" "$b/jitcode.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" "$b/exitproc.exe"
