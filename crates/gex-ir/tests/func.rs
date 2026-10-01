@@ -606,6 +606,7 @@ fn x87_arithmetic_and_compares_round_trip_and_run() {
         sp: GuestReg::Sp,
         max_steps: 10,
         syscall: None,
+        narrow: false,
     };
     // 3 / 3 = 1, and 3 compares greater than 1 (no condition bits).
     let mut regs = interp::initial_regs(1, GuestReg::Sp);
