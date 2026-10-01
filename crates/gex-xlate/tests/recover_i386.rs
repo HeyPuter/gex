@@ -208,4 +208,28 @@ fn a_guarded_vsyscall_is_the_syscall_it_makes() {
     let s = sums.to_ssa(f);
     s.verify().unwrap();
     check_all(&prog.functions, &sums, 64);
+
+    // The same guard from a profile: S6 names the site by the tier-1 block
+    // ending in the call (here f's first), and its target by offset.
+    use gex_xlate::profile::{IndirectSite, Loc, ObjectProfile, Profile};
+    let mut site = IndirectSite {
+        call: true,
+        total: 3,
+        ..Default::default()
+    };
+    site.targets.insert(
+        Loc {
+            obj: "sha256:test".into(),
+            off: 0x10015,
+        },
+        3,
+    );
+    let mut o = ObjectProfile::default();
+    o.indirect.insert(0x10000, site);
+    let mut profile = Profile::new("x86_64");
+    profile.objects.insert("sha256:test".into(), o);
+    let pg = gex_xlate::summary::profile_guards(&prog, &profile, "sha256:test", 0);
+    assert_eq!(pg.calls, guards.calls);
+    // Another object's id matches nothing.
+    assert!(gex_xlate::summary::profile_guards(&prog, &profile, "sha256:other", 0).calls.is_empty());
 }

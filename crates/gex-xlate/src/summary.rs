@@ -1724,6 +1724,65 @@ fn join_summaries(a: &Summary, b: &Summary) -> Summary {
     }
 }
 
+/// Guards from a profile (S6, [`crate::profile`]): every indirect call
+/// site the profile saw, guarded with the targets it recorded inside the
+/// same object (at most four, the profile's table size). `obj` is the
+/// object's profile id (`sha256:…` of the file) and `bias` its load bias
+/// (runtime address minus link-time address). The profile keys a site by
+/// the tier-1 block that ends in the call; that block's straight line
+/// (fall-throughs a later split made) leads to the call instruction.
+pub fn profile_guards(prog: &Program, profile: &crate::profile::Profile, obj: &str, bias: u64) -> Guards {
+    let mut g = Guards::default();
+    let Some(o) = profile.objects.get(obj) else {
+        return g;
+    };
+    // Every lifted block, by start: (function, block).
+    let mut at: HashMap<u64, Vec<(u64, BlockId)>> = HashMap::new();
+    for (&a, f) in &prog.functions {
+        for id in f.ids() {
+            let b = f.block(id);
+            if !b.synthetic {
+                at.entry(b.start).or_default().push((a, id));
+            }
+        }
+    }
+    for (&off, site) in &o.indirect {
+        if !site.call {
+            continue;
+        }
+        let targets: Vec<u64> = site
+            .targets
+            .keys()
+            .filter(|l| l.obj == obj)
+            .map(|l| l.off.wrapping_add(bias))
+            .filter(|t| prog.functions.contains_key(t))
+            .collect();
+        // A target outside the object (a library) has no summary here:
+        // guarding with the rest alone would not cover it.
+        if targets.is_empty() || targets.len() != site.targets.len() {
+            continue;
+        }
+        let start = off.wrapping_add(bias);
+        for &(fa, mut id) in at.get(&start).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let f = &prog.functions[&fa];
+            for _ in 0..64 {
+                match &f.block(id).term {
+                    FTerm::Jump(e) if !f.block(e.to).synthetic => id = e.to,
+                    FTerm::Call {
+                        callee: Callee::Indirect(_),
+                        ..
+                    } => {
+                        g.calls.insert(f.block(id).term_pc, targets.clone());
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    g
+}
+
 /// Guards for i386 syscalls made through the vsyscall entry: every
 /// `call *%gs:0x10` (musl reads its TCB's `sysinfo` word there) guarded
 /// with the image's syscall stub, when it has exactly one. musl sets that
