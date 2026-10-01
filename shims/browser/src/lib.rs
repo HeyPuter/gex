@@ -10941,7 +10941,7 @@ fn note_intrinsics(addr: u64) {
                 gex_xlate::Intrinsic::MemPCpy => 8,
                 gex_xlate::Intrinsic::MemMove => 16,
                 // Never recognised by name, so never reaches this scan.
-                gex_xlate::Intrinsic::Replace(_) => 0,
+                gex_xlate::Intrinsic::Replace(_) | gex_xlate::Intrinsic::Override(_) => 0,
             };
             if mask & bit == 0 {
                 continue;

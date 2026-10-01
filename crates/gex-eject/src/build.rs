@@ -401,6 +401,11 @@ fn bind_replacements(
                 modules.entry(wasm.clone()).or_insert(m)
             }
         };
+        // An "entry" replacement is a whole function, return included: it
+        // stands for a definition, not an import or a library's calls.
+        if *abi == Abi::Entry && !matches!(target, Target::Symbol(_) | Target::Offset { .. }) {
+            bail!("{what}: the \"entry\" ABI replaces a function by \"symbol\" or \"offset\"");
+        }
         // The object(s), each checked against the hash it was written for.
         let objs: Vec<&Placed> = if object.is_empty() {
             if want.is_some() {
@@ -526,7 +531,13 @@ fn bind_replacements(
             });
         }
     }
-    let map = out.iter().map(|r| (r.addr, Intrinsic::Replace(r.id))).collect();
+    let map = out
+        .iter()
+        .map(|r| {
+            let k = if r.abi == Abi::Entry { Intrinsic::Override(r.id) } else { Intrinsic::Replace(r.id) };
+            (r.addr, k)
+        })
+        .collect();
     Ok((out, map))
 }
 

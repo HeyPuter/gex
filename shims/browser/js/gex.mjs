@@ -1068,7 +1068,7 @@ export class Gex {
       // sysreg -200) are served by the embedder; everything else by the shim.
       sysreg_write: opts.replace
         ? (ctx, pc, reg, v) => (reg === -200
-          ? opts.replace(ctx >>> 0, pc, Number(v), this.#memory)
+          ? opts.replace(ctx >>> 0, pc, Number(v), this.#memory, this.#imports)
           : e.gex_sysreg_write(ctx, pc, reg, v))
         : e.gex_sysreg_write,
       cache_op: e.gex_cache_op,
