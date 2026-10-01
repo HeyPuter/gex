@@ -4,7 +4,10 @@
  * read: a vendor string and the CMOV/SSE2 bits a JIT needs. The values
  * themselves are the host's natively and gex's under gex, so only what
  * must agree is printed. */
+#define _GNU_SOURCE
+#include <signal.h>
 #include <stdint.h>
+#include <ucontext.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -27,6 +30,14 @@ static int toggles(uintptr_t bit) {
     return ((after ^ before) & bit) != 0 && ((restored ^ before) & bit) == 0;
 }
 
+/* A signal frame carries ID too: the handler sees it in the saved EFLAGS,
+ * and sigreturn puts it back. */
+static volatile int handler_saw_id;
+static void on_usr1(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si;
+    handler_saw_id = (((ucontext_t *)uc)->uc_mcontext.gregs[REG_EFL] >> 21) & 1;
+}
+
 static void cpuid(uint32_t leaf, uint32_t r[4]) {
     __asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(0));
 }
@@ -44,6 +55,17 @@ int main(void) {
 #else
     printf("has cpuid: %d\n", toggles(1u << 21));
 #endif
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_usr1;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR1, &sa, 0);
+    uintptr_t before = flags();
+    set_flags(before | (1u << 21));
+    raise(SIGUSR1);
+    uintptr_t after = flags();
+    set_flags(before);
+    printf("signal frame keeps ID: %d, sigreturn restores ID: %d\n", handler_saw_id, (int)((after >> 21) & 1));
     uint32_t r[4];
     char vendor[13];
     cpuid(0, r);

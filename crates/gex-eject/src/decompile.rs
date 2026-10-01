@@ -106,11 +106,14 @@ pub fn decompile(dir: &Path, object: &str, what: &str, size: Option<u64>, callee
     }
     let prog = gex_xlate::func::recover(&image, Some(&elf), &gex_xlate::func::RecoverOptions::default());
     let sums = gex_xlate::summary::analyze(&prog).map;
-    // The entries tier-1 serves with a host builtin, as their one block.
+    // The entries tier-1 serves with a host builtin, as their one block. None
+    // for a 32-bit (i386) object, as in gexc: the intrinsic block reads the
+    // 64-bit register arguments, and i386 cdecl passes them on the stack.
     let (tlo, thi) = image.text_range;
     let intr_blocks: Vec<gex_ir::Block> = image
         .symbols
         .iter()
+        .filter(|_| !image.class32)
         .filter(|s| !s.ifunc && s.value >= tlo && s.value < thi)
         .filter_map(|s| gex_xlate::intrinsic::recognise(&s.name).map(|k| gex_xlate::intrinsic::block(s.value, k)))
         .collect();

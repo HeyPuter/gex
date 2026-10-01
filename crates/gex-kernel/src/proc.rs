@@ -49,6 +49,9 @@ pub struct Remote {
     /// to the foreground group is exactly this case.
     pub kill_group: extern "C" fn(caller: i32, pgid: i32, signo: u32) -> i32,
     pub take_signals: extern "C" fn(pid: i32) -> u64,
+    /// Of `taken`, the signals `kill` sent (see [`ProcTable::take_kill_senders`]).
+    pub take_kill_signals: extern "C" fn(pid: i32, taken: u64) -> u64,
+    pub kill_sender: extern "C" fn(pid: i32, signo: u32) -> i32,
     pub has_signals: extern "C" fn(pid: i32) -> i32,
     pub ppid: extern "C" fn(pid: i32) -> i32,
     pub pgid: extern "C" fn(caller: i32, of: i32) -> i32,
@@ -79,6 +82,11 @@ struct Proc {
     /// target picks it up at its next syscall, as Linux delivers at a point the
     /// target chooses.
     pending: Arc<AtomicU64>,
+    /// The part of `pending` that `kill` sent, which the target reports as
+    /// `SI_USER` (the rest -- `SIGCHLD`, a terminal's `^C` -- the kernel
+    /// raised), and the pid that sent each. Under the table's lock.
+    killed: u64,
+    senders: [i32; 64],
 }
 
 struct Table {
@@ -133,6 +141,8 @@ impl ProcTable {
                     sid: INIT_PID,
                     child: Child::new(INIT_PID),
                     pending: Arc::new(AtomicU64::new(0)),
+                    killed: 0,
+                    senders: [0; 64],
                 }],
             }),
         }
@@ -163,6 +173,8 @@ impl ProcTable {
             sid,
             child: Child::new(pid),
             pending: Arc::new(AtomicU64::new(0)),
+            killed: 0,
+            senders: [0; 64],
         });
         pid
     }
@@ -362,16 +374,11 @@ impl ProcTable {
         if signo > 64 {
             return Err(Errno::EINVAL);
         }
-        let t = self.lock();
-        let hits: Vec<&Arc<AtomicU64>> = match target {
+        let mut t = self.lock();
+        let hits: Vec<usize> = match target {
             // Everything but init: killing pid 1 stops the machine (use `reboot`
             // for that). The caller is included, as Linux includes it.
-            -1 => t
-                .procs
-                .iter()
-                .filter(|p| p.pid != INIT_PID)
-                .map(|p| &p.pending)
-                .collect(),
+            -1 => (0..t.procs.len()).filter(|&i| t.procs[i].pid != INIT_PID).collect(),
             // A negative pid is the group of that number; zero is the
             // caller's own group.
             n if n <= 0 => {
@@ -383,26 +390,20 @@ impl ProcTable {
                 } else {
                     -n
                 };
-                t.procs
-                    .iter()
-                    .filter(|p| p.pgid == pgid)
-                    .map(|p| &p.pending)
-                    .collect()
+                (0..t.procs.len()).filter(|&i| t.procs[i].pgid == pgid).collect()
             }
-            n => t
-                .procs
-                .iter()
-                .filter(|p| p.pid == n)
-                .map(|p| &p.pending)
-                .collect(),
+            n => (0..t.procs.len()).filter(|&i| t.procs[i].pid == n).collect(),
         };
         if hits.is_empty() {
             return Err(Errno::ESRCH);
         }
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
-            for p in &hits {
-                p.fetch_or(bit, Ordering::AcqRel);
+            for &i in &hits {
+                let p = &mut t.procs[i];
+                p.killed |= bit;
+                p.senders[signo as usize - 1] = caller;
+                p.pending.fetch_or(bit, Ordering::AcqRel);
             }
         }
         Ok(hits.len())
@@ -442,6 +443,55 @@ impl ProcTable {
             Some(p) => p.pending.swap(0, Ordering::AcqRel),
             None => 0,
         }
+    }
+
+    /// Of the signals in `taken` (what [`ProcTable::take_signals`] just
+    /// returned), those `kill` sent, each with the pid that sent it; the rest
+    /// the kernel raised. Clears what it reports.
+    pub fn take_kill_senders(&self, pid: i32, taken: u64) -> Vec<(u32, i32)> {
+        let mut out = Vec::new();
+        if let Some(r) = self.remote {
+            let mut killed = (r.take_kill_signals)(pid, taken);
+            while killed != 0 {
+                let signo = killed.trailing_zeros() + 1;
+                killed &= killed - 1;
+                out.push((signo, (r.kill_sender)(pid, signo)));
+            }
+            return out;
+        }
+        let mut t = self.lock();
+        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
+            let mut killed = p.killed & taken;
+            p.killed &= !taken;
+            while killed != 0 {
+                let signo = killed.trailing_zeros() + 1;
+                killed &= killed - 1;
+                out.push((signo, p.senders[signo as usize - 1]));
+            }
+        }
+        out
+    }
+
+    /// For [`Remote::take_kill_signals`]: clear and return the bits of `taken`
+    /// that `kill` sent to `pid`.
+    pub fn take_kill_signals(&self, pid: i32, taken: u64) -> u64 {
+        let mut t = self.lock();
+        match t.procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => {
+                let k = p.killed & taken;
+                p.killed &= !taken;
+                k
+            }
+            None => 0,
+        }
+    }
+
+    /// For [`Remote::kill_sender`]: who last sent `signo` to `pid` by `kill`.
+    pub fn kill_sender(&self, pid: i32, signo: u32) -> i32 {
+        if signo == 0 || signo > 64 {
+            return 0;
+        }
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.senders[signo as usize - 1])
     }
 
     /// Whether anything is waiting for `pid`, without taking it. Cheap enough

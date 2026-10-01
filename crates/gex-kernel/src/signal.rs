@@ -132,6 +132,10 @@ pub struct Signals {
     actions: [SigAction; sig::MAX as usize + 1],
     /// Signals raised but not yet delivered.
     pending: u64,
+    /// Who sent each pending signal, when a process did (`kill`, `tgkill`):
+    /// what its siginfo reports instead of `SI_KERNEL`. `None` for one the
+    /// kernel raised itself.
+    sources: [Option<Source>; sig::MAX as usize + 1],
     /// Signals the guest has blocked.
     pub blocked: u64,
     pub alt_stack: SigAltStack,
@@ -168,6 +172,7 @@ impl Signals {
         Signals {
             actions: self.actions,
             pending: 0,
+            sources: [None; sig::MAX as usize + 1],
             blocked: self.blocked,
             suspend_restore: None,
             alt_stack: self.alt_stack,
@@ -197,6 +202,20 @@ impl Signals {
 }
 
 /// Bit for a signal in a `sigset_t`. Signal 1 is bit 0.
+/// A process that sent a signal, for its siginfo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Source {
+    /// `si_code`: [`SI_USER`] or [`SI_TKILL`].
+    pub code: i32,
+    pub pid: i32,
+    pub uid: u32,
+}
+
+/// `si_code` for a signal sent by `kill`.
+pub const SI_USER: i32 = 0;
+/// `si_code` for a signal sent by `tkill` or `tgkill`.
+pub const SI_TKILL: i32 = -6;
+
 fn bit(signal: u32) -> u64 {
     if signal == 0 || signal > 64 {
         0
@@ -210,6 +229,7 @@ impl Signals {
         Signals {
             actions: [SigAction::default(); sig::MAX as usize + 1],
             pending: 0,
+            sources: [None; sig::MAX as usize + 1],
             blocked: 0,
             suspend_restore: None,
             alt_stack: SigAltStack::default(),
@@ -231,11 +251,35 @@ impl Signals {
         Ok(())
     }
 
-    /// Mark a signal pending.
+    /// Mark a signal pending, as the kernel raising it itself (`SI_KERNEL`).
     pub fn raise(&mut self, signal: u32) {
         if signal > 0 && signal <= sig::MAX {
             self.pending |= bit(signal);
+            self.sources[signal as usize] = None;
         }
+    }
+
+    /// Mark a signal pending, as sent by a process: `kill` (`SI_USER`) or
+    /// `tkill`/`tgkill` (`SI_TKILL`). A standard signal does not queue, so the
+    /// last sender is the one reported.
+    pub fn raise_from(&mut self, signal: u32, source: Source) {
+        if signal > 0 && signal <= sig::MAX {
+            self.pending |= bit(signal);
+            self.sources[signal as usize] = Some(source);
+        }
+    }
+
+    /// Forget who sent `signal`: a synchronous fault reports itself, whatever
+    /// a process may also have sent.
+    pub fn forget_source(&mut self, signal: u32) {
+        if signal > 0 && signal <= sig::MAX {
+            self.sources[signal as usize] = None;
+        }
+    }
+
+    /// Take who sent `signal`, as its delivery reports it.
+    pub fn take_source(&mut self, signal: u32) -> Option<Source> {
+        self.sources.get_mut(signal as usize).and_then(Option::take)
     }
 
     /// Take the lowest-numbered pending signal in `set`, blocked or not.
@@ -416,14 +460,7 @@ pub fn setup_frame(
 
     // siginfo: si_signo, si_errno, si_code, then the fault address for the
     // synchronous signals, which is what a crash handler reads.
-    m.write_u32(frame_addr, signal)?;
-    m.write_u32(frame_addr + 8, fault_code(signal))?;
-    if matches!(
-        signal,
-        sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE
-    ) {
-        m.write_u64(frame_addr + 16, fault_address)?;
-    }
+    write_siginfo(signals, m, frame_addr, signal, fault_address, true)?;
 
     let uc = frame_addr + frame::UCONTEXT as u64;
     m.write_u64(uc + frame::UC_FLAGS as u64, 0)?;
@@ -522,14 +559,7 @@ fn setup_frame_x86(
     m.write_u64(frame_addr + xframe::PRETCODE as u64, ret)?;
 
     let info = frame_addr + xframe::SIGINFO as u64;
-    m.write_u32(info, signal)?;
-    m.write_u32(info + 8, fault_code(signal))?;
-    if matches!(
-        signal,
-        sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE
-    ) {
-        m.write_u64(info + 16, fault_address)?;
-    }
+    write_siginfo(signals, m, info, signal, fault_address, true)?;
 
     let uc = frame_addr + xframe::UCONTEXT as u64;
     m.write_u64(uc + xframe::UC_FLAGS as u64, 0)?;
@@ -725,14 +755,7 @@ fn setup_frame_i386(
         let uc = frame_addr + iframe::RT_UC;
         m.write_u32(frame_addr + iframe::RT_PINFO, info as u32)?;
         m.write_u32(frame_addr + iframe::RT_PUC, uc as u32)?;
-        m.write_u32(info, signal)?;
-        m.write_u32(info + 8, fault_code(signal))?;
-        if matches!(
-            signal,
-            sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE
-        ) {
-            m.write_u32(info + 12, fault_address as u32)?;
-        }
+        write_siginfo(signals, m, info, signal, fault_address, false)?;
         m.write_u32(uc, 0)?;
         m.write_u32(uc + 4, 0)?;
         m.write_u32(uc + iframe::UC_STACK, signals.alt_stack.sp as u32)?;
@@ -880,8 +903,14 @@ fn read_rflags(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
         | (f(ctx::NF)? << 7)
         | (1 << 9)
         | (f(ctx::DF)? << 10)
-        | (f(ctx::VF)? << 11))
+        | (f(ctx::VF)? << 11)
+        | (m.read_u32(ctx_addr + ctx::EFLAGS_SYS as u64)? & EFLAGS_AC_ID) as u64)
 }
+
+/// EFLAGS.AC (bit 18) and ID (bit 21): the system bits user code can toggle,
+/// kept in `ctx::EFLAGS_SYS`, so a handler sees, and `sigreturn` restores, what
+/// the interrupted code's last `popf` set.
+const EFLAGS_AC_ID: u32 = 0x24_0000;
 
 fn write_rflags(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), Errno> {
     for (off, bit) in [
@@ -895,6 +924,7 @@ fn write_rflags(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), Errno
     ] {
         m.write(ctx_addr + off as u64, &[((v >> bit) & 1) as u8])?;
     }
+    m.write_u32(ctx_addr + ctx::EFLAGS_SYS as u64, v as u32 & EFLAGS_AC_ID)?;
     Ok(())
 }
 
@@ -980,6 +1010,38 @@ pub fn dispatch(
     }
     let resume = setup_frame(signals, m, ctx_addr, signal, 0, compat)?;
     Ok(Delivery::Resume(resume))
+}
+
+/// The `siginfo_t` head at `info`: signo, code, and then either the sender
+/// (`si_pid`, `si_uid`) of a signal a process sent or, for the synchronous
+/// faults, the fault address, which is what a crash handler reads. `wide` is
+/// the 64-bit layout, where the union after the three ints is 8-aligned (at
+/// 16 rather than 12). Takes the signal's [`Source`].
+fn write_siginfo(
+    signals: &mut Signals,
+    m: &mut GuestMem<'_>,
+    info: u64,
+    signal: u32,
+    fault_address: u64,
+    wide: bool,
+) -> Result<(), Errno> {
+    let fields = info + if wide { 16 } else { 12 };
+    m.write_u32(info, signal)?;
+    if let Some(src) = signals.take_source(signal) {
+        m.write_u32(info + 8, src.code as u32)?;
+        m.write_u32(fields, src.pid as u32)?;
+        m.write_u32(fields + 4, src.uid)?;
+        return Ok(());
+    }
+    m.write_u32(info + 8, fault_code(signal))?;
+    if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
+        if wide {
+            m.write_u64(fields, fault_address)?;
+        } else {
+            m.write_u32(fields, fault_address as u32)?;
+        }
+    }
+    Ok(())
 }
 
 /// The `si_code` a synchronous fault reports.
@@ -1102,11 +1164,7 @@ fn setup_frame_ppc(
     m.zero(newsp, (SIZE + CALLER) as usize)?;
 
     let info = frame + INFO;
-    m.write_u32(info, signal)?;
-    m.write_u32(info + 8, fault_code(signal))?;
-    if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
-        m.write_u32(info + 12, fault_address as u32)?;
-    }
+    write_siginfo(signals, m, info, signal, fault_address, false)?;
     let uc = frame + UC;
     m.write_u32(uc + UC_STACK, signals.alt_stack.sp as u32)?;
     m.write_u32(uc + UC_STACK + 4, signals.alt_stack.flags)?;

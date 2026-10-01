@@ -461,7 +461,7 @@ struct Draft {
 }
 
 /// A resolved jump table, keyed by the address of the block ending in it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
     pub cases: Vec<u64>,
     pub table: JumpTable,
@@ -1208,12 +1208,21 @@ fn recover_seeded(
         for f in functions.values() {
             // Keyed by (function, jump instruction): the jump survives block
             // splits.
+            // A table is resolved on a CFG without its own cases, which can
+            // loop back to it (a state machine): resolved, it is checked
+            // again each round on the CFG with them, until it stands.
             let todo: Vec<(u64, u64)> = f
                 .blocks
                 .iter()
-                .filter(|b| matches!(b.term, FTerm::Unresolved { .. }))
+                .filter(|b| !b.synthetic)
+                .filter(|b| match b.term {
+                    FTerm::Unresolved { .. } => {
+                        !tables.contains_key(&(f.entry, b.term_pc)) && !failed_tables.contains(&(f.entry, b.term_pc))
+                    }
+                    FTerm::Switch { .. } => tables.contains_key(&(f.entry, b.term_pc)),
+                    _ => false,
+                })
                 .map(|b| (b.start, b.term_pc))
-                .filter(|(_, j)| !tables.contains_key(&(f.entry, *j)) && !failed_tables.contains(&(f.entry, *j)))
                 .collect();
             if todo.is_empty() {
                 continue;
@@ -1222,13 +1231,20 @@ fn recover_seeded(
             let extent = starts.get(&f.entry).and_then(|i| i.end).map(|e| (f.entry, e));
             let found = crate::jumptable::resolve_all(f, &starts_todo, &code, opts.max_table, sums.as_ref(), extent);
             for ((_, t), (_, a)) in found.into_iter().zip(todo) {
+                let key = (f.entry, a);
                 match t {
                     Some(t) => {
-                        tables.insert((f.entry, a), t);
-                        changed = true;
+                        if tables.get(&key) != Some(&t) {
+                            tables.insert(key, t);
+                            changed = true;
+                        }
                     }
                     None => {
-                        failed_tables.insert((f.entry, a));
+                        // A table that no longer stands is dropped for good.
+                        if tables.remove(&key).is_some() {
+                            changed = true;
+                        }
+                        failed_tables.insert(key);
                     }
                 }
             }
@@ -1394,7 +1410,10 @@ fn plausible_start(code: &Code, a: u64, typed: bool) -> bool {
     if n == 0 || !arch::decodable(&buf[..n], a) {
         return false;
     }
-    !gex_abi::X86 || typed || a % 16 == 0
+    // A syscall stub (`int $0x80; ret`, `syscall; ret`): i386 musl's
+    // `__vsyscall`, which only its `__sysinfo` pointer names.
+    let stub = n >= 3 && (buf[..3] == [0xcd, 0x80, 0xc3] || buf[..3] == [0x0f, 0x05, 0xc3]);
+    !gex_abi::X86 || typed || a % 16 == 0 || stub
 }
 
 /// Which functions cover an address at an instruction boundary.
