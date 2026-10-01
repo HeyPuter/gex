@@ -282,6 +282,10 @@ mod tests {
 
     #[test]
     fn memcmp_writes_its_answer_to_x0() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let b = block(0x1000, Intrinsic::MemCmp);
         assert!(b.stmts.iter().any(|s| matches!(s, Stmt::MemCmp { .. })));
         assert!(b
@@ -292,6 +296,10 @@ mod tests {
 
     #[test]
     fn a_replacement_is_one_host_call_and_a_return() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let b = block(0x1000, Intrinsic::Replace(7));
         let calls: Vec<_> = b
             .stmts
@@ -322,6 +330,10 @@ mod tests {
 
     #[test]
     fn mempcpy_returns_the_end() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let b = block(0x1000, Intrinsic::MemPCpy);
         assert!(b
             .stmts

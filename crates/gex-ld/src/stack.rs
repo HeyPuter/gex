@@ -322,6 +322,10 @@ mod tests {
 
     #[test]
     fn argc_argv_envp_and_auxv_are_reachable() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let args = vec!["prog".to_string(), "one".to_string()];
         let env = vec!["A=1".to_string()];
         let l = build_initial_stack(

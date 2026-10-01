@@ -1147,6 +1147,10 @@ mod tests {
     /// be loaded at zero to measure it: nothing is placed there.
     #[test]
     fn a_relocatable_image_loads_at_any_base() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         let so = test_image(ET_DYN, 0);
         assert_eq!(load(&so, 0).unwrap().brk, 0x1000);
         assert_eq!(load(&so, gex_abi::MMAP_BOTTOM).unwrap().bias, gex_abi::MMAP_BOTTOM);
@@ -1156,6 +1160,10 @@ mod tests {
     /// the contexts and dispatch directory: refused, not loaded over them.
     #[test]
     fn a_fixed_image_in_the_runtime_region_is_refused() {
+        // An AArch64/x86-64 fixture (64-bit little-endian ELF or A64 code).
+        if gex_abi::PPC {
+            return;
+        }
         assert_eq!(
             load(&exec_at(0x10000), 0).unwrap_err(),
             LoadError::InRuntimeRegion { vaddr: 0x10000, size: 0x1000 }
