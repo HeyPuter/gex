@@ -582,10 +582,33 @@ pub const SYSCALL_NR: gex_ir::GuestReg = if gex_abi::PPC {
     gex_ir::GuestReg::X(if gex_abi::X86 { 0 } else { 8 })
 };
 
+/// Whether the code being recovered is i386 (x86 compatibility mode, set
+/// with [`crate::set_compat`]): 4-byte pointers and return addresses, every
+/// register a zero-extended 32-bit value, the `int 0x80` syscall ABI.
+pub fn compat() -> bool {
+    #[cfg(feature = "x86")]
+    {
+        gex_isa_x86::mode() == gex_isa_x86::Mode::Compat
+    }
+    #[cfg(not(feature = "x86"))]
+    false
+}
+
+/// Bytes in a guest pointer (and a return address on the stack).
+pub fn ptr_bytes() -> u32 {
+    if compat() {
+        4
+    } else {
+        8
+    }
+}
+
 /// Syscalls that never return to the next instruction: `exit`,
-/// `exit_group`, `rt_sigreturn`.
+/// `exit_group`, `rt_sigreturn` (and i386's `sigreturn`).
 pub fn syscall_never_returns(nr: u64) -> bool {
-    if gex_abi::X86 {
+    if compat() {
+        matches!(nr, 1 | 252 | 119 | 173)
+    } else if gex_abi::X86 {
         matches!(nr, 60 | 231 | 15)
     } else if gex_abi::PPC {
         matches!(nr, 1 | 234 | 172 | 119)

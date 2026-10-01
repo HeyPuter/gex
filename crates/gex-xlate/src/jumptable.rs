@@ -46,7 +46,8 @@ pub fn resolve_all(
     let call = |c: Callee| sums.map_or(CallEffect::UNKNOWN, |s| s.call_effect(c));
     let ssa = to_ssa(f, &call);
     let known = crate::summary::known_values(f, sums);
-    let defs = Defs::new(&ssa, known);
+    let mut defs = Defs::new(&ssa, known);
+    defs.maybe = crate::summary::known_values_trusting_frame(f, sums);
     let preds = ssa.preds();
     blocks
         .iter()
@@ -72,6 +73,10 @@ struct Defs<'a> {
     /// Values the abstract interpretation proves constant
     /// ([`crate::summary::known_values`]).
     known: HashMap<Value, u64>,
+    /// Values constant if nothing writes the frame through an escaped
+    /// pointer ([`crate::summary::known_values_trusting_frame`]): a table
+    /// found with one is partial.
+    maybe: HashMap<Value, u64>,
 }
 
 impl<'a> Defs<'a> {
@@ -99,6 +104,7 @@ impl<'a> Defs<'a> {
             folded: Default::default(),
             cut: Default::default(),
             known,
+            maybe: HashMap::new(),
         }
     }
 }
@@ -621,6 +627,19 @@ impl Eval<'_, '_> {
         if let Some(&c) = self.defs.known.get(&v) {
             return Some(c);
         }
+        let r = self.compute_exact(v, depth);
+        if r.is_none() {
+            // A value the image does not give but the frame holds if no
+            // one else wrote it (a spilled table base): best effort.
+            if let Some(&c) = self.defs.maybe.get(&v) {
+                self.assumed = true;
+                return Some(c);
+            }
+        }
+        r
+    }
+
+    fn compute_exact(&mut self, v: Value, depth: u32) -> Option<u64> {
         let Some(&e) = self.defs.expr.get(&v) else {
             return self.param(v, depth);
         };
@@ -853,6 +872,22 @@ fn resolve_one(
     let bs = bounds(f, defs, preds, b);
     if std::env::var_os("GEX_JT_DEBUG").is_some() {
         eprintln!("[jt] {at:#x}: target {target:?} bounds {bs:?}");
+        let mut work = vec![target];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) || seen.len() > 24 {
+                continue;
+            }
+            eprintln!(
+                "[jt]   {v:?} = {:?} known {:?} maybe {:?}",
+                defs.expr.get(&v),
+                defs.known.get(&v),
+                defs.maybe.get(&v)
+            );
+            if let Some(e) = defs.expr.get(&v) {
+                e.for_each_use(|u| work.push(u));
+            }
+        }
     }
     for (x, ty, hi) in bs {
         if hi >= max as u64 {

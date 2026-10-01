@@ -135,6 +135,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn read_dir(&self) -> Result<Vec<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)
     }
+    /// Set the modification time of what this handle is open on. A handle
+    /// onto something that keeps no times accepts it and does nothing.
+    fn set_mtime(&self, _secs: i64) -> Result<(), Errno> {
+        Ok(())
+    }
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let _ = len;
         Err(Errno::EINVAL)

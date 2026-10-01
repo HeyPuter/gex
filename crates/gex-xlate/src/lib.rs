@@ -658,8 +658,21 @@ pub fn cgen_conflict(cgen: bool, profiling: bool) -> Option<&'static str> {
     )
 }
 
+/// Why the function tier refuses `image`, if it does: 32-bit (i386)
+/// programs are not validated on it yet (no lockstep or soundness run on
+/// gi386), so `--cgen` on one fails loudly instead of compiling it.
+pub fn cgen_refuses_image(cgen: bool, class32: bool) -> Option<&'static str> {
+    (cgen && class32).then_some(
+        "the function tier (--cgen) does not handle 32-bit (i386) programs yet: \
+         build or run without --cgen (tier-1)",
+    )
+}
+
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
     if let Some(why) = cgen_conflict(opts.cgen, profile::enabled()) {
+        panic!("{why}");
+    }
+    if let Some(why) = cgen_refuses_image(opts.cgen, image.class32) {
         panic!("{why}");
     }
     let (collected, mut stats) = image_blocks(image, opts);
@@ -685,6 +698,13 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 /// tier-1.
 #[cfg(feature = "cgen")]
 fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Options) -> Vec<u8> {
+    // gex-cgen is written for x86-64 and AArch64 code (8-byte return
+    // addresses and pointers); recovery now accepts i386, but the function
+    // tier is not validated for it. Refuse it loudly, and ship tier-1.
+    if image.class32 {
+        eprintln!("gex-xlate: --cgen: the function tier does not handle i386 code yet; this image stays tier-1");
+        return wasm.to_vec();
+    }
     let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
     let standin = gex_cgen::use_standin().unwrap_or_else(|e| panic!("function tier (--cgen): {e:#}"));
     let functions = if standin {
@@ -1244,6 +1264,13 @@ fn lift_one(
 
 #[cfg(all(test, not(any(feature = "x86", feature = "ppc"))))]
 mod tests {
+    #[test]
+    fn cgen_refuses_i386() {
+        assert!(super::cgen_refuses_image(true, true).is_some());
+        assert!(super::cgen_refuses_image(true, false).is_none());
+        assert!(super::cgen_refuses_image(false, true).is_none());
+    }
+
     #[test]
     fn cgen_refuses_profiling() {
         assert!(super::cgen_conflict(true, true).is_some());

@@ -56,6 +56,11 @@ extern "C" {
     fn warn(ptr: u32, len: u32);
     /// Nanoseconds since an arbitrary epoch.
     fn now() -> i64;
+    /// Block until the host has delivered every `write` so far. Called just
+    /// before this process's exit is published: output from different
+    /// processes reaches the host by different routes, so without it a parent
+    /// that waited for this process could print before its last output.
+    fn drain_output();
 
     // The network. A page cannot open a socket, so each of these asks JS, which
     // has a Wisp connection to a proxy. All non-blocking: only the kernel can
@@ -247,6 +252,8 @@ extern "C" {
     fn k_fs_rmdir(path: u32, path_len: u32) -> i32;
     fn k_fs_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
     fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32;
+    fn k_fs_set_mtime(path: u32, path_len: u32, secs: i64) -> i32;
+    fn k_fs_touch(handle: i32, secs: i64) -> i32;
     fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32;
     fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
     fn k_fs_mksocket(path: u32, path_len: u32) -> i32;
@@ -679,6 +686,12 @@ extern "C" fn rf_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
 extern "C" fn rf_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
     unsafe { k_fs_chmod(path, path_len, mode) }
 }
+extern "C" fn rf_set_mtime(path: u32, path_len: u32, secs: i64) -> i32 {
+    unsafe { k_fs_set_mtime(path, path_len, secs) }
+}
+extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
+    unsafe { k_fs_touch(handle, secs) }
+}
 extern "C" fn rf_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
     unsafe { k_fs_symlink(target, target_len, path, path_len) }
 }
@@ -1109,6 +1122,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             symlink: rf_symlink,
             link: rf_link,
             mksocket: rf_mksocket,
+            set_mtime: rf_set_mtime,
+            touch: rf_touch,
         },
     )))
 }
@@ -1122,6 +1137,7 @@ fn install_bundle_remote() {
     FILES.0.borrow_mut().clear();
     DIRS.0.borrow_mut().clear();
     MODES.0.borrow_mut().clear();
+    MTIMES.0.borrow_mut().clear();
     if unsafe { k_fs_populated() } == 0 {
         unsafe { k_fs_populate_done() };
     }
@@ -3415,6 +3431,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );
     kernel.clock = browser_clock;
+    // And the clock a write stamps a file with.
+    gex_kernel::vfs::tmpfs::set_clock(browser_clock);
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     {
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
@@ -3700,6 +3718,24 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 
+/// A bundled file's modification time, as the host's filesystem had it, so a
+/// program that records one (`gzip`, `make`, `tar`) sees what it would
+/// natively. Like `gex_chmod`.
+#[no_mangle]
+pub extern "C" fn gex_set_mtime(path: u32, path_len: u32, secs: i64) {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    // SAFETY: scalars naming a range of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_set_mtime(path, path_len, secs) };
+        }
+        return;
+    }
+    MTIMES.0.borrow_mut().push((name.to_string(), secs));
+}
+
 /// Make a bundled file executable: the VFS default is 0644 and the tar's mode
 /// did not travel with its bytes, so dpkg reports present programs as missing.
 /// Only modes differing from the default are sent.
@@ -3868,6 +3904,10 @@ pub extern "C" fn gex_add_env(ptr: u32, len: u32) {
     }
 }
 
+/// Bundled files' modification times. See `gex_set_mtime`.
+static MTIMES: SingleThreaded<Vec<(String, i64)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
 /// Modes for bundled files that are not the 0644 default. See `gex_chmod`.
 static MODES: SingleThreaded<Vec<(String, u32)>> =
     SingleThreaded(const { RefCell::new(Vec::new()) });
@@ -3902,9 +3942,14 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
         }
         root.add_file(&name, bytes);
     }
-    // And the modes, after the files exist to carry them.
+    // And the modes and times, after the files exist to carry them.
+    // The page names them as the guest does, with a leading slash; the tmpfs
+    // keys its nodes without one (it is mounted at `/`).
     for (name, mode) in std::mem::take(&mut *MODES.0.borrow_mut()) {
-        let _ = gex_kernel::vfs::FileSystem::chmod(root, &name, mode);
+        let _ = gex_kernel::vfs::FileSystem::chmod(root, name.trim_start_matches('/'), mode);
+    }
+    for (name, secs) in std::mem::take(&mut *MTIMES.0.borrow_mut()) {
+        let _ = gex_kernel::vfs::FileSystem::set_mtime(root, name.trim_start_matches('/'), secs);
     }
 }
 
@@ -6848,6 +6893,8 @@ pub extern "C" fn gex_adopt_child(
         }
     }
     kernel.clock = browser_clock;
+    // And the clock a write stamps a file with.
+    gex_kernel::vfs::tmpfs::set_clock(browser_clock);
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     // The state this Worker started from is a *copy* of the parent's, and the
     // descriptors in it are the parent's: pipe and pty ends it still holds,
@@ -6976,7 +7023,7 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
             }
         }
     }
-    h.kernel.procs.exit(pid, code);
+    publish_exit(h, pid, code);
     // Nothing to hand the stack to: other processes are other Workers already
     // running, and the parent's `wait4` finds the status in the shared table.
     if tracing() {
@@ -10080,12 +10127,18 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let addr = page * gex_abi::DISPATCH_PAGE;
                     let in_images = IMAGE_PAGES.0.borrow().contains_key(&page);
                     let below = addr < gex_abi::INTERP_BASE;
+                    // The held form: this runs inside `with_host`, and the
+                    // exported `gex_closure_owner` takes the host again -- a
+                    // re-entry panic in the single-Worker shim, whose host
+                    // is a `RefCell`, whenever the trace was on and a miss
+                    // translated.
+                    let owner = closure_owner_held(h, page);
                     warn_line(&format!(
                         "[gex] miss pid={} addr={addr:#x} page={page:#x} \
                          below_interp={below} in_image_pages={in_images} \
                          owner={}\n",
                         h.kernel.pid,
-                        gex_closure_owner(page),
+                        owner,
                     ));
                 }
             }
@@ -11750,8 +11803,20 @@ pub extern "C" fn gex_abandon(code: i32) {
                 k_pty_forget(pid);
             }
         }
-        h.kernel.procs.exit(pid, code);
+        publish_exit(h, pid, code);
     });
+}
+
+/// Make this process's exit visible to its parent (`wait4`, `waitid`,
+/// `SIGCHLD`), after everything it wrote has reached the host. Output from
+/// different processes reaches the host by different routes (a Worker's
+/// messages, which nothing orders against another Worker's), so a parent that
+/// waited for this process could otherwise print before this process's last
+/// output did.
+fn publish_exit(h: &mut Host, pid: i32, status: i32) {
+    // SAFETY: no arguments; the host only waits for its own deliveries.
+    unsafe { drain_output() };
+    h.kernel.procs.exit(pid, status);
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.
@@ -11780,7 +11845,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         let pid = my_pid();
         with_host(|h| {
             if h.exit.is_none() {
-                h.kernel.procs.exit(pid, status);
+                publish_exit(h, pid, status);
             }
         });
         return 0;
@@ -11796,7 +11861,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
             0
         }
     };
-    with_host(|h| h.kernel.procs.exit(pid, status));
+    with_host(|h| publish_exit(h, pid, status));
     warn_line(&format!(
         "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
     ));
