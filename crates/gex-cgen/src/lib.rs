@@ -10,6 +10,7 @@ pub mod func;
 pub mod recover;
 pub mod header;
 pub mod splice;
+pub mod standalone;
 pub mod toolchain;
 
 use anyhow::{Context, Result};
@@ -66,6 +67,54 @@ pub fn use_standin() -> Result<bool> {
     }
 }
 
+/// The 4 KiB pages holding a block with a self-modification guard.
+pub fn guarded_pages(blocks: &[&Block]) -> HashSet<u64> {
+    blocks
+        .iter()
+        .filter(|b| b.guard.is_some())
+        .flat_map(|b| pages(b.start, b.end))
+        .collect()
+}
+
+fn pages(lo: u64, hi: u64) -> std::ops::RangeInclusive<u64> {
+    (lo >> 12)..=(hi.max(lo + 1) - 1) >> 12
+}
+
+/// The functions the function tier takes, of `functions`: what
+/// `build_functions` and `standalone` both emit. One place for the
+/// exclusions, which keep being added.
+///
+/// * An entry tier-1 serves with a host builtin (`intrinsics`: its tier-1
+///   block, by entry) is re-formed from that block, so C callers get the
+///   builtin rather than the lifted loop.
+/// * Only memory form.
+/// * A function sharing a page (`guarded`, from [`guarded_pages`]) with a
+///   block that has a self-modification guard stays tier-1: the C side checks
+///   no code bytes. (Pages, not exact ranges: coarser, and immune to
+///   overlapping x86 blocks.)
+/// * What remains must verify; a malformed one is an error.
+pub fn select(
+    mut functions: Vec<Function>,
+    intrinsics: &HashMap<u64, &Block>,
+    guarded: &HashSet<u64>,
+) -> Result<Vec<Function>> {
+    for f in &mut functions {
+        if let Some(b) = intrinsics.get(&f.entry) {
+            // One block: the builtin, then the `ret`.
+            let mut one = recover::functions(&[*b], &[f.entry]);
+            *f = one.pop().expect("an entry block forms a function");
+        }
+    }
+    functions.retain(|f| f.form == gex_ir::func::Form::Memory);
+    let overlaps = |lo: u64, hi: u64| pages(lo, hi).any(|p| guarded.contains(&p));
+    functions.retain(|f| !f.blocks.iter().any(|b| !b.synthetic && overlaps(b.start, b.end)));
+    for f in &functions {
+        f.verify()
+            .map_err(|e| anyhow::anyhow!("recovered function {:#x} is malformed: {e}", f.entry))?;
+    }
+    Ok(functions)
+}
+
 /// Build the function-tier version of a tier-1 module.
 ///
 /// `tier1` is the module `ModuleBuilder` produced from `blocks`, and each
@@ -111,45 +160,24 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
         blocks.iter().map(|(b, f)| (b.start, *f)).collect();
     let refs: Vec<&Block> = blocks.iter().map(|(b, _)| *b).collect();
     let mut sums: HashMap<u64, Summary> = HashMap::new();
-    let mut funcs = match functions {
-        Functions::StandIn { symbols } => recover::functions(&refs, &symbols),
+    let guarded = guarded_pages(&refs);
+    let funcs = match functions {
+        Functions::StandIn { symbols } => select(recover::functions(&refs, &symbols), &HashMap::new(), &guarded)?,
         Functions::Recovered {
-            mut functions,
+            functions,
             intrinsics,
             summaries,
         } => {
             sums = summaries;
-            let by_addr: std::collections::HashMap<u64, &Block> =
-                refs.iter().map(|b| (b.start, *b)).collect();
             let intrinsics: HashSet<u64> = intrinsics.into_iter().collect();
-            for f in &mut functions {
-                if intrinsics.contains(&f.entry) {
-                    if let Some(b) = by_addr.get(&f.entry) {
-                        // One block: the builtin, then the `ret`.
-                        let mut one = recover::functions(&[*b], &[f.entry]);
-                        *f = one.pop().expect("an entry block forms a function");
-                    }
-                }
-            }
-            functions.retain(|f| f.form == gex_ir::func::Form::Memory);
-            functions
+            let blocks: HashMap<u64, &Block> = refs
+                .iter()
+                .filter(|b| intrinsics.contains(&b.start))
+                .map(|b| (b.start, *b))
+                .collect();
+            select(functions, &blocks, &guarded)?
         }
     };
-    // A function sharing a page with a block that has a self-modification
-    // guard stays tier-1: the C side checks no code bytes. (Pages, not
-    // exact ranges: coarser, and immune to overlapping x86 blocks.)
-    let pages = |lo: u64, hi: u64| (lo >> 12)..=(hi.max(lo + 1) - 1) >> 12;
-    let guarded: HashSet<u64> = refs
-        .iter()
-        .filter(|b| b.guard.is_some())
-        .flat_map(|b| pages(b.start, b.end))
-        .collect();
-    let overlaps = |lo: u64, hi: u64| pages(lo, hi).any(|p| guarded.contains(&p));
-    funcs.retain(|f| !f.blocks.iter().any(|b| !b.synthetic && overlaps(b.start, b.end)));
-    for f in &funcs {
-        f.verify()
-            .map_err(|e| anyhow::anyhow!("recovered function {:#x} is malformed: {e}", f.entry))?;
-    }
     let known: HashSet<u64> = funcs.iter().map(|f| f.entry).collect();
     let trapfree = func::trap_free(&funcs, &sums);
     let jobs = toolchain::jobs();

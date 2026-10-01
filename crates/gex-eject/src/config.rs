@@ -177,7 +177,7 @@ impl Config {
                 };
                 let abi = match opt_str(r, "abi") {
                     None => Abi::C,
-                    Some(a) => Abi::parse(&a).ok_or_else(|| anyhow!("{w}: abi \"{a}\" is not \"c\" or \"ctx\""))?,
+                    Some(a) => Abi::parse(&a).ok_or_else(|| anyhow!("{w}: abi \"{a}\" is not \"c\", \"ctx\" or \"entry\""))?,
                 };
                 let object = match &target {
                     Target::Library { .. } => str_field(r, "library", &w)?,

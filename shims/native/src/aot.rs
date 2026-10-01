@@ -61,6 +61,11 @@ pub enum Abi {
     /// host passes the guest's integer and floating-point argument registers
     /// in order and puts the result in the guest's return register.
     C,
+    /// `void f(uint32_t ctx)` that *is* the function, return included: on
+    /// return the context's PC says where the guest goes next (the return
+    /// address, or wherever it left for). What `gexc eject decompile` writes:
+    /// the function tier's C for the function (`gex_cgen::standalone`).
+    Entry,
 }
 
 impl Abi {
@@ -68,6 +73,7 @@ impl Abi {
         match s {
             "ctx" => Some(Abi::Ctx),
             "c" => Some(Abi::C),
+            "entry" => Some(Abi::Entry),
             _ => None,
         }
     }
@@ -75,6 +81,7 @@ impl Abi {
         match self {
             Abi::Ctx => "ctx",
             Abi::C => "c",
+            Abi::Entry => "entry",
         }
     }
 }
@@ -331,6 +338,19 @@ pub(crate) fn reserve_region(kernel: &mut gex_kernel::Kernel, aot: &Aot) {
     );
 }
 
+/// The host functions a replacement module may import from `gex`.
+pub const HOST_IMPORTS: &[&str] = &[
+    gex_abi::imports::SYSCALL,
+    gex_abi::imports::SAFEPOINT,
+    gex_abi::imports::SYSREG_READ,
+    gex_abi::imports::SYSREG_WRITE,
+    gex_abi::imports::CACHE_OP,
+    gex_abi::imports::FMA,
+    gex_abi::imports::ILLEGAL,
+    gex_abi::imports::BREAKPOINT,
+    gex_abi::imports::DISPATCH_MISS,
+];
+
 /// The guest's integer argument registers, as `x` indices in the context.
 const INT_ARGS: &[u8] = if gex_abi::X86 {
     // rdi, rsi, rdx, rcx, r8, r9
@@ -391,9 +411,16 @@ impl ReplacementModule {
                 }
                 imports_memory = true;
             }
+            // The host functions translated code calls (`gex_abi.h`): what
+            // the function tier's C, and so a decompiled function, imports.
+            // Bound to the very ones the guest's own modules get, the syscall
+            // allow-list included.
+            ("gex", n, ExternType::Func(_)) if HOST_IMPORTS.contains(&n) => {}
             (m, n, _) => bail!(
                 "it imports {m}.{n}, which gex does not provide: a replacement module may \
-                 import only env.memory (the guest's memory)"
+                 import env.memory (the guest's memory) and the gex.* host functions \
+                 ({})",
+                HOST_IMPORTS.join(", ")
             ),
         }
     }
@@ -444,12 +471,12 @@ impl ReplacementModule {
         ft.results().map(|t| show(&t)).collect::<Vec<_>>().join(", ")
     );
     match abi {
-        Abi::Ctx => {
+        Abi::Ctx | Abi::Entry => {
             if !(ft.params().len() == 1
                 && matches!(ft.params().next(), Some(ValType::I32))
                 && ft.results().len() == 0)
             {
-                bail!("`{name}` is {sig}; a \"ctx\" replacement is (i32 ctx) -> ()");
+                bail!("`{name}` is {sig}; a \"{}\" replacement is (i32 ctx) -> ()", abi.name());
             }
         }
         Abi::C => {
@@ -520,6 +547,8 @@ fn instantiate(caller: &mut Caller<'_, HostState>, aot: &Aot) -> Result<StoreRep
     let mut instances = Vec::new();
     for (i, m) in modules.iter().enumerate() {
         let mut linker: Linker<HostState> = Linker::new(&engine);
+        // The gex.* host functions, the same ones translated code imports.
+        super::register_imports(&mut linker)?;
         linker.define(&mut *caller, "env", "memory", memory.shared().clone())?;
         let inst = linker
             .instantiate(&mut *caller, m)
@@ -586,9 +615,18 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
         .ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let base = ctx_addr as u32 as usize;
     match r.abi {
-        Abi::Ctx => func
-            .call(&mut *caller, &[Val::I32(ctx_addr)], &mut [])
-            .with_context(|| format!("replacement `{}` for {}", r.export, r.symbol))?,
+        // A host call in it that stops the guest (an exit, a signal, a
+        // fork) unwinds through it as a `StopExecution`, which must reach the
+        // run loop as itself: the replacement left the context architectural
+        // before the call, as translated code does.
+        Abi::Ctx | Abi::Entry => {
+            if let Err(e) = func.call(&mut *caller, &[Val::I32(ctx_addr)], &mut []) {
+                if e.is::<super::StopExecution>() {
+                    return Err(e);
+                }
+                return Err(e.context(format!("replacement `{}` for {}", r.export, r.symbol)));
+            }
+        }
         Abi::C => {
             let ty = func.ty(&*caller);
             let (mut ni, mut nf) = (0usize, 0u8);
