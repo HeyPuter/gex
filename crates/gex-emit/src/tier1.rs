@@ -2287,6 +2287,9 @@ impl<'a> Emitter<'a> {
     /// that fits (out of range gives the indefinite with IE), or zero.
     fn emit_x87(&mut self, op: X87Op, args: &[Value], outs: &[Value]) {
         use code::*;
+        if matches!(op, X87Op::Arith(_) | X87Op::Compare { .. }) {
+            return self.emit_x87_binary(op, args, outs);
+        }
         let sig = self.alloc(Ty::I64);
         let se = self.alloc(Ty::I32);
         let cw = self.alloc(Ty::I32);
@@ -2466,6 +2469,7 @@ impl<'a> Emitter<'a> {
                 self.f.end();
                 self.f.end();
             }
+            X87Op::Arith(_) | X87Op::Compare { .. } => unreachable!("lowered by emit_x87_binary"),
         }
         for (i, (o, l)) in outs.iter().zip([res, sw]).enumerate() {
             let idx = o.0 as usize;
@@ -2535,19 +2539,202 @@ impl<'a> Emitter<'a> {
         self.f.byte(I32_OR);
     }
 
-    /// The slow path: the pure `x87` import, whose status bits come back in
-    /// the context.
+    /// The slow path of a one-operand operation: the pure `x87` import,
+    /// whose status bits come back in the context.
     fn emit_x87_call(&mut self, op: X87Op, sig: u32, se: u32, cw: u32, res: u32, sw: u32) {
         self.f.local_get(self.ctx_local);
         self.f.i32_const(op.code());
         self.f.local_get(sig);
         self.f.local_get(se);
+        self.f.i64_const(0);
+        self.f.i32_const(0);
         self.f.local_get(cw);
         self.f.call(self.cx.x87);
         self.f.local_set(res);
         self.f.local_get(self.ctx_local);
         self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32); // i32.load
         self.f.local_set(sw);
+    }
+
+    /// The two-operand operations: `Arith` (outputs: significand,
+    /// sign/exponent, status bits) and `Compare` (condition codes, status
+    /// bits), through the pure import.
+    fn emit_x87_binary(&mut self, op: X87Op, args: &[Value], outs: &[Value]) {
+        if let X87Op::Compare { .. } = op {
+            return self.emit_x87_compare(op, args, outs);
+        }
+        let res = self.alloc(Ty::I64);
+        let se = self.alloc(Ty::I32);
+        let sw = self.alloc(Ty::I32);
+        self.f.local_get(self.ctx_local);
+        self.f.i32_const(op.code());
+        for a in &args[..4] {
+            self.push(*a);
+        }
+        match args.get(4) {
+            Some(cw) => self.push(*cw),
+            None => self.f.i32_const(0x37f),
+        }
+        self.f.call(self.cx.x87);
+        self.f.local_set(res);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x28, 2, (ctx::X87_TMP + 8) as u32); // i32.load
+        self.f.local_set(se);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32);
+        self.f.local_set(sw);
+        let locals: Vec<(u32, Ty)> = match op {
+            X87Op::Compare { .. } => {
+                // The condition codes come back as the returned value.
+                self.f.local_get(res);
+                self.f.byte(code::I32_WRAP_I64);
+                self.f.local_set(se);
+                self.free_i64.push(res);
+                vec![(se, Ty::I32), (sw, Ty::I32)]
+            }
+            _ => vec![(res, Ty::I64), (se, Ty::I32), (sw, Ty::I32)],
+        };
+        for (o, (l, ty)) in outs.iter().zip(locals) {
+            let idx = o.0 as usize;
+            self.value_ty[idx] = ty;
+            self.value_local[idx] = Some(l);
+        }
+    }
+
+    /// `Compare`: inline when both operands are zeros or normal numbers
+    /// (no NaN, infinity, denormal or unsupported encoding, so no flag can
+    /// be raised); otherwise the import.
+    fn emit_x87_compare(&mut self, op: X87Op, args: &[Value], outs: &[Value]) {
+        use code::*;
+        let asig = self.alloc(Ty::I64);
+        let bsig = self.alloc(Ty::I64);
+        let ase = self.alloc(Ty::I32);
+        let bse = self.alloc(Ty::I32);
+        let ae = self.alloc(Ty::I32);
+        let be = self.alloc(Ty::I32);
+        let an = self.alloc(Ty::I32);
+        let bn = self.alloc(Ty::I32);
+        let cc = self.alloc(Ty::I32);
+        let sw = self.alloc(Ty::I32);
+        let lt = self.alloc(Ty::I32);
+        let eq = self.alloc(Ty::I32);
+        for (v, l) in [(args[0], asig), (args[1], ase), (args[2], bsig), (args[3], bse)] {
+            self.push(v);
+            self.f.local_set(l);
+        }
+        for (se, e) in [(ase, ae), (bse, be)] {
+            self.f.local_get(se);
+            self.f.i32_const(0x7fff);
+            self.f.byte(I32_AND);
+            self.f.local_set(e);
+        }
+        // Eligible: (sig == 0 && e == 0) || (J set && 1 <= e <= 0x7ffe),
+        // for both operands.
+        for (sig, e) in [(asig, ae), (bsig, be)] {
+            self.f.local_get(sig);
+            self.f.byte(I64_EQZ);
+            self.f.local_get(e);
+            self.f.byte(I32_EQZ);
+            self.f.byte(I32_AND);
+            self.f.local_get(sig);
+            self.f.i64_const(0);
+            self.f.byte(I64_LT_S);
+            self.f.local_get(e);
+            self.f.i32_const(1);
+            self.f.byte(I32_SUB);
+            self.f.i32_const(0x7ffd);
+            self.f.byte(I32_LE_U);
+            self.f.byte(I32_AND);
+            self.f.byte(I32_OR);
+        }
+        self.f.byte(I32_AND);
+        self.f.if_void();
+        // Negative and nonzero, for each.
+        for (sig, se, n) in [(asig, ase, an), (bsig, bse, bn)] {
+            self.f.local_get(se);
+            self.f.i32_const(15);
+            self.f.byte(I32_SHR_U);
+            self.f.local_get(sig);
+            self.f.i64_const(0);
+            self.f.byte(I64_NE);
+            self.f.byte(I32_AND);
+            self.f.local_set(n);
+        }
+        // Magnitudes: eq, and lt by (exponent, significand).
+        self.f.local_get(ae);
+        self.f.local_get(be);
+        self.f.byte(I32_EQ);
+        self.f.local_get(asig);
+        self.f.local_get(bsig);
+        self.f.byte(I64_EQ);
+        self.f.byte(I32_AND);
+        self.f.local_set(eq);
+        self.f.local_get(ae);
+        self.f.local_get(be);
+        self.f.byte(0x49); // i32.lt_u
+        self.f.local_get(ae);
+        self.f.local_get(be);
+        self.f.byte(I32_EQ);
+        self.f.local_get(asig);
+        self.f.local_get(bsig);
+        self.f.byte(I64_LT_U);
+        self.f.byte(I32_AND);
+        self.f.byte(I32_OR);
+        self.f.local_set(lt);
+        // Same sign: lt as is for positives, reversed (and not equal) for
+        // negatives. Different signs: a < b exactly when a is negative.
+        self.f.local_get(lt);
+        self.f.byte(I32_EQZ);
+        self.f.local_get(eq);
+        self.f.byte(I32_EQZ);
+        self.f.byte(I32_AND);
+        self.f.local_get(lt);
+        self.f.local_get(an);
+        self.f.select();
+        self.f.local_get(an);
+        self.f.local_get(an);
+        self.f.local_get(bn);
+        self.f.byte(I32_EQ);
+        self.f.select();
+        self.f.local_set(lt);
+        self.f.local_get(eq);
+        self.f.local_get(an);
+        self.f.local_get(bn);
+        self.f.byte(I32_EQ);
+        self.f.byte(I32_AND);
+        self.f.local_set(eq);
+        // cc = lt ? C0 : eq ? C3 : 0.
+        self.f.i32_const(1 << 8);
+        self.f.i32_const(1 << 14);
+        self.f.i32_const(0);
+        self.f.local_get(eq);
+        self.f.select();
+        self.f.local_get(lt);
+        self.f.select();
+        self.f.local_set(cc);
+        self.f.i32_const(0);
+        self.f.local_set(sw);
+        self.f.else_();
+        self.f.local_get(self.ctx_local);
+        self.f.i32_const(op.code());
+        for l in [asig, ase, bsig, bse] {
+            self.f.local_get(l);
+        }
+        self.f.i32_const(0x37f);
+        self.f.call(self.cx.x87);
+        self.f.byte(I32_WRAP_I64);
+        self.f.local_set(cc);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32);
+        self.f.local_set(sw);
+        self.f.end();
+        for (o, l) in outs.iter().zip([cc, sw]) {
+            let idx = o.0 as usize;
+            self.value_ty[idx] = Ty::I32;
+            self.value_local[idx] = Some(l);
+        }
+        self.free_i64.extend([asig, bsig]);
+        self.free_i32.extend([ase, bse, ae, be, an, bn, lt, eq]);
     }
 
     /// A fused multiply-add, without leaving the module.

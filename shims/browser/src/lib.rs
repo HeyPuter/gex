@@ -9142,19 +9142,37 @@ pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64
 }
 
 /// An x87 operation the inline fast path left to the host (see
-/// `gex_abi::imports::X87`): the result returned, the status-word bits left
-/// at `ctx::X87_TMP + 12`.
+/// `gex_abi::imports::X87`): the first result returned, an extended
+/// result's sign and exponent left at `ctx::X87_TMP + 8` and the
+/// status-word bits at `ctx::X87_TMP + 12`.
 #[no_mangle]
-pub extern "C" fn gex_x87(ctx: i32, op: i32, sig: i64, se: i32, cw: i32) -> i64 {
-    let (sig, se, cw) = (sig as u64, se as u16, cw as u16);
-    let (r, sw) = match op {
-        1 => gex_kernel::f80::narrow_op(sig, se, cw, true),
-        2 => gex_kernel::f80::narrow_op(sig, se, cw, false),
-        _ if op & 0x100 != 0 => gex_kernel::f80::to_int_op(sig, se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0),
+pub extern "C" fn gex_x87(ctx: i32, op: i32, a_sig: i64, a_se: i32, b_sig: i64, b_se: i32, cw: i32) -> i64 {
+    use gex_kernel::f80::{self, F80};
+    let (a, b) = (F80 { sig: a_sig as u64, se: a_se as u16 }, F80 { sig: b_sig as u64, se: b_se as u16 });
+    let cw = cw as u16;
+    let (r, se, sw) = match op {
+        1 | 2 => {
+            let (r, sw) = f80::narrow_op(a.sig, a.se, cw, op == 1);
+            (r, 0, sw)
+        }
+        _ if op & 0xf00 == 0x100 => {
+            let (r, sw) = f80::to_int_op(a.sig, a.se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0);
+            (r, 0, sw)
+        }
+        _ if op & 0xf00 == 0x200 => {
+            let (r, sw) = f80::arith_op((op & 3) as u8, a, b, cw);
+            (r.sig, r.se as u32, sw)
+        }
+        _ if op & 0xf00 == 0x300 => {
+            let (cc, sw) = f80::compare_op(a, b, op & 1 != 0);
+            (cc as u64, 0, sw)
+        }
         _ => panic!("x87 import: unknown operation {op:#x}"),
     };
     let mut gm = GuestMem::new(guest_bytes());
-    let _ = gm.write_u32(ctx as u32 as u64 + ctx::X87_TMP as u64 + 12, sw);
+    let base = ctx as u32 as u64 + ctx::X87_TMP as u64;
+    let _ = gm.write_u32(base + 8, se);
+    let _ = gm.write_u32(base + 12, sw);
     r as i64
 }
 
