@@ -278,6 +278,48 @@ struct SpawnContext {
     nt: Option<Arc<gex_kernel::nt::Process>>,
 }
 
+/// Tier-1 counters for `GEX_NT_STATS`: translations published, units
+/// installed into stores, pages retired, the slot high-water mark, and the
+/// dispatch-table entries grown across every store.
+pub(crate) mod jit_stats {
+    use std::sync::atomic::AtomicU64;
+    pub static PUBLISHED: AtomicU64 = AtomicU64::new(0);
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static INSTALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RETIRED: AtomicU64 = AtomicU64::new(0);
+    pub static SLOTS: AtomicU64 = AtomicU64::new(0);
+    pub static GROWN: AtomicU64 = AtomicU64::new(0);
+    pub static WASM_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// The last few translated pcs, and since the last line the lowest and
+    /// highest, so a translation storm shows where it is without a print per
+    /// miss (which changes the timing enough to hide it).
+    pub static LAST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    pub static LO: AtomicU64 = AtomicU64::new(u64::MAX);
+    pub static HI: AtomicU64 = AtomicU64::new(0);
+    pub fn note(pc: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = PUBLISHED.load(Relaxed) as usize;
+        LAST[n % 4].store(pc, Relaxed);
+        LO.fetch_min(pc, Relaxed);
+        HI.fetch_max(pc, Relaxed);
+    }
+    pub fn line() -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (lo, hi) = (LO.swap(u64::MAX, Relaxed), HI.swap(0, Relaxed));
+        format!(
+            "jit pc={lo:#x}..{hi:#x} last={:x?} pub={} blocks={} wasm={}M inst={} retired={} slots={} grown={}",
+            LAST.iter().map(|a| a.load(Relaxed)).collect::<Vec<_>>(),
+            PUBLISHED.load(Relaxed),
+            BLOCKS.load(Relaxed),
+            WASM_BYTES.load(Relaxed) >> 20,
+            INSTALLS.load(Relaxed),
+            RETIRED.load(Relaxed),
+            SLOTS.load(Relaxed),
+            GROWN.load(Relaxed)
+        )
+    }
+}
+
 /// Runtime translation state belonging to one store (PLAN §6.2, M3).
 ///
 /// A wasm table belongs to its store, so each guest thread has its own and
@@ -3252,6 +3294,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             &Default::default(),
         )
     };
+    jit_stats::note(pc);
     if std::env::var_os("GEX_TRACE_MISSES").is_some() {
         eprintln!("[miss] pc={pc:#x} blocks={}", stats.blocks);
     }
@@ -3347,6 +3390,13 @@ fn publish_unit(
     module: Module,
     blocks: usize,
 ) -> Result<Arc<CompiledUnit>> {
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        jit_stats::PUBLISHED.fetch_add(1, Relaxed);
+        jit_stats::BLOCKS.fetch_add(blocks as u64, Relaxed);
+        jit_stats::WASM_BYTES.fetch_add(translated.wasm.len() as u64, Relaxed);
+        jit_stats::SLOTS.fetch_max(translated.table_slots, Relaxed);
+    }
     let unit = Arc::new(CompiledUnit {
         module,
         exported_blocks: translated.exported_blocks.clone(),
@@ -3419,6 +3469,7 @@ fn install_unit(
             .min(per);
         let have = t.size(cx.as_context_mut());
         if want > have {
+            jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
             t.grow(cx.as_context_mut(), want - have, miss.clone())
                 .with_context(|| format!("growing dispatch table {i}"))?;
         }
@@ -3447,6 +3498,7 @@ fn install_unit(
         .as_ref()
         .and_then(|s| s.prof_proc.clone());
     profile::link(&mut linker, cx.as_context_mut(), &proc)?;
+    jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let instance = linker
         .instantiate(cx.as_context_mut(), &unit.module)
         .context("instantiating a runtime-translated module")?;
@@ -3527,6 +3579,7 @@ fn retire_translations(
         for page in first..=last {
             if sh.page_table.forget(page).is_some() {
                 pages += 1;
+                jit_stats::RETIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
             let data = memory.bytes();

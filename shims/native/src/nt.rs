@@ -210,8 +210,8 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         m.read_u32(a).ok()
                     });
                     match value {
-                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v}", start.elapsed().as_millis()),
-                        None => eprintln!("gex-nt: stats t={} presents={presents}", start.elapsed().as_millis()),
+                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} {}", start.elapsed().as_millis(), crate::jit_stats::line()),
+                        None => eprintln!("gex-nt: stats t={} presents={presents} {}", start.elapsed().as_millis(), crate::jit_stats::line()),
                     }
                     // With --sample, the hottest guest back-edges of the last
                     // 30 s, by module, so a run that never exits can still be
