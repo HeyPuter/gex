@@ -78,6 +78,10 @@ mod stub {
         gex_abi::MMAP_TOP
     }
 
+    pub(crate) fn slot_log() -> bool {
+        false
+    }
+
     /// The glue's nested callback loop asks this; with no Windows process
     /// that loop never runs, but the export has to exist for the glue check.
     #[no_mangle]
@@ -245,6 +249,8 @@ mod imp {
             }
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
+        SLOT_LOG.store(flag("GEX_NT_SLOT_LOG"), Ordering::Relaxed);
+        VERIFY_REGISTRY.store(flag("GEX_NT_VERIFY_REGISTRY"), Ordering::Relaxed);
         RETIRE_LOG.store(flag("GEX_NT_RETIRE_LOG"), Ordering::Relaxed);
         // GEX_NT_TRAP_PCS=<hex>,<hex>: block entries that note the thread's
         // registers in its ring, for an execute fault's report.
@@ -449,6 +455,11 @@ mod imp {
             return;
         }
         let presents = p.presents.load(Ordering::Relaxed);
+        if VERIFY_REGISTRY.load(Ordering::Relaxed) {
+            if let Some(what) = with_host(crate::verify_registry) {
+                warn_line(&format!("gex-nt: a translation was overwritten after it was kept: {what}\n"));
+            }
+        }
         match peek() {
             Some(v) => warn_line(&format!("gex-nt: stats t={t} presents={presents} peek={v}\n")),
             None => warn_line(&format!("gex-nt: stats t={t} presents={presents}\n")),
@@ -637,6 +648,19 @@ mod imp {
     /// GEX_NT_NO_RETIRE: keep translations of code that went away (a
     /// diagnostic: stale code runs).
     static NO_RETIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// GEX_NT_VERIFY_REGISTRY: once a second, check every kept translation
+    /// against the hashes taken when it was kept (a stray write into the
+    /// shim's heap).
+    static VERIFY_REGISTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// GEX_NT_SLOT_LOG: name the first few hundred slot conflicts (a block
+    /// entered for a neighbour sharing its dispatch slot).
+    static SLOT_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn slot_log() -> bool {
+        SLOT_LOG.load(Ordering::Relaxed)
+    }
 
     /// GEX_NT_RETIRE_LOG: name each retired range, the first few hundred.
     static RETIRE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

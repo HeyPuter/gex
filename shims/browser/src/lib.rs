@@ -2230,6 +2230,9 @@ struct Jit {
     /// joining Worker instantiates these into its own tables to catch up. Order
     /// matters: each module's page assignments seed the next's.
     registry: Vec<Vec<u8>>,
+    /// Per registry module, a hash of each 256-byte chunk as it was pushed,
+    /// so a stray write into the bytes can be found (`verify_registry`).
+    registry_sums: Vec<Vec<u64>>,
     /// Whether this process has ever run a second thread-Worker. The registry
     /// exists only so a joining Worker can catch up; a single-threaded process
     /// never gains one, so retaining its modules is pure loss against a fixed
@@ -3631,6 +3634,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 translated: Default::default(),
             coverage_snap: Vec::new(),
                 registry: Vec::new(),
+                registry_sums: Vec::new(),
                 ever_threaded: false,
                 shared: Default::default(),
                 installed_mods: Default::default(),
@@ -7032,6 +7036,7 @@ pub extern "C" fn gex_adopt_child(
             translated: Default::default(),
             coverage_snap: Vec::new(),
             registry: Vec::new(),
+            registry_sums: Vec::new(),
             ever_threaded: false,
             shared: Default::default(),
             installed_mods: Default::default(),
@@ -8203,8 +8208,47 @@ fn backfill_registry(h: &mut Host) {
         wasm.shrink_to_fit();
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        h.jit.registry_sums.push(chunk_sums(&wasm));
         h.jit.registry.push(wasm);
     }
+}
+
+/// A hash of each 256-byte chunk of `b`.
+fn chunk_sums(b: &[u8]) -> Vec<u64> {
+    b.chunks(256)
+        .map(|c| {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for &x in c {
+                h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            h
+        })
+        .collect()
+}
+
+/// The first registry module whose bytes changed since they were pushed:
+/// its index, address, the changed chunk's offset and its bytes now. Each
+/// module is reported once.
+pub(crate) fn verify_registry(h: &mut Host) -> Option<String> {
+    for i in 0..h.jit.registry.len() {
+        let now = chunk_sums(&h.jit.registry[i]);
+        if let Some(c) = now.iter().zip(&h.jit.registry_sums[i]).position(|(a, b)| a != b) {
+            let m = &h.jit.registry[i];
+            let at = c * 256;
+            let bytes: Vec<String> = m[at..(at + 256).min(m.len())].iter().map(|b| format!("{b:02x}")).collect();
+            let s = format!(
+                "module {i} at {:#x}+{:#x} (of {} modules): chunk at +{at:#x} (address {:#x}) changed; now {}",
+                m.as_ptr() as usize,
+                m.len(),
+                h.jit.registry.len(),
+                m.as_ptr() as usize + at,
+                bytes.join(" ")
+            );
+            h.jit.registry_sums[i] = now;
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// The shared module holding this page's code, if there is one and this
@@ -9672,6 +9716,14 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // A block entered for a neighbour sharing its slot: forget the
         // neighbour so the miss that follows lifts it (with this block as a
         // mate) into a trampoline. See `gex_abi::DISPATCH_SHIFT`.
+        // `nt::slot_log()`: the first few hundred, named.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if nt::slot_log() && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+            warn_line(&format!(
+                "gex: slot conflict: block {:#x} entered for {:#x}\n",
+                _pc as u64, addr as u64
+            ));
+        }
         with_host(|h| {
             h.jit.translated.remove(&(addr as u64));
         });
@@ -11820,6 +11872,7 @@ pub extern "C" fn gex_jit_installed() {
             // running in the allocator's refill path). Nothing trims `registry`.
             #[cfg(feature = "shared-memory")]
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            h.jit.registry_sums.push(chunk_sums(&wasm));
             h.jit.registry.push(wasm);
         }
         publish_pending(h);

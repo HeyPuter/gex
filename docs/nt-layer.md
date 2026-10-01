@@ -269,6 +269,18 @@ copies (the loader writes to images); `SEC_COMMIT` file sections map a copy of
 the file's bytes; pagefile-backed sections are shared anonymous memory within
 the process. Cross-process shared views wait for multi-process support.
 
+Interlocked operations are wasm atomics, which need natural alignment; x86
+does not. A misaligned `lock` access inside one aligned 8-byte word is a
+compare-exchange loop on that word (atomic); one spanning two words runs under
+the global `gex_abi::SPLIT_LOCK` word, atomic against every other such access
+but not against a plain access racing it (the first is reported).
+`cmpxchg8b` is one 64-bit compare-exchange. **Gap:** `cmpxchg16b` (x64's
+`SLIST_HEADER`, so `InterlockedPushEntrySList` in a 64-bit program) is still
+two 8-byte halves, not atomic: x64 SLists corrupt under contention
+(tests/nt/src/mtx.c runs on x86 only for that reason). The planned fix is the
+same global lock for every `cmpxchg16b` (atomic among cmpxchg16b, which is
+all an SList needs).
+
 ### 3.5 Threads
 
 `NtCreateThreadEx` allocates a TEB block and a stack from the allocator, builds
