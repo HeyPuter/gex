@@ -18,7 +18,7 @@
 use crate::emit::{self, reg_name, Emitter, FnRegs};
 use anyhow::{bail, Result};
 use gex_abi::ctx;
-use gex_ir::func::{Callee, Edge, FTerm, Form, Function, RegSet, Summary};
+use gex_ir::func::{BlockId, Callee, Edge, FTerm, Form, Function, RegSet, Summary};
 use gex_ir::{Block, Expr, GuestReg, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
@@ -286,20 +286,31 @@ impl FnUnit {
             let lname = loop_name(f.entry, k);
             let mut le = Emitter::new(&dummy, &owned);
             le.resize(f.n_values as usize);
-            let mut lregs = registers(f);
+            // Only the registers the loop itself touches are locals here:
+            // everything else is already in the context (the body wrote
+            // everything back before the call) and stays there, which
+            // keeps the loop's register pressure to its own.
+            let in_loop = |i: usize| lp.body.contains(&i);
+            let mut lregs = registers_in(f, &in_loop);
             lregs.clean_spills = clean_spills();
+            let lused: Vec<GuestReg> = lregs.used.iter().copied().collect();
+            let ldirty = if lregs.clean_spills {
+                dirty_in_from(f, lp.header, &in_loop)
+            } else {
+                Vec::new()
+            };
             le.func_regs = Some(lregs);
             let mut head = String::new();
             let _ = writeln!(
                 head,
                 "static __attribute__((noinline)) int {lname}(int ctx, int32_t depth, uint32_t need, uint64_t ret, uint64_t sp0) {{"
             );
-            for r in &used {
+            for r in &lused {
                 let _ = writeln!(head, "  {} {};", emit::cty(r.ty()), reg_name(*r));
             }
             let _ = writeln!(head, "  int32_t poll = {LOOP_POLL};");
             let _ = writeln!(head, "  int hot = 0; (void)hot;");
-            le.load_regs(&used);
+            le.load_regs(&lused);
             le.line(format!("goto L{};", lp.header));
             let scope = Scope { body: &lp.body, header: lp.header, nested: lp.nested };
             for (i, bl) in f.blocks.iter().enumerate() {
@@ -307,7 +318,7 @@ impl FnUnit {
                     continue;
                 }
                 le.line(format!("L{i}: {{"));
-                if let Some(d) = dirty.get(i) {
+                if let Some(d) = ldirty.get(i) {
                     le.set_dirty(d);
                 }
                 for st in &bl.stmts {
@@ -464,7 +475,8 @@ impl FnUnit {
             // tier-1's rule for a backward branch: poll. Here the countdown is
             // a local (tier-1's fused loops do the same) and the slow path
             // writes everything back, since the host may deliver a signal.
-            if !to.synthetic && to.start <= b.start {
+            // (`GEX_CGEN_EXP=NOPOLL` drops inner polls: unsound, pricing only.)
+            if !to.synthetic && to.start <= b.start && !exp("NOPOLL") {
                 e.line("if (--poll <= 0) {");
                 e.line("  poll = 1024;");
                 // Every dirty register, as tier-1 has them at a safepoint;
@@ -735,10 +747,18 @@ pub fn call_known_source(entries: &[u64]) -> String {
 /// Every register the function reads or writes, and every one it writes.
 /// The stack pointer is always used: the return check reads it.
 fn registers(f: &Function) -> FnRegs {
+    registers_in(f, &|_| true)
+}
+
+/// [`registers`] over the blocks `keep` admits (a loop function's).
+fn registers_in(f: &Function, keep: &dyn Fn(usize) -> bool) -> FnRegs {
     let mut used = BTreeSet::new();
     let mut written = BTreeSet::new();
     used.insert(sp_reg());
-    for b in &f.blocks {
+    for (i, b) in f.blocks.iter().enumerate() {
+        if !keep(i) {
+            continue;
+        }
         for s in &b.stmts {
             match s {
                 Stmt::Def {
@@ -773,10 +793,16 @@ fn clean_spills() -> bool {
 /// followed by a reload (a call, a syscall, a clobbering host call) makes
 /// everything clean; the entry starts clean, having just loaded everything.
 fn dirty_in(f: &Function) -> Vec<BTreeSet<GuestReg>> {
+    dirty_in_from(f, 0, &|_| true)
+}
+
+/// [`dirty_in`] for the blocks `keep` admits, entered (clean) at `root`:
+/// a loop function, whose caller wrote everything back before calling it.
+fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool) -> Vec<BTreeSet<GuestReg>> {
     let n = f.blocks.len();
     let mut inn: Vec<Option<BTreeSet<GuestReg>>> = vec![None; n];
-    inn[0] = Some(BTreeSet::new());
-    let order = f.rpo();
+    inn[root] = Some(BTreeSet::new());
+    let order: Vec<BlockId> = f.rpo().into_iter().filter(|b| keep(b.index())).collect();
     let mut changed = true;
     while changed {
         changed = false;
@@ -796,6 +822,9 @@ fn dirty_in(f: &Function) -> Vec<BTreeSet<GuestReg>> {
                 d.clear();
             }
             for s in b.succs() {
+                if !keep(s.index()) {
+                    continue;
+                }
                 let slot = &mut inn[s.index()];
                 let merged = match slot {
                     Some(old) => {
