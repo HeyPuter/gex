@@ -545,6 +545,12 @@ pub const fn dispatch_page(pc: u64) -> u64 {
 /// low region, 8-byte aligned, never guest-observable.
 pub const EXCLUSIVE_SCRATCH: u64 = RESERVED_END - 64;
 
+/// The lock word an x86 locked access spanning two aligned 8-byte words is
+/// done under (wasm has no atomic wider than eight bytes), and beside it a
+/// word set once the first such access has been reported. In the reserved
+/// low region, never guest-observable.
+pub const SPLIT_LOCK: u64 = RESERVED_END - 128;
+
 /// Address of the context for thread slot `n`.
 ///
 /// Contexts are packed into the reserved low region, one per guest thread.
@@ -714,6 +720,10 @@ pub mod cache_op {
     pub const ISB: i32 = 3;
     /// Anything else.
     pub const OTHER: i32 = 4;
+    /// Not a cache operation: the first x86 locked access that spans two
+    /// aligned 8-byte words, at the address given, which runs under
+    /// [`super::SPLIT_LOCK`] -- atomic against other such accesses only.
+    pub const SPLIT_LOCK: i32 = 10;
 }
 
 /// Size in bytes zeroed by one `dc zva`, and the value reported by

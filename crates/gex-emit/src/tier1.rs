@@ -160,6 +160,14 @@ fn bswap_ballast() -> usize {
     })
 }
 
+/// What a misaligned locked access does (`Emitter::emit_misaligned_atomic`),
+/// with the locals holding its operands.
+#[derive(Clone, Copy)]
+enum Misaligned {
+    Cas { expected: u32, replacement: u32 },
+    Rmw { op: RmwOp, val: u32 },
+}
+
 /// How many blocks may go into one region. One turns regions off.
 fn region_limit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1690,6 +1698,262 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// An x86 `lock cmpxchg` (or `cmpxchg8b`) at any alignment: x86 makes a
+    /// misaligned locked access atomic (a split lock), wasm's atomics trap on
+    /// one, and ConcRT (msvcr120) has 64-bit interlocked fields that are only
+    /// 4-aligned. Aligned, the atomic instruction; misaligned, see
+    /// [`Self::emit_misaligned_atomic`]. `addr` (i32) is on the stack; leaves
+    /// the old value.
+    fn emit_cmpxchg_any_alignment(&mut self, expected: Value, replacement: Value, ty: Ty, sz: MemSz, static_off: u32) {
+        let a = self.alloc(Ty::I32);
+        self.f.local_set(a);
+        let e = self.alloc(ty);
+        let r = self.alloc(ty);
+        self.push(expected);
+        self.f.local_set(e);
+        self.push(replacement);
+        self.f.local_set(r);
+        self.emit_aligned_or_not(a, ty, sz, static_off, |me| {
+            me.f.local_get(a);
+            me.f.local_get(e);
+            me.f.local_get(r);
+            me.f.atomic(atomic_cmpxchg_op(ty, sz), natural_align(sz), static_off);
+        }, Misaligned::Cas { expected: e, replacement: r });
+    }
+
+    /// An x86 locked read-modify-write (`xadd`, `xchg`, `lock add`/`or`/...)
+    /// at any alignment, as [`Self::emit_cmpxchg_any_alignment`]. `addr`
+    /// (i32) is on the stack; leaves the old value.
+    fn emit_rmw_any_alignment(&mut self, op: RmwOp, val: Value, ty: Ty, sz: MemSz, static_off: u32) {
+        let a = self.alloc(Ty::I32);
+        self.f.local_set(a);
+        let v = self.alloc(ty);
+        self.push(val);
+        self.f.local_set(v);
+        self.emit_aligned_or_not(a, ty, sz, static_off, |me| {
+            me.f.local_get(a);
+            me.f.local_get(v);
+            me.f.atomic(atomic_rmw_op(op, ty, sz), natural_align(sz), static_off);
+        }, Misaligned::Rmw { op, val: v });
+    }
+
+    /// `if ((a + static_off) & (size - 1)) { misaligned } else { aligned }`,
+    /// leaving the old value either way.
+    fn emit_aligned_or_not(
+        &mut self,
+        a: u32,
+        ty: Ty,
+        sz: MemSz,
+        static_off: u32,
+        aligned: impl FnOnce(&mut Self),
+        misaligned: Misaligned,
+    ) {
+        let mask = (1i32 << natural_align(sz)) - 1;
+        self.f.local_get(a);
+        self.f.i32_const(static_off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.i32_const(mask);
+        self.f.byte(0x71); // i32.and
+        self.f.if_result(val_type(ty));
+        self.emit_misaligned_atomic(a, ty, sz, static_off, misaligned);
+        self.f.else_();
+        aligned(self);
+        self.f.end();
+    }
+
+    /// A misaligned locked access, atomically. Inside one aligned 8-byte
+    /// word, a compare-exchange loop on that word, which is exactly atomic.
+    /// Across two (a 4-byte value at 5..7 mod 8, any misaligned 8-byte one),
+    /// under one global lock word ([`gex_abi::SPLIT_LOCK`]): atomic against
+    /// every other locked access that spans words, not against a plain
+    /// access racing it, which a real split lock also excludes -- so the
+    /// first one says so (`cache_op::SPLIT_LOCK`). Leaves the old value.
+    fn emit_misaligned_atomic(&mut self, a: u32, ty: Ty, sz: MemSz, static_off: u32, kind: Misaligned) {
+        let bytes = 1u32 << natural_align(sz);
+        let ea = self.alloc(Ty::I32);
+        let old = self.alloc(ty);
+        self.f.local_get(a);
+        self.f.i32_const(static_off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.local_set(ea);
+        // (ea & 7) + bytes <= 8: within one word.
+        self.f.local_get(ea);
+        self.f.i32_const(7);
+        self.f.byte(0x71); // i32.and
+        self.f.i32_const(bytes as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.i32_const(8);
+        self.f.byte(0x4d); // i32.le_u
+        self.f.if_void();
+        {
+            let wa = self.alloc(Ty::I32);
+            let sh = self.alloc(Ty::I64);
+            let w = self.alloc(Ty::I64);
+            let f = self.alloc(Ty::I64);
+            let field: i64 = if bytes >= 8 { -1 } else { ((1u64 << (bytes * 8)) - 1) as i64 };
+            self.f.local_get(ea);
+            self.f.i32_const(!7);
+            self.f.byte(0x71); // i32.and
+            self.f.local_set(wa);
+            self.f.local_get(ea);
+            self.f.i32_const(7);
+            self.f.byte(0x71); // i32.and
+            self.f.i32_const(3);
+            self.f.byte(0x74); // i32.shl
+            self.f.byte(code::I64_EXTEND_I32_U);
+            self.f.local_set(sh);
+            self.f.block_void();
+            self.f.loop_void();
+            // w = the word; f = the field in it.
+            self.f.local_get(wa);
+            self.f.atomic(atomic_load_op(Ty::I64, MemSz::B8), 3, 0);
+            self.f.local_tee(w);
+            self.f.local_get(sh);
+            self.f.byte(0x88); // i64.shr_u
+            self.f.i64_const(field);
+            self.f.byte(0x83); // i64.and
+            self.f.local_set(f);
+            // The field's new value, on the stack.
+            match kind {
+                Misaligned::Cas { expected, replacement } => {
+                    // Unequal: done, nothing written.
+                    self.f.local_get(f);
+                    self.f.local_get(expected);
+                    if ty == Ty::I32 {
+                        self.f.byte(code::I64_EXTEND_I32_U);
+                    }
+                    self.f.i64_const(field);
+                    self.f.byte(0x83); // i64.and
+                    self.f.byte(0x52); // i64.ne
+                    self.f.br_if(1);
+                    self.f.local_get(replacement);
+                    if ty == Ty::I32 {
+                        self.f.byte(code::I64_EXTEND_I32_U);
+                    }
+                }
+                Misaligned::Rmw { op, val } => match op {
+                    RmwOp::Xchg => {
+                        self.f.local_get(val);
+                        if ty == Ty::I32 {
+                            self.f.byte(code::I64_EXTEND_I32_U);
+                        }
+                    }
+                    _ => {
+                        self.f.local_get(f);
+                        self.f.local_get(val);
+                        if ty == Ty::I32 {
+                            self.f.byte(code::I64_EXTEND_I32_U);
+                        }
+                        let b = match op {
+                            RmwOp::Add => BinOp::Add,
+                            RmwOp::Sub => BinOp::Sub,
+                            RmwOp::And => BinOp::And,
+                            RmwOp::Or => BinOp::Or,
+                            _ => BinOp::Xor,
+                        };
+                        self.f.byte(bin_op(b, Ty::I64));
+                    }
+                },
+            }
+            self.f.i64_const(field);
+            self.f.byte(0x83); // i64.and
+            self.f.local_get(sh);
+            self.f.byte(0x86); // i64.shl
+            // | (w & !(field << sh))
+            self.f.local_get(w);
+            self.f.i64_const(field);
+            self.f.local_get(sh);
+            self.f.byte(0x86); // i64.shl
+            self.f.i64_const(-1);
+            self.f.byte(0x85); // i64.xor
+            self.f.byte(0x83); // i64.and
+            self.f.byte(0x84); // i64.or
+            // cmpxchg(wa, w, that) != w: someone else wrote; again.
+            let nw = self.alloc(Ty::I64);
+            self.f.local_set(nw);
+            self.f.local_get(wa);
+            self.f.local_get(w);
+            self.f.local_get(nw);
+            self.f.atomic(atomic_cmpxchg_op(Ty::I64, MemSz::B8), 3, 0);
+            self.f.local_get(w);
+            self.f.byte(0x52); // i64.ne
+            self.f.br_if(0);
+            self.f.end(); // loop
+            self.f.end(); // block
+            self.f.local_get(f);
+            if ty == Ty::I32 {
+                self.f.byte(code::I32_WRAP_I64);
+            }
+            self.f.local_set(old);
+        }
+        self.f.else_();
+        {
+            // The first one, out loud.
+            self.f.i32_const(gex_abi::SPLIT_LOCK as i32 + 4);
+            self.f.load(0x28, 2, 0); // i32.load
+            self.f.byte(0x45); // i32.eqz
+            self.f.if_void();
+            self.f.i32_const(gex_abi::SPLIT_LOCK as i32 + 4);
+            self.f.i32_const(1);
+            self.f.store(0x36, 2, 0); // i32.store
+            self.f.local_get(self.ctx_local);
+            self.f.i64_const(self.block_start as i64);
+            self.f.i32_const(gex_abi::cache_op::SPLIT_LOCK);
+            self.f.local_get(ea);
+            self.f.byte(code::I64_EXTEND_I32_U);
+            self.f.call(self.cx.cache_op);
+            self.f.end();
+            // Take the lock.
+            self.f.loop_void();
+            self.f.i32_const(gex_abi::SPLIT_LOCK as i32);
+            self.f.i32_const(0);
+            self.f.i32_const(1);
+            self.f.atomic(atomic_cmpxchg_op(Ty::I32, MemSz::B4), 2, 0);
+            self.f.br_if(0);
+            self.f.end();
+            self.f.local_get(ea);
+            self.f.load(load_op(ty, sz, false), 0, 0);
+            self.f.local_set(old);
+            match kind {
+                Misaligned::Cas { expected, replacement } => {
+                    self.f.local_get(old);
+                    self.f.local_get(expected);
+                    self.f.byte(if ty == Ty::I64 { 0x51 } else { 0x46 }); // eq
+                    self.f.if_void();
+                    self.f.local_get(ea);
+                    self.f.local_get(replacement);
+                    self.f.store(store_op(ty, sz), 0, 0);
+                    self.f.end();
+                }
+                Misaligned::Rmw { op, val } => {
+                    self.f.local_get(ea);
+                    match op {
+                        RmwOp::Xchg => self.f.local_get(val),
+                        _ => {
+                            self.f.local_get(old);
+                            self.f.local_get(val);
+                            let b = match op {
+                                RmwOp::Add => BinOp::Add,
+                                RmwOp::Sub => BinOp::Sub,
+                                RmwOp::And => BinOp::And,
+                                RmwOp::Or => BinOp::Or,
+                                _ => BinOp::Xor,
+                            };
+                            self.f.byte(bin_op(b, ty));
+                        }
+                    }
+                    self.f.store(store_op(ty, sz), 0, 0);
+                }
+            }
+            // Let it go.
+            self.f.i32_const(gex_abi::SPLIT_LOCK as i32);
+            self.f.i32_const(0);
+            self.f.atomic(atomic_store_op(Ty::I32, MemSz::B4), 2, 0);
+        }
+        self.f.end();
+        self.f.local_get(old);
+    }
+
     /// Coherent (atomic-when-aligned) load. `addr` (i32) is on the stack; the
     /// effective address is `addr + static_off`. Leaves the loaded value.
     /// Signed loads use an unsigned atomic load plus a sign-extend, so signed
@@ -1971,9 +2235,13 @@ impl<'a> Emitter<'a> {
                 ty,
             } => {
                 let static_off = self.emit_address(*addr, 0);
-                self.push(*val);
-                let sub = atomic_rmw_op(*op, *ty, *sz);
-                self.f.atomic(sub, natural_align(*sz), static_off);
+                if gex_abi::X86 && natural_align(*sz) > 0 {
+                    self.emit_rmw_any_alignment(*op, *val, *ty, *sz, static_off);
+                } else {
+                    self.push(*val);
+                    let sub = atomic_rmw_op(*op, *ty, *sz);
+                    self.f.atomic(sub, natural_align(*sz), static_off);
+                }
             }
             Expr::CmpXchg {
                 addr,
@@ -1983,10 +2251,14 @@ impl<'a> Emitter<'a> {
                 ty,
             } => {
                 let static_off = self.emit_address(*addr, 0);
-                self.push(*expected);
-                self.push(*replacement);
-                let sub = atomic_cmpxchg_op(*ty, *sz);
-                self.f.atomic(sub, natural_align(*sz), static_off);
+                if gex_abi::X86 && natural_align(*sz) > 0 {
+                    self.emit_cmpxchg_any_alignment(*expected, *replacement, *ty, *sz, static_off);
+                } else {
+                    self.push(*expected);
+                    self.push(*replacement);
+                    let sub = atomic_cmpxchg_op(*ty, *sz);
+                    self.f.atomic(sub, natural_align(*sz), static_off);
+                }
             }
             Expr::HostCall { func, args, .. } => {
                 // Handled here so the result lands in a local like any other

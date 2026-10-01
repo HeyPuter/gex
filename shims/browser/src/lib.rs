@@ -9648,6 +9648,13 @@ static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
+    if op == gex_abi::cache_op::SPLIT_LOCK {
+        warn_line(&format!(
+            "gex: a locked access at {:#x} (block {:#x}) spans two 8-byte words; such accesses run under one global lock, atomic against each other but not against plain accesses\n",
+            addr as u64, _pc as u64
+        ));
+        return;
+    }
     if op == gex_abi::cache_op::SLOT_CONFLICT {
         // A block entered for a neighbour sharing its slot: forget the
         // neighbour so the miss that follows lifts it (with this block as a

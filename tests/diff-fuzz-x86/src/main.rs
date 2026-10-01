@@ -413,7 +413,30 @@ fn gen(rng: &mut Rng) -> Candidate {
             let bits = pick_bits_wide(rng);
             let d = pick_gpr(rng);
             let s = pick_gpr(rng);
-            let (text, mask) = match rng.below(8) {
+            let (text, mask) = match rng.below(11) {
+                // cmpxchg8b, equal half the time (edx:eax loaded from the
+                // word first), at an 8-aligned or a 4-aligned address.
+                8 | 9 => {
+                    let off = OUT_SCRATCH + rng.below(((SCRATCH_LEN - 32) / 4) as u64) as usize * 4;
+                    let at = format!("[{}+{off}]", base());
+                    let load = if rng.below(2) == 0 {
+                        format!("mov eax, DWORD PTR {at}\n    mov edx, DWORD PTR [{}+{}]\n    ", base(), off + 4)
+                    } else {
+                        String::new()
+                    };
+                    (format!("{load}lock cmpxchg8b QWORD PTR {at}"), ZF)
+                }
+                // Locked xadd / cmpxchg at any byte offset (misaligned ones
+                // included).
+                10 if bits > 8 => {
+                    let off = OUT_SCRATCH + rng.below((SCRATCH_LEN - 32) as u64) as usize;
+                    let at = format!("{} [{}+{off}]", ptr(bits), base());
+                    if rng.below(2) == 0 {
+                        (format!("lock xadd {at}, {}", reg_name(s, bits)), ALL)
+                    } else {
+                        (format!("lock cmpxchg {at}, {}", reg_name(s, bits)), ALL)
+                    }
+                }
                 0 => (format!("shld {}, {}, {}", reg_name(d, bits), reg_name(s, bits), 1 + rng.below(bits as u64 - 1)), CF | ZF | SF | PF),
                 1 => (format!("shrd {}, {}, {}", reg_name(d, bits), reg_name(s, bits), 1 + rng.below(bits as u64 - 1)), CF | ZF | SF | PF),
                 2 => (format!("xchg {}, {}", reg_name(d, bits), reg_name(s, bits)), NONE),
