@@ -202,6 +202,11 @@ fn renumber(s: &mut Stmt, base: u32) {
     gex_ir::func::for_each_use_mut(s, |v| v.0 += base);
     match s {
         Stmt::Def { dst, .. } | Stmt::MemCmp { dst, .. } => dst.0 += base,
+        Stmt::X87 { outs, .. } => {
+            for v in outs {
+                v.0 += base;
+            }
+        }
         Stmt::StrOp {
             out_count,
             out_dst,

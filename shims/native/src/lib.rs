@@ -469,6 +469,7 @@ fn run_program_with(
     // for every guest process, so a mixed tree is not supported here (the
     // browser has a shim per process).
     gex_xlate::set_compat(program.compat());
+    lockstep::set_compat(program.compat());
 
     // A profile records where a previous run went, feeding `extra_entries` so
     // discovery reaches entry points static analysis cannot. It changes the

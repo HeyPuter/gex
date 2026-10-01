@@ -71,6 +71,85 @@ pub fn log_result(gm: &GuestMem<'_>, ctx_addr: u64, tid: i32) {
     let _ = f.lock().unwrap_or_else(|e| e.into_inner()).write_all(s.as_bytes());
 }
 
+/// Whether the process is an i386 program (compatibility mode): its
+/// syscall numbers and structure layouts are the 32-bit ABI's.
+static COMPAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compat(on: bool) {
+    COMPAT.store(on, Ordering::Relaxed);
+}
+
+/// The i386 ABI's clock and random syscalls (`fake_syscall`).
+fn fake_syscall32(gm: &mut GuestMem<'_>, ctx_addr: u64, nr: u64) -> bool {
+    let arg = |gm: &GuestMem<'_>, i: usize| rd(gm, ctx_addr + ctx::SYSCALL_ARGS[i] as u64) & 0xffff_ffff;
+    let w32 = |gm: &mut GuestMem<'_>, a: u64, v: u64| {
+        let _ = gm.write(a, &(v as u32).to_le_bytes());
+    };
+    let ret: u64 = match nr {
+        // clock_gettime64: struct __kernel_timespec, two 64-bit fields.
+        403 => {
+            let (buf, t) = (arg(gm, 1), tick());
+            if buf != 0 {
+                let _ = gm.write_u64(buf, t / 1_000_000_000);
+                let _ = gm.write_u64(buf + 8, t % 1_000_000_000);
+            }
+            0
+        }
+        // clock_gettime: the 32-bit timespec.
+        265 => {
+            let (buf, t) = (arg(gm, 1), tick());
+            if buf != 0 {
+                w32(gm, buf, t / 1_000_000_000);
+                w32(gm, buf + 4, t % 1_000_000_000);
+            }
+            0
+        }
+        // gettimeofday: the 32-bit timeval.
+        78 => {
+            let (buf, t) = (arg(gm, 0), tick());
+            if buf != 0 {
+                w32(gm, buf, t / 1_000_000_000);
+                w32(gm, buf + 4, (t % 1_000_000_000) / 1_000);
+            }
+            0
+        }
+        // time.
+        13 => {
+            let (buf, secs) = (arg(gm, 0), tick() / 1_000_000_000);
+            if buf != 0 {
+                w32(gm, buf, secs);
+            }
+            secs
+        }
+        // getrandom: the same fixed stream as the 64-bit ABI's.
+        355 => {
+            let (buf, len) = (arg(gm, 0), arg(gm, 1).min(1 << 20));
+            let bytes = random_bytes(len as usize);
+            let _ = gm.write(buf, &bytes);
+            len
+        }
+        _ => return false,
+    };
+    let _ = gm.write_u64(ctx_addr + ctx::SYSCALL_RET as u64, ret);
+    true
+}
+
+/// `len` bytes of a fixed xorshift stream, the same in every run.
+fn random_bytes(len: usize) -> Vec<u8> {
+    static SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+    let mut bytes = Vec::with_capacity(len);
+    while bytes.len() < len {
+        let mut x = SEED.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        SEED.store(x, Ordering::Relaxed);
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    bytes.truncate(len);
+    bytes
+}
+
 /// The fake clock, in nanoseconds: starts at a fixed date and advances a
 /// microsecond per reading, so time still moves forward.
 fn tick() -> u64 {
@@ -91,6 +170,9 @@ pub fn fake_syscall(gm: &mut GuestMem<'_>, ctx_addr: u64) -> bool {
     }
     let nr = rd(gm, ctx_addr + ctx::SYSCALL_NR as u64);
     let arg = |gm: &GuestMem<'_>, i: usize| rd(gm, ctx_addr + ctx::SYSCALL_ARGS[i] as u64);
+    if COMPAT.load(Ordering::Relaxed) {
+        return fake_syscall32(gm, ctx_addr, nr);
+    }
     let (clock_gettime, gettimeofday, time, getrandom) = if gex_abi::X86 {
         (228, 96, Some(201), 318)
     } else {

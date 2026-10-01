@@ -561,3 +561,28 @@ fn dispatch_function(block_ty: u32) -> Function {
 fn names_wanted() -> bool {
     std::env::var_os("GEX_CGEN_NAMES").is_some()
 }
+
+/// The defined functions of clang's module that read or write a global
+/// (clang's shadow-stack pointer: a frame it could not keep in locals), by
+/// name, so the build can leave their guest functions to tier-1. Anything
+/// else the splice cannot place (a data segment, a table) still fails the
+/// build loudly, in `parse_c`.
+pub fn unspliceable_users(cwasm: &[u8]) -> Result<Vec<String>> {
+    let c = parse_c(cwasm).context("reading the C module")?;
+    let nimp = c.func_imports.len() as u32;
+    let mut out = Vec::new();
+    for (k, body) in c.bodies.iter().enumerate() {
+        let f = nimp + k as u32;
+        let mut ops = body.get_operators_reader()?;
+        while !ops.eof() {
+            if matches!(ops.read()?, Operator::GlobalGet { .. } | Operator::GlobalSet { .. }) {
+                let name = c.names.get(&f).cloned().or_else(|| {
+                    c.exports.iter().find(|(_, &i)| i == f).map(|(n, _)| n.clone())
+                });
+                out.push(name.unwrap_or_else(|| format!("#{f}")));
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
