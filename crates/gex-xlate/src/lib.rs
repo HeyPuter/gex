@@ -118,6 +118,10 @@ pub struct Options {
     /// continue where the last stopped, so their blocks do not claim the same
     /// slots and overwrite one another.
     pub first_slot: u64,
+    /// Build the function tier: every block also as C, compiled by clang and
+    /// spliced into the tier-1 module (`gex-cgen`, docs/function-tier.md).
+    /// Needs the `cgen` feature; runtime translation stays tier-1.
+    pub cgen: bool,
 }
 
 impl Default for Options {
@@ -137,6 +141,7 @@ impl Default for Options {
             demand_fill: false,
             linkage: Linkage::Own,
             first_slot: 0,
+            cgen: false,
         }
     }
 }
@@ -643,16 +648,73 @@ fn image_builder(image: &Image, opts: &Options) -> ModuleBuilder {
     builder
 }
 
+/// Why `opts` cannot be built, if it cannot: the function tier with
+/// profiling on (`GEX_PROFILE`, `--record`). The C side carries no
+/// profiling hooks, so its counts would be lost without a word.
+pub fn cgen_conflict(cgen: bool, profiling: bool) -> Option<&'static str> {
+    (cgen && profiling).then_some(
+        "the function tier (--cgen) cannot be built with profiling on (GEX_PROFILE=1, --record): \
+         its C code is not instrumented, so the profile would silently lose everything it runs",
+    )
+}
+
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
+    if let Some(why) = cgen_conflict(opts.cgen, profile::enabled()) {
+        panic!("{why}");
+    }
     let (collected, mut stats) = image_blocks(image, opts);
     let mut builder = image_builder(image, opts);
+    let mut cgen: Vec<(Block, u32)> = Vec::new();
     for block in collected {
-        builder.reserve(block.start);
+        let f = builder.reserve(block.start);
+        if opts.cgen {
+            cgen.push((block.clone(), f));
+        }
         builder.add_block(block);
     }
-    let module = builder.finish();
+    let mut module = builder.finish();
+    if opts.cgen {
+        module.wasm = cgen_splice(&module.wasm, &cgen, image, opts);
+    }
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
+}
+
+/// The function tier's version of a tier-1 module (`Options::cgen`). Loud on
+/// failure: a build that asked for the function tier must not quietly ship
+/// tier-1.
+#[cfg(feature = "cgen")]
+fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Options) -> Vec<u8> {
+    let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
+    let standin = gex_cgen::use_standin().unwrap_or_else(|e| panic!("function tier (--cgen): {e:#}"));
+    let functions = if standin {
+        gex_cgen::Functions::StandIn {
+            symbols: image.symbols.iter().filter(|s| !s.ifunc).map(|s| s.value).collect(),
+        }
+    } else {
+        // S2's recovery. No ELF bytes reach here, so no `.eh_frame` seeds:
+        // symbols, the entry, relocations and call targets still seed it.
+        let ropts = func::RecoverOptions {
+            limits: opts.limits,
+            ..Default::default()
+        };
+        let prog = func::recover(image, None, &ropts);
+        let summaries = summary::analyze(&prog).map;
+        gex_cgen::Functions::Recovered {
+            functions: prog.functions.into_values().collect(),
+            intrinsics: opts.intrinsics.keys().copied().collect(),
+            summaries,
+        }
+    };
+    match gex_cgen::build(wasm, &refs, functions) {
+        Ok((w, _)) => w,
+        Err(e) => panic!("function tier (--cgen): {e:#}"),
+    }
+}
+
+#[cfg(not(feature = "cgen"))]
+fn cgen_splice(_: &[u8], _: &[(Block, u32)], _: &Image, _: &Options) -> Vec<u8> {
+    panic!("Options::cgen is set, but gex-xlate was built without the `cgen` feature")
 }
 
 /// Like [`translate_image`], but emits SEVERAL modules when the object has more
@@ -1182,6 +1244,13 @@ fn lift_one(
 
 #[cfg(all(test, not(any(feature = "x86", feature = "ppc"))))]
 mod tests {
+    #[test]
+    fn cgen_refuses_profiling() {
+        assert!(super::cgen_conflict(true, true).is_some());
+        assert!(super::cgen_conflict(true, false).is_none());
+        assert!(super::cgen_conflict(false, true).is_none());
+    }
+
     use super::*;
     use gex_ld::elf::Segment;
 

@@ -16,6 +16,7 @@ gex-isa-ppc = { workspace = true, optional = true }
 gex-lift-ppc = { workspace = true, optional = true }
 gex-emit.workspace = true
 gex-ld.workspace = true
+gex-cgen = { workspace = true, optional = true }
 
 [features]
 # Lift blocks on every core. Off for the browser shim, which reaches this
@@ -26,3 +27,6 @@ parallel = ["gex-emit/parallel"]
 x86 = ["gex-abi/x86", "dep:gex-isa-x86", "dep:gex-lift-x86"]
 # Translate a 32-bit big-endian PowerPC guest (docs/ppc.md).
 ppc = ["gex-abi/ppc", "dep:gex-isa-ppc", "dep:gex-lift-ppc"]
+# The function tier (`Options::cgen`): C through clang, spliced into the
+# tier-1 module. Needs clang and wasm-ld at translation time, so native only.
+cgen = ["dep:gex-cgen"]
