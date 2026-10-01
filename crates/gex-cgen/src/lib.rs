@@ -71,11 +71,17 @@ pub fn use_standin() -> Result<bool> {
 /// `tier1` is the module `ModuleBuilder` produced from `blocks`, and each
 /// block comes with the function index `ModuleBuilder::reserve` gave it.
 /// The result has the tier-1 module's exact interface.
-pub fn build(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions) -> Result<(Vec<u8>, SpliceStats)> {
+/// `class32` is an i386 program in compatibility mode (x86 builds only).
+pub fn build(
+    tier1: &[u8],
+    blocks: &[(&Block, u32)],
+    functions: Functions,
+    class32: bool,
+) -> Result<(Vec<u8>, SpliceStats)> {
     emit::check_environment()?;
     match tier()? {
         Tier::Blocks => build_blocks(tier1, blocks),
-        Tier::Functions => build_functions(tier1, blocks, functions),
+        Tier::Functions => build_functions(tier1, blocks, functions, class32),
     }
 }
 
@@ -106,7 +112,12 @@ fn compile_and_link(units: Vec<(String, String)>, exports: &[String]) -> Result<
 }
 
 /// Phase B: whole functions (`func.rs`).
-fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions) -> Result<(Vec<u8>, SpliceStats)> {
+fn build_functions(
+    tier1: &[u8],
+    blocks: &[(&Block, u32)],
+    functions: Functions,
+    class32: bool,
+) -> Result<(Vec<u8>, SpliceStats)> {
     let index: std::collections::HashMap<u64, u32> =
         blocks.iter().map(|(b, f)| (b.start, *f)).collect();
     let refs: Vec<&Block> = blocks.iter().map(|(b, _)| *b).collect();
@@ -161,6 +172,7 @@ fn build_functions(tier1: &[u8], blocks: &[(&Block, u32)], functions: Functions)
     let mut stats = func::FnStats::default();
     for (k, chunk) in funcs.chunks(per).enumerate() {
         let mut u = func::FnUnit::new();
+        u.set_class32(class32);
         for f in chunk {
             u.add(f, &known, &sums, &trapfree)
                 .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;

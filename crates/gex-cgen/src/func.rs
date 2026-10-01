@@ -46,7 +46,14 @@ fn sp_reg() -> GuestReg {
 
 /// How far a `ret` moves SP relative to the call site: x86-64 pops the
 /// return address the call pushed.
-const RET_SP_DELTA: u64 = if gex_abi::X86 { 8 } else { 0 };
+/// (x86-64: 8; i386 compatibility mode: 4, see `FnUnit::ret_sp_delta`.)
+fn ret_sp_delta(class32: bool) -> u64 {
+    match (gex_abi::X86, class32) {
+        (false, _) => 0,
+        (true, false) => 8,
+        (true, true) => 4,
+    }
+}
 
 /// The recursion-depth guard (`docs/function-tier.md` §7). `depth` is an
 /// estimate, in bytes, of the engine stack the C frames below this one in
@@ -158,6 +165,8 @@ pub struct FnUnit {
     pub uses_call_known: bool,
     /// The frame weight of the function being emitted (`frame_weight`).
     weight: u32,
+    /// How far a `ret` moves SP: 8 on x86-64, 4 for an i386 program.
+    pub ret_sp_delta: u64,
     /// Registers live on entry to each block of the function being emitted
     /// (`live_in`): write-backs on internal edges and at calls to functions
     /// with a summary store only these.
@@ -171,6 +180,11 @@ impl Default for FnUnit {
 }
 
 impl FnUnit {
+    /// For an i386 (compatibility-mode) program.
+    pub fn set_class32(&mut self, class32: bool) {
+        self.ret_sp_delta = ret_sp_delta(class32);
+    }
+
     pub fn new() -> FnUnit {
         FnUnit {
             stats: FnStats::default(),
@@ -178,6 +192,7 @@ impl FnUnit {
             bodies: String::new(),
             uses_call_known: false,
             weight: 0,
+            ret_sp_delta: ret_sp_delta(false),
             live: Vec::new(),
         }
     }
@@ -220,6 +235,9 @@ impl FnUnit {
             let _ = writeln!(fhead, "  {} {};", emit::cty(r.ty()), reg_name(*r));
         }
         let _ = writeln!(fhead, "  int32_t poll = {LOOP_POLL};");
+        // Set when a poll expires anywhere: the next outermost back-edge
+        // hands the loop over (§7.2), wherever the hot inner loop is.
+        let _ = writeln!(fhead, "  int hot = 0; (void)hot;");
         // The recursion-depth guard, before anything is loaded: every caller
         // wrote everything back before calling, so leaving for this
         // function's own entry here is exactly the caller leaving for it.
@@ -260,9 +278,10 @@ impl FnUnit {
                 let _ = writeln!(head, "  {} {};", emit::cty(r.ty()), reg_name(*r));
             }
             let _ = writeln!(head, "  int32_t poll = {LOOP_POLL};");
+            let _ = writeln!(head, "  int hot = 0; (void)hot;");
             le.load_regs(&used);
             le.line(format!("goto L{};", lp.header));
-            let scope = Scope { body: &lp.body, header: lp.header };
+            let scope = Scope { body: &lp.body, header: lp.header, nested: lp.nested };
             for (i, bl) in f.blocks.iter().enumerate() {
                 if !lp.body.contains(&i) {
                     continue;
@@ -351,11 +370,20 @@ impl FnUnit {
                         // first 1024 trips run here; a loop that keeps going
                         // moves to its loop function, a fresh call per chunk
                         // (§7.2), and the body resumes where it leaves.
+                        // A poll that expired anywhere in the loop (an inner
+                        // loop's, usually) set `hot`; this edge's own counts
+                        // too.
                         e.line("if (--poll <= 0) {");
                         e.line("  poll = 1024;");
                         e.flush_keep();
                         e.store_pc(&format!("0x{:x}ull", to.start));
                         e.line(format!("  gex_safepoint(ctx, 0x{:x}ll);", to.start));
+                        if lp.nested {
+                            e.line("  hot = 1;");
+                            e.line("}");
+                            e.line("if (hot) {");
+                            e.flush_keep();
+                        }
                         e.line("  int lr;");
                         e.line(format!(
                             "  do lr = {}(ctx, depth + {}, need, ret, sp0); while (lr == LOOP_CHUNK);",
@@ -394,6 +422,15 @@ impl FnUnit {
                     e.line(format!("  gex_safepoint(ctx, 0x{:x}ll);", to.start));
                     e.line("  return LOOP_CHUNK;");
                     e.line("}");
+                    if sc.nested {
+                        // An inner loop's poll expired during this trip: end
+                        // the chunk here too, so a loop whose trips are long
+                        // still gets fresh calls.
+                        e.line("if (hot) {");
+                        e.flush_keep();
+                        e.line("  return LOOP_CHUNK;");
+                        e.line("}");
+                    }
                     e.line(format!("goto L{t};"));
                     return;
                 }
@@ -410,6 +447,12 @@ impl FnUnit {
                 e.flush_keep_live(non_flags().union(live[edge.to.index()]));
                 e.store_pc(&format!("0x{:x}ull", to.start));
                 e.line(format!("  gex_safepoint(ctx, 0x{:x}ll);", to.start));
+                // An inner loop of a nested outermost loop marks it hot.
+                let in_nested = scope.is_some_and(|sc| sc.nested)
+                    || heads.is_some_and(|h| h.loops.iter().any(|lp| lp.nested && lp.body.contains(&i)));
+                if in_nested {
+                    e.line("  hot = 1;");
+                }
                 e.line("}");
             }
             e.line(format!("goto L{};", edge.to.index()));
@@ -485,7 +528,7 @@ impl FnUnit {
                     Some(_) | None => ("NEED_ALL", format!("0x{ret_pc:x}ull")),
                 };
                 e.line(format!(
-                    "{{ const uint64_t sp_want = {spn} + {RET_SP_DELTA}ull;"
+                    "{{ const uint64_t sp_want = {spn} + {}ull;", self.ret_sp_delta
                 ));
                 match callee {
                     Callee::Direct(t) if known.contains(t) => {
@@ -596,7 +639,7 @@ impl FnUnit {
                         e.line("if (1) {");
                     } else {
                         e.line(format!(
-                            "if (__builtin_expect({t} == ret && {spn} == sp0 + {RET_SP_DELTA}ull, 1)) {{"
+                            "if (__builtin_expect({t} == ret && {spn} == sp0 + {}ull, 1)) {{", self.ret_sp_delta
                         ));
                     }
                     let flags: Vec<GuestReg> = FLAG_REGS.to_vec();
@@ -922,6 +965,7 @@ pub(crate) struct Heads<'a> {
 pub(crate) struct Scope<'a> {
     body: &'a BTreeSet<usize>,
     header: usize,
+    nested: bool,
 }
 
 /// An outermost natural loop: its header, its blocks, and the blocks outside
@@ -930,6 +974,9 @@ struct Loop {
     header: usize,
     body: BTreeSet<usize>,
     exits: BTreeSet<usize>,
+    /// It contains an inner loop: a poll that expires there marks the
+    /// outer loop hot, and its back-edge hands over (§7.2).
+    nested: bool,
 }
 
 /// The outermost natural loops of `f`, for outlining (docs/function-tier.md
@@ -1013,7 +1060,17 @@ fn outer_loops(f: &Function) -> Vec<Loop> {
                 }
             }
         }
-        out.push(Loop { header: h, body, exits });
+        let nested = body.iter().any(|&bi| {
+            let b = &f.blocks[bi];
+            b.succs().iter().any(|s| {
+                let t = s.index();
+                t != h && body.contains(&t) && !f.blocks[t].synthetic && f.blocks[t].start <= b.start
+            })
+        });
+        // `GEX_CGEN_HOT=0`: hand over only on the loop's own back-edge, for
+        // pricing.
+        let nested = nested && std::env::var("GEX_CGEN_HOT").as_deref() != Ok("0");
+        out.push(Loop { header: h, body, exits, nested });
     }
     let _ = n;
     out

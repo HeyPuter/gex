@@ -659,7 +659,9 @@ pub fn cgen_conflict(cgen: bool, profiling: bool) -> Option<&'static str> {
 /// programs are not validated on it yet (no lockstep or soundness run on
 /// gi386), so `--cgen` on one fails loudly instead of compiling it.
 pub fn cgen_refuses_image(cgen: bool, class32: bool) -> Option<&'static str> {
-    (cgen && class32).then_some(
+    // `GEX_CGEN_I386=1`: in development, for validating the tier on gi386.
+    let dev = std::env::var_os("GEX_CGEN_I386").is_some();
+    (cgen && class32 && !dev).then_some(
         "the function tier (--cgen) does not handle 32-bit (i386) programs yet: \
          build or run without --cgen (tier-1)",
     )
@@ -696,7 +698,9 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 #[cfg(feature = "cgen")]
 fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Options) -> Vec<u8> {
     let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
-    let standin = gex_cgen::use_standin().unwrap_or_else(|e| panic!("function tier (--cgen): {e:#}"));
+    // S2's recovery does not take i386 images yet: the stand-in does.
+    let standin = gex_cgen::use_standin().unwrap_or_else(|e| panic!("function tier (--cgen): {e:#}"))
+        || image.class32;
     let functions = if standin {
         gex_cgen::Functions::StandIn {
             symbols: image.symbols.iter().filter(|s| !s.ifunc).map(|s| s.value).collect(),
@@ -716,7 +720,7 @@ fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Optio
             summaries,
         }
     };
-    match gex_cgen::build(wasm, &refs, functions) {
+    match gex_cgen::build(wasm, &refs, functions, image.class32) {
         Ok((w, _)) => w,
         Err(e) => panic!("function tier (--cgen): {e:#}"),
     }
