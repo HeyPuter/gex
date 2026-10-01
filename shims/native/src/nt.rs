@@ -71,6 +71,9 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
     let program = Program { exe, interp: None };
     let mut opts = opts.clone();
     opts.jit = true;
+    if xlate.cgen {
+        super::nt_cgen::enable()?;
+    }
     let mut setup = setup.clone();
     if setup.display_out.is_none() {
         setup.display_out = opts.wayland_out.clone();
@@ -215,6 +218,7 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     // profiled.
                     if let Some(s) = sampler.as_ref().filter(|_| next_stats.as_secs() % 30 == 0) {
                         let counts = std::mem::take(&mut *s.counts.lock().unwrap_or_else(|e| e.into_inner()));
+                        s.append_out(&counts);
                         let mut v: Vec<(u64, u64)> = counts.into_iter().collect();
                         v.sort_by(|a, b| b.1.cmp(&a.1));
                         for (pc, n) in v.into_iter().take(12) {
@@ -258,6 +262,8 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     if !retired.is_empty() {
         retire_translations(caller, &retired)?;
     }
+    // An image just mapped that has a hot set gets its function-tier unit.
+    super::nt_cgen::drain_in_caller(caller)?;
     let state = caller.data_mut();
     let resume_pc = || read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     match outcome {

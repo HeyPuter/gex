@@ -16,6 +16,7 @@ pub mod aot;
 pub mod gl;
 pub mod profile;
 pub mod nt;
+pub mod nt_cgen;
 pub mod virgl;
 pub mod wayland;
 
@@ -854,7 +855,11 @@ fn run_program_with(
     }
 
     let entry = match nt_setup {
-        Some(setup) => nt::boot(&mut store, memory.clone(), setup)?,
+        Some(setup) => {
+            let pc = nt::boot(&mut store, memory.clone(), setup)?;
+            nt_cgen::drain_in_store(&mut store)?;
+            pc
+        }
         None => {
             place_image(
                 &mut store,
@@ -975,6 +980,7 @@ fn run_program_with(
             k.mem.vmas().to_vec()
         };
         s.report_mapped(&vmas, opts.sysroot.as_deref().and_then(|p| p.to_str()), 20);
+        s.append_out(&s.counts.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     // Where the pinned objects actually landed. A pin that silently does not
@@ -1852,6 +1858,21 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// `GEX_SAMPLE_OUT=path`: append every sampled address and its count to
+    /// `path`, one `pc count` line each (hex, decimal), so a run that never
+    /// exits still leaves a full profile. Lines for the same address add up.
+    pub fn append_out(&self, counts: &std::collections::HashMap<u64, u64>) {
+        let Some(path) = std::env::var_os("GEX_SAMPLE_OUT") else { return };
+        let mut text = String::new();
+        for (pc, n) in counts {
+            text.push_str(&format!("{pc:x} {n}\n"));
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(text.as_bytes());
+        }
+    }
+
     fn sample(&self, pc: u64) {
         *self
             .counts

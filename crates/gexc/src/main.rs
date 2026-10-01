@@ -53,6 +53,8 @@ fn real_main() -> Result<ExitCode> {
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "funcs" => cmd_funcs(&argv[2..]),
+        "hotset" => cmd_hotset(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "cgen-image" => cmd_cgen_image(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
             usage();
             Ok(ExitCode::SUCCESS)
@@ -98,6 +100,20 @@ usage:
 {}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N]
+                                   build a PE image's function-tier unit (the
+                                   whole image, as C, compiled and cached) for
+                                   `gexc run --cgen`, which installs it when the
+                                   NT layer maps the image at that base. Run it
+                                   with a memory cap: recovery of a large image
+                                   is the peak
+  gexc hotset <elf|pe> --samples FILE [--pe-base HEX] [--budget N] -o OUT
+                                   the function tier's hot set for an image:
+                                   the recovered functions holding the most
+                                   sampled addresses (GEX_SAMPLE_OUT of a
+                                   `--sample` run), then their direct callees,
+                                   up to N (default 4000); for
+                                   `gexc build --cgen --functions OUT`
   gexc funcs  <elf|pe> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list] [--base HEX]
                                    [--vsyscall-guards] [--guards FILE] [--profile FILE] [--truth FILE]
                                    recover functions (CFGs, jump tables,
@@ -360,6 +376,80 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     })
 }
 
+/// Hex addresses, one per line (`#` starts a comment).
+fn read_addr_list(path: &str) -> Result<Vec<u64>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let w = line.split('#').next().unwrap_or("").split_whitespace().next();
+        if let Some(w) = w {
+            let v = u64::from_str_radix(w.trim_start_matches("0x"), 16)
+                .with_context(|| format!("{path}:{}: not a hex address: {w}", n + 1))?;
+            out.push(v);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// `gexc build` on a PE image (an exe or DLL): placed at `pe_base` (its
+/// preferred base by default) and translated as one image module, the way
+/// the NT layer would map it -- tier-1, or the function tier with `--cgen`.
+#[allow(clippy::too_many_arguments)]
+fn build_pe_image(
+    path: &str,
+    bytes: &[u8],
+    out: &str,
+    pe_base: Option<u64>,
+    exhaustive: bool,
+    shared_memory: bool,
+    cgen: bool,
+    no_validate: bool,
+    functions: Option<Vec<u64>>,
+) -> Result<()> {
+    let pe = gex_ld::pe::parse(bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let base = pe_base.unwrap_or(pe.preferred_base);
+    let (image, seeds) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    gex_xlate::set_compat(image.class32);
+    let t0 = std::time::Instant::now();
+    let (module, stats) = gex_xlate::translate_pe_image(
+        &image,
+        &seeds,
+        &match functions {
+            // A hot set (`--functions`): tier-1 stubs at those entries only,
+            // and the function tier for exactly those functions. The rest of
+            // the image stays with the runtime translator.
+            Some(list) => Options {
+                shared_memory,
+                cgen,
+                lazy: true,
+                seeds_only: true,
+                extra_entries: list,
+                ..Options::default()
+            },
+            None => Options {
+                exhaustive,
+                shared_memory,
+                cgen,
+                ..Options::default()
+            },
+        },
+    );
+    std::fs::write(out, &module.wasm).with_context(|| format!("writing {out}"))?;
+    if !no_validate {
+        gex_native::validate_module(&module.wasm).with_context(|| format!("{out} is not valid wasm"))?;
+    }
+    eprintln!(
+        "{out}: PE image at {base:#x}: {} blocks, {} guest instructions, {} KiB wasm, {:.1}s",
+        stats.blocks,
+        stats.instructions,
+        stats.wasm_bytes / 1024,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// The memcpy/memmove/memset/mempcpy definitions in `image`'s own text, by
 /// address (`Symbol::value` is already biased), for `Options::intrinsics`:
 /// a plain build and `gexc run` serve them with the host builtins, as closure
@@ -390,13 +480,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         if ra.opts.record.is_some() {
             bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
         }
-        // Refused rather than ignored: the NT layer's code all arrives through
-        // the runtime translator as Wine maps each image, and nothing builds
-        // those images on the function tier yet, so a run "with --cgen" would
-        // be tier-1 under another name.
-        if ra.xlate.cgen {
-            bail!("--cgen: the function tier does not handle Windows programs yet (they run on tier-1)");
-        }
+        // --cgen: images with a hot set (GEX_NT_HOTSETS) get function-tier
+        // units as the NT layer maps them (gex_native::nt_cgen); without the
+        // directory it fails loudly there.
         let exit = nt_run::run(&ra, &bytes)?;
         return Ok(report_exit(&exit, ra.opts.verbose));
     }
@@ -519,6 +605,8 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut sysroot: Option<String> = None;
     let mut profile: Vec<u64> = Vec::new();
     let mut cgen = false;
+    let mut pe_base: Option<u64> = None;
+    let mut functions: Option<Vec<u64>> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -546,6 +634,16 @@ fn cmd_build(args: &[String]) -> Result<()> {
             }
             // A host that cannot import a shared memory (a shim built without
             // `+atomics`, i.e. every stable-toolchain build) needs a plain one.
+            "--functions" => {
+                i += 1;
+                let p = args.get(i).context("--functions needs a file of hex addresses")?;
+                functions = Some(read_addr_list(p)?);
+            }
+            "--pe-base" => {
+                i += 1;
+                let v = args.get(i).context("--pe-base needs an address")?;
+                pe_base = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16).context("--pe-base expects hex")?);
+            }
             "--no-shared-memory" => shared_memory = false,
             // Only for looking at a module that is known not to validate.
             "--no-validate" => no_validate = true,
@@ -617,6 +715,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
         );
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if gex_ld::pe::is_pe(&bytes) {
+        return build_pe_image(&path, &bytes, &out, pe_base, exhaustive, shared_memory, cgen, no_validate, functions);
+    }
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     // A 32-bit (i386) program's code must be decoded in compatibility mode,
     // exactly as the runtime path does before translating (`run_program_with`).
@@ -1768,4 +1869,153 @@ mod tests {
         objects[0].image.class32 = true;
         assert!(closure_intrinsics(&objects).is_empty());
     }
+}
+
+/// `gexc hotset`: see the usage text.
+fn cmd_hotset(args: &[String]) -> Result<()> {
+    let (mut path, mut samples, mut out, mut pe_base) = (None, None, None, None);
+    let mut budget = 4000usize;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--samples" => {
+                i += 1;
+                samples = Some(args.get(i).context("--samples needs a file")?.clone());
+            }
+            "-o" => {
+                i += 1;
+                out = Some(args.get(i).context("-o needs a path")?.clone());
+            }
+            "--budget" => {
+                i += 1;
+                budget = args.get(i).context("--budget needs a number")?.parse()?;
+            }
+            "--pe-base" => {
+                i += 1;
+                let v = args.get(i).context("--pe-base needs an address")?;
+                pe_base = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16)?);
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected an image")?;
+    let samples = samples.context("--samples FILE is required")?;
+    let out = out.context("-o OUT is required")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let prog = if gex_ld::pe::is_pe(&bytes) {
+        let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        let base = pe_base.unwrap_or(pe.preferred_base);
+        let (image, extra) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        gex_xlate::func::recover_pe(&image, &extra, &Default::default())
+    } else {
+        let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+        gex_xlate::set_compat(image.class32);
+        gex_xlate::func::recover(&image, Some(&bytes), &Default::default())
+    };
+    // Every real block of every function, by start: the functions holding it.
+    let mut blocks: Vec<(u64, u64, u64)> = Vec::new();
+    for (&entry, f) in &prog.functions {
+        for b in f.blocks.iter().filter(|b| !b.synthetic) {
+            blocks.push((b.start, b.end, entry));
+        }
+    }
+    blocks.sort_unstable();
+    let mut weight: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let text = std::fs::read_to_string(&samples).with_context(|| format!("reading {samples}"))?;
+    let (mut total, mut hit) = (0u64, 0u64);
+    for line in text.lines() {
+        let mut w = line.split_whitespace();
+        let (Some(pc), Some(n)) = (w.next(), w.next()) else { continue };
+        let (Ok(pc), Ok(n)) = (u64::from_str_radix(pc, 16), n.parse::<u64>()) else { continue };
+        total += n;
+        // Blocks starting at or before pc whose range holds it.
+        let k = blocks.partition_point(|b| b.0 <= pc);
+        let mut any = false;
+        for b in blocks[..k].iter().rev().take(64) {
+            if pc < b.1 {
+                *weight.entry(b.2).or_default() += n;
+                any = true;
+            }
+        }
+        if any {
+            hit += n;
+        }
+    }
+    let mut hot: Vec<(u64, u64)> = weight.into_iter().collect();
+    hot.sort_by_key(|(a, n)| (std::cmp::Reverse(*n), *a));
+    // The hot functions, hottest first, each followed by its direct callees
+    // (a call to a function outside the set leaves the function tier).
+    let mut chosen: Vec<u64> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    for (a, _) in &hot {
+        if chosen.len() >= budget {
+            break;
+        }
+        queue.push_back(*a);
+        while let Some(f) = queue.pop_front() {
+            if chosen.len() >= budget || !seen.insert(f) {
+                continue;
+            }
+            let Some(func) = prog.functions.get(&f) else { continue };
+            chosen.push(f);
+            for b in &func.blocks {
+                if let gex_ir::func::FTerm::Call { callee: gex_ir::func::Callee::Direct(t), .. }
+                | gex_ir::func::FTerm::TailCall { callee: gex_ir::func::Callee::Direct(t) } = &b.term
+                {
+                    if prog.functions.contains_key(t) && !seen.contains(t) {
+                        queue.push_back(*t);
+                    }
+                }
+            }
+        }
+    }
+    let wmap: std::collections::HashMap<u64, u64> = hot.iter().copied().collect();
+    let mut text = format!(
+        "# gexc hotset {path}: {} of {} recovered functions; {hit} of {total} samples in them\n",
+        chosen.len(),
+        prog.functions.len()
+    );
+    for f in &chosen {
+        let name = prog.functions[f].name.as_deref().unwrap_or("");
+        text.push_str(&format!("{f:x} # {} {name}\n", wmap.get(f).copied().unwrap_or(0)));
+    }
+    std::fs::write(&out, text).with_context(|| format!("writing {out}"))?;
+    eprintln!(
+        "{out}: {} functions ({} sampled); {hit} of {total} samples land in recovered functions",
+        chosen.len(),
+        hot.len()
+    );
+    Ok(())
+}
+
+/// `gexc cgen-image`: see the usage text.
+fn cmd_cgen_image(args: &[String]) -> Result<()> {
+    let (mut path, mut pe_base) = (None, None);
+    let mut jobs = 4usize;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pe-base" => {
+                i += 1;
+                let v = args.get(i).context("--pe-base needs an address")?;
+                pe_base = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16)?);
+            }
+            "--jobs" => {
+                i += 1;
+                jobs = args.get(i).context("--jobs needs a number")?.parse()?;
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected a PE image")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let base = pe_base.unwrap_or(pe.preferred_base);
+    let t0 = std::time::Instant::now();
+    let out = gex_native::nt_cgen::prepare_pe(&pe, base, jobs, true)?;
+    eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
+    Ok(())
 }

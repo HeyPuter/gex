@@ -466,3 +466,46 @@ what the emitted functions do at their exits.
 
 Profiling (`GEX_PROFILE=1`, `gexc run --record`) and the function tier are
 refused together, loudly: the C code carries no profiling hooks.
+
+## 11. Whole images under the NT layer (PE, M7)
+
+Wine's loader maps every image of a Windows program itself, so its code
+arrives through the runtime translator. With `gexc run --cgen` on a PE
+program, every image the NT layer maps also gets a **function-tier unit**:
+
+* **Unit.** The whole image's recovered functions (S2's `recover_pe`), as C,
+  compiled and linked once into one module that exports `e_<entry>` for every
+  function (`gex_cgen::image`). That module does not depend on dispatch slots.
+* **Keyed on the image as placed.** `nt_cgen::image_key` hashes the format
+  (`gex_cgen::image::FORMAT`), the build of gex, and the image's relocated
+  segments at the base it was mapped at (`aot::image_identity` of
+  `pe_input(pe, base)`). The NT layer chooses the base (`section::map_image`):
+  an image that cannot move stays at its preferred base (Noita's exe, at
+  0x40_0000); a relocatable one goes to the first free range, so x64 test exes
+  preferring 0x1_4000_0000 land at 0x40_0000 (S5's open `PeLayout::pack`
+  question; not changed here). A unit is therefore built for the base the image
+  is actually mapped at, never the one in its header.
+* **Built on first use, or ahead of time.** An image mapped with no unit for
+  that base runs on tier-1 while `gexc cgen-image <image> --pe-base B` builds
+  one in a child process (one at a time, under `systemd-run -p
+  MemoryMax=$GEX_CGEN_MEMORY_MAX`, default 12G); the unit is installed when
+  the build finishes. `gexc cgen-image` builds ahead of time.
+  `GEX_NT_CGEN_BUILD=a.dll,b.exe` builds only those; `GEX_NT_CGEN_BUILD=0`
+  turns building off: then the exe without a unit stops
+  the run, and a DLL without one runs on tier-1 (said under GEX_TRACE).
+* **Two stages, bounded memory.** Stage 1 recovers the image and writes its
+  functions in GIR's text form plus a line of summary per function
+  (`write_recovery`; a temporary directory renamed into place, every file
+  versioned). Stage 2 reads them back one at a time, emits C in units of
+  ~512 KiB, compiles each with a precompiled `gex_abi.h` and at most `jobs`
+  clangs, caching objects by the hash of the unit, the header, the flags and
+  clang's version, and links (`build_c_module`). Stage 2's memory is a unit of
+  C; stage 1's is recovery's (10 GB on noita.exe today: S2's queue).
+* **Installed at map time.** The NT layer calls a hook after mapping an image
+  (`gex_kernel::nt::section::set_image_mapped_hook`, no-op by default); the
+  host compares the image's executable bytes in guest memory with the unit's
+  and refuses loudly on a mismatch, then lifts a tier-1 stub at every exported
+  entry against the process's current dispatch slots, splices the unit over
+  them (`translate_runtime_prebuilt`) and installs the result like a runtime
+  translation. Every other address -- code recovery missed, code generated at
+  run time -- stays the runtime translator's.
