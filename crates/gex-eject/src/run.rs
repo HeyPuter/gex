@@ -48,6 +48,7 @@ pub fn aot(dir: &Path, manifest: &BuildManifest) -> Aot {
             symbol: r.symbol.clone(),
             addr: r.addr,
             calls: Default::default(),
+            missing: r.missing,
         });
     }
     aot.modules = modules.iter().map(|m| dir.join(m)).collect();
@@ -60,7 +61,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
         bail!("the project is for {} guests and this gexc runs {} guests", project.isa, gex_abi::ARCH_NAME);
     }
     let manifest = BuildManifest::load(dir)?;
-    let modules: Vec<String> = manifest.replacements.iter().map(|r| r.module.clone()).collect();
+    let modules: Vec<String> = manifest.replacements.iter().filter(|r| !r.missing).map(|r| r.module.clone()).collect();
     if inputs_id(dir, &modules)? != manifest.inputs {
         bail!(
             "{} changed since it was built (gex-project.json, user/eject.json or a replacement \
@@ -99,7 +100,10 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
     } else {
         project.program.env.clone()
     };
-    let aot = Arc::new(aot(dir, &manifest));
+    let mut aot = aot(dir, &manifest);
+    aot.syscalls = allowed_syscalls(dir, &config)?;
+    aot.single_process = project.processes <= 1;
+    let aot = Arc::new(aot);
     let opts = RunOptions {
         args,
         env,
@@ -107,7 +111,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
         verbose: flags.verbose,
         sysroot: Some(root),
         cwd: project.program.cwd.clone(),
-        jit: flags.jit_fallback,
+        jit: flags.jit_fallback || config.jit_fallback,
         aot: Some(Arc::clone(&aot)),
         // A dynamic program's libraries go where their modules were built for.
         pins: manifest.pins.iter().cloned().collect(),
@@ -116,7 +120,7 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
     };
     let (exit, _) = gex_native::run_program(&program, &opts, &gex_xlate::Options::default())?;
     if flags.verbose {
-        for r in &aot.replacements {
+        for r in aot.replacements.iter().filter(|r| r.calls.load(std::sync::atomic::Ordering::Relaxed) > 0 || !r.missing) {
             eprintln!(
                 "[gex-eject] {} at {:#x} -> {}: {} calls",
                 r.symbol,
@@ -127,4 +131,27 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
         }
     }
     Ok(exit)
+}
+
+/// The system calls an ejected program may make, by canonical number: the
+/// recorded session's, plus `allow_syscalls`. `None` with `"syscalls": "all"`.
+pub fn allowed_syscalls(dir: &Path, config: &Config) -> Result<Option<std::collections::HashSet<u64>>> {
+    if config.all_syscalls {
+        return Ok(None);
+    }
+    let p = dir.join("session/session.json");
+    let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+    let session = gex_xlate::profile::Session::from_json(&text).map_err(|e| anyhow!("{}: {e}", p.display()))?;
+    let mut set: std::collections::HashSet<u64> = session.syscalls.keys().copied().collect();
+    gex_native::profile::use_kernel_syscall_names();
+    for name in &config.allow_syscalls {
+        let nr = match name.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => (0..1024u64)
+                .find(|n| gex_xlate::profile::syscall_name(*n) == name)
+                .ok_or_else(|| anyhow!("user/eject.json: allow_syscalls: no system call is called {name:?}"))?,
+        };
+        set.insert(nr);
+    }
+    Ok(Some(set))
 }

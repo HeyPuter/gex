@@ -432,8 +432,12 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
                 }
                 // lld links a static i386 executable at 0x10000 by default,
                 // which is where gex keeps its contexts and dispatch
-                // directory. Refuse it rather than load over them.
-                if p_memsz != 0 && vaddr < gex_abi::DISPATCH_DIR_END {
+                // directory. Refuse it rather than load over them. Only a
+                // fixed-address image: a relocatable one loaded at a low base
+                // is being measured or parsed (`closure::resolve` sizes every
+                // library at base 0), and where it really goes is the
+                // loader's or the kernel's placement, which never picks there.
+                if !pie && p_memsz != 0 && vaddr < gex_abi::DISPATCH_DIR_END {
                     return Err(LoadError::InRuntimeRegion {
                         vaddr,
                         size: p_memsz,
@@ -993,6 +997,29 @@ fn read_symbols(
     out
 }
 
+/// A minimal image for tests: one R+X `PT_LOAD` of 0x1000 bytes at `vaddr`.
+#[cfg(test)]
+pub(crate) fn test_image(e_type: u16, vaddr: u64) -> Vec<u8> {
+    let mut v = vec![0u8; 0x1000];
+    v[0..4].copy_from_slice(b"\x7fELF");
+    v[4] = 2; // ELFCLASS64
+    v[5] = 1; // little endian
+    v[6] = 1;
+    v[16..18].copy_from_slice(&e_type.to_le_bytes());
+    v[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
+    v[24..32].copy_from_slice(&vaddr.to_le_bytes()); // e_entry
+    v[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    v[54..56].copy_from_slice(&56u16.to_le_bytes());
+    v[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let p = 64;
+    v[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    v[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+    v[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes());
+    v[p + 32..p + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+    v[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,24 +1032,16 @@ mod tests {
 
     /// An `ET_EXEC` with one executable `PT_LOAD` at `vaddr`.
     fn exec_at(vaddr: u64) -> Vec<u8> {
-        let mut v = vec![0u8; 0x1000];
-        v[0..4].copy_from_slice(b"\x7fELF");
-        v[4] = 2; // ELFCLASS64
-        v[5] = 1; // little endian
-        v[6] = 1;
-        v[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
-        v[18..20].copy_from_slice(&gex_abi::ELF_MACHINE.to_le_bytes());
-        v[24..32].copy_from_slice(&vaddr.to_le_bytes()); // e_entry
-        v[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-        v[54..56].copy_from_slice(&56u16.to_le_bytes());
-        v[56..58].copy_from_slice(&1u16.to_le_bytes());
-        let p = 64;
-        v[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-        v[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
-        v[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes());
-        v[p + 32..p + 40].copy_from_slice(&0x1000u64.to_le_bytes());
-        v[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes());
-        v
+        test_image(ET_EXEC, vaddr)
+    }
+
+    /// A relocatable object linked at zero, as every shared library is, can
+    /// be loaded at zero to measure it: nothing is placed there.
+    #[test]
+    fn a_relocatable_image_loads_at_any_base() {
+        let so = test_image(ET_DYN, 0);
+        assert_eq!(load(&so, 0).unwrap().brk, 0x1000);
+        assert_eq!(load(&so, gex_abi::MMAP_BOTTOM).unwrap().bias, gex_abi::MMAP_BOTTOM);
     }
 
     /// lld's default base for a static i386 executable is 0x10000, inside

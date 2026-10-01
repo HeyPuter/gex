@@ -5,13 +5,18 @@ use anyhow::{bail, Context, Result};
 use gex_native::Exit;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build]
+pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--web-shim gex_browser.wasm]
                                    write a standalone project from a session
                                    `gexc run --record` recorded: the closure,
                                    the files it read, the runtime, a build step
                                    and a launcher (docs/eject.md)
   gexc eject build <project>       translate it ahead of time and bind the
                                    user's replacements (the project's build.sh)
+  gexc eject override <project> <object> <symbol|0xoffset> [--size N]
+                                   print a user/eject.json replacement entry
+                                   for a function, with the object's hash and
+                                   the function's bytes' hash, so a changed
+                                   binary is reported instead of mis-bound
   gexc eject run <project> [--jit-fallback] [--strace] [--verbose] [--] [args...]
                                    run it natively (the project's run.sh); code
                                    the build never saw fails loudly unless
@@ -55,11 +60,36 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             }
             Ok(Some(gex_eject::run::run(&dir, &flags)?))
         }
+        Some("override") => {
+            // gexc eject override <project> <object> <symbol|0xoffset> [--size N]
+            let mut pos = Vec::new();
+            let mut size = None;
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--size" {
+                    i += 1;
+                    let v = args.get(i).context("--size needs a number")?;
+                    size = Some(match v.strip_prefix("0x") {
+                        Some(h) => u64::from_str_radix(h, 16)?,
+                        None => v.parse()?,
+                    });
+                } else {
+                    pos.push(args[i].clone());
+                }
+                i += 1;
+            }
+            let [dir, object, what] = pos.as_slice() else {
+                bail!("gexc eject override <project> <object> <symbol|0xoffset> [--size N]");
+            };
+            print!("{}", gex_eject::build::describe(std::path::Path::new(dir), object, what, size)?);
+            Ok(None)
+        }
         Some("decompile") => bail!("gexc eject decompile: not yet (eject v1, with the function tier)"),
         Some(_) => {
             let mut record = None;
             let mut out = None;
             let mut then_build = false;
+            let mut web_shim = None;
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -68,6 +98,10 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                         out = Some(PathBuf::from(args.get(i).context("--out needs a directory")?));
                     }
                     "--build" => then_build = true,
+                    "--web-shim" => {
+                        i += 1;
+                        web_shim = Some(PathBuf::from(args.get(i).context("--web-shim needs gex_browser.wasm")?));
+                    }
                     o if o.starts_with('-') => bail!("gexc eject: unknown option {o}"),
                     r => {
                         if record.replace(PathBuf::from(r)).is_some() {
@@ -86,6 +120,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 &gex_eject::eject::EjectOptions {
                     runtime,
                     runtime_build: gex_cache::build_fingerprint(),
+                    web_shim,
                 },
             )?;
             eprintln!(
@@ -98,6 +133,9 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                 s.outputs,
                 if s.kept_user { "; user/ kept" } else { "" }
             );
+            if !s.web {
+                eprintln!("  no web build: give --web-shim <gex_browser.wasm> for run.mjs and index.html");
+            }
             eprintln!(
                 "  the project holds the program's own code and the files it read; \
                  distributing it is subject to their licences"
@@ -116,7 +154,8 @@ fn build(dir: &std::path::Path) -> Result<()> {
     for i in &r.images {
         eprintln!("  {:<40} {:>7} blocks {:>7} KiB  {}", i.path, i.blocks, i.bytes / 1024, i.module);
     }
-    for x in &r.replacements {
+    let missing = r.replacements.iter().filter(|x| x.missing).count();
+    for x in r.replacements.iter().filter(|x| !x.missing) {
         eprintln!(
             "  replace {} at {:#x} with {}:{} ({}, {})",
             x.symbol,
@@ -127,11 +166,23 @@ fn build(dir: &std::path::Path) -> Result<()> {
             x.sig
         );
     }
+    if missing > 0 {
+        eprintln!(
+            "  {missing} functions of replaced libraries have no replacement and fail loudly if \
+             called: {}",
+            r.replacements.iter().filter(|x| x.missing).map(|x| x.symbol.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
     if r.illegal_blocks > 0 {
         eprintln!(
             "  {} blocks end in an instruction gex cannot execute yet; reaching one raises SIGILL",
             r.illegal_blocks
         );
+    }
+    match &r.web {
+        Some(Ok(bytes)) => eprintln!("  web build: {} KiB in build/web (node run.mjs, or serve index.html)", bytes / 1024),
+        Some(Err(why)) => eprintln!("  no web build: {why}"),
+        None => {}
     }
     eprintln!("{}: built ({} files in build/rootfs)", dir.display(), r.rootfs_files);
     Ok(())

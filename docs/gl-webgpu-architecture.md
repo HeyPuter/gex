@@ -2,17 +2,19 @@
 
 ## Decision
 
-The production path should use Mesa's OpenGL state tracker and NIR compiler
-middle-end, backed by a WebGPU Gallium driver.  The existing MobileGL WebGPU
-fork remains a differential oracle and an implementation prototype while that
-path is brought up; it is not the architecture on which OpenGL 4.4 conformance
-will be claimed.
+The production path uses Mesa's OpenGL state tracker and NIR compiler
+middle-end, backed by a WebGPU Gallium driver (gex_wgpu).  It is the only
+browser GL backend.
 
-This replaces the earlier plan to add geometry and tessellation by rewriting
-glslang SPIR-V inside `WebGPURenderer`.  That plan addressed one visible gap in
-one backend, but retained several independent sources of incorrect behaviour:
+History: gex first drew desktop GL on WebGPU through a fork of MobileGL, an
+OpenGL implementation on WebGPU.  It was used as a prototype and briefly as a
+differential reference, then disabled, and has since been removed from the
+tree.  This decision replaced the plan to add geometry and tessellation by
+rewriting glslang SPIR-V inside that backend's renderer.  That plan addressed
+one visible gap in one backend, but retained several independent sources of
+incorrect behaviour:
 
-- MobileGL implements desktop GL object, validation, synchronization, and
+- the backend implemented desktop GL object, validation, synchronization, and
   framebuffer semantics itself.
 - shader translation is followed by WGSL text rewriting for bindings, clip
   space, interpolation, transform feedback, samplers, and interface packing;
@@ -98,14 +100,14 @@ semantics, or shader linkage.  Those stay in Mesa's tested frontend/compiler.
    browser worker, with buffers, RGBA8 textures, clear, and synchronized
    readback.
 2. Connect st/mesa to that screen and run the existing guest GL transport into
-   Mesa instead of MobileGL for a selectable backend.
+   Mesa.
 3. Bring up vertex/fragment draw, indexed draw, textures, FBOs, and queries.
 4. Port the Mesa `poly` support ABI and prove VS, GS, TCS/TES, and final-stage
    transform feedback with deterministic pixel and buffer comparisons.
 5. Expand Khronos CTS by semantic families.  A feature is supported only when
    its official cases and local memory-canary variants pass in a real browser.
-6. Make Mesa/WebGPU the default only after it surpasses MobileGL's passing CTS
-   set.  Remove MobileGL after there is no remaining differential value.
+6. Make Mesa/WebGPU the only backend.  (Done: the earlier backend has been
+   removed.)
 7. Profile STK and optimize real presents only after the relevant rendering
    families pass.  Visual inspection is a smoke test, never the correctness
    gate.
@@ -171,13 +173,6 @@ Softpipe replay proves the transport and Mesa frontend while the WebGPU
 Gallium driver is built.  It advertises only GL 3.3 and cannot prove GL 4.4 or
 WebGPU rendering.  The future WebGPU screen must derive its advertised version
 from tested Gallium capabilities rather than a hard-coded version string.
-
-## Near-term rule for MobileGL
-
-Only make MobileGL changes that improve the shared transport, add a
-differential/conformance test, fix a demonstrated memory-safety issue, or
-unblock the Mesa replacement.  Do not grow another custom pre-raster compiler
-or accept STK-specific shader/application patches.
 
 ## Current WebGPU proof boundary
 

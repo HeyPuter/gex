@@ -28,6 +28,9 @@ pub const GENERATED: &[&str] = &[
     "gen",
     "build.sh",
     "run.sh",
+    "run.mjs",
+    "serve.mjs",
+    "index.html",
     ".gitignore",
 ];
 
@@ -36,6 +39,9 @@ pub struct EjectOptions {
     pub runtime: PathBuf,
     /// Its build fingerprint, when it has one.
     pub runtime_build: Option<String>,
+    /// gex's browser shim (`gex_browser.wasm`, built from the same source for
+    /// the same guest), for a project with a web build.
+    pub web_shim: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +53,8 @@ pub struct Summary {
     pub outputs: usize,
     /// The project existed and its `user/` was kept.
     pub kept_user: bool,
+    /// It has the browser runtime.
+    pub web: bool,
 }
 
 /// `sha256:<hex>` of some bytes.
@@ -320,6 +328,21 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     write_file(&out.join("build.sh"), templates::build_sh().as_bytes(), true)?;
     write_file(&out.join("run.sh"), templates::run_sh().as_bytes(), true)?;
     write_file(&out.join(".gitignore"), templates::GITIGNORE.as_bytes(), false)?;
+    // The web launchers, and the browser runtime when there is one: without
+    // it they say so.
+    write_file(&out.join("run.mjs"), crate::web::RUN_MJS.as_bytes(), true)?;
+    write_file(&out.join("index.html"), crate::web::INDEX_HTML.as_bytes(), false)?;
+    write_file(&out.join("serve.mjs"), crate::web::SERVE_MJS.as_bytes(), true)?;
+    write_file(&out.join("runtime/web/eject.mjs"), crate::web::EJECT_MJS.as_bytes(), false)?;
+    write_file(&out.join("runtime/web/gex.mjs"), crate::web::GEX_MJS.as_bytes(), false)?;
+    if let Some(shim) = &o.web_shim {
+        let b = std::fs::read(shim).with_context(|| format!("reading {}", shim.display()))?;
+        if b.get(..4) != Some(b"\0asm") {
+            bail!("{} is not a wasm module", shim.display());
+        }
+        write_file(&out.join(crate::web::SHIM), &b, false)?;
+        summary.web = true;
+    }
     write_file(&out.join("gen/gex_replace.h"), templates::header(&project.isa).as_bytes(), false)?;
 
     // The user's part, once.

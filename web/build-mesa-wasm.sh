@@ -33,7 +33,7 @@ command -v emcc >/dev/null 2>&1 || { echo "need Emscripten" >&2; exit 1; }
 }
 [ -f "$TINT_OUT/libtint.a" ] || {
     OUTPUT_DIR="$TINT_OUT" TMP_DIR="$TINT_TMP" KEEP_TMP=true WASM_THREADS=true \
-        "$ROOT/third_party/mobilegl-webgpu/tools/build-tint.sh"
+        "$ROOT/web/tint/build-tint.sh"
 }
 
 if [ ! -f "$BUILD/build.ninja" ]; then
