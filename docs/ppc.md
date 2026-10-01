@@ -113,15 +113,35 @@ Why these:
 
 ### 2.3 Pricing
 
-Checked once the corpus runs (§12):
+A ppc32 build with no swaps can't serve as the baseline, because the guest's
+argv, auxv and every initialised word would read backwards. So the price is
+measured the other way round: `GEX_BSWAP_BALLAST=N` (gex-emit) emits every
+swap 2N more times, which leaves every value right, and half of what N = 1
+adds is the cost of the swaps a build has.
 
-- Count the swaps per kernel from GIR statistics. `Bswap` defs are counted
-  like loads in `pass::stats`.
-- Time the ppc32 build against the AArch64 build of the same corpus kernel,
-  and against a ppc32 build with `GEX_UNSAFE_NO_BSWAP=1`. That diagnostic
-  drops the swaps: the result is wrong, but the ratio is the price.
-- Fold `Bswap(Bswap(x)) = x` in the block-local passes. A reload of a stored
-  register inside one block then costs nothing.
+Measured on pewasm's Tier-0 corpus (29 kernels, eh left out for time;
+tier-1 through `bench/gex-run.mjs`, 3 rotating rounds on a reserved core,
+median per-round ratio against emcc). At the time, one set of swaps was
+about 18% of ppc32 tier-1 time: the geomean went from 5.355x to 7.309x emcc
+with the ballast. It is heaviest on memory-bound kernels (array 31%,
+structval 32%, alloc 21%, calls 18%) and lightest on branchy ones (cgoto
+11%).
+
+The lowering was chosen with a microbenchmark on the same core (a load,
+swap, add, swap, store chain; ns per iteration, with 0.84 for no swap):
+
+| lowering | ns/iter |
+| --- | --- |
+| `rotl`/`rotr`/`and`/`and`/`or` (the one used) | 1.61–1.76 |
+| `v128.load32_zero` + constant `i8x16.swizzle` + `extract_lane` | 1.83–1.94 |
+| `i32x4.splat` + swizzle + extract | 2.06–2.50 |
+| four shifts, two masks, three ors | 2.41–2.77 |
+
+The lifter also removes swaps. A value a load produced, when it is stored
+back at the same width, is stored as the word it was loaded as, with no swap
+either way. That covers a copy, `lmw`/`stmw`, and `lfd`/`stfd`. A double made
+from a single (`lfs`, or a single-precision result) is stored by `stfs` as
+the single word it came from.
 
 ### 2.4 32-bit effective addresses
 
@@ -565,15 +585,20 @@ itself into a loud failure.
 
 ## 12. Merge notes
 
-When this branch meets S2's function IR and S3's C backend, which are not on
-merge/main yet, every exhaustive match over GIR needs arms for:
+S2's function IR (merged into this branch): the text form names the
+PowerPC registers and parses `Bswap`/`Bswap16`. `func::reg_index` refuses
+PowerPC registers, because `func::recover` refuses every 32-bit image,
+PowerPC's included, the way it refuses i386's.
 
-- `UnOp::Bswap`/`Bswap16`: the rotate/shift lowerings in
-  `gex-emit/src/tier1.rs::emit_bswap`, and `__builtin_bswap32`/`16`/`64` in C;
+When S3's C backend meets this branch, its exhaustive matches over GIR need
+arms for:
+
+- `UnOp::Bswap`/`Bswap16`: `__builtin_bswap32`/`64`, and a 16-bit form;
 - the PowerPC `GuestReg`s: `R`, `Lr`, `Ctr`, `Cr`, `So`, `Ov`, `Ca`,
   `XerBc`, `Fpscr`, `F`, with their context slots in `gex_abi::ctx::PPC_*`;
 - `I32` memory addresses (§2.4).
 
+The flag liveness masks are u64 (`pass::PPC_FLAGS` beside `ALL_FLAGS`).
 Nothing else in GIR changed.
 
 ---
@@ -585,9 +610,19 @@ Nothing else in GIR changed.
 | toolchain: sysroot and `cc.sh` | done: musl 1.2.5 + compiler-rt 21.1.8 builtins, `-mcpu=ppc`, no vector instructions; hello runs under `qemu-ppc` |
 | P1.1 decoder, disassembler, objdump diff | done: 0 mismatches over the sysroot's libc.a and compiler-rt (128,633 words) and 200,000 random words |
 | P1.2 static hello under `gexc run` | done |
-| P1.3 corpus checksums, diff-fuzz-ppc green | corpus 30/30 under the native shim (result lines equal to qemu-ppc and x86-64); diff-fuzz-ppc green: int 2,000, cr 1,000, branch 1,000, mem 1,000, fp 3,000 cases. Tier-1 timing through the browser shim: pending |
-| P1.4 FP complete, atomics, signals, threads, soundness corpus | — |
-| P1.5 browser shim builds | — |
+| P1.3 corpus checksums, diff-fuzz-ppc green | done: corpus 30/30 under the native shim (result lines equal to qemu-ppc and x86-64); diff-fuzz-ppc green over the int, cr, branch, mem and fp classes; tier-1 geomean against emcc is 5.19x for ppc32 vs 3.22x for AArch64 (29 kernels, eh left out). The gap is the kernels clang vectorises for AArch64 (array, bits, simd, qsort), int64 (64-bit arithmetic on a 32-bit guest), and the byte swaps (§2.3) |
+| P1.4 FP complete, atomics, signals, threads, soundness corpus | done: `tests/ppc/progs.sh` (signals, threads with futex and TLS, C11 atomics, FP) matches qemu-ppc; the soundness corpus is 15 pass, sig_segv xfail (no page protection, as on every guest) |
+| P1.5 browser shim builds | done: gex-browser builds for wasm32 with `--features ppc`, and runs the corpus in Node through `bench/gex-run.mjs` |
+
+Not done, and failing loudly:
+
+- dynamic linking (musl's `ld.so` for ppc: R_PPC_* relocations, secure PLT);
+- conditional traps (`tw`/`twi` with a condition), `lswx`/`stswx`;
+- `fres`/`frsqrte`, `mcrfs`;
+- FP arithmetic in a non-default rounding mode;
+- the PowerPC termios layout (TCGETS and friends fall through as unknown
+  ioctls);
+- gex-eject's replacements (`Intrinsic::Replace`).
 
 Found on the way:
 
