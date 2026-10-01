@@ -77,6 +77,13 @@ mod stub {
     pub(crate) fn arena_ceiling() -> u64 {
         gex_abi::MMAP_TOP
     }
+
+    /// The glue's nested callback loop asks this; with no Windows process
+    /// that loop never runs, but the export has to exist for the glue check.
+    #[no_mangle]
+    pub extern "C" fn gex_nt_callback_done(_ctx: i32) -> i32 {
+        0
+    }
 }
 
 #[cfg(feature = "shared-memory")]

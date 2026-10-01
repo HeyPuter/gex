@@ -1214,6 +1214,19 @@ pub extern "C" fn k_take_signals(pid: i32) -> u64 {
     procs().take_signals(pid)
 }
 
+/// Of `taken` (what `k_take_signals` just returned), the signals `kill` sent,
+/// which the target reports as `SI_USER`.
+#[no_mangle]
+pub extern "C" fn k_take_kill_signals(pid: i32, taken: u64) -> u64 {
+    procs().take_kill_signals(pid, taken)
+}
+
+/// Who last sent `signo` to `pid` by `kill`.
+#[no_mangle]
+pub extern "C" fn k_kill_sender(pid: i32, signo: u32) -> i32 {
+    procs().kill_sender(pid, signo)
+}
+
 /// Whether anything is pending for `pid`, without taking it.
 #[no_mangle]
 pub extern "C" fn k_has_signals(pid: i32) -> i32 {

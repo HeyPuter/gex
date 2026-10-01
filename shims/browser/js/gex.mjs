@@ -1480,8 +1480,8 @@ export class Gex {
     const NAMES = asked.length ? asked : LEGACY_NAMES;
     // Not imported by the shim -- the host reads it after a crash -- so it is
     // not in the list above and its absence is not a link error.
-    // Two of these return an i64, which JS has to answer with a BigInt.
-    const BIG = new Set(['k_wait', 'k_take_signals', 'k_tty_winsize']);
+    // Some of these return an i64, which JS has to answer with a BigInt.
+    const BIG = new Set(['k_wait', 'k_take_signals', 'k_take_kill_signals', 'k_tty_winsize']);
     const out = { k_present: () => (k ? 1 : 0) };
     for (const n of NAMES) {
       // Some `gex_k` imports are answered here, not by the kernel (`k_present`

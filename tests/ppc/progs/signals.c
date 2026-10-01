@@ -3,10 +3,9 @@
  * stacks, and masks across the handler (sigset_t is two big-endian words on
  * ppc32, low word first).
  *
- * Not here, because they are gaps every gex guest shares: a write to an
+ * Not here, because it is a gap every gex guest shares: a write to an
  * unmapped page does not fault (no page protection in wasm; the soundness
- * case sig_segv is xfail), and si_code is SI_KERNEL rather than SI_USER for a
- * signal from kill(). */
+ * case sig_segv is xfail). */
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>

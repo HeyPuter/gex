@@ -226,6 +226,8 @@ extern "C" {
     /// table's lock a thousand times a second.
     fn k_signal_seq() -> i32;
     fn k_take_signals(pid: i32) -> u64;
+    fn k_take_kill_signals(pid: i32, taken: u64) -> u64;
+    fn k_kill_sender(pid: i32, signo: u32) -> i32;
     fn k_has_signals(pid: i32) -> i32;
     fn k_ppid(pid: i32) -> i32;
     fn k_pgid(caller: i32, of: i32) -> i32;
@@ -586,6 +588,12 @@ extern "C" fn r_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
 extern "C" fn r_take_signals(pid: i32) -> u64 {
     unsafe { k_take_signals(pid) }
 }
+extern "C" fn r_take_kill_signals(pid: i32, taken: u64) -> u64 {
+    unsafe { k_take_kill_signals(pid, taken) }
+}
+extern "C" fn r_kill_sender(pid: i32, signo: u32) -> i32 {
+    unsafe { k_kill_sender(pid, signo) }
+}
 extern "C" fn r_has_signals(pid: i32) -> i32 {
     unsafe { k_has_signals(pid) }
 }
@@ -631,6 +639,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             kill: r_kill,
             kill_group: r_kill_group,
             take_signals: r_take_signals,
+            take_kill_signals: r_take_kill_signals,
+            kill_sender: r_kill_sender,
             has_signals: r_has_signals,
             ppid: r_ppid,
             pgid: r_pgid,
