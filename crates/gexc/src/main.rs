@@ -403,9 +403,6 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         std::fs::read(host).ok()
     })
     .with_context(|| format!("loading {}", ra.path))?;
-    if let Some(why) = gex_xlate::cgen_refuses_image(ra.xlate.cgen, program.exe.class32) {
-        bail!("{}: {why}", ra.path);
-    }
     ra.xlate.intrinsics = image_intrinsics(&program.exe);
     if let Some(i) = &program.interp {
         ra.xlate.intrinsics.extend(image_intrinsics(i));
@@ -616,9 +613,6 @@ fn cmd_build(args: &[String]) -> Result<()> {
     // A 32-bit (i386) program's code must be decoded in compatibility mode,
     // exactly as the runtime path does before translating (`run_program_with`).
     gex_xlate::set_compat(image.class32);
-    if let Some(why) = gex_xlate::cgen_refuses_image(cgen, image.class32) {
-        bail!("{path}: {why}");
-    }
     let (module, stats) = gex_xlate::translate_image(
         &image,
         &Options {
