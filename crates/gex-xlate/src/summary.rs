@@ -365,7 +365,7 @@ struct Acc {
     /// Entry registers whose values may reach an output register.
     out_src: RegSet,
     /// Per return path: (registers preserved on it, sp delta if known).
-    exits: Vec<(RegSet, Option<i64>)>,
+    exits: Vec<(RegSet, Option<i64>, RegSet)>,
     /// Some path leaves to code nothing is known about.
     unknown_exit: bool,
     /// Per block: ends in an unresolved jump taken with the frame torn
@@ -1039,6 +1039,9 @@ fn call(st: &mut St, acc: &mut Acc, s: &Summary) -> bool {
     if !s.may_return {
         return false;
     }
+    // What the callee writes on every return path is its result from here
+    // on: a later read of it is not of this function's entry value.
+    st.written = st.written.union(s.always_written);
     // Outputs: derived from what flows into the callee's outputs, except
     // its own stack pointer (a callee handing back its caller's frame is
     // `leaks_sp`).
@@ -1227,7 +1230,7 @@ fn analyze_fn_full(
     let mut visits = vec![0u32; n];
     // Exits are recorded on the final visit of each block only: collect
     // them per block and overwrite on revisit.
-    let mut exits_of: Vec<Option<(RegSet, Option<i64>)>> = vec![None; n];
+    let mut exits_of: Vec<Option<(RegSet, Option<i64>, RegSet)>> = vec![None; n];
     let mut unknown_of: Vec<bool> = vec![false; n];
     while let Some(pos) = work.pop_first() {
         let b = rpo[pos];
@@ -1307,7 +1310,7 @@ fn analyze_fn_full(
                         if s.unknown_callee {
                             unknown_of[bi] = true;
                         }
-                        exits_of[bi] = Some((before.inter(s.preserved), d));
+                        exits_of[bi] = Some((before.inter(s.preserved), d, after.written));
                         if after.regs.iter().enumerate().any(|(i, r)| i != SP && r.frame()) {
                             acc.leaks_sp = true;
                         }
@@ -1326,7 +1329,7 @@ fn analyze_fn_full(
                     acc.may_leave_pending = true;
                 }
                 let d = st.regs[SP].sp_off();
-                exits_of[bi] = Some((unchanged(&st), d));
+                exits_of[bi] = Some((unchanged(&st), d, st.written));
                 output_flow(&st, &mut acc);
                 if st.regs.iter().enumerate().any(|(i, r)| i != SP && r.frame() && r.sp_off().is_none_or(|o| o >= 0)) {
                     acc.leaks_sp = true;
@@ -1415,18 +1418,26 @@ fn analyze_fn_full(
     let unknown_exit = acc.unknown_exit || unknown_of.iter().any(|&u| u);
 
     let may_return = !acc.exits.is_empty() || unknown_exit;
+    // Written on every way back: a must-set, so nothing when a path leaves
+    // to unknown code, everything (vacuously) when none returns.
+    let always_written = if unknown_exit {
+        RegSet::EMPTY
+    } else {
+        acc.exits.iter().fold(RegSet::ALL, |a, (_, _, w)| a.inter(*w))
+    };
     let (preserved, sp_delta) = if unknown_exit {
         (RegSet::EMPTY, None)
     } else if acc.exits.is_empty() {
         (RegSet::ALL, None)
     } else {
-        let p = acc.exits.iter().fold(RegSet::ALL, |a, (s, _)| a.inter(*s));
+        let p = acc.exits.iter().fold(RegSet::ALL, |a, (s, _, _)| a.inter(*s));
         let d0 = acc.exits[0].1;
-        let d = if acc.exits.iter().all(|(_, d)| *d == d0) { d0 } else { None };
+        let d = if acc.exits.iter().all(|(_, d, _)| *d == d0) { d0 } else { None };
         (p, d)
     };
     let mut s = Summary {
         inputs: acc.inputs,
+        always_written,
         stack_inputs: acc.stack_inputs,
         outputs: RegSet::ALL.minus(preserved),
         preserved,
@@ -1477,6 +1488,7 @@ fn join_summaries(a: &Summary, b: &Summary) -> Summary {
     let preserved = a.preserved.inter(b.preserved);
     Summary {
         inputs: a.inputs.union(b.inputs),
+        always_written: a.always_written.inter(b.always_written),
         stack_inputs: a.stack_inputs.join(b.stack_inputs),
         outputs: a.outputs.union(b.outputs),
         preserved,
