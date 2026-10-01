@@ -598,6 +598,7 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
     let frame = {
         let mut s = c.p.gl.lock().unwrap();
         s.frame += 1;
+        c.p.presents.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         s.frame
     };
     // Scripted input (GEX_NT_INPUT) is timed by frames.

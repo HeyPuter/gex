@@ -29,9 +29,27 @@ pub struct NtSetup {
     pub display_out: Option<String>,
 }
 
+/// `GEX_NT_TIME_SCALE`: how much faster than real time the guest's
+/// monotonic clocks run (the counterpart of PEWASM_TIME_SCALE). Every
+/// monotonic source (QueryPerformanceCounter, the tick count and interrupt
+/// time in KUSER_SHARED_DATA, wait timeouts) reads `mono_ns`, so they agree;
+/// the wall-clock date and time are not scaled.
+fn time_scale() -> f64 {
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("GEX_NT_TIME_SCALE").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(1.0)
+    })
+}
+
 fn mono_ns() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    let real = START.get_or_init(Instant::now).elapsed().as_nanos() as u64;
+    let scale = time_scale();
+    if scale == 1.0 {
+        real
+    } else {
+        (real as f64 * scale) as u64
+    }
 }
 
 fn wall() -> (u64, u32) {
@@ -157,10 +175,41 @@ impl nt::display::NtDisplay for PpmDisplay {
 /// process exists, so a guest polling `GetTickCount` without syscalls sees
 /// time pass (docs/nt-layer.md §4).
 fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>) {
+    let stats = std::env::var_os("GEX_NT_STATS").is_some();
+    let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
+        let (addr, deref) = match v.strip_suffix('*') {
+            Some(a) => (a, true),
+            None => (v.as_str(), false),
+        };
+        let addr = u64::from_str_radix(addr.trim_start_matches("0x"), 16).ok()?;
+        Some((addr, deref))
+    });
+    let start = Instant::now();
+    let mut next_stats = Duration::from_secs(1);
     let _ = std::thread::Builder::new().name("gex-nt-usd".into()).spawn(move || loop {
         match p.upgrade() {
             Some(p) if !p.terminating.load(std::sync::atomic::Ordering::Relaxed) => {
                 nt::sysinfo::usd_tick(memory.bytes(), &p.clocks);
+                // GEX_NT_STATS: once a (real) second, for benchmark harnesses.
+                if stats && start.elapsed() >= next_stats {
+                    next_stats += Duration::from_secs(1);
+                    let presents = p.presents.load(std::sync::atomic::Ordering::Relaxed);
+                    let value = peek.and_then(|(addr, deref)| {
+                        let m = GuestMem::new(memory.bytes());
+                        let mut a = addr;
+                        if deref {
+                            a = m.read_u32(a).ok()? as u64;
+                            if a == 0 {
+                                return None; // not set up yet
+                            }
+                        }
+                        m.read_u32(a).ok()
+                    });
+                    match value {
+                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v}", start.elapsed().as_millis()),
+                        None => eprintln!("gex-nt: stats t={} presents={presents}", start.elapsed().as_millis()),
+                    }
+                }
             }
             _ => return,
         }

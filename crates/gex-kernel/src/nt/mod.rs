@@ -383,6 +383,8 @@ pub struct Process {
     pub gdi: Mutex<gdi::Gdi>,
     /// opengl32's Unix side: contexts and the GL command ring.
     pub gl: Mutex<opengl::State>,
+    /// SwapBuffers calls so far (GEX_NT_STATS).
+    pub presents: AtomicU64,
     /// Where top-level windows are shown, if anywhere (§6a.1).
     pub display_host: Mutex<Option<Arc<dyn display::NtDisplay>>>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
@@ -455,6 +457,7 @@ impl Process {
             gdi: Mutex::new(Default::default()),
             gl: Mutex::new(Default::default()),
             display_host: Mutex::new(None),
+            presents: AtomicU64::new(0),
             kill_list: Mutex::new(Vec::new()),
         }
     }
