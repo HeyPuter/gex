@@ -9,7 +9,7 @@
 // What a driver reads: `window.__nt` = { out, status, compositor }.
 
 import { untar } from './tar.js';
-import { fetchBytes, runProgram } from './runtime.js';
+import { runProgram } from './runtime.js';
 
 globalThis.GEX_ARCH = 'x86';
 const q = new URLSearchParams(location.search);
@@ -39,6 +39,30 @@ const term = {
   focus() {},
 };
 
+/**
+ * The bundle, in a SharedArrayBuffer. Every file is a view of it, and the
+ * views go to the process's Worker in its start message: a structured clone
+ * shares a SharedArrayBuffer where it would copy an ArrayBuffer, and copying
+ * Noita's 1.8 GB fails ("Data cannot be cloned, out of memory").
+ */
+async function fetchShared(url) {
+  const res = await fetch(url, { cache: 'no-cache' });
+  if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
+  const total = Number(res.headers.get('content-length'));
+  if (!total) throw new Error(`${url}: no content-length`);
+  const out = new Uint8Array(new SharedArrayBuffer(total));
+  const reader = res.body.getReader();
+  let at = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    out.set(value, at);
+    at += value.length;
+  }
+  if (at !== total) throw new Error(`${url}: ${at} of ${total} bytes`);
+  return out;
+}
+
 async function main() {
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
   const canvas = document.getElementById('out');
@@ -47,8 +71,10 @@ async function main() {
   canvas.style.width = `${w}px`;
   canvas.style.height = `${h}px`;
   state.phase = 'fetching';
-  const tar = await fetchBytes(q.get('tar') || '/gex/nt/bundle.tar');
-  const tree = untar(tar);
+  const tar = await fetchShared(q.get('tar') || '/gex/nt/bundle.tar');
+  // The buffer, not the array: `untar` wraps what it is given in a new
+  // Uint8Array, which copies an array but views a buffer.
+  const tree = untar(tar.buffer);
   const files = { ...tree.files };
   const exe = q.get('exe') || '/t/window.exe';
   if (!files[exe]) throw new Error(`${exe} is not in the bundle`);

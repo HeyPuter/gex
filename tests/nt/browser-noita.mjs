@@ -7,7 +7,7 @@
 //        [--noita DIR] [--keep]
 //
 // The native recipe's steps (MERGE-STATUS S12): at frame 12 a click at
-// (85,661) dismisses the release notes, and the menu is up by ~frame 100.
+// client (85,661) dismisses the release notes, and the menu is up by ~frame 100.
 // Frames are SwapBuffers, counted by GEX_NT_STATS' once-a-second line.
 // Screenshots go to DIR every 30 s and at the end (menu.png).
 //
@@ -25,7 +25,7 @@ const opt = (name, dflt) => {
 };
 const shotDir = opt('--shot', null);
 const minutes = Number(opt('--minutes', 30));
-const wantFrames = Number(opt('--frames', 100));
+const wantFrames = Number(opt('--frames', 140));
 const noita = opt('--noita', join(process.env.HOME, 'src/noita-wasm/Noita'));
 const keep = argv.includes('--keep');
 
@@ -37,8 +37,8 @@ async function main() {
   const t0 = Date.now();
   const { browser, page, evaluate, state, shot, consoleLines } = await openPage(
     `tar=/gex/nt/${tar.split('/').pop()}&exe=/noita/noita.exe&cwd=/noita&gl=1&glbackend=wgpu`
-      + `&size=1282x748&env=GEX_NT_STATS=1`,
-    { width: 1300, height: 900, shotDir },
+      + `&size=1320x800&env=GEX_NT_STATS=1`,
+    { width: 1340, height: 900, shotDir },
   );
   const presents = () => {
     for (let i = consoleLines.length - 1; i >= 0; i--) {
@@ -58,6 +58,14 @@ async function main() {
     }
   };
   const end = t0 + minutes * 60000;
+  // Client-coordinate clicks, in order, each at its frame: the release notes'
+  // Ok, then "Nah. Destroy it" on the autosave question a prefix that has
+  // run gameplay leaves behind (harmless on the title screen when there is
+  // none). The copy of the save in the page is the only one touched.
+  const steps = [
+    { frame: 12, x: 85, y: 661, what: 'dismissing the release notes' },
+    { frame: 90, x: 716, y: 389, what: 'declining an autosave' },
+  ];
   let clicked = false;
   let nextShot = Date.now() + 30000;
   let shots = 0;
@@ -69,12 +77,17 @@ async function main() {
       throw new Error(`Noita stopped (${s.phase})`);
     }
     const p = presents();
-    if (!clicked && p.n >= 12) {
+    if (steps.length && p.n >= steps[0].frame) {
       const w = await window_();
       if (w) {
-        log(`frame ${p.n} at ${(p.t / 1000).toFixed(0)} s: dismissing the release notes (window ${w.w}x${w.h}@${w.x},${w.y})`);
-        await click(w.x + 85, w.y + 661);
-        clicked = true;
+        // The surface is the whole window, so add the frame: Noita's client
+        // area is 1280x720, and its frame has equal sides and a caption.
+        const side = Math.max(0, (w.w - 1280) / 2);
+        const top = Math.max(0, w.h - 720 - side);
+        const st = steps.shift();
+        log(`frame ${p.n} at ${(p.t / 1000).toFixed(0)} s: ${st.what} (window ${w.w}x${w.h}@${w.x},${w.y}, frame ${side},${top})`);
+        await click(w.x + side + st.x, w.y + top + st.y);
+        clicked = !steps.length;
       }
     }
     if (Date.now() >= nextShot) {

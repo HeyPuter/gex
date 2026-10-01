@@ -1,11 +1,12 @@
-// What tests/nt's browser drivers share (docs/nt-layer.md §10.2): a vite dev
-// server for web/, a headless Chromium driven over CDP (web/test/cdp.mjs)
+// What tests/nt's browser drivers share (docs/nt-layer.md §10.2): a vite
+// build of web/nt.html served cross-origin isolated, a headless Chromium driven over CDP (web/test/cdp.mjs)
 // with every Worker's console relayed, web/nt.html opened on a bundle, and
 // screenshots decoded for pixel checks.
 
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, rmSync, symlinkSync, statSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync, rmSync, symlinkSync, statSync, createReadStream } from 'node:fs';
+import { createServer } from 'node:http';
+import { join, dirname, normalize, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import { Cdp, browserWsUrl } from '../../web/test/cdp.mjs';
@@ -99,37 +100,63 @@ export function decodePng(buf) {
 export const near = (got, want, tol = 24) => got.every((v, i) => Math.abs(v - want[i]) <= tol);
 
 
-async function waitHttp(url, ms) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(1000) });
-      if (r.ok) return true;
-    } catch {}
-    await sleep(250);
-  }
-  return false;
-}
-
 const children = [];
+const servers = [];
 
 
 /**
- * Start vite and Chromium, open web/nt.html with `query`, and hand back the
+ * Build web/nt.html with vite (the production build: the dev server's
+ * module rewriting breaks the compositor worker's Mesa glue) into STATE/dist,
+ * and serve it, cross-origin isolated, with web/public behind it -- not
+ * copied, since a bundle can be gigabytes.
+ */
+async function serveBuilt() {
+  if (!existsSync(join(WEB, 'node_modules/.bin/vite'))) throw new Error('no web/node_modules (vite)');
+  const dist = join(STATE, 'dist');
+  const config = join(STATE, 'vite.nt.config.mjs');
+  writeFileSync(config, `import base from ${JSON.stringify(join(WEB, 'vite.config.js'))};
+export default {
+  ...base,
+  root: ${JSON.stringify(WEB)},
+  publicDir: false,
+  logLevel: 'warn',
+  build: { ...base.build, outDir: ${JSON.stringify(dist)}, emptyOutDir: true,
+           rollupOptions: { input: { nt: ${JSON.stringify(join(WEB, 'nt.html'))} } } },
+};
+`);
+  execFileSync(join(WEB, 'node_modules/.bin/vite'), ['build', '--config', config], { cwd: WEB, stdio: ['ignore', 'ignore', 'inherit'] });
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
+    '.css': 'text/css', '.json': 'application/json', '.tar': 'application/x-tar' };
+  const server = createServer((req, res) => {
+    const rel = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname)).replace(/^(\.\.[/\\])+/, '');
+    const file = [join(dist, rel), join(WEB, 'public', rel)].find((f) => existsSync(f) && statSync(f).isFile());
+    if (!file) {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': types[extname(file)] || 'application/octet-stream',
+      'Content-Length': statSync(file).size,
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+      'Cache-Control': 'no-cache',
+    });
+    createReadStream(file).pipe(res);
+  });
+  await new Promise((r) => server.listen(VITE_PORT, '127.0.0.1', r));
+  servers.push(server);
+}
+
+/**
+ * Serve the page and start Chromium, open web/nt.html with `query`, and hand back the
  * means to watch it. Software GL and WebGPU unless GEX_WEBGPU_SOFTWARE=0.
  */
 export async function openPage(query, { width = 1280, height = 900, shotDir = null } = {}) {
   for (const f of ['gex_browser.x86.shared.wasm', 'seed.x86.shared.wasm', 'gex_kernel.x86.wasm']) {
     if (!existsSync(join(WEB, 'public/gex', f))) throw new Error(`no web/public/gex/${f}`);
   }
-  if (!existsSync(join(WEB, 'node_modules/.bin/vite'))) throw new Error('no web/node_modules (vite)');
-  const vite = spawn(join(WEB, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--host', '127.0.0.1'], {
-    cwd: WEB,
-    detached: true,
-    stdio: ['ignore', 'ignore', 'inherit'],
-  });
-  children.push(vite);
-  if (!(await waitHttp(`http://127.0.0.1:${VITE_PORT}/nt.html`, 30000))) throw new Error('vite did not start');
+  await serveBuilt();
   const soft = process.env.GEX_WEBGPU_SOFTWARE !== '0';
   const chrome = spawn(CHROME, [
     '--headless', '--no-sandbox', '--disable-gpu-sandbox', '--enable-unsafe-swiftshader',
@@ -210,5 +237,7 @@ export function stopAll() {
     } catch {}
   }
   children.length = 0;
+  for (const s of servers) s.close();
+  servers.length = 0;
 }
 process.on('exit', stopAll);
