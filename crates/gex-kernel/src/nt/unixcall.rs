@@ -26,7 +26,7 @@ pub const DEGRADES: &[&str] = &[
 
 /// DLLs with a Unix side implemented here, and their ids (the handle is
 /// `(id << 16) | 1`).
-const NATIVE: &[(&str, u64)] = &[("ws2_32.dll", 2)];
+const NATIVE: &[(&str, u64)] = &[("ws2_32.dll", 2), ("opengl32.dll", 3)];
 
 #[derive(Default, Debug)]
 pub struct Registry {
@@ -100,6 +100,7 @@ pub fn dispatch(c: &mut Call<'_>) -> R {
     let lib = c.p.unix.libs.lock().unwrap().get(&handle).cloned();
     match lib {
         Some(name) if name == "ws2_32.dll" => ws2_32(c, code, args),
+        Some(name) if name == "opengl32.dll" => super::opengl::call(c, code, args),
         Some(name) => Err(c.unimplemented(&format!("{name} unix call {code}"))),
         None => Err(c.unimplemented(&format!("unix call {code} on unknown handle {handle:#x}"))),
     }

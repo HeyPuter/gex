@@ -112,7 +112,9 @@ pub fn get_monitor_info(c: &mut Call<'_>, monitor: u32, info: u64) -> R64 {
         return Ok(0);
     }
     let size = c.g.u32(info)?;
-    if size != 40 && size != 72 {
+    // MONITORINFO, or MONITORINFOEXW (32 WCHARs of device name; user32
+    // turns the A form into this one).
+    if size != 40 && size != 104 {
         set_last_error(c, err::INVALID_PARAMETER);
         return Ok(0);
     }
@@ -120,9 +122,9 @@ pub fn get_monitor_info(c: &mut Call<'_>, monitor: u32, info: u64) -> R64 {
     write_rect(&mut c.g, info + 4, &r)?;
     write_rect(&mut c.g, info + 20, &r)?;
     c.g.w32(info + 36, 1)?; // MONITORINFOF_PRIMARY
-    if size == 72 {
+    if size == 104 {
         let mut dev = crate::nt::to_w("\\\\.\\DISPLAY1");
-        dev.resize(16, 0);
+        dev.resize(32, 0);
         c.g.write_wchars(info + 40, &dev)?;
     }
     Ok(1)
@@ -249,4 +251,105 @@ pub fn nt_user_system_parameters_info_for_dpi(c: &mut Call<'_>) -> R64 {
 #[allow(dead_code)]
 fn _unused() -> u64 {
     handle_ret(0)
+}
+
+/// `NtUserEnumDisplayMonitors(hdc, rect, proc, lparam)`: the one monitor,
+/// through user32's `NtUserCallEnumDisplayMonitor` callback.
+pub fn nt_user_enum_display_monitors(c: &mut Call<'_>) -> R64 {
+    let (hdc, rect_p, proc_, lparam) = (c.a32(0), c.a(1), c.a(2), c.a(3));
+    if hdc != 0 {
+        return Err(c.unimplemented("EnumDisplayMonitors with a DC"));
+    }
+    let mut r = primary_rect(c);
+    if rect_p != 0 {
+        r = r.intersect(&super::read_rect(&c.g, rect_p)?);
+        if r.is_empty() {
+            return Ok(1);
+        }
+    }
+    // struct enum_display_monitor_params { proc, monitor, hdc, rect, lparam }
+    let ps = c.p.abi.ptr_size() as usize;
+    let mut args = Vec::new();
+    let mut put = |v: u64, n: usize| args.extend_from_slice(&v.to_le_bytes()[..n]);
+    put(proc_, ps);
+    put(MONITOR as u64, ps);
+    put(0, ps);
+    for v in [r.left, r.top, r.right, r.bottom] {
+        put(v as u32 as u64, 4);
+    }
+    put(lparam, ps);
+    let (_, ret) = super::winproc::user_callback(c, super::callbacks::CALL_ENUM_DISPLAY_MONITOR, &args)?;
+    Ok((ret.len() == 4 && u32::from_le_bytes(ret[..4].try_into().unwrap()) != 0) as u64)
+}
+
+/// Is `device` (a `UNICODE_STRING *`, NULL for the primary) the display?
+fn is_display(c: &Call<'_>, device: u64) -> R<bool> {
+    let Some(name) = c.g.ustr(device)? else { return Ok(true) };
+    Ok(crate::nt::wstr(&name).eq_ignore_ascii_case("\\\\.\\DISPLAY1"))
+}
+
+/// `NtUserEnumDisplaySettings(device, index, devmode, flags)`: one mode,
+/// 1920x1080x32 at 60 Hz, which is also the current and registry one.
+pub fn nt_user_enum_display_settings(c: &mut Call<'_>) -> R64 {
+    let (device, index, dm) = (c.a(0), c.a32(1) as i32, c.a(2));
+    if !is_display(c, device)? {
+        return Ok(0);
+    }
+    let mut name = crate::nt::to_w("Wine Display Driver");
+    name.resize(32, 0);
+    c.g.write_wchars(dm, &name)?;
+    c.g.w16(dm + 64, 0x401)?; // dmSpecVersion
+    c.g.w16(dm + 66, 0x401)?; // dmDriverVersion
+    c.g.w16(dm + 68, 188)?; // dmSize: up to dmICMMethod
+    c.g.w16(dm + 70, 0)?;
+    if !(index == -1 || index == -2 || index == 0) {
+        return Ok(0);
+    }
+    // DM_POSITION | DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH |
+    // DM_PELSHEIGHT | DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY
+    c.g.w32(dm + 72, 0x20 | 0x80 | 0x40000 | 0x80000 | 0x100000 | 0x200000 | 0x400000)?;
+    c.g.w32(dm + 76, 0)?;
+    c.g.w32(dm + 80, 0)?;
+    c.g.w32(dm + 84, 0)?; // DMDO_DEFAULT
+    c.g.w32(dm + 168, 32)?;
+    c.g.w32(dm + 172, SCREEN_W as u32)?;
+    c.g.w32(dm + 176, SCREEN_H as u32)?;
+    c.g.w32(dm + 180, 0)?;
+    c.g.w32(dm + 184, 60)?;
+    Ok(1)
+}
+
+/// `NtUserEnumDisplayDevices(device, index, info, flags)`: the adapter
+/// `\\.\DISPLAY1` and its one monitor.
+pub fn nt_user_enum_display_devices(c: &mut Call<'_>) -> R64 {
+    let (device, index, info) = (c.a(0), c.a32(1), c.a(2));
+    let adapter = c.g.ustr(device)?.is_none();
+    if index != 0 || (!adapter && !is_display(c, device)?) {
+        return Ok(0);
+    }
+    let cb = c.g.u32(info)?;
+    let mut put = |c: &mut Call<'_>, at: u64, n: usize, s: &str| -> R<()> {
+        if at + 2 * n as u64 <= info + cb as u64 {
+            let mut w = crate::nt::to_w(s);
+            w.resize(n, 0);
+            c.g.write_wchars(at, &w)?;
+        }
+        Ok(())
+    };
+    // DISPLAY_DEVICEW: cb, DeviceName[32], DeviceString[128], StateFlags,
+    // DeviceID[128], DeviceKey[128].
+    if adapter {
+        put(c, info + 4, 32, "\\\\.\\DISPLAY1")?;
+        put(c, info + 68, 128, "gex display adapter")?;
+        c.g.w32(info + 324, 0x1 | 0x4)?; // ATTACHED_TO_DESKTOP | PRIMARY_DEVICE
+        put(c, info + 328, 128, "PCI\\VEN_0000&DEV_0000&SUBSYS_00000000&REV_00")?;
+        put(c, info + 584, 128, "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Video\\{00000000-0000-0000-0000-000000000000}\\0000")?;
+    } else {
+        put(c, info + 4, 32, "\\\\.\\DISPLAY1\\Monitor0")?;
+        put(c, info + 68, 128, "Generic Non-PnP Monitor")?;
+        c.g.w32(info + 324, 0x1 | 0x2)?; // ACTIVE | ATTACHED
+        put(c, info + 328, 128, "MONITOR\\Default_Monitor\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0000")?;
+        put(c, info + 584, 128, "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0000")?;
+    }
+    Ok(1)
 }

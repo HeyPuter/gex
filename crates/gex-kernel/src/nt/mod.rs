@@ -22,6 +22,7 @@ pub mod file;
 pub mod gdi;
 pub mod layout;
 pub mod object;
+pub mod opengl;
 pub mod reg;
 pub mod section;
 pub mod status;
@@ -379,6 +380,8 @@ pub struct Process {
     pub user: Mutex<user::User>,
     /// GDI: objects, DCs and the shared handle table (win32u).
     pub gdi: Mutex<gdi::Gdi>,
+    /// opengl32's Unix side: contexts and the GL command ring.
+    pub gl: Mutex<opengl::State>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
@@ -444,6 +447,7 @@ impl Process {
             keyed: Mutex::new(Default::default()),
             user: Mutex::new(user::User::new()),
             gdi: Mutex::new(Default::default()),
+            gl: Mutex::new(Default::default()),
             kill_list: Mutex::new(Vec::new()),
         }
     }
