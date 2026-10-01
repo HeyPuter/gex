@@ -31,6 +31,8 @@ pub struct NtFile {
     /// Notification): the sync id of the manual-reset state that waits on
     /// the handle see, and whether the subtree counts.
     pub notify: Mutex<Option<(u64, bool)>>,
+    /// Where a rename moved the file (`path` is where it was opened).
+    pub moved_to: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +262,7 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
                 delete_on_close: AtomicBool::new(false),
                 dir: Mutex::new(None),
                 notify: Mutex::new(None),
+                moved_to: Mutex::new(None),
             };
             return Ok((Arc::new(f), 1));
         }
@@ -346,6 +349,7 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
         delete_on_close: AtomicBool::new(options & opt::DELETE_ON_CLOSE != 0),
         dir: Mutex::new(None),
         notify: Mutex::new(None),
+        moved_to: Mutex::new(None),
     };
     if creating || info == 0 || info == 3 {
         changed_path(c, &f.path);
@@ -697,6 +701,40 @@ pub fn nt_set_information_file(c: &mut Call<'_>) -> R {
         }
         // FileAllocationInformation: advisory; the size does not change.
         19 => {}
+        // FileRenameInformation { ReplaceIfExists, RootDirectory,
+        // FileNameLength, FileName[] }
+        10 => {
+            let ps = c.p.abi.ptr_size();
+            let replace = c.g.u8(buf)? != 0;
+            let root = c.g.ptr(buf + ps)? as u32;
+            let n = c.g.u32(buf + 2 * ps)? as usize;
+            let name = c.g.wchars(buf + 2 * ps + 4, n / 2)?;
+            let nt = full_nt_name(c, root, &name)?;
+            let to = match nt_to_target(c, &nt)? {
+                Target::Path(p) => p,
+                _ => return Err(Status(st::OBJECT_PATH_NOT_FOUND)),
+            };
+            let from = f.moved_to.lock().unwrap().clone().unwrap_or_else(|| f.path.clone());
+            let dest = match resolve_ci(c, &to) {
+                Ok(existing) => {
+                    if !replace {
+                        return Err(Status(st::OBJECT_NAME_COLLISION));
+                    }
+                    existing
+                }
+                Err(true) => {
+                    // The parent exists; keep the new leaf name as given.
+                    let (parent, leaf) = to.rsplit_once('/').unwrap_or(("", &to));
+                    let parent = resolve_ci(c, if parent.is_empty() { "/" } else { parent }).map_err(|_| Status(st::OBJECT_PATH_NOT_FOUND))?;
+                    format!("{}/{leaf}", parent.trim_end_matches('/'))
+                }
+                Err(false) => return Err(Status(st::OBJECT_PATH_NOT_FOUND)),
+            };
+            c.kernel().vfs.rename(&from, &dest)?;
+            *f.moved_to.lock().unwrap() = Some(dest.clone());
+            changed_path(c, &from);
+            changed_path(c, &dest);
+        }
         _ => return Err(c.unimplemented(&format!("NtSetInformationFile class {class}"))),
     }
     c.g.iosb(iosb, st::SUCCESS, 0)?;
@@ -1065,7 +1103,8 @@ pub fn nt_flush_buffers_file(c: &mut Call<'_>) -> R {
 /// Close-time work for a file: delete-on-close.
 pub fn on_last_close(k: &mut crate::Kernel, f: &NtFile) {
     if f.delete_on_close.load(Ordering::Relaxed) && f.kind == FileKind::Disk {
-        let _ = if f.is_dir { k.vfs.rmdir(&f.path) } else { k.vfs.unlink(&f.path) };
+        let path = f.moved_to.lock().unwrap().clone().unwrap_or_else(|| f.path.clone());
+        let _ = if f.is_dir { k.vfs.rmdir(&path) } else { k.vfs.unlink(&path) };
     }
 }
 
@@ -1087,6 +1126,7 @@ pub fn console_file(k: &crate::Kernel, fd: i32, access: u32) -> Option<Arc<NtFil
         delete_on_close: AtomicBool::new(false),
         dir: Mutex::new(None),
         notify: Mutex::new(None),
+        moved_to: Mutex::new(None),
     }))
 }
 
