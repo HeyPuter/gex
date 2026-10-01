@@ -224,7 +224,9 @@ fn block_ppc(addr: u64, which: Intrinsic) -> Block {
         }
         // gex-eject's replacements speak the AArch64 and x86-64 calling
         // conventions only; on PowerPC the function did not run, so say so.
-        Intrinsic::Replace(_) => return b.finish(Term::Illegal { raw: 0, pc: addr }),
+        Intrinsic::Replace(_) | Intrinsic::Override(_) => {
+            return b.finish(Term::Illegal { raw: 0, pc: addr })
+        }
     }
     let lr = b.read(GuestReg::Lr);
     let mask = b.const_i32(!3);
