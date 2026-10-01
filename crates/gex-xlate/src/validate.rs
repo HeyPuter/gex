@@ -40,7 +40,15 @@ pub struct Report {
 }
 
 /// Bytes above the entry stack pointer that count as the caller's frame.
-const CALLER_FRAME: u64 = 1 << 20;
+/// Pseudo-random pointers land near a 32-bit stack pointer often enough
+/// that i386 code gets a narrower window.
+fn caller_frame() -> u64 {
+    if crate::arch::compat() {
+        1 << 12
+    } else {
+        1 << 20
+    }
+}
 
 /// Check every function of a program. `seeds` runs per function.
 pub fn check_program(
@@ -87,6 +95,7 @@ pub fn check_function(
         sp: SP_REG,
         max_steps,
         syscall: Some(&syscall),
+        narrow: crate::arch::compat(),
     };
     let ssa = sums.to_ssa(f);
     let own = sums.get(a);
@@ -104,7 +113,11 @@ pub fn check_function(
     };
     for seed in 0..seeds {
         let seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ a;
-        let init = interp::initial_regs(seed, SP_REG);
+        let init = if m.narrow {
+            interp::initial_regs32(seed, SP_REG)
+        } else {
+            interp::initial_regs(seed, SP_REG)
+        };
         let mo = interp::run_from(f, seed, init.clone(), &m);
         rep.runs += 1;
         let so = interp::run_from(&ssa, seed, init.clone(), &m);
@@ -140,7 +153,7 @@ pub fn check_function(
         let sp0 = init[spi];
         let above = |addr: u64| -> Option<i64> {
             let o = addr.wrapping_sub(sp0);
-            (o < CALLER_FRAME).then_some(o as i64)
+            (o < caller_frame()).then_some(o as i64)
         };
         for &w in mo.memory.keys() {
             if let Some(o) = above(w) {
@@ -165,7 +178,7 @@ pub fn check_function(
         for i in 0..N_REGS {
             let r = reg_of_index(i);
             if !own.inputs.contains(r) && i != spi {
-                pert[i] = interp::perturb(r, init[i]);
+                pert[i] = interp::perturb_for(r, init[i], m.narrow);
                 changed.push(i);
             }
         }

@@ -695,6 +695,13 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 /// tier-1.
 #[cfg(feature = "cgen")]
 fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Options) -> Vec<u8> {
+    // gex-cgen is written for x86-64 and AArch64 code (8-byte return
+    // addresses and pointers); recovery now accepts i386, but the function
+    // tier is not validated for it. Refuse it loudly, and ship tier-1.
+    if image.class32 {
+        eprintln!("gex-xlate: --cgen: the function tier does not handle i386 code yet; this image stays tier-1");
+        return wasm.to_vec();
+    }
     let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
     let standin = gex_cgen::use_standin().unwrap_or_else(|e| panic!("function tier (--cgen): {e:#}"));
     let functions = if standin {
