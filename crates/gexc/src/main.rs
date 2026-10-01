@@ -364,7 +364,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
 /// a plain build and `gexc run` serve them with the host builtins, as closure
 /// builds and the browser's runtime translator do, so every path agrees on
 /// what those functions are.
+///
+/// Not for 32-bit (i386) images: `intrinsic::block` reads the 64-bit
+/// register arguments and pops an 8-byte return address, while i386 cdecl
+/// passes them on the stack.
 fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
+    if image.class32 {
+        return Default::default();
+    }
     let (tlo, thi) = image.text_range;
     image
         .symbols
