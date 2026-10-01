@@ -151,8 +151,9 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
     assert_eq!(regs.len(), N_REGS);
     let spi = reg_index(m.sp);
     let mut mem: HashMap<u64, u8> = HashMap::new();
-    let mut written: BTreeMap<u64, u8> = BTreeMap::new();
-    let mut rbw: BTreeSet<u64> = BTreeSet::new();
+    // Hash containers while running; ordered ones in the outcome.
+    let mut written: HashMap<u64, u8> = HashMap::new();
+    let mut rbw: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut read_byte = |mem: &HashMap<u64, u8>, a: u64| -> u8 {
         match mem.get(&a) {
             Some(&b) => b,
@@ -162,7 +163,7 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
             }
         }
     };
-    let mut vals: HashMap<Value, u64> = HashMap::new();
+    let mut vals = Vals(vec![None; f.n_values as usize]);
     let mut calls = 0u64;
     let mut block = BlockId(0);
     // The entry block's parameters hold the context's values.
@@ -175,8 +176,8 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
             return Outcome {
                 stop: $stop,
                 regs,
-                memory: written,
-                read_before_write: rbw,
+                memory: written.into_iter().collect(),
+                read_before_write: rbw.into_iter().collect(),
             };
         }};
     }
@@ -192,7 +193,7 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
         for (p, a) in b.params.iter().zip(&args) {
             vals.insert(p.val, *a);
         }
-        let get = |vals: &HashMap<Value, u64>, v: Value| -> Option<u64> { vals.get(&v).copied() };
+        let get = |vals: &Vals, v: Value| -> Option<u64> { vals.get(&v).copied() };
         for (s, &pc) in b.stmts.iter().zip(&b.pcs) {
             let unsupported = || Stop::Unsupported(pc);
             match s {
@@ -309,7 +310,7 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
         let tv = |v: Value| vals.get(&v).copied();
         let pc = b.term_pc;
         let edge_args =
-            |e: &Edge, vals: &HashMap<Value, u64>| -> Option<Vec<u64>> {
+            |e: &Edge, vals: &Vals| -> Option<Vec<u64>> {
                 e.args.iter().map(|a| vals.get(a).copied()).collect()
             };
         let (next, next_args) = match &b.term {
@@ -370,6 +371,22 @@ pub fn run_from(f: &Function, seed: u64, mut regs: Vec<u64>, m: &Model) -> Outco
     }
 }
 
+/// Every value's number when known, indexed densely by [`Value`].
+struct Vals(Vec<Option<u64>>);
+
+impl Vals {
+    fn get(&self, v: &Value) -> Option<&u64> {
+        self.0.get(v.0 as usize).and_then(|x| x.as_ref())
+    }
+    fn insert(&mut self, v: Value, x: u64) {
+        let i = v.0 as usize;
+        if i >= self.0.len() {
+            self.0.resize(i + 1, None);
+        }
+        self.0[i] = Some(x);
+    }
+}
+
 /// What a modelled call does to the registers.
 fn havoc(regs: &mut [u64], eff: CallEffect, site: u64, calls: u64, spi: usize, narrow: bool) {
     for i in 0..N_REGS {
@@ -387,7 +404,7 @@ fn havoc(regs: &mut [u64], eff: CallEffect, site: u64, calls: u64, spi: usize, n
     };
 }
 
-fn callee_key(c: Callee, vals: &HashMap<Value, u64>) -> u64 {
+fn callee_key(c: Callee, vals: &Vals) -> u64 {
     match c {
         Callee::Direct(a) => a,
         Callee::Indirect(v) => vals.get(&v).copied().unwrap_or(0),
