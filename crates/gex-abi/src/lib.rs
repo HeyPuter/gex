@@ -605,6 +605,11 @@ pub mod imports {
     /// as SIGSEGV at the instruction.
     pub const BRK_GENERAL_PROTECTION: i32 = -6;
 
+    /// Not a `brk`: a `Stmt::Trap` for an x87 exception the control word
+    /// leaves unmasked. gex does not deliver x87 exceptions (a real x87
+    /// would fault at the next x87 instruction), so the host fails loudly.
+    pub const BRK_X87_EXCEPTION: i32 = -7;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";

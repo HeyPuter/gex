@@ -106,6 +106,18 @@ fn get(known: &[Option<u64>], v: Value) -> Option<u64> {
     *known.get(v.0 as usize)?
 }
 
+/// Evaluate a pure scalar expression given the constant value of each
+/// operand (`known[v]`), for analyses outside this module. `None` for an
+/// expression that is not pure scalar arithmetic or has an unknown operand.
+/// Constants themselves evaluate to their value.
+pub fn eval_expr(expr: &Expr, known: &[Option<u64>]) -> Option<u64> {
+    match *expr {
+        Expr::ConstI32(c) => Some(c as u64),
+        Expr::ConstI64(c) => Some(c),
+        _ => eval(expr, known),
+    }
+}
+
 fn eval(expr: &Expr, known: &[Option<u64>]) -> Option<u64> {
     match *expr {
         Expr::ConstI32(_) | Expr::ConstI64(_) => None, // already constant

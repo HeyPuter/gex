@@ -1353,6 +1353,15 @@ fn run_thread_loop(
 /// space per process, no copy-on-write, since wasm cannot fault on a write.
 fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     let pid = req.pid;
+    if let Some(aot) = store.data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
+        if aot.single_process {
+            bail!(
+                "gex-eject: the program forked, and the session {} was ejected from never did: \
+                 its runtime is single-process. Record a session that forks",
+                aot.label
+            );
+        }
+    }
     let cx = store
         .data()
         .spawn
@@ -2359,6 +2368,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if caller.data().nt.is_some() {
                 return nt::syscall_import(&mut caller, pc as u64);
             }
+            // An ejected project's runtime allows only the recorded calls.
+            if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
+                return stop;
+            }
             // Every thread shares the dispatch directory (guest memory) but has
             // its own table, filled only when its own store installs a
             // translation. So a thread can be told to call slot N while its
@@ -2819,6 +2832,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         })
                     }
                 }
+                return Err(StopExecution.into());
+            }
+            // An x87 exception the control word unmasks: not delivered, so
+            // the process dies of SIGFPE, saying so.
+            if imm == gex_abi::imports::BRK_X87_EXCEPTION {
+                caller.data_mut().exit = Some(Exit::Signal {
+                    signal: signal::SIGFPE,
+                    pc: pc as u64,
+                    detail: format!("unmasked x87 floating-point exception at 0x{pc:x}; gex does not deliver x87 exceptions"),
+                    internal: true,
+                });
                 return Err(StopExecution.into());
             }
             caller.data_mut().exit = Some(Exit::Signal {

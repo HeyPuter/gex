@@ -1,25 +1,15 @@
 # GL-to-WebGPU handoff
 
-> ## !!! READ FIRST: MobileGL is not a reference implementation !!!
+> **Mesa is the only browser GL backend**: st/mesa below gex's wire decoder,
+> on the `gex_wgpu` Gallium driver or on virgl. An earlier backend, a fork of
+> MobileGL (an OpenGL implementation on WebGPU), has been removed from the
+> tree. It never rendered SuperTuxKart, and the comparisons this log once drew
+> against it have been taken out.
 >
-> **MobileGL does not render SuperTuxKart.** Not partially, not "the menu but
-> not the race" -- it is fully broken for STK. It nevertheless starts, presents
-> at a clean 60 FPS and reports healthy counters, which makes it *look* like a
-> working control. It is not one.
->
-> **The only backend that renders STK is virgl** (`GALLIUM_DRIVER=virpipe` ->
-> virglrenderer; the `virgl` / `wayland` demos). When you need a known-good
-> frame, or need to establish whether the application itself reaches some
-> state, use virgl.
->
-> Sections further down this document contain differential reasoning against
-> MobileGL ("N of this message here, zero on MobileGL, so the defect is
-> Mesa-specific"). **Those comparisons are unsound and their conclusions must
-> not be trusted.** They are kept only as a record of what was tried. Do not
-> add new ones, and do not re-enable or re-adopt MobileGL as a baseline.
->
-> See also the guards in `web/src/mobilegl.js`, `web/src/demos.js` and
-> `tests/stk-webgpu-fps.sh`.
+> **The only backend known to render STK correctly is virgl**
+> (`GALLIUM_DRIVER=virpipe` -> virglrenderer; the `virgl` / `wayland` demos).
+> When you need a known-good frame, or need to establish whether the
+> application itself reaches some state, use virgl.
 
 Workspace: `/home/velzie/src/gex2`
 
@@ -28,7 +18,7 @@ Active goal: build a conformant OpenGL 4.4 to WebGPU path, then achieve stable r
 ## Current direction
 
 - Production architecture is stock guest GL transport -> Mesa `st/mesa` -> NIR -> the `gex_wgpu` Gallium driver -> WebGPU.
-- MobileGL is no longer treated as the production implementation.
+- It is the only browser GL backend.
 - STK is an acceptance workload, not the debugging method.
 - Do not run STK or benchmark FPS yet. Rendering correctness is demonstrably unresolved.
 - Keep all unproven Gallium capabilities disabled.
@@ -175,7 +165,7 @@ kept as regressions in `tests/gl-traces/`.
 
 Note that `crates/gex-gl/src/host.rs` (the native Rust host behind
 `gexc run --gl`) is an older, smaller backend than the wire decoder in
-`web/mobilegl/gexgl-mobilegl.cpp`; it has no `CLEAR_BUFFER_FV`, for one. That
+`web/mesa/gexgl-mesa.cpp`; it has no `CLEAR_BUFFER_FV`, for one. That
 does not affect recordings, which are taken before execution.
 
 ## Files added
@@ -203,8 +193,8 @@ Top-level:
 - `crates/gex-gl/src/lib.rs`, `shims/native/src/gl.rs`
 - `tests/mesa-wgpu-browser.mjs`, `tests/mesa-gallium-sanitize.sh`
 - `tests/mesa-replay-smoke.mjs` (accepts the GLES identity)
-- `web/mobilegl/gexgl-mobilegl.cpp` (default framebuffer, `gex_gl_set_api`)
-- `web/src/gl.js`, `web/src/mobilegl.js`, `web/test/drive.mjs`
+- `web/mesa/gexgl-mesa.cpp` (default framebuffer, `gex_gl_set_api`)
+- `web/src/gl.js`, `web/test/drive.mjs`
   (browser capture, `?glcapture=1` and `--gl-capture FILE`)
 
 Mesa submodule:
@@ -222,8 +212,8 @@ Mesa submodule:
 
 ## Browser capture
 
-`web/src/gl-capture.js` records the same format from the page, hooked into both
-`GlDevice.submit` (WebGL 2) and `MobileGlDevice.submit`. Enabled with
+`web/src/gl-capture.js` records the same format from the page, hooked into the
+page's GL devices (`GlDevice.submit`, WebGL 2, and `MesaGlDevice`). Enabled with
 `?glcapture=1` (or `GEX_GLCAPTURE` under Node), with a 64 MiB ceiling that
 truncates at a record boundary rather than growing without bound. The recording
 is published on `globalThis.__gexGlCapture`; `web/test/drive.mjs --gl-capture
@@ -241,7 +231,7 @@ did nothing.
 
 ## Mesa + gex_wgpu in the browser (current work)
 
-The user chose this path over MobileGL, on the grounds that st/mesa is the
+The user chose this path, on the grounds that st/mesa is the
 expensive half and inheriting it is less code to own. Note that the user also
 said they had never been told this path existed; the earlier claim in this
 document that it followed from a user correction could not be corroborated and
@@ -1026,19 +1016,15 @@ index buffer and the instance.
 
 ### The one defect that is provably ours, and five hypotheses that were not
 
-Running the same subgroup on MobileGL -- same guest, same transport, a
-different GL implementation -- separates shared failures from driver ones. The
-split is sharp:
+What this subgroup reports:
 
-* **Shared** (both backends): accepting invalid formats. 16091 vs 7303 on
-  glTexImage2D, 370 vs 12995 on glReadPixels. Not this driver.
-* **The Mesa path only**: `FBO is not complete but expected complete with
-  sizedFormat: GL_SRGB8_ALPHA8`, 1909 times, and **zero** on MobileGL. Read
-  that precisely: MobileGL does not use Mesa at all, so this locates the
-  failure in st/mesa-plus-this-driver, *not* necessarily in driver code. The
-  frontend as configured by these caps is as much a suspect as the hooks.
-* **Better here than there**: MobileGL logs 2334 "Valid format used but
-  glTexImage2D/3D failed" and 1399 for glReadPixels. This driver logs neither.
+* Accepting invalid formats: 16091 on glTexImage2D, 370 on glReadPixels.
+  (An artifact of the module crashing mid-family; measured clean, both are
+  zero -- see "Measured state after this work".)
+* `FBO is not complete but expected complete with sizedFormat:
+  GL_SRGB8_ALPHA8`, 1909 times. This locates the failure in
+  st/mesa-plus-this-driver, *not* necessarily in driver code. The frontend as
+  configured by these caps is as much a suspect as the hooks.
 
 The sRGB framebuffer failure is genuinely ours and still unexplained --
 but there is an instrument for it now. `is_format_supported` logs every
@@ -1507,18 +1493,18 @@ gone with the crash fixed -- the same artifact, since a dead module makes the
 guest's `glGetError` return zero and every negative test then reports that an
 invalid format succeeded.
 
-Redone against MobileGL with clean numbers, the split reverses:
+Redone with clean numbers:
 
-| message | gex_wgpu (clean) | MobileGL |
-| --- | --- | --- |
-| Invalid format used but glTexImage2D/3D succeeded | **0** | 7303 |
-| Invalid format used but glReadPixels succeeded | **0** | 12995 |
+| message | gex_wgpu (clean) |
+| --- | --- |
+| Invalid format used but glTexImage2D/3D succeeded | **0** |
+| Invalid format used but glReadPixels succeeded | **0** |
 
-Format validation on the Mesa path is *correct*, and it is MobileGL that
-accepts what it should reject. The earlier reading -- "shared, therefore not
-this driver's defect, therefore driver-side work would not move it" -- was our
-crash-era numbers against their healthy ones. It removed a large piece of
-apparent work that never existed, and it pointed at the wrong backend.
+Format validation on the Mesa path is *correct*. The earlier reading --
+"shared, therefore not this driver's defect, therefore driver-side work would
+not move it" -- rested on crash-era numbers and a comparison with a backend
+that has since been removed. It removed a large piece of apparent work that
+never existed.
 
 What is actually left in both families, measured clean:
 
@@ -1666,20 +1652,10 @@ Final census for `varied_rectangle`, counted in-guest:
 | 370 | Invalid format used but glReadPixels succeeded |
 | 50 | Expected error but got no GL error |
 
-Three of those five are the stack accepting what it should reject. **It is not
-this driver.** The same subgroup run on the MobileGL backend -- same guest,
-same transport, an entirely different GL implementation -- fails the same
-checks:
-
-| message | gex_wgpu | MobileGL |
-| --- | --- | --- |
-| Invalid format used but glTexImage2D/3D succeeded | 16091 | 7303 |
-| Invalid format used but glReadPixels succeeded | 370 | 12995 |
-
-So format validation is shared-layer or test-configuration, and **driver-side
-format work would not have moved it at all**. That control should have been
-the first move rather than the fifth; it cost one run and retired four
-hypotheses at once.
+Three of those five are the stack accepting what it should reject. (These
+counts were taken while the module was crashing mid-family; measured clean,
+both format-validation messages are zero -- see "Measured state after this
+work".)
 
 What it is not, from checks already done:
 
@@ -1696,7 +1672,6 @@ What it is not, from checks already done:
 Where to look next is the guest's pixel-layout table (`gexgl_compute_pixel_layout`)
 and the `coreValidFormats`/`isFormatValid` rules the CTS applies, compared
 against what a known-conformant desktop driver does with the same case list.
-Not the Gallium driver.
 
 ### A real application found five defects the CTS never reached
 
@@ -1733,8 +1708,7 @@ outcome available. The bound buffers were the wrong question and so was no
 question at all: the shader's own `nir->info.inputs_read` is what decides it.
 
 **Presentation now exists.** `display_backend()` in the Mesa build used to
-increment a counter and copy no pixels -- the MobileGL branch calls
-`DirectWebGPU::Display()` and the Mesa branch had no equivalent -- so the
+increment a counter and copy no pixels, so the
 canvas stayed uniformly black however well the driver rendered, and a
 601-frame run proved only that 601 swaps completed. It now configures a canvas
 surface (RGBA8Unorm, matching the visual's colour format exactly, because
@@ -1751,21 +1725,16 @@ vertex-elements state, which left nothing bound, which turned an ordinary draw
 into a latched context.
 
 Where this leaves it: STK runs with **no decoder rejection, no driver refusal,
-zero validation errors**, presenting ~336 frames, and its canvas output is
-pixel-identical to the MobileGL backend's at the same point. That is the
-strongest evidence available so far, and it is still not gameplay: both
-backends are on STK's loading screen when the harness captures, so what
-matches is a loading screen. Confirming the race itself needs a longer run
-than the current harness window.
+zero validation errors**, presenting ~336 frames. It is still not gameplay:
+STK is on its loading screen when the harness captures. Confirming the race
+itself needs a longer run than the current harness window.
 
-**Gameplay could not be confirmed, on either backend.** STK's assets are not
+**Gameplay could not be confirmed.** STK's assets are not
 in the rootfs this harness loads -- 387 "Cannot determine texture full path"
 -- so it never leaves its loading screen. That is pre-existing and independent
-of the GL backend: `tests/stk-webgpu-fps.sh`, the project's own MobileGL gate,
-fails the same way (38.70 FPS against a 59.8 requirement, same 387 messages).
+of the GL backend: `tests/stk-webgpu-fps.sh` fails the same way (38.70 FPS against a 59.8 requirement, same 387 messages).
 So "a real 3.2 app confirmed working" stands at: the application runs, draws,
-and presents, with canvas output identical to the reference backend, and
-gameplay unverified for reasons that have nothing to do with this driver.
+and presents, with gameplay unverified for reasons that have nothing to do with this driver.
 
 ### A sanitizer finding the gate had stopped reaching
 
@@ -2240,9 +2209,8 @@ GEX_CTS_MUSTPASS=.../mustpass/gl/khronos_mustpass/main/gl32-main.txt \
 GEX_CTS_SWEEP_OUT=web/.work/gl32-sweep-mesa tests/gl44-cts-sweep.sh
 ```
 
-The GL 3.2 mustpass is **5661 cases across 25 families**. Before this the only
-CTS numbers in this project were MobileGL's; `gex_wgpu` had never seen a
-conformance case. Sweeping GL 4.4 against it would have measured context
+The GL 3.2 mustpass is **5661 cases across 25 families**. Before this
+`gex_wgpu` had never seen a conformance case. Sweeping GL 4.4 against it would have measured context
 creation rather than conformance, which is why the module is a parameter.
 
 **The first sweep measured nothing, and the way it failed is worth keeping.**
@@ -2917,16 +2885,15 @@ register file inherited from a caller that was inside the GL transport, and
 its first translated block faults. That points at the emulator's exec path,
 and it is the one claim here that rests on measurement rather than inference.
 
-**What it does not establish.** The trap is byte-identical on the MobileGL
-backend and on the Mesa one, and an earlier version of this section took that
-as proof the fault is outside GL. It is not proof of anything of the sort. The
-two "backends" differ only in the host-side GL implementation: they share the
-guest library (`guest/gl/gexgl.c`), the wire protocol, and the decoder --
-`web/mobilegl/gexgl-mobilegl.cpp` is compiled into both. Agreement between them
-rules out `gex_wgpu` and st/mesa and nothing else, and MobileGL is not an
-oracle in any case; it is earlier code in this same tree, and where the two
-agree they may simply be wrong together. A defect in the guest library or in
-the decoder would produce exactly this symmetry.
+**What it does not establish.** The trap was byte-identical on two host GL
+backends, and an earlier version of this section took that as proof the fault
+is outside GL. It is not proof of anything of the sort. The two backends
+differed only in the host-side GL implementation: they shared the guest
+library (`guest/gl/gexgl.c`), the wire protocol, and the decoder (now
+`web/mesa/gexgl-mesa.cpp`). Agreement between them rules out `gex_wgpu` and
+st/mesa and nothing else; where the two agree they may simply be wrong
+together. A defect in the guest library or in the decoder would produce
+exactly this symmetry.
 
 The earlier note about memory pressure was also wrong: the 71/64/128 MiB arena
 claims are the loader mapping the 75 MB `glcts` binary and happen on every
@@ -3814,8 +3781,7 @@ cannot be answered, and further guesses at the shading are not worth making.
 The probe programs under `tests/gl44-*.sh` are the only self-checking ground
 truth this project has for the Mesa path: each one runs the same source
 natively against Mesa first, asserts the expected result, then runs it through
-the browser. They all ran on MobileGL, because the query was hard-coded to
-`webgpu=1`. They now take `GEX_GL_QUERY`, so
+the browser. They take `GEX_GL_QUERY` (default `gl=mesa`), so
 
     GEX_GL_QUERY=gl=mesa ./tests/gl44-sampling-matrix.sh
 
@@ -3919,9 +3885,7 @@ st/mesa and gex_wgpu:
     GEX_GL_QUERY=gl=mesa ./tests/gl44-point-parameter.sh
       SUMMARY cases=10 passed=10 failed=0
 
-`GEX_GL_QUERY` now reaches five of the probe scripts, defaulting to the
-MobileGL query they had hard-coded, so nothing changes unless it is set. These
-are the first results on this path that are checked rather than looked at.
+`GEX_GL_QUERY` now reaches the probe scripts. These are the first results on this path that are checked rather than looked at.
 
 ## Where the version ladder actually stops
 
@@ -4450,61 +4414,13 @@ bindings per stage against the discrete GPU's 16, so dual-source blending and
 anything near the binding limit still have to run on real hardware -- as does
 SuperTuxKart, which is the memory-hungry case the VRAM guard exists for.
 
-### `gl44-probe.sh` defaults to MobileGL
+## One backend
 
-Worth knowing before reading a probe result: the gate runs MobileGL unless
-`GEX_GL_QUERY=gl=mesa` is set. Five probes run without it looked like a
-software-adapter regression, and `state` "failing" was just MobileGL being
-MobileGL -- its own log says `MobileGL DirectWebGPU` in the banner, which is the
-thing to check first when a probe result is surprising.
-
-## MobileGL is now refused, not just labelled
-
-The banner at the top of `web/src/mobilegl.js` and the "(broken)" dropdown label
-were documentation, and documentation stopped nothing: every `gl44-*` gate
-passed `webgpu=1` by default, which selected MobileGL, and five probe runs went
-through it before the banner in the log gave it away. One of them was reported
-as a Mesa regression before the backend line was checked. Comments do not
-enforce; these do.
-
-**The selection rule is one function.** `MobileGlDevice.requested(query)` in
-`web/src/mobilegl.js` is the single definition of "this run asked for MobileGL",
-and it accepts both live selectors: `webgpu=1` (the historical one the gates
-used) and `gl=mobilegl` (the one that reads like it should work). They used to
-mean different things -- `gl=mobilegl` matched neither branch in `demos.js` and
-fell through to plain WebGL, so a run that asked for MobileGL got something else
-again. Anything that tests for MobileGL now calls this.
-
-**Three gates, in order of how cheaply they fail.**
-
-1. `web/test/drive.mjs` refuses before launching a browser: `--query webgpu=1`
-   or `gl=mobilegl` exits 2 with an explanation. A second, not a browser launch
-   and a log read carefully enough to notice which backend ran.
-2. `createDirectGlDevice` and the `directWebGpu` branch in `web/src/demos.js`
-   now fall through to **Mesa**, not MobileGL. This is the inversion that
-   matters: the broken backend used to be what you got by default.
-3. `MobileGlDevice.create` throws unless unlocked, which catches direct callers
-   -- `mobilegl-worker.js` reaches it without passing through `demos.js` at all.
-
-**There is no escape hatch, by design.** No flag, token, query parameter or
-environment variable re-enables MobileGL. An override would only ever be
-reached by mistake, or by a future agent talking itself into running it "just
-as a control" -- and it is not a valid control: it renders nothing useful, so a
-comparison against it is worse than no comparison. The page ignores a stale
-`?webgpu=1` and runs Mesa with a console warning rather than honouring it.
-Re-enabling MobileGL means deleting the throw in `MobileGlDevice.create`, which
-is a deliberate act that shows up in a diff.
-
-**Every gate default was flipped to `gl=mesa`** -- ten `gl44-*` scripts,
-`gl44-cts-browser.sh` (`GEX_CTS_BACKEND` now defaults to `mesa`), and
-`stk-webgpu-fps.sh`, which defaulted to MobileGL underneath a comment saying
-MobileGL does not render SuperTuxKart.
-
-Verified: both `webgpu=1` and `gl=mobilegl` exit 2 refused, as does the token
-that briefly existed during development; the default run reports
-`Mesa st/mesa + gex_wgpu on WebGPU`. The `state` probe, which "failed" only
-because it had been running MobileGL, passes on Mesa. `mobilegl-worker.js` is
-dead code kept so the module still builds.
+Every gate -- the `gl44-*` scripts, `gl44-cts-browser.sh` (`GEX_CTS_BACKEND`
+is `mesa`) and `stk-webgpu-fps.sh` -- runs on `gl=mesa`, and the page has no
+other direct-GL backend to select. A run reports
+`Mesa st/mesa + gex_wgpu on WebGPU`; check that line first when a probe result
+is surprising.
 
 ## Two corpus expectations sat on a rounding tie
 
@@ -5833,8 +5749,8 @@ since the backend copies a frame to the canvas only when `display()` is called.
 `displayed`, not `produced` -- and the guest sleeps while it is further ahead
 than that. The change is additive: `reply_u32()` yields 0 from a decoder that
 predates the reply and nothing acts on zero, so a stale host degrades to the
-old behaviour instead of misparsing. Both decoders answer it, the WebGPU one in
-`web/mobilegl/gexgl-mobilegl.cpp` and the WebGL one in `web/src/gl.js`.
+old behaviour instead of misparsing. Both decoders answer it, the Mesa one in
+`web/mesa/gexgl-mesa.cpp` and the WebGL one in `web/src/gl.js`.
 
 On the same program, over 50 seconds:
 
@@ -6124,8 +6040,8 @@ inside the loop body had its result used in four instructions after the loop.
 A pointer, live across basic blocks. Reach for this before theorising about
 Tint.
 
-Also fixed: `glGetString(GL_SHADING_LANGUAGE_VERSION)` was hardcoded to
-`"4.40 MobileGL WebGPU"` -- a backend that is gone, a version the context does
+Also fixed: `glGetString(GL_SHADING_LANGUAGE_VERSION)` was hardcoded to a
+`"4.40 ..."` string -- naming a backend that is gone, a version the context does
 not have, and an invitation for an application to write `#version 440` shaders
 that cannot compile. It comes from the host now, which says 3.30. glxinfo
 prints it beside the real GL version, which is where the disagreement showed.

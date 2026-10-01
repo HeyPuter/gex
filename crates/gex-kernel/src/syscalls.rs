@@ -470,6 +470,9 @@ pub struct Kernel {
     /// splits: the host waits for a connection to arrive, and the work
     /// happens back here.
     pub retry_accept: Option<(i32, u64, u64, u64)>,
+    /// A write parked as a blocking operation: its `EPIPE`, when it comes
+    /// back through `finish_blocking`, raises SIGPIPE as a direct one does.
+    pub write_blocked: bool,
     /// A `recvmsg` on a blocking socket with nothing to read: the fd and the
     /// `msghdr`, re-run once the socket becomes readable. Like `retry_accept`,
     /// the real work waits for the kernel lock (the msghdr may carry
@@ -636,6 +639,21 @@ pub const ITIMER_PROF: usize = 2;
 /// panics there -- so the browser host passes its own, and everything else
 /// gets [`system_clock`].
 pub type ClockFn = fn() -> (u64, u32);
+
+/// Whether an `EPIPE` from syscall `n` also raises SIGPIPE, as Linux does
+/// for a write to a pipe or stream socket with no reader -- except a `send`
+/// with `MSG_NOSIGNAL`. (A shell pipeline's `yes | head` ends with the
+/// writer killed by it; without it the writer sees EPIPE and complains.)
+fn raises_sigpipe(n: u64, a: &[u64; 6]) -> bool {
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    match n {
+        nr::WRITE | nr::WRITEV | nr::PWRITE64 | nr::SENDFILE => true,
+        nr::SENDTO => a[3] & MSG_NOSIGNAL == 0,
+        nr::SENDMSG => a[2] & MSG_NOSIGNAL == 0,
+        nr::SENDMMSG => a[3] & MSG_NOSIGNAL == 0,
+        _ => false,
+    }
+}
 
 /// Read a `struct timeval` -- seconds then microseconds -- as nanoseconds.
 fn read_timeval(m: &GuestMem<'_>, at: u64) -> Result<u128, Errno> {
@@ -1069,6 +1087,7 @@ impl Kernel {
             clock: system_clock,
             itimers: [None; 3],
             retry_accept: None,
+            write_blocked: false,
             retry_recvmsg: None,
             restore_sigmask: None,
             started: 0,
@@ -1289,6 +1308,7 @@ impl Kernel {
             // A fork does not inherit its parent's timers.
             itimers: [None; 3],
             retry_accept: None,
+            write_blocked: false,
             retry_recvmsg: None,
             restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
@@ -1672,6 +1692,7 @@ impl Kernel {
                     eprintln!("[gex:{}] {} blocking", self.pid, syscall_name(n));
                 }
             }
+            self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
             return SyscallOutcome::Blocking(op);
         }
 
@@ -1699,6 +1720,11 @@ impl Kernel {
         } else {
             self.dispatch(m, n, a)
         };
+        if let Ok(Err(Errno::EPIPE)) = &outcome {
+            if raises_sigpipe(n, &a) {
+                self.signals.raise(crate::signal::sig::SIGPIPE);
+            }
+        }
         let ret = match &outcome {
             Ok(r) => match r {
                 Ok(v) if post != crate::i386::Post::None => encode(Ok(post.finish(m, *v))),
@@ -2059,6 +2085,9 @@ impl Kernel {
         // has to carry it -- restoring it here instead would block the very
         // signal that ended the wait, leaving it pending forever.
         let suspended = self.restore_sigmask.take();
+        if std::mem::take(&mut self.write_blocked) && r == Err(Errno::EPIPE) {
+            self.signals.raise(crate::signal::sig::SIGPIPE);
+        }
         let ret = encode(r);
         let _ = set_result(m, self.ctx_addr, ret);
         if let Some(mask) = suspended {
@@ -2161,7 +2190,7 @@ impl Kernel {
             // call is still better than refusing it -- apt sets the time on
             // a file it has just downloaded, and treats the failure as a
             // failure of the download.
-            nr::UTIMENSAT => self.sys_utimensat(m, a[0] as i32, a[1], a[3] as u32),
+            nr::UTIMENSAT => self.sys_utimensat(m, a[0] as i32, a[1], a[2], a[3] as u32),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
             nr::UMASK => {
@@ -4120,22 +4149,47 @@ impl Kernel {
 
     /// `utimensat(dirfd, path, times, flags)`: set a file's timestamps.
     ///
-    /// gex does not persist file times, but must still answer honestly for
-    /// *existence*: a NULL path validates the descriptor (`futimens`); a real
-    /// path must resolve or the call is `ENOENT`. A blanket `Ok(0)` broke
-    /// `touch`, which creates a file only when `utimensat` fails.
-    fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
+    /// gex keeps one time per file, the modification time (`stat` reports
+    /// it for all three), so the access time in `times` is checked and
+    /// dropped. `times` NULL or `UTIME_NOW` means now; `UTIME_OMIT` leaves
+    /// the time alone. A missing path is `ENOENT`, which `touch` relies on
+    /// to create the file. A NULL path is `futimens` on `dirfd`, whose
+    /// descriptor is validated; its time is not kept (an open file's name
+    /// is not tracked).
+    fn sys_utimensat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, times: u64, flags: u32) -> SysResult {
         const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        const UTIME_NOW: u64 = (1 << 30) - 1;
+        const UTIME_OMIT: u64 = (1 << 30) - 2;
+        // The modification time to set, if any.
+        let mtime = if times == 0 {
+            Some((self.clock)().0 as i64)
+        } else {
+            for t in [times, times + 16] {
+                let ns = m.read_u64(t + 8)?;
+                if ns >= 1_000_000_000 && ns != UTIME_NOW && ns != UTIME_OMIT {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            match m.read_u64(times + 24)? {
+                UTIME_OMIT => None,
+                UTIME_NOW => Some((self.clock)().0 as i64),
+                _ => Some(m.read_u64(times + 16)? as i64),
+            }
+        };
         if path == 0 {
             // futimens: the "path" is really the open descriptor in `dirfd`.
             self.fds.get(dirfd)?;
             return Ok(0);
         }
         let p = self.at_path(m, dirfd, path)?;
-        if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            self.vfs.metadata_nofollow(&p)?;
-        } else {
+        let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+        if follow {
             self.vfs.metadata(&p)?;
+        } else {
+            self.vfs.metadata_nofollow(&p)?;
+        }
+        if let Some(t) = mtime {
+            self.vfs.set_mtime(&p, t, follow)?;
         }
         Ok(0)
     }

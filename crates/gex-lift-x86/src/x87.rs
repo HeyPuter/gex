@@ -7,8 +7,9 @@
 //! `(top + i) & 7`.
 //!
 //! Moving values is done here: register-to-register copies, `fxch`,
-//! `fchs`/`fabs`, `fcmov`, the environment. Everything the x87 rounds, and
-//! everything that converts between formats, the host computes exactly
+//! `fchs`/`fabs`, `fcmov`, the environment; so are the conversions to and
+//! from memory formats (`fld`, `fst`, `fild`, `fist`, the constants), in
+//! `x87conv`. The arithmetic the host computes exactly
 //! (`gex_kernel::x86::serve_x87` on `gex_kernel::f80`), honouring the
 //! precision and rounding control of the control word and raising the
 //! exception flags: the lifter hands it an [`crate::x87op`] word through
@@ -29,7 +30,7 @@ const C1: u32 = 1 << 9;
 type Ext = (Value, Value);
 
 impl<'a> Lifter<'a> {
-    fn top(&mut self) -> Value {
+    pub(crate) fn top(&mut self) -> Value {
         self.b.read(GuestReg::X87Top)
     }
 
@@ -90,7 +91,7 @@ impl<'a> Lifter<'a> {
     }
 
     /// `st(i)`.
-    fn ld_st(&mut self, i: u8) -> Ext {
+    pub(crate) fn ld_st(&mut self, i: u8) -> Ext {
         let top = self.top();
         let a = self.st_addr(top, i);
         self.ld_ext(a, 0)
@@ -103,7 +104,7 @@ impl<'a> Lifter<'a> {
     }
 
     /// Push `v` onto the stack.
-    fn push_st(&mut self, v: Ext) {
+    pub(crate) fn push_st(&mut self, v: Ext) {
         let top = self.top();
         let seven = self.k32(7);
         let ntop = self.b.bin(BinOp::Add, Ty::I32, top, seven);
@@ -119,7 +120,7 @@ impl<'a> Lifter<'a> {
         self.b.write(GuestReg::X87Tags, tags);
     }
 
-    fn pop_st(&mut self) {
+    pub(crate) fn pop_st(&mut self) {
         let top = self.top();
         let tags = self.b.read(GuestReg::X87Tags);
         let one = self.k32(1);
@@ -202,53 +203,6 @@ impl<'a> Lifter<'a> {
             self.b.stmt(Stmt::Store {
                 addr: tmp,
                 offset: 8,
-                val: se,
-                sz: MemSz::B2,
-                order: Order::Relaxed,
-            });
-        }
-        Some(())
-    }
-
-    /// Copy the host's result from `X87_TMP` to the memory operand.
-    fn x87_mem_out(&mut self, o: Operand, m: X87Mem) -> Option<()> {
-        let Operand::Mem(mem) = o else {
-            return None;
-        };
-        let (addr, offset) = self.addr(&mem);
-        let tmp = self.x87_tmp();
-        let (sz, ty) = match m {
-            X87Mem::F32 | X87Mem::I32 => (MemSz::B4, Ty::I32),
-            X87Mem::I16 => (MemSz::B2, Ty::I32),
-            X87Mem::F64 | X87Mem::I64 | X87Mem::F80 => (MemSz::B8, Ty::I64),
-        };
-        let v = self.b.def(Expr::Load {
-            addr: tmp,
-            offset: 0,
-            sz,
-            signed: false,
-            ty,
-            order: Order::Relaxed,
-        });
-        self.b.stmt(Stmt::Store {
-            addr,
-            offset,
-            val: v,
-            sz,
-            order: Order::Relaxed,
-        });
-        if m == X87Mem::F80 {
-            let se = self.b.def(Expr::Load {
-                addr: tmp,
-                offset: 8,
-                sz: MemSz::B2,
-                signed: false,
-                ty: Ty::I32,
-                order: Order::Relaxed,
-            });
-            self.b.stmt(Stmt::Store {
-                addr,
-                offset: offset + 8,
                 val: se,
                 sz: MemSz::B2,
                 order: Order::Relaxed,
@@ -350,30 +304,11 @@ impl<'a> Lifter<'a> {
     pub(crate) fn x87(&mut self, i: &Inst) -> Flow {
         self.cur_mem = i.ops[0].unwrap_or(Operand::Imm(0));
         match i.op {
-            Op::Fld(m) | Op::Fild(m) => {
-                if self.x87_mem_in(i.op0(), m).is_none() {
-                    return self.illegal_x87();
-                }
-                self.x87_host(x87op::FLD | Self::mem_code(m));
-            }
-            Op::Fst { mem, pop } => {
-                self.x87_host(x87op::FST | Self::mem_code(mem));
-                if self.x87_mem_out(i.op0(), mem).is_none() {
-                    return self.illegal_x87();
-                }
-                if pop {
-                    self.pop_st();
-                }
-            }
-            Op::Fist { mem, pop, truncate } => {
-                self.x87_host(x87op::FST | Self::mem_code(mem) | if truncate { x87op::TRUNC } else { 0 });
-                if self.x87_mem_out(i.op0(), mem).is_none() {
-                    return self.illegal_x87();
-                }
-                if pop {
-                    self.pop_st();
-                }
-            }
+            // The conversions are inline (see `x87conv`): they are most of
+            // what compiled code does with the x87.
+            Op::Fld(m) | Op::Fild(m) => return self.x87_fld_mem(i.op0(), m),
+            Op::Fst { mem, pop } => return self.x87_fst_mem(i.op0(), mem, pop, false, false),
+            Op::Fist { mem, pop, truncate } => return self.x87_fst_mem(i.op0(), mem, pop, truncate, true),
             Op::FldSt(n) => {
                 let v = self.ld_st(n);
                 self.push_st(v);
@@ -433,7 +368,7 @@ impl<'a> Lifter<'a> {
             Op::Ftst => self.x87_host(x87op::FTST),
             Op::Fxam => self.x87_host(x87op::FXAM),
             Op::Fld1 | Op::Fldl2t | Op::Fldl2e | Op::Fldpi | Op::Fldlg2 | Op::Fldln2 | Op::Fldz => {
-                let k: u64 = match i.op {
+                let k = match i.op {
                     Op::Fld1 => 0,
                     Op::Fldl2t => 1,
                     Op::Fldl2e => 2,
@@ -442,7 +377,7 @@ impl<'a> Lifter<'a> {
                     Op::Fldln2 => 5,
                     _ => 6,
                 };
-                self.x87_host(x87op::FLDCONST | k << x87op::K_SHIFT);
+                return self.x87_fld_const(k);
             }
             Op::Fdecstp => {
                 let top = self.top();
@@ -471,7 +406,7 @@ impl<'a> Lifter<'a> {
             }
             Op::Fldcw => {
                 let v = self.rd(i.op0(), Width::W);
-                self.b.write(GuestReg::X87Cw, v);
+                self.x87_set_cw(v);
             }
             Op::Fnstcw => {
                 let v = self.b.read(GuestReg::X87Cw);
@@ -571,6 +506,17 @@ impl<'a> Lifter<'a> {
             _ => return self.illegal_x87(),
         }
         Flow::Next
+    }
+
+    /// Load the control word as the hardware keeps it: bits 7 and 13-15
+    /// read back as zero, reserved bit 6 as one (`fldcw 0x23f` stores
+    /// 0x27f).
+    pub(crate) fn x87_set_cw(&mut self, v: Value) {
+        let keep = self.k32(0x1f3f);
+        let v = self.b.bin(BinOp::And, Ty::I32, v, keep);
+        let one = self.k32(0x40);
+        let v = self.b.bin(BinOp::Or, Ty::I32, v, one);
+        self.b.write(GuestReg::X87Cw, v);
     }
 
     /// `fninit`'s state: control word 0x37f, status and tags clear, TOP 0.
@@ -720,7 +666,7 @@ impl<'a> Lifter<'a> {
                 this.b.def(Expr::Load { addr, offset, sz: MemSz::B2, signed: false, ty: Ty::I32, order: Order::Relaxed })
             };
             let cw = ld16(self, 0);
-            self.b.write(GuestReg::X87Cw, cw);
+            self.x87_set_cw(cw);
             let sw = ld16(self, stride);
             let eleven = self.k32(11);
             let t = self.b.bin(BinOp::ShrU, Ty::I32, sw, eleven);
@@ -757,7 +703,7 @@ impl<'a> Lifter<'a> {
         }
     }
 
-    fn illegal_x87(&self) -> Flow {
+    pub(crate) fn illegal_x87(&self) -> Flow {
         Flow::End(Term::Illegal {
             raw: self.raw,
             pc: self.pc,
