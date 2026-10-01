@@ -130,6 +130,15 @@ pub struct Context<'a> {
 }
 
 
+/// `GEX_BSWAP_BALLAST`: extra byte-swap pairs per swap, for pricing the
+/// swaps of a big-endian guest (see `Emitter::emit_bswap`). Zero normally.
+fn bswap_ballast() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GEX_BSWAP_BALLAST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
 /// How many blocks may go into one region. One turns regions off.
 fn region_limit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -2188,6 +2197,18 @@ impl<'a> Emitter<'a> {
     /// two shifts, two masks and an or; 64 bits a `pshufb`-shaped swizzle,
     /// which beats the eleven-op scalar sequence and its two 64-bit masks.
     fn emit_bswap(&mut self, op: UnOp, ty: Ty) {
+        // Measurement only: `GEX_BSWAP_BALLAST=N` emits every swap 2N more
+        // times, which leaves the value right (an even number of extra
+        // swaps) and prices one swap as half the time each N adds. A guest
+        // without swaps cannot run at all -- its argv and every initialised
+        // word would read backwards -- so a no-swap build is no baseline.
+        for _ in 0..2 * bswap_ballast() {
+            self.emit_bswap_once(op, ty);
+        }
+        self.emit_bswap_once(op, ty);
+    }
+
+    fn emit_bswap_once(&mut self, op: UnOp, ty: Ty) {
         const I32_AND: u8 = 0x71;
         const I32_OR: u8 = 0x72;
         const I32_SHL: u8 = 0x74;
@@ -2235,7 +2256,7 @@ impl<'a> Emitter<'a> {
             }
             (UnOp::Bswap16, Ty::I64) => {
                 self.f.byte(code::I32_WRAP_I64);
-                self.emit_bswap(UnOp::Bswap16, Ty::I32);
+                self.emit_bswap_once(UnOp::Bswap16, Ty::I32);
                 self.f.byte(code::I64_EXTEND_I32_U);
             }
             _ => unreachable!("byte swap of a {ty:?}"),
