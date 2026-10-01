@@ -4,10 +4,12 @@
 //!
 //! These are most of what the x87 does in compiled code (every float or
 //! double a 32-bit function returns goes through `st(0)`), so they must not
-//! cost a host call. Each is exact: the same results, exception flags and
-//! C1 as `gex_kernel::f80` (whose tests check it against the hardware),
-//! computed with integer operations on the register's significand and
-//! sign/exponent word. Stack overflow and underflow are handled as the host
+//! cost a state-flushing host call. Each is exact: the same results,
+//! exception flags and C1 as `gex_f80` (whose tests check it against the
+//! hardware). The loads widen with integer IR here; the stores that round
+//! (`fst m32/m64`, `fist`) are a pure `Stmt::X87`, which the backend lowers
+//! to a fast path for the common operands and the exact algorithm for the
+//! rest. Stack overflow and underflow are handled as the host
 //! handles them; an exception the control word leaves unmasked fails loudly
 //! through `Stmt::Trap` (gex does not deliver x87 exceptions).
 
@@ -18,9 +20,6 @@ use gex_isa_x86::{Operand, X87Mem};
 /// Status-word exception bits.
 const IE: u32 = 1;
 const DE: u32 = 2;
-const OE: u32 = 8;
-const UE: u32 = 16;
-const PE: u32 = 32;
 const SF: u32 = 64;
 /// C1's bit in the status word.
 const C1_BIT: u32 = 9;
@@ -107,17 +106,6 @@ impl<'a> Lifter<'a> {
         let want = self.b32(BinOp::Sub, two, sign);
         let away = self.c32(CmpOp::Eq, rc, want);
         (near, away)
-    }
-
-    /// Whether to round a magnitude up: to nearest when the dropped bits are
-    /// over half an ulp, or exactly half with the kept part odd; away from
-    /// zero whenever any dropped bit is set.
-    fn x87_round_up(&mut self, (near, away): (Value, Value), inexact: Value, gt: Value, eq: Value, odd: Value) -> Value {
-        let tie_odd = self.and32(eq, odd);
-        let n = self.or32(gt, tie_odd);
-        let n = self.and32(near, n);
-        let a = self.and32(away, inexact);
-        self.or32(n, a)
     }
 
     /// Fold an operation's exceptions into the status word, set C1 (an I32
@@ -350,266 +338,21 @@ impl<'a> Lifter<'a> {
 
     // -- stores ---------------------------------------------------------------
 
-    /// The fields of an extended value for the stores: (sign, unbiased
-    /// exponent as an I64 -- a denormal's taken as the minimum, -16382 --,
-    /// whether it is a finite number the formats can represent (J set, or a
-    /// denormal), a NaN, an SNaN, infinity, zero, unsupported).
-    fn x87_classify(&mut self, sig: Value, se: Value) -> Class80 {
-        let m = self.k32(0x7fff);
-        let e15 = self.and32(se, m);
-        let fifteen = self.k32(15);
-        let sign = self.b32(BinOp::ShrU, se, fifteen);
+    /// A pure [`Stmt::X87`] conversion of `(sig, se)` under the current
+    /// control word: (result `I64`, exception flags `I32`, C1 as an `I32`
+    /// 0/1). The backend computes it -- inline for the common operands, the
+    /// exact host algorithm otherwise.
+    fn x87_op(&mut self, op: X87Op, sig: Value, se: Value) -> (Value, Value, Value) {
+        let cw = self.b.read(GuestReg::X87Cw);
+        let outs = self.b.x87(op, vec![sig, se, cw]);
+        let (r, sw) = (outs[0], outs[1]);
+        let m = self.k32(0x7f);
+        let flags = self.and32(sw, m);
+        let n = self.k32(C1_BIT);
+        let c1 = self.b32(BinOp::ShrU, sw, n);
         let one = self.k32(1);
-        let sign = self.and32(sign, one);
-        let z32 = self.k32(0);
-        let z64 = self.k64(0);
-        let is_max = self.c32(CmpOp::Eq, e15, m);
-        let is_e0 = self.c32(CmpOp::Eq, e15, z32);
-        let sixty3 = self.k64(63);
-        let j = self.b64(BinOp::ShrU, sig, sixty3);
-        let j = self.b.wrap(j);
-        let nj = self.not1(j);
-        let sig0 = self.c64(CmpOp::Eq, sig, z64);
-        let zero = self.and32(is_e0, sig0);
-        let shl1 = self.k64(1);
-        let low = self.b64(BinOp::Shl, sig, shl1);
-        let low0 = self.c64(CmpOp::Eq, low, z64);
-        let inf = self.and32(is_max, j);
-        let inf = self.and32(inf, low0);
-        let nan = self.and32(is_max, j);
-        let lown = self.not1(low0);
-        let nan = self.and32(nan, lown);
-        let qb = self.k64(1 << 62);
-        let qbit = self.b64(BinOp::And, sig, qb);
-        let qclear = self.c64(CmpOp::Eq, qbit, z64);
-        let snan = self.and32(nan, qclear);
-        // Unsupported: J clear with a nonzero exponent (unnormals,
-        // pseudo-NaNs and pseudo-infinities).
-        let ne0 = self.not1(is_e0);
-        let unsupported = self.and32(ne0, nj);
-        // Unbiased exponent, a denormal's as -16382.
-        let e15_64 = self.b.extend(e15, false);
-        let bias = self.k64(16383);
-        let e = self.b64(BinOp::Sub, e15_64, bias);
-        let dmin = self.k64((-16382i64) as u64);
-        let e = self.s64(is_e0, dmin, e);
-        let special = self.or32(is_max, unsupported);
-        let special = self.or32(special, zero);
-        let finite = self.not1(special);
-        Class80 {
-            sign,
-            e,
-            finite,
-            nan,
-            snan,
-            inf,
-            zero,
-            unsupported,
-        }
-    }
-
-    /// Round an extended value to single or double: (raw bits in an I64,
-    /// flags, C1), as `gex_kernel::f80::store` does.
-    fn x87_narrow(&mut self, sig: Value, se: Value, f: Fmt) -> (Value, Value, Value) {
-        let c = self.x87_classify(sig, se);
-        let mode = self.x87_mode(c.sign);
-        let exp_bits = f.bits - 1 - f.frac;
-        let max_field = (1i64 << exp_bits) - 1; // all ones
-        let emin = 1 - f.bias;
-        let z64 = self.k64(0);
-        let z32 = self.k32(0);
-        let one64 = self.k64(1);
-
-        // Bits dropped: the extra significand bits, and for a result below
-        // the normal range as many more as it falls short.
-        let base_drop = (63 - f.frac) as i64;
-        let eminv = self.k64(emin as u64);
-        let short = self.b64(BinOp::Sub, eminv, c.e); // > 0: denormal
-        let is_den = self.c64(CmpOp::GtS, short, z64);
-        let extra = self.s64(is_den, short, z64);
-        let bd = self.k64(base_drop as u64);
-        let drop = self.b64(BinOp::Add, bd, extra); // >= base_drop
-        let sixty4 = self.k64(64);
-        let beyond = self.c64(CmpOp::GtS, drop, sixty4);
-        let ge64 = self.c64(CmpOp::GeS, drop, sixty4);
-        let s = self.s64(ge64, sixty4, drop); // 1..=64
-        // kept = sig >> s (0 at 64); mask = (1 << s) - 1 (all ones at 64).
-        let kept = self.b64(BinOp::ShrU, sig, s);
-        let kept = self.s64(ge64, z64, kept);
-        let pw = self.b64(BinOp::Shl, one64, s);
-        let mask = self.b64(BinOp::Sub, pw, one64);
-        let all = self.k64(u64::MAX);
-        let mask = self.s64(ge64, all, mask);
-        let rem = self.b64(BinOp::And, sig, mask);
-        let sm1 = self.b64(BinOp::Sub, s, one64);
-        let half = self.b64(BinOp::Shl, one64, sm1);
-        let inexact = self.c64(CmpOp::Ne, rem, z64);
-        let gt = self.c64(CmpOp::GtU, rem, half);
-        let eq = self.c64(CmpOp::Eq, rem, half);
-        let nb = self.not1(beyond);
-        let gt = self.and32(gt, nb);
-        let eq = self.and32(eq, nb);
-        let odd = self.b64(BinOp::And, kept, one64);
-        let odd = self.b.wrap(odd);
-        let up = self.x87_round_up(mode, inexact, gt, eq, odd);
-        let up64 = self.b.extend(up, false);
-        let kept2 = self.b64(BinOp::Add, kept, up64);
-
-        // Normal result: ((e + bias - 1) << frac) + kept2 carries a rounding
-        // overflow into the exponent by itself.
-        let bm1 = self.k64((f.bias - 1) as u64);
-        let ef = self.b64(BinOp::Add, c.e, bm1);
-        let fr = self.k64(f.frac as u64);
-        let efs = self.b64(BinOp::Shl, ef, fr);
-        let normal_bits = self.b64(BinOp::Add, efs, kept2);
-        let mag = self.s64(is_den, kept2, normal_bits);
-        // Overflow: the exponent field reaches all ones.
-        let carry = self.b64(BinOp::ShrU, kept2, fr); // 1, or 2 on a carry
-        let field = self.b64(BinOp::Add, ef, carry);
-        let mf = self.k64(max_field as u64);
-        let ovf = self.c64(CmpOp::GeS, field, mf);
-        let nden = self.not1(is_den);
-        let ovf = self.and32(ovf, nden);
-        let ovf = self.and32(ovf, c.finite);
-        // To infinity, or to the largest finite number, by the mode.
-        let to_inf = self.or32(mode.0, mode.1);
-        let one32 = self.k32(1);
-        let inf_bits = self.k64((max_field as u64) << f.frac);
-        let max_bits = self.k64(((max_field as u64) << f.frac) - 1);
-        let ovf_bits = self.s64(to_inf, inf_bits, max_bits);
-        let mag = self.s64(ovf, ovf_bits, mag);
-
-        // Tininess after rounding: tiny unless the value, rounded to the
-        // format's precision with an unbounded exponent, reaches the
-        // smallest normal -- which only a value just below it can.
-        let emin_m1 = self.k64((emin - 1) as u64);
-        let is_below = self.c64(CmpOp::LtS, c.e, eminv);
-        let just_below = self.c64(CmpOp::Eq, c.e, emin_m1);
-        let bdk = self.k64(base_drop as u64);
-        let k1 = self.b64(BinOp::ShrU, sig, bdk);
-        let ones = self.k64((1u64 << (f.frac + 1)) - 1);
-        let all_ones = self.c64(CmpOp::Eq, k1, ones);
-        let m1 = self.k64((1u64 << base_drop) - 1);
-        let r1 = self.b64(BinOp::And, sig, m1);
-        let h1 = self.k64(1u64 << (base_drop - 1));
-        let in1 = self.c64(CmpOp::Ne, r1, z64);
-        let gt1 = self.c64(CmpOp::GtU, r1, h1);
-        let eq1 = self.c64(CmpOp::Eq, r1, h1);
-        let up1 = self.x87_round_up(mode, in1, gt1, eq1, one32);
-        let carries = self.and32(all_ones, up1);
-        let carries = self.and32(carries, just_below);
-        let nc = self.not1(carries);
-        let tiny = self.and32(is_below, nc);
-
-        // Flags for a finite value.
-        let pe = self.or32(inexact, ovf);
-        let pe_f = self.flag(pe, PE);
-        let ue = self.and32(tiny, inexact);
-        let ue_f = self.flag(ue, UE);
-        let oe_f = self.flag(ovf, OE);
-        let ff = self.or32(pe_f, ue_f);
-        let ff = self.or32(ff, oe_f);
-        let c1f = self.s32(ovf, to_inf, up);
-
-        // The special values.
-        let smax = self.k64((max_field as u64) << f.frac);
-        let qn = self.k64(1 << 62);
-        let qsig = self.b64(BinOp::Or, sig, qn);
-        let qsig = self.b64(BinOp::Shl, qsig, one64);
-        let tail = self.k64((64 - f.frac) as u64);
-        let nfrac = self.b64(BinOp::ShrU, qsig, tail);
-        let nan_bits = self.b64(BinOp::Or, smax, nfrac);
-        let indef = self.k64(((max_field as u64) << f.frac) | 1 << (f.frac - 1));
-        let mag = self.s64(c.zero, z64, mag);
-        let mag = self.s64(c.inf, smax, mag);
-        let mag = self.s64(c.nan, nan_bits, mag);
-        let mag = self.s64(c.unsupported, indef, mag);
-        let sign64 = self.b.extend(c.sign, false);
-        let sgn = self.k64((f.bits - 1) as u64);
-        let sbit = self.b64(BinOp::Shl, sign64, sgn);
-        let bits = self.b64(BinOp::Or, mag, sbit);
-        let ind_sign = self.k64(1 << (f.bits - 1));
-        let ib = self.b64(BinOp::Or, indef, ind_sign);
-        let bits = self.s64(c.unsupported, ib, bits);
-
-        let flags = self.s32(c.finite, ff, z32);
-        let bad = self.or32(c.snan, c.unsupported);
-        let ie = self.flag(bad, IE);
-        let flags = self.or32(flags, ie);
-        let c1 = self.s32(c.finite, c1f, z32);
-        (bits, flags, c1)
-    }
-
-    /// Round an extended value to an integer of `bits` bits: (the integer in
-    /// an I64, flags, C1). Out of range, a NaN, an infinity or an
-    /// unsupported value give the integer indefinite with IE.
-    fn x87_to_int(&mut self, sig: Value, se: Value, bits: u32, trunc: bool) -> (Value, Value, Value) {
-        let c = self.x87_classify(sig, se);
-        let z64 = self.k64(0);
-        let z32 = self.k32(0);
-        let one64 = self.k64(1);
-        // Bits below the binary point: 63 - e, at least 1 here.
-        let sixty3 = self.k64(63);
-        let drop = self.b64(BinOp::Sub, sixty3, c.e);
-        let whole = self.c64(CmpOp::LeS, drop, z64); // e >= 63
-        let sixty4 = self.k64(64);
-        let beyond = self.c64(CmpOp::GtS, drop, sixty4);
-        let ge64 = self.c64(CmpOp::GeS, drop, sixty4);
-        let d1 = self.s64(whole, one64, drop); // keep the shifts in range
-        let s = self.s64(ge64, sixty4, d1);
-        let kept = self.b64(BinOp::ShrU, sig, s);
-        let kept = self.s64(ge64, z64, kept);
-        let pw = self.b64(BinOp::Shl, one64, s);
-        let mask = self.b64(BinOp::Sub, pw, one64);
-        let all = self.k64(u64::MAX);
-        let mask = self.s64(ge64, all, mask);
-        let rem = self.b64(BinOp::And, sig, mask);
-        let sm1 = self.b64(BinOp::Sub, s, one64);
-        let half = self.b64(BinOp::Shl, one64, sm1);
-        let inexact = self.c64(CmpOp::Ne, rem, z64);
-        let up = if trunc {
-            z32
-        } else {
-            let gt = self.c64(CmpOp::GtU, rem, half);
-            let eq = self.c64(CmpOp::Eq, rem, half);
-            let nb = self.not1(beyond);
-            let gt = self.and32(gt, nb);
-            let eq = self.and32(eq, nb);
-            let odd = self.b64(BinOp::And, kept, one64);
-            let odd = self.b.wrap(odd);
-            let mode = self.x87_mode(c.sign);
-            self.x87_round_up(mode, inexact, gt, eq, odd)
-        };
-        let up64 = self.b.extend(up, false);
-        let k = self.b64(BinOp::Add, kept, up64);
-        // e >= 63: the significand is the integer (e >= 64 is out of range).
-        let k = self.s64(whole, sig, k);
-        let inexact = self.s32(whole, z32, inexact);
-        let up = self.s32(whole, z32, up);
-        let e64 = self.c64(CmpOp::GeS, c.e, sixty4);
-        // In range: k <= 2^(bits-1) - 1, or 2^(bits-1) when negative. k is
-        // unsigned here (up to 2^64 - 1).
-        let lim = self.k64((1u64 << (bits - 1)) - 1);
-        let sign64 = self.b.extend(c.sign, false);
-        let lim = self.b64(BinOp::Add, lim, sign64);
-        let over = self.c64(CmpOp::GtU, k, lim);
-        let over = self.or32(over, e64);
-        let neg = self.b64(BinOp::Sub, z64, k);
-        let signed = self.s64(c.sign, neg, k);
-        let zero_or_fin = self.or32(c.finite, c.zero);
-        let signed = self.s64(c.zero, z64, signed);
-        let ok = self.not1(over);
-        let ok = self.and32(zero_or_fin, ok);
-        let fin_ok = self.and32(ok, c.finite);
-        let indef = self.k64(1u64 << (bits - 1));
-        let v = self.s64(ok, signed, indef);
-        let pe = self.and32(fin_ok, inexact);
-        let pe_f = self.flag(pe, PE);
-        let bad = self.not1(ok);
-        let ie_f = self.flag(bad, IE);
-        let flags = self.or32(pe_f, ie_f);
-        let c1 = self.and32(fin_ok, up);
-        (v, flags, c1)
+        let c1 = self.and32(c1, one);
+        (r, flags, c1)
     }
 
     /// `fst`/`fstp`/`fist`/`fistp`/`fisttp` to memory, inline. An empty
@@ -640,7 +383,7 @@ impl<'a> Lifter<'a> {
                 X87Mem::I32 => (32, MemSz::B4),
                 _ => (64, MemSz::B8),
             };
-            let (v, flags, c1) = self.x87_to_int(sig, se, bits, trunc);
+            let (v, flags, c1) = self.x87_op(X87Op::ToInt { bits: bits as u8, trunc }, sig, se);
             let v = if sz == MemSz::B8 { v } else { self.b.wrap(v) };
             st(self, offset, v, sz);
             (flags, c1)
@@ -653,13 +396,13 @@ impl<'a> Lifter<'a> {
                     (z, z)
                 }
                 X87Mem::F32 => {
-                    let (v, flags, c1) = self.x87_narrow(sig, se, SINGLE);
+                    let (v, flags, c1) = self.x87_op(X87Op::Narrow { single: true }, sig, se);
                     let v = self.b.wrap(v);
                     st(self, offset, v, MemSz::B4);
                     (flags, c1)
                 }
                 _ => {
-                    let (v, flags, c1) = self.x87_narrow(sig, se, DOUBLE);
+                    let (v, flags, c1) = self.x87_op(X87Op::Narrow { single: false }, sig, se);
                     st(self, offset, v, MemSz::B8);
                     (flags, c1)
                 }
@@ -677,16 +420,4 @@ impl<'a> Lifter<'a> {
         }
         Flow::Next
     }
-}
-
-/// What `x87_classify` finds (I32 0/1 flags, the exponent an I64).
-struct Class80 {
-    sign: Value,
-    e: Value,
-    finite: Value,
-    nan: Value,
-    snan: Value,
-    inf: Value,
-    zero: Value,
-    unsupported: Value,
 }

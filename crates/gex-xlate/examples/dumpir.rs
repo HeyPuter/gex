@@ -28,6 +28,7 @@ fn main() {
         cache_op: 6,
         dispatch_miss: 7,
         safepoint: 8,
+        x87: 9,
         block_ty: 0,
         blocks: &blocks,
         gir: &gir,

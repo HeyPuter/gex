@@ -1,0 +1,8 @@
+[package]
+name = "gex-f80"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gex-f80: the x87's 80-bit extended-precision arithmetic, exact"
+
+[dependencies]

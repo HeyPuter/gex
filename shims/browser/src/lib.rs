@@ -9162,6 +9162,23 @@ pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64
     }
 }
 
+/// An x87 operation the inline fast path left to the host (see
+/// `gex_abi::imports::X87`): the result returned, the status-word bits left
+/// at `ctx::X87_TMP + 12`.
+#[no_mangle]
+pub extern "C" fn gex_x87(ctx: i32, op: i32, sig: i64, se: i32, cw: i32) -> i64 {
+    let (sig, se, cw) = (sig as u64, se as u16, cw as u16);
+    let (r, sw) = match op {
+        1 => gex_kernel::f80::narrow_op(sig, se, cw, true),
+        2 => gex_kernel::f80::narrow_op(sig, se, cw, false),
+        _ if op & 0x100 != 0 => gex_kernel::f80::to_int_op(sig, se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0),
+        _ => panic!("x87 import: unknown operation {op:#x}"),
+    };
+    let mut gm = GuestMem::new(guest_bytes());
+    let _ = gm.write_u32(ctx as u32 as u64 + ctx::X87_TMP as u64 + 12, sw);
+    r as i64
+}
+
 /// How many times the guest has asked for a fused multiply-add.
 pub static FMA_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

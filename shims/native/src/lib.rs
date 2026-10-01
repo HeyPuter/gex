@@ -388,6 +388,17 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 /// Check that a module is well-formed wasm, without compiling or running it.
 /// Cheap next to translating, so `gexc build` does it every time; catches
 /// lifter bugs wasmtime would otherwise only reject deep into a module.
+/// The `x87` import's work: `gex_ir::X87Op::code` decoded onto
+/// `gex_f80`'s pure operations.
+fn x87_op(op: i32, sig: u64, se: u16, cw: u16) -> (u64, u32) {
+    match op {
+        1 => gex_kernel::f80::narrow_op(sig, se, cw, true),
+        2 => gex_kernel::f80::narrow_op(sig, se, cw, false),
+        _ if op & 0x100 != 0 => gex_kernel::f80::to_int_op(sig, se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0),
+        _ => panic!("x87 import: unknown operation {op:#x}"),
+    }
+}
+
 pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
@@ -2968,6 +2979,23 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     .mul_add(f32::from_bits(b as u32), f32::from_bits(c as u32))
                     .to_bits() as i64
             }
+        },
+    )?;
+
+    linker.func_wrap(
+        m,
+        imports::X87,
+        |caller: Caller<'_, HostState>, ctx: i32, op: i32, sig: i64, se: i32, cw: i32| -> Result<i64> {
+            let (r, sw) = x87_op(op, sig as u64, se as u16, cw as u16);
+            let memory = caller
+                .data()
+                .memory
+                .clone()
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            let data = memory.bytes();
+            let at = ctx as u32 as usize + ctx::X87_TMP + 12;
+            data[at..at + 4].copy_from_slice(&sw.to_le_bytes());
+            Ok(r as i64)
         },
     )?;
 
