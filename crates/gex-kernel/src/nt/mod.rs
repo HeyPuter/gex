@@ -770,6 +770,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtMapViewOfSectionEx => section::nt_map_view_of_section_ex(c),
         n::NtUnmapViewOfSection => section::nt_unmap_view_of_section(c),
         n::NtFlushVirtualMemory => section::nt_flush_virtual_memory(c),
+        n::NtNotifyChangeDirectoryFile => file::nt_notify_change_directory_file(c),
         n::NtUnmapViewOfSectionEx => section::nt_unmap_view_of_section_ex(c),
         n::NtQuerySection => section::nt_query_section(c),
         // -- objects ---------------------------------------------------------

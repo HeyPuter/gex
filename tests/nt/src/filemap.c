@@ -1,6 +1,7 @@
 /* File mappings: a read-only view of a file, and a writable one whose
  * changes reach the file through FlushViewOfFile and UnmapViewOfFile,
- * including a mapping that extends the file.
+ * including a mapping that extends the file; and directory change
+ * notifications for changes the program makes itself.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fuse-ld=lld */
 #include <windows.h>
 #include <stdio.h>
@@ -49,6 +50,23 @@ int main(void) {
     n = read_all(path, buf, sizeof(buf));
     CHECK("the writes reached the file", n == 32 && !memcmp(buf, "HELLO mapping", 13) && buf[31] == '!');
     DeleteFileA(path);
+
+    char dir[MAX_PATH], inner[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%sgex-notify-%lu", tmp, GetCurrentProcessId());
+    CreateDirectoryA(dir, 0);
+    HANDLE ch = FindFirstChangeNotificationA(dir, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE);
+    CHECK("FindFirstChangeNotification", ch != INVALID_HANDLE_VALUE);
+    CHECK("no change yet", WaitForSingleObject(ch, 0) == WAIT_TIMEOUT);
+    snprintf(inner, sizeof(inner), "%s\\a.txt", dir);
+    HANDLE a = CreateFileA(inner, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
+    CloseHandle(a);
+    CHECK("creating a file signals it", WaitForSingleObject(ch, 1000) == WAIT_OBJECT_0);
+    CHECK("FindNextChangeNotification", FindNextChangeNotification(ch));
+    CHECK("which re-arms it", WaitForSingleObject(ch, 0) == WAIT_TIMEOUT);
+    DeleteFileA(inner);
+    CHECK("deleting the file signals it", WaitForSingleObject(ch, 1000) == WAIT_OBJECT_0);
+    FindCloseChangeNotification(ch);
+    RemoveDirectoryA(dir);
     printf("%d failures\n", failures);
     return failures;
 }
