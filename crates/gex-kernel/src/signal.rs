@@ -880,8 +880,14 @@ fn read_rflags(m: &GuestMem<'_>, ctx_addr: u64) -> Result<u64, Errno> {
         | (f(ctx::NF)? << 7)
         | (1 << 9)
         | (f(ctx::DF)? << 10)
-        | (f(ctx::VF)? << 11))
+        | (f(ctx::VF)? << 11)
+        | (m.read_u32(ctx_addr + ctx::EFLAGS_SYS as u64)? & EFLAGS_AC_ID) as u64)
 }
+
+/// EFLAGS.AC (bit 18) and ID (bit 21): the system bits user code can toggle,
+/// kept in `ctx::EFLAGS_SYS`, so a handler sees, and `sigreturn` restores, what
+/// the interrupted code's last `popf` set.
+const EFLAGS_AC_ID: u32 = 0x24_0000;
 
 fn write_rflags(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), Errno> {
     for (off, bit) in [
@@ -895,6 +901,7 @@ fn write_rflags(m: &mut GuestMem<'_>, ctx_addr: u64, v: u64) -> Result<(), Errno
     ] {
         m.write(ctx_addr + off as u64, &[((v >> bit) & 1) as u8])?;
     }
+    m.write_u32(ctx_addr + ctx::EFLAGS_SYS as u64, v as u32 & EFLAGS_AC_ID)?;
     Ok(())
 }
 

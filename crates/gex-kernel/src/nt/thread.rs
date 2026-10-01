@@ -57,13 +57,19 @@ pub mod amd64 {
 fn read_eflags(g: &G<'_>, cx: u64) -> R<u32> {
     let b = |o: usize| g.u8(cx + o as u64).map(|v| (v & 1) as u32);
     Ok(b(ctx::CF)? | 0x2 | b(ctx::PF)? << 2 | b(ctx::AF)? << 4 | b(ctx::ZF)? << 6 | b(ctx::NF)? << 7
-        | 0x200 | b(ctx::DF)? << 10 | b(ctx::VF)? << 11)
+        | 0x200 | b(ctx::DF)? << 10 | b(ctx::VF)? << 11
+        | g.u32(cx + ctx::EFLAGS_SYS as u64)? & EFLAGS_AC_ID)
 }
+
+/// EFLAGS.AC (bit 18) and ID (bit 21), which user code can toggle and gex
+/// keeps in `ctx::EFLAGS_SYS` for the next `pushf`.
+const EFLAGS_AC_ID: u32 = 0x24_0000;
 
 fn write_eflags(g: &mut G<'_>, cx: u64, f: u32) -> R<()> {
     for (o, bit) in [(ctx::CF, 0), (ctx::PF, 2), (ctx::AF, 4), (ctx::ZF, 6), (ctx::NF, 7), (ctx::DF, 10), (ctx::VF, 11)] {
         g.w8(cx + o as u64, ((f >> bit) & 1) as u8)?;
     }
+    g.w32(cx + ctx::EFLAGS_SYS as u64, f & EFLAGS_AC_ID)?;
     Ok(())
 }
 
