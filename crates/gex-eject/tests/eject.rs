@@ -179,6 +179,18 @@ fn eject_build_run_and_replace() {
 
     build::build(&p).unwrap();
     let flags = run::RunFlags::default();
+    // The session made no system calls, so the ejected runtime allows none:
+    // its exit_group is refused, by name.
+    match run::run(&p, &flags).unwrap() {
+        Exit::Signal { signal: 31, detail, internal: true, .. } => assert!(detail.contains("exit_group"), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+    // As the real session would have it.
+    let mut session = session;
+    session.syscalls.insert(94, 1); // exit_group, canonical
+    std::fs::write(tmp.join("rec/session.json"), session.to_json()).unwrap();
+    eject::eject(&tmp.join("rec"), &p, &opts).unwrap();
+    build::build(&p).unwrap();
     assert_eq!(run::run(&p, &flags).unwrap(), Exit::Status(38));
 
     // Replace `f` with wasm that adds.
