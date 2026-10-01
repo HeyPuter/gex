@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Lockstep check: run a guest twice and compare it syscall by syscall.
+
+    lockstep [--a "FLAGS"] [--b "FLAGS"] [--gexc PATH] [--keep DIR] [--ignore-flags] <elf> [args...]
+
+Runs `gexc run --no-cache --no-jit <A flags> <elf>` and the same with the
+<B flags> (default: tier-1 against `--cgen`), each with GEX_SYSCALL_LOG and
+GEX_FAKE_CLOCK set (shims/native/src/lockstep.rs), and compares the logs
+thread by thread: every syscall's number and arguments, the architectural
+registers at its entry, and its result. Tier-1 is the reference (merge plan
+§5.2). Prints the first divergence with the fields that differ, or "same".
+Exit status 0 when the runs agree, 1 when they diverge, 2 on usage errors.
+
+--ignore-flags leaves the condition flags out of the comparison. Both
+tiers leave dead flags stale in the context (tier-1's dead-flag
+elimination, the function tier's liveness-limited write-backs), and they
+differ in which stale values they leave; a live flag that is wrong shows up
+as a wrong branch, and so as a divergence elsewhere. Run without it against
+GEX_CGEN_LIVE=0, which writes every flag back, for the exact comparison.
+"""
+import argparse, os, shlex, subprocess, sys, tempfile
+
+FIELDS = ['tid', 'pc', 'nr', 'a0', 'a1', 'a2', 'a3', 'a4', 'a5', '|'] + \
+    [f'x{i}' for i in range(31)] + ['sp', 'flags', 'vhash']
+
+
+def run(gexc, flags, elf, args, log):
+    env = dict(os.environ, GEX_SYSCALL_LOG=log, GEX_FAKE_CLOCK='1')
+    if os.path.exists(log):
+        os.unlink(log)
+    cmd = [gexc, 'run', '--no-cache', '--no-jit', *flags, elf, *args]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def events(log):
+    """Per thread, the list of (kind, fields) lines, in order."""
+    per = {}
+    with open(log) as f:
+        for line in f:
+            parts = line.split()
+            if not parts:
+                continue
+            per.setdefault(parts[1], []).append(parts)
+    return per
+
+
+def describe(a, b):
+    if a[0] != b[0]:
+        return f'line kinds differ: {a[0]} vs {b[0]}'
+    if a[0] == 'R':
+        return f'result {a[2]} vs {b[2]}'
+    out = []
+    names = FIELDS
+    for i, (x, y) in enumerate(zip(a[1:], b[1:])):
+        if x != y:
+            n = names[i] if i < len(names) else f'#{i}'
+            out.append(f'{n}: {x} vs {y}')
+    return ', '.join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--a', default='')
+    ap.add_argument('--b', default='--cgen')
+    ap.add_argument('--gexc', default=os.path.join(os.path.dirname(__file__), '../../../target/release/gexc'))
+    ap.add_argument('--keep', help='directory to keep the two logs in')
+    ap.add_argument('--ignore-flags', action='store_true', help='do not compare the condition flags')
+    ap.add_argument('elf')
+    ap.add_argument('args', nargs=argparse.REMAINDER)
+    o = ap.parse_args()
+    d = o.keep or tempfile.mkdtemp(prefix='gex-lockstep-')
+    os.makedirs(d, exist_ok=True)
+    la, lb = os.path.join(d, 'a.log'), os.path.join(d, 'b.log')
+    ca, oa, ea = run(o.gexc, shlex.split(o.a), o.elf, o.args, la)
+    cb, ob, eb = run(o.gexc, shlex.split(o.b), o.elf, o.args, lb)
+    if not os.path.exists(la) or not os.path.exists(lb):
+        print(f'no syscall log (is this gexc built with shims/native/src/lockstep.rs?)\n{ea[-400:]}{eb[-400:]}')
+        return 2
+    A, B = events(la), events(lb)
+    if o.ignore_flags:
+        for per in (A, B):
+            for evs in per.values():
+                for i, e in enumerate(evs):
+                    evs[i] = [x for x in e if not x.startswith('f=')]
+    bad = False
+    for tid in sorted(set(A) | set(B), key=lambda t: int(t)):
+        xs, ys = A.get(tid, []), B.get(tid, [])
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            if x != y:
+                print(f'thread {tid}: diverges at event {i} of {len(xs)}/{len(ys)}: {describe(x, y)}')
+                print(f'  A: {" ".join(x)}\n  B: {" ".join(y)}')
+                bad = True
+                break
+        else:
+            if len(xs) != len(ys):
+                print(f'thread {tid}: A has {len(xs)} events, B {len(ys)}; the common prefix agrees')
+                bad = True
+    if (ca, oa) != (cb, ob):
+        print(f'exit/stdout differ: A exit {ca}, B exit {cb}')
+        bad = True
+    n = sum(len(v) for v in A.values())
+    if not bad:
+        print(f'same: {n} events over {len(A)} threads, exit {ca}')
+    if not o.keep:
+        for f in (la, lb):
+            os.unlink(f)
+        os.rmdir(d)
+    return 1 if bad else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
