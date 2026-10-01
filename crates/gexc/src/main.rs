@@ -99,6 +99,7 @@ usage:
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
   gexc funcs  <elf|pe> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list] [--base HEX]
+                                   [--vsyscall-guards] [--guards FILE] [--profile FILE] [--truth FILE]
                                    recover functions (CFGs, jump tables,
                                    call-graph summaries) and report them.
                                    --ir prints function-level GIR, --ssa in
@@ -1322,6 +1323,9 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
     let mut runs: u64 = 8;
     let mut pe_base: Option<u64> = None;
     let mut truth: Option<String> = None;
+    let mut vsyscall = false;
+    let mut guard_file: Option<String> = None;
+    let mut profile_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1340,6 +1344,15 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
             "--run" => {
                 i += 1;
                 runs = args.get(i).context("--run needs a count")?.parse().context("--run expects a number")?;
+            }
+            "--vsyscall-guards" => vsyscall = true,
+            "--profile" => {
+                i += 1;
+                profile_file = Some(args.get(i).context("--profile needs a file")?.clone());
+            }
+            "--guards" => {
+                i += 1;
+                guard_file = Some(args.get(i).context("--guards needs a file")?.clone());
             }
             "--truth" => {
                 i += 1;
@@ -1370,7 +1383,42 @@ fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
     };
     let t_rec = t0.elapsed();
     let t1 = std::time::Instant::now();
-    let sums = gex_xlate::summary::analyze(&prog);
+    // Guarded indirect calls (see gex_xlate::summary::Guards for the
+    // contract a backend using them must keep).
+    let mut guards = if vsyscall {
+        gex_xlate::summary::vsyscall_guards(&prog)
+    } else {
+        Default::default()
+    };
+    if let Some(gf) = &guard_file {
+        // One site per line: the calling instruction, then its targets.
+        let text = std::fs::read_to_string(gf).with_context(|| format!("reading {gf}"))?;
+        for line in text.lines() {
+            let w: Vec<u64> = line
+                .split_whitespace()
+                .filter_map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok())
+                .collect();
+            if w.len() >= 2 {
+                guards.calls.insert(w[0], w[1..].to_vec());
+            }
+        }
+    }
+    if let Some(pf) = &profile_file {
+        // Sites and targets the profile recorded for this file (S6's
+        // format), named by the file's content hash.
+        let text = std::fs::read_to_string(pf).with_context(|| format!("reading {pf}"))?;
+        let profile = gex_xlate::profile::Profile::from_json(&text).map_err(|e| anyhow::anyhow!("{pf}: {e}"))?;
+        let mut h = gex_cache::sha256::Sha256::new();
+        h.update(&bytes);
+        let id = format!("sha256:{}", gex_cache::sha256::hex(&h.finish()));
+        let pg = gex_xlate::summary::profile_guards(&prog, &profile, &id, image.bias);
+        eprintln!("profile {pf}: {} guarded call sites for {id}", pg.calls.len());
+        guards.calls.extend(pg.calls);
+    }
+    if !guards.calls.is_empty() {
+        eprintln!("guards: {} indirect call sites", guards.calls.len());
+    }
+    let sums = gex_xlate::summary::analyze_with_guards(&prog, &guards);
     let t_sum = t1.elapsed();
     let st = &prog.stats;
     let pct = |a: u64, b: u64| if b == 0 { 100.0 } else { 100.0 * a as f64 / b as f64 };

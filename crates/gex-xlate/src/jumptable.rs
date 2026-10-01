@@ -31,7 +31,8 @@ use gex_ir::{pass, BinOp, CmpOp, Expr, Stmt, Ty, Value};
 use std::collections::HashMap;
 
 /// Resolve the jump tables ending the blocks at `blocks` (each ends in
-/// [`FTerm::Unresolved`]) of memory-form `f`. `sums`, when there are any,
+/// [`FTerm::Unresolved`], or in an [`FTerm::Switch`] to check again) of
+/// memory-form `f`. `sums`, when there are any,
 /// stand in for its calls. `extent` is the function's extent from the
 /// symbol table or its FDE, which bounds a best-effort table that has no
 /// bound check (see [`resolve_unbounded`]).
@@ -43,8 +44,10 @@ pub fn resolve_all(
     sums: Option<&Summaries>,
     extent: Option<(u64, u64)>,
 ) -> Vec<(u64, Option<Table>)> {
-    let call = |c: Callee| sums.map_or(CallEffect::UNKNOWN, |s| s.call_effect(c));
-    let ssa = to_ssa(f, &call);
+    let ssa = match sums {
+        Some(s) => to_ssa(f, &s.effects_for(&[f])),
+        None => to_ssa(f, &|_| CallEffect::UNKNOWN),
+    };
     let known = crate::summary::known_values(f, sums);
     let mut defs = Defs::new(&ssa, known);
     defs.maybe = crate::summary::known_values_trusting_frame(f, sums);
@@ -363,6 +366,17 @@ fn range_of(
         Expr::Bin { op, ty, a, b } => {
             let m = ty.mask();
             match op {
+                // `(p | q) & m` where p has no bit of m set: q & m. An 8-bit
+                // register write merges into the old value that way, and a
+                // later zero-extending read masks it again.
+                BinOp::And if matches!(fold(defs, b, 0), Some(m) if merged_low(defs, a, m).is_some()) => {
+                    let m = fold(defs, b, 0).unwrap();
+                    let q = merged_low(defs, a, m).unwrap();
+                    match r(q) {
+                        Some((_, hi)) => Some((0, hi.min(m))),
+                        None => Some((0, m)),
+                    }
+                }
                 BinOp::And => match (r(a), r(b)) {
                     (Some((_, x)), Some((_, y))) => Some((0, x.min(y))),
                     (Some((_, x)), None) | (None, Some((_, x))) => Some((0, x)),
@@ -489,6 +503,28 @@ fn range_of(
         }
         ref other => full(other.ty()),
     }
+}
+
+/// For `v = p | q` (through a `wrap` or a zero-extension) where `p` is known
+/// to be zero in every bit of `m`: `q`, the only source of `v & m`'s bits.
+fn merged_low(defs: &Defs, v: Value, m: u64) -> Option<Value> {
+    let mut cur = v;
+    for _ in 0..3 {
+        match **defs.expr.get(&cur)? {
+            Expr::Wrap(x) | Expr::Extend { a: x, signed: false } => cur = x,
+            Expr::Bin { op: BinOp::Or, a, b, .. } => {
+                if known_zero(defs, a) & m == m {
+                    return Some(b);
+                }
+                if known_zero(defs, b) & m == m {
+                    return Some(a);
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Which bits of each value the target depends on (demanded bits), from
@@ -865,9 +901,38 @@ fn resolve_one(
     max: u32,
 ) -> Option<Table> {
     let b = f.block_at(at)?;
-    let FTerm::Unresolved { target } = f.block(b).term else {
-        return None;
+    // An unresolved jump, or a switch being checked again now that its
+    // cases are edges of the function.
+    let target = match f.block(b).term {
+        FTerm::Unresolved { target } | FTerm::Switch { target, .. } => target,
+        _ => return None,
     };
+    // 0. A target the same on every execution (`adr x3, f; ...; br x3`): a
+    // switch of one case, complete when nothing assumed or writable fed it.
+    {
+        let mut ev = Eval {
+            defs,
+            code,
+            memo: HashMap::new(),
+            loads: Vec::new(),
+            writable: false,
+            assumed: false,
+        };
+        if let Some(t) = ev.eval(target, 0) {
+            if code.is_code(t) {
+                return Some(Table {
+                    cases: vec![t],
+                    table: JumpTable {
+                        base: ev.loads.first().map_or(t, |l| l.0),
+                        entry_bytes: 0,
+                        count: 1,
+                        index: None,
+                        complete: !ev.writable && !ev.assumed,
+                    },
+                });
+            }
+        }
+    }
     // 1. The bound check: the first dominating bound the target depends on.
     let bs = bounds(f, defs, preds, b);
     if std::env::var_os("GEX_JT_DEBUG").is_some() {
@@ -976,7 +1041,12 @@ fn with_bound_from(
         for &(l, m) in &leaves {
             ev.memo.insert(l, Some(k & m));
         }
-        let t = ev.eval(target, 0)?;
+        let Some(t) = ev.eval(target, 0) else {
+            if std::env::var_os("GEX_JT_DEBUG").is_some() {
+                eprintln!("[jt] {at:#x}: index {k} does not evaluate (leaves {leaves:?})");
+            }
+            return None;
+        };
         writable |= ev.writable || ev.assumed;
         if k == lo {
             first_loads = ev.loads.clone();
@@ -985,6 +1055,9 @@ fn with_bound_from(
         }
         // Never guess: a target that is not code fails the whole table.
         if !code.is_code(t) {
+            if std::env::var_os("GEX_JT_DEBUG").is_some() {
+                eprintln!("[jt] {at:#x}: index {k} goes to {t:#x}, not code");
+            }
             return None;
         }
         cases.push(t);
@@ -1040,8 +1113,11 @@ fn resolve_unbounded(
     extent: (u64, u64),
 ) -> Option<Table> {
     let b = f.block_at(at)?;
-    let FTerm::Unresolved { target } = f.block(b).term else {
-        return None;
+    // An unresolved jump, or a switch being checked again now that its
+    // cases are edges of the function.
+    let target = match f.block(b).term {
+        FTerm::Unresolved { target } | FTerm::Switch { target, .. } => target,
+        _ => return None,
     };
     let inside = |t: u64| t >= extent.0 && t < extent.1 && code.is_code(t);
     let eval_at = |x: Value, k: u64| -> Option<(u64, Vec<(u64, u32)>, bool)> {
