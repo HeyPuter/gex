@@ -305,6 +305,7 @@ const imports = {
     sysreg_write: () => {},
     cache_op: () => {},
     safepoint: () => {},
+    x87: () => { throw new Error('cross-engine host: x87 not modelled'); },
   },
 };
 

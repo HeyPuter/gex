@@ -945,12 +945,13 @@ impl X87Op {
         }
     }
 
-    /// The code the `x87` host import takes for this operation.
+    /// The code the `x87` host import takes for this operation: 1 and 2 for
+    /// single and double `Narrow`; `0x100 | bits << 1 | trunc` for `ToInt`.
     pub fn code(self) -> i32 {
         match self {
             X87Op::Narrow { single: true } => 1,
             X87Op::Narrow { single: false } => 2,
-            X87Op::ToInt { bits, trunc } => 0x10 | (bits as i32) << 1 | trunc as i32,
+            X87Op::ToInt { bits, trunc } => 0x100 | (bits as i32) << 1 | trunc as i32,
         }
     }
 }

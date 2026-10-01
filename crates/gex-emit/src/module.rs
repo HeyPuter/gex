@@ -568,6 +568,7 @@ struct Imports {
     cache_op: u32,
     safepoint: u32,
     fma: u32,
+    x87: u32,
 }
 
 impl ModuleBuilder {
@@ -652,6 +653,10 @@ impl ModuleBuilder {
             vec![p, ValType::I64, ValType::I64, ValType::I64, ValType::I32],
             vec![ValType::I64],
         ));
+        let t_x87 = m.func_type(FuncType::new(
+            vec![p, ValType::I32, ValType::I64, ValType::I32, ValType::I32],
+            vec![ValType::I64],
+        ));
 
         let im = IMPORT_MODULE;
         let imports = Imports {
@@ -664,6 +669,7 @@ impl ModuleBuilder {
             cache_op: m.import_func(im, imports::CACHE_OP, t_pc_i32_i64),
             safepoint: m.import_func(im, imports::SAFEPOINT, t_syscall),
             fma: m.import_func(im, imports::FMA, t_fma),
+            x87: m.import_func(im, imports::X87, t_x87),
         };
 
         // The memory is the host's and shared, so every guest thread acts on
@@ -844,6 +850,7 @@ impl ModuleBuilder {
                 dispatch_miss: self.imports.dispatch_miss,
                 safepoint: self.imports.safepoint,
                 fma: self.imports.fma,
+                x87: self.imports.x87,
                 block_ty: self.block_ty,
                 blocks: &self.blocks,
                 gir: &gir,

@@ -1028,6 +1028,7 @@ export class Gex {
       cache_op: e.gex_cache_op,
       safepoint: e.gex_safepoint,
       fma: e.gex_fma,
+      x87: e.gex_x87,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(
@@ -1219,6 +1220,7 @@ export class Gex {
       cache_op: e.gex_cache_op,
       safepoint: e.gex_safepoint,
       fma: e.gex_fma,
+      x87: e.gex_x87,
     };
     const tGuest = performance.now();
     this.#guest = await WebAssembly.instantiate(
