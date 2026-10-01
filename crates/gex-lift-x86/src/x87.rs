@@ -18,7 +18,7 @@
 //! loads and stores (and their faults) stay in translated code.
 
 use crate::x87op;
-use crate::{FlagSource, Flow, Lifter};
+use crate::{Flow, Lifter};
 use gex_abi::ctx;
 use gex_ir::*;
 use gex_isa_x86::{Inst, Op, Operand, Width, X87Mem, X87Src};
@@ -97,7 +97,7 @@ impl<'a> Lifter<'a> {
         self.ld_ext(a, 0)
     }
 
-    fn st_st(&mut self, i: u8, v: Ext) {
+    pub(crate) fn st_st(&mut self, i: u8, v: Ext) {
         let top = self.top();
         let a = self.st_addr(top, i);
         self.st_ext(a, 0, v);
@@ -134,13 +134,6 @@ impl<'a> Lifter<'a> {
         self.set_top(ntop);
     }
 
-    /// Guest address of the context's `X87_TMP` slot.
-    fn x87_tmp(&mut self) -> Value {
-        let base = self.b.read(GuestReg::CtxAddr);
-        let k = self.k64(ctx::X87_TMP as u64);
-        self.b.bin(BinOp::Add, Ty::I64, base, k)
-    }
-
     /// Have the host compute an x87 operation (see [`x87op`]).
     fn x87_host(&mut self, op: u64) {
         let pcv = self.k64(self.pc);
@@ -150,147 +143,6 @@ impl<'a> Lifter<'a> {
             func: HostFunc::SysRegWrite,
             args: vec![pcv, id, v],
         });
-    }
-
-    fn mem_code(m: X87Mem) -> u64 {
-        (match m {
-            X87Mem::F32 => x87op::MEM_F32,
-            X87Mem::F64 => x87op::MEM_F64,
-            X87Mem::F80 => x87op::MEM_F80,
-            X87Mem::I16 => x87op::MEM_I16,
-            X87Mem::I32 => x87op::MEM_I32,
-            X87Mem::I64 => x87op::MEM_I64,
-        }) << x87op::MEM_SHIFT
-    }
-
-    /// Copy the memory operand into `X87_TMP` as raw bits, for the host.
-    fn x87_mem_in(&mut self, o: Operand, m: X87Mem) -> Option<()> {
-        let Operand::Mem(mem) = o else {
-            return None;
-        };
-        let (addr, offset) = self.addr(&mem);
-        let tmp = self.x87_tmp();
-        let (sz, ty) = match m {
-            X87Mem::F32 | X87Mem::I32 => (MemSz::B4, Ty::I32),
-            X87Mem::I16 => (MemSz::B2, Ty::I32),
-            X87Mem::F64 | X87Mem::I64 | X87Mem::F80 => (MemSz::B8, Ty::I64),
-        };
-        let v = self.b.def(Expr::Load {
-            addr,
-            offset,
-            sz,
-            signed: false,
-            ty,
-            order: Order::Relaxed,
-        });
-        let v = if ty == Ty::I32 { self.b.extend(v, false) } else { v };
-        self.b.stmt(Stmt::Store {
-            addr: tmp,
-            offset: 0,
-            val: v,
-            sz: MemSz::B8,
-            order: Order::Relaxed,
-        });
-        if m == X87Mem::F80 {
-            let se = self.b.def(Expr::Load {
-                addr,
-                offset: offset + 8,
-                sz: MemSz::B2,
-                signed: false,
-                ty: Ty::I32,
-                order: Order::Relaxed,
-            });
-            self.b.stmt(Stmt::Store {
-                addr: tmp,
-                offset: 8,
-                val: se,
-                sz: MemSz::B2,
-                order: Order::Relaxed,
-            });
-        }
-        Some(())
-    }
-
-    /// An arithmetic instruction: `x87op::FADD` .. `FDIV`, `rev` for the
-    /// reversed forms.
-    fn x87_arith(&mut self, op: u64, src: X87Src, rev: bool) -> Flow {
-        let word = match src {
-            X87Src::MemF(w) => {
-                let m = if w == Width::Q { X87Mem::F64 } else { X87Mem::F32 };
-                if self.x87_mem_in(self.cur_mem, m).is_none() {
-                    return self.illegal_x87();
-                }
-                x87op::FORM_MEM << x87op::FORM_SHIFT | Self::mem_code(m)
-            }
-            X87Src::MemI(w) => {
-                let m = if w == Width::W { X87Mem::I16 } else { X87Mem::I32 };
-                if self.x87_mem_in(self.cur_mem, m).is_none() {
-                    return self.illegal_x87();
-                }
-                x87op::FORM_MEM << x87op::FORM_SHIFT | Self::mem_code(m)
-            }
-            X87Src::St0Sti(i) => {
-                x87op::FORM_ST0_STI << x87op::FORM_SHIFT | (i as u64) << x87op::I_SHIFT
-            }
-            X87Src::StiSt0 { i, pop } => {
-                x87op::FORM_STI_ST0 << x87op::FORM_SHIFT
-                    | (i as u64) << x87op::I_SHIFT
-                    | (pop as u64) << x87op::POP_SHIFT
-            }
-        };
-        self.x87_host(op | word | if rev { x87op::REV } else { 0 });
-        Flow::Next
-    }
-
-    /// A comparison against `st(i)` or the memory operand, `pops` times
-    /// popping afterwards.
-    fn x87_compare(&mut self, src: Option<X87Mem>, i: u8, pops: u8, quiet: bool, eflags: bool) -> Flow {
-        let mut word = x87op::FCOM | (pops as u64) << x87op::POP_SHIFT;
-        match src {
-            Some(m) => {
-                if self.x87_mem_in(self.cur_mem, m).is_none() {
-                    return self.illegal_x87();
-                }
-                word |= x87op::FORM_MEM << x87op::FORM_SHIFT | Self::mem_code(m);
-            }
-            None => word |= x87op::FORM_ST0_STI << x87op::FORM_SHIFT | (i as u64) << x87op::I_SHIFT,
-        }
-        if quiet {
-            word |= x87op::QUIET;
-        }
-        if eflags {
-            word |= x87op::TO_EFLAGS;
-        }
-        self.x87_host(word);
-        if eflags {
-            // The host leaves ZF, PF, CF in bits 0-2 of the scratch slot;
-            // `fcomi` clears OF, SF and AF.
-            let tmp = self.x87_tmp();
-            let r = self.b.def(Expr::Load {
-                addr: tmp,
-                offset: 0,
-                sz: MemSz::B4,
-                signed: false,
-                ty: Ty::I32,
-                order: Order::Relaxed,
-            });
-            let one = self.k32(1);
-            let z = self.b.bin(BinOp::And, Ty::I32, r, one);
-            let p = self.b.bin(BinOp::ShrU, Ty::I32, r, one);
-            let p = self.b.bin(BinOp::And, Ty::I32, p, one);
-            let two = self.k32(2);
-            let c = self.b.bin(BinOp::ShrU, Ty::I32, r, two);
-            let c = self.b.bin(BinOp::And, Ty::I32, c, one);
-            let zero = self.k32(0);
-            self.b.write(GuestReg::Z, z);
-            self.b.write(GuestReg::C, c);
-            self.b.write(GuestReg::P, p);
-            self.b.write(GuestReg::N, zero);
-            self.b.write(GuestReg::V, zero);
-            self.b.write(GuestReg::A, zero);
-            self.flags = FlagSource::Unknown;
-        }
-        Flow::Next
     }
 
     /// Clear C1, as the sign and move instructions do.
@@ -329,27 +181,27 @@ impl<'a> Lifter<'a> {
                 self.st_st(n, a);
                 self.clear_c1();
             }
-            Op::Fadd(s) => return self.x87_arith(x87op::FADD, s, false),
-            Op::Fmul(s) => return self.x87_arith(x87op::FMUL, s, false),
-            Op::Fsub(s) => return self.x87_arith(x87op::FSUB, s, false),
-            Op::Fsubr(s) => return self.x87_arith(x87op::FSUB, s, true),
-            Op::Fdiv(s) => return self.x87_arith(x87op::FDIV, s, false),
-            Op::Fdivr(s) => return self.x87_arith(x87op::FDIV, s, true),
+            Op::Fadd(s) => return self.x87_arith_op(X87Arith::Add, s, false),
+            Op::Fmul(s) => return self.x87_arith_op(X87Arith::Mul, s, false),
+            Op::Fsub(s) => return self.x87_arith_op(X87Arith::Sub, s, false),
+            Op::Fsubr(s) => return self.x87_arith_op(X87Arith::Sub, s, true),
+            Op::Fdiv(s) => return self.x87_arith_op(X87Arith::Div, s, false),
+            Op::Fdivr(s) => return self.x87_arith_op(X87Arith::Div, s, true),
             Op::Fcom { src, pop } => {
                 return match src {
                     X87Src::MemF(w) => {
                         let m = if w == Width::Q { X87Mem::F64 } else { X87Mem::F32 };
-                        self.x87_compare(Some(m), 0, pop, false, false)
+                        self.x87_compare_op(Some(m), 0, pop, false, false, false)
                     }
-                    X87Src::St0Sti(n) => self.x87_compare(None, n, pop, false, false),
+                    X87Src::St0Sti(n) => self.x87_compare_op(None, n, pop, false, false, false),
                     _ => self.illegal_x87(),
                 };
             }
-            Op::Fucom { i: n, pop } => return self.x87_compare(None, n, pop, true, false),
+            Op::Fucom { i: n, pop } => return self.x87_compare_op(None, n, pop, true, false, false),
             Op::Fcomi { i: n, pop, unordered } => {
-                return self.x87_compare(None, n, pop as u8, unordered, true);
+                return self.x87_compare_op(None, n, pop as u8, unordered, true, false);
             }
-            Op::Ficom { mem, pop } => return self.x87_compare(Some(mem), 0, pop as u8, false, false),
+            Op::Ficom { mem, pop } => return self.x87_compare_op(Some(mem), 0, pop as u8, false, false, false),
             Op::Fchs | Op::Fabs => {
                 let (sig, se) = self.ld_st(0);
                 let se = if i.op == Op::Fchs {
@@ -365,7 +217,7 @@ impl<'a> Lifter<'a> {
             Op::Fsqrt => self.x87_host(x87op::FSQRT),
             Op::Frndint => self.x87_host(x87op::FRNDINT),
             Op::Fscale => self.x87_host(x87op::FSCALE),
-            Op::Ftst => self.x87_host(x87op::FTST),
+            Op::Ftst => return self.x87_compare_op(None, 0, 0, false, false, true),
             Op::Fxam => self.x87_host(x87op::FXAM),
             Op::Fld1 | Op::Fldl2t | Op::Fldl2e | Op::Fldpi | Op::Fldlg2 | Op::Fldln2 | Op::Fldz => {
                 let k = match i.op {
