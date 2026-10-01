@@ -390,6 +390,13 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         if ra.opts.record.is_some() {
             bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
         }
+        // Refused rather than ignored: the NT layer's code all arrives through
+        // the runtime translator as Wine maps each image, and nothing builds
+        // those images on the function tier yet, so a run "with --cgen" would
+        // be tier-1 under another name.
+        if ra.xlate.cgen {
+            bail!("--cgen: the function tier does not handle Windows programs yet (they run on tier-1)");
+        }
         let exit = nt_run::run(&ra, &bytes)?;
         return Ok(report_exit(&exit, ra.opts.verbose));
     }
