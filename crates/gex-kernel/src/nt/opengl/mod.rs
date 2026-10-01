@@ -602,6 +602,8 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
     if let Some(dir) = std::env::var_os("GEX_NT_FRAMES") {
         write_ppm(&std::path::Path::new(&dir).join(format!("frame-{frame:05}.ppm")), w, h, &px);
     }
+    // Scripted input (GEX_NT_INPUT) is timed by frames.
+    super::user::input::script_tick(c, frame, hwnd);
     // The next frame is drawn at the window's size.
     fit_surface(c, hdc)?;
     Ok(true)
@@ -616,7 +618,12 @@ fn write_ppm(path: &std::path::Path, w: i32, h: i32, px: &[u8]) {
             out.extend_from_slice(&[px[o + 2], px[o + 1], px[o]]);
         }
     }
-    let _ = std::fs::write(path, out);
+    // Written whole and renamed, so a run that is stopped mid-frame leaves
+    // no torn file.
+    let tmp = path.with_extension("ppm.tmp");
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 // ------------------------------------------------------------ client arrays

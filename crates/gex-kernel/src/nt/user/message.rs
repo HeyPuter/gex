@@ -72,6 +72,8 @@ pub struct Timer {
 #[derive(Debug, Default)]
 pub struct Queue {
     pub posted: VecDeque<Msg>,
+    /// Hardware messages (keyboard and mouse), after posted ones.
+    pub input: VecDeque<super::input::HwMsg>,
     pub sent: VecDeque<Sent>,
     pub quit: Option<u64>,
     pub timers: Vec<Timer>,
@@ -90,6 +92,7 @@ impl Queue {
     /// Drop everything aimed at a destroyed window.
     pub fn forget_window(&mut self, hwnd: u32) {
         self.posted.retain(|m| m.hwnd != hwnd);
+        self.input.retain(|m| m.msg.hwnd != hwnd);
         self.timers.retain(|t| t.hwnd != hwnd);
     }
 }
@@ -104,6 +107,10 @@ fn now_ns(c: &Call<'_>) -> u64 {
 }
 
 /// Wake the thread `tid` (its wait word), if it exists.
+pub fn wake_thread(c: &mut Call<'_>, tid: u32) {
+    wake(c, tid);
+}
+
 fn wake(c: &mut Call<'_>, tid: u32) {
     if let Some(t) = c.p.thread_by_tid(tid) {
         sync::wake_thread(c, &t);
@@ -286,6 +293,31 @@ pub fn peek(c: &mut Call<'_>, hwnd: u32, first: u32, last: u32, flags: u32) -> R
             return Ok(Some(Msg { hwnd: 0, msg: wm::QUIT, wparam: code, lparam: 0, time, pt: q.last_pos }));
         }
     }
+    // Hardware input, after posted messages.
+    let input_mask = mask & (qs::KEY | qs::MOUSEMOVE | qs::MOUSEBUTTON);
+    if input_mask != 0 {
+        let pick = {
+            let snap: Vec<super::input::HwMsg> = u.thread(tid).queue.input.iter().copied().collect();
+            snap.iter().position(|hw| {
+                let bit = match hw.msg.msg {
+                    0x100..=0x109 => qs::KEY,
+                    0x200 => qs::MOUSEMOVE,
+                    _ => qs::MOUSEBUTTON,
+                };
+                input_mask & bit != 0 && matches(&u, &hw.msg, hwnd, first, last)
+            })
+        };
+        if let Some(i) = pick {
+            let q = &mut u.thread(tid).queue;
+            let hw = if remove { q.input.remove(i).unwrap() } else { q.input[i] };
+            q.last_time = hw.msg.time;
+            q.last_pos = hw.msg.pt;
+            if remove {
+                super::input::retrieved(&mut u, tid, &hw);
+            }
+            return Ok(Some(hw.msg));
+        }
+    }
     // WM_PAINT: after posted messages, before timers. It stays until the
     // window is validated; removing it only clears an internal paint.
     if mask & qs::PAINT != 0 && (first == 0 && last == 0 || (first..=last).contains(&wm::PAINT)) {
@@ -355,7 +387,8 @@ fn queue_ready(c: &Call<'_>, mask: u32, changed_only: bool) -> bool {
         }
         return false;
     }
-    let ready = (mask & qs::SENDMESSAGE != 0 && !q.sent.is_empty())
+    let ready = (mask & (qs::KEY | qs::MOUSEMOVE | qs::MOUSEBUTTON) != 0 && !q.input.is_empty())
+        || (mask & qs::SENDMESSAGE != 0 && !q.sent.is_empty())
         || (mask & (qs::POSTMESSAGE | qs::ALLPOSTMESSAGE) != 0 && (!q.posted.is_empty() || q.quit.is_some()))
         || (mask & qs::TIMER != 0 && q.timers.iter().any(|t| t.due <= now));
     ready || (mask & qs::PAINT != 0 && super::paint::window_to_paint(&u, tid, 0).is_some())
@@ -473,6 +506,13 @@ pub fn nt_user_get_queue_status(c: &mut Call<'_>) -> R64 {
     }
     if !q.sent.is_empty() {
         have |= qs::SENDMESSAGE;
+    }
+    for hw in &q.input {
+        have |= match hw.msg.msg {
+            0x100..=0x109 => qs::KEY,
+            0x200 => qs::MOUSEMOVE,
+            _ => qs::MOUSEBUTTON,
+        };
     }
     if q.timers.iter().any(|t| t.due <= now) {
         have |= qs::TIMER;
@@ -610,10 +650,7 @@ pub fn nt_user_dispatch_message(c: &mut Call<'_>) -> R64 {
 /// input yet.
 pub fn nt_user_translate_message(c: &mut Call<'_>) -> R64 {
     let m = read_msg(c, c.a(0))?;
-    match m.msg {
-        0x100..=0x109 => Err(c.unimplemented("TranslateMessage of a key message (no keyboard layout yet)")),
-        _ => Ok(0),
-    }
+    Ok(super::input::translate(c, &m)? as u64)
 }
 
 /// `NtUserSetTimer(hwnd, id, timeout, proc, tolerance)` and
@@ -695,9 +732,17 @@ pub fn nt_user_get_thread_state(c: &mut Call<'_>) -> R64 {
         5 => {
             // UserThreadStateInputState: QS_* bits of pending input
             let q = &t.queue;
-            (if q.posted.is_empty() { 0 } else { qs::POSTMESSAGE }) as u64
+            let mut bits = if q.posted.is_empty() { 0 } else { qs::POSTMESSAGE };
+            for hw in &q.input {
+                bits |= match hw.msg.msg {
+                    0x100..=0x109 => qs::KEY,
+                    0x200 => qs::MOUSEMOVE,
+                    _ => qs::MOUSEBUTTON,
+                };
+            }
+            bits as u64
         }
-        6 => 0, // cursor
+        6 => handle_ret(u.input.cursor_handle),
         7 => t.queue.extra_info,
         8 => (!t.queue.replying.is_empty()) as u64,
         9 => t.queue.last_time as u64,

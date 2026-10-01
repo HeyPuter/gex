@@ -328,7 +328,7 @@ pub fn nt_user_enum_display_devices(c: &mut Call<'_>) -> R64 {
         return Ok(0);
     }
     let cb = c.g.u32(info)?;
-    let mut put = |c: &mut Call<'_>, at: u64, n: usize, s: &str| -> R<()> {
+    let put = |c: &mut Call<'_>, at: u64, n: usize, s: &str| -> R<()> {
         if at + 2 * n as u64 <= info + cb as u64 {
             let mut w = crate::nt::to_w(s);
             w.resize(n, 0);

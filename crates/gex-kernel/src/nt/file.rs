@@ -116,6 +116,12 @@ pub fn nt_to_target(c: &Call<'_>, nt: &[u16]) -> R<Target> {
     if rl == "nul" {
         return Ok(Target::Null);
     }
+    // The named pipe namespace: no process serves a pipe (there are no
+    // services and no wineserver), so every pipe is absent, which is what a
+    // client of a stopped service sees.
+    if rl.starts_with("pipe\\") {
+        return Err(Status(st::OBJECT_NAME_NOT_FOUND));
+    }
     let b = rest.as_bytes();
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
         let root = drive_root(c, b[0]).ok_or(Status(st::OBJECT_PATH_NOT_FOUND))?;

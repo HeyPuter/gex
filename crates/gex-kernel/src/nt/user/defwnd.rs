@@ -171,9 +171,11 @@ pub fn default_window_proc(c: &mut Call<'_>, h: u32, msg: u32, wparam: u64, lpar
         0x0011 => Ok(1), // WM_QUERYENDSESSION
         0x001f => Ok(0), // WM_CANCELMODE
         0x007f => Ok(0), // WM_GETICON: no icons
+        0x0080 => Ok(0), // WM_SETICON: the previous icon, none (the frame draws none)
         0x0055 => Ok(2), // WM_NOTIFYFORMAT: NFR_UNICODE
         0x0281..=0x0291 => Ok(0), // WM_IME_*
         0x0200..=0x020e => Ok(0), // client-area mouse messages
+        0x02a1..=0x02a3 => Ok(0), // WM_MOUSEHOVER, WM_NCMOUSELEAVE, WM_MOUSELEAVE
         wm::ERASEBKGND => super::paint::default_erase(c, hwnd, wparam as u32),
         wm::PAINT => super::paint::default_paint(c, hwnd),
         // The compositor draws window frames (§6a.1).

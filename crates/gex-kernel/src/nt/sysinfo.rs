@@ -223,6 +223,32 @@ fn query_system(c: &mut Call<'_>, class: u32, buf: u64, len: u64, ret: u64) -> R
             c.g.wptr(buf, if c.p.abi == Abi::P64 { 0xffff_8000_0000_0000 } else { 0x8000_0000 })?;
             ps
         }
+        // SystemInterruptInformation: per processor, six counters. Wine
+        // returns random bytes (programs use them as entropy); these are
+        // pseudorandom and deterministic, as gex's /dev/random is.
+        23 => {
+            let size = 24 * PROCESSORS as u64;
+            need(len, size)?;
+            let mut x: u64 = 0x2545_f491_4f6c_dd1d ^ c.p.clocks.filetime();
+            for i in 0..size / 8 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                c.g.w64(buf + 8 * i, x)?;
+            }
+            size
+        }
+        // SystemCurrentTimeZoneInformation: RTL_TIME_ZONE_INFORMATION, the
+        // first 172 bytes of class 102's answer (UTC).
+        44 => {
+            let size = 172u64;
+            need(len, size)?;
+            c.g.zero(buf, size as usize)?;
+            let name = to_w("Coordinated Universal Time");
+            c.g.write_wchars(buf + 4, &name)?;
+            c.g.write_wchars(buf + 88, &name)?;
+            size
+        }
         // SystemDynamicTimeZoneInformation: UTC, gex's only time zone
         // (RTL_DYNAMIC_TIME_ZONE_INFORMATION: bias, standard name[32] and
         // date and bias, daylight name[32] and date and bias, key name[128],

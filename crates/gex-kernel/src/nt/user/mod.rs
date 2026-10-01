@@ -13,6 +13,8 @@
 
 pub mod class;
 pub mod defwnd;
+pub mod input;
+pub mod kbdus;
 pub mod message;
 pub mod paint;
 pub mod sysparams;
@@ -105,6 +107,33 @@ pub struct ThreadState {
     pub capture: u32,
     /// Recursion depth of window procedure calls on this thread.
     pub call_depth: u32,
+    /// Synchronous key state (GetKeyState): as of the last input message
+    /// this thread retrieved.
+    pub keys: KeyState,
+}
+
+/// A key state table (256 bytes; `Default` for a fixed-size array this
+/// long is not derived).
+#[derive(Clone, Copy, Debug)]
+pub struct KeyState(pub [u8; 256]);
+
+impl Default for KeyState {
+    fn default() -> Self {
+        KeyState([0; 256])
+    }
+}
+
+impl std::ops::Deref for KeyState {
+    type Target = [u8; 256];
+    fn deref(&self) -> &[u8; 256] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KeyState {
+    fn deref_mut(&mut self) -> &mut [u8; 256] {
+        &mut self.0
+    }
 }
 
 /// The process's USER state.
@@ -117,6 +146,8 @@ pub struct User {
     pub winprocs: Vec<(u64, u64)>,
     pub workers: [u64; NB_WORKERS],
     handles: Vec<Option<HandleEntry>>,
+    /// The last generation each slot was given.
+    generations: Vec<u16>,
     free: Vec<usize>,
     pub classes: Vec<class::Class>,
     pub next_class_id: u32,
@@ -132,6 +163,8 @@ pub struct User {
     pub foreground: u32,
     pub process_dpi_context: u32,
     pub sys: sysparams::SysParams,
+    /// Keyboard, mouse and cursor state.
+    pub input: input::InputState,
 }
 
 impl User {
@@ -142,6 +175,7 @@ impl User {
             winprocs: vec![(0, 0); NB_PROCS],
             workers: [0; NB_WORKERS],
             handles: Vec::new(),
+            generations: Vec::new(),
             free: Vec::new(),
             classes: Vec::new(),
             next_class_id: 0,
@@ -156,6 +190,7 @@ impl User {
             // DPI_AWARENESS_UNAWARE, version 1, 96 dpi (NTUSER_DPI_UNAWARE).
             process_dpi_context: 0x6010,
             sys: sysparams::SysParams::default(),
+            input: input::InputState::default(),
         }
     }
 
@@ -170,18 +205,24 @@ impl User {
                 self.handles.len() - 1
             }
         };
-        let generation = self.handles[index].map_or(1, |e| e.generation.wrapping_add(1).max(1));
+        if self.generations.len() <= index {
+            self.generations.resize(index + 1, 0);
+        }
+        // A new generation per use of the slot, so a stale handle to the old
+        // object does not name the new one.
+        let generation = match self.generations[index] {
+            0xfffe.. => 1, // 0xffff reads as "any generation"
+            g => g + 1,
+        };
+        self.generations[index] = generation;
         self.handles[index] = Some(HandleEntry { kind, generation });
         Some(FIRST_USER_HANDLE + 2 * index as u32 | (generation as u32) << 16)
     }
 
     pub fn free_handle(&mut self, h: u32) {
         if let Some(i) = self.handle_index(h) {
-            // Keep the generation so the next handle in this slot differs.
-            let generation = self.handles[i].map(|e| e.generation).unwrap_or(0);
             self.handles[i] = None;
             self.free.push(i);
-            let _ = generation;
         }
     }
 
@@ -446,6 +487,37 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtUserEnumDisplaySettings => sysparams::nt_user_enum_display_settings(c),
         n::NtUserEnumDisplayDevices => sysparams::nt_user_enum_display_devices(c),
         n::NtUserGetDC => paint::nt_user_get_dc(c),
+        n::NtUserGetKeyboardLayout => input::nt_user_get_keyboard_layout(c),
+        n::NtUserGetKeyboardLayoutList => input::nt_user_get_keyboard_layout_list(c),
+        n::NtUserActivateKeyboardLayout => input::nt_user_activate_keyboard_layout(c),
+        n::NtUserMapVirtualKeyEx => input::nt_user_map_virtual_key_ex(c),
+        n::NtUserGetKeyState => input::nt_user_get_key_state(c),
+        n::NtUserGetAsyncKeyState => input::nt_user_get_async_key_state(c),
+        n::NtUserGetKeyboardState => input::nt_user_get_keyboard_state(c),
+        n::NtUserSetKeyboardState => input::nt_user_set_keyboard_state(c),
+        n::NtUserToUnicodeEx => input::nt_user_to_unicode_ex(c),
+        n::NtUserVkKeyScanEx => input::nt_user_vk_key_scan_ex(c),
+        n::NtUserGetCursorPos => input::nt_user_get_cursor_pos(c),
+        n::NtUserSetCursorPos => input::nt_user_set_cursor_pos(c),
+        n::NtUserClipCursor => input::nt_user_clip_cursor(c),
+        n::NtUserGetClipCursor => input::nt_user_get_clip_cursor(c),
+        n::NtUserShowCursor => input::nt_user_show_cursor(c),
+        n::NtUserSetCursor => input::nt_user_set_cursor(c),
+        n::NtUserGetCursor => input::nt_user_get_cursor(c),
+        n::NtUserGetCursorInfo => input::nt_user_get_cursor_info(c),
+        n::NtUserSetCursorIconData => input::nt_user_set_cursor_icon_data(c),
+        n::NtUserFindExistingCursorIcon => input::nt_user_find_existing_cursor_icon(c),
+        n::NtUserDestroyCursor => input::nt_user_destroy_cursor(c),
+        n::NtUserGetIconSize => input::nt_user_get_icon_size(c),
+        n::NtUserGetIconInfo => input::nt_user_get_icon_info(c),
+        n::NtUserGetDoubleClickTime => input::nt_user_get_double_click_time(c),
+        n::NtUserGetClipboardSequenceNumber => input::nt_user_get_clipboard_sequence_number(c),
+        n::NtUserAssociateInputContext => input::nt_user_associate_input_context(c),
+        n::NtUserSetCapture => input::nt_user_set_capture(c),
+        n::NtUserReleaseCapture => input::nt_user_release_capture(c),
+        n::NtUserWindowFromPoint => input::nt_user_window_from_point(c),
+        n::NtUserTrackMouseEvent => input::nt_user_track_mouse_event(c),
+        n::NtUserSendInput => input::nt_user_send_input(c),
         n::NtUserGetDCEx => paint::nt_user_get_dc_ex(c),
         n::NtUserGetWindowDC => paint::nt_user_get_window_dc(c),
         n::NtUserReleaseDC => paint::nt_user_release_dc(c),
@@ -493,6 +565,8 @@ fn call_no_param(c: &mut Call<'_>) -> R64 {
 fn call_one_param(c: &mut Call<'_>) -> R64 {
     let (arg, code) = (c.a(0), c.a32(1));
     match code {
+        // CreateCursorIcon(is_icon)
+        0 => input::create_cursor_icon(c, arg != 0),
         // GetPrimaryMonitorRect
         5 => {
             let r = sysparams::primary_rect(c);
