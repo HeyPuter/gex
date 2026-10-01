@@ -2669,6 +2669,19 @@ EMSCRIPTEN_KEEPALIVE int gex_gl_submit(const uint8_t* data, uint32_t len,
     }
     return 0;
 }
+/* Set one host-side environment variable, as "NAME=VALUE".
+ *
+ * The driver's diagnostics are all getenv-gated (GEX_WGPU_DUMP_WGSL and the
+ * rest), and in the browser getenv answers NULL for every one of them unless
+ * the page sets them here, before gex_gl_init. The Mesa fork's gex-wasm
+ * targets export it. */
+EMSCRIPTEN_KEEPALIVE void gex_gl_setenv(const char *pair) {
+    if (!pair) return;
+    const char *equals = std::strchr(pair, '=');
+    if (!equals || equals == pair) return;
+    const std::string name(pair, (size_t)(equals - pair));
+    setenv(name.c_str(), equals + 1, 1);
+}
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_reply_len() { return reply.size(); }
 EMSCRIPTEN_KEEPALIVE const uint8_t* gex_gl_reply_data() { return reply.data(); }
 /* Show one frame of every window that has one waiting.
