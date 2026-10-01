@@ -18,6 +18,7 @@
 //! way.
 
 pub mod boot;
+pub mod display;
 pub mod file;
 pub mod gdi;
 pub mod layout;
@@ -382,6 +383,8 @@ pub struct Process {
     pub gdi: Mutex<gdi::Gdi>,
     /// opengl32's Unix side: contexts and the GL command ring.
     pub gl: Mutex<opengl::State>,
+    /// Where top-level windows are shown, if anywhere (§6a.1).
+    pub display_host: Mutex<Option<Arc<dyn display::NtDisplay>>>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
@@ -451,6 +454,7 @@ impl Process {
             user: Mutex::new(user::User::new()),
             gdi: Mutex::new(Default::default()),
             gl: Mutex::new(Default::default()),
+            display_host: Mutex::new(None),
             kill_list: Mutex::new(Vec::new()),
         }
     }
@@ -466,6 +470,11 @@ impl Process {
             }
             _ => format!("{addr:#x}"),
         }
+    }
+
+    /// The display, if the host gave the process one.
+    pub fn display(&self) -> Option<Arc<dyn display::NtDisplay>> {
+        self.display_host.lock().unwrap().clone()
     }
 
     pub fn new_sync_id(&self) -> u64 {

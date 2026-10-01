@@ -267,6 +267,7 @@ const PM_QS_SHIFT: u32 = 16;
 /// Look for a message (Wine's `peek_message`): sent messages are handled
 /// first, then posted messages, the quit message, and due timers.
 pub fn peek(c: &mut Call<'_>, hwnd: u32, first: u32, last: u32, flags: u32) -> R<Option<Msg>> {
+    crate::nt::display::pump_input(c);
     process_sent(c)?;
     let tid = c.t.tid;
     let remove = flags & PM_REMOVE != 0;

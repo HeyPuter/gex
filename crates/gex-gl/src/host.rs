@@ -190,7 +190,6 @@ mod ffi {
             pixels: *const c_void,
         );
 
-        pub fn glGenFramebuffers(n: GLsizei, names: *mut GLuint);
         pub fn glDeleteFramebuffers(n: GLsizei, names: *const GLuint);
         pub fn glBindFramebuffer(target: GLenum, name: GLuint);
         pub fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
