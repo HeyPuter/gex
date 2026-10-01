@@ -86,7 +86,8 @@ pub fn check_function(
     rep: &mut Report,
 ) {
     rep.functions += 1;
-    let call = |c: Callee| sums.call_effect(c);
+    let ssa = sums.to_ssa(f);
+    let call = sums.effects_for(&[f, &ssa]);
     // Syscalls as the summaries model them.
     let nr = reg_index(crate::arch::SYSCALL_NR);
     let syscall = |regs: &[u64]| crate::summary::syscall_effect(Some(regs[nr]));
@@ -97,7 +98,6 @@ pub fn check_function(
         syscall: Some(&syscall),
         narrow: crate::arch::compat(),
     };
-    let ssa = sums.to_ssa(f);
     let own = sums.get(a);
     let spi = reg_index(SP_REG);
     let name = f.name.as_deref().unwrap_or("-");

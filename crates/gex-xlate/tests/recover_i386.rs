@@ -173,3 +173,39 @@ fn a_pe32_image_recovers_from_its_entry_relocations_and_tables() {
     assert_eq!(sums.get(0x401010).sp_delta, Some(4));
     check_all(&prog.functions, &sums, 16);
 }
+
+/// `f`: `push %ebx; mov 8(%esp),%ebx; mov $20,%eax; call *%gs:0x10;
+/// add %ebx,%eax; pop %ebx; ret` -- getpid through musl's vsyscall entry --
+/// and `stub`: `int $0x80; ret`, which `%gs:0x10` holds.
+#[test]
+fn a_guarded_vsyscall_is_the_syscall_it_makes() {
+    let text = hex("538b5c2408b81400000065ff151000000001d85bc3cd80c3");
+    let len = text.len() as u64;
+    let mut img = elf32();
+    img.segments = vec![segment(0x10000, text, true)];
+    img.code = vec![(0x10000, 0x10000 + len)];
+    img.text_range = (0x10000, 0x10000 + len);
+    img.symbols = vec![sym("f", 0x10000, 0x15), sym("stub", 0x10015, 3)];
+    let prog = recover(&img, None, &RecoverOptions::default());
+    let f = &prog.functions[&0x10000];
+
+    // Unguarded, the call is to unknown code: nothing is proved.
+    let plain = gex_xlate::summary::analyze(&prog);
+    let sf = plain.get(0x10000);
+    assert!(sf.unknown_callee && !sf.preserved.contains(GuestReg::X(3)));
+
+    let guards = gex_xlate::summary::vsyscall_guards(&prog);
+    assert_eq!(guards.calls.get(&0x1000a), Some(&vec![0x10015]), "{guards:?}");
+    let sums = gex_xlate::summary::analyze_with_guards(&prog, &guards);
+    let sf = sums.get(0x10000);
+    let d = gex_xlate::summary::describe(&sf);
+    // getpid (20) changes eax only: ebx is restored, the stack balances,
+    // and nothing unknown is reached.
+    assert!(!sf.unknown_callee && !sf.may_unwind, "{d}");
+    assert!(sf.preserved.contains(GuestReg::X(3)) && sf.preserved.contains(GuestReg::X(1)), "{d}");
+    assert_eq!(sf.sp_delta, Some(4), "{d}");
+    // SSA carries ebx and ecx across the guarded call.
+    let s = sums.to_ssa(f);
+    s.verify().unwrap();
+    check_all(&prog.functions, &sums, 64);
+}

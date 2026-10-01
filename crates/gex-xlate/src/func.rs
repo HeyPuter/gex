@@ -1398,7 +1398,10 @@ fn plausible_start(code: &Code, a: u64, typed: bool) -> bool {
     if n == 0 || !arch::decodable(&buf[..n], a) {
         return false;
     }
-    !gex_abi::X86 || typed || a % 16 == 0
+    // A syscall stub (`int $0x80; ret`, `syscall; ret`): i386 musl's
+    // `__vsyscall`, which only its `__sysinfo` pointer names.
+    let stub = n >= 3 && (buf[..3] == [0xcd, 0x80, 0xc3] || buf[..3] == [0x0f, 0x05, 0xc3]);
+    !gex_abi::X86 || typed || a % 16 == 0 || stub
 }
 
 /// Which functions cover an address at an instruction boundary.

@@ -71,6 +71,38 @@ pub const WIDEN_AFTER: usize = 16;
 pub struct Summaries {
     pub map: HashMap<u64, Summary>,
     pub stats: SummaryStats,
+    /// The guards the summaries were computed with ([`analyze_with_guards`];
+    /// empty for [`analyze`]).
+    pub guards: Guards,
+    /// What each guarded call site was assumed to do, by (function, calling
+    /// instruction): what SSA construction and the interpreter checks must
+    /// assume there too.
+    pub site_effects: HashMap<(u64, u64), CallEffect>,
+    /// Functions that are syscall stubs (see [`Guards`]), with how far each
+    /// moves the stack pointer.
+    pub stubs: HashMap<u64, i64>,
+}
+
+/// Guarded targets of indirect calls, by the calling instruction's address:
+/// the function tier compares the computed target with these and takes the
+/// known callee's path on a match.
+///
+/// **Contract.** A summary computed with guards
+/// ([`analyze_with_guards`]) is valid only if every guard miss leaves the
+/// function tier before any instruction after the guarded call executes:
+/// the miss writes guest state back, sets the PC to the actual target and
+/// returns to the host loop, and every function-tier caller up the nest
+/// leaves through its return check, so none continues under an assumption
+/// the miss broke. A backend that cannot promise that must use [`analyze`].
+///
+/// At a guarded site the callee's summary is the join of its targets'
+/// (unknown if any target has none). A site whose targets are all syscall
+/// stubs (`int $0x80; ret`, `syscall; ret`, `svc #0; ret`: i386 musl's
+/// `__vsyscall`, called through `%gs:0x10`) is the syscall itself, with the
+/// syscall number the caller set ([`vsyscall_guards`]).
+#[derive(Clone, Debug, Default)]
+pub struct Guards {
+    pub calls: HashMap<u64, Vec<u64>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,7 +129,43 @@ impl Summaries {
     /// `f` in SSA form, with these summaries standing in for its calls
     /// and the guest's stack pointer ([`crate::func::to_ssa`]).
     pub fn to_ssa(&self, f: &Function) -> Function {
-        crate::func::to_ssa(f, &|c| self.call_effect(c))
+        let eff = self.effects_for(&[f]);
+        crate::func::to_ssa(f, &eff)
+    }
+
+    /// What each call of the function `forms[0]` (in any of its `forms`:
+    /// memory and SSA) does, as these summaries assumed: a guarded site's
+    /// recorded effect, found by its target value, which names one call
+    /// site of a form. A value two sites share (after SSA renaming) gets the
+    /// meet of their effects.
+    pub fn effects_for<'a>(&'a self, forms: &[&Function]) -> impl Fn(Callee) -> CallEffect + 'a {
+        let entry = forms[0].entry;
+        let mut by_value: HashMap<Value, Option<CallEffect>> = HashMap::new();
+        if !self.site_effects.is_empty() {
+            for f in forms {
+                for b in &f.blocks {
+                    if let FTerm::Call {
+                        callee: Callee::Indirect(v),
+                        ..
+                    } = b.term
+                    {
+                        if let Some(&e) = self.site_effects.get(&(entry, b.term_pc)) {
+                            let slot = by_value.entry(v).or_insert(Some(e));
+                            if let Some(old) = *slot {
+                                *slot = Some(CallEffect {
+                                    preserved: old.preserved.inter(e.preserved),
+                                    sp_delta: if old.sp_delta == e.sp_delta { e.sp_delta } else { None },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        move |c| match c {
+            Callee::Indirect(v) => by_value.get(&v).copied().flatten().unwrap_or(CallEffect::UNKNOWN),
+            c => self.call_effect(c),
+        }
     }
 
     /// What a call does to registers, for [`gex_ir::ssa::to_ssa`].
@@ -335,6 +403,90 @@ impl St {
 // Per-function analysis
 // ---------------------------------------------------------------------------
 
+/// A syscall from state `st`: the state after it, and its number when
+/// known.
+fn syscall_step(st: &St, acc: &mut Acc) -> (St, Option<u64>) {
+        let (reads, clobbers) = syscall_regs();
+        acc.inputs = acc.inputs.union(reads.minus(st.written));
+        let nr = match st.regs[reg_index(SYSCALL_NR)].ex {
+            Ex::Const(c) => Some(c),
+            _ => None,
+        };
+        let mut after = st.clone();
+        // Pointer arguments: the kernel may write through them.
+        let frame_arg = reads.iter().any(|r| after.regs[reg_index(r)].frame());
+        if frame_arg {
+            escape(&mut after, acc);
+        }
+        // The kernel may keep what it is handed (set_tid_address,
+        // set_robust_list, and whatever a syscall not known to be
+        // harmless does).
+        let keeps = nr.map_or(true, |nr| !benign_syscall(nr) || syscall_keeps_args(nr));
+        for r in reads.iter() {
+            let v = after.regs[reg_index(r)];
+            acc.addr_inputs = acc.addr_inputs.union(v.taint.minus(RegSet::of(&[SP_REG])));
+            if keeps {
+                acc.escapes = acc.escapes.union(v.taint);
+            }
+        }
+        after.unknown_store();
+        match nr {
+            Some(nr) if benign_syscall(nr) => {
+                for r in clobbers.iter() {
+                    after.regs[reg_index(r)] = AV::top(RegSet::EMPTY);
+                }
+            }
+            _ => {
+                // A signal handler sees every register.
+                acc.may_unwind = true;
+                escape_regs(&after, acc);
+                for r in after.regs.iter_mut() {
+                    *r = AV::top(RegSet::EMPTY);
+                }
+                after.slots.clear();
+            }
+        }
+    (after, nr)
+}
+
+/// A syscall stub: a function that is a syscall instruction and a return
+/// (`int $0x80; ret`, `syscall; ret`, `svc #0; ret`), touching no register
+/// but the stack pointer on the way. Returns how far the return moves the
+/// stack pointer.
+fn syscall_stub(f: &Function) -> Option<i64> {
+    let lifted: Vec<&FBlock> = f.blocks.iter().filter(|b| !b.synthetic).collect();
+    if lifted.len() != 2 {
+        return None;
+    }
+    let FTerm::Syscall { next: Some(e), .. } = &f.blocks[0].term else {
+        return None;
+    };
+    let quiet = |b: &FBlock, allow: &[GuestReg]| {
+        b.stmts.iter().all(|s| match s {
+            Stmt::WriteReg { reg, .. } => *reg == GuestReg::Pc || allow.contains(reg),
+            Stmt::Def { .. } => true,
+            _ => false,
+        })
+    };
+    let mut to = e.to;
+    // A synthetic landing block may sit between them.
+    if f.block(to).synthetic {
+        match &f.block(to).term {
+            FTerm::Jump(e2) => to = e2.to,
+            _ => return None,
+        }
+    }
+    let ret = f.block(to);
+    if !(quiet(&f.blocks[0], &[]) && matches!(ret.term, FTerm::Return { .. }) && quiet(ret, &[SP_REG])) {
+        return None;
+    }
+    // The stack pointer at the return: entry + k, read from the block.
+    let mut st = St::entry();
+    let mut acc = Acc::empty(f.blocks.len());
+    run_block(ret, &mut st, &mut acc);
+    st.regs[SP].sp_off()
+}
+
 /// The frame's address has escaped: from here on other code may read (and
 /// write) it, so whatever its slots hold escapes too.
 fn escape(st: &mut St, acc: &mut Acc) {
@@ -374,6 +526,27 @@ struct Acc {
     /// Per block: ends in an unresolved jump taken with the frame torn
     /// down (stack pointer and return address as on entry).
     torn_down: Vec<bool>,
+}
+
+impl Acc {
+    fn empty(n: usize) -> Acc {
+        Acc {
+            inputs: RegSet::EMPTY,
+            stack_inputs: Slots::None,
+            caller_frame_writes: Slots::None,
+            addr_inputs: RegSet::EMPTY,
+            may_unwind: false,
+            may_leave_pending: false,
+            unknown_callee: false,
+            reads_ra: false,
+            leaks_sp: false,
+            escapes: RegSet::EMPTY,
+            out_src: RegSet::EMPTY,
+            torn_down: vec![false; n],
+            exits: Vec::new(),
+            unknown_exit: false,
+        }
+    }
 }
 
 /// Registers the kernel reads for a syscall, and those it may change.
@@ -466,9 +639,42 @@ struct Ctx<'a> {
     sums: &'a HashMap<u64, Summary>,
     /// See [`St::trust_frame`]. Never for summaries.
     trust_frame: bool,
+    /// Guarded indirect call sites, and the functions that are syscall
+    /// stubs (see [`Guards`]).
+    guards: Option<&'a Guards>,
+    stubs: Option<&'a HashMap<u64, i64>>,
 }
 
 impl Ctx<'_> {
+    /// The guard targets of the call at `site`, when it is an indirect call
+    /// with guards.
+    fn guarded(&self, c: Callee, site: u64) -> Option<&Vec<u64>> {
+        match c {
+            Callee::Indirect(_) => self.guards?.calls.get(&site).filter(|t| !t.is_empty()),
+            Callee::Direct(_) => None,
+        }
+    }
+
+    /// The callee's summary at `site`: a guarded call's targets joined.
+    fn callee_at(&self, c: Callee, site: u64) -> Summary {
+        match self.guarded(c, site) {
+            Some(ts) => {
+                let mut it = ts.iter().map(|t| self.callee(Callee::Direct(*t)));
+                let first = it.next().unwrap();
+                it.fold(first, |a, b| join_summaries(&a, &b))
+            }
+            None => self.callee(c),
+        }
+    }
+
+    /// Whether every guard target at `site` is a syscall stub.
+    fn stub_site(&self, c: Callee, site: u64) -> bool {
+        match (self.guarded(c, site), self.stubs) {
+            (Some(ts), Some(stubs)) => ts.iter().all(|t| stubs.contains_key(t)),
+            _ => false,
+        }
+    }
+
     fn callee(&self, c: Callee) -> Summary {
         let s = match c {
             Callee::Direct(a) => self.sums.get(&a).cloned(),
@@ -1146,6 +1352,8 @@ fn known_values_mode(f: &Function, sums: Option<&Summaries>, trust_frame: bool) 
     let ctx = Ctx {
         sums: sums.map_or(&empty, |s| &s.map),
         trust_frame,
+        guards: sums.map(|s| &s.guards),
+        stubs: sums.map(|s| &s.stubs),
     };
     let mut rec: Vec<HashMap<Value, AV>> = vec![HashMap::new(); f.blocks.len()];
     analyze_fn_rec(f, &ctx, Some(&mut rec));
@@ -1172,16 +1380,18 @@ pub fn frame_torn_down(f: &Function, sums: &Summaries) -> Vec<u64> {
     let ctx = Ctx {
         sums: &sums.map,
         trust_frame: true,
+        guards: Some(&sums.guards),
+        stubs: Some(&sums.stubs),
     };
     let mut acc_out = Vec::new();
-    analyze_fn_full(f, &ctx, None, Some(&mut acc_out));
+    analyze_fn_full(f, &ctx, None, Some(&mut acc_out), None);
     acc_out
 }
 
 /// [`analyze_fn`], optionally recording every value's abstract value on
 /// the last (fixpoint) visit of its block.
 fn analyze_fn_rec(f: &Function, ctx: &Ctx, record: Option<&mut Vec<HashMap<Value, AV>>>) -> Summary {
-    analyze_fn_full(f, ctx, record, None)
+    analyze_fn_full(f, ctx, record, None, None)
 }
 
 fn analyze_fn_full(
@@ -1189,24 +1399,10 @@ fn analyze_fn_full(
     ctx: &Ctx,
     mut record: Option<&mut Vec<HashMap<Value, AV>>>,
     torn: Option<&mut Vec<u64>>,
+    mut sites: Option<&mut Vec<(u64, CallEffect)>>,
 ) -> Summary {
     let n = f.blocks.len();
-    let mut acc = Acc {
-        inputs: RegSet::EMPTY,
-        stack_inputs: Slots::None,
-        caller_frame_writes: Slots::None,
-        addr_inputs: RegSet::EMPTY,
-        may_unwind: false,
-        may_leave_pending: false,
-        unknown_callee: false,
-        reads_ra: false,
-        leaks_sp: false,
-        escapes: RegSet::EMPTY,
-        out_src: RegSet::EMPTY,
-        torn_down: vec![false; n],
-        exits: Vec::new(),
-        unknown_exit: false,
-    };
+    let mut acc = Acc::empty(n);
     let rpo = f.rpo();
     let mut order = vec![usize::MAX; n];
     for (i, b) in rpo.iter().enumerate() {
@@ -1290,19 +1486,64 @@ fn analyze_fn_full(
                 }
             }
             FTerm::Call { callee, ret, .. } => {
-                let s = ctx.callee(*callee);
+                let site = blk.term_pc;
                 if let Callee::Indirect(v) = callee {
                     note_addr(&mut acc, get(*v));
                 }
-                let mut after = st.clone();
-                if call(&mut after, &mut acc, &s) {
-                    if let Some(e) = ret {
+                if ctx.stub_site(*callee, site) {
+                    // The syscall the stub makes, with the number and
+                    // arguments this caller set; the stub's `ret` pops what
+                    // the call pushed.
+                    // How far the stubs' `ret` moves the stack pointer (their
+                    // own summaries cannot say, not knowing the number).
+                    let delta = {
+                        let stubs = ctx.stubs.unwrap();
+                        let ds: Vec<i64> = ctx.guarded(*callee, site).unwrap().iter().map(|t| stubs[t]).collect();
+                        ds.iter().all(|&d| d == ds[0]).then_some(ds[0])
+                    };
+                    let sp = st.regs[SP];
+                    let (mut after, nr) = syscall_step(&st, &mut acc);
+                    let benign = nr.is_some_and(benign_syscall);
+                    after.regs[SP] = match (sp.sp_off(), delta) {
+                        (Some(o), Some(d)) if benign => AV {
+                            ex: Ex::Entry(SP as u8, o + d),
+                            taint: sp.taint,
+                        },
+                        _ => AV::top(sp.taint),
+                    };
+                    if let Some(out) = sites.as_deref_mut() {
+                        let e = syscall_effect(nr);
+                        let mut preserved = e.preserved;
+                        preserved.remove(SP_REG);
+                        out.push((
+                            site,
+                            CallEffect {
+                                preserved,
+                                sp_delta: if benign { delta } else { None },
+                            },
+                        ));
+                    }
+                    let never = nr.is_some_and(crate::arch::syscall_never_returns);
+                    if let (Some(e), false) = (ret, never) {
                         succ_state.push((e.to, after));
+                    }
+                } else {
+                    let s = ctx.callee_at(*callee, site);
+                    if ctx.guarded(*callee, site).is_some() {
+                        if let Some(out) = sites.as_deref_mut() {
+                            out.push((site, CallEffect::from_summary(&s)));
+                        }
+                    }
+                    let mut after = st.clone();
+                    if call(&mut after, &mut acc, &s) {
+                        if let Some(e) = ret {
+                            succ_state.push((e.to, after));
+                        }
                     }
                 }
             }
             FTerm::TailCall { callee } => {
-                let s = ctx.callee(*callee);
+                let s = ctx.callee_at(*callee, blk.term_pc);
                 if let Callee::Indirect(v) = callee {
                     note_addr(&mut acc, get(*v));
                 }
@@ -1358,46 +1599,7 @@ fn analyze_fn_full(
                 unknown_of[bi] = true;
             }
             FTerm::Syscall { next, .. } => {
-                let (reads, clobbers) = syscall_regs();
-                acc.inputs = acc.inputs.union(reads.minus(st.written));
-                let nr = match st.regs[reg_index(SYSCALL_NR)].ex {
-                    Ex::Const(c) => Some(c),
-                    _ => None,
-                };
-                let mut after = st.clone();
-                // Pointer arguments: the kernel may write through them.
-                let frame_arg = reads.iter().any(|r| after.regs[reg_index(r)].frame());
-                if frame_arg {
-                    escape(&mut after, &mut acc);
-                }
-                // The kernel may keep what it is handed (set_tid_address,
-                // set_robust_list, and whatever a syscall not known to be
-                // harmless does).
-                let keeps = nr.map_or(true, |nr| !benign_syscall(nr) || syscall_keeps_args(nr));
-                for r in reads.iter() {
-                    let v = after.regs[reg_index(r)];
-                    acc.addr_inputs = acc.addr_inputs.union(v.taint.minus(RegSet::of(&[SP_REG])));
-                    if keeps {
-                        acc.escapes = acc.escapes.union(v.taint);
-                    }
-                }
-                after.unknown_store();
-                match nr {
-                    Some(nr) if benign_syscall(nr) => {
-                        for r in clobbers.iter() {
-                            after.regs[reg_index(r)] = AV::top(RegSet::EMPTY);
-                        }
-                    }
-                    _ => {
-                        // A signal handler sees every register.
-                        acc.may_unwind = true;
-                        escape_regs(&after, &mut acc);
-                        for r in after.regs.iter_mut() {
-                            *r = AV::top(RegSet::EMPTY);
-                        }
-                        after.slots.clear();
-                    }
-                }
+                let (after, _) = syscall_step(&st, &mut acc);
                 if let Some(e) = next {
                     succ_state.push((e.to, after));
                 }
@@ -1522,6 +1724,84 @@ fn join_summaries(a: &Summary, b: &Summary) -> Summary {
     }
 }
 
+/// Guards for i386 syscalls made through the vsyscall entry: every
+/// `call *%gs:0x10` (musl reads its TCB's `sysinfo` word there) guarded
+/// with the image's syscall stub, when it has exactly one. musl sets that
+/// word to its own `__vsyscall` unless the kernel passes `AT_SYSINFO`, and
+/// gex passes none, so the guard does not miss. See [`Guards`] for what a
+/// backend must do when one does.
+pub fn vsyscall_guards(prog: &Program) -> Guards {
+    let mut g = Guards::default();
+    if !crate::arch::compat() {
+        return g;
+    }
+    let stubs: Vec<u64> = prog
+        .functions
+        .iter()
+        .filter(|(_, f)| syscall_stub(f).is_some())
+        .map(|(&a, _)| a)
+        .collect();
+    if stubs.len() != 1 {
+        return g;
+    }
+    for f in prog.functions.values() {
+        let defs: HashMap<Value, &Expr> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .filter_map(|s| match s {
+                Stmt::Def { dst, expr } => Some((*dst, expr)),
+                _ => None,
+            })
+            .collect();
+        for b in &f.blocks {
+            if let FTerm::Call {
+                callee: Callee::Indirect(v),
+                ..
+            } = b.term
+            {
+                if loads_gs_sysinfo(&defs, v) {
+                    g.calls.insert(b.term_pc, stubs.clone());
+                }
+            }
+        }
+    }
+    g
+}
+
+/// Whether `v` is the 4-byte word at `%gs:0x10`: a load (through the
+/// zero-extension of an indirect target) from `TpidrRo + 0x10` (wrapped to
+/// 32 bits).
+fn loads_gs_sysinfo(defs: &HashMap<Value, &Expr>, v: Value) -> bool {
+    let peel = |mut v: Value| {
+        for _ in 0..4 {
+            match defs.get(&v) {
+                Some(Expr::Extend { a, signed: false }) | Some(Expr::Wrap(a)) => v = *a,
+                _ => break,
+            }
+        }
+        v
+    };
+    let Some(&&Expr::Load { addr, offset, sz, .. }) = defs.get(&peel(v)) else {
+        return false;
+    };
+    if sz.bytes() != 4 {
+        return false;
+    }
+    let base = peel(addr);
+    let (reg, disp) = match defs.get(&base) {
+        Some(&&Expr::ReadReg(r)) => (Some(r), 0u64),
+        Some(&&Expr::Bin { op: BinOp::Add, a, b, .. }) => match (defs.get(&a), defs.get(&b)) {
+            (Some(&&Expr::ReadReg(r)), Some(&&Expr::ConstI64(c))) | (Some(&&Expr::ConstI64(c)), Some(&&Expr::ReadReg(r))) => {
+                (Some(r), c)
+            }
+            _ => (None, 0),
+        },
+        _ => (None, 0),
+    };
+    reg == Some(GuestReg::TpidrRo) && disp.wrapping_add(offset as u64) == 0x10
+}
+
 /// Tarjan's SCCs, returned callees-first (reverse topological order of the
 /// call graph).
 fn sccs(nodes: &[u64], edges: &HashMap<u64, Vec<u64>>) -> Vec<Vec<u64>> {
@@ -1597,16 +1877,33 @@ pub fn analyze(prog: &Program) -> Summaries {
 
 /// [`analyze`] over any set of functions.
 pub fn analyze_functions(functions: &BTreeMap<u64, Function>) -> Summaries {
+    analyze_functions_with_guards(functions, &Guards::default())
+}
+
+/// [`analyze`] with guarded indirect calls: see [`Guards`], and its
+/// contract, which a backend must keep for these summaries to be valid.
+pub fn analyze_with_guards(prog: &Program, guards: &Guards) -> Summaries {
+    analyze_functions_with_guards(&prog.functions, guards)
+}
+
+/// [`analyze_with_guards`] over any set of functions.
+pub fn analyze_functions_with_guards(functions: &BTreeMap<u64, Function>, guards: &Guards) -> Summaries {
+    let stubs: HashMap<u64, i64> = functions
+        .iter()
+        .filter_map(|(&a, f)| Some((a, syscall_stub(f)?)))
+        .collect();
+    let mut site_effects: HashMap<(u64, u64), CallEffect> = HashMap::new();
     let nodes: Vec<u64> = functions.keys().copied().collect();
     let mut edges: HashMap<u64, Vec<u64>> = HashMap::new();
     for (&a, f) in functions {
         let mut v: Vec<u64> = f
             .call_sites()
             .iter()
-            .filter_map(|c| match c.callee {
-                Callee::Direct(t) if functions.contains_key(&t) => Some(t),
-                _ => None,
+            .flat_map(|c| match c.callee {
+                Callee::Direct(t) => vec![t],
+                Callee::Indirect(_) => guards.calls.get(&c.pc).cloned().unwrap_or_default(),
             })
+            .filter(|t| functions.contains_key(t))
             .collect();
         v.sort_unstable();
         v.dedup();
@@ -1631,13 +1928,22 @@ pub fn analyze_functions(functions: &BTreeMap<u64, Function>) -> Summaries {
             iters += 1;
             let mut changed = false;
             for &a in &comp {
-                let mut s = analyze_fn(
+                let mut sites = Vec::new();
+                let mut s = analyze_fn_full(
                     &functions[&a],
                     &Ctx {
                         sums: &map,
                         trust_frame: false,
+                        guards: Some(guards),
+                        stubs: Some(&stubs),
                     },
+                    None,
+                    None,
+                    Some(&mut sites),
                 );
+                for (pc, eff) in sites {
+                    site_effects.insert((a, pc), eff);
+                }
                 // Only climb: the analysis of one function is not monotone
                 // in its callees' summaries (whether a callee preserves a
                 // register decides whether that register's taint counts),
@@ -1682,5 +1988,11 @@ pub fn analyze_functions(functions: &BTreeMap<u64, Function>) -> Summaries {
         stats.max_iterations = stats.max_iterations.max(iters);
     }
     stats.unknown = map.values().filter(|s| s.unknown_callee).count();
-    Summaries { map, stats }
+    Summaries {
+        map,
+        stats,
+        guards: guards.clone(),
+        site_effects,
+        stubs,
+    }
 }

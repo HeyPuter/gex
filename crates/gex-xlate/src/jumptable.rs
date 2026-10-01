@@ -44,8 +44,10 @@ pub fn resolve_all(
     sums: Option<&Summaries>,
     extent: Option<(u64, u64)>,
 ) -> Vec<(u64, Option<Table>)> {
-    let call = |c: Callee| sums.map_or(CallEffect::UNKNOWN, |s| s.call_effect(c));
-    let ssa = to_ssa(f, &call);
+    let ssa = match sums {
+        Some(s) => to_ssa(f, &s.effects_for(&[f])),
+        None => to_ssa(f, &|_| CallEffect::UNKNOWN),
+    };
     let known = crate::summary::known_values(f, sums);
     let mut defs = Defs::new(&ssa, known);
     defs.maybe = crate::summary::known_values_trusting_frame(f, sums);
