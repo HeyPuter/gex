@@ -8,6 +8,7 @@ use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
 use crate::fs::oflags;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Bytes tmpfs is holding, summed as `Vec` capacity rather than length: a
@@ -30,6 +31,37 @@ fn note_capacity(before: usize, after: usize) {
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
     ino: u64,
+    /// Modification time, in seconds. On the node, not the name, so it follows
+    /// a rename or a link and an open descriptor's `fstat` sees it -- `gzip`
+    /// records its input's time from `fstat` of the open file.
+    mtime: AtomicI64,
+}
+
+impl FileNode {
+    fn new(data: Vec<u8>, ino: u64) -> FileNode {
+        FileNode {
+            data: Mutex::new(data),
+            ino,
+            mtime: AtomicI64::new(now()),
+        }
+    }
+    fn touch(&self) {
+        self.mtime.store(now(), Ordering::Relaxed);
+    }
+}
+
+/// Where a tmpfs gets the time for a file it writes. A host without
+/// `std::time` (the browser) installs its own, the clock it gives the kernel.
+static CLOCK: std::sync::OnceLock<crate::syscalls::ClockFn> = std::sync::OnceLock::new();
+
+/// Set the clock every tmpfs in this module instance stamps writes with. The
+/// first call wins.
+pub fn set_clock(clock: crate::syscalls::ClockFn) {
+    let _ = CLOCK.set(clock);
+}
+
+pub(crate) fn now() -> i64 {
+    (CLOCK.get().copied().unwrap_or(crate::syscalls::system_clock))().0 as i64
 }
 
 #[derive(Debug)]
@@ -53,8 +85,9 @@ struct Inner {
     /// few hundred binaries in a rootfs differ. Needed because dpkg rejects a
     /// `/bin/sh` whose execute bit was silently dropped.
     modes: BTreeMap<String, u32>,
-    /// Modification times set by `utimensat`, sparse like `modes`; a path
-    /// without one reports 0.
+    /// Modification times of the nodes that are not files (a file keeps its
+    /// own, see `FileNode`), set by `utimensat`; sparse like `modes`, and a
+    /// path without one reports 0.
     mtimes: BTreeMap<String, i64>,
 }
 
@@ -86,10 +119,7 @@ impl TmpFs {
         inner.inos.insert(path.clone(), ino);
         inner.nodes.insert(
             path,
-            Node::File(Arc::new(FileNode {
-                data: Mutex::new(contents),
-                ino,
-            })),
+            Node::File(Arc::new(FileNode::new(contents, ino))),
         );
     }
 
@@ -214,6 +244,7 @@ impl FileHandle for TmpHandle {
             note_capacity(was, data.capacity());
         }
         data[start..start + buf.len()].copy_from_slice(buf);
+        file.touch();
         Ok(buf.len() as u64)
     }
 
@@ -226,7 +257,7 @@ impl FileHandle for TmpHandle {
                 size: file.data.lock().unwrap().len() as u64,
                 mode: 0o644,
                 ino: file.ino,
-                mtime: 0,
+                mtime: file.mtime.load(Ordering::Relaxed),
                 nlink: 1,
                 rdev: 0,
             });
@@ -240,7 +271,7 @@ impl FileHandle for TmpHandle {
                 size: f.data.lock().unwrap().len() as u64,
                 mode: inner.modes.get(&self.path).copied().unwrap_or(0o644),
                 ino,
-                mtime,
+                mtime: f.mtime.load(Ordering::Relaxed),
                 // Every name that maps to this inode is a hard link to it.
                 nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
                 rdev: 0,
@@ -317,6 +348,16 @@ impl FileHandle for TmpHandle {
         Ok(out)
     }
 
+    fn set_mtime(&self, secs: i64) -> Result<(), Errno> {
+        match &self.file {
+            Some(f) => {
+                f.mtime.store(secs, Ordering::Relaxed);
+                Ok(())
+            }
+            None => FileSystem::set_mtime(&TmpFs { inner: Arc::clone(&self.inner) }, &self.path, secs),
+        }
+    }
+
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let Some(file) = &self.file else {
             return Err(Errno::EINVAL);
@@ -327,6 +368,7 @@ impl FileHandle for TmpHandle {
             data.resize(len as usize, 0);
             note_capacity(was, data.capacity());
         }
+        file.touch();
         Ok(())
     }
 }
@@ -350,6 +392,7 @@ impl FileSystem for TmpFs {
                                 data.shrink_to_fit();
                                 note_capacity(was, data.capacity());
                             }
+                            f.touch();
                         }
                     }
                     match inner.nodes.get(&path) {
@@ -372,10 +415,7 @@ impl FileSystem for TmpFs {
                     let ino = inner.next_ino;
                     inner.next_ino += 1;
                     inner.inos.insert(path.clone(), ino);
-                    let f = Arc::new(FileNode {
-                        data: Mutex::new(Vec::new()),
-                        ino,
-                    });
+                    let f = Arc::new(FileNode::new(Vec::new(), ino));
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
                     Some(f)
                 }
@@ -413,8 +453,13 @@ impl FileSystem for TmpFs {
 
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.nodes.contains_key(path) {
-            return Err(Errno::ENOENT);
+        match inner.nodes.get(path) {
+            None => return Err(Errno::ENOENT),
+            Some(Node::File(f)) => {
+                f.mtime.store(secs, Ordering::Relaxed);
+                return Ok(());
+            }
+            Some(_) => {}
         }
         inner.mtimes.insert(path.to_string(), secs);
         Ok(())
@@ -634,6 +679,26 @@ mod tests {
         fs.chmod("p.dpkg-new", 0o755).unwrap();
         fs.rename("p.dpkg-new", "p").unwrap();
         assert_eq!(fs.metadata("p").unwrap().mode, 0o755);
+    }
+
+    #[test]
+    fn a_file_has_a_time_and_an_open_descriptor_sees_it() {
+        // `gzip` stores its input's time from `fstat` of the open file; a
+        // tmpfs that answered 0 there made every archive say 1970.
+        let fs = TmpFs::new();
+        fs.add_file("in", b"x".to_vec());
+        assert!(fs.metadata("in").unwrap().mtime > 1_600_000_000, "a new file is stamped now");
+        fs.set_mtime("in", 1_234_567_890).unwrap();
+        let h = fs.open("in", 0, 0).unwrap();
+        assert_eq!(h.metadata().unwrap().mtime, 1_234_567_890);
+        // A rename keeps it; a write moves it on.
+        fs.rename("in", "out").unwrap();
+        assert_eq!(fs.metadata("out").unwrap().mtime, 1_234_567_890);
+        h.write_at(0, b"y").unwrap();
+        assert!(fs.metadata("out").unwrap().mtime > 1_600_000_000);
+        // Through the descriptor, as `futimens` would.
+        h.set_mtime(7).unwrap();
+        assert_eq!(fs.metadata("out").unwrap().mtime, 7);
     }
 
     #[test]

@@ -364,7 +364,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
 /// a plain build and `gexc run` serve them with the host builtins, as closure
 /// builds and the browser's runtime translator do, so every path agrees on
 /// what those functions are.
+///
+/// Not for 32-bit (i386) images: `intrinsic::block` reads the 64-bit
+/// register arguments and pops an 8-byte return address, while i386 cdecl
+/// passes them on the stack.
 fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
+    if image.class32 {
+        return Default::default();
+    }
     let (tlo, thi) = image.text_range;
     image
         .symbols
@@ -396,6 +403,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         std::fs::read(host).ok()
     })
     .with_context(|| format!("loading {}", ra.path))?;
+    if let Some(why) = gex_xlate::cgen_refuses_image(ra.xlate.cgen, program.exe.class32) {
+        bail!("{}: {why}", ra.path);
+    }
     ra.xlate.intrinsics = image_intrinsics(&program.exe);
     if let Some(i) = &program.interp {
         ra.xlate.intrinsics.extend(image_intrinsics(i));
@@ -606,6 +616,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     // A 32-bit (i386) program's code must be decoded in compatibility mode,
     // exactly as the runtime path does before translating (`run_program_with`).
     gex_xlate::set_compat(image.class32);
+    if let Some(why) = gex_xlate::cgen_refuses_image(cgen, image.class32) {
+        bail!("{path}: {why}");
+    }
     let (module, stats) = gex_xlate::translate_image(
         &image,
         &Options {

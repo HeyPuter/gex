@@ -336,7 +336,7 @@ and called with the same `c`/`ctx` ABI as natively. `build.sh` links
 not link to the shim's plain one (checked at build).
 
 Checked on both guests in Node (`run.mjs`, JIT off): the corpus kernels,
-static gzip (`-n`, below) and, on x86-64, the host's dynamically linked glibc
+static gzip and, on x86-64, the host's dynamically linked glibc
 gzip, and a program whose whole library is swapped for wasm. Checked in
 headless Chromium: the `ack` page, with arguments.
 
@@ -344,15 +344,16 @@ headless Chromium: the `ack` page, with arguments.
 
 - **One process, one thread.** A session that forked or ran threads gets a
   manifest that says so, and the launchers refuse it.
-- **The browser's filesystem has no file times** (gex-kernel's `TmpFs`
-  reports 0). gzip without `-n` stores the input's mtime, so its output
-  differs from the native run's, and it warns and takes a path the native
-  session never took (which then fails loudly).
-- `--jit-fallback` in the single-Worker shim hit a kernel re-entry panic on
-  gzip (`lib.rs:9923` holding the kernel while translation re-enters it); not
-  investigated.
+- **File times** are the bundle's (`manifest.json` `mtimes`, from
+  `build/rootfs`, which keeps the times of the files the session read), and
+  a file the guest writes is stamped when it is written, so `gzip` without
+  `-n` matches the native run. (Until `merge/web-fixes` the browser's tmpfs
+  answered 0.)
 
-Found and fixed on the way (`shims/browser`): the break of a dynamic program
+Found and fixed on the way (`shims/browser`): with the syscall trace on, a
+miss the single-Worker shim translated (`--jit-fallback --strace`) asked
+`gex_closure_owner` from inside the kernel borrow and panicked ("the kernel
+was re-entered"); it asks the held form now. And the break of a dynamic program
 started above the interpreter (`Program::brk`), which sits at
 `INTERP_BASE == BRK_TOP`, so it could never grow and glibc's malloc fell
 back to mmap: a different path through libc than natively. It now follows
