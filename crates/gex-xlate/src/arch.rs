@@ -480,6 +480,65 @@ mod imp {
         }
     }
 
+    /// See the A64 version. Each instruction is lifted with fresh lifter
+    /// state, so none borrows a value another one computed. (Function
+    /// recovery refuses 32-bit images today, so nothing calls this yet.)
+    pub fn lift_insts(
+        fetch: &dyn Fn(u64, &mut FetchBuf) -> usize,
+        start: u64,
+        limits: BlockLimits,
+        stop: &dyn Fn(u64) -> bool,
+    ) -> Lifted {
+        use gex_ir::{Builder, Term};
+        use gex_lift_ppc::{BlockState, Flow, Lifter};
+        let mut b = Builder::new(start);
+        let mut pcs: Vec<u64> = Vec::new();
+        let mut insts: Vec<u64> = Vec::new();
+        let mut pc = start;
+        let mut term = None;
+        let mut term_pc = start;
+        for _ in 0..limits.max_insts {
+            if pc != start && stop(pc) {
+                break;
+            }
+            let mut buf = [0u8; 16];
+            if pc % 4 != 0 || fetch(pc, &mut buf) < 4 {
+                term = Some(Term::Illegal { raw: 0, pc });
+                term_pc = pc;
+                break;
+            }
+            let raw = word(&buf);
+            let inst = gex_isa_ppc::decode(raw, pc);
+            let mark = b.mark();
+            let mut st = BlockState::default();
+            let flow = Lifter::new(&mut b, &mut st, raw).lift(&inst, pc);
+            if b.has_inexpressible(mark) {
+                b.rewind(mark);
+                term = Some(Term::Illegal { raw, pc });
+                term_pc = pc;
+                break;
+            }
+            pcs.resize(b.mark(), pc);
+            insts.push(pc);
+            term_pc = pc;
+            pc = (pc + 4) & 0xffff_ffff;
+            b.end_at(pc);
+            if let Flow::End(t) = flow {
+                term = Some(t);
+                break;
+            }
+        }
+        let fell = term.is_none();
+        let block = b.finish(term.unwrap_or(Term::Goto { target: pc }));
+        pcs.truncate(block.stmts.len());
+        Lifted {
+            block,
+            pcs,
+            insts,
+            term_pc: if fell { pc } else { term_pc },
+        }
+    }
+
     pub fn disasm(bytes: &[u8], pc: u64) -> (String, usize) {
         if bytes.len() < 4 {
             return ("(truncated)".into(), bytes.len().max(1));
@@ -510,18 +569,26 @@ pub struct Lifted {
 /// whose lifter leaves [`gex_ir::GuestReg::Sp`] unused.
 pub const SP_REG: gex_ir::GuestReg = if gex_abi::X86 {
     gex_ir::GuestReg::X(4)
+} else if gex_abi::PPC {
+    gex_ir::GuestReg::R(1)
 } else {
     gex_ir::GuestReg::Sp
 };
 
 /// The register holding the syscall number.
-pub const SYSCALL_NR: gex_ir::GuestReg = gex_ir::GuestReg::X(if gex_abi::X86 { 0 } else { 8 });
+pub const SYSCALL_NR: gex_ir::GuestReg = if gex_abi::PPC {
+    gex_ir::GuestReg::R(0)
+} else {
+    gex_ir::GuestReg::X(if gex_abi::X86 { 0 } else { 8 })
+};
 
 /// Syscalls that never return to the next instruction: `exit`,
 /// `exit_group`, `rt_sigreturn`.
 pub fn syscall_never_returns(nr: u64) -> bool {
     if gex_abi::X86 {
         matches!(nr, 60 | 231 | 15)
+    } else if gex_abi::PPC {
+        matches!(nr, 1 | 234 | 172 | 119)
     } else {
         matches!(nr, 93 | 94 | 139)
     }
