@@ -2244,6 +2244,11 @@ struct Jit {
     /// Shared modules this Worker has put into its own tables. Describes the
     /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
+    /// Pages whose translations were retired (code unmapped, reprotected or
+    /// flushed: Detours patching noita.exe). A stored module covering one may
+    /// predate the change, so it is never served here again; see
+    /// `gex_jit_installed` for the pending side.
+    pub(crate) retired_pages: std::collections::HashSet<u64>,
     /// How the shared-slot lookup went. Three outcomes: the page had a base in
     /// this process's table, the identity map knew it, or it did not. See
     /// `gex_reuse_stats`.
@@ -3629,6 +3634,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 ever_threaded: false,
                 shared: Default::default(),
                 installed_mods: Default::default(),
+                retired_pages: Default::default(),
                 reuse_have: 0,
                 reuse_hit: 0,
                 reuse_miss: 0,
@@ -7029,6 +7035,7 @@ pub extern "C" fn gex_adopt_child(
             ever_threaded: false,
             shared: Default::default(),
             installed_mods: Default::default(),
+            retired_pages: Default::default(),
             reuse_have: 0,
             reuse_hit: 0,
             reuse_miss: 0,
@@ -9681,6 +9688,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             if h.jit.page_table.forget(page).is_none() {
                 return;
             }
+            h.jit.retired_pages.insert(page);
             let mut gm = GuestMem::new(guest_bytes());
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, 0);
             let lo = page * gex_abi::DISPATCH_PAGE;
@@ -10349,9 +10357,13 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 let ready: Vec<_> = ready
                     .into_iter()
                     .filter(|(_, _, d, _)| {
+                        // Nor one covering a page retired here: it may have
+                        // been built from the code before the change (a
+                        // translation of noita.exe before Detours patched it),
+                        // and serving it would run that code again.
                         !gex_abi::X86 || d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
                             Some(have) => have == *b,
-                            None => true,
+                            None => !h.jit.retired_pages.contains(p),
                         })
                     })
                     .collect();
@@ -11758,6 +11770,15 @@ pub extern "C" fn gex_jit_installed() {
                 match h.jit.page_table.lookup(page) {
                     Some(have) if have != base => {
                         dir_note(page, have, "install-done-kept-local");
+                        continue;
+                    }
+                    // Retired while this module waited to be installed (its
+                    // page table had the page when it was queued): its blocks
+                    // are of the code before the change, so the page stays
+                    // retired and the next branch there lifts what is there
+                    // now. Assigning the old base back is what ran stale code.
+                    None if h.jit.retired_pages.contains(&page) => {
+                        dir_note(page, base, "install-done-retired");
                         continue;
                     }
                     None => h.jit.page_table.assign(page, base),

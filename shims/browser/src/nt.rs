@@ -552,6 +552,7 @@ mod imp {
                     break;
                 }
                 h.jit.page_table.forget(page);
+                h.jit.retired_pages.insert(page);
                 let at = gex_abi::DISPATCH_DIR + page * 4;
                 // SAFETY: the directory is in the shared memory, four-byte
                 // aligned, and every Worker's dispatch reads it as a word.
