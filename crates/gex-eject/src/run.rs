@@ -100,7 +100,10 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
     } else {
         project.program.env.clone()
     };
-    let aot = Arc::new(aot(dir, &manifest));
+    let mut aot = aot(dir, &manifest);
+    aot.syscalls = allowed_syscalls(dir, &config)?;
+    aot.single_process = project.processes <= 1;
+    let aot = Arc::new(aot);
     let opts = RunOptions {
         args,
         env,
@@ -128,4 +131,27 @@ pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
         }
     }
     Ok(exit)
+}
+
+/// The system calls an ejected program may make, by canonical number: the
+/// recorded session's, plus `allow_syscalls`. `None` with `"syscalls": "all"`.
+pub fn allowed_syscalls(dir: &Path, config: &Config) -> Result<Option<std::collections::HashSet<u64>>> {
+    if config.all_syscalls {
+        return Ok(None);
+    }
+    let p = dir.join("session/session.json");
+    let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+    let session = gex_xlate::profile::Session::from_json(&text).map_err(|e| anyhow!("{}: {e}", p.display()))?;
+    let mut set: std::collections::HashSet<u64> = session.syscalls.keys().copied().collect();
+    gex_native::profile::use_kernel_syscall_names();
+    for name in &config.allow_syscalls {
+        let nr = match name.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => (0..1024u64)
+                .find(|n| gex_xlate::profile::syscall_name(*n) == name)
+                .ok_or_else(|| anyhow!("user/eject.json: allow_syscalls: no system call is called {name:?}"))?,
+        };
+        set.insert(nr);
+    }
+    Ok(Some(set))
 }

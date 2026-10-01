@@ -70,6 +70,10 @@ pub struct Config {
     /// Arguments after `argv[0]` for a run that gives none (default: the
     /// recorded ones).
     pub args: Option<Vec<String>>,
+    /// Only the system calls the session made are allowed (default), or all.
+    pub all_syscalls: bool,
+    /// System calls allowed besides the recorded ones, by name or number.
+    pub allow_syscalls: Vec<String>,
 }
 
 impl Default for Config {
@@ -78,6 +82,8 @@ impl Default for Config {
             replace: Vec::new(),
             coverage: Coverage::Profile,
             args: None,
+            all_syscalls: false,
+            allow_syscalls: Vec::new(),
         }
     }
 }
@@ -92,12 +98,15 @@ pub fn template() -> String {
                  functions served by your wasm (see docs/eject.md), e.g. {\"object\": \"prog\", \
                  \"symbol\": \"strlen\", \"export\": \"my_strlen\", \"abi\": \"c\"}, or by \"offset\", \
                  \"import\" or \"library\"; `gexc eject override` prints a checked entry. \"coverage\" is \"profile\" (what the session ran), \"static\" (and what discovery finds) or \"exhaustive\". \"args\" \
-                 replaces the recorded arguments.",
+                 replaces the recorded arguments. \"syscalls\": \"recorded\" allows only the system \
+                 calls the session made (\"all\": any); \"allow_syscalls\" adds some by name.",
             ),
         ),
         ("replace", Json::Arr(Vec::new())),
         ("coverage", json::s("profile")),
         ("args", Json::Null),
+        ("syscalls", json::s("recorded")),
+        ("allow_syscalls", Json::Arr(Vec::new())),
     ]))
 }
 
@@ -109,7 +118,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "coverage" | "args") {
+            if !matches!(k.as_str(), "about" | "replace" | "coverage" | "args" | "syscalls" | "allow_syscalls") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -193,6 +202,12 @@ impl Config {
             Some("exhaustive") => Coverage::Exhaustive,
             Some(o) => bail!("{what}: coverage \"{o}\" is not \"profile\", \"static\" or \"exhaustive\""),
         };
+        c.all_syscalls = match opt_str(&v, "syscalls").as_deref() {
+            None | Some("recorded") => false,
+            Some("all") => true,
+            Some(o) => bail!("{what}: syscalls \"{o}\" is not \"recorded\" or \"all\""),
+        };
+        c.allow_syscalls = json::str_list(&v, "allow_syscalls", what)?;
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,
             Some(_) => Some(json::str_list(&v, "args", what)?),

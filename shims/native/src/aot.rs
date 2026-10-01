@@ -112,6 +112,12 @@ pub struct Aot {
     pub replacements: Vec<Replacement>,
     /// The project, for messages.
     pub label: String,
+    /// The system calls the program may make, by canonical number (as the
+    /// session manifest counts them). Any other stops the run, naming it.
+    /// `None` allows everything.
+    pub syscalls: Option<std::collections::HashSet<u64>>,
+    /// The recorded session never forked: a fork stops the run.
+    pub single_process: bool,
     /// Replacement modules compiled for an engine. An `execve` builds a new
     /// engine, and a module belongs to the engine that compiled it.
     compiled: Mutex<Vec<(Engine, Arc<Vec<Module>>)>>,
@@ -125,6 +131,8 @@ impl std::fmt::Debug for Aot {
             .field("modules", &self.modules)
             .field("replacements", &self.replacements)
             .field("label", &self.label)
+            .field("syscalls", &self.syscalls.as_ref().map(|s| s.len()))
+            .field("single_process", &self.single_process)
             .finish()
     }
 }
@@ -633,6 +641,45 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
         }
     }
     Ok(())
+}
+
+/// The system-call allow-list: `Some` when the call about to be made is not
+/// on it, having stopped the run.
+pub(crate) fn check_syscall(caller: &mut Caller<'_, HostState>, pc: u64) -> Option<Result<()>> {
+    let aot = caller.data().spawn.as_ref().and_then(|s| s.opts.aot.clone())?;
+    let allowed = aot.syscalls.as_ref()?;
+    let memory = caller.data().memory.clone()?;
+    let ctx_addr = caller.data().thread.ctx_addr as usize;
+    let raw = read_u64(memory.bytes(), ctx_addr + ctx::SYSCALL_NR);
+    let nr = if gex_abi::X86 { gex_kernel::x86::canonical_number(raw) } else { raw };
+    if allowed.contains(&nr) {
+        return None;
+    }
+    super::profile::use_kernel_syscall_names();
+    caller.data_mut().exit = Some(super::Exit::Signal {
+        signal: super::signal::SIGSYS,
+        pc,
+        detail: format!(
+            "gex-eject: system call {} ({nr}) was never made by the session {} was ejected \
+             from, and its runtime allows only those. Record a session that makes it, or add \
+             it to \"allow_syscalls\" in user/eject.json",
+            gex_xlate::profile::syscall_name(nr),
+            aot.label
+        ),
+        internal: true,
+    });
+    Some(Err(super::StopExecution.into()))
+}
+
+/// The guest's own system-call numbers that stand for the canonical ones in
+/// `allowed`: what a host that sees raw numbers (the browser's) checks.
+pub fn raw_syscalls(allowed: &std::collections::HashSet<u64>) -> Vec<u64> {
+    if !gex_abi::X86 {
+        let mut v: Vec<u64> = allowed.iter().copied().collect();
+        v.sort_unstable();
+        return v;
+    }
+    (0..1024u64).filter(|raw| allowed.contains(&gex_kernel::x86::canonical_number(*raw))).collect()
 }
 
 /// Why a dispatch miss happened, when an ejected project without a JIT

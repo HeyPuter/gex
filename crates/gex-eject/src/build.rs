@@ -809,7 +809,8 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
                     .filter(|p| p.obj.role == "library")
                     .map(|p| (p.obj.path.clone(), p.image.bias, p.image.brk - p.image.bias))
                     .collect();
-                crate::web::manifest(dir, &project, &images, &spans, &replacements)?;
+                let allowed = crate::run::allowed_syscalls(dir, &config)?;
+                crate::web::manifest(dir, &project, &images, &spans, &replacements, allowed.as_ref())?;
                 Some(Ok(images.iter().map(|i| i.bytes).sum()))
             }
         }

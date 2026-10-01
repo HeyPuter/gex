@@ -1035,7 +1035,14 @@ export class Gex {
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
-      syscall: e.gex_syscall,
+      // An embedder may vet each system call first (an ejected project's
+      // allow-list); it throws to stop the run.
+      syscall: opts.syscallGuard
+        ? (ctx, pc) => {
+          opts.syscallGuard(ctx >>> 0, pc, this.#memory);
+          return e.gex_syscall(ctx, pc);
+        }
+        : e.gex_syscall,
       dispatch_miss: e.gex_dispatch_miss,
       illegal: e.gex_illegal,
       breakpoint: e.gex_breakpoint,

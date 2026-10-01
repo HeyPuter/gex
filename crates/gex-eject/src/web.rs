@@ -97,6 +97,7 @@ pub fn manifest(
     images: &[BuiltImage],
     pins: &[(String, u64, u64)],
     repl: &[BuiltReplacement],
+    syscalls: Option<&std::collections::HashSet<u64>>,
 ) -> Result<()> {
     // A static program's image module owns the memory and tables. A dynamic
     // one's objects are all library modules (see `Translation::translate`),
@@ -178,6 +179,16 @@ pub fn manifest(
             ]),
         ),
         (
+            "syscalls",
+            match syscalls {
+                None => Json::Null,
+                Some(set) => obj(vec![
+                    ("nr_offset", json::n(ctx::SYSCALL_NR as u64)),
+                    ("allowed", Json::Arr(gex_native::aot::raw_syscalls(set).into_iter().map(json::n).collect())),
+                ]),
+            },
+        ),
+        (
             "region",
             obj(vec![
                 ("end", json::n(REPL_END)),
@@ -238,9 +249,21 @@ export async function launch(m, read, { args = null, write, jitFallback = false,
   for (const [p, { base, span }] of Object.entries(m.pins)) pins[p] = { base, span };
   const argv = args ? [m.argv[0] ?? m.exe, ...args] : m.argv;
   const replace = m.replacements.length ? await replacer(m, read) : undefined;
+  // Only the system calls the recorded session made (user/eject.json
+  // "syscalls"); anything else stops the run, naming it.
+  let syscallGuard;
+  if (m.syscalls) {
+    const allowed = new Set(m.syscalls.allowed.map(BigInt));
+    syscallGuard = (ctx, pc, memory) => {
+      const nr = new DataView(memory.buffer).getBigUint64(ctx + m.syscalls.nr_offset, true);
+      if (!allowed.has(nr)) {
+        throw new Error(`gex-eject: system call ${nr} (at pc ${pc}) was never made by the recorded session, and this runtime allows only those; add it to "allow_syscalls" in user/eject.json`);
+      }
+    };
+  }
   const entry = await gex.load(await read(m.shim), await read(m.module), await read(m.exe_file), files, argv, {
     cwd: m.cwd, env: m.env, dirs: m.dirs, modes: m.modes, pins, closure, program: m.exe, exe: m.exe,
-    jit: jitFallback ? undefined : false, replace, strace,
+    jit: jitFallback ? undefined : false, replace, syscallGuard, strace,
   });
   return await gex.run(entry);
 }
