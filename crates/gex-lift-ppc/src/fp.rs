@@ -10,10 +10,16 @@ const EXP: u64 = 0x7ff0_0000_0000_0000;
 
 impl<'a> Lifter<'a> {
     fn rdf(&mut self, n: u8) -> Value {
-        self.b.read(GuestReg::F(n))
+        if let Some(v) = self.st.fpr[n as usize] {
+            return v;
+        }
+        let v = self.b.read(GuestReg::F(n));
+        self.st.fpr[n as usize] = Some(v);
+        v
     }
     fn wrf(&mut self, n: u8, v: Value) {
         self.b.write(GuestReg::F(n), v);
+        self.st.fpr[n as usize] = Some(v);
     }
     fn bin64c(&mut self, op: BinOp, a: Value, c: u64) -> Value {
         let k = self.k64(c);
@@ -423,6 +429,7 @@ impl<'a> Lifter<'a> {
                     func: HostFunc::SysRegWrite,
                     args: vec![pcv, id, arg64],
                 });
+                self.st.invalidate();
                 if i.rc() {
                     self.record_fp();
                 }

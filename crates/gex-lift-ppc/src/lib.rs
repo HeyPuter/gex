@@ -54,17 +54,43 @@ fn cr_bits(f: u8) -> [GuestReg; 4] {
     ]
 }
 
+/// What the lifter knows about the block so far, carried from one
+/// instruction to the next.
+///
+/// - The GIR value each GPR and FPR holds, once read or written: a register
+///   read is then that value rather than a fresh `ReadReg`, so constants flow
+///   (`lis`/`addi` addresses fold) and values can be recognised.
+/// - For each value a load produced by swapping, the unswapped word it came
+///   from: a store of it writes the word as it was, with no swap either way.
+///   That is a copy (`lwzu`/`stwu`, `lfd`/`stfd`, a struct assignment).
+#[derive(Default)]
+pub struct BlockState {
+    gpr: [Option<Value>; 32],
+    fpr: [Option<Value>; 32],
+    swapped: std::collections::HashMap<Value, (Value, MemSz)>,
+}
+
+impl BlockState {
+    /// Forget the registers, after a host call that may rewrite them.
+    pub(crate) fn invalidate(&mut self) {
+        self.gpr = [None; 32];
+        self.fpr = [None; 32];
+    }
+}
+
 pub struct Lifter<'a> {
     pub(crate) b: &'a mut Builder,
+    pub(crate) st: &'a mut BlockState,
     pub(crate) raw: u32,
     pub(crate) pc: u64,
     pub(crate) next: u64,
 }
 
 impl<'a> Lifter<'a> {
-    pub fn new(b: &'a mut Builder, raw: u32) -> Lifter<'a> {
+    pub fn new(b: &'a mut Builder, st: &'a mut BlockState, raw: u32) -> Lifter<'a> {
         Lifter {
             b,
+            st,
             raw,
             pc: 0,
             next: 0,
@@ -106,7 +132,12 @@ impl<'a> Lifter<'a> {
     // -- registers ------------------------------------------------------------
 
     pub(crate) fn rd(&mut self, n: u8) -> Value {
-        self.b.read(GuestReg::R(n))
+        if let Some(v) = self.st.gpr[n as usize] {
+            return v;
+        }
+        let v = self.b.read(GuestReg::R(n));
+        self.st.gpr[n as usize] = Some(v);
+        v
     }
     /// `(rA|0)`: register 0 reads as zero in an address.
     pub(crate) fn rd0(&mut self, n: u8) -> Value {
@@ -118,6 +149,7 @@ impl<'a> Lifter<'a> {
     }
     pub(crate) fn wr(&mut self, n: u8, v: Value) {
         self.b.write(GuestReg::R(n), v);
+        self.st.gpr[n as usize] = Some(v);
     }
 
     // -- memory ---------------------------------------------------------------
@@ -166,7 +198,7 @@ impl<'a> Lifter<'a> {
         if reverse || sz == MemSz::B1 {
             return v;
         }
-        match sz {
+        let r = match sz {
             MemSz::B2 => {
                 let s = self.b.un(UnOp::Bswap16, Ty::I32, v);
                 if signed {
@@ -181,11 +213,21 @@ impl<'a> Lifter<'a> {
                 }
             }
             _ => self.b.un(UnOp::Bswap, Ty::I32, v),
-        }
+        };
+        // A store of the value back (at this width) needs no swap: its low
+        // bytes, swapped back, are the bytes just loaded.
+        self.st.swapped.insert(r, (v, sz));
+        r
     }
 
     pub(crate) fn store(&mut self, addr: Value, off: i64, sz: MemSz, v: Value, reverse: bool) {
-        let val = if reverse || sz == MemSz::B1 {
+        let unswapped = match self.st.swapped.get(&v) {
+            Some(&(raw, from)) if !reverse && from == sz => Some(raw),
+            _ => None,
+        };
+        let val = if let Some(raw) = unswapped {
+            raw
+        } else if reverse || sz == MemSz::B1 {
             v
         } else if sz == MemSz::B2 {
             self.b.un(UnOp::Bswap16, Ty::I32, v)
@@ -210,11 +252,16 @@ impl<'a> Lifter<'a> {
             ty: Ty::I64,
             order: Order::Relaxed,
         });
-        self.b.un(UnOp::Bswap, Ty::I64, v)
+        let r = self.b.un(UnOp::Bswap, Ty::I64, v);
+        self.st.swapped.insert(r, (v, MemSz::B8));
+        r
     }
 
     pub(crate) fn store64(&mut self, addr: Value, off: i64, v: Value) {
-        let val = self.b.un(UnOp::Bswap, Ty::I64, v);
+        let val = match self.st.swapped.get(&v) {
+            Some(&(raw, MemSz::B8)) => raw,
+            _ => self.b.un(UnOp::Bswap, Ty::I64, v),
+        };
         self.b.stmt(Stmt::Store {
             addr,
             offset: off,

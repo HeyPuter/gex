@@ -1,6 +1,6 @@
 //! Assembling decoded PowerPC instructions into a GIR basic block.
 
-use crate::{Flow, Lifter};
+use crate::{BlockState, Flow, Lifter};
 use gex_ir::{pass, Block, Builder, Term};
 use gex_isa_ppc::decode;
 
@@ -26,6 +26,7 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
     let mut builder = Builder::new(start);
     let mut pc = start;
     let mut term = None;
+    let mut st = BlockState::default();
     for _ in 0..limits.max_insts {
         let Some(raw) = fetch(pc) else {
             term = Some(Term::Illegal { raw: 0, pc });
@@ -33,7 +34,7 @@ pub fn lift_block(fetch: impl Fn(u64) -> Option<u32>, start: u64, limits: BlockL
         };
         let inst = decode(raw, pc);
         let mark = builder.mark();
-        let flow = Lifter::new(&mut builder, raw).lift(&inst, pc);
+        let flow = Lifter::new(&mut builder, &mut st, raw).lift(&inst, pc);
         if builder.has_inexpressible(mark) {
             builder.rewind(mark);
             term = Some(Term::Illegal { raw, pc });
