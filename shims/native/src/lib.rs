@@ -1353,6 +1353,15 @@ fn run_thread_loop(
 /// space per process, no copy-on-write, since wasm cannot fault on a write.
 fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     let pid = req.pid;
+    if let Some(aot) = store.data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
+        if aot.single_process {
+            bail!(
+                "gex-eject: the program forked, and the session {} was ejected from never did: \
+                 its runtime is single-process. Record a session that forks",
+                aot.label
+            );
+        }
+    }
     let cx = store
         .data()
         .spawn
@@ -2356,6 +2365,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
             if caller.data().nt.is_some() {
                 return nt::syscall_import(&mut caller, pc as u64);
+            }
+            // An ejected project's runtime allows only the recorded calls.
+            if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
+                return stop;
             }
             // Every thread shares the dispatch directory (guest memory) but has
             // its own table, filled only when its own store installs a
