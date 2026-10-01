@@ -655,8 +655,21 @@ pub fn cgen_conflict(cgen: bool, profiling: bool) -> Option<&'static str> {
     )
 }
 
+/// Why the function tier refuses `image`, if it does: 32-bit (i386)
+/// programs are not validated on it yet (no lockstep or soundness run on
+/// gi386), so `--cgen` on one fails loudly instead of compiling it.
+pub fn cgen_refuses_image(cgen: bool, class32: bool) -> Option<&'static str> {
+    (cgen && class32).then_some(
+        "the function tier (--cgen) does not handle 32-bit (i386) programs yet: \
+         build or run without --cgen (tier-1)",
+    )
+}
+
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
     if let Some(why) = cgen_conflict(opts.cgen, profile::enabled()) {
+        panic!("{why}");
+    }
+    if let Some(why) = cgen_refuses_image(opts.cgen, image.class32) {
         panic!("{why}");
     }
     let (collected, mut stats) = image_blocks(image, opts);
@@ -1239,6 +1252,13 @@ fn lift_one(
 
 #[cfg(all(test, not(feature = "x86")))]
 mod tests {
+    #[test]
+    fn cgen_refuses_i386() {
+        assert!(super::cgen_refuses_image(true, true).is_some());
+        assert!(super::cgen_refuses_image(true, false).is_none());
+        assert!(super::cgen_refuses_image(false, true).is_none());
+    }
+
     #[test]
     fn cgen_refuses_profiling() {
         assert!(super::cgen_conflict(true, true).is_some());
