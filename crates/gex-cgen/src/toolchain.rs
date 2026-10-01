@@ -12,6 +12,11 @@ use std::process::Command;
 pub const CFLAGS: &[&str] = &[
     "--target=wasm32",
     "-O2",
+    // No switch-to-lookup-table conversion: its tables are data segments,
+    // which the splice cannot place (a guest-memory address); jump tables
+    // (br_table) are unaffected.
+    "-mllvm",
+    "-switch-to-lookup=false",
     "-mtail-call",
     "-msimd128",
     "-matomics",

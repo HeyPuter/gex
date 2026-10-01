@@ -1075,3 +1075,13 @@ fn outer_loops(f: &Function) -> Vec<Loop> {
     let _ = n;
     out
 }
+
+/// The guest function a C function belongs to, from its name: `f_<entry>`,
+/// `e_<entry>` or a loop function `l_<entry>_<k>`.
+pub fn guest_entry_of(name: &str) -> Option<u64> {
+    let rest = name
+        .strip_prefix("f_")
+        .or_else(|| name.strip_prefix("e_"))
+        .or_else(|| name.strip_prefix("l_").map(|r| r.split('_').next().unwrap_or(r)))?;
+    u64::from_str_radix(rest, 16).ok()
+}
