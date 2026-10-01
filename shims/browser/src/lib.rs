@@ -3352,7 +3352,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         }
     };
 
-    let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.brk(), String::new());
+    // The break follows the executable, as Linux and the native host have it:
+    // `Program::brk` is above the interpreter too, and the interpreter sits
+    // at INTERP_BASE == BRK_TOP, so a break there could never grow and every
+    // dynamic program's malloc fell back to mmap -- a different path through
+    // libc than the same program takes natively.
+    let mut kernel = Kernel::new(gex_abi::ctx_addr(0), program.exe.brk, String::new());
     // A 32-bit (i386) program: i386 ABI in the kernel, compatibility-mode
     // decoding in the translator.
     kernel.compat = program.compat();
@@ -3487,8 +3492,14 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         }
     };
     // `/proc/self/{cmdline,exe}` read these. A relative argv[0] is resolved
-    // against the root, which is where a bundled program lives.
-    kernel.exe_path = if args[0].starts_with('/') {
+    // against the root, which is where a bundled program lives -- unless the
+    // embedder named the program's path (`gex_set_exe`), as an ejected
+    // project does: its argv[0] is what was recorded, and glibc's `$ORIGIN`
+    // is the directory of `/proc/self/exe`, not of argv[0].
+    let named = std::mem::take(&mut *EXE_PATH.0.borrow_mut());
+    kernel.exe_path = if !named.is_empty() {
+        named
+    } else if args[0].starts_with('/') {
         args[0].clone()
     } else {
         format!("/{}", args[0])
@@ -4166,6 +4177,16 @@ pub extern "C" fn gex_add_closure_module(ptr: u32, len: u32, prog: u32, prog_len
     });
     // Registered, not published. See `gex_publish_closure_module`.
     0
+}
+
+/// The program's guest path, when the embedder knows it. See `gex_load`.
+static EXE_PATH: SingleThreaded<String> = SingleThreaded(const { RefCell::new(String::new()) });
+
+#[no_mangle]
+pub extern "C" fn gex_set_exe(ptr: u32, len: u32) {
+    if let Ok(s) = std::str::from_utf8(shim_slice(ptr, len)) {
+        *EXE_PATH.0.borrow_mut() = s.to_string();
+    }
 }
 
 /// The program the closure's image module was built from, as the manifest
@@ -6986,7 +7007,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // copy, whose `.got.plt` sends a call through the PLT into unmapped memory.
     let old: Vec<(u64, u64)> = h.kernel.mem.vmas().iter().map(|v| (v.start, v.end)).collect();
     h.kernel.mem =
-        gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.brk()).unwrap_or(0));
+        gex_kernel::mem::MemoryMap::new(program.as_ref().map(|p| p.exe.brk).unwrap_or(0));
     // A fresh map for a fresh image, and it grows the same way.
     h.kernel.mem.grows_on_demand(arena_grow, arena_back);
     {
@@ -9141,6 +9162,23 @@ pub extern "C" fn gex_fma(_ctx: i32, a: i64, b: i64, c: i64, double: i32) -> i64
     }
 }
 
+/// An x87 operation the inline fast path left to the host (see
+/// `gex_abi::imports::X87`): the result returned, the status-word bits left
+/// at `ctx::X87_TMP + 12`.
+#[no_mangle]
+pub extern "C" fn gex_x87(ctx: i32, op: i32, sig: i64, se: i32, cw: i32) -> i64 {
+    let (sig, se, cw) = (sig as u64, se as u16, cw as u16);
+    let (r, sw) = match op {
+        1 => gex_kernel::f80::narrow_op(sig, se, cw, true),
+        2 => gex_kernel::f80::narrow_op(sig, se, cw, false),
+        _ if op & 0x100 != 0 => gex_kernel::f80::to_int_op(sig, se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0),
+        _ => panic!("x87 import: unknown operation {op:#x}"),
+    };
+    let mut gm = GuestMem::new(guest_bytes());
+    let _ = gm.write_u32(ctx as u32 as u64 + ctx::X87_TMP as u64 + 12, sw);
+    r as i64
+}
+
 /// How many times the guest has asked for a fused multiply-add.
 pub static FMA_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -9284,6 +9322,15 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         with_host(|h| set_exit(h, 128 + 11));
         trap();
     }
+    // An x87 exception the control word unmasks: gex does not deliver
+    // them, so the process dies of SIGFPE, saying so.
+    if raw == gex_abi::imports::BRK_X87_EXCEPTION {
+        trace_line(&format!(
+            "gex: unmasked x87 floating-point exception at pc={pc:#x}; gex does not deliver x87 exceptions (SIGFPE)\n"
+        ));
+        with_host(|h| set_exit(h, 128 + 8));
+        trap();
+    }
     // The stack-pointer check borrows this import rather than adding one, so an
     // older shim still links. Names the object, since the block that *writes* a
     // bad `sp` is elsewhere from the one that dies on it.
@@ -9366,7 +9413,17 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
     }
 }
 #[no_mangle]
-pub extern "C" fn gex_sysreg_write(ctx: i32, _pc: i64, reg: i32, val: i64) {
+pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
+    // A gex-eject library replacement (`Intrinsic::Replace`). This shim has no
+    // replacement modules to run it with (eject v0 runs them natively only),
+    // and returning would carry on as if the replaced function had run.
+    if reg == gex_xlate::intrinsic::REPLACE_SYSREG {
+        panic!(
+            "gex: replacement #{val} (the function at {:#x}) cannot run in the browser shim; \
+             run the ejected project natively",
+            pc as u64
+        );
+    }
     // The x86-64 lifter's `cpuid`: the leaf and subleaf arrive in `val`, the
     // four results go back into the context.
     if reg == gex_kernel::x86::SYSREG_CPUID {
@@ -9830,6 +9887,21 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             });
             trap();
         }
+    }
+    // An ejected project without a JIT fallback (`gex_set_jit(0)`): nothing
+    // is translated at run time, so code the build never saw stops the run
+    // here, saying so, rather than being lifted.
+    if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        with_host(|h| {
+            warn_line(&format!(
+                "gex-eject: code at {pc:#x} ({}) was not translated when this project was built: \
+                 the recorded session never reached it. Record a session that reaches it and \
+                 re-eject, or build with the JIT fallback\n",
+                object_off_at(h, pc)
+            ));
+            set_exit(h, 128 + 11);
+        });
+        trap();
     }
     // Past the fill and a closure library still claims this page: everything
     // looks right (pin took, module covers it, directory names it) yet the
@@ -10723,6 +10795,15 @@ const MAX_OBJECT_BLOCKS: usize = 4_000_000;
 ///
 /// Called before either path translates anything, and outside `with_host`
 /// because reading the object takes the host itself.
+/// Whether a dispatch miss may translate. Off for an ejected project built
+/// without a JIT fallback. See `gex_dispatch_miss`.
+static JIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[no_mangle]
+pub extern "C" fn gex_set_jit(on: i32) {
+    JIT_ON.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether library substitution is on. See `gex_set_intrinsics`.
 static mut INTRINSICS_ON: bool = true;
 
@@ -10806,6 +10887,8 @@ fn note_intrinsics(addr: u64) {
                 gex_xlate::Intrinsic::MemCmp => 4,
                 gex_xlate::Intrinsic::MemPCpy => 8,
                 gex_xlate::Intrinsic::MemMove => 16,
+                // Never recognised by name, so never reaches this scan.
+                gex_xlate::Intrinsic::Replace(_) => 0,
             };
             if mask & bit == 0 {
                 continue;

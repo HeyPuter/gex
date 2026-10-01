@@ -280,7 +280,7 @@ pub mod ctx {
     /// One bit per physical register: 1 means valid (tag word derived).
     pub const X87_TAGS: usize = X87_SW + 4;
     /// 16 bytes through which an x87 memory operand passes to and from the
-    /// host, which computes the x87's arithmetic (`gex_kernel::f80`): raw
+    /// host, which computes the x87's arithmetic (`gex_f80`): raw
     /// bits at +0, and for the 80-bit format the sign and exponent at +8.
     pub const X87_TMP: usize = X87_TAGS + 4;
 
@@ -499,6 +499,11 @@ pub mod imports {
     /// as SIGSEGV at the instruction.
     pub const BRK_GENERAL_PROTECTION: i32 = -6;
 
+    /// Not a `brk`: a `Stmt::Trap` for an x87 exception the control word
+    /// leaves unmasked. gex does not deliver x87 exceptions (a real x87
+    /// would fault at the next x87 instruction), so the host fails loudly.
+    pub const BRK_X87_EXCEPTION: i32 = -7;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";
@@ -519,6 +524,15 @@ pub mod imports {
     /// enough to break musl's `pow`, so this asks the host rather than
     /// approximating.
     pub const FMA: &str = "fma";
+
+    /// An x87 operation (`gex_ir::Stmt::X87`) the inline fast path did not
+    /// cover, computed exactly (`gex_f80`). Pure: it reads only its
+    /// arguments and writes only its results, so a block calls it without
+    /// flushing its cached registers. Signature `(ctx: i32, op: i32,
+    /// sig: i64, se: i32, cw: i32) -> i64`, `op` being `X87Op::code`: the
+    /// result is returned, and the status-word bits (exception flags, C1 at
+    /// bit 9) are left as an i32 at `ctx::X87_TMP + 12`.
+    pub const X87: &str = "x87";
 
     /// Safepoint poll taken when the interrupt flag is set.
     /// Signature `(ctx: i32, pc: i64) -> ()`.

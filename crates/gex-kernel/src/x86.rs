@@ -942,8 +942,16 @@ pub fn serve_x87(m: &mut GuestMem<'_>, ctx_addr: u64, op: u64) {
                 _ => (F80::INDEFINITE, 0, true),
             };
             x.set_st(0, r);
-            x.set_cc(X87::quotient_cc(q, complete));
-            env.c1 = complete && q & 1 != 0;
+            if r.se & 0x7fff == 0x7fff && r.sig << 1 != 0 {
+                // A NaN result (an invalid operand or a NaN one): the
+                // hardware clears C2 and C1 and leaves C0 and C3 alone.
+                let sw = x.word(ctx::X87_SW) as u16 & !X87::C2;
+                x.set_word(ctx::X87_SW, sw as u32);
+                env.c1 = false;
+            } else {
+                x.set_cc(X87::quotient_cc(q, complete));
+                env.c1 = complete && q & 1 != 0;
+            }
         }
         x87op::F2XM1 => {
             let v = dbl(x.st(0));

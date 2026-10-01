@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod eject;
 mod nt_run;
 mod pe_info;
 
@@ -45,8 +46,13 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "eject" => match eject::cmd_eject(&argv[2..])? {
+            Some(exit) => Ok(report_exit(&exit, false)),
+            None => Ok(ExitCode::SUCCESS),
+        },
         "disasm" => cmd_disasm(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "ir" => cmd_ir(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "funcs" => cmd_funcs(&argv[2..]),
         "-h" | "--help" | "help" => {
             usage();
             Ok(ExitCode::SUCCESS)
@@ -89,8 +95,18 @@ usage:
                                    different programs add up (--split DIR:
                                    one file per object instead of -o)
   gexc profile show [--top N] IN   summarise a profile
+{}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
+  gexc funcs  <elf> [--at ADDR] [--ir] [--ssa] [--check] [--run N] [--list]
+                                   recover functions (CFGs, jump tables,
+                                   call-graph summaries) and report them.
+                                   --ir prints function-level GIR, --ssa in
+                                   SSA form; --check verifies every function
+                                   and round-trips its text form, and runs
+                                   each N times (default 8) on the GIR
+                                   interpreter: SSA against memory form, and
+                                   its summary's claims
 
 run options:
   --strace        trace every syscall on stderr
@@ -159,7 +175,8 @@ run options:
   --argv0 NAME    what the guest sees as argv[0]; useful with --sysroot,
                   where the host path the program was loaded from is not a
                   path the guest can resolve",
-        pe_info::USAGE
+        pe_info::USAGE,
+        eject::USAGE
     );
 }
 
@@ -546,6 +563,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    // A 32-bit (i386) program's code must be decoded in compatibility mode,
+    // exactly as the runtime path does before translating (`run_program_with`).
+    gex_xlate::set_compat(image.class32);
     let (module, stats) = gex_xlate::translate_image(
         &image,
         &Options {
@@ -651,6 +671,19 @@ fn build_closure(
     profile: &[u64],
 ) -> Result<()> {
     let (closure, interp) = closure_of_all(path, also, sysroot)?;
+    // One decoding mode for the whole closure, taken from the executable: a
+    // 32-bit (i386) program is 32-bit throughout, and a closure that mixes
+    // classes cannot be translated in one mode.
+    let class32 = closure.objects.first().map(|o| o.image.class32).unwrap_or(false);
+    if let Some(o) = closure.objects.iter().find(|o| o.image.class32 != class32) {
+        anyhow::bail!(
+            "{}: a {}-bit object in a {}-bit program's closure",
+            o.path,
+            if o.image.class32 { 32 } else { 64 },
+            if class32 { 32 } else { 64 }
+        );
+    }
+    gex_xlate::set_compat(class32);
     // Sorted once so each object can binary-search its slice of reached PCs.
     let mut profile_sorted = profile.to_vec();
     profile_sorted.sort_unstable();
@@ -750,27 +783,7 @@ fn build_closure(
     // an EdDSA signature only ever appeared with a closure). Global, because a
     // call resolves to another object's definition; keyed by biased address,
     // which is where the block for that function is discovered.
-    let mut intrinsics: std::collections::HashMap<u64, gex_xlate::Intrinsic> =
-        std::collections::HashMap::new();
-    for o in &closure.objects {
-        let (tlo, thi) = o.image.text_range;
-        for s in &o.image.symbols {
-            if s.ifunc {
-                continue;
-            }
-            // Defined, and in this object's own text: an undefined/imported
-            // `memcpy` has no address here (it resolves to libc's definition),
-            // and the executables all share `PIE_BASE`, so an out-of-text entry
-            // would collide across them.
-            let addr = s.value.wrapping_add(o.image.bias);
-            if addr < tlo || addr >= thi {
-                continue;
-            }
-            if let Some(kind) = gex_xlate::intrinsic::recognise(&s.name) {
-                intrinsics.insert(addr, kind);
-            }
-        }
-    }
+    let intrinsics = closure_intrinsics(&closure.objects);
     for (n, o) in ordered.into_iter().enumerate() {
         let skipped = skip.iter().any(|w| o.name.starts_with(w.as_str()));
         // This object's slice of the reached-PC profile, when one was given. The
@@ -949,6 +962,34 @@ fn build_closure(
         pin_file,
     );
     Ok(())
+}
+
+/// Every object's `mem*` functions, by placed address. See `build_closure`.
+fn closure_intrinsics(
+    objects: &[gex_ld::closure::Object],
+) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
+    let mut intrinsics = std::collections::HashMap::new();
+    for o in objects {
+        let (tlo, thi) = o.image.text_range;
+        for s in &o.image.symbols {
+            if s.ifunc {
+                continue;
+            }
+            // Defined, and in this object's own text: an undefined/imported
+            // `memcpy` has no address here (it resolves to libc's definition),
+            // and the executables all share `PIE_BASE`, so an out-of-text entry
+            // would collide across them. `value` is already biased: gex-ld
+            // adds the load bias when it reads the symbol table.
+            let addr = s.value;
+            if addr < tlo || addr >= thi {
+                continue;
+            }
+            if let Some(kind) = gex_xlate::intrinsic::recognise(&s.name) {
+                intrinsics.insert(addr, kind);
+            }
+        }
+    }
+    intrinsics
 }
 
 /// Whether a file name is a dynamic linker.
@@ -1216,6 +1257,185 @@ fn cmd_ir(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `gexc funcs`: function recovery, for inspection. See `gex_xlate::func`.
+fn cmd_funcs(args: &[String]) -> Result<ExitCode> {
+    let mut path = None;
+    let mut at = None;
+    let (mut ir, mut ssa, mut check, mut list) = (false, false, false, false);
+    let mut show_uncovered = false;
+    let mut runs: u64 = 8;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--at" => {
+                i += 1;
+                let v = args.get(i).context("--at needs an address")?;
+                let v = v.strip_prefix("0x").unwrap_or(v);
+                at = Some(u64::from_str_radix(v, 16).context("--at expects hex")?);
+            }
+            "--ir" => ir = true,
+            "--ssa" => ssa = true,
+            "--check" => check = true,
+            "--list" => list = true,
+            "--uncovered" => show_uncovered = true,
+            "--run" => {
+                i += 1;
+                runs = args.get(i).context("--run needs a count")?.parse().context("--run expects a number")?;
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected an input ELF")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let image = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
+    let t0 = std::time::Instant::now();
+    let prog = gex_xlate::func::recover(&image, Some(&bytes), &Default::default());
+    let t_rec = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    let sums = gex_xlate::summary::analyze(&prog);
+    let t_sum = t1.elapsed();
+    let st = &prog.stats;
+    let pct = |a: u64, b: u64| if b == 0 { 100.0 } else { 100.0 * a as f64 / b as f64 };
+    eprintln!(
+        "functions {}  blocks {}  rounds {}  ({:.2}s recovery, {:.2}s summaries)",
+        st.functions,
+        st.blocks,
+        st.rounds,
+        t_rec.as_secs_f64(),
+        t_sum.as_secs_f64()
+    );
+    eprintln!(
+        "symbols {}/{} found ({:.2}%)  fdes {}/{}  symbol bytes covered {:.2}% of {}",
+        st.symbols_found,
+        st.symbols,
+        pct(st.symbols_found as u64, st.symbols as u64),
+        st.fdes_found,
+        st.fdes,
+        pct(st.symbol_bytes_covered, st.symbol_bytes),
+        st.symbol_bytes
+    );
+    eprintln!(
+        "fde bytes covered {:.2}% of {}",
+        pct(st.fde_bytes_covered, st.fde_bytes),
+        st.fde_bytes
+    );
+    let torn: usize = prog
+        .functions
+        .values()
+        .map(|f| gex_xlate::summary::frame_torn_down(f, &sums).len())
+        .sum();
+    eprintln!(
+        "switches {} complete, {} partial; {} unresolved indirect jumps ({} with the frame torn down); {} noreturn calls; {} interior entries",
+        st.switches_complete, st.switches_partial, st.unresolved, torn, st.noreturn_calls, st.interior_entries
+    );
+    eprintln!(
+        "summaries: {} SCCs, {} recursive, max {} iterations, {} not converged; {} functions with unknown callees",
+        sums.stats.sccs,
+        sums.stats.recursive_sccs,
+        sums.stats.max_iterations,
+        sums.stats.unconverged,
+        sums.stats.unknown
+    );
+    let missing: Vec<(&u64, &gex_xlate::func::StartInfo)> = prog
+        .starts
+        .iter()
+        .filter(|(a, s)| s.has(gex_xlate::func::Source::Symbol) && !prog.functions.contains_key(a))
+        .collect();
+    for (a, s) in missing.iter().take(20) {
+        eprintln!("  missing symbol {a:#x} {}", s.name.as_deref().unwrap_or("?"));
+    }
+    if show_uncovered {
+        let view = gex_xlate::CodeView::new(&image);
+        for (lo, hi, sym) in gex_xlate::func::uncovered(&prog) {
+            let name = prog.starts[&sym].name.as_deref().unwrap_or("?");
+            println!("uncovered {lo:#x}..{hi:#x} in {name} ({sym:#x})");
+            let mut pc = lo;
+            while pc < hi {
+                let mut buf = [0u8; 16];
+                let n = view.fetch(pc, &mut buf);
+                if n == 0 {
+                    break;
+                }
+                let (text, len) = gex_xlate::arch::disasm(&buf[..n], pc);
+                println!("    {pc:#x}: {text}");
+                pc += len as u64;
+            }
+        }
+    }
+    let mut bad = 0usize;
+    let mut vrep = gex_xlate::validate::Report::default();
+    for (&a, f) in &prog.functions {
+        if at.is_some_and(|x| x != a) {
+            continue;
+        }
+        let summ = sums.get(a);
+        if list || at.is_some() {
+            let srcs: Vec<String> = prog.starts[&a].sources().iter().map(|s| format!("{s:?}")).collect();
+            println!(
+                "{a:#x} {} blocks={} calls={} entries={} [{}] {}",
+                f.name.as_deref().unwrap_or("-"),
+                f.blocks.len(),
+                f.call_sites().len(),
+                f.entries.len(),
+                srcs.join(","),
+                gex_xlate::summary::describe(&summ)
+            );
+        }
+        let ssa_f = if ssa || check {
+            Some(sums.to_ssa(f))
+        } else {
+            None
+        };
+        if ir {
+            print!("{}", gex_ir::text::print(f));
+        }
+        if ssa {
+            print!("{}", gex_ir::text::print(ssa_f.as_ref().unwrap()));
+        }
+        if check {
+            for g in [f, ssa_f.as_ref().unwrap()] {
+                let r = g.verify().and_then(|_| {
+                    let t = gex_ir::text::print(g);
+                    let back = gex_ir::text::parse(&t)?;
+                    if &back != g {
+                        return Err("text round trip changed the function".into());
+                    }
+                    Ok(())
+                });
+                if let Err(e) = r {
+                    bad += 1;
+                    eprintln!("{a:#x} {:?} form: {e}", g.form);
+                }
+            }
+            if runs > 0 {
+                gex_xlate::validate::check_function(a, f, &sums, runs, 2000, &mut vrep);
+            }
+        }
+    }
+    if check && runs > 0 {
+        eprintln!(
+            "run: {} functions, {} runs ({} to an exit the interpreter models, {} returns checked against summaries), {} failures",
+            vrep.functions,
+            vrep.runs,
+            vrep.runs_complete,
+            vrep.returns_checked,
+            vrep.failures.len()
+        );
+        for f in vrep.failures.iter().take(40) {
+            eprintln!("  {f}");
+        }
+        bad += vrep.failures.len();
+    }
+    if check {
+        eprintln!("check: {bad} failures");
+        if bad > 0 {
+            return Ok(ExitCode::from(1));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `gexc profile merge|show`: work with profiles `gexc run --record` wrote.
 fn cmd_profile(args: &[String]) -> Result<()> {
     use gex_xlate::profile::Profile;
@@ -1298,5 +1518,58 @@ fn cmd_profile(args: &[String]) -> Result<()> {
             Ok(())
         }
         _ => bail!("usage: gexc profile merge (-o OUT | --split DIR) IN... | gexc profile show [--top N] IN"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A library's `memcpy`, placed at a base: the intrinsic goes at the
+    /// address it is loaded at, not that plus the base again (which is
+    /// outside its text, so it was silently dropped).
+    #[test]
+    fn a_placed_librarys_memcpy_is_found_where_it_is() {
+        let base = gex_abi::MMAP_BOTTOM;
+        let at = base + 0x100;
+        let image = gex_ld::Image {
+            soname: None,
+            needed: Vec::new(),
+            runpath: Vec::new(),
+            bias: base,
+            entry: base,
+            code: vec![(base, base + 0x1000)],
+            segments: Vec::new(),
+            phdr_vaddr: base,
+            phentsize: 56,
+            phnum: 0,
+            brk: base + 0x1000,
+            text_range: (base, base + 0x1000),
+            tls: None,
+            class32: false,
+            symbols: vec![gex_ld::Symbol {
+                name: "memcpy".into(),
+                value: at,
+                size: 16,
+                ifunc: false,
+            }],
+            named_relocs: Vec::new(),
+            relocs: Vec::new(),
+            init_array: Vec::new(),
+            dynsyms: Vec::new(),
+            irelative: Vec::new(),
+            pie: true,
+            interp: None,
+        };
+        let objects = vec![gex_ld::closure::Object {
+            path: "/lib/libc.so".into(),
+            name: "libc.so".into(),
+            image,
+            span: 0x1000,
+            depth: 1,
+        }];
+        let got = closure_intrinsics(&objects);
+        assert_eq!(got.get(&at), Some(&gex_xlate::Intrinsic::MemCpy));
+        assert_eq!(got.len(), 1);
     }
 }

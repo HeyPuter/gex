@@ -287,7 +287,7 @@ async function ensureChrome(restart) {
     // A real, if software, WebGL2 context in headless -- the graphics demos
     // negotiate a GL context before drawing a byte.
     ...(!headed ? ['--enable-unsafe-swiftshader'] : []),
-    // The compatibility renderer targets WebGPU. Chromium's Linux/headless
+    // Mesa on gex_wgpu targets WebGPU. Chromium's Linux/headless
     // build exposes navigator.gpu without offering an adapter unless this
     // explicit gate is enabled.
     '--enable-unsafe-webgpu',
@@ -401,25 +401,7 @@ async function runDemo(o) {
       else qs.set(k, v);
     }
   }
-  // MobileGL does not render SuperTuxKart and is not a valid reference for the
-  // Mesa/gex_wgpu path, so the harness refuses to drive it. There is
-  // deliberately no override: an escape hatch would only ever be reached by
-  // mistake, or by a future agent talking itself into "just as a control".
-  // This is the first of two refusals (MobileGlDevice.create throws as well);
-  // it exists because failing here costs a second, while failing in the page
-  // costs a browser launch and a log read carefully enough to notice which
-  // backend even ran.
-  // Must match MobileGlDevice.requested() in web/src/mobilegl.js. `webgpu=1` is
-  // the selector that actually reached MobileGL and the one every gl44 gate
-  // used to pass by default -- checking only `gl=mobilegl` missed it.
-  if (qs.get('gl') === 'mobilegl' || qs.get('webgpu') === '1') {
-    fatal('refusing to run MobileGL: it does not render SuperTuxKart and is '
-        + 'not a valid reference for the Mesa/gex_wgpu path, not even as a '
-        + 'comparison. There is no override flag -- use --query gl=mesa, or '
-        + 'virgl when you need to know what a correct frame looks like.');
-  }
   const url = `http://127.0.0.1:${SERVE_PORT}/?${qs}`;
-  const dumpWgsl = qs.has('dumpwgsl');
   log(`run: ${url}`);
   log(`goal: ${o.want ? `--want ${o.want}` : describe(spec.want)}${settle ? `  (settle: ${settle})` : ''}`);
 
@@ -452,8 +434,6 @@ async function runDemo(o) {
       // the browser's own error strings are long enough that 200 cut them off
       // mid-sentence -- "A valid external \u2026" is not a diagnosis.
       log(`  warn [${label(sid)}] ${trunc(text, 400)}`);
-    } else if (/\[webgpu\] WGSL/.test(text) || (dumpWgsl && /\[mobilegl\]/.test(text))) {
-      log(`  · [${label(sid)}] ${text}`);
     } else if (/\bquiet:|MISS-LOOP|\[virgl\] running/.test(text)) {
       // The wait census (console.debug "[gex] quiet: ...") and a few other
       // diagnostics say what a wedged run is parked on -- surfaced on demand.

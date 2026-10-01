@@ -94,7 +94,17 @@ pub fn start(out: PathBuf, opts: &crate::RunOptions) -> Result<()> {
         isa: gex_abi::ARCH_NAME.to_string(),
         argv: opts.args.clone(),
         env: opts.env.clone(),
-        cwd: opts.cwd.clone(),
+        // Where the guest starts, as `mount_filesystems` decides it: a run
+        // without `--cwd` starts in the host's working directory, and a
+        // replay (gex-eject) must start there too for relative paths to mean
+        // the same files.
+        cwd: Some(match &opts.cwd {
+            Some(d) => d.clone(),
+            None if opts.sysroot.is_some() => "/".to_string(),
+            None => std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/".into()),
+        }),
         sysroot: opts.sysroot.as_ref().map(|p| p.to_string_lossy().into_owned()),
         processes: 1,
         threads: 1,

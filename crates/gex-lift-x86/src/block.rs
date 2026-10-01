@@ -101,10 +101,11 @@ mod tests {
     /// The x87's arithmetic goes to the host (which computes it in 80-bit
     /// extended precision), each instruction with its operands encoded in
     /// the `x87op` word: here `fmulp st(1), st` (de c9) is FMUL on
-    /// `st(1) op= st(0)` with one pop, and `fstp qword [rax]` (dd 18) is FST
-    /// to double followed by the guest's own store.
+    /// `st(1) op= st(0)` with one pop. The conversion that follows, `fstp
+    /// qword [rax]` (dd 18), is lowered inline: no host call, one 8-byte
+    /// store.
     #[test]
-    fn x87_arithmetic_goes_to_the_host_in_extended_precision() {
+    fn x87_arithmetic_goes_to_the_host_and_conversions_stay_inline() {
         use crate::x87op;
         // fmulp st(1), st ; fstp qword [rax] ; ret
         let b = lift_block(bytes(0x1000, &[0xde, 0xc9, 0xdd, 0x18, 0xc3]), 0x1000, BlockLimits::default());
@@ -127,13 +128,63 @@ mod tests {
             .collect();
         assert_eq!(
             words,
-            vec![
-                x87op::FMUL | x87op::FORM_STI_ST0 << x87op::FORM_SHIFT | 1 << x87op::I_SHIFT | 1 << x87op::POP_SHIFT,
-                x87op::FST | x87op::MEM_F64 << x87op::MEM_SHIFT,
-            ],
+            vec![x87op::FMUL | x87op::FORM_STI_ST0 << x87op::FORM_SHIFT | 1 << x87op::I_SHIFT | 1 << x87op::POP_SHIFT],
             "{}",
             print::block(&b)
         );
+        assert!(
+            b.stmts.iter().any(|s| matches!(s, Stmt::Store { sz: gex_ir::MemSz::B8, .. })),
+            "{}",
+            print::block(&b)
+        );
+    }
+
+    /// `div`/`idiv` fault before writing anything: a Trap for a zero
+    /// divisor, then one for an overflowing quotient, then the writes.
+    #[test]
+    fn division_traps_before_it_writes() {
+        // div ecx ; ret
+        let b = lift_block(bytes(0x1000, &[0xf7, 0xf1, 0xc3]), 0x1000, BlockLimits::default());
+        let traps: Vec<(usize, i32)> = b
+            .stmts
+            .iter()
+            .enumerate()
+            .filter_map(|(n, s)| match s {
+                Stmt::Trap { code, pc, .. } if *pc == 0x1000 => Some((n, *code)),
+                _ => None,
+            })
+            .collect();
+        let codes: Vec<i32> = traps.iter().map(|t| t.1).collect();
+        assert_eq!(
+            codes,
+            vec![gex_abi::imports::BRK_DIVIDE_BY_ZERO, gex_abi::imports::BRK_DIVIDE_OVERFLOW],
+            "{}",
+            print::block(&b)
+        );
+        let first_write = b
+            .stmts
+            .iter()
+            .position(|s| matches!(s, Stmt::WriteReg { reg: gex_ir::GuestReg::X(0 | 2), .. }))
+            .unwrap();
+        assert!(traps.iter().all(|t| t.0 < first_write), "{}", print::block(&b));
+    }
+
+    /// `hlt` in user mode is a general-protection fault (SIGSEGV on Linux),
+    /// raised unconditionally; so are cli/sti and in/out.
+    #[test]
+    fn privileged_instructions_fault() {
+        for code in [&[0xf4u8][..], &[0xfa], &[0xfb], &[0xe4, 0x60], &[0xee], &[0x6c]] {
+            let b = lift_block(bytes(0x1000, code), 0x1000, BlockLimits::default());
+            assert!(
+                b.stmts.iter().any(|s| matches!(
+                    s,
+                    Stmt::Trap { code: gex_abi::imports::BRK_GENERAL_PROTECTION, pc: 0x1000, .. }
+                )),
+                "{code:x?}: {}",
+                print::block(&b)
+            );
+            assert_eq!(b.end, 0x1000 + code.len() as u64);
+        }
     }
 
     #[test]

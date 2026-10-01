@@ -1,7 +1,7 @@
 // The guest's GL device, backed by Mesa's frontend and the gex_wgpu Gallium
 // driver on the browser's WebGPU.
 //
-// Same role as `GlDevice` (WebGL 2) and `MobileGlDevice`: it is handed the
+// Same role as `GlDevice` (WebGL 2): it is handed the
 // guest's command ring and executes it. What differs is everything below the
 // decoder -- here the ring goes to gex's wire decoder compiled against
 // st/mesa, so the GL semantics are Mesa's rather than hand-written.
@@ -32,8 +32,7 @@ const H_PROTOCOL_VERSION = 7;
 // copied as-is during build without going through the plugin transforms" -- so
 // the request the module loader makes (with vite's `?import` appended) is a
 // 500. The built site has no such middleware and serves the file as-is, which
-// is why this only ever failed on the dev server, and only on this backend:
-// mobilegl.js has always gone through a blob and so never met the rule.
+// is why this only ever failed on the dev server.
 //
 // So: try the real URL, and fall back to a blob. `mainScriptUrlOrBlob` gives
 // Emscripten back the true location, which is what its worker bootstrap needs
@@ -96,8 +95,7 @@ export class MesaGlDevice {
   #submits = 0;
   #bytes = 0;
   // Wall time actually spent inside a batch, so "the Mesa path is slow" can be
-  // attributed rather than assumed: MobileGL reports the same three numbers,
-  // and the comparison is the whole point of having both backends.
+  // attributed rather than assumed.
   #submitMs = 0;
   #maxSubmitMs = 0;
   #busy = false;
@@ -538,12 +536,11 @@ export class MesaGlDevice {
     return this.#module?._gex_gl_display?.() ?? 0;
   }
 
-  // The rest of the renderer interface MobileGlDevice provides. That backend
-  // runs its GL in a worker and answers these from shared state; this one
+  // The rest of the renderer interface a directGl demo uses. This device
   // decodes on the page's own event loop, so a present is simply a call that
   // has returned and there is no worker to talk to. Answering honestly here
   // is what lets a directGl demo -- a real application, not a demo written
-  // for this driver -- run against either backend unchanged.
+  // for this driver -- run on it unchanged.
   // The backend's own counters, not a tally of display() calls. `produced`
   // advances when the guest swaps and `presented` when a swapped frame is
   // taken, so the two disagreeing is meaningful -- counting calls here would

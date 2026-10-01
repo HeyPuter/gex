@@ -530,7 +530,8 @@ impl<'a> Decoder<'a> {
                 let imm = self.i8()?;
                 return Ok(self.i1(Op::Push, w, Operand::Imm(imm)));
             }
-            0x6c..=0x6f => return Ok(self.unk()), // ins/outs
+            // ins/outs: #GP in user mode.
+            0x6c..=0x6f => return Ok(self.i0(Op::Privileged(op), Width::D)),
             0x70..=0x7f => {
                 let rel = self.i8()?;
                 let target = self.rel_target(rel);
@@ -755,7 +756,13 @@ impl<'a> Decoder<'a> {
             }
             0xf8 => return Ok(self.i0(Op::Clc, Width::D)),
             0xf9 => return Ok(self.i0(Op::Stc, Width::D)),
-            0xfa | 0xfb => return Ok(self.i0(Op::Undefined, Width::D)), // cli/sti: #GP in user mode
+            // cli/sti, and in/out with an immediate port or dx: #GP in
+            // user mode.
+            0xfa | 0xfb | 0xec..=0xef => return Ok(self.i0(Op::Privileged(op), Width::D)),
+            0xe4..=0xe7 => {
+                let _port = self.u8()?;
+                return Ok(self.i0(Op::Privileged(op), Width::D));
+            }
             0xfc => return Ok(self.i0(Op::Cld, Width::D)),
             0xfd => return Ok(self.i0(Op::Std, Width::D)),
             0xfe => {

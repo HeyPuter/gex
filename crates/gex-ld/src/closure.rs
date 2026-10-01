@@ -214,6 +214,26 @@ fn find(
 mod tests {
     use super::*;
 
+    /// Every shared library is linked at zero, and `resolve` measures one by
+    /// loading it there before asking where it goes. That load must not be
+    /// refused as "in the runtime's region": nothing is placed at zero.
+    #[test]
+    fn a_library_linked_at_zero_is_measured_and_placed() {
+        let mut exe = crate::elf::load(&crate::elf::test_image(2, gex_abi::EXEC_BASE), 0).unwrap();
+        exe.needed = vec!["libzero.so".to_string()];
+        let so = crate::elf::test_image(3, 0);
+        let read = |p: &str| (p == "/lib/libzero.so").then(|| so.clone());
+        let mut asked = Vec::new();
+        let mut place = |path: &str, span: u64| {
+            asked.push((path.to_string(), span));
+            gex_abi::MMAP_BOTTOM
+        };
+        let c = resolve(exe, "/bin/prog", &read, &mut place).unwrap();
+        assert!(c.missing.is_empty(), "{:?}", c.missing);
+        assert_eq!(asked, vec![("/lib/libzero.so".to_string(), 0x1000)]);
+        assert_eq!(c.objects[1].image.bias, gex_abi::MMAP_BOTTOM);
+    }
+
     #[test]
     fn origin_expands_to_the_naming_objects_directory() {
         let got = expand_origin(

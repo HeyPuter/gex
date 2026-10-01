@@ -53,6 +53,9 @@ struct Inner {
     /// few hundred binaries in a rootfs differ. Needed because dpkg rejects a
     /// `/bin/sh` whose execute bit was silently dropped.
     modes: BTreeMap<String, u32>,
+    /// Modification times set by `utimensat`, sparse like `modes`; a path
+    /// without one reports 0.
+    mtimes: BTreeMap<String, i64>,
 }
 
 /// An in-memory filesystem.
@@ -230,19 +233,21 @@ impl FileHandle for TmpHandle {
         }
         let inner = self.inner.lock().unwrap();
         let ino = TmpFs::ino_of(&inner, &self.path);
+        let mtime = inner.mtimes.get(&self.path).copied().unwrap_or(0);
         match inner.nodes.get(&self.path) {
             Some(Node::File(f)) => Ok(Metadata {
                 file_type: FileType::Regular,
                 size: f.data.lock().unwrap().len() as u64,
                 mode: inner.modes.get(&self.path).copied().unwrap_or(0o644),
                 ino,
-                mtime: 0,
+                mtime,
                 // Every name that maps to this inode is a hard link to it.
                 nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
                 rdev: 0,
             }),
             Some(Node::Dir) => Ok(Metadata {
                 ino,
+                mtime,
                 nlink: TmpFs::dir_nlink(&inner, &self.path),
                 ..Metadata::dir()
             }),
@@ -251,7 +256,7 @@ impl FileHandle for TmpHandle {
                 size: t.len() as u64,
                 mode: 0o777,
                 ino,
-                mtime: 0,
+                mtime,
                 nlink: 1,
                 rdev: 0,
             }),
@@ -260,7 +265,7 @@ impl FileHandle for TmpHandle {
                 size: 0,
                 mode: 0o755,
                 ino,
-                mtime: 0,
+                mtime,
                 nlink: 1,
                 rdev: 0,
             }),
@@ -406,6 +411,15 @@ impl FileSystem for TmpFs {
         Ok(())
     }
 
+    fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.nodes.contains_key(path) {
+            return Err(Errno::ENOENT);
+        }
+        inner.mtimes.insert(path.to_string(), secs);
+        Ok(())
+    }
+
     fn read_link(&self, path: &str) -> Result<String, Errno> {
         let inner = self.inner.lock().unwrap();
         match inner.nodes.get(path) {
@@ -421,6 +435,7 @@ impl FileSystem for TmpFs {
             Some(_) => {
                 inner.nodes.remove(path);
                 inner.inos.remove(path);
+                inner.mtimes.remove(path);
                 Ok(())
             }
             None => Err(Errno::ENOENT),
@@ -471,6 +486,14 @@ impl FileSystem for TmpFs {
         // without its execute bit, and the failure surfaces later as a shell
         // saying the program does not exist.
         let mode = inner.modes.remove(from);
+        match inner.mtimes.remove(from) {
+            Some(t) => {
+                inner.mtimes.insert(to.to_string(), t);
+            }
+            None => {
+                inner.mtimes.remove(to);
+            }
+        }
         inner.nodes.insert(to.to_string(), node);
         inner.inos.insert(to.to_string(), ino);
         match mode {

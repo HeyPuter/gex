@@ -7,6 +7,7 @@ members = [
     "crates/gex-isa",
     "crates/gex-isa-x86",
     "crates/gex-ir",
+    "crates/gex-f80",
     "crates/gex-lift",
     "crates/gex-lift-x86",
     "crates/gex-emit",
@@ -20,6 +21,7 @@ members = [
     "crates/gex-gpu",
     "crates/gex-gl",
     "crates/gex-virgl",
+    "crates/gex-eject",
     "crates/gexc",
     "shims/browser",
     "shims/hostwl",
@@ -47,6 +49,7 @@ gex-gl = { path = "crates/gex-gl", default-features = false }
 gex-isa = { path = "crates/gex-isa" }
 gex-isa-x86 = { path = "crates/gex-isa-x86" }
 gex-ir = { path = "crates/gex-ir" }
+gex-f80 = { path = "crates/gex-f80" }
 gex-lift = { path = "crates/gex-lift" }
 gex-lift-x86 = { path = "crates/gex-lift-x86" }
 gex-emit = { path = "crates/gex-emit" }
@@ -55,6 +58,7 @@ gex-xlate = { path = "crates/gex-xlate" }
 gex-ld = { path = "crates/gex-ld" }
 gex-kernel = { path = "crates/gex-kernel" }
 gex-native = { path = "shims/native" }
+gex-eject = { path = "crates/gex-eject" }
 
 [profile.release]
 opt-level = 3
