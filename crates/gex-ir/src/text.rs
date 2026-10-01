@@ -443,6 +443,7 @@ pub fn stmt(s: &Stmt) -> String {
             v(*val)
         ),
         Stmt::HostCall { func, args } => format!("host {} {}", tok(func), vs(args)),
+        Stmt::X87 { op, args, outs } => format!("{} = x87 {} {}", vs(outs), x87_tok(*op), vs(args)),
         Stmt::Trap { cond, pc, code } => format!("trap {} {:#x} {}", v(*cond), pc, code),
         Stmt::VStore {
             addr,
@@ -1003,12 +1004,47 @@ fn parse_expr(k: &mut Toks) -> Result<Expr, String> {
     })
 }
 
+/// The text form of an [`X87Op`]: `narrow32`, `narrow64`, `toint16` ..
+/// `toint64`, `trunc16` .. `trunc64`.
+fn x87_tok(op: X87Op) -> String {
+    match op {
+        X87Op::Narrow { single } => format!("narrow{}", if single { 32 } else { 64 }),
+        X87Op::ToInt { bits, trunc } => format!("{}{bits}", if trunc { "trunc" } else { "toint" }),
+    }
+}
+
+fn parse_x87(t: &str) -> Option<X87Op> {
+    Some(match t {
+        "narrow32" => X87Op::Narrow { single: true },
+        "narrow64" => X87Op::Narrow { single: false },
+        _ => {
+            let (trunc, n) = if let Some(n) = t.strip_prefix("trunc") {
+                (true, n)
+            } else {
+                (false, t.strip_prefix("toint")?)
+            };
+            let bits: u8 = n.parse().ok().filter(|b| matches!(b, 16 | 32 | 64))?;
+            X87Op::ToInt { bits, trunc }
+        }
+    })
+}
+
 fn parse_stmt(k: &mut Toks) -> Result<Stmt, String> {
     let first = k.peek().ok_or_else(|| k.err("empty statement"))?;
     if first.starts_with('[') {
-        // [out...] = strop ...
+        // [out...] = strop ... | [out...] = x87 ...
         let outs = k.vals()?;
         k.expect("=")?;
+        if k.peek() == Some("x87") {
+            k.next()?;
+            let t = k.next()?;
+            let op = parse_x87(t).ok_or_else(|| k.err(format!("unknown x87 operation `{t}`")))?;
+            let args = k.vals()?;
+            if args.len() != op.arg_types().len() || outs.len() != op.out_types().len() {
+                return Err(k.err(format!("x87 {t} takes {} values and defines {}", op.arg_types().len(), op.out_types().len())));
+            }
+            return Ok(Stmt::X87 { op, args, outs });
+        }
         k.expect("strop")?;
         if outs.len() != 5 {
             return Err(k.err("strop defines five values"));

@@ -8,6 +8,7 @@ members = [
     "crates/gex-isa-x86",
     "crates/gex-isa-ppc",
     "crates/gex-ir",
+    "crates/gex-f80",
     "crates/gex-lift",
     "crates/gex-lift-x86",
     "crates/gex-lift-ppc",
@@ -47,11 +48,12 @@ gex-wayland = { path = "crates/gex-wayland" }
 gex-xwm = { path = "crates/gex-xwm" }
 gex-virgl = { path = "crates/gex-virgl" }
 gex-gpu = { path = "crates/gex-gpu" }
-gex-gl = { path = "crates/gex-gl" }
+gex-gl = { path = "crates/gex-gl", default-features = false }
 gex-isa = { path = "crates/gex-isa" }
 gex-isa-x86 = { path = "crates/gex-isa-x86" }
 gex-isa-ppc = { path = "crates/gex-isa-ppc" }
 gex-ir = { path = "crates/gex-ir" }
+gex-f80 = { path = "crates/gex-f80" }
 gex-lift = { path = "crates/gex-lift" }
 gex-lift-x86 = { path = "crates/gex-lift-x86" }
 gex-lift-ppc = { path = "crates/gex-lift-ppc" }

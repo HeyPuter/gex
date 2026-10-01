@@ -10,7 +10,7 @@
 //! `fchs`/`fabs`, `fcmov`, the environment; so are the conversions to and
 //! from memory formats (`fld`, `fst`, `fild`, `fist`, the constants), in
 //! `x87conv`. The arithmetic the host computes exactly
-//! (`gex_kernel::x86::serve_x87` on `gex_kernel::f80`), honouring the
+//! (`gex_kernel::x86::serve_x87` on `gex_f80`), honouring the
 //! precision and rounding control of the control word and raising the
 //! exception flags: the lifter hands it an [`crate::x87op`] word through
 //! `sysreg_write`. A memory operand travels through the context's

@@ -16,6 +16,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncKind {
     Event,
+    Timer,
     Mutant,
     Semaphore,
     KeyedEvent,
@@ -25,6 +26,7 @@ impl SyncKind {
     pub fn type_name(self) -> &'static str {
         match self {
             SyncKind::Event => "Event",
+            SyncKind::Timer => "Timer",
             SyncKind::Mutant => "Mutant",
             SyncKind::Semaphore => "Semaphore",
             SyncKind::KeyedEvent => "KeyedEvent",
@@ -49,6 +51,9 @@ pub enum SState {
     Never,
     /// Always signalled (files, which complete I/O synchronously).
     Always,
+    /// A waitable timer: signalled from `due` (monotonic ns) on; a period
+    /// re-arms it on each expiry.
+    Timer { set: bool, manual: bool, due: Option<u64>, period_ms: u32 },
 }
 
 #[derive(Default, Debug)]
@@ -58,8 +63,31 @@ pub struct SyncCore {
 }
 
 impl SyncCore {
+    /// Expire timers that are due (under the lock).
+    fn tick(&mut self, id: u64, now: u64) {
+        if let Some(SState::Timer { set, due, period_ms, .. }) = self.states.get_mut(&id) {
+            if let Some(d) = *due {
+                if now >= d {
+                    *set = true;
+                    *due = if *period_ms > 0 { Some(d + *period_ms as u64 * 1_000_000) } else { None };
+                }
+            }
+        }
+    }
+
+    /// The earliest expiry among `ids`.
+    fn next_due(&self, ids: &[u64]) -> Option<u64> {
+        ids.iter()
+            .filter_map(|id| match self.states.get(id) {
+                Some(SState::Timer { due, .. }) => *due,
+                _ => None,
+            })
+            .min()
+    }
+
     fn signalled(&self, id: u64, me: u32) -> bool {
         match self.states.get(&id) {
+            Some(SState::Timer { set, .. }) => *set,
             Some(SState::Event { set, .. }) => *set,
             Some(SState::Mutant { owner, .. }) => *owner == 0 || *owner == me,
             Some(SState::Semaphore { count, .. }) => *count > 0,
@@ -73,6 +101,10 @@ impl SyncCore {
     fn consume(&mut self, id: u64, me: u32) -> bool {
         match self.states.get_mut(&id) {
             Some(SState::Event { set, manual }) if !*manual => {
+                *set = false;
+                false
+            }
+            Some(SState::Timer { set, manual, .. }) if !*manual => {
                 *set = false;
                 false
             }
@@ -148,7 +180,7 @@ pub fn deadline(c: &Call<'_>, p: u64) -> R<Option<u64>> {
 }
 
 /// The sync-core id and a fresh state for a waitable handle.
-fn wait_id(c: &Call<'_>, h: u32) -> R<u64> {
+pub fn wait_id(c: &Call<'_>, h: u32) -> R<u64> {
     match object::resolve(c, h)? {
         Obj::Sync(s) => Ok(s.id),
         Obj::Thread(t) => Ok(t.sync_id),
@@ -164,6 +196,21 @@ const ALWAYS_ID: u64 = 0;
 /// Wait for `ids`. Returns `WAIT_0 + i`, `ABANDONED + i`, `TIMEOUT`,
 /// `USER_APC` or `ALERTED`.
 pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline: Option<u64>) -> R {
+    wait_ex(c, ids, all, alertable, deadline, None)
+}
+
+/// [`wait`], also ending with `WAIT_0 + ids.len()` when `extra` says so (a
+/// message queue with input, for `MsgWaitForMultipleObjectsEx`). `extra` is
+/// asked after the objects, with no lock held; whatever makes it true must
+/// wake the thread's word afterwards.
+pub fn wait_ex(
+    c: &mut Call<'_>,
+    ids: &[u64],
+    all: bool,
+    alertable: bool,
+    deadline: Option<u64>,
+    extra: Option<&dyn Fn(&Call<'_>) -> bool>,
+) -> R {
     let me = c.t.tid;
     let t = Arc::clone(&c.t);
     {
@@ -171,11 +218,26 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
         core.states.entry(ALWAYS_ID).or_insert(SState::Always);
         core.states.entry(c.p.sync_id).or_insert(SState::Never);
     }
+    let unregister = |c: &Call<'_>| {
+        let mut core = c.p.sync.lock().unwrap();
+        for &id in ids {
+            core.unregister(id, &t);
+        }
+    };
     loop {
+        // Cleared before anything is checked: whatever becomes true after a
+        // check sets it again, so the sleep below cannot miss it.
+        let _ = c.g.w32(t.word, 0);
+        let now = (c.p.clocks.mono_ns)();
+        let timer_due;
         {
             let mut core = c.p.sync.lock().unwrap();
+            for &id in ids {
+                core.tick(id, now);
+            }
+            timer_due = core.next_due(ids);
             if all {
-                if ids.iter().all(|&id| core.signalled(id, me)) {
+                if !ids.is_empty() && ids.iter().all(|&id| core.signalled(id, me)) {
                     let mut abandoned = false;
                     for &id in ids {
                         abandoned |= core.consume(id, me);
@@ -190,19 +252,20 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
                 }
                 return Ok(if abandoned { st::ABANDONED } else { st::WAIT_0 } + i as u32);
             }
-            if alertable && !t.apcs.lock().unwrap().is_empty() {
-                for &id in ids {
-                    core.unregister(id, &t);
-                }
-                return Ok(st::USER_APC);
-            }
             for &id in ids {
                 core.register(id, &t);
             }
-            // Cleared under the lock: a signal after this sets it again.
-            let _ = c.g.w32(t.word, 0);
+        }
+        if extra.is_some_and(|f| f(c)) {
+            unregister(c);
+            return Ok(st::WAIT_0 + ids.len() as u32);
+        }
+        if alertable && !t.apcs.lock().unwrap().is_empty() {
+            unregister(c);
+            return Ok(st::USER_APC);
         }
         if c.p.terminating.load(std::sync::atomic::Ordering::Relaxed) {
+            unregister(c);
             return Err(Status(st::THREAD_IS_TERMINATING));
         }
         let timeout = match deadline {
@@ -210,13 +273,18 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
             Some(d) => {
                 let now = (c.p.clocks.mono_ns)();
                 if now >= d {
-                    let mut core = c.p.sync.lock().unwrap();
-                    for &id in ids {
-                        core.unregister(id, &t);
-                    }
+                    unregister(c);
                     return Ok(st::TIMEOUT);
                 }
                 Some(Duration::from_nanos(d - now))
+            }
+        };
+        // A timer being waited for wakes the wait at its expiry.
+        let timeout = match (timeout, timer_due) {
+            (t, None) => t,
+            (t, Some(d)) => {
+                let until = Duration::from_nanos(d.saturating_sub((c.p.clocks.mono_ns)()));
+                Some(t.map_or(until, |t| t.min(until)))
             }
         };
         sleep_on_word(c, &t, timeout);
@@ -224,7 +292,7 @@ pub fn wait(c: &mut Call<'_>, ids: &[u64], all: bool, alertable: bool, deadline:
 }
 
 /// Sleep on `t`'s wait word while it reads 0, until woken or `timeout`.
-fn sleep_on_word(c: &Call<'_>, t: &Thread, timeout: Option<Duration>) {
+pub fn sleep_on_word(c: &Call<'_>, t: &Thread, timeout: Option<Duration>) {
     let g = &c.g;
     let word = t.word;
     // A bounded slice even for "forever", so a process that is ending is
@@ -282,7 +350,7 @@ pub fn nt_signal_and_wait_for_single_object(c: &mut Call<'_>) -> R {
             SyncKind::Mutant => {
                 release_mutant(c, &s)?;
             }
-            SyncKind::KeyedEvent => return Err(Status(st::OBJECT_TYPE_MISMATCH)),
+            SyncKind::KeyedEvent | SyncKind::Timer => return Err(Status(st::OBJECT_TYPE_MISMATCH)),
         },
         _ => return Err(Status(st::OBJECT_TYPE_MISMATCH)),
     }
@@ -750,4 +818,96 @@ pub fn nt_release_keyed_event(c: &mut Call<'_>) -> R {
 pub fn signal_done(c: &mut Call<'_>, id: u64) {
     c.p.sync.lock().unwrap().states.insert(id, SState::Done(true));
     changed(c, id);
+}
+
+// ---------------------------------------------------------------------------
+// Waitable timers
+// ---------------------------------------------------------------------------
+
+/// `NtCreateTimer(*handle, access, attr, type)`: type 0 is a notification
+/// (manual-reset) timer, 1 a synchronization one.
+pub fn nt_create_timer(c: &mut Call<'_>) -> R {
+    let (hp, access, attr, ty) = (c.a(0), c.a32(1), c.a(2), c.a32(3));
+    if ty > 1 {
+        return Err(Status(st::INVALID_PARAMETER));
+    }
+    create(c, hp, access, attr, SyncKind::Timer, SState::Timer { set: false, manual: ty == 0, due: None, period_ms: 0 })
+}
+
+pub fn nt_open_timer(c: &mut Call<'_>) -> R {
+    let (hp, access, attr) = (c.a(0), c.a32(1), c.a(2));
+    open(c, hp, access, attr, SyncKind::Timer)
+}
+
+/// `NtSetTimer(handle, *due, apc, apc_ctx, resume, period, *prev_state)`.
+pub fn nt_set_timer(c: &mut Call<'_>) -> R {
+    let (h, due_p, apc, _ctx, _resume, period, prev_p) = (c.a32(0), c.a(1), c.a(2), c.a(3), c.a32(4), c.a32(5), c.a(6));
+    if apc != 0 {
+        return Err(c.unimplemented("NtSetTimer with a completion APC"));
+    }
+    let s = get_sync(c, h, SyncKind::Timer)?;
+    let due = deadline(c, due_p)?.unwrap_or_else(|| (c.p.clocks.mono_ns)());
+    let prev = {
+        let mut core = c.p.sync.lock().unwrap();
+        match core.states.get_mut(&s.id) {
+            Some(SState::Timer { set, due: d, period_ms, .. }) => {
+                let prev = *set;
+                *set = false;
+                *d = Some(due);
+                *period_ms = period;
+                prev
+            }
+            _ => return Err(Status(st::OBJECT_TYPE_MISMATCH)),
+        }
+    };
+    // Waiters re-check and re-arm their sleep for the new expiry.
+    changed(c, s.id);
+    c.g.out32(prev_p, prev as u32)?;
+    Ok(st::SUCCESS)
+}
+
+/// `NtCancelTimer(handle, *prev_state)`.
+pub fn nt_cancel_timer(c: &mut Call<'_>) -> R {
+    let (h, prev_p) = (c.a32(0), c.a(1));
+    let s = get_sync(c, h, SyncKind::Timer)?;
+    let now = (c.p.clocks.mono_ns)();
+    let prev = {
+        let mut core = c.p.sync.lock().unwrap();
+        core.tick(s.id, now);
+        match core.states.get_mut(&s.id) {
+            Some(SState::Timer { set, due, .. }) => {
+                *due = None;
+                *set
+            }
+            _ => return Err(Status(st::OBJECT_TYPE_MISMATCH)),
+        }
+    };
+    c.g.out32(prev_p, prev as u32)?;
+    Ok(st::SUCCESS)
+}
+
+/// `NtQueryTimer(handle, class, buffer, len, *ret_len)`:
+/// TimerBasicInformation {remaining time, signalled}.
+pub fn nt_query_timer(c: &mut Call<'_>) -> R {
+    let (h, class, buf, len, ret) = (c.a32(0), c.a32(1), c.a(2), c.a32(3), c.a(4));
+    if class != 0 {
+        return Err(c.unimplemented(&format!("NtQueryTimer class {class}")));
+    }
+    if len < 16 {
+        return Err(Status(st::INFO_LENGTH_MISMATCH));
+    }
+    let s = get_sync(c, h, SyncKind::Timer)?;
+    let now = (c.p.clocks.mono_ns)();
+    let (remaining, set) = {
+        let mut core = c.p.sync.lock().unwrap();
+        core.tick(s.id, now);
+        match core.states.get(&s.id) {
+            Some(SState::Timer { set, due, .. }) => (due.map_or(0, |d| d.saturating_sub(now) / 100), *set),
+            _ => return Err(Status(st::OBJECT_TYPE_MISMATCH)),
+        }
+    };
+    c.g.w64(buf, remaining)?;
+    c.g.w32(buf + 8, set as u32)?;
+    c.g.out32(ret, 16)?;
+    Ok(st::SUCCESS)
 }

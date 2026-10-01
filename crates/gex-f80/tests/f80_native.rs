@@ -1,10 +1,10 @@
-//! gex's x87 extended-precision arithmetic (`gex_kernel::f80`) against the
+//! gex's x87 extended-precision arithmetic (`gex_f80`) against the
 //! host's own x87, instruction by instruction, over operands biased toward
-//! every edge the format has. (A separate test crate: the kernel forbids
+//! every edge the format has. (A separate test crate: the library forbids
 //! `unsafe`, and the oracle is inline assembly.)
 #![cfg(target_arch = "x86_64")]
 
-use gex_kernel::f80::*;
+use gex_f80::*;
 use std::arch::asm;
 
 const C0: u16 = 1 << 8;

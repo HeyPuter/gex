@@ -424,6 +424,10 @@ pub fn dce(block: &mut Block) {
             Stmt::Def { dst, expr } => {
                 !expr.is_pure() || live.get(dst.0 as usize).copied().unwrap_or(true)
             }
+            // Pure: kept while any output is used.
+            Stmt::X87 { outs, .. } => outs
+                .iter()
+                .any(|o| live.get(o.0 as usize).copied().unwrap_or(true)),
             _ => true,
         };
         if keep {
@@ -482,6 +486,32 @@ pub fn stats(block: &Block) -> Stats {
 
 #[cfg(test)]
 mod tests {
+
+    /// An x87 operation is pure: deleted with its outputs unused, kept
+    /// (with what it reads) when one is used.
+    #[test]
+    fn an_unused_x87_operation_is_dead() {
+        let mut b = Builder::new(0x1000);
+        let sig = b.const_i64(1 << 63);
+        let se = b.const_i32(0x3fff);
+        let cw = b.const_i32(0x37f);
+        let outs = b.x87(X87Op::Narrow { single: false }, vec![sig, se, cw]);
+        let mut dead = b.finish(Term::Goto { target: 0x1004 });
+        dce(&mut dead);
+        assert!(!dead.stmts.iter().any(|s| matches!(s, Stmt::X87 { .. })));
+
+        let mut b = Builder::new(0x1000);
+        let sig = b.const_i64(1 << 63);
+        let se = b.const_i32(0x3fff);
+        let cw = b.const_i32(0x37f);
+        let outs2 = b.x87(X87Op::Narrow { single: false }, vec![sig, se, cw]);
+        b.write(GuestReg::X(0), outs2[0]);
+        let mut live = b.finish(Term::Goto { target: 0x1004 });
+        dce(&mut live);
+        assert!(live.stmts.iter().any(|s| matches!(s, Stmt::X87 { .. })));
+        assert_eq!(outs.len(), 2);
+    }
+
 
     /// A register written before a `Trap` is part of the state the fault
     /// reports, so it survives even when a later write would kill it; and

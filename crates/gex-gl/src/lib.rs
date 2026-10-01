@@ -6,5 +6,5 @@
 pub mod proto;
 pub mod trace;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "host", not(target_family = "wasm")))]
 pub mod host;

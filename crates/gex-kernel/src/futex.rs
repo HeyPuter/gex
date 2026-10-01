@@ -256,10 +256,18 @@ mod tests {
                 f.wait(0x2000, 1, None, &|| Some(word.load(Ordering::SeqCst)))
             })
         };
-        std::thread::sleep(Duration::from_millis(30));
-        word.store(2, Ordering::SeqCst);
-        assert!(f.wake(0x2000, 1) > 0);
+        // Wake until the waiter is actually queued: a wake that comes
+        // first finds nobody and is retried. The word stays 1, so however
+        // late the waiter arrives it sleeps rather than returning EAGAIN.
+        // The deadline is generous; under load the thread can take a while
+        // to be scheduled at all.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while f.wake(0x2000, 1) == 0 {
+            assert!(std::time::Instant::now() < deadline, "the waiter never queued");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(waiter.join().unwrap().is_ok());
+        let _ = word.load(Ordering::SeqCst);
     }
 
     #[test]

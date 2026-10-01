@@ -388,6 +388,17 @@ fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
 /// Check that a module is well-formed wasm, without compiling or running it.
 /// Cheap next to translating, so `gexc build` does it every time; catches
 /// lifter bugs wasmtime would otherwise only reject deep into a module.
+/// The `x87` import's work: `gex_ir::X87Op::code` decoded onto
+/// `gex_f80`'s pure operations.
+fn x87_op(op: i32, sig: u64, se: u16, cw: u16) -> (u64, u32) {
+    match op {
+        1 => gex_kernel::f80::narrow_op(sig, se, cw, true),
+        2 => gex_kernel::f80::narrow_op(sig, se, cw, false),
+        _ if op & 0x100 != 0 => gex_kernel::f80::to_int_op(sig, se, cw, ((op >> 1) & 0x7f) as u8, op & 1 != 0),
+        _ => panic!("x87 import: unknown operation {op:#x}"),
+    }
+}
+
 pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
@@ -1284,29 +1295,7 @@ fn run_thread_loop(
                 .spawn
                 .clone()
                 .ok_or_else(|| anyhow!("clone with no spawn context"))?;
-            // Detached: a guest thread is joined through its own futex, not
-            // through the host's handle, and `exit_group` ends the process
-            // whatever its threads are doing.
-            cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let running = Arc::clone(&cx.running);
-            std::thread::Builder::new()
-                .name(format!("gex-tid-{}", child.tid))
-                .spawn(move || {
-                    if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
-                        eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                        // A thread that fails takes its process with it, as on
-                        // Linux: otherwise the other threads sit in a futex
-                        // forever and every descriptor it holds stays open.
-                        stop_other_threads(&cx, false);
-                        cx.kernel
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .fds
-                            .close_all();
-                    }
-                    running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                })
-                .context("spawning a guest thread")?;
+            start_guest_thread(cx, child)?;
         }
         if let Some(req) = store.data_mut().pending_exec.take() {
             return Ok(Stopped::Exec(req));
@@ -1343,6 +1332,35 @@ fn run_thread_loop(
             }
         }
     }
+}
+
+/// Start a host thread for a guest thread a `clone` (or an NT thread
+/// creation) asked for. Called between guest calls, where nothing is borrowed.
+fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
+    // Detached: a guest thread is joined through its own futex, not
+    // through the host's handle, and `exit_group` ends the process
+    // whatever its threads are doing.
+    cx.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let running = Arc::clone(&cx.running);
+    std::thread::Builder::new()
+        .name(format!("gex-tid-{}", child.tid))
+        .spawn(move || {
+            if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
+                eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                // A thread that fails takes its process with it, as on
+                // Linux: otherwise the other threads sit in a futex
+                // forever and every descriptor it holds stays open.
+                stop_other_threads(&cx, false);
+                cx.kernel
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .fds
+                    .close_all();
+            }
+            running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        })
+        .context("spawning a guest thread")?;
+    Ok(())
 }
 
 /// Build and start a child process.
@@ -2778,7 +2796,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::Breakpoint, pc as u64);
+                return nt::fault(&mut caller, nt::Fault::from_brk(imm), pc as u64);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with
@@ -2983,6 +3001,23 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     .mul_add(f32::from_bits(b as u32), f32::from_bits(c as u32))
                     .to_bits() as i64
             }
+        },
+    )?;
+
+    linker.func_wrap(
+        m,
+        imports::X87,
+        |caller: Caller<'_, HostState>, ctx: i32, op: i32, sig: i64, se: i32, cw: i32| -> Result<i64> {
+            let (r, sw) = x87_op(op, sig as u64, se as u16, cw as u16);
+            let memory = caller
+                .data()
+                .memory
+                .clone()
+                .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            let data = memory.bytes();
+            let at = ctx as u32 as usize + ctx::X87_TMP + 12;
+            data[at..at + 4].copy_from_slice(&sw.to_le_bytes());
+            Ok(r as i64)
         },
     )?;
 

@@ -4,6 +4,7 @@
 #   tools/nt-gen-layout.sh WINE_SRC > crates/gex-kernel/src/nt/layout.rs
 #
 # Each field in tools/nt-layout.list is measured with offsetof() by MinGW for
+# (a type spelled struct_NAME is Wine's `struct NAME`)
 # x86-64 and i686 against WINE_SRC/include (the pinned Wine release,
 # docs/nt-layer.md §4), so the layouts are Wine's own, not transcribed.
 set -euo pipefail
@@ -18,16 +19,21 @@ trap 'rm -rf "$TMP"' EXIT
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
+#include "winbase.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
+#include "winuser.h"
+#include "wingdi.h"
+#include "ntuser.h"
+#include "ntgdi.h"
 #include <stddef.h>
 C
     grep -v '^#' "$HERE/nt-layout.list" | grep -v '^$' | while read -r t f _; do
         n=$(echo "$f" | tr '.[]' '___')
-        echo "const unsigned int gexoff__${t}__${n} = offsetof($t, $f);"
+        echo "const unsigned int gexoff__${t}__${n} = offsetof(${t/#struct_/struct }, $f);"
     done
     grep -v '^#' "$HERE/nt-layout.list" | grep -v '^$' | awk '{print $1}' | sort -u | while read -r t; do
-        echo "const unsigned int gexsize__${t} = sizeof($t);"
+        echo "const unsigned int gexsize__${t} = sizeof(${t/#struct_/struct });"
     done
     echo "const unsigned int gexsize__CONTEXT = sizeof(CONTEXT);"
 } >"$TMP/l.c"

@@ -87,6 +87,24 @@ mod code {
     pub const I64_EXTEND32_S: u8 = 0xc4;
     pub const I64_LT_U: u8 = 0x54;
     pub const I64_SUB: u8 = 0x7d;
+    pub const I32_EQZ: u8 = 0x45;
+    pub const I32_EQ: u8 = 0x46;
+    pub const I32_LE_U: u8 = 0x4d;
+    pub const I32_SUB: u8 = 0x6b;
+    pub const I32_AND: u8 = 0x71;
+    pub const I32_OR: u8 = 0x72;
+    pub const I32_SHL: u8 = 0x74;
+    pub const I32_SHR_U: u8 = 0x76;
+    pub const I64_EQZ: u8 = 0x50;
+    pub const I64_EQ: u8 = 0x51;
+    pub const I64_NE: u8 = 0x52;
+    pub const I64_LT_S: u8 = 0x53;
+    pub const I64_GT_U: u8 = 0x56;
+    pub const I64_ADD: u8 = 0x7c;
+    pub const I64_AND: u8 = 0x83;
+    pub const I64_OR: u8 = 0x84;
+    pub const I64_SHL: u8 = 0x86;
+    pub const I64_SHR_U: u8 = 0x88;
     /// Second byte of the `0xfc` bulk-memory pair, after the prefix.
     pub const MEMORY_COPY: u32 = 10;
     pub const MEMORY_FILL: u32 = 11;
@@ -109,6 +127,8 @@ pub struct Context<'a> {
     pub sysreg_read: u32,
     /// Import index of `gex.fma`.
     pub fma: u32,
+    /// Import index of `gex.x87`.
+    pub x87: u32,
     /// Import index of `gex.sysreg_write`.
     pub sysreg_write: u32,
     /// Import index of `gex.cache_op`.
@@ -1211,6 +1231,7 @@ impl<'a> Emitter<'a> {
             Stmt::HostCall { func, args } => {
                 self.host_call(*func, args, None, block);
             }
+            Stmt::X87 { op, args, outs } => self.emit_x87(*op, args, outs),
             Stmt::Trap { cond, pc, code } => {
                 // Only the faulting path writes the registers back, so they
                 // stay dirty for the path that carries on.
@@ -2368,6 +2389,279 @@ impl<'a> Emitter<'a> {
 
     fn type_of(&self, v: Value) -> Ty {
         self.value_ty.get(v.0 as usize).copied().unwrap_or(Ty::I64)
+    }
+
+    /// A [`Stmt::X87`]: the common operands inline, the rest through the
+    /// pure `x87` import (which computes them with `gex_f80`, the same
+    /// algorithm, so either way the bits are the hardware's).
+    ///
+    /// The fast paths: a double or single whose result is normal and cannot
+    /// overflow even when rounding carries -- rounded by RC in a dozen
+    /// instructions -- and an integer from a value of magnitude at least one
+    /// that fits (out of range gives the indefinite with IE), or zero.
+    fn emit_x87(&mut self, op: X87Op, args: &[Value], outs: &[Value]) {
+        use code::*;
+        let sig = self.alloc(Ty::I64);
+        let se = self.alloc(Ty::I32);
+        let cw = self.alloc(Ty::I32);
+        let res = self.alloc(Ty::I64);
+        let sw = self.alloc(Ty::I32);
+        let e = self.alloc(Ty::I32);
+        let sign = self.alloc(Ty::I32);
+        let m = self.alloc(Ty::I64);
+        let rem = self.alloc(Ty::I64);
+        let half = self.alloc(Ty::I64);
+        let up = self.alloc(Ty::I32);
+        self.push(args[0]);
+        self.f.local_set(sig);
+        self.push(args[1]);
+        self.f.local_set(se);
+        self.push(args[2]);
+        self.f.local_set(cw);
+        // The biased exponent and the sign.
+        self.f.local_get(se);
+        self.f.i32_const(0x7fff);
+        self.f.byte(I32_AND);
+        self.f.local_set(e);
+        self.f.local_get(se);
+        self.f.i32_const(15);
+        self.f.byte(I32_SHR_U);
+        self.f.i32_const(1);
+        self.f.byte(I32_AND);
+        self.f.local_set(sign);
+
+        match op {
+            X87Op::Narrow { single } => {
+                // Dropped bits, the normal range that cannot overflow on a
+                // carry, and the bias adjustment that folds the significand's
+                // integer bit into the exponent field.
+                let (drop, frac, total, bias) = if single { (40, 23, 32, 127) } else { (11, 52, 64, 1023) };
+                let lo = 16383 - (bias - 1); // smallest normal
+                let hi = 16383 + (bias - 1); // a carry stays finite
+                // J set and lo <= e <= hi.
+                self.f.local_get(sig);
+                self.f.i64_const(0);
+                self.f.byte(I64_LT_S);
+                self.f.local_get(e);
+                self.f.i32_const(lo);
+                self.f.byte(I32_SUB);
+                self.f.i32_const(hi - lo);
+                self.f.byte(I32_LE_U);
+                self.f.byte(I32_AND);
+                self.f.if_void();
+                self.f.local_get(sig);
+                self.f.i64_const(drop);
+                self.f.byte(I64_SHR_U);
+                self.f.local_set(m);
+                self.f.local_get(sig);
+                self.f.i64_const((1i64 << drop) - 1);
+                self.f.byte(I64_AND);
+                self.f.local_set(rem);
+                self.f.i64_const(1i64 << (drop - 1));
+                self.f.local_set(half);
+                self.emit_x87_round_up(m, rem, half, sign, cw);
+                self.f.local_set(up);
+                // bits = ((e - (16383 - bias) - 1) << frac) + m + up, signed.
+                self.f.local_get(e);
+                self.f.i32_const(16383 - bias + 1);
+                self.f.byte(I32_SUB);
+                self.f.byte(I64_EXTEND_I32_U);
+                self.f.i64_const(frac);
+                self.f.byte(I64_SHL);
+                self.f.local_get(m);
+                self.f.byte(I64_ADD);
+                self.f.local_get(up);
+                self.f.byte(I64_EXTEND_I32_U);
+                self.f.byte(I64_ADD);
+                self.f.local_get(sign);
+                self.f.byte(I64_EXTEND_I32_U);
+                self.f.i64_const(total - 1);
+                self.f.byte(I64_SHL);
+                self.f.byte(I64_OR);
+                self.f.local_set(res);
+                self.emit_x87_inexact_sw(rem, up);
+                self.f.local_set(sw);
+                self.f.else_();
+                self.emit_x87_call(op, sig, se, cw, res, sw);
+                self.f.end();
+            }
+            X87Op::ToInt { bits, trunc } => {
+                let bits = bits as i64;
+                // Zero converts to zero, raising nothing.
+                self.f.local_get(sig);
+                self.f.byte(I64_EQZ);
+                self.f.local_get(e);
+                self.f.byte(I32_EQZ);
+                self.f.byte(I32_AND);
+                self.f.if_void();
+                self.f.i64_const(0);
+                self.f.local_set(res);
+                self.f.i32_const(0);
+                self.f.local_set(sw);
+                self.f.else_();
+                // J set and 1 <= |v| < 2^(bits - 1): 16383 <= e <= 16383 + bits - 2.
+                self.f.local_get(sig);
+                self.f.i64_const(0);
+                self.f.byte(I64_LT_S);
+                self.f.local_get(e);
+                self.f.i32_const(16383);
+                self.f.byte(I32_SUB);
+                self.f.i32_const(bits as i32 - 2);
+                self.f.byte(I32_LE_U);
+                self.f.byte(I32_AND);
+                self.f.if_void();
+                // Bits below the binary point: 63 - (e - 16383), 1..=63.
+                self.f.i32_const(16383 + 63);
+                self.f.local_get(e);
+                self.f.byte(I32_SUB);
+                self.f.byte(I64_EXTEND_I32_U);
+                self.f.local_set(half); // the shift, for now
+                self.f.local_get(sig);
+                self.f.local_get(half);
+                self.f.byte(I64_SHR_U);
+                self.f.local_set(m);
+                self.f.local_get(sig);
+                self.f.i64_const(1);
+                self.f.local_get(half);
+                self.f.byte(I64_SHL);
+                self.f.i64_const(1);
+                self.f.byte(I64_SUB);
+                self.f.byte(I64_AND);
+                self.f.local_set(rem);
+                self.f.i64_const(1);
+                self.f.local_get(half);
+                self.f.i64_const(1);
+                self.f.byte(I64_SUB);
+                self.f.byte(I64_SHL);
+                self.f.local_set(half);
+                if trunc {
+                    self.f.i32_const(0);
+                } else {
+                    self.emit_x87_round_up(m, rem, half, sign, cw);
+                }
+                self.f.local_set(up);
+                // k = m + up, at most 2^(bits-1): over the limit for a
+                // positive value is out of range.
+                self.f.local_get(m);
+                self.f.local_get(up);
+                self.f.byte(I64_EXTEND_I32_U);
+                self.f.byte(I64_ADD);
+                self.f.local_set(m);
+                // Over: k > 2^(bits-1) - 1 + sign.
+                self.f.local_get(m);
+                self.f.i64_const((1i64 << (bits - 1)).wrapping_sub(1));
+                self.f.local_get(sign);
+                self.f.byte(I64_EXTEND_I32_U);
+                self.f.byte(I64_ADD);
+                self.f.byte(I64_GT_U);
+                self.f.if_void();
+                self.f.i64_const(1i64 << (bits - 1));
+                self.f.local_set(res);
+                self.f.i32_const(1); // IE
+                self.f.local_set(sw);
+                self.f.else_();
+                // sign ? -k : k, in `bits` bits.
+                self.f.i64_const(0);
+                self.f.local_get(m);
+                self.f.byte(I64_SUB);
+                self.f.local_get(m);
+                self.f.local_get(sign);
+                self.f.select();
+                if bits < 64 {
+                    self.f.i64_const((1i64 << bits) - 1);
+                    self.f.byte(I64_AND);
+                }
+                self.f.local_set(res);
+                self.emit_x87_inexact_sw(rem, up);
+                self.f.local_set(sw);
+                self.f.end();
+                self.f.else_();
+                self.emit_x87_call(op, sig, se, cw, res, sw);
+                self.f.end();
+                self.f.end();
+            }
+        }
+        for (i, (o, l)) in outs.iter().zip([res, sw]).enumerate() {
+            let idx = o.0 as usize;
+            self.value_ty[idx] = op.out_types()[i];
+            self.value_local[idx] = Some(l);
+        }
+        // The scratch locals go back to the pools; `res` and `sw` now hold
+        // the outputs.
+        self.free_i64.extend([sig, m, rem, half]);
+        self.free_i32.extend([se, cw, e, sign, up]);
+    }
+
+    /// Push whether to round the kept magnitude `m` up, given the dropped
+    /// bits `rem` and half an ulp `half` (I64 locals), the sign and the
+    /// control word: to nearest when over half, or at half with `m` odd;
+    /// away from zero (RC down for a negative value, up for a positive one)
+    /// whenever anything was dropped; toward zero never.
+    fn emit_x87_round_up(&mut self, m: u32, rem: u32, half: u32, sign: u32, cw: u32) {
+        use code::*;
+        // RC == 0 && (rem > half || (rem == half && m odd))
+        self.f.local_get(rem);
+        self.f.local_get(half);
+        self.f.byte(I64_GT_U);
+        self.f.local_get(rem);
+        self.f.local_get(half);
+        self.f.byte(I64_EQ);
+        self.f.local_get(m);
+        self.f.byte(I32_WRAP_I64);
+        self.f.i32_const(1);
+        self.f.byte(I32_AND);
+        self.f.byte(I32_AND);
+        self.f.byte(I32_OR);
+        self.f.local_get(cw);
+        self.f.i32_const(0xc00);
+        self.f.byte(I32_AND);
+        self.f.byte(I32_EQZ);
+        self.f.byte(I32_AND);
+        // RC == 2 - sign && rem != 0
+        self.f.local_get(cw);
+        self.f.i32_const(10);
+        self.f.byte(I32_SHR_U);
+        self.f.i32_const(3);
+        self.f.byte(I32_AND);
+        self.f.i32_const(2);
+        self.f.local_get(sign);
+        self.f.byte(I32_SUB);
+        self.f.byte(I32_EQ);
+        self.f.local_get(rem);
+        self.f.i64_const(0);
+        self.f.byte(I64_NE);
+        self.f.byte(I32_AND);
+        self.f.byte(I32_OR);
+    }
+
+    /// Push the status bits of a rounded result: PE when anything was
+    /// dropped, C1 when it rounded up.
+    fn emit_x87_inexact_sw(&mut self, rem: u32, up: u32) {
+        use code::*;
+        self.f.local_get(rem);
+        self.f.i64_const(0);
+        self.f.byte(I64_NE);
+        self.f.i32_const(5);
+        self.f.byte(I32_SHL);
+        self.f.local_get(up);
+        self.f.i32_const(9);
+        self.f.byte(I32_SHL);
+        self.f.byte(I32_OR);
+    }
+
+    /// The slow path: the pure `x87` import, whose status bits come back in
+    /// the context.
+    fn emit_x87_call(&mut self, op: X87Op, sig: u32, se: u32, cw: u32, res: u32, sw: u32) {
+        self.f.local_get(self.ctx_local);
+        self.f.i32_const(op.code());
+        self.f.local_get(sig);
+        self.f.local_get(se);
+        self.f.local_get(cw);
+        self.f.call(self.cx.x87);
+        self.f.local_set(res);
+        self.f.local_get(self.ctx_local);
+        self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32); // i32.load
+        self.f.local_set(sw);
     }
 
     /// A fused multiply-add, without leaving the module.

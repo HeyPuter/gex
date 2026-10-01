@@ -482,7 +482,9 @@ pub fn dispatch_exception(c: &mut Call<'_>, rec: &[u8], context: u64) -> R<()> {
     }
     // Load the context as the thread's state (the dispatcher reads it back
     // from the stack), then point the stack at the frame.
-    load_context(&mut c.g, cx, context)?;
+    // From the copy: the frame can overlap the caller's CONTEXT, which
+    // lives below its own stack pointer (RtlRaiseException's frame).
+    load_context(&mut c.g, cx, ctx_at)?;
     c.g.w64(cx + ctx::x(4) as u64, frame)?;
     let entry = c.p.ntdll.lock().unwrap().ki_user_exception_dispatcher;
     c.g.w64(cx + ctx::PC as u64, entry)?;
@@ -502,6 +504,23 @@ pub fn record_size(abi: Abi) -> u64 {
 pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
     let (rec_p, context, first) = (c.a(0), c.a(1), c.a32(2) & 0xff != 0);
     let rec = c.g.bytes(rec_p, record_size(c.p.abi) as usize)?;
+    if c.p.cfg.trace {
+        let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
+        let addr = c.g.ptr(rec_p + 2 * 4 + c.g.psize())?;
+        eprintln!("[nt:{:x}] NtRaiseException {code:#010x} at {}", c.t.tid, c.p.describe_addr(addr));
+        // The frame-pointer chain, to see who raised it.
+        if c.p.abi == Abi::P32 {
+            let mut bp = c.g.u32(context + i386::EBP)? as u64;
+            for _ in 0..12 {
+                let (Ok(next), Ok(ret)) = (c.g.u32(bp), c.g.u32(bp + 4)) else { break };
+                eprintln!("[nt:{:x}]   frame {bp:#x}: {}", c.t.tid, c.p.describe_addr(ret as u64));
+                if next as u64 <= bp {
+                    break;
+                }
+                bp = next as u64;
+            }
+        }
+    }
     if first {
         dispatch_exception(c, &rec, context)?;
         return Ok(st::SUCCESS);
@@ -609,14 +628,72 @@ pub fn nt_queue_apc_thread(c: &mut Call<'_>) -> R {
 }
 
 /// `NtCallbackReturn(result, len, status)`: end the innermost user-mode
-/// callback. The nested loop's driver reads the result (docs/nt-layer.md
-/// §5).
+/// callback. The result is copied out now (it lives on the stack the
+/// callback is abandoning), and the nested guest loop ends
+/// (docs/nt-layer.md §5).
 pub fn nt_callback_return(c: &mut Call<'_>) -> R {
     if c.t.callback_depth.load(Ordering::Acquire) == 0 {
         return Err(Status(st::NO_CALLBACK_ACTIVE));
     }
+    let (ptr, len, status) = (c.a(0), c.a32(1), c.a32(2));
+    let data = if ptr != 0 && len != 0 { c.g.bytes(ptr, len as usize)? } else { Vec::new() };
+    *c.t.callback_result.lock().unwrap() = Some((status, data));
     c.outcome = Some(Outcome::CallbackReturn);
     Ok(st::SUCCESS)
+}
+
+/// `KeUserModeCallback(id, args)`: call `KernelCallbackTable[id](args, len)`
+/// in user32 on this thread, in a nested guest loop, and return what it
+/// passed to `NtCallbackReturn` (status, data). The thread's registers are
+/// restored afterwards, so the syscall that called back carries on
+/// (docs/nt-layer.md §5).
+pub fn user_callback(c: &mut Call<'_>, id: u32, args: &[u8]) -> R<(u32, Vec<u8>)> {
+    let cx = c.t.ctx_addr;
+    let saved = c.g.bytes(cx, ctx::SIZE)?;
+    let sp = c.g.u64(cx + ctx::x(4) as u64)?;
+    let pc = c.g.u64(cx + ctx::PC as u64)?;
+    let len = args.len() as u64;
+    let entry = c.p.ntdll.lock().unwrap().ki_user_callback_dispatcher;
+    let frame = match c.p.abi {
+        // callback_stack_layout: home space, args, len, id, machine frame
+        // (rip, cs, eflags, rsp, ss), then the argument data.
+        Abi::P64 => {
+            let f = (sp - 0x58 - len) & !15;
+            c.g.zero(f, 0x58)?;
+            c.g.w64(f + 0x20, f + 0x58)?;
+            c.g.w32(f + 0x28, len as u32)?;
+            c.g.w32(f + 0x2c, id)?;
+            c.g.w64(f + 0x30, pc)?;
+            c.g.w64(f + 0x30 + 24, sp)?;
+            c.g.write(f + 0x58, args)?;
+            f
+        }
+        // eip (the return address KiUserCallbackDispatcher(id, args, len)
+        // sees), id, args, len, unk[2], esp, then the data.
+        Abi::P32 => {
+            let f = (sp - 0x1c - len) & !15;
+            c.g.w32(f, pc as u32)?;
+            c.g.w32(f + 4, id)?;
+            c.g.w32(f + 8, (f + 0x1c) as u32)?;
+            c.g.w32(f + 12, len as u32)?;
+            c.g.zero(f + 16, 8)?;
+            c.g.w32(f + 24, sp as u32)?;
+            c.g.write(f + 0x1c, args)?;
+            f
+        }
+    };
+    c.g.w64(cx + ctx::x(4) as u64, frame)?;
+    c.g.w64(cx + ctx::PC as u64, entry)?;
+    c.t.callback_depth.fetch_add(1, Ordering::AcqRel);
+    let ran = c.host.run_callback();
+    c.t.callback_depth.fetch_sub(1, Ordering::AcqRel);
+    let result = c.t.callback_result.lock().unwrap().take();
+    // The syscall resumes as it was, whatever the callback did.
+    c.g.write(cx, &saved)?;
+    match (ran, result) {
+        (Ok(()), Some(r)) => Ok(r),
+        _ => Err(Status(st::THREAD_IS_TERMINATING)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +817,7 @@ pub fn create_thread_state(
         sync_id,
         suspend: AtomicU32::new(0),
         callback_depth: AtomicU32::new(0),
+        callback_result: Mutex::new(None),
     }))
 }
 
@@ -1343,6 +1421,12 @@ pub fn nt_query_information_process(c: &mut Call<'_>) -> R {
             need(4)?;
             c.g.w32(buf, 1)?;
             4
+        }
+        // ProcessAffinityMask: every processor gex reports.
+        21 => {
+            need(ps)?;
+            c.g.wptr(buf, (1u64 << super::sysinfo::PROCESSORS) - 1)?;
+            ps
         }
         // ProcessHandleCount
         20 => {
