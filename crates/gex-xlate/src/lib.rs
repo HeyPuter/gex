@@ -245,7 +245,10 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         .enumerate()
         .map(|(i, b)| (b.start, i))
         .collect();
-    let effects: Vec<(u8, u8)> = blocks.iter().map(pass::flag_effects).collect();
+    let effects: Vec<(u64, u64)> = blocks.iter().map(pass::flag_effects).collect();
+    // The guest's own flags; the masks carry every guest's, and a block of
+    // one guest never names another's.
+    let all = if gex_abi::PPC { pass::PPC_FLAGS } else { pass::ALL_FLAGS };
 
     // Successors as block indices in one flat array, resolved once: the
     // fixpoint walks them every round, so a fresh `Vec` and hash lookup per
@@ -276,12 +279,12 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
         &succ_of[succ_at[i] as usize..succ_at[i + 1] as usize]
     };
 
-    let mut live_in = vec![0u8; blocks.len()];
+    let mut live_in = vec![0u64; blocks.len()];
     loop {
         let mut changed = false;
         for i in 0..blocks.len() {
             let live_out = if opaque[i] {
-                pass::ALL_FLAGS
+                all
             } else {
                 succs_of(i)
                     .iter()
@@ -301,7 +304,7 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
 
     // What each block may drop, settled before anything is rewritten, so the
     // rewrite reads nothing that another thread is changing.
-    let dead: Vec<u8> = (0..blocks.len())
+    let dead: Vec<u64> = (0..blocks.len())
         .map(|i| {
             if opaque[i] {
                 return 0;
@@ -309,7 +312,7 @@ fn eliminate_dead_flags(blocks: &mut [Block]) -> usize {
             let live_out = succs_of(i)
                 .iter()
                 .fold(0, |a, &s| a | live_in[s as usize]);
-            pass::ALL_FLAGS & !live_out
+            all & !live_out
         })
         .collect();
 

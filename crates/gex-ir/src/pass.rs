@@ -240,11 +240,16 @@ fn eval_cmp(op: CmpOp, ty: Ty, a: u64, b: u64) -> u32 {
 // Flag liveness
 // ---------------------------------------------------------------------------
 
-/// The four condition flags, as a bitmask.
-pub const ALL_FLAGS: u8 = 0b111_1111;
+/// AArch64's and x86-64's condition flags, as a bitmask.
+pub const ALL_FLAGS: u64 = 0b111_1111;
 
-/// Bit position of a flag in an [`ALL_FLAGS`] mask.
-fn flag_bit(r: GuestReg) -> Option<u8> {
+/// PowerPC's flags in the same mask: the 32 CR bits (bits 8..40) and XER's
+/// SO, OV and CA (bits 40..43). Kept apart from [`ALL_FLAGS`] so the other
+/// guests' masks are what they always were.
+pub const PPC_FLAGS: u64 = (0xffff_ffff << 8) | (0b111 << 40);
+
+/// Bit position of a flag in an [`ALL_FLAGS`]/[`PPC_FLAGS`] mask.
+fn flag_bit(r: GuestReg) -> Option<u64> {
     match r {
         GuestReg::N => Some(1),
         GuestReg::Z => Some(2),
@@ -253,12 +258,16 @@ fn flag_bit(r: GuestReg) -> Option<u8> {
         GuestReg::P => Some(16),
         GuestReg::A => Some(32),
         GuestReg::D => Some(64),
+        GuestReg::Cr(i) => Some(1 << (8 + i as u64)),
+        GuestReg::So => Some(1 << 40),
+        GuestReg::Ov => Some(1 << 41),
+        GuestReg::Ca => Some(1 << 42),
         _ => None,
     }
 }
 
 /// Turn a mask back into the registers it names.
-pub fn flags_of_mask(mask: u8) -> Vec<GuestReg> {
+pub fn flags_of_mask(mask: u64) -> Vec<GuestReg> {
     [
         GuestReg::N,
         GuestReg::Z,
@@ -269,6 +278,8 @@ pub fn flags_of_mask(mask: u8) -> Vec<GuestReg> {
         GuestReg::D,
     ]
     .into_iter()
+    .chain((0..32).map(GuestReg::Cr))
+    .chain([GuestReg::So, GuestReg::Ov, GuestReg::Ca])
     .filter(|r| mask & flag_bit(*r).unwrap() != 0)
     .collect()
 }
@@ -276,8 +287,8 @@ pub fn flags_of_mask(mask: u8) -> Vec<GuestReg> {
 /// A block's effect on the flags: which it reads before writing (`use`), and
 /// which it writes (`def`), the sets of a backwards liveness analysis. A
 /// straight-line block always performs every write, so all count toward `def`.
-pub fn flag_effects(block: &Block) -> (u8, u8) {
-    let (mut uses, mut defs) = (0u8, 0u8);
+pub fn flag_effects(block: &Block) -> (u64, u64) {
+    let (mut uses, mut defs) = (0u64, 0u64);
     for s in &block.stmts {
         match s {
             Stmt::Def {
@@ -302,12 +313,12 @@ pub fn flag_effects(block: &Block) -> (u8, u8) {
                 expr: Expr::HostCall { func, .. },
                 ..
             } if func.clobbers_guest_state() => {
-                uses = ALL_FLAGS;
+                uses = ALL_FLAGS | PPC_FLAGS;
             }
             // A fault hands the whole state to the host: every flag not yet
             // written in this block is read from the block's entry.
             Stmt::Trap { .. } => {
-                uses |= ALL_FLAGS & !defs;
+                uses |= (ALL_FLAGS | PPC_FLAGS) & !defs;
             }
             _ => {}
         }
@@ -481,7 +492,7 @@ mod tests {
             .count();
         assert_eq!(writes, 2, "{}", crate::print::block(&block));
         let (uses, _) = flag_effects(&block);
-        assert_eq!(uses, ALL_FLAGS);
+        assert_eq!(uses & ALL_FLAGS, ALL_FLAGS);
     }
 
     use super::*;
