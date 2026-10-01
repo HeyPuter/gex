@@ -16,7 +16,8 @@ gex-virgl.workspace = true
 gex-gpu.workspace = true
 gex-gl = { workspace = true, features = ["host"] }
 gex-ld.workspace = true
-gex-xlate = { workspace = true, features = ["parallel"] }
+gex-xlate = { workspace = true, features = ["parallel", "cgen"] }
+gex-cgen.workspace = true
 
 anyhow = "1"
 # `parallel-compilation` is not a default here because `default-features` is

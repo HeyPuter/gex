@@ -16,6 +16,7 @@ pub mod aot;
 pub mod gl;
 pub mod profile;
 pub mod nt;
+pub mod nt_cgen;
 pub mod virgl;
 pub mod wayland;
 
@@ -277,6 +278,48 @@ struct SpawnContext {
     nt: Option<Arc<gex_kernel::nt::Process>>,
 }
 
+/// Tier-1 counters for `GEX_NT_STATS`: translations published, units
+/// installed into stores, pages retired, the slot high-water mark, and the
+/// dispatch-table entries grown across every store.
+pub(crate) mod jit_stats {
+    use std::sync::atomic::AtomicU64;
+    pub static PUBLISHED: AtomicU64 = AtomicU64::new(0);
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static INSTALLS: AtomicU64 = AtomicU64::new(0);
+    pub static RETIRED: AtomicU64 = AtomicU64::new(0);
+    pub static SLOTS: AtomicU64 = AtomicU64::new(0);
+    pub static GROWN: AtomicU64 = AtomicU64::new(0);
+    pub static WASM_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// The last few translated pcs, and since the last line the lowest and
+    /// highest, so a translation storm shows where it is without a print per
+    /// miss (which changes the timing enough to hide it).
+    pub static LAST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    pub static LO: AtomicU64 = AtomicU64::new(u64::MAX);
+    pub static HI: AtomicU64 = AtomicU64::new(0);
+    pub fn note(pc: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = PUBLISHED.load(Relaxed) as usize;
+        LAST[n % 4].store(pc, Relaxed);
+        LO.fetch_min(pc, Relaxed);
+        HI.fetch_max(pc, Relaxed);
+    }
+    pub fn line() -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (lo, hi) = (LO.swap(u64::MAX, Relaxed), HI.swap(0, Relaxed));
+        format!(
+            "jit pc={lo:#x}..{hi:#x} last={:x?} pub={} blocks={} wasm={}M inst={} retired={} slots={} grown={}",
+            LAST.iter().map(|a| a.load(Relaxed)).collect::<Vec<_>>(),
+            PUBLISHED.load(Relaxed),
+            BLOCKS.load(Relaxed),
+            WASM_BYTES.load(Relaxed) >> 20,
+            INSTALLS.load(Relaxed),
+            RETIRED.load(Relaxed),
+            SLOTS.load(Relaxed),
+            GROWN.load(Relaxed)
+        )
+    }
+}
+
 /// Runtime translation state belonging to one store (PLAN §6.2, M3).
 ///
 /// A wasm table belongs to its store, so each guest thread has its own and
@@ -309,9 +352,6 @@ struct CompiledUnit {
     exported_blocks: Vec<(u64, String)>,
     dir_entries: Vec<(u64, u32)>,
     table_slots: u64,
-    /// Page assignment as of this unit, which is what its blocks' slots were
-    /// computed from.
-    page_table: gex_xlate::PageTable,
 }
 
 /// Runtime translation state shared by every guest thread.
@@ -327,6 +367,14 @@ struct JitShared {
     /// Which page owns each base slot, so the one thing that must never
     /// happen can be noticed if it ever does. See `publish_unit`.
     slot_owner: std::collections::HashMap<u32, u64>,
+    /// Misses at an address already translated, with the last few miss
+    /// sources: past [`REMISS_LIMIT`] the run stops (see `remiss`).
+    remiss: std::collections::HashMap<u64, (u32, [u64; 4])>,
+    /// How often each page has been retired, for that diagnostic.
+    retired_pages: std::collections::HashMap<u64, u32>,
+    /// Blocks a publish did not count as translated because their page was
+    /// retired after the translation's snapshot (their slots are abandoned).
+    stale_blocks: usize,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -839,6 +887,9 @@ fn run_program_with(
                 blocks: 0,
                 calls: 0,
                 slot_owner: Default::default(),
+                remiss: Default::default(),
+                retired_pages: Default::default(),
+                stale_blocks: 0,
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -854,7 +905,11 @@ fn run_program_with(
     }
 
     let entry = match nt_setup {
-        Some(setup) => nt::boot(&mut store, memory.clone(), setup)?,
+        Some(setup) => {
+            let pc = nt::boot(&mut store, memory.clone(), setup)?;
+            nt_cgen::drain_in_store(&mut store)?;
+            pc
+        }
         None => {
             place_image(
                 &mut store,
@@ -975,6 +1030,7 @@ fn run_program_with(
             k.mem.vmas().to_vec()
         };
         s.report_mapped(&vmas, opts.sysroot.as_deref().and_then(|p| p.to_str()), 20);
+        s.append_out(&s.counts.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     // Where the pinned objects actually landed. A pin that silently does not
@@ -1852,6 +1908,21 @@ pub struct Sampler {
 }
 
 impl Sampler {
+    /// `GEX_SAMPLE_OUT=path`: append every sampled address and its count to
+    /// `path`, one `pc count` line each (hex, decimal), so a run that never
+    /// exits still leaves a full profile. Lines for the same address add up.
+    pub fn append_out(&self, counts: &std::collections::HashMap<u64, u64>) {
+        let Some(path) = std::env::var_os("GEX_SAMPLE_OUT") else { return };
+        let mut text = String::new();
+        for (pc, n) in counts {
+            text.push_str(&format!("{pc:x} {n}\n"));
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(text.as_bytes());
+        }
+    }
+
     fn sample(&self, pc: u64) {
         *self
             .counts
@@ -3173,6 +3244,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             .ok_or_else(|| anyhow!("runtime translation is not set up"))?;
         (jit.limits, Arc::clone(&jit.shared))
     };
+    remiss(caller, &shared, pc)?;
     // From here to the publish below, this is the only thread deciding which
     // table slots anything occupies. See `JitShared::translating`.
     let page_table = {
@@ -3238,6 +3310,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             &Default::default(),
         )
     };
+    jit_stats::note(pc);
     if std::env::var_os("GEX_TRACE_MISSES").is_some() {
         eprintln!("[miss] pc={pc:#x} blocks={}", stats.blocks);
     }
@@ -3284,6 +3357,56 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         bail!("translated blocks but none covered 0x{pc:x}");
     }
     Ok(true)
+}
+
+/// How many times an address already translated may miss dispatch again
+/// before the run stops. A miss there is legitimate a few times (a
+/// neighbour's slot conflict, a page retired and translated anew), never
+/// hundreds: translating it again each time ate 100 MB/s until MemoryMax.
+const REMISS_LIMIT: u32 = 64;
+
+/// Count a miss at `pc` when it is already translated, and past
+/// [`REMISS_LIMIT`] stop with what dispatch sees there.
+fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc: u64) -> Result<()> {
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let gm = GuestMem::new(memory.bytes());
+    let source = gm.read_u64(ctx_addr + ctx::LAST_SOURCE as u64).unwrap_or(0);
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    if !sh.translated.contains(&pc) {
+        return Ok(());
+    }
+    let n = {
+        let e = sh.remiss.entry(pc).or_insert((0, [0; 4]));
+        e.1[(e.0 % 4) as usize] = source;
+        e.0 += 1;
+        e.0
+    };
+    if n <= REMISS_LIMIT {
+        return Ok(());
+    }
+    let page = pc / gex_abi::DISPATCH_PAGE;
+    let dir = gm.read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+    let base = sh.page_table.lookup(page);
+    let slot = base.map(|b| b as u64 + ((pc % gex_abi::DISPATCH_PAGE) >> gex_abi::DISPATCH_SHIFT));
+    let owner = base.and_then(|b| sh.slot_owner.get(&b).copied());
+    let units: Vec<usize> = sh
+        .registry
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.exported_blocks.iter().any(|(a, _)| *a == pc))
+        .map(|(i, _)| i)
+        .collect();
+    let retired = sh.retired_pages.get(&page).copied().unwrap_or(0);
+    let sources = sh.remiss[&pc].1;
+    let (n_units, stale) = (sh.registry.len(), sh.stale_blocks);
+    drop(sh);
+    let writable = caller.data_mut().with_kernel(|k| k.mem.check_access(pc, 1, prot::WRITE));
+    eprintln!(
+        "gex: BUG: {pc:#x} is translated but missed dispatch {n} times: page {page:#x} directory          entry {dir} (shared table: {base:?}, slot {slot:?}, base owned by page {owner:x?});          in units {:?} of {n_units} (first, last); page retired {retired} times; writable now:          {writable}; stale blocks so far {stale}; last miss sources {sources:x?}",
+        (units.first(), units.last())
+    );
+    bail!("{pc:#x} keeps missing dispatch after translation (retranslation livelock)")
 }
 
 /// Replay anything this store has not seen, cheaply enough to call often: the
@@ -3333,15 +3456,21 @@ fn publish_unit(
     module: Module,
     blocks: usize,
 ) -> Result<Arc<CompiledUnit>> {
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        jit_stats::PUBLISHED.fetch_add(1, Relaxed);
+        jit_stats::BLOCKS.fetch_add(blocks as u64, Relaxed);
+        jit_stats::WASM_BYTES.fetch_add(translated.wasm.len() as u64, Relaxed);
+        jit_stats::SLOTS.fetch_max(translated.table_slots, Relaxed);
+    }
     let unit = Arc::new(CompiledUnit {
         module,
         exported_blocks: translated.exported_blocks.clone(),
         dir_entries: translated.dir_entries.clone(),
         table_slots: translated.table_slots,
-        page_table: translated.page_table.clone(),
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-    for (page, base) in translated.page_table.entries() {
+    for &(page, base) in &translated.dir_entries {
         match sh.slot_owner.entry(base) {
             std::collections::hash_map::Entry::Occupied(e) if *e.get() != page => {
                 // Loudly, and not only through the error: an error out of here
@@ -3361,11 +3490,26 @@ fn publish_unit(
             }
         }
     }
-    sh.translated
-        .extend(translated.exported_blocks.iter().map(|(a, _)| *a));
-    let mut merged = sh.page_table.clone();
-    merged.merge(&translated.page_table);
-    sh.page_table = merged;
+    // Only the pages this translation allocated join the shared table. The
+    // rest of its snapshot is what the table held when it started; a page
+    // retired since then must stay retired (merging the snapshot brought it
+    // back with its old base while its directory entry stayed zero, so every
+    // translation in it reused that base, never wrote the directory, and
+    // missed again: Noita's retranslation livelock).
+    sh.page_table.insert_entries(&translated.dir_entries);
+    // A block counts as translated only if its page still has the base it
+    // was placed at; otherwise its slots are abandoned and the next miss
+    // translates it again into the page's new slots.
+    let mut stale = 0usize;
+    for (a, _) in &translated.exported_blocks {
+        let page = *a / gex_abi::DISPATCH_PAGE;
+        if sh.page_table.lookup(page).is_some() && sh.page_table.lookup(page) == translated.page_table.lookup(page) {
+            sh.translated.insert(*a);
+        } else {
+            stale += 1;
+        }
+    }
+    sh.stale_blocks += stale;
     sh.registry.push(Arc::clone(&unit));
     sh.blocks += blocks;
     sh.calls += 1;
@@ -3405,6 +3549,7 @@ fn install_unit(
             .min(per);
         let have = t.size(cx.as_context_mut());
         if want > have {
+            jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
             t.grow(cx.as_context_mut(), want - have, miss.clone())
                 .with_context(|| format!("growing dispatch table {i}"))?;
         }
@@ -3433,6 +3578,7 @@ fn install_unit(
         .as_ref()
         .and_then(|s| s.prof_proc.clone());
     profile::link(&mut linker, cx.as_context_mut(), &proc)?;
+    jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let instance = linker
         .instantiate(cx.as_context_mut(), &unit.module)
         .context("instantiating a runtime-translated module")?;
@@ -3441,7 +3587,14 @@ fn install_unit(
     // The module carries element segments for the table it imports, so
     // instantiating it already filled its slots. Writing the directory is
     // idempotent: it lives in shared guest memory.
-    write_dispatch_dir(memory, &unit.dir_entries)?;
+    // Only entries still current: replaying an old unit into a new store
+    // must not point a page retired since back at its abandoned slots.
+    let current: Vec<(u64, u32)> = {
+        let jit = cx.as_context().data().jit.as_ref().unwrap();
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        unit.dir_entries.iter().copied().filter(|&(p, b)| sh.page_table.lookup(p) == Some(b)).collect()
+    };
+    write_dispatch_dir(memory, &current)?;
     cx.as_context_mut()
         .data_mut()
         .jit
@@ -3513,6 +3666,8 @@ fn retire_translations(
         for page in first..=last {
             if sh.page_table.forget(page).is_some() {
                 pages += 1;
+                *sh.retired_pages.entry(page).or_default() += 1;
+                jit_stats::RETIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let off = (gex_abi::DISPATCH_DIR + page * 4) as usize;
             let data = memory.bytes();

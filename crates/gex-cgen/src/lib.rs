@@ -7,6 +7,7 @@
 
 pub mod emit;
 pub mod func;
+pub mod image;
 pub mod recover;
 pub mod header;
 pub mod splice;

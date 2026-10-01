@@ -659,6 +659,17 @@ pub fn cgen_conflict(cgen: bool, profiling: bool) -> Option<&'static str> {
 }
 
 pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stats) {
+    translate_image_seeded(image, None, opts)
+}
+
+/// [`translate_image`] for a PE image from [`func::pe_input`]: the function
+/// tier recovers its functions with [`func::recover_pe`] and those seeds
+/// (`.pdata`, the entry, TLS callbacks, relocated code pointers).
+pub fn translate_pe_image(image: &Image, seeds: &func::PeSeeds, opts: &Options) -> (TranslatedModule, Stats) {
+    translate_image_seeded(image, Some(seeds), opts)
+}
+
+fn translate_image_seeded(image: &Image, pe: Option<&func::PeSeeds>, opts: &Options) -> (TranslatedModule, Stats) {
     if let Some(why) = cgen_conflict(opts.cgen, profile::enabled()) {
         panic!("{why}");
     }
@@ -674,7 +685,7 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
     }
     let mut module = builder.finish();
     if opts.cgen {
-        module.wasm = cgen_splice(&module.wasm, &cgen, image, opts);
+        module.wasm = cgen_splice(&module.wasm, &cgen, image, pe, opts);
     }
     stats.wasm_bytes = module.wasm.len();
     (module, stats)
@@ -684,7 +695,13 @@ pub fn translate_image(image: &Image, opts: &Options) -> (TranslatedModule, Stat
 /// failure: a build that asked for the function tier must not quietly ship
 /// tier-1.
 #[cfg(feature = "cgen")]
-fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Options) -> Vec<u8> {
+fn cgen_splice(
+    wasm: &[u8],
+    blocks: &[(Block, u32)],
+    image: &Image,
+    pe: Option<&func::PeSeeds>,
+    opts: &Options,
+) -> Vec<u8> {
     // i386 (compatibility mode): the same tier, with a 4-byte return
     // address (gex-cgen's `class32`).
     let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
@@ -700,10 +717,20 @@ fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Optio
             limits: opts.limits,
             ..Default::default()
         };
-        let prog = func::recover(image, None, &ropts);
+        let prog = match pe {
+            Some(seeds) => func::recover_pe(image, seeds, &ropts),
+            None => func::recover(image, None, &ropts),
+        };
         let summaries = summary::analyze(&prog).map;
+        // A profile-guided (`seeds_only`) build compiles only the functions
+        // the seeds start: the hot set (`gexc build --functions`).
+        let mut functions: Vec<_> = prog.functions.into_values().collect();
+        if opts.seeds_only {
+            let keep: HashSet<u64> = opts.extra_entries.iter().copied().collect();
+            functions.retain(|f| keep.contains(&f.entry));
+        }
         gex_cgen::Functions::Recovered {
-            functions: prog.functions.into_values().collect(),
+            functions,
             intrinsics: opts.intrinsics.keys().copied().collect(),
             summaries,
         }
@@ -715,7 +742,7 @@ fn cgen_splice(wasm: &[u8], blocks: &[(Block, u32)], image: &Image, opts: &Optio
 }
 
 #[cfg(not(feature = "cgen"))]
-fn cgen_splice(_: &[u8], _: &[(Block, u32)], _: &Image, _: &Options) -> Vec<u8> {
+fn cgen_splice(_: &[u8], _: &[(Block, u32)], _: &Image, _: Option<&func::PeSeeds>, _: &Options) -> Vec<u8> {
     panic!("Options::cgen is set, but gex-xlate was built without the `cgen` feature")
 }
 
@@ -964,6 +991,111 @@ pub fn translate_runtime(
         shared_memory,
         intrinsics,
     )
+}
+
+/// Tier-1 stubs at `entries`, for the function tier to splice over: lifted
+/// from live memory (plus whatever shares their dispatch slots), in one
+/// module against `page_table`, and each with its function index.
+#[cfg(feature = "cgen")]
+fn function_stubs(
+    memory: &[u8],
+    entries: &[u64],
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
+    page_table: PageTable,
+    limits: BlockLimits,
+    shared_memory: bool,
+) -> Result<(TranslatedModule, Vec<(Block, u32)>), String> {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut have: HashSet<u64> = HashSet::new();
+    for &e in entries {
+        if have.insert(e) && fetchable(memory, executable, e) && !known(e) {
+            blocks.push(lift_one(e, memory, executable, limits).0);
+        }
+    }
+    // As `translate_seeded`: blocks sharing a dispatch slot go together.
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        let span = 1u64 << gex_abi::DISPATCH_SHIFT;
+        let mut i = 0;
+        while i < blocks.len() {
+            let lo = blocks[i].start & !(span - 1);
+            for b in lo..lo + span {
+                if !have.contains(&b) && known(b) && fetchable(memory, executable, b) {
+                    have.insert(b);
+                    blocks.push(lift_one(b, memory, executable, limits).0);
+                }
+            }
+            i += 1;
+        }
+    }
+    if blocks.is_empty() {
+        return Err(format!("none of the {} function entries is translatable", entries.len()));
+    }
+    blocks.sort_by_key(|b| b.start);
+    let mut builder = ModuleBuilder::with_pages(blocks[0].start, 0, Linkage::Shared, page_table, shared_memory);
+    let mut out: Vec<(Block, u32)> = Vec::new();
+    for block in blocks {
+        let f = builder.reserve(block.start);
+        out.push((block.clone(), f));
+        builder.add_block(block);
+    }
+    Ok((builder.finish(), out))
+}
+
+/// The function tier for code already in memory, at run time: a unit with a
+/// tier-1 stub at each of `entries` (registered in dispatch) and, spliced
+/// over them, the C of `functions` (gex-cgen). Nothing else is translated:
+/// every other address stays the runtime translator's.
+#[cfg(feature = "cgen")]
+#[allow(clippy::too_many_arguments)]
+pub fn translate_runtime_functions(
+    memory: &[u8],
+    entries: &[u64],
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
+    page_table: PageTable,
+    limits: BlockLimits,
+    shared_memory: bool,
+    functions: Vec<gex_ir::func::Function>,
+    summaries: HashMap<u64, gex_ir::func::Summary>,
+    class32: bool,
+) -> Result<(TranslatedModule, Stats), String> {
+    let (mut module, stubs) = function_stubs(memory, entries, executable, known, page_table, limits, shared_memory)?;
+    let refs: Vec<(&Block, u32)> = stubs.iter().map(|(b, f)| (b, *f)).collect();
+    let (wasm, _) = gex_cgen::build(
+        &module.wasm,
+        &refs,
+        gex_cgen::Functions::Recovered { functions, intrinsics: Vec::new(), summaries },
+        class32,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    module.wasm = wasm;
+    let stats = Stats { blocks: stubs.len(), wasm_bytes: module.wasm.len(), ..Default::default() };
+    Ok((module, stats))
+}
+
+/// [`translate_runtime_functions`] with the C already built and linked
+/// (`gex_cgen::image::build_c_module`, which exports `e_<entry>` for every
+/// function): stubs at those entries, and the module spliced over them.
+#[cfg(feature = "cgen")]
+#[allow(clippy::too_many_arguments)]
+pub fn translate_runtime_prebuilt(
+    memory: &[u8],
+    executable: &(dyn Fn(u64) -> bool + Sync),
+    known: &(dyn Fn(u64) -> bool + Sync),
+    page_table: PageTable,
+    limits: BlockLimits,
+    shared_memory: bool,
+    cwasm: &[u8],
+) -> Result<(TranslatedModule, Stats), String> {
+    let entries = gex_cgen::image::exported_entries(cwasm).map_err(|e| format!("{e:#}"))?;
+    let (mut module, stubs) = function_stubs(memory, &entries, executable, known, page_table, limits, shared_memory)?;
+    let pairs: Vec<(u64, u32)> = stubs.iter().filter(|(b, _)| entries.binary_search(&b.start).is_ok()).map(|(b, f)| (b.start, *f)).collect();
+    let (wasm, _) = gex_cgen::splice::splice(&module.wasm, cwasm, &pairs, &gex_cgen::func::entry_name, false)
+        .map_err(|e| format!("{e:#}"))?;
+    module.wasm = wasm;
+    let stats = Stats { blocks: stubs.len(), wasm_bytes: module.wasm.len(), ..Default::default() };
+    Ok((module, stats))
 }
 
 /// The body both paths share: lift from live memory, following what each
