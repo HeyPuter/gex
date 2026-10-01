@@ -27,6 +27,8 @@ if (process.env.GEX_ATTACH_TRACE) globalThis.GEX_ATTACH_TRACE = 1;
 // Options come first and are named, so a guest argument that happens to
 // contain an `=` -- `lua -e 'local x=1'`, say -- reaches the guest intact.
 const files = {};
+// Each bundled file's modification time, as the host has it (seconds).
+const mtimes = {};
 let strace = false;
 let cwd = null;
 const extract = [];
@@ -41,6 +43,7 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--file wants <guest>=<host>'); process.exit(2); }
       files[spec.slice(0, eq)] = readFileSync(spec.slice(eq + 1));
+      mtimes[spec.slice(0, eq)] = Math.trunc(statSync(spec.slice(eq + 1)).mtimeMs / 1000);
     } else if (av[i] === '--dir') {
       // A whole directory tree, which is what a program that reads headers or
       // data files needs and what a page would bundle up front.
@@ -83,6 +86,7 @@ const rest = [];
           } else {
             try {
               files[g] = readFileSync(h);
+              mtimes[g] = Math.trunc(st.mtimeMs / 1000);
             } catch {
               // Unreadable, or a name the host rejects. One file is not the
               // run.
@@ -397,6 +401,7 @@ try {
     args,
     opts: {
       strace,
+      mtimes,
       // The debugging switches, in the run's own options as well as the boot
       // message: `opts` is what a fork record carries to a child's Worker.
       traceBlocks: !!process.env.GEX_TRACE_BLOCKS,

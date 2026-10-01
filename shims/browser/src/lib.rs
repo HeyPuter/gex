@@ -247,6 +247,8 @@ extern "C" {
     fn k_fs_rmdir(path: u32, path_len: u32) -> i32;
     fn k_fs_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
     fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32;
+    fn k_fs_set_mtime(path: u32, path_len: u32, secs: i64) -> i32;
+    fn k_fs_touch(handle: i32, secs: i64) -> i32;
     fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32;
     fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
     fn k_fs_mksocket(path: u32, path_len: u32) -> i32;
@@ -679,6 +681,12 @@ extern "C" fn rf_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
 extern "C" fn rf_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
     unsafe { k_fs_chmod(path, path_len, mode) }
 }
+extern "C" fn rf_set_mtime(path: u32, path_len: u32, secs: i64) -> i32 {
+    unsafe { k_fs_set_mtime(path, path_len, secs) }
+}
+extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
+    unsafe { k_fs_touch(handle, secs) }
+}
 extern "C" fn rf_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
     unsafe { k_fs_symlink(target, target_len, path, path_len) }
 }
@@ -1109,6 +1117,8 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             symlink: rf_symlink,
             link: rf_link,
             mksocket: rf_mksocket,
+            set_mtime: rf_set_mtime,
+            touch: rf_touch,
         },
     )))
 }
@@ -1122,6 +1132,7 @@ fn install_bundle_remote() {
     FILES.0.borrow_mut().clear();
     DIRS.0.borrow_mut().clear();
     MODES.0.borrow_mut().clear();
+    MTIMES.0.borrow_mut().clear();
     if unsafe { k_fs_populated() } == 0 {
         unsafe { k_fs_populate_done() };
     }
@@ -3415,6 +3426,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );
     kernel.clock = browser_clock;
+    // And the clock a write stamps a file with.
+    gex_kernel::vfs::tmpfs::set_clock(browser_clock);
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     {
         let cwd = std::mem::take(&mut *CWD.0.borrow_mut());
@@ -3700,6 +3713,24 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 
+/// A bundled file's modification time, as the host's filesystem had it, so a
+/// program that records one (`gzip`, `make`, `tar`) sees what it would
+/// natively. Like `gex_chmod`.
+#[no_mangle]
+pub extern "C" fn gex_set_mtime(path: u32, path_len: u32, secs: i64) {
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    // SAFETY: scalars naming a range of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_set_mtime(path, path_len, secs) };
+        }
+        return;
+    }
+    MTIMES.0.borrow_mut().push((name.to_string(), secs));
+}
+
 /// Make a bundled file executable: the VFS default is 0644 and the tar's mode
 /// did not travel with its bytes, so dpkg reports present programs as missing.
 /// Only modes differing from the default are sent.
@@ -3868,6 +3899,10 @@ pub extern "C" fn gex_add_env(ptr: u32, len: u32) {
     }
 }
 
+/// Bundled files' modification times. See `gex_set_mtime`.
+static MTIMES: SingleThreaded<Vec<(String, i64)>> =
+    SingleThreaded(const { RefCell::new(Vec::new()) });
+
 /// Modes for bundled files that are not the 0644 default. See `gex_chmod`.
 static MODES: SingleThreaded<Vec<(String, u32)>> =
     SingleThreaded(const { RefCell::new(Vec::new()) });
@@ -3902,9 +3937,14 @@ fn install_bundle(root: &gex_kernel::vfs::TmpFs) {
         }
         root.add_file(&name, bytes);
     }
-    // And the modes, after the files exist to carry them.
+    // And the modes and times, after the files exist to carry them.
+    // The page names them as the guest does, with a leading slash; the tmpfs
+    // keys its nodes without one (it is mounted at `/`).
     for (name, mode) in std::mem::take(&mut *MODES.0.borrow_mut()) {
-        let _ = gex_kernel::vfs::FileSystem::chmod(root, &name, mode);
+        let _ = gex_kernel::vfs::FileSystem::chmod(root, name.trim_start_matches('/'), mode);
+    }
+    for (name, secs) in std::mem::take(&mut *MTIMES.0.borrow_mut()) {
+        let _ = gex_kernel::vfs::FileSystem::set_mtime(root, name.trim_start_matches('/'), secs);
     }
 }
 
@@ -6819,6 +6859,8 @@ pub extern "C" fn gex_adopt_child(
         }
     }
     kernel.clock = browser_clock;
+    // And the clock a write stamps a file with.
+    gex_kernel::vfs::tmpfs::set_clock(browser_clock);
     kernel.net = unsafe { HAVE_NET }.then(|| Arc::new(WispNet) as Arc<dyn net::NetStack>);
     // The state this Worker started from is a *copy* of the parent's, and the
     // descriptors in it are the parent's: pipe and pty ends it still holds,
