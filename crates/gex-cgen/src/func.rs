@@ -111,7 +111,7 @@ fn exp(name: &str) -> bool {
 
 /// Deliberate miscompilations, `GEX_CGEN_MUTATE=a,b`, each disabling one
 /// safety condition so a test can show it is needed (merge plan §5.3).
-fn mutate(name: &str) -> bool {
+pub(crate) fn mutate(name: &str) -> bool {
     std::env::var("GEX_CGEN_MUTATE")
         .map(|v| v.split(',').any(|x| x == name))
         .unwrap_or(false)
