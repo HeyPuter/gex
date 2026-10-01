@@ -303,19 +303,15 @@ pub(crate) fn install_shared(
             .shared,
     );
     for (module, meta) in units {
-        let page_table = gex_xlate::PageTable::from_entries(&meta.dir_entries, meta.next_slot);
         let unit = Arc::new(super::CompiledUnit {
             module,
             exported_blocks: Vec::new(),
             dir_entries: meta.dir_entries.clone(),
             table_slots: meta.table_slots,
-            page_table: page_table.clone(),
         });
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-            let mut merged = sh.page_table.clone();
-            merged.merge(&page_table);
-            sh.page_table = merged;
+            sh.page_table.insert_entries(&meta.dir_entries);
             sh.registry.push(Arc::clone(&unit));
         }
         super::install_unit(&mut *store, &unit)?;

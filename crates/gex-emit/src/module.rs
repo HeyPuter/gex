@@ -376,6 +376,15 @@ impl PageTable {
     /// Take in another table's assignments, `other`'s winning where they
     /// disagree -- publishing is ordered, so the last merged is the one the
     /// guest's directory ends up holding.
+    /// Record pages a published translation allocated (its `dir_entries`).
+    /// Unlike [`Self::merge`] this never brings back a page that was
+    /// forgotten after the translation took its snapshot.
+    pub fn insert_entries(&mut self, entries: &[(u64, u32)]) {
+        for (page, base) in entries {
+            self.pages.insert(*page, *base);
+        }
+    }
+
     pub fn merge(&mut self, other: &PageTable) {
         for (page, base) in &other.pages {
             self.pages.insert(*page, *base);
