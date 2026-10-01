@@ -10034,12 +10034,18 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let addr = page * gex_abi::DISPATCH_PAGE;
                     let in_images = IMAGE_PAGES.0.borrow().contains_key(&page);
                     let below = addr < gex_abi::INTERP_BASE;
+                    // The held form: this runs inside `with_host`, and the
+                    // exported `gex_closure_owner` takes the host again -- a
+                    // re-entry panic in the single-Worker shim, whose host
+                    // is a `RefCell`, whenever the trace was on and a miss
+                    // translated.
+                    let owner = closure_owner_held(h, page);
                     warn_line(&format!(
                         "[gex] miss pid={} addr={addr:#x} page={page:#x} \
                          below_interp={below} in_image_pages={in_images} \
                          owner={}\n",
                         h.kernel.pid,
-                        gex_closure_owner(page),
+                        owner,
                     ));
                 }
             }
