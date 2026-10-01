@@ -18,38 +18,38 @@ pub fn build_sh() -> String {
 #      user/files/), and with a browser runtime (runtime/web), the web build
 #      in build/web for run.mjs and index.html.
 #
-# Environment: CLANG (default clang), USER_CFLAGS, USER_LDFLAGS.
+# Environment: CLANG, WASM_LD (default clang, wasm-ld), USER_CFLAGS, USER_LDFLAGS
+# (wasm-ld flags).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$HERE/build"
 set -- "$HERE"/user/src/*.c
+rm -f "$HERE/build/user.wasm" "$HERE/build/user.web.wasm"
 if [ -e "$1" ]; then
+    # Compiled as the function tier compiles its C (gexc eject decompile
+    # writes that C), with every function exported.
+    rm -rf "$HERE/build/obj" && mkdir -p "$HERE/build/obj"
+    for c in "$@"; do
+        ${{CLANG:-clang}} {cflags} -fvisibility=default -I"$HERE/gen" ${{USER_CFLAGS:-}} \
+            -c "$c" -o "$HERE/build/obj/$(basename "$c" .c).o"
+    done
     # Replacement code shares the guest's memory: its data and heap go at
     # {base:#x} (above everything the guest and the runtime use; {data} MiB),
     # and the runtime gives each guest thread its own stack after them.
-    ${{CLANG:-clang}} --target=wasm32 -O2 -nostdlib -ffreestanding -fvisibility=default -matomics -mbulk-memory \
-        -I"$HERE/gen" ${{USER_CFLAGS:-}} \
-        -Wl,--no-entry -Wl,--export-dynamic -Wl,--import-memory -Wl,--shared-memory \
-        -Wl,--max-memory={max} -Wl,--global-base={base} \
-        -Wl,--export=__stack_pointer -Wl,--export=__heap_base ${{USER_LDFLAGS:-}} \
-        -o "$HERE/build/user.wasm" "$@"
+    LINK="--no-entry --export-dynamic --import-memory --max-memory={max} --global-base={base} \
+        --export=__stack_pointer --export=__heap_base ${{USER_LDFLAGS:-}}"
+    ${{WASM_LD:-wasm-ld}} $LINK --shared-memory -o "$HERE/build/user.wasm" "$HERE"/build/obj/*.o
     # And for the browser's single-Worker shim, whose memory is not shared.
     if [ -e "$HERE/runtime/web/gex_browser.wasm" ]; then
-        ${{CLANG:-clang}} --target=wasm32 -O2 -nostdlib -ffreestanding -fvisibility=default -mbulk-memory \
-            -I"$HERE/gen" ${{USER_CFLAGS:-}} \
-            -Wl,--no-entry -Wl,--export-dynamic -Wl,--import-memory \
-            -Wl,--max-memory={max} -Wl,--global-base={base} \
-            -Wl,--export=__stack_pointer -Wl,--export=__heap_base ${{USER_LDFLAGS:-}} \
-            -o "$HERE/build/user.web.wasm" "$@"
+        ${{WASM_LD:-wasm-ld}} $LINK -o "$HERE/build/user.web.wasm" "$HERE"/build/obj/*.o
     fi
-else
-    rm -f "$HERE/build/user.wasm" "$HERE/build/user.web.wasm"
 fi
 exec "$HERE/runtime/gexc" eject build "$HERE"
 "#,
         base = REPL_BASE,
         data = REPL_DATA_BYTES >> 20,
         max = gex_abi::GUEST_MEM_BYTES,
+        cflags = gex_cgen::toolchain::CFLAGS.join(" "),
     )
 }
 

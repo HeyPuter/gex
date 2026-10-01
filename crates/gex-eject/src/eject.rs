@@ -344,6 +344,8 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
         summary.web = true;
     }
     write_file(&out.join("gen/gex_replace.h"), templates::header(&project.isa).as_bytes(), false)?;
+    // The function tier's view of gex-abi, which decompiled C includes.
+    write_file(&out.join("gen/gex_abi.h"), gex_cgen::header::header().as_bytes(), false)?;
 
     // The user's part, once.
     let user = out.join("user");

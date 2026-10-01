@@ -268,7 +268,7 @@ fn verify_rootfs(dir: &Path, project: &Project) -> Result<()> {
 
 /// The object a replacement names: by guest path, or by file name when that
 /// is unambiguous.
-fn find_object<'a>(placed: &'a [Placed], name: &str) -> Result<&'a Placed> {
+pub(crate) fn find_object<'a>(placed: &'a [Placed], name: &str) -> Result<&'a Placed> {
     if let Some(o) = placed.iter().find(|p| p.obj.path == name) {
         return Ok(o);
     }
@@ -287,16 +287,16 @@ fn find_object<'a>(placed: &'a [Placed], name: &str) -> Result<&'a Placed> {
 }
 
 /// An object loaded where the run will place it.
-struct Placed {
-    obj: Object,
-    image: gex_ld::Image,
+pub(crate) struct Placed {
+    pub(crate) obj: Object,
+    pub(crate) image: gex_ld::Image,
 }
 
 /// Place every object as the run will: executables at `PIE_BASE` (gex's
 /// loader), the interpreter at `INTERP_BASE` (likewise), and libraries up
 /// from `MMAP_BOTTOM` in the session's order, each at a base the run pins
 /// with `RunOptions::pins`. The same rule as `gexc build --closure`.
-fn layout(dir: &Path, project: &Project) -> Result<Vec<Placed>> {
+pub(crate) fn layout(dir: &Path, project: &Project) -> Result<Vec<Placed>> {
     const SLACK: u64 = 0x10000;
     let mut next = gex_abi::MMAP_BOTTOM;
     let mut out = Vec::new();
@@ -344,7 +344,7 @@ pub fn function_hash(image: &gex_ld::Image, addr: u64, size: u64) -> Result<Stri
 }
 
 /// The unique function a symbol names in a placed image: `(address, size)`.
-fn symbol_in(p: &Placed, symbol: &str) -> Result<(u64, u64)> {
+pub(crate) fn symbol_in(p: &Placed, symbol: &str) -> Result<(u64, u64)> {
     let (tlo, thi) = p.image.text_range;
     let mut found: Vec<(u64, u64, bool)> = p
         .image
