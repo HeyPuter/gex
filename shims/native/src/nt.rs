@@ -243,7 +243,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let ctx_addr = state.thread.ctx_addr;
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
-        nt::syscall(&p, &kernel, memory.bytes(), ctx_addr, pc, &mut host)
+        nt::syscall(&p, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
     };
     // A callback inside that syscall may have ended the process or failed.
     if caller.data().exit.is_some() {
@@ -297,46 +297,12 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     }
 }
 
-/// A processor exception in an NT process's translated code.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Fault {
-    /// `int3`; the pc is the instruction's own address.
-    Breakpoint,
-    /// An instruction gex does not implement (`ud2` included).
-    Illegal,
-    /// A branch to memory that is not executable.
-    NotExecutable,
-    /// x86 #DE from a zero divisor (`Stmt::Trap`, `BRK_DIVIDE_BY_ZERO`).
-    DivideByZero,
-    /// x86 #DE from a quotient too wide (`BRK_DIVIDE_OVERFLOW`).
-    DivideOverflow,
-    /// A privileged instruction such as `hlt` (`BRK_GENERAL_PROTECTION`).
-    Privileged,
-    /// An unmasked x87 exception (`BRK_X87_EXCEPTION`), which gex does not
-    /// deliver: the process ends, loudly.
-    X87,
-}
-
-impl Fault {
-    /// The fault a `breakpoint` import's immediate stands for: the
-    /// `Stmt::Trap` codes, or an `int3`.
-    pub(crate) fn from_brk(imm: i32) -> Fault {
-        use gex_abi::imports as i;
-        match imm {
-            i::BRK_DIVIDE_BY_ZERO => Fault::DivideByZero,
-            i::BRK_DIVIDE_OVERFLOW => Fault::DivideOverflow,
-            i::BRK_GENERAL_PROTECTION => Fault::Privileged,
-            i::BRK_X87_EXCEPTION => Fault::X87,
-            _ => Fault::Breakpoint,
-        }
-    }
-}
+pub(crate) use gex_kernel::nt::Fault;
 
 /// Deliver `fault` at `pc` to the guest as an NT exception, as Wine's signal
 /// handlers do. Returns the StopExecution that redirects the thread into
 /// `KiUserExceptionDispatcher`.
 pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -> Result<()> {
-    use nt::st;
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let state = caller.data_mut();
     let p = Arc::clone(state.nt.as_ref().expect("an NT fault in a Linux process"));
@@ -350,20 +316,8 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
         });
         return Err(StopExecution.into());
     }
-    let (code, rip, info): (u32, u64, Vec<u64>) = match fault {
-        // The context's rip is after the int3, as hardware leaves it.
-        Fault::Breakpoint => (st::BREAKPOINT, pc + 1, vec![0]),
-        Fault::Illegal => (st::ILLEGAL_INSTRUCTION, pc, vec![]),
-        // EXCEPTION_EXECUTE_FAULT at the target.
-        Fault::NotExecutable => (st::ACCESS_VIOLATION, pc, vec![8, pc]),
-        // Windows reports #DE as these two, and `hlt` in user mode as a
-        // privileged instruction, all at the faulting instruction.
-        Fault::DivideByZero => (st::INTEGER_DIVIDE_BY_ZERO, pc, vec![]),
-        Fault::DivideOverflow => (st::INTEGER_OVERFLOW, pc, vec![]),
-        Fault::Privileged => (st::PRIVILEGED_INSTRUCTION, pc, vec![]),
-        Fault::X87 => unreachable!(),
-    };
-    let outcome = nt::hardware_exception(&p, &state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
+    let (code, rip, info) = fault.exception(pc).expect("every fault but X87 is an exception");
+    let outcome = nt::hardware_exception(&p, &*state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {
         nt::Outcome::Resume(target) => state.resume_at = Some(target),
         nt::Outcome::Exit(code) => state.exit = Some(Exit::Status(code as i32)),

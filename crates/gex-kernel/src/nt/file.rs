@@ -241,7 +241,7 @@ fn open(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, options: u3
             Ok(_) => "ok".to_string(),
             Err(e) => format!("{:#010x}", e.0),
         };
-        eprintln!("[nt:{:x}]   {} {:?} -> {s}", c.t.tid, c.name(), wstr(nt));
+        crate::nt_log!("[nt:{:x}]   {} {:?} -> {s}", c.t.tid, c.name(), wstr(nt));
     }
     r
 }

@@ -458,7 +458,7 @@ fn map_nls(c: &mut Call<'_>, file: &str, section_name: Option<&str>) -> R<(u64, 
         _ => {
             let path = format!("{}/nls/{file}", c.p.cfg.prefix);
             let data = super::file::read_guest_file(&c.kernel(), &path).map_err(|e| {
-                eprintln!("gex-nt: cannot read {path}: {e:?}");
+                crate::nt_log!("gex-nt: cannot read {path}: {e:?}");
                 Status(st::OBJECT_NAME_NOT_FOUND)
             })?;
             let size = data.len() as u64;
@@ -504,7 +504,7 @@ pub fn map_readonly_copy(c: &mut Call<'_>, data: &[u8], name: &str) -> R<u64> {
 pub fn alloc_private(c: &mut Call<'_>, size: u64, name: &str) -> R<u64> {
     use super::vm::{self, page_prot, Kind};
     let size = (size.max(1) + vm::PAGE - 1) & !(vm::PAGE - 1);
-    let limit = if c.p.abi == super::Abi::P32 { 0x8000_0000 } else { vm::ALLOC_HIGH };
+    let limit = vm::ALLOC_HIGH;
     let base = {
         let mut stl = c.p.st.lock().unwrap();
         let b = stl.vm.find_free((size + vm::GRANULE - 1) & !(vm::GRANULE - 1), false, limit)

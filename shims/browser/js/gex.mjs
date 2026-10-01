@@ -770,6 +770,12 @@ export class Gex {
           ).replace(/\n$/, ''),
         ),
         now: () => this.#env.now(),
+        // The NT layer's monotonic clock: `now` is `Date.now()`, a
+        // millisecond wall clock that can step.
+        mono_ns: () => BigInt(Math.round(performance.now() * 1e6)),
+        // A Windows program's user-mode callback (docs/nt-layer.md §5): the
+        // guest runs nested, inside the `syscall` import, until it returns.
+        nt_callback: (ctx, pc) => this.#ntCallback(ctx >>> 0, pc),
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
@@ -2822,6 +2828,111 @@ export class Gex {
    * the table the guest dispatches through. The shim lifted and encoded it;
    * only the engine can compile it, and only JS can ask the engine.
    */
+  /**
+   * A user-mode callback of a Windows program (docs/nt-layer.md §5): run the
+   * guest from `pc` on this Worker, nested inside the `syscall` import that
+   * asked, until the thread's `NtCallbackReturn`. Synchronous throughout --
+   * there is a shim frame below this one, so nothing may yield -- which is
+   * why translations are compiled with `new WebAssembly.Module` here (legal
+   * in a Worker at any size). Returns 1 when the callback returned, 0 when
+   * the run failed or the process ended.
+   */
+  #ntCallback(ctx, pc) {
+    const e = this.#shim.exports;
+    // The shim's frames below this import are live: every trap out of the
+    // nested guest abandons only the frames above here, so the shadow stack
+    // goes back to exactly this, never to the Worker's base.
+    const sp = e.__stack_pointer.value;
+    pc = pc < 0n ? pc + (1n << 64n) : pc;
+    for (;;) {
+      try {
+        this.#guest.exports.enter(ctx, pc);
+        console.error('[gex-nt] guest code returned out of a user-mode callback');
+        return 0;
+      } catch (err) {
+        e.__stack_pointer.value = sp;
+        if (!e.gex_handoff()) {
+          // The sibling-numbered-page race, as in the outer loop.
+          if (/table index is out of bounds/.test(err.message) && e.gex_last_target) {
+            const tgt = e.gex_last_target();
+            if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
+              pc = tgt < 0n ? tgt + (1n << 64n) : tgt;
+              continue;
+            }
+          }
+          console.error(`[gex-nt] a user-mode callback crashed: ${err.stack ?? err}`);
+          return 0;
+        }
+        if (e.gex_nt_callback_done(ctx)) return 1;
+        if (e.gex_exited?.()) return 0;
+        const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+        if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+        if (e.gex_jit_pending_len() >>> 0) {
+          const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+          if (need) this.#growTables(need, 'nt-callback');
+        }
+        while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+        this.#catchUpSync();
+        // A thread created inside the callback: posting it is synchronous,
+        // only the answer would need the event loop.
+        this.#drainThread().catch((err) => console.error(`[gex-nt] starting a thread: ${err.message ?? err}`));
+        const next = e.gex_resume_pc();
+        if (next === 0n) {
+          console.error('[gex-nt] a user-mode callback stopped with nowhere to resume');
+          return 0;
+        }
+        pc = next < 0n ? next + (1n << 64n) : next;
+        const c = e.gex_resume_ctx() >>> 0;
+        if (c) ctx = c;
+      }
+    }
+  }
+
+  /** `#installTranslation` without yielding, for `#ntCallback`. */
+  #installTranslationSync() {
+    const e = this.#shim.exports;
+    const ptr = e.gex_jit_pending_ptr() >>> 0;
+    const len = e.gex_jit_pending_len() >>> 0;
+    if (len === 0) return;
+    const bytes = this.#bytes().slice(ptr, ptr + len);
+    const key = moduleContentKey(bytes);
+    this.#installModule(bytes, e.gex_jit_slots() >>> 0, 64, null, 'nt-callback', null, true);
+    e.gex_jit_installed();
+    const count = e.gex_module_count ? e.gex_module_count() >>> 0 : this.#installed;
+    this.#installed = count;
+    if (count) {
+      const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+      if (mod && key && !this.#sharedModules.has(key)) {
+        this.#sharedModules.set(key, mod);
+        this.#env.shareModule?.(key, mod);
+      }
+    }
+  }
+
+  /** `#catchUp` (eager) without yielding, for `#ntCallback`. */
+  #catchUpSync() {
+    const e = this.#shim.exports;
+    if (!e.gex_module_count) return;
+    const have = e.gex_module_count() >>> 0;
+    const need = (e.gex_jit_slots_total?.() ?? 0) >>> 0;
+    for (; this.#installed < have; this.#installed++) {
+      const i = this.#installed;
+      const ptr = e.gex_module_ptr(i) >>> 0;
+      const len = e.gex_module_len(i) >>> 0;
+      if (!len) continue;
+      const bytes = this.#bytes().slice(ptr, ptr + len);
+      const key = moduleContentKey(bytes);
+      const cached = key ? this.#sharedModules.get(key) : undefined;
+      this.#installModule(bytes, need, 64, null, 'nt-catchup', cached, true);
+      if (cached) continue;
+      const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+      if (mod && key) {
+        this.#sharedModules.set(key, mod);
+        this.#env.shareModule?.(key, mod);
+      }
+    }
+  }
+
   async #installTranslation() {
     const e = this.#shim.exports;
     const ptr = e.gex_jit_pending_ptr() >>> 0;
@@ -2888,11 +2999,14 @@ export class Gex {
    * or another did and this one catches up): a thread that installed them
    * differently would dispatch to different code.
    */
-  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null) {
+  async #installModule(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false) {
     const t0 = performance.now();
     this.#installs++;
     try {
-      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled);
+      // With `sync` the inner call never awaits, so the install is complete
+      // when this returns its promise -- what a nested loop inside an import
+      // needs, since it cannot yield.
+      return await this.#installModuleInner(bytes, need, segments, meta, who, precompiled, sync);
     } finally {
       this.#installMs += performance.now() - t0;
     }
@@ -2904,7 +3018,7 @@ export class Gex {
    * turned out not to be what a run costs: each process installs thousands of
    * shared modules, and compiling and instantiating those was uncounted.
    */
-  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null) {
+  async #installModuleInner(bytes, need, segments = 64, meta = null, who = '?', precompiled = null, sync = false) {
     const t0 = performance.now();
     const e = this.#shim.exports;
     const tg = performance.now();
@@ -2929,7 +3043,8 @@ export class Gex {
     // Module). Same registry bytes either way, so the Module is interchangeable.
     const mod = precompiled instanceof WebAssembly.Module
       ? precompiled
-      : bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
+      : bytes instanceof WebAssembly.Module ? bytes
+        : sync ? new WebAssembly.Module(bytes) : await WebAssembly.compile(bytes);
     this.#compileMs += performance.now() - tc;
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must

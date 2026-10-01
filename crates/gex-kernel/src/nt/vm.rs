@@ -14,9 +14,12 @@ use std::collections::BTreeMap;
 pub const PAGE: u64 = 0x1000;
 /// Windows' allocation granularity.
 pub const GRANULE: u64 = 0x10000;
-/// The allocator's range (docs/nt-layer.md §1.2).
+/// The allocator's range (docs/nt-layer.md §1.2). The top is Windows'
+/// `MmHighestUserAddress + 1` for a 32-bit address space: the last 64 KiB
+/// below 2 GiB are never handed out (and the browser shim's guest slice
+/// ends there).
 pub const ALLOC_LOW: u64 = 0x0040_0000;
-pub const ALLOC_HIGH: u64 = gex_abi::MMAP_TOP;
+pub const ALLOC_HIGH: u64 = 0x7fff_0000;
 
 pub mod mem_flags {
     pub const COMMIT: u32 = 0x1000;
@@ -331,6 +334,20 @@ impl Vm {
     }
 }
 
+impl super::Process {
+    /// Keep `[start, end)` out of the allocator for good, before boot: memory
+    /// the host itself uses in an address space it shares with the guest
+    /// (the browser shim's stack, data and heap). Reserved, never committed,
+    /// so it is not in the Linux map and nothing the guest asks for lands on
+    /// it.
+    pub fn reserve_host(&self, start: u64, end: u64, name: &str) {
+        let (start, end) = (start & !(GRANULE - 1), align_up(end, GRANULE));
+        let mut st = self.st.lock().unwrap();
+        debug_assert!(st.vm.is_free(start, end));
+        st.vm.reserve(start, end - start, page_prot::NOACCESS, false, Kind::Private, name);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Syscalls
 // ---------------------------------------------------------------------------
@@ -368,8 +385,8 @@ pub fn after_change(c: &mut Call<'_>, start: u64, end: u64, fresh: &[(u64, u64)]
 }
 
 /// The highest address an allocation may end at, from `ZeroBits`.
-fn zero_bits_limit(c: &Call<'_>, zero_bits: u64) -> u64 {
-    let top = if c.p.abi == super::Abi::P32 { 0x8000_0000 } else { ALLOC_HIGH };
+fn zero_bits_limit(_c: &Call<'_>, zero_bits: u64) -> u64 {
+    let top = ALLOC_HIGH;
     match zero_bits {
         0 => top,
         1..=31 => (1u64 << (32 - zero_bits)).min(top),

@@ -184,7 +184,7 @@ pub fn map_image(
         stl.vm.find_free(align_up(size, vm::GRANULE), false, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))?
     };
     let bytes = img.map(base).map_err(|e| {
-        eprintln!("gex-nt: mapping {path} at {base:#x}: {e}");
+        crate::nt_log!("gex-nt: mapping {path} at {base:#x}: {e}");
         Status(st::INVALID_IMAGE_FORMAT)
     })?;
     // Pages: headers read-only, each section with its own protection.
@@ -267,7 +267,7 @@ pub fn nt_create_section(c: &mut Call<'_>) -> R {
             }));
         }
         let img = pe::parse(&data).map_err(|e| {
-            eprintln!("gex-nt: {path} is not an image gex can map: {e}");
+            crate::nt_log!("gex-nt: {path} is not an image gex can map: {e}");
             Status(st::INVALID_IMAGE_FORMAT)
         })?;
         let size = align_up(img.image_size as u64, PAGE);
@@ -357,7 +357,7 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
     match &sec.kind {
         SecKind::Image { pe, path, nt_path } => {
             let (pe, path, nt_path) = (Arc::clone(pe), path.clone(), nt_path.clone());
-            let mut k = c.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            let mut k = c.kernel.lock_kernel();
             let (base, status) = map_image(c.p, &mut k, &mut c.g, &pe, want, &path, &nt_path)?;
             drop(k);
             sec.views.lock().unwrap().push(base);

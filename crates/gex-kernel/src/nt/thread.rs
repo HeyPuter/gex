@@ -507,13 +507,13 @@ pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
     if c.p.cfg.trace {
         let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
         let addr = c.g.ptr(rec_p + 2 * 4 + c.g.psize())?;
-        eprintln!("[nt:{:x}] NtRaiseException {code:#010x} at {}", c.t.tid, c.p.describe_addr(addr));
+        crate::nt_log!("[nt:{:x}] NtRaiseException {code:#010x} at {}", c.t.tid, c.p.describe_addr(addr));
         // The frame-pointer chain, to see who raised it.
         if c.p.abi == Abi::P32 {
             let mut bp = c.g.u32(context + i386::EBP)? as u64;
             for _ in 0..12 {
                 let (Ok(next), Ok(ret)) = (c.g.u32(bp), c.g.u32(bp + 4)) else { break };
-                eprintln!("[nt:{:x}]   frame {bp:#x}: {}", c.t.tid, c.p.describe_addr(ret as u64));
+                crate::nt_log!("[nt:{:x}]   frame {bp:#x}: {}", c.t.tid, c.p.describe_addr(ret as u64));
                 if next as u64 <= bp {
                     break;
                 }
@@ -528,7 +528,7 @@ pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
     // Second chance: nothing handled it. Wine terminates the process.
     let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
     let addr = c.g.ptr(rec_p + 2 * 4 + c.g.psize())?;
-    eprintln!("gex-nt: unhandled exception {code:#010x} at {addr:#x}; ending the process");
+    crate::nt_log!("gex-nt: unhandled exception {code:#010x} at {addr:#x}; ending the process");
     terminate_process(c, code);
     Ok(st::SUCCESS)
 }
@@ -943,7 +943,7 @@ pub fn nt_create_thread_ex(c: &mut Call<'_>) -> R {
         return Err(c.unimplemented(&format!("NtCreateThreadEx flags {flags:#x}")));
     }
     let t = {
-        let mut k = c.kernel.lock().unwrap_or_else(|e| e.into_inner());
+        let mut k = c.kernel.lock_kernel();
         let t = create_thread_state(c.p, &mut k, &mut c.g, reserve, None)?;
         k.live_threads += 1;
         t
