@@ -9,6 +9,8 @@
 //     --extract <guest>=<host>  write a file back out when the program ends
 //     --argv0 <name>            what the guest sees as argv[0]
 //     --cwd <dir>               the directory the guest starts in
+//     --env <KEY=VALUE>         an environment variable (repeatable); none
+//                               leaves the shim's default environment
 //     --strace               narrate every syscall to stderr
 
 import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
@@ -33,6 +35,8 @@ let strace = false;
 let cwd = null;
 const extract = [];
 let argv0 = null;
+const env = [];
+const dirs = [];
 const rest = [];
 {
   const av = process.argv.slice(2);
@@ -60,6 +64,9 @@ const rest = [];
         } catch {
           return;
         }
+        // An empty directory too: files bring their parents with them, but
+        // a Wine prefix's `Temp` and profile folders arrive empty.
+        if (!names.length) dirs.push(guest);
         for (const name of names) {
           const h = `${host}/${name}`, g = `${guest}/${name}`;
           // A rootfs has dangling symlinks (Debian's /usr/bin/ld.so), and
@@ -101,6 +108,7 @@ const rest = [];
       if (eq <= 0) { console.error('--extract wants <guest>=<host>'); process.exit(2); }
       extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
     } else if (av[i] === '--cwd') cwd = av[++i];
+    else if (av[i] === '--env') env.push(av[++i] ?? '');
     else if (av[i] === '--strace') strace = true;
     else if (av[i] === '--argv0') argv0 = av[++i];
     else break;
@@ -416,6 +424,8 @@ try {
       gid: process.getgid?.(),
       stdin: readStdin(),
       cwd,
+      env: env.length ? env : undefined,
+      dirs,
       // GEX_PINS names a layout written by `gexc build --closure`. Every
       // object in it is placed exactly where the build assumed, which is
       // what makes a module built against those addresses correct -- and it

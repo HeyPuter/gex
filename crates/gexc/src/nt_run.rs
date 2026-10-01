@@ -30,34 +30,7 @@ fn prefix(ra: &RunArgs) -> Result<String> {
 /// (it means nothing to a Windows program), except `WINEDEBUG`, which Wine's
 /// PE DLLs read to decide what to trace.
 fn environment(extra: &[String]) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = [
-        ("ALLUSERSPROFILE", "C:\\ProgramData"),
-        ("APPDATA", "C:\\users\\gex\\AppData\\Roaming"),
-        ("COMPUTERNAME", "GEX"),
-        ("ComSpec", "C:\\windows\\system32\\cmd.exe"),
-        ("LOCALAPPDATA", "C:\\users\\gex\\AppData\\Local"),
-        ("NUMBER_OF_PROCESSORS", "4"),
-        ("OS", "Windows_NT"),
-        ("PATH", "C:\\windows\\system32;C:\\windows;C:\\windows\\system32\\wbem"),
-        ("PATHEXT", ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"),
-        ("PROCESSOR_ARCHITECTURE", "AMD64"),
-        ("ProgramData", "C:\\ProgramData"),
-        ("ProgramFiles", "C:\\Program Files"),
-        ("PUBLIC", "C:\\users\\Public"),
-        ("SystemDrive", "C:"),
-        ("SystemRoot", "C:\\windows"),
-        ("TEMP", "C:\\users\\gex\\AppData\\Local\\Temp"),
-        ("TMP", "C:\\users\\gex\\AppData\\Local\\Temp"),
-        ("USERNAME", "gex"),
-        // What Wine's GetUserNameW reads (its loader sets it from the Unix
-        // user); shell32 builds profile paths from it.
-        ("WINEUSERNAME", "gex"),
-        ("USERPROFILE", "C:\\users\\gex"),
-        ("windir", "C:\\windows"),
-    ]
-    .iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
+    let mut env = nt::boot::default_environment();
     let mut set = |k: &str, v: &str| match env.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(k)) {
         Some(e) => e.1 = v.to_string(),
         None => env.push((k.to_string(), v.to_string())),

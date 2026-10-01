@@ -38,6 +38,8 @@ pub mod gl;
 pub mod virgl;
 pub mod wl;
 mod xwm;
+// The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
+mod nt;
 
 use std::sync::Arc;
 
@@ -1837,7 +1839,7 @@ fn arena_take(len: u64) -> Option<u64> {
         cur
     };
     let end = at.checked_add(len)?;
-    if end > gex_abi::MMAP_TOP || !grow_memory_to(end) {
+    if end > nt::arena_ceiling() || !grow_memory_to(end) {
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
         // which aborts past the panic hook as a bare `unreachable` with nothing
         // printed. This is the only place that knows the arena ran out -- and
@@ -3360,12 +3362,18 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         f.read_at(0, &mut buf).ok()?;
         Some(buf)
     };
-    let program = match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &read_file) {
-        Ok(p) => p,
-        Err(e) => {
-            warn_line(&format!("gex_load: load_program failed: {e:?}"));
-            return 0;
-        }
+    // A Windows program has nothing placed here: the NT layer maps it and
+    // Wine's ntdll below (see `nt::boot`, after the kernel is built).
+    let nt_abi = nt::exe_abi(bytes);
+    let program = match nt_abi {
+        Some(abi) => nt::empty_program(abi),
+        None => match gex_ld::load_program(bytes, gex_abi::PIE_BASE, INTERP_BASE, &read_file) {
+            Ok(p) => p,
+            Err(e) => {
+                warn_line(&format!("gex_load: load_program failed: {e:?}"));
+                return 0;
+            }
+        },
     };
 
     // The break follows the executable, as Linux and the native host have it:
@@ -3500,7 +3508,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // page overrides with `gex_add_env`.
     let env: Vec<String> = {
         let given = std::mem::take(&mut *ENV.0.borrow_mut());
-        if given.is_empty() {
+        // Debian's defaults mean nothing to a Windows program.
+        if given.is_empty() && nt_abi.is_none() {
             vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
                 "HOME=/root".to_string(),
@@ -3577,7 +3586,16 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     }
 
     let meta = gex_xlate::Metadata::decode(&METADATA.0.borrow()).unwrap_or_default();
-    let entry = program.entry();
+    let entry = match nt_abi {
+        Some(abi) => match nt::boot(&mut kernel, abi, &args, &env) {
+            Ok(pc) => pc,
+            Err(e) => {
+                warn_line(&format!("gex_load: {e}\n"));
+                return 0;
+            }
+        },
+        None => program.entry(),
+    };
     set_host(Host {
         magic_head: HOST_MAGIC,
             kernel,
@@ -5417,6 +5435,11 @@ fn count_syscall() {
 /// unwinds out of wasm, since there is no other way to abandon the stack.
 #[no_mangle]
 pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
+    // A Windows process's every syscall is an NT call, made before the kernel
+    // is taken: the NT layer takes it itself, briefly, and blocks without it.
+    if let Some(p) = nt::process() {
+        return nt::syscall(p, ctx, pc);
+    }
     // Which syscall is running, so the allocator can name who was asking (wasm
     // has no backtrace). See `HEAP_BY_CALL`.
     {
@@ -9287,6 +9310,9 @@ pub extern "C" fn gex_fma_calls() -> i64 {
 
 #[no_mangle]
 pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
+    if nt::active() {
+        nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
+    }
     trace_line(&format!(
         "gex: illegal instruction {:#010x} at pc={:#x}\n",
         raw as u32, pc
@@ -9352,6 +9378,11 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
         });
         trace_line(&line);
         return;
+    }
+    // In a Windows process every other breakpoint is a processor exception
+    // the program may handle (`int3`, #DE, `hlt`).
+    if nt::active() && raw != gex_abi::imports::BRK_TRAP_PC {
+        nt::fault(_ctx, gex_kernel::nt::Fault::from_brk(raw), pc as u64);
     }
     // A diagnostic breakpoint planted at a chosen guest pc: dump the live
     // registers (x30 names the caller) and RETURN so the block runs on. Pointed
@@ -9617,6 +9648,9 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
 /// preemption is the engine's job now; see the end of this function.)
 #[no_mangle]
 pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
+    // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
+    // without a syscall: a loop that spins on them passes here.
+    nt::tick();
     // Rearm: translated code counts a word down to zero and calls here; leaving
     // it at zero makes every later back-edge call out.
     {
@@ -9940,6 +9974,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             .iter()
             .any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && pc >= v.start && pc < v.end)
     });
+    if wild && nt::active() {
+        nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
+    }
     if wild {
         with_host(|h| {
             let gm = GuestMem::new(guest_bytes());

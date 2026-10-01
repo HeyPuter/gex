@@ -44,6 +44,40 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub use status as st;
 
+/// Where the layer's own diagnostics go: stderr unless the host says
+/// otherwise. A browser has no stderr (`eprintln!` there writes nowhere), so
+/// the browser shim points this at its console.
+static LOG: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+pub fn set_log(f: fn(&str)) {
+    let _ = LOG.set(f);
+}
+
+pub fn log(s: &str) {
+    match LOG.get() {
+        Some(f) => f(s),
+        None => eprintln!("{s}"),
+    }
+}
+
+/// Text the guest wrote to its debug channel (`__wine_dbg_output`), as it
+/// wrote it.
+pub fn log_raw(bytes: &[u8]) {
+    match LOG.get() {
+        Some(f) => f(String::from_utf8_lossy(bytes).trim_end_matches('\n')),
+        None => {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(bytes);
+        }
+    }
+}
+
+/// `eprintln!` for the NT layer, through [`log`].
+#[macro_export]
+macro_rules! nt_log {
+    ($($t:tt)*) => { $crate::nt::log(&format!($($t)*)) };
+}
+
 /// Which pointer size the process's Windows code uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Abi {
@@ -513,9 +547,9 @@ impl Process {
     /// Report an unimplemented call (or an unimplemented case of one).
     /// Printed every time, never deduplicated.
     pub fn unimplemented(&self, what: &str) -> Status {
-        eprintln!("gex-nt: unimplemented: {what}");
+        crate::nt_log!("gex-nt: unimplemented: {what}");
         if self.cfg.strict {
-            eprintln!("gex-nt: GEX_NT_STRICT is set; ending the process");
+            crate::nt_log!("gex-nt: GEX_NT_STRICT is set; ending the process");
             UNIMPLEMENTED_STRICT.store(true, Ordering::Relaxed);
         }
         Status(st::NOT_IMPLEMENTED)
@@ -545,6 +579,43 @@ pub enum Outcome {
     CallbackReturn,
 }
 
+/// How the NT layer reaches the process's Linux kernel (its VFS, memory map
+/// and devices). Natively that is a `Mutex<Kernel>` of its own; the browser
+/// shim's kernel lives in its host structure behind the shim's kernel lock,
+/// and handing the NT layer that lock (rather than a second kernel) is what
+/// keeps exactly one view of it (docs/nt-layer.md §10.2).
+pub trait KernelCell {
+    fn lock_kernel(&self) -> KernelGuard<'_>;
+}
+
+/// The kernel, held. Dropping it lets go.
+pub struct KernelGuard<'a>(Box<dyn std::ops::DerefMut<Target = Kernel> + 'a>);
+
+impl<'a> KernelGuard<'a> {
+    pub fn new(held: Box<dyn std::ops::DerefMut<Target = Kernel> + 'a>) -> Self {
+        KernelGuard(held)
+    }
+}
+
+impl std::ops::Deref for KernelGuard<'_> {
+    type Target = Kernel;
+    fn deref(&self) -> &Kernel {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KernelGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Kernel {
+        &mut self.0
+    }
+}
+
+impl KernelCell for Mutex<Kernel> {
+    fn lock_kernel(&self) -> KernelGuard<'_> {
+        KernelGuard(Box::new(self.lock().unwrap_or_else(|e| e.into_inner())))
+    }
+}
+
 /// What the host provides the NT layer beyond memory and the kernel: running
 /// guest code on the calling thread, for user-mode callbacks
 /// (docs/nt-layer.md §5).
@@ -561,7 +632,7 @@ pub struct NoHost;
 
 impl NtHost for NoHost {
     fn run_callback(&mut self) -> Result<(), ()> {
-        eprintln!("gex-nt: a user-mode callback where the host cannot run one");
+        crate::nt_log!("gex-nt: a user-mode callback where the host cannot run one");
         Err(())
     }
 }
@@ -570,7 +641,7 @@ impl NtHost for NoHost {
 pub struct Call<'a> {
     pub p: &'a Arc<Process>,
     pub t: Arc<Thread>,
-    pub kernel: &'a Mutex<Kernel>,
+    pub kernel: &'a dyn KernelCell,
     pub g: G<'a>,
     pub nr: u32,
     pub pc: u64,
@@ -615,8 +686,8 @@ impl<'a> Call<'a> {
         self.a(i) as u32
     }
 
-    pub fn kernel(&self) -> std::sync::MutexGuard<'a, Kernel> {
-        self.kernel.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn kernel(&self) -> KernelGuard<'a> {
+        self.kernel.lock_kernel()
     }
 
     pub fn unimplemented(&self, what: &str) -> Status {
@@ -646,6 +717,61 @@ pub fn syscall_name(nr: u32) -> String {
     }
 }
 
+/// A processor exception in an NT process's translated code, as the hosts'
+/// imports report it.
+#[derive(Clone, Copy, Debug)]
+pub enum Fault {
+    /// `int3`; the pc is the instruction's own address.
+    Breakpoint,
+    /// An instruction gex does not implement (`ud2` included).
+    Illegal,
+    /// A branch to memory that is not executable.
+    NotExecutable,
+    /// x86 #DE from a zero divisor (`Stmt::Trap`, `BRK_DIVIDE_BY_ZERO`).
+    DivideByZero,
+    /// x86 #DE from a quotient too wide (`BRK_DIVIDE_OVERFLOW`).
+    DivideOverflow,
+    /// A privileged instruction such as `hlt` (`BRK_GENERAL_PROTECTION`).
+    Privileged,
+    /// An unmasked x87 exception (`BRK_X87_EXCEPTION`), which gex does not
+    /// deliver: the process ends, loudly.
+    X87,
+}
+
+impl Fault {
+    /// The fault a `breakpoint` import's immediate stands for: the
+    /// `Stmt::Trap` codes, or an `int3`.
+    pub fn from_brk(imm: i32) -> Fault {
+        use gex_abi::imports as i;
+        match imm {
+            i::BRK_DIVIDE_BY_ZERO => Fault::DivideByZero,
+            i::BRK_DIVIDE_OVERFLOW => Fault::DivideOverflow,
+            i::BRK_GENERAL_PROTECTION => Fault::Privileged,
+            i::BRK_X87_EXCEPTION => Fault::X87,
+            _ => Fault::Breakpoint,
+        }
+    }
+
+    /// The exception Wine's signal handlers would raise for this fault at
+    /// `pc`: its code, the context's rip and the ExceptionInformation words.
+    /// `None` for an x87 exception, which is not delivered.
+    pub fn exception(self, pc: u64) -> Option<(u32, u64, Vec<u64>)> {
+        Some(match self {
+            // The context's rip is after the int3, as hardware leaves it.
+            Fault::Breakpoint => (st::BREAKPOINT, pc + 1, vec![0]),
+            Fault::Illegal => (st::ILLEGAL_INSTRUCTION, pc, vec![]),
+            // EXCEPTION_EXECUTE_FAULT at the target.
+            Fault::NotExecutable => (st::ACCESS_VIOLATION, pc, vec![8, pc]),
+            // Windows reports #DE as these two, and `hlt` in user mode as a
+            // privileged instruction, all at the faulting instruction.
+            Fault::DivideByZero => (st::INTEGER_DIVIDE_BY_ZERO, pc, vec![]),
+            Fault::DivideOverflow => (st::INTEGER_OVERFLOW, pc, vec![]),
+            Fault::Privileged => (st::PRIVILEGED_INSTRUCTION, pc, vec![]),
+            Fault::X87 => return None,
+        })
+    }
+}
+
 /// A processor exception in translated code (`int3`, an instruction gex
 /// cannot run, a branch to memory that is not executable), delivered as an
 /// NT exception the way Wine's signal handlers do: a CONTEXT of the faulting
@@ -654,7 +780,7 @@ pub fn syscall_name(nr: u32) -> String {
 /// adjusts); `info` fills `ExceptionInformation`.
 pub fn hardware_exception(
     p: &Arc<Process>,
-    kernel: &Mutex<Kernel>,
+    kernel: &dyn KernelCell,
     data: &mut [u8],
     ctx_addr: u64,
     code: u32,
@@ -663,13 +789,13 @@ pub fn hardware_exception(
 ) -> Outcome {
     let g = G::new(data, p.abi);
     let Some(t) = p.thread_by_ctx(ctx_addr) else {
-        eprintln!("gex-nt: exception {code:#x} in a thread the NT layer does not know (ctx {ctx_addr:#x})");
+        crate::nt_log!("gex-nt: exception {code:#x} in a thread the NT layer does not know (ctx {ctx_addr:#x})");
         return Outcome::Exit(code);
     };
     let abi = p.abi;
     if p.cfg.trace {
         let r = |o: usize| g.u64(ctx_addr + o as u64).unwrap_or(0);
-        eprintln!(
+        crate::nt_log!(
             "[nt:{:x}] exception {code:#010x} at {} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
             t.tid,
             p.describe_addr(rip),
@@ -701,7 +827,7 @@ pub fn hardware_exception(
     match (r, c.outcome.take()) {
         (Ok(()), Some(o)) => o,
         (r, _) => {
-            eprintln!("gex-nt: could not dispatch exception {code:#x} at {rip:#x}: {r:?}");
+            crate::nt_log!("gex-nt: could not dispatch exception {code:#x} at {rip:#x}: {r:?}");
             Outcome::Exit(code)
         }
     }
@@ -710,7 +836,7 @@ pub fn hardware_exception(
 /// Handle one syscall from an NT process. `data` is the whole guest memory.
 pub fn syscall(
     p: &Arc<Process>,
-    kernel: &Mutex<Kernel>,
+    kernel: &dyn KernelCell,
     data: &mut [u8],
     ctx_addr: u64,
     pc: u64,
@@ -720,7 +846,7 @@ pub fn syscall(
     let g = G::new(data, abi);
     let nr = g.u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) as u32;
     let Some(t) = p.thread_by_ctx(ctx_addr) else {
-        eprintln!("gex-nt: syscall {nr:#x} from a thread the NT layer does not know (ctx {ctx_addr:#x})");
+        crate::nt_log!("gex-nt: syscall {nr:#x} from a thread the NT layer does not know (ctx {ctx_addr:#x})");
         return Outcome::Exit(st::INVALID_CID);
     };
     if p.terminating.load(Ordering::Acquire) {
@@ -738,7 +864,7 @@ pub fn syscall(
         Err(Status(s)) => s,
     };
     if p.cfg.trace {
-        eprintln!("[nt:{:x}] {} -> {status:#010x}", c.t.tid, c.name());
+        crate::nt_log!("[nt:{:x}] {} -> {status:#010x}", c.t.tid, c.name());
     }
     if UNIMPLEMENTED_STRICT.load(Ordering::Relaxed) {
         // The whole process ends, not just this thread: the others notice at

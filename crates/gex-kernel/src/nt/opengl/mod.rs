@@ -697,7 +697,7 @@ pub fn call(c: &mut Call<'_>, code: u32, args: u64) -> R {
     let p = Params { at: args, offs: layout(sig, c.p.abi) };
     let r = one(c, name, &p);
     if c.p.cfg.trace {
-        eprintln!("[nt:{:x}]   opengl32 {name}", c.t.tid);
+        crate::nt_log!("[nt:{:x}]   opengl32 {name}", c.t.tid);
     }
     r.map(|()| st::SUCCESS)
 }
