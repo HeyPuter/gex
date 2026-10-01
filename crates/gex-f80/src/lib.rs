@@ -12,6 +12,8 @@
 //! the explicit integer bit at bit 63. Results are rounded from a 128-bit
 //! significand whose bit 0 is sticky: `(-1)^s × sig × 2^(e - 127)`.
 
+#![forbid(unsafe_code)]
+
 /// Status-word exception flags, in their status-word bit positions (and the
 /// control word's mask bits, which sit at the same positions).
 pub const IE: u16 = 1 << 0;
@@ -998,4 +1000,33 @@ pub fn extract(env: &mut Env, a: F80) -> (F80, F80) {
             (exp, m)
         }
     }
+}
+
+/// The status-word bits an operation reports: its exception flags, and C1
+/// at bit 9.
+fn sw_bits(env: &Env) -> u32 {
+    env.flags as u32 | (env.c1 as u32) << 9
+}
+
+/// `fst m32`/`fst m64` as one pure function -- what `Stmt::X87` with
+/// `X87Op::Narrow` computes: the format's raw bits (zero-extended), and the
+/// status-word bits (exception flags, C1 at bit 9).
+pub fn narrow_op(sig: u64, se: u16, cw: u16, single: bool) -> (u64, u32) {
+    let mut env = Env::from_cw(cw);
+    let m = if single { Mem::F32 } else { Mem::F64 };
+    let bits = store(&mut env, F80 { sig, se }, m, false);
+    (bits, sw_bits(&env))
+}
+
+/// `fist`/`fisttp` as one pure function -- `X87Op::ToInt`: the integer
+/// (its low `bits` bits, zero-extended) and the status-word bits.
+pub fn to_int_op(sig: u64, se: u16, cw: u16, bits: u8, trunc: bool) -> (u64, u32) {
+    let mut env = Env::from_cw(cw);
+    let m = match bits {
+        16 => Mem::I16,
+        32 => Mem::I32,
+        _ => Mem::I64,
+    };
+    let v = store(&mut env, F80 { sig, se }, m, trunc);
+    (v, sw_bits(&env))
 }

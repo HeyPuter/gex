@@ -280,7 +280,7 @@ pub mod ctx {
     /// One bit per physical register: 1 means valid (tag word derived).
     pub const X87_TAGS: usize = X87_SW + 4;
     /// 16 bytes through which an x87 memory operand passes to and from the
-    /// host, which computes the x87's arithmetic (`gex_kernel::f80`): raw
+    /// host, which computes the x87's arithmetic (`gex_f80`): raw
     /// bits at +0, and for the 80-bit format the sign and exponent at +8.
     pub const X87_TMP: usize = X87_TAGS + 4;
 

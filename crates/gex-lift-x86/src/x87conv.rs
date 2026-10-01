@@ -5,7 +5,7 @@
 //! These are most of what the x87 does in compiled code (every float or
 //! double a 32-bit function returns goes through `st(0)`), so they must not
 //! cost a host call. Each is exact: the same results, exception flags and
-//! C1 as `gex_kernel::f80` (whose tests check it against the hardware),
+//! C1 as `gex_f80` (whose tests check it against the hardware),
 //! computed with integer operations on the register's significand and
 //! sign/exponent word. Stack overflow and underflow are handled as the host
 //! handles them; an exception the control word leaves unmasked fails loudly
@@ -409,7 +409,7 @@ impl<'a> Lifter<'a> {
     }
 
     /// Round an extended value to single or double: (raw bits in an I64,
-    /// flags, C1), as `gex_kernel::f80::store` does.
+    /// flags, C1), as `gex_f80::store` does.
     fn x87_narrow(&mut self, sig: Value, se: Value, f: Fmt) -> (Value, Value, Value) {
         let c = self.x87_classify(sig, se);
         let mode = self.x87_mode(c.sign);
