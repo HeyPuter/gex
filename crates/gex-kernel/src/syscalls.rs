@@ -1722,7 +1722,11 @@ impl Kernel {
         };
         if let Ok(Err(Errno::EPIPE)) = &outcome {
             if raises_sigpipe(n, &a) {
-                self.signals.raise(crate::signal::sig::SIGPIPE);
+                self.signals.raise_from(
+                    crate::signal::sig::SIGPIPE,
+                    // Linux sends it as the writer itself sending it (SI_USER).
+                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.uid },
+                );
             }
         }
         let ret = match &outcome {
@@ -2086,7 +2090,11 @@ impl Kernel {
         // signal that ended the wait, leaving it pending forever.
         let suspended = self.restore_sigmask.take();
         if std::mem::take(&mut self.write_blocked) && r == Err(Errno::EPIPE) {
-            self.signals.raise(crate::signal::sig::SIGPIPE);
+            self.signals.raise_from(
+                crate::signal::sig::SIGPIPE,
+                // Linux sends it as the writer itself sending it (SI_USER).
+                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.uid },
+            );
         }
         let ret = encode(r);
         let _ = set_result(m, self.ctx_addr, ret);
@@ -2377,7 +2385,10 @@ impl Kernel {
             nr::TKILL | nr::TGKILL => {
                 let signo = if n == nr::TKILL { a[1] } else { a[2] } as u32;
                 if signo > 0 {
-                    self.signals.raise(signo);
+                    self.signals.raise_from(
+                        signo,
+                        crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid },
+                    );
                 }
                 Ok(0)
             }
@@ -2671,6 +2682,7 @@ impl Kernel {
                 self.signals.raise(signo);
             }
         }
+        self.note_kill_senders(inbox);
     }
 
     /// Whether anything is waiting to be delivered, counting what other
@@ -2722,6 +2734,7 @@ impl Kernel {
                 core: true,
             };
         }
+        self.signals.forget_source(signo);
         match signal::setup_frame(
             &mut self.signals,
             m,
@@ -4691,11 +4704,24 @@ impl Kernel {
         if !self.procs.has_signals(self.pid) {
             return;
         }
-        let mut sent = self.procs.take_signals(self.pid);
+        let taken = self.procs.take_signals(self.pid);
+        let mut sent = taken;
         while sent != 0 {
             let signo = sent.trailing_zeros() + 1;
             sent &= sent - 1;
             self.signals.raise(signo);
+        }
+        self.note_kill_senders(taken);
+    }
+
+    /// Of the signals just taken from the process table, mark those `kill`
+    /// sent as from their sender (`SI_USER`, `si_pid`), not the kernel.
+    fn note_kill_senders(&mut self, taken: u64) {
+        for (signo, pid) in self.procs.take_kill_senders(self.pid, taken) {
+            self.signals.raise_from(
+                signo,
+                crate::signal::Source { code: crate::signal::SI_USER, pid, uid: self.uid },
+            );
         }
     }
 
@@ -4780,11 +4806,22 @@ impl Kernel {
         let set = if a[0] == 0 { 0 } else { m.read_bits64(a[0])? };
         match self.signals.take_pending_in(set) {
             Some(signal) => {
-                // A `siginfo_t` the caller can read the number out of: si_signo,
-                // si_errno, si_code, then the union, which nothing here fills.
+                // A `siginfo_t`: si_signo, si_errno, si_code, then the sender
+                // for one a process sent (the union is 8-aligned in the 64-bit
+                // layout).
+                let source = self.signals.take_source(signal);
                 if a[1] != 0 {
                     m.zero(a[1], 128)?;
                     m.write_u32(a[1], signal)?;
+                    match source {
+                        Some(src) => {
+                            let fields = a[1] + if self.compat || gex_abi::PPC { 12 } else { 16 };
+                            m.write_u32(a[1] + 8, src.code as u32)?;
+                            m.write_u32(fields, src.pid as u32)?;
+                            m.write_u32(fields + 4, src.uid)?;
+                        }
+                        None => m.write_u32(a[1] + 8, 0x80)?, // SI_KERNEL
+                    }
                 }
                 Ok(signal as u64)
             }
