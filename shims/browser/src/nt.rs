@@ -232,6 +232,7 @@ mod imp {
             env.iter().find_map(|kv| kv.strip_prefix(name).and_then(|r| r.strip_prefix('=')).map(str::to_string))
         };
         let flag = |name: &str| var(name).is_some_and(|v| !v.is_empty() && v != "0");
+        STATS.store(flag("GEX_NT_STATS"), Ordering::Relaxed);
         if let Some(s) = var("GEX_NT_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
             TIME_SCALE.store(s.to_bits(), Ordering::Relaxed);
         }
@@ -393,6 +394,23 @@ mod imp {
         }
     }
 
+    /// `GEX_NT_STATS`: once a (real) second, the native shim's
+    /// `gex-nt: stats t=<ms> presents=<n>` line, on the console.
+    static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn report_stats(p: &nt::Process) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let real = unsafe { mono_ns() } as u64 / 1_000_000;
+        let start = MONO_START.load(Ordering::Relaxed) / 1_000_000;
+        let t = real.saturating_sub(start);
+        let next = NEXT.load(Ordering::Relaxed);
+        if t < next || NEXT.compare_exchange(next, t / 1000 * 1000 + 1000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let presents = p.presents.load(Ordering::Relaxed);
+        warn_line(&format!("gex-nt: stats t={t} presents={presents}\n"));
+    }
+
     /// Bring `KUSER_SHARED_DATA`'s clocks up to date, at most once a
     /// millisecond. Natively a thread does this; here every NT syscall and
     /// every safepoint does, which is as often as anything can look.
@@ -406,6 +424,9 @@ mod imp {
         }
         if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
             nt::sysinfo::usd_tick(guest_bytes(), &p.clocks);
+            if STATS.load(Ordering::Relaxed) {
+                report_stats(p);
+            }
         }
     }
 

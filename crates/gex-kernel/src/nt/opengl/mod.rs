@@ -451,7 +451,10 @@ fn ensure_host(c: &mut Call<'_>) -> R<()> {
     if c.p.gl.lock().unwrap().host_made {
         return Ok(());
     }
-    let mut r = ask(c, op::CONTEXT_CREATE, &[proto::client_api::DESKTOP, 0, 0], &[])?;
+    // The fourth word is the profile, 1 for compatibility (what a WGL context
+    // made the legacy way is, and what Noita's fixed-function drawing needs):
+    // without it a Mesa host makes a core context when it can.
+    let mut r = ask(c, op::CONTEXT_CREATE, &[proto::client_api::DESKTOP, 0, 0, 1], &[])?;
     let _vendor = r.blob();
     let _renderer = r.blob();
     let version = String::from_utf8_lossy(&r.blob()).into_owned();

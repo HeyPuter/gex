@@ -3720,6 +3720,55 @@ pub extern "C" fn gex_pin_report() {
     }
 }
 
+/// [`gex_add_file`] a piece at a time: `data` is the file's bytes from
+/// `offset`, and offset zero starts the file. JS sends a large file this way
+/// so that it never needs a buffer of the file's size in this module's heap:
+/// the heap never gives a span back, and before a Windows program boots
+/// whatever the heap has taken is address space the program cannot have
+/// (`nt::boot`). Noita's music bank is 324 MiB.
+#[no_mangle]
+pub extern "C" fn gex_add_file_part(path: u32, path_len: u32, offset: u64, data: u32, data_len: u32) {
+    if offset == 0 {
+        gex_add_file(path, path_len, data, data_len);
+        return;
+    }
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } != 0 {
+            return;
+        }
+        // SAFETY: scalars and pointers into this module's memory, which the
+        // kernel copies from.
+        unsafe {
+            let h = k_fs_open(path, path_len, 1 /* O_WRONLY */, 0o644);
+            if h < 0 {
+                warn_line(&format!("gex_add_file_part: cannot reopen a staged file ({h})\n"));
+                return;
+            }
+            let mut done = 0u32;
+            while done < data_len {
+                let n = k_fs_write(h, offset + done as u64, data + done, data_len - done);
+                if n <= 0 {
+                    warn_line("gex_add_file_part: a staged write failed\n");
+                    break;
+                }
+                done += n as u32;
+            }
+            k_fs_close(h);
+        }
+        return;
+    }
+    let Ok(name) = std::str::from_utf8(shim_slice(path, path_len)) else {
+        return;
+    };
+    let mut files = FILES.0.borrow_mut();
+    match files.last_mut() {
+        Some((n, bytes)) if n == name && bytes.len() as u64 == offset => {
+            bytes.extend_from_slice(shim_slice(data, data_len));
+        }
+        _ => warn_line("gex_add_file_part: a piece out of order\n"),
+    }
+}
+
 /// Put a file into the guest's filesystem, before it runs.
 ///
 /// A browser has no filesystem to pass through to, so the page bundles what

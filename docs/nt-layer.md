@@ -698,9 +698,48 @@ Worker, so a thread must be one). Hooks in `lib.rs`, each a line or two:
 The page is `web/nt.html` (`web/src/nt-page.js`): it fetches a tar holding a
 prefix under `/wine` and the program, and runs it through `runProgram` with
 the canvas as the compositor's output. `tests/nt/browser-gui.mjs` drives it in
-headless Chromium (its own vite dev server and browser, software GL):
-`window.exe`'s window is checked by pixels, a click and Escape by what the
-program prints.
+headless Chromium (a vite build of the page, served cross-origin isolated,
+and its own browser with software GL and WebGPU): `window.exe`'s window is
+checked by pixels, a click and Escape by what the program prints. The page
+streams the bundle into a SharedArrayBuffer and hands `untar` the buffer, so
+every file is a view of it and the start message to the process's Worker
+shares it instead of copying it (a copied 1.8 GB clone fails with "Data
+cannot be cloned, out of memory").
+
+**Noita in the page (milestone c).** `node tests/nt/browser-noita.mjs
+[--shot DIR]` bundles `~/src/noita-wasm/Noita` and the x86 prefix (1.8 GB),
+opens the page with `gl=1&glbackend=wgpu`, plays the native recipe's clicks
+through CDP (the release notes' Ok at frame 12, and at frame 90 "Nah. Destroy
+it" for the autosave a prefix that has run gameplay offers; client
+coordinates plus the window frame the compositor's surface includes), and
+passes at frame 140, the main menu. First run, 2026-10-01: the menu after
+~120 s in the page (load 13-29, software WebGPU via SwiftShader), about the
+native time; `work/s12/noita-menu-browser.png`.
+
+The GL host is `web/public/gex/gex-wgpu-replay.{js,wasm}`, Mesa's gex_wgpu
+driver built from the fork's `wink` branch:
+- Mesa: `third_party/mesa` at c6a33e6fbd8097432851ed2e938ad03e0895c5b0
+  (mesa-wink `refs/heads/wink`; the superproject's pointer still names
+  gex-virgl 4eeb32a, and is not bumped).
+- Build: `GEX_MESA_WINK_CACHE=<dir> JOBS=4 taskset -c 0-2,6-8 nice -n 10
+  web/build-mesa-wasm.sh <out>`, emsdk 6.0.1 (`/usr/lib/emsdk`), the
+  default emdawnwebgpu (v20250428.134257). When the Mesa checkout has
+  `wink/lib/tint.sh`, the script builds Tint through the fork's own
+  `wink/build.sh --variant=mt --until=tint` (Dawn cdda346c7ce9 with the
+  fork's two patches and SPIRV-Tools/Headers 33e0256/2a611a9), so the pin
+  lives in the fork; `GEX_MESA_TINT` still names a prebuilt one, and a fork
+  without that script still gets web/tint/build-tint.sh.
+- Fork-side issues, for the user (not worked around in the fork):
+  wink/build.sh wants emsdk 3.1.56, so the build passes
+  `WINK_ALLOW_ANY_EMSDK=1` and, for the newer clang,
+  `EMCC_CFLAGS="-Wno-c2y-extensions -Wno-deprecated-pragma
+  -Wno-lifetime-safety-intra-tu-suggestions"` (the flags
+  web/tint/build-tint.sh already uses); and wink's own emdawnwebgpu
+  (v20250822, patched) needs C++20 for `webgpu.cpp`, which the gex-wasm
+  target does not set (the wink-wasm target does), so the gex build keeps
+  the default emdawn.
+- The fork's gex-wasm targets export `_gex_gl_setenv`, which
+  web/mesa/gexgl-mesa.cpp now defines (from gex2's decoder).
 
 **One kernel.** The process's `Kernel` is the one in the shim's `Host`, and
 the NT layer reaches it only through `HostKernel`, whose `lock_kernel` takes

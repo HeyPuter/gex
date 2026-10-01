@@ -8,7 +8,9 @@ function str(bytes, off, len) {
   let end = off;
   const stop = off + len;
   while (end < stop && bytes[end] !== 0) end++;
-  return new TextDecoder().decode(bytes.subarray(off, end));
+  // A copy, not a view: TextDecoder refuses a view of a SharedArrayBuffer,
+  // which is what a bundle shared with a Worker is (web/src/nt-page.js).
+  return new TextDecoder().decode(bytes.slice(off, end));
 }
 
 function octal(bytes, off, len) {

@@ -967,9 +967,27 @@ export class Gex {
       this.#shim.exports.gex_add_env?.(ep, e.length);
       free?.(ep, e.length);
     }
+    // A large file goes over in pieces through one buffer: the shim's heap
+    // never gives a span back, so a file-sized buffer would be held for the
+    // process's life (and a Windows process loses that address space).
+    const PART = 16 << 20;
+    let partBuf = 0;
     for (const [path, contents] of Object.entries(files)) {
       const p = enc.encode(path);
       const d = contents instanceof Uint8Array ? contents : enc.encode(contents);
+      if (d.length > PART && this.#shim.exports.gex_add_file_part) {
+        const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+        this.#bytes().set(p, pp);
+        if (!partBuf) partBuf = this.#shim.exports.gex_alloc(PART) >>> 0;
+        for (let off = 0; off < d.length; off += PART) {
+          const piece = d.subarray(off, Math.min(off + PART, d.length));
+          this.#bytes().set(piece, partBuf);
+          this.#shim.exports.gex_add_file_part(pp, p.length, BigInt(off), partBuf, piece.length);
+        }
+        if (modes[path] !== undefined) this.#shim.exports.gex_chmod?.(pp, p.length, modes[path]);
+        free?.(pp, p.length);
+        continue;
+      }
       const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
       const dp = this.#shim.exports.gex_alloc(d.length) >>> 0;
       this.#bytes().set(p, pp);
@@ -982,6 +1000,7 @@ export class Gex {
       free?.(pp, p.length);
       free?.(dp, d.length);
     }
+    if (partBuf) free?.(partBuf, PART);
     // The bundle's file times (seconds since the epoch), as the host had them:
     // a program that records one -- gzip's header, make's rebuild test --
     // sees what it would natively rather than 1970.

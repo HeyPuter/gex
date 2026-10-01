@@ -31,6 +31,22 @@ command -v emcc >/dev/null 2>&1 || { echo "need Emscripten" >&2; exit 1; }
     echo "initialize third_party/mesa" >&2
     exit 1
 }
+# Tint. A Mesa checkout that pins its own (the wink branch: wink/lib/tint.sh,
+# Dawn and patches chosen by the fork) builds it with its own script, so the
+# pin stays in one place; GEX_MESA_TINT still names a prebuilt one. Wink's
+# script expects emsdk 3.1.56, and the newer clang in the emsdk gex builds
+# Mesa with turns three of Tint's warnings into errors -- the same three
+# web/tint/build-tint.sh silences.
+if [ -z "${GEX_MESA_TINT:-}" ] && [ -f "$MESA/wink/lib/tint.sh" ]; then
+    WINK_CACHE=${GEX_MESA_WINK_CACHE:-${TMPDIR:-/tmp}/gex-mesa-wink-cache}
+    EMSDK_ROOT=$(CDPATH='' cd -- "$(dirname "$(command -v emcc)")/../.." && pwd)
+    tint_log=$(EMCC_CFLAGS="-Wno-c2y-extensions -Wno-deprecated-pragma -Wno-lifetime-safety-intra-tu-suggestions" \
+        WINK_ALLOW_ANY_EMSDK=1 bash "$MESA/wink/build.sh" --variant=mt --until=tint \
+        --cache="$WINK_CACHE" --build-dir="$WINK_CACHE/build" --jobs="${JOBS:-$(nproc)}" \
+        --emsdk="$EMSDK_ROOT" 2>&1) || { echo "$tint_log" | tail -20 >&2; exit 1; }
+    TINT_OUT=$(echo "$tint_log" | sed -n 's/^\[tint\/mt\] \(ready\|cached\) at //p' | tail -1)
+    [ -f "$TINT_OUT/libtint.a" ] || { echo "$tint_log" | tail -20 >&2; echo "no Tint from wink/build.sh" >&2; exit 1; }
+fi
 [ -f "$TINT_OUT/libtint.a" ] || {
     OUTPUT_DIR="$TINT_OUT" TMP_DIR="$TINT_TMP" KEEP_TMP=true WASM_THREADS=true \
         "$ROOT/web/tint/build-tint.sh"
