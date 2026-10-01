@@ -40,6 +40,9 @@ int main(void) {
     w[31] = '!';
     CHECK("FlushViewOfFile", FlushViewOfFile(w, 0));
     UnmapViewOfFile(w);
+    w = MapViewOfFile(rw, FILE_MAP_WRITE, 0, 0, 0);
+    CHECK("the section maps writable again after an unmap", w && !memcmp(w, "HELLO", 5));
+    UnmapViewOfFile(w);
     CloseHandle(rw);
     CloseHandle(f);
     memset(buf, 0, sizeof(buf));

@@ -382,7 +382,12 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
             }
             let writable = prot & (page_prot::READWRITE | page_prot::EXECUTE_READWRITE) != 0;
             {
-                let views = sec.views.lock().unwrap();
+                // Views since unmapped no longer count.
+                let mut views = sec.views.lock().unwrap();
+                {
+                    let stl = c.p.st.lock().unwrap();
+                    views.retain(|&b| stl.vm.find(b).is_some_and(|r| r.base == b && r.kind == Kind::Mapped));
+                }
                 if !views.is_empty() && writable {
                     return Err(c.unimplemented("a second writable view of one section (views can't alias in gex)"));
                 }
@@ -416,10 +421,27 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
             });
             drop(stl);
             c.g.zero(base, size_pg as usize)?;
-            if let SecKind::File { data, .. } = &sec.kind {
-                let from = (offset as usize).min(data.len());
-                let to = ((offset + size) as usize).min(data.len());
-                c.g.write(base, &data[from..to])?;
+            match &sec.kind {
+                // A writable section's file has what earlier views wrote
+                // back: read it now rather than the section's snapshot.
+                SecKind::File { file: Some(f), .. } => {
+                    let mut buf = vec![0u8; size as usize];
+                    let mut done = 0;
+                    while done < buf.len() {
+                        let n = f.read_at(offset + done as u64, &mut buf[done..]).map_err(|_| Status(st::UNSUCCESSFUL))? as usize;
+                        if n == 0 {
+                            break;
+                        }
+                        done += n;
+                    }
+                    c.g.write(base, &buf[..done])?;
+                }
+                SecKind::File { data, .. } => {
+                    let from = (offset as usize).min(data.len());
+                    let to = ((offset + size) as usize).min(data.len());
+                    c.g.write(base, &data[from..to])?;
+                }
+                _ => {}
             }
             vm::after_change(c, base, base + size_pg, &[])?;
             if let Some(file) = write_back_to {
