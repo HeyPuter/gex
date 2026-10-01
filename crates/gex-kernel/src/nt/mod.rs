@@ -399,6 +399,8 @@ pub struct State {
     /// Images mapped so far, by base, for `MemoryWineLoadUnixLib` and
     /// `NtQueryVirtualMemory(MemoryImageInformation)`.
     pub images: std::collections::BTreeMap<u64, section::ImageView>,
+    /// Writable views of file-backed sections, by base, to write back.
+    pub file_views: std::collections::BTreeMap<u64, section::FileView>,
 }
 
 /// Where per-thread wait words live (docs/nt-layer.md §1.2).
@@ -431,6 +433,7 @@ impl Process {
                 handles: object::Handles::default(),
                 vm: vm::Vm::new(),
                 images: Default::default(),
+                file_views: Default::default(),
             }),
             threads: RwLock::new(Threads::default()),
             sync: Mutex::new(sync::SyncCore::default()),
@@ -766,6 +769,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtMapViewOfSection => section::nt_map_view_of_section(c),
         n::NtMapViewOfSectionEx => section::nt_map_view_of_section_ex(c),
         n::NtUnmapViewOfSection => section::nt_unmap_view_of_section(c),
+        n::NtFlushVirtualMemory => section::nt_flush_virtual_memory(c),
         n::NtUnmapViewOfSectionEx => section::nt_unmap_view_of_section_ex(c),
         n::NtQuerySection => section::nt_query_section(c),
         // -- objects ---------------------------------------------------------
