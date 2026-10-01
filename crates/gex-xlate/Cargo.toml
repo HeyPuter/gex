@@ -14,6 +14,7 @@ gex-isa-x86 = { workspace = true, optional = true }
 gex-lift-x86 = { workspace = true, optional = true }
 gex-emit.workspace = true
 gex-ld.workspace = true
+gex-cgen = { workspace = true, optional = true }
 
 [features]
 # Lift blocks on every core. Off for the browser shim, which reaches this
@@ -22,3 +23,6 @@ default = []
 parallel = ["gex-emit/parallel"]
 # Translate an x86-64 guest instead of AArch64. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "dep:gex-isa-x86", "dep:gex-lift-x86"]
+# The function tier (`Options::cgen`): C through clang, spliced into the
+# tier-1 module. Needs clang and wasm-ld at translation time, so native only.
+cgen = ["dep:gex-cgen"]
