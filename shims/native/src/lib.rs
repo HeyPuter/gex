@@ -3004,6 +3004,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 return Ok(());
             }
+            if op == gex_abi::cache_op::SPLIT_LOCK {
+                eprintln!(
+                    "gex: a locked access at {:#x} (block {:#x}) spans two 8-byte words; such accesses run under one global lock, atomic against each other but not against plain accesses",
+                    addr as u64, _pc as u64
+                );
+                return Ok(());
+            }
             if op == gex_abi::cache_op::IC_INVALIDATE {
                 let addr = addr as u64;
                 let page = addr / gex_abi::DISPATCH_PAGE;
