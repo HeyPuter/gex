@@ -25,11 +25,31 @@ pub struct NtSetup {
     /// Arguments after argv[0].
     pub args: Vec<String>,
     pub cfg: nt::Config,
+    /// `--wayland-out`: where the display writes composited frames.
+    pub display_out: Option<String>,
+}
+
+/// `GEX_NT_TIME_SCALE`: how much faster than real time the guest's
+/// monotonic clocks run (the counterpart of PEWASM_TIME_SCALE). Every
+/// monotonic source (QueryPerformanceCounter, the tick count and interrupt
+/// time in KUSER_SHARED_DATA, wait timeouts) reads `mono_ns`, so they agree;
+/// the wall-clock date and time are not scaled.
+fn time_scale() -> f64 {
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("GEX_NT_TIME_SCALE").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(1.0)
+    })
 }
 
 fn mono_ns() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    let real = START.get_or_init(Instant::now).elapsed().as_nanos() as u64;
+    let scale = time_scale();
+    if scale == 1.0 {
+        real
+    } else {
+        (real as f64 * scale) as u64
+    }
 }
 
 fn wall() -> (u64, u32) {
@@ -51,7 +71,11 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
     let program = Program { exe, interp: None };
     let mut opts = opts.clone();
     opts.jit = true;
-    run_program_with(&program, &opts, xlate, None, Some(setup))
+    let mut setup = setup.clone();
+    if setup.display_out.is_none() {
+        setup.display_out = opts.wayland_out.clone();
+    }
+    run_program_with(&program, &opts, xlate, None, Some(&setup))
 }
 
 /// Build the NT process in place of `place_image`. Returns the pc the main
@@ -64,19 +88,128 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
         .data_mut()
         .with_kernel(|k| nt::boot::boot(&p, k, memory.bytes(), &req))
         .map_err(|e| anyhow!("starting {}: {e}", setup.exe_path))?;
+    if let Some(out) = &setup.display_out {
+        *p.display_host.lock().unwrap() = Some(Arc::new(PpmDisplay::new(out)));
+    }
     store.data_mut().nt = Some(Arc::clone(&p));
     start_ticker(memory, Arc::downgrade(&p));
     Ok(pc)
+}
+
+/// The native display (§6a.1): every published frame composites the
+/// visible top-level windows at their screen positions, cropped to their
+/// bounding box, into `PREFIX-NNNNN.ppm`. A file is what a test compares and
+/// what works with no screen. There is no native input source: input is
+/// `GEX_NT_INPUT`'s.
+struct PpmDisplay {
+    prefix: String,
+    state: Mutex<PpmState>,
+}
+
+#[derive(Default)]
+struct PpmState {
+    /// Window id -> (x, y, width, height, BGRX rows).
+    windows: std::collections::BTreeMap<u32, (i32, i32, i32, i32, Vec<u8>)>,
+    written: u64,
+}
+
+impl PpmDisplay {
+    fn new(prefix: &str) -> PpmDisplay {
+        PpmDisplay { prefix: prefix.to_string(), state: Mutex::new(PpmState::default()) }
+    }
+}
+
+impl nt::display::NtDisplay for PpmDisplay {
+    fn publish(&self, mem: &GuestMem<'_>, s: &nt::display::NtSurface) {
+        let (w, h) = (s.width.max(0), s.height.max(0));
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h as u64 {
+            match mem.read(s.addr + y * s.stride as u64, w as usize * 4) {
+                Ok(row) => px.extend_from_slice(row),
+                Err(_) => return,
+            }
+        }
+        let mut st = self.state.lock().unwrap();
+        st.windows.insert(s.id, (s.x, s.y, w, h, px));
+        // The bounding box of what is shown, composited in id order.
+        let (mut l, mut t, mut r, mut b) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for (x, y, w, h, _) in st.windows.values() {
+            l = l.min(*x);
+            t = t.min(*y);
+            r = r.max(x + w);
+            b = b.max(y + h);
+        }
+        let (cw, ch) = ((r - l).max(1), (b - t).max(1));
+        let mut rgb = vec![0u8; (cw * ch * 3) as usize];
+        for (x, y, w, h, px) in st.windows.values() {
+            for row in 0..*h {
+                for col in 0..*w {
+                    let (cx, cy) = (x - l + col, y - t + row);
+                    let i = ((row * w + col) * 4) as usize;
+                    let o = ((cy * cw + cx) * 3) as usize;
+                    rgb[o..o + 3].copy_from_slice(&[px[i + 2], px[i + 1], px[i]]);
+                }
+            }
+        }
+        let path = format!("{}-{:05}.ppm", self.prefix, st.written);
+        st.written += 1;
+        drop(st);
+        let mut out = format!("P6\n{cw} {ch}\n255\n").into_bytes();
+        out.extend_from_slice(&rgb);
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, out).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
+            eprintln!("gex: could not write {path}");
+        }
+    }
+
+    fn remove(&self, id: u32) {
+        self.state.lock().unwrap().windows.remove(&id);
+    }
+
+    fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {
+        Vec::new()
+    }
 }
 
 /// Advance `KUSER_SHARED_DATA`'s clocks every millisecond for as long as the
 /// process exists, so a guest polling `GetTickCount` without syscalls sees
 /// time pass (docs/nt-layer.md §4).
 fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>) {
+    let stats = std::env::var_os("GEX_NT_STATS").is_some();
+    let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
+        let (addr, deref) = match v.strip_suffix('*') {
+            Some(a) => (a, true),
+            None => (v.as_str(), false),
+        };
+        let addr = u64::from_str_radix(addr.trim_start_matches("0x"), 16).ok()?;
+        Some((addr, deref))
+    });
+    let start = Instant::now();
+    let mut next_stats = Duration::from_secs(1);
     let _ = std::thread::Builder::new().name("gex-nt-usd".into()).spawn(move || loop {
         match p.upgrade() {
             Some(p) if !p.terminating.load(std::sync::atomic::Ordering::Relaxed) => {
                 nt::sysinfo::usd_tick(memory.bytes(), &p.clocks);
+                // GEX_NT_STATS: once a (real) second, for benchmark harnesses.
+                if stats && start.elapsed() >= next_stats {
+                    next_stats += Duration::from_secs(1);
+                    let presents = p.presents.load(std::sync::atomic::Ordering::Relaxed);
+                    let value = peek.and_then(|(addr, deref)| {
+                        let m = GuestMem::new(memory.bytes());
+                        let mut a = addr;
+                        if deref {
+                            a = m.read_u32(a).ok()? as u64;
+                            if a == 0 {
+                                return None; // not set up yet
+                            }
+                        }
+                        m.read_u32(a).ok()
+                    });
+                    match value {
+                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v}", start.elapsed().as_millis()),
+                        None => eprintln!("gex-nt: stats t={} presents={presents}", start.elapsed().as_millis()),
+                    }
+                }
             }
             _ => return,
         }
@@ -167,6 +300,9 @@ pub(crate) enum Fault {
     DivideOverflow,
     /// A privileged instruction such as `hlt` (`BRK_GENERAL_PROTECTION`).
     Privileged,
+    /// An unmasked x87 exception (`BRK_X87_EXCEPTION`), which gex does not
+    /// deliver: the process ends, loudly.
+    X87,
 }
 
 impl Fault {
@@ -178,6 +314,7 @@ impl Fault {
             i::BRK_DIVIDE_BY_ZERO => Fault::DivideByZero,
             i::BRK_DIVIDE_OVERFLOW => Fault::DivideOverflow,
             i::BRK_GENERAL_PROTECTION => Fault::Privileged,
+            i::BRK_X87_EXCEPTION => Fault::X87,
             _ => Fault::Breakpoint,
         }
     }
@@ -191,6 +328,16 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let state = caller.data_mut();
     let p = Arc::clone(state.nt.as_ref().expect("an NT fault in a Linux process"));
+    if let Fault::X87 = fault {
+        eprintln!("gex-nt: an unmasked x87 exception at {pc:#x}: gex does not deliver x87 exceptions; ending the process");
+        state.exit = Some(Exit::Signal {
+            signal: 8,
+            pc,
+            detail: "unmasked x87 exception (not delivered by gex)".into(),
+            internal: true,
+        });
+        return Err(StopExecution.into());
+    }
     let (code, rip, info): (u32, u64, Vec<u64>) = match fault {
         // The context's rip is after the int3, as hardware leaves it.
         Fault::Breakpoint => (st::BREAKPOINT, pc + 1, vec![0]),
@@ -202,6 +349,7 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
         Fault::DivideByZero => (st::INTEGER_DIVIDE_BY_ZERO, pc, vec![]),
         Fault::DivideOverflow => (st::INTEGER_OVERFLOW, pc, vec![]),
         Fault::Privileged => (st::PRIVILEGED_INSTRUCTION, pc, vec![]),
+        Fault::X87 => unreachable!(),
     };
     let outcome = nt::hardware_exception(&p, &state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {

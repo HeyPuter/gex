@@ -264,6 +264,13 @@ pub mod ctx {
     pub const AF: usize = NZCV + 5;
     pub const DF: usize = NZCV + 6;
 
+    /// x86 only: the EFLAGS system bits user code can toggle, in place as a
+    /// 32-bit value: AC (bit 18) and ID (bit 21). `popf` stores them and
+    /// `pushf` gives them back, which is how a program tests for `cpuid`
+    /// (it flips ID) or for a 486 (it flips AC). Stored only: gex does not
+    /// check alignment when AC is set.
+    pub const EFLAGS_SYS: usize = 34 * 8;
+
     /// Pack four 0/1 flags into the slot (and [`unpack_nzcv`] to reverse), so
     /// the packing lives in one place.
     #[inline]
@@ -635,9 +642,12 @@ pub mod imports {
     /// cover, computed exactly (`gex_f80`). Pure: it reads only its
     /// arguments and writes only its results, so a block calls it without
     /// flushing its cached registers. Signature `(ctx: i32, op: i32,
-    /// sig: i64, se: i32, cw: i32) -> i64`, `op` being `X87Op::code`: the
-    /// result is returned, and the status-word bits (exception flags, C1 at
-    /// bit 9) are left as an i32 at `ctx::X87_TMP + 12`.
+    /// a_sig: i64, a_se: i32, b_sig: i64, b_se: i32, cw: i32) -> i64`, `op`
+    /// being `X87Op::code` and `b` unused by the one-operand operations:
+    /// the first result is returned; an extended result's sign and
+    /// exponent are left as an i32 at `ctx::X87_TMP + 8`, and the
+    /// status-word bits (exception flags, C1 at bit 9) as an i32 at
+    /// `ctx::X87_TMP + 12`.
     pub const X87: &str = "x87";
 
     /// Safepoint poll taken when the interrupt flag is set.

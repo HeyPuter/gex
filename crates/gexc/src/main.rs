@@ -1025,6 +1025,12 @@ fn closure_intrinsics(
 ) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
     let mut intrinsics = std::collections::HashMap::new();
     for o in objects {
+        // Not for 32-bit (i386) objects, as `image_intrinsics`: the
+        // intrinsic block reads the 64-bit register arguments and pops an
+        // 8-byte return address, and i386 cdecl passes them on the stack.
+        if o.image.class32 {
+            continue;
+        }
         let (tlo, thi) = o.image.text_range;
         for s in &o.image.symbols {
             if s.ifunc {
@@ -1706,5 +1712,11 @@ mod tests {
         let got = closure_intrinsics(&objects);
         assert_eq!(got.get(&at), Some(&gex_xlate::Intrinsic::MemCpy));
         assert_eq!(got.len(), 1);
+
+        // An i386 closure gets none: the intrinsic block is the 64-bit
+        // calling convention, and cdecl passes the arguments on the stack.
+        let mut objects = objects;
+        objects[0].image.class32 = true;
+        assert!(closure_intrinsics(&objects).is_empty());
     }
 }

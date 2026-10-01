@@ -52,6 +52,12 @@ pub enum Intrinsic {
     /// PLT stub through its resolved GOT slot, a function pointer -- runs the
     /// replacement.
     Replace(u32),
+    /// A user-supplied override of the whole function (`gex-eject`'s "entry"
+    /// ABI, which `gexc eject decompile` writes): the host runs it, and it
+    /// does everything the function would, its return included, leaving the
+    /// context's PC where the guest goes next. The block is the host call and
+    /// a dispatch on that PC.
+    Override(u32),
 }
 
 /// The `sysreg_write` register number a [`Intrinsic::Replace`] block passes.
@@ -136,7 +142,7 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
             let wide = b.extend(r, true);
             b.write(GuestReg::X(0), wide);
         }
-        Intrinsic::Replace(id) => {
+        Intrinsic::Replace(id) | Intrinsic::Override(id) => {
             let pc = b.const_i64(addr);
             let reg = b.const_i32(REPLACE_SYSREG as u32);
             let id = b.const_i64(u64::from(id));
@@ -152,6 +158,14 @@ pub fn block(addr: u64, which: Intrinsic) -> Block {
     // value (`g_strdup`, `stpcpy`, ...) reads whatever rax held.
     if gex_abi::X86 && matches!(which, Intrinsic::MemCpy | Intrinsic::MemMove | Intrinsic::MemSet) {
         b.write(GuestReg::X(0), dst);
+    }
+    // An override returned (or left) itself: go where it says.
+    if let Intrinsic::Override(_) = which {
+        let target = b.read(GuestReg::Pc);
+        return b.finish(Term::Indirect {
+            target,
+            is_ret: true,
+        });
     }
     // Return: through the link register, or by popping the return address.
     let target = if gex_abi::X86 {
@@ -326,6 +340,16 @@ mod tests {
         } else {
             assert!(writes.is_empty());
         }
+    }
+
+    #[test]
+    fn an_override_dispatches_where_it_left_the_pc() {
+        let b = block(0x1000, Intrinsic::Override(3));
+        assert!(b.stmts.iter().any(|s| matches!(s, Stmt::HostCall { func: HostFunc::SysRegWrite, .. })));
+        // No register is written: the override did the return itself.
+        assert!(!b.stmts.iter().any(|s| matches!(s, Stmt::WriteReg { .. })));
+        assert!(b.stmts.iter().any(|s| matches!(s, Stmt::Def { expr: Expr::ReadReg(GuestReg::Pc), .. })));
+        assert!(matches!(b.term, Term::Indirect { is_ret: true, .. }));
     }
 
     #[test]

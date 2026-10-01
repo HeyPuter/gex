@@ -23,6 +23,29 @@ fn x87_block(start: u64, target: u64) -> Block {
         b.write(GuestReg::X(n + 1), f);
         n += 2;
     }
+    let sig2 = b.read(GuestReg::X(12));
+    for op in [
+        X87Op::Arith(X87Arith::Add),
+        X87Op::Arith(X87Arith::Sub),
+        X87Op::Arith(X87Arith::Mul),
+        X87Op::Arith(X87Arith::Div),
+    ] {
+        let outs = b.x87(op, vec![sig, se, sig2, se, cw]);
+        b.write(GuestReg::X(n), outs[0]);
+        let e = b.def(Expr::Extend { a: outs[1], signed: false });
+        b.write(GuestReg::X(n + 1), e);
+        let f = b.def(Expr::Extend { a: outs[2], signed: false });
+        b.write(GuestReg::X(n + 2), f);
+        n += 3;
+    }
+    for quiet in [false, true] {
+        let outs = b.x87(X87Op::Compare { quiet }, vec![sig, se, sig2, se]);
+        let c = b.def(Expr::Extend { a: outs[0], signed: false });
+        b.write(GuestReg::X(n), c);
+        let f = b.def(Expr::Extend { a: outs[1], signed: false });
+        b.write(GuestReg::X(n + 1), f);
+        n += 2;
+    }
     b.finish(Term::Goto { target })
 }
 

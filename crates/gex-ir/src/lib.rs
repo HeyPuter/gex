@@ -957,7 +957,7 @@ pub enum Stmt {
 
 /// What a [`Stmt::X87`] computes. Every operation's last output is an
 /// `I32` of status-word bits: the exception flags it raised (IE, DE, ZE, OE,
-/// UE, PE in bits 0-5) and C1 in bit 9.
+/// UE, PE in bits 0-5) and C1 in bit 9 (always clear for `Compare`).
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum X87Op {
     /// `fst`/`fstp` to single (`single`) or double: the register's value
@@ -970,6 +970,27 @@ pub enum X87Op {
     /// Args: as `Narrow`. Outs: the integer `I64` (the low `bits` matter),
     /// flags.
     ToInt { bits: u8, trunc: bool },
+    /// `fadd`/`fsub`/`fmul`/`fdiv` (and their reversed and popping forms,
+    /// which only choose the operands), rounded by the control word's
+    /// precision and rounding control.
+    /// Args: a's significand `I64` and sign/exponent `I32`, b's likewise,
+    /// the control word `I32`. Outs: the result's significand `I64` and
+    /// sign/exponent `I32`, flags.
+    Arith(X87Arith),
+    /// `fcom` (any NaN raises IE) or `fucom` (`quiet`: only an SNaN does).
+    /// Args: a's significand and sign/exponent, b's likewise. Outs: the
+    /// condition codes as status-word bits `I32` (C0 for less, C3 for
+    /// equal, C0|C2|C3 for unordered, none for greater), flags.
+    Compare { quiet: bool },
+}
+
+/// The operation of an [`X87Op::Arith`].
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum X87Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 impl X87Op {
@@ -977,6 +998,8 @@ impl X87Op {
     pub fn arg_types(self) -> &'static [Ty] {
         match self {
             X87Op::Narrow { .. } | X87Op::ToInt { .. } => &[Ty::I64, Ty::I32, Ty::I32],
+            X87Op::Arith(_) => &[Ty::I64, Ty::I32, Ty::I64, Ty::I32, Ty::I32],
+            X87Op::Compare { .. } => &[Ty::I64, Ty::I32, Ty::I64, Ty::I32],
         }
     }
 
@@ -984,16 +1007,22 @@ impl X87Op {
     pub fn out_types(self) -> &'static [Ty] {
         match self {
             X87Op::Narrow { .. } | X87Op::ToInt { .. } => &[Ty::I64, Ty::I32],
+            X87Op::Arith(_) => &[Ty::I64, Ty::I32, Ty::I32],
+            X87Op::Compare { .. } => &[Ty::I32, Ty::I32],
         }
     }
 
     /// The code the `x87` host import takes for this operation: 1 and 2 for
-    /// single and double `Narrow`; `0x100 | bits << 1 | trunc` for `ToInt`.
+    /// single and double `Narrow`; `0x100 | bits << 1 | trunc` for `ToInt`;
+    /// `0x200 | k` for `Arith` (add, sub, mul, div = 0..3); `0x300 | quiet`
+    /// for `Compare`.
     pub fn code(self) -> i32 {
         match self {
             X87Op::Narrow { single: true } => 1,
             X87Op::Narrow { single: false } => 2,
             X87Op::ToInt { bits, trunc } => 0x100 | (bits as i32) << 1 | trunc as i32,
+            X87Op::Arith(k) => 0x200 | k as i32,
+            X87Op::Compare { quiet } => 0x300 | quiet as i32,
         }
     }
 }

@@ -142,6 +142,15 @@ mod ffi {
         pub fn glUniform2f(location: GLint, v0: GLfloat, v1: GLfloat);
         pub fn glUniform3f(location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat);
         pub fn glUniform4f(location: GLint, v0: GLfloat, v1: GLfloat, v2: GLfloat, v3: GLfloat);
+        pub fn glUniform1fv(location: GLint, count: GLsizei, value: *const GLfloat);
+        pub fn glUniform2fv(location: GLint, count: GLsizei, value: *const GLfloat);
+        pub fn glUniform3fv(location: GLint, count: GLsizei, value: *const GLfloat);
+        pub fn glUniform4fv(location: GLint, count: GLsizei, value: *const GLfloat);
+        pub fn glUniform1iv(location: GLint, count: GLsizei, value: *const GLint);
+        pub fn glUniform2iv(location: GLint, count: GLsizei, value: *const GLint);
+        pub fn glUniform3iv(location: GLint, count: GLsizei, value: *const GLint);
+        pub fn glUniform4iv(location: GLint, count: GLsizei, value: *const GLint);
+        pub fn glBlendFuncSeparate(src_rgb: GLenum, dst_rgb: GLenum, src_a: GLenum, dst_a: GLenum);
         pub fn glUniformMatrix4fv(
             location: GLint,
             count: GLsizei,
@@ -190,7 +199,6 @@ mod ffi {
             pixels: *const c_void,
         );
 
-        pub fn glGenFramebuffers(n: GLsizei, names: *mut GLuint);
         pub fn glDeleteFramebuffers(n: GLsizei, names: *const GLuint);
         pub fn glBindFramebuffer(target: GLenum, name: GLuint);
         pub fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
@@ -310,6 +318,8 @@ compat_table! {
     glColor4f: fn(GLfloat, GLfloat, GLfloat, GLfloat);
     glTexEnvi: fn(GLenum, GLenum, GLint);
     glAlphaFunc: fn(GLenum, GLfloat);
+    glPushAttrib: fn(GLbitfield);
+    glPopAttrib: fn();
 }
 
 /// Guest object names to the host's, for the kinds GL insists on naming.
@@ -819,6 +829,35 @@ impl Gl {
                         glBlendFunc(s, d);
                     }
                 }
+                op::BLEND_FUNC_SEPARATE => {
+                    if let (Some(sr), Some(dr), Some(sa), Some(da)) = (a.u32(), a.u32(), a.u32(), a.u32()) {
+                        glBlendFuncSeparate(sr, dr, sa, da);
+                    }
+                }
+                op::UNIFORM_1IV..=op::UNIFORM_4IV => {
+                    // { location, count, blob of count * N values }
+                    let (Some(l), Some(count), Some(data)) = (a.i32(), a.i32(), a.blob()) else { return true };
+                    let n = match opcode {
+                        op::UNIFORM_1IV | op::UNIFORM_1FV => 1,
+                        op::UNIFORM_2FV | op::UNIFORM_2IV => 2,
+                        op::UNIFORM_3FV | op::UNIFORM_3IV => 3,
+                        _ => 4,
+                    };
+                    if count < 0 || data.len() < count as usize * n * 4 {
+                        return true;
+                    }
+                    let p = data.as_ptr();
+                    match opcode {
+                        op::UNIFORM_1FV => glUniform1fv(l, count, p as *const GLfloat),
+                        op::UNIFORM_2FV => glUniform2fv(l, count, p as *const GLfloat),
+                        op::UNIFORM_3FV => glUniform3fv(l, count, p as *const GLfloat),
+                        op::UNIFORM_4FV => glUniform4fv(l, count, p as *const GLfloat),
+                        op::UNIFORM_1IV => glUniform1iv(l, count, p as *const GLint),
+                        op::UNIFORM_2IV => glUniform2iv(l, count, p as *const GLint),
+                        op::UNIFORM_3IV => glUniform3iv(l, count, p as *const GLint),
+                        _ => glUniform4iv(l, count, p as *const GLint),
+                    }
+                }
                 op::DEPTH_FUNC => {
                     if let Some(f) = a.u32() {
                         glDepthFunc(f);
@@ -1308,7 +1347,7 @@ impl Gl {
                 }
 
                 // Fixed function: only in a desktop context.
-                op::MATRIX_MODE..=op::ALPHA_FUNC => {
+                op::MATRIX_MODE..=op::POP_ATTRIB => {
                     let Some(f) = &self.compat else { return false };
                     match opcode {
                         op::MATRIX_MODE => {
@@ -1446,6 +1485,11 @@ impl Gl {
                             let (Some(func), Some(r)) = (a.u32(), a.f32()) else { return true };
                             (f.glAlphaFunc)(func, r);
                         }
+                        op::PUSH_ATTRIB => {
+                            let Some(mask) = a.u32() else { return true };
+                            (f.glPushAttrib)(mask);
+                        }
+                        op::POP_ATTRIB => (f.glPopAttrib)(),
                         _ => return false,
                     }
                 }
@@ -1877,5 +1921,85 @@ mod tests {
         assert_eq!(pixel16(&px, 3, 8), (255, 0, 0, 255), "the client-array quad, scaled");
         assert_eq!(pixel16(&px, 9, 8), (0, 0, 0, 255), "nothing between");
         assert_eq!(pixel16(&px, 14, 8), (0, 255, 0, 255), "the immediate quad, moved by the loaded matrix");
+    }
+
+    /// Protocol 12's attribute stack, and the host's uniform vectors and
+    /// separate blend functions (opcodes that already existed).
+    #[test]
+    fn protocol_12_attribute_stack_and_uniform_vectors() {
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        const GL_BLEND: u32 = 0x0BE2;
+        const GL_ENABLE_BIT: u32 = 0x2000;
+        const GL_VERTEX_ARRAY: u32 = 0x8074;
+        const GL_QUADS: u32 = 0x0007;
+        const GL_ONE: u32 = 1;
+        const GL_ZERO: u32 = 0;
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 2, 1]);
+        let _ = gl.run(b.bytes());
+        if !gl.is_desktop() {
+            eprintln!("skipping: the host has no desktop OpenGL");
+            return;
+        }
+        let vs = b"void main(){gl_Position=gl_Vertex;}\n";
+        let fs = b"uniform vec4 c;\nvoid main(){gl_FragColor=c;}\n";
+        let mut quad = Vec::new();
+        for (x, y) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            quad.extend_from_slice(&x.to_le_bytes());
+            quad.extend_from_slice(&y.to_le_bytes());
+        }
+        let color: Vec<u8> = [0.0f32, 0.0, 1.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut b = Batch::new();
+        b.cmd(op::PUSH_ATTRIB, &[GL_ENABLE_BIT]);
+        b.cmd(op::ENABLE, &[GL_BLEND]);
+        b.cmd(op::BLEND_FUNC_SEPARATE, &[GL_ONE, GL_ZERO, GL_ONE, GL_ZERO]);
+        b.cmd(op::POP_ATTRIB, &[]);
+        b.cmd(op::GET_INTEGERV, &[GL_BLEND]);
+        b.cmd(op::CREATE_SHADER, &[1, GL_VERTEX_SHADER]);
+        b.raw(op::SHADER_SOURCE, &[1, vs.len() as u32], vs);
+        b.cmd(op::COMPILE_SHADER, &[1]);
+        b.cmd(op::CREATE_SHADER, &[2, GL_FRAGMENT_SHADER]);
+        b.raw(op::SHADER_SOURCE, &[2, fs.len() as u32], fs);
+        b.cmd(op::COMPILE_SHADER, &[2]);
+        b.cmd(op::CREATE_PROGRAM, &[3]);
+        b.cmd(op::ATTACH_SHADER, &[3, 1]);
+        b.cmd(op::ATTACH_SHADER, &[3, 2]);
+        b.cmd(op::LINK_PROGRAM, &[3]);
+        b.cmd(op::USE_PROGRAM, &[3]);
+        b.raw(op::GET_UNIFORM_LOCATION, &[3, 1], b"c");
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        let blend = read_u32(r, &mut at);
+        assert_eq!(blend, 0, "POP_ATTRIB restored the blend enable");
+        for _ in 0..3 {
+            let _ = read_u32(r, &mut at);
+        }
+        let loc = read_u32(r, &mut at);
+        let mut b = Batch::new();
+        b.raw(op::UNIFORM_4FV, &[loc, 1, color.len() as u32], &color);
+        b.cmd(op::GEN_BUFFERS, &[1, 9]);
+        b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 9]);
+        b.raw(op::BUFFER_DATA, &[GL_ARRAY_BUFFER, GL_STATIC_DRAW, quad.len() as u32, 0, 1, quad.len() as u32], &quad);
+        b.cmd(op::ENABLE_CLIENT_STATE, &[GL_VERTEX_ARRAY]);
+        b.cmd(op::VERTEX_POINTER, &[2, GL_FLOAT, 8, 0, 0]);
+        b.cmd(op::DRAW_ARRAYS, &[GL_QUADS, 0, 4]);
+        read_back(&mut b);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        let r = reply.bytes();
+        let mut at = 0;
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(pixel16(&px, 8, 8), (0, 0, 255, 255), "the uniform vector's color");
     }
 }

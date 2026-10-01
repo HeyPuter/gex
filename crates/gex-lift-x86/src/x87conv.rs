@@ -15,7 +15,7 @@
 
 use crate::{Flow, Lifter};
 use gex_ir::*;
-use gex_isa_x86::{Operand, X87Mem};
+use gex_isa_x86::{Operand, Width, X87Mem, X87Src};
 
 /// Status-word exception bits.
 const IE: u32 = 1;
@@ -170,6 +170,13 @@ impl<'a> Lifter<'a> {
     /// extended, exactly: (value, flags). An SNaN is quieted with IE; a
     /// denormal raises DE.
     fn x87_widen(&mut self, v: Value, f: Fmt) -> ((Value, Value), Value) {
+        self.x87_widen_q(v, f, true)
+    }
+
+    /// `x87_widen`, quieting an SNaN only when `quiet`: an arithmetic or
+    /// compare operand keeps it signalling, so the operation raises IE and
+    /// picks between NaNs as the x87 does (a QNaN beats an SNaN).
+    fn x87_widen_q(&mut self, v: Value, f: Fmt, quiet: bool) -> ((Value, Value), Value) {
         let exp_bits = f.bits - 1 - f.frac;
         let emax_field = (1u64 << exp_bits) - 1;
         let sh = self.k64((f.bits - 1) as u64);
@@ -206,7 +213,7 @@ impl<'a> Lifter<'a> {
         // Infinity and NaN: the fraction moves up, a NaN comes back quiet.
         let up = self.k64((63 - f.frac) as u64);
         let fs = self.b64(BinOp::Shl, frac, up);
-        let top2 = self.k64(3 << 62);
+        let top2 = self.k64(if quiet { 3 << 62 } else { 1 << 63 });
         let ibit = self.k64(1 << 63);
         let q = self.s64(nonzero, top2, ibit);
         let sig_s = self.b64(BinOp::Or, fs, q);
@@ -251,9 +258,17 @@ impl<'a> Lifter<'a> {
     }
 
     /// `fld`/`fild` from memory, inline.
-    pub(crate) fn x87_fld_mem(&mut self, o: Operand, m: X87Mem) -> Flow {
+    /// A memory operand converted to extended, exactly: (value, the flags
+    /// the conversion raises -- IE for an SNaN, DE for a denormal).
+    pub(crate) fn x87_mem_value(&mut self, o: Operand, m: X87Mem) -> Option<((Value, Value), Value)> {
+        self.x87_mem_value_q(o, m, true)
+    }
+
+    /// `x87_mem_value`, quieting an SNaN only when `quiet` (see
+    /// `x87_widen_q`).
+    pub(crate) fn x87_mem_value_q(&mut self, o: Operand, m: X87Mem, quiet: bool) -> Option<((Value, Value), Value)> {
         let Operand::Mem(mem) = o else {
-            return self.illegal_x87();
+            return None;
         };
         let (addr, offset) = self.addr(&mem);
         let ld = |this: &mut Self, off: i64, sz: MemSz, signed: bool| {
@@ -266,14 +281,14 @@ impl<'a> Lifter<'a> {
                 order: Order::Relaxed,
             })
         };
-        let (v, flags) = match m {
+        Some(match m {
             X87Mem::F32 => {
                 let raw = ld(self, offset, MemSz::B4, false);
-                self.x87_widen(raw, SINGLE)
+                self.x87_widen_q(raw, SINGLE, quiet)
             }
             X87Mem::F64 => {
                 let raw = ld(self, offset, MemSz::B8, false);
-                self.x87_widen(raw, DOUBLE)
+                self.x87_widen_q(raw, DOUBLE, quiet)
             }
             X87Mem::F80 => {
                 // Loaded as it is: fld m80 raises nothing.
@@ -299,6 +314,201 @@ impl<'a> Lifter<'a> {
                 let z = self.k32(0);
                 (self.x87_int_to_ext(raw), z)
             }
+        })
+    }
+
+    /// Whether `st(i)` is empty (its tag clear), as an I32 0/1.
+    pub(crate) fn x87_st_empty(&mut self, i: u8) -> Value {
+        let top = self.top();
+        let iv = self.k32(i as u32);
+        let idx = self.b32(BinOp::Add, top, iv);
+        let seven = self.k32(7);
+        let idx = self.and32(idx, seven);
+        let tags = self.b.read(GuestReg::X87Tags);
+        let t = self.b32(BinOp::ShrU, tags, idx);
+        let one = self.k32(1);
+        let valid = self.and32(t, one);
+        self.not1(valid)
+    }
+
+    /// Combine an operation's flags `f` with a memory operand's conversion
+    /// flags `extra`: its IE always, its DE when `f` has neither IE nor ZE
+    /// and the result (if given) is not a NaN.
+    fn x87_mem_flags(&mut self, f: Value, extra: Value, result: Option<(Value, Value)>) -> Value {
+        let ize = self.k32(IE | 4);
+        let bad = self.and32(f, ize);
+        let z = self.k32(0);
+        let mut ok = self.c32(CmpOp::Eq, bad, z);
+        if let Some((sig, se)) = result {
+            let m = self.k32(0x7fff);
+            let e = self.and32(se, m);
+            let emax = self.c32(CmpOp::Eq, e, m);
+            let one = self.k64(1);
+            let low = self.b64(BinOp::Shl, sig, one);
+            let z64 = self.k64(0);
+            let frac = self.c64(CmpOp::Ne, low, z64);
+            let nan = self.and32(emax, frac);
+            let notnan = self.not1(nan);
+            ok = self.and32(ok, notnan);
+        }
+        self.x87_mem_flags_if(f, extra, ok)
+    }
+
+    /// `f | IE of extra | (DE of extra if ok)`.
+    fn x87_mem_flags_if(&mut self, f: Value, extra: Value, ok: Value) -> Value {
+        let iem = self.k32(IE);
+        let ie = self.and32(extra, iem);
+        let dem = self.k32(DE);
+        let de = self.and32(extra, dem);
+        let z = self.k32(0);
+        let de = self.s32(ok, de, z);
+        let r = self.or32(f, ie);
+        self.or32(r, de)
+    }
+
+    /// `fadd`/`fsub`/`fmul`/`fdiv` (with `rev` for `fsubr`/`fdivr`) on the
+    /// form's operands, through a pure `Stmt::X87`. An empty operand
+    /// register is a stack underflow: the indefinite with IE and SF.
+    pub(crate) fn x87_arith_op(&mut self, k: X87Arith, src: X87Src, rev: bool) -> Flow {
+        let mut extra = self.k32(0);
+        let (a, b, dst, empty, pop) = match src {
+            X87Src::MemF(_) | X87Src::MemI(_) => {
+                let m = match src {
+                    X87Src::MemF(w) if w == Width::Q => X87Mem::F64,
+                    X87Src::MemF(_) => X87Mem::F32,
+                    X87Src::MemI(w) if w == Width::W => X87Mem::I16,
+                    _ => X87Mem::I32,
+                };
+                let Some((v, f)) = self.x87_mem_value_q(self.cur_mem, m, false) else {
+                    return self.illegal_x87();
+                };
+                extra = f;
+                let st0 = self.ld_st(0);
+                let e = self.x87_st_empty(0);
+                (st0, v, 0, e, false)
+            }
+            X87Src::St0Sti(i) => {
+                let st0 = self.ld_st(0);
+                let sti = self.ld_st(i);
+                let e0 = self.x87_st_empty(0);
+                let ei = self.x87_st_empty(i);
+                let e = self.or32(e0, ei);
+                (st0, sti, 0, e, false)
+            }
+            X87Src::StiSt0 { i, pop } => {
+                let st0 = self.ld_st(0);
+                let sti = self.ld_st(i);
+                let e0 = self.x87_st_empty(0);
+                let ei = self.x87_st_empty(i);
+                let e = self.or32(e0, ei);
+                (sti, st0, i, e, pop)
+            }
+        };
+        let (a, b) = if rev { (b, a) } else { (a, b) };
+        let cw = self.b.read(GuestReg::X87Cw);
+        let outs = self.b.x87(X87Op::Arith(k), vec![a.0, a.1, b.0, b.1, cw]);
+        let isig = self.k64(INDEF_SIG);
+        let ise = self.k32(INDEF_SE);
+        let sig = self.s64(empty, isig, outs[0]);
+        let se = self.s32(empty, ise, outs[1]);
+        self.st_st(dst, (sig, se));
+        let m = self.k32(0x7f);
+        let f = self.and32(outs[2], m);
+        let sf = self.k32(IE | SF);
+        let f = self.s32(empty, sf, f);
+        // The memory operand's conversion flags: IE for an SNaN always; DE
+        // for a denormal only when the operation itself would report a
+        // denormal operand -- not beside IE or ZE, nor with a NaN result
+        // (the x87 checks NaNs and invalid operations first).
+        let flags = self.x87_mem_flags(f, extra, Some((sig, se)));
+        let n = self.k32(C1_BIT);
+        let c1 = self.b32(BinOp::ShrU, outs[2], n);
+        let one = self.k32(1);
+        let c1 = self.and32(c1, one);
+        let ne = self.not1(empty);
+        let c1 = self.and32(c1, ne);
+        self.x87_raise(flags, c1);
+        if pop {
+            self.pop_st();
+        }
+        Flow::Next
+    }
+
+    /// `fcom`/`fucom`/`fcomi`/`fucomi`/`ficom`/`ftst`: st(0) against st(i),
+    /// a memory operand, or (`ftst`) zero; the condition codes or (`eflags`)
+    /// ZF/PF/CF, and `pops` pops. An empty register compares unordered with
+    /// IE and SF.
+    pub(crate) fn x87_compare_op(&mut self, src: Option<X87Mem>, i: u8, pops: u8, quiet: bool, eflags: bool, test: bool) -> Flow {
+        let mut extra = self.k32(0);
+        let st0 = self.ld_st(0);
+        let mut empty = self.x87_st_empty(0);
+        let b = if test {
+            let z64 = self.k64(0);
+            let z32 = self.k32(0);
+            (z64, z32)
+        } else if let Some(m) = src {
+            let Some((v, f)) = self.x87_mem_value_q(self.cur_mem, m, false) else {
+                return self.illegal_x87();
+            };
+            extra = f;
+            v
+        } else {
+            let ei = self.x87_st_empty(i);
+            empty = self.or32(empty, ei);
+            self.ld_st(i)
+        };
+        let outs = self.b.x87(X87Op::Compare { quiet }, vec![st0.0, st0.1, b.0, b.1]);
+        let unord = self.k32(1 << 8 | 1 << 10 | 1 << 14);
+        let cc = self.s32(empty, unord, outs[0]);
+        let m = self.k32(0x7f);
+        let f = self.and32(outs[1], m);
+        let sf = self.k32(IE | SF);
+        let f = self.s32(empty, sf, f);
+        // As for the arithmetic: a denormal memory operand reports DE only
+        // when the compare is ordered.
+        let ordered = {
+            let u = self.k32(1 << 10);
+            let c2 = self.and32(cc, u);
+            let z = self.k32(0);
+            self.c32(CmpOp::Eq, c2, z)
+        };
+        let flags = self.x87_mem_flags_if(f, extra, ordered);
+        let z = self.k32(0);
+        if eflags {
+            // C3 -> ZF, C2 -> PF, C0 -> CF; OF, SF and AF cleared.
+            let bit = |this: &mut Self, n: u32| {
+                let k = this.k32(n);
+                let v = this.b32(BinOp::ShrU, cc, k);
+                let one = this.k32(1);
+                this.and32(v, one)
+            };
+            let zf = bit(self, 14);
+            let pf = bit(self, 10);
+            let cf = bit(self, 8);
+            self.b.write(GuestReg::Z, zf);
+            self.b.write(GuestReg::P, pf);
+            self.b.write(GuestReg::C, cf);
+            self.b.write(GuestReg::N, z);
+            self.b.write(GuestReg::V, z);
+            self.b.write(GuestReg::A, z);
+            self.flags = crate::FlagSource::Unknown;
+        } else {
+            let sw = self.b.read(GuestReg::X87Sw);
+            let keep = self.k32(!(1u32 << 8 | 1 << 10 | 1 << 14));
+            let sw = self.and32(sw, keep);
+            let sw = self.or32(sw, cc);
+            self.b.write(GuestReg::X87Sw, sw);
+        }
+        self.x87_raise(flags, z);
+        for _ in 0..pops {
+            self.pop_st();
+        }
+        Flow::Next
+    }
+
+    pub(crate) fn x87_fld_mem(&mut self, o: Operand, m: X87Mem) -> Flow {
+        let Some((v, flags)) = self.x87_mem_value(o, m) else {
+            return self.illegal_x87();
         };
         let (pflags, c1) = self.x87_push_checked(v);
         let flags = self.or32(flags, pflags);

@@ -162,6 +162,9 @@ pub struct FnUnit {
     /// (`live_in`): write-backs on internal edges and at calls to functions
     /// with a summary store only these.
     live: Vec<RegSet>,
+    /// A unit for `standalone::standalone`: everything `static`, and no
+    /// dispatch roots (`e_<F>`), so nothing imports `gexc.dispatch`.
+    standalone: bool,
 }
 
 impl Default for FnUnit {
@@ -179,6 +182,23 @@ impl FnUnit {
             uses_call_known: false,
             weight: 0,
             live: Vec::new(),
+            standalone: false,
+        }
+    }
+
+    /// A unit for a standalone translation unit (`crate::standalone`).
+    pub fn new_standalone() -> FnUnit {
+        FnUnit {
+            standalone: true,
+            ..FnUnit::new()
+        }
+    }
+
+    fn storage(&self) -> &'static str {
+        if self.standalone {
+            "static "
+        } else {
+            ""
         }
     }
 
@@ -215,7 +235,7 @@ impl FnUnit {
         let name = body_name(f.entry);
         // The body's head, kept aside: its loop functions go first.
         let mut fhead = String::new();
-        let _ = writeln!(fhead, "int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{");
+        let _ = writeln!(fhead, "{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
         for r in &used {
             let _ = writeln!(fhead, "  {} {};", emit::cty(r.ty()), reg_name(*r));
         }
@@ -301,7 +321,13 @@ impl FnUnit {
         self.bodies.push_str(&e.take_output());
         self.bodies.push_str("}\n\n");
 
-        // The entry and nest root.
+        // The entry and nest root. A standalone unit has none: its caller
+        // dispatches on `ctx::PC` itself.
+        if self.standalone {
+            self.protos.insert(f.entry);
+            self.protos.extend(calls);
+            return Ok(());
+        }
         let _ = writeln!(self.bodies, "void {}(int ctx) {{", entry_name(f.entry));
         let root_block = Block::new(f.entry);
         let mut r = Emitter::new(&root_block, &owned);
@@ -636,10 +662,11 @@ impl FnUnit {
     pub fn source(&self) -> String {
         let mut s = String::from("#include \"gex_abi.h\"\n\n");
         s.push_str(NEED_DEFS);
+        let st = self.storage();
         for a in &self.protos {
-            let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
+            let _ = writeln!(s, "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
         }
-        let _ = writeln!(s, "int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n");
+        let _ = writeln!(s, "{st}int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n");
         s.push_str(&self.bodies);
         s
     }

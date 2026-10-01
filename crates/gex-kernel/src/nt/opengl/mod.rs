@@ -10,8 +10,9 @@
 //! does for Linux guests.
 //!
 //! Frames: SwapBuffers reads the default framebuffer back into the window's
-//! surface (§6a.1), so GL and GDI output end up in the same place for the
-//! display side. `GEX_NT_FRAMES=dir` writes each swapped frame there as a PPM.
+//! surface (§6a.1), so GL and GDI output end up in the same place, and
+//! publishes it to the display (natively, `gexc run --wayland-out PREFIX`
+//! writes composited PPMs).
 //!
 //! Scope is what Noita and SDL use (its census is in the S12 notes); any
 //! other GL function fails loudly by name. All of the process's contexts
@@ -597,33 +598,14 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
     let frame = {
         let mut s = c.p.gl.lock().unwrap();
         s.frame += 1;
+        c.p.presents.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         s.frame
     };
-    if let Some(dir) = std::env::var_os("GEX_NT_FRAMES") {
-        write_ppm(&std::path::Path::new(&dir).join(format!("frame-{frame:05}.ppm")), w, h, &px);
-    }
     // Scripted input (GEX_NT_INPUT) is timed by frames.
     super::user::input::script_tick(c, frame, hwnd);
     // The next frame is drawn at the window's size.
     fit_surface(c, hdc)?;
     Ok(true)
-}
-
-/// A bottom-up BGRA readback as a PPM.
-fn write_ppm(path: &std::path::Path, w: i32, h: i32, px: &[u8]) {
-    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-    for y in (0..h as usize).rev() {
-        for x in 0..w as usize {
-            let o = (y * w as usize + x) * 4;
-            out.extend_from_slice(&[px[o + 2], px[o + 1], px[o]]);
-        }
-    }
-    // Written whole and renamed, so a run that is stopped mid-frame leaves
-    // no torn file.
-    let tmp = path.with_extension("ppm.tmp");
-    if std::fs::write(&tmp, out).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
 }
 
 // ------------------------------------------------------------ client arrays
@@ -994,6 +976,8 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
         "glTexEnvf" => cmd(c, op::TEX_ENVI, &[p.u32(c, 1)?, p.u32(c, 2)?, p.f32(c, 3)? as i32 as u32], &[])?,
         "glAlphaFunc" => cmd(c, op::ALPHA_FUNC, &[p.u32(c, 1)?, p.u32(c, 2)?], &[])?,
         "glShadeModel" => cmd(c, op::SHADE_MODEL, &[p.u32(c, 1)?], &[])?,
+        "glPushAttrib" => cmd(c, op::PUSH_ATTRIB, &[p.u32(c, 1)?], &[])?,
+        "glPopAttrib" => cmd(c, op::POP_ATTRIB, &[], &[])?,
         "glBegin" => cmd(c, op::BEGIN, &[p.u32(c, 1)?], &[])?,
         "glEnd" => cmd(c, op::END, &[], &[])?,
         "glVertex3f" => cmd(c, op::VERTEX3F, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?], &[])?,
@@ -1193,6 +1177,23 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
         "glUniform3f" => cmd(c, op::UNIFORM_3F, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?, p.u32(c, 4)?], &[])?,
         "glUniform4f" => {
             cmd(c, op::UNIFORM_4F, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?, p.u32(c, 4)?, p.u32(c, 5)?], &[])?
+        }
+        "glUniform1fv" | "glUniform2fv" | "glUniform3fv" | "glUniform4fv" | "glUniform1iv" | "glUniform2iv"
+        | "glUniform3iv" | "glUniform4iv" => {
+            let (loc, count, v) = (p.u32(c, 1)?, p.i32(c, 2)?, p.ptr(c, 3)?);
+            let n: usize = name[9..10].parse().unwrap_or(1);
+            let data = c.g.bytes(v, 4 * n * count.max(0) as usize)?;
+            let opcode = match &name[9..] {
+                "1fv" => op::UNIFORM_1FV,
+                "2fv" => op::UNIFORM_2FV,
+                "3fv" => op::UNIFORM_3FV,
+                "4fv" => op::UNIFORM_4FV,
+                "1iv" => op::UNIFORM_1IV,
+                "2iv" => op::UNIFORM_2IV,
+                "3iv" => op::UNIFORM_3IV,
+                _ => op::UNIFORM_4IV,
+            };
+            cmd_blob(c, opcode, &[loc, count as u32], &data)?;
         }
         "glUniformMatrix4fv" => {
             let (loc, count, transpose, v) = (p.u32(c, 1)?, p.i32(c, 2)?, p.u8(c, 3)?, p.ptr(c, 4)?);

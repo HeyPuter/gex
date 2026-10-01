@@ -18,6 +18,7 @@
 //! way.
 
 pub mod boot;
+pub mod display;
 pub mod file;
 pub mod gdi;
 pub mod layout;
@@ -382,6 +383,10 @@ pub struct Process {
     pub gdi: Mutex<gdi::Gdi>,
     /// opengl32's Unix side: contexts and the GL command ring.
     pub gl: Mutex<opengl::State>,
+    /// SwapBuffers calls so far (GEX_NT_STATS).
+    pub presents: AtomicU64,
+    /// Where top-level windows are shown, if anywhere (§6a.1).
+    pub display_host: Mutex<Option<Arc<dyn display::NtDisplay>>>,
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
@@ -399,6 +404,8 @@ pub struct State {
     /// Images mapped so far, by base, for `MemoryWineLoadUnixLib` and
     /// `NtQueryVirtualMemory(MemoryImageInformation)`.
     pub images: std::collections::BTreeMap<u64, section::ImageView>,
+    /// Writable views of file-backed sections, by base, to write back.
+    pub file_views: std::collections::BTreeMap<u64, section::FileView>,
 }
 
 /// Where per-thread wait words live (docs/nt-layer.md §1.2).
@@ -431,6 +438,7 @@ impl Process {
                 handles: object::Handles::default(),
                 vm: vm::Vm::new(),
                 images: Default::default(),
+                file_views: Default::default(),
             }),
             threads: RwLock::new(Threads::default()),
             sync: Mutex::new(sync::SyncCore::default()),
@@ -448,6 +456,8 @@ impl Process {
             user: Mutex::new(user::User::new()),
             gdi: Mutex::new(Default::default()),
             gl: Mutex::new(Default::default()),
+            display_host: Mutex::new(None),
+            presents: AtomicU64::new(0),
             kill_list: Mutex::new(Vec::new()),
         }
     }
@@ -463,6 +473,11 @@ impl Process {
             }
             _ => format!("{addr:#x}"),
         }
+    }
+
+    /// The display, if the host gave the process one.
+    pub fn display(&self) -> Option<Arc<dyn display::NtDisplay>> {
+        self.display_host.lock().unwrap().clone()
     }
 
     pub fn new_sync_id(&self) -> u64 {
@@ -766,6 +781,8 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtMapViewOfSection => section::nt_map_view_of_section(c),
         n::NtMapViewOfSectionEx => section::nt_map_view_of_section_ex(c),
         n::NtUnmapViewOfSection => section::nt_unmap_view_of_section(c),
+        n::NtFlushVirtualMemory => section::nt_flush_virtual_memory(c),
+        n::NtNotifyChangeDirectoryFile => file::nt_notify_change_directory_file(c),
         n::NtUnmapViewOfSectionEx => section::nt_unmap_view_of_section_ex(c),
         n::NtQuerySection => section::nt_query_section(c),
         // -- objects ---------------------------------------------------------

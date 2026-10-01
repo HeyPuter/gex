@@ -18,6 +18,7 @@ pub const BUFFER_OVERFLOW: u32 = 0x8000_0005;
 pub const NO_MORE_FILES: u32 = 0x8000_0006;
 pub const NO_MORE_ENTRIES: u32 = 0x8000_001a;
 pub const UNSUCCESSFUL: u32 = 0xc000_0001;
+pub const DISK_FULL: u32 = 0xc000_007f;
 pub const NOT_IMPLEMENTED: u32 = 0xc000_0002;
 pub const INVALID_INFO_CLASS: u32 = 0xc000_0003;
 pub const INFO_LENGTH_MISMATCH: u32 = 0xc000_0004;
