@@ -359,6 +359,21 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     })
 }
 
+/// The memcpy/memmove/memset/mempcpy definitions in `image`'s own text, by
+/// address (`Symbol::value` is already biased), for `Options::intrinsics`:
+/// a plain build and `gexc run` serve them with the host builtins, as closure
+/// builds and the browser's runtime translator do, so every path agrees on
+/// what those functions are.
+fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
+    let (tlo, thi) = image.text_range;
+    image
+        .symbols
+        .iter()
+        .filter(|s| !s.ifunc && s.value >= tlo && s.value < thi)
+        .filter_map(|s| gex_xlate::intrinsic::recognise(&s.name).map(|k| (s.value, k)))
+        .collect()
+}
+
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
@@ -381,6 +396,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         std::fs::read(host).ok()
     })
     .with_context(|| format!("loading {}", ra.path))?;
+    ra.xlate.intrinsics = image_intrinsics(&program.exe);
+    if let Some(i) = &program.interp {
+        ra.xlate.intrinsics.extend(image_intrinsics(i));
+    }
 
     // argv[0] is the path as invoked, then whatever followed. Under a sysroot
     // that host path may mean nothing to the guest, so it can be overridden.
@@ -593,6 +612,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             exhaustive,
             shared_memory,
             cgen,
+            intrinsics: image_intrinsics(&image),
             ..Options::default()
         },
     );
