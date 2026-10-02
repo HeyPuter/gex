@@ -6,9 +6,11 @@
 //!   (everything in it but the runtime translator's `lib.rs` and the
 //!   profile and validation code), gex-abi, and gex-ld (placing the image);
 //! * `GEX_CGEN_UNIT_INPUTS`: what decides the C and the module from a
-//!   recovery -- this crate (and its runtime) and gex-abi. What the C embeds
-//!   from elsewhere (gex-emit's constants) is pinned by `UNIT_ABI_VERSION`
-//!   and its test, not hashed, so a tier-1 change does not invalidate units.
+//!   recovery -- this crate (and its runtime). What the C takes from gex-abi
+//!   is hashed at run time (`image::abi_fingerprint`: the header and every
+//!   value formatted into C directly), and what it embeds from gex-emit is
+//!   pinned by `UNIT_ABI_VERSION`, so neither a tier-1 change nor an
+//!   unrelated gex-abi change invalidates units.
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -55,8 +57,11 @@ fn main() {
     rec.extend(src("gex-xlate").into_iter().filter(|p| {
         !matches!(p.file_name().and_then(|n| n.to_str()), Some("lib.rs" | "profile.rs" | "validate.rs"))
     }));
-    let mut unit = src("gex-cgen");
-    unit.extend(src("gex-abi"));
+    // gex-abi is not hashed here: what the C takes from it is the generated
+    // header and the values `image::abi_fingerprint` lists, which the unit
+    // key hashes at run time.
+    let unit = src("gex-cgen");
+    let mut unit = unit;
     let rt = here.join("runtime");
     println!("cargo:rerun-if-changed={}", rt.display());
     walk(&rt, &mut unit);

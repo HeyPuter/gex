@@ -272,7 +272,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     });
                     let nest_exits = GuestMem::new(memory.bytes()).read_u64(gex_abi::NEST_EXITS).unwrap_or(0);
                     let leaves = crate::CGEN_LEAVES.load(std::sync::atomic::Ordering::Relaxed);
-                    let cg = format!("cgen nest_exits={nest_exits} leaves={leaves}");
+                    let co = crate::CALLOUTS.load(std::sync::atomic::Ordering::Relaxed);
+                    let coa = crate::CALLOUT_ABORTS.load(std::sync::atomic::Ordering::Relaxed);
+                    let cg = format!("cgen nest_exits={nest_exits} leaves={leaves} callouts={co} callout_aborts={coa}");
                     match value {
                         Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
                         None => eprintln!("gex-nt: stats t={} presents={presents} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
@@ -507,8 +509,12 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
     let ctx_addr = caller.data().thread.ctx_addr;
     let thread = p.thread_by_ctx(ctx_addr).ok_or_else(|| anyhow!("a callback on a thread the NT layer does not know"))?;
     let mut pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    let mut next: Option<wasmtime::Func> = None;
     loop {
-        let result = enter.call(&mut *caller, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut []);
+        let result = match next.take() {
+            Some(f) => f.call(&mut *caller, &[Val::I32(ctx_addr as i32)], &mut []),
+            None => enter.call(&mut *caller, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut []),
+        };
         if let Some(child) = caller.data_mut().pending_spawn.take() {
             let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
             start_guest_thread(cx, child)?;
@@ -517,6 +523,22 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
             Ok(()) => bail!("guest code returned out of a user-mode callback"),
             Err(e) => e,
         };
+        // A function-tier call-out further out watches a dispatch slot this
+        // callback's code reached: something else that uses the slot runs
+        // what it held; its own return (which a deeper frame cannot make)
+        // goes back to the call-out's loop.
+        if let Some(sig) = caller.data_mut().callout_signal.take() {
+            match sig {
+                crate::CalloutSignal::Bypass(f) => {
+                    next = Some(f);
+                    continue;
+                }
+                other => {
+                    caller.data_mut().callout_signal = Some(other);
+                    return Err(e);
+                }
+            }
+        }
         if thread.callback_result.lock().unwrap().is_some() {
             return Ok(());
         }

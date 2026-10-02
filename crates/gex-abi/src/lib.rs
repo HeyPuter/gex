@@ -566,11 +566,16 @@ pub const PATCHED_PAGES_BYTES: u64 = DISPATCH_MAX_PAGES / 8;
 /// `GEX_NT_STATS`'s leaves per second.
 pub const NEST_EXITS: u64 = RESERVED_END - 256;
 
-/// How many slots of the function tier's body table every store has (a
-/// `u32`, the smallest over the process's stores): compiled code's indirect
-/// call leaves for a slot at or above it rather than index past a table a
-/// lagging store has not grown yet.
-pub const BODY_LIMIT: u64 = RESERVED_END - 264;
+/// How many slots each of the function tier's body tables has in every store
+/// (`[u32; DISPATCH_TABLES]`: body table `t` mirrors dispatch table `t`; each
+/// word the smallest over the process's stores): a unit's indirect call
+/// leaves for a slot at or above it rather than index past a table a lagging
+/// store has not grown yet.
+pub const BODY_LIMITS: u64 = RESERVED_END - 320;
+
+/// Body table 0's limit (`BODY_LIMITS[0]`), the name the browser shim used
+/// first.
+pub const BODY_LIMIT: u64 = BODY_LIMITS;
 
 /// Where the thread contexts must end: the runtime's fixed words
 /// ([`PATCHED_PAGES`] up to [`RESERVED_END`]) start here.
@@ -607,6 +612,15 @@ pub mod imports {
     /// Signature `(ctx: i32, pc: i64) -> i32`, returning the dispatch-table
     /// index to re-enter. In M0 this always traps; from M3 it drives gex-jit.
     pub const DISPATCH_MISS: &str = "dispatch_miss";
+
+    /// The function tier calling code it does not hold (docs/function-tier.md
+    /// §7.3). Signature `(ctx: i32, target: i64, ret: i64, sp_want: i64) ->
+    /// i32`: everything is written back and `ctx::PC = target`; the host runs
+    /// the guest from there until it returns to `ret` with the stack pointer
+    /// back at `sp_want` (or above it by what a callee popped) and returns 1,
+    /// the caller then carrying on; or returns 0 when it cannot (nested too
+    /// deep, the stack unwound past the caller), and the caller leaves.
+    pub const CALL_OUT: &str = "call_out";
 
     /// A decoded-but-unimplemented or architecturally undefined instruction.
     /// Signature `(ctx: i32, pc: i64, raw: i32) -> ()`. Raises SIGILL.
@@ -836,7 +850,8 @@ mod tests {
         assert!(DISPATCH_DIR_END <= EXEC_BASE);
         // The fixed runtime words above the contexts do not overlap.
         assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= NEST_EXITS);
-        assert!(BODY_LIMIT + 4 <= NEST_EXITS);
+        assert!(BODY_LIMITS + 4 * DISPATCH_TABLES as u64 <= NEST_EXITS);
+        assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= BODY_LIMITS);
         assert!(NEST_EXITS + 8 <= SPLIT_LOCK);
         assert!(NEST_EXITS + 8 <= BOOT_STACK_COUNTER && BOOT_STACK_COUNTER + 8 <= SPLIT_LOCK);
         assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= BODY_LIMIT);
