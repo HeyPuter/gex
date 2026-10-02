@@ -758,6 +758,13 @@ pub mod cache_op {
     /// in the runtime's own memory, at the address given. The host raises
     /// an access violation (NT) or SIGSEGV (Linux) and does not return.
     pub const LOW_ACCESS: i32 = 11;
+    /// Not a cache operation: the block at `pc` failed its page check (its
+    /// pages are no longer numbered as when it was translated), and `addr` is
+    /// the id of the module it belongs to (`TranslatedModule::module_id`).
+    /// The host translates `pc` again if that module still provides it --
+    /// otherwise dispatch already reaches a newer translation -- and the
+    /// block then dispatches.
+    pub const PAGE_STALE: i32 = 12;
 }
 
 /// The lowest address a guest access may name: below it are the runtime's

@@ -253,6 +253,27 @@ pub fn load_or_compile(
     })
 }
 
+/// A compiled module kept at `path` (no eviction: for large, long-lived
+/// modules such as a function-tier unit, which the shared cache's budget
+/// would evict at once), compiled from `wasm` when absent or unusable.
+pub fn load_or_compile_at(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<Module> {
+    if let Ok(bytes) = std::fs::read(path) {
+        // SAFETY: as for `load_or_compile`: written by `serialize` below, and
+        // `deserialize` rejects an artifact for another engine.
+        match unsafe { Module::deserialize(engine, &bytes) } {
+            Ok(m) => return Ok(m),
+            Err(_) => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let m = Module::new(engine, wasm).context("validating the module")?;
+    if let (Ok(bytes), Some(dir)) = (m.serialize(), path.parent()) {
+        store(dir, path, &bytes);
+    }
+    Ok(m)
+}
+
 /// Write an artifact, atomically enough that a concurrent reader never sees a
 /// partial file: write to a unique name in the same directory, then rename.
 fn store(dir: &Path, path: &Path, bytes: &[u8]) {
