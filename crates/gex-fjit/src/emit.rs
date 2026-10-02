@@ -9,7 +9,7 @@
 use crate::cfg::{self, Graph, Shape};
 use gex_abi::ctx;
 use gex_cgen::func::{self as cf, Loop};
-use gex_emit::tier1::fmode::FnBody;
+use gex_emit::tier1::fmode::{FnBody, Operand};
 use gex_emit::tier1::Context;
 use gex_emit::wasm::ValType;
 use gex_ir::func::{Callee, FTerm, Function, RegSet, Summary};
@@ -55,6 +55,8 @@ pub struct Stats {
     pub loops_outlined: usize,
     pub returns: usize,
     pub irreducible: usize,
+    /// Left to tier-1 (a loop function that would not structure).
+    pub dropped: usize,
     pub code_bytes: usize,
 }
 
@@ -71,6 +73,7 @@ impl Stats {
         self.loops_outlined += o.loops_outlined;
         self.returns += o.returns;
         self.irreducible += o.irreducible;
+        self.dropped += o.dropped;
         self.code_bytes += o.code_bytes;
     }
 }
@@ -95,7 +98,7 @@ fn flags() -> RegSet {
 }
 
 /// Emit `f` (memory form, verified, `loops` = `outer_loops(f)` when
-/// outlining). `None` when its CFG is irreducible: it stays tier-1.
+/// outlining). `None` when a loop function's CFG is irreducible.
 pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -> Option<Emitted> {
     let n = f.blocks.len();
     // The body's graph: the blocks, then one handover node per outlined
@@ -109,7 +112,30 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         }
         succs.push(lp.exits.iter().copied().collect());
     }
-    let shape = cfg::shape(&Graph { succs, entry: 0 })?;
+    let graph = Graph { succs: succs.clone(), entry: 0 };
+    let mut layout = match cfg::make_reducible(graph) {
+        Some(fx) => {
+            if !fx.dispatch.is_empty() {
+                stats.irreducible += 1;
+            }
+            Layout::Structured(Box::new(fx))
+        }
+        None => {
+            // Not even that: one `loop` over a `br_table` of every block, a
+            // branch setting the arm (tier-1's region form).
+            stats.dropped += 1;
+            if std::env::var_os("GEX_FJIT_STATS").is_some() {
+                eprintln!("[fjit] {:#x}{}: irreducible, laid out flat", f.entry, f.name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default());
+            }
+            let graph = Graph { succs, entry: 0 };
+            let mut arm = vec![u32::MAX; graph.succs.len()];
+            let order = cfg::rpo(&graph);
+            for (k, &x) in order.iter().enumerate() {
+                arm[x] = k as u32;
+            }
+            Layout::Flat { arm, order, idx: 0 }
+        }
+    };
     let regs = cf::registers(f);
     let live = if cf::live_writebacks() { cf::live_in(f, m.sums) } else { vec![RegSet::ALL; n] };
     let dirty: Vec<RegSet> = if cf::clean_spills() {
@@ -151,23 +177,27 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     b.f().local_set(sp0);
     b.f().i32_const(cf::LOOP_POLL);
     b.f().local_set(poll);
+    if let Layout::Flat { idx, .. } = &mut layout {
+        *idx = b.local(ValType::I32);
+    }
+    let sel = b.local(ValType::I32);
     let mut e = E {
         m,
         f,
         b,
-        shape,
+        layout,
         labels: Vec::new(),
         live: &live,
         dirty,
         weight,
-        locals: Locals { sp0, poll, hot, lr, rk },
+        locals: Locals { sp0, poll, hot, lr, rk, sel },
         mode: Mode::Body { loops },
         n_blocks: n,
         stats,
     };
     e.stats.functions += 1;
     e.stats.blocks += f.blocks.iter().filter(|b| !b.synthetic).count();
-    e.tree(0);
+    e.top(0);
     e.b.f().unreachable();
     let body = e.b.finish();
     e.stats.code_bytes += body.len() + lfns.iter().map(|l| l.len()).sum::<usize>();
@@ -193,7 +223,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     let succs: Vec<Vec<usize>> = (0..n)
         .map(|i| if in_loop(i) { f.blocks[i].succs().iter().map(|s| s.index()).filter(|&s| in_loop(s)).collect() } else { Vec::new() })
         .collect();
-    let shape = cfg::shape(&Graph { succs, entry: lp.header })?;
+    let shape = Layout::Structured(Box::new(cfg::make_reducible(Graph { succs, entry: lp.header })?));
     let regs = cf::registers_in(f, &in_loop);
     let dirty: Vec<RegSet> = if cf::clean_spills() {
         cf::dirty_in_from(f, lp.header, &in_loop)
@@ -210,6 +240,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     let hot = b.local(ValType::I32);
     let lr = b.local(ValType::I32);
     let rk = b.local(ValType::I32);
+    let sel = b.local(ValType::I32);
     b.load(&used);
     b.f().i32_const(cf::LOOP_POLL);
     b.f().local_set(poll);
@@ -217,17 +248,17 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
         m,
         f,
         b,
-        shape,
+        layout: shape,
         labels: Vec::new(),
         live,
         dirty,
         weight,
-        locals: Locals { sp0: 4, poll, hot, lr, rk },
+        locals: Locals { sp0: 4, poll, hot, lr, rk, sel },
         mode: Mode::Loop { lp },
         n_blocks: n,
         stats,
     };
-    e.tree(lp.header);
+    e.top(lp.header);
     e.b.f().unreachable();
     Some(e.b.finish())
 }
@@ -238,6 +269,8 @@ struct Locals {
     hot: u32,
     lr: u32,
     rk: u32,
+    /// A dispatch node's selector (`cfg::make_reducible`).
+    sel: u32,
 }
 
 enum Mode<'f> {
@@ -252,15 +285,27 @@ enum Label {
     Loop(usize),
     /// A `block` whose end is followed by this node.
     Follow(usize),
+    /// The `loop` around a flat layout's `br_table`.
+    Dispatch,
     /// Anything else (`if`, a switch's case blocks, a do-while).
     Other,
+}
+
+/// How a function's blocks are laid out.
+enum Layout {
+    /// Ramsey's structure (`cfg`): every branch a `br`, but into an
+    /// irreducible region's entries, which go through its dispatch node.
+    Structured(Box<cfg::Fixed>),
+    /// An irreducible CFG: a `loop` whose `br_table` picks the next block,
+    /// `arm[x]` being block `x`'s arm and `idx` the local holding it.
+    Flat { arm: Vec<u32>, order: Vec<usize>, idx: u32 },
 }
 
 struct E<'m, 'a> {
     m: &'m ModuleCx<'a>,
     f: &'m Function,
     b: FnBody<'a>,
-    shape: Shape,
+    layout: Layout,
     labels: Vec<Label>,
     live: &'m [RegSet],
     dirty: Vec<RegSet>,
@@ -274,9 +319,55 @@ struct E<'m, 'a> {
 impl E<'_, '_> {
     // -- structure ---------------------------------------------------------
 
+    fn shape(&self) -> &Shape {
+        match &self.layout {
+            Layout::Structured(s) => &s.shape,
+            Layout::Flat { .. } => unreachable!("a flat layout has no shape"),
+        }
+    }
+
+    /// The whole function from `entry`.
+    fn top(&mut self, entry: usize) {
+        let Layout::Flat { arm, order, idx } = &self.layout else {
+            let Layout::Structured(fx) = &self.layout else { unreachable!() };
+            let (start, root) = (fx.start, fx.graph.entry);
+            if let Some(k) = start {
+                // The entry is an irreducible region's: through its dispatch.
+                let sel = self.locals.sel;
+                self.b.f().i32_const(k as i32);
+                self.b.f().local_set(sel);
+            }
+            let _ = entry;
+            self.tree(root);
+            return;
+        };
+        let (order, idx) = (order.clone(), *idx);
+        let n = order.len() as u32;
+        let fb = self.b.f();
+        fb.i32_const(arm[entry] as i32);
+        fb.local_set(idx);
+        fb.loop_void();
+        self.labels.push(Label::Dispatch);
+        for _ in 0..n {
+            self.b.f().block_void();
+            self.labels.push(Label::Other);
+        }
+        let fb = self.b.f();
+        fb.local_get(idx);
+        let targets: Vec<u32> = (0..n).collect();
+        fb.br_table(&targets, 0);
+        // Arm k's code follows the end of the k-th block out.
+        for &x in &order {
+            self.close();
+            self.node(x);
+        }
+        self.labels.pop();
+        self.b.f().end();
+    }
+
     fn tree(&mut self, x: usize) {
-        let ys = self.shape.merge_children[x].clone();
-        if self.shape.loop_header[x] {
+        let ys = self.shape().merge_children[x].clone();
+        if self.shape().loop_header[x] {
             self.b.f().loop_void();
             self.labels.push(Label::Loop(x));
             self.within(x, &ys);
@@ -308,10 +399,28 @@ impl E<'_, '_> {
 
     /// Transfer from node `x` to node `y`: a `br`, or `y`'s code inline.
     fn go(&mut self, x: usize, y: usize) {
-        if self.shape.backward(x, y) {
+        if let Layout::Flat { arm, idx, .. } = &self.layout {
+            let (a, idx) = (arm[y], *idx);
+            let d = self.depth(Label::Dispatch);
+            let fb = self.b.f();
+            fb.i32_const(a as i32);
+            fb.local_set(idx);
+            fb.br(d);
+            return;
+        }
+        if let Layout::Structured(fx) = &self.layout {
+            if let Some(&(d, k)) = fx.redirect.get(&(x, y)) {
+                let sel = self.locals.sel;
+                self.b.f().i32_const(k as i32);
+                self.b.f().local_set(sel);
+                self.go(x, d);
+                return;
+            }
+        }
+        if self.shape().backward(x, y) {
             let d = self.depth(Label::Loop(y));
             self.b.f().br(d);
-        } else if self.shape.merge[y] {
+        } else if self.shape().merge[y] {
             let d = self.depth(Label::Follow(y));
             self.b.f().br(d);
         } else {
@@ -321,7 +430,14 @@ impl E<'_, '_> {
 
     fn node(&mut self, x: usize) {
         if x >= self.n_blocks {
-            self.handover(x - self.n_blocks);
+            let entries = match &self.layout {
+                Layout::Structured(fx) => fx.dispatch.iter().find(|d| d.node == x).map(|d| d.entries.clone()),
+                Layout::Flat { .. } => None,
+            };
+            match entries {
+                Some(es) => self.dispatch(x, &es),
+                None => self.handover(x - self.n_blocks),
+            }
             return;
         }
         let f = self.f;
@@ -330,8 +446,13 @@ impl E<'_, '_> {
         let mut keep: Vec<Value> = Vec::new();
         blk.term.for_each_use(|v| keep.push(v));
         self.b.block(blk.start, &blk.stmts, &keep);
-        self.term(x);
-        self.b.release(&keep);
+        // A terminator has at most one value; it outlives the block's
+        // numbering, which code inlined into the terminator reuses.
+        let op = keep.first().map(|&v| self.b.operand(v));
+        self.term(x, op);
+        if let Some(o) = op {
+            self.b.release_operand(o);
+        }
     }
 
     // -- edges ---------------------------------------------------------------
@@ -377,9 +498,11 @@ impl E<'_, '_> {
         if backward_addr(self.f, i, t) {
             return false;
         }
-        match self.mode {
-            Mode::Loop { lp, .. } if !lp.body.contains(&t) => false,
-            _ => self.shape.branched(i, t),
+        match (&self.layout, &self.mode) {
+            (Layout::Flat { .. }, _) => false,
+            (Layout::Structured(fx), _) if fx.redirect.contains_key(&(i, t)) => false,
+            (_, Mode::Loop { lp, .. }) if !lp.body.contains(&t) => false,
+            _ => self.shape().branched(i, t),
         }
     }
 
@@ -469,6 +592,24 @@ impl E<'_, '_> {
         self.go(i, t);
     }
 
+    /// A dispatch node: `br_table` on the selector to the region's entries.
+    fn dispatch(&mut self, x: usize, entries: &[usize]) {
+        let k = entries.len() as u32;
+        for _ in 0..k {
+            self.b.f().block_void();
+            self.labels.push(Label::Other);
+        }
+        let sel = self.locals.sel;
+        let fb = self.b.f();
+        fb.local_get(sel);
+        let targets: Vec<u32> = (0..k).collect();
+        fb.br_table(&targets, k - 1);
+        for &e in entries {
+            self.close();
+            self.go(x, e);
+        }
+    }
+
     /// Loop `k`'s handover node in the body: run the loop function chunk by
     /// chunk, then carry on where it left, or return as it did.
     fn handover(&mut self, k: usize) {
@@ -523,16 +664,16 @@ impl E<'_, '_> {
         self.b.f().ret();
     }
 
-    fn leave_value(&mut self, v: Value) {
+    fn leave_value(&mut self, v: Operand) {
         self.b.flush(RegSet::ALL, false);
         self.store_pc_value(v);
         self.b.f().i32_const(0);
         self.b.f().ret();
     }
 
-    fn store_pc_value(&mut self, v: Value) {
+    fn store_pc_value(&mut self, v: Operand) {
         self.b.f().local_get(0);
-        self.b.push(v);
+        self.b.push_operand(v);
         self.b.f().store(0x37, 3, ctx::PC as u32);
     }
 
@@ -567,26 +708,28 @@ impl E<'_, '_> {
         fb.byte(0x6a); // i32.add
     }
 
-    fn term(&mut self, i: usize) {
+    fn term(&mut self, i: usize, op: Option<Operand>) {
         let f = self.f;
         let blk = &f.blocks[i];
+        let val = || op.expect("the terminator's value");
         match &blk.term {
             FTerm::Jump(e) => self.edge(i, e.to.index()),
-            FTerm::Branch { cond, taken, not_taken } => {
+            FTerm::Branch { taken, not_taken, .. } => {
                 let (t, nt) = (taken.to.index(), not_taken.to.index());
+                let cond = val();
                 if self.plain_br(i, t) {
-                    self.b.push(*cond);
+                    self.b.push_operand(cond);
                     let d = self.br_depth(i, t);
                     self.b.f().br_if(d);
                     self.edge(i, nt);
                 } else if self.plain_br(i, nt) {
-                    self.b.push(*cond);
+                    self.b.push_operand(cond);
                     self.b.f().byte(0x45); // i32.eqz
                     let d = self.br_depth(i, nt);
                     self.b.f().br_if(d);
                     self.edge(i, t);
                 } else {
-                    self.b.push(*cond);
+                    self.b.push_operand(cond);
                     self.b.f().if_void();
                     self.labels.push(Label::Other);
                     self.edge(i, t);
@@ -595,12 +738,12 @@ impl E<'_, '_> {
                     self.close();
                 }
             }
-            FTerm::Switch { target, cases, .. } => {
+            FTerm::Switch { cases, .. } => {
                 self.stats.switches += 1;
-                self.switch(i, *target, cases.iter().map(|(a, e)| (*a, e.to.index())).collect());
-                self.leave_value(*target);
+                self.switch(i, val(), cases.iter().map(|(a, e)| (*a, e.to.index())).collect());
+                self.leave_value(val());
             }
-            FTerm::Call { callee, ret_pc, ret } => self.call(i, *callee, *ret_pc, ret.as_ref().map(|e| e.to.index())),
+            FTerm::Call { callee, ret_pc, ret } => self.call(i, *callee, op, *ret_pc, ret.as_ref().map(|e| e.to.index())),
             FTerm::TailCall { callee } => match callee {
                 Callee::Direct(t) if self.m.bodies.contains_key(t) => {
                     self.stats.tail_known += 1;
@@ -628,9 +771,9 @@ impl E<'_, '_> {
                     self.stats.calls_leaving += 1;
                     self.leave_const(*t)
                 }
-                Callee::Indirect(v) => self.leave_value(*v),
+                Callee::Indirect(_) => self.leave_value(val()),
             },
-            FTerm::Return { target } => {
+            FTerm::Return { .. } => {
                 self.stats.returns += 1;
                 // The return the caller expects: write back what its
                 // continuation may read and report success; anything else
@@ -639,7 +782,7 @@ impl E<'_, '_> {
                 if cf::mutate("NORETCHECK") {
                     self.b.f().i32_const(1);
                 } else {
-                    self.b.push(*target);
+                    self.b.push_operand(val());
                     let fb = self.b.f();
                     fb.local_get(3);
                     fb.byte(0x51); // i64.eq
@@ -662,9 +805,9 @@ impl E<'_, '_> {
                 self.b.f().i32_const(1);
                 self.b.f().ret();
                 self.b.f().end();
-                self.leave_value(*target);
+                self.leave_value(val());
             }
-            FTerm::Unresolved { target } => self.leave_value(*target),
+            FTerm::Unresolved { .. } => self.leave_value(val()),
             FTerm::Syscall { next_pc, next } => {
                 self.b.flush(RegSet::ALL, false);
                 self.b.store_pc(*next_pc);
@@ -697,7 +840,7 @@ impl E<'_, '_> {
     }
 
     fn br_depth(&self, i: usize, t: usize) -> u32 {
-        if self.shape.backward(i, t) {
+        if self.shape().backward(i, t) {
             self.depth(Label::Loop(t))
         } else {
             self.depth(Label::Follow(t))
@@ -706,13 +849,13 @@ impl E<'_, '_> {
 
     /// A jump table's cases; the default (falling out) is the caller's.
     /// Dense tables become a `br_table`, others a chain of compares.
-    fn switch(&mut self, i: usize, target: Value, cases: Vec<(u64, usize)>) {
+    fn switch(&mut self, i: usize, target: Operand, cases: Vec<(u64, usize)>) {
         let shift = gex_abi::INST_ALIGN_SHIFT;
         let (lo, hi) = (cases.first().map(|c| c.0).unwrap_or(0), cases.last().map(|c| c.0).unwrap_or(0));
         let span = ((hi - lo) >> shift) + 1;
         if cases.len() < 4 || span > 4 * cases.len() as u64 + 16 {
             for (a, t) in cases {
-                self.b.push(target);
+                self.b.push_operand(target);
                 let fb = self.b.f();
                 fb.i64_const(a as i64);
                 fb.byte(0x51); // i64.eq
@@ -739,7 +882,7 @@ impl E<'_, '_> {
             self.labels.push(Label::Other);
         }
         // Inside the innermost block group k is at depth k, the default at g.
-        self.b.push(target);
+        self.b.push_operand(target);
         let fb = self.b.f();
         fb.i64_const(lo as i64);
         fb.byte(0x7d); // i64.sub
@@ -772,7 +915,7 @@ impl E<'_, '_> {
         self.close();
     }
 
-    fn call(&mut self, i: usize, callee: Callee, ret_pc: u64, ret: Option<usize>) {
+    fn call(&mut self, i: usize, callee: Callee, op: Option<Operand>, ret_pc: u64, ret: Option<usize>) {
         let m = self.m;
         let live = self.live;
         // A known callee with a summary needs its inputs, the continuation
@@ -840,11 +983,12 @@ impl E<'_, '_> {
                 self.b.f().ret();
                 return;
             }
-            Callee::Indirect(v) => {
+            Callee::Indirect(_) => {
                 self.stats.calls_indirect += 1;
+                let v = op.expect("an indirect call's target");
                 let rk = self.locals.rk;
                 self.b.f().local_get(0);
-                self.b.push(v);
+                self.b.push_operand(v);
                 self.depth_plus(w + cf::CALL_KNOWN_WEIGHT);
                 let fb = self.b.f();
                 fb.i32_const(need_back);

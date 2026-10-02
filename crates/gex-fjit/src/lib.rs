@@ -22,6 +22,7 @@
 pub mod cfg;
 pub mod emit;
 pub mod module;
+pub mod prep;
 
 use anyhow::{Context as _, Result};
 use gex_ir::func::{Function, Summary};
@@ -48,7 +49,10 @@ pub fn build(
     let guarded = gex_cgen::guarded_pages(&refs);
     let intrinsics: HashSet<u64> = intrinsics.iter().copied().collect();
     let ib: HashMap<u64, &Block> = refs.iter().filter(|b| intrinsics.contains(&b.start)).map(|b| (b.start, *b)).collect();
-    let funcs = gex_cgen::select(functions, &ib, &guarded)?;
+    let mut funcs = gex_cgen::select(functions, &ib, &guarded)?;
+    for f in &mut funcs {
+        prep::prepare(f, summaries);
+    }
     let mut stats = Stats::default();
     let (jwasm, entries) = module::build_module(&funcs, summaries, class32, &mut stats)?;
     let emitted = started.elapsed();
@@ -59,10 +63,11 @@ pub fn build(
     if std::env::var_os("GEX_FJIT_STATS").is_some() {
         let n = stats.functions.max(1);
         eprintln!(
-            "[fjit] {} functions ({} irreducible, left to tier-1), {} blocks, {} loops outlined; calls: {} known \
+            "[fjit] {} functions ({} irreducible, {} left to tier-1), {} blocks, {} loops outlined; calls: {} known \
              ({} to trap-free), {} indirect, {} leaving; {} known tail calls, {} switches, {} returns",
             stats.functions,
             stats.irreducible,
+            stats.dropped,
             stats.blocks,
             stats.loops_outlined,
             stats.calls_known,

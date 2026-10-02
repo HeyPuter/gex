@@ -190,6 +190,8 @@ run options:
   --no-jit        no runtime translation; implies --exhaustive
   --cgen          the function tier: compile the program's blocks as C with
                   clang (needs clang and wasm-ld; docs/function-tier.md)
+  --fjit          the function JIT: the program's recovered functions as
+                  wasm, emitted directly (docs/merge-plan.md §9.8)
   --lazy          discover only from the entry point, leaving the rest to
                   runtime translation; much faster to start on a big binary
   --no-cache      do not reuse compiled modules between runs
@@ -235,6 +237,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut no_jit = false;
     let mut lazy = false;
     let mut cgen = false;
+    let mut fjit = false;
     let mut no_cgen = false;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
@@ -311,6 +314,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--no-jit" => no_jit = true,
             "--lazy" => lazy = true,
             "--cgen" => cgen = true,
+            "--fjit" => fjit = true,
             "--no-cgen" => no_cgen = true,
             "--no-cache" => opts.cache = false,
             "--cwd" => {
@@ -355,7 +359,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     }
     // The function tier's C code carries no profiling instrumentation: a
     // recorded run would lose every count in it without a word.
-    if cgen && opts.record.is_some() {
+    if (cgen || fjit) && opts.record.is_some() {
         bail!(
             "--cgen cannot be combined with --record or GEX_PROFILE=1: the function tier's \
              C code is not instrumented, so the profile would silently miss everything it runs \
@@ -371,6 +375,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             exhaustive: exhaustive || no_jit,
             lazy: lazy && !no_jit,
             cgen,
+            fjit,
             ..Options::default()
         },
         jit: !no_jit,
@@ -618,6 +623,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let mut sysroot: Option<String> = None;
     let mut profile: Vec<u64> = Vec::new();
     let mut cgen = false;
+    let mut fjit = false;
     let mut pe_base: Option<u64> = None;
     let mut functions: Option<Vec<u64>> = None;
     let mut i = 0;
@@ -686,6 +692,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
             // The function tier: the blocks as C, through clang, spliced into
             // the module (docs/function-tier.md).
             "--cgen" => cgen = true,
+            // The function JIT: recovered functions straight to wasm, no
+            // clang (gex-fjit, docs/merge-plan.md §9.8).
+            "--fjit" => fjit = true,
             "--sysroot" => {
                 i += 1;
                 sysroot = Some(args.get(i).context("--sysroot needs a directory")?.clone());
@@ -718,6 +727,9 @@ fn cmd_build(args: &[String]) -> Result<()> {
     let path = path.context("expected an input ELF")?;
     let out = out.unwrap_or_else(|| format!("{path}.wasm"));
 
+    if fjit && (closure || gex_ld::pe::is_pe(&std::fs::read(&path).unwrap_or_default())) {
+        bail!("--fjit builds an ELF image only (closures and PE images: not yet)");
+    }
     if closure {
         if cgen {
             bail!("--cgen does not handle --closure builds yet");
@@ -741,6 +753,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             exhaustive,
             shared_memory,
             cgen,
+            fjit,
             intrinsics: image_intrinsics(&image),
             ..Options::default()
         },

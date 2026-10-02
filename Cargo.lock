@@ -644,6 +644,7 @@ dependencies = [
  "gex-abi",
  "gex-cgen",
  "gex-emit",
+ "gex-fjit",
  "gex-ir",
  "gex-isa",
  "gex-isa-ppc",

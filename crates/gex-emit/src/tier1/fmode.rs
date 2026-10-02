@@ -14,6 +14,13 @@
 use super::*;
 use gex_ir::func::RegSet;
 
+/// A terminator's value, past its block (see [`FnBody::operand`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Operand {
+    Local(u32, Ty),
+    Const(u64, Ty),
+}
+
 /// One function body under construction.
 pub struct FnBody<'a> {
     e: Emitter<'a>,
@@ -117,6 +124,14 @@ impl<'a> FnBody<'a> {
     /// statements, for the terminator, until [`Self::release`].
     pub fn block(&mut self, start: u64, stmts: &[Stmt], keep: &[Value]) {
         self.e.block_start = start;
+        // Values are numbered per block: forget the last block's (a value
+        // nobody read keeps its local, which is only a local lost).
+        for v in self.e.value_local.iter_mut() {
+            *v = None;
+        }
+        for v in self.e.value_const.iter_mut() {
+            *v = None;
+        }
         // Last uses, over the values this block touches only: values are
         // numbered across the function but local to their block.
         let mut touched: Vec<u32> = Vec::new();
@@ -153,22 +168,36 @@ impl<'a> FnBody<'a> {
         }
     }
 
-    /// Free the locals of values kept past [`Self::block`].
-    pub fn release(&mut self, vals: &[Value]) {
-        for v in vals {
-            self.e.release(*v);
+    /// A value kept past [`Self::block`], as something that outlives the
+    /// value numbering (the next block reuses the numbers): its local, or
+    /// its constant. Free it with [`Self::release_operand`].
+    pub fn operand(&mut self, v: Value) -> Operand {
+        let k = v.0 as usize;
+        let ty = self.e.value_ty[k];
+        match self.e.value_local[k].take() {
+            Some(l) => Operand::Local(l, ty),
+            None => Operand::Const(self.e.value_const[k].expect("a kept value has a local or a constant"), ty),
         }
     }
 
-    /// Push a value of the current block.
-    pub fn push(&mut self, v: Value) {
-        self.e.push(v);
+    pub fn push_operand(&mut self, o: Operand) {
+        match o {
+            Operand::Local(l, _) => self.e.f.local_get(l),
+            Operand::Const(c, Ty::I32) => self.e.f.i32_const(c as i32),
+            Operand::Const(c, _) => self.e.f.i64_const(c as i64),
+        }
     }
 
-    /// A value's constant, when it has one.
-    pub fn constant(&self, v: Value) -> Option<u64> {
-        self.e.value_const.get(v.0 as usize).copied().flatten()
+    pub fn release_operand(&mut self, o: Operand) {
+        if let Operand::Local(l, ty) = o {
+            match ty {
+                Ty::I32 => self.e.free_i32.push(l),
+                Ty::I64 => self.e.free_i64.push(l),
+                Ty::V128 => self.e.free_v128.push(l),
+            }
+        }
     }
+
 
     pub fn store_pc(&mut self, pc: u64) {
         self.e.store_pc(pc);

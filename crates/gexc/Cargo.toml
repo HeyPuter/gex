@@ -13,7 +13,7 @@ path = "src/main.rs"
 gex-abi.workspace = true
 gex-ir.workspace = true
 gex-ld.workspace = true
-gex-xlate = { workspace = true, features = ["parallel", "cgen"] }
+gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-emit.workspace = true
 gex-native.workspace = true
 gex-kernel.workspace = true

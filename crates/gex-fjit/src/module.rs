@@ -143,7 +143,12 @@ pub fn build_module(
     for (f, ls) in funcs.iter().zip(&loops) {
         match emit::emit(&mcx, f, ls, stats) {
             Some(e) => emitted.push((f.entry, e)),
-            None => stats.irreducible += 1,
+            None => {
+                stats.dropped += 1;
+                if std::env::var_os("GEX_FJIT_STATS").is_some() {
+                    eprintln!("[fjit] {:#x}{}: a loop function is irreducible; left to tier-1", f.entry, f.name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default());
+                }
+            }
         }
     }
     // A function left out is not ours after all: its callers must leave
@@ -152,10 +157,10 @@ pub fn build_module(
     if emitted.len() != funcs.len() {
         let keep: std::collections::HashSet<u64> = emitted.iter().map(|(a, _)| *a).collect();
         let rest: Vec<Function> = funcs.iter().filter(|f| keep.contains(&f.entry)).cloned().collect();
-        let irreducible = stats.irreducible;
-        *stats = Stats { irreducible, ..Stats::default() };
+        let dropped = stats.dropped;
+        *stats = Stats::default();
         let r = build_module(&rest, sums, class32, stats)?;
-        stats.irreducible = irreducible;
+        stats.dropped = dropped;
         return Ok(r);
     }
     for (entry, e) in emitted {
@@ -170,7 +175,36 @@ pub fn build_module(
     }
     let entries: Vec<(u64, u32)> = funcs.iter().map(|f| (f.entry, bodies[&f.entry])).collect();
     m.define_func(ic, ic_body(&entries));
-    Ok((m.encode(), roots.into_iter().map(|(a, _)| a).collect()))
+    // `GEX_CGEN_NAMES=1`: a name section (the splice carries it over), so an
+    // engine profile (`node --cpu-prof`) says where the time goes.
+    let wasm = if std::env::var_os("GEX_CGEN_NAMES").is_some() {
+        let mut names: Vec<(u32, String)> = Vec::new();
+        for f in funcs {
+            names.push((bodies[&f.entry], format!("f_{:x}{}", f.entry, f.name.as_deref().map(|n| format!("_{n}")).unwrap_or_default())));
+        }
+        for (&(a, k), &i) in &lfns {
+            names.push((i, format!("l_{a:x}_{k}")));
+        }
+        for &(a, i) in &roots {
+            names.push((i, root_name(a)));
+        }
+        names.push((ic, "ic".into()));
+        names.sort();
+        let mut sub = Vec::new();
+        gex_emit::wasm::write_u32(&mut sub, names.len() as u32);
+        for (i, n) in &names {
+            gex_emit::wasm::write_u32(&mut sub, *i);
+            gex_emit::wasm::write_u32(&mut sub, n.len() as u32);
+            sub.extend_from_slice(n.as_bytes());
+        }
+        let mut sec = vec![1u8];
+        gex_emit::wasm::write_u32(&mut sec, sub.len() as u32);
+        sec.extend_from_slice(&sub);
+        m.encode_with_custom(&[("name", sec)])
+    } else {
+        m.encode()
+    };
+    Ok((wasm, roots.into_iter().map(|(a, _)| a).collect()))
 }
 
 /// `e_F(ctx)`: the nest root (function-tier.md §7). x86 first checks that
