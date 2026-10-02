@@ -67,6 +67,52 @@ pub fn trampoline_page() -> Vec<u8> {
     page
 }
 
+/// The trampoline page as a recovery input for the function tier: one
+/// executable segment of [`trampoline_page`]'s bytes at [`TRAMPOLINES`], and
+/// the dispatchers of the process's ABI (`class32`: i386) to start recovery
+/// at. Every host builds its trampoline unit from exactly this, so they
+/// compute the same unit key.
+pub fn trampoline_input(class32: bool) -> (gex_ld::Image, Vec<u64>) {
+    let bytes = trampoline_page();
+    let starts: Vec<u64> = if class32 {
+        vec![tramp::UNIX_CALL_32, tramp::SYSCALL_DISPATCHER_32]
+    } else {
+        vec![tramp::UNIX_CALL_64, tramp::SYSCALL_DISPATCHER_64]
+    };
+    let image = gex_ld::Image {
+        soname: None,
+        needed: Vec::new(),
+        runpath: Vec::new(),
+        bias: TRAMPOLINES,
+        entry: starts[0],
+        code: vec![(TRAMPOLINES, TRAMPOLINES_END)],
+        segments: vec![gex_ld::elf::Segment {
+            vaddr: TRAMPOLINES,
+            mem_size: bytes.len() as u64,
+            bytes,
+            readable: true,
+            writable: false,
+            executable: true,
+        }],
+        phdr_vaddr: TRAMPOLINES,
+        phentsize: 0,
+        phnum: 0,
+        brk: TRAMPOLINES_END,
+        text_range: (TRAMPOLINES, TRAMPOLINES_END),
+        tls: None,
+        symbols: Vec::new(),
+        named_relocs: Vec::new(),
+        relocs: Vec::new(),
+        init_array: Vec::new(),
+        dynsyms: Vec::new(),
+        irelative: Vec::new(),
+        pie: false,
+        interp: None,
+        class32,
+    };
+    (image, starts)
+}
+
 /// What `gexc run` asks for.
 pub struct BootRequest<'a> {
     /// The program, as a guest (VFS) path.

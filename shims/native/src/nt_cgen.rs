@@ -307,50 +307,13 @@ fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
     }
 }
 
-/// The NT layer's trampoline page (`gex_kernel::nt::boot::trampoline_page`:
+/// The NT layer's trampoline page (`gex_kernel::nt::boot::trampoline_input`:
 /// the unix-call and syscall dispatchers every Wine DLL calls through, Wine's
 /// opengl32 once per GL call) as a recovery input. Fixed bytes at a fixed
 /// address, so its unit is built once per gex build and installed at boot
 /// like an image's: without it every such call leaves the function tier.
 fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) {
-    use gex_kernel::nt::{boot, TRAMPOLINES, TRAMPOLINES_END};
-    let bytes = boot::trampoline_page();
-    let starts: Vec<u64> = if class32 {
-        vec![boot::tramp::UNIX_CALL_32, boot::tramp::SYSCALL_DISPATCHER_32]
-    } else {
-        vec![boot::tramp::UNIX_CALL_64, boot::tramp::SYSCALL_DISPATCHER_64]
-    };
-    let image = gex_ld::Image {
-        soname: None,
-        needed: Vec::new(),
-        runpath: Vec::new(),
-        bias: TRAMPOLINES,
-        entry: starts[0],
-        code: vec![(TRAMPOLINES, TRAMPOLINES_END)],
-        segments: vec![gex_ld::elf::Segment {
-            vaddr: TRAMPOLINES,
-            mem_size: bytes.len() as u64,
-            bytes,
-            readable: true,
-            writable: false,
-            executable: true,
-        }],
-        phdr_vaddr: TRAMPOLINES,
-        phentsize: 0,
-        phnum: 0,
-        brk: TRAMPOLINES_END,
-        text_range: (TRAMPOLINES, TRAMPOLINES_END),
-        tls: None,
-        symbols: Vec::new(),
-        named_relocs: Vec::new(),
-        relocs: Vec::new(),
-        init_array: Vec::new(),
-        dynsyms: Vec::new(),
-        irelative: Vec::new(),
-        pie: false,
-        interp: None,
-        class32,
-    };
+    let (image, starts) = gex_kernel::nt::boot::trampoline_input(class32);
     let seeds = gex_xlate::func::PeSeeds {
         starts: starts.into_iter().map(|a| (a, gex_xlate::func::Source::Entry)).collect(),
         fdes: Vec::new(),
