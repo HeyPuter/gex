@@ -144,6 +144,16 @@ impl<'a> GuestMem<'a> {
         Ok(())
     }
 
+    /// `len` bytes from `src` to `dst`, both guest addresses, overlap allowed:
+    /// no host buffer in between (in the browser every host buffer is shim
+    /// heap, and a frame-sized one per frame fragmented it to exhaustion).
+    pub fn copy_within(&mut self, src: u64, dst: u64, len: usize) -> Result<(), Errno> {
+        let s = self.range(src, len)?;
+        let d = self.range(dst, len)?;
+        self.view_mut().copy_within(s, d.start);
+        Ok(())
+    }
+
     /// As [`Self::zero`], writing only the 4 KiB pages that are not zero
     /// already. For fresh anonymous memory: reading a page the host never
     /// touched costs no memory, writing it commits it, so a large

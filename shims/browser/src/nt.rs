@@ -257,6 +257,9 @@ mod imp {
             warn_line(&format!("gex-nt: arena self-check: {}\n", crate::arena_selftest()));
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
+        if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
+            crate::BIG_ALLOC.store(n, Ordering::Relaxed);
+        }
         if let Some(a) = var("GEX_NT_WATCH_ALLOC").and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             crate::WATCH_ALLOC.store(a, Ordering::Relaxed);
         }
