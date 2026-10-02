@@ -32,11 +32,23 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// The first line of every file a recovery cache holds.
-pub const FORMAT: &str = "gex-cgen-image 1";
+pub const FORMAT: &str = "gex-cgen-image 3";
 
-/// A hash of every source that decides what a unit holds (build.rs): for
-/// unit-cache keys, in place of the whole build's fingerprint.
-pub const INPUTS: &str = env!("GEX_CGEN_INPUTS");
+/// A hash of the sources that decide an image's recovery (build.rs).
+pub const RECOVERY_INPUTS: &str = env!("GEX_CGEN_RECOVERY_INPUTS");
+
+/// A hash of the sources that decide a unit from a recovery (build.rs).
+pub const UNIT_INPUTS: &str = env!("GEX_CGEN_UNIT_INPUTS");
+
+/// What a unit embeds from outside gex-cgen and gex-abi (gex-emit's FMA
+/// constants, in `gex_abi.h`), which the unit key does not hash: bump it
+/// whenever [`unit_abi_fingerprint`] changes (its test says when).
+pub const UNIT_ABI_VERSION: u32 = 1;
+
+/// The embedded constants [`UNIT_ABI_VERSION`] stands for.
+pub fn unit_abi_fingerprint() -> String {
+    format!("fma {:?} {} {}", gex_emit::fma::SPLIT, gex_emit::fma::SAFE_LO, gex_emit::fma::SAFE_HI)
+}
 
 /// C per translation unit before it is written and compiled.
 pub const UNIT_BYTES: usize = 512 << 10;
@@ -267,6 +279,8 @@ fn emit_and_link(
     // The precompiled header, made once per build directory.
     let pch = toolchain::precompile_header(work)?;
     let known: HashSet<u64> = rec.entries.iter().copied().collect();
+    // The entries a host installs (a stub has no `e_`/`ib_`).
+    let entries: Vec<u64> = rec.entries.iter().copied().filter(|a| !skip.contains(a)).collect();
     let mut stats = ImageStats { functions: rec.entries.len(), ..Default::default() };
 
     // Units go to a bounded queue of `jobs` compilers: emission waits when it
@@ -303,11 +317,13 @@ fn emit_and_link(
             stats.units += 1;
             *unit = FnUnit::new();
             unit.set_class32(rec.class32);
+            unit.call_known_import = true;
             Ok(())
         };
         let mut gir = GirReader::open(recovery)?;
         let mut unit = FnUnit::new();
         unit.set_class32(rec.class32);
+        unit.call_known_import = true;
         let mut k = 0usize;
         while let Some(f) = gir.next()? {
             if skip.contains(&f.entry) {
@@ -327,13 +343,14 @@ fn emit_and_link(
         if unit.len() > 0 {
             emit(&mut unit, k, &mut objs, &mut stats)?;
         }
-        // The by-address call helper, over every function.
-        let ck = func::call_known_source_chunked(&rec.entries);
-        let key = hash128(&[ck.as_bytes(), header_text.as_bytes(), flags.as_bytes(), version.as_bytes()]);
+        // The entries' table indices (`gex_fnref`): what the host reads
+        // instead of an export per function.
+        let fr = func::fnref_source(&entries);
+        let key = hash128(&[fr.as_bytes(), header_text.as_bytes(), flags.as_bytes(), version.as_bytes()]);
         let obj = objects.join(format!("{key}.o"));
         if !obj.exists() {
-            let src = work.join("call_known.c");
-            std::fs::write(&src, ck)?;
+            let src = work.join("fnref.c");
+            std::fs::write(&src, fr)?;
             tx.send((src, obj.clone())).map_err(|_| anyhow!("the compilers stopped"))?;
         }
         objs.push(obj);
@@ -343,12 +360,29 @@ fn emit_and_link(
     if let Some(e) = errors.into_inner().unwrap().into_iter().next() {
         return Err(e);
     }
-    let exports: Vec<String> = rec.entries.iter().filter(|a| !skip.contains(a)).map(|a| func::entry_name(*a)).collect();
     let tmp = out.with_extension("wasm.tmp");
-    toolchain::link(work, &objs, &exports, &tmp)?;
+    toolchain::link_image(work, &objs, &tmp)?;
     stats.wasm_bytes = std::fs::metadata(&tmp)?.len();
+    // The entries, in `gex_fnref`'s order, beside the module.
+    let mut eb = Vec::with_capacity(entries.len() * 8);
+    for a in &entries {
+        eb.extend_from_slice(&a.to_le_bytes());
+    }
+    std::fs::write(entries_path(out), eb)?;
     std::fs::rename(&tmp, out)?;
     Ok(stats)
+}
+
+/// Where a unit's entry list lives, beside its module.
+pub fn entries_path(cwasm: &Path) -> std::path::PathBuf {
+    cwasm.with_extension("entries")
+}
+
+/// The entries of a unit built by [`build_c_module`], in `gex_fnref`'s
+/// order.
+pub fn read_entries(cwasm: &Path) -> Result<Vec<u64>> {
+    let b = std::fs::read(entries_path(cwasm)).with_context(|| format!("reading {}", entries_path(cwasm).display()))?;
+    Ok(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
 /// The entries a C module from [`build_c_module`] exports, from its export
@@ -367,4 +401,18 @@ pub fn exported_entries(cwasm: &[u8]) -> Result<Vec<u64>> {
     }
     out.sort_unstable();
     Ok(out)
+}
+
+#[cfg(test)]
+mod abi_tests {
+    /// Fails when a constant a unit embeds from gex-emit changes: bump
+    /// `UNIT_ABI_VERSION` and record the new fingerprint here, so every unit
+    /// built against the old constants is rebuilt.
+    #[test]
+    fn unit_abi_version_pins_the_embedded_constants() {
+        assert_eq!(
+            (super::UNIT_ABI_VERSION, super::unit_abi_fingerprint().as_str()),
+            (1, "fma 134217729.0 523 1523")
+        );
+    }
 }

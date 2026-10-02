@@ -25,6 +25,11 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_DISPATCH_TABLES {}u", gex_abi::DISPATCH_TABLES);
     let _ = writeln!(w, "#define GEX_DISPATCH_SLOT_BITS {}u", gex_abi::DISPATCH_SLOT_BITS);
     let _ = writeln!(w, "#define GEX_CACHE_OP_SLOT_CONFLICT {}", gex_abi::cache_op::SLOT_CONFLICT);
+    let _ = writeln!(w, "#define GEX_CACHE_OP_SPLIT_LOCK {}", gex_abi::cache_op::SPLIT_LOCK);
+    let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
+    let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}u", gex_abi::PATCHED_PAGES);
+    let _ = writeln!(w, "#define GEX_NEST_EXITS 0x{:x}u", gex_abi::NEST_EXITS);
+    let _ = writeln!(w, "#define GEX_BODY_LIMIT 0x{:x}u", gex_abi::BODY_LIMIT);
     let _ = writeln!(w);
 
     // The context. Every named offset, then the per-register helpers.
@@ -222,8 +227,74 @@ GEX_INLINE uint64_t gex_fma64(int ctx, uint64_t ab, uint64_t bb_, uint64_t cb, u
     return (uint64_t)gex_fma(ctx, (int64_t)ab, (int64_t)bb_, (int64_t)cb, (int32_t)dbl);
 }
 
+/* Whether the code page holding guest address `a` was rewritten after its
+   unit was installed (gex_abi::PATCHED_PAGES): a constant address, one load. */
+#define GEX_PATCHED(a) \
+    ((*(volatile uint8_t *)GEX_P(GEX_PATCHED_PAGES + (uint32_t)((a) >> 15)) >> (uint32_t)(((a) >> 12) & 7u)) & 1u)
+
 /* Old value of a compare-and-swap, at each width. */
 #define GEX_CAS(T, p, e, r) __sync_val_compare_and_swap((T *)(p), (e), (r))
+
+/* An x86 locked access that is not naturally aligned, atomically, exactly as
+   tier-1 does it (gex-emit's emit_misaligned_atomic), so the two tiers stay
+   atomic against each other: inside one aligned 8-byte word, a
+   compare-exchange loop on that word; across two, under the lock word at
+   GEX_SPLIT_LOCK (shared with tier-1), the first such access reported.
+   `op`: 0 compare-exchange (a expected, b replacement), 1 add, 2 sub, 3 and,
+   4 or, 5 xor, 6 exchange (a the operand). Returns the old value. */
+#define GEX_LK_CAS 0
+#define GEX_LK_ADD 1
+#define GEX_LK_SUB 2
+#define GEX_LK_AND 3
+#define GEX_LK_OR 4
+#define GEX_LK_XOR 5
+#define GEX_LK_XCHG 6
+static inline uint64_t gex_lk_apply(int op, uint64_t old, uint64_t a, uint64_t b) {
+    switch (op) {
+    case GEX_LK_CAS: return b;
+    case GEX_LK_ADD: return old + a;
+    case GEX_LK_SUB: return old - a;
+    case GEX_LK_AND: return old & a;
+    case GEX_LK_OR: return old | a;
+    case GEX_LK_XOR: return old ^ a;
+    default: return a;
+    }
+}
+static __attribute__((noinline)) uint64_t gex_locked_misaligned(int ctx, int64_t pc, uint32_t ea, uint32_t bytes,
+                                                                int op, uint64_t a, uint64_t b) {
+    uint64_t field = bytes >= 8 ? ~0ull : ((1ull << (bytes * 8)) - 1);
+    if ((ea & 7u) + bytes <= 8u) {
+        uint32_t wa = ea & ~7u;
+        uint32_t sh = (ea & 7u) * 8u;
+        for (;;) {
+            uint64_t w = __atomic_load_n((gex_a64 *)GEX_P(wa), __ATOMIC_SEQ_CST);
+            uint64_t f = (w >> sh) & field;
+            if (op == GEX_LK_CAS && f != (a & field))
+                return f;
+            uint64_t nw = ((gex_lk_apply(op, f, a, b) & field) << sh) | (w & ~(field << sh));
+            if (GEX_CAS(gex_a64, GEX_P(wa), w, nw) == w)
+                return f;
+        }
+    }
+    if (*(volatile uint32_t *)GEX_P(GEX_SPLIT_LOCK + 4u) == 0) {
+        *(volatile uint32_t *)GEX_P(GEX_SPLIT_LOCK + 4u) = 1;
+        gex_cache_op(ctx, pc, GEX_CACHE_OP_SPLIT_LOCK, (int64_t)ea);
+    }
+    while (GEX_CAS(gex_a32, GEX_P(GEX_SPLIT_LOCK), 0u, 1u) != 0u) {
+    }
+    uint64_t old = bytes == 8 ? *(gex_u64 *)GEX_P(ea) : bytes == 4 ? *(gex_u32 *)GEX_P(ea) : *(gex_u16 *)GEX_P(ea);
+    if (op != GEX_LK_CAS || old == (a & field)) {
+        uint64_t nv = gex_lk_apply(op, old, a, b) & field;
+        if (bytes == 8)
+            *(gex_u64 *)GEX_P(ea) = nv;
+        else if (bytes == 4)
+            *(gex_u32 *)GEX_P(ea) = (uint32_t)nv;
+        else
+            *(gex_u16 *)GEX_P(ea) = (uint16_t)nv;
+    }
+    __atomic_store_n((gex_a32 *)GEX_P(GEX_SPLIT_LOCK), 0u, __ATOMIC_SEQ_CST);
+    return old;
+}
 "#;
 
 #[cfg(test)]

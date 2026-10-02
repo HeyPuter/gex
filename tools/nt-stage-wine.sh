@@ -4,6 +4,9 @@
 #   tools/nt-stage-wine.sh [PREFIX]          stage (default ~/.cache/gex/wine-11.15)
 #   tools/nt-stage-wine.sh --manifest        regenerate the manifest from the host
 #
+# Then, with a gexc around, `gexc cgen-prefix` compiles the core DLLs for the
+# function tier (below; GEX_STAGE_CGEN=0 skips it).
+#
 # The prefix gets
 #   drive_c/windows/system32/  <- $WINE_LIB/x86_64-windows/*  (PE32+ processes)
 #   drive_c/windows/syswow64/  <- $WINE_LIB/i386-windows/*    (PE32 processes)
@@ -115,3 +118,21 @@ mkdir -p "$PREFIX/drive_c/ProgramData" "$PREFIX/drive_c/Program Files" "$PREFIX/
     "$PREFIX/drive_c/windows/temp"
 echo "$VERSION" >"$PREFIX/.wine-version"
 echo "staged $n files for Wine $VERSION in $PREFIX"
+
+# The function tier's core DLLs (docs/function-tier.md §11): PREFIX/gex-layout,
+# a fixed base for each DLL in tools/nt-cgen-core.txt, and a unit built for
+# each at that base, so every Windows program starts with Wine compiled.
+# GEX_STAGE_CGEN=0 skips it; GEXC names the gexc to use; the build runs under
+# MemoryMax=$GEX_CGEN_MEMORY_MAX (default 12G) when systemd-run is there.
+if [ "${GEX_STAGE_CGEN:-1}" != 0 ]; then
+    gexc=${GEXC:-$(command -v gexc || echo "$HERE/../target/release/gexc")}
+    if [ -x "$gexc" ]; then
+        run=(nice -n 10 "$gexc" cgen-prefix "$PREFIX")
+        if command -v systemd-run >/dev/null 2>&1; then
+            run=(systemd-run --user --scope -q -p "MemoryMax=${GEX_CGEN_MEMORY_MAX:-12G}" "${run[@]}")
+        fi
+        "${run[@]}" || { echo "nt-stage-wine: compiling the core DLLs failed" >&2; exit 1; }
+    else
+        echo "nt-stage-wine: no gexc at $gexc: the core DLLs are not compiled (gexc cgen-prefix $PREFIX does it)" >&2
+    fi
+fi

@@ -1,8 +1,14 @@
-//! `GEX_CGEN_INPUTS`: a hash of every source that decides what a
-//! function-tier unit holds -- recovery (gex-xlate's discovery, the lifters,
-//! the decoders), the IR, and this crate's C -- so a unit cache keyed on it
-//! (gex_native::nt_cgen) survives rebuilds that change nothing it depends on,
-//! and is refused after any that do.
+//! Two hashes of the sources a function-tier unit depends on (gex_native::
+//! nt_cgen keys its caches on them; docs/function-tier.md §11):
+//!
+//! * `GEX_CGEN_RECOVERY_INPUTS`: what decides an image's recovery (its GIR
+//!   and summaries) -- the IR, the lifters and decoders, gex-xlate's recovery
+//!   (everything in it but the runtime translator's `lib.rs` and the
+//!   profile and validation code), gex-abi, and gex-ld (placing the image);
+//! * `GEX_CGEN_UNIT_INPUTS`: what decides the C and the module from a
+//!   recovery -- this crate (and its runtime) and gex-abi. What the C embeds
+//!   from elsewhere (gex-emit's constants) is pinned by `UNIT_ABI_VERSION`
+//!   and its test, not hashed, so a tier-1 change does not invalidate units.
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -18,20 +24,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn main() {
-    let here = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let crates = here.parent().unwrap();
-    let mut files = Vec::new();
-    for c in [
-        "gex-cgen", "gex-ir", "gex-xlate", "gex-lift", "gex-lift-x86", "gex-lift-ppc", "gex-isa", "gex-isa-x86",
-        "gex-isa-ppc", "gex-abi", "gex-ld", "gex-emit",
-    ] {
-        let src = crates.join(c).join("src");
-        println!("cargo:rerun-if-changed={}", src.display());
-        walk(&src, &mut files);
-    }
-    walk(&here.join("runtime"), &mut files);
-    println!("cargo:rerun-if-changed={}", here.join("runtime").display());
+fn hash(crates: &Path, mut files: Vec<PathBuf>) -> String {
     files.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for f in &files {
@@ -42,5 +35,31 @@ fn main() {
     let mut h2 = std::collections::hash_map::DefaultHasher::new();
     a.hash(&mut h2);
     files.len().hash(&mut h2);
-    println!("cargo:rustc-env=GEX_CGEN_INPUTS={a:016x}{:016x}", h2.finish());
+    format!("{a:016x}{:016x}", h2.finish())
+}
+
+fn main() {
+    let here = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let crates = here.parent().unwrap().to_path_buf();
+    let src = |c: &str| {
+        let d = crates.join(c).join("src");
+        println!("cargo:rerun-if-changed={}", d.display());
+        let mut v = Vec::new();
+        walk(&d, &mut v);
+        v
+    };
+    let mut rec = Vec::new();
+    for c in ["gex-ir", "gex-lift", "gex-lift-x86", "gex-lift-ppc", "gex-isa", "gex-isa-x86", "gex-isa-ppc", "gex-abi", "gex-ld"] {
+        rec.extend(src(c));
+    }
+    rec.extend(src("gex-xlate").into_iter().filter(|p| {
+        !matches!(p.file_name().and_then(|n| n.to_str()), Some("lib.rs" | "profile.rs" | "validate.rs"))
+    }));
+    let mut unit = src("gex-cgen");
+    unit.extend(src("gex-abi"));
+    let rt = here.join("runtime");
+    println!("cargo:rerun-if-changed={}", rt.display());
+    walk(&rt, &mut unit);
+    println!("cargo:rustc-env=GEX_CGEN_RECOVERY_INPUTS={}", hash(&crates, rec));
+    println!("cargo:rustc-env=GEX_CGEN_UNIT_INPUTS={}", hash(&crates, unit));
 }

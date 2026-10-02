@@ -376,12 +376,18 @@ impl PageTable {
     /// Take in another table's assignments, `other`'s winning where they
     /// disagree -- publishing is ordered, so the last merged is the one the
     /// guest's directory ends up holding.
-    /// Record pages a published translation allocated (its `dir_entries`).
-    /// Unlike [`Self::merge`] this never brings back a page that was
-    /// forgotten after the translation took its snapshot.
+    /// Record pages a published translation allocated (its `dir_entries`),
+    /// where the page has no base yet. Unlike [`Self::merge`] this never
+    /// brings back a page that was forgotten after the translation took its
+    /// snapshot, and never re-bases one: two translations started from
+    /// snapshots without the page each allocate a base for it, and the first
+    /// published keeps it (the other's blocks there are stale from the start
+    /// and are not counted as translated). A page's base therefore changes
+    /// only when it is retired and translated again -- which tier-1's entry
+    /// check (`tier1::Emitter::emit_page_check`) relies on.
     pub fn insert_entries(&mut self, entries: &[(u64, u32)]) {
         for (page, base) in entries {
-            self.pages.insert(*page, *base);
+            self.pages.entry(*page).or_insert(*base);
         }
     }
 

@@ -514,6 +514,32 @@ impl<'a> Emitter<'a> {
     // -- addressing (tier-1's `emit_address`; see docs/function-tier.md §3) --
 
     /// A `char *` expression for a scalar or vector access at `addr + offset`.
+    /// An x86 locked access at any alignment (tier-1's
+    /// `emit_aligned_or_not`): the atomic `aligned` expression when the
+    /// address is naturally aligned, else `gex_locked_misaligned`. Other
+    /// architectures, and byte accesses, are `aligned` as before.
+    #[allow(clippy::too_many_arguments)]
+    fn any_alignment(&self, sz: MemSz, ty: Ty, p: &str, aligned: String, op: &str, a: &str, b: &str) -> String {
+        let bytes = match sz {
+            MemSz::B1 => 1u32,
+            MemSz::B2 => 2,
+            MemSz::B4 => 4,
+            MemSz::B8 => 8,
+        };
+        // GEX_CGEN_MUTATE=aligned-atomics: natural-alignment atomics only, as
+        // before; tests/x86-programs/locked-misaligned.c then traps.
+        if !gex_abi::X86 || bytes == 1 || crate::func::mutate("aligned-atomics") {
+            return aligned;
+        }
+        let ea = format!("((uint32_t)(uintptr_t)({p}))");
+        format!(
+            "(__builtin_expect({ea} & {}u, 0) ? ({})gex_locked_misaligned(ctx, 0x{:x}ll, {ea}, {bytes}u, {op}, {a}, {b}) : {aligned})",
+            bytes - 1,
+            cty(ty),
+            self.block.start
+        )
+    }
+
     fn address(&self, addr: Value, offset: i64) -> String {
         if let Some(c) = self.value_const[addr.0 as usize] {
             let ea = c.wrapping_add(offset as u64);
@@ -1029,7 +1055,16 @@ impl<'a> Emitter<'a> {
                     RmwOp::Xor => "__atomic_fetch_xor",
                     RmwOp::Xchg => "__atomic_exchange_n",
                 };
-                format!("({}){f}(({at} *)({p}), ({nt}){v}, __ATOMIC_SEQ_CST)", cty(*ty))
+                let aligned = format!("({}){f}(({at} *)({p}), ({nt}){v}, __ATOMIC_SEQ_CST)", cty(*ty));
+                let lk = match op {
+                    RmwOp::Add => "GEX_LK_ADD",
+                    RmwOp::Sub => "GEX_LK_SUB",
+                    RmwOp::And => "GEX_LK_AND",
+                    RmwOp::Or => "GEX_LK_OR",
+                    RmwOp::Xor => "GEX_LK_XOR",
+                    RmwOp::Xchg => "GEX_LK_XCHG",
+                };
+                self.any_alignment(*sz, *ty, &p, aligned, lk, &format!("(uint64_t)({nt}){v}"), "0")
             }
             Expr::CmpXchg {
                 addr,
@@ -1040,11 +1075,16 @@ impl<'a> Emitter<'a> {
             } => {
                 let p = self.address(*addr, 0);
                 let (at, nt) = atomic_types(*sz);
-                format!(
-                    "({})GEX_CAS({at}, {p}, ({nt}){}, ({nt}){})",
-                    cty(*ty),
-                    self.v(*expected),
-                    self.v(*replacement)
+                let (e, r) = (self.v(*expected), self.v(*replacement));
+                let aligned = format!("({})GEX_CAS({at}, {p}, ({nt}){e}, ({nt}){r})", cty(*ty));
+                self.any_alignment(
+                    *sz,
+                    *ty,
+                    &p,
+                    aligned,
+                    "GEX_LK_CAS",
+                    &format!("(uint64_t)({nt}){e}"),
+                    &format!("(uint64_t)({nt}){r}"),
                 )
             }
             Expr::HostCall { func, args, ty } => {

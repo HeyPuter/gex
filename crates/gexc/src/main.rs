@@ -55,6 +55,7 @@ fn real_main() -> Result<ExitCode> {
         "funcs" => cmd_funcs(&argv[2..]),
         "hotset" => cmd_hotset(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-image" => cmd_cgen_image(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "cgen-prefix" => cmd_cgen_prefix(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
             usage();
             Ok(ExitCode::SUCCESS)
@@ -100,6 +101,14 @@ usage:
 {}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
+  gexc run [--cgen|--no-cgen] <program.exe> ...
+                                   a Windows program uses the function-tier
+                                   units built for its images (Wine's at
+                                   staging, the program's own on an earlier
+                                   run); an image without one runs on tier-1
+                                   and gets one built for the next run.
+                                   --cgen: every program image must have one;
+                                   --no-cgen: tier-1 only
   gexc cgen-image <pe> [--pe-base HEX] [--jobs N]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
@@ -107,6 +116,13 @@ usage:
                                    NT layer maps the image at that base. Run it
                                    with a memory cap: recovery of a large image
                                    is the peak
+  gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only]
+                                   compile a staged Wine prefix's core DLLs
+                                   (tools/nt-cgen-core.txt, or --set) for the
+                                   function tier: writes PREFIX/gex-layout, the
+                                   fixed base each one gets in every process,
+                                   and builds each unit at that base.
+                                   tools/nt-stage-wine.sh runs it
   gexc hotset <elf|pe> --samples FILE [--pe-base HEX] [--budget N] -o OUT
                                    the function tier's hot set for an image:
                                    the recovered functions holding the most
@@ -210,6 +226,9 @@ struct RunArgs {
     jit: bool,
     /// A Windows program's staged Wine prefix. See `nt_run`.
     wine_prefix: Option<String>,
+    /// `--no-cgen`: a Windows program runs on tier-1 only, prebuilt units or
+    /// not (`gex_native::nt_cgen::Mode`).
+    no_cgen: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
@@ -222,6 +241,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut no_jit = false;
     let mut lazy = false;
     let mut cgen = false;
+    let mut no_cgen = false;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
     let mut i = 0;
@@ -310,6 +330,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--no-jit" => no_jit = true,
             "--lazy" => lazy = true,
             "--cgen" => cgen = true,
+            "--no-cgen" => no_cgen = true,
             "--no-cache" => opts.cache = false,
             "--cwd" => {
                 i += 1;
@@ -373,6 +394,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         },
         jit: !no_jit,
         wine_prefix,
+        no_cgen,
     })
 }
 
@@ -480,9 +502,19 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         if ra.opts.record.is_some() {
             bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
         }
-        // --cgen: images with a hot set (GEX_NT_HOTSETS) get function-tier
-        // units as the NT layer maps them (gex_native::nt_cgen); without the
-        // directory it fails loudly there.
+        // The function tier for the images the NT layer maps
+        // (gex_native::nt_cgen, docs/function-tier.md §11): prebuilt units
+        // are used where they exist, and an image without one runs on tier-1
+        // while its unit is built for the next run; --cgen requires every
+        // program image to have one; --no-cgen is tier-1 only.
+        use gex_native::nt_cgen::Mode;
+        gex_native::nt_cgen::set_mode(if ra.no_cgen {
+            Mode::Off
+        } else if ra.xlate.cgen {
+            Mode::Require
+        } else {
+            Mode::Default
+        });
         let exit = nt_run::run(&ra, &bytes)?;
         return Ok(report_exit(&exit, ra.opts.verbose));
     }
@@ -1990,6 +2022,114 @@ fn cmd_hotset(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The DLLs `gexc cgen-prefix` compiles by default: what Noita and tests/nt
+/// map, measured (`GEX_NT_TRACE_IMAGES=1`).
+const CGEN_CORE: &str = include_str!("../../../tools/nt-cgen-core.txt");
+
+/// `gexc cgen-prefix`: see the usage text.
+fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
+    use gex_kernel::nt::section;
+    let (mut prefix, mut set, mut jobs, mut layout_only) = (None, None, 4usize, false);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--set" => {
+                i += 1;
+                set = Some(std::fs::read_to_string(args.get(i).context("--set needs a file")?)?);
+            }
+            "--jobs" => {
+                i += 1;
+                jobs = args.get(i).context("--jobs needs a number")?.parse()?;
+            }
+            "--layout-only" => layout_only = true,
+            other => prefix = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let prefix = match prefix {
+        Some(p) => p,
+        None => std::env::var("GEX_WINE_PREFIX")
+            .unwrap_or_else(|_| format!("{}/.cache/gex/wine-11.15", std::env::var("HOME").unwrap_or_default())),
+    };
+    let prefix = std::fs::canonicalize(&prefix)
+        .with_context(|| format!("no staged prefix at {prefix}"))?
+        .to_string_lossy()
+        .into_owned();
+    let wine = std::fs::read_to_string(format!("{prefix}/.wine-version"))
+        .with_context(|| format!("{prefix} is not a staged prefix (no .wine-version)"))?;
+    let names: Vec<String> = set
+        .as_deref()
+        .unwrap_or(CGEN_CORE)
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let t_all = std::time::Instant::now();
+    let mut layout = Vec::new();
+    let mut todo = Vec::new();
+    for dir in ["drive_c/windows/syswow64", "drive_c/windows/system32"] {
+        // Which preferred bases are a DLL's own, over the whole directory.
+        let mut prefs: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for e in std::fs::read_dir(format!("{prefix}/{dir}"))? {
+            let p = e?.path();
+            if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("dll")) {
+                if let Ok(pe) = std::fs::read(&p).map_err(anyhow::Error::from).and_then(|b| gex_ld::pe::parse(&b).map_err(|e| anyhow::anyhow!("{e}"))) {
+                    *prefs.entry(pe.preferred_base).or_default() += 1;
+                }
+            }
+        }
+        let mut images = Vec::new();
+        for n in &names {
+            let rel = format!("{dir}/{n}");
+            let path = format!("{prefix}/{rel}");
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("cgen-prefix: {rel} is not in the prefix; skipped");
+                continue;
+            };
+            let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+            let mut h = gex_cache::sha256::Sha256::new();
+            h.update(&bytes);
+            let sha = gex_cache::sha256::hex(&h.finish());
+            let own = prefs.get(&pe.preferred_base).copied().unwrap_or(0) == 1;
+            images.push((rel, pe.preferred_base, pe.image_size as u64, sha, own));
+        }
+        let planned = section::plan_layout(&images);
+        for (rel, b, _, _) in &planned {
+            todo.push((format!("{prefix}/{rel}"), *b));
+        }
+        layout.extend(planned);
+    }
+    let text = section::render_layout(&layout, &wine);
+    let tmp = format!("{prefix}/{}.tmp", section::LAYOUT_FILE);
+    std::fs::write(&tmp, &text)?;
+    std::fs::rename(&tmp, format!("{prefix}/{}", section::LAYOUT_FILE))?;
+    eprintln!("cgen-prefix: {} images laid out in {prefix}/{}", layout.len(), section::LAYOUT_FILE);
+    if layout_only {
+        return Ok(());
+    }
+    let mut wasm_total = 0u64;
+    let _lock = gex_native::nt_cgen::build_lock()?;
+    for (path, base) in &todo {
+        let bytes = std::fs::read(path)?;
+        let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        let t0 = std::time::Instant::now();
+        let out = gex_native::nt_cgen::prepare_pe(&pe, *base, jobs, false)
+            .with_context(|| format!("building the function tier for {path} at {base:#x}"))?;
+        let n = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        wasm_total += n;
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let dir = path.rsplit('/').nth(1).unwrap_or("");
+        eprintln!("cgen-prefix: {dir}/{name} at {base:#x}: {} KiB wasm, {:.1}s", n >> 10, t0.elapsed().as_secs_f64());
+    }
+    eprintln!(
+        "cgen-prefix: {} units, {} MiB wasm, {:.1}s",
+        todo.len(),
+        wasm_total >> 20,
+        t_all.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// `gexc cgen-image`: see the usage text.
 fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let (mut path, mut pe_base) = (None, None);
@@ -2014,6 +2154,10 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     let base = pe_base.unwrap_or(pe.preferred_base);
+    // One build at a time per cache, across processes: a recovery's peak is
+    // the machine's, and runs queue builds for the next run in the
+    // background.
+    let _lock = gex_native::nt_cgen::build_lock()?;
     let t0 = std::time::Instant::now();
     let out = gex_native::nt_cgen::prepare_pe(&pe, base, jobs, true)?;
     eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());

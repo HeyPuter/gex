@@ -472,40 +472,94 @@ refused together, loudly: the C code carries no profiling hooks.
 Wine's loader maps every image of a Windows program itself, so its code
 arrives through the runtime translator. With `gexc run --cgen` on a PE
 program, every image the NT layer maps also gets a **function-tier unit**:
+Wine's DLLs (compiled when the prefix is staged) and the program's own
+images alike. Dispatch and tier-1 are then the fallback for code generated at
+run time (LuaJIT) and code recovery missed, not the boundary between images.
 
 * **Unit.** The whole image's recovered functions (S2's `recover_pe`), as C,
-  compiled and linked once into one module that exports `e_<entry>` for every
-  function (`gex_cgen::image`). That module does not depend on dispatch slots.
-* **Keyed on the image as placed.** `nt_cgen::image_key` hashes the format
-  (`gex_cgen::image::FORMAT`), the build of gex, and the image's relocated
-  segments at the base it was mapped at (`aot::image_identity` of
-  `pe_input(pe, base)`). The NT layer chooses the base (`section::map_image`):
-  an image that cannot move stays at its preferred base (Noita's exe, at
-  0x40_0000); a relocatable one goes to the first free range, so x64 test exes
-  preferring 0x1_4000_0000 land at 0x40_0000 (S5's open `PeLayout::pack`
-  question; not changed here). A unit is therefore built for the base the image
-  is actually mapped at, never the one in its header.
-* **Built on first use, or ahead of time.** An image mapped with no unit for
-  that base runs on tier-1 while `gexc cgen-image <image> --pe-base B` builds
-  one in a child process (one at a time, under `systemd-run -p
-  MemoryMax=$GEX_CGEN_MEMORY_MAX`, default 12G); the unit is installed when
-  the build finishes. `gexc cgen-image` builds ahead of time.
-  `GEX_NT_CGEN_BUILD=a.dll,b.exe` builds only those; `GEX_NT_CGEN_BUILD=0`
-  turns building off: then the exe without a unit stops
-  the run, and a DLL without one runs on tier-1 (said under GEX_TRACE).
+  compiled and linked once into a module of its own (`gex_cgen::image`,
+  format `gex-cgen-image 3`). Every function has `e_<entry>` (the nest root,
+  dispatch's uniform `(i32) -> ()`, with x86's `LAST_TARGET` check) and
+  `ib_<entry>` (the body, checked against `ctx::PC`). Neither is exported:
+  wasm caps a module at 100,000 exports and an "effective type size" of
+  1,000,000 (each exported function costs 1 + 1 + params + results), and
+  noita.exe has 100,147 functions. Both are address-taken instead, so they
+  sit in the unit's own function table (wasm-ld's, `--export-table`), and a
+  generated `gex_fnref(k)` gives entry k's `e_` and `ib_` indices there (the
+  entry list is `c.entries`, beside `c.wasm`). The module imports the gex
+  host functions, the memory and two functions of the per-store dispatcher
+  module (`splice::dispatcher_module`): `gexc.dispatch` (tier-1's dispatch
+  over the dispatch tables) and `gexc.call_known`. No tier-1 stubs, no
+  splice.
+* **Calls.** Inside the image a call is a wasm call to the callee's body.
+  Every indirect call -- `call [IAT]` into another image, a vtable, a
+  callback -- is `gexc.call_known(ctx, target, ...)`: the body table is
+  numbered like dispatch (the page's directory entry plus the slot within
+  the page), and holds every installed unit's `ib_<entry>` and a leave body
+  everywhere else (a host function: it returns -1, so the caller leaves as
+  for any target the tier does not hold, counted, and said once per call
+  site under GEX_TRACE). `call_known` stores `ctx::PC` and
+  `return_call_indirect`s the slot, after checking it against
+  `gex_abi::BODY_LIMIT` (the smallest body table of any store, so a store
+  that has not caught up with a page numbered elsewhere leaves instead of
+  indexing past its table).
+* **Installed at map time.** The NT layer calls a hook after mapping an image
+  (`gex_kernel::nt::section::set_image_mapped_hook`); the host compares the
+  image's executable bytes in guest memory with the unit's and refuses loudly
+  on a mismatch, gives every page holding an entry a base, marks the entries
+  translated, and publishes the unit (`publish_cgen_unit`). Each store
+  instantiates it (`install_cgen`) and copies each entry's `e_` from the
+  unit's table into the dispatch table and its `ib_` into the body table, at
+  its slot (`gex_fnref` is read once per unit). An x86 slot holds
+  four bytes: two entries in one slot (18 in noita.exe) give the first the
+  dispatch slot -- its target check hands the other to tier-1's trampoline --
+  and neither a body. wasmtime tables belong to a store, so "the process's"
+  body table is one per store, filled identically by replay (8 bytes a slot).
+* **Code rewritten after install** (Detours patching noita.exe's prologues):
+  retirement zeroes the page's directory entry, which takes it out of both
+  tables, and tier-1 retranslates it. Direct C calls bypass both, so each
+  direct call and tail call to a compiled function first tests the callee's
+  entry page in `gex_abi::PATCHED_PAGES` (one bit per page, one load at a
+  constant address) and leaves for it when set; the host sets the bit when a
+  retired page no longer hashes to what its unit was built from
+  (`nt_cgen::on_retire`). tests/nt/detour.c is the case
+  (`GEX_CGEN_MUTATE=NOPATCHCHECK` is the mutation). Tier-1's own direct jumps
+  check their page's directory entry against the one they were translated
+  for (gex-emit `emit_page_check`).
+* **Keyed on the image as placed.** `nt_cgen::image_key` hashes the format,
+  the sources that decide a unit (`gex_cgen::image::INPUTS`) and the image's
+  relocated segments at the base it was mapped at. A unit is built for the
+  base the image is actually mapped at.
+* **Wine's DLLs at fixed bases.** 616 of Wine 11.15's 834 i386 DLLs prefer
+  0x1000_0000 (the x64 ones 0x1_8000_0000, above the guest), so the first-free
+  placement made a DLL's base follow each program's load order. `gexc
+  cgen-prefix` (run by tools/nt-stage-wine.sh) writes `PREFIX/gex-layout` --
+  a fixed base for each core DLL (tools/nt-cgen-core.txt: what tests/nt and
+  Noita map), Wine's own unique bases kept, the rest packed below them -- and
+  builds each DLL's unit at its base. The process reads it once at boot,
+  refuses a stale one, reserves its architecture's ranges (`find_free` avoids
+  them while anything else fits), and places a core DLL at its base when the
+  range is free; one that is not is said under GEX_TRACE and counted
+  (`layout_miss=` on GEX_NT_STATS).
 * **Two stages, bounded memory.** Stage 1 recovers the image and writes its
   functions in GIR's text form plus a line of summary per function
-  (`write_recovery`; a temporary directory renamed into place, every file
-  versioned). Stage 2 reads them back one at a time, emits C in units of
-  ~512 KiB, compiles each with a precompiled `gex_abi.h` and at most `jobs`
+  (`write_recovery`). Stage 2 reads them back one at a time, emits C in units
+  of ~512 KiB, compiles each with a precompiled `gex_abi.h` and at most `jobs`
   clangs, caching objects by the hash of the unit, the header, the flags and
-  clang's version, and links (`build_c_module`). Stage 2's memory is a unit of
-  C; stage 1's is recovery's (10 GB on noita.exe today: S2's queue).
-* **Installed at map time.** The NT layer calls a hook after mapping an image
-  (`gex_kernel::nt::section::set_image_mapped_hook`, no-op by default); the
-  host compares the image's executable bytes in guest memory with the unit's
-  and refuses loudly on a mismatch, then lifts a tier-1 stub at every exported
-  entry against the process's current dispatch slots, splices the unit over
-  them (`translate_runtime_prebuilt`) and installs the result like a runtime
-  translation. Every other address -- code recovery missed, code generated at
-  run time -- stays the runtime translator's.
+  clang's version, and links (`build_c_module`). Functions clang gives a
+  shadow-stack frame become stubs that leave for tier-1. Stage 1's memory is
+  recovery's (10 GB on noita.exe).
+* **Built ahead of time, or for the next run.** `gexc cgen-image <image>
+  --pe-base B` and `gexc cgen-prefix` build ahead of time. An image mapped
+  with no unit runs on tier-1 while a capped child (`systemd-run -p
+  MemoryMax=$GEX_CGEN_MEMORY_MAX`, default 12G) builds one.
+
+**Next step, not built: base-independent units.** A unit's C holds absolute
+guest addresses (entries, branch targets, relocated data addresses), so it is
+built per base, and an app image whose base follows its load order needs a
+build per order. With the image's `.reloc` information the lifter knows which
+immediates are relocated; emitting those as `base + offset`, with `base` a
+parameter the host supplies at install (a wasm global, or a constant folded
+at link time per base from one object set), would let one build serve any
+base, and make the staged layout a performance choice rather than a
+correctness one.

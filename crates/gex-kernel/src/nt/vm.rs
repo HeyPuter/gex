@@ -133,6 +133,10 @@ pub struct Mbi {
 #[derive(Default, Debug)]
 pub struct Vm {
     pub regions: BTreeMap<u64, Region>,
+    /// Ranges kept for the staged layout's images (`section::Layout`):
+    /// [`Vm::find_free`] avoids them while anything else fits, so a heap or
+    /// another image does not take a core DLL's base before it loads.
+    pub reserved: Vec<(u64, u64)>,
 }
 
 fn align_up(v: u64, a: u64) -> u64 {
@@ -162,6 +166,30 @@ impl Vm {
     /// A free 64 KiB-aligned range of `size` bytes: bottom-up first fit, or
     /// top-down. `limit` caps the end (zero bits / 32-bit callers).
     pub fn find_free(&self, size: u64, top_down: bool, limit: u64) -> Option<u64> {
+        if !self.reserved.is_empty() {
+            if let Some(b) = self.find_free_in(size, top_down, limit, true) {
+                return Some(b);
+            }
+        }
+        self.find_free_in(size, top_down, limit, false)
+    }
+
+    /// [`Vm::find_free`], treating the layout's reserved ranges as taken
+    /// when `avoid_reserved`.
+    fn find_free_in(&self, size: u64, top_down: bool, limit: u64, avoid_reserved: bool) -> Option<u64> {
+        let reserved: &[(u64, u64)] = if avoid_reserved { &self.reserved } else { &[] };
+        // The start of the highest blocker overlapping [start, start+size),
+        // and the end of the highest one.
+        let below = |start: u64| -> Option<u64> {
+            let r = self.regions.range(..start + size).next_back().filter(|(_, r)| r.end() > start).map(|(&b, _)| b);
+            let q = reserved.iter().filter(|(b, e)| *b < start + size && *e > start).map(|(b, _)| *b).max();
+            r.max(q)
+        };
+        let above = |at: u64| -> Option<u64> {
+            let r = self.regions.range(..at + size).filter(|(_, r)| r.end() > at).map(|(_, r)| r.end()).max();
+            let q = reserved.iter().filter(|(b, e)| *b < at + size && *e > at).map(|(_, e)| *e).max();
+            r.max(q)
+        };
         let high = ALLOC_HIGH.min(limit);
         if top_down {
             let mut end = high;
@@ -170,9 +198,9 @@ impl Vm {
                 if start < ALLOC_LOW {
                     return None;
                 }
-                match self.regions.range(..start + size).next_back().filter(|(_, r)| r.end() > start) {
+                match below(start) {
                     None => return Some(start),
-                    Some((&b, _)) => end = b,
+                    Some(b) => end = b,
                 }
             }
         } else {
@@ -181,13 +209,7 @@ impl Vm {
                 if at + size > high {
                     return None;
                 }
-                let blocker = self
-                    .regions
-                    .range(..at + size)
-                    .filter(|(_, r)| r.end() > at)
-                    .map(|(_, r)| r.end())
-                    .max();
-                match blocker {
+                match above(at) {
                     None => return Some(at),
                     Some(e) => at = align_up(e, GRANULE),
                 }

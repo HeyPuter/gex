@@ -740,7 +740,7 @@ pub fn create_thread_state(
         }
     };
     let ctx_addr = gex_abi::ctx_addr(slot);
-    if ctx_addr + ctx::SIZE as u64 >= gex_abi::EXCLUSIVE_SCRATCH {
+    if ctx_addr + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
         return Err(Status(st::NO_MEMORY));
     }
     let word = p.alloc_wait_word().ok_or(Status(st::NO_MEMORY))?;
