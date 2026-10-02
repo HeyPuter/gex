@@ -23,6 +23,15 @@ use gex_ir::{Block, Expr, GuestReg, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
+/// The compiler barrier at a loop back-edge (`GEX_BACKEDGE`, gex_abi.h):
+/// another thread may change what the loop reads. `GEX_CGEN_EXP=NOBARRIER`
+/// leaves it out (unsound: pricing only).
+fn backedge(e: &mut Emitter<'_>) {
+    if !exp("NOBARRIER") {
+        e.line("GEX_BACKEDGE();");
+    }
+}
+
 /// The C test for "`entry`'s code was rewritten" (`GEX_PATCHED`): its page,
 /// and the next one when a 5-byte patch at the entry would reach into it.
 /// `GEX_CGEN_MUTATE=NOPATCHCHECK`: never.
@@ -488,6 +497,7 @@ impl FnUnit {
                         e.line("  }");
                         e.line("  __builtin_unreachable();");
                         e.line("}");
+                        backedge(e);
                         e.line(format!("goto L{t};"));
                         return;
                     }
@@ -520,6 +530,7 @@ impl FnUnit {
                         e.line("  return LOOP_CHUNK;");
                         e.line("}");
                     }
+                    backedge(e);
                     e.line(format!("goto L{t};"));
                     return;
                 }
@@ -544,6 +555,9 @@ impl FnUnit {
                     e.line("  hot = 1;");
                 }
                 e.line("}");
+            }
+            if edge.to.index() <= i || to.start <= b.start {
+                backedge(e);
             }
             e.line(format!("goto L{};", edge.to.index()));
         };

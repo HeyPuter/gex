@@ -234,6 +234,11 @@ GEX_INLINE uint64_t gex_fma64(int ctx, uint64_t ab, uint64_t bb_, uint64_t cb, u
 #define GEX_PATCHED(a) \
     ((*(volatile uint8_t *)GEX_P(GEX_PATCHED_PAGES + (uint32_t)((a) >> 15)) >> (uint32_t)(((a) >> 12) & 7u)) & 1u)
 
+/* At every loop back-edge: guest memory is shared with other threads, so a
+   load must not be hoisted out of a loop that neither stores nor calls (a
+   spin-wait on a flag another thread sets). A compiler-only fence: no code. */
+#define GEX_BACKEDGE() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+
 /* Old value of a compare-and-swap, at each width. */
 #define GEX_CAS(T, p, e, r) __sync_val_compare_and_swap((T *)(p), (e), (r))
 
