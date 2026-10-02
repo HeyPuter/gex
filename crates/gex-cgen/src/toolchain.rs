@@ -35,6 +35,12 @@ pub const CFLAGS: &[&str] = &[
     "-Wno-unused-but-set-variable",
 ];
 
+/// What a whole-image unit adds (docs/merge-plan.md §9.8.1): it is linked
+/// position-independent, so its function pointers are indices into the
+/// process's function table from `__table_base`, and calls between its
+/// functions stay direct (hidden visibility).
+pub const IMAGE_CFLAGS: &[&str] = &["-fPIC", "-fvisibility=hidden"];
+
 fn tool(env: &str, default: &str) -> String {
     std::env::var(env).unwrap_or_else(|_| default.to_string())
 }
@@ -109,9 +115,10 @@ pub fn clang_version() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The flags every unit is compiled with, as one string, for cache keys.
+/// The flags every whole-image unit is compiled with, as one string, for
+/// cache keys.
 pub fn cflags_key() -> String {
-    let mut v: Vec<String> = CFLAGS.iter().map(|s| s.to_string()).collect();
+    let mut v: Vec<String> = CFLAGS.iter().chain(IMAGE_CFLAGS).map(|s| s.to_string()).collect();
     v.extend(extra_cflags());
     v.join(" ")
 }
@@ -121,6 +128,7 @@ pub fn precompile_header(dir: &Path) -> Result<PathBuf> {
     let pch = dir.join("gex_abi.h.pch");
     let mut cmd = Command::new(clang());
     cmd.args(CFLAGS)
+        .args(IMAGE_CFLAGS)
         .args(extra_cflags())
         .arg("-x")
         .arg("c-header")
@@ -136,7 +144,7 @@ pub fn precompile_header(dir: &Path) -> Result<PathBuf> {
 pub fn compile_one(dir: &Path, src: &Path, obj: &Path, pch: Option<&Path>) -> Result<()> {
     let tmp = obj.with_extension(format!("o.tmp-{}", std::process::id()));
     let mut cmd = Command::new(clang());
-    cmd.args(CFLAGS).args(extra_cflags()).arg("-I").arg(dir);
+    cmd.args(CFLAGS).args(IMAGE_CFLAGS).args(extra_cflags()).arg("-I").arg(dir);
     if let Some(p) = pch {
         cmd.arg("-include-pch").arg(p);
     }
@@ -184,19 +192,19 @@ pub fn link(dir: &Path, objs: &[PathBuf], exports: &[String], out: &Path) -> Res
     link_with_table(dir, objs, exports, out, false)
 }
 
-/// Link a whole-image unit (docs/function-tier.md §11): its own function
-/// table (holding the entries `gex_fnref` names) exported, and three
-/// exports however many functions it has.
+/// Link a whole-image unit (docs/merge-plan.md §9.8.1): position-
+/// independent, importing the process's function table and filling its
+/// slots from `__table_base` with one element segment.
 pub fn link_image(dir: &Path, objs: &[PathBuf], out: &Path) -> Result<()> {
     let rsp = dir.join("link.rsp");
-    let mut text = String::from("--export=gex_fnref\n--export-table\n");
+    let mut text = String::new();
     for o in objs {
         text.push_str(&o.to_string_lossy());
         text.push('\n');
     }
     std::fs::write(&rsp, text)?;
     let mut cmd = Command::new(wasm_ld());
-    cmd.args(["--no-entry", "--import-memory", "--shared-memory", "--max-memory=4294901760", "--allow-undefined", "-O2"])
+    cmd.args(["--experimental-pic", "-shared", "--no-entry", "--import-memory", "--shared-memory", "--max-memory=4294901760", "--allow-undefined", "-O2"])
         .arg(format!("@{}", rsp.display()))
         .arg("-o")
         .arg(out);

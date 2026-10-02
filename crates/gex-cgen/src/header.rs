@@ -32,6 +32,10 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
     let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}u", gex_abi::PATCHED_PAGES);
     let _ = writeln!(w, "#define GEX_NEST_EXITS 0x{:x}u", gex_abi::NEST_EXITS);
+    let _ = writeln!(w, "#define GEX_FCACHE 0x{:x}u", gex_abi::FCACHE);
+    let _ = writeln!(w, "#define GEX_FCACHE_BITS {}u", gex_abi::FCACHE_BITS);
+    let _ = writeln!(w, "#define GEX_FCACHE_MUL 0x{:x}u", gex_abi::FCACHE_MUL);
+    let _ = writeln!(w, "#define GEX_FTAB_RESOLVE {}u", gex_abi::ftab::RESOLVE);
     let _ = writeln!(w);
 
     // The context. Every named offset, then the per-register helpers.
@@ -97,6 +101,7 @@ pub fn header() -> String {
     decl(w, imports::CACHE_OP, "void", "gex_cache_op", "int ctx, int64_t pc, int32_t op, int64_t addr");
     decl(w, imports::FMA, "int64_t", "gex_fma", "int ctx, int64_t a, int64_t b, int64_t c, int32_t dbl");
     decl(w, imports::SAFEPOINT, "void", "gex_safepoint", "int ctx, int64_t pc");
+    decl(w, gex_abi::ftab::LOOKUP, "int32_t", "gex_lookup", "int ctx, int64_t addr");
     decl(
         w,
         imports::X87,
@@ -229,6 +234,22 @@ GEX_INLINE uint64_t gex_fma64(int ctx, uint64_t ab, uint64_t bb_, uint64_t cb, u
     }
     return (uint64_t)gex_fma(ctx, (int64_t)ab, (int64_t)bb_, (int64_t)cb, (int32_t)dbl);
 }
+
+/* The function table (docs/merge-plan.md §9.8.1). A unit is linked
+   position-independent, so its function pointers are indices into the
+   process's table, and a call through one is `call_indirect` on it. The
+   index for a guest address comes from the probe cache: the entry's low half
+   is the address, its high half the index; a miss is the resolve stub (0),
+   which asks the host. Every call through the table stores its target in
+   ctx.LAST_TARGET first (the resolve stub, and any slot a thread has not
+   filled, read it). */
+typedef int (*gex_body_t)(int ctx, int32_t depth, uint32_t need, uint64_t ret);
+GEX_INLINE uint32_t gex_ftab_idx(uint64_t t) {
+    uint32_t slot = ((uint32_t)t * GEX_FCACHE_MUL) >> (32u - GEX_FCACHE_BITS);
+    uint64_t e = __atomic_load_n((gex_a64 *)GEX_P(GEX_FCACHE + 8u * slot), __ATOMIC_RELAXED);
+    return (e & 0xffffffffull) == t ? (uint32_t)(e >> 32) : GEX_FTAB_RESOLVE;
+}
+#define GEX_FTAB(i) ((gex_body_t)(uintptr_t)(i))
 
 /* Whether the code page holding guest address `a` was rewritten after its
    unit was installed (gex_abi::PATCHED_PAGES): a constant address, one load. */

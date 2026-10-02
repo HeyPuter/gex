@@ -41,6 +41,11 @@ struct CModule<'a> {
     exports: HashMap<String, u32>,
     /// Function names from wasm-ld's name section, when it kept one.
     names: HashMap<u32, String>,
+    /// A position-independent whole-image unit's: the index of the
+    /// `env.__stack_pointer` global it imports (clang's shadow stack).
+    stack_pointer: Option<u32>,
+    /// It imports its function table: position-independent.
+    pic: bool,
 }
 
 fn parse_c(wasm: &[u8]) -> Result<CModule<'_>> {
@@ -57,8 +62,11 @@ fn parse_c_as(wasm: &[u8], image: bool) -> Result<CModule<'_>> {
         bodies: Vec::new(),
         exports: HashMap::new(),
         names: HashMap::new(),
+        stack_pointer: None,
+        pic: false,
     };
     let mut c_memories = 0u32;
+    let mut globals = 0u32;
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
             Payload::MemorySection(r) if r.count() > 0 => bail!(
@@ -87,6 +95,16 @@ fn parse_c_as(wasm: &[u8], image: bool) -> Result<CModule<'_>> {
                                     i.name
                                 );
                             }
+                        }
+                        // A whole-image unit is linked position-independent
+                        // (docs/merge-plan.md §9.8.1): it imports the
+                        // function table and its base.
+                        TypeRef::Table(_) if image => m.pic = true,
+                        TypeRef::Global(_) if image => {
+                            if i.name == gex_abi::ftab::PIC_STACK_POINTER {
+                                m.stack_pointer = Some(globals);
+                            }
+                            globals += 1;
                         }
                         other => bail!(
                             "the C module imports {}.{} ({other:?}); only functions and the \
@@ -653,6 +671,13 @@ fn call_known_function(body_ty: u32, first_body_table: u32) -> Function {
 /// `(ctx) -> ()`: tail-call the block for `ctx::LAST_TARGET`, exactly as
 /// tier-1's `emit_dispatch_tail_call_inner` does after its stores.
 fn dispatch_function(block_ty: u32) -> Function {
+    dispatch_function_at(block_ty, 0)
+}
+
+/// [`dispatch_function`] for a module whose dispatch tables start at table
+/// index `first` (the function table's runtime module imports `gex.ftab`
+/// first).
+pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
     use Instruction as I;
     // Locals: 1 = target (i64), 2 = page (i64), 3 = entry (i32), 4 = index (i32).
     let mut f = Function::new([(2, ValType::I64), (2, ValType::I32)]);
@@ -697,7 +722,7 @@ fn dispatch_function(block_ty: u32) -> Function {
         f.instruction(&I::LocalGet(4));
         f.instruction(&I::ReturnCallIndirect {
             type_index: block_ty,
-            table_index: 0,
+            table_index: first,
         });
         f.instruction(&I::End);
         return f;
@@ -718,7 +743,7 @@ fn dispatch_function(block_ty: u32) -> Function {
         f.instruction(&I::LocalGet(4));
         f.instruction(&I::ReturnCallIndirect {
             type_index: block_ty,
-            table_index: k,
+            table_index: first + k,
         });
     }
     f.instruction(&I::End);
@@ -742,7 +767,16 @@ pub fn unspliceable_users(cwasm: &[u8]) -> Result<Vec<String>> {
         let f = nimp + k as u32;
         let mut ops = body.get_operators_reader()?;
         while !ops.eof() {
-            if matches!(ops.read()?, Operator::GlobalGet { .. } | Operator::GlobalSet { .. }) {
+            let sp = match ops.read()? {
+                Operator::GlobalGet { global_index } | Operator::GlobalSet { global_index } => {
+                    match c.stack_pointer {
+                        Some(s) => s == global_index,
+                        None => !c.pic,
+                    }
+                }
+                _ => false,
+            };
+            if sp {
                 let name = c.names.get(&f).cloned().or_else(|| {
                     c.exports.iter().find(|(_, &i)| i == f).map(|(n, _)| n.clone())
                 });
