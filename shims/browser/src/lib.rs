@@ -1886,7 +1886,11 @@ static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
 
 /// nfds, readfds and writefds of the select in flight; nfds 0 means none.
 /// Where `clock_gettime` was told to write, so the trace can read it back.
-static CLOCK_ARG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static CLOCK_ARG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 static SELECT_ARGS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -4972,8 +4976,11 @@ pub extern "C" fn gex_reset_directory() -> u32 {
 /// segments are passive, so its blocks reach the table only via `gexfillat`;
 /// when a branch misses on a page this process already has a base for, the code
 /// exists but is unwritten, so ask for the slot rather than re-lift the block.
-static FILL_WANTED: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(-1);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_WANTED: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
 
 /// Pages already asked about, so one nobody can fill is asked once and then
 /// takes the ordinary path rather than asking forever.
@@ -5006,8 +5013,11 @@ static SERVED_PAGE: SingleThreaded<std::collections::BTreeSet<u64>> =
     SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
 
 /// The page the host is being asked about, so the answer can be attributed.
-static FILL_PENDING: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(-1);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_PENDING: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
 
 /// The host is holding a module whose slots are not written yet.
 ///
@@ -5040,16 +5050,24 @@ pub extern "C" fn gex_fill_possible(on: i32) {
 ///
 /// A fill writes `FILL_SPAN` slots from here rather than the whole page. See
 /// `gex_abi::FILL_SPAN` for why.
-static FILL_FROM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_FROM: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 /// The address that missed, for the fill the host is about to run. `FILL_FROM`
 /// is it rounded to a span, which the module needs; this exact pc is how to see
 /// whether the one slot the guest dispatches through came back written.
-static FILL_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_PC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[no_mangle]
 pub extern "C" fn gex_fill_pc() -> u64 {
-    FILL_PC.load(std::sync::atomic::Ordering::Relaxed)
+    FILL_PC.with(|c| c.get())
 }
 
 /// Slots a fill writes: `FILL_SPAN` normally, a whole page for a closure built
@@ -5067,13 +5085,13 @@ pub extern "C" fn gex_set_fill_width(n: u32) {
 
 #[no_mangle]
 pub extern "C" fn gex_fill_from() -> u32 {
-    FILL_FROM.load(std::sync::atomic::Ordering::Relaxed)
+    FILL_FROM.with(|c| c.get())
 }
 
 /// The slot the host should write, or -1 if it is not being asked.
 #[no_mangle]
 pub extern "C" fn gex_fill_wanted() -> i64 {
-    FILL_WANTED.load(std::sync::atomic::Ordering::Relaxed)
+    FILL_WANTED.with(|c| c.get())
 }
 
 /// The host has answered, and whether it found anybody. A page nobody could
@@ -5081,12 +5099,12 @@ pub extern "C" fn gex_fill_wanted() -> i64 {
 /// deferred module arrives.
 #[no_mangle]
 pub extern "C" fn gex_fill_done(ok: i32) {
-    let page = FILL_PENDING.swap(-1, std::sync::atomic::Ordering::Relaxed);
+    let page = FILL_PENDING.with(|c| c.replace(-1));
     if ok == 0 && page >= 0 {
         // Under KLOCK: shared with the miss path's `FILL_ASKED`/`FILL_FAILED`.
         with_host(|_| FILL_FAILED.0.borrow_mut().insert(page as u64));
     }
-    FILL_WANTED.store(-1, std::sync::atomic::Ordering::Relaxed);
+    FILL_WANTED.with(|c| c.set(-1));
 }
 
 /// The directory the guest starts in, staged until it is loaded.
@@ -5201,7 +5219,11 @@ const SAFEPOINT_SIGNALS: bool = true;
 
 /// The global signal counter as this Worker last saw it at a safepoint. See the
 /// two-step check in `gex_safepoint`.
-static SIGNAL_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static SIGNAL_SEEN: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
 
 /// How long a syscall waits where it stands before giving the stack back.
 ///
@@ -5769,9 +5791,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             // given: apt's stall is a pselect6/clock_gettime loop recomputing a
             // deadline that never arrives if the clock does not move.
             let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
-            CLOCK_ARG.store(g(1), std::sync::atomic::Ordering::Relaxed);
+            CLOCK_ARG.with(|c| c.set(g(1)));
         } else {
-            CLOCK_ARG.store(0, std::sync::atomic::Ordering::Relaxed);
+            CLOCK_ARG.with(|c| c.set(0));
         }
         if n == gex_kernel::syscalls::nr::PSELECT6 {
             let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
@@ -6554,7 +6576,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         };
         let clk = {
-            let at = CLOCK_ARG.load(std::sync::atomic::Ordering::Relaxed);
+            let at = CLOCK_ARG.with(|c| c.get());
             if at == 0 {
                 String::new()
             } else {
@@ -10179,7 +10201,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // signal only when the kernel checks them, which `deliver_pending` does --
     // so a due timer has to count as "something to deliver" here, or a
     // process that never blocks (a shell's `timeout`) never gets its SIGALRM.
-    let anything = SIGNAL_SEEN.swap(sent, std::sync::atomic::Ordering::Relaxed) != sent
+    let anything = SIGNAL_SEEN.with(|c| c.replace(sent)) != sent
         || with_host(|h| h.kernel.signals.has_pending() || h.kernel.timer_due());
     // A thread table with this thread in it: a safepoint can fire in a child
     // still being built, where an empty table would panic.
@@ -10291,7 +10313,11 @@ fn remiss(pc: u64) {
 }
 
 /// The pc of the most recent dispatch miss, for the host's install check.
-static LAST_MISS_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static LAST_MISS_PC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A guest address to watch (`GEX_WATCH_MEM`): its 8 bytes are re-read at every
 /// syscall and dispatch miss, and a change is reported with what ran between.
@@ -10323,7 +10349,7 @@ fn watch_mem(where_: &str) {
 
 #[no_mangle]
 pub extern "C" fn gex_miss_pc() -> i64 {
-    LAST_MISS_PC.load(std::sync::atomic::Ordering::Relaxed) as i64
+    LAST_MISS_PC.with(|c| c.get()) as i64
 }
 
 /// This process's pid, from the static every syscall refreshes.
@@ -10335,7 +10361,7 @@ pub extern "C" fn gex_my_pid() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
-    LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+    LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
@@ -10454,10 +10480,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // `gex_fill_possible`/`gex_fill_done`, which now lock the same way.
         let fresh = with_host(|_| FILL_ASKED.0.borrow_mut().insert(key));
         if fresh {
-            FILL_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
-            FILL_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
-            FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
-            FILL_PENDING.store(page as i64, std::sync::atomic::Ordering::Relaxed);
+            FILL_FROM.with(|c| c.set(from));
+            FILL_PC.with(|c| c.set(pc));
+            FILL_WANTED.with(|c| c.set(page as i64));
+            FILL_PENDING.with(|c| c.set(page as i64));
             with_host(|h| {
                 set_resume(pc);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
