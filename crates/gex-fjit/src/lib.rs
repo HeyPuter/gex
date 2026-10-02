@@ -26,6 +26,7 @@
 
 pub mod cfg;
 pub mod emit;
+pub mod inline;
 pub mod module;
 pub mod prep;
 
@@ -55,6 +56,7 @@ pub fn build(
     let intrinsics: HashSet<u64> = intrinsics.iter().copied().collect();
     let ib: HashMap<u64, &Block> = refs.iter().filter(|b| intrinsics.contains(&b.start)).map(|b| (b.start, *b)).collect();
     let mut funcs = gex_cgen::select(functions, &ib, &guarded)?;
+    let inlined = inline::inline_all(&mut funcs);
     for f in &mut funcs {
         prep::prepare(f, summaries);
     }
@@ -68,13 +70,14 @@ pub fn build(
     if std::env::var_os("GEX_FJIT_STATS").is_some() {
         let n = stats.functions.max(1);
         eprintln!(
-            "[fjit] {} functions ({} irreducible, {} left to tier-1), {} blocks, {} loops outlined; calls: {} known \
+            "[fjit] {} functions ({} irreducible, {} left to tier-1), {} blocks, {} loops outlined, {} calls inlined; calls: {} known \
              ({} to trap-free), {} indirect, {} leaving; {} known tail calls, {} switches, {} returns",
             stats.functions,
             stats.irreducible,
             stats.dropped,
             stats.blocks,
             stats.loops_outlined,
+            inlined,
             stats.calls_known,
             stats.calls_trapfree,
             stats.calls_indirect,
@@ -103,19 +106,33 @@ pub fn build(
 
 /// A run-time translation of `functions` (memory form, verified; the first
 /// is the one asked for) for the function table: the module, the entries it
-/// holds, what the emitter did. `pages` are the `PAGE_GEN` values each
-/// function checks on entry.
+/// holds, what the emitter did. `page_gen` gives the `PAGE_GEN` value of a
+/// page, which each function checks on entry for every page it covers.
 /// `intrinsics` are tier-1's blocks for the entries it serves with a host
 /// builtin (`gex_xlate::intrinsic`): those functions are formed from them.
 pub fn runtime(
     functions: Vec<Function>,
     summaries: &HashMap<u64, Summary>,
     class32: bool,
-    pages: &HashMap<u64, Vec<(u64, u32)>>,
+    page_gen: &dyn Fn(u64) -> u32,
     intrinsics: &[Block],
 ) -> Result<(Vec<u8>, Vec<u64>, Stats)> {
     let ib: HashMap<u64, &Block> = intrinsics.iter().map(|b| (b.start, b)).collect();
     let mut functions = gex_cgen::select(functions, &ib, &HashSet::new())?;
+    inline::inline_all(&mut functions);
+    let mut pages: HashMap<u64, Vec<(u64, u32)>> = HashMap::new();
+    for f in &functions {
+        let mut ps: Vec<u64> = f
+            .blocks
+            .iter()
+            .filter(|b| !b.synthetic)
+            .flat_map(|b| (b.start / gex_abi::DISPATCH_PAGE)..=(b.end.max(b.start + 1) - 1) / gex_abi::DISPATCH_PAGE)
+            .collect();
+        ps.sort_unstable();
+        ps.dedup();
+        pages.insert(f.entry, ps.into_iter().map(|p| (p, page_gen(p))).collect());
+    }
+    let pages = &pages;
     for f in &mut functions {
         prep::prepare(f, summaries);
     }

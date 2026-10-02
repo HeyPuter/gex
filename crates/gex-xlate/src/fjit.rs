@@ -159,18 +159,6 @@ impl Jit {
             }
         }
         let sums = summary::analyze_functions(&batch).map;
-        let mut pages: HashMap<u64, Vec<(u64, u32)>> = HashMap::new();
-        for f in batch.values() {
-            let mut ps: Vec<u64> = f
-                .blocks
-                .iter()
-                .filter(|b| !b.synthetic)
-                .flat_map(|b| (b.start / gex_abi::DISPATCH_PAGE)..=(b.end.max(b.start + 1) - 1) / gex_abi::DISPATCH_PAGE)
-                .collect();
-            ps.sort_unstable();
-            ps.dedup();
-            pages.insert(f.entry, ps.into_iter().map(|p| (p, page_gen(p))).collect());
-        }
         let recovered = started.elapsed();
         let functions: Vec<Function> = order.iter().filter_map(|a| batch.remove(a)).collect();
         let n = functions.len();
@@ -178,7 +166,7 @@ impl Jit {
             .iter()
             .filter_map(|a| self.intrinsics.get(a).map(|&k| crate::intrinsic::block(*a, k)))
             .collect();
-        let out = match gex_fjit::runtime(functions, &sums, class32, &pages, &builtins) {
+        let out = match gex_fjit::runtime(functions, &sums, class32, page_gen, &builtins) {
             Ok((wasm, entries, es)) if entries.contains(&addr) => {
                 if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
                     eprintln!("[fjit] {addr:#x}: {es:?}");
