@@ -272,7 +272,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     });
                     let nest_exits = GuestMem::new(memory.bytes()).read_u64(gex_abi::NEST_EXITS).unwrap_or(0);
                     let leaves = crate::CGEN_LEAVES.load(std::sync::atomic::Ordering::Relaxed);
-                    let cg = format!("cgen nest_exits={nest_exits} leaves={leaves}");
+                    let co = crate::CALLOUTS.load(std::sync::atomic::Ordering::Relaxed);
+                    let coa = crate::CALLOUT_ABORTS.load(std::sync::atomic::Ordering::Relaxed);
+                    let cg = format!("cgen nest_exits={nest_exits} leaves={leaves} callouts={co} callout_aborts={coa}");
                     match value {
                         Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
                         None => eprintln!("gex-nt: stats t={} presents={presents} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),

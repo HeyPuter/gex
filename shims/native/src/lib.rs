@@ -195,6 +195,13 @@ struct HostState {
     exit: Option<Exit>,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
+    /// The function tier's call-outs in progress on this thread, innermost
+    /// last (`call_out`).
+    callouts: Vec<Callout>,
+    /// What the watch stub decided, for `call_out`'s loop.
+    callout_signal: Option<CalloutSignal>,
+    /// The host function watched slots hold (`watch_stub`).
+    watch_stub: Option<wasmtime::Func>,
     /// Where the guest is spending its time, when anyone asked.
     sampler: Option<Arc<Sampler>>,
     /// The compositor, when the guest was given one.
@@ -902,6 +909,9 @@ fn run_program_with(
             proc_state,
             exit: None,
             resume_at: None,
+            callouts: Vec::new(),
+            callout_signal: None,
+            watch_stub: None,
             sampler: sampler.clone(),
             wayland: compositor.clone(),
         virgl: renderer.clone(),
@@ -1715,6 +1725,9 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            callouts: Vec::new(),
+            callout_signal: None,
+            watch_stub: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
             virgl: cx.virgl.clone(),
@@ -1865,6 +1878,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            callouts: Vec::new(),
+            callout_signal: None,
+            watch_stub: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
             virgl: cx.virgl.clone(),
@@ -2827,6 +2843,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 
     linker.func_wrap(
         m,
+        imports::CALL_OUT,
+        |mut caller: Caller<'_, HostState>, ctx: i32, target: i64, ret: i64, sp_want: i64| -> Result<i32> {
+            call_out(&mut caller, ctx, target as u64, ret as u64, sp_want as u64)
+        },
+    )?;
+
+    linker.func_wrap(
+        m,
         imports::DISPATCH_MISS,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<i32> {
             let pc = pc as u64;
@@ -3319,6 +3343,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .memory
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            // A call-out whose caller's frame the stack has unwound past
+            // (longjmp, an exception) is abandoned: its caller leaves.
+            if let Some(co) = caller.data().callouts.last() {
+                let ctx_addr = caller.data().thread.ctx_addr;
+                let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
+                if sp > co.sp_want + CALLOUT_UNWOUND {
+                    let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
+                    caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
+                    return Err(StopExecution.into());
+                }
+            }
             let data = memory.bytes();
             let state = caller.data_mut();
             let mut gm = GuestMem::new(data);
@@ -3612,6 +3647,7 @@ fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
         install_unit(&mut *caller, unit)?;
         caller.data_mut().jit.as_mut().unwrap().replayed += 1;
     }
+    refresh_callouts(&mut *caller)?;
     Ok(true)
 }
 
@@ -3760,6 +3796,11 @@ fn install_unit(
         .and_then(|s| s.prof_proc.clone());
     profile::link(&mut linker, cx.as_context_mut(), &proc)?;
     jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !cx.as_context().data().callouts.is_empty() {
+        let slots: std::collections::HashSet<u64> =
+            unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a)).collect();
+        note_overwritten(&mut cx, &|s| slots.contains(&s));
+    }
     let instance = linker
         .instantiate(cx.as_context_mut(), &unit.module)
         .context("instantiating a runtime-translated module")?;
@@ -3947,6 +3988,10 @@ fn install_cgen(
         }
         Ok(r)
     };
+    if !cx.as_context().data().callouts.is_empty() {
+        let slots: std::collections::HashSet<u64> = cg.entries.iter().map(|e| e.2 as u64).collect();
+        note_overwritten(&mut cx, &|s| slots.contains(&s));
+    }
     let mut cxm = cx.as_context_mut();
     for &(_, k, slot, _) in &cg.entries {
         let (e, b) = refs[k as usize];
@@ -4033,6 +4078,251 @@ fn cgen_leave(caller: &Caller<'_, HostState>, ctx: i32, ret: i64) {
     eprintln!("gex-cgen: the call returning to {ret:#x} leaves the function tier for {target:#x} (no unit holds it)");
 }
 
+/// A function-tier call-out in progress (`call_out`): the return it waits
+/// for, and the dispatch slot it watches for it with the old content.
+struct Callout {
+    ret: u64,
+    sp_want: u64,
+    /// `(slot, what the slot held)` while watched.
+    slot: Option<(u64, wasmtime::Ref)>,
+    /// The slot holds the watch stub (an install may have written over it).
+    live: bool,
+}
+
+/// What the watch stub found when a dispatch reached a watched slot.
+enum CalloutSignal {
+    /// The return call-out `i` waits for.
+    Return(usize),
+    /// Something else that shares the slot: run what it held.
+    Bypass(wasmtime::Func),
+    /// The stack unwound past the innermost call-out's caller.
+    Abort,
+}
+
+/// Call-outs nested deeper than this leave instead: each holds a host frame
+/// and a nested wasm call.
+const CALLOUT_MAX_DEPTH: usize = 32;
+
+/// How far above `sp_want` the stack pointer may be at the return: what a
+/// stdcall callee pops.
+const CALLOUT_SP_SLACK: u64 = 1024;
+
+/// How far above `sp_want` a safepoint must find the stack pointer to call
+/// a call-out's caller unwound (well past any argument popping).
+const CALLOUT_UNWOUND: u64 = 64 << 10;
+
+/// The table-0 slot dispatch reaches `pc` through, as the directory says now.
+fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<u64> {
+    let page = pc / gex_abi::DISPATCH_PAGE;
+    if page >= gex_abi::DISPATCH_MAX_PAGES {
+        return None;
+    }
+    let entry = GuestMem::new(memory.bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).ok()?;
+    if gex_abi::dispatch_entry_table(entry) != 0 {
+        return None;
+    }
+    Some(gex_abi::dispatch_index(pc, entry))
+}
+
+/// The per-store stub a watched slot holds (`call_out`), made once.
+fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtime::Func {
+    if let Some(f) = cx.as_context().data().watch_stub.clone() {
+        return f;
+    }
+    let f = wasmtime::Func::wrap(cx.as_context_mut(), |mut caller: Caller<'_, HostState>, ctx: i32| -> Result<()> {
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        let gm = GuestMem::new(memory.bytes());
+        let c = ctx as u32 as u64;
+        let target = if gex_abi::X86 { gm.read_u64(c + ctx::LAST_TARGET as u64) } else { gm.read_u64(c + ctx::PC as u64) }.unwrap_or(0);
+        let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
+        let state = caller.data_mut();
+        let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + CALLOUT_SP_SLACK);
+        let signal = match hit {
+            Some(i) => CalloutSignal::Return(i),
+            None => {
+                // Another address in the slot, or the same return for a
+                // deeper frame (recursion): what the slot held runs it.
+                let slot = dispatch_slot_of(&memory, target);
+                let old = state.callouts.iter().rev().find_map(|co| match &co.slot {
+                    Some((s, r)) if Some(*s) == slot => r.as_func().flatten().cloned(),
+                    _ => None,
+                });
+                match old {
+                    Some(f) => CalloutSignal::Bypass(f),
+                    None => bail!("a watched dispatch slot with nothing to run for {target:#x}"),
+                }
+            }
+        };
+        let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
+        state.callout_signal = Some(signal);
+        Err(StopExecution.into())
+    });
+    cx.as_context_mut().data_mut().watch_stub = Some(f.clone());
+    f
+}
+
+/// The stack pointer's register index in the context.
+fn sp_index() -> u8 {
+    if gex_abi::X86 {
+        4
+    } else {
+        31
+    }
+}
+
+/// An install wrote dispatch slots `written`: a watched one no longer holds
+/// the stub, and what it now holds is what the return should run when it is
+/// not the awaited one.
+fn note_overwritten(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, written: &dyn Fn(u64) -> bool) {
+    for co in cx.as_context_mut().data_mut().callouts.iter_mut() {
+        if let Some((s, _)) = &co.slot {
+            if written(*s) {
+                co.live = false;
+            }
+        }
+    }
+}
+
+/// Point every call-out's watched slot at the watch stub again, wherever the
+/// directory now says its return is: a translation or a retirement may have
+/// moved it, and an install may have written over it.
+fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> Result<()> {
+    if cx.as_context().data().callouts.is_empty() {
+        return Ok(());
+    }
+    let Some(memory) = cx.as_context().data().memory.clone() else { return Ok(()) };
+    let Some(table) = cx.as_context().data().jit.as_ref().map(|j| j.tables[0]) else { return Ok(()) };
+    let stub = watch_stub(cx);
+    let size = table.size(cx.as_context_mut());
+    let n = cx.as_context().data().callouts.len();
+    for i in 0..n {
+        let ret = cx.as_context().data().callouts[i].ret;
+        let want = dispatch_slot_of(&memory, ret).filter(|&s| s < size);
+        let have = cx.as_context().data().callouts[i].slot.as_ref().map(|(s, _)| *s);
+        if have.is_some() && have != want {
+            // The return moved: put the old slot back, unless another
+            // call-out still watches it or an install wrote over the stub.
+            let (s, old, live) = {
+                let mut c = cx.as_context_mut();
+                let co = &mut c.data_mut().callouts[i];
+                let (s, old) = co.slot.take().unwrap();
+                (s, old, std::mem::replace(&mut co.live, false))
+            };
+            let shared = cx.as_context().data().callouts.iter().any(|c| matches!(&c.slot, Some((os, _)) if *os == s));
+            if live && !shared {
+                table.set(cx.as_context_mut(), s, old)?;
+            }
+        }
+        let Some(s) = want else { continue };
+        // Is the stub live in `s` for some call-out?
+        let sharing = cx.as_context().data().callouts.iter().position(|co| co.live && matches!(&co.slot, Some((os, _)) if *os == s));
+        if let Some(j) = sharing {
+            let old = cx.as_context().data().callouts[j].slot.as_ref().unwrap().1.clone();
+            let mut c = cx.as_context_mut();
+            let co = &mut c.data_mut().callouts[i];
+            co.slot = Some((s, old));
+            co.live = true;
+            continue;
+        }
+        // The slot holds real content: save it for every call-out watching
+        // it, and arm the stub.
+        let cur = table.get(cx.as_context_mut(), s).ok_or_else(|| anyhow!("dispatch slot {s} out of range"))?;
+        for (k, co) in cx.as_context_mut().data_mut().callouts.iter_mut().enumerate() {
+            if k == i || matches!(&co.slot, Some((os, _)) if *os == s) {
+                co.slot = Some((s, cur.clone()));
+                co.live = true;
+            }
+        }
+        table.set(cx.as_context_mut(), s, wasmtime::Ref::Func(Some(stub.clone())))?;
+    }
+    Ok(())
+}
+
+/// `gex.call_out` (docs/function-tier.md §7.3): run the guest from `target`
+/// until it returns to `ret` with the stack pointer at `sp_want` (or what a
+/// callee popped above it), then let the C caller carry on (1); 0 when that
+/// cannot be done, and the caller leaves as before.
+fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u64, sp_want: u64) -> Result<i32> {
+    if caller.data().callouts.len() >= CALLOUT_MAX_DEPTH || caller.data().jit.is_none() {
+        return Ok(0);
+    }
+    let enter = match caller.get_export(exports::ENTER).and_then(Extern::into_func) {
+        Some(f) => f,
+        None => {
+            let instances = caller.data().jit.as_ref().map(|j| j.instances.clone()).unwrap_or_default();
+            match instances.iter().find_map(|i| i.get_func(&mut *caller, exports::ENTER)) {
+                Some(f) => f,
+                None => return Ok(0),
+            }
+        }
+    };
+    CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = ctx_i as u32 as u64;
+    caller.data_mut().callouts.push(Callout { ret, sp_want, slot: None, live: false });
+    let me = caller.data().callouts.len() - 1;
+    refresh_callouts(&mut *caller)?;
+    let mut next: Option<wasmtime::Func> = None;
+    let mut pc = target;
+    let result = loop {
+        let r = match next.take() {
+            Some(f) => f.call(&mut *caller, &[Val::I32(ctx_i)], &mut []),
+            None => enter.call(&mut *caller, &[Val::I32(ctx_i), Val::I64(pc as i64)], &mut []),
+        };
+        if let Some(child) = caller.data_mut().pending_spawn.take() {
+            let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
+            start_guest_thread(cx, child)?;
+        }
+        let e = match r {
+            Ok(()) => break Err(anyhow!("guest code returned out of a call-out")),
+            Err(e) => e,
+        };
+        if let Some(sig) = caller.data_mut().callout_signal.take() {
+            match sig {
+                CalloutSignal::Return(i) if i == me => break Ok(1),
+                // An outer call-out's return: this one's caller is gone.
+                CalloutSignal::Return(_) | CalloutSignal::Abort => break Ok(0),
+                CalloutSignal::Bypass(f) => {
+                    next = Some(f);
+                    continue;
+                }
+            }
+        }
+        if caller.data().exit.is_some() {
+            break Err(e);
+        }
+        if let Some(at) = caller.data_mut().resume_at.take() {
+            pc = at;
+            refresh_callouts(&mut *caller)?;
+            continue;
+        }
+        if is_stale_table_trap(&e) {
+            catch_up_in_caller(caller)?;
+            refresh_callouts(&mut *caller)?;
+            pc = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
+            continue;
+        }
+        break Err(e);
+    };
+    // Unwatch: put the slot back unless an install has written over it.
+    if let Some(co) = caller.data_mut().callouts.pop() {
+        if let (Some((s, old)), Some(table)) = (co.slot, caller.data().jit.as_ref().map(|j| j.tables[0])) {
+            let outer_watches = caller.data().callouts.iter().any(|c| matches!(&c.slot, Some((os, _)) if *os == s));
+            if co.live && !outer_watches {
+                table.set(&mut *caller, s, old)?;
+            }
+        }
+    }
+    if matches!(result, Ok(0)) {
+        CALLOUT_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+/// Call-outs started and abandoned (GEX_NT_STATS).
+pub(crate) static CALLOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CALLOUT_ABORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Every dispatch table a translated image module exports, in index order.
 /// Several because V8 caps a table at 10M entries; natively tables past the
 /// first stay empty but must exist because the code names them.
@@ -4106,6 +4396,7 @@ fn retire_translations(
     }
     drop(sh);
     nt_cgen::on_retire(&memory, ranges);
+    refresh_callouts(caller)?;
     if pages > 0 && std::env::var_os("GEX_VERBOSE_OBJECTS").is_some() {
         eprintln!("[gex] retired {pages} dispatch pages the guest unmapped");
     }

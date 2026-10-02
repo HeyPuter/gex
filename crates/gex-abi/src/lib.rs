@@ -608,6 +608,15 @@ pub mod imports {
     /// index to re-enter. In M0 this always traps; from M3 it drives gex-jit.
     pub const DISPATCH_MISS: &str = "dispatch_miss";
 
+    /// The function tier calling code it does not hold (docs/function-tier.md
+    /// §7.3). Signature `(ctx: i32, target: i64, ret: i64, sp_want: i64) ->
+    /// i32`: everything is written back and `ctx::PC = target`; the host runs
+    /// the guest from there until it returns to `ret` with the stack pointer
+    /// back at `sp_want` (or above it by what a callee popped) and returns 1,
+    /// the caller then carrying on; or returns 0 when it cannot (nested too
+    /// deep, the stack unwound past the caller), and the caller leaves.
+    pub const CALL_OUT: &str = "call_out";
+
     /// A decoded-but-unimplemented or architecturally undefined instruction.
     /// Signature `(ctx: i32, pc: i64, raw: i32) -> ()`. Raises SIGILL.
     pub const ILLEGAL: &str = "illegal";

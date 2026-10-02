@@ -90,6 +90,7 @@ pub fn header() -> String {
     };
     decl(w, imports::SYSCALL, "void", "gex_syscall", "int ctx, int64_t pc");
     decl(w, imports::DISPATCH_MISS, "int32_t", "gex_dispatch_miss", "int ctx, int64_t pc");
+    decl(w, imports::CALL_OUT, "int32_t", "gex_call_out", "int ctx, int64_t target, int64_t ret, int64_t sp_want");
     decl(w, imports::ILLEGAL, "void", "gex_illegal", "int ctx, int64_t pc, int32_t raw");
     decl(w, imports::BREAKPOINT, "void", "gex_breakpoint", "int ctx, int64_t pc, int32_t imm");
     decl(w, imports::SYSREG_READ, "int64_t", "gex_sysreg_read", "int ctx, int64_t pc, int32_t reg");

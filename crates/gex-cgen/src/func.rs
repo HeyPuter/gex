@@ -23,6 +23,13 @@ use gex_ir::{Block, Expr, GuestReg, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
+/// Whether calls to code the tier does not hold call out (§7.3) rather than
+/// leave: in whole-image units (a spliced module has no `gex.call_out`).
+/// `GEX_CGEN_EXP=NOCALLOUT` leaves, as before.
+fn call_out() -> bool {
+    !exp("NOCALLOUT")
+}
+
 /// The compiler barrier at a loop back-edge (`GEX_BACKEDGE`, gex_abi.h):
 /// another thread may change what the loop reads. `GEX_CGEN_EXP=NOBARRIER`
 /// leaves it out (unsound: pricing only).
@@ -658,9 +665,15 @@ impl FnUnit {
                     }
                     Callee::Direct(t) => {
                         *self.stats.leaves.entry(*t).or_default() += 1;
-                        // Not ours: the rest of this function runs in tier-1.
+                        // Not ours: the host runs it and comes back at the
+                        // return (§7.3); if it cannot, the rest of this
+                        // function runs in tier-1.
                         e.store_pc(&format!("0x{t:x}ull"));
-                        e.line("  return 0;");
+                        if call_out() && self.call_known_import {
+                            e.line(format!("  if (!gex_call_out(ctx, 0x{t:x}ll, (int64_t){ret_arg}, (int64_t)sp_want)) return 0;"));
+                        } else {
+                            e.line("  return 0;");
+                        }
                     }
                     Callee::Indirect(v) => {
                         self.uses_call_known = true;
@@ -672,7 +685,11 @@ impl FnUnit {
                         ));
                         e.line("  if (rk < 0) {");
                         e.store_pc(&t);
-                        e.line("    return 0;");
+                        if call_out() && self.call_known_import {
+                            e.line(format!("    rk = gex_call_out(ctx, (int64_t){t}, (int64_t){ret_arg}, (int64_t)sp_want);"));
+                        } else {
+                            e.line("    return 0;");
+                        }
                         e.line("  }");
                         e.line("  if (!rk) return 0;");
                     }
