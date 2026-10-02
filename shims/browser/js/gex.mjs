@@ -39,8 +39,20 @@ function moduleContentKey(bytes) {
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
 const SHIM_STACK_TOP = 0x06000000;
+/** The most a dispatch table grows past what is needed, in entries. */
+const TABLE_STEP = 1 << 20;
 /** `gex_abi::ctx::LAST_TARGET`. */
 const CTX_LAST_TARGET = 44 * 8;
+/**
+ * `table.grow`, said out loud once a table passes a million entries: each
+ * Worker's dispatch tables are V8 heap, and their size is the renderer's.
+ */
+function growTable(table, delta, init, which) {
+  const to = table.length + delta;
+  if (to > (1 << 20)) console.warn(`[gex] dispatch table ${which} grows ${table.length} -> ${to} entries`);
+  table.grow(delta, init);
+}
+
 /** `gex_abi::BOOT_STACK_COUNTER`: which bootstrap stack slice is next. */
 const BOOT_STACK_COUNTER = 0x00100000 - 192;
 /**
@@ -2306,7 +2318,14 @@ export class Gex {
     // Which thread's registers to enter with. The first thread unless a thread
     // in its own Worker says otherwise, or it runs the main thread's registers.
     let ctx = startCtx;
+    // When the last trap came out, for GEX_NT_STATS' time split: what the
+    // glue costs between a trap and the guest again.
+    let trappedAt = 0;
     for (;;) {
+      if (trappedAt) {
+        this.#shim.exports.gex_nt_note_js_ns?.(ctx, (performance.now() - trappedAt) * 1e6);
+        trappedAt = 0;
+      }
       try {
         // Address zero is never a guest instruction: entering there is how a
         // lost resume address shows up, far from whatever forgot to set it.
@@ -2324,6 +2343,7 @@ export class Gex {
         }
         return this.#shim.exports.gex_exit_code();
       } catch (err) {
+        trappedAt = performance.now();
         // First, before asking the shim anything: was this a handoff or a
         // crash? Every way out is the same `unreachable` to the engine, and
         // treating a crash as a handoff reported a crashed runtime as a clean
@@ -2811,7 +2831,12 @@ export class Gex {
       // Geometrically, not exactly: `Table.grow` reallocates and copies, so
       // growing by exactly what each module wants copies an ever-larger table
       // once per module. Doubling makes total copying linear in the final size.
-      const want = Math.min(Math.max(need_i, tables[i].length * 2), per);
+      // Bounded: doubling a table of millions asks V8 for one FixedArray of
+      // tens of megabytes per table per Worker, and at Noita's world load
+      // that request killed the renderer (V8 OOM with an 87 MB heap). A
+      // million entries (8 MB) at most beyond what is needed.
+      const len = tables[i].length;
+      const want = Math.min(Math.max(need_i, Math.min(len * 2, len + TABLE_STEP)), per);
       this.#iGrows++;
       this.#iAdded += want - tables[i].length;
       this.#iCopied += want;
@@ -2824,8 +2849,7 @@ export class Gex {
         );
       }
       try {
-        if (tables[i].length + (want - tables[i].length) > (1 << 21)) console.error(`[gex] table grows to ${tables[i].length + (want - tables[i].length)} entries`);
-        tables[i].grow(want - tables[i].length, stub);
+        growTable(tables[i], want - tables[i].length, stub, i);
       } catch (err) {
         throw new Error(
           `dispatch table ${i} would not grow from ${tables[i].length} to ${want}: ${err.message}`,
@@ -2853,8 +2877,7 @@ export class Gex {
       const need = e.gex_claimed_slots(i) >>> 0;
       if (need <= tables[i].length) continue;
       try {
-        if (tables[i].length + (need - tables[i].length) > (1 << 21)) console.error(`[gex] table grows to ${tables[i].length + (need - tables[i].length)} entries`);
-        tables[i].grow(need - tables[i].length, stub);
+        growTable(tables[i], need - tables[i].length, stub, i);
         grew = true;
       } catch {
         /* a table that will not grow is reported by the caller's retry cap */
@@ -3164,8 +3187,7 @@ export class Gex {
         const want = Math.min(Math.max(need - i * per, 0), per);
         if (tables[i].length < want) {
           grew += want - tables[i].length;
-          if (tables[i].length + (want - tables[i].length) > (1 << 21)) console.error(`[gex] table grows to ${tables[i].length + (want - tables[i].length)} entries`);
-          tables[i].grow(want - tables[i].length, stub);
+          growTable(tables[i], want - tables[i].length, stub, i);
         }
       }
       try {
@@ -3305,8 +3327,7 @@ export class Gex {
     const delta = want - tables[t].length;
     if (delta <= 0) return;
     const g0 = performance.now();
-    if (tables[t].length + (delta) > (1 << 21)) console.error(`[gex] table grows to ${tables[t].length + (delta)} entries`);
-    tables[t].grow(delta, stub);
+    growTable(tables[t], delta, stub, t);
     this.#pubGrewSlots += delta;
     this.#pubGrowMs += performance.now() - g0;
   }

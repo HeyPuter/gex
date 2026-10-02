@@ -127,6 +127,10 @@ async function main() {
       nextShot += 30000;
       await shot(`t${String(++shots).padStart(3, '0')}`);
       log(`${((Date.now() - t0) / 1000).toFixed(0)} s: ${p.n} frames${p.peek !== null ? `, world frame ${p.peek}` : ''}`);
+      // The compositor's side of the frames: GL submits and their time,
+      // readbacks (what SwiftShader took for each frame).
+      const gl = (await evaluate('globalThis.__gexCompositor?.describe()', true))?.gl;
+      if (gl) log(`compositor gl: ${gl}`);
     }
     if (!steps.length && !gameplay && p.n >= last + 50) {
       await sleep(3000);
