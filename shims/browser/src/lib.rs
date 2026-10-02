@@ -38,6 +38,7 @@ pub mod gl;
 pub mod wl;
 mod xwm;
 pub(crate) mod memmap;
+mod cgen;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -10438,6 +10439,15 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
+    // A function-tier unit another Worker published that this one has not
+    // installed yet: the miss is a catch-up, done in JS, not a translation.
+    if cgen::behind() {
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator

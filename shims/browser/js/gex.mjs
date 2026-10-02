@@ -911,6 +911,9 @@ export class Gex {
     }
     // Whatever `useGl` was told before the shim existed.
     this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
+    // And `useCgen`, before the process boots: the exe and ntdll are mapped
+    // there, and their units are looked up then.
+    if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
@@ -2250,6 +2253,200 @@ export class Gex {
    *  shim's per-thread time split. */
   #glWaitNote = (ms) => this.#shim?.exports?.gex_gl_note_wait_ns?.(ms * 1e6);
 
+  /** The function tier's whole-image units (`cgen/shims/browser/src/cgen.rs`):
+   *  1 use one where it exists, 2 also require one for a program image. The
+   *  Env's `loadUnit(key)` returns `{ wasm, entries }` (bytes, or a compiled
+   *  `WebAssembly.Module` for `wasm`) or null. */
+  useCgen(mode) {
+    this.#cgenMode = mode >>> 0;
+    if (this.#shim) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+  }
+
+  #cgenMode = 0;
+  /** This Worker's half of the units: its body table, its dispatcher and how
+   *  many published units it has installed. Made at the first one. */
+  #cgen = null;
+  /** Each unit module's `gex_fnref` answers, by key: the same for every
+   *  instance of a module, so asked once. */
+  #cgenRefs = new Map();
+
+  /** A string the shim writes for unit `u` through `fn(u, buf, cap)`. */
+  #cgenStr(fn, u) {
+    const e = this.#shim.exports;
+    const cap = 1024;
+    const buf = e.gex_alloc(cap) >>> 0;
+    try {
+      const n = Math.min(fn(u, buf, cap) >>> 0, cap);
+      return new TextDecoder().decode(this.#bytes().slice(buf, buf + n));
+    } finally {
+      e.gex_free?.(buf, cap);
+    }
+  }
+
+  /** The unit module for `key`: a sibling's, or loaded and compiled here and
+   *  offered to the siblings. Synchronous, so the nested callback loop can
+   *  install too. */
+  #cgenModule(key, got = null) {
+    const name = `cgen:${key}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    got ??= this.#env.loadUnit?.(key) ?? null;
+    if (!got) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
+    const t0 = performance.now();
+    mod = got.wasm instanceof WebAssembly.Module ? got.wasm : new WebAssembly.Module(got.wasm);
+    this.#compileMs += performance.now() - t0;
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
+  }
+
+  /** This Worker's body tables (one per dispatch table, numbered like it)
+   *  and its dispatcher, made at the first unit. */
+  #cgenStore() {
+    if (this.#cgen) return this.#cgen;
+    const e = this.#shim.exports;
+    const tables = this.#dispatchTables();
+    const bodies = TABLE_NAMES.map(() => new WebAssembly.Table({ element: 'anyfunc', initial: 0 }));
+    let dm = this.#sharedModules.get('cgen-dispatcher');
+    if (!dm) {
+      const ptr = e.gex_cgen_dispatcher_ptr() >>> 0;
+      dm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_cgen_dispatcher_len() >>> 0)));
+      this.#sharedModules.set('cgen-dispatcher', dm);
+    }
+    const gex = { memory: this.#memory };
+    for (let i = 0; i < TABLE_NAMES.length; i++) {
+      gex[TABLE_NAMES[i]] = tables[i] ?? new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
+    }
+    // `bodies0`..`bodies7`, one per dispatch table (gex_cgen::splice).
+    const gexc = {};
+    for (let i = 0; i < bodies.length; i++) gexc[`bodies${i}`] = bodies[i];
+    const di = new WebAssembly.Instance(dm, { gex, gexc });
+    this.#cgen = {
+      bodies,
+      leave: e.gex_cgen_leave,
+      dispatch: di.exports.dispatch,
+      callKnown: di.exports.call_known,
+      have: 0,
+      id: (Math.random() * 0x7fffffff) | 0,
+      reported: bodies.map(() => -1),
+      instances: [di],
+    };
+    return this.#cgen;
+  }
+
+  /** Grow each body table to its dispatch table's length and say how long it
+   *  is: each table's `BODY_LIMITS[t]` is the least of every Worker's. Unfilled
+   *  entries leave (`gex_cgen_leave`). */
+  #cgenGrowBody() {
+    const st = this.#cgen;
+    if (!st) return;
+    const tables = this.#dispatchTables();
+    for (let t = 0; t < st.bodies.length; t++) {
+      const body = st.bodies[t];
+      const want = tables[t]?.length ?? 0;
+      if (body.length < want) body.grow(want - body.length, st.leave);
+      if (st.reported[t] !== body.length) {
+        st.reported[t] = body.length;
+        this.#shim.exports.gex_cgen_body_size(st.id, t, body.length);
+      }
+    }
+  }
+
+  /** Install published unit `u` into this Worker's tables: instantiate it
+   *  against this Worker's dispatcher, then copy each entry's `e_` into its
+   *  dispatch slot and its `ib_` into the same slot of that table's body
+   *  table. */
+  #cgenInstall(u) {
+    const e = this.#shim.exports;
+    const st = this.#cgenStore();
+    const key = this.#cgenStr(e.gex_cgen_key, u);
+    const mod = this.#cgenModule(key);
+    const tables = this.#growTables(e.gex_cgen_slots(u) >>> 0, 'cgen');
+    this.#cgenGrowBody();
+    const inst = new WebAssembly.Instance(mod, {
+      env: { memory: this.#memory },
+      gex: this.#imports,
+      gexc: { dispatch: st.dispatch, call_known: st.callKnown },
+    });
+    const n = e.gex_cgen_regs(u, 0, 0) >>> 0;
+    const buf = e.gex_alloc(4 * n) >>> 0;
+    let regs;
+    try {
+      e.gex_cgen_regs(u, buf, n);
+      regs = new Uint32Array(this.#memory.buffer.slice(buf, buf + 4 * n));
+    } finally {
+      e.gex_free?.(buf, 4 * n);
+    }
+    const own = inst.exports.__indirect_function_table;
+    // The unit's own export (not the shim's), hence the bracket.
+    const fnref = inst.exports['gex_fnref'];
+    let refs = this.#cgenRefs.get(key);
+    if (!refs) {
+      refs = new Map();
+      this.#cgenRefs.set(key, refs);
+    }
+    const ref = (i) => {
+      let r = refs.get(i);
+      if (r === undefined) refs.set(i, (r = fnref(i) >>> 0));
+      return r;
+    };
+    for (let j = 0; j + 3 < regs.length; j += 4) {
+      const k = regs[j], t = regs[j + 1], slot = regs[j + 2];
+      const f = own.get(ref(2 * k));
+      if (!f) throw new Error(`gex-cgen: unit ${key} has no function for entry ${k}`);
+      tables[t].set(slot, f);
+      // A slot several entries share gets the unit's body that picks among
+      // them by `ctx::PC` (`gex_cgen::func::fnref_source`), as natively.
+      st.bodies[t].set(slot, own.get(ref(2 * k + 1)));
+    }
+    st.instances.push(inst);
+    return regs.length / 4;
+  }
+
+  /** Install every unit published so far that this Worker lacks. */
+  #cgenCatchUp() {
+    const e = this.#shim.exports;
+    if (!e.gex_cgen_count) return;
+    const count = e.gex_cgen_count() >>> 0;
+    if (!count && !this.#cgen) return;
+    const st = this.#cgenStore();
+    while (st.have < count) {
+      this.#cgenInstall(e.gex_cgen_published(st.have));
+      st.have++;
+      e.gex_cgen_have(st.have);
+    }
+    this.#cgenGrowBody();
+  }
+
+  /** Load and publish the units the shim placed (images mapped since the last
+   *  trap), then catch up. A unit's bytes never pass through the shim: only
+   *  its entry list does. */
+  #cgenServe() {
+    const e = this.#shim.exports;
+    if (!this.#cgenMode || !e.gex_cgen_wanted) return;
+    for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
+      const t0 = performance.now();
+      const key = this.#cgenStr(e.gex_cgen_key, u);
+      const path = this.#cgenStr(e.gex_cgen_path, u);
+      const got = this.#env.loadUnit?.(key) ?? null;
+      if (!got) {
+        if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
+        continue;
+      }
+      this.#cgenModule(key, got);
+      const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
+      const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
+      this.#bytes().set(ent, gp);
+      const r = e.gex_cgen_publish(u, gp, ent.byteLength / 8);
+      e.gex_free?.(gp, Math.max(8, ent.byteLength));
+      if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
+      this.#cgenCatchUp();
+      e.gex_cgen_installed(u);
+      console.error(`gex-nt: function tier for ${path}: ${ent.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    }
+    this.#cgenCatchUp();
+  }
+
   useGl(gl) {
     this.#gl = gl;
     this.#shim?.exports?.gex_set_gl?.(gl ? 1 : 0);
@@ -2301,6 +2498,8 @@ export class Gex {
     // When the last trap came out, for GEX_NT_STATS' time split: what the
     // glue costs between a trap and the guest again.
     let trappedAt = 0;
+    // Units for what booting mapped (the exe, ntdll), before the guest runs.
+    this.#cgenServe();
     for (;;) {
       if (trappedAt) {
         this.#shim.exports.gex_nt_note_js_ns?.(ctx, (performance.now() - trappedAt) * 1e6);
@@ -2516,6 +2715,7 @@ export class Gex {
         // is a no-op comparison when there is nothing to do.
         this.#armCensus();
         await this.#catchUp();
+        this.#cgenServe();
         // A `fork` leaves a child here for the host to start. Drained before
         // the parent runs on, so the two are only ever one process apart --
         // and before the memory is touched again, because what the child gets
@@ -2940,6 +3140,7 @@ export class Gex {
         }
         while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
         this.#catchUpSync();
+        this.#cgenServe();
         // A thread created inside the callback: posting it is synchronous,
         // only the answer would need the event loop.
         this.#drainThread().catch((err) => console.error(`[gex-nt] starting a thread: ${err.message ?? err}`));

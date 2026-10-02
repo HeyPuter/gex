@@ -12,6 +12,9 @@
 //     --env <KEY=VALUE>         an environment variable (repeatable); none
 //                               leaves the shim's default environment
 //     --strace               narrate every syscall to stderr
+//     --cgen                 function-tier units from GEX_CGEN_CACHE (default
+//                            ~/.cache/gex/cgen), required for a Windows
+//                            program image; --cgen-prefer: used where found
 
 import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -36,6 +39,7 @@ let cwd = null;
 const extract = [];
 let argv0 = null;
 const env = [];
+let cgenMode = 0;
 const dirs = [];
 const rest = [];
 {
@@ -110,6 +114,8 @@ const rest = [];
     } else if (av[i] === '--cwd') cwd = av[++i];
     else if (av[i] === '--env') env.push(av[++i] ?? '');
     else if (av[i] === '--strace') strace = true;
+    else if (av[i] === '--cgen') cgenMode = 2;
+    else if (av[i] === '--cgen-prefer') cgenMode = 1;
     else if (av[i] === '--argv0') argv0 = av[++i];
     else break;
   }
@@ -230,6 +236,10 @@ const host = new ProcessHost({
   // Merged into every process's start message, because on a real machine
   // every process gets the same of all of this.
   extra: {
+    // Function-tier units (--cgen): where their files are, for every Worker.
+    cgen: cgenMode
+      ? { mode: cgenMode, root: process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
+      : undefined,
     // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
     // deflate stream that a UTF-8 round trip would fill with U+FFFD.
     rawOutput: true,
@@ -439,6 +449,9 @@ try {
 } catch (e) {
   process.stderr.write(`gex: ${e?.message ?? e}\n`);
   status = 1;
+  // `start` stops the Workers only when pid 1 exits; one that threw would
+  // otherwise keep node alive until the caller's timeout.
+  host.stop();
 }
 // `process.exitCode`, not `process.exit`: the guest's output goes through
 // `process.stdout`/`process.stderr` (async when a pipe), and `process.exit`

@@ -1,8 +1,26 @@
 # Plan: function-tier units (format `gex-cgen-image 3`) in the browser
 
-Status: plan, not started (stream S12). Wait for S3's native Noita
-`--cgen` against `--no-cgen` numbers before starting: if units do not pay
-natively, they will not pay here.
+Status (stream S12, 2026-10-02): step 1 done -- units load and run in
+the browser shim under node, and `tests/nt/run-browser.sh --cgen` passes
+(shims/browser/src/cgen.rs, `#cgen*` in shims/browser/js/gex.mjs). Steps
+2-3 (Chrome) wait on the function-tier ABI decision (docs/merge-plan.md
+§9); loading, sharing modules between Workers and the key carry over.
+
+How step 1 came out, against the plan below:
+- The key is `gex_cgen::image::image_key`, the native host's own function
+  (crates/gex-key under it), never a copy.
+- The unit's bytes stay out of the shim, as planned: JS loads
+  `<key>/c.wasm` and `c.entries` through the Env (`loadUnit`; a directory
+  under node, a synchronous request in a Worker), compiles once and shares
+  the `WebAssembly.Module` with sibling Workers; the shim gets the entry
+  list, checks the mapped bytes and publishes.
+- The browser's runtime slots do not start in table 0 (the global slot
+  allocator starts above the statically recompiled images' tables), so
+  there is one body table per dispatch table (`gexc.bodies0..7`,
+  `gex_abi::BODY_LIMITS[t]`, S3's dispatcher).
+- `--cgen` needs every program image's unit built natively at the base it
+  is mapped at (`gexc cgen-image --pe-base`), and Wine's from
+  `gexc cgen-prefix`; any change to gex-abi or gex-cgen changes every key.
 
 ## Where the page is now
 
