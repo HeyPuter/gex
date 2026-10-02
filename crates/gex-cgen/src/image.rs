@@ -45,6 +45,19 @@ pub const UNIT_INPUTS: &str = env!("GEX_CGEN_UNIT_INPUTS");
 /// whenever [`unit_abi_fingerprint`] changes (its test says when).
 pub const UNIT_ABI_VERSION: u32 = 1;
 
+/// The identity of an image's recovery (`gex_key::recovery_key` with
+/// [`RECOVERY_INPUTS`]): where the recovery is cached.
+pub fn recovery_key(image: &gex_ld::Image) -> String {
+    gex_key::recovery_key(image, RECOVERY_INPUTS)
+}
+
+/// The identity of an image's unit (`gex_key::unit_key` with this format and
+/// these inputs): the directory under the cgen cache that holds it. Every
+/// host finds units by this one function.
+pub fn image_key(image: &gex_ld::Image) -> String {
+    gex_key::unit_key(image, FORMAT, UNIT_INPUTS, UNIT_ABI_VERSION, RECOVERY_INPUTS)
+}
+
 /// The embedded constants [`UNIT_ABI_VERSION`] stands for.
 pub fn unit_abi_fingerprint() -> String {
     format!("fma {:?} {} {}", gex_emit::fma::SPLIT, gex_emit::fma::SAFE_LO, gex_emit::fma::SAFE_HI)
