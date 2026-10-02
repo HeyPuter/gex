@@ -32,3 +32,6 @@ comctl32.dll
 ws2_32.dll
 wininet.dll
 mpr.dll
+# tests/nt (mtx, lowmem): Wine's own VS2013 runtime
+msvcr120.dll
+msvcp120.dll

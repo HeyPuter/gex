@@ -18,6 +18,13 @@ fx=$root/crates/gex-ld/tests/pe/bin
 prefix=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
 [ -f "$prefix/.wine-version" ] || { echo "no staged Wine prefix at $prefix; run tools/nt-stage-wine.sh" >&2; exit 2; }
 export GEX_NT_STRICT=1
+# GEXC_RUN_FLAGS: flags for every `gexc run` (the gate runs the suite with
+# --no-cgen and with --cgen). Units go to a cache of the checkout's own unless
+# GEX_CGEN_CACHE says otherwise, so a test run never fills the user's; under
+# --cgen a test program without one gets it built before it runs.
+flags=${GEXC_RUN_FLAGS:-}
+export GEX_CGEN_CACHE=${GEX_CGEN_CACHE:-$root/target/nt-test-cgen}
+case " $flags " in *" --cgen "*) export GEX_NT_CGEN_SYNC=1 ;; esac
 
 pass=0 fail=0 xfail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT(regex, whole output) EXE [ARGS...]
@@ -27,7 +34,8 @@ check() {
     err=$(mktemp)
     # A CRT's text-mode stdout writes CRLF, as on Windows; compared without
     # the CRs.
-    out=$(cd "$(dirname "$1")" && timeout 120 "$gexc" run "$@" 2>"$err"; echo "exit=$?")
+    # shellcheck disable=SC2086
+    out=$(cd "$(dirname "$1")" && timeout 120 "$gexc" run $flags "$@" 2>"$err"; echo "exit=$?")
     code=${out##*exit=}
     out=${out%$'\n'exit=*}
     out=${out%exit=*}
@@ -64,11 +72,11 @@ for arch in x64 x86; do
     # N2 (and N3 for x86): every line "ok ...", then "0 failures".
     check $arch/sync 0 "$allok" "$b/sync.exe"
     # Locks under contention (x64's SList is cmpxchg16b, done by the host
-    # under one lock). x86 only natively for now: on x64 the first section
-    # (msvcp120's _Mtx_lock, eight threads) spins forever, without
-    # syscalls, when mtx.exe runs on tier-1 beside the Wine DLLs' function-
-    # tier units (GEX_NT_CGEN_BUILD=0 reproduces it every time); with
-    # mtx.exe's own unit, and in the browser (tier-1 throughout), it passes.
+    # under one lock). x64's _Mtx_lock section also livelocked natively from
+    # 03fd68c2 to f54d5717 (a stale block dispatching back to itself); with
+    # that fixed, mtx still hangs now and then under CPU load on both arches,
+    # on pure tier-1 (a timing race, S12 is on it: NtWaitForAlertByThreadId).
+    # x86 only natively until that is fixed; the browser runs both.
     [ $arch = x86 ] && check $arch/mtx 0 "$allok" "$b/mtx.exe"
     # A locked write through a null pointer's field is an access violation.
     check $arch/lownull-xadd 0 "$allok" "$b/lownull.exe" xadd
@@ -89,6 +97,8 @@ for arch in x64 x86; do
     check $arch/jitcode 0 "$allok" "$b/jitcode.exe"
     # A function's prologue patched at run time, as Detours does.
     check $arch/detour 0 "$allok" "$b/detour.exe"
+    # A block over two pages, only the second rewritten (a hang, once).
+    check $arch/pagespan 0 "$allok" "$b/pagespan.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" "$b/exitproc.exe"
     # Ends in the top-level exception filter, which exits with 77.
     check $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" "$b/seh.exe"
