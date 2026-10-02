@@ -148,17 +148,23 @@ pub fn image_key(image: &gex_ld::Image) -> String {
 /// recovery once (cached), then C compiled unit by unit. Returns its path.
 pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
-    let key = image_key(&image);
+    prepare_image(&image, &seeds, jobs, verbose)
+}
+
+/// [`prepare_pe`] for any recovery input.
+pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
+    let (image, seeds) = (image, seeds);
+    let key = image_key(image);
     let root = cache_root()?;
     let dir = root.join(&key);
     let out = dir.join("c.wasm");
     if out.exists() {
         return Ok(out);
     }
-    let recovery = root.join("recovery").join(recovery_key(&image));
+    let recovery = root.join("recovery").join(recovery_key(image));
     if !recovery.join("summaries").exists() {
         let t0 = std::time::Instant::now();
-        let prog = gex_xlate::func::recover_pe(&image, &seeds, &Default::default());
+        let prog = gex_xlate::func::recover_pe(image, seeds, &Default::default());
         let summaries = gex_xlate::summary::analyze(&prog).map;
         let n = prog.functions.len();
         let funcs = gex_cgen::select(
@@ -314,6 +320,94 @@ fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
             *b &= !(1 << (page % 8));
         }
     }
+}
+
+/// The NT layer's trampoline page (`gex_kernel::nt::boot::trampoline_page`:
+/// the unix-call and syscall dispatchers every Wine DLL calls through, Wine's
+/// opengl32 once per GL call) as a recovery input. Fixed bytes at a fixed
+/// address, so its unit is built once per gex build and installed at boot
+/// like an image's: without it every such call leaves the function tier.
+fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) {
+    use gex_kernel::nt::{boot, TRAMPOLINES, TRAMPOLINES_END};
+    let bytes = boot::trampoline_page();
+    let starts: Vec<u64> = if class32 {
+        vec![boot::tramp::UNIX_CALL_32, boot::tramp::SYSCALL_DISPATCHER_32]
+    } else {
+        vec![boot::tramp::UNIX_CALL_64, boot::tramp::SYSCALL_DISPATCHER_64]
+    };
+    let image = gex_ld::Image {
+        soname: None,
+        needed: Vec::new(),
+        runpath: Vec::new(),
+        bias: TRAMPOLINES,
+        entry: starts[0],
+        code: vec![(TRAMPOLINES, TRAMPOLINES_END)],
+        segments: vec![gex_ld::elf::Segment {
+            vaddr: TRAMPOLINES,
+            mem_size: bytes.len() as u64,
+            bytes,
+            readable: true,
+            writable: false,
+            executable: true,
+        }],
+        phdr_vaddr: TRAMPOLINES,
+        phentsize: 0,
+        phnum: 0,
+        brk: TRAMPOLINES_END,
+        text_range: (TRAMPOLINES, TRAMPOLINES_END),
+        tls: None,
+        symbols: Vec::new(),
+        named_relocs: Vec::new(),
+        relocs: Vec::new(),
+        init_array: Vec::new(),
+        dynsyms: Vec::new(),
+        irelative: Vec::new(),
+        pie: false,
+        interp: None,
+        class32,
+    };
+    let seeds = gex_xlate::func::PeSeeds {
+        starts: starts.into_iter().map(|a| (a, gex_xlate::func::Source::Entry)).collect(),
+        fdes: Vec::new(),
+    };
+    (image, seeds)
+}
+
+static TRAMPOLINES_DONE: OnceLock<()> = OnceLock::new();
+
+/// Build (once per gex build: cached) and install the trampoline page's
+/// unit, at boot.
+fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()> {
+    if TRAMPOLINES_DONE.set(()).is_err() {
+        return Ok(());
+    }
+    let (image, seeds) = trampoline_input(class32);
+    let t0 = std::time::Instant::now();
+    let path = {
+        let _lock = build_lock()?;
+        prepare_image(&image, &seeds, 2, false)?
+    };
+    let cwasm = std::fs::read(&path)?;
+    let memory = store.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    for seg in &image.segments {
+        let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
+        if memory.bytes().get(lo..lo + n) != Some(&seg.bytes[..]) {
+            bail!("the NT trampoline page in guest memory is not the one its unit was built from");
+        }
+    }
+    let entries = gex_cgen::image::read_entries(&path)?;
+    let (shared, engine, cache) = {
+        let jit = store.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+        (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
+    };
+    let module = compile(&engine, cache.as_ref(), &path, &cwasm)?;
+    let unit = publish_cgen_unit(&shared, module, &entries)?;
+    install_unit(&mut *store, &unit)?;
+    store.data_mut().jit.as_mut().unwrap().replayed += 1;
+    if trace() {
+        eprintln!("gex-nt: function tier for the NT trampolines: {} entries, {:.1}s", entries.len(), t0.elapsed().as_secs_f64());
+    }
+    Ok(())
 }
 
 /// Compile a unit's module. The compiled form is kept beside the unit
@@ -473,6 +567,10 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
     let pending = take_pending();
     if pending.is_empty() {
         return Ok(());
+    }
+    // The trampolines with the first images (the exe says the ABI).
+    if let Some(p) = pending.first() {
+        install_trampolines(store, !p.pe.is64)?;
     }
     let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
     for p in pending {
