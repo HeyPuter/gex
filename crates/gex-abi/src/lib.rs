@@ -576,6 +576,11 @@ pub const BODY_LIMIT: u64 = RESERVED_END - 264;
 /// ([`PATCHED_PAGES`] up to [`RESERVED_END`]) start here.
 pub const CTX_LIMIT: u64 = PATCHED_PAGES;
 
+/// A counter the browser glue takes bootstrap stacks by: a Worker calls
+/// `gex_worker_init` before it has a stack of its own, and wasm-ld's default
+/// one is the guest's low memory (shims/browser/js/gex.mjs `#workerStack`).
+pub const BOOT_STACK_COUNTER: u64 = RESERVED_END - 192;
+
 /// Address of the context for thread slot `n`.
 ///
 /// Contexts are packed into the reserved low region, one per guest thread.
@@ -811,8 +816,9 @@ mod tests {
         assert!(DISPATCH_DIR_END <= EXEC_BASE);
         // The fixed runtime words above the contexts do not overlap.
         assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= NEST_EXITS);
-        assert!(NEST_EXITS + 8 <= BODY_LIMIT + 8 && BODY_LIMIT + 4 <= NEST_EXITS);
+        assert!(BODY_LIMIT + 4 <= NEST_EXITS);
         assert!(NEST_EXITS + 8 <= SPLIT_LOCK);
+        assert!(NEST_EXITS + 8 <= BOOT_STACK_COUNTER && BOOT_STACK_COUNTER + 8 <= SPLIT_LOCK);
         assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= BODY_LIMIT);
         assert!(SPLIT_LOCK + 8 <= EXCLUSIVE_SCRATCH);
         // Every address code may occupy needs a directory entry, including the

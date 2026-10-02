@@ -38,6 +38,7 @@ pub mod gl;
 pub mod virgl;
 pub mod wl;
 mod xwm;
+pub(crate) mod memmap;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -1571,9 +1572,40 @@ fn live_sub(n: usize) {
 // counter is atomic.
 unsafe impl Sync for Counting {}
 
+/// An address whose every allocation and free is reported with the wasm
+/// stack (`gex_watch_alloc`), zero for none: who held the memory a stray
+/// write landed in.
+pub(crate) static WATCH_ALLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn watch_alloc(what: &str, p: *mut u8, size: usize) {
+    let w = WATCH_ALLOC.load(std::sync::atomic::Ordering::Relaxed);
+    if w == 0 || p.is_null() {
+        return;
+    }
+    let (a, e) = (p as u64, p as u64 + size as u64);
+    if !(a <= w && w < e) {
+        return;
+    }
+    use core::fmt::Write as _;
+    struct Buf([u8; 200], usize);
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf([0; 200], 0);
+    let _ = write!(b, "[gex-stack] {what} {a:#x}..{e:#x} ({size} bytes) covers watched {w:#x}");
+    // SAFETY: `warn` reads the bytes and keeps none.
+    unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+}
+
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         let p = unsafe { self.0.alloc(l) };
+        watch_alloc("alloc", p, l.size());
         // A null becomes `handle_alloc_error` -> abort -> a bare wasm
         // `unreachable` with nothing said. The heap is fixed, so running out is
         // reachable; say so before the abort.
@@ -1601,6 +1633,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        watch_alloc("free", p, l.size());
         #[cfg(feature = "heap-counters")]
         {
             self.1.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
@@ -1612,7 +1645,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     // Forwarded, not left to the default's allocate-copy-free: talc grows in
     // place where it can, and the lifter pushes onto many vectors.
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        watch_alloc("realloc from", p, l.size());
         let q = unsafe { self.0.realloc(p, l, new) };
+        watch_alloc("realloc to", q, new);
         #[cfg(feature = "heap-counters")]
         if !q.is_null() {
             if new >= l.size() {
@@ -1648,7 +1683,11 @@ struct ShimRegion;
 /// Returns false when the engine will give no more, so `mmap` reports ENOMEM
 /// rather than the process trapping on an address that was never backed.
 fn grow_memory_to(end: u64) -> bool {
+    // One grower at a time, so a sibling Worker's grow is never taken for a
+    // foreign one (`OWN_TOP`).
+    let _g = GrowLock::take();
     const PAGE: u64 = 65536;
+    note_foreign_growth();
     let have = warch::memory_size(0) as u64 * PAGE;
     // DIAGNOSTIC (GEX_PREGROW): grow to a large floor on the first grow so that
     // runtime `memory.grow`s stop happening during the racy startup window --
@@ -1662,7 +1701,118 @@ fn grow_memory_to(end: u64) -> bool {
     // A megabyte at a time past what was asked for: `memory.grow` may copy, so
     // a guest mapping a page at a time should not pay per page.
     let want = (target - have).div_ceil(PAGE).max(16);
-    warch::memory_grow(0, want as usize) != usize::MAX
+    let prev = warch::memory_grow(0, want as usize);
+    if prev == usize::MAX {
+        return false;
+    }
+    // Whoever grew between the read above and this grow owns what they grew.
+    let prev = prev as u64 * PAGE;
+    if prev > have {
+        foreign(have.max(OWN_TOP.load(std::sync::atomic::Ordering::Relaxed)), prev);
+    }
+    OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
+    true
+}
+
+static GROW_LOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+struct GrowLock;
+impl GrowLock {
+    fn take() -> GrowLock {
+        while GROW_LOCK
+            .compare_exchange(0, 1, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        GrowLock
+    }
+}
+impl Drop for GrowLock {
+    fn drop(&mut self) {
+        GROW_LOCK.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The memory size as of this module's own last grow. Memory above it that
+/// this module did not grow is someone else's: std's `System` allocator
+/// (dlmalloc, under every `thread_local!` with a destructor and every
+/// `std::thread::current()`) grows the memory itself and uses the new pages,
+/// and the arena once handed the same pages to the heap -- a Worker's
+/// thread-local destructor list written into a translation.
+static OWN_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes of memory grown outside the arena so far (GEX_NT_STATS).
+pub(crate) static FOREIGN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// GEX_NT_TRACE's look, around each NT call: memory grown outside the arena
+/// since the last look is recorded now, with the wasm stack of whoever is
+/// here (the grower ran just before, on this Worker or another).
+pub(crate) fn foreign_now(when: &str, call: &str) {
+    let mem = warch::memory_size(0) as u64 * 65536;
+    let known = OWN_TOP.load(std::sync::atomic::Ordering::Acquire);
+    if known == 0 || mem <= known {
+        return;
+    }
+    warn_line(&format!("[gex-stack] memory grown outside the arena noticed {when} {call}: {known:#x}..{mem:#x}\n"));
+    let _g = GrowLock::take();
+    note_foreign_growth();
+}
+
+/// The arena keeps out of memory someone else grows: grow a page behind its
+/// back, then take a span, and see where the span lands.
+pub(crate) fn arena_selftest() -> String {
+    let mem = warch::memory_size(0) as u64 * 65536;
+    if warch::memory_grow(0, 1) == usize::MAX {
+        return "skipped (the memory would not grow)".into();
+    }
+    let (fs, fe) = (mem, mem + 65536);
+    let at = arena_take(1 << 20);
+    match at {
+        Some(a) if a < fe && fs < a + (1 << 20) => format!("FAIL: a span at {a:#x} overlaps the foreign page {fs:#x}..{fe:#x}"),
+        Some(a) => format!("ok (foreign page {fs:#x}..{fe:#x}, the next span at {a:#x})"),
+        None => "FAIL: the arena could not take a span".into(),
+    }
+}
+
+/// Pages grown by someone else, kept out of the arena (`memmap::skip_foreign`).
+fn foreign(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    FOREIGN_BYTES.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+    memmap::claim(memmap::Kind::Foreign, 0, start, end, "grown outside the arena (std's System allocator?)");
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        use core::fmt::Write as _;
+        struct Buf([u8; 200], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let n = s.len().min(self.0.len() - self.1);
+                self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+        let mut b = Buf([0; 200], 0);
+        let _ = write!(b, "[gex] memory {start:#x}..{end:#x} was grown outside the arena; the arena keeps out of it\n");
+        // SAFETY: `warn` reads the bytes and keeps none.
+        unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+    }
+}
+
+/// The memory grown since this module last looked, by someone else.
+fn note_foreign_growth() {
+    let mem = warch::memory_size(0) as u64 * 65536;
+    let known = OWN_TOP.load(std::sync::atomic::Ordering::Acquire);
+    if known == 0 {
+        // The first look: everything already there (the loader's, a forked
+        // child's image) is accounted for elsewhere.
+        let _ = OWN_TOP.compare_exchange(0, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if mem > known && OWN_TOP.compare_exchange(known, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok() {
+        foreign(known, mem);
+    }
 }
 
 static PREGROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1736,7 +1886,11 @@ static ARENA_SPENT: [std::sync::atomic::AtomicU64; 4] =
 
 /// nfds, readfds and writefds of the select in flight; nfds 0 means none.
 /// Where `clock_gettime` was told to write, so the trace can read it back.
-static CLOCK_ARG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static CLOCK_ARG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 static SELECT_ARGS: [std::sync::atomic::AtomicU64; 3] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -1848,6 +2002,12 @@ fn arena_take(len: u64) -> Option<u64> {
     } else {
         cur
     };
+    // Never into memory someone else grew (and is using).
+    {
+        let _g = GrowLock::take();
+        note_foreign_growth();
+    }
+    let at = memmap::skip_foreign(at, len);
     let end = at.checked_add(len)?;
     if end > nt::arena_ceiling() || !grow_memory_to(end) {
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
@@ -1960,6 +2120,10 @@ fn arena_take(len: u64) -> Option<u64> {
     // seeing `cur` wins the span; a loser recomputes from the advanced cursor
     // and claims its own bytes. Any grow already done is harmless -- this memory
     // only ever grows, so a span reserved and then lost is just skipped.
+    // Grown by someone else while this grew: look again.
+    if memmap::skip_foreign(at, len) != at {
+        return arena_take(len);
+    }
     if ARENA_NEXT
         .compare_exchange(
             cur,
@@ -1988,7 +2152,11 @@ fn arena_back(end: u64) -> Option<u64> {
     if !grow_memory_to(end) {
         return None;
     }
-    Some(ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed))
+    let prev = ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+    if end > prev {
+        memmap::claim(memmap::Kind::Guest, 0, prev, end, "guest fixed mapping (arena)");
+    }
+    Some(prev)
 }
 
 /// What the kernel's memory map calls to claim a span of arena.
@@ -1997,7 +2165,11 @@ fn arena_back(end: u64) -> Option<u64> {
 /// out the same bytes. Zero means the memory would not grow.
 fn arena_grow(len: u64) -> u64 {
     arena_note(0, len);
-    arena_take(len).unwrap_or(0)
+    let at = arena_take(len).unwrap_or(0);
+    if at != 0 {
+        memmap::claim(memmap::Kind::Guest, 0, at, at + len, "guest mapping (arena)");
+    }
+    at
 }
 
 // SAFETY: `acquire` claims a region of this module's own linear memory and
@@ -2113,6 +2285,7 @@ unsafe impl talc::source::Source for ShimRegion {
             }
         }
         let base = arena_take(len).ok_or(())? as *mut u8;
+        memmap::claim(memmap::Kind::Heap, 0, base as u64, base as u64 + len, "heap span");
         // Extend the last span when this one abuts it, rather than claiming a
         // separate one: talc cannot serve a request larger than any single span
         // from two adjacent ones, so a doubling buffer would otherwise strand
@@ -2230,6 +2403,9 @@ struct Jit {
     /// joining Worker instantiates these into its own tables to catch up. Order
     /// matters: each module's page assignments seed the next's.
     registry: Vec<Vec<u8>>,
+    /// Per registry module, a hash of each 256-byte chunk as it was pushed,
+    /// so a stray write into the bytes can be found (`verify_registry`).
+    registry_sums: Vec<Vec<u64>>,
     /// Whether this process has ever run a second thread-Worker. The registry
     /// exists only so a joining Worker can catch up; a single-threaded process
     /// never gains one, so retaining its modules is pure loss against a fixed
@@ -2244,6 +2420,13 @@ struct Jit {
     /// Shared modules this Worker has put into its own tables. Describes the
     /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
+    /// Pages whose translations were retired (code unmapped, reprotected or
+    /// flushed: Detours patching noita.exe). A stored module covering one may
+    /// predate the change, so it is never served here again; see
+    /// `gex_jit_installed` for the pending side.
+    pub(crate) retired_pages: std::collections::HashSet<u64>,
+    /// Misses at already-translated pcs, by pc (`remiss`).
+    remiss: std::collections::HashMap<u64, u32>,
     /// How the shared-slot lookup went. Three outcomes: the page had a base in
     /// this process's table, the identity map knew it, or it did not. See
     /// `gex_reuse_stats`.
@@ -2838,6 +3021,8 @@ mod slots {
     /// And room for the thread-locals, which are a handful of words today.
     pub const TLS: usize = 1 << 16;
     pub const COUNT: usize = 64;
+    /// Bytes of guard pattern at the bottom of each stack.
+    pub const GUARD: usize = 4096;
 }
 
 #[cfg(feature = "shared-memory")]
@@ -2873,12 +3058,77 @@ pub extern "C" fn gex_worker_init() -> u32 {
     // grown to cover it.
     unsafe {
         let at = base as u32 as *mut u8;
+        extern "C" {
+            static __heap_base: u8;
+        }
+        memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
+        memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
+        memmap::claim(
+            memmap::Kind::Tls,
+            i as u32,
+            base + slots::STACK as u64,
+            base + (slots::STACK + slots::TLS) as u64,
+            "thread-locals",
+        );
         __wasm_init_tls(at.add(slots::STACK));
         // The thread-locals exist now, so this is the first thing that can be
         // said about which Worker this is.
         WORKER.with(|w| w.set(i as u32));
+        // A guard at the bottom of the stack: a stack that outgrows its
+        // megabyte runs on into whatever the arena handed out below it (a
+        // heap span, so translations, the registry...). Checked at every NT
+        // call (`stack_guard_check`).
+        std::slice::from_raw_parts_mut(at as *mut u32, slots::GUARD / 4).fill(STACK_GUARD);
+        STACK_LO.with(|l| l.set(at as u32));
         (at as u32) + slots::STACK as u32
     }
+}
+
+#[cfg(feature = "shared-memory")]
+const STACK_GUARD: u32 = 0x5747_5d0d;
+
+/// This Worker's id, as the lock knows it.
+#[cfg(feature = "shared-memory")]
+pub(crate) fn worker_id() -> u32 {
+    WORKER.with(|w| w.get())
+}
+
+#[cfg(feature = "shared-memory")]
+thread_local! {
+    /// The bottom of this Worker's shim stack (its guard), zero for none.
+    static STACK_LO: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The least headroom seen above the guard.
+    static STACK_LEAST: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// Whether this Worker's shim stack has run into its guard: `Some((bottom,
+/// how many guard bytes are overwritten, least headroom seen))` the first time
+/// it has. Also keeps the least headroom, read from the address of a local.
+#[cfg(feature = "shared-memory")]
+pub(crate) fn stack_guard_check() -> Option<(u32, u32, u32)> {
+    let lo = STACK_LO.with(|l| l.get());
+    if lo == 0 {
+        return None;
+    }
+    let here = 0u8;
+    let sp = &here as *const u8 as u32;
+    let room = sp.wrapping_sub(lo + slots::GUARD as u32);
+    STACK_LEAST.with(|l| l.set(l.get().min(room)));
+    // SAFETY: this Worker's own guard words, inside the span it claimed.
+    let g = unsafe { std::slice::from_raw_parts(lo as *const u32, slots::GUARD / 4) };
+    // A stack running down into the guard hits its top words first: those
+    // are checked every call, the whole guard only once they have changed.
+    if g[g.len() - 16..].iter().all(|w| *w == STACK_GUARD) {
+        return None;
+    }
+    let top_bad = g.iter().rposition(|w| *w != STACK_GUARD)?;
+    STACK_LO.with(|l| l.set(0));
+    Some((lo, (top_bad as u32 + 1) * 4, STACK_LEAST.with(|l| l.get())))
+}
+
+#[cfg(feature = "shared-memory")]
+pub(crate) fn stack_least() -> u32 {
+    STACK_LEAST.with(|l| l.get())
 }
 
 /// Which Worker this is. Per-Worker via TLS, exactly right here (unlike the
@@ -3626,9 +3876,12 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 translated: Default::default(),
             coverage_snap: Vec::new(),
                 registry: Vec::new(),
+                registry_sums: Vec::new(),
                 ever_threaded: false,
                 shared: Default::default(),
                 installed_mods: Default::default(),
+                retired_pages: Default::default(),
+                remiss: Default::default(),
                 reuse_have: 0,
                 reuse_hit: 0,
                 reuse_miss: 0,
@@ -4723,8 +4976,11 @@ pub extern "C" fn gex_reset_directory() -> u32 {
 /// segments are passive, so its blocks reach the table only via `gexfillat`;
 /// when a branch misses on a page this process already has a base for, the code
 /// exists but is unwritten, so ask for the slot rather than re-lift the block.
-static FILL_WANTED: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(-1);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_WANTED: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
 
 /// Pages already asked about, so one nobody can fill is asked once and then
 /// takes the ordinary path rather than asking forever.
@@ -4757,8 +5013,11 @@ static SERVED_PAGE: SingleThreaded<std::collections::BTreeSet<u64>> =
     SingleThreaded(const { RefCell::new(std::collections::BTreeSet::new()) });
 
 /// The page the host is being asked about, so the answer can be attributed.
-static FILL_PENDING: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(-1);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_PENDING: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+}
 
 /// The host is holding a module whose slots are not written yet.
 ///
@@ -4791,16 +5050,24 @@ pub extern "C" fn gex_fill_possible(on: i32) {
 ///
 /// A fill writes `FILL_SPAN` slots from here rather than the whole page. See
 /// `gex_abi::FILL_SPAN` for why.
-static FILL_FROM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_FROM: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 /// The address that missed, for the fill the host is about to run. `FILL_FROM`
 /// is it rounded to a span, which the module needs; this exact pc is how to see
 /// whether the one slot the guest dispatches through came back written.
-static FILL_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static FILL_PC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[no_mangle]
 pub extern "C" fn gex_fill_pc() -> u64 {
-    FILL_PC.load(std::sync::atomic::Ordering::Relaxed)
+    FILL_PC.with(|c| c.get())
 }
 
 /// Slots a fill writes: `FILL_SPAN` normally, a whole page for a closure built
@@ -4818,13 +5085,13 @@ pub extern "C" fn gex_set_fill_width(n: u32) {
 
 #[no_mangle]
 pub extern "C" fn gex_fill_from() -> u32 {
-    FILL_FROM.load(std::sync::atomic::Ordering::Relaxed)
+    FILL_FROM.with(|c| c.get())
 }
 
 /// The slot the host should write, or -1 if it is not being asked.
 #[no_mangle]
 pub extern "C" fn gex_fill_wanted() -> i64 {
-    FILL_WANTED.load(std::sync::atomic::Ordering::Relaxed)
+    FILL_WANTED.with(|c| c.get())
 }
 
 /// The host has answered, and whether it found anybody. A page nobody could
@@ -4832,12 +5099,12 @@ pub extern "C" fn gex_fill_wanted() -> i64 {
 /// deferred module arrives.
 #[no_mangle]
 pub extern "C" fn gex_fill_done(ok: i32) {
-    let page = FILL_PENDING.swap(-1, std::sync::atomic::Ordering::Relaxed);
+    let page = FILL_PENDING.with(|c| c.replace(-1));
     if ok == 0 && page >= 0 {
         // Under KLOCK: shared with the miss path's `FILL_ASKED`/`FILL_FAILED`.
         with_host(|_| FILL_FAILED.0.borrow_mut().insert(page as u64));
     }
-    FILL_WANTED.store(-1, std::sync::atomic::Ordering::Relaxed);
+    FILL_WANTED.with(|c| c.set(-1));
 }
 
 /// The directory the guest starts in, staged until it is loaded.
@@ -4952,7 +5219,11 @@ const SAFEPOINT_SIGNALS: bool = true;
 
 /// The global signal counter as this Worker last saw it at a safepoint. See the
 /// two-step check in `gex_safepoint`.
-static SIGNAL_SEEN: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static SIGNAL_SEEN: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
 
 /// How long a syscall waits where it stands before giving the stack back.
 ///
@@ -5520,9 +5791,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             // given: apt's stall is a pselect6/clock_gettime loop recomputing a
             // deadline that never arrives if the clock does not move.
             let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
-            CLOCK_ARG.store(g(1), std::sync::atomic::Ordering::Relaxed);
+            CLOCK_ARG.with(|c| c.set(g(1)));
         } else {
-            CLOCK_ARG.store(0, std::sync::atomic::Ordering::Relaxed);
+            CLOCK_ARG.with(|c| c.set(0));
         }
         if n == gex_kernel::syscalls::nr::PSELECT6 {
             let g = |i: u8| gm.read_u64(base + ctx::x(i) as u64).unwrap_or(0);
@@ -5638,7 +5909,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     );
     IN_SYSCALL.store(true, std::sync::atomic::Ordering::Relaxed);
     let _in_syscall = InSyscall;
-    CTX_ADDR.store(ctx as u32 as u64, std::sync::atomic::Ordering::Relaxed);
+    ctx_addr_set(ctx as u32 as u64);
     // The process tree, always. Stood down under `GEX_TRACE`, which narrates
     // these along with everything else.
     if !tracing() {
@@ -6305,7 +6576,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         };
         let clk = {
-            let at = CLOCK_ARG.load(std::sync::atomic::Ordering::Relaxed);
+            let at = CLOCK_ARG.with(|c| c.get());
             if at == 0 {
                 String::new()
             } else {
@@ -6689,7 +6960,7 @@ fn resume_ctx() -> Option<u64> {
 }
 
 fn set_resume_ctx(v: u64) {
-    CTX_ADDR.store(v, std::sync::atomic::Ordering::Relaxed);
+    ctx_addr_set(v);
     RESUME_CTX.with(|c| c.set(Some(v)));
 }
 
@@ -6707,7 +6978,35 @@ fn set_resume_ctx(v: u64) {
 /// A crash in the dispatch-miss path is exactly the case that needs a pc, and
 /// exactly the case that could not produce one. A plain static can always be
 /// read.
+///
+/// Per Worker: it was one static for the process, so with threads it named
+/// whichever Worker last made a syscall -- and the run loop's recovery from a
+/// table that lagged a sibling's numbering resumed the trapping thread at
+/// *another thread's* last branch target (`gex_last_target`). In Noita a
+/// worker thread calling a functor's `_Do_call` came back at the neighbouring
+/// slot of the same vtable, and returned with its stack 4 bytes off.
+#[cfg(feature = "shared-memory")]
+thread_local! {
+    static CTX_ADDR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(feature = "shared-memory")]
+fn ctx_addr_get() -> u64 {
+    CTX_ADDR.with(|c| c.get())
+}
+#[cfg(feature = "shared-memory")]
+fn ctx_addr_set(v: u64) {
+    CTX_ADDR.with(|c| c.set(v));
+}
+#[cfg(not(feature = "shared-memory"))]
 static CTX_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(not(feature = "shared-memory"))]
+fn ctx_addr_get() -> u64 {
+    CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(not(feature = "shared-memory"))]
+fn ctx_addr_set(v: u64) {
+    CTX_ADDR.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
 fn set_resume_ctx_none() {
     RESUME_CTX.with(|c| c.set(None));
@@ -7026,9 +7325,12 @@ pub extern "C" fn gex_adopt_child(
             translated: Default::default(),
             coverage_snap: Vec::new(),
             registry: Vec::new(),
+            registry_sums: Vec::new(),
             ever_threaded: false,
             shared: Default::default(),
             installed_mods: Default::default(),
+            retired_pages: Default::default(),
+            remiss: Default::default(),
             reuse_have: 0,
             reuse_hit: 0,
             reuse_miss: 0,
@@ -8196,8 +8498,47 @@ fn backfill_registry(h: &mut Host) {
         wasm.shrink_to_fit();
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        h.jit.registry_sums.push(chunk_sums(&wasm));
         h.jit.registry.push(wasm);
     }
+}
+
+/// A hash of each 256-byte chunk of `b`.
+fn chunk_sums(b: &[u8]) -> Vec<u64> {
+    b.chunks(256)
+        .map(|c| {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for &x in c {
+                h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            h
+        })
+        .collect()
+}
+
+/// The first registry module whose bytes changed since they were pushed:
+/// its index, address, the changed chunk's offset and its bytes now. Each
+/// module is reported once.
+pub(crate) fn verify_registry(h: &mut Host) -> Option<String> {
+    for i in 0..h.jit.registry.len() {
+        let now = chunk_sums(&h.jit.registry[i]);
+        if let Some(c) = now.iter().zip(&h.jit.registry_sums[i]).position(|(a, b)| a != b) {
+            let m = &h.jit.registry[i];
+            let at = c * 256;
+            let bytes: Vec<String> = m[at..(at + 256).min(m.len())].iter().map(|b| format!("{b:02x}")).collect();
+            let s = format!(
+                "module {i} at {:#x}+{:#x} (of {} modules): chunk at +{at:#x} (address {:#x}) changed; now {}",
+                m.as_ptr() as usize,
+                m.len(),
+                h.jit.registry.len(),
+                m.as_ptr() as usize + at,
+                bytes.join(" ")
+            );
+            h.jit.registry_sums[i] = now;
+            return Some(s);
+        }
+    }
+    None
 }
 
 /// The shared module holding this page's code, if there is one and this
@@ -9259,7 +9600,7 @@ pub extern "C" fn gex_in_syscall() -> u32 {
 /// the kernel, because a crash may have left it borrowed.
 #[no_mangle]
 pub extern "C" fn gex_last_target() -> i64 {
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at == 0 {
         return 0;
     }
@@ -9436,6 +9777,12 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             }
         });
         trace_line(&line);
+        return;
+    }
+    // GEX_NT_TRAP_PCS: noted in the thread's ring, silently.
+    #[cfg(feature = "shared-memory")]
+    if nt::active() && raw == gex_abi::imports::BRK_TRAP_PC {
+        nt::trap_note(_ctx as u32 as u64, pc as u64);
         return;
     }
     // In a Windows process every other breakpoint is a processor exception
@@ -9659,6 +10006,14 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // A block entered for a neighbour sharing its slot: forget the
         // neighbour so the miss that follows lifts it (with this block as a
         // mate) into a trampoline. See `gex_abi::DISPATCH_SHIFT`.
+        // `nt::slot_log()`: the first few hundred, named.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if nt::slot_log() && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+            warn_line(&format!(
+                "gex: slot conflict: block {:#x} entered for {:#x}\n",
+                _pc as u64, addr as u64
+            ));
+        }
         with_host(|h| {
             h.jit.translated.remove(&(addr as u64));
         });
@@ -9681,6 +10036,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
             if h.jit.page_table.forget(page).is_none() {
                 return;
             }
+            h.jit.retired_pages.insert(page);
             let mut gm = GuestMem::new(guest_bytes());
             let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, 0);
             let lo = page * gex_abi::DISPATCH_PAGE;
@@ -9845,7 +10201,7 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // signal only when the kernel checks them, which `deliver_pending` does --
     // so a due timer has to count as "something to deliver" here, or a
     // process that never blocks (a shell's `timeout`) never gets its SIGALRM.
-    let anything = SIGNAL_SEEN.swap(sent, std::sync::atomic::Ordering::Relaxed) != sent
+    let anything = SIGNAL_SEEN.with(|c| c.replace(sent)) != sent
         || with_host(|h| h.kernel.signals.has_pending() || h.kernel.timer_due());
     // A thread table with this thread in it: a safepoint can fire in a child
     // still being built, where an empty table would panic.
@@ -9928,8 +10284,40 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// translated ahead of time, and the rest arrives here as needed. The shim
 /// lifts and encodes but cannot compile, so it leaves the module behind and
 /// traps out for JS to instantiate before resuming at the address that missed.
+/// A pc already translated that misses dispatch again and again is a
+/// retranslation livelock (S3 found natively that a page retired between a
+/// translation and its publish came back without its directory entry): say
+/// what dispatch sees there, once per pc, the 64th time.
+fn remiss(pc: u64) {
+    let said = with_host(|h| {
+        if !h.jit.translated.contains(&pc) {
+            return None;
+        }
+        let n = h.jit.remiss.entry(pc).or_insert(0);
+        *n += 1;
+        if *n != 64 {
+            return None;
+        }
+        let page = pc / gex_abi::DISPATCH_PAGE;
+        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+        Some(format!(
+            "gex: {pc:#x} is translated but missed dispatch 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {}, {} misses at translated pcs so far\n",
+            h.jit.page_table.lookup(page),
+            h.jit.retired_pages.contains(&page),
+            h.jit.remiss.values().sum::<u32>()
+        ))
+    });
+    if let Some(s) = said {
+        warn_line(&s);
+    }
+}
+
 /// The pc of the most recent dispatch miss, for the host's install check.
-static LAST_MISS_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per Worker: set on the way into a trap or a check and read back by the
+// same Worker (see `CTX_ADDR` for what a process-wide one did).
+thread_local! {
+    static LAST_MISS_PC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A guest address to watch (`GEX_WATCH_MEM`): its 8 bytes are re-read at every
 /// syscall and dispatch miss, and a change is reported with what ran between.
@@ -9961,7 +10349,7 @@ fn watch_mem(where_: &str) {
 
 #[no_mangle]
 pub extern "C" fn gex_miss_pc() -> i64 {
-    LAST_MISS_PC.load(std::sync::atomic::Ordering::Relaxed) as i64
+    LAST_MISS_PC.with(|c| c.get()) as i64
 }
 
 /// This process's pid, from the static every syscall refreshes.
@@ -9973,8 +10361,9 @@ pub extern "C" fn gex_my_pid() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
-    LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+    LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
+    remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
         // did not come back from, and a line printed after never appears.
@@ -10091,10 +10480,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // `gex_fill_possible`/`gex_fill_done`, which now lock the same way.
         let fresh = with_host(|_| FILL_ASKED.0.borrow_mut().insert(key));
         if fresh {
-            FILL_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
-            FILL_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
-            FILL_WANTED.store(page as i64, std::sync::atomic::Ordering::Relaxed);
-            FILL_PENDING.store(page as i64, std::sync::atomic::Ordering::Relaxed);
+            FILL_FROM.with(|c| c.set(from));
+            FILL_PC.with(|c| c.set(pc));
+            FILL_WANTED.with(|c| c.set(page as i64));
+            FILL_PENDING.with(|c| c.set(page as i64));
             with_host(|h| {
                 set_resume(pc);
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
@@ -10349,9 +10738,13 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 let ready: Vec<_> = ready
                     .into_iter()
                     .filter(|(_, _, d, _)| {
+                        // Nor one covering a page retired here: it may have
+                        // been built from the code before the change (a
+                        // translation of noita.exe before Detours patched it),
+                        // and serving it would run that code again.
                         !gex_abi::X86 || d.iter().all(|(p, b)| match h.jit.page_table.lookup(*p) {
                             Some(have) => have == *b,
-                            None => true,
+                            None => !h.jit.retired_pages.contains(p),
                         })
                     })
                     .collect();
@@ -11438,7 +11831,7 @@ pub extern "C" fn gex_current_ctx() -> i64 {
     // The remembered address first, then the kernel: this is a crash reporter's
     // question, and a trap leaves the kernel borrowed, so `with_host` would
     // panic on top of the crash and describe the reporter instead of the fault.
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at != 0 {
         return at as i64;
     }
@@ -11450,7 +11843,7 @@ pub extern "C" fn gex_current_pc() -> i64 {
     // Without the kernel when there is a remembered context, because the
     // crash this most needs to describe is one that left the kernel borrowed.
     // See `CTX_ADDR`.
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at != 0 {
         let gm = GuestMem::new(guest_bytes());
         return gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64;
@@ -11472,7 +11865,7 @@ pub extern "C" fn gex_current_lr() -> i64 {
         let gm = GuestMem::new(guest_bytes());
         gm.read_u64(at + 30 * 8).unwrap_or(0) as i64
     };
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at != 0 {
         return read(at);
     }
@@ -11760,6 +12153,15 @@ pub extern "C" fn gex_jit_installed() {
                         dir_note(page, have, "install-done-kept-local");
                         continue;
                     }
+                    // Retired while this module waited to be installed (its
+                    // page table had the page when it was queued): its blocks
+                    // are of the code before the change, so the page stays
+                    // retired and the next branch there lifts what is there
+                    // now. Assigning the old base back is what ran stale code.
+                    None if h.jit.retired_pages.contains(&page) => {
+                        dir_note(page, base, "install-done-retired");
+                        continue;
+                    }
                     None => h.jit.page_table.assign(page, base),
                     _ => {}
                 }
@@ -11793,6 +12195,7 @@ pub extern "C" fn gex_jit_installed() {
             // running in the allocator's refill path). Nothing trims `registry`.
             #[cfg(feature = "shared-memory")]
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            h.jit.registry_sums.push(chunk_sums(&wasm));
             h.jit.registry.push(wasm);
         }
         publish_pending(h);

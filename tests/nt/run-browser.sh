@@ -51,6 +51,10 @@ for arch in ${ARCHES:-x64 x86}; do
     b=$root/tests/nt/bin/$arch
     check $arch/hello_args 42 "hello from a Windows program with 3 args${nl}arg 1: a${nl}arg 2: b c" $arch "$b/hello_args.exe" a "b c"
     check $arch/sync 0 "$allok" $arch "$b/sync.exe"
+    # Locks under contention. x86 only: x64's SList is cmpxchg16b, which
+    # gex still does in two halves (wasm has no 16-byte atomic).
+    [ $arch = x86 ] && check $arch/mtx 0 "$allok" $arch "$b/mtx.exe"
+    check $arch/lowmem 0 "$allok" $arch "$b/lowmem.exe"
     check $arch/apc 0 "$allok" $arch "$b/apc.exe"
     check $arch/tls 0 "$allok" $arch "$b/tls.exe"
     check $arch/cxx 0 "$allok" $arch "$b/cxx.exe"
@@ -62,6 +66,8 @@ for arch in ${ARCHES:-x64 x86}; do
     check $arch/window 0 "shown${nl}bye" $arch "$b/window.exe" 0
     # Code written, rewritten and reallocated at run time (a JIT).
     check $arch/jitcode 0 "$allok" $arch "$b/jitcode.exe"
+    # A function's prologue patched at run time, as Detours does.
+    check $arch/detour 0 "$allok" $arch "$b/detour.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" $arch "$b/exitproc.exe"
     check $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" $arch "$b/seh.exe"
     check $arch/seh-traps 0 "$allok" $arch "$b/seh.exe" traps
@@ -76,6 +82,20 @@ fi
 if [ -z "${ARCHES:-}" ] || [[ "$ARCHES" =~ x86 ]]; then
 check pe-x86/hello32 0 "Hello from x86 PE32!" x86 "$fx/x86/hello32.exe"
 check pe-x86/msvc 9 "msvc" x86 "$fx/x86/msvc.exe"
+fi
+# The arena keeps out of memory grown behind its back -- std's `System`
+# allocator (dlmalloc) grows the memory itself for thread-local destructor
+# lists, and the heap once landed on top of it (docs/nt-layer.md §10.2).
+if [ -z "$only" ] || [[ arena-selfcheck =~ $only ]]; then
+    selfcheck=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs \
+        --dir /wine=$prefix --file /t/hello_args.exe=$root/tests/nt/bin/x86/hello_args.exe --argv0 /t/hello_args.exe \
+        --cwd /t --env GEX_NT_ARENA_SELFTEST=1 web/public/gex/seed.x86.shared.wasm \
+        "$root/tests/nt/bin/x86/hello_args.exe" 2>&1 | grep "arena self-check")
+    if [[ "$selfcheck" == *"arena self-check: ok"* ]]; then
+        pass=$((pass + 1)); echo "ok   arena-selfcheck"
+    else
+        fail=$((fail + 1)); echo "FAIL arena-selfcheck: ${selfcheck:-no answer}"
+    fi
 fi
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

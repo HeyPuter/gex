@@ -39,6 +39,10 @@ function moduleContentKey(bytes) {
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
 const SHIM_STACK_TOP = 0x06000000;
+/** `gex_abi::ctx::LAST_TARGET`. */
+const CTX_LAST_TARGET = 44 * 8;
+/** `gex_abi::BOOT_STACK_COUNTER`: which bootstrap stack slice is next. */
+const BOOT_STACK_COUNTER = 0x00100000 - 192;
 /**
  * Whether a fork hands the child its parent's compiled modules (default 1).
  * `?forkmods=0` sends none and the child recompiles what it branches into.
@@ -545,6 +549,17 @@ export class Gex {
     // pointer resets to the top, since a trap abandons the stack), and a fresh
     // slot each time would exhaust the sixty-four available in a second.
     if (this.#stackTop === null) {
+      // `gex_worker_init` runs on a stack too, and until it answers this
+      // instance's is wasm-ld's: the top of the guest's first 8 MiB, which is
+      // a Windows program's image (noita.exe's .text at 0x7ff000..0x800000
+      // was overwritten by every thread that started). So it runs on a
+      // bootstrap slice of the shim's own stack band below SHIM_STACK_TOP,
+      // one of 32 handed out round-robin through a counter in the reserved
+      // low region -- Workers starting together get different ones.
+      if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && this.#memory.buffer instanceof SharedArrayBuffer) {
+        const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
+        this.#shim.exports.__stack_pointer.value = (SHIM_STACK_TOP - k * 0x40000) | 0;
+      }
       const at = this.#shim.exports.gex_worker_init?.();
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
     }
@@ -764,11 +779,23 @@ export class Gex {
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, ''),
         ),
-        warn: (ptr, len) => console.error(
-          utf8(
+        warn: (ptr, len) => {
+          const text = utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
-          ).replace(/\n$/, ''),
-        ),
+          ).replace(/\n$/, '');
+          // `[gex-stack]`: the shim wants to be told who called it (the wasm
+          // frames are named).
+          if (text.startsWith('[gex-stack]')) {
+            // The run loop turns stack traces off around guest code.
+            const limit = Error.stackTraceLimit;
+            Error.stackTraceLimit = 40;
+            const stack = new Error().stack;
+            Error.stackTraceLimit = limit;
+            console.error(`${text}\n${stack}`);
+          } else {
+            console.error(text);
+          }
+        },
         now: () => this.#env.now(),
         // The NT layer's monotonic clock: `now` is `Date.now()`, a
         // millisecond wall clock that can step.
@@ -2095,7 +2122,21 @@ export class Gex {
       // metadata and table-need computation the install does regardless.
       const key = moduleContentKey(bytes);
       const cached = key ? this.#sharedModules.get(key) : undefined;
-      await this.#installModule(bytes, need, 64, null, 'jit2049', cached);
+      let who = 'jit2049';
+      if (globalThis.GEX_DUMP_WHERE ?? true) who = `jit2049-${i}-at-${ptr.toString(16)}`;
+      try {
+        await this.#installModule(bytes, need, 64, null, who, cached);
+      } catch (err) {
+        if (err instanceof WebAssembly.CompileError) {
+          e.gex_nt_where?.(ptr | 0, len | 0);
+          // And whether the registry's copy is still what was read.
+          const now = this.#bytes().slice(ptr, ptr + len);
+          let diff = 0;
+          for (let j = 0; j < len; j++) if (now[j] !== bytes[j]) diff++;
+          console.error(`[gex] module ${i} at 0x${ptr.toString(16)}+0x${len.toString(16)}: ${diff} bytes differ from the copy compiled`);
+        }
+        throw err;
+      }
       if (cached) { reused++; continue; }
       // Newly compiled here: hand it to the host to relay to siblings, and keep
       // it so this Worker does not compile it twice either.
@@ -2304,8 +2345,10 @@ export class Gex {
           // the jit-storm repro). See gex_claimed_slots.
           const eR = this.#shim.exports;
           if (/table index is out of bounds/.test(err.message) && eR.gex_last_target) {
+            // This thread's last target, read from its own context: the
+            // shim's answer was once another thread's.
             let tgt = 0n;
-            try { tgt = eR.gex_last_target(); } catch { tgt = 0n; }
+            try { tgt = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_LAST_TARGET, true); } catch { tgt = 0n; }
             const grew = this.#growTablesToClaimed();
             if (grew && (globalThis.GEX_TABLE_DEBUG || (typeof process !== 'undefined' && process.env?.GEX_TABLE_DEBUG)))
               console.error(`[tblrec] caught up tables for a sibling-numbered page (retry ${this.#tableRetries})`);
@@ -2872,8 +2915,8 @@ export class Gex {
         e.__stack_pointer.value = sp;
         if (!e.gex_handoff()) {
           // The sibling-numbered-page race, as in the outer loop.
-          if (/table index is out of bounds/.test(err.message) && e.gex_last_target) {
-            const tgt = e.gex_last_target();
+          if (/table index is out of bounds/.test(err.message)) {
+            const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
             if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
               pc = tgt < 0n ? tgt + (1n << 64n) : tgt;
               continue;
@@ -3060,10 +3103,25 @@ export class Gex {
     // A `precompiled` Module (a sibling Worker's, relayed by the host) skips the
     // compile entirely; otherwise compile the bytes (or use them if already a
     // Module). Same registry bytes either way, so the Module is interchangeable.
-    const mod = precompiled instanceof WebAssembly.Module
-      ? precompiled
-      : bytes instanceof WebAssembly.Module ? bytes
-        : sync ? new WebAssembly.Module(bytes) : await WebAssembly.compile(bytes);
+    let mod;
+    try {
+      mod = precompiled instanceof WebAssembly.Module
+        ? precompiled
+        : bytes instanceof WebAssembly.Module ? bytes
+          : sync ? new WebAssembly.Module(bytes) : await WebAssembly.compile(bytes);
+    } catch (err) {
+      // The engine refused a translation: hand its bytes to whoever serves
+      // the page (tests/nt's harness keeps them), synchronously, since the
+      // Worker may be about to die. Best effort.
+      if (bytes instanceof Uint8Array && err instanceof WebAssembly.CompileError) {
+        try {
+          const x = new XMLHttpRequest();
+          x.open('POST', `/__gex_dump?name=${encodeURIComponent(who)}`, false);
+          x.send(bytes.slice());
+        } catch {}
+      }
+      throw err;
+    }
     this.#compileMs += performance.now() - tc;
     // With its metadata: a fork hands the child `#compiled`, and without the
     // metadata the child cannot tell which module covers which page and must

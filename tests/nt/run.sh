@@ -63,6 +63,10 @@ for arch in x64 x86; do
         "$b/hello_args.exe" a "b c"
     # N2 (and N3 for x86): every line "ok ...", then "0 failures".
     check $arch/sync 0 "$allok" "$b/sync.exe"
+    # Locks under contention. x86 only: x64's SList is cmpxchg16b, which
+    # gex still does in two halves (wasm has no 16-byte atomic).
+    [ $arch = x86 ] && check $arch/mtx 0 "$allok" "$b/mtx.exe"
+    check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
     check $arch/apc 0 "$allok" "$b/apc.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
     check $arch/cxx 0 "$allok" "$b/cxx.exe"
