@@ -210,6 +210,8 @@ pub struct FnUnit {
     pub ftab: bool,
     /// The functions with a body here, in order (a whole-image unit's).
     defined: Vec<u64>,
+    /// The body being emitted has a `goto gex_resume` (`resume_block`).
+    resumes: bool,
 }
 
 impl Default for FnUnit {
@@ -236,6 +238,7 @@ impl FnUnit {
             standalone: false,
             ftab: false,
             defined: Vec::new(),
+            resumes: false,
         }
     }
 
@@ -435,6 +438,12 @@ impl FnUnit {
             self.term(&mut e, f, i, known, sums, trapfree, &mut calls, None, Some(&heads))?;
             e.line("}");
         }
+        // Always there in a whole-image unit's body (clang drops it when
+        // nothing goes there).
+        self.resumes = false;
+        if self.ftab {
+            resume_block(&mut e, f);
+        }
         self.bodies.push_str(&e.take_output());
         self.bodies.push_str("}\n\n");
 
@@ -502,6 +511,11 @@ impl FnUnit {
         let b = &f.blocks[i];
         let live = &self.live;
         let self_weight = self.weight;
+        // A whole-image unit's body (not a loop function) catches what its
+        // callees leave for (`resume_block`): where they fail, it goes there.
+        let ftab = self.ftab;
+        let resumed = std::cell::Cell::new(false);
+        let fail = if ftab && scope.is_none() { "goto gex_resume;" } else { "return 0;" };
         let goto = |e: &mut Emitter<'_>, edge: &Edge| {
             if !edge.args.is_empty() {
                 unreachable!("memory form has no edge arguments");
@@ -535,7 +549,13 @@ impl FnUnit {
                             loop_name(h.fname, k),
                             self_weight
                         ));
-                        e.line("  if (lr <= 1) return lr;");
+                        if ftab {
+                            resumed.set(true);
+                            e.line("  if (lr == 0) goto gex_resume;");
+                            e.line("  if (lr == 1) return 1;");
+                        } else {
+                            e.line("  if (lr <= 1) return lr;");
+                        }
                         e.load_regs(h.used);
                         e.line("  switch (lr) {");
                         for x in &lp.exits {
@@ -637,11 +657,15 @@ impl FnUnit {
                 e.line("default:;");
                 e.line("}");
                 if self.ftab {
-                    // Anywhere else: a jump, so whatever runs there returns
-                    // where this function would have.
+                    // Anywhere else: leave for it, and this body itself
+                    // catches it first when it is one of its own blocks.
                     e.flush();
+                    e.store_pc(&t);
                     e.safepoint(&t);
-                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                    if scope.is_none() {
+                        resumed.set(true);
+                    }
+                    e.line(fail);
                 } else {
                     leave(e, &t);
                 }
@@ -700,24 +724,24 @@ impl FnUnit {
                         if trapfree.contains_key(t) {
                             e.line(format!("  if (__builtin_expect({}, 0)) {{", patched_test(*t)));
                             e.flush_keep();
-                            ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg);
+                            ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                             reload_all(e);
                             e.line("  } else");
                         }
                         e.line(format!(
-                            "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) return 0;",
+                            "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
                             body_name(*t),
                             self.weight
                         ));
                     }
                     Callee::Direct(t) if self.ftab => {
                         *self.stats.leaves.entry(*t).or_default() += 1;
-                        ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg);
+                        ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                     }
                     Callee::Indirect(v) if self.ftab => {
                         self.stats.calls_indirect += 1;
                         let t = e.v(*v);
-                        ftab_call(e, &t, &format!("depth + {}", self.weight), need_back, &ret_arg);
+                        ftab_call(e, &t, &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                     }
                     Callee::Direct(t) if known.contains(t) => {
                         calls.insert(*t);
@@ -891,11 +915,19 @@ impl FnUnit {
                 // resolved goes on through the function table instead, under
                 // this function's own return contract.
                 e.flush();
-                if self.ftab && matches!(b.term, FTerm::Unresolved { .. }) {
-                    e.safepoint(&t);
-                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                e.store_pc(&t);
+                if self.ftab {
+                    // This body catches it first when it is one of its own
+                    // blocks (a jump table recovery did not resolve, a
+                    // return used as a jump), at no cost to anyone else.
+                    if matches!(b.term, FTerm::Unresolved { .. }) {
+                        e.safepoint(&t);
+                    }
+                    if scope.is_none() {
+                        resumed.set(true);
+                    }
+                    e.line(fail);
                 } else {
-                    e.store_pc(&t);
                     e.line("return 0;");
                 }
             }
@@ -915,6 +947,9 @@ impl FnUnit {
                 e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
                 e.line("__builtin_trap();");
             }
+        }
+        if resumed.get() {
+            self.resumes = true;
         }
         Ok(())
     }
@@ -958,9 +993,47 @@ impl FnUnit {
 /// A call through the function table to `t` (a C expression): the target in
 /// `ctx::LAST_TARGET`, the index from the probe cache (the resolve stub on a
 /// miss), the callee's result tested as for any call.
-fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str) {
+fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, fail: &str) {
     e.line(format!("  {{ const uint64_t ft = {t}; GEX_C64({}u) = ft;", ctx::LAST_TARGET));
-    e.line(format!("    if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need}, {ret})) return 0; }}"));
+    e.line(format!("    if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need}, {ret})) {fail} }}"));
+}
+
+/// Where a whole-image unit's body goes when a callee left (returned 0):
+/// everything is in the context and `ctx::PC` says where the guest goes.
+/// If that is one of this body's blocks and the stack is at or below this
+/// activation's (a `longjmp` back into it, an exception landing in it, a
+/// jump table it did not resolve, the depth guard of a recursive call), the
+/// body reloads every register and carries on there, and nothing further
+/// out unwinds; otherwise it leaves too. Correct for any activation of the
+/// function -- the guest's own stack holds the real return addresses -- so
+/// the stack test only keeps a deeper activation from taking what an outer
+/// one is waiting for.
+fn resume_block(e: &mut Emitter<'_>, f: &Function) {
+    let mut starts: Vec<(u64, usize)> =
+        f.blocks.iter().enumerate().filter(|(_, b)| !b.synthetic).map(|(i, b)| (b.start, i)).collect();
+    starts.sort_unstable();
+    starts.dedup_by_key(|x| x.0);
+    let lo = starts.first().map_or(0, |x| x.0);
+    let hi = f.blocks.iter().filter(|b| !b.synthetic).map(|b| b.end).max().unwrap_or(lo);
+    e.line("gex_resume: {");
+    e.line(format!(
+        "  const uint64_t rpc = GEX_C64({}u);",
+        ctx::PC
+    ));
+    e.line(format!(
+        "  if (rpc - 0x{lo:x}ull < 0x{:x}ull && GEX_C64({}u) <= sp0) {{",
+        hi.saturating_sub(lo),
+        ctx::SP
+    ));
+    reload_all(e);
+    e.line("    switch (rpc) {");
+    for (a, i) in &starts {
+        e.line(format!("    case 0x{a:x}ull: goto L{i};"));
+    }
+    e.line("    }");
+    e.line("  }");
+    e.line("  return 0;");
+    e.line("}");
 }
 
 /// A tail call through the function table to `t`, with this function's own

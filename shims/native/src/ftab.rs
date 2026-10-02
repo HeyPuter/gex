@@ -53,14 +53,30 @@ pub(crate) mod stats {
     pub static TRANSLATED: AtomicU64 = AtomicU64::new(0);
     pub static FALLBACKS: AtomicU64 = AtomicU64::new(0);
     pub static STALE: AtomicU64 = AtomicU64::new(0);
+    /// Guest execution redirected by trapping out of every wasm frame
+    /// (`HostState::resume_at`: signals, NtContinue, exception dispatch),
+    /// which discards the whole nest.
+    pub static RESUMES: AtomicU64 = AtomicU64::new(0);
+    /// Calls the fallback served, and 1 in 1024 of their targets.
+    pub static FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static FALLBACK_SITES: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+    /// The `n` most sampled fallback targets since the last call.
+    pub fn take_fallback_sites(n: usize) -> Vec<(u64, u64)> {
+        let m = FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let mut v: Vec<_> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(n);
+        v
+    }
     pub fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "ftab lookups={} translated={} fallback={} stale={}",
+            "ftab lookups={} translated={} fallback={} stale={} resumes={}",
             LOOKUPS.load(Relaxed),
             TRANSLATED.load(Relaxed),
             FALLBACKS.load(Relaxed),
-            STALE.load(Relaxed)
+            STALE.load(Relaxed),
+            RESUMES.load(Relaxed)
         )
     }
 }
@@ -427,6 +443,9 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
         (true, true) => 4,
     };
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
+    if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {
+        *stats::FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(target).or_default() += 1;
+    }
     // No caller waits for a return (a root, or the bridge): leave, and the
     // root dispatches there flat.
     if ret == gex_abi::ftab::NO_RETURN {

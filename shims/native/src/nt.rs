@@ -284,6 +284,11 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                             .map(|(f, t, c)| format!("{} -> {} x{c}", p.describe_addr(f), p.describe_addr(t)))
                             .collect();
                         eprintln!("gex-nt: nest exits (1 in 4096) {}", ex.join(" | "));
+                        let fb: Vec<String> = crate::ftab::stats::take_fallback_sites(15)
+                            .into_iter()
+                            .map(|(t, c)| format!("{} x{c}", p.describe_addr(t)))
+                            .collect();
+                        eprintln!("gex-nt: fallback targets (1 in 1024) {}", fb.join(" | "));
                         let mut by: std::collections::BTreeMap<String, u64> = Default::default();
                         for (page, n) in crate::tier1_pages() {
                             let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
@@ -541,6 +546,7 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
             return Ok(());
         }
         if let Some(next) = caller.data_mut().resume_at.take() {
+            crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             pc = next;
             continue;
         }
