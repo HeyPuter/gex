@@ -369,7 +369,8 @@ pub fn get_desktop_window(c: &mut Call<'_>) -> R<u32> {
         if u.desktop == 0 {
             class::register_builtin(&mut u, p64, super::procs::DESKTOP);
             class::register_builtin(&mut u, p64, super::procs::MESSAGE);
-            let screen = Rect { left: 0, top: 0, right: super::sysparams::SCREEN_W, bottom: super::sysparams::SCREEN_H };
+            let m = super::sysparams::Mode::unpack_current(&c.p.display_mode);
+            let screen = Rect { left: 0, top: 0, right: m.width, bottom: m.height };
             let desktop = create_bare(&mut u, super::procs::DESKTOP, 0, screen, ws::POPUP | ws::VISIBLE | ws::CLIPCHILDREN, tid)
                 .ok_or(Status(crate::nt::st::NO_MEMORY))?;
             u.desktop = desktop;

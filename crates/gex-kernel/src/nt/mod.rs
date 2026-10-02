@@ -439,6 +439,8 @@ pub struct Process {
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
+    /// The display mode, `user::sysparams::Mode` packed (ChangeDisplaySettings).
+    pub display_mode: AtomicU64,
 }
 
 #[derive(Default)]
@@ -511,6 +513,7 @@ impl Process {
             display_host: Mutex::new(None),
             presents: AtomicU64::new(0),
             kill_list: Mutex::new(Vec::new()),
+            display_mode: AtomicU64::new(user::sysparams::Mode::DEFAULT.pack()),
         }
     }
 

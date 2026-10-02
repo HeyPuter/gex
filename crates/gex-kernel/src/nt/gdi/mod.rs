@@ -15,6 +15,7 @@
 
 pub mod bitmap;
 pub mod blit;
+pub mod d3dkmt;
 pub mod dc;
 pub mod region;
 pub mod surface;
@@ -339,6 +340,15 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtGdiOffsetClipRgn => region::nt_gdi_offset_clip_rgn(c),
         n::NtGdiGetRandomRgn => region::nt_gdi_get_random_rgn(c),
         n::NtGdiFillRgn => region::nt_gdi_fill_rgn(c),
+        n::NtGdiDdDDIOpenAdapterFromLuid => d3dkmt::open_adapter_from_luid(c),
+        n::NtGdiDdDDICreateDevice => d3dkmt::create_device(c),
+        n::NtGdiDdDDIQueryVideoMemoryInfo => d3dkmt::query_video_memory_info(c),
+        n::NtGdiDdDDICreateDCFromMemory => d3dkmt::create_dc_from_memory(c),
+        n::NtGdiDdDDIDestroyDCFromMemory => d3dkmt::destroy_dc_from_memory(c),
+        n::NtGdiDdDDICloseAdapter
+        | n::NtGdiDdDDIDestroyDevice
+        | n::NtGdiDdDDISetQueuedLimit
+        | n::NtGdiDdDDICheckVidPnExclusiveOwnership => d3dkmt::check_adapter(c),
         nr => Err(c.unimplemented(&format!("win32u {} ({nr:#x})", super::syscall_name(nr)))),
     }
 }

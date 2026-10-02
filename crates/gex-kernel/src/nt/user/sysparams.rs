@@ -1,9 +1,10 @@
 //! System metrics, colors, DPI and the one monitor (win32u's sysparams.c).
 //!
-//! gex presents a fixed display: one 1920x1080 monitor at 96 dpi. The
-//! metrics and colors are what Wine 11.15 reports for that display with its
-//! default theme, measured under native Wine (Xvfb, 1920x1080) and recorded
-//! here, so programs see Wine's numbers.
+//! gex presents one monitor at 96 dpi, 1920x1080 unless a program changes
+//! the mode (ChangeDisplaySettings, as a fullscreen game does). The metrics
+//! and colors are what Wine 11.15 reports for 1920x1080 with its default
+//! theme, measured under native Wine (Xvfb, 1920x1080) and recorded here,
+//! so programs see Wine's numbers; the screen-sized ones follow the mode.
 
 use super::window::Rect;
 use super::{err, handle_ret, set_last_error, write_rect, R64};
@@ -11,6 +12,47 @@ use crate::nt::{Call, R};
 
 pub const SCREEN_W: i32 = 1920;
 pub const SCREEN_H: i32 = 1080;
+
+/// A display mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mode {
+    pub width: i32,
+    pub height: i32,
+    pub bpp: u32,
+}
+
+impl Mode {
+    /// The mode at start, and the registry's.
+    pub const DEFAULT: Mode = Mode { width: SCREEN_W, height: SCREEN_H, bpp: 32 };
+
+    pub const fn pack(self) -> u64 {
+        (self.width as u64) | (self.height as u64) << 24 | (self.bpp as u64) << 48
+    }
+
+    fn unpack(v: u64) -> Mode {
+        Mode { width: (v & 0xff_ffff) as i32, height: (v >> 24 & 0xff_ffff) as i32, bpp: (v >> 48) as u32 }
+    }
+
+    /// The mode in `nt::Process::display_mode`.
+    pub fn unpack_current(v: &std::sync::atomic::AtomicU64) -> Mode {
+        Mode::unpack(v.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// The modes on offer, in EnumDisplaySettings order: each size at 32, 16 and
+/// 8 bpp, as Wine's virtual modes are.
+const SIZES: [(i32, i32); 8] = [(640, 480), (800, 600), (1024, 768), (1280, 720), (1280, 960), (1280, 1024), (1600, 900), (1920, 1080)];
+const DEPTHS: [u32; 3] = [32, 16, 8];
+
+fn mode_at(index: usize) -> Option<Mode> {
+    let (w, h) = *SIZES.get(index / DEPTHS.len())?;
+    Some(Mode { width: w, height: h, bpp: DEPTHS[index % DEPTHS.len()] })
+}
+
+/// The current display mode.
+pub fn mode(c: &Call<'_>) -> Mode {
+    Mode::unpack_current(&c.p.display_mode)
+}
 pub const DPI: u32 = 96;
 /// The one monitor's handle.
 pub const MONITOR: u32 = 0x0001_0001;
@@ -42,8 +84,14 @@ impl Default for SysParams {
     }
 }
 
-pub fn system_metrics(_c: &Call<'_>, index: i32) -> i32 {
+pub fn system_metrics(c: &Call<'_>, index: i32) -> i32 {
+    let m = mode(c);
     match index {
+        // The screen, its full-screen client area, the maximized and
+        // maximum-tracking sizes, the virtual screen: measured at 1920x1080,
+        // offset by the mode's size.
+        0 | 16 | 59 | 61 | 78 => METRICS[index as usize] - SCREEN_W + m.width,
+        1 | 17 | 60 | 62 | 79 => METRICS[index as usize] - SCREEN_H + m.height,
         0..=99 => METRICS[index as usize],
         // SM_REMOTESESSION, SM_SHUTTINGDOWN, SM_REMOTECONTROL,
         // SM_CARETBLINKINGENABLED, SM_CONVERTIBLESLATEMODE, SM_SYSTEMDOCKED
@@ -56,8 +104,9 @@ pub fn sys_color(index: i32) -> u32 {
     COLORS.get(index as usize).copied().unwrap_or(0)
 }
 
-pub fn primary_rect(_c: &Call<'_>) -> Rect {
-    Rect { left: 0, top: 0, right: SCREEN_W, bottom: SCREEN_H }
+pub fn primary_rect(c: &Call<'_>) -> Rect {
+    let m = mode(c);
+    Rect { left: 0, top: 0, right: m.width, bottom: m.height }
 }
 
 /// `NtUserGetSystemDpiForProcess(process)`.
@@ -284,17 +333,27 @@ pub fn nt_user_enum_display_monitors(c: &mut Call<'_>) -> R64 {
 
 /// Is `device` (a `UNICODE_STRING *`, NULL for the primary) the display?
 fn is_display(c: &Call<'_>, device: u64) -> R<bool> {
-    let Some(name) = c.g.ustr(device)? else { return Ok(true) };
+    let Some(name) = c.g.ustr(device)?.filter(|n| !n.is_empty()) else { return Ok(true) };
     Ok(crate::nt::wstr(&name).eq_ignore_ascii_case("\\\\.\\DISPLAY1"))
 }
 
-/// `NtUserEnumDisplaySettings(device, index, devmode, flags)`: one mode,
-/// 1920x1080x32 at 60 Hz, which is also the current and registry one.
+/// `NtUserEnumDisplaySettings(device, index, devmode, flags)`: the modes
+/// on offer at 60 Hz, ENUM_CURRENT_SETTINGS (-1) the current one and
+/// ENUM_REGISTRY_SETTINGS (-2) 1920x1080x32.
 pub fn nt_user_enum_display_settings(c: &mut Call<'_>) -> R64 {
     let (device, index, dm) = (c.a(0), c.a32(1) as i32, c.a(2));
     if !is_display(c, device)? {
         return Ok(0);
     }
+    let m = match index {
+        -1 => mode(c),
+        -2 => Mode::DEFAULT,
+        i if i >= 0 => match mode_at(i as usize) {
+            Some(m) => m,
+            None => return Ok(0),
+        },
+        _ => return Ok(0),
+    };
     let mut name = crate::nt::to_w("Wine Display Driver");
     name.resize(32, 0);
     c.g.write_wchars(dm, &name)?;
@@ -302,30 +361,29 @@ pub fn nt_user_enum_display_settings(c: &mut Call<'_>) -> R64 {
     c.g.w16(dm + 66, 0x401)?; // dmDriverVersion
     c.g.w16(dm + 68, 188)?; // dmSize: up to dmICMMethod
     c.g.w16(dm + 70, 0)?;
-    if !(index == -1 || index == -2 || index == 0) {
-        return Ok(0);
-    }
     // DM_POSITION | DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH |
     // DM_PELSHEIGHT | DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY
     c.g.w32(dm + 72, 0x20 | 0x80 | 0x40000 | 0x80000 | 0x100000 | 0x200000 | 0x400000)?;
     c.g.w32(dm + 76, 0)?;
     c.g.w32(dm + 80, 0)?;
     c.g.w32(dm + 84, 0)?; // DMDO_DEFAULT
-    c.g.w32(dm + 168, 32)?;
-    c.g.w32(dm + 172, SCREEN_W as u32)?;
-    c.g.w32(dm + 176, SCREEN_H as u32)?;
+    c.g.w32(dm + 168, m.bpp)?;
+    c.g.w32(dm + 172, m.width as u32)?;
+    c.g.w32(dm + 176, m.height as u32)?;
     c.g.w32(dm + 180, 0)?;
     c.g.w32(dm + 184, 60)?;
     Ok(1)
 }
 
 /// `NtUserEnumDisplayDevices(device, index, info, flags)`: the adapter
-/// `\\.\DISPLAY1` and its one monitor.
+/// `\\.\DISPLAY1` and its one monitor. An NTSTATUS (user32 returns
+/// `!status`), so a loop over the adapters ends at index 1.
 pub fn nt_user_enum_display_devices(c: &mut Call<'_>) -> R64 {
     let (device, index, info) = (c.a(0), c.a32(1), c.a(2));
-    let adapter = c.g.ustr(device)?.is_none();
+    // No name, or an empty one, enumerates the adapters.
+    let adapter = c.g.ustr(device)?.is_none_or(|n| n.is_empty());
     if index != 0 || (!adapter && !is_display(c, device)?) {
-        return Ok(0);
+        return Ok(crate::nt::st::UNSUCCESSFUL as u64);
     }
     let cb = c.g.u32(info)?;
     let put = |c: &mut Call<'_>, at: u64, n: usize, s: &str| -> R<()> {
@@ -351,5 +409,48 @@ pub fn nt_user_enum_display_devices(c: &mut Call<'_>) -> R64 {
         put(c, info + 328, 128, "MONITOR\\Default_Monitor\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0000")?;
         put(c, info + 584, 128, "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Class\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0000")?;
     }
-    Ok(1)
+    Ok(0)
+}
+
+/// `NtUserChangeDisplaySettings(device, devmode, hwnd, flags, lparam)`: a
+/// `DISP_CHANGE_*`. A mode on offer becomes current (the desktop window
+/// takes its size); no devmode, or no fields, restores the registry's.
+/// `CDS_TEST` only checks.
+pub fn nt_user_change_display_settings(c: &mut Call<'_>) -> R64 {
+    const SUCCESSFUL: i32 = 0;
+    const BADMODE: i32 = -2;
+    const BADPARAM: i32 = -5;
+    const CDS_TEST: u32 = 2;
+    let (device, dm, flags) = (c.a(0), c.a(1), c.a32(3));
+    if !is_display(c, device)? {
+        return Ok(BADPARAM as u32 as u64);
+    }
+    let cur = mode(c);
+    let fields = if dm != 0 { c.g.u32(dm + 72)? } else { 0 };
+    let want = if fields == 0 {
+        Mode::DEFAULT
+    } else {
+        // DM_BITSPERPEL, DM_PELSWIDTH, DM_PELSHEIGHT; the rest of the mode
+        // stays as it is.
+        let f = |bit: u32, at: u64, v: u32| -> R<u32> { Ok(if fields & bit != 0 { c.g.u32(dm + at)? } else { v }) };
+        Mode {
+            bpp: f(0x40000, 168, cur.bpp)?,
+            width: f(0x80000, 172, cur.width as u32)? as i32,
+            height: f(0x100000, 176, cur.height as u32)? as i32,
+        }
+    };
+    if !(0..SIZES.len() * DEPTHS.len()).any(|i| mode_at(i) == Some(want)) {
+        return Ok(BADMODE as u32 as u64);
+    }
+    if flags & CDS_TEST == 0 && want != cur {
+        c.p.display_mode.store(want.pack(), std::sync::atomic::Ordering::Relaxed);
+        let mut u = c.p.user.lock().unwrap();
+        let desktop = u.desktop;
+        if let Some(d) = super::window::find_mut(&mut u, desktop) {
+            let r = Rect { left: 0, top: 0, right: want.width, bottom: want.height };
+            d.window_rect = r;
+            d.client_rect = r;
+        }
+    }
+    Ok(SUCCESSFUL as u64)
 }

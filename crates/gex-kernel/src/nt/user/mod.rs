@@ -485,6 +485,7 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtUserNotifyWinEvent => Ok(0),
         n::NtUserEnumDisplayMonitors => sysparams::nt_user_enum_display_monitors(c),
         n::NtUserEnumDisplaySettings => sysparams::nt_user_enum_display_settings(c),
+        n::NtUserChangeDisplaySettings => sysparams::nt_user_change_display_settings(c),
         n::NtUserEnumDisplayDevices => sysparams::nt_user_enum_display_devices(c),
         n::NtUserGetDC => paint::nt_user_get_dc(c),
         n::NtUserGetKeyboardLayout => input::nt_user_get_keyboard_layout(c),
@@ -581,6 +582,8 @@ fn call_one_param(c: &mut Call<'_>) -> R64 {
         9 => Ok(sysparams::system_metrics(c, arg as i32) as i32 as i64 as u64),
         // SetThreadDpiAwarenessContext
         12 => Ok(sysparams::set_thread_dpi_awareness_context(c, arg as u32)? as u64),
+        // D3DKMTOpenAdapterFromGdiDisplayName(D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME *)
+        13 => crate::nt::gdi::d3dkmt::open_adapter_from_gdi_display_name(c, arg),
         _ => Err(c.unimplemented(&format!("NtUserCallOneParam code {code}"))),
     }
 }
