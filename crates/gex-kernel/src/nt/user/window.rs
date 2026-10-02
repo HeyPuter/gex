@@ -201,6 +201,9 @@ pub struct Window {
     pub dlg_info: u64,
     /// A builtin control's state (NtUserSetPrivateData), grown as written.
     pub private: Vec<u8>,
+    /// The part of the window a swapchain presents (D3DKMT's
+    /// SET_PRESENT_RECT_WINE escape); empty for the whole client area.
+    pub present_rect: Rect,
 }
 
 /// The window `hwnd` names (a full or a 16-bit handle).
@@ -354,6 +357,7 @@ fn create_bare(u: &mut User, class_proc: usize, parent: u32, rect: Rect, style: 
             own_dc: 0,
             dlg_info: 0,
             private: Vec::new(),
+            present_rect: Rect::default(),
         },
     );
     if let Some(p) = u.windows.get_mut(&parent) {
@@ -559,6 +563,7 @@ pub fn nt_user_create_window_ex(c: &mut Call<'_>) -> R64 {
                 own_dc: 0,
                 dlg_info: 0,
                 private: Vec::new(),
+                present_rect: Rect::default(),
             },
         );
         if let Some(p) = u.windows.get_mut(&parent) {

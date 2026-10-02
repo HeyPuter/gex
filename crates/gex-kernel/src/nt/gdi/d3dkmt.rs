@@ -3,7 +3,7 @@
 //! There is one adapter, `\\.\DISPLAY1`'s (`user::sysparams`); its handles
 //! name nothing, as no call here allocates or schedules anything.
 
-use super::super::{st, Abi, Call, Status};
+use super::super::{st, Abi, Call, Status, R};
 use super::R64;
 
 /// The one adapter's handle, and the one device's.
@@ -169,5 +169,31 @@ pub fn destroy_dc_from_memory(c: &mut Call<'_>) -> R64 {
         super::dc::release(c, dc)?;
     }
     super::free(c, hbm)?;
+    Ok(st::SUCCESS as u64)
+}
+
+/// `NtGdiDdDDIEscape(D3DKMT_ESCAPE *)`: `{ hAdapter; hDevice; Type; Flags;
+/// void *pPrivateDriverData; UINT PrivateDriverDataSize; hContext; }`. Wine's
+/// own escape that wined3d makes, SET_PRESENT_RECT_WINE (the part of a window
+/// a swapchain presents to), is kept on the window; anything else is
+/// STATUS_NO_MEMORY, as win32u answers.
+pub fn escape(c: &mut Call<'_>) -> R64 {
+    const SET_PRESENT_RECT_WINE: u32 = 0x8000_0001;
+    let d = c.a(0);
+    let ps = c.g.psize();
+    let (ty, data, size, hwnd) = (c.g.u32(d + 8)?, c.g.ptr(d + 16)?, c.g.u32(d + 16 + ps)?, c.g.u32(d + 20 + ps)?);
+    if ty != SET_PRESENT_RECT_WINE {
+        return Ok(st::NO_MEMORY as u64);
+    }
+    if size != 16 {
+        return Err(Status(st::INVALID_PARAMETER));
+    }
+    let r = |i: u64| -> R<i32> { Ok(c.g.u32(data + 4 * i)? as i32) };
+    let rect = super::super::user::window::Rect { left: r(0)?, top: r(1)?, right: r(2)?, bottom: r(3)? };
+    let mut u = c.p.user.lock().unwrap();
+    let Some(w) = super::super::user::window::find_mut(&mut u, hwnd) else {
+        return Err(Status(st::INVALID_PARAMETER));
+    };
+    w.present_rect = rect;
     Ok(st::SUCCESS as u64)
 }

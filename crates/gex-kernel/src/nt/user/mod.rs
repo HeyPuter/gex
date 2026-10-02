@@ -483,6 +483,10 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtUserSetMessageExtraInfo => message::nt_user_set_message_extra_info(c),
         n::NtUserReplyMessage => message::nt_user_reply_message(c),
         n::NtUserNotifyWinEvent => Ok(0),
+        // The startup info's flags (STARTF_USESHOWWINDOW), which a message
+        // box clears so the first ShowWindow is its own: gex starts every
+        // window shown as asked, so there is nothing to clear.
+        n::NtUserModifyUserStartupInfoFlags => Ok(1),
         n::NtUserEnumDisplayMonitors => sysparams::nt_user_enum_display_monitors(c),
         n::NtUserEnumDisplaySettings => sysparams::nt_user_enum_display_settings(c),
         n::NtUserChangeDisplaySettings => sysparams::nt_user_change_display_settings(c),

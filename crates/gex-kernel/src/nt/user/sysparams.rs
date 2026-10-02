@@ -281,6 +281,11 @@ fn spi(c: &mut Call<'_>, action: u32, val: u32, ptr: u64, _winini: u32) -> R64 {
             let _ = ps;
             Ok(1)
         }
+        // SPI_SETSCREENSAVEACTIVE, SPI_SETFILTERKEYS, SPI_SETTOGGLEKEYS,
+        // SPI_SETSTICKYKEYS: what a fullscreen game turns off while it runs
+        // and back on after. gex has no screensaver or accessibility keys to
+        // change, so the settings stay as the GETs report them.
+        0x11 | 0x33 | 0x35 | 0x3b => Ok(1),
         _ => Err(c.unimplemented(&format!("NtUserSystemParametersInfo action {action:#x}"))),
     }
 }
