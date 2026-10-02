@@ -3196,6 +3196,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A block entered for a neighbour sharing its dispatch slot
             // (x86-64): forget the neighbour so the miss that follows lifts it
             // again, with this block as a mate, into a trampoline.
+            if op == gex_abi::cache_op::NEST_EXIT_SAMPLE {
+                *EXIT_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((pc as u64, addr as u64)).or_default() += 1;
+                return Ok(());
+            }
             if op == gex_abi::cache_op::PAGE_STALE {
                 // A block failed its page check. Translate its address again
                 // only if its module still provides it; a newer translation
@@ -3676,6 +3680,13 @@ fn publish_unit(
         }
     }
     sh.stale_blocks += stale;
+    {
+        let mut by = TIER1_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let by = by.get_or_insert_with(Default::default);
+        for (a, _) in &translated.exported_blocks {
+            *by.entry(*a / gex_abi::DISPATCH_PAGE).or_default() += 1;
+        }
+    }
     sh.registry.push(Arc::clone(&unit));
     sh.blocks += blocks;
     sh.calls += 1;
@@ -3937,14 +3948,14 @@ fn install_cgen(
         Ok(r)
     };
     let mut cxm = cx.as_context_mut();
-    for &(_, k, slot, alone) in &cg.entries {
+    for &(_, k, slot, _) in &cg.entries {
         let (e, b) = refs[k as usize];
         let r = get(&mut cxm, e)?;
         tables[0].set(&mut cxm, slot as u64, r)?;
-        if alone {
-            let r = get(&mut cxm, b)?;
-            body_table.set(&mut cxm, slot as u64, r)?;
-        }
+        // A slot several entries share has the unit's body that picks
+        // among them by `ctx::PC` (`gex_cgen::func::fnref_source`).
+        let r = get(&mut cxm, b)?;
+        body_table.set(&mut cxm, slot as u64, r)?;
     }
     let current: Vec<(u64, u32)> = {
         let jit = cx.as_context().data().jit.as_ref().unwrap();
@@ -3959,6 +3970,28 @@ fn install_cgen(
 /// Leaves through the body table by (call site's return address, target),
 /// under GEX_NT_STATS.
 static LEAVE_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// Blocks tier-1 has translated, by guest page, for GEX_NT_STATS's split
+/// by image.
+static TIER1_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
+
+/// Tier-1's translated blocks so far, by page.
+pub(crate) fn tier1_pages() -> Vec<(u64, u64)> {
+    TIER1_PAGES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.iter().map(|(p, n)| (*p, *n)).collect()).unwrap_or_default()
+}
+
+/// Sampled nest exits by (the root's function, where it went), one in 4096.
+static EXIT_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// The `n` most sampled nest exits since the last call, as
+/// `function->target count`.
+pub(crate) fn take_exit_sites(n: usize) -> Vec<(u64, u64, u64)> {
+    let m = EXIT_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut v: Vec<_> = m.into_iter().map(|((f, t), c)| (f, t, c)).collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v.truncate(n);
+    v
+}
 
 /// The `n` call sites that left most since the last call, as `ret->target
 /// count` (GEX_NT_STATS).

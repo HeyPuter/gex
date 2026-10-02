@@ -26,6 +26,7 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_DISPATCH_SLOT_BITS {}u", gex_abi::DISPATCH_SLOT_BITS);
     let _ = writeln!(w, "#define GEX_CACHE_OP_SLOT_CONFLICT {}", gex_abi::cache_op::SLOT_CONFLICT);
     let _ = writeln!(w, "#define GEX_CACHE_OP_SPLIT_LOCK {}", gex_abi::cache_op::SPLIT_LOCK);
+    let _ = writeln!(w, "#define GEX_CACHE_OP_NEST_EXIT_SAMPLE {}", gex_abi::cache_op::NEST_EXIT_SAMPLE);
     let _ = writeln!(w, "#define GEX_CACHE_OP_LOW_ACCESS {}", gex_abi::cache_op::LOW_ACCESS);
     let _ = writeln!(w, "#define GEX_GUEST_FLOOR 0x{:x}u", gex_abi::GUEST_FLOOR);
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
@@ -233,6 +234,11 @@ GEX_INLINE uint64_t gex_fma64(int ctx, uint64_t ab, uint64_t bb_, uint64_t cb, u
    unit was installed (gex_abi::PATCHED_PAGES): a constant address, one load. */
 #define GEX_PATCHED(a) \
     ((*(volatile uint8_t *)GEX_P(GEX_PATCHED_PAGES + (uint32_t)((a) >> 15)) >> (uint32_t)(((a) >> 12) & 7u)) & 1u)
+
+/* At every loop back-edge: guest memory is shared with other threads, so a
+   load must not be hoisted out of a loop that neither stores nor calls (a
+   spin-wait on a flag another thread sets). A compiler-only fence: no code. */
+#define GEX_BACKEDGE() __atomic_signal_fence(__ATOMIC_SEQ_CST)
 
 /* Old value of a compare-and-swap, at each width. */
 #define GEX_CAS(T, p, e, r) __sync_val_compare_and_swap((T *)(p), (e), (r))
