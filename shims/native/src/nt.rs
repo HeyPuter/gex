@@ -236,6 +236,11 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
         let addr = u64::from_str_radix(addr.trim_start_matches("0x"), 16).ok()?;
         Some((addr, deref))
     });
+    // GEX_NT_HANG_DUMP=S: every S seconds, each thread's last safepoint pc,
+    // last indirect branch and context registers (`dump_threads`), for a
+    // console program that hangs (the frame-based dump below needs frames).
+    let dump_every = std::env::var("GEX_NT_HANG_DUMP").ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs);
+    let mut next_dump = dump_every;
     let start = Instant::now();
     let mut next_stats = Duration::from_secs(1);
     // The hang dump: presents frozen this long after the first one.
@@ -244,6 +249,12 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
         match p.upgrade() {
             Some(p) if !p.terminating.load(std::sync::atomic::Ordering::Relaxed) => {
                 nt::sysinfo::usd_tick(memory.bytes(), &p.clocks);
+                if let (Some(every), Some(at)) = (dump_every, next_dump) {
+                    if start.elapsed() >= at {
+                        next_dump = Some(at + every);
+                        dump_threads(&p, &mut GuestMem::new(memory.bytes()));
+                    }
+                }
                 // GEX_NT_STATS: once a (real) second, for benchmark harnesses.
                 if stats && start.elapsed() >= next_stats {
                     next_stats += Duration::from_secs(1);
@@ -294,6 +305,41 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
         }
         std::thread::sleep(Duration::from_millis(1));
     });
+}
+
+/// GEX_NT_HANG_DUMP's report: every thread's last safepoint pc, last
+/// indirect branch, registers and the top of its stack.
+fn dump_threads(p: &nt::Process, gm: &mut GuestMem<'_>) {
+    let threads: Vec<Arc<nt::Thread>> = p.threads.read().unwrap().by_tid.values().cloned().collect();
+    let p32 = p.abi == nt::Abi::P32;
+    for t in threads {
+        let c = t.ctx_addr;
+        let r = |o: usize| gm.read_u64(c + o as u64).unwrap_or(0);
+        let mask = if p32 { 0xffff_ffff } else { !0 };
+        let regs: Vec<String> = (0..if p32 { 8 } else { 16 }).map(|i| format!("{:#x}", r(ctx::x(i)) & mask)).collect();
+        let sp = r(ctx::x(4)) & mask;
+        let stack: Vec<String> = (0..8u64)
+            .map(|i| {
+                let v = if p32 { gm.read_u32(sp + 4 * i).unwrap_or(0) as u64 } else { gm.read_u64(sp + 8 * i).unwrap_or(0) };
+                p.describe_addr(v)
+            })
+            .collect();
+        eprintln!(
+            "gex-nt: thread {:x}: pc {} last target {} from {}; safepoint counter {}; alerted {} word {:#x}; regs [{}] stack [{}]",
+            t.tid,
+            p.describe_addr(r(ctx::PC)),
+            p.describe_addr(r(ctx::LAST_TARGET)),
+            p.describe_addr(r(ctx::LAST_SOURCE)),
+            gm.read_u32(c + ctx::SAFEPOINT_COUNTER as u64).unwrap_or(0) as i32,
+            t.alerted.load(std::sync::atomic::Ordering::Relaxed),
+            gm.read_u32(t.word).unwrap_or(0),
+            regs.join(" "),
+            stack.join(" ")
+        );
+        // The next back-edge then stops at the host, which stores its pc:
+        // a thread looping shows where by the next report.
+        let _ = gm.write_u32(c + ctx::SAFEPOINT_COUNTER as u64, 0);
+    }
 }
 
 /// The `syscall` import for an NT process.

@@ -72,12 +72,10 @@ for arch in x64 x86; do
     # N2 (and N3 for x86): every line "ok ...", then "0 failures".
     check $arch/sync 0 "$allok" "$b/sync.exe"
     # Locks under contention (x64's SList is cmpxchg16b, done by the host
-    # under one lock). x64's _Mtx_lock section also livelocked natively from
-    # 03fd68c2 to f54d5717 (a stale block dispatching back to itself); with
-    # that fixed, mtx still hangs now and then under CPU load on both arches,
-    # on pure tier-1 (a timing race, S12 is on it: NtWaitForAlertByThreadId).
-    # x86 only natively until that is fixed; the browser runs both.
-    [ $arch = x86 ] && check $arch/mtx 0 "$allok" "$b/mtx.exe"
+    # under one lock). Its hangs were a stale block dispatching back to
+    # itself (f54d5717, and under CPU load the PAGE_STALE catch-up); a loaded
+    # machine is what shows them: tests/nt/stress.sh.
+    check $arch/mtx 0 "$allok" "$b/mtx.exe"
     # A locked write through a null pointer's field is an access violation.
     check $arch/lownull-xadd 0 "$allok" "$b/lownull.exe" xadd
     check $arch/lownull-aligned 0 "$allok" "$b/lownull.exe" aligned
