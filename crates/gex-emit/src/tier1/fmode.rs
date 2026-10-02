@@ -15,6 +15,19 @@ use super::*;
 use gex_ir::func::RegSet;
 use std::collections::HashMap;
 
+/// A block's register writes left to its edges ([`FnBody::block`]).
+pub struct Deferred {
+    writes: Vec<(GuestReg, Value)>,
+    sunk: Vec<Stmt>,
+    /// The value tables right after the block: what the deferred code reads.
+    local: Vec<Option<u32>>,
+    cnst: Vec<Option<u64>>,
+    ty: Vec<Ty>,
+    /// The values kept alive for it, released by [`FnBody::end_block`].
+    inputs: Vec<u32>,
+    borrowed: Vec<u32>,
+}
+
 /// A terminator's value, past its block (see [`FnBody::operand`]).
 #[derive(Clone, Copy, Debug)]
 pub enum Operand {
@@ -139,7 +152,11 @@ impl<'a> FnBody<'a> {
     /// Emit one block's statements. `start` is the block's guest address
     /// (what a fault inside reports); values in `keep` stay live after the
     /// statements, for the terminator, until [`Self::release`].
-    pub fn block(&mut self, start: u64, stmts: &[Stmt], keep: &[Value]) {
+    /// `defer` are indices of `WriteReg`s left to the caller, which does
+    /// them on the edges that need them ([`Self::emit_deferred`]); the pure
+    /// definitions only they use are left with them (sunk), so a flag
+    /// computed for an exit taken once is computed there.
+    pub fn block(&mut self, start: u64, stmts: &[Stmt], keep: &[Value], defer: &[usize]) -> Deferred {
         self.e.block_start = start;
         // Values are numbered per block: forget the last block's (a value
         // nobody read keeps its local, which is only a local lost).
@@ -149,9 +166,41 @@ impl<'a> FnBody<'a> {
         for v in self.e.value_const.iter_mut() {
             *v = None;
         }
+        // Who uses each value, and which definitions sink: pure, not a
+        // register read (its register may change before the edge), used by
+        // deferred writes and sunk definitions only.
+        let mut users: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, s) in stmts.iter().enumerate() {
+            s.for_each_use(|v| users.entry(v.0).or_default().push(i));
+        }
+        let mut sunk = vec![false; stmts.len()];
+        for (i, s) in stmts.iter().enumerate().rev() {
+            if let Stmt::Def { dst, expr } = s {
+                let sinks = expr.is_pure()
+                    && !matches!(expr, Expr::ReadReg(_))
+                    && !keep.contains(dst)
+                    && users.get(&dst.0).is_some_and(|u| u.iter().all(|&j| defer.contains(&j) || sunk[j]));
+                sunk[i] = sinks;
+            }
+        }
+        // The values the deferred code reads from the block: kept.
+        let mut inputs: Vec<Value> = Vec::new();
+        for (i, s) in stmts.iter().enumerate() {
+            if sunk[i] || defer.contains(&i) {
+                s.for_each_use(|v| {
+                    let from_sunk = stmts.iter().enumerate().any(|(j, d)| sunk[j] && matches!(d, Stmt::Def { dst, .. } if *dst == v));
+                    if !from_sunk && !inputs.contains(&v) {
+                        inputs.push(v);
+                    }
+                });
+            }
+        }
         // Last uses, over the values this block touches only.
         let mut touched: Vec<u32> = Vec::new();
         for (i, s) in stmts.iter().enumerate() {
+            if sunk[i] || defer.contains(&i) {
+                continue;
+            }
             let last = &mut self.last;
             let mut note = |v: Value| {
                 let k = v.0 as usize;
@@ -165,7 +214,7 @@ impl<'a> FnBody<'a> {
             }
             s.for_each_use(&mut note);
         }
-        for k in keep {
+        for k in keep.iter().chain(&inputs) {
             if (k.0 as usize) < self.last.len() {
                 if self.last[k.0 as usize] == usize::MAX {
                     touched.push(k.0);
@@ -191,6 +240,9 @@ impl<'a> FnBody<'a> {
         let dummy = Block::new(start);
         let mut skip_write = usize::MAX;
         for (i, s) in stmts.iter().enumerate() {
+            if sunk[i] || defer.contains(&i) {
+                continue;
+            }
             if i == skip_write {
                 // The definition before left its value in the register.
                 if let Stmt::WriteReg { reg, .. } = s {
@@ -208,7 +260,9 @@ impl<'a> FnBody<'a> {
                     }
                     Stmt::Def { dst, expr } => {
                         let into = match stmts.get(i + 1) {
-                            Some(Stmt::WriteReg { reg, val }) if val == dst && last_use[&dst.0] == i + 1 && expr.ty() == reg.ty() => {
+                            Some(Stmt::WriteReg { reg, val })
+                                if val == dst && last_use[&dst.0] == i + 1 && expr.ty() == reg.ty() && !defer.contains(&(i + 1)) =>
+                            {
                                 self.e.regs.get(reg).map(|c| c.local)
                             }
                             _ => None,
@@ -234,8 +288,85 @@ impl<'a> FnBody<'a> {
                 }
             }
         }
-        // Kept values that are borrowed must not be freed with the block's.
-        self.borrowed = borrowed;
+        self.borrowed = borrowed.clone();
+        Deferred {
+            writes: defer
+                .iter()
+                .filter_map(|&i| match stmts[i] {
+                    Stmt::WriteReg { reg, val } => Some((reg, val)),
+                    _ => None,
+                })
+                .collect(),
+            sunk: stmts.iter().enumerate().filter(|(i, _)| sunk[*i]).map(|(_, s)| s.clone()).collect(),
+            local: self.e.value_local.clone(),
+            cnst: self.e.value_const.clone(),
+            ty: self.e.value_ty.clone(),
+            inputs: inputs.iter().map(|v| v.0).filter(|v| !keep.iter().any(|k| k.0 == *v)).collect(),
+            borrowed,
+        }
+    }
+
+    /// Do `d`'s writes of the registers `want` admits (and the sunk
+    /// definitions they need): on an edge of the block `d` came from.
+    pub fn emit_deferred(&mut self, d: &Deferred, want: &dyn Fn(GuestReg) -> bool) {
+        let sel: Vec<(GuestReg, Value)> = d.writes.iter().copied().filter(|(r, _)| want(*r)).collect();
+        if sel.is_empty() {
+            return;
+        }
+        self.e.value_local.clone_from(&d.local);
+        self.e.value_const.clone_from(&d.cnst);
+        self.e.value_ty.clone_from(&d.ty);
+        let mut need: Vec<u32> = sel.iter().map(|(_, v)| v.0).collect();
+        let mut emit = vec![false; d.sunk.len()];
+        for (k, s) in d.sunk.iter().enumerate().rev() {
+            if let Stmt::Def { dst, .. } = s {
+                if need.contains(&dst.0) {
+                    emit[k] = true;
+                    s.for_each_use(|v| need.push(v.0));
+                }
+            }
+        }
+        let dummy = Block::new(self.e.block_start);
+        let mut made = Vec::new();
+        for (k, s) in d.sunk.iter().enumerate() {
+            if emit[k] {
+                self.e.stmt(s, &dummy);
+                if let Stmt::Def { dst, .. } = s {
+                    made.push(*dst);
+                }
+            }
+        }
+        for (r, v) in sel {
+            self.e.push(v);
+            let c = self.e.regs.get_mut(&r).expect("a used register");
+            c.dirty = true;
+            let l = c.local;
+            self.e.f.local_set(l);
+        }
+        for v in made {
+            self.e.release(v);
+        }
+    }
+
+    /// The registers `d` writes.
+    pub fn deferred_regs(d: &Deferred) -> impl Iterator<Item = GuestReg> + '_ {
+        d.writes.iter().map(|(r, _)| *r)
+    }
+
+    /// Free what `d` kept alive, once the block's terminator is done.
+    pub fn end_block(&mut self, d: Deferred) {
+        for v in d.inputs {
+            if d.borrowed.contains(&v) {
+                continue;
+            }
+            if let Some(l) = d.local[v as usize] {
+                match d.ty[v as usize] {
+                    Ty::I32 => self.e.free_i32.push(l),
+                    Ty::I64 => self.e.free_i64.push(l),
+                    Ty::V128 => self.e.free_v128.push(l),
+                }
+            }
+        }
     }
 
     /// A value kept past [`Self::block`], as something that outlives the

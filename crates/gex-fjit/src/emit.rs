@@ -9,11 +9,11 @@
 use crate::cfg::{self, Graph, Shape};
 use gex_abi::ctx;
 use gex_cgen::func::{self as cf, Loop};
-use gex_emit::tier1::fmode::{FnBody, Operand};
+use gex_emit::tier1::fmode::{Deferred, FnBody, Operand};
 use gex_emit::tier1::Context;
 use gex_emit::wasm::ValType;
 use gex_ir::func::{Callee, FTerm, Function, RegSet, Summary};
-use gex_ir::{GuestReg, Value};
+use gex_ir::{Expr, GuestReg, Stmt, Value};
 use std::collections::HashMap;
 
 /// `need`: the caller's continuation reads a flag.
@@ -194,6 +194,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         mode: Mode::Body { loops },
         n_blocks: n,
         stats,
+        pending: None,
     };
     e.stats.functions += 1;
     e.stats.blocks += f.blocks.iter().filter(|b| !b.synthetic).count();
@@ -202,6 +203,34 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     let body = e.b.finish();
     e.stats.code_bytes += body.len() + lfns.iter().map(|l| l.len()).sum::<usize>();
     Some(Emitted { body, loops: lfns })
+}
+
+/// The last write of each flag in `stmts` that nothing after it in the
+/// block reads, traps on or reloads: such a write matters only on edges
+/// whose target reads the flag, and is done there (in V8's baseline tier a
+/// `cmp` before a loop's branch would otherwise compute all four flags on
+/// every trip for an exit taken once). `GEX_FJIT_EXP=NOSINK` keeps them.
+fn trailing_flag_writes(stmts: &[Stmt]) -> Vec<usize> {
+    if cf::exp("NOSINK") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen = RegSet::EMPTY;
+    for (i, s) in stmts.iter().enumerate().rev() {
+        match s {
+            Stmt::WriteReg { reg, .. } => {
+                if reg.is_flag() && cf::FLAG_REGS.contains(reg) && !seen.contains(*reg) {
+                    out.push(i);
+                }
+                seen.insert(*reg);
+            }
+            Stmt::Def { expr: Expr::ReadReg(r), .. } => seen.insert(*r),
+            Stmt::Trap { .. } => break,
+            _ if gex_cgen::emit::clobbers(s) => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether `i -> h` is a back-edge of outlined loop `lp` where the body
@@ -257,6 +286,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
         mode: Mode::Loop { lp },
         n_blocks: n,
         stats,
+        pending: None,
     };
     e.top(lp.header);
     e.b.f().unreachable();
@@ -314,6 +344,9 @@ struct E<'m, 'a> {
     mode: Mode<'m>,
     n_blocks: usize,
     stats: &'m mut Stats,
+    /// The current block's trailing flag writes, done on the edges that
+    /// need them (`trailing_flag_writes`).
+    pending: Option<(Deferred, bool)>,
 }
 
 impl E<'_, '_> {
@@ -445,14 +478,18 @@ impl E<'_, '_> {
         self.b.set_dirty(self.dirty[x]);
         let mut keep: Vec<Value> = Vec::new();
         blk.term.for_each_use(|v| keep.push(v));
-        self.b.block(blk.start, &blk.stmts, &keep);
+        let defer = trailing_flag_writes(&blk.stmts);
+        let d = self.b.block(blk.start, &blk.stmts, &keep, &defer);
         // A terminator has at most one value; it outlives the block's
         // numbering, which code inlined into the terminator reuses.
         let op = keep.first().map(|&v| self.b.operand(v));
+        let saved = std::mem::replace(&mut self.pending, Some((d, false)));
         self.term(x, op);
+        let (d, _) = std::mem::replace(&mut self.pending, saved).expect("this block's deferred writes");
         if let Some(o) = op {
             self.b.release_operand(o);
         }
+        self.b.end_block(d);
     }
 
     // -- edges ---------------------------------------------------------------
@@ -495,7 +532,11 @@ impl E<'_, '_> {
 
     /// Whether edge `i -> t` is a bare `br` (no code on the edge).
     fn plain_br(&self, i: usize, t: usize) -> bool {
-        if backward_addr(self.f, i, t) {
+        let pend = match &self.pending {
+            Some((d, false)) => FnBody::deferred_regs(d).any(|r| self.live[t].contains(r)),
+            _ => false,
+        };
+        if backward_addr(self.f, i, t) || pend {
             return false;
         }
         match (&self.layout, &self.mode) {
@@ -506,8 +547,29 @@ impl E<'_, '_> {
         }
     }
 
+    /// The block's flag writes left to its edges, for those whose target
+    /// reads the flag.
+    fn pending_for(&mut self, t: usize) {
+        let live = self.live[t];
+        if let Some((d, false)) = &self.pending {
+            self.b.emit_deferred(d, &|r| live.contains(r));
+        }
+    }
+
+    /// All of them, before a terminator that leaves (or calls): from here on
+    /// none is pending.
+    fn pending_all(&mut self) {
+        if let Some((d, done)) = &mut self.pending {
+            if !*done {
+                self.b.emit_deferred(d, &|_| true);
+                *done = true;
+            }
+        }
+    }
+
     /// The code on edge `i -> t` (block indices), then the transfer.
     fn edge(&mut self, i: usize, t: usize) {
+        self.pending_for(t);
         let f = self.f;
         let backward = backward_addr(f, i, t);
         let to_start = f.blocks[t].start;
@@ -712,6 +774,9 @@ impl E<'_, '_> {
         let f = self.f;
         let blk = &f.blocks[i];
         let val = || op.expect("the terminator's value");
+        if !matches!(blk.term, FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Switch { .. }) {
+            self.pending_all();
+        }
         match &blk.term {
             FTerm::Jump(e) => self.edge(i, e.to.index()),
             FTerm::Branch { taken, not_taken, .. } => {
@@ -741,6 +806,7 @@ impl E<'_, '_> {
             FTerm::Switch { cases, .. } => {
                 self.stats.switches += 1;
                 self.switch(i, val(), cases.iter().map(|(a, e)| (*a, e.to.index())).collect());
+                self.pending_all();
                 self.leave_value(val());
             }
             FTerm::Call { callee, ret_pc, ret } => self.call(i, *callee, op, *ret_pc, ret.as_ref().map(|e| e.to.index())),
