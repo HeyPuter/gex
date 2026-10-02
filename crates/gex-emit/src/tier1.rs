@@ -148,6 +148,34 @@ pub struct Context<'a> {
     /// Profiling instrumentation for this module, when it is on (see
     /// `crate::profile`). `None` emits exactly what an unprofiled build does.
     pub profile: Option<&'a crate::profile::Emit>,
+    /// Each page's directory entry as this module numbered it. A block
+    /// checks its page's entry on entry ([`Emitter::emit_page_check`]): one
+    /// that was retired (zeroed) or translated again (a fresh base -- bases
+    /// are never reused) since means the block is stale, however it was
+    /// reached. `None`: no check (a module that is never retired).
+    pub page_bases: Option<&'a HashMap<u64, u32>>,
+}
+
+/// `GEX_NO_PAGE_CHECK=1`: blocks do not check their page's directory entry
+/// on entry (pricing, and the mutation tests/nt/detour.c catches).
+fn page_check() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("GEX_NO_PAGE_CHECK").is_some())
+}
+
+/// `GEX_PAGE_CHECK_BALLAST=N`: the page check emitted N extra times, for
+/// pricing it (the slope over N is its cost).
+fn page_check_ballast() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("GEX_PAGE_CHECK_BALLAST").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// The pages `[start, end)` touches that the module numbered, with their
+/// entries.
+fn checked_pages(bases: &HashMap<u64, u32>, start: u64, end: u64) -> Vec<(u64, u32)> {
+    let first = start / gex_abi::DISPATCH_PAGE;
+    let last = end.max(start + 1).saturating_sub(1) / gex_abi::DISPATCH_PAGE;
+    (first..=last).filter_map(|p| bases.get(&p).map(|&b| (p, b))).collect()
 }
 
 
@@ -298,6 +326,24 @@ fn trap_pc() -> u64 {
 /// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
     let mut e = Emitter::new(cx, block.start);
+    if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
+        let mut pages = checked_pages(bases, block.start, block.end);
+        // A region carries its members: their pages too.
+        if region_limit() > 1 {
+            if let Some(region) = crate::region::grow(block.start, cx.gir, region_limit()) {
+                for a in region.iter() {
+                    if let Some(b) = cx.gir.get(a) {
+                        pages.extend(checked_pages(bases, b.start, b.end));
+                    }
+                }
+            }
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        for _ in 0..=page_check_ballast() {
+            e.emit_page_check(block.start, &pages);
+        }
+    }
     if check_sp() {
         e.emit_sp_check(block.start);
     }
@@ -319,6 +365,24 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
 
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx, block.start);
+    if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
+        let mut pages = checked_pages(bases, block.start, block.end);
+        // A region carries its members: their pages too.
+        if region_limit() > 1 {
+            if let Some(region) = crate::region::grow(block.start, cx.gir, region_limit()) {
+                for a in region.iter() {
+                    if let Some(b) = cx.gir.get(a) {
+                        pages.extend(checked_pages(bases, b.start, b.end));
+                    }
+                }
+            }
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        for _ in 0..=page_check_ballast() {
+            e.emit_page_check(block.start, &pages);
+        }
+    }
     if check_sp() {
         e.emit_sp_check(block.start);
     }
@@ -4417,6 +4481,40 @@ impl<'a> Emitter<'a> {
         self.f.i64_const(start as i64);
         self.f.local_set(self.scratch_i64);
         if gex_abi::X86 {
+            self.f.local_get(self.ctx_local);
+            self.f.local_get(self.scratch_i64);
+            self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
+        }
+        self.emit_dispatch_tail_call();
+        self.f.end();
+    }
+
+    /// The block's pages must still have the directory entries it was
+    /// translated for. Otherwise the code was retired (unmapped, rewritten:
+    /// Detours patching a prologue) or translated again after it, and a
+    /// direct jump from a block of the same module -- which never looks at
+    /// the directory -- must not run it: store the PC and dispatch, which
+    /// misses and translates the bytes as they are now. Fused loops and
+    /// regions re-enter through the dispatcher every `loop_poll` trips, so a
+    /// thread already inside a stale loop leaves too.
+    fn emit_page_check(&mut self, start: u64, pages: &[(u64, u32)]) {
+        if pages.is_empty() {
+            return;
+        }
+        for (k, (page, base)) in pages.iter().enumerate() {
+            self.f.i32_const((gex_abi::DISPATCH_DIR + page * 4) as u32 as i32);
+            self.f.load(0x28, 2, 0); // i32.load
+            self.f.i32_const(*base as i32);
+            self.f.byte(0x47); // i32.ne
+            if k > 0 {
+                self.f.byte(0x72); // i32.or
+            }
+        }
+        self.f.if_void();
+        self.store_pc(start);
+        self.f.i64_const(start as i64);
+        self.f.local_set(self.scratch_i64);
+        if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
             self.f.local_get(self.ctx_local);
             self.f.local_get(self.scratch_i64);
             self.f.store(0x37, 3, ctx::LAST_TARGET as u32);

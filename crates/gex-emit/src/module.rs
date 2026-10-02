@@ -849,6 +849,16 @@ impl ModuleBuilder {
         let compiled: Vec<(u32, (Vec<u8>, Vec<u32>))> = {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
+            // The entry each block's pages have: what it checks on entry.
+            let mut page_bases: HashMap<u64, u32> = HashMap::new();
+            for (b, _) in &self.pending {
+                let last = b.end.max(b.start + 1) - 1;
+                for page in dispatch_page(b.start)..=dispatch_page(last) {
+                    if let Some(e) = self.page_table.lookup(page) {
+                        page_bases.insert(page, e);
+                    }
+                }
+            }
             let cx = tier1::Context {
                 syscall: self.imports.syscall,
                 illegal: self.imports.illegal,
@@ -864,6 +874,7 @@ impl ModuleBuilder {
                 blocks: &self.blocks,
                 gir: &gir,
                 profile: profile_emit.as_ref(),
+                page_bases: Some(&page_bases),
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.
