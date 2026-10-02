@@ -298,12 +298,19 @@ fn ic_body(entries: &[(u64, u32)]) -> Vec<u8> {
         f.block_void();
     }
     // Inside the innermost block, bucket k's label is k deep, the miss nb.
+    // bucket(t), in 32-bit arithmetic (`bucket`).
+    let t32 = f.add_local(ValType::I32);
     f.local_get(1);
-    f.i64_const(HASH as i64);
-    f.byte(0x7e); // i64.mul
-    f.i64_const(64 - bits as i64);
-    f.byte(0x88); // i64.shr_u
     f.byte(0xa7); // i32.wrap_i64
+    f.local_tee(t32);
+    f.i32_const(gex_abi::INST_ALIGN_SHIFT as i32);
+    f.byte(0x76); // i32.shr_u
+    f.local_get(t32);
+    f.i32_const((gex_abi::INST_ALIGN_SHIFT + bits) as i32);
+    f.byte(0x76); // i32.shr_u
+    f.byte(0x73); // i32.xor
+    f.i32_const((nb - 1) as i32);
+    f.byte(0x71); // i32.and
     let targets: Vec<u32> = (0..nb as u32).collect();
     f.br_table(&targets, nb as u32);
     for b in &buckets {
@@ -328,10 +335,12 @@ fn ic_body(entries: &[(u64, u32)]) -> Vec<u8> {
     f.finish()
 }
 
-const HASH: u64 = 0x9e37_79b9_7f4a_7c15;
-
+/// An address's bucket: its instruction index, folded with the bits above
+/// it (a shift, a shift, a xor, a mask: cheaper than a multiply on the
+/// call path).
 fn bucket(a: u64, bits: u32) -> usize {
-    (a.wrapping_mul(HASH) >> (64 - bits)) as usize
+    let t = a as u32;
+    (((t >> gex_abi::INST_ALIGN_SHIFT) ^ (t >> (gex_abi::INST_ALIGN_SHIFT + bits))) & ((1u32 << bits) - 1)) as usize
 }
 
 /// The module of a run-time translation (docs/merge-plan.md §9.8.1): `funcs`
