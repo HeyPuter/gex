@@ -174,6 +174,16 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   for (const f of ['gex_browser.x86.shared.wasm', 'seed.x86.shared.wasm', 'gex_kernel.x86.wasm']) {
     if (!existsSync(join(WEB, 'public/gex', f))) throw new Error(`no web/public/gex/${f}`);
   }
+  // A page with OpenGL needs Mesa's wasm, and without it the GL device
+  // simply never answers ("did not answer in thirty seconds"): say which
+  // file is missing and how to make it instead.
+  if (/(^|&)gl=1(&|$)/.test(query)) {
+    for (const f of ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm']) {
+      if (!existsSync(join(WEB, 'public/gex', f))) {
+        throw new Error(`no web/public/gex/${f}: the page's OpenGL is Mesa built to wasm; build it with web/build-mesa-wasm.sh`);
+      }
+    }
+  }
   await serveBuilt();
   if (await browserWsUrl(CHROME_PORT)) {
     throw new Error(`a browser is already listening on ${CHROME_PORT} (a run left behind?); stop it first`);
