@@ -175,18 +175,7 @@ impl Aot {
 /// segments. The same file loaded at the same base gives the same identity,
 /// which is what a prebuilt module is only valid for.
 pub fn image_identity(image: &Image) -> String {
-    let mut h = gex_cache::sha256::Sha256::new();
-    h.update(b"gex-image-1");
-    h.update(&image.bias.to_le_bytes());
-    h.update(&image.entry.to_le_bytes());
-    h.update(&[image.class32 as u8]);
-    for seg in &image.segments {
-        h.update(&seg.vaddr.to_le_bytes());
-        h.update(&[seg.executable as u8]);
-        h.update(&(seg.bytes.len() as u64).to_le_bytes());
-        h.update(&seg.bytes);
-    }
-    format!("image:{}", gex_cache::sha256::hex(&h.finish()))
+    gex_key::image_identity(image)
 }
 
 /// The translation metadata a module carries in its `gex.meta` custom

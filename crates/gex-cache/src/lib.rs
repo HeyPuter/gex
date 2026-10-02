@@ -81,7 +81,8 @@ fn evict(dir: &Path, budget: u64) {
     }
 }
 
-pub mod sha256;
+/// SHA-256, from gex-key (the browser shim computes keys without wasmtime).
+pub use gex_key::sha256;
 
 /// Bumped whenever the *layout* of a cache entry changes.
 ///

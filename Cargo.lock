@@ -421,6 +421,7 @@ name = "gex-cache"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "gex-key",
  "wasmtime",
 ]
 
@@ -432,6 +433,8 @@ dependencies = [
  "gex-abi",
  "gex-emit",
  "gex-ir",
+ "gex-key",
+ "gex-ld",
  "wasm-encoder",
  "wasmparser",
 ]
@@ -544,6 +547,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-key"
+version = "0.0.1"
+dependencies = [
+ "gex-ld",
+]
+
+[[package]]
 name = "gex-kmem"
 version = "0.0.1"
 
@@ -603,6 +613,7 @@ dependencies = [
  "gex-gpu",
  "gex-ir",
  "gex-kernel",
+ "gex-key",
  "gex-ld",
  "gex-mem",
  "gex-virgl",
