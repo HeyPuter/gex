@@ -39,6 +39,8 @@ function moduleContentKey(bytes) {
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
 const SHIM_STACK_TOP = 0x06000000;
+/** `gex_abi::ctx::LAST_TARGET`. */
+const CTX_LAST_TARGET = 44 * 8;
 /** `gex_abi::BOOT_STACK_COUNTER`: which bootstrap stack slice is next. */
 const BOOT_STACK_COUNTER = 0x00100000 - 192;
 /**
@@ -2343,8 +2345,10 @@ export class Gex {
           // the jit-storm repro). See gex_claimed_slots.
           const eR = this.#shim.exports;
           if (/table index is out of bounds/.test(err.message) && eR.gex_last_target) {
+            // This thread's last target, read from its own context: the
+            // shim's answer was once another thread's.
             let tgt = 0n;
-            try { tgt = eR.gex_last_target(); } catch { tgt = 0n; }
+            try { tgt = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_LAST_TARGET, true); } catch { tgt = 0n; }
             const grew = this.#growTablesToClaimed();
             if (grew && (globalThis.GEX_TABLE_DEBUG || (typeof process !== 'undefined' && process.env?.GEX_TABLE_DEBUG)))
               console.error(`[tblrec] caught up tables for a sibling-numbered page (retry ${this.#tableRetries})`);
@@ -2911,8 +2915,8 @@ export class Gex {
         e.__stack_pointer.value = sp;
         if (!e.gex_handoff()) {
           // The sibling-numbered-page race, as in the outer loop.
-          if (/table index is out of bounds/.test(err.message) && e.gex_last_target) {
-            const tgt = e.gex_last_target();
+          if (/table index is out of bounds/.test(err.message)) {
+            const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
             if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
               pc = tgt < 0n ? tgt + (1n << 64n) : tgt;
               continue;

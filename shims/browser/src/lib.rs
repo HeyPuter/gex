@@ -2421,6 +2421,8 @@ struct Jit {
     /// predate the change, so it is never served here again; see
     /// `gex_jit_installed` for the pending side.
     pub(crate) retired_pages: std::collections::HashSet<u64>,
+    /// Misses at already-translated pcs, by pc (`remiss`).
+    remiss: std::collections::HashMap<u64, u32>,
     /// How the shared-slot lookup went. Three outcomes: the page had a base in
     /// this process's table, the identity map knew it, or it did not. See
     /// `gex_reuse_stats`.
@@ -3875,6 +3877,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 shared: Default::default(),
                 installed_mods: Default::default(),
                 retired_pages: Default::default(),
+                remiss: Default::default(),
                 reuse_have: 0,
                 reuse_hit: 0,
                 reuse_miss: 0,
@@ -5884,7 +5887,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     );
     IN_SYSCALL.store(true, std::sync::atomic::Ordering::Relaxed);
     let _in_syscall = InSyscall;
-    CTX_ADDR.store(ctx as u32 as u64, std::sync::atomic::Ordering::Relaxed);
+    ctx_addr_set(ctx as u32 as u64);
     // The process tree, always. Stood down under `GEX_TRACE`, which narrates
     // these along with everything else.
     if !tracing() {
@@ -6935,7 +6938,7 @@ fn resume_ctx() -> Option<u64> {
 }
 
 fn set_resume_ctx(v: u64) {
-    CTX_ADDR.store(v, std::sync::atomic::Ordering::Relaxed);
+    ctx_addr_set(v);
     RESUME_CTX.with(|c| c.set(Some(v)));
 }
 
@@ -6953,7 +6956,35 @@ fn set_resume_ctx(v: u64) {
 /// A crash in the dispatch-miss path is exactly the case that needs a pc, and
 /// exactly the case that could not produce one. A plain static can always be
 /// read.
+///
+/// Per Worker: it was one static for the process, so with threads it named
+/// whichever Worker last made a syscall -- and the run loop's recovery from a
+/// table that lagged a sibling's numbering resumed the trapping thread at
+/// *another thread's* last branch target (`gex_last_target`). In Noita a
+/// worker thread calling a functor's `_Do_call` came back at the neighbouring
+/// slot of the same vtable, and returned with its stack 4 bytes off.
+#[cfg(feature = "shared-memory")]
+thread_local! {
+    static CTX_ADDR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+#[cfg(feature = "shared-memory")]
+fn ctx_addr_get() -> u64 {
+    CTX_ADDR.with(|c| c.get())
+}
+#[cfg(feature = "shared-memory")]
+fn ctx_addr_set(v: u64) {
+    CTX_ADDR.with(|c| c.set(v));
+}
+#[cfg(not(feature = "shared-memory"))]
 static CTX_ADDR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(not(feature = "shared-memory"))]
+fn ctx_addr_get() -> u64 {
+    CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(not(feature = "shared-memory"))]
+fn ctx_addr_set(v: u64) {
+    CTX_ADDR.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
 fn set_resume_ctx_none() {
     RESUME_CTX.with(|c| c.set(None));
@@ -7277,6 +7308,7 @@ pub extern "C" fn gex_adopt_child(
             shared: Default::default(),
             installed_mods: Default::default(),
             retired_pages: Default::default(),
+            remiss: Default::default(),
             reuse_have: 0,
             reuse_hit: 0,
             reuse_miss: 0,
@@ -9546,7 +9578,7 @@ pub extern "C" fn gex_in_syscall() -> u32 {
 /// the kernel, because a crash may have left it borrowed.
 #[no_mangle]
 pub extern "C" fn gex_last_target() -> i64 {
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at == 0 {
         return 0;
     }
@@ -10230,6 +10262,34 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// translated ahead of time, and the rest arrives here as needed. The shim
 /// lifts and encodes but cannot compile, so it leaves the module behind and
 /// traps out for JS to instantiate before resuming at the address that missed.
+/// A pc already translated that misses dispatch again and again is a
+/// retranslation livelock (S3 found natively that a page retired between a
+/// translation and its publish came back without its directory entry): say
+/// what dispatch sees there, once per pc, the 64th time.
+fn remiss(pc: u64) {
+    let said = with_host(|h| {
+        if !h.jit.translated.contains(&pc) {
+            return None;
+        }
+        let n = h.jit.remiss.entry(pc).or_insert(0);
+        *n += 1;
+        if *n != 64 {
+            return None;
+        }
+        let page = pc / gex_abi::DISPATCH_PAGE;
+        let dir = GuestMem::new(guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(u32::MAX);
+        Some(format!(
+            "gex: {pc:#x} is translated but missed dispatch 64 times: page {page:#x} directory entry {dir:#x}, page table {:?}, retired {}, {} misses at translated pcs so far\n",
+            h.jit.page_table.lookup(page),
+            h.jit.retired_pages.contains(&page),
+            h.jit.remiss.values().sum::<u32>()
+        ))
+    });
+    if let Some(s) = said {
+        warn_line(&s);
+    }
+}
+
 /// The pc of the most recent dispatch miss, for the host's install check.
 static LAST_MISS_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -10277,6 +10337,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     LAST_MISS_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
     watch_mem("miss");
+    remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
         // did not come back from, and a line printed after never appears.
@@ -11744,7 +11805,7 @@ pub extern "C" fn gex_current_ctx() -> i64 {
     // The remembered address first, then the kernel: this is a crash reporter's
     // question, and a trap leaves the kernel borrowed, so `with_host` would
     // panic on top of the crash and describe the reporter instead of the fault.
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at != 0 {
         return at as i64;
     }
@@ -11756,7 +11817,7 @@ pub extern "C" fn gex_current_pc() -> i64 {
     // Without the kernel when there is a remembered context, because the
     // crash this most needs to describe is one that left the kernel borrowed.
     // See `CTX_ADDR`.
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at != 0 {
         let gm = GuestMem::new(guest_bytes());
         return gm.read_u64(at + ctx::PC as u64).unwrap_or(0) as i64;
@@ -11778,7 +11839,7 @@ pub extern "C" fn gex_current_lr() -> i64 {
         let gm = GuestMem::new(guest_bytes());
         gm.read_u64(at + 30 * 8).unwrap_or(0) as i64
     };
-    let at = CTX_ADDR.load(std::sync::atomic::Ordering::Relaxed);
+    let at = ctx_addr_get();
     if at != 0 {
         return read(at);
     }

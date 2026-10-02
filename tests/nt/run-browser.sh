@@ -66,6 +66,8 @@ for arch in ${ARCHES:-x64 x86}; do
     check $arch/window 0 "shown${nl}bye" $arch "$b/window.exe" 0
     # Code written, rewritten and reallocated at run time (a JIT).
     check $arch/jitcode 0 "$allok" $arch "$b/jitcode.exe"
+    # A function's prologue patched at run time, as Detours does.
+    check $arch/detour 0 "$allok" $arch "$b/detour.exe"
     check $arch/exitproc 33 "worker exiting${nl}atexit ran" $arch "$b/exitproc.exe"
     check $arch/seh 77 "(ok [^$nl]*$nl)+top-level filter saw e00000ff${nl}0 failures" $arch "$b/seh.exe"
     check $arch/seh-traps 0 "$allok" $arch "$b/seh.exe" traps
