@@ -1172,6 +1172,9 @@ class Compositor {
       brightest,
       hash,
       output: `${this.#outW}x${this.#outH}`,
+      // The GL device's counters (submits, their time, readbacks): the
+      // compositor side of a frame's cost.
+      gl: glDevice?.glState?.() ?? null,
     };
   }
 }
