@@ -18,7 +18,7 @@
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
-MESA=$ROOT/third_party/mesa
+MESA=${GEX_MESA_SRC:-$ROOT/third_party/mesa}
 OUT=${1:-${TMPDIR:-/tmp}/gex-mesa-virgl}
 BUILD=$OUT/build
 PUB=$ROOT/web/public/gex
@@ -29,6 +29,15 @@ command -v ninja >/dev/null 2>&1 || { echo "need ninja" >&2; exit 1; }
 command -v emcc >/dev/null 2>&1 || { echo "need Emscripten" >&2; exit 1; }
 [ -f "$MESA/meson.build" ] || {
     echo "initialize third_party/mesa" >&2
+    exit 1
+}
+# The submodule tracks mesa-wink's `wink` branch, which has the WebGPU driver
+# but not the virgl replay (gex-virgl-replay): that lives on the fork's
+# `gex-virgl` branch. Say so rather than fail deep in meson.
+grep -q gex-virgl-replay "$MESA/src/gallium/targets/gex-wasm/meson.build" 2>/dev/null || {
+    echo "third_party/mesa has no gex-virgl-replay target: it is on mesa-wink's" >&2
+    echo "gex-virgl branch, not wink (what the submodule tracks). Build from a" >&2
+    echo "gex-virgl checkout: GEX_MESA_SRC=/path/to/mesa-wink@gex-virgl $0" >&2
     exit 1
 }
 
