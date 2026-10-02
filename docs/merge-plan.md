@@ -717,3 +717,94 @@ AOT units and the JIT like any image. Two ways to make them native wasm:
 
 So option 1 comes first, for 32-bit guests, after §9 lands and once a profile
 shows how much of Noita's time is inside Wine.
+
+### 9.8 Implementation streams and the interface between them (2026-10-02)
+
+The user asked for all of §9 plus the related optimisations. It is split
+into two streams that run in parallel (the two-agent cap). They meet at
+one interface, fixed here so neither waits on the other.
+
+**The ABI is today's `F_body`** (function-tier.md §7):
+`(ctx: i32, depth: i32, need: i32, ret: i64) -> i32`.
+- `1`: the predicted return happened (guest return to `ret` with SP back).
+- `0`: the function left with all state written back and `ctx::PC` set.
+- The callee does the return check, `depth` is §7.1's guard, and loops are
+  outlined as in §7.2.
+- AOT units already have this ABI. The function JIT emits it, and so does
+  the region tier.
+- Anything else a tier needs is internal to that tier.
+
+**The function table** (owned by stream R, in `gex-kernel` plus both shims):
+- One wasm `funcref` table per process (per Worker instance in the
+  browser), imported by every module as `gex.ftab`, holding only `F_body`
+  ABI functions.
+- **Index 0** is a resolve stub: it reads `ctx::LAST_TARGET`, looks up or
+  creates the callee, patches the caller's bind slot, then calls it.
+- **Install:** a module exports `gex_funcs`, a list of (guest address,
+  export name), and `gex_binds`, the guest addresses its external call
+  sites need. The runtime allocates indices and writes them into the
+  module's bind array, a linear-memory region the module exports. A call
+  site does `call_indirect ftab[bind[k]]`; an unbound entry is index 0.
+- **The address map** maps guest address → index:
+  - a host-side hash for authority;
+  - a direct-mapped probe cache in linear memory that generated code checks
+    inline on indirect transfers (pewasm's dispatch-cache probe);
+  - the host import `gex.lookup(ctx, addr) -> i32` on a miss, which
+    translates on demand: AOT body, else the function JIT, else a region.
+- **Retirement** (patched pages): the entry's index is repointed to a
+  forwarding stub that re-resolves. Indices are never reused while a bind
+  slot can hold them.
+- **The root** is the run loop: `call_indirect ftab[lookup(PC)]`, and on 0
+  look up `ctx::PC` again. Safepoints and signals are polled there and at
+  back-edges, as today.
+
+**The unwind transport:**
+- The default is the `return 0` chain: one test per call site, already
+  correct for longjmp, `ret`-as-jump and stack switches.
+- The wasm exception tag `gex.unwind` (no payload; the state is in ctx) is
+  for events that discard a whole nest: fork, execve, thread exit,
+  exit_group, and SEH unwinding past wasm frames.
+- Stream R measures EH against the chain on the Tier 0 corpus and picks per
+  event. The decision is recorded here.
+
+**Stream F, the function JIT** (`crates/gex-fjit`, new; branch `merge/fjit`):
+1. §9.4 step 2: GIR → wasm emitter directly, with no clang:
+   - blocks as `loop`+`br_table`, registers in locals, write-back per §4.1;
+   - calls as `call` within the module and through `ftab` across modules;
+   - recovery on demand, one function at a time, with summaries cached;
+   - `gexc run --fjit`.
+2. Gate and go/no-go as in §9.4. Report before going further.
+3. Make the JIT the default for recoverable code. Per-block tier-1 becomes
+   the region tier's last resort (step 6), coordinated with stream R.
+4. §9.6: ThinLTO and wasm-opt per image, then link groups (staged Wine core,
+   noita.exe + private DLLs, ejected builds), including the page-check-
+   survives-LTO test.
+5. Translation speed and memory per function, plus V8 tier-up behaviour in
+   the browser (Liftoff vs TurboFan on JIT modules; batching small
+   functions into modules).
+
+**Stream R, the runtime and AOT** (shims, `gex-kernel`, AOT side of
+`gex-cgen`; branch `merge/abi9`):
+1. The function table, address map, install and bind, and the root, native
+   first. Land the API early so stream F builds on it.
+2. §9.4 step 3: AOT format-3 units install into `ftab` with direct calls
+   inside a module and bound calls across modules. Retire nests, roots,
+   leaves, per-4-byte slot tables, body tables and shared-slot bodies for
+   code that has a function body.
+3. §9.4 step 4: the region tier from the call-out (interior entries,
+   runtime-generated code such as LuaJIT mcode, recovery give-ups), with
+   per-function page checks, retirement and forwarding. Tests: detour,
+   pagespan, a write/call/rewrite JIT, and longjmp, SEH and C++ unwinding
+   through mixed tiers. The EH-vs-chain measurement belongs here.
+4. Browser parity: all of the above in the browser shim (per-Worker `ftab`,
+   shared modules). This closes today's browser `--cgen` gap.
+5. §9.4 step 5: Noita native, then in the browser on hardware WebGPU,
+   against §9.4's targets (fps, world-up, peak RSS).
+6. Afterwards, by profile: §9.7 option 1 (emcc'd CRT exports for i386
+   guests) if Wine's share of Noita's time justifies it.
+
+**Coordinator:** integrates each stream milestone into `merge/main` behind
+the usual gate. Tests: workspace tests a64/x86, tests/nt with
+`--no-cgen`/`--cgen` (and `--fjit` once it exists), x86-programs, lockstep
+on 3 guests, browser NT, browser-gui `--gl`. Each stream merges `merge/main`
+in before reporting.
