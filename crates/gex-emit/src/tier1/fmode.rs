@@ -23,6 +23,7 @@ pub struct Deferred {
     local: Vec<Option<u32>>,
     cnst: Vec<Option<u64>>,
     ty: Vec<Ty>,
+    fp: Vec<Option<bool>>,
     /// The values kept alive for it, released by [`FnBody::end_block`].
     inputs: Vec<u32>,
     borrowed: Vec<u32>,
@@ -48,6 +49,29 @@ pub struct FnBody<'a> {
 
 /// A last use past the block's statements (the terminator's).
 const KEPT: usize = usize::MAX - 1;
+
+/// The precision of the float `e` computes, when it computes one a float
+/// consumer could take as is (`Emitter::fp_result`).
+fn fp_out(e: &Expr) -> Option<bool> {
+    match *e {
+        Expr::FpBin { double, .. } | Expr::FpUn { double, .. } => Some(double),
+        Expr::FpCvt { kind: FpConvert::FpToFp | FpConvert::IntToFp { .. }, dst_wide, .. } => Some(dst_wide),
+        Expr::VExtract { lane_bytes: 8, ty: Ty::I64, .. } => Some(true),
+        Expr::VExtract { lane_bytes: 4, ty: Ty::I32, .. } => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `s` reads `v` only as a float of that precision.
+fn fp_in(s: &Stmt, v: Value, double: bool) -> bool {
+    let Stmt::Def { expr, .. } = s else { return false };
+    match *expr {
+        Expr::FpBin { double: d, .. } | Expr::FpUn { double: d, .. } | Expr::FpCmp { double: d, .. } => d == double,
+        Expr::FpCvt { kind: FpConvert::FpToFp | FpConvert::FpToInt { .. }, src_wide, a, .. } => src_wide == double && a == v,
+        Expr::VReplace { lane_bytes, val, a, .. } => val == v && a != v && lane_bytes == if double { 8 } else { 4 },
+        _ => false,
+    }
+}
 
 /// The values a statement defines or uses.
 fn s_defs_and_uses(s: &Stmt) -> Vec<u32> {
@@ -78,6 +102,7 @@ impl<'a> FnBody<'a> {
         e.value_local = vec![None; n];
         e.value_const = vec![None; n];
         e.value_ty = vec![Ty::I64; n];
+        e.value_fp = vec![None; n];
         FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new() }
     }
 
@@ -164,6 +189,9 @@ impl<'a> FnBody<'a> {
             *v = None;
         }
         for v in self.e.value_const.iter_mut() {
+            *v = None;
+        }
+        for v in self.e.value_fp.iter_mut() {
             *v = None;
         }
         // Who uses each value, and which definitions sink: pure, not a
@@ -255,10 +283,18 @@ impl<'a> FnBody<'a> {
                     {
                         let k = dst.0 as usize;
                         self.e.value_ty[k] = r.ty();
+                        self.e.value_fp[k] = None;
                         self.e.value_local[k] = Some(self.e.regs[r].local);
                         borrowed.push(dst.0);
                     }
                     Stmt::Def { dst, expr } => {
+                        // A float only floats read: kept as one.
+                        self.e.fp_result = fp_out(expr).is_some_and(|d| {
+                            !keep.contains(dst)
+                                && users.get(&dst.0).is_some_and(|u| {
+                                    !u.is_empty() && u.iter().all(|&j| !sunk[j] && !defer.contains(&j) && fp_in(&stmts[j], *dst, d))
+                                })
+                        });
                         let into = match stmts.get(i + 1) {
                             Some(Stmt::WriteReg { reg, val })
                                 if val == dst && last_use[&dst.0] == i + 1 && expr.ty() == reg.ty() && !defer.contains(&(i + 1)) =>
@@ -267,8 +303,10 @@ impl<'a> FnBody<'a> {
                             }
                             _ => None,
                         };
-                        self.e.def_into = into;
+                        self.e.def_into = if self.e.fp_result { None } else { into };
+                        let into = self.e.def_into;
                         self.e.stmt(s, &dummy);
+                        self.e.fp_result = false;
                         if into.is_some() && self.e.def_into.take().is_none() {
                             borrowed.push(dst.0);
                             skip_write = i + 1;
@@ -301,6 +339,7 @@ impl<'a> FnBody<'a> {
             local: self.e.value_local.clone(),
             cnst: self.e.value_const.clone(),
             ty: self.e.value_ty.clone(),
+            fp: self.e.value_fp.clone(),
             inputs: inputs.iter().map(|v| v.0).filter(|v| !keep.iter().any(|k| k.0 == *v)).collect(),
             borrowed,
         }
@@ -316,6 +355,7 @@ impl<'a> FnBody<'a> {
         self.e.value_local.clone_from(&d.local);
         self.e.value_const.clone_from(&d.cnst);
         self.e.value_ty.clone_from(&d.ty);
+        self.e.value_fp.clone_from(&d.fp);
         let mut need: Vec<u32> = sel.iter().map(|(_, v)| v.0).collect();
         let mut emit = vec![false; d.sunk.len()];
         for (k, s) in d.sunk.iter().enumerate().rev() {
@@ -360,10 +400,12 @@ impl<'a> FnBody<'a> {
                 continue;
             }
             if let Some(l) = d.local[v as usize] {
-                match d.ty[v as usize] {
-                    Ty::I32 => self.e.free_i32.push(l),
-                    Ty::I64 => self.e.free_i64.push(l),
-                    Ty::V128 => self.e.free_v128.push(l),
+                match (d.fp[v as usize], d.ty[v as usize]) {
+                    (Some(true), _) => self.e.free_f64.push(l),
+                    (Some(false), _) => self.e.free_f32.push(l),
+                    (None, Ty::I32) => self.e.free_i32.push(l),
+                    (None, Ty::I64) => self.e.free_i64.push(l),
+                    (None, Ty::V128) => self.e.free_v128.push(l),
                 }
             }
         }
