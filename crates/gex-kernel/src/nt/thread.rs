@@ -1448,6 +1448,29 @@ pub fn nt_query_information_process(c: &mut Call<'_>) -> R {
             c.g.w8(buf + 1, 2)?; // PROCESS_PRIOCLASS_NORMAL
             2
         }
+        // ProcessVmCounters: VM_COUNTERS or VM_COUNTERS_EX, SIZE_Ts but for
+        // the ULONG PageFaultCount (pointer-aligned). Reserved and committed
+        // from the address space; the working set is what is committed.
+        3 => {
+            let fields = if len >= 12 * ps { 12 } else { 11 };
+            need(11 * ps)?;
+            let (reserved, committed) = {
+                let stl = c.p.st.lock().unwrap();
+                stl.vm.regions.values().fold((0u64, 0u64), |(r, m), g| {
+                    (r + g.size, m + super::vm::PAGE * g.pages.iter().filter(|p| p.committed).count() as u64)
+                })
+            };
+            c.g.zero(buf, (fields * ps) as usize)?;
+            // Peak and current virtual size, working set, pagefile usage,
+            // private bytes.
+            for (i, v) in [(0, reserved), (1, reserved), (3, committed), (4, committed), (9, committed), (10, committed)] {
+                c.g.wptr(buf + i * ps, v)?;
+            }
+            if fields == 12 {
+                c.g.wptr(buf + 11 * ps, committed)?;
+            }
+            fields * ps
+        }
         _ => return Err(c.unimplemented(&format!("NtQueryInformationProcess class {class}"))),
     };
     c.g.out32(ret, n as u32)?;
