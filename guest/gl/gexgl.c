@@ -1133,7 +1133,28 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
  * Counting from element zero rather than from `first` is deliberate: the copy
  * then has the same layout as the original, so the draw command itself, its
  * `first`, and any index values need no adjustment. */
+/* The fixed-function arrays (glVertexPointer and friends), kept like the
+   generic attributes above: a pointer with no GL_ARRAY_BUFFER bound is client
+   memory, uploaded just before each draw. Index 0 is the vertex array, 1 the
+   colour array, 2 + n texture unit n's coordinates. */
+#define GEXGL_FF_ARRAYS 6
+struct ff_array_state {
+    int size;
+    unsigned type;
+    int stride;
+    const void *pointer;
+    unsigned scratch;
+    unsigned char client;
+    unsigned char enabled;
+};
+static struct ff_array_state ff_arrays[GEXGL_FF_ARRAYS];
+static int ff_client_count;
+static unsigned client_active_texture;
+
+static void gexgl_upload_ff_arrays(size_t vertices);
+
 static void gexgl_upload_client_arrays(size_t vertices, int instances) {
+    if (ff_client_count > 0) gexgl_upload_ff_arrays(vertices);
     if (vertex_attrib_client_count <= 0) return;
     const unsigned previous = bound_buffer(0x8892u); /* GL_ARRAY_BUFFER */
     for (unsigned i = 0; i < GEXGL_MAX_VERTEX_ATTRIB_POINTERS; ++i) {
@@ -1176,6 +1197,91 @@ static void gexgl_upload_client_arrays(size_t vertices, int instances) {
     }
     glBindBuffer(0x8892u, previous);
 }
+
+static void ff_pointer_command(unsigned slot, const struct ff_array_state *a, uint64_t offset) {
+    static const uint32_t ops[3] = { GEXGL_VERTEX_POINTER, GEXGL_COLOR_POINTER, GEXGL_TEX_COORD_POINTER };
+    uint32_t *p = begin(ops[slot < 2 ? slot : 2], 5, 0);
+    if (!p) return;
+    p[0] = (uint32_t)a->size; p[1] = a->type; p[2] = (uint32_t)a->stride;
+    p[3] = (uint32_t)offset; p[4] = (uint32_t)(offset >> 32);
+}
+
+static void gexgl_upload_ff_arrays(size_t vertices) {
+    if (!vertices) return;
+    const unsigned previous = bound_buffer(0x8892u); /* GL_ARRAY_BUFFER */
+    const unsigned unit = client_active_texture;
+    for (unsigned i = 0; i < GEXGL_FF_ARRAYS; ++i) {
+        struct ff_array_state *a = &ff_arrays[i];
+        if (!a->enabled || !a->client || !a->pointer) continue;
+        const size_t element = attrib_element_bytes(a->size, a->type);
+        if (!element) continue;
+        const size_t stride = a->stride > 0 ? (size_t)a->stride : element;
+        if (vertices - 1 > (SIZE_MAX - element) / stride) continue;
+        const size_t bytes = (vertices - 1) * stride + element;
+        if (!a->scratch) {
+            unsigned name = 0;
+            glGenBuffers(1, &name);
+            if (!name) continue;
+            a->scratch = name;
+        }
+        glBindBuffer(0x8892u, a->scratch);
+        glBufferData(0x8892u, (long)bytes, a->pointer, 0x88E8u /* DYNAMIC_DRAW */);
+        if (i >= 2) CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, 0x84C0u + (i - 2));
+        ff_pointer_command(i, a, 0);
+    }
+    CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, 0x84C0u + unit);
+    glBindBuffer(0x8892u, previous);
+}
+
+static struct ff_array_state *ff_slot_for(unsigned array) {
+    switch (array) {
+    case 0x8074u: return &ff_arrays[0]; /* GL_VERTEX_ARRAY */
+    case 0x8076u: return &ff_arrays[1]; /* GL_COLOR_ARRAY */
+    case 0x8078u:                       /* GL_TEXTURE_COORD_ARRAY */
+        return client_active_texture < GEXGL_FF_ARRAYS - 2 ? &ff_arrays[2 + client_active_texture] : NULL;
+    default: return NULL;
+    }
+}
+
+static void ff_record(unsigned slot, int size, unsigned type, int stride, const void *pointer) {
+    struct ff_array_state *a = &ff_arrays[slot];
+    const unsigned char was = a->client;
+    a->size = size; a->type = type; a->stride = stride; a->pointer = pointer;
+    a->client = bound_buffer(0x8892u) == 0 && pointer != NULL;
+    if (a->client != was) ff_client_count += a->client ? 1 : -1;
+    /* A buffer-backed array goes out now; a client one at the draw. */
+    if (!a->client) ff_pointer_command(slot, a, (uint64_t)(uintptr_t)pointer);
+}
+
+void glEnableClientState(unsigned array) {
+    struct ff_array_state *a = ff_slot_for(array);
+    if (a) a->enabled = 1;
+    CMD1(GEXGL_ENABLE_CLIENT_STATE, array);
+}
+void glDisableClientState(unsigned array) {
+    struct ff_array_state *a = ff_slot_for(array);
+    if (a) a->enabled = 0;
+    CMD1(GEXGL_DISABLE_CLIENT_STATE, array);
+}
+void glVertexPointer(int size, unsigned type, int stride, const void *pointer) {
+    ff_record(0, size, type, stride, pointer);
+}
+void glColorPointer(int size, unsigned type, int stride, const void *pointer) {
+    ff_record(1, size, type, stride, pointer);
+}
+void glTexCoordPointer(int size, unsigned type, int stride, const void *pointer) {
+    if (client_active_texture < GEXGL_FF_ARRAYS - 2)
+        ff_record(2 + client_active_texture, size, type, stride, pointer);
+}
+void glClientActiveTexture(unsigned unit) {
+    client_active_texture = unit >= 0x84C0u ? unit - 0x84C0u : 0;
+    CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, unit);
+}
+void glClientActiveTextureARB(unsigned unit) { glClientActiveTexture(unit); }
+/* glLockArraysEXT/glUnlockArraysEXT are a promise the arrays will not
+   change between them; the uploads above already copy at every draw. */
+void glLockArraysEXT(int first, int count) { (void)first; (void)count; }
+void glUnlockArraysEXT(void) {}
 
 void glVertexAttribPointer(unsigned index, int size, unsigned type,
                            unsigned char normalized, int stride, const void *offset) {
@@ -1479,7 +1585,7 @@ void glDrawElements(unsigned mode, int count, unsigned type, const void *offset)
     /* Client vertex arrays are uploaded as far as these indices reach. With
        the indices in a buffer there is nothing to scan, so the whole array is
        out of reach and the draw is left to the host as before. */
-    if (vertex_attrib_client_count > 0 && client)
+    if ((vertex_attrib_client_count > 0 || ff_client_count > 0) && client)
         gexgl_upload_client_arrays(
             gexgl_client_index_extent(offset, count, type), 1);
     size_t blob_len = 0;
@@ -2927,24 +3033,27 @@ const char *eglQueryString(void *dpy, int name) {
 }
 
 /* An application that looks a function up by name gets the same one it would
-   have linked against, so a loader-style application works unchanged. */
+   have linked against, so a loader-style application works unchanged.
+
+   Looked up in this object itself first, found by the address of this very
+   function: a host's own GL can be in the process too (a glibc guest that
+   dlopens the system libEGL or libOpenGL beside this one), and a global
+   lookup, or a reopen by soname, would hand back its functions, which have
+   no context. CTS loads libEGL with RTLD_LOCAL, and on musl RTLD_DEFAULT
+   does not search that object's scope at all, which is the other reason the
+   lookup goes through a handle on this object. */
 void *eglGetProcAddress(const char *name) {
     if (!name) return NULL;
-    void *proc = dlsym(RTLD_DEFAULT, name);
-    if (proc) return proc;
-
-    /* CTS loads libEGL with RTLD_LOCAL. On musl, RTLD_DEFAULT does not search
-       that local object's symbol scope, even when the lookup originates in
-       the object itself. Reopen the already-loaded object to obtain its
-       handle and search it directly. libEGL and libGLESv2 are two names for
-       this one marshaller, so either name may be the one the application used. */
     static void *self;
     if (!self) {
-        self = dlopen("libEGL.so", RTLD_LAZY | RTLD_LOCAL);
-        if (!self) self = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL);
-        if (!self) self = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_LOCAL);
+        Dl_info info;
+        if (dladdr((void *)eglGetProcAddress, &info) && info.dli_fname)
+            self = dlopen(info.dli_fname, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+        if (!self) self = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+        if (!self) self = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
     }
-    return self ? dlsym(self, name) : NULL;
+    void *proc = self ? dlsym(self, name) : NULL;
+    return proc ? proc : dlsym(RTLD_DEFAULT, name);
 }
 
 /* Fixed function: the compatibility-profile calls a pre-shader program makes.
