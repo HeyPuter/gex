@@ -3245,8 +3245,11 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         (jit.limits, Arc::clone(&jit.shared))
     };
     remiss(caller, &shared, pc)?;
-    // From here to the publish below, this is the only thread deciding which
-    // table slots anything occupies. See `JitShared::translating`.
+    // Not serialised: misses on several threads translate concurrently, each
+    // from this snapshot, and two that both lack a page each allocate it a
+    // base (the shared mark keeps the two distinct). The first to publish
+    // keeps it (`PageTable::insert_entries`); the other's blocks there are
+    // stale from the start and are not counted as translated.
     let page_table = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.page_table.clone()
