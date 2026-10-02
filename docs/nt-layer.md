@@ -280,6 +280,23 @@ reached through `sysreg_write`), under one lock every `cmpxchg16b` takes:
 atomic among them, which is all an SList needs, not against a plain store
 racing one. tests/nt/src/mtx.c runs on both arches.
 
+gex has no page protection, and below `gex_abi::GUEST_FLOOR` (3 MiB, the end
+of the dispatch directory) lie its own thread contexts and words, where
+Windows has no pages at all (nothing NT maps goes below `vm::ALLOC_LOW`). A
+write through a null pointer's field would land there silently. So every
+x86 locked access (both tiers, any alignment) and `cmpxchg16b` compares its
+address with the floor, and below it the host (`cache_op::LOW_ACCESS`)
+raises STATUS_ACCESS_VIOLATION (a write, at the address) through the
+exception dispatcher -- SIGSEGV for a Linux process. The CONTEXT has the
+registers at the access but the block's start as its pc, so a handler that
+resumes re-runs the block; unwinding to a caller's `__except` is exact.
+The NT argument helpers (`out_ptr`, `iosb`, `ustr`, `obj_attr`, ...) return
+STATUS_ACCESS_VIOLATION for such pointers. (The case that found it:
+tests/nt/src/mtx.c passed msvcp120's `_Mtx_lock` the mutex rather than its
+address -- before MSVCP 140 it takes `_Mtx_t *` -- so ConcRT locked a
+critical_section at 0x9.) tests/nt/src/lownull.c and
+tests/x86-programs/locked-null.c check it.
+
 ### 3.5 Threads
 
 `NtCreateThreadEx` allocates a TEB block and a stack from the allocator, builds

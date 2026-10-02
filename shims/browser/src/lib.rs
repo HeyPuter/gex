@@ -10050,9 +10050,32 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
     }
     // `cmpxchg16b`, under the host's lock.
     if reg == gex_kernel::x86::SYSREG_CMPXCHG16B {
+        if (val as u64) < gex_abi::GUEST_FLOOR {
+            low_access("a cmpxchg16b", val as u64, ctx, pc as u64);
+        }
         let mut gm = GuestMem::new(guest_bytes());
         gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, val as u64);
     }
+}
+
+/// A guest access into the runtime's own low memory (below
+/// `gex_abi::GUEST_FLOOR`): where hardware would fault, gex would write into
+/// its contexts or dispatch directory. Said, then raised: an access
+/// violation through SEH for a Windows program, SIGSEGV otherwise.
+fn low_access(what: &str, addr: u64, ctx: i32, pc: u64) -> ! {
+    let gm = GuestMem::new(guest_bytes());
+    let c = ctx as u32 as u64;
+    let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
+    warn_line(&format!(
+        "gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {}: an access violation. regs [{}]\n",
+        nt::describe(pc),
+        r.join(" ")
+    ));
+    if nt::active() {
+        nt::fault(ctx, gex_kernel::nt::Fault::LowWrite(addr), pc);
+    }
+    with_host(|h| set_exit(h, 128 + 11));
+    trap();
 }
 
 /// Cache maintenance. Only `dc zva` does anything, and it must: the lifter
@@ -10064,10 +10087,18 @@ static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
+    if op == gex_abi::cache_op::LOW_ACCESS {
+        low_access("a locked access", addr as u64, _ctx, _pc as u64);
+    }
     if op == gex_abi::cache_op::SPLIT_LOCK {
+        let gm = GuestMem::new(guest_bytes());
+        let c = _ctx as u32 as u64;
+        let r: Vec<String> = (0..16u8).map(|i| format!("{:#x}", gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0))).collect();
         warn_line(&format!(
-            "gex: a locked access at {:#x} (block {:#x}) spans two 8-byte words; such accesses run under one global lock, atomic against each other but not against plain accesses\n",
-            addr as u64, _pc as u64
+            "gex: a locked access at {:#x} (block {}) spans two 8-byte words; such accesses run under one global lock, atomic against each other but not against plain accesses; regs [{}]\n",
+            addr as u64,
+            nt::describe(_pc as u64),
+            r.join(" ")
         ));
         return;
     }

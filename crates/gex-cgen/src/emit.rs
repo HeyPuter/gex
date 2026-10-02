@@ -518,8 +518,12 @@ impl<'a> Emitter<'a> {
     /// `emit_aligned_or_not`): the atomic `aligned` expression when the
     /// address is naturally aligned, else `gex_locked_misaligned`. Other
     /// architectures, and byte accesses, are `aligned` as before.
+    ///
+    /// First (a line before the expression), tier-1's check for an address
+    /// below the guest's floor -- a null pointer's field, in the runtime's
+    /// own memory -- which the host raises as an access violation.
     #[allow(clippy::too_many_arguments)]
-    fn any_alignment(&self, sz: MemSz, ty: Ty, p: &str, aligned: String, op: &str, a: &str, b: &str) -> String {
+    fn any_alignment(&mut self, sz: MemSz, ty: Ty, p: &str, aligned: String, op: &str, a: &str, b: &str) -> String {
         let bytes = match sz {
             MemSz::B1 => 1u32,
             MemSz::B2 => 2,
@@ -532,6 +536,13 @@ impl<'a> Emitter<'a> {
             return aligned;
         }
         let ea = format!("((uint32_t)(uintptr_t)({p}))");
+        let start = self.block.start;
+        self.line(format!("if (__builtin_expect({ea} < GEX_GUEST_FLOOR, 0)) {{"));
+        self.flush_keep();
+        self.store_pc(&format!("0x{start:x}ull"));
+        self.line(format!("  gex_cache_op(ctx, 0x{start:x}ll, GEX_CACHE_OP_LOW_ACCESS, (int64_t){ea});"));
+        self.line("  __builtin_unreachable();");
+        self.line("}");
         format!(
             "(__builtin_expect({ea} & {}u, 0) ? ({})gex_locked_misaligned(ctx, 0x{:x}ll, {ea}, {bytes}u, {op}, {a}, {b}) : {aligned})",
             bytes - 1,

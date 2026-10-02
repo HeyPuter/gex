@@ -2555,6 +2555,23 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
 }
 
 /// Wire the `gex.*` import surface to the kernel.
+/// A guest write into the runtime's own low memory (below
+/// `gex_abi::GUEST_FLOOR`), where hardware would have faulted: said, then
+/// raised as an access violation for a Windows program, SIGSEGV otherwise.
+fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64) -> Result<()> {
+    eprintln!("gex: {what} at {addr:#x}, in the runtime's low memory (a null pointer's field?), in block {pc:#x}: an access violation");
+    if caller.data().nt.is_some() {
+        return nt::fault(caller, nt::Fault::LowWrite(addr), pc);
+    }
+    caller.data_mut().exit = Some(Exit::Signal {
+        signal: 11,
+        pc,
+        detail: format!("{what} at {addr:#x}, below the guest's floor"),
+        internal: false,
+    });
+    Err(StopExecution.into())
+}
+
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
 
@@ -3121,6 +3138,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // stack in the context.
             // `cmpxchg16b`, under the host's lock.
             if reg == gex_kernel::x86::SYSREG_CMPXCHG16B {
+                if (v as u64) < gex_abi::GUEST_FLOOR {
+                    return low_access(&mut caller, "a cmpxchg16b", v as u64, pc as u64);
+                }
                 let memory = caller
                     .data()
                     .memory
@@ -3174,6 +3194,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     sh.translated.remove(&(addr as u64));
                 }
                 return Ok(());
+            }
+            if op == gex_abi::cache_op::LOW_ACCESS {
+                return low_access(&mut caller, "a locked access", addr as u64, _pc as u64);
             }
             if op == gex_abi::cache_op::SPLIT_LOCK {
                 eprintln!(

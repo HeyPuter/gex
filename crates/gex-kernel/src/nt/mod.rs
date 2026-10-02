@@ -156,6 +156,18 @@ fn fault(_: crate::Errno) -> Status {
     Status(st::ACCESS_VIOLATION)
 }
 
+/// A pointer argument from the guest that is not NULL: below the guest's
+/// floor is the runtime's own memory (thread contexts, the dispatch
+/// directory), where Windows has no pages -- STATUS_ACCESS_VIOLATION, as
+/// Windows returns, rather than reading or writing gex's structures. Only
+/// for the argument helpers below: `G` also reads the contexts themselves.
+fn arg_ptr(a: u64) -> R<()> {
+    if a < gex_abi::GUEST_FLOOR {
+        return Err(Status(st::ACCESS_VIOLATION));
+    }
+    Ok(())
+}
+
 impl<'a> G<'a> {
     pub fn new(bytes: &'a mut [u8], abi: Abi) -> G<'a> {
         G { m: GuestMem::new(bytes), abi }
@@ -207,12 +219,14 @@ impl<'a> G<'a> {
     /// Write through an optional out-pointer (NULL means "not wanted").
     pub fn out_ptr(&mut self, a: u64, v: u64) -> R<()> {
         if a != 0 {
+            arg_ptr(a)?;
             self.wptr(a, v)?;
         }
         Ok(())
     }
     pub fn out32(&mut self, a: u64, v: u32) -> R<()> {
         if a != 0 {
+            arg_ptr(a)?;
             self.w32(a, v)?;
         }
         Ok(())
@@ -240,14 +254,13 @@ impl<'a> G<'a> {
         if a == 0 {
             return Ok(None);
         }
+        arg_ptr(a)?;
         let len = self.u16(a)? as usize;
         let buf = self.ptr(a + off!(self.abi, unicode_string::BUFFER))?;
         if len == 0 {
             return Ok(Some(Vec::new()));
         }
-        if buf == 0 {
-            return Err(Status(st::ACCESS_VIOLATION));
-        }
+        arg_ptr(buf)?;
         Ok(Some(self.wchars(buf, len / 2)?))
     }
     /// Write a `UNICODE_STRING` header at `a` naming `buf`.
@@ -267,6 +280,7 @@ impl<'a> G<'a> {
         if a == 0 {
             return Ok(None);
         }
+        arg_ptr(a)?;
         let root = self.ptr(a + off!(self.abi, object_attributes::ROOTDIRECTORY))?;
         let name_p = self.ptr(a + off!(self.abi, object_attributes::OBJECTNAME))?;
         let attrs = self.u32(a + off!(self.abi, object_attributes::ATTRIBUTES))?;
@@ -278,6 +292,7 @@ impl<'a> G<'a> {
         if a == 0 {
             return Ok(());
         }
+        arg_ptr(a)?;
         self.w32(a, status)?;
         if self.p64() {
             self.w32(a + 4, 0)?;
@@ -724,6 +739,11 @@ pub fn syscall_name(nr: u32) -> String {
 /// imports report it.
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
+    /// A write to the given address in the runtime's own low memory (below
+    /// `gex_abi::GUEST_FLOOR`), where hardware would have faulted: a locked
+    /// access or `cmpxchg16b` through a null pointer. The pc is the block's
+    /// start, since the access is checked in the middle of its block.
+    LowWrite(u64),
     /// `int3`; the pc is the instruction's own address.
     Breakpoint,
     /// An instruction gex does not implement (`ud2` included).
@@ -771,6 +791,8 @@ impl Fault {
             Fault::DivideOverflow => (st::INTEGER_OVERFLOW, pc, vec![]),
             Fault::Privileged => (st::PRIVILEGED_INSTRUCTION, pc, vec![]),
             Fault::X87 => return None,
+            // EXCEPTION_WRITE_FAULT at the address.
+            Fault::LowWrite(addr) => (st::ACCESS_VIOLATION, pc, vec![1, addr]),
         })
     }
 }

@@ -1834,6 +1834,13 @@ impl<'a> Emitter<'a> {
 
     /// `if ((a + static_off) & (size - 1)) { misaligned } else { aligned }`,
     /// leaving the old value either way.
+    ///
+    /// First, an address below the guest's floor: the runtime's own memory
+    /// (thread contexts, scratch words, the dispatch directory), so a null
+    /// pointer's field, which hardware would fault on and gex has no page
+    /// protection to fault with. The host raises the access violation
+    /// (`cache_op::LOW_ACCESS`), from the block's start, with the registers
+    /// as they are here. One compare beside an atomic read-modify-write.
     fn emit_aligned_or_not(
         &mut self,
         a: u32,
@@ -1843,6 +1850,24 @@ impl<'a> Emitter<'a> {
         aligned: impl FnOnce(&mut Self),
         misaligned: Misaligned,
     ) {
+        self.f.local_get(a);
+        self.f.i32_const(static_off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.i32_const(gex_abi::GUEST_FLOOR as i32);
+        self.f.byte(0x49); // i32.lt_u
+        self.f.if_void();
+        self.flush_conditional();
+        self.store_pc(self.block_start);
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const(self.block_start as i64);
+        self.f.i32_const(gex_abi::cache_op::LOW_ACCESS);
+        self.f.local_get(a);
+        self.f.i32_const(static_off as i32);
+        self.f.byte(0x6a); // i32.add
+        self.f.byte(code::I64_EXTEND_I32_U);
+        self.f.call(self.cx.cache_op);
+        self.f.unreachable();
+        self.f.end();
         let mask = (1i32 << natural_align(sz)) - 1;
         self.f.local_get(a);
         self.f.i32_const(static_off as i32);
