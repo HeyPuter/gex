@@ -60,6 +60,88 @@ async function loadGlue(url) {
   }
 }
 
+/** The driver's WebGPU calls by name: [calls, ms inside, bytes, ms waited]
+ *  ("waited" is a promise's time to settle: mapAsync, onSubmittedWorkDone).
+ *  Mesa's own wasm is a few percent of a frame; its cost is these calls, so
+ *  they are counted always -- one performance.now pair per call -- and
+ *  `glState` reports them per frame since it was last asked. */
+const wgpuCalls = new Map();
+function countWebGpu() {
+  if (countWebGpu.done || typeof GPUQueue === 'undefined') return;
+  countWebGpu.done = true;
+  const entry = (name) => {
+    let e = wgpuCalls.get(name);
+    if (!e) wgpuCalls.set(name, (e = [0, 0, 0, 0]));
+    return e;
+  };
+  const wrap = (proto, name, bytesOf) => {
+    const f = proto?.[name];
+    if (typeof f !== 'function') return;
+    proto[name] = function (...a) {
+      const t = performance.now();
+      const r = f.apply(this, a);
+      const e = entry(name);
+      e[0]++;
+      e[1] += performance.now() - t;
+      if (bytesOf) {
+        try { e[2] += bytesOf(a) || 0; } catch {}
+      }
+      if (r && typeof r.then === 'function') {
+        r.then(() => { e[3] += performance.now() - t; }, () => {});
+      }
+      return r;
+    };
+  };
+  const view = (d, off, size) => {
+    const el = d?.BYTES_PER_ELEMENT ?? 1;
+    return size !== undefined ? size * el : (d?.byteLength ?? 0) - (off ?? 0) * el;
+  };
+  wrap(GPUQueue.prototype, 'writeBuffer', (a) => view(a[2], a[3], a[4]));
+  wrap(GPUQueue.prototype, 'writeTexture', (a) => a[1]?.byteLength ?? 0);
+  wrap(GPUQueue.prototype, 'submit');
+  wrap(GPUQueue.prototype, 'onSubmittedWorkDone');
+  wrap(GPUCommandEncoder.prototype, 'finish');
+  wrap(GPUCommandEncoder.prototype, 'beginRenderPass');
+  wrap(GPUCommandEncoder.prototype, 'copyBufferToBuffer');
+  wrap(GPUCommandEncoder.prototype, 'copyBufferToTexture');
+  wrap(GPUCommandEncoder.prototype, 'copyTextureToTexture');
+  wrap(GPUDevice.prototype, 'createCommandEncoder');
+  wrap(GPUDevice.prototype, 'createBindGroup');
+  wrap(GPUDevice.prototype, 'createBuffer', (a) => a[0]?.size ?? 0);
+  wrap(GPUDevice.prototype, 'createTexture');
+  wrap(GPUDevice.prototype, 'createRenderPipeline');
+  wrap(GPUBuffer.prototype, 'mapAsync');
+  wrap(GPURenderPassEncoder.prototype, 'draw');
+  wrap(GPURenderPassEncoder.prototype, 'drawIndexed');
+  wrap(GPURenderPassEncoder.prototype, 'setBindGroup');
+  wrap(GPURenderPassEncoder.prototype, 'setPipeline');
+}
+
+/** Mesa's periodic reports ("gex-wgpu: ..." lines its present path prints
+ *  every thirty frames, nine at a time) at most once a minute each, keyed by
+ *  their first words; everything else as it comes. Each console line is a
+ *  message to whatever is listening (DevTools, a harness over CDP), on the
+ *  thread that runs Mesa: two thousand batches in a seven-minute Noita run.
+ *  `?gltrace=1` keeps them all. */
+function quietReports(out) {
+  let all = false;
+  try {
+    all = new URLSearchParams(location.search).get('gltrace') === '1';
+  } catch {}
+  if (all) return out;
+  const last = new Map();
+  return (line) => {
+    const m = /^gex-wgpu: ([a-z -]{4,40}?)(?: --|:| [0-9])/.exec(String(line));
+    if (m) {
+      const now = performance.now();
+      const at = last.get(m[1]);
+      if (at !== undefined && now - at < 60000) return;
+      last.set(m[1], now);
+    }
+    out(line);
+  };
+}
+
 export class MesaGlDevice {
   // The GPUAdapter and GPUDevice, held for the renderer's whole life and never
   // read again.
@@ -258,6 +340,7 @@ export class MesaGlDevice {
       }
       const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
       out.#device = device;
+      countWebGpu();
       // And out of reach of the collector for as long as the page lives.
       //
       // The fields above were supposed to be enough, and are not: the device
@@ -309,7 +392,7 @@ export class MesaGlDevice {
         mainScriptUrlOrBlob: new URL(url, location.href).href,
         locateFile: (file) => new URL(file, new URL(url, location.href)).href,
         print: (line) => console.log('[mesa-gl]', line),
-        printErr: (line) => console.warn('[mesa-gl]', line),
+        printErr: quietReports((line) => console.warn('[mesa-gl]', line)),
       });
 
       // Readback suspends the wasm stack, so submission goes through JSPI.
@@ -593,7 +676,28 @@ export class MesaGlDevice {
       `submit_ms=${this.#submitMs.toFixed(1)} ` +
       `avg_ms=${(this.#submitMs / Math.max(1, this.#submits)).toFixed(3)} ` +
       `max_ms=${this.#maxSubmitMs.toFixed(1)} ` +
-      `readbacks=${this.#readbacks} readback_ms=${this.#readbackMs.toFixed(1)}`;
+      `readbacks=${this.#readbacks} readback_ms=${this.#readbackMs.toFixed(1)}` +
+      this.#wgpuSince();
+  }
+
+  #wgpuLast = { frames: 0, calls: new Map() };
+  /** The WebGPU calls per frame since the last report: name calls/ms[/KiB][/waited ms]. */
+  #wgpuSince() {
+    if (!wgpuCalls.size) return '';
+    const frames = this.producedCount();
+    const f = Math.max(1, frames - this.#wgpuLast.frames);
+    const parts = [];
+    for (const [name, e] of [...wgpuCalls].sort((a, b) => b[1][1] - a[1][1])) {
+      const p = this.#wgpuLast.calls.get(name) ?? [0, 0, 0, 0];
+      const d = e.map((v, i) => v - p[i]);
+      if (!d[0]) continue;
+      let s = `${name} ${(d[0] / f).toFixed(1)}/${(d[1] / f).toFixed(2)}ms`;
+      if (d[2]) s += `/${(d[2] / f / 1024).toFixed(0)}KiB`;
+      if (d[3]) s += `/wait ${(d[3] / f).toFixed(2)}ms`;
+      parts.push(s);
+    }
+    this.#wgpuLast = { frames, calls: new Map([...wgpuCalls].map(([k, v]) => [k, [...v]])) };
+    return ` wgpu per frame over ${f}: ${parts.join(', ')}`;
   }
 
   commands() {

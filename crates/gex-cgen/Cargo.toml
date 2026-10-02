@@ -9,6 +9,8 @@ description = "The function tier: GIR -> C -> clang -> wasm, spliced into tier-1
 gex-abi.workspace = true
 gex-ir.workspace = true
 gex-emit.workspace = true
+gex-key.workspace = true
+gex-ld.workspace = true
 anyhow = "1"
 wasmparser = "0.219.2"
 wasm-encoder = { version = "0.219.2", features = ["wasmparser"] }

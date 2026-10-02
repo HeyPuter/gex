@@ -32,6 +32,13 @@ const CMD_CAPACITY: u32 = 8 << 20;
 const REPLY_CAPACITY: u32 = 16 << 20;
 const HEADER: u64 = 32;
 const GEX_GL_SUBMIT: u64 = 0xc008_6701;
+/// [`GEX_GL_SUBMIT`] without waiting for the batch to run: the device takes
+/// a copy of the ring, so it may be refilled at once, and the next submit of
+/// any kind waits for this one first -- one batch in flight at most. For a
+/// batch with nothing to answer (a frame's last, ending in `PRESENT`). A
+/// device without it says so (no answer), and the batch is submitted the
+/// waiting way.
+const GEX_GL_SUBMIT_ASYNC: u64 = 0xc008_6704;
 
 /// A params struct: where each field of a unix call's arguments is, for the
 /// process's ABI.
@@ -158,6 +165,14 @@ pub struct State {
     formats: HashMap<u32, i32>,
     /// Interned strings handed to the guest.
     strings: HashMap<Vec<u8>, u64>,
+    /// Per GL function since the last [`take_stats`]: calls and nanoseconds
+    /// (the round trips they waited for included); and the submits.
+    /// (calls, ns, submits it caused).
+    stats: HashMap<&'static str, (u64, u64, u64)>,
+    submits: (u64, u64, u64),
+    /// The GL function being served, which a submit is charged to.
+    serving: &'static str,
+    stats_frame: u64,
     next_name: u32,
     /// The default framebuffer's size.
     surface: (i32, i32),
@@ -188,6 +203,10 @@ impl Default for State {
             current: HashMap::new(),
             formats: HashMap::new(),
             strings: HashMap::new(),
+            stats: HashMap::new(),
+            submits: (0, 0, 0),
+            serving: "",
+            stats_frame: 0,
             next_name: 1,
             surface: (0, 0),
             attached: 0,
@@ -281,8 +300,18 @@ fn flush(c: &mut Call<'_>) -> R<Vec<u8>> {
     c.g.w32(ring + 8, tail)?;
     c.g.w32(ring + 16, 0)?;
     c.g.w32(ring + 20, 0)?;
+    let t0 = (c.p.clocks.mono_ns)();
     let r = dev.ioctl(&mut c.g.m, GEX_GL_SUBMIT, ring);
-    c.p.gl.lock().unwrap().tail = 0;
+    let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
+    {
+        let mut s = c.p.gl.lock().unwrap();
+        s.tail = 0;
+        s.submits.0 += 1;
+        s.submits.1 += dt;
+        s.submits.2 += tail as u64;
+        let who = s.serving;
+        s.stats.entry(who).or_insert((0, 0, 0)).2 += 1;
+    }
     let status = c.g.u32(ring + 20)?;
     if !matches!(r, Some(Ok(_))) || status != 0 {
         let failed_at = c.g.u32(ring + 24)?;
@@ -292,6 +321,77 @@ fn flush(c: &mut Call<'_>) -> R<Vec<u8>> {
     }
     let n = c.g.u32(ring + 16)? as usize;
     c.g.bytes(ring + HEADER + CMD_CAPACITY as u64, n)
+}
+
+/// Submit what is queued without waiting for it to run ([`GEX_GL_SUBMIT_ASYNC`]).
+/// A failure surfaces at the next submit, as that batch's.
+fn flush_async(c: &mut Call<'_>) -> R<()> {
+    let (ring, tail, dev) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.ring, s.tail, s.dev.clone())
+    };
+    let Some(dev) = dev else { return Ok(()) };
+    if tail == 0 {
+        return Ok(());
+    }
+    c.g.w32(ring + 8, tail)?;
+    c.g.w32(ring + 16, 0)?;
+    c.g.w32(ring + 20, 0)?;
+    let t0 = (c.p.clocks.mono_ns)();
+    let r = dev.ioctl(&mut c.g.m, GEX_GL_SUBMIT_ASYNC, ring);
+    if r.is_none() {
+        flush(c)?;
+        return Ok(());
+    }
+    let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
+    {
+        let mut s = c.p.gl.lock().unwrap();
+        s.tail = 0;
+        s.submits.0 += 1;
+        s.submits.1 += dt;
+        s.submits.2 += tail as u64;
+        let who = s.serving;
+        s.stats.entry(who).or_insert((0, 0, 0)).2 += 1;
+    }
+    if !matches!(r, Some(Ok(_))) {
+        return Err(c.unimplemented("a GL batch the host refused (the one before this frame's last)"));
+    }
+    Ok(())
+}
+
+/// Whether GL calls are timed by function, for [`take_stats`] (a host's
+/// GEX_NT_GL_STATS): two clock reads and a lock per call, so off by default.
+pub static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the program's GL cost since the last call, for GEX_NT_GL_STATS:
+/// frames, submits (round trips to the host GL, their time and bytes) and the
+/// GL functions by time spent in them (their submits included), the top
+/// `n`. Resets the counters.
+pub fn take_stats(p: &super::Process, n: usize) -> String {
+    let mut s = p.gl.lock().unwrap();
+    let frames = s.frame - s.stats_frame;
+    s.stats_frame = s.frame;
+    let mut v: Vec<(&'static str, (u64, u64, u64))> = s.stats.drain().collect();
+    let (k, ns, bytes) = std::mem::take(&mut s.submits);
+    drop(s);
+    v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    let calls: u64 = v.iter().map(|x| x.1 .0).sum();
+    let f = frames.max(1);
+    let top: Vec<String> = v
+        .iter()
+        .take(n)
+        .map(|(name, (c, t, k))| {
+            format!("{name} {:.1}/f {:.2}ms/f {:.2}sub/f", *c as f64 / f as f64, *t as f64 / 1e6 / f as f64, *k as f64 / f as f64)
+        })
+        .collect();
+    format!(
+        "{frames} frames: {} GL calls/f, {:.1} submits/f ({:.2} ms/f, {} KiB/f); {}",
+        calls / f,
+        k as f64 / f as f64,
+        ns as f64 / 1e6 / f as f64,
+        bytes / f / 1024,
+        top.join(", ")
+    )
 }
 
 /// [`flush`], leaving the reply where it is: its guest address and length.
@@ -309,8 +409,18 @@ fn flush_in_place(c: &mut Call<'_>) -> R<(u64, usize)> {
     c.g.w32(ring + 8, tail)?;
     c.g.w32(ring + 16, 0)?;
     c.g.w32(ring + 20, 0)?;
+    let t0 = (c.p.clocks.mono_ns)();
     let r = dev.ioctl(&mut c.g.m, GEX_GL_SUBMIT, ring);
-    c.p.gl.lock().unwrap().tail = 0;
+    let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
+    {
+        let mut s = c.p.gl.lock().unwrap();
+        s.tail = 0;
+        s.submits.0 += 1;
+        s.submits.1 += dt;
+        s.submits.2 += tail as u64;
+        let who = s.serving;
+        s.stats.entry(who).or_insert((0, 0, 0)).2 += 1;
+    }
     let status = c.g.u32(ring + 20)?;
     if !matches!(r, Some(Ok(_))) || status != 0 {
         let failed_at = c.g.u32(ring + 24)?;
@@ -593,7 +703,10 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
                 gdi::surface::surface(c, g.toplevel, g.size)?;
                 gdi::surface::flush(c, g.toplevel);
             }
-            let _ = ask(c, op::PRESENT, &[], &[])?;
+            // Not waited for: the guest draws the next frame while the
+            // host runs this one, and the next submit waits for it.
+            cmd(c, op::PRESENT, &[], &[])?;
+            flush_async(c)?;
             return finish_swap(c, hdc, hwnd);
         }
     }
@@ -757,7 +870,21 @@ pub fn call(c: &mut Call<'_>, code: u32, args: u64) -> R {
         return Err(c.unimplemented(&format!("opengl32 unix call {code}")));
     };
     let p = Params { at: args, offs: layout(sig, c.p.abi) };
+    let timed = STATS.load(std::sync::atomic::Ordering::Relaxed);
+    let t0 = if timed {
+        c.p.gl.lock().unwrap().serving = name;
+        (c.p.clocks.mono_ns)()
+    } else {
+        0
+    };
     let r = one(c, name, &p);
+    if timed {
+        let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
+        let mut s = c.p.gl.lock().unwrap();
+        let e = s.stats.entry(name).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += dt;
+    }
     if c.p.cfg.trace {
         crate::nt_log!("[nt:{:x}]   opengl32 {name}", c.t.tid);
     }

@@ -16,6 +16,9 @@ extern "C" {
     /// memory). Returns zero, or negative when the page has no WebGL. The reply
     /// is written back into the buffer, not through the return value.
     fn gl_submit(ring: u32) -> i32;
+    /// `gl_submit` without waiting for the batch to run: the page copies the
+    /// ring and returns; the next submit waits for this one first.
+    fn gl_submit_async(ring: u32) -> i32;
 }
 
 /// Set when the page said it has a canvas with WebGL on it. Off by default, so
@@ -39,6 +42,9 @@ pub fn have_gl() -> bool {
 /// The same ioctl numbers the native device uses, for the same reason: one
 /// guest library talks to both.
 pub const GEX_GL_SUBMIT: u64 = 0xc008_6701;
+/// `GEX_GL_SUBMIT`, not waited for (gex-kernel's NT OpenGL, for a frame's
+/// last batch): one batch in flight at most.
+pub const GEX_GL_SUBMIT_ASYNC: u64 = 0xc008_6704;
 pub const GEX_GL_LIMITS: u64 = 0x8008_6702;
 /// `{ kind, id, width, height }` -- this process's window whose pixels the
 /// host draws.
@@ -58,6 +64,18 @@ thread_local! {
     /// Nanoseconds this Worker has spent waiting on the page's GL host
     /// (`gl_submit`), for the NT host's per-thread time split.
     pub(crate) static GL_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The part of that spent waiting for the previous, unwaited batch
+    /// (`GEX_GL_SUBMIT_ASYNC`) to finish: the page says, `gex_gl_note_wait_ns`.
+    pub(crate) static GL_WAIT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// From the page's GL bridge: how long a submit waited for the batch before
+/// it (this Worker's thread).
+#[no_mangle]
+pub extern "C" fn gex_gl_note_wait_ns(ns: f64) {
+    if ns > 0.0 {
+        GL_WAIT_NS.with(|g| g.set(g.get() + ns as u64));
+    }
 }
 
 #[derive(Debug)]
@@ -94,7 +112,7 @@ impl FileHandle for GlDevice {
         // The request is an `int` in the C library, so every `_IOWR` number
         // arrives sign-extended.
         match request & 0xffff_ffff {
-            GEX_GL_SUBMIT => {
+            GEX_GL_SUBMIT | GEX_GL_SUBMIT_ASYNC => {
                 if !have_gl() {
                     return Some(Err(Errno::ENODEV));
                 }
@@ -104,7 +122,11 @@ impl FileHandle for GlDevice {
                     return Some(Err(Errno::EFAULT));
                 }
                 let t0 = crate::now_ns();
-                let r = unsafe { gl_submit(arg as u32) };
+                let r = if request & 0xffff_ffff == GEX_GL_SUBMIT_ASYNC {
+                    unsafe { gl_submit_async(arg as u32) }
+                } else {
+                    unsafe { gl_submit(arg as u32) }
+                };
                 GL_NS.with(|g| g.set(g.get() + crate::now_ns().saturating_sub(t0)));
                 Some(if r < 0 { Err(Errno::EIO) } else { Ok(0) })
             }
