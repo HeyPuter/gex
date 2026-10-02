@@ -39,6 +39,8 @@ function moduleContentKey(bytes) {
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
 const SHIM_STACK_TOP = 0x06000000;
+/** `gex_abi::BOOT_STACK_COUNTER`: which bootstrap stack slice is next. */
+const BOOT_STACK_COUNTER = 0x00100000 - 192;
 /**
  * Whether a fork hands the child its parent's compiled modules (default 1).
  * `?forkmods=0` sends none and the child recompiles what it branches into.
@@ -545,6 +547,17 @@ export class Gex {
     // pointer resets to the top, since a trap abandons the stack), and a fresh
     // slot each time would exhaust the sixty-four available in a second.
     if (this.#stackTop === null) {
+      // `gex_worker_init` runs on a stack too, and until it answers this
+      // instance's is wasm-ld's: the top of the guest's first 8 MiB, which is
+      // a Windows program's image (noita.exe's .text at 0x7ff000..0x800000
+      // was overwritten by every thread that started). So it runs on a
+      // bootstrap slice of the shim's own stack band below SHIM_STACK_TOP,
+      // one of 32 handed out round-robin through a counter in the reserved
+      // low region -- Workers starting together get different ones.
+      if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && this.#memory.buffer instanceof SharedArrayBuffer) {
+        const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
+        this.#shim.exports.__stack_pointer.value = (SHIM_STACK_TOP - k * 0x40000) | 0;
+      }
       const at = this.#shim.exports.gex_worker_init?.();
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
     }

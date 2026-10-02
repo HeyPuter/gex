@@ -551,6 +551,11 @@ pub const EXCLUSIVE_SCRATCH: u64 = RESERVED_END - 64;
 /// low region, never guest-observable.
 pub const SPLIT_LOCK: u64 = RESERVED_END - 128;
 
+/// A counter the browser glue takes bootstrap stacks by: a Worker calls
+/// `gex_worker_init` before it has a stack of its own, and wasm-ld's default
+/// one is the guest's low memory (shims/browser/js/gex.mjs `#workerStack`).
+pub const BOOT_STACK_COUNTER: u64 = RESERVED_END - 192;
+
 /// Address of the context for thread slot `n`.
 ///
 /// Contexts are packed into the reserved low region, one per guest thread.
