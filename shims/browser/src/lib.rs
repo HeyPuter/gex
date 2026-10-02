@@ -10048,6 +10048,11 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
         let mut gm = GuestMem::new(guest_bytes());
         gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, val as u64);
     }
+    // `cmpxchg16b`, under the host's lock.
+    if reg == gex_kernel::x86::SYSREG_CMPXCHG16B {
+        let mut gm = GuestMem::new(guest_bytes());
+        gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, val as u64);
+    }
 }
 
 /// Cache maintenance. Only `dc zva` does anything, and it must: the lifter

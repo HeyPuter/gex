@@ -36,6 +36,9 @@ pub mod sysreg {
     /// code; the host reads and updates the register stack, `TOP`, the tags
     /// and the condition codes in the context.
     pub const X87: i32 = -101;
+    /// `cmpxchg16b`: written with the effective address; the host compares
+    /// and swaps under its lock and sets `rax`, `rdx` and ZF in the context.
+    pub const CMPXCHG16B: i32 = -102;
 }
 
 /// The x87 operations [`sysreg::X87`] carries: an operation code in the low
@@ -1183,59 +1186,24 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
             Op::CmpxchgNb => {
-                // cmpxchg16b: rdx:rax against [m]; replace with rcx:rbx.
-                // Not atomic across the two halves: wasm has no 128-bit
-                // atomics. (x64 Windows' SLIST_HEADER is this; see above.)
+                // cmpxchg16b: rdx:rax against [m], replaced with rcx:rbx.
+                // wasm has no 16-byte atomic, so the host does it, under one
+                // lock every cmpxchg16b takes (gex_kernel::x86::
+                // serve_cmpxchg16b): atomic against each other, which is
+                // what a lock-free list's head (x64 Windows' SLIST_HEADER)
+                // needs, not against a plain access racing it. It reads and
+                // writes rax, rdx and ZF in the context.
                 let Operand::Mem(m) = i.op0() else {
                     return Flow::End(Term::Illegal { raw: self.raw, pc });
                 };
                 let (addr, offset) = self.addr(&m);
-                let half = w; // D for 8b (two 32-bit halves), Q for 16b
-                let sz = mem_sz(half);
-                let lo = self.b.def(Expr::Load {
-                    addr,
-                    offset,
-                    sz,
-                    signed: false,
-                    ty,
-                    order: Order::SeqCst,
+                let addr = self.offset_addr(addr, offset);
+                let pcv = self.k64(pc);
+                let id = self.k32(sysreg::CMPXCHG16B as u32);
+                self.b.stmt(Stmt::HostCall {
+                    func: HostFunc::SysRegWrite,
+                    args: vec![pcv, id, addr],
                 });
-                let hi = self.b.def(Expr::Load {
-                    addr,
-                    offset: offset + half.bytes() as i64,
-                    sz,
-                    signed: false,
-                    ty,
-                    order: Order::SeqCst,
-                });
-                let rax = self.rd_reg(Reg::Gp(RAX, half));
-                let rdx = self.rd_reg(Reg::Gp(RDX, half));
-                let eq_lo = self.b.cmp(CmpOp::Eq, ty, lo, rax);
-                let eq_hi = self.b.cmp(CmpOp::Eq, ty, hi, rdx);
-                let eq = self.b.bin(BinOp::And, Ty::I32, eq_lo, eq_hi);
-                let rbx = self.rd_reg(Reg::Gp(3, half));
-                let rcx = self.rd_reg(Reg::Gp(RCX, half));
-                let nlo = self.b.select(eq, rbx, lo, ty);
-                let nhi = self.b.select(eq, rcx, hi, ty);
-                self.b.stmt(Stmt::Store {
-                    addr,
-                    offset,
-                    val: nlo,
-                    sz,
-                    order: Order::SeqCst,
-                });
-                self.b.stmt(Stmt::Store {
-                    addr,
-                    offset: offset + half.bytes() as i64,
-                    val: nhi,
-                    sz,
-                    order: Order::SeqCst,
-                });
-                let nrax = self.b.select(eq, rax, lo, ty);
-                let nrdx = self.b.select(eq, rdx, hi, ty);
-                self.wr_reg(Reg::Gp(RAX, half), nrax);
-                self.wr_reg(Reg::Gp(RDX, half), nrdx);
-                self.write_flag(GuestReg::Z, eq);
                 self.flags = FlagSource::Unknown;
                 Flow::Next
             }

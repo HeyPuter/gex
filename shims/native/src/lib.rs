@@ -3119,6 +3119,16 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             // An x87 transcendental or remainder, computed on the register
             // stack in the context.
+            // `cmpxchg16b`, under the host's lock.
+            if reg == gex_kernel::x86::SYSREG_CMPXCHG16B {
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, v as u64);
+            }
             if reg == gex_kernel::x86::SYSREG_X87 {
                 let memory = caller
                     .data()

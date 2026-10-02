@@ -274,12 +274,11 @@ does not. A misaligned `lock` access inside one aligned 8-byte word is a
 compare-exchange loop on that word (atomic); one spanning two words runs under
 the global `gex_abi::SPLIT_LOCK` word, atomic against every other such access
 but not against a plain access racing it (the first is reported).
-`cmpxchg8b` is one 64-bit compare-exchange. **Gap:** `cmpxchg16b` (x64's
-`SLIST_HEADER`, so `InterlockedPushEntrySList` in a 64-bit program) is still
-two 8-byte halves, not atomic: x64 SLists corrupt under contention
-(tests/nt/src/mtx.c runs on x86 only for that reason). The planned fix is the
-same global lock for every `cmpxchg16b` (atomic among cmpxchg16b, which is
-all an SList needs).
+`cmpxchg8b` is one 64-bit compare-exchange. `cmpxchg16b` (x64's
+`SLIST_HEADER`) is done by the host (`gex_kernel::x86::serve_cmpxchg16b`,
+reached through `sysreg_write`), under one lock every `cmpxchg16b` takes:
+atomic among them, which is all an SList needs, not against a plain store
+racing one. tests/nt/src/mtx.c runs on both arches.
 
 ### 3.5 Threads
 
