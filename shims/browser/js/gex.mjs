@@ -2824,6 +2824,7 @@ export class Gex {
         );
       }
       try {
+        if (tables[i].length + (want - tables[i].length) > (1 << 21)) console.error(`[gex] table grows to ${tables[i].length + (want - tables[i].length)} entries`);
         tables[i].grow(want - tables[i].length, stub);
       } catch (err) {
         throw new Error(
@@ -2852,6 +2853,7 @@ export class Gex {
       const need = e.gex_claimed_slots(i) >>> 0;
       if (need <= tables[i].length) continue;
       try {
+        if (tables[i].length + (need - tables[i].length) > (1 << 21)) console.error(`[gex] table grows to ${tables[i].length + (need - tables[i].length)} entries`);
         tables[i].grow(need - tables[i].length, stub);
         grew = true;
       } catch {
@@ -3162,6 +3164,7 @@ export class Gex {
         const want = Math.min(Math.max(need - i * per, 0), per);
         if (tables[i].length < want) {
           grew += want - tables[i].length;
+          if (tables[i].length + (want - tables[i].length) > (1 << 21)) console.error(`[gex] table grows to ${tables[i].length + (want - tables[i].length)} entries`);
           tables[i].grow(want - tables[i].length, stub);
         }
       }
@@ -3302,6 +3305,7 @@ export class Gex {
     const delta = want - tables[t].length;
     if (delta <= 0) return;
     const g0 = performance.now();
+    if (tables[t].length + (delta) > (1 << 21)) console.error(`[gex] table grows to ${tables[t].length + (delta)} entries`);
     tables[t].grow(delta, stub);
     this.#pubGrewSlots += delta;
     this.#pubGrowMs += performance.now() - g0;

@@ -290,6 +290,34 @@ fn flush(c: &mut Call<'_>) -> R<Vec<u8>> {
     c.g.bytes(ring + HEADER + CMD_CAPACITY as u64, n)
 }
 
+/// [`flush`], leaving the reply where it is: its guest address and length.
+/// For a reply the size of a frame, which a host copy would allocate twice
+/// a frame.
+fn flush_in_place(c: &mut Call<'_>) -> R<(u64, usize)> {
+    let (ring, tail, dev) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.ring, s.tail, s.dev.clone())
+    };
+    let Some(dev) = dev else { return Ok((0, 0)) };
+    if tail == 0 {
+        return Ok((0, 0));
+    }
+    c.g.w32(ring + 8, tail)?;
+    c.g.w32(ring + 16, 0)?;
+    c.g.w32(ring + 20, 0)?;
+    let r = dev.ioctl(&mut c.g.m, GEX_GL_SUBMIT, ring);
+    c.p.gl.lock().unwrap().tail = 0;
+    let status = c.g.u32(ring + 20)?;
+    if !matches!(r, Some(Ok(_))) || status != 0 {
+        let failed_at = c.g.u32(ring + 24)?;
+        return Err(c.unimplemented(&format!(
+            "a GL batch the host refused (status {status}, command {failed_at}): an opcode or argument it does not take"
+        )));
+    }
+    let n = c.g.u32(ring + 16)? as usize;
+    Ok((ring + HEADER + CMD_CAPACITY as u64, n))
+}
+
 struct Reply {
     b: Vec<u8>,
     at: usize,
@@ -563,7 +591,9 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
             cmd(c, op::PIXEL_STOREI, &[pn, want], &[])?;
         }
     }
-    let mut r = ask(c, op::READ_PIXELS, &[0, 0, w as u32, h as u32, 0x80e1, 0x1401, 0, 0, 0], &[])?;
+    cmd(c, op::READ_PIXELS, &[0, 0, w as u32, h as u32, 0x80e1, 0x1401, 0, 0, 0], &[])?;
+    // The pixels stay in the ring's reply area: `{offset, length, bytes}`.
+    let (reply, n) = flush_in_place(c)?;
     for (pn, cur, want) in packs {
         if cur != want {
             cmd(c, op::PIXEL_STOREI, &[pn, cur], &[])?;
@@ -572,10 +602,10 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
     if read_fbo != 0 {
         cmd(c, op::BIND_FRAMEBUFFER, &[GL_READ_FRAMEBUFFER, read_fbo], &[])?;
     }
-    let _offset = r.u32();
-    let px = r.blob();
+    let px_len = if n >= 8 { c.g.u32(reply + 4)? as usize } else { 0 };
+    let px = reply + 8;
     let stride = w as usize * 4;
-    if px.len() < stride * h as usize {
+    if px_len < stride * h as usize || n < 8 + px_len {
         return Ok(false);
     }
     // Into the top-level window's surface at the client area's place.
@@ -594,8 +624,9 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
             continue;
         }
         let src = (h - 1 - y) as usize * stride + (x0 - ox) as usize * 4;
-        let row = &px[src..src + (x1 - x0) as usize * 4];
-        c.g.write(surf.row(sy) + x0 as u64 * 4, row)?;
+        c.g.m
+            .copy_within(px + src as u64, surf.row(sy) + x0 as u64 * 4, (x1 - x0) as usize * 4)
+            .map_err(|_| Status(st::ACCESS_VIOLATION))?;
     }
     gdi::surface::flush(c, g.toplevel);
     let frame = {

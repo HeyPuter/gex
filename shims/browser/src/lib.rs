@@ -1479,18 +1479,31 @@ impl FileHandle for Console {
 // once, so it needs a real lock -- `TalcSyncCell` refuses to compile with
 // atomics rather than being quietly unsound.
 #[cfg(not(feature = "shared-memory"))]
-type Heap = talc::cell::TalcSyncCell<ShimRegion, talc::wasm::WasmBinning>;
+type Heap<const BIG: bool> = talc::cell::TalcSyncCell<ShimRegion<BIG>, talc::wasm::WasmBinning>;
 #[cfg(not(feature = "shared-memory"))]
-const HEAP: Heap = talc::cell::TalcSyncCell::new_wasm(ShimRegion);
+const HEAP: Heap<false> = talc::cell::TalcSyncCell::new_wasm(ShimRegion);
+#[cfg(not(feature = "shared-memory"))]
+const BIG_HEAP: Heap<true> = talc::cell::TalcSyncCell::new_wasm(ShimRegion);
 
 #[cfg(feature = "shared-memory")]
-type Heap =
-    talc::sync::TalcLock<spinning_top::RawSpinlock, ShimRegion, talc::wasm::WasmBinning>;
+type Heap<const BIG: bool> =
+    talc::sync::TalcLock<spinning_top::RawSpinlock, ShimRegion<BIG>, talc::wasm::WasmBinning>;
 #[cfg(feature = "shared-memory")]
-const HEAP: Heap = talc::sync::TalcLock::new(ShimRegion);
+const HEAP: Heap<false> = talc::sync::TalcLock::new(ShimRegion);
+#[cfg(feature = "shared-memory")]
+const BIG_HEAP: Heap<true> = talc::sync::TalcLock::new(ShimRegion);
+
+/// Allocations this big or bigger come from a heap of their own.
+///
+/// One heap for everything fragmented to exhaustion: Noita at world load had
+/// 510 MiB live in 2 GiB of spans, because the megabyte-sized buffers a
+/// translation and a GL frame churn through (encoding buffers, module copies,
+/// readbacks) came back to holes that small objects had since split, and the
+/// next one took a fresh span. Kept apart, big blocks only meet big blocks.
+const BIG_MIN: usize = 64 * 1024;
 
 #[global_allocator]
-static ALLOC: Counting = Counting(HEAP, std::sync::atomic::AtomicUsize::new(0));
+static ALLOC: Counting = Counting(HEAP, std::sync::atomic::AtomicUsize::new(0), BIG_HEAP);
 
 /// The heap, plus how much of it is out on loan.
 ///
@@ -1498,7 +1511,7 @@ static ALLOC: Counting = Counting(HEAP, std::sync::atomic::AtomicUsize::new(0));
 /// symptom of its own (the page just faults at whatever the guest touched
 /// next), so the only way to know is to ask. Without `heap-counters` the
 /// counting arms compile away, leaving a delegating newtype.
-struct Counting(Heap, std::sync::atomic::AtomicUsize);
+struct Counting(Heap<false>, std::sync::atomic::AtomicUsize, Heap<true>);
 
 /// Live bytes by size class, so a full heap can say *what* is filling it: a few
 /// enormous buffers and a million small ones want different fixes.
@@ -1577,13 +1590,38 @@ unsafe impl Sync for Counting {}
 /// write landed in.
 pub(crate) static WATCH_ALLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `GEX_NT_BIG_ALLOC=<bytes>`: report every allocation and free at least
+/// this big (the allocations with the stack), to find who fragments the heap.
+pub(crate) static BIG_ALLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn watch_alloc(what: &str, p: *mut u8, size: usize) {
     let w = WATCH_ALLOC.load(std::sync::atomic::Ordering::Relaxed);
-    if w == 0 || p.is_null() {
+    let big = BIG_ALLOC.load(std::sync::atomic::Ordering::Relaxed);
+    if p.is_null() || (w == 0 && big == 0) {
         return;
     }
     let (a, e) = (p as u64, p as u64 + size as u64);
-    if !(a <= w && w < e) {
+    let hit = w != 0 && a <= w && w < e;
+    let is_big = big != 0 && size as u64 >= big;
+    if !hit && !is_big {
+        return;
+    }
+    if is_big && !hit {
+        use core::fmt::Write as _;
+        struct Buf([u8; 120], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let n = s.len().min(self.0.len() - self.1);
+                self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+        let mut b = Buf([0; 120], 0);
+        let tag = if what.starts_with("free") || what.starts_with("realloc from") { "[gex-big]" } else { "[gex-stack] [gex-big]" };
+        let _ = write!(b, "{tag} {what} {a:#x} {size}");
+        // SAFETY: `warn` reads the bytes and keeps none.
+        unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
         return;
     }
     use core::fmt::Write as _;
@@ -1604,7 +1642,7 @@ fn watch_alloc(what: &str, p: *mut u8, size: usize) {
 
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        let p = unsafe { self.0.alloc(l) };
+        let p = unsafe { if l.size() >= BIG_MIN { self.2.alloc(l) } else { self.0.alloc(l) } };
         watch_alloc("alloc", p, l.size());
         // A null becomes `handle_alloc_error` -> abort -> a bare wasm
         // `unreachable` with nothing said. The heap is fixed, so running out is
@@ -1639,14 +1677,40 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
             self.1.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
             live_sub(l.size());
         }
-        unsafe { self.0.dealloc(p, l) }
+        unsafe {
+            if l.size() >= BIG_MIN {
+                self.2.dealloc(p, l)
+            } else {
+                self.0.dealloc(p, l)
+            }
+        }
     }
 
     // Forwarded, not left to the default's allocate-copy-free: talc grows in
     // place where it can, and the lifter pushes onto many vectors.
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
         watch_alloc("realloc from", p, l.size());
-        let q = unsafe { self.0.realloc(p, l, new) };
+        let q = unsafe {
+            match (l.size() >= BIG_MIN, new >= BIG_MIN) {
+                (false, false) => self.0.realloc(p, l, new),
+                (true, true) => self.2.realloc(p, l, new),
+                // Across heaps: a fresh block in the other, the bytes, and
+                // the old one back.
+                (_, to_big) => {
+                    let nl = std::alloc::Layout::from_size_align_unchecked(new, l.align());
+                    let q = if to_big { self.2.alloc(nl) } else { self.0.alloc(nl) };
+                    if !q.is_null() {
+                        std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                        if to_big {
+                            self.0.dealloc(p, l)
+                        } else {
+                            self.2.dealloc(p, l)
+                        }
+                    }
+                    q
+                }
+            }
+        };
         watch_alloc("realloc to", q, new);
         #[cfg(feature = "heap-counters")]
         if !q.is_null() {
@@ -1674,7 +1738,7 @@ extern "C" {
 /// in the allocator's initialiser; it is claimed the first time anything is
 /// allocated instead.
 #[derive(Debug)]
-struct ShimRegion;
+struct ShimRegion<const BIG: bool>;
 
 /// Make the memory cover everything below `end`.
 ///
@@ -2178,9 +2242,9 @@ fn arena_grow(len: u64) -> u64 {
 ///
 /// `talc` keeps each claimed span separate; only `extend` joins new memory to
 /// one it owns, and that needs the old end. Zero means nothing claimed yet.
-static HEAP_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HEAP_END: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 
-unsafe impl talc::source::Source for ShimRegion {
+unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
     fn acquire<B: talc::base::binning::Binning>(
         talc: &mut talc::base::Talc<Self, B>,
         _layout: std::alloc::Layout,
@@ -2285,13 +2349,13 @@ unsafe impl talc::source::Source for ShimRegion {
             }
         }
         let base = arena_take(len).ok_or(())? as *mut u8;
-        memmap::claim(memmap::Kind::Heap, 0, base as u64, base as u64 + len, "heap span");
+        memmap::claim(memmap::Kind::Heap, 0, base as u64, base as u64 + len, if BIG { "heap span (big)" } else { "heap span" });
         // Extend the last span when this one abuts it, rather than claiming a
         // separate one: talc cannot serve a request larger than any single span
         // from two adjacent ones, so a doubling buffer would otherwise strand
         // every chunk behind it. Adjacency is checked, not assumed -- the
         // guest's mappings and Worker stacks draw from the same cursor.
-        let end = HEAP_END.load(std::sync::atomic::Ordering::Relaxed);
+        let end = HEAP_END[BIG as usize].load(std::sync::atomic::Ordering::Relaxed);
         let new_end = unsafe {
             if end != 0 && end == base as usize {
                 // SAFETY: the span starts exactly where the heap ended, the
@@ -2304,7 +2368,7 @@ unsafe impl talc::source::Source for ShimRegion {
                 talc.claim(base, len as usize).ok_or(())?
             }
         };
-        HEAP_END.store(new_end.as_ptr() as usize, std::sync::atomic::Ordering::Relaxed);
+        HEAP_END[BIG as usize].store(new_end.as_ptr() as usize, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -10830,7 +10894,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         && SERVED_PAGE.0.borrow_mut().insert(page);
                     let bytes: Vec<&[u8]> = ready.iter().map(|(_, _, _, w)| w.as_slice()).collect();
                     match gex_xlate::merge::merge(&bytes) {
-                        Some(wasm) => h.jit.pending.push_back(PendingModule { dirs, slots, wasm }),
+                        Some(wasm) => h.jit.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm) }),
                         None => {
                             // Not the shape the merger expects. One at a time
                             // rather than lose the code.
@@ -10838,7 +10902,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                                 h.jit.pending.push_back(PendingModule {
                                     dirs: d,
                                     slots: s,
-                                    wasm: w,
+                                    wasm: exact(w),
                                 });
                             }
                         }
@@ -11020,7 +11084,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         h.jit.pending.push_back(PendingModule {
             dirs: unit.dir_entries.clone(),
             slots: unit.table_slots,
-            wasm: unit.wasm,
+            wasm: exact(unit.wasm),
         });
         publish_pending(h);
         // Point the guest directory at the slot this unit's block actually
@@ -11370,7 +11434,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
             h.jit.pending.push_back(PendingModule {
                 dirs: m.dir_entries,
                 slots: m.table_slots,
-                wasm: m.wasm,
+                wasm: exact(m.wasm),
             });
         }
         publish_pending(h);
@@ -11930,6 +11994,18 @@ pub extern "C" fn gex_jit_pending_slots() -> u32 {
 }
 
 /// The module JS has to instantiate, or zero length if there is none.
+/// A module's bytes at their exact size, before any Worker can see where they
+/// are. The pending queue publishes the front module's address to every
+/// Worker of the process (`PENDING`); `gex_jit_installed` used to shrink the
+/// bytes as it kept them, which reallocates -- moving them out from under a
+/// sibling still copying from the published address, into a block the next
+/// translation's buffer took ("expected magic word" from WebAssembly.compile).
+/// Shrunk here instead, the bytes never move once published.
+fn exact(mut v: Vec<u8>) -> Vec<u8> {
+    v.shrink_to_fit();
+    v
+}
+
 #[no_mangle]
 pub extern "C" fn gex_jit_pending_ptr() -> u32 {
     PENDING.with(|p| p[0].load(std::sync::atomic::Ordering::Relaxed))
