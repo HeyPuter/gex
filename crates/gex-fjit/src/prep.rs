@@ -48,24 +48,32 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
     };
     let mut most = 0;
     for ((b, dead), &count) in f.blocks.iter_mut().zip(&dead_out).zip(&counts) {
-        let mut v: Option<Value> = None;
-        b.term.for_each_use(|x| v = Some(x));
-        let term = match (&b.term, v) {
-            (FTerm::Branch { .. }, Some(c)) => Term::Branch { cond: c, taken: 0, not_taken: 0 },
-            (_, Some(t)) => Term::Indirect { target: t, is_ret: false },
-            (_, None) => Term::Goto { target: 0 },
+        // The passes below see the terminator's value through a tier-1
+        // `Term`, made after forwarding has substituted into it: made
+        // before, they would keep the old value alive and let the one the
+        // terminator now reads go (a `jno` after `test`: `0 ^ 1` forwarded
+        // to the constant 1, which DCE then dropped).
+        let term_of = |t: &FTerm| {
+            let mut v: Option<Value> = None;
+            t.for_each_use(|x| v = Some(x));
+            match (t, v) {
+                (FTerm::Branch { .. }, Some(c)) => Term::Branch { cond: c, taken: 0, not_taken: 0 },
+                (_, Some(t)) => Term::Indirect { target: t, is_ret: false },
+                (_, None) => Term::Goto { target: 0 },
+            }
         };
         let mut blk = Block {
             start: b.start,
             end: b.end,
             stmts: std::mem::take(&mut b.stmts),
-            term,
+            term: term_of(&b.term),
             n_values: count,
             call_return: None,
             guard: None,
         };
         let before = blk.stmts.len();
         forward(&mut blk, &mut b.term);
+        blk.term = term_of(&b.term);
         pass::const_fold(&mut blk);
         pass::dead_store_elim_with(&mut blk, dead);
         pass::dce(&mut blk);
@@ -107,7 +115,10 @@ fn renumber(b: &mut gex_ir::func::FBlock) -> u32 {
             next += 1;
         });
     }
-    b.term.for_each_use_mut(|v| *v = Value(*map.get(&v.0).expect("memory form: a terminator value from another block")));
+    let (start, term) = (b.start, format!("{:?}", b.term));
+    b.term.for_each_use_mut(|v| {
+        *v = Value(*map.get(&v.0).unwrap_or_else(|| panic!("memory form: a terminator value from another block ({start:#x}: {term})")))
+    });
     next
 }
 
