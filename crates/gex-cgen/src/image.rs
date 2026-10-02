@@ -55,7 +55,81 @@ pub fn recovery_key(image: &gex_ld::Image) -> String {
 /// these inputs): the directory under the cgen cache that holds it. Every
 /// host finds units by this one function.
 pub fn image_key(image: &gex_ld::Image) -> String {
-    gex_key::unit_key(image, FORMAT, UNIT_INPUTS, UNIT_ABI_VERSION, RECOVERY_INPUTS)
+    gex_key::unit_key(image, FORMAT, &unit_inputs(), UNIT_ABI_VERSION, RECOVERY_INPUTS)
+}
+
+/// [`UNIT_INPUTS`] and a hash of [`abi_fingerprint`]: everything that
+/// decides a unit from a recovery.
+fn unit_inputs() -> String {
+    static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let mut h = gex_key::sha256::Sha256::new();
+        h.update(abi_fingerprint().as_bytes());
+        format!("{UNIT_INPUTS}:{}", gex_key::sha256::hex(&h.finish()))
+    })
+    .clone()
+}
+
+/// What a unit's C takes from gex-abi: the generated header, and every value
+/// gex-cgen formats into C directly (context offsets, dispatch constants).
+/// The test `abi_fingerprint_covers_what_the_c_embeds` fails when the emitter
+/// names a gex-abi value this does not list.
+pub fn abi_fingerprint() -> String {
+    use gex_abi::ctx;
+    let mut s = crate::header::header();
+    let named: &[(&str, u64)] = &[
+        ("X86", gex_abi::X86 as u64),
+        ("PPC", gex_abi::PPC as u64),
+        ("DISPATCH_SHIFT", gex_abi::DISPATCH_SHIFT as u64),
+        ("INST_ALIGN_SHIFT", gex_abi::INST_ALIGN_SHIFT as u64),
+        ("INST_ALIGN", gex_abi::INST_ALIGN),
+        ("DISPATCH_PAGE", gex_abi::DISPATCH_PAGE),
+        ("SYSCALL_INST_BYTES", gex_abi::SYSCALL_INST_BYTES),
+        ("ctx::SP", ctx::SP as u64),
+        ("ctx::PC", ctx::PC as u64),
+        ("ctx::NZCV", ctx::NZCV as u64),
+        ("ctx::NF", ctx::NF as u64),
+        ("ctx::ZF", ctx::ZF as u64),
+        ("ctx::CF", ctx::CF as u64),
+        ("ctx::VF", ctx::VF as u64),
+        ("ctx::PF", ctx::PF as u64),
+        ("ctx::AF", ctx::AF as u64),
+        ("ctx::DF", ctx::DF as u64),
+        ("ctx::TPIDR", ctx::TPIDR as u64),
+        ("ctx::TPIDRRO", ctx::TPIDRRO as u64),
+        ("ctx::FS_BASE", ctx::FS_BASE as u64),
+        ("ctx::GS_BASE", ctx::GS_BASE as u64),
+        ("ctx::MON_ADDR", ctx::MON_ADDR as u64),
+        ("ctx::MON_VALUE", ctx::MON_VALUE as u64),
+        ("ctx::MON_SIZE", ctx::MON_SIZE as u64),
+        ("ctx::FPCR", ctx::FPCR as u64),
+        ("ctx::FPSR", ctx::FPSR as u64),
+        ("ctx::MXCSR", ctx::MXCSR as u64),
+        ("ctx::SAFEPOINT_COUNTER", ctx::SAFEPOINT_COUNTER as u64),
+        ("ctx::BALLAST", ctx::BALLAST as u64),
+        ("ctx::LAST_TARGET", ctx::LAST_TARGET as u64),
+        ("ctx::LAST_SOURCE", ctx::LAST_SOURCE as u64),
+        ("ctx::X87", ctx::X87 as u64),
+        ("ctx::X87_TOP", ctx::X87_TOP as u64),
+        ("ctx::X87_CW", ctx::X87_CW as u64),
+        ("ctx::X87_SW", ctx::X87_SW as u64),
+        ("ctx::X87_TAGS", ctx::X87_TAGS as u64),
+        ("ctx::PPC_CR", ctx::PPC_CR as u64),
+        ("ctx::PPC_LR", ctx::PPC_LR as u64),
+        ("ctx::PPC_CTR", ctx::PPC_CTR as u64),
+        ("ctx::PPC_SO", ctx::PPC_SO as u64),
+        ("ctx::PPC_OV", ctx::PPC_OV as u64),
+        ("ctx::PPC_CA", ctx::PPC_CA as u64),
+        ("ctx::PPC_XER_BC", ctx::PPC_XER_BC as u64),
+        ("ctx::PPC_FPSCR", ctx::PPC_FPSCR as u64),
+    ];
+    for (n, v) in named {
+        s.push_str(&format!("{n}={v}\n"));
+    }
+    for i in 0..32u8 {
+        s.push_str(&format!("ctx::x({i})={} ctx::v({i})={} ctx::f({i})={}\n", ctx::x(i), ctx::v(i), ctx::f(i)));
+    }
+    s
 }
 
 /// The embedded constants [`UNIT_ABI_VERSION`] stands for.
@@ -414,6 +488,47 @@ pub fn exported_entries(cwasm: &[u8]) -> Result<Vec<u64>> {
     }
     out.sort_unstable();
     Ok(out)
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    /// Every `ctx::NAME` and `gex_abi::NAME` the code that writes a unit's
+    /// C names must be in `abi_fingerprint`, or a gex-abi change that alters
+    /// the C would not change the unit key.
+    #[test]
+    fn abi_fingerprint_covers_what_the_c_embeds() {
+        let fp = super::abi_fingerprint();
+        let sources = [
+            ("func.rs", include_str!("func.rs")),
+            ("emit.rs", include_str!("emit.rs")),
+            ("image.rs", include_str!("image.rs").split("mod fingerprint_tests").next().unwrap()),
+            ("lib.rs", include_str!("lib.rs")),
+        ];
+        // Not values: modules, types, functions of the host side.
+        let ignore = ["ctx", "imports", "exports", "cache_op", "IMPORT_MODULE", "dispatch_entry_table", "dispatch_index"];
+        let mut missing = Vec::new();
+        for (file, text) in sources {
+            for prefix in ["ctx::", "gex_abi::"] {
+                for (i, _) in text.match_indices(prefix) {
+                    let rest = &text[i + prefix.len()..];
+                    let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                    if name.is_empty() || ignore.contains(&name.as_str()) || name.chars().next().unwrap().is_ascii_lowercase() && name != "x" && name != "v" && name != "f" {
+                        continue;
+                    }
+                    let key = if prefix == "ctx::" { format!("ctx::{name}") } else { name.clone() };
+                    let listed = if ["x", "v", "f"].contains(&name.as_str()) {
+                        fp.contains(&format!("ctx::{name}(0)="))
+                    } else {
+                        fp.contains(&format!("{key}=")) || fp.contains(&format!("GEX_{name} "))
+                    };
+                    if !listed && !missing.contains(&format!("{file}: {key}")) {
+                        missing.push(format!("{file}: {key}"));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "gex-abi values the C embeds but abi_fingerprint does not list: {missing:?}");
+    }
 }
 
 #[cfg(test)]

@@ -199,7 +199,7 @@ struct HostState {
     /// last (`call_out`).
     callouts: Vec<Callout>,
     /// What the watch stub decided, for `call_out`'s loop.
-    callout_signal: Option<CalloutSignal>,
+    pub(crate) callout_signal: Option<CalloutSignal>,
     /// The host function watched slots hold (`watch_stub`).
     watch_stub: Option<wasmtime::Func>,
     /// Where the guest is spending its time, when anyone asked.
@@ -384,13 +384,17 @@ impl Drop for CgenStore {
     }
 }
 
-/// `gex_abi::BODY_LIMIT` = the smallest body table of any store.
+/// `gex_abi::BODY_LIMITS[0]` = the smallest body table 0 of any store
+/// (natively the others are empty: 0).
 fn publish_body_limit(sh: &JitShared, memory: &gex_mem::GuestMemory) {
     let min = sh.body_sizes.values().copied().min().unwrap_or(0).min(u32::MAX as u64) as u32;
-    let off = gex_abi::BODY_LIMIT as usize;
+    let off = gex_abi::BODY_LIMITS as usize;
     let data = memory.bytes();
-    if off + 4 <= data.len() {
+    if off + 4 * gex_abi::DISPATCH_TABLES <= data.len() {
         data[off..off + 4].copy_from_slice(&min.to_le_bytes());
+        for t in 1..gex_abi::DISPATCH_TABLES {
+            data[off + 4 * t..off + 4 * t + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
     }
 }
 
@@ -3931,7 +3935,14 @@ fn install_cgen(
                 for (i, t) in tables.iter().enumerate() {
                     dl.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::dispatch_table(i), *t)?;
                 }
-                dl.define(cx.as_context_mut(), gex_cgen::splice::DISPATCH_MODULE, gex_cgen::splice::BODY_TABLE, b)?;
+                // Body table t mirrors dispatch table t; natively only 0 is
+                // used, the rest stay empty (BODY_LIMITS[t] = 0).
+                dl.define(cx.as_context_mut(), gex_cgen::splice::DISPATCH_MODULE, &gex_cgen::splice::body_table_name(0), b)?;
+                for t in 1..gex_abi::DISPATCH_TABLES {
+                    let ty = wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None);
+                    let e = Table::new(cx.as_context_mut(), ty, wasmtime::Ref::Func(Some(leave.clone())))?;
+                    dl.define(cx.as_context_mut(), gex_cgen::splice::DISPATCH_MODULE, &gex_cgen::splice::body_table_name(t), e)?;
+                }
                 let di = dl.instantiate(cx.as_context_mut(), &dm).context("instantiating the dispatcher")?;
                 let d = di
                     .get_func(cx.as_context_mut(), gex_cgen::splice::DISPATCH_NAME)
@@ -4090,7 +4101,7 @@ struct Callout {
 }
 
 /// What the watch stub found when a dispatch reached a watched slot.
-enum CalloutSignal {
+pub(crate) enum CalloutSignal {
     /// The return call-out `i` waits for.
     Return(usize),
     /// Something else that shares the slot: run what it held.

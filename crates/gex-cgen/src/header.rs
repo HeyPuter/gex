@@ -32,7 +32,6 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
     let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}u", gex_abi::PATCHED_PAGES);
     let _ = writeln!(w, "#define GEX_NEST_EXITS 0x{:x}u", gex_abi::NEST_EXITS);
-    let _ = writeln!(w, "#define GEX_BODY_LIMIT 0x{:x}u", gex_abi::BODY_LIMIT);
     let _ = writeln!(w);
 
     // The context. Every named offset, then the per-register helpers.

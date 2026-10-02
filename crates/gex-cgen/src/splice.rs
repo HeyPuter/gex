@@ -529,18 +529,20 @@ pub fn dispatcher_module() -> Vec<u8> {
             }),
         );
     }
-    // The body table, after the dispatch tables.
-    imports.import(
-        DISPATCH_MODULE,
-        BODY_TABLE,
-        EntityType::Table(TableType {
-            element_type: RefType::FUNCREF,
-            minimum: 0,
-            maximum: None,
-            table64: false,
-            shared: false,
-        }),
-    );
+    // The body tables, one per dispatch table, after the dispatch tables.
+    for i in 0..gex_abi::DISPATCH_TABLES {
+        imports.import(
+            DISPATCH_MODULE,
+            &body_table_name(i),
+            EntityType::Table(TableType {
+                element_type: RefType::FUNCREF,
+                minimum: 0,
+                maximum: None,
+                table64: false,
+                shared: false,
+            }),
+        );
+    }
     m.section(&imports);
     let mut funcs = FunctionSection::new();
     funcs.function(0);
@@ -557,30 +559,37 @@ pub fn dispatcher_module() -> Vec<u8> {
     m.finish()
 }
 
-/// Import name, in [`DISPATCH_MODULE`], of the process's body table and of
-/// the function a whole-image unit's indirect calls go through.
-pub const BODY_TABLE: &str = "bodies";
+/// Import name, in [`DISPATCH_MODULE`], of body table `i` (mirroring
+/// dispatch table `i`), and of the function a whole-image unit's indirect
+/// calls go through.
+pub fn body_table_name(i: usize) -> String {
+    format!("bodies{i}")
+}
 pub const CALL_KNOWN_NAME: &str = "call_known";
 
-/// `call_known(ctx, target, depth, need, ret) -> i32`: the body the body
-/// table holds for `target`'s slot (numbered like dispatch: the page's
-/// directory entry plus the slot within the page), tail-called with
-/// `ctx::PC = target`; -1 (leave) for an address outside the directory, a
-/// page outside table 0, or a slot past `gex_abi::BODY_LIMIT`.
-fn call_known_function(body_ty: u32, body_table: u32) -> Function {
+/// `call_known(ctx, target, depth, need, ret) -> i32`: the body body table
+/// `t` holds for `target`'s slot -- `t` and the slot as dispatch numbers
+/// them (the page's directory entry: table in the top bits, base slot below,
+/// plus the slot within the page) -- tail-called with `ctx::PC = target`; -1
+/// (leave) for an address outside the directory, or a slot past
+/// `gex_abi::BODY_LIMITS[t]`.
+fn call_known_function(body_ty: u32, first_body_table: u32) -> Function {
     use Instruction as I;
-    // Params: 0 ctx, 1 target, 2 depth, 3 need, 4 ret. Locals: 5 entry, 6 slot.
-    let mut f = Function::new([(2, ValType::I32)]);
+    // Params: 0 ctx, 1 target, 2 depth, 3 need, 4 ret. Locals: 5 entry, 6 slot, 7 table.
+    let mut f = Function::new([(3, ValType::I32)]);
     let m = |off: u64, align: u32| MemArg { offset: off, align, memory_index: 0 };
+    let leave = |f: &mut Function| {
+        f.instruction(&I::If(BlockType::Empty));
+        f.instruction(&I::I32Const(-1));
+        f.instruction(&I::Return);
+        f.instruction(&I::End);
+    };
     // target >= the directory's reach: leave.
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Const((gex_abi::DISPATCH_MAX_PAGES * gex_abi::DISPATCH_PAGE) as i64));
     f.instruction(&I::I64GeU);
-    f.instruction(&I::If(BlockType::Empty));
-    f.instruction(&I::I32Const(-1));
-    f.instruction(&I::Return);
-    f.instruction(&I::End);
-    // entry = dir[target >> 12]
+    leave(&mut f);
+    // entry = dir[target >> 12]; table = entry >> SLOT_BITS
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Const(gex_abi::DISPATCH_PAGE.trailing_zeros() as i64));
     f.instruction(&I::I64ShrU);
@@ -589,15 +598,16 @@ fn call_known_function(body_ty: u32, body_table: u32) -> Function {
     f.instruction(&I::I32Mul);
     f.instruction(&I::I32Load(m(gex_abi::DISPATCH_DIR, 2)));
     f.instruction(&I::LocalTee(5));
-    // A table index in the top bits: not table 0, leave.
     f.instruction(&I::I32Const(gex_abi::DISPATCH_SLOT_BITS as i32));
     f.instruction(&I::I32ShrU);
-    f.instruction(&I::If(BlockType::Empty));
-    f.instruction(&I::I32Const(-1));
-    f.instruction(&I::Return);
-    f.instruction(&I::End);
-    // slot = entry + (target & 0xfff) >> shift
+    f.instruction(&I::LocalTee(7));
+    f.instruction(&I::I32Const(gex_abi::DISPATCH_TABLES as i32));
+    f.instruction(&I::I32GeU);
+    leave(&mut f);
+    // slot = (entry & mask) + (target & 0xfff) >> shift
     f.instruction(&I::LocalGet(5));
+    f.instruction(&I::I32Const(gex_abi::DISPATCH_SLOT_MASK as i32));
+    f.instruction(&I::I32And);
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Const((gex_abi::DISPATCH_PAGE - 1) as i64));
     f.instruction(&I::I64And);
@@ -608,23 +618,34 @@ fn call_known_function(body_ty: u32, body_table: u32) -> Function {
     f.instruction(&I::I32WrapI64);
     f.instruction(&I::I32Add);
     f.instruction(&I::LocalTee(6));
-    f.instruction(&I::I32Const(gex_abi::BODY_LIMIT as i32));
-    f.instruction(&I::I32Load(m(0, 2)));
+    // slot >= BODY_LIMITS[table]: leave.
+    f.instruction(&I::LocalGet(7));
+    f.instruction(&I::I32Const(4));
+    f.instruction(&I::I32Mul);
+    f.instruction(&I::I32Load(m(gex_abi::BODY_LIMITS, 2)));
     f.instruction(&I::I32GeU);
-    f.instruction(&I::If(BlockType::Empty));
-    f.instruction(&I::I32Const(-1));
-    f.instruction(&I::Return);
-    f.instruction(&I::End);
+    leave(&mut f);
     // ctx::PC = target (a body checks it: an x86 slot covers four bytes).
     f.instruction(&I::LocalGet(0));
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Store(m(ctx::PC as u64, 3)));
-    f.instruction(&I::LocalGet(0));
-    f.instruction(&I::LocalGet(2));
-    f.instruction(&I::LocalGet(3));
-    f.instruction(&I::LocalGet(4));
-    f.instruction(&I::LocalGet(6));
-    f.instruction(&I::ReturnCallIndirect { type_index: body_ty, table_index: body_table });
+    // br_table over the body tables, as dispatch does over its tables.
+    let n = gex_abi::DISPATCH_TABLES as u32;
+    for _ in 0..n {
+        f.instruction(&I::Block(BlockType::Empty));
+    }
+    f.instruction(&I::LocalGet(7));
+    let targets: Vec<u32> = (0..n).map(|k| n - 1 - k).collect();
+    f.instruction(&I::BrTable(targets.into(), n - 1));
+    for k in (0..n).rev() {
+        f.instruction(&I::End);
+        f.instruction(&I::LocalGet(0));
+        f.instruction(&I::LocalGet(2));
+        f.instruction(&I::LocalGet(3));
+        f.instruction(&I::LocalGet(4));
+        f.instruction(&I::LocalGet(6));
+        f.instruction(&I::ReturnCallIndirect { type_index: body_ty, table_index: first_body_table + k });
+    }
     f.instruction(&I::End);
     f
 }
