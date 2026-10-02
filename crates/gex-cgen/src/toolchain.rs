@@ -181,6 +181,32 @@ pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 /// Link objects into one module exporting `exports`.
 pub fn link(dir: &Path, objs: &[PathBuf], exports: &[String], out: &Path) -> Result<()> {
+    link_with_table(dir, objs, exports, out, false)
+}
+
+/// Link a whole-image unit (docs/function-tier.md §11): its own function
+/// table (holding the entries `gex_fnref` names) exported, and three
+/// exports however many functions it has.
+pub fn link_image(dir: &Path, objs: &[PathBuf], out: &Path) -> Result<()> {
+    let rsp = dir.join("link.rsp");
+    let mut text = String::from("--export=gex_fnref\n--export-table\n");
+    for o in objs {
+        text.push_str(&o.to_string_lossy());
+        text.push('\n');
+    }
+    std::fs::write(&rsp, text)?;
+    let mut cmd = Command::new(wasm_ld());
+    cmd.args(["--no-entry", "--import-memory", "--shared-memory", "--max-memory=4294901760", "--allow-undefined", "-O2"])
+        .arg(format!("@{}", rsp.display()))
+        .arg("-o")
+        .arg(out);
+    run(&mut cmd, "wasm-ld")
+}
+
+/// [`link`], importing the function table (`env.__indirect_function_table`)
+/// when `import_table`: a whole-image unit's `call_indirect`s go through the
+/// process's body table, which the host provides.
+pub fn link_with_table(dir: &Path, objs: &[PathBuf], exports: &[String], out: &Path, import_table: bool) -> Result<()> {
     // A response file: a closure can have a hundred thousand exports.
     let rsp = dir.join("link.rsp");
     let mut text = String::new();
@@ -203,6 +229,7 @@ pub fn link(dir: &Path, objs: &[PathBuf], exports: &[String], out: &Path) -> Res
         "--allow-undefined",
         "-O2",
     ])
+    .args(import_table.then_some("--import-table"))
     .arg(format!("@{}", rsp.display()))
     .arg("-o")
     .arg(out);

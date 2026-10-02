@@ -23,6 +23,26 @@ use gex_ir::{Block, Expr, GuestReg, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
+/// The C test for "`entry`'s code was rewritten" (`GEX_PATCHED`): its page,
+/// and the next one when a 5-byte patch at the entry would reach into it.
+/// `GEX_CGEN_MUTATE=NOPATCHCHECK`: never.
+fn patched_test(entry: u64) -> String {
+    if mutate("NOPATCHCHECK") {
+        return "0".into();
+    }
+    if entry % gex_abi::DISPATCH_PAGE > gex_abi::DISPATCH_PAGE - 5 {
+        format!("GEX_PATCHED(0x{entry:x}ull) | GEX_PATCHED(0x{:x}ull)", entry + 5)
+    } else {
+        format!("GEX_PATCHED(0x{entry:x}ull)")
+    }
+}
+
+/// The export the body table holds for `entry` (docs/function-tier.md §11):
+/// its body, checked against `ctx::PC`, since an x86 slot covers four bytes.
+pub fn checked_body_name(entry: u64) -> String {
+    format!("ib_{entry:x}")
+}
+
 pub fn body_name(entry: u64) -> String {
     format!("f_{entry:x}")
 }
@@ -174,6 +194,8 @@ pub struct FnUnit {
     /// A unit for `standalone::standalone`: everything `static`, and no
     /// dispatch roots (`e_<F>`), so nothing imports `gexc.dispatch`.
     standalone: bool,
+    /// A whole-image unit's: `gex_call_known` is the dispatcher's import.
+    pub call_known_import: bool,
 }
 
 impl Default for FnUnit {
@@ -198,6 +220,7 @@ impl FnUnit {
             ret_sp_delta: ret_sp_delta(false),
             live: Vec::new(),
             standalone: false,
+            call_known_import: false,
         }
     }
 
@@ -385,11 +408,23 @@ impl FnUnit {
         // return writes everything back and sets PC; should the guest really
         // return there, PC says so and dispatch faults as tier-1's would.
         r.line(format!("if ({name}(ctx, 0, NEED_ALL, ~0ull)) GEX_C64({}u) = ~0ull;", ctx::PC));
+        r.line("(*(volatile uint64_t *)GEX_P(GEX_NEST_EXITS))++;");
         r.line(format!("const uint64_t tgt = GEX_C64({}u);", ctx::PC));
         r.safepoint("tgt");
         r.dispatch("tgt");
         self.bodies.push_str(&r.take_output());
         self.bodies.push_str("}\n\n");
+        // The body-table entry: `gex_call_known` set PC to the target, and a
+        // slot covers four bytes on x86, so a neighbour's call leaves (-1).
+        let _ = writeln!(
+            self.bodies,
+            "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{\n  \
+             if (GEX_C64({}u) != 0x{:x}ull) return -1;\n  \
+             GEX_MUSTTAIL return {name}(ctx, depth, need, ret);\n}}\n",
+            checked_body_name(f.entry),
+            ctx::PC,
+            f.entry
+        );
         self.protos.insert(f.entry);
         self.protos.extend(calls);
         Ok(())
@@ -589,6 +624,13 @@ impl FnUnit {
                     Callee::Direct(t) if known.contains(t) => {
                         calls.insert(*t);
                         self.stats.calls_known += 1;
+                        // Its code rewritten since the unit was installed
+                        // (Detours): leave for it, as for a callee not ours.
+                        e.line(format!("  if (__builtin_expect({}, 0)) {{", patched_test(*t)));
+                        e.flush_keep();
+                        e.store_pc(&format!("0x{t:x}ull"));
+                        e.line("    return 0;");
+                        e.line("  }");
                         e.line(format!(
                             "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) return 0;",
                             body_name(*t),
@@ -657,6 +699,10 @@ impl FnUnit {
                     // A tail call does not pass through a loop back-edge or
                     // the root, so it polls (returns no longer do).
                     e.safepoint(&format!("0x{t:x}ull"));
+                    e.line(format!("if (__builtin_expect({}, 0)) {{", patched_test(*t)));
+                    e.store_pc(&format!("0x{t:x}ull"));
+                    e.line("  return 0;");
+                    e.line("}");
                     if scope.is_some() {
                         // A loop function's signature is not the bodies':
                         // an ordinary call (one more frame) instead.
@@ -747,10 +793,52 @@ impl FnUnit {
         for a in &self.protos {
             let _ = writeln!(s, "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
         }
-        let _ = writeln!(s, "{st}int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n");
+        if self.call_known_import {
+            // A whole-image unit: the process's body table, through the
+            // dispatcher module (`splice::dispatcher_module`).
+            let _ = writeln!(
+                s,
+                "__attribute__((import_module(\"{}\"), import_name(\"{}\"))) int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n",
+                crate::splice::DISPATCH_MODULE,
+                crate::splice::CALL_KNOWN_NAME
+            );
+        } else {
+            let _ = writeln!(s, "{st}int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n");
+        }
         s.push_str(&self.bodies);
         s
     }
+}
+
+/// The table indices of a whole-image unit's entries (docs/function-tier.md
+/// §11): `gex_fnref(2k)` is entry k's `e_` and `gex_fnref(2k + 1)` its
+/// `ib_`, as indices into the unit's own function table (wasm-ld's, which
+/// it exports), so the module exports three things however many functions it
+/// holds (wasm caps a module at 100,000 exports; noita.exe has 100,147
+/// functions). Chunked as `gex_call_known`'s switch is, for clang's sake.
+pub fn fnref_source(entries: &[u64]) -> String {
+    let mut s = String::from("#include \"gex_abi.h\"\n\n");
+    for a in entries {
+        let _ = writeln!(s, "void {}(int ctx);", entry_name(*a));
+        let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", checked_body_name(*a));
+    }
+    let chunk = CALL_KNOWN_CHUNK / 2;
+    let chunks: Vec<&[u64]> = entries.chunks(chunk.max(1)).collect();
+    for (c, es) in chunks.iter().enumerate() {
+        let _ = writeln!(s, "\nstatic __attribute__((noinline)) uint32_t fr_{c}(uint32_t k) {{\n  switch (k) {{");
+        for (i, a) in es.iter().enumerate() {
+            let k = 2 * (c * chunk + i);
+            let _ = writeln!(s, "  case {k}u: return (uint32_t)(uintptr_t)&{};", entry_name(*a));
+            let _ = writeln!(s, "  case {}u: return (uint32_t)(uintptr_t)&{};", k + 1, checked_body_name(*a));
+        }
+        s.push_str("  default: return 0;\n  }\n}\n");
+    }
+    let _ = writeln!(s, "\nuint32_t gex_fnref(uint32_t k) {{\n  switch (k / {}u) {{", 2 * chunk);
+    for c in 0..chunks.len() {
+        let _ = writeln!(s, "  case {c}u: return fr_{c}(k);");
+    }
+    s.push_str("  default: return 0;\n  }\n}\n");
+    s
 }
 
 /// The helper indirect calls go through: a `switch` over every function

@@ -101,6 +101,14 @@ usage:
 {}
   gexc disasm <elf>                disassemble the executable segments
   gexc ir     <elf> --at <addr>    print the GIR for one basic block
+  gexc run [--cgen|--no-cgen] <program.exe> ...
+                                   a Windows program uses the function-tier
+                                   units built for its images (Wine's at
+                                   staging, the program's own on an earlier
+                                   run); an image without one runs on tier-1
+                                   and gets one built for the next run.
+                                   --cgen: every program image must have one;
+                                   --no-cgen: tier-1 only
   gexc cgen-image <pe> [--pe-base HEX] [--jobs N]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
@@ -218,6 +226,9 @@ struct RunArgs {
     jit: bool,
     /// A Windows program's staged Wine prefix. See `nt_run`.
     wine_prefix: Option<String>,
+    /// `--no-cgen`: a Windows program runs on tier-1 only, prebuilt units or
+    /// not (`gex_native::nt_cgen::Mode`).
+    no_cgen: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
@@ -230,6 +241,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut no_jit = false;
     let mut lazy = false;
     let mut cgen = false;
+    let mut no_cgen = false;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
     let mut i = 0;
@@ -318,6 +330,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--no-jit" => no_jit = true,
             "--lazy" => lazy = true,
             "--cgen" => cgen = true,
+            "--no-cgen" => no_cgen = true,
             "--no-cache" => opts.cache = false,
             "--cwd" => {
                 i += 1;
@@ -381,6 +394,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         },
         jit: !no_jit,
         wine_prefix,
+        no_cgen,
     })
 }
 
@@ -488,9 +502,19 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         if ra.opts.record.is_some() {
             bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
         }
-        // --cgen: images with a hot set (GEX_NT_HOTSETS) get function-tier
-        // units as the NT layer maps them (gex_native::nt_cgen); without the
-        // directory it fails loudly there.
+        // The function tier for the images the NT layer maps
+        // (gex_native::nt_cgen, docs/function-tier.md §11): prebuilt units
+        // are used where they exist, and an image without one runs on tier-1
+        // while its unit is built for the next run; --cgen requires every
+        // program image to have one; --no-cgen is tier-1 only.
+        use gex_native::nt_cgen::Mode;
+        gex_native::nt_cgen::set_mode(if ra.no_cgen {
+            Mode::Off
+        } else if ra.xlate.cgen {
+            Mode::Require
+        } else {
+            Mode::Default
+        });
         let exit = nt_run::run(&ra, &bytes)?;
         return Ok(report_exit(&exit, ra.opts.verbose));
     }
@@ -2084,6 +2108,7 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let mut wasm_total = 0u64;
+    let _lock = gex_native::nt_cgen::build_lock()?;
     for (path, base) in &todo {
         let bytes = std::fs::read(path)?;
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
@@ -2129,6 +2154,10 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     let base = pe_base.unwrap_or(pe.preferred_base);
+    // One build at a time per cache, across processes: a recovery's peak is
+    // the machine's, and runs queue builds for the next run in the
+    // background.
+    let _lock = gex_native::nt_cgen::build_lock()?;
     let t0 = std::time::Instant::now();
     let out = gex_native::nt_cgen::prepare_pe(&pe, base, jobs, true)?;
     eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());

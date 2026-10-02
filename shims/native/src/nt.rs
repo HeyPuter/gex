@@ -71,9 +71,7 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
     let program = Program { exe, interp: None };
     let mut opts = opts.clone();
     opts.jit = true;
-    if xlate.cgen {
-        super::nt_cgen::enable()?;
-    }
+    super::nt_cgen::enable()?;
     let mut setup = setup.clone();
     if setup.display_out.is_none() {
         setup.display_out = opts.wayland_out.clone();
@@ -213,9 +211,12 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         }
                         m.read_u32(a).ok()
                     });
+                    let nest_exits = GuestMem::new(memory.bytes()).read_u64(gex_abi::NEST_EXITS).unwrap_or(0);
+                    let leaves = crate::CGEN_LEAVES.load(std::sync::atomic::Ordering::Relaxed);
+                    let cg = format!("cgen nest_exits={nest_exits} leaves={leaves}");
                     match value {
-                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
-                        None => eprintln!("gex-nt: stats t={} presents={presents} layout_miss={} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
+                        Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
+                        None => eprintln!("gex-nt: stats t={} presents={presents} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
                     }
                     // With --sample, the hottest guest back-edges of the last
                     // 30 s, by module, so a run that never exits can still be
@@ -370,10 +371,19 @@ impl nt::NtHost for CallerHost<'_, '_> {
 /// code at the context's pc, follow redirects, and stop at the thread's
 /// `NtCallbackReturn`.
 fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Result<()> {
-    let enter = caller
-        .get_export(exports::ENTER)
-        .and_then(Extern::into_func)
-        .ok_or_else(|| anyhow!("the calling module does not export `enter`"))?;
+    // The calling module's `enter`, or -- when the call came from a
+    // function-tier unit, which has none -- any tier-1 module's in this
+    // store: they all reach every slot through the same tables.
+    let enter = match caller.get_export(exports::ENTER).and_then(Extern::into_func) {
+        Some(f) => f,
+        None => {
+            let instances = caller.data().jit.as_ref().map(|j| j.instances.clone()).unwrap_or_default();
+            instances
+                .iter()
+                .find_map(|i| i.get_func(&mut *caller, exports::ENTER))
+                .ok_or_else(|| anyhow!("no module in this store exports `enter`"))?
+        }
+    };
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
     let thread = p.thread_by_ctx(ctx_addr).ok_or_else(|| anyhow!("a callback on a thread the NT layer does not know"))?;

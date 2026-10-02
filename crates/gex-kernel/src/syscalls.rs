@@ -23,7 +23,7 @@ use crate::signal::{self, Delivery, SigAction, SigAltStack, Signals};
 use crate::stdio::{StdStream, Stream};
 use crate::vfs::{FileType, ProcSource, Vfs};
 use crate::GuestMem;
-use gex_abi::{ctx, ctx_addr, EXCLUSIVE_SCRATCH};
+use gex_abi::{ctx, ctx_addr};
 use std::sync::{Arc, Mutex};
 
 /// aarch64 syscall numbers (the asm-generic ABI).
@@ -1376,7 +1376,7 @@ impl Kernel {
         let child = ctx_addr(slot);
         // Contexts live in the reserved region below the guest's own memory;
         // running out of slots is a hard limit, not something to paper over.
-        if child + ctx::SIZE as u64 >= EXCLUSIVE_SCRATCH {
+        if child + ctx::SIZE as u64 > gex_abi::CTX_LIMIT {
             return Err(Errno::EAGAIN);
         }
 

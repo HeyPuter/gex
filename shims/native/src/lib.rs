@@ -343,7 +343,83 @@ struct Jit {
     /// Registry entries already instantiated into this store.
     replayed: usize,
     limits: gex_xlate::BlockLimits,
+    /// This store's half of the function tier's whole-image units: made at
+    /// the first one installed here.
+    cgen: CgenStore,
 }
+
+/// Per store (`Jit::cgen`): the body table, the leave body filling it, and
+/// the dispatcher a unit imports as `gexc.dispatch` (docs/function-tier.md
+/// §11).
+#[derive(Default)]
+struct CgenStore {
+    body_table: Option<Table>,
+    /// What fills the body table where no unit has a body (`cgen_leave`).
+    leave: Option<wasmtime::Func>,
+    dispatcher: Option<wasmtime::Func>,
+    /// The dispatcher's `call_known`, a unit's indirect calls.
+    call_known: Option<wasmtime::Func>,
+    /// Where this store's body-table size is recorded (`JitShared::
+    /// body_sizes`, keyed by the thread's context), to take it out again.
+    sizes: Option<(Arc<Mutex<JitShared>>, gex_mem::GuestMemory, u64)>,
+}
+
+impl Drop for CgenStore {
+    fn drop(&mut self) {
+        if let Some((shared, memory, key)) = self.sizes.take() {
+            let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.body_sizes.remove(&key);
+            publish_body_limit(&sh, &memory);
+        }
+    }
+}
+
+/// `gex_abi::BODY_LIMIT` = the smallest body table of any store.
+fn publish_body_limit(sh: &JitShared, memory: &gex_mem::GuestMemory) {
+    let min = sh.body_sizes.values().copied().min().unwrap_or(0).min(u32::MAX as u64) as u32;
+    let off = gex_abi::BODY_LIMIT as usize;
+    let data = memory.bytes();
+    if off + 4 <= data.len() {
+        data[off..off + 4].copy_from_slice(&min.to_le_bytes());
+    }
+}
+
+/// Grow this store's body table (if it has one) to `want` slots and say so
+/// in `BODY_LIMIT`. Every install calls it, tier-1's included: a page tier-1
+/// numbered is one compiled code may call into.
+fn grow_body_table(mut cx: impl wasmtime::AsContextMut<Data = HostState>, want: u64) -> Result<()> {
+    let Some(jit) = cx.as_context().data().jit.as_ref() else { return Ok(()) };
+    let (Some(bt), Some(leave)) = (jit.cgen.body_table, jit.cgen.leave.clone()) else { return Ok(()) };
+    let want = want.min(gex_xlate::PageTable::SLOTS_PER_TABLE as u64);
+    let have = bt.size(cx.as_context_mut());
+    if want > have {
+        bt.grow(cx.as_context_mut(), want - have, wasmtime::Ref::Func(Some(leave))).context("growing the body table")?;
+    }
+    let size = bt.size(cx.as_context_mut());
+    if let Some((shared, memory, key)) = &cx.as_context().data().jit.as_ref().unwrap().cgen.sizes {
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.body_sizes.insert(*key, size);
+        publish_body_limit(&sh, memory);
+    }
+    Ok(())
+}
+
+/// A whole-image function-tier unit's registration (`CompiledUnit::cgen`):
+/// each entry with the table-0 slot dispatch reaches it at, whether it is the
+/// only entry in that slot (x86 slots cover four bytes: a shared one gets
+/// no body and keeps `e_`'s target check), and the C module's export names.
+pub(crate) struct CgenUnit {
+    /// (entry, its index in the unit's entry list, slot, alone in the slot).
+    pub entries: Vec<(u64, u32, u32, bool)>,
+    /// Each entry's `e_` and `ib_` as indices into the unit's own function
+    /// table (`gex_fnref`), read at the first instantiation: the same for
+    /// every instance of the module.
+    pub fnrefs: std::sync::OnceLock<Vec<(u32, u32)>>,
+}
+
+/// Leaves out of the function tier through the body table (an indirect call
+/// to something no unit holds), for GEX_NT_STATS.
+pub(crate) static CGEN_LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One runtime-translated module, kept so another thread's store can
 /// instantiate it rather than translating the same code again.
@@ -352,6 +428,9 @@ struct CompiledUnit {
     exported_blocks: Vec<(u64, String)>,
     dir_entries: Vec<(u64, u32)>,
     table_slots: u64,
+    /// A whole-image function-tier unit, installed by instantiating clang's
+    /// module and writing its entries into the tables (`install_cgen`).
+    cgen: Option<Arc<CgenUnit>>,
 }
 
 /// Runtime translation state shared by every guest thread.
@@ -375,6 +454,12 @@ struct JitShared {
     /// Blocks a publish did not count as translated because their page was
     /// retired after the translation's snapshot (their slots are abandoned).
     stale_blocks: usize,
+    /// The function tier's dispatcher module (`gex_cgen::splice::
+    /// dispatcher_module`), compiled once.
+    dispatcher: Option<Module>,
+    /// Each store's body-table size, by its thread's context address
+    /// (`publish_body_limit`).
+    body_sizes: std::collections::BTreeMap<u64, u64>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -890,6 +975,8 @@ fn run_program_with(
                 remiss: Default::default(),
                 retired_pages: Default::default(),
                 stale_blocks: 0,
+                dispatcher: None,
+                body_sizes: Default::default(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -898,6 +985,7 @@ fn run_program_with(
             instances: Vec::new(),
             replayed: 0,
             limits: xlate.limits,
+            cgen: Default::default(),
         });
     }
     if !aot_shared.is_empty() {
@@ -1661,6 +1749,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             instances: Vec::new(),
             replayed: 0,
             limits: cx.limits,
+            cgen: Default::default(),
         });
     }
     catch_up_table(&mut store)?;
@@ -1811,6 +1900,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             instances: Vec::new(),
             replayed: 0,
             limits: cx.limits,
+            cgen: Default::default(),
         });
     }
 
@@ -3471,6 +3561,7 @@ fn publish_unit(
         exported_blocks: translated.exported_blocks.clone(),
         dir_entries: translated.dir_entries.clone(),
         table_slots: translated.table_slots,
+        cgen: None,
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -3543,6 +3634,10 @@ fn install_unit(
     // the unit carries is a running total and each table's share is that
     // total clamped to its own window. Natively only the first ever has any.
     let per = gex_xlate::PageTable::SLOTS_PER_TABLE as u64;
+    if let Some(cg) = &unit.cgen {
+        return install_cgen(cx, unit, cg, memory, linker, &tables);
+    }
+    grow_body_table(cx.as_context_mut(), unit.table_slots)?;
     let miss = tables[0]
         .get(cx.as_context_mut(), 0)
         .ok_or_else(|| anyhow!("dispatch table is empty"))?;
@@ -3606,6 +3701,209 @@ fn install_unit(
         .instances
         .push(instance);
     Ok(())
+}
+
+/// Publish a whole-image function-tier unit (docs/function-tier.md §11):
+/// give every page holding one of its `entries` a base, mark the entries
+/// translated, and append it to the registry. The caller installs it into
+/// its own store; every other store replays it.
+pub(crate) fn publish_cgen_unit(shared: &Arc<Mutex<JitShared>>, module: Module, entries: &[u64]) -> Result<Arc<CompiledUnit>> {
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let mut new_pages = Vec::new();
+    let mut by_slot: std::collections::BTreeMap<u32, Vec<(u64, u32)>> = std::collections::BTreeMap::new();
+    for (k, &a) in entries.iter().enumerate() {
+        let page = a / gex_abi::DISPATCH_PAGE;
+        let base = match sh.page_table.lookup(page) {
+            Some(b) => b,
+            None => {
+                let b = sh.page_table.base(page);
+                new_pages.push((page, b));
+                b
+            }
+        };
+        if gex_abi::dispatch_entry_table(base) != 0 {
+            bail!("{a:#x}: its page landed in dispatch table {} (natively only table 0 is used)", gex_abi::dispatch_entry_table(base));
+        }
+        by_slot.entry(gex_abi::dispatch_index(a, base) as u32).or_default().push((a, k as u32));
+    }
+    let mut regs = Vec::with_capacity(entries.len());
+    for (slot, mut addrs) in by_slot {
+        addrs.sort_unstable();
+        let alone = addrs.len() == 1;
+        // A shared slot: the first gets the dispatch slot (its target check
+        // hands the others to tier-1's trampoline); none gets a body.
+        regs.push((addrs[0].0, addrs[0].1, slot, alone));
+    }
+    for &(page, base) in &new_pages {
+        sh.slot_owner.insert(base, page);
+    }
+    sh.translated.extend(entries.iter().copied());
+    let unit = Arc::new(CompiledUnit {
+        module,
+        exported_blocks: Vec::new(),
+        dir_entries: new_pages,
+        table_slots: sh.page_table.slots(),
+        cgen: Some(Arc::new(CgenUnit { entries: regs, fnrefs: Default::default() })),
+    });
+    sh.registry.push(Arc::clone(&unit));
+    sh.blocks += entries.len();
+    sh.calls += 1;
+    Ok(unit)
+}
+
+/// Install a whole-image unit into this store: the body table and the
+/// dispatcher the first time, clang's module instantiated against them, its
+/// entries written into the dispatch and body tables, and the directory.
+fn install_cgen(
+    mut cx: impl wasmtime::AsContextMut<Data = HostState>,
+    unit: &CompiledUnit,
+    cg: &CgenUnit,
+    memory: gex_mem::GuestMemory,
+    linker: Linker<HostState>,
+    tables: &[Table],
+) -> Result<()> {
+    let want = unit.table_slots.min(gex_xlate::PageTable::SLOTS_PER_TABLE as u64);
+    let miss = tables[0].get(cx.as_context_mut(), 0).ok_or_else(|| anyhow!("dispatch table is empty"))?;
+    let have = tables[0].size(cx.as_context_mut());
+    if want > have {
+        jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
+        tables[0].grow(cx.as_context_mut(), want - have, miss).context("growing dispatch table 0")?;
+    }
+    let (body_table, dispatcher, call_known) = {
+        let have = cx
+            .as_context()
+            .data()
+            .jit
+            .as_ref()
+            .map(|j| (j.cgen.body_table, j.cgen.dispatcher.clone(), j.cgen.call_known.clone()));
+        match have {
+            Some((Some(b), Some(d), Some(ck))) => (b, d, ck),
+            _ => {
+                let leave = wasmtime::Func::wrap(
+                    cx.as_context_mut(),
+                    |caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> i32 {
+                        cgen_leave(&caller, ctx, ret);
+                        -1
+                    },
+                );
+                let ty = wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None);
+                let b = Table::new(cx.as_context_mut(), ty, wasmtime::Ref::Func(Some(leave.clone())))?;
+                let shared = Arc::clone(&cx.as_context().data().jit.as_ref().unwrap().shared);
+                let dm = {
+                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    match &sh.dispatcher {
+                        Some(m) => m.clone(),
+                        None => {
+                            let m = Module::new(cx.as_context().engine(), gex_cgen::splice::dispatcher_module())
+                                .context("compiling the function tier's dispatcher")?;
+                            sh.dispatcher = Some(m.clone());
+                            m
+                        }
+                    }
+                };
+                let mut dl = linker.clone();
+                dl.allow_shadowing(true);
+                dl.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;
+                for (i, t) in tables.iter().enumerate() {
+                    dl.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::dispatch_table(i), *t)?;
+                }
+                dl.define(cx.as_context_mut(), gex_cgen::splice::DISPATCH_MODULE, gex_cgen::splice::BODY_TABLE, b)?;
+                let di = dl.instantiate(cx.as_context_mut(), &dm).context("instantiating the dispatcher")?;
+                let d = di
+                    .get_func(cx.as_context_mut(), gex_cgen::splice::DISPATCH_NAME)
+                    .ok_or_else(|| anyhow!("the dispatcher exports no dispatch"))?;
+                let ck = di
+                    .get_func(cx.as_context_mut(), gex_cgen::splice::CALL_KNOWN_NAME)
+                    .ok_or_else(|| anyhow!("the dispatcher exports no call_known"))?;
+                let key = cx.as_context().data().thread.ctx_addr;
+                let mut ctxm = cx.as_context_mut();
+                let jit = ctxm.data_mut().jit.as_mut().unwrap();
+                jit.cgen.body_table = Some(b);
+                jit.cgen.leave = Some(leave);
+                jit.cgen.dispatcher = Some(d.clone());
+                jit.cgen.call_known = Some(ck.clone());
+                jit.cgen.sizes = Some((shared, memory.clone(), key));
+                jit.instances.push(di);
+                (b, d, ck)
+            }
+        }
+    };
+    // At least what any page so far is numbered up to, tier-1's included.
+    let all = {
+        let jit = cx.as_context().data().jit.as_ref().unwrap();
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.page_table.slots()
+    };
+    grow_body_table(cx.as_context_mut(), want.max(all))?;
+    let mut l = linker;
+    l.allow_shadowing(true);
+    l.define(cx.as_context_mut(), "env", "memory", memory.shared().clone())?;
+    l.define(cx.as_context_mut(), gex_cgen::splice::DISPATCH_MODULE, gex_cgen::splice::DISPATCH_NAME, dispatcher)?;
+    l.define(cx.as_context_mut(), gex_cgen::splice::DISPATCH_MODULE, gex_cgen::splice::CALL_KNOWN_NAME, call_known)?;
+    jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let instance = l.instantiate(cx.as_context_mut(), &unit.module).context("instantiating a function-tier unit")?;
+    let own = instance
+        .get_table(cx.as_context_mut(), "__indirect_function_table")
+        .ok_or_else(|| anyhow!("the unit exports no function table"))?;
+    if cg.fnrefs.get().is_none() {
+        let fnref = instance
+            .get_typed_func::<u32, u32>(cx.as_context_mut(), "gex_fnref")
+            .context("the unit's gex_fnref")?;
+        let n = cg.entries.iter().map(|e| e.1 + 1).max().unwrap_or(0);
+        let mut refs = vec![(0u32, 0u32); n as usize];
+        for &(_, k, _, _) in &cg.entries {
+            refs[k as usize] = (fnref.call(cx.as_context_mut(), 2 * k)?, fnref.call(cx.as_context_mut(), 2 * k + 1)?);
+        }
+        let _ = cg.fnrefs.set(refs);
+    }
+    let refs = cg.fnrefs.get().unwrap();
+    let get = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, i: u32| -> Result<wasmtime::Ref> {
+        let r = own.get(&mut *cx, i as u64).ok_or_else(|| anyhow!("the unit's table has no index {i}"))?;
+        if r.as_func().map_or(true, |f| f.is_none()) {
+            bail!("the unit's table index {i} holds no function");
+        }
+        Ok(r)
+    };
+    let mut cxm = cx.as_context_mut();
+    for &(_, k, slot, alone) in &cg.entries {
+        let (e, b) = refs[k as usize];
+        let r = get(&mut cxm, e)?;
+        tables[0].set(&mut cxm, slot as u64, r)?;
+        if alone {
+            let r = get(&mut cxm, b)?;
+            body_table.set(&mut cxm, slot as u64, r)?;
+        }
+    }
+    let current: Vec<(u64, u32)> = {
+        let jit = cx.as_context().data().jit.as_ref().unwrap();
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        unit.dir_entries.iter().copied().filter(|&(p, b)| sh.page_table.lookup(p) == Some(b)).collect()
+    };
+    write_dispatch_dir(memory, &current)?;
+    cx.as_context_mut().data_mut().jit.as_mut().unwrap().instances.push(instance);
+    Ok(())
+}
+
+/// The body table's default entry: an indirect call to an address no
+/// installed unit holds. It leaves (-1); under GEX_TRACE each call site
+/// (`ret`, the caller's return address) is said once.
+fn cgen_leave(caller: &Caller<'_, HostState>, ctx: i32, ret: i64) {
+    CGEN_LEAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("GEX_TRACE").is_none() {
+        return;
+    }
+    static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.get_or_insert_with(Default::default).insert(ret as u64) {
+        return;
+    }
+    let target = caller
+        .data()
+        .memory
+        .as_ref()
+        .and_then(|m| GuestMem::new(m.bytes()).read_u64(ctx as u32 as u64 + ctx::PC as u64).ok())
+        .unwrap_or(0);
+    eprintln!("gex-cgen: the call returning to {ret:#x} leaves the function tier for {target:#x} (no unit holds it)");
 }
 
 /// Every dispatch table a translated image module exports, in index order.
@@ -3679,6 +3977,8 @@ fn retire_translations(
             }
         }
     }
+    drop(sh);
+    nt_cgen::on_retire(&memory, ranges);
     if pages > 0 && std::env::var_os("GEX_VERBOSE_OBJECTS").is_some() {
         eprintln!("[gex] retired {pages} dispatch pages the guest unmapped");
     }

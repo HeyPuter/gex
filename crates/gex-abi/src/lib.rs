@@ -551,6 +551,31 @@ pub const EXCLUSIVE_SCRATCH: u64 = RESERVED_END - 64;
 /// low region, never guest-observable.
 pub const SPLIT_LOCK: u64 = RESERVED_END - 128;
 
+/// One bit per dispatch-directory page (bit `page & 7` of byte `page >> 3`),
+/// set by the host once a page's code changed after a function-tier unit was
+/// installed over it (Detours patching a prologue, a JIT rewriting code).
+/// Compiled code checks a callee's entry page before a direct call and leaves
+/// for it when set, so a direct C call never runs a function whose bytes are
+/// no longer the ones it was compiled from. Sticky: tier-1 retranslates the
+/// page, the C stays out. In the reserved low region, above the contexts.
+pub const PATCHED_PAGES: u64 = RESERVED_END - 0x1000 - PATCHED_PAGES_BYTES;
+pub const PATCHED_PAGES_BYTES: u64 = DISPATCH_MAX_PAGES / 8;
+
+/// Function-tier nest exits (a nest root handing control to dispatch), a
+/// plain `u64` counter bumped without atomics: a statistic, for
+/// `GEX_NT_STATS`'s leaves per second.
+pub const NEST_EXITS: u64 = RESERVED_END - 256;
+
+/// How many slots of the function tier's body table every store has (a
+/// `u32`, the smallest over the process's stores): compiled code's indirect
+/// call leaves for a slot at or above it rather than index past a table a
+/// lagging store has not grown yet.
+pub const BODY_LIMIT: u64 = RESERVED_END - 264;
+
+/// Where the thread contexts must end: the runtime's fixed words
+/// ([`PATCHED_PAGES`] up to [`RESERVED_END`]) start here.
+pub const CTX_LIMIT: u64 = PATCHED_PAGES;
+
 /// Address of the context for thread slot `n`.
 ///
 /// Contexts are packed into the reserved low region, one per guest thread.
@@ -784,6 +809,12 @@ mod tests {
         // the fixed non-PIE link address.
         assert!(RESERVED_END <= DISPATCH_DIR);
         assert!(DISPATCH_DIR_END <= EXEC_BASE);
+        // The fixed runtime words above the contexts do not overlap.
+        assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= NEST_EXITS);
+        assert!(NEST_EXITS + 8 <= BODY_LIMIT + 8 && BODY_LIMIT + 4 <= NEST_EXITS);
+        assert!(NEST_EXITS + 8 <= SPLIT_LOCK);
+        assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= BODY_LIMIT);
+        assert!(SPLIT_LOCK + 8 <= EXCLUSIVE_SCRATCH);
         // Every address code may occupy needs a directory entry, including the
         // mmap arena where `ld.so` maps and calls into libraries.
         assert!(DISPATCH_MAX_PAGES * DISPATCH_PAGE >= STACK_TOP);
