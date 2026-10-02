@@ -189,6 +189,10 @@ struct HostState {
     /// The function tier's call-outs in progress on this thread, innermost
     /// last (`call_out`).
     callouts: Vec<Callout>,
+    /// The `enter` of the module this thread's loop started in, for nested
+    /// loops entered from code that has none (a function-tier unit or a
+    /// function JIT module) when no runtime-translated module exists yet.
+    root_enter: Option<wasmtime::Func>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
     /// The host function watched slots hold (`watch_stub`).
@@ -804,6 +808,7 @@ fn run_program_with(
             exit: None,
             resume_at: None,
             callouts: Vec::new(),
+            root_enter: None,
             callout_signal: None,
             watch_stub: None,
             sampler: sampler.clone(),
@@ -1349,6 +1354,7 @@ fn run_thread_loop(
     let enter = instance
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
+    store.data_mut().root_enter = Some(enter.clone());
     let mut pc = entry;
     loop {
         let result = enter.call(
@@ -1616,6 +1622,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             exit: None,
             resume_at: None,
             callouts: Vec::new(),
+            root_enter: None,
             callout_signal: None,
             watch_stub: None,
             sampler: cx.sampler.clone(),
@@ -1765,6 +1772,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             exit: None,
             resume_at: None,
             callouts: Vec::new(),
+            root_enter: None,
             callout_signal: None,
             watch_stub: None,
             sampler: cx.sampler.clone(),
@@ -2680,19 +2688,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     tid,
                     clear_child_tid,
                 } => {
-                    // Starting the thread here would mean spawning from
-                    // inside a wasm frame; record it and let the run loop do
-                    // it between calls, where nothing is borrowed.
-                    state.pending_spawn = Some(ThreadState {
-                        ctx_addr,
-                        tid,
-                        clear_child_tid,
-                    });
-                    state.resume_at = Some(
-                        gm.read_u64(state.thread.ctx_addr + ctx::PC as u64)
-                            .unwrap_or(0),
-                    );
-                    Err(StopExecution.into())
+                    // Started here, and the caller carries on (the child
+                    // gets a store of its own; nothing of this one is
+                    // borrowed). Leaving for the run loop would unwind every
+                    // wasm frame, which under the function table means every
+                    // caller resumes at an interior address.
+                    let cx = state.spawn.clone().ok_or_else(|| anyhow!("clone with no spawn context"))?;
+                    start_guest_thread(cx, ThreadState { ctx_addr, tid, clear_child_tid })?;
+                    Ok(())
                 }
                 SyscallOutcome::Blocking(_) => {
                     unreachable!("a blocking syscall was already completed")
@@ -3910,6 +3913,21 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
     Ok(())
 }
 
+/// An `enter` that reaches every slot: the calling module's, or -- when the
+/// call came from code that has none (a function-tier unit, a function JIT
+/// module) -- any tier-1 module's in this store, or the thread loop's root
+/// module's. They all reach every slot through the same tables.
+pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::Func> {
+    if let Some(f) = caller.get_export(exports::ENTER).and_then(Extern::into_func) {
+        return Some(f);
+    }
+    let instances = caller.data().jit.as_ref().map(|j| j.instances.clone()).unwrap_or_default();
+    instances
+        .iter()
+        .find_map(|i| i.get_func(&mut *caller, exports::ENTER))
+        .or_else(|| caller.data().root_enter.clone())
+}
+
 /// `gex.call_out` (docs/function-tier.md §7.3): run the guest from `target`
 /// until it returns to `ret` with the stack pointer at `sp_want` (or what a
 /// callee popped above it), then let the C caller carry on (1); 0 when that
@@ -3918,16 +3936,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     if caller.data().callouts.len() >= CALLOUT_MAX_DEPTH || caller.data().jit.is_none() {
         return Ok(0);
     }
-    let enter = match caller.get_export(exports::ENTER).and_then(Extern::into_func) {
-        Some(f) => f,
-        None => {
-            let instances = caller.data().jit.as_ref().map(|j| j.instances.clone()).unwrap_or_default();
-            match instances.iter().find_map(|i| i.get_func(&mut *caller, exports::ENTER)) {
-                Some(f) => f,
-                None => return Ok(0),
-            }
-        }
-    };
+    let Some(enter) = any_enter(caller) else { return Ok(0) };
     CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;

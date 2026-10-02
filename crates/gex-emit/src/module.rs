@@ -1218,15 +1218,15 @@ impl ModuleBuilder {
         let page = f.add_local(ValType::I64);
 
         // Record the entry PC so a miss inside `enter` reports it correctly,
-        // and the exact target for a shared slot's trampoline (x86-64).
+        // and the exact target: for a shared slot's trampoline (x86-64), and
+        // for the function table's bridge (merge-plan §9.8.1), which serves
+        // the address dispatch was asked for (`LAST_TARGET`) on any guest.
         f.local_get(0);
         f.local_get(1);
         f.store(0x37, 3, ctx::PC as u32);
-        if gex_abi::X86 {
-            f.local_get(0);
-            f.local_get(1);
-            f.store(0x37, 3, ctx::LAST_TARGET as u32);
-        }
+        f.local_get(0);
+        f.local_get(1);
+        f.store(0x37, 3, ctx::LAST_TARGET as u32);
 
         let entry = f.add_local(ValType::I32);
         let index = f.add_local(ValType::I32);

@@ -21,6 +21,8 @@ use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT,
 use gex_ir::*;
 use std::collections::HashMap;
 
+pub mod fmode;
+
 /// SIMD sub-opcodes (the 0xFD prefix space).
 mod simd {
     pub const V128_LOAD: u32 = 0x00;
@@ -515,6 +517,22 @@ struct Emitter<'a> {
     /// Which registers the region writes, and so has to store on the way out.
     /// The ones it only reads are already correct in the context.
     region_writes: std::collections::HashSet<GuestReg>,
+    /// Function mode (`fmode`, the function JIT): every register the
+    /// function uses has a local for its whole body, bound up front, and a
+    /// clobbering host call reloads them all rather than forgetting them.
+    func_regs: Option<Vec<GuestReg>>,
+    /// Function mode: the local the next `def` leaves its value in (a
+    /// register's, when a `WriteReg` of the value follows at once). Taken
+    /// by `def`'s common tail; left set by a definition that has no local.
+    def_into: Option<u32>,
+    /// Function mode: the next `def` (an FP operation or a lane extract)
+    /// keeps its value as a float, for float consumers only (`value_fp`).
+    fp_result: bool,
+    /// Function mode: values held as floats rather than their bit pattern:
+    /// `Some(double)`. Read as integers they are reinterpreted.
+    value_fp: Vec<Option<bool>>,
+    free_f32: Vec<u32>,
+    free_f64: Vec<u32>,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -529,7 +547,12 @@ struct RegionState {
 
 impl<'a> Emitter<'a> {
     fn new(cx: &'a Context<'a>, block_start: u64) -> Emitter<'a> {
-        let mut f = FuncBody::new(1);
+        Self::with_params(cx, block_start, 1)
+    }
+
+    /// An emitter for a function of `n_params` parameters, `ctx` first.
+    fn with_params(cx: &'a Context<'a>, block_start: u64, n_params: u32) -> Emitter<'a> {
+        let mut f = FuncBody::new(n_params);
         let scratch_i64 = f.add_local(ValType::I64);
         let scratch_i32 = f.add_local(ValType::I32);
         let scratch_page = f.add_local(ValType::I64);
@@ -556,6 +579,12 @@ impl<'a> Emitter<'a> {
             reenter_local: None,
             region: None,
             region_writes: Default::default(),
+            func_regs: None,
+            def_into: None,
+            fp_result: false,
+            value_fp: Vec::new(),
+            free_f32: Vec::new(),
+            free_f64: Vec::new(),
         }
     }
 
@@ -918,10 +947,12 @@ impl<'a> Emitter<'a> {
             return;
         }
         if let Some(local) = self.value_local[idx].take() {
-            match self.value_ty[idx] {
-                Ty::I32 => self.free_i32.push(local),
-                Ty::I64 => self.free_i64.push(local),
-                Ty::V128 => self.free_v128.push(local),
+            match (self.value_fp.get(idx).copied().flatten(), self.value_ty[idx]) {
+                (Some(true), _) => self.free_f64.push(local),
+                (Some(false), _) => self.free_f32.push(local),
+                (None, Ty::I32) => self.free_i32.push(local),
+                (None, Ty::I64) => self.free_i64.push(local),
+                (None, Ty::V128) => self.free_v128.push(local),
             }
         }
     }
@@ -930,7 +961,12 @@ impl<'a> Emitter<'a> {
     fn push(&mut self, v: Value) {
         let idx = v.0 as usize;
         match self.value_local.get(idx).copied().flatten() {
-            Some(l) => self.f.local_get(l),
+            Some(l) => {
+                self.f.local_get(l);
+                if let Some(d) = self.value_fp.get(idx).copied().flatten() {
+                    self.reinterpret_from_fp(d);
+                }
+            }
             None => {
                 // A value with no local is either a folded constant or a bug
                 // in liveness; constants are re-materialised inline, which is
@@ -1041,6 +1077,7 @@ impl<'a> Emitter<'a> {
         if let Some(c) = self.regs.get(&r) {
             return c.local;
         }
+        assert!(self.func_regs.is_none(), "function mode: {r:?} has no local (not in the used set)");
         let ty = r.ty();
         let local = self.f.add_local(val_type(ty));
         let before = self.f.code.len();
@@ -1202,6 +1239,12 @@ impl<'a> Emitter<'a> {
     /// Forget every cached register, forcing later reads to reload. Used
     /// after a host call that can rewrite guest state.
     fn invalidate(&mut self) {
+        if let Some(used) = self.func_regs.take() {
+            // Function mode: the locals are the function's, so reload them.
+            self.reload(&used);
+            self.func_regs = Some(used);
+            return;
+        }
         self.regs.clear();
     }
 
@@ -2229,6 +2272,9 @@ impl<'a> Emitter<'a> {
         let ty = expr.ty();
         let idx = dst.0 as usize;
         self.value_ty[idx] = ty;
+        if let Some(f) = self.value_fp.get_mut(idx) {
+            *f = None;
+        }
 
         match expr {
             Expr::ConstI32(c) => {
@@ -2514,6 +2560,14 @@ impl<'a> Emitter<'a> {
                 ty,
             } => {
                 self.push(*a);
+                if self.fp_result && matches!((lane_bytes, ty), (8, Ty::I64) | (4, Ty::I32)) {
+                    // f64x2.extract_lane / f32x4.extract_lane: the float
+                    // never goes through an integer register.
+                    let double = *lane_bytes == 8;
+                    self.f.simd_lane(if double { 0x21 } else { 0x1f }, *lane as u8);
+                    self.keep_fp(dst, double);
+                    return;
+                }
                 let sub = match (lane_bytes, signed) {
                     (1, true) => simd::I8X16_EXTRACT_LANE_S,
                     (1, false) => simd::I8X16_EXTRACT_LANE_U,
@@ -2542,6 +2596,16 @@ impl<'a> Emitter<'a> {
                 val,
             } => {
                 self.push(*a);
+                let fp = self.value_fp.get(val.0 as usize).copied().flatten();
+                if matches!((lane_bytes, fp), (8, Some(true)) | (4, Some(false))) {
+                    // f64x2.replace_lane / f32x4.replace_lane from a float.
+                    self.push_fp(*val, *lane_bytes == 8);
+                    self.f.simd_lane(if *lane_bytes == 8 { 0x22 } else { 0x20 }, *lane as u8);
+                    let local = self.alloc(ty);
+                    self.f.local_set(local);
+                    self.value_local[idx] = Some(local);
+                    return;
+                }
                 self.push(*val);
                 let sub = match lane_bytes {
                     1 => simd::I8X16_REPLACE_LANE,
@@ -2553,10 +2617,8 @@ impl<'a> Emitter<'a> {
             }
 
             Expr::FpBin { op, double, a, b } => {
-                self.push(*a);
-                self.reinterpret_to_fp(*double);
-                self.push(*b);
-                self.reinterpret_to_fp(*double);
+                self.push_fp(*a, *double);
+                self.push_fp(*b, *double);
                 let base: u8 = match op {
                     FpBinOp::Add => 0x92,
                     FpBinOp::Sub => 0x93,
@@ -2568,11 +2630,13 @@ impl<'a> Emitter<'a> {
                 };
                 // The f64 arithmetic block sits 14 opcodes after the f32 one.
                 self.f.byte(if *double { base + 0x0e } else { base });
+                if self.keep_fp(dst, *double) {
+                    return;
+                }
                 self.reinterpret_from_fp(*double);
             }
             Expr::FpUn { op, double, a } => {
-                self.push(*a);
-                self.reinterpret_to_fp(*double);
+                self.push_fp(*a, *double);
                 let base: u8 = match op {
                     FpUnOp::Abs => 0x8b,
                     FpUnOp::Neg => 0x8c,
@@ -2583,13 +2647,14 @@ impl<'a> Emitter<'a> {
                     FpUnOp::Sqrt => 0x91,
                 };
                 self.f.byte(if *double { base + 0x0e } else { base });
+                if self.keep_fp(dst, *double) {
+                    return;
+                }
                 self.reinterpret_from_fp(*double);
             }
             Expr::FpCmp { op, double, a, b } => {
-                self.push(*a);
-                self.reinterpret_to_fp(*double);
-                self.push(*b);
-                self.reinterpret_to_fp(*double);
+                self.push_fp(*a, *double);
+                self.push_fp(*b, *double);
                 let base: u8 = match op {
                     FpCmpOp::Eq => 0x5b,
                     FpCmpOp::Ne => 0x5c,
@@ -2605,11 +2670,15 @@ impl<'a> Emitter<'a> {
                 src_wide,
                 dst_wide,
                 a,
-            } => self.emit_fp_convert(*kind, *src_wide, *dst_wide, *a),
+            } => {
+                if self.emit_fp_convert(*kind, *src_wide, *dst_wide, *a) && self.keep_fp(dst, *dst_wide) {
+                    return;
+                }
+            }
         }
 
         // Everything that reaches here left one value on the stack.
-        let local = self.alloc(ty);
+        let local = self.def_into.take().unwrap_or_else(|| self.alloc(ty));
         self.f.local_set(local);
         self.value_local[idx] = Some(local);
     }
@@ -2697,13 +2766,18 @@ impl<'a> Emitter<'a> {
         self.f.byte(if double { 0xbd } else { 0xbc });
     }
 
-    fn emit_fp_convert(&mut self, kind: FpConvert, src_wide: bool, dst_wide: bool, a: Value) {
+    /// The conversion, its result as an integer (bit pattern) unless it
+    /// is a float `def` keeps as one (`fp_result`): then `true`, the float
+    /// on the stack.
+    fn emit_fp_convert(&mut self, kind: FpConvert, src_wide: bool, dst_wide: bool, a: Value) -> bool {
         match kind {
             FpConvert::FpToFp => {
-                self.push(a);
-                self.reinterpret_to_fp(src_wide);
+                self.push_fp(a, src_wide);
                 // f32.demote_f64 / f64.promote_f32
                 self.f.byte(if dst_wide { 0xbb } else { 0xb6 });
+                if self.fp_result {
+                    return true;
+                }
                 self.reinterpret_from_fp(dst_wide);
             }
             FpConvert::IntToFp { signed } => {
@@ -2719,11 +2793,13 @@ impl<'a> Emitter<'a> {
                     (true, true, false) => 0xba,   // f64.convert_i64_u
                 };
                 self.f.byte(op);
+                if self.fp_result {
+                    return true;
+                }
                 self.reinterpret_from_fp(dst_wide);
             }
             FpConvert::FpToInt { signed } => {
-                self.push(a);
-                self.reinterpret_to_fp(src_wide);
+                self.push_fp(a, src_wide);
                 // The *saturating* conversions, because AArch64's FCVTZ*
                 // clamps out-of-range values and maps NaN to zero, while the
                 // trapping forms would abort the guest.
@@ -2741,6 +2817,38 @@ impl<'a> Emitter<'a> {
                 self.f.u32(sub);
             }
         }
+        false
+    }
+
+    /// Push `v` as a float (`f64` when `double`).
+    fn push_fp(&mut self, v: Value, double: bool) {
+        let idx = v.0 as usize;
+        if self.value_fp.get(idx).copied().flatten() == Some(double) {
+            if let Some(l) = self.value_local[idx] {
+                self.f.local_get(l);
+                return;
+            }
+        }
+        self.push(v);
+        self.reinterpret_to_fp(double);
+    }
+
+    /// Function mode: when `fp_result` is set, take the float on the stack
+    /// as `dst`'s value, kept as a float, and say so.
+    fn keep_fp(&mut self, dst: Value, double: bool) -> bool {
+        if !std::mem::take(&mut self.fp_result) {
+            return false;
+        }
+        let idx = dst.0 as usize;
+        let pool = if double { &mut self.free_f64 } else { &mut self.free_f32 };
+        let local = match pool.pop() {
+            Some(l) => l,
+            None => self.f.add_local(if double { ValType::F64 } else { ValType::F32 }),
+        };
+        self.f.local_set(local);
+        self.value_local[idx] = Some(local);
+        self.value_fp[idx] = Some(double);
+        true
     }
 
     /// Push a `ty`-typed constant.
@@ -4825,6 +4933,12 @@ pub static REG_TRAFFIC: std::sync::Mutex<Option<HashMap<GuestReg, usize>>> =
     std::sync::Mutex::new(None);
 
 fn note_traffic(r: GuestReg) {
+    // Only `gexc` reads it, under the variable: a lock per register load and
+    // store is otherwise a translation cost for nothing.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("GEX_REG_HISTOGRAM").is_some()) {
+        return;
+    }
     let mut t = REG_TRAFFIC.lock().unwrap_or_else(|e| e.into_inner());
     *t.get_or_insert_with(HashMap::new).entry(r).or_default() += 1;
 }

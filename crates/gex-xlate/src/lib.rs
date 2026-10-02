@@ -46,6 +46,8 @@ pub mod profile;
 pub use intrinsic::Intrinsic;
 
 pub mod ehframe;
+#[cfg(feature = "fjit")]
+pub mod fjit;
 pub mod func;
 pub mod jumptable;
 pub mod summary;
@@ -122,6 +124,14 @@ pub struct Options {
     /// spliced into the tier-1 module (`gex-cgen`, docs/function-tier.md).
     /// Needs the `cgen` feature; runtime translation stays tier-1.
     pub cgen: bool,
+    /// The function JIT (`gex-fjit`, docs/merge-plan.md §9.8): every
+    /// recovered function emitted as wasm directly, no clang, and spliced
+    /// into the tier-1 module as `cgen` is. Needs the `fjit` feature.
+    pub fjit: bool,
+    /// Translate nothing ahead of time: the module is `enter` and the miss
+    /// stubs, and every address reaches the runtime (`gexc run --fjit`,
+    /// where the function table's translator serves misses).
+    pub no_blocks: bool,
 }
 
 impl Default for Options {
@@ -142,6 +152,8 @@ impl Default for Options {
             linkage: Linkage::Own,
             first_slot: 0,
             cgen: false,
+            fjit: false,
+            no_blocks: false,
         }
     }
 }
@@ -371,6 +383,9 @@ impl Phases {
 /// is left to the caller: [`translate_image`] builds one module, and
 /// [`translate_image_split`] builds several when the object is too big for one.
 fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
+    if opts.no_blocks {
+        return (Vec::new(), Stats::default());
+    }
     let mut phases = Phases::start();
     let view = CodeView::new(image);
     let mut stats = Stats::default();
@@ -670,7 +685,7 @@ pub fn translate_pe_image(image: &Image, seeds: &func::PeSeeds, opts: &Options) 
 }
 
 fn translate_image_seeded(image: &Image, pe: Option<&func::PeSeeds>, opts: &Options) -> (TranslatedModule, Stats) {
-    if let Some(why) = cgen_conflict(opts.cgen, profile::enabled()) {
+    if let Some(why) = cgen_conflict(opts.cgen || opts.fjit, profile::enabled()) {
         panic!("{why}");
     }
     let (collected, mut stats) = image_blocks(image, opts);
@@ -678,13 +693,15 @@ fn translate_image_seeded(image: &Image, pe: Option<&func::PeSeeds>, opts: &Opti
     let mut cgen: Vec<(Block, u32)> = Vec::new();
     for block in collected {
         let f = builder.reserve(block.start);
-        if opts.cgen {
+        if opts.cgen || opts.fjit {
             cgen.push((block.clone(), f));
         }
         builder.add_block(block);
     }
     let mut module = builder.finish();
-    if opts.cgen {
+    if opts.fjit {
+        module.wasm = fjit_splice(&module.wasm, &cgen, image, pe, opts);
+    } else if opts.cgen {
         module.wasm = cgen_splice(&module.wasm, &cgen, image, pe, opts);
     }
     stats.wasm_bytes = module.wasm.len();
@@ -739,6 +756,56 @@ fn cgen_splice(
         Ok((w, _)) => w,
         Err(e) => panic!("function tier (--cgen): {e:#}"),
     }
+}
+
+/// The function JIT's version of a tier-1 module (`Options::fjit`): S2's
+/// recovery and summaries as for `cgen_splice`, emitted by `gex-fjit`. Loud
+/// on failure, as that is.
+#[cfg(feature = "fjit")]
+fn fjit_splice(
+    wasm: &[u8],
+    blocks: &[(Block, u32)],
+    image: &Image,
+    pe: Option<&func::PeSeeds>,
+    opts: &Options,
+) -> Vec<u8> {
+    let refs: Vec<(&Block, u32)> = blocks.iter().map(|(b, f)| (b, *f)).collect();
+    let ropts = func::RecoverOptions {
+        limits: opts.limits,
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let prog = match pe {
+        Some(seeds) => func::recover_pe(image, seeds, &ropts),
+        None => func::recover(image, None, &ropts),
+    };
+    let summaries = summary::analyze(&prog).map;
+    if std::env::var_os("GEX_FJIT_STATS").is_some() {
+        eprintln!(
+            "[fjit] recovery and summaries: {:.1} ms, {} functions",
+            started.elapsed().as_secs_f64() * 1e3,
+            prog.functions.len()
+        );
+    }
+    let mut functions: Vec<_> = prog.functions.into_values().collect();
+    if opts.seeds_only {
+        let keep: HashSet<u64> = opts.extra_entries.iter().copied().collect();
+        functions.retain(|f| keep.contains(&f.entry));
+    }
+    let intrinsics: Vec<u64> = opts.intrinsics.keys().copied().collect();
+    let byte = |a: u64| {
+        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+    };
+    let pops = fjit::ret_pops(&functions, image.class32, &byte);
+    match gex_fjit::build(wasm, &refs, functions, &intrinsics, &summaries, image.class32, &pops) {
+        Ok((w, _)) => w,
+        Err(e) => panic!("function JIT (--fjit): {e:#}"),
+    }
+}
+
+#[cfg(not(feature = "fjit"))]
+fn fjit_splice(_: &[u8], _: &[(Block, u32)], _: &Image, _: Option<&func::PeSeeds>, _: &Options) -> Vec<u8> {
+    panic!("Options::fjit is set, but gex-xlate was built without the `fjit` feature")
 }
 
 #[cfg(not(feature = "cgen"))]

@@ -186,7 +186,7 @@ impl Unit {
 /// Function mode (Phase B): every register the function touches is a C
 /// local for the whole function, loaded at entry and after anything that may
 /// change guest state, and written back at every point control can leave.
-pub(crate) struct FnRegs {
+pub struct FnRegs {
     /// Read or written anywhere: loaded on entry and reloaded after calls.
     pub used: BTreeSet<GuestReg>,
     /// Written anywhere: stored back before control can leave.
@@ -1659,7 +1659,7 @@ pub fn lane_un_name(op: VLaneUnOp, lane: VLane) -> Result<String> {
 
 /// Whether a statement is a host call that can change guest state, so the
 /// function tier writes back before it and reloads after.
-pub(crate) fn clobbers(s: &Stmt) -> bool {
+pub fn clobbers(s: &Stmt) -> bool {
     match s {
         Stmt::HostCall { func, .. } => func.clobbers_guest_state(),
         Stmt::Def {

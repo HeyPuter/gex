@@ -17,6 +17,7 @@ gex-lift-ppc = { workspace = true, optional = true }
 gex-emit.workspace = true
 gex-ld.workspace = true
 gex-cgen = { workspace = true, optional = true }
+gex-fjit = { workspace = true, optional = true }
 
 [features]
 # Lift blocks on every core. Off for the browser shim, which reaches this
@@ -30,3 +31,5 @@ ppc = ["gex-abi/ppc", "dep:gex-isa-ppc", "dep:gex-lift-ppc"]
 # The function tier (`Options::cgen`): C through clang, spliced into the
 # tier-1 module. Needs clang and wasm-ld at translation time, so native only.
 cgen = ["dep:gex-cgen"]
+# The function JIT (`Options::fjit`): GIR straight to wasm, no toolchain.
+fjit = ["dep:gex-fjit"]

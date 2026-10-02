@@ -421,10 +421,12 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
             Err(StopExecution.into())
         }
         nt::Outcome::SpawnThread { ctx_addr: child, gex_tid } => {
-            // Started by the run loop between calls, as a Linux clone is.
-            state.pending_spawn = Some(ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 });
-            state.resume_at = Some(resume_pc());
-            Err(StopExecution.into())
+            // Started here, and the caller carries on: leaving for the run
+            // loop would unwind every wasm frame, which under the function
+            // table means every caller resumes at an interior address.
+            let cx = state.spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
+            super::start_guest_thread(cx, ThreadState { ctx_addr: child, tid: gex_tid, clear_child_tid: 0 })?;
+            Ok(())
         }
         // The result is with the thread; unwinding here ends the innermost
         // nested loop (`CallerHost::run_callback`).
@@ -495,19 +497,7 @@ impl nt::NtHost for CallerHost<'_, '_> {
 /// code at the context's pc, follow redirects, and stop at the thread's
 /// `NtCallbackReturn`.
 fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Result<()> {
-    // The calling module's `enter`, or -- when the call came from a
-    // function-tier unit, which has none -- any tier-1 module's in this
-    // store: they all reach every slot through the same tables.
-    let enter = match caller.get_export(exports::ENTER).and_then(Extern::into_func) {
-        Some(f) => f,
-        None => {
-            let instances = caller.data().jit.as_ref().map(|j| j.instances.clone()).unwrap_or_default();
-            instances
-                .iter()
-                .find_map(|i| i.get_func(&mut *caller, exports::ENTER))
-                .ok_or_else(|| anyhow!("no module in this store exports `enter`"))?
-        }
-    };
+    let enter = crate::any_enter(caller).ok_or_else(|| anyhow!("no module in this store exports `enter`"))?;
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
     let thread = p.thread_by_ctx(ctx_addr).ok_or_else(|| anyhow!("a callback on a thread the NT layer does not know"))?;
