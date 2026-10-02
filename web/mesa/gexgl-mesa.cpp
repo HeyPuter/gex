@@ -481,6 +481,7 @@ static bool gexgl_negative_count(GLsizei n, Fn call)
 
 gexgl_pixel_store pack_store = gexgl_default_pixel_store();
 gexgl_pixel_store unpack_store = gexgl_default_pixel_store();
+#include "gexgl-compat-host.h"
 
 int get_frontend_param(struct pipe_frontend_screen* fscreen,
                        enum st_manager_param param) {
@@ -1591,6 +1592,21 @@ uint32_t uniform_components(GLuint program, GLint location) {
     }
 }
 
+/* For the generated compatibility-profile cases (gexgl-compat-host.h). */
+#define GEXGEN_NAME(kind, name) lookup(kind, name)
+void* gexgen_proc(const char* name, const char* alias) {
+    void* f = reinterpret_cast<void*>(_mesa_glapi_get_proc_address(name));
+    if (!f && alias) f = reinterpret_cast<void*>(_mesa_glapi_get_proc_address(alias));
+    return f;
+}
+void gexgen_missing(const char* name) {
+    static std::unordered_set<std::string> said;
+    if (said.insert(name).second)
+        fprintf(stderr, "gexgl: Mesa has no %s; the call does nothing\n", name);
+}
+
+#include "gl-compat-generated-decoders.inc"
+
 bool one(uint32_t op, Reader& a) {
     switch (op) {
     case CONTEXT_CREATE: {
@@ -2497,6 +2513,7 @@ bool one(uint32_t op, Reader& a) {
     case PUSH_ATTRIB: glPushAttrib(a.u32()); break;
     case POP_ATTRIB: glPopAttrib(); break;
 #include "gl44-generated-cases.inc"
+#include "gl-compat-generated-cases.inc"
     default:
         /* Named, once. A command the host does not know aborts the whole
          * batch -- the guest discards every queued byte, including the

@@ -751,10 +751,23 @@ impl Gl {
     /// Run one batch. Returns the reply and, if the stream was malformed,
     /// where and why.
     pub fn run(&mut self, batch: &[u8]) -> (Reply, u32, u32) {
-        let mut reply = Reply::default();
         if self.make_current().is_err() {
-            return (reply, error::NO_CONTEXT, 0);
+            return (Reply::default(), error::NO_CONTEXT, 0);
         }
+        let r = self.run_current(batch);
+        // Released after every batch: a guest may submit from any of its
+        // threads (wined3d's command stream thread and the main one), and a
+        // context still current on one thread cannot be made current on
+        // another. Batches are already serialized by the device.
+        unsafe {
+            eglMakeCurrent(self.display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        }
+        self.current_on = None;
+        r
+    }
+
+    fn run_current(&mut self, batch: &[u8]) -> (Reply, u32, u32) {
+        let mut reply = Reply::default();
         let mut commands = Commands::new(batch);
         let mut index = 0u32;
         loop {
@@ -939,6 +952,7 @@ impl Gl {
                     if let (Some(p), Some(v)) = (a.u32(), a.i32()) {
                         glPixelStorei(p, v);
                         set_pixel_store(&mut self.pack_store, &mut self.unpack_store, p, v);
+                        native::gexgl_native_pixel_store(p, v);
                     }
                 }
 
@@ -1007,6 +1021,7 @@ impl Gl {
                     };
                     let real = glCreateShader(ty);
                     self.names.shaders.insert(name, real);
+                    native::gexgl_native_name(0, name, real);
                 }
                 op::SHADER_SOURCE => {
                     let (Some(name), Some(src)) = (a.u32(), a.blob()) else {
@@ -1027,6 +1042,7 @@ impl Gl {
                 op::DELETE_SHADER => {
                     if let Some(n) = a.u32() {
                         if let Some(real) = self.names.shaders.remove(&n) {
+                            native::gexgl_native_name(0, n, 0);
                             glDeleteShader(real);
                         }
                     }
@@ -1035,6 +1051,7 @@ impl Gl {
                     if let Some(name) = a.u32() {
                         let real = glCreateProgram();
                         self.names.programs.insert(name, real);
+                        native::gexgl_native_name(1, name, real);
                     }
                 }
                 op::ATTACH_SHADER => {
@@ -1069,6 +1086,7 @@ impl Gl {
                 op::DELETE_PROGRAM => {
                     if let Some(n) = a.u32() {
                         if let Some(real) = self.names.programs.remove(&n) {
+                            native::gexgl_native_name(1, n, 0);
                             glDeleteProgram(real);
                         }
                     }
@@ -1555,10 +1573,30 @@ impl Gl {
                         _ => return false,
                     }
                 }
-                _ => return false,
+                // The generated commands (GL 4.4 and the registry's
+                // compatibility profile) are decoded by the C++ shared with
+                // the browser's host.
+                _ => {
+                    let (mut out, mut len) = (std::ptr::null(), 0usize);
+                    if native::gexgl_native_one(opcode, body.as_ptr(), body.len(), &mut out, &mut len) != 1 {
+                        return false;
+                    }
+                    if len > 0 {
+                        reply.bytes.extend_from_slice(std::slice::from_raw_parts(out, len));
+                    }
+                }
             }
         }
         true
+    }
+}
+
+/// native/gexgl-native.cpp (built by build.rs).
+mod native {
+    extern "C" {
+        pub fn gexgl_native_one(op: u32, body: *const u8, len: usize, reply: *mut *const u8, reply_len: *mut usize) -> i32;
+        pub fn gexgl_native_pixel_store(pname: u32, param: i32);
+        pub fn gexgl_native_name(kind: u32, guest: u32, host: u32);
     }
 }
 

@@ -156,7 +156,9 @@ impl GlDevice {
             }
             // No GL is reported in the header, not as a failed ioctl, so the
             // guest falls back as it would for a driver that refused to load.
-            Err(_) => {
+            Err(e) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| eprintln!("gex-gl: no host GL context: {e}"));
                 write_status(m, ring, error::NO_CONTEXT, 0, 0)?;
                 return Ok(0);
             }

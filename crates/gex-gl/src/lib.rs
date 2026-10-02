@@ -3,6 +3,7 @@
 //! See [`proto`] for why the split is at the API rather than at a virtual
 //! GPU, and [`host`] for what runs the commands.
 
+pub mod compat_plans;
 pub mod proto;
 pub mod trace;
 
