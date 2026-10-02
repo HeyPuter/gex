@@ -78,6 +78,10 @@ mod stub {
         gex_abi::MMAP_TOP
     }
 
+    pub(crate) fn slot_log() -> bool {
+        false
+    }
+
     /// The glue's nested callback loop asks this; with no Windows process
     /// that loop never runs, but the export has to exist for the glue check.
     #[no_mangle]
@@ -227,12 +231,55 @@ mod imp {
         let taken = ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
         let host_lo = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
         let host_hi = taken.max(gex_abi::ARENA_BOTTOM).min(NT_HEAP_BASE);
+        crate::memmap::claim(crate::memmap::Kind::Guest, 0, host_hi, NT_HEAP_BASE, "Windows address space");
 
         let var = |name: &str| {
             env.iter().find_map(|kv| kv.strip_prefix(name).and_then(|r| r.strip_prefix('=')).map(str::to_string))
         };
         let flag = |name: &str| var(name).is_some_and(|v| !v.is_empty() && v != "0");
         STATS.store(flag("GEX_NT_STATS"), Ordering::Relaxed);
+        // GEX_NT_PEEK=<hex>[*]: a guest word reported on the stats line, read
+        // through a pointer with `*` (as natively).
+        if let Some(v) = var("GEX_NT_PEEK") {
+            let (a, deref) = match v.strip_suffix('*') {
+                Some(a) => (a, true),
+                None => (v.as_str(), false),
+            };
+            if let Ok(a) = u64::from_str_radix(a.trim_start_matches("0x"), 16) {
+                PEEK.store(a << 1 | deref as u64, Ordering::Relaxed);
+            }
+        }
+        if flag("GEX_NT_MAP") || flag("GEX_NT_TRACE") {
+            crate::memmap::print();
+        }
+        TRACE_FOREIGN.store(flag("GEX_NT_TRACE") || flag("GEX_NT_FOREIGN_TRACE"), Ordering::Relaxed);
+        if flag("GEX_NT_ARENA_SELFTEST") {
+            warn_line(&format!("gex-nt: arena self-check: {}\n", crate::arena_selftest()));
+        }
+        NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
+        if let Some(a) = var("GEX_NT_WATCH_ALLOC").and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+            crate::WATCH_ALLOC.store(a, Ordering::Relaxed);
+        }
+        // A Windows process owns the low 2 GiB and the shim's heap is above
+        // it, in the same memory: a guest access above is made a fault, as an
+        // unallocated address is on Windows, rather than a write into the
+        // runtime (natively it would land in nothing). GEX_NT_GUARD_2G=0 to
+        // compare.
+        if var("GEX_NT_GUARD_2G").as_deref() != Some("0") {
+            gex_xlate::set_guard_limit(NT_HEAP_BASE);
+        }
+        SLOT_LOG.store(flag("GEX_NT_SLOT_LOG"), Ordering::Relaxed);
+        VERIFY_REGISTRY.store(flag("GEX_NT_VERIFY_REGISTRY"), Ordering::Relaxed);
+        RETIRE_LOG.store(flag("GEX_NT_RETIRE_LOG"), Ordering::Relaxed);
+        // GEX_NT_TRAP_PCS=<hex>,<hex>: block entries that note the thread's
+        // registers in its ring, for an execute fault's report.
+        if let Some(v) = var("GEX_NT_TRAP_PCS") {
+            for a in v.split(['+', ' ', ';']) {
+                if let Ok(a) = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16) {
+                    gex_xlate::add_trap_pc(a);
+                }
+            }
+        }
         if let Some(s) = var("GEX_NT_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
             TIME_SCALE.store(s.to_bits(), Ordering::Relaxed);
         }
@@ -397,6 +444,25 @@ mod imp {
     /// `GEX_NT_STATS`: once a (real) second, the native shim's
     /// `gex-nt: stats t=<ms> presents=<n>` line, on the console.
     static STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// `GEX_NT_PEEK`'s address shifted up one, with the dereference flag in
+    /// bit 0; zero for none.
+    static PEEK: AtomicU64 = AtomicU64::new(0);
+
+    fn peek() -> Option<u32> {
+        let v = PEEK.load(Ordering::Relaxed);
+        if v == 0 {
+            return None;
+        }
+        let m = GuestMem::new(guest_bytes());
+        let mut a = v >> 1;
+        if v & 1 != 0 {
+            a = m.read_u32(a).ok()? as u64;
+            if a == 0 {
+                return None;
+            }
+        }
+        m.read_u32(a).ok()
+    }
 
     fn report_stats(p: &nt::Process) {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -408,7 +474,20 @@ mod imp {
             return;
         }
         let presents = p.presents.load(Ordering::Relaxed);
-        warn_line(&format!("gex-nt: stats t={t} presents={presents}\n"));
+        if VERIFY_REGISTRY.load(Ordering::Relaxed) {
+            if let Some(what) = with_host(crate::verify_registry) {
+                warn_line(&format!("gex-nt: a translation was overwritten after it was kept: {what}\n"));
+            }
+        }
+        if VERIFY_REGISTRY.load(Ordering::Relaxed) {
+            warn_line(&format!("gex-nt: stats worker stack least headroom {} bytes\n", crate::stack_least()));
+        }
+        let foreign = crate::FOREIGN_BYTES.load(Ordering::Relaxed);
+        let fx = if foreign != 0 { format!(" foreign={foreign}") } else { String::new() };
+        match peek() {
+            Some(v) => warn_line(&format!("gex-nt: stats t={t} presents={presents} peek={v}{fx}\n")),
+            None => warn_line(&format!("gex-nt: stats t={t} presents={presents}{fx}\n")),
+        }
     }
 
     /// Bring `KUSER_SHARED_DATA`'s clocks up to date, at most once a
@@ -455,6 +534,33 @@ mod imp {
         p.thread_by_ctx(ctx as u32 as u64).is_some_and(|t| t.callback_result.lock().unwrap().is_some()) as i32
     }
 
+    /// Which NT regions overlap `[addr, addr+len)`, on the console: for a
+    /// translation the engine refused, whose bytes something overwrote.
+    #[no_mangle]
+    pub extern "C" fn gex_nt_where(addr: u32, len: u32) {
+        let Some(p) = PROCESS.get() else { return };
+        let (a, e) = (addr as u64, addr as u64 + len as u64);
+        let st = p.st.lock().unwrap();
+        let hits: Vec<String> = st
+            .vm
+            .regions
+            .range(..e)
+            .filter(|(_, r)| r.end() > a)
+            .map(|(_, r)| format!("{:#x}+{:#x} {} prot {:#x}", r.base, r.size, r.name, r.alloc_prot))
+            .collect();
+        drop(st);
+        warn_line(&format!(
+            "gex-nt: {a:#x}..{e:#x} is {}, its end {}\n",
+            crate::memmap::owner_of(a),
+            crate::memmap::owner_of(e.saturating_sub(1))
+        ));
+        warn_line(&format!(
+            "gex-nt: {a:#x}..{e:#x} (arena next {:#x}) overlaps NT regions: {}\n",
+            ARENA_NEXT.load(Ordering::Relaxed),
+            if hits.is_empty() { "none".into() } else { hits.join(", ") }
+        ));
+    }
+
     /// Whether this process is a Windows one, for the glue.
     #[no_mangle]
     pub extern "C" fn gex_nt_active() -> i32 {
@@ -467,10 +573,27 @@ mod imp {
     pub(crate) fn syscall(p: &Arc<nt::Process>, ctx: i32, pc: i64) {
         let ctx_addr = ctx as u32 as u64;
         tick();
+        if let Some((lo, bad, least)) = crate::stack_guard_check() {
+            warn_line(&format!(
+                "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
+            ));
+        }
+        let nr = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32;
+        if TRACE_FOREIGN.load(Ordering::Relaxed) {
+            crate::foreign_now("before", &nt::syscall_name(nr));
+        }
+        let gm = GuestMem::new(guest_bytes());
+        let sp0 = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0) & 0xffff_ffff;
+        let r0 = gm.read_u32(sp0).unwrap_or(0) as u64;
+        let r1 = gm.read_u32(sp0 + 4).unwrap_or(0) as u64;
+        ring_note(ctx_addr, (nr as u64) << 32 | sp0, r0 << 32 | r1);
         let outcome = {
             let mut host = Nested { ctx_addr };
             nt::syscall(p, &HostKernel, guest_bytes(), ctx_addr, pc as u64, &mut host)
         };
+        if TRACE_FOREIGN.load(Ordering::Relaxed) {
+            crate::foreign_now("during", &nt::syscall_name(nr));
+        }
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
         tick();
@@ -482,18 +605,40 @@ mod imp {
             let retired = std::mem::take(&mut h.kernel.retired_code);
             h.kernel.new_code.clear();
             if !retired.is_empty() {
-                retire(h, &retired);
+                note_retire(&retired);
+                if !NO_RETIRE.load(Ordering::Relaxed) {
+                    retire(h, &retired);
+                }
             }
         });
         let resume_pc = || GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         match outcome {
-            nt::Outcome::Continue => {}
+            nt::Outcome::Continue => {
+                // A call that returns where it was made leaves the stack
+                // where it was: say so loudly when not.
+                let sp1 = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0) & 0xffff_ffff;
+                if sp1 != sp0 {
+                    warn_line(&format!(
+                        "gex-nt: {} moved the stack: sp {sp0:#x} -> {sp1:#x} (ctx {ctx_addr:#x})\n",
+                        nt::syscall_name(nr)
+                    ));
+                }
+            }
             nt::Outcome::Resume(target) => {
                 set_resume(target);
                 set_resume_ctx(ctx_addr);
                 trap();
             }
-            nt::Outcome::Exit(code) => end_process(code),
+            nt::Outcome::Exit(code) => {
+                static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if code == 0xc000_0002 && !ONCE.swap(true, Ordering::Relaxed) {
+                    // GEX_NT_STRICT's end: what the thread that hit it was
+                    // doing (the first to end; the others follow it).
+                    warn_line(&format!("gex-nt: this thread's last calls: {}\n", ring_report(ctx_addr)));
+                    warn_line(&format!("gex-nt: this thread's last trap pcs: {}\n", trap_report(ctx_addr)));
+                }
+                end_process(code)
+            }
             nt::Outcome::ThreadExit => {
                 // The main thread's Worker is the process's: when it ends
                 // first it waits for the process to end and reports the
@@ -540,6 +685,40 @@ mod imp {
     /// directory entries go back to the miss stub, so the next branch there
     /// (from any Worker) lifts what is there now into fresh slots. The old
     /// slots are left behind, unreachable.
+    /// GEX_NT_NO_RETIRE: keep translations of code that went away (a
+    /// diagnostic: stale code runs).
+    static NO_RETIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// GEX_NT_TRACE: look for memory grown outside the arena around every NT
+    /// call, so the first foreign grow is caught near whoever did it.
+    static TRACE_FOREIGN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// GEX_NT_VERIFY_REGISTRY: once a second, check every kept translation
+    /// against the hashes taken when it was kept (a stray write into the
+    /// shim's heap).
+    static VERIFY_REGISTRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// GEX_NT_SLOT_LOG: name the first few hundred slot conflicts (a block
+    /// entered for a neighbour sharing its dispatch slot).
+    static SLOT_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn slot_log() -> bool {
+        SLOT_LOG.load(Ordering::Relaxed)
+    }
+
+    /// GEX_NT_RETIRE_LOG: name each retired range, the first few hundred.
+    static RETIRE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn note_retire(ranges: &[(u64, u64)]) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if !RETIRE_LOG.load(Ordering::Relaxed) || N.fetch_add(1, Ordering::Relaxed) > 400 {
+            return;
+        }
+        let Some(p) = PROCESS.get() else { return };
+        let s: Vec<String> = ranges.iter().map(|&(a, b)| format!("{}..{b:#x}", p.describe_addr(a))).collect();
+        warn_line(&format!("gex-nt: retiring {}\n", s.join(" ")));
+    }
+
     fn retire(h: &mut crate::Host, ranges: &[(u64, u64)]) {
         use std::sync::atomic::AtomicU32;
         for &(start, end) in ranges {
@@ -552,12 +731,111 @@ mod imp {
                     break;
                 }
                 h.jit.page_table.forget(page);
+                h.jit.retired_pages.insert(page);
                 let at = gex_abi::DISPATCH_DIR + page * 4;
                 // SAFETY: the directory is in the shared memory, four-byte
                 // aligned, and every Worker's dispatch reads it as a word.
                 unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
             }
         }
+    }
+
+    /// Each thread's last NT calls and where they were made, for an execute
+    /// fault's report: a fixed table keyed by context address, with no
+    /// allocation (a thread-local `VecDeque` here was followed by translations
+    /// arriving overwritten -- not understood; see MERGE-STATUS S12).
+    const RING: usize = 32;
+    struct Ring {
+        ctx: AtomicU64,
+        next: AtomicU64,
+        calls: [[AtomicU64; 2]; RING],
+    }
+    static RINGS: [Ring; 64] = [const {
+        Ring { ctx: AtomicU64::new(0), next: AtomicU64::new(0), calls: [const { [const { AtomicU64::new(0) }; 2] }; RING] }
+    }; 64];
+
+    fn ring_of(ctx: u64) -> &'static Ring {
+        &RINGS[(ctx as usize / 0x80) % RINGS.len()]
+    }
+
+    /// `a` is the call number and the stack pointer, `b` the two words on
+    /// top of the stack (the trampoline's return address and the stub's).
+    fn ring_note(ctx: u64, a: u64, b: u64) {
+        let r = ring_of(ctx);
+        if r.ctx.swap(ctx, Ordering::Relaxed) != ctx {
+            r.next.store(0, Ordering::Relaxed);
+        }
+        let i = r.next.fetch_add(1, Ordering::Relaxed);
+        let e = &r.calls[(i % RING as u64) as usize];
+        e[0].store(a, Ordering::Relaxed);
+        e[1].store(b, Ordering::Relaxed);
+    }
+
+    /// GEX_NT_TRAP_PCS' notes: per thread, the last few block entries with
+    /// esp, ebp, eax, ecx, esi, edi and [esp].
+    const TRING: usize = 16;
+    struct TRing {
+        ctx: AtomicU64,
+        next: AtomicU64,
+        e: [[AtomicU64; 4]; TRING],
+    }
+    static TRINGS: [TRing; 64] = [const {
+        TRing { ctx: AtomicU64::new(0), next: AtomicU64::new(0), e: [const { [const { AtomicU64::new(0) }; 4] }; TRING] }
+    }; 64];
+
+    pub(crate) fn trap_note(ctx: u64, pc: u64) {
+        let gm = GuestMem::new(guest_bytes());
+        let r = |i: u8| gm.read_u64(ctx + ctx::x(i) as u64).unwrap_or(0) & 0xffff_ffff;
+        let m = |a: u64| gm.read_u32(a).unwrap_or(0xdead_dead) as u64;
+        let (sp, ecx) = (r(4), r(1));
+        let vt = m(ecx);
+        let t = &TRINGS[(ctx as usize / 0x80) % TRINGS.len()];
+        if t.ctx.swap(ctx, Ordering::Relaxed) != ctx {
+            t.next.store(0, Ordering::Relaxed);
+        }
+        let i = t.next.fetch_add(1, Ordering::Relaxed);
+        let e = &t.e[(i % TRING as u64) as usize];
+        e[0].store(pc << 32 | sp, Ordering::Relaxed);
+        e[1].store(ecx << 32 | r(6), Ordering::Relaxed);
+        let _ = vt;
+        e[2].store(r(5) << 32 | r(0), Ordering::Relaxed);
+        e[3].store(m(sp) << 32 | r(7), Ordering::Relaxed);
+    }
+
+    fn trap_report(ctx: u64) -> String {
+        let t = &TRINGS[(ctx as usize / 0x80) % TRINGS.len()];
+        if t.ctx.load(Ordering::Relaxed) != ctx {
+            return "(none)".into();
+        }
+        let n = t.next.load(Ordering::Relaxed);
+        let h = |v: u64| (v >> 32, v & 0xffff_ffff);
+        (n.saturating_sub(TRING as u64)..n)
+            .map(|i| {
+                let e = &t.e[(i % TRING as u64) as usize];
+                let (pc, sp) = h(e[0].load(Ordering::Relaxed));
+                let (ecx, esi) = h(e[1].load(Ordering::Relaxed));
+                let (ebp, eax) = h(e[2].load(Ordering::Relaxed));
+                let (top, edi) = h(e[3].load(Ordering::Relaxed));
+                format!("[{pc:#x} esp {sp:#x} ebp {ebp:#x} [esp] {top:#x} eax {eax:#x} ecx {ecx:#x} esi {esi:#x} edi {edi:#x}]")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn ring_report(ctx: u64) -> String {
+        let r = ring_of(ctx);
+        if r.ctx.load(Ordering::Relaxed) != ctx {
+            return "(none recorded)".into();
+        }
+        let n = r.next.load(Ordering::Relaxed);
+        (n.saturating_sub(RING as u64)..n)
+            .map(|i| {
+                let e = &r.calls[(i % RING as u64) as usize];
+                let (a, b) = (e[0].load(Ordering::Relaxed), e[1].load(Ordering::Relaxed));
+                format!("{}(sp {:#x}: {:#x} {:#x})", nt::syscall_name((a >> 32) as u32), a & 0xffff_ffff, b >> 32, b & 0xffff_ffff)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn set_resume_ctx_none_and_trap() -> ! {
@@ -588,6 +866,67 @@ mod imp {
             trap();
         };
         let ctx_addr = ctx as u32 as u64;
+        if let nt::Fault::NotExecutable = fault {
+            // What the two maps say about the address, since the NT layer and
+            // the translator disagreeing is the interesting case.
+            let nt_side = {
+                let st = p.st.lock().unwrap();
+                match st.vm.find(pc) {
+                    Some(r) => {
+                        let page = &r.pages[((pc - r.base) / nt::vm::PAGE) as usize];
+                        // Runs of pages by protection, which says whether the
+                        // program protected part of the region and missed this.
+                        let mut runs = String::new();
+                        let mut i = 0;
+                        while i < r.pages.len() {
+                            let p0 = r.pages[i];
+                            let mut j = i;
+                            while j < r.pages.len() && r.pages[j] == p0 {
+                                j += 1;
+                            }
+                            runs.push_str(&format!(" [{:#x}..{:#x} {}{:#x}]", r.base + i as u64 * nt::vm::PAGE,
+                                r.base + j as u64 * nt::vm::PAGE, if p0.committed { "" } else { "res " }, p0.prot));
+                            i = j;
+                        }
+                        format!(
+                            "NT region {:#x}+{:#x} {} alloc_prot {:#x}, page committed={} prot {:#x}; pages{runs}",
+                            r.base, r.size, r.name, r.alloc_prot, page.committed, page.prot
+                        )
+                    }
+                    None => "no NT region".into(),
+                }
+            };
+            let linux = with_host(|h| {
+                h.kernel
+                    .mem
+                    .vmas()
+                    .iter()
+                    .find(|v| pc >= v.start && pc < v.end)
+                    .map(|v| format!("{:#x}-{:#x} prot {:#x} {}", v.start, v.end, v.prot, v.name))
+                    .unwrap_or_else(|| "no Linux mapping".into())
+            });
+            // Who branched there: the block the last indirect branch left,
+            // and the stack (i386: the return address of a call is on top).
+            let gm = GuestMem::new(guest_bytes());
+            let c = ctx as u32 as u64;
+            let r = |o: usize| gm.read_u64(c + o as u64).unwrap_or(0);
+            let sp = r(ctx::SP) & 0xffff_ffff;
+            let stack: Vec<String> = (0..12u64)
+                .map(|i| p.describe_addr(gm.read_u32(sp + 4 * i).unwrap_or(0) as u64))
+                .collect();
+            let regs: Vec<String> = (0..8u8).map(|i| format!("{:#x}", r(ctx::x(i)) & 0xffff_ffff)).collect();
+            let recent = ring_report(c);
+            warn_line(&format!("gex-nt: this thread's last calls: {recent}\n"));
+            warn_line(&format!("gex-nt: this thread's last trap pcs: {}\n", trap_report(c)));
+            warn_line(&format!(
+                "gex-nt: execute fault at {}: {nt_side}; {linux}; from block {} (last target {}), regs [{}], sp {sp:#x} stack [{}]\n",
+                p.describe_addr(pc),
+                p.describe_addr(r(ctx::LAST_SOURCE)),
+                p.describe_addr(r(ctx::LAST_TARGET)),
+                regs.join(" "),
+                stack.join(" ")
+            ));
+        }
         match nt::hardware_exception(p, &HostKernel, guest_bytes(), ctx_addr, code, rip, &info) {
             nt::Outcome::Resume(target) => {
                 set_resume(target);

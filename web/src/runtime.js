@@ -726,6 +726,10 @@ export async function runProgram(
       // `?copyloop=1` emits memcpy as a forward byte loop, to tell a
       // `memory.copy` fault from a bad-argument one. In `extra` for every process.
       copyLoop: flag('copyloop') ? 1 : undefined,
+      // `?coherentloads=1`: guest loads and stores as atomic wasm accesses
+      // where aligned, so V8 cannot move them across the guest's fences. In
+      // `extra` for every Worker.
+      coherentLoads: flag('coherentloads') ? 1 : undefined,
       // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
       // "produced no frame") to debug why a client's window is not shown.
       wlTrace: flag('wltrace') ? 1 : undefined,
