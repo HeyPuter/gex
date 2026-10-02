@@ -13,20 +13,37 @@
 
 use super::*;
 use gex_ir::func::RegSet;
+use std::collections::HashMap;
 
 /// A terminator's value, past its block (see [`FnBody::operand`]).
 #[derive(Clone, Copy, Debug)]
 pub enum Operand {
     Local(u32, Ty),
+    /// A register's local, borrowed: freed with nothing.
+    Reg(u32, Ty),
     Const(u64, Ty),
 }
 
 /// One function body under construction.
 pub struct FnBody<'a> {
     e: Emitter<'a>,
-    /// Per value: the index of its last use in the block being emitted
-    /// (`usize::MAX`: kept past the statements). Scratch for [`Self::block`].
+    /// Per value: scratch for [`Self::block`]'s last-use pass.
     last: Vec<usize>,
+    /// The block's values that live in a register's local.
+    borrowed: Vec<u32>,
+}
+
+/// A last use past the block's statements (the terminator's).
+const KEPT: usize = usize::MAX - 1;
+
+/// The values a statement defines or uses.
+fn s_defs_and_uses(s: &Stmt) -> Vec<u32> {
+    let mut out = Vec::new();
+    if let Stmt::Def { dst, .. } = s {
+        out.push(dst.0);
+    }
+    s.for_each_use(|v| out.push(v.0));
+    out
 }
 
 impl<'a> FnBody<'a> {
@@ -48,7 +65,7 @@ impl<'a> FnBody<'a> {
         e.value_local = vec![None; n];
         e.value_const = vec![None; n];
         e.value_ty = vec![Ty::I64; n];
-        FnBody { e, last: vec![usize::MAX; n] }
+        FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new() }
     }
 
     /// The code, for the JIT's own control flow.
@@ -132,8 +149,7 @@ impl<'a> FnBody<'a> {
         for v in self.e.value_const.iter_mut() {
             *v = None;
         }
-        // Last uses, over the values this block touches only: values are
-        // numbered across the function but local to their block.
+        // Last uses, over the values this block touches only.
         let mut touched: Vec<u32> = Vec::new();
         for (i, s) in stmts.iter().enumerate() {
             let last = &mut self.last;
@@ -149,23 +165,77 @@ impl<'a> FnBody<'a> {
             }
             s.for_each_use(&mut note);
         }
-        let mut frees: Vec<(usize, u32)> = Vec::new();
-        for v in touched {
-            let at = std::mem::replace(&mut self.last[v as usize], usize::MAX);
-            if !keep.iter().any(|k| k.0 == v) {
-                frees.push((at, v));
+        for k in keep {
+            if (k.0 as usize) < self.last.len() {
+                if self.last[k.0 as usize] == usize::MAX {
+                    touched.push(k.0);
+                }
+                self.last[k.0 as usize] = KEPT;
             }
         }
-        frees.sort_unstable();
+        let mut last_use: HashMap<u32, usize> = touched.iter().map(|&v| (v, self.last[v as usize])).collect();
+        for &v in &touched {
+            self.last[v as usize] = usize::MAX;
+        }
+        // Whether register `r`'s local changes in stmts[from..=to]: a write,
+        // or a clobbering host call (which reloads every register).
+        let changes = |r: GuestReg, from: usize, to: usize| {
+            stmts[from..stmts.len().min(to.saturating_add(1))]
+                .iter()
+                .any(|s| matches!(s, Stmt::WriteReg { reg, .. } if *reg == r) || clobbers_guest_state(s))
+        };
+        // Values living in a register's local rather than their own: a
+        // register read whose register does not change before the value's
+        // last use, and a definition written to a register at once.
+        let mut borrowed: Vec<u32> = Vec::new();
         let dummy = Block::new(start);
-        let mut next = 0;
+        let mut skip_write = usize::MAX;
         for (i, s) in stmts.iter().enumerate() {
-            self.e.stmt(s, &dummy);
-            while next < frees.len() && frees[next].0 == i {
-                self.e.release(Value(frees[next].1));
-                next += 1;
+            if i == skip_write {
+                // The definition before left its value in the register.
+                if let Stmt::WriteReg { reg, .. } = s {
+                    self.e.regs.get_mut(reg).expect("a used register").dirty = true;
+                }
+            } else {
+                match s {
+                    Stmt::Def { dst, expr: Expr::ReadReg(r) }
+                        if self.e.regs.contains_key(r) && *r != GuestReg::CtxAddr && !changes(*r, i + 1, last_use[&dst.0]) =>
+                    {
+                        let k = dst.0 as usize;
+                        self.e.value_ty[k] = r.ty();
+                        self.e.value_local[k] = Some(self.e.regs[r].local);
+                        borrowed.push(dst.0);
+                    }
+                    Stmt::Def { dst, expr } => {
+                        let into = match stmts.get(i + 1) {
+                            Some(Stmt::WriteReg { reg, val }) if val == dst && last_use[&dst.0] == i + 1 && expr.ty() == reg.ty() => {
+                                self.e.regs.get(reg).map(|c| c.local)
+                            }
+                            _ => None,
+                        };
+                        self.e.def_into = into;
+                        self.e.stmt(s, &dummy);
+                        if into.is_some() && self.e.def_into.take().is_none() {
+                            borrowed.push(dst.0);
+                            skip_write = i + 1;
+                        }
+                    }
+                    _ => self.e.stmt(s, &dummy),
+                }
+            }
+            for v in s_defs_and_uses(s) {
+                if last_use.get(&v) == Some(&i) {
+                    last_use.remove(&v);
+                    if borrowed.contains(&v) {
+                        self.e.value_local[v as usize] = None;
+                    } else {
+                        self.e.release(Value(v));
+                    }
+                }
             }
         }
+        // Kept values that are borrowed must not be freed with the block's.
+        self.borrowed = borrowed;
     }
 
     /// A value kept past [`Self::block`], as something that outlives the
@@ -175,6 +245,7 @@ impl<'a> FnBody<'a> {
         let k = v.0 as usize;
         let ty = self.e.value_ty[k];
         match self.e.value_local[k].take() {
+            Some(l) if self.borrowed.contains(&v.0) => Operand::Reg(l, ty),
             Some(l) => Operand::Local(l, ty),
             None => Operand::Const(self.e.value_const[k].expect("a kept value has a local or a constant"), ty),
         }
@@ -182,7 +253,7 @@ impl<'a> FnBody<'a> {
 
     pub fn push_operand(&mut self, o: Operand) {
         match o {
-            Operand::Local(l, _) => self.e.f.local_get(l),
+            Operand::Local(l, _) | Operand::Reg(l, _) => self.e.f.local_get(l),
             Operand::Const(c, Ty::I32) => self.e.f.i32_const(c as i32),
             Operand::Const(c, _) => self.e.f.i64_const(c as i64),
         }

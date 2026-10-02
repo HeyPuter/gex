@@ -853,7 +853,7 @@ impl E<'_, '_> {
         let shift = gex_abi::INST_ALIGN_SHIFT;
         let (lo, hi) = (cases.first().map(|c| c.0).unwrap_or(0), cases.last().map(|c| c.0).unwrap_or(0));
         let span = ((hi - lo) >> shift) + 1;
-        if cases.len() < 4 || span > 4 * cases.len() as u64 + 16 {
+        if cases.len() < 3 || span > (64 * cases.len() as u64).max(256).min(4096) {
             for (a, t) in cases {
                 self.b.push_operand(target);
                 let fb = self.b.f();

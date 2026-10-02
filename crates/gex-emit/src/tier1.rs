@@ -521,6 +521,10 @@ struct Emitter<'a> {
     /// function uses has a local for its whole body, bound up front, and a
     /// clobbering host call reloads them all rather than forgetting them.
     func_regs: Option<Vec<GuestReg>>,
+    /// Function mode: the local the next `def` leaves its value in (a
+    /// register's, when a `WriteReg` of the value follows at once). Taken
+    /// by `def`'s common tail; left set by a definition that has no local.
+    def_into: Option<u32>,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -568,6 +572,7 @@ impl<'a> Emitter<'a> {
             region: None,
             region_writes: Default::default(),
             func_regs: None,
+            def_into: None,
         }
     }
 
@@ -2628,7 +2633,7 @@ impl<'a> Emitter<'a> {
         }
 
         // Everything that reaches here left one value on the stack.
-        let local = self.alloc(ty);
+        let local = self.def_into.take().unwrap_or_else(|| self.alloc(ty));
         self.f.local_set(local);
         self.value_local[idx] = Some(local);
     }
