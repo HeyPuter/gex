@@ -119,29 +119,14 @@ pub fn cache_root() -> Result<std::path::PathBuf> {
     Ok(modules.parent().map(|p| p.join("cgen")).unwrap_or(modules))
 }
 
-/// The identity of an image's recovery: the sources that decide it
-/// (`gex_cgen::image::RECOVERY_INPUTS`) and the image as placed
-/// (`aot::image_identity`: its relocated segments at its base).
+/// The identity of an image's recovery, and of a unit: `gex_cgen::image`'s
+/// (gex-key's, shared by every host so they cannot disagree).
 pub fn recovery_key(image: &gex_ld::Image) -> String {
-    let mut h = gex_cache::sha256::Sha256::new();
-    h.update(b"gex-cgen-recovery 1");
-    h.update(gex_cgen::image::RECOVERY_INPUTS.as_bytes());
-    h.update(aot::image_identity(image).as_bytes());
-    gex_cache::sha256::hex(&h.finish())
+    gex_cgen::image::recovery_key(image)
 }
 
-/// The identity of a unit: its format, the sources that decide the C and the
-/// module (`UNIT_INPUTS`), what it embeds from elsewhere
-/// (`UNIT_ABI_VERSION`), and the recovery it was built from. A change to
-/// tier-1 alone changes none of these. clang's version and flags key each
-/// object inside it.
 pub fn image_key(image: &gex_ld::Image) -> String {
-    let mut h = gex_cache::sha256::Sha256::new();
-    h.update(gex_cgen::image::FORMAT.as_bytes());
-    h.update(gex_cgen::image::UNIT_INPUTS.as_bytes());
-    h.update(&gex_cgen::image::UNIT_ABI_VERSION.to_le_bytes());
-    h.update(recovery_key(image).as_bytes());
-    gex_cache::sha256::hex(&h.finish())
+    gex_cgen::image::image_key(image)
 }
 
 /// Build (or find) the unit's C module for a PE image placed at `base`:
