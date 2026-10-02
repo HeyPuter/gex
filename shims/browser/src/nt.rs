@@ -257,6 +257,7 @@ mod imp {
             warn_line(&format!("gex-nt: arena self-check: {}\n", crate::arena_selftest()));
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
+        GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
         }
@@ -339,7 +340,14 @@ mod imp {
     #[derive(Default)]
     struct WlDisplay {
         windows: std::sync::Mutex<std::collections::BTreeMap<u32, (nt::display::NtSurface, u32)>>,
+        /// Windows whose GL frames the compositor draws itself, at this
+        /// rectangle of the window's surface (`gl_target`).
+        gl: std::sync::Mutex<std::collections::BTreeMap<u32, (i32, i32, i32, i32)>>,
     }
+
+    /// GEX_NT_GL_READBACK: read each GL frame back into the window's surface
+    /// instead of handing it to the compositor (the old path, for comparing).
+    static GL_READBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Words in a scene record and an input event: `REC` and `EV` in
     /// `crate::wl` and `wl-bridge.mjs`.
@@ -354,6 +362,7 @@ mod imp {
 
     impl WlDisplay {
         fn flush(&self, windows: &std::collections::BTreeMap<u32, (nt::display::NtSurface, u32)>) {
+            let gl = self.gl.lock().unwrap().clone();
             let mut scene: Vec<i32> = Vec::with_capacity(windows.len() * REC);
             for (s, serial) in windows.values().take(64) {
                 let base = scene.len();
@@ -370,6 +379,14 @@ mod imp {
                 r[9] = s.stride as i32;
                 r[10] = XRGB8888;
                 r[11] = *serial as i32;
+                // The host's GL frame, drawn by the compositor over this
+                // part of the surface (`F_EXTERNAL`, `R_GL_RECT` in
+                // wl-bridge.mjs).
+                if let Some(&(gx, gy, gw, gh)) = gl.get(&s.id) {
+                    r[16] = 2;
+                    r[26] = (gx & 0xffff) | (gy << 16);
+                    r[27] = (gw & 0xffff) | (gh << 16);
+                }
                 let (l, t, rt, b) = s.damage;
                 r[12] = l;
                 r[13] = t;
@@ -401,9 +418,22 @@ mod imp {
 
         fn remove(&self, id: u32) {
             let mut w = self.windows.lock().unwrap();
+            self.gl.lock().unwrap().remove(&id);
             if w.remove(&id).is_some() {
                 self.flush(&w);
             }
+        }
+
+        fn gl_target(&self, toplevel: u32, rect: (i32, i32, i32, i32)) -> Option<u32> {
+            if GL_READBACK.load(Ordering::Relaxed) {
+                return None;
+            }
+            let changed = self.gl.lock().unwrap().insert(toplevel, rect) != Some(rect);
+            if changed {
+                let w = self.windows.lock().unwrap();
+                self.flush(&w);
+            }
+            Some(crate::my_pid().max(0) as u32)
         }
 
         fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {

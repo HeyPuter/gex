@@ -3,7 +3,11 @@
 // shared-memory browser shim, its window a toplevel in the page's compositor
 // (web/nt.html), checked by pixels and by input.
 //
-//   node tests/nt/browser-gui.mjs [--arch x64|x86] [--keep] [--shot DIR]
+//   node tests/nt/browser-gui.mjs [--arch x64|x86] [--gl] [--keep] [--shot DIR]
+//
+// --gl runs glwindow.exe instead: the same picture drawn with OpenGL in a
+// captioned window's client area (the GL frame drawn by the compositor, or
+// read back with GEX_NT_GL_READBACK=1 in GEX_NT_PAGE_ENV).
 //
 // Needs: the x86 shared shim, seed and kernel in web/public/gex
 // (GEX_ARCH=x86 shims/browser/build.sh), web/node_modules (vite), a staged
@@ -15,7 +19,7 @@
 
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bundle, openPage, near, sleep, stopAll } from './browser-harness.mjs';
+import { bundle, openPage, near, sleep, stopAll, log } from './browser-harness.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
@@ -26,6 +30,9 @@ const opt = (name, dflt) => {
 const arch = opt('--arch', 'x64');
 const keep = argv.includes('--keep');
 const shotDir = opt('--shot', null);
+const gl = argv.includes('--gl');
+const name = gl ? 'glwindow' : 'window';
+const title = gl ? 'gex gl window' : 'gex window';
 let failed = 0;
 const check = (name, ok, detail = '') => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}${detail ? ` (${detail})` : ''}`);
@@ -33,21 +40,35 @@ const check = (name, ok, detail = '') => {
 };
 
 async function main() {
-  const exe = join(HERE, 'bin', arch, 'window.exe');
-  const tar = bundle(`window-${arch}`, arch, { 't/window.exe': exe }, [exe]);
+  const exe = join(HERE, 'bin', arch, `${name}.exe`);
+  const tar = bundle(`${name}-${arch}`, arch, { [`t/${name}.exe`]: exe }, [exe]);
   const t0 = Date.now();
+  const env = [...(gl ? ['gl=1&glbackend=wgpu'] : []), ...(process.env.GEX_NT_PAGE_ENV ? [`env=${process.env.GEX_NT_PAGE_ENV}`] : [])];
   const { browser, page, evaluate: eval_, until, shot } = await openPage(
-    `tar=/gex/nt/${tar.split('/').pop()}&exe=/t/window.exe&args=120&size=800x600`, { shotDir });
+    `tar=/gex/nt/${tar.split('/').pop()}&exe=/t/${name}.exe&args=120&size=800x600${env.map((e) => `&${e}`).join('')}`, { shotDir });
   await until((s) => /shown/.test(s.out), 300000, '"shown"');
   check('the program starts and paints', true, `${((Date.now() - t0) / 1000).toFixed(1)} s`);
   await sleep(1500);
 
   const desc = await eval_('globalThis.__gexCompositor?.describe()', true);
-  const win = (desc?.list ?? []).map((l) => /role=1 (\d+)x(\d+)@(-?\d+),(-?\d+).*"(.*)"/.exec(l)).find((m) => m && m[5] === 'gex window');
+  const win = (desc?.list ?? []).map((l) => /role=1 (\d+)x(\d+)@(-?\d+),(-?\d+).*"(.*)"/.exec(l)).find((m) => m && m[5] === title);
   check('the compositor has the window', !!win, (desc?.list ?? []).join('; '));
-  if (!win) return;
-  const [ww, wh, wx, wy] = win.slice(1, 5).map(Number);
+  if (!win) {
+    log(`compositor: ${desc ? JSON.stringify({ log: desc.log, gl: desc.gl, frames: desc.frames }) : 'no answer'}`);
+    return;
+  }
+  let [ww, wh, wx, wy] = win.slice(1, 5).map(Number);
+  // The client area: a captioned window's surface includes the frame the
+  // program draws (borders all round, the caption on top).
+  if (gl) {
+    const side = (ww - 320) / 2;
+    wx += side;
+    wy += wh - 240 - side;
+    ww = 320;
+    wh = 240;
+  }
   check('at its size', ww === 320 && wh === 240, `${ww}x${wh}`);
+  if (gl) log(`compositor gl: ${desc?.gl}`);
 
   let img = await shot('shown');
   const px = (x, y) => img.at(wx + x, wy + y);
@@ -74,6 +95,10 @@ async function main() {
   await browser.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }, page);
   const end = await until((s) => s.phase === 'done', 30000, 'the exit');
   check('Escape reaches it and it exits 0', /key 27/.test(end.out) && /bye/.test(end.out) && end.status === 0, `status ${end.status}`);
+  if (gl) {
+    const f = /frames (\d+)/.exec(end.out);
+    log(`${f ? f[1] : '?'} frames in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  }
   if (keep) {
     log('--keep: leaving the browser up; ^C to stop');
     await new Promise(() => {});

@@ -743,6 +743,27 @@ class Compositor {
     // texture is already in this context, and upside down relative to
     // everything else here: GL's origin is bottom-left.
     const gl = this.#glSurface(win);
+    // A frame for part of the window only (a Windows program's client area,
+    // under a title bar and borders it drew itself): the window's own pixels
+    // first, then the frame over its rectangle.
+    const r = gl && win.info?.glRect;
+    if (r) {
+      const t = this.#textures.get(k);
+      if (t) {
+        this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
+          swizzle: 1,
+          opaque: win.info?.format === 1 ? 1 : 0,
+        });
+      }
+      this.#glDraws++;
+      if (gl.source) {
+        const tex = this.#uploadGlCanvas(gl);
+        if (tex) this.#painter.textured(f.x + r.x, f.y + r.y, r.w, r.h, tex, { opaque: 1 });
+      } else {
+        this.#painter.textured(f.x + r.x, f.y + r.y, r.w, r.h, gl.tex, { opaque: 1, uv: [0, 1, 1, -1] });
+      }
+      return;
+    }
     if (gl) {
       this.#glDraws++;
       if (gl.source) {
