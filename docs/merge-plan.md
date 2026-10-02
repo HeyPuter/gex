@@ -656,3 +656,64 @@ tier-1 for recoverable code.
 - **Code that is neither function- nor region-shaped,** such as self-modifying
   loops. The region tier with per-entry page checks handles it; measure its
   frequency on Noita first.
+
+### 9.6 LTO and link groups (AOT build options, after the function JIT)
+
+pewasm's Noita build linked noita.exe, msvcr120 and msvcp120 into one module
+with ThinLTO (`-flto=thin`); wasm-opt was opt-in (`--no-wasm-opt` by
+default). Most of that gain is cross-image inlining. Under §9:
+
+- **Within an image:** every unit is compiled `-flto=thin` and may be run
+  through wasm-opt after linking. No design change; unit keys stay per image.
+- **Across images, link groups:** one module built from a set of images that
+  load together at known bases (noita.exe with its private DLLs; the staged
+  Wine core as another).
+  - The key is the set of (image identity, base).
+  - It installs at map time only once every member is mapped at its expected
+    base and passes the byte check; otherwise each image uses its own unit.
+  - Format 3's fixed export surface and the function-indexed table make a
+    group of any size fine.
+  - An ejected build is one link group of everything, which is pewasm's build.
+- **Correctness under runtime patching:** the page check stays the first
+  statement of every function body, so a body inlined into another image
+  carries its check with it and still leaves when its page is patched. It is
+  an atomic load and a branch, which LTO must not remove; a test asserts it.
+- **Policy:** groups and wasm-opt are build-time options, on by default for
+  the staged Wine core and for ejected builds. An app image gets per-image LTO
+  in its first background build and a group build afterwards. Neither ever
+  runs at start-up; the JIT covers what isn't built.
+
+### 9.7 Wine's PE DLLs as native wasm (future)
+
+Today Wine's PE DLLs are prebuilt x86 binaries, run as guest code through
+AOT units and the JIT like any image. Two ways to make them native wasm:
+
+1. **Replace hot DLLs or exports (practical; 32-bit guests first).**
+   - Compile selected Wine DLLs, or only their hot exports, with emcc: the CRT
+     (msvcrt/ucrtbase/msvcr120: mem*, malloc, string, math), the heap and
+     synchronisation.
+   - Bind them where the guest calls them through a thin calling-convention
+     shim: read arguments from the guest stack and registers, call the wasm
+     function, write the result back. This is gex-eject's library replacement
+     (`c` ABI), and it is what pewasm did for msvcr120 (host CRT exports).
+   - They become entries in the §9 function table, so an IAT call resolves to
+     them directly. Choose them by profile.
+2. **Port Wine's whole PE side to wasm (large).** Wine has no wasm target:
+   - ntdll and kernelbase carry x86 assembly (exception dispatch, context
+     switching, thunks);
+   - the PE loader, import tables, GetProcAddress and LoadLibrary must handle
+     wasm modules standing in for DLLs;
+   - SEH has to unwind across mixed native and guest frames;
+   - callbacks into guest code (window procedures, thread entries,
+     comparators) must be cheap. §9 makes them so: a guest function is a
+     callable wasm function.
+
+**ABI constraint:**
+- **32-bit guests:** wasm32 matches Win32's ILP32 sizes, and clang's wasm32
+  struct alignment matches MSVC's x86 defaults, so structs pass unchanged.
+- **64-bit guests:** Windows is LLP64 and clang's wasm64 is LP64 (`long` is
+  4 bytes against 8), so every struct with a `long` would need converting at
+  the boundary.
+
+So option 1 comes first, for 32-bit guests, after §9 lands and once a profile
+shows how much of Noita's time is inside Wine.
