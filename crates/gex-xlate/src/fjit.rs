@@ -4,7 +4,8 @@
 //!
 //! A request names one address. The function there is recovered from guest
 //! memory as it is now (`func::recover_one`), and with it the direct callees
-//! no earlier translation holds, breadth first, up to [`BATCH`] of them: one
+//! no earlier translation holds (and what their `call [slot]`s and
+//! `jmp [slot]`s point at now), breadth first, up to [`BATCH`] of them: one
 //! module, the calls among them direct `call`s, summaries over the batch
 //! (callees outside it count as unknown). What recovery learns -- function
 //! starts, which functions never return, what is translated -- is kept for
@@ -135,8 +136,25 @@ impl Jit {
             }
             if !self.intrinsics.contains_key(&a) {
                 for c in f.call_sites() {
-                    if let Callee::Direct(t) = c.callee {
-                        work.push_back(t);
+                    match c.callee {
+                        Callee::Direct(t) => work.push_back(t),
+                        // `call [iat]`: still a call through the table, but
+                        // the target the slot holds now comes in this batch
+                        // rather than a miss of its own (a guess: wrong only
+                        // costs its translation).
+                        Callee::Indirect(v) => {
+                            if let Some(t) = slot_target(&f, c.block, v, mem) {
+                                work.push_back(t);
+                            }
+                        }
+                    }
+                }
+                // And `jmp [slot]` that recovery left unresolved, likewise.
+                for id in f.ids() {
+                    if let gex_ir::func::FTerm::Unresolved { target } = f.block(id).term {
+                        if let Some(t) = slot_target(&f, id, target, mem) {
+                            work.push_back(t);
+                        }
                     }
                 }
             }
@@ -206,6 +224,37 @@ impl Jit {
     pub fn stats(&self) -> String {
         self.st.lock().unwrap_or_else(|e| e.into_inner()).line()
     }
+}
+
+/// The pointer an indirect call's target `v` (in block `b`) loads from a
+/// constant address (`call [iat]`, `jmp [iat]`), as memory holds it now.
+fn slot_target(f: &Function, b: gex_ir::func::BlockId, v: gex_ir::Value, mem: &[u8]) -> Option<u64> {
+    use gex_ir::{Expr, Stmt};
+    let blk = f.block(b);
+    let def = |x: gex_ir::Value| {
+        blk.stmts.iter().find_map(|s| match s {
+            Stmt::Def { dst, expr } if *dst == x => Some(expr),
+            _ => None,
+        })
+    };
+    // i386: the pointer zero-extended.
+    let v = match def(v) {
+        Some(Expr::Extend { a, signed: false }) => *a,
+        _ => v,
+    };
+    let Some(Expr::Load { addr, offset, sz, .. }) = def(v) else { return None };
+    let base = match def(*addr)? {
+        Expr::ConstI64(c) => *c,
+        Expr::ConstI32(c) => *c as u64,
+        _ => return None,
+    };
+    let at = base.wrapping_add(*offset as u64);
+    let n = sz.bytes() as u64;
+    if !(n == 4 || n == 8) {
+        return None;
+    }
+    let bytes = mem.get(at as usize..at.checked_add(n)? as usize)?;
+    Some(if n == 4 { u32::from_le_bytes(bytes.try_into().ok()?) as u64 } else { u64::from_le_bytes(bytes.try_into().ok()?) })
 }
 
 /// Where a function's `ret` pops more than the return address (i386

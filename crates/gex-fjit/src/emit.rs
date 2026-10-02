@@ -112,6 +112,11 @@ fn check() -> bool {
     *ON.get_or_init(|| std::env::var_os("GEX_FJIT_CHECK").is_some())
 }
 
+fn trace_leaves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_FJIT_TRACE_LEAVES").is_some())
+}
+
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GEX_FJIT_TRACE").is_some())
@@ -1272,7 +1277,37 @@ impl E<'_, '_> {
                 self.b.f().i32_const(1);
                 self.b.f().ret();
                 self.b.f().end();
+                if trace_leaves() {
+                    // `GEX_FJIT_TRACE_LEAVES=1`: a failed return check
+                    // prints the return address expected, the entry SP,
+                    // then the registers at the `ret`.
+                    self.flush(RegSet::ALL, false);
+                    let bp = self.m.cx.breakpoint;
+                    let fb = self.b.f();
+                    fb.local_get(0);
+                    fb.local_get(3);
+                    fb.i32_const(gex_abi::imports::BRK_TRACE);
+                    fb.call(bp);
+                    fb.local_get(0);
+                    fb.local_get(sp0);
+                    fb.i32_const(gex_abi::imports::BRK_TRACE);
+                    fb.call(bp);
+                    fb.local_get(0);
+                    fb.i64_const(blk.term_pc as i64);
+                    fb.i32_const(gex_abi::imports::BRK_TRACE);
+                    fb.call(bp);
+                }
                 self.leave_value(val());
+            }
+            // Through the table, the caller's return contract passed on:
+            // an indirect jump is a tail call to whatever serves the target
+            // (`jmp [iat]` into another function, the i386 syscall stubs'
+            // `jmp *__wine_syscall` among them); a jump back into this
+            // function reaches a region whose own return check sorts it
+            // out. Leaving instead would unwind every frame above.
+            FTerm::Unresolved { .. } if matches!(self.m.linkage, Linkage::Runtime { .. }) && !cf::mutate("UNRESOLVEDLEAVES") => {
+                self.stats.tail_table += 1;
+                self.tail_through_table(Target::Op(val()));
             }
             FTerm::Unresolved { .. } => self.leave_value(val()),
             FTerm::Syscall { next_pc, next } => {
