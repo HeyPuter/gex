@@ -236,7 +236,10 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
       log(`chrome.log ends:\n${tail}`);
     } catch {}
   });
+  // Every attached target (the Workers), by session: for `profile`.
+  const targets = new Map();
   browser.on('Target.attachedToTarget', async (p) => {
+    targets.set(p.sessionId, p.targetInfo?.url ?? '');
     await browser.send('Runtime.enable', {}, p.sessionId).catch(() => {});
     await browser.send('Runtime.runIfWaitingForDebugger', {}, p.sessionId).catch(() => {});
   });
@@ -284,7 +287,59 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   const url = `http://127.0.0.1:${VITE_PORT}/nt.html?${query}`;
   log(`open ${url}`);
   await browser.send('Page.navigate', { url }, page);
-  return { browser, page, evaluate, state, until, shot, consoleLines };
+  // A CPU profile of each Worker whose script URL contains `match`, over
+  // `ms`: [{ url, profile }] (Chrome's .cpuprofile shape).
+  const profile = async (match, ms) => {
+    const sids = [...targets].filter(([, u]) => u.includes(match)).map(([s]) => s);
+    for (const s of sids) {
+      await browser.send('Profiler.enable', {}, s);
+      await browser.send('Profiler.setSamplingInterval', { interval: 250 }, s);
+      await browser.send('Profiler.start', {}, s);
+    }
+    await sleep(ms);
+    const out = [];
+    for (const s of sids) {
+      const { profile } = await browser.send('Profiler.stop', {}, s);
+      out.push({ url: targets.get(s), profile });
+    }
+    return out;
+  };
+  return { browser, page, evaluate, state, until, shot, consoleLines, profile };
+}
+
+/** A CPU profile summarised: the `n` functions with the most self time and
+ *  the `n` with the most inclusive time, in ms and percent of the span. */
+export function summariseProfile(profile, n = 25) {
+  const byId = new Map(profile.nodes.map((x) => [x.id, x]));
+  const parent = new Map();
+  for (const x of profile.nodes) for (const c of x.children ?? []) parent.set(c, x.id);
+  const name = (x) => {
+    const f = x.callFrame;
+    const file = (f.url || '').split('/').pop().split('?')[0];
+    return `${f.functionName || '(anonymous)'}${file ? ` [${file}]` : ''}`;
+  };
+  const self = new Map();
+  const incl = new Map();
+  let total = 0;
+  const { samples = [], timeDeltas = [] } = profile;
+  for (let i = 0; i < samples.length; i++) {
+    // The time to the next sample is this one's.
+    const dt = (timeDeltas[i + 1] ?? 0) / 1000;
+    total += dt;
+    let x = byId.get(samples[i]);
+    const k = name(x);
+    self.set(k, (self.get(k) ?? 0) + dt);
+    const seen = new Set();
+    for (; x; x = byId.get(parent.get(x.id))) {
+      const kk = name(x);
+      if (seen.has(kk)) continue;
+      seen.add(kk);
+      incl.set(kk, (incl.get(kk) ?? 0) + dt);
+    }
+  }
+  const top = (m) => [...m].sort((a, b) => b[1] - a[1]).slice(0, n)
+    .map(([k, v]) => `  ${v.toFixed(0).padStart(7)} ms ${(100 * v / Math.max(total, 1e-9)).toFixed(1).padStart(5)}%  ${k}`).join('\n');
+  return `span ${total.toFixed(0)} ms\nself:\n${top(self)}\ninclusive:\n${top(incl)}`;
 }
 
 /** Stop vite and Chromium. */
