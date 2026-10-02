@@ -54,6 +54,12 @@ pub const GEX_GL_SURFACE: u64 = 0x4010_6703;
 
 const MAX_BATCH: u32 = 32 * 1024 * 1024;
 
+thread_local! {
+    /// Nanoseconds this Worker has spent waiting on the page's GL host
+    /// (`gl_submit`), for the NT host's per-thread time split.
+    pub(crate) static GL_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug)]
 pub struct GlDevice;
 
@@ -97,7 +103,9 @@ impl FileHandle for GlDevice {
                 if m.read(arg, 32).is_err() {
                     return Some(Err(Errno::EFAULT));
                 }
+                let t0 = crate::now_ns();
                 let r = unsafe { gl_submit(arg as u32) };
+                GL_NS.with(|g| g.set(g.get() + crate::now_ns().saturating_sub(t0)));
                 Some(if r < 0 { Err(Errno::EIO) } else { Ok(0) })
             }
             GEX_GL_LIMITS => Some(m.write_u32(arg, MAX_BATCH).map(|()| 0)),

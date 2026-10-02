@@ -161,6 +161,9 @@ pub struct State {
     next_name: u32,
     /// The default framebuffer's size.
     surface: (i32, i32),
+    /// The top-level window the host's frames were last attached to
+    /// (`op::SURFACE_ATTACH`), when the display takes them directly.
+    attached: u32,
     unpack: PixelStore,
     pack: PixelStore,
     arrays: [Array; ARRAYS],
@@ -187,6 +190,7 @@ impl Default for State {
             strings: HashMap::new(),
             next_name: 1,
             surface: (0, 0),
+            attached: 0,
             unpack: PixelStore::default(),
             pack: PixelStore::default(),
             arrays: [Array::default(); ARRAYS],
@@ -575,6 +579,24 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
     if w <= 0 || h <= 0 {
         return Ok(true);
     }
+    // A display that takes the host's frame as it is (the browser's
+    // compositor draws Mesa's frame straight into the window, on the GPU):
+    // say which window it belongs to and present it -- nothing comes back.
+    if let (Some(d), Some(g)) = (c.p.display(), gdi::surface::geometry(c, hwnd, false)) {
+        if let Some(token) = d.gl_target(g.toplevel, (g.origin.0, g.origin.1, w, h)) {
+            if c.p.gl.lock().unwrap().attached != g.toplevel {
+                cmd(c, op::SURFACE_ATTACH, &[proto::surface::WAYLAND, g.toplevel, token, 0], &[])?;
+                c.p.gl.lock().unwrap().attached = g.toplevel;
+                // And the window itself, once: its frame and caption are its
+                // own pixels, and a window that only ever draws with GL
+                // would otherwise never be published at all.
+                gdi::surface::surface(c, g.toplevel, g.size)?;
+                gdi::surface::flush(c, g.toplevel);
+            }
+            let _ = ask(c, op::PRESENT, &[], &[])?;
+            return finish_swap(c, hdc, hwnd);
+        }
+    }
     // Read from the default framebuffer with default pack state, then put
     // the program's back.
     let (read_fbo, pack) = {
@@ -629,6 +651,12 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
             .map_err(|_| Status(st::ACCESS_VIOLATION))?;
     }
     gdi::surface::flush(c, g.toplevel);
+    finish_swap(c, hdc, hwnd)
+}
+
+/// After a frame went to the window, however: count it, let scripted input
+/// run, and size the next frame to the window.
+fn finish_swap(c: &mut Call<'_>, hdc: u32, hwnd: u32) -> R<bool> {
     let frame = {
         let mut s = c.p.gl.lock().unwrap();
         s.frame += 1;

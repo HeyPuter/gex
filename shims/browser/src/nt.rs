@@ -257,6 +257,7 @@ mod imp {
             warn_line(&format!("gex-nt: arena self-check: {}\n", crate::arena_selftest()));
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
+        GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
         }
@@ -339,7 +340,14 @@ mod imp {
     #[derive(Default)]
     struct WlDisplay {
         windows: std::sync::Mutex<std::collections::BTreeMap<u32, (nt::display::NtSurface, u32)>>,
+        /// Windows whose GL frames the compositor draws itself, at this
+        /// rectangle of the window's surface (`gl_target`).
+        gl: std::sync::Mutex<std::collections::BTreeMap<u32, (i32, i32, i32, i32)>>,
     }
+
+    /// GEX_NT_GL_READBACK: read each GL frame back into the window's surface
+    /// instead of handing it to the compositor (the old path, for comparing).
+    static GL_READBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Words in a scene record and an input event: `REC` and `EV` in
     /// `crate::wl` and `wl-bridge.mjs`.
@@ -354,6 +362,7 @@ mod imp {
 
     impl WlDisplay {
         fn flush(&self, windows: &std::collections::BTreeMap<u32, (nt::display::NtSurface, u32)>) {
+            let gl = self.gl.lock().unwrap().clone();
             let mut scene: Vec<i32> = Vec::with_capacity(windows.len() * REC);
             for (s, serial) in windows.values().take(64) {
                 let base = scene.len();
@@ -370,6 +379,14 @@ mod imp {
                 r[9] = s.stride as i32;
                 r[10] = XRGB8888;
                 r[11] = *serial as i32;
+                // The host's GL frame, drawn by the compositor over this
+                // part of the surface (`F_EXTERNAL`, `R_GL_RECT` in
+                // wl-bridge.mjs).
+                if let Some(&(gx, gy, gw, gh)) = gl.get(&s.id) {
+                    r[16] = 2;
+                    r[26] = (gx & 0xffff) | (gy << 16);
+                    r[27] = (gw & 0xffff) | (gh << 16);
+                }
                 let (l, t, rt, b) = s.damage;
                 r[12] = l;
                 r[13] = t;
@@ -401,9 +418,22 @@ mod imp {
 
         fn remove(&self, id: u32) {
             let mut w = self.windows.lock().unwrap();
+            self.gl.lock().unwrap().remove(&id);
             if w.remove(&id).is_some() {
                 self.flush(&w);
             }
+        }
+
+        fn gl_target(&self, toplevel: u32, rect: (i32, i32, i32, i32)) -> Option<u32> {
+            if GL_READBACK.load(Ordering::Relaxed) {
+                return None;
+            }
+            let changed = self.gl.lock().unwrap().insert(toplevel, rect) != Some(rect);
+            if changed {
+                let w = self.windows.lock().unwrap();
+                self.flush(&w);
+            }
+            Some(crate::my_pid().max(0) as u32)
         }
 
         fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {
@@ -477,6 +507,9 @@ mod imp {
             return;
         }
         let presents = p.presents.load(Ordering::Relaxed);
+        if t / 1000 % 10 == 0 {
+            report_times();
+        }
         if VERIFY_REGISTRY.load(Ordering::Relaxed) {
             if let Some(what) = with_host(crate::verify_registry) {
                 warn_line(&format!("gex-nt: a translation was overwritten after it was kept: {what}\n"));
@@ -590,12 +623,21 @@ mod imp {
         let r0 = gm.read_u32(sp0).unwrap_or(0) as u64;
         let r1 = gm.read_u32(sp0 + 4).unwrap_or(0) as u64;
         ring_note(ctx_addr, (nr as u64) << 32 | sp0, r0 << 32 | r1);
+        let (t_in, gl_in) = (crate::now_ns(), crate::gl::GL_NS.with(|g| g.get()));
         let outcome = {
             let mut host = Nested { ctx_addr };
             nt::syscall(p, &HostKernel, guest_bytes(), ctx_addr, pc as u64, &mut host)
         };
         if TRACE_FOREIGN.load(Ordering::Relaxed) {
             crate::foreign_now("during", &nt::syscall_name(nr));
+        }
+        {
+            let gl = crate::gl::GL_NS.with(|g| g.get()) - gl_in;
+            let all = crate::now_ns().saturating_sub(t_in);
+            let name = nt::syscall_name(nr);
+            let wait = name.contains("Wait") || name.contains("Delay") || name.contains("Remove") || name.contains("Yield");
+            time_note(ctx_addr, if wait { 1 } else { 0 }, all.saturating_sub(gl));
+            time_note(ctx_addr, 2, gl);
         }
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
@@ -772,6 +814,62 @@ mod imp {
         let e = &r.calls[(i % RING as u64) as usize];
         e[0].store(a, Ordering::Relaxed);
         e[1].store(b, Ordering::Relaxed);
+    }
+
+    /// GEX_NT_STATS' per-thread time split: nanoseconds in NT calls (0),
+    /// in waits (1), waiting on the page's GL host (2), and in the glue's run
+    /// loop between traps (3); and, per thread, the totals as of the last
+    /// report (4..8) and when that was (8). Keyed by context, like the rings.
+    struct Times {
+        ctx: AtomicU64,
+        v: [AtomicU64; 9],
+    }
+    static TIMES: [Times; 64] = [const { Times { ctx: AtomicU64::new(0), v: [const { AtomicU64::new(0) }; 9] } }; 64];
+
+    fn times_of(ctx: u64) -> &'static Times {
+        let t = &TIMES[(ctx as usize / 0x80) % TIMES.len()];
+        if t.ctx.swap(ctx, Ordering::Relaxed) != ctx {
+            for v in &t.v {
+                v.store(0, Ordering::Relaxed);
+            }
+            t.v[8].store(crate::now_ns(), Ordering::Relaxed);
+        }
+        t
+    }
+
+    fn time_note(ctx: u64, what: usize, ns: u64) {
+        times_of(ctx).v[what].fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// The glue's time between a trap and re-entering the guest, per thread.
+    #[no_mangle]
+    pub extern "C" fn gex_nt_note_js_ns(ctx: i32, ns: f64) {
+        if ns > 0.0 {
+            time_note(ctx as u32 as u64, 3, ns as u64);
+        }
+    }
+
+    /// Every thread's split since its last report: one line each.
+    fn report_times() {
+        let now = crate::now_ns();
+        for t in &TIMES {
+            let ctx = t.ctx.load(Ordering::Relaxed);
+            if ctx == 0 {
+                continue;
+            }
+            let cur: Vec<u64> = (0..4).map(|i| t.v[i].load(Ordering::Relaxed)).collect();
+            let d: Vec<u64> = (0..4).map(|i| cur[i].saturating_sub(t.v[4 + i].swap(cur[i], Ordering::Relaxed))).collect();
+            let wall = now.saturating_sub(t.v[8].swap(now, Ordering::Relaxed));
+            if wall == 0 || d.iter().sum::<u64>() == 0 {
+                continue;
+            }
+            let ms = |v: u64| v / 1_000_000;
+            let rest = wall.saturating_sub(d.iter().sum::<u64>());
+            warn_line(&format!(
+                "gex-nt: time ctx {ctx:#x} over {} ms: guest {} ms, NT calls {} ms, waits {} ms, GL host {} ms, glue {} ms\n",
+                ms(wall), ms(rest), ms(d[0]), ms(d[1]), ms(d[2]), ms(d[3])
+            ));
+        }
     }
 
     /// GEX_NT_TRAP_PCS' notes: per thread, the last few block entries with

@@ -97,6 +97,8 @@ export class MesaGlDevice {
   // Wall time actually spent inside a batch, so "the Mesa path is slow" can be
   // attributed rather than assumed.
   #submitMs = 0;
+  #readbacks = 0;
+  #readbackMs = 0;
   #maxSubmitMs = 0;
   #busy = false;
   #lastPresented = 0;
@@ -370,6 +372,12 @@ export class MesaGlDevice {
     const finish = (rc) => {
       const elapsed = performance.now() - started;
       this.#submitMs += elapsed;
+      // A frame's readback (the NT host reads every frame back to blit it
+      // into the window): what the GPU -- SwiftShader, headless -- took.
+      if ((this.#module?._gex_gl_reply_len?.() ?? 0) >= 256 * 1024) {
+        this.#readbacks++;
+        this.#readbackMs += elapsed;
+      }
       if (elapsed > this.#maxSubmitMs) this.#maxSubmitMs = elapsed;
       this.#module._free(ptr);
       if (rc !== 0) {
@@ -584,7 +592,8 @@ export class MesaGlDevice {
       `mesa=1 submits=${this.#submits} bytes=${this.#bytes} ` +
       `submit_ms=${this.#submitMs.toFixed(1)} ` +
       `avg_ms=${(this.#submitMs / Math.max(1, this.#submits)).toFixed(3)} ` +
-      `max_ms=${this.#maxSubmitMs.toFixed(1)}`;
+      `max_ms=${this.#maxSubmitMs.toFixed(1)} ` +
+      `readbacks=${this.#readbacks} readback_ms=${this.#readbackMs.toFixed(1)}`;
   }
 
   commands() {

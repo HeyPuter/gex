@@ -50,6 +50,12 @@ export const R_FLAGS = 16;
 export const R_XID = 17;
 export const R_TITLE = 18;
 export const R_TITLE_WORDS = 8;
+/** With `F_EXTERNAL`: where in the surface the host's GL frame goes, as
+ * `x | y << 16` and `w | h << 16`. Zero for the whole surface (a Wayland GL
+ * client's window is all frame; a Windows one has its frame and title bar
+ * drawn by the program, and the GL picture only in the client area). */
+export const R_GL_ORIGIN = 26;
+export const R_GL_SIZE = 27;
 
 /** Roles, as `gex_wayland::Role::code` writes them. */
 export const ROLE_TOPLEVEL = 1;
@@ -188,6 +194,14 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         flags: a[r + R_FLAGS],
         xid: a[r + R_XID] >>> 0,
         external: (a[r + R_FLAGS] & F_EXTERNAL) !== 0,
+        glRect: (a[r + R_FLAGS] & F_EXTERNAL) && a[r + R_GL_SIZE]
+          ? {
+            x: a[r + R_GL_ORIGIN] << 16 >> 16,
+            y: a[r + R_GL_ORIGIN] >> 16,
+            w: a[r + R_GL_SIZE] & 0xffff,
+            h: a[r + R_GL_SIZE] >>> 16,
+          }
+          : null,
         title: end ? decoder.decode(bytes.subarray(0, end)) : '',
       });
     }
