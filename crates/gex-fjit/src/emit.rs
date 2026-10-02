@@ -104,6 +104,11 @@ pub struct Emitted {
     pub loops: Vec<Vec<u8>>,
 }
 
+fn check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_FJIT_CHECK").is_some())
+}
+
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GEX_FJIT_TRACE").is_some())
@@ -170,6 +175,12 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     };
     let weight = cf::frame_weight(&regs);
     let used: Vec<GuestReg> = regs.used.iter().copied().collect();
+    let used_set = RegSet::of(&used);
+    let rlive = read_live(m, f, &|_| true);
+    // What the entry reads, and what a back-edge into it may leave dirty
+    // (the analysis marks those dirty on the first entry too).
+    let entry_set = always(used_set).union(rlive[0]).union(dirty[0]).inter(used_set);
+    let vin = valid_in(m, f, &|_| true, 0, entry_set, &rlive, &dirty, used_set);
 
     let mut lfns = Vec::new();
     for lp in loops {
@@ -221,7 +232,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         b.f().ret();
         b.f().end();
     }
-    b.load(&used);
+    b.load(&regs_of(entry_set));
     let spl = b.reg(sp_reg());
     b.f().local_get(spl);
     b.f().local_set(sp0);
@@ -245,6 +256,10 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         n_blocks: n,
         stats,
         pending: None,
+        rlive,
+        vin,
+        valid: entry_set,
+        used: used_set,
     };
     e.stats.functions += 1;
     e.stats.blocks += f.blocks.iter().filter(|b| !b.synthetic).count();
@@ -283,6 +298,134 @@ fn trailing_flag_writes(stmts: &[Stmt]) -> Vec<usize> {
     out
 }
 
+fn regs_of(s: RegSet) -> Vec<GuestReg> {
+    (0..gex_ir::func::N_REGS).filter(|&k| s.0 >> k & 1 != 0).map(gex_ir::func::reg_of_index).collect()
+}
+
+/// Registers whose locals must be loaded wherever any are: the stack
+/// pointer (the return check reads its local, not a `ReadReg`) and the
+/// flags (a write-back packs all four).
+fn always(used: RegSet) -> RegSet {
+    flags().union(RegSet::of(&[sp_reg()])).inter(used)
+}
+
+/// The registers a call leaves in their locals: a summarised callee's
+/// preserved ones (not reloaded after it).
+fn kept(m: &ModuleCx<'_>, callee: &Callee) -> RegSet {
+    match callee {
+        Callee::Direct(t) if m.bodies.contains_key(t) && cf::live_writebacks() => {
+            m.sums.get(t).map_or(RegSet::EMPTY, |sm| sm.preserved.minus(RegSet::of(&[sp_reg()])))
+        }
+        _ => RegSet::EMPTY,
+    }
+}
+
+/// The registers some path from each block's entry reads (a `ReadReg`)
+/// before writing, over the blocks `keep` admits. A call reloads what its
+/// continuation reads but the callee's preserved registers (`kept`), which
+/// must hold their values before it; a syscall and a clobbering host call
+/// reload everything.
+fn read_live(m: &ModuleCx<'_>, f: &Function, keep: &dyn Fn(usize) -> bool) -> Vec<RegSet> {
+    let n = f.blocks.len();
+    if cf::exp("FULLRELOAD") {
+        return vec![RegSet::ALL; n];
+    }
+    let mut live = vec![RegSet::EMPTY; n];
+    let order: Vec<usize> = f.rpo().iter().rev().map(|b| b.index()).filter(|&i| keep(i)).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &i in &order {
+            let b = &f.blocks[i];
+            let mut l = match &b.term {
+                FTerm::Call { callee, ret: Some(r), .. } if keep(r.to.index()) => live[r.to.index()].inter(kept(m, callee)),
+                FTerm::Call { .. } | FTerm::Syscall { .. } => RegSet::EMPTY,
+                t => t.edges().iter().map(|e| e.to.index()).filter(|&s| keep(s)).fold(RegSet::EMPTY, |a, s| a.union(live[s])),
+            };
+            for st in b.stmts.iter().rev() {
+                match st {
+                    Stmt::WriteReg { reg, .. } => l.remove(*reg),
+                    Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
+                    _ if gex_cgen::emit::clobbers(st) => l = RegSet::EMPTY,
+                    _ => {}
+                }
+            }
+            if l != live[i] {
+                live[i] = l;
+                changed = true;
+            }
+        }
+    }
+    live
+}
+
+/// For each block of those `keep` admits, the registers whose locals hold
+/// the guest's values on entry: a must-analysis from `entry` (which loads
+/// `entry_set`). A write makes a register valid; a call leaves its
+/// preserved registers as they were and reloads only what its continuation
+/// reads (`read_live`); a syscall or clobbering host call reloads all. An
+/// edge loads what its target may find dirty and is not valid yet (see
+/// `E::edge_inner`), so every dirty register is a valid one.
+#[allow(clippy::too_many_arguments)]
+fn valid_in(
+    m: &ModuleCx<'_>,
+    f: &Function,
+    keep: &dyn Fn(usize) -> bool,
+    entry: usize,
+    entry_set: RegSet,
+    rlive: &[RegSet],
+    dirty: &[RegSet],
+    used: RegSet,
+) -> Vec<RegSet> {
+    let n = f.blocks.len();
+    let mut vin = vec![used; n];
+    let mut seen = vec![false; n];
+    vin[entry] = entry_set;
+    seen[entry] = true;
+    let order: Vec<usize> = f.rpo().iter().map(|b| b.index()).filter(|&i| keep(i)).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &i in &order {
+            if !seen[i] {
+                continue;
+            }
+            let b = &f.blocks[i];
+            let mut v = vin[i];
+            for st in &b.stmts {
+                match st {
+                    Stmt::WriteReg { reg, .. } => v.insert(*reg),
+                    _ if gex_cgen::emit::clobbers(st) => v = used,
+                    _ => {}
+                }
+            }
+            let after = match &b.term {
+                FTerm::Call { callee, ret: Some(r), .. } => {
+                    let kept = kept(m, callee);
+                    let reload = always(used).union(rlive[r.to.index()]).inter(used).minus(kept);
+                    v.inter(kept).union(reload)
+                }
+                FTerm::Syscall { .. } => used,
+                _ => v,
+            };
+            for e in b.term.edges() {
+                let s = e.to.index();
+                if !keep(s) {
+                    continue;
+                }
+                let new = after.union(dirty[s].inter(used));
+                let merged = if seen[s] { vin[s].inter(new) } else { new };
+                if !seen[s] || merged != vin[s] {
+                    vin[s] = merged;
+                    seen[s] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    vin
+}
+
 /// Whether `i -> h` is a back-edge of outlined loop `lp` where the body
 /// hands the loop over (gex-cgen's rule: a backward branch by address).
 fn handover_edge(f: &Function, lp: &Loop, i: usize, t: usize) -> bool {
@@ -314,6 +457,10 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     };
     let weight = cf::frame_weight(&regs);
     let used: Vec<GuestReg> = regs.used.iter().copied().collect();
+    let used_set = RegSet::of(&used);
+    let rlive = read_live(m, f, &in_loop);
+    let entry_set = always(used_set).union(rlive[lp.header]).union(dirty[lp.header]).inter(used_set);
+    let vin = valid_in(m, f, &in_loop, lp.header, entry_set, &rlive, &dirty, used_set);
     let mut b = FnBody::new(m.cx, f.blocks[lp.header].start, 5, &used, f.n_values);
     let poll = b.local(ValType::I32);
     let hot = b.local(ValType::I32);
@@ -321,7 +468,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     let rk = b.local(ValType::I32);
     let sel = b.local(ValType::I32);
     let e64 = b.local(ValType::I64);
-    b.load(&used);
+    b.load(&regs_of(entry_set));
     b.f().i32_const(cf::LOOP_POLL);
     b.f().local_set(poll);
     let mut e = E {
@@ -338,6 +485,10 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
         n_blocks: n,
         stats,
         pending: None,
+        rlive,
+        vin,
+        valid: entry_set,
+        used: used_set,
     };
     e.top(lp.header);
     e.b.f().unreachable();
@@ -425,9 +576,33 @@ struct E<'m, 'a> {
     /// The current block's trailing flag writes, done on the edges that
     /// need them (`trailing_flag_writes`).
     pending: Option<(Deferred, bool)>,
+    /// Per block, the registers some path from its entry reads before
+    /// writing (`read_live`): what a reload after a call loads.
+    rlive: Vec<RegSet>,
+    /// Per block, the registers whose locals hold the guest's values on
+    /// entry (`valid_in`).
+    vin: Vec<RegSet>,
+    /// The same, here in the emission.
+    valid: RegSet,
+    used: RegSet,
 }
 
 impl E<'_, '_> {
+    /// Write back the dirty registers in `mask` (`FnBody::flush`), which
+    /// must all hold their values (`GEX_FJIT_CHECK=1` checks it).
+    fn flush(&mut self, mask: RegSet, keep_dirty: bool) {
+        if check() {
+            let bad = self.b.dirty().inter(mask).inter(self.used).minus(self.valid);
+            assert!(
+                bad == RegSet::EMPTY,
+                "fjit {:#x}: writing back registers whose locals are stale: {:?}",
+                self.f.entry,
+                regs_of(bad)
+            );
+        }
+        self.b.flush(mask, keep_dirty);
+    }
+
     // -- structure ---------------------------------------------------------
 
     fn shape(&self) -> &Shape {
@@ -557,13 +732,24 @@ impl E<'_, '_> {
         if trace() && !blk.synthetic {
             // `GEX_FJIT_TRACE=1`: the host prints each block as it is
             // entered, with the registers written back first.
-            self.b.flush(RegSet::ALL, true);
+            self.flush(RegSet::ALL, true);
             let bp = self.m.cx.breakpoint;
             let fb = self.b.f();
             fb.local_get(0);
             fb.i64_const(blk.start as i64);
             fb.i32_const(gex_abi::imports::BRK_TRACE);
             fb.call(bp);
+        }
+        self.valid = self.vin[x];
+        for st in &blk.stmts {
+            match st {
+                Stmt::WriteReg { reg, .. } => self.valid.insert(*reg),
+                Stmt::Def { expr: Expr::ReadReg(r), .. } if check() && !self.valid.contains(*r) && *r != GuestReg::CtxAddr => {
+                    panic!("fjit {:#x}: block {:#x} reads {r:?}, whose local is stale", f.entry, blk.start)
+                }
+                _ if gex_cgen::emit::clobbers(st) => self.valid = self.used,
+                _ => {}
+            }
         }
         let mut keep: Vec<Value> = Vec::new();
         blk.term.for_each_use(|v| keep.push(v));
@@ -625,7 +811,8 @@ impl E<'_, '_> {
             Some((d, false)) => FnBody::deferred_regs(d).any(|r| self.live[t].contains(r)),
             _ => false,
         };
-        if backward_addr(self.f, i, t) || pend {
+        let fix = t < self.dirty.len() && self.dirty[t].inter(self.used).minus(self.valid) != RegSet::EMPTY;
+        if backward_addr(self.f, i, t) || pend || fix {
             return false;
         }
         match (&self.layout, &self.mode) {
@@ -662,12 +849,22 @@ impl E<'_, '_> {
     /// edge (or its default) starts from the block's state, not the end of
     /// that code.
     fn edge(&mut self, i: usize, t: usize) {
-        let dirty = self.b.dirty();
+        let (dirty, valid) = (self.b.dirty(), self.valid);
         self.edge_inner(i, t);
         self.b.set_dirty(dirty);
+        self.valid = valid;
     }
 
     fn edge_inner(&mut self, i: usize, t: usize) {
+        // A register `t` may find dirty must hold its value here too: one
+        // this path never loaded is loaded now (clean on this path).
+        if t < self.dirty.len() {
+            let fix = self.dirty[t].inter(self.used).minus(self.valid);
+            if fix != RegSet::EMPTY {
+                self.b.load(&regs_of(fix));
+                self.valid = self.valid.union(fix);
+            }
+        }
         self.pending_for(t);
         let f = self.f;
         let backward = backward_addr(f, i, t);
@@ -683,7 +880,7 @@ impl E<'_, '_> {
                     let p = self.locals.poll;
                     self.b.f().i32_const(1024);
                     self.b.f().local_set(p);
-                    self.b.flush(RegSet::ALL, true);
+                    self.flush(RegSet::ALL, true);
                     self.call_safepoint(to_start);
                     if nested {
                         let h = self.locals.hot;
@@ -693,7 +890,7 @@ impl E<'_, '_> {
                         self.b.f().local_get(h);
                         self.b.f().if_void();
                         self.labels.push(Label::Other);
-                        self.b.flush(RegSet::ALL, true);
+                        self.flush(RegSet::ALL, true);
                     }
                     self.go(i, self.n_blocks + k);
                     self.close();
@@ -705,7 +902,7 @@ impl E<'_, '_> {
                 if !lp.body.contains(&t) {
                     // Leaving the loop: everything back, and the body
                     // carries on at `t`.
-                    self.b.flush(RegSet::ALL, true);
+                    self.flush(RegSet::ALL, true);
                     self.b.f().i32_const(LOOP_EXIT + t as i32);
                     self.b.f().ret();
                     return;
@@ -714,7 +911,7 @@ impl E<'_, '_> {
                     // The loop's own back-edge: a chunk ends here when the
                     // countdown expires.
                     self.poll_expired();
-                    self.b.flush(RegSet::ALL, true);
+                    self.flush(RegSet::ALL, true);
                     self.call_safepoint(to_start);
                     self.b.f().i32_const(LOOP_CHUNK);
                     self.b.f().ret();
@@ -724,7 +921,7 @@ impl E<'_, '_> {
                         self.b.f().local_get(h);
                         self.b.f().if_void();
                         self.labels.push(Label::Other);
-                        self.b.flush(RegSet::ALL, true);
+                        self.flush(RegSet::ALL, true);
                         self.b.f().i32_const(LOOP_CHUNK);
                         self.b.f().ret();
                         self.close();
@@ -741,7 +938,7 @@ impl E<'_, '_> {
             let p = self.locals.poll;
             self.b.f().i32_const(1024);
             self.b.f().local_set(p);
-            self.b.flush(cf::non_flags().union(self.live[t]), true);
+            self.flush(cf::non_flags().union(self.live[t]), true);
             self.call_safepoint(to_start);
             if self.in_nested(i) {
                 let h = self.locals.hot;
@@ -801,6 +998,7 @@ impl E<'_, '_> {
         fb.ret();
         fb.end();
         self.b.reload_except(RegSet::EMPTY);
+        self.valid = self.used;
         let me = self.n_blocks + k;
         for &x in &loops[k].exits {
             let fb = self.b.f();
@@ -820,14 +1018,14 @@ impl E<'_, '_> {
 
     /// Write everything back, set PC, return 0: the root takes it from here.
     fn leave_const(&mut self, pc: u64) {
-        self.b.flush(RegSet::ALL, false);
+        self.flush(RegSet::ALL, false);
         self.b.store_pc(pc);
         self.b.f().i32_const(0);
         self.b.f().ret();
     }
 
     fn leave_value(&mut self, v: Operand) {
-        self.b.flush(RegSet::ALL, false);
+        self.flush(RegSet::ALL, false);
         self.store_pc_value(v);
         self.b.f().i32_const(0);
         self.b.f().ret();
@@ -895,7 +1093,7 @@ impl E<'_, '_> {
     /// A tail call through the table (runtime linkage): everything written
     /// back, a poll, and the callee returns to this function's caller.
     fn tail_through_table(&mut self, t: Target) {
-        self.b.flush(RegSet::ALL, false);
+        self.flush(RegSet::ALL, false);
         match t {
             Target::Const(a) => self.b.safepoint(a),
             Target::Op(o) => {
@@ -993,7 +1191,7 @@ impl E<'_, '_> {
             FTerm::TailCall { callee } => match callee {
                 Callee::Direct(t) if self.m.bodies.contains_key(t) => {
                     self.stats.tail_known += 1;
-                    self.b.flush(RegSet::ALL, false);
+                    self.flush(RegSet::ALL, false);
                     // A tail call passes through no back-edge or root, so it
                     // polls.
                     self.b.safepoint(*t);
@@ -1048,13 +1246,13 @@ impl E<'_, '_> {
                     fb.byte(0x71); // i32.and
                 }
                 self.b.f().if_void();
-                self.b.flush(RegSet::ALL.minus(flags()), true);
+                self.flush(RegSet::ALL.minus(flags()), true);
                 let fb = self.b.f();
                 fb.local_get(2);
                 fb.i32_const(NEED_FLAGS);
                 fb.byte(0x71); // i32.and
                 fb.if_void();
-                self.b.flush(flags(), true);
+                self.flush(flags(), true);
                 self.b.f().end();
                 self.b.f().i32_const(1);
                 self.b.f().ret();
@@ -1063,7 +1261,7 @@ impl E<'_, '_> {
             }
             FTerm::Unresolved { .. } => self.leave_value(val()),
             FTerm::Syscall { next_pc, next } => {
-                self.b.flush(RegSet::ALL, false);
+                self.flush(RegSet::ALL, false);
                 self.b.store_pc(*next_pc);
                 let sc = self.m.cx.syscall;
                 let fb = self.b.f();
@@ -1071,6 +1269,7 @@ impl E<'_, '_> {
                 fb.i64_const(blk.term_pc as i64);
                 fb.call(sc);
                 self.b.reload_except(RegSet::EMPTY);
+                self.valid = self.used;
                 match next {
                     Some(e) => self.edge(i, e.to.index()),
                     None => {
@@ -1080,7 +1279,7 @@ impl E<'_, '_> {
                 }
             }
             FTerm::Illegal { raw, pc } => {
-                self.b.flush(RegSet::ALL, false);
+                self.flush(RegSet::ALL, false);
                 self.b.store_pc(*pc);
                 let il = self.m.cx.illegal;
                 let fb = self.b.f();
@@ -1191,7 +1390,7 @@ impl E<'_, '_> {
             },
             _ => RegSet::ALL,
         };
-        self.b.flush(need, false);
+        self.flush(need, false);
         // What the callee must hand back: the flags only if the
         // continuation reads one.
         let need_back = match ret {
@@ -1301,7 +1500,16 @@ impl E<'_, '_> {
             },
             _ => RegSet::EMPTY,
         };
-        self.b.reload_except(keep);
+        // Reload what the continuation may read; the rest keep stale
+        // locals, clean, until written (`valid_in` keeps them out of any
+        // write-back).
+        let reload = match ret {
+            Some(r) => always(self.used).union(self.rlive[r]).inter(self.used).minus(keep),
+            None => RegSet::EMPTY,
+        };
+        self.b.load(&regs_of(reload));
+        self.b.set_dirty(RegSet::EMPTY);
+        self.valid = self.valid.inter(keep).union(reload);
         match ret {
             Some(r) => self.edge(i, r),
             None => {
