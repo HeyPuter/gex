@@ -92,6 +92,7 @@ impl Jit {
         mem: &[u8],
         addr: u64,
         executable: &dyn Fn(u64) -> bool,
+        read_only: &dyn Fn(u64, u64) -> bool,
         page_gen: &dyn Fn(u64) -> u32,
         class32: bool,
     ) -> Option<Vec<u8>> {
@@ -107,7 +108,7 @@ impl Jit {
         }
         let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
         let readonly = st.readonly.clone();
-        let ro = |a: u64, n: u64| readonly.iter().any(|&(lo, hi)| a >= lo && a.saturating_add(n) <= hi);
+        let ro = |a: u64, n: u64| readonly.iter().any(|&(lo, hi)| a >= lo && a.saturating_add(n) <= hi) || read_only(a, n);
         let code = Code::memory(mem, executable, &ro);
         let opts = RecoverOptions::default();
         let mut batch: BTreeMap<u64, Function> = BTreeMap::new();

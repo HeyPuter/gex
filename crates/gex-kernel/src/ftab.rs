@@ -180,6 +180,10 @@ pub struct Request<'a> {
     pub addr: u64,
     /// Whether the guest may execute the byte at an address.
     pub executable: &'a dyn Fn(u64) -> bool,
+    /// Whether `n` bytes at an address are mapped readable and not
+    /// writable now: a jump table read from them is as fixed as one in an
+    /// image's read-only segment (not tracked past a later `mprotect`).
+    pub read_only: &'a dyn Fn(u64, u64) -> bool,
     /// The value `gex_abi::PAGE_GEN` holds for a page (guest address /
     /// `DISPATCH_PAGE`) now, never 0: what the translation's page checks
     /// compare against. Asking numbers the page if it was not.

@@ -53,14 +53,22 @@ pub(crate) mod stats {
     pub static TRANSLATED: AtomicU64 = AtomicU64::new(0);
     pub static FALLBACKS: AtomicU64 = AtomicU64::new(0);
     pub static STALE: AtomicU64 = AtomicU64::new(0);
+    /// Microseconds in the translator, in compiling its modules, and the
+    /// longest single lookup miss (translate + compile + install).
+    pub static TRANSLATE_US: AtomicU64 = AtomicU64::new(0);
+    pub static COMPILE_US: AtomicU64 = AtomicU64::new(0);
+    pub static WORST_US: AtomicU64 = AtomicU64::new(0);
     pub fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "ftab lookups={} translated={} fallback={} stale={}",
+            "ftab lookups={} translated={} fallback={} stale={} translate_ms={} compile_ms={} worst_ms={}",
             LOOKUPS.load(Relaxed),
             TRANSLATED.load(Relaxed),
             FALLBACKS.load(Relaxed),
-            STALE.load(Relaxed)
+            STALE.load(Relaxed),
+            TRANSLATE_US.load(Relaxed) / 1000,
+            COMPILE_US.load(Relaxed) / 1000,
+            WORST_US.load(Relaxed) / 1000
         )
     }
 }
@@ -350,10 +358,15 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
 /// store and say which index serves `addr`.
 fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Result<Option<u32>> {
     let Some(tr) = gex_kernel::ftab::translator() else { return Ok(None) };
-    let exec: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
-        k.mem.vmas().iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect()
+    let (exec, ro): (Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
+        let v = k.mem.vmas();
+        (
+            v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
+            v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
+        )
     });
     let executable = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e);
+    let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     if !executable(addr) {
         return Ok(None);
     }
@@ -370,21 +383,32 @@ fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, mem
         mem: memory.bytes(),
         addr,
         executable: &executable,
+        read_only: &read_only,
         page_gen: &pg,
         class32: gex_abi::X86 && gex_xlate::arch::compat(),
     };
-    let Some(t) = tr.translate(&req) else { return Ok(None) };
+    let t0 = std::time::Instant::now();
+    let t = tr.translate(&req);
+    stats::TRANSLATE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let Some(t) = t else { return Ok(None) };
     let funcs = gex_kernel::ftab::module_funcs(&t.wasm).ok_or_else(|| anyhow!("a translation for {addr:#x} has no gex.funcs section"))?;
     if !funcs.contains(&addr) {
         bail!("the translation for {addr:#x} does not hold it");
     }
     let engine = caller.engine().clone();
+    let t1 = std::time::Instant::now();
     let module = Module::new(&engine, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
+    let tc = t1.elapsed();
+    stats::COMPILE_US.fetch_add(tc.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     stats::TRANSLATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let checks = pages.into_inner().unwrap_or_else(|e| e.into_inner());
     publish(sh, memory, module, &funcs, Tier::Jit, checks)?;
     catch_up(&mut *caller)?;
     replay_registry(caller)?;
+    stats::WORST_US.fetch_max(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var("GEX_FTAB_SLOW").ok().and_then(|v| v.parse::<u128>().ok()).is_some_and(|ms| t0.elapsed().as_millis() >= ms) {
+        eprintln!("[ftab] slow miss {addr:#x}: {} ms (translate {} ms, compile {} ms, {} bytes)", t0.elapsed().as_millis(), (t1 - t0).as_millis(), tc.as_millis(), t.wasm.len());
+    }
     Ok(sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(addr).map(|f| f.idx))
 }
 
