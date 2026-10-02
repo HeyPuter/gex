@@ -1305,6 +1305,25 @@ impl<'a> Lifter<'a> {
                 self.wr_reg(Reg::Gp(RBP, w), v);
                 Flow::Next
             }
+            Op::Pusha => {
+                // eax, ecx, edx, ebx, the esp from before, ebp, esi, edi.
+                let sp = self.rd(Operand::Reg(Reg::Gp(RSP, w)), w);
+                for r in 0..8 {
+                    let v = if r == RSP { sp } else { self.rd(Operand::Reg(Reg::Gp(r, w)), w) };
+                    self.push(w, v);
+                }
+                Flow::Next
+            }
+            Op::Popa => {
+                // The reverse, skipping the saved esp.
+                for r in (0..8).rev() {
+                    let v = self.pop(w);
+                    if r != RSP {
+                        self.wr_reg(Reg::Gp(r, w), v);
+                    }
+                }
+                Flow::Next
+            }
             Op::Enter => {
                 // enter imm16, 0: push rbp; mov rbp, rsp; sub rsp, imm.
                 let Some(Operand::Imm(size)) = i.ops[0] else {

@@ -1319,8 +1319,14 @@ impl<'a> Lifter<'a> {
             | Op::Pcmpestrm
             | Op::Pclmulqdq
             | Op::Mpsadbw
-            | Op::Dpp
-            | Op::Emms => return self.illegal(),
+            | Op::Dpp => return self.illegal(),
+            // Every x87 register empty. gex has no MMX state of its own (the
+            // MMX instructions are not lifted), so that is all emms does:
+            // code that clears it defensively after SSE work runs.
+            Op::Emms => {
+                let z = self.k32(0);
+                self.b.write(GuestReg::X87Tags, z);
+            }
             _ => return self.illegal(),
         }
         Flow::Next

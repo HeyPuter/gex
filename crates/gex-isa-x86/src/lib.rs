@@ -356,6 +356,9 @@ pub enum Op {
     Ret,
     Leave,
     Enter,
+    /// `pusha`/`pushad` and `popa`/`popad`: 32-bit code only.
+    Pusha,
+    Popa,
     Syscall,
     Int3,
     Int,
