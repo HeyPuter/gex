@@ -48,6 +48,7 @@ pub fn build(
     intrinsics: &[u64],
     summaries: &HashMap<u64, Summary>,
     class32: bool,
+    ret_pops: &HashMap<u64, u64>,
 ) -> Result<(Vec<u8>, Stats)> {
     let started = std::time::Instant::now();
     let index: HashMap<u64, u32> = blocks.iter().map(|(b, f)| (b.start, *f)).collect();
@@ -61,7 +62,7 @@ pub fn build(
         prep::prepare(f, summaries);
     }
     let mut stats = Stats::default();
-    let (jwasm, entries) = module::build_module(&funcs, summaries, class32, &mut stats)?;
+    let (jwasm, entries) = module::build_module(&funcs, summaries, class32, ret_pops, &mut stats)?;
     let emitted = started.elapsed();
     // Registered in dispatch: the entries tier-1 also has a block for.
     let pairs: Vec<(u64, u32)> = entries.iter().filter_map(|a| index.get(a).map(|f| (*a, *f))).collect();
@@ -116,6 +117,7 @@ pub fn runtime(
     class32: bool,
     page_gen: &dyn Fn(u64) -> u32,
     intrinsics: &[Block],
+    ret_pops: &HashMap<u64, u64>,
 ) -> Result<(Vec<u8>, Vec<u64>, Stats)> {
     let ib: HashMap<u64, &Block> = intrinsics.iter().map(|b| (b.start, b)).collect();
     let mut functions = gex_cgen::select(functions, &ib, &HashSet::new())?;
@@ -137,6 +139,6 @@ pub fn runtime(
         prep::prepare(f, summaries);
     }
     let mut stats = Stats::default();
-    let (wasm, entries) = module::build_runtime(&functions, summaries, class32, pages, &mut stats)?;
+    let (wasm, entries) = module::build_runtime(&functions, summaries, class32, pages, ret_pops, &mut stats)?;
     Ok((wasm, entries, stats))
 }

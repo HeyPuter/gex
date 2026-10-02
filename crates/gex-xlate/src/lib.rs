@@ -793,7 +793,11 @@ fn fjit_splice(
         functions.retain(|f| keep.contains(&f.entry));
     }
     let intrinsics: Vec<u64> = opts.intrinsics.keys().copied().collect();
-    match gex_fjit::build(wasm, &refs, functions, &intrinsics, &summaries, image.class32) {
+    let byte = |a: u64| {
+        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+    };
+    let pops = fjit::ret_pops(&functions, image.class32, &byte);
+    match gex_fjit::build(wasm, &refs, functions, &intrinsics, &summaries, image.class32, &pops) {
         Ok((w, _)) => w,
         Err(e) => panic!("function JIT (--fjit): {e:#}"),
     }

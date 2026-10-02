@@ -37,6 +37,9 @@ pub struct ModuleCx<'a> {
     pub trapfree: &'a HashMap<u64, u32>,
     /// How far a `ret` moves SP (`gex_cgen::func::ret_sp_delta`).
     pub ret_sp_delta: u64,
+    /// How far the `ret` at a terminator's pc moves SP, where it pops more
+    /// than the return address (i386 `ret N`: stdcall, struct returns).
+    pub ret_pops: &'a HashMap<u64, u64>,
     /// How the module meets code outside it.
     pub linkage: Linkage<'a>,
     /// The `F_body` type's index.
@@ -1234,7 +1237,15 @@ impl E<'_, '_> {
                 // The return the caller expects: write back what its
                 // continuation may read and report success; anything else
                 // leaves with everything written back.
-                let (sp, sp0, delta) = (self.b.reg(sp_reg()), self.locals.sp0, self.m.ret_sp_delta);
+                // SP back where the caller had it, plus what this `ret`
+                // pops: the return address, and on i386 `ret N`'s N (a
+                // stdcall callee's arguments, a struct return's pointer).
+                // The caller reloads SP.
+                let delta = match self.m.ret_pops.get(&blk.term_pc) {
+                    Some(&d) => d,
+                    None => self.m.ret_sp_delta,
+                };
+                let (sp, sp0) = (self.b.reg(sp_reg()), self.locals.sp0);
                 if cf::mutate("NORETCHECK") {
                     self.b.f().i32_const(1);
                 } else {

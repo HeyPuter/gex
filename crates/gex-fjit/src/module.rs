@@ -84,6 +84,7 @@ pub fn build_module(
     funcs: &[Function],
     sums: &HashMap<u64, Summary>,
     class32: bool,
+    ret_pops: &HashMap<u64, u64>,
     stats: &mut Stats,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     let mut m = Module::new();
@@ -137,6 +138,7 @@ pub fn build_module(
         sums,
         trapfree: &trapfree,
         ret_sp_delta: cf::ret_sp_delta(class32),
+        ret_pops,
         linkage: crate::emit::Linkage::Image { ic },
         body_ty,
     };
@@ -160,7 +162,7 @@ pub fn build_module(
         let rest: Vec<Function> = funcs.iter().filter(|f| keep.contains(&f.entry)).cloned().collect();
         let dropped = stats.dropped;
         *stats = Stats::default();
-        let r = build_module(&rest, sums, class32, stats)?;
+        let r = build_module(&rest, sums, class32, ret_pops, stats)?;
         stats.dropped = dropped;
         return Ok(r);
     }
@@ -357,6 +359,7 @@ pub fn build_runtime(
     sums: &HashMap<u64, Summary>,
     class32: bool,
     pages: &HashMap<u64, Vec<(u64, u32)>>,
+    ret_pops: &HashMap<u64, u64>,
     stats: &mut Stats,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     use wasm_encoder::{
@@ -413,6 +416,7 @@ pub fn build_runtime(
             sums,
             trapfree: &trapfree,
             ret_sp_delta: cf::ret_sp_delta(class32),
+            ret_pops,
             linkage: crate::emit::Linkage::Runtime { table: 0, pages },
             body_ty,
         };
