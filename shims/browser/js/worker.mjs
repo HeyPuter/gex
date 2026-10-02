@@ -343,6 +343,32 @@ async function handle(msg) {
     shareModule(key, mod) {
       port.post({ kind: 'compiledModule', key, mod });
     }
+    // A function-tier unit's files by key (`gex.useCgen`): `msg.cgen.root`, a
+    // directory under Node (GEX_CGEN_CACHE's layout), or `msg.cgen.url`, read
+    // with a synchronous request -- allowed in a Worker, and what lets the
+    // nested callback loop install one too. Null when there is none.
+    loadUnit(key) {
+      const c = msg.cgen;
+      if (!c) return null;
+      const read = (name) => {
+        try {
+          if (c.root) {
+            const fs = globalThis.process?.getBuiltinModule?.('node:fs');
+            return fs ? fs.readFileSync(`${c.root}/${key}/${name}`) : null;
+          }
+          const x = new XMLHttpRequest();
+          x.open('GET', `${c.url}/${key}/${name}`, false);
+          x.responseType = 'arraybuffer';
+          x.send();
+          return x.status === 200 ? new Uint8Array(x.response) : null;
+        } catch {
+          return null;
+        }
+      };
+      const wasm = read('c.wasm');
+      const entries = wasm && read('c.entries');
+      return wasm && entries ? { wasm, entries } : null;
+    }
   }
 
   if (msg.debugExit) {
@@ -379,6 +405,7 @@ async function handle(msg) {
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
+  if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
   // Any sibling modules the host already had when this Worker started.
   for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
 

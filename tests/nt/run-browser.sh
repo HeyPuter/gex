@@ -3,12 +3,19 @@
 # same cases as tests/nt/run.sh, each run by shims/browser/js/run-node.mjs --
 # the shim and glue a page loads, under Node -- with GEX_NT_STRICT=1.
 #
-#   tests/nt/run-browser.sh            (ONLY=<regex> picks cases, ARCHES="x64")
+#   tests/nt/run-browser.sh [--cgen]   (ONLY=<regex> picks cases, ARCHES="x64")
+#
+# --cgen: with the function tier's units (run-node.mjs --cgen), required for
+# each program image and used for every Wine DLL that has one, from
+# GEX_CGEN_CACHE as the native host builds them (`gexc cgen-prefix`, and a
+# native run of each program).
 #
 # Needs the x86 shared-memory shim and seed in web/public/gex
 # (GEX_ARCH=x86 shims/browser/build.sh) and a staged Wine prefix
 # (tools/nt-stage-wine.sh), bundled as /wine.
 set -u
+nodeflags=()
+[ "${1:-}" = --cgen ] && { nodeflags+=(--cgen); shift; }
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 cd "$root"
@@ -29,7 +36,7 @@ check() {
     err=$(mktemp)
     local dlls=()
     for d in "$(dirname "$exe")"/*.dll; do [ -f "$d" ] && dlls+=(--file "/t/$(basename "$d")=$d"); done
-    out=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs \
+    out=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs "${nodeflags[@]}" \
         --dir /wine=$prefix --file /t/$base=$exe "${dlls[@]}" --argv0 /t/$base --cwd /t --env GEX_NT_STRICT=1 \
         web/public/gex/seed.x86.shared.wasm "$exe" "$@" 2>"$err" | grep -v '^\[host\]'; echo "exit=${PIPESTATUS[0]}")
     code=${out##*exit=}
@@ -91,7 +98,7 @@ fi
 # allocator (dlmalloc) grows the memory itself for thread-local destructor
 # lists, and the heap once landed on top of it (docs/nt-layer.md §10.2).
 if [ -z "$only" ] || [[ arena-selfcheck =~ $only ]]; then
-    selfcheck=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs \
+    selfcheck=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs "${nodeflags[@]}" \
         --dir /wine=$prefix --file /t/hello_args.exe=$root/tests/nt/bin/x86/hello_args.exe --argv0 /t/hello_args.exe \
         --cwd /t --env GEX_NT_ARENA_SELFTEST=1 web/public/gex/seed.x86.shared.wasm \
         "$root/tests/nt/bin/x86/hello_args.exe" 2>&1 | grep "arena self-check")

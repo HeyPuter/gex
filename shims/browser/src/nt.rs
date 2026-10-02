@@ -72,6 +72,10 @@ mod stub {
         unreachable!()
     }
 
+    pub(crate) fn end_process(_code: u32) -> ! {
+        unreachable!()
+    }
+
     pub(crate) fn tick() {}
 
     pub(crate) fn arena_ceiling() -> u64 {
@@ -676,6 +680,7 @@ mod imp {
             h.kernel.new_code.clear();
             if !retired.is_empty() {
                 note_retire(&retired);
+                crate::cgen::on_retire(&retired);
                 if !NO_RETIRE.load(Ordering::Relaxed) {
                     retire(h, &retired);
                 }
@@ -692,6 +697,14 @@ mod imp {
                         "gex-nt: {} moved the stack: sp {sp0:#x} -> {sp1:#x} (ctx {ctx_addr:#x})\n",
                         nt::syscall_name(nr)
                     ));
+                }
+                // An image mapped with a function-tier unit to fetch: JS
+                // loads and installs it before the guest goes on, as the
+                // native host does after the same syscall.
+                if crate::cgen::drain() {
+                    set_resume(resume_pc());
+                    set_resume_ctx(ctx_addr);
+                    trap();
                 }
             }
             nt::Outcome::Resume(target) => {
@@ -985,7 +998,7 @@ mod imp {
 
     /// End the process with NT exit code `code`. The low byte is what a
     /// parent sees, as natively.
-    fn end_process(code: u32) -> ! {
+    pub(crate) fn end_process(code: u32) -> ! {
         with_host(|h| {
             exit_process(h, (code & 0xff) as i32);
         });
