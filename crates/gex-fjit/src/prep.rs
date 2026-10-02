@@ -27,11 +27,8 @@ fn enabled() -> bool {
 /// Optimise `f`'s blocks in place; `f.n_values` becomes the largest block's
 /// count.
 pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
-    let mut most = 0;
-    for b in &mut f.blocks {
-        most = most.max(renumber(b));
-    }
-    f.n_values = most;
+    let counts: Vec<u32> = f.blocks.iter_mut().map(renumber).collect();
+    f.n_values = counts.iter().copied().max().unwrap_or(0);
     if !enabled() {
         return;
     }
@@ -50,7 +47,7 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
         vec![Vec::new(); f.blocks.len()]
     };
     let mut most = 0;
-    for (b, dead) in f.blocks.iter_mut().zip(&dead_out) {
+    for ((b, dead), &count) in f.blocks.iter_mut().zip(&dead_out).zip(&counts) {
         let mut v: Option<Value> = None;
         b.term.for_each_use(|x| v = Some(x));
         let term = match (&b.term, v) {
@@ -63,11 +60,12 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
             end: b.end,
             stmts: std::mem::take(&mut b.stmts),
             term,
-            n_values: f.n_values,
+            n_values: count,
             call_return: None,
             guard: None,
         };
         let before = blk.stmts.len();
+        forward(&mut blk, &mut b.term);
         pass::const_fold(&mut blk);
         pass::dead_store_elim_with(&mut blk, dead);
         pass::dce(&mut blk);
@@ -111,4 +109,76 @@ fn renumber(b: &mut gex_ir::func::FBlock) -> u32 {
     }
     b.term.for_each_use_mut(|v| *v = Value(*map.get(&v.0).expect("memory form: a terminator value from another block")));
     next
+}
+
+/// Within a block: a register read after the block wrote the register is
+/// the value written (until a host call that may change guest state); and
+/// the algebra the lifter leaves for its operand shapes -- `x | 0`,
+/// `x & all-ones`, a shift by zero, `wrap(extend(x))` -- is `x`. tier-1's
+/// own cache keeps a register in a local within a block too; this keeps
+/// the copies out of the code (V8's baseline tier executes every one).
+fn forward(blk: &mut Block, term: &mut FTerm) {
+    use gex_ir::{BinOp, Expr, Stmt, Ty};
+    // By value, over this block's values only (a block is small; the
+    // function's numbering is as wide as its largest block).
+    let mut subst: HashMap<u32, Value> = HashMap::new();
+    let mut consts: HashMap<u32, u64> = HashMap::new();
+    let mut tys: HashMap<u32, Ty> = HashMap::new();
+    let mut last: HashMap<GuestReg, Value> = HashMap::new();
+    let get = |subst: &HashMap<u32, Value>, v: Value| subst.get(&v.0).copied().unwrap_or(v);
+    let mut extends: HashMap<u32, Value> = HashMap::new();
+    for st in &mut blk.stmts {
+        for_each_use_mut(st, |v| *v = get(&subst, *v));
+        match st {
+            Stmt::WriteReg { reg, val } => {
+                last.insert(*reg, *val);
+            }
+            Stmt::Def { dst, expr } => {
+                let k = dst.0;
+                tys.insert(k, expr.ty());
+                let c = |v: Value| consts.get(&v.0).copied();
+                let to: Option<Value> = match *expr {
+                    Expr::ReadReg(r) => last.get(&r).copied().filter(|v| tys.get(&v.0) == Some(&r.ty())),
+                    Expr::Bin { op: BinOp::Or | BinOp::Xor | BinOp::Add, a, b, .. } if c(a) == Some(0) => Some(b),
+                    Expr::Bin { op: BinOp::Or | BinOp::Xor | BinOp::Add | BinOp::Sub, a, b, .. } if c(b) == Some(0) => Some(a),
+                    Expr::Bin { op: BinOp::Shl | BinOp::ShrU | BinOp::ShrS | BinOp::Rotr, a, b, .. } if c(b) == Some(0) => Some(a),
+                    Expr::Bin { op: BinOp::And, ty, a, b } if c(b) == Some(ty.mask()) => Some(a),
+                    Expr::Bin { op: BinOp::And, ty, a, b } if c(a) == Some(ty.mask()) => Some(b),
+                    Expr::Bin { op: BinOp::Mul, a, b, .. } if c(b) == Some(1) => Some(a),
+                    _ => None,
+                };
+                // `wrap(extend(x))` is `x`: found through the definition of
+                // the extend, kept by value.
+                let to = to.or_else(|| match *expr {
+                    Expr::Wrap(a) => extends.get(&a.0).copied(),
+                    _ => None,
+                });
+                match *expr {
+                    Expr::ConstI32(v) => {
+                        consts.insert(k, v as u64);
+                    }
+                    Expr::ConstI64(v) => {
+                        consts.insert(k, v);
+                    }
+                    _ => {}
+                }
+                if let Expr::Extend { a, .. } = *expr {
+                    extends.insert(dst.0, a);
+                }
+                if let Some(t) = to {
+                    if tys.get(&t.0) == Some(&expr.ty()) {
+                        subst.insert(k, t);
+                    }
+                }
+                if let Expr::HostCall { func, .. } = expr {
+                    if func.clobbers_guest_state() {
+                        last.clear();
+                    }
+                }
+            }
+            Stmt::HostCall { func, .. } if func.clobbers_guest_state() => last.clear(),
+            _ => {}
+        }
+    }
+    term.for_each_use_mut(|v| *v = get(&subst, *v));
 }
