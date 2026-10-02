@@ -852,6 +852,12 @@ fn run_program_with(
         let w = wayland::Wayland::new(opts.wayland_size.0, opts.wayland_size.1);
         if let Some(out) = &opts.wayland_out {
             w.write_frames_to(out);
+            // A GL client's frames are on the host's surface, not in a
+            // buffer the compositor sees: the device hands them over.
+            if let Some(dev) = crate::gl::DEVICE.get() {
+                let w = w.clone();
+                dev.set_frame_sink(Box::new(move |f| w.present_external(f.width, f.height, &f.rgba)));
+            }
         }
         if opts.wayland_gpu {
             match w.enable_gpu(opts.wayland_size.0, opts.wayland_size.1) {
@@ -1951,7 +1957,9 @@ fn mount_filesystems(
         // Named for what it is rather than as `/dev/dri/renderD128`: this is
         // not a DRM device and a program that probed it as one would be
         // misled. The guest's GL library looks for this name.
-        devfs.add("gex-gl", crate::gl::GlDevice::new(1024, 1024));
+        let dev = crate::gl::GlDevice::new(1024, 1024);
+        let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
+        devfs.add("gex-gl", dev);
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // A native host has real sockets, so the guest gets a real network.

@@ -451,6 +451,19 @@ pub struct Gl {
     pub vendor: String,
     pub renderer: String,
     pub version: String,
+    /// Read the surface back at each PRESENT (`keep_frames`), for a host
+    /// that shows or writes the frames; the last one waits in `frame`.
+    keep_frames: bool,
+    frame: Option<Frame>,
+    /// PRESENTs so far.
+    pub presents: u64,
+}
+
+/// A presented frame: RGBA rows, top first.
+pub struct Frame {
+    pub width: i32,
+    pub height: i32,
+    pub rgba: Vec<u8>,
 }
 
 /// What the host wants to say back, appended to the reply area in order.
@@ -578,6 +591,9 @@ impl Gl {
                 vendor: gl_string(0x1F00),
                 renderer: gl_string(0x1F01),
                 version: gl_string(0x1F02),
+                keep_frames: false,
+                frame: None,
+                presents: 0,
             })
         }
     }
@@ -722,6 +738,16 @@ impl Gl {
         self.names.programs.get(&guest).copied()
     }
 
+    /// Read each presented frame back for [`Gl::take_frame`].
+    pub fn keep_frames(&mut self, on: bool) {
+        self.keep_frames = on;
+    }
+
+    /// The last frame presented since the previous call.
+    pub fn take_frame(&mut self) -> Option<Frame> {
+        self.frame.take()
+    }
+
     /// Run one batch. Returns the reply and, if the stream was malformed,
     /// where and why.
     pub fn run(&mut self, batch: &[u8]) -> (Reply, u32, u32) {
@@ -778,6 +804,42 @@ impl Gl {
                 op::FINISH => {
                     glFinish();
                     reply.u32(0);
+                }
+                // This host has one drawable, the pbuffer: every surface
+                // draws into it, and a frame is what it holds at a PRESENT.
+                op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
+                op::PRESENT => {
+                    self.presents += 1;
+                    if self.keep_frames {
+                        let (w, h) = (self.width, self.height);
+                        let mut px = vec![0u8; (w * h * 4) as usize];
+                        // The program's read framebuffer, pack buffer and
+                        // pack state are put back after.
+                        let mut prev = [0; 6];
+                        let saved = [0x8CAA, 0x88ED, 0x0D05, 0x0D02, 0x0D03, 0x0D04];
+                        for (v, pname) in prev.iter_mut().zip(saved) {
+                            glGetIntegerv(pname, v);
+                        }
+                        glBindFramebuffer(0x8CA8, 0); // GL_READ_FRAMEBUFFER
+                        glBindBuffer(0x88EB, 0); // GL_PIXEL_PACK_BUFFER
+                        for pname in [0x0D02, 0x0D03, 0x0D04] {
+                            glPixelStorei(pname, 0);
+                        }
+                        glPixelStorei(0x0D05, 4);
+                        glReadPixels(0, 0, w, h, 0x1908, 0x1401, px.as_mut_ptr() as *mut c_void); // GL_RGBA, GL_UNSIGNED_BYTE
+                        glBindFramebuffer(0x8CA8, prev[0] as GLuint);
+                        glBindBuffer(0x88EB, prev[1] as GLuint);
+                        for (i, pname) in saved.iter().enumerate().skip(2) {
+                            glPixelStorei(*pname, prev[i]);
+                        }
+                        // GL's rows are bottom first.
+                        let stride = (w * 4) as usize;
+                        let mut rgba = Vec::with_capacity(px.len());
+                        for row in px.chunks_exact(stride).rev() {
+                            rgba.extend_from_slice(row);
+                        }
+                        self.frame = Some(Frame { width: w, height: h, rgba });
+                    }
                 }
 
                 op::CLEAR_COLOR => {

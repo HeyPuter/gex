@@ -118,6 +118,22 @@ impl Wayland {
         }
     }
 
+    /// Write a frame drawn somewhere other than a client buffer (a GL
+    /// client's host surface): RGBA rows, top first.
+    pub fn present_external(&self, width: i32, height: i32, rgba: &[u8]) {
+        let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
+            return;
+        };
+        let mut n = self.inner.written.lock().unwrap();
+        let path = format!("{prefix}-{:03}.ppm", *n);
+        *n += 1;
+        let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+        out.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("gex: could not write {path}: {e}");
+        }
+    }
+
     /// Everything committed since the last call.
     pub fn take_frames(&self) -> Vec<Frame> {
         std::mem::take(&mut self.inner.frames.lock().unwrap())
