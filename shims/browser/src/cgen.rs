@@ -18,8 +18,9 @@
 //!   - JS loads `<key>/c.wasm` and `<key>/c.entries` and calls
 //!     `gex_cgen_publish(u, entries, n)`, or `gex_cgen_missing(u)`;
 //!   - every Worker installs published units in order (`gex_cgen_count`,
-//!     `gex_cgen_regs`), reports with `gex_cgen_have(n)` and its body table's
-//!     size with `gex_cgen_body_size`; the publishing Worker then calls
+//!     `gex_cgen_regs`), reports with `gex_cgen_have(n)` and its body tables'
+//!     sizes with `gex_cgen_body_size` (one body table per dispatch table,
+//!     `gexc.bodies0..7`); the publishing Worker then calls
 //!     `gex_cgen_installed(u)`, which writes the directory.
 //!
 //! The body table's default entry is `gex_cgen_leave`: -1, as natively. What
@@ -128,6 +129,15 @@ pub(crate) fn drain() -> bool {
         return false;
     }
     let pending = std::mem::take(&mut *lock(&PENDING));
+    // The NT trampoline page with the first images (the exe says the ABI),
+    // as natively: every Wine DLL's unix calls and syscalls go through it.
+    static TRAMPOLINES: OnceLock<()> = OnceLock::new();
+    if let Some(p) = pending.first() {
+        if TRAMPOLINES.set(()).is_ok() {
+            let (image, _) = gex_kernel::nt::boot::trampoline_input(!p.pe.is64);
+            place(&image, "[the NT trampolines]", image.bias, true);
+        }
+    }
     for p in pending {
         let (image, _) = match gex_xlate::func::pe_input(&p.pe, p.base) {
             Ok(x) => x,
@@ -136,42 +146,50 @@ pub(crate) fn drain() -> bool {
                 continue;
             }
         };
-        let memory = crate::guest_bytes();
-        let mut pages = Vec::new();
-        for seg in image.segments.iter().filter(|s| s.executable) {
-            let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
-            let live = memory.get(lo..lo + n);
-            if let Some(i) = live.and_then(|live| (0..n).find(|&i| live[i] != seg.bytes[i])) {
-                crate::warn_line(&format!(
-                    "gex-cgen: {}: the mapped code at {:#x} differs from the image (guest {:#04x}, image {:#04x}); refusing its unit\n",
-                    p.path,
-                    seg.vaddr + i as u64,
-                    memory[lo + i],
-                    seg.bytes[i]
-                ));
-                crate::nt::end_process(0xc000_0005);
-            }
-            let first = seg.vaddr / gex_abi::DISPATCH_PAGE;
-            let last = (seg.vaddr + n as u64 - 1) / gex_abi::DISPATCH_PAGE;
-            for page in first..=last {
-                pages.push((page, page_hash(memory, page)));
-            }
-        }
-        let key = gex_cgen::image::image_key(&image);
-        let mut units = lock(&UNITS);
-        units.push(Unit {
-            key,
-            wine: is_wine(&p.path),
-            path: p.path,
-            base: p.base,
-            pages,
-            regs: Vec::new(),
-            dirs: Vec::new(),
-            slots: 0,
-        });
-        lock(&WANTED).push_back(units.len() - 1);
+        let wine = is_wine(&p.path);
+        place(&image, &p.path, p.base, wine);
     }
     !lock(&WANTED).is_empty()
+}
+
+/// Want the unit for `image`, mapped at `base`: its key, and the check that
+/// the mapped code is what the unit was built from (a mismatch ends the run,
+/// as natively: a unit over different code is wrong code). `optional`: a
+/// missing unit is fine even under `--cgen` (Wine's DLLs, the trampolines).
+fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool) {
+    let memory = crate::guest_bytes();
+    let mut pages = Vec::new();
+    for seg in image.segments.iter().filter(|s| s.executable) {
+        let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
+        let live = memory.get(lo..lo + n);
+        if let Some(i) = live.and_then(|live| (0..n).find(|&i| live[i] != seg.bytes[i])) {
+            crate::warn_line(&format!(
+                "gex-cgen: {path}: the mapped code at {:#x} differs from the image (guest {:#04x}, image {:#04x}); refusing its unit\n",
+                seg.vaddr + i as u64,
+                memory[lo + i],
+                seg.bytes[i]
+            ));
+            crate::nt::end_process(0xc000_0005);
+        }
+        let first = seg.vaddr / gex_abi::DISPATCH_PAGE;
+        let last = (seg.vaddr + n as u64 - 1) / gex_abi::DISPATCH_PAGE;
+        for page in first..=last {
+            pages.push((page, page_hash(memory, page)));
+        }
+    }
+    let key = gex_cgen::image::image_key(image);
+    let mut units = lock(&UNITS);
+    units.push(Unit {
+        key,
+        wine: optional,
+        path: path.to_string(),
+        base,
+        pages,
+        regs: Vec::new(),
+        dirs: Vec::new(),
+        slots: 0,
+    });
+    lock(&WANTED).push_back(units.len() - 1);
 }
 
 /// The oldest unit waiting for its bytes, or -1.
@@ -341,10 +359,9 @@ pub extern "C" fn gex_cgen_installed(u: u32) {
 }
 
 /// Worker `worker`'s body table for dispatch table `table` holds `size`
-/// entries. Each table's limit is the least of every Worker's, so compiled
-/// code's indirect calls go straight to a body only for a slot every Worker
-/// has (`gex_abi::BODY_LIMIT`; per table once the dispatcher has one body
-/// table per dispatch table).
+/// entries. Each table's limit (`gex_abi::BODY_LIMITS[table]`) is the least
+/// of every Worker's, so the dispatcher's `call_known` goes straight to a
+/// body only for a slot every Worker has.
 #[no_mangle]
 pub extern "C" fn gex_cgen_body_size(worker: u32, table: u32, size: u32) {
     let mut sizes = lock(&BODY_SIZES);
@@ -364,8 +381,10 @@ pub extern "C" fn gex_cgen_body_gone(worker: u32) {
 
 fn publish_limits(sizes: &std::collections::BTreeMap<u32, [u32; gex_abi::DISPATCH_TABLES]>) {
     let mut gm = GuestMem::new(crate::guest_bytes());
-    let min = |t: usize| sizes.values().map(|v| v[t]).min().unwrap_or(0);
-    let _ = gm.write_u32(gex_abi::BODY_LIMIT, min(0));
+    for t in 0..gex_abi::DISPATCH_TABLES {
+        let min = sizes.values().map(|v| v[t]).min().unwrap_or(0);
+        let _ = gm.write_u32(gex_abi::BODY_LIMITS + 4 * t as u64, min);
+    }
 }
 
 static DISPATCHER: OnceLock<Vec<u8>> = OnceLock::new();

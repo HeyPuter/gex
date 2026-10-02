@@ -2317,9 +2317,8 @@ export class Gex {
     for (let i = 0; i < TABLE_NAMES.length; i++) {
       gex[TABLE_NAMES[i]] = tables[i] ?? new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
     }
-    // `bodies0`..`bodies7`, one per dispatch table; a dispatcher with a
-    // single `bodies` mirrors table 0 alone.
-    const gexc = { bodies: bodies[0] };
+    // `bodies0`..`bodies7`, one per dispatch table (gex_cgen::splice).
+    const gexc = {};
     for (let i = 0; i < bodies.length; i++) gexc[`bodies${i}`] = bodies[i];
     const di = new WebAssembly.Instance(dm, { gex, gexc });
     this.#cgen = {
@@ -2336,7 +2335,7 @@ export class Gex {
   }
 
   /** Grow each body table to its dispatch table's length and say how long it
-   *  is: each table's `BODY_LIMIT` is the least of every Worker's. Unfilled
+   *  is: each table's `BODY_LIMITS[t]` is the least of every Worker's. Unfilled
    *  entries leave (`gex_cgen_leave`). */
   #cgenGrowBody() {
     const st = this.#cgen;
@@ -2355,8 +2354,8 @@ export class Gex {
 
   /** Install published unit `u` into this Worker's tables: instantiate it
    *  against this Worker's dispatcher, then copy each entry's `e_` into its
-   *  dispatch slot and, alone in its slot, its `ib_` into the same slot of
-   *  that table's body table. */
+   *  dispatch slot and its `ib_` into the same slot of that table's body
+   *  table. */
   #cgenInstall(u) {
     const e = this.#shim.exports;
     const st = this.#cgenStore();
@@ -2392,11 +2391,13 @@ export class Gex {
       return r;
     };
     for (let j = 0; j + 3 < regs.length; j += 4) {
-      const k = regs[j], t = regs[j + 1], slot = regs[j + 2], alone = regs[j + 3];
+      const k = regs[j], t = regs[j + 1], slot = regs[j + 2];
       const f = own.get(ref(2 * k));
       if (!f) throw new Error(`gex-cgen: unit ${key} has no function for entry ${k}`);
       tables[t].set(slot, f);
-      if (alone) st.bodies[t].set(slot, own.get(ref(2 * k + 1)));
+      // A slot several entries share gets the unit's body that picks among
+      // them by `ctx::PC` (`gex_cgen::func::fnref_source`), as natively.
+      st.bodies[t].set(slot, own.get(ref(2 * k + 1)));
     }
     st.instances.push(inst);
     return regs.length / 4;
