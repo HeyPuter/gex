@@ -424,6 +424,14 @@ pub fn nt_user_create_window_ex(c: &mut Call<'_>) -> R64 {
         None => None,
     };
     let name_buf = if name_p != 0 { c.g.ptr(name_p + off!(c.p.abi, unicode_string::BUFFER))? } else { 0 };
+    if c.p.cfg.trace {
+        let n = |v: &NameOrAtom| match v {
+            NameOrAtom::Name(n) => crate::nt::wstr(n),
+            NameOrAtom::Atom(a) => format!("#{a}"),
+        };
+        let title = window_name.as_ref().filter(|w| w.first() != Some(&0xffff)).map(|w| crate::nt::wstr(w));
+        crate::nt_log!("[nt:{:x}]   window {:?} {:?}", c.t.tid, n(&class_name), title.unwrap_or_default());
+    }
     let desktop = get_desktop_window(c)?;
     let tid = c.t.tid;
 

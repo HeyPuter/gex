@@ -514,6 +514,15 @@ pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
         let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
         let addr = c.g.ptr(rec_p + 2 * 4 + c.g.psize())?;
         crate::nt_log!("[nt:{:x}] NtRaiseException {code:#010x} at {}", c.t.tid, c.p.describe_addr(addr));
+        // DBG_PRINTEXCEPTION_C, OutputDebugStringA: (length, text).
+        if code == 0x4001_0006 {
+            let ps = c.g.psize();
+            let info = rec_p + if c.p.abi == Abi::P64 { 32 } else { 20 };
+            let (n, p) = (c.g.ptr(info)?, c.g.ptr(info + ps)?);
+            if let Ok(b) = c.g.bytes(p, n.min(512) as usize) {
+                crate::nt_log!("[nt:{:x}]   debug string {:?}", c.t.tid, String::from_utf8_lossy(&b).trim_end_matches(['\0', '\n']));
+            }
+        }
         // The frame-pointer chain, to see who raised it.
         if c.p.abi == Abi::P32 {
             let mut bp = c.g.u32(context + i386::EBP)? as u64;

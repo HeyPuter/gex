@@ -467,6 +467,11 @@ pub fn nt_create_section(c: &mut Call<'_>) -> R {
         Section { kind: SecKind::Anon, size, prot, attrs, views: Mutex::new(Vec::new()) }
     };
     let sec = Arc::new(sec);
+    if c.p.cfg.trace {
+        if let Some(n) = &name {
+            crate::nt_log!("[nt:{:x}]   section {n:?}", c.t.tid);
+        }
+    }
     let mut stl = c.p.st.lock().unwrap();
     if let Some(n) = &name {
         let key = n.to_ascii_lowercase();
