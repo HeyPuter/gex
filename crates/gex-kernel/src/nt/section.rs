@@ -37,8 +37,16 @@ pub struct Section {
     pub prot: u32,
     pub attrs: u32,
     /// Views mapped so far (an anonymous section's second view can't alias
-    /// the first in gex's flat memory).
-    pub views: Mutex<Vec<u64>>,
+    /// the first in gex's flat memory, so it shares the first's pages).
+    pub views: Mutex<Vec<View>>,
+}
+
+/// A view of a section: where it is and which part of the section it shows.
+#[derive(Debug, Clone, Copy)]
+pub struct View {
+    pub base: u64,
+    pub offset: u64,
+    pub size: u64,
 }
 
 /// A writable view of a file-backed section. gex has no shared page cache,
@@ -514,7 +522,7 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
             let mut k = c.kernel.lock_kernel();
             let (base, status) = map_image(c.p, &mut k, &mut c.g, &pe, want, &path, &nt_path)?;
             drop(k);
-            sec.views.lock().unwrap().push(base);
+            sec.views.lock().unwrap().push(View { base, offset: 0, size: pe.image_size as u64 });
             c.g.wptr(base_p, base)?;
             c.g.wptr(size_p, align_up(pe.image_size as u64, PAGE))?;
             Ok(status)
@@ -538,12 +546,25 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
             {
                 // Views since unmapped no longer count.
                 let mut views = sec.views.lock().unwrap();
-                {
-                    let stl = c.p.st.lock().unwrap();
-                    views.retain(|&b| stl.vm.find(b).is_some_and(|r| r.base == b && r.kind == Kind::Mapped));
+                let mut stl = c.p.st.lock().unwrap();
+                views.retain(|v| stl.vm.find(v.base).is_some_and(|r| r.base == v.base && r.kind == Kind::Mapped));
+                // Two views can't alias in gex's flat memory. A second view
+                // anywhere the program lets gex choose shares the pages of
+                // one it already has (sections named for sharing a pointer
+                // between modules: SexyFramework's PakInterface); it stays
+                // mapped until every view of it is unmapped.
+                if let Some(v) = views.iter().find(|v| v.offset <= offset && offset + size <= v.offset + v.size).copied() {
+                    if want == 0 || want == v.base + (offset - v.offset) {
+                        *stl.shared_views.entry(v.base).or_insert(0) += 1;
+                        drop(stl);
+                        c.g.wptr(base_p, v.base + (offset - v.offset))?;
+                        c.g.wptr(size_p, align_up(size, PAGE))?;
+                        return Ok(st::SUCCESS);
+                    }
                 }
                 if !views.is_empty() && writable {
-                    return Err(c.unimplemented("a second writable view of one section (views can't alias in gex)"));
+                    drop(stl);
+                    return Err(c.unimplemented("a second writable view of one section at a fixed address (views can't alias in gex)"));
                 }
             }
             let write_back_to = match &sec.kind {
@@ -601,7 +622,7 @@ fn map_view(c: &mut Call<'_>, sh: u32, base_p: u64, offset_p: u64, size_p: u64, 
             if let Some(file) = write_back_to {
                 c.p.st.lock().unwrap().file_views.insert(base, FileView { file, offset, len: size });
             }
-            sec.views.lock().unwrap().push(base);
+            sec.views.lock().unwrap().push(View { base, offset, size });
             c.g.wptr(base_p, base)?;
             c.g.wptr(size_p, size_pg)?;
             Ok(st::SUCCESS)
@@ -639,6 +660,17 @@ fn unmap(c: &mut Call<'_>, addr: u64) -> R {
         }
         r.base
     };
+    {
+        // A view that shares an earlier one's pages (see `map_view`).
+        let mut stl = c.p.st.lock().unwrap();
+        if let Some(n) = stl.shared_views.get_mut(&base) {
+            *n -= 1;
+            if *n == 0 {
+                stl.shared_views.remove(&base);
+            }
+            return Ok(st::SUCCESS);
+        }
+    }
     write_back(c, base)?;
     let mut stl = c.p.st.lock().unwrap();
     stl.file_views.remove(&base);

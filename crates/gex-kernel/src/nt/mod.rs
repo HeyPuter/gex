@@ -457,6 +457,9 @@ pub struct State {
     pub images: std::collections::BTreeMap<u64, section::ImageView>,
     /// Writable views of file-backed sections, by base, to write back.
     pub file_views: std::collections::BTreeMap<u64, section::FileView>,
+    /// Views that share another view's pages, by that view's base: how many
+    /// more unmaps it takes to unmap it (`section::map_view`).
+    pub shared_views: std::collections::BTreeMap<u64, u32>,
     /// The prefix's staged image layout, if it has one (`section::Layout`).
     pub layout: Option<std::sync::Arc<section::Layout>>,
 }
@@ -492,6 +495,7 @@ impl Process {
                 vm: vm::Vm::new(),
                 images: Default::default(),
                 file_views: Default::default(),
+                shared_views: Default::default(),
                 layout: None,
             }),
             threads: RwLock::new(Threads::default()),
