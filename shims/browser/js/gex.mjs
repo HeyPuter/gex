@@ -2263,12 +2263,10 @@ export class Gex {
   }
 
   #cgenMode = 0;
-  /** This Worker's half of the units: its body table, its dispatcher and how
-   *  many published units it has installed. Made at the first one. */
+  /** This Worker's half of the function table (docs/merge-plan.md §9.8.1):
+   *  its `gex.ftab`, the runtime module's `resolve` and `bridge`, and how far
+   *  through the table's log it is. Made at the first unit. */
   #cgen = null;
-  /** Each unit module's `gex_fnref` answers, by key: the same for every
-   *  instance of a module, so asked once. */
-  #cgenRefs = new Map();
 
   /** A string the shim writes for unit `u` through `fn(u, buf, cap)`. */
   #cgenStr(fn, u) {
@@ -2300,122 +2298,105 @@ export class Gex {
     return mod;
   }
 
-  /** This Worker's body tables (one per dispatch table, numbered like it)
-   *  and its dispatcher, made at the first unit. */
+  /** This Worker's function table and runtime instance, made at the first
+   *  unit: every slot holds `resolve` until something is installed there,
+   *  index 1 the shim's fallback. `gex.lookup` catches this Worker up on
+   *  the table's log before asking the shim. */
   #cgenStore() {
     if (this.#cgen) return this.#cgen;
     const e = this.#shim.exports;
     const tables = this.#dispatchTables();
-    const bodies = TABLE_NAMES.map(() => new WebAssembly.Table({ element: 'anyfunc', initial: 0 }));
-    let dm = this.#sharedModules.get('cgen-dispatcher');
-    if (!dm) {
-      const ptr = e.gex_cgen_dispatcher_ptr() >>> 0;
-      dm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_cgen_dispatcher_len() >>> 0)));
-      this.#sharedModules.set('cgen-dispatcher', dm);
+    let rm = this.#sharedModules.get('ftab-runtime');
+    if (!rm) {
+      const ptr = e.gex_ftab_runtime_ptr() >>> 0;
+      rm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_ftab_runtime_len() >>> 0)));
+      this.#sharedModules.set('ftab-runtime', rm);
     }
-    const gex = { memory: this.#memory };
+    const ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
+    const lookup = (ctx, addr) => {
+      if (e.gex_ftab_behind()) this.#cgenCatchUp();
+      return e.gex_ftab_lookup(ctx, addr);
+    };
+    const gex = {
+      memory: this.#memory,
+      ftab,
+      lookup,
+      safepoint: this.#imports.safepoint,
+      cache_op: this.#imports.cache_op,
+      dispatch_miss: this.#imports.dispatch_miss,
+    };
     for (let i = 0; i < TABLE_NAMES.length; i++) {
       gex[TABLE_NAMES[i]] = tables[i] ?? new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
     }
-    // `bodies0`..`bodies7`, one per dispatch table (gex_cgen::splice).
-    const gexc = {};
-    for (let i = 0; i < bodies.length; i++) gexc[`bodies${i}`] = bodies[i];
-    const di = new WebAssembly.Instance(dm, { gex, gexc });
-    this.#cgen = {
-      bodies,
-      leave: e.gex_cgen_leave,
-      dispatch: di.exports.dispatch,
-      callKnown: di.exports.call_known,
-      have: 0,
-      id: (Math.random() * 0x7fffffff) | 0,
-      reported: bodies.map(() => -1),
-      instances: [di],
-    };
+    const ri = new WebAssembly.Instance(rm, { gex });
+    this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri] };
+    this.#cgenGrow();
+    ftab.set(1, e.gex_ftab_fallback);
     return this.#cgen;
   }
 
-  /** Grow each body table to its dispatch table's length and say how long it
-   *  is: each table's `BODY_LIMITS[t]` is the least of every Worker's. Unfilled
-   *  entries leave (`gex_cgen_leave`). */
-  #cgenGrowBody() {
+  /** Grow this Worker's function table past every index handed out, with
+   *  room over, so an index another Worker published to the probe cache is
+   *  in range here (holding `resolve`) before this one replays it. */
+  #cgenGrow() {
     const st = this.#cgen;
-    if (!st) return;
-    const tables = this.#dispatchTables();
-    for (let t = 0; t < st.bodies.length; t++) {
-      const body = st.bodies[t];
-      const want = tables[t]?.length ?? 0;
-      if (body.length < want) body.grow(want - body.length, st.leave);
-      if (st.reported[t] !== body.length) {
-        st.reported[t] = body.length;
-        this.#shim.exports.gex_cgen_body_size(st.id, t, body.length);
-      }
-    }
+    const want = (this.#shim.exports.gex_ftab_size() >>> 0) + 65536;
+    if (st.ftab.length < want) st.ftab.grow(want - st.ftab.length, st.resolve);
   }
 
-  /** Install published unit `u` into this Worker's tables: instantiate it
-   *  against this Worker's dispatcher, then copy each entry's `e_` into its
-   *  dispatch slot and its `ib_` into the same slot of that table's body
-   *  table. */
-  #cgenInstall(u) {
+  /** Install unit `u` into this Worker: instantiate it with `__table_base` =
+   *  `base` (its element segment fills that range of the function table),
+   *  then point tier-1's dispatch slots for its entries at the bridge. */
+  #cgenInstall(u, base) {
     const e = this.#shim.exports;
     const st = this.#cgenStore();
     const key = this.#cgenStr(e.gex_cgen_key, u);
     const mod = this.#cgenModule(key);
     const tables = this.#growTables(e.gex_cgen_slots(u) >>> 0, 'cgen');
-    this.#cgenGrowBody();
     const inst = new WebAssembly.Instance(mod, {
-      env: { memory: this.#memory },
-      gex: this.#imports,
-      gexc: { dispatch: st.dispatch, call_known: st.callKnown },
+      env: {
+        memory: this.#memory,
+        __indirect_function_table: st.ftab,
+        __table_base: new WebAssembly.Global({ value: 'i32', mutable: false }, base | 0),
+        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, 0),
+        // A unit's functions never use clang's shadow stack (those are stubs),
+        // but a position-independent module imports its pointer all the same.
+        __stack_pointer: new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+      },
+      gex: { ...this.#imports, lookup: st.lookup },
     });
     const n = e.gex_cgen_regs(u, 0, 0) >>> 0;
-    const buf = e.gex_alloc(4 * n) >>> 0;
+    const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
     let regs;
     try {
       e.gex_cgen_regs(u, buf, n);
       regs = new Uint32Array(this.#memory.buffer.slice(buf, buf + 4 * n));
     } finally {
-      e.gex_free?.(buf, 4 * n);
+      e.gex_free?.(buf, 4 * Math.max(1, n));
     }
-    const own = inst.exports.__indirect_function_table;
-    // The unit's own export (not the shim's), hence the bracket.
-    const fnref = inst.exports['gex_fnref'];
-    let refs = this.#cgenRefs.get(key);
-    if (!refs) {
-      refs = new Map();
-      this.#cgenRefs.set(key, refs);
-    }
-    const ref = (i) => {
-      let r = refs.get(i);
-      if (r === undefined) refs.set(i, (r = fnref(i) >>> 0));
-      return r;
-    };
-    for (let j = 0; j + 3 < regs.length; j += 4) {
-      const k = regs[j], t = regs[j + 1], slot = regs[j + 2];
-      const f = own.get(ref(2 * k));
-      if (!f) throw new Error(`gex-cgen: unit ${key} has no function for entry ${k}`);
-      tables[t].set(slot, f);
-      // A slot several entries share gets the unit's body that picks among
-      // them by `ctx::PC` (`gex_cgen::func::fnref_source`), as natively.
-      st.bodies[t].set(slot, own.get(ref(2 * k + 1)));
-    }
+    for (let j = 0; j + 1 < regs.length; j += 2) tables[regs[j]].set(regs[j + 1], st.bridge);
     st.instances.push(inst);
-    return regs.length / 4;
+    return regs.length / 2;
   }
 
-  /** Install every unit published so far that this Worker lacks. */
+  /** Replay the function table's log this Worker has not seen: installs,
+   *  and retirements (back to `resolve`). */
   #cgenCatchUp() {
     const e = this.#shim.exports;
-    if (!e.gex_cgen_count) return;
-    const count = e.gex_cgen_count() >>> 0;
-    if (!count && !this.#cgen) return;
+    if (!e.gex_ftab_log_len) return;
+    const len = e.gex_ftab_log_len() >>> 0;
+    if (!len && !this.#cgen) return;
     const st = this.#cgenStore();
-    while (st.have < count) {
-      this.#cgenInstall(e.gex_cgen_published(st.have));
+    if (st.have >= len) return;
+    this.#cgenGrow();
+    while (st.have < len) {
+      const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
+      const kind = Number(ev >> 32n), v = Number(ev & 0xffffffffn);
+      if (kind === 1) this.#cgenInstall(e.gex_ftab_install_unit(v) >>> 0, e.gex_ftab_install_base(v) >>> 0);
+      else if (kind === 2) st.ftab.set(v, st.resolve);
       st.have++;
       e.gex_cgen_have(st.have);
     }
-    this.#cgenGrowBody();
   }
 
   /** Load and publish the units the shim placed (images mapped since the last
