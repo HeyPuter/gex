@@ -707,6 +707,47 @@ Worker, so a thread must be one). Hooks in `lib.rs`, each a line or two:
   opengl32 unixlib's submits go through `gl_submit` to the page's GL host
   (`MesaGlDevice` in the compositor's worker with `gl: 'compositor'`).
 
+**One memory, many owners.** The guest, the shim's data and heap, every
+Worker's shim stack and thread-locals, and the runtime's reserved words are
+all in one linear memory with no protection between them, so a range handed
+to two owners is silent corruption, and it has been, twice:
+
+- `gex_worker_init` (each Worker's first call, which claims the Worker's
+  stack) ran on wasm-ld's default stack, the top of the first 8 MiB --
+  a Windows program's image. Every thread Noita started overwrote a
+  kilobyte or two of noita.exe's .text below 0x800000. The glue now gives it
+  one of 32 bootstrap slices below `SHIM_STACK_TOP`
+  (`gex_abi::BOOT_STACK_COUNTER`); `tests/nt/src/lowmem.c` checks.
+- **std's `System` allocator is a second allocator in the same memory.** On
+  wasm32 it is dlmalloc, which grows the memory itself (`memory.grow`) and
+  uses the new pages. std uses it behind the program's back: the per-thread
+  list of thread-local destructors (any `thread_local!` whose type needs
+  `Drop` registers into it on first use) and the `Thread` handle of
+  `std::thread::current()` (the panic hook asks for it). The arena, which
+  hands out heap spans, Worker slots and guest mappings, did not know: a
+  `thread_local!` `VecDeque` made dlmalloc grow 0x82000000..0x82010000 for
+  four Workers' destructor lists, and the heap later put a translation there,
+  which the next Worker to register a destructor wrote into. The arena now
+  serializes its own growth, records any growth it did not do as `Foreign`
+  and steps over it (`OWN_TOP`, `memmap::skip_foreign`); the first is said
+  out loud ("grown outside the arena"), counted in `GEX_NT_STATS`
+  (`foreign=`), and `GEX_NT_FOREIGN_TRACE` looks around every NT call so the
+  first one is caught near whoever did it. Still: **no `thread_local!` with a
+  `Drop` type in the shim** -- it works now, but it is std allocating where
+  nothing else does.
+
+`shims/browser/src/memmap.rs` writes the ownership down: the fixed layout,
+each heap span, each Worker's stack and thread-locals, the arena's guest
+mappings, the Windows address space and foreign growth, with owners. An
+overlap between owners (guest regions may overlap each other) stops the run
+naming both and printing the map; `GEX_NT_MAP` prints it at boot,
+`memmap::owner_of` names the owner of an address in the fault reports, and
+`GEX_NT_ARENA_SELFTEST` (in `tests/nt/run-browser.sh`) grows a page behind
+the arena's back and checks the next span keeps out of it. A Windows guest's
+accesses above 2 GiB, where the shim's heap is, are bounds-guarded to a fault
+(`gex_xlate::set_guard_limit`; `GEX_NT_GUARD_2G=0` to compare), and each
+Worker's stack has a guard at its bottom checked at every NT call.
+
 The page is `web/nt.html` (`web/src/nt-page.js`): it fetches a tar holding a
 prefix under `/wine` and the program, and runs it through `runProgram` with
 the canvas as the compositor's output. `tests/nt/browser-gui.mjs` drives it in

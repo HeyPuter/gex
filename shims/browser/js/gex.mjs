@@ -777,11 +777,23 @@ export class Gex {
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
           ).replace(/\n$/, ''),
         ),
-        warn: (ptr, len) => console.error(
-          utf8(
+        warn: (ptr, len) => {
+          const text = utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
-          ).replace(/\n$/, ''),
-        ),
+          ).replace(/\n$/, '');
+          // `[gex-stack]`: the shim wants to be told who called it (the wasm
+          // frames are named).
+          if (text.startsWith('[gex-stack]')) {
+            // The run loop turns stack traces off around guest code.
+            const limit = Error.stackTraceLimit;
+            Error.stackTraceLimit = 40;
+            const stack = new Error().stack;
+            Error.stackTraceLimit = limit;
+            console.error(`${text}\n${stack}`);
+          } else {
+            console.error(text);
+          }
+        },
         now: () => this.#env.now(),
         // The NT layer's monotonic clock: `now` is `Date.now()`, a
         // millisecond wall clock that can step.

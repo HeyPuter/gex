@@ -184,6 +184,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     '--enable-unsafe-webgpu',
     ...(soft ? ['--use-angle=swiftshader-webgl', '--use-webgpu-adapter=swiftshader'] : ['--use-angle=vulkan', '--enable-features=Vulkan']),
     '--ozone-platform=headless', `--ozone-override-screen-size=${width},${height}`, `--window-size=${width},${height}`,
+    ...(process.env.GEX_NT_CHROME_FLAGS ? process.env.GEX_NT_CHROME_FLAGS.split(' ') : []),
     '--enable-logging=stderr', '--disable-hang-monitor', '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
     `--remote-debugging-port=${CHROME_PORT}`, `--user-data-dir=${join(STATE, 'profile')}`, 'about:blank',
   ], { detached: true, stdio: ['ignore', 'ignore', openSync(join(STATE, 'chrome.log'), 'w')] });

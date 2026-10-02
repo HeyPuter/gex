@@ -81,5 +81,19 @@ if [ -z "${ARCHES:-}" ] || [[ "$ARCHES" =~ x86 ]]; then
 check pe-x86/hello32 0 "Hello from x86 PE32!" x86 "$fx/x86/hello32.exe"
 check pe-x86/msvc 9 "msvc" x86 "$fx/x86/msvc.exe"
 fi
+# The arena keeps out of memory grown behind its back -- std's `System`
+# allocator (dlmalloc) grows the memory itself for thread-local destructor
+# lists, and the heap once landed on top of it (docs/nt-layer.md §10.2).
+if [ -z "$only" ] || [[ arena-selfcheck =~ $only ]]; then
+    selfcheck=$(GEX_ARCH=x86 GEX_SHARED=1 timeout ${TMO:-300} node shims/browser/js/run-node.mjs \
+        --dir /wine=$prefix --file /t/hello_args.exe=$root/tests/nt/bin/x86/hello_args.exe --argv0 /t/hello_args.exe \
+        --cwd /t --env GEX_NT_ARENA_SELFTEST=1 web/public/gex/seed.x86.shared.wasm \
+        "$root/tests/nt/bin/x86/hello_args.exe" 2>&1 | grep "arena self-check")
+    if [[ "$selfcheck" == *"arena self-check: ok"* ]]; then
+        pass=$((pass + 1)); echo "ok   arena-selfcheck"
+    else
+        fail=$((fail + 1)); echo "FAIL arena-selfcheck: ${selfcheck:-no answer}"
+    fi
+fi
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

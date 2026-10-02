@@ -231,6 +231,7 @@ mod imp {
         let taken = ARENA_NEXT.fetch_max(NT_HEAP_BASE, Ordering::AcqRel);
         let host_lo = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
         let host_hi = taken.max(gex_abi::ARENA_BOTTOM).min(NT_HEAP_BASE);
+        crate::memmap::claim(crate::memmap::Kind::Guest, 0, host_hi, NT_HEAP_BASE, "Windows address space");
 
         let var = |name: &str| {
             env.iter().find_map(|kv| kv.strip_prefix(name).and_then(|r| r.strip_prefix('=')).map(str::to_string))
@@ -248,7 +249,25 @@ mod imp {
                 PEEK.store(a << 1 | deref as u64, Ordering::Relaxed);
             }
         }
+        if flag("GEX_NT_MAP") || flag("GEX_NT_TRACE") {
+            crate::memmap::print();
+        }
+        TRACE_FOREIGN.store(flag("GEX_NT_TRACE") || flag("GEX_NT_FOREIGN_TRACE"), Ordering::Relaxed);
+        if flag("GEX_NT_ARENA_SELFTEST") {
+            warn_line(&format!("gex-nt: arena self-check: {}\n", crate::arena_selftest()));
+        }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
+        if let Some(a) = var("GEX_NT_WATCH_ALLOC").and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+            crate::WATCH_ALLOC.store(a, Ordering::Relaxed);
+        }
+        // A Windows process owns the low 2 GiB and the shim's heap is above
+        // it, in the same memory: a guest access above is made a fault, as an
+        // unallocated address is on Windows, rather than a write into the
+        // runtime (natively it would land in nothing). GEX_NT_GUARD_2G=0 to
+        // compare.
+        if var("GEX_NT_GUARD_2G").as_deref() != Some("0") {
+            gex_xlate::set_guard_limit(NT_HEAP_BASE);
+        }
         SLOT_LOG.store(flag("GEX_NT_SLOT_LOG"), Ordering::Relaxed);
         VERIFY_REGISTRY.store(flag("GEX_NT_VERIFY_REGISTRY"), Ordering::Relaxed);
         RETIRE_LOG.store(flag("GEX_NT_RETIRE_LOG"), Ordering::Relaxed);
@@ -460,9 +479,14 @@ mod imp {
                 warn_line(&format!("gex-nt: a translation was overwritten after it was kept: {what}\n"));
             }
         }
+        if VERIFY_REGISTRY.load(Ordering::Relaxed) {
+            warn_line(&format!("gex-nt: stats worker stack least headroom {} bytes\n", crate::stack_least()));
+        }
+        let foreign = crate::FOREIGN_BYTES.load(Ordering::Relaxed);
+        let fx = if foreign != 0 { format!(" foreign={foreign}") } else { String::new() };
         match peek() {
-            Some(v) => warn_line(&format!("gex-nt: stats t={t} presents={presents} peek={v}\n")),
-            None => warn_line(&format!("gex-nt: stats t={t} presents={presents}\n")),
+            Some(v) => warn_line(&format!("gex-nt: stats t={t} presents={presents} peek={v}{fx}\n")),
+            None => warn_line(&format!("gex-nt: stats t={t} presents={presents}{fx}\n")),
         }
     }
 
@@ -526,6 +550,11 @@ mod imp {
             .collect();
         drop(st);
         warn_line(&format!(
+            "gex-nt: {a:#x}..{e:#x} is {}, its end {}\n",
+            crate::memmap::owner_of(a),
+            crate::memmap::owner_of(e.saturating_sub(1))
+        ));
+        warn_line(&format!(
             "gex-nt: {a:#x}..{e:#x} (arena next {:#x}) overlaps NT regions: {}\n",
             ARENA_NEXT.load(Ordering::Relaxed),
             if hits.is_empty() { "none".into() } else { hits.join(", ") }
@@ -544,7 +573,15 @@ mod imp {
     pub(crate) fn syscall(p: &Arc<nt::Process>, ctx: i32, pc: i64) {
         let ctx_addr = ctx as u32 as u64;
         tick();
+        if let Some((lo, bad, least)) = crate::stack_guard_check() {
+            warn_line(&format!(
+                "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
+            ));
+        }
         let nr = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32;
+        if TRACE_FOREIGN.load(Ordering::Relaxed) {
+            crate::foreign_now("before", &nt::syscall_name(nr));
+        }
         let gm = GuestMem::new(guest_bytes());
         let sp0 = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0) & 0xffff_ffff;
         let r0 = gm.read_u32(sp0).unwrap_or(0) as u64;
@@ -554,6 +591,9 @@ mod imp {
             let mut host = Nested { ctx_addr };
             nt::syscall(p, &HostKernel, guest_bytes(), ctx_addr, pc as u64, &mut host)
         };
+        if TRACE_FOREIGN.load(Ordering::Relaxed) {
+            crate::foreign_now("during", &nt::syscall_name(nr));
+        }
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
         tick();
@@ -648,6 +688,10 @@ mod imp {
     /// GEX_NT_NO_RETIRE: keep translations of code that went away (a
     /// diagnostic: stale code runs).
     static NO_RETIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// GEX_NT_TRACE: look for memory grown outside the arena around every NT
+    /// call, so the first foreign grow is caught near whoever did it.
+    static TRACE_FOREIGN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// GEX_NT_VERIFY_REGISTRY: once a second, check every kept translation
     /// against the hashes taken when it was kept (a stray write into the

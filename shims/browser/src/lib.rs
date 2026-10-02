@@ -38,6 +38,7 @@ pub mod gl;
 pub mod virgl;
 pub mod wl;
 mod xwm;
+pub(crate) mod memmap;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -1571,9 +1572,40 @@ fn live_sub(n: usize) {
 // counter is atomic.
 unsafe impl Sync for Counting {}
 
+/// An address whose every allocation and free is reported with the wasm
+/// stack (`gex_watch_alloc`), zero for none: who held the memory a stray
+/// write landed in.
+pub(crate) static WATCH_ALLOC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn watch_alloc(what: &str, p: *mut u8, size: usize) {
+    let w = WATCH_ALLOC.load(std::sync::atomic::Ordering::Relaxed);
+    if w == 0 || p.is_null() {
+        return;
+    }
+    let (a, e) = (p as u64, p as u64 + size as u64);
+    if !(a <= w && w < e) {
+        return;
+    }
+    use core::fmt::Write as _;
+    struct Buf([u8; 200], usize);
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.1 += n;
+            Ok(())
+        }
+    }
+    let mut b = Buf([0; 200], 0);
+    let _ = write!(b, "[gex-stack] {what} {a:#x}..{e:#x} ({size} bytes) covers watched {w:#x}");
+    // SAFETY: `warn` reads the bytes and keeps none.
+    unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+}
+
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         let p = unsafe { self.0.alloc(l) };
+        watch_alloc("alloc", p, l.size());
         // A null becomes `handle_alloc_error` -> abort -> a bare wasm
         // `unreachable` with nothing said. The heap is fixed, so running out is
         // reachable; say so before the abort.
@@ -1601,6 +1633,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        watch_alloc("free", p, l.size());
         #[cfg(feature = "heap-counters")]
         {
             self.1.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
@@ -1612,7 +1645,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     // Forwarded, not left to the default's allocate-copy-free: talc grows in
     // place where it can, and the lifter pushes onto many vectors.
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        watch_alloc("realloc from", p, l.size());
         let q = unsafe { self.0.realloc(p, l, new) };
+        watch_alloc("realloc to", q, new);
         #[cfg(feature = "heap-counters")]
         if !q.is_null() {
             if new >= l.size() {
@@ -1648,7 +1683,11 @@ struct ShimRegion;
 /// Returns false when the engine will give no more, so `mmap` reports ENOMEM
 /// rather than the process trapping on an address that was never backed.
 fn grow_memory_to(end: u64) -> bool {
+    // One grower at a time, so a sibling Worker's grow is never taken for a
+    // foreign one (`OWN_TOP`).
+    let _g = GrowLock::take();
     const PAGE: u64 = 65536;
+    note_foreign_growth();
     let have = warch::memory_size(0) as u64 * PAGE;
     // DIAGNOSTIC (GEX_PREGROW): grow to a large floor on the first grow so that
     // runtime `memory.grow`s stop happening during the racy startup window --
@@ -1662,7 +1701,118 @@ fn grow_memory_to(end: u64) -> bool {
     // A megabyte at a time past what was asked for: `memory.grow` may copy, so
     // a guest mapping a page at a time should not pay per page.
     let want = (target - have).div_ceil(PAGE).max(16);
-    warch::memory_grow(0, want as usize) != usize::MAX
+    let prev = warch::memory_grow(0, want as usize);
+    if prev == usize::MAX {
+        return false;
+    }
+    // Whoever grew between the read above and this grow owns what they grew.
+    let prev = prev as u64 * PAGE;
+    if prev > have {
+        foreign(have.max(OWN_TOP.load(std::sync::atomic::Ordering::Relaxed)), prev);
+    }
+    OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
+    true
+}
+
+static GROW_LOCK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+struct GrowLock;
+impl GrowLock {
+    fn take() -> GrowLock {
+        while GROW_LOCK
+            .compare_exchange(0, 1, std::sync::atomic::Ordering::Acquire, std::sync::atomic::Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        GrowLock
+    }
+}
+impl Drop for GrowLock {
+    fn drop(&mut self) {
+        GROW_LOCK.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The memory size as of this module's own last grow. Memory above it that
+/// this module did not grow is someone else's: std's `System` allocator
+/// (dlmalloc, under every `thread_local!` with a destructor and every
+/// `std::thread::current()`) grows the memory itself and uses the new pages,
+/// and the arena once handed the same pages to the heap -- a Worker's
+/// thread-local destructor list written into a translation.
+static OWN_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes of memory grown outside the arena so far (GEX_NT_STATS).
+pub(crate) static FOREIGN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// GEX_NT_TRACE's look, around each NT call: memory grown outside the arena
+/// since the last look is recorded now, with the wasm stack of whoever is
+/// here (the grower ran just before, on this Worker or another).
+pub(crate) fn foreign_now(when: &str, call: &str) {
+    let mem = warch::memory_size(0) as u64 * 65536;
+    let known = OWN_TOP.load(std::sync::atomic::Ordering::Acquire);
+    if known == 0 || mem <= known {
+        return;
+    }
+    warn_line(&format!("[gex-stack] memory grown outside the arena noticed {when} {call}: {known:#x}..{mem:#x}\n"));
+    let _g = GrowLock::take();
+    note_foreign_growth();
+}
+
+/// The arena keeps out of memory someone else grows: grow a page behind its
+/// back, then take a span, and see where the span lands.
+pub(crate) fn arena_selftest() -> String {
+    let mem = warch::memory_size(0) as u64 * 65536;
+    if warch::memory_grow(0, 1) == usize::MAX {
+        return "skipped (the memory would not grow)".into();
+    }
+    let (fs, fe) = (mem, mem + 65536);
+    let at = arena_take(1 << 20);
+    match at {
+        Some(a) if a < fe && fs < a + (1 << 20) => format!("FAIL: a span at {a:#x} overlaps the foreign page {fs:#x}..{fe:#x}"),
+        Some(a) => format!("ok (foreign page {fs:#x}..{fe:#x}, the next span at {a:#x})"),
+        None => "FAIL: the arena could not take a span".into(),
+    }
+}
+
+/// Pages grown by someone else, kept out of the arena (`memmap::skip_foreign`).
+fn foreign(start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    FOREIGN_BYTES.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+    memmap::claim(memmap::Kind::Foreign, 0, start, end, "grown outside the arena (std's System allocator?)");
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        use core::fmt::Write as _;
+        struct Buf([u8; 200], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let n = s.len().min(self.0.len() - self.1);
+                self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
+        let mut b = Buf([0; 200], 0);
+        let _ = write!(b, "[gex] memory {start:#x}..{end:#x} was grown outside the arena; the arena keeps out of it\n");
+        // SAFETY: `warn` reads the bytes and keeps none.
+        unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+    }
+}
+
+/// The memory grown since this module last looked, by someone else.
+fn note_foreign_growth() {
+    let mem = warch::memory_size(0) as u64 * 65536;
+    let known = OWN_TOP.load(std::sync::atomic::Ordering::Acquire);
+    if known == 0 {
+        // The first look: everything already there (the loader's, a forked
+        // child's image) is accounted for elsewhere.
+        let _ = OWN_TOP.compare_exchange(0, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if mem > known && OWN_TOP.compare_exchange(known, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok() {
+        foreign(known, mem);
+    }
 }
 
 static PREGROW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1848,6 +1998,12 @@ fn arena_take(len: u64) -> Option<u64> {
     } else {
         cur
     };
+    // Never into memory someone else grew (and is using).
+    {
+        let _g = GrowLock::take();
+        note_foreign_growth();
+    }
+    let at = memmap::skip_foreign(at, len);
     let end = at.checked_add(len)?;
     if end > nt::arena_ceiling() || !grow_memory_to(end) {
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
@@ -1960,6 +2116,10 @@ fn arena_take(len: u64) -> Option<u64> {
     // seeing `cur` wins the span; a loser recomputes from the advanced cursor
     // and claims its own bytes. Any grow already done is harmless -- this memory
     // only ever grows, so a span reserved and then lost is just skipped.
+    // Grown by someone else while this grew: look again.
+    if memmap::skip_foreign(at, len) != at {
+        return arena_take(len);
+    }
     if ARENA_NEXT
         .compare_exchange(
             cur,
@@ -1988,7 +2148,11 @@ fn arena_back(end: u64) -> Option<u64> {
     if !grow_memory_to(end) {
         return None;
     }
-    Some(ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed))
+    let prev = ARENA_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+    if end > prev {
+        memmap::claim(memmap::Kind::Guest, 0, prev, end, "guest fixed mapping (arena)");
+    }
+    Some(prev)
 }
 
 /// What the kernel's memory map calls to claim a span of arena.
@@ -1997,7 +2161,11 @@ fn arena_back(end: u64) -> Option<u64> {
 /// out the same bytes. Zero means the memory would not grow.
 fn arena_grow(len: u64) -> u64 {
     arena_note(0, len);
-    arena_take(len).unwrap_or(0)
+    let at = arena_take(len).unwrap_or(0);
+    if at != 0 {
+        memmap::claim(memmap::Kind::Guest, 0, at, at + len, "guest mapping (arena)");
+    }
+    at
 }
 
 // SAFETY: `acquire` claims a region of this module's own linear memory and
@@ -2113,6 +2281,7 @@ unsafe impl talc::source::Source for ShimRegion {
             }
         }
         let base = arena_take(len).ok_or(())? as *mut u8;
+        memmap::claim(memmap::Kind::Heap, 0, base as u64, base as u64 + len, "heap span");
         // Extend the last span when this one abuts it, rather than claiming a
         // separate one: talc cannot serve a request larger than any single span
         // from two adjacent ones, so a doubling buffer would otherwise strand
@@ -2846,6 +3015,8 @@ mod slots {
     /// And room for the thread-locals, which are a handful of words today.
     pub const TLS: usize = 1 << 16;
     pub const COUNT: usize = 64;
+    /// Bytes of guard pattern at the bottom of each stack.
+    pub const GUARD: usize = 4096;
 }
 
 #[cfg(feature = "shared-memory")]
@@ -2881,12 +3052,77 @@ pub extern "C" fn gex_worker_init() -> u32 {
     // grown to cover it.
     unsafe {
         let at = base as u32 as *mut u8;
+        extern "C" {
+            static __heap_base: u8;
+        }
+        memmap::claim_fixed(core::ptr::addr_of!(__heap_base) as u64);
+        memmap::claim(memmap::Kind::Stack, i as u32, base, base + slots::STACK as u64, "shim stack");
+        memmap::claim(
+            memmap::Kind::Tls,
+            i as u32,
+            base + slots::STACK as u64,
+            base + (slots::STACK + slots::TLS) as u64,
+            "thread-locals",
+        );
         __wasm_init_tls(at.add(slots::STACK));
         // The thread-locals exist now, so this is the first thing that can be
         // said about which Worker this is.
         WORKER.with(|w| w.set(i as u32));
+        // A guard at the bottom of the stack: a stack that outgrows its
+        // megabyte runs on into whatever the arena handed out below it (a
+        // heap span, so translations, the registry...). Checked at every NT
+        // call (`stack_guard_check`).
+        std::slice::from_raw_parts_mut(at as *mut u32, slots::GUARD / 4).fill(STACK_GUARD);
+        STACK_LO.with(|l| l.set(at as u32));
         (at as u32) + slots::STACK as u32
     }
+}
+
+#[cfg(feature = "shared-memory")]
+const STACK_GUARD: u32 = 0x5747_5d0d;
+
+/// This Worker's id, as the lock knows it.
+#[cfg(feature = "shared-memory")]
+pub(crate) fn worker_id() -> u32 {
+    WORKER.with(|w| w.get())
+}
+
+#[cfg(feature = "shared-memory")]
+thread_local! {
+    /// The bottom of this Worker's shim stack (its guard), zero for none.
+    static STACK_LO: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The least headroom seen above the guard.
+    static STACK_LEAST: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// Whether this Worker's shim stack has run into its guard: `Some((bottom,
+/// how many guard bytes are overwritten, least headroom seen))` the first time
+/// it has. Also keeps the least headroom, read from the address of a local.
+#[cfg(feature = "shared-memory")]
+pub(crate) fn stack_guard_check() -> Option<(u32, u32, u32)> {
+    let lo = STACK_LO.with(|l| l.get());
+    if lo == 0 {
+        return None;
+    }
+    let here = 0u8;
+    let sp = &here as *const u8 as u32;
+    let room = sp.wrapping_sub(lo + slots::GUARD as u32);
+    STACK_LEAST.with(|l| l.set(l.get().min(room)));
+    // SAFETY: this Worker's own guard words, inside the span it claimed.
+    let g = unsafe { std::slice::from_raw_parts(lo as *const u32, slots::GUARD / 4) };
+    // A stack running down into the guard hits its top words first: those
+    // are checked every call, the whole guard only once they have changed.
+    if g[g.len() - 16..].iter().all(|w| *w == STACK_GUARD) {
+        return None;
+    }
+    let top_bad = g.iter().rposition(|w| *w != STACK_GUARD)?;
+    STACK_LO.with(|l| l.set(0));
+    Some((lo, (top_bad as u32 + 1) * 4, STACK_LEAST.with(|l| l.get())))
+}
+
+#[cfg(feature = "shared-memory")]
+pub(crate) fn stack_least() -> u32 {
+    STACK_LEAST.with(|l| l.get())
 }
 
 /// Which Worker this is. Per-Worker via TLS, exactly right here (unlike the

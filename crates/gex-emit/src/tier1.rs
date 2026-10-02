@@ -16,7 +16,7 @@
 //!   block needs a handful of locals rather than one per SSA value.
 
 use crate::wasm::{FuncBody, ValType};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT, POISON_ADDR};
 use gex_ir::*;
 use std::collections::HashMap;
@@ -248,6 +248,21 @@ static TRAP_PC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 pub fn set_trap_pc(pc: u64) {
     TRAP_PC.store(pc, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where the bounds guard puts the end of the guest's memory, for blocks
+/// translated from now on: `GUEST_LIMIT` unless a host lowers it. A Windows
+/// process in the browser owns only the low 2 GiB -- the shim's heap is
+/// above it -- so there it is 2 GiB, and a guest access above is a fault
+/// rather than a write into the runtime.
+static GUARD_LIMIT: AtomicU64 = AtomicU64::new(GUEST_LIMIT);
+
+pub fn set_guard_limit(limit: u64) {
+    GUARD_LIMIT.store(limit.min(GUEST_LIMIT), Ordering::Relaxed);
+}
+
+fn guard_limit() -> u64 {
+    GUARD_LIMIT.load(Ordering::Relaxed)
 }
 
 /// More pcs for the same breakpoint, beside [`set_trap_pc`]'s: to watch a
@@ -1158,7 +1173,7 @@ impl<'a> Emitter<'a> {
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
             let ea = c.wrapping_add(offset as u64);
-            if ea < GUEST_LIMIT {
+            if ea < guard_limit() {
                 self.f.i32_const(ea as i32);
                 return 0;
             }
@@ -1219,7 +1234,7 @@ impl<'a> Emitter<'a> {
         self.f.byte(code::I32_WRAP_I64);
         self.f.i32_const(POISON_ADDR as i32);
         self.f.local_get(t);
-        self.f.i64_const(GUEST_LIMIT as i64);
+        self.f.i64_const(guard_limit() as i64);
         self.f.byte(code::I64_LT_U);
         self.f.select();
     }

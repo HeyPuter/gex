@@ -1,0 +1,261 @@
+//! Who owns each part of the shared memory, written down and checked.
+//!
+//! The guest, the shim and every Worker live in one linear memory with no
+//! protection between them, so a range handed to two owners is silent
+//! corruption: a Worker's first call running on wasm-ld's default stack wrote
+//! into noita.exe's .text for months. Every region is registered here with
+//! its owner as it is created -- the fixed layout once, then each heap span,
+//! each Worker's stack and thread-local block, each arena span the guest's
+//! mappings take, the Windows address space at NT boot -- and a region that
+//! overlaps another owner's stops the run, naming both. Guest regions may
+//! overlap each other (the guest remaps its own memory); nothing else may
+//! overlap anything.
+//!
+//! No allocation anywhere here: the heap's refill path registers its spans.
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Kind {
+    /// The guest's: image, stack, mappings, the Windows address space.
+    Guest = 1,
+    /// The runtime's fixed low region: contexts, scratch words, directory.
+    Reserved = 2,
+    /// The shim's data and bss (and the first instance's thread-locals).
+    ShimData = 3,
+    /// Bootstrap stacks for `gex_worker_init` (shims/browser/js/gex.mjs).
+    BootStacks = 4,
+    /// A span of the shim's heap (talc).
+    Heap = 5,
+    /// A Worker's shim stack (owner: its slot).
+    Stack = 6,
+    /// A Worker's thread-local block (owner: its slot).
+    Tls = 7,
+    /// Memory grown by someone other than the arena (std's `System`
+    /// allocator): the arena steps over it.
+    Foreign = 8,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Guest => "guest",
+            Kind::Reserved => "reserved",
+            Kind::ShimData => "shim data",
+            Kind::BootStacks => "bootstrap stacks",
+            Kind::Heap => "shim heap",
+            Kind::Stack => "worker stack",
+            Kind::Tls => "worker tls",
+            Kind::Foreign => "foreign",
+        }
+    }
+    fn from(v: u64) -> Kind {
+        match v {
+            1 => Kind::Guest,
+            2 => Kind::Reserved,
+            3 => Kind::ShimData,
+            4 => Kind::BootStacks,
+            5 => Kind::Heap,
+            6 => Kind::Stack,
+            7 => Kind::Tls,
+            _ => Kind::Foreign,
+        }
+    }
+}
+
+const N: usize = 4096;
+
+/// `[start, end)` and `kind << 32 | owner` per entry; `len` entries used.
+struct Table {
+    start: [AtomicU64; N],
+    end: [AtomicU64; N],
+    tag: [AtomicU64; N],
+    /// What each entry is, a static string's address and length.
+    what: [AtomicU64; N],
+    len: AtomicU32,
+    lock: AtomicU32,
+    full_said: AtomicU32,
+}
+
+static T: Table = Table {
+    start: [const { AtomicU64::new(0) }; N],
+    end: [const { AtomicU64::new(0) }; N],
+    tag: [const { AtomicU64::new(0) }; N],
+    what: [const { AtomicU64::new(0) }; N],
+    len: AtomicU32::new(0),
+    lock: AtomicU32::new(0),
+    full_said: AtomicU32::new(0),
+};
+
+struct Held;
+impl Held {
+    fn take() -> Held {
+        while T.lock.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+        Held
+    }
+}
+impl Drop for Held {
+    fn drop(&mut self) {
+        T.lock.store(0, Ordering::Release);
+    }
+}
+
+fn what_of(i: usize) -> &'static str {
+    let v = T.what[i].load(Ordering::Relaxed);
+    let (p, l) = ((v >> 32) as usize, (v & 0xffff_ffff) as usize);
+    if l == 0 {
+        return "";
+    }
+    // SAFETY: stored from a `&'static str` in `claim`.
+    unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p as *const u8, l)) }
+}
+
+/// A line into a stack buffer and out through `warn`, allocating nothing.
+struct Line([u8; 600], usize);
+impl std::fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let n = s.len().min(self.0.len() - self.1);
+        self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.1 += n;
+        Ok(())
+    }
+}
+fn say(args: std::fmt::Arguments<'_>) {
+    use std::fmt::Write as _;
+    let mut l = Line([0; 600], 0);
+    let _ = l.write_fmt(args);
+    let _ = l.write_str("\n");
+    // SAFETY: the import reads the bytes and keeps none.
+    unsafe { crate::warn(l.0.as_ptr() as u32, l.1 as u32) };
+}
+
+/// Register `[start, end)` for `kind` (`owner`: a Worker slot, or 0), as
+/// `what`. Overlapping another owner's region stops the run.
+pub fn claim(kind: Kind, owner: u32, start: u64, end: u64, what: &'static str) {
+    if end <= start {
+        return;
+    }
+    let tag = (kind as u64) << 32 | owner as u64;
+    let _h = Held::take();
+    let n = T.len.load(Ordering::Relaxed) as usize;
+    for i in 0..n {
+        let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));
+        if s < end && start < e {
+            let other = T.tag[i].load(Ordering::Relaxed);
+            let ok = kind == Kind::Guest && Kind::from(other >> 32) == Kind::Guest;
+            if !ok {
+                say(format_args!(
+                    "[gex] BUG: memory map overlap: {} {:#x}..{:#x} ({} of {}) overlaps {} {:#x}..{:#x} ({} of {})",
+                    kind.name(),
+                    start,
+                    end,
+                    what,
+                    owner,
+                    Kind::from(other >> 32).name(),
+                    s,
+                    e,
+                    what_of(i),
+                    other & 0xffff_ffff
+                ));
+                print_locked(n);
+                core::arch::wasm32::unreachable();
+            }
+        }
+    }
+    // Extend the last entry when this one continues it.
+    if n > 0
+        && T.tag[n - 1].load(Ordering::Relaxed) == tag
+        && T.end[n - 1].load(Ordering::Relaxed) == start
+        && what_of(n - 1) == what
+    {
+        T.end[n - 1].store(end, Ordering::Relaxed);
+        return;
+    }
+    if n == N {
+        if T.full_said.swap(1, Ordering::Relaxed) == 0 {
+            say(format_args!("[gex] memory map: table full at {N} regions; later ones are not checked"));
+        }
+        return;
+    }
+    T.start[n].store(start, Ordering::Relaxed);
+    T.end[n].store(end, Ordering::Relaxed);
+    T.tag[n].store(tag, Ordering::Relaxed);
+    T.what[n].store((what.as_ptr() as u64) << 32 | what.len() as u64, Ordering::Relaxed);
+    T.len.store(n as u32 + 1, Ordering::Relaxed);
+}
+
+fn print_locked(n: usize) {
+    say(format_args!("[gex] memory map, {n} regions:"));
+    for i in 0..n {
+        let t = T.tag[i].load(Ordering::Relaxed);
+        say(format_args!(
+            "[gex]   {:#010x}..{:#010x} {:<16} {:>3} {}",
+            T.start[i].load(Ordering::Relaxed),
+            T.end[i].load(Ordering::Relaxed),
+            Kind::from(t >> 32).name(),
+            t & 0xffff_ffff,
+            what_of(i)
+        ));
+    }
+}
+
+/// The whole map, on the console.
+pub fn print() {
+    let _h = Held::take();
+    print_locked(T.len.load(Ordering::Relaxed) as usize);
+}
+
+/// Who owns `addr`, as "kind owner what start..end" (the last registered
+/// region containing it), or "nobody".
+pub fn owner_of(addr: u64) -> String {
+    let _h = Held::take();
+    let n = T.len.load(Ordering::Relaxed) as usize;
+    for i in (0..n).rev() {
+        let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));
+        if s <= addr && addr < e {
+            let t = T.tag[i].load(Ordering::Relaxed);
+            return format!("{} {} ({}) {s:#x}..{e:#x}", Kind::from(t >> 32).name(), t & 0xffff_ffff, what_of(i));
+        }
+    }
+    "nobody".into()
+}
+
+static FIXED: AtomicU32 = AtomicU32::new(0);
+
+/// The fixed layout, once per process (every Worker calls it).
+pub fn claim_fixed(heap_base: u64) {
+    if FIXED.swap(1, Ordering::AcqRel) != 0 {
+        return;
+    }
+    claim(Kind::Reserved, 0, 0, gex_abi::RESERVED_END, "page zero, contexts, runtime words");
+    claim(Kind::Reserved, 0, gex_abi::DISPATCH_DIR, gex_abi::DISPATCH_DIR_END, "dispatch directory");
+    claim(Kind::Guest, 0, gex_abi::DISPATCH_DIR_END, 0x0580_0000, "low layout: image, interpreter, break, stack");
+    claim(Kind::BootStacks, 0, 0x0580_0000, 0x0600_0000, "gex_worker_init's bootstrap slices");
+    claim(Kind::ShimData, 0, 0x0600_0000, heap_base, "shim data and bss");
+    claim(Kind::Guest, 0, gex_abi::PLACE_BOTTOM, gex_abi::PLACE_TOP, "placement window (shared objects)");
+}
+
+/// The first `at' >= at` where `[at', at'+len)` overlaps no foreign region.
+pub fn skip_foreign(mut at: u64, len: u64) -> u64 {
+    let _h = Held::take();
+    let n = T.len.load(Ordering::Relaxed) as usize;
+    loop {
+        let mut moved = false;
+        for i in 0..n {
+            if Kind::from(T.tag[i].load(Ordering::Relaxed) >> 32) != Kind::Foreign {
+                continue;
+            }
+            let (s, e) = (T.start[i].load(Ordering::Relaxed), T.end[i].load(Ordering::Relaxed));
+            if s < at + len && at < e {
+                at = e;
+                moved = true;
+            }
+        }
+        if !moved {
+            return at;
+        }
+    }
+}
