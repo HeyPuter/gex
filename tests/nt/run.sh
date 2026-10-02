@@ -72,10 +72,9 @@ for arch in x64 x86; do
     # N2 (and N3 for x86): every line "ok ...", then "0 failures".
     check $arch/sync 0 "$allok" "$b/sync.exe"
     # Locks under contention (x64's SList is cmpxchg16b, done by the host
-    # under one lock). x86 only natively for now: x64's first section (the
-    # builtin msvcp120's _Mtx_lock, eight threads) livelocks under native
-    # gexc since the merges of 2026-10-01 -- it passes in the browser.
-    [ $arch = x86 ] && check $arch/mtx 0 "$allok" "$b/mtx.exe"
+    # under one lock). x64's _Mtx_lock section livelocked natively from
+    # 03fd68c2 to f54d5717 (a stale block dispatching back to itself).
+    check $arch/mtx 0 "$allok" "$b/mtx.exe"
     check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
     check $arch/apc 0 "$allok" "$b/apc.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
