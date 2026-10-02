@@ -20,7 +20,7 @@
 //! stub, so a thread behind the log is never wrong, only slower.
 
 use gex_abi::ftab::{RESERVED, RESOLVE};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// What made a function: the tiers of §9.2, for statistics and for what a
 /// retirement has to check.
@@ -65,7 +65,7 @@ pub struct Func {
 /// The process's function table, host side.
 pub struct FuncMap {
     next: u32,
-    by_addr: HashMap<u64, Func>,
+    by_addr: BTreeMap<u64, Func>,
     installs: Vec<Install>,
     log: Vec<Event>,
     /// Indices handed out and later retired, for statistics.
@@ -80,7 +80,7 @@ impl Default for FuncMap {
 
 impl FuncMap {
     pub fn new() -> FuncMap {
-        FuncMap { next: RESERVED, by_addr: HashMap::new(), installs: Vec::new(), log: Vec::new(), retired: 0 }
+        FuncMap { next: RESERVED, by_addr: BTreeMap::new(), installs: Vec::new(), log: Vec::new(), retired: 0 }
     }
 
     /// How large every table must be to hold every index handed out so far.
@@ -146,7 +146,7 @@ impl FuncMap {
 
     /// Retire every function whose entry lies in `[start, end)`.
     pub fn retire_range(&mut self, start: u64, end: u64) -> Vec<(u64, u32)> {
-        let gone: Vec<u64> = self.by_addr.keys().copied().filter(|a| (start..end).contains(a)).collect();
+        let gone: Vec<u64> = self.by_addr.range(start..end).map(|(a, _)| *a).collect();
         let mut out = Vec::with_capacity(gone.len());
         for a in gone {
             if let Some(i) = self.retire(a) {
@@ -154,6 +154,11 @@ impl FuncMap {
             }
         }
         out
+    }
+
+    /// The functions whose entry lies in `[start, end)`.
+    pub fn range(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, Func)> + '_ {
+        self.by_addr.range(start..end).map(|(a, f)| (*a, *f))
     }
 
     /// Number of addresses mapped.

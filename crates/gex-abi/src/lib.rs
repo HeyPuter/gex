@@ -895,6 +895,12 @@ pub mod cache_op {
     /// Not a cache operation: a function-tier nest root handed control to
     /// dispatch at `addr` (one exit in 4096, for GEX_NT_STATS's exit sites).
     pub const NEST_EXIT_SAMPLE: i32 = 13;
+    /// Not a cache operation: the function table's bridge in tier-1's
+    /// dispatch slot for `addr` called a function that left for `addr`
+    /// itself without running anything (no body serves it after all). The
+    /// host lets tier-1 have the address: the miss that follows translates
+    /// it and its block takes the slot.
+    pub const FTAB_TIER1: i32 = 14;
 }
 
 /// The lowest address a guest access may name: below it are the runtime's

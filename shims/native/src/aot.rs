@@ -293,11 +293,11 @@ pub(crate) fn install_shared(
     );
     for (module, meta) in units {
         let unit = Arc::new(super::CompiledUnit {
-            module,
+            module: Some(module),
             exported_blocks: Vec::new(),
             dir_entries: meta.dir_entries.clone(),
             table_slots: meta.table_slots,
-            cgen: None,
+            bridges: Vec::new(),
         });
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());

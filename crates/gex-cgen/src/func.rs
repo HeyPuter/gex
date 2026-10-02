@@ -23,12 +23,6 @@ use gex_ir::{Block, Expr, GuestReg, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
-/// Whether calls to code the tier does not hold call out (§7.3) rather than
-/// leave: in whole-image units (a spliced module has no `gex.call_out`).
-/// `GEX_CGEN_EXP=NOCALLOUT` leaves, as before.
-fn call_out() -> bool {
-    !exp("NOCALLOUT")
-}
 
 /// The compiler barrier at a loop back-edge (`GEX_BACKEDGE`, gex_abi.h):
 /// another thread may change what the loop reads. `GEX_CGEN_EXP=NOBARRIER`
@@ -210,8 +204,12 @@ pub struct FnUnit {
     /// A unit for `standalone::standalone`: everything `static`, and no
     /// dispatch roots (`e_<F>`), so nothing imports `gexc.dispatch`.
     standalone: bool,
-    /// A whole-image unit's: `gex_call_known` is the dispatcher's import.
-    pub call_known_import: bool,
+    /// A whole-image unit's (docs/merge-plan.md §9.8.1): calls to anything
+    /// the unit does not hold go through the process's function table, and
+    /// there are no dispatch roots or body-table entries.
+    pub ftab: bool,
+    /// The functions with a body here, in order (a whole-image unit's).
+    defined: Vec<u64>,
 }
 
 impl Default for FnUnit {
@@ -236,7 +234,8 @@ impl FnUnit {
             ret_sp_delta: ret_sp_delta(false),
             live: Vec::new(),
             standalone: false,
-            call_known_import: false,
+            ftab: false,
+            defined: Vec::new(),
         }
     }
 
@@ -268,6 +267,21 @@ impl FnUnit {
     /// trap-free, so it must not be one.
     pub fn add_leave_stub(&mut self, entry: u64) {
         let st = self.storage();
+        if self.ftab {
+            // Re-entered through the table: the host serves the address
+            // with something other than this unit (it is not in the unit's
+            // `gex.funcs`).
+            let _ = writeln!(
+                self.bodies,
+                "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{\n  \
+                 GEX_C64({}u) = 0x{entry:x}ull;\n  \
+                 GEX_MUSTTAIL return GEX_FTAB(GEX_FTAB_RESOLVE)(ctx, depth, need, ret);\n}}\n",
+                body_name(entry),
+                ctx::LAST_TARGET
+            );
+            self.protos.insert(entry);
+            return;
+        }
         let _ = writeln!(
             self.bodies,
             "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{\n  \
@@ -314,6 +328,23 @@ impl FnUnit {
         // Set when a poll expires anywhere: the next outermost back-edge
         // hands the loop over (§7.2), wherever the hot inner loop is.
         let _ = writeln!(fhead, "  int hot = 0; (void)hot;");
+        // Its code rewritten since the unit was installed (Detours): what
+        // the table now has for the entry runs instead, under the same
+        // contract (a newer translation, which the probe finds once the host
+        // has made it). Every caller of a function that is not trap-free
+        // wrote everything back first, so nothing is lost; trap-free ones
+        // are checked by their callers.
+        if self.ftab && !trapfree.contains_key(&f.entry) {
+            let _ = writeln!(
+                fhead,
+                "  if (__builtin_expect({}, 0)) {{ GEX_C64({}u) = 0x{:x}ull; \
+                 GEX_MUSTTAIL return GEX_FTAB(gex_ftab_idx(0x{:x}ull))(ctx, depth, need, ret); }}",
+                patched_test(f.entry),
+                ctx::LAST_TARGET,
+                f.entry,
+                f.entry
+            );
+        }
         // The recursion-depth guard, before anything is loaded: every caller
         // wrote everything back before calling, so leaving for this
         // function's own entry here is exactly the caller leaving for it.
@@ -408,8 +439,12 @@ impl FnUnit {
         self.bodies.push_str("}\n\n");
 
         // The entry and nest root. A standalone unit has none: its caller
-        // dispatches on `ctx::PC` itself.
-        if self.standalone {
+        // dispatches on `ctx::PC` itself; nor has a whole-image unit, whose
+        // functions are reached through the function table.
+        if self.ftab {
+            self.defined.push(f.entry);
+        }
+        if self.standalone || self.ftab {
             self.protos.insert(f.entry);
             self.protos.extend(calls);
             return Ok(());
@@ -601,7 +636,15 @@ impl FnUnit {
                 }
                 e.line("default:;");
                 e.line("}");
-                leave(e, &t);
+                if self.ftab {
+                    // Anywhere else: a jump, so whatever runs there returns
+                    // where this function would have.
+                    e.flush();
+                    e.safepoint(&t);
+                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                } else {
+                    leave(e, &t);
+                }
             }
             FTerm::Call { callee, ret_pc, ret } => {
                 let spn = reg_name(sp_reg());
@@ -647,6 +690,35 @@ impl FnUnit {
                     "{{ const uint64_t sp_want = {spn} + {}ull;", self.ret_sp_delta
                 ));
                 match callee {
+                    Callee::Direct(t) if known.contains(t) && self.ftab => {
+                        calls.insert(*t);
+                        self.stats.calls_known += 1;
+                        // A callee that is not trap-free checks its own pages
+                        // on entry; a trap-free one is checked here, where
+                        // everything can be written back first. Rewritten:
+                        // call what the table has for it instead.
+                        if trapfree.contains_key(t) {
+                            e.line(format!("  if (__builtin_expect({}, 0)) {{", patched_test(*t)));
+                            e.flush_keep();
+                            ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg);
+                            reload_all(e);
+                            e.line("  } else");
+                        }
+                        e.line(format!(
+                            "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) return 0;",
+                            body_name(*t),
+                            self.weight
+                        ));
+                    }
+                    Callee::Direct(t) if self.ftab => {
+                        *self.stats.leaves.entry(*t).or_default() += 1;
+                        ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg);
+                    }
+                    Callee::Indirect(v) if self.ftab => {
+                        self.stats.calls_indirect += 1;
+                        let t = e.v(*v);
+                        ftab_call(e, &t, &format!("depth + {}", self.weight), need_back, &ret_arg);
+                    }
                     Callee::Direct(t) if known.contains(t) => {
                         calls.insert(*t);
                         self.stats.calls_known += 1;
@@ -669,11 +741,7 @@ impl FnUnit {
                         // return (§7.3); if it cannot, the rest of this
                         // function runs in tier-1.
                         e.store_pc(&format!("0x{t:x}ull"));
-                        if call_out() && self.call_known_import {
-                            e.line(format!("  if (!gex_call_out(ctx, 0x{t:x}ll, (int64_t){ret_arg}, (int64_t)sp_want)) return 0;"));
-                        } else {
-                            e.line("  return 0;");
-                        }
+                        e.line("  return 0;");
                     }
                     Callee::Indirect(v) => {
                         self.uses_call_known = true;
@@ -685,11 +753,7 @@ impl FnUnit {
                         ));
                         e.line("  if (rk < 0) {");
                         e.store_pc(&t);
-                        if call_out() && self.call_known_import {
-                            e.line(format!("    rk = gex_call_out(ctx, (int64_t){t}, (int64_t){ret_arg}, (int64_t)sp_want);"));
-                        } else {
-                            e.line("    return 0;");
-                        }
+                        e.line("    return 0;");
                         e.line("  }");
                         e.line("  if (!rk) return 0;");
                     }
@@ -718,6 +782,41 @@ impl FnUnit {
                     None => {
                         e.store_pc(&format!("0x{ret_pc:x}ull"));
                         e.line("return 0;");
+                    }
+                }
+            }
+            FTerm::TailCall { callee } if self.ftab => {
+                if exp("NOFLAGWB") {
+                    e.forget_flags();
+                }
+                let t = match callee {
+                    Callee::Direct(t) => format!("0x{t:x}ull"),
+                    Callee::Indirect(v) => e.v(*v),
+                };
+                e.flush();
+                // A tail call does not pass through a loop back-edge or the
+                // root, so it polls (returns no longer do).
+                e.safepoint(&t);
+                match callee {
+                    Callee::Direct(c) if known.contains(c) => {
+                        calls.insert(*c);
+                        self.stats.tail_known += 1;
+                        if trapfree.contains_key(c) {
+                            e.line(format!("if (__builtin_expect({}, 0)) {{", patched_test(*c)));
+                            ftab_tail(e, &t, scope.is_some(), self.weight);
+                            e.line("}");
+                        }
+                        if scope.is_some() {
+                            e.line(format!("return {}(ctx, depth + {}, need, ret);", body_name(*c), self.weight));
+                        } else {
+                            e.line(format!("GEX_MUSTTAIL return {}(ctx, depth, need, ret);", body_name(*c)));
+                        }
+                    }
+                    _ => {
+                        if let Callee::Direct(c) = callee {
+                            *self.stats.leaves.entry(*c).or_default() += 1;
+                        }
+                        ftab_tail(e, &t, scope.is_some(), self.weight);
                     }
                 }
             }
@@ -788,10 +887,17 @@ impl FnUnit {
                     e.line("}");
                 }
                 // Anywhere else: everything written back, PC set; the callers
-                // unwind and the root polls and dispatches.
+                // unwind and the root polls and dispatches. A jump nobody
+                // resolved goes on through the function table instead, under
+                // this function's own return contract.
                 e.flush();
-                e.store_pc(&t);
-                e.line("return 0;");
+                if self.ftab && matches!(b.term, FTerm::Unresolved { .. }) {
+                    e.safepoint(&t);
+                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                } else {
+                    e.store_pc(&t);
+                    e.line("return 0;");
+                }
             }
             FTerm::Syscall { next_pc, next } => {
                 e.flush();
@@ -829,78 +935,52 @@ impl FnUnit {
         for a in &self.protos {
             let _ = writeln!(s, "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
         }
-        if self.call_known_import {
-            // A whole-image unit: the process's body table, through the
-            // dispatcher module (`splice::dispatcher_module`).
-            let _ = writeln!(
-                s,
-                "__attribute__((import_module(\"{}\"), import_name(\"{}\"))) int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n",
-                crate::splice::DISPATCH_MODULE,
-                crate::splice::CALL_KNOWN_NAME
-            );
-        } else {
+        if !self.ftab {
             let _ = writeln!(s, "{st}int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n");
         }
         s.push_str(&self.bodies);
+        if self.ftab && !self.defined.is_empty() {
+            // Every body's address taken, so the linker puts it in the
+            // element segment that fills the function table from
+            // `__table_base` (`image::funcs_section` reads where). Exported
+            // so it is kept; nothing calls it.
+            let first = self.defined[0];
+            let _ = writeln!(s, "__attribute__((export_name(\"gex_refs_{first:x}\"))) uint32_t gex_refs_{first:x}(uint32_t k) {{\n  switch (k) {{");
+            for (k, a) in self.defined.iter().enumerate() {
+                let _ = writeln!(s, "  case {k}u: return (uint32_t)(uintptr_t)&{};", body_name(*a));
+            }
+            s.push_str("  default: return 0;\n  }\n}\n");
+        }
         s
     }
 }
 
-/// The table indices of a whole-image unit's entries (docs/function-tier.md
-/// §11): `gex_fnref(2k)` is entry k's `e_` and `gex_fnref(2k + 1)` its
-/// `ib_`, as indices into the unit's own function table (wasm-ld's, which
-/// it exports), so the module exports three things however many functions it
-/// holds (wasm caps a module at 100,000 exports; noita.exe has 100,147
-/// functions). Chunked as `gex_call_known`'s switch is, for clang's sake.
-pub fn fnref_source(entries: &[u64]) -> String {
-    let mut s = String::from("#include \"gex_abi.h\"\n\n");
-    for a in entries {
-        let _ = writeln!(s, "void {}(int ctx);", entry_name(*a));
-        let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", checked_body_name(*a));
+/// A call through the function table to `t` (a C expression): the target in
+/// `ctx::LAST_TARGET`, the index from the probe cache (the resolve stub on a
+/// miss), the callee's result tested as for any call.
+fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str) {
+    e.line(format!("  {{ const uint64_t ft = {t}; GEX_C64({}u) = ft;", ctx::LAST_TARGET));
+    e.line(format!("    if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need}, {ret})) return 0; }}"));
+}
+
+/// A tail call through the function table to `t`, with this function's own
+/// `need` and `ret`: a guest jump hands its caller's return over. A loop
+/// function's signature is not the bodies', so there it is an ordinary call.
+fn ftab_tail(e: &mut Emitter<'_>, t: &str, in_loop: bool, weight: u32) {
+    e.line(format!("{{ const uint64_t ft = {t}; GEX_C64({}u) = ft;", ctx::LAST_TARGET));
+    if in_loop {
+        e.line(format!("  return GEX_FTAB(gex_ftab_idx(ft))(ctx, depth + {weight}, need, ret); }}"));
+    } else {
+        e.line("  GEX_MUSTTAIL return GEX_FTAB(gex_ftab_idx(ft))(ctx, depth, need, ret); }");
     }
-    // Entries sharing a dispatch slot (x86: a slot covers four bytes, e.g. a
-    // one-byte `ret` stub followed by a function): the first one's body-table
-    // entry picks the body by `ctx::PC` among all of them, so a call to any
-    // of them stays in the function tier.
-    let mut groups: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
-    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
-        for a in entries {
-            groups.entry(*a >> gex_abi::DISPATCH_SHIFT).or_default().push(*a);
-        }
-    }
-    let mut shared: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-    for g in groups.values().filter(|g| g.len() > 1) {
-        let first = *g.iter().min().unwrap();
-        let name = format!("ibs_{first:x}");
-        for a in g {
-            let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
-        }
-        let _ = writeln!(s, "static int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{");
-        let _ = writeln!(s, "  const uint64_t pc = GEX_C64({}u);", ctx::PC);
-        for a in g {
-            let _ = writeln!(s, "  if (pc == 0x{a:x}ull) GEX_MUSTTAIL return {}(ctx, depth, need, ret);", body_name(*a));
-        }
-        s.push_str("  return -1;\n}\n");
-        shared.insert(first, name);
-    }
-    let chunk = CALL_KNOWN_CHUNK / 2;
-    let chunks: Vec<&[u64]> = entries.chunks(chunk.max(1)).collect();
-    for (c, es) in chunks.iter().enumerate() {
-        let _ = writeln!(s, "\nstatic __attribute__((noinline)) uint32_t fr_{c}(uint32_t k) {{\n  switch (k) {{");
-        for (i, a) in es.iter().enumerate() {
-            let k = 2 * (c * chunk + i);
-            let _ = writeln!(s, "  case {k}u: return (uint32_t)(uintptr_t)&{};", entry_name(*a));
-            let body = shared.get(a).cloned().unwrap_or_else(|| checked_body_name(*a));
-            let _ = writeln!(s, "  case {}u: return (uint32_t)(uintptr_t)&{body};", k + 1);
-        }
-        s.push_str("  default: return 0;\n  }\n}\n");
-    }
-    let _ = writeln!(s, "\nuint32_t gex_fnref(uint32_t k) {{\n  switch (k / {}u) {{", 2 * chunk);
-    for c in 0..chunks.len() {
-        let _ = writeln!(s, "  case {c}u: return fr_{c}(k);");
-    }
-    s.push_str("  default: return 0;\n  }\n}\n");
-    s
+}
+
+/// Load every register the function (or loop function) keeps in locals
+/// from the context, leaving the emitter's view as it was: after a call on
+/// a conditional path, joining one that reloads lazily.
+fn reload_all(e: &mut Emitter<'_>) {
+    let used: Vec<GuestReg> = e.func_regs.as_ref().map(|r| r.used.iter().copied().collect()).unwrap_or_default();
+    e.load_regs(&used);
 }
 
 /// The helper indirect calls go through: a `switch` over every function

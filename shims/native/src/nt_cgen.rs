@@ -248,7 +248,7 @@ fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
         }
     }
     let entries = gex_cgen::image::read_entries(&cwasm_path)?;
-    if entries.is_empty() {
+    if !entries.iter().any(|&a| a != 0) {
         bail!("{}: its function-tier unit exports no entries", p.path);
     }
     Ok(Some(Placed { path: cwasm_path, cwasm, entries, pages }))
@@ -349,9 +349,9 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
         (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
     };
     let module = compile(&engine, cache.as_ref(), &path, &cwasm)?;
-    let unit = publish_cgen_unit(&shared, module, &entries)?;
-    install_unit(&mut *store, &unit)?;
-    store.data_mut().jit.as_mut().unwrap().replayed += 1;
+    crate::ftab::publish(&shared, &memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+    crate::ftab::catch_up(&mut *store)?;
+    catch_up_table(store)?;
     if trace() {
         eprintln!("gex-nt: function tier for the NT trampolines: {} entries, {:.1}s", entries.len(), t0.elapsed().as_secs_f64());
     }
@@ -504,7 +504,8 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
         };
         let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
         note_pages(&memory, &pl.pages);
-        publish_cgen_unit(&shared, module, &pl.entries)?;
+        crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+        crate::ftab::catch_up(&mut *caller)?;
         replay_registry(caller)?;
         report(&p, &pl, t0);
     }
@@ -535,9 +536,9 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
         };
         let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
         note_pages(&memory, &pl.pages);
-        let unit = publish_cgen_unit(&shared, module, &pl.entries)?;
-        install_unit(&mut *store, &unit)?;
-        store.data_mut().jit.as_mut().unwrap().replayed += 1;
+        crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+        crate::ftab::catch_up(&mut *store)?;
+        catch_up_table(store)?;
         report(&p, &pl, t0);
     }
     Ok(())
@@ -548,7 +549,7 @@ fn report(p: &Pending, pl: &Placed, t0: std::time::Instant) {
         "gex-nt: function tier for {} at {:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
         p.path,
         p.base,
-        pl.entries.len(),
+        pl.entries.iter().filter(|&&a| a != 0).count(),
         pl.cwasm.len() >> 20,
         t0.elapsed().as_secs_f64()
     );

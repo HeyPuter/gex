@@ -404,13 +404,13 @@ fn emit_and_link(
             stats.units += 1;
             *unit = FnUnit::new();
             unit.set_class32(rec.class32);
-            unit.call_known_import = true;
+            unit.ftab = true;
             Ok(())
         };
         let mut gir = GirReader::open(recovery)?;
         let mut unit = FnUnit::new();
         unit.set_class32(rec.class32);
-        unit.call_known_import = true;
+        unit.ftab = true;
         let mut k = 0usize;
         while let Some(f) = gir.next()? {
             if skip.contains(&f.entry) {
@@ -430,17 +430,6 @@ fn emit_and_link(
         if unit.len() > 0 {
             emit(&mut unit, k, &mut objs, &mut stats)?;
         }
-        // The entries' table indices (`gex_fnref`): what the host reads
-        // instead of an export per function.
-        let fr = func::fnref_source(&entries);
-        let key = hash128(&[fr.as_bytes(), header_text.as_bytes(), flags.as_bytes(), version.as_bytes()]);
-        let obj = objects.join(format!("{key}.o"));
-        if !obj.exists() {
-            let src = work.join("fnref.c");
-            std::fs::write(&src, fr)?;
-            tx.send((src, obj.clone())).map_err(|_| anyhow!("the compilers stopped"))?;
-        }
-        objs.push(obj);
         drop(tx);
         Ok(())
     })?;
@@ -449,10 +438,21 @@ fn emit_and_link(
     }
     let tmp = out.with_extension("wasm.tmp");
     toolchain::link_image(work, &objs, &tmp)?;
-    stats.wasm_bytes = std::fs::metadata(&tmp)?.len();
-    // The entries, in `gex_fnref`'s order, beside the module.
-    let mut eb = Vec::with_capacity(entries.len() * 8);
-    for a in &entries {
+    // Which guest function each slot of the element segment is, as the
+    // `gex.funcs` section every function-table module carries, and beside
+    // the module for a host that reads it without parsing wasm.
+    let mut wasm = std::fs::read(&tmp)?;
+    let slots = funcs_section(&wasm)?;
+    let want: HashSet<u64> = entries.iter().copied().collect();
+    let have: HashSet<u64> = slots.iter().copied().filter(|&a| a != 0).collect();
+    if let Some(a) = want.difference(&have).next() {
+        bail!("{a:#x}'s body is not in the unit's element segment");
+    }
+    append_funcs_section(&mut wasm, &slots);
+    std::fs::write(&tmp, &wasm)?;
+    stats.wasm_bytes = wasm.len() as u64;
+    let mut eb = Vec::with_capacity(slots.len() * 8);
+    for a in &slots {
         eb.extend_from_slice(&a.to_le_bytes());
     }
     std::fs::write(entries_path(out), eb)?;
@@ -460,13 +460,82 @@ fn emit_and_link(
     Ok(stats)
 }
 
+/// The guest address of each slot a linked unit's element segment fills
+/// (from `__table_base`): the function there, by its name (`f_<entry>`),
+/// or 0 for anything else.
+pub fn funcs_section(wasm: &[u8]) -> Result<Vec<u64>> {
+    let mut slots: Vec<u32> = Vec::new();
+    let mut names: HashMap<u32, u64> = HashMap::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            wasmparser::Payload::ElementSection(r) => {
+                for el in r {
+                    let el = el?;
+                    if !slots.is_empty() {
+                        bail!("the unit has more than one element segment");
+                    }
+                    if let wasmparser::ElementItems::Functions(fs) = el.items {
+                        for f in fs {
+                            slots.push(f?);
+                        }
+                    }
+                }
+            }
+            wasmparser::Payload::CustomSection(c) if c.name() == "name" => {
+                let reader = wasmparser::NameSectionReader::new(wasmparser::BinaryReader::new(c.data(), c.data_offset()));
+                for n in reader.flatten() {
+                    if let wasmparser::Name::Function(map) = n {
+                        for naming in map.into_iter().flatten() {
+                            if let Some(a) = naming.name.strip_prefix("f_").and_then(|h| u64::from_str_radix(h, 16).ok()) {
+                                names.insert(naming.index, a);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if names.is_empty() {
+        bail!("the unit has no function names (was it linked with names stripped?)");
+    }
+    Ok(slots.iter().map(|f| names.get(f).copied().unwrap_or(0)).collect())
+}
+
+/// Append the `gex.funcs` custom section (`gex_abi::ftab::FUNCS_SECTION`).
+pub fn append_funcs_section(wasm: &mut Vec<u8>, slots: &[u64]) {
+    let name = gex_abi::ftab::FUNCS_SECTION.as_bytes();
+    let mut body = Vec::new();
+    leb(&mut body, name.len() as u64);
+    body.extend_from_slice(name);
+    body.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+    for a in slots {
+        body.extend_from_slice(&a.to_le_bytes());
+    }
+    wasm.push(0);
+    leb(wasm, body.len() as u64);
+    wasm.extend_from_slice(&body);
+}
+
+fn leb(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
 /// Where a unit's entry list lives, beside its module.
 pub fn entries_path(cwasm: &Path) -> std::path::PathBuf {
     cwasm.with_extension("entries")
 }
 
-/// The entries of a unit built by [`build_c_module`], in `gex_fnref`'s
-/// order.
+/// The guest address of each slot of a unit built by [`build_c_module`],
+/// in its element segment's order (0: not an entry).
 pub fn read_entries(cwasm: &Path) -> Result<Vec<u64>> {
     let b = std::fs::read(entries_path(cwasm)).with_context(|| format!("reading {}", entries_path(cwasm).display()))?;
     Ok(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect())
