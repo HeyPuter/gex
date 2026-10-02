@@ -263,6 +263,14 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     }
     return decodePng(buf);
   };
+  // SwiftShader's WebGPU loses its device when the NT host hands the
+  // compositor GL frames directly (the canvas present path), so with the
+  // software adapter a Windows program's frames are read back instead.
+  if (soft && !/GEX_NT_GL_READBACK/.test(query)) {
+    query = /(^|&)env=/.test(query)
+      ? query.replace(/((?:^|&)env=)/, '$1GEX_NT_GL_READBACK=1,')
+      : `${query}&env=GEX_NT_GL_READBACK=1`;
+  }
   const url = `http://127.0.0.1:${VITE_PORT}/nt.html?${query}`;
   log(`open ${url}`);
   await browser.send('Page.navigate', { url }, page);

@@ -61,6 +61,13 @@ pub trait NtDisplay: Send + Sync {
     fn remove(&self, id: u32);
     /// Input and window events since the last call.
     fn poll_input(&self) -> Vec<NtDisplayEvent>;
+    /// Whether this display draws the host GL's frames into window
+    /// `toplevel` itself, at `rect` (x, y, width, height) of its surface: the
+    /// token the GL stream's `SURFACE_ATTACH` names the window by, or `None`
+    /// for a display that wants the pixels read back into the surface.
+    fn gl_target(&self, _toplevel: u32, _rect: (i32, i32, i32, i32)) -> Option<u32> {
+        None
+    }
 }
 
 /// Publish top-level window `toplevel`'s surface, if there is a display.
