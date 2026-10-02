@@ -10121,6 +10121,15 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         });
         if again {
             gex_dispatch_miss(_ctx, start as i64);
+        } else {
+            // The newer translation is another Worker's, maybe not in this
+            // Worker's tables yet; the block would dispatch to itself again,
+            // and ask again, for ever. Resume at it from JavaScript, which
+            // catches up first (the block start is a clean point: the page
+            // check runs before anything else in it).
+            set_resume(start);
+            set_resume_ctx(_ctx as u32 as u64);
+            trap();
         }
         return;
     }

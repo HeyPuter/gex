@@ -687,6 +687,21 @@ and `run_nt_program`. `gexc run` sends a PE file there. The kernel is the
 process's `Arc<Mutex<Kernel>>`; the NT layer takes it through
 `nt::KernelCell`, implemented for `Mutex<Kernel>`.
 
+For a hang: `GEX_NT_HANG_DUMP=S` has the ticker print every S seconds each
+thread's last safepoint pc, last indirect branch and context registers, then
+zero its safepoint counter, so a thread still looping stores its loop's pc
+by the next report; a counter that stays 0 is a thread passing no
+back-edge. (Without frames to count, the GEX_NT_HANG_SECS dump never fires.)
+`tests/nt/stress.sh` runs a program again and again on two cores shared with
+busy loops, natively or (`--browser`) under Node. That is how the last mtx
+hang showed: under load, a stale block whose page check found a newer
+translation already published (`PAGE_STALE`, not retranslated) dispatched
+again through this thread's table, which had not installed it yet, and so
+came straight back to itself -- every thread at one return address, the
+safepoint counter frozen at 0. The host now catches up first (natively the
+registry replay; in the browser a resume through JavaScript, which drains
+other Workers' modules).
+
 ### 10.2 Browser host (`shims/browser/src/nt.rs`)
 
 The same layer in a page, shared-memory build only (an NT wait blocks its

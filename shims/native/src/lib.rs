@@ -3216,6 +3216,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if again {
                     jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     translate_and_install(&mut caller, start)?;
+                } else {
+                    // The newer translation is in the shared registry, but
+                    // not necessarily in this thread's table yet: without
+                    // the catch-up, dispatch reached the stale block again,
+                    // which asked again, for ever (x64 mtx under load, all
+                    // threads at one return address).
+                    catch_up_in_caller(&mut caller)?;
                 }
                 return Ok(());
             }
