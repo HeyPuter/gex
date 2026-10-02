@@ -933,11 +933,23 @@ pub fn translate(
             a[0] = sext(a[0]);
             nr::SHUTDOWN
         }
-        // msghdr and its iovecs are 32-bit structures the kernel does not
-        // read yet.
-        x::SENDMSG | x::RECVMSG | x::SENDMMSG | x::RECVMMSG | x::RECVMMSG_TIME64 | x::SOCKETCALL => {
-            UNKNOWN
+        // msghdr, its iovecs and cmsghdrs are read in their 32-bit layout
+        // under the kernel's `compat` flag.
+        x::SENDMSG | x::RECVMSG => {
+            a[0] = sext(a[0]);
+            if n == x::SENDMSG { nr::SENDMSG } else { nr::RECVMSG }
         }
+        x::SENDMMSG => {
+            a[0] = sext(a[0]);
+            nr::SENDMMSG
+        }
+        x::RECVMMSG_TIME64 => {
+            a[0] = sext(a[0]);
+            nr::RECVMMSG
+        }
+        // recvmmsg's timeout is a 32-bit timespec here; socketcall
+        // multiplexes calls glibc no longer makes through it.
+        x::RECVMMSG | x::SOCKETCALL => UNKNOWN,
         x::REBOOT => nr::REBOOT,
         x::STATFS | x::FSTATFS | x::STATFS64 | x::FSTATFS64 => UNKNOWN,
         x::TRUNCATE | x::TRUNCATE64 | x::GETDENTS => UNKNOWN,
