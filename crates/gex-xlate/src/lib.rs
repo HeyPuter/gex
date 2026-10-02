@@ -46,6 +46,8 @@ pub mod profile;
 pub use intrinsic::Intrinsic;
 
 pub mod ehframe;
+#[cfg(feature = "fjit")]
+pub mod fjit;
 pub mod func;
 pub mod jumptable;
 pub mod summary;
@@ -126,6 +128,10 @@ pub struct Options {
     /// recovered function emitted as wasm directly, no clang, and spliced
     /// into the tier-1 module as `cgen` is. Needs the `fjit` feature.
     pub fjit: bool,
+    /// Translate nothing ahead of time: the module is `enter` and the miss
+    /// stubs, and every address reaches the runtime (`gexc run --fjit`,
+    /// where the function table's translator serves misses).
+    pub no_blocks: bool,
 }
 
 impl Default for Options {
@@ -147,6 +153,7 @@ impl Default for Options {
             first_slot: 0,
             cgen: false,
             fjit: false,
+            no_blocks: false,
         }
     }
 }
@@ -376,6 +383,9 @@ impl Phases {
 /// is left to the caller: [`translate_image`] builds one module, and
 /// [`translate_image_split`] builds several when the object is too big for one.
 fn image_blocks(image: &Image, opts: &Options) -> (Vec<Block>, Stats) {
+    if opts.no_blocks {
+        return (Vec::new(), Stats::default());
+    }
     let mut phases = Phases::start();
     let view = CodeView::new(image);
     let mut stats = Stats::default();

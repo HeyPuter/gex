@@ -496,6 +496,7 @@ dependencies = [
  "gex-cgen",
  "gex-emit",
  "gex-ir",
+ "wasm-encoder",
 ]
 
 [[package]]

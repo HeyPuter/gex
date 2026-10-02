@@ -16,6 +16,7 @@ use gex_ir::func::{Callee, FTerm, Function, RegSet, Summary};
 use gex_ir::{Expr, GuestReg, Stmt, Value};
 use std::collections::HashMap;
 
+
 /// `need`: the caller's continuation reads a flag.
 pub const NEED_FLAGS: i32 = 1;
 pub const NEED_ALL: i32 = -1;
@@ -36,9 +37,23 @@ pub struct ModuleCx<'a> {
     pub trapfree: &'a HashMap<u64, u32>,
     /// How far a `ret` moves SP (`gex_cgen::func::ret_sp_delta`).
     pub ret_sp_delta: u64,
-    /// The indirect-call helper, `(ctx, target, depth, need, ret) -> i32`:
-    /// -1 when no function here starts at `target`.
-    pub ic: u32,
+    /// How the module meets code outside it.
+    pub linkage: Linkage<'a>,
+    /// The `F_body` type's index.
+    pub body_ty: u32,
+}
+
+/// Where a call to a function the module does not hold goes.
+pub enum Linkage<'a> {
+    /// Spliced into the tier-1 module: an indirect call goes through `ic`,
+    /// `(ctx, target, depth, need, ret) -> i32`, -1 when no function here
+    /// starts at the target; a direct one leaves for the root.
+    Image { ic: u32 },
+    /// Installed in the process's function table (merge-plan §9.8.1):
+    /// anything outside the module is a probe of the cache and a call
+    /// through table `table`; a function checks, on entry, that each page
+    /// it covers still holds the `PAGE_GEN` value in `pages` (by entry).
+    Runtime { table: u32, pages: &'a HashMap<u64, Vec<(u64, u32)>> },
 }
 
 /// What a function's exits did, for `GEX_FJIT_STATS`.
@@ -50,6 +65,9 @@ pub struct Stats {
     pub calls_trapfree: usize,
     pub calls_indirect: usize,
     pub calls_leaving: usize,
+    /// Calls and tail calls through the function table (runtime linkage).
+    pub calls_table: usize,
+    pub tail_table: usize,
     pub tail_known: usize,
     pub switches: usize,
     pub loops_outlined: usize,
@@ -68,6 +86,8 @@ impl Stats {
         self.calls_trapfree += o.calls_trapfree;
         self.calls_indirect += o.calls_indirect;
         self.calls_leaving += o.calls_leaving;
+        self.calls_table += o.calls_table;
+        self.tail_table += o.tail_table;
         self.tail_known += o.tail_known;
         self.switches += o.switches;
         self.loops_outlined += o.loops_outlined;
@@ -82,6 +102,11 @@ impl Stats {
 pub struct Emitted {
     pub body: Vec<u8>,
     pub loops: Vec<Vec<u8>>,
+}
+
+fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_FJIT_TRACE").is_some())
 }
 
 /// The guest stack pointer as a GIR register.
@@ -158,6 +183,31 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     let hot = b.local(ValType::I32);
     let lr = b.local(ValType::I32);
     let rk = b.local(ValType::I32);
+    let e64 = b.local(ValType::I64);
+    // Its pages unchanged since translation, or the table's newer function
+    // for this address (merge-plan §9.8.1), before anything else.
+    if let Linkage::Runtime { table, pages } = &m.linkage {
+        let none: &[(u64, u32)] = &[];
+        let pages = if cf::exp("NOPAGECHECK") { none } else { pages.get(&f.entry).map(|v| v.as_slice()).unwrap_or(none) };
+        for &(page, gen) in pages {
+            let fb = b.f();
+            fb.i32_const(0);
+            fb.load(0x28, 2, (gex_abi::PAGE_GEN + 4 * page) as u32); // i32.load
+            fb.i32_const(gen as i32);
+            fb.byte(0x47); // i32.ne
+            fb.if_void();
+            fb.local_get(0);
+            fb.i64_const(f.entry as i64);
+            fb.store(0x37, 3, ctx::LAST_TARGET as u32);
+            fb.local_get(0);
+            fb.local_get(1);
+            fb.local_get(2);
+            fb.local_get(3);
+            probe_const(fb, f.entry, e64);
+            fb.return_call_indirect(m.body_ty, *table);
+            fb.end();
+        }
+    }
     // The recursion-depth guard, before anything is loaded (§7.1).
     if !m.trapfree.contains_key(&f.entry) {
         let limit = cf::stack_budget().saturating_sub(weight + cf::TRAPFREE_RESERVE);
@@ -190,7 +240,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         live: &live,
         dirty,
         weight,
-        locals: Locals { sp0, poll, hot, lr, rk, sel },
+        locals: Locals { sp0, poll, hot, lr, rk, sel, e64 },
         mode: Mode::Body { loops },
         n_blocks: n,
         stats,
@@ -270,6 +320,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     let lr = b.local(ValType::I32);
     let rk = b.local(ValType::I32);
     let sel = b.local(ValType::I32);
+    let e64 = b.local(ValType::I64);
     b.load(&used);
     b.f().i32_const(cf::LOOP_POLL);
     b.f().local_set(poll);
@@ -282,7 +333,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
         live,
         dirty,
         weight,
-        locals: Locals { sp0: 4, poll, hot, lr, rk, sel },
+        locals: Locals { sp0: 4, poll, hot, lr, rk, sel, e64 },
         mode: Mode::Loop { lp },
         n_blocks: n,
         stats,
@@ -301,11 +352,38 @@ struct Locals {
     rk: u32,
     /// A dispatch node's selector (`cfg::make_reducible`).
     sel: u32,
+    /// Scratch for a probe of the function table's cache.
+    e64: u32,
+}
+
+/// Push the table index the probe cache holds for constant `t`
+/// (`gex_abi::fcache_entry`), 0 (resolve) on a miss. `e` is i64 scratch.
+fn probe_const(fb: &mut gex_emit::wasm::FuncBody, t: u64, e: u32) {
+    fb.i32_const(0);
+    fb.load(0x29, 3, gex_abi::fcache_entry(t) as u32); // i64.load
+    fb.local_tee(e);
+    fb.i64_const(32);
+    fb.byte(0x88); // i64.shr_u
+    fb.byte(0xa7); // i32.wrap_i64
+    fb.i32_const(gex_abi::ftab::RESOLVE as i32);
+    fb.local_get(e);
+    fb.i64_const(0xffff_ffff);
+    fb.byte(0x83); // i64.and
+    fb.i64_const(t as i64);
+    fb.byte(0x51); // i64.eq
+    fb.select();
 }
 
 enum Mode<'f> {
     Body { loops: &'f [Loop] },
     Loop { lp: &'f Loop },
+}
+
+/// A call's target, for the table.
+#[derive(Clone, Copy)]
+enum Target {
+    Const(u64),
+    Op(Operand),
 }
 
 /// An enclosing label, for branch depths.
@@ -476,6 +554,17 @@ impl E<'_, '_> {
         let f = self.f;
         let blk = &f.blocks[x];
         self.b.set_dirty(self.dirty[x]);
+        if trace() && !blk.synthetic {
+            // `GEX_FJIT_TRACE=1`: the host prints each block as it is
+            // entered, with the registers written back first.
+            self.b.flush(RegSet::ALL, true);
+            let bp = self.m.cx.breakpoint;
+            let fb = self.b.f();
+            fb.local_get(0);
+            fb.i64_const(blk.start as i64);
+            fb.i32_const(gex_abi::imports::BRK_TRACE);
+            fb.call(bp);
+        }
         let mut keep: Vec<Value> = Vec::new();
         blk.term.for_each_use(|v| keep.push(v));
         let defer = trailing_flag_writes(&blk.stmts);
@@ -567,8 +656,18 @@ impl E<'_, '_> {
         }
     }
 
-    /// The code on edge `i -> t` (block indices), then the transfer.
+    /// The code on edge `i -> t` (block indices), then the transfer. The
+    /// registers' dirty state is the block's again afterwards: the target's
+    /// code may have been emitted inline here, and the terminator's next
+    /// edge (or its default) starts from the block's state, not the end of
+    /// that code.
     fn edge(&mut self, i: usize, t: usize) {
+        let dirty = self.b.dirty();
+        self.edge_inner(i, t);
+        self.b.set_dirty(dirty);
+    }
+
+    fn edge_inner(&mut self, i: usize, t: usize) {
         self.pending_for(t);
         let f = self.f;
         let backward = backward_addr(f, i, t);
@@ -710,6 +809,7 @@ impl E<'_, '_> {
             fb.byte(0x46); // i32.eq
             fb.if_void();
             self.labels.push(Label::Other);
+            self.b.set_dirty(RegSet::EMPTY);
             self.go(me, x);
             self.close();
         }
@@ -739,11 +839,91 @@ impl E<'_, '_> {
         self.b.f().store(0x37, 3, ctx::PC as u32);
     }
 
+    /// Push the table index for the target `t` (a constant or the
+    /// operand), after storing it in `ctx::LAST_TARGET` -- every call
+    /// through the table does, for the resolve stub (merge-plan §9.8.1).
+    /// The caller pushes the arguments in between: `before` does.
+    fn probe_call(&mut self, t: Target, before: &mut dyn FnMut(&mut Self), tail: bool) {
+        let Linkage::Runtime { table, .. } = self.m.linkage else { unreachable!("a probe outside the runtime linkage") };
+        let e = self.locals.e64;
+        self.b.f().local_get(0);
+        match t {
+            Target::Const(a) => self.b.f().i64_const(a as i64),
+            Target::Op(o) => self.b.push_operand(o),
+        }
+        self.b.f().store(0x37, 3, ctx::LAST_TARGET as u32);
+        before(self);
+        match t {
+            Target::Const(a) => probe_const(self.b.f(), a, e),
+            Target::Op(o) => {
+                // e = cache[(t32 * MUL) >> (32 - BITS)]
+                self.b.push_operand(o);
+                let fb = self.b.f();
+                fb.byte(0xa7); // i32.wrap_i64
+                fb.i32_const(gex_abi::FCACHE_MUL as i32);
+                fb.byte(0x6c); // i32.mul
+                fb.i32_const(32 - gex_abi::FCACHE_BITS as i32);
+                fb.byte(0x76); // i32.shr_u
+                fb.i32_const(3);
+                fb.byte(0x74); // i32.shl
+                fb.load(0x29, 3, gex_abi::FCACHE as u32); // i64.load
+                fb.local_tee(e);
+                fb.i64_const(32);
+                fb.byte(0x88); // i64.shr_u
+                fb.byte(0xa7); // i32.wrap_i64
+                fb.i32_const(gex_abi::ftab::RESOLVE as i32);
+                fb.local_get(e);
+                fb.i64_const(0xffff_ffff);
+                fb.byte(0x83); // i64.and
+                self.b.push_operand(o);
+                let fb = self.b.f();
+                fb.byte(0x51); // i64.eq
+                fb.select();
+            }
+        }
+        let ty = self.m.body_ty;
+        let fb = self.b.f();
+        if tail {
+            fb.return_call_indirect(ty, table);
+        } else {
+            fb.byte(gex_emit::wasm::op::CALL_INDIRECT);
+            fb.u32(ty);
+            fb.u32(table);
+        }
+    }
+
+    /// A tail call through the table (runtime linkage): everything written
+    /// back, a poll, and the callee returns to this function's caller.
+    fn tail_through_table(&mut self, t: Target) {
+        self.b.flush(RegSet::ALL, false);
+        match t {
+            Target::Const(a) => self.b.safepoint(a),
+            Target::Op(o) => {
+                let e = self.locals.e64;
+                self.b.push_operand(o);
+                self.b.f().local_set(e);
+                self.b.safepoint_dynamic(e);
+            }
+        }
+        self.probe_call(
+            t,
+            &mut |me: &mut Self| {
+                let fb = me.b.f();
+                fb.local_get(0);
+                fb.local_get(1);
+                fb.local_get(2);
+                fb.local_get(3);
+            },
+            true,
+        );
+    }
+
     /// Leaves the i32 "`entry`'s code was rewritten" (`GEX_PATCHED`, one
-    /// byte at a constant address per page) on the stack.
+    /// byte at a constant address per page) on the stack. A run-time
+    /// translation checks its own pages on entry instead: never.
     fn patched(&mut self, entry: u64) {
         let fb = self.b.f();
-        if cf::mutate("NOPATCHCHECK") {
+        if cf::mutate("NOPATCHCHECK") || matches!(self.m.linkage, Linkage::Runtime { .. }) {
             fb.i32_const(0);
             return;
         }
@@ -832,6 +1012,14 @@ impl E<'_, '_> {
                     fb.local_get(2);
                     fb.local_get(3);
                     fb.return_call(body);
+                }
+                Callee::Direct(t) if matches!(self.m.linkage, Linkage::Runtime { .. }) => {
+                    self.stats.tail_table += 1;
+                    self.tail_through_table(Target::Const(*t));
+                }
+                Callee::Indirect(_) if matches!(self.m.linkage, Linkage::Runtime { .. }) => {
+                    self.stats.tail_table += 1;
+                    self.tail_through_table(Target::Op(val()));
                 }
                 Callee::Direct(t) => {
                     self.stats.calls_leaving += 1;
@@ -1040,6 +1228,32 @@ impl E<'_, '_> {
                 fb.ret();
                 fb.end();
             }
+            Callee::Direct(_) | Callee::Indirect(_) if matches!(m.linkage, Linkage::Runtime { .. }) => {
+                // Through the table: whatever serves the target, the JIT's
+                // or a unit's function, or the fallback.
+                self.stats.calls_table += 1;
+                let t = match callee {
+                    Callee::Direct(t) => Target::Const(t),
+                    Callee::Indirect(_) => Target::Op(op.expect("an indirect call's target")),
+                };
+                self.probe_call(
+                    t,
+                    &mut |me: &mut Self| {
+                        me.b.f().local_get(0);
+                        me.depth_plus(w);
+                        let fb = me.b.f();
+                        fb.i32_const(need_back);
+                        fb.i64_const(ret_pc as i64);
+                    },
+                    false,
+                );
+                let fb = self.b.f();
+                fb.byte(0x45); // i32.eqz
+                fb.if_void();
+                fb.i32_const(0);
+                fb.ret();
+                fb.end();
+            }
             Callee::Direct(t) => {
                 // Not ours: the root runs it, and the rest of this function
                 // runs where the guest returns to.
@@ -1051,6 +1265,7 @@ impl E<'_, '_> {
             }
             Callee::Indirect(_) => {
                 self.stats.calls_indirect += 1;
+                let Linkage::Image { ic } = m.linkage else { unreachable!() };
                 let v = op.expect("an indirect call's target");
                 let rk = self.locals.rk;
                 self.b.f().local_get(0);
@@ -1059,7 +1274,7 @@ impl E<'_, '_> {
                 let fb = self.b.f();
                 fb.i32_const(need_back);
                 fb.i64_const(ret_pc as i64);
-                fb.call(m.ic);
+                fb.call(ic);
                 fb.local_tee(rk);
                 fb.i32_const(0);
                 fb.byte(0x48); // i32.lt_s

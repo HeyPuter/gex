@@ -198,19 +198,40 @@ pub struct Program {
 /// Read access to the image for recovery: instruction bytes gated on the
 /// code sections, and data reads that say whether the memory is writable.
 pub struct Code<'a> {
-    pub image: &'a Image,
-    view: CodeView<'a>,
+    src: Src<'a>,
     /// Executable sections read from the file when the loader did not
     /// (ELF32): they bound code more tightly than the segments.
     ranges: Vec<(u64, u64)>,
 }
 
+/// Where [`Code`] reads from.
+enum Src<'a> {
+    Image { image: &'a Image, view: CodeView<'a> },
+    /// Guest memory at run time (the function JIT, docs/merge-plan.md
+    /// §9.8): what is executable now, read as it is now.
+    Memory { mem: &'a [u8], exec: &'a dyn Fn(u64) -> bool, readonly: &'a dyn Fn(u64, u64) -> bool },
+}
+
 impl<'a> Code<'a> {
     pub fn new(image: &'a Image) -> Code<'a> {
         Code {
-            image,
-            view: CodeView::new(image),
+            src: Src::Image { image, view: CodeView::new(image) },
             ranges: Vec::new(),
+        }
+    }
+
+    /// Guest memory as it is at run time; `exec` says what the guest may
+    /// execute, `readonly(addr, len)` which data cannot change: only that
+    /// is read (a jump table, a constant pool).
+    pub fn memory(mem: &'a [u8], exec: &'a dyn Fn(u64) -> bool, readonly: &'a dyn Fn(u64, u64) -> bool) -> Code<'a> {
+        Code { src: Src::Memory { mem, exec, readonly }, ranges: Vec::new() }
+    }
+
+    /// The image, for an image's code.
+    pub fn image(&self) -> Option<&'a Image> {
+        match self.src {
+            Src::Image { image, .. } => Some(image),
+            Src::Memory { .. } => None,
         }
     }
     /// [`Code::new`], taking the executable sections from the raw file when
@@ -225,21 +246,60 @@ impl<'a> Code<'a> {
         c
     }
     pub fn fetch(&self, pc: u64, buf: &mut FetchBuf) -> usize {
-        self.view.fetch_code(pc, buf)
+        match &self.src {
+            Src::Image { view, .. } => view.fetch_code(pc, buf),
+            Src::Memory { mem, exec, .. } => {
+                if pc % INST_ALIGN != 0 || !exec(pc) || pc as usize + INST_ALIGN as usize > mem.len() {
+                    return 0;
+                }
+                // Up to the first byte that is not executable.
+                let off = pc as usize;
+                let mut n = (mem.len() - off).min(16);
+                for k in INST_ALIGN as usize..n {
+                    if !exec(pc + k as u64) {
+                        n = k;
+                        break;
+                    }
+                }
+                buf[..n].copy_from_slice(&mem[off..off + n]);
+                n
+            }
+        }
     }
     pub fn is_code(&self, a: u64) -> bool {
         a % INST_ALIGN == 0
-            && if self.ranges.is_empty() {
-                self.view.is_executable(a)
-            } else {
-                self.ranges.iter().any(|&(lo, hi)| a >= lo && a < hi)
+            && match &self.src {
+                Src::Memory { mem, exec, .. } => (a as usize) < mem.len() && exec(a),
+                Src::Image { view, .. } => {
+                    if self.ranges.is_empty() {
+                        view.is_executable(a)
+                    } else {
+                        self.ranges.iter().any(|&(lo, hi)| a >= lo && a < hi)
+                    }
+                }
             }
     }
     /// `bytes` little-endian bytes at `addr`, and whether the segment holding
     /// them is writable (its contents could change at run time).
     pub fn read(&self, addr: u64, bytes: u32) -> Option<(u64, bool)> {
         let n = bytes as u64;
-        for s in &self.image.segments {
+        let image = match self.src {
+            Src::Image { image, .. } => image,
+            Src::Memory { mem, readonly, .. } => {
+                // Only what cannot change: data the program wrote by now
+                // (a bytecode array, say) would fold into a constant target
+                // that is not one; ahead of time it reads as the file has it.
+                if !readonly(addr, n) {
+                    return None;
+                }
+                let o = addr as usize;
+                let b = mem.get(o..o.checked_add(bytes as usize)?)?;
+                let mut buf = [0u8; 8];
+                buf[..bytes as usize].copy_from_slice(b);
+                return Some((u64::from_le_bytes(buf), false));
+            }
+        };
+        for s in &image.segments {
             if addr >= s.vaddr && addr.checked_add(n)? <= s.vaddr + s.bytes.len() as u64 {
                 let o = (addr - s.vaddr) as usize;
                 let mut buf = [0u8; 8];
@@ -262,7 +322,7 @@ pub fn seeds(
     elf: Option<&[u8]>,
     scan_data: bool,
 ) -> (BTreeMap<u64, StartInfo>, Vec<ehframe::Fde>) {
-    let image = code.image;
+    let image = code.image().expect("seeds come from an image");
     let mut starts: BTreeMap<u64, StartInfo> = BTreeMap::new();
     let add = |starts: &mut BTreeMap<u64, StartInfo>, a: u64, s: Source| {
         if code.is_code(a) {
@@ -801,7 +861,7 @@ fn assemble(start: u64, name: Option<String>, drafts: &BTreeMap<u64, Draft>, ent
 /// return (an unknown target, an unresolved jump, a tail call to a function
 /// that may). A call's continuation is followed only if the callee may
 /// return. Unrecovered callees are assumed to return.
-fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bool> {
+pub(crate) fn may_return(functions: &BTreeMap<u64, Function>) -> HashMap<u64, bool> {
     let mut ret: HashMap<u64, bool> = functions.keys().map(|&a| (a, false)).collect();
     let returns = |ret: &HashMap<u64, bool>, a: u64| ret.get(&a).copied().unwrap_or(true);
     loop {
@@ -894,6 +954,85 @@ pub fn recover(image: &Image, elf: Option<&[u8]>, opts: &RecoverOptions) -> Prog
     let code = Code::with_elf(image, elf);
     let (starts, fdes) = seeds(&code, elf, opts.scan_data);
     recover_seeded(&code, starts, fdes, opts)
+}
+
+/// Recover the function at `start` alone, from code read as it is now (the
+/// function JIT at run time, docs/merge-plan.md §9.8): discovery, then its
+/// jump tables, rediscovered until both stand. `starts` are the function
+/// entries known so far, which bound it (a jump to one is a tail call); the
+/// call targets it makes are added. `noreturn` are callees known not to
+/// return. No summaries, no interior entries, no symbols: code the
+/// discovery reaches that belongs to a function nobody has called yet is
+/// part of this one, which only duplicates it.
+pub fn recover_one(
+    code: &Code,
+    start: u64,
+    starts: &mut BTreeMap<u64, StartInfo>,
+    noreturn: &BTreeSet<u64>,
+    opts: &RecoverOptions,
+) -> Function {
+    starts.entry(start).or_default().add(Source::Call);
+    let mut lifter = Lifter { code, limits: opts.limits, cache: HashMap::new() };
+    let mut tables: HashMap<(u64, u64), Table> = HashMap::new();
+    let mut failed: HashSet<(u64, u64)> = HashSet::new();
+    let leaders: HashMap<u64, BTreeSet<u64>> = HashMap::new();
+    let mut f;
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        let mut calls = Vec::new();
+        let drafts = {
+            let facts = Facts { starts, noreturn, tables: &tables, leaders: &leaders };
+            discover(start, &facts, &mut lifter, &mut calls)
+        };
+        // A call target inside what was discovered splits it there.
+        let mut changed = false;
+        for c in calls {
+            if code.is_code(c) && !starts.get(&c).is_some_and(|s| s.has(Source::Call)) {
+                starts.entry(c).or_default().add(Source::Call);
+                if c != start && drafts.values().any(|d| d.l.insts.contains(&c)) {
+                    changed = true;
+                }
+            }
+        }
+        f = assemble(start, None, &drafts, &[]);
+        let todo: Vec<(u64, u64)> = f
+            .blocks
+            .iter()
+            .filter(|b| !b.synthetic)
+            .filter(|b| match b.term {
+                FTerm::Unresolved { .. } => !tables.contains_key(&(start, b.term_pc)) && !failed.contains(&(start, b.term_pc)),
+                FTerm::Switch { .. } => tables.contains_key(&(start, b.term_pc)),
+                _ => false,
+            })
+            .map(|b| (b.start, b.term_pc))
+            .collect();
+        if !todo.is_empty() {
+            let at: Vec<u64> = todo.iter().map(|t| t.0).collect();
+            let extent = starts.get(&start).and_then(|i| i.end).map(|e| (start, e));
+            let found = crate::jumptable::resolve_all(&f, &at, code, opts.max_table, None, extent);
+            for ((_, t), (_, a)) in found.into_iter().zip(todo) {
+                let key = (start, a);
+                match t {
+                    Some(t) => {
+                        if tables.get(&key) != Some(&t) {
+                            tables.insert(key, t);
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        if tables.remove(&key).is_some() {
+                            changed = true;
+                        }
+                        failed.insert(key);
+                    }
+                }
+            }
+        }
+        if !changed || rounds >= opts.max_rounds {
+            return f;
+        }
+    }
 }
 
 /// Seeds of a PE module beyond what [`seeds`] finds in any image, and its

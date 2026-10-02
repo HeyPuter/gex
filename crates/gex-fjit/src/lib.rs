@@ -15,9 +15,14 @@
 //!   gex-cgen's, by the same analyses: this crate is that lowering with wasm
 //!   in place of C.
 //!
-//! [`build`] is the whole-image form: every recovered function of an image,
-//! spliced into the tier-1 module built from it, which both hosts install
-//! unchanged (`gexc build --fjit`, `gexc run --fjit`).
+//! Two linkages:
+//!
+//! * [`runtime`]: a run-time translation, one function and the callees it
+//!   brings, installed in the process's function table (merge-plan §9.8.1;
+//!   `gexc run --fjit`, through `gex_xlate::fjit`).
+//! * [`build`], the whole-image form: every recovered function of an
+//!   image, spliced into the tier-1 module built from it, which both hosts
+//!   install unchanged (`gexc build --fjit`, `gexc run --fjit-image`).
 
 pub mod cfg;
 pub mod emit;
@@ -94,4 +99,27 @@ pub fn build(
         std::fs::write(format!("{dir}/spliced.wasm"), &wasm)?;
     }
     Ok((wasm, stats))
+}
+
+/// A run-time translation of `functions` (memory form, verified; the first
+/// is the one asked for) for the function table: the module, the entries it
+/// holds, what the emitter did. `pages` are the `PAGE_GEN` values each
+/// function checks on entry.
+/// `intrinsics` are tier-1's blocks for the entries it serves with a host
+/// builtin (`gex_xlate::intrinsic`): those functions are formed from them.
+pub fn runtime(
+    functions: Vec<Function>,
+    summaries: &HashMap<u64, Summary>,
+    class32: bool,
+    pages: &HashMap<u64, Vec<(u64, u32)>>,
+    intrinsics: &[Block],
+) -> Result<(Vec<u8>, Vec<u64>, Stats)> {
+    let ib: HashMap<u64, &Block> = intrinsics.iter().map(|b| (b.start, b)).collect();
+    let mut functions = gex_cgen::select(functions, &ib, &HashSet::new())?;
+    for f in &mut functions {
+        prep::prepare(f, summaries);
+    }
+    let mut stats = Stats::default();
+    let (wasm, entries) = module::build_runtime(&functions, summaries, class32, pages, &mut stats)?;
+    Ok((wasm, entries, stats))
 }

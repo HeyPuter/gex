@@ -137,7 +137,8 @@ pub fn build_module(
         sums,
         trapfree: &trapfree,
         ret_sp_delta: cf::ret_sp_delta(class32),
-        ic,
+        linkage: crate::emit::Linkage::Image { ic },
+        body_ty,
     };
     let mut emitted: Vec<(u64, Emitted)> = Vec::new();
     for (f, ls) in funcs.iter().zip(&loops) {
@@ -331,4 +332,192 @@ const HASH: u64 = 0x9e37_79b9_7f4a_7c15;
 
 fn bucket(a: u64, bits: u32) -> usize {
     (a.wrapping_mul(HASH) >> (64 - bits)) as usize
+}
+
+/// The module of a run-time translation (docs/merge-plan.md §9.8.1): `funcs`
+/// (memory form, prepared), installed in the process's function table. It
+/// imports the guest memory, `gex.ftab`, `env.__table_base` and tier-1's
+/// host functions; one active element segment puts each function's body at
+/// `__table_base + k` in the order of `gex.funcs`, which lists their guest
+/// addresses. Calls inside the module are `call`s, anything else goes
+/// through the table. `pages` are the `PAGE_GEN` values each function
+/// checks on entry, by entry. Functions whose loops would not structure
+/// are left out (the caller gets the entries that are in).
+pub fn build_runtime(
+    funcs: &[Function],
+    sums: &HashMap<u64, Summary>,
+    class32: bool,
+    pages: &HashMap<u64, Vec<(u64, u32)>>,
+    stats: &mut Stats,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    use wasm_encoder::{
+        CodeSection, ConstExpr, CustomSection, ElementSection, Elements, EntityType, FunctionSection, GlobalType,
+        ImportSection, MemoryType, RefType, TableType, TypeSection, ValType as V,
+    };
+    let outline = cf::outline_loops();
+    let mut funcs: Vec<Function> = funcs.to_vec();
+    loop {
+        let loops: Vec<Vec<Loop>> = funcs.iter().map(|f| if outline { cf::outer_loops(f) } else { Vec::new() }).collect();
+        // Imports: tier-1's ten host functions, in `host_imports`' order.
+        const N_IMPORTS: u32 = 10;
+        let (block_ty, t_syscall, t_miss, t_pc_i32, t_sysreg_read, t_pc_i32_i64, t_fma, t_x87, body_ty, loop_ty) =
+            (0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+        let mut next = N_IMPORTS;
+        let mut bodies: HashMap<u64, u32> = HashMap::new();
+        let mut lfns: HashMap<(u64, usize), u32> = HashMap::new();
+        let mut order: Vec<(u32, u32)> = Vec::new(); // (function index, type)
+        for (f, ls) in funcs.iter().zip(&loops) {
+            bodies.insert(f.entry, next);
+            order.push((next, body_ty));
+            next += 1;
+            for k in 0..ls.len() {
+                lfns.insert((f.entry, k), next);
+                order.push((next, loop_ty));
+                next += 1;
+            }
+        }
+        let trapfree = cf::trap_free(&funcs, sums);
+        let no_blocks = HashMap::new();
+        let no_gir = HashMap::new();
+        let cx = Context {
+            syscall: 0,
+            dispatch_miss: 1,
+            illegal: 2,
+            breakpoint: 3,
+            sysreg_read: 4,
+            sysreg_write: 5,
+            cache_op: 6,
+            safepoint: 7,
+            fma: 8,
+            x87: 9,
+            block_ty,
+            blocks: &no_blocks,
+            gir: &no_gir,
+            profile: None,
+            page_bases: None,
+            module_id: 0,
+        };
+        let mcx = ModuleCx {
+            cx: &cx,
+            bodies: &bodies,
+            loops: &lfns,
+            sums,
+            trapfree: &trapfree,
+            ret_sp_delta: cf::ret_sp_delta(class32),
+            linkage: crate::emit::Linkage::Runtime { table: 0, pages },
+            body_ty,
+        };
+        let mut emitted: Vec<(u64, Emitted)> = Vec::new();
+        let mut dropped = Vec::new();
+        for (f, ls) in funcs.iter().zip(&loops) {
+            match emit::emit(&mcx, f, ls, stats) {
+                Some(e) => emitted.push((f.entry, e)),
+                None => dropped.push(f.entry),
+            }
+        }
+        if !dropped.is_empty() {
+            stats.dropped += dropped.len();
+            funcs.retain(|f| !dropped.contains(&f.entry));
+            if funcs.is_empty() {
+                anyhow::bail!("no function of the translation structures");
+            }
+            continue;
+        }
+        let mut m = wasm_encoder::Module::new();
+        let mut types = TypeSection::new();
+        let i32_ = V::I32;
+        let i64_ = V::I64;
+        types.ty().function([i32_], []);
+        types.ty().function([i32_, i64_], []);
+        types.ty().function([i32_, i64_], [i32_]);
+        types.ty().function([i32_, i64_, i32_], []);
+        types.ty().function([i32_, i64_, i32_], [i64_]);
+        types.ty().function([i32_, i64_, i32_, i64_], []);
+        types.ty().function([i32_, i64_, i64_, i64_, i32_], [i64_]);
+        types.ty().function([i32_, i32_, i64_, i32_, i64_, i32_, i32_], [i64_]);
+        types.ty().function([i32_, i32_, i32_, i64_], [i32_]);
+        types.ty().function([i32_, i32_, i32_, i64_, i64_], [i32_]);
+        m.section(&types);
+        let mut imports = ImportSection::new();
+        let im = gex_abi::IMPORT_MODULE;
+        for (name, ty) in [
+            (imports::SYSCALL, t_syscall),
+            (imports::DISPATCH_MISS, t_miss),
+            (imports::ILLEGAL, t_pc_i32),
+            (imports::BREAKPOINT, t_pc_i32),
+            (imports::SYSREG_READ, t_sysreg_read),
+            (imports::SYSREG_WRITE, t_pc_i32_i64),
+            (imports::CACHE_OP, t_pc_i32_i64),
+            (imports::SAFEPOINT, t_syscall),
+            (imports::FMA, t_fma),
+            (imports::X87, t_x87),
+        ] {
+            imports.import(im, name, EntityType::Function(ty));
+        }
+        imports.import(
+            im,
+            exports::MEMORY,
+            EntityType::Memory(MemoryType { minimum: 0, maximum: Some(65536), memory64: false, shared: true, page_size_log2: None }),
+        );
+        imports.import(
+            im,
+            gex_abi::ftab::TABLE,
+            EntityType::Table(TableType { element_type: RefType::FUNCREF, minimum: 0, maximum: None, table64: false, shared: false }),
+        );
+        imports.import(
+            gex_abi::ftab::PIC_MODULE,
+            gex_abi::ftab::PIC_TABLE_BASE,
+            EntityType::Global(GlobalType { val_type: i32_, mutable: false, shared: false }),
+        );
+        m.section(&imports);
+        let mut fsec = FunctionSection::new();
+        for &(_, ty) in &order {
+            fsec.function(ty);
+        }
+        m.section(&fsec);
+        let entries: Vec<u64> = funcs.iter().map(|f| f.entry).collect();
+        let slots: Vec<u32> = entries.iter().map(|a| bodies[a]).collect();
+        let mut elems = ElementSection::new();
+        elems.active(Some(0), &ConstExpr::global_get(0), Elements::Functions(std::borrow::Cow::Borrowed(&slots)));
+        m.section(&elems);
+        let mut by_index: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (entry, e) in emitted {
+            by_index.insert(bodies[&entry], e.body);
+            for (k, l) in e.loops.into_iter().enumerate() {
+                by_index.insert(lfns[&(entry, k)], l);
+            }
+        }
+        let mut code = CodeSection::new();
+        for &(i, _) in &order {
+            code.raw(strip_size(&by_index[&i]));
+        }
+        m.section(&code);
+        let mut desc = (entries.len() as u32).to_le_bytes().to_vec();
+        for a in &entries {
+            desc.extend_from_slice(&a.to_le_bytes());
+        }
+        m.section(&CustomSection { name: gex_abi::ftab::FUNCS_SECTION.into(), data: desc.into() });
+        if std::env::var_os("GEX_CGEN_NAMES").is_some() {
+            let mut names = wasm_encoder::NameMap::new();
+            let mut all: Vec<(u32, String)> = funcs.iter().map(|f| (bodies[&f.entry], format!("f_{:x}", f.entry))).collect();
+            all.extend(lfns.iter().map(|(&(a, k), &i)| (i, format!("l_{a:x}_{k}"))));
+            all.sort();
+            for (i, n) in &all {
+                names.append(*i, n);
+            }
+            let mut ns = wasm_encoder::NameSection::new();
+            ns.functions(&names);
+            m.section(&ns);
+        }
+        return Ok((m.finish(), entries));
+    }
+}
+
+/// A body as `FuncBody::finish` writes it, without its size prefix.
+fn strip_size(body: &[u8]) -> &[u8] {
+    let mut at = 0;
+    while body[at] & 0x80 != 0 {
+        at += 1;
+    }
+    &body[at + 1..]
 }

@@ -190,8 +190,13 @@ run options:
   --no-jit        no runtime translation; implies --exhaustive
   --cgen          the function tier: compile the program's blocks as C with
                   clang (needs clang and wasm-ld; docs/function-tier.md)
-  --fjit          the function JIT: the program's recovered functions as
-                  wasm, emitted directly (docs/merge-plan.md §9.8)
+  --fjit          the function JIT: every function recovered at run time
+                  from guest memory, a batch at a time, as wasm emitted
+                  directly and installed in the function table
+                  (docs/merge-plan.md §9.8); tier-1 runs what it does not
+  --fjit-image    the function JIT ahead of time: the program image's
+                  recovered functions spliced into its tier-1 module, as
+                  --cgen does with clang
   --lazy          discover only from the entry point, leaving the rest to
                   runtime translation; much faster to start on a big binary
   --no-cache      do not reuse compiled modules between runs
@@ -238,6 +243,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut lazy = false;
     let mut cgen = false;
     let mut fjit = false;
+    let mut fjit_image = false;
     let mut no_cgen = false;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
@@ -315,6 +321,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--lazy" => lazy = true,
             "--cgen" => cgen = true,
             "--fjit" => fjit = true,
+            "--fjit-image" => fjit_image = true,
             "--no-cgen" => no_cgen = true,
             "--no-cache" => opts.cache = false,
             "--cwd" => {
@@ -359,7 +366,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     }
     // The function tier's C code carries no profiling instrumentation: a
     // recorded run would lose every count in it without a word.
-    if (cgen || fjit) && opts.record.is_some() {
+    if (cgen || fjit || fjit_image) && opts.record.is_some() {
         bail!(
             "--cgen cannot be combined with --record or GEX_PROFILE=1: the function tier's \
              C code is not instrumented, so the profile would silently miss everything it runs \
@@ -375,7 +382,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             exhaustive: exhaustive || no_jit,
             lazy: lazy && !no_jit,
             cgen,
-            fjit,
+            fjit: fjit_image,
+            no_blocks: fjit,
             ..Options::default()
         },
         jit: !no_jit,
@@ -480,6 +488,17 @@ fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex
         .collect()
 }
 
+/// `gexc run --fjit`: the function JIT serves the function table's misses.
+struct FjitTranslator(gex_xlate::fjit::Jit);
+
+impl gex_kernel::ftab::Translator for FjitTranslator {
+    fn translate(&self, req: &gex_kernel::ftab::Request<'_>) -> Option<gex_kernel::ftab::Translated> {
+        self.0
+            .translate(req.mem, req.addr, req.executable, req.page_gen, req.class32)
+            .map(|wasm| gex_kernel::ftab::Translated { wasm })
+    }
+}
+
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
@@ -494,7 +513,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         // while its unit is built for the next run; --cgen requires every
         // program image to have one; --no-cgen is tier-1 only.
         use gex_native::nt_cgen::Mode;
-        gex_native::nt_cgen::set_mode(if ra.no_cgen {
+        if ra.xlate.no_blocks {
+            gex_kernel::ftab::set_translator(Box::new(FjitTranslator(gex_xlate::fjit::Jit::new(Default::default()))));
+        }
+        gex_native::nt_cgen::set_mode(if ra.no_cgen || ra.xlate.no_blocks {
             Mode::Off
         } else if ra.xlate.cgen {
             Mode::Require
@@ -518,6 +540,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     ra.xlate.intrinsics = image_intrinsics(&program.exe);
     if let Some(i) = &program.interp {
         ra.xlate.intrinsics.extend(image_intrinsics(i));
+    }
+    if ra.xlate.no_blocks {
+        let jit = gex_xlate::fjit::Jit::new(ra.xlate.intrinsics.clone());
+        jit.add_image(&program.exe, Some(&bytes));
+        gex_kernel::ftab::set_translator(Box::new(FjitTranslator(jit)));
     }
 
     // argv[0] is the path as invoked, then whatever followed. Under a sysroot
