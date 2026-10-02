@@ -220,7 +220,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     // too, since a log that fills the disk ends more than the run.
     const wanted = p.type === 'error'
       ? !/^\[mesa-gl\] gex-gl: gl[A-Z]/.test(text)
-      : p.type === 'warning' && /gex-nt|wine:|\[gex\]|panic|trap/i.test(text);
+      : p.type === 'warning' && /gex-nt|gex-wgpu|wine:|\[gex\]|panic|trap/i.test(text);
     if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE) && printed++ < 20000) {
       log(`console[${sid?.slice(0, 6)}] ${text.slice(0, 4000)}`);
     }
