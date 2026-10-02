@@ -26,6 +26,7 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_DISPATCH_SLOT_BITS {}u", gex_abi::DISPATCH_SLOT_BITS);
     let _ = writeln!(w, "#define GEX_CACHE_OP_SLOT_CONFLICT {}", gex_abi::cache_op::SLOT_CONFLICT);
     let _ = writeln!(w, "#define GEX_CACHE_OP_SPLIT_LOCK {}", gex_abi::cache_op::SPLIT_LOCK);
+    let _ = writeln!(w, "#define GEX_CACHE_OP_NEST_EXIT_SAMPLE {}", gex_abi::cache_op::NEST_EXIT_SAMPLE);
     let _ = writeln!(w, "#define GEX_CACHE_OP_LOW_ACCESS {}", gex_abi::cache_op::LOW_ACCESS);
     let _ = writeln!(w, "#define GEX_GUEST_FLOOR 0x{:x}u", gex_abi::GUEST_FLOOR);
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);

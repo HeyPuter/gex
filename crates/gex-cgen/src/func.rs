@@ -417,7 +417,12 @@ impl FnUnit {
         // return writes everything back and sets PC; should the guest really
         // return there, PC says so and dispatch faults as tier-1's would.
         r.line(format!("if ({name}(ctx, 0, NEED_ALL, ~0ull)) GEX_C64({}u) = ~0ull;", ctx::PC));
-        r.line("(*(volatile uint64_t *)GEX_P(GEX_NEST_EXITS))++;");
+        r.line("if (__builtin_expect(((*(volatile uint64_t *)GEX_P(GEX_NEST_EXITS))++ & 4095u) == 0, 0))");
+        r.line(format!(
+            "  gex_cache_op(ctx, 0x{:x}ll, GEX_CACHE_OP_NEST_EXIT_SAMPLE, (int64_t)GEX_C64({}u));",
+            f.entry,
+            ctx::PC
+        ));
         r.line(format!("const uint64_t tgt = GEX_C64({}u);", ctx::PC));
         r.safepoint("tgt");
         r.dispatch("tgt");
@@ -836,6 +841,31 @@ pub fn fnref_source(entries: &[u64]) -> String {
         let _ = writeln!(s, "void {}(int ctx);", entry_name(*a));
         let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", checked_body_name(*a));
     }
+    // Entries sharing a dispatch slot (x86: a slot covers four bytes, e.g. a
+    // one-byte `ret` stub followed by a function): the first one's body-table
+    // entry picks the body by `ctx::PC` among all of them, so a call to any
+    // of them stays in the function tier.
+    let mut groups: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        for a in entries {
+            groups.entry(*a >> gex_abi::DISPATCH_SHIFT).or_default().push(*a);
+        }
+    }
+    let mut shared: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for g in groups.values().filter(|g| g.len() > 1) {
+        let first = *g.iter().min().unwrap();
+        let name = format!("ibs_{first:x}");
+        for a in g {
+            let _ = writeln!(s, "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
+        }
+        let _ = writeln!(s, "static int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{");
+        let _ = writeln!(s, "  const uint64_t pc = GEX_C64({}u);", ctx::PC);
+        for a in g {
+            let _ = writeln!(s, "  if (pc == 0x{a:x}ull) GEX_MUSTTAIL return {}(ctx, depth, need, ret);", body_name(*a));
+        }
+        s.push_str("  return -1;\n}\n");
+        shared.insert(first, name);
+    }
     let chunk = CALL_KNOWN_CHUNK / 2;
     let chunks: Vec<&[u64]> = entries.chunks(chunk.max(1)).collect();
     for (c, es) in chunks.iter().enumerate() {
@@ -843,7 +873,8 @@ pub fn fnref_source(entries: &[u64]) -> String {
         for (i, a) in es.iter().enumerate() {
             let k = 2 * (c * chunk + i);
             let _ = writeln!(s, "  case {k}u: return (uint32_t)(uintptr_t)&{};", entry_name(*a));
-            let _ = writeln!(s, "  case {}u: return (uint32_t)(uintptr_t)&{};", k + 1, checked_body_name(*a));
+            let body = shared.get(a).cloned().unwrap_or_else(|| checked_body_name(*a));
+            let _ = writeln!(s, "  case {}u: return (uint32_t)(uintptr_t)&{body};", k + 1);
         }
         s.push_str("  default: return 0;\n  }\n}\n");
     }

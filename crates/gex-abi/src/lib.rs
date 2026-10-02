@@ -765,6 +765,9 @@ pub mod cache_op {
     /// otherwise dispatch already reaches a newer translation -- and the
     /// block then dispatches.
     pub const PAGE_STALE: i32 = 12;
+    /// Not a cache operation: a function-tier nest root handed control to
+    /// dispatch at `addr` (one exit in 4096, for GEX_NT_STATS's exit sites).
+    pub const NEST_EXIT_SAMPLE: i32 = 13;
 }
 
 /// The lowest address a guest access may name: below it are the runtime's

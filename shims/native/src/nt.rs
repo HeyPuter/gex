@@ -279,6 +279,21 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     }
                     if next_stats.as_secs() % 60 == 0 {
                         eprintln!("gex-nt: leave sites {}", crate::take_leave_sites(15));
+                        let ex: Vec<String> = crate::take_exit_sites(15)
+                            .into_iter()
+                            .map(|(f, t, c)| format!("{} -> {} x{c}", p.describe_addr(f), p.describe_addr(t)))
+                            .collect();
+                        eprintln!("gex-nt: nest exits (1 in 4096) {}", ex.join(" | "));
+                        let mut by: std::collections::BTreeMap<String, u64> = Default::default();
+                        for (page, n) in crate::tier1_pages() {
+                            let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
+                            let name = d.split('(').nth(1).and_then(|x| x.split('+').next()).unwrap_or("(no image)").to_string();
+                            *by.entry(name).or_default() += n;
+                        }
+                        let mut v: Vec<_> = by.into_iter().collect();
+                        v.sort_by(|a, b| b.1.cmp(&a.1));
+                        let v: Vec<String> = v.iter().take(12).map(|(m, n)| format!("{m} {n}")).collect();
+                        eprintln!("gex-nt: tier-1 blocks by image: {}", v.join(", "));
                     }
                     let presents = presents as u64;
                     if presents != last_presents {
