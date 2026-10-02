@@ -48,7 +48,7 @@ pub mod tramp {
     pub const UNIX_CALL_32: u64 = TRAMPOLINES + 0x60;
 }
 
-fn trampoline_page() -> Vec<u8> {
+pub fn trampoline_page() -> Vec<u8> {
     let mut page = vec![0xccu8; (TRAMPOLINES_END - TRAMPOLINES) as usize];
     let put = |page: &mut Vec<u8>, at: u64, code: &[u8]| {
         let o = (at - TRAMPOLINES) as usize;

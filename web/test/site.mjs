@@ -18,7 +18,7 @@ const CHROME = process.env.CHROME || '/usr/bin/chromium';
 // A site to test other than the built one; requests are passed through and
 // only the HTML is touched, to add the reporter.
 //
-//   GEX_SITE=http://localhost:5173 node web/test/site.mjs virgl
+//   GEX_SITE=http://localhost:5173 node web/test/site.mjs gears
 const UPSTREAM = process.env.GEX_SITE || '';
 const WALL = Number(process.env.GEX_WALL || 900) * 1000;
 // How many terminal lines to print; `GEX_TAIL=0` means all of the scrollback.
@@ -161,21 +161,6 @@ const DEMOS = {
     want: /covered ([1-9]\d*)%/,
     fail: /covered 0%/,
     settle: 'finished',
-  },
-  // Two things must be true: glxgears' frame rate (Mesa completed frames) and
-  // that the frames reached the canvas -- vtest has no present, so a run can
-  // draw perfectly onto a canvas that stays black.
-  virgl: {
-    // Wrapping stripped before matching: xterm breaks a line at the window
-    // width and `innerText` keeps the break, splitting `lit=7` across rows.
-    // `lit`, not `presented`: a blit counts as presented whether or not the
-    // frame had anything in it; `lit` counts blits whose texture had a pixel.
-    want: (t) =>
-      /frames in [\d.]+ seconds/.test(t) &&
-      Number(/lit=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
-    // No `settle`: a run that finishes having lit nothing is the exact failure
-    // this is for, and `finished` would call it a pass.
-    fail: (t) => /lit=0(?!\d)/.test(t.replace(/\s+/g, '')),
   },
 };
 

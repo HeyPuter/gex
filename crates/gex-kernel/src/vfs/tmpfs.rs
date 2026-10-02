@@ -133,9 +133,9 @@ impl TmpFs {
         inner.nodes.entry(path).or_insert(Node::Dir);
     }
 
-    /// A socket node the host serves, e.g. the virtio-gpu renderer at
-    /// `/tmp/.virgl_test`. Must be visible to `stat`, not just `connect`, so
-    /// a program that checks for the renderer before connecting finds it.
+    /// A socket node the host serves. Must be visible to `stat`, not just
+    /// `connect`, so a program that checks for the service before connecting
+    /// finds it.
     pub fn add_socket(&self, path: &str) {
         let path = path.trim_start_matches('/').to_string();
         let mut inner = self.inner.lock().unwrap();

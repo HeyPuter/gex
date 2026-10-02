@@ -24,7 +24,6 @@ members = [
     "crates/gex-xwm",
     "crates/gex-gpu",
     "crates/gex-gl",
-    "crates/gex-virgl",
     "crates/gex-eject",
     "crates/gexc",
     "shims/browser",
@@ -49,7 +48,6 @@ gex-key = { path = "crates/gex-key" }
 gex-mem = { path = "crates/gex-mem" }
 gex-wayland = { path = "crates/gex-wayland" }
 gex-xwm = { path = "crates/gex-xwm" }
-gex-virgl = { path = "crates/gex-virgl" }
 gex-gpu = { path = "crates/gex-gpu" }
 gex-gl = { path = "crates/gex-gl", default-features = false }
 gex-isa = { path = "crates/gex-isa" }

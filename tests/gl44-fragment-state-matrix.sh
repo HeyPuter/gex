@@ -48,8 +48,7 @@ GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 # Which host backend decodes the guest's GL: `gl=mesa` is st/mesa on the
 # gex_wgpu Gallium driver. These probes check
 # their own results against native Mesa, so they are the only ground truth
-# this project has for the Mesa path -- SuperTuxKart cannot provide one,
-# and the virgl reference does not survive a run.
+# this project has for the Mesa path -- SuperTuxKart cannot provide one.
 GEX_GL_QUERY=${GEX_GL_QUERY:-gl=mesa} \
 node "$ROOT/web/test/drive.mjs" gears \
     --allow-errors \

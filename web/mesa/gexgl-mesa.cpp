@@ -2,11 +2,10 @@
  *
  * The guest's GL driver (guest/gl) sends GL calls down the wire; this decodes
  * them, maps the guest's object names onto the host's, and runs them through
- * Mesa's st/mesa frontend on one of three Gallium drivers:
+ * Mesa's st/mesa frontend on one of two Gallium drivers:
  *
  *   GEX_MESA_WGPU   gex_wgpu, onto the browser's WebGPU
- *   GEX_MESA_VIRGL  virgl, with virglrenderer decoding on the page's WebGL
- *   neither         softpipe, the software reference
+ *   otherwise       softpipe, the software reference
  *
  * Built by the gex-wasm target in the Mesa fork (third_party/mesa,
  * src/gallium/targets/gex-wasm/meson.build), which defines GEX_MESA_WASM.
@@ -44,20 +43,6 @@ extern "C" const char *gex_wgpu_declined_last_why;
 
 #include "gex_wgpu/gex_wgpu_public.h"
 extern "C" WGPUDevice emscripten_webgpu_get_device(void);
-#elif defined(GEX_MESA_VIRGL)
-#include "frontend/winsys_handle.h"
-/* The same Mesa frontend again, on the driver that has always drawn these
- * pixels: Gallium's virgl encoder, with virglrenderer decoding it on the
- * page's WebGL. The guest used to run this half itself; the only thing that
- * moved is where the encoder runs. */
-#include "sw/null/null_sw_winsys.h"
-/* Neither of these carries an `extern "C"` of its own, and this decoder is
- * C++: without the guard the linker looks for mangled names Mesa never
- * defined. */
-extern "C" {
-#include "virgl/virgl_public.h"
-#include "virgl_vtest_public.h"
-}
 #else
 #include "softpipe/sp_public.h"
 #include "sw/null/null_sw_winsys.h"
@@ -438,10 +423,7 @@ bool use_surface(uint32_t handle) {
     if (sur == next) return true;
     sur = next;
     /* Every flush from here belongs to this surface, not only the one that
-     * presents it. virglrenderer keeps a frame per surface and takes it
-     * whenever commands arrive -- including in the middle of a frame -- so a
-     * tag that only moved at present time filed one client's half-drawn
-     * frames under another client's window. */
+     * presents it. */
     note_surface_to_backend(sur->uid);
     /* Before the context exists there is nothing to make current with; the
      * context creation that follows uses whatever is current then. */
@@ -992,15 +974,6 @@ int ensure_screen() {
     WGPUDevice device = emscripten_webgpu_get_device();
     if (!device) return -1;
     mesa_frontend_screen.screen = gex_wgpu_screen_create(device);
-#elif defined(GEX_MESA_VIRGL)
-    /* The sw_winsys is what a Gallium screen presents *through*, and this one
-     * displays nothing: virglrenderer already blits the resource it just drew
-     * into onto its own canvas, exactly as it does for a guest. */
-    mesa_winsys = null_sw_create();
-    if (!mesa_winsys) return -1;
-    struct virgl_winsys *vws = virgl_vtest_winsys_wrap(mesa_winsys);
-    if (!vws) return -3;
-    mesa_frontend_screen.screen = virgl_create_screen(vws, NULL);
 #else
     mesa_winsys = null_sw_create();
     if (!mesa_winsys) return -1;
@@ -1040,8 +1013,8 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
                            unsigned profile) {
     if (mesa_context)
         return 0;
-    /* This client's own screen, which is where its virgl context comes from:
-     * the page only ever made one, for whoever was current at the time. */
+    /* This client's own screen: the page only ever made one, for whoever
+     * was current at the time. */
     if (ensure_screen() != 0 || !mesa_frontend_screen.screen)
         return -1;
 
@@ -1403,52 +1376,10 @@ bool display_backend() {
     return true;
 }
 #else
-/* Tell the renderer next door which surface the frame it is about to see
- * belongs to.
- *
- * virglrenderer notices a finished frame itself, in the middle of the command
- * stream, and keeps a copy of it for the page to draw. With more than one
- * window it has to keep a copy each, and only this side knows which window is
- * being drawn -- so it is said before the flush that carries the frame. */
-EM_JS(void, gex_note_present_surface, (unsigned handle), {
-  Module.gexVirgl?.surface?.(handle);
-});
-
-/* And, after the flush, that this surface's frame is finished -- naming the
- * renderer's own resource it was drawn into.
- *
- * By name and not "whatever is bound": the renderer's current GL context
- * follows whichever vtest connection submitted last, so with two clients
- * drawing, a snapshot of the bound framebuffer is the wrong client's picture
- * as often as not. glxgears' frames stopped dead at 280 the moment glmark2
- * started submitting. */
-EM_JS(void, gex_note_frame_done, (unsigned surface, unsigned resource), {
-  Module.gexVirgl?.snapshot?.(surface, resource);
-});
-
-void note_surface_to_backend(unsigned uid) { gex_note_present_surface(uid); }
+void note_surface_to_backend(unsigned uid) { (void)uid; }
 
 void present_backend() {
-    /* Finish first, so everything this client drew has been through the
-     * renderer; then name the resource it was drawn into, which is what the
-     * renderer keeps a copy of. */
     glFinish();
-    if (sur) {
-        /* The renderer's own name for the buffer this frame was drawn into.
-         * `resource_get_handle` is Gallium's way to ask, and the vtest winsys
-         * answers with the handle the renderer created the resource under --
-         * which is what `virgl_renderer_resource_get_info` takes. */
-        struct pipe_resource* back =
-            sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
-        unsigned resource = 0;
-        struct pipe_screen* screen = mesa_frontend_screen.screen;
-        if (back && screen && screen->resource_get_handle) {
-            struct winsys_handle whandle = {};
-            if (screen->resource_get_handle(screen, nullptr, back, &whandle, 0))
-                resource = whandle.handle;
-        }
-        gex_note_frame_done(sur->uid, resource);
-    }
     ++produced;
     if (sur) ++sur->produced;
 }
@@ -2764,7 +2695,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_token(uint32_t i) {
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_client(uint32_t i) {
     return i < surface_list.size() ? surface_list[i].client : 0;
 }
-/* What the renderer keys this surface's frame by: see `gex_note_present_surface`. */
+/* What the renderer keys this surface's frame by. */
 EMSCRIPTEN_KEEPALIVE uint32_t gex_gl_surface_frame(uint32_t i) {
     return i < surface_list.size() ? surface_list[i].uid : 0;
 }

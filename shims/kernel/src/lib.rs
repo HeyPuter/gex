@@ -2400,36 +2400,3 @@ fn path_of_raw(at: u32, len: u32) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-// -- the GPU's session numbers -----------------------------------------------
-//
-// One renderer, one canvas; every drawing process is a client of it. A client's
-// number is the renderer's own context id, so two processes must never pick the
-// same -- and a per-process table gave both zero. Allocated here, where there
-// is one of them.
-
-/// Which client numbers the renderer has out. Sixteen, matching the shim's
-/// `MAX_SESSIONS`; numbers are given back rather than counting upwards.
-static VIRGL_TAKEN: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
-
-/// Claim a session number, or -1 if the renderer has no room.
-#[no_mangle]
-pub extern "C" fn k_virgl_take() -> i32 {
-    note_panics();
-    let mut bits = VIRGL_TAKEN.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 0..16u32 {
-        if *bits & (1 << i) == 0 {
-            *bits |= 1 << i;
-            return i as i32;
-        }
-    }
-    -1
-}
-
-/// Give one back, when the client's socket closes.
-#[no_mangle]
-pub extern "C" fn k_virgl_release(id: i32) {
-    note_panics();
-    if (0..16).contains(&id) {
-        *VIRGL_TAKEN.lock().unwrap_or_else(|e| e.into_inner()) &= !(1u32 << id);
-    }
-}

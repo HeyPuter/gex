@@ -295,8 +295,8 @@ async function startHostGl(compositor, glChannel, opts, term) {
     // every GL window black and nothing else amiss, so a line in the console
     // is a line nobody reads: the demo's own terminal is where the rest of
     // the session's trouble is reported.
-    console.error(`[gex] the guest's OpenGL did not start (${opts.backend || 'virgl'}): ${why}`);
-    term?.writeln?.(`gex: the guest's OpenGL did not start (${opts.backend || 'virgl'}): ${why}`);
+    console.error(`[gex] the guest's OpenGL did not start (${opts.backend || 'wgpu'}): ${why}`);
+    term?.writeln?.(`gex: the guest's OpenGL did not start (${opts.backend || 'wgpu'}): ${why}`);
     term?.writeln?.('gex: GL windows will be blank; everything else still runs');
     globalThis.__gexGlError = why;
     return null;
@@ -376,11 +376,9 @@ export async function runProgram(
     network = null,
     onNetEvent = null,
     gl = null,
-    // Which Mesa the host runs when `gl` is 'compositor': 'virgl' (Gallium's
-    // virgl encoder, virglrenderer decoding on WebGL) or 'wgpu' (the gex_wgpu
-    // driver, straight onto WebGPU). Only the driver under Mesa differs -- the
-    // guest sees the same GL either way.
-    glBackend = 'virgl',
+    // Which Gallium driver the host's Mesa runs when `gl` is 'compositor':
+    // gex_wgpu, straight onto WebGPU.
+    glBackend = 'wgpu',
     // The compositor's output canvas. Its control is transferred to a worker
     // that owns a WebGL2 context and draws the whole scene there: every
     // window, its decorations, its menus, and the cursor.
@@ -395,7 +393,6 @@ export async function runProgram(
     // kernel's unix socket, so from their side nothing changes -- but the
     // server's own drawing runs at wasm speed rather than translated AArch64.
     hostX = false,
-    virgl = null,
     uid,
     // Every N safepoints, print the guest pc -- the only instrument for
     // locating what is slow in a page.
@@ -458,37 +455,14 @@ export async function runProgram(
   // once at startup and then only on `SIGWINCH`.
   sharedTty?.resize(term.rows, term.cols);
 
-  // The GPU, if this demo has one. The renderer normally owns an
-  // OffscreenCanvas in its own Worker; the guest reaches it across a
-  // `SharedArrayBuffer` and blocks on
-  // `Atomics.wait`, because `virgl_submit` is called from inside a syscall
-  // and there is nothing to await with. See `virgl-bridge.js`.
-  let channel = null;
-  let serve = null;
   // Which GPU rings this run wired up. A demo that passes `gl` but whose
   // worker never mounts /dev/gex-gl is otherwise indistinguishable from one
   // that never asked, and the guest's only symptom is an empty GL_VERSION
   // much later.
-  console.warn(`[gex] runtime rings: virgl=${!!virgl} gl=${!!gl} wl=${!!wl}`);
-  if (virgl) {
-    if (!globalThis.crossOriginIsolated) {
-      throw new Error(
-        'the graphics demo needs a cross-origin isolated page: the renderer is ' +
-          'here and the guest is in a Worker, and what carries the command ' +
-          'stream between them is a SharedArrayBuffer.',
-      );
-    }
-    const { makeChannel, serveVirgl } = await import('@gex/virgl-bridge.mjs');
-    channel = makeChannel();
-    // OffscreenCanvas path: the renderer worker serves the ring itself. The
-    // returned function only forwards the wake-up. Older browsers retain the
-    // original main-thread renderer and serve it directly.
-    serve = virgl.attachChannel?.(channel) || serveVirgl(virgl, channel);
-  }
-
-  // The other GPU path: a `GlDevice` (web/src/gl.js) the guest drives through
-  // libGLESv2/libEGL marshallers over a command ring. Same reason it needs a
-  // SharedArrayBuffer bridge as virgl -- `gl_submit` is synchronous inside an
+  console.warn(`[gex] runtime rings: gl=${!!gl} wl=${!!wl}`);
+  // The GPU: a `GlDevice` (web/src/gl.js) the guest drives through
+  // libGLESv2/libEGL marshallers over a command ring. It needs a
+  // SharedArrayBuffer bridge -- `gl_submit` is synchronous inside an
   // ioctl and the canvas is here, not in the Worker. Without this the `gl`
   // option was accepted and dropped, so `/dev/gex-gl` was never mounted (it is
   // gated on `have_gl()`) and gles-gears died at `eglInitialize`/`ring_open`.
@@ -645,13 +619,8 @@ export async function runProgram(
       // constructor as `shared`. A guest's threads are Workers -- the only
       // shape the shim has now.
       shared: true,
-      virgl: channel ?? undefined,
-      // Trace every vtest feed (`[virgl] fed N bytes`) when asked -- the only
-      // way to tell a client that is rendering from one stuck before its first
-      // draw. Off unless GEX_VIRGL_TRACE is set.
-      virglTrace: !!globalThis.GEX_VIRGL_TRACE,
       // The GL ring's shared buffers, so a Worker that opens /dev/gex-gl can
-      // reach the page's GlDevice. In `extra` like virgl, for the same reason.
+      // reach the page's GlDevice.
       glChannel: glChannel ?? undefined,
       // The Wayland ring's shared buffers, so a Worker that binds the
       // compositor can carry its frames to the page's canvas. Like glChannel.
@@ -757,8 +726,7 @@ export async function runProgram(
       return tenv.readStdin();
     },
     onMessage: (m) => {
-      if (m.kind === 'virgl') serve?.();
-      else if (m.kind === 'gl') glServe?.();
+      if (m.kind === 'gl') glServe?.();
       // A process that has a compositor block hands the compositor its memory:
       // that is where the pixels of every one of its surfaces are.
       else if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory);

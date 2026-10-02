@@ -162,12 +162,6 @@ run options:
                   write each composited screen as PATH-NNN.ppm
   --gl            give the guest /dev/gex-gl, so a program linked against the
                   guest's libGLESv2 runs its OpenGL on the host's
-  --virgl [PATH]  where to serve the virtio-gpu renderer, so the guest's own
-                  Mesa draws on the host's GPU. Unmodified OpenGL programs
-                  work through this; set GALLIUM_DRIVER=virpipe in the guest.
-                  On by default at /tmp/.virgl_test, which is where Mesa
-                  looks, in a build that has libvirglrenderer.
-  --no-virgl      do not serve one
   --wayland-gpu   composite surfaces on the GPU through WebGPU, rather than
                   handing the host one client buffer at a time. Falls back to
                   the CPU, with a note, when there is no adapter
@@ -271,19 +265,6 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 opts.wayland_size = (w.parse()?, h.parse()?);
             }
             "--wayland-gpu" => opts.wayland_gpu = true,
-            "--virgl" => {
-                // The path is optional: Mesa has a default nobody overrides.
-                let next = args.get(i + 1);
-                let path = match next {
-                    Some(p) if !p.starts_with('-') => {
-                        i += 1;
-                        p.clone()
-                    }
-                    _ => gex_native::virgl::DEFAULT_SOCKET.to_string(),
-                };
-                opts.virgl = Some(path);
-            }
-            "--no-virgl" => opts.virgl = None,
             "--gl" => opts.gl = true,
             "--wayland-out" => {
                 i += 1;

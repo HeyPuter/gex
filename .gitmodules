@@ -7,4 +7,4 @@
 [submodule "third_party/mesa"]
 	path = third_party/mesa
 	url = https://github.com/MercuryWorkshop/mesa-wink.git
-	branch = gex-virgl
+	branch = wink

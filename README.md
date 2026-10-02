@@ -49,16 +49,15 @@ landed. What runs today:
   redirected it with Composite and paired it with a surface through
   `WL_SURFACE_ID`, so the compositor does all three
   (`crates/gex-xwm`), the way sway and mutter do. X11 and Wayland programs are
-  windows of the same session, and an OpenGL one -- the guest's own Mesa through
-  virgl to virglrenderer -- sits beside them in the same output;
+  windows of the same session, and an OpenGL one -- marshalled out of the guest
+  to Mesa on WebGPU in the page -- sits beside them in the same output;
 * **an X server that is not a guest program** -- `web/build-xwayland-wasm.sh`
   cross-builds Xwayland itself to WebAssembly (pixman, libwayland, libXfont2 and
   the rest with it) and `?hostx=1` runs it in a Worker of the page instead of in
   a guest process, so the server's own drawing is native wasm rather than
   translated AArch64 -- xeyes, xclock, xcalc and a terminal with a shell in it
   all behave. What it has not got is GLX, which wants glamor on a GPU a tab does
-  not have; while rendering goes through Mesa and virgl the guest's own Xwayland
-  is what a session starts, and this one waits behind the flag. Its two connections are bridged rather than emulated: X
+  not have. Its two connections are bridged rather than emulated: X
   clients are guest processes reaching it through the global kernel's unix
   socket, and the compositor is `gex-wayland` in the same Worker with no socket
   at all (`shims/hostwl`). A `wl_shm` pool is an allocation in the server's own

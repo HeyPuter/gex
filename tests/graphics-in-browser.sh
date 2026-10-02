@@ -1,12 +1,11 @@
 #!/bin/sh
 # The graphics stack in the browser runtime, stage by stage.
 #
-#   tests/graphics-in-browser.sh [x|gears] [seconds]
+#   tests/graphics-in-browser.sh [x] [seconds]
 #
 # The browser runtime under Node: the same `gex.mjs` a page loads, the same
 # shim, the same runtime translator. What it cannot do is draw -- there is no
-# WebGL here -- so `gears` gets as far as Mesa asking for a socket that nobody
-# serves. `web/test/virgl-gears.mjs` is the one with a GPU behind it.
+# WebGL here.
 #
 # What this is for is the part that has nothing to do with graphics: an X
 # server, its `xkbcomp`, a shell and a client, all as separate processes in one
@@ -50,16 +49,7 @@ echo "stage: X server still alive"
 EOF
         WANT="X server still alive"
         ;;
-    gears)
-        cat > "$R/stages.sh" <<EOF
-GEARS_SECONDS=$SECONDS_ARG
-export GEARS_SECONDS
-echo "stage: running the gears script"
-. /gears.sh
-EOF
-        WANT="frames in"
-        ;;
-    *) echo "usage: graphics-in-browser.sh [x|gears] [seconds]"; exit 2 ;;
+    *) echo "usage: graphics-in-browser.sh [x] [seconds]"; exit 2 ;;
 esac
 
 out="${TMPDIR:-/tmp}/gex-graphics-stages.$$"

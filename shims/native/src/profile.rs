@@ -664,7 +664,6 @@ mod tests {
             record: Some(dir.clone()),
             jit: true,
             cache: false,
-            virgl: None,
             ..Default::default()
         };
         let (exit, _) = crate::run_image(&image, &opts, &gex_xlate::Options::default()).unwrap();

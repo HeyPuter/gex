@@ -1,7 +1,7 @@
 // A fast, persistent, well-instrumented driver for the demo site.
 //
-//   node web/test/drive.mjs virgl                 # run the glxgears+Mesa demo
-//   node web/test/drive.mjs virgl --build         # build.sh first, then run
+//   node web/test/drive.mjs wayland               # glxgears under Xwayland
+//   node web/test/drive.mjs wayland --build       # build.sh first, then run
 //   node web/test/drive.mjs gears --query gears_size=100x100
 //   node web/test/drive.mjs debian --cmd 'ls /; echo done' --want 'done'
 //
@@ -59,33 +59,21 @@ const DEMOS = {
   // The API-split WebGL path (guest links libGLESv2/libEGL marshallers): its
   // own glReadPixels coverage, so a black frame that exits 0 does not pass.
   gears: { want: /covered ([1-9]\d*)%/, fail: /covered 0%/, settle: 'finished' },
-  // glxgears on Debian's own Mesa via virglrenderer. Two things must hold: a
-  // frame rate (Mesa completed frames) AND that a lit texture reached the
-  // canvas -- `lit=0` is the draws-but-presents-black failure this is for.
-  virgl: {
-    want: (t) =>
-      /frames in [\d.]+ seconds/.test(t) &&
-      Number(/lit=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
-    fail: (t) => /lit=0(?!\d)/.test(t.replace(/\s+/g, '')),
-  },
   // A session: several clients, each its own process, in one output. The bar
   // is the compositor's own: windows mapped and pixels on the output, which
   // `--wllit` reads back from its framebuffer. The terminal line only says the
   // shell got that far.
   compositor: { want: /gex: session up/ },
-  // glxgears under Xwayland, GL through virgl (same success bar as `virgl`):
-  // a frame rate AND a lit texture presented. `lit=0` is drew-nothing.
+  // glxgears under Xwayland: a frame rate is the bar (its GL is the guest's
+  // own Mesa, in software, unless `?gl=1` sends it to the host).
   wayland: {
-    want: (t) =>
-      /frames in [\d.]+ seconds/.test(t) &&
-      Number(/lit=(\d+)/.exec(t.replace(/\s+/g, ''))?.[1]) > 0,
-    fail: (t) => /lit=0(?!\d)/.test(t.replace(/\s+/g, '')),
+    want: /frames in [\d.]+ seconds/,
     settle: 'finished',
   },
 };
 
 // Dispatched in the page by `--input`: synthetic mouse and keyboard on the
-// visible Wayland/virgl canvas, the same DOM events a real user would make, so
+// visible Wayland canvas, the same DOM events a real user would make, so
 // `attachWlInput`'s listeners fire and fill the input ring. Coordinates are
 // element-relative; the keys are `KeyboardEvent.code`s the evdev table maps.
 const INJECT_JS = `(() => {
@@ -145,7 +133,7 @@ const WLSTATE_JS = `(async () => {
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
   const o = {
-    demo: 'virgl',
+    demo: 'wayland',
     build: false,
     wallMs: 240_000,
     idleMs: 60_000,
@@ -434,7 +422,7 @@ async function runDemo(o) {
       // the browser's own error strings are long enough that 200 cut them off
       // mid-sentence -- "A valid external \u2026" is not a diagnosis.
       log(`  warn [${label(sid)}] ${trunc(text, 400)}`);
-    } else if (/\bquiet:|MISS-LOOP|\[virgl\] running/.test(text)) {
+    } else if (/\bquiet:|MISS-LOOP/.test(text)) {
       // The wait census (console.debug "[gex] quiet: ...") and a few other
       // diagnostics say what a wedged run is parked on -- surfaced on demand.
       log(`  · [${label(sid)}] ${trunc(text, 300)}`);
@@ -642,8 +630,8 @@ async function runDemo(o) {
       }
     }
 
-    // --applit: client-agnostic success. Any GL client that renders makes the
-    // virgl renderer report lit>0, so poll its live state and pass on the first
+    // --applit: client-agnostic success. A GL device that reports lit>0 has
+    // drawn, so poll its live state and pass on the first
     // lit frame -- no need for a client to print a frame rate or to exit.
     if (o.applit && !verdict) {
       try {

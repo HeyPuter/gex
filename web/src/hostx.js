@@ -37,7 +37,7 @@ const EBADF = 9;
 /**
  * Import emscripten's glue.
  *
- * Directly, not through a blob the way `virgl.js` does it: this module is built
+ * Directly, not through a blob: this module is built
  * `-pthread`, and emscripten's thread support works out where to load its
  * Worker from `import.meta.url` -- which is not a URL at all when the glue was
  * imported from a blob ("TypeError: Invalid URL", from `allocateUnusedWorker`,
