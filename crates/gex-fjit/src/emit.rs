@@ -196,7 +196,8 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     let rk = b.local(ValType::I32);
     let e64 = b.local(ValType::I64);
     // Its pages unchanged since translation, or the table's newer function
-    // for this address (merge-plan §9.8.1), before anything else.
+    // for this address (merge-plan §9.8.1; `gex.lookup` retires this one and
+    // finds or makes it), before anything else.
     if let Linkage::Runtime { table, pages } = &m.linkage {
         let none: &[(u64, u32)] = &[];
         let pages = if cf::exp("NOPAGECHECK") { none } else { pages.get(&f.entry).map(|v| v.as_slice()).unwrap_or(none) };
@@ -214,7 +215,10 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
             fb.local_get(1);
             fb.local_get(2);
             fb.local_get(3);
-            probe_const(fb, f.entry, e64);
+            // Straight to `resolve`, not through the probe cache: when only
+            // a later page changed, the entry's cache line still names this
+            // function, and probing would come back here forever.
+            fb.i32_const(gex_abi::ftab::RESOLVE as i32);
             fb.return_call_indirect(m.body_ty, *table);
             fb.end();
         }
