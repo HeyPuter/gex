@@ -3227,7 +3227,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if op == gex_abi::cache_op::LOW_ACCESS {
-                return low_access(&mut caller, "a locked access", addr as u64, _pc as u64);
+                return low_access(&mut caller, "a locked access", addr as u64, pc as u64);
             }
             if op == gex_abi::cache_op::SPLIT_LOCK {
                 eprintln!(
