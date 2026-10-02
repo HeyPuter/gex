@@ -63,8 +63,10 @@ for arch in x64 x86; do
         "$b/hello_args.exe" a "b c"
     # N2 (and N3 for x86): every line "ok ...", then "0 failures".
     check $arch/sync 0 "$allok" "$b/sync.exe"
-    # Locks under contention. x86 only: x64's SList is cmpxchg16b, which
-    # gex still does in two halves (wasm has no 16-byte atomic).
+    # Locks under contention (x64's SList is cmpxchg16b, done by the host
+    # under one lock). x86 only natively for now: x64's first section (the
+    # builtin msvcp120's _Mtx_lock, eight threads) livelocks under native
+    # gexc since the merges of 2026-10-01 -- it passes in the browser.
     [ $arch = x86 ] && check $arch/mtx 0 "$allok" "$b/mtx.exe"
     check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
     check $arch/apc 0 "$allok" "$b/apc.exe"

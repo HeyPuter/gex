@@ -26,6 +26,11 @@ pub const SYSREG_CPUID: i32 = -100;
 /// [`serve_x87`].
 pub const SYSREG_X87: i32 = -101;
 
+/// The pseudo system register the lifter writes for `cmpxchg16b`
+/// (`gex_lift_x86::sysreg::CMPXCHG16B`): the value is the effective address.
+/// See [`serve_cmpxchg16b`].
+pub const SYSREG_CMPXCHG16B: i32 = -102;
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {
@@ -638,6 +643,36 @@ pub fn serve_cpuid(m: &mut GuestMem<'_>, ctx_addr: u64, value: u64) {
     for (reg, v) in [(0u8, r[0]), (3, r[1]), (1, r[2]), (2, r[3])] {
         let _ = m.write_u64(ctx_addr + ctx::x(reg) as u64, v as u64);
     }
+}
+
+/// `cmpxchg16b` at `addr`, for the thread at `ctx_addr`: rdx:rax against the
+/// sixteen bytes there; equal, rcx:rbx is stored and ZF set; otherwise
+/// rdx:rax receive what was there and ZF is clear.
+///
+/// Under one lock for every `cmpxchg16b` of every thread (wasm has no
+/// 16-byte atomic): atomic against each other, not against a plain store
+/// racing it. A lock-free list (x64 Windows' SLIST_HEADER) changes its
+/// head only this way, so that is all it needs.
+pub fn serve_cmpxchg16b(m: &mut GuestMem<'_>, ctx_addr: u64, addr: u64) {
+    use gex_abi::ctx;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOCK: AtomicBool = AtomicBool::new(false);
+    while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        std::hint::spin_loop();
+    }
+    let r = |i: u8| m.read_u64(ctx_addr + ctx::x(i) as u64).unwrap_or(0);
+    let (rax, rdx, rbx, rcx) = (r(0), r(2), r(3), r(1));
+    let (lo, hi) = (m.read_u64(addr).unwrap_or(0), m.read_u64(addr + 8).unwrap_or(0));
+    let equal = lo == rax && hi == rdx;
+    if equal {
+        let _ = m.write_u64(addr, rbx);
+        let _ = m.write_u64(addr + 8, rcx);
+    } else {
+        let _ = m.write_u64(ctx_addr + ctx::x(0) as u64, lo);
+        let _ = m.write_u64(ctx_addr + ctx::x(2) as u64, hi);
+    }
+    LOCK.store(false, Ordering::Release);
+    let _ = m.write(ctx_addr + ctx::ZF as u64, &[equal as u8]);
 }
 
 /// The x87 register stack as the lifter keeps it in the context: eight
