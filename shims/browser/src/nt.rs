@@ -262,6 +262,8 @@ mod imp {
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
         GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
+        GL_STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
+        nt::opengl::STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
         TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
@@ -353,6 +355,10 @@ mod imp {
     /// GEX_NT_GL_READBACK: read each GL frame back into the window's surface
     /// instead of handing it to the compositor (the old path, for comparing).
     static GL_READBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// GEX_NT_GL_STATS: every ten seconds, the program's GL by function
+    /// (`nt::opengl::take_stats`).
+    static GL_STATS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Words in a scene record and an input event: `REC` and `EV` in
     /// `crate::wl` and `wl-bridge.mjs`.
@@ -514,6 +520,9 @@ mod imp {
         let presents = p.presents.load(Ordering::Relaxed);
         if t / 1000 % 10 == 0 {
             report_times();
+            if GL_STATS.load(Ordering::Relaxed) {
+                warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
+            }
         }
         if VERIFY_REGISTRY.load(Ordering::Relaxed) {
             if let Some(what) = with_host(crate::verify_registry) {

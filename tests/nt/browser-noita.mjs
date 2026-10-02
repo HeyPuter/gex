@@ -24,9 +24,9 @@
 // Needs everything browser-gui.mjs does, plus web/public/gex/gex-wgpu-replay.*
 // (web/build-mesa-wasm.sh).
 
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { bundle, openPage, sleep, log, WEB } from './browser-harness.mjs';
+import { bundle, openPage, sleep, log, WEB, summariseProfile } from './browser-harness.mjs';
 
 const argv = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -50,7 +50,7 @@ async function main() {
   // (GEX_NT_PAGE_FLAGS: more query flags, `&name=value`).
   const env = ['GEX_NT_STATS=1', ...(gameplay ? ['GEX_NT_PEEK=0x122374c*'] : []),
     ...(process.env.GEX_NT_PAGE_ENV ? [process.env.GEX_NT_PAGE_ENV] : [])].join(',');
-  const { browser, page, evaluate, state, shot, consoleLines } = await openPage(
+  const { browser, page, evaluate, state, shot, consoleLines, profile } = await openPage(
     `tar=/gex/nt/${tar.split('/').pop()}&exe=/noita/noita.exe&cwd=/noita&gl=1&glbackend=wgpu`
       + `&size=1320x800&trapstack=1${process.env.GEX_NT_PAGE_FLAGS ?? ''}&env=${env}${gameplay ? '&args=-single_threaded_loading' : ''}`,
     { width: 1340, height: 900, shotDir },
@@ -98,6 +98,10 @@ async function main() {
   let shots = 0;
   // Gameplay: when the world's counter first moved.
   let world = null;
+  const profileSpec = process.env.GEX_NT_PROFILE
+    ? (([match, at = '60', secs = '20']) => ({ match, at: +at, secs: +secs }))(process.env.GEX_NT_PROFILE.split(','))
+    : null;
+  let profiled = false;
   for (;;) {
     const s = await state();
     if (s?.phase === 'failed' || s?.phase === 'done') {
@@ -142,6 +146,17 @@ async function main() {
       if (!world && p.peek !== null && p.peek > 0) {
         world = { t: p.t, n: p.n, peek: p.peek };
         console.log(`ok   the world is up at ${(p.t / 1000).toFixed(0)} s, ${((p.t - lastClickAt) / 1000).toFixed(0)} s after the game mode was chosen`);
+      }
+      // GEX_NT_PROFILE=MATCH[,AT[,SECS]]: a CPU profile of the Workers whose
+      // script URL contains MATCH, AT seconds into the measurement (default
+      // 60) for SECS (default 20), summarised and saved (--shot DIR).
+      if (world && profileSpec && !profiled && p.t - world.t >= profileSpec.at * 1000) {
+        profiled = true;
+        for (const { url, profile: prof } of await profile(profileSpec.match, profileSpec.secs * 1000)) {
+          const file = url.split('/').pop().split('?')[0];
+          log(`profile of ${file}:\n${summariseProfile(prof, 30)}`);
+          if (shotDir) writeFileSync(join(shotDir, `${file}.cpuprofile`), JSON.stringify(prof));
+        }
       }
       if (world && p.t - world.t >= measure * 1000) {
         const secs = (p.t - world.t) / 1000;
