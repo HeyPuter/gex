@@ -98,14 +98,20 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
     Ok(pc)
 }
 
-/// GEX_NT_STATS, once, when no frame has been presented for 60 s: every
+/// How long without a frame before the hang dump: `GEX_NT_HANG_SECS`, default
+/// 300 (Noita's world load holds one frame for over a minute).
+fn hang_after() -> Duration {
+    Duration::from_secs(std::env::var("GEX_NT_HANG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300))
+}
+
+/// GEX_NT_STATS, once, when no frame has been presented for a while: every
 /// guest thread's pc, stack pointer and state, and the image addresses on the
 /// top of its stack (return addresses, mostly), so a hang says where each
 /// thread is.
 fn hang_dump(p: &nt::Process, memory: &gex_mem::GuestMemory) {
     let m = GuestMem::new(memory.bytes());
     let threads: Vec<Arc<nt::Thread>> = p.threads.read().unwrap().by_tid.values().cloned().collect();
-    eprintln!("gex-nt: hang: no frame for 60 s; {} threads", threads.len());
+    eprintln!("gex-nt: hang: no frame for {} s; {} threads", hang_after().as_secs(), threads.len());
     let p32 = p.abi == nt::Abi::P32;
     for t in threads {
         let pc = m.read_u64(t.ctx_addr + gex_abi::ctx::PC as u64).unwrap_or(0);
@@ -266,7 +272,7 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     let presents = presents as u64;
                     if presents != last_presents {
                         (last_presents, frozen_since) = (presents, Instant::now());
-                    } else if presents > 0 && !dumped && frozen_since.elapsed() >= Duration::from_secs(60) {
+                    } else if presents > 0 && !dumped && frozen_since.elapsed() >= hang_after() {
                         dumped = true;
                         hang_dump(&p, &memory);
                     }
