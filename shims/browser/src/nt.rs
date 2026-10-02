@@ -82,6 +82,10 @@ mod stub {
         false
     }
 
+    pub(crate) fn describe(addr: u64) -> String {
+        format!("{addr:#x}")
+    }
+
     /// The glue's nested callback loop asks this; with no Windows process
     /// that loop never runs, but the export has to exist for the glue check.
     #[no_mangle]
@@ -258,6 +262,7 @@ mod imp {
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
         GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
+        TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
         }
@@ -597,6 +602,14 @@ mod imp {
         ));
     }
 
+    /// `addr` as the NT layer names it (`image+offset`), for a report.
+    pub(crate) fn describe(addr: u64) -> String {
+        match PROCESS.get() {
+            Some(p) => p.describe_addr(addr),
+            None => format!("{addr:#x}"),
+        }
+    }
+
     /// Whether this process is a Windows one, for the glue.
     #[no_mangle]
     pub extern "C" fn gex_nt_active() -> i32 {
@@ -901,7 +914,16 @@ mod imp {
         let _ = vt;
         e[2].store(r(5) << 32 | r(0), Ordering::Relaxed);
         e[3].store(m(sp) << 32 | r(7), Ordering::Relaxed);
+        static PRINTED: AtomicU64 = AtomicU64::new(0);
+        if TRAP_PRINT.load(Ordering::Relaxed) && PRINTED.fetch_add(1, Ordering::Relaxed) < 200 {
+            let q = |i: u8| gm.read_u64(ctx + ctx::x(i) as u64).unwrap_or(0);
+            warn_line(&format!(
+                "gex-nt: trap {} ctx {ctx:#x}: rax {:#x} rcx {:#x} rdx {:#x} rbx {:#x} rsp {:#x} rsi {:#x} rdi {:#x} r8 {:#x} [rsp] {:#x}\n",
+                describe(pc), q(0), q(1), q(2), q(3), q(4), q(6), q(7), q(8), gm.read_u64(q(4)).unwrap_or(0)
+            ));
+        }
     }
+    static TRAP_PRINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     fn trap_report(ctx: u64) -> String {
         let t = &TRINGS[(ctx as usize / 0x80) % TRINGS.len()];

@@ -38,13 +38,16 @@ static void reset(void) {
     for (int i = 0; i < 64; i++) { ring[i][0] = 0; ring[i][1] = ~0u; }
 }
 
+/* Before MSVCP 140, _Mtx_lock and _Mtx_unlock take the _Mtx_t's address
+ * (_Mtx_arg_t is _Mtx_t *); passing the _Mtx_t made ConcRT lock a
+ * critical_section at its flags word (a null pointer's field). */
 typedef void *mtx_t;
 static int (__cdecl *mtx_init)(mtx_t *, int);
-static int (__cdecl *mtx_lock)(mtx_t);
-static int (__cdecl *mtx_unlock)(mtx_t);
+static int (__cdecl *mtx_lock)(mtx_t *);
+static int (__cdecl *mtx_unlock)(mtx_t *);
 static mtx_t mtx;
 static DWORD WINAPI mtx_worker(void *p) {
-    for (int i = 0; i < ITERS; i++) { mtx_lock(mtx); critical(); mtx_unlock(mtx); }
+    for (int i = 0; i < ITERS; i++) { mtx_lock(&mtx); critical(); mtx_unlock(&mtx); }
     return 0;
 }
 

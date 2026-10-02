@@ -754,7 +754,17 @@ pub mod cache_op {
     /// aligned 8-byte words, at the address given, which runs under
     /// [`super::SPLIT_LOCK`] -- atomic against other such accesses only.
     pub const SPLIT_LOCK: i32 = 10;
+    /// Not a cache operation: a locked access below [`super::GUEST_FLOOR`],
+    /// in the runtime's own memory, at the address given. The host raises
+    /// an access violation (NT) or SIGSEGV (Linux) and does not return.
+    pub const LOW_ACCESS: i32 = 11;
 }
+
+/// The lowest address a guest access may name: below it are the runtime's
+/// thread contexts, words and dispatch directory, which a null pointer's
+/// field would otherwise write into silently (gex has no page protection).
+/// Checked where an access already goes through host code or a slow path.
+pub const GUEST_FLOOR: u64 = DISPATCH_DIR_END;
 
 /// Size in bytes zeroed by one `dc zva`, and the value reported by
 /// `DCZID_EL0`. 64 bytes is what every mainstream aarch64 core reports.

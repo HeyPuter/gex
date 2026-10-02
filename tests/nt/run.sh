@@ -64,10 +64,16 @@ for arch in x64 x86; do
     # N2 (and N3 for x86): every line "ok ...", then "0 failures".
     check $arch/sync 0 "$allok" "$b/sync.exe"
     # Locks under contention (x64's SList is cmpxchg16b, done by the host
-    # under one lock). x86 only natively for now: x64's first section (the
-    # builtin msvcp120's _Mtx_lock, eight threads) livelocks under native
-    # gexc since the merges of 2026-10-01 -- it passes in the browser.
+    # under one lock). x86 only natively for now: on x64 the first section
+    # (msvcp120's _Mtx_lock, eight threads) spins forever, without
+    # syscalls, when mtx.exe runs on tier-1 beside the Wine DLLs' function-
+    # tier units (GEX_NT_CGEN_BUILD=0 reproduces it every time); with
+    # mtx.exe's own unit, and in the browser (tier-1 throughout), it passes.
     [ $arch = x86 ] && check $arch/mtx 0 "$allok" "$b/mtx.exe"
+    # A locked write through a null pointer's field is an access violation.
+    check $arch/lownull-xadd 0 "$allok" "$b/lownull.exe" xadd
+    check $arch/lownull-aligned 0 "$allok" "$b/lownull.exe" aligned
+    [ $arch = x64 ] && check $arch/lownull-cmpxchg16b 0 "$allok" "$b/lownull.exe" cmpxchg16b
     check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
     check $arch/apc 0 "$allok" "$b/apc.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
