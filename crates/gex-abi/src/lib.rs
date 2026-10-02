@@ -577,9 +577,122 @@ pub const BODY_LIMITS: u64 = RESERVED_END - 320;
 /// first.
 pub const BODY_LIMIT: u64 = BODY_LIMITS;
 
+/// The function table's probe cache (docs/merge-plan.md §9.8): guest address
+/// → [`ftab`] index, direct-mapped, shared by every thread of the process.
+/// Entry `fcache_slot(a)` is one `u64`: the address's low 32 bits in the low
+/// half (guest code is below 4 GiB), the index in the high half. Generated
+/// code probes it inline on an indirect transfer; a miss (or a stale entry)
+/// is index 0, the resolve stub, which asks the host (`gex.lookup`) and
+/// writes the entry. All zero at start: address 0 maps to the resolve stub.
+pub const FCACHE: u64 = PATCHED_PAGES - FCACHE_BYTES;
+/// `log2` of the probe cache's entries.
+pub const FCACHE_BITS: u32 = 15;
+pub const FCACHE_ENTRIES: u64 = 1 << FCACHE_BITS;
+pub const FCACHE_BYTES: u64 = FCACHE_ENTRIES * 8;
+
+/// The probe cache slot of guest address `a`: a multiplicative hash of its
+/// low 32 bits (pewasm's dispatch cache), so code that is 16-byte aligned
+/// still spreads over every slot. Every emitter computes exactly this.
+#[inline]
+pub const fn fcache_slot(a: u64) -> u64 {
+    ((a as u32).wrapping_mul(FCACHE_MUL) >> (32 - FCACHE_BITS)) as u64
+}
+/// The multiplier of [`fcache_slot`].
+pub const FCACHE_MUL: u32 = 0x9e37_79b1;
+
+/// The address of `a`'s probe cache entry.
+#[inline]
+pub const fn fcache_entry(a: u64) -> u64 {
+    FCACHE + 8 * fcache_slot(a)
+}
+
+/// A probe cache entry for `a` at index `idx`.
+#[inline]
+pub const fn fcache_pack(a: u64, idx: u32) -> u64 {
+    (a & 0xffff_ffff) | ((idx as u64) << 32)
+}
+
 /// Where the thread contexts must end: the runtime's fixed words
-/// ([`PATCHED_PAGES`] up to [`RESERVED_END`]) start here.
-pub const CTX_LIMIT: u64 = PATCHED_PAGES;
+/// ([`FCACHE`] up to [`RESERVED_END`]) start here.
+pub const CTX_LIMIT: u64 = FCACHE;
+
+/// One `u32` per code page that changes whenever the page's code may have
+/// (merge-plan §9.8, per-function page checks): a function translated at run
+/// time records the value of every page it covers and compares them on
+/// entry; on a mismatch it re-enters through the resolve stub with
+/// `ctx::LAST_TARGET` = its entry, and the host translates it again. Until
+/// tier-1's dispatch slots go (§9.4 step 6) this *is* the dispatch directory:
+/// a page retired is zeroed there and numbered afresh, never with an old
+/// value, and the host numbers every page it hands a translator
+/// (`page_gen`), so an entry of zero never belongs to a translation. Units
+/// built ahead of time check [`PATCHED_PAGES`] instead (their bytes are
+/// fixed at build time, so "changed since install" is the question).
+pub const PAGE_GEN: u64 = DISPATCH_DIR;
+
+/// The function table (docs/merge-plan.md §9.8): one `funcref` table per
+/// process -- per store natively, per Worker in the browser, numbered alike
+/// in all of them -- holding only `F_body` functions:
+///
+/// ```text
+/// F_body(ctx: i32, depth: i32, need: i32, ret: i64) -> i32
+/// ```
+///
+/// 1: the predicted return happened (the guest returned to `ret` with the
+/// stack pointer back); 0: the function left with all state written back
+/// and `ctx::PC` set. The callee does the return check; `depth` is the
+/// recursion guard's estimate (docs/function-tier.md §7.1).
+///
+/// Every call through the table first stores the target in
+/// `ctx::LAST_TARGET`, so any slot a thread's table has not filled yet --
+/// which holds the resolve stub -- and any retired slot -- which is
+/// pointed back at it -- can still find out where the call was going.
+pub mod ftab {
+    /// The table, imported by every module that calls through it. Units
+    /// linked by wasm-ld (`--experimental-pic -shared`) import it as
+    /// [`PIC_TABLE`] instead; the host defines both names to the same table.
+    pub const TABLE: &str = "ftab";
+    /// What wasm-ld's position-independent modules call the table, the base
+    /// of their slots and their memory base, all in module [`PIC_MODULE`].
+    pub const PIC_MODULE: &str = "env";
+    pub const PIC_TABLE: &str = "__indirect_function_table";
+    pub const PIC_TABLE_BASE: &str = "__table_base";
+    pub const PIC_MEMORY_BASE: &str = "__memory_base";
+    pub const PIC_STACK_POINTER: &str = "__stack_pointer";
+
+    /// `gex.lookup(ctx: i32, addr: i64) -> i32`: the index of a function
+    /// for guest address `addr`, translating it on demand (a unit's body,
+    /// else the function JIT, else a region). Never 0. Also writes the
+    /// probe cache entry, so the next probe hits.
+    pub const LOOKUP: &str = "lookup";
+
+    /// Index 0: the resolve stub. Reads `ctx::LAST_TARGET`, calls
+    /// [`LOOKUP`], tail-calls the result with its own arguments.
+    pub const RESOLVE: u32 = 0;
+    /// Index 1: runs code no function body holds yet (tier-1 until the
+    /// region tier replaces it), entered at `ctx::LAST_TARGET`, under the
+    /// same contract.
+    pub const FALLBACK: u32 = 1;
+    /// Indices below this are the runtime's; modules' functions start here.
+    pub const RESERVED: u32 = 16;
+
+    /// `F_body`'s results.
+    pub const RET_PREDICTED: i32 = 1;
+    pub const RET_LEFT: i32 = 0;
+
+    /// `need` bits: the caller's continuation reads a flag, so an expected
+    /// return writes the flags back too. A root passes [`NEED_ALL`].
+    pub const NEED_FLAGS: u32 = 1;
+    pub const NEED_ALL: u32 = u32::MAX;
+
+    /// The `ret` a root passes: no code is there, so no return is predicted.
+    pub const NO_RETURN: u64 = u64::MAX;
+
+    /// A module's install descriptor: a custom section listing, for each
+    /// slot its one active element segment fills from `__table_base`, the
+    /// guest address of the function there (0: not reachable by address,
+    /// e.g. a helper). `u32` count, then that many little-endian `u64`s.
+    pub const FUNCS_SECTION: &str = "gex.funcs";
+}
 
 /// A counter the browser glue takes bootstrap stacks by: a Worker calls
 /// `gex_worker_init` before it has a stack of its own, and wasm-ld's default
@@ -855,6 +968,8 @@ mod tests {
         assert!(NEST_EXITS + 8 <= SPLIT_LOCK);
         assert!(NEST_EXITS + 8 <= BOOT_STACK_COUNTER && BOOT_STACK_COUNTER + 8 <= SPLIT_LOCK);
         assert!(PATCHED_PAGES + PATCHED_PAGES_BYTES <= BODY_LIMIT);
+        assert!(FCACHE + FCACHE_BYTES <= PATCHED_PAGES);
+        assert!(FCACHE % 8 == 0 && FCACHE > RESERVED_BASE + 256 * ((ctx::SIZE as u64 + 63) & !63));
         assert!(SPLIT_LOCK + 8 <= EXCLUSIVE_SCRATCH);
         // Every address code may occupy needs a directory entry, including the
         // mmap arena where `ld.so` maps and calls into libraries.

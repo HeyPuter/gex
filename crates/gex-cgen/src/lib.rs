@@ -9,6 +9,7 @@ pub mod emit;
 pub mod func;
 pub mod image;
 pub mod recover;
+pub mod runtime;
 pub mod header;
 pub mod splice;
 pub mod standalone;

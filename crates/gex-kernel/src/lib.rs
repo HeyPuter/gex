@@ -15,6 +15,7 @@ pub mod errno;
 pub mod eventfd;
 pub mod file;
 pub mod fs;
+pub mod ftab;
 pub mod futex;
 pub mod mem;
 pub mod net;
