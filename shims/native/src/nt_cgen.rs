@@ -411,15 +411,16 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
 }
 
 /// Compile a unit's module. The compiled form is kept beside the unit
-/// (`c.<build>.cwasm`), not in the shared module cache: a large image's is
-/// hundreds of MiB, which that cache's LRU budget evicts at once, and
-/// Cranelift over noita.exe's unit takes a minute.
+/// (`c.cwasm`), not in the shared module cache: a large image's is hundreds
+/// of MiB, which that cache's LRU budget evicts at once, and Cranelift over
+/// noita.exe's unit takes about a minute. Not keyed on the build of gex: the
+/// unit directory is keyed on the module's content already, and wasmtime
+/// refuses an artifact from an incompatible engine, which recompiles it.
 fn compile(engine: &Engine, cache: Option<&(std::path::PathBuf, String)>, cwasm_path: &std::path::Path, cwasm: &[u8]) -> Result<Module> {
-    let Some((_, build)) = cache else {
+    if cache.is_none() {
         return Ok(Module::new(engine, cwasm)?);
-    };
-    let tag = &gex_cache::key(build, [b"gex-cgen-compiled 1".as_slice()])[..16];
-    gex_cache::load_or_compile_at(engine, &cwasm_path.with_extension(format!("{tag}.cwasm")), cwasm)
+    }
+    gex_cache::load_or_compile_at(engine, &cwasm_path.with_extension("cwasm"), cwasm)
 }
 
 /// Build a unit for `p` in a background child for the next run: `gexc
