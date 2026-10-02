@@ -124,6 +124,9 @@ export class GlProxy {
   #data;
   #words;
   #wake;
+  /** An unwaited batch (`async`) is in flight: this client holds LOCK, and
+   *  the next submit collects the answer before anything else. */
+  #pending = false;
 
   constructor(channel, wake) {
     this.#ctl = new Int32Array(channel.control);
@@ -136,8 +139,15 @@ export class GlProxy {
    *
    * `client` names this process to the host, which keeps a GL context per
    * client. Zero for a caller that has no identity to give.
+   *
+   * `async`: copy the batch over and return without waiting for it -- the
+   * guest's ring is free again as soon as it is copied, so the guest records
+   * its next frame while the host runs this one. The next submit waits for
+   * it first (one batch in flight: the channel's buffer is the second copy),
+   * reports that wait through `noteWait(ms)`, and fails if it did. Only for
+   * a batch with nothing to answer.
    */
-  submit(memory, ring, client = 0) {
+  submit(memory, ring, client = 0, async = false, noteWait = null) {
     const gbytes = new Uint8Array(memory.buffer);
     const ghead = new Uint32Array(memory.buffer, ring, HEADER_BYTES / 4);
     const capacity = ghead[H_CAPACITY];
@@ -145,6 +155,12 @@ export class GlProxy {
     if (HEADER_BYTES + tail > this.#data.length) return -1;
 
     const ctl = this.#ctl;
+    if (this.#pending) {
+      const t0 = performance.now();
+      const before = this.#collect();
+      noteWait?.(performance.now() - t0);
+      if (before < 0) return before;
+    }
     // One ring, and as many processes as have OpenGL open. Without a claim,
     // two of them copy their commands over each other and the host decodes
     // the mixture -- which is not a corrupt frame, it is a rejected batch and
@@ -169,9 +185,40 @@ export class GlProxy {
         break;
       }
     }
+    if (async) {
+      // Held until `#collect`: the channel's buffer is in use until then.
+      this.#data.set(gbytes.subarray(ring, ring + HEADER_BYTES + tail), 0);
+      Atomics.store(ctl, CLIENT, client >>> 0);
+      Atomics.store(ctl, STATE, REQUEST);
+      Atomics.notify(ctl, STATE);
+      this.#wake();
+      this.#pending = true;
+      // As the host will leave it: the guest refills its ring at once.
+      ghead[H_TAIL] = 0;
+      return 0;
+    }
     try {
       return this.#exchange(gbytes, ring, capacity, tail, client);
     } finally {
+      Atomics.store(ctl, LOCK, 0);
+      Atomics.notify(ctl, LOCK);
+    }
+  }
+
+  /** Wait for the unwaited batch, release the ring, and return its result. */
+  #collect() {
+    const ctl = this.#ctl;
+    try {
+      while (Atomics.load(ctl, STATE) === REQUEST) {
+        if (Atomics.wait(ctl, STATE, REQUEST, 30000) === 'timed-out') {
+          throw new Error('the GL device did not answer in thirty seconds');
+        }
+      }
+      Atomics.store(ctl, STATE, IDLE);
+      Atomics.notify(ctl, STATE);
+      return ctl[RESULT];
+    } finally {
+      this.#pending = false;
       Atomics.store(ctl, LOCK, 0);
       Atomics.notify(ctl, LOCK);
     }

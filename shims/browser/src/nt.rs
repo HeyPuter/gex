@@ -645,7 +645,8 @@ mod imp {
         let r0 = gm.read_u32(sp0).unwrap_or(0) as u64;
         let r1 = gm.read_u32(sp0 + 4).unwrap_or(0) as u64;
         ring_note(ctx_addr, (nr as u64) << 32 | sp0, r0 << 32 | r1);
-        let (t_in, gl_in) = (crate::now_ns(), crate::gl::GL_NS.with(|g| g.get()));
+        let (t_in, gl_in, glw_in) =
+            (crate::now_ns(), crate::gl::GL_NS.with(|g| g.get()), crate::gl::GL_WAIT_NS.with(|g| g.get()));
         let outcome = {
             let mut host = Nested { ctx_addr };
             nt::syscall(p, &HostKernel, guest_bytes(), ctx_addr, pc as u64, &mut host)
@@ -655,11 +656,13 @@ mod imp {
         }
         {
             let gl = crate::gl::GL_NS.with(|g| g.get()) - gl_in;
+            let glw = (crate::gl::GL_WAIT_NS.with(|g| g.get()) - glw_in).min(gl);
             let all = crate::now_ns().saturating_sub(t_in);
             let name = nt::syscall_name(nr);
             let wait = name.contains("Wait") || name.contains("Delay") || name.contains("Remove") || name.contains("Yield");
             time_note(ctx_addr, if wait { 1 } else { 0 }, all.saturating_sub(gl));
-            time_note(ctx_addr, 2, gl);
+            time_note(ctx_addr, 2, gl - glw);
+            time_note(ctx_addr, 4, glw);
         }
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
@@ -839,14 +842,18 @@ mod imp {
     }
 
     /// GEX_NT_STATS' per-thread time split: nanoseconds in NT calls (0),
-    /// in waits (1), waiting on the page's GL host (2), and in the glue's run
-    /// loop between traps (3); and, per thread, the totals as of the last
-    /// report (4..8) and when that was (8). Keyed by context, like the rings.
+    /// in waits (1), waiting on the page's GL host (2), in the glue's run
+    /// loop between traps (3), and waiting for the previous unwaited GL batch
+    /// (4, `GEX_GL_SUBMIT_ASYNC`: the frame before's Mesa time the guest did
+    /// not hide); and, per thread, the totals as of the last report
+    /// (KINDS..2*KINDS) and when that was (2*KINDS). Keyed by context, like
+    /// the rings.
+    const KINDS: usize = 5;
     struct Times {
         ctx: AtomicU64,
-        v: [AtomicU64; 9],
+        v: [AtomicU64; 2 * KINDS + 1],
     }
-    static TIMES: [Times; 64] = [const { Times { ctx: AtomicU64::new(0), v: [const { AtomicU64::new(0) }; 9] } }; 64];
+    static TIMES: [Times; 64] = [const { Times { ctx: AtomicU64::new(0), v: [const { AtomicU64::new(0) }; 2 * KINDS + 1] } }; 64];
 
     fn times_of(ctx: u64) -> &'static Times {
         let t = &TIMES[(ctx as usize / 0x80) % TIMES.len()];
@@ -854,7 +861,7 @@ mod imp {
             for v in &t.v {
                 v.store(0, Ordering::Relaxed);
             }
-            t.v[8].store(crate::now_ns(), Ordering::Relaxed);
+            t.v[2 * KINDS].store(crate::now_ns(), Ordering::Relaxed);
         }
         t
     }
@@ -879,17 +886,18 @@ mod imp {
             if ctx == 0 {
                 continue;
             }
-            let cur: Vec<u64> = (0..4).map(|i| t.v[i].load(Ordering::Relaxed)).collect();
-            let d: Vec<u64> = (0..4).map(|i| cur[i].saturating_sub(t.v[4 + i].swap(cur[i], Ordering::Relaxed))).collect();
-            let wall = now.saturating_sub(t.v[8].swap(now, Ordering::Relaxed));
+            let cur: Vec<u64> = (0..KINDS).map(|i| t.v[i].load(Ordering::Relaxed)).collect();
+            let d: Vec<u64> =
+                (0..KINDS).map(|i| cur[i].saturating_sub(t.v[KINDS + i].swap(cur[i], Ordering::Relaxed))).collect();
+            let wall = now.saturating_sub(t.v[2 * KINDS].swap(now, Ordering::Relaxed));
             if wall == 0 || d.iter().sum::<u64>() == 0 {
                 continue;
             }
             let ms = |v: u64| v / 1_000_000;
             let rest = wall.saturating_sub(d.iter().sum::<u64>());
             warn_line(&format!(
-                "gex-nt: time ctx {ctx:#x} over {} ms: guest {} ms, NT calls {} ms, waits {} ms, GL host {} ms, glue {} ms\n",
-                ms(wall), ms(rest), ms(d[0]), ms(d[1]), ms(d[2]), ms(d[3])
+                "gex-nt: time ctx {ctx:#x} over {} ms: guest {} ms, NT calls {} ms, waits {} ms, GL host {} ms, GL previous frame {} ms, glue {} ms\n",
+                ms(wall), ms(rest), ms(d[0]), ms(d[1]), ms(d[2]), ms(d[4]), ms(d[3])
             ));
         }
     }

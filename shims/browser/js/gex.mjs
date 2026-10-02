@@ -843,7 +843,14 @@ export class Gex {
         // own and another process hands out the same ones.
         gl_submit: (ring) =>
           (this.#gl
-            ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken())
+            ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), false, this.#glWaitNote)
+            : -1),
+        // The same, not waited for (a frame's last batch): the copy is taken
+        // and the guest draws on; the next submit waits for this one, and
+        // says how long through `gex_gl_note_wait_ns`.
+        gl_submit_async: (ring) =>
+          (this.#gl
+            ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
             : -1),
         // The other GPU path: unmodified Mesa speaking VirGL over a socket,
         // decoded by virglrenderer (a separate wasm module with its own heap,
@@ -2257,6 +2264,10 @@ export class Gex {
    * Off by default, like the network. Best set before `load`, since the device
    * node is made while the filesystem is built; a later call still works.
    */
+  /** How long a GL submit waited for the unwaited batch before it, to the
+   *  shim's per-thread time split. */
+  #glWaitNote = (ms) => this.#shim?.exports?.gex_gl_note_wait_ns?.(ms * 1e6);
+
   useGl(gl) {
     this.#gl = gl;
     this.#shim?.exports?.gex_set_gl?.(gl ? 1 : 0);

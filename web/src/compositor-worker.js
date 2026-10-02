@@ -108,6 +108,10 @@ function compile(gl, type, src) {
 class Painter {
   constructor(gl) {
     this.gl = gl;
+    /** Whether another renderer draws in this context (virgl's GL, which
+     *  `startGl` puts on the compositor's own canvas): then `begin` saves its
+     *  state and `end` puts it back. */
+    this.shared = false;
     const prog = gl.createProgram();
     gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
     gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG));
@@ -150,6 +154,16 @@ class Painter {
       this.saved = null;
       return false;
     }
+    // Nobody else draws in this context (no virgl GL, or Mesa on WebGPU,
+    // which presents into a canvas of its own): nothing to save, and the
+    // fourteen queries below are each a synchronous round trip to the GPU
+    // process -- a tenth of this worker's time under Noita, on the thread
+    // that also runs Mesa. Set the state and draw.
+    if (!this.shared) {
+      this.saved = null;
+      this.#own(w, h);
+      return true;
+    }
     // This context is shared: the guest's OpenGL runs in it too (see
     // `startGl`). Two things follow, and both were learned the hard way.
     //
@@ -181,6 +195,12 @@ class Painter {
     gl.activeTexture(gl.TEXTURE0);
     this.saved.tex0 = gl.getParameter(gl.TEXTURE_BINDING_2D);
     this.saved.sampler = gl.getParameter(gl.SAMPLER_BINDING);
+    this.#own(w, h);
+  }
+
+  /** The state this draws with, set rather than assumed. */
+  #own(w, h) {
+    const gl = this.gl;
     gl.bindSampler(0, this.sampler);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.disable(gl.SCISSOR_TEST);
@@ -1141,6 +1161,11 @@ class Compositor {
       win.surface);
   }
 
+  /** Whether the guest's GL draws in this compositor's own context. */
+  shareContext(on) {
+    this.#painter.shared = on;
+  }
+
   /**
    * What the harness and the demo UI read.
    *
@@ -1323,6 +1348,7 @@ async function startGl(m, canvas) {
   // as an upload. One copy per frame, GPU-side -- the price of the API that
   // cannot share a texture with the one this compositor draws in.
   glTarget = backend === 'wgpu' ? new OffscreenCanvas(16, 16) : canvas;
+  comp?.shareContext(glTarget === canvas);
   // Emscripten looks a canvas up by selector, and a worker has no document.
   if (!globalThis.document) globalThis.document = { querySelector: () => glTarget };
   const { MesaGlDevice } = await import('./mesa-gl.js');
