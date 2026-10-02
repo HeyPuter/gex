@@ -218,6 +218,7 @@ fn take_pending() -> Vec<Pending> {
 
 /// A unit found for an image, checked against what is mapped.
 struct Placed {
+    path: std::path::PathBuf,
     cwasm: Vec<u8>,
     entries: Vec<u64>,
     /// A hash of each executable page as the unit was built from it.
@@ -259,7 +260,7 @@ fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
     if entries.is_empty() {
         bail!("{}: its function-tier unit exports no entries", p.path);
     }
-    Ok(Some(Placed { cwasm, entries, pages }))
+    Ok(Some(Placed { path: cwasm_path, cwasm, entries, pages }))
 }
 
 /// A hash of guest page `page` as it is now.
@@ -315,17 +316,16 @@ fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
     }
 }
 
-/// Compile a unit's module (through the module cache: Cranelift over a
-/// large image is minutes, the cached form is not).
-fn compile(engine: &Engine, cache: Option<&(std::path::PathBuf, String)>, cwasm: &[u8]) -> Result<Module> {
-    Ok(match cache {
-        Some((dir, build)) => {
-            let key = gex_cache::key(build, [cwasm]);
-            let wasm = cwasm.to_vec();
-            gex_cache::load_or_compile(engine, dir, &key, move || Ok((wasm, Vec::new())))?.module
-        }
-        None => Module::new(engine, cwasm)?,
-    })
+/// Compile a unit's module. The compiled form is kept beside the unit
+/// (`c.<build>.cwasm`), not in the shared module cache: a large image's is
+/// hundreds of MiB, which that cache's LRU budget evicts at once, and
+/// Cranelift over noita.exe's unit takes a minute.
+fn compile(engine: &Engine, cache: Option<&(std::path::PathBuf, String)>, cwasm_path: &std::path::Path, cwasm: &[u8]) -> Result<Module> {
+    let Some((_, build)) = cache else {
+        return Ok(Module::new(engine, cwasm)?);
+    };
+    let tag = &gex_cache::key(build, [b"gex-cgen-compiled 1".as_slice()])[..16];
+    gex_cache::load_or_compile_at(engine, &cwasm_path.with_extension(format!("{tag}.cwasm")), cwasm)
 }
 
 /// Build a unit for `p` in a background child for the next run: `gexc
@@ -333,6 +333,9 @@ fn compile(engine: &Engine, cache: Option<&(std::path::PathBuf, String)>, cwasm:
 /// (`GEX_CGEN_MEMORY_MAX`, default 12G). Builders take [`build_lock`], so
 /// they run one at a time, and outlive this process.
 fn spawn_build(p: &Pending) -> Result<std::process::Child> {
+    // A process group of its own: the run ending -- a Ctrl-C at the terminal,
+    // `timeout` signalling its group -- must not take the build with it.
+    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
     let max = std::env::var("GEX_CGEN_MEMORY_MAX").unwrap_or_else(|_| "12G".into());
     let base = format!("{:#x}", p.base);
@@ -346,6 +349,7 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
+        .process_group(0)
         .spawn();
     match capped {
         Ok(c) => Ok(c),
@@ -353,8 +357,37 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
+            .process_group(0)
             .spawn()?),
     }
+}
+
+/// `GEX_NT_CGEN_SYNC=1` (tests/nt under --cgen): a program image mapped
+/// without a unit has one built there and then, and installed, rather than
+/// running on tier-1 or failing.
+fn sync_build() -> bool {
+    std::env::var_os("GEX_NT_CGEN_SYNC").is_some()
+}
+
+/// Build `p`'s unit now (the child `gexc cgen-image`), waiting for it.
+fn build_now(p: &Pending) -> Result<()> {
+    let status = spawn_build(p)?.wait()?;
+    if !status.success() {
+        bail!("building the function tier for {} failed ({status})", p.path);
+    }
+    Ok(())
+}
+
+/// A unit for `p`: placed if built; built first under `GEX_NT_CGEN_SYNC`.
+fn place_or_build(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
+    if let Some(pl) = place(p, memory)? {
+        return Ok(Some(pl));
+    }
+    if sync_build() && !is_wine(p) {
+        build_now(p)?;
+        return place(p, memory);
+    }
+    Ok(None)
 }
 
 /// An image Wine's prefix provides, not the program.
@@ -422,11 +455,11 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
         };
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         let t0 = std::time::Instant::now();
-        let Some(pl) = place(&p, memory.bytes())? else {
+        let Some(pl) = place_or_build(&p, memory.bytes())? else {
             missing(p)?;
             continue;
         };
-        let module = compile(&engine, cache.as_ref(), &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
+        let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
         note_pages(&memory, &pl.pages);
         publish_cgen_unit(&shared, module, &pl.entries)?;
         replay_registry(caller)?;
@@ -449,11 +482,11 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
         };
         let memory = store.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         let t0 = std::time::Instant::now();
-        let Some(pl) = place(&p, memory.bytes())? else {
+        let Some(pl) = place_or_build(&p, memory.bytes())? else {
             missing(p)?;
             continue;
         };
-        let module = compile(&engine, cache.as_ref(), &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
+        let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
         note_pages(&memory, &pl.pages);
         let unit = publish_cgen_unit(&shared, module, &pl.entries)?;
         install_unit(&mut *store, &unit)?;

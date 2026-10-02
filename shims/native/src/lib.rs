@@ -290,6 +290,8 @@ pub(crate) mod jit_stats {
     pub static SLOTS: AtomicU64 = AtomicU64::new(0);
     pub static GROWN: AtomicU64 = AtomicU64::new(0);
     pub static WASM_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Blocks that failed their page check and were translated again.
+    pub static STALE: AtomicU64 = AtomicU64::new(0);
     /// The last few translated pcs, and since the last line the lowest and
     /// highest, so a translation storm shows where it is without a print per
     /// miss (which changes the timing enough to hide it).
@@ -307,13 +309,14 @@ pub(crate) mod jit_stats {
         use std::sync::atomic::Ordering::Relaxed;
         let (lo, hi) = (LO.swap(u64::MAX, Relaxed), HI.swap(0, Relaxed));
         format!(
-            "jit pc={lo:#x}..{hi:#x} last={:x?} pub={} blocks={} wasm={}M inst={} retired={} slots={} grown={}",
+            "jit pc={lo:#x}..{hi:#x} last={:x?} pub={} blocks={} wasm={}M inst={} retired={} stale={} slots={} grown={}",
             LAST.iter().map(|a| a.load(Relaxed)).collect::<Vec<_>>(),
             PUBLISHED.load(Relaxed),
             BLOCKS.load(Relaxed),
             WASM_BYTES.load(Relaxed) >> 20,
             INSTALLS.load(Relaxed),
             RETIRED.load(Relaxed),
+            STALE.load(Relaxed),
             SLOTS.load(Relaxed),
             GROWN.load(Relaxed)
         )
@@ -457,6 +460,10 @@ struct JitShared {
     /// The function tier's dispatcher module (`gex_cgen::splice::
     /// dispatcher_module`), compiled once.
     dispatcher: Option<Module>,
+    /// Which translation (`TranslatedModule::module_id`) provides each
+    /// translated address: a block failing its page check is translated
+    /// again only while its own module still does (`PAGE_STALE`).
+    provider: std::collections::HashMap<u64, u64>,
     /// Each store's body-table size, by its thread's context address
     /// (`publish_body_limit`).
     body_sizes: std::collections::BTreeMap<u64, u64>,
@@ -977,6 +984,7 @@ fn run_program_with(
                 stale_blocks: 0,
                 dispatcher: None,
                 body_sizes: Default::default(),
+                provider: Default::default(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -3135,7 +3143,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::CACHE_OP,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, _pc: i64, op: i32, addr: i64| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, op: i32, addr: i64| -> Result<()> {
             if op == gex_abi::cache_op::DC_ZVA {
                 let memory = caller
                     .data()
@@ -3158,6 +3166,29 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A block entered for a neighbour sharing its dispatch slot
             // (x86-64): forget the neighbour so the miss that follows lifts it
             // again, with this block as a mate, into a trampoline.
+            if op == gex_abi::cache_op::PAGE_STALE {
+                // A block failed its page check. Translate its address again
+                // only if its module still provides it; a newer translation
+                // otherwise already sits in the slot dispatch reaches.
+                let start = pc as u64;
+                let again = match caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
+                    Some(shared) => {
+                        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        let again = sh.provider.get(&start).map_or(true, |&m| m == addr as u64);
+                        if again {
+                            sh.translated.remove(&start);
+                            sh.provider.remove(&start);
+                        }
+                        again
+                    }
+                    None => false,
+                };
+                if again {
+                    jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    translate_and_install(&mut caller, start)?;
+                }
+                return Ok(());
+            }
             if op == gex_abi::cache_op::SLOT_CONFLICT {
                 if let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -3168,7 +3199,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if op == gex_abi::cache_op::SPLIT_LOCK {
                 eprintln!(
                     "gex: a locked access at {:#x} (block {:#x}) spans two 8-byte words; such accesses run under one global lock, atomic against each other but not against plain accesses",
-                    addr as u64, _pc as u64
+                    addr as u64, pc as u64
                 );
                 return Ok(());
             }
@@ -3599,6 +3630,7 @@ fn publish_unit(
         let page = *a / gex_abi::DISPATCH_PAGE;
         if sh.page_table.lookup(page).is_some() && sh.page_table.lookup(page) == translated.page_table.lookup(page) {
             sh.translated.insert(*a);
+            sh.provider.insert(*a, translated.module_id);
         } else {
             stale += 1;
         }
@@ -3884,11 +3916,33 @@ fn install_cgen(
     Ok(())
 }
 
+/// Leaves through the body table by (call site's return address, target),
+/// under GEX_NT_STATS.
+static LEAVE_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// The `n` call sites that left most since the last call, as `ret->target
+/// count` (GEX_NT_STATS).
+pub(crate) fn take_leave_sites(n: usize) -> String {
+    let m = LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut v: Vec<_> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.iter().take(n).map(|((r, t), c)| format!("{r:x}->{t:x}:{c}")).collect::<Vec<_>>().join(" ")
+}
+
 /// The body table's default entry: an indirect call to an address no
 /// installed unit holds. It leaves (-1); under GEX_TRACE each call site
 /// (`ret`, the caller's return address) is said once.
 fn cgen_leave(caller: &Caller<'_, HostState>, ctx: i32, ret: i64) {
     CGEN_LEAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("GEX_NT_STATS").is_some() {
+        let target = caller
+            .data()
+            .memory
+            .as_ref()
+            .and_then(|m| GuestMem::new(m.bytes()).read_u64(ctx as u32 as u64 + ctx::PC as u64).ok())
+            .unwrap_or(0);
+        *LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((ret as u64, target)).or_default() += 1;
+    }
     if std::env::var_os("GEX_TRACE").is_none() {
         return;
     }

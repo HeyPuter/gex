@@ -98,6 +98,46 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
     Ok(pc)
 }
 
+/// GEX_NT_STATS, once, when no frame has been presented for 60 s: every
+/// guest thread's pc, stack pointer and state, and the image addresses on the
+/// top of its stack (return addresses, mostly), so a hang says where each
+/// thread is.
+fn hang_dump(p: &nt::Process, memory: &gex_mem::GuestMemory) {
+    let m = GuestMem::new(memory.bytes());
+    let threads: Vec<Arc<nt::Thread>> = p.threads.read().unwrap().by_tid.values().cloned().collect();
+    eprintln!("gex-nt: hang: no frame for 60 s; {} threads", threads.len());
+    let p32 = p.abi == nt::Abi::P32;
+    for t in threads {
+        let pc = m.read_u64(t.ctx_addr + gex_abi::ctx::PC as u64).unwrap_or(0);
+        let sp = m.read_u64(t.ctx_addr + gex_abi::ctx::x(4) as u64).unwrap_or(0);
+        let sp = if p32 { sp & 0xffff_ffff } else { sp };
+        let mut chain = Vec::new();
+        let w = if p32 { 4 } else { 8 };
+        for i in 0..256u64 {
+            let a = sp + i * w;
+            let v = if p32 { m.read_u32(a).map(|v| v as u64) } else { m.read_u64(a) };
+            let Ok(v) = v else { break };
+            let d = p.describe_addr(v);
+            if d.contains('(') {
+                chain.push(d);
+                if chain.len() >= 12 {
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "gex-nt: hang: tid {} pc {} sp {sp:#x} suspend {} callback_depth {} alerted {} exited {}\n    stack: {}",
+            t.tid,
+            p.describe_addr(pc),
+            t.suspend.load(std::sync::atomic::Ordering::Relaxed),
+            t.callback_depth.load(std::sync::atomic::Ordering::Relaxed),
+            t.alerted.load(std::sync::atomic::Ordering::Relaxed),
+            t.exit_code.lock().unwrap().is_some(),
+            chain.join(" <- ")
+        );
+    }
+}
+
 fn layout_misses() -> u64 {
     nt::section::LAYOUT_MISSES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -192,6 +232,8 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
     });
     let start = Instant::now();
     let mut next_stats = Duration::from_secs(1);
+    // The hang dump: presents frozen this long after the first one.
+    let (mut last_presents, mut frozen_since, mut dumped) = (0u64, Instant::now(), false);
     let _ = std::thread::Builder::new().name("gex-nt-usd".into()).spawn(move || loop {
         match p.upgrade() {
             Some(p) if !p.terminating.load(std::sync::atomic::Ordering::Relaxed) => {
@@ -217,6 +259,16 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     match value {
                         Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
                         None => eprintln!("gex-nt: stats t={} presents={presents} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
+                    }
+                    if next_stats.as_secs() % 60 == 0 {
+                        eprintln!("gex-nt: leave sites {}", crate::take_leave_sites(15));
+                    }
+                    let presents = presents as u64;
+                    if presents != last_presents {
+                        (last_presents, frozen_since) = (presents, Instant::now());
+                    } else if presents > 0 && !dumped && frozen_since.elapsed() >= Duration::from_secs(60) {
+                        dumped = true;
+                        hang_dump(&p, &memory);
                     }
                     // With --sample, the hottest guest back-edges of the last
                     // 30 s, by module, so a run that never exits can still be

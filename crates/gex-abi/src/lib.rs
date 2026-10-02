@@ -754,6 +754,13 @@ pub mod cache_op {
     /// aligned 8-byte words, at the address given, which runs under
     /// [`super::SPLIT_LOCK`] -- atomic against other such accesses only.
     pub const SPLIT_LOCK: i32 = 10;
+    /// Not a cache operation: the block at `pc` failed its page check (its
+    /// pages are no longer numbered as when it was translated), and `addr` is
+    /// the id of the module it belongs to (`TranslatedModule::module_id`).
+    /// The host translates `pc` again if that module still provides it --
+    /// otherwise dispatch already reaches a newer translation -- and the
+    /// block then dispatches.
+    pub const PAGE_STALE: i32 = 11;
 }
 
 /// Size in bytes zeroed by one `dc zva`, and the value reported by

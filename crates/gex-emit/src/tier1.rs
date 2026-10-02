@@ -154,6 +154,8 @@ pub struct Context<'a> {
     /// are never reused) since means the block is stale, however it was
     /// reached. `None`: no check (a module that is never retired).
     pub page_bases: Option<&'a HashMap<u64, u32>>,
+    /// `TranslatedModule::module_id` of the module being built.
+    pub module_id: u64,
 }
 
 /// `GEX_NO_PAGE_CHECK=1`: blocks do not check their page's directory entry
@@ -161,6 +163,13 @@ pub struct Context<'a> {
 fn page_check() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     !*OFF.get_or_init(|| std::env::var_os("GEX_NO_PAGE_CHECK").is_some())
+}
+
+/// `GEX_PAGE_CHECK_NO_RETRANSLATE=1`: a block failing its page check only
+/// dispatches (the mutation tests/nt/pagespan.c catches).
+fn page_check_no_retranslate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_PAGE_CHECK_NO_RETRANSLATE").is_some())
 }
 
 /// `GEX_PAGE_CHECK_BALLAST=N`: the page check emitted N extra times, for
@@ -4542,6 +4551,21 @@ impl<'a> Emitter<'a> {
             }
         }
         self.f.if_void();
+        // Dispatch alone could come straight back here: a block that runs
+        // into a second page fails when only that page changed, while the
+        // directory entry of the page it starts on -- the one dispatch reads
+        // -- still names this block's slot. So the host is told first
+        // (`PAGE_STALE`, with this module's id): if this module still provides
+        // the address it translates it again, which writes the new block into
+        // the slot; if a newer translation provides it already (this block was
+        // reached by a direct jump from a sibling), it does nothing.
+        if !page_check_no_retranslate() {
+            self.f.local_get(self.ctx_local);
+            self.f.i64_const(start as i64);
+            self.f.i32_const(gex_abi::cache_op::PAGE_STALE);
+            self.f.i64_const(self.cx.module_id as i64);
+            self.f.call(self.cx.cache_op);
+        }
         self.store_pc(start);
         self.f.i64_const(start as i64);
         self.f.local_set(self.scratch_i64);

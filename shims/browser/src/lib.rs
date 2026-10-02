@@ -2457,6 +2457,9 @@ struct Jit {
     /// handed out from zero and overwrite the image module's own table blocks.
     described: bool,
     /// Addresses whose slot now holds real code.
+    /// Which translation provides each translated address
+    /// (`TranslatedModule::module_id`), for `PAGE_STALE`.
+    provider: std::collections::HashMap<u64, u64>,
     translated: std::collections::HashSet<u64>,
     /// A sorted snapshot of `translated`, materialised by `gex_coverage_snapshot`
     /// so JS can read the executed block PCs out of linear memory and write them
@@ -3938,6 +3941,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
                 described: meta.next_slot != 0,
                 page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
                 translated: Default::default(),
+            provider: Default::default(),
             coverage_snap: Vec::new(),
                 registry: Vec::new(),
                 registry_sums: Vec::new(),
@@ -7387,6 +7391,7 @@ pub extern "C" fn gex_adopt_child(
             described: meta.next_slot != 0,
             page_table: shared_page_table(&meta.dir_entries, meta.next_slot, meta.n_blocks),
             translated: Default::default(),
+            provider: Default::default(),
             coverage_snap: Vec::new(),
             registry: Vec::new(),
             registry_sums: Vec::new(),
@@ -10066,6 +10071,23 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         ));
         return;
     }
+    if op == gex_abi::cache_op::PAGE_STALE {
+        // A block failed its page check (gex-emit `emit_page_check`):
+        // translate its address again if its module still provides it.
+        let start = _pc as u64;
+        let again = with_host(|h| {
+            let again = h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
+            if again {
+                h.jit.translated.remove(&start);
+                h.jit.provider.remove(&start);
+            }
+            again
+        });
+        if again {
+            gex_dispatch_miss(_ctx, start as i64);
+        }
+        return;
+    }
     if op == gex_abi::cache_op::SLOT_CONFLICT {
         // A block entered for a neighbour sharing its slot: forget the
         // neighbour so the miss that follows lifts it (with this block as a
@@ -11070,6 +11092,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         }
         for (addr, _) in &unit.exported_blocks {
             h.jit.translated.insert(*addr);
+            h.jit.provider.insert(*addr, unit.module_id);
         }
         // The base this unit gave the faulting page, captured before `wasm`
         // is moved. `dir_entries` holds only *freshly allocated* pages, so a
@@ -11409,6 +11432,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
             h.jit.page_table = m.page_table.clone();
             for b in &m.exported_blocks {
                 h.jit.translated.insert(b.0);
+                h.jit.provider.insert(b.0, m.module_id);
             }
         }
         h.jit.blocks += stats.blocks as u64;

@@ -52,6 +52,10 @@ pub struct TranslatedModule {
     pub covered: Vec<(u64, u32)>,
     /// The updated page assignment, to carry into the next translation.
     pub page_table: PageTable,
+    /// This translation's id, unique in the process (never 0): what its
+    /// blocks report when they fail their page check
+    /// (`gex_abi::cache_op::PAGE_STALE`).
+    pub module_id: u64,
     /// Number of guest basic blocks translated.
     pub n_blocks: usize,
     /// For a [`Linkage::Shared`] module, the blocks it defines and the export
@@ -530,6 +534,9 @@ impl Reader<'_> {
 }
 
 /// Builds a wasm module from GIR blocks.
+/// The next `TranslatedModule::module_id`.
+static NEXT_MODULE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct ModuleBuilder {
     m: Module,
     text_base: u64,
@@ -809,6 +816,13 @@ impl ModuleBuilder {
     pub fn add_block(&mut self, block: Block) {
         let f = self.reserve(block.start);
         self.page_base(block.start);
+        // A block that runs on into the next page depends on that page's
+        // bytes too: give it a base, so retiring it (the bytes there
+        // rewritten) is something the block's entry check sees.
+        let last = block.end.max(block.start + 1) - 1;
+        if dispatch_page(last) != dispatch_page(block.start) {
+            self.page_base(last);
+        }
         if self.linkage == Linkage::Shared {
             self.exports_by_addr.push((block.start, f));
         }
@@ -852,6 +866,7 @@ impl ModuleBuilder {
                 records: region.records,
             }
         });
+        let module_id = NEXT_MODULE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let compiled: Vec<(u32, (Vec<u8>, Vec<u32>))> = {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
@@ -881,6 +896,7 @@ impl ModuleBuilder {
                 gir: &gir,
                 profile: profile_emit.as_ref(),
                 page_bases: Some(&page_bases),
+                module_id,
             };
             // The single largest serial phase there was: one wasm body per
             // guest block, hundreds of thousands for a large library.
@@ -1144,6 +1160,7 @@ impl ModuleBuilder {
             dir_entries,
             covered,
             page_table: self.page_table.clone(),
+            module_id,
             n_blocks,
             exported_blocks,
         }
