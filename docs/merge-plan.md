@@ -624,10 +624,11 @@ tier-1 for recoverable code.
      gi386; Tier 0 CPU time per kernel against tier-1, the clang tier and
      emcc (paired A/B, the usual rules); translation time per function;
      memory per function.
-   - **Go/no-go:** the prototype must beat tier-1 clearly (target: at or
-     below 2× tier-1's time-per-kernel ratio to the clang tier, i.e. most of
-     the way from tier-1 to clang) and translate fast enough for start-up
-     (target: Noita's working set in seconds, not minutes).
+   - **Go/no-go:** the prototype must close most of the gap from tier-1 to
+     the clang tier. Today tier-1 is 1.6-1.85× slower than clang on the Tier 0
+     geomean (gi386 4.39/2.77, gx64 4.46/2.41). The target is the function
+     JIT at or below 1.25× clang. It must also translate fast enough for
+     start-up: Noita's working set in seconds, not minutes.
 3. **Make AOT units use the same ABI** and install into the one function
    table; retire body tables and nests for code that has a function body.
 4. **Region tier** for non-function-shaped code, from the call-out; tests:
