@@ -35,7 +35,6 @@ use gex_kernel::{GuestMem, Kernel, SyscallOutcome, ThreadState};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 pub mod gl;
-pub mod virgl;
 pub mod wl;
 mod xwm;
 pub(crate) mod memmap;
@@ -392,11 +391,6 @@ extern "C" {
     fn k_sock_shutdown(id: i32);
     fn k_sock_exists(path: u32, path_len: u32) -> i32;
 
-    // The GPU's client numbers. One renderer, one canvas, and every drawing
-    // process a client of it -- so the number cannot come from a table each
-    // process keeps for itself.
-    fn k_virgl_take() -> i32;
-    fn k_virgl_release(id: i32);
 }
 
 /// The first slot number no dispatch table can hold: `DISPATCH_TABLES` tables
@@ -527,22 +521,6 @@ fn shared_page_table(
     }
     let _ = n_blocks;
     table
-}
-
-/// Claim a renderer session number, or -1 when there is no global kernel to
-/// claim it from -- in which case the caller falls back to its own table,
-/// which is right when there is only one process.
-pub(crate) fn virgl_take_session() -> i32 {
-    if unsafe { k_present() } == 0 {
-        return -1;
-    }
-    unsafe { k_virgl_take() }
-}
-
-pub(crate) fn virgl_release_session(id: i32) {
-    if unsafe { k_present() } != 0 {
-        unsafe { k_virgl_release(id) };
-    }
 }
 
 // A wasm import is `unsafe` and `Remote` holds safe fn pointers, so each needs
@@ -1260,40 +1238,20 @@ impl FileHandle for StdinQueue {
     }
 }
 
-/// Mount `/dev`, and bind the virtio-gpu socket if the page brought a
-/// renderer. Returns the device, which the `Host` holds.
+/// Mount `/dev`, and bind the Wayland socket if the page brought a canvas.
+/// Returns the compositor, which the `Host` holds.
 ///
 /// A function because every kernel this shim builds needs it -- both the
 /// process `gex_load` places and every child `gex_adopt_child` adopts, since a
 /// child with only the root filesystem has no `/dev/null` and no GPU.
-fn mount_devices(
-    kernel: &mut Kernel,
-) -> (
-    Option<crate::virgl::VirglDevice>,
-    Option<crate::wl::WaylandDevice>,
-) {
+fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
     let mut devfs = gex_kernel::vfs::DevFs::new();
     devfs.add("tty", Arc::new(Tty));
     if crate::gl::have_gl() {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
-    // Only when the page brought one: Mesa's winsys does not fall back if the
-    // socket is unserved -- it writes its handshake and blocks on a reply that
-    // cannot come, worse than finding no socket at all.
-    let virgl = crate::virgl::have_virgl().then(|| {
-        let device = crate::virgl::VirglDevice::new();
-        // In this process's own host table, not the system-wide one: the device
-        // can only reach the memory of the process it is in, so the name must
-        // resolve to the device of whoever is connecting. Sharing it across a
-        // fork handed one process's clients to another's device.
-        kernel.host_names.bind_host(
-            crate::virgl::DEFAULT_SOCKET,
-            Arc::new(device.clone()) as Arc<dyn gex_kernel::unix::HostListener>,
-        );
-        device
-    });
-    // The Wayland compositor, on the same terms: bound only when the page
+    // The Wayland compositor: bound only when the page
     // brought a canvas for it, so a guest without one finds no `wayland-0` and
     // libwayland fails to connect cleanly rather than blocking on a dead name.
     let wayland = crate::wl::have_wl().then(|| {
@@ -1309,7 +1267,7 @@ fn mount_devices(
         crate::wl::set_compositor(&device);
         device
     });
-    (virgl, wayland)
+    wayland
 }
 
 /// Mount `/proc`. Returns the source it reads from, which the `Host` holds
@@ -2553,11 +2511,8 @@ struct Host {
     /// before this did it".
     magic_head: u64,
     kernel: Kernel,
-    /// The virtio-gpu renderer, when the page brought one. Held here, not in
-    /// the kernel, because the scheduler pumps it.
-    virgl: Option<crate::virgl::VirglDevice>,
-    /// The Wayland compositor, when the page brought a canvas. Held here like
-    /// `virgl` because the scheduler pumps it once per turn.
+    /// The Wayland compositor, when the page brought a canvas. Held here, not
+    /// in the kernel, because the scheduler pumps it once per turn.
     wayland: Option<crate::wl::WaylandDevice>,
     /// The root filesystem, kept so files can be added before the guest runs.
     root: Arc<gex_kernel::vfs::TmpFs>,
@@ -3745,13 +3700,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // The graphics device, when the page said it has a canvas to draw on.
     // Absent otherwise, so a guest sees a machine with no GL rather than one
     // whose drawing vanishes.
-    let (virgl, wayland) = mount_devices(&mut kernel);
-    // Also a node in the filesystem, for a guest that looks (`test -e`, the
-    // gears script) before it connects. Through the mount, not into `root`:
-    // with a global kernel `root` is an unmounted `TmpFs` nothing can see.
-    if virgl.is_some() {
-        let _ = kernel.vfs.mksocket(crate::virgl::DEFAULT_SOCKET);
-    }
+    let wayland = mount_devices(&mut kernel);
     // `/tmp` in the root, not a mount of its own, so a page may bundle a file
     // at any path: a mount would shadow a bundled `/tmp/x`.
     root.add_dir("/tmp");
@@ -3926,7 +3875,6 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     set_host(Host {
         magic_head: HOST_MAGIC,
             kernel,
-            virgl,
             wayland,
             root,
             proc_state,
@@ -7330,7 +7278,7 @@ pub extern "C" fn gex_adopt_child(
     }
     // And the per-process mounts that are not files: without them a child has
     // no `/dev/null` to redirect into and no `/proc/self/maps` for libc.
-    let (virgl, wayland) = mount_devices(&mut kernel);
+    let wayland = mount_devices(&mut kernel);
     let proc_state = mount_procfs(&mut kernel);
     // The parent's working directory, now that the root is mounted so `set_cwd`
     // can confirm the target exists; else the child resolves relative paths
@@ -7368,7 +7316,6 @@ pub extern "C" fn gex_adopt_child(
     set_host(Host {
         magic_head: HOST_MAGIC,
         kernel,
-        virgl,
         wayland,
         root: Arc::new(gex_kernel::vfs::TmpFs::new()),
         proc_state,
@@ -9073,14 +9020,11 @@ fn schedule() -> i32 {
         }
     }
     loop {
-        // Before anything is chosen: a vtest client writes a request then
-        // blocks on the reply, so the renderer must run in between -- here, the
-        // one place every thread passes through on its way to waiting.
-        with_host(|h| h.virgl.clone()).map(|v| v.pump());
-        // The compositor, on the same terms and in the same place: a wayland
-        // client writes a request then blocks on the reply, so it must run
-        // here. Needs the kernel (to find a buffer's shared mapping) and guest
-        // memory (the pixels), so it pumps inside `with_host`; the device is a
+        // Before anything is chosen, the compositor: a wayland client writes
+        // a request then blocks on the reply, so it must run here, the one
+        // place every thread passes through on its way to waiting. Needs the
+        // kernel (to find a buffer's shared mapping) and guest memory (the
+        // pixels), so it pumps inside `with_host`; the device is a
         // cheap Arc clone that aliases none of the host's mutable state.
         with_host(|h| {
             if let Some(w) = h.wayland.clone() {

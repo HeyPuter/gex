@@ -3,14 +3,11 @@
 #
 #   web/build-graphics-rootfs.sh [out.tar] [source-rootfs]
 #
-# Debian's own aarch64 binaries: `glxgears` and `Xvfb` as shipped, against
-# Debian's own Mesa. Nothing here is built for the occasion, and nothing is
-# patched -- the guest runs a real graphics driver and a real X server, and
-# the only thing that is not Debian's is what sits on the far side of the
-# vtest socket.
+# Debian's own aarch64 binaries, as shipped. Nothing here is built for the
+# occasion, and nothing is patched.
 #
 # The source tree is the one `web/build-session-tree.sh` builds and
-# `tests/opengl-in-guest.sh` uses: a Debian with the session's programs
+# a Debian with the session's programs
 # unpacked into it. What comes across is that tree less its documentation, its
 # translations and what only a compiler reads -- so the image is a Debian
 # userspace, with `ls`, `bash`, `dpkg` and `apt` in it, and a session can add
@@ -28,7 +25,7 @@
 # wants, and the 22 MB of libz3 behind that. All of it is gone, because the
 # guest no longer has a graphics driver at all -- its `libGL`/`libEGL` are
 # marshallers, and the Mesa that runs is a wasm one in the page's compositor
-# worker (see `web/build-mesa-virgl-wasm.sh`).
+# worker (see `web/build-mesa-wasm.sh`).
 #
 # `Xwayland` is gone for the same reason: the X server is in the page too.
 # What stays is the X *clients* and their libraries, which is what a session
@@ -573,8 +570,8 @@ SHELL
 chmod 755 "$R/usr/bin/shell.sh"
 
 # glmark2's benchmark data: the 3D models, the GLSL shaders, and the textures
-# its scenes load. A real GL workload -- shaders, VBOs, framebuffers -- to
-# push virglrenderer well past spinning gears.
+# its scenes load. A real GL workload -- shaders, VBOs, framebuffers -- well
+# past spinning gears.
 [ -d "$SRC/usr/share/glmark2" ] && { mkdir -p "$R/usr/share"; cp -r "$SRC/usr/share/glmark2" "$R/usr/share/glmark2"; }
 
 # GLVND's EGL vendor config: Debian's libEGL.so.1 is the vendor-neutral
@@ -718,82 +715,13 @@ cat > "$R/etc/group" <<'EOF'
 root:x:0:
 EOF
 
-# The script the demo runs, kept in the image so what the page does is
-# readable from the tar rather than only from the JavaScript.
-cat > "$R/gears.sh" <<'EOF'
-export DISPLAY=:0
-export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu
-# Before the X server, not after it.
-#
-# virpipe is Mesa's own name for virgl over a vtest socket, and it is the only
-# thing this guest is ever told about its GPU. It used to be exported further
-# down, just before the client -- which left *Xvfb* to pick a driver for its
-# own GLX, and it picked llvmpipe. The heartbeat caught it: at six and ten
-# seconds the guest was executing at 0x6501bd00 and 0x668fbbfc, deep in the
-# 106 MB of libLLVM, before the X socket had even appeared.
-#
-# Nothing in this demo wants a software rasteriser. The renderer is on the
-# other side of the socket.
-export GALLIUM_DRIVER=virpipe
-# Mesa's on-disk shader cache runs on its own thread. Under the worker-per-thread
-# model that thread is a second Web Worker, and its handshake with the main one
-# rides a cross-worker futex wake that the browser scheduler can drop -- the
-# process then deadlocks in futex after the fbconfig probe, before it ever opens
-# the rendering connection (glxgears/es2gears both hung here). No cache, no
-# thread, no lost wake.
-export MESA_SHADER_CACHE_DISABLE=true
-export MESA_GLSL_CACHE_DISABLE=1
-# Every step says so. In a page this is the only channel there is, and a run
-# that is merely slow looks exactly like one that is stuck without it -- the
-# first browser attempt at this printed nothing for half an hour and the
-# question "where is it" had no answer at all.
-echo "gex: starting the X server"
-# The screen size is a variable so that a run can ask the question "is the
-# frame rate bound by pixels or by calls?" without rebuilding this image.
-# glxgears with no geometry fills the screen, so this is the window too.
-Xvfb :0 -screen 0 "${GEARS_SIZE:-300x300}x24" -nolisten tcp &
-i=0
-while [ ! -e /tmp/.X11-unix/X0 ]; do
-  i=$((i + 1))
-  [ "$i" -gt 600 ] && { echo "gex: no X socket after $i tries"; exit 1; }
-  sleep 1
-done
-echo "gex: X server up after $i seconds"
-if [ -e /tmp/.virgl_test ]; then
-  echo "gex: the renderer is listening"
-else
-  echo "gex: no /tmp/.virgl_test -- Mesa will connect to nothing and wait"
-fi
-echo "gex: loading Mesa and drawing"
-# Unbounded unless asked otherwise, and whoever started it decides when to
-# stop -- a page closes the tab, a harness gives up. glxgears reports its
-# frame rate every five seconds, which is the signal either of them wants.
-#
-# `timeout` used to bound this and was removed: it forks the program and
-# waits, and `wait` came back ECHILD in a browser, so the run ended with
-# `timeout: error waiting for command: No child processes` and nothing to say
-# whether the gears had drawn. That is a real defect with its own task, but it
-# is not this demo's, and having it in the way made every run ambiguous.
-if [ -n "${GEARS_SECONDS:-}" ] && [ "${GEARS_SECONDS}" != "0" ]; then
-  timeout "$GEARS_SECONDS" glxgears.aarch64-linux-gnu
-  s=$?
-  # 124 is `timeout` saying it stopped the program, which for a run given a
-  # budget is how it is *supposed* to end. It used to be `exec`ed and passed
-  # straight out, so a demo that drew for ninety seconds at thirty frames a
-  # second reported "exit 124" and coloured itself a failure.
-  [ "$s" = 124 ] && s=0
-  exit "$s"
-fi
-exec glxgears.aarch64-linux-gnu
-EOF
-chmod +x "$R/gears.sh"
 
 mkdir -p "$(dirname "$OUT")"
 # The scripts baked into the image name the multiarch directory and the
 # mesa-utils program suffix as the arm64 image spells them; for the x86-64
 # image, say the x86-64 names.
 if [ "$MA" != "aarch64-linux-gnu" ]; then
-    for f in "$R/gears.sh" "$R/session.sh" "$R/tk-demo.tcl" "$R/root/.twmrc"; do
+    for f in "$R/session.sh" "$R/tk-demo.tcl" "$R/root/.twmrc"; do
         [ -f "$f" ] && sed -i "s/aarch64-linux-gnu/$MA/g" "$f"
     done
 fi
@@ -808,8 +736,7 @@ echo "  $OUT: $(du -h "$OUT" | cut -f1)"
 #
 # libLLVM is 107 MB of that, and the temptation is to stub it for this image --
 # nothing in the session should enter llvmpipe, since Xwayland's glamor finds
-# no GPU and falls back to its own software blitting while the GL clients render
-# through Mesa's virgl driver. It does not work, and it fails quietly: with a
+# no GPU and falls back to its own software blitting. It does not work, and it fails quietly: with a
 # stub of `brk #0` in its place Xwayland initialises every extension, GLX
 # included, says it is ready, and then never answers a client. Its X clients and
 # the compositor's own window manager both sit in `connect` forever. Something

@@ -31,7 +31,7 @@ BASE="apt dash bash coreutils dpkg findutils grep sed tar gzip diffutils
 # not decoration -- KF5 asks for a session bus before it draws anything.
 # No `xwayland`: the X server is the one in the page now (see
 # `web/build-xwayland-wasm.sh`), cross-built to wasm rather than run as a
-# guest program. `xvfb` stays because the older virgl demos still start one.
+# guest program. `xvfb` stays because the graphics-in-browser test starts one.
 APPS="xvfb x11-apps xterm twm tk8.6
       mesa-utils glmark2-x11 gtk-3-examples
       kcalc dolphin qt6ct compton-conf explosive-c4

@@ -166,8 +166,6 @@ export class MesaGlDevice {
   #device = null;
   #module = null;
   #submit = null;
-  /** The virglrenderer this Mesa encodes for, when that is the backend. */
-  #renderer = null;
   #failed = null;
   /** Batches this device refused, and the last of them: a client's own
    *  problem, kept where a page can see it. */
@@ -188,88 +186,6 @@ export class MesaGlDevice {
   static #reported = false;
 
   /**
-   * The same Mesa, on the driver that has always drawn these pixels.
-   *
-   * Gallium's virgl encoder speaks the vtest protocol to virglrenderer, which
-   * here is a module in this same context rather than a process across a
-   * socket: `Module.gexVirgl` is what the winsys's redirected `socket`,
-   * `read` and `write` end up calling (see the Mesa fork's `gex_vtest_os.c`).
-   * The renderer owns the canvas and blits what it last drew onto it, so this
-   * backend never presents anything itself.
-   */
-  static async #onVirgl(canvas, { url, api, major, minor, preserve }) {
-    const out = new MesaGlDevice();
-    try {
-      const { VirglRenderer } = await import('./virgl.js');
-      // In this context on purpose: the winsys calls across synchronously,
-      // from inside a wasm frame, with nothing to await on.
-      const renderer = await VirglRenderer.create(canvas, '/gex/gexvirgl.mjs', null,
-                                                  { inProcess: true, preserve });
-      // Frames are asked for rather than noticed: this Mesa is on this side
-      // of the transport and knows when a frame is finished and whose it is.
-      renderer.presentDirect?.(true);
-      if (!renderer.ok) throw new Error(renderer.describe?.() || 'the renderer would not start');
-      out.#renderer = renderer;
-
-      const Module = await loadGlue(url);
-      out.#module = await Module({
-        mainScriptUrlOrBlob: new URL(url, location.href).href,
-        locateFile: (file) => new URL(file, new URL(url, location.href)).href,
-        print: (line) => console.log('[mesa-virgl]', line),
-        printErr: (line) => console.warn('[mesa-virgl]', line),
-      });
-      // Before `init`, which is what opens the connection.
-      // `?gltrace=1` narrates the vtest exchange. A stream protocol that
-      // stops says nothing on its own: the last command written and whether
-      // a reply followed is the whole diagnosis.
-      const trace = new URLSearchParams(location.search).get('gltrace') === '1';
-      const head = (b) => (b.length >= 8
-        ? `len=${new DataView(b.buffer, b.byteOffset).getUint32(0, true)} ` +
-          `cmd=${new DataView(b.buffer, b.byteOffset).getUint32(4, true)}`
-        : `${b.length} bytes`);
-      out.#module.gexVirgl = {
-        open: () => {
-          const s = renderer.openSession();
-          if (trace) console.log('[vtest] open ->', s);
-          return s;
-        },
-        write: (session, bytes) => {
-          const n = renderer.feed(session, bytes);
-          if (trace) console.log('[vtest] write', bytes.length, head(bytes), '->', n,
-                                 'pending', renderer.pending(session));
-          return n;
-        },
-        read: (session, out8) => {
-          const n = renderer.drainInto(session, out8);
-          if (trace) console.log('[vtest] read want', out8.length, '->', n);
-          return n;
-        },
-        close: (session) => renderer.close(session),
-        // Which window the frame about to be flushed belongs to. Said by the
-        // decoder, one module over, because only it knows -- and needed by
-        // the renderer, which keeps a frame per window.
-        surface: (uid) => renderer.presentSurface(uid),
-        // And that this surface's frame is finished: the renderer takes its
-        // copy then and only then, from the framebuffer that is still bound.
-        snapshot: (uid, resource) => renderer.snapshotSurface(uid, resource),
-      };
-      // No JSPI here: virglrenderer runs the commands before `feed` returns,
-      // so a submit is an ordinary call.
-      out.#submit = (ptr, len, client) =>
-        out.#module._gex_gl_submit(ptr, len, client >>> 0);
-      if (out.#module._gex_gl_set_api)
-        out.#module._gex_gl_set_api(api === 'core' ? 1 : 0, major, minor);
-      const rc = out.#module._gex_gl_init(canvas.width, canvas.height);
-      if (rc !== 0) out.#failed = `Mesa/virgl initialization failed (${rc})`;
-      out.#description = `Mesa st/mesa + virgl on virglrenderer (${api})`;
-      out.capture = captureIfRequested(PROTOCOL_VERSION, canvas.width, canvas.height);
-    } catch (e) {
-      out.#failed = e?.message || String(e);
-    }
-    return out;
-  }
-
-  /**
    * `api` is 'es' or 'core'; `major`/`minor` ask st/mesa for a version, with
    * zero meaning the backend's default. The driver's caps decide what it can
    * actually give, so asking for more than they support fails context
@@ -280,16 +196,8 @@ export class MesaGlDevice {
       api = 'es',
       major = 0,
       minor = 0,
-      // The backend is the choice; the module follows from it. Naming the
-      // module still works and still decides the backend when it is all a
-      // caller passes, but asking for a backend and getting the other one's
-      // module -- which is what a url-shaped default did -- cannot happen.
-      backend = (options.url || '').includes('virgl') ? 'virgl' : 'wgpu',
-      url = backend === 'virgl' ? '/gex/gex-virgl-replay.js' : '/gex/gex-wgpu-replay.js',
+      url = '/gex/gex-wgpu-replay.js',
     } = options;
-    if (backend === 'virgl') {
-      return MesaGlDevice.#onVirgl(canvas, { url, api, major, minor, preserve: options.preserve });
-    }
     const out = new MesaGlDevice();
     canvas.id = 'gex-gl';
     try {
@@ -539,11 +447,6 @@ export class MesaGlDevice {
       : done(result);
   }
 
-  /** The renderer this device encodes for, when the backend is virgl. */
-  get renderer() {
-    return this.#renderer;
-  }
-
   /** What the guest says its frames belong to: see `op::SURFACE_ATTACH`.
    *
    * `kind` 0 is a Wayland surface named with the process that published it,
@@ -604,13 +507,6 @@ export class MesaGlDevice {
   forgetClient(client) {
     const m = this.#module;
     if (!m?._gex_gl_forget_client || !client) return;
-    // The frames first: after the client is gone its surfaces are no longer
-    // enumerable, so this is the last chance to know which they were.
-    if (this.#renderer) {
-      for (const s of this.surfaces()) {
-        if (s.client === client && s.frame) this.#renderer.forgetSurface(s.frame);
-      }
-    }
     m._gex_gl_forget_client(client >>> 0);
   }
 

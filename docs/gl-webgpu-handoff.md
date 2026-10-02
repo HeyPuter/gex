@@ -1,15 +1,11 @@
 # GL-to-WebGPU handoff
 
-> **Mesa is the only browser GL backend**: st/mesa below gex's wire decoder,
-> on the `gex_wgpu` Gallium driver or on virgl. An earlier backend, a fork of
-> MobileGL (an OpenGL implementation on WebGPU), has been removed from the
-> tree. It never rendered SuperTuxKart, and the comparisons this log once drew
-> against it have been taken out.
->
-> **The only backend known to render STK correctly is virgl**
-> (`GALLIUM_DRIVER=virpipe` -> virglrenderer; the `virgl` / `wayland` demos).
-> When you need a known-good frame, or need to establish whether the
-> application itself reaches some state, use virgl.
+> **Mesa on `gex_wgpu` is the only browser GL backend**: st/mesa below gex's
+> wire decoder, built from mesa-wink's `wink` branch. Two earlier backends have
+> been removed from the tree: a fork of MobileGL (an OpenGL implementation on
+> WebGPU), and virgl (Mesa's virgl driver decoded by virglrenderer on WebGL,
+> removed 2026-10-02 once wink had surpassed it). Mentions of virgl below are
+> history; don't use it as a reference.
 
 Workspace: `/home/velzie/src/gex2`
 

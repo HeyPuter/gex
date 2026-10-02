@@ -803,8 +803,8 @@ native time; `work/s12/noita-menu-browser.png`.
 The GL host is `web/public/gex/gex-wgpu-replay.{js,wasm}`, Mesa's gex_wgpu
 driver built from the fork's `wink` branch:
 - Mesa: `third_party/mesa` at c6a33e6fbd8097432851ed2e938ad03e0895c5b0
-  (mesa-wink `refs/heads/wink`; the superproject's pointer still names
-  gex-virgl 4eeb32a, and is not bumped).
+  (mesa-wink `refs/heads/wink`). The superproject now tracks wink, at
+  9016782 with S12's two gex_wgpu patches (228b0745).
 - Build: `GEX_MESA_WINK_CACHE=<dir> JOBS=4 taskset -c 0-2,6-8 nice -n 10
   web/build-mesa-wasm.sh <out>`, emsdk 6.0.1 (`/usr/lib/emsdk`), the
   default emdawnwebgpu (v20250428.134257). When the Mesa checkout has

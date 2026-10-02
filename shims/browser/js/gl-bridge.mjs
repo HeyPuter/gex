@@ -1,7 +1,7 @@
 // The guest's GL device, reached from a Worker. The WebGL `GlDevice`
 // (web/src/gl.js) is on the page -- it owns the canvas -- while the drawing
 // guest is a Worker. `gl_submit` is a wasm import called synchronously from
-// inside an ioctl, so -- exactly as `virgl-bridge.mjs` does for virgl -- the
+// inside an ioctl, so the
 // call crosses a `SharedArrayBuffer` with `Atomics.wait`: the Worker copies its
 // command ring in, wakes the page, and blocks; the page runs `GlDevice.submit`
 // on the shared copy, writes the reply back into it, and wakes the Worker.
@@ -9,9 +9,6 @@
 // Copying just the ring (not the whole guest memory) is enough because the ring
 // is self-contained: `guest/gl/gexgl.c` writes every command's data inline with
 // `put_blob`, so the page never needs to follow a guest pointer.
-//
-// This mirrors virgl-bridge; the only reason gl needs its own is that
-// `GlDevice.submit` reads a `{buffer}` and a ring offset, not a vtest stream.
 
 const STATE = 0; // 0 idle, 1 request, 2 reply
 const RESULT = 1;

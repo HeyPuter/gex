@@ -17,7 +17,6 @@ pub mod gl;
 pub mod profile;
 pub mod nt;
 pub mod nt_cgen;
-pub mod virgl;
 pub mod wayland;
 
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};
@@ -104,9 +103,6 @@ pub struct RunOptions {
     /// Run a Wayland compositor and bind it at this path in the guest, so a
     /// guest client can put a window on the screen. See `wayland`.
     pub wayland: Option<String>,
-    /// Serve a virtio-gpu renderer on this socket name, so the guest's own
-    /// Mesa can render on the host's GPU. See `virgl`.
-    pub virgl: Option<String>,
     /// What size to tell a toplevel it is.
     pub wayland_size: (i32, i32),
     /// Where to write each committed frame, as a PPM. A window would be
@@ -156,12 +152,6 @@ impl Default for RunOptions {
             pins: std::collections::HashMap::new(),
             report_pins: false,
             wayland: None,
-            // On unless the build cannot render. Costs nothing until a client
-            // connects (the renderer is brought up lazily). On by default
-            // because Mesa's vtest winsys hangs forever in `read` when the
-            // socket is missing rather than failing.
-            virgl: virgl::VirglDevice::available()
-                .then(|| virgl::DEFAULT_SOCKET.to_string()),
             wayland_size: (640, 480),
             wayland_out: None,
             wayland_gpu: false,
@@ -199,7 +189,6 @@ struct HostState {
     sampler: Option<Arc<Sampler>>,
     /// The compositor, when the guest was given one.
     wayland: Option<wayland::Wayland>,
-    virgl: Option<virgl::VirglDevice>,
     /// Everything needed to translate and install code at run time.
     jit: Option<Jit>,
     /// Everything a new guest thread needs to build a store of its own.
@@ -269,7 +258,6 @@ struct SpawnContext {
     /// Inherited the same way, so a client that a shell forked reaches the
     /// same compositor its parent could.
     wayland: Option<wayland::Wayland>,
-    virgl: Option<virgl::VirglDevice>,
     jit_shared: Option<Arc<Mutex<JitShared>>>,
     limits: gex_xlate::BlockLimits,
     /// Where this process's objects are, for naming profile counts.
@@ -592,7 +580,6 @@ struct Inherited {
     kernel: Kernel,
     proc_state: Arc<Mutex<ProcState>>,
     wayland: Option<wayland::Wayland>,
-    virgl: Option<virgl::VirglDevice>,
 }
 
 fn run_program_with(
@@ -783,10 +770,7 @@ fn run_program_with(
     let fresh = inherited.is_none();
     // Taken before the kernel is moved out, because the setup below uses them
     // to decide whether to build a device or keep the one already bound.
-    let (kept_wayland, kept_virgl) = match &inherited {
-        Some(i) => (i.wayland.clone(), i.virgl.clone()),
-        None => (None, None),
-    };
+    let kept_wayland = inherited.as_ref().and_then(|i| i.wayland.clone());
     let (kernel, proc_state) = match inherited {
         Some(Inherited {
             kernel: mut k,
@@ -875,21 +859,6 @@ fn run_program_with(
             .bind_host(path, Arc::new(w.clone()) as Arc<dyn gex_kernel::unix::HostListener>);
         w
     }));
-    // The same shape, and bound just as early: Mesa connects while it is
-    // still working out which driver it has, long before the first draw.
-    let renderer = kept_virgl.or_else(|| opts.virgl.as_ref().map(|path| {
-        if !virgl::VirglDevice::available() {
-            eprintln!(
-                "gex: this build has no libvirglrenderer, so {path} will accept \
-                 connections and answer nothing"
-            );
-        }
-        let v = virgl::VirglDevice::new(opts.verbose);
-        kernel
-            .socket_names
-            .bind_host(path, Arc::new(v.clone()) as Arc<dyn gex_kernel::unix::HostListener>);
-        v
-    }));
     let tid = kernel.pid;
     let prof_proc = profile::new_process(&kernel, program, kernel.pid, &opts.args, &opts.env);
 
@@ -904,7 +873,6 @@ fn run_program_with(
             resume_at: None,
             sampler: sampler.clone(),
             wayland: compositor.clone(),
-        virgl: renderer.clone(),
             jit: None,
             spawn: None,
             pending_spawn: None,
@@ -1048,7 +1016,6 @@ fn run_program_with(
         jit_cache: jit_cache.clone(),
         sampler: sampler.clone(),
         wayland: compositor.clone(),
-        virgl: renderer.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: engine.clone(),
@@ -1106,7 +1073,6 @@ fn run_program_with(
             kernel,
             Arc::clone(&spawn.proc_state),
             spawn.wayland.clone(),
-            spawn.virgl.clone(),
         );
     }
     let Stopped::Exited(exit) = stopped else {
@@ -1631,7 +1597,6 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         // most of its time in programs it started.
         sampler: cx.sampler.clone(),
         wayland: cx.wayland.clone(),
-        virgl: cx.virgl.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         engine: cx.engine.clone(),
@@ -1717,7 +1682,6 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_at: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
-            virgl: cx.virgl.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
@@ -1785,7 +1749,6 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
                 kernel,
                 Arc::clone(&cx.proc_state),
                 cx.wayland.clone(),
-                cx.virgl.clone(),
             )
             .map(|(exit, _)| exit)
         }
@@ -1808,7 +1771,6 @@ fn exec_program(
     mut kernel: Kernel,
     proc_state: Arc<Mutex<ProcState>>,
     wayland: Option<wayland::Wayland>,
-    virgl: Option<virgl::VirglDevice>,
 ) -> Result<(Exit, Stats)> {
     // The file comes from the guest's namespace, not the host's, so a sysroot
     // is honoured and `/bin/sh` means the guest's.
@@ -1848,7 +1810,6 @@ fn exec_program(
             kernel,
             proc_state,
             wayland,
-            virgl,
         }),
         None,
     )
@@ -1867,7 +1828,6 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             resume_at: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
-            virgl: cx.virgl.clone(),
             jit: None,
             spawn: Some(Arc::clone(&cx)),
             pending_spawn: None,
@@ -2666,7 +2626,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // then finished under the lock again.
             let outcome = if let SyscallOutcome::Blocking(op) = outcome {
                 let compositor = caller.data().wayland.clone();
-                let renderer = caller.data().virgl.clone();
                 let kernel_for_service = Arc::clone(&caller.data().kernel);
                 let service = move |bytes: &mut [u8]| {
                     if let Some(w) = &compositor {
@@ -2675,11 +2634,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             .unwrap_or_else(|e| e.into_inner());
                         let gm = GuestMem::new(bytes);
                         w.pump(&k, &gm);
-                    }
-                    // The renderer needs neither the kernel nor guest memory:
-                    // at this protocol version every payload is in the stream.
-                    if let Some(v) = &renderer {
-                        v.pump();
                     }
                 };
                 // Timers are checked here rather than only at syscall entry:
@@ -2710,9 +2664,6 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let k = kernel.lock().unwrap_or_else(|e| e.into_inner());
                 let gm = GuestMem::new(memory.bytes());
                 w.pump(&k, &gm);
-            }
-            if let Some(v) = caller.data().virgl.clone() {
-                v.pump();
             }
             // Code that has gone away, retired before the newly mapped code
             // below: a `dlclose`+`dlopen` reuses addresses, and retiring after

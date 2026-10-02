@@ -20,9 +20,7 @@ GEX_SERVE_PORT=${GEX_SERVE_PORT:-8091} \
 # running the previous build with no sign that it did -- a whole run's worth of
 # diagnostics then describes code that is no longer in the tree. Copy into both
 # web/public/gex and web/dist/gex.
-#
-# The only working reference renderer for STK is virgl
-# (tests/graphics-in-browser.sh and the virgl/wayland demos).
+
 node "$ROOT/web/test/drive.mjs" supertuxkart \
     --query "gl=${GEX_STK_GL:-mesa}" --cmd "$STK_RACE" \
     --display-fps 55 --display-samples 15 --wall 90 --idle 90 | tee "$LOG"

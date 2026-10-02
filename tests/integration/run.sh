@@ -73,39 +73,6 @@ compare() {
 # can only re-exec *itself* for the program it was given, so a guest that execs
 # another aarch64 binary fails under QEMU and works under gex. The expectation
 # is therefore written down, and derived from what Linux does.
-# A host device has to survive an `execve`.
-#
-# The compositor and the virtio-gpu renderer each bind a name in the guest's
-# socket namespace, and `execve` re-enters the function that created them.
-# Building a second one rebinds the name: a client that connects afterwards is
-# accepted by the new device while the process that would service it holds the
-# old, and the guest waits forever for a reply nobody will write. A shell's
-# fork-then-exec hits it every time.
-#
-# QEMU is no oracle -- there is no renderer behind it -- so what is checked is
-# that both the parent and the program it exec'd got an answer.
-virgl_exec() {
-    label="$1"; prog="$2"
-    out="$WORK/$label"
-    if ! "$GEXC" run --virgl /tmp/.gex-test-virgl "$prog" >"$out.stdout" 2>"$out.stderr"; then
-        echo "skip $label: no host renderer"
-        return
-    fi
-    if grep -q "no host renderer" "$out.stderr"; then
-        echo "skip $label: no host renderer"
-        return
-    fi
-    if grep -q "^parent: read 8" "$out.stdout" &&
-        grep -q "^exec.d child: read 8" "$out.stdout"; then
-        echo "ok   $label"
-        pass=$((pass + 1))
-    else
-        echo "FAIL $label: a client was accepted but never serviced"
-        sed 's/^/     /' "$out.stdout"
-        fail=$((fail + 1))
-    fi
-}
-
 # Run a Wayland client against gex's own compositor and check the pixels.
 #
 # QEMU is no oracle here: there is no compositor on the other side of it, so
@@ -544,7 +511,6 @@ echo "building guest programs..."
 "$CC" -O3 -static -o "$WORK/neon-mul-rbit" "$HERE/programs/neon-mul-rbit.c"
 "$CC" -O2 -static -o "$WORK/fp-literal" "$HERE/programs/fp-literal.c"
 "$CC" -O2 -static -o "$WORK/unixsock-visible" "$HERE/programs/unixsock-visible.c"
-"$CC" -O2 -static -o "$WORK/virgl-exec" "$HERE/programs/virgl-exec.c"
 "$CC" -O2 -static -o "$WORK/iov-partial" "$HERE/programs/iov-partial.c"
 "$CC" -O2 -static -o "$WORK/signal-kill" "$HERE/programs/signal-kill.c"
 "$CC" -O2 -static -o "$WORK/signal-alarm" "$HERE/programs/signal-alarm.c"
@@ -568,7 +534,6 @@ echo "building guest programs..."
 "$CC" -static -no-pie -O2 -o "$WORK/brk-zero" "$HERE/programs/brk-zero.c"
 "$CC" -static -O2 -o "$WORK/selfmod" "$HERE/programs/selfmod.c"
 "$CC" -static -O2 -o "$WORK/fma" "$HERE/programs/fma.c"
-"$CC" -static -O2 -o "$WORK/virgl-handshake" "$HERE/programs/virgl-handshake.c"
 "$CC" -static -no-pie -O2 -o "$WORK/init" "$HERE/programs/init.c"
 "$CC" -static -no-pie -O2 -pthread -o "$WORK/forkthread" "$HERE/programs/forkthread.c"
 # C++ pulls in the scalar AdvSIMD group, and its exception unwinder walks
@@ -959,7 +924,6 @@ compare "fma" "$WORK/fma"
 compare "signal-kill" "$WORK/signal-kill"
 compare "signal-alarm" "$WORK/signal-alarm"
 compare "signal-sigchld" "$WORK/signal-sigchld"
-virgl_exec "virgl-exec" "$WORK/virgl-exec"
 compare "nojit-vector" "$WORK/vector"
 compare "nojit-neon-structure" "$WORK/neon2"
 compare "nojit-cross-block-flags" "$WORK/flags"
@@ -1040,79 +1004,6 @@ fi
 # for `rt_sigsuspend`, the native shim learned it, and the browser shim was
 # left with two non-exhaustive matches for however long it took someone to
 # rebuild the page.
-# The vtest handshake, over the socket the guest's Mesa would use. QEMU is no
-# oracle -- it has no renderer behind that socket -- and the capability set
-# differs by host, so what is checked is that the answer arrives whole: the
-# size is announced and then that many bytes follow. The size itself is
-# printed, because it is the one number that says which renderer answered.
-if out=$("$GEXC" run "$WORK/virgl-handshake" 2>&1); then
-    echo "$out" | sed -n 's/^capset reply/     capset reply/p'
-    if echo "$out" | grep -q "^capset read whole$"; then
-        echo "ok   virgl-handshake"
-        pass=$((pass + 1))
-    else
-        echo "FAIL virgl-handshake: the capability set did not arrive whole"
-        echo "$out" | sed 's/^/     /' | head -6
-        fail=$((fail + 1))
-    fi
-else
-    echo "skip virgl-handshake: no renderer in this build"
-fi
-
-# The same handshake, but in a browser: the guest running as translated wasm
-# in headless Chromium, talking to virglrenderer on a WebGL 2 context. This is
-# the only test of the browser renderer that can mean anything -- a recorded
-# stream carries the capability set the *recording* host gave, and no
-# recording made against a desktop-GL or GLES host is a valid input to a
-# WebGL 2 one. The guest has to ask for itself, and the number it gets back
-# differs from the native one, which is how you know it did.
-if [ -n "$NODE" ] && [ -f "$WORK/virgl-handshake" ]; then
-    "$GEXC" build --no-shared-memory "$WORK/virgl-handshake" \
-        -o "$WORK/virgl-handshake.wasm" >/dev/null 2>&1
-    cp "$WORK/virgl-handshake" "$WORK/virgl-handshake.wasm.elf"
-    if out=$(GEX_VIRGL_GUEST="$WORK/virgl-handshake.wasm" \
-             "$NODE" "$HERE/../../web/test/virgl-guest.mjs" 2>&1); then
-        echo "$out" | grep -E "^(ok|skip)" || true
-        echo "$out" | sed -n 's/^     capset reply/     capset reply/p'
-        echo "$out" | grep -q "^ok" && pass=$((pass + 1))
-    else
-        echo "$out" | sed 's/^/     /' | head -8
-        fail=$((fail + 1))
-    fi
-fi
-
-# virglrenderer, compiled to wasm, coming up on a WebGL 2 context in a real
-# browser. Not a translation test at all -- it is the other half of the
-# graphics path: the native runtime gives the guest a GPU by handing VirGL to
-# the host's libvirglrenderer, and a page has no host to hand it to, so the
-# renderer itself is what crosses. Skips without the wasm build or a browser.
-if [ -n "$NODE" ]; then
-    if out=$("$NODE" "$HERE/../../web/test/virgl-webgl.mjs" 2>&1); then
-        echo "$out" | grep -E "^(ok|skip|     )" || true
-        echo "$out" | grep -q "^ok" && pass=$((pass + 1))
-    else
-        echo "$out" | sed 's/^/     /' | head -8
-        fail=$((fail + 1))
-    fi
-else
-    echo "skip virgl-webgl: no node"
-fi
-
-# Debian's own glxinfo and glxgears, on the host's real OpenGL, through the
-# guest's own unmodified Mesa. Minutes on a cold cache -- it translates all of
-# Mesa and LLVM -- so it is opt-in with the rest of the slow ones.
-if [ "${GEX_SLOW:-0}" = "1" ]; then
-    if out=$("$HERE/../opengl-in-guest.sh" 2>&1); then
-        echo "$out" | grep -E "^(ok|skip|     )" || true
-        echo "$out" | grep -q "^ok" && pass=$((pass + 1))
-    else
-        echo "$out" | sed 's/^/     /'
-        fail=$((fail + 1))
-    fi
-else
-    echo "skip opengl-in-guest: set GEX_SLOW=1 (it takes minutes)"
-fi
-
 #
 # `cargo check`, not `cargo build`: a plain `cargo build` for wasm32 writes
 # `gex_browser.wasm` *without* the link flags in `shims/browser/build.sh`, and

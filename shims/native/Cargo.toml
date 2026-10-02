@@ -13,7 +13,6 @@ gex-emit.workspace = true
 gex-mem.workspace = true
 gex-kernel.workspace = true
 gex-wayland.workspace = true
-gex-virgl.workspace = true
 gex-gpu.workspace = true
 gex-gl = { workspace = true, features = ["host"] }
 gex-ld.workspace = true

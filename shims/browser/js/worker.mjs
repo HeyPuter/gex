@@ -382,22 +382,6 @@ async function handle(msg) {
   // Any sibling modules the host already had when this Worker started.
   for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
 
-  // The guest's GPU. The renderer is on the page, so calls cross a
-  // `SharedArrayBuffer` and block on `Atomics.wait` -- they must be synchronous
-  // (`virgl_submit` is called from inside a syscall). Before `load`: the vtest
-  // socket is bound while the namespace is built, and Mesa's winsys does not
-  // fall back when it is missing.
-  if (msg.virgl) {
-    const { VirglProxy } = await import('./virgl-bridge.mjs');
-    gex.useVirgl(
-      new VirglProxy(msg.virgl, () => {
-        // An OffscreenCanvas renderer waits on the shared control word itself;
-        // only the main-thread fallback needs a posted wake-up.
-        if (!msg.virgl.direct) port.post({ kind: 'virgl' });
-      }),
-      !!msg.virglTrace,
-    );
-  }
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a
   // SharedArrayBuffer. `useGl` sets the flag `gex_set_gl` reads at load, so it
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.

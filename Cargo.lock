@@ -616,15 +616,10 @@ dependencies = [
  "gex-key",
  "gex-ld",
  "gex-mem",
- "gex-virgl",
  "gex-wayland",
  "gex-xlate",
  "wasmtime",
 ]
-
-[[package]]
-name = "gex-virgl"
-version = "0.1.0"
 
 [[package]]
 name = "gex-wayland"

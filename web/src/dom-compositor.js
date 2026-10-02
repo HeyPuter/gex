@@ -329,9 +329,7 @@ export class DomDesktop {
     canvas.style.top = '0';
     canvas.style.left = '-99999px';
     canvas.style.pointerEvents = 'none';
-    // As large as the desktop, for two reasons: virglrenderer fixes the
-    // drawable's size when it starts, so a window bigger than this would have
-    // its frame clipped; and every window's frame is staged here, so it has
+    // As large as the desktop: every window's frame is staged here, so it has
     // to hold the biggest of them.
     canvas.width = Math.max(640, this.#mount.clientWidth || 1280);
     canvas.height = Math.max(480, this.#mount.clientHeight || 760);
@@ -340,7 +338,6 @@ export class DomDesktop {
     this.#glCanvas = canvas;
     const { MesaGlDevice } = await import('./mesa-gl.js');
     const device = await MesaGlDevice.create(canvas, {
-      backend: opts.backend || 'virgl',
       url: opts.url,
       api: opts.api || 'core',
       // This canvas is composited by the page, so keep what was presented
@@ -353,13 +350,8 @@ export class DomDesktop {
       throw new Error(device.error || 'the GL device would not start');
     }
     this.#gl = device;
-    // Presented straight onto that canvas. The scene compositor asks for the
-    // frame as a texture instead, because it has a scene to put it in; here
-    // the canvas *is* where it goes.
-    // Snapshots, not a blit: the renderer keeps a frame per window and this
-    // desktop copies each into its own window's canvas (see `#drawGl`). A
-    // blit would put whichever window presented last over the whole canvas.
-    device.renderer?.presentToCanvas(false);
+    // Presented straight onto that canvas, which `#drawGl` copies into the
+    // window's own.
     const { serveGl } = await import('@gex/gl-bridge.mjs');
     this.#glServe = serveGl(device, channel);
     this.#glServed = true;
@@ -646,7 +638,6 @@ export class DomDesktop {
    */
   #drawGl() {
     const device = this.#gl;
-    const renderer = device?.renderer;
     this.#glLooks++;
     if (!device?.ok) {
       // Once, and loudly. A device that dies after it started -- a WebGPU
@@ -662,28 +653,15 @@ export class DomDesktop {
       }
       return;
     }
-    // Which of the two backends is drawing. virglrenderer hands over a frame
-    // per surface as a texture, and this desktop asks for one window at a
-    // time; gex_wgpu presents into the canvas it was configured with, so the
-    // frame is simply *there* and the copy takes it as it is.
-    //
-    // Without this the WebGPU backend drew nothing at all: there is no
-    // renderer object on that path, and this returned before looking at a
-    // single window.
-    const staged = !renderer;
+    // gex_wgpu presents into the canvas it was configured with, so the frame
+    // is simply *there* and the copy takes it as it is.
     // Read every frame rather than when a counter says it changed. The
     // counter was an optimisation worth a handful of wasm calls per frame,
     // and it was wrong once -- a list captured while only one client had
     // attached, never refreshed, and a second GL window that was therefore
     // never drawn at all. A window that is missing is much more expensive
     // than sixteen calls.
-    const before = this.#glList;
     this.#glList = device.surfaces();
-    for (const old of before) {
-      if (!old.frame) continue;
-      if (this.#glList.some((s) => s.frame === old.frame)) continue;
-      renderer?.forgetSurface?.(old.frame);
-    }
     if (!this.#glList.length) return;
     for (const [key, win] of this.#windows) {
       const found = this.#glList.find((s) => s.id && (s.kind === 0
@@ -693,28 +671,17 @@ export class DomDesktop {
       // Its pixels are the host's from now on: nothing paints this window
       // out of the guest's memory any more. See `#update`.
       win.external = true;
-      if (staged) {
-        // The frame is already on this desktop's canvas: that is where the
-        // backend presents. One canvas, so one frame -- with several GL
-        // windows on this backend they would all show whichever presented
-        // last, which is why the other one keeps a frame per surface.
-        const serial = device.presentedCount?.() ?? 0;
-        if (this.#glShown.get(key) === serial) continue;
-        const w = this.#glCanvas.width;
-        const h = this.#glCanvas.height;
-        if (w < 2 || h < 2) continue;   // still at its placeholder size
-        this.#glShown.set(key, serial);
-        this.#glCopies++;
-        win.showGl(this.#glCanvas, w, h);
-        continue;
-      }
-      const frame = found.frame ? renderer.frameFor?.(found.frame) : null;
-      if (!frame) continue;
-      if (this.#glShown.get(key) === frame.serial) continue;
-      if (!renderer.showSurface?.(found.frame)) continue;
-      this.#glShown.set(key, frame.serial);
+      // The frame is already on this desktop's canvas: that is where the
+      // backend presents. One canvas, so one frame -- with several GL
+      // windows they would all show whichever presented last.
+      const serial = device.presentedCount?.() ?? 0;
+      if (this.#glShown.get(key) === serial) continue;
+      const w = this.#glCanvas.width;
+      const h = this.#glCanvas.height;
+      if (w < 2 || h < 2) continue;   // still at its placeholder size
+      this.#glShown.set(key, serial);
       this.#glCopies++;
-      win.showGl(this.#glCanvas, frame.w, frame.h);
+      win.showGl(this.#glCanvas, w, h);
     }
     for (const key of [...this.#glShown.keys()])
       if (!this.#windows.has(key)) this.#glShown.delete(key);

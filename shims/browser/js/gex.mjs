@@ -384,7 +384,7 @@ const TABLE_NAMES = [
 ];
 
 export class Gex {
-  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #virgl = null; #virglTrace = false; #wl = null;
+  #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
   #tick = null;
   // Translated modules this Worker has put into its own dispatch tables. Per
@@ -852,14 +852,6 @@ export class Gex {
           (this.#gl
             ? this.#gl.submit(this.#memory, ring >>> 0, this.wlToken(), true, this.#glWaitNote)
             : -1),
-        // The other GPU path: unmodified Mesa speaking VirGL over a socket,
-        // decoded by virglrenderer (a separate wasm module with its own heap,
-        // so bytes not an address -- see web/src/virgl.js). `session` says
-        // which vtest client these bytes belong to.
-        virgl_submit: (session, ptr, len) =>
-          this.#virgl
-            ? this.#virgl.submit(session >>> 0, this.#memory, ptr >>> 0, len >>> 0)
-            : -1,
         // This pump's scene: `count` surface records at `ptr` in this memory,
         // saying where each surface's pixels are rather than carrying them. The
         // compositor reads those addresses out of this same memory, so a frame
@@ -871,11 +863,6 @@ export class Gex {
         // surface the compositor's own hit test picked.
         wl_poll_input: (ptr, max) =>
           this.#wl?.pollInput(this.#memory, ptr >>> 0, max >>> 0) ?? 0,
-        virgl_take: (session, ptr, max) =>
-          this.#virgl
-            ? this.#virgl.take(session >>> 0, this.#memory, ptr >>> 0, max >>> 0)
-            : 0,
-        virgl_close: (session) => this.#virgl?.close(session >>> 0),
     };
   }
 
@@ -925,9 +912,6 @@ export class Gex {
     // Whatever `useGl` was told before the shim existed.
     this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
-    // Only when there really is one: Mesa's vtest winsys does not fall back
-    // from a socket nobody serves -- it blocks on a reply that cannot come.
-    this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
@@ -1320,7 +1304,6 @@ export class Gex {
     if (devices) {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
-      this.#shim.exports.gex_set_virgl?.(this.#virgl ? (this.#virglTrace ? 2 : 1) : 0);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
     // Narrate one page's directory writes, in every process. See #136.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
@@ -1530,7 +1513,6 @@ export class Gex {
       'k_sock_bind', 'k_sock_connect', 'k_sock_accept', 'k_sock_pending',
       'k_sock_read', 'k_sock_write', 'k_sock_readable', 'k_sock_writable',
       'k_sock_available', 'k_sock_close', 'k_sock_shutdown', 'k_sock_exists',
-      'k_virgl_take', 'k_virgl_release',
       'k_wake_seq', 'k_wake', 'k_park',
       // Which dispatch slots an identity's code is in, system-wide rather than
       // per Worker. Without a kernel these answer zero: one process has no
@@ -2296,19 +2278,6 @@ export class Gex {
    */
   wlToken() {
     return this.#shim?.exports?.gex_wl_token?.() ?? 0;
-  }
-
-  /**
-   * Give the guest a virtio-gpu renderer instead: the GPU path that needs no
-   * change to the guest (unmodified Debian Mesa, not gex's libGLESv2).
-   * `renderer` is a `VirglRenderer` from web/src/virgl.js. Must be set before
-   * `load` -- the socket is bound while the namespace is built, and Mesa's
-   * vtest winsys blocks rather than falling back when it is missing.
-   */
-  useVirgl(renderer, trace = false) {
-    this.#virgl = renderer;
-    this.#virglTrace = trace;
-    this.#shim?.exports?.gex_set_virgl?.(renderer ? (trace ? 2 : 1) : 0);
   }
 
   async run(entry, startCtx = 0x1000) {

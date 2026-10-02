@@ -21,7 +21,7 @@ fi
 OUT=${1:-$DEFAULT_OUT}
 BUILD=$OUT/build
 EMDAWN=${GEX_EMDAWN_DIR:-$($ROOT/web/fetch-emdawnwebgpu.sh)}
-TINT_OUT=${GEX_MESA_TINT:-${TMPDIR:-/tmp}/gex-virgl-wasm/mesa-tint-pthread}
+TINT_OUT=${GEX_MESA_TINT:-${TMPDIR:-/tmp}/gex-mesa-wasm/mesa-tint-pthread}
 TINT_TMP=${GEX_MESA_TINT_TMP:-${TMPDIR:-/tmp}/gex-mesa-tint-build}
 
 command -v meson >/dev/null 2>&1 || { echo "need meson" >&2; exit 1; }

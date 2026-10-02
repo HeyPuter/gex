@@ -54,26 +54,10 @@ else
     skip "no Emscripten for the X server"
 fi
 
-# 2. virglrenderer: the decoder for the virgl backend, and the frame store the
-#    compositors draw from.
-say "virglrenderer"
-if command -v emcc >/dev/null 2>&1; then
-    "$HERE/build-virgl-wasm.sh" || skip "build-virgl-wasm.sh failed"
-else
-    skip "no Emscripten for virglrenderer"
-fi
+# 2. Mesa for wasm, the command decoder (gex-wgpu-replay), is built by
+#    build-mesa-wasm.sh, which needs Tint and emdawnwebgpu.
 
-# 3. Mesa for wasm: the command decoder itself. `gex-virgl-replay` always,
-#    `gex-wgpu-replay` when that tree has been configured for WebGPU (see
-#    build-mesa-wasm.sh, which needs Tint and emdawnwebgpu).
-say "Mesa (the decoder), for both backends this tree has"
-if command -v meson >/dev/null 2>&1 && command -v emcc >/dev/null 2>&1; then
-    "$HERE/build-mesa-virgl-wasm.sh" || skip "build-mesa-virgl-wasm.sh failed"
-else
-    skip "no meson or Emscripten for Mesa"
-fi
-
-# 4. The guest's own GL libraries. These are *committed*, so a checkout
+# 3. The guest's own GL libraries. These are *committed*, so a checkout
 #    already has ones that match the tree; they are rebuilt here only because
 #    a protocol change touches both halves, and a tree with local changes to
 #    the marshaller would otherwise ship the old ones. Failing to build them

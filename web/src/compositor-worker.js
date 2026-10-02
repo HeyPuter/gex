@@ -10,10 +10,8 @@
 //
 // What does NOT happen here is a copy of a frame. A `wl_shm` buffer is guest
 // memory, the guest's memory is a SharedArrayBuffer, and `texSubImage2D` reads
-// it in place. An OpenGL client's pixels take one more step than a software
-// one's -- Mesa renders through virgl in the renderer worker and reads the
-// result back into its shm buffer, because vtest has no way to hand a texture
-// over -- but nothing is copied on this side of the guest either way.
+// it in place. An OpenGL client's frame comes from Mesa in this worker (see
+// startGl).
 
 import {
   readScene,
@@ -108,9 +106,9 @@ function compile(gl, type, src) {
 class Painter {
   constructor(gl) {
     this.gl = gl;
-    /** Whether another renderer draws in this context (virgl's GL, which
-     *  `startGl` puts on the compositor's own canvas): then `begin` saves its
-     *  state and `end` puts it back. */
+    /** Whether another renderer draws in this context: then `begin` saves
+     *  its state and `end` puts it back. Nothing does today -- Mesa on
+     *  WebGPU presents into a canvas of its own. */
     this.shared = false;
     const prog = gl.createProgram();
     gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
@@ -154,8 +152,8 @@ class Painter {
       this.saved = null;
       return false;
     }
-    // Nobody else draws in this context (no virgl GL, or Mesa on WebGPU,
-    // which presents into a canvas of its own): nothing to save, and the
+    // Nobody else draws in this context (Mesa on WebGPU presents into a
+    // canvas of its own): nothing to save, and the
     // fourteen queries below are each a synchronous round trip to the GPU
     // process -- a tenth of this worker's time under Noita, on the thread
     // that also runs Mesa. Set the state and draw.
@@ -885,10 +883,8 @@ class Compositor {
       this.#note(`gl attachment ${stamp}, frame ${f ? `${f.w}x${f.h} #${f.serial}` : 'none'}`
         + `, window ${win.token}:${win.surface} xid ${win.info?.xid ?? 0}`
         + `, drawn ${this.#glDraws}`
-        + `, shared ${glRenderer?.sharesContextWith?.(this.#gl) ?? '?'}`
         + `, sample ${this.#glSample(f)}`
-        + `, device ${glDevice?.glState?.() ?? '?'}`
-        + `, renderer ${glRenderer?.glState?.() ?? '?'}`);
+        + `, device ${glDevice?.glState?.() ?? '?'}`);
     }
     // Per window, out of the device's list of them: see `glFrameFor`.
     const frame = glFrameFor(win);
@@ -1251,22 +1247,14 @@ function loop() {
 
 // -- the guest's OpenGL, in this worker -------------------------------------
 //
-// Mesa and virglrenderer run here rather than on the page, and that is the
-// whole point: they render into *this* worker's WebGL context, so a GL
-// window's frame is a texture this compositor binds. Nothing is read back and
-// nothing is uploaded -- the path that used to end in the guest copying its
-// own frame into an shm buffer for us to upload again.
-//
-// One canvas is what makes it one context: `getContext('webgl2')` on a canvas
-// that already has one hands back the same object, whoever asked first.
+// Mesa runs here rather than on the page: a GL window's frame is a canvas in
+// this worker, uploaded into the scene GPU-side, so nothing comes back
+// through the guest.
 let glDevice = null;
-let glRenderer = null;
 let glChannel = null;
 let glServing = false;
-// Where Mesa presents. The same canvas as this compositor's when virgl is
-// decoding -- its frames are then textures in this very context -- and a
-// canvas of its own when gex_wgpu is, because a canvas has one context and
-// WebGPU is not WebGL.
+// Where Mesa presents: a canvas of its own, because a canvas has one context
+// and WebGPU is not WebGL.
 let glTarget = null;
 let glPresentCanvas = null;
 
@@ -1295,15 +1283,7 @@ function glSurfaceList() {
   // worse trade than the handful of wasm calls this costs.
   if (glSurfaceFrame === glTick) return glSurfaces;
   glSurfaceFrame = glTick;
-  const before = glSurfaces;
   glSurfaces = glDevice.surfaces();
-  // A window that has gone leaves a frame behind; the renderer holds a
-  // texture the size of that window until someone says it may go.
-  for (const old of before) {
-    if (!old.frame) continue;
-    if (glSurfaces.some((s) => s.frame === old.frame)) continue;
-    glRenderer?.forgetSurface?.(old.frame);
-  }
   return glSurfaces;
 }
 
@@ -1319,22 +1299,16 @@ function glFrameFor(win) {
       ? win.token === s.token && win.surface === s.id
       : win.info?.xid === s.id;
     if (!hit) continue;
-    const frame = s.frame ? glRenderer?.frameFor?.(s.frame) : null;
-    // A device without per-surface frames (the WebGPU backend has one canvas
-    // and one frame) still has the one; it is this window's if the match
-    // above says so.
-    return frame || glFrame();
+    // The WebGPU backend has one canvas and one frame; it is this window's if
+    // the match above says so.
+    return glFrame();
   }
   return null;
 }
 
-/** The frame itself, or null if there is none.
- *
- * Two shapes, because the two backends hand it over differently: `tex` is a
- * texture this context can bind (virgl decoded it here), `source` is a canvas
- * to upload from (WebGPU drew it, and nothing else can touch that texture). */
+/** The frame itself, or null if there is none: `source` is a canvas to upload
+ * from (WebGPU drew it, and nothing else can touch that texture). */
 function glFrame() {
-  if (glRenderer?.ok) return glRenderer.frame();
   if (!glPresentCanvas) return null;
   const w = glPresentCanvas.width, h = glPresentCanvas.height;
   if (w < 2 || h < 2) return null;   // still at its placeholder size
@@ -1342,29 +1316,21 @@ function glFrame() {
 }
 
 async function startGl(m, canvas) {
-  const backend = m.backend === 'wgpu' ? 'wgpu' : 'virgl';
   // A WebGPU context cannot be created on a canvas that already has WebGL's,
   // so gex_wgpu presents into one of its own and the frame reaches the scene
   // as an upload. One copy per frame, GPU-side -- the price of the API that
   // cannot share a texture with the one this compositor draws in.
-  glTarget = backend === 'wgpu' ? new OffscreenCanvas(16, 16) : canvas;
-  comp?.shareContext(glTarget === canvas);
+  glTarget = new OffscreenCanvas(16, 16);
+  comp?.shareContext(false);
   // Emscripten looks a canvas up by selector, and a worker has no document.
   if (!globalThis.document) globalThis.document = { querySelector: () => glTarget };
   const { MesaGlDevice } = await import('./mesa-gl.js');
   glDevice = await MesaGlDevice.create(glTarget, {
-    backend,
     url: m.url,
     api: m.api || 'core',
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
-  glRenderer = glDevice.renderer;
-  glPresentCanvas = glRenderer ? null : glTarget;
-  // The compositor draws these frames where their window is; a blit would put
-  // the last one over the whole output. `?glcanvas=1` keeps the blit, which
-  // is how to tell "the renderer drew nothing" from "the compositor drew it
-  // wrong" -- they look the same from outside.
-  glRenderer?.presentToCanvas(!!m.canvasBlit);
+  glPresentCanvas = glTarget;
   glChannel = m.channel;
   postMessage({ kind: 'gl-ready', describe: glDevice.describe() });
   serveGlRing();

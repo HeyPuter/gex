@@ -320,9 +320,6 @@ for (const [event, describe] of [
   // `?attachtrace=1`: narrate a thread Worker's attach/adopt, to catch a
   // stranded thread whose wasm instantiate never returns.
   if (params.get('attachtrace')) globalThis.GEX_ATTACH_TRACE = 1;
-  // `?virgltrace=1`: log every vtest feed, to tell a rendering client from one
-  // stuck before its first draw.
-  if (params.get('virgltrace')) globalThis.GEX_VIRGL_TRACE = 1;
   const asked = params.get('demo') || location.hash.slice(1);
   const want = DEMOS.find((d) => d.id === asked) || DEMOS[0];
   await select(want);
