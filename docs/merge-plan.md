@@ -861,8 +861,15 @@ host half is `gex_kernel::ftab`; the runtime functions are
   the same way.
 - **Translation on demand.** `gex_kernel::ftab::set_translator` installs a
   `Translator` (stream F's JIT); `gex.lookup` calls it on a miss with guest
-  memory, the address, an executability test and `page_gen`, and installs the
-  module it returns. `None` falls back to index 1.
+  memory, the address, an executability test, a read-only test
+  (`Request::read_only(addr, n)`: mapped readable and not writable now, so a
+  jump table there is as fixed as one in an image's read-only segment; added
+  by stream F) and `page_gen`, and installs the module it returns. `None`
+  falls back to index 1.
+- **The return check** (every tier) compares SP with the entry SP plus what
+  that `ret` pops: the return address, and for i386 `ret N` (stdcall,
+  struct returns) N more. `gex_cgen::func::ret_pops` decodes it per
+  terminator from the code bytes. The caller reloads SP after every call.
 - **The root** is `gex_cgen::runtime`'s `root(ctx)`: probe `ctx::PC`, call
   with `ret = ftab::NO_RETURN` and `need = NEED_ALL`, poll the safepoint
   countdown, repeat; the host stops it by trapping out.

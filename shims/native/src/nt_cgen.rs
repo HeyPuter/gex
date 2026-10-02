@@ -168,7 +168,10 @@ pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jo
     }
     let t0 = std::time::Instant::now();
     let work = dir.join("work");
-    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs)?;
+    let byte = |a: u64| {
+        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+    };
+    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte)?;
     let _ = std::fs::remove_dir_all(&work);
     if verbose {
         eprintln!(

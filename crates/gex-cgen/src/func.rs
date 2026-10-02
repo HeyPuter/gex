@@ -85,6 +85,41 @@ pub fn ret_sp_delta(class32: bool) -> u64 {
     }
 }
 
+/// Where a function's `ret` pops more than the return address (i386
+/// `ret N`: stdcall callees, struct returns): the terminator's pc and how
+/// far it moves SP, for the return check of AOT units and the function JIT,
+/// which otherwise sees SP past where the caller expects and leaves. `read`
+/// gives a guest byte. Empty off x86.
+pub fn ret_pops(functions: &[Function], class32: bool, read: &dyn Fn(u64) -> Option<u8>) -> HashMap<u64, u64> {
+    let mut out = HashMap::new();
+    if !gex_abi::X86 {
+        return out;
+    }
+    let ptr = if class32 { 4 } else { 8 };
+    for f in functions {
+        for b in &f.blocks {
+            if !matches!(b.term, gex_ir::func::FTerm::Return { .. }) || b.synthetic {
+                continue;
+            }
+            let mut a = b.term_pc;
+            // `rep ret` / `bnd ret`; an operand-size prefix (a 16-bit
+            // pop) gets no entry, and its check leaves.
+            while matches!(read(a), Some(0xf2 | 0xf3)) && a < b.term_pc + 4 {
+                a += 1;
+            }
+            if read(a) == Some(0xc2) {
+                if let (Some(lo), Some(hi)) = (read(a + 1), read(a + 2)) {
+                    let n = u16::from_le_bytes([lo, hi]) as u64;
+                    if n != 0 {
+                        out.insert(b.term_pc, ptr + n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The recursion-depth guard (`docs/function-tier.md` §7). `depth` is an
 /// estimate, in bytes, of the engine stack the C frames below this one in
 /// the nest use; a function whose own frame would take it past this budget
@@ -197,6 +232,9 @@ pub struct FnUnit {
     weight: u32,
     /// How far a `ret` moves SP: 8 on x86-64, 4 for an i386 program.
     pub ret_sp_delta: u64,
+    /// Where a `ret` moves it further ([`ret_pops`], by the terminator's
+    /// pc): i386 `ret N`. Whoever adds a function fills in its entries.
+    pub ret_pops: HashMap<u64, u64>,
     /// Registers live on entry to each block of the function being emitted
     /// (`live_in`): write-backs on internal edges and at calls to functions
     /// with a summary store only these.
@@ -234,6 +272,7 @@ impl FnUnit {
             uses_call_known: false,
             weight: 0,
             ret_sp_delta: ret_sp_delta(false),
+            ret_pops: HashMap::new(),
             live: Vec::new(),
             standalone: false,
             ftab: false,
@@ -894,13 +933,16 @@ impl FnUnit {
                     // the flags when `need` says so) and report success;
                     // the caller carries on without looking at the context.
                     // `GEX_CGEN_MUTATE=NORETCHECK` skips the check.
+                    // SP back where the caller had it, plus what this
+                    // `ret` pops: the return address, and on i386 `ret N`'s
+                    // N (a stdcall callee's arguments, a struct return's
+                    // pointer). The caller reloads SP after every call.
                     let spn = reg_name(sp_reg());
+                    let delta = self.ret_pops.get(&b.term_pc).copied().unwrap_or(self.ret_sp_delta);
                     if mutate("NORETCHECK") {
                         e.line("if (1) {");
                     } else {
-                        e.line(format!(
-                            "if (__builtin_expect({t} == ret && {spn} == sp0 + {}ull, 1)) {{", self.ret_sp_delta
-                        ));
+                        e.line(format!("if (__builtin_expect({t} == ret && {spn} == sp0 + {delta}ull, 1)) {{"));
                     }
                     let flags: Vec<GuestReg> = FLAG_REGS.to_vec();
                     e.flush_keep_live(RegSet::ALL.minus(RegSet::of(&flags)));

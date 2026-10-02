@@ -313,8 +313,16 @@ pub struct ImageStats {
 
 /// Stage 2: the recovery in `recovery` as one linked C module at `out`.
 /// `work` holds the unit sources while they compile; `objects` is the object
-/// cache (shared across images and builds).
-pub fn build_c_module(recovery: &Path, work: &Path, objects: &Path, out: &Path, jobs: usize) -> Result<ImageStats> {
+/// cache (shared across images and builds). `read` gives a byte of the
+/// image as placed (for [`func::ret_pops`]).
+pub fn build_c_module(
+    recovery: &Path,
+    work: &Path,
+    objects: &Path,
+    out: &Path,
+    jobs: usize,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
+) -> Result<ImageStats> {
     let rec = read_recovery(recovery)?;
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
@@ -322,7 +330,7 @@ pub fn build_c_module(recovery: &Path, work: &Path, objects: &Path, out: &Path, 
     // (its callers would not have written everything back).
     let mut skip: HashSet<u64> = HashSet::new();
     loop {
-        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip)?;
+        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip, read)?;
         let cwasm = std::fs::read(out)?;
         let users = crate::splice::unspliceable_users(&cwasm)?;
         if users.is_empty() {
@@ -356,6 +364,7 @@ fn emit_and_link(
     out: &Path,
     jobs: usize,
     skip: &HashSet<u64>,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
 ) -> Result<ImageStats> {
     std::fs::create_dir_all(work)?;
     std::fs::create_dir_all(objects)?;
@@ -416,6 +425,7 @@ fn emit_and_link(
             if skip.contains(&f.entry) {
                 unit.add_leave_stub(f.entry);
             } else {
+                unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
                 unit.add(&f, &known, &rec.sums, &rec.trapfree)
                     .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
             }
