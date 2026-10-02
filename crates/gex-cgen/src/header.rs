@@ -32,7 +32,6 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_SPLIT_LOCK 0x{:x}u", gex_abi::SPLIT_LOCK);
     let _ = writeln!(w, "#define GEX_PATCHED_PAGES 0x{:x}u", gex_abi::PATCHED_PAGES);
     let _ = writeln!(w, "#define GEX_NEST_EXITS 0x{:x}u", gex_abi::NEST_EXITS);
-    let _ = writeln!(w, "#define GEX_BODY_LIMIT 0x{:x}u", gex_abi::BODY_LIMIT);
     let _ = writeln!(w);
 
     // The context. Every named offset, then the per-register helpers.
@@ -90,6 +89,7 @@ pub fn header() -> String {
     };
     decl(w, imports::SYSCALL, "void", "gex_syscall", "int ctx, int64_t pc");
     decl(w, imports::DISPATCH_MISS, "int32_t", "gex_dispatch_miss", "int ctx, int64_t pc");
+    decl(w, imports::CALL_OUT, "int32_t", "gex_call_out", "int ctx, int64_t target, int64_t ret, int64_t sp_want");
     decl(w, imports::ILLEGAL, "void", "gex_illegal", "int ctx, int64_t pc, int32_t raw");
     decl(w, imports::BREAKPOINT, "void", "gex_breakpoint", "int ctx, int64_t pc, int32_t imm");
     decl(w, imports::SYSREG_READ, "int64_t", "gex_sysreg_read", "int ctx, int64_t pc, int32_t reg");
