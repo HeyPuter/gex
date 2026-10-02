@@ -42,6 +42,10 @@ work; its "Direction" section, §12 and §16 were updated for this merge).
 
 ## 2. End-state architecture
 
+> **Revised 2026-10-02: see §9.** Every tier now shares one call-returning
+> ABI and function-sized code; the per-block tier-1 and the splice/nest
+> bridge below survive only as the region tier's last resort.
+
 ```
  ELF closure (gex-ld)          PE image + DLLs (gex-ld, PE support: M6)
           \                    /
@@ -87,6 +91,9 @@ wherever they don't (§4).
 ---
 
 ## 4. The hard part: the function tier inside a runtime that assumes flat stacks
+
+> **Revised 2026-10-02: see §9.** The invariants below still hold; nests,
+> leaves and per-slot dispatch are replaced by one call-returning ABI.
 
 Tier-1 never nests guest calls on the Wasm stack, and gex relies on that for
 `fork`, `execve`, signal delivery, thread switches and `longjmp`. Function-tier
@@ -478,3 +485,173 @@ their numbers.
 Measure with gex's A/B rules and price optimizations before building them.
 Don't push, don't touch master, don't edit another stream's files.
 ```
+
+---
+
+## 9. Revision (2026-10-02): one call-returning ABI for every tier
+
+**Status:** adopted direction, at the user's request after the Noita
+measurements below. It replaces the splice-and-nest design of §2 and §4 for
+anything function recovery covers. §4's invariants (state correct at unknown
+boundaries, patched code never runs) still hold; how they are met changes.
+
+### 9.1 Why
+
+Noita natively (i386 PE, staged Wine prefix, same scene; S3, 2026-10-02):
+
+| | world-up | fps, first 300 s | fps, steady | peak RSS |
+|---|---|---|---|---|
+| tier-1 only (`--no-cgen`) | 207 s | 16.2 | 19.1 | 5.3 GB |
+| units, before the call-out | 308 s | 13.8 | 24.2 | 8.6 GB |
+
+The function tier helps steady state (+27%) but costs load time and 3 GB,
+and it gets there through machinery that exists only to bridge two
+incompatible execution models:
+
+- **tier-1 never returns.** A block is a wasm function, blocks `return_call`
+  each other, and every non-constant transfer, including a guest `ret`, goes
+  through a per-page slot table (one slot per 4 bytes of code on x86).
+- **the function tier returns.** A guest call is a wasm call.
+
+Bridging them needs nests, roots, leaves, predicted returns, call-outs,
+shared-slot bodies, page checks and stale-module retranslation. Noita pays
+6.6M switches between the two per second, keeps about 281k tier-1 blocks
+next to the units (the same code twice), and gives every thread its own
+dispatch and body tables of about 4.8M entries each. Browser Workers cannot
+share a wasm table, so those per-thread copies are inherent there.
+
+pewasm, which has one model (whole functions, direct calls, one table for
+indirect calls), runs the same program at 60 fps in a browser on a 2 GB heap.
+
+### 9.2 The design
+
+**One ABI.** Every guest function, whichever tier runs it, is a wasm
+function of one signature that returns to its wasm caller when the guest
+returns to its guest caller. The return is checked (§4.2): the callee
+compares the guest return address and SP with what its caller set up; on a
+mismatch (longjmp, a stack switch, `ret` used as a jump) it unwinds, and the
+code that caught the unwind resumes at the real guest state.
+
+**Code is function-sized in every tier.**
+
+1. **The function JIT (new; replaces tier-1 for recoverable code).** On the
+   first call to an address with no code, recover the function that starts
+   there (S2's recovery, one function at a time, summaries cached), and emit
+   one wasm function directly from GIR, with no clang:
+   - blocks as a `loop` plus `br_table` state machine inside the function
+     (no relooper needed, cheap to emit);
+   - guest registers in wasm locals across blocks, written back only where
+     §4.1 requires;
+   - calls as wasm calls (see below), and returns as wasm returns.
+   The emitter can start from gex-cgen's GIR → C lowering, which already
+   makes every decision this needs, emitting wasm instead of C.
+2. **The AOT tier (clang) is the same ABI with better code.** Whole-image
+   units stay; the builder from S3 stays. A function with an AOT body never
+   gets a JIT body.
+3. **The region tier (fallback).** Code that is not function-shaped: jumps
+   into the middle of a function, runtime-generated code (LuaJIT's mcode),
+   code recovery gives up on. A region starts at the target, is translated
+   like a function, and follows the same call/return contract. Today's
+   call-out is the prototype of this. Block-at-a-time translation survives
+   only here, as the last resort.
+
+**Calls.**
+
+- Within a module: wasm `call`.
+- Across modules, and into JIT or region code: `call_indirect` through one
+  function table, at a known index (bound when the callee is installed, so an
+  IAT call or a vtable call that has resolved once costs one indirect call)
+  or through the address map below.
+- Calling into JIT code costs the same as any indirect call. There is no
+  nest, root, leave or dispatch loop on the hot path.
+
+**Tables index functions, not 4-byte slots.**
+
+- The function table has one entry per function. Noita has about 100k
+  functions against about 4.8M slots, about 40× fewer, which is what makes
+  per-Worker copies affordable in the browser.
+- The guest address → function index map is consulted only on indirect
+  transfers whose target is not already bound. It is a hash or a sparse map,
+  not a slot array per page, so two functions 1 byte apart no longer share
+  anything.
+
+**One copy of each function.** AOT if a unit has it, otherwise JIT, once.
+Nothing is translated twice, which removes the duplication behind most of
+the extra memory.
+
+**Exceptional control flow.** Wasm exception handling (V8 and wasmtime both
+support it now) for unwinding: longjmp, C++ exceptions, Windows SEH frames
+that unwind past wasm frames, and the failed return checks above. Signals
+are delivered at safepoints, as in §4.3. fork, execve and thread migration
+unwind every frame first (§4.2's mechanism, with EH as the transport).
+
+**Patched code.** A function's entry checks that its pages are unchanged
+(today's page check, per function rather than per block). A patched function
+is retired from the table and map; callers bound to it reach the new body
+through the retired entry's forwarding stub.
+
+**Ejected builds** are the same modules with the JIT and region tier left
+out: a miss fails loudly. That is pewasm's model exactly.
+
+### 9.3 What carries over from today
+
+- S2's function recovery and summaries; the per-function C lowering in
+  gex-cgen (the template for the JIT emitter); the whole-image builder, unit
+  cache, unit keys and gex-key.
+- Patched-page detection, retirement, and the PAGE_STALE lessons (first
+  publish wins; a lagging store catches up).
+- The call-out (the region tier's starting point), the trampoline-page unit,
+  direct cross-image binding (now: install-time binding into the one table).
+- The browser's unit loading, shared modules across Workers and per-Worker
+  instantiation.
+
+What goes: nests, roots, leaves, predicted-return plumbing between the tiers,
+per-4-byte slot tables, body tables, shared-slot bodies, and per-block
+tier-1 for recoverable code.
+
+### 9.4 Plan and gates
+
+1. **Measure the current design to the end** (S3, in progress): the call-out
+   run, with world-load split into unit placement, tier switches and tier-1
+   translation, and the 8 GB broken down into unit code, per-store tables
+   and duplicate tier-1 translations. These numbers are the baseline every
+   later step is compared with.
+2. **Prototype the function JIT on the Tier 0 corpus** (S3):
+   - GIR function → wasm function directly, the ABI above, a function table
+     plus an address map;
+   - run under `gexc run --fjit` beside today's tiers;
+   - **gate:** lockstep against tier-1 on all 30 programs on ga64, gx64 and
+     gi386; Tier 0 CPU time per kernel against tier-1, the clang tier and
+     emcc (paired A/B, the usual rules); translation time per function;
+     memory per function.
+   - **Go/no-go:** the prototype must beat tier-1 clearly (target: at or
+     below 2× tier-1's time-per-kernel ratio to the clang tier, i.e. most of
+     the way from tier-1 to clang) and translate fast enough for start-up
+     (target: Noita's working set in seconds, not minutes).
+3. **Make AOT units use the same ABI** and install into the one function
+   table; retire body tables and nests for code that has a function body.
+4. **Region tier** for non-function-shaped code, from the call-out; tests:
+   detour, pagespan, a JIT-style code generator (write, call, rewrite), and
+   longjmp, SEH and C++ unwinding through mixed tiers.
+5. **Noita**, native then browser. **Targets:**
+   - steady fps above today's units run (24) natively, at or above pewasm's
+     60 fps cap in the browser on hardware WebGPU;
+   - world-up no slower than tier-1 today (207 s natively), heading for
+     native Wine's ~60 s;
+   - peak RSS at or below tier-1 today (5.3 GB), heading for pewasm's
+     2 GB heap.
+6. **Retire** per-block tier-1 except as the region tier's last resort.
+
+### 9.5 Risks
+
+- **JIT emit speed.** Whole functions are more expensive to emit than blocks.
+  Mitigation: emit straight to wasm without an optimiser; leave optimisation
+  to the AOT tier and V8/wasmtime's own tier-up.
+- **Recovery on demand.** Recovering one function at a time at run time must
+  not need the whole image's analysis. Summaries for callees not yet seen
+  default to the conservative interface (state written back at the call).
+- **Wasm call depth.** Guest recursion becomes wasm recursion; the existing
+  depth guard (function-tier.md §7.1) carries over, unwinding through EH.
+- **Code that is neither function- nor region-shaped,** such as self-modifying
+  loops. The region tier with per-entry page checks handles it; measure its
+  frequency on Noita first.
