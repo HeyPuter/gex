@@ -808,3 +808,64 @@ the usual gate. Tests: workspace tests a64/x86, tests/nt with
 `--no-cgen`/`--cgen` (and `--fjit` once it exists), x86-programs, lockstep
 on 3 guests, browser NT, browser-gui `--gl`. Each stream merges `merge/main`
 in before reporting.
+
+#### 9.8.1 The interface as built (stream R, R1)
+
+Names and constants are in `gex_abi::ftab` and beside it in gex-abi; the
+host half is `gex_kernel::ftab`; the runtime functions are
+`gex_cgen::runtime`. Where this differs from §9.8 above, it says so.
+
+- **The table.** `gex.ftab`, funcref. Indices 0..16 are the runtime's:
+  0 is `resolve` (`ftab::RESOLVE`), 1 runs code no function body holds yet
+  (`ftab::FALLBACK`: tier-1 now, the region tier later). Every slot a
+  thread's table has not filled yet holds `resolve`, and a retired slot is
+  pointed back at it, so **every call through the table stores its target
+  in `ctx::LAST_TARGET` first**; `resolve` reads it, calls `gex.lookup`, and
+  tail-calls the answer with its own arguments.
+- **Placing a module's functions.** A module imports `env.__table_base`
+  (immutable i32) and fills its slots with one active element segment at
+  offset `global.get __table_base`, which is exactly what wasm-ld emits for
+  `--experimental-pic -shared` (AOT units are linked that way, importing the
+  table as `env.__indirect_function_table`; the host defines both names to
+  the one table). A custom section `gex.funcs` lists the guest address of
+  each slot in segment order (u32 count, then little-endian u64s; 0 for a
+  helper nobody reaches by address). The host reserves that many indices,
+  instantiates with `__table_base` = the first, and maps each address to
+  its slot. *Deviation:* no `gex_funcs` export list (wasm caps exports at
+  100,000; noita.exe alone has 100,147 functions); the element segment is
+  the list.
+- **Calls.** Within a module, `call`. Anything else, constant target or
+  not:
+  ```
+  e   = i64.load (FCACHE + 8 * fcache_slot(t))      ;; gex_abi::fcache_entry
+  idx = (e & 0xffffffff) == t ? e >> 32 : 0          ;; RESOLVE on a miss
+  ctx.LAST_TARGET = t
+  call_indirect (F_body) ftab idx                    ;; or return_call_indirect
+  ```
+  `fcache_slot(t) = (t as u32 * 0x9e3779b1) >> 17` (32,768 entries, 256 KiB,
+  in the reserved low region below `PATCHED_PAGES`; contexts end at
+  `CTX_LIMIT = FCACHE`, about 600 threads). `gex.lookup(ctx, addr) -> i32`
+  may also be called directly; it never returns 0 and writes the cache
+  entry. *Deviation:* no `gex_binds` bind arrays. A static target's probe
+  is a constant address (the hash folds), one load and one compare more
+  than a bind slot, and needs no runtime-owned memory per module; a
+  module-local bind table can be added if cache collisions show up in a
+  profile.
+- **Page checks.** A JIT or region function compares, on entry, the
+  `u32` at `PAGE_GEN + 4 * page` of every page it covers with the value the
+  host gave it at translation (`Request::page_gen`, never 0); on a mismatch
+  it does the call sequence above to its own entry (so a newer translation
+  in the cache is reached without the host). Until tier-1's dispatch slots go
+  `PAGE_GEN` *is* the dispatch directory, which retirement zeroes and
+  renumbers. AOT units check `PATCHED_PAGES` (bytes changed since install)
+  the same way.
+- **Translation on demand.** `gex_kernel::ftab::set_translator` installs a
+  `Translator` (stream F's JIT); `gex.lookup` calls it on a miss with guest
+  memory, the address, an executability test and `page_gen`, and installs the
+  module it returns. `None` falls back to index 1.
+- **The root** is `gex_cgen::runtime`'s `root(ctx)`: probe `ctx::PC`, call
+  with `ret = ftab::NO_RETURN` and `need = NEED_ALL`, poll the safepoint
+  countdown, repeat; the host stops it by trapping out.
+- **Retirement:** `FuncMap::retire*` logs the index; each table points it
+  back at `resolve` as it replays the log; the host clears the probe cache
+  entry. Indices are never reused.
