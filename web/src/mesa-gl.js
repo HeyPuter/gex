@@ -117,6 +117,31 @@ function countWebGpu() {
   wrap(GPURenderPassEncoder.prototype, 'setPipeline');
 }
 
+/** Mesa's periodic reports ("gex-wgpu: ..." lines its present path prints
+ *  every thirty frames, nine at a time) at most once a minute each, keyed by
+ *  their first words; everything else as it comes. Each console line is a
+ *  message to whatever is listening (DevTools, a harness over CDP), on the
+ *  thread that runs Mesa: two thousand batches in a seven-minute Noita run.
+ *  `?gltrace=1` keeps them all. */
+function quietReports(out) {
+  let all = false;
+  try {
+    all = new URLSearchParams(location.search).get('gltrace') === '1';
+  } catch {}
+  if (all) return out;
+  const last = new Map();
+  return (line) => {
+    const m = /^gex-wgpu: ([a-z -]{4,40}?)(?: --|:| [0-9])/.exec(String(line));
+    if (m) {
+      const now = performance.now();
+      const at = last.get(m[1]);
+      if (at !== undefined && now - at < 60000) return;
+      last.set(m[1], now);
+    }
+    out(line);
+  };
+}
+
 export class MesaGlDevice {
   // The GPUAdapter and GPUDevice, held for the renderer's whole life and never
   // read again.
@@ -367,7 +392,7 @@ export class MesaGlDevice {
         mainScriptUrlOrBlob: new URL(url, location.href).href,
         locateFile: (file) => new URL(file, new URL(url, location.href)).href,
         print: (line) => console.log('[mesa-gl]', line),
-        printErr: (line) => console.warn('[mesa-gl]', line),
+        printErr: quietReports((line) => console.warn('[mesa-gl]', line)),
       });
 
       // Readback suspends the wasm stack, so submission goes through JSPI.
