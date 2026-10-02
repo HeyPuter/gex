@@ -83,7 +83,7 @@ fn sp_reg() -> GuestReg {
 /// How far a `ret` moves SP relative to the call site: x86-64 pops the
 /// return address the call pushed.
 /// (x86-64: 8; i386 compatibility mode: 4, see `FnUnit::ret_sp_delta`.)
-fn ret_sp_delta(class32: bool) -> u64 {
+pub fn ret_sp_delta(class32: bool) -> u64 {
     match (gex_abi::X86, class32) {
         (false, _) => 0,
         (true, false) => 8,
@@ -100,7 +100,7 @@ fn ret_sp_delta(class32: bool) -> u64 {
 /// 512 KiB, V8's whole stack about 984 KiB.
 pub const STACK_BUDGET: u32 = 384 << 10;
 
-fn stack_budget() -> u32 {
+pub fn stack_budget() -> u32 {
     std::env::var("GEX_CGEN_STACK_BUDGET")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -110,7 +110,7 @@ fn stack_budget() -> u32 {
 /// A function's frame, estimated from the registers it keeps in locals: the
 /// wasm locals clang ends up with measured up to ~2.5x the register bytes
 /// (coremark, x86-64), plus the engine's spill slots and frame header.
-fn frame_weight(regs: &FnRegs) -> u32 {
+pub fn frame_weight(regs: &FnRegs) -> u32 {
     let bytes: u32 = regs
         .used
         .iter()
@@ -127,19 +127,19 @@ const NEED_DEFS: &str = "#define NEED_FLAGS 1u\n#define NEED_ALL 0xffffffffu\n\
 /// The flag registers of the guest (AArch64 has no P and A: a liveness set
 /// that says they are live, because an exit reads "everything", must not make
 /// a caller ask for flags).
-const FLAG_REGS: &[GuestReg] = if gex_abi::X86 {
+pub const FLAG_REGS: &[GuestReg] = if gex_abi::X86 {
     &[GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V, GuestReg::P, GuestReg::A]
 } else {
     &[GuestReg::N, GuestReg::Z, GuestReg::C, GuestReg::V]
 };
 
 /// What the indirect-call helper's own frame adds.
-const CALL_KNOWN_WEIGHT: u32 = 32;
+pub const CALL_KNOWN_WEIGHT: u32 = 32;
 
 /// Pricing experiments, `GEX_CGEN_EXP=a,b`: variants that are measured
 /// before they are built properly. Some are unsound (`NOFLAGWB`) and exist
 /// only to price what a sound version could at most win.
-fn exp(name: &str) -> bool {
+pub fn exp(name: &str) -> bool {
     std::env::var("GEX_CGEN_EXP")
         .map(|v| v.split(',').any(|x| x == name))
         .unwrap_or(false)
@@ -147,14 +147,14 @@ fn exp(name: &str) -> bool {
 
 /// Deliberate miscompilations, `GEX_CGEN_MUTATE=a,b`, each disabling one
 /// safety condition so a test can show it is needed (merge plan §5.3).
-pub(crate) fn mutate(name: &str) -> bool {
+pub fn mutate(name: &str) -> bool {
     std::env::var("GEX_CGEN_MUTATE")
         .map(|v| v.split(',').any(|x| x == name))
         .unwrap_or(false)
 }
 
 /// Local loop iterations between safepoint polls (tier-1's `loop_poll`).
-const LOOP_POLL: i32 = 1024;
+pub const LOOP_POLL: i32 = 1024;
 
 /// What the emitted functions do at their exits (`GEX_CGEN_STATS=1`).
 #[derive(Default, Debug)]
@@ -966,12 +966,12 @@ pub fn call_known_source_chunked(entries: &[u64]) -> String {
 
 /// Every register the function reads or writes, and every one it writes.
 /// The stack pointer is always used: the return check reads it.
-fn registers(f: &Function) -> FnRegs {
+pub fn registers(f: &Function) -> FnRegs {
     registers_in(f, &|_| true)
 }
 
 /// [`registers`] over the blocks `keep` admits (a loop function's).
-fn registers_in(f: &Function, keep: &dyn Fn(usize) -> bool) -> FnRegs {
+pub fn registers_in(f: &Function, keep: &dyn Fn(usize) -> bool) -> FnRegs {
     let mut used = BTreeSet::new();
     let mut written = BTreeSet::new();
     used.insert(sp_reg());
@@ -1004,7 +1004,7 @@ fn registers_in(f: &Function, keep: &dyn Fn(usize) -> bool) -> FnRegs {
 
 /// Clean-spill elision (pewasm's `opt_spill`, optimization-plan §16) is on
 /// unless `GEX_CGEN_CLEAN=0`.
-fn clean_spills() -> bool {
+pub fn clean_spills() -> bool {
     std::env::var("GEX_CGEN_CLEAN").as_deref() != Ok("0")
 }
 
@@ -1012,13 +1012,13 @@ fn clean_spills() -> bool {
 /// a forward may-analysis. A write makes a register dirty; a write-back
 /// followed by a reload (a call, a syscall, a clobbering host call) makes
 /// everything clean; the entry starts clean, having just loaded everything.
-fn dirty_in(f: &Function) -> Vec<BTreeSet<GuestReg>> {
+pub fn dirty_in(f: &Function) -> Vec<BTreeSet<GuestReg>> {
     dirty_in_from(f, 0, &|_| true)
 }
 
 /// [`dirty_in`] for the blocks `keep` admits, entered (clean) at `root`:
 /// a loop function, whose caller wrote everything back before calling it.
-fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool) -> Vec<BTreeSet<GuestReg>> {
+pub fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool) -> Vec<BTreeSet<GuestReg>> {
     let n = f.blocks.len();
     let mut inn: Vec<Option<BTreeSet<GuestReg>>> = vec![None; n];
     inn[root] = Some(BTreeSet::new());
@@ -1065,7 +1065,7 @@ fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool) -> Vec
 }
 
 /// Liveness-limited write-backs are on unless `GEX_CGEN_LIVE=0`.
-fn live_writebacks() -> bool {
+pub fn live_writebacks() -> bool {
     std::env::var("GEX_CGEN_LIVE").as_deref() != Ok("0")
 }
 
@@ -1082,7 +1082,7 @@ fn live_writebacks() -> bool {
 /// not preserve across calls can be stale in the context when a callee
 /// `longjmp`s to an earlier call's continuation in the same frame; C and
 /// the ABIs leave them undefined there (docs/function-tier.md §5).
-fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
+pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
     let n = f.blocks.len();
     let mut live = vec![RegSet::EMPTY; n];
     let order: Vec<usize> = f.rpo().iter().rev().map(|b| b.index()).collect();
@@ -1131,7 +1131,7 @@ fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
 }
 
 /// Every register but the flags.
-fn non_flags() -> RegSet {
+pub fn non_flags() -> RegSet {
     RegSet::ALL.minus(RegSet::of(FLAG_REGS))
 }
 
@@ -1222,7 +1222,7 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
 }
 
 /// Outlining outermost loops is on unless `GEX_CGEN_OUTLINE=0`.
-fn outline_loops() -> bool {
+pub fn outline_loops() -> bool {
     std::env::var("GEX_CGEN_OUTLINE").as_deref() != Ok("0")
 }
 
@@ -1246,13 +1246,13 @@ pub(crate) struct Scope<'a> {
 
 /// An outermost natural loop: its header, its blocks, and the blocks outside
 /// it that its edges reach.
-struct Loop {
-    header: usize,
-    body: BTreeSet<usize>,
-    exits: BTreeSet<usize>,
+pub struct Loop {
+    pub header: usize,
+    pub body: BTreeSet<usize>,
+    pub exits: BTreeSet<usize>,
     /// It contains an inner loop: a poll that expires there marks the
     /// outer loop hot, and its back-edge hands over (§7.2).
-    nested: bool,
+    pub nested: bool,
 }
 
 /// The outermost natural loops of `f`, for outlining (docs/function-tier.md
@@ -1261,7 +1261,7 @@ struct Loop {
 /// would never reach optimised code. Outlined, each chunk of iterations is a
 /// new call. None when the CFG has a backward edge that is not a natural
 /// loop's (irreducible): outlining needs the header to be the only way in.
-fn outer_loops(f: &Function) -> Vec<Loop> {
+pub fn outer_loops(f: &Function) -> Vec<Loop> {
     let n = f.blocks.len();
     let idom = f.idoms();
     let dominates = |h: usize, mut b: usize| -> bool {

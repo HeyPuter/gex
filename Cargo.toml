@@ -15,6 +15,7 @@ members = [
     "crates/gex-lift-ppc",
     "crates/gex-emit",
     "crates/gex-cgen",
+    "crates/gex-fjit",
     "crates/gex-kmem",
     "shims/kernel",
     "crates/gex-xlate",
@@ -60,6 +61,7 @@ gex-lift-x86 = { path = "crates/gex-lift-x86" }
 gex-lift-ppc = { path = "crates/gex-lift-ppc" }
 gex-emit = { path = "crates/gex-emit" }
 gex-cgen = { path = "crates/gex-cgen" }
+gex-fjit = { path = "crates/gex-fjit" }
 gex-kmem = { path = "crates/gex-kmem" }
 gex-xlate = { path = "crates/gex-xlate" }
 gex-ld = { path = "crates/gex-ld" }

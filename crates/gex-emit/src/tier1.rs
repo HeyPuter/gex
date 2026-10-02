@@ -21,6 +21,8 @@ use gex_abi::{ctx, DISPATCH_DIR, DISPATCH_MAX_PAGES, DISPATCH_PAGE, GUEST_LIMIT,
 use gex_ir::*;
 use std::collections::HashMap;
 
+pub mod fmode;
+
 /// SIMD sub-opcodes (the 0xFD prefix space).
 mod simd {
     pub const V128_LOAD: u32 = 0x00;
@@ -515,6 +517,10 @@ struct Emitter<'a> {
     /// Which registers the region writes, and so has to store on the way out.
     /// The ones it only reads are already correct in the context.
     region_writes: std::collections::HashSet<GuestReg>,
+    /// Function mode (`fmode`, the function JIT): every register the
+    /// function uses has a local for its whole body, bound up front, and a
+    /// clobbering host call reloads them all rather than forgetting them.
+    func_regs: Option<Vec<GuestReg>>,
 }
 
 /// What a region member needs to know to branch to its neighbours.
@@ -529,7 +535,12 @@ struct RegionState {
 
 impl<'a> Emitter<'a> {
     fn new(cx: &'a Context<'a>, block_start: u64) -> Emitter<'a> {
-        let mut f = FuncBody::new(1);
+        Self::with_params(cx, block_start, 1)
+    }
+
+    /// An emitter for a function of `n_params` parameters, `ctx` first.
+    fn with_params(cx: &'a Context<'a>, block_start: u64, n_params: u32) -> Emitter<'a> {
+        let mut f = FuncBody::new(n_params);
         let scratch_i64 = f.add_local(ValType::I64);
         let scratch_i32 = f.add_local(ValType::I32);
         let scratch_page = f.add_local(ValType::I64);
@@ -556,6 +567,7 @@ impl<'a> Emitter<'a> {
             reenter_local: None,
             region: None,
             region_writes: Default::default(),
+            func_regs: None,
         }
     }
 
@@ -1041,6 +1053,7 @@ impl<'a> Emitter<'a> {
         if let Some(c) = self.regs.get(&r) {
             return c.local;
         }
+        assert!(self.func_regs.is_none(), "function mode: {r:?} has no local (not in the used set)");
         let ty = r.ty();
         let local = self.f.add_local(val_type(ty));
         let before = self.f.code.len();
@@ -1202,6 +1215,12 @@ impl<'a> Emitter<'a> {
     /// Forget every cached register, forcing later reads to reload. Used
     /// after a host call that can rewrite guest state.
     fn invalidate(&mut self) {
+        if let Some(used) = self.func_regs.take() {
+            // Function mode: the locals are the function's, so reload them.
+            self.reload(&used);
+            self.func_regs = Some(used);
+            return;
+        }
         self.regs.clear();
     }
 
@@ -4825,6 +4844,12 @@ pub static REG_TRAFFIC: std::sync::Mutex<Option<HashMap<GuestReg, usize>>> =
     std::sync::Mutex::new(None);
 
 fn note_traffic(r: GuestReg) {
+    // Only `gexc` reads it, under the variable: a lock per register load and
+    // store is otherwise a translation cost for nothing.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("GEX_REG_HISTOGRAM").is_some()) {
+        return;
+    }
     let mut t = REG_TRAFFIC.lock().unwrap_or_else(|e| e.into_inner());
     *t.get_or_insert_with(HashMap::new).entry(r).or_default() += 1;
 }

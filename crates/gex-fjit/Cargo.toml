@@ -1,0 +1,13 @@
+[package]
+name = "gex-fjit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The function JIT: recovered GIR functions -> wasm functions, with no clang"
+
+[dependencies]
+gex-abi.workspace = true
+gex-ir.workspace = true
+gex-emit.workspace = true
+gex-cgen.workspace = true
+anyhow = "1"
