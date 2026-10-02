@@ -592,6 +592,8 @@ fn call_one_param(c: &mut Call<'_>) -> R64 {
 fn call_two_param(c: &mut Call<'_>) -> R64 {
     let (a1, a2, code) = (c.a(0), c.a(1), c.a32(2));
     match code {
+        // GetDialogProc(proc, ansi): what a dialog procedure handle calls.
+        0 => Ok(class::get_dialog_proc(&c.p.user.lock().unwrap(), a1, a2 != 0)),
         // GetMonitorInfo
         2 => sysparams::get_monitor_info(c, a1 as u32, a2),
         // GetSystemMetricsForDpi

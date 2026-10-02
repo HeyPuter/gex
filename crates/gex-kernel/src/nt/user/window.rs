@@ -197,6 +197,10 @@ pub struct Window {
     pub surface: u32,
     /// The window's own DC (CS_OWNDC), 0 until asked for.
     pub own_dc: u32,
+    /// user32's `DIALOGINFO` for a dialog (SetDialogInfo).
+    pub dlg_info: u64,
+    /// A builtin control's state (NtUserSetPrivateData), grown as written.
+    pub private: Vec<u8>,
 }
 
 /// The window `hwnd` names (a full or a 16-bit handle).
@@ -348,6 +352,8 @@ fn create_bare(u: &mut User, class_proc: usize, parent: u32, rect: Rect, style: 
             internal_paint: false,
             surface: 0,
             own_dc: 0,
+            dlg_info: 0,
+            private: Vec::new(),
         },
     );
     if let Some(p) = u.windows.get_mut(&parent) {
@@ -543,6 +549,8 @@ pub fn nt_user_create_window_ex(c: &mut Call<'_>) -> R64 {
                 internal_paint: false,
                 surface: 0,
                 own_dc: 0,
+                dlg_info: 0,
+                private: Vec::new(),
             },
         );
         if let Some(p) = u.windows.get_mut(&parent) {
@@ -1574,6 +1582,8 @@ pub fn call_hwnd(c: &mut Call<'_>) -> R64 {
     let u = c.p.user.lock().unwrap();
     let w = find(&u, h);
     let r = match code {
+        // GetDialogInfo
+        1 => w.map(|w| w.dlg_info).unwrap_or(0),
         // GetDpiForWindow
         2 => w.map(|_| super::sysparams::DPI as u64).unwrap_or(0),
         // GetParent: the parent of a child, the owner of a popup.
@@ -1754,6 +1764,38 @@ pub fn call_hwnd_param(c: &mut Call<'_>) -> R64 {
         }
         // MonitorFromWindow
         22 => Ok(handle_ret(super::sysparams::MONITOR)),
+        // SetDialogInfo
+        24 => {
+            let mut u = c.p.user.lock().unwrap();
+            let Some(w) = find_mut(&mut u, h) else { return Ok(0) };
+            w.dlg_info = param;
+            Ok(1)
+        }
+        // GetPrivateData / SetPrivateData: ({offset, size[, value]} *); the
+        // value there before.
+        30 | 31 => {
+            let (offset, size) = (c.g.u32(param)? as usize, c.g.u32(param + 4)? as usize);
+            let value = if code == 31 { c.g.ptr(param + 8)? } else { 0 };
+            // A builtin control's state is a few words.
+            if size == 0 || size > 8 || offset > 256 {
+                return Ok(0);
+            }
+            let mut u = c.p.user.lock().unwrap();
+            let Some(w) = find_mut(&mut u, h) else {
+                drop(u);
+                set_last_error(c, err::INVALID_WINDOW_HANDLE);
+                return Ok(0);
+            };
+            if w.private.len() < offset + size {
+                w.private.resize(offset + size, 0);
+            }
+            let mut old = [0u8; 8];
+            old[..size].copy_from_slice(&w.private[offset..offset + size]);
+            if code == 31 {
+                w.private[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
+            }
+            Ok(u64::from_le_bytes(old))
+        }
         _ => Err(c.unimplemented(&format!("NtUserCallHwndParam code {code}"))),
     }
 }
