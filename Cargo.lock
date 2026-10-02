@@ -488,6 +488,17 @@ name = "gex-f80"
 version = "0.0.1"
 
 [[package]]
+name = "gex-fjit"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "gex-abi",
+ "gex-cgen",
+ "gex-emit",
+ "gex-ir",
+]
+
+[[package]]
 name = "gex-gl"
 version = "0.0.1"
 
