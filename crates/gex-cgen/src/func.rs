@@ -767,6 +767,12 @@ impl FnUnit {
                 }
             }
             FTerm::Call { callee, ret_pc, ret } => {
+                // A callee that left: resume right here when the guest is
+                // back at this call's continuation (`local_resume`), else
+                // leave as before.
+                let local = ftab && scope.is_none() && local_resume() && ret.is_some();
+                let fail_call = if local { format!("goto gex_lc_{i};") } else { fail.to_string() };
+                let fail = fail_call.as_str();
                 let spn = reg_name(sp_reg());
                 if exp("NOFLAGWB") {
                     e.forget_flags();
@@ -935,7 +941,24 @@ impl FnUnit {
                 }
                 e.mark_dirty(carried);
                 match ret {
-                    Some(edge) => goto(e, edge),
+                    Some(edge) => {
+                        goto(e, edge);
+                        if local {
+                            // Reached only from the call's failure: the
+                            // continuation is the call's own successor, so
+                            // the control flow stays reducible.
+                            e.line(format!(
+                                "gex_lc_{i}: if (GEX_C64({}u) == 0x{ret_pc:x}ull && GEX_C64({}u) <= sp0) {{",
+                                ctx::PC,
+                                ctx::SP
+                            ));
+                            reload_all(e);
+                            e.line(format!("  goto L{};", edge.to.index()));
+                            e.line("}");
+                            resumed.set(true);
+                            e.line("goto gex_resume;");
+                        }
+                    }
                     // Believed not to return, and it did: leave to the
                     // return address, with everything written back.
                     None => {
@@ -1150,6 +1173,10 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 /// reloaded nearly doubled the largest bodies (noita.exe's 0xdc14c0, 414 to
 /// 720 KB of wasm) and put them past Cranelift's limits.
 fn resume_block(e: &mut Emitter<'_>, f: &Function) {
+    if local_resume() {
+        e.line("gex_resume: return 0;");
+        return;
+    }
     let mut starts: Vec<(u64, usize)> = f
         .blocks
         .iter()
@@ -1588,6 +1615,20 @@ pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u
         }
     }
     out
+}
+
+/// Whole-image units resume after a callee that left only at that call's
+/// own continuation, checked at the call site (`gex_lc_<block>`), not
+/// through one switch over every continuation of the body: the switch
+/// jumps into loops, which made the control flow irreducible, and clang's
+/// wasm backend then dispatched every iteration of those loops through a
+/// label variable (noita.exe 0x724580: 10,845 instructions with the
+/// switch, 9,186 without). Lost: resuming at a different continuation of
+/// the same frame, which now leaves (correct, slower).
+/// `GEX_CGEN_EXP=CENTRALRESUME` restores the switch (not in the unit key:
+/// for pricing only).
+pub fn local_resume() -> bool {
+    !exp("CENTRALRESUME")
 }
 
 pub fn minimal_writeback() -> bool {
