@@ -202,7 +202,7 @@ fn build(dir: &std::path::Path) -> Result<()> {
         }
         for (path, n, first) in &pe.uncovered {
             let f: Vec<String> = first.iter().map(|a| format!("{a:#x}")).collect();
-            eprintln!("  warning: {path}: {n} addresses the session ran on tier-1 are not unit entries (first: {})", f.join(" "));
+            eprintln!("  warning: {path}: {n} entries the session reached are not unit functions even with seeds (first: {})", f.join(" "));
         }
         eprintln!("{}: built ({} files in build/rootfs; no run-time translation)", dir.display(), r.rootfs_files);
         return Ok(());

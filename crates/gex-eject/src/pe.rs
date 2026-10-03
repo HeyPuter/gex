@@ -17,6 +17,56 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::profile::{NtSession, Session};
 use std::path::{Path, PathBuf};
 
+/// What a provider includes (gex-cgen's), for `gen/provider.h`.
+pub const PROVIDER_H: &str = include_str!("../../gex-cgen/providers/provider.h");
+
+/// Whether the PE file at `path` is LuaJIT's lua51.dll (it exports
+/// `luaJIT_setmode`): its trace compiler writes x86 at run time, which an
+/// ejected project cannot run, so it gets the Lua provider.
+pub fn is_luajit(path: &Path) -> Result<bool> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    Ok(pe.exports.entries.iter().any(|e| e.names.iter().any(|n| n == "luaJIT_setmode")))
+}
+
+/// Where a configured provider's module goes.
+fn provider_wasm(dir: &Path, p: &crate::config::Provider) -> PathBuf {
+    dir.join("build/providers").join(p.library.to_ascii_lowercase().replace(".dll", ".wasm"))
+}
+
+/// The imports a stateful provider may have.
+fn check_provider_imports(wasm: &[u8], what: &str) -> Result<()> {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::ImportSection(r) = payload? {
+            for i in r {
+                let i = i?;
+                let ok = match i.module {
+                    "env" => matches!(i.name, "memory" | "__indirect_function_table" | "__stack_pointer" | "__memory_base" | "__table_base"),
+                    "gex" => i.name.starts_with("provider_"),
+                    _ => false,
+                };
+                if !ok {
+                    bail!("{what} imports {}.{}, which a provider cannot have (give it a definition)", i.module, i.name);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The project's stateful providers, as the runtime takes them.
+fn lib_providers(dir: &Path, config: &Config) -> Vec<gex_native::libprov::LibProvider> {
+    config
+        .providers
+        .iter()
+        .map(|p| gex_native::libprov::LibProvider {
+            name: p.library.clone(),
+            dlls: vec![p.library.to_ascii_lowercase()],
+            wasm: provider_wasm(dir, p),
+        })
+        .collect()
+}
+
 /// The recorded session of a project, when it was a Windows program's.
 pub fn nt_session(dir: &Path) -> Result<Option<NtSession>> {
     let p = dir.join("session/session.json");
@@ -53,8 +103,8 @@ fn images(nt: &NtSession) -> Vec<&gex_xlate::profile::NtImage> {
 pub struct PeReport {
     pub units: Vec<(String, u64, usize, u64, &'static str)>,
     pub providers: Vec<String>,
-    /// Addresses the session ran on tier-1 that no unit has an entry for,
-    /// by image: (image, count, first few).
+    /// Entries the session reached by a call that no unit has even after
+    /// recovery was seeded with them, by image: (image, count, first few).
     pub uncovered: Vec<(String, usize, Vec<u64>)>,
     pub rootfs_files: usize,
 }
@@ -90,7 +140,6 @@ fn reuse(key_dir: &Path, sources: &[PathBuf]) -> Result<bool> {
 }
 
 pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport> {
-    let _ = config;
     let ntss = nt_session(dir)?.ok_or_else(|| anyhow!("not a Windows program's project"))?;
     verify_rootfs(dir, project)?;
     let mut report = PeReport::default();
@@ -157,7 +206,34 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", m.path))?;
         let key_dir = nt_cgen::unit_dir(&pe, m.base)?;
-        let how = if key_dir.join("c.wasm").exists() {
+        let bias = m.base.wrapping_sub(m.preferred);
+        // Entries the session reached by an indirect call that the unit
+        // must have: function starts recovery may not find on its own (a
+        // thread start only an immediate names, a callback). Seeds of
+        // user/eject.json besides.
+        let mut seeds: Vec<u64> = Vec::new();
+        for op in profile.iter().flat_map(|pr| pr.objects.values()) {
+            for site in op.indirect.values().filter(|s| s.call) {
+                seeds.extend(site.targets.keys().filter(|l| l.obj == m.id).map(|l| l.off.wrapping_add(bias)));
+            }
+        }
+        let name = m.path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+        for s in &config.seeds {
+            if let Some((img, off)) = s.split_once('+') {
+                if img.eq_ignore_ascii_case(&name) {
+                    let off = u64::from_str_radix(off.trim_start_matches("0x"), 16).map_err(|_| anyhow!("user/eject.json: seed {s:?}"))?;
+                    seeds.push(m.base + off);
+                }
+            }
+        }
+        let missing_seeds = |entries: &[u64]| -> Vec<u64> {
+            let set: std::collections::HashSet<u64> = entries.iter().copied().collect();
+            let mut v: Vec<u64> = seeds.iter().copied().filter(|a| !set.contains(a)).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let mut how = if key_dir.join("c.wasm").exists() {
             "present"
         } else if reuse(&key_dir, &sources)? {
             "reused"
@@ -165,7 +241,19 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             eprintln!("  building the unit for {} at {:#x} ...", m.path, m.base);
             "built"
         };
-        let p = nt_cgen::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
+        let mut p = nt_cgen::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
+        let extra = missing_seeds(&gex_cgen::image::read_entries(&p)?);
+        if !extra.is_empty() {
+            eprintln!("  {}: recovering again with {} entries the session reached ({:#x}...)", m.path, extra.len(), extra[0]);
+            let _ = std::fs::remove_dir_all(&key_dir);
+            let _ = std::fs::remove_dir_all(nt_cgen::recovery_dir(&pe, m.base)?);
+            p = nt_cgen::prepare_pe_seeded(&pe, m.base, &extra, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
+            how = "built with seeds";
+            let still = missing_seeds(&gex_cgen::image::read_entries(&p)?);
+            if !still.is_empty() {
+                report.uncovered.push((m.path.clone(), still.len(), still.iter().take(8).copied().collect()));
+            }
+        }
         compile(&p)?;
         for name in nt_cgen::prepare_providers(&pe)? {
             if !report.providers.contains(&name) {
@@ -173,16 +261,6 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             }
         }
         let entries = gex_cgen::image::read_entries(&p)?;
-        // What the session ran on tier-1 in this image that the unit has no
-        // entry for.
-        if let Some(op) = profile.as_ref().and_then(|pr| pr.objects.get(&m.id)) {
-            let bias = m.base.wrapping_sub(m.preferred);
-            let set: std::collections::HashSet<u64> = entries.iter().copied().collect();
-            let miss: Vec<u64> = op.blocks.keys().map(|o| o.wrapping_add(bias)).filter(|a| !set.contains(a)).collect();
-            if !miss.is_empty() {
-                report.uncovered.push((m.path.clone(), miss.len(), miss.iter().take(8).copied().collect()));
-            }
-        }
         report.units.push((m.path.clone(), m.base, entries.len(), std::fs::metadata(&p)?.len(), how));
         images_out.push(BuiltImage {
             kind: "unit".into(),
@@ -194,6 +272,28 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             blocks: entries.len() as u64,
             bytes: std::fs::metadata(&p)?.len(),
         });
+    }
+    // Stateful providers, from their sources (Lua: PUC Lua and its binding).
+    for p in &config.providers {
+        let out = provider_wasm(dir, p);
+        std::fs::create_dir_all(out.parent().unwrap())?;
+        let script = dir.join(&p.dir).join("build.sh");
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .arg(&out)
+            .arg(dir.join("gen"))
+            .status()
+            .with_context(|| format!("running {}", script.display()))?;
+        if !status.success() {
+            bail!("building the provider for {} ({}) failed", p.library, script.display());
+        }
+        let wasm = std::fs::read(&out)?;
+        check_provider_imports(&wasm, &format!("the provider for {}", p.library))?;
+        // Its compiled form is keyed by nothing but its path: compiled anew.
+        let _ = std::fs::remove_file(out.with_extension("cwasm"));
+        gex_cache::load_or_compile_at(&engine, &out.with_extension("cwasm"), &wasm)
+            .with_context(|| format!("compiling the provider for {}", p.library))?;
+        report.providers.push(format!("{} ({} KiB, stateful)", p.library, wasm.len() / 1024));
     }
     let manifest = BuildManifest {
         inputs: crate::build::inputs_id(dir, &[])?,
@@ -234,6 +334,7 @@ pub fn run(dir: &Path, flags: &crate::run::RunFlags) -> Result<Exit> {
     }
     std::env::set_var("GEX_CGEN_CACHE", &units);
     std::env::set_var("GEX_NT_CGEN_BUILD", "0");
+    gex_native::libprov::set(lib_providers(dir, &config));
     let jit = flags.jit_fallback || config.jit_fallback;
     nt_cgen::set_mode(if jit { nt_cgen::Mode::Default } else { nt_cgen::Mode::Aot });
     let args: Vec<String> = match (&flags.args, &config.args) {

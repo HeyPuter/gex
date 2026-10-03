@@ -261,8 +261,17 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             );
         }
         let src = host_path(sysroot, p);
-        let meta = std::fs::metadata(&src)
-            .with_context(|| format!("the session read {p}, and {} is gone", src.display()))?;
+        let meta = match std::fs::metadata(&src) {
+            Ok(m) => m,
+            // A Windows program's file made and removed during the session
+            // by a way the NT layer's open hook does not see as a create
+            // (a rename, a copy): its output.
+            Err(_) if nt.is_some() => {
+                outputs.push(p.clone());
+                continue;
+            }
+            Err(e) => return Err(anyhow!("the session read {p}, and {} is gone: {e}", src.display())),
+        };
         if meta.is_dir() {
             dirs.insert(p.clone());
             continue;
@@ -363,10 +372,33 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     // The function tier's view of gex-abi, which decompiled C includes.
     write_file(&out.join("gen/gex_abi.h"), gex_cgen::header::header().as_bytes(), false)?;
 
+    // A Windows program's stateful providers: LuaJIT's lua51.dll (which
+    // generates code at run time) is served by PUC Lua in wasm
+    // (docs/eject-pe.md §5).
+    let mut providers = Vec::new();
+    if nt.is_some() {
+        write_file(&out.join("gen/provider.h"), crate::pe::PROVIDER_H.as_bytes(), false)?;
+        for o in &project.objects {
+            let name = o.path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+            if name == "lua51.dll" && crate::pe::is_luajit(&out.join(rootfs_rel(&o.path)?))? {
+                providers.push(config::Provider { library: "lua51.dll".into(), dir: "user/lib/lua51".into() });
+            }
+        }
+    }
+
     // The user's part, once.
     let user = out.join("user");
     if !user.join("eject.json").exists() {
-        write_file(&user.join("eject.json"), config::template().as_bytes(), false)?;
+        write_file(&user.join("eject.json"), config::template_with(&providers).as_bytes(), false)?;
+    }
+    for p in &providers {
+        let lib = p.dir.rsplit('/').next().unwrap_or("");
+        if !out.join(&p.dir).exists() {
+            for (l, path, bytes, exec) in crate::libs::LIBS.iter().filter(|(l, ..)| *l == lib) {
+                let _ = l;
+                write_file(&out.join(&p.dir).join(path), bytes, *exec)?;
+            }
+        }
     }
     if !user.join("README").exists() {
         write_file(&user.join("README"), templates::USER_README.as_bytes(), false)?;

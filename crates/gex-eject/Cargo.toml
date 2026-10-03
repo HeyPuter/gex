@@ -16,6 +16,7 @@ gex-kernel.workspace = true
 gex-cgen.workspace = true
 gex-ir.workspace = true
 anyhow = "1"
+wasmparser = "0.219.2"
 
 [features]
 # For an x86-64 guest. See `gex_abi::X86`.
