@@ -406,7 +406,10 @@ pub fn map_image(
     } else {
         st::SUCCESS
     };
-    if let Some(hook) = IMAGE_MAPPED.get() {
+    // Not for an image ntdll is about to relocate in place: a function-tier
+    // unit is built from the image as gex maps it, and ntdll's relocation
+    // then changes the code under it. Such an image runs on tier-1.
+    if let (Some(hook), false) = (IMAGE_MAPPED.get(), moved_static) {
         hook(&MappedImage { path, base, pe: img });
     }
     Ok((base, status))
