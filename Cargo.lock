@@ -674,6 +674,7 @@ dependencies = [
  "anyhow",
  "gex-abi",
  "gex-cache",
+ "gex-cgen",
  "gex-eject",
  "gex-emit",
  "gex-ir",
@@ -681,6 +682,7 @@ dependencies = [
  "gex-ld",
  "gex-native",
  "gex-xlate",
+ "libc",
 ]
 
 [[package]]

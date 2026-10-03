@@ -90,7 +90,12 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
         .with_kernel(|k| nt::boot::boot(&p, k, memory.bytes(), &req))
         .map_err(|e| anyhow!("starting {}: {e}", setup.exe_path))?;
     if let Some(out) = &setup.display_out {
-        *p.display_host.lock().unwrap() = Some(Arc::new(PpmDisplay::new(out)));
+        // `--wayland-out null`: frames are presented and dropped (the
+        // throughput recipe, docs/noita-perf.md: pewasm's null GL shows
+        // nothing either).
+        let host: Arc<dyn nt::display::NtDisplay> =
+            if out == "null" { Arc::new(NullDisplay) } else { Arc::new(PpmDisplay::new(out)) };
+        *p.display_host.lock().unwrap() = Some(host);
     }
     store.data_mut().nt = Some(Arc::clone(&p));
     let sampler = store.data().sampler.clone();
@@ -153,6 +158,16 @@ fn layout_misses() -> u64 {
 /// bounding box, into `PREFIX-NNNNN.ppm`. A file is what a test compares and
 /// what works with no screen. There is no native input source: input is
 /// `GEX_NT_INPUT`'s.
+struct NullDisplay;
+
+impl nt::display::NtDisplay for NullDisplay {
+    fn publish(&self, _mem: &GuestMem<'_>, _s: &nt::display::NtSurface) {}
+    fn remove(&self, _id: u32) {}
+    fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {
+        Vec::new()
+    }
+}
+
 struct PpmDisplay {
     prefix: String,
     state: Mutex<PpmState>,
@@ -284,6 +299,24 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                             .map(|(f, t, c)| format!("{} -> {} x{c}", p.describe_addr(f), p.describe_addr(t)))
                             .collect();
                         eprintln!("gex-nt: nest exits (1 in 4096) {}", ex.join(" | "));
+                        if let Some(l) = crate::aot_share::line() {
+                            eprintln!("gex-nt: {l}");
+                        }
+                        let (lt, lv) = crate::take_leave_sites(15);
+                        let lv: Vec<String> = lv
+                            .into_iter()
+                            .map(|(f, t, c)| format!("{} -> {}{} x{c}", p.describe_addr(f), p.describe_addr(t & !(1 << 63)), if t >> 63 != 0 { " [patched]" } else { "" }))
+                            .collect();
+                        eprintln!("gex-nt: leaves among them x{lt}: {}", lv.join(" | "));
+                        let fb: Vec<String> = crate::ftab::stats::take_fallback_sites(15)
+                            .into_iter()
+                            .map(|(t, c)| format!("{} x{c}", p.describe_addr(t)))
+                            .collect();
+                        eprintln!("gex-nt: fallback targets (1 in 1024) {}", fb.join(" | "));
+                        let (tot, top) = crate::ftab::stats::take_resume_causes(12);
+                        let tot: Vec<String> = tot.iter().map(|(c, k)| format!("{c} x{k}")).collect();
+                        let top: Vec<String> = top.iter().map(|((c, t), k)| format!("{c} -> {} x{k}", p.describe_addr(*t))).collect();
+                        eprintln!("gex-nt: resumes by cause {} || {}", tot.join(" | "), top.join(" | "));
                         let mut by: std::collections::BTreeMap<String, u64> = Default::default();
                         for (page, n) in crate::tier1_pages() {
                             let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
@@ -369,6 +402,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let p = Arc::clone(state.nt.as_ref().expect("an NT syscall in a Linux process"));
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
+    let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
         nt::syscall(&p, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
@@ -393,6 +427,9 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     match outcome {
         nt::Outcome::Continue => Ok(()),
         nt::Outcome::Resume(target) => {
+            if crate::ftab::stats_on() {
+                state.resume_cause = Some(nt::syscall_name(nr));
+            }
             state.resume_at = Some(target);
             Err(StopExecution.into())
         }
@@ -451,7 +488,12 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
     let (code, rip, info) = fault.exception(pc).expect("every fault but X87 is an exception");
     let outcome = nt::hardware_exception(&p, &*state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {
-        nt::Outcome::Resume(target) => state.resume_at = Some(target),
+        nt::Outcome::Resume(target) => {
+            if crate::ftab::stats_on() {
+                state.resume_cause = Some(format!("exception {code:#x} at {pc:#x}"));
+            }
+            state.resume_at = Some(target)
+        }
         nt::Outcome::Exit(code) => state.exit = Some(Exit::Status(code as i32)),
         other => bail!("gex-nt: unexpected outcome {other:?} from exception dispatch"),
     }
@@ -531,6 +573,8 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
             return Ok(());
         }
         if let Some(next) = caller.data_mut().resume_at.take() {
+            crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::note_resume(caller.data_mut(), next, "callback loop");
             pc = next;
             continue;
         }

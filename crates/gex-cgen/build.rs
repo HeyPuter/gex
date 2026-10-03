@@ -60,8 +60,12 @@ fn main() {
     // gex-abi is not hashed here: what the C takes from it is the generated
     // header and the values `image::abi_fingerprint` lists, which the unit
     // key hashes at run time.
-    let unit = src("gex-cgen");
-    let mut unit = unit;
+    // provider.rs is not: what export providers change in a unit (the
+    // addresses that become stubs, and the providers' sources) is in the
+    // unit key itself (`gex_native::nt_cgen::unit_key`), and the provider
+    // list must be able to grow without rebuilding every unit.
+    let mut unit: Vec<PathBuf> =
+        src("gex-cgen").into_iter().filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("provider.rs")).collect();
     let rt = here.join("runtime");
     println!("cargo:rerun-if-changed={}", rt.display());
     walk(&rt, &mut unit);

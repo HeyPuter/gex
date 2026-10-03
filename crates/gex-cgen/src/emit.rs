@@ -44,6 +44,13 @@ fn ballast() -> usize {
         .unwrap_or(0)
 }
 
+/// `GEX_CGEN_DISP=0`: guard every i386 address after its displacement, as
+/// before (`Emitter::note_disp`).
+fn disp_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("GEX_CGEN_DISP").as_deref() == Ok("0"))
+}
+
 fn no_guard() -> bool {
     std::env::var_os("GEX_UNSAFE_NO_GUARD").is_some()
 }
@@ -53,6 +60,28 @@ pub(crate) fn cty(ty: Ty) -> &'static str {
         Ty::I32 => "uint32_t",
         Ty::I64 => "uint64_t",
         Ty::V128 => "v128_t",
+    }
+}
+
+/// Whether `r` lives in a 32-bit C variable: an i386 program's
+/// general-purpose registers (the context slot is 64 bits, but every write
+/// zero-extends, so the low half is the register). `GEX_CGEN_NARROW=0` keeps
+/// them 64-bit. Arithmetic, addresses and compares then stay in i32, where
+/// wasm needs no wraps and extends between them.
+pub(crate) fn narrow_reg(r: GuestReg, class32: bool) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    class32
+        && gex_abi::X86
+        && matches!(r, GuestReg::X(n) if n < 8)
+        && *ON.get_or_init(|| std::env::var("GEX_CGEN_NARROW").as_deref() != Ok("0"))
+}
+
+/// The C type of `r`'s variable.
+pub(crate) fn reg_cty(r: GuestReg, class32: bool) -> &'static str {
+    if narrow_reg(r, class32) {
+        "uint32_t"
+    } else {
+        cty(r.ty())
     }
 }
 
@@ -164,7 +193,7 @@ impl Unit {
         self.protos.extend(e.called.iter().copied());
         let _ = writeln!(self.bodies, "void {}(int ctx) {{", fn_name(block.start));
         for (r, _) in e.declared.iter() {
-            let _ = writeln!(self.bodies, "  {} {};", cty(r.ty()), reg_name(*r));
+            let _ = writeln!(self.bodies, "  {} {};", reg_cty(*r, e.class32), reg_name(*r));
         }
         self.bodies.push_str(&e.out);
         self.bodies.push_str("}\n\n");
@@ -214,6 +243,16 @@ pub(crate) struct Emitter<'a> {
     called: BTreeSet<u64>,
     /// Counter for block-scoped temporaries.
     tmp: u32,
+    /// An i386 program: its GPRs are 32-bit variables (`narrow_reg`).
+    pub(crate) class32: bool,
+    /// Values known to be below 2^32 (a zero-extension, a narrow register).
+    value_zext: Vec<bool>,
+    /// `base + c` (stage 0), its wrap to 32 bits (1) and that zero-extended
+    /// (2), for a `base` below 2^32 and 0 <= c <= 0xffff: an i386 effective
+    /// address with a displacement, which `address` turns into the guarded
+    /// base plus a static offset (tier-1's shape, and the guard of one base
+    /// shared by every displacement from it).
+    value_disp: Vec<Option<(Value, u64, u8)>>,
 }
 
 impl<'a> Emitter<'a> {
@@ -231,6 +270,9 @@ impl<'a> Emitter<'a> {
             value_half: vec![false; n],
             called: BTreeSet::new(),
             tmp: 0,
+            class32: false,
+            value_zext: vec![false; n],
+            value_disp: vec![None; n],
         }
     }
 
@@ -240,6 +282,8 @@ impl<'a> Emitter<'a> {
         self.value_ty = vec![Ty::I64; n];
         self.value_const = vec![None; n];
         self.value_half = vec![false; n];
+        self.value_zext = vec![false; n];
+        self.value_disp = vec![None; n];
     }
 
     /// The C emitted so far, leaving the emitter empty.
@@ -292,6 +336,8 @@ impl<'a> Emitter<'a> {
             "(uint64_t)(uint32_t)ctx".to_string()
         } else if r.is_flag() {
             format!("GEX_C8({off}u)")
+        } else if narrow_reg(r, self.class32) {
+            format!("GEX_C32({off}u)")
         } else {
             match r.ty() {
                 Ty::I32 => format!("GEX_C32({off}u)"),
@@ -308,6 +354,23 @@ impl<'a> Emitter<'a> {
         self.declared.insert(r, ());
         self.line(format!("{} = {val};", reg_name(r)));
         self.regs.insert(r, true);
+    }
+
+    /// The registers currently dirty (differ from the context).
+    pub(crate) fn dirty_set(&self) -> RegSet {
+        let v: Vec<GuestReg> = self.regs.iter().filter(|(_, d)| **d).map(|(r, _)| *r).collect();
+        RegSet::of(&v)
+    }
+
+    /// Mark `set` dirty again (registers a call left untouched in locals).
+    pub(crate) fn mark_dirty(&mut self, set: RegSet) {
+        if let Some(fr) = &self.func_regs {
+            for r in fr.used.iter() {
+                if set.contains(*r) {
+                    self.regs.insert(*r, true);
+                }
+            }
+        }
     }
 
     /// Function mode: the registers that may differ from the context here.
@@ -427,6 +490,19 @@ impl<'a> Emitter<'a> {
             self.load_regs(&u);
             self.regs.clear();
             return;
+        }
+        self.regs.clear();
+    }
+
+    /// Function mode, after a call that returned as predicted: load only the
+    /// used registers in `load` (what the continuation may read). The others
+    /// keep stale locals, marked clean like everything else, so no
+    /// write-back stores them before they are written again (which needs
+    /// clean-spill elision: `FnRegs::clean_spills`).
+    pub(crate) fn invalidate_only(&mut self, load: RegSet) {
+        if let Some(fr) = &self.func_regs {
+            let u: Vec<GuestReg> = fr.used.iter().copied().filter(|r| load.contains(*r)).collect();
+            self.load_regs(&u);
         }
         self.regs.clear();
     }
@@ -551,7 +627,61 @@ impl<'a> Emitter<'a> {
         )
     }
 
+    /// The unguarded flavor (`image::unguarded`) for an i386 unit: every
+    /// address is reduced mod 2^32 and used as is. Past the guest memory
+    /// (whose end, `GUEST_LIMIT`, is the linear memory's maximum) an access
+    /// traps on its own, exactly as the guard would make it. Not for a
+    /// 64-bit guest, whose addresses a truncation would alias.
+    fn unguarded(&self) -> bool {
+        self.class32 && crate::image::unguarded()
+    }
+
+    /// Track `value_zext` and `value_disp` for the definition of value `idx`.
+    fn note_disp(&mut self, idx: usize, expr: &Expr) {
+        if idx >= self.value_zext.len() || !gex_abi::X86 || disp_off() {
+            return;
+        }
+        let z = |me: &Self, v: &Value| me.value_zext.get(v.0 as usize).copied().unwrap_or(false);
+        let k = |me: &Self, v: &Value| me.value_const.get(v.0 as usize).copied().flatten();
+        let disp = |me: &Self, v: &Value| me.value_disp.get(v.0 as usize).copied().flatten();
+        match expr {
+            Expr::ReadReg(r) => self.value_zext[idx] = narrow_reg(*r, self.class32),
+            Expr::Extend { a, signed: false } => {
+                self.value_zext[idx] = true;
+                if let Some((b, c, 1)) = disp(self, a) {
+                    self.value_disp[idx] = Some((b, c, 2));
+                }
+            }
+            Expr::Wrap(a) => {
+                if let Some((b, c, 0)) = disp(self, a) {
+                    self.value_disp[idx] = Some((b, c, 1));
+                }
+            }
+            Expr::Bin { op: BinOp::Add, ty: Ty::I64, a, b } => {
+                if let Some(c) = k(self, b).filter(|c| *c <= 0xffff).filter(|_| z(self, a)) {
+                    self.value_disp[idx] = Some((*a, c, 0));
+                } else if let Some(c) = k(self, a).filter(|c| *c <= 0xffff).filter(|_| z(self, b)) {
+                    self.value_disp[idx] = Some((*b, c, 0));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn address(&self, addr: Value, offset: i64) -> String {
+        // An i386 base-plus-displacement address (`value_disp`): the
+        // displacement rides on the guarded base, as tier-1's static offset
+        // does. Only a sum past 2^32 (which the guest would wrap to low
+        // memory) differs: it traps.
+        if offset == 0 && (!no_guard() || self.unguarded()) {
+            if let Some((b, c, 2)) = self.value_disp.get(addr.0 as usize).copied().flatten() {
+                return if self.unguarded() {
+                    format!("(GEX_P((uint32_t){}) + {c}u)", self.v(b))
+                } else {
+                    format!("(gex_gb({}) + {c}u)", self.v(b))
+                };
+            }
+        }
         if let Some(c) = self.value_const[addr.0 as usize] {
             let ea = c.wrapping_add(offset as u64);
             return if ea < GUEST_LIMIT {
@@ -562,14 +692,18 @@ impl<'a> Emitter<'a> {
         }
         let a = self.v(addr);
         let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
-        if no_guard() {
+        if no_guard() || self.unguarded() {
             if (0..=max_static).contains(&offset) {
                 return format!("(GEX_P((uint32_t){a}) + {offset}u)");
             }
             return format!("GEX_P((uint32_t)({a} + (uint64_t){offset}ll))");
         }
         if (0..=0xffff).contains(&offset) {
-            if offset == 0 {
+            if offset == 0 && self.class32 && !disp_off() {
+                // i386: every effective address is mod 2^32, so the guard
+                // works on 32 bits (a push's `sp - 4` included).
+                format!("gex_gb32((uint32_t)({a}))")
+            } else if offset == 0 {
                 format!("gex_gb({a})")
             } else {
                 format!("(gex_gb({a}) + {offset}u)")
@@ -583,7 +717,7 @@ impl<'a> Emitter<'a> {
 
     /// The guarded 32-bit address of a bulk operation's operand (no offset).
     fn bulk_address(&self, v: &str) -> String {
-        if no_guard() {
+        if no_guard() || self.unguarded() {
             format!("(uint32_t)({v})")
         } else {
             format!("gex_g({v})")
@@ -913,6 +1047,13 @@ impl<'a> Emitter<'a> {
         let idx = dst.0 as usize;
         self.value_ty[idx] = ty;
         let d = self.v(dst);
+        if let Some(z) = self.value_zext.get_mut(idx) {
+            *z = false;
+        }
+        if let Some(p) = self.value_disp.get_mut(idx) {
+            *p = None;
+        }
+        self.note_disp(idx, expr);
         let rhs: String = match expr {
             Expr::ConstI32(c) => {
                 self.value_const[idx] = Some(*c as u64);

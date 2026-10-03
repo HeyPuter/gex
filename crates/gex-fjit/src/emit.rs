@@ -175,9 +175,9 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         }
     };
     let regs = cf::registers(f);
-    let live = if cf::live_writebacks() { cf::live_in(f, m.sums) } else { vec![RegSet::ALL; n] };
+    let live = if cf::live_writebacks() { crate::prep::live_in(f, m.sums) } else { vec![RegSet::ALL; n] };
     let dirty: Vec<RegSet> = if cf::clean_spills() {
-        cf::dirty_in(f).iter().map(|d| RegSet::of(&d.iter().copied().collect::<Vec<_>>())).collect()
+        cf::dirty_in(f, &Default::default()).iter().map(|d| RegSet::of(&d.iter().copied().collect::<Vec<_>>())).collect()
     } else {
         vec![RegSet::of(&regs.written.iter().copied().collect::<Vec<_>>()); n]
     };
@@ -317,6 +317,17 @@ fn regs_of(s: RegSet) -> Vec<GuestReg> {
 /// Registers whose locals must be loaded wherever any are: the stack
 /// pointer (the return check reads its local, not a `ReadReg`) and the
 /// flags (a write-back packs all four).
+/// What a call's continuation reloads whether or not it reads it: SP, and
+/// the flags unless calls are taken to clobber them (`prep::flags_abi`), in
+/// which case only a continuation that reads one reloads it.
+fn after_call(used: RegSet) -> RegSet {
+    if crate::prep::flags_abi() {
+        RegSet::of(&[sp_reg()]).inter(used)
+    } else {
+        always(used)
+    }
+}
+
 fn always(used: RegSet) -> RegSet {
     flags().union(RegSet::of(&[sp_reg()])).inter(used)
 }
@@ -414,7 +425,7 @@ fn valid_in(
             let after = match &b.term {
                 FTerm::Call { callee, ret: Some(r), .. } => {
                     let kept = kept(m, callee);
-                    let reload = always(used).union(rlive[r.to.index()]).inter(used).minus(kept);
+                    let reload = after_call(used).union(rlive[r.to.index()]).inter(used).minus(kept);
                     v.inter(kept).union(reload)
                 }
                 FTerm::Syscall { .. } => used,
@@ -460,7 +471,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     let shape = Layout::Structured(Box::new(cfg::make_reducible(Graph { succs, entry: lp.header })?));
     let regs = cf::registers_in(f, &in_loop);
     let dirty: Vec<RegSet> = if cf::clean_spills() {
-        cf::dirty_in_from(f, lp.header, &in_loop)
+        cf::dirty_in_from(f, lp.header, &in_loop, &Default::default())
             .iter()
             .map(|d| RegSet::of(&d.iter().copied().collect::<Vec<_>>()))
             .collect()
@@ -1438,6 +1449,8 @@ impl E<'_, '_> {
                 }
                 None => RegSet::ALL,
             },
+            // No callee reads the flags it is entered with (`flags_abi`).
+            _ if crate::prep::flags_abi() => cf::non_flags(),
             _ => RegSet::ALL,
         };
         self.flush(need, false);
@@ -1554,7 +1567,7 @@ impl E<'_, '_> {
         // locals, clean, until written (`valid_in` keeps them out of any
         // write-back).
         let reload = match ret {
-            Some(r) => always(self.used).union(self.rlive[r]).inter(self.used).minus(keep),
+            Some(r) => after_call(self.used).union(self.rlive[r]).inter(self.used).minus(keep),
             None => RegSet::EMPTY,
         };
         self.b.load(&regs_of(reload));

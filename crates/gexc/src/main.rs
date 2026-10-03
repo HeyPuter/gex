@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod prof;
 mod eject;
 mod nt_run;
 mod pe_info;
@@ -39,8 +40,28 @@ fn real_main() -> Result<ExitCode> {
         usage();
         return Ok(ExitCode::from(2));
     }
+    // Natively, i386 units drop the bounds guard (the guest memory is the
+    // whole linear memory) and outline no loops (wasmtime compiles every
+    // function fully, so V8's missing OSR does not apply): `GEX_CGEN_GUARD=1`
+    // builds and uses the guarded, browser flavor instead.
+    // Only for what runs here: `gexc build` makes modules for the browser.
+    let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c");
+    gex_cgen::image::set_unguarded(native && std::env::var("GEX_CGEN_GUARD").as_deref() != Ok("1"));
     match argv[1].as_str() {
-        "run" => cmd_run(&argv[2..]),
+        "run" => {
+            // On a thread with a guest-sized stack: the first guest thread
+            // runs here (`gex_native::guest_thread_stack`).
+            let args = argv[2..].to_vec();
+            let r = std::thread::Builder::new()
+                .name("gex-main".into())
+                .stack_size(gex_native::guest_thread_stack())
+                .spawn(move || cmd_run(&args))
+                .expect("spawning the main guest thread")
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p));
+            prof::finish();
+            r
+        }
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
@@ -55,6 +76,7 @@ fn real_main() -> Result<ExitCode> {
         "funcs" => cmd_funcs(&argv[2..]),
         "hotset" => cmd_hotset(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-image" => cmd_cgen_image(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "cgen-c" => cmd_cgen_c(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-prefix" => cmd_cgen_prefix(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
             usage();
@@ -500,6 +522,7 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
+    prof::start();
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
     if gex_ld::pe::is_pe(&bytes) {
@@ -2152,6 +2175,52 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
 }
 
 /// `gexc cgen-image`: see the usage text.
+/// `gexc cgen-c <pe> [--pe-base HEX] [--recovery DIR] --at ADDR`: print the C the function
+/// tier's unit holds for one function, from the image's cached recovery
+/// (`gexc cgen-image` makes it).
+fn cmd_cgen_c(args: &[String]) -> Result<()> {
+    let (mut path, mut pe_base, mut at, mut rec) = (None, None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let hex = |v: Option<&String>| -> Result<u64> { Ok(u64::from_str_radix(v.context("needs an address")?.trim_start_matches("0x"), 16)?) };
+        match args[i].as_str() {
+            "--pe-base" => {
+                i += 1;
+                pe_base = Some(hex(args.get(i))?);
+            }
+            "--at" => {
+                i += 1;
+                at = Some(hex(args.get(i))?);
+            }
+            // Print the header the C includes (gex_abi.h) instead.
+            "--header" => {
+                print!("{}", gex_cgen::header::header());
+                return Ok(());
+            }
+            // A recovery directory to use rather than this build's key's.
+            "--recovery" => {
+                i += 1;
+                rec = Some(std::path::PathBuf::from(args.get(i).context("--recovery needs a directory")?));
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected a PE image")?;
+    let at = at.context("--at is required")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let base = pe_base.unwrap_or(pe.preferred_base);
+    let (image, _) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let dir = match rec {
+        Some(d) => d,
+        None => gex_native::nt_cgen::cache_root()?.join("recovery").join(gex_native::nt_cgen::recovery_key(&image)),
+    };
+    let read = |a: u64| image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied());
+    print!("{}", gex_cgen::image::function_c(&dir, at, &read)?);
+    Ok(())
+}
+
 fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let (mut path, mut pe_base) = (None, None);
     let mut jobs = 4usize;

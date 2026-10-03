@@ -10,6 +10,8 @@ name = "gexc"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
+gex-cgen.workspace = true
 gex-abi.workspace = true
 gex-ir.workspace = true
 gex-ld.workspace = true

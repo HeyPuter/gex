@@ -172,7 +172,13 @@ int main(void) {
     int fired = 0;
     for (int i = 0; i < 3; i++) fired += WaitForSingleObject(wt, 2000) == WAIT_OBJECT_0;
     CHECK("periodic timer", fired == 3);
-    CHECK("CancelWaitableTimer", CancelWaitableTimer(wt) && WaitForSingleObject(wt, 50) == WAIT_TIMEOUT);
+    /* Cancelling stops further periods but, as on Windows, leaves a period
+     * that already elapsed signalled (it may land between the last wait and
+     * the cancel under load): consume at most that one, then nothing more
+     * may fire. */
+    BOOL cancelled = CancelWaitableTimer(wt);
+    WaitForSingleObject(wt, 0);
+    CHECK("CancelWaitableTimer", cancelled && WaitForSingleObject(wt, 50) == WAIT_TIMEOUT);
     CloseHandle(wt);
 
     /* Sleep and clocks */

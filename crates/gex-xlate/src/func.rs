@@ -1048,7 +1048,26 @@ pub struct PeSeeds {
 /// ([`Image::class32`]); plus the seeds only a PE has: the entry point, TLS
 /// callbacks, base relocations whose target is code, and `.pdata`.
 pub fn pe_input(pe: &gex_ld::pe::PeImage, base: u64) -> Result<(Image, PeSeeds), String> {
-    let img = pe.map(base).map_err(|e| e.to_string())?;
+    let mut img = pe.map(base).map_err(|e| e.to_string())?;
+    // The import address tables hold, in the file, hint/name RVAs that the
+    // loader overwrites with the imports' addresses. Read as constant data
+    // (they usually sit in a read-only section) they made every `jmp [slot]`
+    // thunk a one-entry jump table into the middle of the hint table, which
+    // decodes as garbage and never returns -- so every call through a thunk
+    // (noita.exe's memset, memcpy...) was taken not to return, and its
+    // continuation was left out of the function. Recovered with the slots
+    // zeroed, a thunk's target is unknown: an indirect tail call.
+    {
+        let ptr = if pe.is64 { 8 } else { 4 };
+        let mut slots: Vec<usize> = pe.imports.iter().flat_map(|d| d.symbols.iter().map(|s| s.iat_rva as usize)).collect();
+        slots.extend(pe.delay_imports.iter().flat_map(|d| d.symbols.iter().map(|s| s.iat_rva as usize)));
+        for o in slots {
+            if let Some(b) = img.get_mut(o..o + ptr) {
+                b.fill(0);
+            }
+        }
+    }
+    let img = img;
     let segments = pe.segments(base, &img);
     let code: Vec<(u64, u64)> = pe
         .sections

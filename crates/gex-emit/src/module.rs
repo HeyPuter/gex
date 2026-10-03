@@ -537,6 +537,14 @@ impl Reader<'_> {
 /// The next `TranslatedModule::module_id`.
 static NEXT_MODULE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// What `gex.dispatch_miss` returns for "translated `pc` and installed it in
+/// this store: dispatch to it again". The miss stub then re-enters dispatch
+/// in place, so the wasm frames below it survive (no trap-out; unit frames
+/// included). Any other value is a table-0 slot to tail-call; a host may
+/// also trap out and resume instead. (Here, not in gex-abi, whose sources key
+/// every unit's recovery.)
+pub const DISPATCH_MISS_REDISPATCH: i32 = -1;
+
 pub struct ModuleBuilder {
     m: Module,
     text_base: u64,
@@ -548,6 +556,8 @@ pub struct ModuleBuilder {
     covered: Vec<(u64, u32)>,
     block_ty: u32,
     miss_stub: u32,
+    /// `enter(ctx, pc)`, which the miss stub re-dispatches through.
+    enter: u32,
     /// Guest block address -> wasm function index.
     blocks: HashMap<u64, u32>,
     /// Blocks awaiting code generation, paired with their function index.
@@ -733,6 +743,7 @@ impl ModuleBuilder {
             covered: Vec::new(),
             block_ty,
             miss_stub,
+            enter,
             blocks: HashMap::new(),
             pending: Vec::new(),
             imports,
@@ -1147,9 +1158,24 @@ impl ModuleBuilder {
             self.m.add_fill_all(no_args);
         }
         let started = crate::par::Stopwatch::start();
-        let wasm = self
-            .m
-            .encode_with_custom(&[(METADATA_SECTION, meta.encode())]);
+        let mut custom = vec![(METADATA_SECTION, meta.encode())];
+        // `GEX_PERFMAP`: a name section, `b_<guest address>` per block, so
+        // the host's perf map attributes tier-1 code to guest addresses.
+        if std::env::var_os("GEX_PERFMAP").is_some() {
+            let mut v: Vec<(u32, u64)> = self.blocks.iter().map(|(a, f)| (*f, *a)).collect();
+            v.sort_unstable();
+            let mut sub = Vec::new();
+            crate::wasm::write_u32(&mut sub, v.len() as u32);
+            for (f, a) in &v {
+                crate::wasm::write_u32(&mut sub, *f);
+                crate::wasm::write_name(&mut sub, &format!("b_{a:x}"));
+            }
+            let mut names = vec![1u8];
+            crate::wasm::write_u32(&mut names, sub.len() as u32);
+            names.extend_from_slice(&sub);
+            custom.push(("name", names));
+        }
+        let wasm = self.m.encode_with_custom(&custom);
         if timing {
             eprintln!("[timing]   encoding: {:.2}s", started.secs());
         }
@@ -1203,11 +1229,23 @@ impl ModuleBuilder {
 
     fn build_miss_stub(&self) -> Vec<u8> {
         let mut f = FuncBody::new(1);
-        f.local_get(0); // ctx argument for the eventual target
-        f.local_get(0); // and again, for dispatch_miss itself
-        f.local_get(0); // and as a memory address, to read the PC out
+        let r = f.add_local(ValType::I32);
+        f.local_get(0); // ctx, for dispatch_miss
+        f.local_get(0); // as a memory address, to read the PC out
         f.load(0x29, 3, ctx::PC as u32); // i64.load ctx.pc
         f.call(self.imports.dispatch_miss);
+        f.local_tee(r);
+        f.i32_const(DISPATCH_MISS_REDISPATCH);
+        f.byte(0x46); // i32.eq
+        f.if_void();
+        // Translated and installed: dispatch to it again, in place.
+        f.local_get(0);
+        f.local_get(0);
+        f.load(0x29, 3, ctx::PC as u32);
+        f.return_call_local(self.enter);
+        f.end();
+        f.local_get(0); // ctx argument for the target
+        f.local_get(r);
         f.return_call_indirect(self.block_ty, 0);
         f.finish()
     }
