@@ -262,6 +262,9 @@ pub struct FnUnit {
     /// minimal write-back, the live registers its callee never touches,
     /// which stay dirty in locals across it (`carried`).
     carry: HashMap<usize, RegSet>,
+    /// The functions that need no depth guard (`guard_free`), from the
+    /// recovery.
+    pub guardfree: HashSet<u64>,
 }
 
 impl Default for FnUnit {
@@ -326,6 +329,7 @@ impl FnUnit {
             class32: false,
             touched: HashMap::new(),
             carry: HashMap::new(),
+            guardfree: HashSet::new(),
         }
     }
 
@@ -444,7 +448,7 @@ impl FnUnit {
         // A trap-free function has none (its caller may not have written
         // everything back, and it must not leave): its whole subtree fits in
         // the reserve every other function keeps below the budget.
-        if !trapfree.contains_key(&f.entry) {
+        if !trapfree.contains_key(&f.entry) && !(self.guardfree.contains(&f.entry) && !exp("ALLGUARDS")) {
             let _ = writeln!(
                 fhead,
                 "  if (__builtin_expect(depth > {}, 0)) {{ GEX_C64({}u) = 0x{:x}ull; return 0; }}",
@@ -1529,6 +1533,62 @@ fn wb_bisect() -> bool {
     }
 }
 static WB_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The functions that need no recursion-depth guard (function-tier.md
+/// §7.1): not recursive, their whole call tree known (no indirect call, no
+/// unknown code, so nothing can re-enter them), and the tree's stack fits in
+/// the reserve every guarded function keeps below the budget, as a
+/// trap-free tree must. pewasm has no guard at all; this keeps gex's where
+/// a call chain can grow without bound.
+pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u64> {
+    let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
+    let mut cand: Vec<Option<(u32, Vec<usize>)>> = Vec::with_capacity(funcs.len());
+    for f in funcs {
+        let ok = sums.get(&f.entry).is_some_and(|s| !s.unknown_callee && !s.may_unwind);
+        let mut callees = Vec::new();
+        let mut bad = !ok;
+        for b in &f.blocks {
+            match &b.term {
+                FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => match idx.get(t) {
+                    Some(&c) => callees.push(c),
+                    None => bad = true,
+                },
+                FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } => bad = true,
+                _ => {}
+            }
+        }
+        cand.push((!bad).then(|| (frame_weight(&registers(f)), callees)));
+    }
+    // Depth-first, memoised; a cycle (recursion) fails every function on it.
+    fn visit(k: usize, cand: &[Option<(u32, Vec<usize>)>], memo: &mut [Option<Option<u32>>], onstack: &mut [bool]) -> Option<u32> {
+        if let Some(m) = memo[k] {
+            return m;
+        }
+        if onstack[k] {
+            return None;
+        }
+        onstack[k] = true;
+        let r = cand[k].as_ref().and_then(|(w, callees)| {
+            let mut deepest = 0u32;
+            for &c in callees {
+                deepest = deepest.max(visit(c, cand, memo, onstack)? + CALL_KNOWN_WEIGHT);
+            }
+            Some(w + deepest).filter(|n| *n <= TRAPFREE_RESERVE)
+        });
+        onstack[k] = false;
+        memo[k] = Some(r);
+        r
+    }
+    let mut memo = vec![None; funcs.len()];
+    let mut onstack = vec![false; funcs.len()];
+    let mut out = HashSet::new();
+    for k in 0..funcs.len() {
+        if visit(k, &cand, &mut memo, &mut onstack).is_some() {
+            out.insert(funcs[k].entry);
+        }
+    }
+    out
+}
 
 pub fn minimal_writeback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
