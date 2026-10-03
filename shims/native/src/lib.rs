@@ -3147,6 +3147,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let mut gm = GuestMem::new(memory.bytes());
                 gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, v as u64);
             }
+            if gex_abi::X86 && reg == gex_kernel::x86::SYSREG_TRACE {
+                let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let gm = GuestMem::new(memory.bytes());
+                lockstep::log_trace(&gm, ctx as u32 as u64, v as u64);
+            }
             if reg == gex_kernel::x86::SYSREG_X87 {
                 let memory = caller
                     .data()

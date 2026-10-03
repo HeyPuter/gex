@@ -39,6 +39,9 @@ pub mod sysreg {
     /// `cmpxchg16b`: written with the effective address; the host compares
     /// and swaps under its lock and sets `rax`, `rdx` and ZF in the context.
     pub const CMPXCHG16B: i32 = -102;
+    /// `GEX_TRACE_INSNS`: written with the pc before an instruction; the
+    /// host logs the context.
+    pub const TRACE: i32 = -103;
 }
 
 /// The x87 operations [`sysreg::X87`] carries: an operation code in the low
