@@ -11,7 +11,9 @@
 //! for those addresses are stubs that re-enter the table ([`stubs`]), so the
 //! library's own calls reach the provider too.
 //!
-//! `GEX_PROVIDERS=0` turns every provider off (A/B runs, lockstep).
+//! `GEX_PROVIDERS=0` turns every provider off (A/B runs, lockstep);
+//! `GEX_PROVIDER_SKIP=<export>[,<export>...]` leaves those exports to the
+//! guest's own code.
 
 use crate::{header, toolchain};
 use anyhow::{anyhow, bail, Context, Result};
@@ -67,6 +69,8 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     if binds.is_empty() {
         bail!("provider {name} provides nothing");
     }
+    let skip = std::env::var("GEX_PROVIDER_SKIP").unwrap_or_default();
+    binds.retain(|(_, e)| !skip.split(',').any(|s| s == e));
     let dlls = w[2].split(',').map(|d| d.to_ascii_lowercase()).collect();
     Ok(Provider { name, text, dlls, class32, binds })
 }

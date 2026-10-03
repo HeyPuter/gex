@@ -939,6 +939,29 @@ One general mechanism serves Windows and Linux guests on every tier.
 - **In the browser,** providers link into the shim, or into the units module
   for direct calls. It's the same code, since the host is wasm already.
 
+**As built (stream R, 10dc2c01).**
+- Sources are `crates/gex-cgen/providers/*.c`. The first line names the
+  libraries (`/* PROVIDES msvcr120.dll,ucrtbase.dll i386`), and
+  `GEX_PROVIDE(fn, "export")` binds an F_body to an export. `provider.h`
+  holds the i386 registers and stack, the return, and waits on guest words
+  with wasm atomics.
+- Each source is compiled with the units' toolchain into a position-
+  independent module (no data, no shadow stack), cached in the unit cache.
+- When a library maps, `nt_cgen` binds the functions at the exports'
+  addresses in ftab, after its unit, on every tier, `--no-cgen` included.
+- `GEX_PROVIDERS=0` turns every provider off.
+  `GEX_PROVIDER_SKIP=<export,...>` leaves single exports to the guest code.
+- *Deviation: hand-written adapters.* Each adapter is C written per
+  function in pewasm's form (it reads its arguments, sets EAX, pops the
+  return address plus N, and returns 1 on the predicted return). They are
+  not descriptors plus generated thunks: "use the same code".
+- *Deviation: no direct call from units.* A unit reaches a provider through
+  the leave stub at the export's address. The stub probes the fcache, then
+  makes one indirect call; the provided addresses are the unit build's
+  `stubs`, and they are in the unit key.
+- *Later, only if the units profile shows the probe:* a direct call from
+  units to the provider.
+
 #### 9.9.2 Contents, in order (each step ranked by profile, gated on fps)
 
 1. **Synchronisation** (R's current work):
