@@ -299,6 +299,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                             .map(|(f, t, c)| format!("{} -> {} x{c}", p.describe_addr(f), p.describe_addr(t)))
                             .collect();
                         eprintln!("gex-nt: nest exits (1 in 4096) {}", ex.join(" | "));
+                        let (lt, lv) = crate::take_leave_sites(15);
+                        let lv: Vec<String> = lv.into_iter().map(|(f, t, c)| format!("{} -> {} x{c}", p.describe_addr(f), p.describe_addr(t))).collect();
+                        eprintln!("gex-nt: leaves among them x{lt}: {}", lv.join(" | "));
                         let fb: Vec<String> = crate::ftab::stats::take_fallback_sites(15)
                             .into_iter()
                             .map(|(t, c)| format!("{} x{c}", p.describe_addr(t)))

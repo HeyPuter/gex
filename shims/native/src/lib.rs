@@ -3127,6 +3127,25 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // again, with this block as a mate, into a trampoline.
             if op == gex_abi::cache_op::NEST_EXIT_SAMPLE {
                 *EXIT_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((pc as u64, addr as u64)).or_default() += 1;
+                // A normal return leaves PC at the word `ret` just popped
+                // (still in memory below SP); anything else is a leave: the
+                // function, or something it called, went elsewhere, and
+                // every unit frame between it and that place is gone.
+                if let Some(memory) = caller.data().memory.clone() {
+                    let gm = GuestMem::new(memory.bytes());
+                    let c = caller.data().thread.ctx_addr;
+                    let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+                    let popped = if gex_xlate::arch::compat() {
+                        gm.read_u32(sp.wrapping_sub(4)).map(|v| v as u64).unwrap_or(1)
+                    } else {
+                        gm.read_u64(sp.wrapping_sub(8)).unwrap_or(1)
+                    };
+                    let leave = (addr as u64) != popped
+                        && !gm.read(sp.wrapping_sub(64), 64).map(|w| w.chunks(4).any(|x| u32::from_le_bytes(x.try_into().unwrap()) as u64 == addr as u64)).unwrap_or(false);
+                    if leave {
+                        *LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((pc as u64, addr as u64)).or_default() += 1;
+                    }
+                }
                 return Ok(());
             }
             if op == gex_abi::cache_op::PAGE_STALE {
@@ -3766,6 +3785,19 @@ static EXIT_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = M
 
 /// The `n` most sampled nest exits since the last call, as
 /// `function->target count`.
+/// Sampled nest exits that were not a plain return (see NEST_EXIT_SAMPLE).
+static LEAVE_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// The `n` most sampled leaves since the last call, and their total.
+pub(crate) fn take_leave_sites(n: usize) -> (u64, Vec<(u64, u64, u64)>) {
+    let m = LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let total = m.values().sum();
+    let mut v: Vec<_> = m.into_iter().map(|((f, t), c)| (f, t, c)).collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v.truncate(n);
+    (total, v)
+}
+
 pub(crate) fn take_exit_sites(n: usize) -> Vec<(u64, u64, u64)> {
     let m = EXIT_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut v: Vec<_> = m.into_iter().map(|((f, t), c)| (f, t, c)).collect();
