@@ -451,4 +451,29 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
 
 ## Status
 
-- 2026-10-03: design (this file). Nothing built yet.
+- 2026-10-03: design (this file).
+- E1-E3 built (merge/eject9): recording, eject, build (units reused by key
+  from `GEX_EJECT_UNIT_CACHE`, `.cwasm` at build time, exact layout,
+  recovery seeded with recorded indirect-call targets), and the AOT-only
+  runtime (`gex_native::aot_only`). tests/nt x86 ejected and run with no
+  run-time translation, same stdout and exit as a normal run: hello_args,
+  sync, mtx, crtmem, tls, icall, user_win, gdi, exitproc, input, display,
+  window, lowmem, filemap, and the GL demo glcompat.
+  - Stop loudly, by design: jitcode, detour, pagespan (code written or
+    patched at run time).
+  - Stop loudly, not yet covered: cxx, seh, apc. Each resumes at an
+    interior address after an exception or APC (a catch continuation, the
+    instruction after a faulting call, the trampoline page after an
+    alertable wait). Needs §3.3's region entries, or units resuming at
+    escape targets plus nested hardware faults and APCs.
+- E4/E5 in part: stateful providers (`gex_native::libprov`) and the Lua
+  provider (`crates/gex-eject/libs/lua51`, 275 KiB). A LuaJIT host
+  program (states, chunks, guest C functions, errors from them caught by
+  Lua and by the host, nested calls, coroutines, GC, bit, string.format)
+  ejected with it gives LuaJIT's output except two cosmetic differences:
+  %f rounds exact ties to even (MSVC rounds them away), and a long chunk
+  name is abbreviated PUC Lua's way.
+- Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
+  lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
+  `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
+  provider replaces DllMain, so the eject does not depend on it.
