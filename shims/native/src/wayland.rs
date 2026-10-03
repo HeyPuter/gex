@@ -80,10 +80,22 @@ impl Wayland {
         }
     }
 
-    /// Write every committed frame as a PPM at `prefix-NNN.ppm` -- a file is
-    /// what a test can compare and what works with no display.
+    /// Write every committed frame (every Nth with `GEX_PPM_EVERY=N`) as a
+    /// PPM at `prefix-NNN.ppm` -- a file is what a test can compare and what
+    /// works with no display.
     pub fn write_frames_to(&self, prefix: &str) {
         *self.inner.out.lock().unwrap() = Some(prefix.to_string());
+    }
+
+    /// `GEX_PPM_EVERY=N` (crate::ppm_every): count a frame that is not
+    /// written, so the ones that are keep their real index.
+    fn skip_frame(&self) -> bool {
+        let mut n = self.inner.written.lock().unwrap();
+        if *n % crate::ppm_every() == 0 {
+            return false;
+        }
+        *n += 1;
+        true
     }
 
     /// Write out what was drawn: with a GPU, the whole composited screen;
@@ -92,6 +104,9 @@ impl Wayland {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
+        if self.skip_frame() {
+            return;
+        }
         let mut gpu = self.inner.gpu.lock().unwrap();
         let (width, height, rgb) = if let Some(c) = gpu.as_mut() {
             match c.draw(frames).and_then(|()| c.read_back()) {
@@ -124,6 +139,9 @@ impl Wayland {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
+        if self.skip_frame() {
+            return;
+        }
         let mut n = self.inner.written.lock().unwrap();
         let path = format!("{prefix}-{:03}.ppm", *n);
         *n += 1;

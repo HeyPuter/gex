@@ -479,6 +479,15 @@ pub fn x87_op(op: i32, a_sig: u64, a_se: u16, b_sig: u64, b_se: u16, cw: u16) ->
     }
 }
 
+/// `GEX_PPM_EVERY=N`: `--wayland-out` writes every Nth frame only, each
+/// named by its real index (so `GEX_NT_INPUT`'s frame numbers still line up
+/// and the newest name is the frame count). A long run otherwise writes a
+/// frame at every present, 6 MB each at 1920x1080.
+pub(crate) fn ppm_every() -> u32 {
+    static EVERY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| std::env::var("GEX_PPM_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1))
+}
+
 pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
