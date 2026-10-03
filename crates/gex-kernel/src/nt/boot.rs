@@ -279,7 +279,12 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
         let wine = read_file(k, &format!("{}/.wine-version", p.cfg.prefix)).unwrap_or_default();
         let layout = section::Layout::parse(&String::from_utf8_lossy(&text), &p.cfg.prefix, &String::from_utf8_lossy(&wine))?;
         let mut stl = p.st.lock().unwrap();
-        stl.vm.reserved = layout.ranges_under(&sys);
+        if layout.exact {
+            stl.vm.reserved = layout.ranges();
+            stl.vm.strict_reserved = true;
+        } else {
+            stl.vm.reserved = layout.ranges_under(&sys);
+        }
         stl.layout = Some(Arc::new(layout));
     }
 
