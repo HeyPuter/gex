@@ -32,4 +32,4 @@ ppc = ["gex-abi/ppc", "dep:gex-isa-ppc", "dep:gex-lift-ppc"]
 # tier-1 module. Needs clang and wasm-ld at translation time, so native only.
 cgen = ["dep:gex-cgen"]
 # The function JIT (`Options::fjit`): GIR straight to wasm, no toolchain.
-fjit = ["dep:gex-fjit"]
+fjit = ["dep:gex-fjit", "dep:gex-cgen"]

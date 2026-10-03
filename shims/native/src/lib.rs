@@ -1386,6 +1386,7 @@ fn run_thread_loop(
             }
             Err(e) => {
                 if let Some(next) = store.data_mut().resume_at.take() {
+                    crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     pc = next;
                     continue;
                 }
@@ -3972,6 +3973,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             break Err(e);
         }
         if let Some(at) = caller.data_mut().resume_at.take() {
+            crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             pc = at;
             refresh_callouts(&mut *caller)?;
             continue;

@@ -142,6 +142,40 @@ fn an_i386_elf_program_recovers_with_its_table_stdcall_and_noreturn() {
     check_all(&prog.functions, &sums, 64);
 }
 
+/// The return check of an AOT unit (and of the function JIT) expects SP
+/// back past what the `ret` pops: 4 for `ret`, 8 for g's stdcall `ret $4`.
+/// With only 4, every stdcall return failed its check and left.
+#[cfg(feature = "cgen")]
+#[test]
+fn the_return_check_counts_what_ret_n_pops() {
+    let img = elf32();
+    let prog = recover(&img, None, &RecoverOptions::default());
+    let sums = gex_xlate::summary::analyze(&prog).map;
+    let byte = |a: u64| {
+        img.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+    };
+    let funcs = gex_cgen::select(
+        prog.functions.into_values().collect(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
+    )
+    .unwrap();
+    // g's `ret $4` is at 0x10045.
+    let pops = gex_cgen::func::ret_pops(&funcs, true, &byte);
+    assert_eq!(pops, [(0x10045u64, 8u64)].into_iter().collect());
+    let c = gex_cgen::standalone::standalone(&funcs, &[(0x10000, "f".into()), (0x10041, "g".into())], &sums, true, &byte)
+        .unwrap();
+    let body = |entry: u64| {
+        let def = format!("{}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", gex_cgen::func::body_name(entry));
+        let start = c.find(&def).unwrap_or_else(|| panic!("no {def} in\n{c}"));
+        let rest = &c[start..];
+        rest[..rest.find("\n}\n").unwrap()].to_string()
+    };
+    let (f, g) = (body(0x10000), body(0x10041));
+    assert!(f.contains("== sp0 + 4ull"), "{f}");
+    assert!(g.contains("== sp0 + 8ull") && !g.contains("== sp0 + 4ull"), "{g}");
+}
+
 /// `tests/pe/switch32.exe` (see `tests/pe/build.sh`): MinGW -O2, no CRT.
 /// `_pick` has a seven-case jump table and a `.cold` part, `_scale@8` is
 /// stdcall, `_entry` calls `pick` through a pointer and `ExitProcess`

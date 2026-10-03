@@ -303,40 +303,9 @@ fn slot_target(f: &Function, b: gex_ir::func::BlockId, v: gex_ir::Value, mem: &[
     Some(if n == 4 { u32::from_le_bytes(bytes.try_into().ok()?) as u64 } else { u64::from_le_bytes(bytes.try_into().ok()?) })
 }
 
-/// Where a function's `ret` pops more than the return address (i386
-/// `ret N`: stdcall callees, struct returns): the terminator's pc and how
-/// far it moves SP, for the function JIT's return check, which otherwise
-/// sees SP past where the caller expects and leaves. `read` gives a guest
-/// byte. Empty off x86.
-pub fn ret_pops(functions: &[Function], class32: bool, read: &dyn Fn(u64) -> Option<u8>) -> HashMap<u64, u64> {
-    let mut out = HashMap::new();
-    if !gex_abi::X86 {
-        return out;
-    }
-    let ptr = if class32 { 4 } else { 8 };
-    for f in functions {
-        for b in &f.blocks {
-            if !matches!(b.term, gex_ir::func::FTerm::Return { .. }) || b.synthetic {
-                continue;
-            }
-            let mut a = b.term_pc;
-            // `rep ret` / `bnd ret`; an operand-size prefix (a 16-bit
-            // pop) gets no entry, and its check leaves.
-            while matches!(read(a), Some(0xf2 | 0xf3)) && a < b.term_pc + 4 {
-                a += 1;
-            }
-            if read(a) == Some(0xc2) {
-                if let (Some(lo), Some(hi)) = (read(a + 1), read(a + 2)) {
-                    let n = u16::from_le_bytes([lo, hi]) as u64;
-                    if n != 0 {
-                        out.insert(b.term_pc, ptr + n);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
+/// Where a function's `ret` pops more than the return address
+/// (`gex_cgen::func::ret_pops`, which the AOT tier's return check uses too).
+pub use gex_cgen::func::ret_pops;
 
 impl State {
     fn line(&self) -> String {

@@ -85,6 +85,41 @@ pub fn ret_sp_delta(class32: bool) -> u64 {
     }
 }
 
+/// Where a function's `ret` pops more than the return address (i386
+/// `ret N`: stdcall callees, struct returns): the terminator's pc and how
+/// far it moves SP, for the return check of AOT units and the function JIT,
+/// which otherwise sees SP past where the caller expects and leaves. `read`
+/// gives a guest byte. Empty off x86.
+pub fn ret_pops(functions: &[Function], class32: bool, read: &dyn Fn(u64) -> Option<u8>) -> HashMap<u64, u64> {
+    let mut out = HashMap::new();
+    if !gex_abi::X86 {
+        return out;
+    }
+    let ptr = if class32 { 4 } else { 8 };
+    for f in functions {
+        for b in &f.blocks {
+            if !matches!(b.term, gex_ir::func::FTerm::Return { .. }) || b.synthetic {
+                continue;
+            }
+            let mut a = b.term_pc;
+            // `rep ret` / `bnd ret`; an operand-size prefix (a 16-bit
+            // pop) gets no entry, and its check leaves.
+            while matches!(read(a), Some(0xf2 | 0xf3)) && a < b.term_pc + 4 {
+                a += 1;
+            }
+            if read(a) == Some(0xc2) {
+                if let (Some(lo), Some(hi)) = (read(a + 1), read(a + 2)) {
+                    let n = u16::from_le_bytes([lo, hi]) as u64;
+                    if n != 0 {
+                        out.insert(b.term_pc, ptr + n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The recursion-depth guard (`docs/function-tier.md` §7). `depth` is an
 /// estimate, in bytes, of the engine stack the C frames below this one in
 /// the nest use; a function whose own frame would take it past this budget
@@ -197,6 +232,9 @@ pub struct FnUnit {
     weight: u32,
     /// How far a `ret` moves SP: 8 on x86-64, 4 for an i386 program.
     pub ret_sp_delta: u64,
+    /// Where a `ret` moves it further ([`ret_pops`], by the terminator's
+    /// pc): i386 `ret N`. Whoever adds a function fills in its entries.
+    pub ret_pops: HashMap<u64, u64>,
     /// Registers live on entry to each block of the function being emitted
     /// (`live_in`): write-backs on internal edges and at calls to functions
     /// with a summary store only these.
@@ -210,6 +248,8 @@ pub struct FnUnit {
     pub ftab: bool,
     /// The functions with a body here, in order (a whole-image unit's).
     defined: Vec<u64>,
+    /// The body being emitted has a `goto gex_resume` (`resume_block`).
+    resumes: bool,
 }
 
 impl Default for FnUnit {
@@ -232,10 +272,12 @@ impl FnUnit {
             uses_call_known: false,
             weight: 0,
             ret_sp_delta: ret_sp_delta(false),
+            ret_pops: HashMap::new(),
             live: Vec::new(),
             standalone: false,
             ftab: false,
             defined: Vec::new(),
+            resumes: false,
         }
     }
 
@@ -435,6 +477,12 @@ impl FnUnit {
             self.term(&mut e, f, i, known, sums, trapfree, &mut calls, None, Some(&heads))?;
             e.line("}");
         }
+        // Always there in a whole-image unit's body (clang drops it when
+        // nothing goes there).
+        self.resumes = false;
+        if self.ftab {
+            resume_block(&mut e, f);
+        }
         self.bodies.push_str(&e.take_output());
         self.bodies.push_str("}\n\n");
 
@@ -502,6 +550,11 @@ impl FnUnit {
         let b = &f.blocks[i];
         let live = &self.live;
         let self_weight = self.weight;
+        // A whole-image unit's body (not a loop function) catches what its
+        // callees leave for (`resume_block`): where they fail, it goes there.
+        let ftab = self.ftab;
+        let resumed = std::cell::Cell::new(false);
+        let fail = if ftab && scope.is_none() { "goto gex_resume;" } else { "return 0;" };
         let goto = |e: &mut Emitter<'_>, edge: &Edge| {
             if !edge.args.is_empty() {
                 unreachable!("memory form has no edge arguments");
@@ -535,7 +588,13 @@ impl FnUnit {
                             loop_name(h.fname, k),
                             self_weight
                         ));
-                        e.line("  if (lr <= 1) return lr;");
+                        if ftab {
+                            resumed.set(true);
+                            e.line("  if (lr == 0) goto gex_resume;");
+                            e.line("  if (lr == 1) return 1;");
+                        } else {
+                            e.line("  if (lr <= 1) return lr;");
+                        }
                         e.load_regs(h.used);
                         e.line("  switch (lr) {");
                         for x in &lp.exits {
@@ -637,11 +696,15 @@ impl FnUnit {
                 e.line("default:;");
                 e.line("}");
                 if self.ftab {
-                    // Anywhere else: a jump, so whatever runs there returns
-                    // where this function would have.
+                    // Anywhere else: leave for it, and this body itself
+                    // catches it first when it is one of its own blocks.
                     e.flush();
+                    e.store_pc(&t);
                     e.safepoint(&t);
-                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                    if scope.is_none() {
+                        resumed.set(true);
+                    }
+                    e.line(fail);
                 } else {
                     leave(e, &t);
                 }
@@ -700,24 +763,24 @@ impl FnUnit {
                         if trapfree.contains_key(t) {
                             e.line(format!("  if (__builtin_expect({}, 0)) {{", patched_test(*t)));
                             e.flush_keep();
-                            ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg);
+                            ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                             reload_all(e);
                             e.line("  } else");
                         }
                         e.line(format!(
-                            "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) return 0;",
+                            "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
                             body_name(*t),
                             self.weight
                         ));
                     }
                     Callee::Direct(t) if self.ftab => {
                         *self.stats.leaves.entry(*t).or_default() += 1;
-                        ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg);
+                        ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                     }
                     Callee::Indirect(v) if self.ftab => {
                         self.stats.calls_indirect += 1;
                         let t = e.v(*v);
-                        ftab_call(e, &t, &format!("depth + {}", self.weight), need_back, &ret_arg);
+                        ftab_call(e, &t, &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                     }
                     Callee::Direct(t) if known.contains(t) => {
                         calls.insert(*t);
@@ -870,13 +933,16 @@ impl FnUnit {
                     // the flags when `need` says so) and report success;
                     // the caller carries on without looking at the context.
                     // `GEX_CGEN_MUTATE=NORETCHECK` skips the check.
+                    // SP back where the caller had it, plus what this
+                    // `ret` pops: the return address, and on i386 `ret N`'s
+                    // N (a stdcall callee's arguments, a struct return's
+                    // pointer). The caller reloads SP after every call.
                     let spn = reg_name(sp_reg());
+                    let delta = self.ret_pops.get(&b.term_pc).copied().unwrap_or(self.ret_sp_delta);
                     if mutate("NORETCHECK") {
                         e.line("if (1) {");
                     } else {
-                        e.line(format!(
-                            "if (__builtin_expect({t} == ret && {spn} == sp0 + {}ull, 1)) {{", self.ret_sp_delta
-                        ));
+                        e.line(format!("if (__builtin_expect({t} == ret && {spn} == sp0 + {delta}ull, 1)) {{"));
                     }
                     let flags: Vec<GuestReg> = FLAG_REGS.to_vec();
                     e.flush_keep_live(RegSet::ALL.minus(RegSet::of(&flags)));
@@ -891,11 +957,19 @@ impl FnUnit {
                 // resolved goes on through the function table instead, under
                 // this function's own return contract.
                 e.flush();
-                if self.ftab && matches!(b.term, FTerm::Unresolved { .. }) {
-                    e.safepoint(&t);
-                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                e.store_pc(&t);
+                if self.ftab {
+                    // This body catches it first when it is one of its own
+                    // blocks (a jump table recovery did not resolve, a
+                    // return used as a jump), at no cost to anyone else.
+                    if matches!(b.term, FTerm::Unresolved { .. }) {
+                        e.safepoint(&t);
+                    }
+                    if scope.is_none() {
+                        resumed.set(true);
+                    }
+                    e.line(fail);
                 } else {
-                    e.store_pc(&t);
                     e.line("return 0;");
                 }
             }
@@ -915,6 +989,9 @@ impl FnUnit {
                 e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
                 e.line("__builtin_trap();");
             }
+        }
+        if resumed.get() {
+            self.resumes = true;
         }
         Ok(())
     }
@@ -958,9 +1035,47 @@ impl FnUnit {
 /// A call through the function table to `t` (a C expression): the target in
 /// `ctx::LAST_TARGET`, the index from the probe cache (the resolve stub on a
 /// miss), the callee's result tested as for any call.
-fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str) {
+fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, fail: &str) {
     e.line(format!("  {{ const uint64_t ft = {t}; GEX_C64({}u) = ft;", ctx::LAST_TARGET));
-    e.line(format!("    if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need}, {ret})) return 0; }}"));
+    e.line(format!("    if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need}, {ret})) {fail} }}"));
+}
+
+/// Where a whole-image unit's body goes when a callee left (returned 0):
+/// everything is in the context and `ctx::PC` says where the guest goes.
+/// If that is one of this body's blocks and the stack is at or below this
+/// activation's (a `longjmp` back into it, an exception landing in it, a
+/// jump table it did not resolve, the depth guard of a recursive call), the
+/// body reloads every register and carries on there, and nothing further
+/// out unwinds; otherwise it leaves too. Correct for any activation of the
+/// function -- the guest's own stack holds the real return addresses -- so
+/// the stack test only keeps a deeper activation from taking what an outer
+/// one is waiting for.
+fn resume_block(e: &mut Emitter<'_>, f: &Function) {
+    let mut starts: Vec<(u64, usize)> =
+        f.blocks.iter().enumerate().filter(|(_, b)| !b.synthetic).map(|(i, b)| (b.start, i)).collect();
+    starts.sort_unstable();
+    starts.dedup_by_key(|x| x.0);
+    let lo = starts.first().map_or(0, |x| x.0);
+    let hi = f.blocks.iter().filter(|b| !b.synthetic).map(|b| b.end).max().unwrap_or(lo);
+    e.line("gex_resume: {");
+    e.line(format!(
+        "  const uint64_t rpc = GEX_C64({}u);",
+        ctx::PC
+    ));
+    e.line(format!(
+        "  if (rpc - 0x{lo:x}ull < 0x{:x}ull && GEX_C64({}u) <= sp0) {{",
+        hi.saturating_sub(lo),
+        ctx::SP
+    ));
+    reload_all(e);
+    e.line("    switch (rpc) {");
+    for (a, i) in &starts {
+        e.line(format!("    case 0x{a:x}ull: goto L{i};"));
+    }
+    e.line("    }");
+    e.line("  }");
+    e.line("  return 0;");
+    e.line("}");
 }
 
 /// A tail call through the function table to `t`, with this function's own
