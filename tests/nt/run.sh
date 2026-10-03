@@ -76,6 +76,7 @@ for arch in x64 x86; do
     # itself (f54d5717, and under CPU load the PAGE_STALE catch-up); a loaded
     # machine is what shows them: tests/nt/stress.sh.
     check $arch/mtx 0 "$allok" "$b/mtx.exe"
+    check $arch/crtmem 0 "$allok" "$b/crtmem.exe"
     # A locked write through a null pointer's field is an access violation.
     check $arch/lownull-xadd 0 "$allok" "$b/lownull.exe" xadd
     check $arch/lownull-aligned 0 "$allok" "$b/lownull.exe" aligned

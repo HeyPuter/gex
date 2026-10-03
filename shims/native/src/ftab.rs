@@ -261,7 +261,38 @@ fn publish_at(
     checks: Vec<(u64, u32)>,
     epoch: Option<u64>,
 ) -> Result<Option<u32>> {
-    let entries: Vec<u64> = funcs.iter().copied().filter(|&a| a != 0).collect();
+    let pairs: Vec<(u64, u32)> = funcs.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
+    publish_pairs_at(sh, memory, module, funcs.len() as u32, &pairs, tier, checks, epoch)
+}
+
+/// [`publish`] for a module whose slots are bound by explicit (guest
+/// address, slot) pairs: several addresses may share a slot (an export
+/// provider's function serving several exports).
+pub(crate) fn publish_pairs(
+    sh: &Arc<Mutex<JitShared>>,
+    memory: &gex_mem::GuestMemory,
+    module: Module,
+    len: u32,
+    pairs: &[(u64, u32)],
+    tier: Tier,
+) -> Result<u32> {
+    Ok(publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_pairs_at(
+    sh: &Arc<Mutex<JitShared>>,
+    memory: &gex_mem::GuestMemory,
+    module: Module,
+    len: u32,
+    pairs: &[(u64, u32)],
+    tier: Tier,
+    checks: Vec<(u64, u32)>,
+    epoch: Option<u64>,
+) -> Result<Option<u32>> {
+    let mut entries: Vec<u64> = pairs.iter().map(|&(a, _)| a).filter(|&a| a != 0).collect();
+    entries.sort_unstable();
+    entries.dedup();
     let n = {
         let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
         if epoch.is_some_and(|e| e != s.ftab.epoch) {
@@ -269,8 +300,7 @@ fn publish_at(
         }
         let m = s.ftab.modules.len() as u32;
         s.ftab.modules.push(module);
-        let pairs: Vec<(u64, u32)> = funcs.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
-        let n = s.ftab.map.publish(funcs.len() as u32, m, tier, &pairs);
+        let n = s.ftab.map.publish(len, m, tier, pairs);
         if !checks.is_empty() {
             s.ftab.checks.insert(n, checks.clone());
         }

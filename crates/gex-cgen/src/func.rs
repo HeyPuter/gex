@@ -318,13 +318,14 @@ impl FnUnit {
         let st = self.storage();
         if self.ftab {
             // Re-entered through the table: the host serves the address
-            // with something other than this unit (it is not in the unit's
-            // `gex.funcs`).
+            // with something other than this unit (a provider, or tier-1
+            // for a body clang could not compile). The probe cache first, so
+            // a served address costs one indirect call, not a host lookup.
             let _ = writeln!(
                 self.bodies,
                 "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{\n  \
                  GEX_C64({}u) = 0x{entry:x}ull;\n  \
-                 GEX_MUSTTAIL return GEX_FTAB(GEX_FTAB_RESOLVE)(ctx, depth, need, ret);\n}}\n",
+                 GEX_MUSTTAIL return GEX_FTAB(gex_ftab_idx(0x{entry:x}ull))(ctx, depth, need, ret);\n}}\n",
                 body_name(entry),
                 ctx::LAST_TARGET
             );
