@@ -1962,6 +1962,9 @@ fn mount_filesystems(
         devfs.add("gex-gl", dev);
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
+    // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
+    // in memory (Chromium's, in a CEF game, refuses to start without it).
+    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(
