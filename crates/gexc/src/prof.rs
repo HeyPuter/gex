@@ -47,14 +47,23 @@ pub fn start() {
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGPROF, &sa, std::ptr::null_mut());
-            let tv = libc::timeval { tv_sec: 0, tv_usec: 1000 };
-            let it = libc::itimerval { it_interval: tv, it_value: tv };
-            libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
         }
+        // `GEX_PROF_START=<s>`: start sampling that many seconds in (a
+        // steady-state profile, past loading).
+        let start = std::env::var("GEX_PROF_START").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let path = std::path::PathBuf::from(path);
-        let _ = std::thread::Builder::new().name("gex-prof".into()).spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            dump(&path);
+        let _ = std::thread::Builder::new().name("gex-prof".into()).spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(start));
+            // SAFETY: as above; the timer is the process's, set from any thread.
+            unsafe {
+                let tv = libc::timeval { tv_sec: 0, tv_usec: 1000 };
+                let it = libc::itimerval { it_interval: tv, it_value: tv };
+                libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                dump(&path);
+            }
         });
     });
 }

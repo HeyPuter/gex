@@ -60,6 +60,7 @@ fn real_main() -> Result<ExitCode> {
         "funcs" => cmd_funcs(&argv[2..]),
         "hotset" => cmd_hotset(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-image" => cmd_cgen_image(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        "cgen-c" => cmd_cgen_c(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "cgen-prefix" => cmd_cgen_prefix(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "-h" | "--help" | "help" => {
             usage();
@@ -2158,6 +2159,52 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
 }
 
 /// `gexc cgen-image`: see the usage text.
+/// `gexc cgen-c <pe> [--pe-base HEX] [--recovery DIR] --at ADDR`: print the C the function
+/// tier's unit holds for one function, from the image's cached recovery
+/// (`gexc cgen-image` makes it).
+fn cmd_cgen_c(args: &[String]) -> Result<()> {
+    let (mut path, mut pe_base, mut at, mut rec) = (None, None, None, None);
+    let mut i = 0;
+    while i < args.len() {
+        let hex = |v: Option<&String>| -> Result<u64> { Ok(u64::from_str_radix(v.context("needs an address")?.trim_start_matches("0x"), 16)?) };
+        match args[i].as_str() {
+            "--pe-base" => {
+                i += 1;
+                pe_base = Some(hex(args.get(i))?);
+            }
+            "--at" => {
+                i += 1;
+                at = Some(hex(args.get(i))?);
+            }
+            // Print the header the C includes (gex_abi.h) instead.
+            "--header" => {
+                print!("{}", gex_cgen::header::header());
+                return Ok(());
+            }
+            // A recovery directory to use rather than this build's key's.
+            "--recovery" => {
+                i += 1;
+                rec = Some(std::path::PathBuf::from(args.get(i).context("--recovery needs a directory")?));
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = path.context("expected a PE image")?;
+    let at = at.context("--at is required")?;
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let base = pe_base.unwrap_or(pe.preferred_base);
+    let (image, _) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    let dir = match rec {
+        Some(d) => d,
+        None => gex_native::nt_cgen::cache_root()?.join("recovery").join(gex_native::nt_cgen::recovery_key(&image)),
+    };
+    let read = |a: u64| image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied());
+    print!("{}", gex_cgen::image::function_c(&dir, at, &read)?);
+    Ok(())
+}
+
 fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let (mut path, mut pe_base) = (None, None);
     let mut jobs = 4usize;

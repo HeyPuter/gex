@@ -253,6 +253,27 @@ fn read_recovery(dir: &Path) -> Result<Recovery> {
     Ok(rec)
 }
 
+/// The C a unit holds for the function at `entry`, from the cached recovery
+/// in `recovery` (`gexc cgen-c`): what to read when comparing one function's
+/// code with another backend's. `read` gives the image's bytes, for `ret N`.
+pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>) -> Result<String> {
+    let rec = read_recovery(recovery)?;
+    let known: HashSet<u64> = rec.entries.iter().copied().collect();
+    let mut gir = GirReader::open(recovery)?;
+    while let Some(f) = gir.next()? {
+        if f.entry != entry {
+            continue;
+        }
+        let mut unit = FnUnit::new();
+        unit.set_class32(rec.class32);
+        unit.ftab = true;
+        unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+        unit.add(&f, &known, &rec.sums, &rec.trapfree)?;
+        return Ok(unit.source());
+    }
+    bail!("no function at {entry:#x} in {}", recovery.display())
+}
+
 /// The functions of a recovery, parsed one at a time.
 struct GirReader {
     r: BufReader<std::fs::File>,
