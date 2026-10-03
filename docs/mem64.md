@@ -107,19 +107,39 @@ non-executable data:
 Keeping code low also keeps every per-page array in the low region the same
 size, so M64 costs nothing there.
 
-## 4. LIMIT64
+## 4. LIMIT64, and what step 0 measured
 
-- **Native (wasmtime):** 64 GiB of virtual reservation. Pages cost nothing
-  until touched.
-- **Browser (V8):** memory64 is capped at 16 GiB, and growth commits memory
-  up to the highest address used. The high arena is therefore allocated
-  bottom-up from 4 GiB, first fit, as the NT allocator already is. A Unity
-  game's 20-30 slots at 256 MiB alignment reach about 9-12 GiB of address
-  even though only about 650 MiB is committed. Whether V8 commits a grown
-  shared memory64 lazily has to be measured (§9, step 0); if it does not,
-  `LIMIT64` in the browser is what the machine can afford, and Unity's
-  trimmed slot tails (the part of each 256 MiB slot past the block) are a
-  case for sub-slot packing.
+`LIMIT64` is **16 GiB on both hosts.** V8 caps memory64 at 262144 pages and
+refuses to compile a module whose declared maximum is larger, and an imported
+memory's maximum has to match the module's, so one figure lets one module
+run natively and in the browser. A Unity game's 20-30 slots at 256 MiB
+alignment reach about 9-12 GiB of address with about 650 MiB committed, so
+16 GiB holds them. The high arena is allocated bottom-up from 4 GiB, first
+fit, because the browser grows memory to the highest address in use.
+
+Step 0's smoke tests (2026-10-03, `scratchpad`, no gex code involved):
+
+| | wasmtime 27 | V8 (Node 26, Chromium 151) |
+|---|---|---|
+| shared memory64, max 16 GiB, grown to 12 GiB | 31 µs, RSS 9.8 MB | 0.1-3.4 ms, RSS 51 MiB: committed lazily |
+| a second thread (store / Worker) reads it, `wait`/`notify` | yes | yes |
+| an access past the end | traps | traps |
+| table64 `call_indirect` | yes | yes |
+
+- **wasmtime:** a shared memory has to be a static allocation, so the
+  engine needs `static_memory_maximum_size(LIMIT64)` (and `wasm_memory64`).
+  That raises every memory's virtual reservation, wasm32 ones included,
+  without changing their bounds-check elision (a 4 GiB reservation already
+  elided them), so it is set only when an M64 process exists.
+- **clang 22 / wasm-ld:** `--target=wasm64 -fPIC` and `wasm-ld -mwasm64
+  --experimental-pic -shared --shared-memory` link. Such a module imports
+  `__memory_base` and `__table_base` as **i64** globals and the function
+  table as a **table64** (`table i64 funcref`, `call_indirect` with an i64
+  index).
+- **So an M64 process's `ftab` is a table64,** and its tier-1 and fjit
+  modules index it with i64 (one `i64.extend_i32_u` before each
+  `call_indirect` through it). The tier-1 dispatch tables, which only tier-1
+  modules use, stay 32-bit tables.
 
 ## 5. Choosing the flavour at exec (level 1)
 
