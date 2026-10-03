@@ -527,6 +527,22 @@ pub struct Table {
     pub table: JumpTable,
 }
 
+/// Whether a jump table resolved again replaces the one a site has: only
+/// when it has more cases, or the same ones now proven complete. A table
+/// resolved on the CFG it added to can come out smaller (SDL2.dll's
+/// 0x68450: 84 cases, then 1, then 84 again), and letting it shrink made the
+/// fixpoint alternate until the round limit, before weak starts were ever
+/// promoted -- SDL2 kept 754 of its functions. Only growing, it converges.
+/// Keeping the larger table is safe: a unit's switch sends any other
+/// target through the function table.
+fn replaces(old: Option<&Table>, new: &Table) -> bool {
+    match old {
+        None => true,
+        Some(o) if o == new => false,
+        Some(o) => new.cases.len() > o.cases.len() || (new.cases.len() == o.cases.len() && new.table.complete && !o.table.complete),
+    }
+}
+
 /// Inputs to body discovery that the outer fixpoint refines.
 struct Facts<'a> {
     starts: &'a BTreeMap<u64, StartInfo>,
@@ -1015,7 +1031,7 @@ pub fn recover_one(
                 let key = (start, a);
                 match t {
                     Some(t) => {
-                        if tables.get(&key) != Some(&t) {
+                        if replaces(tables.get(&key), &t) {
                             tables.insert(key, t);
                             changed = true;
                         }
@@ -1392,7 +1408,7 @@ fn recover_seeded(
                 let key = (f.entry, a);
                 match t {
                     Some(t) => {
-                        if tables.get(&key) != Some(&t) {
+                        if replaces(tables.get(&key), &t) {
                             tables.insert(key, t);
                             changed = true;
                         }
