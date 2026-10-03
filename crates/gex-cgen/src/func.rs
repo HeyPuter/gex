@@ -1077,7 +1077,16 @@ impl FnUnit {
                 // this function's own return contract.
                 e.flush();
                 e.store_pc(&t);
-                if self.ftab {
+                if self.ftab && matches!(b.term, FTerm::Unresolved { .. }) && local_resume() {
+                    // An indirect jump nobody resolved (`jmp [iat]`, a
+                    // computed tail call) goes on through the function
+                    // table under this function's own return contract, as
+                    // the function JIT does: leaving would unwind every
+                    // frame above. A target inside this function runs on
+                    // the fallback (the call-out) and returns the same way.
+                    e.safepoint(&t);
+                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                } else if self.ftab {
                     // This body catches it first when it is one of its own
                     // blocks (a jump table recovery did not resolve, a
                     // return used as a jump), at no cost to anyone else.
