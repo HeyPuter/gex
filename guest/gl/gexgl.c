@@ -2166,6 +2166,18 @@ static size_t gexgen_elements(const struct gexgen_tok *t, const uint64_t *v) {
 }
 
 static uint64_t gexgen_call(uint32_t opcode, const char *plan, const uint64_t *v) {
+    /* GEXGL_TRACE_GENERATED=1: each generated opcode the first time it is
+       called (names in crates/gex-gl/src/compat_plans.rs). */
+    static int trace = -1;
+    if (trace < 0) trace = getenv("GEXGL_TRACE_GENERATED") != NULL;
+    if (trace) {
+        static unsigned char seen[8192];
+        unsigned i = opcode - 8192u;
+        if (i < 8192u * 8u && !(seen[i / 8] & (1u << (i % 8)))) {
+            seen[i / 8] |= (unsigned char)(1u << (i % 8));
+            fprintf(stderr, "gexgl: generated %u (%s)\n", (unsigned)opcode, plan);
+        }
+    }
     struct gexgen_tok toks[GEXGEN_MAX_PARAMS + 1];
     toks[0].kind = 'v';
     size_t bytes[GEXGEN_MAX_PARAMS];
