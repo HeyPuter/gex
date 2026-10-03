@@ -481,6 +481,7 @@ static bool gexgl_negative_count(GLsizei n, Fn call)
 
 gexgl_pixel_store pack_store = gexgl_default_pixel_store();
 gexgl_pixel_store unpack_store = gexgl_default_pixel_store();
+#include "gexgl-compat-host.h"
 
 int get_frontend_param(struct pipe_frontend_screen* fscreen,
                        enum st_manager_param param) {
@@ -1552,7 +1553,9 @@ size_t integer_query_components(GLenum pname) {
         return static_cast<size_t>(std::clamp(count, 0, 4096));
     }
     default:
-        return 1;
+        /* The fixed-function state, matrices among them, and every other
+         * multi-valued pname the shared table knows. */
+        return gexgl_pname_count(pname);
     }
 }
 
@@ -1590,6 +1593,21 @@ uint32_t uniform_components(GLuint program, GLint location) {
     default: return 1;
     }
 }
+
+/* For the generated compatibility-profile cases (gexgl-compat-host.h). */
+#define GEXGEN_NAME(kind, name) lookup(kind, name)
+void* gexgen_proc(const char* name, const char* alias) {
+    void* f = reinterpret_cast<void*>(_mesa_glapi_get_proc_address(name));
+    if (!f && alias) f = reinterpret_cast<void*>(_mesa_glapi_get_proc_address(alias));
+    return f;
+}
+void gexgen_missing(const char* name) {
+    static std::unordered_set<std::string> said;
+    if (said.insert(name).second)
+        fprintf(stderr, "gexgl: Mesa has no %s; the call does nothing\n", name);
+}
+
+#include "gl-compat-generated-decoders.inc"
 
 bool one(uint32_t op, Reader& a) {
     switch (op) {
@@ -2367,9 +2385,11 @@ bool one(uint32_t op, Reader& a) {
     }
     case GET_INTEGERV: {
         const GLenum pname = a.u32();
-        std::vector<GLint> values(integer_query_components(pname));
-        if (!values.empty()) glGetIntegerv(pname, values.data());
-        put_blob(values.data(), values.size() * sizeof(values[0]));
+        const size_t n = integer_query_components(pname);
+        /* Room for what GL writes even where the table says less. */
+        std::vector<GLint> values(std::max<size_t>(n, 16));
+        if (n) glGetIntegerv(pname, values.data());
+        put_blob(values.data(), n * sizeof(values[0]));
         break;
     }
     case GET_ERROR: put_u32(glGetError()); break;
@@ -2497,6 +2517,7 @@ bool one(uint32_t op, Reader& a) {
     case PUSH_ATTRIB: glPushAttrib(a.u32()); break;
     case POP_ATTRIB: glPopAttrib(); break;
 #include "gl44-generated-cases.inc"
+#include "gl-compat-generated-cases.inc"
     default:
         /* Named, once. A command the host does not know aborts the whole
          * batch -- the guest discards every queued byte, including the

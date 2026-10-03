@@ -574,7 +574,18 @@ pub fn nt_user_msg_wait_for_multiple_objects_ex(c: &mut Call<'_>) -> R64 {
 pub fn nt_user_post_message(c: &mut Call<'_>) -> R64 {
     let (h, msg, wparam, lparam) = (c.a32(0), c.a32(1), c.a(2), c.a(3));
     if h == 0xffff || h == 0xffff_ffff {
-        return Err(c.unimplemented("PostMessage(HWND_BROADCAST)"));
+        // HWND_BROADCAST: every top-level window (the desktop's children)
+        // gets one.
+        let targets: Vec<(u32, u32)> = {
+            let u = c.p.user.lock().unwrap();
+            let kids = u.windows.get(&u.desktop).map(|d| d.children.clone()).unwrap_or_default();
+            kids.iter().filter_map(|k| u.windows.get(k)).map(|w| (w.hwnd, w.tid)).collect()
+        };
+        let time = tick_count(c);
+        for (hwnd, tid) in targets {
+            post_to_thread(c, tid, Msg { hwnd, msg, wparam, lparam, time, pt: (0, 0) });
+        }
+        return Ok(1);
     }
     let (hwnd, tid) = if h == 0 {
         (0, c.t.tid)

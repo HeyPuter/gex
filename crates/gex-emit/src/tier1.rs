@@ -4651,6 +4651,11 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(gex_abi::cache_op::IC_INVALIDATE);
         self.f.i64_const(start as i64);
         self.f.call(self.cx.cache_op);
+        // The dispatch below now misses, and a miss translates the address in
+        // the context's PC: this one, not the last one stored (a direct jump
+        // into rewritten code arrives without storing it, and the miss went
+        // to wherever the last indirect branch had been).
+        self.store_pc(start);
         self.f.i64_const(start as i64);
         self.f.local_set(self.scratch_i64);
         if gex_abi::X86 {

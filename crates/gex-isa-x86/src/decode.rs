@@ -393,6 +393,13 @@ impl<'a> Decoder<'a> {
                 }
                 0x67 => {
                     if self.mode == Mode::Compat {
+                        // `addr32 call/jmp rel32` is GNU ld's padding when it
+                        // relaxes an indirect call through the GOT (glibc's
+                        // i386 ld.so has them); the address size changes
+                        // nothing about a relative branch.
+                        if matches!(self.peek(), Some(0xe8 | 0xe9)) {
+                            continue;
+                        }
                         // 16-bit addressing: nothing gex runs uses it.
                         return Err(());
                     }
@@ -817,6 +824,8 @@ impl<'a> Decoder<'a> {
                     _ => Ok(self.unk()),
                 };
             }
+            0x60 if self.mode == Mode::Compat => return Ok(self.i0(Op::Pusha, self.wv())),
+            0x61 if self.mode == Mode::Compat => return Ok(self.i0(Op::Popa, self.wv())),
             0x62 if self.mode == Mode::Compat => return Ok(self.unk()),
             0xc4 | 0xc5 => return self.vex(op),
             0x62 => return self.evex(),

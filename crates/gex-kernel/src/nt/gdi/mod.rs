@@ -15,6 +15,7 @@
 
 pub mod bitmap;
 pub mod blit;
+pub mod d3dkmt;
 pub mod dc;
 pub mod region;
 pub mod surface;
@@ -339,6 +340,28 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtGdiOffsetClipRgn => region::nt_gdi_offset_clip_rgn(c),
         n::NtGdiGetRandomRgn => region::nt_gdi_get_random_rgn(c),
         n::NtGdiFillRgn => region::nt_gdi_fill_rgn(c),
+        // The display's gamma ramp: the identity, three 256-entry WORD
+        // tables. Setting one is accepted and changes nothing shown.
+        n::NtGdiGetDeviceGammaRamp => {
+            let ramp = c.a(1);
+            for ch in 0..3u64 {
+                for i in 0..256u64 {
+                    c.g.w16(ramp + 2 * (ch * 256 + i), (i * 257) as u16)?;
+                }
+            }
+            Ok(1)
+        }
+        n::NtGdiSetDeviceGammaRamp => Ok(1),
+        n::NtGdiDdDDIOpenAdapterFromLuid => d3dkmt::open_adapter_from_luid(c),
+        n::NtGdiDdDDICreateDevice => d3dkmt::create_device(c),
+        n::NtGdiDdDDIQueryVideoMemoryInfo => d3dkmt::query_video_memory_info(c),
+        n::NtGdiDdDDICreateDCFromMemory => d3dkmt::create_dc_from_memory(c),
+        n::NtGdiDdDDIDestroyDCFromMemory => d3dkmt::destroy_dc_from_memory(c),
+        n::NtGdiDdDDIEscape => d3dkmt::escape(c),
+        n::NtGdiDdDDICloseAdapter
+        | n::NtGdiDdDDIDestroyDevice
+        | n::NtGdiDdDDISetQueuedLimit
+        | n::NtGdiDdDDICheckVidPnExclusiveOwnership => d3dkmt::check_adapter(c),
         nr => Err(c.unimplemented(&format!("win32u {} ({nr:#x})", super::syscall_name(nr)))),
     }
 }

@@ -28,6 +28,9 @@ fi
 # This deliberately fails closed if a pointer-shaped command has no explicit
 # wire policy in tools/gen_gl44_transport.py.
 python3 "$ROOT/tools/gen_gl44_transport.py"
+# And every other registry command with a wire plan: the guest's entry
+# points, opengl32's plans and the hosts' decoder (tools/gen_gl_compat.py).
+python3 "$ROOT/tools/gen_gl_compat.py"
 
 # The opcodes come from the Rust side, so the two cannot drift.
 python3 - "$ROOT" "$HERE" <<'PYEOF'

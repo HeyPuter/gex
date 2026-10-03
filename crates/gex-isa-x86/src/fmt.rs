@@ -208,6 +208,8 @@ pub fn mnemonic(i: &Inst) -> String {
         Ret => "ret".into(),
         Leave => "leave".into(),
         Enter => "enter".into(),
+        Pusha => if w == Width::W { "pushaw" } else { "pushal" }.into(),
+        Popa => if w == Width::W { "popaw" } else { "popal" }.into(),
         Syscall => "syscall".into(),
         Int3 => "int3".into(),
         Int => "int".into(),

@@ -514,6 +514,15 @@ pub fn nt_raise_exception(c: &mut Call<'_>) -> R {
         let code = u32::from_le_bytes(rec[..4].try_into().unwrap());
         let addr = c.g.ptr(rec_p + 2 * 4 + c.g.psize())?;
         crate::nt_log!("[nt:{:x}] NtRaiseException {code:#010x} at {}", c.t.tid, c.p.describe_addr(addr));
+        // DBG_PRINTEXCEPTION_C, OutputDebugStringA: (length, text).
+        if code == 0x4001_0006 {
+            let ps = c.g.psize();
+            let info = rec_p + if c.p.abi == Abi::P64 { 32 } else { 20 };
+            let (n, p) = (c.g.ptr(info)?, c.g.ptr(info + ps)?);
+            if let Ok(b) = c.g.bytes(p, n.min(512) as usize) {
+                crate::nt_log!("[nt:{:x}]   debug string {:?}", c.t.tid, String::from_utf8_lossy(&b).trim_end_matches(['\0', '\n']));
+            }
+        }
         // The frame-pointer chain, to see who raised it.
         if c.p.abi == Abi::P32 {
             let mut bp = c.g.u32(context + i386::EBP)? as u64;
@@ -1447,6 +1456,29 @@ pub fn nt_query_information_process(c: &mut Call<'_>) -> R {
             c.g.w8(buf, 0)?;
             c.g.w8(buf + 1, 2)?; // PROCESS_PRIOCLASS_NORMAL
             2
+        }
+        // ProcessVmCounters: VM_COUNTERS or VM_COUNTERS_EX, SIZE_Ts but for
+        // the ULONG PageFaultCount (pointer-aligned). Reserved and committed
+        // from the address space; the working set is what is committed.
+        3 => {
+            let fields = if len >= 12 * ps { 12 } else { 11 };
+            need(11 * ps)?;
+            let (reserved, committed) = {
+                let stl = c.p.st.lock().unwrap();
+                stl.vm.regions.values().fold((0u64, 0u64), |(r, m), g| {
+                    (r + g.size, m + super::vm::PAGE * g.pages.iter().filter(|p| p.committed).count() as u64)
+                })
+            };
+            c.g.zero(buf, (fields * ps) as usize)?;
+            // Peak and current virtual size, working set, pagefile usage,
+            // private bytes.
+            for (i, v) in [(0, reserved), (1, reserved), (3, committed), (4, committed), (9, committed), (10, committed)] {
+                c.g.wptr(buf + i * ps, v)?;
+            }
+            if fields == 12 {
+                c.g.wptr(buf + 11 * ps, committed)?;
+            }
+            fields * ps
         }
         _ => return Err(c.unimplemented(&format!("NtQueryInformationProcess class {class}"))),
     };

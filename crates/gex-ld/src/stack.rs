@@ -56,10 +56,11 @@ pub const HWCAP: u64 = if gex_abi::PPC {
     // vector routine (docs/ppc.md §5).
     0x8000_0000 | 0x0800_0000 | 0x0400_0000
 } else if gex_abi::X86 {
-    // x86-64: the CPUID.1:EDX feature word. FPU, TSC, CX8, CMOV, CLFSH, MMX,
-    // FXSR, SSE, SSE2 -- the baseline every x86-64 has, and what the `cpuid`
-    // host handler reports too (they must agree: glibc's resolvers read both).
-    (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 19) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26)
+    // x86-64: the CPUID.1:EDX feature word. FPU, TSC, CX8, CMOV, CLFSH,
+    // FXSR, SSE, SSE2 -- the x86-64 baseline less MMX, which the lifter does
+    // not implement; what the `cpuid` host handler reports too (they must
+    // agree: glibc's resolvers read both).
+    (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 19) | (1 << 24) | (1 << 25) | (1 << 26)
 } else {
     const HWCAP_FP: u64 = 1 << 0;
     const HWCAP_ASIMD: u64 = 1 << 1;

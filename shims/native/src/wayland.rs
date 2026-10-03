@@ -9,7 +9,8 @@
 
 use gex_kernel::file::OpenFile;
 use gex_kernel::syscalls::Kernel;
-use gex_kernel::unix::{HostListener, UnixSocket};
+use gex_kernel::unix::{HostListener, MemFd, UnixSocket};
+use gex_kernel::vfs::FileHandle;
 use gex_kernel::GuestMem;
 use gex_wayland::{Buffers, Client, Frame};
 use std::sync::{Arc, Mutex};
@@ -117,6 +118,22 @@ impl Wayland {
         }
     }
 
+    /// Write a frame drawn somewhere other than a client buffer (a GL
+    /// client's host surface): RGBA rows, top first.
+    pub fn present_external(&self, width: i32, height: i32, rgba: &[u8]) {
+        let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
+            return;
+        };
+        let mut n = self.inner.written.lock().unwrap();
+        let path = format!("{prefix}-{:03}.ppm", *n);
+        *n += 1;
+        let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+        out.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("gex: could not write {path}: {e}");
+        }
+    }
+
     /// Everything committed since the last call.
     pub fn take_frames(&self) -> Vec<Frame> {
         std::mem::take(&mut self.inner.frames.lock().unwrap())
@@ -160,6 +177,16 @@ impl Wayland {
                 }
             }
             s.out.extend_from_slice(&s.client.take_outgoing());
+            // A `wl_keyboard.keymap` event owes a descriptor for its `h`
+            // argument: an in-memory file holding the keymap, staged on the
+            // socket so it rides the next send (as the browser host does).
+            if let Some(km) = s.client.take_keymap() {
+                let memfd = Arc::new(MemFd::new("gex-keymap"));
+                let _ = memfd.write_at(0, &km);
+                let handle: Arc<dyn FileHandle> = memfd;
+                let file = OpenFile::new(handle, "anon:wl-keymap".into(), 0, true, false);
+                s.socket.stage_send(vec![file]);
+            }
             while s.sent < s.out.len() {
                 match s.socket.send(&s.out[s.sent..]) {
                     Ok(0) | Err(_) => break,

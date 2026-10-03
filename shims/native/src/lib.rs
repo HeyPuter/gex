@@ -777,6 +777,12 @@ fn run_program_with(
         let w = wayland::Wayland::new(opts.wayland_size.0, opts.wayland_size.1);
         if let Some(out) = &opts.wayland_out {
             w.write_frames_to(out);
+            // A GL client's frames are on the host's surface, not in a
+            // buffer the compositor sees: the device hands them over.
+            if let Some(dev) = crate::gl::DEVICE.get() {
+                let w = w.clone();
+                dev.set_frame_sink(Box::new(move |f| w.present_external(f.width, f.height, &f.rgba)));
+            }
         }
         if opts.wayland_gpu {
             match w.enable_gpu(opts.wayland_size.0, opts.wayland_size.1) {
@@ -1879,9 +1885,14 @@ fn mount_filesystems(
         // Named for what it is rather than as `/dev/dri/renderD128`: this is
         // not a DRM device and a program that probed it as one would be
         // misled. The guest's GL library looks for this name.
-        devfs.add("gex-gl", crate::gl::GlDevice::new(1024, 1024));
+        let dev = crate::gl::GlDevice::new(1024, 1024);
+        let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
+        devfs.add("gex-gl", dev);
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
+    // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
+    // in memory (Chromium's, in a CEF game, refuses to start without it).
+    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(
@@ -3064,6 +3075,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     .ok_or_else(|| anyhow!("guest memory unavailable"))?;
                 let mut gm = GuestMem::new(memory.bytes());
                 gex_kernel::x86::serve_cmpxchg16b(&mut gm, ctx as u32 as u64, v as u64);
+            }
+            if gex_abi::X86 && reg == gex_kernel::x86::SYSREG_TRACE {
+                let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let gm = GuestMem::new(memory.bytes());
+                lockstep::log_trace(&gm, ctx as u32 as u64, v as u64);
             }
             if reg == gex_kernel::x86::SYSREG_X87 {
                 let memory = caller

@@ -39,6 +39,9 @@ pub mod sysreg {
     /// `cmpxchg16b`: written with the effective address; the host compares
     /// and swaps under its lock and sets `rax`, `rdx` and ZF in the context.
     pub const CMPXCHG16B: i32 = -102;
+    /// `GEX_TRACE_INSNS`: written with the pc before an instruction; the
+    /// host logs the context.
+    pub const TRACE: i32 = -103;
 }
 
 /// The x87 operations [`sysreg::X87`] carries: an operation code in the low
@@ -1303,6 +1306,25 @@ impl<'a> Lifter<'a> {
                 self.wr64(RSP, rbp);
                 let v = self.pop(w);
                 self.wr_reg(Reg::Gp(RBP, w), v);
+                Flow::Next
+            }
+            Op::Pusha => {
+                // eax, ecx, edx, ebx, the esp from before, ebp, esi, edi.
+                let sp = self.rd(Operand::Reg(Reg::Gp(RSP, w)), w);
+                for r in 0..8 {
+                    let v = if r == RSP { sp } else { self.rd(Operand::Reg(Reg::Gp(r, w)), w) };
+                    self.push(w, v);
+                }
+                Flow::Next
+            }
+            Op::Popa => {
+                // The reverse, skipping the saved esp.
+                for r in (0..8).rev() {
+                    let v = self.pop(w);
+                    if r != RSP {
+                        self.wr_reg(Reg::Gp(r, w), v);
+                    }
+                }
                 Flow::Next
             }
             Op::Enter => {

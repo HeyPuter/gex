@@ -784,7 +784,7 @@ case 1188: {
 case 1189: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
-    std::vector<GLboolean> values(components);
+    std::vector<GLboolean> values(components < 16 ? 16 : components);
     if (components) GEX_GL_CALL(glGetBooleanv, pname, values.data());
     put_blob(values.data(), components * sizeof(GLboolean));
     break;
@@ -836,7 +836,7 @@ case 1196: {
 case 1197: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
-    std::vector<GLdouble> values(components);
+    std::vector<GLdouble> values(components < 16 ? 16 : components);
     if (components) GEX_GL_CALL(glGetDoublev, pname, values.data());
     put_blob(values.data(), components * sizeof(GLdouble));
     break;
@@ -853,7 +853,7 @@ case 1199: {
 case 1200: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
-    std::vector<GLfloat> values(components);
+    std::vector<GLfloat> values(components < 16 ? 16 : components);
     if (components) GEX_GL_CALL(glGetFloatv, pname, values.data());
     put_blob(values.data(), components * sizeof(GLfloat));
     break;
@@ -913,7 +913,7 @@ case 1205: {
 case 1206: {
     GLenum pname = a.u32();
     const uint32_t components = gexgl_state_query_components(pname);
-    std::vector<GLint64> values(components);
+    std::vector<GLint64> values(components < 16 ? 16 : components);
     if (components) GEX_GL_CALL(glGetInteger64v, pname, values.data());
     put_blob(values.data(), components * sizeof(GLint64));
     break;
