@@ -4,7 +4,11 @@
 // (opengl32 → /dev/gex-gl) runs on Mesa in the compositor's worker.
 //
 //   /nt.html?tar=/gex/nt/bundle.tar&exe=/t/window.exe&args=30&size=1024x768
-//            [&gl=1&glbackend=wgpu][&env=K=V,K=V][&cwd=/t]
+//            [&gl=1&glbackend=wgpu][&env=K=V,K=V][&cwd=/t][&hostx=1]
+//
+// The exe may also be a Linux ELF (an i386 or x86-64 program with its
+// libraries in the bundle); `hostx=1` gives it the page's X server
+// (Xwayland as wasm, web/build-xwayland-wasm.sh) at DISPLAY=:0.
 //
 // What a driver reads: `window.__nt` = { out, status, compositor }.
 
@@ -79,6 +83,15 @@ async function main() {
   // Uint8Array, which copies an array but views a buffer.
   const tree = untar(tar.buffer);
   const files = { ...tree.files };
+  // Hard links name a file by its path from the archive's root (tar -h
+  // writes one for every second path to an inode it has stored). Symlinks
+  // are not followed here: a bundle is made with -h.
+  for (const [path, target] of Object.entries(tree.hard ?? {})) {
+    if (files[target]) {
+      files[path] = files[target];
+      if (tree.modes?.[target] !== undefined) tree.modes[path] = tree.modes[target];
+    }
+  }
   const exe = q.get('exe') || '/t/window.exe';
   if (!files[exe]) throw new Error(`${exe} is not in the bundle`);
   const args = [exe, ...(q.get('args') ? q.get('args').split(' ') : [])];
@@ -100,6 +113,7 @@ async function main() {
     glBackend: q.get('glbackend') || 'wgpu',
     wl: canvas,
     wlInput: canvas,
+    hostX: q.get('hostx') === '1',
   });
   state.status = status;
   state.phase = 'done';
