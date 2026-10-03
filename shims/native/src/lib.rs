@@ -13,6 +13,7 @@ use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod aot;
+pub mod aot_share;
 pub mod gl;
 pub mod profile;
 pub mod nt;
@@ -186,6 +187,8 @@ struct HostState {
     exit: Option<Exit>,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
+    /// Why `resume_at` was set (GEX_NT_STATS only; `note_resume`).
+    pub(crate) resume_cause: Option<String>,
     /// The function tier's call-outs in progress on this thread, innermost
     /// last (`call_out`).
     callouts: Vec<Callout>,
@@ -576,6 +579,9 @@ fn run_program_with(
 
     let phase = std::time::Instant::now();
     let mut config = Config::new();
+    // Deep guest call chains are wasm recursion (units call units): room for
+    // them, on threads with stacks to match (`guest_thread_stack`).
+    config.max_wasm_stack(wasm_stack_bytes());
     // Tail calls are load-bearing: the whole block-per-function design in
     // PLAN §2.4 depends on them.
     config.wasm_tail_call(true);
@@ -820,6 +826,7 @@ fn run_program_with(
             proc_state,
             exit: None,
             resume_at: None,
+            resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
@@ -1400,6 +1407,7 @@ fn run_thread_loop(
             Err(e) => {
                 if let Some(next) = store.data_mut().resume_at.take() {
                     crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    note_resume(store.data_mut(), next, "run loop");
                     pc = next;
                     continue;
                 }
@@ -1434,6 +1442,7 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
     let running = Arc::clone(&cx.running);
     std::thread::Builder::new()
         .name(format!("gex-tid-{}", child.tid))
+        .stack_size(guest_thread_stack())
         .spawn(move || {
             if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
                 eprintln!("gexc: thread {} failed: {e:#}", child.tid);
@@ -1584,6 +1593,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     let thread = ThreadState::new(ctx_addr, pid);
     std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
+        .stack_size(guest_thread_stack())
         .spawn(move || {
             let cleanup = Arc::clone(&child_cx);
             // Two numbers, deliberately: the process table keeps the one a
@@ -1634,6 +1644,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
@@ -1784,6 +1795,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
@@ -2667,6 +2679,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             match outcome {
                 SyscallOutcome::Continue => Ok(()),
                 SyscallOutcome::Resume(target) => {
+                    state.resume_cause = Some("linux syscall".into());
                     state.resume_at = Some(target);
                     Err(StopExecution.into())
                 }
@@ -2690,6 +2703,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         child_stack,
                         tls,
                     });
+                    state.resume_cause = Some("fork".into());
                     state.resume_at = Some(
                         gm.read_u64(state.thread.ctx_addr + ctx::PC as u64)
                             .unwrap_or(0),
@@ -2765,6 +2779,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let mut gm = GuestMem::new(data);
                 return match state.with_kernel(|k| k.sigreturn(&mut gm)) {
                     Ok(target) => {
+                        state.resume_cause = Some("sigreturn".into());
                         state.resume_at = Some(target);
                         Err(StopExecution.into())
                     }
@@ -2781,10 +2796,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             // Translate on demand and patch the slot, then resume there.
             match translate_and_install(&mut caller, pc) {
-                Ok(true) => {
-                    caller.data_mut().resume_at = Some(pc);
-                    Err(StopExecution.into())
-                }
+                // Installed in this store: the miss stub dispatches again
+                // in place, keeping every wasm frame below it.
+                Ok(true) => Ok(gex_emit::module::DISPATCH_MISS_REDISPATCH),
                 Ok(false) => {
                     if caller.data().nt.is_some() {
                         return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
@@ -2872,6 +2886,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // is how some runtimes probe for optional instructions.
             match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGILL as u32, pc, pc)) {
                 gex_kernel::signal::Delivery::Resume(target) => {
+                    state.resume_cause = Some("SIGILL".into());
                     state.resume_at = Some(target);
                 }
                 _ => {
@@ -2947,7 +2962,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let state = caller.data_mut();
                 let mut gm = GuestMem::new(data);
                 match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGFPE as u32, pc, pc)) {
-                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGFPE".into());
+                        state.resume_at = Some(target)
+                    }
                     _ => {
                         state.exit = Some(Exit::Signal {
                             signal: signal::SIGFPE,
@@ -2975,7 +2993,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let state = caller.data_mut();
                 let mut gm = GuestMem::new(data);
                 match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, 0)) {
-                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGSEGV".into());
+                        state.resume_at = Some(target)
+                    }
                     _ => {
                         state.exit = Some(Exit::Signal {
                             signal: signal::SIGSEGV,
@@ -3120,6 +3141,30 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // again, with this block as a mate, into a trampoline.
             if op == gex_abi::cache_op::NEST_EXIT_SAMPLE {
                 *EXIT_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((pc as u64, addr as u64)).or_default() += 1;
+                // A normal return leaves PC at the word `ret` just popped
+                // (still in memory below SP); anything else is a leave: the
+                // function, or something it called, went elsewhere, and
+                // every unit frame between it and that place is gone.
+                if let Some(memory) = caller.data().memory.clone() {
+                    let gm = GuestMem::new(memory.bytes());
+                    let c = caller.data().thread.ctx_addr;
+                    let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+                    let popped = if gex_xlate::arch::compat() {
+                        gm.read_u32(sp.wrapping_sub(4)).map(|v| v as u64).unwrap_or(1)
+                    } else {
+                        gm.read_u64(sp.wrapping_sub(8)).unwrap_or(1)
+                    };
+                    let leave = (addr as u64) != popped
+                        && !gm.read(sp.wrapping_sub(64), 64).map(|w| w.chunks(4).any(|x| u32::from_le_bytes(x.try_into().unwrap()) as u64 == addr as u64)).unwrap_or(false);
+                    // Bit 63: the target's page is marked patched (a unit
+                    // leaves for a callee there instead of calling it).
+                    let t = addr as u64;
+                    let patched = gm.read(gex_abi::PATCHED_PAGES + (t >> 15), 1).map(|b| (b[0] >> ((t >> 12) & 7)) & 1 == 1).unwrap_or(false);
+                    let addr = (t | ((patched as u64) << 63)) as i64;
+                    if leave {
+                        *LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((pc as u64, addr as u64)).or_default() += 1;
+                    }
+                }
                 return Ok(());
             }
             if op == gex_abi::cache_op::PAGE_STALE {
@@ -3286,6 +3331,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
+                    state.resume_cause = Some("signal at safepoint".into());
                     state.resume_at = Some(target);
                     Err(StopExecution.into())
                 }
@@ -3575,6 +3621,7 @@ fn publish_unit(
     module: Module,
     blocks: usize,
 ) -> Result<Arc<CompiledUnit>> {
+    aot_share::note(&module, aot_share::Kind::Tier1);
     {
         use std::sync::atomic::Ordering::Relaxed;
         jit_stats::PUBLISHED.fetch_add(1, Relaxed);
@@ -3762,6 +3809,19 @@ static EXIT_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = M
 
 /// The `n` most sampled nest exits since the last call, as
 /// `function->target count`.
+/// Sampled nest exits that were not a plain return (see NEST_EXIT_SAMPLE).
+static LEAVE_SITES: Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// The `n` most sampled leaves since the last call, and their total.
+pub(crate) fn take_leave_sites(n: usize) -> (u64, Vec<(u64, u64, u64)>) {
+    let m = LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let total = m.values().sum();
+    let mut v: Vec<_> = m.into_iter().map(|((f, t), c)| (f, t, c)).collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2));
+    v.truncate(n);
+    (total, v)
+}
+
 pub(crate) fn take_exit_sites(n: usize) -> Vec<(u64, u64, u64)> {
     let m = EXIT_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut v: Vec<_> = m.into_iter().map(|((f, t), c)| (f, t, c)).collect();
@@ -3991,6 +4051,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         }
         if let Some(at) = caller.data_mut().resume_at.take() {
             crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_resume(caller.data_mut(), at, "call-out");
             pc = at;
             refresh_callouts(&mut *caller)?;
             continue;
@@ -4364,4 +4425,28 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
         return anyhow!("{detail} (pc≈0x{pc:x})");
     }
     e
+}
+
+/// Record a taken resume's cause (set with `resume_at`) and target, under
+/// GEX_NT_STATS; `taker` names the loop that took it when no cause was set.
+pub(crate) fn note_resume(state: &mut HostState, target: u64, taker: &str) {
+    let cause = state.resume_cause.take();
+    if crate::ftab::stats_on() {
+        crate::ftab::stats::note_resume_cause(cause.unwrap_or_else(|| format!("untagged ({taker})")), target);
+    }
+}
+
+/// The wasm stack each guest thread may use (`GEX_WASM_STACK_MB`, default
+/// 64 MiB; wasmtime's own default is 512 KiB): units are call-returning, so
+/// guest call depth is wasm stack depth. Natively the units' depth guard is
+/// what keeps them inside it.
+pub fn wasm_stack_bytes() -> usize {
+    std::env::var("GEX_WASM_STACK_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64) << 20
+}
+
+/// The host stack for a thread that runs guest code: the wasm stack plus
+/// room for the host's own frames below and above it (reserved, touched
+/// only as used).
+pub fn guest_thread_stack() -> usize {
+    wasm_stack_bytes() + (16 << 20)
 }

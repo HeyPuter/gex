@@ -299,6 +299,15 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                             .map(|(f, t, c)| format!("{} -> {} x{c}", p.describe_addr(f), p.describe_addr(t)))
                             .collect();
                         eprintln!("gex-nt: nest exits (1 in 4096) {}", ex.join(" | "));
+                        if let Some(l) = crate::aot_share::line() {
+                            eprintln!("gex-nt: {l}");
+                        }
+                        let (lt, lv) = crate::take_leave_sites(15);
+                        let lv: Vec<String> = lv
+                            .into_iter()
+                            .map(|(f, t, c)| format!("{} -> {}{} x{c}", p.describe_addr(f), p.describe_addr(t & !(1 << 63)), if t >> 63 != 0 { " [patched]" } else { "" }))
+                            .collect();
+                        eprintln!("gex-nt: leaves among them x{lt}: {}", lv.join(" | "));
                         let fb: Vec<String> = crate::ftab::stats::take_fallback_sites(15)
                             .into_iter()
                             .map(|(t, c)| format!("{} x{c}", p.describe_addr(t)))
@@ -393,6 +402,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let p = Arc::clone(state.nt.as_ref().expect("an NT syscall in a Linux process"));
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
+    let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
         nt::syscall(&p, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
@@ -418,8 +428,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         nt::Outcome::Continue => Ok(()),
         nt::Outcome::Resume(target) => {
             if crate::ftab::stats_on() {
-                let nr = read_u64(memory.bytes(), (ctx_addr + ctx::LAST_SYSCALL as u64) as usize) as u32;
-                crate::ftab::stats::note_resume_cause(nt::syscall_name(nr), target);
+                state.resume_cause = Some(nt::syscall_name(nr));
             }
             state.resume_at = Some(target);
             Err(StopExecution.into())
@@ -481,7 +490,7 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
     match outcome {
         nt::Outcome::Resume(target) => {
             if crate::ftab::stats_on() {
-                crate::ftab::stats::note_resume_cause(format!("exception {code:#x} at {pc:#x}"), target);
+                state.resume_cause = Some(format!("exception {code:#x} at {pc:#x}"));
             }
             state.resume_at = Some(target)
         }
@@ -565,6 +574,7 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
         }
         if let Some(next) = caller.data_mut().resume_at.take() {
             crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::note_resume(caller.data_mut(), next, "callback loop");
             pc = next;
             continue;
         }

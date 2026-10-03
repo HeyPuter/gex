@@ -621,6 +621,7 @@ fn install_providers(p: &Pending, shared: &Arc<Mutex<JitShared>>, engine: &Engin
             continue;
         }
         let module = Module::from_file(engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
+        crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
         crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
         eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
     }
