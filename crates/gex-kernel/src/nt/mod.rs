@@ -24,6 +24,7 @@ pub mod gdi;
 pub mod layout;
 pub mod object;
 pub mod opengl;
+pub mod pipe;
 pub mod reg;
 pub mod section;
 pub mod status;
@@ -423,6 +424,8 @@ pub struct Process {
     /// The process's own sync id, signalled when it ends.
     pub sync_id: u64,
     pub unix: unixcall::Registry,
+    /// Named pipes served in this process (`pipe.rs`).
+    pub pipes: Arc<pipe::Pipes>,
     pub atoms: Mutex<sysinfo::Atoms>,
     /// Threads blocked on keyed events.
     pub keyed: Mutex<sync::Keyed>,
@@ -509,6 +512,7 @@ impl Process {
             next_word: AtomicU32::new(0),
             sync_id: 1,
             unix: unixcall::Registry::default(),
+            pipes: Arc::default(),
             atoms: Mutex::new(Default::default()),
             keyed: Mutex::new(Default::default()),
             user: Mutex::new(user::User::new()),
@@ -963,6 +967,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtQueryVolumeInformationFile => file::nt_query_volume_information_file(c),
         n::NtQueryDirectoryFile => file::nt_query_directory_file(c),
         n::NtFsControlFile => file::nt_fs_control_file(c),
+        n::NtCreateNamedPipeFile => file::nt_create_named_pipe_file(c),
         n::NtDeviceIoControlFile => file::nt_device_io_control_file(c),
         n::NtFlushBuffersFile => file::nt_flush_buffers_file(c),
         // -- registry --------------------------------------------------------
