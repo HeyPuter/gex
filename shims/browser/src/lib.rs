@@ -6481,6 +6481,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // nothing is instantiated and the guest is not interrupted, because a page's
     // directory entry is not published until its module installs, so every
     // branch still finds the miss stub; JS picks the queue up at the next miss.
+    retire_unmapped_code();
     recompile_objects();
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
@@ -11188,6 +11189,46 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     trap();
 }
 
+
+/// Code the guest unmapped or reprotected since the last syscall loses its
+/// translations, as natively (`retire_translations`): the pages leave the
+/// shared page table and their directory entries go back to the miss stub,
+/// so the next branch there, from any Worker, lifts what is mapped there
+/// now. Without this a `dlclose` and a `dlopen` that reuses the address ran
+/// the old library's blocks (Half-Life: SDL's libudev landing where an
+/// earlier library had been, entered in the middle of an instruction).
+fn retire_unmapped_code() {
+    with_host(|h| {
+        let retired = std::mem::take(&mut h.kernel.retired_code);
+        if !retired.is_empty() {
+            crate::cgen::on_retire(&retired);
+            retire_code(h, &retired);
+        }
+    });
+}
+
+/// Forget every translation in `ranges` (see `retire_unmapped_code`). The
+/// old slots are left behind, unreachable.
+pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    for &(start, end) in ranges {
+        if end <= start {
+            continue;
+        }
+        h.jit.translated.retain(|a| *a < start || *a >= end);
+        for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
+            if page >= gex_abi::DISPATCH_MAX_PAGES {
+                break;
+            }
+            h.jit.page_table.forget(page);
+            h.jit.retired_pages.insert(page);
+            let at = gex_abi::DISPATCH_DIR + page * 4;
+            // SAFETY: the directory is in the shared memory, four-byte
+            // aligned, and every Worker's dispatch reads it as a word.
+            unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
+        }
+    }
+}
 
 /// Queue objects the guest mapped since the last syscall as recompile
 /// candidates. Off unless the page asks. Bulk static recompilation (see

@@ -803,24 +803,7 @@ mod imp {
     }
 
     fn retire(h: &mut crate::Host, ranges: &[(u64, u64)]) {
-        use std::sync::atomic::AtomicU32;
-        for &(start, end) in ranges {
-            if end <= start {
-                continue;
-            }
-            h.jit.translated.retain(|a| *a < start || *a >= end);
-            for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
-                if page >= gex_abi::DISPATCH_MAX_PAGES {
-                    break;
-                }
-                h.jit.page_table.forget(page);
-                h.jit.retired_pages.insert(page);
-                let at = gex_abi::DISPATCH_DIR + page * 4;
-                // SAFETY: the directory is in the shared memory, four-byte
-                // aligned, and every Worker's dispatch reads it as a word.
-                unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
-            }
-        }
+        crate::retire_code(h, ranges);
     }
 
     /// Each thread's last NT calls and where they were made, for an execute
