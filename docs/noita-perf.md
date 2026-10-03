@@ -122,6 +122,21 @@ Synchronisation spinning (ConcRT plus the yields it causes) is about 13%, and
 pewasm replaced exactly that (`noita_concrt.c`, lock-free critical sections).
 Lua is about 1% here; world-up is not attributed yet.
 
+### Export providers (§9.9), tier-1
+
+4x clock, null display, cores 3 and 9, world fps over 720-1000 s:
+
+| build | world-up | steady world fps |
+|---|---|---|
+| `GEX_PROVIDERS=0` | 450 s | 14.5 |
+| ConcRT provider with a 1 ms `_Yield` (two runs) | 495, 441 s | 15.6, 17.8 |
+| ConcRT provider, the guest's own `_Yield` (two runs) | 443, 450 s | 18.1, 18.3 |
+
+The ConcRT provider takes msvcr120 from 11.6% of the CPU to 4.4% and the
+host's `sched_yield` out of the profile. `_Yield` stays the guest's
+(`SwitchToThread`, a host yield): a 1 ms wait there slowed both loading and
+the steady state.
+
 ### One function at a time
 
 `gexc cgen-c noita.exe --pe-base 0x400000 [--recovery DIR] --at ADDR`
