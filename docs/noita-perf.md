@@ -321,3 +321,39 @@ units. Tier-1's 17.6% is interior blocks of functions units hold
 resumed in tier-1 after a leave; nest exits ran at 2.3 G over the run.
 So about 28% of the time is tier-1 plus tier switching, which is R's
 (leaves, resume, call-out), and 7% is the guest's spin-yield.
+
+### Stream F, second wrap-up (2026-10-03)
+
+**f_724580 (10.7% of CPU).** Compiled noita.exe's unit with gex's exact
+wasmtime config (scratchpad `tools/wcompile`; the native function has the
+perf map's size, 0xd418, so profile PCs map onto it). Most samples sit on
+guest data loads (pointer chasing in a grid lookup: pewasm pays the same
+misses). About 7% sit on two jump-table dispatches in the hot loops: clang's
+fix-up for irreducible control flow, caused by the `gex_resume` switch,
+which jumps into loops. Without the switch the function is 9,186 wasm
+instructions instead of 10,845, and the 78/40/32-entry dispatch tables go.
+
+**Local resume (WIP commit on merge/fjit, awaiting R).** A failed call
+resumes only at its own continuation (`gex_lc_<block>`), which keeps the
+CFG reducible. Waiting on R: does anything need entry at a continuation
+from outside (SEH, longjmp), and how often does the cross-continuation
+case fire. Gated: ntdll + hello32 repro, lockstep (flags ignored) 30/30 on
+gi386 and gx64. To do before un-WIP: exact-mode lockstep,
+tests/nt/cgen-prefix.sh, a unit rebuild (coordinated), Noita fps.
+
+**World-up (warm units, providers, null display, 4x, cores 4,10):** first
+frame at 59 s, world-up at 276 s in this run (433 and 590 s in the two
+earlier runs; the 590 s run also compiled noita.exe's 122 MiB unit cold,
+205 s). CPU 0-280 s: host 91% (gexc 76%, libc 15%), units 4.4%, tier-1
+2.9%. The host share is Cranelift compiling tier-1 modules (regalloc2,
+egraph and lowering are the top symbols, together well over half of the
+CPU): code the units do not hold (resumed interiors, Wine DLLs without
+units, runtime-generated code) is translated block by block and compiled
+at start-up. pewasm compiles nothing at start-up (one AOT module): 27 s.
+Not fixed, as asked. Levers: units for every DLL the run maps, fewer
+tier-1 interiors (R's leaves), Cranelift opt level none for tier-1, a
+compiled-module cache for tier-1 (gex-cache) across runs.
+
+**Next for F:** un-WIP local resume after R answers; then the flags-at-
+returns fixpoint (about 5% of instructions on f_dd6ba0, nothing on the
+hottest functions) and vector reloads, only where hot functions show them.
