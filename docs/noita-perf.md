@@ -176,57 +176,6 @@ arithmetic flags; registers a pure callee never touches are not in the
 context during the call (only in the caller's locals) -- a memory fault
 inside such a callee sees the caller's older values, as in pewasm.
 
-The browser can drop the guard once its NT layer's guard limit equals the
-memory size (no host data above the guest's addresses).
-
-## Stream F's state at wrap-up (2026-10-03)
-
-merge/fjit @ 77f4ef26 (merge/abi9 merged up to 212d4f11). Commits since
-the first report, in order: 1827b993 (32-bit GPRs, displacements in the
-memarg, 32-bit guard, partial reload, `flags_abi`), a00fb489 (unguarded
-native flavor, in the unit key), fae67c12 + 70297e1f (minimal write-back at
-pure calls, as pewasm's A*(g); the second fixes the first), the native
-flavor's no-outlining commit, 77f4ef26 (depth guard only where the call
-tree can grow without bound), and the tools: 5ae8acfe (`gexc cgen-c`,
-`GEX_PROF_START`), 90649c55 (`prof-report --modules`).
-
-Gates on these: lockstep tier-1 against `--cgen` 30/30 on gi386 and gx64
-in both modes (flags ignored, and `GEX_CGEN_LIVE=0` exact); tests/nt
-`--cgen` 48/48, and 50/50 with the prefix's DLL units built by 77f4ef26;
-Tier 0 gi386 in node (the browser flavor): cg 2.810 -> 2.700 x emcc.
-
-**Noita units fps: not measured.** The units built before 70297e1f failed
-in Wine's ntdll (the write-back bug that commit fixes); the full unit build
-for 77f4ef26 (prefix done in 16.5 min, images about an hour more) was
-stopped at wrap-up. The hot-function table above is for the native flavor
-before 70297e1f and 77f4ef26 (both only remove instructions).
-
-To measure, on cores 4 and 10:
-
-```
-S=<scratchpad>/fjit
-$S/build-units.sh <gexc> $S/cgcache    # cgen-prefix into $S/prefix, then the 8 Noita images
-GEX_CGEN_CACHE=$S/cgcache NULLDISP=1 GEX_NT_TIME_SCALE=4 CPUS=4,10 GEXC=<gexc> \
-    $S/run-noita2.sh units 1100        # R's recipe (null display); providers on by default
-```
-
-and compare the `peek` slope with pewasm's 76-84. Report noita.exe's unit
-share and the rest separately (`tools/prof-report.py --modules`, R's
-`tools/modattr.py`).
-
-Next, in order:
-1. That measurement, with a profile (`GEX_PROF_START` past world-up).
-2. The return check and the resume dispatch at call continuations are
-   the remaining entry/exit overhead on small functions (0x70b110: 197
-   against pewasm's 162). pewasm has neither (it tests `recomp_jmp_pending`
-   after calls); both carry R's §4.2/§9 invariants, so any change goes
-   through R.
-3. Flags at returns: gex computes them and stores them when the caller's
-   `need` asks; pewasm drops them by a whole-program fixpoint. The
-   computation stays live in gex (0xdd6ba0's early exits).
-4. Vector registers reloaded after calls because partial lane writes read
-   the whole register (lane liveness).
-
 Still open: each call writes back every dirty register (§4.1's state at a
 host-visible point), where pewasm writes back the callee's inputs; vector
 registers reloaded after calls because partial lane writes read them;
@@ -290,3 +239,54 @@ tier-1 translation are the suspects.
 4. The heap family, all at once (§9.9.2 step 4).
 5. A direct call from units to providers, only if the units profile shows
    the stub's fcache probe (a §9.9.1 deviation).
+
+The browser can drop the guard once its NT layer's guard limit equals the
+memory size (no host data above the guest's addresses).
+
+## Stream F's state at wrap-up (2026-10-03)
+
+merge/fjit @ 77f4ef26 (merge/abi9 merged up to 212d4f11). Commits since
+the first report, in order: 1827b993 (32-bit GPRs, displacements in the
+memarg, 32-bit guard, partial reload, `flags_abi`), a00fb489 (unguarded
+native flavor, in the unit key), fae67c12 + 70297e1f (minimal write-back at
+pure calls, as pewasm's A*(g); the second fixes the first), the native
+flavor's no-outlining commit, 77f4ef26 (depth guard only where the call
+tree can grow without bound), and the tools: 5ae8acfe (`gexc cgen-c`,
+`GEX_PROF_START`), 90649c55 (`prof-report --modules`).
+
+Gates on these: lockstep tier-1 against `--cgen` 30/30 on gi386 and gx64
+in both modes (flags ignored, and `GEX_CGEN_LIVE=0` exact); tests/nt
+`--cgen` 48/48, and 50/50 with the prefix's DLL units built by 77f4ef26;
+Tier 0 gi386 in node (the browser flavor): cg 2.810 -> 2.700 x emcc.
+
+**Noita units fps: not measured.** The units built before 70297e1f failed
+in Wine's ntdll (the write-back bug that commit fixes); the full unit build
+for 77f4ef26 (prefix done in 16.5 min, images about an hour more) was
+stopped at wrap-up. The hot-function table above is for the native flavor
+before 70297e1f and 77f4ef26 (both only remove instructions).
+
+To measure, on cores 4 and 10:
+
+```
+S=<scratchpad>/fjit
+$S/build-units.sh <gexc> $S/cgcache    # cgen-prefix into $S/prefix, then the 8 Noita images
+GEX_CGEN_CACHE=$S/cgcache NULLDISP=1 GEX_NT_TIME_SCALE=4 CPUS=4,10 GEXC=<gexc> \
+    $S/run-noita2.sh units 1100        # R's recipe (null display); providers on by default
+```
+
+and compare the `peek` slope with pewasm's 76-84. Report noita.exe's unit
+share and the rest separately (`tools/prof-report.py --modules`, R's
+`tools/modattr.py`).
+
+Next, in order:
+1. That measurement, with a profile (`GEX_PROF_START` past world-up).
+2. The return check and the resume dispatch at call continuations are
+   the remaining entry/exit overhead on small functions (0x70b110: 197
+   against pewasm's 162). pewasm has neither (it tests `recomp_jmp_pending`
+   after calls); both carry R's §4.2/§9 invariants, so any change goes
+   through R.
+3. Flags at returns: gex computes them and stores them when the caller's
+   `need` asks; pewasm drops them by a whole-program fixpoint. The
+   computation stays live in gex (0xdd6ba0's early exits).
+4. Vector registers reloaded after calls because partial lane writes read
+   the whole register (lane liveness).
