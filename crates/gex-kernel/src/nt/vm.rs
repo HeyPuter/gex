@@ -418,7 +418,26 @@ fn zero_bits_limit(_c: &Call<'_>, zero_bits: u64) -> u64 {
 }
 
 /// Core of NtAllocateVirtualMemory(Ex).
+/// [`allocate_inner`], traced under `GEX_NT_TRACE`: what was asked (address,
+/// size, type, protection) and what was given, which is how a program's
+/// reservation pattern is read off a run.
 fn allocate(c: &mut Call<'_>, addr_p: u64, limit: u64, size_p: u64, typ: u32, prot: u32) -> R {
+    if !c.p.cfg.trace {
+        return allocate_inner(c, addr_p, limit, size_p, typ, prot);
+    }
+    let (want, size) = (c.g.ptr(addr_p).unwrap_or(0), c.g.ptr(size_p).unwrap_or(0));
+    let r = allocate_inner(c, addr_p, limit, size_p, typ, prot);
+    let got = if r.is_ok() { c.g.ptr(addr_p).unwrap_or(0) } else { 0 };
+    let got_size = if r.is_ok() { c.g.ptr(size_p).unwrap_or(0) } else { 0 };
+    crate::nt_log!(
+        "[nt:{:x}]   alloc want={want:#x} size={size:#x} type={typ:#x} prot={prot:#x} -> {} at {got:#x}+{got_size:#x}",
+        c.t.tid,
+        match &r { Ok(_) => "ok".to_string(), Err(e) => format!("{:#010x}", e.0) }
+    );
+    r
+}
+
+fn allocate_inner(c: &mut Call<'_>, addr_p: u64, limit: u64, size_p: u64, typ: u32, prot: u32) -> R {
     use mem_flags::*;
     let addr = c.g.ptr(addr_p)?;
     let size = c.g.ptr(size_p)?;
