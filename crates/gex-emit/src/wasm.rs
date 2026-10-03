@@ -329,6 +329,80 @@ impl FuncBody {
         write_i64(&mut self.code, v);
     }
 
+    /// Push the constant guest address `a` as the memory's index type: i32
+    /// for a wasm32 guest memory, i64 for a memory64 one (docs/mem64.md).
+    pub fn addr_const(&mut self, a: u64) {
+        if gex_abi::mem64() {
+            self.i64_const(a as i64);
+        } else {
+            self.i32_const(a as u32 as i32);
+        }
+    }
+
+    /// Address arithmetic in the memory's index type (docs/mem64.md). For
+    /// a wasm32 memory each emits exactly the i32 instruction tier-1 always
+    /// has, so wasm32 modules are unchanged.
+    ///
+    /// `+ k`.
+    pub fn addr_add_const(&mut self, k: u32) {
+        if gex_abi::mem64() {
+            self.i64_const(k as i64);
+            self.byte(0x7c); // i64.add
+        } else {
+            self.i32_const(k as i32);
+            self.byte(0x6a); // i32.add
+        }
+    }
+
+    /// `& k`.
+    pub fn addr_and_const(&mut self, k: i64) {
+        if gex_abi::mem64() {
+            self.i64_const(k);
+            self.byte(0x83); // i64.and
+        } else {
+            self.i32_const(k as i32);
+            self.byte(0x71); // i32.and
+        }
+    }
+
+    /// `<u` of the two addresses on the stack, an i32 result.
+    pub fn addr_lt_u(&mut self) {
+        self.byte(if gex_abi::mem64() { 0x54 } else { 0x49 });
+    }
+
+    /// The address on the stack as an i64 value (for a host call).
+    pub fn addr_to_i64(&mut self) {
+        if !gex_abi::mem64() {
+            self.byte(0xad); // i64.extend_i32_u
+        }
+    }
+
+    /// The low 32 bits of the address on the stack, for alignment arithmetic.
+    pub fn addr_low32(&mut self) {
+        if gex_abi::mem64() {
+            self.byte(0xa7); // i32.wrap_i64
+        }
+    }
+
+    /// Make the i32 function-table index on top of the stack `gex.ftab`'s
+    /// index type: a memory64 process's `ftab` is a table64, as clang's
+    /// wasm64 units import it (docs/mem64.md §4).
+    pub fn ftab_index(&mut self) {
+        if gex_abi::mem64() {
+            self.byte(0xad); // i64.extend_i32_u
+        }
+    }
+
+    /// Make the i32 address on top of the stack the memory's index type:
+    /// nothing for a wasm32 guest memory, a zero-extension for memory64. The
+    /// context pointer (`ctx`, an i32 in every ABI) and the runtime's low
+    /// addresses are such i32s.
+    pub fn addr_i32(&mut self) {
+        if gex_abi::mem64() {
+            self.byte(0xad); // i64.extend_i32_u
+        }
+    }
+
     pub fn call(&mut self, func: u32) {
         self.byte(op::CALL);
         self.u32(func);
@@ -609,6 +683,8 @@ pub enum ImportKind {
         min: u64,
         max: u64,
         shared: bool,
+        /// A memory64 (64-bit index) memory.
+        mem64: bool,
     },
     /// A funcref table with the given minimum size.
     Table {
@@ -738,7 +814,20 @@ impl Module {
         self.imports.push(Import {
             module: module.to_string(),
             name: name.to_string(),
-            kind: ImportKind::Memory { min, max, shared },
+            kind: ImportKind::Memory { min, max, shared, mem64: false },
+        });
+    }
+
+    /// Import the guest memory: shared, and a memory64 one of
+    /// [`gex_abi::LIMIT64_PAGES`] in an M64 process (docs/mem64.md), else
+    /// `min..max` pages of wasm32.
+    pub fn import_guest_memory(&mut self, module: &str, name: &str, min: u64, max: u64) {
+        let mem64 = gex_abi::mem64();
+        let max = if mem64 { gex_abi::LIMIT64_PAGES } else { max };
+        self.imports.push(Import {
+            module: module.to_string(),
+            name: name.to_string(),
+            kind: ImportKind::Memory { min, max, shared: true, mem64 },
         });
     }
 
@@ -1123,13 +1212,17 @@ impl Module {
                         s.push(0x00);
                         write_u32(&mut s, *ty);
                     }
-                    ImportKind::Memory { min, max, shared } => {
+                    ImportKind::Memory { min, max, shared, mem64 } => {
                         s.push(0x02);
                         // Limits flags: bit 0 says a maximum follows, bit 1
-                        // shared. A shared memory must declare a maximum.
+                        // shared, bit 2 a 64-bit index. A shared memory must
+                        // declare a maximum.
                         let mut flags = 0x01;
                         if *shared {
                             flags |= 0x02;
+                        }
+                        if *mem64 {
+                            flags |= 0x04;
                         }
                         s.push(flags);
                         write_u64(&mut s, *min);
@@ -1292,10 +1385,23 @@ impl Module {
             }
             // The offset of an active data segment is a constant expression
             // typed by the memory it lands in.
+            let mem64 = self
+                .imports
+                .iter()
+                .find_map(|i| match i.kind {
+                    ImportKind::Memory { mem64, .. } => Some(mem64),
+                    _ => None,
+                })
+                .unwrap_or(false);
             for d in &self.data {
                 s.push(0x00); // active, memory 0
-                s.push(op::I32_CONST);
-                write_i32(&mut s, d.offset as i32);
+                if mem64 {
+                    s.push(op::I64_CONST);
+                    write_i64(&mut s, d.offset as i64);
+                } else {
+                    s.push(op::I32_CONST);
+                    write_i32(&mut s, d.offset as i32);
+                }
                 s.push(op::END);
                 write_u32(&mut s, d.bytes.len() as u32);
                 s.extend_from_slice(&d.bytes);

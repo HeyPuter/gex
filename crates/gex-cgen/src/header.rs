@@ -121,7 +121,11 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_FMA_SPLIT {:?}", gex_emit::fma::SPLIT);
     let _ = writeln!(w, "#define GEX_FMA_SAFE_LO {}ull", gex_emit::fma::SAFE_LO);
     let _ = writeln!(w, "#define GEX_FMA_SAFE_HI {}ull", gex_emit::fma::SAFE_HI);
-    w.push_str(BODY_HELPERS);
+    if gex_abi::mem64() {
+        w.push_str(&mem64_helpers());
+    } else {
+        w.push_str(BODY_HELPERS);
+    }
     w.push_str(X87_HELPERS);
     w.push_str("#endif\n");
     h
@@ -158,6 +162,42 @@ typedef uint64_t __attribute__((may_alias)) gex_a64;
 #define GEX_MUSTTAIL __attribute__((musttail))
 
 "#;
+
+/// [`BODY_HELPERS`] for a memory64 guest memory (docs/mem64.md): the guard
+/// helpers pass the 64-bit guest address through (the engine's own check
+/// traps past the end, as tier-1's M64 code relies on), and the misaligned
+/// lock takes a 64-bit address. The wasm32 text is untouched, so wasm32
+/// units, their keys and their objects do not change.
+fn mem64_helpers() -> String {
+    let mut s = String::from("#define GEX_MEM64 1\n");
+    let mut b = BODY_HELPERS.to_string();
+    let subs: &[(&str, &str)] = &[
+        (
+            "GEX_INLINE uint32_t gex_g(uint64_t a) {\n    return a < GEX_GUEST_LIMIT ? (uint32_t)a : GEX_POISON_ADDR;\n}",
+            "GEX_INLINE uint64_t gex_g(uint64_t a) {\n    return a;\n}",
+        ),
+        (
+            "    return (char *)(uintptr_t)(a < GEX_GUEST_LIMIT ? (uint32_t)a : (uint32_t)GEX_GUEST_LIMIT);",
+            "    return (char *)(uintptr_t)a;",
+        ),
+        (
+            "    uint64_t e = (uint64_t)gex_g(base) + off;\n    return (char *)(uintptr_t)(e < 0x100000000ull ? (uint32_t)e : GEX_POISON_ADDR);",
+            "    return (char *)(uintptr_t)(base + off);",
+        ),
+        (
+            "int64_t pc, uint32_t ea, uint32_t bytes,",
+            "int64_t pc, uint64_t ea, uint32_t bytes,",
+        ),
+        ("        uint32_t wa = ea & ~7u;", "        uint64_t wa = ea & ~7ull;"),
+        ("        uint32_t sh = (ea & 7u) * 8u;", "        uint32_t sh = (uint32_t)(ea & 7u) * 8u;"),
+    ];
+    for (from, to) in subs {
+        assert!(b.contains(from), "the M64 header no longer matches BODY_HELPERS: {from}");
+        b = b.replace(from, to);
+    }
+    s.push_str(&b);
+    s
+}
 
 const BODY_HELPERS: &str = r#"
 #define GEX_INLINE static inline __attribute__((always_inline))

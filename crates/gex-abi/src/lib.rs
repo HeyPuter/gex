@@ -163,6 +163,31 @@ impl MemFlavor {
     }
 }
 
+static MEM64: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set the guest memory every translation in this host process targets
+/// (docs/mem64.md §3). Natively a gexc process's guests share one flavour; a
+/// browser shim's is fixed by its build. Set before anything is translated.
+pub fn set_mem_flavor(f: MemFlavor) {
+    MEM64.store(f.is_64() || cfg!(target_arch = "wasm64"), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The guest memory translations target: [`MemFlavor::M32`] unless
+/// [`set_mem_flavor`] said otherwise, or this is a wasm64 build (whose own
+/// memory is the guest's, so it can only emit for a 64-bit one).
+pub fn mem_flavor() -> MemFlavor {
+    if cfg!(target_arch = "wasm64") || MEM64.load(core::sync::atomic::Ordering::Relaxed) {
+        MemFlavor::M64
+    } else {
+        MemFlavor::M32
+    }
+}
+
+/// `mem_flavor().is_64()`.
+pub fn mem64() -> bool {
+    mem_flavor().is_64()
+}
+
 /// The size of an [`MemFlavor::M64`] memory: 16 GiB, V8's memory64 cap
 /// (262144 pages), used natively too so that every module declares the same
 /// maximum and runs on either host.

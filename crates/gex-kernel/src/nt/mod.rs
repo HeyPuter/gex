@@ -505,7 +505,12 @@ impl Process {
             futexes,
             st: Mutex::new(State {
                 handles: object::Handles::default(),
-                vm: vm::Vm::new(),
+                vm: vm::Vm {
+                    // A PE32+ process with a 64-bit guest memory has the high
+                    // arena (docs/mem64.md §3); a PE32 one cannot address it.
+                    high: (gex_abi::mem64() && abi == Abi::P64).then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
+                    ..vm::Vm::new()
+                },
                 images: Default::default(),
                 file_views: Default::default(),
                 shared_views: Default::default(),

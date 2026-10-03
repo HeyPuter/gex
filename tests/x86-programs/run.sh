@@ -13,13 +13,17 @@ WORK=${WORK:-$(mktemp -d)}
 fail=0
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)
-    for target in x86_64-linux-musl x86-linux-musl; do
+    # mem64-*: a 64-bit guest memory (docs/mem64.md), x86-64 only.
+    gexflags=""
+    targets="x86_64-linux-musl x86-linux-musl"
+    case $name in mem64-*) gexflags=--mem64; targets=x86_64-linux-musl ;; esac
+    for target in $targets; do
         extra=""
         [ "$target" = x86-linux-musl ] && extra="-Wl,--image-base=0x1000000"
         bin="$WORK/$name-$target"
         zig cc -target "$target" -O1 -static $extra -o "$bin" "$src" || { fail=1; continue; }
         native=$("$bin" 2>/dev/null); ns=$?
-        gex=$("$GEXC" run "$bin" 2>/dev/null); gs=$?
+        gex=$("$GEXC" run $gexflags "$bin" 2>/dev/null); gs=$?
         if [ "$native" = "$gex" ] && [ $ns = $gs ]; then
             echo "ok   $name ($target, exit $ns)"
         else

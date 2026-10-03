@@ -479,6 +479,11 @@ struct Emitter<'a> {
     block_start: u64,
     /// Scratch for address computation.
     scratch_i64: u32,
+    /// Two addresses for a bulk memory op under a memory64 guest memory
+    /// (docs/mem64.md), whose addresses are i64 and so cannot borrow the
+    /// i32 scratches the wasm32 path uses. Zero, and never declared, unless
+    /// the memory is 64-bit: a wasm32 function keeps exactly its locals.
+    scratch_addr: (u32, u32),
     /// Scratch for the safepoint counter.
     scratch_i32: u32,
     /// Scratch for the dispatch page index.
@@ -565,7 +570,13 @@ impl<'a> Emitter<'a> {
         let scratch_page = f.add_local(ValType::I64);
         let scratch_entry = f.add_local(ValType::I32);
         let scratch_index = f.add_local(ValType::I32);
+        let scratch_addr = if gex_abi::mem64() {
+            (f.add_local(ValType::I64), f.add_local(ValType::I64))
+        } else {
+            (0, 0)
+        };
         Emitter {
+            scratch_addr,
             f,
             cx,
             ctx_local: 0,
@@ -724,7 +735,7 @@ impl<'a> Emitter<'a> {
             for r in flags {
                 note_traffic(r);
             }
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(locals[0]);
             for (i, &l) in locals.iter().enumerate().skip(1) {
                 self.f.local_get(l);
@@ -742,7 +753,7 @@ impl<'a> Emitter<'a> {
             let la = self.regs[&GuestReg::A].local;
             note_traffic(GuestReg::P);
             note_traffic(GuestReg::A);
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(lp);
             self.f.local_get(la);
             self.f.i32_const(8);
@@ -758,7 +769,7 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             note_traffic(r);
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(local);
             if Self::is_flag(r) {
                 self.f.store(0x3a, 0, Self::reg_offset(r)); // i32.store8
@@ -1050,7 +1061,7 @@ impl<'a> Emitter<'a> {
     /// context directly, not through `reg_local`, so it does not make the body
     /// that follows believe `sp` is already in a local.
     fn emit_sp_check(&mut self, pc: u64) {
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x29, 3, ctx::SP as u32);
         self.f.i64_const(gex_abi::STACK_TOP as i64);
         self.f.byte(0x5a); // i64.ge_u
@@ -1099,8 +1110,10 @@ impl<'a> Emitter<'a> {
         } else if Self::is_flag(r) {
             // i32.load8_u: the flag is one byte of the packed slot, and it is
             // 0 or 1, so there is nothing to sign-extend or mask.
+            self.f.addr_i32();
             self.f.load(0x2d, 0, Self::reg_offset(r));
         } else {
+            self.f.addr_i32();
             match ty {
                 Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
                 Ty::I64 => self.f.load(0x29, 3, Self::reg_offset(r)),
@@ -1176,7 +1189,7 @@ impl<'a> Emitter<'a> {
             for r in flags {
                 note_traffic(r);
             }
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(locals[0]);
             for (i, &l) in locals.iter().enumerate().skip(1) {
                 self.f.local_get(l);
@@ -1203,7 +1216,7 @@ impl<'a> Emitter<'a> {
             let la = self.regs[&GuestReg::A].local;
             note_traffic(GuestReg::P);
             note_traffic(GuestReg::A);
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(lp);
             self.f.local_get(la);
             self.f.i32_const(8);
@@ -1227,7 +1240,7 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             note_traffic(r);
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(local);
             if Self::is_flag(r) {
                 self.f.store(0x3a, 0, Self::reg_offset(r)); // i32.store8
@@ -1262,7 +1275,7 @@ impl<'a> Emitter<'a> {
     /// Record the guest PC in the context, so a host call or dispatch miss
     /// sees a precise architectural state.
     fn store_pc(&mut self, pc: u64) {
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.i64_const(pc as i64);
         self.f.store(0x37, 3, ctx::PC as u32);
     }
@@ -1294,6 +1307,24 @@ impl<'a> Emitter<'a> {
             }
             self.f.i32_const(offset as i32);
             self.f.byte(0x6a); // i32.add
+            return 0;
+        }
+        // A memory64 guest memory (docs/mem64.md) takes the guest address
+        // as it stands: past the end of the memory, the engine's own check
+        // traps, which is the SIGSEGV the guard below exists to produce. The
+        // static offset follows the same rule as the guarded path.
+        if gex_abi::mem64() {
+            if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
+                self.f.i64_const(c.wrapping_add(offset as u64) as i64);
+                return 0;
+            }
+            self.push(addr);
+            let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
+            if (0..=max_static).contains(&offset) {
+                return offset as u32;
+            }
+            self.f.i64_const(offset);
+            self.f.byte(0x7c); // i64.add
             return 0;
         }
         // Constant addresses are extremely common (literal pools, absolute
@@ -1345,6 +1376,40 @@ impl<'a> Emitter<'a> {
         static_off
     }
 
+    /// [`Self::addr_ty`] as a GIR type, for [`Self::alloc`].
+    fn addr_ir_ty() -> Ty {
+        if gex_abi::mem64() {
+            Ty::I64
+        } else {
+            Ty::I32
+        }
+    }
+
+    /// The type of a local holding a memory address: the memory's index type.
+    fn addr_ty() -> ValType {
+        if gex_abi::mem64() {
+            ValType::I64
+        } else {
+            ValType::I32
+        }
+    }
+
+    /// The i64 length on the stack as a bulk memory op's length: the
+    /// memory's index type.
+    fn len_to_index(&mut self) {
+        if !gex_abi::mem64() {
+            self.f.byte(code::I32_WRAP_I64);
+        }
+    }
+
+    /// Push the context as a memory address: the `ctx` parameter (an i32 in
+    /// every ABI), widened for a memory64 guest memory (docs/mem64.md). Pass
+    /// `ctx_local` itself to calls.
+    fn ctx_base(&mut self) {
+        self.f.local_get(self.ctx_local);
+        self.f.addr_i32();
+    }
+
     /// Whether to emit the bounds guard at all.
     ///
     /// `GEX_UNSAFE_NO_GUARD=1` drops it, which is **not shippable**: a guest
@@ -1356,8 +1421,12 @@ impl<'a> Emitter<'a> {
         *ON.get_or_init(|| std::env::var_os("GEX_UNSAFE_NO_GUARD").is_some())
     }
 
-    /// Consume an `i64` effective address and leave a bounds-safe `i32`.
+    /// Consume an `i64` effective address and leave a bounds-safe `i32`; for
+    /// a memory64 guest memory, leave the `i64` (the engine checks it).
     fn guard_to_i32(&mut self) {
+        if gex_abi::mem64() {
+            return;
+        }
         if Self::no_guard() {
             self.f.byte(code::I32_WRAP_I64);
             return;
@@ -1454,7 +1523,7 @@ impl<'a> Emitter<'a> {
             Stmt::MemCopy { dst, src, len } => {
                 // Both addresses first: `guard_to_i32` borrows the i64
                 // scratch, and the length wants it afterwards.
-                let (d, s) = (self.scratch_i32, self.scratch_entry);
+                let (d, s) = if gex_abi::mem64() { self.scratch_addr } else { (self.scratch_i32, self.scratch_entry) };
                 self.emit_address(*dst, 0);
                 self.f.local_set(d);
                 self.emit_address(*src, 0);
@@ -1463,14 +1532,14 @@ impl<'a> Emitter<'a> {
                 self.f.local_get(d);
                 self.f.local_get(s);
                 self.f.local_get(self.scratch_i64);
-                self.f.byte(code::I32_WRAP_I64);
+                self.len_to_index();
                 self.f.byte(crate::wasm::op::MISC_PREFIX);
                 self.f.u32(code::MEMORY_COPY);
                 self.f.byte(0); // destination memory
                 self.f.byte(0); // source memory
             }
             Stmt::MemFill { dst, val, len } => {
-                let d = self.scratch_i32;
+                let d = if gex_abi::mem64() { self.scratch_addr.0 } else { self.scratch_i32 };
                 self.emit_address(*dst, 0);
                 self.f.local_set(d);
                 self.clamp_len(*len, &[d]);
@@ -1478,7 +1547,7 @@ impl<'a> Emitter<'a> {
                 self.push(*val);
                 self.f.byte(code::I32_WRAP_I64);
                 self.f.local_get(self.scratch_i64);
-                self.f.byte(code::I32_WRAP_I64);
+                self.len_to_index();
                 self.f.byte(crate::wasm::op::MISC_PREFIX);
                 self.f.u32(code::MEMORY_FILL);
                 self.f.byte(0); // memory
@@ -1492,6 +1561,11 @@ impl<'a> Emitter<'a> {
     /// Clamp the length in the i64 scratch so a bulk op from any of `bases`
     /// cannot run off the end of guest memory. See [`Self::clamp_len`].
     fn clamp_scratch_len(&mut self, bases: &[u32]) {
+        // A memory64 guest memory needs no clamp: an op running past its
+        // end traps, which the host reports as the guest's SIGSEGV.
+        if gex_abi::mem64() {
+            return;
+        }
         let n = self.scratch_i64;
         let room = self.scratch_page;
         for &b in bases {
@@ -1568,7 +1642,7 @@ impl<'a> Emitter<'a> {
         self.f.i64_const(0);
         self.f.local_set(lb);
 
-        let (d32, s32) = (self.scratch_i32, self.scratch_entry);
+        let (d32, s32) = if gex_abi::mem64() { self.scratch_addr } else { (self.scratch_i32, self.scratch_entry) };
 
         self.f.block_void(); // $end
         if matches!(kind, StrKind::Movs | StrKind::Stos) {
@@ -1613,7 +1687,7 @@ impl<'a> Emitter<'a> {
                     self.f.local_get(d32);
                     self.f.local_get(s32);
                     self.f.local_get(self.scratch_i64);
-                    self.f.byte(code::I32_WRAP_I64);
+                    self.len_to_index();
                     self.f.byte(crate::wasm::op::MISC_PREFIX);
                     self.f.u32(code::MEMORY_COPY);
                     self.f.byte(0);
@@ -1657,7 +1731,7 @@ impl<'a> Emitter<'a> {
                     self.f.local_get(lv);
                     self.f.byte(code::I32_WRAP_I64);
                     self.f.local_get(self.scratch_i64);
-                    self.f.byte(code::I32_WRAP_I64);
+                    self.len_to_index();
                     self.f.byte(crate::wasm::op::MISC_PREFIX);
                     self.f.u32(code::MEMORY_FILL);
                     self.f.byte(0);
@@ -1783,6 +1857,10 @@ impl<'a> Emitter<'a> {
         let room = self.scratch_page;
         self.push(len);
         self.f.local_set(n);
+        // See `clamp_scratch_len`.
+        if gex_abi::mem64() {
+            return;
+        }
         for &b in bases {
             self.f.i64_const(GUEST_LIMIT as i64);
             self.f.local_get(b);
@@ -1876,7 +1954,7 @@ impl<'a> Emitter<'a> {
     /// [`Self::emit_misaligned_atomic`]. `addr` (i32) is on the stack; leaves
     /// the old value.
     fn emit_cmpxchg_any_alignment(&mut self, expected: Value, replacement: Value, ty: Ty, sz: MemSz, static_off: u32) {
-        let a = self.alloc(Ty::I32);
+        let a = self.alloc(Self::addr_ir_ty());
         self.f.local_set(a);
         let e = self.alloc(ty);
         let r = self.alloc(ty);
@@ -1896,7 +1974,7 @@ impl<'a> Emitter<'a> {
     /// at any alignment, as [`Self::emit_cmpxchg_any_alignment`]. `addr`
     /// (i32) is on the stack; leaves the old value.
     fn emit_rmw_any_alignment(&mut self, op: RmwOp, val: Value, ty: Ty, sz: MemSz, static_off: u32) {
-        let a = self.alloc(Ty::I32);
+        let a = self.alloc(Self::addr_ir_ty());
         self.f.local_set(a);
         let v = self.alloc(ty);
         self.push(val);
@@ -1927,10 +2005,9 @@ impl<'a> Emitter<'a> {
         misaligned: Misaligned,
     ) {
         self.f.local_get(a);
-        self.f.i32_const(static_off as i32);
-        self.f.byte(0x6a); // i32.add
-        self.f.i32_const(gex_abi::GUEST_FLOOR as i32);
-        self.f.byte(0x49); // i32.lt_u
+        self.f.addr_add_const(static_off);
+        self.f.addr_const(gex_abi::GUEST_FLOOR);
+        self.f.addr_lt_u();
         self.f.if_void();
         self.flush_conditional();
         self.store_pc(self.block_start);
@@ -1938,16 +2015,15 @@ impl<'a> Emitter<'a> {
         self.f.i64_const(self.block_start as i64);
         self.f.i32_const(gex_abi::cache_op::LOW_ACCESS);
         self.f.local_get(a);
-        self.f.i32_const(static_off as i32);
-        self.f.byte(0x6a); // i32.add
-        self.f.byte(code::I64_EXTEND_I32_U);
+        self.f.addr_add_const(static_off);
+        self.f.addr_to_i64();
         self.f.call(self.cx.cache_op);
         self.f.unreachable();
         self.f.end();
         let mask = (1i32 << natural_align(sz)) - 1;
         self.f.local_get(a);
-        self.f.i32_const(static_off as i32);
-        self.f.byte(0x6a); // i32.add
+        self.f.addr_add_const(static_off);
+        self.f.addr_low32();
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_result(val_type(ty));
@@ -1966,14 +2042,14 @@ impl<'a> Emitter<'a> {
     /// first one says so (`cache_op::SPLIT_LOCK`). Leaves the old value.
     fn emit_misaligned_atomic(&mut self, a: u32, ty: Ty, sz: MemSz, static_off: u32, kind: Misaligned) {
         let bytes = 1u32 << natural_align(sz);
-        let ea = self.alloc(Ty::I32);
+        let ea = self.alloc(Self::addr_ir_ty());
         let old = self.alloc(ty);
         self.f.local_get(a);
-        self.f.i32_const(static_off as i32);
-        self.f.byte(0x6a); // i32.add
+        self.f.addr_add_const(static_off);
         self.f.local_set(ea);
         // (ea & 7) + bytes <= 8: within one word.
         self.f.local_get(ea);
+        self.f.addr_low32();
         self.f.i32_const(7);
         self.f.byte(0x71); // i32.and
         self.f.i32_const(bytes as i32);
@@ -1982,16 +2058,16 @@ impl<'a> Emitter<'a> {
         self.f.byte(0x4d); // i32.le_u
         self.f.if_void();
         {
-            let wa = self.alloc(Ty::I32);
+            let wa = self.alloc(Self::addr_ir_ty());
             let sh = self.alloc(Ty::I64);
             let w = self.alloc(Ty::I64);
             let f = self.alloc(Ty::I64);
             let field: i64 = if bytes >= 8 { -1 } else { ((1u64 << (bytes * 8)) - 1) as i64 };
             self.f.local_get(ea);
-            self.f.i32_const(!7);
-            self.f.byte(0x71); // i32.and
+            self.f.addr_and_const(!7);
             self.f.local_set(wa);
             self.f.local_get(ea);
+            self.f.addr_low32();
             self.f.i32_const(7);
             self.f.byte(0x71); // i32.and
             self.f.i32_const(3);
@@ -2085,23 +2161,23 @@ impl<'a> Emitter<'a> {
         self.f.else_();
         {
             // The first one, out loud.
-            self.f.i32_const(gex_abi::SPLIT_LOCK as i32 + 4);
+            self.f.addr_const(gex_abi::SPLIT_LOCK + 4);
             self.f.load(0x28, 2, 0); // i32.load
             self.f.byte(0x45); // i32.eqz
             self.f.if_void();
-            self.f.i32_const(gex_abi::SPLIT_LOCK as i32 + 4);
+            self.f.addr_const(gex_abi::SPLIT_LOCK + 4);
             self.f.i32_const(1);
             self.f.store(0x36, 2, 0); // i32.store
             self.f.local_get(self.ctx_local);
             self.f.i64_const(self.block_start as i64);
             self.f.i32_const(gex_abi::cache_op::SPLIT_LOCK);
             self.f.local_get(ea);
-            self.f.byte(code::I64_EXTEND_I32_U);
+            self.f.addr_to_i64();
             self.f.call(self.cx.cache_op);
             self.f.end();
             // Take the lock.
             self.f.loop_void();
-            self.f.i32_const(gex_abi::SPLIT_LOCK as i32);
+            self.f.addr_const(gex_abi::SPLIT_LOCK);
             self.f.i32_const(0);
             self.f.i32_const(1);
             self.f.atomic(atomic_cmpxchg_op(Ty::I32, MemSz::B4), 2, 0);
@@ -2142,7 +2218,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             // Let it go.
-            self.f.i32_const(gex_abi::SPLIT_LOCK as i32);
+            self.f.addr_const(gex_abi::SPLIT_LOCK);
             self.f.i32_const(0);
             self.f.atomic(atomic_store_op(Ty::I32, MemSz::B4), 2, 0);
         }
@@ -2165,12 +2241,12 @@ impl<'a> Emitter<'a> {
             return;
         }
         let mask = (1i32 << alogp) - 1;
-        let a = self.alloc(Ty::I32);
+        let a = self.alloc(Self::addr_ir_ty());
         self.f.local_set(a);
         // (addr + static_off) & mask  -- nonzero iff unaligned.
         self.f.local_get(a);
-        self.f.i32_const(static_off as i32);
-        self.f.byte(0x6a); // i32.add
+        self.f.addr_add_const(static_off);
+        self.f.addr_low32();
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_result(val_type(ty));
@@ -2199,12 +2275,12 @@ impl<'a> Emitter<'a> {
             self.f.atomic(atomic_store_op(ty, sz), 0, static_off);
             return;
         }
-        let a = self.alloc(Ty::I32);
+        let a = self.alloc(Self::addr_ir_ty());
         self.f.local_set(a);
         let mask = (1i32 << alogp) - 1;
         self.f.local_get(a);
-        self.f.i32_const(static_off as i32);
-        self.f.byte(0x6a); // i32.add
+        self.f.addr_add_const(static_off);
+        self.f.addr_low32();
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_void();
@@ -3199,7 +3275,7 @@ impl<'a> Emitter<'a> {
         self.f.local_get(cw);
         self.f.call(self.cx.x87);
         self.f.local_set(res);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32); // i32.load
         self.f.local_set(sw);
     }
@@ -3228,10 +3304,10 @@ impl<'a> Emitter<'a> {
         }
         self.f.call(self.cx.x87);
         self.f.local_set(res);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x28, 2, (ctx::X87_TMP + 8) as u32); // i32.load
         self.f.local_set(se);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32);
         self.f.local_set(sw);
         let locals: Vec<(u32, Ty)> = match op {
@@ -3711,10 +3787,10 @@ impl<'a> Emitter<'a> {
         }
         self.f.call(self.cx.x87);
         self.f.local_set(res);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x28, 2, (ctx::X87_TMP + 8) as u32);
         self.f.local_set(se);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32);
         self.f.local_set(sw);
         self.f.end(); // $out
@@ -3851,7 +3927,7 @@ impl<'a> Emitter<'a> {
         self.f.call(self.cx.x87);
         self.f.byte(I32_WRAP_I64);
         self.f.local_set(cc);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x28, 2, (ctx::X87_TMP + 12) as u32);
         self.f.local_set(sw);
         self.f.end();
@@ -4312,7 +4388,7 @@ impl<'a> Emitter<'a> {
                 self.prof_indirect(block);
                 // The context PC must be exact before a possible dispatch
                 // miss, since that is the only place the target is recorded.
-                self.f.local_get(self.ctx_local);
+                self.ctx_base();
                 self.f.local_get(self.scratch_i64);
                 self.f.store(0x37, 3, ctx::PC as u32);
                 self.flush();
@@ -4379,8 +4455,8 @@ impl<'a> Emitter<'a> {
     /// indirect terminator has just stored) rather than a constant.
     fn emit_safepoint_no_flush_dynamic(&mut self) {
         let before = self.f.code.len();
-        self.f.local_get(self.ctx_local);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
+        self.ctx_base();
         self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
         self.f.i32_const(1);
         self.f.byte(0x6b); // i32.sub
@@ -4398,8 +4474,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_safepoint_no_flush_inner(&mut self, pc: u64) {
-        self.f.local_get(self.ctx_local);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
+        self.ctx_base();
         self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
         self.f.i32_const(1);
         self.f.byte(0x6b); // i32.sub
@@ -4430,8 +4506,8 @@ impl<'a> Emitter<'a> {
     fn emit_safepoint_inner(&mut self, pc: u64) {
         // Count down, and only call out when the counter runs out, so the
         // common case is a load, a subtract, a store and a not-taken branch.
-        self.f.local_get(self.ctx_local);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
+        self.ctx_base();
         self.f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
         self.f.i32_const(1);
         self.f.byte(0x6b); // i32.sub
@@ -4508,7 +4584,7 @@ impl<'a> Emitter<'a> {
                 // The callee checks `LAST_TARGET` against its own address
                 // (x86-64), so a direct jump has to record it as a dispatch would.
                 if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
-                    self.f.local_get(self.ctx_local);
+                    self.ctx_base();
                     self.f.i64_const(target as i64);
                     self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
                 }
@@ -4527,7 +4603,7 @@ impl<'a> Emitter<'a> {
         // The exact target, for a slot shared by several blocks (x86-64): the
         // trampoline there reads `LAST_TARGET` to pick one.
         if gex_abi::X86 {
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(self.scratch_i64);
             self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
         }
@@ -4566,6 +4642,7 @@ impl<'a> Emitter<'a> {
         self.f.byte(0xa7); // i32.wrap_i64
         self.f.i32_const(4);
         self.f.byte(0x6c); // i32.mul
+        self.f.addr_i32();
         self.f.load(0x28, 2, DISPATCH_DIR as u32);
         self.f.i32_const(0);
         self.f.local_get(self.scratch_page);
@@ -4615,7 +4692,7 @@ impl<'a> Emitter<'a> {
     /// host to translate the real target (the slot then gets a trampoline
     /// covering both) and dispatches again.
     fn emit_target_check(&mut self, start: u64) {
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
         self.f.i64_const(start as i64);
         self.f.byte(0x52); // i64.ne
@@ -4626,15 +4703,15 @@ impl<'a> Emitter<'a> {
         self.f.local_get(self.ctx_local);
         self.f.i64_const(start as i64);
         self.f.i32_const(gex_abi::cache_op::SLOT_CONFLICT);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
         self.f.call(self.cx.cache_op);
         self.f.local_get(self.ctx_local);
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
         self.f.call(self.cx.dispatch_miss);
         self.f.byte(0x1a); // drop the slot it answered with
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.load(0x29, 3, ctx::LAST_TARGET as u32);
         self.f.local_set(self.scratch_i64);
         self.emit_dispatch_tail_call();
@@ -4683,7 +4760,7 @@ impl<'a> Emitter<'a> {
         self.f.i64_const(start as i64);
         self.f.local_set(self.scratch_i64);
         if gex_abi::X86 {
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(self.scratch_i64);
             self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
         }
@@ -4704,7 +4781,7 @@ impl<'a> Emitter<'a> {
             return;
         }
         for (k, (page, base)) in pages.iter().enumerate() {
-            self.f.i32_const((gex_abi::DISPATCH_DIR + page * 4) as u32 as i32);
+            self.f.addr_const(gex_abi::DISPATCH_DIR + page * 4);
             self.f.load(0x28, 2, 0); // i32.load
             self.f.i32_const(*base as i32);
             self.f.byte(0x47); // i32.ne
@@ -4732,7 +4809,7 @@ impl<'a> Emitter<'a> {
         self.f.i64_const(start as i64);
         self.f.local_set(self.scratch_i64);
         if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(self.scratch_i64);
             self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
         }
@@ -4773,13 +4850,14 @@ impl<'a> Emitter<'a> {
             return;
         }
         for i in 0..n {
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.local_get(self.scratch_i64);
             self.f.i64_const(DISPATCH_PAGE.trailing_zeros() as i64);
             self.f.byte(0x88); // i64.shr_u
             self.f.byte(0xa7); // i32.wrap_i64
             self.f.i32_const(4);
             self.f.byte(0x6c); // i32.mul
+            self.f.addr_i32();
             self.f.load(0x28, 2, DISPATCH_DIR as u32 + 4 * (i as u32 + 1));
             self.f.store(0x36, 2, ctx::BALLAST as u32);
         }
@@ -4799,13 +4877,13 @@ impl<'a> Emitter<'a> {
         // Where this branch is going, before it goes. See `ctx::LAST_TARGET`:
         // the tail call below replaces this frame, so afterwards there is no
         // way left to ask.
-        self.f.local_get(self.ctx_local);
+        self.ctx_base();
         self.f.local_get(self.scratch_i64);
         self.f.store(0x37, 3, ctx::LAST_TARGET as u32);
         // And where it was made: the block start, a constant per block
         // (x86-64, whose wild-branch reports name it).
         if gex_abi::X86 {
-            self.f.local_get(self.ctx_local);
+            self.ctx_base();
             self.f.i64_const(self.block_start as i64);
             self.f.store(0x37, 3, ctx::LAST_SOURCE as u32);
         }

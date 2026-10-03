@@ -162,7 +162,13 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
             }
         }
     };
-    let table = Table::new(cx.as_context_mut(), wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None), wasmtime::Ref::Func(None))?;
+    // A table64 beside a 64-bit guest memory, as wasm64 units import it.
+    let ftab_type = if gex_abi::mem64() {
+        wasmtime::TableType::new64(wasmtime::RefType::FUNCREF, 0, None)
+    } else {
+        wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None)
+    };
+    let table = Table::new(cx.as_context_mut(), ftab_type, wasmtime::Ref::Func(None))?;
     let mut l = linker;
     l.allow_shadowing(true);
     l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;
@@ -241,8 +247,14 @@ fn instantiate(mut cx: impl AsContextMut<Data = HostState>, table: Table, base: 
     };
     let mut l = linker;
     l.allow_shadowing(true);
+    // The PIC globals are pointer-sized: i64 for a wasm64 module beside a
+    // 64-bit guest memory (docs/mem64.md).
     let i32c = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, v: i32, m: wasmtime::Mutability| {
-        wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v))
+        if gex_abi::mem64() {
+            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, m), Val::I64(v as u32 as i64))
+        } else {
+            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v))
+        }
     };
     let mut c = cx.as_context_mut();
     l.define(&mut c, gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;

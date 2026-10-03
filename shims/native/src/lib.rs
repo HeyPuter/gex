@@ -503,6 +503,23 @@ pub(crate) fn ppm_every() -> u32 {
     *EVERY.get_or_init(|| std::env::var("GEX_PPM_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1))
 }
 
+/// The guest memory's type: 4 GiB of wasm32, or for a 64-bit guest memory
+/// (docs/mem64.md) all of `LIMIT64` at once, which natively is only a
+/// reservation, so the high arena never needs the memory to grow.
+pub fn guest_memory_type() -> wasmtime::MemoryType {
+    if gex_abi::mem64() {
+        wasmtime::MemoryTypeBuilder::new()
+            .memory64(true)
+            .shared(true)
+            .min(gex_abi::LIMIT64_PAGES)
+            .max(Some(gex_abi::LIMIT64_PAGES))
+            .build()
+            .expect("a memory64 type")
+    } else {
+        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32)
+    }
+}
+
 pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
@@ -510,6 +527,10 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
+    // A 64-bit guest memory (docs/mem64.md).
+    if gex_abi::mem64() {
+        config.wasm_memory64(true);
+    }
     let engine = Engine::new(&config).context("creating the wasm engine")?;
     Module::validate(&engine, wasm)
 }
@@ -527,9 +548,6 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
-    if opts.mem.is_64() {
-        bail!("a 64-bit guest memory (--mem64, docs/mem64.md) is not built yet");
-    }
     run_program_with(program, opts, xlate, None, None)
 }
 
@@ -605,6 +623,13 @@ fn run_program_with(
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
+    // A 64-bit guest memory (docs/mem64.md): a shared memory is a static
+    // allocation, so the reservation has to hold all of it. Only then: a
+    // wasm32 process keeps the engine it always had.
+    if gex_abi::mem64() {
+        config.wasm_memory64(true);
+        config.static_memory_maximum_size(gex_abi::LIMIT64);
+    }
     // gex's output is already optimised; Cranelift only adds register
     // allocation and peepholes, whose time dominates on a large program (half
     // a minute to compile SQLite vs under two seconds to translate).
@@ -881,7 +906,7 @@ fn run_program_with(
     // each of them a private copy of the address space.
     let shared = wasmtime::SharedMemory::new(
         &engine,
-        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32),
+        guest_memory_type(),
     )
     .context("creating the guest's shared memory")?;
     linker.define(&mut store, IMPORT_MODULE, exports::MEMORY, shared.clone())?;
@@ -1545,7 +1570,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
 
     let shared = wasmtime::SharedMemory::new(
         &cx.engine,
-        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32),
+        guest_memory_type(),
     )
     .context("creating the child's memory")?;
     let child_mem = gex_mem::GuestMemory::new(shared);

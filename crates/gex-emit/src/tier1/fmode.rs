@@ -471,7 +471,9 @@ impl<'a> FnBody<'a> {
         let sc = self.e.scratch_i32;
         let f = &mut self.e.f;
         f.local_get(ctx);
+        f.addr_i32();
         f.local_get(ctx);
+        f.addr_i32();
         f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
         f.i32_const(1);
         f.byte(0x6b); // i32.sub
@@ -512,8 +514,10 @@ impl Emitter<'_> {
             if r == GuestReg::CtxAddr {
                 self.f.byte(code::I64_EXTEND_I32_U);
             } else if Self::is_flag(r) {
+                self.f.addr_i32();
                 self.f.load(0x2d, 0, Self::reg_offset(r)); // i32.load8_u
             } else {
+                self.f.addr_i32();
                 match r.ty() {
                     Ty::I32 => self.f.load(0x28, 2, Self::reg_offset(r)),
                     Ty::I64 => self.f.load(0x29, 3, Self::reg_offset(r)),

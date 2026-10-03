@@ -160,7 +160,9 @@ impl MemoryMap {
             arena: Vec::new(),
             take: None,
             back: None,
-            high: None,
+            // Every process of a host with a 64-bit guest memory has the
+            // high arena (docs/mem64.md §3).
+            high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
         }
     }
 
@@ -531,6 +533,15 @@ impl MemoryMap {
         self.mmap_from(addr, len, prot, flags, name, None)
     }
 
+    /// [`Self::mmap`] below the high arena whatever the protection: a
+    /// mapping that will hold code (the dynamic loader's object reservation).
+    pub fn mmap_low(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str) -> SysResult {
+        let high = self.high.take();
+        let r = self.mmap(addr, len, prot, flags, name);
+        self.high = high;
+        r
+    }
+
     /// As [`Self::mmap`], recording the file and offset the bytes came from.
     pub fn mmap_from(
         &mut self,
@@ -554,6 +565,12 @@ impl MemoryMap {
             let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
             if end > self.limit() {
                 return Err(Errno::ENOMEM);
+            }
+            // Code above 4 GiB is beyond the dispatch directory (docs/mem64.md
+            // §3), as for mprotect.
+            if prot & prot::EXEC != 0 && self.high.is_some() && end > gex_abi::HIGH_ARENA_BASE {
+                eprintln!("gex: an executable mapping at {addr:#x}..{end:#x}, above 4 GiB in a 64-bit memory: not supported yet (docs/mem64.md)");
+                return Err(Errno::EACCES);
             }
             // `MAP_FIXED_NOREPLACE` (which wins over `MAP_FIXED`, as on
             // Linux) fails over any existing mapping, a PROT_NONE
@@ -590,9 +607,11 @@ impl MemoryMap {
             }
         }
 
-        // Data in an M64 process goes to the high arena; code stays below
-        // MMAP_TOP, where the dispatch directory reaches.
-        if prot & prot::EXEC == 0 {
+        // Anonymous data in an M64 process goes to the high arena; code
+        // stays below MMAP_TOP, where the dispatch directory reaches. A file
+        // mapping stays low whatever its protection: ld.so reserves a whole
+        // library read-only and then maps its text executable inside it.
+        if prot & prot::EXEC == 0 && origin.is_none() {
             if let Some(start) = self.find_high(len) {
                 if let Some(back) = self.back {
                     back(start + len).ok_or(Errno::ENOMEM)?;

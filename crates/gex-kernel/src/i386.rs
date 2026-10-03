@@ -124,6 +124,12 @@ pub mod raw {
     pub const GETSID: u64 = 147;
     pub const FDATASYNC: u64 = 148;
     pub const SCHED_YIELD: u64 = 158;
+    pub const SCHED_SETPARAM: u64 = 154;
+    pub const SCHED_GETPARAM: u64 = 155;
+    pub const SCHED_SETSCHEDULER: u64 = 156;
+    pub const SCHED_GETSCHEDULER: u64 = 157;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 159;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 160;
     pub const NANOSLEEP: u64 = 162;
     pub const MREMAP: u64 = 163;
     pub const POLL: u64 = 168;
@@ -793,6 +799,12 @@ pub fn translate(
         x::EVENTFD2 => nr::EVENTFD2,
         x::MEMFD_CREATE => nr::MEMFD_CREATE,
         x::SCHED_YIELD => nr::SCHED_YIELD,
+        x::SCHED_SETPARAM => nr::SCHED_SETPARAM,
+        x::SCHED_GETPARAM => nr::SCHED_GETPARAM,
+        x::SCHED_SETSCHEDULER => nr::SCHED_SETSCHEDULER,
+        x::SCHED_GETSCHEDULER => nr::SCHED_GETSCHEDULER,
+        x::SCHED_GET_PRIORITY_MAX => nr::SCHED_GET_PRIORITY_MAX,
+        x::SCHED_GET_PRIORITY_MIN => nr::SCHED_GET_PRIORITY_MIN,
         x::SCHED_GETAFFINITY => nr::SCHED_GETAFFINITY,
         x::GETCPU => nr::GETCPU,
         x::GETPRIORITY => nr::GETPRIORITY,

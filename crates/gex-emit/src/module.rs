@@ -707,13 +707,11 @@ impl ModuleBuilder {
         // The memory is the host's and shared, so every guest thread acts on
         // the same bytes; a defined memory would be per-instance. The table is
         // sized in `finish`, once the pages the module touches are known.
-        m.import_memory(
-            IMPORT_MODULE,
-            exports::MEMORY,
-            GUEST_MEM_INITIAL_PAGES,
-            GUEST_MEM_PAGES,
-            shared_memory,
-        );
+        if shared_memory {
+            m.import_guest_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_INITIAL_PAGES, GUEST_MEM_PAGES);
+        } else {
+            m.import_memory(IMPORT_MODULE, exports::MEMORY, GUEST_MEM_INITIAL_PAGES, GUEST_MEM_PAGES, false);
+        }
         // Profiling: a second memory, the host's, per store (memory index 1,
         // since the guest's memory is the first memory import).
         let profiling = crate::profile::enabled();
@@ -1207,6 +1205,7 @@ impl ModuleBuilder {
         let mut f = FuncBody::new(1);
         let t = f.add_local(ValType::I64);
         f.local_get(0);
+        f.addr_i32();
         f.load(0x29, 3, ctx::LAST_TARGET as u32);
         f.local_set(t);
         for (addr, func) in members {
@@ -1232,6 +1231,7 @@ impl ModuleBuilder {
         let r = f.add_local(ValType::I32);
         f.local_get(0); // ctx, for dispatch_miss
         f.local_get(0); // as a memory address, to read the PC out
+        f.addr_i32();
         f.load(0x29, 3, ctx::PC as u32); // i64.load ctx.pc
         f.call(self.imports.dispatch_miss);
         f.local_tee(r);
@@ -1241,6 +1241,7 @@ impl ModuleBuilder {
         // Translated and installed: dispatch to it again, in place.
         f.local_get(0);
         f.local_get(0);
+        f.addr_i32();
         f.load(0x29, 3, ctx::PC as u32);
         f.return_call_local(self.enter);
         f.end();
@@ -1260,9 +1261,11 @@ impl ModuleBuilder {
         // for the function table's bridge (merge-plan §9.8.1), which serves
         // the address dispatch was asked for (`LAST_TARGET`) on any guest.
         f.local_get(0);
+        f.addr_i32();
         f.local_get(1);
         f.store(0x37, 3, ctx::PC as u32);
         f.local_get(0);
+        f.addr_i32();
         f.local_get(1);
         f.store(0x37, 3, ctx::LAST_TARGET as u32);
 
@@ -1280,6 +1283,7 @@ impl ModuleBuilder {
         f.byte(0xa7); // i32.wrap_i64
         f.i32_const(4);
         f.byte(0x6c); // i32.mul
+        f.addr_i32();
         f.load(0x28, 2, DISPATCH_DIR as u32);
         f.i32_const(0);
         f.local_get(page);

@@ -91,8 +91,14 @@ pub mod nr {
     pub const MOUNT: u64 = 40;
     pub const GETITIMER: u64 = 102;
     pub const SETITIMER: u64 = 103;
+    pub const SCHED_SETPARAM: u64 = 118;
+    pub const SCHED_SETSCHEDULER: u64 = 119;
+    pub const SCHED_GETSCHEDULER: u64 = 120;
+    pub const SCHED_GETPARAM: u64 = 121;
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 125;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 126;
     pub const SETPRIORITY: u64 = 140;
     pub const GETPRIORITY: u64 = 141;
     pub const GETCPU: u64 = 168;
@@ -574,6 +580,9 @@ pub struct Kernel {
     /// this one has to ask, and can only ask once the reservation says how
     /// long the object is.
     pub armed_place: Option<String>,
+    /// The pc of the syscall being handled (docs/mem64.md: a mapping the
+    /// dynamic loader asks for stays below 4 GiB, since it will hold code).
+    pub syscall_pc: u64,
     /// Where each pinned object actually landed, for checking afterwards.
     ///
     /// A pin that silently does not take is the worst outcome available: the
@@ -1094,6 +1103,7 @@ impl Kernel {
             pins: std::collections::HashMap::new(),
             place: None,
             armed_place: None,
+            syscall_pc: 0,
             armed_pin: None,
             compat: false,
             sigreturn_legacy: false,
@@ -1318,6 +1328,7 @@ impl Kernel {
             // same library must be given the same address its parent was.
             place: self.place.clone(),
             armed_place: None,
+            syscall_pc: 0,
             armed_pin: None,
             compat: self.compat,
             sigreturn_legacy: false,
@@ -1438,6 +1449,7 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        self.syscall_pc = pc;
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
@@ -2384,6 +2396,20 @@ impl Kernel {
                 std::thread::yield_now();
                 Ok(0)
             }
+            // Scheduling policy: every guest thread runs SCHED_OTHER at
+            // priority 0, which is what these report. Setting a normal policy
+            // is accepted; a real-time one is refused as for an unprivileged
+            // process. Mono treats a failed priority query as fatal.
+            nr::SCHED_GETSCHEDULER => Ok(0),
+            nr::SCHED_GETPARAM => self.sys_sched_getparam(m, a[1]),
+            nr::SCHED_SETPARAM => Ok(0),
+            nr::SCHED_SETSCHEDULER => match a[1] & 0xff {
+                1 | 2 => Err(Errno::EPERM),
+                0 | 3 | 5 => Ok(0),
+                _ => Err(Errno::EINVAL),
+            },
+            nr::SCHED_GET_PRIORITY_MAX => Ok(if matches!(a[0], 1 | 2) { 99 } else { 0 }),
+            nr::SCHED_GET_PRIORITY_MIN => Ok(if matches!(a[0], 1 | 2) { 1 } else { 0 }),
             // Scheduling niceness: we run every guest thread at the default
             // priority, so report nice 0 and accept any set as a no-op. The
             // raw getpriority ABI returns `20 - nice` (kept non-negative so a
@@ -4480,6 +4506,12 @@ impl Kernel {
         Ok(8)
     }
 
+    /// `sched_getparam(pid, *param)`: priority 0, the only one there is.
+    fn sys_sched_getparam(&mut self, m: &mut GuestMem<'_>, param: u64) -> SysResult {
+        m.write_u32(param, 0)?;
+        Ok(0)
+    }
+
     /// `statfs`. One filesystem, large and mostly empty, which is what a
     /// program checking for room before it writes wants to hear.
     fn sys_statfs(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
@@ -4709,7 +4741,16 @@ impl Kernel {
                 }
             }
         }
-        let start = self.mem.mmap(addr, len, prot_bits, flags, "")?;
+        // The dynamic loader's reservation for an object (glibc maps an
+        // over-aligned library into anonymous PROT_NONE memory) will hold
+        // code, so in a 64-bit memory it stays below 4 GiB with the code; the
+        // loader runs at INTERP_BASE (docs/mem64.md §3).
+        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
+        let start = if from_loader {
+            self.mem.mmap_low(addr, len, prot_bits, flags, "")?
+        } else {
+            self.mem.mmap(addr, len, prot_bits, flags, "")?
+        };
         if let Some((path, base)) = pinned {
             self.pin_landed.push((path, base, start));
         }
@@ -6240,6 +6281,12 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::GETITIMER => "getitimer",
         nr::SCHED_GETAFFINITY => "sched_getaffinity",
         nr::SCHED_YIELD => "sched_yield",
+        nr::SCHED_SETPARAM => "sched_setparam",
+        nr::SCHED_SETSCHEDULER => "sched_setscheduler",
+        nr::SCHED_GETSCHEDULER => "sched_getscheduler",
+        nr::SCHED_GETPARAM => "sched_getparam",
+        nr::SCHED_GET_PRIORITY_MAX => "sched_get_priority_max",
+        nr::SCHED_GET_PRIORITY_MIN => "sched_get_priority_min",
         nr::SETPRIORITY => "setpriority",
         nr::GETPRIORITY => "getpriority",
         nr::GETCPU => "getcpu",

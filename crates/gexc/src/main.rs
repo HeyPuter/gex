@@ -541,6 +541,8 @@ fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
         eprintln!("gex: {} runs with a 64-bit memory (an earlier run needed more than 4 GiB)", ra.path);
     }
     ra.opts.mem = if m64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 };
+    // Everything translated in this process targets it.
+    gex_abi::set_mem_flavor(ra.opts.mem);
     Ok(())
 }
 
@@ -764,6 +766,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             }
             "--no-shared-memory" => shared_memory = false,
             // Only for looking at a module that is known not to validate.
+            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             "--no-validate" => no_validate = true,
             // Translate the whole program: the executable and every DT_NEEDED
             // object, each at its pinned base. Without this a build translates
