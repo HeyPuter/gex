@@ -28,6 +28,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("msvcr120_concrt", include_str!("../providers/msvcr120_concrt.c")),
     ("crt_mem", include_str!("../providers/crt_mem.c")),
     ("crt_math", include_str!("../providers/crt_math.c")),
+    ("debug_string", include_str!("../providers/debug_string.c")),
 ];
 
 /// One provider source, parsed.

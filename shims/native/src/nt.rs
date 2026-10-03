@@ -71,7 +71,7 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
     let program = Program { exe, interp: None };
     let mut opts = opts.clone();
     opts.jit = true;
-    super::nt_cgen::enable()?;
+    super::nt_cgen::enable(opts.record.is_some())?;
     let mut setup = setup.clone();
     if setup.display_out.is_none() {
         setup.display_out = opts.wayland_out.clone();
@@ -165,6 +165,9 @@ impl nt::display::NtDisplay for NullDisplay {
     fn remove(&self, _id: u32) {}
     fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {
         Vec::new()
+    }
+    fn shows_frames(&self) -> bool {
+        false
     }
 }
 
@@ -407,6 +410,10 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
+    // Where the syscall returns to, and the stack it was made on: what a
+    // nested exception dispatch needs to come back here.
+    let next_pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    let raise_sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize);
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
         nt::syscall(&p, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
@@ -431,6 +438,15 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     match outcome {
         nt::Outcome::Continue => Ok(()),
         nt::Outcome::Resume(target) => {
+            // NtContinue out of a nested dispatch (EXCEPTION_CONTINUE_EXECUTION,
+            // a handler resuming its frame): back to where it was raised.
+            if exc_escape(caller, target) {
+                return Err(StopExecution.into());
+            }
+            if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(memory.bytes(), next_pc) {
+                return raise_nested(caller, &p, target, raise_sp, next_pc);
+            }
+            let state = caller.data_mut();
             if crate::ftab::stats_on() {
                 state.resume_cause = Some(nt::syscall_name(nr));
             }
@@ -468,6 +484,162 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         // nested loop (`CallerHost::run_callback`).
         nt::Outcome::CallbackReturn => Err(StopExecution.into()),
     }
+}
+
+/// Exceptions dispatched nested and escaped back (GEX_NT_STATS).
+pub(crate) static EXC_NESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static EXC_ESCAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How deep exceptions nest before raising traps out as before.
+const EXC_MAX_DEPTH: usize = 8;
+
+/// Whether an exception raised by the syscall returning to `next_pc` is
+/// dispatched nested (`raise_nested`) rather than by unwinding every wasm
+/// frame of the thread. Only with function bodies about (tier-1 alone has no
+/// frames to keep), and only when the syscall returns through a `ret`, which
+/// is how the dispatch gets back (`GEX_NT_EXC_NEST=0` turns it off).
+fn nest_exceptions(mem: &[u8], next_pc: u64) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) {
+        return false;
+    }
+    if super::nt_cgen::mode() == super::nt_cgen::Mode::Off {
+        return false;
+    }
+    matches!(mem.get(next_pc as usize), Some(0xc3) | Some(0xc2))
+}
+
+/// Has control left the innermost nested exception dispatch on this thread
+/// for `target`? It has when the stack is above the `NtRaiseException`
+/// that started it: a handler's longjmp, a `catch` continuation or an
+/// NtContinue went back to the frames the exception was raised under.
+/// Then the state is the context's with PC = `target`, and the caller
+/// unwinds to `raise_nested`'s loop (`CalloutSignal::Escape`). Called where
+/// the context is complete: the fallback, a dispatch miss, a safepoint, a
+/// syscall's resume.
+pub(crate) fn exc_escape(caller: &mut Caller<'_, HostState>, target: u64) -> bool {
+    let Some(&raise_sp) = caller.data().exc_levels.last() else { return false };
+    let Some(memory) = caller.data().memory.clone() else { return false };
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let mut gm = GuestMem::new(memory.bytes());
+    let sp = gm.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0);
+    let sp = if caller.data().nt.as_ref().is_some_and(|p| p.abi == nt::Abi::P32) { sp & 0xffff_ffff } else { sp };
+    if sp <= raise_sp {
+        return false;
+    }
+    let _ = gm.write_u64(ctx_addr + ctx::PC as u64, target);
+    let level = caller.data().exc_levels.len() - 1;
+    caller.data_mut().callout_signal = Some(CalloutSignal::Escape(level));
+    true
+}
+
+/// Dispatch an exception without unwinding the thread's wasm frames
+/// (`NtRaiseException`, first chance): run `KiUserExceptionDispatcher`
+/// (`target`) in a nested loop on top of them, as a user-mode callback
+/// runs, until control goes back above the raise (`exc_escape`). Then the
+/// syscall returns, its `ret` taking the guest to where the dispatch
+/// ended: the frames below see an ordinary leave, and the one that owns the
+/// address (a `setjmp`'s caller, the function a `catch` resumes in, the
+/// raiser itself after EXCEPTION_CONTINUE_EXECUTION) carries on in its own
+/// code (`gex_resume`). A trap-out instead drops every frame, and the
+/// thread's outer functions (a game's main loop) run on the fallback from
+/// then on.
+fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target: u64, raise_sp: u64, next_pc: u64) -> Result<()> {
+    let enter = super::any_enter(caller).ok_or_else(|| anyhow!("no module in this store exports `enter`"))?;
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let p32 = p.abi == nt::Abi::P32;
+    let mask = if p32 { 0xffff_ffff } else { !0u64 };
+    if caller.data().exc_levels.len() >= EXC_MAX_DEPTH {
+        let state = caller.data_mut();
+        if crate::ftab::stats_on() {
+            state.resume_cause = Some("NtRaiseException (nested too deep)".into());
+        }
+        state.resume_at = Some(target);
+        return Err(StopExecution.into());
+    }
+    EXC_NESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    caller.data_mut().exc_levels.push(raise_sp & mask);
+    let me = caller.data().exc_levels.len() - 1;
+    let mut pc = target;
+    let mut next: Option<wasmtime::Func> = None;
+    let result = loop {
+        let r = match next.take() {
+            Some(f) => f.call(&mut *caller, &[Val::I32(ctx_addr as i32)], &mut []),
+            None => enter.call(&mut *caller, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut []),
+        };
+        if let Some(child) = caller.data_mut().pending_spawn.take() {
+            let cx = caller.data().spawn.clone().ok_or_else(|| anyhow!("thread creation with no spawn context"))?;
+            start_guest_thread(cx, child)?;
+        }
+        let e = match r {
+            Ok(()) => break Err(anyhow!("guest code returned out of exception dispatch")),
+            Err(e) => e,
+        };
+        if let Some(sig) = caller.data_mut().callout_signal.take() {
+            match sig {
+                CalloutSignal::Escape(i) if i == me => break Ok(()),
+                CalloutSignal::Bypass(f) => {
+                    next = Some(f);
+                    continue;
+                }
+                // An outer dispatch's escape, or a return a call-out further
+                // out waits for: theirs, with these frames.
+                other => {
+                    caller.data_mut().callout_signal = Some(other);
+                    break Err(e);
+                }
+            }
+        }
+        if caller.data().exit.is_some() {
+            break Err(e);
+        }
+        if let Some(at) = caller.data_mut().resume_at.take() {
+            crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_resume(caller.data_mut(), at, "exception dispatch");
+            pc = at;
+            continue;
+        }
+        if is_stale_table_trap(&e) {
+            catch_up_in_caller(caller)?;
+            pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+            continue;
+        }
+        // Anything else (an NtCallbackReturn ending a callback further out,
+        // a failure) is for the loops below.
+        break Err(e);
+    };
+    caller.data_mut().exc_levels.truncate(me);
+    result?;
+    EXC_ESCAPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The guest goes on at the context's PC and SP. The syscall's `ret`
+    // (or `ret n`) takes it there: the return address it pops is that PC,
+    // just below the new stack (dead stack on x86: nothing lives below SP).
+    let mut gm = GuestMem::new(memory.bytes());
+    let to_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+    let to_sp = gm.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & mask;
+    let pops = match memory.bytes().get(next_pc as usize) {
+        Some(0xc2) => gm.read_u32(next_pc + 1).unwrap_or(0) as u64 & 0xffff,
+        _ => 0,
+    };
+    let psize = if p32 { 4 } else { 8 };
+    let sp = to_sp.wrapping_sub(psize + pops) & mask;
+    if p.cfg.trace {
+        gex_kernel::nt_log!(
+            "[nt:{:x}] exception dispatched nested, back at {} sp {to_sp:#x} (raised at sp {raise_sp:#x})",
+            p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid),
+            p.describe_addr(to_pc),
+        );
+    }
+    let wrote = if p32 { gm.write_u32(sp, to_pc as u32) } else { gm.write_u64(sp, to_pc) };
+    if wrote.is_err() {
+        // No stack there: resume the old way.
+        caller.data_mut().resume_at = Some(to_pc);
+        return Err(StopExecution.into());
+    }
+    let _ = gm.write_u64(ctx_addr + ctx::x(4) as u64, sp);
+    let _ = gm.write_u64(ctx_addr + ctx::PC as u64, next_pc);
+    Ok(())
 }
 
 pub(crate) use gex_kernel::nt::Fault;

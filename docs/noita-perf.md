@@ -438,6 +438,42 @@ bridge; with no predicted return, each one is counted.
 4. Then sched_yield (7.1% in F's run: Noita's own yield loops) and the
    heap.
 
+### Stream F at the machine restart (2026-10-03)
+
+merge/fjit @ 9eacbbd5 (abi9 65f9a719 and the AOT-share line merged).
+
+Since the step-4 report:
+- c9100b46: local resume is final. Exact-mode lockstep 30/30 on gi386 and
+  gx64; tests/nt/cgen-prefix.sh 50/50.
+- cg8 units (local resume, before the IAT fix), 4x, null display, cores 4
+  and 10: world fps 27.2-28.6 steady (cg7: 25), world-up 443 s, resumes
+  10,843 (all during loading), tier-1 module cache 0/10,821 hits (the
+  key includes the build fingerprint, so every new binary starts cold;
+  tier-1 compiling cost 327 s of CPU).
+- AOT share on cg7 (tools/aot-coverage.py): 73.3% of guest CPU. noita.exe
+  60.5% units, 21.3% tier-1 interior, 1.5% missed; msvcr120 2.1%
+  interior, ntdll 0.75%, kernelbase 0.69%.
+- d11b5464: the IAT slots are zeroed before recovery. In the file they
+  hold hint RVAs; read as constant jump tables, every import thunk was
+  garbage that "never returns", so 395 noita.exe call sites lost their
+  continuation (code after memset/sqrt calls ran on tier-1). New
+  recovery: 0 noreturn calls (was 395), 100,215 functions (was 100,147);
+  the 38 pewasm-only starts were all behind such calls. Units tail-call
+  unresolved jumps (now every thunk) through the function table.
+- 101a7477: a switch's default does the same.
+- Gates on the binary with all of the above (gexc-cg11): exact lockstep
+  gi386 30/30; gx64 exact, flags-ignored mode and cgen-prefix.sh not run
+  (stopped for the restart).
+
+Exact next step: finish the gates on `scratchpad/fjit/gexc-cg11` (exact
+and flags-ignored lockstep on gx64, tests/nt/cgen-prefix.sh), then
+`build-units.sh gexc-cg11 cgcache-cg9` (keep cg7/cg8: R's overlay reads
+cg8), then the Noita run (`GEX_CGEN_CACHE=.../cgcache-cg9 NULLDISP=1
+GEX_NT_TIME_SCALE=4 CPUS=4,10 GEXC=gexc-cg11 run-noita2.sh u11 1200` with
+GEX_PROF/GEX_PERFMAP past world-up) and tools/aot-coverage.py against
+cgcache-cg9, splitting interior into what the IAT fix removed and what
+remains for R.
+
 ## Runtime, stream R: fallback causes (2026-10-03, before the reboot)
 
 merge/abi9 = merge/fjit 9eacbbd5 (F merged R's 65f9a719 and ed6c838b).
@@ -492,3 +528,75 @@ merge/abi9 = merge/fjit 9eacbbd5 (F merged R's 65f9a719 and ed6c838b).
 3. Region entries for frames demoted by anything left: the safety net.
 4. If depth-guard leaves appear, raise the native budget. The runtime half
    is in (64 MiB wasm stacks); the units' budget constant is F's.
+
+## Stream F: cg9 measured (2026-10-03)
+
+merge/fjit 3fe58dc8 (abi9 78089b0e merged), binary `gexc-cg12`, every unit
+rebuilt into `cgcache-cg9` (prefix 23 min, noita.exe 21 min). New since the
+restart:
+- a73be6f2: pewasm's profile-guided devirtualisation (§8.1: `if (t == K)
+  f_K(); else <table call>`) and its small-leaf copies (§3.6: a `static
+  inline` copy in each translation unit that calls a leaf of at most 96
+  lifted statements, so clang inlines it across the image's units). The
+  hottest unit functions were one-instruction virtual getters
+  (f_4ac0d0 `mov eax,[ecx+14h]; ret` 4.4% of CPU, f_5b01c0 1.8%), which
+  pewasm inlines. noita.exe: 4,305 devirtualised calls from 3,281 hints,
+  20,386 calls to leaf copies.
+- **The cg9 hints are pewasm's.** `out/noita/icall-profile.txt`
+  (PEWASM_PROFILE_INDIRECT) converted with tools/icall-hints.py (pewasm
+  places noita.exe at 0x10000). gex's own collector came after
+  (d39b63e6: `gexc run --record DIR prog.exe` works for PE programs, and
+  icall-hints.py reads DIR/profile.json); the file format is the same.
+- b007fe99: tests/nt icall (hot indirect calls; 9.6 s without hints, 4.9 s
+  with, same output).
+
+**Gates** on gexc-cg12: lockstep exact 20/20 (gi386 and gx64: ack, calls,
+cgoto, eh, sjlj, virtual, fp, simd, interp, qsort), tests/nt --cgen 52/52,
+cgen-prefix.sh 52/52.
+
+**Noita, 4x clock, null display, cores 4 and 10** (R's run on 3,9 and G's
+on 5,11 at the same time): world-up 200 s (cg8: 443 s; this includes a 104 s
+cold Cranelift compile of noita.exe's unit). World fps in 120 s windows from
+world-up: 29.6, 37.4, 43.3, 42.4, 44.1, 43.9, 38.6, 35.3, 38.6 (cg8:
+27-28.6). R's run on 3,9: 43.3. This is one number for the import fix, R's
+ffa2cec9 and devirtualisation with leaf copies together.
+
+**AOT share** (aot-coverage.py, profile 600-1250 s): **99.6%** of guest CPU
+(cg7 73.3%, cg8 71.4%); the run's own line: AOT 99.5% (units 97.8%,
+providers 1.7%, tier-1 0.4%).
+
+| % of guest | units | tier-1 |
+|---|---|---|
+| noita.exe | 81.40 | 0 (cg8: interior 22.77, missed 1.53) |
+| msvcr120 | 5.87 | 0 (cg8: interior 2.17) |
+| ntdll | 4.97 | 0 (cg8: 0.77) |
+| kernelbase, opengl32, kernel32, msvcp120 | 1.3-1.8 each | 0 |
+| SDL2 | 0.05 | missed 0.26 |
+| lua51 | 0.11 | missed 0.11, interior 0.02 |
+
+cg8's noita.exe "missed" was the code after import-thunk calls (every hot
+address follows a `call <memset/sqrt thunk>`), which d11b5464 recovers. Its
+interior was frames demoted by leaves at those thunks and by loading
+resumes; with d11b5464, 101a7477 and R's 65f9a719/ffa2cec9 none is left
+(nest exits 0.6k/s, 10 resumes). What remained:
+- SDL2: one switch whose table re-resolved to 84 cases, then 1, for ever;
+  the recovery fixpoint never settled, so its weak (relocation-only) starts,
+  SDL's dynapi `SDL_*_REAL` bodies, were never promoted. 56988e74: a
+  re-resolved table only grows. 754 -> 2,553 functions. (pewasm uses
+  native SDL and Lua, so neither has a pewasm counterpart.)
+- lua51: LuaJIT's VM ops, reached only through its runtime-built dispatch
+  table (the Lua exclusion).
+
+**The process uses about one core of two.** GEX_PROF samples at 1 kHz of
+process CPU: 643k samples over the 650 s window is about 990 per second.
+pewasm's bench uses 1.75-1.85 cores. Per world frame at 44 fps: guest code
+about 13.7 ms, host about 8.6 ms. The hot functions' wasm is at parity with
+pewasm (0x724580 10,845 against 11,903 instructions; 0x864060 994 against
+1,004; 0x70b110 176 against 162). So the gap is waiting (latency, a
+serialising lock), not code: handed to R.
+
+**The machine is not quiet.** Two qemu VMs, Steam and the other streams
+share it (load average 14 on 12 threads); pewasm's bench on 4,10 during
+F's gates gave 49.2 world fps (BUSY ms/frame t0 9.09, t1 11.02, t2 10.90,
+t3 0.44, t4 0.49; 1.75 cores), not 76-84. Compare gex with pewasm in paired
+runs under the same load.

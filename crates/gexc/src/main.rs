@@ -572,9 +572,6 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
     if gex_ld::pe::is_pe(&bytes) {
         // A Windows program: Wine's PE DLLs on gex's NT layer.
-        if ra.opts.record.is_some() {
-            bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
-        }
         // The function tier for the images the NT layer maps
         // (gex_native::nt_cgen, docs/function-tier.md §11): prebuilt units
         // are used where they exist, and an image without one runs on tier-1
@@ -595,6 +592,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         choose_mem(&mut ra, &bytes, wide)?;
         let exit = nt_run::run(&ra, &bytes)?;
         learn_mem(&ra, &bytes, wide);
+        if let Some(dir) = gex_native::profile::finish(&exit)? {
+            if ra.opts.verbose {
+                eprintln!("[gex] profile and session manifest written to {}", dir.display());
+            }
+        }
         return Ok(report_exit(&exit, ra.opts.verbose));
     }
     // Resolved through the guest's namespace (the sysroot when given), so a
@@ -2229,9 +2231,11 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
 /// `gexc cgen-image`: see the usage text.
 /// `gexc cgen-c <pe> [--pe-base HEX] [--recovery DIR] --at ADDR`: print the C the function
 /// tier's unit holds for one function, from the image's cached recovery
-/// (`gexc cgen-image` makes it).
+/// (`gexc cgen-image` makes it). `--icall-path` instead prints where the
+/// image's indirect-call profile goes.
 fn cmd_cgen_c(args: &[String]) -> Result<()> {
     let (mut path, mut pe_base, mut at, mut rec) = (None, None, None, None);
+    let mut icall_path = false;
     let mut i = 0;
     while i < args.len() {
         let hex = |v: Option<&String>| -> Result<u64> { Ok(u64::from_str_radix(v.context("needs an address")?.trim_start_matches("0x"), 16)?) };
@@ -2249,6 +2253,9 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
                 print!("{}", gex_cgen::header::header());
                 return Ok(());
             }
+            // Print where the image's indirect-call profile goes
+            // (`nt_cgen::icall_hints`) instead.
+            "--icall-path" => icall_path = true,
             // A recovery directory to use rather than this build's key's.
             "--recovery" => {
                 i += 1;
@@ -2259,11 +2266,15 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
         i += 1;
     }
     let path = path.context("expected a PE image")?;
-    let at = at.context("--at is required")?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     let base = pe_base.unwrap_or(pe.preferred_base);
     let (image, _) = gex_xlate::func::pe_input(&pe, base).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+    if icall_path {
+        println!("{}", gex_native::nt_cgen::icall_path(&image)?.display());
+        return Ok(());
+    }
+    let at = at.context("--at is required")?;
     let dir = match rec {
         Some(d) => d,
         None => gex_native::nt_cgen::cache_root()?.join("recovery").join(gex_native::nt_cgen::recovery_key(&image)),

@@ -49,7 +49,7 @@ pub fn set_mode(m: Mode) {
     let _ = MODE.set(m);
 }
 
-fn mode() -> Mode {
+pub(crate) fn mode() -> Mode {
     MODE.get().copied().unwrap_or(Mode::Default)
 }
 
@@ -152,18 +152,63 @@ fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
     Provided { providers, exports, stubs }
 }
 
-/// The key of `image`'s unit built around `pv`'s providers: the image's own
-/// key when there are none.
+/// The key of `image`'s unit built around `pv`'s providers and its
+/// indirect-call profile (`icall_hints`): the image's own key when there
+/// are neither.
 fn unit_key(image: &gex_ld::Image, pv: &Provided) -> String {
-    let key = image_key(image);
-    if pv.stubs.is_empty() {
-        return key;
-    }
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    pv.stubs.hash(&mut h);
-    gex_cgen::provider::fingerprint(&pv.providers).hash(&mut h);
-    format!("{key}-p{:016x}", h.finish())
+    let mut key = image_key(image);
+    if !pv.stubs.is_empty() {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        pv.stubs.hash(&mut h);
+        gex_cgen::provider::fingerprint(&pv.providers).hash(&mut h);
+        key = format!("{key}-p{:016x}", h.finish());
+    }
+    let hints = icall_hints(image);
+    if !hints.is_empty() {
+        let mut v: Vec<(u64, u64)> = hints.into_iter().collect();
+        v.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        v.hash(&mut h);
+        key = format!("{key}-i{:016x}", h.finish());
+    }
+    key
+}
+
+/// Where [`icall_hints`] reads the image's profile.
+pub fn icall_path(image: &gex_ld::Image) -> Result<std::path::PathBuf> {
+    Ok(cache_root()?.join("icall").join(format!("{}.txt", gex_key::image_identity(image).trim_start_matches("image:"))))
+}
+
+/// The image's indirect-call profile, `<cache>/icall/<image identity>.txt`:
+/// lines `icall <return address> <target> <count>` (pewasm's
+/// `PEWASM_PROFILE_INDIRECT` dump, in this image's addresses; anything
+/// before `icall` is ignored). As pewasm's `read_icall_hints`: a call site
+/// whose dominant target takes at least 90% of at least 64 calls gets a
+/// guarded direct call to it. By return address.
+pub fn icall_hints(image: &gex_ld::Image) -> HashMap<u64, u64> {
+    let Ok(path) = icall_path(image) else { return HashMap::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
+    let num = |w: &str| u64::from_str_radix(w.trim_start_matches("0x"), if w.starts_with("0x") { 16 } else { 10 }).ok();
+    let mut sites: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
+    for l in text.lines() {
+        let Some(k) = l.find("icall ") else { continue };
+        let w: Vec<&str> = l[k + 6..].split_whitespace().collect();
+        if let [r, t, n, ..] = w[..] {
+            if let (Some(r), Some(t), Some(n)) = (num(r), num(t), num(n)) {
+                *sites.entry(r).or_default().entry(t).or_default() += n;
+            }
+        }
+    }
+    let mut hints = HashMap::new();
+    for (ret, targets) in sites {
+        let total: u64 = targets.values().sum();
+        let (t, best) = targets.into_iter().max_by_key(|&(t, n)| (n, std::cmp::Reverse(t))).unwrap();
+        if best >= 64 && best * 10 >= total * 9 {
+            hints.insert(ret, t);
+        }
+    }
+    hints
 }
 
 /// Build (or find) the unit's C module for a PE image placed at `base`:
@@ -215,27 +260,33 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
         image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
     };
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
-    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs)?;
+    let hints = icall_hints(image);
+    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
     let _ = std::fs::remove_dir_all(&work);
     if verbose {
         eprintln!(
-            "[cgen] {} functions, {} units ({} compiled, {} cached), {} MiB of C, {} MiB wasm, {:.1}s",
+            "[cgen] {} functions, {} units ({} compiled, {} cached), {} MiB of C, {} MiB wasm, {:.1}s; {} devirtualised calls ({} hints), {} calls to leaf copies",
             stats.functions,
             stats.units,
             stats.compiled,
             stats.cached,
             stats.c_bytes >> 20,
             stats.wasm_bytes >> 20,
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            stats.devirt,
+            hints.len(),
+            stats.leaf_copies
         );
     }
     Ok(out)
 }
 
 /// Turn the function tier on for this process's images (`--cgen`).
-pub(crate) fn enable() -> Result<()> {
+/// `record`: a profile is being recorded (`--record`), which names each
+/// image as it maps (`profile::note_pe`), on every tier.
+pub(crate) fn enable(record: bool) -> Result<()> {
     // Export providers bind on every tier, units or not.
-    if mode() == Mode::Off && !gex_cgen::provider::enabled() {
+    if mode() == Mode::Off && !gex_cgen::provider::enabled() && !record {
         return Ok(());
     }
     if ON.set(()).is_err() {
@@ -547,6 +598,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
     }
     let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
     for p in pending {
+        crate::profile::note_pe(&p.path, p.base, &p.pe);
         let (shared, engine, cache) = {
             let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
             (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
@@ -583,6 +635,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
     }
     let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
     for p in pending {
+        crate::profile::note_pe(&p.path, p.base, &p.pe);
         let (shared, engine, cache) = {
             let jit = store.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
             (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())

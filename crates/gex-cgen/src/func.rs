@@ -57,6 +57,44 @@ pub fn body_name(entry: u64) -> String {
     format!("f_{entry:x}")
 }
 
+/// What a call to `t` names: the unit-private copy when `t` is a small
+/// leaf (`FnUnit::leaves`), else its body. On the unit's fields, so it is
+/// callable while others are borrowed.
+fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, copies: &mut BTreeSet<u64>, stats: &mut FnStats, t: u64) -> String {
+    if !copying && leaves.contains_key(&t) {
+        copies.insert(t);
+        stats.calls_leaf_copy += 1;
+        leaf_name(t)
+    } else {
+        body_name(t)
+    }
+}
+
+/// A unit-private copy of a small leaf (`FnUnit::leaves`).
+pub fn leaf_name(entry: u64) -> String {
+    format!("fl_{entry:x}")
+}
+
+/// Whether `f` may be copied into its callers' translation units (pewasm's
+/// opt_inline.cc): a leaf (no calls, no transfers out other than its
+/// returns) of at most `LEAF_STMTS` statements. pewasm's bound is 48 C
+/// statements; gex's lifted statements are about two per pewasm line.
+pub fn is_small_leaf(f: &Function) -> bool {
+    const LEAF_STMTS: usize = 96;
+    let mut n = 0;
+    for b in &f.blocks {
+        match b.term {
+            FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Return { .. } => {}
+            _ => return false,
+        }
+        n += b.stmts.len();
+        if n > LEAF_STMTS {
+            return false;
+        }
+    }
+    f.form == Form::Memory
+}
+
 pub fn entry_name(entry: u64) -> String {
     format!("e_{entry:x}")
 }
@@ -196,6 +234,12 @@ pub struct FnStats {
     pub calls_trapfree: usize,
     /// Calls with the minimal write-back (`minimal_writeback`).
     pub calls_minimal: usize,
+    /// Indirect calls with a guarded direct call to the profile's dominant
+    /// target (`FnUnit::icall_hints`).
+    pub calls_devirt: usize,
+    /// Calls that go to a unit-private copy of a small leaf
+    /// (`FnUnit::leaves`).
+    pub calls_leaf_copy: usize,
     pub tail_known: usize,
     pub switches: usize,
     pub loops_outlined: usize,
@@ -213,6 +257,8 @@ impl FnStats {
         self.calls_indirect += o.calls_indirect;
         self.calls_trapfree += o.calls_trapfree;
         self.calls_minimal += o.calls_minimal;
+        self.calls_devirt += o.calls_devirt;
+        self.calls_leaf_copy += o.calls_leaf_copy;
         self.tail_known += o.tail_known;
         self.switches += o.switches;
         self.loops_outlined += o.loops_outlined;
@@ -265,6 +311,20 @@ pub struct FnUnit {
     /// The functions that need no depth guard (`guard_free`), from the
     /// recovery.
     pub guardfree: HashSet<u64>,
+    /// Profile-guided devirtualisation (pewasm's `--icall-profile`,
+    /// optimization-plan.md §8.1): an indirect call whose return address is
+    /// here gets a guarded direct call to the target, which skips the probe
+    /// and lets clang inline it. By return address.
+    pub icall_hints: std::sync::Arc<HashMap<u64, u64>>,
+    /// Small leaf functions of the image (pewasm's opt_inline.cc, §3.6):
+    /// a call to one goes to a private `static inline` copy in this
+    /// translation unit, which clang can inline across the image's units.
+    pub leaves: std::sync::Arc<HashMap<u64, Function>>,
+    /// The copies this unit's calls need (`leaves`), emitted by
+    /// `add_leaf_copies`.
+    leaf_copies: BTreeSet<u64>,
+    /// Emitting a copy: `static inline`, under `leaf_name`.
+    copying: bool,
 }
 
 impl Default for FnUnit {
@@ -330,7 +390,33 @@ impl FnUnit {
             touched: HashMap::new(),
             carry: HashMap::new(),
             guardfree: HashSet::new(),
+            icall_hints: Default::default(),
+            leaves: Default::default(),
+            leaf_copies: BTreeSet::new(),
+            copying: false,
         }
+    }
+
+    /// The copies of small leaves this unit's calls named ([`callee_name`]),
+    /// as `static inline` functions after its bodies.
+    pub fn add_leaf_copies(&mut self, known: &HashSet<u64>, sums: &HashMap<u64, Summary>, trapfree: &HashMap<u64, u32>) -> Result<()> {
+        let want = std::mem::take(&mut self.leaf_copies);
+        let leaves = std::sync::Arc::clone(&self.leaves);
+        let saved = std::mem::take(&mut self.stats);
+        self.copying = true;
+        let mut r = Ok(());
+        for a in &want {
+            if let Some(f) = leaves.get(a) {
+                if let Err(err) = self.add(f, known, sums, trapfree) {
+                    r = Err(err);
+                    break;
+                }
+            }
+        }
+        self.copying = false;
+        self.stats = saved;
+        self.leaf_copies = want;
+        r
     }
 
     /// A unit for a standalone translation unit (`crate::standalone`).
@@ -342,7 +428,9 @@ impl FnUnit {
     }
 
     fn storage(&self) -> &'static str {
-        if self.standalone {
+        if self.copying {
+            "static inline "
+        } else if self.standalone {
             "static "
         } else {
             ""
@@ -414,7 +502,7 @@ impl FnUnit {
 
         self.stats.functions += 1;
         self.stats.blocks += f.blocks.iter().filter(|b| !b.synthetic).count();
-        let name = body_name(f.entry);
+        let name = if self.copying { leaf_name(f.entry) } else { body_name(f.entry) };
         // The body's head, kept aside: its loop functions go first.
         let mut fhead = String::new();
         let _ = writeln!(fhead, "{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
@@ -545,6 +633,9 @@ impl FnUnit {
         // The entry and nest root. A standalone unit has none: its caller
         // dispatches on `ctx::PC` itself; nor has a whole-image unit, whose
         // functions are reached through the function table.
+        if self.copying {
+            return Ok(());
+        }
         if self.ftab {
             self.defined.push(f.entry);
         }
@@ -854,17 +945,17 @@ impl FnUnit {
                             reload_all(e);
                             e.line("  } else");
                         }
+                        let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, *t);
                         if leave_wb.is_empty() {
                             e.line(format!(
-                                "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
-                                body_name(*t),
+                                "  if (!{callee_c}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
                                 self.weight
                             ));
                         } else {
                             // It left: the registers it never writes are
                             // ours, still in locals; tier-1 (or this body's
                             // resume) needs them in the context.
-                            e.line(format!("  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {{", body_name(*t), self.weight));
+                            e.line(format!("  if (!{callee_c}(ctx, depth + {}, {need_back}, {ret_arg})) {{", self.weight));
                             // (The write-back before the call marked
                             // everything clean.)
                             e.mark_dirty(carried);
@@ -880,7 +971,32 @@ impl FnUnit {
                     Callee::Indirect(v) if self.ftab => {
                         self.stats.calls_indirect += 1;
                         let t = e.v(*v);
-                        ftab_call(e, &t, &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
+                        let depth = format!("depth + {}", self.weight);
+                        match self.icall_hints.get(ret_pc).copied().filter(|k| known.contains(k)) {
+                            Some(k) => {
+                                // pewasm's `if (x == K) sub_K(s); else
+                                // recomp_call_indirect(s, x)`. A trap-free K
+                                // checks no pages itself: a rewritten one
+                                // goes through the table.
+                                self.stats.calls_devirt += 1;
+                                calls.insert(k);
+                                let guard = if trapfree.contains_key(&k) {
+                                    format!(" && !({})", patched_test(k))
+                                } else {
+                                    String::new()
+                                };
+                                let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, k);
+                                e.line(format!("  {{ const uint64_t ft = {t};"));
+                                e.line(format!(
+                                    "    if (__builtin_expect(ft == 0x{k:x}ull{guard}, 1)) {{ if (!{callee_c}(ctx, {depth}, {need_back}, {ret_arg})) {fail} }}"
+                                ));
+                                e.line(format!(
+                                    "    else {{ GEX_C64({}u) = ft; if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need_back}, {ret_arg})) {fail} }} }}",
+                                    ctx::LAST_TARGET
+                                ));
+                            }
+                            None => ftab_call(e, &t, &depth, need_back, &ret_arg, fail),
+                        }
                     }
                     Callee::Direct(t) if known.contains(t) => {
                         calls.insert(*t);
@@ -1147,6 +1263,9 @@ impl FnUnit {
         for a in &self.protos {
             let _ = writeln!(s, "{st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", body_name(*a));
         }
+        for a in &self.leaf_copies {
+            let _ = writeln!(s, "static inline int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret);", leaf_name(*a));
+        }
         if !self.ftab {
             let _ = writeln!(s, "{st}int {CALL_KNOWN}(int ctx, uint64_t target, int32_t depth, uint32_t need, uint64_t ret);\n");
         }
@@ -1190,7 +1309,28 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 /// 720 KB of wasm) and put them past Cranelift's limits.
 fn resume_block(e: &mut Emitter<'_>, f: &Function) {
     if local_resume() {
-        e.line("gex_resume: return 0;");
+        // Each call takes its own continuation (`gex_lc_*`). Anything else
+        // inside this function's code with the stack at or below this
+        // activation is a continuation this frame owns but no call of it
+        // returned to: a `longjmp` to a `setjmp` here, a `catch` or
+        // `__except` continuation, a callee's leave for one of our blocks.
+        // The rest of the function then runs through the table (the
+        // fallback's call-out, or a region) under this frame's own return
+        // contract, so the frames further out keep running their bodies;
+        // leaving would hand all of them to the fallback.
+        let lo = f.blocks.iter().map(|b| b.start).min().unwrap_or(f.entry);
+        let hi = f.blocks.iter().map(|b| b.end.max(b.start + 1)).max().unwrap_or(f.entry + 1);
+        e.line("gex_resume: {");
+        e.line(format!("  const uint64_t rpc = GEX_C64({}u);", ctx::PC));
+        e.line(format!(
+            "  if (rpc - 0x{lo:x}ull < 0x{:x}ull && GEX_C64({}u) <= sp0) {{",
+            hi.saturating_sub(lo),
+            ctx::SP
+        ));
+        ftab_tail(e, "rpc", false, 0);
+        e.line("  }");
+        e.line("  return 0;");
+        e.line("}");
         return;
     }
     let mut starts: Vec<(u64, usize)> = f
@@ -1643,6 +1783,13 @@ pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u
 /// the same frame, which now leaves (correct, slower).
 /// `GEX_CGEN_EXP=CENTRALRESUME` restores the switch (not in the unit key:
 /// for pricing only).
+/// Calls to small leaves go to unit-private copies (`FnUnit::leaves`);
+/// `GEX_CGEN_EXP=NOLEAFCOPY` turns it off (not in the unit key: use a
+/// private cache).
+pub fn leaf_copies() -> bool {
+    !exp("NOLEAFCOPY")
+}
+
 pub fn local_resume() -> bool {
     !exp("CENTRALRESUME")
 }

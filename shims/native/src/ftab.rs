@@ -115,12 +115,14 @@ pub(crate) mod stats {
     pub fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "ftab lookups={} translated={} fallback={} stale={} resumes={} translate_ms={} compile_ms={} worst_ms={} queued={} dropped={} latency_ms={}",
+            "ftab lookups={} translated={} fallback={} stale={} resumes={} exc_nested={} exc_escaped={} translate_ms={} compile_ms={} worst_ms={} queued={} dropped={} latency_ms={}",
             LOOKUPS.load(Relaxed),
             TRANSLATED.load(Relaxed),
             FALLBACKS.load(Relaxed),
             STALE.load(Relaxed),
             RESUMES.load(Relaxed),
+            crate::nt::EXC_NESTED.load(Relaxed),
+            crate::nt::EXC_ESCAPED.load(Relaxed),
             TRANSLATE_US.load(Relaxed) / 1000,
             COMPILE_US.load(Relaxed) / 1000,
             WORST_US.load(Relaxed) / 1000,
@@ -677,6 +679,12 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
     if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {
         *stats::FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(target).or_default() += 1;
+    }
+    // A jump out of an exception being dispatched nested (a handler's
+    // longjmp to its `setjmp`, a `catch` continuation): back to the frames
+    // it was raised under.
+    if crate::nt::exc_escape(caller, target) {
+        return Err(StopExecution.into());
     }
     // No caller waits for a return (a root, or the bridge): leave, and the
     // root dispatches there flat.
