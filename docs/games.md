@@ -74,30 +74,28 @@ What made it this far:
 - `?mesaenv=K=V,...` passes environment variables to Mesa in the GL worker
   (for example `MESA_DEBUG=incomplete_fbo`).
 
-Blockers, in order:
+It renders c1a0 at about 9 frames/s on the real GPU (`-nomsaa`).
 
-1. **Black frames in the page.** The map loads and the compositor counts
-   presents, but the canvas stays black. **This is not the driver.** I
-   replayed a native capture of the same stream (with `-nomsaa`, the first 600
-   frames) through `tests/gl-replay.mjs` on softpipe, then through
-   `web/public/mesa-wgpu-replay.html` (`allowerrors=1`) on gex_wgpu with a real
-   GPU. Both produced the c1a0 corridor with the same mean (32.6,37.2,38.2 and
-   coverage 45.7%). The cause is therefore in the live path:
-   - how the window's GL surface gets presented, or
-   - something the browser run sends that the native capture does not.
+The black window came from the bundle's hard links. `nt.html` turned each
+hard link into a copy, and glibc's loader identifies a loaded library by
+device and inode. So `libGL.so.1` and `libEGL.so.1` (one file on the host)
+loaded as two libraries, each with its own gex-gl ring and its own GL device.
+HL created its framebuffer's texture through one and attached it through the
+other, which left the framebuffer incomplete. Hard links are now real links
+in the VFS (`gex_add_hardlink`). `tests/games/src/sdl-fbo-blit.c` reproduces
+HL's present path on its own, and `info` prints the GL version, the
+framebuffer queries and the extension list.
 
-   HL ends each frame by blitting a texture-rectangle FBO to framebuffer 0
-   with `glBlitFramebuffer`. A standalone version of that blit does work in
-   the page.
+Still open:
 
-   Next step: run a small i386 SDL2 program that does the same thing (FBO,
-   blit to 0, swap) under `nt.html`. If it is also black, the problem is the
-   Linux-guest presentation path. If it renders, capture HL's live stream in
-   the browser and diff it against the native capture.
-2. **MSAA:** without `-nomsaa`, the main framebuffer is incomplete
+1. **MSAA:** without `-nomsaa`, the main framebuffer is incomplete
    (multisample FBO) on gex_wgpu.
+2. **V8 out of memory.** One real-GPU run ran the renderer out of heap. Each
+   guest thread is a Worker with its own copy of the dispatch tables, and they
+   grow to millions of entries (table 4 reached 4.5M). Function-indexed tables
+   (merge plan §9) remove these per-Worker tables; that work belongs to §9,
+   not to this stream.
 3. **SwiftShader:** the WebGPU device is lost ("destroyed") during the run.
-   One real-GPU run also ran out of V8 heap.
 
 ## Peggle Deluxe
 
@@ -113,24 +111,18 @@ GEX_NT_STRICT=1 gexc run --no-cgen --wine-prefix $PREFIX --gl --wayland-out DIR 
 ```
 
 What works: it loads, bass.dll's self-check passes (tier-1 SMC guard fix),
-HWND_BROADCAST messages work, and the game reaches its first MessageBox.
+and HWND_BROADCAST messages work. With MMX lifted (j2k-codec decodes the
+JPEG 2000 images), it shows the PopCap logo and reaches the title screen
+("Click to play") natively. The startup MessageBox no longer appears. It was
+most likely the images/sunglow load failure.
 
 Next steps:
 
-1. **GDI text (WIP commit):** `crates/gex-kernel/src/nt/gdi/font.rs`.
-   - It parses the bitmap `.fon` files (NE resources, FNT v2/v3).
-   - It answers the win32u calls that user32 and comctl32 make for dialog
-     text: GetTextExtentExW, GetTextMetricsW, GetTextFaceW, GetCharWidthW,
-     GetCharABCWidthsW, GetGlyphIndicesW, and ExtTextOutW (alignment, opaque
-     and clipped).
-   - It builds but has not been run against Peggle yet. Test it on the
-     MessageBox first, then on `tests/nt` with a test of its own.
-2. **images/sunglow fails to load.** The JPEG 2000 path is j2k-codec, which
-   uses MMX. **MMX has to be implemented in the lifter**, because removing it
-   broke i386 glibc, whose ISA level requires MMX
-   (`tests/x86-programs/glibc/run.sh` guards that now). After that, find out
-   why sunglow fails.
-3. Gameplay natively, then in the browser (`browser-noita.mjs` is the model).
+1. Gameplay natively, then in the browser (`browser-noita.mjs` is the model).
+2. **GDI text (WIP commit, parked):** `crates/gex-kernel/src/nt/gdi/font.rs`
+   parses the bitmap `.fon` files and answers the win32u text calls that
+   user32 and comctl32 make for dialogs. It has never been run. Pick it up
+   only if Peggle needs dialog text.
 
 ## Measurement scripts (not written yet)
 
