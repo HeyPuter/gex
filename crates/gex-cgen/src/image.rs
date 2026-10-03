@@ -165,21 +165,25 @@ pub const UNIT_BYTES: usize = 512 << 10;
 
 /// What code generation reads of a function's summary (the rest stays
 /// "unknown", which is always sound).
-fn summary_line(entry: u64, s: &Summary, trapfree: Option<u32>) -> String {
+fn summary_line(entry: u64, s: &Summary, trapfree: Option<u32>, touched: RegSet) -> String {
     format!(
-        "{entry:x} {:x} {:x} {}{}{} {}\n",
+        "{entry:x} {:x} {:x} {}{}{} {} {:x}\n",
         s.inputs.0,
         s.preserved.0,
         s.may_unwind as u8,
         s.may_leave_pending as u8,
         s.unknown_callee as u8,
-        trapfree.map(|w| w as i64).unwrap_or(-1)
+        trapfree.map(|w| w as i64).unwrap_or(-1),
+        touched.0
     )
 }
 
-fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>)> {
+/// The line's sixth field, the registers the function's call tree names
+/// (`func::touched`), is optional: a recovery written before it existed
+/// reads as touching everything.
+fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>, RegSet)> {
     let w: Vec<&str> = line.split_whitespace().collect();
-    if w.len() != 5 || w[3].len() != 3 {
+    if !(w.len() == 5 || w.len() == 6) || w[3].len() != 3 {
         bail!("malformed summary line {line:?}");
     }
     let hex = |s: &str| u128::from_str_radix(s, 16).map_err(|e| anyhow!("{line:?}: {e}"));
@@ -192,7 +196,11 @@ fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>)> {
     s.unknown_callee = f[2] == b'1';
     let tf: i64 = w[4].parse().map_err(|e| anyhow!("{line:?}: {e}"))?;
     let entry = u64::from_str_radix(w[0], 16).map_err(|e| anyhow!("{line:?}: {e}"))?;
-    Ok((entry, s, (tf >= 0).then_some(tf as u32)))
+    let touched = match w.get(5) {
+        Some(t) => RegSet(hex(t)?),
+        None => RegSet::ALL,
+    };
+    Ok((entry, s, (tf >= 0).then_some(tf as u32), touched))
 }
 
 /// Stage 1: write `funcs` (memory form, already [`crate::select`]ed) and
@@ -200,6 +208,7 @@ fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>)> {
 /// the record: the emitted C depends on it.
 pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summary>, class32: bool) -> Result<()> {
     let trapfree = func::trap_free(funcs, sums);
+    let touched = func::touched(funcs);
     let parent = dir.parent().ok_or_else(|| anyhow!("{} has no parent", dir.display()))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
@@ -215,7 +224,8 @@ pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summar
         writeln!(meta, "class32 {}", class32 as u8)?;
         for f in funcs {
             let s = sums.get(&f.entry).cloned().unwrap_or_else(Summary::unknown);
-            meta.write_all(summary_line(f.entry, &s, trapfree.get(&f.entry).copied()).as_bytes())?;
+            let t = touched.get(&f.entry).copied().unwrap_or(RegSet::ALL);
+            meta.write_all(summary_line(f.entry, &s, trapfree.get(&f.entry).copied(), t).as_bytes())?;
         }
         meta.flush()?;
         let mut gir = BufWriter::new(std::fs::File::create(tmp.join("functions.gir"))?);
@@ -238,6 +248,7 @@ struct Recovery {
     entries: Vec<u64>,
     sums: HashMap<u64, Summary>,
     trapfree: HashMap<u64, u32>,
+    touched: HashMap<u64, RegSet>,
 }
 
 fn read_format(r: &mut impl BufRead, what: &Path) -> Result<()> {
@@ -264,9 +275,10 @@ fn read_recovery(dir: &Path) -> Result<Recovery> {
         "class32 1" => true,
         other => bail!("{}: expected the class32 line, found {other:?}", path.display()),
     };
-    let mut rec = Recovery { class32, entries: Vec::new(), sums: HashMap::new(), trapfree: HashMap::new() };
+    let mut rec = Recovery { class32, entries: Vec::new(), sums: HashMap::new(), trapfree: HashMap::new(), touched: HashMap::new() };
     for line in r.lines() {
-        let (e, s, tf) = parse_summary_line(&line?)?;
+        let (e, s, tf, t) = parse_summary_line(&line?)?;
+        rec.touched.insert(e, t);
         rec.entries.push(e);
         rec.sums.insert(e, s);
         if let Some(w) = tf {
@@ -290,6 +302,7 @@ pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>)
         let mut unit = FnUnit::new();
         unit.set_class32(rec.class32);
         unit.ftab = true;
+        unit.touched = rec.touched.clone();
         unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
         unit.add(&f, &known, &rec.sums, &rec.trapfree)?;
         return Ok(unit.source());
@@ -462,12 +475,14 @@ fn emit_and_link(
             *unit = FnUnit::new();
             unit.set_class32(rec.class32);
             unit.ftab = true;
+            unit.touched = rec.touched.clone();
             Ok(())
         };
         let mut gir = GirReader::open(recovery)?;
         let mut unit = FnUnit::new();
         unit.set_class32(rec.class32);
         unit.ftab = true;
+        unit.touched = rec.touched.clone();
         let mut k = 0usize;
         while let Some(f) = gir.next()? {
             if skip.contains(&f.entry) {
