@@ -102,6 +102,9 @@ struct Pending {
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Set after a push to [`PENDING`]: every syscall drains, and looks here
+/// first rather than taking the lock.
+static HAS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ON: OnceLock<()> = OnceLock::new();
 /// One unit is placed at a time: slot assignment runs from a snapshot of the
 /// page table to the publish.
@@ -296,11 +299,15 @@ pub(crate) fn enable() -> Result<()> {
             base: m.base,
             pe: Arc::clone(m.pe),
         });
+        HAS_PENDING.store(true, std::sync::atomic::Ordering::Release);
     });
     Ok(())
 }
 
 fn take_pending() -> Vec<Pending> {
+    if !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
     std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 

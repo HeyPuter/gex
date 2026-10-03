@@ -44,27 +44,33 @@ const GEX_GL_SUBMIT_ASYNC: u64 = 0xc008_6704;
 /// process's ABI.
 struct Params {
     at: u64,
-    offs: Vec<u64>,
+    offs: [u64; MAX_PARAMS],
+    /// How many there are (the last is the return value's slot).
+    n: usize,
 }
 
-fn layout(sig: &str, abi: Abi) -> Vec<u64> {
+/// More than any opengl32 unix call takes (25 at most).
+const MAX_PARAMS: usize = 32;
+
+/// The parameters' offsets in the call's argument block. A fixed array: this
+/// runs for every GL call (hundreds of thousands a second in Noita).
+fn layout(sig: &str, abi: Abi) -> [u64; MAX_PARAMS] {
     let ps = abi.ptr_size();
     let mut off = 0u64;
-    sig.bytes()
-        .map(|k| {
-            let s = match k {
-                b'b' => 1,
-                b'h' => 2,
-                b'i' | b'f' => 4,
-                b'd' | b'q' => 8,
-                _ => ps,
-            };
-            off = off.div_ceil(s) * s;
-            let o = off;
-            off += s;
-            o
-        })
-        .collect()
+    let mut offs = [0u64; MAX_PARAMS];
+    for (i, k) in sig.bytes().take(MAX_PARAMS).enumerate() {
+        let s = match k {
+            b'b' => 1,
+            b'h' => 2,
+            b'i' | b'f' => 4,
+            b'd' | b'q' => 8,
+            _ => ps,
+        };
+        off = off.div_ceil(s) * s;
+        offs[i] = off;
+        off += s;
+    }
+    offs
 }
 
 impl Params {
@@ -105,7 +111,7 @@ impl Params {
     }
     /// The last field: a call's result.
     fn ret(&self) -> usize {
-        self.offs.len() - 1
+        self.n - 1
     }
 }
 
@@ -931,7 +937,7 @@ pub fn call(c: &mut Call<'_>, code: u32, args: u64) -> R {
     let Some(&(name, sig)) = table::FUNCS.get(code as usize) else {
         return Err(c.unimplemented(&format!("opengl32 unix call {code}")));
     };
-    let p = Params { at: args, offs: layout(sig, c.p.abi) };
+    let p = Params { at: args, offs: layout(sig, c.p.abi), n: sig.len().min(MAX_PARAMS) };
     let timed = STATS.load(std::sync::atomic::Ordering::Relaxed);
     let t0 = if timed {
         c.p.gl.lock().unwrap().serving = name;
@@ -1468,3 +1474,20 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
 
 #[allow(dead_code)]
 fn _unused(_: Rect, _: Status) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Offsets follow each parameter's alignment, and the return value's
+    /// slot is the last parameter of the signature, not of the array.
+    #[test]
+    fn params_layout_and_return_slot() {
+        let sig = "pibqi";
+        let p = Params { at: 0, offs: layout(sig, Abi::P32), n: sig.len() };
+        assert_eq!(&p.offs[..5], &[0, 4, 8, 16, 24]);
+        assert_eq!(p.ret(), 4);
+        let p = Params { at: 0, offs: layout(sig, Abi::P64), n: sig.len() };
+        assert_eq!(&p.offs[..5], &[0, 8, 12, 16, 24]);
+    }
+}

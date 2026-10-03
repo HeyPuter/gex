@@ -303,6 +303,7 @@ pub(crate) fn install_shared(
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.page_table.insert_entries(&meta.dir_entries);
             sh.registry.push(Arc::clone(&unit));
+            crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
         }
         super::install_unit(&mut *store, &unit)?;
         store.data_mut().jit.as_mut().unwrap().replayed += 1;

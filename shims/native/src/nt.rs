@@ -459,11 +459,14 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     // Code that went away (an unmapped image, a protection change) loses its
     // translations. NT images are never statically recompiled, so newly
     // mapped code needs nothing here.
-    let (retired, _mapped) = caller
-        .data_mut()
-        .with_kernel(|k| (std::mem::take(&mut k.retired_code), std::mem::take(&mut k.new_code)));
-    if !retired.is_empty() {
-        retire_translations(caller, &retired)?;
+    // The kernel lock only when something was recorded since the last look.
+    if gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
+        let (retired, _mapped) = caller
+            .data_mut()
+            .with_kernel(|k| (std::mem::take(&mut k.retired_code), std::mem::take(&mut k.new_code)));
+        if !retired.is_empty() {
+            retire_translations(caller, &retired)?;
+        }
     }
     // An image just mapped that has a hot set gets its function-tier unit.
     super::nt_cgen::drain_in_caller(caller)?;
