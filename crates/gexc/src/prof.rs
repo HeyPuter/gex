@@ -52,6 +52,7 @@ pub fn start() {
         // steady-state profile, past loading).
         let start = std::env::var("GEX_PROF_START").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let path = std::path::PathBuf::from(path);
+        gex_native::aot_share::set_sampler(Box::new(take_new));
         let _ = std::thread::Builder::new().name("gex-prof".into()).spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(start));
             // SAFETY: as above; the timer is the process's, set from any thread.
@@ -66,6 +67,14 @@ pub fn start() {
             }
         });
     });
+}
+
+/// The samples since the previous call (for `gex_native::aot_share`).
+fn take_new() -> Vec<u64> {
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.load(Ordering::Relaxed).min(N);
+    let from = SEEN.swap(n, Ordering::Relaxed).min(n);
+    SAMPLES[from..n].iter().map(|s| s.load(Ordering::Relaxed)).collect()
 }
 
 /// Write the profile now (at the end of a run).

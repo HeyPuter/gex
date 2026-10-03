@@ -49,7 +49,16 @@ fn real_main() -> Result<ExitCode> {
     gex_cgen::image::set_unguarded(native && std::env::var("GEX_CGEN_GUARD").as_deref() != Ok("1"));
     match argv[1].as_str() {
         "run" => {
-            let r = cmd_run(&argv[2..]);
+            // On a thread with a guest-sized stack: the first guest thread
+            // runs here (`gex_native::guest_thread_stack`).
+            let args = argv[2..].to_vec();
+            let r = std::thread::Builder::new()
+                .name("gex-main".into())
+                .stack_size(gex_native::guest_thread_stack())
+                .spawn(move || cmd_run(&args))
+                .expect("spawning the main guest thread")
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p));
             prof::finish();
             r
         }

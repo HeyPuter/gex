@@ -13,6 +13,7 @@ use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod aot;
+pub mod aot_share;
 pub mod gl;
 pub mod profile;
 pub mod nt;
@@ -570,6 +571,9 @@ fn run_program_with(
 
     let phase = std::time::Instant::now();
     let mut config = Config::new();
+    // Deep guest call chains are wasm recursion (units call units): room for
+    // them, on threads with stacks to match (`guest_thread_stack`).
+    config.max_wasm_stack(wasm_stack_bytes());
     // Tail calls are load-bearing: the whole block-per-function design in
     // PLAN §2.4 depends on them.
     config.wasm_tail_call(true);
@@ -1430,6 +1434,7 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
     let running = Arc::clone(&cx.running);
     std::thread::Builder::new()
         .name(format!("gex-tid-{}", child.tid))
+        .stack_size(guest_thread_stack())
         .spawn(move || {
             if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
                 eprintln!("gexc: thread {} failed: {e:#}", child.tid);
@@ -1580,6 +1585,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
     let thread = ThreadState::new(ctx_addr, pid);
     std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
+        .stack_size(guest_thread_stack())
         .spawn(move || {
             let cleanup = Arc::clone(&child_cx);
             // Two numbers, deliberately: the process table keeps the one a
@@ -3142,6 +3148,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     };
                     let leave = (addr as u64) != popped
                         && !gm.read(sp.wrapping_sub(64), 64).map(|w| w.chunks(4).any(|x| u32::from_le_bytes(x.try_into().unwrap()) as u64 == addr as u64)).unwrap_or(false);
+                    // Bit 63: the target's page is marked patched (a unit
+                    // leaves for a callee there instead of calling it).
+                    let t = addr as u64;
+                    let patched = gm.read(gex_abi::PATCHED_PAGES + (t >> 15), 1).map(|b| (b[0] >> ((t >> 12) & 7)) & 1 == 1).unwrap_or(false);
+                    let addr = (t | ((patched as u64) << 63)) as i64;
                     if leave {
                         *LEAVE_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((pc as u64, addr as u64)).or_default() += 1;
                     }
@@ -3598,6 +3609,7 @@ fn publish_unit(
     module: Module,
     blocks: usize,
 ) -> Result<Arc<CompiledUnit>> {
+    aot_share::note(&module, aot_share::Kind::Tier1);
     {
         use std::sync::atomic::Ordering::Relaxed;
         jit_stats::PUBLISHED.fetch_add(1, Relaxed);
@@ -4410,4 +4422,19 @@ pub(crate) fn note_resume(state: &mut HostState, target: u64, taker: &str) {
     if crate::ftab::stats_on() {
         crate::ftab::stats::note_resume_cause(cause.unwrap_or_else(|| format!("untagged ({taker})")), target);
     }
+}
+
+/// The wasm stack each guest thread may use (`GEX_WASM_STACK_MB`, default
+/// 64 MiB; wasmtime's own default is 512 KiB): units are call-returning, so
+/// guest call depth is wasm stack depth. Natively the units' depth guard is
+/// what keeps them inside it.
+pub fn wasm_stack_bytes() -> usize {
+    std::env::var("GEX_WASM_STACK_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64) << 20
+}
+
+/// The host stack for a thread that runs guest code: the wasm stack plus
+/// room for the host's own frames below and above it (reserved, touched
+/// only as used).
+pub fn guest_thread_stack() -> usize {
+    wasm_stack_bytes() + (16 << 20)
 }

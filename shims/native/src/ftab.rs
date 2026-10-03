@@ -156,6 +156,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
             None => {
                 let m = Module::new(cx.as_context().engine(), gex_cgen::runtime::module())
                     .context("compiling the function table's runtime module")?;
+                crate::aot_share::note(&m, crate::aot_share::Kind::Runtime);
                 s.ftab.runtime = Some(m.clone());
                 m
             }
@@ -327,6 +328,14 @@ fn publish_pairs_at(
             return Ok(None);
         }
         let m = s.ftab.modules.len() as u32;
+        crate::aot_share::note(
+            &module,
+            match tier {
+                Tier::Unit => crate::aot_share::Kind::Unit,
+                Tier::Jit => crate::aot_share::Kind::Jit,
+                Tier::Region => crate::aot_share::Kind::Tier1,
+            },
+        );
         s.ftab.modules.push(module);
         let n = s.ftab.map.publish(len, m, tier, pairs);
         if !checks.is_empty() {
