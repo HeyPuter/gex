@@ -584,6 +584,11 @@ fn run_program_with(
         Ok("speed_and_size") => wasmtime::OptLevel::SpeedAndSize,
         _ => wasmtime::OptLevel::Speed,
     });
+    // `GEX_PERFMAP=1`: name every compiled function in /tmp/perf-<pid>.map,
+    // so a host profiler (perf, samply) attributes JIT and unit code.
+    if std::env::var_os("GEX_PERFMAP").is_some() {
+        config.profiler(wasmtime::ProfilingStrategy::PerfMap);
+    }
     let engine = Engine::new(&config).context("creating the wasm engine")?;
 
     // Only the executable is translated ahead of time; the interpreter and its
