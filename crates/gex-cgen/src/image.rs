@@ -62,12 +62,35 @@ pub fn image_key(image: &gex_ld::Image) -> String {
 /// decides a unit from a recovery.
 fn unit_inputs() -> String {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    S.get_or_init(|| {
-        let mut h = gex_key::sha256::Sha256::new();
-        h.update(abi_fingerprint().as_bytes());
-        format!("{UNIT_INPUTS}:{}", gex_key::sha256::hex(&h.finish()))
-    })
-    .clone()
+    let base = S
+        .get_or_init(|| {
+            let mut h = gex_key::sha256::Sha256::new();
+            h.update(abi_fingerprint().as_bytes());
+            format!("{UNIT_INPUTS}:{}", gex_key::sha256::hex(&h.finish()))
+        })
+        .clone();
+    // The flavor is part of the key: native and browser units never mix.
+    if unguarded() {
+        format!("{base}:unguarded")
+    } else {
+        base
+    }
+}
+
+static UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Build and look up the unguarded flavor of i386 units (no bounds guard on
+/// guest accesses: `Emitter::unguarded`), for a host whose guest memory is
+/// the whole linear memory, so out-of-range accesses trap by themselves --
+/// natively. The browser's NT layer keeps host data above a lower guard
+/// limit and keeps the guarded flavor (docs/noita-perf.md). Set before the
+/// first key is computed.
+pub fn set_unguarded(on: bool) {
+    UNGUARDED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn unguarded() -> bool {
+    UNGUARDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a unit's C takes from gex-abi: the generated header, and every value

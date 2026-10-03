@@ -40,6 +40,10 @@ fn real_main() -> Result<ExitCode> {
         usage();
         return Ok(ExitCode::from(2));
     }
+    // Natively, i386 units drop the bounds guard (the guest memory is the
+    // whole linear memory): `GEX_CGEN_GUARD=1` builds and uses the guarded,
+    // browser flavor instead.
+    gex_cgen::image::set_unguarded(std::env::var("GEX_CGEN_GUARD").as_deref() != Ok("1"));
     match argv[1].as_str() {
         "run" => {
             let r = cmd_run(&argv[2..]);

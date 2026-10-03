@@ -356,6 +356,23 @@ impl<'a> Emitter<'a> {
         self.regs.insert(r, true);
     }
 
+    /// The registers currently dirty (differ from the context).
+    pub(crate) fn dirty_set(&self) -> RegSet {
+        let v: Vec<GuestReg> = self.regs.iter().filter(|(_, d)| **d).map(|(r, _)| *r).collect();
+        RegSet::of(&v)
+    }
+
+    /// Mark `set` dirty again (registers a call left untouched in locals).
+    pub(crate) fn mark_dirty(&mut self, set: RegSet) {
+        if let Some(fr) = &self.func_regs {
+            for r in fr.used.iter() {
+                if set.contains(*r) {
+                    self.regs.insert(*r, true);
+                }
+            }
+        }
+    }
+
     /// Function mode: the registers that may differ from the context here.
     pub(crate) fn set_dirty(&mut self, dirty: &BTreeSet<GuestReg>) {
         self.regs = dirty.iter().map(|r| (*r, true)).collect();
@@ -610,6 +627,15 @@ impl<'a> Emitter<'a> {
         )
     }
 
+    /// The unguarded flavor (`image::unguarded`) for an i386 unit: every
+    /// address is reduced mod 2^32 and used as is. Past the guest memory
+    /// (whose end, `GUEST_LIMIT`, is the linear memory's maximum) an access
+    /// traps on its own, exactly as the guard would make it. Not for a
+    /// 64-bit guest, whose addresses a truncation would alias.
+    fn unguarded(&self) -> bool {
+        self.class32 && crate::image::unguarded()
+    }
+
     /// Track `value_zext` and `value_disp` for the definition of value `idx`.
     fn note_disp(&mut self, idx: usize, expr: &Expr) {
         if idx >= self.value_zext.len() || !gex_abi::X86 || disp_off() {
@@ -647,9 +673,13 @@ impl<'a> Emitter<'a> {
         // displacement rides on the guarded base, as tier-1's static offset
         // does. Only a sum past 2^32 (which the guest would wrap to low
         // memory) differs: it traps.
-        if offset == 0 && !no_guard() {
+        if offset == 0 && (!no_guard() || self.unguarded()) {
             if let Some((b, c, 2)) = self.value_disp.get(addr.0 as usize).copied().flatten() {
-                return format!("(gex_gb({}) + {c}u)", self.v(b));
+                return if self.unguarded() {
+                    format!("(GEX_P((uint32_t){}) + {c}u)", self.v(b))
+                } else {
+                    format!("(gex_gb({}) + {c}u)", self.v(b))
+                };
             }
         }
         if let Some(c) = self.value_const[addr.0 as usize] {
@@ -662,7 +692,7 @@ impl<'a> Emitter<'a> {
         }
         let a = self.v(addr);
         let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
-        if no_guard() {
+        if no_guard() || self.unguarded() {
             if (0..=max_static).contains(&offset) {
                 return format!("(GEX_P((uint32_t){a}) + {offset}u)");
             }
@@ -687,7 +717,7 @@ impl<'a> Emitter<'a> {
 
     /// The guarded 32-bit address of a bulk operation's operand (no offset).
     fn bulk_address(&self, v: &str) -> String {
-        if no_guard() {
+        if no_guard() || self.unguarded() {
             format!("(uint32_t)({v})")
         } else {
             format!("gex_g({v})")
