@@ -290,3 +290,34 @@ Next, in order:
    computation stays live in gex (0xdd6ba0's early exits).
 4. Vector registers reloaded after calls because partial lane writes read
    the whole register (lane liveness).
+
+## Noita units, measured (stream F, 2026-10-03)
+
+merge/fjit @ 5b559302 (abi9 ea470321 merged), every unit rebuilt under the
+current key into a private cache (`build-units.sh`: cgen-prefix 28 min,
+the eight Noita images about 50 min). Start-up check: R's
+`bisect-ntdll.sh` (ntdll unit + hello32 --cgen) prints its line;
+`tests/nt/cgen-prefix.sh` 50/50.
+
+R's parity recipe: null display, `GEX_NT_TIME_SCALE=4`, cores 4 and 10,
+world fps the slope of `peek` in 120 s windows after world-up:
+
+| build | world fps (steady) | world-up |
+|---|---|---|
+| pewasm `out/noita/build` | 76.2, 83.9 | 27 s |
+| gex units + providers (default) | 25.1, 25.5, 24.0 (830-1150 s) | 590 s |
+| gex units, `GEX_PROVIDERS=0` | 13.5, 13.7, 13.5 (790-1150 s) | 433 s |
+| gex tier-1 (earlier, PPM display) | 15.5-16.8 | 559 s |
+
+By module (units + providers, CPU 700-1150 s, `tools/modattr.py`): units
+48.2%, host 23.5%, tier-1 17.6%, other wasm 10.8%. noita.exe 54.7%
+(f_724580 alone 10.7%), msvcr120 4.6%, Wine core about 5%, libc 13.9%
+(`sched_yield` 7.1%: idle workers spinning in Noita's own yield loops; a
+memcpy-family symbol, mis-named `_dl_mcount_wrapper`, 4.6%), gexc 7.6%
+(NT syscalls), Mesa 1.6%. The 10.8% of other wasm is the ftab runtime
+module's `bridge` (6.0%) and its neighbour (4.2%): tier-1 calling into
+units. Tier-1's 17.6% is interior blocks of functions units hold
+(noita.exe 0x72a5c6.., 0x88c863.., msvcr120 0x15d489c..) -- frames that
+resumed in tier-1 after a leave; nest exits ran at 2.3 G over the run.
+So about 28% of the time is tier-1 plus tier switching, which is R's
+(leaves, resume, call-out), and 7% is the guest's spin-yield.
