@@ -93,6 +93,7 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
 /// Build the NT process in place of `place_image`. Returns the pc the main
 /// thread starts at (its registers are already in context slot 0).
 pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, setup: &NtSetup) -> Result<u64> {
+    crate::profile::note_nt(setup, crate::gl::DEVICE.get().is_some());
     let (futexes, pid) = store.data_mut().with_kernel(|k| (Arc::clone(&k.futexes), k.pid));
     let p = Arc::new(nt::Process::new(setup.abi, nt::thread::nt_pid(pid), setup.cfg.clone(), clocks(), futexes));
     let req = nt::boot::BootRequest { exe_path: &setup.exe_path, args: &setup.args };
