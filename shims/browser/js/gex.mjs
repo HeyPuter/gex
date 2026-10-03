@@ -2428,9 +2428,14 @@ export class Gex {
   #cgenInstall(u, base) {
     const e = this.#shim.exports;
     const st = this.#cgenStore();
-    const key = this.#cgenStr(e.gex_cgen_key, u);
-    const mod = this.#cgenModule(key);
-    const tables = this.#growTables(e.gex_cgen_slots(u) >>> 0, 'cgen');
+    // An export provider's module (`PROVIDER | number`, cgen.rs) installs as
+    // a unit does, from its file in the unit cache.
+    const prov = u >= 0x80000000 ? u - 0x80000000 : -1;
+    const mod = prov >= 0
+      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
+      : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
+    const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c) : (b, c) => e.gex_cgen_regs(u, b, c);
+    const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
     const inst = new WebAssembly.Instance(mod, {
       env: {
         memory: this.#memory,
@@ -2443,11 +2448,11 @@ export class Gex {
       },
       gex: { ...this.#imports, lookup: st.lookup },
     });
-    const n = e.gex_cgen_regs(u, 0, 0) >>> 0;
+    const n = regsOf(0, 0) >>> 0;
     const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
     let regs;
     try {
-      e.gex_cgen_regs(u, buf, n);
+      regsOf(buf, n);
       regs = new Uint32Array(this.#memory.buffer.slice(buf, buf + 4 * n));
     } finally {
       e.gex_free?.(buf, 4 * Math.max(1, n));
@@ -2461,6 +2466,45 @@ export class Gex {
     }
     st.instances.push(inst);
     return regs.length / 2;
+  }
+
+  /** A module file from the unit cache (an export provider's), compiled
+   *  once per process and offered to the siblings. Synchronous. */
+  #cgenFileModule(file, bytes = null) {
+    const name = `cgenfile:${file}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    bytes ??= this.#env.loadFile?.(file) ?? null;
+    if (!bytes) throw new Error(`gex-cgen: ${file} was published but cannot be loaded here`);
+    mod = new WebAssembly.Module(bytes);
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
+  }
+
+  /** Bind unit `u`'s export providers (§9.9), after the unit, whether or
+   *  not it had one: each provider's module from the unit cache, published
+   *  by the shim at its exports' addresses. */
+  #cgenProviders(u) {
+    const e = this.#shim.exports;
+    const n = e.gex_cgen_provider_count?.(u) >>> 0;
+    for (let i = 0; i < n; i++) {
+      const file = this.#cgenStr((uu, b, c) => e.gex_cgen_provider_file(uu, i, b, c), u);
+      const bytes = this.#env.loadFile?.(file) ?? null;
+      if (!bytes) {
+        console.error(`gex-cgen: no provider module ${file} in the unit cache (build it natively: a run of the program, or gexc cgen-prefix)`);
+        continue;
+      }
+      const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      this.#cgenFileModule(file, b);
+      const gp = e.gex_alloc(Math.max(8, b.byteLength)) >>> 0;
+      this.#bytes().set(b, gp);
+      const number = e.gex_cgen_provider_publish(u, i, gp, b.byteLength);
+      e.gex_free?.(gp, Math.max(8, b.byteLength));
+      if (number < 0) continue;
+      this.#cgenCatchUp();
+      e.gex_cgen_pmod_installed(number);
+    }
   }
 
   /** Replay the function table's log this Worker has not seen: installs,
@@ -2496,6 +2540,7 @@ export class Gex {
       const got = this.#env.loadUnit?.(key) ?? null;
       if (!got) {
         if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
+        this.#cgenProviders(u);
         continue;
       }
       this.#cgenModule(key, got);
@@ -2507,6 +2552,7 @@ export class Gex {
       if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
       this.#cgenCatchUp();
       e.gex_cgen_installed(u);
+      this.#cgenProviders(u);
       console.error(`gex-nt: function tier for ${path}: ${ent.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     }
     this.#cgenCatchUp();

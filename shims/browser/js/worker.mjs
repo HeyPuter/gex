@@ -348,26 +348,28 @@ async function handle(msg) {
     // with a synchronous request -- allowed in a Worker, and what lets the
     // nested callback loop install one too. Null when there is none.
     loadUnit(key) {
+      const wasm = this.loadFile(`${key}/c.wasm`);
+      const entries = wasm && this.loadFile(`${key}/c.entries`);
+      return wasm && entries ? { wasm, entries } : null;
+    }
+    // Any file of the unit cache by its relative path (an export
+    // provider's module: `providers/<name>-<fingerprint>.wasm`), or null.
+    loadFile(rel) {
       const c = msg.cgen;
       if (!c) return null;
-      const read = (name) => {
-        try {
-          if (c.root) {
-            const fs = globalThis.process?.getBuiltinModule?.('node:fs');
-            return fs ? fs.readFileSync(`${c.root}/${key}/${name}`) : null;
-          }
-          const x = new XMLHttpRequest();
-          x.open('GET', `${c.url}/${key}/${name}`, false);
-          x.responseType = 'arraybuffer';
-          x.send();
-          return x.status === 200 ? new Uint8Array(x.response) : null;
-        } catch {
-          return null;
+      try {
+        if (c.root) {
+          const fs = globalThis.process?.getBuiltinModule?.('node:fs');
+          return fs ? new Uint8Array(fs.readFileSync(`${c.root}/${rel}`)) : null;
         }
-      };
-      const wasm = read('c.wasm');
-      const entries = wasm && read('c.entries');
-      return wasm && entries ? { wasm, entries } : null;
+        const x = new XMLHttpRequest();
+        x.open('GET', `${c.url}/${rel}`, false);
+        x.responseType = 'arraybuffer';
+        x.send();
+        return x.status === 200 ? new Uint8Array(x.response) : null;
+      } catch {
+        return null;
+      }
     }
   }
 

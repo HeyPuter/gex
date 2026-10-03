@@ -65,7 +65,34 @@ struct Unit {
     dirs: Vec<(u64, u32)>,
     /// What the dispatch table must hold.
     slots: u64,
+    /// The image's export providers (`gex_cgen::provider`, §9.9): each one's
+    /// module file under the unit cache and the (C function, guest address)
+    /// pairs it binds. Bound after the unit, whether or not it has one.
+    providers: Vec<Provided>,
 }
+
+/// One export provider for a placed image.
+struct Provided {
+    /// `providers/<name>-<fingerprint>.wasm`, as `provider::build` names it.
+    file: String,
+    binds: Vec<(String, u64)>,
+}
+
+/// Provider modules published, by number (the module id an install names
+/// is `PROVIDER | number`): the file JS loads, the bridges every Worker
+/// writes and the pages the publisher numbered (as a unit's).
+struct ProviderModule {
+    file: String,
+    regs: Vec<u32>,
+    dirs: Vec<(u64, u32)>,
+    slots: u64,
+}
+
+static PROVIDERS: Mutex<Vec<ProviderModule>> = Mutex::new(Vec::new());
+
+/// Module ids at and above this are providers' (`PROVIDERS`), below
+/// it units (`UNITS`).
+const PROVIDER: u32 = 1 << 31;
 
 static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
 /// Units waiting for their bytes, oldest first (indices into `UNITS`).
@@ -144,7 +171,7 @@ pub(crate) fn drain() -> bool {
     if let Some(p) = pending.first() {
         if TRAMPOLINES.set(()).is_ok() {
             let (image, _) = gex_kernel::nt::boot::trampoline_input(!p.pe.is64);
-            place(&image, "[the NT trampolines]", image.bias, true);
+            place(&image, "[the NT trampolines]", image.bias, true, None);
         }
     }
     for p in pending {
@@ -156,7 +183,7 @@ pub(crate) fn drain() -> bool {
             }
         };
         let wine = is_wine(&p.path);
-        place(&image, &p.path, p.base, wine);
+        place(&image, &p.path, p.base, wine, Some(&p.pe));
     }
     !lock(&WANTED).is_empty()
 }
@@ -165,7 +192,7 @@ pub(crate) fn drain() -> bool {
 /// the mapped code is what the unit was built from (a mismatch ends the run,
 /// as natively: a unit over different code is wrong code). `optional`: a
 /// missing unit is fine even under `--cgen` (Wine's DLLs, the trampolines).
-fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool) {
+fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Option<&gex_ld::pe::PeImage>) {
     let memory = crate::guest_bytes();
     let mut pages = Vec::new();
     for seg in image.segments.iter().filter(|s| s.executable) {
@@ -186,7 +213,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool) {
             pages.push((page, page_hash(memory, page)));
         }
     }
-    let key = gex_cgen::image::image_key(image);
+    let (key, providers) = unit_key(image, pe, base);
     let mut units = lock(&UNITS);
     units.push(Unit {
         key,
@@ -197,8 +224,51 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool) {
         regs: Vec::new(),
         dirs: Vec::new(),
         slots: 0,
+        providers,
     });
     lock(&WANTED).push_back(units.len() - 1);
+}
+
+/// The key of the unit for `image` (the native host's `nt_cgen::unit_key`:
+/// the image's key, extended by its export providers' stubs and sources),
+/// and those providers. *Deviation:* no indirect-call profile (`icall_hints`
+/// natively reads `<cache>/icall/`; the page has no such file), so an image
+/// built with one is looked up under a key the build did not use.
+fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) -> (String, Vec<Provided>) {
+    use std::hash::{Hash, Hasher};
+    let mut key = gex_cgen::image::image_key(image);
+    let Some(pe) = pe else { return (key, Vec::new()) };
+    let providers = gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64);
+    if providers.is_empty() {
+        return (key, Vec::new());
+    }
+    let mut exports = std::collections::HashMap::new();
+    for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+        for n in &e.names {
+            exports.insert(n.clone(), e.rva);
+        }
+    }
+    let stubs = gex_cgen::provider::stubs(&providers, &exports, base);
+    if !stubs.is_empty() {
+        // As natively `stubs.hash(h)`: a slice's length is a `usize`, eight
+        // bytes there, so it is written as a u64 here.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u64(stubs.len() as u64);
+        for a in &stubs {
+            a.hash(&mut h);
+        }
+        gex_cgen::provider::fingerprint(&providers).hash(&mut h);
+        key = format!("{key}-p{:016x}", h.finish());
+    }
+    let provided = providers
+        .iter()
+        .map(|p| Provided {
+            file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
+            binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), base + rva as u64))).collect(),
+        })
+        .filter(|p| !p.binds.is_empty())
+        .collect();
+    (key, provided)
 }
 
 /// The oldest unit waiting for its bytes, or -1.
@@ -265,10 +335,42 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    let (regs, dirs, nslots) = crate::with_host(|h| {
+    let (regs, dirs, nslots) = bridges(&addrs);
+    {
+        let mut units = lock(&UNITS);
+        let Some(x) = units.get_mut(u as usize) else {
+            crate::warn_line(&format!("gex-cgen: no unit {u} to publish\n"));
+            return -1;
+        };
+        x.regs = regs;
+        x.dirs = dirs;
+        x.slots = nslots;
+        let mut pages = lock(&UNIT_PAGES);
+        let map = pages.get_or_insert_with(Default::default);
+        let mem = crate::guest_bytes();
+        for &(page, hash) in &x.pages {
+            map.insert(page, hash);
+            let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
+            if let Some(b) = mem.get_mut(off) {
+                *b &= !(1 << (page % 8));
+            }
+        }
+    }
+    lock(&WANTED).retain(|&w| w != u as usize);
+    lock(&PUBLISHED).push(u as usize);
+    0
+}
+
+/// The bridges that make `addrs` reachable from tier-1: each address's
+/// dispatch slot (numbering its page if it has none) as `[table, slot]`,
+/// flattened for JS (a dense slot gets an index of its own in `blocks`,
+/// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
+/// dispatch table must hold.
+fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
+    crate::with_host(|h| {
         let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         let mut new_pages = Vec::new();
-        for &a in &addrs {
+        for &a in addrs {
             let page = a / gex_abi::DISPATCH_PAGE;
             if page >= gex_abi::DISPATCH_MAX_PAGES {
                 continue;
@@ -300,30 +402,106 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
         }
         h.jit.translated.extend(addrs.iter().copied());
         (regs, new_pages, h.jit.page_table.slots())
-    });
-    {
-        let mut units = lock(&UNITS);
-        let Some(x) = units.get_mut(u as usize) else {
-            crate::warn_line(&format!("gex-cgen: no unit {u} to publish\n"));
+    })
+}
+
+/// How many export providers unit `u`'s image has.
+#[no_mangle]
+pub extern "C" fn gex_cgen_provider_count(u: u32) -> u32 {
+    lock(&UNITS).get(u as usize).map_or(0, |x| x.providers.len() as u32)
+}
+
+/// Provider `i` of unit `u`: its module's file under the unit cache.
+#[no_mangle]
+pub extern "C" fn gex_cgen_provider_file(u: u32, i: u32, buf: u32, cap: u32) -> u32 {
+    let units = lock(&UNITS);
+    units.get(u as usize).and_then(|x| x.providers.get(i as usize)).map_or(0, |p| put_str(&p.file, buf, cap))
+}
+
+/// Bind provider `i` of unit `u`, whose module is the `len` bytes at `ptr`,
+/// at its exports' addresses, after the unit (as the native
+/// `install_providers`): a range of the function table filled by its
+/// element segment, the addresses mapped to the slots holding the C
+/// functions bound to them, and bridges from tier-1. Returns the
+/// provider's module number (an install names `PROVIDER | number`), or -1.
+#[no_mangle]
+pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) -> i32 {
+    let (file, binds) = {
+        let units = lock(&UNITS);
+        let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
+        (p.file.clone(), p.binds.clone())
+    };
+    let wasm = &crate::guest_bytes()[ptr as usize..(ptr + len) as usize];
+    let names = match gex_cgen::provider::slot_names(wasm) {
+        Ok(n) => n,
+        Err(e) => {
+            crate::warn_line(&format!("gex-cgen: provider {file}: {e}\n"));
             return -1;
-        };
-        x.regs = regs;
-        x.dirs = dirs;
-        x.slots = nslots;
-        let mut pages = lock(&UNIT_PAGES);
-        let map = pages.get_or_insert_with(Default::default);
+        }
+    };
+    let pairs: Vec<(u64, u32)> = binds
+        .iter()
+        .filter_map(|(f, a)| names.iter().position(|s| s.as_deref() == Some(f.as_str())).map(|k| (*a, k as u32)))
+        .collect();
+    if pairs.is_empty() {
+        return -1;
+    }
+    let number = lock(&PROVIDERS).len() as u32;
+    ftab(|m| m.publish(names.len() as u32, PROVIDER | number, Tier::Unit, &pairs));
+    let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
+    {
         let mem = crate::guest_bytes();
-        for &(page, hash) in &x.pages {
-            map.insert(page, hash);
-            let off = (gex_abi::PATCHED_PAGES + page / 8) as usize;
-            if let Some(b) = mem.get_mut(off) {
-                *b &= !(1 << (page % 8));
-            }
+        for &a in &addrs {
+            gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    lock(&WANTED).retain(|&w| w != u as usize);
-    lock(&PUBLISHED).push(u as usize);
-    0
+    let (regs, dirs, slots) = bridges(&addrs);
+    crate::warn_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
+    lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots });
+    number as i32
+}
+
+/// Provider module `number`'s file, bridges and table need, as for a unit.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_file(number: u32, buf: u32, cap: u32) -> u32 {
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| put_str(&p.file, buf, cap))
+}
+
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_regs(number: u32, buf: u32, cap: u32) -> u32 {
+    let ps = lock(&PROVIDERS);
+    let Some(p) = ps.get(number as usize) else { return 0 };
+    let n = p.regs.len().min(cap as usize);
+    let mut gm = GuestMem::new(crate::guest_bytes());
+    for (i, v) in p.regs[..n].iter().enumerate() {
+        let _ = gm.write_u32(buf as u64 + 4 * i as u64, *v);
+    }
+    p.regs.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_slots(number: u32) -> u32 {
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| p.slots.min(u32::MAX as u64) as u32)
+}
+
+/// The publishing Worker installed provider module `number`: the
+/// directory for the pages its bridges numbered.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_installed(number: u32) {
+    let dirs = lock(&PROVIDERS).get(number as usize).map(|p| p.dirs.clone()).unwrap_or_default();
+    write_dirs(dirs);
+}
+
+fn write_dirs(dirs: Vec<(u64, u32)>) {
+    crate::with_host(|h| {
+        let mut gm = GuestMem::new(crate::guest_bytes());
+        for (page, base) in dirs {
+            if h.jit.page_table.lookup(page) == Some(base) {
+                crate::dense::note_entry(base);
+                let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+            }
+        }
+    });
 }
 
 /// How many units are published: a Worker installs up to this many.
@@ -452,14 +630,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, _ret: i64
 #[no_mangle]
 pub extern "C" fn gex_cgen_installed(u: u32) {
     let dirs = lock(&UNITS).get(u as usize).map(|x| x.dirs.clone()).unwrap_or_default();
-    crate::with_host(|h| {
-        let mut gm = GuestMem::new(crate::guest_bytes());
-        for (page, base) in dirs {
-            if h.jit.page_table.lookup(page) == Some(base) {
-                let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
-            }
-        }
-    });
+    write_dirs(dirs);
 }
 
 static LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
