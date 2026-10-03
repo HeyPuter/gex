@@ -63,7 +63,10 @@ export class Compositor {
         else reject(new Error(m.error));
       };
       this.#worker.addEventListener('message', onMessage);
-      this.#worker.postMessage({ kind: 'gl', channel, ...opts });
+      // `?mesaenv=K=V,K=V`: environment for Mesa in the GL worker
+      // (MESA_DEBUG=incomplete_fbo, say), for finding what it refuses.
+      const mesaEnv = globalThis.location ? new URLSearchParams(location.search).get('mesaenv') : null;
+      this.#worker.postMessage({ kind: 'gl', channel, ...opts, ...(mesaEnv ? { mesaEnv } : {}) });
     });
   }
 

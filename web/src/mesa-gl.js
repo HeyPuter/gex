@@ -307,6 +307,15 @@ export class MesaGlDevice {
       out.#submit = WebAssembly.promising(out.#module.gexGlSubmitRaw);
       if (out.#module._gex_gl_set_api)
         out.#module._gex_gl_set_api(api === 'core' ? 1 : 0, major, minor);
+      // Environment for Mesa (`?mesaenv=`), before the context exists.
+      for (const pair of (options.env || '').split(',').filter(Boolean)) {
+        if (!out.#module._gex_gl_setenv) break;
+        const bytes = new TextEncoder().encode(`${pair}\0`);
+        const at = out.#module._malloc(bytes.length);
+        out.#module.HEAPU8.set(bytes, at);
+        out.#module._gex_gl_setenv(at);
+        out.#module._free(at);
+      }
       const rc = out.#module._gex_gl_init(canvas.width, canvas.height);
       if (rc !== 0) out.#failed = `Mesa/WebGPU initialization failed (${rc})`;
       out.#description = `Mesa st/mesa + gex_wgpu on WebGPU (${api})`;
