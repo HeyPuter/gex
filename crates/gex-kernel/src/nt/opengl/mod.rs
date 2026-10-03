@@ -309,8 +309,53 @@ fn open_device(c: &mut Call<'_>) -> R<()> {
 /// Append one command: `words` of arguments and a `tail` blob (its length
 /// word included by the caller where the protocol has one).
 fn cmd(c: &mut Call<'_>, opcode: u32, words: &[u32], tail: &[u8]) -> R<()> {
+    cmd_with(c, opcode, words, Tail::Bytes(tail))
+}
+
+/// A command whose tail is one length-prefixed blob.
+fn cmd_blob(c: &mut Call<'_>, opcode: u32, words: &[u32], blob: &[u8]) -> R<()> {
+    cmd_with(c, opcode, words, Tail::Blob(blob))
+}
+
+/// [`cmd_blob`] with the blob `n` bytes of guest memory at `addr`, copied
+/// once, straight into the ring (texture and buffer uploads, every frame).
+fn cmd_blob_at(c: &mut Call<'_>, opcode: u32, words: &[u32], addr: u64, n: usize) -> R<()> {
+    cmd_with(c, opcode, words, Tail::Guest(addr, n))
+}
+
+/// What follows a command's argument words.
+#[derive(Clone, Copy)]
+enum Tail<'b> {
+    /// As it is (its own length word, if any, included).
+    Bytes(&'b [u8]),
+    /// A length word, then these bytes.
+    Blob(&'b [u8]),
+    /// A length word, then `n` bytes of guest memory at the address.
+    Guest(u64, usize),
+}
+
+impl Tail<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Tail::Bytes(b) => b.len(),
+            Tail::Blob(b) => 4 + b.len(),
+            Tail::Guest(_, n) => 4 + n,
+        }
+    }
+}
+
+/// Write the command into the ring where it goes: header, words, then the
+/// tail, zero-padded to a word.
+fn cmd_with(c: &mut Call<'_>, opcode: u32, words: &[u32], tail: Tail<'_>) -> R<()> {
     open_device(c)?;
-    let padded = tail.len().div_ceil(4) * 4;
+    // A bad source faults before anything is queued, as reading it first did.
+    if let Tail::Guest(addr, n) = tail {
+        if n > 0 {
+            c.g.m.read(addr, n).map_err(|_| Status(st::ACCESS_VIOLATION))?;
+        }
+    }
+    let tail_len = tail.len();
+    let padded = tail_len.div_ceil(4) * 4;
     let len = 8 + 4 * words.len() + padded;
     if len as u32 > CMD_CAPACITY {
         return Err(c.unimplemented(&format!("a GL command of {len} bytes")));
@@ -326,23 +371,35 @@ fn cmd(c: &mut Call<'_>, opcode: u32, words: &[u32], tail: &[u8]) -> R<()> {
         (s.ring, at)
     };
     let base = ring + HEADER + at as u64;
-    let mut buf = Vec::with_capacity(len);
-    buf.extend_from_slice(&opcode.to_le_bytes());
-    buf.extend_from_slice(&(len as u32).to_le_bytes());
+    let head_len = 8 + 4 * words.len();
+    let mut head = Vec::with_capacity(head_len + 4);
+    head.extend_from_slice(&opcode.to_le_bytes());
+    head.extend_from_slice(&(len as u32).to_le_bytes());
     for w in words {
-        buf.extend_from_slice(&w.to_le_bytes());
+        head.extend_from_slice(&w.to_le_bytes());
     }
-    buf.extend_from_slice(tail);
-    buf.resize(len, 0);
-    c.g.write(base, &buf)
-}
-
-/// A command whose tail is one length-prefixed blob.
-fn cmd_blob(c: &mut Call<'_>, opcode: u32, words: &[u32], blob: &[u8]) -> R<()> {
-    let mut t = Vec::with_capacity(4 + blob.len());
-    t.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-    t.extend_from_slice(blob);
-    cmd(c, opcode, words, &t)
+    match tail {
+        Tail::Bytes(b) => {
+            c.g.write(base, &head)?;
+            c.g.write(base + head_len as u64, b)?;
+        }
+        Tail::Blob(b) => {
+            head.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            c.g.write(base, &head)?;
+            c.g.write(base + head_len as u64 + 4, b)?;
+        }
+        Tail::Guest(addr, n) => {
+            head.extend_from_slice(&(n as u32).to_le_bytes());
+            c.g.write(base, &head)?;
+            if n > 0 {
+                c.g.m.copy_within(addr, base + head_len as u64 + 4, n).map_err(|_| Status(st::ACCESS_VIOLATION))?;
+            }
+        }
+    }
+    if padded > tail_len {
+        c.g.write(base + (head_len + tail_len) as u64, &[0u8; 3][..padded - tail_len])?;
+    }
+    Ok(())
 }
 
 /// Submit what is queued; the reply, if any, follows.
@@ -775,6 +832,11 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
             flush_async(c)?;
             return finish_swap(c, hdc, hwnd);
         }
+    }
+    // A display that drops every frame: run the frame, keep the pixels.
+    if c.p.display().is_some_and(|d| !d.shows_frames()) {
+        flush(c)?;
+        return finish_swap(c, hdc, hwnd);
     }
     // Read from the default framebuffer with default pack state, then put
     // the program's back.
@@ -1995,16 +2057,15 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
         }
         "glBufferData" => {
             let (t, size, data, usage) = (p.u32(c, 1)?, p.isize(c, 2)?, p.ptr(c, 3)?, p.u32(c, 4)?);
-            let bytes = if data != 0 { c.g.bytes(data, size.max(0) as usize)? } else { Vec::new() };
+            let n = if data != 0 { size.max(0) as usize } else { 0 };
             let [lo, hi] = proto::Batch::words64(size.max(0) as u64);
-            cmd_blob(c, op::BUFFER_DATA, &[t, usage, lo, hi, (data != 0) as u32], &bytes)?;
+            cmd_blob_at(c, op::BUFFER_DATA, &[t, usage, lo, hi, (data != 0) as u32], data, n)?;
         }
         "glBufferSubData" => {
             let (t, off, size, data) = (p.u32(c, 1)?, p.isize(c, 2)?, p.isize(c, 3)?, p.ptr(c, 4)?);
-            let bytes = c.g.bytes(data, size.max(0) as usize)?;
             let [ol, oh] = proto::Batch::words64(off.max(0) as u64);
             let [sl, sh] = proto::Batch::words64(size.max(0) as u64);
-            cmd_blob(c, op::BUFFER_SUB_DATA, &[t, ol, oh, sl, sh], &bytes)?;
+            cmd_blob_at(c, op::BUFFER_SUB_DATA, &[t, ol, oh, sl, sh], data, size.max(0) as usize)?;
         }
 
         // --- textures
@@ -2025,20 +2086,20 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
                 (v[4] as i32, v[5] as i32, v[6], v[7])
             };
             let unpack = c.p.gl.lock().unwrap().unpack;
-            let data = if pixels != 0 {
+            let n = if pixels != 0 {
                 let Some(n) = transfer_bytes(format, ty, w, h, unpack) else {
                     return Err(c.unimplemented(&format!("{name} with format {format:#x} type {ty:#x}")));
                 };
-                c.g.bytes(pixels, n)?
+                n
             } else {
-                Vec::new()
+                0
             };
             let mut words = v.clone();
             // { pbo, pointer:u64 } then the blob; the pointer only says
             // whether there was one.
             words.extend_from_slice(&[0, (pixels != 0) as u32, 0]);
             let opcode = if name == "glTexImage2D" { op::TEX_IMAGE_2D } else { op::TEX_SUB_IMAGE_2D };
-            cmd_blob(c, opcode, &words, &data)?;
+            cmd_blob_at(c, opcode, &words, pixels, n)?;
         }
 
         // --- framebuffers
