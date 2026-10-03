@@ -18,6 +18,9 @@ pub struct RunFlags {
     pub jit_fallback: bool,
     pub trace: bool,
     pub verbose: bool,
+    /// Where a Windows program's frames go (`--wayland-out`: a PPM prefix,
+    /// or `null`).
+    pub display: Option<String>,
 }
 
 /// The runtime's view of a built project.
@@ -56,6 +59,9 @@ pub fn aot(dir: &Path, manifest: &BuildManifest) -> Aot {
 }
 
 pub fn run(dir: &Path, flags: &RunFlags) -> Result<Exit> {
+    if crate::pe::nt_session(dir)?.is_some() {
+        return crate::pe::run(dir, flags);
+    }
     let project = Project::load(dir)?;
     if project.isa != gex_abi::ARCH_NAME {
         bail!("the project is for {} guests and this gexc runs {} guests", project.isa, gex_abi::ARCH_NAME);

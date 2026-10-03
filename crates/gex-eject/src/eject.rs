@@ -161,10 +161,16 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             gex_abi::ARCH_NAME
         );
     }
-    let first = session
-        .programs
-        .first()
-        .ok_or_else(|| anyhow!("the session ran no program"))?;
+    // A Windows program's run is one process whose program is the NT
+    // layer's (docs/eject-pe.md).
+    let nt = session.nt.as_ref();
+    let (exe, argv) = match nt {
+        Some(n) => (n.exe.clone(), std::iter::once(n.exe.clone()).chain(n.args.iter().cloned()).collect::<Vec<_>>()),
+        None => {
+            let first = session.programs.first().ok_or_else(|| anyhow!("the session ran no program"))?;
+            (first.exe.clone(), session.argv.clone())
+        }
+    };
     let sysroot = session.sysroot.as_deref();
 
     let kept_user = prepare(out)?;
@@ -201,15 +207,12 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
         objects.push(Object {
             id,
             path: ob.path.clone(),
-            role: ob.role.clone(),
+            role: if nt.is_some() && ob.path == exe { "exe".into() } else { ob.role.clone() },
             size: bytes.len() as u64,
         });
     }
-    if !objects.iter().any(|x| x.path == first.exe) {
-        bail!(
-            "the session's program {} is not among its objects (was it recorded under `anon`?)",
-            first.exe
-        );
+    if !objects.iter().any(|x| x.path == exe) {
+        bail!("the session's program {exe} is not among its objects (was it recorded under `anon`?)");
     }
 
     // The files it read. Created and write-only files are its output; failed
@@ -217,7 +220,20 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     let mut files = Vec::new();
     let mut dirs = std::collections::BTreeSet::new();
     let (mut missing, mut outputs) = (Vec::new(), Vec::new());
-    for f in session.files.values() {
+    // A Windows program's prefix: the build writes its own image layout, and
+    // the NT layer checks the prefix's Wine version.
+    let mut nt_files: Vec<gex_xlate::profile::FileEntry> = Vec::new();
+    if let Some(n) = nt {
+        let v = format!("{}/.wine-version", n.prefix);
+        if !session.files.contains_key(&v) {
+            nt_files.push(gex_xlate::profile::FileEntry { path: v, read: true, ok: 1, ..Default::default() });
+        }
+    }
+    let layout_file = nt.map(|n| format!("{}/{}", n.prefix, gex_kernel::nt::section::LAYOUT_FILE));
+    for f in session.files.values().chain(nt_files.iter()) {
+        if layout_file.as_deref() == Some(f.path.as_str()) {
+            continue;
+        }
         if !f.path.starts_with('/') {
             // `<fd N>/name`: relative to a directory nobody could name.
             bail!("the session opened {:?}, relative to a directory with no known path", f.path);
@@ -296,8 +312,8 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     let project = Project {
         isa: session.isa.clone(),
         program: Program {
-            exe: first.exe.clone(),
-            argv: session.argv.clone(),
+            exe: exe.clone(),
+            argv,
             env: session.env.clone(),
             cwd: session.cwd.clone(),
         },
