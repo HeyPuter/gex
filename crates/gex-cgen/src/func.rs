@@ -194,6 +194,8 @@ pub struct FnStats {
     pub calls_indirect: usize,
     /// Known calls whose callee is trap-free (liveness-limited write-back).
     pub calls_trapfree: usize,
+    /// Calls with the minimal write-back (`minimal_writeback`).
+    pub calls_minimal: usize,
     pub tail_known: usize,
     pub switches: usize,
     pub loops_outlined: usize,
@@ -210,6 +212,7 @@ impl FnStats {
         self.calls_known += o.calls_known;
         self.calls_indirect += o.calls_indirect;
         self.calls_trapfree += o.calls_trapfree;
+        self.calls_minimal += o.calls_minimal;
         self.tail_known += o.tail_known;
         self.switches += o.switches;
         self.loops_outlined += o.loops_outlined;
@@ -730,6 +733,13 @@ impl FnUnit {
                 // or resumes from can happen before it returns. Otherwise
                 // every dirty register is written back, so the context is
                 // what tier-1's would be wherever the host looks.
+                // `minimal_writeback`: a callee in this unit whose summary is
+                // complete and that cannot reach the kernel or unwind gets
+                // only its inputs and the continuation's live registers it
+                // may change; the live registers it never writes (preserved
+                // and not read: saving one reads it) stay dirty in locals,
+                // and are written back on the leave path (`leave_wb`).
+                let mut leave_wb = RegSet::EMPTY;
                 let need = match (callee, ret) {
                     (Callee::Direct(t), Some(r)) if known.contains(t) => match sums.get(t) {
                         Some(sm) => {
@@ -737,6 +747,16 @@ impl FnUnit {
                             if trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
                                 self.stats.calls_trapfree += 1;
                                 n
+                            } else if self.ftab
+                                && minimal_writeback()
+                                && !sm.may_unwind
+                                && !sm.may_leave_pending
+                                && !sm.unknown_callee
+                            {
+                                self.stats.calls_minimal += 1;
+                                let kept = sm.preserved.minus(sm.inputs).minus(RegSet::of(&[sp_reg()]));
+                                leave_wb = live[r.to.index()].inter(kept);
+                                n.minus(leave_wb)
                             } else {
                                 n.union(non_flags())
                             }
@@ -748,6 +768,9 @@ impl FnUnit {
                     _ if flags_abi() => non_flags(),
                     _ => RegSet::ALL,
                 };
+                // Dirty registers the callee never writes stay dirty across
+                // it (they are not reloaded: preserved).
+                let carried = e.dirty_set().inter(leave_wb);
                 e.flush_live(need);
                 // What the callee must hand back: the flags only if the
                 // continuation reads one; everything when there is no
@@ -777,11 +800,21 @@ impl FnUnit {
                             reload_all(e);
                             e.line("  } else");
                         }
-                        e.line(format!(
-                            "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
-                            body_name(*t),
-                            self.weight
-                        ));
+                        if leave_wb.is_empty() {
+                            e.line(format!(
+                                "  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
+                                body_name(*t),
+                                self.weight
+                            ));
+                        } else {
+                            // It left: the registers it never writes are
+                            // ours, still in locals; tier-1 (or this body's
+                            // resume) needs them in the context.
+                            e.line(format!("  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {{", body_name(*t), self.weight));
+                            e.flush_keep_live(leave_wb);
+                            e.line(format!("    {fail}"));
+                            e.line("  }");
+                        }
                     }
                     Callee::Direct(t) if self.ftab => {
                         *self.stats.leaves.entry(*t).or_default() += 1;
@@ -856,6 +889,7 @@ impl FnUnit {
                     (_, Some(p)) => e.invalidate_except(p),
                     _ => e.invalidate(),
                 }
+                e.mark_dirty(carried);
                 match ret {
                     Some(edge) => goto(e, edge),
                     // Believed not to return, and it did: leave to the
@@ -1359,6 +1393,18 @@ pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
 pub fn flags_abi() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| gex_abi::X86 && live_writebacks() && std::env::var("GEX_CGEN_FLAGS_ABI").as_deref() != Ok("0"))
+}
+
+/// The whole-image units' write-back at calls to a summarised callee that
+/// cannot reach the kernel, unwind or leave pending (`FnUnit::add`): what
+/// it reads, and what the continuation reads that it may change, as
+/// pewasm does. A trap inside it (a memory fault: SEH) sees the caller's
+/// other registers as they were at the last write-back; the compilers'
+/// handlers reload callee-saved registers from their frames, not from the
+/// faulting context. `GEX_CGEN_WB=all` writes back every dirty register.
+pub fn minimal_writeback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| live_writebacks() && std::env::var("GEX_CGEN_WB").as_deref() != Ok("all"))
 }
 
 pub fn non_flags() -> RegSet {
