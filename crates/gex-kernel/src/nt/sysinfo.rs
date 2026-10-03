@@ -31,6 +31,7 @@ pub const QPC_FREQUENCY: u64 = 10_000_000;
 /// CMPXCHG16B, no SSE4, no AVX, no XSAVE); indices are winnt.h's `PF_*`.
 const FEATURES: &[usize] = &[
     2,  // PF_COMPARE_EXCHANGE_DOUBLE
+    3,  // PF_MMX_INSTRUCTIONS_AVAILABLE
     6,  // PF_XMMI_INSTRUCTIONS_AVAILABLE
     8,  // PF_RDTSC_INSTRUCTION_AVAILABLE
     10, // PF_XMMI64_INSTRUCTIONS_AVAILABLE
@@ -195,10 +196,9 @@ fn query_system(c: &mut Call<'_>, class: u32, buf: u64, len: u64, ret: u64) -> R
             c.g.w16(buf + 2, 6)?;
             c.g.w16(buf + 4, 0x0f0b)?;
             c.g.w16(buf + 6, PROCESSORS as u16)?;
-            // CPU_FEATURE_*: VME TSC CMOV PGE PSE MTRR CX8 X86 PAT FXSR SEP
-            // SSE 3DNOW SSE2 SSE3 CX128 NX SSSE3 (no MMX: `cpuid` does not
-            // claim it).
-            let bits: u32 = 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x400 | 0x800 | 0x1000
+            // CPU_FEATURE_*: VME TSC CMOV PGE PSE MTRR CX8 MMX X86 PAT FXSR
+            // SEP SSE 3DNOW SSE2 SSE3 CX128 NX SSSE3.
+            let bits: u32 = 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x400 | 0x800 | 0x1000
                 | 0x2000 | 0x4000 | 0x1_0000 | 0x2_0000 | 0x8_0000 | 0x20_0000 | 0x100_0000;
             c.g.w32(buf + 8, bits)?;
             12
