@@ -6,7 +6,13 @@
 // the page's own X server (Xwayland as wasm, `hostx=1`).
 //
 //   node tests/games/browser-halflife.mjs [--map c1a0] [--shot DIR]
-//        [--minutes N] [--measure S] [--keep]
+//        [--minutes N] [--measure S] [--keep] [--hl-args ARGS]
+//        [--overlay DIR --exe PATH [--exe-args ARGS] --want RE]
+//
+// --overlay: a directory bundled at / over the game's bundle and --exe run
+// from it instead of hl_linux, with the game's libraries and environment
+// (tests/games/src/sdl-fbo-blit.c: Half-Life's present path alone); --want
+// is what its output must show.
 //
 // Needs: the Steam install (HL_DIR, default ~/.steam/steam/steamapps/common/
 // Half-Life), guest/gl built for i386 (GEX_GL_I386, guest/gl/build.sh with
@@ -34,6 +40,9 @@ const shotDir = opt('--shot', null);
 const minutes = Number(opt('--minutes', 40));
 const measure = Number(opt('--measure', 60));
 const keep = argv.includes('--keep');
+const overlayDir = opt('--overlay', null);
+const exe = opt('--exe', '/hl/hl_linux');
+const want = opt('--want', null);
 const env = (k, d) => process.env[k] || d;
 const HL = env('HL_DIR', join(process.env.HOME, '.steam/steam/steamapps/common/Half-Life'));
 const GL = env('GEX_GL_I386', join(ROOT, 'guest/gl/out-i386'));
@@ -75,6 +84,12 @@ async function main() {
     if (!existsSync(join(WEB, 'public/gex', f))) throw new Error(`no web/public/gex/${f}`);
   }
   const tar = bundle();
+  let overlay = '';
+  if (overlayDir) {
+    const out = join(WEB, 'public/gex/nt/overlay.tar');
+    execFileSync('tar', ['-chf', out, '-C', overlayDir, '.']);
+    overlay = ',/gex/nt/overlay.tar';
+  }
   const t0 = Date.now();
   const genv = [
     'LD_LIBRARY_PATH=/gex/steam:/gex/gl:/hl:/gex/fallback:/usr/lib32',
@@ -83,14 +98,16 @@ async function main() {
     ...(process.env.GEX_HL_PAGE_ENV ? [process.env.GEX_HL_PAGE_ENV] : []),
   ].join(',');
   // No joystick: SDL's udev hotplug path is for devices a page has none of.
-  const args = `-novid -nojoy ${opt('--hl-args', '')} +map ${map}`;
+  const args = overlayDir ? opt('--exe-args', '')
+    : `-novid -nojoy ${opt('--hl-args', '')} +map ${map}`;
   const { browser, page, evaluate, state, shot, consoleLines } = await openPage(
-    `tar=/gex/nt/${tar.split('/').pop()}&exe=/hl/hl_linux&cwd=/hl&gl=1&glbackend=wgpu&hostx=1`
+    `tar=/gex/nt/${tar.split('/').pop()}${overlay}&exe=${exe}&cwd=/hl&gl=1&glbackend=wgpu&hostx=1`
+      + (process.env.GEX_GLCAPTURE ? `&glcapture=${process.env.GEX_GLCAPTURE}` : '')
       + (process.env.GEX_MESA_ENV ? `&mesaenv=${encodeURIComponent(process.env.GEX_MESA_ENV)}` : '')
       + `&size=800x600&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(args)}`,
     { width: 820, height: 700, shotDir },
   );
-  void browser; void page;
+  void page;
   // Frames: the compositor's GL presents (describe().gl counts them).
   const presents = async () => {
     const gl = (await evaluate('globalThis.__gexCompositor?.describe()', true))?.gl ?? '';
@@ -103,6 +120,12 @@ async function main() {
   let nextShot = Date.now() + 30000;
   for (;;) {
     const s = await state();
+    // A program that prints its answer and exits (sdl-fbo-blit info).
+    if (s?.phase === 'done' && want && new RegExp(want).test(s.out)) {
+      if (opt('--out', null)) writeFileSync(opt('--out', null), s.out);
+      console.log(`ok   ${exe}: ${want} (exited ${s.status})`);
+      break;
+    }
     if (s?.phase === 'failed' || s?.phase === 'done') {
       log(`output: ${s.out.slice(-3000)}`);
       throw new Error(`Half-Life stopped (${s.phase}, status ${s.status}) ${s.error ?? ''}`);
@@ -111,6 +134,10 @@ async function main() {
     if (threw) throw new Error(`a thread died: ${threw.slice(0, 600)}`);
     const out = s?.out ?? '';
     const n = await presents();
+    if (want && !up && new RegExp(want).test(out)) {
+      up = { t: Date.now(), n };
+      console.log(`ok   ${exe}: ${want} (presents ${n})`);
+    }
     if (!up && /Unknown command: VModEnable|loaded map|Loading map/.test(out)) {
       up = { t: Date.now(), n };
       console.log(`ok   ${map} is loaded ${((up.t - t0) / 1000).toFixed(0)} s after the page opened (presents ${n})`);
@@ -119,12 +146,19 @@ async function main() {
       nextShot += 30000;
       await shot(`t${String(++shots).padStart(3, '0')}`);
       log(`${((Date.now() - t0) / 1000).toFixed(0)} s: presents ${n}; ${out.slice(-160).replace(/\n/g, ' | ')}`);
+      // Each guest thread is a Worker with its own dispatch tables, all in
+      // the renderer's one V8 heap cage: the count is what an OOM is about.
+      const { targetInfos } = await browser.send('Target.getTargets', {}).catch(() => ({ targetInfos: [] }));
+      log(`workers ${targetInfos.filter((t) => /worker/.test(t.type)).length}`);
       const d = await evaluate('globalThis.__gexCompositor?.describe()', true);
       if (d) log(`compositor: frames ${d.frames}, windows ${d.windows}, lit ${d.lit}, ${JSON.stringify(d.list)}, gl ${d.gl}`);
     }
     if (up && Date.now() - up.t >= measure * 1000) {
       const n2 = await presents();
       await shot('map');
+      // --out FILE: the program's whole output, for a run that prints its
+      // answer (sdl-fbo-blit info) rather than draws it.
+      if (opt('--out', null)) writeFileSync(opt('--out', null), (await state())?.out ?? '');
       const secs = (Date.now() - up.t) / 1000;
       console.log(`ok   ${map}: ${n2 !== null && up.n !== null ? ((n2 - up.n) / secs).toFixed(1) : '?'} frames/s over ${secs.toFixed(0)} s`);
       break;
