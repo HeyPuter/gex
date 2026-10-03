@@ -17,6 +17,7 @@ pub mod bitmap;
 pub mod blit;
 pub mod d3dkmt;
 pub mod dc;
+pub mod font;
 pub mod region;
 pub mod surface;
 
@@ -340,6 +341,13 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtGdiOffsetClipRgn => region::nt_gdi_offset_clip_rgn(c),
         n::NtGdiGetRandomRgn => region::nt_gdi_get_random_rgn(c),
         n::NtGdiFillRgn => region::nt_gdi_fill_rgn(c),
+        n::NtGdiGetTextExtentExW => font::nt_gdi_get_text_extent_ex_w(c),
+        n::NtGdiGetTextMetricsW => font::nt_gdi_get_text_metrics_w(c),
+        n::NtGdiGetTextFaceW => font::nt_gdi_get_text_face_w(c),
+        n::NtGdiGetCharWidthW => font::nt_gdi_get_char_width_w(c),
+        n::NtGdiGetCharABCWidthsW => font::nt_gdi_get_char_abc_widths_w(c),
+        n::NtGdiGetGlyphIndicesW => font::nt_gdi_get_glyph_indices_w(c),
+        n::NtGdiExtTextOutW => font::nt_gdi_ext_text_out_w(c),
         // The display's gamma ramp: the identity, three 256-entry WORD
         // tables. Setting one is accepted and changes nothing shown.
         n::NtGdiGetDeviceGammaRamp => {
