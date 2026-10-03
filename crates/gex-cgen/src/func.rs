@@ -752,7 +752,14 @@ impl FnUnit {
                 }
                 e.line("default:;");
                 e.line("}");
-                if self.ftab {
+                if self.ftab && local_resume() {
+                    // Anywhere else: on through the function table under
+                    // this function's return contract (as an unresolved
+                    // jump), not a leave.
+                    e.flush();
+                    e.safepoint(&t);
+                    ftab_tail(e, &t, scope.is_some(), self.weight);
+                } else if self.ftab {
                     // Anywhere else: leave for it, and this body itself
                     // catches it first when it is one of its own blocks.
                     e.flush();
