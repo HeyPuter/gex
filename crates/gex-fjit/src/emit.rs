@@ -177,7 +177,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     let regs = cf::registers(f);
     let live = if cf::live_writebacks() { crate::prep::live_in(f, m.sums) } else { vec![RegSet::ALL; n] };
     let dirty: Vec<RegSet> = if cf::clean_spills() {
-        cf::dirty_in(f).iter().map(|d| RegSet::of(&d.iter().copied().collect::<Vec<_>>())).collect()
+        cf::dirty_in(f, &Default::default()).iter().map(|d| RegSet::of(&d.iter().copied().collect::<Vec<_>>())).collect()
     } else {
         vec![RegSet::of(&regs.written.iter().copied().collect::<Vec<_>>()); n]
     };
@@ -471,7 +471,7 @@ fn emit_loop(m: &ModuleCx<'_>, f: &Function, lp: &Loop, live: &[RegSet], stats: 
     let shape = Layout::Structured(Box::new(cfg::make_reducible(Graph { succs, entry: lp.header })?));
     let regs = cf::registers_in(f, &in_loop);
     let dirty: Vec<RegSet> = if cf::clean_spills() {
-        cf::dirty_in_from(f, lp.header, &in_loop)
+        cf::dirty_in_from(f, lp.header, &in_loop, &Default::default())
             .iter()
             .map(|d| RegSet::of(&d.iter().copied().collect::<Vec<_>>()))
             .collect()

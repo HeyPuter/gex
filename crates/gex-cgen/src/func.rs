@@ -255,6 +255,16 @@ pub struct FnUnit {
     resumes: bool,
     /// An i386 program (`set_class32`).
     class32: bool,
+    /// The registers each function's call tree names (`touched`), from the
+    /// recovery; a callee missing here touches everything.
+    pub touched: HashMap<u64, RegSet>,
+    /// For the function being emitted: per block ending in a call with the
+    /// minimal write-back, the live registers its callee never touches,
+    /// which stay dirty in locals across it (`carried`).
+    carry: HashMap<usize, RegSet>,
+    /// The functions that need no depth guard (`guard_free`), from the
+    /// recovery.
+    pub guardfree: HashSet<u64>,
 }
 
 impl Default for FnUnit {
@@ -268,6 +278,38 @@ impl FnUnit {
     pub fn set_class32(&mut self, class32: bool) {
         self.ret_sp_delta = ret_sp_delta(class32);
         self.class32 = class32;
+    }
+
+    /// The calls of `f` that get the minimal write-back, by block: a call to
+    /// a function of this unit whose summary is complete and that cannot
+    /// reach the kernel, unwind or leave pending, and is not trap-free
+    /// (those already have exact write-backs). The value is what the
+    /// caller keeps dirty across it: the continuation's live registers its
+    /// call tree never names (pewasm's A*(g)), PC and SP excepted.
+    fn carried(&self, f: &Function, known: &HashSet<u64>, sums: &HashMap<u64, Summary>, trapfree: &HashMap<u64, u32>) -> HashMap<usize, RegSet> {
+        let mut out = HashMap::new();
+        if !self.ftab || !minimal_writeback() {
+            return out;
+        }
+        for (i, b) in f.blocks.iter().enumerate() {
+            let FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } = &b.term else { continue };
+            if !known.contains(t) || trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
+                continue;
+            }
+            let Some(sm) = sums.get(t) else { continue };
+            let Some(tt) = self.touched.get(t) else { continue };
+            if sm.may_unwind || sm.may_leave_pending || sm.unknown_callee || !wb_bisect() {
+                continue;
+            }
+            let untouched = RegSet::ALL.minus(*tt);
+            let kept = untouched.inter(sm.preserved).minus(RegSet::of(&[sp_reg(), GuestReg::Pc, GuestReg::CtxAddr]));
+            let k = WB_K.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::env::var("GEX_CGEN_WB_SHOW").ok().and_then(|v| v.parse::<u64>().ok()) == Some(k) {
+                eprintln!("[wb] site {k}: {:#x} calls {t:#x}: keeps {:?}", f.entry, self.live[r.to.index()].inter(kept));
+            }
+            out.insert(i, self.live[r.to.index()].inter(kept));
+        }
+        out
     }
 
     pub fn new() -> FnUnit {
@@ -285,6 +327,9 @@ impl FnUnit {
             defined: Vec::new(),
             resumes: false,
             class32: false,
+            touched: HashMap::new(),
+            carry: HashMap::new(),
+            guardfree: HashSet::new(),
         }
     }
 
@@ -359,8 +404,9 @@ impl FnUnit {
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
-        let dirty = if regs.clean_spills { dirty_in(f) } else { Vec::new() };
         self.live = if live_writebacks() { live_in(f, sums) } else { vec![RegSet::ALL; f.blocks.len()] };
+        self.carry = if regs.clean_spills { self.carried(f, known, sums, trapfree) } else { HashMap::new() };
+        let dirty = if regs.clean_spills { dirty_in(f, &self.carry) } else { Vec::new() };
         let used: Vec<GuestReg> = regs.used.iter().copied().collect();
         self.weight = frame_weight(&regs);
         e.func_regs = Some(regs);
@@ -402,7 +448,7 @@ impl FnUnit {
         // A trap-free function has none (its caller may not have written
         // everything back, and it must not leave): its whole subtree fits in
         // the reserve every other function keeps below the budget.
-        if !trapfree.contains_key(&f.entry) {
+        if !trapfree.contains_key(&f.entry) && !(self.guardfree.contains(&f.entry) && !exp("ALLGUARDS")) {
             let _ = writeln!(
                 fhead,
                 "  if (__builtin_expect(depth > {}, 0)) {{ GEX_C64({}u) = 0x{:x}ull; return 0; }}",
@@ -434,7 +480,7 @@ impl FnUnit {
             lregs.clean_spills = clean_spills();
             let lused: Vec<GuestReg> = lregs.used.iter().copied().collect();
             let ldirty = if lregs.clean_spills {
-                dirty_in_from(f, lp.header, &in_loop)
+                dirty_in_from(f, lp.header, &in_loop, &self.carry)
             } else {
                 Vec::new()
             };
@@ -748,15 +794,9 @@ impl FnUnit {
                             if trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
                                 self.stats.calls_trapfree += 1;
                                 n
-                            } else if self.ftab
-                                && minimal_writeback()
-                                && !sm.may_unwind
-                                && !sm.may_leave_pending
-                                && !sm.unknown_callee
-                            {
+                            } else if let Some(c) = self.carry.get(&i) {
                                 self.stats.calls_minimal += 1;
-                                let kept = sm.preserved.minus(sm.inputs).minus(RegSet::of(&[sp_reg()]));
-                                leave_wb = live[r.to.index()].inter(kept);
+                                leave_wb = *c;
                                 n.minus(leave_wb)
                             } else {
                                 n.union(non_flags())
@@ -812,6 +852,9 @@ impl FnUnit {
                             // ours, still in locals; tier-1 (or this body's
                             // resume) needs them in the context.
                             e.line(format!("  if (!{}(ctx, depth + {}, {need_back}, {ret_arg})) {{", body_name(*t), self.weight));
+                            // (The write-back before the call marked
+                            // everything clean.)
+                            e.mark_dirty(carried);
                             e.flush_keep_live(leave_wb);
                             e.line(format!("    {fail}"));
                             e.line("  }");
@@ -1275,13 +1318,15 @@ pub fn clean_spills() -> bool {
 /// a forward may-analysis. A write makes a register dirty; a write-back
 /// followed by a reload (a call, a syscall, a clobbering host call) makes
 /// everything clean; the entry starts clean, having just loaded everything.
-pub fn dirty_in(f: &Function) -> Vec<BTreeSet<GuestReg>> {
-    dirty_in_from(f, 0, &|_| true)
+pub fn dirty_in(f: &Function, carry: &HashMap<usize, RegSet>) -> Vec<BTreeSet<GuestReg>> {
+    dirty_in_from(f, 0, &|_| true, carry)
 }
 
 /// [`dirty_in`] for the blocks `keep` admits, entered (clean) at `root`:
 /// a loop function, whose caller wrote everything back before calling it.
-pub fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool) -> Vec<BTreeSet<GuestReg>> {
+/// `carry`: per block ending in a call with the minimal write-back
+/// (`FnUnit::carried`), the registers that stay dirty across it.
+pub fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool, carry: &HashMap<usize, RegSet>) -> Vec<BTreeSet<GuestReg>> {
     let n = f.blocks.len();
     let mut inn: Vec<Option<BTreeSet<GuestReg>>> = vec![None; n];
     inn[root] = Some(BTreeSet::new());
@@ -1302,7 +1347,10 @@ pub fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool) ->
                 }
             }
             if matches!(b.term, FTerm::Call { .. } | FTerm::Syscall { .. }) {
-                d.clear();
+                match carry.get(&id.index()) {
+                    Some(c) if matches!(b.term, FTerm::Call { .. }) => d.retain(|r| c.contains(*r)),
+                    _ => d.clear(),
+                }
             }
             for s in b.succs() {
                 if !keep(s.index()) {
@@ -1418,6 +1466,130 @@ pub fn flags_abi() -> bool {
 /// other registers as they were at the last write-back; the compilers'
 /// handlers reload callee-saved registers from their frames, not from the
 /// faulting context. `GEX_CGEN_WB=all` writes back every dirty register.
+/// The registers each function's call tree names (reads or writes, saving
+/// included), pewasm's A*(g): a least fixpoint over direct calls; anything
+/// that reaches code outside `funcs`, an indirect transfer or a clobbering
+/// host call names everything.
+pub fn touched(funcs: &[Function]) -> HashMap<u64, RegSet> {
+    let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
+    let mut local = vec![RegSet::EMPTY; funcs.len()];
+    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); funcs.len()];
+    for (k, f) in funcs.iter().enumerate() {
+        let mut l = RegSet::EMPTY;
+        for b in &f.blocks {
+            for s in &b.stmts {
+                match s {
+                    Stmt::WriteReg { reg, .. } => l.insert(*reg),
+                    Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
+                    // A host helper may read or write any register in the
+                    // context (x87, fxsave, cpuid), and a trap reads them all.
+                    Stmt::HostCall { .. } | Stmt::Def { expr: Expr::HostCall { .. }, .. } | Stmt::Trap { .. } => l = RegSet::ALL,
+                    _ if emit::clobbers(s) => l = RegSet::ALL,
+                    _ => {}
+                }
+            }
+            match &b.term {
+                FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => match idx.get(t) {
+                    Some(&c) => callees[k].push(c),
+                    None => l = RegSet::ALL,
+                },
+                FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } | FTerm::Syscall { .. } => l = RegSet::ALL,
+                FTerm::Switch { table, .. } if !table.complete => l = RegSet::ALL,
+                _ => {}
+            }
+        }
+        local[k] = l;
+    }
+    let mut t = local.clone();
+    let mut changed = true;
+    let mut rounds = 0;
+    while changed && rounds < 64 {
+        changed = false;
+        rounds += 1;
+        for k in 0..funcs.len() {
+            let mut v = t[k];
+            for &c in &callees[k] {
+                v = v.union(t[c]);
+            }
+            if v != t[k] {
+                t[k] = v;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        return HashMap::new();
+    }
+    funcs.iter().enumerate().map(|(k, f)| (f.entry, t[k])).collect()
+}
+
+/// `GEX_CGEN_WB_BISECT=N`: the minimal write-back at the first N call
+/// sites a process emits only (bisecting a miscompile).
+fn wb_bisect() -> bool {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    match *N.get_or_init(|| std::env::var("GEX_CGEN_WB_BISECT").ok().and_then(|v| v.parse().ok())) {
+        Some(n) => WB_K.load(std::sync::atomic::Ordering::Relaxed) < n,
+        None => true,
+    }
+}
+static WB_K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The functions that need no recursion-depth guard (function-tier.md
+/// §7.1): not recursive, their whole call tree known (no indirect call, no
+/// unknown code, so nothing can re-enter them), and the tree's stack fits in
+/// the reserve every guarded function keeps below the budget, as a
+/// trap-free tree must. pewasm has no guard at all; this keeps gex's where
+/// a call chain can grow without bound.
+pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u64> {
+    let idx: HashMap<u64, usize> = funcs.iter().enumerate().map(|(k, f)| (f.entry, k)).collect();
+    let mut cand: Vec<Option<(u32, Vec<usize>)>> = Vec::with_capacity(funcs.len());
+    for f in funcs {
+        let ok = sums.get(&f.entry).is_some_and(|s| !s.unknown_callee && !s.may_unwind);
+        let mut callees = Vec::new();
+        let mut bad = !ok;
+        for b in &f.blocks {
+            match &b.term {
+                FTerm::Call { callee: Callee::Direct(t), .. } | FTerm::TailCall { callee: Callee::Direct(t) } => match idx.get(t) {
+                    Some(&c) => callees.push(c),
+                    None => bad = true,
+                },
+                FTerm::Call { .. } | FTerm::TailCall { .. } | FTerm::Unresolved { .. } => bad = true,
+                _ => {}
+            }
+        }
+        cand.push((!bad).then(|| (frame_weight(&registers(f)), callees)));
+    }
+    // Depth-first, memoised; a cycle (recursion) fails every function on it.
+    fn visit(k: usize, cand: &[Option<(u32, Vec<usize>)>], memo: &mut [Option<Option<u32>>], onstack: &mut [bool]) -> Option<u32> {
+        if let Some(m) = memo[k] {
+            return m;
+        }
+        if onstack[k] {
+            return None;
+        }
+        onstack[k] = true;
+        let r = cand[k].as_ref().and_then(|(w, callees)| {
+            let mut deepest = 0u32;
+            for &c in callees {
+                deepest = deepest.max(visit(c, cand, memo, onstack)? + CALL_KNOWN_WEIGHT);
+            }
+            Some(w + deepest).filter(|n| *n <= TRAPFREE_RESERVE)
+        });
+        onstack[k] = false;
+        memo[k] = Some(r);
+        r
+    }
+    let mut memo = vec![None; funcs.len()];
+    let mut onstack = vec![false; funcs.len()];
+    let mut out = HashSet::new();
+    for k in 0..funcs.len() {
+        if visit(k, &cand, &mut memo, &mut onstack).is_some() {
+            out.insert(funcs[k].entry);
+        }
+    }
+    out
+}
+
 pub fn minimal_writeback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| live_writebacks() && std::env::var("GEX_CGEN_WB").as_deref() != Ok("all"))
@@ -1515,7 +1687,13 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
 
 /// Outlining outermost loops is on unless `GEX_CGEN_OUTLINE=0`.
 pub fn outline_loops() -> bool {
-    std::env::var("GEX_CGEN_OUTLINE").as_deref() != Ok("0")
+    match std::env::var("GEX_CGEN_OUTLINE").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        // The native flavor (`image::unguarded`): no tiering engine to
+        // escape, so no loop functions (pewasm has none either).
+        _ => !crate::image::unguarded(),
+    }
 }
 
 fn loop_name(entry: u64, k: usize) -> String {

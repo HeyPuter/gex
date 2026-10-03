@@ -140,30 +140,41 @@ the steady state.
 ### One function at a time
 
 `gexc cgen-c noita.exe --pe-base 0x400000 [--recovery DIR] --at ADDR`
-prints a unit's C for one function; compiled with the unit flags and
-compared with pewasm's (wasm instructions, clang -O2, the function and its
-outlined loop):
+prints a unit's C for one function. `cmp/cc.sh` (scratchpad) compiles it
+with the unit flags; pewasm's is cut from `out/noita/build/app.wasm`
+(`wasm-objdump -d`, function `sub_<addr - 0x3f0000>`). Wasm instructions,
+the function and (before eaf64e45) its outlined loop:
 
-| noita.exe | pewasm | gex unit before | gex unit now (1827b993) |
+| noita.exe | pewasm | gex 21012db5 | gex 1827b993 | gex now (native flavor) |
+|---|---|---|---|---|
+| 0x724580 (worker hot spot) | 11,903 | 37,712 | 28,493 | **10,845** |
+| 0x872300 | 1,152 | | 1,238 | **765** |
+| 0x70b110 | 162 | | 250 | **197** |
+| 0xdd6ba0 | 715 | | 3,867 | **1,245** |
+| 0x864060 | 1,004 | | 1,249 | **994** |
+
+What differed from pewasm's C, and where gex now stands:
+
+| | pewasm | gex before | gex now |
 |---|---|---|---|
-| 0x724580 (worker hot spot) | 11,903 | 37,712 | 28,493 |
-| 0x872300 | 1,152 | | 1,238 |
-| 0x70b110 | 162 | | 250 |
-| 0xdd6ba0 | 715 | | 3,867 |
-| 0x864060 | 1,004 | | 1,249 |
+| registers | `uint32_t` locals | `uint64_t`, wrap/extend between operations | `uint32_t` (1827b993) |
+| memory access | `MEMR32(a)`: no check (`MEMCHECK=0`) | guard on every address, after the displacement | none natively (the unguarded flavor, in the unit key); the browser keeps the guard (a00fb489) |
+| displacement | in the memarg | added before the guard | in the memarg |
+| write-back at calls | spill the roots a pure callee's call tree names (`opt_program`), all of them otherwise | every dirty register (§4.1) | the same as pewasm for a callee of the unit with a complete summary that cannot reach the kernel, unwind or leave; registers it never touches stay in locals and are written back on the leave path (fae67c12) |
+| reload after calls | all roots, then LLVM drops the dead | every used register | what the continuation reads, minus a preserved set (1827b993) |
+| flags | elided across calls and returns (fixpoint) | written back at every call | not passed to callees (`flags_abi`); at returns still written when the caller's `need` asks (a runtime check where pewasm has a fixpoint) |
+| loops | inline | inline copy plus an outlined loop function (V8 OSR, §7.2) | inline natively (native flavor) |
 
-What made 0x724580 3.2x pewasm's size, and what 1827b993 changed:
+Kept on gex's side, off the fast path but still costing instructions: the
+per-function patched-page check and depth guard at entry, the return check
+(`ret == ret_pc && sp == sp0 + delta`), and the resume dispatch at call
+continuations (R's §9 return-0 path). These are most of the remaining
+difference on 0x70b110 and 0xdd6ba0.
 
-- 64-bit register variables for an i386 program (wraps and extends between
-  every operation): now uint32_t.
-- The bounds guard on every access, computed on the full address after the
-  displacement (so no guard is shared, and the offset never rides in the
-  memarg): displacements now ride on the guarded base, and the guard is
-  32-bit. The guard itself is still about 20% of the function's
-  instructions (22,873 without it); pewasm has none (`MEMCHECK=0`).
-- A full reload of every register after every call: now only what the
-  continuation reads.
-- Flags written back before calls: now not (`flags_abi`).
+ABI assumptions changed (for R): calls are taken not to read the
+arithmetic flags; registers a pure callee never touches are not in the
+context during the call (only in the caller's locals) -- a memory fault
+inside such a callee sees the caller's older values, as in pewasm.
 
 Still open: each call writes back every dirty register (§4.1's state at a
 host-visible point), where pewasm writes back the callee's inputs; vector
@@ -228,3 +239,54 @@ tier-1 translation are the suspects.
 4. The heap family, all at once (§9.9.2 step 4).
 5. A direct call from units to providers, only if the units profile shows
    the stub's fcache probe (a §9.9.1 deviation).
+
+The browser can drop the guard once its NT layer's guard limit equals the
+memory size (no host data above the guest's addresses).
+
+## Stream F's state at wrap-up (2026-10-03)
+
+merge/fjit @ 77f4ef26 (merge/abi9 merged up to 212d4f11). Commits since
+the first report, in order: 1827b993 (32-bit GPRs, displacements in the
+memarg, 32-bit guard, partial reload, `flags_abi`), a00fb489 (unguarded
+native flavor, in the unit key), fae67c12 + 70297e1f (minimal write-back at
+pure calls, as pewasm's A*(g); the second fixes the first), the native
+flavor's no-outlining commit, 77f4ef26 (depth guard only where the call
+tree can grow without bound), and the tools: 5ae8acfe (`gexc cgen-c`,
+`GEX_PROF_START`), 90649c55 (`prof-report --modules`).
+
+Gates on these: lockstep tier-1 against `--cgen` 30/30 on gi386 and gx64
+in both modes (flags ignored, and `GEX_CGEN_LIVE=0` exact); tests/nt
+`--cgen` 48/48, and 50/50 with the prefix's DLL units built by 77f4ef26;
+Tier 0 gi386 in node (the browser flavor): cg 2.810 -> 2.700 x emcc.
+
+**Noita units fps: not measured.** The units built before 70297e1f failed
+in Wine's ntdll (the write-back bug that commit fixes); the full unit build
+for 77f4ef26 (prefix done in 16.5 min, images about an hour more) was
+stopped at wrap-up. The hot-function table above is for the native flavor
+before 70297e1f and 77f4ef26 (both only remove instructions).
+
+To measure, on cores 4 and 10:
+
+```
+S=<scratchpad>/fjit
+$S/build-units.sh <gexc> $S/cgcache    # cgen-prefix into $S/prefix, then the 8 Noita images
+GEX_CGEN_CACHE=$S/cgcache NULLDISP=1 GEX_NT_TIME_SCALE=4 CPUS=4,10 GEXC=<gexc> \
+    $S/run-noita2.sh units 1100        # R's recipe (null display); providers on by default
+```
+
+and compare the `peek` slope with pewasm's 76-84. Report noita.exe's unit
+share and the rest separately (`tools/prof-report.py --modules`, R's
+`tools/modattr.py`).
+
+Next, in order:
+1. That measurement, with a profile (`GEX_PROF_START` past world-up).
+2. The return check and the resume dispatch at call continuations are
+   the remaining entry/exit overhead on small functions (0x70b110: 197
+   against pewasm's 162). pewasm has neither (it tests `recomp_jmp_pending`
+   after calls); both carry R's §4.2/§9 invariants, so any change goes
+   through R.
+3. Flags at returns: gex computes them and stores them when the caller's
+   `need` asks; pewasm drops them by a whole-program fixpoint. The
+   computation stays live in gex (0xdd6ba0's early exits).
+4. Vector registers reloaded after calls because partial lane writes read
+   the whole register (lane liveness).
