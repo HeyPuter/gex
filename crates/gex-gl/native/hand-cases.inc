@@ -314,3 +314,12 @@
         }
         break;
     }
+    case GET_INTEGERV: {
+        const GLenum pname = a.u32();
+        const size_t n = integer_query_components(pname);
+        /* Room for what GL writes even where the table says less. */
+        std::vector<GLint> values(std::max<size_t>(n, 16));
+        if (n) glGetIntegerv(pname, values.data());
+        put_blob(values.data(), n * sizeof(values[0]));
+        break;
+    }

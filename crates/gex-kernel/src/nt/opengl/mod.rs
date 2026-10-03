@@ -1604,15 +1604,19 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             if let Some(v) = local {
                 c.g.w32(out, v)?;
             } else {
+                // A blob of as many values as the pname has (the host sizes
+                // it with the table generated::pname_count is, plus the core
+                // multi-valued ones).
                 let mut r = ask(c, op::GET_INTEGERV, &[pname], &[])?;
+                let values = r.blob();
                 let n = match pname {
                     0x0ba2 | 0x0c10 | 0x0c22 | 0x0c23 => 4, // viewport, scissor box, clear color, write mask
-                    0x0d3a | 0x846e | 0x846d => 2,          // max viewport dims, aliased line/point ranges
-                    _ => 1,
+                    0x0d3a | 0x846e | 0x846d | 0x0b70 | 0x0b12 | 0x0b22 | 0x825d | 0x0b40 => 2,
+                    0x91be | 0x91bf => 3,                    // compute work group count, size
+                    _ => generated::pname_count(pname) as usize,
                 };
-                for i in 0..n {
-                    let v = r.u32();
-                    c.g.w32(out + 4 * i, v)?;
+                if out != 0 && values.len() == 4 * n {
+                    c.g.write(out, &values)?;
                 }
             }
         }

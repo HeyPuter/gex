@@ -175,7 +175,9 @@ size_t integer_query_components(GLenum pname) {
         return static_cast<size_t>(std::clamp(count, 0, 4096));
     }
     default:
-        return 1;
+        /* The fixed-function state, matrices among them, and every other
+         * multi-valued pname the shared table knows. */
+        return gexgl_pname_count(pname);
     }
 }
 

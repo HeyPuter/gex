@@ -1553,7 +1553,9 @@ size_t integer_query_components(GLenum pname) {
         return static_cast<size_t>(std::clamp(count, 0, 4096));
     }
     default:
-        return 1;
+        /* The fixed-function state, matrices among them, and every other
+         * multi-valued pname the shared table knows. */
+        return gexgl_pname_count(pname);
     }
 }
 
@@ -2383,9 +2385,11 @@ bool one(uint32_t op, Reader& a) {
     }
     case GET_INTEGERV: {
         const GLenum pname = a.u32();
-        std::vector<GLint> values(integer_query_components(pname));
-        if (!values.empty()) glGetIntegerv(pname, values.data());
-        put_blob(values.data(), values.size() * sizeof(values[0]));
+        const size_t n = integer_query_components(pname);
+        /* Room for what GL writes even where the table says less. */
+        std::vector<GLint> values(std::max<size_t>(n, 16));
+        if (n) glGetIntegerv(pname, values.data());
+        put_blob(values.data(), n * sizeof(values[0]));
         break;
     }
     case GET_ERROR: put_u32(glGetError()); break;

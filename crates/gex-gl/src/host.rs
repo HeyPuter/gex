@@ -1367,14 +1367,6 @@ impl Gl {
                     let s = gl_string(name);
                     reply.blob(s.as_bytes());
                 }
-                op::GET_INTEGERV => {
-                    let Some(pname) = a.u32() else { return true };
-                    let mut v = [0 as GLint; 4];
-                    glGetIntegerv(pname, v.as_mut_ptr());
-                    for x in v {
-                        reply.u32(x as u32);
-                    }
-                }
                 op::GET_ERROR => {
                     reply.u32(glGetError());
                 }
@@ -2077,11 +2069,10 @@ mod tests {
         assert_eq!(status, error::NONE);
         let r = reply.bytes();
         let mut at = 0;
+        // GET_INTEGERV's reply is a blob of as many values as the pname has.
+        assert_eq!(read_u32(r, &mut at), 4, "GL_BLEND is one value");
         let blend = read_u32(r, &mut at);
         assert_eq!(blend, 0, "POP_ATTRIB restored the blend enable");
-        for _ in 0..3 {
-            let _ = read_u32(r, &mut at);
-        }
         let loc = read_u32(r, &mut at);
         let mut b = Batch::new();
         b.raw(op::UNIFORM_4FV, &[loc, 1, color.len() as u32], &color);

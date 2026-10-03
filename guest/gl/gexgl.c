@@ -2011,7 +2011,8 @@ static size_t gexgl_state_query_components(unsigned pname) {
         int count = 0; glGetIntegerv(0x8DF9u, &count); /* GL_NUM_SHADER_BINARY_FORMATS */
         return count > 0 && count <= 4096 ? (size_t)count : 0;
     }
-    default: return 1;
+    /* The fixed-function state, matrices among them (gl-pname-counts.h). */
+    default: return gexgl_pname_count(pname);
     }
 }
 
