@@ -553,8 +553,9 @@ fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
                         }
                         1 => {
                             tables += 1;
-                            q += 2; // funcref, limits flag
-                            let flag = body[q - 1];
+                            q += 2; // the kind, funcref
+                            let flag = *body.get(q)?;
+                            q += 1;
                             leb(body, &mut q)?;
                             if flag & 1 != 0 {
                                 leb(body, &mut q)?;
