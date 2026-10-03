@@ -1147,9 +1147,24 @@ impl ModuleBuilder {
             self.m.add_fill_all(no_args);
         }
         let started = crate::par::Stopwatch::start();
-        let wasm = self
-            .m
-            .encode_with_custom(&[(METADATA_SECTION, meta.encode())]);
+        let mut custom = vec![(METADATA_SECTION, meta.encode())];
+        // `GEX_PERFMAP`: a name section, `b_<guest address>` per block, so
+        // the host's perf map attributes tier-1 code to guest addresses.
+        if std::env::var_os("GEX_PERFMAP").is_some() {
+            let mut v: Vec<(u32, u64)> = self.blocks.iter().map(|(a, f)| (*f, *a)).collect();
+            v.sort_unstable();
+            let mut sub = Vec::new();
+            crate::wasm::write_u32(&mut sub, v.len() as u32);
+            for (f, a) in &v {
+                crate::wasm::write_u32(&mut sub, *f);
+                crate::wasm::write_name(&mut sub, &format!("b_{a:x}"));
+            }
+            let mut names = vec![1u8];
+            crate::wasm::write_u32(&mut names, sub.len() as u32);
+            names.extend_from_slice(&sub);
+            custom.push(("name", names));
+        }
+        let wasm = self.m.encode_with_custom(&custom);
         if timing {
             eprintln!("[timing]   encoding: {:.2}s", started.secs());
         }

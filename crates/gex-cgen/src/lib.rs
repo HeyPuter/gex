@@ -8,6 +8,7 @@
 pub mod emit;
 pub mod func;
 pub mod image;
+pub mod provider;
 pub mod recover;
 pub mod runtime;
 pub mod header;

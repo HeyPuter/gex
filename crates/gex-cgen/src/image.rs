@@ -358,7 +358,9 @@ pub struct ImageStats {
 /// Stage 2: the recovery in `recovery` as one linked C module at `out`.
 /// `work` holds the unit sources while they compile; `objects` is the object
 /// cache (shared across images and builds). `read` gives a byte of the
-/// image as placed (for [`func::ret_pops`]).
+/// image as placed (for [`func::ret_pops`]); `stubs` are entries an export
+/// provider serves (`crate::provider::stubs`), whose bodies re-enter the
+/// function table instead.
 pub fn build_c_module(
     recovery: &Path,
     work: &Path,
@@ -366,13 +368,15 @@ pub fn build_c_module(
     out: &Path,
     jobs: usize,
     read: &(dyn Fn(u64) -> Option<u8> + Sync),
+    stubs: &HashSet<u64>,
 ) -> Result<ImageStats> {
     let rec = read_recovery(recovery)?;
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
     // export goes, and only its unit recompiles. It must not be trap-free
     // (its callers would not have written everything back).
-    let mut skip: HashSet<u64> = HashSet::new();
+    // Export providers' addresses start as stubs (`crate::provider`).
+    let mut skip: HashSet<u64> = stubs.clone();
     loop {
         let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip, read)?;
         let cwasm = std::fs::read(out)?;

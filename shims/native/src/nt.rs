@@ -90,7 +90,12 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
         .with_kernel(|k| nt::boot::boot(&p, k, memory.bytes(), &req))
         .map_err(|e| anyhow!("starting {}: {e}", setup.exe_path))?;
     if let Some(out) = &setup.display_out {
-        *p.display_host.lock().unwrap() = Some(Arc::new(PpmDisplay::new(out)));
+        // `--wayland-out null`: frames are presented and dropped (the
+        // throughput recipe, docs/noita-perf.md: pewasm's null GL shows
+        // nothing either).
+        let host: Arc<dyn nt::display::NtDisplay> =
+            if out == "null" { Arc::new(NullDisplay) } else { Arc::new(PpmDisplay::new(out)) };
+        *p.display_host.lock().unwrap() = Some(host);
     }
     store.data_mut().nt = Some(Arc::clone(&p));
     let sampler = store.data().sampler.clone();
@@ -153,6 +158,16 @@ fn layout_misses() -> u64 {
 /// bounding box, into `PREFIX-NNNNN.ppm`. A file is what a test compares and
 /// what works with no screen. There is no native input source: input is
 /// `GEX_NT_INPUT`'s.
+struct NullDisplay;
+
+impl nt::display::NtDisplay for NullDisplay {
+    fn publish(&self, _mem: &GuestMem<'_>, _s: &nt::display::NtSurface) {}
+    fn remove(&self, _id: u32) {}
+    fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {
+        Vec::new()
+    }
+}
+
 struct PpmDisplay {
     prefix: String,
     state: Mutex<PpmState>,

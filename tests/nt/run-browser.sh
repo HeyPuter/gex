@@ -61,6 +61,7 @@ for arch in ${ARCHES:-x64 x86}; do
     # Locks under contention (x64's SList is cmpxchg16b, done by the host
     # under one lock).
     check $arch/mtx 0 "$allok" $arch "$b/mtx.exe"
+    check $arch/crtmem 0 "$allok" $arch "$b/crtmem.exe"
     # A locked write through a null pointer's field is an access violation.
     check $arch/lownull-xadd 0 "$allok" $arch "$b/lownull.exe" xadd
     check $arch/lownull-aligned 0 "$allok" $arch "$b/lownull.exe" aligned
