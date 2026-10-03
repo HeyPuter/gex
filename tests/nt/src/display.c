@@ -123,6 +123,17 @@ int main(void) {
     CHECK("a builtin control keeps its state", SendMessageA(btn, BM_GETCHECK, 0, 0) == BST_CHECKED);
     if (dlg) DestroyWindow(dlg);
 
+    /* A broadcast reaches this thread's top-level window. */
+    HWND top = CreateWindowA("STATIC", "top", WS_POPUP, 0, 0, 10, 10, NULL, NULL, NULL, NULL);
+    UINT reg = RegisterWindowMessageA("gex-display-broadcast");
+    CHECK("PostMessage(HWND_BROADCAST)", PostMessageA(HWND_BROADCAST, reg, 7, 9));
+    MSG msg;
+    int got = 0;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE))
+        if (msg.message == reg && msg.hwnd == top && msg.wParam == 7 && msg.lParam == 9) got = 1;
+    CHECK("the top-level window got it", got);
+    DestroyWindow(top);
+
     printf("%d failures\n", failures);
     return failures;
 }
