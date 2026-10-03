@@ -99,6 +99,8 @@ for arch in x64 x86; do
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
+    # crypt32 with gex's empty Unix side, and the registered RSA provider.
+    check $arch/crypt 0 "$allok" "$b/crypt.exe"
     # Display modes, D3DKMT, memory status, a section mapped twice, dialogs.
     check $arch/display 0 "$allok" "$b/display.exe"
     # An image without DYNAMIC_BASE: at its linked base, or relocated by ntdll

@@ -975,6 +975,8 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtEnumerateValueKey => reg::nt_enumerate_value_key(c),
         n::NtQueryKey => reg::nt_query_key(c),
         n::NtDeleteValueKey => reg::nt_delete_value_key(c),
+        n::NtNotifyChangeKey => reg::nt_notify_change_key(c),
+        n::NtRenameKey => reg::nt_rename_key(c),
         // -- sync --------------------------------------------------------------
         n::NtCreateEvent => sync::nt_create_event(c),
         n::NtOpenEvent => sync::nt_open_event(c),

@@ -29,7 +29,7 @@ pub const DEGRADES: &[&str] = &[
 
 /// DLLs with a Unix side implemented here, and their ids (the handle is
 /// `(id << 16) | 1`).
-const NATIVE: &[(&str, u64)] = &[("ws2_32.dll", 2), ("opengl32.dll", 3)];
+const NATIVE: &[(&str, u64)] = &[("ws2_32.dll", 2), ("opengl32.dll", 3), ("crypt32.dll", 4)];
 
 #[derive(Default, Debug)]
 pub struct Registry {
@@ -104,8 +104,30 @@ pub fn dispatch(c: &mut Call<'_>) -> R {
     match lib {
         Some(name) if name == "ws2_32.dll" => ws2_32(c, code, args),
         Some(name) if name == "opengl32.dll" => super::opengl::call(c, code, args),
+        Some(name) if name == "crypt32.dll" => crypt32(c, code),
         Some(name) => Err(c.unimplemented(&format!("{name} unix call {code}"))),
         None => Err(c.unimplemented(&format!("unix call {code} on unknown handle {handle:#x}"))),
+    }
+}
+
+/// crypt32's Unix side (`enum unix_funcs`, dlls/crypt32/crypt32_private.h):
+/// the host's root certificates and PKCS#12 through GnuTLS. crypt32's
+/// DllMain fails the process when it has no Unix side at all, so it gets
+/// one with nothing behind it: no host root certificates, and PFX import and
+/// export unsupported, which its PE side reports as ordinary failures.
+fn crypt32(c: &mut Call<'_>, code: u32) -> R {
+    const PROCESS_ATTACH: u32 = 0;
+    const PROCESS_DETACH: u32 = 1;
+    const ENUM_ROOT_CERTS: u32 = 6;
+    match code {
+        PROCESS_ATTACH | PROCESS_DETACH => Ok(st::SUCCESS),
+        // The enumeration loop stops at the first nonzero status.
+        ENUM_ROOT_CERTS => Ok(st::NO_MORE_ENTRIES),
+        // open_cert_store, import_store_key/cert, close_cert_store,
+        // export_cert_store: PFXImportCertStore returns NULL and
+        // PFXExportCertStore FALSE.
+        2..=5 | 7 => Ok(st::NOT_SUPPORTED),
+        _ => Err(c.unimplemented(&format!("crypt32.dll unix call {code}"))),
     }
 }
 
