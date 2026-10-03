@@ -869,3 +869,146 @@ host half is `gex_kernel::ftab`; the runtime functions are
 - **Retirement:** `FuncMap::retire*` logs the index; each table points it
   back at `resolve` as it replays the log; the host clears the probe cache
   entry. Indices are never reused.
+
+### 9.9 Native libc (2026-10-02)
+
+**Goal.** The guest's C library runs as native wasm, not as lifted x86. This
+is §9.7 option 1, brought forward. Two things justify it:
+- The Noita tier-1 profile: msvcr120 is 11.6% of CPU (about 5% of it ConcRT
+  spinning; mem*, str*, sin/cos, malloc/free), plus ntdll's heap and locks
+  at 2.9%.
+- pewasm: its host CRT plus lock-free critical sections took Noita from 81 to
+  104 world fps at the 4x clock (pewasm docs/optimization-plan.md §3.8 and
+  "Lock-free PE32 critical sections").
+
+Lifted hand-tuned SSE2 or AVX libc code is the worst case for a lifter, and
+the C versions compile to tight wasm.
+
+**Reference: copy pewasm, don't redesign.** These are pewasm's
+implementations to port:
+- src/x86/host_ucrt.c: CRT and UCRT exports;
+- host_memory.c and dlmalloc32.inc: the heap;
+- host_stdio.c;
+- host.c and host_threads.c: critical sections and wait/wake on an address;
+- the port's noita_concrt.c: ConcRT on atomics.
+
+pewasm's port overrides (per-game patches) are not copied; only general
+library replacements are.
+
+#### 9.9.1 Mechanism: export providers
+
+One general mechanism serves Windows and Linux guests on every tier.
+
+- **Provider:** a native wasm function plus a descriptor:
+  - the library identity: DLL name and content-hash set, or ELF soname
+    plus build-id;
+  - the export or symbol;
+  - the calling convention: cdecl or stdcall (arguments on the guest stack,
+    stdcall pops N), SysV i386, or SysV x86-64 / Win64 in registers;
+  - the argument and return kinds: i32, i64 in edx:eax, f32/f64 in ST0 on
+    i386, xmm0 on x86-64, or by-pointer struct;
+  - the registers it clobbers: the convention's caller-saved set and flags;
+  - whether it may fault, raise or call back (see 9.9.3).
+- **Binding by address.** When a matching image maps, look up each provided
+  symbol's guest address and install an ftab entry at that address pointing
+  at the provider's adapter.
+  - This catches every caller: IAT calls, GetProcAddress pointers, the
+    library's own internal calls, and Linux PLT and ifunc targets, because all
+    of them reach the address.
+  - The guest's x86 code for that function is never translated.
+- **The adapter** is a generated wasm thunk with the §9 signature
+  `F_body(ctx, depth, need, ret) -> i32`:
+  1. read the arguments from the guest stack or ctx registers;
+  2. call the native function;
+  3. write the result back and pop the return address (plus N for stdcall);
+  4. return 1.
+
+  It touches only the convention's registers. Its summary says exactly that,
+  so callers in units write back only the arguments, following F's
+  summary-driven write-back.
+- **In units,** cgen knows the provided addresses at build time and emits a
+  direct call to the adapter, or to the native function with arguments in
+  locals, skipping the adapter. The unit key includes the provider set.
+- **In the browser,** providers link into the shim, or into the units module
+  for direct calls. It's the same code, since the host is wasm already.
+
+#### 9.9.2 Contents, in order (each step ranked by profile, gated on fps)
+
+1. **Synchronisation** (R's current work):
+   - ConcRT's critical_section, reader_writer_lock and event, and Context
+     yield, on wasm atomics plus gex futexes;
+   - lock-free RtlEnterCriticalSection / RtlLeaveCriticalSection (CAS on
+     OwningThread, a bounded spin, then futex) in ntdll;
+   - SRW locks.
+
+   Keep pewasm's lesson: a waiter in a Sleep or yield loop must still get
+   prompt wake-ups. Also fix gex's own sched_yield and sem_trywait polling.
+2. **mem* and str*:** memcpy, memmove, memset, memcmp, memchr, strlen,
+   strcmp, strncmp, strcpy, strcpy_s, strcat_s, strchr, wcslen, wcscmp,
+   wmemcpy. These lower to wasm bulk memory where possible. The memory
+   contract follows pewasm: validate whole ranges once.
+3. **Math:**
+   - sin, cos, tan, atan2, pow, exp, log, sqrt, floor, ceil, fmod, and the
+     float forms;
+   - msvcr120's `_CI*` x87-ABI entries (arguments in ST0/ST1, result in ST0)
+     and the `__libm_sse2_*` forms;
+   - `_ftol2` and `_ftol2_sse`.
+
+   Native results must match the guest's own msvcr120 or glibc results, which
+   need not be IEEE-correct, to the bit, or the lockstep tests flag a
+   mismatch. Use the matching libm (musl or fdlibm) and check differentially;
+   a function that can't match stays lifted.
+4. **The heap, all or nothing per heap.** Replace the whole malloc family at
+   once (malloc, free, realloc, calloc, _msize, _expand, _aligned_*, operator
+   new and delete), because mixing guest and native allocators on one heap
+   corrupts it.
+   - The native allocator (dlmalloc, as in pewasm) takes guest pages from
+     NtAllocateVirtualMemory (Linux: mmap), so pointers stay guest pointers.
+   - Then ntdll's RtlAllocateHeap, RtlFreeHeap and RtlReAllocateHeap for the
+     process heap, keeping HeapWalk and HeapSize semantics, or leave
+     HeapWalk users on the guest.
+5. **Linux guests:** glibc's or musl's libc.so and libm.so with the same
+   symbol set, including glibc's ifunc variants (bound at the resolved
+   address).
+6. **CRT copies statically linked into executables** (noita.exe carries
+   MSVC 2013 libcmt and libcpmt functions):
+   - match them FLIRT-style, byte patterns with relocation wildcards, against
+     the static CRT libraries;
+   - replace only exact matches, with the same providers.
+
+   This is pewasm §3.8's second item. It comes last because it needs the
+   static libraries for each toolchain.
+7. **Excluded unless profiled hot and semantics allow:**
+   - functions that depend on locale (printf family, strtod, toupper in a
+     non-C locale);
+   - stdio over guest handles (it already costs a syscall);
+   - anything that calls back into guest code (qsort or bsearch comparators;
+     allowed later through the §9 table, since a guest function is a callable
+     wasm function).
+
+#### 9.9.3 Semantics and validation
+
+- **errno** and per-thread CRT state live in the guest's own TLS (msvcr120's
+  _tiddata via TEB, glibc's TLS errno). A provider that sets errno writes
+  through the guest's `_errno()` or `__errno_location()` address, resolved
+  once per thread. Prefer functions that never set it.
+- **Faults.** A bad pointer must raise the same guest exception as the
+  lifted code. Natively, a wasm out-of-bounds access traps; the adapter turns
+  the trap into a guest access violation at the call site's return address,
+  through the §9.8 unwind path. Range pre-checks keep ordinary failures off
+  the trap path.
+- **Differential tests,** per function, guest implementation against
+  provider:
+  - random inputs, including unaligned, overlapping, zero-length and
+    page-crossing cases, plus NaN/Inf/denormal for math;
+  - compare results, memory, errno and the registers the ABI preserves;
+  - live in tests/providers.
+
+  The provider set can be switched off (`GEX_PROVIDERS=0`) for lockstep and
+  for A/B comparison.
+- **Gate:** the coordinator gate, lockstep with providers on, tests/nt, and
+  Noita world fps at the 4x clock against pewasm (docs/noita-perf.md).
+
+**Owner:** stream R. It builds the mechanism, then steps 1–4 on 32-bit PE
+first, since that's Noita. Steps 5 and 6 follow, once Noita's profile no
+longer shows libc.
