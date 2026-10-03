@@ -40,6 +40,10 @@ pub enum Mode {
     Default,
     /// `--cgen`: every program image (not Wine's) must have a unit.
     Require,
+    /// An ejected project (docs/eject-pe.md): every image, Wine's included,
+    /// has a unit built for its base ahead of time; nothing is ever built at
+    /// run time, and an image without one stops the run.
+    Aot,
 }
 
 static MODE: OnceLock<Mode> = OnceLock::new();
@@ -219,6 +223,32 @@ pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: boo
     prepare_with(&image, &seeds, jobs, verbose, &pv)
 }
 
+/// The directory under the unit cache that holds the unit for a PE image
+/// placed at `base` (with its providers and hints), built or not.
+pub fn unit_dir(pe: &gex_ld::pe::PeImage, base: u64) -> Result<std::path::PathBuf> {
+    let (image, _) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    let pv = provided(pe, base);
+    Ok(cache_root()?.join(unit_key(&image, &pv)))
+}
+
+/// Build (or find) the NT trampoline page's unit for the given ABI, as boot
+/// installs it.
+pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::PathBuf> {
+    let (image, seeds) = trampoline_input(class32);
+    prepare_image(&image, &seeds, jobs, false)
+}
+
+/// Build every export provider for a PE image (`gex_cgen::provider`) into the
+/// unit cache, as mapping it would; their names.
+pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
+    let mut v = Vec::new();
+    for prov in gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64) {
+        gex_cgen::provider::build(&prov, &cache_root()?)?;
+        v.push(prov.name.to_string());
+    }
+    Ok(v)
+}
+
 /// [`prepare_pe`] for any recovery input (no providers).
 pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
@@ -233,6 +263,9 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
     let out = dir.join("c.wasm");
     if out.exists() {
         return Ok(out);
+    }
+    if mode() == Mode::Aot {
+        bail!("no function-tier unit {key} in {} (the ejected project was not built for this image; run ./build.sh)", root.display());
     }
     let recovery = root.join("recovery").join(recovery_key(image));
     if !recovery.join("summaries").exists() {
@@ -532,7 +565,7 @@ fn place_or_build(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
     if let Some(pl) = place(p, memory)? {
         return Ok(Some(pl));
     }
-    if sync_build() && !is_wine(p) {
+    if sync_build() && !is_wine(p) && mode() != Mode::Aot {
         build_now(p)?;
         return place(p, memory);
     }
@@ -549,6 +582,15 @@ fn is_wine(p: &Pending) -> bool {
 /// no (`0`, or a list of file names that leaves it out), gets a unit built
 /// for the next run.
 fn missing(p: Pending) -> Result<()> {
+    if mode() == Mode::Aot {
+        bail!(
+            "gex-eject: {} was mapped at {:#x}, and the ejected project has no code built for it there \
+             (the recorded session never mapped it, or mapped it elsewhere). Record a session that loads it \
+             and re-eject",
+            p.path,
+            p.base
+        );
+    }
     if mode() == Mode::Require && !is_wine(&p) {
         bail!(
             "--cgen: {} has no function-tier unit for base {:#x}; build one with \
