@@ -226,6 +226,28 @@ pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: boo
     prepare_with(&image, &seeds, jobs, verbose, &pv)
 }
 
+/// [`prepare_pe`] with function starts of the caller's besides the image's
+/// own (gex-eject: entries a recorded session reached that recovery did not
+/// find). The unit has the same key: the caller owns the cache it builds
+/// into, and starts from a cache without this image's recovery.
+pub fn prepare_pe_seeded(pe: &gex_ld::pe::PeImage, base: u64, extra: &[u64], jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
+    let (image, mut seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    for &a in extra {
+        if !seeds.starts.iter().any(|&(s, _)| s == a) {
+            seeds.starts.push((a, gex_xlate::func::Source::Entry));
+        }
+    }
+    let pv = provided(pe, base);
+    prepare_with(&image, &seeds, jobs, verbose, &pv)
+}
+
+/// The recovery directory of a PE image at `base` (what [`prepare_pe`]
+/// caches), for a caller that must recover it again.
+pub fn recovery_dir(pe: &gex_ld::pe::PeImage, base: u64) -> Result<std::path::PathBuf> {
+    let (image, _) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    Ok(cache_root()?.join("recovery").join(recovery_key(&image)))
+}
+
 /// The directory under the unit cache that holds the unit for a PE image
 /// placed at `base` (with its providers and hints), built or not.
 pub fn unit_dir(pe: &gex_ld::pe::PeImage, base: u64) -> Result<std::path::PathBuf> {
@@ -724,7 +746,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
                 None => missing(p.clone())?,
             }
         }
-        install_providers(&p, &shared, &engine, &memory)?;
+        install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *caller)?;
         replay_registry(caller)?;
     }
@@ -761,7 +783,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
                 None => missing(p.clone())?,
             }
         }
-        install_providers(&p, &shared, &engine, &memory)?;
+        install_providers(&p, store.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *store)?;
         catch_up_table(store)?;
     }
@@ -770,7 +792,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
 
 /// Bind `p`'s export providers (`gex_cgen::provider`) at their exports'
 /// addresses, after its unit (whose bodies there are stubs into the table).
-fn install_providers(p: &Pending, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
+fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
     let pv = provided(&p.pe, p.base);
     for prov in &pv.providers {
         // Small, and built in a private directory then renamed into place:
@@ -791,6 +813,21 @@ fn install_providers(p: &Pending, shared: &Arc<Mutex<JitShared>>, engine: &Engin
             }
         }
         eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
+    }
+    // Stateful providers (`libprov`: an ejected project's), after the
+    // built-in ones, so they win where both bind an export.
+    let libs = crate::libprov::for_dll(&p.pe.exports.dll_name);
+    if !libs.is_empty() {
+        let mut exports = HashMap::new();
+        for e in p.pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+            for n in &e.names {
+                exports.insert(n.clone(), e.rva);
+            }
+        }
+        for lp in libs {
+            let n = crate::libprov::install(lp, state, shared, engine, memory, &exports, p.base, p.pe.entry_rva)?;
+            eprintln!("gex-nt: provider {} for {}: {n} exports", lp.name, p.path);
+        }
     }
     Ok(())
 }
