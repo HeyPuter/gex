@@ -592,7 +592,7 @@ pub fn canonical_number(raw: u64) -> u64 {
 }
 
 /// The processor gex claims to be: an SSSE3-era Intel core (family 6, model
-/// 15) with the baseline x86-64 feature set (less MMX) plus SSE3, SSSE3, CMPXCHG16B and
+/// 15) with the baseline x86-64 feature set plus SSE3, SSSE3, CMPXCHG16B and
 /// POPCNT -- exactly the instruction set the lifter implements, so glibc's
 /// IFUNC resolvers pick code gex can run. No AVX, no SSE4, no XSAVE.
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
@@ -602,17 +602,15 @@ pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
             let eax = 0x0000_06fb; // family 6, model 15, stepping 11
             let ebx = 0x0001_0800; // 1 logical processor, 64-byte clflush line
             let ecx = 1 | (1 << 9) | (1 << 13) | (1 << 23); // SSE3 SSSE3 CX16 POPCNT
-            // No MMX: the lifter has none of its instructions (an `mm`
-            // register op is SIGILL), and code that checks the bit -- a
-            // codec's MMX path, Peggle's j2k-codec -- takes its other path.
             let edx = (1 << 0)
                 | (1 << 4)
                 | (1 << 8)
                 | (1 << 15)
                 | (1 << 19)
+                | (1 << 23)
                 | (1 << 24)
                 | (1 << 25)
-                | (1 << 26); // FPU TSC CX8 CMOV CLFSH FXSR SSE SSE2
+                | (1 << 26); // FPU TSC CX8 CMOV CLFSH MMX FXSR SSE SSE2
             [eax, ebx, ecx, edx]
         }
         // Deterministic cache parameters: a 32 KiB 8-way L1D and a 4 MiB
