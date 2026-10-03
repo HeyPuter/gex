@@ -522,6 +522,8 @@ struct Job {
     class32: bool,
     epoch: u64,
     queued_at: std::time::Instant,
+    /// The module cache (directory, build), when it is on.
+    cache: Option<(std::path::PathBuf, String)>,
 }
 
 fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Option<Job> {
@@ -547,6 +549,7 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
         class32: gex_abi::X86 && gex_xlate::arch::compat(),
         epoch,
         queued_at: std::time::Instant::now(),
+        cache: caller.data().jit.as_ref().and_then(|jit| jit.cache.clone()),
     })
 }
 
@@ -585,7 +588,7 @@ fn run_job(j: &Job) -> Result<bool> {
         bail!("the translation for {addr:#x} does not hold it");
     }
     let t1 = std::time::Instant::now();
-    let module = Module::new(&j.engine, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
+    let module = compile_translation(j, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
     let tc = t1.elapsed();
     stats::COMPILE_US.fetch_add(tc.as_micros() as u64, Relaxed);
     let checks = pages.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -628,6 +631,24 @@ fn queue(j: Job) {
 
 /// Translate `addr` on this thread, install what it makes into this store
 /// and say which index serves `addr`.
+/// Compile a run-time translation. With `GEX_FJIT_CACHE=1` (and the
+/// module cache on), the compiled module is kept on disk by the wasm it came
+/// from, so a program's next run loads instead of compiling: a large
+/// program's start-up under the function JIT is mostly Cranelift (Unity's:
+/// about 60% of its CPU). Off by default, since a large program leaves
+/// gigabytes of them.
+fn compile_translation(j: &Job, wasm: &[u8]) -> Result<Module> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("GEX_FJIT_CACHE").is_ok_and(|v| !v.is_empty() && v != "0"));
+    match j.cache.as_ref().filter(|_| on) {
+        Some((dir, build)) => {
+            let key = gex_cache::key(build, [b"fjit".as_slice(), wasm]);
+            gex_cache::load_or_compile_at(&j.engine, &dir.join("fjit").join(format!("{key}.cwasm")), wasm)
+        }
+        None => Module::new(&j.engine, wasm),
+    }
+}
+
 fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Result<Option<u32>> {
     let Some(j) = job(caller, sh, memory, addr) else { return Ok(None) };
     if !run_job(&j)? {
