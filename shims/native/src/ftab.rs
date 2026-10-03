@@ -34,6 +34,12 @@ pub(crate) struct Shared {
     checks: HashMap<u32, Vec<(u64, u32)>>,
     /// Addresses the bridge handed back to tier-1 (`cache_op::FTAB_TIER1`).
     pub tier1_only: std::collections::HashSet<u64>,
+    /// Bumped by every retirement: a background translation made across
+    /// one may have read code since rewritten, and is dropped.
+    epoch: u64,
+    /// Addresses handed to the background translator (`queue`), until a
+    /// retirement covers them.
+    queued: std::collections::HashSet<u64>,
 }
 
 /// One store's half, inside [`Jit`].
@@ -47,28 +53,82 @@ pub(crate) struct Store {
 
 /// `GEX_NT_STATS` counters: host lookups, run-time translations, lookups
 /// answered with the fallback, stale functions found on a lookup.
+/// Whether `GEX_NT_STATS` is set (read once).
+pub(crate) fn stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_NT_STATS").is_some())
+}
+
 pub(crate) mod stats {
     use std::sync::atomic::AtomicU64;
     pub static LOOKUPS: AtomicU64 = AtomicU64::new(0);
     pub static TRANSLATED: AtomicU64 = AtomicU64::new(0);
     pub static FALLBACKS: AtomicU64 = AtomicU64::new(0);
     pub static STALE: AtomicU64 = AtomicU64::new(0);
+    /// Guest execution redirected by trapping out of every wasm frame
+    /// (`HostState::resume_at`: signals, NtContinue, exception dispatch),
+    /// which discards the whole nest.
+    pub static RESUMES: AtomicU64 = AtomicU64::new(0);
+    /// Why each resume happened (`note_resume_cause`), by cause and target.
+    pub static RESUME_CAUSES: std::sync::Mutex<Option<std::collections::HashMap<(String, u64), u64>>> = std::sync::Mutex::new(None);
+    /// Record a trap-out resume's cause (a syscall's name, an exception
+    /// code, a signal) and where the guest went.
+    pub fn note_resume_cause(cause: String, target: u64) {
+        *RESUME_CAUSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((cause, target)).or_default() += 1;
+    }
+    /// The causes since the last call, totals first, then the `n` busiest
+    /// (cause, target) pairs.
+    pub fn take_resume_causes(n: usize) -> (Vec<(String, u64)>, Vec<((String, u64), u64)>) {
+        let m = RESUME_CAUSES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let mut by: std::collections::HashMap<String, u64> = Default::default();
+        for ((c, _), k) in &m {
+            *by.entry(c.clone()).or_default() += k;
+        }
+        let mut tot: Vec<_> = by.into_iter().collect();
+        tot.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut v: Vec<_> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(n);
+        (tot, v)
+    }
+    /// Calls the fallback served, and 1 in 1024 of their targets.
+    pub static FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static FALLBACK_SITES: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+    /// The `n` most sampled fallback targets since the last call.
+    pub fn take_fallback_sites(n: usize) -> Vec<(u64, u64)> {
+        let m = FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let mut v: Vec<_> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(n);
+        v
+    }
     /// Microseconds in the translator, in compiling its modules, and the
     /// longest single lookup miss (translate + compile + install).
     pub static TRANSLATE_US: AtomicU64 = AtomicU64::new(0);
     pub static COMPILE_US: AtomicU64 = AtomicU64::new(0);
     pub static WORST_US: AtomicU64 = AtomicU64::new(0);
+    /// Background translations: queued, dropped (retired meanwhile), and
+    /// microseconds from queueing to publication.
+    pub static QUEUED: AtomicU64 = AtomicU64::new(0);
+    pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+    pub static LATENCY_US: AtomicU64 = AtomicU64::new(0);
     pub fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
         format!(
-            "ftab lookups={} translated={} fallback={} stale={} translate_ms={} compile_ms={} worst_ms={}",
+            "ftab lookups={} translated={} fallback={} stale={} resumes={} exc_nested={} exc_escaped={} translate_ms={} compile_ms={} worst_ms={} queued={} dropped={} latency_ms={}",
             LOOKUPS.load(Relaxed),
             TRANSLATED.load(Relaxed),
             FALLBACKS.load(Relaxed),
             STALE.load(Relaxed),
+            RESUMES.load(Relaxed),
+            crate::nt::EXC_NESTED.load(Relaxed),
+            crate::nt::EXC_ESCAPED.load(Relaxed),
             TRANSLATE_US.load(Relaxed) / 1000,
             COMPILE_US.load(Relaxed) / 1000,
-            WORST_US.load(Relaxed) / 1000
+            WORST_US.load(Relaxed) / 1000,
+            QUEUED.load(Relaxed),
+            DROPPED.load(Relaxed),
+            LATENCY_US.load(Relaxed) / 1000
         )
     }
 }
@@ -98,6 +158,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
             None => {
                 let m = Module::new(cx.as_context().engine(), gex_cgen::runtime::module())
                     .context("compiling the function table's runtime module")?;
+                crate::aot_share::note(&m, crate::aot_share::Kind::Runtime);
                 s.ftab.runtime = Some(m.clone());
                 m
             }
@@ -217,13 +278,68 @@ pub(crate) fn publish(
     tier: Tier,
     checks: Vec<(u64, u32)>,
 ) -> Result<u32> {
-    let entries: Vec<u64> = funcs.iter().copied().filter(|&a| a != 0).collect();
+    Ok(publish_at(sh, memory, module, funcs, tier, checks, None)?.expect("an unconditional publish"))
+}
+
+/// [`publish`], unless `epoch` is given and a retirement happened since
+/// (then nothing, and `None`).
+fn publish_at(
+    sh: &Arc<Mutex<JitShared>>,
+    memory: &gex_mem::GuestMemory,
+    module: Module,
+    funcs: &[u64],
+    tier: Tier,
+    checks: Vec<(u64, u32)>,
+    epoch: Option<u64>,
+) -> Result<Option<u32>> {
+    let pairs: Vec<(u64, u32)> = funcs.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
+    publish_pairs_at(sh, memory, module, funcs.len() as u32, &pairs, tier, checks, epoch)
+}
+
+/// [`publish`] for a module whose slots are bound by explicit (guest
+/// address, slot) pairs: several addresses may share a slot (an export
+/// provider's function serving several exports).
+pub(crate) fn publish_pairs(
+    sh: &Arc<Mutex<JitShared>>,
+    memory: &gex_mem::GuestMemory,
+    module: Module,
+    len: u32,
+    pairs: &[(u64, u32)],
+    tier: Tier,
+) -> Result<u32> {
+    Ok(publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_pairs_at(
+    sh: &Arc<Mutex<JitShared>>,
+    memory: &gex_mem::GuestMemory,
+    module: Module,
+    len: u32,
+    pairs: &[(u64, u32)],
+    tier: Tier,
+    checks: Vec<(u64, u32)>,
+    epoch: Option<u64>,
+) -> Result<Option<u32>> {
+    let mut entries: Vec<u64> = pairs.iter().map(|&(a, _)| a).filter(|&a| a != 0).collect();
+    entries.sort_unstable();
+    entries.dedup();
     let n = {
         let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        if epoch.is_some_and(|e| e != s.ftab.epoch) {
+            return Ok(None);
+        }
         let m = s.ftab.modules.len() as u32;
+        crate::aot_share::note(
+            &module,
+            match tier {
+                Tier::Unit => crate::aot_share::Kind::Unit,
+                Tier::Jit => crate::aot_share::Kind::Jit,
+                Tier::Region => crate::aot_share::Kind::Tier1,
+            },
+        );
         s.ftab.modules.push(module);
-        let pairs: Vec<(u64, u32)> = funcs.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
-        let n = s.ftab.map.publish(funcs.len() as u32, m, tier, &pairs);
+        let n = s.ftab.map.publish(len, m, tier, pairs);
         if !checks.is_empty() {
             s.ftab.checks.insert(n, checks.clone());
         }
@@ -236,7 +352,7 @@ pub(crate) fn publish(
         gex_kernel::ftab::fcache_clear(data, a);
     }
     publish_bridges(sh, &entries, &checks)?;
-    Ok(n)
+    Ok(Some(n))
 }
 
 /// Point tier-1's dispatch slot for each of `entries` at the bridge, in
@@ -340,12 +456,26 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
             }
             stats::STALE.fetch_add(1, Relaxed);
             s.ftab.map.retire(addr);
+            s.ftab.queued.remove(&addr);
             drop(s);
             gex_kernel::ftab::fcache_clear(memory.bytes(), addr);
             catch_up(&mut *caller)?;
         }
     }
-    if let Some(idx) = translate(caller, &sh, &memory, addr)? {
+    if background() {
+        // Tier-1 (the fallback) runs it meanwhile; the publication clears
+        // this address's cache entry, so the next call finds the function.
+        // The cache entry first: a publication racing ahead clears it.
+        stats::FALLBACKS.fetch_add(1, Relaxed);
+        gex_kernel::ftab::fcache_write(memory.bytes(), addr, gex_abi::ftab::FALLBACK);
+        let fresh = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.queued.insert(addr);
+        if fresh {
+            if let Some(j) = job(caller, &sh, &memory, addr) {
+                queue(j);
+            }
+        }
+        return Ok(gex_abi::ftab::FALLBACK as i32);
+    } else if let Some(idx) = translate(caller, &sh, &memory, addr)? {
         gex_kernel::ftab::fcache_write(memory.bytes(), addr, idx);
         return Ok(idx as i32);
     }
@@ -354,10 +484,36 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
     Ok(gex_abi::ftab::FALLBACK as i32)
 }
 
-/// Ask the run-time translator for `addr`, install what it makes into this
-/// store and say which index serves `addr`.
-fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Result<Option<u32>> {
-    let Some(tr) = gex_kernel::ftab::translator() else { return Ok(None) };
+/// Whether misses are translated on worker threads while the fallback
+/// runs the code (`GEX_FJIT_BACKGROUND=1`), or on the missing thread before
+/// it carries on (the default). Natively the fallback is tier-1, whose
+/// translation of the same code costs about as much as the JIT's (it is
+/// compiled by the same Cranelift, a block at a time): tests/nt sync runs
+/// 6.0 s (x86) and 9.9 s (x64) in the background against 4.0 s and 3.9 s
+/// inline. Worth it only with a cheap fallback (the browser's, or an
+/// interpreter).
+pub(crate) fn background() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_FJIT_BACKGROUND").is_some())
+}
+
+/// One translation's inputs, taken on the guest thread so that any thread
+/// can do it: the mappings as they are now, and the retirement epoch they
+/// belong to.
+struct Job {
+    sh: Arc<Mutex<JitShared>>,
+    memory: gex_mem::GuestMemory,
+    engine: wasmtime::Engine,
+    addr: u64,
+    exec: Vec<(u64, u64)>,
+    ro: Vec<(u64, u64)>,
+    class32: bool,
+    epoch: u64,
+    queued_at: std::time::Instant,
+}
+
+fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Option<Job> {
+    gex_kernel::ftab::translator()?;
     let (exec, ro): (Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let v = k.mem.vmas();
         (
@@ -365,11 +521,32 @@ fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, mem
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
         )
     });
-    let executable = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e);
-    let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
-    if !executable(addr) {
-        return Ok(None);
+    if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
+        return None;
     }
+    let epoch = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.epoch;
+    Some(Job {
+        sh: Arc::clone(sh),
+        memory: memory.clone(),
+        engine: caller.engine().clone(),
+        addr,
+        exec,
+        ro,
+        class32: gex_abi::X86 && gex_xlate::arch::compat(),
+        epoch,
+        queued_at: std::time::Instant::now(),
+    })
+}
+
+/// Translate, compile and publish `j` (into no store: each catches up as it
+/// replays). False when the translator declined or a retirement since the
+/// job was taken made it stale.
+fn run_job(j: &Job) -> Result<bool> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(tr) = gex_kernel::ftab::translator() else { return Ok(false) };
+    let (sh, memory, addr) = (&j.sh, &j.memory, j.addr);
+    let executable = |a: u64| j.exec.iter().any(|&(s, e)| a >= s && a < e);
+    let read_only = |a: u64, n: u64| j.ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     let pages = Mutex::new(Vec::<(u64, u32)>::new());
     let pg = |page: u64| {
         let g = page_gen(sh, memory, page);
@@ -385,30 +562,67 @@ fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, mem
         executable: &executable,
         read_only: &read_only,
         page_gen: &pg,
-        class32: gex_abi::X86 && gex_xlate::arch::compat(),
+        class32: j.class32,
     };
     let t0 = std::time::Instant::now();
     let t = tr.translate(&req);
-    stats::TRANSLATE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    let Some(t) = t else { return Ok(None) };
+    stats::TRANSLATE_US.fetch_add(t0.elapsed().as_micros() as u64, Relaxed);
+    let Some(t) = t else { return Ok(false) };
     let funcs = gex_kernel::ftab::module_funcs(&t.wasm).ok_or_else(|| anyhow!("a translation for {addr:#x} has no gex.funcs section"))?;
     if !funcs.contains(&addr) {
         bail!("the translation for {addr:#x} does not hold it");
     }
-    let engine = caller.engine().clone();
     let t1 = std::time::Instant::now();
-    let module = Module::new(&engine, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
+    let module = Module::new(&j.engine, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
     let tc = t1.elapsed();
-    stats::COMPILE_US.fetch_add(tc.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    stats::TRANSLATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stats::COMPILE_US.fetch_add(tc.as_micros() as u64, Relaxed);
     let checks = pages.into_inner().unwrap_or_else(|e| e.into_inner());
-    publish(sh, memory, module, &funcs, Tier::Jit, checks)?;
+    if publish_at(sh, memory, module, &funcs, Tier::Jit, checks, Some(j.epoch))?.is_none() {
+        stats::DROPPED.fetch_add(1, Relaxed);
+        return Ok(false);
+    }
+    stats::TRANSLATED.fetch_add(1, Relaxed);
+    stats::LATENCY_US.fetch_add(j.queued_at.elapsed().as_micros() as u64, Relaxed);
+    stats::WORST_US.fetch_max(t0.elapsed().as_micros() as u64, Relaxed);
+    if std::env::var("GEX_FTAB_SLOW").ok().and_then(|v| v.parse::<u128>().ok()).is_some_and(|ms| t0.elapsed().as_millis() >= ms) {
+        eprintln!("[ftab] slow translation {addr:#x}: {} ms (translate {} ms, compile {} ms, {} bytes)", t0.elapsed().as_millis(), (t1 - t0).as_millis(), tc.as_millis(), t.wasm.len());
+    }
+    Ok(true)
+}
+
+/// Hand `j` to the background translators (`GEX_FJIT_WORKERS`, default 2),
+/// started at the first need.
+fn queue(j: Job) {
+    static TX: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        let n = std::env::var("GEX_FJIT_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).max(1);
+        for k in 0..n {
+            let rx = Arc::clone(&rx);
+            let _ = std::thread::Builder::new().name(format!("gex-fjit-{k}")).spawn(move || loop {
+                let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                let Ok(j) = next else { return };
+                if let Err(e) = run_job(&j) {
+                    eprintln!("[fjit] {:#x}: {e:#}; left to the fallback", j.addr);
+                }
+            });
+        }
+        Mutex::new(tx)
+    });
+    stats::QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send(j);
+}
+
+/// Translate `addr` on this thread, install what it makes into this store
+/// and say which index serves `addr`.
+fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Result<Option<u32>> {
+    let Some(j) = job(caller, sh, memory, addr) else { return Ok(None) };
+    if !run_job(&j)? {
+        return Ok(None);
+    }
     catch_up(&mut *caller)?;
     replay_registry(caller)?;
-    stats::WORST_US.fetch_max(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    if std::env::var("GEX_FTAB_SLOW").ok().and_then(|v| v.parse::<u128>().ok()).is_some_and(|ms| t0.elapsed().as_millis() >= ms) {
-        eprintln!("[ftab] slow miss {addr:#x}: {} ms (translate {} ms, compile {} ms, {} bytes)", t0.elapsed().as_millis(), (t1 - t0).as_millis(), tc.as_millis(), t.wasm.len());
-    }
     Ok(sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(addr).map(|f| f.idx))
 }
 
@@ -451,6 +665,15 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
         (true, true) => 4,
     };
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
+    if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {
+        *stats::FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(target).or_default() += 1;
+    }
+    // A jump out of an exception being dispatched nested (a handler's
+    // longjmp to its `setjmp`, a `catch` continuation): back to the frames
+    // it was raised under.
+    if crate::nt::exc_escape(caller, target) {
+        return Err(StopExecution.into());
+    }
     // No caller waits for a return (a root, or the bridge): leave, and the
     // root dispatches there flat.
     if ret == gex_abi::ftab::NO_RETURN {
@@ -475,6 +698,8 @@ pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots
 /// Their page checks would catch them anyway; this keeps the cache from
 /// sending callers there first.
 pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u64)]) {
+    sh.ftab.epoch += 1;
+    sh.ftab.queued.retain(|&a| !ranges.iter().any(|&(s, e)| a >= s && a < e));
     for &(start, end) in ranges {
         let hit: Vec<(u64, gex_kernel::ftab::Func)> = sh.ftab.map.range(start, end).collect();
         for (a, f) in hit {

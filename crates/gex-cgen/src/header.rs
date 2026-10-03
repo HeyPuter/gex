@@ -174,6 +174,11 @@ GEX_INLINE uint32_t gex_g(uint64_t a) {
 GEX_INLINE char *gex_gb(uint64_t a) {
     return (char *)(uintptr_t)(a < GEX_GUEST_LIMIT ? (uint32_t)a : (uint32_t)GEX_GUEST_LIMIT);
 }
+/* An i386 effective address, already reduced mod 2^32 as the guest's are:
+ * the same guard, on 32 bits. */
+GEX_INLINE char *gex_gb32(uint32_t a) {
+    return (char *)(uintptr_t)(a < (uint32_t)GEX_GUEST_LIMIT ? a : (uint32_t)GEX_GUEST_LIMIT);
+}
 /* A static offset above 0xffff (AArch64 only): tier-1 adds it in the memarg,
  * a 33-bit sum that traps past 2^32. Emulated exactly. */
 GEX_INLINE char *gex_g33(uint64_t base, uint64_t off) {

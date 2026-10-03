@@ -1,14 +1,17 @@
-//! The function tier's whole-image units (format `gex-cgen-image 3`) in the
-//! browser: the shim's half (docs/browser-units-plan.md, step 1).
+//! The function tier's whole-image units (format `gex-cgen-image 3`) and the
+//! function table in the browser: the shim's half (docs/browser-units-plan.md,
+//! docs/merge-plan.md §9.8.1).
 //!
 //! What stays here is small: which images were mapped, which unit each one
 //! wants (its key, `gex_cgen::image::image_key`, the same function the native
 //! host uses), that the mapped bytes are the ones the unit was built from,
-//! and the publish -- page bases, the entries' slots, the directory -- as the
-//! native `publish_cgen_unit` does it. A unit's wasm never enters the shim's
-//! heap (noita.exe's is ~195 MiB): JavaScript fetches and compiles it, hands
-//! over only its entry list, and fills each Worker's dispatch and body tables
-//! from the unit's own function table (`gex_fnref`). Units are kept in a list
+//! and the publish -- a range of the function table, the address map, the
+//! bridges in tier-1's dispatch slots, the directory -- as the native
+//! `ftab::publish` does it. A unit's wasm never enters the shim's heap
+//! (noita.exe's is ~195 MiB): JavaScript fetches and compiles it, hands over
+//! only its slot list (`c.entries`, the `gex.funcs` section's), and each
+//! Worker instantiates it into its own function table with `__table_base` at
+//! the unit's range as it replays the table's log. Units are kept in a list
 //! of their own, not in the module registry: the registry may be rebuilt
 //! (`backfill_registry`), and a unit has no bytes to keep in it.
 //!
@@ -17,15 +20,17 @@
 //!     `gex_cgen_key`/`gex_cgen_path` say which;
 //!   - JS loads `<key>/c.wasm` and `<key>/c.entries` and calls
 //!     `gex_cgen_publish(u, entries, n)`, or `gex_cgen_missing(u)`;
-//!   - every Worker installs published units in order (`gex_cgen_count`,
-//!     `gex_cgen_regs`), reports with `gex_cgen_have(n)` and its body tables'
-//!     sizes with `gex_cgen_body_size` (one body table per dispatch table,
-//!     `gexc.bodies0..7`); the publishing Worker then calls
-//!     `gex_cgen_installed(u)`, which writes the directory.
-//!
-//! The body table's default entry is `gex_cgen_leave`: -1, as natively. What
-//! C code does when it leaves is the units' business, not this file's.
+//!   - every Worker replays the table's log (`gex_ftab_log_len`,
+//!     `gex_ftab_event`): an install is its unit instantiated with
+//!     `__table_base` = `gex_ftab_install_base` and its bridges written
+//!     (`gex_cgen_regs`); a retirement points the index back at the
+//!     runtime module's `resolve`. It reports with `gex_cgen_have(n)`; the
+//!     publishing Worker then calls `gex_cgen_installed(u)`, which writes
+//!     the directory.
+//!   - `gex.lookup` is `gex_ftab_lookup` (JS catches up first when
+//!     `gex_ftab_behind`), the table's index 1 `gex_ftab_fallback`.
 
+use gex_kernel::ftab::{Event, FuncMap, Tier};
 use gex_kernel::GuestMem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -53,8 +58,8 @@ struct Unit {
     wine: bool,
     /// Each executable page as the unit was built from it, hashed.
     pages: Vec<(u64, u64)>,
-    /// Once published: (entry's index in the unit, its dispatch table, its
-    /// slot there, alone in the slot), flattened for JS.
+    /// Once published: the tier-1 dispatch slots (table, slot) its entries
+    /// are reached at, which hold the bridge, flattened for JS.
     regs: Vec<u32>,
     /// Pages this unit was the first to number.
     dirs: Vec<(u64, u32)>,
@@ -67,14 +72,18 @@ static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
 static WANTED: Mutex<std::collections::VecDeque<usize>> = Mutex::new(std::collections::VecDeque::new());
 /// Published units, in publish order: what every Worker installs.
 static PUBLISHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// Each Worker's body-table size, by Worker; `gex_abi::BODY_LIMIT` is the least.
-static BODY_SIZES: Mutex<std::collections::BTreeMap<u32, [u32; gex_abi::DISPATCH_TABLES]>> =
-    Mutex::new(std::collections::BTreeMap::new());
 /// The pages installed units cover, hashed as built (`on_retire`).
 static UNIT_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
+/// The process's function table, host side (`gex_kernel::ftab`): one for
+/// every Worker, each of which keeps its own `WebAssembly.Table` in step.
+static FTAB: Mutex<Option<FuncMap>> = Mutex::new(None);
+
+fn ftab<R>(f: impl FnOnce(&mut FuncMap) -> R) -> R {
+    f(lock(&FTAB).get_or_insert_with(FuncMap::new))
+}
 
 thread_local! {
-    /// How many published units this Worker has installed.
+    /// How far through the function table's log this Worker is.
     static HAVE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -238,21 +247,32 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     0
 }
 
-/// Publish unit `u` with its `n` entries (u64s at `entries`): give every page
-/// holding one a base, mark them translated, and number their slots, as the
-/// native `publish_cgen_unit` does. 0, or -1.
+/// Publish unit `u` with its `n` slots (u64s at `entries`: the guest address
+/// of each slot its element segment fills, 0 for none): a range of the
+/// function table, each entry mapped to its slot, the probe cache cleared for
+/// them, and a bridge in tier-1's dispatch slot for each, numbering their
+/// pages -- the native `ftab::publish`. 0, or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
     let gm = GuestMem::new(crate::guest_bytes());
-    let addrs: Vec<u64> = (0..n as u64).filter_map(|i| gm.read_u64(entries as u64 + 8 * i).ok()).collect();
-    let (regs, dirs, slots) = crate::with_host(|h| {
-        // By (table, slot): the browser's runtime slots span several dispatch
-        // tables (they start above the statically recompiled images'), and
-        // each has a body table of its own.
-        let mut by_slot: std::collections::BTreeMap<(u32, u32), Vec<(u64, u32)>> = Default::default();
+    let slots: Vec<u64> = (0..n as u64).filter_map(|i| gm.read_u64(entries as u64 + 8 * i).ok()).collect();
+    let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0).collect();
+    let pairs: Vec<(u64, u32)> = slots.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
+    ftab(|m| m.publish(slots.len() as u32, u, Tier::Unit, &pairs));
+    {
+        let mem = crate::guest_bytes();
+        for &a in &addrs {
+            gex_kernel::ftab::fcache_clear(mem, a);
+        }
+    }
+    let (regs, dirs, nslots) = crate::with_host(|h| {
+        let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         let mut new_pages = Vec::new();
-        for (k, &a) in addrs.iter().enumerate() {
+        for &a in &addrs {
             let page = a / gex_abi::DISPATCH_PAGE;
+            if page >= gex_abi::DISPATCH_MAX_PAGES {
+                continue;
+            }
             let base = match h.jit.page_table.lookup(page) {
                 Some(b) => b,
                 None => {
@@ -262,14 +282,11 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
                 }
             };
             let t = gex_abi::dispatch_entry_table(base) as u32;
-            by_slot.entry((t, gex_abi::dispatch_index(a, base) as u32)).or_default().push((a, k as u32));
+            seen.insert((t, gex_abi::dispatch_index(a, base) as u32));
         }
-        let mut regs = Vec::with_capacity(4 * by_slot.len());
-        for ((t, slot), mut v) in by_slot {
-            // A shared slot: the first gets the dispatch slot (its target
-            // check hands the others to tier-1's trampoline); none gets a body.
-            v.sort_unstable();
-            regs.extend_from_slice(&[v[0].1, t, slot, (v.len() == 1) as u32]);
+        let mut regs = Vec::with_capacity(2 * seen.len());
+        for (t, slot) in seen {
+            regs.extend_from_slice(&[t, slot]);
         }
         h.jit.translated.extend(addrs.iter().copied());
         (regs, new_pages, h.jit.page_table.slots())
@@ -282,7 +299,7 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
         };
         x.regs = regs;
         x.dirs = dirs;
-        x.slots = slots;
+        x.slots = nslots;
         let mut pages = lock(&UNIT_PAGES);
         let map = pages.get_or_insert_with(Default::default);
         let mem = crate::guest_bytes();
@@ -311,7 +328,7 @@ pub extern "C" fn gex_cgen_published(i: u32) -> i32 {
     lock(&PUBLISHED).get(i as usize).map_or(-1, |&u| u as i32)
 }
 
-/// Unit `u`'s registrations, `[k, table, slot, alone]` per slot, copied to `buf`
+/// Unit `u`'s bridges, `[table, slot]` per dispatch slot, copied to `buf`
 /// (`cap` u32s); returns how many u32s there are.
 #[no_mangle]
 pub extern "C" fn gex_cgen_regs(u: u32, buf: u32, cap: u32) -> u32 {
@@ -331,16 +348,93 @@ pub extern "C" fn gex_cgen_slots(u: u32) -> u32 {
     lock(&UNITS).get(u as usize).map_or(0, |x| x.slots.min(u32::MAX as u64) as u32)
 }
 
-/// This Worker has installed the first `n` published units.
+/// This Worker has replayed the first `n` events of the function table's log.
 #[no_mangle]
 pub extern "C" fn gex_cgen_have(n: u32) {
     HAVE.with(|c| c.set(n));
 }
 
-/// Whether this Worker has published units still to install: a miss at a
-/// unit's entry is then a catch-up, not a translation.
+/// Whether this Worker has the function table's log still to replay: a miss
+/// at a unit's entry is then a catch-up, not a translation.
 pub(crate) fn behind() -> bool {
-    on() && HAVE.with(|c| c.get()) < gex_cgen_count()
+    on() && (HAVE.with(|c| c.get()) as usize) < ftab(|m| m.log_len())
+}
+
+/// [`behind`], for `gex.lookup`'s JS half.
+#[no_mangle]
+pub extern "C" fn gex_ftab_behind() -> i32 {
+    behind() as i32
+}
+
+/// How many events the function table's log has.
+#[no_mangle]
+pub extern "C" fn gex_ftab_log_len() -> u32 {
+    ftab(|m| m.log_len() as u32)
+}
+
+/// Event `i` of the log: an install as `1 << 32 | install`, a retirement as
+/// `2 << 32 | index`; 0 past the end.
+#[no_mangle]
+pub extern "C" fn gex_ftab_event(i: u32) -> i64 {
+    ftab(|m| match m.log_from(i as usize).first() {
+        Some(Event::Install(n)) => (1i64 << 32) | *n as i64,
+        Some(Event::Retire(idx)) => (2i64 << 32) | *idx as i64,
+        None => 0,
+    })
+}
+
+/// Install `n`'s table range starts here.
+#[no_mangle]
+pub extern "C" fn gex_ftab_install_base(n: u32) -> u32 {
+    ftab(|m| m.installs().get(n as usize).map_or(0, |i| i.base))
+}
+
+/// And holds this unit (the index the other `gex_cgen_*` calls take).
+#[no_mangle]
+pub extern "C" fn gex_ftab_install_unit(n: u32) -> u32 {
+    ftab(|m| m.installs().get(n as usize).map_or(u32::MAX, |i| i.module))
+}
+
+/// How large every Worker's table must be.
+#[no_mangle]
+pub extern "C" fn gex_ftab_size() -> u32 {
+    ftab(|m| m.size())
+}
+
+/// `gex.lookup(ctx, addr)`: the index of the function for `addr` -- a
+/// unit's, if its entry page was not rewritten since -- else the fallback,
+/// written into the probe cache either way. JS has caught this Worker up.
+#[no_mangle]
+pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
+    let addr = addr as u64;
+    let mem = crate::guest_bytes();
+    let hit = ftab(|m| {
+        let f = m.get(addr)?;
+        let page = addr / gex_abi::DISPATCH_PAGE;
+        let patched = mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
+        if patched {
+            m.retire(addr);
+            return None;
+        }
+        Some(f.idx)
+    });
+    let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);
+    gex_kernel::ftab::fcache_write(mem, addr, idx);
+    idx as i32
+}
+
+/// The table's index 1: code no unit holds. The browser has no call-out
+/// yet (a nested guest run inside a wasm call), so this leaves for it:
+/// `ctx::PC` = the target, 0; the frame that owns the code it returns into
+/// catches it, else tier-1 runs it.
+#[no_mangle]
+pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, _ret: i64) -> i32 {
+    LEAVES.fetch_add(1, Ordering::Relaxed);
+    let mut gm = GuestMem::new(crate::guest_bytes());
+    let c = ctx as u32 as u64;
+    let t = gm.read_u64(c + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
+    let _ = gm.write_u64(c + gex_abi::ctx::PC as u64, t);
+    gex_abi::ftab::RET_LEFT
 }
 
 /// The publishing Worker has installed unit `u`: point the directory at the
@@ -358,61 +452,23 @@ pub extern "C" fn gex_cgen_installed(u: u32) {
     });
 }
 
-/// Worker `worker`'s body table for dispatch table `table` holds `size`
-/// entries. Each table's limit (`gex_abi::BODY_LIMITS[table]`) is the least
-/// of every Worker's, so the dispatcher's `call_known` goes straight to a
-/// body only for a slot every Worker has.
-#[no_mangle]
-pub extern "C" fn gex_cgen_body_size(worker: u32, table: u32, size: u32) {
-    let mut sizes = lock(&BODY_SIZES);
-    if (table as usize) < gex_abi::DISPATCH_TABLES {
-        sizes.entry(worker).or_insert([0; gex_abi::DISPATCH_TABLES])[table as usize] = size;
-    }
-    publish_limits(&sizes);
-}
-
-/// A Worker has gone: its body tables no longer limit anyone.
-#[no_mangle]
-pub extern "C" fn gex_cgen_body_gone(worker: u32) {
-    let mut sizes = lock(&BODY_SIZES);
-    sizes.remove(&worker);
-    publish_limits(&sizes);
-}
-
-fn publish_limits(sizes: &std::collections::BTreeMap<u32, [u32; gex_abi::DISPATCH_TABLES]>) {
-    let mut gm = GuestMem::new(crate::guest_bytes());
-    for t in 0..gex_abi::DISPATCH_TABLES {
-        let min = sizes.values().map(|v| v[t]).min().unwrap_or(0);
-        let _ = gm.write_u32(gex_abi::BODY_LIMITS + 4 * t as u64, min);
-    }
-}
-
-static DISPATCHER: OnceLock<Vec<u8>> = OnceLock::new();
-
-/// The per-store dispatcher module (`gex_cgen::splice::dispatcher_module`):
-/// where its bytes are.
-#[no_mangle]
-pub extern "C" fn gex_cgen_dispatcher_ptr() -> u32 {
-    DISPATCHER.get_or_init(gex_cgen::splice::dispatcher_module).as_ptr() as u32
-}
-
-/// And how long they are.
-#[no_mangle]
-pub extern "C" fn gex_cgen_dispatcher_len() -> u32 {
-    DISPATCHER.get_or_init(gex_cgen::splice::dispatcher_module).len() as u32
-}
-
 static LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The body table's default entry: an address no installed unit holds a body
-/// for. -1, leave -- as the native `cgen_leave`.
+/// The function table's runtime module (`gex_cgen::runtime`): where its
+/// bytes are, and how long they are.
+static RUNTIME: OnceLock<Vec<u8>> = OnceLock::new();
+
 #[no_mangle]
-pub extern "C" fn gex_cgen_leave(_ctx: i32, _depth: i32, _need: i32, _ret: i64) -> i32 {
-    LEAVES.fetch_add(1, Ordering::Relaxed);
-    -1
+pub extern "C" fn gex_ftab_runtime_ptr() -> u32 {
+    RUNTIME.get_or_init(gex_cgen::runtime::module).as_ptr() as u32
 }
 
-/// Leaves so far, for the stats line.
+#[no_mangle]
+pub extern "C" fn gex_ftab_runtime_len() -> u32 {
+    RUNTIME.get_or_init(gex_cgen::runtime::module).len() as u32
+}
+
+/// Calls the fallback answered (it leaves), for the stats line.
 pub(crate) fn leaves() -> u64 {
     LEAVES.load(Ordering::Relaxed)
 }
@@ -421,6 +477,19 @@ pub(crate) fn leaves() -> u64 {
 /// the ones it was built from gets its bit in `gex_abi::PATCHED_PAGES`, and
 /// compiled code stops calling into it (the native `on_retire`).
 pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
+    on_retire_pages(ranges);
+    // After the bits: a lookup once the probe cache is cleared sees them.
+    let memory = crate::guest_bytes();
+    ftab(|m| {
+        for &(start, end) in ranges {
+            for (a, _) in m.range(start, end).collect::<Vec<_>>() {
+                gex_kernel::ftab::fcache_clear(memory, a);
+            }
+        }
+    });
+}
+
+fn on_retire_pages(ranges: &[(u64, u64)]) {
     let guard = lock(&UNIT_PAGES);
     let Some(pages) = guard.as_ref() else { return };
     let memory = crate::guest_bytes();

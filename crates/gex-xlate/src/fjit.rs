@@ -125,7 +125,7 @@ impl Jit {
             }
             let State { starts, noreturn, .. } = &mut *st;
             let f = func::recover_one(&code, a, starts, noreturn, &opts);
-            if let Err(e) = f.verify() {
+            if let Err(e) = f.verify().and_then(|_| block_local(&f)) {
                 if std::env::var_os("GEX_FJIT_STATS").is_some() {
                     eprintln!("[fjit] {a:#x}: recovered malformed ({e}); left to the fallback");
                 }
@@ -186,8 +186,24 @@ impl Jit {
             .filter_map(|a| self.intrinsics.get(a).map(|&k| crate::intrinsic::block(*a, k)))
             .collect();
         let pops = ret_pops(&functions, class32, &|a| mem.get(a as usize).copied());
-        let out = match gex_fjit::runtime(functions, &sums, class32, page_gen, &builtins, &pops) {
-            Ok((wasm, entries, es)) if entries.contains(&addr) => {
+        if let Ok(dir) = std::env::var("GEX_FJIT_DUMP") {
+            // The batch as GIR text (`gex_ir::text`), to replay offline.
+            let _ = std::fs::create_dir_all(&dir);
+            let text: String = functions.iter().map(gex_ir::text::print).collect::<Vec<_>>().join("\n");
+            let _ = std::fs::write(format!("{dir}/{addr:x}.gir"), text);
+        }
+        // A bug in the emitter costs the batch its translation, not the
+        // process: the fallback runs it.
+        let emitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gex_fjit::runtime(functions, &sums, class32, page_gen, &builtins, &pops)
+        }))
+        .map_err(|p| p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default());
+        let out = match emitted {
+            Err(why) => {
+                eprintln!("[fjit] {addr:#x}: the emitter panicked ({why}); left to the fallback");
+                None
+            }
+            Ok(Ok((wasm, entries, es))) if entries.contains(&addr) => {
                 if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
                     eprintln!("[fjit] {addr:#x}: {es:?}");
                 }
@@ -198,13 +214,13 @@ impl Jit {
                 }
                 Some(wasm)
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 if std::env::var_os("GEX_FJIT_STATS").is_some() {
                     eprintln!("[fjit] {addr:#x}: the module does not hold it; left to the fallback");
                 }
                 None
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 eprintln!("[fjit] {addr:#x}: {e:#}; left to the fallback");
                 None
             }
@@ -224,6 +240,36 @@ impl Jit {
     pub fn stats(&self) -> String {
         self.st.lock().unwrap_or_else(|e| e.into_inner()).line()
     }
+}
+
+/// Memory form's rule, which the emitter relies on: every value a block
+/// uses is defined earlier in the same block. (Recovery has been seen to
+/// break it on code that jumps into the middle of a lifted block, in a
+/// packed section of noita.exe.)
+fn block_local(f: &Function) -> Result<(), String> {
+    for b in &f.blocks {
+        let mut defined = HashSet::new();
+        let mut bad = None;
+        for s in &b.stmts {
+            s.for_each_use(|v| {
+                if !defined.contains(&v.0) {
+                    bad = Some(v);
+                }
+            });
+            gex_ir::func::for_each_def(s, |v| {
+                defined.insert(v.0);
+            });
+        }
+        b.term.for_each_use(|v| {
+            if !defined.contains(&v.0) {
+                bad = Some(v);
+            }
+        });
+        if let Some(v) = bad {
+            return Err(format!("block {:#x} uses {v:?} from another block", b.start));
+        }
+    }
+    Ok(())
 }
 
 /// The pointer an indirect call's target `v` (in block `b`) loads from a
@@ -257,40 +303,9 @@ fn slot_target(f: &Function, b: gex_ir::func::BlockId, v: gex_ir::Value, mem: &[
     Some(if n == 4 { u32::from_le_bytes(bytes.try_into().ok()?) as u64 } else { u64::from_le_bytes(bytes.try_into().ok()?) })
 }
 
-/// Where a function's `ret` pops more than the return address (i386
-/// `ret N`: stdcall callees, struct returns): the terminator's pc and how
-/// far it moves SP, for the function JIT's return check, which otherwise
-/// sees SP past where the caller expects and leaves. `read` gives a guest
-/// byte. Empty off x86.
-pub fn ret_pops(functions: &[Function], class32: bool, read: &dyn Fn(u64) -> Option<u8>) -> HashMap<u64, u64> {
-    let mut out = HashMap::new();
-    if !gex_abi::X86 {
-        return out;
-    }
-    let ptr = if class32 { 4 } else { 8 };
-    for f in functions {
-        for b in &f.blocks {
-            if !matches!(b.term, gex_ir::func::FTerm::Return { .. }) || b.synthetic {
-                continue;
-            }
-            let mut a = b.term_pc;
-            // `rep ret` / `bnd ret`; an operand-size prefix (a 16-bit
-            // pop) gets no entry, and its check leaves.
-            while matches!(read(a), Some(0xf2 | 0xf3)) && a < b.term_pc + 4 {
-                a += 1;
-            }
-            if read(a) == Some(0xc2) {
-                if let (Some(lo), Some(hi)) = (read(a + 1), read(a + 2)) {
-                    let n = u16::from_le_bytes([lo, hi]) as u64;
-                    if n != 0 {
-                        out.insert(b.term_pc, ptr + n);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
+/// Where a function's `ret` pops more than the return address
+/// (`gex_cgen::func::ret_pops`, which the AOT tier's return check uses too).
+pub use gex_cgen::func::ret_pops;
 
 impl State {
     fn line(&self) -> String {

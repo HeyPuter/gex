@@ -147,7 +147,10 @@ pub fn decompile(dir: &Path, object: &str, what: &str, size: Option<u64>, callee
     }
     let funcs: Vec<Function> = set.iter().map(|a| by_entry[a].clone()).collect();
     let export = format!("decompiled_{}", ident(&name));
-    let body = gex_cgen::standalone::standalone(&funcs, &[(addr, export.clone())], &sums, p.image.class32)
+    let byte = |a: u64| {
+        p.image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+    };
+    let body = gex_cgen::standalone::standalone(&funcs, &[(addr, export.clone())], &sums, p.image.class32, &byte)
         .with_context(|| format!("emitting C for {name}"))?;
 
     let objname = p.obj.path.rsplit('/').next().unwrap_or(&p.obj.path).to_string();

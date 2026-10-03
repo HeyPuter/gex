@@ -62,12 +62,35 @@ pub fn image_key(image: &gex_ld::Image) -> String {
 /// decides a unit from a recovery.
 fn unit_inputs() -> String {
     static S: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    S.get_or_init(|| {
-        let mut h = gex_key::sha256::Sha256::new();
-        h.update(abi_fingerprint().as_bytes());
-        format!("{UNIT_INPUTS}:{}", gex_key::sha256::hex(&h.finish()))
-    })
-    .clone()
+    let base = S
+        .get_or_init(|| {
+            let mut h = gex_key::sha256::Sha256::new();
+            h.update(abi_fingerprint().as_bytes());
+            format!("{UNIT_INPUTS}:{}", gex_key::sha256::hex(&h.finish()))
+        })
+        .clone();
+    // The flavor is part of the key: native and browser units never mix.
+    if unguarded() {
+        format!("{base}:unguarded")
+    } else {
+        base
+    }
+}
+
+static UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Build and look up the unguarded flavor of i386 units (no bounds guard on
+/// guest accesses: `Emitter::unguarded`), for a host whose guest memory is
+/// the whole linear memory, so out-of-range accesses trap by themselves --
+/// natively. The browser's NT layer keeps host data above a lower guard
+/// limit and keeps the guarded flavor (docs/noita-perf.md). Set before the
+/// first key is computed.
+pub fn set_unguarded(on: bool) {
+    UNGUARDED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn unguarded() -> bool {
+    UNGUARDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a unit's C takes from gex-abi: the generated header, and every value
@@ -142,21 +165,26 @@ pub const UNIT_BYTES: usize = 512 << 10;
 
 /// What code generation reads of a function's summary (the rest stays
 /// "unknown", which is always sound).
-fn summary_line(entry: u64, s: &Summary, trapfree: Option<u32>) -> String {
+fn summary_line(entry: u64, s: &Summary, trapfree: Option<u32>, touched: RegSet, guardfree: bool) -> String {
     format!(
-        "{entry:x} {:x} {:x} {}{}{} {}\n",
+        "{entry:x} {:x} {:x} {}{}{} {} {:x} {}\n",
         s.inputs.0,
         s.preserved.0,
         s.may_unwind as u8,
         s.may_leave_pending as u8,
         s.unknown_callee as u8,
-        trapfree.map(|w| w as i64).unwrap_or(-1)
+        trapfree.map(|w| w as i64).unwrap_or(-1),
+        touched.0,
+        guardfree as u8
     )
 }
 
-fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>)> {
+/// The line's sixth field, the registers the function's call tree names
+/// (`func::touched`), is optional: a recovery written before it existed
+/// reads as touching everything.
+fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>, RegSet, bool)> {
     let w: Vec<&str> = line.split_whitespace().collect();
-    if w.len() != 5 || w[3].len() != 3 {
+    if !(5..=7).contains(&w.len()) || w[3].len() != 3 {
         bail!("malformed summary line {line:?}");
     }
     let hex = |s: &str| u128::from_str_radix(s, 16).map_err(|e| anyhow!("{line:?}: {e}"));
@@ -169,7 +197,12 @@ fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>)> {
     s.unknown_callee = f[2] == b'1';
     let tf: i64 = w[4].parse().map_err(|e| anyhow!("{line:?}: {e}"))?;
     let entry = u64::from_str_radix(w[0], 16).map_err(|e| anyhow!("{line:?}: {e}"))?;
-    Ok((entry, s, (tf >= 0).then_some(tf as u32)))
+    let touched = match w.get(5) {
+        Some(t) => RegSet(hex(t)?),
+        None => RegSet::ALL,
+    };
+    let guardfree = w.get(6) == Some(&"1");
+    Ok((entry, s, (tf >= 0).then_some(tf as u32), touched, guardfree))
 }
 
 /// Stage 1: write `funcs` (memory form, already [`crate::select`]ed) and
@@ -177,6 +210,8 @@ fn parse_summary_line(line: &str) -> Result<(u64, Summary, Option<u32>)> {
 /// the record: the emitted C depends on it.
 pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summary>, class32: bool) -> Result<()> {
     let trapfree = func::trap_free(funcs, sums);
+    let touched = func::touched(funcs);
+    let guardfree = func::guard_free(funcs, sums);
     let parent = dir.parent().ok_or_else(|| anyhow!("{} has no parent", dir.display()))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
@@ -192,7 +227,8 @@ pub fn write_recovery(dir: &Path, funcs: &[Function], sums: &HashMap<u64, Summar
         writeln!(meta, "class32 {}", class32 as u8)?;
         for f in funcs {
             let s = sums.get(&f.entry).cloned().unwrap_or_else(Summary::unknown);
-            meta.write_all(summary_line(f.entry, &s, trapfree.get(&f.entry).copied()).as_bytes())?;
+            let t = touched.get(&f.entry).copied().unwrap_or(RegSet::ALL);
+            meta.write_all(summary_line(f.entry, &s, trapfree.get(&f.entry).copied(), t, guardfree.contains(&f.entry)).as_bytes())?;
         }
         meta.flush()?;
         let mut gir = BufWriter::new(std::fs::File::create(tmp.join("functions.gir"))?);
@@ -215,6 +251,8 @@ struct Recovery {
     entries: Vec<u64>,
     sums: HashMap<u64, Summary>,
     trapfree: HashMap<u64, u32>,
+    touched: HashMap<u64, RegSet>,
+    guardfree: HashSet<u64>,
 }
 
 fn read_format(r: &mut impl BufRead, what: &Path) -> Result<()> {
@@ -241,9 +279,13 @@ fn read_recovery(dir: &Path) -> Result<Recovery> {
         "class32 1" => true,
         other => bail!("{}: expected the class32 line, found {other:?}", path.display()),
     };
-    let mut rec = Recovery { class32, entries: Vec::new(), sums: HashMap::new(), trapfree: HashMap::new() };
+    let mut rec = Recovery { class32, entries: Vec::new(), sums: HashMap::new(), trapfree: HashMap::new(), touched: HashMap::new(), guardfree: HashSet::new() };
     for line in r.lines() {
-        let (e, s, tf) = parse_summary_line(&line?)?;
+        let (e, s, tf, t, g) = parse_summary_line(&line?)?;
+        rec.touched.insert(e, t);
+        if g {
+            rec.guardfree.insert(e);
+        }
         rec.entries.push(e);
         rec.sums.insert(e, s);
         if let Some(w) = tf {
@@ -251,6 +293,29 @@ fn read_recovery(dir: &Path) -> Result<Recovery> {
         }
     }
     Ok(rec)
+}
+
+/// The C a unit holds for the function at `entry`, from the cached recovery
+/// in `recovery` (`gexc cgen-c`): what to read when comparing one function's
+/// code with another backend's. `read` gives the image's bytes, for `ret N`.
+pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>) -> Result<String> {
+    let rec = read_recovery(recovery)?;
+    let known: HashSet<u64> = rec.entries.iter().copied().collect();
+    let mut gir = GirReader::open(recovery)?;
+    while let Some(f) = gir.next()? {
+        if f.entry != entry {
+            continue;
+        }
+        let mut unit = FnUnit::new();
+        unit.set_class32(rec.class32);
+        unit.ftab = true;
+        unit.touched = rec.touched.clone();
+        unit.guardfree = rec.guardfree.clone();
+        unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+        unit.add(&f, &known, &rec.sums, &rec.trapfree)?;
+        return Ok(unit.source());
+    }
+    bail!("no function at {entry:#x} in {}", recovery.display())
 }
 
 /// The functions of a recovery, parsed one at a time.
@@ -309,20 +374,38 @@ pub struct ImageStats {
     pub cached: usize,
     pub c_bytes: u64,
     pub wasm_bytes: u64,
+    /// Indirect calls with a guarded direct call (`FnUnit::icall_hints`).
+    pub devirt: usize,
+    /// Calls to unit-private copies of small leaves (`FnUnit::leaves`).
+    pub leaf_copies: usize,
 }
 
 /// Stage 2: the recovery in `recovery` as one linked C module at `out`.
 /// `work` holds the unit sources while they compile; `objects` is the object
-/// cache (shared across images and builds).
-pub fn build_c_module(recovery: &Path, work: &Path, objects: &Path, out: &Path, jobs: usize) -> Result<ImageStats> {
+/// cache (shared across images and builds). `read` gives a byte of the
+/// image as placed (for [`func::ret_pops`]); `stubs` are entries an export
+/// provider serves (`crate::provider::stubs`), whose bodies re-enter the
+/// function table instead.
+pub fn build_c_module(
+    recovery: &Path,
+    work: &Path,
+    objects: &Path,
+    out: &Path,
+    jobs: usize,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
+    stubs: &HashSet<u64>,
+    icall_hints: &HashMap<u64, u64>,
+) -> Result<ImageStats> {
     let rec = read_recovery(recovery)?;
+    let hints = std::sync::Arc::new(icall_hints.clone());
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
     // export goes, and only its unit recompiles. It must not be trap-free
     // (its callers would not have written everything back).
-    let mut skip: HashSet<u64> = HashSet::new();
+    // Export providers' addresses start as stubs (`crate::provider`).
+    let mut skip: HashSet<u64> = stubs.clone();
     loop {
-        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip)?;
+        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip, read, &hints)?;
         let cwasm = std::fs::read(out)?;
         let users = crate::splice::unspliceable_users(&cwasm)?;
         if users.is_empty() {
@@ -356,8 +439,35 @@ fn emit_and_link(
     out: &Path,
     jobs: usize,
     skip: &HashSet<u64>,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
+    hints: &std::sync::Arc<HashMap<u64, u64>>,
 ) -> Result<ImageStats> {
     std::fs::create_dir_all(work)?;
+    // The small leaves every unit may copy (`FnUnit::leaves`), and how
+    // their returns pop. A stub's body is not its function's: no copy.
+    let mut leaves = HashMap::new();
+    let mut leaf_pops = HashMap::new();
+    if func::leaf_copies() {
+        let mut gir = GirReader::open(recovery)?;
+        while let Some(f) = gir.next()? {
+            if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
+                leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                leaves.insert(f.entry, f);
+            }
+        }
+    }
+    let leaves = std::sync::Arc::new(leaves);
+    let new_unit = || {
+        let mut unit = FnUnit::new();
+        unit.set_class32(rec.class32);
+        unit.ftab = true;
+        unit.touched = rec.touched.clone();
+        unit.guardfree = rec.guardfree.clone();
+        unit.icall_hints = std::sync::Arc::clone(hints);
+        unit.leaves = std::sync::Arc::clone(&leaves);
+        unit.ret_pops = leaf_pops.clone();
+        unit
+    };
     std::fs::create_dir_all(objects)?;
     let header_text = header::header();
     std::fs::write(work.join("gex_abi.h"), &header_text)?;
@@ -388,6 +498,7 @@ fn emit_and_link(
             });
         }
         let emit = |unit: &mut FnUnit, k: usize, objs: &mut Vec<PathBuf>, stats: &mut ImageStats| -> Result<()> {
+            unit.add_leaf_copies(&known, &rec.sums, &rec.trapfree)?;
             let src_text = unit.source();
             stats.c_bytes += src_text.len() as u64;
             let key = hash128(&[src_text.as_bytes(), header_text.as_bytes(), flags.as_bytes(), version.as_bytes()]);
@@ -402,20 +513,19 @@ fn emit_and_link(
             }
             objs.push(obj);
             stats.units += 1;
-            *unit = FnUnit::new();
-            unit.set_class32(rec.class32);
-            unit.ftab = true;
+            stats.devirt += unit.stats.calls_devirt;
+            stats.leaf_copies += unit.stats.calls_leaf_copy;
+            *unit = new_unit();
             Ok(())
         };
         let mut gir = GirReader::open(recovery)?;
-        let mut unit = FnUnit::new();
-        unit.set_class32(rec.class32);
-        unit.ftab = true;
+        let mut unit = new_unit();
         let mut k = 0usize;
         while let Some(f) = gir.next()? {
             if skip.contains(&f.entry) {
                 unit.add_leave_stub(f.entry);
             } else {
+                unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
                 unit.add(&f, &known, &rec.sums, &rec.trapfree)
                     .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
             }

@@ -752,7 +752,10 @@ fn cgen_splice(
             summaries,
         }
     };
-    match gex_cgen::build(wasm, &refs, functions, image.class32) {
+    let byte = |a: u64| {
+        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+    };
+    match gex_cgen::build(wasm, &refs, functions, image.class32, &byte) {
         Ok((w, _)) => w,
         Err(e) => panic!("function tier (--cgen): {e:#}"),
     }
@@ -1134,6 +1137,7 @@ pub fn translate_runtime_functions(
         &refs,
         gex_cgen::Functions::Recovered { functions, intrinsics: Vec::new(), summaries },
         class32,
+        &|a| memory.get(a as usize).copied(),
     )
     .map_err(|e| format!("{e:#}"))?;
     module.wasm = wasm;

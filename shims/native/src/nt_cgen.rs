@@ -49,7 +49,7 @@ pub fn set_mode(m: Mode) {
     let _ = MODE.set(m);
 }
 
-fn mode() -> Mode {
+pub(crate) fn mode() -> Mode {
     MODE.get().copied().unwrap_or(Mode::Default)
 }
 
@@ -94,6 +94,7 @@ pub fn build_lock() -> Result<BuildLock> {
 }
 
 /// An image the NT layer mapped, waiting for the host.
+#[derive(Clone)]
 struct Pending {
     path: String,
     base: u64,
@@ -129,17 +130,104 @@ pub fn image_key(image: &gex_ld::Image) -> String {
     gex_cgen::image::image_key(image)
 }
 
+/// The export providers for a PE image at `base` (`gex_cgen::provider`),
+/// its exports by name, and the guest addresses they take over.
+struct Provided {
+    providers: Vec<gex_cgen::provider::Provider>,
+    exports: HashMap<String, u32>,
+    stubs: Vec<u64>,
+}
+
+fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
+    let providers = gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64);
+    let mut exports = HashMap::new();
+    if !providers.is_empty() {
+        for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+            for n in &e.names {
+                exports.insert(n.clone(), e.rva);
+            }
+        }
+    }
+    let stubs = gex_cgen::provider::stubs(&providers, &exports, base);
+    Provided { providers, exports, stubs }
+}
+
+/// The key of `image`'s unit built around `pv`'s providers and its
+/// indirect-call profile (`icall_hints`): the image's own key when there
+/// are neither.
+fn unit_key(image: &gex_ld::Image, pv: &Provided) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut key = image_key(image);
+    if !pv.stubs.is_empty() {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        pv.stubs.hash(&mut h);
+        gex_cgen::provider::fingerprint(&pv.providers).hash(&mut h);
+        key = format!("{key}-p{:016x}", h.finish());
+    }
+    let hints = icall_hints(image);
+    if !hints.is_empty() {
+        let mut v: Vec<(u64, u64)> = hints.into_iter().collect();
+        v.sort_unstable();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        v.hash(&mut h);
+        key = format!("{key}-i{:016x}", h.finish());
+    }
+    key
+}
+
+/// Where [`icall_hints`] reads the image's profile.
+pub fn icall_path(image: &gex_ld::Image) -> Result<std::path::PathBuf> {
+    Ok(cache_root()?.join("icall").join(format!("{}.txt", gex_key::image_identity(image).trim_start_matches("image:"))))
+}
+
+/// The image's indirect-call profile, `<cache>/icall/<image identity>.txt`:
+/// lines `icall <return address> <target> <count>` (pewasm's
+/// `PEWASM_PROFILE_INDIRECT` dump, in this image's addresses; anything
+/// before `icall` is ignored). As pewasm's `read_icall_hints`: a call site
+/// whose dominant target takes at least 90% of at least 64 calls gets a
+/// guarded direct call to it. By return address.
+pub fn icall_hints(image: &gex_ld::Image) -> HashMap<u64, u64> {
+    let Ok(path) = icall_path(image) else { return HashMap::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return HashMap::new() };
+    let num = |w: &str| u64::from_str_radix(w.trim_start_matches("0x"), if w.starts_with("0x") { 16 } else { 10 }).ok();
+    let mut sites: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
+    for l in text.lines() {
+        let Some(k) = l.find("icall ") else { continue };
+        let w: Vec<&str> = l[k + 6..].split_whitespace().collect();
+        if let [r, t, n, ..] = w[..] {
+            if let (Some(r), Some(t), Some(n)) = (num(r), num(t), num(n)) {
+                *sites.entry(r).or_default().entry(t).or_default() += n;
+            }
+        }
+    }
+    let mut hints = HashMap::new();
+    for (ret, targets) in sites {
+        let total: u64 = targets.values().sum();
+        let (t, best) = targets.into_iter().max_by_key(|&(t, n)| (n, std::cmp::Reverse(t))).unwrap();
+        if best >= 64 && best * 10 >= total * 9 {
+            hints.insert(ret, t);
+        }
+    }
+    hints
+}
+
 /// Build (or find) the unit's C module for a PE image placed at `base`:
 /// recovery once (cached), then C compiled unit by unit. Returns its path.
 pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
-    prepare_image(&image, &seeds, jobs, verbose)
+    let pv = provided(pe, base);
+    prepare_with(&image, &seeds, jobs, verbose, &pv)
 }
 
-/// [`prepare_pe`] for any recovery input.
+/// [`prepare_pe`] for any recovery input (no providers).
 pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
+    let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
+    prepare_with(image, seeds, jobs, verbose, &none)
+}
+
+fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool, pv: &Provided) -> Result<std::path::PathBuf> {
     let (image, seeds) = (image, seeds);
-    let key = image_key(image);
+    let key = unit_key(image, pv);
     let root = cache_root()?;
     let dir = root.join(&key);
     let out = dir.join("c.wasm");
@@ -168,18 +256,26 @@ pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jo
     }
     let t0 = std::time::Instant::now();
     let work = dir.join("work");
-    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs)?;
+    let byte = |a: u64| {
+        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+    };
+    let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
+    let hints = icall_hints(image);
+    let stats = gex_cgen::image::build_c_module(&recovery, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
     let _ = std::fs::remove_dir_all(&work);
     if verbose {
         eprintln!(
-            "[cgen] {} functions, {} units ({} compiled, {} cached), {} MiB of C, {} MiB wasm, {:.1}s",
+            "[cgen] {} functions, {} units ({} compiled, {} cached), {} MiB of C, {} MiB wasm, {:.1}s; {} devirtualised calls ({} hints), {} calls to leaf copies",
             stats.functions,
             stats.units,
             stats.compiled,
             stats.cached,
             stats.c_bytes >> 20,
             stats.wasm_bytes >> 20,
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            stats.devirt,
+            hints.len(),
+            stats.leaf_copies
         );
     }
     Ok(out)
@@ -187,7 +283,8 @@ pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jo
 
 /// Turn the function tier on for this process's images (`--cgen`).
 pub(crate) fn enable() -> Result<()> {
-    if mode() == Mode::Off {
+    // Export providers bind on every tier, units or not.
+    if mode() == Mode::Off && !gex_cgen::provider::enabled() {
         return Ok(());
     }
     if ON.set(()).is_err() {
@@ -220,7 +317,8 @@ struct Placed {
 fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
     let (image, _) = gex_xlate::func::pe_input(&p.pe, p.base)
         .map_err(|e| anyhow!("{}: placing the image at {:#x}: {e}", p.path, p.base))?;
-    let cwasm_path = cache_root()?.join(image_key(&image)).join("c.wasm");
+    let pv = provided(&p.pe, p.base);
+    let cwasm_path = cache_root()?.join(unit_key(&image, &pv)).join("c.wasm");
     let Ok(cwasm) = std::fs::read(&cwasm_path) else {
         return Ok(None);
     };
@@ -247,7 +345,13 @@ fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
             pages.push((page, page_hash(memory, page)));
         }
     }
-    let entries = gex_cgen::image::read_entries(&cwasm_path)?;
+    let mut entries = gex_cgen::image::read_entries(&cwasm_path)?;
+    // A provider's addresses are its stubs: the provider is bound there.
+    for a in entries.iter_mut() {
+        if pv.stubs.binary_search(a).is_ok() {
+            *a = 0;
+        }
+    }
     if !entries.iter().any(|&a| a != 0) {
         bail!("{}: its function-tier unit exports no entries", p.path);
     }
@@ -498,16 +602,20 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
         };
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         let t0 = std::time::Instant::now();
-        let Some(pl) = place_or_build(&p, memory.bytes())? else {
-            missing(p)?;
-            continue;
-        };
-        let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
-        note_pages(&memory, &pl.pages);
-        crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+        if mode() != Mode::Off {
+            match place_or_build(&p, memory.bytes())? {
+                Some(pl) => {
+                    let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
+                    note_pages(&memory, &pl.pages);
+                    crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+                    report(&p, &pl, t0);
+                }
+                None => missing(p.clone())?,
+            }
+        }
+        install_providers(&p, &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *caller)?;
         replay_registry(caller)?;
-        report(&p, &pl, t0);
     }
     Ok(())
 }
@@ -519,7 +627,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
         return Ok(());
     }
     // The trampolines with the first images (the exe says the ABI).
-    if let Some(p) = pending.first() {
+    if let Some(p) = pending.first().filter(|_| mode() != Mode::Off) {
         install_trampolines(store, !p.pe.is64)?;
     }
     let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
@@ -530,16 +638,41 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
         };
         let memory = store.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         let t0 = std::time::Instant::now();
-        let Some(pl) = place_or_build(&p, memory.bytes())? else {
-            missing(p)?;
-            continue;
-        };
-        let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
-        note_pages(&memory, &pl.pages);
-        crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+        if mode() != Mode::Off {
+            match place_or_build(&p, memory.bytes())? {
+                Some(pl) => {
+                    let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
+                    note_pages(&memory, &pl.pages);
+                    crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+                    report(&p, &pl, t0);
+                }
+                None => missing(p.clone())?,
+            }
+        }
+        install_providers(&p, &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *store)?;
         catch_up_table(store)?;
-        report(&p, &pl, t0);
+    }
+    Ok(())
+}
+
+/// Bind `p`'s export providers (`gex_cgen::provider`) at their exports'
+/// addresses, after its unit (whose bodies there are stubs into the table).
+fn install_providers(p: &Pending, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
+    let pv = provided(&p.pe, p.base);
+    for prov in &pv.providers {
+        // Small, and built in a private directory then renamed into place:
+        // no need for the cache's build lock (which a unit build holds for
+        // an hour).
+        let (path, slots) = gex_cgen::provider::build(prov, &cache_root()?)?;
+        let pairs = gex_cgen::provider::bindings(prov, &slots, &pv.exports, p.base, trace());
+        if pairs.is_empty() {
+            continue;
+        }
+        let module = Module::from_file(engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
+        crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
+        crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
     }
     Ok(())
 }

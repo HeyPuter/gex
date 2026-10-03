@@ -35,7 +35,7 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
     // Flags dead at each block's exit, by gex-cgen's liveness (flags only:
     // GEX_CGEN_LIVE=0, the exact-flags lockstep mode, keeps them all).
     let dead_out: Vec<Vec<GuestReg>> = if cf::live_writebacks() {
-        let live = cf::live_in(f, sums);
+        let live = live_in(f, sums);
         f.blocks
             .iter()
             .map(|b| {
@@ -48,24 +48,32 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
     };
     let mut most = 0;
     for ((b, dead), &count) in f.blocks.iter_mut().zip(&dead_out).zip(&counts) {
-        let mut v: Option<Value> = None;
-        b.term.for_each_use(|x| v = Some(x));
-        let term = match (&b.term, v) {
-            (FTerm::Branch { .. }, Some(c)) => Term::Branch { cond: c, taken: 0, not_taken: 0 },
-            (_, Some(t)) => Term::Indirect { target: t, is_ret: false },
-            (_, None) => Term::Goto { target: 0 },
+        // The passes below see the terminator's value through a tier-1
+        // `Term`, made after forwarding has substituted into it: made
+        // before, they would keep the old value alive and let the one the
+        // terminator now reads go (a `jno` after `test`: `0 ^ 1` forwarded
+        // to the constant 1, which DCE then dropped).
+        let term_of = |t: &FTerm| {
+            let mut v: Option<Value> = None;
+            t.for_each_use(|x| v = Some(x));
+            match (t, v) {
+                (FTerm::Branch { .. }, Some(c)) => Term::Branch { cond: c, taken: 0, not_taken: 0 },
+                (_, Some(t)) => Term::Indirect { target: t, is_ret: false },
+                (_, None) => Term::Goto { target: 0 },
+            }
         };
         let mut blk = Block {
             start: b.start,
             end: b.end,
             stmts: std::mem::take(&mut b.stmts),
-            term,
+            term: term_of(&b.term),
             n_values: count,
             call_return: None,
             guard: None,
         };
         let before = blk.stmts.len();
         forward(&mut blk, &mut b.term);
+        blk.term = term_of(&b.term);
         pass::const_fold(&mut blk);
         pass::dead_store_elim_with(&mut blk, dead);
         pass::dce(&mut blk);
@@ -81,18 +89,81 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
     f.n_values = most;
 }
 
-/// What gex-cgen's liveness says is live just before `term` runs (its
-/// `live_in` before a block's statements).
-fn live_out(term: &FTerm, live: &[RegSet], sums: &HashMap<u64, Summary>) -> RegSet {
+/// What is live just before `term` runs, given what is live at each
+/// block's entry: gex-cgen's rule, except that no callee reads the
+/// arithmetic flags it is entered with (`flags_abi`).
+pub fn live_out(term: &FTerm, live: &[RegSet], sums: &HashMap<u64, Summary>) -> RegSet {
+    let entry = |t: Option<&u64>| match t.and_then(|t| sums.get(t)) {
+        Some(sm) => sm.inputs,
+        None => RegSet::ALL,
+    };
+    let abi = |r: RegSet| if flags_abi() { r.minus(RegSet::of(cf::FLAG_REGS)) } else { r };
     match term {
         FTerm::Jump(e) => live[e.to.index()],
         FTerm::Branch { taken, not_taken, .. } => live[taken.to.index()].union(live[not_taken.to.index()]),
-        FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } => match sums.get(t) {
-            Some(sm) => sm.inputs.union(live[r.to.index()]),
-            None => RegSet::ALL,
-        },
+        FTerm::Call { callee, ret, .. } => {
+            let t = match callee {
+                Callee::Direct(t) => Some(t),
+                Callee::Indirect(_) => None,
+            };
+            let after = ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]);
+            match (callee, ret) {
+                // gex-cgen's own rule where it is exact.
+                (Callee::Direct(t), Some(r)) if sums.contains_key(t) => sums[t].inputs.union(live[r.to.index()]),
+                _ => abi(entry(t)).union(if ret.is_some() { after } else { RegSet::EMPTY }),
+            }
+        }
+        FTerm::TailCall { .. } => abi(RegSet::ALL),
         _ => RegSet::ALL,
     }
+}
+
+/// Whether calls are taken not to read the arithmetic flags (x86: no ABI
+/// passes anything in them, and compilers treat them as clobbered by every
+/// call), so a flag computation whose only reader would be the callee is
+/// dead. Returns, switches' defaults and unresolved jumps still read them
+/// all. `GEX_FJIT_FLAGS_ABI=0` turns it off; `GEX_CGEN_LIVE=0` (every flag
+/// written back) implies off.
+pub fn flags_abi() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gex_abi::X86 && cf::live_writebacks() && std::env::var("GEX_FJIT_FLAGS_ABI").as_deref() != Ok("0"))
+}
+
+/// gex-cgen's `live_in` (registers live at each block's entry), with
+/// [`live_out`]'s rule for calls.
+pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
+    if !flags_abi() {
+        return cf::live_in(f, sums);
+    }
+    use gex_ir::{Expr, Stmt};
+    let n = f.blocks.len();
+    let mut live = vec![RegSet::EMPTY; n];
+    let order: Vec<usize> = f.rpo().iter().rev().map(|b| b.index()).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &i in &order {
+            let b = &f.blocks[i];
+            let mut l = match &b.term {
+                FTerm::Switch { .. } => RegSet::ALL,
+                t => live_out(t, &live, sums),
+            };
+            for s in b.stmts.iter().rev() {
+                match s {
+                    Stmt::WriteReg { reg, .. } => l.remove(*reg),
+                    Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
+                    Stmt::Trap { .. } => l = RegSet::ALL,
+                    _ if gex_cgen::emit::clobbers(s) => l = RegSet::ALL,
+                    _ => {}
+                }
+            }
+            if l != live[i] {
+                live[i] = l;
+                changed = true;
+            }
+        }
+    }
+    live
 }
 
 /// Number `b`'s values `0..n` in order of definition; returns `n`.
@@ -107,7 +178,10 @@ fn renumber(b: &mut gex_ir::func::FBlock) -> u32 {
             next += 1;
         });
     }
-    b.term.for_each_use_mut(|v| *v = Value(*map.get(&v.0).expect("memory form: a terminator value from another block")));
+    let (start, term) = (b.start, format!("{:?}", b.term));
+    b.term.for_each_use_mut(|v| {
+        *v = Value(*map.get(&v.0).unwrap_or_else(|| panic!("memory form: a terminator value from another block ({start:#x}: {term})")))
+    });
     next
 }
 

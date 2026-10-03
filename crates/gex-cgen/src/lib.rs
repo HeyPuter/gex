@@ -8,6 +8,7 @@
 pub mod emit;
 pub mod func;
 pub mod image;
+pub mod provider;
 pub mod recover;
 pub mod runtime;
 pub mod header;
@@ -122,17 +123,19 @@ pub fn select(
 /// `tier1` is the module `ModuleBuilder` produced from `blocks`, and each
 /// block comes with the function index `ModuleBuilder::reserve` gave it.
 /// The result has the tier-1 module's exact interface.
-/// `class32` is an i386 program in compatibility mode (x86 builds only).
+/// `class32` is an i386 program in compatibility mode (x86 builds only);
+/// `read` gives a guest code byte (for `func::ret_pops`).
 pub fn build(
     tier1: &[u8],
     blocks: &[(&Block, u32)],
     functions: Functions,
     class32: bool,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
 ) -> Result<(Vec<u8>, SpliceStats)> {
     emit::check_environment()?;
     match tier()? {
         Tier::Blocks => build_blocks(tier1, blocks),
-        Tier::Functions => build_functions(tier1, blocks, functions, class32),
+        Tier::Functions => build_functions(tier1, blocks, functions, class32, read),
     }
 }
 
@@ -168,6 +171,7 @@ fn build_functions(
     blocks: &[(&Block, u32)],
     functions: Functions,
     class32: bool,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
 ) -> Result<(Vec<u8>, SpliceStats)> {
     let index: std::collections::HashMap<u64, u32> =
         blocks.iter().map(|(b, f)| (b.start, *f)).collect();
@@ -205,6 +209,7 @@ fn build_functions(
         for (k, chunk) in funcs.chunks(per).enumerate() {
             let mut u = func::FnUnit::new();
             u.set_class32(class32);
+            u.ret_pops = func::ret_pops(chunk, class32, read);
             for f in chunk {
                 u.add(f, &known, &sums, &trapfree)
                     .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;

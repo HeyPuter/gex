@@ -26,6 +26,15 @@ flags=${GEXC_RUN_FLAGS:-}
 export GEX_CGEN_CACHE=${GEX_CGEN_CACHE:-$root/target/nt-test-cgen}
 case " $flags " in *" --cgen "*) export GEX_NT_CGEN_SYNC=1 ;; esac
 
+# icall.exe's indirect-call profile, as tools/icall-hints.py writes one
+# (x86: its three call sites and their dominant targets), so under --cgen its
+# unit has the guarded direct calls and the fallback through the table runs.
+case " $flags " in *" --cgen "*)
+    hints=$("$gexc" cgen-c "$here/bin/x86/icall.exe" --pe-base 0x400000 --icall-path) &&
+        mkdir -p "$(dirname "$hints")" &&
+        printf 'icall 0x402a9b 0x401560 1000\nicall 0x402aae 0x401590 1000\nicall 0x402ae7 0x401560 980\nicall 0x402ae7 0x401570 20\n' > "$hints" ;;
+esac
+
 pass=0 fail=0 xfail=0
 # check NAME EXPECTED_EXIT EXPECTED_STDOUT(regex, whole output) EXE [ARGS...]
 check() {
@@ -85,6 +94,7 @@ for arch in x64 x86; do
     # itself (f54d5717, and under CPU load the PAGE_STALE catch-up); a loaded
     # machine is what shows them: tests/nt/stress.sh.
     check $arch/mtx 0 "$allok" "$b/mtx.exe"
+    check $arch/crtmem 0 "$allok" "$b/crtmem.exe"
     # A locked write through a null pointer's field is an access violation.
     check $arch/lownull-xadd 0 "$allok" "$b/lownull.exe" xadd
     check $arch/lownull-aligned 0 "$allok" "$b/lownull.exe" aligned
@@ -93,6 +103,8 @@ for arch in x64 x86; do
     check $arch/apc 0 "$allok" "$b/apc.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
     check $arch/cxx 0 "$allok" "$b/cxx.exe"
+    # Hot indirect calls (devirtualised under --cgen, with the profile above).
+    check $arch/icall 0 "icall: 1284803844 -1238658015 2 3 4" "$b/icall.exe"
     # N4: USER without a display.
     check $arch/user_win 0 "$allok" "$b/user_win.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"

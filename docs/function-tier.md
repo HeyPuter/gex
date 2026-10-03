@@ -478,54 +478,57 @@ run time (LuaJIT) and code recovery missed, not the boundary between images.
 
 * **Unit.** The whole image's recovered functions (S2's `recover_pe`), as C,
   compiled and linked once into a module of its own (`gex_cgen::image`,
-  format `gex-cgen-image 3`). Every function has `e_<entry>` (the nest root,
-  dispatch's uniform `(i32) -> ()`, with x86's `LAST_TARGET` check) and
-  `ib_<entry>` (the body, checked against `ctx::PC`). Neither is exported:
-  wasm caps a module at 100,000 exports and an "effective type size" of
-  1,000,000 (each exported function costs 1 + 1 + params + results), and
-  noita.exe has 100,147 functions. Both are address-taken instead, so they
-  sit in the unit's own function table (wasm-ld's, `--export-table`), and a
-  generated `gex_fnref(k)` gives entry k's `e_` and `ib_` indices there (the
-  entry list is `c.entries`, beside `c.wasm`). The module imports the gex
-  host functions, the memory and two functions of the per-store dispatcher
-  module (`splice::dispatcher_module`): `gexc.dispatch` (tier-1's dispatch
-  over the dispatch tables) and `gexc.call_known`. No tier-1 stubs, no
-  splice.
+  format `gex-cgen-image 3`), position-independent (`-fPIC
+  -fvisibility=hidden`, `wasm-ld --experimental-pic -shared`;
+  docs/merge-plan.md §9.8.1). Every function is one `F_body`, `f_<entry>`;
+  there are no roots and no exports per function (wasm caps a module at
+  100,000 exports; noita.exe has 100,147 functions). Each translation unit
+  takes its bodies' addresses (an exported `gex_refs_<first>`, never
+  called), so wasm-ld puts every body in the one element segment that
+  fills the process's function table from the imported `__table_base`; the
+  build reads which body each slot holds from the element segment and the
+  name section and appends that as the `gex.funcs` section (and beside the
+  module as `c.entries`). Functions clang gives a shadow-stack frame are
+  stubs that re-enter the table at their own address, which the host serves
+  with something else.
 * **Calls.** Inside the image a call is a wasm call to the callee's body.
-  Every indirect call -- `call [IAT]` into another image, a vtable, a
-  callback -- is `gexc.call_known(ctx, target, ...)`: the body table is
-  numbered like dispatch (the page's directory entry plus the slot within
-  the page), and holds every installed unit's `ib_<entry>` and a leave body
-  everywhere else (a host function: it returns -1, so the caller leaves as
-  for any target the tier does not hold, counted, and said once per call
-  site under GEX_TRACE). `call_known` stores `ctx::PC` and
-  `return_call_indirect`s the slot, after checking it against
-  `gex_abi::BODY_LIMIT` (the smallest body table of any store, so a store
-  that has not caught up with a page numbered elsewhere leaves instead of
-  indexing past its table).
+  Anything else -- `call [IAT]` into another image, a vtable, a callback,
+  a direct call to code the image does not hold -- stores its target in
+  `ctx::LAST_TARGET`, probes the process's probe cache (`gex_ftab_idx`:
+  one load at a constant address for a constant target) and
+  `call_indirect`s the function table: a function pointer in a
+  position-independent module *is* a table index. A miss is index 0, the
+  resolve stub, which asks the host (`gex.lookup`). Jumps out of a function
+  (tail calls, switch defaults, jumps recovery left unresolved) are tail
+  calls through the table under the function's own `need` and `ret`, so
+  whatever runs there returns where the function would have.
 * **Installed at map time.** The NT layer calls a hook after mapping an image
   (`gex_kernel::nt::section::set_image_mapped_hook`); the host compares the
   image's executable bytes in guest memory with the unit's and refuses loudly
-  on a mismatch, gives every page holding an entry a base, marks the entries
-  translated, and publishes the unit (`publish_cgen_unit`). Each store
-  instantiates it (`install_cgen`) and copies each entry's `e_` from the
-  unit's table into the dispatch table and its `ib_` into the body table, at
-  its slot (`gex_fnref` is read once per unit). An x86 slot holds
-  four bytes: two entries in one slot (18 in noita.exe) give the first the
-  dispatch slot -- its target check hands the other to tier-1's trampoline --
-  and neither a body. wasmtime tables belong to a store, so "the process's"
-  body table is one per store, filled identically by replay (8 bytes a slot).
+  on a mismatch, reserves a range of the function table for the unit's
+  element segment, maps each entry to its slot, and publishes it
+  (`shims/native/src/ftab.rs` `publish`); each store instantiates it with
+  `__table_base` at that range as it replays the table's log. Tier-1 still
+  runs what no unit holds; its dispatch slot for every entry holds the
+  runtime module's `bridge` (`gex_cgen::runtime`), which calls the function
+  with no predicted return and dispatches on what it leaves in `ctx::PC`
+  (an x86 slot covers four bytes: a neighbour that no function serves is a
+  slot conflict, handed to tier-1's miss path). Code no unit holds, called
+  from a unit, is the table's index 1: tier-1, run nested until the guest
+  returns to the caller (the call-out).
 * **Code rewritten after install** (Detours patching noita.exe's prologues):
-  retirement zeroes the page's directory entry, which takes it out of both
-  tables, and tier-1 retranslates it. Direct C calls bypass both, so each
-  direct call and tail call to a compiled function first tests the callee's
-  entry page in `gex_abi::PATCHED_PAGES` (one bit per page, one load at a
-  constant address) and leaves for it when set; the host sets the bit when a
-  retired page no longer hashes to what its unit was built from
-  (`nt_cgen::on_retire`). tests/nt/detour.c is the case
-  (`GEX_CGEN_MUTATE=NOPATCHCHECK` is the mutation). Tier-1's own direct jumps
-  check their page's directory entry against the one they were translated
-  for (gex-emit `emit_page_check`).
+  the host sets the page's bit in `gex_abi::PATCHED_PAGES` when a retired
+  page no longer hashes to what its unit was built from
+  (`nt_cgen::on_retire`), before it clears the probe cache entries there.
+  Every function that is not trap-free tests its own entry page on entry
+  and, when set, does the call sequence above to its own address: the
+  lookup sees the bit, retires the unit's slot and serves the new bytes
+  (tier-1 now; the function JIT or the region tier later), and the probe
+  finds that from then on. A trap-free function's callers test it instead,
+  where they can write everything back first. tests/nt/detour.c is the case
+  (`GEX_CGEN_MUTATE=NOPATCHCHECK` is the mutation). Tier-1's own direct
+  jumps check their page's directory entry against the one they were
+  translated for (gex-emit `emit_page_check`).
 * **Keyed on the image as placed.** `nt_cgen::image_key` hashes the format,
   the sources that decide a unit (`gex_cgen::image::INPUTS`) and the image's
   relocated segments at the base it was mapped at. A unit is built for the

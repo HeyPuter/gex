@@ -220,11 +220,13 @@ pub fn module() -> Vec<u8> {
     f.instruction(&I::LocalGet(0));
     f.instruction(&I::ReturnCall(DISPATCH));
     f.instruction(&I::End);
-    // NEST_EXITS += 1 (a statistic, not atomic).
+    // NEST_EXITS += 1 (a statistic, not atomic); every 4096th says where
+    // it went once the function is back (`cache_op::NEST_EXIT_SAMPLE`).
     let abs = |off: u64| MemArg { offset: off, align: 3, memory_index: 0 };
     f.instruction(&I::I32Const(0));
     f.instruction(&I::I32Const(0));
     f.instruction(&I::I64Load(abs(gex_abi::NEST_EXITS)));
+    f.instruction(&I::LocalTee(2));
     f.instruction(&I::I64Const(1));
     f.instruction(&I::I64Add);
     f.instruction(&I::I64Store(abs(gex_abi::NEST_EXITS)));
@@ -235,6 +237,18 @@ pub fn module() -> Vec<u8> {
     f.instruction(&I::LocalGet(3));
     call_root(&mut f);
     no_return(&mut f);
+    f.instruction(&I::LocalGet(2));
+    f.instruction(&I::I64Const(4095));
+    f.instruction(&I::I64And);
+    f.instruction(&I::I64Eqz);
+    f.instruction(&I::If(BlockType::Empty));
+    f.instruction(&I::LocalGet(0));
+    f.instruction(&I::LocalGet(1));
+    f.instruction(&I::I32Const(gex_abi::cache_op::NEST_EXIT_SAMPLE));
+    f.instruction(&I::LocalGet(0));
+    f.instruction(&I::I64Load(ctxm(ctx::PC, 3)));
+    f.instruction(&I::Call(CACHE_OP));
+    f.instruction(&I::End);
     // Left for this very address, having run nothing: no body serves it
     // (index 1 behind a translation, say). Tier-1 takes the slot over.
     f.instruction(&I::LocalGet(0));
