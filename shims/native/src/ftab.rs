@@ -53,6 +53,12 @@ pub(crate) struct Store {
 
 /// `GEX_NT_STATS` counters: host lookups, run-time translations, lookups
 /// answered with the fallback, stale functions found on a lookup.
+/// Whether `GEX_NT_STATS` is set (read once).
+pub(crate) fn stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_NT_STATS").is_some())
+}
+
 pub(crate) mod stats {
     use std::sync::atomic::AtomicU64;
     pub static LOOKUPS: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +69,28 @@ pub(crate) mod stats {
     /// (`HostState::resume_at`: signals, NtContinue, exception dispatch),
     /// which discards the whole nest.
     pub static RESUMES: AtomicU64 = AtomicU64::new(0);
+    /// Why each resume happened (`note_resume_cause`), by cause and target.
+    pub static RESUME_CAUSES: std::sync::Mutex<Option<std::collections::HashMap<(String, u64), u64>>> = std::sync::Mutex::new(None);
+    /// Record a trap-out resume's cause (a syscall's name, an exception
+    /// code, a signal) and where the guest went.
+    pub fn note_resume_cause(cause: String, target: u64) {
+        *RESUME_CAUSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry((cause, target)).or_default() += 1;
+    }
+    /// The causes since the last call, totals first, then the `n` busiest
+    /// (cause, target) pairs.
+    pub fn take_resume_causes(n: usize) -> (Vec<(String, u64)>, Vec<((String, u64), u64)>) {
+        let m = RESUME_CAUSES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let mut by: std::collections::HashMap<String, u64> = Default::default();
+        for ((c, _), k) in &m {
+            *by.entry(c.clone()).or_default() += k;
+        }
+        let mut tot: Vec<_> = by.into_iter().collect();
+        tot.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut v: Vec<_> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(n);
+        (tot, v)
+    }
     /// Calls the fallback served, and 1 in 1024 of their targets.
     pub static FALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
     pub static FALLBACK_SITES: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> = std::sync::Mutex::new(None);

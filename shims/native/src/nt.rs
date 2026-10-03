@@ -304,6 +304,10 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                             .map(|(t, c)| format!("{} x{c}", p.describe_addr(t)))
                             .collect();
                         eprintln!("gex-nt: fallback targets (1 in 1024) {}", fb.join(" | "));
+                        let (tot, top) = crate::ftab::stats::take_resume_causes(12);
+                        let tot: Vec<String> = tot.iter().map(|(c, k)| format!("{c} x{k}")).collect();
+                        let top: Vec<String> = top.iter().map(|((c, t), k)| format!("{c} -> {} x{k}", p.describe_addr(*t))).collect();
+                        eprintln!("gex-nt: resumes by cause {} || {}", tot.join(" | "), top.join(" | "));
                         let mut by: std::collections::BTreeMap<String, u64> = Default::default();
                         for (page, n) in crate::tier1_pages() {
                             let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
@@ -413,6 +417,10 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     match outcome {
         nt::Outcome::Continue => Ok(()),
         nt::Outcome::Resume(target) => {
+            if crate::ftab::stats_on() {
+                let nr = read_u64(memory.bytes(), (ctx_addr + ctx::LAST_SYSCALL as u64) as usize) as u32;
+                crate::ftab::stats::note_resume_cause(nt::syscall_name(nr), target);
+            }
             state.resume_at = Some(target);
             Err(StopExecution.into())
         }
@@ -471,7 +479,12 @@ pub(crate) fn fault(caller: &mut Caller<'_, HostState>, fault: Fault, pc: u64) -
     let (code, rip, info) = fault.exception(pc).expect("every fault but X87 is an exception");
     let outcome = nt::hardware_exception(&p, &*state.kernel, memory.bytes(), state.thread.ctx_addr, code, rip, &info);
     match outcome {
-        nt::Outcome::Resume(target) => state.resume_at = Some(target),
+        nt::Outcome::Resume(target) => {
+            if crate::ftab::stats_on() {
+                crate::ftab::stats::note_resume_cause(format!("exception {code:#x} at {pc:#x}"), target);
+            }
+            state.resume_at = Some(target)
+        }
         nt::Outcome::Exit(code) => state.exit = Some(Exit::Status(code as i32)),
         other => bail!("gex-nt: unexpected outcome {other:?} from exception dispatch"),
     }
