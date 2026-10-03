@@ -215,6 +215,13 @@ fn st_err(what: &str) -> impl Fn(Status) -> String + '_ {
     move |s| format!("{what}: NTSTATUS {:#010x}", s.0)
 }
 
+/// Reserve and commit a fresh private read-write region of the process's
+/// address space from the NT allocator, for a host-side owner (an export
+/// provider's data, stacks and heap): named `name`, bottom-up first fit.
+pub fn alloc_private(p: &Process, k: &mut Kernel, size: u64, name: &str) -> Result<u64, String> {
+    alloc(p, k, size, name).map_err(|s| format!("allocating {size:#x} bytes for {name}: NTSTATUS {:#010x}", s.0))
+}
+
 /// Reserve and commit a fresh private region from the NT allocator.
 fn alloc(p: &Process, k: &mut Kernel, size: u64, name: &str) -> R<u64> {
     let size = (size + PAGE - 1) & !(PAGE - 1);

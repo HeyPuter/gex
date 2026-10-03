@@ -14,6 +14,7 @@ use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod aot;
 pub mod aot_only;
+pub mod libprov;
 pub mod aot_share;
 pub mod gl;
 pub mod profile;
@@ -2571,6 +2572,7 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
 
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
+    libprov::register(linker)?;
 
     linker.func_wrap(
         m,
@@ -4499,7 +4501,9 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
             }
             other => format!("wasm trap: {other}"),
         };
-        return anyhow!("{detail} (pc≈0x{pc:x})");
+        // The wasm frames, when the engine kept them (GEX_WASM_BACKTRACE=1).
+        let bt = e.downcast_ref::<wasmtime::WasmBacktrace>().map(|b| format!("\n{b:?}")).unwrap_or_default();
+        return anyhow!("{detail} (pc≈0x{pc:x}){bt}");
     }
     e
 }

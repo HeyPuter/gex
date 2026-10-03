@@ -148,6 +148,13 @@ pub(crate) fn missing(caller: &mut Caller<'_, HostState>, addr: u64, how: &str) 
         "gex-eject: {how} reached {what}, {why}. Record a session that reaches it and re-eject, add it to \
          \"seeds\" in user/eject.json, or run with --jit-fallback"
     );
+    stop(caller, addr, &detail)
+}
+
+/// Stop the run with `detail`, from any thread (an ejected project's loud
+/// failure).
+pub(crate) fn stop(caller: &mut Caller<'_, HostState>, addr: u64, detail: &str) -> anyhow::Error {
+    let detail = detail.to_string();
     eprintln!("{detail}");
     // Another thread's end would go unnoticed (its store's exit is its
     // own): the whole process stops, loudly, as for any failed thread.
