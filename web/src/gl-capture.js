@@ -90,11 +90,11 @@ export class GlCapture {
  * `globalThis.__gexGlCapture` so a CDP driver can collect it without the page
  * having to offer a download.
  */
-export function captureIfRequested(protocolVersion, width, height) {
+export function captureIfRequested(protocolVersion, width, height, given = null) {
   const search = globalThis.location?.search;
-  const value = search
+  const value = given ?? (search
     ? new URLSearchParams(search).get("glcapture")
-    : (globalThis.process?.env?.GEX_GLCAPTURE ?? null);
+    : (globalThis.process?.env?.GEX_GLCAPTURE ?? null));
   if (!value || value === "0") return null;
 
   const limit = Number(value);

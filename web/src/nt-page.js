@@ -4,7 +4,11 @@
 // (opengl32 → /dev/gex-gl) runs on Mesa in the compositor's worker.
 //
 //   /nt.html?tar=/gex/nt/bundle.tar&exe=/t/window.exe&args=30&size=1024x768
-//            [&gl=1&glbackend=wgpu][&env=K=V,K=V][&cwd=/t]
+//            [&gl=1&glbackend=wgpu][&env=K=V,K=V][&cwd=/t][&hostx=1]
+//
+// The exe may also be a Linux ELF (an i386 or x86-64 program with its
+// libraries in the bundle); `hostx=1` gives it the page's X server
+// (Xwayland as wasm, web/build-xwayland-wasm.sh) at DISPLAY=:0.
 //
 // What a driver reads: `window.__nt` = { out, status, compositor }.
 
@@ -74,13 +78,32 @@ async function main() {
   canvas.style.width = `${w}px`;
   canvas.style.height = `${h}px`;
   state.phase = 'fetching';
-  const tar = await fetchShared(q.get('tar') || '/gex/nt/bundle.tar');
-  // The buffer, not the array: `untar` wraps what it is given in a new
-  // Uint8Array, which copies an array but views a buffer.
-  const tree = untar(tar.buffer);
+  // `tar=a.tar,b.tar`: bundles laid over one another, later ones winning --
+  // a small test program over a large cached bundle of its libraries.
+  const trees = [];
+  for (const url of (q.get('tar') || '/gex/nt/bundle.tar').split(',')) {
+    const tar = await fetchShared(url);
+    // The buffer, not the array: `untar` wraps what it is given in a new
+    // Uint8Array, which copies an array but views a buffer.
+    trees.push(untar(tar.buffer));
+  }
+  const tree = trees.reduce((a, t) => ({
+    files: Object.assign(a.files, t.files),
+    dirs: [...a.dirs, ...t.dirs],
+    modes: Object.assign(a.modes ?? {}, t.modes),
+    hard: Object.assign(a.hard ?? {}, t.hard),
+  }));
   const files = { ...tree.files };
+  // Hard links name a file by its path from the archive's root (tar -h
+  // writes one for every second path to an inode it has stored). They go to
+  // the guest as links, not copies: glibc knows a loaded library by its
+  // inode, and `libGL.so.1` and `libEGL.so.1` copies of one file load as two
+  // libraries with two sets of GL state. Symlinks are not followed here: a
+  // bundle is made with -h.
+  const hard = Object.fromEntries(Object.entries(tree.hard ?? {}).filter(([, t]) => files[t]));
   const exe = q.get('exe') || '/t/window.exe';
-  if (!files[exe]) throw new Error(`${exe} is not in the bundle`);
+  const exeBytes = files[exe] ?? files[hard[exe]];
+  if (!exeBytes) throw new Error(`${exe} is not in the bundle`);
   const args = [exe, ...(q.get('args') ? q.get('args').split(' ') : [])];
   const env = (q.get('env') || '').split(',').filter(Boolean);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
@@ -88,10 +111,11 @@ async function main() {
   const gl = q.get('gl') === '1';
   state.phase = 'running';
   const { status } = await runProgram(term, {
-    elf: files[exe],
+    elf: exeBytes,
     files,
     dirs: tree.dirs,
     modes: tree.modes,
+    hard,
     env,
     args,
     cwd: q.get('cwd') || exe.replace(/\/[^/]*$/, '') || '/',
@@ -100,6 +124,7 @@ async function main() {
     glBackend: q.get('glbackend') || 'wgpu',
     wl: canvas,
     wlInput: canvas,
+    hostX: q.get('hostx') === '1',
   });
   state.status = status;
   state.phase = 'done';

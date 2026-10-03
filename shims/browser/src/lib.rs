@@ -1252,6 +1252,12 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
+    // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
+    // for every process so a name one creates another opens (Chromium's
+    // processes, in a CEF game). The shim's memory is the processes' shared
+    // memory, so one static is one filesystem.
+    static SHM: std::sync::OnceLock<Arc<gex_kernel::vfs::TmpFs>> = std::sync::OnceLock::new();
+    kernel.vfs.mount("/dev/shm", SHM.get_or_init(|| Arc::new(gex_kernel::vfs::TmpFs::new())).clone());
     // The Wayland compositor: bound only when the page
     // brought a canvas for it, so a guest without one finds no `wayland-0` and
     // libwayland fails to connect cleanly rather than blocking on a dead name.
@@ -4065,6 +4071,24 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 
+/// A bundled hard link: `path` becomes another name for the already-added
+/// `target`, one inode as in the bundle. glibc's loader knows a loaded
+/// library by device and inode, so two copies where the host had two names
+/// for one file load it twice (two `libGL`s, each with its own state).
+/// Returns 1 when linked; 0 tells the caller to add a copy instead (no
+/// global kernel: this process's filesystem does not exist yet).
+#[no_mangle]
+pub extern "C" fn gex_add_hardlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+    // SAFETY: scalars naming ranges of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            return (unsafe { k_fs_link(target, target_len, path, path_len) } == 0) as i32;
+        }
+        return 1;
+    }
+    0
+}
+
 /// A bundled file's modification time, as the host's filesystem had it, so a
 /// program that records one (`gzip`, `make`, `tar`) sees what it would
 /// natively. Like `gex_chmod`.
@@ -6481,6 +6505,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // nothing is instantiated and the guest is not interrupted, because a page's
     // directory entry is not published until its module installs, so every
     // branch still finds the miss stub; JS picks the queue up at the next miss.
+    retire_unmapped_code();
     recompile_objects();
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
@@ -11188,6 +11213,46 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     trap();
 }
 
+
+/// Code the guest unmapped or reprotected since the last syscall loses its
+/// translations, as natively (`retire_translations`): the pages leave the
+/// shared page table and their directory entries go back to the miss stub,
+/// so the next branch there, from any Worker, lifts what is mapped there
+/// now. Without this a `dlclose` and a `dlopen` that reuses the address ran
+/// the old library's blocks (Half-Life: SDL's libudev landing where an
+/// earlier library had been, entered in the middle of an instruction).
+fn retire_unmapped_code() {
+    with_host(|h| {
+        let retired = std::mem::take(&mut h.kernel.retired_code);
+        if !retired.is_empty() {
+            crate::cgen::on_retire(&retired);
+            retire_code(h, &retired);
+        }
+    });
+}
+
+/// Forget every translation in `ranges` (see `retire_unmapped_code`). The
+/// old slots are left behind, unreachable.
+pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    for &(start, end) in ranges {
+        if end <= start {
+            continue;
+        }
+        h.jit.translated.retain(|a| *a < start || *a >= end);
+        for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
+            if page >= gex_abi::DISPATCH_MAX_PAGES {
+                break;
+            }
+            h.jit.page_table.forget(page);
+            h.jit.retired_pages.insert(page);
+            let at = gex_abi::DISPATCH_DIR + page * 4;
+            // SAFETY: the directory is in the shared memory, four-byte
+            // aligned, and every Worker's dispatch reads it as a word.
+            unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
+        }
+    }
+}
 
 /// Queue objects the guest mapped since the last syscall as recompile
 /// candidates. Off unless the page asks. Bulk static recompilation (see

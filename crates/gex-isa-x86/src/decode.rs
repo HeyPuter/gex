@@ -1139,7 +1139,7 @@ impl<'a> Decoder<'a> {
                     }
                     _ => {
                         let lane = if mand == Mand::P66 { F64 } else { F32 };
-                        let mut i = self.sse(Op::CvtMmx, lane, false, Self::xmm(m.reg), Self::em(&m));
+                        let mut i = self.sse(Op::CvtMmx { truncate: false }, lane, false, Self::xmm(m.reg), Self::em(&m));
                         i.mmx = true;
                         i
                     }
@@ -1168,7 +1168,7 @@ impl<'a> Decoder<'a> {
                     }
                     _ => {
                         let lane = if mand == Mand::P66 { F64 } else { F32 };
-                        let mut i = self.sse(Op::CvtMmx, lane, false, Self::mm(m.reg), Self::ex(&m));
+                        let mut i = self.sse(Op::CvtMmx { truncate: op == 0x2c }, lane, false, Self::mm(m.reg), Self::ex(&m));
                         i.mmx = true;
                         i
                     }
