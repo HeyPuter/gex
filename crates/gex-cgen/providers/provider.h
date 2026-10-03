@@ -51,6 +51,46 @@ GEX_INLINE int gp_return_eax(int ctx, uint64_t ret, unsigned pop, uint32_t eax) 
     return gp_return(ctx, ret, pop);
 }
 
+/* A double stack argument at byte offset `off` past the return address. */
+GEX_INLINE double gp_argf64(int ctx, unsigned off) {
+    return gex_f64(*(gex_u64 *)GEX_P(gp_reg(ctx, R_ESP) + 4 + off));
+}
+/* xmm`n`'s low double, and setting it (the high half kept, as movsd does). */
+GEX_INLINE double gp_xmm_f64(int ctx, unsigned n) { return gex_f64(GEX_C64(GEX_CTX_VN(n))); }
+GEX_INLINE void gp_set_xmm_f64(int ctx, unsigned n, double v) { GEX_C64(GEX_CTX_VN(n)) = gex_b64(v); }
+
+/* Push `v` onto the x87 stack as `fld m64` does (exactly: a double is an
+ * extended value): the i386 ABI's floating-point return in ST0. */
+GEX_INLINE void gp_push_st0_raw(int ctx, uint64_t sig, uint32_t se) {
+    uint32_t top = (GEX_C32(GEX_CTX_X87_TOP) - 1u) & 7u;
+    GEX_C32(GEX_CTX_X87_TOP) = top;
+    GEX_C64(GEX_CTX_X87 + 16u * top) = sig;
+    GEX_C16(GEX_CTX_X87 + 16u * top + 8u) = (uint16_t)se;
+    GEX_C32(GEX_CTX_X87_TAGS) |= 1u << top;
+    GEX_C32(GEX_CTX_X87_SW) &= ~0x200u; /* C1: no stack overflow */
+}
+GEX_INLINE void gp_push_st0(int ctx, double v) {
+    uint64_t b = gex_b64(v), m = b & 0xfffffffffffffull, sig;
+    uint32_t sign = (uint32_t)(b >> 63) << 15, e = (uint32_t)(b >> 52) & 0x7ff, se;
+    if (e == 0x7ff) {
+        se = sign | 0x7fff;
+        sig = 0x8000000000000000ull | (m << 11);
+    } else if (e == 0) {
+        if (m == 0) {
+            se = sign;
+            sig = 0;
+        } else {
+            uint32_t s = (uint32_t)__builtin_clzll(m);
+            sig = m << s;
+            se = sign | (15372u - s);
+        }
+    } else {
+        se = sign | (e - 1023u + 16383u);
+        sig = 0x8000000000000000ull | (m << 11);
+    }
+    gp_push_st0_raw(ctx, sig, se);
+}
+
 /* This guest thread, never 0. */
 GEX_INLINE uint32_t gp_self(int ctx) { return (uint32_t)GEX_C64(GEX_CTX_TID) + 1u; }
 
@@ -72,7 +112,79 @@ GEX_INLINE void gp_sleep(int ctx, uint32_t ms) {
  * safepoint, which may stop the thread (exit, a signal) and resume it at
  * the provider's own entry, `pc`. */
 GEX_INLINE void gp_poll(int ctx, uint64_t pc) { gex_safepoint(ctx, (int64_t)pc); }
-/* The address this body was entered at (every call through the table sets it). */
+/* The address this body was entered at: every way into a provider (a call
+ * or jump through the table, a unit's stub, tier-1's bridge, the root) sets
+ * it. Read it on entry, before anything calls out. */
 #define GP_SELF_PC() GEX_C64(GEX_CTX_LAST_TARGET)
+
+/* ---- the slow path's view of the library a provider serves ----
+ * For rare cases (errors) that must do what the library at hand does: the
+ * library is found from the provider's own export address, so one provider
+ * serves Microsoft's and Wine's builds of a DLL. */
+
+/* The base of the PE image holding `addr` (its exports are inside it): the
+ * 64 KiB-aligned "MZ" at or below it whose SizeOfImage covers it; 0 if none
+ * within 64 MiB. */
+GEX_INLINE uint32_t gp_module_base(uint32_t addr) {
+    for (uint32_t b = addr & ~0xffffu, n = 0; n < 1024 && b; b -= 0x10000u, ++n) {
+        if (*(gex_u16 *)GEX_P(b) != 0x5a4d) {
+            continue;
+        }
+        uint32_t pe = b + GW(b + 0x3c);
+        if (GW(pe) == 0x4550 && addr - b < GW(pe + 24 + 56)) {
+            return b;
+        }
+    }
+    return 0;
+}
+/* Wine's own build of a DLL ("Wine builtin DLL" after the DOS header).
+ * (Constants, not strings: a provider module carries no data.) */
+GEX_INLINE int gp_wine_builtin(uint32_t base) {
+    return GW(base + 0x40) == 0x656e6957u && GW(base + 0x44) == 0x69756220u && GW(base + 0x48) == 0x6e69746cu &&
+           GW(base + 0x4c) == 0x4c4c4420u;
+}
+/* The address of the export of the image at `base` whose name is the `len`
+ * (at most 8) bytes of `name` (little-endian: "_errno" is
+ * 0x6f6e7272655full), or 0. */
+GEX_INLINE uint32_t gp_export(uint32_t base, uint64_t name, uint32_t len) {
+    uint32_t pe = base + GW(base + 0x3c), dir = GW(pe + 24 + 96);
+    if (!dir) {
+        return 0;
+    }
+    uint32_t e = base + dir, nn = GW(e + 24), af = base + GW(e + 28), an = base + GW(e + 32), ao = base + GW(e + 36);
+    for (uint32_t i = 0; i < nn; ++i) {
+        uint32_t n = base + GW(an + 4 * i), k = 0;
+        while (k < len && *(gex_u8 *)GEX_P(n + k) == (uint8_t)(name >> (8 * k))) {
+            ++k;
+        }
+        if (k == len && !*(gex_u8 *)GEX_P(n + k)) {
+            return base + GW(af + 4 * *(gex_u16 *)GEX_P(ao + 2 * i));
+        }
+    }
+    return 0;
+}
+/* Call the guest function at `fn` with no arguments (cdecl) and return its
+ * EAX. Pushes a return address of its own, so the call returns here; a
+ * callee that leaves instead (longjmp, an exception unwinding past this
+ * frame) is beyond a provider's slow path and traps. */
+GEX_INLINE uint32_t gp_call0(int ctx, int32_t depth, uint32_t fn) {
+    uint32_t sp = gp_reg(ctx, R_ESP) - 4, ra = fn ^ 1u;
+    GW(sp) = ra;
+    gp_set(ctx, R_ESP, sp);
+    GEX_C64(GEX_CTX_LAST_TARGET) = fn;
+    if (!GEX_FTAB(gex_ftab_idx(fn))(ctx, depth + 256, 0, ra)) {
+        __builtin_trap();
+    }
+    return gp_reg(ctx, R_EAX);
+}
+/* errno = `code`, through the library's own `_errno()` (its per-thread
+ * slot). `self` is the provider's entry address (GP_SELF_PC on entry). */
+GEX_INLINE void gp_set_errno(int ctx, int32_t depth, uint32_t self, uint32_t code) {
+    uint32_t base = gp_module_base(self), f = base ? gp_export(base, 0x6f6e7272655full, 6) : 0;
+    if (f) {
+        GW(gp_call0(ctx, depth, f)) = code;
+    }
+}
+#define GP_EDOM 33u
 
 #endif

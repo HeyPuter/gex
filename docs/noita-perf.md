@@ -357,3 +357,83 @@ compiled-module cache for tier-1 (gex-cache) across runs.
 **Next for F:** un-WIP local resume after R answers; then the flags-at-
 returns fixpoint (about 5% of instructions on f_dd6ba0, nothing on the
 hottest functions) and vector reloads, only where hot functions show them.
+
+## Runtime, stream R, second session (2026-10-03)
+
+Commits on merge/abi9:
+- ea470321: `tests/nt/cgen-prefix.sh GEXC`, the --cgen gate leg with Wine's
+  core DLLs as units under the current key. 50/50.
+- 5ec26034: the x64/sync CancelWaitableTimer flake. The test raced the
+  10 ms period: as on Windows, a cancelled timer keeps a period that already
+  elapsed signalled. Now 10/10 per arch under --cgen.
+- 1593fa58: a tier-1 miss no longer copies the set of translated blocks.
+  That copy was hashbrown's RawTable clone, 0.65% of tier-1's CPU in
+  memcpy. The rest of host memcpy (3.7% in all) is Cranelift and object
+  writing for runtime translation, plus Vec growth (ptsamp, direct-caller
+  attribution); units should remove most of it.
+- 1b27744d: the crt_math provider, plus tests/providers. floor, ceil,
+  modf, sqrt and `_libm_sse2_sqrt_precise` are bit-exact against both
+  Microsoft's msvcr120 (Noita's) and Wine's in every tested case. Details
+  in the commit: errno differs per build, the x87 sqrt double-rounds unless
+  the control word is 0x27f, and the SSE2 entry falls back outside the
+  default FP state. Run `tests/providers/run.sh GEXC
+  [~/src/noita-wasm/Noita/msvcr120.dll]`.
+  - Tier-1 A/B, two pairs at 4x on cores 3 and 9: 16.3 and 19.9 world fps
+    with these exports skipped, 18.7 and 18.9 with them. That is within
+    noise; they were about 1% of the CPU.
+  - sin, cos and pow stay lifted. Microsoft's `_libm_sse2_*_precise` are
+    table-driven Intel routines that no libm port matches to the bit, and
+    units compile them already.
+- c3120dd8: GEX_NT_STATS reports trap-out resumes by cause (the NT syscall
+  name, or the exception code and pc) and target, every 60 s.
+
+**Leaves (the coordinator's step 1): where they come from.** F's units run
+(u7.log) had 2.5 G nest exits. Those are tier-1 → unit calls through the
+bridge; with no predicted return, each one is counted.
+- The busiest sampled pairs are a msvcr120 ConcRT worker loop (around
+  +0x14894) calling kernel32/kernelbase `SwitchToThread` and the syscall
+  trampoline, then noita.exe's 0x72a5xx and 0x88c7xx interiors. These are
+  long-lived loop frames running on tier-1.
+- The same run had 11,081 trap-out resumes. A resume discards every wasm
+  frame of its thread, so any loop frame above it stays on tier-1 until it
+  returns, and a worker's or the game loop's frame never returns.
+- The first job is c3120dd8's cause table on a units run: which syscalls
+  (NtContinue after SEH, NtSetContextThread) or exceptions those resumes
+  are. Not measured yet: the overlay cache is ready (below).
+
+**F's local-resume proposal: my answers.**
+- **(a)** Nothing has to enter a unit body at a continuation from outside
+  on a hot path. The resume switch catches three things:
+  1. a callee that came back to this call site's continuation with its
+     return check failed. F's local test at the site covers it.
+  2. a longjmp to a setjmp in this frame, i.e. a different call site's
+     continuation. That can leave: the state is all in the context, and
+     tier-1 finishes the frame. It's rare.
+  3. trap-out resumes. These never reach the switch: the frames are gone.
+
+  So approve local resume. The central switch only serves case 2.
+- **(b)** Not measured: no counter on switch hits. The structural answer is
+  that the expensive case isn't the switch. It's frames already discarded
+  by trap-out resumes, and a continuation entry in the unit can't recover
+  them either.
+- **The fix for (b):** don't let a demoted frame run on tier-1. When the
+  root or the fallback reaches a call continuation inside a function a unit
+  holds, compile the rest of the frame as a function: §9.2's region tier,
+  via stream F's function JIT, starting at the interior address with the
+  same call/return contract. Its loops then run JIT code, and its calls are
+  wasm calls, not bridge round trips.
+- **Make resumes rarer, too.** Only an exception that unwinds past wasm
+  frames needs a trap-out. An exception handled inside the faulting frame
+  could resume in place.
+
+**Next, in order:**
+1. A units run with c3120dd8, to get the resume causes. Use the overlay
+   cache `scratchpad/abi9/ovl`: symlinks to F's cgcache-cg7 plus
+   msvcr120, ucrtbase and msvcrt rebuilt under the crt_math provider key.
+   Run with `GEX_CGEN_CACHE=$S/ovl`, my prefix (same layout), and
+   `GEX_NT_CGEN_BUILD=0`.
+2. Region entries for demoted frames (the region tier, from the
+   fallback/root path). Coordinate with F, since it's the JIT.
+3. Avoid the trap-out for exceptions handled in the faulting frame.
+4. Then sched_yield (7.1% in F's run: Noita's own yield loops) and the
+   heap.

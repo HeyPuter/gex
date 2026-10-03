@@ -3374,10 +3374,10 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         .memory
         .clone()
         .ok_or_else(|| anyhow!("guest memory unavailable"))?;
-    let known: std::collections::HashSet<u64> = {
-        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated.clone()
-    };
+    // What is already translated, asked of the shared state per address
+    // rather than copied: a copy of the set (half a million entries for
+    // Noita) per miss was 0.7% of tier-1's CPU in memcpy alone.
+    let known = |a: u64| shared.lock().unwrap_or_else(|e| e.into_inner()).translated.contains(&a);
     let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
         k.mem
             .vmas()
@@ -3406,7 +3406,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             data,
             pc,
             &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-            &|a| known.contains(&a),
+            &known,
             page_table,
             limits,
             // A cap keeps one miss from translating an entire library
@@ -4200,10 +4200,10 @@ fn recompile_object(
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.page_table.clone()
     };
-    let known: std::collections::HashSet<u64> = {
-        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated.clone()
-    };
+    // What is already translated, asked of the shared state per address
+    // rather than copied: a copy of the set (half a million entries for
+    // Noita) per miss was 0.7% of tier-1's CPU in memcpy alone.
+    let known = |a: u64| shared.lock().unwrap_or_else(|e| e.into_inner()).translated.contains(&a);
     let memory = caller
         .as_context()
         .data()
@@ -4231,7 +4231,7 @@ fn recompile_object(
             map.end,
             seeds,
             &|a| exec_ranges.iter().any(|(s, e)| a >= *s && a + gex_abi::INST_ALIGN <= *e),
-            &|a| known.contains(&a),
+            &known,
             page_table,
             limits,
             MAX_OBJECT_BLOCKS,
