@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Symbolise a GEX_PROF profile (crates/gexc/src/prof.rs).
 
-    tools/prof-report.py PROFILE [--top N] [--cats FILE.json] [--perfmap PATH]
+    tools/prof-report.py PROFILE [--modules] [--top N] [--cats FILE.json] [--perfmap PATH]
+
+--modules sums compiled wasm by module (big modules are whole-image
+units, small ones tier-1's runtime translations).
 
 PROFILE is what GEX_PROF wrote (`pid`, `samples`, then `pc count` in hex),
 with PROFILE.maps beside it. Compiled wasm is named by wasmtime's perf map
@@ -13,6 +16,8 @@ share of each category: the first regex in --cats (a JSON list of
 import bisect, collections, json, re, subprocess, sys
 
 args = sys.argv[1:]
+bymod = '--modules' in args
+args = [a for a in args if a != '--modules']
 top = 40
 cats = None
 perfmap = None
@@ -44,14 +49,31 @@ maps.sort()
 starts = [m[0] for m in maps]
 
 jit = []
+# wasmtime names every module's functions `wasm[0]::function[k]`: modules
+# are told apart by the perf map's order (each module's entries are written
+# together, its function indices rising), and named by their size, so the
+# big whole-image units stand out from tier-1's small runtime modules.
+mods = []  # per jit entry: module number
+sizes = collections.Counter()
 try:
+    mod, last = -1, None
     for l in open(perfmap or f'/tmp/perf-{pid}.map'):
         a, n, name = l.rstrip('\n').split(' ', 2)
-        jit.append((int(a, 16), int(n, 16), name))
+        m = re.match(r'wasm\[\d+\]::function\[(\d+)\]', name)
+        if m:
+            k = int(m.group(1))
+            if last is None or k <= last:
+                mod += 1
+            last = k
+            sizes[mod] += 1
+        jit.append((int(a, 16), int(n, 16), name, mod))
 except FileNotFoundError:
     pass
 jit.sort()
 jstarts = [j[0] for j in jit]
+def modname(m):
+    n = sizes[m]
+    return f'module#{m}({n} fns)' if n >= 1000 else 'small-module'
 
 symcache = {}
 def syms(path):
@@ -78,6 +100,8 @@ def syms(path):
 def name(pc):
     k = bisect.bisect_right(jstarts, pc) - 1
     if k >= 0 and jit[k][0] <= pc < jit[k][0] + jit[k][1]:
+        if bymod and 'trampoline' not in jit[k][2]:
+            return 'jit:' + modname(jit[k][3])
         return 'jit:' + jit[k][2]
     k = bisect.bisect_right(starts, pc) - 1
     if k < 0 or not (maps[k][0] <= pc < maps[k][1]):
