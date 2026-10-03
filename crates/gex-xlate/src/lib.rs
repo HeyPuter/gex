@@ -194,10 +194,17 @@ impl<'a> CodeView<'a> {
             if !seg.executable {
                 continue;
             }
-            if pc >= seg.vaddr && pc < seg.vaddr + seg.bytes.len() as u64 {
+            // Past `bytes` the mapping is zeros: a PE section's trailing
+            // zeros are not stored, and an instruction can end in one
+            // (`ret $0xc`, or a rebased `jmp *slot` whose slot address has
+            // a zero high byte, last in `.text`).
+            let span = seg.mem_size.max(seg.bytes.len() as u64);
+            if pc >= seg.vaddr && pc < seg.vaddr + span {
                 let off = (pc - seg.vaddr) as usize;
-                let n = (seg.bytes.len() - off).min(16);
-                buf[..n].copy_from_slice(&seg.bytes[off..off + n]);
+                let n = (span as usize - off).min(16);
+                let have = seg.bytes.len().saturating_sub(off).min(n);
+                buf[..have].copy_from_slice(&seg.bytes[off..off + have]);
+                buf[have..n].fill(0);
                 return n;
             }
         }
@@ -753,7 +760,7 @@ fn cgen_splice(
         }
     };
     let byte = |a: u64| {
-        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+        image.segments.iter().find_map(|s| s.byte(a))
     };
     match gex_cgen::build(wasm, &refs, functions, image.class32, &byte) {
         Ok((w, _)) => w,
@@ -797,7 +804,7 @@ fn fjit_splice(
     }
     let intrinsics: Vec<u64> = opts.intrinsics.keys().copied().collect();
     let byte = |a: u64| {
-        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+        image.segments.iter().find_map(|s| s.byte(a))
     };
     let pops = fjit::ret_pops(&functions, image.class32, &byte);
     match gex_fjit::build(wasm, &refs, functions, &intrinsics, &summaries, image.class32, &pops) {
