@@ -319,7 +319,7 @@ export class MesaGlDevice {
       const rc = out.#module._gex_gl_init(canvas.width, canvas.height);
       if (rc !== 0) out.#failed = `Mesa/WebGPU initialization failed (${rc})`;
       out.#description = `Mesa st/mesa + gex_wgpu on WebGPU (${api})`;
-      out.capture = captureIfRequested(PROTOCOL_VERSION, canvas.width, canvas.height);
+      out.capture = captureIfRequested(PROTOCOL_VERSION, canvas.width, canvas.height, options.capture);
     } catch (e) {
       out.#failed = e?.message || String(e);
     }
@@ -364,7 +364,14 @@ export class MesaGlDevice {
     this.#submits++;
     this.#bytes += tail;
     const src = new Uint8Array(memory.buffer, ring + HEADER_BYTES, tail);
-    this.capture?.record(src, replyCap);
+    if (this.capture && !this.capture.record(src, replyCap) && !this.capture.posted) {
+      // Full: hand the recording to whoever serves the page (a Worker has
+      // no CDP-reachable global the page's driver can read).
+      this.capture.posted = true;
+      const bytes = this.capture.toBytes();
+      this.capture = null;
+      fetch('/__gex_capture', { method: 'POST', body: bytes }).catch(() => {});
+    }
 
     const ptr = this.#module._malloc(tail || 1);
     if (tail) this.#module.HEAPU8.set(src, ptr);

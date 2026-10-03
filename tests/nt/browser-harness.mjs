@@ -130,6 +130,19 @@ export default {
   const server = createServer((req, res) => {
     // A Worker's dump (gex.mjs: the bytes of a module the engine refused),
     // into STATE/dumps, a few at most.
+    // A GL recording from the compositor Worker (?glcapture=BYTES), to
+    // STATE/capture.gexgltr.
+    if (req.method === 'POST' && req.url.startsWith('/__gex_capture')) {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        writeFileSync(join(STATE, 'capture.gexgltr'), Buffer.concat(chunks));
+        log(`GL capture: ${join(STATE, 'capture.gexgltr')}`);
+        res.writeHead(204, { 'Cross-Origin-Resource-Policy': 'same-origin' });
+        res.end();
+      });
+      return;
+    }
     if (req.method === 'POST' && req.url.startsWith('/__gex_dump')) {
       const chunks = [];
       req.on('data', (c) => chunks.push(c));
