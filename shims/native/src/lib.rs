@@ -186,6 +186,8 @@ struct HostState {
     exit: Option<Exit>,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
+    /// Why `resume_at` was set (GEX_NT_STATS only; `note_resume`).
+    pub(crate) resume_cause: Option<String>,
     /// The function tier's call-outs in progress on this thread, innermost
     /// last (`call_out`).
     callouts: Vec<Callout>,
@@ -812,6 +814,7 @@ fn run_program_with(
             proc_state,
             exit: None,
             resume_at: None,
+            resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
@@ -1392,6 +1395,7 @@ fn run_thread_loop(
             Err(e) => {
                 if let Some(next) = store.data_mut().resume_at.take() {
                     crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    note_resume(store.data_mut(), next, "run loop");
                     pc = next;
                     continue;
                 }
@@ -1626,6 +1630,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
@@ -1776,6 +1781,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
             resume_at: None,
+            resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
@@ -2659,6 +2665,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             match outcome {
                 SyscallOutcome::Continue => Ok(()),
                 SyscallOutcome::Resume(target) => {
+                    state.resume_cause = Some("linux syscall".into());
                     state.resume_at = Some(target);
                     Err(StopExecution.into())
                 }
@@ -2682,6 +2689,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         child_stack,
                         tls,
                     });
+                    state.resume_cause = Some("fork".into());
                     state.resume_at = Some(
                         gm.read_u64(state.thread.ctx_addr + ctx::PC as u64)
                             .unwrap_or(0),
@@ -2757,6 +2765,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let mut gm = GuestMem::new(data);
                 return match state.with_kernel(|k| k.sigreturn(&mut gm)) {
                     Ok(target) => {
+                        state.resume_cause = Some("sigreturn".into());
                         state.resume_at = Some(target);
                         Err(StopExecution.into())
                     }
@@ -2773,10 +2782,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             // Translate on demand and patch the slot, then resume there.
             match translate_and_install(&mut caller, pc) {
-                Ok(true) => {
-                    caller.data_mut().resume_at = Some(pc);
-                    Err(StopExecution.into())
-                }
+                // Installed in this store: the miss stub dispatches again
+                // in place, keeping every wasm frame below it.
+                Ok(true) => Ok(gex_emit::module::DISPATCH_MISS_REDISPATCH),
                 Ok(false) => {
                     if caller.data().nt.is_some() {
                         return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
@@ -2864,6 +2872,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // is how some runtimes probe for optional instructions.
             match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGILL as u32, pc, pc)) {
                 gex_kernel::signal::Delivery::Resume(target) => {
+                    state.resume_cause = Some("SIGILL".into());
                     state.resume_at = Some(target);
                 }
                 _ => {
@@ -2939,7 +2948,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let state = caller.data_mut();
                 let mut gm = GuestMem::new(data);
                 match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGFPE as u32, pc, pc)) {
-                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGFPE".into());
+                        state.resume_at = Some(target)
+                    }
                     _ => {
                         state.exit = Some(Exit::Signal {
                             signal: signal::SIGFPE,
@@ -2967,7 +2979,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let state = caller.data_mut();
                 let mut gm = GuestMem::new(data);
                 match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, 0)) {
-                    gex_kernel::signal::Delivery::Resume(target) => state.resume_at = Some(target),
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGSEGV".into());
+                        state.resume_at = Some(target)
+                    }
                     _ => {
                         state.exit = Some(Exit::Signal {
                             signal: signal::SIGSEGV,
@@ -3278,6 +3293,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
+                    state.resume_cause = Some("signal at safepoint".into());
                     state.resume_at = Some(target);
                     Err(StopExecution.into())
                 }
@@ -3979,6 +3995,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         }
         if let Some(at) = caller.data_mut().resume_at.take() {
             crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_resume(caller.data_mut(), at, "call-out");
             pc = at;
             refresh_callouts(&mut *caller)?;
             continue;
@@ -4352,4 +4369,13 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
         return anyhow!("{detail} (pc≈0x{pc:x})");
     }
     e
+}
+
+/// Record a taken resume's cause (set with `resume_at`) and target, under
+/// GEX_NT_STATS; `taker` names the loop that took it when no cause was set.
+pub(crate) fn note_resume(state: &mut HostState, target: u64, taker: &str) {
+    let cause = state.resume_cause.take();
+    if crate::ftab::stats_on() {
+        crate::ftab::stats::note_resume_cause(cause.unwrap_or_else(|| format!("untagged ({taker})")), target);
+    }
 }
