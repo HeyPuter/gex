@@ -124,7 +124,7 @@ pub fn write_i64(out: &mut Vec<u8>, mut v: i64) {
     }
 }
 
-fn write_name(out: &mut Vec<u8>, s: &str) {
+pub(crate) fn write_name(out: &mut Vec<u8>, s: &str) {
     write_u32(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
 }
