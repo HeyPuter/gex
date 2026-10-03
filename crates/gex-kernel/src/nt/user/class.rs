@@ -92,11 +92,29 @@ pub fn get_winproc(u: &User, proc_: u64, ansi: bool) -> u64 {
     }
 }
 
+/// A dialog procedure handle's procedure for `ansi` (Wine's
+/// `get_dialog_proc`): unlike [`get_winproc`], 0 when it has none of that
+/// kind, so user32 tries the other.
+pub fn get_dialog_proc(u: &User, proc_: u64, ansi: bool) -> u64 {
+    match winproc_index(u, proc_) {
+        None => proc_,
+        Some(i) => {
+            let (a, w) = u.winprocs[i];
+            if ansi {
+                a
+            } else {
+                w
+            }
+        }
+    }
+}
+
 /// `NtUserInitializeClientPfnArrays(procsA, procsW, workers, user32)`: the
-/// entries are 64-bit on every ABI.
+/// entries are 64-bit on every ABI (`ntuser_client_func_ptr`), a 32-bit
+/// process's pointer in the low half.
 pub fn nt_user_initialize_client_pfn_arrays(c: &mut Call<'_>) -> R64 {
     let (pa, pw, workers, module) = (c.a(0), c.a(1), c.a(2), c.a(3));
-    let ps = c.p.abi.ptr_size() as u64;
+    let ps = 8;
     let mut procs = vec![(0u64, 0u64); NB_PROCS];
     for (i, p) in procs.iter_mut().enumerate() {
         *p = (c.g.ptr(pa + ps * i as u64)?, c.g.ptr(pw + ps * i as u64)?);

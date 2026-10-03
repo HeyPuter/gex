@@ -42,6 +42,14 @@ pub fn lift_block(
         }
         let inst = decode(&buf[..n], pc);
         let raw = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        if trace_range().is_some_and(|(lo, hi)| pc >= lo && pc < hi) {
+            // GEX_TRACE_INSNS: the state before this instruction, to the
+            // host (sysreg::TRACE), for comparing against a reference trace.
+            let pcv = builder.const_i64(pc);
+            let id = builder.const_i32(crate::sysreg::TRACE as u32);
+            builder.stmt(gex_ir::Stmt::HostCall { func: gex_ir::HostFunc::SysRegWrite, args: vec![pcv, id, pcv] });
+            flags = FlagSource::Unknown;
+        }
         let mark = builder.mark();
         let mut lifter = Lifter::new(&mut builder, flags, raw);
         let flow = lifter.lift(&inst, pc);
@@ -66,6 +74,21 @@ pub fn lift_block(
     let mut block = builder.finish(term);
     pass::optimize(&mut block);
     block
+}
+
+/// `GEX_TRACE_INSNS=LO-HI` (hex): tier-1 x86 instructions in [LO, HI)
+/// report the state before them to the host, which logs it (the native
+/// shim's `lockstep::log_trace`): a trace to compare with a reference one of
+/// the same program, whose first difference is the instruction gex gets
+/// wrong.
+pub fn trace_range() -> Option<(u64, u64)> {
+    static R: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let v = std::env::var("GEX_TRACE_INSNS").ok()?;
+        let (a, b) = v.split_once('-')?;
+        let p = |x: &str| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok();
+        Some((p(a)?, p(b)?))
+    })
 }
 
 #[cfg(test)]

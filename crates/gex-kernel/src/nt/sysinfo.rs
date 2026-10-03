@@ -203,6 +203,17 @@ fn query_system(c: &mut Call<'_>, class: u32, buf: u64, len: u64, ret: u64) -> R
             c.g.w32(buf + 8, bits)?;
             12
         }
+        // SystemPerformanceInformation (312 bytes, no pointers): what
+        // GlobalMemoryStatusEx reads, half of [`PHYS_PAGES`] available and
+        // a commit limit of twice it, none of it committed.
+        2 => {
+            let size = 312u64;
+            need(len, size)?;
+            c.g.zero(buf, size as usize)?;
+            c.g.w32(buf + 44, (PHYS_PAGES / 2) as u32)?; // AvailablePages
+            c.g.w32(buf + 52, (PHYS_PAGES * 2) as u32)?; // TotalCommitLimit
+            size
+        }
         // SystemTimeOfDayInformation: boot time, now, time-zone bias (UTC),
         // time-zone id, reserved, boot time bias, sleep time bias.
         3 => {

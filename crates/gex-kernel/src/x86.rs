@@ -30,6 +30,8 @@ pub const SYSREG_X87: i32 = -101;
 /// (`gex_lift_x86::sysreg::CMPXCHG16B`): the value is the effective address.
 /// See [`serve_cmpxchg16b`].
 pub const SYSREG_CMPXCHG16B: i32 = -102;
+/// `GEX_TRACE_INSNS` (`gex_lift_x86::sysreg::TRACE`): the value is the pc.
+pub const SYSREG_TRACE: i32 = -103;
 
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.

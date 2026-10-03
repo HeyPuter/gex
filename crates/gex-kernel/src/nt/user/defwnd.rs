@@ -42,6 +42,9 @@ fn read_text(c: &Call<'_>, p: u64, ansi: bool) -> R<Vec<u16>> {
 }
 
 fn set_text(c: &mut Call<'_>, hwnd: u32, text: Vec<u16>) {
+    if c.p.cfg.trace {
+        crate::nt_log!("[nt:{:x}]   text {hwnd:#x} {:?}", c.t.tid, crate::nt::wstr(&text));
+    }
     if let Some(w) = window::find_mut(&mut c.p.user.lock().unwrap(), hwnd) {
         w.text = text;
     }

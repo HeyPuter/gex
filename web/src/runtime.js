@@ -368,6 +368,9 @@ export async function runProgram(
     dirs = [],
     // Which bundled files are executable; see `untar`.
     modes = {},
+    // Hard links, path to target (`untar`'s `hard`): made as links, so the
+    // two names are one inode as on the host.
+    hard = {},
     /// `KEY=VALUE` strings for pid 1. Empty takes the shim's default.
     env = [],
     args,
@@ -763,7 +766,7 @@ export async function runProgram(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, env, pins: closure?.pins,
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, env, pins: closure?.pins,
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.

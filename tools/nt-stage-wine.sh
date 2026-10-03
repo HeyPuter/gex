@@ -29,6 +29,9 @@ SETS=(
     "$WINE_LIB/x86_64-windows|drive_c/windows/system32|*"
     "$WINE_LIB/i386-windows|drive_c/windows/syswow64|*"
     "$WINE_SHARE/nls|nls|*.nls"
+    # The bitmap and TrueType fonts Wine installs in C:\windows\Fonts; the NT
+    # layer's GDI text draws with the bitmap ones (nt/gdi/font.rs).
+    "$WINE_SHARE/fonts|drive_c/windows/Fonts|*"
 )
 
 host_version() {

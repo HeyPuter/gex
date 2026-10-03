@@ -300,9 +300,11 @@ mod imp {
         }
         let prefix = var("GEX_WINE_PREFIX").unwrap_or_else(|| "/wine".into());
         let mut wenv = nt::boot::default_environment();
+        let mut settings = Vec::new();
         for kv in env {
             let Some((name, v)) = kv.split_once('=') else { continue };
             if name.starts_with("GEX_") {
+                settings.push((name.to_string(), v.to_string()));
                 continue;
             }
             match wenv.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
@@ -325,6 +327,7 @@ mod imp {
             cwd: nt::boot::dos_path(&prefix, &cwd),
             trace: flag("GEX_NT_TRACE"),
             strict: flag("GEX_NT_STRICT"),
+            settings,
         };
         let p = Arc::new(nt::Process::new(abi, nt::thread::nt_pid(k.pid), cfg, clocks(), Arc::clone(&k.futexes)));
         p.reserve_host(host_lo, host_hi, "[gex-shim]");
@@ -803,24 +806,7 @@ mod imp {
     }
 
     fn retire(h: &mut crate::Host, ranges: &[(u64, u64)]) {
-        use std::sync::atomic::AtomicU32;
-        for &(start, end) in ranges {
-            if end <= start {
-                continue;
-            }
-            h.jit.translated.retain(|a| *a < start || *a >= end);
-            for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
-                if page >= gex_abi::DISPATCH_MAX_PAGES {
-                    break;
-                }
-                h.jit.page_table.forget(page);
-                h.jit.retired_pages.insert(page);
-                let at = gex_abi::DISPATCH_DIR + page * 4;
-                // SAFETY: the directory is in the shared memory, four-byte
-                // aligned, and every Worker's dispatch reads it as a word.
-                unsafe { (*(at as usize as *const AtomicU32)).store(0, Ordering::Release) };
-            }
-        }
+        crate::retire_code(h, ranges);
     }
 
     /// Each thread's last NT calls and where they were made, for an execute

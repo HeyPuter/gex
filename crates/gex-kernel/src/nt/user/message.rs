@@ -47,6 +47,17 @@ pub struct Sent {
     pub reply: Arc<Reply>,
     /// Whether the sender used the ANSI entry point.
     pub ansi: bool,
+    /// Win32u's own work for the receiving thread (Wine's WM_WINE_*
+    /// messages), done there in place of a window procedure call.
+    pub internal: Option<Internal>,
+}
+
+/// What win32u does on a window's own thread when another thread asks
+/// (Wine's `handle_internal_message`).
+#[derive(Debug, Clone, Copy)]
+pub enum Internal {
+    /// WM_WINE_SETWINDOWPOS: `set_window_pos(hwnd, after, x, y, cx, cy, flags)`.
+    SetWindowPos { after: u32, x: i32, y: i32, cx: i32, cy: i32, flags: u32 },
 }
 
 #[derive(Debug, Default)]
@@ -152,12 +163,38 @@ pub fn send_to_thread(
     ansi: bool,
     timeout_ms: Option<u32>,
 ) -> R<Option<u64>> {
+    send_to_thread_with(c, tid, hwnd, msg, wparam, lparam, ansi, timeout_ms, None)
+}
+
+/// Have thread `tid`, which owns `hwnd`, do `what` itself and wait for it
+/// (Wine sends a WM_WINE_* message: a window's position, style and so on
+/// change on the thread that owns it).
+pub fn send_internal(c: &mut Call<'_>, tid: u32, hwnd: u32, what: Internal) -> R<u64> {
+    const WM_WINE_SETWINDOWPOS: u32 = 0x8000_0001;
+    let msg = match what {
+        Internal::SetWindowPos { .. } => WM_WINE_SETWINDOWPOS,
+    };
+    Ok(send_to_thread_with(c, tid, hwnd, msg, 0, 0, false, None, Some(what))?.unwrap_or(0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_to_thread_with(
+    c: &mut Call<'_>,
+    tid: u32,
+    hwnd: u32,
+    msg: u32,
+    wparam: u64,
+    lparam: u64,
+    ansi: bool,
+    timeout_ms: Option<u32>,
+    internal: Option<Internal>,
+) -> R<Option<u64>> {
     let reply = Arc::new(Reply { from: c.t.tid, ..Default::default() });
     let m = Msg { hwnd, msg, wparam, lparam, time: tick_count(c), pt: (0, 0) };
     {
         let mut u = c.p.user.lock().unwrap();
         let q = &mut u.thread(tid).queue;
-        q.sent.push_back(Sent { msg: m, reply: Arc::clone(&reply), ansi });
+        q.sent.push_back(Sent { msg: m, reply: Arc::clone(&reply), ansi, internal });
         q.changed |= qs::SENDMESSAGE;
     }
     wake(c, tid);
@@ -198,7 +235,14 @@ pub fn process_sent(c: &mut Call<'_>) -> R<bool> {
         let Some(s) = next else { return Ok(any) };
         any = true;
         c.p.user.lock().unwrap().thread(tid).queue.replying.push(Arc::clone(&s.reply));
-        let (r, _) = winproc::call_window_proc(c, s.msg.hwnd, s.msg.msg, s.msg.wparam, s.msg.lparam, &Pack::None, s.ansi, winproc::MAP_SENDMESSAGE)?;
+        let r = match s.internal {
+            Some(Internal::SetWindowPos { after, x, y, cx, cy, flags }) => {
+                window::set_window_pos(c, s.msg.hwnd, after, x, y, cx, cy, flags)? as u64
+            }
+            None => {
+                winproc::call_window_proc(c, s.msg.hwnd, s.msg.msg, s.msg.wparam, s.msg.lparam, &Pack::None, s.ansi, winproc::MAP_SENDMESSAGE)?.0
+            }
+        };
         c.p.user.lock().unwrap().thread(tid).queue.replying.pop();
         reply(c, &s.reply, r);
     }
@@ -574,7 +618,18 @@ pub fn nt_user_msg_wait_for_multiple_objects_ex(c: &mut Call<'_>) -> R64 {
 pub fn nt_user_post_message(c: &mut Call<'_>) -> R64 {
     let (h, msg, wparam, lparam) = (c.a32(0), c.a32(1), c.a(2), c.a(3));
     if h == 0xffff || h == 0xffff_ffff {
-        return Err(c.unimplemented("PostMessage(HWND_BROADCAST)"));
+        // HWND_BROADCAST: every top-level window (the desktop's children)
+        // gets one.
+        let targets: Vec<(u32, u32)> = {
+            let u = c.p.user.lock().unwrap();
+            let kids = u.windows.get(&u.desktop).map(|d| d.children.clone()).unwrap_or_default();
+            kids.iter().filter_map(|k| u.windows.get(k)).map(|w| (w.hwnd, w.tid)).collect()
+        };
+        let time = tick_count(c);
+        for (hwnd, tid) in targets {
+            post_to_thread(c, tid, Msg { hwnd, msg, wparam, lparam, time, pt: (0, 0) });
+        }
+        return Ok(1);
     }
     let (hwnd, tid) = if h == 0 {
         (0, c.t.tid)

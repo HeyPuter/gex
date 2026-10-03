@@ -17,7 +17,9 @@
 pub const MAGIC: u32 = 0x4758_4547;
 /// Version of the command ABI. A guest and host must agree before any opcode
 /// is decoded; generated opcode policy changes require incrementing this.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13: the registry's compatibility-profile commands (tools/gen_gl_compat.py,
+/// opcodes from [`crate::compat_plans::COMPAT_BASE`]).
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The fixed header at the start of the shared buffer. `repr(C)` for the C
 /// guest half; every field 32 bits, 32 bytes total.

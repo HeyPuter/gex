@@ -442,7 +442,7 @@ pub fn boot(p: &Arc<Process>, k: &mut Kernel, mem: &mut [u8], req: &BootRequest<
     let entry = exe_base + exe.entry_rva as u64;
     super::thread::init_start_frame(p, &mut g, &t, entry, peb).map_err(st_err("building the initial frame"))?;
     let pc = g.u64(t.ctx_addr + gex_abi::ctx::PC as u64).map_err(st_err("reading the start pc"))?;
-    if std::env::var_os("GEX_NT_STATS").is_some() {
+    if p.setting("GEX_NT_STATS").is_some() {
         crate::nt_log!("gex-nt: exe {} at {exe_base:#x}", req.exe_path);
     }
     if p.cfg.trace {
