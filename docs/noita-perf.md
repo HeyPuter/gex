@@ -54,6 +54,13 @@ GEX_NT_TIME_SCALE=4 PREFIX=$S/prefix CPUS=4,10 GEXC=<gexc> \
     $S/run-noita.sh TAG SECONDS [--no-cgen]
 ```
 
+**Display: null, for parity.** pewasm's recipe runs null GL and shows
+nothing; gex's frame dump (`PpmDisplay::publish`, compositing every frame
+to a PPM file) was 3.3% of tier-1's CPU. Parity runs pass
+`--wayland-out null` (frames presented and dropped; run-noita.sh's
+`NULLDISP=1`). GL calls still reach the host's Mesa (about 2%: opengl32 plus
+gallium); a null GL is not built.
+
 World fps = the slope of `peek` over a steady window (120 s steps from
 world-up). `PREFIX` is a private copy of the staged Wine prefix, so other
 agents' runs (which delete the save) cannot collide; `GEX_CGEN_CACHE` a
@@ -92,6 +99,28 @@ sampler in gexc, 1 kHz of process CPU time; `perf` is not installed and
 So in tier-1 the guest's own code is three quarters of the time; gex
 spends about 100 ms of CPU per world frame where pewasm's three busy
 threads spend about 18 ms.
+
+### By guest module (tier-1, steady state, stream R)
+
+`tools/modattr.py` maps a GEX_PROF profile to guest images: tier-1 blocks
+carry `b_<addr>` names under `GEX_PERFMAP` (gex-emit's name section), units
+`f_<entry>`; `--exports DLL@BASE` groups one image by export. 4x clock,
+cores 3 and 9, frames still dumped, 650-1000 s (364 s of CPU, world 16.1/s):
+
+| share | module |
+|---|---|
+| 57.7% | noita.exe (hottest: 0x724720 3.9%, 0x4ac0d0 2.1%, 0x5b01c0, 0x70b110, 0x864060) |
+| 11.6% | msvcr120: about 5% ConcRT spinning and locking (`_SpinWait::_SpinOnce`, `_ReaderWriterLock::_TryAcquireWrite`, `_Context::_Yield`, `critical_section`), memset 1.3%, strcpy_s 0.7%, sin/cos 0.9% |
+| 12.4% | host libc: `sched_yield` 5.7% (the guest's `SwitchToThread`/`Sleep(0)`: `NtYieldExecution` is a host yield), the rest stripped-symbol mem* and futex paths |
+| 8.3% | host gexc: the frame dump 3.3%, the NT layer about 2.5%, wasmtime unwinding 0.5% |
+| 5.3% | Wine: ntdll 2.9% (heap, yield, SRW locks), kernelbase 1.4% and kernel32 1.0% (TlsGetValue, SwitchToThread), opengl32 0.8% |
+| 1.0% | msvcp120 |
+| 1.1% | LuaJIT: lua51.dll 0.3%, its generated code 0.8% |
+| 0.1% | SDL2; fmod, fmodstudio and steam_api about 0 |
+
+Synchronisation spinning (ConcRT plus the yields it causes) is about 13%, and
+pewasm replaced exactly that (`noita_concrt.c`, lock-free critical sections).
+Lua is about 1% here; world-up is not attributed yet.
 
 ### One function at a time
 
