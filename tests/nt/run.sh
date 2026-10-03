@@ -100,6 +100,10 @@ for arch in x64 x86; do
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
     # Display modes, D3DKMT, memory status, a section mapped twice, dialogs.
     check $arch/display 0 "$allok" "$b/display.exe"
+    # An image without DYNAMIC_BASE: at its linked base, or relocated by ntdll
+    # with its header as linked.
+    check $arch/fixedbase 0 "$allok" "$b/fixedbase.exe"
+    check $arch/fixedbase-taken 0 "$allok" "$b/fixedbase.exe" taken
     # opengl32 through the generated transport (tools/gen_gl_compat.py).
     check_gl $arch/glcompat 0 "$allok" "$b/glcompat.exe"
     # A window that paints and runs a message loop (tests/nt/browser-gui.mjs shows it).

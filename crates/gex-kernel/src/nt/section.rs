@@ -336,10 +336,28 @@ pub fn map_image(
             return Err(Status(st::CONFLICTING_ADDRESSES));
         }
         b
+    } else if img.dll_characteristics & 0x40 == 0
+        && stl.layout.as_ref().and_then(|l| l.base_of(path)).is_none()
+        && img.preferred_base % vm::GRANULE == 0
+        && img.preferred_base >= vm::ALLOC_LOW
+        && img.preferred_base + size <= vm::ALLOC_HIGH
+        && stl.vm.is_free(img.preferred_base, img.preferred_base + size)
+    {
+        // Without DYNAMIC_BASE an image goes where it was linked when that
+        // is free, as on Windows and Wine: no ASLR for it.
+        img.preferred_base
     } else {
         relocatable_base(&stl, path, size)?
     };
-    let bytes = img.map(base).map_err(|e| {
+    // An image moved off a base it did not declare movable (no
+    // DYNAMIC_BASE) is mapped as linked, and ntdll's loader relocates it,
+    // leaving the header's ImageBase as it was, as Wine does: packers hash
+    // their headers (bass.dll reports "tampered with" otherwise). A
+    // DYNAMIC_BASE image is relocated here, its ImageBase updated (Wine's
+    // dynamic-base path).
+    let dynamic = img.dll_characteristics & 0x40 != 0;
+    let moved_static = base != img.preferred_base && !dynamic;
+    let bytes = img.map(if moved_static { img.preferred_base } else { base }).map_err(|e| {
         crate::nt_log!("gex-nt: mapping {path} at {base:#x}: {e}");
         Status(st::INVALID_IMAGE_FORMAT)
     })?;
@@ -381,7 +399,13 @@ pub fn map_image(
     if stl.vm.mirror(&mut k.mem, base, base + size) {
         k.retired_code.push((base, base + size));
     }
-    let status = if img.machine != native_machine(p.abi) { st::IMAGE_MACHINE_TYPE_MISMATCH } else { st::SUCCESS };
+    let status = if img.machine != native_machine(p.abi) {
+        st::IMAGE_MACHINE_TYPE_MISMATCH
+    } else if moved_static {
+        st::IMAGE_NOT_AT_BASE
+    } else {
+        st::SUCCESS
+    };
     if let Some(hook) = IMAGE_MAPPED.get() {
         hook(&MappedImage { path, base, pe: img });
     }

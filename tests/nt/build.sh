@@ -16,6 +16,13 @@ for arch in x64 x86; do
         cc=$(sed -n 's/^.*gex-nt-cc: *//p' "$c" | sed "s/ARCH/$triple/g")
         # No timestamp in the PE header, so a rebuild of an unchanged source
         # produces the same file.
+        # `gex-nt-dll: BASE` builds a DLL linked at BASE without DYNAMIC_BASE.
+        dllbase=$(sed -n 's/^.*gex-nt-dll: *//p' "$c")
+        if [ -n "$dllbase" ]; then
+            ${cc:-$triple-w64-mingw32-gcc} -O2 -s -shared -Wl,--no-insert-timestamp \
+                -Wl,--image-base=$dllbase -Wl,--disable-dynamicbase -o "$here/bin/$arch/$n.dll" "$c"
+            continue
+        fi
         ${cc:-$triple-w64-mingw32-gcc} -O2 -s -Wl,--no-insert-timestamp -o "$here/bin/$arch/$n.exe" "$c"
     done
 done
