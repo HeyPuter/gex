@@ -73,6 +73,7 @@ async function main() {
   if (q.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
   if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
+  if (q.get('cgen')) globalThis.GEX_CGEN = Number(q.get('cgen'));
   if (q.get('densedebug')) globalThis.GEX_DENSE_DEBUG = 1;
   if (q.get('tracemisses')) globalThis.GEX_TRACE_MISSES = 1;
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);

@@ -648,6 +648,10 @@ export async function runProgram(
       trapStack: globalThis.GEX_TRAP_STACK ? 1 : undefined,
       // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
       dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
+      // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
+      // a program image), read from the server's `/gex-cgen/` (a unit
+      // cache, GEX_CGEN_CACHE's layout) with synchronous requests.
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: '/gex-cgen' } : undefined,
       denseDebug: !!globalThis.GEX_DENSE_DEBUG,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?forkskip=N`, in `extra` because the process that acts on it is a

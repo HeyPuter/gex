@@ -160,7 +160,11 @@ export default {
       return;
     }
     const rel = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname)).replace(/^(\.\.[/\\])+/, '');
-    const file = [join(dist, rel), join(WEB, 'public', rel)].find((f) => existsSync(f) && statSync(f).isFile());
+    // `/gex-cgen/...`: the function-tier unit cache (GEX_CGEN_CACHE), for
+    // a page opened with `cgen=1|2`.
+    const cgen = process.env.GEX_CGEN_CACHE && rel.startsWith('/gex-cgen/')
+      ? join(process.env.GEX_CGEN_CACHE, rel.slice('/gex-cgen/'.length)) : null;
+    const file = (cgen ? [cgen] : [join(dist, rel), join(WEB, 'public', rel)]).find((f) => existsSync(f) && statSync(f).isFile());
     if (!file) {
       res.writeHead(404);
       res.end();
