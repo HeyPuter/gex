@@ -1,4 +1,4 @@
-# Games on gex: Half-Life and Peggle Deluxe
+# Games on gex: Half-Life, Peggle Deluxe and Unity games
 
 Stream G of the pewasm to gex merge. The goal is to run both games in gex's JIT
 tier, first natively (`gexc`) and then in the browser (`web/nt.html`). Nothing
@@ -123,6 +123,85 @@ Next steps:
    parses the bitmap `.fon` files and answers the win32u text calls that
    user32 and comctl32 make for dialogs. It has never been run. Pick it up
    only if Peggle needs dialog text.
+
+## Unity games (stream U)
+
+Muck (Linux x86-64, Unity 2019.4.19f1), Hollow Knight (Windows x64,
+Unity 6000.0.61f1) and Rain World (Windows x64, Unity 2020.3.45f1). All
+three are Mono (MonoBleedingEdge), not IL2CPP. Run them in place from the
+Steam install, read-only; write prefixes, homes and logs elsewhere.
+
+State as of 2026-10-03: none reaches its menu on gex yet. Every one of them
+needs more address space than a wasm32 guest has (below).
+
+### Running
+
+- **Muck:** guest GL for x86-64 (`GEX_CC=gcc guest/gl/build.sh DIR`), an X
+  display (a private `Xvfb :N` on the host works natively), and
+  `gexc run --fjit --gl --wayland $XDG_RUNTIME_DIR/x --wayland-out DIR
+  --env LD_LIBRARY_PATH=DIR --env DISPLAY=:N --env HOME=... ./Muck.x86_64
+  -logFile LOG -screen-width 800 -screen-height 600 -screen-fullscreen 0`.
+  Unity 2019.4's SDL is X11-only (GLX through gex-gl's libGL).
+- **Hollow Knight / Rain World:** a staged prefix (`tools/nt-stage-wine.sh`),
+  `gexc run --fjit --wine-prefix P --gl --wayland-out DIR game.exe`.
+  Hollow Knight's build has no OpenGL renderer (`-force-glcore` fails with
+  "OpenGL Core was not built"), so it needs D3D11 on wined3d. Rain World:
+  `--env WINEDLLOVERRIDES=winhttp=b` keeps BepInEx's doorstop proxy
+  (`winhttp.dll` in the game directory) from loading, without touching the
+  install.
+- **Mono's null checks.** Mono turns a fault on a null object reference into
+  NullReferenceException, and gex has no page protection in the low region,
+  so the fault does not happen. The run scripts set
+  `MONO_DEBUG=explicit-null-checks` (Mono configuration, not a game change).
+  The general fix is low-page protection in gex: a fault on an access below
+  the guest's floor, which other runtimes that rely on null faults (JVMs,
+  .NET) need as well.
+- **Steam.** Without a Steam client, Muck's Host Lobby does nothing (its
+  game is a Steam lobby; there is no offline mode), so Muck's gameplay needs
+  an x86-64 gex-steam with lobby and loopback P2P. Hollow Knight stops on its
+  title screen natively without Steam; Rain World gets through EOS errors.
+- Knobs: `GEX_FPS=1` (presents per second), `GEX_FRAME_EVERY=N`,
+  `--wayland-out null`, `GEX_STRACE_STACK=N` (stack words at each syscall
+  under `--strace`), and `GEX_NT_TRACE` now logs each
+  NtAllocateVirtualMemory request.
+
+### Address space: why none fits in wasm32
+
+Unity's memory manager (`MemoryManager::VirtualAllocator`, named from Muck's
+`UnityPlayer_s.debug`) gives every allocator block its own 256 MiB-aligned
+slot and looks blocks up by `address >> 28`, so two blocks never share a
+slot whatever their size. Baselib reserves each one by mapping 512 MiB - 4 KiB
+`PROT_NONE` and trimming. A gex x86-64 guest has 2 GiB for mappings
+(`MMAP_TOP`, the dispatch directory's reach), and the NT allocator 2 GiB.
+
+Slots used, measured natively (Muck on Linux with an `mmap` backtrace shim,
+the Windows games under host Wine 11.15 with `WINEDEBUG=+virtual`):
+
+| game | slots at startup | what they are |
+|---|---|---|
+| Muck | 19 at the menu | 4 job temp allocators (ThreadsafeLinearAllocator), 1 bucket allocator, 1 main-thread temp (TLSAllocator), 9 dynamic-heap pools (main, per-thread, gfx, typetree, file system, ...), 4 large allocations (gfx command buffer, async upload queue, a texture, FMOD samples) |
+| Hollow Knight | 17 at the title screen | (no symbols; same Baselib pattern) |
+| Rain World | 16 after engine init | (no symbols; same pattern) |
+
+Every allocation larger than a heap block takes a slot of its own, so the
+count grows with what a level loads. Launch knobs tried:
+
+- Muck: `-job-worker-count 0/1`, `-force-gfx-st`, both together, even
+  `-nographics`: 19 every time. Unity 2019.4 has no `memorysetup-*` keys.
+- Hollow Knight (Unity 6 reads `-memorysetup-KEY VALUE` from the command
+  line; the `KEY=VALUE` form is ignored): every heap block size at 256 MiB
+  takes it from 17 to 13 at the first screen; 1 MiB blocks leave it at 17;
+  `-job-worker-count 1` leaves it at 17.
+- Rain World (2020.3): only `-job-worker-count`, no memorysetup keys.
+
+Raising `MMAP_TOP` does not get there: up to 3 GiB costs a larger directory
+(it must end below the non-PIE base 0x400000, which allows exactly 3 GiB) and,
+for Windows guests, moving the host-call slots and trampolines at
+0x30_0000-0x40_0000 that a larger directory runs into; past 3 GiB the
+directory has to leave the low region, and in the browser the NT shim's heap
+above 0x8000_0000 has to move. 3.75 GiB gives at most 14 slots, fewer once
+images, stacks and the 512 MiB transient reservation are placed. So all
+three need a 64-bit guest memory (docs/mem64.md).
 
 ## Measurement scripts (not written yet)
 
