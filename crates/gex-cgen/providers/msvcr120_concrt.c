@@ -185,15 +185,11 @@ static GEX_PROVIDER(cond_notify) {
 
 /* ---- scheduler queries, yielding and tasks ---- */
 
-/* ?_Yield@_Context@details@Concurrency@@SAXXZ, ?_UnderlyingYield@details@Concurrency@@YAXXZ:
- * a real wait (1 ms or a wake), not a spin: a yielder must not starve the
- * thread it waits for. */
-static GEX_PROVIDER(yield_) {
-    (void)depth, (void)need;
-    gp_poll(ctx, GP_SELF_PC());
-    gp_sleep(ctx, 1);
-    return gp_return(ctx, ret, 0);
-}
+/* _Context::_Yield and _UnderlyingYield are not provided: the guest's own
+ * (SwitchToThread, a host yield) measured better than a 1 ms wait, for
+ * world loading (447 s against 468 s) and steady state (18.2 against 16.7
+ * world fps; tier-1, two paired runs each, docs/noita-perf.md). */
+
 /* ?wait@Concurrency@@YAXI@Z (cdecl, milliseconds) */
 static GEX_PROVIDER(wait_ms) {
     (void)depth, (void)need;
@@ -249,8 +245,6 @@ GEX_PROVIDE(cond_wait_, "?wait@_Condition_variable@details@Concurrency@@QAEXAAVc
 GEX_PROVIDE(cond_wait_for, "?wait_for@_Condition_variable@details@Concurrency@@QAE_NAAVcritical_section@3@I@Z")
 GEX_PROVIDE(cond_notify, "?notify_one@_Condition_variable@details@Concurrency@@QAEXXZ")
 GEX_PROVIDE(cond_notify, "?notify_all@_Condition_variable@details@Concurrency@@QAEXXZ")
-GEX_PROVIDE(yield_, "?_Yield@_Context@details@Concurrency@@SAXXZ")
-GEX_PROVIDE(yield_, "?_UnderlyingYield@details@Concurrency@@YAXXZ")
 GEX_PROVIDE(wait_ms, "?wait@Concurrency@@YAXI@Z")
 GEX_PROVIDE(one, "?_GetConcurrency@details@Concurrency@@YAIXZ")
 GEX_PROVIDE(one, "?_Id@_CurrentScheduler@details@Concurrency@@SAIXZ")
