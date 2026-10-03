@@ -13,6 +13,8 @@ one gets a struct of its size. The methods with an answer worth giving
 (logged on, owns the app, the language) are in OVERRIDES.
 """
 import json
+import os
+import re
 import sys
 
 # Bodies for the methods that say something. Keyed "Class::Method"; the
@@ -47,6 +49,13 @@ OVERRIDES = {
     'ISteamApps::GetCurrentBetaName': ('', 'return false;'),
     'ISteamApps::GetLaunchQueryParam': ('', 'return "";'),
     'ISteamApps::GetAppInstallDir': ('unsigned app, char *buf, unsigned size', '(void)app; return gex_steam_copy(buf, (int)size, gex_steam_dir());'),
+    # Authentication with no Steam to vouch: a ticket that names the user,
+    # which this library's own game server side accepts. A game checks only
+    # that one came back (GoldSrc: "STEAM certificate length error").
+    'ISteamUser::InitiateGameConnection_DEPRECATED': ('void *blob, int max, unsigned long long server, unsigned ip, unsigned short port, bool secure', '(void)server; (void)ip; (void)port; (void)secure; return gex_steam_ticket(blob, max);'),
+    'ISteamUser::GetAuthSessionTicket': ('void *ticket, int max, unsigned *len', 'int n = gex_steam_ticket(ticket, max); if (len) *len = (unsigned)n; return n ? 1u : 0u;'),
+    'ISteamGameServer::GetAuthSessionTicket': ('void *ticket, int max, unsigned *len', 'int n = gex_steam_ticket(ticket, max); if (len) *len = (unsigned)n; return n ? 1u : 0u;'),
+    'ISteamGameServer::SendUserConnectAndAuthenticate_DEPRECATED': ('unsigned ip, const void *blob, unsigned size, void *user', '(void)ip; (void)blob; (void)size; gex_ret_CSteamID id = gex_steam_id(); if (user) memcpy(user, id.b, sizeof id.b); return true;'),
     'ISteamGameServer::BLoggedOn': ('', 'return true;'),
     'ISteamGameServer::BSecure': ('', 'return false;'),
     'ISteamGameServer::GetSteamID': ('', 'return gex_steam_id();'),
@@ -69,8 +78,54 @@ PRIMS = {
 }
 
 
+def class_virtuals(headers, cls):
+    """The virtual functions of `cls` in its header, in vtable order, as
+    (name, return type, private): steam_api.json leaves out the
+    STEAM_PRIVATE_API ones, which still take their vtable slots (an
+    ISteamGameServer's InitGameServer: without it every later method is
+    one slot early for a game built against that header)."""
+    for text in headers:
+        m = re.search(r'\bclass\s+' + cls + r'\b[^;{]*\{', text)
+        if not m:
+            continue
+        depth, i = 1, m.end()
+        while depth and i < len(text):
+            depth += {'{': 1, '}': -1}.get(text[i], 0)
+            i += 1
+        body = text[m.end():i]
+        out = []
+        for v in re.finditer(r'(STEAM_PRIVATE_API\s*\(\s*)?virtual\s+([^;(]*?)\b(\w+)\s*\(', body):
+            out.append((v.group(3), v.group(2).strip(), bool(v.group(1))))
+        return out
+    return []
+
+
+def with_private_methods(itf, headers):
+    """The interface's methods with its private ones in their slots."""
+    methods = list(itf['methods'])
+    virtuals = class_virtuals(headers, itf['classname'])
+    if not any(p for _, _, p in virtuals):
+        return methods
+    out, j = [], 0
+    for name, ret, private in virtuals:
+        if j < len(methods) and methods[j]['methodname'] == name:
+            out.append(methods[j])
+            j += 1
+        elif private:
+            out.append({'methodname': name, 'returntype': ret, 'params': []})
+    return out + methods[j:]
+
+
 def main():
     api = json.load(open(sys.argv[1]))
+    # The SDK headers beside the JSON, for what it leaves out.
+    hdir = os.path.dirname(os.path.abspath(sys.argv[1]))
+    headers = []
+    for f in sorted(os.listdir(hdir)):
+        if f.endswith('.h'):
+            t = open(os.path.join(hdir, f), errors='replace').read()
+            t = re.sub(r'/\*.*?\*/', '', t, flags=re.S)
+            headers.append(re.sub(r'//[^\n]*', '', t))
     typedefs = {t['typedef']: t['type'] for t in api['typedefs']}
     structs = {s['struct']: s for s in api['structs']}
     enums = {e['enumname'] for e in api['enums']}
@@ -129,7 +184,7 @@ def main():
     for itf in api['interfaces']:
         cls = itf['classname']
         lines = [f'struct Gex{cls} {{']
-        for i, m in enumerate(itf['methods']):
+        for i, m in enumerate(with_private_methods(itf, headers)):
             rt = ret_type(m['returntype'])
             key = f"{cls}::{m['methodname']}"
             params, body = OVERRIDES.get(key, ('', None))
@@ -142,6 +197,7 @@ def main():
         out.append(f'struct {name} {{ unsigned char b[sizeof(void *) == 8 ? {s64} : {s32}]; }};')
     # The one helper an override needs that returns an aggregate.
     out.append('static gex_ret_CSteamID gex_steam_id();')
+    out.append('static int gex_steam_ticket(void *buf, int max);')
     out.append('')
     out += classes
     out.append('')

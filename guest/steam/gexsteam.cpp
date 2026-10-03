@@ -66,6 +66,17 @@ static gex_ret_CSteamID gex_steam_id() {
     return r;
 }
 
+/* An auth ticket: "gexsteam", then the user's SteamID. */
+static int gex_steam_ticket(void *buf, int max) {
+    unsigned char t[16];
+    memcpy(t, "gexsteam", 8);
+    gex_ret_CSteamID id = gex_steam_id();
+    memcpy(t + 8, id.b, 8);
+    if (!buf || max < (int)sizeof t) return 0;
+    memcpy(buf, t, sizeof t);
+    return (int)sizeof t;
+}
+
 #define GEX_INSTANCE(cls, version) static cls inst_##cls;
 GEX_STEAM_INTERFACES(GEX_INSTANCE)
 
