@@ -167,6 +167,9 @@ impl nt::display::NtDisplay for NullDisplay {
     fn poll_input(&self) -> Vec<nt::display::NtDisplayEvent> {
         Vec::new()
     }
+    fn shows_frames(&self) -> bool {
+        false
+    }
 }
 
 struct PpmDisplay {

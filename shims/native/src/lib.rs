@@ -555,6 +555,12 @@ pub fn engine() -> Result<Engine> {
     // Deep guest call chains are wasm recursion (units call units): room for
     // them, on threads with stacks to match (`guest_thread_stack`).
     config.max_wasm_stack(wasm_stack_bytes());
+    // Traps are control flow here (a call-out's return, a resume, a callback's
+    // end, all StopExecution), hundreds a second in Noita, and each walked
+    // and symbolised the whole wasm stack for a backtrace nothing reads
+    // (`classify_trap` reports the trap's kind). GEX_WASM_BACKTRACE=1 keeps
+    // them, for debugging.
+    config.wasm_backtrace(std::env::var("GEX_WASM_BACKTRACE").as_deref() == Ok("1"));
     // Tail calls are load-bearing: the whole block-per-function design in
     // PLAN §2.4 depends on them.
     config.wasm_tail_call(true);

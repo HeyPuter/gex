@@ -68,6 +68,14 @@ pub trait NtDisplay: Send + Sync {
     fn gl_target(&self, _toplevel: u32, _rect: (i32, i32, i32, i32)) -> Option<u32> {
         None
     }
+    /// Whether published surfaces are looked at. A display that drops every
+    /// frame (`--wayland-out null`, the measuring recipe) says no, and
+    /// SwapBuffers runs the frame's GL without reading it back into the
+    /// window's surface: a full-frame readback, a GPU stall and a copy per
+    /// row each frame, all for pixels nobody sees.
+    fn shows_frames(&self) -> bool {
+        true
+    }
 }
 
 /// Publish top-level window `toplevel`'s surface, if there is a display.
