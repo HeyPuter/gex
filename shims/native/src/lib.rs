@@ -290,6 +290,11 @@ pub(crate) mod jit_stats {
     pub static SLOTS: AtomicU64 = AtomicU64::new(0);
     pub static GROWN: AtomicU64 = AtomicU64::new(0);
     pub static WASM_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Tier-1 miss translations: compiled-module cache hits and misses, and
+    /// microseconds spent compiling (and loading) them.
+    pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    pub static COMPILE_US: AtomicU64 = AtomicU64::new(0);
     /// Blocks that failed their page check and were translated again.
     pub static STALE: AtomicU64 = AtomicU64::new(0);
     /// The last few translated pcs, and since the last line the lowest and
@@ -309,7 +314,7 @@ pub(crate) mod jit_stats {
         use std::sync::atomic::Ordering::Relaxed;
         let (lo, hi) = (LO.swap(u64::MAX, Relaxed), HI.swap(0, Relaxed));
         format!(
-            "jit pc={lo:#x}..{hi:#x} last={:x?} pub={} blocks={} wasm={}M inst={} retired={} stale={} slots={} grown={}",
+            "jit pc={lo:#x}..{hi:#x} last={:x?} pub={} blocks={} wasm={}M inst={} retired={} stale={} slots={} grown={} t1cache={}/{} t1compile_ms={}",
             LAST.iter().map(|a| a.load(Relaxed)).collect::<Vec<_>>(),
             PUBLISHED.load(Relaxed),
             BLOCKS.load(Relaxed),
@@ -318,7 +323,10 @@ pub(crate) mod jit_stats {
             RETIRED.load(Relaxed),
             STALE.load(Relaxed),
             SLOTS.load(Relaxed),
-            GROWN.load(Relaxed)
+            GROWN.load(Relaxed),
+            CACHE_HITS.load(Relaxed),
+            CACHE_HITS.load(Relaxed) + CACHE_MISSES.load(Relaxed),
+            COMPILE_US.load(Relaxed) / 1000
         )
     }
 }
@@ -3433,17 +3441,21 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // processes. Without the cache every dynamic program recompiles ld.so and
     // libc from scratch (eight seconds on `dpkg --version`).
     let cache = caller.data().jit.as_ref().and_then(|j| j.cache.clone());
+    let t0 = std::time::Instant::now();
     let module = match cache {
         Some((dir, build)) => {
             let key = gex_cache::key(&build, [translated_module.wasm.as_slice()]);
             let wasm = translated_module.wasm.clone();
-            gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
-                .context("compiling runtime-translated wasm")?
-                .module
+            let l = gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
+                .context("compiling runtime-translated wasm")?;
+            let c = if l.hit { &jit_stats::CACHE_HITS } else { &jit_stats::CACHE_MISSES };
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            l.module
         }
         None => Module::new(&engine, &translated_module.wasm)
             .context("validating runtime-translated wasm")?,
     };
+    jit_stats::COMPILE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 
     // Publish first, install second. The store's watermark only ever advances
     // through `replay_registry`, so installing here as well would double-count
