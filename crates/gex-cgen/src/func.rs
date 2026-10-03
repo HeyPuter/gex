@@ -250,6 +250,8 @@ pub struct FnUnit {
     defined: Vec<u64>,
     /// The body being emitted has a `goto gex_resume` (`resume_block`).
     resumes: bool,
+    /// An i386 program (`set_class32`).
+    class32: bool,
 }
 
 impl Default for FnUnit {
@@ -262,6 +264,7 @@ impl FnUnit {
     /// For an i386 (compatibility-mode) program.
     pub fn set_class32(&mut self, class32: bool) {
         self.ret_sp_delta = ret_sp_delta(class32);
+        self.class32 = class32;
     }
 
     pub fn new() -> FnUnit {
@@ -278,6 +281,7 @@ impl FnUnit {
             ftab: false,
             defined: Vec::new(),
             resumes: false,
+            class32: false,
         }
     }
 
@@ -347,6 +351,7 @@ impl FnUnit {
         let dummy = Block::new(f.entry);
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
+        e.class32 = self.class32;
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
@@ -364,7 +369,7 @@ impl FnUnit {
         let mut fhead = String::new();
         let _ = writeln!(fhead, "{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
         for r in &used {
-            let _ = writeln!(fhead, "  {} {};", emit::cty(r.ty()), reg_name(*r));
+            let _ = writeln!(fhead, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
         }
         let _ = writeln!(fhead, "  int32_t poll = {LOOP_POLL};");
         // Set when a poll expires anywhere: the next outermost back-edge
@@ -414,6 +419,7 @@ impl FnUnit {
             self.stats.loops_outlined += 1;
             let lname = loop_name(f.entry, k);
             let mut le = Emitter::new(&dummy, &owned);
+            le.class32 = self.class32;
             le.resize(f.n_values as usize);
             // Only the registers the loop itself touches are locals here:
             // everything else is already in the context (the body wrote
@@ -435,7 +441,7 @@ impl FnUnit {
                 "static __attribute__((noinline)) int {lname}(int ctx, int32_t depth, uint32_t need, uint64_t ret, uint64_t sp0) {{"
             );
             for r in &lused {
-                let _ = writeln!(head, "  {} {};", emit::cty(r.ty()), reg_name(*r));
+                let _ = writeln!(head, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
             }
             let _ = writeln!(head, "  int32_t poll = {LOOP_POLL};");
             let _ = writeln!(head, "  int hot = 0; (void)hot;");
@@ -500,6 +506,7 @@ impl FnUnit {
         let _ = writeln!(self.bodies, "void {}(int ctx) {{", entry_name(f.entry));
         let root_block = Block::new(f.entry);
         let mut r = Emitter::new(&root_block, &owned);
+        r.class32 = self.class32;
         if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
             r.target_check();
         }
@@ -736,6 +743,9 @@ impl FnUnit {
                         }
                         None => RegSet::ALL,
                     },
+                    // No callee reads the flags it is entered with
+                    // (`flags_abi`).
+                    _ if flags_abi() => non_flags(),
                     _ => RegSet::ALL,
                 };
                 e.flush_live(need);
@@ -828,14 +838,22 @@ impl FnUnit {
                 e.line("  (void)sp_want;");
                 e.line("}");
                 // A summarised callee that returned as expected left its
-                // preserved registers as they were: no reload.
-                match callee {
+                // preserved registers as they were: no reload. With
+                // clean-spill elision, only what the continuation may read
+                // is reloaded at all (the callee wrote back every register
+                // but the flags, and the flags too when `need_back` asked).
+                let preserved = match callee {
                     Callee::Direct(t) if known.contains(t) && live_writebacks() => {
-                        match sums.get(t) {
-                            Some(sm) => e.invalidate_except(sm.preserved.minus(RegSet::of(&[sp_reg()]))),
-                            None => e.invalidate(),
-                        }
+                        sums.get(t).map(|sm| sm.preserved.minus(RegSet::of(&[sp_reg()])))
                     }
+                    _ => None,
+                };
+                match (ret, preserved) {
+                    (Some(r), p) if live_writebacks() && clean_spills() && !exp("FULLRELOAD") => {
+                        let load = self.live[r.to.index()].union(RegSet::of(&[sp_reg()]));
+                        e.invalidate_only(load.minus(p.unwrap_or(RegSet::EMPTY)));
+                    }
+                    (_, Some(p)) => e.invalidate_except(p),
                     _ => e.invalidate(),
                 }
                 match ret {
@@ -1299,8 +1317,14 @@ pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
                     ..
                 } => match sums.get(t) {
                     Some(sm) => sm.inputs.union(live[r.to.index()]),
+                    None if flags_abi() => non_flags().union(live[r.to.index()]),
                     None => RegSet::ALL,
                 },
+                // `flags_abi`: no callee reads the flags it is entered with.
+                FTerm::Call { ret, .. } if flags_abi() => {
+                    non_flags().union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
+                }
+                FTerm::TailCall { .. } if flags_abi() => non_flags(),
                 _ => RegSet::ALL,
             };
             for s in b.stmts.iter().rev() {
@@ -1326,6 +1350,17 @@ pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
 }
 
 /// Every register but the flags.
+/// Whether calls are taken not to read the arithmetic flags: no x86 ABI
+/// passes anything in them, and compilers treat every call as clobbering
+/// them. A flag computation whose only reader would be the callee is then
+/// dead, and a call writes back no flags (pewasm's flag elision across
+/// calls). Returns, switch defaults and unresolved jumps still read them
+/// all. `GEX_CGEN_FLAGS_ABI=0` turns it off; `GEX_CGEN_LIVE=0` implies off.
+pub fn flags_abi() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gex_abi::X86 && live_writebacks() && std::env::var("GEX_CGEN_FLAGS_ABI").as_deref() != Ok("0"))
+}
+
 pub fn non_flags() -> RegSet {
     RegSet::ALL.minus(RegSet::of(FLAG_REGS))
 }
