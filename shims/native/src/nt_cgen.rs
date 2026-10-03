@@ -282,9 +282,11 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
 }
 
 /// Turn the function tier on for this process's images (`--cgen`).
-pub(crate) fn enable() -> Result<()> {
+/// `record`: a profile is being recorded (`--record`), which names each
+/// image as it maps (`profile::note_pe`), on every tier.
+pub(crate) fn enable(record: bool) -> Result<()> {
     // Export providers bind on every tier, units or not.
-    if mode() == Mode::Off && !gex_cgen::provider::enabled() {
+    if mode() == Mode::Off && !gex_cgen::provider::enabled() && !record {
         return Ok(());
     }
     if ON.set(()).is_err() {
@@ -596,6 +598,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
     }
     let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
     for p in pending {
+        crate::profile::note_pe(&p.path, p.base, &p.pe);
         let (shared, engine, cache) = {
             let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
             (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
@@ -632,6 +635,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
     }
     let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
     for p in pending {
+        crate::profile::note_pe(&p.path, p.base, &p.pe);
         let (shared, engine, cache) = {
             let jit = store.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
             (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())

@@ -527,9 +527,6 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
     if gex_ld::pe::is_pe(&bytes) {
         // A Windows program: Wine's PE DLLs on gex's NT layer.
-        if ra.opts.record.is_some() {
-            bail!("--record/GEX_PROFILE: profiling a Windows program is not supported yet");
-        }
         // The function tier for the images the NT layer maps
         // (gex_native::nt_cgen, docs/function-tier.md §11): prebuilt units
         // are used where they exist, and an image without one runs on tier-1
@@ -547,6 +544,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
             Mode::Default
         });
         let exit = nt_run::run(&ra, &bytes)?;
+        if let Some(dir) = gex_native::profile::finish(&exit)? {
+            if ra.opts.verbose {
+                eprintln!("[gex] profile and session manifest written to {}", dir.display());
+            }
+        }
         return Ok(report_exit(&exit, ra.opts.verbose));
     }
     // Resolved through the guest's namespace (the sysroot when given), so a
