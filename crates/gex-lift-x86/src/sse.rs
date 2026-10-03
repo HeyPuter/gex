@@ -50,6 +50,14 @@ fn lane_shuffle(lane_bytes: usize, sel: &[usize]) -> [u8; 16] {
     out
 }
 
+
+/// `mm0` is `V128(MM_BASE)`: past the sixteen `xmm` registers.
+const MM_BASE: u8 = 16;
+/// `rdi`, `maskmovq`'s implicit destination.
+const RDI_REG: u8 = 7;
+/// A shuffle keeping the low 64 bits of `a` and zeroing the rest (`b` zero).
+const LOW64: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 16, 16, 16, 16, 16, 16, 16, 16];
+
 impl<'a> Lifter<'a> {
     // -- vector operand access ------------------------------------------------------
 
@@ -75,8 +83,11 @@ impl<'a> Lifter<'a> {
     fn rd_x_n(&mut self, o: Operand, bytes: u32) -> Value {
         match o {
             Operand::Reg(Reg::Xmm(n)) => self.b.read(GuestReg::V128(n)),
+            Operand::Reg(Reg::Mm(n)) => self.b.read(GuestReg::V128(MM_BASE + (n & 7))),
             Operand::Mem(m) => {
                 let (addr, offset) = self.addr(&m);
+                // An MMX operand in memory is 64 bits.
+                let bytes = if self.mmx { bytes.min(8) } else { bytes };
                 self.b.def(Expr::VLoad {
                     addr,
                     offset,
@@ -94,7 +105,15 @@ impl<'a> Lifter<'a> {
     fn wr_x_n(&mut self, o: Operand, v: Value, bytes: u32) {
         match o {
             Operand::Reg(Reg::Xmm(n)) => self.b.write(GuestReg::V128(n), v),
+            Operand::Reg(Reg::Mm(n)) => {
+                // Only the low 64 bits are the register; the rest stays zero
+                // so a 128-bit lane op on it computes nothing spurious there.
+                let z = self.zero_v();
+                let lo = self.shuffle(v, z, LOW64);
+                self.b.write(GuestReg::V128(MM_BASE + (n & 7)), lo)
+            }
             Operand::Mem(m) => {
+                let bytes = if self.mmx { bytes.min(8) } else { bytes };
                 let (addr, offset) = self.addr(&m);
                 self.b.stmt(Stmt::VStore {
                     addr,
@@ -427,8 +446,191 @@ impl<'a> Lifter<'a> {
 
     pub(crate) fn sse(&mut self, i: &Inst) -> Flow {
         if i.mmx {
-            return self.illegal();
+            self.mmx = true;
+            let f = self.mmx_op(i);
+            self.mmx = false;
+            return f;
         }
+        self.sse_op(i)
+    }
+
+    /// An MMX instruction: an `mm` register is a vector whose upper half is
+    /// zero and an `m64` is an 8-byte load or store, so every lane-wise op is
+    /// the SSE one. The ops whose result depends on the vector's width are
+    /// here: their operands are rearranged so the 128-bit form computes the
+    /// 64-bit one in its low half.
+    ///
+    /// Not modelled: the x87 registers' aliasing of `mm0`–`mm7` (an MMX
+    /// instruction does not empty or fill the x87 stack, and FSAVE does not
+    /// store `mm`), which code that uses the two as separate units, with
+    /// `emms` between, cannot observe.
+    fn mmx_op(&mut self, i: &Inst) -> Flow {
+        let vl = vlane(i.lane);
+        match i.op {
+            Op::Movd => match i.op0() {
+                Operand::Reg(Reg::Mm(_)) => {
+                    let w = i.width;
+                    let v = self.rd(i.op1(), w);
+                    let z = self.zero_v();
+                    let r = self.replace(z, 0, w.bytes(), v);
+                    self.wr_x(i.op0(), r);
+                }
+                d => {
+                    let s = self.rd_x(i.op1());
+                    let w = i.width;
+                    let v = self.extract(s, 0, w.bytes(), false, ty_of(w));
+                    self.wr(d, w, v);
+                }
+            },
+            Op::Pshufw => {
+                let Operand::Imm(imm) = i.op2() else { return self.illegal() };
+                let s = self.rd_x(i.op1());
+                let mut sel: Vec<usize> = (0..8).collect();
+                for k in 0..4 {
+                    sel[k] = ((imm >> (2 * k)) & 3) as usize;
+                }
+                let r = self.shuffle(s, s, lane_shuffle(2, &sel));
+                self.wr_x(i.op0(), r);
+            }
+            Op::Punpckl => {
+                // The low halves: an m32 source.
+                let a = self.rd_x(i.op0());
+                let b = self.rd_x_n(i.op1(), 4);
+                let r = self.shuffle(a, b, unpack_lanes(vl.bytes() as usize, false));
+                self.wr_x(i.op0(), r);
+            }
+            Op::Punpckh => {
+                // The high halves of two 64-bit values, interleaved: the low
+                // interleave of each moved down by four bytes.
+                let (a, b) = self.packed_ops(i);
+                let z = self.zero_v();
+                let hi = [4, 5, 6, 7, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16];
+                let a = self.shuffle(a, z, hi);
+                let b = self.shuffle(b, z, hi);
+                let r = self.shuffle(a, b, unpack_lanes(vl.bytes() as usize, false));
+                self.wr_x(i.op0(), r);
+            }
+            Op::Packss | Op::Packus | Op::Phadd | Op::Phsub | Op::Phadds | Op::Phsubs => {
+                // Both 64-bit operands side by side as one vector, used for
+                // both: the 128-bit form's low half is then the 64-bit result.
+                let (a, b) = self.packed_ops(i);
+                let c = self.shuffle(a, b, [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]);
+                let r = match i.op {
+                    Op::Packss | Op::Packus => self.b.def(Expr::VCvt {
+                        op: VCvtOp::NarrowSat {
+                            signed: i.op == Op::Packss,
+                        },
+                        from: vl,
+                        a: c,
+                        b: Some(c),
+                    }),
+                    _ => {
+                        let lb = vl.bytes() as usize;
+                        let n = 16 / lb;
+                        let even: Vec<usize> = (0..n).map(|k| 2 * k).collect();
+                        let odd: Vec<usize> = (0..n).map(|k| 2 * k + 1).collect();
+                        let e = self.shuffle(c, c, lane_shuffle(lb, &even));
+                        let o = self.shuffle(c, c, lane_shuffle(lb, &odd));
+                        let op = match i.op {
+                            Op::Phadd => VLaneBinOp::Add,
+                            Op::Phsub => VLaneBinOp::Sub,
+                            Op::Phadds => VLaneBinOp::AddSatS,
+                            _ => VLaneBinOp::SubSatS,
+                        };
+                        self.vbin(op, vl, e, o)
+                    }
+                };
+                self.wr_x(i.op0(), r);
+            }
+            Op::Pshufb => {
+                // Indices select among eight bytes; bit 7 still zeroes.
+                let (a, idx) = self.packed_ops(i);
+                let m = self.k32(0x87);
+                let mv = self.vsplat(m, 1);
+                let idx = self.vbit(VBinOp::And, idx, mv);
+                let r = self.b.def(Expr::VSwizzle { a, idx });
+                self.wr_x(i.op0(), r);
+            }
+            Op::Palignr => {
+                // (dst:src) >> 8n, the low 64 bits.
+                let Operand::Imm(n) = i.op2() else { return self.illegal() };
+                let (d, s) = self.packed_ops(i);
+                let n = n as usize;
+                let t = self.shuffle(s, d, [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]);
+                let z = self.zero_v();
+                let mut lanes = [16u8; 16];
+                for k in 0..8 {
+                    if k + n < 16 {
+                        lanes[k] = (k + n) as u8;
+                    }
+                }
+                let r = self.shuffle(t, z, lanes);
+                self.wr_x(i.op0(), r);
+            }
+            Op::Pextr | Op::Pinsr => {
+                // Four words, not eight.
+                let Operand::Imm(imm) = i.op2() else { return self.illegal() };
+                let mut j = i.clone();
+                j.ops[2] = Some(Operand::Imm(imm & 3));
+                return self.sse_op(&j);
+            }
+            Op::Maskmov => {
+                // Bytes of mm1 whose mask byte (mm2) has its top bit set, to
+                // [ds:(e/r)di]: read, merge and write the eight bytes.
+                let v = self.rd_x(i.op0());
+                let m = self.rd_x(i.op1());
+                let z = self.zero_v();
+                let sel = self.vbin(VLaneBinOp::LtS, VLane::I8, m, z);
+                let mut at = gex_isa_x86::Mem::abs(0);
+                at.base = Some(RDI_REG);
+                let at = Operand::Mem(at);
+                let old = self.rd_x(at);
+                let r = self.b.def(Expr::VBitSelect { mask: sel, a: v, b: old });
+                self.wr_x(at, r);
+            }
+            Op::CvtMmx { truncate } => return self.cvt_mmx(i, truncate),
+            _ => return self.sse_op(i),
+        }
+        Flow::Next
+    }
+
+    /// The conversions between `mm` integer pairs and `xmm` floats.
+    fn cvt_mmx(&mut self, i: &Inst, truncate: bool) -> Flow {
+        if let Operand::Reg(Reg::Mm(_)) = i.op0() {
+            // cvt[t]ps2pi / cvt[t]pd2pi: cvt[t]p?2dq's low two lanes. The
+            // source is m64 for floats and m128 for doubles.
+            let mut j = i.clone();
+            j.op = Op::Cvtp2dq { truncate };
+            j.mmx = false;
+            self.mmx = i.lane != Lane::F64;
+            return self.sse_op(&j);
+        }
+        let s = self.rd_x_n(i.op1(), 8);
+        if i.lane == Lane::F64 {
+            // cvtpi2pd: both doubles.
+            let r = self.b.def(Expr::VCvt {
+                op: VCvtOp::IntToFp { signed: true },
+                from: VLane::F64,
+                a: s,
+                b: None,
+            });
+            self.wr_x(i.op0(), r);
+        } else {
+            // cvtpi2ps: the low two floats; the upper two are kept.
+            let c = self.b.def(Expr::VCvt {
+                op: VCvtOp::IntToFp { signed: true },
+                from: VLane::I32,
+                a: s,
+                b: None,
+            });
+            let d = self.rd_x(i.op0());
+            let r = self.shuffle(c, d, [0, 1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30, 31]);
+            self.wr_x(i.op0(), r);
+        }
+        Flow::Next
+    }
+
+    fn sse_op(&mut self, i: &Inst) -> Flow {
         let lane = i.lane;
         let vl = vlane(lane);
         let double = lane == Lane::F64;
@@ -876,11 +1078,22 @@ impl<'a> Lifter<'a> {
                     let fix = self.vbit(VBinOp::And, indefinite, bad);
                     self.vbit(VBinOp::Or, keep, fix)
                 } else {
-                    r
+                    // Doubles: the two results are the low two i32 lanes,
+                    // each 64-bit lane's verdict moved down to its i32 lane.
+                    let limit = self.vconst(0x41e0_0000_0000_0000u64.to_le_bytes().repeat(2).try_into().unwrap());
+                    let over = self.vbin(VLaneBinOp::GeS, VLane::F64, s, limit);
+                    let nan = self.vbin(VLaneBinOp::Ne, VLane::F64, s, s);
+                    let bad = self.vbit(VBinOp::Or, over, nan);
+                    let z = self.zero_v();
+                    let bad = self.shuffle(bad, z, [0, 1, 2, 3, 8, 9, 10, 11, 16, 16, 16, 16, 16, 16, 16, 16]);
+                    let indefinite = self.vconst(0x8000_0000u32.to_le_bytes().repeat(4).try_into().unwrap());
+                    let keep = self.vbit(VBinOp::AndNot, r, bad);
+                    let fix = self.vbit(VBinOp::And, indefinite, bad);
+                    self.vbit(VBinOp::Or, keep, fix)
                 };
                 self.wr_x(i.op0(), r);
             }
-            Op::CvtMmx => return self.illegal(),
+            Op::CvtMmx { .. } => return self.illegal(),
 
             // -- packed integer ----------------------------------------------------------------
             Op::Padd => self.pint(i, VLaneBinOp::Add),
@@ -1320,9 +1533,8 @@ impl<'a> Lifter<'a> {
             | Op::Pclmulqdq
             | Op::Mpsadbw
             | Op::Dpp => return self.illegal(),
-            // Every x87 register empty. gex has no MMX state of its own (the
-            // MMX instructions are not lifted), so that is all emms does:
-            // code that clears it defensively after SSE work runs.
+            // Every x87 register empty. The mm registers are separate from
+            // the x87 stack in gex (see `mmx_op`), so that is all emms does.
             Op::Emms => {
                 let z = self.k32(0);
                 self.b.write(GuestReg::X87Tags, z);

@@ -10,7 +10,9 @@
 //! arithmetic flags are `N` (SF), `Z`, `C`, `V` (OF), `P` and `A`, with `D`
 //! for the direction flag. `Tpidr` holds the FS base and `TpidrRo` the GS
 //! base. `xmm0`–`xmm15` are `V128(0..16)`. The x87 stack lives in the
-//! context as eight doubles reached through `GuestReg::CtxAddr`.
+//! context as eight doubles reached through `GuestReg::CtxAddr`. `mm0`–`mm7`
+//! are the low halves of `V128(16..24)` (upper halves kept zero), apart from
+//! the x87 registers they alias in hardware: see `sse.rs`.
 
 #![forbid(unsafe_code)]
 
@@ -143,6 +145,8 @@ pub struct Lifter<'a> {
     /// The current instruction's memory operand, for the x87 forms whose
     /// decoded `X87Src` names memory without carrying the operand.
     cur_mem: Operand,
+    /// Lifting an MMX instruction: `mm` operands and 64-bit memory (sse.rs).
+    mmx: bool,
 }
 
 const RAX: u8 = 0;
@@ -180,6 +184,7 @@ impl<'a> Lifter<'a> {
             pc: 0,
             next: 0,
             cur_mem: Operand::Imm(0),
+            mmx: false,
         }
     }
 
