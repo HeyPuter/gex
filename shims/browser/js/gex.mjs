@@ -45,6 +45,11 @@ const DENSE_FIRST_TABLE = 4;
 const TABLE_STEP = 1 << 20;
 /** `gex_abi::ctx::LAST_TARGET`. */
 const CTX_LAST_TARGET = 44 * 8;
+/** `gex_abi::ctx::PC`, and x86's `rsp` (`ctx::x(4)`). */
+const CTX_PC = 32 * 8;
+const CTX_SP = 4 * 8;
+/** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
+const CALLOUT_UNWOUND = 64n << 10n;
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -849,6 +854,10 @@ export class Gex {
         // A Windows program's user-mode callback (docs/nt-layer.md §5): the
         // guest runs nested, inside the `syscall` import, until it returns.
         nt_callback: (ctx, pc) => this.#ntCallback(ctx >>> 0, pc),
+        // The function table's fallback (cgen.rs `gex_ftab_fallback`): tier-1
+        // runs nested until the guest returns to the function body that
+        // called it.
+        call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
@@ -3219,19 +3228,46 @@ export class Gex {
    * the run failed or the process ended.
    */
   #ntCallback(ctx, pc) {
+    this.#nest.push('callback');
+    try {
+      return this.#ntCallbackLoop(ctx, pc);
+    } finally {
+      this.#nest.pop();
+    }
+  }
+
+  #ntCallbackLoop(ctx, pc) {
     const e = this.#shim.exports;
     // The shim's frames below this import are live: every trap out of the
     // nested guest abandons only the frames above here, so the shadow stack
     // goes back to exactly this, never to the Worker's base.
     const sp = e.__stack_pointer.value;
     pc = pc < 0n ? pc + (1n << 64n) : pc;
+    let next = null;
     for (;;) {
       try {
-        this.#guest.exports.enter(ctx, pc);
+        if (next) {
+          const f = next;
+          next = null;
+          f(ctx);
+        } else {
+          this.#guest.exports.enter(ctx, pc);
+        }
         console.error('[gex-nt] guest code returned out of a user-mode callback');
         return 0;
       } catch (err) {
         e.__stack_pointer.value = sp;
+        // A call-out's watched entry reached inside the callback: what the
+        // entry held runs (`#watchHit` never ends a call-out from here).
+        const sig = this.#calloutSignal;
+        this.#calloutSignal = null;
+        if (sig?.kind === 'bypass' && sig.f) {
+          next = sig.f;
+          continue;
+        }
+        // This callback's NtCallbackReturn, reached inside a call-out it
+        // made (up through the call-out's frames).
+        if (err?.gexCallbackDone && e.gex_nt_callback_done(ctx)) return 1;
         if (!e.gex_handoff()) {
           // The sibling-numbered-page race, as in the outer loop.
           if (/table index is out of bounds/.test(err.message)) {
@@ -3270,6 +3306,218 @@ export class Gex {
       }
     }
   }
+
+  /** This Worker's call-outs in progress, innermost last: the return each
+   *  waits for, the stack it comes back at, and the table entry watching
+   *  for a translated return (`{ table, index, old }`). */
+  #callouts = [];
+  /** What the watch stub found (`{ kind: 'return', i }` or `{ kind:
+   *  'bypass', f }`), for the nested loop to act on. */
+  #calloutSignal = null;
+  /** Which nested loops this Worker is in, innermost last ('callout' or
+   *  'callback'): a watch stub reached inside an NT callback is not its
+   *  call-out's business. */
+  #nest = [];
+  #watchStub = null;
+
+  /** The function a watched table entry holds: it tells JS (`hit`) and
+   *  traps, so the nested loop in `#callOut` sees why. */
+  #watch() {
+    if (this.#watchStub) return this.#watchStub;
+    // (module (type (func (param i32))) (import "w" "hit" (func (type 0)))
+    //   (func (export "c") (type 0) local.get 0 call 0 unreachable))
+    const bytes = new Uint8Array([
+      0, 97, 115, 109, 1, 0, 0, 0,
+      1, 5, 1, 96, 1, 127, 0,
+      2, 9, 1, 1, 119, 3, 104, 105, 116, 0, 0,
+      3, 2, 1, 0,
+      7, 5, 1, 1, 99, 0, 1,
+      10, 9, 1, 7, 0, 32, 0, 16, 0, 0, 11,
+    ]);
+    const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { w: { hit: (ctx) => this.#watchHit(ctx >>> 0) } });
+    this.#watchStub = inst.exports.c;
+    return this.#watchStub;
+  }
+
+  /** A dispatch reached a watched entry: the awaited return of a call-out
+   *  (the innermost one waiting for it, as natively), or something else
+   *  that shares the entry (another address of an x86 slot, a deeper frame
+   *  returning to the same place), which runs what the entry held. */
+  #watchHit(ctx) {
+    const dv = new DataView(this.#memory.buffer);
+    const target = dv.getBigUint64(ctx + CTX_LAST_TARGET, true);
+    const sp = dv.getBigUint64(ctx + CTX_SP, true);
+    let i = -1;
+    // Only a call-out with no NT callback nested inside it: an outer one's
+    // return reached from inside a callback is not that call-out's (its
+    // caller's frame is below the callback's), and runs as a bypass.
+    const lastCallback = this.#nest.lastIndexOf('callback');
+    for (let k = this.#callouts.length - 1; k >= 0; k--) {
+      const c = this.#callouts[k];
+      if (c.nestAt < lastCallback) break;
+      if (c.ret === target && sp >= c.spWant && sp <= c.spWant + CALLOUT_UNWOUND) { i = k; break; }
+    }
+    dv.setBigUint64(ctx + CTX_PC, target, true);
+    if (i >= 0) {
+      this.#calloutSignal = { kind: 'return', i };
+      return;
+    }
+    const ref = this.#shim.exports.gex_dispatch_ref(target);
+    const table = Number(BigInt.asIntN(64, ref) >> 32n), index = Number(BigInt.asUintN(64, ref) & 0xffffffffn);
+    const w = this.#callouts.find((c) => c.w && c.w.table === table && c.w.index === index)?.w;
+    this.#calloutSignal = { kind: 'bypass', f: w?.old ?? null };
+  }
+
+  /** The table `table` of `gex_dispatch_ref` names. */
+  #refTable(table) {
+    return table === TABLE_NAMES.length ? this.#guest.exports.blocks : this.#dispatchTables()[table];
+  }
+
+  /** Point every call-out's return entry at the watch stub, wherever
+   *  dispatch now reaches its return (an install or a retirement may have
+   *  moved or overwritten it); an untranslated return is caught by the miss
+   *  path (cgen.rs `returned`). */
+  #armCallouts() {
+    const e = this.#shim.exports;
+    const stub = this.#watch();
+    for (const c of this.#callouts) {
+      const ref = e.gex_dispatch_ref(c.ret);
+      const table = ref < 0n ? -1 : Number(ref >> 32n), index = ref < 0n ? -1 : Number(ref & 0xffffffffn);
+      if (c.w && (c.w.table !== table || c.w.index !== index)) this.#unwatch(c);
+      if (table < 0) continue;
+      const t = this.#refTable(table);
+      if (!t || index >= t.length) continue;
+      if (c.w) {
+        const now = t.get(index);
+        if (now !== stub) c.w.old = now;
+        if (now !== stub) t.set(index, stub);
+        continue;
+      }
+      const shared = this.#callouts.find((o) => o !== c && o.w && o.w.table === table && o.w.index === index);
+      const old = shared ? shared.w.old : t.get(index);
+      c.w = { table, index, old };
+      t.set(index, stub);
+    }
+  }
+
+  /** Put a call-out's watched entry back, unless another still watches it. */
+  #unwatch(c) {
+    const w = c.w;
+    c.w = null;
+    if (!w || this.#callouts.some((o) => o !== c && o.w && o.w.table === w.table && o.w.index === w.index)) return;
+    const t = this.#refTable(w.table);
+    if (t && w.index < t.length && t.get(w.index) === this.#watchStub) t.set(w.index, w.old);
+  }
+
+  /**
+   * The call-out (cgen.rs `gex_ftab_fallback`): run the guest from `target`
+   * in a nested loop on this Worker until it returns to `ret` with the stack
+   * at `spWant` (or what the callee popped above it). 1 then, and the
+   * function body that called the fallback carries on; 0 when it cannot
+   * (the process ended, the stack unwound past its caller), with `ctx::PC`
+   * where the guest is, and the body leaves as before. Synchronous, as
+   * `#ntCallback`: a shim frame is below this one.
+   */
+  #callOut(ctx, target, ret, spWant) {
+    const e = this.#shim.exports;
+    const sp0 = e.__stack_pointer.value;
+    const me = this.#callouts.length;
+    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length };
+    this.#callouts.push(c);
+    this.#nest.push('callout');
+    this.#calloutsMade++;
+    if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && (this.#calloutsMade & (this.#calloutsMade - 1)) === 0)) {
+      console.error(`[callout] #${this.#calloutsMade} depth ${me}: ${BigInt.asUintN(64, target).toString(16)} returning to ${c.ret.toString(16)}`);
+    }
+    let pc = BigInt.asUintN(64, target);
+    let next = null;
+    try {
+      this.#armCallouts();
+      for (;;) {
+        try {
+          if (next) {
+            const f = next;
+            next = null;
+            f(ctx);
+          } else {
+            this.#guest.exports.enter(ctx, pc);
+          }
+          console.error('[gex] guest code returned out of a call-out');
+          return 0;
+        } catch (err) {
+          e.__stack_pointer.value = sp0;
+          const sig = this.#calloutSignal;
+          this.#calloutSignal = null;
+          if (sig?.kind === 'return') return sig.i === me ? 1 : 0;
+          if (sig?.kind === 'bypass') {
+            if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
+            next = sig.f;
+            continue;
+          }
+          if (!e.gex_handoff()) {
+            if (/table index is out of bounds/.test(err.message)) {
+              const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
+              if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
+                pc = BigInt.asUintN(64, tgt);
+                continue;
+              }
+            }
+            throw err;
+          }
+          const hit = e.gex_callout_hit();
+          if (hit >= 0) return hit === me ? 1 : 0;
+          if (e.gex_exited?.()) return 0;
+          // The NtCallbackReturn of a callback further out (the function
+          // this call-out ran was the callback's dispatcher): its loop's, so
+          // up through every frame between, as natively.
+          if (this.#nest.lastIndexOf('callback') >= 0 && e.gex_nt_callback_done?.(ctx)) {
+            const up = new Error('gex: a user-mode callback returned inside a call-out');
+            up.gexCallbackDone = true;
+            throw up;
+          }
+          const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+          if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+          this.#denseCatchUp();
+          if (e.gex_jit_pending_len() >>> 0) {
+            const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+            if (need) this.#growTables(need, 'call-out');
+          }
+          while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+          this.#catchUpSync();
+          this.#cgenServe();
+          this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+          const nextPc = e.gex_resume_pc();
+          if (nextPc === 0n) return 0;
+          pc = BigInt.asUintN(64, nextPc);
+          const rc = e.gex_resume_ctx() >>> 0;
+          if (rc && rc !== ctx) {
+            // A resume on another thread's context is not this call-out's.
+            return 0;
+          }
+          // The stack unwound past the caller (longjmp, an exception
+          // handled further out): its frame is gone, so it leaves.
+          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
+          if (sp > c.spWant + CALLOUT_UNWOUND) {
+            new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
+            return 0;
+          }
+          this.#armCallouts();
+        }
+      }
+    } finally {
+      this.#unwatch(c);
+      this.#callouts.pop();
+      this.#nest.pop();
+      // Left by an exception, the shim's half has not popped its entry.
+      e.gex_callout_unwind?.(me);
+      if (globalThis.GEX_CALLOUT_TRACE) {
+        const dv = new DataView(this.#memory.buffer);
+        console.error(`[callout] end depth ${me}: pc ${dv.getBigUint64(ctx + CTX_PC, true).toString(16)} sp ${dv.getBigUint64(ctx + CTX_SP, true).toString(16)} want ${c.spWant.toString(16)}`);
+      }
+    }
+  }
+
+  #calloutsMade = 0;
 
   /** `#installTranslation` without yielding, for `#ntCallback`. */
   #installTranslationSync() {

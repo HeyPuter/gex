@@ -611,18 +611,161 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     idx as i32
 }
 
-/// The table's index 1: code no unit holds. The browser has no call-out
-/// yet (a nested guest run inside a wasm call), so this leaves for it:
-/// `ctx::PC` = the target, 0; the frame that owns the code it returns into
-/// catches it, else tier-1 runs it.
+/// The table's index 1: code no function body holds, under the `F_body`
+/// contract (the call-out, docs/function-tier.md §7.3, as natively): tier-1
+/// runs the target nested -- JavaScript's loop inside this call -- until the
+/// guest returns to `ret` with the stack back (1, the predicted return), so
+/// the frames that called here carry on in their bodies instead of leaving
+/// for tier-1. With no caller waiting (`NO_RETURN`), too deep a nest, or a
+/// run that cannot finish nested (the stack unwound past the caller), it
+/// leaves: `ctx::PC` set, 0.
 #[no_mangle]
-pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, _ret: i64) -> i32 {
+pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64) -> i32 {
     LEAVES.fetch_add(1, Ordering::Relaxed);
     let mut gm = GuestMem::new(crate::guest_bytes());
     let c = ctx as u32 as u64;
     let t = gm.read_u64(c + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
     let _ = gm.write_u64(c + gex_abi::ctx::PC as u64, t);
-    gex_abi::ftab::RET_LEFT
+    if ret as u64 == gex_abi::ftab::NO_RETURN || !CALLOUT_ON.load(Ordering::Relaxed) {
+        return gex_abi::ftab::RET_LEFT;
+    }
+    if CALLOUTS.with(|c| c.borrow().len()) >= CALLOUT_MAX_DEPTH {
+        return gex_abi::ftab::RET_LEFT;
+    }
+    // The stack once the guest has returned: the caller's, past the return
+    // address (and whatever a stdcall callee pops, allowed for below).
+    let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::arch::compat() { 4 } else { 8 };
+    let want = sp + delta;
+    let cb = CB_DEPTH.with(|d| d.get());
+    let depth = CALLOUTS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.push((ret as u64, want, cb));
+        c.len() - 1
+    });
+    CALLOUT_N.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: a host import taking scalars; nothing here holds a lock.
+    let r = unsafe { call_out(ctx, t as i64, ret, want as i64) };
+    CALLOUTS.with(|c| c.borrow_mut().truncate(depth));
+    if r == gex_abi::ftab::RET_LEFT {
+        CALLOUT_LEFT.fetch_add(1, Ordering::Relaxed);
+    }
+    r
+}
+
+#[link(wasm_import_module = "gex_env")]
+extern "C" {
+    /// Run the guest from `target` in a nested loop until it returns to
+    /// `ret` with the stack pointer at `sp_want` (or what a callee popped
+    /// above it): 1; 0 when it cannot (`ctx::PC` says where the guest is).
+    fn call_out(ctx: i32, target: i64, ret: i64, sp_want: i64) -> i32;
+}
+
+/// `gex_set_callout(0)` turns the call-out off (the fallback always leaves,
+/// as before it existed), for measuring.
+static CALLOUT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[no_mangle]
+pub extern "C" fn gex_set_callout(on: i32) {
+    CALLOUT_ON.store(on != 0, Ordering::Relaxed);
+}
+
+/// Call-outs nested deeper than this leave instead: each holds a shim frame
+/// and a JS one.
+const CALLOUT_MAX_DEPTH: usize = 32;
+
+/// How far above a call-out's `sp_want` its return may come back (what a
+/// stdcall callee pops, or a function frame resumed inside), and past which
+/// the stack has unwound beyond its caller: as natively.
+pub(crate) const CALLOUT_UNWOUND: u64 = 64 << 10;
+
+static CALLOUT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CALLOUT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// This Worker's call-outs in progress: `(ret, sp_want, NT callbacks in
+    /// progress when it began)`, innermost last.
+    static CALLOUTS: std::cell::RefCell<Vec<(u64, u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// NT user-mode callbacks in progress on this Worker (nt.rs).
+    static CB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The call-out whose return a dispatch miss found (`returned`), or -1.
+    static HIT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
+fn sp_index() -> u8 {
+    if gex_abi::X86 {
+        4
+    } else {
+        31
+    }
+}
+
+/// A dispatch missed at `pc` with the stack at `sp`: whether it is the
+/// return a call-out of this Worker waits for (the caller then traps; JS's
+/// nested loop ends that call-out). An untranslated return address is
+/// caught here; a translated one by the watched table entry (JS).
+pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
+    let sp = GuestMem::new(crate::guest_bytes()).read_u64(ctx + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+    // Only a call-out with no NT callback begun inside it (as `#watchHit`).
+    let cb = CB_DEPTH.with(|d| d.get());
+    let hit = CALLOUTS.with(|c| {
+        let v = c.borrow();
+        v.iter().rposition(|&(r, w, d)| d == cb && r == pc && sp >= w && sp <= w + CALLOUT_UNWOUND)
+    });
+    match hit {
+        Some(i) => {
+            HIT.with(|h| h.set(i as i32));
+            true
+        }
+        None => false,
+    }
+}
+
+/// A call-out at depth `depth` (and every deeper one) was left by an
+/// exception (JS's loop unwound through its frames): its entries go.
+#[no_mangle]
+pub extern "C" fn gex_callout_unwind(depth: u32) {
+    CALLOUTS.with(|c| c.borrow_mut().truncate(depth as usize));
+}
+
+/// An NT user-mode callback begins (or ends) on this Worker.
+pub(crate) fn callback(enter: bool) {
+    CB_DEPTH.with(|d| d.set(if enter { d.get() + 1 } else { d.get().saturating_sub(1) }));
+}
+
+/// The call-out a miss found returned (its depth, 0 outermost), or -1;
+/// reading it clears it.
+#[no_mangle]
+pub extern "C" fn gex_callout_hit() -> i32 {
+    HIT.with(|h| h.replace(-1))
+}
+
+/// Call-outs made and left (for the stats line).
+pub(crate) fn callouts() -> (u64, u64) {
+    (CALLOUT_N.load(Ordering::Relaxed), CALLOUT_LEFT.load(Ordering::Relaxed))
+}
+
+/// How dispatch reaches `pc` in this Worker: `table << 32 | index`, the
+/// table being a dispatch table or `gex_emit::dense::TABLE_INDEX`
+/// (`blocks`); -1 when nothing is there yet (a miss). What a call-out
+/// watches its return through.
+#[no_mangle]
+pub extern "C" fn gex_dispatch_ref(pc: i64) -> i64 {
+    let pc = pc as u64;
+    let page = gex_abi::dispatch_page(pc);
+    if page >= gex_abi::DISPATCH_MAX_PAGES {
+        return -1;
+    }
+    let entry = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
+    if entry == 0 {
+        return -1;
+    }
+    let k = gex_abi::dispatch_entry_table(entry);
+    if crate::dense::map(k).is_some() {
+        let d = crate::dense::lookup(pc);
+        return if d == 0 { -1 } else { ((gex_emit::dense::TABLE_INDEX as i64) << 32) | d as i64 };
+    }
+    ((k as i64) << 32) | gex_abi::dispatch_index(pc, entry) as i64
 }
 
 /// The publishing Worker has installed unit `u`: point the directory at the
@@ -642,13 +785,28 @@ static RUNTIME: OnceLock<Vec<u8>> = OnceLock::new();
 fn runtime() -> &'static Vec<u8> {
     RUNTIME.get_or_init(|| {
         let m = gex_cgen::runtime::module();
-        if !crate::dense::on() {
-            return m;
-        }
-        dense_runtime(&m).unwrap_or_else(|| {
-            crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
+        let mut m = if !crate::dense::on() {
             m
-        })
+        } else {
+            dense_runtime(&m).unwrap_or_else(|| {
+                crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
+                m
+            })
+        };
+        // Named, so a CPU profile tells it from tier-1 (`wasm://wasm/
+        // gex-ftab-runtime-...`; tests/nt/aot-share.mjs).
+        let name = b"gex-ftab-runtime";
+        let mut sub = vec![name.len() as u8];
+        sub.extend_from_slice(name);
+        let mut sec = vec![4u8];
+        sec.extend_from_slice(b"name");
+        sec.push(0); // the module-name subsection
+        put_leb(&mut sec, sub.len() as u32);
+        sec.extend_from_slice(&sub);
+        m.push(0);
+        put_leb(&mut m, sec.len() as u32);
+        m.extend_from_slice(&sec);
+        m
     })
 }
 

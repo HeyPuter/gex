@@ -530,8 +530,9 @@ mod imp {
             // What every Worker's tables hold: `blocks` (dense) and the
             // slots each dispatch table is numbered to.
             let slots: Vec<String> = (0..gex_abi::DISPATCH_TABLES as u32).map(|k| crate::gex_claimed_slots(k).to_string()).collect();
+            let (callouts, left) = crate::cgen::callouts();
             warn_line(&format!(
-                "gex-nt: tables blocks={} slots={} dense={}\n",
+                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left}\n",
                 crate::dense::gex_dense_size(),
                 slots.join("/"),
                 crate::dense::on() as u8
@@ -585,7 +586,10 @@ mod imp {
             let pc = GuestMem::new(guest_bytes()).read_u64(self.ctx_addr + ctx::PC as u64).unwrap_or(0);
             // SAFETY: a host import taking scalars. Nothing here holds the
             // kernel: the NT layer lets go before it runs a callback.
-            match unsafe { nt_callback(self.ctx_addr as u32 as i32, pc as i64) } {
+            crate::cgen::callback(true);
+            let r = unsafe { nt_callback(self.ctx_addr as u32 as i32, pc as i64) };
+            crate::cgen::callback(false);
+            match r {
                 1 => Ok(()),
                 _ => Err(()),
             }

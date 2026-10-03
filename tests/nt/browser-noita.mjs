@@ -27,6 +27,7 @@
 import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { bundle, openPage, sleep, log, WEB, summariseProfile } from './browser-harness.mjs';
+import { aotCounts, aotLine } from './aot-share.mjs';
 
 const argv = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -152,11 +153,14 @@ async function main() {
       // 60) for SECS (default 20), summarised and saved (--shot DIR).
       if (world && profileSpec && !profiled && p.t - world.t >= profileSpec.at * 1000) {
         profiled = true;
-        for (const { url, profile: prof } of await profile(profileSpec.match, profileSpec.secs * 1000)) {
-          const file = url.split('/').pop().split('?')[0];
+        const profs = await profile(profileSpec.match, profileSpec.secs * 1000);
+        for (const [k, { url, profile: prof }] of profs.entries()) {
+          const file = `${url.split('/').pop().split('?')[0]}.${k}`;
           log(`profile of ${file}:\n${summariseProfile(prof, 30)}`);
           if (shotDir) writeFileSync(join(shotDir, `${file}.cpuprofile`), JSON.stringify(prof));
         }
+        // As GEX_NT_STATS' line natively (tests/nt/aot-share.mjs).
+        console.log(`ok   ${aotLine(aotCounts(profs.map((x) => x.profile)))}`);
       }
       if (world && p.t - world.t >= measure * 1000) {
         const secs = (p.t - world.t) / 1000;

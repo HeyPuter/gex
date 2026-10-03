@@ -22,6 +22,37 @@ How step 1 came out, against the plan below:
   is mapped at (`gexc cgen-image --pe-base`), and Wine's from
   `gexc cgen-prefix`; any change to gex-abi or gex-cgen changes every key.
 
+## §9 parity, stream B (2026-10-03)
+
+- **Dense block tables** (`gex_emit::dense`, shims/browser/src/dense.rs):
+  tier-1's dispatch tables 4..7 (the run's) no longer exist per Worker.
+  Their slots are a `u32` map per table in the process's memory, naming an
+  index in one more table, `blocks`, with an entry per installed block;
+  dispatch reads the map and falls back to the classic table when the map
+  word is zero. Peggle: 166k blocks against 1.74M slots per Worker.
+  Half-Life: the classic tables (4.85M entries in each of 11 Workers) ran
+  the renderer out of V8 heap at about 95 s; dense it plays c1a0 with the
+  renderer's memory bounded. `?dense=0` / `GEX_DENSE=0` is the old layout.
+- **Units on the §9 ABI:** per-Worker `gex.ftab`, units placed by element
+  segment at `__table_base`, `gex.lookup`, the probe cache, bridges in the
+  dense or classic tier-1 slots, and the function table's runtime module
+  rewritten for dense dispatch. Unit keys match the native host's (export
+  providers' stubs included), and the providers are bound after each image
+  from `<cache>/providers/`. `tests/nt/run-browser.sh --cgen` with
+  browser-flavour units (`GEX_CGEN_GUARD=1 gexc cgen-prefix|cgen-image`;
+  PE32+ images at the base the page gives them, 0x400000 for an exe): 48/49
+  (x64/cxx: no unit, the guarded flavour fails to compile it).
+- **In the page:** `nt.html?cgen=1|2` reads units from `/gex-cgen/`
+  (the harness serves `GEX_CGEN_CACHE` there).
+- **The call-out:** index 1 runs tier-1 nested (`gex_env.call_out`, JS's
+  loop as for NT callbacks) until the guest returns to the calling body:
+  a translated return is caught by a watch stub in this Worker's table
+  entry for it, an untranslated one by the miss path.
+- **AOT share:** tests/nt/aot-share.mjs classifies V8 CPU profiles of the
+  Workers by module (units, providers, runtime, tier-1, host), the native
+  GEX_NT_STATS line's accounting; browser-noita.mjs prints it with
+  `GEX_NT_PROFILE`.
+
 ## Where the page is now
 
 Noita in headless Chromium, hardware WebGPU, full speed: about 4.2

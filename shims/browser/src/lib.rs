@@ -10511,6 +10511,15 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
+    // The return a call-out of this Worker waits for, untranslated: that
+    // call-out is done (cgen::returned; JS's nested loop ends it).
+    if cgen::returned(pc, _ctx as u32 as u64) {
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
     // A block this process has (the slot names it in `blocks`) that this
     // Worker has not instantiated: JavaScript catches up, then the dispatch
     // is retried (`dense::missing`).
