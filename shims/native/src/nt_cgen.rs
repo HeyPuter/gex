@@ -49,7 +49,7 @@ pub fn set_mode(m: Mode) {
     let _ = MODE.set(m);
 }
 
-fn mode() -> Mode {
+pub(crate) fn mode() -> Mode {
     MODE.get().copied().unwrap_or(Mode::Default)
 }
 

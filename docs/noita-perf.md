@@ -473,3 +473,58 @@ GEX_NT_TIME_SCALE=4 CPUS=4,10 GEXC=gexc-cg11 run-noita2.sh u11 1200` with
 GEX_PROF/GEX_PERFMAP past world-up) and tools/aot-coverage.py against
 cgcache-cg9, splitting interior into what the IAT fix removed and what
 remains for R.
+
+## Runtime, stream R: fallback causes (2026-10-03, before the reboot)
+
+merge/abi9 = merge/fjit 9eacbbd5 (F merged R's 65f9a719 and ed6c838b).
+
+**Measured on F's cg7 units, through an overlay cache** (`scratchpad/abi9/ovl`):
+4x clock, null display, cores 3 and 9.
+
+- **Trap-out resumes: fixed.** 10,868 before, 20 after (65f9a719).
+  - 99% were tier-1 dispatch misses: the miss import translated the block,
+    then trapped out of every wasm frame, units included.
+  - It now returns `DISPATCH_MISS_REDISPATCH` and the miss stub
+    re-dispatches in place.
+  - The 20 left are exceptions at load time. F's "NtAccessCheck" labels were
+    my c3120dd8 mis-read of LAST_SYSCALL; the correct names are NtContinue
+    and NtRaiseException.
+  - With `--strace`, the main-thread raises are 0x40010006
+    (DBG_PRINTEXCEPTION_C) from OutputDebugStringA called by steam_api at
+    startup. The frames below are noita.exe 0x80b90b and 0xdfda10 (the game's
+    main), so these trap-outs can demote the main thread's outer frames to
+    tier-1 for the whole run.
+- **Leaves: about 1.6 M/s.** None were to patched pages, and none were from
+  the depth guard. Almost all were unit functions ending in an unresolved
+  jump (`jmp [IAT]` import thunks: noita.exe 0xdfe2xx, kernel32+0xf53c,
+  msvcr120+0x6cc98, kernelbase+0x67620) that left instead of tail-calling.
+  F's d11b5464 and 101a7477 fix this (the IAT hint RVAs, and tail calls for
+  unresolved jumps and switch defaults). cg9 has them.
+- **AOT share** (the GEX_NT_STATS line, GEX_PROF): 59-65% of guest.
+  - Units 57-64%, tier-1 22-28%, runtime 13-14% (the bridge: tier-1 frames
+    calling units).
+  - Steady world fps: 25.8 before the dispatch-miss fix, 22.7 and 26.7 after
+    (seed noise).
+
+**Next:**
+1. The same table on cg9. Make an overlay of cg9 plus the three
+   provider-keyed units (msvcr120, ucrtbase, msvcrt; about 6 min with
+   `cgen-image`). Run `GEX_CGEN_CACHE=$S/ovl GEX_NT_CGEN_BUILD=0 NULLDISP=1
+   GEX_NT_TIME_SCALE=4 GEX_PROF=... GEX_PERFMAP=1 run-noita.sh TAG 1000
+   --cgen`, then read the "AOT", "resumes by cause" and "leaves among them"
+   lines.
+2. Exceptions without frame loss. NtRaiseException should dispatch nested
+   (no trap-out), and the guest's unwinding should land in its unit frame.
+   - Wine's `__TRY/__EXCEPT` lands with `__wine_longjmp` at the `setjmp`
+     call's continuation, and MSVC longjmp does the same. That is a
+     *different* call site's continuation than the call that failed, which
+     F's local resume does not take.
+   - So: a resume entry for setjmp-like call continuations only. Recovery
+     marks callees that return twice, and only functions calling one get
+     the (small) continuation switch.
+   - A stopgap with the same effect at startup: a kernelbase
+     OutputDebugStringA/W provider that skips the raise. gex never has a
+     debugger, and no DBWIN monitor runs in a gex session.
+3. Region entries for frames demoted by anything left: the safety net.
+4. If depth-guard leaves appear, raise the native budget. The runtime half
+   is in (64 MiB wasm stacks); the units' budget constant is F's.
