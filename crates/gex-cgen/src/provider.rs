@@ -27,6 +27,7 @@ const PRELUDE: &str = include_str!("../providers/provider.h");
 const SOURCES: &[(&str, &str)] = &[
     ("msvcr120_concrt", include_str!("../providers/msvcr120_concrt.c")),
     ("crt_mem", include_str!("../providers/crt_mem.c")),
+    ("crt_math", include_str!("../providers/crt_math.c")),
 ];
 
 /// One provider source, parsed.
