@@ -470,9 +470,11 @@ dependencies = [
  "gex-cgen",
  "gex-emit",
  "gex-ir",
+ "gex-kernel",
  "gex-ld",
  "gex-native",
  "gex-xlate",
+ "wasmparser",
 ]
 
 [[package]]
@@ -634,6 +636,8 @@ dependencies = [
  "gex-mem",
  "gex-wayland",
  "gex-xlate",
+ "wasm-encoder",
+ "wasmparser",
  "wasmtime",
 ]
 
