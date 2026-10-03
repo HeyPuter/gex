@@ -1252,6 +1252,12 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
         devfs.add("gex-gl", crate::gl::GlDevice::new());
     }
     kernel.vfs.mount("/dev", Arc::new(devfs));
+    // POSIX shared memory (shm_open) is files in /dev/shm, one filesystem
+    // for every process so a name one creates another opens (Chromium's
+    // processes, in a CEF game). The shim's memory is the processes' shared
+    // memory, so one static is one filesystem.
+    static SHM: std::sync::OnceLock<Arc<gex_kernel::vfs::TmpFs>> = std::sync::OnceLock::new();
+    kernel.vfs.mount("/dev/shm", SHM.get_or_init(|| Arc::new(gex_kernel::vfs::TmpFs::new())).clone());
     // The Wayland compositor: bound only when the page
     // brought a canvas for it, so a guest without one finds no `wayland-0` and
     // libwayland fails to connect cleanly rather than blocking on a dead name.
