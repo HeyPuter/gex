@@ -2912,8 +2912,15 @@ unsigned eglDestroySurface(void *dpy, void *surface) {
 
 void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
     (void)dpy; (void)config; (void)share;
-    egl_context_major = egl_api == 0x30A2u ? 4 : 3;
-    egl_context_minor = egl_api == 0x30A2u ? 4 : 0;
+    /* EGL's defaults: version 1.0, which for desktop GL means a context of
+       whatever version the implementation offers that is backward compatible
+       with 1.0 -- the compatibility profile, since a core one is defined only
+       from 3.2 and the profile mask is ignored below it. (4.4 here made an
+       application that asks for no version, SDL's default, get a 4.4 core
+       context with no fixed function on a host that honours the profile.) */
+    egl_context_major = egl_api == 0x30A2u ? 1 : 3;
+    egl_context_minor = 0;
+    egl_context_profile = 0;
     if (attrs) {
         for (const int *a = attrs; *a != 0x3038; a += 2) {
             if (a[0] == 0x3098) egl_context_major = a[1];

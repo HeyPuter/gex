@@ -1051,7 +1051,7 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
      * vertex array object, which core does not have and GL2-era code assumes:
      * without it st drops every draw before the driver is called. */
     attribs.profile = api != 1 ? API_OPENGLES2
-                    : profile == 1 ? API_OPENGL_COMPAT : API_OPENGL_CORE;
+                    : profile == 1 || major * 10 + minor < 32 ? API_OPENGL_COMPAT : API_OPENGL_CORE;
 
     fprintf(stderr, "gex-wgpu: context requested api=%u %u.%u\n",
             api, major, minor);
