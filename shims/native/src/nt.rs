@@ -338,6 +338,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                                 format!("{} {n}", nt::syscall_name(nr))
                             }).collect();
                         eprintln!("gex-nt: syscalls {total}: {}", sc.join(" | "));
+                        if let Some(l) = super::nt_cgen::no_unit_line() {
+                            eprintln!("{l}");
+                        }
                         let mut ss: Vec<((u32, u32, u64), u64)> =
                             std::mem::take(&mut *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner())).into_iter().collect();
                         ss.sort_by(|a, b| b.1.cmp(&a.1));
