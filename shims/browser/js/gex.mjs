@@ -2544,6 +2544,16 @@ export class Gex {
     if (!this.#cgenMode || !e.gex_cgen_wanted) return;
     for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
       const t0 = performance.now();
+      // The image's indirect-call profile is part of its unit's key, as
+      // natively: read it from the unit cache first.
+      if (e.gex_cgen_icall_path) {
+        const prof = this.#env.loadFile?.(this.#cgenStr(e.gex_cgen_icall_path, u)) ?? null;
+        const b = prof ? (prof instanceof Uint8Array ? prof : new Uint8Array(prof)) : null;
+        const gp = b ? e.gex_alloc(Math.max(8, b.byteLength)) >>> 0 : 0;
+        if (b) this.#bytes().set(b, gp);
+        e.gex_cgen_set_icall(u, gp, b ? b.byteLength : 0);
+        if (b) e.gex_free?.(gp, Math.max(8, b.byteLength));
+      }
       const key = this.#cgenStr(e.gex_cgen_key, u);
       const path = this.#cgenStr(e.gex_cgen_path, u);
       const got = this.#env.loadUnit?.(key) ?? null;

@@ -410,6 +410,7 @@ dependencies = [
  "gex-cgen",
  "gex-emit",
  "gex-kernel",
+ "gex-key",
  "gex-ld",
  "gex-wayland",
  "gex-xlate",

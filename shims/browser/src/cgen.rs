@@ -69,6 +69,12 @@ struct Unit {
     /// module file under the unit cache and the (C function, guest address)
     /// pairs it binds. Bound after the unit, whether or not it has one.
     providers: Vec<Provided>,
+    /// The image's identity (`gex_key::image_identity`, without `image:`):
+    /// its indirect-call profile is `<cache>/icall/<identity>.txt`, which JS
+    /// reads and hands over (`gex_cgen_set_icall`) before the key is used.
+    identity: String,
+    /// The key before the profile's part (`key` adds it).
+    key_base: String,
 }
 
 /// One export provider for a placed image.
@@ -214,8 +220,11 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         }
     }
     let (key, providers) = unit_key(image, pe, base);
+    let identity = gex_key::image_identity(image).trim_start_matches("image:").to_string();
     let mut units = lock(&UNITS);
     units.push(Unit {
+        identity,
+        key_base: key.clone(),
         key,
         wine: optional,
         path: path.to_string(),
@@ -231,9 +240,8 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
 
 /// The key of the unit for `image` (the native host's `nt_cgen::unit_key`:
 /// the image's key, extended by its export providers' stubs and sources),
-/// and those providers. *Deviation:* no indirect-call profile (`icall_hints`
-/// natively reads `<cache>/icall/`; the page has no such file), so an image
-/// built with one is looked up under a key the build did not use.
+/// and those providers. The indirect-call profile's part is added when JS
+/// has read `<cache>/icall/<identity>.txt` (`gex_cgen_set_icall`).
 fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) -> (String, Vec<Provided>) {
     use std::hash::{Hash, Hasher};
     let mut key = gex_cgen::image::image_key(image);
@@ -269,6 +277,64 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) 
         .filter(|p| !p.binds.is_empty())
         .collect();
     (key, provided)
+}
+
+/// Where unit `u`'s indirect-call profile is in the unit cache
+/// (`icall/<identity>.txt`), for JS to read.
+#[no_mangle]
+pub extern "C" fn gex_cgen_icall_path(u: u32, buf: u32, cap: u32) -> u32 {
+    let units = lock(&UNITS);
+    units.get(u as usize).map_or(0, |x| put_str(&format!("icall/{}.txt", x.identity), buf, cap))
+}
+
+/// Unit `u`'s indirect-call profile (the `len` bytes at `ptr`, or none):
+/// its key gains the profile's part, exactly as natively (`nt_cgen::
+/// icall_hints` and `unit_key`).
+#[no_mangle]
+pub extern "C" fn gex_cgen_set_icall(u: u32, ptr: u32, len: u32) {
+    use std::hash::{Hash, Hasher};
+    let text = if len == 0 { String::new() } else { String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..(ptr + len) as usize]).into_owned() };
+    let mut units = lock(&UNITS);
+    let Some(x) = units.get_mut(u as usize) else { return };
+    let hints = icall_hints(&text);
+    x.key = x.key_base.clone();
+    if !hints.is_empty() {
+        let mut v: Vec<(u64, u64)> = hints.into_iter().collect();
+        v.sort_unstable();
+        // As natively `v.hash(h)`: the length a u64 (usize there).
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u64(v.len() as u64);
+        for p in &v {
+            p.hash(&mut h);
+        }
+        x.key = format!("{}-i{:016x}", x.key_base, h.finish());
+    }
+}
+
+/// `nt_cgen::icall_hints` on the profile's text: a call site whose dominant
+/// target takes at least 90% of at least 64 calls, by return address.
+fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
+    use std::collections::HashMap;
+    let num = |w: &str| u64::from_str_radix(w.trim_start_matches("0x"), if w.starts_with("0x") { 16 } else { 10 }).ok();
+    let mut sites: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
+    for l in text.lines() {
+        let Some(k) = l.find("icall ") else { continue };
+        let w: Vec<&str> = l[k + 6..].split_whitespace().collect();
+        if let [r, t, n, ..] = w[..] {
+            if let (Some(r), Some(t), Some(n)) = (num(r), num(t), num(n)) {
+                *sites.entry(r).or_default().entry(t).or_default() += n;
+            }
+        }
+    }
+    let mut hints = HashMap::new();
+    for (ret, targets) in sites {
+        let total: u64 = targets.values().sum();
+        let (t, best) = targets.into_iter().max_by_key(|&(t, n)| (n, std::cmp::Reverse(t))).unwrap();
+        if best >= 64 && best * 10 >= total * 9 {
+            hints.insert(ret, t);
+        }
+    }
+    hints
 }
 
 /// The oldest unit waiting for its bytes, or -1.
@@ -314,6 +380,13 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
         ));
         return 1;
     }
+    // Loudly, as natively: a unit built at another base (or under another
+    // key) is silently not used otherwise.
+    crate::warn_line(&format!(
+        "gex-nt: image {} at base {:#x}: no function-tier unit (key {}), tier-1; build it with \
+         GEX_CGEN_GUARD=1 gexc cgen-image <image> --pe-base {:#x}\n",
+        x.path, x.base, x.key, x.base
+    ));
     0
 }
 
