@@ -320,6 +320,32 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         let tot: Vec<String> = tot.iter().map(|(c, k)| format!("{c} x{k}")).collect();
                         let top: Vec<String> = top.iter().map(|((c, t), k)| format!("{c} -> {} x{k}", p.describe_addr(*t))).collect();
                         eprintln!("gex-nt: resumes by cause {} || {}", tot.join(" | "), top.join(" | "));
+                        // Syscalls since the last report, most frequent first.
+                        let mut sc: Vec<(u32, u64)> = SYSCALLS
+                            .iter()
+                            .enumerate()
+                            .map(|(nr, n)| (nr as u32, n.swap(0, std::sync::atomic::Ordering::Relaxed)))
+                            .filter(|&(_, n)| n > 0)
+                            .collect();
+                        sc.sort_by(|a, b| b.1.cmp(&a.1));
+                        let total: u64 = sc.iter().map(|x| x.1).sum();
+                        let sc: Vec<String> = sc.iter().take(12).map(|&(nr, n)| {
+                                let nr = if nr as usize == UNIX_CALL_SLOT { nt::gex_nr::UNIX_CALL } else { nr };
+                                format!("{} {n}", nt::syscall_name(nr))
+                            }).collect();
+                        eprintln!("gex-nt: syscalls {total}: {}", sc.join(" | "));
+                        let mut ss: Vec<((u32, u32, u64), u64)> =
+                            std::mem::take(&mut *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner())).into_iter().collect();
+                        ss.sort_by(|a, b| b.1.cmp(&a.1));
+                        let ss: Vec<String> = ss
+                            .iter()
+                            .take(16)
+                            .map(|&((nr, tid, site), n)| {
+                                let nr = if nr as usize == UNIX_CALL_SLOT { nt::gex_nr::UNIX_CALL } else { nr };
+                                format!("{} t{tid:x} from {} x{n}", nt::syscall_name(nr), p.describe_addr(site))
+                            })
+                            .collect();
+                        eprintln!("gex-nt: syscall sites (1 in 64) {}", ss.join(" | "));
                         let mut by: std::collections::BTreeMap<String, u64> = Default::default();
                         for (page, n) in crate::tier1_pages() {
                             let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
@@ -406,6 +432,18 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
+    if crate::ftab::stats_on() {
+        let i = if nr == nt::gex_nr::UNIX_CALL { UNIX_CALL_SLOT } else { nr as usize };
+        if let Some(n) = SYSCALLS.get(i) {
+            // 1 in 64: who made it, the first return address outside
+            // Wine's core DLLs on the guest's frame-pointer chain.
+            if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 63 == 0 && p.abi == nt::Abi::P32 {
+                let site = syscall_site(&p, &memory, ctx_addr);
+                let tid = p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid);
+                *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).entry((i as u32, tid, site)).or_default() += 1;
+            }
+        }
+    }
     // Where the syscall returns to, and the stack it was made on: what a
     // nested exception dispatch needs to come back here.
     let next_pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
@@ -481,6 +519,40 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         nt::Outcome::CallbackReturn => Err(StopExecution.into()),
     }
 }
+
+/// NT syscalls by number (GEX_NT_STATS): ntdll's table and win32u's
+/// (0x1000 up).
+const UNIX_CALL_SLOT: usize = 0x1fff;
+/// Sampled syscalls by (number, thread, guest site) (GEX_NT_STATS).
+static SYSCALL_SITES: std::sync::Mutex<std::collections::BTreeMap<(u32, u32, u64), u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The first return address outside Wine's core DLLs (ntdll, kernelbase,
+/// kernel32, the trampolines) on an i386 thread's EBP chain at a syscall:
+/// the program code that asked. 0 when the chain ends first.
+fn syscall_site(p: &nt::Process, memory: &gex_mem::GuestMemory, ctx_addr: u64) -> u64 {
+    let gm = GuestMem::new(memory.bytes());
+    let system = |a: u64| {
+        if (nt::TRAMPOLINES..nt::TRAMPOLINES_END).contains(&a) {
+            return true;
+        }
+        let d = p.describe_addr(a);
+        ["(ntdll.dll+", "(kernelbase.dll+", "(kernel32.dll+"].iter().any(|m| d.contains(m))
+    };
+    let mut bp = gm.read_u64(ctx_addr + ctx::x(5) as u64).unwrap_or(0) & 0xffff_ffff;
+    for _ in 0..16 {
+        let (Ok(next), Ok(ret)) = (gm.read_u32(bp), gm.read_u32(bp + 4)) else { return 0 };
+        if !system(ret as u64) {
+            return ret as u64;
+        }
+        if (next as u64) <= bp {
+            return 0;
+        }
+        bp = next as u64;
+    }
+    0
+}
+static SYSCALLS: [std::sync::atomic::AtomicU64; 0x2000] = [const { std::sync::atomic::AtomicU64::new(0) }; 0x2000];
 
 /// Exceptions dispatched nested and escaped back (GEX_NT_STATS).
 pub(crate) static EXC_NESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
