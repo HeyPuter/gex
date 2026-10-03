@@ -8,6 +8,7 @@
 //! Covers the MVP plus the three proposals gex depends on: tail calls
 //! (PLAN §2.4), threads/atomics (PLAN §5.8) and reference types for the
 //! dispatch table.
+use std::collections::HashMap;
 
 /// Wasm value types.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -187,6 +188,12 @@ pub struct FuncBody {
     /// with another. Recording the offsets lets the merger patch them without
     /// decoding the stream.
     relocs: Vec<u32>,
+    /// Peephole for the function JIT ([`Self::fold_tees`]): the last
+    /// `local.set` emitted, as (opcode offset, local, end of code then).
+    last_set: Option<(usize, u32, usize)>,
+    fold: bool,
+    /// With `fold`: every local instruction, as (offset, local, length).
+    local_log: Vec<(u32, u32, u8)>,
 }
 
 impl FuncBody {
@@ -196,6 +203,9 @@ impl FuncBody {
             code: Vec::new(),
             n_params,
             relocs: Vec::new(),
+            last_set: None,
+            fold: false,
+            local_log: Vec::new(),
         }
     }
 
@@ -222,18 +232,91 @@ impl FuncBody {
     // -- instructions ------------------------------------------------------
 
     pub fn local_get(&mut self, idx: u32) {
+        // `local.set x; local.get x` is `local.tee x`: nothing can branch
+        // between two adjacent instructions.
+        if let Some((at, x, end)) = self.last_set {
+            if self.fold && x == idx && end == self.code.len() && self.code[at] == op::LOCAL_SET {
+                self.code[at] = op::LOCAL_TEE;
+                self.last_set = None;
+                return;
+            }
+        }
+        let at = self.code.len();
         self.byte(op::LOCAL_GET);
         self.u32(idx);
+        self.log_local(at, idx);
     }
 
     pub fn local_set(&mut self, idx: u32) {
+        let at = self.code.len();
         self.byte(op::LOCAL_SET);
         self.u32(idx);
+        self.last_set = Some((at, idx, self.code.len()));
+        self.log_local(at, idx);
+    }
+
+    fn log_local(&mut self, at: usize, idx: u32) {
+        if self.fold {
+            self.local_log.push((at as u32, idx, (self.code.len() - at) as u8));
+        }
+    }
+
+    /// Remove every `local.tee` of a local `temp` admits whose value nothing
+    /// reads: the next instruction naming that local, in code order, sets
+    /// it (or there is none). Sound for locals that never carry a value
+    /// backwards (around a loop) -- a block-local temporary is set before
+    /// any read in its block. The value the tee left on the stack stays.
+    pub fn strip_dead_tees(&mut self, temp: &dyn Fn(u32) -> bool) {
+        if !self.fold {
+            return;
+        }
+        let log = std::mem::take(&mut self.local_log);
+        let mut next_of: HashMap<u32, usize> = HashMap::new();
+        let mut dead = vec![false; log.len()];
+        for (k, &(at, idx, _)) in log.iter().enumerate().rev() {
+            if self.code[at as usize] == op::LOCAL_TEE && temp(idx) {
+                dead[k] = match next_of.get(&idx) {
+                    None => true,
+                    Some(&n) => self.code[log[n].0 as usize] == op::LOCAL_SET,
+                };
+            }
+            next_of.insert(idx, k);
+        }
+        if !dead.iter().any(|&d| d) {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.code.len());
+        let mut cut: Vec<(u32, u32)> = Vec::new(); // (offset, bytes removed up to and including it)
+        let mut from = 0usize;
+        let mut removed = 0u32;
+        for (k, &(at, _, len)) in log.iter().enumerate() {
+            if dead[k] {
+                out.extend_from_slice(&self.code[from..at as usize]);
+                from = at as usize + len as usize;
+                removed += len as u32;
+                cut.push((at, removed));
+            }
+        }
+        out.extend_from_slice(&self.code[from..]);
+        let shift = |r: u32| cut.iter().take_while(|&&(at, _)| at < r).last().map_or(0, |&(_, n)| n);
+        for r in self.relocs.iter_mut() {
+            *r -= shift(*r);
+        }
+        self.code = out;
+        self.last_set = None;
+    }
+
+    /// Fold `local.set x; local.get x` into `local.tee x` from here on
+    /// (off by default, which keeps tier-1's bytes as they were).
+    pub fn fold_tees(&mut self) {
+        self.fold = true;
     }
 
     pub fn local_tee(&mut self, idx: u32) {
+        let at = self.code.len();
         self.byte(op::LOCAL_TEE);
         self.u32(idx);
+        self.log_local(at, idx);
     }
 
     pub fn i32_const(&mut self, v: i32) {

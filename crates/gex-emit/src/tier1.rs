@@ -497,6 +497,13 @@ struct Emitter<'a> {
     value_local: Vec<Option<u32>>,
     /// Constant value of each GIR value, when known.
     value_const: Vec<Option<u64>>,
+    /// Function mode only: the values defined by a zero-extension from 32
+    /// bits, as addresses below 2^32 that need no bounds guard
+    /// (`emit_address`). Empty elsewhere.
+    pub(crate) value_u32: Vec<bool>,
+    /// The locals `alloc` made: block-local temporaries, never holding a
+    /// value from one block to another (fmode's `strip_dead_tees`).
+    pub(crate) temps: Vec<u32>,
     /// Type of each GIR value, needed to pick the right local pool.
     value_ty: Vec<Ty>,
     /// Free locals available for reuse, by type.
@@ -570,6 +577,8 @@ impl<'a> Emitter<'a> {
             scratch_index,
             value_local: Vec::new(),
             value_const: Vec::new(),
+            value_u32: Vec::new(),
+            temps: Vec::new(),
             value_ty: Vec::new(),
             free_i32: Vec::new(),
             free_i64: Vec::new(),
@@ -938,7 +947,9 @@ impl<'a> Emitter<'a> {
         if let Some(l) = pool.pop() {
             return l;
         }
-        self.f.add_local(val_type(ty))
+        let l = self.f.add_local(val_type(ty));
+        self.temps.push(l);
+        l
     }
 
     fn release(&mut self, v: Value) {
@@ -1295,6 +1306,19 @@ impl<'a> Emitter<'a> {
             }
             self.f.i32_const(POISON_ADDR as i32);
             return 0;
+        }
+        // An address zero-extended from 32 bits is below 2^32: past the
+        // memory, it traps by itself, as the guard would make it -- when
+        // nothing but guest memory lies below the guard limit (natively; the
+        // browser's NT layer keeps its heap above a lower one). The static
+        // offset is no different from the guarded case.
+        if self.value_u32.get(addr.0 as usize).copied().unwrap_or(false) && guard_limit() >= GUEST_LIMIT && !Self::no_guard() {
+            let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
+            if (0..=max_static).contains(&offset) {
+                self.push(addr);
+                self.f.byte(code::I32_WRAP_I64);
+                return offset as u32;
+            }
         }
         // Caching a repeated base's guard in a local was tried and bought
         // nothing: the guard is pure arithmetic on an unchanging value, which

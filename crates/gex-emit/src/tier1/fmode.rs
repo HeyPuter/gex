@@ -98,6 +98,7 @@ impl<'a> FnBody<'a> {
             e.regs.insert(r, Cached { local, dirty: false });
         }
         e.func_regs = Some(used);
+        e.f.fold_tees();
         let n = n_values as usize;
         e.value_local = vec![None; n];
         e.value_const = vec![None; n];
@@ -183,6 +184,15 @@ impl<'a> FnBody<'a> {
     /// computed for an exit taken once is computed there.
     pub fn block(&mut self, start: u64, stmts: &[Stmt], keep: &[Value], defer: &[usize]) -> Deferred {
         self.e.block_start = start;
+        let mut u32s = vec![false; self.e.value_local.len()];
+        for st in stmts {
+            if let Stmt::Def { dst, expr: Expr::Extend { signed: false, .. } } = st {
+                if let Some(u) = u32s.get_mut(dst.0 as usize) {
+                    *u = true;
+                }
+            }
+        }
+        self.e.value_u32 = u32s;
         // Values are numbered per block: forget the last block's (a value
         // nobody read keeps its local, which is only a local lost).
         for v in self.e.value_local.iter_mut() {
@@ -352,6 +362,8 @@ impl<'a> FnBody<'a> {
         if sel.is_empty() {
             return;
         }
+        // Sunk code is pure: no address to guard; nothing claimed for it.
+        self.e.value_u32.clear();
         self.e.value_local.clone_from(&d.local);
         self.e.value_const.clone_from(&d.cnst);
         self.e.value_ty.clone_from(&d.ty);
@@ -475,7 +487,11 @@ impl<'a> FnBody<'a> {
         f.end();
     }
 
-    pub fn finish(self) -> Vec<u8> {
+    pub fn finish(mut self) -> Vec<u8> {
+        if std::env::var("GEX_FJIT_TEES").as_deref() != Ok("0") {
+            let temps: std::collections::HashSet<u32> = self.e.temps.iter().copied().collect();
+            self.e.f.strip_dead_tees(&|l| temps.contains(&l));
+        }
         self.e.f.finish()
     }
 }
