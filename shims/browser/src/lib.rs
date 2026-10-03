@@ -4071,6 +4071,24 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     FILES.0.borrow_mut().push((name.to_string(), bytes));
 }
 
+/// A bundled hard link: `path` becomes another name for the already-added
+/// `target`, one inode as in the bundle. glibc's loader knows a loaded
+/// library by device and inode, so two copies where the host had two names
+/// for one file load it twice (two `libGL`s, each with its own state).
+/// Returns 1 when linked; 0 tells the caller to add a copy instead (no
+/// global kernel: this process's filesystem does not exist yet).
+#[no_mangle]
+pub extern "C" fn gex_add_hardlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+    // SAFETY: scalars naming ranges of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            return (unsafe { k_fs_link(target, target_len, path, path_len) } == 0) as i32;
+        }
+        return 1;
+    }
+    0
+}
+
 /// A bundled file's modification time, as the host's filesystem had it, so a
 /// program that records one (`gzip`, `make`, `tar`) sees what it would
 /// natively. Like `gex_chmod`.
