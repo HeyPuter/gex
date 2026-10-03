@@ -39,6 +39,8 @@ function moduleContentKey(bytes) {
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
 const SHIM_STACK_TOP = 0x06000000;
+/** `gex_emit::dense::FIRST_TABLE`: dispatch tables from here on may be dense. */
+const DENSE_FIRST_TABLE = 4;
 /** The most a dispatch table grows past what is needed, in entries. */
 const TABLE_STEP = 1 << 20;
 /** `gex_abi::ctx::LAST_TARGET`. */
@@ -325,6 +327,33 @@ export function elementTableNeeds(wasm) {
   return needs;
 }
 
+/** A module's `gex.dense` section (gex_emit::dense::SECTION), or null. */
+export function denseSection(wasm) {
+  if (wasm instanceof WebAssembly.Module) {
+    const secs = WebAssembly.Module.customSections(wasm, 'gex.dense');
+    return secs.length ? new Uint8Array(secs[0]) : null;
+  }
+  if (!(wasm instanceof Uint8Array)) return null;
+  const dv = new DataView(wasm.buffer, wasm.byteOffset, wasm.byteLength);
+  let i = 8;
+  const leb = () => {
+    let n = 0, shift = 0, b;
+    do { b = dv.getUint8(i++); n |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    return n >>> 0;
+  };
+  while (i < wasm.length) {
+    const id = dv.getUint8(i++);
+    const size = leb();
+    const end = i + size;
+    if (id === 0) {
+      const nameLen = leb();
+      if (utf8(wasm.subarray(i, i + nameLen)) === 'gex.dense') return wasm.slice(i + nameLen, end);
+    }
+    i = end;
+  }
+  return null;
+}
+
 export function metadataSection(wasm) {
   // A compiled `WebAssembly.Module` -- which `attach` accepts, so the guest
   // image and the closure's libraries cross `postMessage` by reference rather
@@ -443,6 +472,10 @@ export class Gex {
   /// them all up front. Set in `adoptThread` from `GEX_LAZY_THREAD`. See
   /// `#catchUpLazy` and gtk-startup-is-per-thread-install.
   #lazyCatchUp = false;
+  /** Whether this process numbers its blocks densely (gex_emit::dense): a
+   *  dense table's slots live in the process's slot maps, and this Worker's
+   *  only table for them is `blocks`, one entry per block. */
+  #dense = false;
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
   #unfilled = [];
@@ -755,6 +788,7 @@ export class Gex {
       bigGrows: this.#bigGrows.slice(0, 6).join(' | '),
       tn: this.#tn.join(' '),
       tlen: this.#shim ? this.#dispatchTables().map((t) => t.length).join('/') : '',
+      blen: this.#guest?.exports?.blocks?.length ?? -1,
       tailMs: Math.round(this.#tailMs),
       strictGrows: this.#strictGrows,
       strictSlots: this.#strictSlots,
@@ -1162,6 +1196,11 @@ export class Gex {
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
     this.#tnAt('boot');
+    // Dense block tables when the image module has `blocks` (the seed does;
+    // a closure image, whose libraries dispatch classically, does not).
+    this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
+    e.gex_set_dense?.(this.#dense ? (opts.dense === 2 ? 2 : 1) : 0);
     this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
@@ -1178,6 +1217,15 @@ export class Gex {
    */
   async #adoptModule(m) {
     const e = this.#shim.exports;
+    // Its dense blocks keep the parent's numbering: point this process's
+    // slots at them where nothing newer does.
+    const ds = this.#dense ? denseSection(m.mod) : null;
+    if (ds && e.gex_dense_adopt) {
+      const dp = e.gex_alloc(ds.length) >>> 0;
+      this.#bytes().set(ds, dp);
+      e.gex_dense_adopt(dp, ds.length);
+      e.gex_free?.(dp, ds.length);
+    }
     // What this module actually reaches: a closure library claims zero here.
     // See `slotsNeeded`.
     const truly = Math.max(m.need >>> 0, slotsNeeded(m.meta));
@@ -1353,6 +1401,9 @@ export class Gex {
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
     _at('guest instantiated');
+    // A thread joins its process's numbering; a forked child decides once its
+    // kernel exists (`adoptProcess`).
+    this.#dense = !!e.gex_dense_on?.() && !!this.#guest.exports.blocks;
     this.#offerToFill(this.#guest);
     _at('offerToFill done, catchUp');
     // Everything the process translated before this thread existed.
@@ -1755,6 +1806,10 @@ export class Gex {
       child.brk ?? 0n,
     );
     if (child.compat) e.gex_set_compat?.(1);
+    // The parent's block numbering carries on in the child (its low region),
+    // over slot maps of its own (`dense::child`).
+    this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    e.gex_set_dense?.(this.#dense ? ((child.opts ?? {}).dense === 2 ? 2 : 1) : 0);
     step(`kernel built, entry 0x${entry.toString(16)}, ${live()} non-zero bytes in the context`);
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
@@ -2349,6 +2404,8 @@ export class Gex {
     for (let i = 0; i < TABLE_NAMES.length; i++) {
       gex[TABLE_NAMES[i]] = tables[i] ?? new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
     }
+    // Dense: the shim's runtime module dispatches through `blocks` too.
+    if (this.#dense) gex.blocks = this.#guest.exports.blocks;
     const ri = new WebAssembly.Instance(rm, { gex });
     this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri] };
     this.#cgenGrow();
@@ -2395,7 +2452,13 @@ export class Gex {
     } finally {
       e.gex_free?.(buf, 4 * Math.max(1, n));
     }
-    for (let j = 0; j + 1 < regs.length; j += 2) tables[regs[j]].set(regs[j + 1], st.bridge);
+    // Table 8 (`gex_emit::dense::TABLE_INDEX`) is `blocks`: a dense slot's
+    // bridge has an index there of its own.
+    const blocks = this.#guest.exports.blocks;
+    if (blocks) this.#growBlocks();
+    for (let j = 0; j + 1 < regs.length; j += 2) {
+      (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+    }
     st.instances.push(inst);
     return regs.length / 2;
   }
@@ -2698,6 +2761,7 @@ export class Gex {
           }
           e.gex_fill_done(answer ? 1 : 0);
         }
+        this.#denseCatchUp();
         // One grow for the whole queue before any install: `#installModule`
         // grows per module and `Table.grow` reallocates, so a batch of hundreds
         // with a rising need copies an ever-larger table hundreds of times.
@@ -3008,6 +3072,7 @@ export class Gex {
     // start empty, with no element 0 of their own.
     const stub = tables[0].get(0);
     for (let i = 0; i < tables.length; i++) {
+      if (this.#denseTable(i)) continue;
       const need_i = need_of(i);
       if (tables[i].length >= need_i) continue;
       // Geometrically, not exactly: `Table.grow` reallocates and copies, so
@@ -3054,8 +3119,9 @@ export class Gex {
     if (!e.gex_claimed_slots) return false;
     const tables = this.#dispatchTables();
     const stub = tables[0].get(0);
-    let grew = false;
+    let grew = this.#growBlocks();
     for (let i = 0; i < tables.length; i++) {
+      if (this.#denseTable(i)) continue;
       const need = e.gex_claimed_slots(i) >>> 0;
       if (need <= tables[i].length) continue;
       try {
@@ -3136,6 +3202,7 @@ export class Gex {
         if (e.gex_exited?.()) return 0;
         const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
         if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+        this.#denseCatchUp();
         if (e.gex_jit_pending_len() >>> 0) {
           const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
           if (need) this.#growTables(need, 'nt-callback');
@@ -3342,6 +3409,23 @@ export class Gex {
     });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
+    // Dense: the module's blocks go to `blocks` at the base its bytes name,
+    // within what the process has numbered.
+    if (this.#guest?.exports?.blocks) {
+      imports.blocks = this.#guest.exports.blocks;
+      this.#growBlocks();
+      const ds = denseSection(bytes instanceof Uint8Array ? bytes : mod);
+      if (ds) {
+        const dv = new DataView(ds.buffer, ds.byteOffset, ds.byteLength);
+        const base = dv.getUint32(0, true);
+        if (globalThis.GEX_DENSE_DEBUG) {
+          console.error(`[dense] ${who} base=${base} n=${dv.getUint32(4, true)} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`);
+        }
+        // Base 0 is a module nobody numbered: its blocks would land on the
+        // miss stub and its neighbours.
+        if (base === 0) throw new Error(`gex: a translation with unnumbered dense blocks reached the install (${who})`);
+      }
+    }
     // What this module's own entries need per table, where known. `need` alone
     // is one running total that cannot say which tables absolute segments fall
     // in; the segments (or `Metadata` for an already-compiled module) can, which
@@ -3367,6 +3451,7 @@ export class Gex {
       const stub = tables[0].get(0);
       let grew = 0;
       for (let i = 0; i < tables.length; i++) {
+        if (this.#denseTable(i)) continue;
         const want = Math.min(Math.max(need - i * per, 0), per);
         if (tables[i].length < want) {
           grew += want - tables[i].length;
@@ -3502,7 +3587,7 @@ export class Gex {
   #reach(t, end) {
     const e = this.#shim.exports;
     const tables = this.#dispatchTables();
-    if (t < 0 || t >= tables.length || tables[t].length >= end) return;
+    if (t < 0 || t >= tables.length || tables[t].length >= end || this.#denseTable(t)) return;
     const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
     const CHUNK = SLOTS_PER_PAGE * 16;
     const want = Math.min(Math.ceil(end / CHUNK) * CHUNK, per);
@@ -3868,6 +3953,53 @@ export class Gex {
       );
     }
     return false;
+  }
+
+  /** A dispatch missed on a block of this process this Worker never
+   *  instantiated (`gex_dense_want`): instantiate the registry module that
+   *  holds it, whatever order this Worker caught up in. Synchronous. */
+  #denseCatchUp() {
+    const e = this.#shim.exports;
+    const d = e.gex_dense_want ? e.gex_dense_want() >>> 0 : 0;
+    if (!d) return;
+    const i = e.gex_dense_owner(d);
+    if (i < 0) return;
+    const ptr = e.gex_module_ptr(i) >>> 0;
+    const len = e.gex_module_len(i) >>> 0;
+    if (!len) return;
+    const bytes = this.#bytes().slice(ptr, ptr + len);
+    const key = moduleContentKey(bytes);
+    const cached = key ? this.#sharedModules.get(key) : undefined;
+    this.#installModule(bytes, 0, 64, null, `dense-${i}`, cached, true);
+    this.#denseCatchUps++;
+    if (cached) return;
+    const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+    if (mod && key) {
+      this.#sharedModules.set(key, mod);
+      this.#env.shareModule?.(key, mod);
+    }
+  }
+
+  #denseCatchUps = 0;
+
+  /** Whether dispatch table `t` is dense here (gex_emit::dense::FIRST_TABLE
+   *  and up): its slots are the process's slot maps, never this table. */
+  #denseTable(t) {
+    return this.#dense && t >= DENSE_FIRST_TABLE;
+  }
+
+  /** Grow this Worker's `blocks` to every index the process has numbered
+   *  (`gex_dense_size`), the miss stub (its entry 0) in the new entries.
+   *  Whether it grew. */
+  #growBlocks() {
+    const b = this.#guest?.exports?.blocks;
+    if (!this.#dense || !b) return false;
+    const need = this.#shim.exports.gex_dense_size() >>> 0;
+    const len = b.length;
+    if (len >= need) return false;
+    const want = Math.max(need, Math.min(len * 2, len + (1 << 18)));
+    growTable(b, want - len, b.get(0), 'blocks');
+    return true;
   }
 
   /** Every dispatch table the guest module exports, in index order. */

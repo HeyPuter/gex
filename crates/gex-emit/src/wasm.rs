@@ -650,6 +650,9 @@ pub struct ElementSegment {
     /// page. Keying on an entry left every other miss re-translating code the
     /// closure already held.
     pub guest_page: u32,
+    /// The offset is written as a five-byte LEB, so a host can rewrite it in
+    /// place (`crate::dense::set_base`).
+    pub padded: bool,
 }
 
 /// A memory initialiser.
@@ -1243,7 +1246,16 @@ impl Module {
                     s.push(0x02);
                     write_u32(&mut s, e.table);
                     s.push(op::I32_CONST);
-                    write_i32(&mut s, e.offset as i32);
+                    if e.padded {
+                        let mut v = e.offset as i32;
+                        for i in 0..5 {
+                            let byte = (v & 0x7f) as u8;
+                            v >>= 7;
+                            s.push(if i < 4 { byte | 0x80 } else { byte & 0x7f });
+                        }
+                    } else {
+                        write_i32(&mut s, e.offset as i32);
+                    }
                     s.push(op::END);
                     s.push(0x00); // elemkind: funcref
                 }

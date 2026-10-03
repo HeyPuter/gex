@@ -527,6 +527,15 @@ mod imp {
         let presents = p.presents.load(Ordering::Relaxed);
         if t / 1000 % 10 == 0 {
             report_times();
+            // What every Worker's tables hold: `blocks` (dense) and the
+            // slots each dispatch table is numbered to.
+            let slots: Vec<String> = (0..gex_abi::DISPATCH_TABLES as u32).map(|k| crate::gex_claimed_slots(k).to_string()).collect();
+            warn_line(&format!(
+                "gex-nt: tables blocks={} slots={} dense={}\n",
+                crate::dense::gex_dense_size(),
+                slots.join("/"),
+                crate::dense::on() as u8
+            ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
             }

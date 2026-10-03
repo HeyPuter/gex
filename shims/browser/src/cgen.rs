@@ -285,8 +285,18 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             seen.insert((t, gex_abi::dispatch_index(a, base) as u32));
         }
         let mut regs = Vec::with_capacity(2 * seen.len());
+        // A dense table's slot gets an index in `blocks` of its own, which
+        // JS writes the bridge at (as table `gex_emit::dense::TABLE_INDEX`).
+        let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::map(t as usize).is_some()).collect();
+        let first = if dense.is_empty() { 0 } else { crate::dense::alloc(dense.len() as u32) };
+        for (j, &(t, slot)) in dense.iter().enumerate() {
+            crate::dense::set_slot(gex_abi::dispatch_entry(t as usize, slot), first + j as u32);
+            regs.extend_from_slice(&[gex_emit::dense::TABLE_INDEX, first + j as u32]);
+        }
         for (t, slot) in seen {
-            regs.extend_from_slice(&[t, slot]);
+            if crate::dense::map(t as usize).is_none() {
+                regs.extend_from_slice(&[t, slot]);
+            }
         }
         h.jit.translated.extend(addrs.iter().copied());
         (regs, new_pages, h.jit.page_table.slots())
@@ -458,14 +468,146 @@ static LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// bytes are, and how long they are.
 static RUNTIME: OnceLock<Vec<u8>> = OnceLock::new();
 
+fn runtime() -> &'static Vec<u8> {
+    RUNTIME.get_or_init(|| {
+        let m = gex_cgen::runtime::module();
+        if !crate::dense::on() {
+            return m;
+        }
+        dense_runtime(&m).unwrap_or_else(|| {
+            crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
+            m
+        })
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn gex_ftab_runtime_ptr() -> u32 {
-    RUNTIME.get_or_init(gex_cgen::runtime::module).as_ptr() as u32
+    runtime().as_ptr() as u32
 }
 
 #[no_mangle]
 pub extern "C" fn gex_ftab_runtime_len() -> u32 {
-    RUNTIME.get_or_init(gex_cgen::runtime::module).len() as u32
+    runtime().len() as u32
+}
+
+fn leb(b: &[u8], p: &mut usize) -> Option<u32> {
+    let mut v = 0u32;
+    let mut shift = 0;
+    loop {
+        let byte = *b.get(*p)?;
+        *p += 1;
+        v |= ((byte & 0x7f) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+    }
+}
+
+fn put_leb(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if v != 0 { b | 0x80 } else { b });
+        if v == 0 {
+            return;
+        }
+    }
+}
+
+/// The runtime module (`gex_cgen::runtime`) with dense dispatch (the
+/// bridge carries on in tier-1 through its last function, `dispatch`): an
+/// import of `gex.blocks` after its tables, and that function replaced by
+/// `gex_emit::dense::dispatch_body`. `None` if the module is not the shape
+/// that was written for (memory, `ftab` and the dispatch tables imported, four
+/// functions defined, `dispatch` last, of type 3).
+fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
+    if m.get(..8)? != b"\0asm\x01\0\0\0" {
+        return None;
+    }
+    let mut out = m[..8].to_vec();
+    let mut p = 8;
+    let mut tables = 0u32;
+    while p < m.len() {
+        let id = m[p];
+        p += 1;
+        let len = leb(m, &mut p)? as usize;
+        let body = m.get(p..p + len)?;
+        p += len;
+        let mut sec = Vec::new();
+        match id {
+            2 => {
+                let mut q = 0;
+                let n = leb(body, &mut q)?;
+                let start = q;
+                for _ in 0..n {
+                    for _ in 0..2 {
+                        let l = leb(body, &mut q)? as usize;
+                        q += l;
+                    }
+                    match *body.get(q)? {
+                        0 => {
+                            q += 1;
+                            leb(body, &mut q)?;
+                        }
+                        1 => {
+                            tables += 1;
+                            q += 2; // funcref, limits flag
+                            let flag = body[q - 1];
+                            leb(body, &mut q)?;
+                            if flag & 1 != 0 {
+                                leb(body, &mut q)?;
+                            }
+                        }
+                        2 => {
+                            q += 1;
+                            let flag = *body.get(q)?;
+                            q += 1;
+                            leb(body, &mut q)?;
+                            if flag & 1 != 0 {
+                                leb(body, &mut q)?;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                if tables != 1 + gex_abi::DISPATCH_TABLES as u32 {
+                    return None;
+                }
+                put_leb(&mut sec, n + 1);
+                sec.extend_from_slice(&body[start..]);
+                for name in [gex_abi::IMPORT_MODULE, gex_emit::dense::TABLE_NAME] {
+                    put_leb(&mut sec, name.len() as u32);
+                    sec.extend_from_slice(name.as_bytes());
+                }
+                sec.extend_from_slice(&[0x01, 0x70, 0x00, 0x00]);
+            }
+            10 => {
+                let mut q = 0;
+                let n = leb(body, &mut q)?;
+                if n != 4 {
+                    return None;
+                }
+                put_leb(&mut sec, n);
+                for k in 0..n {
+                    let at = q;
+                    let l = leb(body, &mut q)? as usize;
+                    q += l;
+                    if k + 1 < n {
+                        sec.extend_from_slice(body.get(at..q)?);
+                    } else {
+                        sec.extend_from_slice(&gex_emit::dense::dispatch_body(3, 1, tables));
+                    }
+                }
+            }
+            _ => sec.extend_from_slice(body),
+        }
+        out.push(id);
+        put_leb(&mut out, sec.len() as u32);
+        out.extend_from_slice(&sec);
+    }
+    Some(out)
 }
 
 /// Calls the fallback answered (it leaves), for the stats line.

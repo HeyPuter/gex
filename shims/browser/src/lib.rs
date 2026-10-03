@@ -39,6 +39,7 @@ pub mod wl;
 mod xwm;
 pub(crate) mod memmap;
 mod cgen;
+mod dense;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -2413,6 +2414,18 @@ struct PendingModule {
     dirs: Vec<(u64, u32)>,
     /// How many slots the dispatch table must hold for it.
     slots: u64,
+    /// Its dense elements, numbered (`dense::register`), published with it.
+    dense: Option<gex_emit::dense::Section>,
+}
+
+/// Queue a module for JavaScript to install, numbering its dense blocks;
+/// `id` is its id in the shared store, if it has one.
+fn push_pending(h: &mut Host, dirs: Vec<(u64, u32)>, slots: u64, mut wasm: Vec<u8>, id: u32) {
+    let dense = dense::register(&mut wasm);
+    if let (Some(d), true) = (&dense, id != 0) {
+        h.jit.dense_base.insert(id, d.base);
+    }
+    h.jit.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm), dense });
 }
 
 struct Jit {
@@ -2438,6 +2451,10 @@ struct Jit {
     /// Per registry module, a hash of each 256-byte chunk as it was pushed,
     /// so a stray write into the bytes can be found (`verify_registry`).
     registry_sums: Vec<Vec<u64>>,
+    /// Each registry module's dense range `(base, n)`, `(0, 0)` for none:
+    /// how a Worker missing index `d` finds the module to instantiate
+    /// (`gex_dense_owner`), whatever order it caught up in.
+    registry_dense: Vec<(u32, u32)>,
     /// Whether this process has ever run a second thread-Worker. The registry
     /// exists only so a joining Worker can catch up; a single-threaded process
     /// never gains one, so retaining its modules is pure loss against a fixed
@@ -2452,6 +2469,10 @@ struct Jit {
     /// Shared modules this Worker has put into its own tables. Describes the
     /// Worker, not the program, and survives `execve` as the tables do.
     installed_mods: std::collections::HashSet<u32>,
+    /// The dense base each stored module (by store id) was given here: the
+    /// store keeps the bytes as built, and `backfill_registry` must keep
+    /// them as installed (`dense`).
+    dense_base: std::collections::HashMap<u32, u32>,
     /// Pages whose translations were retired (code unmapped, reprotected or
     /// flushed: Detours patching noita.exe). A stored module covering one may
     /// predate the change, so it is never served here again; see
@@ -3900,9 +3921,11 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             coverage_snap: Vec::new(),
                 registry: Vec::new(),
                 registry_sums: Vec::new(),
+                registry_dense: Vec::new(),
                 ever_threaded: false,
                 shared: Default::default(),
                 installed_mods: Default::default(),
+                dense_base: Default::default(),
                 retired_pages: Default::default(),
                 remiss: Default::default(),
                 reuse_have: 0,
@@ -4898,6 +4921,7 @@ fn dir_note(page: u64, entry: u32, who: &str) {
     // per-table high-water is kept: fold this base in before the watch gate so a
     // sibling Worker can grow its table to cover this page. See `DIR_HIGH`.
     note_dir_high(entry);
+    dense::note_entry(entry);
     let want = DIR_WATCH.load(std::sync::atomic::Ordering::Relaxed);
     if want < 0 || want as u64 != page {
         return;
@@ -7233,6 +7257,8 @@ pub extern "C" fn gex_adopt_child(
     brk: i64,
 ) -> i64 {
     phase(1);
+    // The slot maps the copied low region names are the parent's.
+    dense::child();
     let ctx_addr = ctx_addr as u64;
     {
         let mut gm = GuestMem::new(guest_bytes());
@@ -7368,9 +7394,11 @@ pub extern "C" fn gex_adopt_child(
             coverage_snap: Vec::new(),
             registry: Vec::new(),
             registry_sums: Vec::new(),
+            registry_dense: Vec::new(),
             ever_threaded: false,
             shared: Default::default(),
             installed_mods: Default::default(),
+            dense_base: Default::default(),
             retired_pages: Default::default(),
             remiss: Default::default(),
             reuse_have: 0,
@@ -8537,6 +8565,16 @@ fn backfill_registry(h: &mut Host) {
         if unsafe { k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) } as usize != len {
             continue;
         }
+        // As this process installed it: at its dense base, or not at all.
+        let mut range = (0, 0);
+        if dense::on() {
+            if let Some(at) = gex_emit::dense::locate(&wasm) {
+                let Some(&base) = h.jit.dense_base.get(&id) else { continue };
+                gex_emit::dense::set_base(&mut wasm, &at, base);
+                range = (base, gex_emit::dense::section(&wasm, &at).map_or(0, |s| s.entries.len() as u32));
+            }
+        }
+        h.jit.registry_dense.push(range);
         wasm.shrink_to_fit();
         #[cfg(feature = "shared-memory")]
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -10473,6 +10511,29 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
+    // A block this process has (the slot names it in `blocks`) that this
+    // Worker has not instantiated: JavaScript catches up, then the dispatch
+    // is retried (`dense::missing`).
+    if dense::missing(pc) {
+        dense::want(pc);
+        if unsafe { TRACE_MISSES } {
+            trace_line(&format!("[gex] dense miss at pc={pc:#x}: index {} not in this Worker's blocks\n", dense::lookup(pc)));
+        }
+        if FILL_POSSIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+            // A module inherited lazily is instantiated by the fill path.
+            let page = gex_abi::dispatch_page(pc);
+            let width = FILL_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+            FILL_FROM.with(|c| c.set(((pc & 0xfff) >> gex_abi::DISPATCH_SHIFT) as u32 & !(width - 1)));
+            FILL_PC.with(|c| c.set(pc));
+            FILL_WANTED.with(|c| c.set(page as i64));
+            FILL_PENDING.with(|c| c.set(page as i64));
+        }
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
@@ -10940,16 +11001,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                         && SERVED_PAGE.0.borrow_mut().insert(page);
                     let bytes: Vec<&[u8]> = ready.iter().map(|(_, _, _, w)| w.as_slice()).collect();
                     match gex_xlate::merge::merge(&bytes) {
-                        Some(wasm) => h.jit.pending.push_back(PendingModule { dirs, slots, wasm: exact(wasm) }),
+                        Some(wasm) => push_pending(h, dirs, slots, wasm, 0),
                         None => {
                             // Not the shape the merger expects. One at a time
                             // rather than lose the code.
-                            for (_, s, d, w) in ready {
-                                h.jit.pending.push_back(PendingModule {
-                                    dirs: d,
-                                    slots: s,
-                                    wasm: exact(w),
-                                });
+                            for (id, s, d, w) in ready {
+                                push_pending(h, d, s, w, id);
                             }
                         }
                     }
@@ -11128,11 +11185,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // module), so the block at `pc` misses, re-translates, and misses
         // again forever. Reconcile it below, after the unit is installed.
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
-        h.jit.pending.push_back(PendingModule {
-            dirs: unit.dir_entries.clone(),
-            slots: unit.table_slots,
-            wasm: exact(unit.wasm),
-        });
+        push_pending(h, unit.dir_entries.clone(), unit.table_slots, unit.wasm, mod_id);
         publish_pending(h);
         // Point the guest directory at the slot this unit's block actually
         // lives in, for the faulting page only (minimal, to keep the shared
@@ -11519,11 +11572,7 @@ fn recompile_object(map: &gex_kernel::CodeMap) -> usize {
             }
         }
         for m in modules {
-            h.jit.pending.push_back(PendingModule {
-                dirs: m.dir_entries,
-                slots: m.table_slots,
-                wasm: exact(m.wasm),
-            });
+            push_pending(h, m.dir_entries, m.table_slots, m.wasm, 0);
         }
         publish_pending(h);
         produced
@@ -12301,6 +12350,11 @@ pub extern "C" fn gex_jit_installed() {
             publish_pending(h);
             return;
         };
+        // Its slots point at its blocks (`dense`), before the directory
+        // names its pages.
+        if let Some(d) = &done.dense {
+            dense::publish(d);
+        }
         let mut gm = GuestMem::new(guest_bytes());
         for (page, base) in done.dirs {
             // A page has ONE base per process. A served module built elsewhere
@@ -12361,6 +12415,7 @@ pub extern "C" fn gex_jit_installed() {
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
             h.jit.registry_sums.push(chunk_sums(&wasm));
             h.jit.registry.push(wasm);
+            h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
         }
         publish_pending(h);
     });

@@ -646,6 +646,10 @@ export async function runProgram(
       // because a trap that matters happens in a Worker, and a global set in
       // the page is not visible there.
       trapStack: globalThis.GEX_TRAP_STACK ? 1 : undefined,
+      // `?dense=0`: classic per-slot dispatch tables (gex_emit::dense off).
+      dense: globalThis.GEX_DENSE === 0 ? false : globalThis.GEX_DENSE === 2 ? 2 : undefined,
+      denseDebug: !!globalThis.GEX_DENSE_DEBUG,
+      traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?forkskip=N`, in `extra` because the process that acts on it is a
       // forked child, not the page's own.
       forkSkip: typeof globalThis.GEX_FORK_SKIP_MIB === 'number'

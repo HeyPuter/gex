@@ -392,6 +392,7 @@ async function handle(msg) {
   // thread (one whose wasm instantiate never completes) is visible. Off by
   // default -- it is one line per phase per thread. See threads-worker note.
   if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
+  if (msg.denseDebug) globalThis.GEX_DENSE_DEBUG = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
@@ -598,6 +599,7 @@ async function handle(msg) {
           // Top level as well as `opts`: a child's Worker gets the host's
           // `extra`, and pid 1's `opts` never reach it.
           link: msg.link ?? msg.opts?.link,
+          dense: msg.dense ?? msg.opts?.dense,
           wantLibrary,
         },
       );
