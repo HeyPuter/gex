@@ -949,6 +949,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtOpenDirectoryObject => object::nt_open_directory_object(c),
         n::NtQueryObject => object::nt_query_object(c),
         n::NtSetInformationObject => object::nt_set_information_object(c),
+        n::NtSetSecurityObject => object::nt_set_security_object(c),
         n::NtOpenSymbolicLinkObject => object::nt_open_symbolic_link_object(c),
         // -- files -----------------------------------------------------------
         n::NtCreateFile => file::nt_create_file(c),
