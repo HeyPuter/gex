@@ -21,7 +21,7 @@ pub const USAGE: &str = "  gexc eject <record-dir> --out <project> [--build] [--
                                    write the function tier's C for a function
                                    into user/src/ as an editable override
                                    (\"entry\" ABI), and print its eject.json entry
-  gexc eject run <project> [--jit-fallback] [--strace] [--verbose] [--] [args...]
+  gexc eject run <project> [--jit-fallback] [--strace] [--verbose] [--wayland-out P|null] [--] [args...]
                                    run it natively (the project's run.sh); code
                                    the build never saw fails loudly unless
                                    --jit-fallback";
@@ -47,6 +47,10 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     "--jit-fallback" => flags.jit_fallback = true,
                     "--strace" => flags.trace = true,
                     "--verbose" | "-v" => flags.verbose = true,
+                    "--wayland-out" => {
+                        i += 1;
+                        flags.display = Some(args.get(i).context("--wayland-out needs a file prefix or `null`")?.clone());
+                    }
                     "--" => {
                         rest.extend(args[i + 1..].iter().cloned());
                         flags.args = Some(Vec::new());
@@ -189,6 +193,20 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
 
 fn build(dir: &std::path::Path) -> Result<()> {
     let r = gex_eject::build::build(dir)?;
+    if let Some(pe) = &r.pe {
+        for (path, base, entries, bytes, how) in &pe.units {
+            eprintln!("  {path:<60} {base:#10x} {entries:>7} entries {:>7} KiB  {how}", bytes / 1024);
+        }
+        if !pe.providers.is_empty() {
+            eprintln!("  providers: {}", pe.providers.join(", "));
+        }
+        for (path, n, first) in &pe.uncovered {
+            let f: Vec<String> = first.iter().map(|a| format!("{a:#x}")).collect();
+            eprintln!("  warning: {path}: {n} addresses the session ran on tier-1 are not unit entries (first: {})", f.join(" "));
+        }
+        eprintln!("{}: built ({} files in build/rootfs; no run-time translation)", dir.display(), r.rootfs_files);
+        return Ok(());
+    }
     for i in &r.images {
         eprintln!("  {:<40} {:>7} blocks {:>7} KiB  {}", i.path, i.blocks, i.bytes / 1024, i.module);
     }
