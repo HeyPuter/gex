@@ -252,6 +252,9 @@ struct RunArgs {
     /// `--no-cgen`: a Windows program runs on tier-1 only, prebuilt units or
     /// not (`gex_native::nt_cgen::Mode`).
     no_cgen: bool,
+    /// `--mem64` / `--mem32`: the guest memory, overriding the learned
+    /// record (docs/mem64.md §5). `None`: the record decides.
+    mem64: Option<bool>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
@@ -267,6 +270,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut fjit = false;
     let mut fjit_image = false;
     let mut no_cgen = false;
+    let mut mem64 = None;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
     let mut i = 0;
@@ -346,6 +350,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--fjit-image" => fjit_image = true,
             "--no-cgen" => no_cgen = true,
             "--no-cache" => opts.cache = false,
+            "--mem64" => mem64 = Some(true),
+            "--mem32" => mem64 = Some(false),
             "--cwd" => {
                 i += 1;
                 let v = args.get(i).context("--cwd needs a directory")?;
@@ -411,6 +417,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         jit: !no_jit,
         wine_prefix,
         no_cgen,
+        mem64,
     })
 }
 
@@ -521,6 +528,42 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
     }
 }
 
+/// The guest memory for this run (docs/mem64.md §5): `--mem64`/`--mem32`,
+/// else what an earlier run of the same image learned. `wide` is whether
+/// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
+/// has a wasm32 memory.
+fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
+    if ra.mem64 == Some(true) && !wide {
+        bail!("--mem64: {} is a 32-bit program, which cannot address more than 4 GiB", ra.path);
+    }
+    let m64 = wide && ra.mem64.unwrap_or_else(|| gex_cache::mem64_recorded(bytes));
+    if m64 && ra.mem64.is_none() {
+        eprintln!("gex: {} runs with a 64-bit memory (an earlier run needed more than 4 GiB)", ra.path);
+    }
+    ra.opts.mem = if m64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 };
+    Ok(())
+}
+
+/// After a 64-bit guest's wasm32 run: if it ran out of address space,
+/// record it so the next start has a 64-bit memory (docs/mem64.md §5).
+fn learn_mem(ra: &RunArgs, bytes: &[u8], wide: bool) {
+    if !wide || ra.opts.mem.is_64() || ra.mem64 == Some(false) {
+        return;
+    }
+    let short = gex_kernel::mem::ADDRESS_SPACE_SHORT.load(std::sync::atomic::Ordering::Relaxed);
+    if short == 0 {
+        return;
+    }
+    if let Some(p) = gex_cache::record_mem64(bytes, &ra.path, short) {
+        eprintln!(
+            "gex: {} needs more than 4 GiB of address space (a request for {short:#x} bytes did not fit); \
+             it runs with --mem64 from the next start ({})",
+            ra.path,
+            p.display()
+        );
+    }
+}
+
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     prof::start();
     let mut ra = parse_run_args(args)?;
@@ -546,7 +589,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         } else {
             Mode::Default
         });
+        let wide = gex_kernel::nt::boot::exe_abi(&bytes).is_some_and(|a| a == gex_kernel::nt::Abi::P64);
+        choose_mem(&mut ra, &bytes, wide)?;
         let exit = nt_run::run(&ra, &bytes)?;
+        learn_mem(&ra, &bytes, wide);
         return Ok(report_exit(&exit, ra.opts.verbose));
     }
     // Resolved through the guest's namespace (the sysroot when given), so a
@@ -593,7 +639,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     if ra.opts.record.is_some() {
         gex_native::profile::set_exe_host_path(ra.path.clone().into());
     }
+    let wide = !program.compat();
+    choose_mem(&mut ra, &bytes, wide)?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
+    learn_mem(&ra, &bytes, wide);
     if let Some(dir) = gex_native::profile::finish(&exit)? {
         if ra.opts.verbose {
             eprintln!("[gex] profile and session manifest written to {}", dir.display());

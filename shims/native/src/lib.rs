@@ -139,11 +139,15 @@ pub struct RunOptions {
     /// `aot`). With it, an image is never translated: its module comes from
     /// the project, or the run fails.
     pub aot: Option<Arc<aot::Aot>>,
+    /// The guest memory (docs/mem64.md): wasm32 unless this process needs
+    /// more address space.
+    pub mem: gex_abi::MemFlavor,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
+            mem: gex_abi::MemFlavor::M32,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -523,6 +527,9 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
 
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
+    if opts.mem.is_64() {
+        bail!("a 64-bit guest memory (--mem64, docs/mem64.md) is not built yet");
+    }
     run_program_with(program, opts, xlate, None, None)
 }
 

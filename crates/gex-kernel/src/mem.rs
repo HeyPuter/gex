@@ -110,6 +110,21 @@ pub struct MemoryMap {
     /// reformatting on every read (measured half of an X server's time in
     /// `core::fmt` before this).
     generation: u64,
+    /// An M64 process's high arena, `[HIGH_ARENA_BASE, LIMIT64)`
+    /// (docs/mem64.md §3): non-executable mappings without a fixed address go
+    /// there. `None` for every M32 process, whose map behaves exactly as it
+    /// always has.
+    high: Option<(u64, u64)>,
+}
+
+/// Bytes an M32 process asked for and could not be given for lack of address
+/// space (not of memory): the run that sees it records the program for a
+/// 64-bit memory next time (docs/mem64.md §5). Zero until it happens.
+pub static ADDRESS_SPACE_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Note that an M32 process ran out of address space asking for `len` bytes.
+pub fn note_address_space_short(len: u64) {
+    ADDRESS_SPACE_SHORT.fetch_max(len.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether `[start, end)` touches guest memory the runtime owns but no VMA
@@ -145,6 +160,33 @@ impl MemoryMap {
             arena: Vec::new(),
             take: None,
             back: None,
+            high: None,
+        }
+    }
+
+    /// Give this process a 64-bit memory's high arena (docs/mem64.md §3).
+    pub fn set_high_arena(&mut self, lo: u64, hi: u64) {
+        self.high = Some((lo, hi));
+    }
+
+    /// The highest address a mapping may end at, exclusive.
+    fn limit(&self) -> u64 {
+        self.high.map_or(GUEST_LIMIT, |(_, hi)| hi)
+    }
+
+    /// First fit, bottom-up, in the high arena: the browser grows memory to
+    /// the highest address used, so low and dense is cheap.
+    fn find_high(&self, len: u64) -> Option<u64> {
+        let (lo, hi) = self.high?;
+        let mut candidate = lo;
+        loop {
+            if candidate + len > hi {
+                return None;
+            }
+            match self.vmas.iter().filter(|v| v.start < candidate + len && v.end > candidate).map(|v| v.end).max() {
+                Some(end) => candidate = page_align_up(end),
+                None => return Some(candidate),
+            }
         }
     }
 
@@ -301,6 +343,9 @@ impl MemoryMap {
         };
         let start = take(want);
         if start == 0 {
+            if self.high.is_none() {
+                note_address_space_short(len);
+            }
             return Err(Errno::ENOMEM);
         }
         // Join to the span below when adjacent rather than recording a second
@@ -507,7 +552,7 @@ impl MemoryMap {
                 return Err(Errno::EINVAL);
             }
             let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
-            if end > GUEST_LIMIT {
+            if end > self.limit() {
                 return Err(Errno::ENOMEM);
             }
             // `MAP_FIXED_NOREPLACE` (which wins over `MAP_FIXED`, as on
@@ -535,13 +580,25 @@ impl MemoryMap {
         // is not the runtime's.
         if addr != 0 && addr.is_multiple_of(PAGE_SIZE) {
             let end = addr.saturating_add(len);
-            if end <= GUEST_LIMIT
+            if end <= self.limit()
                 && self.is_free(addr, end)
                 && !hits_runtime(addr, end)
                 && self.claim(addr, end).is_ok()
             {
                 self.insert_from(addr, end, prot, name, origin);
                 return Ok(addr);
+            }
+        }
+
+        // Data in an M64 process goes to the high arena; code stays below
+        // MMAP_TOP, where the dispatch directory reaches.
+        if prot & prot::EXEC == 0 {
+            if let Some(start) = self.find_high(len) {
+                if let Some(back) = self.back {
+                    back(start + len).ok_or(Errno::ENOMEM)?;
+                }
+                self.insert_from(start, start + len, prot, name, origin);
+                return Ok(start);
             }
         }
 
@@ -577,6 +634,9 @@ impl MemoryMap {
         let mut candidate = self.mmap_next;
         loop {
             if candidate < len || candidate - len < MMAP_BOTTOM {
+                if self.high.is_none() {
+                    note_address_space_short(len);
+                }
                 return Err(Errno::ENOMEM);
             }
             let start = page_align_down(candidate - len);
@@ -631,7 +691,7 @@ impl MemoryMap {
             return Ok((addr, false));
         }
         let grown = addr + new_len;
-        if grown <= GUEST_LIMIT
+        if grown <= self.limit()
             && self.is_free(addr + old_len, grown)
             && !hits_runtime(addr + old_len, grown)
             && self.claim(addr + old_len, grown).is_ok()
@@ -685,6 +745,16 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        // Code in the high arena is beyond the dispatch directory's reach
+        // (docs/mem64.md §3): refused, loudly, until a sparse page table
+        // covers it.
+        if new_prot & prot::EXEC != 0 && self.high.is_some() && end > gex_abi::HIGH_ARENA_BASE {
+            eprintln!(
+                "gex: mprotect makes {addr:#x}..{end:#x} executable, above 4 GiB in a 64-bit memory: \
+                 not supported yet (docs/mem64.md)"
+            );
+            return Err(Errno::EACCES);
+        }
         let mut out = Vec::with_capacity(self.vmas.len() + 2);
         let mut touched = false;
         for v in std::mem::take(&mut self.vmas) {
@@ -1057,5 +1127,40 @@ mod tests {
         m.insert(0x1000_1000, 0x1000_2000, prot::READ, "b");
         assert!(m.check_access(0x1000_0800, 0x1000, prot::READ));
         assert!(!m.check_access(0x1000_1800, 0x1000, prot::READ));
+    }
+
+    /// docs/mem64.md §3: in an M64 process, data goes above 4 GiB, code stays
+    /// below MMAP_TOP, and a high page cannot become code.
+    #[test]
+    fn a_64_bit_memory_puts_data_in_the_high_arena() {
+        let mut m = MemoryMap::new(0x40_0000);
+        m.set_high_arena(gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64);
+        // Unity's reservations: 512 MiB - 4 KiB with no access, twenty of them.
+        let mut last = 0;
+        for _ in 0..20 {
+            let a = m.mmap(0, 0x1fff_f000, prot::NONE, 0, "res").unwrap();
+            assert!(a >= gex_abi::HIGH_ARENA_BASE && a + 0x1fff_f000 <= gex_abi::LIMIT64);
+            assert!(a > last);
+            last = a;
+        }
+        let code = m.mmap(0, 0x10000, prot::READ | prot::WRITE | prot::EXEC, 0, "jit").unwrap();
+        assert!(code < MMAP_TOP);
+        assert_eq!(m.protect(last, 0x1000, prot::READ | prot::EXEC), Err(Errno::EACCES));
+        assert!(m.protect(last, 0x1000, prot::READ | prot::WRITE).is_ok());
+        // A hint or a fixed address up to the 64-bit limit is honoured.
+        let fixed = 10u64 << 30;
+        assert_eq!(m.mmap(fixed, 0x1000, prot::READ, flags::FIXED, "f"), Ok(fixed));
+    }
+
+    /// An M32 map is unchanged, and running out of address space is recorded
+    /// for the next start (docs/mem64.md §5).
+    #[test]
+    fn a_32_bit_memory_records_running_out_of_address_space() {
+        let mut m = MemoryMap::new(0x40_0000);
+        let a = m.mmap(0, 0x1000, prot::READ, 0, "x").unwrap();
+        assert!(a < MMAP_TOP);
+        assert_eq!(m.mmap(1 << 33, 0x1000, prot::READ, flags::FIXED, "f"), Err(Errno::ENOMEM));
+        while m.mmap(0, 0x1fff_f000, prot::NONE, 0, "res").is_ok() {}
+        assert!(ADDRESS_SPACE_SHORT.load(std::sync::atomic::Ordering::Relaxed) >= 0x1fff_f000);
     }
 }

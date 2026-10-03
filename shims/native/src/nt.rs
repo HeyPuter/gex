@@ -63,6 +63,9 @@ pub fn clocks() -> nt::Clocks {
 
 /// Run a Windows program to completion.
 pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Result<(Exit, Stats)> {
+    if opts.mem.is_64() {
+        anyhow::bail!("a 64-bit guest memory (--mem64, docs/mem64.md) is not built yet");
+    }
     // Nothing is translated ahead of time: Wine's loader maps every image
     // itself, so all code arrives through the runtime translator.
     let mut exe = gex_ld::elf::headers_only(0, 0, 0, 0);

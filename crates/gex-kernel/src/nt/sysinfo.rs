@@ -167,7 +167,9 @@ fn write_basic_info(c: &mut Call<'_>, buf: u64, len: u64) -> R<u64> {
     c.g.w32(o!(MMHIGHESTPHYSICALPAGE), PHYS_PAGES as u32 - 1)?;
     c.g.w32(o!(ALLOCATIONGRANULARITY), 0x1_0000)?;
     c.g.wptr(o!(LOWESTUSERADDRESS), 0x1_0000)?;
-    c.g.wptr(o!(HIGHESTUSERADDRESS), HIGHEST_USER_ADDRESS)?;
+    // An M64 process's data reaches its high arena (docs/mem64.md).
+    let highest = c.p.st.lock().unwrap().vm.high.map_or(HIGHEST_USER_ADDRESS, |(_, hi)| hi - 1);
+    c.g.wptr(o!(HIGHESTUSERADDRESS), highest)?;
     c.g.wptr(o!(ACTIVEPROCESSORSAFFINITYMASK), (1u64 << PROCESSORS) - 1)?;
     c.g.w8(o!(NUMBEROFPROCESSORS), PROCESSORS as u8)?;
     Ok(size)
