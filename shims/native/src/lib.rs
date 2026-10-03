@@ -1432,6 +1432,24 @@ fn run_thread_loop(
                         continue;
                     }
                 }
+                // A wild pointer in a Linux guest with no SIGSEGV handler:
+                // the process dies of SIGSEGV, as it would natively (the
+                // translated code cannot say which instruction faulted, so a
+                // handler, which would resume there, is not run; that case
+                // stays a gex error below).
+                if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds))
+                    && store.data().nt.is_none()
+                {
+                    let action = store.data_mut().with_kernel(|k| k.signals.action(signal::SIGSEGV as u32));
+                    if action.handler == 0 {
+                        return Ok(Stopped::Exited(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc: 0,
+                            detail: "guest memory access out of bounds".into(),
+                            internal: false,
+                        }));
+                    }
+                }
                 return Err(classify_trap(e, store));
             }
         }
@@ -4438,7 +4456,26 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
             }
             other => format!("wasm trap: {other}"),
         };
-        return anyhow!("{detail} (pc≈0x{pc:x})");
+        // The innermost wasm frames name the guest code that trapped (each
+        // translated function is named after its guest address).
+        let frames = e
+            .downcast_ref::<wasmtime::WasmBacktrace>()
+            .map(|bt| {
+                bt.frames()
+                    .iter()
+                    .take(6)
+                    .map(|f| {
+                        let name = f.func_name().map(str::to_string).unwrap_or_else(|| format!("#{}", f.func_index()));
+                        match f.module().name() {
+                            Some(m) => format!("{m}:{name}"),
+                            None => name,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" < ")
+            })
+            .unwrap_or_default();
+        return anyhow!("{detail} (pc≈0x{pc:x}) [{frames}]");
     }
     e
 }

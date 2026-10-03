@@ -1646,8 +1646,6 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "27.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b79302e3e084713249cc5622e8608e7410afdeeea8c8026d04f491d1fab0b4b"
 dependencies = [
  "anyhow",
  "bitflags",
