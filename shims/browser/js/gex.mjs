@@ -3253,12 +3253,12 @@ export class Gex {
     // goes back to exactly this, never to the Worker's base.
     const sp = e.__stack_pointer.value;
     pc = pc < 0n ? pc + (1n << 64n) : pc;
-    let next = null;
+    let bypass = null;
     for (;;) {
       try {
-        if (next) {
-          const f = next;
-          next = null;
+        if (bypass) {
+          const f = bypass;
+          bypass = null;
           f(ctx);
         } else {
           this.#guest.exports.enter(ctx, pc);
@@ -3272,7 +3272,7 @@ export class Gex {
         const sig = this.#calloutSignal;
         this.#calloutSignal = null;
         if (sig?.kind === 'bypass' && sig.f) {
-          next = sig.f;
+          bypass = sig.f;
           continue;
         }
         // This callback's NtCallbackReturn, reached inside a call-out it
