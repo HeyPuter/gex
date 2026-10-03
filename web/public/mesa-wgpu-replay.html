@@ -21,6 +21,9 @@
   // so this is how the working floor gets found rather than guessed.
   const major = Number(query.get('major') || 0);
   const minor = Number(query.get('minor') || 0);
+  // `allowerrors=1`: a GL error does not stop the replay (an application's
+  // own stream has benign ones; gl-replay.mjs --allow-gl-errors).
+  const allowErrors = query.get('allowerrors') === '1';
 
   // Format is defined by crates/gex-gl/src/trace.rs.
   function parseTrace(bytes) {
@@ -120,9 +123,6 @@
     console.log('LIMITS ' + JSON.stringify(Object.fromEntries(
       limitNames.map((n) => [n, device.limits[n]]))));
 
-    const traceBytes = new Uint8Array(await (await fetch(tracePath)).arrayBuffer());
-    const trace = parseTrace(traceBytes);
-
     const { default: createModule } = await import('/gex/gex-wgpu-replay.js');
     const module = await createModule({
       preinitializedWebGPUDevice: device,
@@ -130,6 +130,11 @@
       print: (line) => console.log(line),
       printErr: (line) => console.error(line),
     });
+
+    // The trace after the module: a large one fetched first left the
+    // module's workers never loading.
+    const traceBytes = new Uint8Array(await (await fetch(tracePath)).arrayBuffer());
+    const trace = parseTrace(traceBytes);
 
     // Readback suspends the wasm stack, so every submit goes through JSPI.
     const submitRaw = WebAssembly.promising(module.gexGlSubmitRaw);
@@ -160,6 +165,8 @@
         failed = { index, reason: `decoder status ${status}` };
         break;
       }
+      if (index % 500 === 0) console.log(`BATCH ${index}/${trace.batches.length}`);
+      if (allowErrors) continue;
       // GET_ERROR, so a GL error is attributed to the batch that caused it.
       if (await submit(command(131)) === 0) {
         const bytes = reply();

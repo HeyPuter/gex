@@ -1598,6 +1598,13 @@ impl Kernel {
                 }
             };
             let sp = stack.wrapping_add(stack_size);
+            // An i386 caller's `tls` is a `struct user_desc *`, as for its
+            // `clone` (`crate::i386`): the base is its second word.
+            let tls = if self.compat && !gex_abi::PPC && flags & clone_flags::SETTLS != 0 && tls != 0 {
+                m.read_u32(tls + 4).map(|b| b as u64).unwrap_or(0)
+            } else {
+                tls
+            };
             if flags & clone_flags::THREAD == 0 {
                 let pid = self.procs.spawn(self.pid);
                 let _ = set_result(m, self.ctx_addr, pid as u64);
@@ -5486,13 +5493,47 @@ impl Kernel {
         Ok(0)
     }
 
-    /// A `struct cmsghdr` is a length, a level, a type, then the payload,
-    /// with every field and the whole header aligned to a pointer.
-    const CMSG_ALIGN: u64 = 8;
-    const CMSG_HDR: u64 = 16;
+    /// A `struct cmsghdr` is a length (a `size_t`), a level, a type, then
+    /// the payload, with the whole header aligned to a pointer: 16 bytes,
+    /// or 12 for an i386 process. `msghdr`, `iovec` and `mmsghdr` are
+    /// pointer-sized fields too ([`Self::msg_word`]).
+    fn cmsg_hdr(&self) -> u64 {
+        if self.compat {
+            12
+        } else {
+            16
+        }
+    }
 
-    fn cmsg_align(n: u64) -> u64 {
-        n.div_ceil(Self::CMSG_ALIGN) * Self::CMSG_ALIGN
+    fn cmsg_align(&self, n: u64) -> u64 {
+        let a = self.msg_word();
+        n.div_ceil(a) * a
+    }
+
+    /// The pointer and `size_t` width of the message structures.
+    fn msg_word(&self) -> u64 {
+        if self.compat {
+            4
+        } else {
+            8
+        }
+    }
+
+    /// The `i`th pointer-sized word of a message structure at `at`.
+    fn msg_rd(&self, m: &GuestMem<'_>, at: u64, i: u64) -> Result<u64, Errno> {
+        if self.compat {
+            Ok(m.read_u32(at + 4 * i)? as u64)
+        } else {
+            m.read_u64(at + 8 * i)
+        }
+    }
+
+    fn msg_wr(&self, m: &mut GuestMem<'_>, at: u64, i: u64, v: u64) -> Result<(), Errno> {
+        if self.compat {
+            m.write_u32(at + 4 * i, v as u32)
+        } else {
+            m.write_u64(at + 8 * i, v)
+        }
     }
 
     /// Collect the descriptors a `sendmsg` is passing.
@@ -5508,23 +5549,24 @@ impl Kernel {
     ) -> Result<Vec<Arc<OpenFile>>, Errno> {
         const SOL_SOCKET: u32 = 1;
         const SCM_RIGHTS: u32 = 1;
+        let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
         let mut out = Vec::new();
         let mut at = 0u64;
-        while at + Self::CMSG_HDR <= len {
-            let cmsg_len = m.read_u64(control + at)?;
-            if cmsg_len < Self::CMSG_HDR || at + cmsg_len > len {
+        while at + hdr <= len {
+            let cmsg_len = self.msg_rd(m, control + at, 0)?;
+            if cmsg_len < hdr || at + cmsg_len > len {
                 break;
             }
-            let level = m.read_u32(control + at + 8)?;
-            let ty = m.read_u32(control + at + 12)?;
+            let level = m.read_u32(control + at + w)?;
+            let ty = m.read_u32(control + at + w + 4)?;
             if level == SOL_SOCKET && ty == SCM_RIGHTS {
-                let n = (cmsg_len - Self::CMSG_HDR) / 4;
+                let n = (cmsg_len - hdr) / 4;
                 for i in 0..n.min(253) {
-                    let fd = m.read_u32(control + at + Self::CMSG_HDR + i * 4)? as i32;
+                    let fd = m.read_u32(control + at + hdr + i * 4)? as i32;
                     out.push(self.fds.get(fd)?);
                 }
             }
-            at += Self::cmsg_align(cmsg_len);
+            at += self.cmsg_align(cmsg_len);
         }
         Ok(out)
     }
@@ -5546,17 +5588,18 @@ impl Kernel {
         if files.is_empty() || control == 0 {
             return Ok(0);
         }
+        let (hdr, w) = (self.cmsg_hdr(), self.msg_word());
         let payload = files.len() as u64 * 4;
-        let cmsg_len = Self::CMSG_HDR + payload;
+        let cmsg_len = hdr + payload;
         if cmsg_len > len {
             return Ok(0);
         }
-        m.write_u64(control, cmsg_len)?;
-        m.write_u32(control + 8, SOL_SOCKET)?;
-        m.write_u32(control + 12, SCM_RIGHTS)?;
+        self.msg_wr(m, control, 0, cmsg_len)?;
+        m.write_u32(control + w, SOL_SOCKET)?;
+        m.write_u32(control + w + 4, SCM_RIGHTS)?;
         for (i, f) in files.into_iter().enumerate() {
             let fd = self.fds.insert(f, false)?;
-            m.write_u32(control + Self::CMSG_HDR + i as u64 * 4, fd as u32)?;
+            m.write_u32(control + hdr + i as u64 * 4, fd as u32)?;
         }
         Ok(cmsg_len)
     }
@@ -5566,7 +5609,7 @@ impl Kernel {
     fn sys_sendmsg(&mut self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
         // `msg_name` is where this one goes, and a reply has to be reported
         // as having come from there or a resolver drops it as spoofed.
-        let name = m.read_u64(msg)?;
+        let name = self.msg_rd(m, msg, 0)?;
         if name != 0 {
             if let Ok(sock) = self.socket_of(fd) {
                 let bytes = m.read(name, 16)?.to_vec();
@@ -5575,12 +5618,12 @@ impl Kernel {
                 }
             }
         }
-        let iov = m.read_u64(msg + 16)?;
-        let iovlen = m.read_u64(msg + 24)?;
+        let iov = self.msg_rd(m, msg, 2)?;
+        let iovlen = self.msg_rd(m, msg, 3)?;
         let mut data = Vec::new();
         for i in 0..iovlen.min(1024) {
-            let base = m.read_u64(iov + i * 16)?;
-            let len = m.read_u64(iov + i * 16 + 8)? as usize;
+            let base = self.msg_rd(m, iov, 2 * i)?;
+            let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
             if len > 0 {
                 data.extend_from_slice(m.read(base, len.min(1 << 22))?);
             }
@@ -5588,9 +5631,9 @@ impl Kernel {
         // Ancillary data, which for a unix socket may be descriptors. Staged
         // on the socket rather than passed down, so the send attaches them to
         // the first byte it writes and a send that fails attaches nothing.
-        let control = m.read_u64(msg + 32)?;
-        let controllen = m.read_u64(msg + 40)?;
-        if control != 0 && controllen >= Self::CMSG_HDR {
+        let control = self.msg_rd(m, msg, 4)?;
+        let controllen = self.msg_rd(m, msg, 5)?;
+        if control != 0 && controllen >= self.cmsg_hdr() {
             if let Ok(sock) = self.unix_of(fd) {
                 let files = self.read_scm_rights(m, control, controllen)?;
                 sock.stage_send(files);
@@ -5599,19 +5642,27 @@ impl Kernel {
         self.fds.get(fd)?.write(&data)
     }
 
-    /// One `struct mmsghdr` is a `msghdr` and the length it carried.
-    const MMSGHDR: u64 = 64;
+    /// One `struct mmsghdr` is a `msghdr` and the length it carried: 64
+    /// bytes with the length at 56, or 32 with it at 28 for i386.
+    fn mmsghdr(&self) -> (u64, u64) {
+        if self.compat {
+            (32, 28)
+        } else {
+            (64, 56)
+        }
+    }
 
     /// `sendmmsg`: several datagrams in one call. glibc's resolver sends its A
     /// and AAAA queries this way and does not fall back to `sendto` on
     /// `ENOSYS`, so it must be real or name resolution fails.
     fn sys_sendmmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, vec: u64, n: u64) -> SysResult {
+        let (size, len_at) = self.mmsghdr();
         let mut sent = 0u64;
         for i in 0..n.min(1024) {
-            let hdr = vec + i * Self::MMSGHDR;
+            let hdr = vec + i * size;
             match self.sys_sendmsg(m, fd, hdr) {
                 Ok(len) => {
-                    m.write_u32(hdr + 56, len as u32)?;
+                    m.write_u32(hdr + len_at, len as u32)?;
                     sent += 1;
                 }
                 // A failure on the first is the call's failure; after that
@@ -5631,12 +5682,13 @@ impl Kernel {
         n: u64,
         flags: u64,
     ) -> SysResult {
+        let (size, len_at) = self.mmsghdr();
         let mut got = 0u64;
         for i in 0..n.min(1024) {
-            let hdr = vec + i * Self::MMSGHDR;
+            let hdr = vec + i * size;
             match self.sys_recvmsg(m, fd, hdr, flags) {
                 Ok(len) => {
-                    m.write_u32(hdr + 56, len as u32)?;
+                    m.write_u32(hdr + len_at, len as u32)?;
                     got += 1;
                     // A datagram socket delivers one message per call; if
                     // this one came up short there is nothing else waiting.
@@ -5659,23 +5711,23 @@ impl Kernel {
 
     fn sys_recvmsg(&mut self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
         let peek = flags & Self::MSG_PEEK != 0;
-        let iov = m.read_u64(msg + 16)?;
-        let iovlen = m.read_u64(msg + 24)?;
-        let control = m.read_u64(msg + 32)?;
-        let controllen = m.read_u64(msg + 40)?;
+        let iov = self.msg_rd(m, msg, 2)?;
+        let iovlen = self.msg_rd(m, msg, 3)?;
+        let control = self.msg_rd(m, msg, 4)?;
+        let controllen = self.msg_rd(m, msg, 5)?;
         // How many descriptors the caller left room for. A reader that offers
         // no room leaves them queued for the next call rather than losing
         // them, which is what Wayland's two-stage read depends on.
-        let room = if control != 0 && controllen >= Self::CMSG_HDR {
-            ((controllen - Self::CMSG_HDR) / 4) as usize
+        let room = if control != 0 && controllen >= self.cmsg_hdr() {
+            ((controllen - self.cmsg_hdr()) / 4) as usize
         } else {
             0
         };
         let unix_sock = self.unix_of(fd).ok();
         let mut total = 0u64;
         for i in 0..iovlen.min(1024) {
-            let base = m.read_u64(iov + i * 16)?;
-            let len = m.read_u64(iov + i * 16 + 8)? as usize;
+            let base = self.msg_rd(m, iov, 2 * i)?;
+            let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
             if len == 0 {
                 continue;
             }
@@ -5694,7 +5746,7 @@ impl Kernel {
         }
         let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
         let written = self.write_scm_rights(m, control, controllen, received)?;
-        m.write_u64(msg + 40, written)?;
+        self.msg_wr(m, msg, 5, written)?;
         Ok(total)
     }
 

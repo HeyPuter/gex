@@ -71,7 +71,7 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
     let program = Program { exe, interp: None };
     let mut opts = opts.clone();
     opts.jit = true;
-    super::nt_cgen::enable()?;
+    super::nt_cgen::enable(opts.record.is_some())?;
     let mut setup = setup.clone();
     if setup.display_out.is_none() {
         setup.display_out = opts.wayland_out.clone();
@@ -201,6 +201,10 @@ impl nt::display::NtDisplay for PpmDisplay {
         }
         let mut st = self.state.lock().unwrap();
         st.windows.insert(s.id, (s.x, s.y, w, h, px));
+        if st.written % crate::ppm_every() as u64 != 0 {
+            st.written += 1;
+            return;
+        }
         // The bounding box of what is shown, composited in id order.
         let (mut l, mut t, mut r, mut b) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         for (x, y, w, h, _) in st.windows.values() {

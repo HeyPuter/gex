@@ -394,6 +394,9 @@ pub struct Config {
     /// End the process on an unimplemented call instead of returning
     /// `STATUS_NOT_IMPLEMENTED`.
     pub strict: bool,
+    /// gex's own `GEX_*` settings the host was given for the program (a
+    /// page's `env=`), which stay out of its Windows environment.
+    pub settings: Vec<(String, String)>,
 }
 
 /// NT-side process state. Shared by all the process's threads.
@@ -439,6 +442,8 @@ pub struct Process {
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
+    /// The display mode, `user::sysparams::Mode` packed (ChangeDisplaySettings).
+    pub display_mode: AtomicU64,
 }
 
 #[derive(Default)]
@@ -457,6 +462,9 @@ pub struct State {
     pub images: std::collections::BTreeMap<u64, section::ImageView>,
     /// Writable views of file-backed sections, by base, to write back.
     pub file_views: std::collections::BTreeMap<u64, section::FileView>,
+    /// Views that share another view's pages, by that view's base: how many
+    /// more unmaps it takes to unmap it (`section::map_view`).
+    pub shared_views: std::collections::BTreeMap<u64, u32>,
     /// The prefix's staged image layout, if it has one (`section::Layout`).
     pub layout: Option<std::sync::Arc<section::Layout>>,
 }
@@ -480,6 +488,13 @@ pub mod gex_nr {
 }
 
 impl Process {
+    /// A gex setting (`GEX_NT_INPUT` and the like): the host's environment,
+    /// or else what the host passed in `Config::settings`. A page has no
+    /// environment of its own, only what it gives the program.
+    pub fn setting(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok().or_else(|| self.cfg.settings.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()))
+    }
+
     pub fn new(abi: Abi, pid: u32, cfg: Config, clocks: Clocks, futexes: Arc<FutexTable>) -> Process {
         Process {
             abi,
@@ -492,6 +507,7 @@ impl Process {
                 vm: vm::Vm::new(),
                 images: Default::default(),
                 file_views: Default::default(),
+                shared_views: Default::default(),
                 layout: None,
             }),
             threads: RwLock::new(Threads::default()),
@@ -513,6 +529,7 @@ impl Process {
             display_host: Mutex::new(None),
             presents: AtomicU64::new(0),
             kill_list: Mutex::new(Vec::new()),
+            display_mode: AtomicU64::new(user::sysparams::Mode::DEFAULT.pack()),
         }
     }
 
@@ -944,6 +961,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtOpenDirectoryObject => object::nt_open_directory_object(c),
         n::NtQueryObject => object::nt_query_object(c),
         n::NtSetInformationObject => object::nt_set_information_object(c),
+        n::NtSetSecurityObject => object::nt_set_security_object(c),
         n::NtOpenSymbolicLinkObject => object::nt_open_symbolic_link_object(c),
         // -- files -----------------------------------------------------------
         n::NtCreateFile => file::nt_create_file(c),

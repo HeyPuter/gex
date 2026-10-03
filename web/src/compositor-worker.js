@@ -1328,6 +1328,8 @@ async function startGl(m, canvas) {
   glDevice = await MesaGlDevice.create(glTarget, {
     url: m.url,
     api: m.api || 'core',
+    env: m.mesaEnv,
+    capture: m.glCapture,
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
   glPresentCanvas = glTarget;

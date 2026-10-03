@@ -18,6 +18,7 @@
 //! other GL function fails loudly by name. All of the process's contexts
 //! share the one host context, as if created with wglShareLists.
 
+pub mod generated;
 pub mod table;
 
 use super::gdi::{self, Obj};
@@ -47,6 +48,8 @@ struct Params {
     offs: [u64; MAX_PARAMS],
     /// How many there are (the last is the return value's slot).
     n: usize,
+    /// The field kinds (`table::FUNCS`).
+    sig: &'static str,
 }
 
 /// More than any opengl32 unix call takes (25 at most).
@@ -122,11 +125,13 @@ struct PixelStore {
     row_length: u32,
     skip_pixels: u32,
     skip_rows: u32,
+    image_height: u32,
+    skip_images: u32,
 }
 
 impl Default for PixelStore {
     fn default() -> Self {
-        PixelStore { alignment: 4, row_length: 0, skip_pixels: 0, skip_rows: 0 }
+        PixelStore { alignment: 4, row_length: 0, skip_pixels: 0, skip_rows: 0, image_height: 0, skip_images: 0 }
     }
 }
 
@@ -150,6 +155,42 @@ const COLOR: usize = 1;
 /// Texture coordinates for units 0..8 are `TEXCOORD + unit`.
 const TEXCOORD: usize = 2;
 const ARRAYS: usize = TEXCOORD + 8;
+/// The other fixed-function arrays, after the texture coordinates.
+const NORMAL: usize = ARRAYS;
+const SECONDARY: usize = ARRAYS + 1;
+const FOG: usize = ARRAYS + 2;
+const FIXED_ARRAYS: usize = ARRAYS + 3;
+/// Generic vertex attributes kept (GL_MAX_VERTEX_ATTRIBS is at least 16).
+const ATTRIBS: usize = 16;
+
+/// A generic vertex attribute array (glVertexAttribPointer and its integer
+/// and double forms).
+#[derive(Clone, Copy, Default)]
+struct Attrib {
+    enabled: bool,
+    size: i32,
+    ty: u32,
+    normalized: bool,
+    stride: i32,
+    pointer: u64,
+    buffer: u32,
+    scratch: u32,
+    /// 0 glVertexAttribPointer, 1 the I form, 2 the L form.
+    kind: u8,
+    divisor: u32,
+}
+
+/// A buffer mapped into guest memory (glMapBuffer*): a copy, written back
+/// at unmap or flush.
+#[derive(Clone, Copy)]
+struct Mapping {
+    target: u32,
+    addr: u64,
+    offset: u64,
+    len: u64,
+    write: bool,
+    explicit_flush: bool,
+}
 
 /// A guest context (`struct opengl_client_context` in guest memory).
 struct Ctx {
@@ -187,9 +228,20 @@ pub struct State {
     attached: u32,
     unpack: PixelStore,
     pack: PixelStore,
-    arrays: [Array; ARRAYS],
+    arrays: [Array; FIXED_ARRAYS],
+    attribs: [Attrib; ATTRIBS],
+    /// Every buffer target's binding (GL_ARRAY_BUFFER's is `array_buffer`
+    /// too), for mapping.
+    bound: HashMap<u32, u32>,
+    /// Mapped buffers by name, and the copies' allocations by name for reuse.
+    maps: HashMap<u32, Mapping>,
+    map_memory: HashMap<u32, (u64, u64)>,
+    /// Our upload buffer for client-memory indices.
+    element_scratch: u32,
     client_texture: usize,
     array_buffer: u32,
+    /// GL_PIXEL_UNPACK_BUFFER's binding: pixel data is an offset into it.
+    unpack_buffer: u32,
     element_buffer: u32,
     read_fbo: u32,
     swap_interval: i32,
@@ -218,9 +270,15 @@ impl Default for State {
             attached: 0,
             unpack: PixelStore::default(),
             pack: PixelStore::default(),
-            arrays: [Array::default(); ARRAYS],
+            arrays: [Array::default(); FIXED_ARRAYS],
+            attribs: [Attrib::default(); ATTRIBS],
+            bound: HashMap::new(),
+            maps: HashMap::new(),
+            map_memory: HashMap::new(),
+            element_scratch: 0,
             client_texture: 0,
             array_buffer: 0,
+            unpack_buffer: 0,
             element_buffer: 0,
             read_fbo: 0,
             swap_interval: 1,
@@ -591,6 +649,8 @@ fn set_store(s: &mut State, pname: u32, v: i32) {
         0x0cf2 => s.unpack.row_length = v,
         0x0cf4 => s.unpack.skip_pixels = v,
         0x0cf3 => s.unpack.skip_rows = v,
+        0x806e => s.unpack.image_height = v,
+        0x806d => s.unpack.skip_images = v,
         0x0d05 => s.pack.alignment = v,
         0x0d02 => s.pack.row_length = v,
         0x0d04 => s.pack.skip_pixels = v,
@@ -683,12 +743,18 @@ fn sync_client(c: &mut Call<'_>, client: u64) -> R<()> {
     let mut nums = version.split(|ch: char| !ch.is_ascii_digit()).filter(|x| !x.is_empty());
     let major: i32 = nums.next().and_then(|x| x.parse().ok()).unwrap_or(1);
     let minor: i32 = nums.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    // No newer than what this serves every command of.
+    let (major, minor) = (major, minor).min(generated::MAX_VERSION);
     c.g.w32(client + f::MAJOR_VERSION, major as u32)?;
     c.g.w32(client + f::MINOR_VERSION, minor as u32)?;
     c.g.w32(client + f::CONTEXT_FLAGS, 0)?;
     c.g.w32(client + f::PROFILE_MASK, if major >= 3 && (major > 3 || minor >= 2) { 2 } else { 0 })?; // compatibility
     let mut on = vec![false; table::EXTENSIONS.len()];
     for name in exts.split_ascii_whitespace() {
+        // Only those whose every command is served here.
+        if generated::CLAIMABLE.binary_search(&name).is_err() {
+            continue;
+        }
         if let Some(i) = table::EXTENSIONS[..table::WGL_FIRST_EXTENSION].iter().position(|e| *e == name) {
             on[i] = true;
         }
@@ -856,49 +922,291 @@ fn finish_swap(c: &mut Call<'_>, hdc: u32, hwnd: u32) -> R<bool> {
 /// Upload each enabled client-memory array for a draw reaching `vertices`
 /// elements, and point GL at the copies.
 fn upload_arrays(c: &mut Call<'_>, vertices: usize) -> R<()> {
-    let (arrays, bound) = {
-        let s = c.p.gl.lock().unwrap();
-        (s.arrays, s.array_buffer)
+    upload_arrays_instanced(c, vertices, 1)
+}
+
+/// The opcode of a pointer command (`generated::POINTER_PLANS`).
+fn pointer_op(name: &str) -> u32 {
+    generated::POINTER_PLANS.binary_search_by(|e| e.0.cmp(name)).map(|i| generated::POINTER_PLANS[i].1).unwrap_or(0)
+}
+
+/// Send fixed array `i`'s pointer, as `offset` into the bound array buffer.
+fn send_array_pointer(c: &mut Call<'_>, i: usize, a: &Array, offset: u64) -> R<()> {
+    let [lo, hi] = proto::Batch::words64(offset);
+    let (size, ty, stride) = (a.size as u32, a.ty, a.stride as u32);
+    match i {
+        VERTEX => cmd(c, op::VERTEX_POINTER, &[size, ty, stride, lo, hi], &[]),
+        COLOR => cmd(c, op::COLOR_POINTER, &[size, ty, stride, lo, hi], &[]),
+        NORMAL => cmd(c, pointer_op("glNormalPointer"), &[ty, stride, lo, hi], &[]),
+        SECONDARY => cmd(c, pointer_op("glSecondaryColorPointer"), &[size, ty, stride, lo, hi], &[]),
+        FOG => cmd(c, pointer_op("glFogCoordPointer"), &[ty, stride, lo, hi], &[]),
+        _ => {
+            cmd(c, op::CLIENT_ACTIVE_TEXTURE, &[0x84c0 + (i - TEXCOORD) as u32], &[])?;
+            cmd(c, op::TEX_COORD_POINTER, &[size, ty, stride, lo, hi], &[])
+        }
+    }
+}
+
+/// Send generic attribute `i`'s pointer, as `offset` into the bound array
+/// buffer.
+fn send_attrib_pointer(c: &mut Call<'_>, i: usize, a: &Attrib, offset: u64) -> R<()> {
+    let [lo, hi] = proto::Batch::words64(offset);
+    let (idx, size, ty, stride) = (i as u32, a.size as u32, a.ty, a.stride as u32);
+    match a.kind {
+        0 => cmd(c, pointer_op("glVertexAttribPointer"), &[idx, size, ty, a.normalized as u32, stride, lo, hi], &[]),
+        1 => cmd(c, pointer_op("glVertexAttribIPointer"), &[idx, size, ty, stride, lo, hi], &[]),
+        _ => cmd(c, pointer_op("glVertexAttribLPointer"), &[idx, size, ty, stride, lo, hi], &[]),
+    }
+}
+
+/// Copy `bytes` of client memory at `pointer` into scratch buffer `*scratch`
+/// (made on first use), left bound to GL_ARRAY_BUFFER.
+fn upload_scratch(c: &mut Call<'_>, scratch: u32, target: u32, data: &[u8]) -> R<u32> {
+    let scratch = if scratch != 0 {
+        scratch
+    } else {
+        let n = take_name(c);
+        cmd(c, op::GEN_BUFFERS, &[1, n], &[])?;
+        n
     };
+    cmd(c, op::BIND_BUFFER, &[target, scratch], &[])?;
+    let [lo, hi] = proto::Batch::words64(data.len() as u64);
+    cmd_blob(c, op::BUFFER_DATA, &[target, 0x88e8, lo, hi, 1], data)?; // GL_DYNAMIC_DRAW
+    Ok(scratch)
+}
+
+/// Client-memory arrays (fixed and generic) copied into buffers of ours for
+/// a draw reaching `vertices` vertices and `instances` instances.
+fn upload_arrays_instanced(c: &mut Call<'_>, vertices: usize, instances: usize) -> R<()> {
+    let (arrays, attribs, bound) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.arrays, s.attribs, s.array_buffer)
+    };
+    const GL_ARRAY_BUFFER: u32 = 0x8892;
     let mut rebound = false;
     for (i, a) in arrays.iter().enumerate() {
         if !a.enabled || a.buffer != 0 || a.pointer == 0 || vertices == 0 {
             continue;
         }
-        let elem = element_bytes(a.size, a.ty);
+        let elem = element_bytes(if i == NORMAL { 3 } else if i == FOG { 1 } else { a.size }, a.ty);
         if elem == 0 {
             return Err(c.unimplemented(&format!("a client array of type {:#x}", a.ty)));
         }
         let stride = if a.stride > 0 { a.stride as usize } else { elem };
-        let bytes = (vertices - 1) * stride + elem;
-        let data = c.g.bytes(a.pointer, bytes)?;
-        let scratch = if a.scratch != 0 {
-            a.scratch
-        } else {
-            let n = take_name(c);
-            c.p.gl.lock().unwrap().arrays[i].scratch = n;
-            cmd(c, op::GEN_BUFFERS, &[1, n], &[])?;
-            n
-        };
-        const GL_ARRAY_BUFFER: u32 = 0x8892;
-        cmd(c, op::BIND_BUFFER, &[GL_ARRAY_BUFFER, scratch], &[])?;
+        let data = c.g.bytes(a.pointer, (vertices - 1) * stride + elem)?;
+        let scratch = upload_scratch(c, a.scratch, GL_ARRAY_BUFFER, &data)?;
+        c.p.gl.lock().unwrap().arrays[i].scratch = scratch;
         rebound = true;
-        let [lo, hi] = proto::Batch::words64(bytes as u64);
-        cmd_blob(c, op::BUFFER_DATA, &[GL_ARRAY_BUFFER, 0x88e8, lo, hi, 1], &data)?; // GL_DYNAMIC_DRAW
-        let opcode = match i {
-            VERTEX => op::VERTEX_POINTER,
-            COLOR => op::COLOR_POINTER,
-            _ => {
-                cmd(c, op::CLIENT_ACTIVE_TEXTURE, &[0x84c0 + (i - TEXCOORD) as u32], &[])?;
-                op::TEX_COORD_POINTER
-            }
-        };
-        cmd(c, opcode, &[a.size as u32, a.ty, a.stride as u32, 0, 0], &[])?;
+        send_array_pointer(c, i, a, 0)?;
+    }
+    for (i, a) in attribs.iter().enumerate() {
+        if !a.enabled || a.buffer != 0 || a.pointer == 0 || vertices == 0 {
+            continue;
+        }
+        let elem = attrib_bytes(a.size, a.ty);
+        if elem == 0 {
+            return Err(c.unimplemented(&format!("a client vertex attribute of type {:#x}", a.ty)));
+        }
+        let stride = if a.stride > 0 { a.stride as usize } else { elem };
+        let count = if a.divisor == 0 { vertices } else { instances.div_ceil(a.divisor as usize).max(1) };
+        let data = c.g.bytes(a.pointer, (count - 1) * stride + elem)?;
+        let scratch = upload_scratch(c, a.scratch, GL_ARRAY_BUFFER, &data)?;
+        c.p.gl.lock().unwrap().attribs[i].scratch = scratch;
+        rebound = true;
+        send_attrib_pointer(c, i, a, 0)?;
     }
     if rebound {
-        cmd(c, op::BIND_BUFFER, &[0x8892, bound], &[])?;
+        cmd(c, op::BIND_BUFFER, &[GL_ARRAY_BUFFER, bound], &[])?;
         let unit = c.p.gl.lock().unwrap().client_texture;
         cmd(c, op::CLIENT_ACTIVE_TEXTURE, &[0x84c0 + unit as u32], &[])?;
+    }
+    Ok(())
+}
+
+/// Whether any enabled array is in client memory.
+fn client_arrays(c: &Call<'_>) -> bool {
+    let s = c.p.gl.lock().unwrap();
+    s.arrays.iter().any(|a| a.enabled && a.buffer == 0 && a.pointer != 0)
+        || s.attribs.iter().any(|a| a.enabled && a.buffer == 0 && a.pointer != 0)
+}
+
+/// A generic attribute's element: `size` components of `ty` (the packed
+/// types are one 4-byte element; GL_BGRA as a size is four).
+fn attrib_bytes(size: i32, ty: u32) -> usize {
+    match ty {
+        0x8d9f | 0x8368 | 0x8c3b => 4, // INT_2_10_10_10_REV, UNSIGNED_INT_2_10_10_10_REV, 10F_11F_11F
+        _ => element_bytes(size, ty),
+    }
+}
+
+/// glDrawElements and its family: `vals` are the command's parameters in
+/// its plan's order, the indices pointer at `at`. Client-memory indices are
+/// uploaded to a buffer of ours, and client arrays as far as they reach.
+fn draw_elements(c: &mut Call<'_>, name: &str, mut vals: Vec<u64>, at: usize, count: i32, ty: u32, base_vertex: i64, instances: usize) -> R<()> {
+    let (element_buffer, scratch) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.element_buffer, s.element_scratch)
+    };
+    let size = match ty {
+        0x1401 => 1,
+        0x1403 => 2,
+        0x1405 => 4,
+        _ => 0,
+    };
+    let pointer = vals[at];
+    let client_indices = element_buffer == 0 && pointer != 0 && count > 0 && size > 0;
+    let mut indices = Vec::new();
+    if client_indices {
+        indices = c.g.bytes(pointer, count as usize * size)?;
+    } else if element_buffer != 0 && count > 0 && size > 0 && client_arrays(c) {
+        // The indices are the host's; read back as far as the draw goes to
+        // know how much of the client arrays it reaches.
+        let mut r = ask_plan(c, "glGetBufferSubData", &[0x8893, pointer, (count as usize * size) as u64, 0])?;
+        indices = r.blob();
+    }
+    if !indices.is_empty() {
+        let max = indices
+            .chunks_exact(size)
+            .map(|x| match size {
+                1 => x[0] as u64,
+                2 => u16::from_le_bytes([x[0], x[1]]) as u64,
+                _ => u32::from_le_bytes([x[0], x[1], x[2], x[3]]) as u64,
+            })
+            .max()
+            .unwrap_or(0);
+        let reach = (max as i64 + 1 + base_vertex).max(0) as usize;
+        upload_arrays_instanced(c, reach, instances)?;
+    }
+    if client_indices {
+        const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+        let n = upload_scratch(c, scratch, GL_ELEMENT_ARRAY_BUFFER, &indices)?;
+        c.p.gl.lock().unwrap().element_scratch = n;
+        vals[at] = 0;
+        send_pointer_plan(c, name, &vals)?;
+        cmd(c, op::BIND_BUFFER, &[GL_ELEMENT_ARRAY_BUFFER, 0], &[])?;
+        return Ok(());
+    }
+    send_pointer_plan(c, name, &vals)
+}
+
+/// Send pointer command `name` (`generated::POINTER_PLANS`) with `vals`,
+/// its parameters, a pointer as its offset.
+fn send_pointer_plan(c: &mut Call<'_>, name: &str, vals: &[u64]) -> R<()> {
+    let Ok(i) = generated::POINTER_PLANS.binary_search_by(|e| e.0.cmp(name)) else {
+        return Err(c.unimplemented(&format!("opengl32 {name}")));
+    };
+    let (_, opcode, plan) = generated::POINTER_PLANS[i];
+    let mut words = Vec::new();
+    for (t, v) in parse_plan(plan)[1..].iter().zip(vals) {
+        match t.kind {
+            b'q' | b'P' => words.extend([*v as u32, (*v >> 32) as u32]),
+            _ => words.push(*v as u32),
+        }
+    }
+    cmd(c, opcode, &words, &[])
+}
+
+/// Run planned command `name` with scalar `vals` from our own code, waiting
+/// for its reply.
+fn ask_plan(c: &mut Call<'_>, name: &str, vals: &[u64]) -> R<Reply> {
+    let Ok(i) = generated::PLANS.binary_search_by(|e| e.0.cmp(name)) else {
+        return Err(c.unimplemented(&format!("opengl32 {name} (internal)")));
+    };
+    let (_, opcode, plan) = generated::PLANS[i];
+    let mut words = Vec::new();
+    for (t, v) in parse_plan(plan)[1..].iter().zip(vals) {
+        match t.kind {
+            b'q' => words.extend([*v as u32, (*v >> 32) as u32]),
+            b'o' => {}
+            _ => words.push(*v as u32),
+        }
+    }
+    ask(c, opcode, &words, &[])
+}
+
+/// The parameters of opengl32 call `p` as raw words, by its params struct.
+fn raw_params(c: &Call<'_>, p: &Params) -> R<Vec<u64>> {
+    let kinds = p.sig.as_bytes();
+    (1..kinds.len())
+        .map(|f| {
+            Ok(match kinds[f] {
+                b'b' => p.u8(c, f)? as u64,
+                b'h' => c.g.u16(p.at + p.offs[f])? as u64,
+                b'i' | b'f' => p.u32(c, f)? as u64,
+                b'd' | b'q' => c.g.u64(p.at + p.offs[f])?,
+                _ => p.ptr(c, f)?,
+            })
+        })
+        .collect()
+}
+
+/// glMapBuffer/glMapBufferRange: a copy of the range in guest memory, read
+/// back first when the access reads.
+fn map_buffer(c: &mut Call<'_>, target: u32, offset: u64, len: Option<u64>, read: bool, write: bool, explicit_flush: bool) -> R<u64> {
+    let name = c.p.gl.lock().unwrap().bound.get(&target).copied().unwrap_or(0);
+    if name == 0 {
+        return Ok(0);
+    }
+    let len = match len {
+        Some(l) => l,
+        None => {
+            let mut r = ask_plan(c, "glGetBufferParameteriv", &[target as u64, 0x8764, 0])?; // GL_BUFFER_SIZE
+            let b = r.blob();
+            b.get(..4).map(|x| u32::from_le_bytes(x.try_into().unwrap()) as u64).unwrap_or(0)
+        }
+    };
+    let cached = c.p.gl.lock().unwrap().map_memory.get(&name).copied();
+    let addr = match cached {
+        Some((a, cap)) if cap >= len.max(1) => a,
+        _ => {
+            let a = super::sysinfo::alloc_private(c, len.max(1), "[gl mapped buffer]")?;
+            c.p.gl.lock().unwrap().map_memory.insert(name, (a, len.max(1)));
+            a
+        }
+    };
+    if read && len > 0 {
+        let mut r = ask_plan(c, "glGetBufferSubData", &[target as u64, offset, len, 0])?;
+        let data = r.blob();
+        c.g.write(addr, &data[..data.len().min(len as usize)])?;
+    }
+    c.p.gl.lock().unwrap().maps.insert(name, Mapping { target, addr, offset, len, write, explicit_flush });
+    Ok(addr)
+}
+
+/// Write `len` bytes of mapping `m` from `at` (relative to the mapping) back.
+fn write_back_map(c: &mut Call<'_>, m: &Mapping, at: u64, len: u64) -> R<()> {
+    let len = len.min(m.len.saturating_sub(at));
+    if len == 0 {
+        return Ok(());
+    }
+    let bytes = c.g.bytes(m.addr + at, len as usize)?;
+    let [ol, oh] = proto::Batch::words64(m.offset + at);
+    let [sl, sh] = proto::Batch::words64(len);
+    cmd_blob(c, op::BUFFER_SUB_DATA, &[m.target, ol, oh, sl, sh], &bytes)
+}
+
+/// Generated opcodes of the GL 4.4 transport the hand-written calls here
+/// use (tools/gen_gl44_transport.py: 1024 plus the command's index in the
+/// 4.4 core command list).
+const GL44_GET_COMPRESSED_TEX_IMAGE: u32 = 1194;
+const GL44_GET_TEX_IMAGE: u32 = 1247;
+
+/// glNormalPointer, glFogCoordPointer, glSecondaryColorPointer: fixed array
+/// `i` with `size` components.
+fn set_typed_pointer(c: &mut Call<'_>, i: usize, size: i32, ty: u32, stride: i32, pointer: u64) -> R<()> {
+    let a = {
+        let mut s = c.p.gl.lock().unwrap();
+        let buffer = s.array_buffer;
+        let a = &mut s.arrays[i];
+        a.size = size;
+        a.ty = ty;
+        a.stride = stride;
+        a.pointer = pointer;
+        a.buffer = buffer;
+        *a
+    };
+    if a.buffer != 0 {
+        send_array_pointer(c, i, &a, pointer)?;
     }
     Ok(())
 }
@@ -908,6 +1216,9 @@ fn array_index(c: &Call<'_>, cap: u32) -> Option<usize> {
         0x8074 => Some(VERTEX),
         0x8076 => Some(COLOR),
         0x8078 => Some(TEXCOORD + c.p.gl.lock().unwrap().client_texture),
+        0x8075 => Some(NORMAL),
+        0x845e => Some(SECONDARY),
+        0x8457 => Some(FOG),
         _ => None,
     }
 }
@@ -937,7 +1248,7 @@ pub fn call(c: &mut Call<'_>, code: u32, args: u64) -> R {
     let Some(&(name, sig)) = table::FUNCS.get(code as usize) else {
         return Err(c.unimplemented(&format!("opengl32 unix call {code}")));
     };
-    let p = Params { at: args, offs: layout(sig, c.p.abi), n: sig.len().min(MAX_PARAMS) };
+    let p = Params { at: args, offs: layout(sig, c.p.abi), n: sig.len().min(MAX_PARAMS), sig };
     let timed = STATS.load(std::sync::atomic::Ordering::Relaxed);
     let t0 = if timed {
         c.p.gl.lock().unwrap().serving = name;
@@ -1003,6 +1314,194 @@ fn delete_names(c: &mut Call<'_>, opcode: u32, n: i32, names: u64) -> R<()> {
         words.push(c.g.u32(names + 4 * i as u64)?);
     }
     cmd(c, opcode, &words, &[])
+}
+
+// ------------------------------------------------- the planned commands
+
+/// A plan token (`tools/gen_gl_compat.py`, `guest/gl/gexgl-plan.h`).
+#[derive(Clone, Copy, Default)]
+struct Tok {
+    kind: u8,
+    size: u32,
+    spec: u8,
+    arg: [i32; 5],
+}
+
+fn parse_plan(plan: &str) -> Vec<Tok> {
+    plan.split(' ')
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            let b = t.as_bytes();
+            let mut tok = Tok { kind: b[0], arg: [-1; 5], ..Default::default() };
+            if matches!(b[0], b'i' | b'j' | b'o') {
+                let (size, spec) = t[1..].split_once(':').unwrap_or(("0", "n0"));
+                tok.size = size.parse().unwrap_or(0);
+                tok.spec = spec.as_bytes()[0];
+                for (i, a) in spec[1..].split([',', '*']).filter(|a| !a.is_empty()).take(5).enumerate() {
+                    tok.arg[i] = a.parse().unwrap_or(-1);
+                }
+                if tok.spec == b'p' && tok.arg[1] < 0 {
+                    tok.arg[1] = 1;
+                }
+            }
+            tok
+        })
+        .collect()
+}
+
+/// `gexgl_compute_pixel_layout`'s end: the bytes an unpack transfer spans.
+fn pixel_end(format: u32, ty: u32, w: i32, h: i32, d: i32, s: PixelStore) -> usize {
+    if w <= 0 || h <= 0 || d == 0 || d < -1 {
+        return 0;
+    }
+    let Some(g) = group_bytes(format, ty) else { return 0 };
+    let g = g as usize;
+    let is_3d = d >= 0;
+    let row_px = if s.row_length != 0 { s.row_length as usize } else { w as usize };
+    let a = s.alignment.max(1) as usize;
+    let stride = (row_px * g).div_ceil(a) * a;
+    let rows = if is_3d && s.image_height != 0 { s.image_height as usize } else { h as usize };
+    let image = stride * rows;
+    let offset = if is_3d { s.skip_images as usize * image } else { 0 } + s.skip_rows as usize * stride + s.skip_pixels as usize * g;
+    let layers = if is_3d { d as usize } else { 1 };
+    offset + (layers - 1) * image + (h as usize - 1) * stride + w as usize * g
+}
+
+/// How many elements (bytes, for byte-sized specs) array token `t` holds.
+fn plan_elements(t: &Tok, v: &[u64], store: PixelStore) -> usize {
+    let a = |i: usize| v.get(t.arg[i] as usize).copied().unwrap_or(0);
+    let count = |x: i64, m: i64| if x <= 0 || m <= 0 { 0 } else { (x.saturating_mul(m) as usize).min(1 << 28) };
+    match t.spec {
+        b'n' => t.arg[0].max(0) as usize,
+        b'p' => count(a(0) as u32 as i32 as i64, t.arg[1] as i64),
+        b'e' => generated::pname_count(a(0) as u32) as usize,
+        b'z' => count(a(0) as i64, 1),
+        b'L' => {
+            let size = match a(1) as u32 {
+                0x1400 | 0x1401 => 1,
+                0x1402 | 0x1403 | 0x1407 => 2,
+                0x1408 => 3,
+                0x1404 | 0x1405 | 0x1406 | 0x1409 => 4,
+                _ => 0,
+            };
+            count(a(0) as u32 as i32 as i64, size)
+        }
+        b'T' => 128,
+        // A uniform: the host says how many, at most a 4x4 matrix.
+        b'U' => 16,
+        b'B' => {
+            let (w, h) = (a(0) as u32 as i32, a(1) as u32 as i32);
+            if w <= 0 || h <= 0 || w > 1 << 20 || h > 1 << 20 {
+                return 0;
+            }
+            let px = if store.row_length != 0 { store.row_length as usize } else { w as usize };
+            let al = store.alignment.max(1) as usize;
+            let row = px.div_ceil(8).div_ceil(al) * al;
+            (store.skip_rows as usize + h as usize) * row + (store.skip_pixels as usize).div_ceil(8)
+        }
+        b'X' => {
+            let dim = |i: usize, d: i32| if t.arg[i] >= 0 { a(i) as u32 as i32 } else { d };
+            pixel_end(a(0) as u32, a(1) as u32, dim(2, 1), dim(3, 1), dim(4, -1), store)
+        }
+        _ => 0,
+    }
+}
+
+/// A command with a plan and no hand-written arm (`generated::PLANS`): its
+/// parameters read as the plan says, sent on the wire it describes, and its
+/// return value and outputs written back.
+fn planned(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
+    if let Ok(i) = generated::ALIASES.binary_search_by(|e| e.0.cmp(name)) {
+        return one(c, generated::ALIASES[i].1, p);
+    }
+    let Ok(i) = generated::PLANS.binary_search_by(|e| e.0.cmp(name)) else {
+        return Err(c.unimplemented(&format!("opengl32 {name}")));
+    };
+    let (_, opcode, plan) = generated::PLANS[i];
+    let toks = parse_plan(plan);
+    let (ret, params) = (toks[0], &toks[1..]);
+    let kinds = p.sig.as_bytes();
+    let mut v = Vec::with_capacity(params.len());
+    for (i, t) in params.iter().enumerate() {
+        let f = i + 1;
+        v.push(match kinds[f] {
+            b'b' => p.u8(c, f)? as u64,
+            b'h' => c.g.u16(p.at + p.offs[f])? as u64,
+            b'i' | b'f' => p.u32(c, f)? as u64,
+            b'd' | b'q' => c.g.u64(p.at + p.offs[f])?,
+            // GLintptr and GLsizeiptr are signed; pointers are addresses.
+            _ if t.kind == b'q' => p.isize(c, f)? as u64,
+            _ => p.ptr(c, f)?,
+        });
+    }
+    let (store, unpack_buffer) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.unpack, s.unpack_buffer)
+    };
+    let mut words: Vec<u32> = Vec::new();
+    let mut outputs = false;
+    for (i, t) in params.iter().enumerate() {
+        match t.kind {
+            b'w' | b'f' => words.push(v[i] as u32),
+            b'q' => words.extend([v[i] as u32, (v[i] >> 32) as u32]),
+            b'o' => outputs = true,
+            _ => {
+                let ptr = v[i];
+                if t.kind == b'j' && unpack_buffer != 0 {
+                    words.extend([2, ptr as u32, (ptr >> 32) as u32]);
+                    continue;
+                }
+                if ptr == 0 {
+                    words.push(0);
+                    continue;
+                }
+                let bytes = match t.spec {
+                    b's' => cstr(c, ptr)?,
+                    b'S' => {
+                        let len = v[t.arg[0] as usize] as u32 as i32;
+                        if len < 0 {
+                            cstr(c, ptr)?
+                        } else {
+                            c.g.bytes(ptr, len as usize)?
+                        }
+                    }
+                    _ => c.g.bytes(ptr, plan_elements(t, &v, store) * t.size as usize)?,
+                };
+                words.extend([1, bytes.len() as u32]);
+                words.extend(bytes.chunks(4).map(|w| {
+                    let mut x = [0u8; 4];
+                    x[..w.len()].copy_from_slice(w);
+                    u32::from_le_bytes(x)
+                }));
+            }
+        }
+    }
+    if ret.kind == b'v' && !outputs {
+        return cmd(c, opcode, &words, &[]);
+    }
+    let mut r = ask(c, opcode, &words, &[])?;
+    if ret.kind != b'v' {
+        let lo = r.u32() as u64;
+        let value = if ret.kind == b'q' { lo | (r.u32() as u64) << 32 } else { lo };
+        let at = p.ret();
+        match kinds[at] {
+            b'b' => p.set_u8(c, at, value as u8)?,
+            b'h' => c.g.w16(p.at + p.offs[at], value as u16)?,
+            b'd' | b'q' => c.g.w64(p.at + p.offs[at], value)?,
+            _ => p.set_u32(c, at, value as u32)?,
+        }
+    }
+    for (i, t) in params.iter().enumerate() {
+        if t.kind != b'o' {
+            continue;
+        }
+        let blob = r.blob();
+        let want = plan_elements(t, &v, store) * t.size as usize;
+        if v[i] != 0 && (blob.len() == want || (t.spec == b'U' && blob.len() <= want)) {
+            c.g.write(v[i], &blob)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -1134,7 +1633,28 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
                 out
             } else {
                 let mut r = ask(c, op::GET_STRING, &[pname], &[])?;
-                r.blob()
+                let host = r.blob();
+                // The version, and the shading language's, as far as this
+                // serves (`generated::MAX_VERSION`), the host's string after.
+                let client = c.p.gl.lock().unwrap().current.get(&c.t.tid).copied().unwrap_or(0);
+                let v = c.p.gl.lock().unwrap().contexts.get(&client).map(|x| (x.major, x.minor));
+                match (pname, v) {
+                    (0x1f02, Some((ma, mi))) => format!("{ma}.{mi} (Compatibility Profile) ({})", String::from_utf8_lossy(&host)).into_bytes(),
+                    (0x8b8c, Some((ma, mi))) => {
+                        let glsl = match (ma, mi) {
+                            (2, 0) => "1.10",
+                            (2, _) => "1.20",
+                            (3, 0) => "1.30",
+                            (3, 1) => "1.40",
+                            (3, 2) => "1.50",
+                            (3, _) => "3.30",
+                            _ => "",
+                        };
+                        let glsl = if ma >= 4 { format!("{ma}.{mi}0") } else { glsl.to_string() };
+                        if glsl.is_empty() { host } else { glsl.into_bytes() }
+                    }
+                    _ => host,
+                }
             };
             let at = intern(c, &s)?;
             p.set_ptr(c, 2, at)?;
@@ -1152,15 +1672,19 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             if let Some(v) = local {
                 c.g.w32(out, v)?;
             } else {
+                // A blob of as many values as the pname has (the host sizes
+                // it with the table generated::pname_count is, plus the core
+                // multi-valued ones).
                 let mut r = ask(c, op::GET_INTEGERV, &[pname], &[])?;
+                let values = r.blob();
                 let n = match pname {
                     0x0ba2 | 0x0c10 | 0x0c22 | 0x0c23 => 4, // viewport, scissor box, clear color, write mask
-                    0x0d3a | 0x846e | 0x846d => 2,          // max viewport dims, aliased line/point ranges
-                    _ => 1,
+                    0x0d3a | 0x846e | 0x846d | 0x0b70 | 0x0b12 | 0x0b22 | 0x825d | 0x0b40 => 2,
+                    0x91be | 0x91bf => 3,                    // compute work group count, size
+                    _ => generated::pname_count(pname) as usize,
                 };
-                for i in 0..n {
-                    let v = r.u32();
-                    c.g.w32(out + 4 * i, v)?;
+                if out != 0 && values.len() == 4 * n {
+                    c.g.write(out, &values)?;
                 }
             }
         }
@@ -1271,6 +1795,254 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             }
             cmd(c, op::DRAW_ARRAYS, &[mode, first as u32, count as u32], &[])?;
         }
+        "glNormalPointer" => set_typed_pointer(c, NORMAL, 3, p.u32(c, 1)?, p.i32(c, 2)?, p.ptr(c, 3)?)?,
+        "glFogCoordPointer" => set_typed_pointer(c, FOG, 1, p.u32(c, 1)?, p.i32(c, 2)?, p.ptr(c, 3)?)?,
+        "glSecondaryColorPointer" => set_typed_pointer(c, SECONDARY, p.i32(c, 1)?, p.u32(c, 2)?, p.i32(c, 3)?, p.ptr(c, 4)?)?,
+
+        // --- generic vertex attributes and the other draws
+        "glVertexAttribPointer" | "glVertexAttribIPointer" | "glVertexAttribLPointer" => {
+            let index = p.u32(c, 1)? as usize;
+            let (normalized, stride, pointer, kind) = if name == "glVertexAttribPointer" {
+                (p.u8(c, 4)? != 0, p.i32(c, 5)?, p.ptr(c, 6)?, 0)
+            } else {
+                (false, p.i32(c, 4)?, p.ptr(c, 5)?, if name == "glVertexAttribIPointer" { 1 } else { 2 })
+            };
+            if index >= ATTRIBS {
+                return Err(c.unimplemented(&format!("vertex attribute {index}")));
+            }
+            let a = {
+                let mut s = c.p.gl.lock().unwrap();
+                let buffer = s.array_buffer;
+                let a = &mut s.attribs[index];
+                a.size = p.i32(c, 2)?;
+                a.ty = p.u32(c, 3)?;
+                a.normalized = normalized;
+                a.stride = stride;
+                a.pointer = pointer;
+                a.buffer = buffer;
+                a.kind = kind;
+                *a
+            };
+            if a.buffer != 0 {
+                send_attrib_pointer(c, index, &a, pointer)?;
+            }
+        }
+        "glEnableVertexAttribArray" | "glDisableVertexAttribArray" => {
+            let index = p.u32(c, 1)?;
+            let on = name == "glEnableVertexAttribArray";
+            if let Some(a) = c.p.gl.lock().unwrap().attribs.get_mut(index as usize) {
+                a.enabled = on;
+            }
+            cmd(c, if on { op::ENABLE_VERTEX_ATTRIB_ARRAY } else { op::DISABLE_VERTEX_ATTRIB_ARRAY }, &[index], &[])?;
+        }
+        "glVertexAttribDivisor" => {
+            let (index, divisor) = (p.u32(c, 1)?, p.u32(c, 2)?);
+            if let Some(a) = c.p.gl.lock().unwrap().attribs.get_mut(index as usize) {
+                a.divisor = divisor;
+            }
+            planned(c, name, p)?;
+        }
+        "glDrawArraysInstanced" | "glDrawArraysInstancedBaseInstance" => {
+            let (first, count, instances) = (p.i32(c, 2)?, p.i32(c, 3)?, p.i32(c, 4)?);
+            if first >= 0 && count > 0 {
+                upload_arrays_instanced(c, first as usize + count as usize, instances.max(1) as usize)?;
+            }
+            planned(c, name, p)?;
+        }
+        "glMultiDrawArrays" => {
+            let (first, count, n) = (p.ptr(c, 2)?, p.ptr(c, 3)?, p.i32(c, 4)?);
+            let mut reach = 0usize;
+            for i in 0..n.max(0) as u64 {
+                let (f, k) = (c.g.u32(first + 4 * i)? as i32, c.g.u32(count + 4 * i)? as i32);
+                if f >= 0 && k > 0 {
+                    reach = reach.max(f as usize + k as usize);
+                }
+            }
+            upload_arrays(c, reach)?;
+            planned(c, name, p)?;
+        }
+        "glDrawElements" => {
+            let v = raw_params(c, p)?;
+            draw_elements(c, name, v, 3, p.i32(c, 2)?, p.u32(c, 3)?, 0, 1)?;
+        }
+        "glDrawRangeElements" => {
+            let v = raw_params(c, p)?;
+            draw_elements(c, name, v, 5, p.i32(c, 4)?, p.u32(c, 5)?, 0, 1)?;
+        }
+        "glDrawElementsBaseVertex" => {
+            let v = raw_params(c, p)?;
+            draw_elements(c, name, v, 3, p.i32(c, 2)?, p.u32(c, 3)?, p.i32(c, 5)? as i64, 1)?;
+        }
+        "glDrawRangeElementsBaseVertex" => {
+            let v = raw_params(c, p)?;
+            draw_elements(c, name, v, 5, p.i32(c, 4)?, p.u32(c, 5)?, p.i32(c, 7)? as i64, 1)?;
+        }
+        "glDrawElementsInstanced" | "glDrawElementsInstancedBaseInstance" => {
+            let v = raw_params(c, p)?;
+            draw_elements(c, name, v, 3, p.i32(c, 2)?, p.u32(c, 3)?, 0, p.i32(c, 5)?.max(1) as usize)?;
+        }
+        "glDrawElementsInstancedBaseVertex" | "glDrawElementsInstancedBaseVertexBaseInstance" => {
+            let v = raw_params(c, p)?;
+            draw_elements(c, name, v, 3, p.i32(c, 2)?, p.u32(c, 3)?, p.i32(c, 6)? as i64, p.i32(c, 5)?.max(1) as usize)?;
+        }
+        "glDrawArraysIndirect" | "glDrawElementsIndirect" | "glMultiDrawArraysIndirect" | "glMultiDrawElementsIndirect" => {
+            // The commands are in GL_DRAW_INDIRECT_BUFFER: the pointer is an
+            // offset into it.
+            let v = raw_params(c, p)?;
+            send_pointer_plan(c, name, &v)?;
+        }
+
+        // --- object names the host generates
+        "glGenQueries" => gen_names(c, op::GEN_QUERIES, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glDeleteQueries" => delete_names(c, op::DELETE_QUERIES, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glGenVertexArrays" => gen_names(c, op::GEN_VERTEX_ARRAYS, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glDeleteVertexArrays" => delete_names(c, op::DELETE_VERTEX_ARRAYS, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glBindVertexArray" => cmd(c, op::BIND_VERTEX_ARRAY, &[p.u32(c, 1)?], &[])?,
+        "glGenSamplers" => gen_names(c, op::GEN_SAMPLERS, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glDeleteSamplers" => delete_names(c, op::DELETE_SAMPLERS, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glGenTransformFeedbacks" => gen_names(c, op::GEN_TRANSFORM_FEEDBACKS, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glDeleteTransformFeedbacks" => delete_names(c, op::DELETE_TRANSFORM_FEEDBACKS, p.i32(c, 1)?, p.ptr(c, 2)?)?,
+        "glGenLists" => {
+            let mut r = ask(c, op::GEN_LISTS, &[p.u32(c, 1)?], &[])?;
+            let base = r.u32();
+            let at = p.ret();
+            p.set_u32(c, at, base)?;
+        }
+        "glNewList" => cmd(c, op::NEW_LIST, &[p.u32(c, 1)?, p.u32(c, 2)?], &[])?,
+        "glEndList" => cmd(c, op::END_LIST, &[], &[])?,
+        "glDeleteLists" => cmd(c, op::DELETE_LISTS, &[p.u32(c, 1)?, p.u32(c, 2)?], &[])?,
+        "glBindBufferBase" | "glBindBufferRange" => {
+            let (t, b) = (p.u32(c, 1)?, p.u32(c, 3)?);
+            c.p.gl.lock().unwrap().bound.insert(t, b);
+            planned(c, name, p)?;
+        }
+        "glPixelStoref" => {
+            let (pn, v) = (p.u32(c, 1)?, p.f32(c, 2)?.round() as i32);
+            set_store(&mut c.p.gl.lock().unwrap(), pn, v);
+            cmd(c, op::PIXEL_STOREI, &[pn, v as u32], &[])?;
+        }
+        "glGetStringi" => {
+            let mut r = ask(c, op::GET_STRING_I, &[p.u32(c, 1)?, p.u32(c, 2)?], &[])?;
+            let s = r.blob();
+            let at = intern(c, &s)?;
+            p.set_ptr(c, 3, at)?;
+        }
+
+        // --- mapping buffers: a copy in guest memory, written back
+        "glMapBuffer" => {
+            let (t, access) = (p.u32(c, 1)?, p.u32(c, 2)?);
+            // GL_READ_ONLY, GL_WRITE_ONLY, GL_READ_WRITE
+            let addr = map_buffer(c, t, 0, None, access != 0x88b9, access != 0x88b8, false)?;
+            p.set_ptr(c, 3, addr)?;
+        }
+        "glMapBufferRange" => {
+            let (t, off, len, access) = (p.u32(c, 1)?, p.isize(c, 2)?, p.isize(c, 3)?, p.u32(c, 4)?);
+            // GL_MAP_READ_BIT, _WRITE_BIT, _INVALIDATE_RANGE_BIT,
+            // _INVALIDATE_BUFFER_BIT, _FLUSH_EXPLICIT_BIT
+            let read = access & 1 != 0 && access & 0xc == 0;
+            let addr = map_buffer(c, t, off.max(0) as u64, Some(len.max(0) as u64), read, access & 2 != 0, access & 0x10 != 0)?;
+            p.set_ptr(c, 5, addr)?;
+        }
+        "glFlushMappedBufferRange" => {
+            let (t, off, len) = (p.u32(c, 1)?, p.isize(c, 2)?, p.isize(c, 3)?);
+            let m = {
+                let s = c.p.gl.lock().unwrap();
+                s.bound.get(&t).and_then(|b| s.maps.get(b)).copied()
+            };
+            if let Some(m) = m {
+                write_back_map(c, &m, off.max(0) as u64, len.max(0) as u64)?;
+            }
+        }
+        "glUnmapBuffer" => {
+            let t = p.u32(c, 1)?;
+            let m = {
+                let mut s = c.p.gl.lock().unwrap();
+                let b = s.bound.get(&t).copied().unwrap_or(0);
+                s.maps.remove(&b)
+            };
+            if let Some(m) = m {
+                if m.write && !m.explicit_flush {
+                    write_back_map(c, &m, 0, m.len)?;
+                }
+            }
+            let at = p.ret();
+            p.set_u8(c, at, m.is_some() as u8)?;
+        }
+        "glGetBufferPointerv" => {
+            let (t, out) = (p.u32(c, 1)?, p.ptr(c, 3)?);
+            let addr = {
+                let s = c.p.gl.lock().unwrap();
+                s.bound.get(&t).and_then(|b| s.maps.get(b)).map(|m| m.addr).unwrap_or(0)
+            };
+            if out != 0 {
+                c.g.wptr(out, addr)?;
+            }
+        }
+
+        // --- sync objects: the command stream runs in order, so a fence is
+        // signaled by the time anything can wait on it.
+        // opengl32 names the sync itself (its `ret` arrives as the client
+        // sync's handle, which a success leaves as it is).
+        "glFenceSync" => {}
+        "glClientWaitSync" => {
+            let at = p.ret();
+            p.set_u32(c, at, 0x911a)?; // GL_ALREADY_SIGNALED
+        }
+        "glWaitSync" | "glDeleteSync" => {}
+        "glIsSync" => {
+            let v = p.ptr(c, 1)? != 0;
+            let at = p.ret();
+            p.set_u8(c, at, v as u8)?;
+        }
+        "glGetSynciv" => {
+            let (pname, count, length, values) = (p.u32(c, 2)?, p.i32(c, 3)?, p.ptr(c, 4)?, p.ptr(c, 5)?);
+            let v = match pname {
+                0x9112 => 0x9116, // GL_OBJECT_TYPE: GL_SYNC_FENCE
+                0x9113 => 0x9117, // GL_SYNC_CONDITION: GL_SYNC_GPU_COMMANDS_COMPLETE
+                0x9114 => 0x9119, // GL_SYNC_STATUS: GL_SIGNALED
+                _ => 0,           // GL_SYNC_FLAGS
+            };
+            if count > 0 && values != 0 {
+                c.g.w32(values, v)?;
+            }
+            if length != 0 {
+                c.g.w32(length, (count > 0) as u32)?;
+            }
+        }
+
+        // --- reading textures back
+        "glGetTexImage" => {
+            let (t, level, format, ty, pixels) = (p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?, p.u32(c, 4)?, p.ptr(c, 5)?);
+            let pbo = c.p.gl.lock().unwrap().bound.get(&0x88eb).copied().unwrap_or(0) != 0;
+            let [lo, hi] = proto::Batch::words64(pixels);
+            cmd(c, GL44_GET_TEX_IMAGE, &[t, level, format, ty, pbo as u32, lo, hi], &[])?;
+            let mut r = Reply { b: flush(c)?, at: 0 };
+            if !pbo && pixels != 0 {
+                let (offset, row_stride, row_bytes, rows, image_stride, images) =
+                    (r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64);
+                let data = r.blob();
+                for image in 0..images {
+                    for row in 0..rows {
+                        let at = image * image_stride + row * row_stride;
+                        if at + row_bytes > data.len() as u64 {
+                            break;
+                        }
+                        c.g.write(pixels + offset + at, &data[at as usize..(at + row_bytes) as usize])?;
+                    }
+                }
+            }
+        }
+        "glGetCompressedTexImage" => {
+            let (t, level, img) = (p.u32(c, 1)?, p.u32(c, 2)?, p.ptr(c, 3)?);
+            let pbo = c.p.gl.lock().unwrap().bound.get(&0x88eb).copied().unwrap_or(0) != 0;
+            let [lo, hi] = proto::Batch::words64(img);
+            cmd(c, GL44_GET_COMPRESSED_TEX_IMAGE, &[t, level, pbo as u32, lo, hi], &[])?;
+            let mut r = Reply { b: flush(c)?, at: 0 };
+            if !pbo && img != 0 {
+                let data = r.blob();
+                c.g.write(img, &data)?;
+            }
+        }
 
         // --- buffers
         "glGenBuffers" => gen_names(c, op::GEN_BUFFERS, p.i32(c, 1)?, p.ptr(c, 2)?)?,
@@ -1282,8 +2054,10 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
                 match t {
                     0x8892 => s.array_buffer = b,
                     0x8893 => s.element_buffer = b,
+                    0x88ec => s.unpack_buffer = b,
                     _ => {}
                 }
+                s.bound.insert(t, b);
             }
             cmd(c, op::BIND_BUFFER, &[t, b], &[])?;
         }
@@ -1393,6 +2167,14 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
         "glLinkProgram" => cmd(c, op::LINK_PROGRAM, &[p.u32(c, 1)?], &[])?,
         "glUseProgram" => cmd(c, op::USE_PROGRAM, &[p.u32(c, 1)?], &[])?,
         "glDeleteProgram" => cmd(c, op::DELETE_PROGRAM, &[p.u32(c, 1)?], &[])?,
+        // ARB_shader_objects' one delete for both kinds (opengl32 makes it
+        // for a context's objects): programs and shaders share one name
+        // space here, so whichever it is, the other delete finds nothing.
+        "glDeleteObjectARB" => {
+            let n = p.u32(c, 1)?;
+            cmd(c, op::DELETE_PROGRAM, &[n], &[])?;
+            cmd(c, op::DELETE_SHADER, &[n], &[])?;
+        }
         "glGetShaderiv" | "glGetProgramiv" => {
             let (obj, pname, out) = (p.u32(c, 1)?, p.u32(c, 2)?, p.ptr(c, 3)?);
             let opcode = if name == "glGetShaderiv" { op::GET_SHADER_IV } else { op::GET_PROGRAM_IV };
@@ -1467,7 +2249,8 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             c.g.write(out + offset, &px)?;
         }
 
-        _ => return Err(c.unimplemented(&format!("opengl32 {name}"))),
+        // Every other registry command, by its plan.
+        _ => return planned(c, name, p),
     }
     Ok(())
 }
@@ -1484,10 +2267,10 @@ mod tests {
     #[test]
     fn params_layout_and_return_slot() {
         let sig = "pibqi";
-        let p = Params { at: 0, offs: layout(sig, Abi::P32), n: sig.len() };
+        let p = Params { at: 0, offs: layout(sig, Abi::P32), n: sig.len(), sig };
         assert_eq!(&p.offs[..5], &[0, 4, 8, 16, 24]);
         assert_eq!(p.ret(), 4);
-        let p = Params { at: 0, offs: layout(sig, Abi::P64), n: sig.len() };
+        let p = Params { at: 0, offs: layout(sig, Abi::P64), n: sig.len(), sig };
         assert_eq!(&p.offs[..5], &[0, 8, 12, 16, 24]);
     }
 }

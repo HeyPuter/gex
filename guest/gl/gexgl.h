@@ -183,7 +183,6 @@
 #define GEXGL_END_LIST 182
 #define GEXGL_CALL_LIST 183
 #define GEXGL_DELETE_LISTS 184
-/* Protocol 11: client arrays and fixed-function matrices (proto.rs). */
 #define GEXGL_ENABLE_CLIENT_STATE 185
 #define GEXGL_DISABLE_CLIENT_STATE 186
 #define GEXGL_VERTEX_POINTER 187
@@ -197,7 +196,6 @@
 #define GEXGL_COLOR4F 195
 #define GEXGL_TEX_ENVI 196
 #define GEXGL_ALPHA_FUNC 197
-/* Protocol 12: the attribute stack (proto.rs). */
 #define GEXGL_PUSH_ATTRIB 198
 #define GEXGL_POP_ATTRIB 199
 
@@ -208,7 +206,7 @@
 #define GEXGL_CLIENT_API_DESKTOP 1
 
 #define GEXGL_MAGIC 0x47584547u
-#define GEXGL_PROTOCOL_VERSION 12u
+#define GEXGL_PROTOCOL_VERSION 13u
 #define GEXGL_SUBMIT 0xc0086701u
 #define GEXGL_SURFACE 0x40106703u
 

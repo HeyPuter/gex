@@ -5,7 +5,7 @@
 //! address rather than data -- one host call per frame however many GL calls
 //! it holds.
 
-use gex_gl::host::{read_header, Gl};
+use gex_gl::host::{read_header, Frame, Gl};
 use gex_gl::proto::{error, Header, MAGIC};
 use gex_gl::trace;
 use gex_kernel::errno::{Errno, SysResult};
@@ -34,7 +34,16 @@ pub struct GlDevice {
     /// once one batch has arrived. Recording is a debugging aid: a guest whose
     /// trace cannot be written still runs.
     capture: Mutex<Capture>,
+    /// Where presented frames go (`--wayland-out`), if anywhere.
+    sink: Mutex<Option<FrameSink>>,
 }
+
+/// What a presented frame is handed to.
+pub type FrameSink = Box<dyn Fn(Frame) + Send + Sync>;
+
+/// The process's device, once `--gl` made one, so the host can route its
+/// frames once the compositor exists.
+pub static DEVICE: std::sync::OnceLock<Arc<GlDevice>> = std::sync::OnceLock::new();
 
 /// The recording half of the device.
 #[derive(Default)]
@@ -64,6 +73,7 @@ impl GlDevice {
             gl: Mutex::new(None),
             size: (width, height),
             capture: Mutex::new(capture),
+            sink: Mutex::new(None),
         })
     }
 
@@ -94,6 +104,12 @@ impl GlDevice {
                 *capture = Capture::Off;
             }
         }
+    }
+
+    /// Hand every presented frame to `sink` (read back from the host's
+    /// surface at each PRESENT).
+    pub fn set_frame_sink(&self, sink: FrameSink) {
+        *self.sink.lock().unwrap() = Some(sink);
     }
 
     /// What the host's GL turned out to be, once a guest has asked for it.
@@ -128,11 +144,21 @@ impl GlDevice {
         if slot.is_none() {
             *slot = Some(Gl::new(self.size.0, self.size.1));
         }
+        let sink = self.sink.lock().unwrap();
         let (reply, status, executed) = match slot.as_mut().unwrap() {
-            Ok(gl) => gl.run(&batch),
+            Ok(gl) => {
+                gl.keep_frames(sink.is_some());
+                let r = gl.run(&batch);
+                if let (Some(sink), Some(frame)) = (sink.as_ref(), gl.take_frame()) {
+                    sink(frame);
+                }
+                r
+            }
             // No GL is reported in the header, not as a failed ioctl, so the
             // guest falls back as it would for a driver that refused to load.
-            Err(_) => {
+            Err(e) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| eprintln!("gex-gl: no host GL context: {e}"));
                 write_status(m, ring, error::NO_CONTEXT, 0, 0)?;
                 return Ok(0);
             }

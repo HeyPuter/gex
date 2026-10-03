@@ -1573,7 +1573,9 @@ def host_case(command: dict, opcode: int) -> str:
         output_type = output["type"]
         lines.append(f"    const uint32_t components = {components};")
         if RESOURCE_OUTPUT_QUERIES[name] == "state":
-            lines += [f"    std::vector<{output_type}> values(components);",
+            # Room for what GL writes even where the table says less (a
+            # fixed-function matrix is sixteen); the reply is `components`.
+            lines += [f"    std::vector<{output_type}> values(components < 16 ? 16 : components);",
                       f"    if (components) GEX_GL_CALL({name}, {', '.join(call_names + ['values.data()'])});"]
         else:
             lines += [f"    {output_type} values[4]{{}};",

@@ -63,7 +63,15 @@ export class Compositor {
         else reject(new Error(m.error));
       };
       this.#worker.addEventListener('message', onMessage);
-      this.#worker.postMessage({ kind: 'gl', channel, ...opts });
+      // `?mesaenv=K=V,K=V`: environment for Mesa in the GL worker
+      // (MESA_DEBUG=incomplete_fbo, say), for finding what it refuses.
+      // `?glcapture=BYTES`: record the GL stream in the worker and POST it
+      // to /__gex_capture when the ceiling is reached (gl-capture.js).
+      const q = globalThis.location ? new URLSearchParams(location.search) : null;
+      const mesaEnv = q?.get('mesaenv');
+      const glCapture = q?.get('glcapture');
+      this.#worker.postMessage({ kind: 'gl', channel, ...opts, ...(mesaEnv ? { mesaEnv } : {}),
+        ...(glCapture ? { glCapture } : {}) });
     });
   }
 

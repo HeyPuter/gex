@@ -22,6 +22,9 @@ pub const DEGRADES: &[&str] = &[
     // win32u's PE side makes no unix calls (everything is a syscall); its
     // DllMain asks only because winecrt0 always does.
     "win32u.dll",
+    // libresolv: "No libresolv support, expect problems", and DNS queries
+    // fail (wininet and iphlpapi load it; Peggle).
+    "dnsapi.dll",
 ];
 
 /// DLLs with a Unix side implemented here, and their ids (the handle is

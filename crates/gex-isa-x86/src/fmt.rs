@@ -208,6 +208,8 @@ pub fn mnemonic(i: &Inst) -> String {
         Ret => "ret".into(),
         Leave => "leave".into(),
         Enter => "enter".into(),
+        Pusha => if w == Width::W { "pushaw" } else { "pushal" }.into(),
+        Popa => if w == Width::W { "popaw" } else { "popal" }.into(),
         Syscall => "syscall".into(),
         Int3 => "int3".into(),
         Int => "int".into(),
@@ -321,7 +323,15 @@ pub fn mnemonic(i: &Inst) -> String {
         Cvtp2p => if l == Lane::F32 { "cvtps2pd" } else { "cvtpd2ps" }.into(),
         Cvtdq2p => format!("cvtdq2{}", fsfx(l, false)),
         Cvtp2dq { truncate } => format!("cvt{}{}2dq", if truncate { "t" } else { "" }, fsfx(l, false)),
-        CvtMmx => "cvtpi2ps".into(),
+        CvtMmx { truncate } => match (i.ops[0], i.lane, truncate) {
+            (Some(Operand::Reg(Reg::Xmm(_))), Lane::F64, _) => "cvtpi2pd",
+            (Some(Operand::Reg(Reg::Xmm(_))), _, _) => "cvtpi2ps",
+            (_, Lane::F64, true) => "cvttpd2pi",
+            (_, Lane::F64, false) => "cvtpd2pi",
+            (_, _, true) => "cvttps2pi",
+            (_, _, false) => "cvtps2pi",
+        }
+        .into(),
 
         Padd => format!("padd{}", isfx(l)),
         Psub => format!("psub{}", isfx(l)),

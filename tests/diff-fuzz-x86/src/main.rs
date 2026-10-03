@@ -6,7 +6,7 @@
 //! 1. pick random instructions from a table of templates -- integer ALU,
 //!    shifts, multiplies, bit ops, conditional moves, SSE lane ops, a few x87
 //!    forms -- with random registers, widths and immediates;
-//! 2. wrap them in a harness that seeds every GPR, the flags, the xmm file and
+//! 2. wrap them in a harness that seeds every GPR, the flags, the xmm and mm files and
 //!    a scratch buffer from a random blob, runs the candidates, then dumps the
 //!    register file, the flags, the xmm registers and the buffer to stdout;
 //! 3. assemble with the system `as`/`ld`;
@@ -42,12 +42,13 @@ const GPRS32: [u8; 6] = [0, 1, 2, 3, 6, 7];
 fn gprs() -> &'static [u8] {
     if bits32() { &GPRS32 } else { &GPRS }
 }
-/// Blob layout: 16 GPR slots, flags, 16 xmm, scratch.
+/// Blob layout: 16 GPR slots, flags, 16 xmm, 8 mm, scratch.
 const OUT_GPR: usize = 0;
 const OUT_FLAGS: usize = 16 * 8;
 /// 16-byte aligned: aligned SSE memory operands fault natively otherwise.
 const OUT_XMM: usize = 16 * 8 + 16;
-const OUT_SCRATCH: usize = OUT_XMM + 16 * 16;
+const OUT_MM: usize = OUT_XMM + 16 * 16;
+const OUT_SCRATCH: usize = OUT_MM + 8 * 8;
 const SCRATCH_LEN: usize = 512;
 const OUT_LEN: usize = OUT_SCRATCH + SCRATCH_LEN;
 
@@ -99,6 +100,12 @@ fn main() {
                     continue;
                 }
             }
+            // x87 loads overwrite the mm registers they alias natively; gex
+            // keeps the two apart. One or the other per sequence.
+            let other = match c.class { "mmx" => "x87", "x87" => "mmx", _ => "" };
+            if insts.iter().any(|p| p.class == other) {
+                continue;
+            }
             insts.push(c);
         }
         let blob: Vec<u8> = (0..OUT_LEN).map(|_| rng.next() as u8).collect();
@@ -119,7 +126,9 @@ fn main() {
             by_class.entry(c.class).or_insert((0, 0)).0 += 1;
         }
         let mask = insts.last().map(|c| c.flag_mask).unwrap_or(ALL);
-        match compare(&native, &gex, mask) {
+        // The x87 registers alias mm natively, not in gex.
+        let mm = !insts.iter().any(|c| c.class == "x87");
+        match compare(&native, &gex, mask, mm) {
             None => {
                 if cfg.verbose {
                     eprintln!("case {i}: ok  {}", insts.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ; "));
@@ -474,7 +483,8 @@ fn gen(rng: &mut Rng) -> Candidate {
             let _ = bytes;
             c(text, "string", NONE)
         }
-        75..=92 => gen_sse(rng),
+        75..=86 => gen_sse(rng),
+        87..=92 => gen_mmx(rng),
         _ => gen_x87(rng),
     }
 }
@@ -580,6 +590,64 @@ fn gen_sse(rng: &mut Rng) -> Candidate {
     };
     let mask = if text.starts_with("comis") || text.starts_with("ucomis") { ZF | PF | CF } else { NONE };
     Candidate { text, class: "sse", flag_mask: mask }
+}
+
+/// MMX and its SSE/SSSE3 extensions on `mm` registers. Each ends in `emms`,
+/// so the x87 candidates after it find an empty stack natively too (gex does
+/// not model the aliasing; `compare` skips `mm` when x87 ran).
+fn gen_mmx(rng: &mut Rng) -> Candidate {
+    let bb = base();
+    let m = |rng: &mut Rng| format!("mm{}", rng.below(8));
+    let d = m(rng);
+    let s = if rng.below(4) == 0 {
+        format!("QWORD PTR [{bb}+{}]", OUT_SCRATCH + rng.below(60) as usize * 8)
+    } else {
+        m(rng)
+    };
+    let x = format!("xmm{}", rng.below(8));
+    let g = pick_gpr(rng);
+    const BIN: [&str; 62] = [
+        "paddb", "paddw", "paddd", "paddq", "paddsb", "paddsw", "paddusb", "paddusw", "psubb", "psubw",
+        "psubd", "psubq", "psubsb", "psubsw", "psubusb", "psubusw", "pmullw", "pmulhw", "pmulhuw",
+        "pmuludq", "pmaddwd", "pand", "pandn", "por", "pxor", "pcmpeqb", "pcmpeqw", "pcmpeqd",
+        "pcmpgtb", "pcmpgtw", "pcmpgtd", "packsswb", "packssdw", "packuswb", "punpcklbw",
+        "punpcklwd", "punpckldq", "punpckhbw", "punpckhwd", "punpckhdq", "pavgb", "pavgw", "pminub",
+        "pmaxub", "pminsw", "pmaxsw", "psadbw", "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq",
+        "psraw", "psrad", "pshufb", "phaddw", "phaddd", "phsubsw", "pmaddubsw", "pmulhrsw", "psignw",
+    ];
+    let text = match rng.below(12) {
+        0..=5 => {
+            let op = BIN[rng.below(BIN.len() as u64) as usize];
+            // The low unpacks read 32 bits of memory.
+            let s = if op.starts_with("punpckl") { s.replace("QWORD", "DWORD") } else { s };
+            format!("{op} {d}, {s}")
+        }
+        6 => {
+            let op = ["psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad"][rng.below(8) as usize];
+            format!("{op} {d}, {}", rng.below(70))
+        }
+        7 => format!("pshufw {d}, {s}, {}", rng.below(256)),
+        8 => format!("palignr {d}, {s}, {}", rng.below(20)),
+        9 => match rng.below(4) {
+            0 => format!("pextrw {}, {d}, {}", reg_name(g, 32), rng.below(8)),
+            1 => format!("pinsrw {d}, {}, {}", reg_name(g, 32), rng.below(8)),
+            2 => format!("pmovmskb {}, {d}", reg_name(g, 32)),
+            _ => format!("pabsb {d}, {s}"),
+        },
+        10 => match rng.below(4) {
+            0 => format!("movd {d}, {}", reg_name(g, 32)),
+            1 => format!("movd {}, {d}", reg_name(g, 32)),
+            2 => format!("movq2dq {x}, {d}"),
+            _ => format!("movdq2q {d}, {x}"),
+        },
+        _ => match rng.below(4) {
+            0 => format!("cvtpi2ps {x}, {s}"),
+            1 => format!("cvtpi2pd {x}, {s}"),
+            2 => format!("cvttps2pi {d}, {x}"),
+            _ => format!("cvtps2pi {d}, {x}"),
+        },
+    };
+    Candidate { text: format!("{text}\n    emms"), class: "mmx", flag_mask: NONE }
 }
 
 fn gen_x87(rng: &mut Rng) -> Candidate {
@@ -701,6 +769,11 @@ fn harness(insts: &[Candidate], blob: &[u8], rng: &mut Rng) -> String {
     for i in 0..nx {
         s.push_str(&format!("    movdqu xmm{i}, XMMWORD PTR [{bb}+{}]\n", OUT_XMM + i * 16));
     }
+    // mm from the blob, then an empty x87 stack.
+    for i in 0..8 {
+        s.push_str(&format!("    movq mm{i}, QWORD PTR [{bb}+{}]\n", OUT_MM + i * 8));
+    }
+    s.push_str("    emms\n");
     // Flags: only the six arithmetic flags, DF clear, IF set.
     let fl = (rng.next() & ALL) | 0x202;
     if bits32() {
@@ -731,6 +804,9 @@ fn harness(insts: &[Candidate], blob: &[u8], rng: &mut Rng) -> String {
     }
     for i in 0..nx {
         s.push_str(&format!("    movdqu XMMWORD PTR [{bb}+{}], xmm{i}\n", OUT_XMM + i * 16));
+    }
+    for i in 0..8 {
+        s.push_str(&format!("    movq QWORD PTR [{bb}+{}], mm{i}\n", OUT_MM + i * 8));
     }
     // write(1, blob, OUT_LEN); exit(0)
     if bits32() {
@@ -788,7 +864,7 @@ fn run(bin: &Path, args: &[String]) -> Vec<u8> {
     }
 }
 
-fn compare(native: &[u8], gex: &[u8], flag_mask: u64) -> Option<String> {
+fn compare(native: &[u8], gex: &[u8], flag_mask: u64, mm: bool) -> Option<String> {
     if native.len() != OUT_LEN {
         return Some(format!("native produced {} bytes: {}", native.len(), String::from_utf8_lossy(&native[..native.len().min(200)])));
     }
@@ -817,6 +893,12 @@ fn compare(native: &[u8], gex: &[u8], flag_mask: u64) -> Option<String> {
                 hex(&native[o..o + 16]),
                 hex(&gex[o..o + 16])
             ));
+        }
+    }
+    for i in 0..8 {
+        let o = OUT_MM + i * 8;
+        if mm && native[o..o + 8] != gex[o..o + 8] {
+            diffs.push(format!("mm{i}: native {} gex {}", hex(&native[o..o + 8]), hex(&gex[o..o + 8])));
         }
     }
     if native[OUT_SCRATCH..] != gex[OUT_SCRATCH..] {

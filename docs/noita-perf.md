@@ -528,3 +528,75 @@ merge/abi9 = merge/fjit 9eacbbd5 (F merged R's 65f9a719 and ed6c838b).
 3. Region entries for frames demoted by anything left: the safety net.
 4. If depth-guard leaves appear, raise the native budget. The runtime half
    is in (64 MiB wasm stacks); the units' budget constant is F's.
+
+## Stream F: cg9 measured (2026-10-03)
+
+merge/fjit 3fe58dc8 (abi9 78089b0e merged), binary `gexc-cg12`, every unit
+rebuilt into `cgcache-cg9` (prefix 23 min, noita.exe 21 min). New since the
+restart:
+- a73be6f2: pewasm's profile-guided devirtualisation (§8.1: `if (t == K)
+  f_K(); else <table call>`) and its small-leaf copies (§3.6: a `static
+  inline` copy in each translation unit that calls a leaf of at most 96
+  lifted statements, so clang inlines it across the image's units). The
+  hottest unit functions were one-instruction virtual getters
+  (f_4ac0d0 `mov eax,[ecx+14h]; ret` 4.4% of CPU, f_5b01c0 1.8%), which
+  pewasm inlines. noita.exe: 4,305 devirtualised calls from 3,281 hints,
+  20,386 calls to leaf copies.
+- **The cg9 hints are pewasm's.** `out/noita/icall-profile.txt`
+  (PEWASM_PROFILE_INDIRECT) converted with tools/icall-hints.py (pewasm
+  places noita.exe at 0x10000). gex's own collector came after
+  (d39b63e6: `gexc run --record DIR prog.exe` works for PE programs, and
+  icall-hints.py reads DIR/profile.json); the file format is the same.
+- b007fe99: tests/nt icall (hot indirect calls; 9.6 s without hints, 4.9 s
+  with, same output).
+
+**Gates** on gexc-cg12: lockstep exact 20/20 (gi386 and gx64: ack, calls,
+cgoto, eh, sjlj, virtual, fp, simd, interp, qsort), tests/nt --cgen 52/52,
+cgen-prefix.sh 52/52.
+
+**Noita, 4x clock, null display, cores 4 and 10** (R's run on 3,9 and G's
+on 5,11 at the same time): world-up 200 s (cg8: 443 s; this includes a 104 s
+cold Cranelift compile of noita.exe's unit). World fps in 120 s windows from
+world-up: 29.6, 37.4, 43.3, 42.4, 44.1, 43.9, 38.6, 35.3, 38.6 (cg8:
+27-28.6). R's run on 3,9: 43.3. This is one number for the import fix, R's
+ffa2cec9 and devirtualisation with leaf copies together.
+
+**AOT share** (aot-coverage.py, profile 600-1250 s): **99.6%** of guest CPU
+(cg7 73.3%, cg8 71.4%); the run's own line: AOT 99.5% (units 97.8%,
+providers 1.7%, tier-1 0.4%).
+
+| % of guest | units | tier-1 |
+|---|---|---|
+| noita.exe | 81.40 | 0 (cg8: interior 22.77, missed 1.53) |
+| msvcr120 | 5.87 | 0 (cg8: interior 2.17) |
+| ntdll | 4.97 | 0 (cg8: 0.77) |
+| kernelbase, opengl32, kernel32, msvcp120 | 1.3-1.8 each | 0 |
+| SDL2 | 0.05 | missed 0.26 |
+| lua51 | 0.11 | missed 0.11, interior 0.02 |
+
+cg8's noita.exe "missed" was the code after import-thunk calls (every hot
+address follows a `call <memset/sqrt thunk>`), which d11b5464 recovers. Its
+interior was frames demoted by leaves at those thunks and by loading
+resumes; with d11b5464, 101a7477 and R's 65f9a719/ffa2cec9 none is left
+(nest exits 0.6k/s, 10 resumes). What remained:
+- SDL2: one switch whose table re-resolved to 84 cases, then 1, for ever;
+  the recovery fixpoint never settled, so its weak (relocation-only) starts,
+  SDL's dynapi `SDL_*_REAL` bodies, were never promoted. 56988e74: a
+  re-resolved table only grows. 754 -> 2,553 functions. (pewasm uses
+  native SDL and Lua, so neither has a pewasm counterpart.)
+- lua51: LuaJIT's VM ops, reached only through its runtime-built dispatch
+  table (the Lua exclusion).
+
+**The process uses about one core of two.** GEX_PROF samples at 1 kHz of
+process CPU: 643k samples over the 650 s window is about 990 per second.
+pewasm's bench uses 1.75-1.85 cores. Per world frame at 44 fps: guest code
+about 13.7 ms, host about 8.6 ms. The hot functions' wasm is at parity with
+pewasm (0x724580 10,845 against 11,903 instructions; 0x864060 994 against
+1,004; 0x70b110 176 against 162). So the gap is waiting (latency, a
+serialising lock), not code: handed to R.
+
+**The machine is not quiet.** Two qemu VMs, Steam and the other streams
+share it (load average 14 on 12 threads); pewasm's bench on 4,10 during
+F's gates gave 49.2 world fps (BUSY ms/frame t0 9.09, t1 11.02, t2 10.90,
+t3 0.44, t4 0.49; 1.75 cores), not 76-84. Compare gex with pewasm in paired
+runs under the same load.

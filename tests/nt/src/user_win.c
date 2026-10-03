@@ -1,7 +1,8 @@
 /* USER without a display: classes, window creation and its messages, window
  * data and properties, sending and posting, timers, the quit message, the
  * window tree, moving and sizing, destruction, registered messages, a
- * message sent from another thread, and MsgWaitForMultipleObjects.
+ * message sent from another thread, SetWindowPos from another thread, and
+ * MsgWaitForMultipleObjects.
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld -municode */
 #include <windows.h>
 #include <stdio.h>
@@ -17,6 +18,7 @@ static void *create_param;
 static WCHAR create_name[64];
 static int destroyed, nc_destroyed, timer_ticks, user_msgs, moved_x, sized_w;
 static LPARAM last_lparam;
+static DWORD poschanging_tid;
 
 static LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     if (nlog < 256) log_msgs[nlog++] = m;
@@ -31,6 +33,7 @@ static LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     case WM_USER + 7: return wp * 3 + lp;
     case WM_USER + 1: user_msgs++; last_lparam = lp; return 0;
     case WM_TIMER: timer_ticks++; return 0;
+    case WM_WINDOWPOSCHANGING: poschanging_tid = GetCurrentThreadId(); break;
     case WM_MOVE: moved_x = (short)LOWORD(lp); return 0;
     case WM_SIZE: sized_w = LOWORD(lp); return 0;
     case WM_DESTROY: destroyed++; return 0;
@@ -43,6 +46,15 @@ static HWND target;
 static DWORD WINAPI sender(void *p) {
     Sleep(10);
     return (DWORD)SendMessageW(target, WM_USER + 7, 5, 1);
+}
+
+/* SetWindowPos on another thread's window: the owner moves it (Wine's
+ * WM_WINE_SETWINDOWPOS), so its procedure sees WM_WINDOWPOSCHANGING on the
+ * owner's thread. */
+static DWORD owner_tid;
+static DWORD WINAPI mover(void *p) {
+    Sleep(10);
+    return (DWORD)SetWindowPos(target, 0, 70, 80, 320, 220, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static BOOL CALLBACK count_child(HWND h, LPARAM lp) { (*(int *)lp)++; return TRUE; }
@@ -123,6 +135,17 @@ int wmain(void) {
             while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
     GetExitCodeThread(th, &code);
     CHECK("SendMessage from another thread", code == 16);
+
+    owner_tid = GetCurrentThreadId();
+    poschanging_tid = 0;
+    th = CreateThread(0, 0, mover, 0, 0, 0);
+    while (WaitForSingleObject(th, 0) == WAIT_TIMEOUT)
+        if (MsgWaitForMultipleObjects(1, &th, FALSE, 1000, QS_ALLINPUT) == WAIT_OBJECT_0 + 1)
+            while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    GetExitCodeThread(th, &code);
+    GetWindowRect(w, &r);
+    CHECK("SetWindowPos from another thread", code && r.left == 70 && r.top == 80 && r.right == 390 && r.bottom == 300);
+    CHECK("it runs on the owner's thread", poschanging_tid == owner_tid);
 
     HANDLE ev = CreateEventW(0, TRUE, FALSE, 0);
     PostThreadMessageW(GetCurrentThreadId(), WM_USER + 3, 0, 0);

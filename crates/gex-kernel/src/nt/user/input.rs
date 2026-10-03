@@ -602,10 +602,10 @@ fn parse_script(s: &str) -> Vec<(u64, Action)> {
 /// presenting it.
 pub fn script_tick(c: &mut Call<'_>, frame: u64, hwnd: u32) {
     let due: Vec<Action> = {
+        let unread = c.p.user.lock().unwrap().input.script.is_none();
+        let setting = if unread { c.p.setting("GEX_NT_INPUT") } else { None };
         let mut u = c.p.user.lock().unwrap();
-        let script = u.input.script.get_or_insert_with(|| {
-            std::env::var("GEX_NT_INPUT").map(|s| parse_script(&s)).unwrap_or_default()
-        });
+        let script = u.input.script.get_or_insert_with(|| setting.map(|s| parse_script(&s)).unwrap_or_default());
         let due = script.iter().filter(|(f, _)| *f == frame).map(|(_, a)| *a).collect();
         script.retain(|(f, _)| *f > frame);
         due

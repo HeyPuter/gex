@@ -3,7 +3,7 @@
 
 use super::super::user::{handle_ret, window::Rect, R64};
 use super::{alloc, get, obj, set_user_pointer, stock, with_obj, Obj};
-use crate::nt::{off, Call, R};
+use crate::nt::{off, st, Call, Status, R};
 
 #[derive(Clone, Debug)]
 pub struct Saved {
@@ -196,6 +196,32 @@ pub fn nt_gdi_select(c: &mut Call<'_>, kind: u32) -> R64 {
         super::super::user::write_rect(&mut c.g, d.attr + vis, &Rect { left: 0, top: 0, right: w, bottom: h2 })?;
     }
     Ok(handle_ret(prev))
+}
+
+/// Select bitmap `hbm` into memory DC `hdc` (what `SelectObject` does, for
+/// DCs the NT layer makes itself).
+pub fn select_bitmap(c: &mut Call<'_>, hdc: u32, hbm: u32) -> R<()> {
+    let Some(Obj::Dc(d)) = get(c, hdc) else { return Err(Status(st::INVALID_HANDLE)) };
+    let prev = with_obj(c, hdc, |o| match o {
+        Obj::Dc(d) => std::mem::replace(&mut d.bitmap, hbm),
+        _ => 0,
+    })
+    .unwrap_or(0);
+    with_obj(c, prev, |o| {
+        if let Obj::Bitmap(b) = o {
+            b.selected = false;
+        }
+    });
+    let (w, h) = with_obj(c, hbm, |o| match o {
+        Obj::Bitmap(b) => {
+            b.selected = true;
+            (b.width, b.height)
+        }
+        _ => (1, 1),
+    })
+    .unwrap_or((1, 1));
+    let vis = off!(c.p.abi, dc_attr::VIS_RECT);
+    super::super::user::write_rect(&mut c.g, d.attr + vis, &Rect { left: 0, top: 0, right: w, bottom: h })
 }
 
 /// `NtGdiGetDCObject(hdc, type)`.
