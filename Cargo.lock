@@ -403,6 +403,10 @@ name = "gex-abi"
 version = "0.0.1"
 
 [[package]]
+name = "gex-atomic"
+version = "0.0.1"
+
+[[package]]
 name = "gex-browser"
 version = "0.0.1"
 dependencies = [
@@ -548,6 +552,7 @@ name = "gex-kernel"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "gex-atomic",
  "gex-f80",
  "gex-gl",
  "gex-ld",
@@ -622,6 +627,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "gex-abi",
+ "gex-atomic",
  "gex-cache",
  "gex-cgen",
  "gex-emit",

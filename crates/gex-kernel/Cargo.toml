@@ -7,6 +7,8 @@ description = "gex-kernel: the userspace Linux personality"
 
 [dependencies]
 gex-abi.workspace = true
+# Atomic operations on guest words (PI futexes); the one unsafe view.
+gex-atomic.workspace = true
 gex-f80.workspace = true
 # PE parsing and mapping for the NT personality (docs/nt-layer.md §1.1).
 gex-ld.workspace = true

@@ -1247,6 +1247,41 @@ fn perform_block(
                 .wait(uaddr, val, deadline, &|| mem.read_u32(uaddr).ok())
                 .map(|_| 0)
         }
+        BlockOp::FutexLockPi { table, uaddr, tid, deadline } => {
+            use gex_kernel::futex::pi;
+            let start = std::time::Instant::now();
+            loop {
+                let mem = GuestMem::new(&mut *data);
+                let v = gex_atomic::load_u32(mem.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                match v & pi::TID_MASK {
+                    // Free: take it. The waiters bit stays (set) because
+                    // others may still sleep on it, so the next unlock goes
+                    // through the kernel and wakes one.
+                    0 => {
+                        if gex_atomic::cas_u32(mem.bytes, uaddr, v, tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
+                            return Ok(0);
+                        }
+                        continue;
+                    }
+                    owner if owner == tid => return Err(Errno::EDEADLK),
+                    _ => {}
+                }
+                let want = v | pi::WAITERS;
+                if v != want && gex_atomic::cas_u32(mem.bytes, uaddr, v, want).ok_or(Errno::EFAULT)?.is_err() {
+                    continue;
+                }
+                let left = match deadline {
+                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
+                    Some(d) => d - start.elapsed(),
+                    None => std::time::Duration::from_millis(100),
+                };
+                // In slices: the owner's UNLOCK_PI wakes this, and the word
+                // is re-read either way.
+                let _ = table.wait(uaddr, want, Some(left.min(std::time::Duration::from_millis(100))), &|| {
+                    mem.read_u32(uaddr).ok()
+                });
+            }
+        }
         BlockOp::Sleep(d) => {
             // In slices, so a signal ends it. A flat `sleep(d)` is why
             // `nanosleep` ran its full five seconds against a one-second

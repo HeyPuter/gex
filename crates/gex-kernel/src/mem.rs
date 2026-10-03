@@ -1169,6 +1169,15 @@ mod tests {
         // A hint or a fixed address up to the 64-bit limit is honoured.
         let fixed = 10u64 << 30;
         assert_eq!(m.mmap(fixed, 0x1000, prot::READ, flags::FIXED, "f"), Ok(fixed));
+        // A file mapping stays low whatever its protection (ld.so reserves a
+        // library read-only, then maps its text inside), and so does a
+        // reservation made with `mmap_low` (the loader's, for code).
+        let lib = m.mmap_from(0, 0x20000, prot::READ, 0, "libx.so", Some(("libx.so".into(), 0))).unwrap();
+        assert!(lib < MMAP_TOP);
+        let res = m.mmap_low(0, 0x40_0000, prot::NONE, 0, "").unwrap();
+        assert!(res < MMAP_TOP);
+        // ... and refuses executable pages above 4 GiB in either form.
+        assert_eq!(m.mmap(11u64 << 30, 0x1000, prot::READ | prot::EXEC, flags::FIXED, "x"), Err(Errno::EACCES));
     }
 
     /// An M32 map is unchanged, and running out of address space is recorded

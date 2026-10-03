@@ -6375,6 +6375,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
+                    // Priority-inheritance locks are not served here yet: the
+                    // call finishes at once with ENOSYS, as before gex had them
+                    // (`finish_parked`). docs/mem64.md step 6 brings the page.
+                    gex_kernel::BlockOp::FutexLockPi { .. } => Waiting::Sleep(now_ns()),
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         // What the thing being waited on says about itself,
                         // at the moment of parking. A reader on a pipe whose
@@ -9427,6 +9431,7 @@ fn finish_parked(
             Err(Errno::ETIMEDOUT)
         }
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
+        gex_kernel::BlockOp::FutexLockPi { .. } => Err(Errno::ENOSYS),
         // The read the guest asked for happens now, into the buffer it named.
         // Doing it here rather than re-executing the instruction is what keeps
         // the guest's pc moving forward: a syscall that parks is finished by

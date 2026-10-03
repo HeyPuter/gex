@@ -26,12 +26,27 @@ pub mod op {
     /// glibc's condvar signalling path uses it; without it a `pthread_cond`
     /// wake is lost and the waiter deadlocks (Qt's threads hit exactly this).
     pub const WAKE_OP: u32 = 5;
+    /// Priority-inheritance locks (glibc's `PTHREAD_PRIO_INHERIT` mutexes):
+    /// the word holds the owner's tid, plus [`super::pi::WAITERS`] when
+    /// someone sleeps on it. gex has no priorities to inherit, so these are
+    /// plain owner-tracking locks (`Kernel::sys_futex`, `BlockOp::FutexLockPi`).
+    pub const LOCK_PI: u32 = 6;
+    pub const UNLOCK_PI: u32 = 7;
+    pub const TRYLOCK_PI: u32 = 8;
+    pub const LOCK_PI2: u32 = 13;
     pub const WAIT_BITSET: u32 = 9;
     pub const WAKE_BITSET: u32 = 10;
     /// `FUTEX_PRIVATE_FLAG`; these queues are per-process and all waiters share
     /// its memory, so it changes nothing.
     pub const PRIVATE_FLAG: u32 = 128;
     pub const CLOCK_REALTIME: u32 = 256;
+}
+
+/// The bits of a priority-inheritance futex word.
+pub mod pi {
+    pub const WAITERS: u32 = 0x8000_0000;
+    pub const OWNER_DIED: u32 = 0x4000_0000;
+    pub const TID_MASK: u32 = 0x3fff_ffff;
 }
 
 /// One wait queue, keyed by guest address.

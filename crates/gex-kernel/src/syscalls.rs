@@ -299,6 +299,17 @@ pub enum BlockOp {
         parked: Option<crate::futex::Parked>,
     },
     Sleep(std::time::Duration),
+    /// `FUTEX_LOCK_PI(2)`: take the priority-inheritance lock at `uaddr` for
+    /// `tid`, waiting as long as it is held. The host loops: an atomic take
+    /// when the word is free (keeping the waiters bit, since others may
+    /// sleep), else set the waiters bit and wait on the word; `EDEADLK` for
+    /// a lock `tid` already owns; `ETIMEDOUT` at `deadline`.
+    FutexLockPi {
+        table: Arc<FutexTable>,
+        uaddr: u64,
+        tid: u32,
+        deadline: Option<std::time::Duration>,
+    },
     /// `rt_sigsuspend`: wait until a signal the caller can see arrives.
     ///
     /// The blocked mask has already been replaced with the one the caller
@@ -1993,6 +2004,29 @@ impl Kernel {
             nr::FUTEX => {
                 let operation =
                     (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+                if operation == futex::op::LOCK_PI || operation == futex::op::LOCK_PI2 {
+                    let mapped = self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end);
+                    if !mapped || a[0] % 4 != 0 {
+                        return None;
+                    }
+                    // An absolute time (CLOCK_REALTIME for LOCK_PI, the
+                    // monotonic clock for LOCK_PI2: one clock in gex).
+                    let deadline = if a[3] == 0 {
+                        None
+                    } else {
+                        let secs = m.read_u64(a[3]).ok()?;
+                        let nanos = m.read_u64(a[3] + 8).ok()?;
+                        let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
+                        let left = want.saturating_sub(self.now_nanos()).min(3600 * 1_000_000_000);
+                        Some(std::time::Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32))
+                    };
+                    return Some(BlockOp::FutexLockPi {
+                        table: Arc::clone(&self.futexes),
+                        uaddr: a[0],
+                        tid: self.tid as u32,
+                        deadline,
+                    });
+                }
                 if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
                     return None;
                 }
@@ -2513,6 +2547,43 @@ impl Kernel {
                 Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
             }
             futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
+            // LOCK_PI reaches here only when `blocking_op` refused it: a
+            // word the process does not have, or misaligned.
+            futex::op::LOCK_PI | futex::op::LOCK_PI2 => {
+                Err(if uaddr % 4 != 0 { Errno::EINVAL } else { Errno::EFAULT })
+            }
+            // Release a PI lock this thread owns, and wake one waiter, which
+            // takes it in its own `FUTEX_LOCK_PI` loop.
+            futex::op::UNLOCK_PI => {
+                let tid = self.tid as u32;
+                loop {
+                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                    if v & futex::pi::TID_MASK != tid {
+                        return Err(Errno::EPERM);
+                    }
+                    if gex_atomic::cas_u32(m.bytes, uaddr, v, 0).ok_or(Errno::EFAULT)?.is_ok() {
+                        break;
+                    }
+                }
+                self.futexes.wake(uaddr, 1);
+                Ok(0)
+            }
+            futex::op::TRYLOCK_PI => {
+                let tid = self.tid as u32;
+                loop {
+                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                    match v & futex::pi::TID_MASK {
+                        0 => {
+                            let new = tid | (v & futex::pi::WAITERS);
+                            if gex_atomic::cas_u32(m.bytes, uaddr, v, new).ok_or(Errno::EFAULT)?.is_ok() {
+                                return Ok(0);
+                            }
+                        }
+                        owner if owner == tid => return Err(Errno::EDEADLK),
+                        _ => return Err(Errno::EAGAIN),
+                    }
+                }
+            }
             // Requeue is an optimisation for condition variables; waking
             // everyone is correct, if less efficient.
             futex::op::REQUEUE | futex::op::CMP_REQUEUE => Ok(self.futexes.wake(uaddr, u32::MAX)),
