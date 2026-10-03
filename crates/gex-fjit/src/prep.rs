@@ -35,7 +35,7 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
     // Flags dead at each block's exit, by gex-cgen's liveness (flags only:
     // GEX_CGEN_LIVE=0, the exact-flags lockstep mode, keeps them all).
     let dead_out: Vec<Vec<GuestReg>> = if cf::live_writebacks() {
-        let live = cf::live_in(f, sums);
+        let live = live_in(f, sums);
         f.blocks
             .iter()
             .map(|b| {
@@ -89,18 +89,81 @@ pub fn prepare(f: &mut Function, sums: &HashMap<u64, Summary>) {
     f.n_values = most;
 }
 
-/// What gex-cgen's liveness says is live just before `term` runs (its
-/// `live_in` before a block's statements).
-fn live_out(term: &FTerm, live: &[RegSet], sums: &HashMap<u64, Summary>) -> RegSet {
+/// What is live just before `term` runs, given what is live at each
+/// block's entry: gex-cgen's rule, except that no callee reads the
+/// arithmetic flags it is entered with (`flags_abi`).
+pub fn live_out(term: &FTerm, live: &[RegSet], sums: &HashMap<u64, Summary>) -> RegSet {
+    let entry = |t: Option<&u64>| match t.and_then(|t| sums.get(t)) {
+        Some(sm) => sm.inputs,
+        None => RegSet::ALL,
+    };
+    let abi = |r: RegSet| if flags_abi() { r.minus(RegSet::of(cf::FLAG_REGS)) } else { r };
     match term {
         FTerm::Jump(e) => live[e.to.index()],
         FTerm::Branch { taken, not_taken, .. } => live[taken.to.index()].union(live[not_taken.to.index()]),
-        FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } => match sums.get(t) {
-            Some(sm) => sm.inputs.union(live[r.to.index()]),
-            None => RegSet::ALL,
-        },
+        FTerm::Call { callee, ret, .. } => {
+            let t = match callee {
+                Callee::Direct(t) => Some(t),
+                Callee::Indirect(_) => None,
+            };
+            let after = ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]);
+            match (callee, ret) {
+                // gex-cgen's own rule where it is exact.
+                (Callee::Direct(t), Some(r)) if sums.contains_key(t) => sums[t].inputs.union(live[r.to.index()]),
+                _ => abi(entry(t)).union(if ret.is_some() { after } else { RegSet::EMPTY }),
+            }
+        }
+        FTerm::TailCall { .. } => abi(RegSet::ALL),
         _ => RegSet::ALL,
     }
+}
+
+/// Whether calls are taken not to read the arithmetic flags (x86: no ABI
+/// passes anything in them, and compilers treat them as clobbered by every
+/// call), so a flag computation whose only reader would be the callee is
+/// dead. Returns, switches' defaults and unresolved jumps still read them
+/// all. `GEX_FJIT_FLAGS_ABI=0` turns it off; `GEX_CGEN_LIVE=0` (every flag
+/// written back) implies off.
+pub fn flags_abi() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gex_abi::X86 && cf::live_writebacks() && std::env::var("GEX_FJIT_FLAGS_ABI").as_deref() != Ok("0"))
+}
+
+/// gex-cgen's `live_in` (registers live at each block's entry), with
+/// [`live_out`]'s rule for calls.
+pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
+    if !flags_abi() {
+        return cf::live_in(f, sums);
+    }
+    use gex_ir::{Expr, Stmt};
+    let n = f.blocks.len();
+    let mut live = vec![RegSet::EMPTY; n];
+    let order: Vec<usize> = f.rpo().iter().rev().map(|b| b.index()).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &i in &order {
+            let b = &f.blocks[i];
+            let mut l = match &b.term {
+                FTerm::Switch { .. } => RegSet::ALL,
+                t => live_out(t, &live, sums),
+            };
+            for s in b.stmts.iter().rev() {
+                match s {
+                    Stmt::WriteReg { reg, .. } => l.remove(*reg),
+                    Stmt::Def { expr: Expr::ReadReg(r), .. } => l.insert(*r),
+                    Stmt::Trap { .. } => l = RegSet::ALL,
+                    _ if gex_cgen::emit::clobbers(s) => l = RegSet::ALL,
+                    _ => {}
+                }
+            }
+            if l != live[i] {
+                live[i] = l;
+                changed = true;
+            }
+        }
+    }
+    live
 }
 
 /// Number `b`'s values `0..n` in order of definition; returns `n`.
