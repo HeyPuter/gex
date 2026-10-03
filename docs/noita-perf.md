@@ -169,3 +169,62 @@ Still open: each call writes back every dirty register (§4.1's state at a
 host-visible point), where pewasm writes back the callee's inputs; vector
 registers reloaded after calls because partial lane writes read them;
 loop outlining for V8's missing OSR (not needed natively).
+
+## Runtime: state at the 2026-10-03 wrap-up (stream R, merge/abi9)
+
+Commits after the §9 ftab work (65a3c7d5 .. 602a9497):
+- aae0e2c1: units' return check knows `ret N` (stdcall, struct returns),
+  as F's de1acfd7 did for the JIT.
+- a20c8a92: a unit body resumes only at its call continuations. Resuming
+  at every block nearly doubled the largest bodies, and wasmtime refused
+  noita.exe's unit ("Code for function is too large").
+- 01e88bab, e8a3cc94: `GEX_PERFMAP`, and `b_<addr>` names on tier-1
+  modules.
+- e8282628: `--wayland-out null`, tools/modattr.py, the per-module
+  attribution above.
+- 10dc2c01, 7994d41a, 212d4f11, 5c7f0cfb: export providers (§9.9.1), with
+  the ConcRT and crt_mem providers and their numbers above.
+
+**The 514 s / 9.4 fps tier-1 baseline** came from a CPU budget, not a
+regression. `taskset -c 3,9` gives two hardware threads; S3's 207 s ran on
+six (0-2,6-8). wasmtime compiles tier-1's modules on every CPU in the
+affinity mask, and Noita's threads share them. On 6 threads this branch's
+tier-1 gives 208 s, 14.8 then 19.9 fps, 5.3 GB, which matches S3. On 2
+threads merge/main gave 468 s and this branch 509 s, so there is no
+regression.
+
+**World-up with providers.** One run gave 539 s against 450 s without
+providers. The paired A/B traced it to the provider's 1 ms `_Yield`:
+with the guest's own `_Yield` world-up is 443 and 450 s, the same as
+without providers. World-up is not attributed by module yet; Lua and
+tier-1 translation are the suspects.
+
+**Units: blocked.**
+- noita.exe's unit now compiles: 131 MiB wasm, 210 s of Cranelift on two
+  threads on a cold run (the compiled form is cached beside the unit).
+- But fae67c12 ("whole-image units write back only what a pure callee
+  touches") breaks every unit-backed NT run with Wine's prefix units: Wine's
+  ntdll unit ends in `NtOpenFile of the NT path ""` under GEX_NT_STRICT.
+- Bisected: 1827b993 and a00fb489 pass, fae67c12 fails.
+- Repro: build syswow64/ntdll.dll's unit alone into a fresh cache, then run
+  crates/gex-ld/tests/pe/bin/x86/hello32.exe with `--cgen`
+  (stream R's scratchpad/abi9/bisect-ntdll.sh).
+- Not caused by functions left to tier-1: ntdll's build leaves none.
+- `GEX_CGEN_WB=all` restores the full write-back, but it is not in the unit
+  key, so it needs its own cache.
+- Earlier "nt --cgen 48/48" results ran without prefix units under the key
+  of the time, so they did not exercise Wine's units. The coordinator gate
+  should build prefix units before its --cgen leg.
+- So there is no units fps at the 4x clock yet.
+
+**Next, in order:**
+1. Fix or gate fae67c12 (F's area). Then units at the 4x clock on 3,9 and
+   on 6 threads, with modattr attribution and nest exits per second.
+2. Host memcpy, about 3.7%: `__memmove_avx_unaligned_erms`. Find its
+   callers (GL uploads, wasmtime's memory.copy libcall, NT copies).
+3. Math providers: the IEEE-exact ones first (floor, ceil, modf, sqrt;
+   `floor` returns in x87 ST0), then `__libm_sse2_*` under a differential
+   test against msvcr120.
+4. The heap family, all at once (§9.9.2 step 4).
+5. A direct call from units to providers, only if the units profile shows
+   the stub's fcache probe (a §9.9.1 deviation).
