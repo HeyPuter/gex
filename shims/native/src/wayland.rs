@@ -82,10 +82,22 @@ impl Wayland {
         }
     }
 
-    /// Write every committed frame as a PPM at `prefix-NNN.ppm` -- a file is
-    /// what a test can compare and what works with no display.
+    /// Write every committed frame (every Nth with `GEX_PPM_EVERY=N`) as a
+    /// PPM at `prefix-NNN.ppm` -- a file is what a test can compare and what
+    /// works with no display.
     pub fn write_frames_to(&self, prefix: &str) {
         *self.inner.out.lock().unwrap() = Some(prefix.to_string());
+    }
+
+    /// `GEX_PPM_EVERY=N` (crate::ppm_every): count a frame that is not
+    /// written, so the ones that are keep their real index.
+    fn skip_frame(&self) -> bool {
+        let mut n = self.inner.written.lock().unwrap();
+        if *n % crate::ppm_every() == 0 {
+            return false;
+        }
+        *n += 1;
+        true
     }
 
     /// Write out what was drawn: with a GPU, the whole composited screen;
@@ -94,6 +106,8 @@ impl Wayland {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
+        // Before the GPU read-back, so a skipped frame costs nothing.
+        let Some(path) = self.frame_path(&prefix) else { return };
         let mut gpu = self.inner.gpu.lock().unwrap();
         let (width, height, rgb) = if let Some(c) = gpu.as_mut() {
             match c.draw(frames).and_then(|()| c.read_back()) {
@@ -110,7 +124,6 @@ impl Wayland {
             let Some(frame) = frames.last() else { return };
             (frame.width, frame.height, gex_wayland::to_rgb(frame))
         };
-        let Some(path) = self.frame_path(&prefix) else { return };
         let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
         out.extend_from_slice(&rgb);
         if let Err(e) = std::fs::write(&path, out) {
@@ -118,11 +131,10 @@ impl Wayland {
         }
     }
 
-    /// Count a presented frame and say where to write it, if anywhere. A
-    /// game presents tens of frames a second, so a run of minutes cannot keep
-    /// them all: `GEX_FRAME_EVERY=N` keeps every Nth, and the prefix `null`
-    /// keeps none. `GEX_FPS=1` prints presents per second to stderr, which is
-    /// what a measurement script reads.
+    /// Count a presented frame and say where to write it, if anywhere:
+    /// `GEX_PPM_EVERY=N` keeps every Nth ([`Self::skip_frame`]), and the
+    /// prefix `null` keeps none. `GEX_FPS=1` prints presents per second to
+    /// stderr, which is what a measurement script reads.
     fn frame_path(&self, prefix: &str) -> Option<String> {
         if std::env::var_os("GEX_FPS").is_some_and(|v| v != "0") {
             let mut fps = self.inner.fps.lock().unwrap();
@@ -135,14 +147,13 @@ impl Wayland {
                 *since = std::time::Instant::now();
             }
         }
-        let mut n = self.inner.written.lock().unwrap();
-        let index = *n;
-        *n += 1;
-        let every: u32 = std::env::var("GEX_FRAME_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
-        if prefix == "null" || index % every != 0 {
+        if prefix == "null" || self.skip_frame() {
             return None;
         }
-        Some(format!("{prefix}-{index:03}.ppm"))
+        let mut n = self.inner.written.lock().unwrap();
+        let path = format!("{prefix}-{:03}.ppm", *n);
+        *n += 1;
+        Some(path)
     }
 
     /// Write a frame drawn somewhere other than a client buffer (a GL

@@ -883,16 +883,22 @@ fn set_zorder(u: &mut User, hwnd: u32, after: u32) {
     }
 }
 
-/// Wine's `set_window_pos` for the calling thread's windows: `WINDOWPOS`
-/// through WM_WINDOWPOSCHANGING, WM_NCCALCSIZE when the size or frame
-/// changes, apply, WM_WINDOWPOSCHANGED, activation.
+/// Wine's `set_window_pos`: `WINDOWPOS` through WM_WINDOWPOSCHANGING,
+/// WM_NCCALCSIZE when the size or frame changes, apply, WM_WINDOWPOSCHANGED,
+/// activation. Another thread's window is moved by that thread
+/// (WM_WINE_SETWINDOWPOS), as its messages go to its own procedure.
 #[allow(clippy::too_many_arguments)]
 pub fn set_window_pos(c: &mut Call<'_>, hwnd: u32, after: u32, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> R<bool> {
-    let (old_wr, old_cr, style, ex_style, parent, menu) = {
+    let (old_wr, old_cr, style, ex_style, parent, menu, owner) = {
         let u = c.p.user.lock().unwrap();
         let Some(w) = u.windows.get(&hwnd) else { return Ok(false) };
-        (w.window_rect, w.client_rect, w.style, w.ex_style, w.parent, w.menu != 0 && w.style & ws::CHILD == 0)
+        let owner = (w.tid != c.t.tid && u.threads.contains_key(&w.tid)).then_some(w.tid);
+        (w.window_rect, w.client_rect, w.style, w.ex_style, w.parent, w.menu != 0 && w.style & ws::CHILD == 0, owner)
     };
+    if let Some(tid) = owner {
+        let what = super::message::Internal::SetWindowPos { after, x, y, cx, cy, flags };
+        return Ok(super::message::send_internal(c, tid, hwnd, what)? != 0);
+    }
     let mut flags = flags;
     let visible = style & ws::VISIBLE != 0;
     if visible && flags & swp::SHOWWINDOW != 0 || !visible && flags & swp::HIDEWINDOW != 0 {
@@ -989,9 +995,7 @@ pub fn nt_user_set_window_pos(c: &mut Call<'_>) -> R64 {
         set_last_error(c, err::INVALID_WINDOW_HANDLE);
         return Ok(0);
     }
-    if c.p.user.lock().unwrap().windows[&hwnd].tid != c.t.tid {
-        return Err(c.unimplemented("SetWindowPos on another thread's window"));
-    }
+    // Another thread's window: set_window_pos has its owner do it.
     if flags & swp::ASYNCWINDOWPOS != 0 {
         return Err(c.unimplemented("SetWindowPos with SWP_ASYNCWINDOWPOS"));
     }
