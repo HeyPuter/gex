@@ -1094,21 +1094,36 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 
 /// Where a whole-image unit's body goes when a callee left (returned 0):
 /// everything is in the context and `ctx::PC` says where the guest goes.
-/// If that is one of this body's blocks and the stack is at or below this
-/// activation's (a `longjmp` back into it, an exception landing in it, a
-/// jump table it did not resolve, the depth guard of a recursive call), the
-/// body reloads every register and carries on there, and nothing further
-/// out unwinds; otherwise it leaves too. Correct for any activation of the
+/// If that is the continuation of one of this body's calls and the stack is
+/// at or below this activation's (a callee whose return check failed, a
+/// `longjmp` back to a `setjmp`, a call-out that came back), the body
+/// reloads every register and carries on there, and nothing further out
+/// unwinds; otherwise it leaves too. Correct for any activation of the
 /// function -- the guest's own stack holds the real return addresses -- so
 /// the stack test only keeps a deeper activation from taking what an outer
-/// one is waiting for.
+/// one is waiting for. Only call continuations: they reload after the call
+/// anyway, while making every block a join point with all registers
+/// reloaded nearly doubled the largest bodies (noita.exe's 0xdc14c0, 414 to
+/// 720 KB of wasm) and put them past Cranelift's limits.
 fn resume_block(e: &mut Emitter<'_>, f: &Function) {
-    let mut starts: Vec<(u64, usize)> =
-        f.blocks.iter().enumerate().filter(|(_, b)| !b.synthetic).map(|(i, b)| (b.start, i)).collect();
+    let mut starts: Vec<(u64, usize)> = f
+        .blocks
+        .iter()
+        .filter_map(|b| match &b.term {
+            FTerm::Call { ret: Some(edge), .. } => Some(edge.to.index()),
+            _ => None,
+        })
+        .filter(|&i| !f.blocks[i].synthetic)
+        .map(|i| (f.blocks[i].start, i))
+        .collect();
     starts.sort_unstable();
     starts.dedup_by_key(|x| x.0);
-    let lo = starts.first().map_or(0, |x| x.0);
-    let hi = f.blocks.iter().filter(|b| !b.synthetic).map(|b| b.end).max().unwrap_or(lo);
+    if starts.is_empty() {
+        e.line("gex_resume: return 0;");
+        return;
+    }
+    let lo = starts[0].0;
+    let hi = starts[starts.len() - 1].0 + 1;
     e.line("gex_resume: {");
     e.line(format!(
         "  const uint64_t rpc = GEX_C64({}u);",
