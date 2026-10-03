@@ -1190,7 +1190,28 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 /// 720 KB of wasm) and put them past Cranelift's limits.
 fn resume_block(e: &mut Emitter<'_>, f: &Function) {
     if local_resume() {
-        e.line("gex_resume: return 0;");
+        // Each call takes its own continuation (`gex_lc_*`). Anything else
+        // inside this function's code with the stack at or below this
+        // activation is a continuation this frame owns but no call of it
+        // returned to: a `longjmp` to a `setjmp` here, a `catch` or
+        // `__except` continuation, a callee's leave for one of our blocks.
+        // The rest of the function then runs through the table (the
+        // fallback's call-out, or a region) under this frame's own return
+        // contract, so the frames further out keep running their bodies;
+        // leaving would hand all of them to the fallback.
+        let lo = f.blocks.iter().map(|b| b.start).min().unwrap_or(f.entry);
+        let hi = f.blocks.iter().map(|b| b.end.max(b.start + 1)).max().unwrap_or(f.entry + 1);
+        e.line("gex_resume: {");
+        e.line(format!("  const uint64_t rpc = GEX_C64({}u);", ctx::PC));
+        e.line(format!(
+            "  if (rpc - 0x{lo:x}ull < 0x{:x}ull && GEX_C64({}u) <= sp0) {{",
+            hi.saturating_sub(lo),
+            ctx::SP
+        ));
+        ftab_tail(e, "rpc", false, 0);
+        e.line("  }");
+        e.line("  return 0;");
+        e.line("}");
         return;
     }
     let mut starts: Vec<(u64, usize)> = f

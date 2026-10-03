@@ -198,6 +198,10 @@ struct HostState {
     root_enter: Option<wasmtime::Func>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
+    /// Exceptions being dispatched nested (`nt::raise_nested`), innermost
+    /// last: the stack pointer at each `NtRaiseException`. Control that
+    /// reaches the host with the stack above one has left that dispatch.
+    pub(crate) exc_levels: Vec<u64>,
     /// The host function watched slots hold (`watch_stub`).
     watch_stub: Option<wasmtime::Func>,
     /// Where the guest is spending its time, when anyone asked.
@@ -830,6 +834,7 @@ fn run_program_with(
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
+            exc_levels: Vec::new(),
             watch_stub: None,
             sampler: sampler.clone(),
             wayland: compositor.clone(),
@@ -1648,6 +1653,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
+            exc_levels: Vec::new(),
             watch_stub: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
@@ -1799,6 +1805,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             callouts: Vec::new(),
             root_enter: None,
             callout_signal: None,
+            exc_levels: Vec::new(),
             watch_stub: None,
             sampler: cx.sampler.clone(),
             wayland: cx.wayland.clone(),
@@ -2794,6 +2801,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                 };
             }
+            if nt::exc_escape(&mut caller, pc) {
+                return Err(StopExecution.into());
+            }
             // Translate on demand and patch the slot, then resume there.
             match translate_and_install(&mut caller, pc) {
                 // Installed in this store: the miss stub dispatches again
@@ -3294,6 +3304,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .memory
                 .clone()
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            if nt::exc_escape(&mut caller, pc as u64) {
+                return Err(StopExecution.into());
+            }
             // A call-out whose caller's frame the stack has unwound past
             // (longjmp, an exception) is abandoned: its caller leaves.
             if let Some(co) = caller.data().callouts.last() {
@@ -3849,18 +3862,23 @@ pub(crate) enum CalloutSignal {
     Bypass(wasmtime::Func),
     /// The stack unwound past the innermost call-out's caller.
     Abort,
+    /// Control left nested exception dispatch `i` (`nt::raise_nested`) for
+    /// the state in the context: every loop between passes it on.
+    Escape(usize),
 }
 
 /// Call-outs nested deeper than this leave instead: each holds a host frame
 /// and a nested wasm call.
 const CALLOUT_MAX_DEPTH: usize = 32;
 
-/// How far above `sp_want` the stack pointer may be at the return: what a
-/// stdcall callee pops.
-const CALLOUT_SP_SLACK: u64 = 1024;
-
 /// How far above `sp_want` a safepoint must find the stack pointer to call
-/// a call-out's caller unwound (well past any argument popping).
+/// a call-out's caller unwound (well past any argument popping), and how far
+/// above it the awaited return may come back: what a stdcall callee pops,
+/// or, for a call-out entered inside a function (a unit body resuming at a
+/// `setjmp` or `catch` continuation, `gex_resume`), the rest of that
+/// function's frame. `sp_want` is the stack at the call-out plus the
+/// return address; a deeper activation returning to the same address
+/// (recursion) is always below it.
 const CALLOUT_UNWOUND: u64 = 64 << 10;
 
 /// The table-0 slot dispatch reaches `pc` through, as the directory says now.
@@ -3888,7 +3906,7 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let target = if gex_abi::X86 { gm.read_u64(c + ctx::LAST_TARGET as u64) } else { gm.read_u64(c + ctx::PC as u64) }.unwrap_or(0);
         let sp = gm.read_u64(c + ctx::x(sp_index()) as u64).unwrap_or(0);
         let state = caller.data_mut();
-        let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + CALLOUT_SP_SLACK);
+        let hit = state.callouts.iter().rposition(|co| co.ret == target && sp >= co.sp_want && sp <= co.sp_want + CALLOUT_UNWOUND);
         let signal = match hit {
             Some(i) => CalloutSignal::Return(i),
             None => {
@@ -4043,6 +4061,12 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
                 CalloutSignal::Bypass(f) => {
                     next = Some(f);
                     continue;
+                }
+                // Not a frame of this call-out's: down to the dispatch's
+                // loop, every wasm frame between with it.
+                sig @ CalloutSignal::Escape(_) => {
+                    caller.data_mut().callout_signal = Some(sig);
+                    break Err(e);
                 }
             }
         }
