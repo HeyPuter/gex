@@ -300,9 +300,11 @@ mod imp {
         }
         let prefix = var("GEX_WINE_PREFIX").unwrap_or_else(|| "/wine".into());
         let mut wenv = nt::boot::default_environment();
+        let mut settings = Vec::new();
         for kv in env {
             let Some((name, v)) = kv.split_once('=') else { continue };
             if name.starts_with("GEX_") {
+                settings.push((name.to_string(), v.to_string()));
                 continue;
             }
             match wenv.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
@@ -325,6 +327,7 @@ mod imp {
             cwd: nt::boot::dos_path(&prefix, &cwd),
             trace: flag("GEX_NT_TRACE"),
             strict: flag("GEX_NT_STRICT"),
+            settings,
         };
         let p = Arc::new(nt::Process::new(abi, nt::thread::nt_pid(k.pid), cfg, clocks(), Arc::clone(&k.futexes)));
         p.reserve_host(host_lo, host_hi, "[gex-shim]");

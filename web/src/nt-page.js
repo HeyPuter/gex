@@ -105,7 +105,9 @@ async function main() {
   const exeBytes = files[exe] ?? files[hard[exe]];
   if (!exeBytes) throw new Error(`${exe} is not in the bundle`);
   const args = [exe, ...(q.get('args') ? q.get('args').split(' ') : [])];
-  const env = (q.get('env') || '').split(',').filter(Boolean);
+  // Comma-separated, but a comma inside a value stays (GEX_NT_INPUT's
+  // `700:click:960,850`): a variable starts where NAME= does.
+  const env = (q.get('env') || '').split(/,(?=[A-Za-z_][A-Za-z0-9_]*=)/).filter(Boolean);
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
   if (!env.some((e) => e.startsWith('GEX_NT_STRICT='))) env.push('GEX_NT_STRICT=1');
   const gl = q.get('gl') === '1';

@@ -5,12 +5,60 @@ tier, first natively (`gexc`) and then in the browser (`web/nt.html`). Nothing
 here is specific to one game: every fix lives in gex as general x86, Linux, NT,
 or GL behaviour, and each one has its own test under `tests/`.
 
-State as of 2026-10-03:
+State as of 2026-10-03 (evening):
 
-| | native (`gexc`) | browser |
+| | native (`gexc`) | browser (`nt.html`, real GPU) |
 |---|---|---|
-| Half-Life (i386 Linux, GoldSrc) | plays c1a0, about 29 fps | loads c1a0 (needs `-nomsaa`) at 8-9 presents/s on a real GPU, but **the frames are black** |
-| Peggle Deluxe (i386 Windows, PopCap) | gets to its first MessageBox; text is still in progress (WIP commit) | not tried yet |
+| Half-Life (i386 Linux, GoldSrc) | plays c1a0, 16-29 fps | renders c1a0 (needs `-nomsaa`), 7-9 fps |
+| Peggle Deluxe (i386 Windows, PopCap) | plays Stage One: name entry, shots, scoring; 7-12 fps | plays Stage One with the same scripted input; 3-5 fps |
+
+Screenshots: `work/games/screens/` (`halflife-c1a0-{native,browser}.png`,
+`peggle-stage1-{native,browser}.png`).
+
+## Measurement scripts
+
+Both games are workloads for the other streams. Each script prints `ok` lines
+(time to the first frame or the map, time to gameplay, frames/s over
+`--measure` seconds) or `FAIL`:
+
+```
+tests/games/peggle.sh    [--browser] [--measure S] [--shot DIR] [-- GEXC-FLAGS]
+tests/games/halflife.sh  [--browser] [--map M] [--measure S] [--shot DIR] [-- GEXC-FLAGS]
+```
+
+- Native runs use `GEXC` (default `target/x86/release/gexc`) in the JIT tier
+  (`--no-cgen`); anything after `--` replaces those flags, so the same run
+  measures `--cgen` or `--fjit`. Games run on `CORES` (default 5,11).
+- `--browser` runs `browser-peggle.mjs` / `browser-halflife.mjs`.
+  `GEX_WEBGPU_SOFTWARE=0` picks the real GPU; SwiftShader is the default.
+  They need `web/public/gex` built (`GEX_ARCH=x86 shims/browser/build.sh`,
+  `web/build-mesa-wasm.sh`, and for Half-Life `web/build-xwayland-wasm.sh`).
+- Peggle's input is `tests/games/peggle-input.txt`: `GEX_NT_INPUT`, timed by
+  GL presents, so the run is the same natively and in the page, from a
+  profile-less start (click to play, the name "GEX", Stage One, its
+  instructions, then shots). Gameplay is measured from its `# gameplay N`
+  frame. The native script runs on a linked copy of the prefix with an empty
+  `ProgramData` (where Peggle keeps its profile).
+- Half-Life's workload is `+map c1a0`, the tram ride, which plays the same way
+  with no input. Its frames are counted from `--wayland-out` file names
+  (`GEX_PPM_EVERY=10` writes every 10th frame, named by its real index).
+- Defaults for Half-Life's libraries are `work/games/deps/{gl-i386,steam-i386,
+  hl-fallback}` and the game copy `work/games/halflife`; Peggle's is
+  `work/games/peggle`.
+
+Measured on this machine with the scripts (JIT tier, shared cores):
+
+| | time to first frame | time to gameplay / map | gameplay fps |
+|---|---|---|---|
+| Peggle native | 173 s | 332 s | 7.1 (120 s) |
+| Peggle browser, real GPU | 43 s | 487 s | 3.4 (150 s) |
+| Half-Life native | | 429 s | 16.0 (60 s) |
+| Half-Life browser, real GPU (`-nomsaa`) | | 88 s | 7.2 (60 s) |
+
+Native numbers include writing every 10th frame and the GL readback for it,
+and the cores were shared with other streams' builds; compare runs made the
+same way. Half-Life's native load (429 s) is far slower than the page's
+(88 s) and has not been looked at.
 
 ## Half-Life
 
@@ -102,33 +150,40 @@ Still open:
 The game directory is `Peggle Deluxe/`. Make a run copy (`work/games/peggle`)
 and extract the real executable from the DRM wrapper with
 `tests/games/popcap-unwrap.py Peggle.exe popcapgame1.exe`. Stage the Wine prefix
-with `tools/nt-stage-wine.sh`, which now also stages Wine's bitmap fonts into
-`drive_c/windows/Fonts`. Then run:
+with `tools/nt-stage-wine.sh`. Then run:
 
 ```
 cd work/games/peggle
-GEX_NT_STRICT=1 gexc run --no-cgen --wine-prefix $PREFIX --gl --wayland-out DIR popcapgame1.exe
+GEX_NT_STRICT=1 GEX_NT_INPUT=... gexc run --no-cgen --wine-prefix $PREFIX --gl --wayland-out DIR popcapgame1.exe
 ```
 
-What works: it loads, bass.dll's self-check passes (tier-1 SMC guard fix),
-and HWND_BROADCAST messages work. With MMX lifted (j2k-codec decodes the
-JPEG 2000 images), it shows the PopCap logo and reaches the title screen
-("Click to play") natively. The startup MessageBox no longer appears. It was
-most likely the images/sunglow load failure.
+or `tests/games/peggle.sh` (above). The window is 1920x1080 with Peggle's
+800x600 scaled to 1440x1080 in the middle; `GEX_NT_INPUT` coordinates are
+client coordinates of that window.
 
-Next steps:
+What made it work:
 
-1. Gameplay natively, then in the browser (`browser-noita.mjs` is the model).
-2. **GDI text (WIP commit, parked):** `crates/gex-kernel/src/nt/gdi/font.rs`
-   parses the bitmap `.fon` files and answers the win32u text calls that
-   user32 and comctl32 make for dialogs. It has never been run. Pick it up
-   only if Peggle needs dialog text.
+- bass.dll's self-check (tier-1 SMC guard fix), HWND_BROADCAST messages.
+- MMX lifted: j2k-codec decodes the JPEG 2000 images (logo, title screen).
+- SetWindowPos on another thread's window runs on the owning thread (Wine's
+  WM_WINE_SETWINDOWPOS). In the page, the compositor's Configure is handled
+  by whichever thread peeks first, which for Peggle is a helper thread; before,
+  that sent WM_WINDOWPOSCHANGING across threads and stopped the process.
+- gex's `GEX_*` settings reach the kernel in a page (`nt::Config::settings`,
+  `Process::setting`), so `GEX_NT_INPUT` scripts work in the browser, and
+  `nt.html`'s `env=` keeps commas inside a value.
 
-## Measurement scripts (not written yet)
+Not needed so far: the GDI text WIP (`crates/gex-kernel/src/nt/gdi/font.rs`,
+parked commit). Peggle draws all its text itself.
 
-The plan is for `tests/games/*.sh` to cover native and browser variants of
-each game: fps, time to gameplay, and scripted input. `browser-halflife.mjs`
-already reports time to map and presents/s.
+Open:
+
+1. Frame rate. Natively 7-12 fps in the JIT tier, in the page 3-5 fps, where
+   Peggle wants 100. Not profiled yet; the main thread is guest time
+   (`GEX_NT_STATS`' time split in the page).
+2. The page's window has a caption, so a 1920x1080 client area does not fit
+   a 1920x1080 page (scrollbars). Input is injected at client coordinates, so
+   the script is not affected.
 
 ## Tools that came out of this
 
