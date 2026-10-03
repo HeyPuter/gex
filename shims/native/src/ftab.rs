@@ -53,6 +53,9 @@ pub(crate) struct Store {
     pub table: Table,
     pub resolve: wasmtime::Func,
     pub bridge: wasmtime::Func,
+    /// The run loop (`gex_cgen::runtime::ROOT`), which an AOT-only process
+    /// enters through (`aot_only::bind_root`).
+    pub root: wasmtime::Func,
     /// How far through the map's log this table is.
     replayed: usize,
 }
@@ -191,16 +194,26 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     let mut c = cx.as_context_mut();
     let resolve = get(&mut c, gex_cgen::runtime::RESOLVE)?;
     let bridge = get(&mut c, gex_cgen::runtime::BRIDGE)?;
-    let fallback = wasmtime::Func::wrap(
-        &mut c,
-        |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> Result<i32> { fallback(&mut caller, ctx, ret as u64) },
-    );
+    let root = get(&mut c, gex_cgen::runtime::ROOT)?;
+    let fallback = if crate::aot_only::enabled() {
+        wasmtime::Func::wrap(
+            &mut c,
+            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, _ret: i64| -> Result<i32> {
+                crate::aot_only::fallback(&mut caller, ctx)
+            },
+        )
+    } else {
+        wasmtime::Func::wrap(
+            &mut c,
+            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> Result<i32> { fallback(&mut caller, ctx, ret as u64) },
+        )
+    };
     let want = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.size() + HEADROOM;
     table.grow(&mut c, want as u64, wasmtime::Ref::Func(Some(resolve.clone())))?;
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, root, replayed: 0 });
     Ok(())
 }
 
@@ -368,6 +381,10 @@ fn publish_pairs_at(
 /// are pages a translation was numbered for (`Request::page_gen`), whose
 /// directory entries must be written even with no entry on them.
 pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages: &[(u64, u32)]) -> Result<()> {
+    // No tier-1 dispatch to bridge from.
+    if crate::aot_only::enabled() {
+        return Ok(());
+    }
     let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
     let mut dirs: Vec<(u64, u32)> = pages.to_vec();
     let mut slots = Vec::with_capacity(entries.len());
@@ -721,6 +738,11 @@ pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u
             }
         }
     }
+}
+
+/// This store's run loop, once its table exists.
+pub(crate) fn root_of(cx: &impl AsContext<Data = HostState>) -> Option<wasmtime::Func> {
+    cx.as_context().data().jit.as_ref()?.ftab.as_ref().map(|s| s.root.clone())
 }
 
 /// The resolve stub's funcref, for a host that fills a table of its own.
