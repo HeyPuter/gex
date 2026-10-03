@@ -1514,7 +1514,13 @@ pub fn trap_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashMap<u6
 
 /// Outlining outermost loops is on unless `GEX_CGEN_OUTLINE=0`.
 pub fn outline_loops() -> bool {
-    std::env::var("GEX_CGEN_OUTLINE").as_deref() != Ok("0")
+    match std::env::var("GEX_CGEN_OUTLINE").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        // The native flavor (`image::unguarded`): no tiering engine to
+        // escape, so no loop functions (pewasm has none either).
+        _ => !crate::image::unguarded(),
+    }
 }
 
 fn loop_name(entry: u64, k: usize) -> String {
