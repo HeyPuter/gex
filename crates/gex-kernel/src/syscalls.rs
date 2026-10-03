@@ -1762,6 +1762,22 @@ impl Kernel {
                 traced_path(m, n, a),
                 ret as i64
             );
+            // `GEX_STRACE_STACK=N`: the top N stack words too, which in a
+            // libc syscall wrapper start with the caller's return address --
+            // enough to tell who made a call without a debugger.
+            static STACK_WORDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let words = *STACK_WORDS.get_or_init(|| {
+                std::env::var("GEX_STRACE_STACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            });
+            if words > 0 {
+                if let Ok(sp) = m.read_u64(self.ctx_addr + ctx::SP as u64) {
+                    let ws: Vec<String> = (0..words)
+                        .filter_map(|i| m.read_u64(sp + 8 * i).ok())
+                        .map(|w| format!("{w:#x}"))
+                        .collect();
+                    eprintln!("[gex:{}]   sp={sp:#x}: {}", self.pid, ws.join(" "));
+                }
+            }
         }
         let _ = set_result(m, self.ctx_addr, ret);
 
