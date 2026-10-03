@@ -374,6 +374,10 @@ pub struct ImageStats {
     pub cached: usize,
     pub c_bytes: u64,
     pub wasm_bytes: u64,
+    /// Indirect calls with a guarded direct call (`FnUnit::icall_hints`).
+    pub devirt: usize,
+    /// Calls to unit-private copies of small leaves (`FnUnit::leaves`).
+    pub leaf_copies: usize,
 }
 
 /// Stage 2: the recovery in `recovery` as one linked C module at `out`.
@@ -390,8 +394,10 @@ pub fn build_c_module(
     jobs: usize,
     read: &(dyn Fn(u64) -> Option<u8> + Sync),
     stubs: &HashSet<u64>,
+    icall_hints: &HashMap<u64, u64>,
 ) -> Result<ImageStats> {
     let rec = read_recovery(recovery)?;
+    let hints = std::sync::Arc::new(icall_hints.clone());
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
     // export goes, and only its unit recompiles. It must not be trap-free
@@ -399,7 +405,7 @@ pub fn build_c_module(
     // Export providers' addresses start as stubs (`crate::provider`).
     let mut skip: HashSet<u64> = stubs.clone();
     loop {
-        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip, read)?;
+        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip, read, &hints)?;
         let cwasm = std::fs::read(out)?;
         let users = crate::splice::unspliceable_users(&cwasm)?;
         if users.is_empty() {
@@ -434,8 +440,34 @@ fn emit_and_link(
     jobs: usize,
     skip: &HashSet<u64>,
     read: &(dyn Fn(u64) -> Option<u8> + Sync),
+    hints: &std::sync::Arc<HashMap<u64, u64>>,
 ) -> Result<ImageStats> {
     std::fs::create_dir_all(work)?;
+    // The small leaves every unit may copy (`FnUnit::leaves`), and how
+    // their returns pop. A stub's body is not its function's: no copy.
+    let mut leaves = HashMap::new();
+    let mut leaf_pops = HashMap::new();
+    if func::leaf_copies() {
+        let mut gir = GirReader::open(recovery)?;
+        while let Some(f) = gir.next()? {
+            if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
+                leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                leaves.insert(f.entry, f);
+            }
+        }
+    }
+    let leaves = std::sync::Arc::new(leaves);
+    let new_unit = || {
+        let mut unit = FnUnit::new();
+        unit.set_class32(rec.class32);
+        unit.ftab = true;
+        unit.touched = rec.touched.clone();
+        unit.guardfree = rec.guardfree.clone();
+        unit.icall_hints = std::sync::Arc::clone(hints);
+        unit.leaves = std::sync::Arc::clone(&leaves);
+        unit.ret_pops = leaf_pops.clone();
+        unit
+    };
     std::fs::create_dir_all(objects)?;
     let header_text = header::header();
     std::fs::write(work.join("gex_abi.h"), &header_text)?;
@@ -466,6 +498,7 @@ fn emit_and_link(
             });
         }
         let emit = |unit: &mut FnUnit, k: usize, objs: &mut Vec<PathBuf>, stats: &mut ImageStats| -> Result<()> {
+            unit.add_leaf_copies(&known, &rec.sums, &rec.trapfree)?;
             let src_text = unit.source();
             stats.c_bytes += src_text.len() as u64;
             let key = hash128(&[src_text.as_bytes(), header_text.as_bytes(), flags.as_bytes(), version.as_bytes()]);
@@ -480,19 +513,13 @@ fn emit_and_link(
             }
             objs.push(obj);
             stats.units += 1;
-            *unit = FnUnit::new();
-            unit.set_class32(rec.class32);
-            unit.ftab = true;
-            unit.touched = rec.touched.clone();
-        unit.guardfree = rec.guardfree.clone();
+            stats.devirt += unit.stats.calls_devirt;
+            stats.leaf_copies += unit.stats.calls_leaf_copy;
+            *unit = new_unit();
             Ok(())
         };
         let mut gir = GirReader::open(recovery)?;
-        let mut unit = FnUnit::new();
-        unit.set_class32(rec.class32);
-        unit.ftab = true;
-        unit.touched = rec.touched.clone();
-        unit.guardfree = rec.guardfree.clone();
+        let mut unit = new_unit();
         let mut k = 0usize;
         while let Some(f) = gir.next()? {
             if skip.contains(&f.entry) {
