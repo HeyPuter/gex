@@ -14,6 +14,7 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::Options;
 use std::process::ExitCode;
 
+mod prof;
 mod eject;
 mod nt_run;
 mod pe_info;
@@ -40,7 +41,11 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
     match argv[1].as_str() {
-        "run" => cmd_run(&argv[2..]),
+        "run" => {
+            let r = cmd_run(&argv[2..]);
+            prof::finish();
+            r
+        }
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "seed" => cmd_seed(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
@@ -500,6 +505,7 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
+    prof::start();
     let mut ra = parse_run_args(args)?;
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
     if gex_ld::pe::is_pe(&bytes) {

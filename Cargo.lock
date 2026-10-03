@@ -678,6 +678,7 @@ dependencies = [
  "gex-ld",
  "gex-native",
  "gex-xlate",
+ "libc",
 ]
 
 [[package]]
