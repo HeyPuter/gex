@@ -1034,6 +1034,27 @@ export class Gex {
       free?.(dp, d.length);
     }
     if (partBuf) free?.(partBuf, PART);
+    // Hard links (`web/src/tar.js`), after their targets: one inode with two
+    // names, as the host had it. A shim that cannot link gets a copy.
+    for (const [path, target] of Object.entries(opts.hard ?? {})) {
+      const p = enc.encode(path);
+      const t = enc.encode(target);
+      const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
+      const tp = this.#shim.exports.gex_alloc(t.length) >>> 0;
+      this.#bytes().set(p, pp);
+      this.#bytes().set(t, tp);
+      const linked = this.#shim.exports.gex_add_hardlink?.(tp, t.length, pp, p.length) ?? 0;
+      const d = files[target];
+      if (!linked && d) {
+        const dp = this.#shim.exports.gex_alloc(d.length) >>> 0;
+        this.#bytes().set(d, dp);
+        this.#shim.exports.gex_add_file(pp, p.length, dp, d.length);
+        free?.(dp, d.length);
+      }
+      if (modes[target] !== undefined) this.#shim.exports.gex_chmod?.(pp, p.length, modes[target]);
+      free?.(pp, p.length);
+      free?.(tp, t.length);
+    }
     // The bundle's file times (seconds since the epoch), as the host had them:
     // a program that records one -- gzip's header, make's rebuild test --
     // sees what it would natively rather than 1970.

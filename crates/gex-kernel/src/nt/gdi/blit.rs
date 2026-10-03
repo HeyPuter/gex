@@ -131,6 +131,42 @@ pub fn fill_rect(c: &mut Call<'_>, hdc: u32, r: &Rect, brush: u32) -> R<()> {
     blit(c, &t, r.left, r.top, r.width(), r.height(), None, 0, 0, 0, 0, 0x00f0_0021)
 }
 
+/// Fill `r` (logical) with one color, inside `clip` (logical) if given: a
+/// text background (ExtTextOut's ETO_OPAQUE and OPAQUE background mode).
+pub fn fill_solid(c: &mut Call<'_>, hdc: u32, r: &Rect, rgb: u32, clip: Option<&Rect>) -> R<()> {
+    let Some(t) = target(c, hdc)? else { return Ok(()) };
+    let mut area = r.offset(t.dx, t.dy);
+    if let Some(cl) = clip {
+        area = area.intersect(&cl.offset(t.dx, t.dy));
+    }
+    for cr in &t.clip {
+        let a = area.intersect(cr);
+        for y in a.top..a.bottom {
+            for x in a.left..a.right {
+                t.bm.set(c, x, y, rgb);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set `points` (logical) to one color, inside `clip` (logical) if given:
+/// a bitmap font's glyphs.
+pub fn plot(c: &mut Call<'_>, hdc: u32, points: &[(i32, i32)], rgb: u32, clip: Option<&Rect>) -> R<()> {
+    let Some(t) = target(c, hdc)? else { return Ok(()) };
+    let lim = clip.map(|cl| cl.offset(t.dx, t.dy));
+    for &(x, y) in points {
+        let (px, py) = (x + t.dx, y + t.dy);
+        if lim.as_ref().is_some_and(|l| px < l.left || py < l.top || px >= l.right || py >= l.bottom) {
+            continue;
+        }
+        if t.clip.iter().any(|r| px >= r.left && py >= r.top && px < r.right && py < r.bottom) {
+            t.bm.set(c, px, py, rgb);
+        }
+    }
+    Ok(())
+}
+
 /// The pattern color at device (x, y), or `None` for a null brush.
 struct Pattern {
     solid: Option<u32>,

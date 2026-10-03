@@ -502,6 +502,9 @@ dependencies = [
 [[package]]
 name = "gex-gl"
 version = "0.0.1"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "gex-gpu"

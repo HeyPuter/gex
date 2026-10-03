@@ -198,6 +198,10 @@ impl nt::display::NtDisplay for PpmDisplay {
         }
         let mut st = self.state.lock().unwrap();
         st.windows.insert(s.id, (s.x, s.y, w, h, px));
+        if st.written % crate::ppm_every() as u64 != 0 {
+            st.written += 1;
+            return;
+        }
         // The bounding box of what is shown, composited in id order.
         let (mut l, mut t, mut r, mut b) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         for (x, y, w, h, _) in st.windows.values() {

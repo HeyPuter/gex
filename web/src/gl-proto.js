@@ -198,7 +198,7 @@ export const op = {
 };
 
 export const MAGIC = 0x47584547;
-export const PROTOCOL_VERSION = 12;
+export const PROTOCOL_VERSION = 13;
 export const HEADER_BYTES = 32;
 
 export const error = {

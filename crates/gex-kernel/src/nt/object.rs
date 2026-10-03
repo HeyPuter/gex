@@ -335,3 +335,18 @@ pub fn nt_set_information_object(c: &mut Call<'_>) -> R {
         _ => Err(c.unimplemented(&format!("NtSetInformationObject class {class}"))),
     }
 }
+
+/// `NtSetSecurityObject(handle, info, sd)`: gex keeps no security
+/// descriptors (every object is the user's), so setting one on a valid
+/// handle succeeds and changes nothing.
+pub fn nt_set_security_object(c: &mut Call<'_>) -> R {
+    let (h, sd) = (c.a32(0), c.a(2));
+    if sd == 0 {
+        return Err(Status(st::INVALID_PARAMETER));
+    }
+    // The pseudo-handles (current process, thread) are always valid.
+    if h < 0xffff_fff0 && c.p.st.lock().unwrap().handles.get_mut(h).is_none() {
+        return Err(Status(st::INVALID_HANDLE));
+    }
+    Ok(st::SUCCESS)
+}

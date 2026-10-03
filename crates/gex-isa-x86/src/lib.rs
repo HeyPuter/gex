@@ -356,6 +356,9 @@ pub enum Op {
     Ret,
     Leave,
     Enter,
+    /// `pusha`/`pushad` and `popa`/`popad`: 32-bit code only.
+    Pusha,
+    Popa,
     Syscall,
     Int3,
     Int,
@@ -478,7 +481,9 @@ pub enum Op {
     /// `cvtps2dq`/`cvtpd2dq` and the truncating forms.
     Cvtp2dq { truncate: bool },
     /// MMX-register conversions (`cvtpi2ps` etc.).
-    CvtMmx,
+    /// `cvtpi2ps`/`cvtpi2pd` (an `xmm` destination) and `cvt[t]ps2pi`/
+    /// `cvt[t]pd2pi` (an `mm` one).
+    CvtMmx { truncate: bool },
 
     // -- SSE integer (lane in `lane`) -------------------------------------
     Padd,

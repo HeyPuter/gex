@@ -451,6 +451,19 @@ pub struct Gl {
     pub vendor: String,
     pub renderer: String,
     pub version: String,
+    /// Read the surface back at each PRESENT (`keep_frames`), for a host
+    /// that shows or writes the frames; the last one waits in `frame`.
+    keep_frames: bool,
+    frame: Option<Frame>,
+    /// PRESENTs so far.
+    pub presents: u64,
+}
+
+/// A presented frame: RGBA rows, top first.
+pub struct Frame {
+    pub width: i32,
+    pub height: i32,
+    pub rgba: Vec<u8>,
 }
 
 /// What the host wants to say back, appended to the reply area in order.
@@ -578,6 +591,9 @@ impl Gl {
                 vendor: gl_string(0x1F00),
                 renderer: gl_string(0x1F01),
                 version: gl_string(0x1F02),
+                keep_frames: false,
+                frame: None,
+                presents: 0,
             })
         }
     }
@@ -722,13 +738,36 @@ impl Gl {
         self.names.programs.get(&guest).copied()
     }
 
+    /// Read each presented frame back for [`Gl::take_frame`].
+    pub fn keep_frames(&mut self, on: bool) {
+        self.keep_frames = on;
+    }
+
+    /// The last frame presented since the previous call.
+    pub fn take_frame(&mut self) -> Option<Frame> {
+        self.frame.take()
+    }
+
     /// Run one batch. Returns the reply and, if the stream was malformed,
     /// where and why.
     pub fn run(&mut self, batch: &[u8]) -> (Reply, u32, u32) {
-        let mut reply = Reply::default();
         if self.make_current().is_err() {
-            return (reply, error::NO_CONTEXT, 0);
+            return (Reply::default(), error::NO_CONTEXT, 0);
         }
+        let r = self.run_current(batch);
+        // Released after every batch: a guest may submit from any of its
+        // threads (wined3d's command stream thread and the main one), and a
+        // context still current on one thread cannot be made current on
+        // another. Batches are already serialized by the device.
+        unsafe {
+            eglMakeCurrent(self.display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        }
+        self.current_on = None;
+        r
+    }
+
+    fn run_current(&mut self, batch: &[u8]) -> (Reply, u32, u32) {
+        let mut reply = Reply::default();
         let mut commands = Commands::new(batch);
         let mut index = 0u32;
         loop {
@@ -778,6 +817,42 @@ impl Gl {
                 op::FINISH => {
                     glFinish();
                     reply.u32(0);
+                }
+                // This host has one drawable, the pbuffer: every surface
+                // draws into it, and a frame is what it holds at a PRESENT.
+                op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
+                op::PRESENT => {
+                    self.presents += 1;
+                    if self.keep_frames {
+                        let (w, h) = (self.width, self.height);
+                        let mut px = vec![0u8; (w * h * 4) as usize];
+                        // The program's read framebuffer, pack buffer and
+                        // pack state are put back after.
+                        let mut prev = [0; 6];
+                        let saved = [0x8CAA, 0x88ED, 0x0D05, 0x0D02, 0x0D03, 0x0D04];
+                        for (v, pname) in prev.iter_mut().zip(saved) {
+                            glGetIntegerv(pname, v);
+                        }
+                        glBindFramebuffer(0x8CA8, 0); // GL_READ_FRAMEBUFFER
+                        glBindBuffer(0x88EB, 0); // GL_PIXEL_PACK_BUFFER
+                        for pname in [0x0D02, 0x0D03, 0x0D04] {
+                            glPixelStorei(pname, 0);
+                        }
+                        glPixelStorei(0x0D05, 4);
+                        glReadPixels(0, 0, w, h, 0x1908, 0x1401, px.as_mut_ptr() as *mut c_void); // GL_RGBA, GL_UNSIGNED_BYTE
+                        glBindFramebuffer(0x8CA8, prev[0] as GLuint);
+                        glBindBuffer(0x88EB, prev[1] as GLuint);
+                        for (i, pname) in saved.iter().enumerate().skip(2) {
+                            glPixelStorei(*pname, prev[i]);
+                        }
+                        // GL's rows are bottom first.
+                        let stride = (w * 4) as usize;
+                        let mut rgba = Vec::with_capacity(px.len());
+                        for row in px.chunks_exact(stride).rev() {
+                            rgba.extend_from_slice(row);
+                        }
+                        self.frame = Some(Frame { width: w, height: h, rgba });
+                    }
                 }
 
                 op::CLEAR_COLOR => {
@@ -877,6 +952,7 @@ impl Gl {
                     if let (Some(p), Some(v)) = (a.u32(), a.i32()) {
                         glPixelStorei(p, v);
                         set_pixel_store(&mut self.pack_store, &mut self.unpack_store, p, v);
+                        native::gexgl_native_pixel_store(p, v);
                     }
                 }
 
@@ -945,6 +1021,7 @@ impl Gl {
                     };
                     let real = glCreateShader(ty);
                     self.names.shaders.insert(name, real);
+                    native::gexgl_native_name(0, name, real);
                 }
                 op::SHADER_SOURCE => {
                     let (Some(name), Some(src)) = (a.u32(), a.blob()) else {
@@ -965,6 +1042,7 @@ impl Gl {
                 op::DELETE_SHADER => {
                     if let Some(n) = a.u32() {
                         if let Some(real) = self.names.shaders.remove(&n) {
+                            native::gexgl_native_name(0, n, 0);
                             glDeleteShader(real);
                         }
                     }
@@ -973,6 +1051,7 @@ impl Gl {
                     if let Some(name) = a.u32() {
                         let real = glCreateProgram();
                         self.names.programs.insert(name, real);
+                        native::gexgl_native_name(1, name, real);
                     }
                 }
                 op::ATTACH_SHADER => {
@@ -1007,6 +1086,7 @@ impl Gl {
                 op::DELETE_PROGRAM => {
                     if let Some(n) = a.u32() {
                         if let Some(real) = self.names.programs.remove(&n) {
+                            native::gexgl_native_name(1, n, 0);
                             glDeleteProgram(real);
                         }
                     }
@@ -1287,14 +1367,6 @@ impl Gl {
                     let s = gl_string(name);
                     reply.blob(s.as_bytes());
                 }
-                op::GET_INTEGERV => {
-                    let Some(pname) = a.u32() else { return true };
-                    let mut v = [0 as GLint; 4];
-                    glGetIntegerv(pname, v.as_mut_ptr());
-                    for x in v {
-                        reply.u32(x as u32);
-                    }
-                }
                 op::GET_ERROR => {
                     reply.u32(glGetError());
                 }
@@ -1493,10 +1565,30 @@ impl Gl {
                         _ => return false,
                     }
                 }
-                _ => return false,
+                // The generated commands (GL 4.4 and the registry's
+                // compatibility profile) are decoded by the C++ shared with
+                // the browser's host.
+                _ => {
+                    let (mut out, mut len) = (std::ptr::null(), 0usize);
+                    if native::gexgl_native_one(opcode, body.as_ptr(), body.len(), &mut out, &mut len) != 1 {
+                        return false;
+                    }
+                    if len > 0 {
+                        reply.bytes.extend_from_slice(std::slice::from_raw_parts(out, len));
+                    }
+                }
             }
         }
         true
+    }
+}
+
+/// native/gexgl-native.cpp (built by build.rs).
+mod native {
+    extern "C" {
+        pub fn gexgl_native_one(op: u32, body: *const u8, len: usize, reply: *mut *const u8, reply_len: *mut usize) -> i32;
+        pub fn gexgl_native_pixel_store(pname: u32, param: i32);
+        pub fn gexgl_native_name(kind: u32, guest: u32, host: u32);
     }
 }
 
@@ -1977,11 +2069,10 @@ mod tests {
         assert_eq!(status, error::NONE);
         let r = reply.bytes();
         let mut at = 0;
+        // GET_INTEGERV's reply is a blob of as many values as the pname has.
+        assert_eq!(read_u32(r, &mut at), 4, "GL_BLEND is one value");
         let blend = read_u32(r, &mut at);
         assert_eq!(blend, 0, "POP_ATTRIB restored the blend enable");
-        for _ in 0..3 {
-            let _ = read_u32(r, &mut at);
-        }
         let loc = read_u32(r, &mut at);
         let mut b = Batch::new();
         b.raw(op::UNIFORM_4FV, &[loc, 1, color.len() as u32], &color);

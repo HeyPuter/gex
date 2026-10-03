@@ -10,7 +10,9 @@
 //! arithmetic flags are `N` (SF), `Z`, `C`, `V` (OF), `P` and `A`, with `D`
 //! for the direction flag. `Tpidr` holds the FS base and `TpidrRo` the GS
 //! base. `xmm0`–`xmm15` are `V128(0..16)`. The x87 stack lives in the
-//! context as eight doubles reached through `GuestReg::CtxAddr`.
+//! context as eight doubles reached through `GuestReg::CtxAddr`. `mm0`–`mm7`
+//! are the low halves of `V128(16..24)` (upper halves kept zero), apart from
+//! the x87 registers they alias in hardware: see `sse.rs`.
 
 #![forbid(unsafe_code)]
 
@@ -39,6 +41,9 @@ pub mod sysreg {
     /// `cmpxchg16b`: written with the effective address; the host compares
     /// and swaps under its lock and sets `rax`, `rdx` and ZF in the context.
     pub const CMPXCHG16B: i32 = -102;
+    /// `GEX_TRACE_INSNS`: written with the pc before an instruction; the
+    /// host logs the context.
+    pub const TRACE: i32 = -103;
 }
 
 /// The x87 operations [`sysreg::X87`] carries: an operation code in the low
@@ -140,6 +145,8 @@ pub struct Lifter<'a> {
     /// The current instruction's memory operand, for the x87 forms whose
     /// decoded `X87Src` names memory without carrying the operand.
     cur_mem: Operand,
+    /// Lifting an MMX instruction: `mm` operands and 64-bit memory (sse.rs).
+    mmx: bool,
 }
 
 const RAX: u8 = 0;
@@ -177,6 +184,7 @@ impl<'a> Lifter<'a> {
             pc: 0,
             next: 0,
             cur_mem: Operand::Imm(0),
+            mmx: false,
         }
     }
 
@@ -1303,6 +1311,25 @@ impl<'a> Lifter<'a> {
                 self.wr64(RSP, rbp);
                 let v = self.pop(w);
                 self.wr_reg(Reg::Gp(RBP, w), v);
+                Flow::Next
+            }
+            Op::Pusha => {
+                // eax, ecx, edx, ebx, the esp from before, ebp, esi, edi.
+                let sp = self.rd(Operand::Reg(Reg::Gp(RSP, w)), w);
+                for r in 0..8 {
+                    let v = if r == RSP { sp } else { self.rd(Operand::Reg(Reg::Gp(r, w)), w) };
+                    self.push(w, v);
+                }
+                Flow::Next
+            }
+            Op::Popa => {
+                // The reverse, skipping the saved esp.
+                for r in (0..8).rev() {
+                    let v = self.pop(w);
+                    if r != RSP {
+                        self.wr_reg(Reg::Gp(r, w), v);
+                    }
+                }
                 Flow::Next
             }
             Op::Enter => {

@@ -69,6 +69,8 @@ pub fn run(ra: &RunArgs, bytes: &[u8]) -> Result<Exit> {
         cwd: nt::boot::dos_path(&prefix, &cwd),
         trace: ra.opts.trace || flag("GEX_NT_TRACE"),
         strict: flag("GEX_NT_STRICT"),
+        // Read from the process environment (Process::setting).
+        settings: Vec::new(),
     };
     let setup = NtSetup { abi, exe_path, args: ra.guest_args.clone(), cfg, display_out: None };
     let (exit, _stats) = gex_native::nt::run_nt_program(&ra.opts, &ra.xlate, &setup)?;

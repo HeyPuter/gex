@@ -64,6 +64,33 @@ pub fn log_entry(gm: &GuestMem<'_>, ctx_addr: u64, tid: i32, pc: u64) {
     let _ = f.lock().unwrap_or_else(|e| e.into_inner()).write_all(s.as_bytes());
 }
 
+/// `GEX_TRACE_INSNS`: one line per traced instruction, to GEX_TRACE_FILE
+/// (default stderr): `pc eax ecx edx ebx esp ebp esi edi flags`, the flags
+/// as x86 EFLAGS bits (CF PF AF ZF SF DF OF). i386 width when the process is
+/// one.
+pub fn log_trace(gm: &GuestMem<'_>, ctx_addr: u64, pc: u64) {
+    static OUT: std::sync::OnceLock<Mutex<Box<dyn Write + Send>>> = std::sync::OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        let w: Box<dyn Write + Send> = match std::env::var("GEX_TRACE_FILE") {
+            Ok(p) => Box::new(std::io::LineWriter::new(std::fs::File::create(p).expect("GEX_TRACE_FILE"))),
+            Err(_) => Box::new(std::io::stderr()),
+        };
+        Mutex::new(w)
+    });
+    let f = |o: usize| gm.read(ctx_addr + ctx::NZCV as u64 + o as u64, 1).map(|b| b[0] as u64 & 1).unwrap_or(0);
+    // N Z C V P A D bytes -> SF ZF CF OF PF AF DF bits.
+    let eflags = f(2) | f(4) << 2 | f(5) << 4 | f(1) << 6 | f(0) << 7 | f(6) << 10 | f(3) << 11;
+    let compat = COMPAT.load(Ordering::Relaxed);
+    let mut s = format!("{pc:x}");
+    for n in 0..8u8 {
+        let v = rd(gm, ctx_addr + ctx::x(n) as u64);
+        s += &format!(" {:x}", if compat { v & 0xffff_ffff } else { v });
+    }
+    s += &format!(" {eflags:x}\n");
+    let _ = out.lock().unwrap_or_else(|e| e.into_inner()).write_all(s.as_bytes());
+}
+
+
 /// The result line: `R tid result`.
 pub fn log_result(gm: &GuestMem<'_>, ctx_addr: u64, tid: i32) {
     let Some(f) = log() else { return };
