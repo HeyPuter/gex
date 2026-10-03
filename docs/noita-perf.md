@@ -437,3 +437,39 @@ bridge; with no predicted return, each one is counted.
 3. Avoid the trap-out for exceptions handled in the faulting frame.
 4. Then sched_yield (7.1% in F's run: Noita's own yield loops) and the
    heap.
+
+### Stream F at the machine restart (2026-10-03)
+
+merge/fjit @ 9eacbbd5 (abi9 65f9a719 and the AOT-share line merged).
+
+Since the step-4 report:
+- c9100b46: local resume is final. Exact-mode lockstep 30/30 on gi386 and
+  gx64; tests/nt/cgen-prefix.sh 50/50.
+- cg8 units (local resume, before the IAT fix), 4x, null display, cores 4
+  and 10: world fps 27.2-28.6 steady (cg7: 25), world-up 443 s, resumes
+  10,843 (all during loading), tier-1 module cache 0/10,821 hits (the
+  key includes the build fingerprint, so every new binary starts cold;
+  tier-1 compiling cost 327 s of CPU).
+- AOT share on cg7 (tools/aot-coverage.py): 73.3% of guest CPU. noita.exe
+  60.5% units, 21.3% tier-1 interior, 1.5% missed; msvcr120 2.1%
+  interior, ntdll 0.75%, kernelbase 0.69%.
+- d11b5464: the IAT slots are zeroed before recovery. In the file they
+  hold hint RVAs; read as constant jump tables, every import thunk was
+  garbage that "never returns", so 395 noita.exe call sites lost their
+  continuation (code after memset/sqrt calls ran on tier-1). New
+  recovery: 0 noreturn calls (was 395), 100,215 functions (was 100,147);
+  the 38 pewasm-only starts were all behind such calls. Units tail-call
+  unresolved jumps (now every thunk) through the function table.
+- 101a7477: a switch's default does the same.
+- Gates on the binary with all of the above (gexc-cg11): exact lockstep
+  gi386 30/30; gx64 exact, flags-ignored mode and cgen-prefix.sh not run
+  (stopped for the restart).
+
+Exact next step: finish the gates on `scratchpad/fjit/gexc-cg11` (exact
+and flags-ignored lockstep on gx64, tests/nt/cgen-prefix.sh), then
+`build-units.sh gexc-cg11 cgcache-cg9` (keep cg7/cg8: R's overlay reads
+cg8), then the Noita run (`GEX_CGEN_CACHE=.../cgcache-cg9 NULLDISP=1
+GEX_NT_TIME_SCALE=4 CPUS=4,10 GEXC=gexc-cg11 run-noita2.sh u11 1200` with
+GEX_PROF/GEX_PERFMAP past world-up) and tools/aot-coverage.py against
+cgcache-cg9, splitting interior into what the IAT fix removed and what
+remains for R.
