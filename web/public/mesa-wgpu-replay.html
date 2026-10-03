@@ -123,9 +123,6 @@
     console.log('LIMITS ' + JSON.stringify(Object.fromEntries(
       limitNames.map((n) => [n, device.limits[n]]))));
 
-    const traceBytes = new Uint8Array(await (await fetch(tracePath)).arrayBuffer());
-    const trace = parseTrace(traceBytes);
-
     const { default: createModule } = await import('/gex/gex-wgpu-replay.js');
     const module = await createModule({
       preinitializedWebGPUDevice: device,
@@ -133,6 +130,11 @@
       print: (line) => console.log(line),
       printErr: (line) => console.error(line),
     });
+
+    // The trace after the module: a large one fetched first left the
+    // module's workers never loading.
+    const traceBytes = new Uint8Array(await (await fetch(tracePath)).arrayBuffer());
+    const trace = parseTrace(traceBytes);
 
     // Readback suspends the wasm stack, so every submit goes through JSPI.
     const submitRaw = WebAssembly.promising(module.gexGlSubmitRaw);
