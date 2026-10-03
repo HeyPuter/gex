@@ -155,6 +155,10 @@ fn layout_misses() -> u64 {
 /// `GEX_NT_INPUT`'s.
 struct PpmDisplay {
     prefix: String,
+    /// `GEX_NT_PPM_EVERY=N`: write every Nth frame only (named by its real
+    /// index, so `GEX_NT_INPUT`'s frame numbers still line up). A long run
+    /// at 1920x1080 is 6 MB a frame otherwise.
+    every: u64,
     state: Mutex<PpmState>,
 }
 
@@ -167,7 +171,8 @@ struct PpmState {
 
 impl PpmDisplay {
     fn new(prefix: &str) -> PpmDisplay {
-        PpmDisplay { prefix: prefix.to_string(), state: Mutex::new(PpmState::default()) }
+        let every = std::env::var("GEX_NT_PPM_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1);
+        PpmDisplay { prefix: prefix.to_string(), every, state: Mutex::new(PpmState::default()) }
     }
 }
 
@@ -183,6 +188,10 @@ impl nt::display::NtDisplay for PpmDisplay {
         }
         let mut st = self.state.lock().unwrap();
         st.windows.insert(s.id, (s.x, s.y, w, h, px));
+        if st.written % self.every != 0 {
+            st.written += 1;
+            return;
+        }
         // The bounding box of what is shown, composited in id order.
         let (mut l, mut t, mut r, mut b) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         for (x, y, w, h, _) in st.windows.values() {
