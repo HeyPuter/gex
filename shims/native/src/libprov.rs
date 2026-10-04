@@ -118,14 +118,24 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
 /// Guest pages from the NT allocator (a Windows process; there is no other
 /// kind of stateful provider yet).
 pub(crate) fn alloc(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
-    let p = state.nt.clone().ok_or_else(|| anyhow!("a stateful provider outside a Windows process"))?;
+    let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
     state.with_kernel(|k| gex_kernel::nt::boot::alloc_private(&p, k, size, name)).map_err(|e| anyhow!(e))
+}
+
+/// Guest pages in a Linux process (a native wasm32 program, `wasmprog`):
+/// an anonymous private mapping, as the program's own `mmap` would get.
+fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
+    use gex_kernel::mem::prot;
+    let len = (size + 0xfff) & !0xfff;
+    state
+        .with_kernel(|k| k.mem.mmap(0, len, prot::READ | prot::WRITE, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
+        .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
 /// [`alloc`] from the top down (`boot::alloc_private_top`): a built-in
 /// provider's data and heap, which must not move the program's later DLLs.
 pub(crate) fn alloc_top(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
-    let p = state.nt.clone().ok_or_else(|| anyhow!("a stateful provider outside a Windows process"))?;
+    let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
     state.with_kernel(|k| gex_kernel::nt::boot::alloc_private_top(&p, k, size, name)).map_err(|e| anyhow!(e))
 }
 
@@ -177,11 +187,21 @@ pub(crate) fn install(
     let (size, align) = dylink_memory(&wasm)?;
     let data = alloc(state, (size as u64).max(16) + (1u64 << align), &format!("[provider {} data]", p.name))?;
     let data = (data + (1u64 << align) - 1) & !((1u64 << align) - 1);
-    let module = gex_cache::load_or_compile_at(engine, &p.wasm.with_extension("cwasm"), &wasm)
+    let module = gex_cache::load_or_compile_at(engine, &cwasm_path(&p.wasm, &wasm), &wasm)
         .with_context(|| format!("compiling provider {}", p.name))?;
     crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
     ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, Extras { memory_base: data as u32 })?;
     Ok(pairs.len())
+}
+
+/// Where a provider module's compiled form is kept: beside it, named by
+/// the module's content (`lua51.0123456789abcdef.cwasm`), so a rebuilt
+/// module is never run from a stale artifact. Anything that precompiles a
+/// provider ahead of time (an ejected project) names it with this too.
+pub fn cwasm_path(wasm_path: &std::path::Path, wasm: &[u8]) -> PathBuf {
+    let key = gex_cache::key("libprov", [wasm]);
+    let stem = wasm_path.file_stem().and_then(|s| s.to_str()).unwrap_or("provider");
+    wasm_path.with_file_name(format!("{stem}.{}.cwasm", &key[..16]))
 }
 
 /// Data whose relocations have been applied: the process (its linear

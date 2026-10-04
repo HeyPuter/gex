@@ -519,10 +519,19 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         }
         let wasm = std::fs::read(&out)?;
         check_provider_imports(&wasm, &format!("the provider for {}", p.library))?;
-        // Its compiled form is keyed by nothing but its path: compiled anew.
-        let _ = std::fs::remove_file(out.with_extension("cwasm"));
-        gex_cache::load_or_compile_at(&engine, &out.with_extension("cwasm"), &wasm)
-            .with_context(|| format!("compiling the provider for {}", p.library))?;
+        // Its compiled form, named by its content as the runtime looks it
+        // up (`libprov::cwasm_path`): gex-rt has no compiler to make it.
+        // Older ones beside it are stale.
+        let cwasm = gex_native::libprov::cwasm_path(&out, &wasm);
+        if let (Some(d), Some(stem)) = (out.parent(), out.file_stem().and_then(|s| s.to_str())) {
+            for e in std::fs::read_dir(d)?.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with(&format!("{stem}.")) && n.ends_with(".cwasm") && e.path() != cwasm {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        gex_cache::load_or_compile_at(&engine, &cwasm, &wasm).with_context(|| format!("compiling the provider for {}", p.library))?;
         report.providers.push(format!("{} ({} KiB, stateful)", p.library, wasm.len() / 1024));
     }
     // Link groups (docs/eject-pe.md §6a): members by file name, one module

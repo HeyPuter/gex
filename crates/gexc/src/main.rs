@@ -573,6 +573,25 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         } else {
             Mode::Default
         });
+        // Native wasm DLLs (stream W, docs/wine-native.md W0(b)):
+        // `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` binds each module's
+        // `gexp_<export>` functions at that DLL's exports when it maps (a
+        // stateful provider, `libprov`).
+        if let Ok(v) = std::env::var("GEX_WASM_DLLS") {
+            let libs = v
+                .split(',')
+                .filter(|e| !e.is_empty())
+                .map(|e| {
+                    let (dll, wasm) = e.split_once('=').context("GEX_WASM_DLLS: want dll=module.wasm")?;
+                    Ok(gex_native::libprov::LibProvider {
+                        name: dll.to_string(),
+                        dlls: vec![dll.to_ascii_lowercase()],
+                        wasm: std::path::PathBuf::from(wasm),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            gex_native::libprov::set(libs);
+        }
         let exit = nt_run::run(&ra, &bytes)?;
         if let Some(dir) = gex_native::profile::finish(&exit)? {
             if ra.opts.verbose {

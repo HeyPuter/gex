@@ -1063,3 +1063,34 @@ One general mechanism serves Windows and Linux guests on every tier.
 **Owner:** stream R. It builds the mechanism, then steps 1–4 on 32-bit PE
 first, since that's Noita. Steps 5 and 6 follow, once Noita's profile no
 longer shows libc.
+
+## 10. A native gex wasm target for any program (future, noted 2026-10-04)
+
+Stream W's Wine work (docs/wine-native.md §3.10, §4.1) created a general
+target. clang `--target=wasm32-unknown-linux-musl` plus the gex musl port
+(arch/wasm32, syscalls through `gex.syscall` on the i386 ABI) builds a PIC/PIE
+wasm module. gexc runs it from an ELF32 container (wasmprog.rs) as a normal
+process: exec, stack, auxv, brk, fds, sockets, fork in the syscall, and
+threads as Workers or instances.
+
+So any POSIX C/C++ program can be compiled for gex and run natively beside
+translated x86 programs. It shares the kernel, the VFS, sockets, the
+compositor and gex-gl. It can also go further:
+- **A native userland.** sh, coreutils, busybox, Xwayland and Mesa built
+  natively instead of translated. Half-Life's X display could come from a
+  native Xwayland in the same gex instance, avoiding the mixed-ISA problem
+  (stream U).
+- **Native libraries inside translated processes.** The same modules
+  dlopen'd by x86 programs, through §9.9 providers with generated adapters.
+  This generalises the hand-written providers and PUC Lua.
+- **Toolchain products.** A `gexcc` wrapper, a sysroot, and (later) the
+  wasm64 variant (memory64) for 64-bit programs.
+
+Gaps before it is general:
+- setjmp/longjmp and C++ exceptions need wasm EH;
+- signal delivery to native code;
+- dlopen for native .so;
+- a defined `wasm32` kernel personality (W1);
+- performance work on the syscall boundary.
+
+Not scheduled. Revisit after Wine W1–W3 have hardened the toolchain.
