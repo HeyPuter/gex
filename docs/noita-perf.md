@@ -675,3 +675,59 @@ wined3d, ddraw and d3d8 had no layout base and so no unit. 126d8269 adds
 the Direct3D set to tools/nt-cgen-core.txt, with `cgen-prefix --append`,
 which keeps every existing base (dry run: 18 entries added, none moved).
 It is applied to the staged prefix with cg12.
+
+### Stream F at the reboot (2026-10-03, late)
+
+merge/fjit @ 2a256612. In it, since d71ef103:
+- abi9 adb0efbc merged;
+- e3cc3434: 32-bit i386 GPR stores on by default; R's efcb8bfc
+  zero-extends every host writer;
+- 8327893c: 32-bit loads;
+- cfc3ed08: leaf copies bounded by 32 guest instructions;
+- 3c9f6f82: the fjit clock, wasm-safe;
+- 126d8269: `cgen-prefix --append` and the D3D set in nt-cgen-core.txt;
+- 2a256612: fixes a panic in 417b638f's fetch, which stopped cgen-prefix on
+  user32/rpcrt4. Any binary between 417b638f and 2a256612 crashes a full
+  cgen-prefix.
+
+**cg11 was abandoned** (that panic). **cg12 not built.** Its gates ran on
+`scratchpad/fjit/gexc-cg19` (= 2a256612) until the reboot:
+- lockstep exact gi386 30/30, gx64 30/30 (GEX_CHECK_I386_HIGH=1);
+- tests/nt --no-cgen 60/60;
+- cgen-prefix.sh was mid-run (stopped).
+
+`cgcache-cg12` has only objects from that gate.
+
+The staged layout (~/.cache/gex/wine-11.15/gex-layout) is **untouched**:
+the --append step had not run.
+
+**Resume, in order:**
+1. Rebuild gexc at merge/fjit HEAD (or reuse gexc-cg19) and rerun
+   `scratchpad/fjit/cg12.sh`. It runs:
+   - every gate: lockstep, tests/nt, cgen-prefix, the i386-high scan of
+     the x86 NT tests under --cgen, providers;
+   - then `cgen-prefix ~/.cache/gex/wine-11.15 --append --layout-only`,
+     whose diff must have no removed lines (scratchpad
+     `append-removed.txt`);
+   - then `build-units.sh` (now `--append` on the run prefix) into
+     cgcache-cg12.
+
+   About 3 h on a loaded machine.
+2. Send the coordinator the new layout's path and sha256 and the cache path
+   (for B, E and U).
+3. `scratchpad/fjit/abba.sh`: fixed-seed ABBA, cg10 (`gexc-cg10f`, cg10's
+   source plus fixed time and per-thread profiles; checked: it finds all
+   eight Noita units) against cg12 (`gexc-cg19`), with pewasm before,
+   between and after, on cores 4,10. Then `threadwork.py TAG`: each
+   worker's real-work ms/frame against pewasm's t1/t2 (about 5.9 ms),
+   R's question (codegen, or wake latency).
+4. Not started: the coordinator's engine A/B. Run the Tier 0 corpus's
+   identical wasm under node and under wasmtime (gexc), per kernel and
+   geomean, with wasmtime's config noted (bounds checks, guard pages,
+   Cranelift opt level, shared memory), plus a 724580-sized microbench.
+5. Peggle: hints are staged in `scratchpad/fjit/cgcache-peg/icall/`
+   (popcapgame1.exe at 0x400000; wined3d, ddraw, d3d8 at their appended
+   bases), from gex's own recording (`scratchpad/fjit/peggle/rec`, tier-1,
+   10.6 fps). After cg12's layout append: units for popcapgame1, bass and
+   j2k, then `tests/games/peggle.sh -- --cgen` on 5,11 (coordinate with
+   B), against tier-1.
