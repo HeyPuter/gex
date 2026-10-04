@@ -461,6 +461,89 @@ link adds:
   `dlopen("/usr/lib/wine/i386-unix/ws2_32.so")`, and an unlinked library
   fails with dlerror (`tools/wine-wasm/spike-a/ws2test.c -DUSE_DLOPEN`).
 
+### 3.13 The PE side's build (W1, as built)
+
+In the Wine fork (`wt/wine-wasm`, branch `wasm32`):
+- **`CPU_WASM32` in the tools** (`tools/tools.h`): i386's data layout, no
+  assembly.
+  - Spec entries marked `-arch=i386` are wasm32's too (it serves i386
+    programs). `-thiscall` and `-fastcall` are kept: they describe the
+    guest's calling convention.
+  - widl generates i386's stubs and format strings.
+  - Skeletons carry `IMAGE_FILE_MACHINE_I386`.
+- **Compiling:** with no PE cross-compiler, configure plans Wine's
+  "builtin ELF DLL" layout. On wasm32 that is the layout wanted: PE code
+  compiled by the host compiler (`wcc`, `-D_WIN32 -fshort-wchar
+  -fno-builtin`) into a module, plus a PE file per DLL (makedep's "fake
+  module").
+  - `wcc` applies the ICALL pass to PE-side code (`-D_WIN32`).
+  - `__TRY` uses clang's wasm SjLj lowering (`exception.h`, winecrt0's
+    `__wasm_setjmp`), which needs wasm exception handling: V8 has it,
+    wasmtime 27 does not.
+- **`winebuild --dll` (wasm32)** writes C, not assembly (`wasm32.c`):
+  - one entry adapter `gexp_<export>` per exported function. It matches
+    the `.spec`'s arguments one by one with the wasm signature of the C
+    function, read from the objects' linking sections:
+    - 8-byte arguments that the code takes as i32 are structs passed by
+      value, so the adapter passes the guest stack address;
+    - a leading hidden pointer with a void result is a small struct
+      return, which goes back in EDX:EAX;
+    - results go in EAX, EDX:EAX or ST0;
+    - stdcall pops its arguments; thiscall and fastcall read ECX/EDX;
+  - stubs call `__wine_spec_unimplemented_stub`;
+  - `gexp__entry` calls the DLL's entry point;
+  - the data exports go out as `--export-if-defined` link options (an
+    `.rsp` beside the object), so their module offsets are readable.
+- **Not adapted yet:** varargs exports (i386's 4-byte stack slots are not
+  wasm32's `va_list`) and ntdll's system-call exports (they become direct
+  calls into the Unix side, W2). Both bind to `gexp__missing`, which
+  names them when called.
+- **`winegcc`** links a position-independent module. Undefined symbols
+  stay imports (`--unresolved-symbols=import-dynamic`), and no libc is
+  linked. The import libraries are empty archives.
+- **`winebuild --fake-module --wasm-module M`** writes the PE skeleton
+  from the linked module (`spec32.c: output_wasm_skeleton`):
+  - `.text`: the entry point and one 4-byte `ud2; ud2` stub per exported
+    function;
+  - `.wasmdat`: the module's data (`__memory_base`); data exports point
+    at their offsets in it;
+  - `.edata`: the exports, forwarders included;
+  - `.wasm`: the module;
+  - `.rsrc`: the resources.
+
+  makedep builds it after the module.
+- **winecrt0 (`libs/winecrt0/wasm32.c`)** is linked into every DLL. It
+  holds:
+  - the adapters' helpers;
+  - `__gexw_guest_call` for the ICALL pass's exit stubs;
+  - the per-thread wasm globals;
+  - the SjLj runtime.
+
+  It uses gex's ABI headers, vendored as `include/wine/gex/`.
+- **In gexc (`shims/native/src/wasmdll.rs`):** when Wine's loader maps a
+  PE with a `.wasm` section, the module is installed as a stateful
+  provider. Its data is at `.wasmdat`, `gexp_<name>` binds at each export,
+  `gexp__entry` at the entry point, and `gexp__missing` at the rest.
+- **Tested:** `tests/wasm32/dll` builds a DLL through winebuild and wasm-ld
+  and calls it from a MinGW i386 program, on `--no-cgen` and `--fjit`. It
+  covers each adapter kind:
+  - stdcall and cdecl;
+  - int64 (EDX:EAX), and float and double (ST0);
+  - thiscall and fastcall;
+  - a struct by value and a struct return;
+  - void;
+  - cdecl and stdcall callbacks (through the ICALL pass);
+  - a data export, a forwarder and a stub.
+- **Open for W2:** imports between DLL modules. Each DLL's module imports
+  what other DLLs define, and gex instantiates a module when its DLL maps,
+  which can be before the DLLs it imports from. The proposed answer is the
+  closed world again:
+  - link the PE side as one module, every DLL's bitcode internalized to
+    its exports first (`llvm-link` + `-internalize`), so their private
+    symbols cannot collide;
+  - every cross-DLL call is then direct, with LTO across DLLs;
+  - per-DLL modules stay possible for a run-time-loaded DLL.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
