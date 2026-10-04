@@ -203,7 +203,9 @@ impl<'a> CodeView<'a> {
                 let off = (pc - seg.vaddr) as usize;
                 let n = (span as usize - off).min(16);
                 let have = seg.bytes.len().saturating_sub(off).min(n);
-                buf[..have].copy_from_slice(&seg.bytes[off..off + have]);
+                if have > 0 {
+                    buf[..have].copy_from_slice(&seg.bytes[off..off + have]);
+                }
                 buf[have..n].fill(0);
                 return n;
             }
@@ -1465,6 +1467,28 @@ mod tests {
 
     use super::*;
     use gex_ld::elf::Segment;
+
+    /// Past the stored bytes, up to the mapped size, a fetch reads zeros:
+    /// from inside the stored bytes (an instruction ending in a trimmed zero)
+    /// and from wholly past them (where `bytes[off..]` once panicked,
+    /// stopping `cgen-prefix` on a Wine DLL).
+    #[test]
+    fn a_fetch_reads_zeros_past_the_stored_bytes() {
+        let mut img = image_with(&[0x9090_9090], 0x1000);
+        img.segments[0].mem_size = 0x100;
+        img.code = vec![(0x1000, 0x1100)];
+        let v = CodeView::new(&img);
+        let mut buf = [0xaau8; 16];
+        assert_eq!(v.fetch(0x1000, &mut buf), 16);
+        assert_eq!(buf[..6], [0x90, 0x90, 0x90, 0x90, 0, 0]);
+        let mut buf = [0xaau8; 16];
+        assert_eq!(v.fetch(0x1080, &mut buf), 16);
+        assert_eq!(buf, [0u8; 16]);
+        let mut buf = [0xaau8; 16];
+        assert_eq!(v.fetch(0x10f8, &mut buf), 8);
+        assert_eq!(buf[..8], [0u8; 8]);
+        assert_eq!(v.fetch(0x1100, &mut buf), 0);
+    }
 
     fn image_with(code: &[u32], base: u64) -> Image {
         let mut bytes = Vec::new();
