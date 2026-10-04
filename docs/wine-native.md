@@ -317,9 +317,47 @@ in W1.** It is additive: a new personality whose structure layouts are
 defined to match musl's `arch/wasm32`. The i386 paths stay unchanged, and
 tests cover both. As built: §3.11.
 
-**The ICALL check (decided).** The LLVM pass emits the select form measured
-in W0(c): `idx = p < 0x400000 ? p : exit_stub[sig]`, the guest address
-in a per-thread wasm global, then one `call_indirect`.
+**The ICALL check (decided, built in W1).** `tools/wine-wasm/icall/GexIcall.cpp`
+is an LLVM pass plugin for the system clang (`-fpass-plugin=GexIcall.so`,
+run at the end of the optimisation pipeline, after inlining). Every
+non-variadic indirect call becomes:
+
+```
+gexw_set_icall_target(p)                        ; a wasm global (gexw_globals.s)
+callee = p < 0x400000 ? p : __gexw_exit.<sig>   ; select, no branch
+call callee(args)
+```
+
+- **The exit stubs** are one per wasm signature (plus `byval` layout),
+  `linkonce_odr` and hidden. A stub lays the arguments out as i386 stack
+  words: i64 and double take two, `byval` structs are copied in, narrow
+  integers are widened. It then calls `__gexw_guest_call` (EDX:EAX) or
+  `__gexw_guest_call_fp` (ST0, popped) in `tools/wine-wasm/gexw_rt.c`.
+  Those push the words and a return address, run the target through the
+  function table, and put ESP back, so one stub serves cdecl and stdcall
+  callees.
+- **Variadic indirect calls** are left alone and counted
+  (`GEXW_ICALL_STATS=1`).
+- **Cost in V8** (node 26.7, core 3, tools/wine-wasm/spike-c, 20M calls,
+  median of 5):
+
+  | | ns/call |
+  |---|---|
+  | plain `call_indirect` | 0.49 |
+  | the pass's output | 0.99 |
+  | W0(c)'s hand-written select form | 0.93 |
+  | native → guest through a pass stub | 6.7 |
+
+- **Spike (b)** runs on the pass by default: demo.dll's callbacks, cdecl
+  and stdcall, plus a double-returning callback with an int64 argument.
+- **Not yet handled:** native function pointers that escape to guest code
+  (COM vtables a native DLL hands the program, WNDPROCs) are table
+  indices, which x86 code cannot call. The plan is ARM64EC's entry thunks:
+  - gex's lookup of an address below 0x400000 routes it to an entry adapter
+    for that function's signature and convention;
+  - the convention comes from `WINAPI`/`__stdcall` declarations, which
+    clang drops on wasm32 and must be carried as an annotation;
+  - this is W2 work with the PE loader.
 
 ### 3.11 The wasm32 ABI on gex-kernel (W1, 2026-10-04)
 

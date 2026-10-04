@@ -42,3 +42,15 @@ int WINAPI demo_apply(apply_fn f, int x) { calls++; return ICALL(f)(x) * 2; }
 int demo_native_cmp(const int *a, const int *b) { return *a - *b; }
 
 int demo_calls(void) { return calls; }
+
+/* A double callback with a 64-bit argument: ST0 back from x86, and an
+ * argument that is two stack words. */
+typedef double (*fd_fn)(double, int64_t);
+
+double demo_sum_fd(fd_fn f, int n)
+{
+    double s = 0;
+    calls++;
+    for (int i = 1; i <= n; i++) s += ICALL(f)(i * 0.5, (int64_t)i << 33);
+    return s;
+}
