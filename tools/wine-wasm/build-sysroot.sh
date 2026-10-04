@@ -59,4 +59,6 @@ done
 wait
 rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a" $objs
+# The ICALL pass (wcc applies it to Wine's PE-side code, -D_WIN32).
+"$(dirname "$0")/icall/build.sh" "$OUT/sysroot/lib"
 echo "sysroot: $OUT/sysroot"
