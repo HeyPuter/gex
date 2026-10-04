@@ -191,7 +191,7 @@ struct HostState {
     exit: Option<Exit>,
     /// Set with `exit` when only this thread ends (`exit` with others left),
     /// not the process.
-    thread_only: bool,
+    pub(crate) thread_only: bool,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
     /// Why `resume_at` was set (GEX_NT_STATS only; `note_resume`).
