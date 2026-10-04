@@ -1242,10 +1242,31 @@ fn perform_block(
         } => {
             // The re-read has to happen under the queue's own lock, which is
             // what closes the race between checking the word and sleeping.
+            // In slices, so a signal for this thread ends the wait (Linux
+            // interrupts a futex wait to run a handler; glibc takes EINTR as
+            // a spurious wake). Mono's GC suspends threads that sit in
+            // condition-variable waits exactly this way.
             let mem = GuestMem::new(data);
-            table
-                .wait(uaddr, val, deadline, &|| mem.read_u32(uaddr).ok())
-                .map(|_| 0)
+            let start = std::time::Instant::now();
+            let slice = std::time::Duration::from_millis(20);
+            loop {
+                let left = match deadline {
+                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
+                    Some(d) => (d - start.elapsed()).min(slice),
+                    None => slice,
+                };
+                match table.wait(uaddr, val, Some(left), &|| mem.read_u32(uaddr).ok()) {
+                    Err(Errno::ETIMEDOUT) => {
+                        if deadline.is_some_and(|d| start.elapsed() >= d) {
+                            return Err(Errno::ETIMEDOUT);
+                        }
+                        if interrupted() {
+                            return Err(Errno::EINTR);
+                        }
+                    }
+                    r => return r.map(|_| 0),
+                }
+            }
         }
         BlockOp::FutexLockPi { table, uaddr, tid, deadline } => {
             use gex_kernel::futex::pi;
@@ -1870,6 +1891,8 @@ fn exec_program(
     kernel.close_on_exec();
     // And the handlers, which are addresses in the image being replaced.
     kernel.signals.exec();
+    // Every other thread is gone; their signal state with them.
+    kernel.thread_signals.clear();
     // `/proc/self/exe` is the file just loaded, by its guest path -- not
     // argv[0], which for a busybox applet run through `$PATH` is a bare `wc`
     // (and glibc's `$ORIGIN` handling asserts on a relative link).
@@ -2732,11 +2755,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // a process asleep in a wait loop issues no syscalls, so
                 // nothing else would ever arm `SIGALRM`.
                 let kernel_for_signals = Arc::clone(&caller.data().kernel);
+                // Signals for *this* thread: masks and thread-directed signals
+                // are per thread, and the kernel's loaded state may be another
+                // thread's by the time this asks.
+                let waiting_tid = caller.data().thread.tid;
                 let interrupted = move || {
                     kernel_for_signals
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .signal_pending()
+                        .signal_pending_for(waiting_tid)
                 };
                 let r = perform_block(op, memory.bytes(), &service, &interrupted);
                 let mut gm = GuestMem::new(memory.bytes());

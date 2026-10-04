@@ -7506,6 +7506,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.close_on_exec();
     // Handlers are addresses in the image being replaced; see Signals::exec.
     h.kernel.signals.exec();
+    h.kernel.thread_signals.clear();
     // The old image goes, and not only from the memory map. `execve` reuses
     // the process's existing memory rather than getting a fresh address space,
     // so anything not deliberately cleared stays, and the next program maps its

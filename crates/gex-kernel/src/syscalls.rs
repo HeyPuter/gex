@@ -591,6 +591,12 @@ pub struct Kernel {
     /// this one has to ask, and can only ask once the reservation says how
     /// long the object is.
     pub armed_place: Option<String>,
+    /// Every thread's own signal state but the running one's, which is in
+    /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
+    /// pending signals and alternate stacks are per thread, as on Linux.
+    pub thread_signals: std::collections::HashMap<i32, crate::signal::ThreadSignals>,
+    /// The thread whose part `signals` holds now.
+    pub sig_tid: i32,
     /// The pc of the syscall being handled (docs/mem64.md: a mapping the
     /// dynamic loader asks for stays below 4 GiB, since it will hold code).
     pub syscall_pc: u64,
@@ -1055,6 +1061,40 @@ impl Kernel {
         self.ctx_addr = t.ctx_addr;
         self.tid = t.tid;
         self.clear_child_tid = t.clear_child_tid;
+        self.switch_signals(t.tid);
+    }
+
+    /// Make `tid`'s signal state the running one (see `thread_signals`).
+    fn switch_signals(&mut self, tid: i32) {
+        if tid == self.sig_tid {
+            return;
+        }
+        let saved = self.signals.save_thread();
+        self.thread_signals.insert(self.sig_tid, saved);
+        let next = self
+            .thread_signals
+            .remove(&tid)
+            .unwrap_or_else(|| crate::signal::ThreadSignals::new_thread(self.signals.blocked));
+        self.signals.load_thread(next);
+        self.sig_tid = tid;
+    }
+
+    /// Whether a signal is ready for thread `tid` (the host's wait loops ask
+    /// for the thread that is waiting, which need not be the one whose state
+    /// is loaded).
+    pub fn signal_pending_for(&mut self, tid: i32) -> bool {
+        if tid == self.sig_tid {
+            return self.signal_pending();
+        }
+        self.collect_signals();
+        self.check_timers();
+        match self.thread_signals.get(&tid) {
+            Some(t) => {
+                let ready = (self.signals.pending_raw_for(t) ) & !t.blocked;
+                ready != 0
+            }
+            None => self.signals.has_pending(),
+        }
     }
 
     /// Copy back what the syscall changed about the calling thread.
@@ -1115,6 +1155,8 @@ impl Kernel {
             place: None,
             armed_place: None,
             syscall_pc: 0,
+            thread_signals: std::collections::HashMap::new(),
+            sig_tid: 0,
             armed_pin: None,
             compat: false,
             sigreturn_legacy: false,
@@ -1340,6 +1382,8 @@ impl Kernel {
             place: self.place.clone(),
             armed_place: None,
             syscall_pc: 0,
+            thread_signals: std::collections::HashMap::new(),
+            sig_tid: 0,
             armed_pin: None,
             compat: self.compat,
             sigreturn_legacy: false,
@@ -1431,6 +1475,8 @@ impl Kernel {
             m.write_u32(child_tid, tid as u32)?;
         }
         self.live_threads += 1;
+        // The new thread's signal state: its creator's mask, nothing pending.
+        self.thread_signals.insert(tid, crate::signal::ThreadSignals::new_thread(self.signals.blocked));
         Ok(SpawnRequest {
             ctx_addr: child,
             tid,
@@ -1701,6 +1747,9 @@ impl Kernel {
                 eprintln!("[gex:{}] exit({}) (thread {})", self.pid, a[0] as i32, self.tid);
             }
             self.thread_exit(m);
+            // Its signal state goes with it; the next thread to enter loads
+            // its own.
+            self.thread_signals.remove(&self.tid);
             return SyscallOutcome::ThreadExit;
         }
 
@@ -2463,18 +2512,8 @@ impl Kernel {
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
-            // `tkill` and `tgkill` address a thread, and every thread of a
-            // process shares this kernel, so they raise here directly.
-            nr::TKILL | nr::TGKILL => {
-                let signo = if n == nr::TKILL { a[1] } else { a[2] } as u32;
-                if signo > 0 {
-                    self.signals.raise_from(
-                        signo,
-                        crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid },
-                    );
-                }
-                Ok(0)
-            }
+            // `tkill` and `tgkill` address a thread: see `sys_tgkill`.
+            nr::TKILL | nr::TGKILL => self.sys_tgkill(n, a),
             // `kill` addresses a process, which may be any process on the
             // system. It goes through the table, which leaves the signal
             // pending for the target to collect at its next syscall.
@@ -2799,7 +2838,7 @@ impl Kernel {
         }
         for signo in 1..=64u32 {
             if inbox & (1u64 << (signo - 1)) != 0 {
-                self.signals.raise(signo);
+                self.signals.raise_shared(signo, None);
             }
         }
         self.note_kill_senders(inbox);
@@ -4558,11 +4597,14 @@ impl Kernel {
                     interval: timer.interval,
                 })
             };
-            self.signals.raise(match which {
-                ITIMER_VIRTUAL => signal::sig::SIGVTALRM,
-                ITIMER_PROF => signal::sig::SIGPROF,
-                _ => signal::sig::SIGALRM,
-            });
+            self.signals.raise_shared(
+                match which {
+                    ITIMER_VIRTUAL => signal::sig::SIGVTALRM,
+                    ITIMER_PROF => signal::sig::SIGPROF,
+                    _ => signal::sig::SIGALRM,
+                },
+                None,
+            );
         }
     }
 
@@ -4575,6 +4617,37 @@ impl Kernel {
             m.write_u64(mask, 1)?;
         }
         Ok(8)
+    }
+
+    /// `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
+    /// signal goes to that thread. Mono's GC stops the world with
+    /// `tgkill(SIGPWR)` to each thread, and raising it on the caller instead
+    /// left the target running and the GC waiting.
+    fn sys_tgkill(&mut self, n: u64, a: [u64; 6]) -> SysResult {
+        let (tgid, tid, signo) = if n == nr::TKILL {
+            (self.pid, a[0] as i32, a[1] as u32)
+        } else {
+            (a[0] as i32, a[1] as i32, a[2] as u32)
+        };
+        if signo > crate::signal::sig::MAX || tid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        if tgid != self.pid {
+            // Another process's thread: its process, as `kill` does.
+            return self.procs.kill(self.pid, tgid, signo).map(|_| 0);
+        }
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid };
+        if tid == self.tid {
+            if signo > 0 {
+                self.signals.raise_from(signo, source);
+            }
+        } else {
+            let Some(t) = self.thread_signals.get_mut(&tid) else { return Err(Errno::ESRCH) };
+            if signo > 0 {
+                t.raise_from(signo, source);
+            }
+        }
+        Ok(0)
     }
 
     /// `sched_getparam(pid, *param)`: priority 0, the only one there is.
@@ -4844,7 +4917,7 @@ impl Kernel {
         while sent != 0 {
             let signo = sent.trailing_zeros() + 1;
             sent &= sent - 1;
-            self.signals.raise(signo);
+            self.signals.raise_shared(signo, None);
         }
         self.note_kill_senders(taken);
     }
@@ -4853,9 +4926,9 @@ impl Kernel {
     /// sent as from their sender (`SI_USER`, `si_pid`), not the kernel.
     fn note_kill_senders(&mut self, taken: u64) {
         for (signo, pid) in self.procs.take_kill_senders(self.pid, taken) {
-            self.signals.raise_from(
+            self.signals.raise_shared(
                 signo,
-                crate::signal::Source { code: crate::signal::SI_USER, pid, uid: self.uid },
+                Some(crate::signal::Source { code: crate::signal::SI_USER, pid, uid: self.uid }),
             );
         }
     }

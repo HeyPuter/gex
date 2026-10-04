@@ -154,6 +154,58 @@ pub struct Signals {
     /// and `sigreturn` restores it -- without it the woken signal stays blocked
     /// and pending forever (`timeout` spun 2.2 million times).
     pub suspend_restore: Option<u64>,
+    /// Process-directed signals (another process's `kill`, a timer, a child's
+    /// exit): any thread that does not block one may take it. `pending`
+    /// above is the current thread's own (`tgkill`, faults). Linux keeps the
+    /// two sets apart the same way.
+    shared: u64,
+    shared_sources: [Option<Source>; sig::MAX as usize + 1],
+}
+
+/// The part of [`Signals`] that belongs to one thread, which the kernel
+/// swaps in for whichever thread is running (`Kernel::enter_thread`): its
+/// own pending signals, mask, alternate stack and handler state. The
+/// dispositions and process-directed pending set are the process's.
+#[derive(Debug, Clone)]
+pub struct ThreadSignals {
+    pending: u64,
+    sources: [Option<Source>; sig::MAX as usize + 1],
+    pub blocked: u64,
+    alt_stack: SigAltStack,
+    in_handler: bool,
+    legacy_frame: bool,
+    suspend_restore: Option<u64>,
+}
+
+impl ThreadSignals {
+    /// A new thread's: its creator's mask, nothing pending, no alternate
+    /// stack (a thread sets its own), not in a handler.
+    pub fn new_thread(blocked: u64) -> ThreadSignals {
+        ThreadSignals {
+            pending: 0,
+            sources: [None; sig::MAX as usize + 1],
+            blocked,
+            alt_stack: SigAltStack::default(),
+            in_handler: false,
+            legacy_frame: false,
+            suspend_restore: None,
+        }
+    }
+
+    /// Mark a thread-directed signal pending on a thread that is not the one
+    /// running (`tgkill` to another thread).
+    pub fn raise_from(&mut self, signal: u32, source: Source) {
+        if signal > 0 && signal <= sig::MAX {
+            self.pending |= bit(signal);
+            self.sources[signal as usize] = Some(source);
+        }
+    }
+
+    /// Whether a signal that would do something is ready for this thread,
+    /// counting the process's shared set (`Signals::would_deliver`'s rule).
+    pub fn would_deliver(&self, process: &Signals) -> bool {
+        process.would_deliver_with(self.pending, self.blocked)
+    }
 }
 
 impl Default for Signals {
@@ -178,6 +230,51 @@ impl Signals {
             alt_stack: self.alt_stack,
             in_handler: false,
             legacy_frame: false,
+            shared: 0,
+            shared_sources: [None; sig::MAX as usize + 1],
+        }
+    }
+
+    /// The running thread's part, to keep while another runs.
+    pub fn save_thread(&self) -> ThreadSignals {
+        ThreadSignals {
+            pending: self.pending,
+            sources: self.sources,
+            blocked: self.blocked,
+            alt_stack: self.alt_stack,
+            in_handler: self.in_handler,
+            legacy_frame: self.legacy_frame,
+            suspend_restore: self.suspend_restore,
+        }
+    }
+
+    /// Make `t` the running thread's part.
+    pub fn load_thread(&mut self, t: ThreadSignals) {
+        self.pending = t.pending;
+        self.sources = t.sources;
+        self.blocked = t.blocked;
+        self.alt_stack = t.alt_stack;
+        self.in_handler = t.in_handler;
+        self.legacy_frame = t.legacy_frame;
+        self.suspend_restore = t.suspend_restore;
+    }
+
+    /// Mark a process-directed signal pending: whichever thread does not
+    /// block it takes it.
+    pub fn raise_shared(&mut self, signal: u32, source: Option<Source>) {
+        if signal > 0 && signal <= sig::MAX {
+            self.shared |= bit(signal);
+            self.shared_sources[signal as usize] = source;
+        }
+    }
+
+    /// Clear `signal` as delivered or taken: the thread's own first, else
+    /// the process's.
+    pub fn clear_pending(&mut self, signal: u32) {
+        if self.pending & bit(signal) != 0 {
+            self.pending &= !bit(signal);
+        } else {
+            self.shared &= !bit(signal);
         }
     }
 
@@ -235,6 +332,8 @@ impl Signals {
             alt_stack: SigAltStack::default(),
             in_handler: false,
             legacy_frame: false,
+            shared: 0,
+            shared_sources: [None; sig::MAX as usize + 1],
         }
     }
 
@@ -279,7 +378,11 @@ impl Signals {
 
     /// Take who sent `signal`, as its delivery reports it.
     pub fn take_source(&mut self, signal: u32) -> Option<Source> {
-        self.sources.get_mut(signal as usize).and_then(Option::take)
+        if self.pending & bit(signal) != 0 {
+            self.sources.get_mut(signal as usize).and_then(Option::take)
+        } else {
+            self.shared_sources.get_mut(signal as usize).and_then(Option::take)
+        }
     }
 
     /// Take the lowest-numbered pending signal in `set`, blocked or not.
@@ -287,22 +390,27 @@ impl Signals {
     /// `sigwaitinfo` is used precisely on signals the caller has blocked, so
     /// this deliberately ignores the mask [`Signals::next_deliverable`] respects.
     pub fn take_pending_in(&mut self, set: u64) -> Option<u32> {
-        let ready = self.pending & set;
+        let ready = (self.pending | self.shared) & set;
         if ready == 0 {
             return None;
         }
         let signal = ready.trailing_zeros() + 1;
-        self.pending &= !bit(signal);
+        self.clear_pending(signal);
         Some(signal)
     }
 
     /// Everything raised, deliverable or not. For diagnostics only.
     pub fn pending_raw(&self) -> u64 {
-        self.pending
+        self.pending | self.shared
+    }
+
+    /// Thread `t`'s pending signals with this process's shared set.
+    pub fn pending_raw_for(&self, t: &ThreadSignals) -> u64 {
+        t.pending | self.shared
     }
 
     pub fn has_pending(&self) -> bool {
-        self.pending & !self.blocked != 0
+        (self.pending | self.shared) & !self.blocked != 0
     }
 
     /// Whether a pending signal would actually *do* something -- a handler, or a
@@ -311,7 +419,14 @@ impl Signals {
     /// arrives on every child exit, and would otherwise interrupt a shell's wait
     /// for nothing.
     pub fn would_deliver(&self) -> bool {
-        let mut ready = self.pending & !self.blocked;
+        self.would_deliver_with(self.pending, self.blocked)
+    }
+
+    /// [`Self::would_deliver`] for a thread whose own pending set and mask
+    /// are `pending` and `blocked` (with this process's dispositions and
+    /// shared set).
+    pub fn would_deliver_with(&self, pending: u64, blocked: u64) -> bool {
+        let mut ready = (pending | self.shared) & !blocked;
         while ready != 0 {
             let signal = ready.trailing_zeros() + 1;
             ready &= ready - 1;
@@ -329,7 +444,7 @@ impl Signals {
 
     /// The lowest-numbered deliverable signal, if any.
     fn next_deliverable(&self) -> Option<u32> {
-        let ready = self.pending & !self.blocked;
+        let ready = (self.pending | self.shared) & !self.blocked;
         if ready == 0 {
             return None;
         }
@@ -494,7 +609,7 @@ pub fn setup_frame(
     if action.flags & sa::NODEFER == 0 {
         signals.blocked |= bit(signal);
     }
-    signals.pending &= !bit(signal);
+    signals.clear_pending(signal);
     signals.in_handler = true;
 
     // A one-shot handler reverts before it runs, as `SA_RESETHAND` requires.
@@ -602,7 +717,7 @@ fn setup_frame_x86(
     if action.flags & sa::NODEFER == 0 {
         signals.blocked |= bit(signal);
     }
-    signals.pending &= !bit(signal);
+    signals.clear_pending(signal);
     signals.in_handler = true;
     if action.flags & sa::RESETHAND != 0 {
         let _ = signals.set_action(signal, SigAction::default());
@@ -807,7 +922,7 @@ fn setup_frame_i386(
     if action.flags & sa::NODEFER == 0 {
         signals.blocked |= bit(signal);
     }
-    signals.pending &= !bit(signal);
+    signals.clear_pending(signal);
     signals.in_handler = true;
     if action.flags & sa::RESETHAND != 0 {
         let _ = signals.set_action(signal, SigAction::default());
@@ -984,11 +1099,11 @@ pub fn dispatch(
     };
     let action = signals.action(signal);
     if action.handler == SIG_IGN {
-        signals.pending &= !bit(signal);
+        signals.clear_pending(signal);
         return Ok(Delivery::None);
     }
     if action.handler == SIG_DFL {
-        signals.pending &= !bit(signal);
+        signals.clear_pending(signal);
         return Ok(match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
             // The three a terminal raises, with no handler and no scheduler to
@@ -1207,7 +1322,7 @@ fn setup_frame_ppc(
     if action.flags & sa::NODEFER == 0 {
         signals.blocked |= bit(signal);
     }
-    signals.pending &= !bit(signal);
+    signals.clear_pending(signal);
     signals.in_handler = true;
     if action.flags & sa::RESETHAND != 0 {
         let _ = signals.set_action(signal, SigAction::default());
