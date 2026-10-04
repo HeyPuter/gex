@@ -203,6 +203,9 @@ fn build(dir: &std::path::Path) -> Result<()> {
         for (path, base, entries, bytes, how) in &pe.units {
             eprintln!("  {path:<60} {base:#10x} {entries:>7} entries {:>7} KiB  {how}", bytes / 1024);
         }
+        for (names, iat, bytes) in &pe.groups {
+            eprintln!("  link group {names}: {iat} IAT call sites made direct, {} KiB", bytes / 1024);
+        }
         for (path, n) in &pe.regions {
             eprintln!("  region entries: {path}: {n}");
         }

@@ -844,6 +844,35 @@ Each phase gets its own page ABBA, and stays only if it gains.
   - Next levers: R's crt_heap / nt_qpc providers; the link group (merge-plan
     §9.6: noita.exe with msvcr120 and msvcp120 in one module, IAT calls
     direct, ThinLTO), pewasm's build.
+- **State at the reboot (2026-10-04, evening).** merge/eject9 is the
+  branch; exp/yield-wake holds the os/wake experiment only (drop it after
+  the integ merge).
+  - G1 (link groups) is written, built, **not yet tested** (WIP commit):
+    `gex_cgen::image::build_group_module` (emit_and_link over several
+    recoveries; one member gives the same C as before), `nt_cgen::
+    prepare_group` (IATs resolved within the group, API sets mapped to
+    ucrtbase/kernelbase, `FF 15` call sites hinted, `<cache>/groups/<key>/`),
+    `install_placed` in the native host (members held until every member is
+    placed, then the group module; `<cache>/groups/index.txt`), and
+    user/eject.json `"link_groups"`. The browser shim does not install
+    groups yet (it uses the members' own units, so it still runs).
+  - Resume:
+    1. Wait for the coordinator's green on integ/2026-10-04, then merge
+       merge/main into merge/eject9 (17 files conflict: libprov, aot_only,
+       ftab, nt_cgen, gex-eject, the browser shim; keep both behaviours:
+       providers kept on rewrite, no native gating, top-down provider
+       stacks except with GEX_NT_STATEFUL, gex_provider_alloc_top/stack/
+       nt_qpc). Verify the native and browser unit keys of msvcr120 and
+       ntdll match. Drop exp/yield-wake.
+    2. Test G1: `scratchpad/eject9/ntgroup.sh cxx x86
+       '[["cxx.exe","ucrtbase.dll"]]'` (gex-rt and Node), then the group in
+       the browser shim (cgen.rs place(): hold members, publish
+       `groups/<key>` once all are placed; gex.mjs loadUnit of
+       `groups/<key>`), then Noita with
+       `[["noita.exe","msvcr120.dll","msvcp120.dll"]]` (about 2 h of clang
+       at nice 19) and its page ABBA against pewasm (abba-yield.sh shape,
+       wake on, cores 5,11 when the coordinator gives them).
+    3. G2-G4 per §6a.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua

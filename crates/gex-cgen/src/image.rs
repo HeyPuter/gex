@@ -281,6 +281,26 @@ fn read_format(r: &mut impl BufRead, what: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Several images' recoveries as one (a link group's): entries in member
+/// order, the maps merged. All members must be the same class.
+fn read_recoveries(dirs: &[&Path]) -> Result<Recovery> {
+    let mut it = dirs.iter();
+    let first = it.next().ok_or_else(|| anyhow!("a link group with no members"))?;
+    let mut rec = read_recovery(first)?;
+    for d in it {
+        let r = read_recovery(d)?;
+        if r.class32 != rec.class32 {
+            bail!("{}: a link group's members are of one class (i386 or x86-64)", d.display());
+        }
+        rec.entries.extend(r.entries);
+        rec.sums.extend(r.sums);
+        rec.trapfree.extend(r.trapfree);
+        rec.touched.extend(r.touched);
+        rec.guardfree.extend(r.guardfree);
+    }
+    Ok(rec)
+}
+
 fn read_recovery(dir: &Path) -> Result<Recovery> {
     let path = dir.join("summaries");
     let mut r = BufReader::new(std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?);
@@ -410,7 +430,26 @@ pub fn build_c_module(
     stubs: &HashSet<u64>,
     icall_hints: &HashMap<u64, u64>,
 ) -> Result<ImageStats> {
-    let rec = read_recovery(recovery)?;
+    build_group_module(&[recovery], work, objects, out, jobs, read, stubs, icall_hints)
+}
+
+/// [`build_c_module`] over several images' recoveries at once: one module
+/// holding every member's functions, whose calls between members are direct
+/// (a link group, docs/eject-pe.md §6a). The members' addresses must not
+/// overlap (images at fixed bases); `read`, `stubs` and `icall_hints` cover
+/// them all.
+#[allow(clippy::too_many_arguments)]
+pub fn build_group_module(
+    recoveries: &[&Path],
+    work: &Path,
+    objects: &Path,
+    out: &Path,
+    jobs: usize,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
+    stubs: &HashSet<u64>,
+    icall_hints: &HashMap<u64, u64>,
+) -> Result<ImageStats> {
+    let rec = read_recoveries(recoveries)?;
     let hints = std::sync::Arc::new(icall_hints.clone());
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
@@ -419,7 +458,7 @@ pub fn build_c_module(
     // Export providers' addresses start as stubs (`crate::provider`).
     let mut skip: HashSet<u64> = stubs.clone();
     loop {
-        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip, read, &hints)?;
+        let stats = emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints)?;
         let cwasm = std::fs::read(out)?;
         let users = crate::splice::unspliceable_users(&cwasm)?;
         if users.is_empty() {
@@ -447,7 +486,7 @@ pub fn build_c_module(
 #[allow(clippy::too_many_arguments)]
 fn emit_and_link(
     rec: &Recovery,
-    recovery: &Path,
+    recoveries: &[&Path],
     work: &Path,
     objects: &Path,
     out: &Path,
@@ -462,11 +501,13 @@ fn emit_and_link(
     let mut leaves = HashMap::new();
     let mut leaf_pops = HashMap::new();
     if func::leaf_copies() {
-        let mut gir = GirReader::open(recovery)?;
-        while let Some(f) = gir.next()? {
-            if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
-                leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
-                leaves.insert(f.entry, f);
+        for recovery in recoveries {
+            let mut gir = GirReader::open(recovery)?;
+            while let Some(f) = gir.next()? {
+                if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
+                    leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                    leaves.insert(f.entry, f);
+                }
             }
         }
     }
@@ -532,9 +573,10 @@ fn emit_and_link(
             *unit = new_unit();
             Ok(())
         };
-        let mut gir = GirReader::open(recovery)?;
         let mut unit = new_unit();
         let mut k = 0usize;
+        for recovery in recoveries {
+        let mut gir = GirReader::open(recovery)?;
         while let Some(f) = gir.next()? {
             if skip.contains(&f.entry) {
                 unit.add_leave_stub(f.entry);
@@ -550,6 +592,7 @@ fn emit_and_link(
             if !errors.lock().unwrap().is_empty() {
                 break;
             }
+        }
         }
         if unit.len() > 0 {
             emit(&mut unit, k, &mut objs, &mut stats)?;

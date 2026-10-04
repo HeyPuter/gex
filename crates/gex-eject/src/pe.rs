@@ -120,6 +120,8 @@ pub struct PeReport {
     /// Functions units were built without (left to tier-1: clang wanted a
     /// shadow stack), by image.
     pub left: Vec<(String, Vec<u64>)>,
+    /// Link groups built: (members, IAT call sites made direct, bytes).
+    pub groups: Vec<(String, usize, u64)>,
     pub web_regions: usize,
 }
 
@@ -523,6 +525,29 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             .with_context(|| format!("compiling the provider for {}", p.library))?;
         report.providers.push(format!("{} ({} KiB, stateful)", p.library, wasm.len() / 1024));
     }
+    // Link groups (docs/eject-pe.md §6a): members by file name, one module
+    // each, and the index a runtime reads to install them.
+    let mut index = String::new();
+    for names in &config.link_groups {
+        let mut parsed = Vec::new();
+        for n in names {
+            let m = images(&ntss)
+                .into_iter()
+                .find(|m| m.path.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case(n)))
+                .ok_or_else(|| anyhow!("user/eject.json: link group member {n} is not an image the session mapped"))?;
+            let host = root.join(rootfs_rel(&m.path)?.strip_prefix("rootfs")?);
+            let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
+            parsed.push((m.path.clone(), m.base, gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", m.path))?));
+        }
+        let members: Vec<nt_cgen::GroupMember<'_>> = parsed.iter().map(|(path, base, pe)| nt_cgen::GroupMember { path, pe, base: *base }).collect();
+        eprintln!("  building the link group {} ...", names.join(" + "));
+        let g = nt_cgen::prepare_group(&members, jobs).with_context(|| format!("building the link group {}", names.join(" + ")))?;
+        compile(&g.module)?;
+        index.push_str(&format!("{} {}\n", g.key, g.member_keys.join(" ")));
+        report.groups.push((names.join(" + "), g.iat_hints, std::fs::metadata(&g.module)?.len()));
+    }
+    std::fs::create_dir_all(units.join("groups"))?;
+    std::fs::write(units.join("groups/index.txt"), &index)?;
     // The web build's units, when the project has a browser runtime.
     if dir.join(WEB_NT_DIR).join(WEB_NT_WASM[0]).exists() {
         let stateful: Vec<(String, PathBuf)> = config.providers.iter().map(|p| (p.library.clone(), provider_wasm(dir, p))).collect();

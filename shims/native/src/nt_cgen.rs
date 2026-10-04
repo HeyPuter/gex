@@ -502,6 +502,167 @@ pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
     Ok(v)
 }
 
+/// A link group's member: an image and where it is mapped.
+pub struct GroupMember<'a> {
+    pub path: &'a str,
+    pub pe: &'a gex_ld::pe::PeImage,
+    pub base: u64,
+}
+
+/// What [`prepare_group`] made.
+pub struct GroupBuilt {
+    /// `<cache>/groups/<key>/c.wasm`.
+    pub module: std::path::PathBuf,
+    /// The group's key (its directory's name).
+    pub key: String,
+    /// Each member's unit key, in member order: what a host matches.
+    pub member_keys: Vec<String>,
+    /// Call sites made direct by resolving the members' IATs.
+    pub iat_hints: usize,
+}
+
+/// The import address table of `m`, resolved against the other members as
+/// Wine's loader binds it (forwarders followed within the group): IAT slot
+/// address -> the target's address. Imports from images outside the group
+/// are left out.
+fn resolve_iats(m: &GroupMember<'_>, members: &[GroupMember<'_>]) -> HashMap<u64, u64> {
+    let by_name = |dll: &str| {
+        let d = dll.to_ascii_lowercase();
+        let d = if d.ends_with(".dll") || d.ends_with(".exe") { d } else { format!("{d}.dll") };
+        // API sets, as Wine's loader resolves them (its apiset schema): the
+        // CRT ones to ucrtbase, the core ones to kernelbase. A wrong guess
+        // costs nothing: the call compares the slot's value first.
+        let d = if d.starts_with("api-ms-win-crt-") {
+            "ucrtbase.dll".to_string()
+        } else if d.starts_with("api-ms-win-core-") {
+            "kernelbase.dll".to_string()
+        } else {
+            d
+        };
+        members.iter().find(|x| x.pe.exports.dll_name.eq_ignore_ascii_case(&d) || x.path.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(&d)))
+    };
+    let mut out = HashMap::new();
+    for imp in &m.pe.imports {
+        let Some(target) = by_name(&imp.dll) else { continue };
+        for sym in &imp.symbols {
+            let mut t = target;
+            let mut want = sym.import.clone();
+            // At most a few forwarders deep.
+            for _ in 0..4 {
+                let Some(e) = t.pe.exports.find(&want) else { break };
+                match &e.forwarder {
+                    None => {
+                        out.insert(m.base + sym.iat_rva as u64, t.base + e.rva as u64);
+                        break;
+                    }
+                    Some(f) => {
+                        let Some((dll, name)) = f.split_once('.') else { break };
+                        let Some(next) = by_name(dll) else { break };
+                        t = next;
+                        want = match name.strip_prefix('#').and_then(|o| o.parse().ok()) {
+                            Some(o) => gex_ld::pe::ImportName::Ordinal(o),
+                            None => gex_ld::pe::ImportName::Name { name: name.to_string(), hint: 0 },
+                        };
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A link group (docs/eject-pe.md §6a): every member's functions in one
+/// module, calls between members direct. Each member's recovery is its
+/// unit's (built if missing: [`prepare_pe`]). An IAT call (`call [slot]`,
+/// `FF 15 disp32` before its return address) whose slot binds a member's
+/// function gets a guarded direct call, as a devirtualised indirect call
+/// (`if (target == K) f_K() else the table`), so a hooked IAT still works.
+#[cfg(feature = "translate")]
+pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBuilt> {
+    use std::hash::{Hash, Hasher};
+    let root = cache_root()?;
+    let mut recoveries = Vec::new();
+    let mut member_keys = Vec::new();
+    let mut stubs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut hints: HashMap<u64, u64> = HashMap::new();
+    let mut images = Vec::new();
+    for m in members {
+        prepare_pe(m.pe, m.base, jobs, true).with_context(|| format!("the unit for {}", m.path))?;
+        let (image, _) = gex_xlate::func::pe_input(m.pe, m.base).map_err(|e| anyhow!("placing {} at {:#x}: {e}", m.path, m.base))?;
+        let pv = provided(m.pe, m.base);
+        member_keys.push(unit_key(&image, &pv));
+        recoveries.push(root.join("recovery").join(recovery_key(&image)));
+        stubs.extend(pv.stubs.iter().copied());
+        hints.extend(icall_hints(&image));
+        images.push(image);
+    }
+    let byte = |a: u64| images.iter().find_map(|im| im.segments.iter().find_map(|s| s.byte(a)));
+    // The members' entries: an IAT target must be one (a provider's stub is
+    // not; nor is data).
+    let mut known: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for r in &recoveries {
+        let text = std::fs::read_to_string(r.join("summaries")).with_context(|| format!("{}", r.display()))?;
+        known.extend(text.lines().skip(2).filter_map(|l| l.split_whitespace().next().and_then(|a| u64::from_str_radix(a, 16).ok())));
+    }
+    let mut iat_hints = 0usize;
+    for m in members {
+        let iat = resolve_iats(m, members);
+        if iat.is_empty() {
+            continue;
+        }
+        // Every `call dword [slot]` in the member's code sections.
+        for sec in m.pe.sections.iter().filter(|s| s.characteristics & 0x2000_0000 != 0) {
+            let lo = m.base + sec.rva as u64;
+            let n = sec.vsize.max(sec.raw_size) as u64;
+            let mut a = lo;
+            while a + 6 <= lo + n {
+                if byte(a) == Some(0xff) && byte(a + 1) == Some(0x15) {
+                    let d = (0..4).map(|i| byte(a + 2 + i).unwrap_or(0) as u64).enumerate().fold(0u64, |acc, (i, b)| acc | b << (8 * i));
+                    if let Some(&t) = iat.get(&d) {
+                        if known.contains(&t) && !stubs.contains(&t) {
+                            // A recorded profile's hint for the site wins.
+                            if !hints.contains_key(&(a + 6)) {
+                                hints.insert(a + 6, t);
+                                iat_hints += 1;
+                            }
+                        }
+                    }
+                }
+                a += 1;
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "gex link group v1".hash(&mut h);
+    member_keys.hash(&mut h);
+    let mut v: Vec<(u64, u64)> = hints.iter().map(|(a, b)| (*a, *b)).collect();
+    v.sort_unstable();
+    v.hash(&mut h);
+    let key = format!("{:016x}", h.finish());
+    let dir = root.join("groups").join(&key);
+    let out = dir.join("c.wasm");
+    if !out.exists() {
+        let t0 = std::time::Instant::now();
+        let work = dir.join("work");
+        let recs: Vec<&std::path::Path> = recoveries.iter().map(|p| p.as_path()).collect();
+        let stats = gex_cgen::image::build_group_module(&recs, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::write(dir.join("members.txt"), member_keys.join("\n") + "\n")?;
+        eprintln!(
+            "[cgen] link group {key}: {} members, {} functions, {} units ({} compiled, {} cached), {} MiB wasm, {:.1}s; {} devirtualised calls ({iat_hints} from the IATs)",
+            members.len(),
+            stats.functions,
+            stats.units,
+            stats.compiled,
+            stats.cached,
+            stats.wasm_bytes >> 20,
+            t0.elapsed().as_secs_f64(),
+            stats.devirt
+        );
+    }
+    Ok(GroupBuilt { module: out, key, member_keys, iat_hints })
+}
+
 /// [`prepare_pe`] for any recovery input (no providers).
 pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
@@ -936,13 +1097,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
         let t0 = std::time::Instant::now();
         if mode() != Mode::Off {
             match place_or_build(&p, memory.bytes())? {
-                Some(pl) => {
-                    let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
-                    note_pages(&memory, &pl.pages);
-                    crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
-                    report(&p, &pl, t0);
-                    install_regions(&p, &pl, &shared, &engine, cache.as_ref(), &memory)?;
-                }
+                Some(pl) => install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?,
                 None => missing(p.clone())?,
             }
         }
@@ -974,13 +1129,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
         let t0 = std::time::Instant::now();
         if mode() != Mode::Off {
             match place_or_build(&p, memory.bytes())? {
-                Some(pl) => {
-                    let module = compile(&engine, cache.as_ref(), &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
-                    note_pages(&memory, &pl.pages);
-                    crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
-                    report(&p, &pl, t0);
-                    install_regions(&p, &pl, &shared, &engine, cache.as_ref(), &memory)?;
-                }
+                Some(pl) => install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?,
                 None => missing(p.clone())?,
             }
         }
@@ -991,7 +1140,105 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
     Ok(())
 }
 
-/// Bind `p`'s export providers (`gex_cgen::provider`) at their exports'
+/// A link group's state in this process: its members' unit keys, and the
+/// members placed so far.
+struct GroupState {
+    key: String,
+    members: Vec<String>,
+    placed: Vec<(Pending, Placed)>,
+    installed: bool,
+}
+
+/// The cache's link groups (`<cache>/groups/index.txt`: a group key, then its
+/// members' unit keys, per line), read once.
+static GROUPS: Mutex<Option<Vec<GroupState>>> = Mutex::new(None);
+
+fn with_groups<R>(f: impl FnOnce(&mut Vec<GroupState>) -> R) -> R {
+    let mut g = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    let v = g.get_or_insert_with(|| {
+        let text = cache_root().ok().and_then(|r| std::fs::read_to_string(r.join("groups/index.txt")).ok()).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                let key = w.next()?.to_string();
+                Some(GroupState { key, members: w.map(str::to_string).collect(), placed: Vec::new(), installed: false })
+            })
+            .collect()
+    });
+    f(v)
+}
+
+/// Publish a placed unit -- or, for a link group's member, hold it until
+/// every member is placed, then publish the group's module in place of the
+/// members' units (docs/eject-pe.md §6a). Wine maps an exe's static imports
+/// before any of their code runs, so the group is in before a member runs.
+#[allow(clippy::too_many_arguments)]
+fn install_placed(
+    p: &Pending,
+    pl: Placed,
+    shared: &Arc<Mutex<JitShared>>,
+    engine: &Engine,
+    cache: Option<&(std::path::PathBuf, String)>,
+    memory: &gex_mem::GuestMemory,
+    t0: std::time::Instant,
+) -> Result<()> {
+    let key = pl.path.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let member = with_groups(|gs| gs.iter().any(|g| !g.installed && g.members.contains(&key)));
+    if !member {
+        let module = compile(engine, cache, &pl.path, &pl.cwasm).with_context(|| format!("compiling {}'s function tier", p.path))?;
+        note_pages(memory, &pl.pages);
+        crate::ftab::publish(shared, memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+        report(p, &pl, t0);
+        return install_regions(p, &pl, shared, engine, cache, memory);
+    }
+    let ready = with_groups(|gs| {
+        let g = gs.iter_mut().find(|g| !g.installed && g.members.contains(&key))?;
+        g.placed.push((p.clone(), pl));
+        if g.placed.len() < g.members.len() {
+            return Some(None);
+        }
+        g.installed = true;
+        Some(Some((g.key.clone(), std::mem::take(&mut g.placed))))
+    });
+    match ready.flatten() {
+        None => {
+            eprintln!("gex-nt: {} at {:#x}: held for its link group", p.path, p.base);
+            Ok(())
+        }
+        Some((gkey, members)) => {
+            let path = cache_root()?.join("groups").join(&gkey).join("c.wasm");
+            let cwasm = std::fs::read(&path).with_context(|| format!("reading link group {}", path.display()))?;
+            let module = compile(engine, cache, &path, &cwasm).with_context(|| format!("compiling link group {gkey}"))?;
+            let mut entries = gex_cgen::image::read_entries(&path)?;
+            // The members' providers' stubs: bound by the providers.
+            let mut stubs: Vec<u64> = members.iter().flat_map(|(mp, _)| provided(&mp.pe, mp.base).stubs).collect();
+            stubs.sort_unstable();
+            for a in entries.iter_mut() {
+                if stubs.binary_search(a).is_ok() {
+                    *a = 0;
+                }
+            }
+            for (_, mpl) in &members {
+                note_pages(memory, &mpl.pages);
+            }
+            crate::ftab::publish(shared, memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+            eprintln!(
+                "gex-nt: link group {gkey}: {} members ({}), {} entries, {} MiB wasm, placed in {:.1}s",
+                members.len(),
+                members.iter().map(|(mp, _)| mp.path.rsplit(['/', '\\']).next().unwrap_or("")).collect::<Vec<_>>().join(", "),
+                entries.iter().filter(|&&a| a != 0).count(),
+                cwasm.len() >> 20,
+                t0.elapsed().as_secs_f64()
+            );
+            for (mp, mpl) in &members {
+                install_regions(mp, mpl, shared, engine, cache, memory)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Bind `p`'s export providers (`gex_cgen::provider`) at their exports'"""
 /// addresses, after its unit (whose bodies there are stubs into the table).
 fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
     let pv = provided(&p.pe, p.base);

@@ -94,6 +94,10 @@ pub struct Config {
     /// every run of this build (default off; a run can ask with
     /// `--jit-fallback`).
     pub jit_fallback: bool,
+    /// Windows programs: link groups, each a list of image file names whose
+    /// functions are linked into one module with direct calls between them
+    /// (docs/eject-pe.md §6a).
+    pub link_groups: Vec<Vec<String>>,
 }
 
 impl Default for Config {
@@ -107,6 +111,7 @@ impl Default for Config {
             all_syscalls: false,
             allow_syscalls: Vec::new(),
             jit_fallback: false,
+            link_groups: Vec::new(),
         }
     }
 }
@@ -159,7 +164,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -262,6 +267,20 @@ impl Config {
             None | Some(Json::Null) => false,
             Some(Json::Bool(b)) => *b,
             Some(_) => bail!("{what}: jit_fallback is not true or false"),
+        };
+        c.link_groups = match v.get("link_groups") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Arr(gs)) => gs
+                .iter()
+                .map(|g| match g {
+                    Json::Arr(m) => m
+                        .iter()
+                        .map(|x| x.as_str().map(str::to_string).ok_or_else(|| anyhow!("{what}: a link group holds a non-string")))
+                        .collect::<Result<Vec<String>>>(),
+                    _ => bail!("{what}: \"link_groups\" holds a non-list"),
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => bail!("{what}: \"link_groups\" is not a list of lists"),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,
