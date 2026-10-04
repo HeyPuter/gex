@@ -139,6 +139,21 @@ pub struct Vm {
     pub reserved: Vec<(u64, u64)>,
 }
 
+/// The end of the user address space a fixed-address allocation or view
+/// may reach: `GUEST_LIMIT` (natively the guest owns the whole memory),
+/// lowered by a host that keeps its own data above the guest (the browser:
+/// 2 GiB, where its heap starts). Top-down and zero-bits allocation stop at
+/// `ALLOC_HIGH` regardless.
+static USER_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(gex_abi::GUEST_LIMIT);
+
+pub fn set_user_limit(limit: u64) {
+    USER_LIMIT.store(limit.min(gex_abi::GUEST_LIMIT), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn user_limit() -> u64 {
+    USER_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
 }
@@ -159,7 +174,7 @@ impl Vm {
 
     pub fn is_free(&self, start: u64, end: u64) -> bool {
         start >= PAGE
-            && end <= gex_abi::GUEST_LIMIT
+            && end <= user_limit()
             && !self.regions.range(..end).any(|(_, r)| r.end() > start)
     }
 
@@ -589,7 +604,7 @@ pub fn nt_query_virtual_memory(c: &mut Call<'_>) -> R {
             if len < size {
                 return Err(Status(st::INFO_LENGTH_MISMATCH));
             }
-            if addr >= gex_abi::GUEST_LIMIT {
+            if addr >= user_limit() {
                 return Err(Status(st::INVALID_PARAMETER));
             }
             let m = c.p.st.lock().unwrap().vm.query(addr);

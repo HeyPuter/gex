@@ -323,6 +323,9 @@ mod imp {
         if var("GEX_NT_GUARD_2G").as_deref() != Some("0") {
             gex_xlate::set_guard_limit(NT_HEAP_BASE);
         }
+        // Nor may a fixed-address allocation or view reach it (a request at
+        // 2 GiB or above succeeded and handed the guest the shim's heap).
+        nt::vm::set_user_limit(NT_HEAP_BASE);
         SLOT_LOG.store(flag("GEX_NT_SLOT_LOG"), Ordering::Relaxed);
         VERIFY_REGISTRY.store(flag("GEX_NT_VERIFY_REGISTRY"), Ordering::Relaxed);
         RETIRE_LOG.store(flag("GEX_NT_RETIRE_LOG"), Ordering::Relaxed);
