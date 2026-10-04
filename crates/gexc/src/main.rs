@@ -45,7 +45,10 @@ fn real_main() -> Result<ExitCode> {
     // function fully, so V8's missing OSR does not apply): `GEX_CGEN_GUARD=1`
     // builds and uses the guarded, browser flavor instead.
     // Only for what runs here: `gexc build` makes modules for the browser.
-    let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c");
+    // An ejected project's native build and run too (its units are the
+    // native flavor; the web build's are built apart).
+    let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c")
+        || (argv[1] == "eject" && matches!(argv.get(2).map(String::as_str), Some("build" | "run")));
     gex_cgen::image::set_unguarded(native && std::env::var("GEX_CGEN_GUARD").as_deref() != Ok("1"));
     match argv[1].as_str() {
         "run" => {
