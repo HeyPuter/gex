@@ -323,6 +323,17 @@ mod imp {
         if var("GEX_NT_GUARD_2G").as_deref() != Some("0") {
             gex_xlate::set_guard_limit(NT_HEAP_BASE);
         }
+        // The yield policy and the desktop size, as natively from the
+        // environment (GEX_NT_YIELD=wake[:us[:streak]]|os|spin|sleep:N,
+        // GEX_NT_DESKTOP=WxH).
+        if let Some(v) = var("GEX_NT_YIELD") {
+            nt::sync::set_yield_policy(&v);
+        }
+        if let Some(v) = var("GEX_NT_DESKTOP") {
+            if !nt::user::sysparams::Mode::set_startup(&v) {
+                warn_line(&format!("gex-nt: GEX_NT_DESKTOP={v}: not a size on offer\n"));
+            }
+        }
         // Nor may a fixed-address allocation or view reach it (a request at
         // 2 GiB or above succeeded and handed the guest the shim's heap).
         nt::vm::set_user_limit(NT_HEAP_BASE);
@@ -769,6 +780,24 @@ mod imp {
     }
 
     impl nt::NtHost for Nested {
+        // The yield park (gex_kernel::nt::sync::guest_yield): guest memory is
+        // this module's memory, so a wasm wait on the generation word is
+        // ended by the ConcRT provider's `memory.atomic.notify` and by any
+        // Worker's `notify` alike. Guest threads run in Workers, which may
+        // block. (With a biased guest, `addr` gains the guest's base.)
+        fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
+            let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
+            // SAFETY: an aligned guest word of the shared memory.
+            unsafe { crate::warch::memory_atomic_wait32(p, expected as i32, timeout.as_nanos() as i64) };
+            true
+        }
+
+        fn notify(&self, addr: u64) {
+            let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
+            // SAFETY: as above.
+            unsafe { crate::warch::memory_atomic_notify(p, u32::MAX) };
+        }
+
         fn run_callback(&mut self) -> Result<(), ()> {
             let pc = GuestMem::new(guest_bytes()).read_u64(self.ctx_addr + ctx::PC as u64).unwrap_or(0);
             // SAFETY: a host import taking scalars. Nothing here holds the
