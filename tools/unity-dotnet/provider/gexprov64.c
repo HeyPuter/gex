@@ -5,6 +5,69 @@
 __thread int gexp_ctx;
 __thread int32_t gexp_depth;
 
+/* ---- which side of the boundary a thread is on ----
+ * gexp_in_guest is 1 while the thread runs guest code. The host stops every
+ * thread that is (shims/native libprov: a collection's stop-the-world); a
+ * thread crossing into guest code meanwhile parks first. gexp_stop is the
+ * host's flag, in this module's memory so the check is a load. */
+static __thread volatile int gexp_in_guest;
+static volatile int gexp_stop;
+__attribute__((import_module("gex"), import_name("provider_thread_register"))) void gexp_host_thread_register(volatile int *in_guest, volatile int *stop);
+__attribute__((import_module("gex"), import_name("provider_park"))) void gexp_host_park(void);
+__attribute__((import_module("gex"), import_name("provider_stop_guest"))) void gexp_host_stop_guest(void);
+__attribute__((import_module("gex"), import_name("provider_start_guest"))) void gexp_host_start_guest(void);
+__attribute__((import_module("gex"), import_name("provider_guest_stack_end"))) uint64_t gexp_host_guest_stack_end(uint64_t sp);
+
+/* A runtime's hooks at the crossing (a GC-safe region while in guest code). */
+static void no_hook(void) {}
+__attribute__((weak, alias("no_hook"))) void gexp_hook_to_guest(void);
+__attribute__((weak, alias("no_hook"))) void gexp_hook_from_guest(void);
+
+void gexp_attach_thread(void)
+{
+	gexp_host_thread_register(&gexp_in_guest, &gexp_stop);
+}
+
+void gexp_from_guest(void)
+{
+	__atomic_store_n(&gexp_in_guest, 0, __ATOMIC_SEQ_CST);
+	gexp_hook_from_guest();
+}
+
+void gexp_to_guest(void)
+{
+	gexp_hook_to_guest();
+	__atomic_store_n(&gexp_in_guest, 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&gexp_stop, __ATOMIC_SEQ_CST))
+		gexp_host_park();
+}
+
+void gexp_stop_guest_threads(void)
+{
+	gexp_host_stop_guest();
+}
+
+void gexp_start_guest_threads(void)
+{
+	gexp_host_start_guest();
+}
+
+#include <stdlib.h>
+void gexp_thread_guest_info(uint64_t *ctx, uint64_t *stack_end)
+{
+	/* GEXP_NO_GUEST_ROOTS=1: leave the guest's frames out (a test that
+	 * the scanning is what keeps their objects). */
+	static int off = -1;
+	if (off < 0)
+		off = getenv("GEXP_NO_GUEST_ROOTS") != 0;
+	if (off) {
+		*ctx = *stack_end = 0;
+		return;
+	}
+	*ctx = (uint32_t)gexp_ctx;
+	*stack_end = gexp_ctx ? gexp_host_guest_stack_end(GEXP_X(gexp_ctx, 4)) : 0;
+}
+
 /* The return address a provider's guest call pushes: in the provider's own
  * code page (its thread entry is at offset 0), one per call depth, so gex's
  * dispatch covers it and its call-out catches a return there that no
@@ -56,6 +119,7 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	for (unsigned i = 0; i < c->nxmm && i < 8; i++)
 		*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16 * i) = c->xmm[i];
 	GEXP_X(ctx, 4) = sp;
+	gexp_to_guest();
 	/* Run the guest until it returns to `ra`. A function body returns 1 when
 	 * its return went to the address its caller predicted; otherwise 0, with
 	 * PC where the guest continues (a longjmp inside the callee, a signal, a
@@ -75,6 +139,7 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	gexp_ctx = ctx;
 	gexp_depth = depth;
 	__gex_set_ctx((uint32_t)ctx);
+	gexp_from_guest();
 	GEXP_X(ctx, 4) = rsp0;
 	c->rax = GEXP_X(ctx, 0);
 	c->rdx = GEXP_X(ctx, 2);

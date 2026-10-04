@@ -150,6 +150,67 @@ index 8d5fba2b6..6cc1e1aad 100644
  #endif // !HOST_WASI
 +
 +#endif /* !HOST_GEX */
+diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
+index 787ca8c2f..ed1afb5a7 100644
+--- a/src/mono/mono/metadata/sgen-mono.c
++++ b/src/mono/mono/metadata/sgen-mono.c
+@@ -2221,6 +2221,18 @@ sgen_client_scan_thread_data (void *start_nursery, void *end_nursery, gboolean p
+ 				}
+ 			}
+ 		}
++#ifdef HOST_GEX
++		/* gex: the guest's frames below this thread's way into the runtime
++		 * (UnityPlayer's locals) and its registers, conservatively, as Boehm
++		 * scanned them. Every other guest thread is stopped (sgen-stw.c). */
++		if (!precise && info->client_info.info.gex_ctx) {
++			guint64 *regs = (guint64 *)(gsize)info->client_info.info.gex_ctx;
++			guint64 rsp = regs [4] & ~(guint64)7;
++			sgen_conservatively_pin_objects_from ((void **)regs, (void **)(regs + 16), start_nursery, end_nursery, PIN_TYPE_STACK);
++			if (rsp && rsp < info->client_info.info.gex_stack_end)
++				sgen_conservatively_pin_objects_from ((void **)(gsize)rsp, (void **)(gsize)info->client_info.info.gex_stack_end, start_nursery, end_nursery, PIN_TYPE_STACK);
++		}
++#endif
+ 		if (gc_callbacks.interp_mark_func) {
+ 			PinHandleStackInteriorPtrData ud;
+ 			memset (&ud, 0, sizeof (ud));
+diff --git a/src/mono/mono/metadata/sgen-stw.c b/src/mono/mono/metadata/sgen-stw.c
+index daaafba2a..b7f15460e 100644
+--- a/src/mono/mono/metadata/sgen-stw.c
++++ b/src/mono/mono/metadata/sgen-stw.c
+@@ -93,6 +93,11 @@ update_current_thread_stack (void *start)
+ }
+ MONO_RESTORE_WARNING
+ 
++#ifdef HOST_GEX
++void gexp_stop_guest_threads (void);
++void gexp_start_guest_threads (void);
++#endif
++
+ static void
+ acquire_gc_locks (void)
+ {
+@@ -157,6 +162,11 @@ sgen_client_stop_world (int generation, gboolean serial_collection)
+ 	TV_GETTIME (stop_world_time);
+ 
+ 	unified_suspend_stop_world (MONO_THREAD_INFO_FLAGS_NO_GC, sgen_client_stop_world_thread_stopped_callback);
++#ifdef HOST_GEX
++	/* gex: threads running guest code are GC-safe to Mono but still run;
++	 * stop them at their next safepoint, as Boehm stopped them. */
++	gexp_stop_guest_threads ();
++#endif
+ 
+ 	SGEN_LOG (3, "world stopped");
+ 
+@@ -204,6 +214,9 @@ sgen_client_restart_world (int generation, gboolean serial_collection, gint64 *s
+ 
+ 	TV_GETTIME (start_handshake);
+ 
++#ifdef HOST_GEX
++	gexp_start_guest_threads ();
++#endif
+ 	unified_suspend_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC, sgen_client_stop_world_thread_restarted_callback);
+ 
+ 	TV_GETTIME (end_sw);
 diff --git a/src/mono/mono/mini/CMakeLists.txt b/src/mono/mono/mini/CMakeLists.txt
 index 176bbbb4f..94a52d1b6 100644
 --- a/src/mono/mono/mini/CMakeLists.txt
@@ -659,6 +720,53 @@ index eb3a8f55a..f6777a63c 100644
  
  void
  mono_runtime_setup_stat_profiler (void)
+diff --git a/src/mono/mono/sgen/sgen-alloc.c b/src/mono/mono/sgen/sgen-alloc.c
+index 5afa90dda..b80eaa9c6 100644
+--- a/src/mono/mono/sgen/sgen-alloc.c
++++ b/src/mono/mono/sgen/sgen-alloc.c
+@@ -185,6 +185,14 @@ sgen_alloc_obj_nolock (GCVTable vtable, size_t size)
+ 		if (p) {
+ 			increment_thread_allocation_counter (size);
+ 		}
++#ifdef HOST_GEX
++	} else if (1) {
++		/* gex (noita-wasm docs/unity-dotnet.md): Boehm-like, as Unity's native
++		 * code expects -- nothing moves, every collection is a full mark, so a
++		 * raw object pointer or a store without a write barrier from guest
++		 * code stays valid. No nursery: straight into the major heap. */
++		return alloc_degraded (vtable, size, TRUE);
++#endif
+ 	} else {
+ 		/* tlab_next and tlab_temp_end are TLS vars so accessing them might be expensive */
+ 
+@@ -337,6 +345,10 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
+ 	if (real_size > SGEN_MAX_SMALL_OBJ_SIZE)
+ 		return NULL;
+ 
++#ifdef HOST_GEX
++	return NULL; /* no nursery (sgen_alloc_obj_nolock) */
++#endif
++
+ 	if (G_UNLIKELY (size > sgen_tlab_size)) {
+ 		/* Allocate directly from the nursery */
+ 
+diff --git a/src/mono/mono/sgen/sgen-marksweep.c b/src/mono/mono/sgen/sgen-marksweep.c
+index c74ff69af..b1785d173 100644
+--- a/src/mono/mono/sgen/sgen-marksweep.c
++++ b/src/mono/mono/sgen/sgen-marksweep.c
+@@ -184,7 +184,12 @@ static int fast_block_obj_size_indexes [MS_NUM_FAST_BLOCK_OBJ_SIZE_INDEXES];
+ #define MS_BLOCK_TYPE_MAX	4
+ 
+ static gboolean *evacuate_block_obj_sizes;
++#ifdef HOST_GEX
++/* gex: nothing moves (Boehm-like, sgen-alloc.c) */
++static float evacuation_threshold = 0.0f;
++#else
+ static float evacuation_threshold = 0.666f;
++#endif
+ 
+ static gboolean lazy_sweep = TRUE;
+ 
 diff --git a/src/mono/mono/utils/CMakeLists.txt b/src/mono/mono/utils/CMakeLists.txt
 index 8c124a1aa..921e9e8c7 100644
 --- a/src/mono/mono/utils/CMakeLists.txt
@@ -750,6 +858,77 @@ index 09af6f899..c96f1f40f 100644
  			__func__, filepath ? filepath : "", length, (guint64)offset, "mmaps of zero length are not permitted with emscripten");
  		return NULL;
  #endif
+diff --git a/src/mono/mono/utils/mono-threads-gex.c b/src/mono/mono/utils/mono-threads-gex.c
+new file mode 100644
+index 000000000..0036d0da9
+--- /dev/null
++++ b/src/mono/mono/utils/mono-threads-gex.c
+@@ -0,0 +1,65 @@
++/**
++ * \file
++ * gex (noita-wasm docs/unity-dotnet.md): Mono as wasm64 inside an x86-64
++ * Linux guest. Threads are POSIX threads (mono-threads-posix.c, musl's
++ * pthreads over gex-kernel's clone and futex); suspension is cooperative
++ * only, as on every wasm host: no signal can interrupt wasm code.
++ */
++
++#include "config.h"
++
++#include <mono/utils/mono-threads.h>
++#include <mono/utils/mono-threads-coop.h>
++
++#if defined (USE_GEX_BACKEND)
++
++void
++mono_threads_suspend_init_signals (void)
++{
++}
++
++void
++mono_threads_suspend_init (void)
++{
++	g_assert (mono_threads_is_cooperative_suspension_enabled ());
++}
++
++/* From the provider (gexprov64.c): this guest thread's context and the end
++ * of its guest stack. */
++void gexp_thread_guest_info (guint64 *ctx, guint64 *stack_end);
++
++void
++mono_threads_suspend_register (MonoThreadInfo *info)
++{
++	gexp_thread_guest_info (&info->gex_ctx, &info->gex_stack_end);
++}
++
++void
++mono_threads_suspend_free (MonoThreadInfo *info)
++{
++}
++
++gboolean
++mono_threads_suspend_begin_async_suspend (MonoThreadInfo *info, gboolean interrupt_kernel)
++{
++	return TRUE;
++}
++
++gboolean
++mono_threads_suspend_check_suspend_result (MonoThreadInfo *info)
++{
++	return TRUE;
++}
++
++gboolean
++mono_threads_suspend_begin_async_resume (MonoThreadInfo *info)
++{
++	return TRUE;
++}
++
++void
++mono_threads_suspend_abort_syscall (MonoThreadInfo *info)
++{
++}
++
++#endif /* USE_GEX_BACKEND */
 diff --git a/src/mono/mono/utils/mono-threads-posix.c b/src/mono/mono/utils/mono-threads-posix.c
 index fa1899390..fda4bfa37 100644
 --- a/src/mono/mono/utils/mono-threads-posix.c
@@ -818,7 +997,7 @@ index 64fbd11a2..5f5597581 100644
  
  #endif /* __MONO_THREADS_WASM_H__ */
 diff --git a/src/mono/mono/utils/mono-threads.h b/src/mono/mono/utils/mono-threads.h
-index 44f2535fb..9f7716830 100644
+index 44f2535fb..499b1f71f 100644
 --- a/src/mono/mono/utils/mono-threads.h
 +++ b/src/mono/mono/utils/mono-threads.h
 @@ -128,7 +128,9 @@ and reduce the number of casts drastically.
@@ -832,7 +1011,22 @@ index 44f2535fb..9f7716830 100644
  #define USE_WASM_BACKEND
  #elif defined (_POSIX_VERSION)
  #if defined (__MACH__) && !defined (USE_SIGNALS_ON_MACH)
-@@ -893,7 +895,7 @@ mono_win32_abort_blocking_io_call (THREAD_INFO_TYPE *info);
+@@ -312,6 +314,14 @@ typedef struct _MonoThreadInfo {
+ 	 * TODO support multiple values by multiple tools
+ 	 */
+ 	void *tools_data;
++
++#ifdef HOST_GEX
++	/* gex: the guest thread's register context (its address) and the end of
++	 * its guest stack: conservative roots (sgen-mono.c). Set when the thread
++	 * registers (mono-threads-gex.c). */
++	guint64 gex_ctx;
++	guint64 gex_stack_end;
++#endif
+ } MonoThreadInfo;
+ 
+ typedef struct {
+@@ -893,7 +903,7 @@ mono_win32_abort_blocking_io_call (THREAD_INFO_TYPE *info);
  		if (GetLastError () != _last_error_restore_point) \
  			mono_SetLastError (_last_error_restore_point);
  

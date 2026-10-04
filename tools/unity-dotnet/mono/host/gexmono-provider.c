@@ -10,6 +10,7 @@
  * interpreter. It also stands in for C++ exceptions, which a wasm module
  * without wasm EH cannot have (natively: gex.provider_try/throw).
  */
+#include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +94,51 @@ dl_symbol (void *handle, const char *name, char **err, void *user_data)
 		*err = strdup ("gexmono: symbol not found");
 	return (void *)p;
 }
+
+/* ---- guest code is a GC-safe region ----
+ * A thread attached to the runtime runs guest code in GC Safe (blocking)
+ * mode, so a collection does not wait for it to poll: gex stops it at its
+ * next safepoint instead (sgen-stw.c, gexp_stop_guest_threads), and its
+ * guest stack and registers are scanned conservatively (sgen-mono.c). Each
+ * crossing into guest code pushes whether it entered the region. */
+
+#include <mono/utils/mono-threads.h>
+#include <mono/utils/mono-threads-api.h>
+
+#define GEXMONO_SAFE_MAX 256
+static __thread gpointer safe_cookie [GEXMONO_SAFE_MAX];
+static __thread int safe_depth;
+
+void
+gexp_hook_to_guest (void)
+{
+	gpointer cookie = NULL;
+	MonoThreadInfo *info = mono_thread_info_current_unchecked ();
+	if (info && mono_thread_info_current_state (info) == STATE_RUNNING) {
+		gpointer dummy;
+		cookie = mono_threads_enter_gc_safe_region_unbalanced (&dummy);
+	}
+	if (safe_depth < GEXMONO_SAFE_MAX)
+		safe_cookie [safe_depth] = cookie;
+	safe_depth++;
+}
+
+void
+gexp_hook_from_guest (void)
+{
+	if (!safe_depth)
+		return; /* the thread's first entry */
+	safe_depth--;
+	gpointer cookie = safe_depth < GEXMONO_SAFE_MAX ? safe_cookie [safe_depth] : NULL;
+	if (cookie) {
+		gpointer dummy;
+		mono_threads_exit_gc_safe_region_unbalanced (cookie, &dummy);
+	}
+}
+
+/* This is the embedding API's other side: its external-only functions are
+ * ours to call (the runtime's headers make the warning an error). */
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 /* ---- raising a managed exception from guest code ---- */
 

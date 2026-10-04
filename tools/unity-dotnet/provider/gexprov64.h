@@ -39,6 +39,13 @@ void __gex_provider_attach(void);
 extern __thread int gexp_ctx;
 extern __thread int32_t gexp_depth;
 
+/* Crossing between guest code and the provider (gexprov64.c): which side
+ * a thread is on, for stopping the guest's threads around a collection,
+ * and the provider's own hooks (a runtime's GC-safe transitions). */
+void gexp_from_guest(void);
+void gexp_to_guest(void);
+void gexp_attach_thread(void);
+
 /* Every adapter's first act: this thread's context for libc's syscalls,
  * and libc's per-thread state on its first visit. Nested entries (guest
  * code the provider called, calling the provider again) see the same
@@ -47,10 +54,14 @@ extern __thread int32_t gexp_depth;
 static inline void gexp_enter_(int ctx, int32_t depth)
 {
 	__gex_set_ctx((uint32_t)ctx);
-	if (__builtin_expect(!__gex_get_tp(), 0))
+	/* (TLS exists only once the thread is attached.) */
+	if (__builtin_expect(!__gex_get_tp(), 0)) {
 		__gex_provider_attach();
+		gexp_attach_thread();
+	}
 	gexp_ctx = ctx;
 	gexp_depth = depth;
+	gexp_from_guest();
 }
 
 #define GEXP_SYSV(name) int name(int ctx, int32_t depth, uint32_t need, uint64_t ret)
@@ -83,6 +94,7 @@ static inline uint64_t gexp_arg_win64(int ctx, unsigned i)
  * one the caller predicted (`ret`), as every F_body reports. */
 static inline int gexp_return(int ctx, uint64_t ret)
 {
+	gexp_to_guest();
 	uint64_t sp = GEXP_X(ctx, 4);
 	uint64_t ra = GEXP_MEM64(sp);
 	GEXP_X(ctx, 4) = sp + 8;

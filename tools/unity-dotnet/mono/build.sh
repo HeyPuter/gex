@@ -85,14 +85,14 @@ step_provider() {
 	. "$UD/sysroot/flags.sh"
 	local P="$OUT/src/src/native/public" N="$OUT/src/src/native" L="$OUT/obj/mono" W="$OUT/provider"
 	mkdir -p "$W"; cd "$W"
-	local INC="-nostdinc -isystem $SR/include -isystem $(clang -print-resource-dir)/include -I$P -I$OUT/src/src/mono -I$UD/provider -I$HERE/host -I$OUT/obj"
+	local INC="-nostdinc -isystem $SR/include -isystem $(clang -print-resource-dir)/include -I$P -I$OUT/src/src/mono -I$UD/provider -I$HERE/host -I$OUT/obj -I$OUT/src/src/mono/mono/eglib -I$OUT/obj/mono/eglib -I$OUT/src/src/native"
 	llvm-nm --defined-only -j "$L"/mini/libmonosgen-2.0.a "$L"/mini/libmono-ee-interp.a "$L"/mini/libmono-component-*-stub-static.a \
 		"$L"/mini/libmono-component-marshal-ilgen-static.a 2>/dev/null | grep '^mono_' | sort -u > have.txt
 	python3 "$HERE/host/gen-adapters.py" --abi sysv --skip "$HERE/host/gexmono-skip.txt" --have have.txt \
 		"$P"/mono/*/details/*-functions.h "$P"/mono/*/details/*-types.h > adapters.c 2> adapters.log
 	python3 "$HERE/host/gen-m2n.py" "$HERE/host/m2n-extra.txt" > m2n.c
 	for f in adapters.c m2n.c "$HERE/host/gexmono-provider.c" "$UD/provider/gexprov64.c" "$UD/provider/gexprov64-table.s"; do
-		clang $WASM64_CFLAGS $INC -Wno-unused-command-line-argument -c "$f" -o "$(basename "${f%.*}").o"
+		clang $WASM64_CFLAGS $INC -Wno-unused-command-line-argument -Wno-deprecated-declarations -c "$f" -o "$(basename "${f%.*}").o"
 	done
 	clang $WASM64_CFLAGS $INC -I"$N/libs/Common" -I"$OUT/objnative/Common" -I"$N/libs/System.Native" -I"$N" -I"$N/libs" \
 		-c "$N/libs/System.Native/entrypoints.c" -o entrypoints-System.Native.o

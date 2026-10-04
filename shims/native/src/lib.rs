@@ -2104,6 +2104,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
         aot_only::bind_root(&mut store, &instance)?;
     }
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
+    libprov::guest_stop().forget(thread.tid as u32);
     profile::harvest(&mut store)?;
     match stopped {
         Stopped::Exec(_) => bail!("execve from a non-main thread is not supported"),
@@ -2895,7 +2896,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                         .unwrap_or_else(|e| e.into_inner())
                         .signal_pending_for(waiting_tid)
                 };
+                // Blocked in the kernel counts as stopped for a provider's
+                // collection; the thread parks on its way out if one runs.
+                libprov::guest_stop().enter_kernel(waiting_tid as u32);
                 let r = perform_block(op, memory.bytes(), &service, &interrupted);
+                libprov::guest_stop().leave_kernel(waiting_tid as u32, memory.bytes());
                 let mut gm = GuestMem::new(memory.bytes());
                 caller
                     .data_mut()
@@ -3647,6 +3652,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // here, its registers written back, until it is resumed.
             if let Some(p) = state.nt.clone() {
                 gex_kernel::nt::suspend_point(&p, ctx_addr);
+            }
+            // A stateful provider's collection stops guest threads here.
+            if libprov::guest_stop().active() {
+                libprov::guest_stop().park_if_stopping(state.thread.tid as u32, gm.bytes, false);
             }
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),

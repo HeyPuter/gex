@@ -45,5 +45,16 @@ public static class T {
     catch (ArgumentException e) { s += "; caught " + e.Message; }
     return s;
   }
+  public static string Make(int i) => "object " + i + " " + new string('x', i % 50);
+  public static int Churn(int rounds) {
+    int n = 0;
+    for (int r = 0; r < rounds; r++) {
+      var l = new List<object>();
+      for (int i = 0; i < 20000; i++) l.Add(new byte[64 + i % 300]);
+      n += l.Count;
+      GC.Collect();
+    }
+    return n;
+  }
   public static string Hello(string s) => "hello " + s + " from " + typeof(T).Assembly.GetName().Name + " ptr=" + IntPtr.Size;
 }

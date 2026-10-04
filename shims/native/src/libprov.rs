@@ -413,6 +413,33 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         };
         Ok(guest_sym(caller.data_mut(), &name).unwrap_or(0) as i64)
     })?;
+    // Stopping the guest's threads around a provider runtime's collection
+    // (`GuestStop`).
+    linker.func_wrap(IMPORT_MODULE, "provider_thread_register", |caller: Caller<'_, HostState>, in_guest: i64, stop: i64| {
+        guest_stop().register(caller.data().thread.tid as u32, in_guest as u64, stop as u64);
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_park", |caller: Caller<'_, HostState>| {
+        let mem = caller.data().memory.clone();
+        if let Some(m) = mem {
+            guest_stop().park_if_stopping(caller.data().thread.tid as u32, m.bytes(), true);
+        }
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_stop_guest", |caller: Caller<'_, HostState>| -> Result<()> {
+        let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        guest_stop().stop(caller.data().thread.tid as u32, m.bytes());
+        Ok(())
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_start_guest", |caller: Caller<'_, HostState>| -> Result<()> {
+        let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        guest_stop().start(m.bytes());
+        Ok(())
+    })?;
+    // The end of the mapping holding guest stack pointer `sp` (a thread's
+    // stack top, for scanning it).
+    linker.func_wrap(IMPORT_MODULE, "provider_guest_stack_end", |mut caller: Caller<'_, HostState>, sp: i64| -> i64 {
+        let sp = sp as u64;
+        caller.data_mut().with_kernel(|k| k.mem.vmas().iter().find(|v| v.start <= sp && sp < v.end).map_or(0, |v| v.end)) as i64
+    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_code_page", |_caller: Caller<'_, HostState>| -> i64 {
         THREAD_ENTRY.load(std::sync::atomic::Ordering::Acquire) as i64
     })?;
@@ -510,4 +537,145 @@ fn guest_sym(state: &mut HostState, name: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Stopping a process's guest threads for a stateful provider's garbage
+/// collector (docs/unity-dotnet.md): the threads running guest code are
+/// GC-safe to the runtime but still run; they stop at their next safepoint
+/// or syscall, with their registers written back, as Boehm stopped them.
+/// Each thread registers a word in the provider's memory saying whether it
+/// is in guest code, and the provider's own stop flag, which it checks
+/// before crossing into guest code (`provider_park`).
+pub(crate) struct GuestStop {
+    stopping: std::sync::atomic::AtomicBool,
+    state: Mutex<GuestStopState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GuestStopState {
+    /// tid -> the provider's "in guest code" word for it.
+    threads: std::collections::HashMap<u32, u64>,
+    /// The provider's stop flag (one per process).
+    stop_word: u64,
+    /// Threads parked, and threads inside a syscall (stopped as far as the
+    /// collector is concerned; they park on the way out).
+    parked: std::collections::HashSet<u32>,
+    in_kernel: std::collections::HashSet<u32>,
+    /// The thread running the collection.
+    stopper: Option<u32>,
+}
+
+static GUEST_STOP: OnceLock<GuestStop> = OnceLock::new();
+
+pub(crate) fn guest_stop() -> &'static GuestStop {
+    GUEST_STOP.get_or_init(|| GuestStop { stopping: false.into(), state: Mutex::new(Default::default()), cv: std::sync::Condvar::new() })
+}
+
+fn word(mem: &[u8], addr: u64) -> u32 {
+    mem.get(addr as usize..addr as usize + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
+impl GuestStop {
+    fn register(&self, tid: u32, in_guest: u64, stop: u64) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.threads.insert(tid, in_guest);
+        st.stop_word = stop;
+    }
+
+    /// A thread that has ended: nothing to wait for.
+    pub(crate) fn forget(&self, tid: u32) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.threads.remove(&tid);
+        st.in_kernel.remove(&tid);
+        self.cv.notify_all();
+    }
+
+    /// Whether a collection is stopping the guest's threads (the fast path's test).
+    pub(crate) fn active(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// At a safepoint or a syscall boundary in guest code (or from the
+    /// provider, `forced`): park while a collection runs.
+    pub(crate) fn park_if_stopping(&self, tid: u32, mem: &[u8], forced: bool) {
+        if !self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&w) = st.threads.get(&tid) else { return };
+        if st.stopper == Some(tid) || (!forced && word(mem, w) == 0) {
+            return;
+        }
+        st.parked.insert(tid);
+        self.cv.notify_all();
+        while self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.parked.remove(&tid);
+    }
+
+    /// Around a syscall made from guest code: it counts as stopped.
+    pub(crate) fn enter_kernel(&self, tid: u32) {
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).threads.contains_key(&tid) {
+            self.state.lock().unwrap_or_else(|e| e.into_inner()).in_kernel.insert(tid);
+            self.cv.notify_all();
+        }
+    }
+
+    pub(crate) fn leave_kernel(&self, tid: u32, mem: &[u8]) {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.in_kernel.remove(&tid) {
+                return;
+            }
+        }
+        self.park_if_stopping(tid, mem, false);
+    }
+
+    fn stop(&self, me: u32, mem: &mut [u8]) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.stopper = Some(me);
+        if st.stop_word != 0 {
+            store_word(mem, st.stop_word, 1);
+        }
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: Vec<u32> = st
+                .threads
+                .iter()
+                .filter(|(&t, &w)| t != me && word(mem, w) != 0 && !st.parked.contains(&t) && !st.in_kernel.contains(&t))
+                .map(|(&t, _)| t)
+                .collect();
+            if waiting.is_empty() {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                eprintln!("gex: provider stop-the-world: threads {waiting:?} never reached a safepoint; going on without them");
+                return;
+            }
+            st = self.cv.wait_timeout(st, std::time::Duration::from_millis(2)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    fn start(&self, mem: &mut [u8]) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.stopper = None;
+        if st.stop_word != 0 {
+            store_word(mem, st.stop_word, 0);
+        }
+        self.stopping.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.cv.notify_all();
+    }
+}
+
+/// Store a 32-bit word of guest memory, ordered with everything around it
+/// (the provider reads it with an atomic load).
+fn store_word(mem: &mut [u8], addr: u64, v: u32) {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    if let Some(b) = mem.get_mut(addr as usize..addr as usize + 4) {
+        b.copy_from_slice(&v.to_le_bytes());
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
