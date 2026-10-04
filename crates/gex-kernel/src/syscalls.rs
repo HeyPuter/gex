@@ -2320,7 +2320,12 @@ impl Kernel {
             // treat the socket as broken.
             nr::SETSOCKOPT => Ok(0),
             nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
-            nr::SHUTDOWN => self.fds.get(a[0] as i32).map(|_| 0),
+            // A unix socket's directions close as asked; any other socket
+            // (the proxied network, the global kernel's) just agrees.
+            nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
+                Ok(sock) => sock.shutdown_how(a[1]),
+                Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+            },
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends
             // and gives up if that fails.
