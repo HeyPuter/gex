@@ -10521,6 +10521,13 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // A function-tier unit another Worker published that this one has not
     // installed yet: the miss is a catch-up, done in JS, not a translation.
     if cgen::behind() {
+        // AOT-only: catch up inside the call and dispatch again, keeping the
+        // thread's frames (leaving would resume at continuations no unit
+        // has entries for).
+        if !jit_on() {
+            nt::serve_now();
+            return gex_emit::module::DISPATCH_MISS_REDISPATCH;
+        }
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
@@ -10693,6 +10700,27 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
             });
             trap();
+        }
+    }
+    // An ejected project's training run (`run.mjs --record-entries`): code
+    // inside an image with a unit, entered where the unit has no entry, is
+    // what the web build's region entries must cover.
+    crate::cgen::note_web_entry(pc as u64);
+    // AOT-only, a pc the function table has (published by another Worker
+    // after this one last caught up): catch up and dispatch again.
+    if !jit_on() && cgen::knows(pc) {
+        thread_local! {
+            static AGAIN: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+        }
+        let n = AGAIN.with(|a| {
+            let (p, n) = a.get();
+            let n = if p == pc { n + 1 } else { 1 };
+            a.set((pc, n));
+            n
+        });
+        if n <= 3 {
+            nt::serve_now();
+            return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
     }
     // An ejected project without a JIT fallback (`gex_set_jit(0)`): nothing

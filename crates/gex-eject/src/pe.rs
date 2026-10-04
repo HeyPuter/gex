@@ -146,9 +146,12 @@ pub const WEB_NT_RUN_MJS: &str = r#"#!/usr/bin/env node
 //   ./run.mjs                  the recorded arguments
 //   ./run.mjs ARGS...          these instead
 //   ./run.mjs --jit-fallback [-- ARGS...]   translate what the build never saw
+//   ./run.mjs --record-entries [-- ARGS...] a training run: with the fallback,
+//        writing where the browser entered code the units have no entry for
+//        to user/web-entries.txt, which ./build.sh makes region entries of
 //
 // GEX_NT_* variables set now are passed to the NT layer (GEX_NT_STATS, ...).
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -166,12 +169,39 @@ if (!existsSync(runFile)) {
 const m = JSON.parse(readFileSync(runFile, 'utf8'));
 let av = process.argv.slice(2);
 let jit = false;
+let record = false;
 if (av[0] === '--jit-fallback') { jit = true; av = av.slice(1); }
+if (av[0] === '--record-entries') { jit = record = true; av = av.slice(1); }
 if (av[0] === '--') av = av.slice(1);
 const args = av.length ? av : m.args;
 const rootfs = join(here, 'build/rootfs');
 const env = [`GEX_WINE_PREFIX=${m.prefix}`, ...m.settings, ...m.env];
 for (const [k, v] of Object.entries(process.env)) if (k.startsWith('GEX_NT_')) env.push(`${k}=${v}`);
+if (record) {
+  env.push('GEX_NT_ENTRY_LOG=1');
+  const file = join(here, 'user/web-entries.txt');
+  const seen = new Set(existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
+  const before = seen.size;
+  // The Workers' output reaches this process's stderr (Node pipes it
+  // there): taken out line by line.
+  const write = process.stderr.write.bind(process.stderr);
+  let partial = '';
+  process.stderr.write = (chunk, ...rest) => {
+    const lines = (partial + (typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())).split('\n');
+    partial = lines.pop();
+    const keep = [];
+    for (const l of lines) {
+      const m = l.match(/gex-nt: web entry (0x[0-9a-f]+)/);
+      if (m) seen.add(m[1]);
+      else keep.push(l + '\n');
+    }
+    return keep.length ? write(keep.join(''), ...rest) : true;
+  };
+  process.on('exit', () => {
+    writeFileSync(file, [...seen].sort().join('\n') + '\n');
+    write(`gex-eject: ${seen.size - before} new web entries (${seen.size} in all) in user/web-entries.txt; run ./build.sh\n`);
+  });
+}
 process.env.GEX_ARCH = 'x86';
 process.env.GEX_SHARED = '1';
 process.env.GEX_WEB_DIR = web;
@@ -457,6 +487,13 @@ fn build_web(
     let sources: Vec<PathBuf> = std::env::var("GEX_EJECT_WEB_UNIT_CACHE")
         .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default();
+    // Where a training run of the web build (`./run.mjs --record-entries`)
+    // entered code the units have no entry for.
+    let web_entries: Vec<u64> = std::fs::read_to_string(dir.join("user/web-entries.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| u64::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
+        .collect();
     std::env::set_var("GEX_CGEN_CACHE", &web);
     gex_cgen::image::set_unguarded(false);
     let r = (|| -> Result<()> {
@@ -474,6 +511,10 @@ fn build_web(
         }
         for (path, base, bytes, interior) in inputs {
             let pe = gex_ld::pe::parse(bytes).map_err(|e| anyhow!("{path}: {e}"))?;
+            let end = base + pe.image_size as u64;
+            let mut interior = interior.clone();
+            interior.extend(web_entries.iter().copied().filter(|a| a >= base && *a < end));
+            let interior = &interior;
             let key_dir = nt_cgen::unit_dir(&pe, *base)?;
             let how = if key_dir.join("c.wasm").exists() {
                 "present"

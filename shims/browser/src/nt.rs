@@ -77,6 +77,7 @@ mod stub {
     }
 
     pub(crate) fn tick() {}
+    pub(crate) fn serve_now() {}
 
     pub(crate) fn arena_ceiling() -> u64 {
         gex_abi::MMAP_TOP
@@ -347,6 +348,7 @@ mod imp {
             FIXED_TIME.store(t, Ordering::Relaxed);
         }
         // An ejected project's stateful providers (docs/eject-pe.md §5.1).
+        crate::cgen::ENTRY_LOG.store(flag("GEX_NT_ENTRY_LOG"), Ordering::Relaxed);
         if let Some(v) = var("GEX_NT_STATEFUL") {
             crate::cgen::set_stateful(&v);
         }
@@ -676,7 +678,10 @@ mod imp {
         let p32 = PROCESS.get().is_some_and(|p| p.abi == nt::Abi::P32);
         let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
         let sp = if p32 { sp & 0xffff_ffff } else { sp };
-        if sp <= raise_sp {
+        // At or above the syscall's own stack: control is back with the
+        // frames the dispatch was entered from (an APC's NtContinue comes
+        // back to exactly it), as natively (fb7dfd52).
+        if sp < raise_sp {
             return false;
         }
         let _ = gm.write_u64(c + ctx::PC as u64, target);
@@ -738,6 +743,13 @@ mod imp {
         let mut gm = GuestMem::new(guest_bytes());
         let to_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         let to_sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0) & mask;
+        // Back at the syscall's own return (an APC's NtContinue, an
+        // exception continued at the raise): just return, with the
+        // context's registers.
+        if to_pc == next_pc && to_sp == raise_sp & mask {
+            let _ = gm.write_u64(ctx_addr + ctx::PC as u64, next_pc);
+            return true;
+        }
         let pops = match guest_bytes().get(next_pc as usize) {
             Some(0xc2) => gm.read_u32(next_pc + 1).unwrap_or(0) as u64 & 0xffff,
             _ => 0,
@@ -921,7 +933,14 @@ mod imp {
                 if nr == nt::sysno::ntdll::NtRaiseException && crate::tracing_exc() {
                     warn_line(&format!("[nt] NtRaiseException returning to {next_pc:#x} (byte {:#x}): nested {}\n", guest_bytes().get(next_pc as usize).copied().unwrap_or(0), nest_exceptions(next_pc)));
                 }
-                if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(next_pc) && raise_nested(p, ctx_addr, target, raise_sp, next_pc) {
+                // An exception raised, or a user APC delivered by an
+                // alertable wait (not NtContinue's own delivery): both run a
+                // dispatcher that ends in NtContinue, nested (fb7dfd52's
+                // browser half).
+                let apc = target == p.ntdll.lock().unwrap().ki_user_apc_dispatcher
+                    && nr != nt::sysno::ntdll::NtContinue
+                    && nr != nt::sysno::ntdll::NtContinueEx;
+                if (nr == nt::sysno::ntdll::NtRaiseException || apc) && nest_exceptions(next_pc) && raise_nested(p, ctx_addr, target, raise_sp, next_pc) {
                     return;
                 }
                 set_resume(target);
@@ -1203,6 +1222,13 @@ mod imp {
 
     /// End the process with NT exit code `code`. The low byte is what a
     /// parent sees, as natively.
+    /// An AOT-only run: JS serves units, catches this Worker up on the
+    /// function table and posts new threads, inside this call.
+    pub(crate) fn serve_now() {
+        // SAFETY: a host import without arguments.
+        unsafe { serve_in_place() };
+    }
+
     pub(crate) fn end_process(code: u32) -> ! {
         if crate::tracing_exc() {
             let (n, l) = crate::cgen::callouts();

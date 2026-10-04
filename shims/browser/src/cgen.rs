@@ -739,6 +739,30 @@ pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
     1
 }
 
+/// GEX_NT_ENTRY_LOG: print each pc entered inside a unit's pages without an
+/// entry there, once (`gex-nt: web entry <pc>`), for an ejected project's
+/// training run.
+pub(crate) static ENTRY_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the function table has a function for `pc`.
+pub(crate) fn knows(pc: u64) -> bool {
+    ftab(|m| m.get(pc).is_some())
+}
+
+pub(crate) fn note_web_entry(pc: u64) {
+    if !ENTRY_LOG.load(Ordering::Relaxed) {
+        return;
+    }
+    let page = pc / gex_abi::DISPATCH_PAGE;
+    if !lock(&UNIT_PAGES).as_ref().is_some_and(|m| m.contains_key(&page)) {
+        return;
+    }
+    static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+    if lock(&SEEN).get_or_insert_with(Default::default).insert(pc) {
+        crate::warn_line(&format!("gex-nt: web entry {pc:#x}\n"));
+    }
+}
+
 /// `gex.provider_try` calls and the throws they caught (GEX_NT_STATS).
 pub(crate) static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -919,6 +943,20 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     // An ejected project's AOT-only run (`gex_set_jit(0)`, docs/eject-pe.md
     // §3.1): no function body holds `t`, and nothing may translate it.
     if !crate::jit_on() {
+        // A branch to memory nothing executable is mapped at: the guest's
+        // access violation, as natively (34c3e45b).
+        let wild = crate::with_host(|h| {
+            !h.kernel.mem.vmas().iter().any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && t >= v.start && t < v.end)
+        });
+        if wild {
+            crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
+        }
+        // Published by another Worker and not yet installed here: catch up,
+        // and leave to the dispatcher, which finds it.
+        if ftab(|m| m.get(t).is_some()) {
+            crate::nt::serve_now();
+            return gex_abi::ftab::RET_LEFT;
+        }
         let path = lock(&UNITS)
             .iter()
             .filter(|x| x.base <= t)
