@@ -4731,7 +4731,7 @@ impl<'a> Emitter<'a> {
             buf[..chunk.len()].copy_from_slice(chunk);
             let want = u64::from_le_bytes(buf);
             let mask: u64 = if chunk.len() == 8 { !0 } else { (1u64 << (8 * chunk.len())) - 1 };
-            self.f.i32_const(at as u32 as i32);
+            self.f.addr_const(at);
             self.f.load(0x29, 0, 0); // i64.load, unaligned
             if mask != !0 {
                 self.f.i64_const(mask as i64);
