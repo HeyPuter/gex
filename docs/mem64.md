@@ -389,3 +389,34 @@ browser shim; the coordinator sequences them.
   sockets only `connect` today). After that: the browser (step 6), the live
   switch (step 7), and Rain World and Hollow Knight.
 
+### State at 2026-10-04, evening (paused for a reboot)
+
+- **Committed since the menu:** Rain World work in the NT layer (see
+  docs/games.md, Unity section: thread suspension, WINEDLLOVERRIDES,
+  display configuration, raw input), a fix for my regression where a
+  Windows worker's ExitThread ended the process, and illegal-instruction
+  logging. tests/nt passed 73/73 at 7e5fad7a; display.c gained checks
+  since (passing). tests/x86-programs passed 61/61 at ad2e04d6.
+- **WIP (addac37e):** the function JIT translates writable-and-executable
+  code with a byte check of all its blocks on entry (the coordinator's
+  option (b)); `GEX_FJIT_WX=refuse` keeps the refusal. It builds and is
+  untested. **Resume:** tests/x86-programs smc-direct-jump.c and
+  smc-threads.c under `--fjit`. smc-direct-jump writes code and jumps to
+  it within one invocation, which an entry-only check does not see, so a
+  direct transfer into writable code may have to leave through dispatch.
+  Then a mid-function patch test, then Muck's menu fps natively as a proxy
+  (the browser is what counts).
+- **Next after that (coordinator's order):** guest AF_INET
+  bind/listen/accept natively backed by host sockets, with a test in
+  tests/x86-programs. Then halflife.sh's native mode uses a second gexc
+  running the in-guest x86-64 Xwayland, serving CEF over TCP, with the
+  reason recorded in the script. A host Xwayland on gexc's socket was ruled
+  out: the compositor's socket exists only in the guest namespace, and it
+  reads shm buffers from guest memory. Then the live switch, the browser,
+  and Hollow Knight.
+- **Build:** the current binary is `target/x86b/release/gexc`; target/x86
+  is older. Rebuilding invalidates the fjit cache, and a cold Muck or Rain
+  World run takes 40-100 minutes. Run scripts are in work/unity-resume/
+  (muck.sh, rw/rw.sh after the copy below); muck.sh's cores default to
+  1,7, and the coordinator assigns cores.
+

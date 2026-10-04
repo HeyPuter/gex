@@ -284,6 +284,31 @@ of address space.
   byte check for code in writable-and-executable pages, with direct
   transfers into code not yet seen leaving through dispatch, or a store-side
   check of a code-page bitmap.
+- **Rain World (2026-10-04, paused for a reboot):** run natively as
+  `rw.sh` in work/unity-resume/rw/ does (`--fjit --mem64 --wine-prefix P
+  --gl`, `--env WINEDLLOVERRIDES=winhttp=b`, 800x600, a copy of the staged
+  prefix and a hard-linked copy of F's scratchpad/fjit/cgcache-peg units).
+  Its build has **no OpenGL Core shaders** ("Forced GfxDevice 'OpenGL Core'
+  was not built from editor"), so it runs D3D11 on wined3d, as Hollow Knight
+  must: "Direct3D 11.0 [level 11.1]", Mono's reload completes (430-500 s
+  cold), Rewired's input initializes, the first scene loads ("UnloadTime")
+  and the window presents its first (black) frame. Fixed on the way, each
+  with a test in tests/nt: NtSuspendThread/NtGetContextThread for Boehm's
+  stop-the-world (it aborted with a message box), WINEDLLOVERRIDES (BepInEx's
+  winhttp.dll doorstop loaded regardless and MonoMod died), the display
+  configuration queries (Unity allocated 0xffffffff * 72 bytes), raw input,
+  display device names, per-monitor DPI; and a regression of mine (a
+  Windows worker thread's ExitThread ended the process).
+  **Where it stops:** run r7 died about 10 minutes after the scene load of
+  an unhandled illegal instruction in Mono's JIT code (0xa3ea00a, no
+  module). gexc now logs the bytes (`gex-nt: illegal instruction at`); run
+  r8 was stopped by the reboot before reaching that point (presents=1, 36
+  min in). **Resume:** rerun `rw.sh r9 7200 --fjit --mem64` (with
+  `RENDER=` and `CGDIR=.../cgpeg`; about 40 minutes cold), read the
+  illegal-instruction line, decode the bytes, fix the decoder or the
+  trap's handling. Still unimplemented and seen: NtCreateUserProcess (the
+  crash handler), NtSetInformationThread class 1000, NtUserSetWindowsHookEx,
+  secur32's Unix side.
 - Knobs: `GEX_FPS=1` (presents per second), `GEX_PPM_EVERY=N`,
   `--wayland-out null`, `GEX_STRACE_STACK=N` (stack words at each syscall
   under `--strace`), `GEX_NT_TRACE` (logs each NtAllocateVirtualMemory
