@@ -372,18 +372,25 @@ Today's path keeps working throughout. Programs switch per process
   - a wasm program's fork made inside the syscall rather than by trapping
     out of its frames, which native code cannot survive.
 - **Findings for W1–W3:**
-  - **Server round trip: 1.07 ms per request natively.** gex's native host
-    waits on fds by polling with 1 ms sleeps (`perform_block`). Wine
-    clients make a server call for nearly every NT operation, so
-    gex-kernel needs event-driven fd wakeups before W3. ntsync (§3.5)
+  - **Server round trip: 1.07 ms per request natively, now 11 µs.** gex's
+    native host waited on fds by polling with 1 ms sleeps (`perform_block`).
+    Since 5c92f7d6 a syscall that can change descriptor readiness wakes
+    parked threads at once (`shims/native/src/ready.rs`): 20,000
+    `event_op` requests take 0.22 s, 11.0–11.3 µs each over three runs
+    (cores 3 and 9). The browser shim already woke parked Workers on a
+    global counter every syscall bumps (`park_until_ready`). ntsync (§3.5)
     takes waits off the server altogether.
-  - **gex-kernel bugs this hit:**
-    - mkdir on hostfs ignores the mode, so wineserver's 0700 check fails
-      (worked around by chmod on the host);
-    - `poll` reports nothing after the peer's `shutdown(SHUT_WR)`
-      (wineserver's `sock_check_pollhup` prints an error and carries
-      on);
-    - the i386 F_*LK64 passthrough (above).
+  - **gex-kernel bugs this hit, all fixed with tests in
+    tests/x86-programs:**
+    - mkdir ignored its mode on hostfs and tmpfs, so wineserver's 0700
+      check failed (076e010b, `mkdir-mode`);
+    - `shutdown` on unix sockets did nothing, so a peer never saw
+      end-of-file after `SHUT_WR`, which wineserver's `sock_check_pollhup`
+      tests (6aa24358, `shutdown-poll`);
+    - i386's F_*LK64 reached the kernel unmapped, and F_GETLK was
+      unhandled (7ab9dd35, `fcntl-locks`);
+    - and in musl's wasm32 port, `struct epoll_event` was not packed, which
+      wineserver reported as "Error on master socket".
   - **Shared memory:** wineserver shares coherent `MAP_SHARED` memory
     with its clients (session objects; since Wine 9, queue and desktop
     state that win32u reads directly). gex processes have separate
