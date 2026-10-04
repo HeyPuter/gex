@@ -1354,12 +1354,10 @@ pub fn nt_get_context_thread(c: &mut Call<'_>) -> R {
     let (h, at) = (c.a32(0), c.a(1));
     let t = get_thread(c, h)?;
     let own = Arc::ptr_eq(&t, &c.t);
-    if !own && t.suspend.load(Ordering::SeqCst) == 0 {
-        // Windows gives a running thread's registers of some recent moment;
-        // gex can only give them for a stopped thread.
-        return Err(c.unimplemented("NtGetContextThread on a running thread"));
-    }
-    if !own {
+    // A running thread: Windows gives its registers of some recent moment,
+    // and so does gex -- the last ones it wrote back (its last safepoint or
+    // syscall). A suspended one: where it stopped.
+    if !own && t.suspend.load(Ordering::SeqCst) > 0 {
         wait_stopped(c.p, &t);
     }
     let abi = c.p.abi;

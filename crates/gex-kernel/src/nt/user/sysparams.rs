@@ -575,3 +575,62 @@ pub fn nt_user_query_display_config(c: &mut Call<'_>) -> R64 {
     c.g.w32(nm, if virt { 3 } else { 2 })?;
     Ok(0)
 }
+
+/// `NtUserDisplayConfigGetDeviceInfo(packet)`: names for the one source,
+/// target and adapter of [`nt_user_query_display_config`] (an NTSTATUS).
+pub fn nt_user_display_config_get_device_info(c: &mut Call<'_>) -> R64 {
+    use crate::nt::st;
+    let p = c.a(0);
+    if p == 0 {
+        return Ok(st::UNSUCCESSFUL as u64);
+    }
+    let (kind, size) = (c.g.u32(p)?, c.g.u32(p + 4)?);
+    if size < 20 {
+        return Ok(st::UNSUCCESSFUL as u64);
+    }
+    let put = |c: &mut Call<'_>, at: u64, n: usize, s: &str| -> R<()> {
+        let mut w = crate::nt::to_w(s);
+        w.resize(n, 0);
+        c.g.write_wchars(at, &w)
+    };
+    match kind {
+        // DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME: viewGdiDeviceName[32].
+        1 => {
+            if size < 84 {
+                return Ok(st::INVALID_PARAMETER as u64);
+            }
+            put(c, p + 20, 32, "\\\\.\\DISPLAY1")?;
+        }
+        // _GET_TARGET_NAME: flags, outputTechnology, EDID ids, connector,
+        // monitorFriendlyDeviceName[64], monitorDevicePath[128].
+        2 => {
+            if size < 420 {
+                return Ok(st::INVALID_PARAMETER as u64);
+            }
+            c.g.zero(p + 20, 400)?;
+            c.g.w32(p + 24, 0x8000_0000)?; // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+            put(c, p + 36, 64, "Display1")?;
+            put(c, p + 164, 128, "\\\\?\\DISPLAY#Default_Monitor#4&17f0ff54&0&UID0#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}")?;
+        }
+        // _GET_ADAPTER_NAME: adapterDevicePath[128].
+        4 => {
+            if size < 276 {
+                return Ok(st::INVALID_PARAMETER as u64);
+            }
+            put(c, p + 20, 128, "\\\\?\\PCI#VEN_0000&DEV_0000&SUBSYS_00000000&REV_00#0&0&0&0#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}")?;
+        }
+        _ => return Ok(st::NOT_SUPPORTED as u64),
+    }
+    Ok(st::SUCCESS as u64)
+}
+
+/// `NtUserGetDpiForMonitor(monitor, type, *x, *y)`: 96, as the system DPI.
+pub fn nt_user_get_dpi_for_monitor(c: &mut Call<'_>) -> R64 {
+    let (x, y) = (c.a(2), c.a(3));
+    if x == 0 || y == 0 {
+        return Ok(0);
+    }
+    c.g.w32(x, 96)?;
+    c.g.w32(y, 96)?;
+    Ok(1)
+}

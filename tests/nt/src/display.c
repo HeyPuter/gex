@@ -148,6 +148,18 @@ int main(void) {
           dcmodes[si].sourceMode.width == (UINT32)GetSystemMetrics(SM_CXSCREEN) &&
           dcmodes[ti].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET &&
           dcmodes[ti].targetMode.targetVideoSignalInfo.vSyncFreq.Numerator > 0);
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME sn = {0};
+    sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    sn.header.size = sizeof sn;
+    sn.header.adapterId = paths[0].sourceInfo.adapterId;
+    sn.header.id = paths[0].sourceInfo.id;
+    CHECK("the source's GDI name", DisplayConfigGetDeviceInfo(&sn.header) == ERROR_SUCCESS && !lstrcmpW(sn.viewGdiDeviceName, L"\\\\.\\DISPLAY1"));
+    DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {0};
+    tn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tn.header.size = sizeof tn;
+    tn.header.adapterId = paths[0].targetInfo.adapterId;
+    tn.header.id = paths[0].targetInfo.id;
+    CHECK("the target's name", DisplayConfigGetDeviceInfo(&tn.header) == ERROR_SUCCESS && tn.monitorFriendlyDeviceName[0]);
     np = 1; nm = 1;
     CHECK("too few modes", QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, dcmodes, NULL) == ERROR_INSUFFICIENT_BUFFER);
 

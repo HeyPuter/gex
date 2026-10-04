@@ -493,6 +493,8 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtUserEnumDisplayDevices => sysparams::nt_user_enum_display_devices(c),
         n::NtUserGetDisplayConfigBufferSizes => sysparams::nt_user_get_display_config_buffer_sizes(c),
         n::NtUserQueryDisplayConfig => sysparams::nt_user_query_display_config(c),
+        n::NtUserDisplayConfigGetDeviceInfo => sysparams::nt_user_display_config_get_device_info(c),
+        n::NtUserGetDpiForMonitor => sysparams::nt_user_get_dpi_for_monitor(c),
         // Raw input: no devices to list, and registering is accepted (no
         // WM_INPUT follows; keyboard and mouse still arrive as messages).
         n::NtUserGetRawInputDeviceList => {
