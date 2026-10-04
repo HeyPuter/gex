@@ -134,6 +134,29 @@ int main(void) {
     CHECK("the top-level window got it", got);
     DestroyWindow(top);
 
+    /* The display configuration (Unity sizes its buffers from it). */
+    UINT32 np = 0xdead, nm = 0xdead;
+    CHECK("GetDisplayConfigBufferSizes", GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) == ERROR_SUCCESS && np == 1 && nm == 2);
+    DISPLAYCONFIG_PATH_INFO paths[2];
+    DISPLAYCONFIG_MODE_INFO dcmodes[4];
+    np = 2; nm = 4;
+    LONG qr = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, dcmodes, NULL);
+    CHECK("QueryDisplayConfig", qr == ERROR_SUCCESS && np == 1 && nm == 2 && (paths[0].flags & DISPLAYCONFIG_PATH_ACTIVE));
+    UINT32 si = paths[0].sourceInfo.modeInfoIdx, ti = paths[0].targetInfo.modeInfoIdx;
+    CHECK("its source and target modes", qr == ERROR_SUCCESS && si < 2 && ti < 2 &&
+          dcmodes[si].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+          dcmodes[si].sourceMode.width == (UINT32)GetSystemMetrics(SM_CXSCREEN) &&
+          dcmodes[ti].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET &&
+          dcmodes[ti].targetMode.targetVideoSignalInfo.vSyncFreq.Numerator > 0);
+    np = 1; nm = 1;
+    CHECK("too few modes", QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, dcmodes, NULL) == ERROR_INSUFFICIENT_BUFFER);
+
+    /* Raw input: nothing to list, and registering is accepted. */
+    UINT n = 99;
+    CHECK("GetRawInputDeviceList count", GetRawInputDeviceList(NULL, &n, sizeof(RAWINPUTDEVICELIST)) == 0);
+    RAWINPUTDEVICE rid = {1, 2, 0, NULL}; /* generic desktop, mouse */
+    CHECK("RegisterRawInputDevices", RegisterRawInputDevices(&rid, 1, sizeof rid));
+
     printf("%d failures\n", failures);
     return failures;
 }

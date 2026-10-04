@@ -491,6 +491,21 @@ pub fn dispatch(c: &mut Call<'_>) -> R64 {
         n::NtUserEnumDisplaySettings => sysparams::nt_user_enum_display_settings(c),
         n::NtUserChangeDisplaySettings => sysparams::nt_user_change_display_settings(c),
         n::NtUserEnumDisplayDevices => sysparams::nt_user_enum_display_devices(c),
+        n::NtUserGetDisplayConfigBufferSizes => sysparams::nt_user_get_display_config_buffer_sizes(c),
+        n::NtUserQueryDisplayConfig => sysparams::nt_user_query_display_config(c),
+        // Raw input: no devices to list, and registering is accepted (no
+        // WM_INPUT follows; keyboard and mouse still arrive as messages).
+        n::NtUserGetRawInputDeviceList => {
+            let (list, count_p, size) = (c.a(0), c.a(1), c.a32(2));
+            if size as u64 != 2 * c.p.abi.ptr_size() || count_p == 0 {
+                return Ok(u32::MAX as u64);
+            }
+            if list == 0 {
+                c.g.w32(count_p, 0)?;
+            }
+            Ok(0)
+        }
+        n::NtUserRegisterRawInputDevices => Ok(1),
         n::NtUserGetDC => paint::nt_user_get_dc(c),
         n::NtUserGetKeyboardLayout => input::nt_user_get_keyboard_layout(c),
         n::NtUserGetKeyboardLayoutList => input::nt_user_get_keyboard_layout_list(c),
