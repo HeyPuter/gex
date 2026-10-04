@@ -22,6 +22,91 @@ How step 1 came out, against the plan below:
   is mapped at (`gexc cgen-image --pe-base`), and Wine's from
   `gexc cgen-prefix`; any change to gex-abi or gex-cgen changes every key.
 
+## §9 parity, stream B (2026-10-03)
+
+- **Dense block tables** (`gex_emit::dense`, shims/browser/src/dense.rs):
+  tier-1's dispatch tables 4..7 (the run's) no longer exist per Worker.
+  Their slots are a `u32` map per table in the process's memory, naming an
+  index in one more table, `blocks`, with an entry per installed block;
+  dispatch reads the map and falls back to the classic table when the map
+  word is zero. Peggle: 166k blocks against 1.74M slots per Worker.
+  Half-Life: the classic tables (4.85M entries in each of 11 Workers) ran
+  the renderer out of V8 heap at about 95 s; dense it plays c1a0 with the
+  renderer's memory bounded. `?dense=0` / `GEX_DENSE=0` is the old layout.
+- **Units on the §9 ABI:** per-Worker `gex.ftab`, units placed by element
+  segment at `__table_base`, `gex.lookup`, the probe cache, bridges in the
+  dense or classic tier-1 slots, and the function table's runtime module
+  rewritten for dense dispatch. Unit keys match the native host's (export
+  providers' stubs included), and the providers are bound after each image
+  from `<cache>/providers/`. `tests/nt/run-browser.sh --cgen` with
+  browser-flavour units (`GEX_CGEN_GUARD=1 gexc cgen-prefix|cgen-image`;
+  PE32+ images at the base the page gives them, 0x400000 for an exe): 48/49
+  (x64/cxx: no unit, the guarded flavour fails to compile it).
+- **In the page:** `nt.html?cgen=1|2` reads units from `/gex-cgen/`
+  (the harness serves `GEX_CGEN_CACHE` there).
+- **The call-out:** index 1 runs tier-1 nested (`gex_env.call_out`, JS's
+  loop as for NT callbacks) until the guest returns to the calling body:
+  a translated return is caught by a watch stub in this Worker's table
+  entry for it, an untranslated one by the miss path.
+- **AOT share:** tests/nt/aot-share.mjs classifies V8 CPU profiles of the
+  Workers by module (units, providers, runtime, tier-1, host), the native
+  GEX_NT_STATS line's accounting; browser-noita.mjs prints it with
+  `GEX_NT_PROFILE`.
+
+### Stream B state at the reboot (2026-10-03, late)
+
+merge/web9 @ this commit; merge/web9-fjit (worktree wt/web9f) = it + F's
+3c9f6f82 + a WIP browser function JIT.
+
+- Done and gated (run-browser.sh 49/49 plain and --cgen, games ok): dense
+  tables, units + providers + icall keys, the call-out, in-place dispatch
+  misses (65f9a719's half), nested NtRaiseException (ffa2cec9's half; seh.exe
+  x86: exc_nested=20 escaped=19 with GEX_NT_EXC_TRACE=1), GEX_NT_FIXED_TIME,
+  fault-pc bit 62 masked.
+- pewasm in the page (port/browser.mjs, scratchpad `web9/run-pewasm-page.sh`,
+  fixed seed, 4x): about 58 world fps. gex's Noita-on-units number is next.
+- **Noita browser units** (GEX_CGEN_GUARD=1, gexc built from 0dc27c10, copy
+  at scratchpad `web9/gexc-web9b`): the whole prefix is built into
+  `target/bnoita2/cgen` (2991 s); the eight Noita images were not (noita.exe
+  was compiling when stopped). Resume with scratchpad
+  `web9/build-noita-images.sh web9/gexc-web9b` (the bases the page uses:
+  noita 0x400000, lua51 0x1560000, msvcr120 0x15c0000, SDL2 0x6c740000,
+  msvcp120 0x16b0000, fmod 0x1730000, fmodstudio 0x18f0000, steam_api
+  0x1a10000; nice 19, 2 jobs), copy `target/bnt2/cgen/providers` in, then
+  `GEX_CGEN_CACHE=target/bnoita2/cgen GEX_WINE_PREFIX=target/bnoita2/prefix
+  GEX_NT_PAGE_FLAGS='&cgen=2' GEX_NT_PAGE_ENV=GEX_NT_FIXED_TIME=1767225600,GEX_NT_TIME_SCALE=4
+  GEX_NT_PROFILE=worker,60,20 run-noita-page.sh TAG --gameplay` (scratchpad),
+  and check the AOT line before trusting the fps.
+- **Function JIT (WIP, wt/web9f):** shims/browser/src/fjit.rs translates a
+  `gex.lookup` miss in the shim and publishes it as `FJIT | n`; tier-1 misses
+  are served through bridges (`serve`), FTAB_TIER1 handled. Not green:
+  GEX_FJIT=1 hello_args/sync time out under run-node; debug that first.
+
+### Stream B state at the second reboot (2026-10-04, ~00:55)
+
+- **Browser fjit is green** on merge/web9-fjit (wt/web9f): 3cf08afe
+  (gex-xlate: `Src` is `repr(u8)`. The niche on the null guest-memory
+  pointer made every fetch empty. Also jumptable `with_capacity(hi - lo)`,
+  where `hi` asked for 16 GB) and 96ae953e (shim: MODULES held across
+  publish, GEX_FJIT=2 trace, GEX_FJIT_MAX/ONLY/DUMP knobs). Under taskset
+  5,11, `GEX_FJIT=1 tests/nt/run-browser.sh` is 49/49 and plain is 49/49.
+  F is cherry-picking 3cf08afe into merge/fjit (cg13). Merge web9-fjit
+  into web9 once merge/fjit carries both fixes and 3c9f6f82 (they re-key
+  units).
+- **Noita browser units: not finished.** The build of noita.exe at
+  0x400000 (key dir `27f192cd...`) was killed after 1h40 of clang at nice
+  19 with 2 jobs. About 2980 objects are in `target/bnoita2/cgen/objects`,
+  and the link had not run. These are cached per object, so a rerun only
+  compiles what is missing. The other seven images have not been started.
+  The providers are copied in. Resume with scratchpad
+  `web9/build-noita-images.sh web9/gexc-web9b` (log
+  `web9/bnoita2-img2.log`), then the page run above (run-noita-page.sh)
+  paired with `run-pewasm-page.sh` (pewasm about 59 world fps).
+- cg12 (coordinator): layout `~/.cache/gex/wine-11.15/gex-layout` sha256
+  63b13c67..., 18 D3D lines appended, and the existing bases are unchanged.
+  The native cache is `scratchpad/fjit/cgcache-cg12`. Build browser units
+  for the new D3D DLLs only when Peggle in the page needs them.
+
 ## Where the page is now
 
 Noita in headless Chromium, hardware WebGPU, full speed: about 4.2

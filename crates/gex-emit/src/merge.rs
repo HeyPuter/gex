@@ -188,6 +188,10 @@ pub fn merge(units: &[&[u8]]) -> Option<Vec<u8>> {
     if parsed.iter().any(|p| p.iter().any(|(id, _)| *id == 6 || *id == 12)) {
         return None;
     }
+    // Nor are dense segments (`crate::dense`): each unit's is at its own base.
+    if units.iter().any(|u| crate::dense::locate(u).is_some()) {
+        return None;
+    }
     let n_imports = import_funcs(&parsed[0]);
     for p in &parsed[1..] {
         if import_funcs(p) != n_imports {

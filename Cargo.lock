@@ -408,7 +408,9 @@ version = "0.0.1"
 dependencies = [
  "gex-abi",
  "gex-cgen",
+ "gex-emit",
  "gex-kernel",
+ "gex-key",
  "gex-ld",
  "gex-wayland",
  "gex-xlate",

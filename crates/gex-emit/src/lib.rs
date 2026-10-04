@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dense;
 pub mod merge;
 pub mod module;
 pub mod fma;

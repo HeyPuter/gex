@@ -348,26 +348,28 @@ async function handle(msg) {
     // with a synchronous request -- allowed in a Worker, and what lets the
     // nested callback loop install one too. Null when there is none.
     loadUnit(key) {
+      const wasm = this.loadFile(`${key}/c.wasm`);
+      const entries = wasm && this.loadFile(`${key}/c.entries`);
+      return wasm && entries ? { wasm, entries } : null;
+    }
+    // Any file of the unit cache by its relative path (an export
+    // provider's module: `providers/<name>-<fingerprint>.wasm`), or null.
+    loadFile(rel) {
       const c = msg.cgen;
       if (!c) return null;
-      const read = (name) => {
-        try {
-          if (c.root) {
-            const fs = globalThis.process?.getBuiltinModule?.('node:fs');
-            return fs ? fs.readFileSync(`${c.root}/${key}/${name}`) : null;
-          }
-          const x = new XMLHttpRequest();
-          x.open('GET', `${c.url}/${key}/${name}`, false);
-          x.responseType = 'arraybuffer';
-          x.send();
-          return x.status === 200 ? new Uint8Array(x.response) : null;
-        } catch {
-          return null;
+      try {
+        if (c.root) {
+          const fs = globalThis.process?.getBuiltinModule?.('node:fs');
+          return fs ? new Uint8Array(fs.readFileSync(`${c.root}/${rel}`)) : null;
         }
-      };
-      const wasm = read('c.wasm');
-      const entries = wasm && read('c.entries');
-      return wasm && entries ? { wasm, entries } : null;
+        const x = new XMLHttpRequest();
+        x.open('GET', `${c.url}/${rel}`, false);
+        x.responseType = 'arraybuffer';
+        x.send();
+        return x.status === 200 ? new Uint8Array(x.response) : null;
+      } catch {
+        return null;
+      }
     }
   }
 
@@ -392,6 +394,8 @@ async function handle(msg) {
   // thread (one whose wasm instantiate never completes) is visible. Off by
   // default -- it is one line per phase per thread. See threads-worker note.
   if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
+  if (msg.denseDebug) globalThis.GEX_DENSE_DEBUG = 1;
+  if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for
   // the first Worker, which keeps the linked-in stack and reads the numbers out.
@@ -598,6 +602,7 @@ async function handle(msg) {
           // Top level as well as `opts`: a child's Worker gets the host's
           // `extra`, and pid 1's `opts` never reach it.
           link: msg.link ?? msg.opts?.link,
+          dense: msg.dense ?? msg.opts?.dense,
           wantLibrary,
         },
       );
@@ -617,6 +622,8 @@ async function handle(msg) {
     if (beat) {
       gex.shim.exports.gex_set_heartbeat?.(BigInt(beat));
     }
+    if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
+    if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
     }

@@ -680,6 +680,10 @@ fn cmd_seed(args: &[String]) -> Result<()> {
         i += 1;
     }
     let out = out.unwrap_or_else(|| "seed.wasm".to_string());
+    // The seed is the browser's image module: its `enter` dispatches
+    // dense-capable, and it defines the `blocks` table (gex_emit::dense; a
+    // table stays classic while the host leaves its map word zero).
+    gex_emit::dense::set(true);
     let module = gex_xlate::seed_module(shared_memory);
     std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
     gex_native::validate_module(&module.wasm)
