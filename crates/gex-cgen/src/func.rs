@@ -555,7 +555,7 @@ impl FnUnit {
         let loops = if outline_loops() { outer_loops(f) } else { Vec::new() };
         for (k, lp) in loops.iter().enumerate() {
             self.stats.loops_outlined += 1;
-            let lname = loop_name(f.entry, k);
+            let lname = loop_name(f.entry, k, self.copying);
             let mut le = Emitter::new(&dummy, &owned);
             le.class32 = self.class32;
             le.resize(f.n_values as usize);
@@ -617,7 +617,7 @@ impl FnUnit {
             for s in &b.stmts {
                 e.stmt(s)?;
             }
-            let heads = Heads { loops: &loops, fname: f.entry, used: &used };
+            let heads = Heads { loops: &loops, fname: f.entry, copy: self.copying, used: &used };
             self.term(&mut e, f, i, known, sums, trapfree, &mut calls, None, Some(&heads))?;
             e.line("}");
         }
@@ -733,7 +733,7 @@ impl FnUnit {
                         e.line("  int lr;");
                         e.line(format!(
                             "  do lr = {}(ctx, depth + {}, need, ret, sp0); while (lr == LOOP_CHUNK);",
-                            loop_name(h.fname, k),
+                            loop_name(h.fname, k, h.copy),
                             self_weight
                         ));
                         if ftab {
@@ -1900,14 +1900,23 @@ pub fn outline_loops() -> bool {
     }
 }
 
-fn loop_name(entry: u64, k: usize) -> String {
-    format!("l_{entry:x}_{k}")
+/// An outlined loop's function. A leaf copy's (`FnUnit::leaves`) are
+/// named apart: the original and its copy can share a translation unit,
+/// and loop functions are `static`.
+fn loop_name(entry: u64, k: usize, copy: bool) -> String {
+    if copy {
+        format!("ll_{entry:x}_{k}")
+    } else {
+        format!("l_{entry:x}_{k}")
+    }
 }
 
 /// The body's view of its outlined loops.
 pub(crate) struct Heads<'a> {
     loops: &'a [Loop],
     fname: u64,
+    /// Emitting a leaf copy (`loop_name`).
+    copy: bool,
     used: &'a [GuestReg],
 }
 
@@ -2034,4 +2043,82 @@ pub fn guest_entry_of(name: &str) -> Option<u64> {
         .or_else(|| name.strip_prefix("e_"))
         .or_else(|| name.strip_prefix("l_").map(|r| r.split('_').next().unwrap_or(r)))?;
     u64::from_str_radix(rest, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `0x1000`: a leaf with a loop (`x0 += 1` while below `x1`), then
+    /// `ret`; `0x2000` calls it. The leaf is copied into the caller's unit
+    /// (`FnUnit::leaves`), and with loop outlining on (the browser's guarded
+    /// flavor) both the leaf and its copy outline the loop: their loop
+    /// functions must be named apart (stream B: "redefinition of
+    /// 'l_419a70_0'" in tests/nt x64/cxx's unit).
+    const LEAF: &str = "func 0x1000 - entries [] form memory values 12
+b0 0x1000..0x1003 insts [1000]:
+  @1000 jump b1()
+b1 0x1003..0x1008 insts [1003,1005]:
+  @1003 v0 = read x1
+  @1003 v1 = read x0
+  @1003 v2 = i64 0x1
+  @1003 v3 = bin Add i64 v1 v2
+  @1003 write x0 v3
+  @1005 v4 = cmp LtU i64 v3 v0
+  @1005 br v4 b1() b2()
+b2 0x1008..0x1009 insts [1008]:
+  @1008 v5 = read x4
+  @1008 v6 = load B4 u i32 Relaxed v5 0
+  @1008 v7 = i64 0x4
+  @1008 v8 = bin Add i64 v5 v7
+  @1008 write x4 v8
+  @1008 v9 = extend u v6
+  @1008 return v9
+";
+    const CALLER: &str = "func 0x2000 - entries [] form memory values 12
+b0 0x2000..0x2005 insts [2000]:
+  @2000 v0 = read x4
+  @2000 v1 = i64 0x4
+  @2000 v2 = bin Sub i64 v0 v1
+  @2000 v3 = i32 0x2005
+  @2000 store B4 Relaxed v2 0 v3
+  @2000 write x4 v2
+  @2000 call 0x1000 ret 0x2005 -> b1()
+b1 0x2005..0x2006 insts [2005]:
+  @2005 v4 = read x4
+  @2005 v5 = load B4 u i32 Relaxed v4 0
+  @2005 v6 = i64 0x4
+  @2005 v7 = bin Add i64 v4 v6
+  @2005 write x4 v7
+  @2005 v8 = extend u v5
+  @2005 return v8
+";
+
+    #[test]
+    fn a_leaf_copy_names_its_outlined_loops_apart() {
+        let leaf = gex_ir::text::parse(LEAF).unwrap();
+        let caller = gex_ir::text::parse(CALLER).unwrap();
+        assert!(is_small_leaf(&leaf) && !is_small_leaf(&caller));
+        if !outline_loops() {
+            return;
+        }
+        let known: HashSet<u64> = [0x1000, 0x2000].into_iter().collect();
+        let mut unit = FnUnit::new();
+        unit.set_class32(true);
+        unit.ftab = true;
+        unit.leaves = std::sync::Arc::new([(0x1000, leaf.clone())].into_iter().collect());
+        unit.add(&leaf, &known, &HashMap::new(), &HashMap::new()).unwrap();
+        unit.add(&caller, &known, &HashMap::new(), &HashMap::new()).unwrap();
+        unit.add_leaf_copies(&known, &HashMap::new(), &HashMap::new()).unwrap();
+        let c = unit.source();
+        assert!(c.contains("fl_1000(ctx"), "the call goes to the copy:\n{c}");
+        assert!(c.contains("int l_1000_0(") && c.contains("int ll_1000_0("), "both outline the loop, apart:\n{c}");
+        // And clang takes it (a redefinition is an error).
+        let dir = std::env::temp_dir().join(format!("gex-cgen-leafloop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gex_abi.h"), crate::header::header()).unwrap();
+        std::fs::write(dir.join("u.c"), &c).unwrap();
+        crate::toolchain::compile_one(&dir, &dir.join("u.c"), &dir.join("u.o"), None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
