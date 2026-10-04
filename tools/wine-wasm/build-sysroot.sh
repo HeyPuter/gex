@@ -23,6 +23,11 @@ if [ ! -f config.mak ]; then
     "$MUSL/configure" --target=wasm32-unknown-linux-musl --prefix="$OUT/sysroot" \
     --disable-shared --enable-static >/dev/null
 fi
+# musl's makefile tracks no header dependencies: a changed header (the
+# wasm32 syscall stub is one) means rebuilding everything.
+if [ -f lib/libc.a ] && [ -n "$(find "$MUSL/arch" "$MUSL/include" "$MUSL/src/internal" -name '*.h' -newer lib/libc.a | head -1)" ]; then
+  make -s clean
+fi
 make -s -j"$JOBS" install-headers install-libs >/dev/null
 
 # Linux UAPI headers (Wine's Unix side includes linux/*.h). asm/ is the

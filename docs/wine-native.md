@@ -314,13 +314,82 @@ native one. The case so far is `fcntl` locks: gex hands F_GETLK64 (12–14)
 through unmapped, so wasm32 uses 5/6/7 with the 64-bit `struct flock`.
 **Decided (coordinator, 2026-10-04): a `wasm32` personality in gex-kernel,
 in W1.** It is additive: a new personality whose structure layouts are
-defined to match musl's `arch/wasm32` (64-bit members 8-aligned, 64-bit
-`time_t`, `struct stat` as musl's own). The i386 paths stay unchanged, and
-tests cover both. Its ABI is written here when it is built (§3.11).
+defined to match musl's `arch/wasm32`. The i386 paths stay unchanged, and
+tests cover both. As built: §3.11.
 
 **The ICALL check (decided).** The LLVM pass emits the select form measured
 in W0(c): `idx = p < 0x400000 ? p : exit_stub[sig]`, the guest address
 in a per-thread wasm global, then one `call_indirect`.
+
+### 3.11 The wasm32 ABI on gex-kernel (W1, 2026-10-04)
+
+A native wasm32 program (wasmprog, §3.10) is a gex process with
+`Kernel::compat` (the i386 ABI) and `Kernel::wasm32` set. The ABI is
+**i386 Linux's, with musl's `arch/wasm32` converting where wasm32's own
+layouts differ, and one difference in control flow**. The i386 paths are
+unchanged.
+
+**Calls.**
+- **Entry:** the thread writes the number to `eax` and the arguments to
+  `ebx, ecx, edx, esi, edi, ebp` in its gex context (8-byte slots, upper
+  half zero), sets `esp` to its C stack pointer less 256 (below
+  everything live), and calls `gex.syscall(ctx, 0)`.
+- **Result:** in `eax`, negative errno as on Linux.
+- **Numbers:** i386's (`asm/unistd_32.h`), including the time64 calls,
+  `statx`, `fcntl64` and the direct socket calls. 64-bit arguments are
+  split low/high as on i386.
+
+**Structures.** Everything the kernel reads or writes uses the i386 kernel
+layout. Where wasm32's C layout differs (it aligns 64-bit members to 8),
+musl declares or converts:
+
+| structure | kernel layout | in musl wasm32 |
+|---|---|---|
+| `stat64` (stat, fstat, fstatat64) | i386, 96 bytes, 64-bit fields 4-aligned | `struct kstat` with `aligned(4)` 64-bit members; `struct stat` is musl's own and converted. `statx` is tried first and is the same on both. |
+| `statfs64` | i386, 84 bytes | `struct statfs` packed to 84 |
+| `epoll_event` | 12 bytes, packed | packed, as on x86-64 |
+| `flock` (F_GETLK/F_SETLK/F_SETLKW = 5/6/7) | the canonical 64-bit layout (`l_start` at 8) | wasm32's natural `struct flock` is that layout. The kernel reads only `l_type`, at 0 in every layout, so i386's F_*LK64 (12–14, mapped since 7ab9dd35) works too. |
+| `sigaction` | i386 `k_sigaction`; the handler is a **function-table index** | musl's own conversion |
+| `timespec` / `timeval` | time64 calls only: two 64-bit words | `time_t` is 64-bit |
+| `msghdr`, `iovec`, `sockaddr`, `cmsghdr`, `dirent64`, `rlimit64`, `siginfo` | i386 | identical in wasm32 (ILP32) |
+
+**Threads and processes.**
+- **`clone` with `CLONE_THREAD`:** the child gets the parent's context
+  copied, with `esp` = the new stack. The parent sets `PC` to the image's
+  thread entry (`AT_ENTRY + 16`) for the call. The child's stack top holds
+  `(func, arg, thread pointer, fresh-TLS flag)`. `CLONE_SETTLS` is not
+  passed: the thread pointer and `__tls_base` are wasm globals the child's
+  entry sets (one module instance per thread).
+- **A `clone` without `CLONE_THREAD`** (posix_spawn's
+  `CLONE_VM|CLONE_VFORK`) is a new process, a copy of the address space,
+  starting at the same thread entry. The native shim makes it inside the
+  syscall (the parent's wasm frames cannot be resumed elsewhere).
+- **Plain `fork()`** is unsupported (no stack to resume on).
+- **`execve`** of another wasm32 container works.
+
+**Signals, the one control-flow difference.** gex cannot interrupt wasm
+code or move its PC, so signals are delivered at syscall returns:
+- The kernel builds the ordinary i386 frame in the context: `esp` = the
+  frame, `eax` = the signal, for an `SA_SIGINFO` frame `edx` = `&info` and
+  `ecx` = `&uc`, `PC` = the handler (a table index). The syscall then
+  **returns normally** (`SyscallOutcome::Continue`) instead of resuming at
+  the handler.
+- musl's stub sees `PC` changed, calls the handler on a C stack below the
+  frame, sets `esp` as the i386 restorer would (+4 rt, +8 legacy) and
+  issues `rt_sigreturn`/`sigreturn`.
+- `sigreturn` restores the interrupted context (the syscall's result
+  included) and also returns normally.
+- A signal sent while the program computes without syscalls waits for its
+  next syscall. Handlers that `longjmp` out need wasm EH (§3.4).
+
+**Tests:** `tests/wasm32/run.sh` (native output against gex):
+- `signals.c`: plain and SA_SIGINFO handlers, the mask during and after,
+  blocked-then-unblocked, a syscall's result surviving its handler;
+- `threads.c`: threads, thread-locals, mutexes, the heap, stat,
+  posix_spawn plus exec plus wait.
+
+The x86 and i386 paths are covered by x86-programs, lockstep and tests/nt
+as before.
 
 ### 3.9 x64 programs (later)
 

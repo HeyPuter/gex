@@ -833,6 +833,8 @@ fn run_program_with(
     // translator for every guest process, so a mixed tree is not supported
     // here (the browser has a shim per process).
     kernel.compat = program.compat();
+    // Set again by `wasmprog` if this program is native wasm32.
+    kernel.wasm32 = false;
     // An ejected project's replacement code has its own region. Recorded for
     // each new address space, an exec's included.
     if let Some(aot) = &opts.aot {
