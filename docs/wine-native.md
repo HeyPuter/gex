@@ -744,8 +744,9 @@ these are per-call overheads:
 
 **Wine builds for wasm32:** `configure --host=wasm32-unknown-linux-musl`
 plus `make -k`.
-- 738 of 852 PE modules link, each as a module plus skeleton (before the
-  last round of fixes, which brought in kernel32, user32 and setupapi).
+- 741 of 852 PE modules link, each as a module plus skeleton, kernel32,
+  user32 and setupapi among them. All 741 were rebuilt with the final
+  toolchain.
 - Of the rest:
   - 51 are Win16 (`.dll16`, `.exe16`, `.drv16`, `.vxd`), which wasm32 has
     no use for.
