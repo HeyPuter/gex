@@ -118,14 +118,24 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
 /// Guest pages from the NT allocator (a Windows process; there is no other
 /// kind of stateful provider yet).
 pub(crate) fn alloc(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
-    let p = state.nt.clone().ok_or_else(|| anyhow!("a stateful provider outside a Windows process"))?;
+    let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
     state.with_kernel(|k| gex_kernel::nt::boot::alloc_private(&p, k, size, name)).map_err(|e| anyhow!(e))
+}
+
+/// Guest pages in a Linux process (a native wasm32 program, `wasmprog`):
+/// an anonymous private mapping, as the program's own `mmap` would get.
+fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
+    use gex_kernel::mem::prot;
+    let len = (size + 0xfff) & !0xfff;
+    state
+        .with_kernel(|k| k.mem.mmap(0, len, prot::READ | prot::WRITE, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
+        .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
 /// [`alloc`] from the top down (`boot::alloc_private_top`): a built-in
 /// provider's data and heap, which must not move the program's later DLLs.
 pub(crate) fn alloc_top(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
-    let p = state.nt.clone().ok_or_else(|| anyhow!("a stateful provider outside a Windows process"))?;
+    let Some(p) = state.nt.clone() else { return alloc_linux(state, size, name) };
     state.with_kernel(|k| gex_kernel::nt::boot::alloc_private_top(&p, k, size, name)).map_err(|e| anyhow!(e))
 }
 

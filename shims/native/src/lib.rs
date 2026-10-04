@@ -20,6 +20,7 @@ pub mod gl;
 pub mod profile;
 pub mod nt;
 pub mod nt_cgen;
+pub mod wasmprog;
 pub(crate) mod ftab;
 pub mod wayland;
 
@@ -1022,6 +1023,13 @@ fn run_program_with(
                 data[off..off + 4].copy_from_slice(&base.to_le_bytes());
             }
         }
+    }
+
+    // A native wasm32 program (stream W): its module, not its x86 bytes,
+    // runs at the entry. After the directory above, which its bridges
+    // overwrite.
+    if nt_setup.is_none() {
+        wasmprog::install(&mut store, &memory, program)?;
     }
 
     if opts.verbose {
