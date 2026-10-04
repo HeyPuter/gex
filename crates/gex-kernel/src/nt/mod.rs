@@ -446,8 +446,10 @@ pub struct Process {
     /// a thread was told to stop.
     pub kill_pending: AtomicUsize,
     /// Threads parked in a yield (`sync::guest_yield`), so a kick knows
-    /// whether to notify.
+    /// whether to notify. Mirrored, under `yield_park_lock`, into the guest
+    /// word `sync::YIELD_PARKED` for the providers' kicks.
     pub yield_parked: AtomicU32,
+    pub yield_park_lock: Mutex<()>,
     /// The display mode, `user::sysparams::Mode` packed (ChangeDisplaySettings).
     pub display_mode: AtomicU64,
 }
@@ -537,6 +539,7 @@ impl Process {
             kill_list: Mutex::new(Vec::new()),
             kill_pending: AtomicUsize::new(0),
             yield_parked: AtomicU32::new(0),
+            yield_park_lock: Mutex::new(()),
             display_mode: AtomicU64::new(user::sysparams::Mode::startup().pack()),
         }
     }

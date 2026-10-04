@@ -495,6 +495,26 @@ pub fn nt_yield_execution(c: &mut Call<'_>) -> R {
 /// and its wakes signal.
 pub const YIELD_GEN: u64 = super::USD + 0xff0;
 
+/// How many threads are parked on [`YIELD_GEN`], for kicks made outside
+/// the kernel (the ConcRT provider): with none parked a kick only bumps the
+/// generation and skips `memory.atomic.notify`, which costs V8 a global lock.
+/// Exact (written under the process's `yield_park_lock`); a kick that reads
+/// a stale 0 is still seen, since a parker re-reads the generation after
+/// publishing itself and its wait compares it.
+pub const YIELD_PARKED: u64 = super::USD + 0xff4;
+
+/// One more (`d` = 1) or one fewer (`d` = -1) parked yielder: the count and
+/// its guest mirror.
+fn yield_parked_add(c: &mut Call<'_>, d: i32) {
+    let _l = c.p.yield_park_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let n = if d > 0 {
+        c.p.yield_parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    } else {
+        c.p.yield_parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1
+    };
+    let _ = c.g.w32(YIELD_PARKED, n);
+}
+
 /// Something a yielding thread may be waiting for happened: bump
 /// [`YIELD_GEN`] and wake the threads parked on it.
 pub fn yield_kick(c: &mut Call<'_>) {
@@ -569,10 +589,13 @@ fn guest_yield(c: &mut Call<'_>) {
             let (last, n) = RUN.with(|r| r.get());
             let n = if now == last.wrapping_add(1) { n.saturating_add(1) } else { 0 };
             let parked = n > streak && {
+                // Published before the generation is read: a kick after
+                // the read sees the count and notifies; one before it
+                // changed the word the wait compares.
+                yield_parked_add(c, 1);
                 let g = c.g.u32(YIELD_GEN).unwrap_or(0);
-                c.p.yield_parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let ok = c.host.park(YIELD_GEN, g, Duration::from_micros(park_us));
-                c.p.yield_parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                yield_parked_add(c, -1);
                 ok
             };
             if !parked {
