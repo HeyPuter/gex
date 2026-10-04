@@ -1009,3 +1009,105 @@ umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
 3. Optional: rerun `ENG_NODE_FLAGS=--no-wasm-inlining eng.py gx64 3
    --configs cg` in full; a wasmtime upgrade A/B on regalloc (sand).
 4. Peggle (step 5 of the previous list), with the layout now appended.
+
+### Stream F after the second reboot (2026-10-04)
+
+merge/fjit @ this commit; since 88986b85: 2c83dead (carried registers at
+trap-free and devirtualised calls; cgen-c applies the icall hints),
+f00aa7df (both carries off by default). All runs on cores 4,10, null
+display, 4x; per-run outputs in `scratchpad/fjit/abba*.out`.
+
+**The world seed.** `GEX_NT_FIXED_TIME` / `PEWASM_FIXED_TIME` do not fix
+Noita's world (E: port/seedpin, above). Runs before the pin were random
+seeds: the 0.81 of cg10 against pewasm (74.5 / 92.3) was mostly a seed
+difference. `run-noita3.sh` (scratchpad) runs noita.exe from a
+`pin.sh farm` and re-pins the save after deleting it; the check
+(`GEX_NT_PEEK=0x1205004`) read 1767225600. With the pin, tier-1 is 0.9%
+of guest (0.15% unpinned): lua51.dll's VM ops reached through LuaJIT's
+dispatch table (`aot-coverage.py`: lua51 "missed" 0.73%, anon 0.15%), the
+Lua exclusion; no image lacks a unit.
+
+**Seed-pinned, against pewasm.** World fps, steady windows (`threadwork.py`):
+
+| build | runs | mean | pewasm beside them |
+|---|---|---|---|
+| cg12 | 73.0 74.9 74.2 75.4 73.2 76.7 72.7 | 74.3 | 63.6-87.5 (load 6-22) |
+| cg13 (2c83dead, carries on) | 67.9* 69.2 | | |
+| cg14 (f00aa7df) | 64.6* 82.9 78.4 | 80.7 (warm) | |
+
+\* the first run of a new unit cache compiles every module cold (world-up
+at 200-211 s instead of about 60 s) and is slower throughout: compare warm
+runs only. cg14 against cg12, warm and interleaved: 1.09. cg14 against
+the pewasm runs of the same session (81.2 68.6 77.6 87.5 83.2): about 1.0.
+
+**Per thread** (ms per world frame, `threadwork.py`; pewasm BUSY t0
+3.7-6.6, t1/t2 6.2-7.7):
+
+| | main total | main guest | main yield | main other | worker guest |
+|---|---|---|---|---|---|
+| cg12 | 12.4-13.2 | 6.9-7.7 | 2.4-2.8 | 2.8-3.0 | 4.2-4.6 |
+| cg14 | 11.5-12.2 | 6.5-6.9 | 2.3-2.5 | 2.7-2.8 | 3.9-4.2 |
+
+Workers do less real work per frame than pewasm's t1/t2. The main thread
+is busy every millisecond of the frame (ms/frame = 1000/fps): about 2.4 ms
+spinning in `sched_yield` on the job chain (R) and 2.8 ms of host (NT
+layer about 1.4 ms, trampolines, GL, memcpy). The lever is there, not in
+worker codegen.
+
+**f_724580 against sub_334580.** pewasm (`node --cpu-prof`, pinned,
+`scratchpad/fjit/pwprof2`): sub_334580 is 22.5% of each worker's non-wait
+time, about 1.2-1.4 ms per frame; gex's f_724580 is 29-31%, 1.38-1.49 ms.
+The hot loop's wasm is the same computation (gex's whole function 10,520
+instructions, pewasm's 11,903). 18.7% of the function's samples are on the
+grid-cell load (`(%rbx,%r8)` into `%eax`, a miss pewasm takes too); most
+of the rest is Cranelift keeping loop values in stack slots (the engine
+A/B above). At the devirtualised call to 0x5b01c0, 6.6% of samples were on
+the context stores (six v128, six GPRs) before it.
+
+**Carried registers at trap-free and devirtualised calls: measured, off.**
+2c83dead extends the minimal write-back (`FnUnit::carried`) to trap-free
+callees and to the hinted callee of a devirtualised call (the fallback
+stores the carried registers and reloads them after the table call), as
+pewasm's A*(g). Gated (lockstep 30/30 exact and live on gi386 and gx64,
+cgen-prefix 60/60, providers). It was slower: cg13 0.92x cg12, worker
+guest 4.24 -> 4.55 ms per frame. The carried registers stay dirty, so
+every later exit stores them (the cold breakpoint and leave paths too) and
+they stay live in locals across the function: noita.exe 0x70b200 went
+from 1,374 to 1,668 wasm instructions and ran 1.53x slower, 0x70bdc0
+1.58x; 0x724580 did not change (0.99x): the stores it saved were cheap.
+f00aa7df turns both off; `GEX_CGEN_WB_TRAPFREE=1` / `GEX_CGEN_WB_DEVIRT=1`
+opt in. What would make it pay: carry only where the call is in a loop and
+the carried registers are not written again before the next carried call.
+
+**cg14** (`scratchpad/fjit/cgcache-cg14`, `gexc-cg22` = f00aa7df): cg12's
+codegen plus B's recovery fixes (97f86d21), every Noita image and the 82
+prefix units. Layout unchanged (sha256 63b13c67...). Building it reused
+cg13's recovery and cg12's and cg13's objects (hard links), so nothing
+compiled. **The noita.exe unit build peaks near 10 GB:** in cg12 and cg13
+it was killed by the global OOM killer (journalctl, 04:17), which
+build-units.sh hid; it now prints `FAILED <image> exit N`. Rerun that
+image alone.
+
+**Peggle.** Units: popcapgame1.exe at 0x400000 (7,555 functions, 303
+devirtualised calls from 483 hints), j2k-codec at 0x10000000, the hinted
+wined3d, ddraw, d3d8 (cgen-prefix --append with the hints in the cache's
+icall/), in `scratchpad/fjit/cgcache-peg`. bass.dll is not mapped as an
+image section (PopCap loads it itself) and stays on tier-1; wsock32,
+iphlpapi, dnsapi, nsi have no layout base. 60 s of gameplay:
+
+| display | tier-1 | --cgen |
+|---|---|---|
+| PPM frames (`tests/games/peggle.sh`) | 14.1, 12.5 | 19.8, 18.5 |
+| null (`scratchpad/fjit/peggle-null.sh`) | 15.2 | 23.7, 24.4 |
+
+--cgen reaches the first frame at 21 s (tier-1 167 s) and gameplay at
+88-108 s (tier-1 297-321 s). AOT 98.1% of guest. Guest code is a quarter
+of the CPU: with the null display, memcpy (the mis-named
+`_dl_mcount_wrapper`) is 30% of the process (the gex-gl thread 89%, the
+guest thread running wined3d's CS 57%) and the main thread spends 43% in
+`sched_yield` waiting on them: the GL path copying pixel data (R;
+profiles `scratchpad/fjit/peg-cgn*.prof`).
+
+**Engine.** wasmtime 27 (Cranelift 0.114) has no regalloc-algorithm
+setting; the only lever is an upgrade (wasmtime 49 / regalloc2 0.15 is in
+the cargo registry). Held by the coordinator until R's main-thread work.
