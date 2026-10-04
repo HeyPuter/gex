@@ -2915,8 +2915,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::ILLEGAL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> Result<()> {
+            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
+            let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::Illegal, pc as u64);
+                return nt::fault_at(&mut caller, nt::Fault::Illegal, pc as u64, resumable);
             }
             let pc = pc as u64;
             let raw = raw as u32;
@@ -2968,6 +2970,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::BREAKPOINT,
         |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> Result<()> {
+            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
+            let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             // The diagnostic trace points dump the registers and carry on.
             if imm == gex_abi::imports::BRK_TRAP_PC || imm == gex_abi::imports::BRK_TRACE {
                 if let Some(memory) = caller.data().memory.clone() {
@@ -2992,7 +2996,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::from_brk(imm), pc as u64);
+                return nt::fault_at(&mut caller, nt::Fault::from_brk(imm), pc as u64, resumable);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with

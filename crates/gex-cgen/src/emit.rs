@@ -245,6 +245,11 @@ pub(crate) struct Emitter<'a> {
     tmp: u32,
     /// An i386 program: its GPRs are 32-bit variables (`narrow_reg`).
     pub(crate) class32: bool,
+    /// What a fault import's caller does when the host returns from it (the
+    /// fault was dispatched nested and `ctx::PC` says where to go on):
+    /// `goto gex_resume;` in a whole-image body, `return 0;` in its loop
+    /// functions. `None`: the import never returns (a trap follows).
+    pub(crate) fault_exit: Option<&'static str>,
     /// Values known to be below 2^32 (a zero-extension, a narrow register).
     value_zext: Vec<bool>,
     /// `base + c` (stage 0), its wrap to 32 bits (1) and that zero-extended
@@ -271,6 +276,7 @@ impl<'a> Emitter<'a> {
             called: BTreeSet::new(),
             tmp: 0,
             class32: false,
+            fault_exit: None,
             value_zext: vec![false; n],
             value_disp: vec![None; n],
         }
@@ -771,8 +777,16 @@ impl<'a> Emitter<'a> {
                 self.line(format!("if (__builtin_expect({c} != 0, 0)) {{"));
                 self.flush_keep();
                 self.store_pc(&format!("0x{pc:x}ull"));
-                self.line(format!("  gex_breakpoint(ctx, 0x{pc:x}ll, (int32_t){code});"));
-                self.line("  __builtin_unreachable();");
+                match self.fault_exit {
+                    Some(exit) => {
+                        self.line(format!("  gex_breakpoint(ctx, (int64_t)(0x{pc:x}ull | GEX_RESUMABLE_PC), (int32_t){code});"));
+                        self.line(format!("  {exit}"));
+                    }
+                    None => {
+                        self.line(format!("  gex_breakpoint(ctx, 0x{pc:x}ll, (int32_t){code});"));
+                        self.line("  __builtin_unreachable();");
+                    }
+                }
                 self.line("}");
             }
             Stmt::HostCall { func, args } => {
