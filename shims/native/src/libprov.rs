@@ -368,6 +368,19 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         }
         Ok(())
     })?;
+    // This thread's provider C stack (`stack`): its lowest address; it is
+    // `STACK` bytes. musl reports it as the thread's stack.
+    linker.func_wrap(IMPORT_MODULE, "provider_stack", |mut caller: Caller<'_, HostState>| -> Result<i64> {
+        use wasmtime::AsContextMut;
+        let mut cx = caller.as_context_mut();
+        let g = stack(&mut cx)?;
+        let top = match g.get(&mut cx) {
+            Val::I64(v) => v as u64,
+            Val::I32(v) => v as u32 as u64,
+            _ => 0,
+        };
+        Ok((top + 16 - STACK) as i64)
+    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_thread_entry", |_caller: Caller<'_, HostState>| -> i64 {
         THREAD_ENTRY.load(std::sync::atomic::Ordering::Acquire) as i64
     })?;
