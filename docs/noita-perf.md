@@ -600,3 +600,78 @@ share it (load average 14 on 12 threads); pewasm's bench on 4,10 during
 F's gates gave 49.2 world fps (BUSY ms/frame t0 9.09, t1 11.02, t2 10.90,
 t3 0.44, t4 0.49; 1.75 cores), not 76-84. Compare gex with pewasm in paired
 runs under the same load.
+
+## Stream F after cg9 (2026-10-03, evening)
+
+**Measuring.**
+- **Per-thread CPU:** `run-noita2.sh` (scratchpad) samples
+  `/proc/PID/task/*/stat` every 10 s into `TAG.threads`; `threads.py`
+  gives each thread's cores and ms of CPU per world frame over a window.
+- **Per-thread profiles:** GEX_PROF writes a profile per busy thread beside
+  the process one (34cfede2), `<stem>-<thread>-<tid>.prof`.
+  `threadwork.py TAG` splits each thread's ms/frame into guest code,
+  yield/spin and the rest. pewasm's BUSY counts its `_Yield` sleeps as
+  waiting, so compare the real-work column with pewasm's t0/t1/t2.
+- **Fixed seed:** `GEX_NT_FIXED_TIME=1767225600` (54cb7124) is
+  PEWASM_FIXED_TIME's counterpart. Noita seeds its world from the date:
+  on cg10 two random-seed runs gave 58 and 38-50 world fps while pewasm
+  ran a steady 80 beside both.
+- **Pairs:** pewasm runs right before and after each gex run, on the same
+  cores. On this machine pewasm alone ranged from 40 to 92 world fps
+  during the day, with load.
+- **Check the AOT line before trusting a run.** A recovery-keyed change
+  re-keys every unit, and a newer binary then finds none and runs on
+  tier-1 silently.
+- **Bases.** Since f050a455, SDL2 (no DYNAMIC_BASE) loads at its linked base
+  0x6c740000 and the DLLs after it pack one slot lower. build-units.sh has
+  the new bases (BASES= overrides).
+
+**cg10** (h1 binary, 4,10). On the first run five DLLs had no unit at their
+new bases (AOT 92.6%): 57.9 world fps, random seed. With all units,
+another seed: 41.7 (AOT 99.8%). R, fixed seed on cg10: 74.5 against
+pewasm's 92.3, 0.81.
+- Per thread (random seed, 57.9 fps): gex-main 0.99 cores (17.05 ms/frame),
+  two workers 5.3 ms/frame each.
+- pewasm BUSY: t0 5.7, t1 5.9, t2 5.8 ms/frame.
+- R: gex-main's excess is `_Yield` spinning on the job counter; the
+  critical path is the worker job chain.
+
+**Codegen against pewasm** (wasm instructions, cgen-c, before devirt and
+leaf copies):
+
+| fn | gex | pewasm |
+|---|---|---|
+| 724580 | 10,517 | 11,903 |
+| 72a150 | 5,133 | 4,272 |
+| 70c6e0 | 5,314 | 4,505 |
+| 70bdc0 | 8,552 | 7,623 |
+| 70b200 | 1,307 | 1,059 |
+| 72b390 | 325 | 143 |
+
+- About 500 of each big function's extra instructions are the 64-bit
+  context slots.
+- 8327893c: 32-bit loads of i386 GPRs.
+- 255e04fa: GEX_CGEN_NARROW_STORES=1, 32-bit stores as pewasm's CpuState.
+  In the unit key and off until the runtime makes every writer of those
+  slots zero-extend (queued for R). Lockstep diverges without that: the
+  Linux layer writes syscall results sign-extended.
+- The rest is the call contract: the 64-bit `ret` argument, the return
+  check and the local-resume compares at each call site.
+- Flags at returns (pewasm's §3.4 fixpoint) measured at 0-1% on the large
+  functions: not ported.
+- cfc3ed08: leaf copies bounded by guest instructions (32), so
+  compare-heavy getters like 0x72b390 are copied and lose their flag math
+  when inlined.
+
+**Fixes for other streams:**
+- 417b638f (E): an instruction ending a PE section in a zero byte was cut
+  short (the rebased lua51 thunk).
+- d9e0dd0e (B): leaf copies' outlined loops are named apart.
+- 4f2223e4: profile writes raced under Peggle.
+
+**Peggle** (gex's own PE recorder, tier-1, 10.6 fps). Indirect calls:
+wined3d.dll 223M, ntdll 123M, opengl32 54M, popcapgame1.exe 13M.
+wined3d, ddraw and d3d8 had no layout base and so no unit. 126d8269 adds
+the Direct3D set to tools/nt-cgen-core.txt, with `cgen-prefix --append`,
+which keeps every existing base (dry run: 18 entries added, none moved).
+It is applied to the staged prefix with cg12.
