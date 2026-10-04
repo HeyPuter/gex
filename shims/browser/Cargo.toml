@@ -11,7 +11,7 @@ gex-abi.workspace = true
 gex-kernel.workspace = true
 gex-wayland.workspace = true
 gex-xwm.workspace = true
-gex-xlate.workspace = true
+gex-xlate = { workspace = true, features = ["fjit"] }
 gex-ld.workspace = true
 gex-cgen.workspace = true
 gex-emit.workspace = true

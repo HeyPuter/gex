@@ -402,6 +402,7 @@ pub fn after_change(c: &mut Call<'_>, start: u64, end: u64, fresh: &[(u64, u64)]
     let mut k = c.kernel();
     if st.vm.mirror(&mut k.mem, start, end) {
         k.retired_code.push((start, end));
+        crate::note_code_change();
     }
     Ok(())
 }
@@ -630,6 +631,7 @@ pub fn nt_flush_instruction_cache(c: &mut Call<'_>) -> R {
         let start = addr & !(PAGE - 1);
         let end = align_up(addr + size, PAGE);
         c.kernel().retired_code.push((start, end));
+        crate::note_code_change();
     }
     Ok(st::SUCCESS)
 }
