@@ -184,8 +184,13 @@ pub(crate) fn install(
     Ok(pairs.len())
 }
 
-/// Data whose relocations have been applied, by its guest address.
-static RELOCATED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Data whose relocations have been applied: the process (its linear
+/// memory's host address and its NT pid, so a later process whose memory
+/// lands at a freed one's address is still another) and the data's guest
+/// address. Per process, not host-wide: another process (fork and exec, a
+/// child process) places the same provider at the same base in a memory of
+/// its own.
+static RELOCATED: Mutex<Vec<(usize, u32, u32)>> = Mutex::new(Vec::new());
 
 /// After an instantiation: the module's data relocations (`__wasm_apply_
 /// data_relocs`: the absolute data and function addresses its initialised
@@ -194,14 +199,16 @@ static RELOCATED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 /// function has initialised the data itself, once, by then. Held under a
 /// lock, so a thread instantiating meanwhile waits for it.
 pub(crate) fn relocate_once(cx: &mut wasmtime::StoreContextMut<'_, HostState>, inst: &wasmtime::Instance, x: Extras) -> Result<()> {
+    let mem = cx.data().memory.as_ref().map_or(0, |m| m.bytes().as_ptr() as usize);
+    let pid = cx.data().nt.as_ref().map_or(0, |p| p.pid);
     let mut done = RELOCATED.lock().unwrap_or_else(|e| e.into_inner());
-    if done.contains(&x.memory_base) {
+    if done.contains(&(mem, pid, x.memory_base)) {
         return Ok(());
     }
     if let Ok(f) = inst.get_typed_func::<(), ()>(&mut *cx, "__wasm_apply_data_relocs") {
         f.call(&mut *cx, ()).context("applying a provider's data relocations")?;
     }
-    done.push(x.memory_base);
+    done.push((mem, pid, x.memory_base));
     Ok(())
 }
 
