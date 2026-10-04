@@ -621,6 +621,43 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   binary and 0 translations. An earlier pass ran pewasm on a 1x clock (its
   frame cap: 58.3 at 0.97x realtime) and is void, as is the first pass that
   U's Muck run shared.
+- **E8, the web build (2026-10-04, merged merge/web9 a5b24767):**
+  - `gexc eject --web-shim web/public/gex [--web-page DIR]` vendors the
+    x86 shared-memory shim, kernel, seed and host JS (`runtime/web/nt`),
+    and the page (`web/build-eject-page.sh DIR`: nt.html built with vite,
+    Mesa's wgpu replay beside it; `runtime/web/page`). build.sh then also
+    builds every image's unit in the browser's (guarded) flavour, its
+    region entries and providers into `build/web/cgen`
+    (`GEX_EJECT_WEB_UNIT_CACHE` reuses units by key), copies the stateful
+    providers (Lua) to `build/web/cgen/stateful/`, writes
+    `build/web/nt.json` (exe, prefix, cwd, args, env, settings) and, with
+    a page, `build/web/rootfs.tar`.
+  - `./run.mjs`: the web build under Node (run-node.mjs `--no-jit`).
+    `node serve.mjs` + `index.html`: in a browser (`?jit` for the
+    fallback, `?env=` for more settings).
+  - The browser runtime, AOT-only (`gex_set_jit(0)`, every Worker): index
+    1 stops loudly, or raises the guest's access violation for memory
+    nothing executable is at; region-entry modules (`regions/<key>`) load
+    after their unit; the trampoline page's syscall continuations have
+    region entries (the browser resumes there); units of newly mapped
+    images, new threads and a Worker's catch-up on the function table are
+    served inside the call (`serve_in_place`), not by trapping out of the
+    guest's frames; user APCs are delivered nested (fb7dfd52's browser
+    half). Stateful providers (`GEX_NT_STATEFUL`) work as natively, with
+    `provider_try` a JS try/catch.
+  - A training run, `./run.mjs --record-entries` (the fallback on;
+    `GEX_NT_ENTRY_LOG`): where the browser entered unit images without an
+    entry, kept in `user/web-entries.txt`, which build.sh turns into region
+    entries. tests/nt needs none since the nesting fixes.
+  - Results, AOT-only: tests/nt x86 under Node 16/17 (hello_args, sync,
+    mtx, crtmem, tls, icall, user_win, gdi, exitproc, input, display,
+    window, lowmem, apc, seh, cxx; same stdout and exit as recorded; the
+    same projects on gex-rt too). glcompat (GL on Mesa over WebGPU) and
+    hello_args in headless Chromium from their projects' pages. The LuaJIT
+    host program prints the same on the web build as on gex-rt.
+  - Open: filemap's first two subtests fail on the ejected web run only
+    (pass in B's harness on the same shim and units, and natively);
+    timing-dependent, not yet found.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
