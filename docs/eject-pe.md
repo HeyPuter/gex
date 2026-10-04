@@ -473,6 +473,26 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   ejected with it gives LuaJIT's output except two cosmetic differences:
   %f rounds exact ties to even (MSVC rounds them away), and a long chunk
   name is abbreviated PUC Lua's way.
+- **Noita, ejected, runs to the world with no run-time translation**
+  (2026-10-03). Recorded with F's cg10 units, ejected (38 images,
+  58 files, 96 MB), built reusing 33 units by key (msvcp120, fmod,
+  fmodstudio, steam_api and SDL2 built at their recorded bases), Lua on
+  the PUC provider. The run's GEX_NT_STATS line: no tier-1 blocks, no
+  translations; world-up 24-28 s.
+  - Lua protected calls (`provider_try`): about 1.4 per world frame
+    (13,567 over 8,404 frames), and no throws.
+  - World fps, 4x clock, null display, cores 1 and 7, paired
+    (load average about 15):
+
+    | run | world fps |
+    | --- | --- |
+    | pewasm `out/noita/build` (bench.cjs, 60 s after 30 s) | 41.98, then 38.73 |
+    | gex eject, 60 s windows from world-up | 26.2, 25.9, 27.4, 29.6, 30.4 |
+  - What it took besides the above: the native unit flavor for eject
+    (the guarded flavor matched no cache); recorded unit-less entries as
+    recovery seeds (5 outside lua51); providers exempt from patched-page
+    retirement (Noita's mod sandbox rewrites ~120 lua51 entry points, as
+    pewasm also ignores).
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
