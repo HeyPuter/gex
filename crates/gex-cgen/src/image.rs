@@ -464,7 +464,7 @@ fn emit_and_link(
     if func::leaf_copies() {
         let mut gir = GirReader::open(recovery)?;
         while let Some(f) = gir.next()? {
-            if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
+            if !skip.contains(&f.entry) && func::is_small_copyable(&f) {
                 leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
                 leaves.insert(f.entry, f);
             }

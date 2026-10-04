@@ -61,7 +61,10 @@ pub fn body_name(entry: u64) -> String {
 /// leaf (`FnUnit::leaves`), else its body. On the unit's fields, so it is
 /// callable while others are borrowed.
 fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, copies: &mut BTreeSet<u64>, stats: &mut FnStats, t: u64) -> String {
-    if !copying && leaves.contains_key(&t) {
+    // Inside a copy, only a leaf's copy (no chains of calling copies): a
+    // small caller's copy keeps its own leaf callee inlinable, as the body
+    // it replaces had it (0x70b110's 0x4ac0d0).
+    if leaves.get(&t).is_some_and(|f| !copying || makes_no_calls(f)) {
         copies.insert(t);
         stats.calls_leaf_copy += 1;
         leaf_name(t)
@@ -83,12 +86,26 @@ pub fn leaf_name(entry: u64) -> String {
 /// no measure: 0x72b390, 18 instructions with four compares, is 288. The
 /// flags go when the copy is inlined, the caller's `need` folding the
 /// return's flag store away.
-pub fn is_small_leaf(f: &Function) -> bool {
+/// A function none of whose blocks ends in a call.
+fn makes_no_calls(f: &Function) -> bool {
+    !f.blocks.iter().any(|b| matches!(b.term, FTerm::Call { .. }))
+}
+
+pub fn is_small_copyable(f: &Function) -> bool {
     const LEAF_INSTS: usize = 32;
+    // Also a small function making at most two calls that return to it
+    // (noita.exe 0x70b110, 0x70b050: a load and a virtual call): V8 never
+    // inlines those into 0x724580's outlined loop (726 wire bytes each, and
+    // the loop's 26 KB leaves it no inlining budget), where pewasm's
+    // TurboFan does. `GEX_CGEN_EXP=NOSMALLCALLS` (not in the unit key)
+    // keeps copies to leaves.
+    let calls_ok = !exp("NOSMALLCALLS");
     let mut n = 0;
+    let mut calls = 0;
     for b in &f.blocks {
         match b.term {
             FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Return { .. } => {}
+            FTerm::Call { ret: Some(_), .. } if calls_ok && calls < 2 => calls += 1,
             _ => return false,
         }
         n += b.insts.len();
@@ -418,22 +435,29 @@ impl FnUnit {
     /// The copies of small leaves this unit's calls named ([`callee_name`]),
     /// as `static inline` functions after its bodies.
     pub fn add_leaf_copies(&mut self, known: &HashSet<u64>, sums: &HashMap<u64, Summary>, trapfree: &HashMap<u64, u32>) -> Result<()> {
-        let want = std::mem::take(&mut self.leaf_copies);
         let leaves = std::sync::Arc::clone(&self.leaves);
         let saved = std::mem::take(&mut self.stats);
         self.copying = true;
         let mut r = Ok(());
-        for a in &want {
-            if let Some(f) = leaves.get(a) {
-                if let Err(err) = self.add(f, known, sums, trapfree) {
-                    r = Err(err);
-                    break;
+        // A worklist: a calling copy may want a leaf's copy (`callee_name`).
+        let mut done = BTreeSet::new();
+        'all: loop {
+            let pending: Vec<u64> = self.leaf_copies.difference(&done).copied().collect();
+            if pending.is_empty() {
+                break;
+            }
+            for a in pending {
+                done.insert(a);
+                if let Some(f) = leaves.get(&a) {
+                    if let Err(err) = self.add(f, known, sums, trapfree) {
+                        r = Err(err);
+                        break 'all;
+                    }
                 }
             }
         }
         self.copying = false;
         self.stats = saved;
-        self.leaf_copies = want;
         r
     }
 
@@ -526,7 +550,11 @@ impl FnUnit {
         let name = if self.copying { leaf_name(f.entry) } else { body_name(f.entry) };
         // The body's head, kept aside: its loop functions go first.
         let mut fhead = String::new();
-        let _ = writeln!(fhead, "{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
+        // A calling copy is too costly for clang's threshold at a call site
+        // of many (0x70b110 in 0x724580's loop): forced, as V8 would not
+        // inline it either.
+        let force = if self.copying && !makes_no_calls(f) { "__attribute__((always_inline)) " } else { "" };
+        let _ = writeln!(fhead, "{force}{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
         for r in &used {
             let _ = writeln!(fhead, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
         }
@@ -654,6 +682,9 @@ impl FnUnit {
         // dispatches on `ctx::PC` itself; nor has a whole-image unit, whose
         // functions are reached through the function table.
         if self.copying {
+            // A copy that calls (`is_small_copyable`) needs its callees
+            // declared like any body here.
+            self.protos.extend(calls);
             return Ok(());
         }
         if self.ftab {
@@ -2214,7 +2245,9 @@ b1 0x2005..0x2006 insts [2005]:
     fn a_leaf_copy_names_its_outlined_loops_apart() {
         let leaf = gex_ir::text::parse(LEAF).unwrap();
         let caller = gex_ir::text::parse(CALLER).unwrap();
-        assert!(is_small_leaf(&leaf) && !is_small_leaf(&caller));
+        assert!(is_small_copyable(&leaf));
+        // One call that returns to it: copyable too (unless NOSMALLCALLS).
+        assert_eq!(is_small_copyable(&caller), !exp("NOSMALLCALLS"));
         if !outline_loops() {
             return;
         }
