@@ -26,7 +26,8 @@ if os.path.basename(sys.argv[0]).endswith('++'):
     CC[0] = 'clang++'
 
 args = sys.argv[1:]
-if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or '--version' in args or '-v' == args[-1:]:
+if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
+       for a in args) or not args:
     os.execvp(CC[0], CC + args)
 
 out = 'a.out'
