@@ -16,6 +16,7 @@ gex-ld.workspace = true
 gex-cgen.workspace = true
 gex-emit.workspace = true
 gex-key.workspace = true
+wasmparser = "0.219"
 talc = { version = "5.0.4", default-features = false }
 # Only the shared-memory build needs a lock around the heap; a spinlock is the
 # only kind available with no OS under it.

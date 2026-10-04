@@ -417,6 +417,7 @@ dependencies = [
  "gex-xwm",
  "spinning_top",
  "talc",
+ "wasmparser",
 ]
 
 [[package]]

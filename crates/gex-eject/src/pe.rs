@@ -376,11 +376,6 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             bytes: std::fs::metadata(&p)?.len(),
         });
     }
-    // The web build's units, when the project has a browser runtime.
-    if dir.join(WEB_NT_DIR).join(WEB_NT_WASM[0]).exists() {
-        build_web(dir, &ntss, project, &units, &web_inputs, class32, jobs, &mut report)?;
-        std::env::set_var("GEX_CGEN_CACHE", &units);
-    }
     // Stateful providers, from their sources (Lua: PUC Lua and its binding).
     for p in &config.providers {
         let out = provider_wasm(dir, p);
@@ -402,6 +397,12 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         gex_cache::load_or_compile_at(&engine, &out.with_extension("cwasm"), &wasm)
             .with_context(|| format!("compiling the provider for {}", p.library))?;
         report.providers.push(format!("{} ({} KiB, stateful)", p.library, wasm.len() / 1024));
+    }
+    // The web build's units, when the project has a browser runtime.
+    if dir.join(WEB_NT_DIR).join(WEB_NT_WASM[0]).exists() {
+        let stateful: Vec<(String, PathBuf)> = config.providers.iter().map(|p| (p.library.clone(), provider_wasm(dir, p))).collect();
+        build_web(dir, &ntss, project, &units, &web_inputs, &stateful, class32, jobs, &mut report)?;
+        std::env::set_var("GEX_CGEN_CACHE", &units);
     }
     let manifest = BuildManifest {
         inputs: crate::manifest::inputs_id(dir, &[])?,
@@ -428,6 +429,7 @@ fn build_web(
     project: &Project,
     native: &Path,
     inputs: &[(String, u64, Vec<u8>, Vec<u64>)],
+    stateful: &[(String, PathBuf)],
     class32: bool,
     jobs: usize,
     report: &mut PeReport,
@@ -496,12 +498,24 @@ fn build_web(
     gex_cgen::image::set_unguarded(true);
     r?;
     // How the launcher starts the program: the guest's paths as recorded.
-    let settings: Vec<String> = ntss
+    let mut settings: Vec<String> = ntss
         .settings
         .iter()
         .filter(|s| s.split_once('=').is_some_and(|(k, _)| replayed_setting(k)))
         .cloned()
         .collect();
+    // Stateful providers (Lua), the same modules as natively: the browser
+    // runtime finds them under the unit cache.
+    let mut spec = Vec::new();
+    for (lib, wasm) in stateful {
+        let rel = format!("stateful/{}", wasm.file_name().unwrap().to_string_lossy());
+        std::fs::create_dir_all(web.join("stateful"))?;
+        std::fs::copy(wasm, web.join(&rel)).with_context(|| format!("copying {}", wasm.display()))?;
+        spec.push(format!("{}={rel}", lib.to_ascii_lowercase()));
+    }
+    if !spec.is_empty() {
+        settings.push(format!("GEX_NT_STATEFUL={}", spec.join(",")));
+    }
     use crate::json::{b, obj, s, strs};
     let j = obj(vec![
         ("exe", s(&ntss.exe)),

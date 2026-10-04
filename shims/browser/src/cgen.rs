@@ -82,7 +82,29 @@ struct Provided {
     /// `providers/<name>-<fingerprint>.wasm`, as `provider::build` names it.
     file: String,
     binds: Vec<(String, u64)>,
+    /// A stateful provider (docs/eject-pe.md §5.1): every export of the
+    /// image by name and address, and its entry point (DllMain), which
+    /// `gexp__entry` replaces.
+    stateful: Option<(Vec<(String, u64)>, u64)>,
 }
+
+/// Stateful providers by library (lower case) and module file under the
+/// unit cache: `GEX_NT_STATEFUL=<dll>=<file>[,...]`, an ejected project's
+/// (the native `libprov`).
+static STATEFUL: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+pub(crate) fn set_stateful(spec: &str) {
+    let mut v = lock(&STATEFUL);
+    for item in spec.split(',') {
+        if let Some((d, f)) = item.split_once('=') {
+            v.push((d.trim().to_ascii_lowercase(), f.trim().to_string()));
+        }
+    }
+}
+
+/// Exports a stateful provider does not implement, by address: for the
+/// message when the program calls one.
+static MISSING: Mutex<Option<std::collections::HashMap<u64, String>>> = Mutex::new(None);
 
 /// Provider modules published, by number (the module id an install names
 /// is `PROVIDER | number`): the file JS loads, the bridges every Worker
@@ -92,6 +114,8 @@ struct ProviderModule {
     regs: Vec<u32>,
     dirs: Vec<(u64, u32)>,
     slots: u64,
+    /// A stateful provider's data (`__memory_base`), 0 for a stateless one.
+    memory_base: u32,
 }
 
 static PROVIDERS: Mutex<Vec<ProviderModule>> = Mutex::new(Vec::new());
@@ -219,7 +243,20 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             pages.push((page, page_hash(memory, page)));
         }
     }
-    let (key, providers) = unit_key(image, pe, base);
+    let (key, mut providers) = unit_key(image, pe, base);
+    if let Some(pe) = pe {
+        let dll = pe.exports.dll_name.to_ascii_lowercase();
+        for (_, file) in lock(&STATEFUL).iter().filter(|(d, _)| *d == dll) {
+            let mut exports = Vec::new();
+            for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+                for n in &e.names {
+                    exports.push((n.clone(), base + e.rva as u64));
+                }
+            }
+            let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 };
+            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)) });
+        }
+    }
     let identity = gex_key::image_identity(image).trim_start_matches("image:").to_string();
     let mut units = lock(&UNITS);
     units.push(Unit {
@@ -273,6 +310,7 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) 
         .map(|p| Provided {
             file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
             binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), base + rva as u64))).collect(),
+            stateful: None,
         })
         .filter(|p| !p.binds.is_empty())
         .collect();
@@ -532,10 +570,10 @@ pub extern "C" fn gex_cgen_provider_file(u: u32, i: u32, buf: u32, cap: u32) -> 
 /// provider's module number (an install names `PROVIDER | number`), or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) -> i32 {
-    let (file, binds) = {
+    let (file, binds, stateful) = {
         let units = lock(&UNITS);
         let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
-        (p.file.clone(), p.binds.clone())
+        (p.file.clone(), p.binds.clone(), p.stateful.clone())
     };
     let wasm = crate::shim_slice(ptr, len);
     let names = match gex_cgen::provider::slot_names(wasm) {
@@ -545,10 +583,25 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
             return -1;
         }
     };
-    let pairs: Vec<(u64, u32)> = binds
-        .iter()
-        .filter_map(|(f, a)| names.iter().position(|s| s.as_deref() == Some(f.as_str())).map(|k| (*a, k as u32)))
-        .collect();
+    let mut memory_base = 0u32;
+    let pairs: Vec<(u64, u32)> = match &stateful {
+        None => binds
+            .iter()
+            .filter_map(|(f, a)| names.iter().position(|s| s.as_deref() == Some(f.as_str())).map(|k| (*a, k as u32)))
+            .collect(),
+        Some((exports, entry)) => {
+            match stateful_pairs(&file, wasm, &names, exports, *entry) {
+                Ok((pairs, base)) => {
+                    memory_base = base;
+                    pairs
+                }
+                Err(e) => {
+                    crate::warn_line(&format!("gex-nt: stateful provider {file}: {e}\n"));
+                    crate::nt::end_process(0xc000_0135);
+                }
+            }
+        }
+    };
     if pairs.is_empty() {
         return -1;
     }
@@ -563,8 +616,139 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
     }
     let (regs, dirs, slots) = bridges(&addrs);
     crate::warn_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
-    lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots });
+    lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
     number as i32
+}
+
+/// A stateful provider's bindings (the native `libprov::install`): each
+/// export to `gexp_<export>` or `gexp__missing`, the entry point to
+/// `gexp__entry`; and its data, allocated below 2 GiB.
+fn stateful_pairs(file: &str, wasm: &[u8], names: &[Option<String>], exports: &[(String, u64)], entry: u64) -> Result<(Vec<(u64, u32)>, u32), String> {
+    let missing = names
+        .iter()
+        .position(|s| s.as_deref() == Some("gexp__missing"))
+        .ok_or_else(|| "no gexp__missing in its module's table".to_string())? as u32;
+    let mut provided: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for (k, s) in names.iter().enumerate() {
+        if let Some(e) = s.as_deref().and_then(|s| s.strip_prefix("gexp_")).filter(|e| !e.starts_with('_') && !e.starts_with("ptr_")) {
+            provided.insert(e, k as u32);
+        }
+    }
+    let mut pairs = Vec::new();
+    let mut unprovided = Vec::new();
+    for (e, addr) in exports {
+        match provided.get(e.as_str()) {
+            Some(&k) => pairs.push((*addr, k)),
+            None => {
+                pairs.push((*addr, missing));
+                unprovided.push((*addr, e.clone()));
+            }
+        }
+    }
+    if let (Some(k), true) = (names.iter().position(|s| s.as_deref() == Some("gexp__entry")), entry != 0) {
+        pairs.push((entry, k as u32));
+    }
+    pairs.sort_by_key(|&(a, k)| (a, k == missing));
+    pairs.dedup_by_key(|&mut (a, _)| a);
+    lock(&MISSING).get_or_insert_with(Default::default).extend(unprovided);
+    let (size, align) = dylink_memory(wasm)?;
+    let data = provider_alloc_bytes((size as u64).max(16) + (1u64 << align), &format!("[provider {file} data]"))?;
+    let data = (data + (1u64 << align) - 1) & !((1u64 << align) - 1);
+    crate::warn_line(&format!("gex-nt: stateful provider {file}: {} exports, data at {data:#x}\n", pairs.len()));
+    Ok((pairs, data as u32))
+}
+
+/// The `dylink.0` memory size and alignment (log2) of a PIC module.
+fn dylink_memory(wasm: &[u8]) -> Result<(u32, u32), String> {
+    let e = |e: wasmparser::BinaryReaderError| e.to_string();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::CustomSection(c) = payload.map_err(e)? {
+            if c.name() != "dylink.0" {
+                continue;
+            }
+            let mut r = wasmparser::BinaryReader::new(c.data(), 0);
+            while !r.eof() {
+                let kind = r.read_u8().map_err(e)?;
+                let len = r.read_var_u32().map_err(e)? as usize;
+                let start = r.original_position();
+                if kind == 1 {
+                    let size = r.read_var_u32().map_err(e)?;
+                    let align = r.read_var_u32().map_err(e)?;
+                    return Ok((size, align));
+                }
+                r.read_bytes(len - (r.original_position() - start)).map_err(e)?;
+            }
+        }
+    }
+    Err("not a position-independent module (no dylink.0 memory info)".into())
+}
+
+/// Guest pages from the NT allocator, for a stateful provider.
+fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
+    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    crate::with_host(|h| gex_kernel::nt::boot::alloc_private(p, &mut h.kernel, size, name))
+}
+
+/// Provider module `number`'s data (`__memory_base`), 0 when stateless.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_memory_base(number: u32) -> u32 {
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| p.memory_base)
+}
+
+/// `gex.provider_alloc(size)`: fresh read-write guest pages, or 0.
+#[no_mangle]
+pub extern "C" fn gex_provider_alloc(size: u32) -> u32 {
+    match provider_alloc_bytes(size as u64, "[provider heap]") {
+        Ok(a) => a as u32,
+        Err(e) => {
+            crate::warn_line(&format!("gex-nt: provider_alloc({size:#x}): {e}\n"));
+            0
+        }
+    }
+}
+
+/// `gex.provider_ctx()`: the calling thread's context.
+#[no_mangle]
+pub extern "C" fn gex_provider_ctx() -> u32 {
+    crate::with_host(|h| h.threads[crate::cur()].kstate.ctx_addr) as u32
+}
+
+/// `gex.provider_missing(addr)`: the program called an export the provider
+/// does not implement. Ends the process, saying which.
+#[no_mangle]
+pub extern "C" fn gex_provider_missing(addr: u32) {
+    let addr = addr as u64;
+    let name = lock(&MISSING).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
+    crate::warn_line(&format!(
+        "gex-eject: the program called {name} ({}), an export of a replaced library that its provider does not implement\n",
+        crate::nt::describe(addr)
+    ));
+    crate::nt::end_process(0xc000_0139);
+}
+
+/// Whether the provider data at `base` still needs its relocations applied
+/// (once per process): 1 the first time, then 0.
+#[no_mangle]
+pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
+    static DONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let mut d = lock(&DONE);
+    if d.contains(&base) {
+        return 0;
+    }
+    d.push(base);
+    1
+}
+
+/// `gex.provider_try` calls and the throws they caught (GEX_NT_STATS).
+pub(crate) static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_provider_note(thrown: i32) {
+    TRIES.fetch_add(1, Ordering::Relaxed);
+    if thrown != 0 {
+        THROWS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Provider module `number`'s file, bridges and table need, as for a unit.
