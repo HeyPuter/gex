@@ -370,6 +370,17 @@ pub struct Thread {
     pub sync_id: u64,
     /// Suspend count; a thread created suspended starts at 1.
     pub suspend: AtomicU32,
+    /// Whether the thread has started running (a thread created suspended
+    /// has not until its first resume).
+    pub started: AtomicBool,
+    /// Inside a syscall (and not in a user callback it made): its guest
+    /// registers are in its context, as they were at the syscall, so a
+    /// suspender may read them.
+    pub in_kernel: AtomicBool,
+    /// Stopped at a safepoint or a syscall's return because it is suspended.
+    pub parked: AtomicBool,
+    /// Where a suspended thread waits for its count to reach zero.
+    pub park: (Mutex<()>, std::sync::Condvar),
     /// Nesting depth of user-mode callbacks (`KeUserModeCallback`).
     pub callback_depth: AtomicU32,
     /// What the innermost callback returned (`NtCallbackReturn`'s status and
@@ -885,7 +896,41 @@ pub fn hardware_exception(
 }
 
 /// Handle one syscall from an NT process. `data` is the whole guest memory.
+///
+/// While it runs the thread counts as stopped for a suspender
+/// (`Thread::in_kernel`); a thread suspended meanwhile parks before it
+/// returns to guest code.
 pub fn syscall(
+    p: &Arc<Process>,
+    kernel: &dyn KernelCell,
+    data: &mut [u8],
+    ctx_addr: u64,
+    pc: u64,
+    host: &mut dyn NtHost,
+) -> Outcome {
+    let t = p.thread_by_ctx(ctx_addr);
+    if let Some(t) = &t {
+        t.in_kernel.store(true, Ordering::SeqCst);
+    }
+    let o = syscall_inner(p, kernel, data, ctx_addr, pc, host);
+    if let Some(t) = &t {
+        t.in_kernel.store(false, Ordering::SeqCst);
+        if matches!(o, Outcome::Continue | Outcome::Resume(_) | Outcome::CallbackReturn) {
+            thread::park_if_suspended(p, t);
+        }
+    }
+    o
+}
+
+/// A safepoint in guest code (the host's countdown expired, registers
+/// written back): park here while the thread is suspended.
+pub fn suspend_point(p: &Process, ctx_addr: u64) {
+    if let Some(t) = p.thread_by_ctx(ctx_addr) {
+        thread::park_if_suspended(p, &t);
+    }
+}
+
+fn syscall_inner(
     p: &Arc<Process>,
     kernel: &dyn KernelCell,
     data: &mut [u8],
@@ -1036,6 +1081,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtTerminateThread => thread::nt_terminate_thread(c),
         n::NtTerminateProcess => thread::nt_terminate_process(c),
         n::NtResumeThread => thread::nt_resume_thread(c),
+        n::NtSuspendThread => thread::nt_suspend_thread(c),
         n::NtGetNextThread => thread::nt_get_next_thread(c),
         n::NtQueryInformationThread => thread::nt_query_information_thread(c),
         n::NtSetInformationThread => thread::nt_set_information_thread(c),

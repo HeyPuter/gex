@@ -101,6 +101,7 @@ for arch in x64 x86; do
     [ $arch = x64 ] && check $arch/lownull-cmpxchg16b 0 "$allok" "$b/lownull.exe" cmpxchg16b
     check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
     check $arch/apc 0 "$allok" "$b/apc.exe"
+    check $arch/suspend 0 "$allok" "$b/suspend.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
     check $arch/cxx 0 "$allok" "$b/cxx.exe"
     # Hot indirect calls (devirtualised under --cgen, with the profile above).

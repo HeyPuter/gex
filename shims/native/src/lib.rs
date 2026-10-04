@@ -3539,6 +3539,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 state.exit = Some(Exit::Status(0));
                 return Err(StopExecution.into());
             }
+            // An NT thread another has suspended (NtSuspendThread) stops
+            // here, its registers written back, until it is resumed.
+            if let Some(p) = state.nt.clone() {
+                gex_kernel::nt::suspend_point(&p, ctx_addr);
+            }
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
