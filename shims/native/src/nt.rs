@@ -52,8 +52,19 @@ fn mono_ns() -> u64 {
     }
 }
 
+/// The guest's wall clock. `GEX_NT_FIXED_TIME=<unix seconds>` (the
+/// counterpart of PEWASM_FIXED_TIME) starts it at that instant and advances
+/// it with real time, so a program that seeds from the date (Noita's world)
+/// sees the same value every run: reproducible measurements.
 fn wall() -> (u64, u32) {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    static FIXED: OnceLock<Option<(u64, Instant)>> = OnceLock::new();
+    let fixed = FIXED.get_or_init(|| {
+        std::env::var("GEX_NT_FIXED_TIME").ok().and_then(|v| v.parse::<u64>().ok()).map(|s| (s, Instant::now()))
+    });
+    let d = match fixed {
+        Some((start, origin)) => std::time::Duration::from_secs(*start) + origin.elapsed(),
+        None => SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(),
+    };
     (d.as_secs(), d.subsec_nanos())
 }
 

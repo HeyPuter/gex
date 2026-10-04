@@ -318,7 +318,7 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
     let t0 = std::time::Instant::now();
     let work = dir.join("work");
     let byte = |a: u64| {
-        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+        image.segments.iter().find_map(|s| s.byte(a))
     };
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
     let hints = icall_hints(image);

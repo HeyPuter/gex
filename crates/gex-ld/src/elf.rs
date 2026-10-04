@@ -155,6 +155,19 @@ pub struct Segment {
     pub executable: bool,
 }
 
+impl Segment {
+    /// The byte at guest address `a`, if the mapping covers it: past
+    /// `bytes` (`.bss`, or a PE section's trailing zeros, which
+    /// `PeImage::segments` does not store) it is zero.
+    pub fn byte(&self, a: u64) -> Option<u8> {
+        let o = a.checked_sub(self.vaddr)?;
+        if o >= self.mem_size.max(self.bytes.len() as u64) {
+            return None;
+        }
+        Some(self.bytes.get(o as usize).copied().unwrap_or(0))
+    }
+}
+
 /// A function symbol, used as an entry-point hint for code discovery.
 #[derive(Clone, Debug)]
 pub struct Symbol {
