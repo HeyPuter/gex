@@ -33,11 +33,37 @@ impl Mode {
         Mode { width: (v & 0xff_ffff) as i32, height: (v >> 24 & 0xff_ffff) as i32, bpp: (v >> 48) as u32 }
     }
 
+    /// The mode at start: [`Mode::DEFAULT`], or `GEX_NT_DESKTOP=WxH` (one of
+    /// the sizes on offer). A smaller desktop is a smaller DirectDraw
+    /// primary surface, which wined3d moves between texture and memory
+    /// whole (Peggle, windowed, reads back and re-uploads it twice a frame).
+    pub fn startup() -> Mode {
+        *STARTUP.get_or_init(|| std::env::var("GEX_NT_DESKTOP").ok().and_then(|v| Mode::parse(&v)).unwrap_or(Mode::DEFAULT))
+    }
+
+    /// Set the mode at start from a `GEX_NT_DESKTOP` value (`WxH`), for a
+    /// host whose settings are not `std::env` (the browser's page). Before
+    /// the process starts; false when the size is not one on offer.
+    pub fn set_startup(spec: &str) -> bool {
+        match Mode::parse(spec) {
+            Some(m) => STARTUP.set(m).is_ok(),
+            None => false,
+        }
+    }
+
+    fn parse(v: &str) -> Option<Mode> {
+        let (w, h) = v.split_once('x')?;
+        let (w, h) = (w.parse().ok()?, h.parse().ok()?);
+        SIZES.contains(&(w, h)).then_some(Mode { width: w, height: h, bpp: 32 })
+    }
+
     /// The mode in `nt::Process::display_mode`.
     pub fn unpack_current(v: &std::sync::atomic::AtomicU64) -> Mode {
         Mode::unpack(v.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
+
+static STARTUP: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
 
 /// The modes on offer, in EnumDisplaySettings order: each size at 32, 16 and
 /// 8 bpp, as Wine's virtual modes are.
@@ -352,7 +378,7 @@ pub fn nt_user_enum_display_settings(c: &mut Call<'_>) -> R64 {
     }
     let m = match index {
         -1 => mode(c),
-        -2 => Mode::DEFAULT,
+        -2 => Mode::startup(),
         i if i >= 0 => match mode_at(i as usize) {
             Some(m) => m,
             None => return Ok(0),
@@ -433,7 +459,7 @@ pub fn nt_user_change_display_settings(c: &mut Call<'_>) -> R64 {
     let cur = mode(c);
     let fields = if dm != 0 { c.g.u32(dm + 72)? } else { 0 };
     let want = if fields == 0 {
-        Mode::DEFAULT
+        Mode::startup()
     } else {
         // DM_BITSPERPEL, DM_PELSWIDTH, DM_PELSHEIGHT; the rest of the mode
         // stays as it is.

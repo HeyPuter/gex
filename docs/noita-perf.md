@@ -1128,3 +1128,138 @@ recovered but not in the unit (0x52a1dd.., about 1.4%) and ddraw interiors.
 The wasmtime 49 A/B was cancelled: native gexc is the debugging tool, and
 the performance target is the browser page against pewasm in the page.
 Codegen changes are measured under V8 (node or the page) from here on.
+### Stream R state at the second reboot (2026-10-04, merge/abi9)
+
+**Yield study** (`GEX_NT_YIELD`; gexc-e1 = efcb8bfc, cg10 units, fixed
+seed, null display, 4x, cores 3,9, 480 s runs, world fps over 120-480 s,
+AOT 99.8% of guest in every run). Script: scratchpad `abi9/yz.sh PREFIX
+"ARMS"` runs pewasm, the arms, pewasm, the arms reversed, pewasm.
+
+| arm | pass 1 (f, r) | pass 2 | mean |
+|---|---|---|---|
+| os (sched_yield, today's default) | 80.9, 47.2 | 76.8 | 68.3 |
+| spin | 59.5, 67.2 | | 63.4 |
+| sleep:20 | 76.1, 81.5 | 89.0 | 82.2 |
+| sleep:50 | 73.2, 91.5 | (killed) | 82.4 |
+| sleep:100 | 80.3, 87.4 | 89.8 | 85.8 |
+| pewasm bench, same cores | 84.1, 52.0, 81.6 | 76.2 | |
+
+Load average 13-25 throughout; pewasm itself moved 52-84. Earlier pairs:
+os 74.5, 65.1, 50.8; sleep:50 78.7; spin 65.0, 72.4.
+
+- Per thread (wakelat, 60 s at t=200): with os or spin the main thread
+  burns 915-970 ms/s of CPU; the busy workers wait 320-350 ms/s in the
+  runqueue, p50 240-470 µs per wake. With any sleep the main thread uses
+  570-650 ms/s, the busy workers wait 205-230 ms/s, p50 120-170 µs.
+- So sleeps win and are steadier; 20, 50 and 100 µs are not separated yet
+  (nanosleep adds about 50 µs of timer slack to each).
+- **Left:** pass 2's sleep:50 and the reversed half (scratchpad
+  `abi9/yz2.txt` has f1-f3), i.e. rerun `yz.sh yz3 "sleep:50 sleep:100
+  sleep:20 os"`. Then propose the default to the coordinator: a yield that
+  gives the CPU up (sleep ~100 µs) where pewasm spins (main_spin). A
+  better candidate to try next: wake the main thread when a worker goes
+  idle (providers' waits through a host import bumping a generation, as
+  pewasm's host_generation), and longer backstops for idle workers' 1 ms
+  ConcRT waits (842 wakes/s each, 190 ms/s of runqueue wait).
+
+**Commits this session:**
+- a740fcf6: glcompat's "a query's result" flake was the test: availability
+  asked right after glEndQuery may be FALSE. GEX_GL_SYNC made no
+  difference (2/16 without, 0/16 with, 1/12 in an earlier batch). The test
+  now reads GL_QUERY_RESULT first. 20/20 on x86 and x64.
+- 21eb78cd (WIP): int3 resumable in whole-image units. tests/nt 60/60 in
+  both modes. Not run: cgen-prefix.sh, lockstep.
+- 8393fe11 (WIP): providers survive rewrites (E's hunk), the hook log line,
+  tests/providers hookodstr. Not run: --cgen with kernel32's unit.
+
+**Next:** finish the yield study (above). Gate 21eb78cd: cgen-prefix.sh,
+then lockstep gi386 and gx64, exact and flags-ignored (scratchpad
+`abi9/gate-int3.sh` does all of it). Recheck hookodstr under --cgen. The
+heap provider (§9.9.2 step 4) needs E's stateful providers (37300952,
+merge/eject9: data, guest-page allocation), so it starts after that reaches
+merge/main; profile the malloc family's share on cg10 first (GEX_PERFMAP=1
+is needed for tools/modattr.py).
+
+### Stream R after the second reboot (2026-10-04, merge/abi9)
+
+All fps here are pinned-seed (port/seedpin; `pin.sh farm` into scratchpad
+`abi9/farm`, `run-noita.sh` re-enables the mod after deleting the save),
+null display, 4x clock, cores 3,9, 480 s runs, world fps over 120-480 s,
+ABBA with pewasm before/between/after, AOT 98.8-99.1% in every gex run.
+Scripts: scratchpad `abi9/yzp.sh` (yield arms), `abi9/abp.sh` (binary and
+cache per arm), `abi9/pegab.sh` (Peggle).
+
+**Yield policy** (gexc-cg19 + cgcache-cg12, `abi9/yz4.txt`); proposal sent
+to the coordinator, default NOT changed (it differs from pewasm's spin):
+
+| GEX_NT_YIELD | f | r | mean |
+|---|---|---|---|
+| os (sched_yield, default) | 70.7 | 70.9 | 70.8 |
+| sleep:20 | 84.8 | 84.2 | 84.5 |
+| sleep:100 | 81.4 | 82.8 | 82.1 |
+| pewasm | 69.6, 76.9, 69.5 | | 72.0 |
+
+With os the main thread burns 900-950 ms/s and the two busy workers wait
+300-330 ms/s in the run queue; with a sleep the main thread uses ~600 ms/s
+and the workers get ~360 ms/s. The unpinned passes (gexc-e1 + cg10) agree:
+os 47-81, spin 60-72, sleep:20 76-89, sleep:100 80-90.
+
+**Main-thread host work.** Noita makes ~130,000 `__wine_unix_call`
+(opengl32, ~3900 GL calls a frame) and ~70,000 NtQueryPerformanceCounter
+a second (noita.exe+0x9dc420, a frame timer called ~1000 times a frame;
+Wine's i386 ntdll always makes the syscall). Commits:
+- 47bf0342: per-syscall allocation and global locks out (unix-call library
+  by reference, `kill_pending`, load-before-swap on CODE_EVENTS and
+  HAS_PENDING, `any_enter` via `root_enter`, syscall-site sampling only
+  with GEX_NT_SYSCALL_SITES=1, GL `cmd_with` one lock and no Vec).
+- 38ae0aa0: built-in providers may be `stateful` (E's libprov, cherry-picked
+  as f797ab30^..37300952), `native` and `nowine`; their data, heap and
+  stack come top down (`boot::alloc_private_top`) so DLL bases do not move.
+  `nt_qpc` (ntdll RtlQueryPerformanceCounter, no syscall) and `crt_heap`
+  (msvcr120's malloc family on dlmalloc, Noita's msvcr120 only).
+- 8b957ed1: hot GL calls by code, the syscall's thread per store (no
+  measurable change on its own).
+
+Measurement binaries are built from merge/eject9 + these patches
+(scratchpad `abi9/wtm`), whose unit key equals cg12's (provider.rs is not
+in UNIT_INPUTS), and run on `abi9/ovl12`: cgcache-cg12 symlinked, with
+ntdll and Noita's msvcr120 rebuilt for the new provider stubs.
+
+| arm | runs | mean |
+|---|---|---|
+| base gexc-cg19 + cg12, sleep:20 (ab5) | 77.8, 83.9 | 80.9 |
+| m4 = base + 47bf0342 + 38ae0aa0, sleep:20 (ab5) | 94.3, 90.0 | 92.2 |
+| m4 again (ab6) | 81.6, 90.9 | 86.3 |
+| m6 = m4 + 2a75edc8 + 8b957ed1 (ab6) | 82.4, 86.5 | 84.5 |
+| pewasm (ab5; ab6) | 75.7, 56.5, 83.2; 68.5, 73.0, 78.3 | |
+
+Load was 10-30 throughout and drifts; within a pass m4 is +14% over base
+and 15-20% over pewasm.
+
+**Peggle** (`pegab.sh`, --cgen, null display, 60 s of gameplay): it moved
+~16 MB of GL commands a frame. wined3d reads the DirectDraw primary
+surface back (glGetTexImage) and re-uploads it (glTexSubImage2D) twice a
+frame, and the primary is the desktop: 1920x1080 BGRA, 8 MB.
+- 2a75edc8 (fewer copies: synchronous submits read the ring in place,
+  readback through a STREAM_READ pack buffer straight into the reply,
+  mapped ranges written back without a Vec): 26.0/23.8 -> 30.1/27.1.
+- 06316c0a (GEX_NT_DESKTOP=WxH; every screen-size answer follows the mode):
+  1920x1080 26.6, 29.5 vs **800x600 99.7, 99.6** frames/s (GL 3.4 ms/f and
+  1.9 MB/f; gameplay reached in 89 s instead of 187 s). The default stays
+  1920x1080; a per-game desktop size (or a smaller default) is the user's
+  call.
+- Not changed: the NT opengl32 glMapBufferRange shadow has U's bug class
+  (a write-only map without invalidate starts from a stale shadow and
+  unmap writes all of it back; U fixed guest/gl/gexgl.c in 6ab47b86,
+  cherry-picked as a355a62e).
+
+**Gates:** 21eb78cd and 8393fe11 un-WIPed (now eea5f584, 21485645): tests/nt
+60/60 both modes, cgen-prefix.sh 60/60, providers 3/3, lockstep gi386/gx64
+exact and flags-ignored 30/30; hookodstr under --cgen with kernel32's unit
+keeps the provider and logs the hook. Every later commit: tests/nt 60/60
+both modes, providers 3/3 (cgen-prefix 60/60 with nt_qpc in ntdll's unit).
+
+**Next:** the yield default (user's call); then the GL unix-call path
+itself (~1 µs a call through the NT syscall machinery: a provider for
+opengl32's hot entry points writing the ring directly would remove the
+syscall); Peggle at 800x600 is at its 100 fps cap.

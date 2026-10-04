@@ -200,7 +200,10 @@ fn set_vis_rect(c: &mut Call<'_>, hdc: u32, hwnd: u32, whole: bool) -> R<()> {
                 let r = if whole { w.window_rect } else { w.client_rect };
                 Rect { left: 0, top: 0, right: r.width(), bottom: r.height() }
             }
-            _ => Rect { left: 0, top: 0, right: 1920, bottom: 1080 },
+            _ => {
+                let m = super::sysparams::Mode::unpack_current(&c.p.display_mode);
+                Rect { left: 0, top: 0, right: m.width, bottom: m.height }
+            }
         }
     };
     let Some(Obj::Dc(d)) = gdi::get(c, hdc) else { return Ok(()) };

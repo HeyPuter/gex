@@ -119,7 +119,7 @@ impl Params {
 }
 
 /// Unpack/pack pixel storage, for sizing pixel transfers.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct PixelStore {
     alignment: u32,
     row_length: u32,
@@ -215,7 +215,7 @@ pub struct State {
     /// Per GL function since the last [`take_stats`]: calls and nanoseconds
     /// (the round trips they waited for included); and the submits.
     /// (calls, ns, submits it caused).
-    stats: HashMap<&'static str, (u64, u64, u64)>,
+    stats: HashMap<&'static str, (u64, u64, u64, u64)>,
     submits: (u64, u64, u64),
     /// The GL function being served, which a submit is charged to.
     serving: &'static str,
@@ -366,37 +366,56 @@ fn cmd_with(c: &mut Call<'_>, opcode: u32, words: &[u32], tail: Tail<'_>) -> R<(
     if len as u32 > CMD_CAPACITY {
         return Err(c.unimplemented(&format!("a GL command of {len} bytes")));
     }
-    let tail_now = c.p.gl.lock().unwrap().tail;
-    if tail_now as usize + len > CMD_CAPACITY as usize {
-        flush(c)?;
-    }
-    let (ring, at) = {
+    // The room, taken under one lock (a flush first when the ring is full).
+    let reserve = |c: &mut Call<'_>| {
         let mut s = c.p.gl.lock().unwrap();
+        if s.tail as usize + len > CMD_CAPACITY as usize {
+            return None;
+        }
         let at = s.tail;
         s.tail += len as u32;
-        (s.ring, at)
+        if STATS.load(std::sync::atomic::Ordering::Relaxed) {
+            let who = s.serving;
+            s.stats.entry(who).or_insert((0, 0, 0, 0)).3 += len as u64;
+        }
+        Some((s.ring, at))
+    };
+    let (ring, at) = match reserve(c) {
+        Some(r) => r,
+        None => {
+            flush(c)?;
+            reserve(c).ok_or_else(|| c.unimplemented(&format!("a GL command of {len} bytes after a flush")))?
+        }
     };
     let base = ring + HEADER + at as u64;
     let head_len = 8 + 4 * words.len();
-    let mut head = Vec::with_capacity(head_len + 4);
-    head.extend_from_slice(&opcode.to_le_bytes());
-    head.extend_from_slice(&(len as u32).to_le_bytes());
-    for w in words {
-        head.extend_from_slice(&w.to_le_bytes());
+    // On the stack for all but the widest commands.
+    let mut small = [0u8; 128];
+    let mut big = Vec::new();
+    let head: &mut [u8] = if head_len + 4 <= small.len() {
+        &mut small[..head_len + 4]
+    } else {
+        big.resize(head_len + 4, 0);
+        &mut big[..]
+    };
+    head[0..4].copy_from_slice(&opcode.to_le_bytes());
+    head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+    for (i, w) in words.iter().enumerate() {
+        head[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
     }
     match tail {
         Tail::Bytes(b) => {
-            c.g.write(base, &head)?;
+            c.g.write(base, &head[..head_len])?;
             c.g.write(base + head_len as u64, b)?;
         }
         Tail::Blob(b) => {
-            head.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            c.g.write(base, &head)?;
+            head[head_len..].copy_from_slice(&(b.len() as u32).to_le_bytes());
+            c.g.write(base, head)?;
             c.g.write(base + head_len as u64 + 4, b)?;
         }
         Tail::Guest(addr, n) => {
-            head.extend_from_slice(&(n as u32).to_le_bytes());
-            c.g.write(base, &head)?;
+            head[head_len..].copy_from_slice(&(n as u32).to_le_bytes());
+            c.g.write(base, head)?;
             if n > 0 {
                 c.g.m.copy_within(addr, base + head_len as u64 + 4, n).map_err(|_| Status(st::ACCESS_VIOLATION))?;
             }
@@ -431,7 +450,7 @@ fn flush(c: &mut Call<'_>) -> R<Vec<u8>> {
         s.submits.1 += dt;
         s.submits.2 += tail as u64;
         let who = s.serving;
-        s.stats.entry(who).or_insert((0, 0, 0)).2 += 1;
+        s.stats.entry(who).or_insert((0, 0, 0, 0)).2 += 1;
     }
     let status = c.g.u32(ring + 20)?;
     if !matches!(r, Some(Ok(_))) || status != 0 {
@@ -472,7 +491,7 @@ fn flush_async(c: &mut Call<'_>) -> R<()> {
         s.submits.1 += dt;
         s.submits.2 += tail as u64;
         let who = s.serving;
-        s.stats.entry(who).or_insert((0, 0, 0)).2 += 1;
+        s.stats.entry(who).or_insert((0, 0, 0, 0)).2 += 1;
     }
     if !matches!(r, Some(Ok(_))) {
         return Err(c.unimplemented("a GL batch the host refused (the one before this frame's last)"));
@@ -492,7 +511,7 @@ pub fn take_stats(p: &super::Process, n: usize) -> String {
     let mut s = p.gl.lock().unwrap();
     let frames = s.frame - s.stats_frame;
     s.stats_frame = s.frame;
-    let mut v: Vec<(&'static str, (u64, u64, u64))> = s.stats.drain().collect();
+    let mut v: Vec<(&'static str, (u64, u64, u64, u64))> = s.stats.drain().collect();
     let (k, ns, bytes) = std::mem::take(&mut s.submits);
     drop(s);
     v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
@@ -501,8 +520,14 @@ pub fn take_stats(p: &super::Process, n: usize) -> String {
     let top: Vec<String> = v
         .iter()
         .take(n)
-        .map(|(name, (c, t, k))| {
-            format!("{name} {:.1}/f {:.2}ms/f {:.2}sub/f", *c as f64 / f as f64, *t as f64 / 1e6 / f as f64, *k as f64 / f as f64)
+        .map(|(name, (c, t, k, b))| {
+            format!(
+                "{name} {:.1}/f {:.2}ms/f {:.2}sub/f {}KiB/f",
+                *c as f64 / f as f64,
+                *t as f64 / 1e6 / f as f64,
+                *k as f64 / f as f64,
+                *b / f / 1024
+            )
         })
         .collect();
     format!(
@@ -540,7 +565,7 @@ fn flush_in_place(c: &mut Call<'_>) -> R<(u64, usize)> {
         s.submits.1 += dt;
         s.submits.2 += tail as u64;
         let who = s.serving;
-        s.stats.entry(who).or_insert((0, 0, 0)).2 += 1;
+        s.stats.entry(who).or_insert((0, 0, 0, 0)).2 += 1;
     }
     let status = c.g.u32(ring + 20)?;
     if !matches!(r, Some(Ok(_))) || status != 0 {
@@ -1181,10 +1206,10 @@ fn write_back_map(c: &mut Call<'_>, m: &Mapping, at: u64, len: u64) -> R<()> {
     if len == 0 {
         return Ok(());
     }
-    let bytes = c.g.bytes(m.addr + at, len as usize)?;
     let [ol, oh] = proto::Batch::words64(m.offset + at);
     let [sl, sh] = proto::Batch::words64(len);
-    cmd_blob(c, op::BUFFER_SUB_DATA, &[m.target, ol, oh, sl, sh], &bytes)
+    // Straight from the mapping into the ring (no copy between).
+    cmd_blob_at(c, op::BUFFER_SUB_DATA, &[m.target, ol, oh, sl, sh], m.addr + at, len as usize)
 }
 
 /// Generated opcodes of the GL 4.4 transport the hand-written calls here
@@ -1258,11 +1283,14 @@ pub fn call(c: &mut Call<'_>, code: u32, args: u64) -> R {
     } else {
         0
     };
-    let r = one(c, name, &p);
+    let r = match hot(code) {
+        Some(h) => hot_one(c, h, &p),
+        None => one(c, name, &p),
+    };
     if timed {
         let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
         let mut s = c.p.gl.lock().unwrap();
-        let e = s.stats.entry(name).or_insert((0, 0, 0));
+        let e = s.stats.entry(name).or_insert((0, 0, 0, 0));
         e.0 += 1;
         e.1 += dt;
     }
@@ -1270,6 +1298,54 @@ pub fn call(c: &mut Call<'_>, code: u32, args: u64) -> R {
         crate::nt_log!("[nt:{:x}]   opengl32 {name}", c.t.tid);
     }
     r.map(|()| st::SUCCESS)
+}
+
+/// The calls a frame makes thousands of (Noita: glEnable, glDisable,
+/// glActiveTexture, glUseProgram, glBindTexture, glUniform1i, glUniform2f
+/// ~4000 a frame between them), found by their unix-call code instead of
+/// [`one`]'s match on names (hundreds of string comparisons before the
+/// late arms). Each does exactly what its arm in [`one`] does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hot {
+    Enable,
+    Disable,
+    ActiveTexture,
+    UseProgram,
+    BindTexture,
+    Uniform1i,
+    Uniform2f,
+}
+
+fn hot(code: u32) -> Option<Hot> {
+    static BY_CODE: std::sync::OnceLock<Vec<Option<Hot>>> = std::sync::OnceLock::new();
+    let v = BY_CODE.get_or_init(|| {
+        table::FUNCS
+            .iter()
+            .map(|&(name, _)| match name {
+                "glEnable" => Some(Hot::Enable),
+                "glDisable" => Some(Hot::Disable),
+                "glActiveTexture" => Some(Hot::ActiveTexture),
+                "glUseProgram" => Some(Hot::UseProgram),
+                "glBindTexture" => Some(Hot::BindTexture),
+                "glUniform1i" => Some(Hot::Uniform1i),
+                "glUniform2f" => Some(Hot::Uniform2f),
+                _ => None,
+            })
+            .collect()
+    });
+    v.get(code as usize).copied().flatten()
+}
+
+fn hot_one(c: &mut Call<'_>, h: Hot, p: &Params) -> R<()> {
+    match h {
+        Hot::Enable => cmd(c, op::ENABLE, &[p.u32(c, 1)?], &[]),
+        Hot::Disable => cmd(c, op::DISABLE, &[p.u32(c, 1)?], &[]),
+        Hot::ActiveTexture => cmd(c, op::ACTIVE_TEXTURE, &[p.u32(c, 1)?], &[]),
+        Hot::UseProgram => cmd(c, op::USE_PROGRAM, &[p.u32(c, 1)?], &[]),
+        Hot::BindTexture => cmd(c, op::BIND_TEXTURE, &[p.u32(c, 1)?, p.u32(c, 2)?], &[]),
+        Hot::Uniform1i => cmd(c, op::UNIFORM_1I, &[p.u32(c, 1)?, p.u32(c, 2)?], &[]),
+        Hot::Uniform2f => cmd(c, op::UNIFORM_2F, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?], &[]),
+    }
 }
 
 /// The FBO functions come in core and EXT spellings with the same arguments.
@@ -2018,18 +2094,25 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             let pbo = c.p.gl.lock().unwrap().bound.get(&0x88eb).copied().unwrap_or(0) != 0;
             let [lo, hi] = proto::Batch::words64(pixels);
             cmd(c, GL44_GET_TEX_IMAGE, &[t, level, format, ty, pbo as u32, lo, hi], &[])?;
-            let mut r = Reply { b: flush(c)?, at: 0 };
+            let (r, n) = flush_in_place(c)?;
             if !pbo && pixels != 0 {
-                let (offset, row_stride, row_bytes, rows, image_stride, images) =
-                    (r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64);
-                let data = r.blob();
+                // { offset, row stride, row bytes, rows, image stride,
+                //   images, blob }: each row copied from the ring's reply
+                // area to its place, with no copy between.
+                if n < 28 {
+                    return Ok(());
+                }
+                let w = |i: u64| c.g.u32(r + 4 * i).map(u64::from);
+                let (offset, row_stride, row_bytes, rows, image_stride, images) = (w(0)?, w(1)?, w(2)?, w(3)?, w(4)?, w(5)?);
+                let len = (w(6)?).min(n as u64 - 28);
+                let data = r + 28;
                 for image in 0..images {
                     for row in 0..rows {
                         let at = image * image_stride + row * row_stride;
-                        if at + row_bytes > data.len() as u64 {
+                        if at + row_bytes > len {
                             break;
                         }
-                        c.g.write(pixels + offset + at, &data[at as usize..(at + row_bytes) as usize])?;
+                        c.g.m.copy_within(data + at, pixels + offset + at, row_bytes as usize).map_err(|_| Status(st::ACCESS_VIOLATION))?;
                     }
                 }
             }

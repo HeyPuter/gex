@@ -1140,8 +1140,27 @@ case 1247: {
     if (!gexgl_compute_pixel_layout(format, type, width, height, threeDimensional ? depth : -1,
                                     &pack_store, &layout) ||
         layout.end > UINT32_MAX) { a.ok = false; break; }
-    std::vector<uint8_t> pixels(layout.end, 0);
-    glGetTexImage(target, level, format, type, pixels.data());
+    // Through a pack buffer read as GL_STREAM_READ: the driver copies into
+    // memory the CPU reads cached (a direct read of a GPU texture maps it
+    // write-combined, and wined3d reads its surfaces back every frame).
+    static GLuint readback = 0; static GLsizeiptr readback_size = 0;
+    GLint bound = 0; glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &bound);
+    if (!readback) glGenBuffers(1, &readback);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, readback);
+    if (readback_size < (GLsizeiptr)layout.end) {
+        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)layout.end, nullptr, GL_STREAM_READ);
+        readback_size = (GLsizeiptr)layout.end;
+    }
+    glGetTexImage(target, level, format, type, nullptr);
+    const uint8_t *mapped = static_cast<const uint8_t *>(
+        glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)layout.end, GL_MAP_READ_BIT));
+    std::vector<uint8_t> fallback;
+    if (!mapped) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        fallback.assign(layout.end, 0);
+        glGetTexImage(target, level, format, type, fallback.data());
+        mapped = fallback.data();
+    }
     const size_t group = gexgl_pixel_group_bytes(format, type);
     const uint32_t rows = height > 0 ? static_cast<uint32_t>(height) : 0;
     const uint32_t images = threeDimensional && depth > 0
@@ -1152,8 +1171,10 @@ case 1247: {
     put_u32(rows);
     put_u32(static_cast<uint32_t>(layout.image_stride));
     put_u32(images);
-    put_blob(pixels.data() + layout.offset,
+    put_blob(mapped + layout.offset,
              static_cast<uint32_t>(layout.end - layout.offset));
+    if (fallback.empty()) glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(bound));
     break;
 }
 case 1248: {
