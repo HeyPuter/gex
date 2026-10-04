@@ -139,7 +139,13 @@ pub fn fingerprint(providers: &[Provider]) -> String {
         // Only a stateful provider sees them: the keys of every other
         // provider (and so of the units built around it) do not move.
         if p.stateful {
-            INCLUDES.hash(&mut h);
+            // As `INCLUDES.hash(h)` on a 64-bit host: a slice's length is a
+            // `usize`, so it is written as a u64 for the browser's (wasm32)
+            // key to match the units built natively.
+            h.write_u64(INCLUDES.len() as u64);
+            for i in INCLUDES {
+                i.hash(&mut h);
+            }
         }
     }
     format!("{:016x}", h.finish())
