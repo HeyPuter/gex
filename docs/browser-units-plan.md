@@ -270,6 +270,16 @@ directory, statics, stack and heap); the guest takes 2 GiB..4 GiB-64 KiB.
   e.g. 0x4000_0000 with the guest capped at 1 GiB), so an error can't
   hide behind memory that happens to be zero.
 
+- **Stateful providers** (R's merge/abi9-page, E's d3d20072) put their
+  C data and a per-Worker stack in memory from the shim (`__memory_base`,
+  `gex_provider_alloc`). Under the bias these stay linear and below the
+  base, out of the guest's reach, which is fine. But crt_heap's dlmalloc
+  hands *guest* pointers to the program: its arena must sit above the
+  base, and malloc/free must convert (`p - base` out, `p + base` in),
+  as must every provider that returns or takes a guest pointer. The same
+  goes for the yield park's `addr` (`sync::YIELD_GEN`) and for
+  `GA()`-style reads in all providers. Audit these with the JS readers.
+
 **Rejected:**
 - *Mask (`a & 0x7fffffff`):* one AND per access, but isolation by silent
   aliasing (a wild pointer corrupts guest memory instead of faulting).
