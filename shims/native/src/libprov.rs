@@ -187,11 +187,21 @@ pub(crate) fn install(
     let (size, align) = dylink_memory(&wasm)?;
     let data = alloc(state, (size as u64).max(16) + (1u64 << align), &format!("[provider {} data]", p.name))?;
     let data = (data + (1u64 << align) - 1) & !((1u64 << align) - 1);
-    let module = gex_cache::load_or_compile_at(engine, &p.wasm.with_extension("cwasm"), &wasm)
+    let module = gex_cache::load_or_compile_at(engine, &cwasm_path(&p.wasm, &wasm), &wasm)
         .with_context(|| format!("compiling provider {}", p.name))?;
     crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
     ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, Extras { memory_base: data as u32 })?;
     Ok(pairs.len())
+}
+
+/// Where a provider module's compiled form is kept: beside it, named by
+/// the module's content (`lua51.0123456789abcdef.cwasm`), so a rebuilt
+/// module is never run from a stale artifact. Anything that precompiles a
+/// provider ahead of time (an ejected project) names it with this too.
+pub fn cwasm_path(wasm_path: &std::path::Path, wasm: &[u8]) -> PathBuf {
+    let key = gex_cache::key("libprov", [wasm]);
+    let stem = wasm_path.file_stem().and_then(|s| s.to_str()).unwrap_or("provider");
+    wasm_path.with_file_name(format!("{stem}.{}.cwasm", &key[..16]))
 }
 
 /// Data whose relocations have been applied, by its guest address.

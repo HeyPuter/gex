@@ -26,4 +26,4 @@ $LD "$OUT/demo.adapters.o" "$OUT/gexw_globals.o" -o "$OUT/demo.wasm"
 i686-w64-mingw32-gcc -O2 -s -shared -nostdlib -Wl,--no-insert-timestamp -Wl,-e,_skel_entry \
   -o "$OUT/demo.dll" "$OUT/demo.skel.c" "$OUT/demo.def"
 i686-w64-mingw32-gcc -O2 -s -Wl,--no-insert-timestamp -o "$OUT/test.exe" "$here/test.c"
-rm -f "$OUT/demo.cwasm"  # libprov caches the compiled module beside it
+
