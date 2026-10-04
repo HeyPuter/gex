@@ -554,6 +554,31 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   input, display, window, lowmem, filemap, glcompat). jitcode, detour and
   pagespan stop loudly, as designed. cxx's earlier kernelbase clang failure
   was a SIGTERM from the session ending, not a build error.
+- **cg12 (2026-10-04):** merged merge/fjit (632bb7ba). seh, cxx and apc
+  pass ejected on gex-rt against cg12's units (overlay
+  `scratchpad/eject9/units-cg12`, symlinks into `fjit/cgcache-cg12`; the
+  `UC=` variable of `ntcase.sh`).
+- **State at the reboot (2026-10-04):** the Noita rebuild on cg12 has not
+  started. `target/noita-prefix/gex-layout` is now the staged cg12 layout
+  (sha256 63b13c67..., the old one is kept as
+  `scratchpad/eject9/noita/gex-layout.pre-cg12`). F's cg12 noita.exe unit
+  (`fjit/chain2.sh` -> `fjit/noita-cg12.log`) was still building at the
+  reboot, so the cg12 recording waits for it: a recording without a
+  noita.exe unit would log every lookup as an interior entry. The old
+  recording is at `noita/rec-cg10`; a stale p-noita9 build (cg10 keys) was
+  stopped and can be deleted. Resume:
+  1. Make sure cgcache-cg12 has noita.exe at 0x400000 (rerun F's
+     chain2.sh if its log has no `exit 0`).
+  2. Record: `OVL=$S/eject9/noita/ovl12 CPUS=1,7 ./rec-noita.sh 420`.
+     ovl12 holds symlinks to cg12's unit dirs and a copy of `icall`.
+     **Never link `build.lock`:** the first try did, and waited on F's
+     build.
+  3. `gexc eject noita/rec --out p-noita12`, then `build.sh` with
+     `GEX_EJECT_UNIT_CACHE=$S/eject9/noita/ovl12` at nice 19 on 0,2,6,8.
+     Note the regions line: whether expanding call continuations stays
+     small on Noita's big functions.
+  4. Run on gex-rt (`PROJECT=... run-ejected.sh`), check 0 translations,
+     then the fixed-seed pewasm pairing (step 3 of the plan), then E8.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
