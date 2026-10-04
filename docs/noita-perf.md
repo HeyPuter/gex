@@ -941,3 +941,71 @@ whose unit keys are cg10's):
 - int3 and ud2 as resumable faults: they're HostCall statements.
 - The Detours-on-provided-export log and test, once E's
   providers-survive-rewrites change lands.
+
+### Stream F at the second reboot (2026-10-04, early)
+
+merge/fjit @ this commit. Since 01864a5d: abi9 ed951711 merged (docs);
+632bb7ba `GEX_IMAGE_WASM` (below); 97f86d21 = B's 3cf08afe cherry-picked
+(Src `repr(u8)`, jump-table capacity `hi - lo`; re-keys units, so it rides
+cg13; no test for the capacity: observing it needs an allocator hook).
+
+**cg12: built.**
+- Gates on `scratchpad/fjit/gexc-cg19` (= 2a256612), GEX_CHECK_I386_HIGH=1:
+  lockstep exact gi386 30/30, gx64 30/30; tests/nt --no-cgen 60/60;
+  cgen-prefix.sh 60/60; i386-high under --cgen 0 reports; providers ok.
+- Staged layout `~/.cache/gex/wine-11.15/gex-layout` appended (D3D set, 18
+  lines, 0 removed): sha256 63b13c676f9a3fb9f8e61cedce566d7c205be217e4b176a4f4e4db7a6ee97c2a.
+  The run prefix's layout equals it.
+- `scratchpad/fjit/cgcache-cg12`: prefix (82 units) and all eight Noita
+  images. noita.exe's unit failed silently in build-units.sh (its log only
+  shows recovery; cause not seen) and was rebuilt alone: 100,222 functions,
+  128 MiB wasm, 4,306 devirtualised calls (3,281 hints), exit 0
+  (`scratchpad/fjit/noita-cg12.log`). Check that line after any full rebuild.
+
+**Engine A/B (step 4).** The same gex module under wasmtime (gexc) and V8
+(node 26.7). `gexc build --exhaustive [--cgen|--fjit-image]` with a shared
+memory; native runs it via `GEX_IMAGE_WASM=PATH gexc run ELF` (632bb7ba);
+node runs the same bytes with the memory import's shared flag cleared (the
+result is byte-identical to a `--no-shared-memory` build) through
+pewasm/bench/gex-run.mjs, single Worker. Cores 4,10, 3 rounds, medians;
+metric the guest's kernel-us. Script `scratchpad/fjit/eng.py`, results
+`scratchpad/fjit/eng/eng-<guest>.txt`.
+- wasmtime 27: Cranelift `Speed`, 4 GiB static reservation plus 2 GiB guard
+  (no explicit bounds checks), signal-based traps, tail-call convention
+  (SysV callee-saves), no epoch/fuel. V8: trap-handler bounds (none
+  explicit), Liftoff then dynamic tier-up, wasm inlining on.
+
+| guest | clang tier (cg) wasmtime/node | fjit-image wasmtime/node |
+|---|---|---|
+| gi386 | 1.066 (27 kernels) | 1.133 |
+| gx64 | 1.100 | 1.139 |
+| ga64 | 1.095 | 1.172 |
+
+Process CPU is the other way (cg 0.89-0.92): node compiles every run.
+Worst for wasmtime on cg: sand 1.46-1.89, simd, matmul, interp, qsort,
+umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
+- **Not V8's inlining:** `--no-wasm-inlining` gives gi386 cg 1.065 (was
+  1.066); gx64 1.089 on the 18 kernels run before the reboot (1.085 with
+  inlining on the same 18). `scratchpad/fjit/eng/noinl-*.txt`.
+- **sand's hot function** (wasm func 6477, 96% of samples; Cranelift
+  0x3618 bytes, TurboFan 12,732): Cranelift keeps the loop's induction and
+  carried values in stack slots, storing and reloading them each iteration
+  (`mov %r10,0x30(%rsp)` the hottest instruction, then reloaded twice), with
+  the many cold call-out exits (each spilling six v128 and eight GPR context
+  slots) raising the pressure. TurboFan keeps them in registers. Dumps:
+  `eng/f6477.cl.s` (wcompile, gex's config), `eng/f6477.tf.s`
+  (`--print-wasm-code-function-index`), `eng/sand.prof` (PC samples).
+- Note: Noita's native units are the unguarded flavor, so the
+  `cmp 0xffff0000; cmovb` clamp in these browser-flavor modules is absent
+  there.
+
+**Resume, in order:**
+1. `scratchpad/fjit/abba.sh` (cg10 `gexc-cg10f`/cgcache-cg10 against cg12
+   `gexc-cg19`/cgcache-cg12, pewasm before/between/after, fixed seed, 4,10),
+   then `threadwork.py` per tag; check each run's AOT line.
+2. pewasm profile for sub_334580: `node --cpu-prof` on port/bench.cjs
+   (chain.sh has the command), against gex's f_724580 ms/frame from the
+   ABBA profiles.
+3. Optional: rerun `ENG_NODE_FLAGS=--no-wasm-inlining eng.py gx64 3
+   --configs cg` in full; a wasmtime upgrade A/B on regalloc (sand).
+4. Peggle (step 5 of the previous list), with the layout now appended.
