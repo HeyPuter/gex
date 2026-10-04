@@ -146,7 +146,7 @@ struct Provided {
 }
 
 fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
-    let providers = gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64);
+    let providers = gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data);
     let mut exports = HashMap::new();
     if !providers.is_empty() {
         for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
@@ -185,6 +185,33 @@ fn unit_key(image: &gex_ld::Image, pv: &Provided) -> String {
 /// Where [`icall_hints`] reads the image's profile.
 pub fn icall_path(image: &gex_ld::Image) -> Result<std::path::PathBuf> {
     Ok(cache_root()?.join("icall").join(format!("{}.txt", gex_key::image_identity(image).trim_start_matches("image:"))))
+}
+
+/// Say where the image's indirect-call profile was looked for and how many
+/// hints it gave (`gexc cgen-image`). A unit built without one has no
+/// devirtualised calls, so its hot virtual calls stay table calls that no
+/// engine inlines (the browser units of 2026-10-04 were all built so). When
+/// it is missing, each cache in `GEX_CGEN_ICALL_FROM` (colon-separated
+/// cache roots) is checked for the same identity's file, and one found is
+/// named, loudly.
+fn report_hints(image: &gex_ld::Image) {
+    let Ok(path) = icall_path(image) else { return };
+    if path.exists() {
+        eprintln!("[cgen] indirect-call hints: {} from {}", icall_hints(image).len(), path.display());
+        return;
+    }
+    eprintln!("[cgen] indirect-call hints: none (no {})", path.display());
+    let name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    for root in std::env::var("GEX_CGEN_ICALL_FROM").unwrap_or_default().split(':').filter(|r| !r.is_empty()) {
+        let other = std::path::Path::new(root).join("icall").join(&name);
+        if other.exists() {
+            eprintln!(
+                "[cgen] WARNING: building without the indirect-call profile at {}; copy it to {} for devirtualised calls",
+                other.display(),
+                path.display()
+            );
+        }
+    }
 }
 
 /// The image's indirect-call profile, `<cache>/icall/<image identity>.txt`:
@@ -492,7 +519,7 @@ fn install_regions(
 /// unit cache, as mapping it would; their names.
 pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
     let mut v = Vec::new();
-    for prov in gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64) {
+    for prov in gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data) {
         let (path, _) = gex_cgen::provider::build(&prov, &cache_root()?)?;
         if let Some(dir) = gex_cache::precompiled_dir() {
             gex_cache::precompile(&crate::engine()?, &std::fs::read(&path)?, &dir)?;
@@ -598,7 +625,8 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         recoveries.push(root.join("recovery").join(recovery_key(&image)));
         stubs.extend(pv.stubs.iter().copied());
         if with_providers {
-            for prov in &pv.providers {
+            // A stateful provider (data, a stack) stays a module of its own.
+            for prov in pv.providers.iter().filter(|p| !p.stateful) {
                 if !gp.sources.iter().any(|(n, _)| n == prov.name) {
                     gp.sources.push((prov.name.to_string(), gex_cgen::provider::group_source(prov)));
                 }
@@ -694,6 +722,9 @@ pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jo
 
 fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool, pv: &Provided) -> Result<std::path::PathBuf> {
     let (image, seeds) = (image, seeds);
+    if verbose {
+        report_hints(image);
+    }
     let key = unit_key(image, pv);
     let root = cache_root()?;
     let dir = root.join(&key);
@@ -774,7 +805,9 @@ pub(crate) fn enable(record: bool) -> Result<()> {
 }
 
 fn take_pending() -> Vec<Pending> {
-    if !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
+    // A load first: every syscall of every thread comes here, and a swap
+    // would write the shared line each time.
+    if !HAS_PENDING.load(std::sync::atomic::Ordering::Relaxed) || !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
         return Vec::new();
     }
     std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
@@ -876,6 +909,47 @@ pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
 /// Whether an installed unit covers the code page of `pc`.
 pub(crate) fn unit_covers(pc: u64) -> bool {
     UNIT_PAGES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&(pc / gex_abi::DISPATCH_PAGE)))
+}
+
+/// Provided exports by guest address: a label (`kernel32.dll!OutputDebugStringA`),
+/// the first bytes of the library's own code there when the provider was
+/// bound, and whether a rewrite of them was reported.
+static PROVIDED: Mutex<Option<std::collections::BTreeMap<u64, (String, [u8; PROVIDED_BYTES], bool)>>> = Mutex::new(None);
+const PROVIDED_BYTES: usize = 8;
+
+fn provided_bytes(memory: &[u8], addr: u64) -> [u8; PROVIDED_BYTES] {
+    let mut b = [0; PROVIDED_BYTES];
+    if let Some(m) = memory.get(addr as usize..addr as usize + PROVIDED_BYTES) {
+        b.copy_from_slice(m);
+    }
+    b
+}
+
+fn note_provided(memory: &gex_mem::GuestMemory, addr: u64, label: String) {
+    let bytes = provided_bytes(memory.bytes(), addr);
+    PROVIDED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(addr, (label, bytes, false));
+}
+
+/// Report, once per export, a guest that rewrote the start of an export a
+/// provider serves (a Detours-style hook, a patch). The provider stays
+/// bound (`ftab::Shared::providers`), so the guest's new code there does
+/// not run; on Windows it would. `GEX_PROVIDER_SKIP=<export>` leaves the
+/// export to the library's code, hooks included.
+pub(crate) fn provided_rewrites(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
+    let memory = memory.bytes();
+    let mut guard = PROVIDED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = guard.as_mut() else { return };
+    for &(start, end) in ranges {
+        for (&addr, (label, bytes, told)) in map.range_mut(start.saturating_sub(PROVIDED_BYTES as u64 - 1)..end) {
+            if !*told && provided_bytes(memory, addr) != *bytes {
+                *told = true;
+                let e = label.rsplit('!').next().unwrap_or(label);
+                eprintln!(
+                    "gex-nt: the guest rewrote provided export {label} at {addr:#x} (a hook?); the provider stays bound, so its new code does not run (GEX_PROVIDER_SKIP={e} runs the library's own code)"
+                );
+            }
+        }
+    }
 }
 
 /// Record a placed unit's pages as built, and clear their patched bits.
@@ -1276,7 +1350,24 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
         }
         let module = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| gex_cache::compile(engine, &b)).with_context(|| format!("compiling provider {}", prov.name))?;
         crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-        crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        if prov.stateful {
+            // Its data in guest pages, as an ejected project's stateful
+            // providers have it (`libprov`); the stack comes per thread.
+            let wasm = std::fs::read(&path)?;
+            let (size, align) = crate::libprov::dylink_memory(&wasm)?;
+            let a = 1u64 << align;
+            let data = crate::libprov::alloc_top(state, (size as u64).max(16) + a, &format!("[provider {} data]", prov.name))?;
+            let data = (data + a - 1) & !(a - 1);
+            crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data as u32 })?;
+        } else {
+            crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        }
+        let dll = p.path.rsplit(['/', '\\']).next().unwrap_or(&p.path);
+        for (_, e) in &prov.binds {
+            if let Some(&rva) = pv.exports.get(e) {
+                note_provided(memory, p.base + rva as u64, format!("{dll}!{e}"));
+            }
+        }
         eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
     }
     // Stateful providers (`libprov`: an ejected project's), after the

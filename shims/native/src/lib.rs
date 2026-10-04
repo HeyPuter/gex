@@ -202,6 +202,8 @@ struct HostState {
     /// loops entered from code that has none (a function-tier unit or a
     /// function JIT module) when no runtime-translated module exists yet.
     root_enter: Option<wasmtime::Func>,
+    /// This store's NT thread, once a syscall has looked it up.
+    nt_thread: Option<Arc<gex_kernel::nt::Thread>>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
     /// Exceptions being dispatched nested (`nt::raise_nested`), innermost
@@ -887,6 +889,7 @@ fn run_program_with(
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -941,6 +944,9 @@ fn run_program_with(
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
     store.data_mut().memory = Some(memory.clone());
+    if let Some(dev) = crate::gl::DEVICE.get() {
+        dev.set_memory(memory.clone());
+    }
 
     // Runtime translation needs the table to patch and the engine and linker
     // to build modules with; holding them here turns a dispatch miss into a
@@ -1712,6 +1718,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -1864,6 +1871,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -4105,6 +4113,12 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
 /// module) -- any tier-1 module's in this store, or the thread loop's root
 /// module's. They all reach every slot through the same tables.
 pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::Func> {
+    // The thread loop's, when there is one: the others are found by name,
+    // one instance at a time, and a call-out from a unit (most of them)
+    // would look through every tier-1 module before reaching it.
+    if let Some(f) = caller.data().root_enter.clone() {
+        return Some(f);
+    }
     if let Some(f) = caller.get_export(exports::ENTER).and_then(Extern::into_func) {
         return Some(f);
     }
@@ -4252,6 +4266,7 @@ fn retire_translations(
     // Units' rewritten pages first: a lookup after the probe cache is
     // cleared below must already see them (`ftab::current`).
     nt_cgen::on_retire(&memory, ranges);
+    nt_cgen::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut pages = 0usize;
     for &(start, end) in ranges {

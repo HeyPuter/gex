@@ -96,6 +96,10 @@ struct Provided {
     /// image by name and address, and its entry point (DllMain), which
     /// `gexp__entry` replaces.
     stateful: Option<(Vec<(String, u64)>, u64)>,
+    /// A built-in provider with data and a C stack (`stateful` on its
+    /// PROVIDES line: crt_heap): bound like any built-in one, its data
+    /// allocated as an ejected project's is, top down.
+    data: bool,
 }
 
 /// Stateful providers by library (lower case) and module file under the
@@ -277,7 +281,7 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
                 }
             }
             let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 };
-            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)) });
+            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false });
         }
     }
     let identity = gex_key::image_identity(image).trim_start_matches("image:").to_string();
@@ -310,7 +314,9 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) 
     use std::hash::{Hash, Hasher};
     let mut key = gex_cgen::image::image_key(image);
     let Some(pe) = pe else { return (key, Vec::new()) };
-    let providers = gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64);
+    // As natively (`nt_cgen::provided`): Wine's own build of a DLL leaves out
+    // the `nowine` providers.
+    let providers = gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data);
     if providers.is_empty() {
         return (key, Vec::new());
     }
@@ -338,6 +344,7 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) 
             file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
             binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), base + rva as u64))).collect(),
             stateful: None,
+            data: p.stateful,
         })
         .filter(|p| !p.binds.is_empty())
         .collect();
@@ -646,10 +653,10 @@ pub extern "C" fn gex_cgen_provider_file(u: u32, i: u32, buf: u32, cap: u32) -> 
 /// provider's module number (an install names `PROVIDER | number`), or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) -> i32 {
-    let (file, binds, stateful) = {
+    let (file, binds, stateful, data) = {
         let units = lock(&UNITS);
         let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
-        (p.file.clone(), p.binds.clone(), p.stateful.clone())
+        (p.file.clone(), p.binds.clone(), p.stateful.clone(), p.data)
     };
     let wasm = crate::shim_slice(ptr, len);
     let names = match gex_cgen::provider::slot_names(wasm) {
@@ -661,10 +668,23 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
     };
     let mut memory_base = 0u32;
     let pairs: Vec<(u64, u32)> = match &stateful {
-        None => binds
-            .iter()
-            .filter_map(|(f, a)| names.iter().position(|s| s.as_deref() == Some(f.as_str())).map(|k| (*a, k as u32)))
-            .collect(),
+        None => {
+            if data {
+                // A built-in stateful provider's data, top down as natively
+                // (`nt_cgen::install_providers`).
+                match builtin_data(&file, wasm) {
+                    Ok(b) => memory_base = b,
+                    Err(e) => {
+                        crate::warn_line(&format!("gex-nt: provider {file}: {e}\n"));
+                        return -1;
+                    }
+                }
+            }
+            binds
+                .iter()
+                .filter_map(|(f, a)| names.iter().position(|s| s.as_deref() == Some(f.as_str())).map(|k| (*a, k as u32)))
+                .collect()
+        }
         Some((exports, entry)) => {
             match stateful_pairs(&file, wasm, &names, exports, *entry) {
                 Ok((pairs, base)) => {
@@ -763,6 +783,54 @@ fn dylink_memory(wasm: &[u8]) -> Result<(u32, u32), String> {
 fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
     let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
     crate::with_host(|h| gex_kernel::nt::boot::alloc_private(p, &mut h.kernel, size, name))
+}
+
+/// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a
+/// built-in provider's data, heap and stack, which then do not move the DLLs
+/// the program maps after them.
+fn provider_alloc_top_bytes(size: u64, name: &str) -> Result<u64, String> {
+    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    crate::with_host(|h| gex_kernel::nt::boot::alloc_private_top(p, &mut h.kernel, size, name))
+}
+
+/// A built-in stateful provider's data (its `dylink.0` size, aligned).
+fn builtin_data(file: &str, wasm: &[u8]) -> Result<u32, String> {
+    let (size, align) = dylink_memory(wasm)?;
+    let a = 1u64 << align;
+    let data = provider_alloc_top_bytes((size as u64).max(16) + a, &format!("[provider {file} data]"))?;
+    Ok(((data + a - 1) & !(a - 1)) as u32)
+}
+
+/// `gex.provider_alloc_top(size)`: fresh read-write guest pages from the top
+/// down (crt_heap's heap), or 0.
+#[no_mangle]
+pub extern "C" fn gex_provider_alloc_top(size: u32) -> u32 {
+    match provider_alloc_top_bytes(size as u64, "[provider heap]") {
+        Ok(a) => a as u32,
+        Err(e) => {
+            crate::warn_line(&format!("gex-nt: provider_alloc_top({size:#x}): {e}\n"));
+            0
+        }
+    }
+}
+
+/// This Worker's provider stack: top down unless an ejected project's
+/// stateful providers are set (its sessions were recorded with the stack
+/// bottom up, as the native `libprov::stack`).
+#[no_mangle]
+pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
+    if lock(&STATEFUL).is_empty() {
+        gex_provider_alloc_top(size)
+    } else {
+        gex_provider_alloc(size)
+    }
+}
+
+/// `gex.nt_qpc()`: the process clock as NtQueryPerformanceCounter reads it
+/// (100 ns units), for the nt_qpc provider.
+#[no_mangle]
+pub extern "C" fn gex_nt_qpc() -> i64 {
+    crate::nt::process().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
 }
 
 /// Provider module `number`'s data (`__memory_base`), 0 when stateless.

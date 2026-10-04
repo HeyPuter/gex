@@ -235,11 +235,24 @@ pub fn alloc_private(p: &Process, k: &mut Kernel, size: u64, name: &str) -> Resu
     alloc(p, k, size, name).map_err(|s| format!("allocating {size:#x} bytes for {name}: NTSTATUS {:#010x}", s.0))
 }
 
+/// [`alloc_private`] from the top of the address space down: for the host's
+/// own regions made while the program runs (a built-in provider's data and
+/// heap), which then do not move what the program maps after them -- a DLL
+/// mapped bottom-up lands where it would without them, at the base its unit
+/// was built for.
+pub fn alloc_private_top(p: &Process, k: &mut Kernel, size: u64, name: &str) -> Result<u64, String> {
+    alloc_in(p, k, size, name, true).map_err(|s| format!("allocating {size:#x} bytes for {name}: NTSTATUS {:#010x}", s.0))
+}
+
 /// Reserve and commit a fresh private region from the NT allocator.
 fn alloc(p: &Process, k: &mut Kernel, size: u64, name: &str) -> R<u64> {
+    alloc_in(p, k, size, name, false)
+}
+
+fn alloc_in(p: &Process, k: &mut Kernel, size: u64, name: &str, top_down: bool) -> R<u64> {
     let size = (size + PAGE - 1) & !(PAGE - 1);
     let mut stl = p.st.lock().unwrap();
-    let b = stl.vm.find_free((size + GRANULE - 1) & !(GRANULE - 1), false, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))?;
+    let b = stl.vm.find_free((size + GRANULE - 1) & !(GRANULE - 1), top_down, vm::ALLOC_HIGH).ok_or(Status(st::NO_MEMORY))?;
     stl.vm.reserve(b, size, page_prot::READWRITE, true, Kind::Private, name);
     stl.vm.mirror(&mut k.mem, b, b + size);
     Ok(b)

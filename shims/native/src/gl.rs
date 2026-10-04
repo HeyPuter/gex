@@ -53,6 +53,9 @@ pub struct GlDevice {
     /// every batch runs on the submitting thread, as it always did, and
     /// `GEX_GL_SUBMIT_ASYNC` is refused (the guest then submits normally).
     threaded: std::sync::atomic::AtomicBool,
+    /// The guest's memory (`set_memory`): a synchronous batch is read where
+    /// it is in it.
+    memory: Mutex<Option<gex_mem::GuestMemory>>,
 }
 
 /// `GEX_GL_SYNC=1`: every batch runs before its submit returns.
@@ -64,8 +67,27 @@ fn sync_only() -> bool {
 /// One batch for the GL thread; `done` takes the result back to a
 /// synchronous submit: (reply, status, index of the failed command).
 struct Job {
-    batch: Vec<u8>,
+    batch: Batch,
     done: Option<std::sync::mpsc::Sender<(Vec<u8>, u32, u32)>>,
+}
+
+/// A batch's bytes: a copy (an asynchronous submit, whose ring the guest
+/// goes on filling), or the ring itself in guest memory (a synchronous one:
+/// the submitting thread waits for the reply, so the ring is not rewritten
+/// meanwhile, and its megabytes of texture data are not copied once more).
+enum Batch {
+    Owned(Vec<u8>),
+    /// The guest's memory, and the batch's range in it.
+    Ring(gex_mem::GuestMemory, std::ops::Range<usize>),
+}
+
+impl Batch {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Batch::Owned(v) => v,
+            Batch::Ring(m, r) => &m.bytes()[r.clone()],
+        }
+    }
 }
 
 /// What a presented frame is handed to.
@@ -108,6 +130,7 @@ impl GlDevice {
             pending: Arc::new((Mutex::new((0, None)), std::sync::Condvar::new())),
             me: me.clone(),
             threaded: std::sync::atomic::AtomicBool::new(false),
+            memory: Mutex::new(None),
         })
     }
 
@@ -144,6 +167,11 @@ impl GlDevice {
     /// surface at each PRESENT).
     pub fn set_frame_sink(&self, sink: FrameSink) {
         *self.sink.lock().unwrap() = Some(sink);
+    }
+
+    /// The guest's memory, for reading synchronous batches in place.
+    pub fn set_memory(&self, m: gex_mem::GuestMemory) {
+        *self.memory.lock().unwrap() = Some(m);
     }
 
     /// Run batches on a GL thread and take asynchronous submits: for a
@@ -206,7 +234,7 @@ impl GlDevice {
             .name("gex-gl".into())
             .spawn(move || {
                 for job in rx {
-                    let r = dev.execute(&job.batch);
+                    let r = dev.execute(job.batch.bytes());
                     match job.done {
                         Some(done) => {
                             let _ = done.send(r);
@@ -239,8 +267,15 @@ impl GlDevice {
         p.1.take()
     }
 
-    /// The header and command bytes of the ring at `ring`.
+    /// The header and command bytes of the ring at `ring` (a copy, for an
+    /// asynchronous submit).
     fn take_batch(&self, m: &mut GuestMem<'_>, ring: u64) -> Result<(Header, Vec<u8>), Errno> {
+        let (header, batch) = self.ring_batch(m, ring)?;
+        Ok((header, batch.to_vec()))
+    }
+
+    /// The header, and the command bytes where they are in the ring.
+    fn ring_batch<'m>(&self, m: &'m mut GuestMem<'_>, ring: u64) -> Result<(Header, &'m [u8]), Errno> {
         let head = m.read(ring, Header::SIZE)?.to_vec();
         let Some(header) = read_header(&head) else {
             return Err(Errno::EINVAL);
@@ -251,22 +286,32 @@ impl GlDevice {
         if header.capacity > MAX_BATCH || header.tail > header.capacity {
             return Err(Errno::EINVAL);
         }
-        let batch = m.read(ring + Header::SIZE as u64, header.tail as usize)?.to_vec();
-        self.record(&batch, header.reply_capacity);
+        let batch = m.read(ring + Header::SIZE as u64, header.tail as usize)?;
+        self.record(batch, header.reply_capacity);
         Ok((header, batch))
     }
 
     /// Run one batch, reading it out of guest memory and writing the reply back.
     fn submit(&self, m: &mut GuestMem<'_>, ring: u64) -> SysResult {
-        let (header, batch) = self.take_batch(m, ring)?;
+        let (header, batch) = self.ring_batch(m, ring)?;
         let (bytes, status, executed) = if self.threaded() {
+            // In place when the ring is in the memory the device knows (the
+            // process's own; a forked child's is copied as before).
+            let start = ring as usize + Header::SIZE;
+            let mem = self.memory.lock().unwrap().clone().filter(|g| g.bytes().as_ptr() as usize + start == batch.as_ptr() as usize);
+            let batch = match mem {
+                Some(g) => Batch::Ring(g, start..start + batch.len()),
+                None => Batch::Owned(batch.to_vec()),
+            };
             let (tx, rx) = std::sync::mpsc::channel();
             if self.queue().send(Job { batch, done: Some(tx) }).is_err() {
                 return Err(Errno::EIO);
             }
+            // The GL thread reads the ring until it answers: wait for that
+            // whatever happens.
             rx.recv().map_err(|_| Errno::EIO)?
         } else {
-            self.execute(&batch)
+            self.execute(batch)
         };
         // Behind it in the queue, so everything handed over before has run.
         if let Some(failed) = self.drain_to(0) {
@@ -291,7 +336,7 @@ impl GlDevice {
         let (_, batch) = self.take_batch(m, ring)?;
         let failed = self.drain_to(0);
         self.pending.0.lock().unwrap().0 += 1;
-        if self.queue().send(Job { batch, done: None }).is_err() {
+        if self.queue().send(Job { batch: Batch::Owned(batch), done: None }).is_err() {
             return Err(Errno::EIO);
         }
         write_status(m, ring, error::NONE, 0, 0)?;

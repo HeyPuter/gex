@@ -116,6 +116,25 @@ static LONG CALLBACK vectored(EXCEPTION_POINTERS *e) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+/* A vectored handler that continues past an int3, as a debugger does:
+ * the faulting function goes on at the next instruction. */
+static volatile LONG bp_calls;
+static LONG CALLBACK bp_vectored(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_BREAKPOINT) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement(&bp_calls);
+#ifdef __x86_64__
+    e->ContextRecord->Rip = (DWORD64)e->ExceptionRecord->ExceptionAddress + 1;
+#else
+    e->ContextRecord->Eip = (DWORD)e->ExceptionRecord->ExceptionAddress + 1;
+#endif
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+__attribute__((noinline)) static int past_int3(volatile int *p) {
+    int a = *p;
+    __asm__ volatile("int3");
+    return a + *p + 1;
+}
+
 __attribute__((noinline)) static int raise_keeps_control_words(int pad) {
     volatile char *room = __builtin_alloca(pad + 1);
     room[0] = 0;
@@ -174,6 +193,12 @@ int main(int argc, char **argv) {
     int kept = 1;
     for (int pad = 0; pad < 64; pad += 4) kept &= raise_keeps_control_words(pad);
     CHECK("continuing keeps the x87 and SSE control words", kept);
+    RemoveVectoredExceptionHandler(h);
+    h = AddVectoredExceptionHandler(1, bp_vectored);
+    volatile int twenty = 20;
+    int sum = 0;
+    for (int i = 0; i < 3; i++) sum += past_int3(&twenty);
+    CHECK("a vectored handler continues past int3", sum == 3 * 41 && bp_calls == 3);
     RemoveVectoredExceptionHandler(h);
 
 #ifdef __x86_64__

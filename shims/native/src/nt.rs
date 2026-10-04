@@ -383,7 +383,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                                 format!("{} t{tid:x} from {} x{n}", nt::syscall_name(nr), p.describe_addr(site))
                             })
                             .collect();
-                        eprintln!("gex-nt: syscall sites (1 in 64) {}", ss.join(" | "));
+                        if !ss.is_empty() {
+                            eprintln!("gex-nt: syscall sites (1 in 64) {}", ss.join(" | "));
+                        }
                         let mut by: std::collections::BTreeMap<String, u64> = Default::default();
                         for (page, n) in crate::tier1_pages() {
                             let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
@@ -475,7 +477,9 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         if let Some(n) = SYSCALLS.get(i) {
             // 1 in 64: who made it, the first return address outside
             // Wine's core DLLs on the guest's frame-pointer chain.
-            if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 63 == 0 && p.abi == nt::Abi::P32 {
+            // GEX_NT_SYSCALL_SITES=1 only: the walk and its lock cost the
+            // measured run itself.
+            if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 63 == 0 && p.abi == nt::Abi::P32 && sites_on() {
                 let site = syscall_site(&p, &memory, ctx_addr);
                 let tid = p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid);
                 *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).entry((i as u32, tid, site)).or_default() += 1;
@@ -486,9 +490,18 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     // nested exception dispatch needs to come back here.
     let next_pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     let raise_sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize);
+    // The thread, once per store: its context address never changes.
+    let t = match caller.data().nt_thread.as_ref().filter(|t| t.ctx_addr == ctx_addr) {
+        Some(t) => Some(Arc::clone(t)),
+        None => {
+            let t = p.thread_by_ctx(ctx_addr);
+            caller.data_mut().nt_thread = t.clone();
+            t
+        }
+    };
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
-        nt::syscall(&p, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
+        nt::syscall_on(&p, t, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
     };
     // A callback inside that syscall may have ended the process or failed.
     if caller.data().exit.is_some() {
@@ -498,7 +511,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     // translations. NT images are never statically recompiled, so newly
     // mapped code needs nothing here.
     // The kernel lock only when something was recorded since the last look.
-    if gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
+    if gex_kernel::CODE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) != 0 && gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
         let (retired, _mapped) = caller
             .data_mut()
             .with_kernel(|k| (std::mem::take(&mut k.retired_code), std::mem::take(&mut k.new_code)));
@@ -571,7 +584,13 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
 /// NT syscalls by number (GEX_NT_STATS): ntdll's table and win32u's
 /// (0x1000 up).
 const UNIX_CALL_SLOT: usize = 0x1fff;
-/// Sampled syscalls by (number, thread, guest site) (GEX_NT_STATS).
+fn sites_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_NT_SYSCALL_SITES").as_deref() == Ok("1"))
+}
+
+/// Sampled syscalls by (number, thread, guest site) (GEX_NT_STATS with
+/// GEX_NT_SYSCALL_SITES=1).
 static SYSCALL_SITES: std::sync::Mutex<std::collections::BTreeMap<(u32, u32, u64), u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -847,6 +866,21 @@ struct CallerHost<'a, 'b> {
 }
 
 impl nt::NtHost for CallerHost<'_, '_> {
+    // The yield park on the wasm memory's own wait queue, so the guest's
+    // `memory.atomic.notify` (the ConcRT provider's kicks) ends it too.
+    fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
+        match self.caller.data().memory.as_ref() {
+            Some(m) => m.shared().atomic_wait32(addr, expected, Some(timeout)).is_ok(),
+            None => false,
+        }
+    }
+
+    fn notify(&self, addr: u64) {
+        if let Some(m) = self.caller.data().memory.as_ref() {
+            let _ = m.shared().atomic_notify(addr, u32::MAX);
+        }
+    }
+
     fn run_callback(&mut self) -> std::result::Result<(), ()> {
         match nested_loop(self.caller, self.p) {
             Ok(()) => Ok(()),
