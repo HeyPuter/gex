@@ -1882,7 +1882,10 @@ fn exec_program(
     let program = gex_ld::load_program(
         &bytes,
         gex_abi::PIE_BASE,
-        gex_abi::PIE_BASE + 0x1000_0000,
+        // Where `gexc run` and the browser put it: the kernel knows the
+        // loader by that address (its reservations for code stay below 4 GiB
+        // in a 64-bit memory).
+        gex_abi::INTERP_BASE,
         &|p| kernel.read_file(p),
     )
     .with_context(|| format!("execve: loading {}", req.path))?;
