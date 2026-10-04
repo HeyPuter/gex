@@ -311,7 +311,7 @@ fn read_recovery(dir: &Path) -> Result<Recovery> {
 /// The C a unit holds for the function at `entry`, from the cached recovery
 /// in `recovery` (`gexc cgen-c`): what to read when comparing one function's
 /// code with another backend's. `read` gives the image's bytes, for `ret N`.
-pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>) -> Result<String> {
+pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>, icall_hints: &HashMap<u64, u64>) -> Result<String> {
     let rec = read_recovery(recovery)?;
     let known: HashSet<u64> = rec.entries.iter().copied().collect();
     let mut gir = GirReader::open(recovery)?;
@@ -324,6 +324,7 @@ pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>)
         unit.ftab = true;
         unit.touched = rec.touched.clone();
         unit.guardfree = rec.guardfree.clone();
+        unit.icall_hints = std::sync::Arc::new(icall_hints.clone());
         unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
         unit.add(&f, &known, &rec.sums, &rec.trapfree)?;
         return Ok(unit.source());

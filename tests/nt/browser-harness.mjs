@@ -4,7 +4,7 @@
 // screenshots decoded for pixel checks.
 
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, rmSync, symlinkSync, statSync, createReadStream, readdirSync, openSync, readFileSync } from 'node:fs';
+import { existsSync, renameSync, mkdirSync, writeFileSync, rmSync, symlinkSync, statSync, createReadStream, readdirSync, openSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname, normalize, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,7 +47,10 @@ export function bundle(name, arch, trees, deps = []) {
     top.push(guest.split('/')[0]);
   }
   const skip = arch === 'x64' ? 'wine/drive_c/windows/syswow64' : 'wine/drive_c/windows/system32';
-  execFileSync('tar', ['-chf', out, '-C', stage, `--exclude=${skip}`, ...new Set(top)]);
+  // Through a temporary name: a failed tar must not leave a bundle that
+  // looks newer than its inputs.
+  execFileSync('tar', ['-chf', `${out}.tmp`, '-C', stage, `--exclude=${skip}`, ...new Set(top)]);
+  renameSync(`${out}.tmp`, out);
   log(`bundle ${out}: ${(statSync(out).size / 1048576).toFixed(0)} MiB`);
   return out;
 }

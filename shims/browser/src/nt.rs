@@ -139,8 +139,9 @@ mod imp {
         /// (leaving would resume at continuations no unit has entries for).
         fn serve_in_place();
         /// Monotonic nanoseconds (`performance.now()`): the page's `now` is
-        /// `Date.now()`, a millisecond clock that can step.
-        fn mono_ns() -> i64;
+        /// `Date.now()`, a millisecond clock that can step. An f64 (exact
+        /// for 104 days): an i64 is a BigInt in JS, per call.
+        fn mono_ns() -> f64;
         /// The compositor's scene for this process (see `crate::wl`).
         fn wl_publish(ptr: u32, count: u32);
         /// This process's compositor input ring (see `crate::wl`).
@@ -209,6 +210,12 @@ mod imp {
     /// `GEX_NT_TIME_SCALE`, as natively.
     static TIME_SCALE: AtomicU64 = AtomicU64::new(0);
     static MONO_START: AtomicU64 = AtomicU64::new(0);
+
+    /// `performance.now()` in nanoseconds, unscaled: for timing the host
+    /// (the glue's `now` is a BigInt, and only milliseconds in a Worker).
+    fn mono_raw() -> u64 {
+        unsafe { mono_ns() as u64 }
+    }
 
     fn mono() -> u64 {
         let now = unsafe { mono_ns() } as u64;
@@ -582,18 +589,20 @@ mod imp {
         let presents = p.presents.load(Ordering::Relaxed);
         if t / 1000 % 10 == 0 {
             report_times();
+            report_syscalls();
             // What every Worker's tables hold: `blocks` (dense) and the
             // slots each dispatch table is numbered to.
             let slots: Vec<String> = (0..gex_abi::DISPATCH_TABLES as u32).map(|k| crate::gex_claimed_slots(k).to_string()).collect();
             let (callouts, left) = crate::cgen::callouts();
             warn_line(&format!(
-                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={} exc_nested={} exc_escaped={}\n",
+                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={} exc_nested={} exc_escaped={} fjit={:?}\n",
                 crate::dense::gex_dense_size(),
                 slots.join("/"),
                 crate::dense::on() as u8,
                 crate::IN_PLACE_N.load(Ordering::Relaxed),
                 EXC_NESTED.load(Ordering::Relaxed),
-                EXC_ESCAPED.load(Ordering::Relaxed)
+                EXC_ESCAPED.load(Ordering::Relaxed),
+                crate::fjit::counts()
             ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
@@ -843,7 +852,20 @@ mod imp {
     /// nested callback loop) with the resume address set.
     pub(crate) fn syscall(p: &Arc<nt::Process>, ctx: i32, pc: i64) {
         let ctx_addr = ctx as u32 as u64;
-        tick();
+        // A clock read (`performance.now()`) costs about a microsecond in a
+        // Worker, as much as a cheap syscall: the clocks are brought up to
+        // date every 16th call and around waits, and the time split is
+        // sampled likewise (Noita's main thread makes ~10^5 NtYieldExecution
+        // a second).
+        let n = SYSCALL_N.with(|c| {
+            let n = c.get().wrapping_add(1);
+            c.set(n);
+            n
+        });
+        let sampled = n % SAMPLE == 0;
+        if sampled {
+            tick();
+        }
         if let Some((lo, bad, least)) = crate::stack_guard_check() {
             warn_line(&format!(
                 "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
@@ -862,8 +884,16 @@ mod imp {
         // nested exception dispatch needs to come back here.
         let next_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         let raise_sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
-        let (t_in, gl_in, glw_in) =
-            (crate::now_ns(), crate::gl::GL_NS.with(|g| g.get()), crate::gl::GL_WAIT_NS.with(|g| g.get()));
+        // Waits other than a yield are timed every time (they are few and
+        // long), everything else every SAMPLE-th call, counted SAMPLE times.
+        let wait = is_wait(nr);
+        let timed = sampled || (wait && nr != nt::sysno::ntdll::NtYieldExecution);
+        let scale = if timed && !sampled { 1 } else { SAMPLE };
+        let (t_in, gl_in, glw_in) = (
+            if timed { mono_raw() } else { 0 },
+            crate::gl::GL_NS.with(|g| g.get()),
+            crate::gl::GL_WAIT_NS.with(|g| g.get()),
+        );
         let outcome = {
             let mut host = Nested { ctx_addr };
             nt::syscall(p, &HostKernel, guest_bytes(), ctx_addr, pc as u64, &mut host)
@@ -871,19 +901,23 @@ mod imp {
         if TRACE_FOREIGN.load(Ordering::Relaxed) {
             crate::foreign_now("during", &nt::syscall_name(nr));
         }
+        count_syscall(nr);
         {
+            // GL time is the GL host's own clock, every call.
             let gl = crate::gl::GL_NS.with(|g| g.get()) - gl_in;
             let glw = (crate::gl::GL_WAIT_NS.with(|g| g.get()) - glw_in).min(gl);
-            let all = crate::now_ns().saturating_sub(t_in);
-            let name = nt::syscall_name(nr);
-            let wait = name.contains("Wait") || name.contains("Delay") || name.contains("Remove") || name.contains("Yield");
-            time_note(ctx_addr, if wait { 1 } else { 0 }, all.saturating_sub(gl));
+            if timed {
+                let all = mono_raw().saturating_sub(t_in);
+                time_note(ctx_addr, if wait { 1 } else { 0 }, all.saturating_sub(gl) * scale);
+            }
             time_note(ctx_addr, 2, gl - glw);
             time_note(ctx_addr, 4, glw);
         }
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
-        tick();
+        if timed {
+            tick();
+        }
         // Code that went away (an unmapped image, a protection change: LuaJIT
         // rewrites its machine code in place) loses its translations, as
         // natively. NT images are never statically recompiled, so newly mapped
@@ -1104,6 +1138,51 @@ mod imp {
         t
     }
 
+    /// Every how many NT syscalls a thread reads the clock (see `syscall`).
+    const SAMPLE: u64 = 16;
+
+    thread_local! {
+        static SYSCALL_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Whether syscall `nr` waits (its time is a wait, not NT work): by
+    /// name, worked out once per number rather than per call.
+    fn is_wait(nr: u32) -> bool {
+        static WAITS: OnceLock<Vec<bool>> = OnceLock::new();
+        let w = WAITS.get_or_init(|| {
+            (0..0x2000u32)
+                .map(|n| {
+                    let name = nt::syscall_name(n);
+                    name.contains("Wait") || name.contains("Delay") || name.contains("Remove") || name.contains("Yield")
+                })
+                .collect()
+        });
+        w.get(nr as usize).copied().unwrap_or(false)
+    }
+
+    /// NT syscalls by number since the last report (GEX_NT_STATS' `calls`
+    /// line): which calls a frame makes.
+    static SYSCALLS: [AtomicU64; 0x2000] = [const { AtomicU64::new(0) }; 0x2000];
+
+    fn count_syscall(nr: u32) {
+        if let Some(c) = SYSCALLS.get(nr as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The busiest syscalls since the last call, as `name n` pairs.
+    fn report_syscalls() {
+        let mut v: Vec<(u64, u32)> =
+            (0..SYSCALLS.len()).map(|i| (SYSCALLS[i].swap(0, Ordering::Relaxed), i as u32)).filter(|x| x.0 > 0).collect();
+        if v.is_empty() {
+            return;
+        }
+        let total: u64 = v.iter().map(|x| x.0).sum();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        let top: Vec<String> = v.iter().take(10).map(|(n, nr)| format!("{} {n}", nt::syscall_name(*nr))).collect();
+        warn_line(&format!("gex-nt: calls {total}: {}\n", top.join(", ")));
+    }
+
     fn time_note(ctx: u64, what: usize, ns: u64) {
         times_of(ctx).v[what].fetch_add(ns, Ordering::Relaxed);
     }
@@ -1234,10 +1313,11 @@ mod imp {
         if crate::tracing_exc() {
             let (n, l) = crate::cgen::callouts();
             crate::stderr_line(&format!(
-                "[nt] at exit: exc_nested={} exc_escaped={} callouts={n} callouts_left={l} in_place={}\n",
+                "[nt] at exit: exc_nested={} exc_escaped={} callouts={n} callouts_left={l} in_place={} fjit={:?}\n",
                 EXC_NESTED.load(Ordering::Relaxed),
                 EXC_ESCAPED.load(Ordering::Relaxed),
-                crate::IN_PLACE_N.load(Ordering::Relaxed)
+                crate::IN_PLACE_N.load(Ordering::Relaxed),
+                crate::fjit::counts()
             ));
         }
         with_host(|h| {

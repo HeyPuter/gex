@@ -858,7 +858,8 @@ export class Gex {
         now: () => this.#env.now(),
         // The NT layer's monotonic clock: `now` is `Date.now()`, a
         // millisecond wall clock that can step.
-        mono_ns: () => BigInt(Math.round(performance.now() * 1e6)),
+        // An f64, not an i64: a BigInt per call was most of an NT syscall's cost.
+        mono_ns: () => performance.now() * 1e6,
         // A Windows program's user-mode callback (docs/nt-layer.md §5): the
         // guest runs nested, inside the `syscall` import, until it returns.
         nt_callback: (ctx, pc) => this.#ntCallback(ctx >>> 0, pc),
@@ -1231,6 +1232,13 @@ export class Gex {
     this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(this.#dense ? (opts.dense === 2 ? 2 : 1) : 0);
+    // The function JIT (fjit.rs): its translations reach the function table,
+    // which the function tier's plumbing drives (units where any exist).
+    if (opts.fjit && e.gex_set_fjit) {
+      e.gex_set_fjit(opts.fjit === 2 ? 2 : 1);
+      if (opts.fjitMax != null || opts.fjitOnly) e.gex_fjit_limit?.(opts.fjitMax ?? 0xffffffff, BigInt(opts.fjitOnly ?? 0));
+      if (!this.#cgenMode) this.useCgen(1);
+    }
     this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
@@ -2421,7 +2429,11 @@ export class Gex {
     const ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
     const lookup = (ctx, addr) => {
       if (e.gex_ftab_behind()) this.#cgenCatchUp();
-      return e.gex_ftab_lookup(ctx, addr);
+      const idx = e.gex_ftab_lookup(ctx, addr);
+      // A translation the function JIT just published: in this Worker's
+      // table before `resolve` calls it.
+      if (e.gex_ftab_behind()) this.#cgenCatchUp();
+      return idx;
     };
     const gex = {
       memory: this.#memory,
@@ -2461,14 +2473,19 @@ export class Gex {
     // An export provider's module (`PROVIDER | number`, cgen.rs) installs as
     // a unit does, from its file in the unit cache.
     const prov = u >= 0x80000000 ? u - 0x80000000 : -1;
+    // A function JIT translation (`FJIT | n`, fjit.rs): its bytes are the shim's.
+    const jit = prov < 0 && u >= 0x40000000 ? u - 0x40000000 : -1;
     const mod = prov >= 0
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
+      : jit >= 0 ? this.#fjitModule(jit)
       : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
     // A stateful provider (docs/eject-pe.md §5.1): its data in the guest's
     // memory, this Worker's provider stack, and the provider_* imports.
     const memBase = prov >= 0 ? (e.gex_cgen_pmod_memory_base?.(prov) >>> 0) : 0;
-    const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c) : (b, c) => e.gex_cgen_regs(u, b, c);
-    const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
+    const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c)
+      : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
+      : (b, c) => e.gex_cgen_regs(u, b, c);
+    const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : jit >= 0 ? e.gex_fjit_slots(jit) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
     const inst = new WebAssembly.Instance(mod, {
       env: {
         memory: this.#memory,
@@ -2480,7 +2497,7 @@ export class Gex {
         // A stateful provider's is this Worker's (one C stack per thread).
         __stack_pointer: memBase ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
       },
-      gex: { ...this.#imports, lookup: st.lookup, ...(memBase ? this.#providerImports() : {}) },
+      gex: { ...this.#imports, lookup: st.lookup, ftab: st.ftab, ...(memBase ? this.#providerImports() : {}) },
     });
     if (memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     const n = regsOf(0, 0) >>> 0;
@@ -2500,6 +2517,9 @@ export class Gex {
       (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
     }
     st.instances.push(inst);
+    // The first Worker to install a JIT module writes the directory for the
+    // pages it numbered (idempotent).
+    if (jit >= 0) e.gex_fjit_installed(jit);
     return regs.length / 2;
   }
 
@@ -2614,6 +2634,25 @@ export class Gex {
     console.error(`gex-nt: region entries for ${path}: ${n}`);
   }
 
+  /** Function JIT module `n` (fjit.rs), compiled once per process from the
+   *  shim's bytes and offered to the siblings. Synchronous (a Worker). */
+  #fjitModule(n) {
+    const name = `fjit:${n}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    const e = this.#shim.exports;
+    const ptr = e.gex_fjit_ptr(n) >>> 0;
+    const bytes = this.#bytes().slice(ptr, ptr + (e.gex_fjit_len(n) >>> 0));
+    const dump = globalThis.process?.env?.GEX_FJIT_DUMP;
+    if (dump) globalThis.process.getBuiltinModule('fs').writeFileSync(`${dump}/fjit-${n}.wasm`, bytes);
+    const t0 = performance.now();
+    mod = new WebAssembly.Module(bytes);
+    this.#compileMs += performance.now() - t0;
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
+  }
+
   /** Replay the function table's log this Worker has not seen: installs,
    *  and retirements (back to `resolve`). */
   #cgenCatchUp() {
@@ -2639,6 +2678,12 @@ export class Gex {
    *  its entry list does. */
   #cgenServe() {
     const e = this.#shim.exports;
+    // A Worker with the function JIT on but no units of its own still
+    // replays the function table's log.
+    if (!this.#cgenMode && e.gex_fjit_on?.()) {
+      this.#cgenCatchUp();
+      return;
+    }
     if (!this.#cgenMode || !e.gex_cgen_wanted) return;
     for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
       const t0 = performance.now();
@@ -3535,7 +3580,7 @@ export class Gex {
     this.#callouts.push(c);
     this.#nest.push('callout');
     this.#calloutsMade++;
-    if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && (this.#calloutsMade & (this.#calloutsMade - 1)) === 0)) {
+    if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
       console.error(`[callout] #${this.#calloutsMade} depth ${me}: ${BigInt.asUintN(64, target).toString(16)} returning to ${c.ret.toString(16)}`);
     }
     let pc = BigInt.asUintN(64, target);

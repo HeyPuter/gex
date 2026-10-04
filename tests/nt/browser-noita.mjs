@@ -24,9 +24,10 @@
 // Needs everything browser-gui.mjs does, plus web/public/gex/gex-wgpu-replay.*
 // (web/build-mesa-wasm.sh).
 
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, rmSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { bundle, openPage, sleep, log, WEB, summariseProfile } from './browser-harness.mjs';
+import { execFileSync } from 'node:child_process';
+import { bundle, openPage, sleep, log, WEB, STATE, PREFIX, summariseProfile } from './browser-harness.mjs';
 import { aotCounts, aotLine } from './aot-share.mjs';
 
 const argv = process.argv.slice(2);
@@ -40,16 +41,44 @@ const minutes = Number(opt('--minutes', gameplay ? 45 : 30));
 const measure = Number(opt('--measure', 300));
 const noita = opt('--noita', join(process.env.HOME, 'src/noita-wasm/Noita'));
 const keep = argv.includes('--keep');
+// NOITA_WORLD_SEED (default 1767225600, as port/bench.cjs; 0 = the engine's
+// random world): port/seedpin's mod in a farm of the install, enabled in the
+// page's save (docs/noita-perf.md). GEX_NT_FIXED_TIME alone does not fix it.
+const worldSeed = Number(process.env.NOITA_WORLD_SEED ?? 1767225600);
+const seedpin = process.env.NOITA_SEEDPIN || join(process.env.HOME, 'src/noita-wasm/port/seedpin');
+// The guest word on the stats line: the world's frame counter, or
+// NOITA_PEEK=0x1205004 for the world seed (a check run; no fps then).
+const peekAt = process.env.NOITA_PEEK || '0x122374c*';
+// With units (`cgen=` in GEX_NT_PAGE_FLAGS) a run is only trusted with a unit
+// for every image and the AOT share at NOITA_MIN_AOT% (default 99) or more.
+const cgen = /[?&]cgen=[1-9]/.test(process.env.GEX_NT_PAGE_FLAGS ?? '');
+const minAot = Number(process.env.NOITA_MIN_AOT ?? (cgen ? 99 : 0));
+
+// The install as symlinks plus mods/seedpin, and the save's mod_config.xml
+// in the prefix (a new file: the prefix may be a hard-linked copy).
+function pinSeed() {
+  const farm = join(STATE, `noita-farm-${worldSeed}`);
+  rmSync(farm, { recursive: true, force: true });
+  execFileSync('sh', [join(seedpin, 'pin.sh'), 'farm', farm], { env: { ...process.env, NOITA_WORLD_SEED: String(worldSeed) } });
+  const save = join(PREFIX, 'drive_c/users/gex/AppData/LocalLow/Nolla_Games_Noita/save00');
+  mkdirSync(save, { recursive: true });
+  rmSync(join(save, 'mod_config.xml'), { force: true });
+  copyFileSync(join(seedpin, 'mod_config.xml'), join(save, 'mod_config.xml'));
+  log(`world seed pinned to ${worldSeed} (${farm})`);
+  return farm;
+}
 
 async function main() {
   for (const f of ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm']) {
     if (!existsSync(join(WEB, 'public/gex', f))) throw new Error(`no web/public/gex/${f}: run web/build-mesa-wasm.sh`);
   }
-  const tar = bundle('noita', 'x86', { noita }, [join(noita, 'noita.exe')]);
+  const tar = worldSeed
+    ? bundle(`noita-seed${worldSeed}`, 'x86', { noita: pinSeed() }, [join(noita, 'noita.exe'), join(seedpin, 'init.lua'), join(seedpin, 'mod_config.xml')])
+    : bundle('noita', 'x86', { noita }, [join(noita, 'noita.exe')]);
   const t0 = Date.now();
   // GEX_NT_PAGE_ENV: more of the page's environment, comma-separated
   // (GEX_NT_PAGE_FLAGS: more query flags, `&name=value`).
-  const env = ['GEX_NT_STATS=1', ...(gameplay ? ['GEX_NT_PEEK=0x122374c*'] : []),
+  const env = ['GEX_NT_STATS=1', ...(gameplay ? [`GEX_NT_PEEK=${peekAt}`] : []),
     ...(process.env.GEX_NT_PAGE_ENV ? [process.env.GEX_NT_PAGE_ENV] : [])].join(',');
   const { browser, page, evaluate, state, shot, consoleLines, profile } = await openPage(
     `tar=/gex/nt/${tar.split('/').pop()}&exe=/noita/noita.exe&cwd=/noita&gl=1&glbackend=wgpu`
@@ -113,6 +142,12 @@ async function main() {
     // A Worker that threw is a guest thread gone: the run cannot recover.
     const threw = consoleLines.find((l) => /\[gex\] pid \d+:\d+ threw:|execute fault|\[harness\] the page crashed/.test(l));
     if (threw) throw new Error(`a thread died: ${threw.slice(0, 600)}`);
+    if (cgen) {
+      // The NT trampolines included (`gexc cgen-image --nt-trampolines32`):
+      // without their unit every syscall stub is a call-out, 20x slower.
+      const missing = consoleLines.find((l) => /no function-tier unit|no provider module/.test(l));
+      if (missing) throw new Error(`not every image has its unit, the run would be on tier-1: ${missing.slice(0, 400)}`);
+    }
     const p = stats();
     if (steps.length && p.n >= last + steps[0].after) {
       const w = await window_();
@@ -160,7 +195,13 @@ async function main() {
           if (shotDir) writeFileSync(join(shotDir, `${file}.cpuprofile`), JSON.stringify(prof));
         }
         // As GEX_NT_STATS' line natively (tests/nt/aot-share.mjs).
-        console.log(`ok   ${aotLine(aotCounts(profs.map((x) => x.profile)))}`);
+        const line = aotLine(aotCounts(profs.map((x) => x.profile)));
+        const aot = Number(/AOT ([\d.]+)%/.exec(line)?.[1] ?? 0);
+        if (aot < minAot) throw new Error(`${line}: under ${minAot}%`);
+        console.log(`ok   ${line}`);
+        // The measurement starts after the profile, which slows the Workers.
+        const q = stats();
+        world = { ...world, t: q.t, n: q.n, peek: q.peek };
       }
       if (world && p.t - world.t >= measure * 1000) {
         const secs = (p.t - world.t) / 1000;

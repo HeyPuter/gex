@@ -356,8 +356,22 @@ impl FnUnit {
             return out;
         }
         for (i, b) in f.blocks.iter().enumerate() {
-            let FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } = &b.term else { continue };
-            if !known.contains(t) || trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
+            // A direct call to a function of this unit, or an indirect one
+            // devirtualised to one (`icall_hints`: its fallback writes the
+            // carried registers back and reloads them). A trap-free callee
+            // too: what it never touches need not be stored for it either
+            // (pewasm's A*(g)).
+            let (t, r) = match &b.term {
+                FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } => (t, r),
+                FTerm::Call { callee: Callee::Indirect(_), ret: Some(r), ret_pc } if devirt_carry() => {
+                    match self.icall_hints.get(ret_pc).filter(|k| known.contains(*k)) {
+                        Some(k) => (k, r),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if !known.contains(t) || (trapfree.contains_key(t) && !trapfree_carry()) || mutate("IGNOREUNWIND") {
                 continue;
             }
             let Some(sm) = sums.get(t) else { continue };
@@ -907,7 +921,13 @@ impl FnUnit {
                             let n = sm.inputs.union(live[r.to.index()]).union(RegSet::of(&[sp_reg()]));
                             if trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
                                 self.stats.calls_trapfree += 1;
-                                n
+                                match self.carry.get(&i) {
+                                    Some(c) => {
+                                        leave_wb = *c;
+                                        n.minus(leave_wb)
+                                    }
+                                    None => n,
+                                }
                             } else if let Some(c) = self.carry.get(&i) {
                                 self.stats.calls_minimal += 1;
                                 leave_wb = *c;
@@ -918,6 +938,14 @@ impl FnUnit {
                         }
                         None => RegSet::ALL,
                     },
+                    // Devirtualised (`carried`): the hinted callee keeps what
+                    // it never touches in locals; the fallback stores those
+                    // itself.
+                    (Callee::Indirect(_), Some(_)) if self.carry.contains_key(&i) => {
+                        leave_wb = self.carry[&i];
+                        let all = if flags_abi() { non_flags() } else { RegSet::ALL };
+                        all.minus(leave_wb)
+                    }
                     // No callee reads the flags it is entered with
                     // (`flags_abi`).
                     _ if flags_abi() => non_flags(),
@@ -950,6 +978,9 @@ impl FnUnit {
                         // call what the table has for it instead.
                         if trapfree.contains_key(t) {
                             e.line(format!("  if (__builtin_expect({}, 0)) {{", patched_test(*t)));
+                            // The carried registers too: whatever runs
+                            // instead may read them.
+                            e.mark_dirty(carried);
                             e.flush_keep();
                             ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                             reload_all(e);
@@ -997,13 +1028,40 @@ impl FnUnit {
                                 };
                                 let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, k);
                                 e.line(format!("  {{ const uint64_t ft = {t};"));
-                                e.line(format!(
-                                    "    if (__builtin_expect(ft == 0x{k:x}ull{guard}, 1)) {{ if (!{callee_c}(ctx, {depth}, {need_back}, {ret_arg})) {fail} }}"
-                                ));
-                                e.line(format!(
-                                    "    else {{ GEX_C64({}u) = ft; if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need_back}, {ret_arg})) {fail} }} }}",
-                                    ctx::LAST_TARGET
-                                ));
+                                if carried.is_empty() {
+                                    e.line(format!(
+                                        "    if (__builtin_expect(ft == 0x{k:x}ull{guard}, 1)) {{ if (!{callee_c}(ctx, {depth}, {need_back}, {ret_arg})) {fail} }}"
+                                    ));
+                                    e.line(format!(
+                                        "    else {{ GEX_C64({}u) = ft; if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need_back}, {ret_arg})) {fail} }} }}",
+                                        ctx::LAST_TARGET
+                                    ));
+                                } else {
+                                    // The hinted callee never touches the
+                                    // carried registers: they stay in locals,
+                                    // and are stored only if it leaves. Any
+                                    // other target gets them stored first,
+                                    // and may change them: reloaded after.
+                                    e.line(format!("    if (__builtin_expect(ft == 0x{k:x}ull{guard}, 1)) {{"));
+                                    e.line(format!("    if (!{callee_c}(ctx, {depth}, {need_back}, {ret_arg})) {{"));
+                                    e.mark_dirty(carried);
+                                    e.flush_keep_live(leave_wb);
+                                    e.line(format!("      {fail}"));
+                                    e.line("    }");
+                                    e.line("    } else {");
+                                    e.flush_keep_live(leave_wb);
+                                    e.line(format!(
+                                        "    GEX_C64({}u) = ft; if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need_back}, {ret_arg})) {fail}",
+                                        ctx::LAST_TARGET
+                                    ));
+                                    let back: Vec<GuestReg> = e
+                                        .func_regs
+                                        .as_ref()
+                                        .map(|fr| fr.used.iter().copied().filter(|r| leave_wb.contains(*r)).collect())
+                                        .unwrap_or_default();
+                                    e.load_regs(&back);
+                                    e.line("    } }");
+                                }
                             }
                             None => ftab_call(e, &t, &depth, need_back, &ret_arg, fail),
                         }
@@ -1062,6 +1120,9 @@ impl FnUnit {
                     Callee::Direct(t) if known.contains(t) && live_writebacks() => {
                         sums.get(t).map(|sm| sm.preserved.minus(RegSet::of(&[sp_reg()])))
                     }
+                    // Devirtualised with carried registers: the hinted
+                    // callee kept them, the fallback reloaded them.
+                    Callee::Indirect(_) if !leave_wb.is_empty() => Some(leave_wb),
                     _ => None,
                 };
                 match (ret, preserved) {
@@ -1818,6 +1879,22 @@ pub fn local_resume() -> bool {
 pub fn minimal_writeback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| live_writebacks() && std::env::var("GEX_CGEN_WB").as_deref() != Ok("all"))
+}
+
+/// `minimal_writeback` at calls to trap-free callees as well: the live
+/// registers they never touch stay in locals across them instead of being
+/// stored before and trusted after. `GEX_CGEN_WB_TRAPFREE=0` turns it off.
+pub fn trapfree_carry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_CGEN_WB_TRAPFREE").as_deref() != Ok("0"))
+}
+
+/// `minimal_writeback` at devirtualised indirect calls, for the hinted
+/// callee; the fallback stores the carried registers and reloads them.
+/// `GEX_CGEN_WB_DEVIRT=0` turns it off.
+pub fn devirt_carry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_CGEN_WB_DEVIRT").as_deref() != Ok("0"))
 }
 
 pub fn non_flags() -> RegSet {

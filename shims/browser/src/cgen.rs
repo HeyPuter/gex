@@ -154,9 +154,16 @@ pub(crate) fn on() -> bool {
 }
 
 /// Turn the function tier on (1) or require it for program images (2). Before
-/// the process boots, so the exe and ntdll are seen.
+/// the process boots, so the exe and ntdll are seen. Bit 2 (4) selects the
+/// unguarded flavor of i386 units (the native one, `:unguarded` keys): in
+/// the browser the guarded flavor guards only at the memory's end, as the
+/// unguarded one traps there by itself (docs/browser-units-plan.md).
 #[no_mangle]
 pub extern "C" fn gex_cgen_set_mode(mode: u32) {
+    if mode & 4 != 0 {
+        gex_cgen::image::set_unguarded(true);
+    }
+    let mode = mode & 3;
     MODE.store(mode.min(2), Ordering::Relaxed);
     if mode == 0 {
         return;
@@ -383,7 +390,7 @@ pub extern "C" fn gex_cgen_wanted() -> i32 {
 }
 
 /// `v` into a buffer of the shim's heap (above the guest's limit).
-fn put_u32s(v: &[u32], buf: u32) {
+pub(crate) fn put_u32s(v: &[u32], buf: u32) {
     let out = crate::shim_slice_mut(buf, 4 * v.len() as u32);
     for (c, x) in out.chunks_exact_mut(4).zip(v) {
         c.copy_from_slice(&x.to_le_bytes());
@@ -510,7 +517,7 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
 /// flattened for JS (a dense slot gets an index of its own in `blocks`,
 /// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
 /// dispatch table must hold.
-fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
+pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
     crate::with_host(|h| {
         let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
         let mut new_pages = Vec::new();
@@ -803,7 +810,7 @@ pub extern "C" fn gex_cgen_pmod_installed(number: u32) {
     write_dirs(dirs);
 }
 
-fn write_dirs(dirs: Vec<(u64, u32)>) {
+pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
     crate::with_host(|h| {
         let mut gm = GuestMem::new(crate::guest_bytes());
         for (page, base) in dirs {
@@ -813,6 +820,17 @@ fn write_dirs(dirs: Vec<(u64, u32)>) {
             }
         }
     });
+}
+
+/// Publish a module of `len` slots into the function table (`pairs`: guest
+/// address, slot): its install's number.
+pub(crate) fn publish(len: u32, module: u32, tier: Tier, pairs: &[(u64, u32)]) -> u32 {
+    ftab(|m| m.publish(len, module, tier, pairs))
+}
+
+/// The function table index serving `addr` now, if any.
+pub(crate) fn index_of(addr: u64) -> Option<u32> {
+    ftab(|m| m.get(addr).map(|f| f.idx))
 }
 
 /// How many units are published: a Worker installs up to this many.
@@ -906,18 +924,24 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let mem = crate::guest_bytes();
     let hit = ftab(|m| {
         let f = m.get(addr)?;
-        let page = addr / gex_abi::DISPATCH_PAGE;
-        let patched = mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
-        // A provider serves the export whatever its bytes became: Noita's
-        // mod sandbox rewrites lua51's entry points, which the Lua provider
-        // replaces (as natively, ftab.rs `current`).
-        let provider = m.install(f.install).module >= PROVIDER;
-        if patched && !provider {
+        let stale = if m.install(f.install).tier == Tier::Jit {
+            !crate::fjit::current(f.install)
+        } else {
+            let page = addr / gex_abi::DISPATCH_PAGE;
+            let patched = mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
+            // A provider serves the export whatever its bytes became: Noita's
+            // mod sandbox rewrites lua51's entry points, which the Lua provider
+            // replaces (as natively, ftab.rs `current`).
+            patched && m.install(f.install).module < PROVIDER
+        };
+        if stale {
             m.retire(addr);
             return None;
         }
         Some(f.idx)
     });
+    // Nothing serves it: the function JIT makes it, if it is on.
+    let hit = hit.or_else(|| crate::fjit::translate(addr));
     let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);
     gex_kernel::ftab::fcache_write(mem, addr, idx);
     idx as i32

@@ -74,7 +74,9 @@ async function main() {
   if (q.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
   if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
-  if (q.get('cgen')) globalThis.GEX_CGEN = Number(q.get('cgen'));
+  // cgen=1|2 (prefer|require units); unguarded=1 adds 4: the native,
+  // unguarded flavor of i386 units.
+  if (q.get('cgen')) globalThis.GEX_CGEN = Number(q.get('cgen')) | (q.get('unguarded') === '1' ? 4 : 0);
   // An ejected project's page (gexc eject): its units, and no translation.
   if (q.get('cgenurl')) globalThis.GEX_CGEN_URL = q.get('cgenurl');
   if (q.get('aot') === '1') globalThis.GEX_NO_JIT = 1;

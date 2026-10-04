@@ -159,6 +159,10 @@ usage:
                                    NT layer maps the image at that base. Run it
                                    with a memory cap: recovery of a large image
                                    is the peak
+  gexc cgen-image --nt-trampolines32|--nt-trampolines64 [--jobs N]
+                                   the NT trampoline page's unit, which the
+                                   native host builds at boot; the browser
+                                   needs it built ahead (GEX_CGEN_GUARD=1)
   gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only] [--append]
                                    compile a staged Wine prefix's core DLLs
                                    (tools/nt-cgen-core.txt, or --set) for the
@@ -2280,7 +2284,9 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
         None => gex_native::nt_cgen::cache_root()?.join("recovery").join(gex_native::nt_cgen::recovery_key(&image)),
     };
     let read = |a: u64| image.segments.iter().find_map(|s| s.byte(a));
-    print!("{}", gex_cgen::image::function_c(&dir, at, &read)?);
+    // The image's indirect-call profile, as its unit build uses it.
+    let hints = gex_native::nt_cgen::icall_hints(&image);
+    print!("{}", gex_cgen::image::function_c(&dir, at, &read, &hints)?);
     Ok(())
 }
 
@@ -2299,11 +2305,21 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
                 i += 1;
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
             }
+            // The NT trampoline page (i386 with --nt-trampolines32): built
+            // at boot natively, ahead of time for the browser.
+            t @ ("--nt-trampolines32" | "--nt-trampolines64") => path = Some(t.to_string()),
             other => path = Some(other.to_string()),
         }
         i += 1;
     }
     let path = path.context("expected a PE image")?;
+    if let Some(w) = path.strip_prefix("--nt-trampolines") {
+        let _lock = gex_native::nt_cgen::build_lock()?;
+        let t0 = std::time::Instant::now();
+        let out = gex_native::nt_cgen::prepare_trampolines(w == "32", jobs)?;
+        eprintln!("the NT trampolines ({w}-bit): {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     let base = pe_base.unwrap_or(pe.preferred_base);
