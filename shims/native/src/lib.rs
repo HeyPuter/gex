@@ -189,6 +189,9 @@ struct HostState {
     proc_state: Arc<Mutex<ProcState>>,
     /// Set when a host function decided the run must stop.
     exit: Option<Exit>,
+    /// Set with `exit` when only this thread ends (`exit` with others left),
+    /// not the process.
+    thread_only: bool,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
     /// Why `resume_at` was set (GEX_NT_STATS only; `note_resume`).
@@ -260,6 +263,10 @@ struct SpawnContext {
     stopping: Arc<std::sync::atomic::AtomicBool>,
     /// How many spawned threads have not yet noticed.
     running: Arc<std::sync::atomic::AtomicUsize>,
+    /// How the process ended when a thread other than the first ended it
+    /// (`exit_group`, a fatal signal, a gex failure): the first thread only
+    /// sees `stopping`, and reports this instead of its own way out.
+    ended: Arc<Mutex<Option<Exit>>>,
     engine: Engine,
     /// The image module, instantiated fresh in each thread's store.
     image_module: Module,
@@ -882,6 +889,7 @@ fn run_program_with(
             memory: None,
             proc_state,
             exit: None,
+            thread_only: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -1035,6 +1043,7 @@ fn run_program_with(
         wayland: compositor.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ended: Arc::new(Mutex::new(None)),
         engine: engine.clone(),
         image_module: module.clone(),
         linker: base_linker,
@@ -1095,6 +1104,9 @@ fn run_program_with(
     let Stopped::Exited(exit) = stopped else {
         unreachable!()
     };
+    // Another thread may have ended the process (this one then only saw
+    // `stopping`).
+    let exit = spawn.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit);
 
     // The process is over. Every other thread must stop before the stores and
     // memory go away: set the stopping flag and wake anyone parked on a futex,
@@ -1576,17 +1588,29 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
         .name(format!("gex-tid-{}", child.tid))
         .stack_size(guest_thread_stack())
         .spawn(move || {
-            if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
-                eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                // A thread that fails takes its process with it, as on
-                // Linux: otherwise the other threads sit in a futex
-                // forever and every descriptor it holds stays open.
-                stop_other_threads(&cx, false);
-                cx.kernel
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .fds
-                    .close_all();
+            match run_guest_thread(Arc::clone(&cx), child) {
+                Err(e) => {
+                    eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                    // A thread that fails takes its process with it, as on
+                    // Linux: otherwise the other threads sit in a futex
+                    // forever and every descriptor it holds stays open.
+                    end_process(&cx, Exit::Signal {
+                        signal: signal::SIGSEGV,
+                        pc: 0,
+                        detail: format!("thread {} failed: {e:#}", child.tid),
+                        internal: true,
+                    });
+                    cx.kernel
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .fds
+                        .close_all();
+                }
+                // `exit_group` or a fatal signal on this thread: the process
+                // ends with it, and the first thread, parked in a futex
+                // (`pthread_join`) or running, must hear how.
+                Ok(Some(exit)) => end_process(&cx, exit),
+                Ok(None) => {}
             }
             running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         })
@@ -1694,6 +1718,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         wayland: cx.wayland.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ended: Arc::new(Mutex::new(None)),
         engine: cx.engine.clone(),
         image_module: cx.image_module.clone(),
         linker: cx.linker.clone(),
@@ -1775,6 +1800,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
+            thread_only: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -1832,7 +1858,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
     match stopped {
         Stopped::Exited(exit) => {
             stop_other_threads(&cx, false);
-            Ok(exit)
+            Ok(cx.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit))
         }
         Stopped::Exec(req) => {
             // The child is usually the one that execs: this is the shell's
@@ -1930,7 +1956,9 @@ fn exec_program(
 }
 
 /// A guest thread: its own store, its own instances, the same memory.
-fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
+/// Run one spawned thread to its end. `Some` when its end is the process's
+/// (`exit_group`, a fatal signal), not just its own.
+fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option<Exit>> {
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -1939,6 +1967,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
+            thread_only: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -2003,10 +2032,25 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
     };
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
     profile::harvest(&mut store)?;
-    if let Stopped::Exec(_) = stopped {
-        bail!("execve from a non-main thread is not supported");
+    match stopped {
+        Stopped::Exec(_) => bail!("execve from a non-main thread is not supported"),
+        // Stopped because another thread ended the process: that one says how.
+        Stopped::Exited(_) if cx.stopping.load(std::sync::atomic::Ordering::Acquire) => Ok(None),
+        Stopped::Exited(_) if store.data().thread_only => Ok(None),
+        Stopped::Exited(exit) => Ok(Some(exit)),
     }
-    Ok(())
+}
+
+/// A thread other than the first ended the process with `exit`: keep the
+/// first such end and stop every thread.
+fn end_process(cx: &SpawnContext, exit: Exit) {
+    {
+        let mut ended = cx.ended.lock().unwrap_or_else(|e| e.into_inner());
+        if ended.is_none() && !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            *ended = Some(exit);
+        }
+    }
+    stop_other_threads(cx, false);
 }
 
 /// Instantiate every registry entry into this store, outside a wasm frame.
@@ -2884,6 +2928,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 SyscallOutcome::ThreadExit => {
                     state.exit = Some(Exit::Status(0));
+                    state.thread_only = true;
                     Err(StopExecution.into())
                 }
                 SyscallOutcome::Killed { signal, core } => {
