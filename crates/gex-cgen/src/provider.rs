@@ -40,6 +40,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("debug_string", include_str!("../providers/debug_string.c")),
     ("crt_heap", include_str!("../providers/crt_heap.c")),
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
+    ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
 ];
 
 /// Files a stateful provider may `#include` (written beside it when built).
