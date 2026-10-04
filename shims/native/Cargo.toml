@@ -20,6 +20,7 @@ gex-gl = { workspace = true, features = ["host"] }
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-cgen.workspace = true
+gex-ir.workspace = true
 
 anyhow = "1"
 # `parallel-compilation` is not a default here because `default-features` is
@@ -43,5 +44,4 @@ x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]
 ppc = ["gex-abi/ppc", "gex-xlate/ppc", "gex-kernel/ppc"]
 
 [dev-dependencies]
-gex-ir.workspace = true
 gex-emit.workspace = true

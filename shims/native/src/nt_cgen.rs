@@ -309,7 +309,8 @@ pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Pa
     let mut want: Vec<u64> = pcs.iter().copied().filter(|a| !have.contains(a) && pv.stubs.binary_search(a).is_err()).collect();
     want.sort_unstable();
     want.dedup();
-    let list = want.iter().map(|a| format!("{a:#x}\n")).collect::<String>();
+    // v3: call continuations of the enclosing functions, and direct callees.
+    let list = String::from("v3\n") + &want.iter().map(|a| format!("{a:#x}\n")).collect::<String>();
     if want.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
         return Ok(Vec::new());
@@ -334,13 +335,66 @@ pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Pa
         starts.entry(e).or_default().add(Source::Call);
     }
     let noreturn = std::collections::BTreeSet::new();
+    // A recorded call continuation means the frame of the function it
+    // continues was discarded once (an exception resumed past it), and from
+    // then on that function's code runs from regions, whose frames the next
+    // resume discards in turn. So every call continuation of such a function
+    // gets a region too (the recording saw only the first: tier-1 ran the
+    // rest). The function is the unit's nearest entry at or below the PC.
+    let mut sorted: Vec<u64> = have.iter().copied().collect();
+    sorted.sort_unstable();
+    let mut enclosing: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for &pc in &want {
+        let i = sorted.partition_point(|&e| e <= pc);
+        if i > 0 {
+            enclosing.insert(sorted[i - 1]);
+        }
+    }
+    let mut extra: Vec<u64> = Vec::new();
+    for &e in &enclosing {
+        let mut st = starts.clone();
+        let f = func::recover_one(&code, e, &mut st, &noreturn, &RecoverOptions::default());
+        let rets: Vec<u64> = f
+            .blocks
+            .iter()
+            .filter_map(|b| match b.term {
+                gex_ir::func::FTerm::Call { ret_pc, .. } => Some(ret_pc),
+                _ => None,
+            })
+            .collect();
+        if rets.iter().any(|r| want.binary_search(r).is_ok()) {
+            extra.extend(rets.into_iter().filter(|r| !have.contains(r) && pv.stubs.binary_search(r).is_err()));
+        }
+    }
+    let n_recorded = want.len();
+    want.extend(extra);
+    want.sort_unstable();
+    want.dedup();
+    if want.len() > n_recorded {
+        eprintln!("[regions] {base:#x}: {n_recorded} recorded, {} with the call continuations of their functions", want.len());
+    }
     let mut batch = std::collections::BTreeMap::new();
     let mut failed = Vec::new();
-    for &pc in &want {
+    // Closed under direct calls and tail calls: a callee the unit lacks
+    // (code recovery reached only from here, as from a landing pad) is a
+    // region function too, or the first call to it would stop the run.
+    let mut queue: std::collections::VecDeque<u64> = want.iter().copied().collect();
+    let mut seen: std::collections::HashSet<u64> = want.iter().copied().collect();
+    while let Some(pc) = queue.pop_front() {
         let mut st = starts.clone();
         let f = func::recover_one(&code, pc, &mut st, &noreturn, &RecoverOptions::default());
         match f.verify() {
             Ok(()) => {
+                for b in &f.blocks {
+                    let t = match b.term {
+                        gex_ir::func::FTerm::Call { callee: gex_ir::func::Callee::Direct(t), .. } => t,
+                        gex_ir::func::FTerm::TailCall { callee: gex_ir::func::Callee::Direct(t) } => t,
+                        _ => continue,
+                    };
+                    if !have.contains(&t) && code.is_code(t) && pv.stubs.binary_search(&t).is_err() && seen.insert(t) {
+                        queue.push_back(t);
+                    }
+                }
                 batch.insert(pc, f);
             }
             Err(e) => {
@@ -348,6 +402,9 @@ pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Pa
                 failed.push(pc);
             }
         }
+    }
+    if batch.len() + failed.len() > want.len() {
+        eprintln!("[regions] {base:#x}: {} more reached by direct calls", batch.len() + failed.len() - want.len());
     }
     let sums = gex_xlate::summary::analyze_functions(&batch).map;
     let funcs = gex_cgen::select(batch.into_values().collect(), &HashMap::new(), &std::collections::HashSet::new())?;
@@ -359,7 +416,11 @@ pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Pa
     let _ = std::fs::remove_dir_all(dir.join("work"));
     std::fs::write(dir.join("pcs.txt"), &list)?;
     let got: std::collections::HashSet<u64> = gex_cgen::image::read_entries(&out)?.into_iter().collect();
-    let more: Vec<u64> = want.iter().copied().filter(|a| !got.contains(a) && !failed.contains(a)).collect();
+    // Only recorded PCs count as failures: a continuation added above that
+    // select() refused is reported by the run if it is ever reached.
+    let recorded: std::collections::HashSet<u64> = pcs.iter().copied().collect();
+    failed.retain(|a| recorded.contains(a));
+    let more: Vec<u64> = want.iter().copied().filter(|a| recorded.contains(a) && !got.contains(a) && !failed.contains(a)).collect();
     failed.extend(more);
     Ok(failed)
 }
