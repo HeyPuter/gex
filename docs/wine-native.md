@@ -171,13 +171,28 @@ The plan does the same with **wasm32 as Wine's host architecture**:
 - **Native Unix libraries,** in priority order: ntdll.so, win32u.so,
   winewayland.drv, opengl32, ws2_32, crypt32, secur32, dnsapi, nsiproxy,
   winepulse/winealsa (audio, §6), then winevulkan.
-- **wineserver as wasm,** first as a gex-kernel process over a Unix socket
-  with SCM_RIGHTS and shared memory, all of which gex-kernel supports.
-- **Faster sync:** Wine 11 supports the ntsync driver
-  (`dlls/ntdll/unix/sync.c`). gex-kernel implementing `/dev/ntsync`
-  removes the server round trip from waits, mutexes and events; that
-  matters for Noita's job chain.
-- **Later:** wineserver in-process with a direct-call transport.
+- **wineserver in-process (decided after W0(a), 2026-10-04).** wineserver
+  shares coherent `MAP_SHARED` memory with its clients: session objects,
+  and since Wine 9 the queue and desktop state win32u reads directly. gex
+  processes have separate linear memories, and in the browser separate
+  `WebAssembly.Memory`s cannot alias. So wineserver runs as a thread of the
+  Windows process: `clone(CLONE_VM)` without `CLONE_FILES`, i.e. the same
+  memory but its own fd table, its own module instance and its own data
+  region. Its protocol stays Wine's (the Unix socket, SCM_RIGHTS, the
+  request and reply pipes), so the server and ntdll.so are unmodified Wine.
+  - It needs gex-kernel to support a long-lived `CLONE_VM` process (shared
+    memory, separate fd table and pid).
+  - Several Windows processes in one session share one address space.
+    That fits i386 programs (2 GiB each at most) only with memory64; until
+    then, one Windows process per session, which covers the games.
+  - **Later:** a direct-call transport in place of the socket.
+- **Sync through ntsync.** Wine 11 supports the ntsync driver
+  (`dlls/ntdll/unix/sync.c`). gex-kernel implements `/dev/ntsync`, and its
+  ioctls (semaphores, mutexes, events, wait-any/all) go to the kernel's
+  futex machinery. Waits, mutexes and events then never reach wineserver,
+  which matters for Noita's job chain. The server round trip that is left
+  (W0(a): 1.07 ms, from the native host's 1 ms fd polling) needs
+  event-driven fd wakeups in gex-kernel before W3.
 
 ### 3.6 Graphics and input
 
@@ -297,8 +312,15 @@ numbering, gex's compat conversions". Where gex's i386 layer passes a
 structure through unconverted, musl's wasm32 layout must match gex-kernel's
 native one. The case so far is `fcntl` locks: gex hands F_GETLK64 (12–14)
 through unmapped, so wasm32 uses 5/6/7 with the 64-bit `struct flock`.
-A proper `wasm32` personality in gex-kernel would remove this coupling.
-That is a shared-ABI change, proposed for W1, not made.
+**Decided (coordinator, 2026-10-04): a `wasm32` personality in gex-kernel,
+in W1.** It is additive: a new personality whose structure layouts are
+defined to match musl's `arch/wasm32` (64-bit members 8-aligned, 64-bit
+`time_t`, `struct stat` as musl's own). The i386 paths stay unchanged, and
+tests cover both. Its ABI is written here when it is built (§3.11).
+
+**The ICALL check (decided).** The LLVM pass emits the select form measured
+in W0(c): `idx = p < 0x400000 ? p : exit_stub[sig]`, the guest address
+in a per-thread wasm global, then one `call_indirect`.
 
 ### 3.9 x64 programs (later)
 
