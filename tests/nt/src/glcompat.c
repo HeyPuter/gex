@@ -58,7 +58,9 @@ int main(void) {
     HWND w = CreateWindowExW(0, L"gex_glcompat", L"glcompat", WS_POPUP, 0, 0, 64, 64, 0, 0, wc.hInstance, 0);
     HDC dc = GetDC(w);
     PIXELFORMATDESCRIPTOR pfd = {sizeof pfd, 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 32};
-    SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd);
+    /* BOOL results come back through the unix call's return slot (the
+     * transport's Params::ret): a wrong slot reads as FALSE here. */
+    CHECK("SetPixelFormat returns TRUE", SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd) == TRUE);
     HGLRC gl = wglCreateContext(dc);
     CHECK("a context", gl && wglMakeCurrent(dc, gl));
     ShowWindow(w, SW_SHOW);
@@ -161,8 +163,9 @@ int main(void) {
 
 out:
     CHECK("no GL error", glGetError() == GL_NO_ERROR);
+    CHECK("SwapBuffers returns TRUE", SwapBuffers(dc) == TRUE);
     wglMakeCurrent(0, 0);
-    wglDeleteContext(gl);
+    CHECK("wglDeleteContext returns TRUE", wglDeleteContext(gl) == TRUE);
     printf("%d failures\n", failures);
     return failures;
 }

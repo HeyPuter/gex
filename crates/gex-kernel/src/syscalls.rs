@@ -200,7 +200,7 @@ pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), E
         m.write_u64(ctx_addr + ctx::SYSCALL_RET as u64, v)?;
         return m.write(ctx_addr + (ctx::PPC_CR + 3) as u64, &[err as u8]);
     }
-    m.write_u64(ctx_addr + ctx::x(0) as u64, ret)
+    m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(ret))
 }
 
 /// `*at` calls use this to mean "relative to the current directory".
@@ -4653,6 +4653,7 @@ impl Kernel {
             // An executable file mapping is a shared library arriving: tell the
             // host so the static recompiler gets the whole object at once.
             if prot_bits & crate::mem::prot::EXEC != 0 {
+                crate::note_code_change();
                 self.new_code.push(CodeMap {
                     start,
                     end: start + len_aligned,
@@ -5101,6 +5102,7 @@ impl Kernel {
             .any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
         if executable {
             self.retired_code.push((start, end));
+            crate::note_code_change();
         }
     }
 
