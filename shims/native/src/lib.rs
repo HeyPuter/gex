@@ -21,6 +21,7 @@ pub mod profile;
 pub mod nt;
 pub mod nt_cgen;
 pub mod wasmprog;
+pub mod wasmdll;
 mod ready;
 pub(crate) mod ftab;
 pub mod wayland;
