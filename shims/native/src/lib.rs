@@ -578,6 +578,7 @@ pub fn engine() -> Result<Engine> {
     // allocation and peepholes, whose time dominates on a large program (half
     // a minute to compile SQLite vs under two seconds to translate).
     // `GEX_OPT_LEVEL` picks the trade.
+    #[cfg(feature = "compile")]
     config.cranelift_opt_level(match std::env::var("GEX_OPT_LEVEL").as_deref() {
         Ok("none") => wasmtime::OptLevel::None,
         Ok("speed_and_size") => wasmtime::OptLevel::SpeedAndSize,
@@ -649,6 +650,11 @@ fn run_program_with(
     // hit skips it and reports empty stats apart from the sidecar block count.
     let mut stats = Stats::default();
     let translate = || {
+        // Without the translator (gex-rt) only an ejected project's
+        // AOT-only process gets here, and it never calls this.
+        #[cfg(not(feature = "translate"))]
+        panic!("{} has no translator to translate the program image", env!("CARGO_PKG_NAME"));
+        #[allow(unreachable_code)]
         let (m, s) = gex_xlate::translate_image(image, xlate);
         if opts.verbose {
             eprintln!(
@@ -673,7 +679,7 @@ fn run_program_with(
     let (module, meta) = if opts.aot_only {
         // An ejected Windows program: no tier-1 module, only the root's
         // entry (`aot_only`).
-        (Module::new(&engine, aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
+        (gex_cache::compile(&engine, &aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
     } else if let Some(aot) = &opts.aot {
         // An ejected project: the image was translated when it was built.
         let dir = use_cache.then(gex_cache::cache_dir).flatten();
@@ -707,7 +713,7 @@ fn run_program_with(
             stats = s;
             let meta = m.metadata();
             (
-                Module::new(&engine, &m.wasm).context("validating translated wasm")?,
+                gex_cache::compile(&engine, &m.wasm).context("validating translated wasm")?,
                 meta,
             )
         }
@@ -3441,6 +3447,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    // No translator in this build (gex-rt): nothing is ever translated.
+    if cfg!(not(feature = "translate")) {
+        return Ok(false);
+    }
     if caller.data().nt.is_some() && profile::active() {
         profile::note_nt_entry(pc);
     }
@@ -3581,7 +3591,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             l.module
         }
-        None => Module::new(&engine, &translated_module.wasm)
+        None => gex_cache::compile(&engine, &translated_module.wasm)
             .context("validating runtime-translated wasm")?,
     };
     jit_stats::COMPILE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4354,7 +4364,7 @@ fn recompile_object(
     map: &gex_kernel::CodeMap,
     seeds: &[u64],
 ) -> Result<()> {
-    if caller.as_context().data().jit.is_none() {
+    if caller.as_context().data().jit.is_none() || cfg!(not(feature = "translate")) {
         return Ok(());
     }
     // The interpreter maps its own segments before it has a kernel to ask, so
@@ -4439,7 +4449,7 @@ fn recompile_object(
                     .context("compiling a statically recompiled object")?
                     .module
             }
-            None => Module::new(&engine, &translated.wasm)
+            None => gex_cache::compile(&engine, &translated.wasm)
                 .context("validating a statically recompiled object")?,
         };
         let unit = publish_unit(&shared, translated, module, translated.n_blocks)?;

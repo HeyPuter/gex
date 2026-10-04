@@ -269,12 +269,30 @@ pub fn provider_stubs(pe: &gex_ld::pe::PeImage, base: u64) -> Vec<u64> {
     provided(pe, base).stubs
 }
 
+/// A built-in provider's module and its slots: built here (clang) when
+/// missing, unless this runtime has no translator (gex-rt), which only finds
+/// the one its project's build made (`gex_cgen::provider::build`'s name).
+fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(std::path::PathBuf, Vec<Option<String>>)> {
+    if cfg!(feature = "translate") {
+        return gex_cgen::provider::build(prov, &cache_root()?);
+    }
+    let path = cache_root()?
+        .join("providers")
+        .join(format!("{}-{}.wasm", prov.name, gex_cgen::provider::fingerprint(std::slice::from_ref(prov))));
+    let wasm = std::fs::read(&path).with_context(|| format!("provider {} was not built with the project ({})", prov.name, path.display()))?;
+    Ok((path, gex_cgen::provider::slot_names(&wasm)?))
+}
+
 /// Build every export provider for a PE image (`gex_cgen::provider`) into the
+#[cfg(feature = "translate")]
 /// unit cache, as mapping it would; their names.
 pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
     let mut v = Vec::new();
     for prov in gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64) {
-        gex_cgen::provider::build(&prov, &cache_root()?)?;
+        let (path, _) = gex_cgen::provider::build(&prov, &cache_root()?)?;
+        if let Some(dir) = gex_cache::precompiled_dir() {
+            gex_cache::precompile(&crate::engine()?, &std::fs::read(&path)?, &dir)?;
+        }
         v.push(prov.name.to_string());
     }
     Ok(v)
@@ -295,7 +313,7 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
     if out.exists() {
         return Ok(out);
     }
-    if mode() == Mode::Aot {
+    if mode() == Mode::Aot || cfg!(not(feature = "translate")) {
         bail!("no function-tier unit {key} in {} (the ejected project was not built for this image; run ./build.sh)", root.display());
     }
     let recovery = root.join("recovery").join(recovery_key(image));
@@ -545,7 +563,7 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
 /// refuses an artifact from an incompatible engine, which recompiles it.
 fn compile(engine: &Engine, cache: Option<&(std::path::PathBuf, String)>, cwasm_path: &std::path::Path, cwasm: &[u8]) -> Result<Module> {
     if cache.is_none() {
-        return Ok(Module::new(engine, cwasm)?);
+        return Ok(gex_cache::compile(engine, cwasm)?);
     }
     gex_cache::load_or_compile_at(engine, &cwasm_path.with_extension("cwasm"), cwasm)
 }
@@ -768,12 +786,12 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
         // Small, and built in a private directory then renamed into place:
         // no need for the cache's build lock (which a unit build holds for
         // an hour).
-        let (path, slots) = gex_cgen::provider::build(prov, &cache_root()?)?;
+        let (path, slots) = provider_module(prov)?;
         let pairs = gex_cgen::provider::bindings(prov, &slots, &pv.exports, p.base, trace());
         if pairs.is_empty() {
             continue;
         }
-        let module = Module::from_file(engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
+        let module = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| gex_cache::compile(engine, &b)).with_context(|| format!("compiling provider {}", prov.name))?;
         crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
         crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
         eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());

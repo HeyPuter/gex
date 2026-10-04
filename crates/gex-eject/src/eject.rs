@@ -317,6 +317,20 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     if std::fs::hard_link(&o.runtime, &rt).is_err() {
         write_file(&rt, &runtime, true)?;
     }
+    // A Windows program's AOT-only runtime (gex-rt: no translator, no wasm
+    // compiler), from `GEX_RT` or beside this gexc.
+    if nt.is_some() {
+        let found = std::env::var_os("GEX_RT")
+            .map(PathBuf::from)
+            .or_else(|| o.runtime.parent().map(|d| d.join("gex-rt")))
+            .filter(|p| p.is_file());
+        if let Some(src) = found {
+            let dst = out.join("runtime/gex-rt");
+            if std::fs::hard_link(&src, &dst).is_err() {
+                write_file(&dst, &std::fs::read(&src)?, true)?;
+            }
+        }
+    }
 
     let project = Project {
         isa: session.isa.clone(),

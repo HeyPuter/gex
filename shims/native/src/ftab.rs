@@ -171,7 +171,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
         match &s.ftab.runtime {
             Some(m) => m.clone(),
             None => {
-                let m = Module::new(cx.as_context().engine(), gex_cgen::runtime::module())
+                let m = gex_cache::compile(cx.as_context().engine(), &gex_cgen::runtime::module())
                     .context("compiling the function table's runtime module")?;
                 crate::aot_share::note(&m, crate::aot_share::Kind::Runtime);
                 s.ftab.runtime = Some(m.clone());
@@ -643,6 +643,9 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
 /// replays). False when the translator declined or a retirement since the
 /// job was taken made it stale.
 fn run_job(j: &Job) -> Result<bool> {
+    if cfg!(not(feature = "translate")) {
+        return Ok(false);
+    }
     use std::sync::atomic::Ordering::Relaxed;
     let Some(tr) = gex_kernel::ftab::translator() else { return Ok(false) };
     let (sh, memory, addr) = (&j.sh, &j.memory, j.addr);
@@ -674,7 +677,7 @@ fn run_job(j: &Job) -> Result<bool> {
         bail!("the translation for {addr:#x} does not hold it");
     }
     let t1 = std::time::Instant::now();
-    let module = Module::new(&j.engine, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
+    let module = gex_cache::compile(&j.engine, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
     let tc = t1.elapsed();
     stats::COMPILE_US.fetch_add(tc.as_micros() as u64, Relaxed);
     let checks = pages.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -841,6 +844,9 @@ impl gex_kernel::ftab::Translator for Forwarder {
 }
 
 pub(crate) fn selftest_init() {
+    if cfg!(not(feature = "translate")) {
+        return;
+    }
     if std::env::var_os("GEX_FTAB_SELFTEST").is_some() {
         gex_kernel::ftab::set_translator(Box::new(Forwarder));
     }

@@ -642,6 +642,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-rt"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "gex-cgen",
+ "gex-eject",
+ "gex-native",
+]
+
+[[package]]
 name = "gex-wayland"
 version = "0.0.1"
 

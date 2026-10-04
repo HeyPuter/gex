@@ -84,6 +84,18 @@ pub(crate) fn base_module() -> Vec<u8> {
     m.finish()
 }
 
+/// Compile the modules every AOT-only process makes at run time -- the
+/// function table's runtime module and the base module -- into the
+/// content-addressed precompiled directory (`gex_cache::precompiled_dir`), for
+/// a runtime without a compiler (gex-rt).
+#[cfg(feature = "compile")]
+pub fn precompile(dir: &std::path::Path) -> Result<()> {
+    let engine = crate::engine()?;
+    gex_cache::precompile(&engine, &gex_cgen::runtime::module(), dir)?;
+    gex_cache::precompile(&engine, &base_module(), dir)?;
+    Ok(())
+}
+
 /// Point `instance`'s (the base module's) `enter` at this store's `root`,
 /// making the store's function table first. Once per store, before the
 /// first `enter`.

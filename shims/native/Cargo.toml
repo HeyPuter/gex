@@ -27,9 +27,16 @@ anyhow = "1"
 # module with one function per guest basic block -- fifty thousand of them for
 # bash, half a million for Mesa -- which is close to the ideal shape for
 # compiling in parallel, and it was using one core out of twenty-four.
-wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads", "parallel-compilation"] }
+wasmtime = { version = "27", default-features = false, features = ["runtime", "std", "threads"] }
 
 [features]
+default = ["translate"]
+# A wasm compiler (Cranelift) in the process.
+compile = ["wasmtime/cranelift", "wasmtime/parallel-compilation", "gex-cache/compile"]
+# gex's run-time translation: tier-1, the function JIT, unit builds. Off,
+# the runtime runs only code compiled ahead of time (`aot_only`): an
+# ejected project's runtime (docs/eject-pe.md §7, E7).
+translate = ["compile"]
 # Host an x86-64 guest. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-kernel/x86"]
 # Host a 32-bit big-endian PowerPC guest (docs/ppc.md).

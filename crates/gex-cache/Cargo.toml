@@ -6,4 +6,10 @@ edition.workspace = true
 [dependencies]
 anyhow = "1"
 gex-key.workspace = true
-wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }
+wasmtime = { version = "27", default-features = false, features = ["runtime", "std", "threads"] }
+
+[features]
+default = ["compile"]
+# A wasm compiler (Cranelift) in the process. Without it every module must
+# have been compiled ahead of time (`compile` looks it up by content).
+compile = ["wasmtime/cranelift"]

@@ -7,7 +7,9 @@
 //! The session's `nt` section says how the NT layer was set up; the rootfs
 //! holds the images and the files the NT layer opened, at their guest paths.
 
-use crate::build::{copy_tree, verify_rootfs, BuildManifest, BuiltImage, BUILD_FILE};
+#[cfg(feature = "build")]
+use crate::build::{copy_tree, verify_rootfs};
+use crate::manifest::{BuildManifest, BuiltImage, BUILD_FILE};
 use crate::config::Config;
 use crate::project::{rootfs_rel, Project};
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,9 +19,11 @@ use gex_native::{Exit, RunOptions};
 use gex_xlate::profile::{NtSession, Session};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "build")]
 /// What a provider includes (gex-cgen's), for `gen/provider.h`.
 pub const PROVIDER_H: &str = include_str!("../../gex-cgen/providers/provider.h");
 
+#[cfg(feature = "build")]
 /// Whether the PE file at `path` is LuaJIT's lua51.dll (it exports
 /// `luaJIT_setmode`): its trace compiler writes x86 at run time, which an
 /// ejected project cannot run, so it gets the Lua provider.
@@ -34,6 +38,7 @@ fn provider_wasm(dir: &Path, p: &crate::config::Provider) -> PathBuf {
     dir.join("build/providers").join(p.library.to_ascii_lowercase().replace(".dll", ".wasm"))
 }
 
+#[cfg(feature = "build")]
 /// The imports a stateful provider may have.
 fn check_provider_imports(wasm: &[u8], what: &str) -> Result<()> {
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
@@ -109,6 +114,7 @@ pub struct PeReport {
     pub rootfs_files: usize,
 }
 
+#[cfg(feature = "build")]
 /// Link `from` to `to` (a copy across file systems).
 fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
     if to.exists() {
@@ -120,6 +126,7 @@ fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "build")]
 /// Take a unit already built elsewhere (`GEX_EJECT_UNIT_CACHE`: units are
 /// keyed by content, so one with the same key is the same unit).
 fn reuse(key_dir: &Path, sources: &[PathBuf]) -> Result<bool> {
@@ -139,6 +146,7 @@ fn reuse(key_dir: &Path, sources: &[PathBuf]) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(feature = "build")]
 pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport> {
     let ntss = nt_session(dir)?.ok_or_else(|| anyhow!("not a Windows program's project"))?;
     verify_rootfs(dir, project)?;
@@ -172,6 +180,11 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
     let units = units_dir(dir);
     std::fs::create_dir_all(&units)?;
     std::env::set_var("GEX_CGEN_CACHE", &units);
+    // What a runtime without a compiler (gex-rt) needs besides the units:
+    // every module an AOT-only process makes at run time, compiled here.
+    let pre = units.join("precompiled");
+    std::env::set_var("GEX_PRECOMPILED", &pre);
+    gex_native::aot_only::precompile(&pre)?;
     let sources: Vec<PathBuf> = std::env::var("GEX_EJECT_UNIT_CACHE")
         .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default();
@@ -316,7 +329,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         report.providers.push(format!("{} ({} KiB, stateful)", p.library, wasm.len() / 1024));
     }
     let manifest = BuildManifest {
-        inputs: crate::build::inputs_id(dir, &[])?,
+        inputs: crate::manifest::inputs_id(dir, &[])?,
         images: images_out,
         replacements: Vec::new(),
         pins: Vec::new(),
@@ -339,11 +352,11 @@ pub fn run(dir: &Path, flags: &crate::run::RunFlags) -> Result<Exit> {
     let ntss = nt_session(dir)?.ok_or_else(|| anyhow!("not a Windows program's project"))?;
     let project = Project::load(dir)?;
     let manifest = BuildManifest::load(dir)?;
-    if crate::build::inputs_id(dir, &[])? != manifest.inputs {
+    if crate::manifest::inputs_id(dir, &[])? != manifest.inputs {
         bail!("{} changed since it was built (gex-project.json or user/eject.json); run ./build.sh", dir.display());
     }
     let (config, _) = Config::load(dir)?;
-    let root = std::fs::canonicalize(crate::build::rootfs(dir)).with_context(|| format!("{} (run ./build.sh)", dir.display()))?;
+    let root = std::fs::canonicalize(crate::manifest::rootfs(dir)).with_context(|| format!("{} (run ./build.sh)", dir.display()))?;
     let units = std::fs::canonicalize(units_dir(dir))?;
     for s in &ntss.settings {
         if let Some((k, v)) = s.split_once('=') {
@@ -353,6 +366,7 @@ pub fn run(dir: &Path, flags: &crate::run::RunFlags) -> Result<Exit> {
         }
     }
     std::env::set_var("GEX_CGEN_CACHE", &units);
+    std::env::set_var("GEX_PRECOMPILED", units.join("precompiled"));
     std::env::set_var("GEX_NT_CGEN_BUILD", "0");
     gex_native::libprov::set(lib_providers(dir, &config));
     let jit = flags.jit_fallback || config.jit_fallback;
