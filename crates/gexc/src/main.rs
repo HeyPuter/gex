@@ -501,7 +501,7 @@ struct FjitTranslator(gex_xlate::fjit::Jit);
 impl gex_kernel::ftab::Translator for FjitTranslator {
     fn translate(&self, req: &gex_kernel::ftab::Request<'_>) -> Option<gex_kernel::ftab::Translated> {
         self.0
-            .translate(req.mem, req.addr, req.executable, req.read_only, req.page_gen, req.class32)
+            .translate(req.mem, req.addr, req.executable, req.read_only, req.volatile, req.page_gen, req.class32)
             .map(|wasm| gex_kernel::ftab::Translated { wasm })
     }
 

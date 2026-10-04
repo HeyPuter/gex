@@ -184,6 +184,11 @@ pub struct Request<'a> {
     /// writable now: a jump table read from them is as fixed as one in an
     /// image's read-only segment (not tracked past a later `mprotect`).
     pub read_only: &'a dyn Fn(u64, u64) -> bool,
+    /// Whether an address is mapped writable and executable now (a JIT's
+    /// code area): its bytes may change with no flush to announce it, so
+    /// tier-1 guards each block there (`Block::guard`) and the function
+    /// JIT leaves it alone.
+    pub volatile: &'a dyn Fn(u64) -> bool,
     /// The value `gex_abi::PAGE_GEN` holds for a page (guest address /
     /// `DISPATCH_PAGE`) now, never 0: what the translation's page checks
     /// compare against. Asking numbers the page if it was not.

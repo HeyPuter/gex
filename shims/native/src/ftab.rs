@@ -519,6 +519,9 @@ struct Job {
     addr: u64,
     exec: Vec<(u64, u64)>,
     ro: Vec<(u64, u64)>,
+    /// Writable-and-executable ranges (a JIT's code), which the function
+    /// JIT does not translate.
+    wx: Vec<(u64, u64)>,
     class32: bool,
     epoch: u64,
     queued_at: std::time::Instant,
@@ -528,11 +531,12 @@ struct Job {
 
 fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Option<Job> {
     gex_kernel::ftab::translator()?;
-    let (exec, ro): (Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
+    let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let v = k.mem.vmas();
         (
             v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
+            v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
         )
     });
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
@@ -546,6 +550,7 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
         addr,
         exec,
         ro,
+        wx,
         class32: gex_abi::X86 && gex_xlate::arch::compat(),
         epoch,
         queued_at: std::time::Instant::now(),
@@ -562,6 +567,7 @@ fn run_job(j: &Job) -> Result<bool> {
     let (sh, memory, addr) = (&j.sh, &j.memory, j.addr);
     let executable = |a: u64| j.exec.iter().any(|&(s, e)| a >= s && a < e);
     let read_only = |a: u64, n: u64| j.ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
+    let volatile = |a: u64| j.wx.iter().any(|&(s, e)| a >= s && a < e);
     let pages = Mutex::new(Vec::<(u64, u32)>::new());
     let pg = |page: u64| {
         let g = page_gen(sh, memory, page);
@@ -576,6 +582,7 @@ fn run_job(j: &Job) -> Result<bool> {
         addr,
         executable: &executable,
         read_only: &read_only,
+        volatile: &volatile,
         page_gen: &pg,
         class32: j.class32,
     };

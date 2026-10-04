@@ -110,6 +110,7 @@ impl Jit {
         addr: u64,
         executable: &dyn Fn(u64) -> bool,
         read_only: &dyn Fn(u64, u64) -> bool,
+        volatile: &dyn Fn(u64) -> bool,
         page_gen: &dyn Fn(u64) -> u32,
         class32: bool,
     ) -> Option<Vec<u8>> {
@@ -145,6 +146,21 @@ impl Jit {
             if let Err(e) = f.verify().and_then(|_| block_local(&f)) {
                 if std::env::var_os("GEX_FJIT_STATS").is_some() {
                     eprintln!("[fjit] {a:#x}: recovered malformed ({e}); left to the fallback");
+                }
+                if a == addr {
+                    return None;
+                }
+                continue;
+            }
+            // Code in writable-and-executable memory (a JIT's) may be
+            // rewritten with nothing to announce it: tier-1 checks each
+            // block's bytes there (`Block::guard`); a function checks only
+            // its pages' generations on entry, so it would run whatever a
+            // direct jump reached when it was translated -- in a JIT's
+            // fresh area, often bytes not yet written. It stays tier-1.
+            if f.blocks.iter().any(|b| !b.synthetic && (volatile(b.start) || volatile(b.end.max(b.start + 1) - 1))) {
+                if std::env::var_os("GEX_FJIT_STATS").is_some() {
+                    eprintln!("[fjit] {a:#x}: code in writable memory; left to the fallback");
                 }
                 if a == addr {
                     return None;
