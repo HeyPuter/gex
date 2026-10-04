@@ -175,6 +175,20 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
     let sources: Vec<PathBuf> = std::env::var("GEX_EJECT_UNIT_CACHE")
         .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default();
+    // Indirect-call hints (`<cache>/icall/<image>.txt`, part of a unit's key)
+    // from the project (user/icall/) and from the caches units are reused
+    // from, so a reused unit built with hints is found by its key.
+    std::fs::create_dir_all(units.join("icall"))?;
+    for src in std::iter::once(dir.join("user")).chain(sources.iter().cloned()) {
+        if let Ok(rd) = std::fs::read_dir(src.join("icall")) {
+            for e in rd.flatten() {
+                let to = units.join("icall").join(e.file_name());
+                if !to.exists() {
+                    std::fs::copy(e.path(), &to)?;
+                }
+            }
+        }
+    }
     let jobs = std::env::var("JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
     let class32 = abi_of(&ntss)? == nt::Abi::P32;
     if class32 {
@@ -217,6 +231,11 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
                 seeds.extend(site.targets.keys().filter(|l| l.obj == m.id).map(|l| l.off.wrapping_add(bias)));
             }
         }
+        // Where code ran without a unit although the image had one (a resume
+        // into the middle of a function, a unit's leave): a narrow stopgap
+        // until such frames are kept (R's nested dispatch, merge plan §9).
+        let end = m.base + m.size;
+        seeds.extend(ntss.entries.iter().copied().filter(|&a| a >= m.base && a < end));
         let name = m.path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
         for s in &config.seeds {
             if let Some((img, off)) = s.split_once('+') {
@@ -226,8 +245,9 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
                 }
             }
         }
+        let stubs = nt_cgen::provider_stubs(&pe, m.base);
         let missing_seeds = |entries: &[u64]| -> Vec<u64> {
-            let set: std::collections::HashSet<u64> = entries.iter().copied().collect();
+            let set: std::collections::HashSet<u64> = entries.iter().chain(stubs.iter()).copied().collect();
             let mut v: Vec<u64> = seeds.iter().copied().filter(|a| !set.contains(a)).collect();
             v.sort_unstable();
             v.dedup();
