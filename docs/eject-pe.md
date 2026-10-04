@@ -660,6 +660,29 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   - A project's own files go in `user/files/<guest path>` (copied into
     build/rootfs and the page's tar): Noita's world seed is pinned there
     with `port/seedpin/pin.sh mod|save`.
+- **E8: Noita's web build in the page, AOT-only (2026-10-04).** cg12
+  recording, `gexc eject --web-shim web/public/gex --web-page DIR`
+  (`p-noita12w`), build.sh: 38 browser-flavour units (25 built here: the
+  guarded flavour is another key), world seed pinned through
+  `user/files` (port/seedpin). In headless Chromium on hardware WebGPU
+  (Mesa wink's wgpu replay):
+  - The first AOT-only run stopped at noita.exe+0x1791ac (a call
+    continuation; the browser leaves wasm where native does not). A
+    training run (`index.html?record`, the fallback on) crashed in
+    LuaJIT's own code: the browser retired the Lua provider's entries on
+    pages Noita's mod sandbox patches. With providers exempt (as
+    natively), the training run reached the world and recorded 73
+    entries in `user/web-entries.txt`.
+  - Rebuilt (169 region entries), the AOT-only page runs to the world and
+    on: 420 s, world frame 13,859, no stops, nothing translated
+    (callouts 0, in-place installs 0). World fps 34-45 in 60 s windows
+    (untimed: build cores 0,2,6,8, Chromium beside it; pewasm's page is
+    about 59 per stream B).
+  - Open: the guarded flavour leaves two functions out of their units
+    (`clang wanted a shadow stack`: noita.exe 0xdd80a0, msvcr120.dll
+    0x1637a00); not reached so far, but the build should fail on them, as
+    on anything uncovered. A paired page measurement (pewasm's page and
+    the ejected page, same cores) is next.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
