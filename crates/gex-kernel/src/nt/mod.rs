@@ -928,6 +928,8 @@ pub fn syscall(
             // NTSTATUS is 32 bits; the upper half of rax is zero, as after
             // Wine's `movl %eax` return. win32u calls return their own value.
             let v = c.ret64.unwrap_or(status as u64);
+            // An i386 result is 32 bits, zero-extended in the context.
+            let v = if abi == Abi::P32 { v & 0xffff_ffff } else { v };
             let _ = c.g.w64(ctx_addr + ctx::x(0) as u64, v);
             other.unwrap_or(Outcome::Continue)
         }

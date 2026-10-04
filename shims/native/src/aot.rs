@@ -652,7 +652,7 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
                 // A wasm32 `int` or pointer: zero-extended, which is what a
                 // pointer needs and all a caller of an `int` function reads.
                 Some(Val::I32(v)) => write_u64(data, base + ctx::x(0), *v as u32 as u64),
-                Some(Val::I64(v)) => write_u64(data, base + ctx::x(0), *v as u64),
+                Some(Val::I64(v)) => write_u64(data, base + ctx::x(0), gex_kernel::gpr(*v as u64)),
                 Some(Val::F32(v)) => {
                     write_u64(data, base + ctx::v(0), u64::from(*v));
                     write_u64(data, base + ctx::v(0) + 8, 0);

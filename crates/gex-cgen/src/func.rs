@@ -77,18 +77,22 @@ pub fn leaf_name(entry: u64) -> String {
 
 /// Whether `f` may be copied into its callers' translation units (pewasm's
 /// opt_inline.cc): a leaf (no calls, no transfers out other than its
-/// returns) of at most `LEAF_STMTS` statements. pewasm's bound is 48 C
-/// statements; gex's lifted statements are about two per pewasm line.
+/// returns) of at most `LEAF_INSTS` guest instructions. pewasm bounds 48 C
+/// statements after its own optimisation, flags mostly gone; gex's lifted
+/// statements still hold every flag (a compare is about 30), so they are
+/// no measure: 0x72b390, 18 instructions with four compares, is 288. The
+/// flags go when the copy is inlined, the caller's `need` folding the
+/// return's flag store away.
 pub fn is_small_leaf(f: &Function) -> bool {
-    const LEAF_STMTS: usize = 96;
+    const LEAF_INSTS: usize = 32;
     let mut n = 0;
     for b in &f.blocks {
         match b.term {
             FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Return { .. } => {}
             _ => return false,
         }
-        n += b.stmts.len();
-        if n > LEAF_STMTS {
+        n += b.insts.len();
+        if n > LEAF_INSTS {
             return false;
         }
     }
@@ -489,6 +493,9 @@ impl FnUnit {
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
         e.class32 = self.class32;
+        if self.ftab {
+            e.fault_exit = Some("goto gex_resume;");
+        }
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
@@ -558,6 +565,9 @@ impl FnUnit {
             let lname = loop_name(f.entry, k, self.copying);
             let mut le = Emitter::new(&dummy, &owned);
             le.class32 = self.class32;
+            if self.ftab {
+                le.fault_exit = Some("return 0;");
+            }
             le.resize(f.n_values as usize);
             // Only the registers the loop itself touches are locals here:
             // everything else is already in the context (the body wrote
@@ -1237,8 +1247,19 @@ impl FnUnit {
             FTerm::Illegal { raw, pc } => {
                 e.flush();
                 e.store_pc(&format!("0x{pc:x}ull"));
-                e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
-                e.line("__builtin_trap();");
+                match e.fault_exit {
+                    Some(exit) => {
+                        e.line(format!("gex_illegal(ctx, (int64_t)(0x{pc:x}ull | GEX_RESUMABLE_PC), (int32_t)0x{raw:x}u);"));
+                        e.line(exit);
+                        if scope.is_none() {
+                            resumed.set(true);
+                        }
+                    }
+                    None => {
+                        e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
+                        e.line("__builtin_trap();");
+                    }
+                }
             }
         }
         if resumed.get() {

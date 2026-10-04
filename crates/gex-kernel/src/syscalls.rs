@@ -200,7 +200,7 @@ pub fn set_result(m: &mut GuestMem<'_>, ctx_addr: u64, ret: u64) -> Result<(), E
         m.write_u64(ctx_addr + ctx::SYSCALL_RET as u64, v)?;
         return m.write(ctx_addr + (ctx::PPC_CR + 3) as u64, &[err as u8]);
     }
-    m.write_u64(ctx_addr + ctx::x(0) as u64, ret)
+    m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(ret))
 }
 
 /// `*at` calls use this to mean "relative to the current directory".

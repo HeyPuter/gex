@@ -107,6 +107,12 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
         // nothing either).
         let host: Arc<dyn nt::display::NtDisplay> =
             if out == "null" { Arc::new(NullDisplay) } else { Arc::new(PpmDisplay::new(out)) };
+        // Frames nobody sees: a frame's GL may run while the next is built.
+        if out == "null" {
+            if let Some(dev) = crate::gl::DEVICE.get() {
+                dev.set_threaded();
+            }
+        }
         *p.display_host.lock().unwrap() = Some(host);
     }
     store.data_mut().nt = Some(Arc::clone(&p));
@@ -262,6 +268,9 @@ impl nt::display::NtDisplay for PpmDisplay {
 /// time pass (docs/nt-layer.md §4).
 fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, sampler: Option<Arc<Sampler>>) {
     let stats = std::env::var_os("GEX_NT_STATS").is_some();
+    // GEX_NT_GL_STATS=1: the program's GL by function, with the 60 s report.
+    let gl_stats = std::env::var("GEX_NT_GL_STATS").as_deref() == Ok("1");
+    nt::opengl::STATS.store(gl_stats, std::sync::atomic::Ordering::Relaxed);
     let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
         let (addr, deref) = match v.strip_suffix('*') {
             Some(a) => (a, true),
@@ -357,6 +366,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         eprintln!("gex-nt: syscalls {total}: {}", sc.join(" | "));
                         if let Some(l) = super::nt_cgen::no_unit_line() {
                             eprintln!("{l}");
+                        }
+                        if gl_stats {
+                            eprintln!("gex-nt: gl {}", nt::opengl::take_stats(&p, 16));
                         }
                         let mut ss: Vec<((u32, u32, u64), u64)> =
                             std::mem::take(&mut *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner())).into_iter().collect();
@@ -512,7 +524,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
                 && nr != nt::sysno::ntdll::NtContinue
                 && nr != nt::sysno::ntdll::NtContinueEx;
             if (nr == nt::sysno::ntdll::NtRaiseException || apc) && nest_exceptions(memory.bytes(), next_pc) {
-                return raise_nested(caller, &p, target, raise_sp, next_pc);
+                return raise_nested(caller, &p, target, raise_sp, Some(next_pc));
             }
             let state = caller.data_mut();
             if crate::ftab::stats_on() {
@@ -601,14 +613,14 @@ const EXC_MAX_DEPTH: usize = 8;
 /// frames to keep), and only when the syscall returns through a `ret`, which
 /// is how the dispatch gets back (`GEX_NT_EXC_NEST=0` turns it off).
 fn nest_exceptions(mem: &[u8], next_pc: u64) -> bool {
+    nest_on() && matches!(mem.get(next_pc as usize), Some(0xc3) | Some(0xc2))
+}
+
+/// Nested dispatch at all: with function bodies about, unless
+/// `GEX_NT_EXC_NEST=0`.
+fn nest_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) {
-        return false;
-    }
-    if super::nt_cgen::mode() == super::nt_cgen::Mode::Off {
-        return false;
-    }
-    matches!(mem.get(next_pc as usize), Some(0xc3) | Some(0xc2))
+    *ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) && super::nt_cgen::mode() != super::nt_cgen::Mode::Off
 }
 
 /// Has control left the innermost nested exception dispatch on this thread
@@ -650,7 +662,7 @@ pub(crate) fn exc_escape(caller: &mut Caller<'_, HostState>, target: u64) -> boo
 /// code (`gex_resume`). A trap-out instead drops every frame, and the
 /// thread's outer functions (a game's main loop) run on the fallback from
 /// then on.
-fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target: u64, raise_sp: u64, next_pc: u64) -> Result<()> {
+fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target: u64, raise_sp: u64, next_pc: Option<u64>) -> Result<()> {
     let enter = super::any_enter(caller).ok_or_else(|| anyhow!("no module in this store exports `enter`"))?;
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
@@ -732,6 +744,10 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
             if target == p.ntdll.lock().unwrap().ki_user_apc_dispatcher { "APC" } else { "exception" },
         );
     }
+    // A fault: the faulting code goes on at the context's PC itself.
+    let Some(next_pc) = next_pc else {
+        return Ok(());
+    };
     // Back at the syscall's own return (an APC's NtContinue, an exception
     // continued at the raise): just return, with the context's registers.
     if to_pc == next_pc && to_sp == raise_sp & mask {
@@ -756,6 +772,38 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
 }
 
 pub(crate) use gex_kernel::nt::Fault;
+
+/// [`fault`] from code that goes on after the import returns
+/// (`gex_cgen::RESUMABLE_PC`): the exception is dispatched nested
+/// (`raise_nested`), and the import returns with the state the handlers
+/// left (the caller continues at `ctx::PC` through its `gex_resume`), so
+/// the thread's wasm frames survive the fault as they do a raise.
+pub(crate) fn fault_at(caller: &mut Caller<'_, HostState>, f: Fault, pc: u64, resumable: bool) -> Result<()> {
+    if resumable && !matches!(f, Fault::X87) && nest_on() {
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        let ctx_addr = caller.data().thread.ctx_addr;
+        let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize);
+        let p = Arc::clone(caller.data().nt.as_ref().expect("an NT fault in a Linux process"));
+        let (code, rip, info) = f.exception(pc).expect("every fault but X87 is an exception");
+        let outcome = {
+            let state = caller.data_mut();
+            nt::hardware_exception(&p, &*state.kernel, memory.bytes(), ctx_addr, code, rip, &info)
+        };
+        return match outcome {
+            nt::Outcome::Resume(target) => {
+                let r = raise_nested(caller, &p, target, sp, None);
+                super::check_i386_high(&*caller, "a fault dispatched nested");
+                r
+            }
+            nt::Outcome::Exit(code) => {
+                caller.data_mut().exit = Some(Exit::Status(code as i32));
+                Err(StopExecution.into())
+            }
+            other => bail!("gex-nt: unexpected outcome {other:?} from exception dispatch"),
+        };
+    }
+    fault(caller, f, pc)
+}
 
 /// Deliver `fault` at `pc` to the guest as an NT exception, as Wine's signal
 /// handlers do. Returns the StopExecution that redirects the thread into

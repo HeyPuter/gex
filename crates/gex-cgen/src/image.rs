@@ -70,11 +70,24 @@ fn unit_inputs() -> String {
         })
         .clone();
     // The flavor is part of the key: native and browser units never mix.
-    if unguarded() {
-        format!("{base}:unguarded")
-    } else {
+    let base = if unguarded() { format!("{base}:unguarded") } else { base };
+    if narrow_stores() {
         base
+    } else {
+        format!("{base}:widest")
     }
+}
+
+/// Store an i386 program's general-purpose registers to the low 32 bits of
+/// their 64-bit context slots, as pewasm's CpuState fields are 32-bit
+/// (3-4% of the wasm of Noita's large hot functions). Exact because every
+/// other writer of those slots zero-extends (efcb8bfc: the host's syscall
+/// results, signal frames, the NT layer's contexts; GEX_CHECK_I386_HIGH=1
+/// checks it), so the high half is always zero. `GEX_CGEN_NARROW_STORES=0`
+/// turns it off. In the unit key.
+pub fn narrow_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_CGEN_NARROW_STORES").as_deref() != Ok("0"))
 }
 
 static UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

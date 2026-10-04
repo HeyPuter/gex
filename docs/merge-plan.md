@@ -766,6 +766,27 @@ one interface, fixed here so neither waits on the other.
   exit_group, and SEH unwinding past wasm frames.
 - Stream R measures EH against the chain on the Tier 0 corpus and picks per
   event. The decision is recorded here.
+- *As built (stream R, 2026-10-03): guest exceptions use neither.*
+  - NtRaiseException (ffa2cec9), user APCs from alertable waits (fb7dfd52)
+    and hardware faults in whole-image units run their dispatcher
+    **nested**, on top of the thread's wasm frames, instead of trapping
+    out.
+  - Hardware faults need `RESUMABLE_PC` in the fault import's pc: the unit
+    goes on at `ctx::PC` through its `gex_resume` when the import returns.
+  - Control coming back at or above the raise's stack ends the nested
+    loop. The guest then resumes there through the return-0 chain, and the
+    frame that owns the target continues in its own body:
+    - at a call continuation (`gex_lc_*`);
+    - anywhere else in its own code, by a tail call through the table at
+      that address (`gex_resume`'s interior entry).
+  - Trap-outs remain for exceptions dispatched from tier-1 and for a fault
+    in a unit without the bit.
+  - **Known region-entry case:** a handler that resumes *inside the
+    faulting function itself* at a non-call address (a VEH returning
+    EXCEPTION_CONTINUE_EXECUTION at the fault pc + n) is reached by that
+    interior tail call, so it runs on the fallback (tier-1's call-out). An
+    AOT-only eject has no tier-1 for it: that is a region entry
+    (§9.2 region tier).
 
 **Stream F, the function JIT** (`crates/gex-fjit`, new; branch `merge/fjit`):
 1. §9.4 step 2: GIR → wasm emitter directly, with no clang:

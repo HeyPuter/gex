@@ -311,6 +311,68 @@ pub fn plan_layout(images: &[(String, u64, u64, String, bool)]) -> Vec<LayoutEnt
     out
 }
 
+/// [`plan_layout`] that keeps a layout: every entry of `existing` keeps its
+/// exact base, so units built for it stay valid, and only images it does
+/// not name get places -- their own preferred base when that is theirs,
+/// fits and is free, else packed downward below everything placed. An image
+/// whose bytes changed (another sha256) cannot keep its entry: an error, and
+/// the prefix needs a full layout. Entries for images no longer in the set
+/// stay. (`gexc cgen-prefix --append`.)
+pub fn plan_layout_append(existing: &[LayoutEntry], images: &[(String, u64, u64, String, bool)]) -> Result<Vec<LayoutEntry>, String> {
+    let span = |b: u64, n: u64| (b, b + align_up(n, vm::GRANULE));
+    let mut out: Vec<LayoutEntry> = existing.to_vec();
+    let mut taken: Vec<(u64, u64)> = existing.iter().map(|e| span(e.1, e.2)).collect();
+    let mut rest = Vec::new();
+    for im in images {
+        if let Some(e) = existing.iter().find(|e| e.0.eq_ignore_ascii_case(&im.0)) {
+            if e.3 != im.3 {
+                return Err(format!("{} changed since the layout was made (sha256 {} -> {}); lay the prefix out again", im.0, e.3, im.3));
+            }
+            continue;
+        }
+        let (b, e) = span(im.1, im.2);
+        let fits = im.4 && b >= vm::ALLOC_LOW && e <= vm::ALLOC_HIGH && b % vm::GRANULE == 0;
+        if fits && !taken.iter().any(|&(tb, te)| tb < e && b < te) {
+            taken.push((b, e));
+            out.push((im.0.clone(), im.1, im.2, im.3.clone()));
+        } else {
+            rest.push(im);
+        }
+    }
+    rest.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut top = taken.iter().map(|&(b, _)| b).min().unwrap_or(0x7a80_0000);
+    for im in rest {
+        let n = align_up(im.2, vm::GRANULE);
+        top = top.checked_sub(n).filter(|t| *t >= vm::ALLOC_LOW).ok_or_else(|| format!("no room below the layout for {}", im.0))?;
+        out.push((im.0.clone(), top, im.2, im.3.clone()));
+    }
+    out.sort_by_key(|e| e.1);
+    Ok(out)
+}
+
+/// The entries of a layout file's text (as [`render_layout`] writes them),
+/// for Wine `wine`.
+pub fn parse_layout_entries(text: &str, wine: &str) -> Result<Vec<LayoutEntry>, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(LAYOUT_VERSION) {
+        return Err(format!("not a {LAYOUT_VERSION} file"));
+    }
+    match lines.next().and_then(|l| l.strip_prefix("wine ")) {
+        Some(v) if v.trim() == wine.trim() => {}
+        other => return Err(format!("written for Wine {other:?}, the prefix is Wine {}", wine.trim())),
+    }
+    let mut out = Vec::new();
+    for l in lines {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let [base, size, sha, rel] = f[..] else {
+            return Err(format!("bad line {l:?}"));
+        };
+        let hex = |v: &str| u64::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|_| format!("bad number in {l:?}"));
+        out.push((rel.to_string(), hex(base)?, hex(size)?, sha.to_string()));
+    }
+    Ok(out)
+}
+
 /// The text of a layout file for Wine `wine` ([`Layout::parse`] reads it).
 pub fn render_layout(entries: &[LayoutEntry], wine: &str) -> String {
     let mut s = format!("{LAYOUT_VERSION}\nwine {}\n", wine.trim());
@@ -904,4 +966,50 @@ pub fn nt_flush_virtual_memory(c: &mut Call<'_>) -> R {
         c.g.wptr(iosb + c.g.psize(), 0)?;
     }
     Ok(st::SUCCESS)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Appending keeps every existing base (units built for them stay
+    /// valid) and gives new images free places: their own preferred base
+    /// when free, else below everything.
+    #[test]
+    fn appending_to_a_layout_moves_nothing() {
+        let img = |n: &str, b: u64, sz: u64, own: bool| (format!("drive_c/windows/syswow64/{n}"), b, sz, format!("sha-{n}"), own);
+        let core = [
+            img("ntdll.dll", 0x7bc0_0000, 0x36c000, true),
+            img("kernel32.dll", 0x7b80_0000, 0x0a0000, true),
+            img("user32.dll", 0x1000_0000, 0x53a000, false),
+            img("msvcrt.dll", 0x1000_0000, 0x0a0000, false),
+        ];
+        let old = plan_layout(&core);
+        let mut more = core.to_vec();
+        // Sorts before every packed name, so a full re-plan would move them.
+        more.push(img("d3d8.dll", 0x1000_0000, 0x040000, false));
+        more.push(img("wined3d.dll", 0x1000_0000, 0x200000, false));
+        // Its own preferred base, free.
+        more.push(img("ddraw.dll", 0x6000_0000, 0x060000, true));
+        let new = plan_layout_append(&old, &more).unwrap();
+        for e in &old {
+            assert!(new.contains(e), "{e:?} moved: {new:x?}");
+        }
+        assert_eq!(new.len(), old.len() + 3);
+        let ddraw = new.iter().find(|e| e.0.ends_with("ddraw.dll")).unwrap();
+        assert_eq!(ddraw.1, 0x6000_0000);
+        let spans: Vec<(u64, u64)> = new.iter().map(|e| (e.1, e.1 + align_up(e.2, vm::GRANULE))).collect();
+        for (i, a) in spans.iter().enumerate() {
+            for b in &spans[i + 1..] {
+                assert!(a.1 <= b.0 || b.1 <= a.0, "{a:x?} overlaps {b:x?}");
+            }
+        }
+        // A changed DLL cannot keep its entry.
+        let mut changed = more.clone();
+        changed[0].3 = "sha-other".into();
+        assert!(plan_layout_append(&old, &changed).is_err());
+        // The text round-trips.
+        let text = render_layout(&new, "wine-11.15");
+        assert_eq!(parse_layout_entries(&text, "wine-11.15").unwrap(), new);
+    }
 }
