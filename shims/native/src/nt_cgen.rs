@@ -427,6 +427,13 @@ fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) 
     (image, seeds)
 }
 
+/// The NT trampoline page's unit, built into the cache (`gexc cgen-image
+/// --nt-trampolines`): for a host that cannot build it at boot, the browser.
+pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::PathBuf> {
+    let (image, seeds) = trampoline_input(class32);
+    prepare_image(&image, &seeds, jobs, true)
+}
+
 static TRAMPOLINES_DONE: OnceLock<()> = OnceLock::new();
 
 /// Build (once per gex build: cached) and install the trampoline page's
