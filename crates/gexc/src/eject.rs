@@ -132,6 +132,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
             let mut out = None;
             let mut then_build = false;
             let mut web_shim = None;
+            let mut web_page = None;
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -143,6 +144,10 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     "--web-shim" => {
                         i += 1;
                         web_shim = Some(PathBuf::from(args.get(i).context("--web-shim needs gex_browser.wasm")?));
+                    }
+                    "--web-page" => {
+                        i += 1;
+                        web_page = Some(PathBuf::from(args.get(i).context("--web-page needs a directory (web/build-eject-page.sh DIR)")?));
                     }
                     o if o.starts_with('-') => bail!("gexc eject: unknown option {o}"),
                     r => {
@@ -163,6 +168,7 @@ pub fn cmd_eject(args: &[String]) -> Result<Option<Exit>> {
                     runtime,
                     runtime_build: gex_cache::build_fingerprint(),
                     web_shim,
+                    web_page,
                 },
             )?;
             eprintln!(

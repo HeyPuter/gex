@@ -5,6 +5,7 @@
 //
 //   /nt.html?tar=/gex/nt/bundle.tar&exe=/t/window.exe&args=30&size=1024x768
 //            [&gl=1&glbackend=wgpu][&env=K=V,K=V][&cwd=/t][&hostx=1]
+//            [&cgen=2&cgenurl=/project/build/web/cgen&aot=1]   (an ejected project)
 //
 // The exe may also be a Linux ELF (an i386 or x86-64 program with its
 // libraries in the bundle); `hostx=1` gives it the page's X server
@@ -74,6 +75,9 @@ async function main() {
   if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
   if (q.get('cgen')) globalThis.GEX_CGEN = Number(q.get('cgen'));
+  // An ejected project's page (gexc eject): its units, and no translation.
+  if (q.get('cgenurl')) globalThis.GEX_CGEN_URL = q.get('cgenurl');
+  if (q.get('aot') === '1') globalThis.GEX_NO_JIT = 1;
   if (q.get('densedebug')) globalThis.GEX_DENSE_DEBUG = 1;
   if (q.get('tracemisses')) globalThis.GEX_TRACE_MISSES = 1;
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
@@ -109,7 +113,8 @@ async function main() {
   const exe = q.get('exe') || '/t/window.exe';
   const exeBytes = files[exe] ?? files[hard[exe]];
   if (!exeBytes) throw new Error(`${exe} is not in the bundle`);
-  const args = [exe, ...(q.get('args') ? q.get('args').split(' ') : [])];
+  // `argv=` (a JSON array) keeps arguments with spaces whole; `args=` splits.
+  const args = [exe, ...(q.get('argv') ? JSON.parse(q.get('argv')) : q.get('args') ? q.get('args').split(' ') : [])];
   // Comma-separated, but a comma inside a value stays (GEX_NT_INPUT's
   // `700:click:960,850`): a variable starts where NAME= does.
   const env = (q.get('env') || '').split(/,(?=[A-Za-z_][A-Za-z0-9_]*=)/).filter(Boolean);

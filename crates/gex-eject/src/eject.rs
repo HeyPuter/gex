@@ -42,6 +42,9 @@ pub struct EjectOptions {
     /// gex's browser shim (`gex_browser.wasm`, built from the same source for
     /// the same guest), for a project with a web build.
     pub web_shim: Option<PathBuf>,
+    /// A Windows program's page (web/build-eject-page.sh's output), for the
+    /// web build in a browser: vendored as runtime/web/page.
+    pub web_page: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -399,6 +402,21 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             write_file(&to.join("js").join(f), text.as_bytes(), false)?;
         }
         write_file(&out.join("run.mjs"), crate::pe::WEB_NT_RUN_MJS.as_bytes(), true)?;
+        // The page, when given: index.html and serve.mjs run the web build
+        // in a browser (with OpenGL, on Mesa over WebGPU).
+        if let Some(page) = &o.web_page {
+            if !page.join("nt.html").is_file() {
+                bail!("{} has no nt.html (make it with web/build-eject-page.sh)", page.display());
+            }
+            let to = out.join(crate::pe::WEB_NT_PAGE);
+            if to.exists() {
+                std::fs::remove_dir_all(&to)?;
+            }
+            let mut n = 0;
+            crate::build::copy_tree(page, &to, &mut n)?;
+            write_file(&out.join("index.html"), crate::pe::WEB_NT_INDEX_HTML.as_bytes(), false)?;
+            write_file(&out.join("serve.mjs"), crate::pe::WEB_NT_SERVE_MJS.as_bytes(), true)?;
+        }
         summary.web = true;
     } else if let Some(shim) = &o.web_shim {
         let b = std::fs::read(shim).with_context(|| format!("reading {}", shim.display()))?;
