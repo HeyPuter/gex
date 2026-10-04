@@ -420,6 +420,9 @@ struct JitShared {
     provider: std::collections::HashMap<u64, u64>,
     /// The function table's process half (`ftab`).
     ftab: ftab::Shared,
+    /// A native wasm32 program (`wasmprog`): its native frames cannot be
+    /// unwound and resumed, so a fork is made without leaving them.
+    wasm_program: bool,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -975,6 +978,7 @@ fn run_program_with(
                 stale_blocks: 0,
                 provider: Default::default(),
                 ftab: Default::default(),
+                wasm_program: false,
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1456,7 +1460,7 @@ fn run_thread_loop(
             &mut [],
         );
         if let Some(req) = store.data_mut().pending_fork.take() {
-            fork_process(store, req)?;
+            fork_process(&*store, req)?;
         }
         if let Some(child) = store.data_mut().pending_spawn.take() {
             let cx = store
@@ -1541,9 +1545,9 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
 /// every module the parent translated. What it cannot share is the memory: it
 /// gets a fresh one with the parent's mapped regions copied in — one address
 /// space per process, no copy-on-write, since wasm cannot fault on a write.
-fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
+fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest) -> Result<()> {
     let pid = req.pid;
-    if let Some(aot) = store.data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
+    if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
         if aot.single_process {
             bail!(
                 "gex-eject: the program forked, and the session {} was ejected from never did: \
@@ -1553,11 +1557,13 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         }
     }
     let cx = store
+        .as_context()
         .data()
         .spawn
         .clone()
         .ok_or_else(|| anyhow!("fork with no spawn context"))?;
     let parent_mem = store
+        .as_context()
         .data()
         .memory
         .clone()
@@ -1573,7 +1579,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         let mut child = k.fork_kernel();
         child.pid = pid;
         child.tid = pid;
-        (child, regions, store.data().thread.ctx_addr)
+        (child, regions, store.as_context().data().thread.ctx_addr)
     };
 
     let shared = wasmtime::SharedMemory::new(
@@ -2785,6 +2791,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     child_stack,
                     tls,
                 } => {
+                    // A native wasm32 program: its frames are native code
+                    // that cannot be resumed at a guest PC, so the child is
+                    // made here and the parent carries on (`wasmprog`).
+                    if state.jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program) {
+                        fork_process(&caller, ForkRequest { pid, child_stack, tls })?;
+                        return Ok(());
+                    }
+                    let state = caller.data_mut();
                     // Same reason as a thread: the store is borrowed here, and
                     // a fork has to copy the whole address space.
                     state.pending_fork = Some(ForkRequest {

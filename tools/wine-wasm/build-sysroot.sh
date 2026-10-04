@@ -25,6 +25,20 @@ if [ ! -f config.mak ]; then
 fi
 make -s -j"$JOBS" install-headers install-libs >/dev/null
 
+# Linux UAPI headers (Wine's Unix side includes linux/*.h). asm/ is the
+# host's x86 set taken down its i386 branches: gex-kernel serves the i386
+# ABI. swab.h keeps its generic C (its i386 branch is inline asm).
+SR="$OUT/sysroot/include"
+rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
+cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
+cp -r /usr/include/asm "$SR/asm"
+for h in $(grep -l __i386__ "$SR"/asm/*.h); do
+  case $h in */swab.h) continue ;; esac
+  sed -i -e 's/defined(__i386__)/(defined(__i386__) || defined(__wasm32__))/g' \
+         -e 's/^\(#[ ]*\)ifdef __i386__/\1if defined(__i386__) || defined(__wasm32__)/' \
+         -e 's/^\(#[ ]*\)ifndef __i386__/\1if !defined(__i386__) \&\& !defined(__wasm32__)/' "$h"
+done
+
 cd "$OUT/crt-build"
 objs=
 for f in "$CRT"/*.c; do
