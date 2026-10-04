@@ -839,9 +839,11 @@ fn swap(c: &mut Call<'_>, hdc: u32) -> R<bool> {
             return finish_swap(c, hdc, hwnd);
         }
     }
-    // A display that drops every frame: run the frame, keep the pixels.
+    // A display that drops every frame: run the frame, keep the pixels, and
+    // do not wait for it (the host runs it while the guest builds the next;
+    // a device without asynchronous submits runs it now).
     if c.p.display().is_some_and(|d| !d.shows_frames()) {
-        flush(c)?;
+        flush_async(c)?;
         return finish_swap(c, hdc, hwnd);
     }
     // Read from the default framebuffer with default pack state, then put

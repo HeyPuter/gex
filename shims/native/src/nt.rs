@@ -106,6 +106,12 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
         // nothing either).
         let host: Arc<dyn nt::display::NtDisplay> =
             if out == "null" { Arc::new(NullDisplay) } else { Arc::new(PpmDisplay::new(out)) };
+        // Frames nobody sees: a frame's GL may run while the next is built.
+        if out == "null" {
+            if let Some(dev) = crate::gl::DEVICE.get() {
+                dev.set_threaded();
+            }
+        }
         *p.display_host.lock().unwrap() = Some(host);
     }
     store.data_mut().nt = Some(Arc::clone(&p));
@@ -261,6 +267,9 @@ impl nt::display::NtDisplay for PpmDisplay {
 /// time pass (docs/nt-layer.md §4).
 fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, sampler: Option<Arc<Sampler>>) {
     let stats = std::env::var_os("GEX_NT_STATS").is_some();
+    // GEX_NT_GL_STATS=1: the program's GL by function, with the 60 s report.
+    let gl_stats = std::env::var("GEX_NT_GL_STATS").as_deref() == Ok("1");
+    nt::opengl::STATS.store(gl_stats, std::sync::atomic::Ordering::Relaxed);
     let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
         let (addr, deref) = match v.strip_suffix('*') {
             Some(a) => (a, true),
@@ -351,6 +360,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         eprintln!("gex-nt: syscalls {total}: {}", sc.join(" | "));
                         if let Some(l) = super::nt_cgen::no_unit_line() {
                             eprintln!("{l}");
+                        }
+                        if gl_stats {
+                            eprintln!("gex-nt: gl {}", nt::opengl::take_stats(&p, 16));
                         }
                         let mut ss: Vec<((u32, u32, u64), u64)> =
                             std::mem::take(&mut *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner())).into_iter().collect();

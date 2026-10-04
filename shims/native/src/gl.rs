@@ -19,6 +19,10 @@ use std::sync::{Arc, Mutex};
 pub const GEX_GL_SUBMIT: u64 = 0xc008_6701;
 /// `_IOR('g', 2, ...)`: how big a batch the device will take.
 pub const GEX_GL_LIMITS: u64 = 0x8008_6702;
+/// As [`GEX_GL_SUBMIT`], but returns once the batch is handed over: it runs
+/// on the device's GL thread while the guest goes on (`GEX_GL_SYNC=1` makes
+/// it a plain submit). A failure is reported by the next submit.
+pub const GEX_GL_SUBMIT_ASYNC: u64 = 0xc008_6704;
 
 /// The largest batch the device will read in one go.
 const MAX_BATCH: u32 = 32 * 1024 * 1024;
@@ -36,6 +40,32 @@ pub struct GlDevice {
     capture: Mutex<Capture>,
     /// Where presented frames go (`--wayland-out`), if anywhere.
     sink: Mutex<Option<FrameSink>>,
+    /// The thread every batch runs on (it owns the EGL context), started at
+    /// the first submit.
+    worker: Mutex<Option<std::sync::mpsc::Sender<Job>>>,
+    /// Asynchronous batches handed over and not run yet, and the first
+    /// failure among those run since the last submit looked.
+    pending: Arc<(Mutex<(usize, Option<u32>)>, std::sync::Condvar)>,
+    /// This device, for the GL thread to hold (ioctls get `&self`).
+    me: std::sync::Weak<GlDevice>,
+    /// Batches run on a GL thread of their own, and asynchronous submits are
+    /// taken (`set_threaded`, for a display that drops frames). Otherwise
+    /// every batch runs on the submitting thread, as it always did, and
+    /// `GEX_GL_SUBMIT_ASYNC` is refused (the guest then submits normally).
+    threaded: std::sync::atomic::AtomicBool,
+}
+
+/// `GEX_GL_SYNC=1`: every batch runs before its submit returns.
+fn sync_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_GL_SYNC").as_deref() == Ok("1"))
+}
+
+/// One batch for the GL thread; `done` takes the result back to a
+/// synchronous submit: (reply, status, index of the failed command).
+struct Job {
+    batch: Vec<u8>,
+    done: Option<std::sync::mpsc::Sender<(Vec<u8>, u32, u32)>>,
 }
 
 /// What a presented frame is handed to.
@@ -69,11 +99,15 @@ impl GlDevice {
             Some(path) if !path.is_empty() => Capture::Requested(path.into()),
             _ => Capture::Off,
         };
-        Arc::new(GlDevice {
+        Arc::new_cyclic(|me| GlDevice {
             gl: Mutex::new(None),
             size: (width, height),
             capture: Mutex::new(capture),
             sink: Mutex::new(None),
+            worker: Mutex::new(None),
+            pending: Arc::new((Mutex::new((0, None)), std::sync::Condvar::new())),
+            me: me.clone(),
+            threaded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -112,6 +146,17 @@ impl GlDevice {
         *self.sink.lock().unwrap() = Some(sink);
     }
 
+    /// Run batches on a GL thread and take asynchronous submits: for a
+    /// display that drops frames, where a frame's GL can overlap the guest
+    /// building the next. Before the first batch.
+    pub fn set_threaded(&self) {
+        self.threaded.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn threaded(&self) -> bool {
+        self.threaded.load(std::sync::atomic::Ordering::Relaxed) && !sync_only()
+    }
+
     /// What the host's GL turned out to be, once a guest has asked for it.
     pub fn describe(&self) -> Option<String> {
         match &*self.gl.lock().unwrap() {
@@ -121,8 +166,81 @@ impl GlDevice {
         }
     }
 
-    /// Run one batch, reading it out of guest memory and writing the reply back.
-    fn submit(&self, m: &mut GuestMem<'_>, ring: u64) -> SysResult {
+    /// Run `batch` on this thread: (reply, status, index of the failed
+    /// command). The GL thread's half.
+    fn execute(&self, batch: &[u8]) -> (Vec<u8>, u32, u32) {
+        let mut slot = self.gl.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(Gl::new(self.size.0, self.size.1));
+        }
+        let sink = self.sink.lock().unwrap();
+        match slot.as_mut().unwrap() {
+            Ok(gl) => {
+                gl.keep_frames(sink.is_some());
+                let (reply, status, executed) = gl.run(batch);
+                if let (Some(sink), Some(frame)) = (sink.as_ref(), gl.take_frame()) {
+                    sink(frame);
+                }
+                (reply.bytes().to_vec(), status, executed)
+            }
+            // No GL is reported in the header, not as a failed ioctl, so the
+            // guest falls back as it would for a driver that refused to load.
+            Err(e) => {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| eprintln!("gex-gl: no host GL context: {e}"));
+                (Vec::new(), error::NO_CONTEXT, 0)
+            }
+        }
+    }
+
+    /// The GL thread's queue, started on first use. Batches run in the order
+    /// submitted, synchronous and asynchronous alike.
+    fn queue(&self) -> std::sync::mpsc::Sender<Job> {
+        let mut w = self.worker.lock().unwrap();
+        if let Some(tx) = w.as_ref() {
+            return tx.clone();
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let dev = self.me.upgrade().expect("a GL device in use is alive");
+        std::thread::Builder::new()
+            .name("gex-gl".into())
+            .spawn(move || {
+                for job in rx {
+                    let r = dev.execute(&job.batch);
+                    match job.done {
+                        Some(done) => {
+                            let _ = done.send(r);
+                        }
+                        None => {
+                            let (m, cv) = &*dev.pending;
+                            let mut p = m.lock().unwrap();
+                            if r.1 != error::NONE && p.1.is_none() {
+                                p.1 = Some(r.1);
+                            }
+                            p.0 -= 1;
+                            cv.notify_all();
+                        }
+                    }
+                }
+            })
+            .expect("starting the GL thread");
+        *w = Some(tx.clone());
+        tx
+    }
+
+    /// Wait until at most `n` asynchronous batches are still to run; the first
+    /// failure among those that ran, if any.
+    fn drain_to(&self, n: usize) -> Option<u32> {
+        let (m, cv) = &*self.pending;
+        let mut p = m.lock().unwrap();
+        while p.0 > n {
+            p = cv.wait(p).unwrap();
+        }
+        p.1.take()
+    }
+
+    /// The header and command bytes of the ring at `ring`.
+    fn take_batch(&self, m: &mut GuestMem<'_>, ring: u64) -> Result<(Header, Vec<u8>), Errno> {
         let head = m.read(ring, Header::SIZE)?.to_vec();
         let Some(header) = read_header(&head) else {
             return Err(Errno::EINVAL);
@@ -133,37 +251,28 @@ impl GlDevice {
         if header.capacity > MAX_BATCH || header.tail > header.capacity {
             return Err(Errno::EINVAL);
         }
-
-        let batch = m
-            .read(ring + Header::SIZE as u64, header.tail as usize)?
-            .to_vec();
-
+        let batch = m.read(ring + Header::SIZE as u64, header.tail as usize)?.to_vec();
         self.record(&batch, header.reply_capacity);
+        Ok((header, batch))
+    }
 
-        let mut slot = self.gl.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(Gl::new(self.size.0, self.size.1));
-        }
-        let sink = self.sink.lock().unwrap();
-        let (reply, status, executed) = match slot.as_mut().unwrap() {
-            Ok(gl) => {
-                gl.keep_frames(sink.is_some());
-                let r = gl.run(&batch);
-                if let (Some(sink), Some(frame)) = (sink.as_ref(), gl.take_frame()) {
-                    sink(frame);
-                }
-                r
+    /// Run one batch, reading it out of guest memory and writing the reply back.
+    fn submit(&self, m: &mut GuestMem<'_>, ring: u64) -> SysResult {
+        let (header, batch) = self.take_batch(m, ring)?;
+        let (bytes, status, executed) = if self.threaded() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            if self.queue().send(Job { batch, done: Some(tx) }).is_err() {
+                return Err(Errno::EIO);
             }
-            // No GL is reported in the header, not as a failed ioctl, so the
-            // guest falls back as it would for a driver that refused to load.
-            Err(e) => {
-                static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| eprintln!("gex-gl: no host GL context: {e}"));
-                write_status(m, ring, error::NO_CONTEXT, 0, 0)?;
-                return Ok(0);
-            }
+            rx.recv().map_err(|_| Errno::EIO)?
+        } else {
+            self.execute(&batch)
         };
-        let bytes = reply.bytes();
+        // Behind it in the queue, so everything handed over before has run.
+        if let Some(failed) = self.drain_to(0) {
+            write_status(m, ring, failed, 0, 0)?;
+            return Ok(0);
+        }
         let room = header.reply_capacity as usize;
         let n = bytes.len().min(room);
         if n > 0 {
@@ -172,6 +281,24 @@ impl GlDevice {
         }
         write_status(m, ring, status, executed, n as u32)?;
         Ok(0)
+    }
+
+    /// Hand one batch to the GL thread and return: a frame's GL runs while the
+    /// guest builds the next. At most one is in flight (the next waits for
+    /// it, as a swap chain of two would). A failure of the one before is
+    /// this call's.
+    fn submit_async(&self, m: &mut GuestMem<'_>, ring: u64) -> SysResult {
+        let (_, batch) = self.take_batch(m, ring)?;
+        let failed = self.drain_to(0);
+        self.pending.0.lock().unwrap().0 += 1;
+        if self.queue().send(Job { batch, done: None }).is_err() {
+            return Err(Errno::EIO);
+        }
+        write_status(m, ring, error::NONE, 0, 0)?;
+        match failed {
+            Some(_) => Err(Errno::EIO),
+            None => Ok(0),
+        }
     }
 }
 
@@ -215,6 +342,7 @@ impl FileHandle for GlDevice {
         // `ioctl`'s request is a C `int`, so every `_IOWR` arrives sign-extended.
         match request & 0xffff_ffff {
             GEX_GL_SUBMIT => Some(self.submit(m, arg)),
+            GEX_GL_SUBMIT_ASYNC if self.threaded() => Some(self.submit_async(m, arg)),
             GEX_GL_LIMITS => Some(
                 m.write_u32(arg, MAX_BATCH)
                     .map(|()| 0)
