@@ -63,7 +63,10 @@ fn placement(c: &mut Call<'_>, d: &Dc) -> R<Placement> {
         }),
         // The screen itself: the display DC and the desktop window's.
         None => Ok(Placement {
-            vis: vec![Rect { left: 0, top: 0, right: 1920, bottom: 1080 }],
+            vis: {
+                let m = crate::nt::user::sysparams::mode(c);
+                vec![Rect { left: 0, top: 0, right: m.width, bottom: m.height }]
+            },
             origin: (0, 0),
             screen: (0, 0),
             window: None,

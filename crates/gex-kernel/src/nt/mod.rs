@@ -533,7 +533,7 @@ impl Process {
             presents: AtomicU64::new(0),
             kill_list: Mutex::new(Vec::new()),
             kill_pending: AtomicUsize::new(0),
-            display_mode: AtomicU64::new(user::sysparams::Mode::DEFAULT.pack()),
+            display_mode: AtomicU64::new(user::sysparams::Mode::startup().pack()),
         }
     }
 

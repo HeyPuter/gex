@@ -33,6 +33,24 @@ impl Mode {
         Mode { width: (v & 0xff_ffff) as i32, height: (v >> 24 & 0xff_ffff) as i32, bpp: (v >> 48) as u32 }
     }
 
+    /// The mode at start: [`Mode::DEFAULT`], or `GEX_NT_DESKTOP=WxH` (one of
+    /// the sizes on offer). A smaller desktop is a smaller DirectDraw
+    /// primary surface, which wined3d moves between texture and memory
+    /// whole (Peggle, windowed, reads back and re-uploads it twice a frame).
+    pub fn startup() -> Mode {
+        static M: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+        *M.get_or_init(|| {
+            std::env::var("GEX_NT_DESKTOP")
+                .ok()
+                .and_then(|v| {
+                    let (w, h) = v.split_once('x')?;
+                    let (w, h) = (w.parse().ok()?, h.parse().ok()?);
+                    SIZES.contains(&(w, h)).then_some(Mode { width: w, height: h, bpp: 32 })
+                })
+                .unwrap_or(Mode::DEFAULT)
+        })
+    }
+
     /// The mode in `nt::Process::display_mode`.
     pub fn unpack_current(v: &std::sync::atomic::AtomicU64) -> Mode {
         Mode::unpack(v.load(std::sync::atomic::Ordering::Relaxed))
@@ -352,7 +370,7 @@ pub fn nt_user_enum_display_settings(c: &mut Call<'_>) -> R64 {
     }
     let m = match index {
         -1 => mode(c),
-        -2 => Mode::DEFAULT,
+        -2 => Mode::startup(),
         i if i >= 0 => match mode_at(i as usize) {
             Some(m) => m,
             None => return Ok(0),
@@ -433,7 +451,7 @@ pub fn nt_user_change_display_settings(c: &mut Call<'_>) -> R64 {
     let cur = mode(c);
     let fields = if dm != 0 { c.g.u32(dm + 72)? } else { 0 };
     let want = if fields == 0 {
-        Mode::DEFAULT
+        Mode::startup()
     } else {
         // DM_BITSPERPEL, DM_PELSWIDTH, DM_PELSHEIGHT; the rest of the mode
         // stays as it is.
