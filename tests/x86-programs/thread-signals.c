@@ -51,6 +51,13 @@ static void *waiter(void *arg) {
     return NULL;
 }
 
+static void *block_all(void *arg) {
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
+    return arg;
+}
+
 int main(void) {
     sem_init(&ack, 0, 0);
     struct sigaction sa;
@@ -58,6 +65,14 @@ int main(void) {
     sa.sa_handler = on_usr1;
     sa.sa_flags = SA_RESTART;
     sigaction(SIGUSR1, &sa, NULL);
+    /* The main thread's own mask survives another thread (one that blocks
+       everything) running first: gex once handed the main thread the mask of
+       whichever thread had last been in the kernel. */
+    pthread_t first;
+    pthread_create(&first, NULL, block_all, NULL);
+    pthread_join(first, NULL);
+    pthread_kill(pthread_self(), SIGUSR1);
+    int early = nhandled;
     pthread_t b, w;
     pthread_create(&b, NULL, blocker, NULL);
     pthread_create(&w, NULL, waiter, NULL);
@@ -74,8 +89,13 @@ int main(void) {
     void *pending_in_blocker;
     pthread_join(b, &pending_in_blocker);
     pthread_join(w, NULL);
-    printf("handled on the waiting thread: %s\n", nhandled >= 1 && pthread_equal(handled_on[0], w) ? "yes" : "no");
-    printf("blocked thread took it while blocked: %s\n", while_blocked > 1 ? "yes" : "no");
+    printf("handled on the main thread after an all-blocking thread: %s\n", early == 1 ? "yes" : "no");
+    printf("handled on the waiting thread: %s\n", nhandled >= 2 && pthread_equal(handled_on[1], w) ? "yes" : "no");
+    printf("blocked thread took it while blocked: %s\n", while_blocked > 2 ? "yes" : "no");
     printf("still pending in the blocked thread: %s\n", pending_in_blocker ? "yes" : "no");
+    /* And a signal sent to the main thread runs its handler here. */
+    int before = nhandled;
+    pthread_kill(pthread_self(), SIGUSR1);
+    printf("handled on the main thread: %s\n", nhandled == before + 1 && pthread_equal(handled_on[before], pthread_self()) ? "yes" : "no");
     return 0;
 }

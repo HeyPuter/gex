@@ -1069,6 +1069,12 @@ impl Kernel {
         if tid == self.sig_tid {
             return;
         }
+        // A new kernel (and a forked child's) holds the state of the one
+        // thread it has, whatever its tid: the first thread in adopts it.
+        if self.sig_tid == 0 {
+            self.sig_tid = tid;
+            return;
+        }
         let saved = self.signals.save_thread();
         self.thread_signals.insert(self.sig_tid, saved);
         let next = self
@@ -1768,7 +1774,7 @@ impl Kernel {
                         .collect();
                     eprintln!("[gex:{}] {} blocking on [{}]", self.pid, syscall_name(n), want.join(" "));
                 } else {
-                    eprintln!("[gex:{}] {} blocking", self.pid, syscall_name(n));
+                    eprintln!("[gex:{}.{}] {} blocking", self.pid, self.tid, syscall_name(n));
                 }
             }
             self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
@@ -1825,8 +1831,10 @@ impl Kernel {
         };
         if self.trace {
             eprintln!(
-                "[gex:{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
+                "[gex:{}{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
                 self.pid,
+                // The thread, when it is not the process's first.
+                if self.tid != self.pid { format!(".{}", self.tid) } else { String::new() },
                 syscall_name(n),
                 a[0],
                 a[1],
@@ -2226,8 +2234,9 @@ impl Kernel {
         }
         if self.trace {
             eprintln!(
-                "[gex:{}] after blocking: delivery {:?}, pending {:#x}, blocked {:#x}",
+                "[gex:{}.{}] after blocking: delivery {:?}, pending {:#x}, blocked {:#x}",
                 self.pid,
+                self.tid,
                 delivery,
                 self.signals.pending_raw(),
                 self.signals.blocked
@@ -2856,8 +2865,9 @@ impl Kernel {
             // and worth saying out loud: a process that will not wake looks
             // exactly like one nobody signalled.
             eprintln!(
-                "[gex:{}] signal pending {:#x} but blocked {:#x}",
+                "[gex:{}.{}] signal pending {:#x} but blocked {:#x}",
                 self.pid,
+                self.sig_tid,
                 self.signals.pending_raw(),
                 self.signals.blocked
             );
