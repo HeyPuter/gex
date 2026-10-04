@@ -493,6 +493,40 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
     recovery seeds (5 outside lua51); providers exempt from patched-page
     retirement (Noita's mod sandbox rewrites ~120 lua51 entry points, as
     pewasm also ignores).
+- **Fixed seed (GEX_NT_FIXED_TIME=1767225600, PEWASM_FIXED_TIME's value),
+  same units, cores 1 and 7, GEX_PROF per thread:**
+
+  | run | world fps, 60 s windows from world-up |
+  | --- | --- |
+  | gex eject (AOT-only, gexc) | 38.0, 43.8, 42.4, 36.6, 44.8, 42.7 |
+  | gex `--cgen`, same units (tier-1 behind them, LuaJIT) | 34.5, 38.5, 44.3, 45.6, 44.6, 44.6 |
+  | pewasm bench.cjs | 68.51 |
+
+  The eject runtime adds nothing over normal gex: whole-process and
+  main-thread profiles match within noise (noita.exe 55.9/53.9%, host
+  futex/syscalls 10.6/8.1%, sched_yield 5.2/5.6%, GL 4.4/5.5%, NT layer
+  3.1/4.2%; Lua 1.1% on PUC Lua against 0.6% on LuaJIT). The main thread
+  is about 44% busy, a quarter of it in sched_yield, futexes, GL and the
+  NT layer. The gap to pewasm is gex's, not the eject's.
+- **E7: gex-rt** (`crates/gex-rt`): the runtime with no translator and no
+  wasm compiler (see the commit for what is linked). tests/nt hello_args,
+  sync, apc, mtx and glcompat run on it (glcompat's "a query's result"
+  check is flaky, 2/5 on gex-rt and on gexc alike). Noita on gex-rt, fixed
+  seed, cores 1 and 7, a paired window (load average about 17):
+
+  | run | world fps |
+  | --- | --- |
+  | gex-rt | 38.8, 45.2, 55.9, 52.5, 50.8; then 50.6, 51.1, 54.9, 54.9, 54.6 |
+  | gexc AOT-only | 61.2, 53.2, 49.2, 51.4, 52.9 |
+  | pewasm, between them | 44.70 |
+
+  Under this load pewasm's number moves 39-69 between runs; only paired
+  windows compare.
+- apc passes ejected with R's nested APCs (fb7dfd52). cxx (0x40ef20) and
+  seh (0x401bb0) still stop: the recorded interior entries are given to
+  recovery as seeds, but recovery does not make functions of them (they
+  sit inside another function's loop). Waiting on R's nested faults and
+  F's interior entries.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
