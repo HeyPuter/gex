@@ -376,7 +376,9 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                                 format!("{} t{tid:x} from {} x{n}", nt::syscall_name(nr), p.describe_addr(site))
                             })
                             .collect();
-                        eprintln!("gex-nt: syscall sites (1 in 64) {}", ss.join(" | "));
+                        if !ss.is_empty() {
+                            eprintln!("gex-nt: syscall sites (1 in 64) {}", ss.join(" | "));
+                        }
                         let mut by: std::collections::BTreeMap<String, u64> = Default::default();
                         for (page, n) in crate::tier1_pages() {
                             let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
@@ -468,7 +470,9 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         if let Some(n) = SYSCALLS.get(i) {
             // 1 in 64: who made it, the first return address outside
             // Wine's core DLLs on the guest's frame-pointer chain.
-            if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 63 == 0 && p.abi == nt::Abi::P32 {
+            // GEX_NT_SYSCALL_SITES=1 only: the walk and its lock cost the
+            // measured run itself.
+            if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 63 == 0 && p.abi == nt::Abi::P32 && sites_on() {
                 let site = syscall_site(&p, &memory, ctx_addr);
                 let tid = p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid);
                 *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).entry((i as u32, tid, site)).or_default() += 1;
@@ -491,7 +495,7 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     // translations. NT images are never statically recompiled, so newly
     // mapped code needs nothing here.
     // The kernel lock only when something was recorded since the last look.
-    if gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
+    if gex_kernel::CODE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) != 0 && gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
         let (retired, _mapped) = caller
             .data_mut()
             .with_kernel(|k| (std::mem::take(&mut k.retired_code), std::mem::take(&mut k.new_code)));
@@ -564,7 +568,13 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
 /// NT syscalls by number (GEX_NT_STATS): ntdll's table and win32u's
 /// (0x1000 up).
 const UNIX_CALL_SLOT: usize = 0x1fff;
-/// Sampled syscalls by (number, thread, guest site) (GEX_NT_STATS).
+fn sites_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_NT_SYSCALL_SITES").as_deref() == Ok("1"))
+}
+
+/// Sampled syscalls by (number, thread, guest site) (GEX_NT_STATS with
+/// GEX_NT_SYSCALL_SITES=1).
 static SYSCALL_SITES: std::sync::Mutex<std::collections::BTreeMap<(u32, u32, u64), u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 

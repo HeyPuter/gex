@@ -4092,6 +4092,12 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
 /// module) -- any tier-1 module's in this store, or the thread loop's root
 /// module's. They all reach every slot through the same tables.
 pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::Func> {
+    // The thread loop's, when there is one: the others are found by name,
+    // one instance at a time, and a call-out from a unit (most of them)
+    // would look through every tier-1 module before reaching it.
+    if let Some(f) = caller.data().root_enter.clone() {
+        return Some(f);
+    }
     if let Some(f) = caller.get_export(exports::ENTER).and_then(Extern::into_func) {
         return Some(f);
     }

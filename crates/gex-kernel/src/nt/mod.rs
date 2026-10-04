@@ -39,7 +39,7 @@ use crate::futex::FutexTable;
 use crate::{GuestMem, Kernel};
 use gex_abi::ctx;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub use status as st;
@@ -442,6 +442,9 @@ pub struct Process {
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
+    /// `kill_list`'s length: every syscall looks, and only this word unless
+    /// a thread was told to stop.
+    pub kill_pending: AtomicUsize,
     /// The display mode, `user::sysparams::Mode` packed (ChangeDisplaySettings).
     pub display_mode: AtomicU64,
 }
@@ -529,6 +532,7 @@ impl Process {
             display_host: Mutex::new(None),
             presents: AtomicU64::new(0),
             kill_list: Mutex::new(Vec::new()),
+            kill_pending: AtomicUsize::new(0),
             display_mode: AtomicU64::new(user::sysparams::Mode::DEFAULT.pack()),
         }
     }
@@ -896,7 +900,7 @@ pub fn syscall(
     if p.terminating.load(Ordering::Acquire) {
         return Outcome::Exit(p.exit_code.load(Ordering::Acquire));
     }
-    if p.kill_list.lock().unwrap().contains(&t.tid) {
+    if p.kill_pending.load(Ordering::Acquire) != 0 && p.kill_list.lock().unwrap().contains(&t.tid) {
         let mut c = Call { p, t, kernel, g, nr, pc, outcome: None, ret64: None, host };
         thread::exit_thread(&mut c, p.exit_code.load(Ordering::Acquire));
         return Outcome::ThreadExit;

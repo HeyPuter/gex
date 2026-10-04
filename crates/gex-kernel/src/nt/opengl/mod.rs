@@ -366,37 +366,52 @@ fn cmd_with(c: &mut Call<'_>, opcode: u32, words: &[u32], tail: Tail<'_>) -> R<(
     if len as u32 > CMD_CAPACITY {
         return Err(c.unimplemented(&format!("a GL command of {len} bytes")));
     }
-    let tail_now = c.p.gl.lock().unwrap().tail;
-    if tail_now as usize + len > CMD_CAPACITY as usize {
-        flush(c)?;
-    }
-    let (ring, at) = {
+    // The room, taken under one lock (a flush first when the ring is full).
+    let reserve = |c: &mut Call<'_>| {
         let mut s = c.p.gl.lock().unwrap();
+        if s.tail as usize + len > CMD_CAPACITY as usize {
+            return None;
+        }
         let at = s.tail;
         s.tail += len as u32;
-        (s.ring, at)
+        Some((s.ring, at))
+    };
+    let (ring, at) = match reserve(c) {
+        Some(r) => r,
+        None => {
+            flush(c)?;
+            reserve(c).ok_or_else(|| c.unimplemented(&format!("a GL command of {len} bytes after a flush")))?
+        }
     };
     let base = ring + HEADER + at as u64;
     let head_len = 8 + 4 * words.len();
-    let mut head = Vec::with_capacity(head_len + 4);
-    head.extend_from_slice(&opcode.to_le_bytes());
-    head.extend_from_slice(&(len as u32).to_le_bytes());
-    for w in words {
-        head.extend_from_slice(&w.to_le_bytes());
+    // On the stack for all but the widest commands.
+    let mut small = [0u8; 128];
+    let mut big = Vec::new();
+    let head: &mut [u8] = if head_len + 4 <= small.len() {
+        &mut small[..head_len + 4]
+    } else {
+        big.resize(head_len + 4, 0);
+        &mut big[..]
+    };
+    head[0..4].copy_from_slice(&opcode.to_le_bytes());
+    head[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+    for (i, w) in words.iter().enumerate() {
+        head[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
     }
     match tail {
         Tail::Bytes(b) => {
-            c.g.write(base, &head)?;
+            c.g.write(base, &head[..head_len])?;
             c.g.write(base + head_len as u64, b)?;
         }
         Tail::Blob(b) => {
-            head.extend_from_slice(&(b.len() as u32).to_le_bytes());
-            c.g.write(base, &head)?;
+            head[head_len..].copy_from_slice(&(b.len() as u32).to_le_bytes());
+            c.g.write(base, head)?;
             c.g.write(base + head_len as u64 + 4, b)?;
         }
         Tail::Guest(addr, n) => {
-            head.extend_from_slice(&(n as u32).to_le_bytes());
-            c.g.write(base, &head)?;
+            head[head_len..].copy_from_slice(&(n as u32).to_le_bytes());
+            c.g.write(base, head)?;
             if n > 0 {
                 c.g.m.copy_within(addr, base + head_len as u64 + 4, n).map_err(|_| Status(st::ACCESS_VIOLATION))?;
             }

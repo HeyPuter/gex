@@ -1086,6 +1086,7 @@ pub fn nt_terminate_process(c: &mut Call<'_>) -> R {
             } else {
                 t.apcs.lock().unwrap().clear();
                 c.p.kill_list.lock().unwrap().push(t.tid);
+                c.p.kill_pending.fetch_add(1, Ordering::Release);
                 sync::wake_thread(c, &t);
             }
         }
