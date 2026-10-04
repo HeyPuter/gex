@@ -40,6 +40,15 @@ pub(crate) struct Shared {
     /// Addresses handed to the background translator (`queue`), until a
     /// retirement covers them.
     queued: std::collections::HashSet<u64>,
+    /// Installs that are export providers (`publish_pairs`): native code in
+    /// place of a library's, so a rewrite of the library's bytes there does
+    /// not retire them (the bytes are not what runs). Noita's mod sandbox
+    /// overwrites ~120 lua51.dll entry points; pewasm, whose lua51 is
+    /// native too, ignores those writes the same way.
+    pub providers: std::collections::HashSet<u32>,
+    /// Stateful providers' installs (`libprov`), by module: their data's
+    /// guest address.
+    pub stateful: HashMap<u32, crate::libprov::Extras>,
 }
 
 /// One store's half, inside [`Jit`].
@@ -47,6 +56,12 @@ pub(crate) struct Store {
     pub table: Table,
     pub resolve: wasmtime::Func,
     pub bridge: wasmtime::Func,
+    /// The run loop (`gex_cgen::runtime::ROOT`), which an AOT-only process
+    /// enters through (`aot_only::bind_root`).
+    pub root: wasmtime::Func,
+    /// The stack pointer this thread's stateful providers share
+    /// (`libprov::stack`), made at the first one's instantiation.
+    pub provider_sp: Option<wasmtime::Global>,
     /// How far through the map's log this table is.
     replayed: usize,
 }
@@ -185,16 +200,26 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     let mut c = cx.as_context_mut();
     let resolve = get(&mut c, gex_cgen::runtime::RESOLVE)?;
     let bridge = get(&mut c, gex_cgen::runtime::BRIDGE)?;
-    let fallback = wasmtime::Func::wrap(
-        &mut c,
-        |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> Result<i32> { fallback(&mut caller, ctx, ret as u64) },
-    );
+    let root = get(&mut c, gex_cgen::runtime::ROOT)?;
+    let fallback = if crate::aot_only::enabled() {
+        wasmtime::Func::wrap(
+            &mut c,
+            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, _ret: i64| -> Result<i32> {
+                crate::aot_only::fallback(&mut caller, ctx)
+            },
+        )
+    } else {
+        wasmtime::Func::wrap(
+            &mut c,
+            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> Result<i32> { fallback(&mut caller, ctx, ret as u64) },
+        )
+    };
     let want = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.size() + HEADROOM;
     table.grow(&mut c, want as u64, wasmtime::Ref::Func(Some(resolve.clone())))?;
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, replayed: 0 });
     Ok(())
 }
 
@@ -204,13 +229,14 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
     let Some(jit) = cx.as_context().data().jit.as_ref() else { return Ok(()) };
     let Some(st) = jit.ftab.as_ref() else { return Ok(()) };
     let (sh, from, table, resolve) = (Arc::clone(&jit.shared), st.replayed, st.table, st.resolve.clone());
-    let (events, size, installs, modules): (Vec<Event>, u32, Vec<gex_kernel::ftab::Install>, Vec<Module>) = {
+    #[allow(clippy::type_complexity)]
+    let (events, size, installs, modules, stateful): (Vec<Event>, u32, Vec<gex_kernel::ftab::Install>, Vec<Module>, HashMap<u32, crate::libprov::Extras>) = {
         let s = sh.lock().unwrap_or_else(|e| e.into_inner());
         let ev = s.ftab.map.log_from(from).to_vec();
         if ev.is_empty() {
             return Ok(());
         }
-        (ev, s.ftab.map.size(), s.ftab.map.installs().to_vec(), s.ftab.modules.clone())
+        (ev, s.ftab.map.size(), s.ftab.map.installs().to_vec(), s.ftab.modules.clone(), s.ftab.stateful.clone())
     };
     let have = table.size(cx.as_context_mut());
     if (size as u64) > have {
@@ -221,7 +247,7 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
             Event::Install(i) => {
                 let inst = &installs[i as usize];
                 let module = &modules[inst.module as usize];
-                instantiate(cx.as_context_mut(), table, inst.base, module)?;
+                instantiate(cx.as_context_mut(), table, inst.base, module, stateful.get(&inst.module).copied())?;
             }
             Event::Retire(idx) => {
                 table.set(cx.as_context_mut(), idx as u64, wasmtime::Ref::Func(Some(resolve.clone())))?;
@@ -235,7 +261,13 @@ pub(crate) fn catch_up(mut cx: impl AsContextMut<Data = HostState>) -> Result<()
 }
 
 /// Instantiate a module whose element segment fills `table` from `base`.
-fn instantiate(mut cx: impl AsContextMut<Data = HostState>, table: Table, base: u32, module: &Module) -> Result<wasmtime::Instance> {
+fn instantiate(
+    mut cx: impl AsContextMut<Data = HostState>,
+    table: Table,
+    base: u32,
+    module: &Module,
+    stateful: Option<crate::libprov::Extras>,
+) -> Result<wasmtime::Instance> {
     use gex_abi::ftab as f;
     let (linker, memory) = {
         let d = cx.as_context().data();
@@ -253,14 +285,30 @@ fn instantiate(mut cx: impl AsContextMut<Data = HostState>, table: Table, base: 
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE, table)?;
     let g = i32c(&mut c, base as i32, wasmtime::Mutability::Const)?;
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE_BASE, g)?;
-    let g = i32c(&mut c, 0, wasmtime::Mutability::Const)?;
-    l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
-    // A unit's functions never touch clang's shadow stack (those are stubs),
-    // but a position-independent module imports its pointer all the same.
-    let g = i32c(&mut c, 0, wasmtime::Mutability::Var)?;
-    l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, g)?;
+    match stateful {
+        // A stateful provider: its data where the host put it, and this
+        // thread's own stack (`libprov`).
+        Some(x) => {
+            let g = i32c(&mut c, x.memory_base as i32, wasmtime::Mutability::Const)?;
+            l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
+            let sp = crate::libprov::stack(&mut c)?;
+            l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, sp)?;
+        }
+        None => {
+            let g = i32c(&mut c, 0, wasmtime::Mutability::Const)?;
+            l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
+            // A unit's functions never touch clang's shadow stack (those are
+            // stubs), but a position-independent module imports its pointer
+            // all the same.
+            let g = i32c(&mut c, 0, wasmtime::Mutability::Var)?;
+            l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, g)?;
+        }
+    }
     jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let inst = l.instantiate(&mut c, module).context("instantiating a function-table module")?;
+    if let Some(x) = stateful {
+        crate::libprov::relocate_once(&mut c, &inst, x)?;
+    }
     c.data_mut().jit.as_mut().unwrap().instances.push(inst);
     Ok(inst)
 }
@@ -307,7 +355,37 @@ pub(crate) fn publish_pairs(
     pairs: &[(u64, u32)],
     tier: Tier,
 ) -> Result<u32> {
-    Ok(publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish"))
+    let n = publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish");
+    sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.providers.insert(n);
+    Ok(n)
+}
+
+/// [`publish_pairs`] for a stateful provider (`libprov`): every store
+/// instantiates it with `extras`.
+pub(crate) fn publish_stateful(
+    sh: &Arc<Mutex<JitShared>>,
+    memory: &gex_mem::GuestMemory,
+    module: Module,
+    len: u32,
+    pairs: &[(u64, u32)],
+    extras: crate::libprov::Extras,
+) -> Result<u32> {
+    {
+        let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        let m = s.ftab.modules.len() as u32;
+        s.ftab.stateful.insert(m, extras);
+    }
+    publish_pairs(sh, memory, module, len, pairs, Tier::Unit)
+}
+
+/// The function at `idx` of this store's table (a C function pointer of a
+/// provider module: its table index).
+pub(crate) fn table_func(cx: &mut Caller<'_, HostState>, idx: u32) -> Result<wasmtime::Func> {
+    let t = cx.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|s| s.table).ok_or_else(|| anyhow!("no function table"))?;
+    match t.get(&mut *cx, idx as u64) {
+        Some(wasmtime::Ref::Func(Some(f))) => Ok(f),
+        _ => bail!("function table index {idx} holds no function"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,6 +438,10 @@ fn publish_pairs_at(
 /// are pages a translation was numbered for (`Request::page_gen`), whose
 /// directory entries must be written even with no entry on them.
 pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages: &[(u64, u32)]) -> Result<()> {
+    // No tier-1 dispatch to bridge from.
+    if crate::aot_only::enabled() {
+        return Ok(());
+    }
     let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
     let mut dirs: Vec<(u64, u32)> = pages.to_vec();
     let mut slots = Vec::with_capacity(entries.len());
@@ -426,6 +508,9 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -> bool {
     let inst = s.ftab.map.install(f.install);
     let word = |off: u64| memory.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    if s.ftab.providers.contains(&f.install) {
+        return true;
+    }
     match inst.tier {
         Tier::Unit => {
             let page = addr / gex_abi::DISPATCH_PAGE;
@@ -440,6 +525,12 @@ fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -
     }
 }
 
+/// `GEX_FTAB_TRACE=1`: every host lookup that finds a function, said.
+fn trace_lookups() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_FTAB_TRACE").is_some())
+}
+
 /// `gex.lookup(ctx, addr)`.
 pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i32> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -451,6 +542,15 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
         let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(f) = s.ftab.map.get(addr) {
             if current(&s, memory.bytes(), addr, f) {
+                if trace_lookups() {
+                    let inst = s.ftab.map.install(f.install).clone();
+                    drop(s);
+                    let t = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|st| st.table);
+                    let ty = t.and_then(|t| t.get(&mut *caller, f.idx as u64)).and_then(|r| r.as_func().flatten().map(|f| format!("{:?}", f.ty(&*caller))));
+                    eprintln!("[ftab] lookup {addr:#x} -> index {} (install {}, module {}, base {}, {:?}) holds {ty:?}", f.idx, f.install, inst.module, inst.base, inst.tier);
+                    gex_kernel::ftab::fcache_write(memory.bytes(), addr, f.idx);
+                    return Ok(f.idx as i32);
+                }
                 drop(s);
                 gex_kernel::ftab::fcache_write(memory.bytes(), addr, f.idx);
                 return Ok(f.idx as i32);
@@ -710,6 +810,11 @@ pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u
             }
         }
     }
+}
+
+/// This store's run loop, once its table exists.
+pub(crate) fn root_of(cx: &impl AsContext<Data = HostState>) -> Option<wasmtime::Func> {
+    cx.as_context().data().jit.as_ref()?.ftab.as_ref().map(|s| s.root.clone())
 }
 
 /// The resolve stub's funcref, for a host that fills a table of its own.

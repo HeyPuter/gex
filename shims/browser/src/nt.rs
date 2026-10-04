@@ -351,6 +351,10 @@ mod imp {
             FIXED_ORIGIN.store(unsafe { mono_ns() } as u64, Ordering::Relaxed);
             FIXED_TIME.store(t, Ordering::Relaxed);
         }
+        // An ejected project's stateful providers (docs/eject-pe.md §5.1).
+        if let Some(v) = var("GEX_NT_STATEFUL") {
+            crate::cgen::set_stateful(&v);
+        }
         let prefix = var("GEX_WINE_PREFIX").unwrap_or_else(|| "/wine".into());
         let mut wenv = nt::boot::default_environment();
         let mut settings = Vec::new();

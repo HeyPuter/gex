@@ -137,6 +137,8 @@ pub struct Vm {
     /// [`Vm::find_free`] avoids them while anything else fits, so a heap or
     /// another image does not take a core DLL's base before it loads.
     pub reserved: Vec<(u64, u64)>,
+    /// An exact layout's: nothing but its image ever takes a reserved range.
+    pub strict_reserved: bool,
 }
 
 /// The end of the user address space a fixed-address allocation or view
@@ -184,6 +186,9 @@ impl Vm {
         if !self.reserved.is_empty() {
             if let Some(b) = self.find_free_in(size, top_down, limit, true) {
                 return Some(b);
+            }
+            if self.strict_reserved {
+                return None;
             }
         }
         self.find_free_in(size, top_down, limit, false)

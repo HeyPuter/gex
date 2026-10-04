@@ -251,6 +251,11 @@ pub(crate) struct Emitter<'a> {
     /// `goto gex_resume;` in a whole-image body, `return 0;` in its loop
     /// functions. `None`: the import never returns (a trap follows).
     pub(crate) fault_exit: Option<&'static str>,
+    /// With `fault_exit`: the address after the instruction of the
+    /// statement being emitted, set by the caller for a `HostCall` to
+    /// `Breakpoint` or `Illegal` (`int3`), which carries on there when the
+    /// fault's handlers continue at it.
+    pub(crate) fault_next: Option<u64>,
     /// Values known to be below 2^32 (a zero-extension, a narrow register).
     value_zext: Vec<bool>,
     /// `base + c` (stage 0), its wrap to 32 bits (1) and that zero-extended
@@ -278,6 +283,7 @@ impl<'a> Emitter<'a> {
             tmp: 0,
             class32: false,
             fault_exit: None,
+            fault_next: None,
             value_zext: vec![false; n],
             value_disp: vec![None; n],
         }
@@ -801,6 +807,29 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 self.line("}");
+            }
+            Stmt::HostCall { func, args }
+                if matches!(func, HostFunc::Breakpoint | HostFunc::Illegal)
+                    && self.fault_exit.is_some()
+                    && self.fault_next.is_some() =>
+            {
+                // A resumable fault (`int3`): the host dispatches it nested
+                // and returns with the handlers' state in the context. PC is
+                // set to the next instruction first, so a host that returns
+                // without delivering anything (a trace point) carries on
+                // too; any other PC is a handler's target, which the body's
+                // `gex_resume` (or the loop function's caller) takes.
+                let (exit, next) = (self.fault_exit.unwrap(), self.fault_next.unwrap());
+                let name = if *func == HostFunc::Breakpoint { "gex_breakpoint" } else { "gex_illegal" };
+                let [pc, imm] = args.as_slice() else {
+                    bail!("{func:?} with {} arguments, the import takes 2", args.len());
+                };
+                let (pc, imm) = (self.v(*pc), self.v(*imm));
+                self.flush();
+                self.store_pc(&format!("0x{next:x}ull"));
+                self.line(format!("{name}(ctx, (int64_t)((uint64_t)({pc}) | GEX_RESUMABLE_PC), {imm});"));
+                self.line(format!("if (GEX_C64({}u) != 0x{next:x}ull) {exit}", ctx::PC));
+                self.invalidate();
             }
             Stmt::HostCall { func, args } => {
                 let call = self.host_call_expr(*func, args)?;

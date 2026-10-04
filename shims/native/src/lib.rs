@@ -13,6 +13,8 @@ use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod aot;
+pub mod aot_only;
+pub mod libprov;
 pub mod aot_share;
 pub mod gl;
 pub mod profile;
@@ -139,6 +141,9 @@ pub struct RunOptions {
     /// `aot`). With it, an image is never translated: its module comes from
     /// the project, or the run fails.
     pub aot: Option<Arc<aot::Aot>>,
+    /// Run ahead-of-time code only (`aot_only`): an ejected Windows
+    /// program's runtime, with no tier-1 module and no run-time translator.
+    pub aot_only: bool,
 }
 
 impl Default for RunOptions {
@@ -167,6 +172,7 @@ impl Default for RunOptions {
             cache: true,
             record: None,
             aot: None,
+            aot_only: false,
         }
     }
 }
@@ -196,6 +202,8 @@ struct HostState {
     /// loops entered from code that has none (a function-tier unit or a
     /// function JIT module) when no runtime-translated module exists yet.
     root_enter: Option<wasmtime::Func>,
+    /// This store's NT thread, once a syscall has looked it up.
+    nt_thread: Option<Arc<gex_kernel::nt::Thread>>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
     /// Exceptions being dispatched nested (`nt::raise_nested`), innermost
@@ -547,6 +555,44 @@ struct Inherited {
     wayland: Option<wayland::Wayland>,
 }
 
+/// The wasm engine every guest process runs on. Code compiled ahead of time
+/// for a run (an ejected project's `.cwasm`) must be compiled by an engine
+/// configured exactly so.
+pub fn engine() -> Result<Engine> {
+    let mut config = Config::new();
+    // Deep guest call chains are wasm recursion (units call units): room for
+    // them, on threads with stacks to match (`guest_thread_stack`).
+    config.max_wasm_stack(wasm_stack_bytes());
+    // Traps are control flow here (a call-out's return, a resume, a callback's
+    // end, all StopExecution), hundreds a second in Noita, and each walked
+    // and symbolised the whole wasm stack for a backtrace nothing reads
+    // (`classify_trap` reports the trap's kind). GEX_WASM_BACKTRACE=1 keeps
+    // them, for debugging.
+    config.wasm_backtrace(std::env::var("GEX_WASM_BACKTRACE").as_deref() == Ok("1"));
+    // Tail calls are load-bearing: the whole block-per-function design in
+    // PLAN §2.4 depends on them.
+    config.wasm_tail_call(true);
+    config.wasm_threads(true);
+    config.wasm_bulk_memory(true);
+    // The profile counters are a second memory (`profile`).
+    config.wasm_multi_memory(true);
+    // gex's output is already optimised; Cranelift only adds register
+    // allocation and peepholes, whose time dominates on a large program (half
+    // a minute to compile SQLite vs under two seconds to translate).
+    // `GEX_OPT_LEVEL` picks the trade.
+    config.cranelift_opt_level(match std::env::var("GEX_OPT_LEVEL").as_deref() {
+        Ok("none") => wasmtime::OptLevel::None,
+        Ok("speed_and_size") => wasmtime::OptLevel::SpeedAndSize,
+        _ => wasmtime::OptLevel::Speed,
+    });
+    // `GEX_PERFMAP=1`: name every compiled function in /tmp/perf-<pid>.map,
+    // so a host profiler (perf, samply) attributes JIT and unit code.
+    if std::env::var_os("GEX_PERFMAP").is_some() {
+        config.profiler(wasmtime::ProfilingStrategy::PerfMap);
+    }
+    Engine::new(&config).context("creating the wasm engine")
+}
+
 fn run_program_with(
     program: &Program,
     opts: &RunOptions,
@@ -598,38 +644,7 @@ fn run_program_with(
     let xlate = &xlate;
 
     let phase = std::time::Instant::now();
-    let mut config = Config::new();
-    // Deep guest call chains are wasm recursion (units call units): room for
-    // them, on threads with stacks to match (`guest_thread_stack`).
-    config.max_wasm_stack(wasm_stack_bytes());
-    // Traps are control flow here (a call-out's return, a resume, a callback's
-    // end, all StopExecution), hundreds a second in Noita, and each walked
-    // and symbolised the whole wasm stack for a backtrace nothing reads
-    // (`classify_trap` reports the trap's kind). GEX_WASM_BACKTRACE=1 keeps
-    // them, for debugging.
-    config.wasm_backtrace(std::env::var("GEX_WASM_BACKTRACE").as_deref() == Ok("1"));
-    // Tail calls are load-bearing: the whole block-per-function design in
-    // PLAN §2.4 depends on them.
-    config.wasm_tail_call(true);
-    config.wasm_threads(true);
-    config.wasm_bulk_memory(true);
-    // The profile counters are a second memory (`profile`).
-    config.wasm_multi_memory(true);
-    // gex's output is already optimised; Cranelift only adds register
-    // allocation and peepholes, whose time dominates on a large program (half
-    // a minute to compile SQLite vs under two seconds to translate).
-    // `GEX_OPT_LEVEL` picks the trade.
-    config.cranelift_opt_level(match std::env::var("GEX_OPT_LEVEL").as_deref() {
-        Ok("none") => wasmtime::OptLevel::None,
-        Ok("speed_and_size") => wasmtime::OptLevel::SpeedAndSize,
-        _ => wasmtime::OptLevel::Speed,
-    });
-    // `GEX_PERFMAP=1`: name every compiled function in /tmp/perf-<pid>.map,
-    // so a host profiler (perf, samply) attributes JIT and unit code.
-    if std::env::var_os("GEX_PERFMAP").is_some() {
-        config.profiler(wasmtime::ProfilingStrategy::PerfMap);
-    }
-    let engine = Engine::new(&config).context("creating the wasm engine")?;
+    let engine = engine()?;
 
     // Only the executable is translated ahead of time; the interpreter and its
     // libraries arrive through runtime translation, because at build time we do
@@ -655,7 +670,14 @@ fn run_program_with(
         (m, s)
     };
 
-    let (module, meta) = if let Some(aot) = &opts.aot {
+    if opts.aot_only {
+        aot_only::enable();
+    }
+    let (module, meta) = if opts.aot_only {
+        // An ejected Windows program: no tier-1 module, only the root's
+        // entry (`aot_only`).
+        (Module::new(&engine, aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
+    } else if let Some(aot) = &opts.aot {
         // An ejected project: the image was translated when it was built.
         let dir = use_cache.then(gex_cache::cache_dir).flatten();
         aot::image_module(aot, &engine, dir.as_deref().map(|d| (d, build.as_str())), image)?
@@ -711,7 +733,7 @@ fn run_program_with(
         opts.recompile_objects,
         std::sync::atomic::Ordering::Relaxed,
     );
-    JIT_ON.store(opts.jit, std::sync::atomic::Ordering::Relaxed);
+    JIT_ON.store(opts.jit && !opts.aot_only, std::sync::atomic::Ordering::Relaxed);
     DUMP_ABORT.store(
         std::env::var_os("GEX_DUMP_ABORT").is_some(),
         std::sync::atomic::Ordering::Relaxed,
@@ -861,6 +883,7 @@ fn run_program_with(
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -883,6 +906,9 @@ fn run_program_with(
 
     let mut linker = Linker::new(&engine);
     register_imports(&mut linker)?;
+    if opts.aot_only {
+        aot_only::override_imports(&mut linker)?;
+    }
     // Kept before any store-bound definition is added, so a thread can clone
     // it and define its own memory and table.
     let base_linker = linker.clone();
@@ -912,6 +938,9 @@ fn run_program_with(
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
     store.data_mut().memory = Some(memory.clone());
+    if let Some(dev) = crate::gl::DEVICE.get() {
+        dev.set_memory(memory.clone());
+    }
 
     // Runtime translation needs the table to patch and the engine and linker
     // to build modules with; holding them here turns a dispatch miss into a
@@ -1053,6 +1082,9 @@ fn run_program_with(
         }
     }
 
+    if opts.aot_only {
+        aot_only::bind_root(&mut store, &instance)?;
+    }
     let stopped = run_thread_loop(&mut store, &instance, ctx_addr, entry)?;
     profile::harvest(&mut store)?;
     if let Stopped::Exec(req) = stopped {
@@ -1680,6 +1712,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -1832,6 +1865,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -1890,6 +1924,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
         let data = cx.memory.bytes();
         read_u64(data, (thread.ctx_addr + ctx::PC as u64) as usize)
     };
+    if cx.opts.aot_only {
+        aot_only::bind_root(&mut store, &instance)?;
+    }
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
     profile::harvest(&mut store)?;
     if let Stopped::Exec(_) = stopped {
@@ -2556,6 +2593,7 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
 
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
+    libprov::register(linker)?;
 
     linker.func_wrap(
         m,
@@ -4062,6 +4100,12 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
 /// module) -- any tier-1 module's in this store, or the thread loop's root
 /// module's. They all reach every slot through the same tables.
 pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::Func> {
+    // The thread loop's, when there is one: the others are found by name,
+    // one instance at a time, and a call-out from a unit (most of them)
+    // would look through every tier-1 module before reaching it.
+    if let Some(f) = caller.data().root_enter.clone() {
+        return Some(f);
+    }
     if let Some(f) = caller.get_export(exports::ENTER).and_then(Extern::into_func) {
         return Some(f);
     }
@@ -4209,6 +4253,7 @@ fn retire_translations(
     // Units' rewritten pages first: a lookup after the probe cache is
     // cleared below must already see them (`ftab::current`).
     nt_cgen::on_retire(&memory, ranges);
+    nt_cgen::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut pages = 0usize;
     for &(start, end) in ranges {
@@ -4495,7 +4540,9 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
             }
             other => format!("wasm trap: {other}"),
         };
-        return anyhow!("{detail} (pc≈0x{pc:x})");
+        // The wasm frames, when the engine kept them (GEX_WASM_BACKTRACE=1).
+        let bt = e.downcast_ref::<wasmtime::WasmBacktrace>().map(|b| format!("\n{b:?}")).unwrap_or_default();
+        return anyhow!("{detail} (pc≈0x{pc:x}){bt}");
     }
     e
 }
