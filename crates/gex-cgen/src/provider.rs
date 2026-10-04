@@ -43,6 +43,12 @@ pub struct Provider {
     pub binds: Vec<(String, String)>,
 }
 
+/// Every provider gex carries (`gexc cgen-image --providers` builds them
+/// all into a unit cache, for a host that cannot build them at run time).
+pub fn all() -> Vec<Provider> {
+    SOURCES.iter().map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed")).collect()
+}
+
 /// Whether providers are on (`GEX_PROVIDERS=0` turns them off).
 pub fn enabled() -> bool {
     std::env::var("GEX_PROVIDERS").map_or(true, |v| v != "0")
