@@ -75,9 +75,11 @@ const rest = [];
         } catch {
           return;
         }
-        // An empty directory too: files bring their parents with them, but
-        // a Wine prefix's `Temp` and profile folders arrive empty.
-        if (!names.length) dirs.push(guest);
+        // Every directory: files bring their parents with them, but a Wine
+        // prefix's `Temp` and profile folders arrive empty, and an empty
+        // one's parents need not hold a file either (an ejected project's
+        // sparse prefix: `users/gex/AppData/Local/Temp` alone).
+        if (guest) dirs.push(guest);
         for (const name of names) {
           const h = `${host}/${name}`, g = `${guest}/${name}`;
           // A rootfs has dangling symlinks (Debian's /usr/bin/ld.so), and
