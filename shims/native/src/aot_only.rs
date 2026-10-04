@@ -138,6 +138,12 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32) -> Result<i
     if nt::exc_escape(caller, target) {
         return Err(StopExecution.into());
     }
+    // A branch to memory that is not executable is the guest's own fault
+    // (DEP: an access violation, ExceptionInformation[0] = 8), delivered as
+    // the translator's miss path delivers it. Not a gap in the build.
+    if caller.data().nt.is_some() && !caller.data_mut().with_kernel(|k| k.mem.check_access(target, 1, prot::EXEC)) {
+        return nt::fault(caller, nt::Fault::NotExecutable, target).map(|_| 0);
+    }
     Err(missing(caller, target, "a call or jump"))
 }
 
