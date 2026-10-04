@@ -4209,6 +4209,7 @@ fn retire_translations(
     // Units' rewritten pages first: a lookup after the probe cache is
     // cleared below must already see them (`ftab::current`).
     nt_cgen::on_retire(&memory, ranges);
+    nt_cgen::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut pages = 0usize;
     for &(start, end) in ranges {

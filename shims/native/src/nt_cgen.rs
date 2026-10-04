@@ -406,6 +406,47 @@ pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
     }
 }
 
+/// Provided exports by guest address: a label (`kernel32.dll!OutputDebugStringA`),
+/// the first bytes of the library's own code there when the provider was
+/// bound, and whether a rewrite of them was reported.
+static PROVIDED: Mutex<Option<std::collections::BTreeMap<u64, (String, [u8; PROVIDED_BYTES], bool)>>> = Mutex::new(None);
+const PROVIDED_BYTES: usize = 8;
+
+fn provided_bytes(memory: &[u8], addr: u64) -> [u8; PROVIDED_BYTES] {
+    let mut b = [0; PROVIDED_BYTES];
+    if let Some(m) = memory.get(addr as usize..addr as usize + PROVIDED_BYTES) {
+        b.copy_from_slice(m);
+    }
+    b
+}
+
+fn note_provided(memory: &gex_mem::GuestMemory, addr: u64, label: String) {
+    let bytes = provided_bytes(memory.bytes(), addr);
+    PROVIDED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(addr, (label, bytes, false));
+}
+
+/// Report, once per export, a guest that rewrote the start of an export a
+/// provider serves (a Detours-style hook, a patch). The provider stays
+/// bound (`ftab::Shared::providers`), so the guest's new code there does
+/// not run; on Windows it would. `GEX_PROVIDER_SKIP=<export>` leaves the
+/// export to the library's code, hooks included.
+pub(crate) fn provided_rewrites(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
+    let memory = memory.bytes();
+    let mut guard = PROVIDED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = guard.as_mut() else { return };
+    for &(start, end) in ranges {
+        for (&addr, (label, bytes, told)) in map.range_mut(start.saturating_sub(PROVIDED_BYTES as u64 - 1)..end) {
+            if !*told && provided_bytes(memory, addr) != *bytes {
+                *told = true;
+                let e = label.rsplit('!').next().unwrap_or(label);
+                eprintln!(
+                    "gex-nt: the guest rewrote provided export {label} at {addr:#x} (a hook?); the provider stays bound, so its new code does not run (GEX_PROVIDER_SKIP={e} runs the library's own code)"
+                );
+            }
+        }
+    }
+}
+
 /// Record a placed unit's pages as built, and clear their patched bits.
 fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
     let memory = memory.bytes();
@@ -701,6 +742,12 @@ fn install_providers(p: &Pending, shared: &Arc<Mutex<JitShared>>, engine: &Engin
         let module = Module::from_file(engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
         crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
         crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        let dll = p.path.rsplit(['/', '\\']).next().unwrap_or(&p.path);
+        for (_, e) in &prov.binds {
+            if let Some(&rva) = pv.exports.get(e) {
+                note_provided(memory, p.base + rva as u64, format!("{dll}!{e}"));
+            }
+        }
         eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
     }
     Ok(())

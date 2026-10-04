@@ -40,6 +40,12 @@ pub(crate) struct Shared {
     /// Addresses handed to the background translator (`queue`), until a
     /// retirement covers them.
     queued: std::collections::HashSet<u64>,
+    /// Installs that are export providers (`publish_pairs`): native code in
+    /// place of a library's, so a rewrite of the library's bytes there does
+    /// not retire them (the bytes are not what runs). Noita's mod sandbox
+    /// overwrites ~120 lua51.dll entry points; pewasm, whose lua51 is
+    /// native too, ignores those writes the same way.
+    pub providers: std::collections::HashSet<u32>,
 }
 
 /// One store's half, inside [`Jit`].
@@ -307,7 +313,9 @@ pub(crate) fn publish_pairs(
     pairs: &[(u64, u32)],
     tier: Tier,
 ) -> Result<u32> {
-    Ok(publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish"))
+    let n = publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish");
+    sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.providers.insert(n);
+    Ok(n)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -426,6 +434,9 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -> bool {
     let inst = s.ftab.map.install(f.install);
     let word = |off: u64| memory.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    if s.ftab.providers.contains(&f.install) {
+        return true;
+    }
     match inst.tier {
         Tier::Unit => {
             let page = addr / gex_abi::DISPATCH_PAGE;
