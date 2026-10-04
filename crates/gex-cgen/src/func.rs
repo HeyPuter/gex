@@ -493,6 +493,9 @@ impl FnUnit {
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
         e.class32 = self.class32;
+        if self.ftab {
+            e.fault_exit = Some("goto gex_resume;");
+        }
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
@@ -562,6 +565,9 @@ impl FnUnit {
             let lname = loop_name(f.entry, k, self.copying);
             let mut le = Emitter::new(&dummy, &owned);
             le.class32 = self.class32;
+            if self.ftab {
+                le.fault_exit = Some("return 0;");
+            }
             le.resize(f.n_values as usize);
             // Only the registers the loop itself touches are locals here:
             // everything else is already in the context (the body wrote
@@ -1241,8 +1247,19 @@ impl FnUnit {
             FTerm::Illegal { raw, pc } => {
                 e.flush();
                 e.store_pc(&format!("0x{pc:x}ull"));
-                e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
-                e.line("__builtin_trap();");
+                match e.fault_exit {
+                    Some(exit) => {
+                        e.line(format!("gex_illegal(ctx, (int64_t)(0x{pc:x}ull | GEX_RESUMABLE_PC), (int32_t)0x{raw:x}u);"));
+                        e.line(exit);
+                        if scope.is_none() {
+                            resumed.set(true);
+                        }
+                    }
+                    None => {
+                        e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
+                        e.line("__builtin_trap();");
+                    }
+                }
             }
         }
         if resumed.get() {

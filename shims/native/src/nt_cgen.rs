@@ -102,6 +102,9 @@ struct Pending {
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Set after a push to [`PENDING`]: every syscall drains, and looks here
+/// first rather than taking the lock.
+static HAS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ON: OnceLock<()> = OnceLock::new();
 /// One unit is placed at a time: slot assignment runs from a snapshot of the
 /// page table to the publish.
@@ -298,11 +301,15 @@ pub(crate) fn enable(record: bool) -> Result<()> {
             base: m.base,
             pe: Arc::clone(m.pe),
         });
+        HAS_PENDING.store(true, std::sync::atomic::Ordering::Release);
     });
     Ok(())
 }
 
 fn take_pending() -> Vec<Pending> {
+    if !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
     std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -549,6 +556,14 @@ fn is_wine(p: &Pending) -> bool {
 /// no (`0`, or a list of file names that leaves it out), gets a unit built
 /// for the next run.
 fn missing(p: Pending) -> Result<()> {
+    // Always said, and kept for GEX_NT_STATS: an image on tier-1 because its
+    // unit is missing (a base its unit was not built for, a stale key) is
+    // otherwise only visible as a lower AOT share.
+    let key = gex_xlate::func::pe_input(&p.pe, p.base)
+        .map(|(image, _)| unit_key(&image, &provided(&p.pe, p.base)))
+        .unwrap_or_else(|e| format!("(not placeable: {e})"));
+    eprintln!("gex-nt: warning: {} at {:#x}: no function-tier unit (key {key}); it runs on tier-1", p.path, p.base);
+    NO_UNIT.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{} at {:#x} (key {key})", p.path, p.base));
     if mode() == Mode::Require && !is_wine(&p) {
         bail!(
             "--cgen: {} has no function-tier unit for base {:#x}; build one with \
@@ -584,6 +599,16 @@ fn missing(p: Pending) -> Result<()> {
         Err(e) => eprintln!("gex-nt: could not start building the function tier for {}: {e}", p.path),
     }
     Ok(())
+}
+
+/// Images mapped with no unit for their base, as `missing` reported them.
+static NO_UNIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// GEX_NT_STATS's "no unit" line: every image running on tier-1 for want of
+/// a unit, or `None` when there are none.
+pub(crate) fn no_unit_line() -> Option<String> {
+    let v = NO_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+    (!v.is_empty()).then(|| format!("gex-nt: no unit ({}): {}", v.len(), v.join(" | ")))
 }
 
 /// Place, compile, publish and install, for a caller inside the guest

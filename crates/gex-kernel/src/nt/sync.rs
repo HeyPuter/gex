@@ -454,7 +454,7 @@ pub fn nt_delay_execution(c: &mut Call<'_>) -> R {
     let d = deadline(c, tp)?;
     let now = (c.p.clocks.mono_ns)();
     if d.is_some_and(|d| d <= now) {
-        std::thread::yield_now();
+        guest_yield();
         return Ok(st::SUCCESS);
     }
     let t = Arc::clone(&c.t);
@@ -479,8 +479,35 @@ pub fn nt_delay_execution(c: &mut Call<'_>) -> R {
 
 /// `NtYieldExecution()`.
 pub fn nt_yield_execution(_c: &mut Call<'_>) -> R {
-    std::thread::yield_now();
+    guest_yield();
     Ok(st::SUCCESS)
+}
+
+/// The guest's own yield (`SwitchToThread`, `Sleep(0)`): a host
+/// `sched_yield` by default. `GEX_NT_YIELD=spin`: nothing but a pause, as in
+/// pewasm, whose emscripten `sched_yield` yields to no one (it runs the event
+/// queue). `GEX_NT_YIELD=sleep:N`: a sleep of N microseconds, which gives the
+/// CPU up for real (a Linux `sched_yield` only lets another task on the same
+/// CPU's runqueue run). Knobs for measuring the job-wait loops Noita's main
+/// thread spends its waits in.
+fn guest_yield() {
+    #[derive(Clone, Copy)]
+    enum Y {
+        Os,
+        Spin,
+        Sleep(u64),
+    }
+    static MODE: std::sync::OnceLock<Y> = std::sync::OnceLock::new();
+    let m = *MODE.get_or_init(|| match std::env::var("GEX_NT_YIELD").as_deref() {
+        Ok("spin") => Y::Spin,
+        Ok(v) if v.starts_with("sleep:") => v[6..].parse().map(Y::Sleep).unwrap_or(Y::Os),
+        _ => Y::Os,
+    });
+    match m {
+        Y::Os => std::thread::yield_now(),
+        Y::Spin => std::hint::spin_loop(),
+        Y::Sleep(us) => std::thread::sleep(Duration::from_micros(us)),
+    }
 }
 
 // ---------------------------------------------------------------------------
