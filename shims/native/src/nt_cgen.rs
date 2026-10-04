@@ -260,6 +260,12 @@ pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::Path
     prepare_image(&image, &seeds, jobs, false)
 }
 
+/// The guest addresses export providers take over in a PE image at `base`
+/// (its unit has no entry there: the provider serves them).
+pub fn provider_stubs(pe: &gex_ld::pe::PeImage, base: u64) -> Vec<u64> {
+    provided(pe, base).stubs
+}
+
 /// Build every export provider for a PE image (`gex_cgen::provider`) into the
 /// unit cache, as mapping it would; their names.
 pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
@@ -452,6 +458,11 @@ pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
             }
         }
     }
+}
+
+/// Whether an installed unit covers the code page of `pc`.
+pub(crate) fn unit_covers(pc: u64) -> bool {
+    UNIT_PAGES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&(pc / gex_abi::DISPATCH_PAGE)))
 }
 
 /// Record a placed unit's pages as built, and clear their patched bits.

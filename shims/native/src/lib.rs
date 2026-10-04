@@ -3435,6 +3435,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    if caller.data().nt.is_some() && profile::active() {
+        profile::note_nt_entry(pc);
+    }
     // With runtime translation off, a miss is still worth catching up on --
     // another thread or a freshly mapped object may already have covered this
     // address -- but nothing new is translated for it. A miss that survives
@@ -4517,6 +4520,9 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
 /// Record a taken resume's cause (set with `resume_at`) and target, under
 /// GEX_NT_STATS; `taker` names the loop that took it when no cause was set.
 pub(crate) fn note_resume(state: &mut HostState, target: u64, taker: &str) {
+    if state.nt.is_some() && profile::active() {
+        profile::note_nt_entry(target);
+    }
     let cause = state.resume_cause.take();
     if crate::ftab::stats_on() {
         crate::ftab::stats::note_resume_cause(cause.unwrap_or_else(|| format!("untagged ({taker})")), target);

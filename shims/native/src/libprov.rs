@@ -194,6 +194,12 @@ pub(crate) fn relocate_once(cx: &mut wasmtime::StoreContextMut<'_, HostState>, i
     Ok(())
 }
 
+/// `gex.provider_try` calls (a Lua protected call each: lua_pcall,
+/// lua_resume, lua_close's finalizers, the parser) and the throws they
+/// caught, for GEX_NT_STATS.
+pub static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A `gex.provider_throw` unwinding to its `gex.provider_try`.
 #[derive(Debug)]
 pub(crate) struct Throw(pub i32);
@@ -209,12 +215,16 @@ impl std::error::Error for Throw {}
 /// The host functions stateful providers import.
 pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> Result<i32> {
+        TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let func = ftab::table_func(&mut caller, f as u32)?;
         let typed = func.typed::<i32, ()>(&caller).context("gex.provider_try: the function is not void(int)")?;
         match typed.call(&mut caller, arg) {
             Ok(()) => Ok(0),
             Err(e) => match e.downcast_ref::<Throw>() {
-                Some(t) => Ok(t.0),
+                Some(t) => {
+                    THROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(t.0)
+                }
                 None => Err(e),
             },
         }

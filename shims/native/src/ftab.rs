@@ -43,6 +43,12 @@ pub(crate) struct Shared {
     /// Stateful providers' installs (`libprov`), by module: their data's
     /// guest address.
     pub stateful: HashMap<u32, crate::libprov::Extras>,
+    /// Installs that are export providers (`publish_pairs`): native code in
+    /// place of a library's, so a rewrite of the library's bytes there does
+    /// not retire them (the bytes are not what runs). Noita's mod sandbox
+    /// overwrites ~120 lua51.dll entry points; pewasm, whose lua51 is
+    /// native too, ignores those writes the same way.
+    pub providers: std::collections::HashSet<u32>,
 }
 
 /// One store's half, inside [`Jit`].
@@ -349,7 +355,9 @@ pub(crate) fn publish_pairs(
     pairs: &[(u64, u32)],
     tier: Tier,
 ) -> Result<u32> {
-    Ok(publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish"))
+    let n = publish_pairs_at(sh, memory, module, len, pairs, tier, Vec::new(), None)?.expect("an unconditional publish");
+    sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.providers.insert(n);
+    Ok(n)
 }
 
 /// [`publish_pairs`] for a stateful provider (`libprov`): every store
@@ -499,6 +507,9 @@ fn page_gen(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, page: u64
 fn current(s: &JitShared, memory: &[u8], addr: u64, f: gex_kernel::ftab::Func) -> bool {
     let inst = s.ftab.map.install(f.install);
     let word = |off: u64| memory.get(off as usize..off as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    if s.ftab.providers.contains(&f.install) {
+        return true;
+    }
     match inst.tier {
         Tier::Unit => {
             let page = addr / gex_abi::DISPATCH_PAGE;
@@ -754,6 +765,9 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
         (true, true) => 4,
     };
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
+    if caller.data().nt.is_some() && crate::profile::active() {
+        crate::profile::note_nt_entry(target);
+    }
     if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {
         *stats::FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(target).or_default() += 1;
     }
