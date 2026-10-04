@@ -1025,7 +1025,10 @@ fn with_bound_from(
     };
 
     // 2. Evaluate every case.
-    let mut cases = Vec::with_capacity(hi as usize + 1);
+    // `hi - lo`, not `hi`: a narrow range can sit high (`narrow_values`), and
+    // `hi` alone asked for 16 GB (lazily zero natively, a capacity overflow
+    // in the browser's 32-bit shim).
+    let mut cases = Vec::with_capacity(hi.saturating_sub(lo) as usize + 1);
     let mut writable = false;
     let mut first_loads: Vec<(u64, u32)> = Vec::new();
     let mut second_loads: Vec<(u64, u32)> = Vec::new();
