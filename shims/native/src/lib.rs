@@ -935,6 +935,9 @@ fn run_program_with(
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
     store.data_mut().memory = Some(memory.clone());
+    if let Some(dev) = crate::gl::DEVICE.get() {
+        dev.set_memory(memory.clone());
+    }
 
     // Runtime translation needs the table to patch and the engine and linker
     // to build modules with; holding them here turns a dispatch miss into a

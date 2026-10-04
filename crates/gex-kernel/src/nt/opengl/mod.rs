@@ -1196,10 +1196,10 @@ fn write_back_map(c: &mut Call<'_>, m: &Mapping, at: u64, len: u64) -> R<()> {
     if len == 0 {
         return Ok(());
     }
-    let bytes = c.g.bytes(m.addr + at, len as usize)?;
     let [ol, oh] = proto::Batch::words64(m.offset + at);
     let [sl, sh] = proto::Batch::words64(len);
-    cmd_blob(c, op::BUFFER_SUB_DATA, &[m.target, ol, oh, sl, sh], &bytes)
+    // Straight from the mapping into the ring (no copy between).
+    cmd_blob_at(c, op::BUFFER_SUB_DATA, &[m.target, ol, oh, sl, sh], m.addr + at, len as usize)
 }
 
 /// Generated opcodes of the GL 4.4 transport the hand-written calls here
@@ -2033,18 +2033,25 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             let pbo = c.p.gl.lock().unwrap().bound.get(&0x88eb).copied().unwrap_or(0) != 0;
             let [lo, hi] = proto::Batch::words64(pixels);
             cmd(c, GL44_GET_TEX_IMAGE, &[t, level, format, ty, pbo as u32, lo, hi], &[])?;
-            let mut r = Reply { b: flush(c)?, at: 0 };
+            let (r, n) = flush_in_place(c)?;
             if !pbo && pixels != 0 {
-                let (offset, row_stride, row_bytes, rows, image_stride, images) =
-                    (r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64, r.u32() as u64);
-                let data = r.blob();
+                // { offset, row stride, row bytes, rows, image stride,
+                //   images, blob }: each row copied from the ring's reply
+                // area to its place, with no copy between.
+                if n < 28 {
+                    return Ok(());
+                }
+                let w = |i: u64| c.g.u32(r + 4 * i).map(u64::from);
+                let (offset, row_stride, row_bytes, rows, image_stride, images) = (w(0)?, w(1)?, w(2)?, w(3)?, w(4)?, w(5)?);
+                let len = (w(6)?).min(n as u64 - 28);
+                let data = r + 28;
                 for image in 0..images {
                     for row in 0..rows {
                         let at = image * image_stride + row * row_stride;
-                        if at + row_bytes > data.len() as u64 {
+                        if at + row_bytes > len {
                             break;
                         }
-                        c.g.write(pixels + offset + at, &data[at as usize..(at + row_bytes) as usize])?;
+                        c.g.m.copy_within(data + at, pixels + offset + at, row_bytes as usize).map_err(|_| Status(st::ACCESS_VIOLATION))?;
                     }
                 }
             }
