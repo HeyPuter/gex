@@ -3737,13 +3737,30 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     replay_registry(caller)?;
 
     // If the address that faulted did not end up with code, resuming would
-    // fault again at the same place forever. Say so instead.
-    let covered = {
+    // fault again at the same place forever. Say so instead -- unless its
+    // page was retired while this translation was being made (another
+    // thread's block guard saw a JIT rewrite code there, or an munmap or
+    // mprotect): `publish_unit` then counts the block stale, and translating
+    // again from the current memory is the answer. Bounded, so a page that
+    // keeps changing under its translator still reports.
+    let (covered, retired) = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated.contains(&pc)
+        let page = pc / gex_abi::DISPATCH_PAGE;
+        (sh.translated.contains(&pc), sh.page_table.lookup(page) != translated_module.page_table.lookup(page))
     };
     if !covered {
-        bail!("translated blocks but none covered 0x{pc:x}");
+        thread_local! {
+            static RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        const MAX_RETRIES: u32 = 16;
+        if retired && RETRIES.with(|r| r.get()) < MAX_RETRIES {
+            jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            RETRIES.with(|r| r.set(r.get() + 1));
+            let again = translate_and_install(caller, pc);
+            RETRIES.with(|r| r.set(r.get() - 1));
+            return again;
+        }
+        bail!("translated blocks but none covered 0x{pc:x}{}", if retired { " (its page kept being retired)" } else { "" });
     }
     Ok(true)
 }
