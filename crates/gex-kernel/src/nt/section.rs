@@ -201,6 +201,12 @@ pub fn set_image_mapped_hook(f: impl Fn(&MappedImage<'_>) + Send + Sync + 'stati
 pub struct Layout {
     /// Lower-cased guest path -> (base, size).
     bases: HashMap<String, (u64, u64)>,
+    /// An `exact` layout (gex-eject's: every image a recorded session
+    /// mapped, the program's included): its ranges are kept from every other
+    /// allocation, not only preferred against, and an image that cannot get
+    /// its base fails to map instead of going elsewhere, since an ejected
+    /// project has code built for that base only.
+    pub exact: bool,
 }
 
 /// The layout file's name in the prefix and its first line.
@@ -229,15 +235,23 @@ impl Layout {
             }
         }
         let mut bases = HashMap::new();
+        let mut exact = false;
         for l in lines {
+            if l.trim() == "exact" {
+                exact = true;
+                continue;
+            }
             let f: Vec<&str> = l.split_whitespace().collect();
             let [base, size, _sha, rel] = f[..] else {
                 return Err(format!("{prefix}/{LAYOUT_FILE}: bad line {l:?}"));
             };
             let hex = |v: &str| u64::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|_| format!("{prefix}/{LAYOUT_FILE}: bad number in {l:?}"));
-            bases.insert(format!("{prefix}/{rel}").to_ascii_lowercase(), (hex(base)?, hex(size)?));
+            // A path outside the prefix (an exact layout's program images) is
+            // absolute.
+            let path = if rel.starts_with('/') { rel.to_string() } else { format!("{prefix}/{rel}") };
+            bases.insert(path.to_ascii_lowercase(), (hex(base)?, hex(size)?));
         }
-        Ok(Layout { bases })
+        Ok(Layout { bases, exact })
     }
 
     /// The ranges of the images under `dir` (one architecture's DLL
@@ -246,6 +260,13 @@ impl Layout {
         let dir = dir.to_ascii_lowercase();
         let mut v: Vec<(u64, u64)> =
             self.bases.iter().filter(|(p, _)| p.starts_with(&dir)).map(|(_, &(b, n))| (b, b + n)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Every image's range.
+    pub fn ranges(&self) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = self.bases.values().map(|&(b, n)| (b, b + n)).collect();
         v.sort_unstable();
         v
     }
@@ -369,6 +390,13 @@ fn relocatable_base(stl: &super::State, path: &str, size: u64) -> R<u64> {
             return Ok(b);
         }
         LAYOUT_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if stl.layout.as_ref().is_some_and(|l| l.exact) {
+            crate::nt_log!(
+                "gex-nt: {path} cannot be mapped at {b:#x}, the base the ejected project's code was built for \
+                 (the range is taken); refusing to place it elsewhere"
+            );
+            return Err(Status(st::CONFLICTING_ADDRESSES));
+        }
         if std::env::var_os("GEX_TRACE").is_some() {
             crate::nt_log!("gex-nt: {path} could not get its layout base {b:#x} (taken); placed elsewhere, so its prebuilt unit does not apply");
         }

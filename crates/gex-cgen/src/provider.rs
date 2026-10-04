@@ -11,6 +11,18 @@
 //! for those addresses are stubs that re-enter the table ([`stubs`]), so the
 //! library's own calls reach the provider too.
 //!
+//! Words after the architecture on the first line:
+//! * `stateful`: the provider may have static data and a C stack; the host
+//!   gives it both as it gives an ejected project's stateful providers
+//!   (shims/native libprov: data in guest pages from the NT allocator, one
+//!   stack per thread), and it may `#include` the files in [`INCLUDES`];
+//! * `native`: it imports host functions only the native runtime has
+//!   (`gex.provider_alloc_top`, `gex.nt_qpc`), so only a host that says it has
+//!   them ([`set_native_host`]) binds it; the browser's never does;
+//! * `nowine`: not for Wine's own build of the library (one whose DOS stub
+//!   says "Wine builtin DLL"), whose internals reach the same state by
+//!   other paths ([`for_image`]).
+//!
 //! `GEX_PROVIDERS=0` turns every provider off (A/B runs, lockstep);
 //! `GEX_PROVIDER_SKIP=<export>[,<export>...]` leaves those exports to the
 //! guest's own code.
@@ -29,7 +41,12 @@ const SOURCES: &[(&str, &str)] = &[
     ("crt_mem", include_str!("../providers/crt_mem.c")),
     ("crt_math", include_str!("../providers/crt_math.c")),
     ("debug_string", include_str!("../providers/debug_string.c")),
+    ("crt_heap", include_str!("../providers/crt_heap.c")),
+    ("nt_qpc", include_str!("../providers/nt_qpc.c")),
 ];
+
+/// Files a stateful provider may `#include` (written beside it when built).
+const INCLUDES: &[(&str, &str)] = &[("dlmalloc.inc", include_str!("../providers/dlmalloc.inc"))];
 
 /// One provider source, parsed.
 #[derive(Clone, Debug)]
@@ -39,6 +56,12 @@ pub struct Provider {
     /// The libraries, lower case (`msvcr120.dll`).
     pub dlls: Vec<String>,
     pub class32: bool,
+    /// Has data and a stack (`stateful` on the first line).
+    pub stateful: bool,
+    /// Needs the native host's imports (`native` on the first line).
+    pub native: bool,
+    /// Not for Wine's build of the library (`nowine` on the first line).
+    pub nowine: bool,
     /// (C function, export), in source order.
     pub binds: Vec<(String, String)>,
 }
@@ -52,8 +75,11 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     let first = text.lines().next().unwrap_or("");
     let w: Vec<&str> = first.split_whitespace().collect();
     if w.len() < 4 || w[0] != "/*" || w[1] != "PROVIDES" {
-        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64>`");
+        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64> [stateful] [native]`");
     }
+    let stateful = w[4..].contains(&"stateful");
+    let native = w[4..].contains(&"native");
+    let nowine = w[4..].contains(&"nowine");
     let class32 = match w[3] {
         "i386" => true,
         "x86_64" => false,
@@ -74,7 +100,16 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     let skip = std::env::var("GEX_PROVIDER_SKIP").unwrap_or_default();
     binds.retain(|(_, e)| !skip.split(',').any(|s| s == e));
     let dlls = w[2].split(',').map(|d| d.to_ascii_lowercase()).collect();
-    Ok(Provider { name, text, dlls, class32, binds })
+    Ok(Provider { name, text, dlls, class32, stateful, native, nowine, binds })
+}
+
+static NATIVE_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether what runs here (and the units built here, whose keys and stubs
+/// follow their providers) has the native runtime's imports. Set before the
+/// first key is computed.
+pub fn set_native_host(on: bool) {
+    NATIVE_HOST.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The providers for library `dll` (its export directory's name, any case)
@@ -87,8 +122,17 @@ pub fn for_dll(dll: &str, class32: bool) -> Vec<Provider> {
     SOURCES
         .iter()
         .map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed"))
-        .filter(|p| p.dlls.contains(&dll) && p.class32 == class32)
+        .filter(|p| p.dlls.contains(&dll) && p.class32 == class32 && (!p.native || NATIVE_HOST.load(std::sync::atomic::Ordering::Relaxed)))
         .collect()
+}
+
+/// [`for_dll`] for an image whose file is `data`: without the `nowine`
+/// providers when it is Wine's own build.
+pub fn for_image(dll: &str, class32: bool, data: &[u8]) -> Vec<Provider> {
+    let wine = data.get(0x40..0x50) == Some(&b"Wine builtin DLL"[..]);
+    let mut v = for_dll(dll, class32);
+    v.retain(|p| !(p.nowine && wine));
+    v
 }
 
 /// A hash of `providers`' sources and what they compile against: part of
@@ -101,6 +145,11 @@ pub fn fingerprint(providers: &[Provider]) -> String {
     for p in providers {
         p.name.hash(&mut h);
         p.text.hash(&mut h);
+        // Only a stateful provider sees them: the keys of every other
+        // provider (and so of the units built around it) do not move.
+        if p.stateful {
+            INCLUDES.hash(&mut h);
+        }
     }
     format!("{:016x}", h.finish())
 }
@@ -132,6 +181,11 @@ pub fn build(p: &Provider, root: &Path) -> Result<(PathBuf, Vec<Option<String>>)
         std::fs::create_dir_all(&work)?;
         std::fs::write(work.join("gex_abi.h"), header::header())?;
         std::fs::write(work.join("provider.h"), PRELUDE)?;
+        if p.stateful {
+            for (n, t) in INCLUDES {
+                std::fs::write(work.join(n), t)?;
+            }
+        }
         let src = work.join(format!("{}.c", p.name));
         std::fs::write(&src, format!("#include \"gex_abi.h\"\n#include \"provider.h\"\n#line 1 \"{}.c\"\n{}", p.name, p.text))?;
         let obj = work.join(format!("{}.o", p.name));
@@ -139,16 +193,17 @@ pub fn build(p: &Provider, root: &Path) -> Result<(PathBuf, Vec<Option<String>>)
         let tmp = work.join("p.wasm");
         toolchain::link_image(&work, &[obj], &tmp).with_context(|| format!("linking provider {}", p.name))?;
         // Instantiated as units are: no data (its memory base is 0) and no
-        // shadow stack (its stack pointer is a dummy).
+        // shadow stack (its stack pointer is a dummy). A stateful one gets
+        // both from the host.
         let wasm = std::fs::read(&tmp)?;
         for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
             if let wasmparser::Payload::DataSection(r) = payload? {
-                if r.count() > 0 {
+                if r.count() > 0 && !p.stateful {
                     bail!("provider {} has static data, which a function-table module cannot carry", p.name);
                 }
             }
         }
-        let users = crate::splice::unspliceable_users(&wasm)?;
+        let users = if p.stateful { Vec::new() } else { crate::splice::unspliceable_users(&wasm)? };
         if !users.is_empty() {
             bail!("provider {}: {users:?} use clang's shadow stack", p.name);
         }
@@ -219,5 +274,30 @@ mod tests {
             let p = super::parse(n, t).unwrap();
             assert!(!p.binds.is_empty());
         }
+    }
+
+    /// Needs the units' toolchain: `cargo test -p gex-cgen -- --ignored providers_build`.
+    #[test]
+    #[ignore]
+    fn providers_build() {
+        let root = std::env::temp_dir().join(format!("gex-providers-build-{}", std::process::id()));
+        for (n, t) in super::SOURCES {
+            let p = super::parse(n, t).unwrap();
+            let (path, slots) = super::build(&p, &root).unwrap_or_else(|e| panic!("{n}: {e:#}"));
+            // Nothing left undefined (wasm-ld's --allow-undefined would make
+            // it an import no host provides).
+            for payload in wasmparser::Parser::new(0).parse_all(&std::fs::read(&path).unwrap()) {
+                if let wasmparser::Payload::ImportSection(r) = payload.unwrap() {
+                    for i in r {
+                        let i = i.unwrap();
+                        eprintln!("{n}: imports {}.{}", i.module, i.name);
+                    }
+                }
+            }
+            for (f, _) in &p.binds {
+                assert!(slots.iter().any(|s| s.as_deref() == Some(f.as_str())), "{n}: {f} not in the table");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

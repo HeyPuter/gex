@@ -9794,7 +9794,9 @@ pub extern "C" fn gex_fma_calls() -> i64 {
 
 #[no_mangle]
 pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
-    let pc = fault_pc(pc);
+    // Whole-image units mark a fault they can go on after
+    // (`gex_cgen::RESUMABLE_PC`); the browser still traps out of them.
+    let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
@@ -9840,7 +9842,8 @@ pub extern "C" fn gex_set_trace_blocks(on: i32) {
 
 #[no_mangle]
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
-    let pc = fault_pc(pc);
+    // As in `gex_illegal`: the browser traps out of a resumable fault too.
+    let pc = fault_pc((pc as u64 & !gex_cgen::RESUMABLE_PC) as i64);
     if raw == gex_abi::imports::BRK_TRACE {
         let line = with_host(|h| {
             let gm = GuestMem::new(guest_bytes());
