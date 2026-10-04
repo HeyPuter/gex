@@ -1128,3 +1128,52 @@ recovered but not in the unit (0x52a1dd.., about 1.4%) and ddraw interiors.
 The wasmtime 49 A/B was cancelled: native gexc is the debugging tool, and
 the performance target is the browser page against pewasm in the page.
 Codegen changes are measured under V8 (node or the page) from here on.
+
+### Stream F at the third reboot (2026-10-04, afternoon)
+
+merge/fjit @ this commit (since 440fe8e9: 2a60a53d, the indirect-call
+hints report and `GEX_CGEN_ICALL_FROM` warning). Nothing running.
+
+**V8 comparison (the performance target is the page).** Scratchpad
+`fjit/v8/`: `pw-page.sh` (pewasm in the page, cores 4,10, every Worker
+profiled with `browser-prof.mjs`, a copy of port/browser.mjs),
+`gex-page.sh TAG CACHE_ROOT` (B's browser-noita.mjs on 4,10, ports
+5297/9397, TMPDIR /tmp/gwf: a long TMPDIR breaks Chromium's socket path),
+`cmp.py` (the per-function table), `pwmap.json` (pewasm's unnamed page
+wasm functions -> guest entries by return-address constants, 49,760
+mapped). Result (pa1 vs ga3, sent to the coordinator): gex's main thread
+spins (32.8 ms work per world frame against pewasm's 11.1, NtYieldExecution
+about 18k per frame) on 2 cores; workers 13.5 vs 8.0 ms but inflated by
+preemption. Waiting on R/E's wake-on-idle in the page before profiling
+again.
+
+**Browser units had no devirtualisation.** Every browser cache (B's
+bnoita2/3/3u, and bu) built noita.exe with 0 hints: no `cgen/icall/`. So
+0x70b200's virtual calls (0x4abfa0, 0x5b01b0, 0x4ac0d0: millions per run)
+stay GEX_FTAB call_indirects V8 cannot inline; pewasm calls them directly.
+
+**bu** (`wt/fv8/target/bu`, worktree wt/fv8 at B's f2747801, binary
+`scratchpad/fjit/gexc-fv8`): guarded browser units, carries off
+(`GEX_CGEN_WB_TRAPFREE=0 GEX_CGEN_WB_DEVIRT=0`), prefix at the staged
+layout (541eac20, appended), the four providers (built by a short native
+`GEX_CGEN_GUARD=1 gexc run`), and noita.exe both without hints (key
+a0b9331b...) and with (a0b9331b...-ie77f2dfea53061fa: 4,785 devirtualised
+calls). `bu/cgen/icall/` has noita.exe's profile, so the page now picks the
+hinted one. B wants to reuse bu.
+
+**Hints for the other images: recorded, not yet converted.** Only
+noita.exe had a profile (pewasm's dump). A tier-1 recording of Noita
+(seed-pinned farm, 1300 s, `GEX_PROFILE_EVERY=60`: without it a timeout
+kill writes nothing) is `scratchpad/fjit/noitarec/rec/profile.json`.
+
+**Resume:**
+1. For each of msvcr120 0x15c0000, msvcp120 0x16b0000, lua51 0x1560000,
+   SDL2 0x6c740000, fmod 0x1730000, fmodstudio 0x18f0000 (and the hot Wine
+   DLLs at their layout bases): `tools/icall-hints.py
+   scratchpad/fjit/noitarec/rec/profile.json IMAGE --base BASE --out
+   $(GEX_CGEN_CACHE=CACHE gexc cgen-c IMAGE --pe-base BASE --icall-path)`
+   into cgcache-cg14 and bu (browser: `GEX_CGEN_GUARD=1`), then rebuild
+   those units (`GEX_CGEN_ICALL_FROM` set, check the hints line).
+2. When the coordinator says wake-on-idle is in the page: `gex-page.sh`
+   on bu (hinted) and `pw-page.sh`, then `cmp.py`; then TurboFan dumps of
+   0x724580, 0x70b200, 0x70bdc0 if the workers still lag.
