@@ -1,0 +1,3 @@
+# Written by hand in gexmono-provider.c, not generated.
+mono_jit_init
+mono_jit_init_version

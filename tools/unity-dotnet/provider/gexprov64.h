@@ -84,6 +84,8 @@ static inline int gexp_return(int ctx, uint64_t ret)
 __attribute__((import_module("gex"), import_name("provider_missing"))) void gexp_host_missing(uint64_t addr);
 __attribute__((import_module("gex"), import_name("provider_log"))) void gexp_host_log(const void *p, uint64_t n);
 __attribute__((import_module("gex"), import_name("provider_thread_entry"))) uint64_t gexp_host_thread_entry(void);
+__attribute__((import_module("gex"), import_name("provider_stack"))) uint64_t gexp_host_stack(void);
+#define GEXP_STACK_SIZE (1ul << 20) /* shims/native libprov::STACK */
 
 /* Bound at every export the provider does not implement. */
 #define GEXP_LAST_TARGET 44 /* gex_abi::ctx::LAST_TARGET / 8 */
@@ -93,7 +95,8 @@ __attribute__((import_module("gex"), import_name("provider_thread_entry"))) uint
 /* musl's clone starts a thread at the address the host bound to
  * __gex_thread_start; a provider's is not the program's AT_ENTRY + 16. */
 #define GEXP_DEFINE_THREAD_ENTRY \
-	unsigned long __gex_thread_entry(void) { return gexp_host_thread_entry(); }
+	unsigned long __gex_thread_entry(void) { return gexp_host_thread_entry(); } \
+	int __gex_thread_stack(unsigned long *lo, unsigned long *size) { *lo = gexp_host_stack(); *size = GEXP_STACK_SIZE; return 0; }
 
 /* The element segment: every adapter, plus musl's thread entry. */
 int __gex_thread_start(int, int, int, long long);

@@ -1,18 +1,88 @@
+diff --git a/eng/native/configurecompiler.cmake b/eng/native/configurecompiler.cmake
+index 95641492a..c62cee5e8 100644
+--- a/eng/native/configurecompiler.cmake
++++ b/eng/native/configurecompiler.cmake
+@@ -361,7 +361,12 @@ elseif (CLR_CMAKE_HOST_ARCH_S390X)
+   add_definitions(-DHOST_S390X -DHOST_64BIT -DBIGENDIAN)
+ elseif (CLR_CMAKE_HOST_ARCH_WASM)
+   set(ARCH_HOST_NAME wasm)
+-  add_definitions(-DHOST_WASM -DHOST_32BIT=1)
++  if (CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
++    # gex: wasm64 (noita-wasm docs/unity-dotnet.md)
++    add_definitions(-DHOST_WASM -DHOST_64BIT=1)
++  else()
++    add_definitions(-DHOST_WASM -DHOST_32BIT=1)
++  endif()
+ elseif (CLR_CMAKE_HOST_ARCH_MIPS64)
+   set(ARCH_HOST_NAME mips64)
+   add_definitions(-DHOST_MIPS64 -DHOST_64BIT=1)
+@@ -392,6 +397,8 @@ if (CLR_CMAKE_HOST_UNIX)
+       message("Detected Linux s390x")
+     elseif(CLR_CMAKE_HOST_UNIX_POWERPC64)
+       message("Detected Linux ppc64le")
++    elseif(CLR_CMAKE_HOST_UNIX_WASM)
++      message("Detected Linux wasm64 (gex)")
+     else()
+       clr_unknown_arch()
+     endif()
+@@ -523,7 +530,11 @@ elseif (CLR_CMAKE_TARGET_ARCH_WASM)
+     set(ARCH_TARGET_NAME wasm)
+     set(ARCH_SOURCES_DIR wasm)
+     add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_WASM>)
+-    add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_32BIT>)
++    if (CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
++        add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_64BIT>)
++    else()
++        add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_32BIT>)
++    endif()
+ elseif (CLR_CMAKE_TARGET_ARCH_MIPS64)
+     set(ARCH_TARGET_NAME mips64)
+     set(ARCH_SOURCES_DIR mips64)
+diff --git a/eng/native/configureplatform.cmake b/eng/native/configureplatform.cmake
+index 0154f877e..87b21a777 100644
+--- a/eng/native/configureplatform.cmake
++++ b/eng/native/configureplatform.cmake
+@@ -66,6 +66,9 @@ if(CLR_CMAKE_HOST_OS STREQUAL linux)
+             set(CLR_CMAKE_HOST_UNIX_POWERPC64 1)
+         elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL mips64)
+             set(CLR_CMAKE_HOST_UNIX_MIPS64 1)
++        elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
++            # gex: wasm64 code in an x86-64 Linux guest (noita-wasm docs/unity-dotnet.md)
++            set(CLR_CMAKE_HOST_UNIX_WASM 1)
+         else()
+             clr_unknown_arch()
+         endif()
+@@ -287,6 +290,9 @@ elseif(CLR_CMAKE_HOST_WASI)
+ elseif(CLR_CMAKE_HOST_UNIX_MIPS64)
+     set(CLR_CMAKE_HOST_ARCH_MIPS64 1)
+     set(CLR_CMAKE_HOST_ARCH "mips64")
++elseif(CLR_CMAKE_HOST_UNIX_WASM)
++    set(CLR_CMAKE_HOST_ARCH_WASM 1)
++    set(CLR_CMAKE_HOST_ARCH "wasm")
+ elseif(WIN32)
+     # CLR_CMAKE_HOST_ARCH is passed in as param to cmake
+     if (CLR_CMAKE_HOST_ARCH STREQUAL x64)
 diff --git a/src/mono/CMakeLists.txt b/src/mono/CMakeLists.txt
-index 781cddbfd..93840d8ba 100644
+index 781cddbfd..b761e627e 100644
 --- a/src/mono/CMakeLists.txt
 +++ b/src/mono/CMakeLists.txt
-@@ -405,6 +405,9 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "s390x")
+@@ -405,6 +405,15 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "s390x")
    set(HOST_S390X 1)
  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm32")
    set(HOST_WASM 1)
 +elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm64")
 +  set(HOST_WASM 1)
 +  set(HOST_WASM64 1)
++  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    # gex: a stateful provider inside an x86-64 Linux guest (noita-wasm docs/unity-dotnet.md):
++    # wasm code, but the OS is Linux (musl, x86-64 syscalls served by gex-kernel), with real
++    # threads, mmap and files. No JS, no emscripten.
++    set(HOST_GEX 1)
++  endif()
  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
    set(HOST_POWERPC 1)
    set(HOST_POWERPC64 1)
-@@ -486,6 +489,14 @@ elseif(TARGET_ARCH STREQUAL "wasm" OR TARGET_ARCH STREQUAL "wasm32")
+@@ -486,6 +495,14 @@ elseif(TARGET_ARCH STREQUAL "wasm" OR TARGET_ARCH STREQUAL "wasm32")
    set(MONO_ARCHITECTURE "\"wasm\"")
    set(TARGET_SIZEOF_VOID_P 4)
    set(SIZEOF_REGISTER 4)
@@ -27,8 +97,17 @@ index 781cddbfd..93840d8ba 100644
  elseif(TARGET_ARCH STREQUAL "ppc64le")
    set(TARGET_POWERPC 1)
    set(TARGET_POWERPC64 1)
+@@ -823,7 +840,7 @@ else()
+   set(NAME_DEV_RANDOM "\"/dev/random\"")
+ endif()
+ 
+-if(HOST_LINUX AND HAVE_SYS_MMAN_H AND HAVE_ELF_H AND HAVE_SYS_SYSCALL_H)
++if(HOST_LINUX AND NOT HOST_GEX AND HAVE_SYS_MMAN_H AND HAVE_ELF_H AND HAVE_SYS_SYSCALL_H)
+   set(ENABLE_JIT_DUMP 1)
+ endif()
+ 
 diff --git a/src/mono/cmake/config.h.in b/src/mono/cmake/config.h.in
-index b52242112..728e090c5 100644
+index b52242112..7d2b81fc9 100644
 --- a/src/mono/cmake/config.h.in
 +++ b/src/mono/cmake/config.h.in
 @@ -498,6 +498,9 @@
@@ -41,16 +120,49 @@ index b52242112..728e090c5 100644
  /* ... */
  #cmakedefine TARGET_WASI 1
  
-@@ -540,6 +543,9 @@
+@@ -540,6 +543,12 @@
  /* ... */
  #cmakedefine HOST_WASM 1
  
 +/* gex: wasm with 64-bit pointers */
 +#cmakedefine HOST_WASM64 1
 +
++/* gex: wasm64 in an x86-64 Linux guest */
++#cmakedefine HOST_GEX 1
++
  /* ... */
  #cmakedefine HOST_BROWSER 1
  
+diff --git a/src/mono/mono/component/mini-wasm-debugger.c b/src/mono/mono/component/mini-wasm-debugger.c
+index 8d5fba2b6..6cc1e1aad 100644
+--- a/src/mono/mono/component/mini-wasm-debugger.c
++++ b/src/mono/mono/component/mini-wasm-debugger.c
+@@ -1,4 +1,6 @@
+ #ifndef HOST_WASI
++#include <config.h>
++#if !defined(HOST_GEX) /* gex: no browser debugger (noita-wasm docs/unity-dotnet.md) */
+ #include <glib.h>
+ #include <mono/mini/mini.h>
+ #include <mono/mini/mini-runtime.h>
+@@ -485,3 +487,5 @@ mini_wasm_debugger_add_function_pointers (MonoComponentDebugger* fn_table)
+ }
+ 
+ #endif // !HOST_WASI
++
++#endif /* !HOST_GEX */
+diff --git a/src/mono/mono/mini/CMakeLists.txt b/src/mono/mono/mini/CMakeLists.txt
+index 176bbbb4f..94a52d1b6 100644
+--- a/src/mono/mono/mini/CMakeLists.txt
++++ b/src/mono/mono/mini/CMakeLists.txt
+@@ -229,7 +229,7 @@ set(posix_sources
+ 
+ if(HOST_DARWIN)
+ set(os_sources "${darwin_sources};${posix_sources}")
+-elseif(HOST_LINUX OR HOST_SOLARIS OR HOST_FREEBSD OR HOST_HAIKU)
++elseif((HOST_LINUX AND NOT HOST_GEX) OR HOST_SOLARIS OR HOST_FREEBSD OR HOST_HAIKU)
+ set(os_sources "${posix_sources}")
+ elseif(HOST_WIN32)
+ set(os_sources "${windows_sources}")
 diff --git a/src/mono/mono/mini/aot-runtime-wasm.c b/src/mono/mono/mini/aot-runtime-wasm.c
 index 1687088b1..58267dce9 100644
 --- a/src/mono/mono/mini/aot-runtime-wasm.c
@@ -191,6 +303,180 @@ index 98dfc77ca..f35f8313e 100644
  	if (MONO_TYPE_IS_POINTER (tp))
  		return TRUE;
  	if (MONO_TYPE_IS_REFERENCE (tp))
+diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
+index eb3a8f55a..f6777a63c 100644
+--- a/src/mono/mono/mini/mini-wasm.c
++++ b/src/mono/mono/mini/mini-wasm.c
+@@ -5596,7 +5596,7 @@ mono_arch_context_get_int_reg_address (MonoContext *ctx, int reg)
+ 	return 0;
+ }
+ 
+-#if defined(HOST_BROWSER) || defined(HOST_WASI)
++#if defined(HOST_BROWSER) || defined(HOST_WASI) || defined(HOST_GEX)
+ 
+ void
+ mono_runtime_install_handlers (void)
+@@ -5611,7 +5611,7 @@ mono_init_native_crash_info (void)
+ 
+ #endif
+ 
+-#ifdef HOST_BROWSER
++#if defined(HOST_BROWSER) || defined(HOST_GEX)
+ 
+ void
+ mono_runtime_setup_stat_profiler (void)
+diff --git a/src/mono/mono/utils/CMakeLists.txt b/src/mono/mono/utils/CMakeLists.txt
+index 8c124a1aa..921e9e8c7 100644
+--- a/src/mono/mono/utils/CMakeLists.txt
++++ b/src/mono/mono/utils/CMakeLists.txt
+@@ -130,6 +130,7 @@ set(utils_common_sources
+     mono-threads-aix.c
+     mono-threads-wasm.h
+     mono-threads-wasm.c
++    mono-threads-gex.c
+     mono-threads-sunos.c
+     mono-threads.h
+     mono-threads-debug.h
+diff --git a/src/mono/mono/utils/mono-dl-posix.c b/src/mono/mono/utils/mono-dl-posix.c
+index 0da305efe..f2dfc86f0 100644
+--- a/src/mono/mono/utils/mono-dl-posix.c
++++ b/src/mono/mono/utils/mono-dl-posix.c
+@@ -15,7 +15,7 @@
+ #include <unistd.h>
+ #endif
+ 
+-#if defined(_POSIX_VERSION) && !defined (HOST_WASM)
++#if defined(_POSIX_VERSION) && (!defined (HOST_WASM) || defined (HOST_GEX))
+ 
+ #include "mono/utils/mono-dl.h"
+ #include "mono/utils/mono-path.h"
+diff --git a/src/mono/mono/utils/mono-dl-wasm.c b/src/mono/mono/utils/mono-dl-wasm.c
+index e601c3f96..f147abce5 100644
+--- a/src/mono/mono/utils/mono-dl-wasm.c
++++ b/src/mono/mono/utils/mono-dl-wasm.c
+@@ -2,7 +2,7 @@
+ #include <mono/utils/mono-compiler.h>
+ #include <mono/eglib/glib.h>
+ 
+-#if defined (HOST_WASM)
++#if defined (HOST_WASM) && !defined (HOST_GEX)
+ 
+ #include "mono/utils/mono-dl.h"
+ #include "mono/utils/mono-path.h"
+diff --git a/src/mono/mono/utils/mono-mmap-wasm.c b/src/mono/mono/utils/mono-mmap-wasm.c
+index b2ca24cd6..dd481e0dc 100644
+--- a/src/mono/mono/utils/mono-mmap-wasm.c
++++ b/src/mono/mono/utils/mono-mmap-wasm.c
+@@ -1,7 +1,7 @@
+ 
+ #include <config.h>
+ 
+-#ifdef HOST_WASM
++#if defined(HOST_WASM) && !defined(HOST_GEX)
+ 
+ #include <sys/types.h>
+ #if HAVE_SYS_STAT_H
+diff --git a/src/mono/mono/utils/mono-mmap.c b/src/mono/mono/utils/mono-mmap.c
+index 09af6f899..c96f1f40f 100644
+--- a/src/mono/mono/utils/mono-mmap.c
++++ b/src/mono/mono/utils/mono-mmap.c
+@@ -129,7 +129,7 @@ mono_mem_account_register_counters (void)
+ // Windows specific implementation in mono-mmap-windows.c
+ #define HAVE_VALLOC_ALIGNED
+ 
+-#elif defined(HOST_WASM)
++#elif defined(HOST_WASM) && !defined(HOST_GEX)
+ // WebAssembly implementation in mono-mmap-wasm.c
+ #define HAVE_VALLOC_ALIGNED
+ 
+@@ -376,7 +376,7 @@ mono_file_map_error (size_t length, int flags, int fd, guint64 offset, void **re
+ #ifdef HOST_WASM
+ 	if (length == 0)
+ 		/* emscripten throws an exception on 0 length */
+-		*error_message = g_stdrup_printf ("%s failed file:%s length:0x%" G_GSIZE_FORMAT "x offset:0x%" PRIu64 "X error:%s\n",
++		*error_message = g_strdup_printf ("%s failed file:%s length:0x%" G_GSIZE_FORMAT "x offset:0x%" PRIu64 "X error:%s\n",
+ 			__func__, filepath ? filepath : "", length, (guint64)offset, "mmaps of zero length are not permitted with emscripten");
+ 		return NULL;
+ #endif
+diff --git a/src/mono/mono/utils/mono-threads-gex.c b/src/mono/mono/utils/mono-threads-gex.c
+new file mode 100644
+index 000000000..62fdc8d50
+--- /dev/null
++++ b/src/mono/mono/utils/mono-threads-gex.c
+@@ -0,0 +1,60 @@
++/**
++ * \file
++ * gex (noita-wasm docs/unity-dotnet.md): Mono as wasm64 inside an x86-64
++ * Linux guest. Threads are POSIX threads (mono-threads-posix.c, musl's
++ * pthreads over gex-kernel's clone and futex); suspension is cooperative
++ * only, as on every wasm host: no signal can interrupt wasm code.
++ */
++
++#include "config.h"
++
++#include <mono/utils/mono-threads.h>
++#include <mono/utils/mono-threads-coop.h>
++
++#if defined (USE_GEX_BACKEND)
++
++void
++mono_threads_suspend_init_signals (void)
++{
++}
++
++void
++mono_threads_suspend_init (void)
++{
++	g_assert (mono_threads_is_cooperative_suspension_enabled ());
++}
++
++void
++mono_threads_suspend_register (MonoThreadInfo *info)
++{
++}
++
++void
++mono_threads_suspend_free (MonoThreadInfo *info)
++{
++}
++
++gboolean
++mono_threads_suspend_begin_async_suspend (MonoThreadInfo *info, gboolean interrupt_kernel)
++{
++	return TRUE;
++}
++
++gboolean
++mono_threads_suspend_check_suspend_result (MonoThreadInfo *info)
++{
++	return TRUE;
++}
++
++gboolean
++mono_threads_suspend_begin_async_resume (MonoThreadInfo *info)
++{
++	return TRUE;
++}
++
++void
++mono_threads_suspend_abort_syscall (MonoThreadInfo *info)
++{
++}
++
++#endif /* USE_GEX_BACKEND */
+diff --git a/src/mono/mono/utils/mono-threads-posix.c b/src/mono/mono/utils/mono-threads-posix.c
+index fa1899390..fda4bfa37 100644
+--- a/src/mono/mono/utils/mono-threads-posix.c
++++ b/src/mono/mono/utils/mono-threads-posix.c
+@@ -36,7 +36,7 @@
+ 
+ #include <errno.h>
+ 
+-#if defined(_POSIX_VERSION) && !defined (HOST_WASM)
++#if defined(_POSIX_VERSION) && (!defined (HOST_WASM) || defined (HOST_GEX))
+ 
+ #include <pthread.h>
+ 
 diff --git a/src/mono/mono/utils/mono-threads-wasm.S b/src/mono/mono/utils/mono-threads-wasm.S
 index 8752b03f1..186f92830 100644
 --- a/src/mono/mono/utils/mono-threads-wasm.S
@@ -224,3 +510,69 @@ index 8752b03f1..186f92830 100644
    global.get __stack_high@GOT
    end_function
 +#endif
+diff --git a/src/mono/mono/utils/mono-threads-wasm.h b/src/mono/mono/utils/mono-threads-wasm.h
+index 64fbd11a2..5f5597581 100644
+--- a/src/mono/mono/utils/mono-threads-wasm.h
++++ b/src/mono/mono/utils/mono-threads-wasm.h
+@@ -11,7 +11,7 @@
+ #include <glib.h>
+ #include <mono/utils/mono-threads.h>
+ 
+-#ifdef HOST_WASM
++#if defined(HOST_WASM) && !defined(HOST_GEX)
+ 
+ /*
+  * declared in mono-threads.h
+@@ -105,6 +105,6 @@ mono_threads_wasm_on_thread_unregistered (void);
+ void
+ mono_wasm_pthread_set_name (const char* thread_name);
+ 
+-#endif /* HOST_WASM*/
++#endif /* HOST_WASM && !HOST_GEX */
+ 
+ #endif /* __MONO_THREADS_WASM_H__ */
+diff --git a/src/mono/mono/utils/mono-threads.h b/src/mono/mono/utils/mono-threads.h
+index 44f2535fb..9f7716830 100644
+--- a/src/mono/mono/utils/mono-threads.h
++++ b/src/mono/mono/utils/mono-threads.h
+@@ -128,7 +128,9 @@ and reduce the number of casts drastically.
+ /* If this is defined, use the signals backed on Mach. Debug only as signals can't be made usable on OSX. */
+ // #define USE_SIGNALS_ON_MACH
+ 
+-#ifdef HOST_WASM
++#if defined(HOST_GEX)
++#define USE_GEX_BACKEND
++#elif defined(HOST_WASM)
+ #define USE_WASM_BACKEND
+ #elif defined (_POSIX_VERSION)
+ #if defined (__MACH__) && !defined (USE_SIGNALS_ON_MACH)
+@@ -893,7 +895,7 @@ mono_win32_abort_blocking_io_call (THREAD_INFO_TYPE *info);
+ 		if (GetLastError () != _last_error_restore_point) \
+ 			mono_SetLastError (_last_error_restore_point);
+ 
+-#elif defined(USE_WASM_BACKEND) || defined (USE_POSIX_BACKEND)
++#elif defined(USE_WASM_BACKEND) || defined (USE_POSIX_BACKEND) || defined (USE_GEX_BACKEND)
+ 
+ #define MONO_DEFINE_LAST_ERROR_RESTORE_POINT     \
+ 	int _last_errno_restore_point = errno;
+diff --git a/src/native/libs/CMakeLists.txt b/src/native/libs/CMakeLists.txt
+index cf8b2b47f..e11de6c65 100644
+--- a/src/native/libs/CMakeLists.txt
++++ b/src/native/libs/CMakeLists.txt
+@@ -146,10 +146,13 @@ if (CLR_CMAKE_TARGET_UNIX OR CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
+     endif ()
+ 
+     add_subdirectory(System.Native)
+-    add_subdirectory(System.Globalization.Native)
++    if (NOT GEX_NO_GLOBALIZATION_NATIVE)
++        # gex (noita-wasm docs/unity-dotnet.md) runs invariant globalization: no ICU.
++        add_subdirectory(System.Globalization.Native)
++    endif()
+ 
+-    if (CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
+-        # skip for now
++    if (CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI OR GEX_NO_GLOBALIZATION_NATIVE)
++        # skip for now (gex: no Kerberos or OpenSSL in the provider either)
+     elseif (CLR_CMAKE_TARGET_APPLE)
+         if (NOT CLR_CMAKE_TARGET_TVOS) # no gssapi on tvOS, see https://developer.apple.com/documentation/gss
+             add_subdirectory(System.Net.Security.Native)

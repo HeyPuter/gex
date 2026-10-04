@@ -65,14 +65,24 @@ translate.
    The managed side is the 64-bit Mono CoreLib and BCL, **built from the
    same tag** for `linux-x64` (Muck) and `windows-x64` (Rain World and
    Hollow Knight). CoreLib's icall table must match the runtime exactly.
-4. **Toolchain: emscripten's clang and its `wasm64-emscripten` libc** (already in
-   `/usr/lib/emsdk`'s sysroot), with the output linked as a **PIC side module**
-   (`-m64`, wasm-ld `-shared --experimental-pic`, `dylink.0`), which is the stateful-provider
-   format. Emscripten's JS runtime is not used. The few imports libc makes
-   (`__syscall_*`, clock and futex wait) are gex host imports, backed by
-   gex's Linux syscall layer, which NT processes have too (Wine's unix
-   side uses it). Threads are guest threads (§5), not emscripten's pthread
-   Workers.
+4. **Toolchain: clang and a musl of our own for wasm64, not emscripten**
+   (revised in P2, following stream W's decision for Wine, docs/wine-native.md
+   §3.10).
+   - musl has a gex `wasm64` arch (fork `wt/musl-wasm64`, branch `gex-wasm64`,
+     from W's `gex-wasm32`):
+     - syscalls are the **x86-64 Linux ABI** through `gex.syscall(ctx)`, and
+       every register slot is put back afterwards, since the context is the
+       calling guest thread's;
+     - the kernel layouts are x86-64's own, so nothing is converted;
+     - `brk` stays the guest's.
+   - Mono is configured as **Linux on a wasm64 CPU** (`HOST_GEX`):
+     - wasm for the architecture (no MonoContext, the interpreter);
+     - POSIX for the OS: pthreads, mmap, files and dlopen go through musl to
+       gex-kernel;
+     - suspend is cooperative only, as on every wasm host.
+
+   Emscripten would bring its JS runtime's syscalls, Workers and memory model
+   into a process gex owns. Its build stays only as P1's node smoke test.
 5. **Binding: the whole Mono library is one stateful provider.** When an
    image named `mono-2.0-bdwgc.dll` or `libmonobdwgc-2.0.so` maps (UnityPlayer
    `dlopen`s or `LoadLibrary`s it), every export of that image is bound in
@@ -263,7 +273,7 @@ Native gexc runs the same provider on wasmtime. It is for correctness only.
 | step | what | done when |
 |---|---|---|
 | P1 | The fork's Mono built for wasm64 with the interpreter; CoreLib from the same tree for linux-x64; System.Native for wasm64. **Done** (§9). | `mono_jit_init` + CoreLib load, run natively |
-| P2 | Stateful providers for x86-64: SysV and Win64 adapters, M64 (today they are i386-only and never M64; mem64.md §10), TLS, `provider_bind`, guest-thread creation. Built on integ's `libprov.rs`. | tests in tests/x86-programs |
+| P2 | Stateful providers for x86-64: SysV adapters, M64, TLS, guest-thread creation, Linux shared objects; the Mono runtime packaged as one. **Done** (§10). | tests/unity-dotnet/prov64, tests/unity-dotnet/embed |
 | P3 | `tests/unity-dotnet/embed.c`: a small x86-64 Linux program that dlopens a stub `libmonobdwgc-2.0.so` (exports only) and, like UnityPlayer, calls `mono_jit_init_version`, opens a test assembly, finds a class and method, registers an icall, calls `runtime_invoke`. The managed code calls the icall back, which raises; it also uses GC handles, strings, arrays and a GC with an object held only on the x86 stack. | it prints the same as the same program on host Mono |
 | P4 | Muck: the shim layer for the 272 names, the find-plugin callback, failed-lookup logging. | the player log reaches "Completed reload", then the menu, natively |
 | P5 | The browser: the provider in the browser shim, wasm EH for icall exits. | Muck's menu in Chromium. Then the AOT tier, and fps measured paired with Muck on x86 Mono (`GEX_UNITY_DOTNET=0`) |
@@ -357,3 +367,79 @@ Not yet:
   - its emitter's addresses;
   - pointer-to-int casts in `interp.c`'s JIT entry and in the jiterpreter,
     which the compiler flags.
+
+## 10. P2 as built (2026-10-04)
+
+**Stateful providers for x86-64 Linux guests with a 64-bit memory**
+(shims/native libprov, additive; streams E and W share the file):
+- `Extras::memory_base` is u64, and the provider stack global is i64 under
+  M64.
+- `register64`: the `gex.provider_*` imports with i64 pointers and table
+  indices, plus `provider_thread_entry` and `provider_stack`.
+- A module containing musl's `__gex_thread_start` gets a guest address of
+  its own (low, read-only) bound to it, for `clone`.
+- `libprov::on_linux_maps`: when a Linux shared object a provider serves
+  maps executable, its `.dynsym` exports are bound before the loader can
+  call into it.
+- `GEX_WASM_DLLS=soname=module.wasm` applies to Linux programs too.
+
+**The provider runtime:**
+- `tools/unity-dotnet/sysroot` builds musl wasm64 and compiler-rt.
+- `tools/unity-dotnet/provider/gexprov64.h` gives the SysV/Win64 register
+  view, entry (which sets the thread context, and attaches musl's
+  per-thread state on a thread's first visit) and return.
+- musl's `__gex_provider_init` runs once per process:
+  - libc's own state, from a fake auxv and `/proc/self/environ`;
+  - the module's constructors.
+- `__gex_provider_attach` runs once per guest thread: a `struct pthread`, a
+  TLS block, and the C stack libprov gave the thread.
+- Threads the provider creates are guest threads (`clone`), started at the
+  bound entry.
+
+**Mono as a provider** (`tools/unity-dotnet/mono/build.sh OUT`):
+- The fork is configured `HOST_GEX` (patches/0001-wasm64.patch):
+  - a `wasm64` processor;
+  - POSIX threads, mmap and dl, with `mono-threads-gex.c` for cooperative
+    suspend;
+  - no jitdump, no mini-posix signals;
+  - `eng/native` taught wasm64 Linux (64-bit, not 32).
+- System.Native is built for the same target, with no ICU, Kerberos or
+  OpenSSL.
+- `host/gen-adapters.py` writes a SysV adapter for every public `mono_*`
+  function the build defines (661). Callback-taking functions are skipped:
+  they need guest calls, which is P3.
+- `host/gexmono-provider.c` does the browser driver's pre-init before
+  `mono_jit_init*`, and supplies Mono's two C++-exception entry points
+  through `gex.provider_try`/`throw`.
+- The result is one 17 MB PIC module (with names). It imports only the
+  memory, the table, the three PIC globals, `gex.syscall` and five
+  `gex.provider_*` functions.
+
+**Tests** (native, `--mem64`):
+- **tests/unity-dotnet/prov64.** An x86-64 glibc program dlopens `libgt.so`
+  and calls it from three threads. The calls cover integers, 8 arguments,
+  doubles and floats, TLS, malloc, write, getenv, and the library's own
+  pthreads. The wasm64 provider runs instead of the library, and the output
+  matches the native run.
+- **tests/unity-dotnet/embed.** An x86-64 program does what UnityPlayer
+  does: it dlopens `libmonobdwgc-2.0.so` (a stub whose every export
+  aborts) and dlsyms the API. Under gex:
+  - CoreLib boots on the interpreter;
+  - `t.dll` loads, and class and method lookup work;
+  - `mono_runtime_invoke` runs collections, `GC.Collect`, string
+  concatenation and reflection;
+  - a full collection completes.
+- tests/x86-programs 69/69, tests/providers 3/3.
+
+**Not yet (P3):**
+- calls from managed code into guest code: icalls, P/Invokes, callbacks;
+- reverse thunks;
+- `mono_raise_exception` through guest frames;
+- conservative scanning of guest stacks and contexts, and SGen in its
+  Boehm-like mode;
+- signals at a provider's syscall (musl's `__gex_signal_frames` stops
+  loudly);
+- the browser shim's side (`register64` and `on_linux_maps` are native
+  only);
+- the Win64 ABI and NT processes, where every syscall is an NT call, so the
+  provider's libc needs an NT-side route.
