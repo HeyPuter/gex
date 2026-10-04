@@ -20,6 +20,8 @@ pub mod gl;
 pub mod profile;
 pub mod nt;
 pub mod nt_cgen;
+pub mod wasmprog;
+mod ready;
 pub(crate) mod ftab;
 pub mod wayland;
 
@@ -419,6 +421,9 @@ struct JitShared {
     provider: std::collections::HashMap<u64, u64>,
     /// The function table's process half (`ftab`).
     ftab: ftab::Shared,
+    /// A native wasm32 program (`wasmprog`): its native frames cannot be
+    /// unwound and resumed, so a fork is made without leaving them.
+    wasm_program: bool,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -974,6 +979,7 @@ fn run_program_with(
                 stale_blocks: 0,
                 provider: Default::default(),
                 ftab: Default::default(),
+                wasm_program: false,
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1022,6 +1028,13 @@ fn run_program_with(
                 data[off..off + 4].copy_from_slice(&base.to_le_bytes());
             }
         }
+    }
+
+    // A native wasm32 program (stream W): its module, not its x86 bytes,
+    // runs at the entry. After the directory above, which its bridges
+    // overwrite.
+    if nt_setup.is_none() {
+        wasmprog::install(&mut store, &memory, program)?;
     }
 
     if opts.verbose {
@@ -1229,12 +1242,16 @@ fn perform_block(
     use gex_kernel::errno::Errno;
     /// One turn of a wait loop: let the host do its work, then give up if a
     /// signal has arrived.
+    ///
+    /// The turn ends early when a syscall elsewhere may have made a
+    /// descriptor ready (`ready`); `$seen` is the sequence taken before this
+    /// turn's check.
     macro_rules! turn {
-        () => {
+        ($seen:expr) => {
             if interrupted() {
                 return Err(Errno::EINTR);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            ready::wait($seen, std::time::Duration::from_millis(1));
         };
     }
     match op {
@@ -1272,9 +1289,10 @@ fn perform_block(
         }
         // Both are polls; natively a real thread sleeps here, costing nobody.
         BlockOp::Connect { socket } => loop {
+            let seen = ready::seq();
             match socket.status() {
                 gex_kernel::net::Status::Connecting => {
-                    turn!();
+                    turn!(seen);
                 }
                 gex_kernel::net::Status::Open => return Ok(0),
                 gex_kernel::net::Status::Refused => return Err(Errno::ECONNREFUSED),
@@ -1288,6 +1306,7 @@ fn perform_block(
         } => {
             let start = std::time::Instant::now();
             loop {
+                let seen = ready::seq();
                 service(data);
                 if gex_kernel::syscalls::poll_ready(&fds) {
                     let mut mem = GuestMem::new(data);
@@ -1297,20 +1316,21 @@ fn perform_block(
                     let mut mem = GuestMem::new(data);
                     return gex_kernel::syscalls::poll_finish(&fds, &report, &mut mem);
                 }
-                turn!();
+                turn!(seen);
             }
         }
         BlockOp::WriteStream { handle, buf, len } => {
             let data = GuestMem::new(data).read(buf, len)?.to_vec();
             let mut done = 0usize;
             while done < data.len() {
+                let seen = ready::seq();
                 if !handle.poll_writable() {
                     // A partial write already delivered is the caller's
                     // answer; only an untouched write reports the signal.
                     if interrupted() {
                         return if done > 0 { Ok(done as u64) } else { Err(Errno::EINTR) };
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    ready::wait(seen, std::time::Duration::from_millis(1));
                     continue;
                 }
                 match handle.write_at(0, &data[done..]) {
@@ -1327,6 +1347,7 @@ fn perform_block(
         BlockOp::ReadStream { handle, buf, len } => {
             let mut tmp = vec![0u8; len];
             loop {
+                let seen = ready::seq();
                 service(data);
                 if handle.poll_readable() {
                     let n = handle.read_at(0, &mut tmp)?;
@@ -1334,26 +1355,28 @@ fn perform_block(
                     mem.write(buf, &tmp[..n as usize])?;
                     return Ok(n);
                 }
-                turn!();
+                turn!(seen);
             }
         }
         BlockOp::SigSuspend { .. } => loop {
             // Nothing to poll but the signal state, which `interrupted` is.
+            let seen = ready::seq();
             service(data);
             if interrupted() {
                 return Err(Errno::EINTR);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            ready::wait(seen, std::time::Duration::from_millis(1));
         },
         BlockOp::AcceptWait { socket } => {
             // Only the wait: the descriptor is made by the kernel afterwards,
             // which is the one place that has a descriptor table.
             loop {
+                let seen = ready::seq();
                 service(data);
                 if socket.poll_readable() {
                     return Ok(0);
                 }
-                turn!();
+                turn!(seen);
             }
         }
         BlockOp::WaitChild {
@@ -1448,7 +1471,7 @@ fn run_thread_loop(
             &mut [],
         );
         if let Some(req) = store.data_mut().pending_fork.take() {
-            fork_process(store, req)?;
+            fork_process(&*store, req)?;
         }
         if let Some(child) = store.data_mut().pending_spawn.take() {
             let cx = store
@@ -1533,9 +1556,9 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
 /// every module the parent translated. What it cannot share is the memory: it
 /// gets a fresh one with the parent's mapped regions copied in — one address
 /// space per process, no copy-on-write, since wasm cannot fault on a write.
-fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
+fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest) -> Result<()> {
     let pid = req.pid;
-    if let Some(aot) = store.data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
+    if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
         if aot.single_process {
             bail!(
                 "gex-eject: the program forked, and the session {} was ejected from never did: \
@@ -1545,11 +1568,13 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         }
     }
     let cx = store
+        .as_context()
         .data()
         .spawn
         .clone()
         .ok_or_else(|| anyhow!("fork with no spawn context"))?;
     let parent_mem = store
+        .as_context()
         .data()
         .memory
         .clone()
@@ -1565,7 +1590,7 @@ fn fork_process(store: &mut Store<HostState>, req: ForkRequest) -> Result<()> {
         let mut child = k.fork_kernel();
         child.pid = pid;
         child.tid = pid;
-        (child, regions, store.data().thread.ctx_addr)
+        (child, regions, store.as_context().data().thread.ctx_addr)
     };
 
     let shared = wasmtime::SharedMemory::new(
@@ -2708,6 +2733,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             } else {
                 outcome
             };
+            // Wake threads parked on descriptors if this call may have made
+            // one ready (`ready`).
+            if caller.data_mut().with_kernel(|k| k.take_fd_activity()) {
+                ready::notify();
+            }
             profile::syscall_exit(caller.data_mut(), memory.bytes());
             // The compositor runs here, between one syscall and the next. A
             // client writes a request and then waits for the reply, and the
@@ -2777,6 +2807,14 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     child_stack,
                     tls,
                 } => {
+                    // A native wasm32 program: its frames are native code
+                    // that cannot be resumed at a guest PC, so the child is
+                    // made here and the parent carries on (`wasmprog`).
+                    if state.jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program) {
+                        fork_process(&caller, ForkRequest { pid, child_stack, tls })?;
+                        return Ok(());
+                    }
+                    let state = caller.data_mut();
                     // Same reason as a thread: the store is borrowed here, and
                     // a fork has to copy the whole address space.
                     state.pending_fork = Some(ForkRequest {

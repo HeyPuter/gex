@@ -312,9 +312,26 @@ impl UnixSocket {
     }
 
     pub fn shutdown(&self) {
-        if let Role::Connected { tx, .. } = &*self.role.lock().unwrap() {
+        self.shutdown_how(1);
+    }
+
+    /// `shutdown(2)`: 0 stops reading (the peer's writes then fail with
+    /// EPIPE), 1 stops writing (the peer reads end-of-file and polls
+    /// readable), 2 both. Not connected is `ENOTCONN`.
+    pub fn shutdown_how(&self, how: u64) -> SysResult {
+        if how > 2 {
+            return Err(Errno::EINVAL);
+        }
+        let Role::Connected { rx, tx, .. } = &*self.role.lock().unwrap() else {
+            return Err(Errno::ENOTCONN);
+        };
+        if how != 1 {
+            rx.close();
+        }
+        if how != 0 {
             tx.close();
         }
+        Ok(0)
     }
 }
 
