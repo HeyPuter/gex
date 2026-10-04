@@ -612,10 +612,34 @@ runs under the same load.
   `threadwork.py TAG` splits each thread's ms/frame into guest code,
   yield/spin and the rest. pewasm's BUSY counts its `_Yield` sleeps as
   waiting, so compare the real-work column with pewasm's t0/t1/t2.
-- **Fixed seed:** `GEX_NT_FIXED_TIME=1767225600` (54cb7124) is
-  PEWASM_FIXED_TIME's counterpart. Noita seeds its world from the date:
-  on cg10 two random-seed runs gave 58 and 38-50 world fps while pewasm
-  ran a steady 80 beside both.
+- **Fixed seed (corrected 2026-10-04, stream E): the fixed-time variables
+  do not fix the world.** `GEX_NT_FIXED_TIME=1767225600` (54cb7124) and
+  PEWASM_FIXED_TIME pin the date, but Noita does not seed its world from
+  it. noita.exe 0x883540: the world seed (stored at 0x1205004) is the
+  WORLD_SEED magic number if set, else drawn from the engine's RNG, seeded
+  at start-up. Every "fixed seed" run before this note had a random world
+  on both runtimes. The pin, the same on both:
+  - **`port/seedpin/`**: a mod (`mod.xml`, `init.lua` calling
+    `ModMagicNumbersFileAdd`, a `magic_numbers.xml` with WORLD_SEED written
+    per run) and the save's `mod_config.xml` enabling it. The game install
+    is never written. `NOITA_WORLD_SEED` picks the seed (default
+    1767225600; 0 = random).
+  - **pewasm:** `port/bench.cjs` (so also `port/tput.sh`) writes them into
+    its in-memory FS before start (`/mods/seedpin`,
+    `/locallow/Nolla_Games_Noita/save00`) and prints `world seed N`, read
+    from the game's memory.
+  - **gex, `gexc run`:** run noita.exe from a farm, the install as symlinks
+    plus the mod (`port/seedpin/pin.sh farm DIR`, once; unit keys are by
+    content, so the units still match), and after the run script deletes
+    the save, `pin.sh save <prefix>/drive_c/users/gex/AppData/LocalLow/Nolla_Games_Noita/save00`.
+  - **gex, an ejected project:** `pin.sh mod <rootfs>/<game dir>` and
+    `pin.sh save <rootfs>/<save00>` (run-ejected.sh does both).
+  - **Check:** `GEX_NT_PEEK=0x1205004` prints the world seed as `peek=`.
+    "Setting random seed: N" is the engine's start-up RNG, not the world,
+    and differs every run with or without the pin.
+  - Verified 2026-10-04: world seed 1767225600 on pewasm (two runs), on
+    the ejected project (two) and on `gexc run` from the farm (one);
+    without the pin, 731381664 (pewasm) and 775215642 (gex).
 - **Pairs:** pewasm runs right before and after each gex run, on the same
   cores. On this machine pewasm alone ranged from 40 to 92 world fps
   during the day, with load.
