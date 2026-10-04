@@ -1,7 +1,7 @@
 # Wine as native wasm: plan (draft, 2026-10-03)
 
 Status: stream W, W0 in progress (2026-10-04). The toolchain is decided
-(§3.10); spikes (a) and (c) have run (§4.1); (b) is next.
+(§3.10); all three spikes have run (§4.1).
 
 ## 1. Why
 
@@ -397,6 +397,68 @@ Today's path keeps working throughout. Programs switch per process
   - **dlopen** of Unix libraries: the same install with a data region,
     plus symbol binding between modules. Not built yet; ws2_32 was linked
     statically for the spike.
+
+**(b) A native DLL behind a PE skeleton, called from i386 code, calling
+back: works natively** (`tools/wine-wasm/spike-b`, `specgen.py`).
+
+- **The DLL** `demo.dll` is plain C (`demo.c`) compiled to a wasm32 PIC
+  module.
+- **`specgen.py`, a winebuild prototype,** reads `demo.spec` and the
+  compiled code and generates:
+  - an entry adapter per export (`gexp_<name>`, an `F_body`). It reads the
+    i386 arguments from the guest stack, calls the native function, and
+    returns in EAX, EDX:EAX or ST0, popping for stdcall;
+  - `gexp__entry` in place of DllMain;
+  - the exit stubs per wasm signature;
+  - the PE skeleton's source and `.def`: each export is `ud2`, built with
+    MinGW.
+
+  The spec gives the convention and the argument words. The argument and
+  return types come from the compiled module's wasm signatures, because a
+  spec has no return types. The generator cross-checks the word counts.
+- **Binding:** `GEX_WASM_DLLS=demo.dll=demo.wasm` (gexc) makes it a
+  stateful provider. `libprov` binds the adapters at the skeleton's
+  export addresses when Wine's loader maps the DLL. The skeleton's bytes
+  never run.
+- **Callbacks:** `demo.c` calls function pointers through `ICALL()`,
+  the select form written out as the pass will emit it (`icall.h`). A
+  guest target reaches the exit stub. The stub pushes an i386 frame and
+  calls the target through the function table. Its return address is
+  `target ^ 1`, as `gp_call0` does, so tier-1's call-out can watch it.
+  It restores ESP afterwards, so the same stub serves cdecl and stdcall
+  callees.
+- **Per-thread state** (the ICALL target, the guest ctx and depth of the
+  innermost adapter) lives in wasm globals defined in assembly
+  (`gexw_globals.s`), because clang cannot address `address_space(1)`
+  globals in PIC code.
+- **The i386 test** (MinGW `test.exe`) passes, through LoadLibrary and
+  GetProcAddress, with:
+  - stdcall `int` and `int64` (EDX:EAX) returns;
+  - a cdecl `double` (ST0) return;
+  - a cdecl sort calling an x86 comparator 18 times;
+  - the same sort given a native export's guest address (exit stub →
+    table → adapter → native);
+  - a stdcall x86 callback.
+- **Timings** natively, wasmtime, cores 3 and 9 (each figure includes its
+  loop's work; the browser figures are (c)'s):
+
+  | | `--no-cgen` (tier-1 app code) | `--fjit` |
+  |---|---|---|
+  | x86 → native, stdcall adapter, per call | 44.0 ns | 18.2 ns |
+  | x86 → x86 through a pointer, same loop (baseline) | 31.1 ns | 13.0 ns |
+  | native → x86 callback (exit stub), per comparator call | 644 ns | 22.4 ns |
+
+  On tier-1 every callback is a call-out (a nested tier-1 run). With
+  function bodies (fjit, AOT) a callback is an ordinary table call.
+- **Learned for W1:**
+  - The adapters must call through the wasm signature (casts), not the
+    C prototype.
+  - libprov caches `<module>.cwasm` beside the module: a rebuilt module
+    needs it removed.
+  - Exit stubs need the guest ctx. They take it from the innermost entry
+    adapter, or `gex.provider_ctx()` on a thread no adapter has entered.
+  - A callee that leaves without returning (longjmp, SEH unwind) traps
+    for now; W2 unwinds it.
 
 **(c) Boundary and ICALL check costs in V8** (node 26.7,
 `tools/wine-wasm/spike-c`, gex-cgen's unit flags, 20M calls per case,
