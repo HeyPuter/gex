@@ -604,6 +604,23 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
     the engine RNG, which is seeded at start-up through a config callback
     (0xddcac0, the line's printer). The "fixed seed" pairings above were
     random-seed pairings; pinning needs WORLD_SEED on both runtimes.
+- **Paired, world seed pinned (port/seedpin, WORLD_SEED 1767225600 on both),
+  2026-10-04 02:42-03:04:** cg12 Noita, gex-rt vs pewasm `out/noita/build`,
+  ABBA on cores 1 and 7, both at a 4x clock (PEWASM_TIME_SCALE=4, the
+  recording's GEX_NT_TIME_SCALE=4), world-up+30 s to +210 s. Load average
+  17-19; builds on 0-2,6-8 shared 1 and 7 in every leg.
+
+  | leg | run | world fps |
+  | --- | --- | --- |
+  | A1 | gex-rt | 55.61 |
+  | B1 | pewasm | 50.00 |
+  | B2 | pewasm | 52.79 |
+  | A2 | gex-rt | 49.71 |
+
+  gex-rt 52.7 against pewasm 51.4 (1.02x), with no translator in the
+  binary and 0 translations. An earlier pass ran pewasm on a 1x clock (its
+  frame cap: 58.3 at 0.97x realtime) and is void, as is the first pass that
+  U's Muck run shared.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
