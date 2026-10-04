@@ -131,7 +131,6 @@ impl Jit {
         let code = Code::memory(mem, executable, &ro);
         let opts = RecoverOptions::default();
         let mut batch: BTreeMap<u64, Function> = BTreeMap::new();
-        let mut guards = gex_fjit::Guards::new();
         let mut order: Vec<u64> = Vec::new();
         let mut work: VecDeque<u64> = VecDeque::from([addr]);
         let limit = batch_limit();
@@ -160,30 +159,13 @@ impl Jit {
             // direct jump reached when it was translated -- in a JIT's
             // fresh area, often bytes not yet written. It stays tier-1.
             if f.blocks.iter().any(|b| !b.synthetic && (volatile(b.start) || volatile(b.end.max(b.start + 1) - 1))) {
-                if wx_refused() {
-                    if std::env::var_os("GEX_FJIT_STATS").is_some() {
-                        eprintln!("[fjit] {a:#x}: code in writable memory; left to the fallback");
-                    }
-                    if a == addr {
-                        return None;
-                    }
-                    continue;
+                if std::env::var_os("GEX_FJIT_STATS").is_some() {
+                    eprintln!("[fjit] {a:#x}: code in writable memory; left to the fallback");
                 }
-                // Its bytes, compared on entry (`gex_fjit::Guards`).
-                let mut spans: Vec<(u64, u64)> = f.blocks.iter().filter(|b| !b.synthetic).map(|b| (b.start, b.end.max(b.start + 1))).collect();
-                spans.sort_unstable();
-                let mut merged: Vec<(u64, u64)> = Vec::new();
-                for (lo, hi) in spans {
-                    match merged.last_mut() {
-                        Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
-                        _ => merged.push((lo, hi)),
-                    }
+                if a == addr {
+                    return None;
                 }
-                let ranges: Vec<(u64, Vec<u8>)> = merged
-                    .into_iter()
-                    .filter_map(|(lo, hi)| mem.get(lo as usize..hi as usize).map(|b| (lo, b.to_vec())))
-                    .collect();
-                guards.insert(a, ranges);
+                continue;
             }
             if !intrinsics.contains_key(&a) {
                 for c in f.call_sites() {
@@ -246,7 +228,7 @@ impl Jit {
         // A bug in the emitter costs the batch its translation, not the
         // process: the fallback runs it.
         let emitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            gex_fjit::runtime(functions, &sums, class32, page_gen, &builtins, &pops, &guards)
+            gex_fjit::runtime(functions, &sums, class32, page_gen, &builtins, &pops)
         }))
         .map_err(|p| p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default());
         let out = match emitted {
@@ -375,11 +357,3 @@ impl State {
     }
 }
 
-
-/// `GEX_FJIT_WX=refuse`: leave code in writable and executable memory to
-/// tier-1's block guards instead of translating it with a byte check on
-/// entry (`gex_fjit::Guards`).
-fn wx_refused() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GEX_FJIT_WX").as_deref() == Ok("refuse"))
-}

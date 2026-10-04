@@ -27,6 +27,6 @@ fn replay() {
         }
     }
     let sums = std::collections::HashMap::new();
-    let r = gex_fjit::runtime(funcs, &sums, true, &|_| 1, &[], &std::collections::HashMap::new(), &Default::default());
+    let r = gex_fjit::runtime(funcs, &sums, true, &|_| 1, &[], &std::collections::HashMap::new());
     println!("{:?}", r.map(|(w, e, _)| (w.len(), e.len())));
 }

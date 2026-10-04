@@ -105,26 +105,12 @@ pub fn build(
     Ok((wasm, stats))
 }
 
-/// By function entry: `(address, bytes)` ranges of guest code the function
-/// was translated from. Code in writable and executable memory (a JIT's
-/// code area) can change with nothing to announce it -- no page is retired
-/// -- so such a function compares these bytes on entry, all of them (a
-/// method patched in its middle as well as at its head), and on a
-/// difference retires their pages (`cache_op` IC_INVALIDATE, as tier-1's
-/// block guard does) and leaves for the table's resolve, which translates
-/// it again. A change made while the function runs is not seen until its
-/// next entry.
-pub type Guards = HashMap<u64, Vec<(u64, Vec<u8>)>>;
-
 /// A run-time translation of `functions` (memory form, verified; the first
 /// is the one asked for) for the function table: the module, the entries it
 /// holds, what the emitter did. `page_gen` gives the `PAGE_GEN` value of a
 /// page, which each function checks on entry for every page it covers.
 /// `intrinsics` are tier-1's blocks for the entries it serves with a host
 /// builtin (`gex_xlate::intrinsic`): those functions are formed from them.
-/// `guards` are, by entry, the code bytes a function in writable and
-/// executable memory (a JIT's) was translated from, which it compares on
-/// entry (see [`Guards`]).
 pub fn runtime(
     functions: Vec<Function>,
     summaries: &HashMap<u64, Summary>,
@@ -132,7 +118,6 @@ pub fn runtime(
     page_gen: &dyn Fn(u64) -> u32,
     intrinsics: &[Block],
     ret_pops: &HashMap<u64, u64>,
-    guards: &Guards,
 ) -> Result<(Vec<u8>, Vec<u64>, Stats)> {
     let ib: HashMap<u64, &Block> = intrinsics.iter().map(|b| (b.start, b)).collect();
     let mut functions = gex_cgen::select(functions, &ib, &HashSet::new())?;
@@ -154,6 +139,6 @@ pub fn runtime(
         prep::prepare(f, summaries);
     }
     let mut stats = Stats::default();
-    let (wasm, entries) = module::build_runtime(&functions, summaries, class32, pages, guards, ret_pops, &mut stats)?;
+    let (wasm, entries) = module::build_runtime(&functions, summaries, class32, pages, ret_pops, &mut stats)?;
     Ok((wasm, entries, stats))
 }
