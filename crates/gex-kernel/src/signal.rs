@@ -346,6 +346,9 @@ impl Signals {
         if signal == 0 || signal > sig::MAX || signal == sig::SIGKILL || signal == sig::SIGSTOP {
             return Err(Errno::EINVAL);
         }
+        // Nor blocked, by a handler's mask either (Linux strips them).
+        let mut action = action;
+        action.mask &= !(bit(sig::SIGKILL) | bit(sig::SIGSTOP));
         self.actions[signal as usize] = action;
         Ok(())
     }
@@ -440,6 +443,11 @@ impl Signals {
             return true;
         }
         false
+    }
+
+    /// [`Self::next_deliverable`], for a trace.
+    pub fn peek_deliverable(&self) -> Option<u32> {
+        self.next_deliverable()
     }
 
     /// The lowest-numbered deliverable signal, if any.

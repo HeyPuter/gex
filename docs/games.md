@@ -252,6 +252,10 @@ of address space.
   game is a Steam lobby; there is no offline mode), so Muck's gameplay needs
   an x86-64 gex-steam with lobby and loopback P2P. Hollow Knight stops on its
   title screen natively without Steam; Rain World gets through EOS errors.
+- **Status (2026-10-03):** Muck under `--fjit --mem64` draws its first
+  frame (the menu's background) and then hung at the next GC; the cause (a
+  sigsuspend mask leaking between threads) is fixed, the rerun to the menu
+  UI is next. See docs/mem64.md section 10.
 - Knobs: `GEX_FPS=1` (presents per second), `GEX_PPM_EVERY=N`,
   `--wayland-out null`, `GEX_STRACE_STACK=N` (stack words at each syscall
   under `--strace`), `GEX_NT_TRACE` (logs each NtAllocateVirtualMemory

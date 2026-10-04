@@ -597,6 +597,11 @@ pub struct Kernel {
     pub thread_signals: std::collections::HashMap<i32, crate::signal::ThreadSignals>,
     /// The thread whose part `signals` holds now.
     pub sig_tid: i32,
+    /// Every other thread's half-finished blocking call (`PendingCall`),
+    /// swapped with `signals`: one thread's `rt_sigsuspend` must not hand
+    /// its mask to the next thread that finishes a futex wait (Mono's GC
+    /// left the main thread with SIGPWR blocked that way).
+    pub thread_calls: std::collections::HashMap<i32, PendingCall>,
     /// The pc of the syscall being handled (docs/mem64.md: a mapping the
     /// dynamic loader asks for stays below 4 GiB, since it will hold code).
     pub syscall_pc: u64,
@@ -1020,6 +1025,16 @@ pub struct ChildHandle {
     pub reaped: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A blocking call's state that waits in the kernel for the host to finish
+/// the wait (`finish_blocking`), kept per thread: see `Kernel::thread_calls`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingCall {
+    pub retry_accept: Option<(i32, u64, u64, u64)>,
+    pub write_blocked: bool,
+    pub retry_recvmsg: Option<(i32, u64, u64)>,
+    pub restore_sigmask: Option<u64>,
+}
+
 /// A thread the kernel has prepared and the host must start.
 #[derive(Clone, Copy, Debug)]
 pub struct SpawnRequest {
@@ -1077,6 +1092,20 @@ impl Kernel {
         }
         let saved = self.signals.save_thread();
         self.thread_signals.insert(self.sig_tid, saved);
+        let call = PendingCall {
+            retry_accept: self.retry_accept.take(),
+            write_blocked: std::mem::take(&mut self.write_blocked),
+            retry_recvmsg: self.retry_recvmsg.take(),
+            restore_sigmask: self.restore_sigmask.take(),
+        };
+        if call != PendingCall::default() {
+            self.thread_calls.insert(self.sig_tid, call);
+        }
+        let call = self.thread_calls.remove(&tid).unwrap_or_default();
+        self.retry_accept = call.retry_accept;
+        self.write_blocked = call.write_blocked;
+        self.retry_recvmsg = call.retry_recvmsg;
+        self.restore_sigmask = call.restore_sigmask;
         let next = self
             .thread_signals
             .remove(&tid)
@@ -1162,6 +1191,7 @@ impl Kernel {
             armed_place: None,
             syscall_pc: 0,
             thread_signals: std::collections::HashMap::new(),
+            thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             armed_pin: None,
             compat: false,
@@ -1389,6 +1419,7 @@ impl Kernel {
             armed_place: None,
             syscall_pc: 0,
             thread_signals: std::collections::HashMap::new(),
+            thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
             armed_pin: None,
             compat: self.compat,
@@ -1581,7 +1612,10 @@ impl Kernel {
             return match self.sigreturn(m) {
                 Ok(pc) => {
                     if self.trace {
-                        eprintln!("[gex:{}] rt_sigreturn -> 0x{pc:x}", self.pid);
+                        eprintln!(
+                            "[gex:{}.{}] rt_sigreturn -> 0x{pc:x}, blocked {:#x}",
+                            self.pid, self.tid, self.signals.blocked
+                        );
                     }
                     SyscallOutcome::Resume(pc)
                 }
@@ -1756,6 +1790,7 @@ impl Kernel {
             // Its signal state goes with it; the next thread to enter loads
             // its own.
             self.thread_signals.remove(&self.tid);
+            self.thread_calls.remove(&self.tid);
             return SyscallOutcome::ThreadExit;
         }
 
@@ -2827,6 +2862,16 @@ impl Kernel {
         self.check_timers();
         if !self.signals.has_pending() {
             return Delivery::None;
+        }
+        if self.trace {
+            eprintln!(
+                "[gex:{}.{}] delivering signal {} (pending {:#x}, blocked {:#x})",
+                self.pid,
+                self.sig_tid,
+                self.signals.peek_deliverable().unwrap_or(0),
+                self.signals.pending_raw(),
+                self.signals.blocked
+            );
         }
         signal::dispatch(&mut self.signals, m, self.ctx_addr, self.compat).unwrap_or(Delivery::None)
     }

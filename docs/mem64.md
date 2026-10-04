@@ -319,3 +319,24 @@ browser shim; the coordinator sequences them.
   12 GiB the way Unity does.
 - **Not yet:** the browser (step 6), the live switch (step 7), executable
   pages above 4 GiB.
+
+### State at 2026-10-03 (paused for a reboot)
+
+- Step 3 (Muck to the menu under `--fjit --mem64`) is **not done**. Muck
+  reaches its first frame (the menu's background scene) in about 6.7 min
+  with a warm `GEX_FJIT_CACHE`, then stalled at the next Mono GC: the GC
+  thread `tgkill`s SIGPWR to the main thread, which had SIGPWR blocked.
+- Cause, found and fixed (uncommitted until this commit): `restore_sigmask`
+  (and `retry_accept`, `retry_recvmsg`, `write_blocked`) lived in the shared
+  kernel, so thread 3's `rt_sigsuspend` (inside Mono's suspend handler)
+  handed its mask to the main thread when the main thread's futex wait
+  finished. They are now per thread (`PendingCall`, swapped with the signal
+  state in `switch_signals`). Test: `tests/x86-programs/sigsuspend-thread.c`
+  (passes; not yet confirmed to fail on the old kernel). Also: `sa_mask` no
+  longer keeps SIGKILL/SIGSTOP.
+- **Next:** rerun Muck (`$S/muck.sh TAG 3000 --fjit --mem64` with
+  `GEX_FJIT_CACHE=1`, `$S/watch.sh TAG`; S is the stream-U scratch dir under
+  /tmp/claude-1000/.../scratchpad/unity, X through `Xvfb :71` plus a socat
+  bridge on 127.0.0.1:6071, both killed for the reboot and to be replaced by
+  native Xwayland) and check the menu UI and fps; then the step-3 report,
+  the halflife.sh Xwayland conversion, and step 6 (browser).
