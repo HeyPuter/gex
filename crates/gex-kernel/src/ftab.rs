@@ -204,6 +204,10 @@ pub struct Translated {
 /// ([`gex_abi::ftab::FALLBACK`]: tier-1, until the region tier).
 pub trait Translator: Send + Sync {
     fn translate(&self, req: &Request<'_>) -> Option<Translated>;
+    /// The process `execve`d `program` (the file `bytes`): what was learned
+    /// of the image it replaced -- function starts, read-only ranges,
+    /// builtins by address -- describes addresses the new image now holds.
+    fn exec(&self, _program: &gex_ld::Program, _bytes: &[u8]) {}
 }
 
 static TRANSLATOR: std::sync::OnceLock<Box<dyn Translator>> = std::sync::OnceLock::new();

@@ -495,28 +495,6 @@ fn build_pe_image(
     Ok(())
 }
 
-/// The memcpy/memmove/memset/mempcpy definitions in `image`'s own text, by
-/// address (`Symbol::value` is already biased), for `Options::intrinsics`:
-/// a plain build and `gexc run` serve them with the host builtins, as closure
-/// builds and the browser's runtime translator do, so every path agrees on
-/// what those functions are.
-///
-/// Not for 32-bit (i386) images: `intrinsic::block` reads the 64-bit
-/// register arguments and pops an 8-byte return address, while i386 cdecl
-/// passes them on the stack.
-fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
-    if image.class32 {
-        return Default::default();
-    }
-    let (tlo, thi) = image.text_range;
-    image
-        .symbols
-        .iter()
-        .filter(|s| !s.ifunc && s.value >= tlo && s.value < thi)
-        .filter_map(|s| gex_xlate::intrinsic::recognise(&s.name).map(|k| (s.value, k)))
-        .collect()
-}
-
 /// `gexc run --fjit`: the function JIT serves the function table's misses.
 struct FjitTranslator(gex_xlate::fjit::Jit);
 
@@ -525,6 +503,10 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
         self.0
             .translate(req.mem, req.addr, req.executable, req.read_only, req.page_gen, req.class32)
             .map(|wasm| gex_kernel::ftab::Translated { wasm })
+    }
+
+    fn exec(&self, program: &gex_ld::Program, bytes: &[u8]) {
+        self.0.exec(gex_xlate::intrinsic::program_intrinsics(program), &program.exe, Some(bytes));
     }
 }
 
@@ -610,10 +592,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         std::fs::read(host).ok()
     })
     .with_context(|| format!("loading {}", ra.path))?;
-    ra.xlate.intrinsics = image_intrinsics(&program.exe);
-    if let Some(i) = &program.interp {
-        ra.xlate.intrinsics.extend(image_intrinsics(i));
-    }
+    ra.xlate.intrinsics = gex_xlate::intrinsic::program_intrinsics(&program);
     if ra.xlate.no_blocks {
         let jit = gex_xlate::fjit::Jit::new(ra.xlate.intrinsics.clone());
         jit.add_image(&program.exe, Some(&bytes));
@@ -858,7 +837,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             shared_memory,
             cgen,
             fjit,
-            intrinsics: image_intrinsics(&image),
+            intrinsics: gex_xlate::intrinsic::image_intrinsics(&image),
             ..Options::default()
         },
     );

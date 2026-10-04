@@ -1886,6 +1886,13 @@ fn exec_program(
         &|p| kernel.read_file(p),
     )
     .with_context(|| format!("execve: loading {}", req.path))?;
+    // What the translators knew of the old image is about addresses the new
+    // one holds now.
+    let mut xlate = xlate.clone();
+    xlate.intrinsics = gex_xlate::intrinsic::program_intrinsics(&program);
+    if let Some(t) = gex_kernel::ftab::translator() {
+        t.exec(&program, &bytes);
+    }
     // Descriptors marked close-on-exec go now; the rest survive, which is how
     // a shell hands a pipe to the command it starts.
     kernel.close_on_exec();
@@ -1909,7 +1916,7 @@ fn exec_program(
     run_program_with(
         &program,
         &opts,
-        xlate,
+        &xlate,
         Some(Inherited {
             kernel,
             proc_state,
