@@ -434,6 +434,52 @@ fn read_file_handle(c: &Call<'_>, h: u32) -> R<(Arc<Vec<u8>>, String, Vec<u16>)>
     Ok((Arc::new(data), f.path.clone(), f.nt_path.clone()))
 }
 
+/// What `WINEDLLOVERRIDES` says about loading the DLL at guest path `path`
+/// (Wine's load order, which its Unix side applies when an image is
+/// mapped: `dlls/ntdll/unix/loadorder.c`). Only the environment variable,
+/// not the registry's DllOverrides.
+enum LoadOrder {
+    /// Map the file found (no override, or native first).
+    Native,
+    /// Map the prefix's builtin of the same name instead, at this guest path.
+    Builtin(String),
+    /// `name=` or `name=d`: the DLL is not loaded.
+    Disabled,
+}
+
+fn load_order(c: &Call<'_>, path: &str) -> LoadOrder {
+    let Some(overrides) = c.p.cfg.env.iter().find(|(k, _)| k.eq_ignore_ascii_case("WINEDLLOVERRIDES")).map(|(_, v)| v.clone()) else {
+        return LoadOrder::Native;
+    };
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let lower = file.to_ascii_lowercase();
+    let module = lower.strip_suffix(".dll").unwrap_or(&lower);
+    let sysdir = format!("{}/drive_c/windows/{}", c.p.cfg.prefix, match c.p.abi {
+        Abi::P64 => "system32",
+        Abi::P32 => "syswow64",
+    });
+    // `name[,name...]=order;...`; the last entry naming the module wins.
+    let mut order: Option<String> = None;
+    for entry in overrides.split(';') {
+        let Some((names, value)) = entry.split_once('=') else { continue };
+        for n in names.split(',') {
+            let n = n.trim().to_ascii_lowercase();
+            let n = n.strip_suffix(".dll").unwrap_or(&n);
+            if n == module || n == "*" {
+                order = Some(value.trim().to_ascii_lowercase());
+            }
+        }
+    }
+    // A system directory's own DLL is the builtin already.
+    let in_sysdir = path.to_ascii_lowercase().starts_with(&sysdir.to_ascii_lowercase());
+    match order.as_deref() {
+        None => LoadOrder::Native,
+        Some("") | Some("d") => LoadOrder::Disabled,
+        Some(o) if o.starts_with('b') && !in_sysdir => LoadOrder::Builtin(format!("{sysdir}/{lower}")),
+        Some(_) => LoadOrder::Native,
+    }
+}
+
 /// `NtCreateSection(*handle, access, attr, *size, prot, attributes, file)`.
 pub fn nt_create_section(c: &mut Call<'_>) -> R {
     let (hp, access, attr_p, size_p, prot, attrs, file) =
@@ -448,6 +494,23 @@ pub fn nt_create_section(c: &mut Call<'_>) -> R {
             return Err(Status(st::INVALID_FILE_FOR_SECTION));
         }
         let (data, path, nt_path) = read_file_handle(c, file)?;
+        let (data, path, nt_path) = match load_order(c, &path) {
+            LoadOrder::Disabled => return Err(Status(st::DLL_NOT_FOUND)),
+            LoadOrder::Builtin(builtin) => {
+                let k = c.kernel();
+                match super::file::read_guest_file(&k, &builtin) {
+                    Ok(b) if pe::is_pe(&b) => {
+                        if c.p.cfg.trace {
+                            crate::nt_log!("[nt:{:x}]   {path} -> builtin {builtin} (WINEDLLOVERRIDES)", c.t.tid);
+                        }
+                        let nt: Vec<u16> = format!("\\??\\{}", super::boot::dos_path(&c.p.cfg.prefix, &builtin)).encode_utf16().collect();
+                        (Arc::new(b), builtin, nt)
+                    }
+                    _ => (data, path, nt_path),
+                }
+            }
+            LoadOrder::Native => (data, path, nt_path),
+        };
         if !pe::is_pe(&data) {
             return Err(Status(if data.len() >= 2 && &data[..2] == b"MZ" {
                 st::INVALID_IMAGE_FORMAT

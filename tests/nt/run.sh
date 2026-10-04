@@ -124,6 +124,10 @@ for arch in x64 x86; do
     # An image without DYNAMIC_BASE: at its linked base, or relocated by ntdll
     # with its header as linked.
     check $arch/fixedbase 0 "$allok" "$b/fixedbase.exe"
+    # WINEDLLOVERRIDES: the winhttp.dll beside it, the builtin, none.
+    check $arch/loadorder-native 0 "$allok" "$b/loadorder.exe" native
+    extra="--env WINEDLLOVERRIDES=winhttp=b" check $arch/loadorder-builtin 0 "$allok" "$b/loadorder.exe" builtin
+    extra="--env WINEDLLOVERRIDES=winhttp=" check $arch/loadorder-disabled 0 "$allok" "$b/loadorder.exe" none
     check $arch/fixedbase-taken 0 "$allok" "$b/fixedbase.exe" taken
     # opengl32 through the generated transport (tools/gen_gl_compat.py).
     check_gl $arch/glcompat 0 "$allok" "$b/glcompat.exe"
