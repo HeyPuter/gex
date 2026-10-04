@@ -35,7 +35,8 @@ give it one.
 ## 2. Target: the Hangover model on a wasm host
 
 Wine already supports running foreign-architecture application code with its
-own DLLs native:
+own DLLs native. That holds for x64 programs on ARM64EC; for i386 programs
+Wine's own 32-bit DLLs are emulated too, via wow64:
 - Windows on ARM: ARM64 Wine runs i386 programs through wow64 plus an
   emulator DLL, and x64 programs through ARM64EC plus `xtajit64`.
 - The emulator plugs in through the BTCpu interface (`dlls/wow64/syscall.c`):
@@ -243,9 +244,19 @@ Today's path keeps working throughout. Programs switch per process
   arch-shaped (configure, winebuild, `signal_wasm32.c`, per-arch `#ifdef`s),
   rebased on Wine releases, and upstreamable in principle. It would live in a
   fork like mesa-wink's; pushing needs the user's approval.
-- **Cost of the ICALL check** on indirect-call-heavy code (wined3d, COM). The
-  fast path must be a few instructions. If W0(c) shows it doesn't pay, fall
-  back to type-based checks on callback types only, which is less general.
+- **The ICALL check isn't wasm-specific.** Any native-Wine/emulated-app
+  split needs it; it's how ARM64EC works.
+  - **What is ours to build:** clang emits the check and the entry and exit
+    thunks for ARM64EC, but has nothing for wasm32. We write that pass and
+    the thunk generator, then validate them.
+  - **No precedent for i386:** for 32-bit programs on ARM, Wine uses wow64
+    with emulated i386 DLLs, as gex does today. Native Wine DLLs exist only
+    for x64 programs (ARM64EC). Native Wine for i386 programs is a new
+    combination, built from ARM64EC's design, the spec signatures and the
+    BTCpu contract.
+  - **Cost:** on indirect-call-heavy code (wined3d, COM) the fast path must be
+    a few instructions. If W0(c) shows it doesn't pay, fall back to
+    type-based checks on callback types only, which is less general.
 - **Exceptions and unwinding through mixed frames** (a guest handler
   unwinding native frames) depend on wasm EH and the wasmtime upgrade.
 - **Startup cost** of instantiating hundreds of modules, especially per
