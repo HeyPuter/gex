@@ -55,7 +55,12 @@ pub(crate) fn install(
         if e.rva >= data_sec.rva && e.rva < data_sec.rva + data_sec.vsize {
             continue;
         }
-        let k = e.names.iter().find_map(|n| slot(&format!("gexp_{n}"))).unwrap_or(missing);
+        let k = e
+            .names
+            .iter()
+            .find_map(|n| slot(&format!("gexp_{n}")))
+            .or_else(|| slot(&format!("gexp_#{}", e.ordinal)))
+            .unwrap_or(missing);
         pairs.push((base + e.rva as u64, k));
     }
     if let (Some(k), true) = (slot("gexp__entry"), pe.entry_rva != 0) {
