@@ -44,7 +44,7 @@ check() {
     # A CRT's text-mode stdout writes CRLF, as on Windows; compared without
     # the CRs.
     # shellcheck disable=SC2086
-    out=$(cd "$(dirname "$1")" && timeout 120 "$gexc" run $flags "$@" 2>"$err"; echo "exit=$?")
+    out=$(cd "$(dirname "$1")" && timeout 120 "$gexc" run $flags ${extra:-} "$@" 2>"$err"; echo "exit=$?")
     code=${out##*exit=}
     out=${out%$'\n'exit=*}
     out=${out%exit=*}
@@ -114,6 +114,10 @@ for arch in x64 x86; do
     check $arch/crypt 0 "$allok" "$b/crypt.exe"
     # Anonymous and named pipes within the process (CreatePipe).
     check $arch/pipe 0 "$allok" "$b/pipe.exe"
+    # A 64-bit guest memory (docs/mem64.md): Unity's 12 GiB of reservations.
+    if [ $arch = x64 ]; then
+        extra=--mem64 check $arch/mem64 0 "$allok" "$b/mem64.exe"
+    fi
     # Display modes, D3DKMT, memory status, a section mapped twice, dialogs.
     check $arch/display 0 "$allok" "$b/display.exe"
     # An image without DYNAMIC_BASE: at its linked base, or relocated by ntdll

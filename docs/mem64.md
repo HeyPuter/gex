@@ -282,3 +282,40 @@ learned record is not enough there.
 Owners: steps 0, 1, 4 and the Unity side are stream U's. Steps 2, 3 and 5
 touch gex-emit, gex-fjit and gex-cgen (streams F and R), and step 6 the
 browser shim; the coordinator sequences them.
+
+## 10. As built (steps 1-3, native)
+
+- **The flavour is per host process:** `gex_abi::set_mem_flavor` /
+  `mem_flavor()`, set by `gexc run` (`--mem64`, `--mem32`, else the learned
+  record) and `gexc build --mem64`. Everything that emits or links code
+  reads it; nothing branches on it at run time. A wasm64 build (the browser
+  shim, later) is M64 by construction.
+- **M32 is byte-identical** (`tools/mem32-identity.sh`): every tier-1, fjit
+  and cgen module of the Tier 0 corpus on ga64/gx64/gi386, and every unit
+  object and module of four PE images. Unit keys hash gex-abi's and
+  gex-cgen's *sources* (`gex-cgen/build.rs`), so any edit there changes them,
+  M32 or not; no M32 key gains a flavour field.
+- **Placement, refined:** anonymous mappings without `PROT_EXEC` go high;
+  *file* mappings stay low whatever their protection (ld.so reserves a
+  library read-only, then maps its text inside it), and so do anonymous
+  mappings the dynamic loader asks for (an `mmap` whose pc is in ld.so's
+  text at `INTERP_BASE`: glibc reserves `PROT_NONE` memory for an
+  over-aligned library such as UnityPlayer.so). `MAP_FIXED` or `mprotect`
+  that would put code above 4 GiB fails loudly (EACCES).
+- **Code generation:** `FuncBody` address helpers that emit today's bytes
+  for M32; the context stays an i32 everywhere (F_body and every host
+  import keep their signatures) and is widened where it is an address; no
+  bounds guard and no bulk-op clamp in M64 (the engine traps past the end,
+  which the shim reports as SIGSEGV); `ftab` is a table64 with i64 indices,
+  `__table_base`/`__memory_base`/`__stack_pointer` are i64; units are clang
+  `--target=wasm64` with a substituted header. Providers are i386-only and
+  never M64.
+- **Native shim:** the engine gets memory64 and a 16 GiB static reservation
+  only for M64; the guest memory is created at its full 16 GiB (a
+  reservation; the high arena never grows it).
+- **Validated:** every corpus program's tier-1, fjit and cgen module
+  validates as M64; the corpus runs under `--mem64` with native output on
+  tier-1 and `--fjit` (60/60); `tests/x86-programs/mem64-reserve.c` reserves
+  12 GiB the way Unity does.
+- **Not yet:** the browser (step 6), the live switch (step 7), executable
+  pages above 4 GiB.
