@@ -423,6 +423,131 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   in the shim). The eject's web part waits for B's merge, then adds only
   vendoring and the launchers.
 
+## 6a. Link groups for the ejected page (design, 2026-10-04)
+
+merge-plan §9.6 says an ejected build is one link group of everything,
+which is what pewasm built: noita.exe, msvcr120 and msvcp120 in one module.
+This is the design for the first group, measured in the page against
+pewasm's page (the only performance target).
+
+### What a group buys
+
+Today each image is its own unit. A call to another image is
+`call dword [IAT slot]`, an indirect call. In a unit that becomes a load of
+the slot, a probe of the function table (`gex_ftab_idx`) and a
+`call_indirect` (V8 checks the signature), unless an indirect-call hint
+(`icall_hints`) names a callee in the same image. Nothing inlines across
+images.
+
+noita.exe's IAT call sites (`call [IAT]`, plus `jmp [IAT]` thunks):
+
+| target | sites | the hottest |
+| --- | --- | --- |
+| msvcr120.dll | 18,401 (+46) | `operator delete` 12,360, `operator new` 3,722, memmove 705, `type_info::name` 682, free 221, malloc 132 |
+| msvcp120.dll | 4,568 (+161) | `_Xbad_alloc` 1,768, `_Xlength_error` 928, iostream destructors |
+| lua51.dll (the Lua provider) | 4,047 (+6) | lua_checkstack 1,070, lua_gettop 467, lua_tonumber 356 |
+| kernel32, SDL2, FMOD, Steam, ... | about 500 | QueryPerformanceCounter 173 |
+
+The page profile (§ the page against pewasm's page) has msvcr120 at 14.5%
+of the main thread's unit time and ntdll at 8.8% (RtlAllocateHeap is the
+top of it), under `new`/`delete` -> malloc/free -> HeapAlloc. pewasm calls
+all of these directly, and its host CRT's malloc is wasm.
+
+### The group
+
+- **Members:** images that an ejected project maps at known bases. Every
+  base is known in an ejected project (the exact layout pins them), so any
+  set works. The first group is noita.exe + msvcr120 + msvcp120 (pewasm's
+  set). The project lists it in user/eject.json:
+  `"link_groups": [["noita.exe", "msvcr120.dll", "msvcp120.dll"]]`.
+- **Recovery:** each member's own recovery, unchanged and cached as now.
+  The group's emission reads all of them and merges entries, summaries,
+  trap-free and guard-free sets, and the touched maps. Function names are
+  `f_<guest address>`, unique across members because the bases are fixed.
+- **Calls between members:**
+  - A direct call to a member's entry (a thunk's `jmp` target, a known
+    callee) becomes a direct C call. `known` is the union of the members'
+    entries, so the existing `Callee::Direct(t) if known.contains(t)` path
+    and its page checks apply unchanged.
+  - IAT calls: at build time, each import of each member is resolved
+    against the exporting member's export table at its recorded base,
+    forwarders followed, as Wine's loader resolves it. This gives
+    `IAT slot -> target`. A `call [slot]` site then gets a build-time hint
+    `ret_pc -> target`, through the existing devirtualised-call path:
+    `ft = load(slot); if (ft == K) f_K(...) else ftab(ft)`. The compare
+    keeps it correct when the program or a mod rewrites an IAT entry (a
+    hook): a mismatch goes through the table, as today. Profile hints
+    (`icall/`) still apply to the other indirect calls, now across members.
+  - Leaf copies (`func::is_small_leaf`) work across members too: msvcr120's
+    small leaves are copied into noita.exe's units.
+  - An IAT target that a provider serves (crt_mem's memmove, crt_heap's
+    malloc/free, concrt) is a stub address with no unit entry. In G2 the
+    provider's C is compiled into the group as objects, and the hint calls
+    the provider's function directly (`gexp_<export>`).
+- **Link:** one `wasm-ld` over every member's objects (plus the providers'
+  in G2) into `<cache>/groups/<group key>/c.wasm`, with `c.entries` and
+  `gex.funcs` as for a unit. The element segment holds every member's
+  entries. No data segments, as for units.
+- **Key:** a hash of `group v1`, the members' unit keys (identity, base,
+  providers, icall hints) in a fixed order, and the resolved IAT map.
+  The objects cache stays keyed by C text: units with no cross-member calls
+  are reused, the rest recompile. For noita.exe that is most units, so
+  about the cost of one noita.exe build (about 2 h at nice 19, 4 jobs; its
+  link peaks near 10 GB, per F).
+- **Region entries** stay per member (their own modules). They call into
+  the group through the table as they call into units today.
+- **Install (browser shim and native host alike):** a group is wanted once
+  all its members are placed (mapped at their expected bases and passing
+  the byte check). Then the group module is published in place of the
+  members' units, and the members are marked as covered so their own units
+  are not fetched. Wine maps all of an exe's static imports before running
+  any of their code (DllMain included), so the group is in before any
+  member runs. If a member is missing or elsewhere, each image uses its own
+  unit: an ejected project still builds the per-image units, which the
+  group's objects mostly share, and the build fails if the layout cannot
+  hold.
+- **ThinLTO (G3):** units compile `-flto=thin` to bitcode objects (cached
+  as now), and wasm-ld runs ThinLTO across the group (`--thinlto-jobs`),
+  with the code generator flags the units use today
+  (`-mllvm -switch-to-lookup=false`, no shadow-stack users: the splice
+  check runs on the linked module as now). The page check stays the first
+  statement of every body, so an inlined body still leaves on a patched
+  page; a test asserts LTO keeps it. Measured separately from G1, since
+  its build cost is the large one.
+- **Lua (G4):** the stateful Lua provider in the group, which is what
+  pewasm's native Lua was: 4,047 call sites made direct. Its data base
+  becomes the group module's `__memory_base` (units have no data of their
+  own), and its stack global the group's `__stack_pointer`.
+
+### Runtime-specific providers (to settle at the integ merge)
+
+R's crt_heap and nt_qpc are `native` (bound only when the native,
+unguarded flavour is built or run). The ejected web build now *is* the
+native unguarded units, and a provider's stubs are part of its image's
+unit key. So either:
+- the browser binds them too, which needs `gex.nt_qpc` (a clock read, which
+  costs about a microsecond in a Worker, so likely a shared-memory clock
+  word) and crt_heap's `provider_alloc_top` in the shim (the stateful
+  mechanism is there); or
+- the web build keys msvcr120 and ntdll without them, which is a second
+  build of those two images.
+
+The first is better for the page: `new`/`delete` on dlmalloc in wasm is
+what pewasm runs.
+
+### Phases and measurement
+
+- **G1:** members' recoveries merged, IAT hints, one link, no LTO, installed
+  in the shim and in gex-rt. Correctness: tests/nt with a group of the exe
+  and its CRT (ucrtbase), and Noita AOT-only in the page. Measure: the page
+  ABBA against pewasm, seed pinned, wake on.
+- **G2:** stateless and stateful providers compiled into the group (crt_mem,
+  crt_math, concrt, crt_heap), with direct calls to them.
+- **G3:** ThinLTO across the group.
+- **G4:** the Lua provider in the group.
+
+Each phase gets its own page ABBA, and stays only if it gains.
+
 ## 7. Phases
 
 | | what | gate |
