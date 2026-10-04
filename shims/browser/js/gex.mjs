@@ -866,6 +866,9 @@ export class Gex {
         // runs nested until the guest returns to the function body that
         // called it.
         call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+        // An AOT-only fallback whose target this Worker has just installed
+        // (cgen.rs `gex_ftab_fallback`): called as a function body.
+        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(idx >>> 0)(ctx, depth, need, ret),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).

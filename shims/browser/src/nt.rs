@@ -349,6 +349,7 @@ mod imp {
         }
         // An ejected project's stateful providers (docs/eject-pe.md §5.1).
         crate::cgen::ENTRY_LOG.store(flag("GEX_NT_ENTRY_LOG"), Ordering::Relaxed);
+        crate::RESUME_LOG.store(flag("GEX_NT_RESUME_LOG"), Ordering::Relaxed);
         if let Some(v) = var("GEX_NT_STATEFUL") {
             crate::cgen::set_stateful(&v);
         }

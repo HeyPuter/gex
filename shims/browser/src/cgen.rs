@@ -908,7 +908,11 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         let f = m.get(addr)?;
         let page = addr / gex_abi::DISPATCH_PAGE;
         let patched = mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
-        if patched {
+        // A provider serves the export whatever its bytes became: Noita's
+        // mod sandbox rewrites lua51's entry points, which the Lua provider
+        // replaces (as natively, ftab.rs `current`).
+        let provider = m.install(f.install).module >= PROVIDER;
+        if patched && !provider {
             m.retire(addr);
             return None;
         }
@@ -952,10 +956,13 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
             crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
         }
         // Published by another Worker and not yet installed here: catch up,
-        // and leave to the dispatcher, which finds it.
-        if ftab(|m| m.get(t).is_some()) {
+        // then call it, as the lookup would have (leaving would lose the
+        // frames that called here).
+        if let Some(idx) = ftab(|m| m.get(t).map(|f| f.idx)) {
             crate::nt::serve_now();
-            return gex_abi::ftab::RET_LEFT;
+            CAUGHT_UP.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: a host import taking scalars; nothing here holds a lock.
+            return unsafe { ftab_call(idx as i32, ctx, _depth, _need, ret) };
         }
         let path = lock(&UNITS)
             .iter()
@@ -963,9 +970,17 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
             .max_by_key(|x| x.base)
             .map(|x| format!("{} at {:#x}, +{:#x}", x.path, x.base, t - x.base))
             .unwrap_or_else(|| "no image".into());
+        // Who branched there, and the stack (i386: a call's return address
+        // on top), to tell a lost return from an indirect branch.
+        let from = gm.read_u64(c + gex_abi::ctx::LAST_SOURCE as u64).unwrap_or(0);
+        let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0) & 0xffff_ffff;
+        let stack: Vec<String> = (0..8u64).map(|i| crate::nt::describe(gm.read_u32(sp + 4 * i).unwrap_or(0) as u64)).collect();
         crate::warn_line(&format!(
             "gex-eject: the guest reached {t:#x} ({path}), which no unit, region entry or provider holds, \
-             and this project runs without translation: record a session that reaches it and re-eject\n"
+             and this project runs without translation: record a session that reaches it and re-eject \
+             (from {}, ret {ret:#x}, sp {sp:#x} stack [{}])\n",
+            crate::nt::describe(from),
+            stack.join(" ")
         ));
         crate::nt::end_process(0xc000_001d);
     }
@@ -1002,7 +1017,13 @@ extern "C" {
     /// `ret` with the stack pointer at `sp_want` (or what a callee popped
     /// above it): 1; 0 when it cannot (`ctx::PC` says where the guest is).
     fn call_out(ctx: i32, target: i64, ret: i64, sp_want: i64) -> i32;
+    /// Call function-table entry `idx` as a function body (AOT-only: one
+    /// this Worker has just installed).
+    fn ftab_call(idx: i32, ctx: i32, depth: i32, need: i32, ret: i64) -> i32;
 }
+
+/// AOT-only fallbacks that found their target published and called it.
+pub(crate) static CAUGHT_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `gex_set_callout(0)` turns the call-out off (the fallback always leaves,
 /// as before it existed), for measuring.
