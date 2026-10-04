@@ -49,3 +49,9 @@ dsound.dll
 winmm.dll
 msacm32.dll
 dinput8.dll
+# Peggle's networking (wsock32 -> iphlpapi, dnsapi, nsi), mapped at start-up
+# and run on tier-1 without a base. Added with `--append`.
+wsock32.dll
+iphlpapi.dll
+dnsapi.dll
+nsi.dll
