@@ -417,6 +417,14 @@ const TABLE_NAMES = [
   'dispatch7',
 ];
 
+/** A stateful provider's `provider_throw`, caught by its `provider_try`. */
+class ProviderThrow extends Error {
+  constructor(code) {
+    super(`gex.provider_throw(${code}) with no gex.provider_try to catch it`);
+    this.code = code;
+  }
+}
+
 export class Gex {
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #wl = null;
   // The channel `#turn` posts to itself on, made once and kept.
@@ -2462,6 +2470,9 @@ export class Gex {
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
       : jit >= 0 ? this.#fjitModule(jit)
       : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
+    // A stateful provider (docs/eject-pe.md §5.1): its data in the guest's
+    // memory, this Worker's provider stack, and the provider_* imports.
+    const memBase = prov >= 0 ? (e.gex_cgen_pmod_memory_base?.(prov) >>> 0) : 0;
     const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c)
       : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
       : (b, c) => e.gex_cgen_regs(u, b, c);
@@ -2471,13 +2482,15 @@ export class Gex {
         memory: this.#memory,
         __indirect_function_table: st.ftab,
         __table_base: new WebAssembly.Global({ value: 'i32', mutable: false }, base | 0),
-        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, 0),
+        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, memBase),
         // A unit's functions never use clang's shadow stack (those are stubs),
         // but a position-independent module imports its pointer all the same.
-        __stack_pointer: new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+        // A stateful provider's is this Worker's (one C stack per thread).
+        __stack_pointer: memBase ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
       },
-      gex: { ...this.#imports, lookup: st.lookup, ftab: st.ftab },
+      gex: { ...this.#imports, lookup: st.lookup, ftab: st.ftab, ...(memBase ? this.#providerImports() : {}) },
     });
+    if (memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     const n = regsOf(0, 0) >>> 0;
     const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
     let regs;
@@ -2499,6 +2512,53 @@ export class Gex {
     // pages it numbered (idempotent).
     if (jit >= 0) e.gex_fjit_installed(jit);
     return regs.length / 2;
+  }
+
+  /** This Worker's stack for stateful providers (one per guest thread, as
+   *  natively), made at the first one's instantiation. */
+  #provStack = null;
+  #providerStack() {
+    if (!this.#provStack) {
+      const size = 1 << 20;
+      const base = this.#shim.exports.gex_provider_alloc(size) >>> 0;
+      if (!base) throw new Error('gex-nt: no memory for a provider stack');
+      this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
+    }
+    return this.#provStack;
+  }
+
+  /** What a stateful provider imports from `gex` (the native `libprov`). */
+  #providerImports() {
+    const e = this.#shim.exports;
+    const ftab = this.#cgen.ftab;
+    return {
+      // A protected call: `fn(arg)` from the function table, 0, or the code
+      // a provider_throw inside it threw (every frame between discarded, as
+      // a C longjmp).
+      provider_try: (f, arg) => {
+        try {
+          ftab.get(f >>> 0)(arg);
+          e.gex_provider_note(0);
+          return 0;
+        } catch (err) {
+          if (err instanceof ProviderThrow) {
+            e.gex_provider_note(1);
+            return err.code;
+          }
+          throw err;
+        }
+      },
+      provider_throw: (code) => {
+        throw new ProviderThrow(code);
+      },
+      provider_ctx: () => e.gex_provider_ctx(),
+      provider_time: (which) => (which === 0 ? Date.now() / 1000 : performance.now() / 1000),
+      provider_missing: (addr) => e.gex_provider_missing(addr),
+      provider_alloc: (size) => e.gex_provider_alloc(size),
+      provider_log: (ptr, len) => {
+        console.error(new TextDecoder().decode(this.#bytes().slice(ptr >>> 0, (ptr >>> 0) + (len >>> 0))));
+      },
+    };
   }
 
   /** A module file from the unit cache (an export provider's), compiled
