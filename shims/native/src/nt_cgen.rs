@@ -586,6 +586,10 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
     let mut stubs: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut hints: HashMap<u64, u64> = HashMap::new();
     let mut images = Vec::new();
+    // G2 (docs/eject-pe.md §6a): the members' stateless providers compiled
+    // into the group, their addresses served by bodies of its own.
+    let with_providers = std::env::var("GEX_GROUP_PROVIDERS").is_ok_and(|v| v == "1");
+    let mut gp = gex_cgen::image::GroupProviders::default();
     for m in members {
         prepare_pe(m.pe, m.base, jobs, true).with_context(|| format!("the unit for {}", m.path))?;
         let (image, _) = gex_xlate::func::pe_input(m.pe, m.base).map_err(|e| anyhow!("placing {} at {:#x}: {e}", m.path, m.base))?;
@@ -593,6 +597,18 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         member_keys.push(unit_key(&image, &pv));
         recoveries.push(root.join("recovery").join(recovery_key(&image)));
         stubs.extend(pv.stubs.iter().copied());
+        if with_providers {
+            for prov in &pv.providers {
+                if !gp.sources.iter().any(|(n, _)| n == prov.name) {
+                    gp.sources.push((prov.name.to_string(), gex_cgen::provider::group_source(prov)));
+                }
+                for (f, e) in &prov.binds {
+                    if let Some(&rva) = pv.exports.get(e) {
+                        gp.bodies.entry(m.base + rva as u64).or_insert_with(|| gex_cgen::provider::group_symbol(prov, f));
+                    }
+                }
+            }
+        }
         hints.extend(icall_hints(&image));
         images.push(image);
     }
@@ -619,7 +635,7 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
                 if byte(a) == Some(0xff) && byte(a + 1) == Some(0x15) {
                     let d = (0..4).map(|i| byte(a + 2 + i).unwrap_or(0) as u64).enumerate().fold(0u64, |acc, (i, b)| acc | b << (8 * i));
                     if let Some(&t) = iat.get(&d) {
-                        if known.contains(&t) && !stubs.contains(&t) {
+                        if known.contains(&t) && (!stubs.contains(&t) || gp.bodies.contains_key(&t)) {
                             // A recorded profile's hint for the site wins.
                             if !hints.contains_key(&(a + 6)) {
                                 hints.insert(a + 6, t);
@@ -638,6 +654,13 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
     let mut v: Vec<(u64, u64)> = hints.iter().map(|(a, b)| (*a, *b)).collect();
     v.sort_unstable();
     v.hash(&mut h);
+    if with_providers {
+        "providers".hash(&mut h);
+        gp.sources.hash(&mut h);
+        let mut b: Vec<(&u64, &String)> = gp.bodies.iter().collect();
+        b.sort_unstable();
+        b.hash(&mut h);
+    }
     let key = format!("{:016x}", h.finish());
     let dir = root.join("groups").join(&key);
     let out = dir.join("c.wasm");
@@ -645,7 +668,7 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         let t0 = std::time::Instant::now();
         let work = dir.join("work");
         let recs: Vec<&std::path::Path> = recoveries.iter().map(|p| p.as_path()).collect();
-        let stats = gex_cgen::image::build_group_module(&recs, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints)?;
+        let stats = gex_cgen::image::build_group_module(&recs, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, &gp)?;
         let _ = std::fs::remove_dir_all(&work);
         std::fs::write(dir.join("members.txt"), member_keys.join("\n") + "\n")?;
         eprintln!(

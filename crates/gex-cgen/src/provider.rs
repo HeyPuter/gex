@@ -119,6 +119,38 @@ pub fn stubs(providers: &[Provider], exports: &HashMap<String, u32>, base: u64) 
     v
 }
 
+/// The C symbol a link group calls for `p`'s function `f`
+/// ([`group_source`]).
+pub fn group_symbol(p: &Provider, f: &str) -> String {
+    format!("gexg_{}_{f}", p.name)
+}
+
+/// `p`'s source as one translation unit of a link group's module
+/// (docs/eject-pe.md §6a G2): no `GEX_PROVIDE` exports (the group's own
+/// bodies at the exports' addresses call in), and each bound function
+/// reachable from the group's units as [`group_symbol`].
+pub fn group_source(p: &Provider) -> String {
+    let mut s = format!(
+        "#include \"gex_abi.h\"\n#include \"provider.h\"\n#undef GEX_PROVIDE\n#define GEX_PROVIDE(fn, export)\n#line 1 \"{}.c\"\n{}\n",
+        p.name, p.text
+    );
+    let mut seen = std::collections::HashSet::new();
+    for (f, _) in &p.binds {
+        if seen.insert(f.as_str()) {
+            s.push_str(&format!(
+                "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{ GEX_MUSTTAIL return {f}(ctx, depth, need, ret); }}\n",
+                group_symbol(p, f)
+            ));
+        }
+    }
+    s
+}
+
+/// The prelude a provider source compiles against (`provider.h`).
+pub fn prelude() -> &'static str {
+    PRELUDE
+}
+
 /// The provider's module, built once into `root/providers` (keyed by its
 /// [`fingerprint`] and clang's version), and the C function each slot of
 /// its element segment holds.
