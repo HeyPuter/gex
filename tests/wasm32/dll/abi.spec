@@ -15,3 +15,4 @@
 @ extern abi_data
 @ stub abi_missing
 @ stdcall abi_forward() kernel32.GetTickCount
+100 stdcall -noname abi_noname(long)

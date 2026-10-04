@@ -20,3 +20,4 @@ int abi_data = 1234;
 /* winecrt0's, for the stub: here it records the call. */
 int abi_stub_called;
 void __wine_spec_unimplemented_stub(const char *module, const char *function) { abi_stub_called = 1; }
+int abi_noname(int x) { return x + 100; }

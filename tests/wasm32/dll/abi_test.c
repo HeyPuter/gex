@@ -48,6 +48,8 @@ int main(void)
     CHECK(abi_data && *abi_data == 1234);
     CHECK(abi_forward != NULL && abi_forward() == GetTickCount() || abi_forward() + 1000 > GetTickCount());
     CHECK(GetProcAddress(h, "abi_missing") != NULL);
+    int (WINAPI *noname)(int) = (void *)GetProcAddress(h, (LPCSTR)100);
+    CHECK(noname && noname(5) == 105);
     printf(fails ? "FAILED\n" : "PASS\n");
     return fails;
 }
