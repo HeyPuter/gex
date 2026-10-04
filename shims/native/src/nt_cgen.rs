@@ -146,7 +146,7 @@ struct Provided {
 }
 
 fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
-    let providers = gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64);
+    let providers = gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data);
     let mut exports = HashMap::new();
     if !providers.is_empty() {
         for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
@@ -267,7 +267,7 @@ pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::Path
 /// unit cache, as mapping it would; their names.
 pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
     let mut v = Vec::new();
-    for prov in gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64) {
+    for prov in gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data) {
         gex_cgen::provider::build(&prov, &cache_root()?)?;
         v.push(prov.name.to_string());
     }
@@ -362,7 +362,9 @@ pub(crate) fn enable(record: bool) -> Result<()> {
 }
 
 fn take_pending() -> Vec<Pending> {
-    if !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
+    // A load first: every syscall of every thread comes here, and a swap
+    // would write the shared line each time.
+    if !HAS_PENDING.load(std::sync::atomic::Ordering::Relaxed) || !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
         return Vec::new();
     }
     std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
@@ -805,7 +807,18 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
         }
         let module = Module::from_file(engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
         crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-        crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        if prov.stateful {
+            // Its data in guest pages, as an ejected project's stateful
+            // providers have it (`libprov`); the stack comes per thread.
+            let wasm = std::fs::read(&path)?;
+            let (size, align) = crate::libprov::dylink_memory(&wasm)?;
+            let a = 1u64 << align;
+            let data = crate::libprov::alloc_top(state, (size as u64).max(16) + a, &format!("[provider {} data]", prov.name))?;
+            let data = (data + a - 1) & !(a - 1);
+            crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data as u32 })?;
+        } else {
+            crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        }
         let dll = p.path.rsplit(['/', '\\']).next().unwrap_or(&p.path);
         for (_, e) in &prov.binds {
             if let Some(&rva) = pv.exports.get(e) {

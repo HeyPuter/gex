@@ -102,7 +102,11 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
         return Ok(g);
     }
     let tid = cx.data().thread.tid;
-    let base = alloc(cx.data_mut(), STACK, &format!("[provider stack, thread {tid}]"))?;
+    // Top down when only built-in providers are stateful, so the first call
+    // (a DllMain's malloc) does not move the DLLs mapped after it; an
+    // ejected project's sessions were recorded with it bottom-up.
+    let name = format!("[provider stack, thread {tid}]");
+    let base = if LIBS.get().map_or(true, |v| v.is_empty()) { alloc_top(cx.data_mut(), STACK, &name)? } else { alloc(cx.data_mut(), STACK, &name)? };
     let top = (base + STACK - 16) as i32;
     let g = wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Var), Val::I32(top))?;
     if let Some(s) = cx.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
@@ -116,6 +120,13 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
 pub(crate) fn alloc(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     let p = state.nt.clone().ok_or_else(|| anyhow!("a stateful provider outside a Windows process"))?;
     state.with_kernel(|k| gex_kernel::nt::boot::alloc_private(&p, k, size, name)).map_err(|e| anyhow!(e))
+}
+
+/// [`alloc`] from the top down (`boot::alloc_private_top`): a built-in
+/// provider's data and heap, which must not move the program's later DLLs.
+pub(crate) fn alloc_top(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
+    let p = state.nt.clone().ok_or_else(|| anyhow!("a stateful provider outside a Windows process"))?;
+    state.with_kernel(|k| gex_kernel::nt::boot::alloc_private_top(&p, k, size, name)).map_err(|e| anyhow!(e))
 }
 
 /// Install `p`'s functions for an image whose exports are `exports` at
@@ -220,6 +231,11 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         }
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> Result<()> { Err(Throw(code).into()) })?;
+    // The NT process clock as NtQueryPerformanceCounter reads it (100 ns
+    // units): the `nt_qpc` provider's.
+    linker.func_wrap(IMPORT_MODULE, "nt_qpc", |caller: Caller<'_, HostState>| -> i64 {
+        caller.data().nt.as_ref().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
+    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_time", |_caller: Caller<'_, HostState>, which: i32| -> f64 {
         match which {
@@ -241,6 +257,10 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     })?;
     linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i32| -> Result<i32> {
         Ok(alloc(caller.data_mut(), size as u32 as u64, "[provider heap]")? as i32)
+    })?;
+    // The same from the top down: a built-in provider's heap (`alloc_top`).
+    linker.func_wrap(IMPORT_MODULE, "provider_alloc_top", |mut caller: Caller<'_, HostState>, size: i32| -> Result<i32> {
+        Ok(alloc_top(caller.data_mut(), size as u32 as u64, "[provider heap]")? as i32)
     })?;
     // Diagnostics: text a provider writes to its stderr.
     linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> Result<()> {
