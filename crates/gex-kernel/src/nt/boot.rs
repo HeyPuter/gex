@@ -48,6 +48,19 @@ pub mod tramp {
     pub const UNIX_CALL_32: u64 = TRAMPOLINES + 0x60;
 }
 
+/// Where the trampoline page's code continues after its system call
+/// instructions (and the unix-call dispatcher's inner call): where a host
+/// that leaves the guest's code for a system call (the browser's) resumes
+/// it. The unit has no entries there; an ejected web build gives them
+/// region entries (docs/eject-pe.md §6).
+pub fn trampoline_resumes(class32: bool) -> Vec<u64> {
+    if class32 {
+        vec![tramp::SYSCALL_DISPATCHER_32 + 2, tramp::UNIX_CALL_32 + 10, tramp::UNIX_CALL_32 + 15]
+    } else {
+        vec![tramp::UNIX_CALL_64 + 10]
+    }
+}
+
 pub fn trampoline_page() -> Vec<u8> {
     let mut page = vec![0xccu8; (TRAMPOLINES_END - TRAMPOLINES) as usize];
     let put = |page: &mut Vec<u8>, at: u64, code: &[u8]| {

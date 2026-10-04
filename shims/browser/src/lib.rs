@@ -11703,6 +11703,11 @@ pub extern "C" fn gex_set_jit(on: i32) {
     JIT_ON.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether run-time translation is allowed (`gex_set_jit`).
+pub(crate) fn jit_on() -> bool {
+    JIT_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether library substitution is on. See `gex_set_intrinsics`.
 static mut INTRINSICS_ON: bool = true;
 

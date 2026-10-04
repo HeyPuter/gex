@@ -302,10 +302,38 @@ fn regions_dir(unit: &std::path::Path) -> Option<std::path::PathBuf> {
 /// change.
 #[cfg(feature = "translate")]
 pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Path, pcs: &[u64], jobs: usize) -> Result<Vec<u64>> {
+    let pv = provided(pe, base);
+    let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    regions_from(&image, &seeds.starts, &pv.stubs, base, unit, pcs, jobs)
+}
+
+/// The NT trampoline page's region entries (at its unit `unit`): where a
+/// host resumes it after a system call ([`gex_kernel::nt::boot::trampoline_resumes`]).
+#[cfg(feature = "translate")]
+pub fn prepare_trampoline_regions(class32: bool, unit: &std::path::Path, jobs: usize) -> Result<Vec<u64>> {
+    let (image, seeds) = trampoline_input(class32);
+    let pcs = gex_kernel::nt::boot::trampoline_resumes(class32);
+    regions_from(&image, &seeds.starts, &[], gex_kernel::nt::TRAMPOLINES, unit, &pcs, jobs)
+}
+
+#[cfg(feature = "translate")]
+#[allow(clippy::too_many_arguments)]
+fn regions_from(
+    image: &gex_ld::Image,
+    seed_starts: &[(u64, gex_xlate::func::Source)],
+    stubs: &[u64],
+    base: u64,
+    unit: &std::path::Path,
+    pcs: &[u64],
+    jobs: usize,
+) -> Result<Vec<u64>> {
     use gex_xlate::func::{self as func, Code, RecoverOptions, Source};
+    struct Pv<'a> {
+        stubs: &'a [u64],
+    }
+    let pv = Pv { stubs };
     let dir = regions_dir(unit).ok_or_else(|| anyhow!("no cache for region entries"))?;
     let have: std::collections::HashSet<u64> = gex_cgen::image::read_entries(unit)?.into_iter().collect();
-    let pv = provided(pe, base);
     let mut want: Vec<u64> = pcs.iter().copied().filter(|a| !have.contains(a) && pv.stubs.binary_search(a).is_err()).collect();
     want.sort_unstable();
     want.dedup();
@@ -321,10 +349,9 @@ pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Pa
     }
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let (image, seeds) = func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
-    let code = Code::with_elf(&image, None);
+    let code = Code::with_elf(image, None);
     let (mut starts, _) = func::seeds(&code, None, false);
-    for &(a, src) in &seeds.starts {
+    for &(a, src) in seed_starts {
         if code.is_code(a) {
             starts.entry(a).or_default().add(src);
         }

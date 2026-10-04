@@ -382,7 +382,25 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     write_file(&out.join("serve.mjs"), crate::web::SERVE_MJS.as_bytes(), true)?;
     write_file(&out.join("runtime/web/eject.mjs"), crate::web::EJECT_MJS.as_bytes(), false)?;
     write_file(&out.join("runtime/web/gex.mjs"), crate::web::GEX_MJS.as_bytes(), false)?;
-    if let Some(shim) = &o.web_shim {
+    if let (Some(shim), true) = (&o.web_shim, nt.is_some()) {
+        // A Windows program runs on the shared-memory x86 shim with its
+        // kernel and seed (the browser's NT layer), named by their directory
+        // (web/public/gex) or any file in it.
+        let from = if shim.is_dir() { shim.clone() } else { shim.parent().map(Path::to_path_buf).unwrap_or_default() };
+        let to = out.join(crate::pe::WEB_NT_DIR);
+        for f in crate::pe::WEB_NT_WASM {
+            let src = from.join(f);
+            let b = std::fs::read(&src).with_context(|| {
+                format!("reading {} (a Windows program's web build needs the x86 shared-memory shim, kernel and seed: GEX_ARCH=x86 shims/browser/build.sh)", src.display())
+            })?;
+            write_file(&to.join(f), &b, false)?;
+        }
+        for (f, text) in crate::pe::WEB_NT_JS {
+            write_file(&to.join("js").join(f), text.as_bytes(), false)?;
+        }
+        write_file(&out.join("run.mjs"), crate::pe::WEB_NT_RUN_MJS.as_bytes(), true)?;
+        summary.web = true;
+    } else if let Some(shim) = &o.web_shim {
         let b = std::fs::read(shim).with_context(|| format!("reading {}", shim.display()))?;
         if b.get(..4) != Some(b"\0asm") {
             bail!("{} is not a wasm module", shim.display());

@@ -132,6 +132,11 @@ mod imp {
         /// Worker until control goes back above the raise (`exc_escape`
         /// for depth `level`): 1, or 0 when it could not.
         fn exc_dispatch(ctx: i32, target: i64, level: i32) -> i32;
+        /// An AOT-only run (an ejected project's): serve what a syscall
+        /// left for JS -- the units of images just mapped, a thread just
+        /// created -- inside the call, so the guest's frames survive it
+        /// (leaving would resume at continuations no unit has entries for).
+        fn serve_in_place();
         /// Monotonic nanoseconds (`performance.now()`): the page's `now` is
         /// `Date.now()`, a millisecond clock that can step.
         fn mono_ns() -> i64;
@@ -893,6 +898,11 @@ mod imp {
                 // loads and installs it before the guest goes on, as the
                 // native host does after the same syscall.
                 if crate::cgen::drain() {
+                    if !crate::jit_on() {
+                        // SAFETY: a host import without arguments.
+                        unsafe { serve_in_place() };
+                        return;
+                    }
                     set_resume(resume_pc());
                     set_resume_ctx(ctx_addr);
                     trap();
@@ -955,6 +965,12 @@ mod imp {
                     }
                     stage_thread(gex_tid, child, start);
                 });
+                if !crate::jit_on() {
+                    crate::cgen::drain();
+                    // SAFETY: a host import without arguments.
+                    unsafe { serve_in_place() };
+                    return;
+                }
                 set_resume(resume_pc());
                 set_resume_ctx(ctx_addr);
                 trap();

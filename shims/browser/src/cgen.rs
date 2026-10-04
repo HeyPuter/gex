@@ -442,6 +442,31 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
     0
 }
 
+/// A region-entry module for placed unit `u` (docs/eject-pe.md §3.3): an
+/// entry of its own whose key is `regions/<u's key>`, which the loaders find
+/// at `<cache>/regions/<key>/` as natively. JS publishes it after the unit,
+/// when it has one. Returns its index, or -1.
+#[no_mangle]
+pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
+    let mut units = lock(&UNITS);
+    let Some(x) = units.get(u as usize) else { return -1 };
+    let r = Unit {
+        identity: x.identity.clone(),
+        key_base: format!("regions/{}", x.key),
+        key: format!("regions/{}", x.key),
+        wine: true,
+        path: x.path.clone(),
+        base: x.base,
+        pages: Vec::new(),
+        regs: Vec::new(),
+        dirs: Vec::new(),
+        slots: 0,
+        providers: Vec::new(),
+    };
+    units.push(r);
+    (units.len() - 1) as i32
+}
+
 /// The bridges that make `addrs` reachable from tier-1: each address's
 /// dispatch slot (numbering its page if it has none) as `[table, slot]`,
 /// flattened for JS (a dense slot gets an index of its own in `blocks`,
@@ -706,6 +731,21 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if crate::nt::exc_escape(ctx, t) {
         crate::set_resume_none();
         crate::trap();
+    }
+    // An ejected project's AOT-only run (`gex_set_jit(0)`, docs/eject-pe.md
+    // §3.1): no function body holds `t`, and nothing may translate it.
+    if !crate::jit_on() {
+        let path = lock(&UNITS)
+            .iter()
+            .filter(|x| x.base <= t)
+            .max_by_key(|x| x.base)
+            .map(|x| format!("{} at {:#x}, +{:#x}", x.path, x.base, t - x.base))
+            .unwrap_or_else(|| "no image".into());
+        crate::warn_line(&format!(
+            "gex-eject: the guest reached {t:#x} ({path}), which no unit, region entry or provider holds, \
+             and this project runs without translation: record a session that reaches it and re-eject\n"
+        ));
+        crate::nt::end_process(0xc000_001d);
     }
     if ret as u64 == gex_abi::ftab::NO_RETURN || !CALLOUT_ON.load(Ordering::Relaxed) {
         return gex_abi::ftab::RET_LEFT;

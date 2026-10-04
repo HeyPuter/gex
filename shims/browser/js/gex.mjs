@@ -862,6 +862,12 @@ export class Gex {
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
         exc_dispatch: (ctx, target, level) => this.#excDispatch(ctx >>> 0, target, level),
+        // An AOT-only run serves units and new threads inside the syscall
+        // (nt.rs `serve_in_place`), as the NT callback loop does.
+        serve_in_place: () => {
+          this.#cgenServe();
+          this.#drainThread().catch((err) => console.error(`[gex-nt] starting a thread: ${err.message ?? err}`));
+        },
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
@@ -2520,6 +2526,31 @@ export class Gex {
     }
   }
 
+  /** An ejected project's region entries for unit `u` (docs/eject-pe.md
+   *  §3.3): `<cache>/regions/<key>/`, published after the unit as a unit of
+   *  their own, when the build made them. */
+  #cgenRegions(u, path) {
+    const e = this.#shim.exports;
+    if (!e.gex_cgen_region) return;
+    const r = e.gex_cgen_region(u);
+    if (r < 0) return;
+    const key = this.#cgenStr(e.gex_cgen_key, r);
+    const got = this.#env.loadUnit?.(key) ?? null;
+    if (!got) return;
+    this.#cgenModule(key, got);
+    const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
+    const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
+    this.#bytes().set(ent, gp);
+    const res = e.gex_cgen_publish(r, gp, ent.byteLength / 8);
+    e.gex_free?.(gp, Math.max(8, ent.byteLength));
+    if (res < 0) throw new Error(`gex-cgen: publishing ${path}'s region entries failed`);
+    this.#cgenCatchUp();
+    e.gex_cgen_installed(r);
+    let n = 0;
+    for (let i = 0; i + 8 <= ent.byteLength; i += 8) if (ent[i] | ent[i + 1] | ent[i + 2] | ent[i + 3] | ent[i + 4] | ent[i + 5] | ent[i + 6] | ent[i + 7]) n++;
+    console.error(`gex-nt: region entries for ${path}: ${n}`);
+  }
+
   /** Replay the function table's log this Worker has not seen: installs,
    *  and retirements (back to `resolve`). */
   #cgenCatchUp() {
@@ -2577,6 +2608,7 @@ export class Gex {
       e.gex_cgen_installed(u);
       this.#cgenProviders(u);
       console.error(`gex-nt: function tier for ${path}: ${ent.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+      this.#cgenRegions(u, path);
     }
     this.#cgenCatchUp();
   }

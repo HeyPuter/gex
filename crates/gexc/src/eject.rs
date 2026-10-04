@@ -207,6 +207,17 @@ fn build(dir: &std::path::Path) -> Result<()> {
             let f: Vec<String> = first.iter().map(|a| format!("{a:#x}")).collect();
             eprintln!("  warning: {path}: {n} entries the session reached have no function or region entry (first: {})", f.join(" "));
         }
+        if !pe.web_units.is_empty() {
+            let count = |h: &str| pe.web_units.iter().filter(|(_, x)| *x == h).count();
+            eprintln!(
+                "  web build: {} units in build/web/cgen ({} present, {} reused, {} built), {} region entries; ./run.mjs",
+                pe.web_units.len(),
+                count("present"),
+                count("reused"),
+                count("built"),
+                pe.web_regions
+            );
+        }
         eprintln!("{}: built ({} files in build/rootfs; no run-time translation)", dir.display(), r.rootfs_files);
         return Ok(());
     }

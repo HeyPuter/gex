@@ -639,6 +639,8 @@ async function handle(msg) {
     // because that is when it changes (a shell sets up then prints a prompt).
     lflag = () => gex.shim.exports.gex_tty_lflag?.() ?? 0;
     const ex = gex.shim.exports;
+    // An ejected project's AOT-only run: nothing translates, in any Worker.
+    if ((msg.jit ?? msg.opts?.jit) === false) ex.gex_set_jit(0);
     if (msg.hot) ex.gex_set_hot?.(1);
     if (msg.noIntrinsics) ex.gex_set_intrinsics?.(0);
     if (msg.intrinsicMask !== undefined) ex.gex_set_intrinsic_mask?.(msg.intrinsicMask);

@@ -15,6 +15,11 @@
 //     --cgen                 function-tier units from GEX_CGEN_CACHE (default
 //                            ~/.cache/gex/cgen), required for a Windows
 //                            program image; --cgen-prefer: used where found
+//     --no-jit               translate nothing at run time (an ejected
+//                            project's AOT-only run): a miss stops the run
+//
+// GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
+// web/public/gex of this tree; an ejected project's runtime/web).
 
 import { lstatSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -41,6 +46,7 @@ const extract = [];
 let argv0 = null;
 const env = [];
 let cgenMode = 0;
+let noJit = false;
 const dirs = [];
 const rest = [];
 {
@@ -117,6 +123,7 @@ const rest = [];
     else if (av[i] === '--strace') strace = true;
     else if (av[i] === '--cgen') cgenMode = 2;
     else if (av[i] === '--cgen-prefer') cgenMode = 1;
+    else if (av[i] === '--no-jit') noJit = true;
     else if (av[i] === '--argv0') argv0 = av[++i];
     else break;
   }
@@ -147,11 +154,13 @@ function readStdin() {
 // closure module must be the shared ones together. That is the configuration
 // the page ships and the one a fork breaks in.
 const SHARED = !!process.env.GEX_SHARED;
+const PUB = process.env.GEX_WEB_DIR
+  ? new URL(`file://${process.env.GEX_WEB_DIR.replace(/\/?$/, '/')}`)
+  : new URL('../../../web/public/gex/', import.meta.url);
 const shimWasm = readFileSync(
   new URL(
-    SHARED ? `../../../web/public/gex/gex_browser${ARCH_INFIX}.shared.wasm`
-           : `../../../web/public/gex/gex_browser${ARCH_INFIX}.wasm`,
-    import.meta.url,
+    SHARED ? `gex_browser${ARCH_INFIX}.shared.wasm` : `gex_browser${ARCH_INFIX}.wasm`,
+    PUB,
   ),
 );
 
@@ -162,9 +171,8 @@ const shimWasm = readFileSync(
 let kernel = null;
 try {
   const path = new URL(
-    SHARED ? `../../../web/public/gex/gex_kernel${ARCH_INFIX}.wasm`
-           : `../../../web/public/gex/gex_kernel${ARCH_INFIX}.plain.wasm`,
-    import.meta.url,
+    SHARED ? `gex_kernel${ARCH_INFIX}.wasm` : `gex_kernel${ARCH_INFIX}.plain.wasm`,
+    PUB,
   );
   kernel = {
     module: await WebAssembly.compile(readFileSync(path)),
@@ -241,6 +249,8 @@ const host = new ProcessHost({
     cgen: cgenMode
       ? { mode: cgenMode, root: process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
       : undefined,
+    // --no-jit: nothing is translated at run time, in any Worker.
+    jit: noJit ? false : undefined,
     // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
     // deflate stream that a UTF-8 round trip would fill with U+FFFD.
     rawOutput: true,
