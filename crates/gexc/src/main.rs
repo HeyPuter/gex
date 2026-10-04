@@ -593,6 +593,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/root".into()];
     }
 
+    // GEX_IMAGE_WASM=PATH: run the program image from a module `gexc build`
+    // wrote (the bytes a browser host runs) instead of translating it, so the
+    // same wasm can be timed under wasmtime and under V8. The module must be
+    // built with a shared memory, as the native guest memory is one.
+    if let Some(p) = std::env::var_os("GEX_IMAGE_WASM") {
+        let mut aot = gex_native::aot::Aot::new(format!("GEX_IMAGE_WASM={}", p.to_string_lossy()));
+        aot.images.insert(gex_native::aot::image_identity(&program.exe), p.into());
+        ra.opts.aot = Some(std::sync::Arc::new(aot));
+    }
     ra.opts.jit = ra.jit;
     if ra.opts.record.is_some() {
         gex_native::profile::set_exe_host_path(ra.path.clone().into());
