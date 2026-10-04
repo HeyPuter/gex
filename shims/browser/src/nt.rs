@@ -100,6 +100,13 @@ mod stub {
     pub extern "C" fn gex_nt_callback_done(_ctx: i32) -> i32 {
         0
     }
+
+    /// No nested exception dispatch without a Windows process: never an
+    /// escape. The glue calls it, so the export has to exist.
+    #[no_mangle]
+    pub extern "C" fn gex_exc_escaped(_clear: i32) -> i32 {
+        -1
+    }
 }
 
 #[cfg(feature = "shared-memory")]
