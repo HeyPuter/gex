@@ -594,11 +594,17 @@ pub fn translate(
             nr::IOCTL
         }
         x::FCNTL | x::FCNTL64 => {
-            // F_GETLK64/F_SETLK64/F_SETLKW64 carry a flock64 the kernel does
-            // not read in its 32-bit layout; they fall through as the lock
-            // commands they are and fail loudly on the struct if anything
-            // uses them.
+            // F_GETLK64/F_SETLK64/F_SETLKW64 (12-14) are i386's names for the
+            // lock commands with a flock64; the canonical ones are 5-7. The
+            // kernel reads no field of either struct but l_type, which is
+            // first in both (`Kernel::sys_fcntl`).
             a[0] = sext(a[0]);
+            a[1] = match a[1] {
+                12 => 5,
+                13 => 6,
+                14 => 7,
+                c => c,
+            };
             nr::FCNTL
         }
         x::UMASK => nr::UMASK,

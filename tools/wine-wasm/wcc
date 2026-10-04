@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""clang for gex wasm32 programs.
+
+Compiles like clang. A link (no -c/-S/-E) compiles any sources, runs wasm-ld
+for a position-independent executable that imports gex's shared memory and
+function table, and wraps it in the ELF container gexc runs (wasm-elf.py);
+the module stays beside it as OUT.wasm. `-shared` links a PIC side module
+instead (a Unix library: .so), with no container.
+
+GEX_WASM_SYSROOT names the sysroot (build-sysroot.sh)."""
+import os, subprocess, sys, tempfile
+
+here = os.path.dirname(os.path.realpath(__file__))
+flags = {}
+for line in open(os.path.join(here, 'flags.sh')):
+    if '=' in line and not line.startswith('#'):
+        k, v = line.strip().split('=', 1)
+        v = v.strip('"')
+        for kk, vv in flags.items():
+            v = v.replace('$' + kk, vv)
+        flags[k] = v
+CFLAGS = flags['WASM_CFLAGS'].split()
+sysroot = os.environ.get('GEX_WASM_SYSROOT') or sys.exit('wcc: set GEX_WASM_SYSROOT')
+CC = ['clang'] + CFLAGS + ['--sysroot=' + sysroot, '-isystem', sysroot + '/include']
+if os.path.basename(sys.argv[0]).endswith('++'):
+    CC[0] = 'clang++'
+
+args = sys.argv[1:]
+if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or '--version' in args or '-v' == args[-1:]:
+    os.execvp(CC[0], CC + args)
+
+out = 'a.out'
+srcs, ld_in, ld_flags, cflags = [], [], [], []
+shared = False
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == '-o':
+        out = args[i + 1]; i += 2; continue
+    if a == '-shared':
+        shared = True
+    elif a.startswith('-Wl,'):
+        ld_flags += [x for x in a[4:].split(',') if x]
+    elif a.startswith('-l') or a.startswith('-L'):
+        if a in ('-l', '-L'):
+            ld_in += [a + args[i + 1]]; i += 2; continue
+        if a not in ('-lc', '-lm', '-lpthread', '-ldl', '-lrt', '-lutil'):
+            ld_in.append(a)
+    elif a.endswith(('.c', '.cc', '.cpp', '.s', '.S')) and not a.startswith('-'):
+        srcs.append(a)
+    elif a.endswith(('.o', '.a', '.so', '.lo')) and not a.startswith('-'):
+        ld_in.append(a)
+    elif a in ('-pthread', '-rdynamic', '-static', '-pie', '-no-pie', '-fPIE', '-fpie'):
+        pass
+    elif a in ('-I', '-D', '-U', '-include', '-isystem', '-MF', '-MT', '-x'):
+        cflags += [a, args[i + 1]]; i += 2; continue
+    else:
+        cflags.append(a)
+    i += 1
+
+tmp = tempfile.mkdtemp(prefix='wcc-')
+objs = []
+for k, s in enumerate(srcs):
+    o = os.path.join(tmp, '%d.o' % k)
+    r = subprocess.call(CC + cflags + ['-c', s, '-o', o])
+    if r:
+        sys.exit(r)
+    objs.append(o)
+
+lib = sysroot + '/lib'
+common = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory',
+          '--max-memory=4294967296', '-L' + lib]
+if shared:
+    cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags
+    sys.exit(subprocess.call(cmd))
+wasm = out + '.wasm'
+cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
+    ['-lc', lib + '/libclang_rt.builtins-wasm32.a']
+r = subprocess.call(cmd)
+if r:
+    sys.exit(r)
+sys.exit(subprocess.call([sys.executable, os.path.join(here, 'wasm-elf.py'), wasm, out]))

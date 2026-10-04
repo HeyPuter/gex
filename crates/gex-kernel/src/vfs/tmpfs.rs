@@ -276,12 +276,16 @@ impl FileHandle for TmpHandle {
                 nlink: inner.inos.values().filter(|&&v| v == ino).count() as u32,
                 rdev: 0,
             }),
-            Some(Node::Dir) => Ok(Metadata {
-                ino,
-                mtime,
-                nlink: TmpFs::dir_nlink(&inner, &self.path),
-                ..Metadata::dir()
-            }),
+            Some(Node::Dir) => {
+                let d = Metadata::dir();
+                Ok(Metadata {
+                    ino,
+                    mtime,
+                    nlink: TmpFs::dir_nlink(&inner, &self.path),
+                    mode: inner.modes.get(&self.path).copied().unwrap_or(d.mode),
+                    ..d
+                })
+            }
             Some(Node::Symlink(t)) => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: t.len() as u64,
@@ -443,7 +447,8 @@ impl FileSystem for TmpFs {
             return Err(Errno::ENOENT);
         }
         let mode = mode & 0o7777;
-        if mode == 0o644 {
+        let default = if matches!(inner.nodes.get(path), Some(Node::Dir)) { Metadata::dir().mode } else { 0o644 };
+        if mode == default {
             inner.modes.remove(path);
         } else {
             inner.modes.insert(path.to_string(), mode);
@@ -487,10 +492,14 @@ impl FileSystem for TmpFs {
         }
     }
 
-    fn mkdir(&self, path: &str, _mode: u32) -> Result<(), Errno> {
+    fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let mut inner = self.inner.lock().unwrap();
         if inner.nodes.contains_key(path) {
             return Err(Errno::EEXIST);
+        }
+        let mode = mode & 0o7777;
+        if mode != Metadata::dir().mode {
+            inner.modes.insert(path.to_string(), mode);
         }
         let ino = inner.next_ino;
         inner.next_ino += 1;
@@ -516,6 +525,7 @@ impl FileSystem for TmpFs {
         }
         inner.nodes.remove(path);
         inner.inos.remove(path);
+        inner.modes.remove(path);
         Ok(())
     }
 
