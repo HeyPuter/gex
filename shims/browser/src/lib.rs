@@ -9793,6 +9793,7 @@ pub extern "C" fn gex_fma_calls() -> i64 {
 
 #[no_mangle]
 pub extern "C" fn gex_illegal(_ctx: i32, pc: i64, raw: i32) {
+    let pc = fault_pc(pc);
     if nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::Illegal, pc as u64);
     }
@@ -9838,6 +9839,7 @@ pub extern "C" fn gex_set_trace_blocks(on: i32) {
 
 #[no_mangle]
 pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
+    let pc = fault_pc(pc);
     if raw == gex_abi::imports::BRK_TRACE {
         let line = with_host(|h| {
             let gm = GuestMem::new(guest_bytes());
@@ -10019,6 +10021,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
 }
 #[no_mangle]
 pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
+    let _pc = fault_pc(_pc);
     match reg {
         // CNTVCT_EL0, at the frequency the lifter tells the guest CNTFRQ is,
         // so the guest's own arithmetic on it comes out exact.
@@ -10031,6 +10034,7 @@ pub extern "C" fn gex_sysreg_read(_ctx: i32, _pc: i64, reg: i32) -> i64 {
 }
 #[no_mangle]
 pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
+    let pc = fault_pc(pc);
     // A gex-eject library replacement (`Intrinsic::Replace`). This shim has no
     // replacement modules to run it with (eject v0 runs them natively only),
     // and returning would carry on as if the replaced function had run.
@@ -10106,6 +10110,7 @@ static SMC_INVALIDATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
+    let _pc = fault_pc(_pc);
     if op == gex_abi::cache_op::LOW_ACCESS {
         low_access("a locked access", addr as u64, _ctx, _pc as u64);
     }
@@ -10218,6 +10223,11 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
     // without a syscall: a loop that spins on them passes here.
     nt::tick();
+    // A loop that has left an exception dispatched nested (nt::exc_escape).
+    if nt::exc_escape(ctx, pc as u64) {
+        set_resume_none();
+        trap();
+    }
     // Rearm: translated code counts a word down to zero and calls here; leaving
     // it at zero makes every later back-edge call out.
     {
@@ -10515,6 +10525,11 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         });
+        trap();
+    }
+    // Control leaving an exception dispatched nested (nt::exc_escape).
+    if nt::exc_escape(_ctx, pc) {
+        set_resume_none();
         trap();
     }
     // The return a call-out of this Worker waits for, untranslated: that
@@ -11328,6 +11343,13 @@ pub(crate) static IN_PLACE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::
 #[no_mangle]
 pub extern "C" fn gex_set_in_place(on: i32) {
     IN_PLACE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A fault import's pc without bit 62, which a unit sets on a fault it can
+/// resume nested (R: the native host dispatches those nested; guest pcs are
+/// below 2^48). The browser still traps out for them.
+fn fault_pc(pc: i64) -> i64 {
+    pc & !(1i64 << 62)
 }
 
 /// Code the guest unmapped or reprotected since the last syscall loses its

@@ -701,6 +701,12 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     let c = ctx as u32 as u64;
     let t = gm.read_u64(c + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
     let _ = gm.write_u64(c + gex_abi::ctx::PC as u64, t);
+    // A jump out of an exception dispatched nested: back to the frames it
+    // was raised under (nt::exc_escape), the dispatch's loop ends.
+    if crate::nt::exc_escape(ctx, t) {
+        crate::set_resume_none();
+        crate::trap();
+    }
     if ret as u64 == gex_abi::ftab::NO_RETURN || !CALLOUT_ON.load(Ordering::Relaxed) {
         return gex_abi::ftab::RET_LEFT;
     }
@@ -801,6 +807,11 @@ pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
 #[no_mangle]
 pub extern "C" fn gex_callout_unwind(depth: u32) {
     CALLOUTS.with(|c| c.borrow_mut().truncate(depth as usize));
+}
+
+/// NT user-mode callbacks in progress on this Worker.
+pub(crate) fn callback_depth() -> u32 {
+    CB_DEPTH.with(|d| d.get())
 }
 
 /// An NT user-mode callback begins (or ends) on this Worker.

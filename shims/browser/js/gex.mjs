@@ -860,6 +860,8 @@ export class Gex {
         call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
+        // An exception dispatched nested (nt.rs `raise_nested`).
+        exc_dispatch: (ctx, target, level) => this.#excDispatch(ctx >>> 0, target, level),
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
@@ -2661,7 +2663,7 @@ export class Gex {
         // exit 0. `trap()` sets a flag; nothing else does. First because the
         // recovery below calls into the shim, whose kernel a crash may leave
         // borrowed -- a second call would bury the first error.
-        if (this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
+        if (!err?.gexHandoff && this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
           // RECOVERABLE first: a "table index is out of bounds" during dispatch
           // is usually just this Worker's funcref table lagging the shared
           // directory. Another Worker numbered a page (bumping the process-wide
@@ -3280,7 +3282,7 @@ export class Gex {
         // This callback's NtCallbackReturn, reached inside a call-out it
         // made (up through the call-out's frames).
         if (err?.gexCallbackDone && e.gex_nt_callback_done(ctx)) return 1;
-        if (!e.gex_handoff()) {
+        if (!err?.gexHandoff && !e.gex_handoff()) {
           // The sibling-numbered-page race, as in the outer loop.
           if (/table index is out of bounds/.test(err.message)) {
             const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
@@ -3363,7 +3365,7 @@ export class Gex {
     // Only a call-out with no NT callback nested inside it: an outer one's
     // return reached from inside a callback is not that call-out's (its
     // caller's frame is below the callback's), and runs as a bypass.
-    const lastCallback = this.#nest.lastIndexOf('callback');
+    const lastCallback = Math.max(this.#nest.lastIndexOf('callback'), this.#nest.lastIndexOf('exc'));
     for (let k = this.#callouts.length - 1; k >= 0; k--) {
       const c = this.#callouts[k];
       if (c.nestAt < lastCallback) break;
@@ -3466,7 +3468,7 @@ export class Gex {
             next = sig.f;
             continue;
           }
-          if (!e.gex_handoff()) {
+          if (!err?.gexHandoff && !e.gex_handoff()) {
             if (/table index is out of bounds/.test(err.message)) {
               const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
               if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
@@ -3478,7 +3480,16 @@ export class Gex {
           }
           const hit = e.gex_callout_hit();
           if (hit >= 0) return hit === me ? 1 : 0;
-          if (e.gex_exited?.()) return 0;
+          // The process ended: down through every frame to the run loop
+          // (returning would run the guest on).
+          if (e.gex_exited?.()) {
+            err.gexHandoff = true;
+            throw err;
+          }
+          // Control left an exception dispatched nested further out: this
+          // call-out's caller leaves, and the dispatch's loop sees the escape
+          // at the next check (nt.rs `exc_escape`).
+          if ((e.gex_exc_escaped?.(0) ?? -1) >= 0) return 0;
           // The NtCallbackReturn of a callback further out (the function
           // this call-out ran was the callback's dispatcher): its loop's, so
           // up through every frame between, as natively.
@@ -3499,7 +3510,12 @@ export class Gex {
           this.#cgenServe();
           this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
           const nextPc = e.gex_resume_pc();
-          if (nextPc === 0n) return 0;
+          // Nowhere to resume (the thread ended, or waits): the run loop's
+          // business, down through every frame.
+          if (nextPc === 0n) {
+            err.gexHandoff = true;
+            throw err;
+          }
           pc = BigInt.asUintN(64, nextPc);
           const rc = e.gex_resume_ctx() >>> 0;
           if (rc && rc !== ctx) {
@@ -3530,6 +3546,89 @@ export class Gex {
   }
 
   #calloutsMade = 0;
+
+  /**
+   * An exception dispatched nested (nt.rs `raise_nested`, ffa2cec9's browser
+   * half): run the guest from `target` (KiUserExceptionDispatcher) in a loop
+   * on this Worker until control goes back above the raise (the escape for
+   * depth `level`): 1; 0 when it could not, and the syscall traps out as
+   * before. Synchronous, as `#ntCallback`.
+   */
+  #excDispatch(ctx, target, level) {
+    const e = this.#shim.exports;
+    const sp0 = e.__stack_pointer.value;
+    this.#nest.push('exc');
+    if (globalThis.GEX_CALLOUT_TRACE) console.error(`[exc] nested dispatch depth ${level} at ${BigInt.asUintN(64, target).toString(16)}`);
+    let pc = BigInt.asUintN(64, target);
+    let bypass = null;
+    try {
+      for (;;) {
+        try {
+          if (bypass) {
+            const f = bypass;
+            bypass = null;
+            f(ctx);
+          } else {
+            this.#guest.exports.enter(ctx, pc);
+          }
+          console.error('[gex] guest code returned out of exception dispatch');
+          return 0;
+        } catch (err) {
+          e.__stack_pointer.value = sp0;
+          const sig = this.#calloutSignal;
+          this.#calloutSignal = null;
+          if (sig?.kind === 'bypass' && sig.f) {
+            bypass = sig.f;
+            continue;
+          }
+          if (!err?.gexHandoff && !e.gex_handoff()) {
+            if (/table index is out of bounds/.test(err.message)) {
+              const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
+              if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
+                pc = BigInt.asUintN(64, tgt);
+                continue;
+              }
+            }
+            throw err;
+          }
+          if (e.gex_exc_escaped(0) === level) {
+            e.gex_exc_escaped(1);
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[exc] depth ${level} escaped`);
+            return 1;
+          }
+          if (e.gex_exited?.()) {
+            err.gexHandoff = true;
+            throw err;
+          }
+          const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+          if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+          this.#denseCatchUp();
+          if (e.gex_jit_pending_len() >>> 0) {
+            const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+            if (need) this.#growTables(need, 'exception');
+          }
+          while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+          this.#catchUpSync();
+          this.#cgenServe();
+          this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+          const nextPc = e.gex_resume_pc();
+          // Nowhere to resume (the thread ended, or waits): the run loop's
+          // business, down through every frame.
+          if (nextPc === 0n) {
+            err.gexHandoff = true;
+            throw err;
+          }
+          pc = BigInt.asUintN(64, nextPc);
+          const rc = e.gex_resume_ctx() >>> 0;
+          if (rc && rc !== ctx) return 0;
+          this.#armCallouts();
+        }
+      }
+    } finally {
+      this.#nest.pop();
+      e.gex_exc_unwind?.(level);
+    }
+  }
 
   /** What a dispatch miss needs, installed synchronously on this Worker
    *  (lib.rs `in_place`): 1, or 0 when it cannot be done here (a page's

@@ -90,6 +90,10 @@ mod stub {
         format!("{addr:#x}")
     }
 
+    pub(crate) fn exc_escape(_ctx: i32, _target: u64) -> bool {
+        false
+    }
+
     /// The glue's nested callback loop asks this; with no Windows process
     /// that loop never runs, but the export has to exist for the glue check.
     #[no_mangle]
@@ -116,6 +120,11 @@ mod imp {
         /// until its `NtCallbackReturn` (docs/nt-layer.md §5). One when the
         /// callback returned, zero when the run failed or the process ended.
         fn nt_callback(ctx: i32, pc: i64) -> i32;
+        /// Dispatch an exception nested (`raise_nested`): run the guest
+        /// from `target` (KiUserExceptionDispatcher) in a loop on this
+        /// Worker until control goes back above the raise (`exc_escape`
+        /// for depth `level`): 1, or 0 when it could not.
+        fn exc_dispatch(ctx: i32, target: i64, level: i32) -> i32;
         /// Monotonic nanoseconds (`performance.now()`): the page's `now` is
         /// `Date.now()`, a millisecond clock that can step.
         fn mono_ns() -> i64;
@@ -314,6 +323,9 @@ mod imp {
         }
         if let Some(s) = var("GEX_NT_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
             TIME_SCALE.store(s.to_bits(), Ordering::Relaxed);
+        }
+        if var("GEX_NT_EXC_NEST").as_deref() == Some("0") {
+            NO_EXC_NEST.store(true, Ordering::Relaxed);
         }
         if let Some(t) = var("GEX_NT_FIXED_TIME").and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) {
             FIXED_ORIGIN.store(unsafe { mono_ns() } as u64, Ordering::Relaxed);
@@ -553,11 +565,13 @@ mod imp {
             let slots: Vec<String> = (0..gex_abi::DISPATCH_TABLES as u32).map(|k| crate::gex_claimed_slots(k).to_string()).collect();
             let (callouts, left) = crate::cgen::callouts();
             warn_line(&format!(
-                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={}\n",
+                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={} exc_nested={} exc_escaped={}\n",
                 crate::dense::gex_dense_size(),
                 slots.join("/"),
                 crate::dense::on() as u8,
-                crate::IN_PLACE_N.load(Ordering::Relaxed)
+                crate::IN_PLACE_N.load(Ordering::Relaxed),
+                EXC_NESTED.load(Ordering::Relaxed),
+                EXC_ESCAPED.load(Ordering::Relaxed)
             ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
@@ -596,6 +610,131 @@ mod imp {
                 report_stats(p);
             }
         }
+    }
+
+    /// Exceptions dispatched nested and escaped back (the stats line).
+    pub(crate) static EXC_NESTED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXC_ESCAPED: AtomicU64 = AtomicU64::new(0);
+
+    /// How deep exceptions nest before raising traps out as before.
+    const EXC_MAX_DEPTH: usize = 8;
+
+    thread_local! {
+        /// This Worker's nested exception dispatches: the stack each was
+        /// raised on, and the NT callbacks in progress then.
+        static EXC: std::cell::RefCell<Vec<(u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// The dispatch whose escape was found (`exc_escape`), or -1.
+        static ESCAPE: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+    }
+
+    /// Whether an exception the syscall returning to `next_pc` raises is
+    /// dispatched nested, as natively: with function bodies about (units on),
+    /// when the syscall returns through a `ret`. `GEX_NT_EXC_NEST=0` (a page
+    /// setting) turns it off.
+    fn nest_exceptions(next_pc: u64) -> bool {
+        if !crate::cgen::on() || NO_EXC_NEST.load(Ordering::Relaxed) {
+            return false;
+        }
+        matches!(guest_bytes().get(next_pc as usize), Some(0xc3) | Some(0xc2))
+    }
+
+    static NO_EXC_NEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Has control left the innermost nested exception dispatch on this
+    /// Worker for `target`? It has when the stack is above the raise (a
+    /// handler's longjmp, a catch continuation, an NtContinue) and no NT
+    /// callback begun inside the dispatch is still in progress. Then
+    /// `ctx::PC` = `target` and the caller traps: the dispatch's loop ends.
+    /// Called where the context is complete: the fallback, a dispatch miss,
+    /// a safepoint, a syscall's resume.
+    pub(crate) fn exc_escape(ctx: i32, target: u64) -> bool {
+        let Some((raise_sp, cb, level)) = EXC.with(|e| e.borrow().last().map(|&(s, c)| (s, c, e.borrow().len() - 1))) else { return false };
+        if cb != crate::cgen::callback_depth() {
+            return false;
+        }
+        let c = ctx as u32 as u64;
+        let mut gm = GuestMem::new(guest_bytes());
+        let p32 = PROCESS.get().is_some_and(|p| p.abi == nt::Abi::P32);
+        let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+        let sp = if p32 { sp & 0xffff_ffff } else { sp };
+        if sp <= raise_sp {
+            return false;
+        }
+        let _ = gm.write_u64(c + ctx::PC as u64, target);
+        ESCAPE.with(|e| e.set(level as i32));
+        true
+    }
+
+    /// The nested dispatch an escape was found for (its depth), or -1;
+    /// reading it clears it (`clear` = 0 only looks).
+    #[no_mangle]
+    pub extern "C" fn gex_exc_escaped(clear: i32) -> i32 {
+        ESCAPE.with(|e| if clear != 0 { e.replace(-1) } else { e.get() })
+    }
+
+    /// A nested dispatch at depth `level` (and deeper) was left by an
+    /// exception through JS's loop: its entries go.
+    #[no_mangle]
+    pub extern "C" fn gex_exc_unwind(level: u32) {
+        let gone = EXC.with(|e| {
+            let mut e = e.borrow_mut();
+            let n = e.len().saturating_sub(level as usize);
+            e.truncate(level as usize);
+            n
+        });
+        for _ in 0..gone {
+            crate::cgen::callback(false);
+        }
+    }
+
+    /// Dispatch an exception without unwinding the thread's wasm frames
+    /// (`NtRaiseException`, first chance), as natively (ffa2cec9): run
+    /// `KiUserExceptionDispatcher` (`target`) in a nested loop on top of them
+    /// until control goes back above the raise; then the syscall returns,
+    /// its `ret` taking the guest to where the dispatch ended (the return
+    /// address it pops is written just below the new stack). False when it
+    /// cannot (too deep, the loop failed): trap out as before.
+    fn raise_nested(p: &Arc<nt::Process>, ctx_addr: u64, target: u64, raise_sp: u64, next_pc: u64) -> bool {
+        let p32 = p.abi == nt::Abi::P32;
+        let mask = if p32 { 0xffff_ffff } else { !0u64 };
+        let level = EXC.with(|e| e.borrow().len());
+        if level >= EXC_MAX_DEPTH {
+            return false;
+        }
+        EXC_NESTED.fetch_add(1, Ordering::Relaxed);
+        // A barrier for call-outs, as a callback is: one begun outside cannot
+        // end inside (its caller's frame is below this loop's).
+        crate::cgen::callback(true);
+        let cb = crate::cgen::callback_depth();
+        EXC.with(|e| e.borrow_mut().push((raise_sp & mask, cb)));
+        // SAFETY: a host import taking scalars; nothing here holds a lock.
+        let r = unsafe { exc_dispatch(ctx_addr as u32 as i32, target as i64, level as i32) };
+        // JS's loop unwinds its level on the way out; again here, harmlessly,
+        // for a host that did not.
+        gex_exc_unwind(level as u32);
+        if r != 1 {
+            return false;
+        }
+        EXC_ESCAPED.fetch_add(1, Ordering::Relaxed);
+        let mut gm = GuestMem::new(guest_bytes());
+        let to_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+        let to_sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0) & mask;
+        let pops = match guest_bytes().get(next_pc as usize) {
+            Some(0xc2) => gm.read_u32(next_pc + 1).unwrap_or(0) as u64 & 0xffff,
+            _ => 0,
+        };
+        let psize = if p32 { 4 } else { 8 };
+        let sp = to_sp.wrapping_sub(psize + pops) & mask;
+        let wrote = if p32 { gm.write_u32(sp, to_pc as u32) } else { gm.write_u64(sp, to_pc) };
+        if wrote.is_err() {
+            // No stack there: resume the old way.
+            set_resume(to_pc);
+            set_resume_ctx(ctx_addr);
+            trap();
+        }
+        let _ = gm.write_u64(ctx_addr + ctx::SP as u64, sp);
+        let _ = gm.write_u64(ctx_addr + ctx::PC as u64, next_pc);
+        true
     }
 
     /// Runs user-mode callbacks: the JS side's nested loop on this Worker.
@@ -687,6 +826,10 @@ mod imp {
         let r0 = gm.read_u32(sp0).unwrap_or(0) as u64;
         let r1 = gm.read_u32(sp0 + 4).unwrap_or(0) as u64;
         ring_note(ctx_addr, (nr as u64) << 32 | sp0, r0 << 32 | r1);
+        // Where the syscall returns to and the stack it was made on: what a
+        // nested exception dispatch needs to come back here.
+        let next_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+        let raise_sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
         let (t_in, gl_in, glw_in) =
             (crate::now_ns(), crate::gl::GL_NS.with(|g| g.get()), crate::gl::GL_WAIT_NS.with(|g| g.get()));
         let outcome = {
@@ -746,6 +889,17 @@ mod imp {
                 }
             }
             nt::Outcome::Resume(target) => {
+                // NtContinue out of a nested dispatch: back where it was raised.
+                if exc_escape(ctx, target) {
+                    set_resume_none();
+                    trap();
+                }
+                if nr == nt::sysno::ntdll::NtRaiseException && p.cfg.trace {
+                    warn_line(&format!("[nt] NtRaiseException returning to {next_pc:#x}: nested {}\n", nest_exceptions(next_pc)));
+                }
+                if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(next_pc) && raise_nested(p, ctx_addr, target, raise_sp, next_pc) {
+                    return;
+                }
                 set_resume(target);
                 set_resume_ctx(ctx_addr);
                 trap();
