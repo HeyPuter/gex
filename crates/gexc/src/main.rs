@@ -2255,7 +2255,9 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
         None => gex_native::nt_cgen::cache_root()?.join("recovery").join(gex_native::nt_cgen::recovery_key(&image)),
     };
     let read = |a: u64| image.segments.iter().find_map(|s| s.byte(a));
-    print!("{}", gex_cgen::image::function_c(&dir, at, &read)?);
+    // The image's indirect-call profile, as its unit build uses it.
+    let hints = gex_native::nt_cgen::icall_hints(&image);
+    print!("{}", gex_cgen::image::function_c(&dir, at, &read, &hints)?);
     Ok(())
 }
 
