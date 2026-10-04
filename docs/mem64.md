@@ -366,3 +366,26 @@ browser shim; the coordinator sequences them.
      switch; then Rain World and Hollow Knight (F has pinned the D3D DLLs in
      the gex-layout prefix, sha256 63b13c67..., with units in F's
      cgcache-cg12).
+
+### State at 2026-10-04, later (Muck at its menu)
+
+- The rejected module was tier-1's self-modification guard
+  (`emit_guard`): it loaded the code bytes at an `i32.const` address. It now
+  uses `FuncBody::addr_const`, which emits the same bytes for M32
+  (`tools/mem32-identity.sh`: identical apart from five gx64 cgen modules,
+  whose output depends on how many CPUs the build sees; old and new
+  binaries agree on 2 CPUs and on 4). Test:
+  `tests/x86-programs/mem64-smc.c`.
+- Muck then reached its menu (docs/games.md, Unity status), after three
+  fixes not specific to M64: the function JIT leaves writable-and-executable
+  code to tier-1, tier-1 translates again when its page was retired
+  mid-translation, and a worker thread's `exit_group` ends the process.
+- **Next:** `tests/games/halflife.sh`'s native mode to an Xwayland on
+  gex's compositor. Half-Life is i386 and Xwayland x86-64, and one gexc
+  process decodes one of the two (`gex_xlate::set_compat` is per process,
+  and a guest fork is a thread of the same host process), so the
+  in-guest Xwayland Muck uses needs either a per-thread decode mode or a
+  second gexc running Xwayland with guest TCP `listen` (the kernel's AF_INET
+  sockets only `connect` today). After that: the browser (step 6), the live
+  switch (step 7), and Rain World and Hollow Knight.
+

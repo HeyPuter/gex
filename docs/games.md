@@ -192,10 +192,10 @@ Unity 6000.0.61f1) and Rain World (Windows x64, Unity 2020.3.45f1). All
 three are Mono (MonoBleedingEdge), not IL2CPP. Run them in place from the
 Steam install, read-only; write prefixes, homes and logs elsewhere.
 
-State as of 2026-10-03: none reaches its menu on gex yet. Every one of them
-needs more address space than a wasm32 guest has (below), which `--mem64`
-now provides; Muck gets through engine start-up (GL device on the host GPU,
-Mono) and is loading its C# assemblies.
+State as of 2026-10-04: Muck reaches its main menu natively (`--fjit
+--mem64`, status below); Rain World and Hollow Knight have not been run
+since. Every one of them needs more address space than a wasm32 guest has
+(below), which `--mem64` provides.
 
 ### Running
 
@@ -256,10 +256,34 @@ of address space.
   game is a Steam lobby; there is no offline mode), so Muck's gameplay needs
   an x86-64 gex-steam with lobby and loopback P2P. Hollow Knight stops on its
   title screen natively without Steam; Rain World gets through EOS errors.
-- **Status (2026-10-04):** the GC hang is fixed (per-thread sigsuspend
-  mask); Muck under `--fjit --mem64` reaches its first frame and then stops
-  on a tier-1 M64 translation wasmtime rejects (i32 where an i64 address is
-  expected). See docs/mem64.md section 10.
+- **Status (2026-10-04, later):** Muck reaches its main menu natively
+  under `--fjit --mem64` (Host Lobby, Join Lobby, Settings, Achievements,
+  About, Quit over the 3D island; work/games/screens/muck-menu-gex-fjit-mem64.png)
+  at 17-23 fps at 800x600 on two cores (cores 1,7; a GL capture was being
+  written, and there is no pewasm Unity run to pair it with). From a cold
+  translation cache the menu took about 100 minutes of wall time; most of
+  it is translation. What it took, each with a test: tier-1's self-modification
+  guard read code bytes at an i32 address in an M64 module; the function
+  JIT translated a JIT's writable-and-executable code without guards (it now
+  leaves it to tier-1); tier-1 failed a miss whose page another thread's
+  guard retired mid-translation (it now translates again); a worker
+  thread's `exit_group` or fatal error left the process hanging; and gex-gl's
+  `glMapBufferRange` shadow uploaded zeros over bytes not written or not
+  flushed. Muck logs a NullReferenceException after "Initializing packets."
+  (no Steam) and goes on.
+- **Slow menu frames look tiled.** While a frame takes seconds, Muck's
+  menu draws its scene tiled (8x11, later 23x30 copies). The GL capture shows
+  that this is Muck's own data: its full-screen quad's texcoords are
+  0.5 +/- 11.5 (and 15.3 vertically, 4:3), sampled with REPEAT, and `_MainTex_ST`
+  is (1,1,0,0). It looks like a per-frame zoom that is unstable at
+  Unity's 0.333 s maximum deltaTime, and the menu draws correctly once frames
+  are fast.
+- **Mono's code under the function JIT** now runs on tier-1, each block
+  checking its bytes on entry (`Block::guard`). This is correct, but managed
+  code gets no function-tier speed. What would recover it: a function-level
+  byte check for code in writable-and-executable pages, with direct
+  transfers into code not yet seen leaving through dispatch, or a store-side
+  check of a code-page bitmap.
 - Knobs: `GEX_FPS=1` (presents per second), `GEX_PPM_EVERY=N`,
   `--wayland-out null`, `GEX_STRACE_STACK=N` (stack words at each syscall
   under `--strace`), `GEX_NT_TRACE` (logs each NtAllocateVirtualMemory
