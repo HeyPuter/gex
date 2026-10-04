@@ -562,6 +562,7 @@ fn run_program_with(
     // browser has a shim per process).
     gex_xlate::set_compat(program.compat());
     lockstep::set_compat(program.compat());
+    gex_kernel::set_compat32(program.compat() && gex_abi::X86);
     ftab::selftest_init();
 
     // A profile records where a previous run went, feeding `extra_entries` so
@@ -2561,7 +2562,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
             if caller.data().nt.is_some() {
-                return nt::syscall_import(&mut caller, pc as u64);
+                let r = nt::syscall_import(&mut caller, pc as u64);
+                check_i386_high(&caller, "an NT syscall");
+                return r;
             }
             // An ejected project's runtime allows only the recorded calls.
             if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
@@ -2714,6 +2717,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
                 lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
             }
+            check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();
             match outcome {
                 SyscallOutcome::Continue => Ok(()),
@@ -4514,4 +4518,26 @@ pub fn wasm_stack_bytes() -> usize {
 /// only as used).
 pub fn guest_thread_stack() -> usize {
     wasm_stack_bytes() + (16 << 20)
+}
+
+/// `GEX_CHECK_I386_HIGH=1`: after a host function that writes guest
+/// registers, an i386 process's GPR slots must have zero high halves
+/// (`gex_kernel::gpr`), which compiled code may rely on. A slot that does
+/// not is reported with where it was found (the first 32).
+pub(crate) fn check_i386_high(cx: &impl wasmtime::AsContext<Data = HostState>, site: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var("GEX_CHECK_I386_HIGH").as_deref() == Ok("1")) || !gex_kernel::compat32() {
+        return;
+    }
+    let d = cx.as_context().data();
+    let Some(memory) = d.memory.as_ref() else { return };
+    let base = d.thread.ctx_addr as usize;
+    for i in 0..8u8 {
+        let v = read_u64(memory.bytes(), base + ctx::x(i));
+        if v >> 32 != 0 && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let pc = read_u64(memory.bytes(), base + ctx::PC);
+            eprintln!("gex: GEX_CHECK_I386_HIGH: x{i} = {v:#x} after {site} (pc {pc:#x})");
+        }
+    }
 }
