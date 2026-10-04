@@ -1,7 +1,6 @@
 # Wine as native wasm: plan (draft, 2026-10-03)
 
-Status: stream W, W0 in progress (2026-10-04). The toolchain is decided
-(§3.10); all three spikes have run (§4.1).
+Status: stream W. W0 done (§4.1); W1 toolchain built (§3.10–3.13, §4.2).
 
 ## 1. Why
 
@@ -722,6 +721,69 @@ these are per-call overheads:
 - **The adapters cost what a cross-image call costs today** (6.5 ns), and
   Wine-internal calls drop from that (calls between lifted Wine images)
   to 0.5–1.4 ns.
+
+### 4.2 W1 results (2026-10-04)
+
+**The toolchain** (§3.10–3.13), every piece built and tested:
+- the musl wasm32 port;
+- the wasm32 personality in gex-kernel;
+- closed-world dlopen;
+- the ICALL pass;
+- winebuild `CPU_WASM32` adapters and skeletons;
+- winegcc and makedep for wasm32;
+- winecrt0's wasm32 runtime;
+- `wasmdll` in gexc.
+
+**Tests:**
+- `tests/wasm32/run.sh`: signals, threads, posix_spawn (native against
+  gex);
+- `tests/wasm32/dll/run.sh`: every adapter kind through winebuild,
+  wasm-ld and the skeleton, from a MinGW i386 program, on `--no-cgen` and
+  `--fjit`;
+- the coordinator gate on each change to gex-kernel or the shims.
+
+**Wine builds for wasm32:** `configure --host=wasm32-unknown-linux-musl`
+plus `make -k`.
+- 738 of 852 PE modules link, each as a module plus skeleton (before the
+  last round of fixes, which brought in kernel32, user32 and setupapi).
+- Of the rest:
+  - 51 are Win16 (`.dll16`, `.exe16`, `.drv16`, `.vxd`), which wasm32 has
+    no use for.
+  - The Unix-backed drivers configure turned off (winex11, winemac,
+    wineandroid, winegstreamer, opencl, sane, gphoto2, wpcap, winscard,
+    capi2032) and wow64/xtajit64.
+  - **W2's core:**
+    - **ntdll:** signal_wasm32.c, the system-call path and `current_machine`;
+    - **win32u:** system-call stubs become direct calls;
+    - **the CRTs** (msvcrt and its versions, ucrtbase, msvcp*, concrt140,
+      vcruntime140_1): `DISPATCHER_CONTEXT` and C++ exception frames for
+      wasm32; vtables written in assembly (`__ASM_VTABLE`);
+    - **rpcrt4:** `ndr_stubless`'s generic call with stack arguments;
+    - **the rest:** winedbg, winevdm, ntoskrnl, w32skrnl, wow32.
+  - **W3:** winewayland.drv, icu, dmsynth.
+
+**Boundary costs in V8** (node 26.7, core 3), per call:
+- **x86 → native through a winebuild adapter** (`spike-c/adapter_bench.mjs`,
+  a unit's call sequence into `gexp_abi_add`, cross-module): 7.0 ns. A
+  hand-written adapter in one module is 6.0 ns; the first generated version
+  was 8.2 ns.
+- **The ICALL check:** 0.99 against 0.49 ns for a plain `call_indirect`
+  (§3.10).
+- **Native → x86 through a pass stub:** 6.7 ns.
+
+**Open, with what they need:**
+- **Native runs of code that uses setjmp (`__TRY`)** need wasm exception
+  handling, i.e. the wasmtime upgrade (§3.4). V8 runs it today.
+- **The longjmp tag:** each DLL module defines `__c_longjmp`, so a longjmp
+  between two DLL modules would not be caught. The single PE-side module
+  (§3.13, W2) removes that. A per-DLL build would need the tag imported
+  from one place.
+- **Cross-DLL imports** are wasm imports of each DLL's module; binding them
+  at instantiation is W2's single-module link.
+- **Varargs exports and ntdll's system calls** have no adapters yet; they
+  bind to `gexp__missing`.
+- **Native function pointers handed to guest code** (COM vtables,
+  WNDPROCs) need entry thunks, ARM64EC-style (§3.3).
 
 ## 5. Risks
 
