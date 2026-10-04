@@ -480,11 +480,9 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   window, lowmem, filemap, and the GL demo glcompat.
   - Stop loudly, by design: jitcode, detour, pagespan (code written or
     patched at run time).
-  - Stop loudly, not yet covered: cxx, seh, apc. Each resumes at an
-    interior address after an exception or APC (a catch continuation, the
-    instruction after a faulting call, the trampoline page after an
-    alertable wait). Needs §3.3's region entries, or units resuming at
-    escape targets plus nested hardware faults and APCs.
+  - cxx, seh and apc resume at interior addresses (a catch continuation,
+    the instruction after a faulting call, the trampoline page after an
+    alertable wait): covered since by region entries (below).
 - E4/E5 in part: stateful providers (`gex_native::libprov`) and the Lua
   provider (`crates/gex-eject/libs/lua51`, 275 KiB). A LuaJIT host
   program (states, chunks, guest C functions, errors from them caught by
@@ -541,11 +539,7 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
 
   Under this load pewasm's number moves 39-69 between runs; only paired
   windows compare.
-- apc passes ejected with R's nested APCs (fb7dfd52). cxx (0x40ef20) and
-  seh (0x401bb0) still stop: the recorded interior entries are given to
-  recovery as seeds, but recovery does not make functions of them (they
-  sit inside another function's loop). Waiting on R's nested faults and
-  F's interior entries.
+- apc passes ejected with R's nested APCs (fb7dfd52).
 - **Region entries (§3.3), 2026-10-04:** `nt_cgen::prepare_regions`
   recovers a function entered at each PC (`func::recover_one`, with the
   unit's entries as strong starts) and lowers it with gex-cgen's existing
