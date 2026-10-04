@@ -425,6 +425,9 @@ struct JitShared {
     /// A native wasm32 program (`wasmprog`): its native frames cannot be
     /// unwound and resumed, so a fork is made without leaving them.
     wasm_program: bool,
+    /// Wine's PE side as one wasm module (`wasmdll`, shared mode): installed
+    /// at the first skeleton that names it, bound DLL by DLL.
+    wine_pe: Option<Arc<wasmdll::WinePe>>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -983,6 +986,7 @@ fn run_program_with(
                 provider: Default::default(),
                 ftab: Default::default(),
                 wasm_program: false,
+                wine_pe: None,
             })),
             engine: engine.clone(),
             linker: linker.clone(),

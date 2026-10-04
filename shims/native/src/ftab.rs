@@ -378,6 +378,20 @@ pub(crate) fn publish_stateful(
     publish_pairs(sh, memory, module, len, pairs, Tier::Unit)
 }
 
+/// Bind more addresses to slots of an existing install (`FuncMap::bind`):
+/// one module serving several images.
+pub(crate) fn bind_pairs(sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, install: u32, pairs: &[(u64, u32)]) -> Result<()> {
+    let mut entries: Vec<u64> = pairs.iter().map(|&(a, _)| a).filter(|&a| a != 0).collect();
+    entries.sort_unstable();
+    entries.dedup();
+    sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.bind(install, pairs);
+    let data = memory.bytes();
+    for &a in &entries {
+        gex_kernel::ftab::fcache_clear(data, a);
+    }
+    publish_bridges(sh, &entries, &[])
+}
+
 /// The function at `idx` of this store's table (a C function pointer of a
 /// provider module: its table index).
 pub(crate) fn table_func(cx: &mut Caller<'_, HostState>, idx: u32) -> Result<wasmtime::Func> {

@@ -533,7 +533,8 @@ In the Wine fork (`wt/wine-wasm`, branch `wasm32`):
   - void;
   - cdecl and stdcall callbacks (through the ICALL pass);
   - a data export, a forwarder and a stub.
-- **Open for W2:** imports between DLL modules. Each DLL's module imports
+- **Imports between DLL modules** (decided: §3.14 links the PE side as
+  one module). The original note: Each DLL's module imports
   what other DLLs define, and gex instantiates a module when its DLL maps,
   which can be before the DLLs it imports from. The proposed answer is the
   closed world again:
@@ -542,6 +543,48 @@ In the Wine fork (`wt/wine-wasm`, branch `wasm32`):
     symbols cannot collide;
   - every cross-DLL call is then direct, with LTO across DLLs;
   - per-DLL modules stay possible for a run-time-loaded DLL.
+
+### 3.14 Wine's PE side as one module (W2, as built)
+
+The alternative to per-DLL modules (§3.13, which stay possible): every DLL
+of the PE side linked into one wasm module, as an ejected program is
+linked. Cross-DLL calls are direct, and there is one copy of the runtime
+and one exception tag.
+- **Each DLL as one relocatable object.** winegcc (wasm32) also writes
+  `X.dll.so.r.o` (`wasm-ld -r` of the DLL's objects and static libraries)
+  and `X.dll.so.exports` (winebuild's list of the DLL's export link
+  names). The shared runtime moved out of winecrt0 into `libs/gexrt`,
+  which is linked once.
+- **`tools/wine-wasm/pesym.py`** rewrites the linking section's symbol
+  table of each DLL object:
+  - `dll`: the DLL's exports and spec glue become `DLL!name`; every other
+    defined symbol becomes local, so private names cannot collide and two
+    DLLs may export the same name.
+  - `imports`: each undefined symbol that another DLL exports becomes
+    `owner!name`, the owner being the first of the DLL's IMPORTS that
+    exports it, else any DLL.
+  - The stale name section that `wasm-ld -r` wrote is dropped, so the
+    final module's function names are the renamed symbols.
+- **`tools/wine-wasm/pelink.py`** runs both passes and links everything
+  with libgexrt into one PIC module. It works from a Wine build tree, or
+  from explicit `--dll NAME R.o EXPORTS [IMPORTS]` inputs. The DLLs' data
+  exports are exported as globals (their data offsets); what stays
+  undefined is listed beside the module.
+- **Skeletons:** `winebuild --fake-module --wasm-shared NAME` writes them
+  with no code or data of their own. A `.wasmref` section names the
+  module, the DLL and the DLL's data exports (export index, link name).
+- **In gexc** (`wasmdll`, shared mode):
+  - The first skeleton to map installs the module (its data from the NT
+    allocator); every later one binds its exports to the same install's
+    slots (`FuncMap::bind`, new and additive).
+  - `-import` re-exports are bound to the owner's adapter.
+  - Data exports are pointed at the module's data by rewriting the
+    skeleton's export address table entries (32-bit RVAs wrap to any
+    address).
+- **Tested:** `tests/wasm32/dll/shared.sh`. Three DLLs, two of which
+  export the same name and each define a private function of the same
+  name. One DLL calls another's export directly. A data export reads the
+  shared data. All of it from a MinGW i386 program.
 
 ### 3.9 x64 programs (later)
 
