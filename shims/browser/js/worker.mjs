@@ -603,6 +603,7 @@ async function handle(msg) {
           // `extra`, and pid 1's `opts` never reach it.
           link: msg.link ?? msg.opts?.link,
           dense: msg.dense ?? msg.opts?.dense,
+          fjit: msg.fjit ?? msg.opts?.fjit,
           wantLibrary,
         },
       );

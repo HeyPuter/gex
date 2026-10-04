@@ -40,6 +40,7 @@ mod xwm;
 pub(crate) mod memmap;
 mod cgen;
 mod dense;
+mod fjit;
 // The NT personality's host side: a Windows program (docs/nt-layer.md §10.2).
 mod nt;
 
@@ -10152,6 +10153,15 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         }
         return;
     }
+    if op == gex_abi::cache_op::FTAB_TIER1 {
+        // The bridge left for this very address having run nothing: tier-1
+        // takes the slot over, and the function JIT serves it no more.
+        fjit::tier1_only(addr as u64);
+        with_host(|h| {
+            h.jit.translated.remove(&(addr as u64));
+        });
+        return;
+    }
     if op == gex_abi::cache_op::SLOT_CONFLICT {
         // A block entered for a neighbour sharing its slot: forget the
         // neighbour so the miss that follows lifts it (with this block as a
@@ -10560,6 +10570,18 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             FILL_PC.with(|c| c.set(pc));
             FILL_WANTED.with(|c| c.set(page as i64));
             FILL_PENDING.with(|c| c.set(page as i64));
+        }
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
+    // A function serves it, or the function JIT makes one: tier-1 reaches
+    // it through the bridge once this Worker has installed it.
+    if fjit::serve(pc) {
+        if in_place(_ctx, pc) {
+            return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
         with_host(|h| {
             set_resume(pc);

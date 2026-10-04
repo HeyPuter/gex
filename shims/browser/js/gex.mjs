@@ -1214,6 +1214,12 @@ export class Gex {
     this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
     this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
     e.gex_set_dense?.(this.#dense ? (opts.dense === 2 ? 2 : 1) : 0);
+    // The function JIT (fjit.rs): its translations reach the function table,
+    // which the function tier's plumbing drives (units where any exist).
+    if (opts.fjit && e.gex_set_fjit) {
+      e.gex_set_fjit(1);
+      if (!this.#cgenMode) this.useCgen(1);
+    }
     this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
@@ -2404,7 +2410,11 @@ export class Gex {
     const ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
     const lookup = (ctx, addr) => {
       if (e.gex_ftab_behind()) this.#cgenCatchUp();
-      return e.gex_ftab_lookup(ctx, addr);
+      const idx = e.gex_ftab_lookup(ctx, addr);
+      // A translation the function JIT just published: in this Worker's
+      // table before `resolve` calls it.
+      if (e.gex_ftab_behind()) this.#cgenCatchUp();
+      return idx;
     };
     const gex = {
       memory: this.#memory,
@@ -2444,11 +2454,16 @@ export class Gex {
     // An export provider's module (`PROVIDER | number`, cgen.rs) installs as
     // a unit does, from its file in the unit cache.
     const prov = u >= 0x80000000 ? u - 0x80000000 : -1;
+    // A function JIT translation (`FJIT | n`, fjit.rs): its bytes are the shim's.
+    const jit = prov < 0 && u >= 0x40000000 ? u - 0x40000000 : -1;
     const mod = prov >= 0
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
+      : jit >= 0 ? this.#fjitModule(jit)
       : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
-    const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c) : (b, c) => e.gex_cgen_regs(u, b, c);
-    const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
+    const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c)
+      : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
+      : (b, c) => e.gex_cgen_regs(u, b, c);
+    const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : jit >= 0 ? e.gex_fjit_slots(jit) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
     const inst = new WebAssembly.Instance(mod, {
       env: {
         memory: this.#memory,
@@ -2459,7 +2474,7 @@ export class Gex {
         // but a position-independent module imports its pointer all the same.
         __stack_pointer: new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
       },
-      gex: { ...this.#imports, lookup: st.lookup },
+      gex: { ...this.#imports, lookup: st.lookup, ftab: st.ftab },
     });
     const n = regsOf(0, 0) >>> 0;
     const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
@@ -2478,6 +2493,9 @@ export class Gex {
       (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
     }
     st.instances.push(inst);
+    // The first Worker to install a JIT module writes the directory for the
+    // pages it numbered (idempotent).
+    if (jit >= 0) e.gex_fjit_installed(jit);
     return regs.length / 2;
   }
 
@@ -2520,6 +2538,23 @@ export class Gex {
     }
   }
 
+  /** Function JIT module `n` (fjit.rs), compiled once per process from the
+   *  shim's bytes and offered to the siblings. Synchronous (a Worker). */
+  #fjitModule(n) {
+    const name = `fjit:${n}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    const e = this.#shim.exports;
+    const ptr = e.gex_fjit_ptr(n) >>> 0;
+    const bytes = this.#bytes().slice(ptr, ptr + (e.gex_fjit_len(n) >>> 0));
+    const t0 = performance.now();
+    mod = new WebAssembly.Module(bytes);
+    this.#compileMs += performance.now() - t0;
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
+  }
+
   /** Replay the function table's log this Worker has not seen: installs,
    *  and retirements (back to `resolve`). */
   #cgenCatchUp() {
@@ -2545,6 +2580,12 @@ export class Gex {
    *  its entry list does. */
   #cgenServe() {
     const e = this.#shim.exports;
+    // A Worker with the function JIT on but no units of its own still
+    // replays the function table's log.
+    if (!this.#cgenMode && e.gex_fjit_on?.()) {
+      this.#cgenCatchUp();
+      return;
+    }
     if (!this.#cgenMode || !e.gex_cgen_wanted) return;
     for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
       const t0 = performance.now();

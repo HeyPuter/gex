@@ -568,13 +568,14 @@ mod imp {
             let slots: Vec<String> = (0..gex_abi::DISPATCH_TABLES as u32).map(|k| crate::gex_claimed_slots(k).to_string()).collect();
             let (callouts, left) = crate::cgen::callouts();
             warn_line(&format!(
-                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={} exc_nested={} exc_escaped={}\n",
+                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={} exc_nested={} exc_escaped={} fjit={:?}\n",
                 crate::dense::gex_dense_size(),
                 slots.join("/"),
                 crate::dense::on() as u8,
                 crate::IN_PLACE_N.load(Ordering::Relaxed),
                 EXC_NESTED.load(Ordering::Relaxed),
-                EXC_ESCAPED.load(Ordering::Relaxed)
+                EXC_ESCAPED.load(Ordering::Relaxed),
+                crate::fjit::counts()
             ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
@@ -1180,10 +1181,11 @@ mod imp {
         if crate::tracing_exc() {
             let (n, l) = crate::cgen::callouts();
             crate::stderr_line(&format!(
-                "[nt] at exit: exc_nested={} exc_escaped={} callouts={n} callouts_left={l} in_place={}\n",
+                "[nt] at exit: exc_nested={} exc_escaped={} callouts={n} callouts_left={l} in_place={} fjit={:?}\n",
                 EXC_NESTED.load(Ordering::Relaxed),
                 EXC_ESCAPED.load(Ordering::Relaxed),
-                crate::IN_PLACE_N.load(Ordering::Relaxed)
+                crate::IN_PLACE_N.load(Ordering::Relaxed),
+                crate::fjit::counts()
             ));
         }
         with_host(|h| {
