@@ -692,6 +692,33 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
     and msvcr120.dll 0x1637a00 (`clang wanted a shadow stack`); not
     reached so far. A paired page measurement (pewasm's page and the
     ejected page, same cores) is next.
+- **The page against pewasm's page (2026-10-04; the target: native
+  numbers are debugging proxies).** Cores 5,11, hardware WebGPU, world seed
+  pinned on both (1767225600), world fps from world-up+90 s to the end of
+  330 s (stream B's wfps.sh window).
+  - Guarded browser units (`p-noita12w`), ABBA: ejected 39.2, 37.8 against
+    pewasm 55.6, 59.5: 0.67x.
+  - Then: B's step 0 (the web build is the native units, unguarded:
+    `build/units`, `nt.json` `cgen`/`unguarded`), cg14 units (F's, carries
+    off), and the yield policy. Same ejected project per arm (`p-noita14y`):
+
+    | arm | runs | mean | vs pewasm |
+    | --- | --- | --- | --- |
+    | pewasm page | 58.8, 56.7 | 57.8 | 1.00 |
+    | os (the spin, today) | 47.2, 51.0 | 49.1 | 0.85 |
+    | wake (R's e094d4ae + park patch) | 62.7, 66.1 | 64.4 | 1.11 |
+    | sleep:50 (reference) | 63.1 | 63.1 | 1.09 |
+
+    wake is on `exp/yield-wake` (a hand port) until R's and B's merges.
+  - V8 profile of the main thread (os): units 10.7 ms per world frame
+    (noita.exe 61% of it; msvcr120 14.5%, ntdll 8.8%, kernel32/kernelbase
+    8%: the yield path, the heap, TlsGetValue), shim syscall glue 5.9 ms,
+    performance.now 1.5 ms. pewasm's page: wasm about 7.6 ms per frame, its
+    main thread 63% busy (a yield gives the event loop a turn). Fixed since:
+    yields sampled apart (every 512th), cgen::drain lock-free.
+  - Next levers: R's crt_heap / nt_qpc providers; the link group (merge-plan
+    §9.6: noita.exe with msvcr120 and msvcp120 in one module, IAT calls
+    direct, ThinLTO), pewasm's build.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
