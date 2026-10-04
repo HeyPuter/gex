@@ -217,6 +217,19 @@ impl FileSystem for HostFs {
             .map_err(|e| Errno::from_io(&e))
     }
 
+    /// The host's answer: a guest that believes it owns everything (stat
+    /// reports the guest's uid) would otherwise be told it may write
+    /// root's directories, and pick them over its fallbacks (Xwayland's
+    /// keymap directory, `/var/lib/xkb`, over `/tmp`).
+    fn access(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let host = self.host_path(path)?;
+        if mode & 2 != 0 && self.read_only {
+            std::fs::metadata(&host).map_err(|e| Errno::from_io(&e))?;
+            return Err(Errno::EROFS);
+        }
+        host_access(&host, mode)
+    }
+
     fn read_link(&self, path: &str) -> Result<String, Errno> {
         let host = self.host_path(path)?;
         // `read_link` on a non-symlink reports EINVAL, which the VFS uses to
@@ -359,4 +372,73 @@ mod tests {
         );
         assert!(fs.open("ro.txt", oflags::O_RDONLY, 0).is_ok());
     }
+}
+
+/// `access(2)` against the host's permission bits, for this process's
+/// effective ids and groups (from `/proc/self/status`; no unsafe here, so
+/// not the host call itself). Root may read and write anything and execute
+/// what has an execute bit. ACLs and read-only mounts are not seen.
+#[cfg(unix)]
+fn host_access(host: &std::path::Path, mode: u32) -> Result<(), Errno> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(host).map_err(|e| Errno::from_io(&e))?;
+    let mode = mode & 7;
+    if mode == 0 {
+        return Ok(());
+    }
+    let ids = host_ids();
+    let bits = md.mode();
+    let ok = if ids.uid == 0 {
+        mode & 1 == 0 || md.is_dir() || bits & 0o111 != 0
+    } else {
+        let have = if md.uid() == ids.uid {
+            bits >> 6
+        } else if md.gid() == ids.gid || ids.groups.contains(&md.gid()) {
+            bits >> 3
+        } else {
+            bits
+        } & 7;
+        have & mode == mode
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Errno::EACCES)
+    }
+}
+
+#[cfg(unix)]
+struct HostIds {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+}
+
+#[cfg(unix)]
+fn host_ids() -> &'static HostIds {
+    static IDS: std::sync::OnceLock<HostIds> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        // "Uid:\treal\teffective\tsaved\tfs"; the effective one decides.
+        let field = |name: &str| -> Vec<u32> {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .map(|r| r.split_whitespace().filter_map(|v| v.parse().ok()).collect())
+                .unwrap_or_default()
+        };
+        let uid = field("Uid:");
+        let gid = field("Gid:");
+        HostIds {
+            // Unknown ids (no /proc) count as nobody's, the cautious answer.
+            uid: uid.get(1).copied().unwrap_or(u32::MAX - 1),
+            gid: gid.get(1).copied().unwrap_or(u32::MAX - 1),
+            groups: field("Groups:"),
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn host_access(host: &std::path::Path, _mode: u32) -> Result<(), Errno> {
+    std::fs::metadata(host).map(|_| ()).map_err(|e| Errno::from_io(&e))
 }

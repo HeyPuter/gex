@@ -2339,7 +2339,7 @@ impl Kernel {
             // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
             // and refuses to write any file-backed database.
             nr::FSYNC | nr::FDATASYNC => self.fds.get(a[0] as i32).map(|_| 0),
-            nr::FACCESSAT | nr::FACCESSAT2 => self.sys_faccessat(m, a[0] as i32, a[1]),
+            nr::FACCESSAT | nr::FACCESSAT2 => self.sys_faccessat(m, a[0] as i32, a[1], a[2] as u32),
             nr::READLINKAT => self.sys_readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.sys_getcwd(m, a[0], a[1]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
@@ -4257,9 +4257,12 @@ impl Kernel {
         let _ = self.procs.kill_group(self.pid, g, signo);
     }
 
-    fn sys_faccessat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> SysResult {
+    fn sys_faccessat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
-        self.vfs.metadata(&p).map(|_| 0)
+        // A root guest (`--uid 0`) may read and write anything; execute
+        // still needs an execute bit, which the host checks.
+        let mode = if self.uid == 0 { mode & 1 } else { mode & 7 };
+        self.vfs.access(&p, mode).map(|_| 0)
     }
 
     fn sys_readlinkat(

@@ -277,6 +277,13 @@ pub trait FileSystem: Send + Sync {
     /// Open a path relative to this mount's root (no leading slash).
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
     fn metadata(&self, path: &str) -> Result<Metadata, Errno>;
+    /// `access(2)`: whether the caller may use `path` as `mode` asks
+    /// (`R_OK` 4, `W_OK` 2, `X_OK` 1; 0 is existence). Filesystems that do
+    /// not model permissions say yes to anything that exists.
+    fn access(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let _ = mode;
+        self.metadata(path).map(|_| ())
+    }
     fn read_link(&self, path: &str) -> Result<String, Errno> {
         let _ = path;
         Err(Errno::EINVAL)
@@ -426,6 +433,25 @@ impl Vfs {
                     };
                 }
                 Err(_) => return fs.metadata(&rel),
+            }
+        }
+        Err(Errno::ELOOP)
+    }
+
+    /// `access(2)` on `path`, following symlinks as [`Vfs::metadata`] does.
+    pub fn access(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        let mut current = normalize(path, &self.cwd);
+        for _ in 0..40 {
+            let (fs, rel) = self.resolve(&current)?;
+            match fs.read_link(&rel) {
+                Ok(target) => {
+                    current = if target.starts_with('/') {
+                        normalize(&target, "/")
+                    } else {
+                        normalize(&target, &parent_of(&current))
+                    };
+                }
+                Err(_) => return fs.access(&rel, mode),
             }
         }
         Err(Errno::ELOOP)
