@@ -1,0 +1,226 @@
+diff --git a/src/mono/CMakeLists.txt b/src/mono/CMakeLists.txt
+index 781cddbfd..93840d8ba 100644
+--- a/src/mono/CMakeLists.txt
++++ b/src/mono/CMakeLists.txt
+@@ -405,6 +405,9 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "s390x")
+   set(HOST_S390X 1)
+ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm32")
+   set(HOST_WASM 1)
++elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm64")
++  set(HOST_WASM 1)
++  set(HOST_WASM64 1)
+ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
+   set(HOST_POWERPC 1)
+   set(HOST_POWERPC64 1)
+@@ -486,6 +489,14 @@ elseif(TARGET_ARCH STREQUAL "wasm" OR TARGET_ARCH STREQUAL "wasm32")
+   set(MONO_ARCHITECTURE "\"wasm\"")
+   set(TARGET_SIZEOF_VOID_P 4)
+   set(SIZEOF_REGISTER 4)
++elseif(TARGET_ARCH STREQUAL "wasm64")
++  # gex: wasm with 64-bit pointers (memory64), sharing an x86-64 guest's memory.
++  set(TARGET_ARCH "wasm")
++  set(TARGET_WASM 1)
++  set(TARGET_WASM64 1)
++  set(MONO_ARCHITECTURE "\"wasm\"")
++  set(TARGET_SIZEOF_VOID_P 8)
++  set(SIZEOF_REGISTER 8)
+ elseif(TARGET_ARCH STREQUAL "ppc64le")
+   set(TARGET_POWERPC 1)
+   set(TARGET_POWERPC64 1)
+diff --git a/src/mono/cmake/config.h.in b/src/mono/cmake/config.h.in
+index b52242112..728e090c5 100644
+--- a/src/mono/cmake/config.h.in
++++ b/src/mono/cmake/config.h.in
+@@ -498,6 +498,9 @@
+ /* ... */
+ #cmakedefine TARGET_WASM 1
+ 
++/* gex: wasm with 64-bit pointers */
++#cmakedefine TARGET_WASM64 1
++
+ /* ... */
+ #cmakedefine TARGET_WASI 1
+ 
+@@ -540,6 +543,9 @@
+ /* ... */
+ #cmakedefine HOST_WASM 1
+ 
++/* gex: wasm with 64-bit pointers */
++#cmakedefine HOST_WASM64 1
++
+ /* ... */
+ #cmakedefine HOST_BROWSER 1
+ 
+diff --git a/src/mono/mono/mini/aot-runtime-wasm.c b/src/mono/mono/mini/aot-runtime-wasm.c
+index 1687088b1..58267dce9 100644
+--- a/src/mono/mono/mini/aot-runtime-wasm.c
++++ b/src/mono/mono/mini/aot-runtime-wasm.c
+@@ -14,6 +14,14 @@
+ 
+ #ifdef HOST_WASM
+ 
++/* gex wasm64: 'P' is a pointer-sized value, which is i64 on wasm64 and i32 on wasm32. The cookie
++ * names the callee's wasm signature, so on wasm64 it is written 'L'. */
++#if SIZEOF_VOID_P == 8
++#define WASM_PTR_C 'L'
++#else
++#define WASM_PTR_C 'I'
++#endif
++
+ static char
+ type_to_c (MonoType *t, gboolean *is_byref_return)
+ {
+@@ -22,7 +30,7 @@ type_to_c (MonoType *t, gboolean *is_byref_return)
+ 	if (is_byref_return)
+ 		*is_byref_return = 0;
+ 	if (m_type_is_byref (t))
+-		return 'I';
++		return WASM_PTR_C;
+ 
+ handle_enum:
+ 	switch (t->type) {
+@@ -34,14 +42,17 @@ handle_enum:
+ 	case MONO_TYPE_U2:
+ 	case MONO_TYPE_I4:
+ 	case MONO_TYPE_U4:
++		return 'I';
+ 	case MONO_TYPE_I:
+ 	case MONO_TYPE_U:
+ 	case MONO_TYPE_PTR:
++	case MONO_TYPE_FNPTR:
++	case MONO_TYPE_ARRAY:
+ 	case MONO_TYPE_SZARRAY:
+ 	case MONO_TYPE_CLASS:
+ 	case MONO_TYPE_OBJECT:
+ 	case MONO_TYPE_STRING:
+-		return 'I';
++		return WASM_PTR_C;
+ 	case MONO_TYPE_R4:
+ 		return 'F';
+ 	case MONO_TYPE_R8:
+@@ -69,7 +80,7 @@ handle_enum:
+ 		if (is_byref_return)
+ 			*is_byref_return = 1;
+ 
+-		return 'I';
++		return WASM_PTR_C;
+ 	}
+ 	case MONO_TYPE_GENERICINST: {
+ 		// This previously erroneously used m_type_data_get_klass which isn't legal for genericinst, we have to use class_from_mono_type_internal
+@@ -84,7 +95,7 @@ handle_enum:
+ 			return 'S';
+ 		}
+ 
+-		return 'I';
++		return WASM_PTR_C;
+ 	}
+ 	default:
+ 		g_warning ("CANT TRANSLATE %s", mono_type_full_name (t));
+@@ -105,6 +116,10 @@ typedef union {
+ static gint64
+ get_long_arg (InterpMethodArguments *margs, int idx)
+ {
++#if SIZEOF_VOID_P == 8
++	/* an I8 takes one 64-bit slot (get_build_args_from_sig_info) */
++	return (gint64)(gssize)margs->iargs [idx];
++#endif
+ 	interp_pair p;
+ 	p.pair.lo = (gint32)(gssize)margs->iargs [idx];
+ 	p.pair.hi = (gint32)(gssize)margs->iargs [idx + 1];
+@@ -171,12 +186,12 @@ mono_wasm_get_interp_to_native_trampoline (MonoMethodSignature *sig)
+ 	if (is_byref_return) {
+ 		cookie[0] = 'V';
+ 		// return value address goes in arg0
+-		cookie[1] = 'I';
++		cookie[1] = WASM_PTR_C;
+ 		offset += 1;
+ 	}
+ 	if (sig->hasthis) {
+ 		// thisptr goes in arg0/arg1 depending on return type
+-		cookie [offset] = 'I';
++		cookie [offset] = WASM_PTR_C;
+ 		offset += 1;
+ 	}
+ 	for (int i = 0; i < sig->param_count; ++i) {
+diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
+index 3dea312b7..222536c07 100644
+--- a/src/mono/mono/mini/interp/jiterpreter.c
++++ b/src/mono/mono/mini/interp/jiterpreter.c
+@@ -1592,7 +1592,7 @@ atomically_set_value_once (gint32 *address, gint32 value) {
+ 	*address = value;
+ #else
+ 	gint32 expected = 0;
+-	static_assert (sizeof(atomic_int) == sizeof(address) && ATOMIC_INT_LOCK_FREE == 2, "");
++	static_assert (sizeof(atomic_int) == sizeof(*address) && ATOMIC_INT_LOCK_FREE == 2, "");
+ 	if (atomic_compare_exchange_strong ((atomic_int *)address, &expected, value))
+ 		return;
+ 	if (expected == value)
+@@ -1776,7 +1776,7 @@ mono_jiterp_increment_counter (volatile int *counter) {
+ 	*counter = result + 1;
+ 	return result;
+ #else
+-	static_assert (sizeof (atomic_int) == sizeof(counter) && ATOMIC_INT_LOCK_FREE == 2, "");
++	static_assert (sizeof (atomic_int) == sizeof(*counter) && ATOMIC_INT_LOCK_FREE == 2, "");
+ 	return atomic_fetch_add ((atomic_int *)counter, 1);
+ #endif
+ }
+diff --git a/src/mono/mono/mini/interp/transform.c b/src/mono/mono/mini/interp/transform.c
+index 98dfc77ca..f35f8313e 100644
+--- a/src/mono/mono/mini/interp/transform.c
++++ b/src/mono/mono/mini/interp/transform.c
+@@ -2867,6 +2867,22 @@ is_scalar_vtype (MonoType *type)
+ static gboolean
+ interp_type_as_ptr (MonoType *tp)
+ {
++#if defined(HOST_WASM) && SIZEOF_VOID_P == 8
++	/* gex wasm64: the fast icall path calls through a C type whose arguments are all gpointer (i64).
++	 * Only types whose wasm value type is i64 may take it; an int32 is i32 in the callee's signature. */
++	if (MONO_TYPE_IS_POINTER (tp) || MONO_TYPE_IS_REFERENCE (tp))
++		return TRUE;
++	switch (tp->type) {
++	case MONO_TYPE_I: case MONO_TYPE_U: case MONO_TYPE_I8: case MONO_TYPE_U8: case MONO_TYPE_FNPTR:
++		return TRUE;
++	case MONO_TYPE_VALUETYPE:
++		if (m_class_is_enumtype (m_type_data_get_klass_unchecked (tp)))
++			return interp_type_as_ptr (mono_class_enum_basetype_internal (m_type_data_get_klass_unchecked (tp)));
++		return is_scalar_vtype (tp);
++	default:
++		return FALSE;
++	}
++#endif
+ 	if (MONO_TYPE_IS_POINTER (tp))
+ 		return TRUE;
+ 	if (MONO_TYPE_IS_REFERENCE (tp))
+diff --git a/src/mono/mono/utils/mono-threads-wasm.S b/src/mono/mono/utils/mono-threads-wasm.S
+index 8752b03f1..186f92830 100644
+--- a/src/mono/mono/utils/mono-threads-wasm.S
++++ b/src/mono/mono/utils/mono-threads-wasm.S
+@@ -1,6 +1,23 @@
+ .globl get_wasm_stack_low
+ .globl get_wasm_stack_high
+ 
++#ifdef __wasm64__
++/* gex: wasm64 (memory64): addresses are i64 */
++get_wasm_stack_low:
++  .functype get_wasm_stack_low () -> (i64)
++  global.get __stack_low@GOT
++  // align up to 16 bytes
++  i64.const 0xF
++  i64.add
++  i64.const -0x10
++  i64.and
++  end_function
++
++get_wasm_stack_high:
++  .functype get_wasm_stack_high () -> (i64)
++  global.get __stack_high@GOT
++  end_function
++#else
+ get_wasm_stack_low:
+   .functype get_wasm_stack_low () -> (i32)
+   global.get __stack_low@GOT
+@@ -15,3 +32,4 @@ get_wasm_stack_high:
+   .functype get_wasm_stack_high () -> (i32)
+   global.get __stack_high@GOT
+   end_function
++#endif

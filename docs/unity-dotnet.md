@@ -11,14 +11,15 @@ translate.
 
 ## 1. Decisions
 
-1. **Runtime: dotnet/runtime's Mono** (`src/mono`), interpreter first, with
-   Mono's LLVM AOT of every managed assembly as the performance tier. It is
-   pinned to **v10.0.10**, which matches the installed shared framework.
-   CoreCLR is not the choice: its wasm port is a preview in .NET 11 and
-   ships in .NET 12 (2027). It has no `mono_*` embedding API, and its GC is
-   precise, while Unity's native code holds object pointers in x86
-   registers and stacks. CoreCLR's browser ReadyToRun is worth another look
-   once it ships.
+1. **Runtime: Mono from r58Playz/dotnet-runtime, branch `wasm-jspi-jit-10.0.3`**
+   (user, 2026-10-04). That is dotnet/runtime v10.0.3 plus a runtime wasm
+   JIT for Mono (`mini-wasm.c`, `wasm-encoder.c`: mono IR to one wasm module
+   per method, tiered), and changes to CoreLib's Reflection.Emit (so CoreLib
+   is built from the same tree). It is pinned to commit 6812ea26 in
+   `tools/unity-dotnet/mono/build.sh`. The interpreter runs first; the
+   fork's JIT is off (`MONO_WASM_JIT_AUTO=0`) until its emitter produces
+   wasm64. Mono's LLVM AOT of every managed assembly is the other speed
+   tier. CoreLib is not CoreCLR's: the user ruled CoreCLR out ("no coreclr").
 2. **BCL: upstream's, not Unity's.** Upstream Mono can only use
    `System.Private.CoreLib` as its corlib (`MONO_ASSEMBLY_CORLIB_NAME`). Its
    icall table (`icall-def.h`) is CoreLib's, for example `RuntimeType`
@@ -66,7 +67,7 @@ translate.
    Hollow Knight). CoreLib's icall table must match the runtime exactly.
 4. **Toolchain: emscripten's clang and its `wasm64-emscripten` libc** (already in
    `/usr/lib/emsdk`'s sysroot), with the output linked as a **PIC side module**
-   (`-sSIDE_MODULE -sMEMORY64`, `dylink.0`), which is the stateful-provider
+   (`-m64`, wasm-ld `-shared --experimental-pic`, `dylink.0`), which is the stateful-provider
    format. Emscripten's JS runtime is not used. The few imports libc makes
    (`__syscall_*`, clock and futex wait) are gex host imports, backed by
    gex's Linux syscall layer, which NT processes have too (Wine's unix
@@ -227,18 +228,18 @@ native code was written against:
 
 ## 6. Performance (browser only)
 
-The interpreter is the bring-up tier. The jiterpreter is not used: it
-generates wasm32 modules from JS at run time, which neither fits wasm64 nor
-the "eject: no JIT" rule.
+The interpreter is the bring-up tier. The jiterpreter is not used (it
+generates wasm32 traces from JS); the build turns it off (`-jiterp`).
 
-The performance tier is **Mono LLVM AOT** of CoreLib, the BCL, `UnityEngine.*`
-and the game's assemblies:
-- compiled at eject or build time to wasm64 (LLVM's wasm64 backend), the
-  way Blazor's AOT compiles to wasm32;
-- linked into the provider;
-- with interpreter fallback for generic instances it did not see.
-
-The `Managed` set is fixed per game, so it is all known at build time.
+Two speed tiers, both from the fork:
+- **its runtime wasm JIT** (tiered, one module per method; in the browser
+  through `WebAssembly.Module`). Under gex it needs a wasm64 emitter
+  (addresses as i64, as gex-emit's M64 work did) and a host hook to compile
+  and instantiate a module in the provider's thread, which gex's own JIT
+  path already has, natively and in the browser;
+- **Mono LLVM AOT** of CoreLib, the BCL, `UnityEngine.*` and the game's
+  assemblies at build time (the `Managed` set is fixed per game), to wasm64,
+  linked into the provider, with the interpreter for what it did not see.
 
 Native gexc runs the same provider on wasmtime. It is for correctness only.
 
@@ -246,7 +247,7 @@ Native gexc runs the same provider on wasmtime. It is for correctness only.
 
 | step | what | done when |
 |---|---|---|
-| P1 | Upstream Mono at v10.0.10, built as a wasm64 side module with the interpreter, SGen in Boehm mode and the `gex` thread platform. The managed parts are built for linux-x64 from the same tag. | `mono_jit_init` + CoreLib load under a native test host (wasmtime, memory64) |
+| P1 | The fork's Mono built for wasm64 with the interpreter; CoreLib from the same tree for linux-x64; System.Native for wasm64. **Done** (§9). | `mono_jit_init` + CoreLib load, run natively |
 | P2 | Stateful providers for x86-64: SysV and Win64 adapters, M64 (today they are i386-only and never M64; mem64.md §10), TLS, `provider_bind`, guest-thread creation. Built on integ's `libprov.rs`. | tests in tests/x86-programs |
 | P3 | `tests/unity-dotnet/embed.c`: a small x86-64 Linux program that dlopens a stub `libmonobdwgc-2.0.so` (exports only) and, like UnityPlayer, calls `mono_jit_init_version`, opens a test assembly, finds a class and method, registers an icall, calls `runtime_invoke`. The managed code calls the icall back, which raises; it also uses GC handles, strings, arrays and a GC with an object held only on the x86 stack. | it prints the same as the same program on host Mono |
 | P4 | Muck: the shim layer for the 272 names, the find-plugin callback, failed-lookup logging. | the player log reaches "Completed reload", then the menu, natively |
@@ -278,3 +279,66 @@ Native gexc runs the same provider on wasmtime. It is for correctness only.
 - **Icall crossing cost:** 7,700 to 9,750 icalls, thousands of calls per frame.
   Each call is an indirect call plus the ABI placement. If it shows in a
   profile, specialised per-signature thunks are generated at AOT time.
+
+## 9. P1 as built (2026-10-04)
+
+`tools/unity-dotnet/mono/build.sh OUT` clones the fork at 6812ea26, applies
+`patches/`, and builds:
+- the runtime (`libmonosgen-2.0.a`, `libmono-ee-interp.a`, the icall table,
+  the components) with emscripten for wasm64;
+- `libSystem.Native.a` (the browser's build of the BCL's native shim) and
+  its DllImport table (`entrypoints.c`);
+- CoreLib (`./build.sh -subset mono.corelib -os linux -arch x64`).
+
+`tests/unity-dotnet/smoke/run.sh OUT` links a test program against it and
+runs it under node (V8, memory64; node 24+ needs no flag). It covers:
+- CoreLib boot on the interpreter;
+- loading `t.dll`;
+- class and method lookup;
+- `mono_add_internal_call`;
+- `mono_runtime_invoke`, running `List`, `Dictionary`, `int.ToString`,
+  `GC.Collect`, the internal call, string concatenation and reflection
+  (`Assembly.GetName`);
+- a full collection.
+
+`IntPtr.Size` is 8. It passes.
+
+The patches (`patches/0001-wasm64.patch`):
+- **CMake:** a `wasm64` processor (`TARGET_WASM`/`HOST_WASM` with 8-byte
+  pointers, plus `TARGET_WASM64`/`HOST_WASM64`).
+- **`mono-threads-wasm.S`:** the stack bounds as i64.
+- **`jiterpreter.c`:** two `static_assert`s that compared an `int` with a
+  pointer's size.
+- **The interpreter's native calls.**
+  - The fast icall path calls through a C type with all-`gpointer`
+    arguments. On wasm64 an `int32` is i32 in the callee's wasm signature,
+    so only i64-typed signatures take the fast path
+    (`interp_type_as_ptr`).
+  - The interp-to-native signature cookie writes pointer-sized values as
+    `L` (`aot-runtime-wasm.c`).
+  - An `I8` takes one argument slot.
+
+`host/gexmono.c` stands in for the browser driver: it does what
+`src/mono/browser/runtime` does, minus JS.
+- Runtime properties: invariant globalization.
+- The interp-to-native table, from `host/gen-m2n.py`:
+  - every `I/L/F/D` cookie up to 4 arguments, plus `m2n-extra.txt` (found
+    by running);
+  - the browser generates this table per app with WasmAppBuilder.
+- The DllImport fallback for `libSystem.Native`.
+- Interpreter-only mode, with the jiterpreter and the fork's JIT off.
+
+Not yet:
+- The **module format.** This is an emscripten main module run by node. The
+  provider is a PIC module with emscripten's PIC libc for wasm64, whose
+  syscall and thread imports gex provides; that is P2, on libprov.
+- **The rest of the BCL** for the same tree (`-subset libs.sfx`; the smoke
+  test uses the installed .NET 10's facades).
+- **ICU.**
+- **SGen in Boehm mode.**
+- **The `gex` thread platform.** With threads, `mono-threads-wasm` requires
+  coop suspend, so this build is coop.
+- **The fork's JIT on wasm64:**
+  - its emitter's addresses;
+  - pointer-to-int casts in `interp.c`'s JIT entry and in the jiterpreter,
+    which the compiler flags.
