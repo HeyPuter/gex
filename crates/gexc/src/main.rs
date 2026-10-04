@@ -70,6 +70,24 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        // `eject run` runs the guest, as `run` does: on a thread with a
+        // guest-sized stack, under GEX_PROF when asked.
+        "eject" if argv.get(2).map(String::as_str) == Some("run") => {
+            prof::start();
+            let args = argv[2..].to_vec();
+            let r = std::thread::Builder::new()
+                .name("gex-main".into())
+                .stack_size(gex_native::guest_thread_stack())
+                .spawn(move || eject::cmd_eject(&args))
+                .expect("spawning the main guest thread")
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p));
+            prof::finish();
+            match r? {
+                Some(exit) => Ok(report_exit(&exit, false)),
+                None => Ok(ExitCode::SUCCESS),
+            }
+        }
         "eject" => match eject::cmd_eject(&argv[2..])? {
             Some(exit) => Ok(report_exit(&exit, false)),
             None => Ok(ExitCode::SUCCESS),
