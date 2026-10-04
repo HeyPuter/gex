@@ -618,6 +618,18 @@ mod imp {
                 EXC_ESCAPED.load(Ordering::Relaxed),
                 crate::fjit::counts()
             ));
+            // The yield park (GEX_NT_YIELD=wake): parks by how they ended
+            // (woken by a kick, the word had moved, timed out) and kicks by
+            // whether they woke anyone, since the last report.
+            let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
+            warn_line(&format!(
+                "gex-nt: yield parks woken={} moved={} timed_out={} kicks waking={} idle={}\n",
+                take(&YIELD_PARKS[0]),
+                take(&YIELD_PARKS[1]),
+                take(&YIELD_PARKS[2]),
+                take(&YIELD_KICKS[1]),
+                take(&YIELD_KICKS[0])
+            ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
             }
@@ -657,6 +669,10 @@ mod imp {
         }
     }
 
+    /// Yield parks by result (`memory.atomic.wait32`: 0 woken, 1 not equal, 2
+    /// timed out) and kicks (`notify`) by whether they woke a waiter.
+    pub(crate) static YIELD_PARKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+    pub(crate) static YIELD_KICKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
     /// Exceptions dispatched nested and escaped back (the stats line).
     pub(crate) static EXC_NESTED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static EXC_ESCAPED: AtomicU64 = AtomicU64::new(0);
@@ -806,14 +822,18 @@ mod imp {
         fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
             let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
             // SAFETY: an aligned guest word of the shared memory.
-            unsafe { crate::warch::memory_atomic_wait32(p, expected as i32, timeout.as_nanos() as i64) };
+            let r = unsafe { crate::warch::memory_atomic_wait32(p, expected as i32, timeout.as_nanos() as i64) };
+            if let Some(n) = YIELD_PARKS.get(r as usize) {
+                n.fetch_add(1, Ordering::Relaxed);
+            }
             true
         }
 
         fn notify(&self, addr: u64) {
             let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
             // SAFETY: as above.
-            unsafe { crate::warch::memory_atomic_notify(p, u32::MAX) };
+            let woke = unsafe { crate::warch::memory_atomic_notify(p, u32::MAX) };
+            YIELD_KICKS[(woke > 0) as usize].fetch_add(1, Ordering::Relaxed);
         }
 
         fn run_callback(&mut self) -> Result<(), ()> {
