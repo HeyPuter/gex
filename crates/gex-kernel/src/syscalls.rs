@@ -2172,6 +2172,14 @@ impl Kernel {
             nr::FSTAT => self.sys_fstat(m, a[0] as i32, a[1]),
             nr::NEWFSTATAT => self.sys_fstatat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::STATX => self.sys_statx(m, a[0] as i32, a[1], a[2], a[4]),
+            // F_GETLK and F_OFD_GETLK: nobody holds a lock (see
+            // `sys_fcntl`), so the answer is l_type = F_UNLCK, which is the
+            // first field in every `struct flock` layout (i386's flock and
+            // flock64, x86-64's, wasm32's).
+            nr::FCNTL if a[1] == 5 || a[1] == 36 => self.fds.get(a[0] as i32).and_then(|_| {
+                const F_UNLCK: u16 = 2;
+                m.write(a[2], &F_UNLCK.to_le_bytes()).map(|_| 0)
+            }),
             nr::FCNTL => self.sys_fcntl(a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self
@@ -3547,6 +3555,9 @@ impl Kernel {
         const F_SETFL: u64 = 4;
         const F_SETLK: u64 = 6;
         const F_SETLKW: u64 = 7;
+        // Open file description locks: the same story.
+        const F_OFD_SETLK: u64 = 37;
+        const F_OFD_SETLKW: u64 = 38;
         const F_ADD_SEALS: u64 = 1033;
         const F_GET_SEALS: u64 = 1034;
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -3578,7 +3589,7 @@ impl Kernel {
             }
             // Advisory locks always succeed: gex runs one process tree over
             // one namespace, so there is nobody to contend with.
-            F_SETLK | F_SETLKW => {
+            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
                 self.fds.get(fd)?;
                 Ok(0)
             }
