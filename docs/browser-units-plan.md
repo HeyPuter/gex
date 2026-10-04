@@ -107,6 +107,49 @@ merge/web9 @ this commit; merge/web9-fjit (worktree wt/web9f) = it + F's
   The native cache is `scratchpad/fjit/cgcache-cg12`. Build browser units
   for the new D3D DLLs only when Peggle in the page needs them.
 
+### Stream B: Noita on browser units, measured (2026-10-04, ~05:35)
+
+- **Numbers** (seed pinned to 1767225600 on both, 4x clock, cores 5,11,
+  real GPU; ABBA): pewasm in the page 58.4 / 50.8 world fps; gex on
+  browser units 29.7 / 30.4 world fps, AOT 99.4% of guest. Round 1, before
+  the two fixes below: pewasm 56.6 / 55.8, gex 1.3 / 1.2.
+- **The NT trampolines need a unit** (8e96b196). Natively it is built at
+  boot; the page cannot, so every syscall stub ran on tier-1 and each
+  call into one from a unit (opengl32's GL thunks, ~7.7k/s) was a
+  call-out ending in a trap: 1.3 world fps. `GEX_CGEN_GUARD=1
+  GEX_CGEN_CACHE=... gexc cgen-image --nt-trampolines32` builds it; the
+  page's key matches. -> 26 world fps.
+- **Clock reads in the syscall path** (9dbecfdf): `performance.now()` is
+  about a microsecond in a Worker, and each NT syscall read it four times
+  (plus a BigInt each and a `syscall_name` String with four substring
+  searches). Noita's main thread makes ~5*10^5 NtYieldExecution a second
+  (it spin-yields for its job threads). Now every 16th call and around
+  waits. -> 30-31 world fps.
+- **Where the time goes now** (main thread, V8 profile): units 48%, NT
+  syscalls 38% (nearly all NtYieldExecution: waiting), providers 6%;
+  job threads ~40% busy, 60% in the concrt provider's `cond_wait_` (an
+  Atomics.wait, which the AOT line counts as provider time: the AOT share
+  overstates). The main thread's own work per frame (~17 ms) is pewasm's
+  whole frame: the units themselves are slower than pewasm's code. The
+  guarded flavour (a bounds guard on every guest access) is the first
+  suspect; an unguarded browser layout is the lever.
+- **Seed pin in the page:** browser-noita.mjs pins by default
+  (NOITA_WORLD_SEED; a pin.sh farm plus the save's mod_config.xml in the
+  prefix; NOITA_PEEK=0x1205004 checks it: 1767225600 seen). The scratchpad
+  pewasm page takes `?seed=` and run-pewasm-page.sh passes it (world seed
+  read back: 1767225600).
+- **Precondition:** with `cgen=` in GEX_NT_PAGE_FLAGS, browser-noita.mjs
+  fails on any "no function-tier unit" / "no provider module" line (the
+  trampolines included) and on AOT under NOITA_MIN_AOT (99); the fps
+  window starts after the profile.
+- **Merged:** merge/web9-fjit and merge/fjit (2c83dead) are in merge/web9;
+  run-browser.sh 49/49 plain and GEX_FJIT=1. That re-keys every unit: the
+  measured units (target/bnoita2, gexc-web9b) no longer match this tree.
+  Rebuild with scratchpad `web9/build-bunits3.sh web9/gexc-web9c` (into
+  target/bnoita3: trampolines, Noita's eight images, then the prefix), and
+  run the page with GEX_CGEN_CACHE/GEX_WINE_PREFIX pointing there
+  (absolute paths: the bundle symlinks the prefix).
+
 ## Where the page is now
 
 Noita in headless Chromium, hardware WebGPU, full speed: about 4.2
