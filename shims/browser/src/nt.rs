@@ -206,8 +206,25 @@ mod imp {
         }
     }
 
+    /// `GEX_NT_FIXED_TIME=<unix seconds>`, as natively (54cb7124): the
+    /// guest's wall clock starts there and advances with real time, so a
+    /// program seeding from the date (Noita's world) sees the same value
+    /// every run. 0 for the page's own clock.
+    static FIXED_TIME: AtomicU64 = AtomicU64::new(0);
+    static FIXED_ORIGIN: AtomicU64 = AtomicU64::new(0);
+
+    fn wall() -> (u64, u32) {
+        let fixed = FIXED_TIME.load(Ordering::Relaxed);
+        if fixed == 0 {
+            return crate::browser_clock();
+        }
+        let now = unsafe { mono_ns() } as u64;
+        let ns = fixed * 1_000_000_000 + now.saturating_sub(FIXED_ORIGIN.load(Ordering::Relaxed));
+        (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+    }
+
     fn clocks() -> nt::Clocks {
-        nt::Clocks { mono_ns: mono, wall: crate::browser_clock }
+        nt::Clocks { mono_ns: mono, wall }
     }
 
     fn log(s: &str) {
@@ -297,6 +314,10 @@ mod imp {
         }
         if let Some(s) = var("GEX_NT_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
             TIME_SCALE.store(s.to_bits(), Ordering::Relaxed);
+        }
+        if let Some(t) = var("GEX_NT_FIXED_TIME").and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) {
+            FIXED_ORIGIN.store(unsafe { mono_ns() } as u64, Ordering::Relaxed);
+            FIXED_TIME.store(t, Ordering::Relaxed);
         }
         let prefix = var("GEX_WINE_PREFIX").unwrap_or_else(|| "/wine".into());
         let mut wenv = nt::boot::default_environment();
@@ -532,10 +553,11 @@ mod imp {
             let slots: Vec<String> = (0..gex_abi::DISPATCH_TABLES as u32).map(|k| crate::gex_claimed_slots(k).to_string()).collect();
             let (callouts, left) = crate::cgen::callouts();
             warn_line(&format!(
-                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left}\n",
+                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={}\n",
                 crate::dense::gex_dense_size(),
                 slots.join("/"),
-                crate::dense::on() as u8
+                crate::dense::on() as u8,
+                crate::IN_PLACE_N.load(Ordering::Relaxed)
             ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));

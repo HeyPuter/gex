@@ -858,6 +858,8 @@ export class Gex {
         // runs nested until the guest returns to the function body that
         // called it.
         call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+        // A dispatch miss installs in place (lib.rs `in_place`).
+        jit_install: (_ctx) => this.#jitInstall(),
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
@@ -3528,6 +3530,28 @@ export class Gex {
   }
 
   #calloutsMade = 0;
+
+  /** What a dispatch miss needs, installed synchronously on this Worker
+   *  (lib.rs `in_place`): 1, or 0 when it cannot be done here (a page's
+   *  main thread may not compile synchronously) and the miss traps out. */
+  #jitInstall() {
+    if (typeof window !== 'undefined') return 0;
+    const e = this.#shim.exports;
+    try {
+      this.#denseCatchUp();
+      if (e.gex_jit_pending_len() >>> 0) {
+        const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+        if (need) this.#growTables(need, 'in-place');
+      }
+      while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+      this.#catchUpSync();
+      this.#armCallouts();
+      return 1;
+    } catch (err) {
+      console.error(`[gex] an in-place install failed, trapping instead: ${err.message ?? err}`);
+      return 0;
+    }
+  }
 
   /** `#installTranslation` without yielding, for `#ntCallback`. */
   #installTranslationSync() {

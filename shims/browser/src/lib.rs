@@ -49,6 +49,12 @@ use std::sync::Arc;
 // happens in this module.
 #[link(wasm_import_module = "gex_env")]
 extern "C" {
+    /// Install, synchronously on this Worker, what a dispatch miss just
+    /// queued or found missing here (the pending translations, the registry,
+    /// the dense block a slot names): 1 when it could, and the miss stub
+    /// dispatches again in place; 0 (a page's main thread cannot compile
+    /// synchronously) and the miss traps out as before.
+    fn jit_install(ctx: i32) -> i32;
     /// Write `len` bytes at `ptr` -- an address in the shared memory -- to the
     /// host's console for `fd`.
     fn write(fd: i32, ptr: u32, len: u32);
@@ -10525,6 +10531,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // is retried (`dense::missing`).
     if dense::missing(pc) {
         dense::want(pc);
+        if in_place(_ctx, pc) {
+            return gex_emit::module::DISPATCH_MISS_REDISPATCH;
+        }
         if unsafe { TRACE_MISSES } {
             trace_line(&format!("[gex] dense miss at pc={pc:#x}: index {} not in this Worker's blocks\n", dense::lookup(pc)));
         }
@@ -11240,6 +11249,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         true
     });
+    if translated && in_place(_ctx, pc) {
+        return gex_emit::module::DISPATCH_MISS_REDISPATCH;
+    }
     if !translated {
         if !with_host(|h| h.jit.described) {
             trace_line("gex: the guest module carries no gex.meta section, so there is\n");
@@ -11275,6 +11287,48 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     trap();
 }
 
+
+/// The browser half of the native in-place redispatch (65f9a719): instead
+/// of trapping out of every wasm frame of the thread (unit frames included)
+/// to resume at `pc`, have JS install what the miss needs synchronously and
+/// let the miss stub dispatch again. At most a few times in a row at one
+/// pc, then the trap as before (it also catches up on everything else).
+fn in_place(ctx: i32, pc: u64) -> bool {
+    thread_local! {
+        static LAST: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    if !IN_PLACE.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let n = LAST.with(|l| {
+        let (p, n) = l.get();
+        let n = if p == pc { n + 1 } else { 1 };
+        l.set((pc, n));
+        n
+    });
+    if n > 3 {
+        return false;
+    }
+    // SAFETY: a host import taking scalars; nothing here holds the host.
+    let ok = unsafe { jit_install(ctx) } == 1;
+    if ok {
+        IN_PLACE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The resume the miss path staged for a trap is not taken: left, the
+        // next trap that means "wait" (no resume of its own) would resume here.
+        set_resume_none();
+        RESUME_CTX.with(|c| c.set(None));
+    }
+    ok
+}
+
+/// `gex_set_in_place(0)`: every miss traps out, as before (for measuring).
+static IN_PLACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub(crate) static IN_PLACE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_set_in_place(on: i32) {
+    IN_PLACE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Code the guest unmapped or reprotected since the last syscall loses its
 /// translations, as natively (`retire_translations`): the pages leave the
