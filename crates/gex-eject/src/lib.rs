@@ -31,6 +31,7 @@ pub mod config;
 pub mod decompile;
 pub mod eject;
 pub mod json;
+pub mod pe;
 pub mod plt;
 pub mod project;
 pub mod run;

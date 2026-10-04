@@ -46,7 +46,8 @@ fn real_main() -> Result<ExitCode> {
     // builds and uses the guarded, browser flavor instead.
     // Only for what runs here: `gexc build` makes modules for the browser.
     let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c");
-    gex_cgen::image::set_unguarded(native && std::env::var("GEX_CGEN_GUARD").as_deref() != Ok("1"));
+    let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
+    gex_cgen::image::set_unguarded(native && !guard);
     match argv[1].as_str() {
         "run" => {
             // On a thread with a guest-sized stack: the first guest thread

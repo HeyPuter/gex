@@ -14,6 +14,19 @@
 
 #define COOPERATIVE_WAIT_TIMEOUT 0xffffffffu
 
+/* The NT yield park's generation word (gex_kernel::nt::sync::YIELD_GEN, in
+ * KUSER_SHARED_DATA's page past the structure). A thread spinning in
+ * SwitchToThread/Sleep(0) parks on it; bumping it and notifying wakes the
+ * spinner, which re-checks what it waits for. Kicked when a wait here first
+ * blocks (this thread went idle: the work a spinner waits for may be done)
+ * and when a wake signals a waiter. A host with no parked thread just sees
+ * the word change. */
+#define YIELD_GEN 0x7ffe0ff0u
+static void yield_kick(void) {
+    __atomic_fetch_add(GA(YIELD_GEN), 1u, __ATOMIC_SEQ_CST);
+    gp_wake(YIELD_GEN, 0x7fffffffu);
+}
+
 /* ---- critical_section: word 0 = owner (thread + 1), word 1 = waiters; not recursive ---- */
 
 static int cs_try(int ctx, uint32_t cs) {
@@ -38,6 +51,9 @@ static int cs_lock(int ctx, uint32_t cs, uint32_t limit_ms, uint64_t pc) {
         if (pc) {
             gp_poll(ctx, pc);
         }
+        if (!waited) {
+            yield_kick();
+        }
         __atomic_fetch_add(GA(cs + 4), 1u, __ATOMIC_SEQ_CST);
         gp_wait(cs, held, 1);
         __atomic_fetch_sub(GA(cs + 4), 1u, __ATOMIC_SEQ_CST);
@@ -48,6 +64,7 @@ static void cs_unlock(uint32_t cs) {
     __atomic_store_n(GA(cs), 0u, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(GA(cs + 4), __ATOMIC_SEQ_CST)) {
         gp_wake(cs, 1);
+        yield_kick();
     }
 }
 
@@ -108,6 +125,7 @@ static GEX_PROVIDER(event_set) {
     if (__atomic_load_n(GA(e + 4), __ATOMIC_SEQ_CST)) {
         gp_wake(e, 0x7fffffffu);
     }
+    yield_kick();
     return gp_return(ctx, ret, 0);
 }
 /* ?reset@event@Concurrency@@QAEXXZ */
@@ -123,6 +141,9 @@ static GEX_PROVIDER(event_wait) {
     uint32_t e = gp_reg(ctx, R_ECX), timeout = gp_arg(ctx, 0), waited = 0;
     while (!__atomic_load_n(GA(e), __ATOMIC_SEQ_CST) && timeout && (timeout == 0xffffffffu || waited < timeout)) {
         gp_poll(ctx, pc);
+        if (!waited) {
+            yield_kick();
+        }
         __atomic_fetch_add(GA(e + 4), 1u, __ATOMIC_SEQ_CST);
         gp_wait(e, 0, 1);
         __atomic_fetch_sub(GA(e + 4), 1u, __ATOMIC_SEQ_CST);
@@ -152,6 +173,9 @@ static int cond_wait(int ctx, uint32_t c, uint32_t cs, uint32_t timeout) {
     cs_unlock(cs);
     int signaled;
     while (!(signaled = __atomic_load_n(GA(c), __ATOMIC_SEQ_CST) != gen) && (timeout == 0xffffffffu || waited < timeout)) {
+        if (!waited) {
+            yield_kick();
+        }
         __atomic_fetch_add(GA(c + 4), 1u, __ATOMIC_SEQ_CST);
         gp_wait(c, gen, 1);
         __atomic_fetch_sub(GA(c + 4), 1u, __ATOMIC_SEQ_CST);
@@ -180,6 +204,7 @@ static GEX_PROVIDER(cond_notify) {
     if (__atomic_load_n(GA(c + 4), __ATOMIC_SEQ_CST)) {
         gp_wake(c, 0x7fffffffu);
     }
+    yield_kick();
     return gp_return(ctx, ret, 0);
 }
 
@@ -196,6 +221,9 @@ static GEX_PROVIDER(wait_ms) {
     uint64_t pc = GP_SELF_PC();
     for (uint32_t ms = gp_arg(ctx, 0), k = 0; k < ms; ++k) {
         gp_poll(ctx, pc);
+        if (!k) {
+            yield_kick();
+        }
         gp_sleep(ctx, 1);
     }
     return gp_return(ctx, ret, 0);

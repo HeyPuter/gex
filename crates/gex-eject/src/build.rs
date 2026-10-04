@@ -242,10 +242,12 @@ pub struct BuildReport {
     pub replacements: Vec<BuiltReplacement>,
     pub illegal_blocks: usize,
     pub rootfs_files: usize,
+    /// A Windows program's build (`pe`).
+    pub pe: Option<crate::pe::PeReport>,
 }
 
 /// Check the project's `rootfs/` is what the eject wrote.
-fn verify_rootfs(dir: &Path, project: &Project) -> Result<()> {
+pub(crate) fn verify_rootfs(dir: &Path, project: &Project) -> Result<()> {
     let items = project
         .objects
         .iter()
@@ -589,7 +591,7 @@ pub fn describe(dir: &Path, object: &str, what: &str, size: Option<u64>) -> Resu
     Ok(json::write(&obj(fields)))
 }
 
-fn copy_tree(from: &Path, to: &Path, count: &mut usize) -> Result<()> {
+pub(crate) fn copy_tree(from: &Path, to: &Path, count: &mut usize) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
     let mut entries: Vec<_> = std::fs::read_dir(from)
         .with_context(|| format!("reading {}", from.display()))?
@@ -749,6 +751,11 @@ pub fn build(dir: &Path) -> Result<BuildReport> {
         bail!("the project is for {} guests and this gexc runs {} guests", project.isa, gex_abi::ARCH_NAME);
     }
     let (config, _) = Config::load(dir)?;
+    if crate::pe::nt_session(dir)?.is_some() {
+        let pe = crate::pe::build(dir, &project, &config)?;
+        let rootfs_files = pe.rootfs_files;
+        return Ok(BuildReport { pe: Some(pe), rootfs_files, ..BuildReport::default() });
+    }
     verify_rootfs(dir, &project)?;
     // What the session ran, per object, to seed discovery with.
     let profile = match std::fs::read_to_string(dir.join("session/profile.json")) {

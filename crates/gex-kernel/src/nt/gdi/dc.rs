@@ -79,8 +79,9 @@ fn init_attr(c: &mut Call<'_>, attr: u64, hdc: u32, vis: Rect) -> R<()> {
     c.g.w32(a!(MAP_MODE), 1)?; // MM_TEXT
     c.g.w32(a!(GRAPHICS_MODE), 1)?; // GM_COMPATIBLE
     c.g.w32(a!(ARC_DIRECTION), 1)?; // AD_COUNTERCLOCKWISE
-    c.g.w32(a!(VIRTUAL_RES), 1920)?;
-    c.g.w32(a!(VIRTUAL_RES) + 4, 1080)?;
+    let m = crate::nt::user::sysparams::mode(c);
+    c.g.w32(a!(VIRTUAL_RES), m.width as u32)?;
+    c.g.w32(a!(VIRTUAL_RES) + 4, m.height as u32)?;
     c.g.w32(a!(VIRTUAL_SIZE), 508)?;
     c.g.w32(a!(VIRTUAL_SIZE) + 4, 286)?;
     super::super::user::write_rect(&mut c.g, a!(VIS_RECT), &vis)?;
@@ -105,7 +106,8 @@ pub fn create(c: &mut Call<'_>, memory: bool, hwnd: u32, whole_window: bool) -> 
         pixel_format: 0,
     };
     let h = alloc(c, Obj::Dc(d))?;
-    let vis = if memory { Rect { left: 0, top: 0, right: 1, bottom: 1 } } else { Rect { left: 0, top: 0, right: 1920, bottom: 1080 } };
+    let m = crate::nt::user::sysparams::mode(c);
+    let vis = if memory { Rect { left: 0, top: 0, right: 1, bottom: 1 } } else { Rect { left: 0, top: 0, right: m.width, bottom: m.height } };
     init_attr(c, attr, h, vis)?;
     set_user_pointer(c, h, attr)?;
     Ok(h)
@@ -238,9 +240,11 @@ pub fn nt_gdi_get_dc_object(c: &mut Call<'_>) -> R64 {
     }))
 }
 
-/// `NtGdiGetDeviceCaps(hdc, cap)`: the display (1920x1080, 32 bpp, 96 dpi).
+/// `NtGdiGetDeviceCaps(hdc, cap)`: the display (the current mode, 1920x1080
+/// unless changed, 32 bpp, 96 dpi).
 pub fn nt_gdi_get_device_caps(c: &mut Call<'_>) -> R64 {
     let (hdc, cap) = (c.a32(0), c.a32(1));
+    let m = crate::nt::user::sysparams::mode(c);
     let Some(Obj::Dc(d)) = get(c, hdc) else { return Ok(0) };
     let mono = d.memory && matches!(get(c, d.bitmap), Some(Obj::Bitmap(b)) if b.bpp == 1) && false;
     let v: i32 = match cap {
@@ -248,8 +252,8 @@ pub fn nt_gdi_get_device_caps(c: &mut Call<'_>) -> R64 {
         2 => 1,             // TECHNOLOGY: DT_RASDISPLAY
         4 => 508,           // HORZSIZE (mm)
         6 => 286,           // VERTSIZE
-        8 => 1920,          // HORZRES
-        10 => 1080,         // VERTRES
+        8 => m.width,       // HORZRES
+        10 => m.height,     // VERTRES
         12 => if mono { 1 } else { 32 }, // BITSPIXEL
         14 => 1,            // PLANES
         16 => -1,           // NUMBRUSHES
@@ -273,7 +277,7 @@ pub fn nt_gdi_get_device_caps(c: &mut Call<'_>) -> R64 {
         108 => 0,           // COLORRES
         110..=114 => 0,     // PHYSICALWIDTH.. (printers)
         116 => 60,          // VREFRESH
-        117 | 118 => if cap == 117 { 1920 } else { 1080 }, // DESKTOPVERTRES/HORZRES
+        117 | 118 => if cap == 117 { m.width } else { m.height }, // DESKTOPVERTRES/HORZRES
         119 => 0,           // BLTALIGNMENT
         120 => 0xff,        // SHADEBLENDCAPS
         121 => 0,           // COLORMGMTCAPS

@@ -12,10 +12,11 @@ gex-xlate = { workspace = true, features = ["parallel"] }
 gex-emit.workspace = true
 gex-cache.workspace = true
 gex-native.workspace = true
+gex-kernel.workspace = true
 gex-cgen.workspace = true
 gex-ir.workspace = true
 anyhow = "1"
 
 [features]
 # For an x86-64 guest. See `gex_abi::X86`.
-x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86"]
+x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86", "gex-kernel/x86"]
