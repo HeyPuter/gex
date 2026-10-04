@@ -656,6 +656,7 @@ export async function runProgram(
       // `?aot=1`: an ejected project's run, with no run-time translation (a
       // miss stops the run, saying where).
       jit: globalThis.GEX_NO_JIT ? false : undefined,
+      aot: globalThis.GEX_AOT ? true : undefined,
       denseDebug: !!globalThis.GEX_DENSE_DEBUG,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?forkskip=N`, in `extra` because the process that acts on it is a

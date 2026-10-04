@@ -10538,7 +10538,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // AOT-only: catch up inside the call and dispatch again, keeping the
         // thread's frames (leaving would resume at continuations no unit
         // has entries for).
-        if !jit_on() {
+        if aot() {
             nt::serve_now();
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
@@ -10722,7 +10722,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     crate::cgen::note_web_entry(pc as u64);
     // AOT-only, a pc the function table has (published by another Worker
     // after this one last caught up): catch up and dispatch again.
-    if !jit_on() && cgen::knows(pc) {
+    if aot() && cgen::knows(pc) {
         thread_local! {
             static AGAIN: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
         }
@@ -11748,6 +11748,22 @@ pub extern "C" fn gex_set_jit(on: i32) {
 /// Whether run-time translation is allowed (`gex_set_jit`).
 pub(crate) fn jit_on() -> bool {
     JIT_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An ejected project's run (`gex_set_aot(1)`): what keeps the guest's
+/// frames as an AOT-only runtime must (units and threads served inside the
+/// call, a Worker catching up in place, a wild branch the guest's fault).
+/// On in its training run too, where translation is allowed, so what that
+/// run records is what the AOT-only run needs.
+static AOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_aot(on: i32) {
+    AOT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn aot() -> bool {
+    AOT.load(std::sync::atomic::Ordering::Relaxed) || !jit_on()
 }
 
 /// Whether library substitution is on. See `gex_set_intrinsics`.

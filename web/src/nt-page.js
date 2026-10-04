@@ -78,6 +78,8 @@ async function main() {
   // An ejected project's page (gexc eject): its units, and no translation.
   if (q.get('cgenurl')) globalThis.GEX_CGEN_URL = q.get('cgenurl');
   if (q.get('aot') === '1') globalThis.GEX_NO_JIT = 1;
+  // `aot=record`: its training run (translation on, the rest as aot=1).
+  if (q.get('aot')) globalThis.GEX_AOT = 1;
   if (q.get('densedebug')) globalThis.GEX_DENSE_DEBUG = 1;
   if (q.get('tracemisses')) globalThis.GEX_TRACE_MISSES = 1;
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);

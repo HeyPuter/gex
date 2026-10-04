@@ -211,7 +211,7 @@ process.env.GEX_WEB_DIR = web;
 process.env.GEX_CGEN_CACHE = join(here, 'build/web/cgen');
 process.argv = [
   process.argv[0], join(web, 'js/run-node.mjs'),
-  '--cgen', ...(jit ? [] : ['--no-jit']),
+  '--cgen', ...(jit ? (record ? ['--aot'] : []) : ['--no-jit']),
   '--dir', `/=${rootfs}`, '--argv0', m.exe, '--cwd', m.cwd,
   ...env.flatMap((e) => ['--env', e]),
   join(web, 'seed.x86.shared.wasm'), join(rootfs, m.exe), ...args,
@@ -259,6 +259,7 @@ pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
     const argv = q.has('args') ? q.get('args').split(' ').filter((a) => a) : m.args;
     if (argv.length) p.set('argv', JSON.stringify(argv));
     if (!q.has('jit') && !q.has('record')) p.set('aot', '1');
+    if (q.has('record')) p.set('aot', 'record');
     if (m.gl) { p.set('gl', '1'); p.set('glbackend', 'wgpu'); }
     location.replace(`/nt.html?${p}`);
   } catch (e) {

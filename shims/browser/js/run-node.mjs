@@ -17,6 +17,8 @@
 //                            program image; --cgen-prefer: used where found
 //     --no-jit               translate nothing at run time (an ejected
 //                            project's AOT-only run): a miss stops the run
+//     --aot                  an ejected project's run with translation (its
+//                            training run): everything else as --no-jit
 //
 // GEX_WEB_DIR: the directory holding the shim, kernel and seed (default
 // web/public/gex of this tree; an ejected project's runtime/web).
@@ -47,6 +49,7 @@ let argv0 = null;
 const env = [];
 let cgenMode = 0;
 let noJit = false;
+let aotRun = false;
 const dirs = [];
 const rest = [];
 {
@@ -126,6 +129,7 @@ const rest = [];
     else if (av[i] === '--cgen') cgenMode = 2;
     else if (av[i] === '--cgen-prefer') cgenMode = 1;
     else if (av[i] === '--no-jit') noJit = true;
+    else if (av[i] === '--aot') aotRun = true;
     else if (av[i] === '--argv0') argv0 = av[++i];
     else break;
   }
@@ -253,6 +257,9 @@ const host = new ProcessHost({
       : undefined,
     // --no-jit: nothing is translated at run time, in any Worker.
     jit: noJit ? false : undefined,
+    // --aot (implied by --no-jit): an ejected project's run, translation
+    // allowed or not (its training run).
+    aot: noJit || aotRun ? true : undefined,
     // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
     // deflate stream that a UTF-8 round trip would fill with U+FFFD.
     rawOutput: true,

@@ -915,7 +915,7 @@ mod imp {
                 // loads and installs it before the guest goes on, as the
                 // native host does after the same syscall.
                 if crate::cgen::drain() {
-                    if !crate::jit_on() {
+                    if crate::aot() {
                         // SAFETY: a host import without arguments.
                         unsafe { serve_in_place() };
                         return;
@@ -989,7 +989,7 @@ mod imp {
                     }
                     stage_thread(gex_tid, child, start);
                 });
-                if !crate::jit_on() {
+                if crate::aot() {
                     crate::cgen::drain();
                     // SAFETY: a host import without arguments.
                     unsafe { serve_in_place() };

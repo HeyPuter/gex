@@ -944,9 +944,10 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         crate::set_resume_none();
         crate::trap();
     }
-    // An ejected project's AOT-only run (`gex_set_jit(0)`, docs/eject-pe.md
-    // §3.1): no function body holds `t`, and nothing may translate it.
-    if !crate::jit_on() {
+    // An ejected project's run (`gex_set_aot`, docs/eject-pe.md §3.1): no
+    // function body holds `t`. AOT-only (`gex_set_jit(0)`), nothing may
+    // translate it either.
+    if crate::aot() {
         // A branch to memory nothing executable is mapped at: the guest's
         // access violation, as natively (34c3e45b).
         let wild = crate::with_host(|h| {
@@ -964,6 +965,8 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
             // SAFETY: a host import taking scalars; nothing here holds a lock.
             return unsafe { ftab_call(idx as i32, ctx, _depth, _need, ret) };
         }
+    }
+    if !crate::jit_on() {
         let path = lock(&UNITS)
             .iter()
             .filter(|x| x.base <= t)

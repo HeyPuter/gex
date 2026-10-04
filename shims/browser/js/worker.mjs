@@ -641,6 +641,8 @@ async function handle(msg) {
     const ex = gex.shim.exports;
     // An ejected project's AOT-only run: nothing translates, in any Worker.
     if ((msg.jit ?? msg.opts?.jit) === false) ex.gex_set_jit(0);
+    // An ejected project's run, its training run included (translation on).
+    if (msg.aot ?? msg.opts?.aot) ex.gex_set_aot?.(1);
     if (msg.hot) ex.gex_set_hot?.(1);
     if (msg.noIntrinsics) ex.gex_set_intrinsics?.(0);
     if (msg.intrinsicMask !== undefined) ex.gex_set_intrinsic_mask?.(msg.intrinsicMask);
