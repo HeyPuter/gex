@@ -34,13 +34,23 @@ void __gex_set_ctx(unsigned long);
 unsigned long __gex_get_tp(void);
 void __gex_provider_attach(void);
 
+/* The calling guest thread's context and call depth, for calls back into
+ * guest code from anywhere in the provider (gexprov64.c). */
+extern __thread int gexp_ctx;
+extern __thread int32_t gexp_depth;
+
 /* Every adapter's first act: this thread's context for libc's syscalls,
- * and libc's per-thread state on its first visit. */
-static inline void gexp_enter(int ctx)
+ * and libc's per-thread state on its first visit. Nested entries (guest
+ * code the provider called, calling the provider again) see the same
+ * context; the depth is the caller's. */
+#define gexp_enter(ctx) gexp_enter_(ctx, depth)
+static inline void gexp_enter_(int ctx, int32_t depth)
 {
 	__gex_set_ctx((uint32_t)ctx);
 	if (__builtin_expect(!__gex_get_tp(), 0))
 		__gex_provider_attach();
+	gexp_ctx = ctx;
+	gexp_depth = depth;
 }
 
 #define GEXP_SYSV(name) int name(int ctx, int32_t depth, uint32_t need, uint64_t ret)
@@ -80,11 +90,52 @@ static inline int gexp_return(int ctx, uint64_t ret)
 	return ra == ret;
 }
 
+/* ---- calling guest code (gexprov64.c) ----
+ * A call by the guest ABI to the guest function at `fn`, from inside the
+ * provider, on the current guest thread: arguments in registers and on the
+ * guest stack below the current guest RSP, a return address of its own, the
+ * function reached through gex's function table like any call. The guest's
+ * callee-saved registers and RSP are as they were afterwards. */
+typedef struct {
+	uint64_t ireg[6];      /* SysV: rdi rsi rdx rcx r8 r9; Win64: rcx rdx r8 r9 */
+	uint64_t xmm[8];       /* low 64 bits of xmm0..7 (a float in the low 32) */
+	unsigned nireg, nxmm;  /* used: SysV puts nxmm in al (varargs) */
+	const uint64_t *stack; /* stack arguments, first at the lowest address */
+	unsigned nstack;
+	int win64;             /* the Win64 convention: 32 bytes of home space */
+	/* results */
+	uint64_t rax, rdx, xmm0, xmm1;
+} gexp_call;
+
+void gexp_call_guest(uint64_t fn, gexp_call *c);
+
+/* A guest call whose callee raised (gexp_raise) instead of returning: the
+ * guest's registers are restored to before the call, and the payload is
+ * returned; 0 when it returned normally. */
+uint64_t gexp_call_guest_catching(uint64_t fn, gexp_call *c);
+
+/* From provider code that guest code called during gexp_call_guest_catching:
+ * abandon the guest frames back to that call, which returns `payload`. Only
+ * when gexp_catching() says one is active. */
+_Noreturn void gexp_raise(uint64_t payload);
+int gexp_catching(void);
+
+/* Whether a function pointer is a guest address rather than one of this
+ * module's own (a table index in its slots). */
+int gexp_is_guest_fn(uint64_t p);
+
 /* Host imports (shims/native libprov). */
 __attribute__((import_module("gex"), import_name("provider_missing"))) void gexp_host_missing(uint64_t addr);
 __attribute__((import_module("gex"), import_name("provider_log"))) void gexp_host_log(const void *p, uint64_t n);
 __attribute__((import_module("gex"), import_name("provider_thread_entry"))) uint64_t gexp_host_thread_entry(void);
 __attribute__((import_module("gex"), import_name("provider_stack"))) uint64_t gexp_host_stack(void);
+__attribute__((import_module("gex"), import_name("provider_abi"))) uint64_t gexp_host_abi(int which);
+__attribute__((import_module("gex"), import_name("provider_try"))) int gexp_host_try(void (*fn)(void *), void *arg);
+__attribute__((import_module("gex"), import_name("provider_throw"))) _Noreturn void gexp_host_throw(int code);
+/* gexp_host_abi(which): */
+#define GEXP_ABI_FCACHE 0       /* gex_abi::FCACHE */
+#define GEXP_ABI_FCACHE_BITS 1  /* gex_abi::FCACHE_BITS */
+#define GEXP_ABI_CTX_V 2        /* gex_abi::ctx::V */
 #define GEXP_STACK_SIZE (1ul << 20) /* shims/native libprov::STACK */
 
 /* Bound at every export the provider does not implement. */

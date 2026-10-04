@@ -199,7 +199,11 @@ pub(crate) fn install(
         pairs.push((base + entry_rva as u64, k as u32));
     }
     // A provider's own threads (musl's clone, wasm64): they start at a
-    // guest address of their own, bound to `__gex_thread_start`.
+    // guest address of their own, bound to `__gex_thread_start`. The page
+    // also holds the return addresses its calls into guest code push
+    // (`gex.provider_code_page`): addresses gex's dispatch covers, so a
+    // return there that nothing predicted is still caught by the call-out
+    // that made the call.
     if let Some(k) = slots.iter().position(|s| s.as_deref() == Some("__gex_thread_start")) {
         // Below 4 GiB, like all code: the call cache keys on 32-bit targets.
         let at = alloc_code(state, &format!("[provider {} thread entry]", p.name))?;
@@ -381,6 +385,37 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         };
         Ok((top + 16 - STACK) as i64)
     })?;
+    // Constants of gex's ABI a provider calling guest code needs.
+    linker.func_wrap(IMPORT_MODULE, "provider_abi", |_caller: Caller<'_, HostState>, which: i32| -> i64 {
+        match which {
+            0 => gex_abi::FCACHE as i64,
+            1 => gex_abi::FCACHE_BITS as i64,
+            2 => gex_abi::ctx::V as i64,
+            _ => -1,
+        }
+    })?;
+    // How many table slots the module installed at `base` has: what is its
+    // own function pointer (a table index) and what is a guest address.
+    linker.func_wrap(IMPORT_MODULE, "provider_table_size", |caller: Caller<'_, HostState>, base: i64| -> i64 {
+        let Some(jit) = caller.data().jit.as_ref() else { return 0 };
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        sh.ftab.map.installs().iter().find(|i| i.base as i64 == base).map_or(0, |i| i.len as i64)
+    })?;
+    // The guest address of the function `name` exports from the first
+    // mapped Linux object that defines it (as RTLD_DEFAULT would find it), or
+    // 0: how a provider finds the guest's own dlopen/dlsym.
+    linker.func_wrap(IMPORT_MODULE, "provider_guest_sym", |mut caller: Caller<'_, HostState>, ptr: i64, len: i64| -> Result<i64> {
+        let name = {
+            let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+            let b = m.bytes();
+            let bytes = b.get(ptr as usize..(ptr as usize).saturating_add(len as usize)).ok_or_else(|| anyhow!("provider_guest_sym: bad name"))?;
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        Ok(guest_sym(caller.data_mut(), &name).unwrap_or(0) as i64)
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_code_page", |_caller: Caller<'_, HostState>| -> i64 {
+        THREAD_ENTRY.load(std::sync::atomic::Ordering::Acquire) as i64
+    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_thread_entry", |_caller: Caller<'_, HostState>| -> i64 {
         THREAD_ENTRY.load(std::sync::atomic::Ordering::Acquire) as i64
     })?;
@@ -439,4 +474,40 @@ pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_ke
         crate::ftab::catch_up(&mut *caller)?;
     }
     Ok(())
+}
+
+/// The dynamic symbols of a mapped object, by path: (name, value) of each
+/// defined function, and its executable segment's page-aligned vaddr.
+type ObjSyms = (std::collections::HashMap<String, u64>, u64);
+static OBJ_SYMS: Mutex<Option<std::collections::HashMap<String, Arc<ObjSyms>>>> = Mutex::new(None);
+
+/// [`provider_guest_sym`]'s search: every executable file mapping, lowest
+/// address first.
+fn guest_sym(state: &mut HostState, name: &str) -> Option<u64> {
+    let maps: Vec<(u64, String)> = state.with_kernel(|k| {
+        k.mem.vmas().iter().filter(|v| v.prot & gex_kernel::mem::prot::EXEC != 0).filter_map(|v| v.code.as_ref().map(|(p, _)| (v.start, p.clone()))).collect()
+    });
+    let mut seen = std::collections::HashSet::new();
+    for (start, path) in maps {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let cached = OBJ_SYMS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&path).cloned();
+        let syms = match cached {
+            Some(s) => s,
+            None => {
+                let Some(bytes) = state.with_kernel(|k| k.read_file(&path)) else { continue };
+                let Ok(image) = gex_ld::elf::load(&bytes, 0) else { continue };
+                let Some(text) = image.segments.iter().find(|s| s.executable) else { continue };
+                let map = image.dynsyms.iter().filter(|y| !y.undefined && !y.tls && y.value != 0).map(|y| (y.name.clone(), y.value)).collect();
+                let s = Arc::new((map, text.vaddr & !0xfff));
+                OBJ_SYMS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(path.clone(), Arc::clone(&s));
+                s
+            }
+        };
+        if let Some(v) = syms.0.get(name) {
+            return Some(start.wrapping_sub(syms.1).wrapping_add(*v));
+        }
+    }
+    None
 }

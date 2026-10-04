@@ -1,0 +1,156 @@
+/* Runtime support every wasm64 provider links (docs/unity-dotnet.md):
+ * calls into guest code, and abandoning guest frames on a raise. */
+#include "gexprov64.h"
+
+__thread int gexp_ctx;
+__thread int32_t gexp_depth;
+
+/* The return address a provider's guest call pushes: in the provider's own
+ * code page (its thread entry is at offset 0), one per call depth, so gex's
+ * dispatch covers it and its call-out catches a return there that no
+ * function body predicted (a longjmp inside the callee, say). */
+__attribute__((import_module("gex"), import_name("provider_code_page"))) uint64_t gexp_host_code_page(void);
+static uint64_t code_page;
+
+static uint64_t fcache, fcache_bits;
+
+static uint32_t ftab_idx(uint64_t t)
+{
+	if (__builtin_expect(!fcache, 0)) {
+		fcache = gexp_host_abi(GEXP_ABI_FCACHE);
+		fcache_bits = gexp_host_abi(GEXP_ABI_FCACHE_BITS);
+	}
+	uint64_t slot = (uint32_t)((uint32_t)t * 0x9e3779b1u) >> (32 - fcache_bits);
+	uint64_t e = __atomic_load_n((uint64_t *)(uintptr_t)(fcache + 8 * slot), __ATOMIC_RELAXED);
+	return (e & 0xffffffffull) == (t & 0xffffffffull) ? (uint32_t)(e >> 32) : 0; /* RESOLVE */
+}
+
+void gexp_call_guest(uint64_t fn, gexp_call *c)
+{
+	int ctx = gexp_ctx;
+	int32_t depth = gexp_depth;
+	static const unsigned char sysv[6] = { 7, 6, 2, 1, 8, 9 }, win[4] = { 1, 2, 8, 9 };
+	uint64_t rsp0 = GEXP_X(ctx, 4);
+	/* Below the caller's frame (and any red zone), 16-aligned after the
+	 * stack arguments, so RSP + 8 is 16-aligned at the callee's entry. */
+	uint64_t sp = (rsp0 - 256) & ~15ull;
+	unsigned n = c->nstack + (c->win64 ? 4 : 0);
+	if (n & 1)
+		sp -= 8;
+	sp -= 8 * (uint64_t)n;
+	for (unsigned i = 0; i < c->nstack; i++)
+		GEXP_MEM64(sp + 8 * ((c->win64 ? 4 : 0) + i)) = c->stack[i];
+	if (__builtin_expect(!code_page, 0))
+		code_page = gexp_host_code_page();
+	uint64_t ra = code_page + 0x100 + ((uint64_t)(uint32_t)depth % 0xe00);
+	sp -= 8;
+	GEXP_MEM64(sp) = ra;
+	if (c->win64) {
+		for (unsigned i = 0; i < c->nireg && i < 4; i++)
+			GEXP_X(ctx, win[i]) = c->ireg[i];
+	} else {
+		for (unsigned i = 0; i < c->nireg && i < 6; i++)
+			GEXP_X(ctx, sysv[i]) = c->ireg[i];
+		GEXP_X(ctx, 0) = c->nxmm;
+	}
+	for (unsigned i = 0; i < c->nxmm && i < 8; i++)
+		*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16 * i) = c->xmm[i];
+	GEXP_X(ctx, 4) = sp;
+	/* Run the guest until it returns to `ra`. A function body returns 1 when
+	 * its return went to the address its caller predicted; otherwise 0, with
+	 * PC where the guest continues (a longjmp inside the callee, a signal, a
+	 * resume), and the loop goes on from there as gex's own dispatch would. */
+	uint64_t pc = fn;
+	for (;;) {
+		GEXP_X(ctx, GEXP_LAST_TARGET) = pc;
+		gexp_body_t f = (gexp_body_t)(uintptr_t)ftab_idx(pc);
+		if (f(ctx, depth + 1, 0, ra))
+			break;
+		pc = GEXP_X(ctx, GEXP_PC);
+		if (pc == ra)
+			break;
+	}
+	/* Back from the callee: it popped the return address. Everything the
+	 * provider was entered with is the caller's to see again. */
+	gexp_ctx = ctx;
+	gexp_depth = depth;
+	__gex_set_ctx((uint32_t)ctx);
+	GEXP_X(ctx, 4) = rsp0;
+	c->rax = GEXP_X(ctx, 0);
+	c->rdx = GEXP_X(ctx, 2);
+	c->xmm0 = *(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V);
+	c->xmm1 = *(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16);
+}
+
+/* ---- raising through guest frames ---- */
+
+#define GEXP_RAISE_CODE 0x52414953 /* "RAIS" */
+
+typedef struct catching {
+	struct catching *prev;
+	uint64_t fn;
+	gexp_call *c;
+	uint64_t payload;
+	int ctx;
+	int32_t depth;
+	uint64_t saved[16]; /* the guest's general registers */
+} catching;
+
+static __thread catching *catch_top;
+
+static void catch_body(void *arg)
+{
+	catching *k = arg;
+	gexp_call_guest(k->fn, k->c);
+}
+
+int gexp_catching(void)
+{
+	return catch_top != 0;
+}
+
+uint64_t gexp_call_guest_catching(uint64_t fn, gexp_call *c)
+{
+	catching k = { catch_top, fn, c, 0, gexp_ctx, gexp_depth };
+	for (int i = 0; i < 16; i++)
+		k.saved[i] = GEXP_X(k.ctx, i);
+	catch_top = &k;
+	int code = gexp_host_try(catch_body, &k);
+	catch_top = k.prev;
+	if (!code)
+		return 0;
+	/* Unwound: the guest's registers as they were before the call (its
+	 * callee-saved ones were mid-function), this thread's state again. */
+	for (int i = 0; i < 16; i++)
+		GEXP_X(k.ctx, i) = k.saved[i];
+	gexp_ctx = k.ctx;
+	gexp_depth = k.depth;
+	__gex_set_ctx((uint32_t)k.ctx);
+	if (code != GEXP_RAISE_CODE)
+		gexp_host_throw(code); /* someone else's: keep going */
+	return k.payload ? k.payload : 1;
+}
+
+_Noreturn void gexp_raise(uint64_t payload)
+{
+	catch_top->payload = payload;
+	gexp_host_throw(GEXP_RAISE_CODE);
+}
+
+/* ---- what a function pointer is ---- */
+
+uint64_t gexp_table_base(void);
+__attribute__((import_module("gex"), import_name("provider_table_size"))) uint64_t gexp_host_table_size(uint64_t base);
+
+static uint64_t tbase, tsize;
+
+int gexp_is_guest_fn(uint64_t p)
+{
+	if (__builtin_expect(!tsize, 0)) {
+		tbase = gexp_table_base();
+		tsize = gexp_host_table_size(tbase);
+		if (!tsize)
+			__builtin_trap();
+	}
+	return p - tbase >= tsize;
+}

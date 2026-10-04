@@ -16,8 +16,11 @@ cc -O1 -shared -fPIC -o "$W/libgt.so" "$HERE/libgt.c"
 cc -O1 -pthread -o "$W/main" "$HERE/main.c" -ldl
 clang $WASM64_CFLAGS -nostdinc -isystem "$SR/include" -isystem "$(clang -print-resource-dir)/include" \
 	-I"$HERE/../../../tools/unity-dotnet/provider" -c "$HERE/gt.c" -o "$W/gt.o"
+P=$HERE/../../../tools/unity-dotnet/provider
+clang $WASM64_CFLAGS -nostdinc -isystem "$SR/include" -isystem "$(clang -print-resource-dir)/include" -I"$P" -c "$P/gexprov64.c" -o "$W/gexprov64.o"
+clang $WASM64_CFLAGS -Wno-unused-command-line-argument -c "$P/gexprov64-table.s" -o "$W/gexprov64-table.o"
 wasm-ld -mwasm64 --experimental-pic -pie --no-entry --shared-memory --import-memory --max-memory=17179869184 \
-	-o "$W/gt.wasm" "$W/gt.o" -L"$SR/lib" -lc "$SR/lib/libclang_rt.builtins-wasm64.a"
+	-o "$W/gt.wasm" "$W/gt.o" "$W/gexprov64.o" "$W/gexprov64-table.o" -L"$SR/lib" -lc "$SR/lib/libclang_rt.builtins-wasm64.a"
 
 cd "$W"
 # Thread lines come in any order; the implementation line must differ.

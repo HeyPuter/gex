@@ -1623,6 +1623,10 @@ fn run_thread_loop(
                     && store.data().nt.is_none()
                 {
                     let action = store.data_mut().with_kernel(|k| k.signals.action(signal::SIGSEGV as u32));
+                    // GEX_TRACE_SEGV=1: where (with GEX_WASM_BACKTRACE=1, the wasm frames).
+                    if std::env::var_os("GEX_TRACE_SEGV").is_some() {
+                        eprintln!("gex: guest memory access out of bounds: {e:?}");
+                    }
                     if action.handler == 0 {
                         return Ok(Stopped::Exited(Exit::Signal {
                             signal: signal::SIGSEGV,

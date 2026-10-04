@@ -319,3 +319,4 @@ void *mono_value_box (void) { stub ("mono_value_box"); return 0; }
 void *mono_verifier_set_mode (void) { stub ("mono_verifier_set_mode"); return 0; }
 void *mono_string_new (void) { stub ("mono_string_new"); return 0; }
 void *mono_object_to_string (void) { stub ("mono_object_to_string"); return 0; }
+void *mono_get_exception_argument (void) { stub ("mono_get_exception_argument"); return 0; }
