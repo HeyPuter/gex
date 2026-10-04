@@ -204,19 +204,23 @@ nothing at all after the first run, which records the image when it runs out
 of address space.
 
 - **Muck** (natively): guest GL for x86-64 (`GEX_CC=gcc guest/gl/build.sh
-  DIR`) and an X display. gex has no host unix-socket passthrough natively,
-  so the guest reaches a private Xvfb over TCP through a loopback-only bridge
-  (an Xvfb listening on TCP itself would be open to the network):
+  DIR`) and an X display: Xwayland run *inside the guest*, a client of gex's
+  own compositor (no Xvfb, no host socket bridge). A small script started
+  under gexc runs `Xwayland :N -geometry 800x600 -shm -ac -nolisten tcp`
+  with no `LD_LIBRARY_PATH` (gex-gl's libGL is not Xwayland's), waits for
+  `/tmp/.X11-unix/XN`, then `DISPLAY=:N exec`s the game (`-ac`: the socket
+  exists only in the guest's namespace):
 
   ```
-  Xvfb :71 -screen 0 1280x720x24 &
-  socat TCP-LISTEN:6071,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/tmp/.X11-unix/X71 &
   GEX_FJIT_CACHE=1 gexc run --fjit --mem64 --gl --wayland $XDG_RUNTIME_DIR/x \
-    --wayland-out DIR --env LD_LIBRARY_PATH=GLDIR --env DISPLAY=localhost:71 \
+    --wayland-size 800x600 --wayland-out DIR --env LD_LIBRARY_PATH=GLDIR \
     --env HOME=... --env MONO_DEBUG=explicit-null-checks \
-    ./Muck.x86_64 -logFile LOG -screen-width 800 -screen-height 600 -screen-fullscreen 0
+    /bin/sh inguest.sh 71 XWLOG ./Muck.x86_64 -logFile LOG \
+    -screen-width 800 -screen-height 600 -screen-fullscreen 0
   ```
 
+  Xwayland's lock and socket node land in the host's /tmp; remove only your
+  display's afterwards. (A copy of the script: work/unity-resume/inguest.sh.)
   Unity 2019.4's SDL is X11-only (GLX through gex-gl's libGL). Its window's
   frames are presented by gex-gl on the host GPU and written to DIR
   (`GEX_PPM_EVERY=N`, `GEX_FPS=1`).
@@ -252,14 +256,15 @@ of address space.
   game is a Steam lobby; there is no offline mode), so Muck's gameplay needs
   an x86-64 gex-steam with lobby and loopback P2P. Hollow Knight stops on its
   title screen natively without Steam; Rain World gets through EOS errors.
-- **Status (2026-10-03):** Muck under `--fjit --mem64` draws its first
-  frame (the menu's background) and then hung at the next GC; the cause (a
-  sigsuspend mask leaking between threads) is fixed, the rerun to the menu
-  UI is next. See docs/mem64.md section 10.
+- **Status (2026-10-04):** the GC hang is fixed (per-thread sigsuspend
+  mask); Muck under `--fjit --mem64` reaches its first frame and then stops
+  on a tier-1 M64 translation wasmtime rejects (i32 where an i64 address is
+  expected). See docs/mem64.md section 10.
 - Knobs: `GEX_FPS=1` (presents per second), `GEX_PPM_EVERY=N`,
   `--wayland-out null`, `GEX_STRACE_STACK=N` (stack words at each syscall
   under `--strace`), `GEX_NT_TRACE` (logs each NtAllocateVirtualMemory
-  request), `GEX_FJIT_CACHE=1`.
+  request), `GEX_FJIT_CACHE=1`, `GEX_DUMP_BAD_WASM=DIR` (keep a translation the
+  engine rejects as DIR/PC.wasm).
 
 ### Address space: why none fits in wasm32
 

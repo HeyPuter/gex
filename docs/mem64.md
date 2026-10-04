@@ -320,23 +320,49 @@ browser shim; the coordinator sequences them.
 - **Not yet:** the browser (step 6), the live switch (step 7), executable
   pages above 4 GiB.
 
-### State at 2026-10-03 (paused for a reboot)
+### State at 2026-10-04 (paused for a second reboot)
 
-- Step 3 (Muck to the menu under `--fjit --mem64`) is **not done**. Muck
-  reaches its first frame (the menu's background scene) in about 6.7 min
-  with a warm `GEX_FJIT_CACHE`, then stalled at the next Mono GC: the GC
-  thread `tgkill`s SIGPWR to the main thread, which had SIGPWR blocked.
-- Cause, found and fixed (uncommitted until this commit): `restore_sigmask`
-  (and `retry_accept`, `retry_recvmsg`, `write_blocked`) lived in the shared
-  kernel, so thread 3's `rt_sigsuspend` (inside Mono's suspend handler)
-  handed its mask to the main thread when the main thread's futex wait
-  finished. They are now per thread (`PendingCall`, swapped with the signal
-  state in `switch_signals`). Test: `tests/x86-programs/sigsuspend-thread.c`
-  (passes; not yet confirmed to fail on the old kernel). Also: `sa_mask` no
-  longer keeps SIGKILL/SIGSTOP.
-- **Next:** rerun Muck (`$S/muck.sh TAG 3000 --fjit --mem64` with
-  `GEX_FJIT_CACHE=1`, `$S/watch.sh TAG`; S is the stream-U scratch dir under
-  /tmp/claude-1000/.../scratchpad/unity, X through `Xvfb :71` plus a socat
-  bridge on 127.0.0.1:6071, both killed for the reboot and to be replaced by
-  native Xwayland) and check the menu UI and fps; then the step-3 report,
-  the halflife.sh Xwayland conversion, and step 6 (browser).
+- **The sigsuspend fix is verified:** `tests/x86-programs/sigsuspend-thread.c`
+  fails on the kernel before bdbe0ea8 (tier-1, `--fjit`, `--fjit --mem64`:
+  "took the suspender's") and passes after. Muck now gets past the GC that
+  hung: the player log reaches "Desktop is 800 x 600 @ 60 Hz" after
+  "Completed reload, in 362 s" (about 15 min wall clock to the first frame,
+  warm cache, with Xwayland and sh also running M64).
+- **X without Xvfb:** Xwayland runs *inside the guest* on gex's compositor
+  (`inguest.sh` below: `sh` starts `Xwayland :71 -geometry 800x600 -shm -ac
+  -nolisten tcp` without `LD_LIBRARY_PATH`, waits for its socket, then execs
+  Muck with `DISPLAY=:71`). Getting there needed three fixes, all committed:
+  the fjit forgot nothing on `execve` (Xwayland exec'd from sh read its data
+  as sh's read-only data: "initializing atoms"); `access(2)` ignored its
+  mode (Xwayland chose root's /var/lib/xkb for xkbcomp output); native
+  `execve` put ld.so at PIE_BASE+0x1000_0000 instead of INTERP_BASE, so under
+  M64 glibc's reservation for UnityPlayer.so went above 4 GiB. Xwayland's
+  lock and socket node are host files (/tmp/.X71-lock,
+  /tmp/.X11-unix/X71); the script removes only its own.
+- **The new blocker:** right after the first frame, tier-1 (block
+  translation, not fjit) emits a module wasmtime rejects under M64: "type
+  mismatch: expected i64, found i32" (runs x3 at 0x6b379799 and x4 at
+  0x6b3792c9, same function region). The module is saved:
+  `work/unity-resume/6b3792c9.wasm` (from `GEX_DUMP_BAD_WASM=DIR`, added
+  for this). It is an M64 address that tier-1's emitter leaves i32 on some
+  path the corpus does not cover. No fps number yet: no frame after the
+  first.
+- **Resume:** the scripts, gex-gl x86-64 build and the warm fjit cache
+  (6.4 GB) are copied to `/home/velzie/src/noita-wasm/work/unity-resume/`
+  (`muck.sh`, `inguest.sh`, `gl64/`, `xdg/`; the scratch originals are under
+  /tmp/claude-1000/.../scratchpad/unity, paths inside the scripts point
+  there). Steps:
+  1. `wasm-tools print` / `validate` the saved module (cargo install
+     wasm-tools if missing), find the instruction at offset ~1156 and the
+     gex-emit M64 address helper that misses it; add the guest instruction
+     to the M64 corpus; rebuild.
+  2. Rerun `GEX_FJIT_CACHE=1 GEX_DUMP_BAD_WASM=DIR muck.sh TAG 3000 --fjit
+     --mem64` (cores 1,7) to the menu UI; screenshot to
+     work/games/screens/, fps (`GEX_FPS=1`).
+  3. Then halflife.sh's native mode to the in-guest Xwayland, generally
+     (better as a `gexc run` option that starts Xwayland as a guest process
+     than as a wrapper script, so the program stays the run's image for the
+     learned-M64 record and units); then step 6 (browser) and the live
+     switch; then Rain World and Hollow Knight (F has pinned the D3D DLLs in
+     the gex-layout prefix, sha256 63b13c67..., with units in F's
+     cgcache-cg12).
