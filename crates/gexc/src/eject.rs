@@ -224,8 +224,9 @@ fn build(dir: &std::path::Path) -> Result<()> {
         if !pe.web_units.is_empty() {
             let count = |h: &str| pe.web_units.iter().filter(|(_, x)| *x == h).count();
             eprintln!(
-                "  web build: {} units in build/web/cgen ({} present, {} reused, {} built), {} region entries; ./run.mjs",
+                "  web build: {} units ({}; {} present, {} reused, {} built), {} region entries; ./run.mjs",
                 pe.web_units.len(),
+                if std::env::var("GEX_EJECT_WEB_GUARDED").as_deref() == Ok("1") { "guarded, build/web/cgen" } else { "unguarded: the native units, build/units" },
                 count("present"),
                 count("reused"),
                 count("built"),
