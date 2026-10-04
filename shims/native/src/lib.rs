@@ -202,6 +202,8 @@ struct HostState {
     /// loops entered from code that has none (a function-tier unit or a
     /// function JIT module) when no runtime-translated module exists yet.
     root_enter: Option<wasmtime::Func>,
+    /// This store's NT thread, once a syscall has looked it up.
+    nt_thread: Option<Arc<gex_kernel::nt::Thread>>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
     /// Exceptions being dispatched nested (`nt::raise_nested`), innermost
@@ -881,6 +883,7 @@ fn run_program_with(
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -1709,6 +1712,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -1861,6 +1865,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,

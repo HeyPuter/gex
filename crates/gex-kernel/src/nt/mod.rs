@@ -890,10 +890,26 @@ pub fn syscall(
     pc: u64,
     host: &mut dyn NtHost,
 ) -> Outcome {
+    let t = p.thread_by_ctx(ctx_addr);
+    syscall_on(p, t, kernel, data, ctx_addr, pc, host)
+}
+
+/// [`syscall`] for a caller that already holds the thread (`thread_by_ctx`
+/// takes the process's thread table lock, which every thread's every
+/// syscall then shares).
+pub fn syscall_on(
+    p: &Arc<Process>,
+    t: Option<Arc<Thread>>,
+    kernel: &dyn KernelCell,
+    data: &mut [u8],
+    ctx_addr: u64,
+    pc: u64,
+    host: &mut dyn NtHost,
+) -> Outcome {
     let abi = p.abi;
     let g = G::new(data, abi);
     let nr = g.u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) as u32;
-    let Some(t) = p.thread_by_ctx(ctx_addr) else {
+    let Some(t) = t else {
         crate::nt_log!("gex-nt: syscall {nr:#x} from a thread the NT layer does not know (ctx {ctx_addr:#x})");
         return Outcome::Exit(st::INVALID_CID);
     };

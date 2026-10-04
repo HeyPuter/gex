@@ -483,9 +483,18 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     // nested exception dispatch needs to come back here.
     let next_pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     let raise_sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize);
+    // The thread, once per store: its context address never changes.
+    let t = match caller.data().nt_thread.as_ref().filter(|t| t.ctx_addr == ctx_addr) {
+        Some(t) => Some(Arc::clone(t)),
+        None => {
+            let t = p.thread_by_ctx(ctx_addr);
+            caller.data_mut().nt_thread = t.clone();
+            t
+        }
+    };
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
-        nt::syscall(&p, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
+        nt::syscall_on(&p, t, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
     };
     // A callback inside that syscall may have ended the process or failed.
     if caller.data().exit.is_some() {
