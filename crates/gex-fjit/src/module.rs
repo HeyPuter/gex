@@ -368,6 +368,7 @@ pub fn build_runtime(
     sums: &HashMap<u64, Summary>,
     class32: bool,
     pages: &HashMap<u64, Vec<(u64, u32)>>,
+    guards: &crate::Guards,
     ret_pops: &HashMap<u64, u64>,
     stats: &mut Stats,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
@@ -426,7 +427,7 @@ pub fn build_runtime(
             trapfree: &trapfree,
             ret_sp_delta: cf::ret_sp_delta(class32),
             ret_pops,
-            linkage: crate::emit::Linkage::Runtime { table: 0, pages },
+            linkage: crate::emit::Linkage::Runtime { table: 0, pages, guards },
             body_ty,
         };
         let mut emitted: Vec<(u64, Emitted)> = Vec::new();

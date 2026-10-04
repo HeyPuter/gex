@@ -56,7 +56,7 @@ pub enum Linkage<'a> {
     /// anything outside the module is a probe of the cache and a call
     /// through table `table`; a function checks, on entry, that each page
     /// it covers still holds the `PAGE_GEN` value in `pages` (by entry).
-    Runtime { table: u32, pages: &'a HashMap<u64, Vec<(u64, u32)>> },
+    Runtime { table: u32, pages: &'a HashMap<u64, Vec<(u64, u32)>>, guards: &'a crate::Guards },
 }
 
 /// What a function's exits did, for `GEX_FJIT_STATS`.
@@ -206,7 +206,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     // Its pages unchanged since translation, or the table's newer function
     // for this address (merge-plan §9.8.1; `gex.lookup` retires this one and
     // finds or makes it), before anything else.
-    if let Linkage::Runtime { table, pages } = &m.linkage {
+    if let Linkage::Runtime { table, pages, guards } = &m.linkage {
         let none: &[(u64, u32)] = &[];
         let pages = if cf::exp("NOPAGECHECK") { none } else { pages.get(&f.entry).map(|v| v.as_slice()).unwrap_or(none) };
         for &(page, gen) in pages {
@@ -227,6 +227,61 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
             // Straight to `resolve`, not through the probe cache: when only
             // a later page changed, the entry's cache line still names this
             // function, and probing would come back here forever.
+            fb.i32_const(gex_abi::ftab::RESOLVE as i32);
+            fb.ftab_index();
+            fb.return_call_indirect(m.body_ty, *table);
+            fb.end();
+        }
+        // Code in writable and executable memory: its bytes unchanged
+        // (`crate::Guards`).
+        if let Some(ranges) = guards.get(&f.entry).filter(|r| !r.is_empty()) {
+            let acc = b.local(ValType::I64);
+            let fb = b.f();
+            fb.i64_const(0);
+            fb.local_set(acc);
+            for (start, bytes) in ranges {
+                for (i, chunk) in bytes.chunks(8).enumerate() {
+                    let mut buf = [0u8; 8];
+                    buf[..chunk.len()].copy_from_slice(chunk);
+                    let want = u64::from_le_bytes(buf);
+                    fb.addr_const(start + 8 * i as u64);
+                    fb.load(0x29, 0, 0); // i64.load, unaligned
+                    if chunk.len() < 8 {
+                        fb.i64_const(((1u64 << (8 * chunk.len())) - 1) as i64);
+                        fb.byte(0x83); // i64.and
+                    }
+                    fb.i64_const(want as i64);
+                    fb.byte(0x85); // i64.xor
+                    fb.local_get(acc);
+                    fb.byte(0x84); // i64.or
+                    fb.local_set(acc);
+                }
+            }
+            fb.local_get(acc);
+            fb.byte(0x50); // i64.eqz
+            fb.byte(0x45); // i32.eqz: changed?
+            fb.if_void();
+            let mut pages: Vec<u64> = ranges
+                .iter()
+                .flat_map(|(s, b)| (s / gex_abi::DISPATCH_PAGE)..=((s + b.len().max(1) as u64 - 1) / gex_abi::DISPATCH_PAGE))
+                .collect();
+            pages.sort_unstable();
+            pages.dedup();
+            for p in pages {
+                fb.local_get(0);
+                fb.i64_const(f.entry as i64);
+                fb.i32_const(gex_abi::cache_op::IC_INVALIDATE);
+                fb.i64_const((p * gex_abi::DISPATCH_PAGE) as i64);
+                fb.call(m.cx.cache_op);
+            }
+            fb.local_get(0);
+            fb.addr_i32();
+            fb.i64_const(f.entry as i64);
+            fb.store(0x37, 3, ctx::LAST_TARGET as u32);
+            fb.local_get(0);
+            fb.local_get(1);
+            fb.local_get(2);
+            fb.local_get(3);
             fb.i32_const(gex_abi::ftab::RESOLVE as i32);
             fb.ftab_index();
             fb.return_call_indirect(m.body_ty, *table);
