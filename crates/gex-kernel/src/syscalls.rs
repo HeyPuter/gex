@@ -4653,6 +4653,7 @@ impl Kernel {
             // An executable file mapping is a shared library arriving: tell the
             // host so the static recompiler gets the whole object at once.
             if prot_bits & crate::mem::prot::EXEC != 0 {
+                crate::note_code_change();
                 self.new_code.push(CodeMap {
                     start,
                     end: start + len_aligned,
@@ -5101,6 +5102,7 @@ impl Kernel {
             .any(|v| v.prot & crate::mem::prot::EXEC != 0 && v.start < end && v.end > start);
         if executable {
             self.retired_code.push((start, end));
+            crate::note_code_change();
         }
     }
 

@@ -426,6 +426,7 @@ pub fn map_image(
     g.write(base, &bytes)?;
     if stl.vm.mirror(&mut k.mem, base, base + size) {
         k.retired_code.push((base, base + size));
+        crate::note_code_change();
     }
     let status = if img.machine != native_machine(p.abi) {
         st::IMAGE_MACHINE_TYPE_MISMATCH

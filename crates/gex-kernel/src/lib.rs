@@ -306,3 +306,12 @@ mod tests {
         assert!(b[..0x800].iter().chain(&b[0x1800..]).all(|&x| x == 7));
     }
 }
+
+/// Bumped (after the push, under the kernel lock) whenever code is mapped or
+/// retired (`Kernel::new_code`, `Kernel::retired_code`): a host checks this
+/// before taking the kernel lock to drain them, on every syscall.
+pub static CODE_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_code_change() {
+    CODE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Release);
+}

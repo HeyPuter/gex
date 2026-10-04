@@ -371,6 +371,12 @@ struct Jit {
     ftab: Option<ftab::Store>,
 }
 
+/// How long `JitShared::registry` is (stored after every push, under its
+/// lock): `catch_up_in_caller`'s check without the lock. A hint only: one
+/// process's in a forked child may be longer than the child's registry,
+/// which costs that check its lock, as before.
+static REGISTRY_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// One runtime-translated module, kept so another thread's store can
 /// instantiate it rather than translating the same code again.
 struct CompiledUnit {
@@ -3655,6 +3661,9 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
 /// catches up by walking forward from its own watermark.
 fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
     let behind = match caller.data().jit.as_ref() {
+        // Nothing published past this store's watermark: no lock (every
+        // syscall and safepoint comes through here).
+        Some(jit) if REGISTRY_LEN.load(std::sync::atomic::Ordering::Acquire) <= jit.replayed => false,
         Some(jit) => {
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.registry.len() > jit.replayed
@@ -3763,6 +3772,7 @@ fn publish_unit(
         }
     }
     sh.registry.push(Arc::clone(&unit));
+    crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
     sh.blocks += blocks;
     sh.calls += 1;
     Ok(unit)

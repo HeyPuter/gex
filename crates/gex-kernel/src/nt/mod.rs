@@ -449,7 +449,9 @@ pub struct Process {
 #[derive(Default)]
 pub struct Threads {
     pub by_tid: HashMap<u32, Arc<Thread>>,
-    pub by_ctx: HashMap<u64, Arc<Thread>>,
+    /// By context address. A B-tree: every syscall looks its thread up here,
+    /// and for a few dozen threads that beats hashing the key.
+    pub by_ctx: std::collections::BTreeMap<u64, Arc<Thread>>,
 }
 
 pub struct State {

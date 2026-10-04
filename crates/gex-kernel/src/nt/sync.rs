@@ -454,7 +454,7 @@ pub fn nt_delay_execution(c: &mut Call<'_>) -> R {
     let d = deadline(c, tp)?;
     let now = (c.p.clocks.mono_ns)();
     if d.is_some_and(|d| d <= now) {
-        std::thread::yield_now();
+        guest_yield();
         return Ok(st::SUCCESS);
     }
     let t = Arc::clone(&c.t);
@@ -479,8 +479,21 @@ pub fn nt_delay_execution(c: &mut Call<'_>) -> R {
 
 /// `NtYieldExecution()`.
 pub fn nt_yield_execution(_c: &mut Call<'_>) -> R {
-    std::thread::yield_now();
+    guest_yield();
     Ok(st::SUCCESS)
+}
+
+/// The guest's own yield (`SwitchToThread`, `Sleep(0)`): a host
+/// `sched_yield`, or with `GEX_NT_YIELD=spin` nothing but a pause, as in
+/// pewasm, whose `sched_yield` under emscripten yields to no one (it runs
+/// the event queue): a thread waiting in such a loop keeps its core.
+fn guest_yield() {
+    static SPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SPIN.get_or_init(|| std::env::var("GEX_NT_YIELD").as_deref() == Ok("spin")) {
+        std::hint::spin_loop();
+    } else {
+        std::thread::yield_now();
+    }
 }
 
 // ---------------------------------------------------------------------------
