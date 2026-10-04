@@ -283,13 +283,6 @@ pub fn unit_dir(pe: &gex_ld::pe::PeImage, base: u64) -> Result<std::path::PathBu
     Ok(cache_root()?.join(unit_key(&image, &pv)))
 }
 
-/// Build (or find) the NT trampoline page's unit for the given ABI, as boot
-/// installs it.
-pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::PathBuf> {
-    let (image, seeds) = trampoline_input(class32);
-    prepare_image(&image, &seeds, jobs, false)
-}
-
 /// Build every export provider for a PE image (`gex_cgen::provider`) into the
 /// unit cache, as mapping it would; their names.
 pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
@@ -560,6 +553,13 @@ fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) 
         fdes: Vec::new(),
     };
     (image, seeds)
+}
+
+/// The NT trampoline page's unit, built into the cache (`gexc cgen-image
+/// --nt-trampolines`): for a host that cannot build it at boot, the browser.
+pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::PathBuf> {
+    let (image, seeds) = trampoline_input(class32);
+    prepare_image(&image, &seeds, jobs, true)
 }
 
 static TRAMPOLINES_DONE: OnceLock<()> = OnceLock::new();

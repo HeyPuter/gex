@@ -90,11 +90,22 @@ mod stub {
         format!("{addr:#x}")
     }
 
+    pub(crate) fn exc_escape(_ctx: i32, _target: u64) -> bool {
+        false
+    }
+
     /// The glue's nested callback loop asks this; with no Windows process
     /// that loop never runs, but the export has to exist for the glue check.
     #[no_mangle]
     pub extern "C" fn gex_nt_callback_done(_ctx: i32) -> i32 {
         0
+    }
+
+    /// No nested exception dispatch without a Windows process: never an
+    /// escape. The glue calls it, so the export has to exist.
+    #[no_mangle]
+    pub extern "C" fn gex_exc_escaped(_clear: i32) -> i32 {
+        -1
     }
 }
 
@@ -116,9 +127,15 @@ mod imp {
         /// until its `NtCallbackReturn` (docs/nt-layer.md §5). One when the
         /// callback returned, zero when the run failed or the process ended.
         fn nt_callback(ctx: i32, pc: i64) -> i32;
+        /// Dispatch an exception nested (`raise_nested`): run the guest
+        /// from `target` (KiUserExceptionDispatcher) in a loop on this
+        /// Worker until control goes back above the raise (`exc_escape`
+        /// for depth `level`): 1, or 0 when it could not.
+        fn exc_dispatch(ctx: i32, target: i64, level: i32) -> i32;
         /// Monotonic nanoseconds (`performance.now()`): the page's `now` is
-        /// `Date.now()`, a millisecond clock that can step.
-        fn mono_ns() -> i64;
+        /// `Date.now()`, a millisecond clock that can step. An f64 (exact
+        /// for 104 days): an i64 is a BigInt in JS, per call.
+        fn mono_ns() -> f64;
         /// The compositor's scene for this process (see `crate::wl`).
         fn wl_publish(ptr: u32, count: u32);
         /// This process's compositor input ring (see `crate::wl`).
@@ -188,6 +205,12 @@ mod imp {
     static TIME_SCALE: AtomicU64 = AtomicU64::new(0);
     static MONO_START: AtomicU64 = AtomicU64::new(0);
 
+    /// `performance.now()` in nanoseconds, unscaled: for timing the host
+    /// (the glue's `now` is a BigInt, and only milliseconds in a Worker).
+    fn mono_raw() -> u64 {
+        unsafe { mono_ns() as u64 }
+    }
+
     fn mono() -> u64 {
         let now = unsafe { mono_ns() } as u64;
         let start = match MONO_START.load(Ordering::Relaxed) {
@@ -206,8 +229,25 @@ mod imp {
         }
     }
 
+    /// `GEX_NT_FIXED_TIME=<unix seconds>`, as natively (54cb7124): the
+    /// guest's wall clock starts there and advances with real time, so a
+    /// program seeding from the date (Noita's world) sees the same value
+    /// every run. 0 for the page's own clock.
+    static FIXED_TIME: AtomicU64 = AtomicU64::new(0);
+    static FIXED_ORIGIN: AtomicU64 = AtomicU64::new(0);
+
+    fn wall() -> (u64, u32) {
+        let fixed = FIXED_TIME.load(Ordering::Relaxed);
+        if fixed == 0 {
+            return crate::browser_clock();
+        }
+        let now = unsafe { mono_ns() } as u64;
+        let ns = fixed * 1_000_000_000 + now.saturating_sub(FIXED_ORIGIN.load(Ordering::Relaxed));
+        (ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+    }
+
     fn clocks() -> nt::Clocks {
-        nt::Clocks { mono_ns: mono, wall: crate::browser_clock }
+        nt::Clocks { mono_ns: mono, wall }
     }
 
     fn log(s: &str) {
@@ -297,6 +337,20 @@ mod imp {
         }
         if let Some(s) = var("GEX_NT_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
             TIME_SCALE.store(s.to_bits(), Ordering::Relaxed);
+        }
+        if var("GEX_NT_EXC_TRACE").is_some() {
+            crate::gex_set_exc_trace(1);
+        }
+        if var("GEX_NT_EXC_NEST").as_deref() == Some("0") {
+            NO_EXC_NEST.store(true, Ordering::Relaxed);
+        }
+        if let Some(t) = var("GEX_NT_FIXED_TIME").and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0) {
+            FIXED_ORIGIN.store(unsafe { mono_ns() } as u64, Ordering::Relaxed);
+            FIXED_TIME.store(t, Ordering::Relaxed);
+        }
+        // An ejected project's stateful providers (docs/eject-pe.md §5.1).
+        if let Some(v) = var("GEX_NT_STATEFUL") {
+            crate::cgen::set_stateful(&v);
         }
         let prefix = var("GEX_WINE_PREFIX").unwrap_or_else(|| "/wine".into());
         let mut wenv = nt::boot::default_environment();
@@ -527,6 +581,21 @@ mod imp {
         let presents = p.presents.load(Ordering::Relaxed);
         if t / 1000 % 10 == 0 {
             report_times();
+            report_syscalls();
+            // What every Worker's tables hold: `blocks` (dense) and the
+            // slots each dispatch table is numbered to.
+            let slots: Vec<String> = (0..gex_abi::DISPATCH_TABLES as u32).map(|k| crate::gex_claimed_slots(k).to_string()).collect();
+            let (callouts, left) = crate::cgen::callouts();
+            warn_line(&format!(
+                "gex-nt: tables blocks={} slots={} dense={} callouts={callouts} callouts_left={left} in_place={} exc_nested={} exc_escaped={} fjit={:?}\n",
+                crate::dense::gex_dense_size(),
+                slots.join("/"),
+                crate::dense::on() as u8,
+                crate::IN_PLACE_N.load(Ordering::Relaxed),
+                EXC_NESTED.load(Ordering::Relaxed),
+                EXC_ESCAPED.load(Ordering::Relaxed),
+                crate::fjit::counts()
+            ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
             }
@@ -566,6 +635,131 @@ mod imp {
         }
     }
 
+    /// Exceptions dispatched nested and escaped back (the stats line).
+    pub(crate) static EXC_NESTED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXC_ESCAPED: AtomicU64 = AtomicU64::new(0);
+
+    /// How deep exceptions nest before raising traps out as before.
+    const EXC_MAX_DEPTH: usize = 8;
+
+    thread_local! {
+        /// This Worker's nested exception dispatches: the stack each was
+        /// raised on, and the NT callbacks in progress then.
+        static EXC: std::cell::RefCell<Vec<(u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// The dispatch whose escape was found (`exc_escape`), or -1.
+        static ESCAPE: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+    }
+
+    /// Whether an exception the syscall returning to `next_pc` raises is
+    /// dispatched nested, as natively: with function bodies about (units on),
+    /// when the syscall returns through a `ret`. `GEX_NT_EXC_NEST=0` (a page
+    /// setting) turns it off.
+    fn nest_exceptions(next_pc: u64) -> bool {
+        if !crate::cgen::on() || NO_EXC_NEST.load(Ordering::Relaxed) {
+            return false;
+        }
+        matches!(guest_bytes().get(next_pc as usize), Some(0xc3) | Some(0xc2))
+    }
+
+    static NO_EXC_NEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Has control left the innermost nested exception dispatch on this
+    /// Worker for `target`? It has when the stack is above the raise (a
+    /// handler's longjmp, a catch continuation, an NtContinue) and no NT
+    /// callback begun inside the dispatch is still in progress. Then
+    /// `ctx::PC` = `target` and the caller traps: the dispatch's loop ends.
+    /// Called where the context is complete: the fallback, a dispatch miss,
+    /// a safepoint, a syscall's resume.
+    pub(crate) fn exc_escape(ctx: i32, target: u64) -> bool {
+        let Some((raise_sp, cb, level)) = EXC.with(|e| e.borrow().last().map(|&(s, c)| (s, c, e.borrow().len() - 1))) else { return false };
+        if cb != crate::cgen::callback_depth() {
+            return false;
+        }
+        let c = ctx as u32 as u64;
+        let mut gm = GuestMem::new(guest_bytes());
+        let p32 = PROCESS.get().is_some_and(|p| p.abi == nt::Abi::P32);
+        let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+        let sp = if p32 { sp & 0xffff_ffff } else { sp };
+        if sp <= raise_sp {
+            return false;
+        }
+        let _ = gm.write_u64(c + ctx::PC as u64, target);
+        ESCAPE.with(|e| e.set(level as i32));
+        true
+    }
+
+    /// The nested dispatch an escape was found for (its depth), or -1;
+    /// reading it clears it (`clear` = 0 only looks).
+    #[no_mangle]
+    pub extern "C" fn gex_exc_escaped(clear: i32) -> i32 {
+        ESCAPE.with(|e| if clear != 0 { e.replace(-1) } else { e.get() })
+    }
+
+    /// A nested dispatch at depth `level` (and deeper) was left by an
+    /// exception through JS's loop: its entries go.
+    #[no_mangle]
+    pub extern "C" fn gex_exc_unwind(level: u32) {
+        let gone = EXC.with(|e| {
+            let mut e = e.borrow_mut();
+            let n = e.len().saturating_sub(level as usize);
+            e.truncate(level as usize);
+            n
+        });
+        for _ in 0..gone {
+            crate::cgen::callback(false);
+        }
+    }
+
+    /// Dispatch an exception without unwinding the thread's wasm frames
+    /// (`NtRaiseException`, first chance), as natively (ffa2cec9): run
+    /// `KiUserExceptionDispatcher` (`target`) in a nested loop on top of them
+    /// until control goes back above the raise; then the syscall returns,
+    /// its `ret` taking the guest to where the dispatch ended (the return
+    /// address it pops is written just below the new stack). False when it
+    /// cannot (too deep, the loop failed): trap out as before.
+    fn raise_nested(p: &Arc<nt::Process>, ctx_addr: u64, target: u64, raise_sp: u64, next_pc: u64) -> bool {
+        let p32 = p.abi == nt::Abi::P32;
+        let mask = if p32 { 0xffff_ffff } else { !0u64 };
+        let level = EXC.with(|e| e.borrow().len());
+        if level >= EXC_MAX_DEPTH {
+            return false;
+        }
+        EXC_NESTED.fetch_add(1, Ordering::Relaxed);
+        // A barrier for call-outs, as a callback is: one begun outside cannot
+        // end inside (its caller's frame is below this loop's).
+        crate::cgen::callback(true);
+        let cb = crate::cgen::callback_depth();
+        EXC.with(|e| e.borrow_mut().push((raise_sp & mask, cb)));
+        // SAFETY: a host import taking scalars; nothing here holds a lock.
+        let r = unsafe { exc_dispatch(ctx_addr as u32 as i32, target as i64, level as i32) };
+        // JS's loop unwinds its level on the way out; again here, harmlessly,
+        // for a host that did not.
+        gex_exc_unwind(level as u32);
+        if r != 1 {
+            return false;
+        }
+        EXC_ESCAPED.fetch_add(1, Ordering::Relaxed);
+        let mut gm = GuestMem::new(guest_bytes());
+        let to_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+        let to_sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0) & mask;
+        let pops = match guest_bytes().get(next_pc as usize) {
+            Some(0xc2) => gm.read_u32(next_pc + 1).unwrap_or(0) as u64 & 0xffff,
+            _ => 0,
+        };
+        let psize = if p32 { 4 } else { 8 };
+        let sp = to_sp.wrapping_sub(psize + pops) & mask;
+        let wrote = if p32 { gm.write_u32(sp, to_pc as u32) } else { gm.write_u64(sp, to_pc) };
+        if wrote.is_err() {
+            // No stack there: resume the old way.
+            set_resume(to_pc);
+            set_resume_ctx(ctx_addr);
+            trap();
+        }
+        let _ = gm.write_u64(ctx_addr + ctx::SP as u64, sp);
+        let _ = gm.write_u64(ctx_addr + ctx::PC as u64, next_pc);
+        true
+    }
+
     /// Runs user-mode callbacks: the JS side's nested loop on this Worker.
     struct Nested {
         ctx_addr: u64,
@@ -576,7 +770,10 @@ mod imp {
             let pc = GuestMem::new(guest_bytes()).read_u64(self.ctx_addr + ctx::PC as u64).unwrap_or(0);
             // SAFETY: a host import taking scalars. Nothing here holds the
             // kernel: the NT layer lets go before it runs a callback.
-            match unsafe { nt_callback(self.ctx_addr as u32 as i32, pc as i64) } {
+            crate::cgen::callback(true);
+            let r = unsafe { nt_callback(self.ctx_addr as u32 as i32, pc as i64) };
+            crate::cgen::callback(false);
+            match r {
                 1 => Ok(()),
                 _ => Err(()),
             }
@@ -637,7 +834,20 @@ mod imp {
     /// nested callback loop) with the resume address set.
     pub(crate) fn syscall(p: &Arc<nt::Process>, ctx: i32, pc: i64) {
         let ctx_addr = ctx as u32 as u64;
-        tick();
+        // A clock read (`performance.now()`) costs about a microsecond in a
+        // Worker, as much as a cheap syscall: the clocks are brought up to
+        // date every 16th call and around waits, and the time split is
+        // sampled likewise (Noita's main thread makes ~10^5 NtYieldExecution
+        // a second).
+        let n = SYSCALL_N.with(|c| {
+            let n = c.get().wrapping_add(1);
+            c.set(n);
+            n
+        });
+        let sampled = n % SAMPLE == 0;
+        if sampled {
+            tick();
+        }
         if let Some((lo, bad, least)) = crate::stack_guard_check() {
             warn_line(&format!(
                 "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
@@ -652,8 +862,20 @@ mod imp {
         let r0 = gm.read_u32(sp0).unwrap_or(0) as u64;
         let r1 = gm.read_u32(sp0 + 4).unwrap_or(0) as u64;
         ring_note(ctx_addr, (nr as u64) << 32 | sp0, r0 << 32 | r1);
-        let (t_in, gl_in, glw_in) =
-            (crate::now_ns(), crate::gl::GL_NS.with(|g| g.get()), crate::gl::GL_WAIT_NS.with(|g| g.get()));
+        // Where the syscall returns to and the stack it was made on: what a
+        // nested exception dispatch needs to come back here.
+        let next_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
+        let raise_sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0);
+        // Waits other than a yield are timed every time (they are few and
+        // long), everything else every SAMPLE-th call, counted SAMPLE times.
+        let wait = is_wait(nr);
+        let timed = sampled || (wait && nr != nt::sysno::ntdll::NtYieldExecution);
+        let scale = if timed && !sampled { 1 } else { SAMPLE };
+        let (t_in, gl_in, glw_in) = (
+            if timed { mono_raw() } else { 0 },
+            crate::gl::GL_NS.with(|g| g.get()),
+            crate::gl::GL_WAIT_NS.with(|g| g.get()),
+        );
         let outcome = {
             let mut host = Nested { ctx_addr };
             nt::syscall(p, &HostKernel, guest_bytes(), ctx_addr, pc as u64, &mut host)
@@ -661,19 +883,23 @@ mod imp {
         if TRACE_FOREIGN.load(Ordering::Relaxed) {
             crate::foreign_now("during", &nt::syscall_name(nr));
         }
+        count_syscall(nr);
         {
+            // GL time is the GL host's own clock, every call.
             let gl = crate::gl::GL_NS.with(|g| g.get()) - gl_in;
             let glw = (crate::gl::GL_WAIT_NS.with(|g| g.get()) - glw_in).min(gl);
-            let all = crate::now_ns().saturating_sub(t_in);
-            let name = nt::syscall_name(nr);
-            let wait = name.contains("Wait") || name.contains("Delay") || name.contains("Remove") || name.contains("Yield");
-            time_note(ctx_addr, if wait { 1 } else { 0 }, all.saturating_sub(gl));
+            if timed {
+                let all = mono_raw().saturating_sub(t_in);
+                time_note(ctx_addr, if wait { 1 } else { 0 }, all.saturating_sub(gl) * scale);
+            }
             time_note(ctx_addr, 2, gl - glw);
             time_note(ctx_addr, 4, glw);
         }
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
-        tick();
+        if timed {
+            tick();
+        }
         // Code that went away (an unmapped image, a protection change: LuaJIT
         // rewrites its machine code in place) loses its translations, as
         // natively. NT images are never statically recompiled, so newly mapped
@@ -711,6 +937,17 @@ mod imp {
                 }
             }
             nt::Outcome::Resume(target) => {
+                // NtContinue out of a nested dispatch: back where it was raised.
+                if exc_escape(ctx, target) {
+                    set_resume_none();
+                    trap();
+                }
+                if nr == nt::sysno::ntdll::NtRaiseException && crate::tracing_exc() {
+                    warn_line(&format!("[nt] NtRaiseException returning to {next_pc:#x} (byte {:#x}): nested {}\n", guest_bytes().get(next_pc as usize).copied().unwrap_or(0), nest_exceptions(next_pc)));
+                }
+                if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(next_pc) && raise_nested(p, ctx_addr, target, raise_sp, next_pc) {
+                    return;
+                }
                 set_resume(target);
                 set_resume_ctx(ctx_addr);
                 trap();
@@ -865,6 +1102,51 @@ mod imp {
         t
     }
 
+    /// Every how many NT syscalls a thread reads the clock (see `syscall`).
+    const SAMPLE: u64 = 16;
+
+    thread_local! {
+        static SYSCALL_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Whether syscall `nr` waits (its time is a wait, not NT work): by
+    /// name, worked out once per number rather than per call.
+    fn is_wait(nr: u32) -> bool {
+        static WAITS: OnceLock<Vec<bool>> = OnceLock::new();
+        let w = WAITS.get_or_init(|| {
+            (0..0x2000u32)
+                .map(|n| {
+                    let name = nt::syscall_name(n);
+                    name.contains("Wait") || name.contains("Delay") || name.contains("Remove") || name.contains("Yield")
+                })
+                .collect()
+        });
+        w.get(nr as usize).copied().unwrap_or(false)
+    }
+
+    /// NT syscalls by number since the last report (GEX_NT_STATS' `calls`
+    /// line): which calls a frame makes.
+    static SYSCALLS: [AtomicU64; 0x2000] = [const { AtomicU64::new(0) }; 0x2000];
+
+    fn count_syscall(nr: u32) {
+        if let Some(c) = SYSCALLS.get(nr as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The busiest syscalls since the last call, as `name n` pairs.
+    fn report_syscalls() {
+        let mut v: Vec<(u64, u32)> =
+            (0..SYSCALLS.len()).map(|i| (SYSCALLS[i].swap(0, Ordering::Relaxed), i as u32)).filter(|x| x.0 > 0).collect();
+        if v.is_empty() {
+            return;
+        }
+        let total: u64 = v.iter().map(|x| x.0).sum();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        let top: Vec<String> = v.iter().take(10).map(|(n, nr)| format!("{} {n}", nt::syscall_name(*nr))).collect();
+        warn_line(&format!("gex-nt: calls {total}: {}\n", top.join(", ")));
+    }
+
     fn time_note(ctx: u64, what: usize, ns: u64) {
         times_of(ctx).v[what].fetch_add(ns, Ordering::Relaxed);
     }
@@ -985,6 +1267,16 @@ mod imp {
     /// End the process with NT exit code `code`. The low byte is what a
     /// parent sees, as natively.
     pub(crate) fn end_process(code: u32) -> ! {
+        if crate::tracing_exc() {
+            let (n, l) = crate::cgen::callouts();
+            crate::stderr_line(&format!(
+                "[nt] at exit: exc_nested={} exc_escaped={} callouts={n} callouts_left={l} in_place={} fjit={:?}\n",
+                EXC_NESTED.load(Ordering::Relaxed),
+                EXC_ESCAPED.load(Ordering::Relaxed),
+                crate::IN_PLACE_N.load(Ordering::Relaxed),
+                crate::fjit::counts()
+            ));
+        }
         with_host(|h| {
             exit_process(h, (code & 0xff) as i32);
         });

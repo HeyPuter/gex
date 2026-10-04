@@ -16,9 +16,6 @@
 //!   gives it both as it gives an ejected project's stateful providers
 //!   (shims/native libprov: data in guest pages from the NT allocator, one
 //!   stack per thread), and it may `#include` the files in [`INCLUDES`];
-//! * `native`: it imports host functions only the native runtime has
-//!   (`gex.provider_alloc_top`, `gex.nt_qpc`), so only a host that says it has
-//!   them ([`set_native_host`]) binds it; the browser's never does;
 //! * `nowine`: not for Wine's own build of the library (one whose DOS stub
 //!   says "Wine builtin DLL"), whose internals reach the same state by
 //!   other paths ([`for_image`]).
@@ -58,12 +55,16 @@ pub struct Provider {
     pub class32: bool,
     /// Has data and a stack (`stateful` on the first line).
     pub stateful: bool,
-    /// Needs the native host's imports (`native` on the first line).
-    pub native: bool,
     /// Not for Wine's build of the library (`nowine` on the first line).
     pub nowine: bool,
     /// (C function, export), in source order.
     pub binds: Vec<(String, String)>,
+}
+
+/// Every provider gex carries (`gexc cgen-image --providers` builds them
+/// all into a unit cache, for a host that cannot build them at run time).
+pub fn all() -> Vec<Provider> {
+    SOURCES.iter().map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed")).collect()
 }
 
 /// Whether providers are on (`GEX_PROVIDERS=0` turns them off).
@@ -75,10 +76,9 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     let first = text.lines().next().unwrap_or("");
     let w: Vec<&str> = first.split_whitespace().collect();
     if w.len() < 4 || w[0] != "/*" || w[1] != "PROVIDES" {
-        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64> [stateful] [native]`");
+        bail!("provider {name}: the first line must be `/* PROVIDES <dll>[,<dll>...] <i386|x86_64> [stateful] [nowine]`");
     }
     let stateful = w[4..].contains(&"stateful");
-    let native = w[4..].contains(&"native");
     let nowine = w[4..].contains(&"nowine");
     let class32 = match w[3] {
         "i386" => true,
@@ -100,16 +100,7 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     let skip = std::env::var("GEX_PROVIDER_SKIP").unwrap_or_default();
     binds.retain(|(_, e)| !skip.split(',').any(|s| s == e));
     let dlls = w[2].split(',').map(|d| d.to_ascii_lowercase()).collect();
-    Ok(Provider { name, text, dlls, class32, stateful, native, nowine, binds })
-}
-
-static NATIVE_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether what runs here (and the units built here, whose keys and stubs
-/// follow their providers) has the native runtime's imports. Set before the
-/// first key is computed.
-pub fn set_native_host(on: bool) {
-    NATIVE_HOST.store(on, std::sync::atomic::Ordering::Relaxed);
+    Ok(Provider { name, text, dlls, class32, stateful, nowine, binds })
 }
 
 /// The providers for library `dll` (its export directory's name, any case)
@@ -122,7 +113,7 @@ pub fn for_dll(dll: &str, class32: bool) -> Vec<Provider> {
     SOURCES
         .iter()
         .map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed"))
-        .filter(|p| p.dlls.contains(&dll) && p.class32 == class32 && (!p.native || NATIVE_HOST.load(std::sync::atomic::Ordering::Relaxed)))
+        .filter(|p| p.dlls.contains(&dll) && p.class32 == class32)
         .collect()
 }
 

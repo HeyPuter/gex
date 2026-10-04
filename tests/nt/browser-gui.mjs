@@ -45,7 +45,7 @@ async function main() {
   const t0 = Date.now();
   const env = [...(gl ? ['gl=1&glbackend=wgpu'] : []), ...(process.env.GEX_NT_PAGE_ENV ? [`env=${process.env.GEX_NT_PAGE_ENV}`] : [])];
   const { browser, page, evaluate: eval_, until, shot } = await openPage(
-    `tar=/gex/nt/${tar.split('/').pop()}&exe=/t/${name}.exe&args=120&size=800x600${env.map((e) => `&${e}`).join('')}`, { shotDir });
+    `tar=/gex/nt/${tar.split('/').pop()}&exe=/t/${name}.exe&args=120&size=800x600${env.map((e) => `&${e}`).join('')}${process.env.GEX_NT_PAGE_FLAGS ?? ''}`, { shotDir });
   await until((s) => /shown/.test(s.out), 300000, '"shown"');
   check('the program starts and paints', true, `${((Date.now() - t0) / 1000).toFixed(1)} s`);
   await sleep(1500);

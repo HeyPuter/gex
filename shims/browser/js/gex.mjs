@@ -39,10 +39,17 @@ function moduleContentKey(bytes) {
 const GUEST_INITIAL_BYTES = 0x07000000;
 // The shim's stack sits at the bottom of its region, below its data.
 const SHIM_STACK_TOP = 0x06000000;
+/** `gex_emit::dense::FIRST_TABLE`: dispatch tables from here on may be dense. */
+const DENSE_FIRST_TABLE = 4;
 /** The most a dispatch table grows past what is needed, in entries. */
 const TABLE_STEP = 1 << 20;
 /** `gex_abi::ctx::LAST_TARGET`. */
 const CTX_LAST_TARGET = 44 * 8;
+/** `gex_abi::ctx::PC`, and x86's `rsp` (`ctx::x(4)`). */
+const CTX_PC = 32 * 8;
+const CTX_SP = 4 * 8;
+/** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
+const CALLOUT_UNWOUND = 64n << 10n;
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -325,6 +332,33 @@ export function elementTableNeeds(wasm) {
   return needs;
 }
 
+/** A module's `gex.dense` section (gex_emit::dense::SECTION), or null. */
+export function denseSection(wasm) {
+  if (wasm instanceof WebAssembly.Module) {
+    const secs = WebAssembly.Module.customSections(wasm, 'gex.dense');
+    return secs.length ? new Uint8Array(secs[0]) : null;
+  }
+  if (!(wasm instanceof Uint8Array)) return null;
+  const dv = new DataView(wasm.buffer, wasm.byteOffset, wasm.byteLength);
+  let i = 8;
+  const leb = () => {
+    let n = 0, shift = 0, b;
+    do { b = dv.getUint8(i++); n |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    return n >>> 0;
+  };
+  while (i < wasm.length) {
+    const id = dv.getUint8(i++);
+    const size = leb();
+    const end = i + size;
+    if (id === 0) {
+      const nameLen = leb();
+      if (utf8(wasm.subarray(i, i + nameLen)) === 'gex.dense') return wasm.slice(i + nameLen, end);
+    }
+    i = end;
+  }
+  return null;
+}
+
 export function metadataSection(wasm) {
   // A compiled `WebAssembly.Module` -- which `attach` accepts, so the guest
   // image and the closure's libraries cross `postMessage` by reference rather
@@ -382,6 +416,14 @@ const TABLE_NAMES = [
   'dispatch6',
   'dispatch7',
 ];
+
+/** A stateful provider's `provider_throw`, caught by its `provider_try`. */
+class ProviderThrow extends Error {
+  constructor(code) {
+    super(`gex.provider_throw(${code}) with no gex.provider_try to catch it`);
+    this.code = code;
+  }
+}
 
 export class Gex {
   #memory; #shim; #guest; #env; #u8; #imports; #net = null; #gl = null; #wl = null;
@@ -443,6 +485,10 @@ export class Gex {
   /// them all up front. Set in `adoptThread` from `GEX_LAZY_THREAD`. See
   /// `#catchUpLazy` and gtk-startup-is-per-thread-install.
   #lazyCatchUp = false;
+  /** Whether this process numbers its blocks densely (gex_emit::dense): a
+   *  dense table's slots live in the process's slot maps, and this Worker's
+   *  only table for them is `blocks`, one entry per block. */
+  #dense = false;
   // Instances whose slots have not been written, newest first: a miss asks
   // each in turn whether it holds the slot. See `fillSlot`.
   #unfilled = [];
@@ -755,6 +801,7 @@ export class Gex {
       bigGrows: this.#bigGrows.slice(0, 6).join(' | '),
       tn: this.#tn.join(' '),
       tlen: this.#shim ? this.#dispatchTables().map((t) => t.length).join('/') : '',
+      blen: this.#guest?.exports?.blocks?.length ?? -1,
       tailMs: Math.round(this.#tailMs),
       strictGrows: this.#strictGrows,
       strictSlots: this.#strictSlots,
@@ -811,10 +858,19 @@ export class Gex {
         now: () => this.#env.now(),
         // The NT layer's monotonic clock: `now` is `Date.now()`, a
         // millisecond wall clock that can step.
-        mono_ns: () => BigInt(Math.round(performance.now() * 1e6)),
+        // An f64, not an i64: a BigInt per call was most of an NT syscall's cost.
+        mono_ns: () => performance.now() * 1e6,
         // A Windows program's user-mode callback (docs/nt-layer.md §5): the
         // guest runs nested, inside the `syscall` import, until it returns.
         nt_callback: (ctx, pc) => this.#ntCallback(ctx >>> 0, pc),
+        // The function table's fallback (cgen.rs `gex_ftab_fallback`): tier-1
+        // runs nested until the guest returns to the function body that
+        // called it.
+        call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+        // A dispatch miss installs in place (lib.rs `in_place`).
+        jit_install: (_ctx) => this.#jitInstall(),
+        // An exception dispatched nested (nt.rs `raise_nested`).
+        exc_dispatch: (ctx, target, level) => this.#excDispatch(ctx >>> 0, target, level),
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
@@ -1162,6 +1218,18 @@ export class Gex {
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
     this.#tnAt('boot');
+    // Dense block tables when the image module has `blocks` (the seed does;
+    // a closure image, whose libraries dispatch classically, does not).
+    this.#dense = opts.dense !== false && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    this.#opts.dense = this.#dense ? (opts.dense === 2 ? 2 : 1) : false;
+    e.gex_set_dense?.(this.#dense ? (opts.dense === 2 ? 2 : 1) : 0);
+    // The function JIT (fjit.rs): its translations reach the function table,
+    // which the function tier's plumbing drives (units where any exist).
+    if (opts.fjit && e.gex_set_fjit) {
+      e.gex_set_fjit(opts.fjit === 2 ? 2 : 1);
+      if (opts.fjitMax != null || opts.fjitOnly) e.gex_fjit_limit?.(opts.fjitMax ?? 0xffffffff, BigInt(opts.fjitOnly ?? 0));
+      if (!this.#cgenMode) this.useCgen(1);
+    }
     this.#offerToFill(this.#guest);
     if (globalThis.GEX_DEBUG_EXIT) console.error('[gex] load: instantiated, installing');
     await this.#installClosure();
@@ -1178,6 +1246,15 @@ export class Gex {
    */
   async #adoptModule(m) {
     const e = this.#shim.exports;
+    // Its dense blocks keep the parent's numbering: point this process's
+    // slots at them where nothing newer does.
+    const ds = this.#dense ? denseSection(m.mod) : null;
+    if (ds && e.gex_dense_adopt) {
+      const dp = e.gex_alloc(ds.length) >>> 0;
+      this.#bytes().set(ds, dp);
+      e.gex_dense_adopt(dp, ds.length);
+      e.gex_free?.(dp, ds.length);
+    }
     // What this module actually reaches: a closure library claims zero here.
     // See `slotsNeeded`.
     const truly = Math.max(m.need >>> 0, slotsNeeded(m.meta));
@@ -1353,6 +1430,9 @@ export class Gex {
     );
     this.#guestInstantiateMs = performance.now() - tGuest;
     _at('guest instantiated');
+    // A thread joins its process's numbering; a forked child decides once its
+    // kernel exists (`adoptProcess`).
+    this.#dense = !!e.gex_dense_on?.() && !!this.#guest.exports.blocks;
     this.#offerToFill(this.#guest);
     _at('offerToFill done, catchUp');
     // Everything the process translated before this thread existed.
@@ -1755,6 +1835,10 @@ export class Gex {
       child.brk ?? 0n,
     );
     if (child.compat) e.gex_set_compat?.(1);
+    // The parent's block numbering carries on in the child (its low region),
+    // over slot maps of its own (`dense::child`).
+    this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
+    e.gex_set_dense?.(this.#dense ? ((child.opts ?? {}).dense === 2 ? 2 : 1) : 0);
     step(`kernel built, entry 0x${entry.toString(16)}, ${live()} non-zero bytes in the context`);
     // The kernel exists now, so everything that configures one can be said.
     const o = child.opts ?? {};
@@ -2336,7 +2420,11 @@ export class Gex {
     const ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
     const lookup = (ctx, addr) => {
       if (e.gex_ftab_behind()) this.#cgenCatchUp();
-      return e.gex_ftab_lookup(ctx, addr);
+      const idx = e.gex_ftab_lookup(ctx, addr);
+      // A translation the function JIT just published: in this Worker's
+      // table before `resolve` calls it.
+      if (e.gex_ftab_behind()) this.#cgenCatchUp();
+      return idx;
     };
     const gex = {
       memory: this.#memory,
@@ -2349,6 +2437,8 @@ export class Gex {
     for (let i = 0; i < TABLE_NAMES.length; i++) {
       gex[TABLE_NAMES[i]] = tables[i] ?? new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
     }
+    // Dense: the shim's runtime module dispatches through `blocks` too.
+    if (this.#dense) gex.blocks = this.#guest.exports.blocks;
     const ri = new WebAssembly.Instance(rm, { gex });
     this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri] };
     this.#cgenGrow();
@@ -2371,33 +2461,175 @@ export class Gex {
   #cgenInstall(u, base) {
     const e = this.#shim.exports;
     const st = this.#cgenStore();
-    const key = this.#cgenStr(e.gex_cgen_key, u);
-    const mod = this.#cgenModule(key);
-    const tables = this.#growTables(e.gex_cgen_slots(u) >>> 0, 'cgen');
+    // An export provider's module (`PROVIDER | number`, cgen.rs) installs as
+    // a unit does, from its file in the unit cache.
+    const prov = u >= 0x80000000 ? u - 0x80000000 : -1;
+    // A function JIT translation (`FJIT | n`, fjit.rs): its bytes are the shim's.
+    const jit = prov < 0 && u >= 0x40000000 ? u - 0x40000000 : -1;
+    const mod = prov >= 0
+      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
+      : jit >= 0 ? this.#fjitModule(jit)
+      : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
+    // A stateful provider (docs/eject-pe.md §5.1): its data in the guest's
+    // memory, this Worker's provider stack, and the provider_* imports.
+    const memBase = prov >= 0 ? (e.gex_cgen_pmod_memory_base?.(prov) >>> 0) : 0;
+    const regsOf = prov >= 0 ? (b, c) => e.gex_cgen_pmod_regs(prov, b, c)
+      : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
+      : (b, c) => e.gex_cgen_regs(u, b, c);
+    const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : jit >= 0 ? e.gex_fjit_slots(jit) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
     const inst = new WebAssembly.Instance(mod, {
       env: {
         memory: this.#memory,
         __indirect_function_table: st.ftab,
         __table_base: new WebAssembly.Global({ value: 'i32', mutable: false }, base | 0),
-        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, 0),
+        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, memBase),
         // A unit's functions never use clang's shadow stack (those are stubs),
         // but a position-independent module imports its pointer all the same.
-        __stack_pointer: new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+        // A stateful provider's is this Worker's (one C stack per thread).
+        __stack_pointer: memBase ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
       },
-      gex: { ...this.#imports, lookup: st.lookup },
+      gex: {
+        ...this.#imports, lookup: st.lookup, ftab: st.ftab,
+        // Built-in providers' host functions (gex-cgen/providers): nt_qpc's
+        // clock, crt_heap's pages.
+        ...(prov >= 0 ? {
+          // The shim's exports themselves: a wasm-to-wasm call, no JS.
+          nt_qpc: e.gex_nt_qpc,
+          provider_alloc_top: e.gex_provider_alloc_top,
+        } : {}),
+        ...(memBase ? this.#providerImports() : {}),
+      },
     });
-    const n = e.gex_cgen_regs(u, 0, 0) >>> 0;
+    if (memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
+    const n = regsOf(0, 0) >>> 0;
     const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
     let regs;
     try {
-      e.gex_cgen_regs(u, buf, n);
+      regsOf(buf, n);
       regs = new Uint32Array(this.#memory.buffer.slice(buf, buf + 4 * n));
     } finally {
       e.gex_free?.(buf, 4 * Math.max(1, n));
     }
-    for (let j = 0; j + 1 < regs.length; j += 2) tables[regs[j]].set(regs[j + 1], st.bridge);
+    // Table 8 (`gex_emit::dense::TABLE_INDEX`) is `blocks`: a dense slot's
+    // bridge has an index there of its own.
+    const blocks = this.#guest.exports.blocks;
+    if (blocks) this.#growBlocks();
+    for (let j = 0; j + 1 < regs.length; j += 2) {
+      (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+    }
     st.instances.push(inst);
+    // The first Worker to install a JIT module writes the directory for the
+    // pages it numbered (idempotent).
+    if (jit >= 0) e.gex_fjit_installed(jit);
     return regs.length / 2;
+  }
+
+  /** This Worker's stack for stateful providers (one per guest thread, as
+   *  natively), made at the first one's instantiation. */
+  #provStack = null;
+  #providerStack() {
+    if (!this.#provStack) {
+      const size = 1 << 20;
+      // Top down unless an ejected project's providers are set (cgen.rs).
+      const e = this.#shim.exports;
+      const base = (e.gex_provider_stack ? e.gex_provider_stack(size) : e.gex_provider_alloc(size)) >>> 0;
+      if (!base) throw new Error('gex-nt: no memory for a provider stack');
+      this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
+    }
+    return this.#provStack;
+  }
+
+  /** What a stateful provider imports from `gex` (the native `libprov`). */
+  #providerImports() {
+    const e = this.#shim.exports;
+    const ftab = this.#cgen.ftab;
+    return {
+      // A protected call: `fn(arg)` from the function table, 0, or the code
+      // a provider_throw inside it threw (every frame between discarded, as
+      // a C longjmp).
+      provider_try: (f, arg) => {
+        try {
+          ftab.get(f >>> 0)(arg);
+          e.gex_provider_note(0);
+          return 0;
+        } catch (err) {
+          if (err instanceof ProviderThrow) {
+            e.gex_provider_note(1);
+            return err.code;
+          }
+          throw err;
+        }
+      },
+      provider_throw: (code) => {
+        throw new ProviderThrow(code);
+      },
+      provider_ctx: () => e.gex_provider_ctx(),
+      provider_time: (which) => (which === 0 ? Date.now() / 1000 : performance.now() / 1000),
+      provider_missing: (addr) => e.gex_provider_missing(addr),
+      provider_alloc: (size) => e.gex_provider_alloc(size),
+      provider_alloc_top: (size) => e.gex_provider_alloc_top(size),
+      provider_log: (ptr, len) => {
+        console.error(new TextDecoder().decode(this.#bytes().slice(ptr >>> 0, (ptr >>> 0) + (len >>> 0))));
+      },
+    };
+  }
+
+  /** A module file from the unit cache (an export provider's), compiled
+   *  once per process and offered to the siblings. Synchronous. */
+  #cgenFileModule(file, bytes = null) {
+    const name = `cgenfile:${file}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    bytes ??= this.#env.loadFile?.(file) ?? null;
+    if (!bytes) throw new Error(`gex-cgen: ${file} was published but cannot be loaded here`);
+    mod = new WebAssembly.Module(bytes);
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
+  }
+
+  /** Bind unit `u`'s export providers (§9.9), after the unit, whether or
+   *  not it had one: each provider's module from the unit cache, published
+   *  by the shim at its exports' addresses. */
+  #cgenProviders(u) {
+    const e = this.#shim.exports;
+    const n = e.gex_cgen_provider_count?.(u) >>> 0;
+    for (let i = 0; i < n; i++) {
+      const file = this.#cgenStr((uu, b, c) => e.gex_cgen_provider_file(uu, i, b, c), u);
+      const bytes = this.#env.loadFile?.(file) ?? null;
+      if (!bytes) {
+        console.error(`gex-cgen: no provider module ${file} in the unit cache (build it natively: a run of the program, or gexc cgen-prefix)`);
+        continue;
+      }
+      const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      this.#cgenFileModule(file, b);
+      const gp = e.gex_alloc(Math.max(8, b.byteLength)) >>> 0;
+      this.#bytes().set(b, gp);
+      const number = e.gex_cgen_provider_publish(u, i, gp, b.byteLength);
+      e.gex_free?.(gp, Math.max(8, b.byteLength));
+      if (number < 0) continue;
+      this.#cgenCatchUp();
+      e.gex_cgen_pmod_installed(number);
+    }
+  }
+
+  /** Function JIT module `n` (fjit.rs), compiled once per process from the
+   *  shim's bytes and offered to the siblings. Synchronous (a Worker). */
+  #fjitModule(n) {
+    const name = `fjit:${n}`;
+    let mod = this.#sharedModules.get(name);
+    if (mod) return mod;
+    const e = this.#shim.exports;
+    const ptr = e.gex_fjit_ptr(n) >>> 0;
+    const bytes = this.#bytes().slice(ptr, ptr + (e.gex_fjit_len(n) >>> 0));
+    const dump = globalThis.process?.env?.GEX_FJIT_DUMP;
+    if (dump) globalThis.process.getBuiltinModule('fs').writeFileSync(`${dump}/fjit-${n}.wasm`, bytes);
+    const t0 = performance.now();
+    mod = new WebAssembly.Module(bytes);
+    this.#compileMs += performance.now() - t0;
+    this.#sharedModules.set(name, mod);
+    this.#env.shareModule?.(name, mod);
+    return mod;
   }
 
   /** Replay the function table's log this Worker has not seen: installs,
@@ -2425,14 +2657,31 @@ export class Gex {
    *  its entry list does. */
   #cgenServe() {
     const e = this.#shim.exports;
+    // A Worker with the function JIT on but no units of its own still
+    // replays the function table's log.
+    if (!this.#cgenMode && e.gex_fjit_on?.()) {
+      this.#cgenCatchUp();
+      return;
+    }
     if (!this.#cgenMode || !e.gex_cgen_wanted) return;
     for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
       const t0 = performance.now();
+      // The image's indirect-call profile is part of its unit's key, as
+      // natively: read it from the unit cache first.
+      if (e.gex_cgen_icall_path) {
+        const prof = this.#env.loadFile?.(this.#cgenStr(e.gex_cgen_icall_path, u)) ?? null;
+        const b = prof ? (prof instanceof Uint8Array ? prof : new Uint8Array(prof)) : null;
+        const gp = b ? e.gex_alloc(Math.max(8, b.byteLength)) >>> 0 : 0;
+        if (b) this.#bytes().set(b, gp);
+        e.gex_cgen_set_icall(u, gp, b ? b.byteLength : 0);
+        if (b) e.gex_free?.(gp, Math.max(8, b.byteLength));
+      }
       const key = this.#cgenStr(e.gex_cgen_key, u);
       const path = this.#cgenStr(e.gex_cgen_path, u);
       const got = this.#env.loadUnit?.(key) ?? null;
       if (!got) {
         if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
+        this.#cgenProviders(u);
         continue;
       }
       this.#cgenModule(key, got);
@@ -2444,6 +2693,7 @@ export class Gex {
       if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
       this.#cgenCatchUp();
       e.gex_cgen_installed(u);
+      this.#cgenProviders(u);
       console.error(`gex-nt: function tier for ${path}: ${ent.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
     }
     this.#cgenCatchUp();
@@ -2531,7 +2781,7 @@ export class Gex {
         // exit 0. `trap()` sets a flag; nothing else does. First because the
         // recovery below calls into the shim, whose kernel a crash may leave
         // borrowed -- a second call would bury the first error.
-        if (this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
+        if (!err?.gexHandoff && this.#shim.exports.gex_handoff && !this.#shim.exports.gex_handoff()) {
           // RECOVERABLE first: a "table index is out of bounds" during dispatch
           // is usually just this Worker's funcref table lagging the shared
           // directory. Another Worker numbered a page (bumping the process-wide
@@ -2698,6 +2948,7 @@ export class Gex {
           }
           e.gex_fill_done(answer ? 1 : 0);
         }
+        this.#denseCatchUp();
         // One grow for the whole queue before any install: `#installModule`
         // grows per module and `Table.grow` reallocates, so a batch of hundreds
         // with a rising need copies an ever-larger table hundreds of times.
@@ -3008,6 +3259,7 @@ export class Gex {
     // start empty, with no element 0 of their own.
     const stub = tables[0].get(0);
     for (let i = 0; i < tables.length; i++) {
+      if (this.#denseTable(i)) continue;
       const need_i = need_of(i);
       if (tables[i].length >= need_i) continue;
       // Geometrically, not exactly: `Table.grow` reallocates and copies, so
@@ -3054,8 +3306,9 @@ export class Gex {
     if (!e.gex_claimed_slots) return false;
     const tables = this.#dispatchTables();
     const stub = tables[0].get(0);
-    let grew = false;
+    let grew = this.#growBlocks();
     for (let i = 0; i < tables.length; i++) {
+      if (this.#denseTable(i)) continue;
       const need = e.gex_claimed_slots(i) >>> 0;
       if (need <= tables[i].length) continue;
       try {
@@ -3107,20 +3360,47 @@ export class Gex {
    * the run failed or the process ended.
    */
   #ntCallback(ctx, pc) {
+    this.#nest.push('callback');
+    try {
+      return this.#ntCallbackLoop(ctx, pc);
+    } finally {
+      this.#nest.pop();
+    }
+  }
+
+  #ntCallbackLoop(ctx, pc) {
     const e = this.#shim.exports;
     // The shim's frames below this import are live: every trap out of the
     // nested guest abandons only the frames above here, so the shadow stack
     // goes back to exactly this, never to the Worker's base.
     const sp = e.__stack_pointer.value;
     pc = pc < 0n ? pc + (1n << 64n) : pc;
+    let bypass = null;
     for (;;) {
       try {
-        this.#guest.exports.enter(ctx, pc);
+        if (bypass) {
+          const f = bypass;
+          bypass = null;
+          f(ctx);
+        } else {
+          this.#guest.exports.enter(ctx, pc);
+        }
         console.error('[gex-nt] guest code returned out of a user-mode callback');
         return 0;
       } catch (err) {
         e.__stack_pointer.value = sp;
-        if (!e.gex_handoff()) {
+        // A call-out's watched entry reached inside the callback: what the
+        // entry held runs (`#watchHit` never ends a call-out from here).
+        const sig = this.#calloutSignal;
+        this.#calloutSignal = null;
+        if (sig?.kind === 'bypass' && sig.f) {
+          bypass = sig.f;
+          continue;
+        }
+        // This callback's NtCallbackReturn, reached inside a call-out it
+        // made (up through the call-out's frames).
+        if (err?.gexCallbackDone && e.gex_nt_callback_done(ctx)) return 1;
+        if (!err?.gexHandoff && !e.gex_handoff()) {
           // The sibling-numbered-page race, as in the outer loop.
           if (/table index is out of bounds/.test(err.message)) {
             const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
@@ -3136,6 +3416,7 @@ export class Gex {
         if (e.gex_exited?.()) return 0;
         const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
         if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+        this.#denseCatchUp();
         if (e.gex_jit_pending_len() >>> 0) {
           const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
           if (need) this.#growTables(need, 'nt-callback');
@@ -3155,6 +3436,337 @@ export class Gex {
         const c = e.gex_resume_ctx() >>> 0;
         if (c) ctx = c;
       }
+    }
+  }
+
+  /** This Worker's call-outs in progress, innermost last: the return each
+   *  waits for, the stack it comes back at, and the table entry watching
+   *  for a translated return (`{ table, index, old }`). */
+  #callouts = [];
+  /** What the watch stub found (`{ kind: 'return', i }` or `{ kind:
+   *  'bypass', f }`), for the nested loop to act on. */
+  #calloutSignal = null;
+  /** Which nested loops this Worker is in, innermost last ('callout' or
+   *  'callback'): a watch stub reached inside an NT callback is not its
+   *  call-out's business. */
+  #nest = [];
+  #watchStub = null;
+
+  /** The function a watched table entry holds: it tells JS (`hit`) and
+   *  traps, so the nested loop in `#callOut` sees why. */
+  #watch() {
+    if (this.#watchStub) return this.#watchStub;
+    // (module (type (func (param i32))) (import "w" "hit" (func (type 0)))
+    //   (func (export "c") (type 0) local.get 0 call 0 unreachable))
+    const bytes = new Uint8Array([
+      0, 97, 115, 109, 1, 0, 0, 0,
+      1, 5, 1, 96, 1, 127, 0,
+      2, 9, 1, 1, 119, 3, 104, 105, 116, 0, 0,
+      3, 2, 1, 0,
+      7, 5, 1, 1, 99, 0, 1,
+      10, 9, 1, 7, 0, 32, 0, 16, 0, 0, 11,
+    ]);
+    const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { w: { hit: (ctx) => this.#watchHit(ctx >>> 0) } });
+    this.#watchStub = inst.exports.c;
+    return this.#watchStub;
+  }
+
+  /** A dispatch reached a watched entry: the awaited return of a call-out
+   *  (the innermost one waiting for it, as natively), or something else
+   *  that shares the entry (another address of an x86 slot, a deeper frame
+   *  returning to the same place), which runs what the entry held. */
+  #watchHit(ctx) {
+    const dv = new DataView(this.#memory.buffer);
+    const target = dv.getBigUint64(ctx + CTX_LAST_TARGET, true);
+    const sp = dv.getBigUint64(ctx + CTX_SP, true);
+    let i = -1;
+    // Only a call-out with no NT callback nested inside it: an outer one's
+    // return reached from inside a callback is not that call-out's (its
+    // caller's frame is below the callback's), and runs as a bypass.
+    const lastCallback = Math.max(this.#nest.lastIndexOf('callback'), this.#nest.lastIndexOf('exc'));
+    for (let k = this.#callouts.length - 1; k >= 0; k--) {
+      const c = this.#callouts[k];
+      if (c.nestAt < lastCallback) break;
+      if (c.ret === target && sp >= c.spWant && sp <= c.spWant + CALLOUT_UNWOUND) { i = k; break; }
+    }
+    dv.setBigUint64(ctx + CTX_PC, target, true);
+    if (i >= 0) {
+      this.#calloutSignal = { kind: 'return', i };
+      return;
+    }
+    const ref = this.#shim.exports.gex_dispatch_ref(target);
+    const table = Number(BigInt.asIntN(64, ref) >> 32n), index = Number(BigInt.asUintN(64, ref) & 0xffffffffn);
+    const w = this.#callouts.find((c) => c.w && c.w.table === table && c.w.index === index)?.w;
+    this.#calloutSignal = { kind: 'bypass', f: w?.old ?? null };
+  }
+
+  /** The table `table` of `gex_dispatch_ref` names. */
+  #refTable(table) {
+    return table === TABLE_NAMES.length ? this.#guest.exports.blocks : this.#dispatchTables()[table];
+  }
+
+  /** Point every call-out's return entry at the watch stub, wherever
+   *  dispatch now reaches its return (an install or a retirement may have
+   *  moved or overwritten it); an untranslated return is caught by the miss
+   *  path (cgen.rs `returned`). */
+  #armCallouts() {
+    const e = this.#shim.exports;
+    const stub = this.#watch();
+    for (const c of this.#callouts) {
+      const ref = e.gex_dispatch_ref(c.ret);
+      const table = ref < 0n ? -1 : Number(ref >> 32n), index = ref < 0n ? -1 : Number(ref & 0xffffffffn);
+      if (c.w && (c.w.table !== table || c.w.index !== index)) this.#unwatch(c);
+      if (table < 0) continue;
+      const t = this.#refTable(table);
+      if (!t || index >= t.length) continue;
+      if (c.w) {
+        const now = t.get(index);
+        if (now !== stub) c.w.old = now;
+        if (now !== stub) t.set(index, stub);
+        continue;
+      }
+      const shared = this.#callouts.find((o) => o !== c && o.w && o.w.table === table && o.w.index === index);
+      const old = shared ? shared.w.old : t.get(index);
+      c.w = { table, index, old };
+      t.set(index, stub);
+    }
+  }
+
+  /** Put a call-out's watched entry back, unless another still watches it. */
+  #unwatch(c) {
+    const w = c.w;
+    c.w = null;
+    if (!w || this.#callouts.some((o) => o !== c && o.w && o.w.table === w.table && o.w.index === w.index)) return;
+    const t = this.#refTable(w.table);
+    if (t && w.index < t.length && t.get(w.index) === this.#watchStub) t.set(w.index, w.old);
+  }
+
+  /**
+   * The call-out (cgen.rs `gex_ftab_fallback`): run the guest from `target`
+   * in a nested loop on this Worker until it returns to `ret` with the stack
+   * at `spWant` (or what the callee popped above it). 1 then, and the
+   * function body that called the fallback carries on; 0 when it cannot
+   * (the process ended, the stack unwound past its caller), with `ctx::PC`
+   * where the guest is, and the body leaves as before. Synchronous, as
+   * `#ntCallback`: a shim frame is below this one.
+   */
+  #callOut(ctx, target, ret, spWant) {
+    const e = this.#shim.exports;
+    const sp0 = e.__stack_pointer.value;
+    const me = this.#callouts.length;
+    const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length };
+    this.#callouts.push(c);
+    this.#nest.push('callout');
+    this.#calloutsMade++;
+    if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
+      console.error(`[callout] #${this.#calloutsMade} depth ${me}: ${BigInt.asUintN(64, target).toString(16)} returning to ${c.ret.toString(16)}`);
+    }
+    let pc = BigInt.asUintN(64, target);
+    let next = null;
+    try {
+      this.#armCallouts();
+      for (;;) {
+        try {
+          if (next) {
+            const f = next;
+            next = null;
+            f(ctx);
+          } else {
+            this.#guest.exports.enter(ctx, pc);
+          }
+          console.error('[gex] guest code returned out of a call-out');
+          return 0;
+        } catch (err) {
+          e.__stack_pointer.value = sp0;
+          const sig = this.#calloutSignal;
+          this.#calloutSignal = null;
+          if (sig?.kind === 'return') return sig.i === me ? 1 : 0;
+          if (sig?.kind === 'bypass') {
+            if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
+            next = sig.f;
+            continue;
+          }
+          if (!err?.gexHandoff && !e.gex_handoff()) {
+            if (/table index is out of bounds/.test(err.message)) {
+              const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
+              if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
+                pc = BigInt.asUintN(64, tgt);
+                continue;
+              }
+            }
+            throw err;
+          }
+          const hit = e.gex_callout_hit();
+          if (hit >= 0) return hit === me ? 1 : 0;
+          // The process ended: down through every frame to the run loop
+          // (returning would run the guest on).
+          if (e.gex_exited?.()) {
+            err.gexHandoff = true;
+            throw err;
+          }
+          // Control left an exception dispatched nested further out: this
+          // call-out's caller leaves, and the dispatch's loop sees the escape
+          // at the next check (nt.rs `exc_escape`).
+          if ((e.gex_exc_escaped?.(0) ?? -1) >= 0) return 0;
+          // The NtCallbackReturn of a callback further out (the function
+          // this call-out ran was the callback's dispatcher): its loop's, so
+          // up through every frame between, as natively.
+          if (this.#nest.lastIndexOf('callback') >= 0 && e.gex_nt_callback_done?.(ctx)) {
+            const up = new Error('gex: a user-mode callback returned inside a call-out');
+            up.gexCallbackDone = true;
+            throw up;
+          }
+          const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+          if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+          this.#denseCatchUp();
+          if (e.gex_jit_pending_len() >>> 0) {
+            const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+            if (need) this.#growTables(need, 'call-out');
+          }
+          while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+          this.#catchUpSync();
+          this.#cgenServe();
+          this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+          const nextPc = e.gex_resume_pc();
+          // Nowhere to resume (the thread ended, or waits): the run loop's
+          // business, down through every frame.
+          if (nextPc === 0n) {
+            err.gexHandoff = true;
+            throw err;
+          }
+          pc = BigInt.asUintN(64, nextPc);
+          const rc = e.gex_resume_ctx() >>> 0;
+          if (rc && rc !== ctx) {
+            // A resume on another thread's context is not this call-out's.
+            return 0;
+          }
+          // The stack unwound past the caller (longjmp, an exception
+          // handled further out): its frame is gone, so it leaves.
+          const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
+          if (sp > c.spWant + CALLOUT_UNWOUND) {
+            new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
+            return 0;
+          }
+          this.#armCallouts();
+        }
+      }
+    } finally {
+      this.#unwatch(c);
+      this.#callouts.pop();
+      this.#nest.pop();
+      // Left by an exception, the shim's half has not popped its entry.
+      e.gex_callout_unwind?.(me);
+      if (globalThis.GEX_CALLOUT_TRACE) {
+        const dv = new DataView(this.#memory.buffer);
+        console.error(`[callout] end depth ${me}: pc ${dv.getBigUint64(ctx + CTX_PC, true).toString(16)} sp ${dv.getBigUint64(ctx + CTX_SP, true).toString(16)} want ${c.spWant.toString(16)}`);
+      }
+    }
+  }
+
+  #calloutsMade = 0;
+
+  /**
+   * An exception dispatched nested (nt.rs `raise_nested`, ffa2cec9's browser
+   * half): run the guest from `target` (KiUserExceptionDispatcher) in a loop
+   * on this Worker until control goes back above the raise (the escape for
+   * depth `level`): 1; 0 when it could not, and the syscall traps out as
+   * before. Synchronous, as `#ntCallback`.
+   */
+  #excDispatch(ctx, target, level) {
+    const e = this.#shim.exports;
+    const sp0 = e.__stack_pointer.value;
+    this.#nest.push('exc');
+    if (globalThis.GEX_CALLOUT_TRACE) console.error(`[exc] nested dispatch depth ${level} at ${BigInt.asUintN(64, target).toString(16)}`);
+    let pc = BigInt.asUintN(64, target);
+    let bypass = null;
+    try {
+      for (;;) {
+        try {
+          if (bypass) {
+            const f = bypass;
+            bypass = null;
+            f(ctx);
+          } else {
+            this.#guest.exports.enter(ctx, pc);
+          }
+          console.error('[gex] guest code returned out of exception dispatch');
+          return 0;
+        } catch (err) {
+          e.__stack_pointer.value = sp0;
+          const sig = this.#calloutSignal;
+          this.#calloutSignal = null;
+          if (sig?.kind === 'bypass' && sig.f) {
+            bypass = sig.f;
+            continue;
+          }
+          if (!err?.gexHandoff && !e.gex_handoff()) {
+            if (/table index is out of bounds/.test(err.message)) {
+              const tgt = new DataView(this.#memory.buffer).getBigUint64(Number(ctx) + CTX_LAST_TARGET, true);
+              if (tgt && this.#growTablesToClaimed() && this.#tableRetries++ < 100000) {
+                pc = BigInt.asUintN(64, tgt);
+                continue;
+              }
+            }
+            throw err;
+          }
+          if (e.gex_exc_escaped(0) === level) {
+            e.gex_exc_escaped(1);
+            if (globalThis.GEX_CALLOUT_TRACE) console.error(`[exc] depth ${level} escaped`);
+            return 1;
+          }
+          if (e.gex_exited?.()) {
+            err.gexHandoff = true;
+            throw err;
+          }
+          const want = e.gex_fill_wanted ? Number(e.gex_fill_wanted()) : -1;
+          if (want >= 0) e.gex_fill_done(this.fillSlotNow(want >>> 0) ? 1 : 0);
+          this.#denseCatchUp();
+          if (e.gex_jit_pending_len() >>> 0) {
+            const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+            if (need) this.#growTables(need, 'exception');
+          }
+          while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+          this.#catchUpSync();
+          this.#cgenServe();
+          this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+          const nextPc = e.gex_resume_pc();
+          // Nowhere to resume (the thread ended, or waits): the run loop's
+          // business, down through every frame.
+          if (nextPc === 0n) {
+            err.gexHandoff = true;
+            throw err;
+          }
+          pc = BigInt.asUintN(64, nextPc);
+          const rc = e.gex_resume_ctx() >>> 0;
+          if (rc && rc !== ctx) return 0;
+          this.#armCallouts();
+        }
+      }
+    } finally {
+      this.#nest.pop();
+      e.gex_exc_unwind?.(level);
+    }
+  }
+
+  /** What a dispatch miss needs, installed synchronously on this Worker
+   *  (lib.rs `in_place`): 1, or 0 when it cannot be done here (a page's
+   *  main thread may not compile synchronously) and the miss traps out. */
+  #jitInstall() {
+    if (typeof window !== 'undefined') return 0;
+    const e = this.#shim.exports;
+    try {
+      this.#denseCatchUp();
+      if (e.gex_jit_pending_len() >>> 0) {
+        const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+        if (need) this.#growTables(need, 'in-place');
+      }
+      while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+      this.#catchUpSync();
+      this.#armCallouts();
+      return 1;
+    } catch (err) {
+      console.error(`[gex] an in-place install failed, trapping instead: ${err.message ?? err}`);
+      return 0;
     }
   }
 
@@ -3342,6 +3954,23 @@ export class Gex {
     });
     const imports = { ...this.#imports };
     for (let i = 0; i < tables.length; i++) imports[TABLE_NAMES[i]] = tables[i];
+    // Dense: the module's blocks go to `blocks` at the base its bytes name,
+    // within what the process has numbered.
+    if (this.#guest?.exports?.blocks) {
+      imports.blocks = this.#guest.exports.blocks;
+      this.#growBlocks();
+      const ds = denseSection(bytes instanceof Uint8Array ? bytes : mod);
+      if (ds) {
+        const dv = new DataView(ds.buffer, ds.byteOffset, ds.byteLength);
+        const base = dv.getUint32(0, true);
+        if (globalThis.GEX_DENSE_DEBUG) {
+          console.error(`[dense] ${who} base=${base} n=${dv.getUint32(4, true)} blocks=${imports.blocks.length} size=${e.gex_dense_size()}`);
+        }
+        // Base 0 is a module nobody numbered: its blocks would land on the
+        // miss stub and its neighbours.
+        if (base === 0) throw new Error(`gex: a translation with unnumbered dense blocks reached the install (${who})`);
+      }
+    }
     // What this module's own entries need per table, where known. `need` alone
     // is one running total that cannot say which tables absolute segments fall
     // in; the segments (or `Metadata` for an already-compiled module) can, which
@@ -3367,6 +3996,7 @@ export class Gex {
       const stub = tables[0].get(0);
       let grew = 0;
       for (let i = 0; i < tables.length; i++) {
+        if (this.#denseTable(i)) continue;
         const want = Math.min(Math.max(need - i * per, 0), per);
         if (tables[i].length < want) {
           grew += want - tables[i].length;
@@ -3502,7 +4132,7 @@ export class Gex {
   #reach(t, end) {
     const e = this.#shim.exports;
     const tables = this.#dispatchTables();
-    if (t < 0 || t >= tables.length || tables[t].length >= end) return;
+    if (t < 0 || t >= tables.length || tables[t].length >= end || this.#denseTable(t)) return;
     const per = (e.gex_slots_per_table?.() ?? 0) >>> 0 || Number.MAX_SAFE_INTEGER;
     const CHUNK = SLOTS_PER_PAGE * 16;
     const want = Math.min(Math.ceil(end / CHUNK) * CHUNK, per);
@@ -3868,6 +4498,53 @@ export class Gex {
       );
     }
     return false;
+  }
+
+  /** A dispatch missed on a block of this process this Worker never
+   *  instantiated (`gex_dense_want`): instantiate the registry module that
+   *  holds it, whatever order this Worker caught up in. Synchronous. */
+  #denseCatchUp() {
+    const e = this.#shim.exports;
+    const d = e.gex_dense_want ? e.gex_dense_want() >>> 0 : 0;
+    if (!d) return;
+    const i = e.gex_dense_owner(d);
+    if (i < 0) return;
+    const ptr = e.gex_module_ptr(i) >>> 0;
+    const len = e.gex_module_len(i) >>> 0;
+    if (!len) return;
+    const bytes = this.#bytes().slice(ptr, ptr + len);
+    const key = moduleContentKey(bytes);
+    const cached = key ? this.#sharedModules.get(key) : undefined;
+    this.#installModule(bytes, 0, 64, null, `dense-${i}`, cached, true);
+    this.#denseCatchUps++;
+    if (cached) return;
+    const mod = this.#compiled[this.#compiled.length - 1]?.mod;
+    if (mod && key) {
+      this.#sharedModules.set(key, mod);
+      this.#env.shareModule?.(key, mod);
+    }
+  }
+
+  #denseCatchUps = 0;
+
+  /** Whether dispatch table `t` is dense here (gex_emit::dense::FIRST_TABLE
+   *  and up): its slots are the process's slot maps, never this table. */
+  #denseTable(t) {
+    return this.#dense && t >= DENSE_FIRST_TABLE;
+  }
+
+  /** Grow this Worker's `blocks` to every index the process has numbered
+   *  (`gex_dense_size`), the miss stub (its entry 0) in the new entries.
+   *  Whether it grew. */
+  #growBlocks() {
+    const b = this.#guest?.exports?.blocks;
+    if (!this.#dense || !b) return false;
+    const need = this.#shim.exports.gex_dense_size() >>> 0;
+    const len = b.length;
+    if (len >= need) return false;
+    const want = Math.max(need, Math.min(len * 2, len + (1 << 18)));
+    growTable(b, want - len, b.get(0), 'blocks');
+    return true;
   }
 
   /** Every dispatch table the guest module exports, in index order. */

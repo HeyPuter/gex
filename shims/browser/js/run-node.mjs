@@ -28,6 +28,7 @@ if (process.env.GEX_ARCH === 'x86') globalThis.GEX_ARCH = 'x86';
 // The host runs on the main thread; give it the attach-trace flag too so
 // thread spawn/adopt timing is visible from the host side, not just the Worker.
 if (process.env.GEX_ATTACH_TRACE) globalThis.GEX_ATTACH_TRACE = 1;
+if (process.env.GEX_DENSE_DEBUG) globalThis.GEX_DENSE_DEBUG = 1;
 
 // Options come first and are named, so a guest argument that happens to
 // contain an `=` -- `lua -e 'local x=1'`, say -- reaches the guest intact.
@@ -238,7 +239,7 @@ const host = new ProcessHost({
   extra: {
     // Function-tier units (--cgen): where their files are, for every Worker.
     cgen: cgenMode
-      ? { mode: cgenMode, root: process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
+      ? { mode: cgenMode | (process.env.GEX_CGEN_UNGUARDED === '1' ? 4 : 0), root: process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
       : undefined,
     // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
     // deflate stream that a UTF-8 round trip would fill with U+FFFD.
@@ -263,6 +264,16 @@ const host = new ProcessHost({
     // the host flips the switch via gex_set_wl_trace in the worker).
     wlTrace: process.env.GEX_WL_TRACE ? 1 : undefined,
     attachTrace: !!process.env.GEX_ATTACH_TRACE,
+    // GEX_DENSE=0: classic per-slot dispatch tables (gex_emit::dense off).
+    dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
+    denseDebug: !!process.env.GEX_DENSE_DEBUG,
+    calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
+    inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
+    excTrace: !!process.env.GEX_EXC_TRACE,
+    // GEX_FJIT=1: the function JIT (gexc run --fjit's browser half).
+    fjit: process.env.GEX_FJIT ? Number(process.env.GEX_FJIT) || 1 : undefined,
+    fjitMax: process.env.GEX_FJIT_MAX ? Number(process.env.GEX_FJIT_MAX) : undefined,
+    fjitOnly: process.env.GEX_FJIT_ONLY ? Number(process.env.GEX_FJIT_ONLY) : undefined,
     // GEX_LAZY_THREAD: spawned threads register the process's modules lazily
     // (instance on first branch) instead of installing them all up front.
     lazyThread: !!process.env.GEX_LAZY_THREAD,

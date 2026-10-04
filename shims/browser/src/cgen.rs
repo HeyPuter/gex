@@ -65,7 +65,68 @@ struct Unit {
     dirs: Vec<(u64, u32)>,
     /// What the dispatch table must hold.
     slots: u64,
+    /// The image's export providers (`gex_cgen::provider`, §9.9): each one's
+    /// module file under the unit cache and the (C function, guest address)
+    /// pairs it binds. Bound after the unit, whether or not it has one.
+    providers: Vec<Provided>,
+    /// The image's identity (`gex_key::image_identity`, without `image:`):
+    /// its indirect-call profile is `<cache>/icall/<identity>.txt`, which JS
+    /// reads and hands over (`gex_cgen_set_icall`) before the key is used.
+    identity: String,
+    /// The key before the profile's part (`key` adds it).
+    key_base: String,
 }
+
+/// One export provider for a placed image.
+struct Provided {
+    /// `providers/<name>-<fingerprint>.wasm`, as `provider::build` names it.
+    file: String,
+    binds: Vec<(String, u64)>,
+    /// A stateful provider (docs/eject-pe.md §5.1): every export of the
+    /// image by name and address, and its entry point (DllMain), which
+    /// `gexp__entry` replaces.
+    stateful: Option<(Vec<(String, u64)>, u64)>,
+    /// A built-in provider with data and a C stack (`stateful` on its
+    /// PROVIDES line: crt_heap): bound like any built-in one, its data
+    /// allocated as an ejected project's is, top down.
+    data: bool,
+}
+
+/// Stateful providers by library (lower case) and module file under the
+/// unit cache: `GEX_NT_STATEFUL=<dll>=<file>[,...]`, an ejected project's
+/// (the native `libprov`).
+static STATEFUL: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+pub(crate) fn set_stateful(spec: &str) {
+    let mut v = lock(&STATEFUL);
+    for item in spec.split(',') {
+        if let Some((d, f)) = item.split_once('=') {
+            v.push((d.trim().to_ascii_lowercase(), f.trim().to_string()));
+        }
+    }
+}
+
+/// Exports a stateful provider does not implement, by address: for the
+/// message when the program calls one.
+static MISSING: Mutex<Option<std::collections::HashMap<u64, String>>> = Mutex::new(None);
+
+/// Provider modules published, by number (the module id an install names
+/// is `PROVIDER | number`): the file JS loads, the bridges every Worker
+/// writes and the pages the publisher numbered (as a unit's).
+struct ProviderModule {
+    file: String,
+    regs: Vec<u32>,
+    dirs: Vec<(u64, u32)>,
+    slots: u64,
+    /// A stateful provider's data (`__memory_base`), 0 for a stateless one.
+    memory_base: u32,
+}
+
+static PROVIDERS: Mutex<Vec<ProviderModule>> = Mutex::new(Vec::new());
+
+/// Module ids at and above this are providers' (`PROVIDERS`), below
+/// it units (`UNITS`).
+const PROVIDER: u32 = 1 << 31;
 
 static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
 /// Units waiting for their bytes, oldest first (indices into `UNITS`).
@@ -97,9 +158,16 @@ pub(crate) fn on() -> bool {
 }
 
 /// Turn the function tier on (1) or require it for program images (2). Before
-/// the process boots, so the exe and ntdll are seen.
+/// the process boots, so the exe and ntdll are seen. Bit 2 (4) selects the
+/// unguarded flavor of i386 units (the native one, `:unguarded` keys): in
+/// the browser the guarded flavor guards only at the memory's end, as the
+/// unguarded one traps there by itself (docs/browser-units-plan.md).
 #[no_mangle]
 pub extern "C" fn gex_cgen_set_mode(mode: u32) {
+    if mode & 4 != 0 {
+        gex_cgen::image::set_unguarded(true);
+    }
+    let mode = mode & 3;
     MODE.store(mode.min(2), Ordering::Relaxed);
     if mode == 0 {
         return;
@@ -144,7 +212,7 @@ pub(crate) fn drain() -> bool {
     if let Some(p) = pending.first() {
         if TRAMPOLINES.set(()).is_ok() {
             let (image, _) = gex_kernel::nt::boot::trampoline_input(!p.pe.is64);
-            place(&image, "[the NT trampolines]", image.bias, true);
+            place(&image, "[the NT trampolines]", image.bias, true, None);
         }
     }
     for p in pending {
@@ -156,7 +224,7 @@ pub(crate) fn drain() -> bool {
             }
         };
         let wine = is_wine(&p.path);
-        place(&image, &p.path, p.base, wine);
+        place(&image, &p.path, p.base, wine, Some(&p.pe));
     }
     !lock(&WANTED).is_empty()
 }
@@ -165,7 +233,7 @@ pub(crate) fn drain() -> bool {
 /// the mapped code is what the unit was built from (a mismatch ends the run,
 /// as natively: a unit over different code is wrong code). `optional`: a
 /// missing unit is fine even under `--cgen` (Wine's DLLs, the trampolines).
-fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool) {
+fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Option<&gex_ld::pe::PeImage>) {
     let memory = crate::guest_bytes();
     let mut pages = Vec::new();
     for seg in image.segments.iter().filter(|s| s.executable) {
@@ -186,9 +254,25 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool) {
             pages.push((page, page_hash(memory, page)));
         }
     }
-    let key = gex_cgen::image::image_key(image);
+    let (key, mut providers) = unit_key(image, pe, base);
+    if let Some(pe) = pe {
+        let dll = pe.exports.dll_name.to_ascii_lowercase();
+        for (_, file) in lock(&STATEFUL).iter().filter(|(d, _)| *d == dll) {
+            let mut exports = Vec::new();
+            for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+                for n in &e.names {
+                    exports.push((n.clone(), base + e.rva as u64));
+                }
+            }
+            let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 };
+            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false });
+        }
+    }
+    let identity = gex_key::image_identity(image).trim_start_matches("image:").to_string();
     let mut units = lock(&UNITS);
     units.push(Unit {
+        identity,
+        key_base: key.clone(),
         key,
         wine: optional,
         path: path.to_string(),
@@ -197,8 +281,112 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool) {
         regs: Vec::new(),
         dirs: Vec::new(),
         slots: 0,
+        providers,
     });
     lock(&WANTED).push_back(units.len() - 1);
+}
+
+/// The key of the unit for `image` (the native host's `nt_cgen::unit_key`:
+/// the image's key, extended by its export providers' stubs and sources),
+/// and those providers. The indirect-call profile's part is added when JS
+/// has read `<cache>/icall/<identity>.txt` (`gex_cgen_set_icall`).
+fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) -> (String, Vec<Provided>) {
+    use std::hash::{Hash, Hasher};
+    let mut key = gex_cgen::image::image_key(image);
+    let Some(pe) = pe else { return (key, Vec::new()) };
+    // As natively (`nt_cgen::provided`): Wine's own build of a DLL leaves out
+    // the `nowine` providers.
+    let providers = gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data);
+    if providers.is_empty() {
+        return (key, Vec::new());
+    }
+    let mut exports = std::collections::HashMap::new();
+    for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+        for n in &e.names {
+            exports.insert(n.clone(), e.rva);
+        }
+    }
+    let stubs = gex_cgen::provider::stubs(&providers, &exports, base);
+    if !stubs.is_empty() {
+        // As natively `stubs.hash(h)`: a slice's length is a `usize`, eight
+        // bytes there, so it is written as a u64 here.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u64(stubs.len() as u64);
+        for a in &stubs {
+            a.hash(&mut h);
+        }
+        gex_cgen::provider::fingerprint(&providers).hash(&mut h);
+        key = format!("{key}-p{:016x}", h.finish());
+    }
+    let provided = providers
+        .iter()
+        .map(|p| Provided {
+            file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
+            binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), base + rva as u64))).collect(),
+            stateful: None,
+            data: p.stateful,
+        })
+        .filter(|p| !p.binds.is_empty())
+        .collect();
+    (key, provided)
+}
+
+/// Where unit `u`'s indirect-call profile is in the unit cache
+/// (`icall/<identity>.txt`), for JS to read.
+#[no_mangle]
+pub extern "C" fn gex_cgen_icall_path(u: u32, buf: u32, cap: u32) -> u32 {
+    let units = lock(&UNITS);
+    units.get(u as usize).map_or(0, |x| put_str(&format!("icall/{}.txt", x.identity), buf, cap))
+}
+
+/// Unit `u`'s indirect-call profile (the `len` bytes at `ptr`, or none):
+/// its key gains the profile's part, exactly as natively (`nt_cgen::
+/// icall_hints` and `unit_key`).
+#[no_mangle]
+pub extern "C" fn gex_cgen_set_icall(u: u32, ptr: u32, len: u32) {
+    use std::hash::{Hash, Hasher};
+    let text = if len == 0 { String::new() } else { String::from_utf8_lossy(crate::shim_slice(ptr, len)).into_owned() };
+    let mut units = lock(&UNITS);
+    let Some(x) = units.get_mut(u as usize) else { return };
+    let hints = icall_hints(&text);
+    x.key = x.key_base.clone();
+    if !hints.is_empty() {
+        let mut v: Vec<(u64, u64)> = hints.into_iter().collect();
+        v.sort_unstable();
+        // As natively `v.hash(h)`: the length a u64 (usize there).
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u64(v.len() as u64);
+        for p in &v {
+            p.hash(&mut h);
+        }
+        x.key = format!("{}-i{:016x}", x.key_base, h.finish());
+    }
+}
+
+/// `nt_cgen::icall_hints` on the profile's text: a call site whose dominant
+/// target takes at least 90% of at least 64 calls, by return address.
+fn icall_hints(text: &str) -> std::collections::HashMap<u64, u64> {
+    use std::collections::HashMap;
+    let num = |w: &str| u64::from_str_radix(w.trim_start_matches("0x"), if w.starts_with("0x") { 16 } else { 10 }).ok();
+    let mut sites: HashMap<u64, HashMap<u64, u64>> = HashMap::new();
+    for l in text.lines() {
+        let Some(k) = l.find("icall ") else { continue };
+        let w: Vec<&str> = l[k + 6..].split_whitespace().collect();
+        if let [r, t, n, ..] = w[..] {
+            if let (Some(r), Some(t), Some(n)) = (num(r), num(t), num(n)) {
+                *sites.entry(r).or_default().entry(t).or_default() += n;
+            }
+        }
+    }
+    let mut hints = HashMap::new();
+    for (ret, targets) in sites {
+        let total: u64 = targets.values().sum();
+        let (t, best) = targets.into_iter().max_by_key(|&(t, n)| (n, std::cmp::Reverse(t))).unwrap();
+        if best >= 64 && best * 10 >= total * 9 {
+            hints.insert(ret, t);
+        }
+    }
+    hints
 }
 
 /// The oldest unit waiting for its bytes, or -1.
@@ -208,10 +396,18 @@ pub extern "C" fn gex_cgen_wanted() -> i32 {
     lock(&WANTED).front().map_or(-1, |&u| u as i32)
 }
 
+/// `v` into a buffer of the shim's heap (above the guest's limit).
+pub(crate) fn put_u32s(v: &[u32], buf: u32) {
+    let out = crate::shim_slice_mut(buf, 4 * v.len() as u32);
+    for (c, x) in out.chunks_exact_mut(4).zip(v) {
+        c.copy_from_slice(&x.to_le_bytes());
+    }
+}
+
 fn put_str(s: &str, buf: u32, cap: u32) -> u32 {
     let n = s.len().min(cap as usize);
-    let gm = &mut crate::guest_bytes()[buf as usize..buf as usize + n];
-    gm.copy_from_slice(&s.as_bytes()[..n]);
+    // A buffer from the shim's heap, above the guest's limit.
+    crate::shim_slice_mut(buf, n as u32).copy_from_slice(&s.as_bytes()[..n]);
     s.len() as u32
 }
 
@@ -244,6 +440,13 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
         ));
         return 1;
     }
+    // Loudly, as natively: a unit built at another base (or under another
+    // key) is silently not used otherwise.
+    crate::warn_line(&format!(
+        "gex-nt: image {} at base {:#x}: no function-tier unit (key {}), tier-1; build it with \
+         GEX_CGEN_GUARD=1 gexc cgen-image <image> --pe-base {:#x}\n",
+        x.path, x.base, x.key, x.base
+    ));
     0
 }
 
@@ -254,8 +457,8 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
 /// pages -- the native `ftab::publish`. 0, or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
-    let gm = GuestMem::new(crate::guest_bytes());
-    let slots: Vec<u64> = (0..n as u64).filter_map(|i| gm.read_u64(entries as u64 + 8 * i).ok()).collect();
+    let raw = crate::shim_slice(entries, 8 * n);
+    let slots: Vec<u64> = raw.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
     let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0).collect();
     let pairs: Vec<(u64, u32)> = slots.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     ftab(|m| m.publish(slots.len() as u32, u, Tier::Unit, &pairs));
@@ -265,32 +468,7 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             gex_kernel::ftab::fcache_clear(mem, a);
         }
     }
-    let (regs, dirs, nslots) = crate::with_host(|h| {
-        let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
-        let mut new_pages = Vec::new();
-        for &a in &addrs {
-            let page = a / gex_abi::DISPATCH_PAGE;
-            if page >= gex_abi::DISPATCH_MAX_PAGES {
-                continue;
-            }
-            let base = match h.jit.page_table.lookup(page) {
-                Some(b) => b,
-                None => {
-                    let b = h.jit.page_table.base(page);
-                    new_pages.push((page, b));
-                    b
-                }
-            };
-            let t = gex_abi::dispatch_entry_table(base) as u32;
-            seen.insert((t, gex_abi::dispatch_index(a, base) as u32));
-        }
-        let mut regs = Vec::with_capacity(2 * seen.len());
-        for (t, slot) in seen {
-            regs.extend_from_slice(&[t, slot]);
-        }
-        h.jit.translated.extend(addrs.iter().copied());
-        (regs, new_pages, h.jit.page_table.slots())
-    });
+    let (regs, dirs, nslots) = bridges(&addrs);
     {
         let mut units = lock(&UNITS);
         let Some(x) = units.get_mut(u as usize) else {
@@ -316,6 +494,364 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
     0
 }
 
+/// The bridges that make `addrs` reachable from tier-1: each address's
+/// dispatch slot (numbering its page if it has none) as `[table, slot]`,
+/// flattened for JS (a dense slot gets an index of its own in `blocks`,
+/// `gex_emit::dense::TABLE_INDEX`), the pages it numbered, and what the
+/// dispatch table must hold.
+pub(crate) fn bridges(addrs: &[u64]) -> (Vec<u32>, Vec<(u64, u32)>, u64) {
+    crate::with_host(|h| {
+        let mut seen: std::collections::BTreeSet<(u32, u32)> = Default::default();
+        let mut new_pages = Vec::new();
+        for &a in addrs {
+            let page = a / gex_abi::DISPATCH_PAGE;
+            if page >= gex_abi::DISPATCH_MAX_PAGES {
+                continue;
+            }
+            let base = match h.jit.page_table.lookup(page) {
+                Some(b) => b,
+                None => {
+                    let b = h.jit.page_table.base(page);
+                    new_pages.push((page, b));
+                    b
+                }
+            };
+            let t = gex_abi::dispatch_entry_table(base) as u32;
+            seen.insert((t, gex_abi::dispatch_index(a, base) as u32));
+        }
+        let mut regs = Vec::with_capacity(2 * seen.len());
+        // A dense table's slot gets an index in `blocks` of its own, which
+        // JS writes the bridge at (as table `gex_emit::dense::TABLE_INDEX`).
+        let dense: Vec<(u32, u32)> = seen.iter().copied().filter(|&(t, _)| crate::dense::map(t as usize).is_some()).collect();
+        let first = if dense.is_empty() { 0 } else { crate::dense::alloc(dense.len() as u32) };
+        for (j, &(t, slot)) in dense.iter().enumerate() {
+            crate::dense::set_slot(gex_abi::dispatch_entry(t as usize, slot), first + j as u32);
+            regs.extend_from_slice(&[gex_emit::dense::TABLE_INDEX, first + j as u32]);
+        }
+        for (t, slot) in seen {
+            if crate::dense::map(t as usize).is_none() {
+                regs.extend_from_slice(&[t, slot]);
+            }
+        }
+        h.jit.translated.extend(addrs.iter().copied());
+        (regs, new_pages, h.jit.page_table.slots())
+    })
+}
+
+/// How many export providers unit `u`'s image has.
+#[no_mangle]
+pub extern "C" fn gex_cgen_provider_count(u: u32) -> u32 {
+    lock(&UNITS).get(u as usize).map_or(0, |x| x.providers.len() as u32)
+}
+
+/// Provider `i` of unit `u`: its module's file under the unit cache.
+#[no_mangle]
+pub extern "C" fn gex_cgen_provider_file(u: u32, i: u32, buf: u32, cap: u32) -> u32 {
+    let units = lock(&UNITS);
+    units.get(u as usize).and_then(|x| x.providers.get(i as usize)).map_or(0, |p| put_str(&p.file, buf, cap))
+}
+
+/// Bind provider `i` of unit `u`, whose module is the `len` bytes at `ptr`,
+/// at its exports' addresses, after the unit (as the native
+/// `install_providers`): a range of the function table filled by its
+/// element segment, the addresses mapped to the slots holding the C
+/// functions bound to them, and bridges from tier-1. Returns the
+/// provider's module number (an install names `PROVIDER | number`), or -1.
+#[no_mangle]
+pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) -> i32 {
+    let (file, binds, stateful, data) = {
+        let units = lock(&UNITS);
+        let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
+        (p.file.clone(), p.binds.clone(), p.stateful.clone(), p.data)
+    };
+    let wasm = crate::shim_slice(ptr, len);
+    let names = match gex_cgen::provider::slot_names(wasm) {
+        Ok(n) => n,
+        Err(e) => {
+            crate::warn_line(&format!("gex-cgen: provider {file}: {e}\n"));
+            return -1;
+        }
+    };
+    let mut memory_base = 0u32;
+    let pairs: Vec<(u64, u32)> = match &stateful {
+        None => {
+            if data {
+                // A built-in stateful provider's data, top down as natively
+                // (`nt_cgen::install_providers`).
+                match builtin_data(&file, wasm) {
+                    Ok(b) => memory_base = b,
+                    Err(e) => {
+                        crate::warn_line(&format!("gex-nt: provider {file}: {e}\n"));
+                        return -1;
+                    }
+                }
+            }
+            binds
+                .iter()
+                .filter_map(|(f, a)| names.iter().position(|s| s.as_deref() == Some(f.as_str())).map(|k| (*a, k as u32)))
+                .collect()
+        }
+        Some((exports, entry)) => {
+            match stateful_pairs(&file, wasm, &names, exports, *entry) {
+                Ok((pairs, base)) => {
+                    memory_base = base;
+                    pairs
+                }
+                Err(e) => {
+                    crate::warn_line(&format!("gex-nt: stateful provider {file}: {e}\n"));
+                    crate::nt::end_process(0xc000_0135);
+                }
+            }
+        }
+    };
+    if pairs.is_empty() {
+        return -1;
+    }
+    let number = lock(&PROVIDERS).len() as u32;
+    ftab(|m| m.publish(names.len() as u32, PROVIDER | number, Tier::Unit, &pairs));
+    let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
+    {
+        let mem = crate::guest_bytes();
+        for &a in &addrs {
+            gex_kernel::ftab::fcache_clear(mem, a);
+        }
+    }
+    let (regs, dirs, slots) = bridges(&addrs);
+    crate::warn_line(&format!("gex-nt: provider {file}: {} exports\n", pairs.len()));
+    lock(&PROVIDERS).push(ProviderModule { file, regs, dirs, slots, memory_base });
+    number as i32
+}
+
+/// A stateful provider's bindings (the native `libprov::install`): each
+/// export to `gexp_<export>` or `gexp__missing`, the entry point to
+/// `gexp__entry`; and its data, allocated below 2 GiB.
+fn stateful_pairs(file: &str, wasm: &[u8], names: &[Option<String>], exports: &[(String, u64)], entry: u64) -> Result<(Vec<(u64, u32)>, u32), String> {
+    let missing = names
+        .iter()
+        .position(|s| s.as_deref() == Some("gexp__missing"))
+        .ok_or_else(|| "no gexp__missing in its module's table".to_string())? as u32;
+    let mut provided: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for (k, s) in names.iter().enumerate() {
+        if let Some(e) = s.as_deref().and_then(|s| s.strip_prefix("gexp_")).filter(|e| !e.starts_with('_') && !e.starts_with("ptr_")) {
+            provided.insert(e, k as u32);
+        }
+    }
+    let mut pairs = Vec::new();
+    let mut unprovided = Vec::new();
+    for (e, addr) in exports {
+        match provided.get(e.as_str()) {
+            Some(&k) => pairs.push((*addr, k)),
+            None => {
+                pairs.push((*addr, missing));
+                unprovided.push((*addr, e.clone()));
+            }
+        }
+    }
+    if let (Some(k), true) = (names.iter().position(|s| s.as_deref() == Some("gexp__entry")), entry != 0) {
+        pairs.push((entry, k as u32));
+    }
+    pairs.sort_by_key(|&(a, k)| (a, k == missing));
+    pairs.dedup_by_key(|&mut (a, _)| a);
+    lock(&MISSING).get_or_insert_with(Default::default).extend(unprovided);
+    let (size, align) = dylink_memory(wasm)?;
+    let data = provider_alloc_bytes((size as u64).max(16) + (1u64 << align), &format!("[provider {file} data]"))?;
+    let data = (data + (1u64 << align) - 1) & !((1u64 << align) - 1);
+    crate::warn_line(&format!("gex-nt: stateful provider {file}: {} exports, data at {data:#x}\n", pairs.len()));
+    Ok((pairs, data as u32))
+}
+
+/// The `dylink.0` memory size and alignment (log2) of a PIC module.
+fn dylink_memory(wasm: &[u8]) -> Result<(u32, u32), String> {
+    let e = |e: wasmparser::BinaryReaderError| e.to_string();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::CustomSection(c) = payload.map_err(e)? {
+            if c.name() != "dylink.0" {
+                continue;
+            }
+            let mut r = wasmparser::BinaryReader::new(c.data(), 0);
+            while !r.eof() {
+                let kind = r.read_u8().map_err(e)?;
+                let len = r.read_var_u32().map_err(e)? as usize;
+                let start = r.original_position();
+                if kind == 1 {
+                    let size = r.read_var_u32().map_err(e)?;
+                    let align = r.read_var_u32().map_err(e)?;
+                    return Ok((size, align));
+                }
+                r.read_bytes(len - (r.original_position() - start)).map_err(e)?;
+            }
+        }
+    }
+    Err("not a position-independent module (no dylink.0 memory info)".into())
+}
+
+/// Guest pages from the NT allocator, for a stateful provider.
+fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
+    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    crate::with_host(|h| gex_kernel::nt::boot::alloc_private(p, &mut h.kernel, size, name))
+}
+
+/// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a
+/// built-in provider's data, heap and stack, which then do not move the DLLs
+/// the program maps after them.
+fn provider_alloc_top_bytes(size: u64, name: &str) -> Result<u64, String> {
+    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    crate::with_host(|h| gex_kernel::nt::boot::alloc_private_top(p, &mut h.kernel, size, name))
+}
+
+/// A built-in stateful provider's data (its `dylink.0` size, aligned).
+fn builtin_data(file: &str, wasm: &[u8]) -> Result<u32, String> {
+    let (size, align) = dylink_memory(wasm)?;
+    let a = 1u64 << align;
+    let data = provider_alloc_top_bytes((size as u64).max(16) + a, &format!("[provider {file} data]"))?;
+    Ok(((data + a - 1) & !(a - 1)) as u32)
+}
+
+/// `gex.provider_alloc_top(size)`: fresh read-write guest pages from the top
+/// down (crt_heap's heap), or 0.
+#[no_mangle]
+pub extern "C" fn gex_provider_alloc_top(size: u32) -> u32 {
+    match provider_alloc_top_bytes(size as u64, "[provider heap]") {
+        Ok(a) => a as u32,
+        Err(e) => {
+            crate::warn_line(&format!("gex-nt: provider_alloc_top({size:#x}): {e}\n"));
+            0
+        }
+    }
+}
+
+/// This Worker's provider stack: top down unless an ejected project's
+/// stateful providers are set (its sessions were recorded with the stack
+/// bottom up, as the native `libprov::stack`).
+#[no_mangle]
+pub extern "C" fn gex_provider_stack(size: u32) -> u32 {
+    if lock(&STATEFUL).is_empty() {
+        gex_provider_alloc_top(size)
+    } else {
+        gex_provider_alloc(size)
+    }
+}
+
+/// `gex.nt_qpc()`: the process clock as NtQueryPerformanceCounter reads it
+/// (100 ns units), for the nt_qpc provider.
+#[no_mangle]
+pub extern "C" fn gex_nt_qpc() -> i64 {
+    crate::nt::process().map_or(0, |p| ((p.clocks.mono_ns)() / 100) as i64)
+}
+
+/// Provider module `number`'s data (`__memory_base`), 0 when stateless.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_memory_base(number: u32) -> u32 {
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| p.memory_base)
+}
+
+/// `gex.provider_alloc(size)`: fresh read-write guest pages, or 0.
+#[no_mangle]
+pub extern "C" fn gex_provider_alloc(size: u32) -> u32 {
+    match provider_alloc_bytes(size as u64, "[provider heap]") {
+        Ok(a) => a as u32,
+        Err(e) => {
+            crate::warn_line(&format!("gex-nt: provider_alloc({size:#x}): {e}\n"));
+            0
+        }
+    }
+}
+
+/// `gex.provider_ctx()`: the calling thread's context.
+#[no_mangle]
+pub extern "C" fn gex_provider_ctx() -> u32 {
+    crate::with_host(|h| h.threads[crate::cur()].kstate.ctx_addr) as u32
+}
+
+/// `gex.provider_missing(addr)`: the program called an export the provider
+/// does not implement. Ends the process, saying which.
+#[no_mangle]
+pub extern "C" fn gex_provider_missing(addr: u32) {
+    let addr = addr as u64;
+    let name = lock(&MISSING).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
+    crate::warn_line(&format!(
+        "gex-eject: the program called {name} ({}), an export of a replaced library that its provider does not implement\n",
+        crate::nt::describe(addr)
+    ));
+    crate::nt::end_process(0xc000_0139);
+}
+
+/// Whether the provider data at `base` still needs its relocations applied
+/// (once per process): 1 the first time, then 0.
+#[no_mangle]
+pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
+    static DONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let mut d = lock(&DONE);
+    if d.contains(&base) {
+        return 0;
+    }
+    d.push(base);
+    1
+}
+
+/// `gex.provider_try` calls and the throws they caught (GEX_NT_STATS).
+pub(crate) static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_provider_note(thrown: i32) {
+    TRIES.fetch_add(1, Ordering::Relaxed);
+    if thrown != 0 {
+        THROWS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Provider module `number`'s file, bridges and table need, as for a unit.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_file(number: u32, buf: u32, cap: u32) -> u32 {
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| put_str(&p.file, buf, cap))
+}
+
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_regs(number: u32, buf: u32, cap: u32) -> u32 {
+    let ps = lock(&PROVIDERS);
+    let Some(p) = ps.get(number as usize) else { return 0 };
+    let n = p.regs.len().min(cap as usize);
+    put_u32s(&p.regs[..n], buf);
+    p.regs.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_slots(number: u32) -> u32 {
+    lock(&PROVIDERS).get(number as usize).map_or(0, |p| p.slots.min(u32::MAX as u64) as u32)
+}
+
+/// The publishing Worker installed provider module `number`: the
+/// directory for the pages its bridges numbered.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_installed(number: u32) {
+    let dirs = lock(&PROVIDERS).get(number as usize).map(|p| p.dirs.clone()).unwrap_or_default();
+    write_dirs(dirs);
+}
+
+pub(crate) fn write_dirs(dirs: Vec<(u64, u32)>) {
+    crate::with_host(|h| {
+        let mut gm = GuestMem::new(crate::guest_bytes());
+        for (page, base) in dirs {
+            if h.jit.page_table.lookup(page) == Some(base) {
+                crate::dense::note_entry(base);
+                let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
+            }
+        }
+    });
+}
+
+/// Publish a module of `len` slots into the function table (`pairs`: guest
+/// address, slot): its install's number.
+pub(crate) fn publish(len: u32, module: u32, tier: Tier, pairs: &[(u64, u32)]) -> u32 {
+    ftab(|m| m.publish(len, module, tier, pairs))
+}
+
+/// The function table index serving `addr` now, if any.
+pub(crate) fn index_of(addr: u64) -> Option<u32> {
+    ftab(|m| m.get(addr).map(|f| f.idx))
+}
+
 /// How many units are published: a Worker installs up to this many.
 #[no_mangle]
 pub extern "C" fn gex_cgen_count() -> u32 {
@@ -335,10 +871,7 @@ pub extern "C" fn gex_cgen_regs(u: u32, buf: u32, cap: u32) -> u32 {
     let units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return 0 };
     let n = x.regs.len().min(cap as usize);
-    let mut gm = GuestMem::new(crate::guest_bytes());
-    for (i, v) in x.regs[..n].iter().enumerate() {
-        let _ = gm.write_u32(buf as u64 + 4 * i as u64, *v);
-    }
+    put_u32s(&x.regs[..n], buf);
     x.regs.len() as u32
 }
 
@@ -410,31 +943,191 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let mem = crate::guest_bytes();
     let hit = ftab(|m| {
         let f = m.get(addr)?;
-        let page = addr / gex_abi::DISPATCH_PAGE;
-        let patched = mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
-        if patched {
+        let stale = if m.install(f.install).tier == Tier::Jit {
+            !crate::fjit::current(f.install)
+        } else {
+            let page = addr / gex_abi::DISPATCH_PAGE;
+            mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0)
+        };
+        if stale {
             m.retire(addr);
             return None;
         }
         Some(f.idx)
     });
+    // Nothing serves it: the function JIT makes it, if it is on.
+    let hit = hit.or_else(|| crate::fjit::translate(addr));
     let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);
     gex_kernel::ftab::fcache_write(mem, addr, idx);
     idx as i32
 }
 
-/// The table's index 1: code no unit holds. The browser has no call-out
-/// yet (a nested guest run inside a wasm call), so this leaves for it:
-/// `ctx::PC` = the target, 0; the frame that owns the code it returns into
-/// catches it, else tier-1 runs it.
+/// The table's index 1: code no function body holds, under the `F_body`
+/// contract (the call-out, docs/function-tier.md §7.3, as natively): tier-1
+/// runs the target nested -- JavaScript's loop inside this call -- until the
+/// guest returns to `ret` with the stack back (1, the predicted return), so
+/// the frames that called here carry on in their bodies instead of leaving
+/// for tier-1. With no caller waiting (`NO_RETURN`), too deep a nest, or a
+/// run that cannot finish nested (the stack unwound past the caller), it
+/// leaves: `ctx::PC` set, 0.
 #[no_mangle]
-pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, _ret: i64) -> i32 {
+pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64) -> i32 {
     LEAVES.fetch_add(1, Ordering::Relaxed);
     let mut gm = GuestMem::new(crate::guest_bytes());
     let c = ctx as u32 as u64;
     let t = gm.read_u64(c + gex_abi::ctx::LAST_TARGET as u64).unwrap_or(0);
     let _ = gm.write_u64(c + gex_abi::ctx::PC as u64, t);
-    gex_abi::ftab::RET_LEFT
+    // A jump out of an exception dispatched nested: back to the frames it
+    // was raised under (nt::exc_escape), the dispatch's loop ends.
+    if crate::nt::exc_escape(ctx, t) {
+        crate::set_resume_none();
+        crate::trap();
+    }
+    if ret as u64 == gex_abi::ftab::NO_RETURN || !CALLOUT_ON.load(Ordering::Relaxed) {
+        return gex_abi::ftab::RET_LEFT;
+    }
+    if CALLOUTS.with(|c| c.borrow().len()) >= CALLOUT_MAX_DEPTH {
+        return gex_abi::ftab::RET_LEFT;
+    }
+    // The stack once the guest has returned: the caller's, past the return
+    // address (and whatever a stdcall callee pops, allowed for below).
+    let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+    let delta = if !gex_abi::X86 { 0 } else if gex_xlate::arch::compat() { 4 } else { 8 };
+    let want = sp + delta;
+    let cb = CB_DEPTH.with(|d| d.get());
+    let depth = CALLOUTS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.push((ret as u64, want, cb));
+        c.len() - 1
+    });
+    CALLOUT_N.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: a host import taking scalars; nothing here holds a lock.
+    let r = unsafe { call_out(ctx, t as i64, ret, want as i64) };
+    CALLOUTS.with(|c| c.borrow_mut().truncate(depth));
+    if r == gex_abi::ftab::RET_LEFT {
+        CALLOUT_LEFT.fetch_add(1, Ordering::Relaxed);
+    }
+    r
+}
+
+#[link(wasm_import_module = "gex_env")]
+extern "C" {
+    /// Run the guest from `target` in a nested loop until it returns to
+    /// `ret` with the stack pointer at `sp_want` (or what a callee popped
+    /// above it): 1; 0 when it cannot (`ctx::PC` says where the guest is).
+    fn call_out(ctx: i32, target: i64, ret: i64, sp_want: i64) -> i32;
+}
+
+/// `gex_set_callout(0)` turns the call-out off (the fallback always leaves,
+/// as before it existed), for measuring.
+static CALLOUT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[no_mangle]
+pub extern "C" fn gex_set_callout(on: i32) {
+    CALLOUT_ON.store(on != 0, Ordering::Relaxed);
+}
+
+/// Call-outs nested deeper than this leave instead: each holds a shim frame
+/// and a JS one.
+const CALLOUT_MAX_DEPTH: usize = 32;
+
+/// How far above a call-out's `sp_want` its return may come back (what a
+/// stdcall callee pops, or a function frame resumed inside), and past which
+/// the stack has unwound beyond its caller: as natively.
+pub(crate) const CALLOUT_UNWOUND: u64 = 64 << 10;
+
+static CALLOUT_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CALLOUT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// This Worker's call-outs in progress: `(ret, sp_want, NT callbacks in
+    /// progress when it began)`, innermost last.
+    static CALLOUTS: std::cell::RefCell<Vec<(u64, u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// NT user-mode callbacks in progress on this Worker (nt.rs).
+    static CB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The call-out whose return a dispatch miss found (`returned`), or -1.
+    static HIT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
+fn sp_index() -> u8 {
+    if gex_abi::X86 {
+        4
+    } else {
+        31
+    }
+}
+
+/// A dispatch missed at `pc` with the stack at `sp`: whether it is the
+/// return a call-out of this Worker waits for (the caller then traps; JS's
+/// nested loop ends that call-out). An untranslated return address is
+/// caught here; a translated one by the watched table entry (JS).
+pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
+    let sp = GuestMem::new(crate::guest_bytes()).read_u64(ctx + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+    // Only a call-out with no NT callback begun inside it (as `#watchHit`).
+    let cb = CB_DEPTH.with(|d| d.get());
+    let hit = CALLOUTS.with(|c| {
+        let v = c.borrow();
+        v.iter().rposition(|&(r, w, d)| d == cb && r == pc && sp >= w && sp <= w + CALLOUT_UNWOUND)
+    });
+    match hit {
+        Some(i) => {
+            HIT.with(|h| h.set(i as i32));
+            true
+        }
+        None => false,
+    }
+}
+
+/// A call-out at depth `depth` (and every deeper one) was left by an
+/// exception (JS's loop unwound through its frames): its entries go.
+#[no_mangle]
+pub extern "C" fn gex_callout_unwind(depth: u32) {
+    CALLOUTS.with(|c| c.borrow_mut().truncate(depth as usize));
+}
+
+/// NT user-mode callbacks in progress on this Worker.
+pub(crate) fn callback_depth() -> u32 {
+    CB_DEPTH.with(|d| d.get())
+}
+
+/// An NT user-mode callback begins (or ends) on this Worker.
+pub(crate) fn callback(enter: bool) {
+    CB_DEPTH.with(|d| d.set(if enter { d.get() + 1 } else { d.get().saturating_sub(1) }));
+}
+
+/// The call-out a miss found returned (its depth, 0 outermost), or -1;
+/// reading it clears it.
+#[no_mangle]
+pub extern "C" fn gex_callout_hit() -> i32 {
+    HIT.with(|h| h.replace(-1))
+}
+
+/// Call-outs made and left (for the stats line).
+pub(crate) fn callouts() -> (u64, u64) {
+    (CALLOUT_N.load(Ordering::Relaxed), CALLOUT_LEFT.load(Ordering::Relaxed))
+}
+
+/// How dispatch reaches `pc` in this Worker: `table << 32 | index`, the
+/// table being a dispatch table or `gex_emit::dense::TABLE_INDEX`
+/// (`blocks`); -1 when nothing is there yet (a miss). What a call-out
+/// watches its return through.
+#[no_mangle]
+pub extern "C" fn gex_dispatch_ref(pc: i64) -> i64 {
+    let pc = pc as u64;
+    let page = gex_abi::dispatch_page(pc);
+    if page >= gex_abi::DISPATCH_MAX_PAGES {
+        return -1;
+    }
+    let entry = GuestMem::new(crate::guest_bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(0);
+    if entry == 0 {
+        return -1;
+    }
+    let k = gex_abi::dispatch_entry_table(entry);
+    if crate::dense::map(k).is_some() {
+        let d = crate::dense::lookup(pc);
+        return if d == 0 { -1 } else { ((gex_emit::dense::TABLE_INDEX as i64) << 32) | d as i64 };
+    }
+    ((k as i64) << 32) | gex_abi::dispatch_index(pc, entry) as i64
 }
 
 /// The publishing Worker has installed unit `u`: point the directory at the
@@ -442,14 +1135,7 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, _ret: i64
 #[no_mangle]
 pub extern "C" fn gex_cgen_installed(u: u32) {
     let dirs = lock(&UNITS).get(u as usize).map(|x| x.dirs.clone()).unwrap_or_default();
-    crate::with_host(|h| {
-        let mut gm = GuestMem::new(crate::guest_bytes());
-        for (page, base) in dirs {
-            if h.jit.page_table.lookup(page) == Some(base) {
-                let _ = gm.write_u32(gex_abi::DISPATCH_DIR + page * 4, base);
-            }
-        }
-    });
+    write_dirs(dirs);
 }
 
 static LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -458,14 +1144,162 @@ static LEAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// bytes are, and how long they are.
 static RUNTIME: OnceLock<Vec<u8>> = OnceLock::new();
 
+fn runtime() -> &'static Vec<u8> {
+    RUNTIME.get_or_init(|| {
+        let m = gex_cgen::runtime::module();
+        let mut m = if !crate::dense::on() {
+            m
+        } else {
+            dense_runtime(&m).unwrap_or_else(|| {
+                crate::warn_line("gex-cgen: the function table's runtime module is not the shape expected; its bridge dispatches classically\n");
+                m
+            })
+        };
+        // Named, so a CPU profile tells it from tier-1 (`wasm://wasm/
+        // gex-ftab-runtime-...`; tests/nt/aot-share.mjs).
+        let name = b"gex-ftab-runtime";
+        let mut sub = vec![name.len() as u8];
+        sub.extend_from_slice(name);
+        let mut sec = vec![4u8];
+        sec.extend_from_slice(b"name");
+        sec.push(0); // the module-name subsection
+        put_leb(&mut sec, sub.len() as u32);
+        sec.extend_from_slice(&sub);
+        m.push(0);
+        put_leb(&mut m, sec.len() as u32);
+        m.extend_from_slice(&sec);
+        m
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn gex_ftab_runtime_ptr() -> u32 {
-    RUNTIME.get_or_init(gex_cgen::runtime::module).as_ptr() as u32
+    runtime().as_ptr() as u32
 }
 
 #[no_mangle]
 pub extern "C" fn gex_ftab_runtime_len() -> u32 {
-    RUNTIME.get_or_init(gex_cgen::runtime::module).len() as u32
+    runtime().len() as u32
+}
+
+fn leb(b: &[u8], p: &mut usize) -> Option<u32> {
+    let mut v = 0u32;
+    let mut shift = 0;
+    loop {
+        let byte = *b.get(*p)?;
+        *p += 1;
+        v |= ((byte & 0x7f) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+    }
+}
+
+fn put_leb(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if v != 0 { b | 0x80 } else { b });
+        if v == 0 {
+            return;
+        }
+    }
+}
+
+/// The runtime module (`gex_cgen::runtime`) with dense dispatch (the
+/// bridge carries on in tier-1 through its last function, `dispatch`): an
+/// import of `gex.blocks` after its tables, and that function replaced by
+/// `gex_emit::dense::dispatch_body`. `None` if the module is not the shape
+/// that was written for (memory, `ftab` and the dispatch tables imported, four
+/// functions defined, `dispatch` last, of type 3).
+fn dense_runtime(m: &[u8]) -> Option<Vec<u8>> {
+    if m.get(..8)? != b"\0asm\x01\0\0\0" {
+        return None;
+    }
+    let mut out = m[..8].to_vec();
+    let mut p = 8;
+    let mut tables = 0u32;
+    while p < m.len() {
+        let id = m[p];
+        p += 1;
+        let len = leb(m, &mut p)? as usize;
+        let body = m.get(p..p + len)?;
+        p += len;
+        let mut sec = Vec::new();
+        match id {
+            2 => {
+                let mut q = 0;
+                let n = leb(body, &mut q)?;
+                let start = q;
+                for _ in 0..n {
+                    for _ in 0..2 {
+                        let l = leb(body, &mut q)? as usize;
+                        q += l;
+                    }
+                    match *body.get(q)? {
+                        0 => {
+                            q += 1;
+                            leb(body, &mut q)?;
+                        }
+                        1 => {
+                            tables += 1;
+                            q += 2; // the kind, funcref
+                            let flag = *body.get(q)?;
+                            q += 1;
+                            leb(body, &mut q)?;
+                            if flag & 1 != 0 {
+                                leb(body, &mut q)?;
+                            }
+                        }
+                        2 => {
+                            q += 1;
+                            let flag = *body.get(q)?;
+                            q += 1;
+                            leb(body, &mut q)?;
+                            if flag & 1 != 0 {
+                                leb(body, &mut q)?;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                if tables != 1 + gex_abi::DISPATCH_TABLES as u32 {
+                    return None;
+                }
+                put_leb(&mut sec, n + 1);
+                sec.extend_from_slice(&body[start..]);
+                for name in [gex_abi::IMPORT_MODULE, gex_emit::dense::TABLE_NAME] {
+                    put_leb(&mut sec, name.len() as u32);
+                    sec.extend_from_slice(name.as_bytes());
+                }
+                sec.extend_from_slice(&[0x01, 0x70, 0x00, 0x00]);
+            }
+            10 => {
+                let mut q = 0;
+                let n = leb(body, &mut q)?;
+                if n != 4 {
+                    return None;
+                }
+                put_leb(&mut sec, n);
+                for k in 0..n {
+                    let at = q;
+                    let l = leb(body, &mut q)? as usize;
+                    q += l;
+                    if k + 1 < n {
+                        sec.extend_from_slice(body.get(at..q)?);
+                    } else {
+                        sec.extend_from_slice(&gex_emit::dense::dispatch_body(3, 1, tables));
+                    }
+                }
+            }
+            _ => sec.extend_from_slice(body),
+        }
+        out.push(id);
+        put_leb(&mut out, sec.len() as u32);
+        out.extend_from_slice(&sec);
+    }
+    Some(out)
 }
 
 /// Calls the fallback answered (it leaves), for the stats line.

@@ -48,9 +48,6 @@ fn real_main() -> Result<ExitCode> {
     let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c");
     let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
     gex_cgen::image::set_unguarded(native && !guard);
-    // The `native` providers too: a guarded build is for the browser's units,
-    // whose host has none of their imports.
-    gex_cgen::provider::set_native_host(native && !guard);
     match argv[1].as_str() {
         "run" => {
             // On a thread with a guest-sized stack: the first guest thread
@@ -142,6 +139,12 @@ usage:
                                    NT layer maps the image at that base. Run it
                                    with a memory cap: recovery of a large image
                                    is the peak
+  gexc cgen-image --nt-trampolines32|--nt-trampolines64 [--jobs N]
+                                   the NT trampoline page's unit, which the
+                                   native host builds at boot; the browser
+                                   needs it built ahead (GEX_CGEN_GUARD=1)
+  gexc cgen-image --providers      every export provider's module, into
+                                   GEX_CGEN_CACHE (the browser cannot build them)
   gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only] [--append]
                                    compile a staged Wine prefix's core DLLs
                                    (tools/nt-cgen-core.txt, or --set) for the
@@ -663,6 +666,10 @@ fn cmd_seed(args: &[String]) -> Result<()> {
         i += 1;
     }
     let out = out.unwrap_or_else(|| "seed.wasm".to_string());
+    // The seed is the browser's image module: its `enter` dispatches
+    // dense-capable, and it defines the `blocks` table (gex_emit::dense; a
+    // table stays classic while the host leaves its map word zero).
+    gex_emit::dense::set(true);
     let module = gex_xlate::seed_module(shared_memory);
     std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
     gex_native::validate_module(&module.wasm)
@@ -2280,11 +2287,29 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
                 i += 1;
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
             }
+            // The NT trampoline page (i386 with --nt-trampolines32): built
+            // at boot natively, ahead of time for the browser.
+            t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),
             other => path = Some(other.to_string()),
         }
         i += 1;
     }
     let path = path.context("expected a PE image")?;
+    if path == "--providers" {
+        let root = std::path::PathBuf::from(std::env::var("GEX_CGEN_CACHE").context("--providers needs GEX_CGEN_CACHE")?);
+        for p in gex_cgen::provider::all() {
+            let (out, _) = gex_cgen::provider::build(&p, &root)?;
+            eprintln!("provider {}: {}", p.name, out.display());
+        }
+        return Ok(());
+    }
+    if let Some(w) = path.strip_prefix("--nt-trampolines") {
+        let _lock = gex_native::nt_cgen::build_lock()?;
+        let t0 = std::time::Instant::now();
+        let out = gex_native::nt_cgen::prepare_trampolines(w == "32", jobs)?;
+        eprintln!("the NT trampolines ({w}-bit): {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     let base = pe_base.unwrap_or(pe.preferred_base);
