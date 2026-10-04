@@ -82,6 +82,31 @@ merge/web9 @ this commit; merge/web9-fjit (worktree wt/web9f) = it + F's
   are served through bridges (`serve`), FTAB_TIER1 handled. Not green:
   GEX_FJIT=1 hello_args/sync time out under run-node; debug that first.
 
+### Stream B state at the second reboot (2026-10-04, ~00:55)
+
+- **Browser fjit is green** on merge/web9-fjit (wt/web9f): 3cf08afe
+  (gex-xlate: `Src` is `repr(u8)`. The niche on the null guest-memory
+  pointer made every fetch empty. Also jumptable `with_capacity(hi - lo)`,
+  where `hi` asked for 16 GB) and 96ae953e (shim: MODULES held across
+  publish, GEX_FJIT=2 trace, GEX_FJIT_MAX/ONLY/DUMP knobs). Under taskset
+  5,11, `GEX_FJIT=1 tests/nt/run-browser.sh` is 49/49 and plain is 49/49.
+  F is cherry-picking 3cf08afe into merge/fjit (cg13). Merge web9-fjit
+  into web9 once merge/fjit carries both fixes and 3c9f6f82 (they re-key
+  units).
+- **Noita browser units: not finished.** The build of noita.exe at
+  0x400000 (key dir `27f192cd...`) was killed after 1h40 of clang at nice
+  19 with 2 jobs. About 2980 objects are in `target/bnoita2/cgen/objects`,
+  and the link had not run. These are cached per object, so a rerun only
+  compiles what is missing. The other seven images have not been started.
+  The providers are copied in. Resume with scratchpad
+  `web9/build-noita-images.sh web9/gexc-web9b` (log
+  `web9/bnoita2-img2.log`), then the page run above (run-noita-page.sh)
+  paired with `run-pewasm-page.sh` (pewasm about 59 world fps).
+- cg12 (coordinator): layout `~/.cache/gex/wine-11.15/gex-layout` sha256
+  63b13c67..., 18 D3D lines appended, and the existing bases are unchanged.
+  The native cache is `scratchpad/fjit/cgcache-cg12`. Build browser units
+  for the new D3D DLLs only when Peggle in the page needs them.
+
 ## Where the page is now
 
 Noita in headless Chromium, hardware WebGPU, full speed: about 4.2
