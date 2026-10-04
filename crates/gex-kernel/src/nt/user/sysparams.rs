@@ -38,17 +38,23 @@ impl Mode {
     /// primary surface, which wined3d moves between texture and memory
     /// whole (Peggle, windowed, reads back and re-uploads it twice a frame).
     pub fn startup() -> Mode {
-        static M: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
-        *M.get_or_init(|| {
-            std::env::var("GEX_NT_DESKTOP")
-                .ok()
-                .and_then(|v| {
-                    let (w, h) = v.split_once('x')?;
-                    let (w, h) = (w.parse().ok()?, h.parse().ok()?);
-                    SIZES.contains(&(w, h)).then_some(Mode { width: w, height: h, bpp: 32 })
-                })
-                .unwrap_or(Mode::DEFAULT)
-        })
+        *STARTUP.get_or_init(|| std::env::var("GEX_NT_DESKTOP").ok().and_then(|v| Mode::parse(&v)).unwrap_or(Mode::DEFAULT))
+    }
+
+    /// Set the mode at start from a `GEX_NT_DESKTOP` value (`WxH`), for a
+    /// host whose settings are not `std::env` (the browser's page). Before
+    /// the process starts; false when the size is not one on offer.
+    pub fn set_startup(spec: &str) -> bool {
+        match Mode::parse(spec) {
+            Some(m) => STARTUP.set(m).is_ok(),
+            None => false,
+        }
+    }
+
+    fn parse(v: &str) -> Option<Mode> {
+        let (w, h) = v.split_once('x')?;
+        let (w, h) = (w.parse().ok()?, h.parse().ok()?);
+        SIZES.contains(&(w, h)).then_some(Mode { width: w, height: h, bpp: 32 })
     }
 
     /// The mode in `nt::Process::display_mode`.
@@ -56,6 +62,8 @@ impl Mode {
         Mode::unpack(v.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
+
+static STARTUP: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
 
 /// The modes on offer, in EnumDisplaySettings order: each size at 32, 16 and
 /// 8 bpp, as Wine's virtual modes are.

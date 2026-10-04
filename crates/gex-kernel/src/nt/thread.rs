@@ -1012,6 +1012,7 @@ pub fn exit_thread(c: &mut Call<'_>, code: u32) {
     *t.exit_code.lock().unwrap() = Some(code);
     sync::abandon_mutants(c, t.tid);
     sync::signal_done(c, t.sync_id);
+    sync::yield_kick(c);
     c.p.remove_thread(&t);
     {
         let mut k = c.kernel();

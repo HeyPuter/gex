@@ -859,6 +859,21 @@ struct CallerHost<'a, 'b> {
 }
 
 impl nt::NtHost for CallerHost<'_, '_> {
+    // The yield park on the wasm memory's own wait queue, so the guest's
+    // `memory.atomic.notify` (the ConcRT provider's kicks) ends it too.
+    fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
+        match self.caller.data().memory.as_ref() {
+            Some(m) => m.shared().atomic_wait32(addr, expected, Some(timeout)).is_ok(),
+            None => false,
+        }
+    }
+
+    fn notify(&self, addr: u64) {
+        if let Some(m) = self.caller.data().memory.as_ref() {
+            let _ = m.shared().atomic_notify(addr, u32::MAX);
+        }
+    }
+
     fn run_callback(&mut self) -> std::result::Result<(), ()> {
         match nested_loop(self.caller, self.p) {
             Ok(()) => Ok(()),
