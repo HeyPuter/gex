@@ -4106,7 +4106,7 @@ impl Kernel {
 
     fn sys_mkdirat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
-        self.vfs.mkdir(&p, mode).map(|_| 0)
+        self.vfs.mkdir(&p, mode & !self.umask).map(|_| 0)
     }
 
     fn sys_unlinkat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {

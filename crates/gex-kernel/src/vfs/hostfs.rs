@@ -237,11 +237,19 @@ impl FileSystem for HostFs {
         std::fs::remove_file(self.host_path(path)?).map_err(|e| Errno::from_io(&e))
     }
 
-    fn mkdir(&self, path: &str, _mode: u32) -> Result<(), Errno> {
+    fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        std::fs::create_dir(self.host_path(path)?).map_err(|e| Errno::from_io(&e))
+        // The guest's mode (its umask already applied), as Linux would make
+        // it: wineserver refuses a server directory others can read. The
+        // owner keeps rwx, as `chmod` does for files, so gex can always
+        // manage what it made.
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode((mode & 0o7777) | 0o700)
+            .create(self.host_path(path)?)
+            .map_err(|e| Errno::from_io(&e))
     }
 
     fn rmdir(&self, path: &str) -> Result<(), Errno> {
