@@ -293,7 +293,7 @@ pub extern "C" fn gex_cgen_icall_path(u: u32, buf: u32, cap: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_cgen_set_icall(u: u32, ptr: u32, len: u32) {
     use std::hash::{Hash, Hasher};
-    let text = if len == 0 { String::new() } else { String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..(ptr + len) as usize]).into_owned() };
+    let text = if len == 0 { String::new() } else { String::from_utf8_lossy(crate::shim_slice(ptr, len)).into_owned() };
     let mut units = lock(&UNITS);
     let Some(x) = units.get_mut(u as usize) else { return };
     let hints = icall_hints(&text);
@@ -344,10 +344,18 @@ pub extern "C" fn gex_cgen_wanted() -> i32 {
     lock(&WANTED).front().map_or(-1, |&u| u as i32)
 }
 
+/// `v` into a buffer of the shim's heap (above the guest's limit).
+fn put_u32s(v: &[u32], buf: u32) {
+    let out = crate::shim_slice_mut(buf, 4 * v.len() as u32);
+    for (c, x) in out.chunks_exact_mut(4).zip(v) {
+        c.copy_from_slice(&x.to_le_bytes());
+    }
+}
+
 fn put_str(s: &str, buf: u32, cap: u32) -> u32 {
     let n = s.len().min(cap as usize);
-    let gm = &mut crate::guest_bytes()[buf as usize..buf as usize + n];
-    gm.copy_from_slice(&s.as_bytes()[..n]);
+    // A buffer from the shim's heap, above the guest's limit.
+    crate::shim_slice_mut(buf, n as u32).copy_from_slice(&s.as_bytes()[..n]);
     s.len() as u32
 }
 
@@ -397,8 +405,8 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
 /// pages -- the native `ftab::publish`. 0, or -1.
 #[no_mangle]
 pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
-    let gm = GuestMem::new(crate::guest_bytes());
-    let slots: Vec<u64> = (0..n as u64).filter_map(|i| gm.read_u64(entries as u64 + 8 * i).ok()).collect();
+    let raw = crate::shim_slice(entries, 8 * n);
+    let slots: Vec<u64> = raw.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
     let addrs: Vec<u64> = slots.iter().copied().filter(|&a| a != 0).collect();
     let pairs: Vec<(u64, u32)> = slots.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     ftab(|m| m.publish(slots.len() as u32, u, Tier::Unit, &pairs));
@@ -504,7 +512,7 @@ pub extern "C" fn gex_cgen_provider_publish(u: u32, i: u32, ptr: u32, len: u32) 
         let Some(p) = units.get(u as usize).and_then(|x| x.providers.get(i as usize)) else { return -1 };
         (p.file.clone(), p.binds.clone())
     };
-    let wasm = &crate::guest_bytes()[ptr as usize..(ptr + len) as usize];
+    let wasm = crate::shim_slice(ptr, len);
     let names = match gex_cgen::provider::slot_names(wasm) {
         Ok(n) => n,
         Err(e) => {
@@ -545,10 +553,7 @@ pub extern "C" fn gex_cgen_pmod_regs(number: u32, buf: u32, cap: u32) -> u32 {
     let ps = lock(&PROVIDERS);
     let Some(p) = ps.get(number as usize) else { return 0 };
     let n = p.regs.len().min(cap as usize);
-    let mut gm = GuestMem::new(crate::guest_bytes());
-    for (i, v) in p.regs[..n].iter().enumerate() {
-        let _ = gm.write_u32(buf as u64 + 4 * i as u64, *v);
-    }
+    put_u32s(&p.regs[..n], buf);
     p.regs.len() as u32
 }
 
@@ -596,10 +601,7 @@ pub extern "C" fn gex_cgen_regs(u: u32, buf: u32, cap: u32) -> u32 {
     let units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return 0 };
     let n = x.regs.len().min(cap as usize);
-    let mut gm = GuestMem::new(crate::guest_bytes());
-    for (i, v) in x.regs[..n].iter().enumerate() {
-        let _ = gm.write_u32(buf as u64 + 4 * i as u64, *v);
-    }
+    put_u32s(&x.regs[..n], buf);
     x.regs.len() as u32
 }
 
