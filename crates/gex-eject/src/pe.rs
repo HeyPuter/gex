@@ -208,7 +208,8 @@ if (record) {
 process.env.GEX_ARCH = 'x86';
 process.env.GEX_SHARED = '1';
 process.env.GEX_WEB_DIR = web;
-process.env.GEX_CGEN_CACHE = join(here, 'build/web/cgen');
+process.env.GEX_CGEN_CACHE = join(here, m.cgen ?? 'build/web/cgen');
+if (m.unguarded) process.env.GEX_CGEN_UNGUARDED = '1';
 process.argv = [
   process.argv[0], join(web, 'js/run-node.mjs'),
   '--cgen', ...(jit ? (record ? ['--aot'] : []) : ['--no-jit']),
@@ -252,10 +253,11 @@ pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
       exe: m.exe,
       env: env.join(','),
       cgen: '2',
-      cgenurl: '/project/build/web/cgen',
+      cgenurl: `/project/${m.cgen ?? 'build/web/cgen'}`,
       size: q.get('size') ?? '1320x800',
     });
     if (m.cwd && m.cwd !== '/') p.set('cwd', m.cwd);
+    if (m.unguarded) p.set('unguarded', '1');
     const argv = q.has('args') ? q.get('args').split(' ').filter((a) => a) : m.args;
     if (argv.length) p.set('argv', JSON.stringify(argv));
     if (!q.has('jit') && !q.has('record')) p.set('aot', '1');
@@ -422,6 +424,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         .transpose()?;
     let mut images_out = Vec::new();
     let mut web_inputs: Vec<(String, u64, Vec<u8>, Vec<u64>)> = Vec::new();
+    let web_entries = web_entries(dir);
     for m in images(&ntss) {
         let host = root.join(rootfs_rel(&m.path)?.strip_prefix("rootfs")?);
         let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
@@ -466,6 +469,9 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         // And the starts above that recovery did not find: the unit's key
         // and contents stay those of the image alone.
         interior.extend(seeds);
+        // And where a training run of the web build entered (its units are
+        // these ones, unguarded): one region module for both runtimes.
+        interior.extend(web_entries.iter().copied().filter(|&a| a >= m.base && a < end));
         web_inputs.push((m.path.clone(), m.base, bytes.clone(), interior.clone()));
         if !interior.is_empty() {
             let failed = nt_cgen::prepare_regions(&pe, m.base, &p, &interior, jobs)?;
@@ -534,6 +540,17 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
 }
 
 #[cfg(feature = "build")]
+/// Where a training run of the web build (`./run.mjs --record-entries`,
+/// `index.html?record`) entered code the units have no entry for.
+fn web_entries(dir: &Path) -> Vec<u64> {
+    std::fs::read_to_string(dir.join("user/web-entries.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| u64::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+#[cfg(feature = "build")]
 /// Functions a unit was built without (gex-cgen left them to tier-1):
 /// uncovered in a project that runs with no translation.
 fn note_left(pe: &gex_ld::pe::PeImage, base: u64, unit: &Path, path: &str, what: &str, report: &mut PeReport) -> Result<()> {
@@ -565,18 +582,24 @@ fn build_web(
     report: &mut PeReport,
 ) -> Result<()> {
     let web = dir.join("build/web/cgen");
-    std::fs::create_dir_all(&web)?;
+    let guarded_build = std::env::var("GEX_EJECT_WEB_GUARDED").as_deref() == Ok("1");
+    std::fs::create_dir_all(dir.join("build/web"))?;
+    if guarded_build {
+        std::fs::create_dir_all(&web)?;
+    }
     // Recovery and C objects do not depend on the flavour (objects are keyed
     // by their C): the native build's, shared.
-    for d in ["recovery", "objects"] {
+    for d in ["recovery", "objects"].into_iter().filter(|_| guarded_build) {
         let to = web.join(d);
         if std::fs::symlink_metadata(&to).is_err() {
             std::fs::create_dir_all(native.join(d))?;
             std::os::unix::fs::symlink(Path::new("../../units").join(d), &to)?;
         }
     }
-    std::fs::create_dir_all(web.join("icall"))?;
-    if let Ok(rd) = std::fs::read_dir(native.join("icall")) {
+    if guarded_build {
+        std::fs::create_dir_all(web.join("icall"))?;
+    }
+    if let Ok(rd) = std::fs::read_dir(native.join("icall")).map(|r| r.filter(|_| guarded_build)) {
         for e in rd.flatten() {
             let to = web.join("icall").join(e.file_name());
             if !to.exists() {
@@ -584,18 +607,24 @@ fn build_web(
             }
         }
     }
-    let sources: Vec<PathBuf> = std::env::var("GEX_EJECT_WEB_UNIT_CACHE")
+    let mut sources: Vec<PathBuf> = std::env::var("GEX_EJECT_WEB_UNIT_CACHE")
         .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default();
-    // Where a training run of the web build (`./run.mjs --record-entries`)
-    // entered code the units have no entry for.
-    let web_entries: Vec<u64> = std::fs::read_to_string(dir.join("user/web-entries.txt"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| u64::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
-        .collect();
+    let web_entries = web_entries(dir);
+    // The unguarded flavour (stream B's step 0): the native units, by the
+    // same keys, so the web build adds nothing to compile. The browser's
+    // guard protects nothing its memory's end does not (docs/browser-units-
+    // plan.md). GEX_EJECT_WEB_GUARDED=1: the guarded flavour, built apart.
+    let guarded = std::env::var("GEX_EJECT_WEB_GUARDED").as_deref() == Ok("1");
+    let web = if guarded {
+        web
+    } else {
+        let _ = std::fs::remove_dir_all(&web);
+        sources.extend(std::env::var("GEX_EJECT_UNIT_CACHE").map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect::<Vec<_>>()).unwrap_or_default());
+        native.to_path_buf()
+    };
     std::env::set_var("GEX_CGEN_CACHE", &web);
-    gex_cgen::image::set_unguarded(false);
+    gex_cgen::image::set_unguarded(!guarded);
     let r = (|| -> Result<()> {
         {
             let (image, _) = gex_kernel::nt::boot::trampoline_input(class32);
@@ -667,6 +696,9 @@ fn build_web(
         ("env", strs(&ntss.env)),
         ("settings", strs(&settings)),
         ("gl", b(ntss.gl)),
+        // The units' directory in the project, and their flavour.
+        ("cgen", s(web.strip_prefix(dir).unwrap_or(&web).to_string_lossy())),
+        ("unguarded", b(!guarded)),
     ]);
     std::fs::write(dir.join(WEB_NT_RUN), crate::json::write(&j))?;
     // The page's bundle: the rootfs as one tar (links followed), which the
