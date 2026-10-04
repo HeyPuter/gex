@@ -391,6 +391,38 @@ code or move its PC, so signals are delivered at syscall returns:
 The x86 and i386 paths are covered by x86-programs, lockstep and tests/nt
 as before.
 
+### 3.12 Unix libraries: a closed world, dlopen by registry (W1)
+
+Wine's Unix side loads libraries with `dlopen`: ntdll.so loads each PE
+module's unixlib (`ws2_32.so`, `opengl32.so`, …) and the drivers
+(`winewayland.drv.so`), then `dlsym`s `__wine_unix_call_funcs`. Under gex
+there is no run-time dynamic linking. **Every Unix library a build will use
+is linked into the program** (the eject model, pewasm's whole-program
+static build). musl's wasm32 `dlopen` looks the name up in a registry the
+link adds:
+
+- **Renaming:** each library is compiled with its exported symbols renamed
+  apart (`-D__wine_unix_call_funcs=ws2_32__wine_unix_call_funcs`). Wine's
+  unixlibs export only a handful of names; everything else in them is
+  `static`, and their calls into ntdll.so are ordinary symbols that resolve
+  at link time.
+- **The registry:** `tools/wine-wasm/dlreg.py` writes it, one entry per
+  `(library file name, symbol, renamed symbol, data|func)`.
+- **Lookup:** `dlopen` matches the file name in any directory (Wine asks
+  for `…/i386-unix/ws2_32.so`). `dlsym` searches one library, or all of
+  them for `RTLD_DEFAULT`/`dlopen(NULL)`. `dlclose` does nothing.
+- **Why:**
+  - nothing to instantiate per Worker at run time (§3.7's startup risk
+    goes away for the Unix side);
+  - direct calls and LTO across ntdll.so, win32u.so and the drivers;
+  - no shim support for side modules.
+
+  A run-time loader (side modules instantiated per thread, symbol binding
+  through the store's instances) stays possible if something needs it.
+- **Tested:** the ws2_32 harness finds `__wine_unix_call_funcs` through
+  `dlopen("/usr/lib/wine/i386-unix/ws2_32.so")`, and an unlinked library
+  fails with dlerror (`tools/wine-wasm/spike-a/ws2test.c -DUSE_DLOPEN`).
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
