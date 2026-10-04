@@ -604,6 +604,8 @@ async function handle(msg) {
           link: msg.link ?? msg.opts?.link,
           dense: msg.dense ?? msg.opts?.dense,
           fjit: msg.fjit ?? msg.opts?.fjit,
+          fjitMax: msg.fjitMax ?? msg.opts?.fjitMax,
+          fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
           wantLibrary,
         },
       );

@@ -24,6 +24,25 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) const FJIT: u32 = 1 << 30;
 
 static ON: AtomicBool = AtomicBool::new(false);
+/// `gex_set_fjit(2)`: each translation on stderr.
+static TRACE: AtomicBool = AtomicBool::new(false);
+/// At most this many translations, the rest declined (bisecting a bad one).
+static LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// Translate only the function at this address (0: any).
+static ONLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Debugging: translate at most `n` functions, or (`only` != 0) just the one at `only`.
+#[no_mangle]
+pub extern "C" fn gex_fjit_limit(n: u32, only: i64) {
+    LIMIT.store(n, Ordering::Relaxed);
+    ONLY.store(only as u64, Ordering::Relaxed);
+}
+
+fn trace(s: &str) {
+    if TRACE.load(Ordering::Relaxed) {
+        crate::stderr_line(&format!("[fjit] {s}\n"));
+    }
+}
 static JIT: OnceLock<gex_xlate::fjit::Jit> = OnceLock::new();
 
 /// One translation: its bytes (named `gex-fjit` for profiles), the bridges
@@ -59,6 +78,7 @@ pub(crate) fn on() -> bool {
 #[no_mangle]
 pub extern "C" fn gex_set_fjit(on: i32) {
     ON.store(on != 0, Ordering::Relaxed);
+    TRACE.store(on == 2, Ordering::Relaxed);
     if on != 0 {
         let _ = JIT.get_or_init(|| gex_xlate::fjit::Jit::new(Default::default()));
     }
@@ -119,6 +139,10 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     if !on() || is_tier1_only(addr) {
         return None;
     }
+    let only = ONLY.load(Ordering::Relaxed);
+    if (only != 0 && addr != only) || lock(&MODULES).len() as u32 >= LIMIT.load(Ordering::Relaxed) {
+        return None;
+    }
     let jit = JIT.get()?;
     let (exec, ro): (Vec<(u64, u64)>, Vec<(u64, u64)>) = crate::with_host(|h| {
         use gex_kernel::mem::prot;
@@ -144,8 +168,10 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
         g
     };
     let class32 = gex_abi::X86 && gex_xlate::arch::compat();
+    trace(&format!("translate {addr:#x}"));
     let Some(wasm) = jit.translate(crate::guest_bytes(), addr, &executable, &read_only, &pg, class32) else {
         DECLINED.fetch_add(1, Ordering::Relaxed);
+        trace(&format!("declined {addr:#x}"));
         return None;
     };
     let funcs = gex_kernel::ftab::module_funcs(&wasm)?;
@@ -154,7 +180,12 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
         return None;
     }
     let wasm = named(wasm);
-    let n = lock(&MODULES).len() as u32;
+    // Held until the module is in the list: a Worker replaying the
+    // function table's log (`gex_fjit_ptr`, `gex_fjit_regs`) waits for it
+    // rather than reading nothing, and two Workers translating at once get
+    // numbers of their own.
+    let mut modules = lock(&MODULES);
+    let n = modules.len() as u32;
     let pairs: Vec<(u64, u32)> = funcs.iter().enumerate().map(|(k, &a)| (a, k as u32)).collect();
     let install = crate::cgen::publish(funcs.len() as u32, FJIT | n, gex_kernel::ftab::Tier::Jit, &pairs);
     lock(&CHECKS).get_or_insert_with(Default::default).insert(install, checks.into_inner());
@@ -171,9 +202,12 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
             dirs.push(d);
         }
     }
-    lock(&MODULES).push(Module { wasm, regs, dirs, slots });
+    modules.push(Module { wasm, regs, dirs, slots });
+    drop(modules);
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
-    crate::cgen::index_of(addr)
+    let idx = crate::cgen::index_of(addr);
+    trace(&format!("module {n}: {addr:#x} {} funcs, install {install}, index {idx:?}", funcs.len()));
+    idx
 }
 
 /// `wasm` with a module name, `gex-fjit` (tests/nt/aot-share.mjs: jit).

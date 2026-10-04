@@ -1217,7 +1217,8 @@ export class Gex {
     // The function JIT (fjit.rs): its translations reach the function table,
     // which the function tier's plumbing drives (units where any exist).
     if (opts.fjit && e.gex_set_fjit) {
-      e.gex_set_fjit(1);
+      e.gex_set_fjit(opts.fjit === 2 ? 2 : 1);
+      if (opts.fjitMax != null || opts.fjitOnly) e.gex_fjit_limit?.(opts.fjitMax ?? 0xffffffff, BigInt(opts.fjitOnly ?? 0));
       if (!this.#cgenMode) this.useCgen(1);
     }
     this.#offerToFill(this.#guest);
@@ -2547,6 +2548,8 @@ export class Gex {
     const e = this.#shim.exports;
     const ptr = e.gex_fjit_ptr(n) >>> 0;
     const bytes = this.#bytes().slice(ptr, ptr + (e.gex_fjit_len(n) >>> 0));
+    const dump = globalThis.process?.env?.GEX_FJIT_DUMP;
+    if (dump) globalThis.process.getBuiltinModule('fs').writeFileSync(`${dump}/fjit-${n}.wasm`, bytes);
     const t0 = performance.now();
     mod = new WebAssembly.Module(bytes);
     this.#compileMs += performance.now() - t0;
