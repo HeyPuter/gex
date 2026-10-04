@@ -774,7 +774,10 @@ plus `make -k`.
 
 **Open, with what they need:**
 - **Native runs of code that uses setjmp (`__TRY`)** need wasm exception
-  handling, i.e. the wasmtime upgrade (§3.4). V8 runs it today.
+  handling, i.e. the wasmtime upgrade (§3.4). V8 runs it today. The SjLj
+  runtime and its tag are archive members of their own (winecrt0, musl),
+  so only modules that use setjmp carry exception handling: 38 of the 1,188
+  modules the build links.
 - **The longjmp tag:** each DLL module defines `__c_longjmp`, so a longjmp
   between two DLL modules would not be caught. The single PE-side module
   (§3.13, W2) removes that. A per-DLL build would need the tag imported

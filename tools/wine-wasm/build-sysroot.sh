@@ -18,10 +18,16 @@ JOBS=${JOBS:-4}
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/sysroot/lib"
 
 cd "$OUT/musl-build"
+# reconfigure when the flags changed (configure bakes them in)
+if [ "$(cat .gex-flags 2>/dev/null)" != "$WASM_CFLAGS" ]; then
+  rm -f config.mak
+  [ -f Makefile ] && make -s clean >/dev/null 2>&1 || true
+fi
 if [ ! -f config.mak ]; then
   CC=clang CFLAGS="$WASM_CFLAGS" AR=llvm-ar RANLIB=llvm-ranlib \
     "$MUSL/configure" --target=wasm32-unknown-linux-musl --prefix="$OUT/sysroot" \
     --disable-shared --enable-static >/dev/null
+  printf '%s' "$WASM_CFLAGS" > .gex-flags
 fi
 # musl's makefile tracks no header dependencies: a changed header (the
 # wasm32 syscall stub is one) means rebuilding everything.
