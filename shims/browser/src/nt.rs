@@ -623,10 +623,12 @@ mod imp {
             // whether they woke anyone, since the last report.
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
             warn_line(&format!(
-                "gex-nt: yield parks woken={} moved={} timed_out={} kicks waking={} idle={}\n",
+                "gex-nt: yield parks woken={} ({} ms) moved={} timed_out={} ({} ms) kicks waking={} idle={}\n",
                 take(&YIELD_PARKS[0]),
+                take(&YIELD_PARK_NS[0]) / 1_000_000,
                 take(&YIELD_PARKS[1]),
                 take(&YIELD_PARKS[2]),
+                take(&YIELD_PARK_NS[2]) / 1_000_000,
                 take(&YIELD_KICKS[1]),
                 take(&YIELD_KICKS[0])
             ));
@@ -673,6 +675,8 @@ mod imp {
     /// timed out) and kicks (`notify`) by whether they woke a waiter.
     pub(crate) static YIELD_PARKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
     pub(crate) static YIELD_KICKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    /// And the time spent in them, by result.
+    pub(crate) static YIELD_PARK_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
     /// Exceptions dispatched nested and escaped back (the stats line).
     pub(crate) static EXC_NESTED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static EXC_ESCAPED: AtomicU64 = AtomicU64::new(0);
@@ -822,9 +826,11 @@ mod imp {
         fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
             let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
             // SAFETY: an aligned guest word of the shared memory.
+            let t0 = mono_raw();
             let r = unsafe { crate::warch::memory_atomic_wait32(p, expected as i32, timeout.as_nanos() as i64) };
             if let Some(n) = YIELD_PARKS.get(r as usize) {
                 n.fetch_add(1, Ordering::Relaxed);
+                YIELD_PARK_NS[r as usize].fetch_add(mono_raw().saturating_sub(t0), Ordering::Relaxed);
             }
             true
         }
