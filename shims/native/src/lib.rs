@@ -3073,6 +3073,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         imports::ILLEGAL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> Result<()> {
             if caller.data().nt.is_some() {
+                // What gex could not decode, or a deliberate trap: the bytes
+                // say which (the guest's handler may take it either way).
+                if let Some(m) = caller.data().memory.clone() {
+                    let gm = GuestMem::new(m.bytes());
+                    let bytes: Vec<String> = gm.read(pc as u64, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect()).unwrap_or_default();
+                    eprintln!("gex-nt: illegal instruction at {:#x}: {}", pc as u64, bytes.join(" "));
+                }
                 return nt::fault(&mut caller, nt::Fault::Illegal, pc as u64);
             }
             let pc = pc as u64;
