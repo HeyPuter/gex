@@ -53,6 +53,35 @@ How step 1 came out, against the plan below:
   GEX_NT_STATS line's accounting; browser-noita.mjs prints it with
   `GEX_NT_PROFILE`.
 
+### Stream B state at the reboot (2026-10-03, late)
+
+merge/web9 @ this commit; merge/web9-fjit (worktree wt/web9f) = it + F's
+3c9f6f82 + a WIP browser function JIT.
+
+- Done and gated (run-browser.sh 49/49 plain and --cgen, games ok): dense
+  tables, units + providers + icall keys, the call-out, in-place dispatch
+  misses (65f9a719's half), nested NtRaiseException (ffa2cec9's half; seh.exe
+  x86: exc_nested=20 escaped=19 with GEX_NT_EXC_TRACE=1), GEX_NT_FIXED_TIME,
+  fault-pc bit 62 masked.
+- pewasm in the page (port/browser.mjs, scratchpad `web9/run-pewasm-page.sh`,
+  fixed seed, 4x): about 58 world fps. gex's Noita-on-units number is next.
+- **Noita browser units** (GEX_CGEN_GUARD=1, gexc built from 0dc27c10, copy
+  at scratchpad `web9/gexc-web9b`): the whole prefix is built into
+  `target/bnoita2/cgen` (2991 s); the eight Noita images were not (noita.exe
+  was compiling when stopped). Resume with scratchpad
+  `web9/build-noita-images.sh web9/gexc-web9b` (the bases the page uses:
+  noita 0x400000, lua51 0x1560000, msvcr120 0x15c0000, SDL2 0x6c740000,
+  msvcp120 0x16b0000, fmod 0x1730000, fmodstudio 0x18f0000, steam_api
+  0x1a10000; nice 19, 2 jobs), copy `target/bnt2/cgen/providers` in, then
+  `GEX_CGEN_CACHE=target/bnoita2/cgen GEX_WINE_PREFIX=target/bnoita2/prefix
+  GEX_NT_PAGE_FLAGS='&cgen=2' GEX_NT_PAGE_ENV=GEX_NT_FIXED_TIME=1767225600,GEX_NT_TIME_SCALE=4
+  GEX_NT_PROFILE=worker,60,20 run-noita-page.sh TAG --gameplay` (scratchpad),
+  and check the AOT line before trusting the fps.
+- **Function JIT (WIP, wt/web9f):** shims/browser/src/fjit.rs translates a
+  `gex.lookup` miss in the shim and publishes it as `FJIT | n`; tier-1 misses
+  are served through bridges (`serve`), FTAB_TIER1 handled. Not green:
+  GEX_FJIT=1 hello_args/sync time out under run-node; debug that first.
+
 ## Where the page is now
 
 Noita in headless Chromium, hardware WebGPU, full speed: about 4.2
