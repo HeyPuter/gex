@@ -324,11 +324,19 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             .map(PathBuf::from)
             .or_else(|| o.runtime.parent().map(|d| d.join("gex-rt")))
             .filter(|p| p.is_file());
-        if let Some(src) = found {
-            let dst = out.join("runtime/gex-rt");
-            if std::fs::hard_link(&src, &dst).is_err() {
-                write_file(&dst, &std::fs::read(&src)?, true)?;
-            }
+        // Without it run.sh's default would be gexc, which holds the
+        // translator (docs/eject-pe.md §0): refuse rather than ship that.
+        let Some(src) = found else {
+            bail!(
+                "no gex-rt for this Windows program's project: set GEX_RT to a gex-rt binary \
+                 (cargo build --release -p gex-rt --features x86 --target-dir target/x86-rt) \
+                 or put one beside {}",
+                o.runtime.display()
+            );
+        };
+        let dst = out.join("runtime/gex-rt");
+        if std::fs::hard_link(&src, &dst).is_err() {
+            write_file(&dst, &std::fs::read(&src)?, true)?;
         }
     }
 
