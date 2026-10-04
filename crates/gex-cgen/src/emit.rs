@@ -64,9 +64,11 @@ pub(crate) fn cty(ty: Ty) -> &'static str {
 }
 
 /// Whether `r` lives in a 32-bit C variable: an i386 program's
-/// general-purpose registers (the context slot is 64 bits, but every write
-/// zero-extends, so the low half is the register). `GEX_CGEN_NARROW=0` keeps
-/// them 64-bit. Arithmetic, addresses and compares then stay in i32, where
+/// general-purpose registers (the context slot is 64 bits and its low half
+/// is the register, so loads read only that). Stores stay 64-bit: the high
+/// half is not always zero (the Linux layer writes a syscall's result
+/// sign-extended), and a 32-bit store would keep a stale high half that
+/// 64-bit readers see. `GEX_CGEN_NARROW=0` keeps them 64-bit. Arithmetic, addresses and compares then stay in i32, where
 /// wasm needs no wraps and extends between them.
 pub(crate) fn narrow_reg(r: GuestReg, class32: bool) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -526,6 +528,10 @@ impl<'a> Emitter<'a> {
                 "(uint64_t)(uint32_t)ctx".to_string()
             } else if r.is_flag() {
                 format!("GEX_C8({off}u)")
+            } else if narrow_reg(r, self.class32) {
+                // The low half is the register (`narrow_reg`), as the lazy
+                // load reads it.
+                format!("GEX_C32({off}u)")
             } else {
                 match r.ty() {
                     Ty::I32 => format!("GEX_C32({off}u)"),
