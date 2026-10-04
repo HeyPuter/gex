@@ -218,6 +218,58 @@ directory, statics, stack and heap); the guest takes 2 GiB..4 GiB-64 KiB.
   audit is most of the work, plus the gates and Noita, Peggle and
   Half-Life in the page.
 
+**Step 1, refined (design work while step 0 builds):**
+- **Fold verified:** clang -O2 for wasm32 puts `(char *)(uint32_t)a +
+  0x80000000u (+ disp)` entirely in the memarg (`i32.load offset=
+  0x80000008`). No instruction is added per access.
+- **The shim's link layout stays as it is.** Its statics and stack at
+  0x0600_0000 are already below 2 GiB; only the NT heap moves, from
+  `NT_HEAP_BASE` 0x8000_0000 up, to 0x0800_0000..0x8000_0000 (about
+  1.9 GiB, against about 2 GiB now). The runtime's low area (thread
+  contexts at 0x1000, the dispatch directory at 1 MiB) stays where it is,
+  and is then outside the guest's reach. Today a guest null-pointer field
+  writes into it, which is why `GUEST_FLOOR` exists.
+- **One base per process,** chosen at boot: 0x8000_0000 for an NT i386
+  process, 0 otherwise.
+  - tier-1: a per-process emitter setting (`set_guard_limit` already is
+    one). The base goes into the memarg, and the 2 GiB guard goes away.
+  - Units and providers: a compile-time flavor in the key (`:bias80`,
+    `GEX_GUEST_BASE` in gex_abi.h, used only by GEX_P and GA). This is
+    the only gex-cgen change: two macros and a key suffix, called out
+    for F.
+  - The kernel: `guest_bytes()` starts at the base, so GuestMem follows,
+    and its slice stays under `isize::MAX`.
+  - JS: `Gex.guestBase` for every reader of a *guest* pointer. Addresses
+    the shim hands over that are its own (rings, contexts, command
+    buffers in its heap) are linear already and stay as they are.
+- **The NT allocator:** top-down and zero-bits allocation cap at
+  `ALLOC_HIGH` 0x7fff0000. But `Vm::is_free` (fixed-address
+  NtAllocateVirtualMemory and NtMapViewOfSection) accepts any range up to
+  `GUEST_LIMIT` 0xffff0000. So a fixed request at 2 GiB or above
+  succeeds today, and in the page it lands in the shim's heap: a latent
+  bug now, and a must-fix for step 1. Cap it at the process's user limit
+  (0x7fff0000 for i386). The KUSER_SHARED_DATA, PEB and TEB addresses
+  (0x7ffe0000, 0x7ffd....) are below it.
+- **Memory:** the page's memory starts at 2 GiB plus the guest's initial
+  size. V8 reserves the maximum and commits the initial size. Pages never
+  touched cost no RSS, but check that Chrome's renderer limit counts RSS
+  and not the commit (the first run's memwatch line).
+- **Readers to audit** (sites that touch `memory.buffer` / DataView):
+  gex.mjs 56, gl.js 15, worker.mjs 11, compositor-worker.js 10, gl-bridge
+  7, mesa-gl 6, wl-bridge 4, dom-compositor 3, host 2. Most take
+  addresses the shim computed. The guest ones are GL client memory
+  (opengl32 client arrays, glTexImage pixels, glReadPixels out), wl SHM
+  buffers, NT callback and exception frames (the ctx's SP and PC are
+  guest values), and the call-out's stack reads.
+- **Test** (the coordinator's condition): a tests/nt case that maps a
+  buffer at the top of the allocatable range (fixed base near 0x7ff0_0000),
+  fills it, and hands it to GL (glTexImage2D, glReadPixels) and to a wl
+  SHM buffer, with run-browser.sh checking the pixels. With base 0 it
+  passes trivially; with the bias, a reader that forgot the base reads
+  the shim's heap and fails. Also a debug base (`GEX_NT_GUEST_BASE`,
+  e.g. 0x4000_0000 with the guest capped at 1 GiB), so an error can't
+  hide behind memory that happens to be zero.
+
 **Rejected:**
 - *Mask (`a & 0x7fffffff`):* one AND per access, but isolation by silent
   aliasing (a wild pointer corrupts guest memory instead of faulting).
