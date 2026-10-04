@@ -65,7 +65,8 @@ pub(crate) fn for_dll(dll: &str) -> Vec<&'static LibProvider> {
 /// What every store instantiates a stateful provider with.
 #[derive(Clone, Copy, Debug)]
 pub struct Extras {
-    pub memory_base: u32,
+    /// A guest address: above 4 GiB is possible in a 64-bit guest memory.
+    pub memory_base: u64,
 }
 
 /// Bytes of C stack each guest thread gets for its stateful providers.
@@ -107,8 +108,13 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
     // ejected project's sessions were recorded with it bottom-up.
     let name = format!("[provider stack, thread {tid}]");
     let base = if LIBS.get().map_or(true, |v| v.is_empty()) { alloc_top(cx.data_mut(), STACK, &name)? } else { alloc(cx.data_mut(), STACK, &name)? };
-    let top = (base + STACK - 16) as i32;
-    let g = wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Var), Val::I32(top))?;
+    let top = base + STACK - 16;
+    // Pointer-sized: i64 for a wasm64 provider beside a 64-bit guest memory.
+    let g = if gex_abi::mem64() {
+        wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, wasmtime::Mutability::Var), Val::I64(top as i64))?
+    } else {
+        wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Var), Val::I32(top as i32))?
+    };
     if let Some(s) = cx.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
         s.provider_sp = Some(g.clone());
     }
@@ -129,6 +135,18 @@ fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
     let len = (size + 0xfff) & !0xfff;
     state
         .with_kernel(|k| k.mem.mmap(0, len, prot::READ | prot::WRITE, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
+        .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
+}
+
+/// A page for a guest code address a provider binds (a thread entry): low,
+/// where code lives in a 64-bit guest memory (docs/mem64.md), and read-only.
+fn alloc_code(state: &mut HostState, name: &str) -> Result<u64> {
+    if state.nt.is_some() {
+        return alloc(state, 0x1000, name);
+    }
+    use gex_kernel::mem::prot;
+    state
+        .with_kernel(|k| k.mem.mmap_low(0, 0x1000, prot::READ, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
         .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
@@ -180,6 +198,14 @@ pub(crate) fn install(
     if let (Some(k), true) = (slots.iter().position(|s| s.as_deref() == Some("gexp__entry")), entry_rva != 0) {
         pairs.push((base + entry_rva as u64, k as u32));
     }
+    // A provider's own threads (musl's clone, wasm64): they start at a
+    // guest address of their own, bound to `__gex_thread_start`.
+    if let Some(k) = slots.iter().position(|s| s.as_deref() == Some("__gex_thread_start")) {
+        // Below 4 GiB, like all code: the call cache keys on 32-bit targets.
+        let at = alloc_code(state, &format!("[provider {} thread entry]", p.name))?;
+        pairs.push((at, k as u32));
+        THREAD_ENTRY.store(at, std::sync::atomic::Ordering::Release);
+    }
     // An address several names share is served by whichever is provided.
     pairs.sort_by_key(|&(a, k)| (a, k == missing));
     pairs.dedup_by_key(|&mut (a, _)| a);
@@ -190,7 +216,7 @@ pub(crate) fn install(
     let module = gex_cache::load_or_compile_at(engine, &cwasm_path(&p.wasm, &wasm), &wasm)
         .with_context(|| format!("compiling provider {}", p.name))?;
     crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-    ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, Extras { memory_base: data as u32 })?;
+    ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, Extras { memory_base: data })?;
     Ok(pairs.len())
 }
 
@@ -205,7 +231,7 @@ pub fn cwasm_path(wasm_path: &std::path::Path, wasm: &[u8]) -> PathBuf {
 }
 
 /// Data whose relocations have been applied, by its guest address.
-static RELOCATED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static RELOCATED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// After an instantiation: the module's data relocations (`__wasm_apply_
 /// data_relocs`: the absolute data and function addresses its initialised
@@ -237,8 +263,18 @@ impl std::fmt::Display for Throw {
 
 impl std::error::Error for Throw {}
 
+/// Where a provider's own threads start (`__gex_thread_start`, bound by
+/// [`install`]): musl's `clone` sets the child's PC to it.
+static THREAD_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The host functions stateful providers import.
 pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
+    // A wasm64 provider's pointers and table indices are i64 (docs/unity-
+    // dotnet.md): one process is one flavour, so the same names take the
+    // wider types.
+    if gex_abi::mem64() {
+        return register64(linker);
+    }
     linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> Result<i32> {
         let func = ftab::table_func(&mut caller, f as u32)?;
         let typed = func.typed::<i32, ()>(&caller).context("gex.provider_try: the function is not void(int)")?;
@@ -292,5 +328,102 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         }
         Ok(())
     })?;
+    Ok(())
+}
+
+/// [`register`] for a 64-bit guest memory: the same functions with i64
+/// addresses, sizes and function-table indices (stream U, additive).
+fn register64(linker: &mut Linker<HostState>) -> Result<()> {
+    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i64, arg: i64| -> Result<i32> {
+        let func = ftab::table_func(&mut caller, f as u32)?;
+        let typed = func.typed::<i64, ()>(&caller).context("gex.provider_try: the function is not void(void *)")?;
+        match typed.call(&mut caller, arg) {
+            Ok(()) => Ok(0),
+            Err(e) => match e.downcast_ref::<Throw>() {
+                Some(t) => Ok(t.0),
+                None => Err(e),
+            },
+        }
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> Result<()> { Err(Throw(code).into()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> Result<()> {
+        let addr = addr as u64;
+        let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
+        let what = match caller.data().nt.as_ref() {
+            Some(p) => p.describe_addr(addr),
+            None => format!("{addr:#x}"),
+        };
+        Err(crate::aot_only::stop(&mut caller, addr, &format!("gex: the program called {name} ({what}), an export of a replaced library that its provider does not implement")))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i64| -> Result<i64> {
+        Ok(alloc(caller.data_mut(), size as u64, "[provider heap]")? as i64)
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i64, len: i64| -> Result<()> {
+        if let Some(m) = caller.data().memory.as_ref() {
+            if let Some(b) = m.bytes().get(ptr as usize..(ptr as usize).saturating_add(len as usize)) {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(b);
+            }
+        }
+        Ok(())
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_thread_entry", |_caller: Caller<'_, HostState>| -> i64 {
+        THREAD_ENTRY.load(std::sync::atomic::Ordering::Acquire) as i64
+    })?;
+    Ok(())
+}
+
+/// Linux libraries already given their provider: (path, load bias).
+static ELF_INSTALLED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// After a Linux syscall that mapped executable code (`Kernel::new_code`):
+/// a shared object one of this process's stateful providers serves gets
+/// its exports bound to the provider, before anything can call them
+/// (docs/unity-dotnet.md: Unity's `libmonobdwgc-2.0.so`). The library's
+/// dynamic symbols say where each export is; its own code never runs.
+pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kernel::CodeMap]) -> Result<()> {
+    if LIBS.get().is_none_or(|v| v.is_empty()) {
+        return Ok(());
+    }
+    for m in mapped {
+        let file = m.path.rsplit('/').next().unwrap_or(&m.path);
+        let libs = for_dll(file);
+        if libs.is_empty() {
+            continue;
+        }
+        let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&m.path)) else {
+            bail!("provider for {}: cannot read the library", m.path);
+        };
+        let image = gex_ld::elf::load(&bytes, 0).map_err(|e| anyhow!("provider for {}: {e:?}", m.path))?;
+        let text = image.segments.iter().find(|s| s.executable).ok_or_else(|| anyhow!("provider for {}: no executable segment", m.path))?;
+        let bias = m.start.wrapping_sub(text.vaddr & !0xfff);
+        {
+            let mut done = ELF_INSTALLED.lock().unwrap_or_else(|e| e.into_inner());
+            if done.iter().any(|(p, b)| *p == m.path && *b == bias) {
+                continue;
+            }
+            done.push((m.path.clone(), bias));
+        }
+        let (lo, hi) = (text.vaddr, text.vaddr + text.bytes.len() as u64);
+        let exports: std::collections::HashMap<String, u32> = image
+            .dynsyms
+            .iter()
+            .filter(|y| !y.undefined && !y.tls && y.value >= lo && y.value < hi)
+            .map(|y| (y.name.clone(), y.value as u32))
+            .collect();
+        let (shared, engine) = {
+            let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("a stateful provider needs the function table (--no-jit?)"))?;
+            (Arc::clone(&jit.shared), jit.engine.clone())
+        };
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        for lp in libs {
+            let n = install(lp, caller.data_mut(), &shared, &engine, &memory, &exports, bias, 0)?;
+            if std::env::var_os("GEX_PROVIDER_TRACE").is_some() {
+                eprintln!("gex: provider {} for {} at {bias:#x}: {n} exports bound", lp.name, m.path);
+            }
+        }
+        crate::ftab::catch_up(&mut *caller)?;
+    }
     Ok(())
 }

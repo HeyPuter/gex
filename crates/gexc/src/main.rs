@@ -523,6 +523,30 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
 /// else what an earlier run of the same image learned. `wide` is whether
 /// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
 /// has a wasm32 memory.
+/// Native wasm libraries in place of guest ones, as stateful providers
+/// (`libprov`): `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` (stream W, docs/
+/// wine-native.md W0(b)) binds each module's `gexp_<export>` functions at
+/// that DLL's exports when it maps. A Linux shared object is named by its
+/// file name (`libmonobdwgc-2.0.so=mono.wasm`, docs/unity-dotnet.md).
+fn set_wasm_libs() -> Result<()> {
+    if let Ok(v) = std::env::var("GEX_WASM_DLLS") {
+        let libs = v
+            .split(',')
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                let (dll, wasm) = e.split_once('=').context("GEX_WASM_DLLS: want dll=module.wasm")?;
+                Ok(gex_native::libprov::LibProvider {
+                    name: dll.to_string(),
+                    dlls: vec![dll.to_ascii_lowercase()],
+                    wasm: std::path::PathBuf::from(wasm),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        gex_native::libprov::set(libs);
+    }
+    Ok(())
+}
+
 fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
     if ra.mem64 == Some(true) && !wide {
         bail!("--mem64: {} is a 32-bit program, which cannot address more than 4 GiB", ra.path);
@@ -581,25 +605,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         });
         let wide = gex_kernel::nt::boot::exe_abi(&bytes).is_some_and(|a| a == gex_kernel::nt::Abi::P64);
         choose_mem(&mut ra, &bytes, wide)?;
-        // Native wasm DLLs (stream W, docs/wine-native.md W0(b)):
-        // `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` binds each module's
-        // `gexp_<export>` functions at that DLL's exports when it maps (a
-        // stateful provider, `libprov`).
-        if let Ok(v) = std::env::var("GEX_WASM_DLLS") {
-            let libs = v
-                .split(',')
-                .filter(|e| !e.is_empty())
-                .map(|e| {
-                    let (dll, wasm) = e.split_once('=').context("GEX_WASM_DLLS: want dll=module.wasm")?;
-                    Ok(gex_native::libprov::LibProvider {
-                        name: dll.to_string(),
-                        dlls: vec![dll.to_ascii_lowercase()],
-                        wasm: std::path::PathBuf::from(wasm),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            gex_native::libprov::set(libs);
-        }
+        set_wasm_libs()?;
         let exit = nt_run::run(&ra, &bytes)?;
         learn_mem(&ra, &bytes, wide);
         if let Some(dir) = gex_native::profile::finish(&exit)? {
@@ -661,6 +667,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     }
     let wide = !program.compat();
     choose_mem(&mut ra, &bytes, wide)?;
+    set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
     learn_mem(&ra, &bytes, wide);
     if let Some(dir) = gex_native::profile::finish(&exit)? {

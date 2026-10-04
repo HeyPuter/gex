@@ -71,7 +71,7 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         .map(|j| Arc::clone(&j.shared))
         .ok_or_else(|| anyhow!("wasm32 program: the function table is off (--no-jit?)"))?;
     shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program = true;
-    crate::ftab::publish_stateful(&shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: mem_base as u32 })?;
+    crate::ftab::publish_stateful(&shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: mem_base })?;
     if std::env::var_os("GEX_WASM_TRACE").is_some() {
         eprintln!(
             "gex: wasm32 program: {} KiB wasm, data at {mem_base:#x}, entry {entry:#x}, compiled in {:.2}s",

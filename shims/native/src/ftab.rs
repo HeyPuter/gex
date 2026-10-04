@@ -283,11 +283,11 @@ fn instantiate(
     l.allow_shadowing(true);
     // The PIC globals are pointer-sized: i64 for a wasm64 module beside a
     // 64-bit guest memory (docs/mem64.md).
-    let i32c = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, v: i32, m: wasmtime::Mutability| {
+    let i32c = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, v: u64, m: wasmtime::Mutability| {
         if gex_abi::mem64() {
-            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, m), Val::I64(v as u32 as i64))
+            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, m), Val::I64(v as i64))
         } else {
-            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v))
+            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v as u32 as i32))
         }
     };
     let mut c = cx.as_context_mut();
@@ -295,24 +295,24 @@ fn instantiate(
     l.define(&mut c, f::PIC_MODULE, "memory", memory.shared().clone())?;
     l.define(&mut c, gex_abi::IMPORT_MODULE, f::TABLE, table)?;
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE, table)?;
-    let g = i32c(&mut c, base as i32, wasmtime::Mutability::Const)?;
+    let g = i32c(&mut c, base as u64, wasmtime::Mutability::Const)?;
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE_BASE, g)?;
     match stateful {
         // A stateful provider: its data where the host put it, and this
         // thread's own stack (`libprov`).
         Some(x) => {
-            let g = i32c(&mut c, x.memory_base as i32, wasmtime::Mutability::Const)?;
+            let g = i32c(&mut c, x.memory_base, wasmtime::Mutability::Const)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
             let sp = crate::libprov::stack(&mut c)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, sp)?;
         }
         None => {
-            let g = i32c(&mut c, 0, wasmtime::Mutability::Const)?;
+            let g = i32c(&mut c, 0u64, wasmtime::Mutability::Const)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
             // A unit's functions never touch clang's shadow stack (those are
             // stubs), but a position-independent module imports its pointer
             // all the same.
-            let g = i32c(&mut c, 0, wasmtime::Mutability::Var)?;
+            let g = i32c(&mut c, 0u64, wasmtime::Mutability::Var)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, g)?;
         }
     }

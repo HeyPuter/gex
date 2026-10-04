@@ -845,7 +845,7 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
             let a = 1u64 << align;
             let data = crate::libprov::alloc_top(state, (size as u64).max(16) + a, &format!("[provider {} data]", prov.name))?;
             let data = (data + a - 1) & !(a - 1);
-            crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data as u32 })?;
+            crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data })?;
         } else {
             crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
         }

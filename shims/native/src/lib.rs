@@ -2928,6 +2928,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .data_mut()
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
             profile::note_mapped(caller.data_mut(), &mapped);
+            // A library a stateful provider replaces (stream U): bound before
+            // the loader can call into it.
+            libprov::on_linux_maps(&mut caller, &mapped)?;
             profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
