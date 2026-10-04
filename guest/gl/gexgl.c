@@ -579,7 +579,14 @@ void *glMapBufferRange(unsigned target, long offset, long length,
     object->map_offset = (size_t)offset;
     object->map_access = access;
     object->map = calloc(1, object->map_length ? object->map_length : 1);
-    if (object->map && (access & 1u) && object->map_length)
+    /* The shadow must hold the buffer's bytes wherever the application may
+       read them (GL_MAP_READ_BIT) or where unmap uploads bytes it did not
+       write: without GL_MAP_INVALIDATE_{RANGE,BUFFER}_BIT the range keeps
+       its old contents. With GL_MAP_FLUSH_EXPLICIT_BIT only flushed ranges
+       are uploaded, so nothing else needs to be read. */
+    unsigned keep = (access & 1u) ||
+                    !(access & (0x4u | 0x8u | 0x10u)); /* INVALIDATE_RANGE/BUFFER, FLUSH_EXPLICIT */
+    if (object->map && keep && object->map_length)
         glGetBufferSubData(target, offset, length, object->map);
     return object->map;
 }
@@ -594,7 +601,11 @@ void *glMapBuffer(unsigned target, unsigned access) {
 unsigned char glUnmapBuffer(unsigned target) {
     struct buffer_object_state *object = buffer_object(bound_buffer(target), 0);
     if (!object || !object->map) return 0;
-    if (object->map_access & 2u)
+    /* With GL_MAP_FLUSH_EXPLICIT_BIT the application said which ranges it
+       wrote (glFlushMappedBufferRange, already uploaded); uploading the
+       whole shadow would overwrite the rest of the range with zeros --
+       a ring buffer's other, in-flight, contents. */
+    if ((object->map_access & 2u) && !(object->map_access & 0x10u))
         glBufferSubData(target, (long)object->map_offset, (long)object->map_length, object->map);
     free(object->map);
     object->map = NULL;
