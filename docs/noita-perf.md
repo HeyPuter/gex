@@ -810,3 +810,55 @@ whose unit keys are cg10's):
 - int3 and ud2 as resumable faults: they're HostCall statements.
 - The Detours-on-provided-export log and test, once E's
   providers-survive-rewrites change lands.
+
+### Stream R state at the second reboot (2026-10-04, merge/abi9)
+
+**Yield study** (`GEX_NT_YIELD`; gexc-e1 = efcb8bfc, cg10 units, fixed
+seed, null display, 4x, cores 3,9, 480 s runs, world fps over 120-480 s,
+AOT 99.8% of guest in every run). Script: scratchpad `abi9/yz.sh PREFIX
+"ARMS"` runs pewasm, the arms, pewasm, the arms reversed, pewasm.
+
+| arm | pass 1 (f, r) | pass 2 | mean |
+|---|---|---|---|
+| os (sched_yield, today's default) | 80.9, 47.2 | 76.8 | 68.3 |
+| spin | 59.5, 67.2 | | 63.4 |
+| sleep:20 | 76.1, 81.5 | 89.0 | 82.2 |
+| sleep:50 | 73.2, 91.5 | (killed) | 82.4 |
+| sleep:100 | 80.3, 87.4 | 89.8 | 85.8 |
+| pewasm bench, same cores | 84.1, 52.0, 81.6 | 76.2 | |
+
+Load average 13-25 throughout; pewasm itself moved 52-84. Earlier pairs:
+os 74.5, 65.1, 50.8; sleep:50 78.7; spin 65.0, 72.4.
+
+- Per thread (wakelat, 60 s at t=200): with os or spin the main thread
+  burns 915-970 ms/s of CPU; the busy workers wait 320-350 ms/s in the
+  runqueue, p50 240-470 µs per wake. With any sleep the main thread uses
+  570-650 ms/s, the busy workers wait 205-230 ms/s, p50 120-170 µs.
+- So sleeps win and are steadier; 20, 50 and 100 µs are not separated yet
+  (nanosleep adds about 50 µs of timer slack to each).
+- **Left:** pass 2's sleep:50 and the reversed half (scratchpad
+  `abi9/yz2.txt` has f1-f3), i.e. rerun `yz.sh yz3 "sleep:50 sleep:100
+  sleep:20 os"`. Then propose the default to the coordinator: a yield that
+  gives the CPU up (sleep ~100 µs) where pewasm spins (main_spin). A
+  better candidate to try next: wake the main thread when a worker goes
+  idle (providers' waits through a host import bumping a generation, as
+  pewasm's host_generation), and longer backstops for idle workers' 1 ms
+  ConcRT waits (842 wakes/s each, 190 ms/s of runqueue wait).
+
+**Commits this session:**
+- a740fcf6: glcompat's "a query's result" flake was the test: availability
+  asked right after glEndQuery may be FALSE. GEX_GL_SYNC made no
+  difference (2/16 without, 0/16 with, 1/12 in an earlier batch). The test
+  now reads GL_QUERY_RESULT first. 20/20 on x86 and x64.
+- 21eb78cd (WIP): int3 resumable in whole-image units. tests/nt 60/60 in
+  both modes. Not run: cgen-prefix.sh, lockstep.
+- 8393fe11 (WIP): providers survive rewrites (E's hunk), the hook log line,
+  tests/providers hookodstr. Not run: --cgen with kernel32's unit.
+
+**Next:** finish the yield study (above). Gate 21eb78cd: cgen-prefix.sh,
+then lockstep gi386 and gx64, exact and flags-ignored (scratchpad
+`abi9/gate-int3.sh` does all of it). Recheck hookodstr under --cgen. The
+heap provider (§9.9.2 step 4) needs E's stateful providers (37300952,
+merge/eject9: data, guest-page allocation), so it starts after that reaches
+merge/main; profile the malloc family's share on cg10 first (GEX_PERFMAP=1
+is needed for tools/modattr.py).
