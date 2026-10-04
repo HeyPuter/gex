@@ -649,15 +649,17 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
     `GEX_NT_ENTRY_LOG`): where the browser entered unit images without an
     entry, kept in `user/web-entries.txt`, which build.sh turns into region
     entries. tests/nt needs none since the nesting fixes.
-  - Results, AOT-only: tests/nt x86 under Node 16/17 (hello_args, sync,
-    mtx, crtmem, tls, icall, user_win, gdi, exitproc, input, display,
-    window, lowmem, apc, seh, cxx; same stdout and exit as recorded; the
-    same projects on gex-rt too). glcompat (GL on Mesa over WebGPU) and
-    hello_args in headless Chromium from their projects' pages. The LuaJIT
-    host program prints the same on the web build as on gex-rt.
-  - Open: filemap's first two subtests fail on the ejected web run only
-    (pass in B's harness on the same shim and units, and natively);
-    timing-dependent, not yet found.
+  - Results, AOT-only: tests/nt x86 all 17 (hello_args, sync, mtx,
+    crtmem, tls, icall, user_win, gdi, exitproc, input, display, window,
+    lowmem, filemap, apc, seh, cxx under Node; glcompat, GL on Mesa over
+    WebGPU, in headless Chromium from its project's page), each with the
+    stdout and exit of the recording; the same projects pass on gex-rt.
+    The LuaJIT host program prints the same on the web build as on gex-rt.
+    (filemap needed run-node.mjs to bundle every directory: a sparse
+    prefix's `Temp` had no parents.)
+  - A project's own files go in `user/files/<guest path>` (copied into
+    build/rootfs and the page's tar): Noita's world seed is pinned there
+    with `port/seedpin/pin.sh mod|save`.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
