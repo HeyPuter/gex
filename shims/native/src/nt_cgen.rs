@@ -616,6 +616,8 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
     // G2 (docs/eject-pe.md §6a): the members' stateless providers compiled
     // into the group, their addresses served by bodies of its own.
     let with_providers = std::env::var("GEX_GROUP_PROVIDERS").is_ok_and(|v| v == "1");
+    // G3: ThinLTO across the group.
+    let lto = std::env::var("GEX_GROUP_LTO").is_ok_and(|v| v == "1");
     let mut gp = gex_cgen::image::GroupProviders::default();
     for m in members {
         prepare_pe(m.pe, m.base, jobs, true).with_context(|| format!("the unit for {}", m.path))?;
@@ -689,6 +691,9 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         b.sort_unstable();
         b.hash(&mut h);
     }
+    if lto {
+        "thinlto".hash(&mut h);
+    }
     let key = format!("{:016x}", h.finish());
     let dir = root.join("groups").join(&key);
     let out = dir.join("c.wasm");
@@ -696,7 +701,10 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
         let t0 = std::time::Instant::now();
         let work = dir.join("work");
         let recs: Vec<&std::path::Path> = recoveries.iter().map(|p| p.as_path()).collect();
-        let stats = gex_cgen::image::build_group_module(&recs, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, &gp)?;
+        gex_cgen::toolchain::set_lto(lto);
+        let stats = gex_cgen::image::build_group_module(&recs, &work, &root.join("objects"), &out, jobs, &byte, &stubs, &hints, &gp);
+        gex_cgen::toolchain::set_lto(false);
+        let stats = stats?;
         let _ = std::fs::remove_dir_all(&work);
         std::fs::write(dir.join("members.txt"), member_keys.join("\n") + "\n")?;
         eprintln!(
