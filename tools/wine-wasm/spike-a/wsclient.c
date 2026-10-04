@@ -100,7 +100,12 @@ int main(int argc, char **argv)
     if (chdir(argv[1])) die("chdir server dir");
     struct sockaddr_un addr = { AF_UNIX, "socket" };
     if ((fd_socket = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) die("socket");
-    if (connect(fd_socket, (struct sockaddr *)&addr, sizeof(addr))) die("connect");
+    /* a socket file left by an earlier server is refused until the new
+     * server has replaced it */
+    for (int i = 0; connect(fd_socket, (struct sockaddr *)&addr, sizeof(addr)); i++) {
+        if (i == 2000) die("connect");
+        usleep(5000);
+    }
 
     obj_handle_t version;
     request_fd = receive_fd(&version);

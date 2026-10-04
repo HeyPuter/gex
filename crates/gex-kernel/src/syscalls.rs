@@ -486,6 +486,11 @@ pub struct Kernel {
     /// ones (see `crate::i386`). Set at exec from the image's class,
     /// inherited across fork.
     pub compat: bool,
+    /// Set by a syscall that may have made a descriptor readable or
+    /// writable for someone else (a write, a read that freed room, a close,
+    /// a signal); the host takes it after the call and wakes threads parked
+    /// on descriptors ([`Kernel::take_fd_activity`]).
+    pub fd_activity: bool,
     /// The i386 process entered through the non-rt `sigreturn` (119), whose
     /// frame is laid out differently from `rt_sigreturn`'s. Set at entry,
     /// consumed by `sigreturn`.
@@ -1096,6 +1101,7 @@ impl Kernel {
             armed_place: None,
             armed_pin: None,
             compat: false,
+            fd_activity: false,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1320,6 +1326,7 @@ impl Kernel {
             armed_place: None,
             armed_pin: None,
             compat: self.compat,
+            fd_activity: false,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1499,6 +1506,8 @@ impl Kernel {
         } else {
             raw
         };
+
+        self.fd_activity |= wakes_fd_waiters(n);
 
         // Returning from a handler restores a whole context, so it cannot go
         // through the normal "write x0 and continue" path.
@@ -2077,6 +2086,12 @@ impl Kernel {
     }
 
     /// Finish a syscall whose blocking half the host has now run.
+    /// Whether a syscall since the last call may have changed descriptor
+    /// readiness ([`Kernel::fd_activity`]), clearing it.
+    pub fn take_fd_activity(&mut self) -> bool {
+        std::mem::take(&mut self.fd_activity)
+    }
+
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
@@ -6126,6 +6141,44 @@ impl Kernel {
 /// This is deliberately a list of what does *not* need it rather than what
 /// does: forgetting to exclude a syscall costs a little speed, while
 /// forgetting to include one would serve a stale `/proc`.
+/// Whether canonical syscall `n` can change another thread's descriptor
+/// readiness (or signal state): what a host parking threads on descriptors
+/// must wake them for. Over-approximate (any read or write, of any file);
+/// futexes, clocks, memory and the like are left out because they are the
+/// hot calls and never make a descriptor ready.
+pub fn wakes_fd_waiters(n: u64) -> bool {
+    matches!(
+        n,
+        nr::WRITE
+            | nr::WRITEV
+            | nr::PWRITE64
+            | nr::READ
+            | nr::READV
+            | nr::PREAD64
+            | nr::SENDTO
+            | nr::SENDMSG
+            | nr::SENDMMSG
+            | nr::SENDFILE
+            | nr::RECVFROM
+            | nr::RECVMSG
+            | nr::RECVMMSG
+            | nr::CLOSE
+            | nr::CLOSE_RANGE
+            | nr::DUP3
+            | nr::SHUTDOWN
+            | nr::CONNECT
+            | nr::ACCEPT
+            | nr::ACCEPT4
+            | nr::LISTEN
+            | nr::EXIT
+            | nr::EXIT_GROUP
+            | nr::KILL
+            | nr::TKILL
+            | nr::TGKILL
+            | nr::TIMERFD_SETTIME
+    )
+}
+
 pub fn skips_proc_snapshot(n: u64) -> bool {
     matches!(
         n,
