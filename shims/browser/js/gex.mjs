@@ -850,7 +850,8 @@ export class Gex {
         now: () => this.#env.now(),
         // The NT layer's monotonic clock: `now` is `Date.now()`, a
         // millisecond wall clock that can step.
-        mono_ns: () => BigInt(Math.round(performance.now() * 1e6)),
+        // An f64, not an i64: a BigInt per call was most of an NT syscall's cost.
+        mono_ns: () => performance.now() * 1e6,
         // A Windows program's user-mode callback (docs/nt-layer.md §5): the
         // guest runs nested, inside the `syscall` import, until it returns.
         nt_callback: (ctx, pc) => this.#ntCallback(ctx >>> 0, pc),
@@ -3440,7 +3441,7 @@ export class Gex {
     this.#callouts.push(c);
     this.#nest.push('callout');
     this.#calloutsMade++;
-    if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && (this.#calloutsMade & (this.#calloutsMade - 1)) === 0)) {
+    if (globalThis.GEX_CALLOUT_TRACE || (globalThis.GEX_DENSE_DEBUG && ((this.#calloutsMade & (this.#calloutsMade - 1)) === 0 || this.#calloutsMade % 4096 === 0))) {
       console.error(`[callout] #${this.#calloutsMade} depth ${me}: ${BigInt.asUintN(64, target).toString(16)} returning to ${c.ret.toString(16)}`);
     }
     let pc = BigInt.asUintN(64, target);
