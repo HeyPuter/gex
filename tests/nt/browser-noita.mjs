@@ -52,7 +52,9 @@ const peekAt = process.env.NOITA_PEEK || '0x122374c*';
 // With units (`cgen=` in GEX_NT_PAGE_FLAGS) a run is only trusted with a unit
 // for every image and the AOT share at NOITA_MIN_AOT% (default 99) or more.
 const cgen = /[?&]cgen=[1-9]/.test(process.env.GEX_NT_PAGE_FLAGS ?? '');
-const minAot = Number(process.env.NOITA_MIN_AOT ?? (cgen ? 99 : 0));
+// 97, not 99: with provider waits left out (aot-share.mjs) the share is the
+// guest's real work, and LuaJIT's machine code is tier-1 by nature (~1-2%).
+const minAot = Number(process.env.NOITA_MIN_AOT ?? (cgen ? 97 : 0));
 
 // The install as symlinks plus mods/seedpin, and the save's mod_config.xml
 // in the prefix (a new file: the prefix may be a hard-linked copy).

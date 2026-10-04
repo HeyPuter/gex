@@ -8,6 +8,10 @@
 //   runtime    the function table's runtime module (`gex-ftab-runtime`)
 //   tier-1     any other wasm module (unnamed: `wasm://wasm/<hash>`)
 //   host       the shim and the kernel (`gex_browser`, `gex_kernel`), and JS
+//   wait       a provider function that blocks (ConcRT's cs_lock, cond_wait,
+//              event_wait, wait_ms; crt_heap's lock): a thread asleep in
+//              memory.atomic.wait32 samples as that function, and counting it
+//              as AOT work made the share say "providers 74%"
 //
 // Idle, program and GC samples are left out. The share is of guest samples,
 // AOT meaning units and providers.
@@ -26,7 +30,7 @@ function kindOf(frame) {
   }
   const name = url.slice('wasm://wasm/'.length);
   if (name.startsWith('c.wasm')) return 'units';
-  if (name.startsWith('p.wasm')) return 'providers';
+  if (name.startsWith('p.wasm')) return /wait|(?<!un)lock/.test(frame.functionName ?? '') ? 'wait' : 'providers';
   if (name.startsWith('gex-ftab-runtime')) return 'runtime';
   if (name.startsWith('gex_browser') || name.startsWith('gex_kernel')) return 'host';
   return 'tier-1';
@@ -34,7 +38,7 @@ function kindOf(frame) {
 
 /** Sample counts by kind (and `host`) over `profiles` (Chrome's shape). */
 export function aotCounts(profiles) {
-  const n = Object.fromEntries([...KINDS, 'host'].map((k) => [k, 0]));
+  const n = Object.fromEntries([...KINDS, 'host', 'wait'].map((k) => [k, 0]));
   for (const p of profiles) {
     const kind = new Map(p.nodes.map((x) => [x.id, kindOf(x.callFrame)]));
     for (const s of p.samples ?? []) {
@@ -51,7 +55,7 @@ export function aotLine(n) {
   const all = guest + n.host;
   const pct = (x, of) => (of ? (100 * x) / of : 0).toFixed(1);
   return `AOT ${pct(n.units + n.providers, guest)}% of guest (${KINDS.map((k) => `${k} ${pct(n[k], guest)}%`).join(' ')}); `
-    + `host ${pct(n.host, all)}% of all; ${all} samples`;
+    + `host ${pct(n.host, all)}% of all; waiting in providers ${n.wait} samples (left out); ${all} samples`;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
