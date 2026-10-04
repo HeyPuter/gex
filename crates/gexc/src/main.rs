@@ -138,12 +138,14 @@ usage:
                                    NT layer maps the image at that base. Run it
                                    with a memory cap: recovery of a large image
                                    is the peak
-  gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only]
+  gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only] [--append]
                                    compile a staged Wine prefix's core DLLs
                                    (tools/nt-cgen-core.txt, or --set) for the
                                    function tier: writes PREFIX/gex-layout, the
                                    fixed base each one gets in every process,
                                    and builds each unit at that base.
+                                   --append keeps the existing layout's
+                                   bases and places only DLLs it lacks.
                                    tools/nt-stage-wine.sh runs it
   gexc hotset <elf|pe> --samples FILE [--pe-base HEX] [--budget N] -o OUT
                                    the function tier's hot set for an image:
@@ -2076,6 +2078,7 @@ const CGEN_CORE: &str = include_str!("../../../tools/nt-cgen-core.txt");
 fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
     use gex_kernel::nt::section;
     let (mut prefix, mut set, mut jobs, mut layout_only) = (None, None, 4usize, false);
+    let mut append = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2088,6 +2091,9 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
             }
             "--layout-only" => layout_only = true,
+            // Keep the prefix's layout: existing entries keep their bases
+            // (and so their units' keys), only DLLs it lacks get places.
+            "--append" => append = true,
             other => prefix = Some(other.to_string()),
         }
         i += 1;
@@ -2111,6 +2117,13 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
         .filter(|l| !l.is_empty())
         .collect();
     let t_all = std::time::Instant::now();
+    let existing = if append {
+        let text = std::fs::read_to_string(format!("{prefix}/{}", section::LAYOUT_FILE))
+            .with_context(|| format!("--append: {prefix} has no {}", section::LAYOUT_FILE))?;
+        section::parse_layout_entries(&text, &wine).map_err(|e| anyhow::anyhow!("--append: {prefix}/{}: {e}", section::LAYOUT_FILE))?
+    } else {
+        Vec::new()
+    };
     let mut layout = Vec::new();
     let mut todo = Vec::new();
     for dir in ["drive_c/windows/syswow64", "drive_c/windows/system32"] {
@@ -2139,7 +2152,12 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
             let own = prefs.get(&pe.preferred_base).copied().unwrap_or(0) == 1;
             images.push((rel, pe.preferred_base, pe.image_size as u64, sha, own));
         }
-        let planned = section::plan_layout(&images);
+        let planned = if append {
+            let mine: Vec<section::LayoutEntry> = existing.iter().filter(|e| e.0.starts_with(&format!("{dir}/"))).cloned().collect();
+            section::plan_layout_append(&mine, &images).map_err(|e| anyhow::anyhow!("--append: {e}"))?
+        } else {
+            section::plan_layout(&images)
+        };
         for (rel, b, _, _) in &planned {
             todo.push((format!("{prefix}/{rel}"), *b));
         }
