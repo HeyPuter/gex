@@ -65,10 +65,9 @@ pub(crate) fn cty(ty: Ty) -> &'static str {
 
 /// Whether `r` lives in a 32-bit C variable: an i386 program's
 /// general-purpose registers (the context slot is 64 bits and its low half
-/// is the register, so loads read only that). Stores stay 64-bit: the high
-/// half is not always zero (the Linux layer writes a syscall's result
-/// sign-extended), and a 32-bit store would keep a stale high half that
-/// 64-bit readers see. `GEX_CGEN_NARROW=0` keeps them 64-bit. Arithmetic, addresses and compares then stay in i32, where
+/// is the register, so loads read only that). Stores are 32-bit too, as
+/// every writer zero-extends (`image::narrow_stores`). `GEX_CGEN_NARROW=0`
+/// keeps them 64-bit. Arithmetic, addresses and compares then stay in i32, where
 /// wasm needs no wraps and extends between them.
 pub(crate) fn narrow_reg(r: GuestReg, class32: bool) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -478,8 +477,8 @@ impl<'a> Emitter<'a> {
             if r.is_flag() {
                 self.line(format!("GEX_C8({off}u) = (uint8_t){name};"));
             } else if narrow_reg(r, self.class32) && crate::image::narrow_stores() {
-                // pewasm's 32-bit CpuState fields: exact once every writer
-                // of the slot zero-extends (`image::narrow_stores`).
+                // pewasm's 32-bit CpuState fields: exact, every writer of
+                // the slot zero-extends (`image::narrow_stores`).
                 self.line(format!("GEX_C32({off}u) = {name};"));
             } else {
                 match r.ty() {
@@ -590,8 +589,8 @@ impl<'a> Emitter<'a> {
             if r.is_flag() {
                 self.line(format!("GEX_C8({off}u) = (uint8_t){name};"));
             } else if narrow_reg(r, self.class32) && crate::image::narrow_stores() {
-                // pewasm's 32-bit CpuState fields: exact once every writer
-                // of the slot zero-extends (`image::narrow_stores`).
+                // pewasm's 32-bit CpuState fields: exact, every writer of
+                // the slot zero-extends (`image::narrow_stores`).
                 self.line(format!("GEX_C32({off}u) = {name};"));
             } else {
                 match r.ty() {
