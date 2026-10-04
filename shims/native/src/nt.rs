@@ -54,8 +54,10 @@ fn mono_ns() -> u64 {
 
 /// The guest's wall clock. `GEX_NT_FIXED_TIME=<unix seconds>` (the
 /// counterpart of PEWASM_FIXED_TIME) starts it at that instant and advances
-/// it with real time, so a program that seeds from the date (Noita's world)
-/// sees the same value every run: reproducible measurements.
+/// it with real time, so a program that reads the date sees the same day
+/// every run. It does not fix Noita's world: its seed comes from the
+/// engine's RNG, seeded at start-up, unless the WORLD_SEED magic number
+/// (0x1206fe8) is set; "Setting random seed" differs run to run on pewasm too.
 fn wall() -> (u64, u32) {
     static FIXED: OnceLock<Option<(u64, Instant)>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
