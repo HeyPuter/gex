@@ -269,6 +269,7 @@ const host = new ProcessHost({
     denseDebug: !!process.env.GEX_DENSE_DEBUG,
     calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
+    excTrace: !!process.env.GEX_EXC_TRACE,
     // GEX_LAZY_THREAD: spawned threads register the process's modules lazily
     // (instance on first branch) instead of installing them all up front.
     lazyThread: !!process.env.GEX_LAZY_THREAD,

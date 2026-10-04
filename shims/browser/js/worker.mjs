@@ -623,6 +623,7 @@ async function handle(msg) {
       gex.shim.exports.gex_set_heartbeat?.(BigInt(beat));
     }
     if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
+    if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
     }

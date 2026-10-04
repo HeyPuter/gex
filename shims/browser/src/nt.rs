@@ -324,6 +324,9 @@ mod imp {
         if let Some(s) = var("GEX_NT_TIME_SCALE").and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0) {
             TIME_SCALE.store(s.to_bits(), Ordering::Relaxed);
         }
+        if var("GEX_NT_EXC_TRACE").is_some() {
+            crate::gex_set_exc_trace(1);
+        }
         if var("GEX_NT_EXC_NEST").as_deref() == Some("0") {
             NO_EXC_NEST.store(true, Ordering::Relaxed);
         }
@@ -894,8 +897,8 @@ mod imp {
                     set_resume_none();
                     trap();
                 }
-                if nr == nt::sysno::ntdll::NtRaiseException && p.cfg.trace {
-                    warn_line(&format!("[nt] NtRaiseException returning to {next_pc:#x}: nested {}\n", nest_exceptions(next_pc)));
+                if nr == nt::sysno::ntdll::NtRaiseException && crate::tracing_exc() {
+                    warn_line(&format!("[nt] NtRaiseException returning to {next_pc:#x} (byte {:#x}): nested {}\n", guest_bytes().get(next_pc as usize).copied().unwrap_or(0), nest_exceptions(next_pc)));
                 }
                 if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(next_pc) && raise_nested(p, ctx_addr, target, raise_sp, next_pc) {
                     return;
@@ -1174,6 +1177,15 @@ mod imp {
     /// End the process with NT exit code `code`. The low byte is what a
     /// parent sees, as natively.
     pub(crate) fn end_process(code: u32) -> ! {
+        if crate::tracing_exc() {
+            let (n, l) = crate::cgen::callouts();
+            crate::stderr_line(&format!(
+                "[nt] at exit: exc_nested={} exc_escaped={} callouts={n} callouts_left={l} in_place={}\n",
+                EXC_NESTED.load(Ordering::Relaxed),
+                EXC_ESCAPED.load(Ordering::Relaxed),
+                crate::IN_PLACE_N.load(Ordering::Relaxed)
+            ));
+        }
         with_host(|h| {
             exit_process(h, (code & 0xff) as i32);
         });

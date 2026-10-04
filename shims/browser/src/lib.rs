@@ -13024,3 +13024,19 @@ pub extern "C" fn gex_reuse_stat(which: u32) -> i64 {
 pub extern "C" fn gex_jit_millis() -> i64 {
     with_host(|h| (h.jit.nanos / 1_000_000) as i64)
 }
+
+/// `GEX_EXC_TRACE`-style narration of NtRaiseException's nesting decision
+/// (set from JS with `gex_set_exc_trace`).
+static EXC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn tracing_exc() -> bool {
+    EXC_TRACE.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[no_mangle]
+pub extern "C" fn gex_set_exc_trace(on: i32) {
+    EXC_TRACE.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A line on the guest's standard error (delivered in order with its output).
+pub(crate) fn stderr_line(s: &str) {
+    unsafe { write(2, s.as_ptr() as u32, s.len() as u32) };
+}
