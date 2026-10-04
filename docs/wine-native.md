@@ -254,6 +254,18 @@ Today's path keeps working throughout. Programs switch per process
     for x64 programs (ARM64EC). Native Wine for i386 programs is a new
     combination, built from ARM64EC's design, the spec signatures and the
     BTCpu contract.
+  - **Eject avoids it.** An ejected program is a closed world: no JIT, every
+    target known at build time. Gluing every used module into one wasm
+    resolves the check at link time:
+    - for each C signature Wine calls through a pointer, every possible target
+      gets a correct table entry: Wine functions directly, program functions
+      through a generated guest-entry wrapper;
+    - the call site is a plain `call_indirect` after the existing
+      address-to-slot lookup.
+
+    The same build also removes per-module instantiation cost and allows LTO
+    across Wine and the program, as pewasm's single static module did. The
+    runtime check remains only for dynamic gexc runs.
   - **Cost:** on indirect-call-heavy code (wined3d, COM) the fast path must be
     a few instructions. If W0(c) shows it doesn't pay, fall back to
     type-based checks on callback types only, which is less general.
