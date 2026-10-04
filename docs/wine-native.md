@@ -1,6 +1,7 @@
 # Wine as native wasm: plan (draft, 2026-10-03)
 
-Status: proposal for review. Nothing here is built.
+Status: stream W, W0 in progress (2026-10-04). The toolchain is decided
+(§3.10); spikes (a) and (c) have run (§4.1); (b) is next.
 
 ## 1. Why
 
@@ -213,6 +214,92 @@ The plan does the same with **wasm32 as Wine's host architecture**:
   are application code and stay translated. ConcRT and the CRT providers stay
   useful for them.
 
+### 3.10 Toolchain (decided in W0, 2026-10-04)
+
+**clang with a musl port of our own, not emscripten and not wasi-libc.**
+
+- **Compiler:** the system clang (22), the one gex-cgen already uses, with
+  `--target=wasm32-unknown-linux-musl`. clang accepts that triple and
+  defines `__linux__`, so Wine's Unix code takes its Linux paths. Flags
+  (`tools/wine-wasm/flags.sh`): `-fPIC -matomics -mbulk-memory
+  -mmutable-globals -msign-ext -mnontrapping-fptoint -mtail-call`, which
+  V8 and wasmtime 27 both run.
+- **libc:** upstream musl 1.2.5 with a new `arch/wasm32` (fork
+  `wt/musl-wasm`, branch `gex-wasm32`, not pushed; about 600 lines):
+  - Syscalls are the **i386 Linux ABI**: the wrapper writes the number and
+    the arguments into the thread's gex register context and calls
+    `gex.syscall(ctx, pc)`, the import translated code already uses.
+    gex-kernel's i386 compat layer serves them unchanged.
+  - Where i386 and wasm32 struct layouts differ (wasm32 aligns 64-bit
+    members to 8), musl converts: `struct kstat`, `statfs`, packed
+    `epoll_event`. `struct flock` matches what gex-kernel reads (see the
+    note below).
+  - Threads, TLS and the C stack are wasm-ld's: one module instance per
+    thread, `__tls_base` and `__stack_pointer` per instance,
+    `__wasm_init_tls` for new threads; `clone` starts the child at a fixed
+    entry with its function on the new stack.
+  - `setjmp`/`longjmp` are stubs (longjmp aborts) until there is wasm
+    exception handling (V8 has it; wasmtime 27 natively does not).
+  - Signals are not delivered asynchronously; a handler would have to run
+    at a syscall boundary, which needs gex support (W1).
+- **compiler-rt builtins** from emsdk's copy of the sources (int128 and
+  binary128 `long double`; no x87 or bf16).
+- **Linux UAPI headers** are the host's, with `asm/` taken down its i386
+  branches (`build-sysroot.sh`).
+- **Linking:** `wasm-ld --experimental-pic -pie --shared-memory
+  --import-memory`: a position-independent module importing gex's memory,
+  `env.__indirect_function_table` (the ftab), `__memory_base`,
+  `__table_base` and `__stack_pointer`. Its `__wasm_init_memory` start
+  function initialises the data once (an atomic flag), so instantiating it
+  per thread is safe. `tools/wine-wasm/wcc` is the compiler driver
+  (`clang` for compiles; wasm-ld plus the container for links; `-shared`
+  for side modules).
+- **Running it under gex** (`shims/native/src/wasmprog.rs`, about 90
+  lines): the module goes in an ELF32 i386 container
+  (`tools/wine-wasm/wasm-elf.py`), so exec, the initial stack, auxv and
+  brk are the kernel's as for any i386 program. A header next to the
+  entry names the module, its data region and two entries. The shim
+  installs the module in the function table as a stateful provider
+  (stream E's `libprov`: data at `__memory_base`, a stack per thread),
+  bound at those entries. Nothing is translated. The first dispatch of the
+  entry finds the binding (`ftab::serve`).
+
+**Why not emscripten.** Its libc is musl too, but its syscalls, threads
+(pthread Workers), dlopen and memory growth belong to its JS runtime. gex
+owns all four (gex-kernel, its own Workers, the ftab, its own memory map).
+Emscripten would also give the browser and native builds different
+runtimes. The hostx Xwayland build shows the cost: a hand-written JS bridge
+per program.
+
+**Why not wasi-libc.** WASI has no fork/exec, Unix sockets, SCM_RIGHTS,
+mmap, futexes or signals. Wine's Unix side and wineserver need all of
+them, and gex-kernel already has them.
+
+**How Wine learns the host** (fork `wt/wine-wasm`, branch `wasm32`, from
+11.15; not pushed):
+- `configure.ac`: `wasm32` → `HOST_ARCH=wasm32` and `__wasm32__`. No
+  `-mabi=ms`: wasm32 has one calling convention.
+- `configure --host=wasm32-unknown-linux-musl CC=wcc
+  --with-wine-tools=<native tools build> --without-mingw` configures
+  as-is.
+- On wasm32, `winnt.h` takes the i386 `CONTEXT`. The PE side's CONTEXT is
+  the guest's register file (§3.4).
+- The tools (widl, winebuild) map `wasm32` to i386 for now, which is right
+  for data layout. W1 gives winebuild a `CPU_WASM32` that emits the
+  wasm module plus PE skeleton (§3.2).
+- Without mingw, Wine's makedep already plans its "builtin ELF DLL" layout:
+  PE-side code compiled by the host compiler with `-D_WIN32 -fshort-wchar`
+  into host-format modules. That is the precedent for PE DLLs as wasm
+  modules. The PE side gets its own triple/flags in W1.
+
+**ABI note (for the coordinator).** On wasm32 the gex-kernel ABI is "i386
+numbering, gex's compat conversions". Where gex's i386 layer passes a
+structure through unconverted, musl's wasm32 layout must match gex-kernel's
+native one. The case so far is `fcntl` locks: gex hands F_GETLK64 (12–14)
+through unmapped, so wasm32 uses 5/6/7 with the 64-bit `struct flock`.
+A proper `wasm32` personality in gex-kernel would remove this coupling.
+That is a shared-ABI change, proposed for W1, not made.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
@@ -237,6 +324,91 @@ The plan does the same with **wasm32 as Wine's host architecture**:
 
 Today's path keeps working throughout. Programs switch per process
 (`--wine native`) until W6.
+
+### 4.1 W0 results
+
+**(a) wineserver and a Unix library on gex-kernel: works natively.**
+
+- **wineserver** from Wine 11.15, compiled for wasm32 with two source
+  changes (i386 machine on wasm32; the CONTEXT in `winnt.h`), runs under
+  `gexc run`. The module is 3.0 MB (with debug info) and compiles in
+  0.16 s.
+- **A test client** (`tools/wine-wasm/spike-a/wsclient.c`, also wasm32)
+  `posix_spawn`s it, as ntdll's `start_server` does. It then:
+  - connects to the master socket;
+  - receives the request fd and protocol version 958 over SCM_RIGHTS;
+  - sends its reply and wait pipes back;
+  - runs `init_first_thread`, which returns pid/tid, session 1 and
+    machine 0x14c (i386);
+  - creates, sets and queries an event.
+- **ws2_32's `unixlib.c`** compiles unchanged and runs through its
+  `__wine_unix_call_funcs` table: `gethostname` returns "gex", and
+  `getaddrinfo("127.0.0.1", "80")` gives AF_INET, port 80.
+- **What it took in gex:**
+  - `wasmprog.rs` (new);
+  - a Linux fallback in `libprov::alloc`;
+  - a wasm program's fork made inside the syscall rather than by trapping
+    out of its frames, which native code cannot survive.
+- **Findings for W1–W3:**
+  - **Server round trip: 1.07 ms per request natively.** gex's native host
+    waits on fds by polling with 1 ms sleeps (`perform_block`). Wine
+    clients make a server call for nearly every NT operation, so
+    gex-kernel needs event-driven fd wakeups before W3. ntsync (§3.5)
+    takes waits off the server altogether.
+  - **gex-kernel bugs this hit:**
+    - mkdir on hostfs ignores the mode, so wineserver's 0700 check fails
+      (worked around by chmod on the host);
+    - `poll` reports nothing after the peer's `shutdown(SHUT_WR)`
+      (wineserver's `sock_check_pollhup` prints an error and carries
+      on);
+    - the i386 F_*LK64 passthrough (above).
+  - **Shared memory:** wineserver shares coherent `MAP_SHARED` memory
+    with its clients (session objects; since Wine 9, queue and desktop
+    state that win32u reads directly). gex processes have separate
+    linear memories, and browser processes are separate
+    `WebAssembly.Memory`s, which cannot alias. So wineserver has to live
+    in the client's memory: a thread of the Windows process (CLONE_VM
+    with its own fd table), not a separate process. §3.5's "later" option
+    becomes the plan for W3. Multi-process Windows programs then share
+    one address space per session; that fits i386 programs (2 GiB each
+    at most) only with memory64.
+  - **dlopen** of Unix libraries: the same install with a data region,
+    plus symbol binding between modules. Not built yet; ws2_32 was linked
+    statically for the spike.
+
+**(c) Boundary and ICALL check costs in V8** (node 26.7,
+`tools/wine-wasm/spike-c`, gex-cgen's unit flags, 20M calls per case,
+median of 5, one core). Each case is a trivial `int f(int, int)`, so
+these are per-call overheads:
+
+| call | ns/call |
+|---|---|
+| native → native, direct `call` | 0.46 |
+| native → native, `call_indirect` (V8 inlines the monomorphic target) | 0.74 |
+| native → native through the ICALL check, branch form | 2.18 |
+| native → native through the ICALL check, select form (below) | 1.37 |
+| native → guest (exit thunk: guest frame, fcache probe, `F_body`) | 7.4–8.3 |
+| guest → guest (a unit's cross-module call today) | 6.50 |
+| guest → native (unit call site → spec adapter → native function) | 6.50 |
+
+- **The check's form matters in V8.** The branch form
+  `p < LIMIT ? p(...) : exit(p, ...)` puts a real call on the cold path.
+  V8 has no callee-saved registers, so every loop value is spilled around
+  it (seen in TurboFan's code). The select form avoids that: the index is
+  `p < LIMIT ? p : exit_stub[sig]`, the guest address goes in a wasm
+  global, and there is one `call_indirect`. V8 still inlines a monomorphic
+  native target. With V8's wasm inlining off, both forms cost the same as
+  a plain `call_indirect` (4.4 vs 4.5 ns). The LLVM pass emits the select
+  form.
+- **LIMIT** is 0x400000. ftab indices stay below it, and every guest
+  image and allocation in an NT process is at or above it (nt-layer §1.2).
+- **Worst case for the check:** +0.6 ns per indirect call in a tight
+  loop. At Peggle's 222M wined3d indirect calls that is about 0.14 s per
+  run. That is if every one of them were in a loop this tight: real call
+  sites sit in larger functions with their own register pressure.
+- **The adapters cost what a cross-image call costs today** (6.5 ns), and
+  Wine-internal calls drop from that (calls between lifted Wine images)
+  to 0.5–1.4 ns.
 
 ## 5. Risks
 
