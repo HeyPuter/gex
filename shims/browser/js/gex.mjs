@@ -2699,26 +2699,100 @@ export class Gex {
       }
       const key = this.#cgenStr(e.gex_cgen_key, u);
       const path = this.#cgenStr(e.gex_cgen_path, u);
-      const got = this.#env.loadUnit?.(key) ?? null;
-      if (!got) {
-        if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
-        this.#cgenProviders(u);
+      // A link group's member (docs/eject-pe.md §6a): held until every
+      // member is placed, then the group's module stands for them all.
+      const grp = e.gex_cgen_group ? this.#cgenGroupOf(key) : null;
+      if (grp) {
+        e.gex_cgen_hold(u);
+        grp.held.set(key, { u, path });
+        console.error(`gex-nt: ${path}: held for its link group`);
+        if (grp.held.size === grp.members.length) this.#cgenGroup(grp, t0);
         continue;
       }
-      this.#cgenModule(key, got);
-      const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
-      const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
-      this.#bytes().set(ent, gp);
-      const r = e.gex_cgen_publish(u, gp, ent.byteLength / 8);
-      e.gex_free?.(gp, Math.max(8, ent.byteLength));
-      if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
-      this.#cgenCatchUp();
-      e.gex_cgen_installed(u);
-      this.#cgenProviders(u);
-      console.error(`gex-nt: function tier for ${path}: ${ent.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-      this.#cgenRegions(u, path);
+      this.#cgenUnit(u, key, path, t0);
     }
     this.#cgenCatchUp();
+  }
+
+  /** Load and publish unit `u` (`key`), then its providers and region
+   *  entries. */
+  #cgenUnit(u, key, path, t0) {
+    const e = this.#shim.exports;
+    const got = this.#env.loadUnit?.(key) ?? null;
+    if (!got) {
+      if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
+      this.#cgenProviders(u);
+      return;
+    }
+    this.#cgenPublish(u, key, path, got);
+    this.#cgenProviders(u);
+    console.error(`gex-nt: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    this.#cgenRegions(u, path);
+  }
+
+  /** Publish unit `u`'s module (`got`, under `key`) and install it here. */
+  #cgenPublish(u, key, path, got) {
+    const e = this.#shim.exports;
+    this.#cgenModule(key, got);
+    const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
+    const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
+    this.#bytes().set(ent, gp);
+    const r = e.gex_cgen_publish(u, gp, ent.byteLength / 8);
+    e.gex_free?.(gp, Math.max(8, ent.byteLength));
+    if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
+    this.#cgenCatchUp();
+    e.gex_cgen_installed(u);
+  }
+
+  /** The unit cache's link groups (`groups/index.txt`: a group key, then its
+   *  members' unit keys, per line), by member key; read once. */
+  #cgenGroups = null;
+  #cgenGroupOf(key) {
+    if (!this.#cgenGroups) {
+      this.#cgenGroups = new Map();
+      const b = this.#env.loadFile?.('groups/index.txt') ?? null;
+      const text = b ? new TextDecoder().decode(b) : '';
+      for (const line of text.split('\n')) {
+        const [gkey, ...members] = line.trim().split(/\s+/);
+        if (!gkey || !members.length) continue;
+        const g = { key: gkey, members, held: new Map(), done: false };
+        for (const m of members) this.#cgenGroups.set(m, g);
+      }
+    }
+    const g = this.#cgenGroups.get(key);
+    return g && !g.done ? g : null;
+  }
+
+  /** Every member of `grp` is placed: publish the group's module in place
+   *  of their units (or, without one, each member's own), then each
+   *  member's providers and region entries. */
+  #cgenGroup(grp, t0) {
+    const e = this.#shim.exports;
+    grp.done = true;
+    const ms = grp.members.map((k) => ({ key: k, ...grp.held.get(k) }));
+    const got = this.#env.loadUnit?.(`groups/${grp.key}`) ?? null;
+    if (!got) {
+      console.error(`gex-nt: link group ${grp.key} is not in the unit cache; its members' own units`);
+      for (const m of ms) this.#cgenUnit(m.u, m.key, m.path, t0);
+      return;
+    }
+    const us = new Uint32Array(ms.map((m) => m.u));
+    const kb = new TextEncoder().encode(grp.key);
+    const up = e.gex_alloc(Math.max(8, us.byteLength)) >>> 0;
+    const kp = e.gex_alloc(Math.max(8, kb.byteLength)) >>> 0;
+    this.#bytes().set(new Uint8Array(us.buffer), up);
+    this.#bytes().set(kb, kp);
+    const g = e.gex_cgen_group(up, us.length, kp, kb.byteLength);
+    e.gex_free?.(up, Math.max(8, us.byteLength));
+    e.gex_free?.(kp, Math.max(8, kb.byteLength));
+    if (g < 0) throw new Error(`gex-cgen: link group ${grp.key}: no unit`);
+    const path = this.#cgenStr(e.gex_cgen_path, g);
+    this.#cgenPublish(g, `groups/${grp.key}`, path, got);
+    console.error(`gex-nt: ${path} (${grp.key}): ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    for (const m of ms) {
+      this.#cgenProviders(m.u);
+      this.#cgenRegions(m.u, m.path);
+    }
   }
 
   useGl(gl) {

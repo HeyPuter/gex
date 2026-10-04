@@ -537,6 +537,50 @@ pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
     (units.len() - 1) as i32
 }
 
+/// Unit `u` is a link group's member (docs/eject-pe.md §6a): not wanted on
+/// its own. JS publishes the group's module once every member is placed
+/// ([`gex_cgen_group`]); Wine maps an exe's static imports before any of
+/// their code runs, so no member runs before it.
+#[no_mangle]
+pub extern "C" fn gex_cgen_hold(u: u32) {
+    let mut w = lock(&WANTED);
+    w.retain(|&x| x != u as usize);
+    WANTED_N.store(w.len(), Ordering::Release);
+}
+
+/// A link group's module as a unit of its own: key `groups/<key>` (the
+/// `len` bytes at `key`), the pages of its `n` members (unit indices, u32s
+/// at `members`). JS publishes it as a unit; each member's providers and
+/// region entries follow. Returns its index, or -1.
+#[no_mangle]
+pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i32 {
+    let us: Vec<usize> = crate::shim_slice(members, 4 * n).chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize).collect();
+    let Ok(key) = std::str::from_utf8(crate::shim_slice(key, len)).map(|k| format!("groups/{k}")) else { return -1 };
+    let mut units = lock(&UNITS);
+    let mut pages = Vec::new();
+    let mut paths = Vec::new();
+    for &u in &us {
+        let Some(x) = units.get(u) else { return -1 };
+        pages.extend(x.pages.iter().copied());
+        paths.push(x.path.rsplit(['/', '\\']).next().unwrap_or("").to_string());
+    }
+    let base = us.first().and_then(|&u| units.get(u)).map_or(0, |x| x.base);
+    units.push(Unit {
+        identity: String::new(),
+        key_base: key.clone(),
+        key,
+        wine: false,
+        path: format!("the link group {}", paths.join(" + ")),
+        base,
+        pages,
+        regs: Vec::new(),
+        dirs: Vec::new(),
+        slots: 0,
+        providers: Vec::new(),
+    });
+    (units.len() - 1) as i32
+}
+
 /// The bridges that make `addrs` reachable from tier-1: each address's
 /// dispatch slot (numbering its page if it has none) as `[table, slot]`,
 /// flattened for JS (a dense slot gets an index of its own in `blocks`,
