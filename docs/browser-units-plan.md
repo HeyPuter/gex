@@ -291,6 +291,65 @@ directory, statics, stack and heap); the guest takes 2 GiB..4 GiB-64 KiB.
 Order: step 0 first (it is the performance, and it is as safe as today),
 then step 1 for isolation, after the coordinator agrees.
 
+### Stream B state at the third reboot (2026-10-04, ~14:10)
+
+- **merge/web9 @ this commit**:
+  - merge/web9-fjit and merge/fjit (2c83dead);
+  - R's merge/abi9-page (abi9, stateful providers in the page, carries
+    off), via merge/web9-bias;
+  - the browser yield park (R's patch) and page GEX_NT_YIELD /
+    GEX_NT_DESKTOP;
+  - the NT fixed-address cap (ce415836);
+  - `gexc cgen-image --nt-trampolines32 | --providers`;
+  - the unguarded mode bit (page `unguarded=1`, run-node
+    GEX_CGEN_UNGUARDED=1);
+  - the aot-share wait class (NOITA_MIN_AOT 97);
+  - seed pin and unit precondition in browser-noita.mjs.
+
+  run-browser.sh is 49/49 (plain) on web9-bias. Not yet on the final
+  merge: web9's shim was rebuilt after the merge and installed, but its
+  gate was not rerun. Do that first.
+- **Not done:** the step-0 A/B (guarded vs unguarded) and the yield arms.
+  - bnoita3 and bnoita3u (pre-rebase, carries on, *no icall hints*):
+    abandoned.
+  - The new sets: `target/bnoita4u` (unguarded) and `target/bnoita4g`
+    (guarded). They use the staged layout (real copy, `--append`), have
+    the cg14 icall hints copied into cgen/icall (noita.exe's key ends
+    `-ie77f2dfea53061fa`) and providers built, and come from gexc
+    `target/x86/release/gexc` of web9 (= scratchpad gexc-web9d).
+  - Both were stopped mid noita.exe: bnoita4u had 991 objects, bnoita4g
+    244 (of about 3300).
+  - **bnoita4u's noita.exe failed twice** at about unit 925 (and
+    bnoita3u's at about unit 1550), with the error cut off by `tail`. The
+    guarded flavor of the same tree built fine (bnoita3). Find the
+    failing unit first: run `gexc cgen-image noita.exe --pe-base 0x400000`
+    with GEX_CGEN_CACHE=target/bnoita4u/cgen, *without* GEX_CGEN_GUARD,
+    and keep the whole log. Objects are cached, so it gets back to the
+    failure quickly.
+- **Resume:**
+  - Scripts are saved in `target/streamB-scripts/`: build-bunits4.sh
+    GEXC u|g, run-noita-page.sh, run-pewasm-page.sh, abba.sh, wfps.sh,
+    and the pewasm page's index.html with `?seed=`. Their copies also
+    sit in scratchpad web9/.
+  - Then: guarded vs unguarded (page flag `&unguarded=1`), each paired
+    with pewasm, seed pinned, on 5,11. Then GEX_NT_YIELD=os against the
+    default wake on the unguarded set.
+  - Report the step-0 delta before step 1.
+- **Compositor (the next lever after these):** per frame, from dg4's
+  compositor line:
+  - 12 queue submits (2.9 ms);
+  - 60 render passes for 56 draws (0.7 ms);
+  - 218 writeBuffer, 137 copyBufferToBuffer, 15 createBuffer, and
+    writeTexture of about 840 KiB;
+  - about 11 ms of gex_gl_submit per frame.
+
+  The profile also shows `vsnprintf`/`printf_core` about 200 ms per 11 s
+  under gex_wgpu_draw_vbo_inner (mesa-wink gex_wgpu_screen.c,
+  `gex-cull` / `facing capture` fprintfs).
+- **Disk:** /home is at 98% (45 GB free). bnoita2, bnoita3 and bnoita3u
+  are several GB each and superseded. F read bnoita2 and bnoita3, so ask
+  before deleting.
+
 ## Where the page is now
 
 Noita in headless Chromium, hardware WebGPU, full speed: about 4.2
