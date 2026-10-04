@@ -117,6 +117,9 @@ pub struct PeReport {
     /// The web build's units (browser flavour), by image: (image, how), and
     /// region entries made for it; empty without a browser runtime.
     pub web_units: Vec<(String, &'static str)>,
+    /// Functions units were built without (left to tier-1: clang wanted a
+    /// shadow stack), by image.
+    pub left: Vec<(String, Vec<u64>)>,
     pub web_regions: usize,
 }
 
@@ -453,6 +456,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         };
         let p = nt_cgen::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
         compile(&p)?;
+        note_left(&pe, m.base, &p, &m.path, "", &mut report)?;
         // Where code ran without a unit although the image had one (a resume
         // into the middle of a function, a unit's leave): region entries,
         // a module of their own beside the unit (docs/eject-pe.md §3.3).
@@ -526,6 +530,17 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
     };
     std::fs::write(dir.join(BUILD_FILE), manifest.to_json()).with_context(|| format!("writing {BUILD_FILE}"))?;
     Ok(report)
+}
+
+#[cfg(feature = "build")]
+/// Functions a unit was built without (gex-cgen left them to tier-1):
+/// uncovered in a project that runs with no translation.
+fn note_left(pe: &gex_ld::pe::PeImage, base: u64, unit: &Path, path: &str, what: &str, report: &mut PeReport) -> Result<()> {
+    let left = nt_cgen::left_out(pe, base, unit)?;
+    if !left.is_empty() {
+        report.left.push((format!("{path}{what}"), left));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "build")]
@@ -609,6 +624,7 @@ fn build_web(
                 "built"
             };
             let p = nt_cgen::prepare_pe(&pe, *base, jobs, true).with_context(|| format!("building the web unit for {path}"))?;
+            note_left(&pe, *base, &p, path, " (web)", report)?;
             if !interior.is_empty() {
                 let failed = nt_cgen::prepare_regions(&pe, *base, &p, interior, jobs)?;
                 if nt_cgen::region_module(&p).is_some() {

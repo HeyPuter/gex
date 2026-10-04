@@ -209,6 +209,14 @@ fn build(dir: &std::path::Path) -> Result<()> {
         if !pe.providers.is_empty() {
             eprintln!("  providers: {}", pe.providers.join(", "));
         }
+        for (path, left) in &pe.left {
+            let f: Vec<String> = left.iter().map(|a| format!("{a:#x}")).collect();
+            eprintln!(
+                "  warning: {path}: {} functions have no AOT code (gex-cgen left them to tier-1: clang wanted a shadow stack): {}; the run stops if it reaches one",
+                left.len(),
+                f.join(" ")
+            );
+        }
         for (path, n, first) in &pe.uncovered {
             let f: Vec<String> = first.iter().map(|a| format!("{a:#x}")).collect();
             eprintln!("  warning: {path}: {n} entries the session reached have no function or region entry (first: {})", f.join(" "));

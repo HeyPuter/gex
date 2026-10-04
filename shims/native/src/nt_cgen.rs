@@ -226,6 +226,24 @@ pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: boo
     prepare_with(&image, &seeds, jobs, verbose, &pv)
 }
 
+/// Functions recovery found in the image at `base` that its unit (`unit`,
+/// its `c.wasm`) has no entry for, its providers' stubs aside: those
+/// gex-cgen left to tier-1 (clang wanted a shadow stack), which a runtime
+/// with no translation cannot run (docs/eject-pe.md §3.4).
+pub fn left_out(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Path) -> Result<Vec<u64>> {
+    let (image, _) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    let summaries = cache_root()?.join("recovery").join(recovery_key(&image)).join("summaries");
+    let Ok(text) = std::fs::read_to_string(&summaries) else { return Ok(Vec::new()) };
+    let have: std::collections::HashSet<u64> = gex_cgen::image::read_entries(unit)?.into_iter().collect();
+    let stubs = provided(pe, base).stubs;
+    Ok(text
+        .lines()
+        .skip(2)
+        .filter_map(|l| l.split_whitespace().next().and_then(|a| u64::from_str_radix(a, 16).ok()))
+        .filter(|a| !have.contains(a) && stubs.binary_search(a).is_err())
+        .collect())
+}
+
 /// [`prepare_pe`] with function starts of the caller's besides the image's
 /// own (gex-eject: entries a recorded session reached that recovery did not
 /// find). The unit has the same key: the caller owns the cache it builds
