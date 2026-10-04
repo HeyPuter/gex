@@ -239,7 +239,7 @@ const host = new ProcessHost({
   extra: {
     // Function-tier units (--cgen): where their files are, for every Worker.
     cgen: cgenMode
-      ? { mode: cgenMode, root: process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
+      ? { mode: cgenMode | (process.env.GEX_CGEN_UNGUARDED === '1' ? 4 : 0), root: process.env.GEX_CGEN_CACHE ?? join(process.env.HOME ?? '', '.cache/gex/cgen') }
       : undefined,
     // Bytes, not a string: a command line is a pipe, and `gzip -c` writes a
     // deflate stream that a UTF-8 round trip would fill with U+FFFD.

@@ -130,9 +130,16 @@ pub(crate) fn on() -> bool {
 }
 
 /// Turn the function tier on (1) or require it for program images (2). Before
-/// the process boots, so the exe and ntdll are seen.
+/// the process boots, so the exe and ntdll are seen. Bit 2 (4) selects the
+/// unguarded flavor of i386 units (the native one, `:unguarded` keys): in
+/// the browser the guarded flavor guards only at the memory's end, as the
+/// unguarded one traps there by itself (docs/browser-units-plan.md).
 #[no_mangle]
 pub extern "C" fn gex_cgen_set_mode(mode: u32) {
+    if mode & 4 != 0 {
+        gex_cgen::image::set_unguarded(true);
+    }
+    let mode = mode & 3;
     MODE.store(mode.min(2), Ordering::Relaxed);
     if mode == 0 {
         return;
