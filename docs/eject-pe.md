@@ -678,11 +678,20 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
     (callouts 0, in-place installs 0). World fps 34-45 in 60 s windows
     (untimed: build cores 0,2,6,8, Chromium beside it; pewasm's page is
     about 59 per stream B).
-  - Open: the guarded flavour leaves two functions out of their units
-    (`clang wanted a shadow stack`: noita.exe 0xdd80a0, msvcr120.dll
-    0x1637a00); not reached so far, but the build should fail on them, as
-    on anything uncovered. A paired page measurement (pewasm's page and
-    the ejected page, same cores) is next.
+  - The training run now behaves as the AOT-only run except that a miss
+    translates (`gex_set_aot` without `gex_set_jit(0)`): units and threads
+    served in place, catch-ups in place. It records 13 entries for Noita,
+    all in noita.exe (the fallback alone recorded 73, most of them
+    continuations of the syscalls it left wasm for). Where the browser
+    still leaves wasm and native does not: a call-out (training only) and
+    the waits and yields the browser parks in JS (`GEX_NT_RESUME_LOG`
+    names `set_resume` sites). With the 13 (108 region entries in all) the
+    AOT-only page ran 600 s clean, world frame 22,209.
+  - build.sh warns, by image, of functions a unit was built without
+    (`nt_cgen::left_out`): the guarded flavour leaves noita.exe 0xdd80a0
+    and msvcr120.dll 0x1637a00 (`clang wanted a shadow stack`); not
+    reached so far. A paired page measurement (pewasm's page and the
+    ejected page, same cores) is next.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
