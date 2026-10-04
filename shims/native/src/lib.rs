@@ -3654,17 +3654,31 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // libc from scratch (eight seconds on `dpkg --version`).
     let cache = caller.data().jit.as_ref().and_then(|j| j.cache.clone());
     let t0 = std::time::Instant::now();
+    // `GEX_DUMP_BAD_WASM=DIR`: keep a translation the engine rejects, as
+    // DIR/PC.wasm, to take apart offline (wasm-tools validate/print).
+    let keep_bad = |e: anyhow::Error| -> anyhow::Error {
+        if let Some(dir) = std::env::var_os("GEX_DUMP_BAD_WASM") {
+            let path = std::path::Path::new(&dir).join(format!("{pc:x}.wasm"));
+            let _ = std::fs::create_dir_all(&dir);
+            if std::fs::write(&path, &translated_module.wasm).is_ok() {
+                return e.context(format!("the module is in {}", path.display()));
+            }
+        }
+        e
+    };
     let module = match cache {
         Some((dir, build)) => {
             let key = gex_cache::key(&build, [translated_module.wasm.as_slice()]);
             let wasm = translated_module.wasm.clone();
             let l = gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
+                .map_err(keep_bad)
                 .context("compiling runtime-translated wasm")?;
             let c = if l.hit { &jit_stats::CACHE_HITS } else { &jit_stats::CACHE_MISSES };
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             l.module
         }
         None => Module::new(&engine, &translated_module.wasm)
+            .map_err(keep_bad)
             .context("validating runtime-translated wasm")?,
     };
     jit_stats::COMPILE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
