@@ -18,8 +18,8 @@
 use crate::emit::{self, reg_name, Emitter, FnRegs};
 use anyhow::{bail, Result};
 use gex_abi::ctx;
-use gex_ir::func::{BlockId, Callee, Edge, FTerm, Form, Function, RegSet, Summary};
-use gex_ir::{Block, Expr, GuestReg, Stmt};
+use gex_ir::func::{BlockId, Callee, Edge, FBlock, FTerm, Form, Function, RegSet, Summary};
+use gex_ir::{Block, Expr, GuestReg, HostFunc, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
@@ -600,9 +600,7 @@ impl FnUnit {
                 if let Some(d) = ldirty.get(i) {
                     le.set_dirty(d);
                 }
-                for st in &bl.stmts {
-                    le.stmt(st)?;
-                }
+                block_stmts(&mut le, bl)?;
                 self.term(&mut le, f, i, known, sums, trapfree, &mut calls, Some(&scope), None)?;
                 le.line("}");
             }
@@ -620,9 +618,7 @@ impl FnUnit {
             if let Some(d) = dirty.get(i) {
                 e.set_dirty(d);
             }
-            for s in &b.stmts {
-                e.stmt(s)?;
-            }
+            block_stmts(&mut e, b)?;
             let heads = Heads { loops: &loops, fname: f.entry, used: &used };
             self.term(&mut e, f, i, known, sums, trapfree, &mut calls, None, Some(&heads))?;
             e.line("}");
@@ -1324,6 +1320,23 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 /// anyway, while making every block a join point with all registers
 /// reloaded nearly doubled the largest bodies (noita.exe's 0xdc14c0, 414 to
 /// 720 KB of wasm) and put them past Cranelift's limits.
+/// Emit a block's statements, telling the emitter where each resumable
+/// fault statement (`int3`'s `HostCall`) carries on.
+fn block_stmts(e: &mut Emitter<'_>, b: &FBlock) -> Result<()> {
+    for (k, s) in b.stmts.iter().enumerate() {
+        e.fault_next = match s {
+            Stmt::HostCall { func: HostFunc::Breakpoint | HostFunc::Illegal, .. } if e.fault_exit.is_some() => {
+                let pc = b.pcs[k];
+                Some(b.insts.iter().position(|&a| a == pc).and_then(|j| b.insts.get(j + 1).copied()).unwrap_or(b.end))
+            }
+            _ => None,
+        };
+        e.stmt(s)?;
+    }
+    e.fault_next = None;
+    Ok(())
+}
+
 fn resume_block(e: &mut Emitter<'_>, f: &Function) {
     if local_resume() {
         // Each call takes its own continuation (`gex_lc_*`). Anything else
