@@ -9,11 +9,18 @@
 //! profile. Symbolise with `GEX_PERFMAP=1`'s /tmp/perf-<pid>.map for
 //! compiled wasm and the binaries' symbol tables for the rest
 //! (tools/prof-report.py).
+//!
+//! Each sample also records the thread it hit, and every thread with at
+//! least 5% of the samples gets a profile of its own beside the file,
+//! `<stem>-<thread name>-<tid>.<ext>` (and its `.maps`), in the same format:
+//! what the main thread, the critical path of a game's frame, spends its
+//! time on.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const N: usize = 1 << 23;
 static SAMPLES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+static TIDS: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn on_prof(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
@@ -32,6 +39,8 @@ extern "C" fn on_prof(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut libc::c_
     let i = NEXT.fetch_add(1, Ordering::Relaxed);
     if i < N {
         SAMPLES[i].store(pc, Ordering::Relaxed);
+        // SAFETY: gettid is async-signal-safe.
+        TIDS[i].store(unsafe { libc::syscall(libc::SYS_gettid) } as u32, Ordering::Relaxed);
     }
 }
 
@@ -86,10 +95,34 @@ pub fn finish() {
 
 fn dump(path: &std::path::Path) {
     let n = NEXT.load(Ordering::Relaxed).min(N);
+    let maps = std::fs::read("/proc/self/maps").ok();
     let mut hist: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    for s in &SAMPLES[..n] {
-        *hist.entry(s.load(Ordering::Relaxed)).or_default() += 1;
+    let mut by_tid: std::collections::HashMap<u32, std::collections::HashMap<u64, u64>> = Default::default();
+    for (s, t) in SAMPLES[..n].iter().zip(&TIDS[..n]) {
+        let pc = s.load(Ordering::Relaxed);
+        *hist.entry(pc).or_default() += 1;
+        *by_tid.entry(t.load(Ordering::Relaxed)).or_default().entry(pc).or_default() += 1;
     }
+    write_one(path, &hist, maps.as_deref());
+    // Threads with at least 5% of the samples, each on its own.
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "prof".into());
+    for (tid, h) in by_tid {
+        let k: u64 = h.values().sum();
+        if tid == 0 || k * 20 < n as u64 {
+            continue;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
+            .map(|c| c.trim().replace(['/', ' ', ':'], "_"))
+            .unwrap_or_else(|_| "gone".into());
+        write_one(&path.with_file_name(format!("{stem}-{comm}-{tid}.{ext}")), &h, maps.as_deref());
+    }
+}
+
+/// One histogram as a profile file (`pid`, `samples`, `pc count`), with
+/// the maps beside it.
+fn write_one(path: &std::path::Path, hist: &std::collections::HashMap<u64, u64>, maps: Option<&[u8]>) {
+    let n: u64 = hist.values().sum();
     let mut out = format!("pid {}\nsamples {}\n", std::process::id(), n);
     for (pc, c) in hist {
         out.push_str(&format!("{pc:x} {c}\n"));
@@ -98,7 +131,7 @@ fn dump(path: &std::path::Path) {
     if std::fs::write(&tmp, out).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
-    if let Ok(maps) = std::fs::read("/proc/self/maps") {
-        let _ = std::fs::write(path.with_extension("maps"), maps);
+    if let Some(m) = maps {
+        let _ = std::fs::write(path.with_extension("maps"), m);
     }
 }

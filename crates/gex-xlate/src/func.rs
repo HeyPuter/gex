@@ -204,7 +204,11 @@ pub struct Code<'a> {
     ranges: Vec<(u64, u64)>,
 }
 
-/// Where [`Code`] reads from.
+/// Where [`Code`] reads from. Tagged (`repr(u8)`), not niche-encoded: the
+/// browser shim's guest memory starts at linear address 0, so `mem`'s
+/// pointer is null there, and with the niche a `Memory` read as an `Image`
+/// (every fetch empty, so every function JIT translation one `illegal`).
+#[repr(u8)]
 enum Src<'a> {
     Image { image: &'a Image, view: CodeView<'a> },
     /// Guest memory at run time (the function JIT, docs/merge-plan.md

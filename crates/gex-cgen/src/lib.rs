@@ -322,3 +322,11 @@ fn build_blocks(tier1: &[u8], blocks: &[(&Block, u32)]) -> Result<(Vec<u8>, Spli
     }
     Ok((wasm, stats))
 }
+
+/// Set in the pc argument of the `breakpoint` and `illegal` imports by code
+/// that can go on after the import returns (a whole-image unit body: it
+/// continues at `ctx::PC` through its `gex_resume`), so a host may dispatch
+/// the fault nested and return instead of unwinding every wasm frame. Guest
+/// addresses are below 2^48; a host strips it before using the pc. (Here,
+/// not in gex-abi, whose sources key every recovery.)
+pub const RESUMABLE_PC: u64 = 1 << 62;

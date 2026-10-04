@@ -102,6 +102,9 @@ struct Pending {
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Set after a push to [`PENDING`]: every syscall drains, and looks here
+/// first rather than taking the lock.
+static HAS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ON: OnceLock<()> = OnceLock::new();
 /// One unit is placed at a time: slot assignment runs from a snapshot of the
 /// page table to the publish.
@@ -180,6 +183,33 @@ pub fn icall_path(image: &gex_ld::Image) -> Result<std::path::PathBuf> {
     Ok(cache_root()?.join("icall").join(format!("{}.txt", gex_key::image_identity(image).trim_start_matches("image:"))))
 }
 
+/// Say where the image's indirect-call profile was looked for and how many
+/// hints it gave (`gexc cgen-image`). A unit built without one has no
+/// devirtualised calls, so its hot virtual calls stay table calls that no
+/// engine inlines (the browser units of 2026-10-04 were all built so). When
+/// it is missing, each cache in `GEX_CGEN_ICALL_FROM` (colon-separated
+/// cache roots) is checked for the same identity's file, and one found is
+/// named, loudly.
+fn report_hints(image: &gex_ld::Image) {
+    let Ok(path) = icall_path(image) else { return };
+    if path.exists() {
+        eprintln!("[cgen] indirect-call hints: {} from {}", icall_hints(image).len(), path.display());
+        return;
+    }
+    eprintln!("[cgen] indirect-call hints: none (no {})", path.display());
+    let name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    for root in std::env::var("GEX_CGEN_ICALL_FROM").unwrap_or_default().split(':').filter(|r| !r.is_empty()) {
+        let other = std::path::Path::new(root).join("icall").join(&name);
+        if other.exists() {
+            eprintln!(
+                "[cgen] WARNING: building without the indirect-call profile at {}; copy it to {} for devirtualised calls",
+                other.display(),
+                path.display()
+            );
+        }
+    }
+}
+
 /// The image's indirect-call profile, `<cache>/icall/<image identity>.txt`:
 /// lines `icall <return address> <target> <count>` (pewasm's
 /// `PEWASM_PROFILE_INDIRECT` dump, in this image's addresses; anything
@@ -227,6 +257,9 @@ pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jo
 
 fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool, pv: &Provided) -> Result<std::path::PathBuf> {
     let (image, seeds) = (image, seeds);
+    if verbose {
+        report_hints(image);
+    }
     let key = unit_key(image, pv);
     let root = cache_root()?;
     let dir = root.join(&key);
@@ -257,7 +290,7 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
     let t0 = std::time::Instant::now();
     let work = dir.join("work");
     let byte = |a: u64| {
-        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+        image.segments.iter().find_map(|s| s.byte(a))
     };
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
     let hints = icall_hints(image);
@@ -298,11 +331,15 @@ pub(crate) fn enable(record: bool) -> Result<()> {
             base: m.base,
             pe: Arc::clone(m.pe),
         });
+        HAS_PENDING.store(true, std::sync::atomic::Ordering::Release);
     });
     Ok(())
 }
 
 fn take_pending() -> Vec<Pending> {
+    if !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
     std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -549,6 +586,14 @@ fn is_wine(p: &Pending) -> bool {
 /// no (`0`, or a list of file names that leaves it out), gets a unit built
 /// for the next run.
 fn missing(p: Pending) -> Result<()> {
+    // Always said, and kept for GEX_NT_STATS: an image on tier-1 because its
+    // unit is missing (a base its unit was not built for, a stale key) is
+    // otherwise only visible as a lower AOT share.
+    let key = gex_xlate::func::pe_input(&p.pe, p.base)
+        .map(|(image, _)| unit_key(&image, &provided(&p.pe, p.base)))
+        .unwrap_or_else(|e| format!("(not placeable: {e})"));
+    eprintln!("gex-nt: warning: {} at {:#x}: no function-tier unit (key {key}); it runs on tier-1", p.path, p.base);
+    NO_UNIT.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{} at {:#x} (key {key})", p.path, p.base));
     if mode() == Mode::Require && !is_wine(&p) {
         bail!(
             "--cgen: {} has no function-tier unit for base {:#x}; build one with \
@@ -584,6 +629,16 @@ fn missing(p: Pending) -> Result<()> {
         Err(e) => eprintln!("gex-nt: could not start building the function tier for {}: {e}", p.path),
     }
     Ok(())
+}
+
+/// Images mapped with no unit for their base, as `missing` reported them.
+static NO_UNIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// GEX_NT_STATS's "no unit" line: every image running on tier-1 for want of
+/// a unit, or `None` when there are none.
+pub(crate) fn no_unit_line() -> Option<String> {
+    let v = NO_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+    (!v.is_empty()).then(|| format!("gex-nt: no unit ({}): {}", v.len(), v.join(" | ")))
 }
 
 /// Place, compile, publish and install, for a caller inside the guest

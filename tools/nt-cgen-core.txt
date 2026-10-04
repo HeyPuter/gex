@@ -35,3 +35,23 @@ mpr.dll
 # tests/nt (mtx, lowmem): Wine's own VS2013 runtime
 msvcr120.dll
 msvcp120.dll
+# Games on Direct3D over wined3d (Peggle's ddraw/d3d8; Unity and Hollow
+# Knight's d3d11/dxgi), their sound and input. Added with `--append`, so
+# the bases above did not move.
+ddraw.dll
+d3d8.dll
+d3d9.dll
+d3d11.dll
+dxgi.dll
+d3dcompiler_47.dll
+wined3d.dll
+dsound.dll
+winmm.dll
+msacm32.dll
+dinput8.dll
+# Peggle's networking (wsock32 -> iphlpapi, dnsapi, nsi), mapped at start-up
+# and run on tier-1 without a base. Added with `--append`.
+wsock32.dll
+iphlpapi.dll
+dnsapi.dll
+nsi.dll

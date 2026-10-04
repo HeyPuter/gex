@@ -18,6 +18,7 @@ pub fn header() -> String {
     let _ = writeln!(w, "#define GEX_SYSCALL_INST_BYTES {}u", gex_abi::SYSCALL_INST_BYTES);
     let _ = writeln!(w, "#define GEX_GUEST_LIMIT 0x{:x}ull", gex_abi::GUEST_LIMIT);
     let _ = writeln!(w, "#define GEX_POISON_ADDR 0x{:x}u", gex_abi::POISON_ADDR);
+    let _ = writeln!(w, "#define GEX_RESUMABLE_PC 0x{:x}ull", crate::RESUMABLE_PC);
     let _ = writeln!(w, "#define GEX_DISPATCH_DIR 0x{:x}u", gex_abi::DISPATCH_DIR);
     let _ = writeln!(w, "#define GEX_DISPATCH_PAGE 0x{:x}u", gex_abi::DISPATCH_PAGE);
     let _ = writeln!(w, "#define GEX_DISPATCH_MAX_PAGES 0x{:x}u", gex_abi::DISPATCH_MAX_PAGES);

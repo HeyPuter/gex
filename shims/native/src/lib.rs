@@ -365,6 +365,12 @@ struct Jit {
     ftab: Option<ftab::Store>,
 }
 
+/// How long `JitShared::registry` is (stored after every push, under its
+/// lock): `catch_up_in_caller`'s check without the lock. A hint only: one
+/// process's in a forked child may be longer than the child's registry,
+/// which costs that check its lock, as before.
+static REGISTRY_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// One runtime-translated module, kept so another thread's store can
 /// instantiate it rather than translating the same code again.
 struct CompiledUnit {
@@ -556,6 +562,7 @@ fn run_program_with(
     // browser has a shim per process).
     gex_xlate::set_compat(program.compat());
     lockstep::set_compat(program.compat());
+    gex_kernel::set_compat32(program.compat() && gex_abi::X86);
     ftab::selftest_init();
 
     // A profile records where a previous run went, feeding `extra_entries` so
@@ -2555,7 +2562,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
             if caller.data().nt.is_some() {
-                return nt::syscall_import(&mut caller, pc as u64);
+                let r = nt::syscall_import(&mut caller, pc as u64);
+                check_i386_high(&caller, "an NT syscall");
+                return r;
             }
             // An ejected project's runtime allows only the recorded calls.
             if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
@@ -2708,6 +2717,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
                 lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
             }
+            check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();
             match outcome {
                 SyscallOutcome::Continue => Ok(()),
@@ -2905,8 +2915,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::ILLEGAL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> Result<()> {
+            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
+            let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::Illegal, pc as u64);
+                return nt::fault_at(&mut caller, nt::Fault::Illegal, pc as u64, resumable);
             }
             let pc = pc as u64;
             let raw = raw as u32;
@@ -2958,6 +2970,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::BREAKPOINT,
         |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> Result<()> {
+            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
+            let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             // The diagnostic trace points dump the registers and carry on.
             if imm == gex_abi::imports::BRK_TRAP_PC || imm == gex_abi::imports::BRK_TRACE {
                 if let Some(memory) = caller.data().memory.clone() {
@@ -2982,7 +2996,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::from_brk(imm), pc as u64);
+                return nt::fault_at(&mut caller, nt::Fault::from_brk(imm), pc as u64, resumable);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with
@@ -3622,6 +3636,9 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
 /// catches up by walking forward from its own watermark.
 fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
     let behind = match caller.data().jit.as_ref() {
+        // Nothing published past this store's watermark: no lock (every
+        // syscall and safepoint comes through here).
+        Some(jit) if REGISTRY_LEN.load(std::sync::atomic::Ordering::Acquire) <= jit.replayed => false,
         Some(jit) => {
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.registry.len() > jit.replayed
@@ -3730,6 +3747,7 @@ fn publish_unit(
         }
     }
     sh.registry.push(Arc::clone(&unit));
+    crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
     sh.blocks += blocks;
     sh.calls += 1;
     Ok(unit)
@@ -4504,4 +4522,26 @@ pub fn wasm_stack_bytes() -> usize {
 /// only as used).
 pub fn guest_thread_stack() -> usize {
     wasm_stack_bytes() + (16 << 20)
+}
+
+/// `GEX_CHECK_I386_HIGH=1`: after a host function that writes guest
+/// registers, an i386 process's GPR slots must have zero high halves
+/// (`gex_kernel::gpr`), which compiled code may rely on. A slot that does
+/// not is reported with where it was found (the first 32).
+pub(crate) fn check_i386_high(cx: &impl wasmtime::AsContext<Data = HostState>, site: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var("GEX_CHECK_I386_HIGH").as_deref() == Ok("1")) || !gex_kernel::compat32() {
+        return;
+    }
+    let d = cx.as_context().data();
+    let Some(memory) = d.memory.as_ref() else { return };
+    let base = d.thread.ctx_addr as usize;
+    for i in 0..8u8 {
+        let v = read_u64(memory.bytes(), base + ctx::x(i));
+        if v >> 32 != 0 && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let pc = read_u64(memory.bytes(), base + ctx::PC);
+            eprintln!("gex: GEX_CHECK_I386_HIGH: x{i} = {v:#x} after {site} (pc {pc:#x})");
+        }
+    }
 }
