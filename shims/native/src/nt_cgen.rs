@@ -183,6 +183,33 @@ pub fn icall_path(image: &gex_ld::Image) -> Result<std::path::PathBuf> {
     Ok(cache_root()?.join("icall").join(format!("{}.txt", gex_key::image_identity(image).trim_start_matches("image:"))))
 }
 
+/// Say where the image's indirect-call profile was looked for and how many
+/// hints it gave (`gexc cgen-image`). A unit built without one has no
+/// devirtualised calls, so its hot virtual calls stay table calls that no
+/// engine inlines (the browser units of 2026-10-04 were all built so). When
+/// it is missing, each cache in `GEX_CGEN_ICALL_FROM` (colon-separated
+/// cache roots) is checked for the same identity's file, and one found is
+/// named, loudly.
+fn report_hints(image: &gex_ld::Image) {
+    let Ok(path) = icall_path(image) else { return };
+    if path.exists() {
+        eprintln!("[cgen] indirect-call hints: {} from {}", icall_hints(image).len(), path.display());
+        return;
+    }
+    eprintln!("[cgen] indirect-call hints: none (no {})", path.display());
+    let name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    for root in std::env::var("GEX_CGEN_ICALL_FROM").unwrap_or_default().split(':').filter(|r| !r.is_empty()) {
+        let other = std::path::Path::new(root).join("icall").join(&name);
+        if other.exists() {
+            eprintln!(
+                "[cgen] WARNING: building without the indirect-call profile at {}; copy it to {} for devirtualised calls",
+                other.display(),
+                path.display()
+            );
+        }
+    }
+}
+
 /// The image's indirect-call profile, `<cache>/icall/<image identity>.txt`:
 /// lines `icall <return address> <target> <count>` (pewasm's
 /// `PEWASM_PROFILE_INDIRECT` dump, in this image's addresses; anything
@@ -230,6 +257,9 @@ pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jo
 
 fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool, pv: &Provided) -> Result<std::path::PathBuf> {
     let (image, seeds) = (image, seeds);
+    if verbose {
+        report_hints(image);
+    }
     let key = unit_key(image, pv);
     let root = cache_root()?;
     let dir = root.join(&key);
