@@ -47,6 +47,16 @@ struct Pending {
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Whether `PENDING` may hold something (set after a push, cleared before a
+/// drain takes it).
+static ANY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How many units wait for their bytes (`WANTED`'s length), readable without
+/// its lock.
+static WANTED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn lock_free_wanted_empty() -> bool {
+    WANTED_N.load(Ordering::Acquire) == 0
+}
 
 /// A unit placed for an image: wanted until JS brings its bytes, then
 /// published.
@@ -172,6 +182,7 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if HOOK.set(()).is_ok() {
         gex_kernel::nt::section::set_image_mapped_hook(|m| {
             lock(&PENDING).push(Pending { path: m.path.to_string(), base: m.base, pe: Arc::clone(m.pe) });
+            ANY_PENDING.store(true, Ordering::Release);
         });
     }
 }
@@ -201,6 +212,11 @@ pub(crate) fn drain() -> bool {
     if !on() {
         return false;
     }
+    // Every syscall asks: an atomic load when nothing was mapped (no lock).
+    if !ANY_PENDING.load(Ordering::Acquire) && lock_free_wanted_empty() {
+        return false;
+    }
+    ANY_PENDING.store(false, Ordering::Release);
     let pending = std::mem::take(&mut *lock(&PENDING));
     // The NT trampoline page with the first images (the exe says the ABI),
     // as natively: every Wine DLL's unix calls and syscalls go through it.
@@ -279,7 +295,11 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         slots: 0,
         providers,
     });
-    lock(&WANTED).push_back(units.len() - 1);
+    {
+        let mut w = lock(&WANTED);
+        w.push_back(units.len() - 1);
+        WANTED_N.store(w.len(), Ordering::Release);
+    }
 }
 
 /// The key of the unit for `image` (the native host's `nt_cgen::unit_key`:
@@ -424,6 +444,7 @@ pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {
 pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     let mut wanted = lock(&WANTED);
     wanted.retain(|&w| w != u as usize);
+    WANTED_N.store(wanted.len(), Ordering::Release);
     let units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return 0 };
     if MODE.load(Ordering::Relaxed) == 2 && !x.wine {
@@ -482,7 +503,11 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             }
         }
     }
-    lock(&WANTED).retain(|&w| w != u as usize);
+    {
+        let mut w = lock(&WANTED);
+        w.retain(|&x| x != u as usize);
+        WANTED_N.store(w.len(), Ordering::Release);
+    }
     lock(&PUBLISHED).push(u as usize);
     0
 }

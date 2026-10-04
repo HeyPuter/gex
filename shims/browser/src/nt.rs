@@ -857,21 +857,31 @@ mod imp {
         // date every 16th call and around waits, and the time split is
         // sampled likewise (Noita's main thread makes ~10^5 NtYieldExecution
         // a second).
-        let n = SYSCALL_N.with(|c| {
-            let n = c.get().wrapping_add(1);
-            c.set(n);
-            n
-        });
-        let sampled = n % SAMPLE == 0;
+        let nr = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32;
+        // A spin-yield loop makes hundreds of thousands of NtYieldExecution
+        // a second: those are counted apart and sampled far more rarely, so
+        // the clock reads of the sampling stay a small share of a spin.
+        let sampled = if nr == nt::sysno::ntdll::NtYieldExecution {
+            YIELD_N.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n % SAMPLE_YIELD == 0
+            })
+        } else {
+            SYSCALL_N.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n % SAMPLE == 0
+            })
+        };
         if sampled {
             tick();
+            if let Some((lo, bad, least)) = crate::stack_guard_check() {
+                warn_line(&format!(
+                    "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
+                ));
+            }
         }
-        if let Some((lo, bad, least)) = crate::stack_guard_check() {
-            warn_line(&format!(
-                "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
-            ));
-        }
-        let nr = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32;
         if TRACE_FOREIGN.load(Ordering::Relaxed) {
             crate::foreign_now("before", &nt::syscall_name(nr));
         }
@@ -888,7 +898,13 @@ mod imp {
         // long), everything else every SAMPLE-th call, counted SAMPLE times.
         let wait = is_wait(nr);
         let timed = sampled || (wait && nr != nt::sysno::ntdll::NtYieldExecution);
-        let scale = if timed && !sampled { 1 } else { SAMPLE };
+        let scale = if timed && !sampled {
+            1
+        } else if nr == nt::sysno::ntdll::NtYieldExecution {
+            SAMPLE_YIELD
+        } else {
+            SAMPLE
+        };
         let (t_in, gl_in, glw_in) = (
             if timed { mono_raw() } else { 0 },
             crate::gl::GL_NS.with(|g| g.get()),
@@ -1140,9 +1156,12 @@ mod imp {
 
     /// Every how many NT syscalls a thread reads the clock (see `syscall`).
     const SAMPLE: u64 = 16;
+    /// Every how many NtYieldExecution (see `syscall`).
+    const SAMPLE_YIELD: u64 = 512;
 
     thread_local! {
         static SYSCALL_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static YIELD_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     /// Whether syscall `nr` waits (its time is a wait, not NT work): by
