@@ -203,7 +203,9 @@ impl<'a> CodeView<'a> {
                 let off = (pc - seg.vaddr) as usize;
                 let n = (span as usize - off).min(16);
                 let have = seg.bytes.len().saturating_sub(off).min(n);
-                buf[..have].copy_from_slice(&seg.bytes[off..off + have]);
+                if have > 0 {
+                    buf[..have].copy_from_slice(&seg.bytes[off..off + have]);
+                }
                 buf[have..n].fill(0);
                 return n;
             }
