@@ -28,6 +28,7 @@
 //! [`REPL_THREADS`] stacks of [`REPL_STACK_BYTES`], one per guest thread by
 //! context slot. The region is recorded as a mapping so `fork` copies it.
 
+use crate::WasmtimeContext;
 use super::{read_u64, write_u64, HostState};
 use anyhow::{anyhow, bail, Context, Result};
 use gex_abi::ctx;
@@ -499,6 +500,11 @@ fn engine_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
     config.wasm_tail_call(true);
     config.wasm_threads(true);
+    // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
+    config.shared_memory(true);
+    // Wasm exception handling: setjmp/longjmp in native Wine and wasm32
+    // programs (clang's SjLj lowering), docs/wine-native.md §4.2.
+    config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
     config.wasm_multi_memory(true);
     config
@@ -609,9 +615,9 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
         Abi::Ctx | Abi::Entry => {
             if let Err(e) = func.call(&mut *caller, &[Val::I32(ctx_addr)], &mut []) {
                 if e.is::<super::StopExecution>() {
-                    return Err(e);
+                    return Err(anyhow::Error::from(e));
                 }
-                return Err(e.context(format!("replacement `{}` for {}", r.export, r.symbol)));
+                return Err(anyhow::Error::from(e).context(format!("replacement `{}` for {}", r.export, r.symbol)));
             }
         }
         Abi::C => {
