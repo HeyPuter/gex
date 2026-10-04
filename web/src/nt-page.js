@@ -71,6 +71,13 @@ async function main() {
   // `?trapstack=1`: a trap's wasm frames, which name the shim function it
   // was in (runtime.js passes the switch to every Worker).
   if (q.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
+  if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
+  if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
+  // cgen=1|2 (prefer|require units); unguarded=1 adds 4: the native,
+  // unguarded flavor of i386 units.
+  if (q.get('cgen')) globalThis.GEX_CGEN = Number(q.get('cgen')) | (q.get('unguarded') === '1' ? 4 : 0);
+  if (q.get('densedebug')) globalThis.GEX_DENSE_DEBUG = 1;
+  if (q.get('tracemisses')) globalThis.GEX_TRACE_MISSES = 1;
   const [w, h] = (q.get('size') || '1024x768').split('x').map(Number);
   const canvas = document.getElementById('out');
   canvas.width = w;

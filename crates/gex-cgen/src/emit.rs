@@ -64,9 +64,10 @@ pub(crate) fn cty(ty: Ty) -> &'static str {
 }
 
 /// Whether `r` lives in a 32-bit C variable: an i386 program's
-/// general-purpose registers (the context slot is 64 bits, but every write
-/// zero-extends, so the low half is the register). `GEX_CGEN_NARROW=0` keeps
-/// them 64-bit. Arithmetic, addresses and compares then stay in i32, where
+/// general-purpose registers (the context slot is 64 bits and its low half
+/// is the register, so loads read only that). Stores are 32-bit too, as
+/// every writer zero-extends (`image::narrow_stores`). `GEX_CGEN_NARROW=0`
+/// keeps them 64-bit. Arithmetic, addresses and compares then stay in i32, where
 /// wasm needs no wraps and extends between them.
 pub(crate) fn narrow_reg(r: GuestReg, class32: bool) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -245,6 +246,16 @@ pub(crate) struct Emitter<'a> {
     tmp: u32,
     /// An i386 program: its GPRs are 32-bit variables (`narrow_reg`).
     pub(crate) class32: bool,
+    /// What a fault import's caller does when the host returns from it (the
+    /// fault was dispatched nested and `ctx::PC` says where to go on):
+    /// `goto gex_resume;` in a whole-image body, `return 0;` in its loop
+    /// functions. `None`: the import never returns (a trap follows).
+    pub(crate) fault_exit: Option<&'static str>,
+    /// With `fault_exit`: the address after the instruction of the
+    /// statement being emitted, set by the caller for a `HostCall` to
+    /// `Breakpoint` or `Illegal` (`int3`), which carries on there when the
+    /// fault's handlers continue at it.
+    pub(crate) fault_next: Option<u64>,
     /// Values known to be below 2^32 (a zero-extension, a narrow register).
     value_zext: Vec<bool>,
     /// `base + c` (stage 0), its wrap to 32 bits (1) and that zero-extended
@@ -271,6 +282,8 @@ impl<'a> Emitter<'a> {
             called: BTreeSet::new(),
             tmp: 0,
             class32: false,
+            fault_exit: None,
+            fault_next: None,
             value_zext: vec![false; n],
             value_disp: vec![None; n],
         }
@@ -469,6 +482,10 @@ impl<'a> Emitter<'a> {
             let name = reg_name(r);
             if r.is_flag() {
                 self.line(format!("GEX_C8({off}u) = (uint8_t){name};"));
+            } else if narrow_reg(r, self.class32) && crate::image::narrow_stores() {
+                // pewasm's 32-bit CpuState fields: exact, every writer of
+                // the slot zero-extends (`image::narrow_stores`).
+                self.line(format!("GEX_C32({off}u) = {name};"));
             } else {
                 match r.ty() {
                     Ty::I32 => self.line(format!("GEX_C32({off}u) = {name};")),
@@ -526,6 +543,10 @@ impl<'a> Emitter<'a> {
                 "(uint64_t)(uint32_t)ctx".to_string()
             } else if r.is_flag() {
                 format!("GEX_C8({off}u)")
+            } else if narrow_reg(r, self.class32) {
+                // The low half is the register (`narrow_reg`), as the lazy
+                // load reads it.
+                format!("GEX_C32({off}u)")
             } else {
                 match r.ty() {
                     Ty::I32 => format!("GEX_C32({off}u)"),
@@ -573,6 +594,10 @@ impl<'a> Emitter<'a> {
             let name = reg_name(r);
             if r.is_flag() {
                 self.line(format!("GEX_C8({off}u) = (uint8_t){name};"));
+            } else if narrow_reg(r, self.class32) && crate::image::narrow_stores() {
+                // pewasm's 32-bit CpuState fields: exact, every writer of
+                // the slot zero-extends (`image::narrow_stores`).
+                self.line(format!("GEX_C32({off}u) = {name};"));
             } else {
                 match r.ty() {
                     Ty::I32 => self.line(format!("GEX_C32({off}u) = {name};")),
@@ -794,9 +819,40 @@ impl<'a> Emitter<'a> {
                 self.line(format!("if (__builtin_expect({c} != 0, 0)) {{"));
                 self.flush_keep();
                 self.store_pc(&format!("0x{pc:x}ull"));
-                self.line(format!("  gex_breakpoint(ctx, 0x{pc:x}ll, (int32_t){code});"));
-                self.line("  __builtin_unreachable();");
+                match self.fault_exit {
+                    Some(exit) => {
+                        self.line(format!("  gex_breakpoint(ctx, (int64_t)(0x{pc:x}ull | GEX_RESUMABLE_PC), (int32_t){code});"));
+                        self.line(format!("  {exit}"));
+                    }
+                    None => {
+                        self.line(format!("  gex_breakpoint(ctx, 0x{pc:x}ll, (int32_t){code});"));
+                        self.line("  __builtin_unreachable();");
+                    }
+                }
                 self.line("}");
+            }
+            Stmt::HostCall { func, args }
+                if matches!(func, HostFunc::Breakpoint | HostFunc::Illegal)
+                    && self.fault_exit.is_some()
+                    && self.fault_next.is_some() =>
+            {
+                // A resumable fault (`int3`): the host dispatches it nested
+                // and returns with the handlers' state in the context. PC is
+                // set to the next instruction first, so a host that returns
+                // without delivering anything (a trace point) carries on
+                // too; any other PC is a handler's target, which the body's
+                // `gex_resume` (or the loop function's caller) takes.
+                let (exit, next) = (self.fault_exit.unwrap(), self.fault_next.unwrap());
+                let name = if *func == HostFunc::Breakpoint { "gex_breakpoint" } else { "gex_illegal" };
+                let [pc, imm] = args.as_slice() else {
+                    bail!("{func:?} with {} arguments, the import takes 2", args.len());
+                };
+                let (pc, imm) = (self.v(*pc), self.v(*imm));
+                self.flush();
+                self.store_pc(&format!("0x{next:x}ull"));
+                self.line(format!("{name}(ctx, (int64_t)((uint64_t)({pc}) | GEX_RESUMABLE_PC), {imm});"));
+                self.line(format!("if (GEX_C64({}u) != 0x{next:x}ull) {exit}", ctx::PC));
+                self.invalidate();
             }
             Stmt::HostCall { func, args } => {
                 let call = self.host_call_expr(*func, args)?;

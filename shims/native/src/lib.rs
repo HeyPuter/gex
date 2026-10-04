@@ -13,6 +13,8 @@ use gex_ld::{build_initial_stack, Identity, Image, Program};
 use gex_xlate::{Options, Stats};
 use std::sync::{Arc, Mutex};
 pub mod aot;
+pub mod aot_only;
+pub mod libprov;
 pub mod aot_share;
 pub mod gl;
 pub mod profile;
@@ -142,6 +144,9 @@ pub struct RunOptions {
     /// The guest memory (docs/mem64.md): wasm32 unless this process needs
     /// more address space.
     pub mem: gex_abi::MemFlavor,
+    /// Run ahead-of-time code only (`aot_only`): an ejected Windows
+    /// program's runtime, with no tier-1 module and no run-time translator.
+    pub aot_only: bool,
 }
 
 impl Default for RunOptions {
@@ -171,6 +176,7 @@ impl Default for RunOptions {
             cache: true,
             record: None,
             aot: None,
+            aot_only: false,
         }
     }
 }
@@ -203,6 +209,8 @@ struct HostState {
     /// loops entered from code that has none (a function-tier unit or a
     /// function JIT module) when no runtime-translated module exists yet.
     root_enter: Option<wasmtime::Func>,
+    /// This store's NT thread, once a syscall has looked it up.
+    nt_thread: Option<Arc<gex_kernel::nt::Thread>>,
     /// What the watch stub decided, for `call_out`'s loop.
     pub(crate) callout_signal: Option<CalloutSignal>,
     /// Exceptions being dispatched nested (`nt::raise_nested`), innermost
@@ -375,6 +383,12 @@ struct Jit {
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
 }
+
+/// How long `JitShared::registry` is (stored after every push, under its
+/// lock): `catch_up_in_caller`'s check without the lock. A hint only: one
+/// process's in a forked child may be longer than the child's registry,
+/// which costs that check its lock, as before.
+static REGISTRY_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// One runtime-translated module, kept so another thread's store can
 /// instantiate it rather than translating the same code again.
@@ -573,56 +587,10 @@ struct Inherited {
     wayland: Option<wayland::Wayland>,
 }
 
-fn run_program_with(
-    program: &Program,
-    opts: &RunOptions,
-    xlate: &Options,
-    inherited: Option<Inherited>,
-    nt_setup: Option<&nt::NtSetup>,
-) -> Result<(Exit, Stats)> {
-    let image = &program.exe;
-    // Before anything is translated: a 32-bit (i386) program's code is
-    // decoded in compatibility mode, and the kernel below speaks its ABI.
-    // One setting per host process -- the native runner keeps one translator
-    // for every guest process, so a mixed tree is not supported here (the
-    // browser has a shim per process).
-    gex_xlate::set_compat(program.compat());
-    lockstep::set_compat(program.compat());
-    ftab::selftest_init();
-
-    // A profile records where a previous run went, feeding `extra_entries` so
-    // discovery reaches entry points static analysis cannot. It changes the
-    // cache key, so a run that discovers something new recompiles once.
-    //
-    // A build that cannot identify itself must not use the cache: reusing
-    // another build's compiled code would serve stale translations.
-    if let Some(dir) = &opts.record {
-        profile::start(dir.clone(), opts)?;
-    }
-    // Profiled modules differ from plain ones, so they are cached apart.
-    let build = gex_cache::build_fingerprint()
-        .map(|b| if profile::active() { format!("{b}+profile") } else { b });
-    let use_cache = opts.cache && build.is_some();
-    let build = build.unwrap_or_default();
-    let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
-    let image_key = cache_key(image, &Options::default(), &build);
-    let mut xlate = xlate.clone();
-    // Off unless asked for: measured, the profile costs a recompile on the
-    // second run and buys nothing measurable after it on programs this size.
-    // Still written every run, so turning it on costs only the recompile.
-    let use_profile = opts.profile;
-    if let Some(dir) = profile_dir.as_ref().filter(|_| use_profile) {
-        let learned = gex_cache::read_profile(dir, &image_key);
-        if !learned.is_empty() && opts.verbose {
-            eprintln!("[gex] profile: {} learned entry points", learned.len());
-        }
-        xlate.extra_entries.extend(learned);
-        xlate.extra_entries.sort_unstable();
-        xlate.extra_entries.dedup();
-    }
-    let xlate = &xlate;
-
-    let phase = std::time::Instant::now();
+/// The wasm engine every guest process runs on. Code compiled ahead of time
+/// for a run (an ejected project's `.cwasm`) must be compiled by an engine
+/// configured exactly so.
+pub fn engine() -> Result<Engine> {
     let mut config = Config::new();
     // Deep guest call chains are wasm recursion (units call units): room for
     // them, on threads with stacks to match (`guest_thread_stack`).
@@ -661,7 +629,61 @@ fn run_program_with(
     if std::env::var_os("GEX_PERFMAP").is_some() {
         config.profiler(wasmtime::ProfilingStrategy::PerfMap);
     }
-    let engine = Engine::new(&config).context("creating the wasm engine")?;
+    Engine::new(&config).context("creating the wasm engine")
+}
+
+fn run_program_with(
+    program: &Program,
+    opts: &RunOptions,
+    xlate: &Options,
+    inherited: Option<Inherited>,
+    nt_setup: Option<&nt::NtSetup>,
+) -> Result<(Exit, Stats)> {
+    let image = &program.exe;
+    // Before anything is translated: a 32-bit (i386) program's code is
+    // decoded in compatibility mode, and the kernel below speaks its ABI.
+    // One setting per host process -- the native runner keeps one translator
+    // for every guest process, so a mixed tree is not supported here (the
+    // browser has a shim per process).
+    gex_xlate::set_compat(program.compat());
+    lockstep::set_compat(program.compat());
+    gex_kernel::set_compat32(program.compat() && gex_abi::X86);
+    ftab::selftest_init();
+
+    // A profile records where a previous run went, feeding `extra_entries` so
+    // discovery reaches entry points static analysis cannot. It changes the
+    // cache key, so a run that discovers something new recompiles once.
+    //
+    // A build that cannot identify itself must not use the cache: reusing
+    // another build's compiled code would serve stale translations.
+    if let Some(dir) = &opts.record {
+        profile::start(dir.clone(), opts)?;
+    }
+    // Profiled modules differ from plain ones, so they are cached apart.
+    let build = gex_cache::build_fingerprint()
+        .map(|b| if profile::active() { format!("{b}+profile") } else { b });
+    let use_cache = opts.cache && build.is_some();
+    let build = build.unwrap_or_default();
+    let profile_dir = use_cache.then(gex_cache::profile_dir).flatten();
+    let image_key = cache_key(image, &Options::default(), &build);
+    let mut xlate = xlate.clone();
+    // Off unless asked for: measured, the profile costs a recompile on the
+    // second run and buys nothing measurable after it on programs this size.
+    // Still written every run, so turning it on costs only the recompile.
+    let use_profile = opts.profile;
+    if let Some(dir) = profile_dir.as_ref().filter(|_| use_profile) {
+        let learned = gex_cache::read_profile(dir, &image_key);
+        if !learned.is_empty() && opts.verbose {
+            eprintln!("[gex] profile: {} learned entry points", learned.len());
+        }
+        xlate.extra_entries.extend(learned);
+        xlate.extra_entries.sort_unstable();
+        xlate.extra_entries.dedup();
+    }
+    let xlate = &xlate;
+
+    let phase = std::time::Instant::now();
+    let engine = engine()?;
 
     // Only the executable is translated ahead of time; the interpreter and its
     // libraries arrive through runtime translation, because at build time we do
@@ -687,7 +709,14 @@ fn run_program_with(
         (m, s)
     };
 
-    let (module, meta) = if let Some(aot) = &opts.aot {
+    if opts.aot_only {
+        aot_only::enable();
+    }
+    let (module, meta) = if opts.aot_only {
+        // An ejected Windows program: no tier-1 module, only the root's
+        // entry (`aot_only`).
+        (Module::new(&engine, aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
+    } else if let Some(aot) = &opts.aot {
         // An ejected project: the image was translated when it was built.
         let dir = use_cache.then(gex_cache::cache_dir).flatten();
         aot::image_module(aot, &engine, dir.as_deref().map(|d| (d, build.as_str())), image)?
@@ -743,7 +772,7 @@ fn run_program_with(
         opts.recompile_objects,
         std::sync::atomic::Ordering::Relaxed,
     );
-    JIT_ON.store(opts.jit, std::sync::atomic::Ordering::Relaxed);
+    JIT_ON.store(opts.jit && !opts.aot_only, std::sync::atomic::Ordering::Relaxed);
     DUMP_ABORT.store(
         std::env::var_os("GEX_DUMP_ABORT").is_some(),
         std::sync::atomic::Ordering::Relaxed,
@@ -894,6 +923,7 @@ fn run_program_with(
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -916,6 +946,9 @@ fn run_program_with(
 
     let mut linker = Linker::new(&engine);
     register_imports(&mut linker)?;
+    if opts.aot_only {
+        aot_only::override_imports(&mut linker)?;
+    }
     // Kept before any store-bound definition is added, so a thread can clone
     // it and define its own memory and table.
     let base_linker = linker.clone();
@@ -945,6 +978,9 @@ fn run_program_with(
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
     store.data_mut().memory = Some(memory.clone());
+    if let Some(dev) = crate::gl::DEVICE.get() {
+        dev.set_memory(memory.clone());
+    }
 
     // Runtime translation needs the table to patch and the engine and linker
     // to build modules with; holding them here turns a dispatch miss into a
@@ -1087,6 +1123,9 @@ fn run_program_with(
         }
     }
 
+    if opts.aot_only {
+        aot_only::bind_root(&mut store, &instance)?;
+    }
     let stopped = run_thread_loop(&mut store, &instance, ctx_addr, entry)?;
     profile::harvest(&mut store)?;
     if let Stopped::Exec(req) = stopped {
@@ -1805,6 +1844,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -1972,6 +2012,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             resume_cause: None,
             callouts: Vec::new(),
             root_enter: None,
+            nt_thread: None,
             callout_signal: None,
             exc_levels: Vec::new(),
             watch_stub: None,
@@ -2030,6 +2071,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
         let data = cx.memory.bytes();
         read_u64(data, (thread.ctx_addr + ctx::PC as u64) as usize)
     };
+    if cx.opts.aot_only {
+        aot_only::bind_root(&mut store, &instance)?;
+    }
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
     profile::harvest(&mut store)?;
     match stopped {
@@ -2711,13 +2755,16 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
 
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
+    libprov::register(linker)?;
 
     linker.func_wrap(
         m,
         imports::SYSCALL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
             if caller.data().nt.is_some() {
-                return nt::syscall_import(&mut caller, pc as u64);
+                let r = nt::syscall_import(&mut caller, pc as u64);
+                check_i386_high(&caller, "an NT syscall");
+                return r;
             }
             // An ejected project's runtime allows only the recorded calls.
             if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
@@ -2874,6 +2921,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let (ctx_addr, tid) = (caller.data().thread.ctx_addr, caller.data().thread.tid);
                 lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
             }
+            check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();
             match outcome {
                 SyscallOutcome::Continue => Ok(()),
@@ -3072,6 +3120,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::ILLEGAL,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> Result<()> {
+            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
+            let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             if caller.data().nt.is_some() {
                 // What gex could not decode, or a deliberate trap: the bytes
                 // say which (the guest's handler may take it either way).
@@ -3080,7 +3130,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     let bytes: Vec<String> = gm.read(pc as u64, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect()).unwrap_or_default();
                     eprintln!("gex-nt: illegal instruction at {:#x}: {}", pc as u64, bytes.join(" "));
                 }
-                return nt::fault(&mut caller, nt::Fault::Illegal, pc as u64);
+                return nt::fault_at(&mut caller, nt::Fault::Illegal, pc as u64, resumable);
             }
             let pc = pc as u64;
             let raw = raw as u32;
@@ -3132,6 +3182,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::BREAKPOINT,
         |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> Result<()> {
+            let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
+            let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             // The diagnostic trace points dump the registers and carry on.
             if imm == gex_abi::imports::BRK_TRAP_PC || imm == gex_abi::imports::BRK_TRACE {
                 if let Some(memory) = caller.data().memory.clone() {
@@ -3156,7 +3208,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
-                return nt::fault(&mut caller, nt::Fault::from_brk(imm), pc as u64);
+                return nt::fault_at(&mut caller, nt::Fault::from_brk(imm), pc as u64, resumable);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
             // divisor and a quotient overflow alike, as SIGFPE with
@@ -3832,6 +3884,9 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
 /// catches up by walking forward from its own watermark.
 fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
     let behind = match caller.data().jit.as_ref() {
+        // Nothing published past this store's watermark: no lock (every
+        // syscall and safepoint comes through here).
+        Some(jit) if REGISTRY_LEN.load(std::sync::atomic::Ordering::Acquire) <= jit.replayed => false,
         Some(jit) => {
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.registry.len() > jit.replayed
@@ -3940,6 +3995,7 @@ fn publish_unit(
         }
     }
     sh.registry.push(Arc::clone(&unit));
+    crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
     sh.blocks += blocks;
     sh.calls += 1;
     Ok(unit)
@@ -4254,6 +4310,12 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
 /// module) -- any tier-1 module's in this store, or the thread loop's root
 /// module's. They all reach every slot through the same tables.
 pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::Func> {
+    // The thread loop's, when there is one: the others are found by name,
+    // one instance at a time, and a call-out from a unit (most of them)
+    // would look through every tier-1 module before reaching it.
+    if let Some(f) = caller.data().root_enter.clone() {
+        return Some(f);
+    }
     if let Some(f) = caller.get_export(exports::ENTER).and_then(Extern::into_func) {
         return Some(f);
     }
@@ -4401,6 +4463,7 @@ fn retire_translations(
     // Units' rewritten pages first: a lookup after the probe cache is
     // cleared below must already see them (`ftab::current`).
     nt_cgen::on_retire(&memory, ranges);
+    nt_cgen::provided_rewrites(&memory, ranges);
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     let mut pages = 0usize;
     for &(start, end) in ranges {
@@ -4687,26 +4750,9 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
             }
             other => format!("wasm trap: {other}"),
         };
-        // The innermost wasm frames name the guest code that trapped (each
-        // translated function is named after its guest address).
-        let frames = e
-            .downcast_ref::<wasmtime::WasmBacktrace>()
-            .map(|bt| {
-                bt.frames()
-                    .iter()
-                    .take(6)
-                    .map(|f| {
-                        let name = f.func_name().map(str::to_string).unwrap_or_else(|| format!("#{}", f.func_index()));
-                        match f.module().name() {
-                            Some(m) => format!("{m}:{name}"),
-                            None => name,
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" < ")
-            })
-            .unwrap_or_default();
-        return anyhow!("{detail} (pc≈0x{pc:x}) [{frames}]");
+        // The wasm frames, when the engine kept them (GEX_WASM_BACKTRACE=1).
+        let bt = e.downcast_ref::<wasmtime::WasmBacktrace>().map(|b| format!("\n{b:?}")).unwrap_or_default();
+        return anyhow!("{detail} (pc≈0x{pc:x}){bt}");
     }
     e
 }
@@ -4733,4 +4779,26 @@ pub fn wasm_stack_bytes() -> usize {
 /// only as used).
 pub fn guest_thread_stack() -> usize {
     wasm_stack_bytes() + (16 << 20)
+}
+
+/// `GEX_CHECK_I386_HIGH=1`: after a host function that writes guest
+/// registers, an i386 process's GPR slots must have zero high halves
+/// (`gex_kernel::gpr`), which compiled code may rely on. A slot that does
+/// not is reported with where it was found (the first 32).
+pub(crate) fn check_i386_high(cx: &impl wasmtime::AsContext<Data = HostState>, site: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !*ON.get_or_init(|| std::env::var("GEX_CHECK_I386_HIGH").as_deref() == Ok("1")) || !gex_kernel::compat32() {
+        return;
+    }
+    let d = cx.as_context().data();
+    let Some(memory) = d.memory.as_ref() else { return };
+    let base = d.thread.ctx_addr as usize;
+    for i in 0..8u8 {
+        let v = read_u64(memory.bytes(), base + ctx::x(i));
+        if v >> 32 != 0 && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let pc = read_u64(memory.bytes(), base + ctx::PC);
+            eprintln!("gex: GEX_CHECK_I386_HIGH: x{i} = {v:#x} after {site} (pc {pc:#x})");
+        }
+    }
 }

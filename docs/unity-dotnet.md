@@ -231,15 +231,30 @@ native code was written against:
 The interpreter is the bring-up tier. The jiterpreter is not used (it
 generates wasm32 traces from JS); the build turns it off (`-jiterp`).
 
-Two speed tiers, both from the fork:
-- **its runtime wasm JIT** (tiered, one module per method; in the browser
-  through `WebAssembly.Module`). Under gex it needs a wasm64 emitter
-  (addresses as i64, as gex-emit's M64 work did) and a host hook to compile
-  and instantiate a module in the provider's thread, which gex's own JIT
-  path already has, natively and in the browser;
-- **Mono LLVM AOT** of CoreLib, the BCL, `UnityEngine.*` and the game's
-  assemblies at build time (the `Managed` set is fixed per game), to wasm64,
-  linked into the provider, with the interpreter for what it did not see.
+The user's decision (2026-10-04): both speed tiers, after P2-P4
+correctness, with the interpreter kept as the fallback.
+- **Normal gex runs (not ejected): the fork's runtime wasm JIT**, ported to
+  wasm64/memory64. It is tiered, one module per method, through
+  `WebAssembly.Module` in the browser. The port needs:
+  - an emitter whose addresses are i64, as gex-emit's M64 work was;
+  - a host hook to compile and instantiate a module in the calling guest
+    thread's store. gex's own JIT path has one, natively and in the
+    browser: the module is published like any other, and each thread's
+    store instantiates it.
+
+  The jiterpreter stays off unless a profile says otherwise.
+- **Eject: .NET AOT, no JIT.** At build time, Mono AOT (LLVM, to wasm64)
+  compiles CoreLib, the BCL, `UnityEngine.*` and the game's `Managed/*.dll`.
+  The game's assembly set is fixed and recorded in the session. The output
+  fits stream E's model (docs/eject-pe.md):
+  - the AOT code links into the Mono provider module: one stateful
+    provider, its data and heap in the provider region;
+  - interpreter fallback only for what AOT could not see (generic
+    instances), which the coverage report names;
+  - the provider is a precompiled module like any unit (`.cwasm`
+    natively, `c.wasm` in the page);
+  - UnityPlayer's own x86 code is units with region entries, as for any
+    image.
 
 Native gexc runs the same provider on wasmtime. It is for correctness only.
 

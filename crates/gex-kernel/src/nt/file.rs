@@ -238,8 +238,47 @@ fn wants_write(access: u32) -> bool {
 }
 
 /// Open or create. Returns the file and the `IO_STATUS_BLOCK` information.
+/// What the NT layer did with one guest path (`set_file_hook`): a session
+/// recorder (gex-eject) learns from it which files a Windows program needs.
+#[derive(Debug, Clone)]
+pub struct FileAccess<'a> {
+    /// The guest (Unix-style) path, resolved case-insensitively when it
+    /// exists.
+    pub path: &'a str,
+    pub read: bool,
+    pub write: bool,
+    pub create: bool,
+    pub directory: bool,
+    /// Whether the open or query succeeded.
+    pub ok: bool,
+}
+
+type FileHook = Box<dyn Fn(&FileAccess<'_>) + Send + Sync>;
+static FILE_HOOK: std::sync::OnceLock<FileHook> = std::sync::OnceLock::new();
+
+/// Have `f` told about every path the NT layer opens or queries (`NtCreateFile`,
+/// `NtOpenFile`, the attribute queries, and files it reads itself such as NLS
+/// tables). Once per host process; none by default.
+pub fn set_file_hook(f: impl Fn(&FileAccess<'_>) + Send + Sync + 'static) {
+    let _ = FILE_HOOK.set(Box::new(f));
+}
+
+fn note_access(c: &Call<'_>, nt: &[u16], write: bool, create: bool, directory: bool, ok: bool) {
+    let Some(hook) = FILE_HOOK.get() else { return };
+    let Ok(Target::Path(p)) = nt_to_target(c, nt) else { return };
+    let path = resolve_ci(c, &p).unwrap_or(p);
+    hook(&FileAccess { path: &path, read: !create, write, create, directory, ok });
+}
+
 fn open(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, options: u32) -> R<(Arc<NtFile>, u64)> {
     let r = open_inner(c, nt, access, disposition, options);
+    if FILE_HOOK.get().is_some() {
+        let creates = matches!(disposition, disp::CREATE | disp::OPEN_IF | disp::OVERWRITE_IF | disp::SUPERSEDE);
+        match &r {
+            Ok((f, info)) => note_access(c, nt, wants_write(access), *info == 2, f.is_dir, true),
+            Err(_) => note_access(c, nt, wants_write(access), creates, options & opt::DIRECTORY_FILE != 0, false),
+        }
+    }
     if c.p.cfg.trace {
         let s = match &r {
             Ok(_) => "ok".to_string(),
@@ -883,6 +922,16 @@ pub fn nt_query_full_attributes_file(c: &mut Call<'_>) -> R {
 fn stat_attr(c: &mut Call<'_>, attr_p: u64) -> R<(String, Metadata)> {
     let a = c.g.obj_attr(attr_p)?.ok_or(Status(st::INVALID_PARAMETER))?;
     let nt = full_nt_name(c, a.root, &a.name)?;
+    let r = stat_attr_inner(c, &nt);
+    if FILE_HOOK.get().is_some() {
+        let dir = r.as_ref().is_ok_and(|(_, m)| m.file_type == FileType::Directory);
+        note_access(c, &nt, false, false, dir, r.is_ok());
+    }
+    r
+}
+
+fn stat_attr_inner(c: &mut Call<'_>, nt: &[u16]) -> R<(String, Metadata)> {
+    let nt = nt.to_vec();
     match nt_to_target(c, &nt)? {
         Target::Path(p) => {
             let path = resolve_ci(c, &p).map_err(|parent| {
@@ -1205,7 +1254,11 @@ pub fn console_file(k: &crate::Kernel, fd: i32, access: u32) -> Option<Arc<NtFil
 
 /// Read a whole file by guest path (NLS files, images).
 pub fn read_guest_file(k: &crate::Kernel, path: &str) -> Result<Vec<u8>, crate::Errno> {
-    let h = k.vfs.open(path, oflags::O_RDONLY, 0)?;
+    let h = k.vfs.open(path, oflags::O_RDONLY, 0);
+    if let Some(hook) = FILE_HOOK.get() {
+        hook(&FileAccess { path, read: true, write: false, create: false, directory: false, ok: h.is_ok() });
+    }
+    let h = h?;
     let size = h.metadata()?.size as usize;
     let mut v = vec![0u8; size];
     let mut done = 0;

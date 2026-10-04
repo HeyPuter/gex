@@ -52,8 +52,19 @@ fn mono_ns() -> u64 {
     }
 }
 
+/// The guest's wall clock. `GEX_NT_FIXED_TIME=<unix seconds>` (the
+/// counterpart of PEWASM_FIXED_TIME) starts it at that instant and advances
+/// it with real time, so a program that seeds from the date (Noita's world)
+/// sees the same value every run: reproducible measurements.
 fn wall() -> (u64, u32) {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    static FIXED: OnceLock<Option<(u64, Instant)>> = OnceLock::new();
+    let fixed = FIXED.get_or_init(|| {
+        std::env::var("GEX_NT_FIXED_TIME").ok().and_then(|v| v.parse::<u64>().ok()).map(|s| (s, Instant::now()))
+    });
+    let d = match fixed {
+        Some((start, origin)) => std::time::Duration::from_secs(*start) + origin.elapsed(),
+        None => SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(),
+    };
     (d.as_secs(), d.subsec_nanos())
 }
 
@@ -82,6 +93,7 @@ pub fn run_nt_program(opts: &RunOptions, xlate: &Options, setup: &NtSetup) -> Re
 /// Build the NT process in place of `place_image`. Returns the pc the main
 /// thread starts at (its registers are already in context slot 0).
 pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, setup: &NtSetup) -> Result<u64> {
+    crate::profile::note_nt(setup, crate::gl::DEVICE.get().is_some());
     let (futexes, pid) = store.data_mut().with_kernel(|k| (Arc::clone(&k.futexes), k.pid));
     let p = Arc::new(nt::Process::new(setup.abi, nt::thread::nt_pid(pid), setup.cfg.clone(), clocks(), futexes));
     let req = nt::boot::BootRequest { exe_path: &setup.exe_path, args: &setup.args };
@@ -95,6 +107,12 @@ pub(crate) fn boot(store: &mut Store<HostState>, memory: gex_mem::GuestMemory, s
         // nothing either).
         let host: Arc<dyn nt::display::NtDisplay> =
             if out == "null" { Arc::new(NullDisplay) } else { Arc::new(PpmDisplay::new(out)) };
+        // Frames nobody sees: a frame's GL may run while the next is built.
+        if out == "null" {
+            if let Some(dev) = crate::gl::DEVICE.get() {
+                dev.set_threaded();
+            }
+        }
         *p.display_host.lock().unwrap() = Some(host);
     }
     store.data_mut().nt = Some(Arc::clone(&p));
@@ -250,6 +268,9 @@ impl nt::display::NtDisplay for PpmDisplay {
 /// time pass (docs/nt-layer.md §4).
 fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, sampler: Option<Arc<Sampler>>) {
     let stats = std::env::var_os("GEX_NT_STATS").is_some();
+    // GEX_NT_GL_STATS=1: the program's GL by function, with the 60 s report.
+    let gl_stats = std::env::var("GEX_NT_GL_STATS").as_deref() == Ok("1");
+    nt::opengl::STATS.store(gl_stats, std::sync::atomic::Ordering::Relaxed);
     let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
         let (addr, deref) = match v.strip_suffix('*') {
             Some(a) => (a, true),
@@ -324,6 +345,40 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                         let tot: Vec<String> = tot.iter().map(|(c, k)| format!("{c} x{k}")).collect();
                         let top: Vec<String> = top.iter().map(|((c, t), k)| format!("{c} -> {} x{k}", p.describe_addr(*t))).collect();
                         eprintln!("gex-nt: resumes by cause {} || {}", tot.join(" | "), top.join(" | "));
+                        // Syscalls since the last report, most frequent first.
+                        let mut sc: Vec<(u32, u64)> = SYSCALLS
+                            .iter()
+                            .enumerate()
+                            .map(|(nr, n)| (nr as u32, n.swap(0, std::sync::atomic::Ordering::Relaxed)))
+                            .filter(|&(_, n)| n > 0)
+                            .collect();
+                        sc.sort_by(|a, b| b.1.cmp(&a.1));
+                        let total: u64 = sc.iter().map(|x| x.1).sum();
+                        let sc: Vec<String> = sc.iter().take(12).map(|&(nr, n)| {
+                                let nr = if nr as usize == UNIX_CALL_SLOT { nt::gex_nr::UNIX_CALL } else { nr };
+                                format!("{} {n}", nt::syscall_name(nr))
+                            }).collect();
+                        eprintln!("gex-nt: syscalls {total}: {}", sc.join(" | "));
+                        if let Some(l) = super::nt_cgen::no_unit_line() {
+                            eprintln!("{l}");
+                        }
+                        if gl_stats {
+                            eprintln!("gex-nt: gl {}", nt::opengl::take_stats(&p, 16));
+                        }
+                        let mut ss: Vec<((u32, u32, u64), u64)> =
+                            std::mem::take(&mut *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner())).into_iter().collect();
+                        ss.sort_by(|a, b| b.1.cmp(&a.1));
+                        let ss: Vec<String> = ss
+                            .iter()
+                            .take(16)
+                            .map(|&((nr, tid, site), n)| {
+                                let nr = if nr as usize == UNIX_CALL_SLOT { nt::gex_nr::UNIX_CALL } else { nr };
+                                format!("{} t{tid:x} from {} x{n}", nt::syscall_name(nr), p.describe_addr(site))
+                            })
+                            .collect();
+                        if !ss.is_empty() {
+                            eprintln!("gex-nt: syscall sites (1 in 64) {}", ss.join(" | "));
+                        }
                         let mut by: std::collections::BTreeMap<String, u64> = Default::default();
                         for (page, n) in crate::tier1_pages() {
                             let d = p.describe_addr(page * gex_abi::DISPATCH_PAGE);
@@ -410,13 +465,36 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
+    if crate::ftab::stats_on() {
+        let i = if nr == nt::gex_nr::UNIX_CALL { UNIX_CALL_SLOT } else { nr as usize };
+        if let Some(n) = SYSCALLS.get(i) {
+            // 1 in 64: who made it, the first return address outside
+            // Wine's core DLLs on the guest's frame-pointer chain.
+            // GEX_NT_SYSCALL_SITES=1 only: the walk and its lock cost the
+            // measured run itself.
+            if n.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 63 == 0 && p.abi == nt::Abi::P32 && sites_on() {
+                let site = syscall_site(&p, &memory, ctx_addr);
+                let tid = p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid);
+                *SYSCALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).entry((i as u32, tid, site)).or_default() += 1;
+            }
+        }
+    }
     // Where the syscall returns to, and the stack it was made on: what a
     // nested exception dispatch needs to come back here.
     let next_pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     let raise_sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize);
+    // The thread, once per store: its context address never changes.
+    let t = match caller.data().nt_thread.as_ref().filter(|t| t.ctx_addr == ctx_addr) {
+        Some(t) => Some(Arc::clone(t)),
+        None => {
+            let t = p.thread_by_ctx(ctx_addr);
+            caller.data_mut().nt_thread = t.clone();
+            t
+        }
+    };
     let outcome = {
         let mut host = CallerHost { caller: &mut *caller, p: &p };
-        nt::syscall(&p, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
+        nt::syscall_on(&p, t, &*kernel, memory.bytes(), ctx_addr, pc, &mut host)
     };
     // A callback inside that syscall may have ended the process or failed.
     if caller.data().exit.is_some() {
@@ -425,11 +503,14 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     // Code that went away (an unmapped image, a protection change) loses its
     // translations. NT images are never statically recompiled, so newly
     // mapped code needs nothing here.
-    let (retired, _mapped) = caller
-        .data_mut()
-        .with_kernel(|k| (std::mem::take(&mut k.retired_code), std::mem::take(&mut k.new_code)));
-    if !retired.is_empty() {
-        retire_translations(caller, &retired)?;
+    // The kernel lock only when something was recorded since the last look.
+    if gex_kernel::CODE_EVENTS.load(std::sync::atomic::Ordering::Relaxed) != 0 && gex_kernel::CODE_EVENTS.swap(0, std::sync::atomic::Ordering::Acquire) != 0 {
+        let (retired, _mapped) = caller
+            .data_mut()
+            .with_kernel(|k| (std::mem::take(&mut k.retired_code), std::mem::take(&mut k.new_code)));
+        if !retired.is_empty() {
+            retire_translations(caller, &retired)?;
+        }
     }
     // An image just mapped that has a hot set gets its function-tier unit.
     super::nt_cgen::drain_in_caller(caller)?;
@@ -443,8 +524,15 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
             if exc_escape(caller, target) {
                 return Err(StopExecution.into());
             }
-            if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(memory.bytes(), next_pc) {
-                return raise_nested(caller, &p, target, raise_sp, next_pc);
+            // An exception raised, or a user APC delivered by an alertable
+            // wait: both run a dispatcher that ends in NtContinue.
+            // (Not NtContinue's own APC delivery: what it returns to is the
+            // context it loaded, not its caller.)
+            let apc = target == p.ntdll.lock().unwrap().ki_user_apc_dispatcher
+                && nr != nt::sysno::ntdll::NtContinue
+                && nr != nt::sysno::ntdll::NtContinueEx;
+            if (nr == nt::sysno::ntdll::NtRaiseException || apc) && nest_exceptions(memory.bytes(), next_pc) {
+                return raise_nested(caller, &p, target, raise_sp, Some(next_pc));
             }
             let state = caller.data_mut();
             if crate::ftab::stats_on() {
@@ -489,6 +577,46 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     }
 }
 
+/// NT syscalls by number (GEX_NT_STATS): ntdll's table and win32u's
+/// (0x1000 up).
+const UNIX_CALL_SLOT: usize = 0x1fff;
+fn sites_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_NT_SYSCALL_SITES").as_deref() == Ok("1"))
+}
+
+/// Sampled syscalls by (number, thread, guest site) (GEX_NT_STATS with
+/// GEX_NT_SYSCALL_SITES=1).
+static SYSCALL_SITES: std::sync::Mutex<std::collections::BTreeMap<(u32, u32, u64), u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The first return address outside Wine's core DLLs (ntdll, kernelbase,
+/// kernel32, the trampolines) on an i386 thread's EBP chain at a syscall:
+/// the program code that asked. 0 when the chain ends first.
+fn syscall_site(p: &nt::Process, memory: &gex_mem::GuestMemory, ctx_addr: u64) -> u64 {
+    let gm = GuestMem::new(memory.bytes());
+    let system = |a: u64| {
+        if (nt::TRAMPOLINES..nt::TRAMPOLINES_END).contains(&a) {
+            return true;
+        }
+        let d = p.describe_addr(a);
+        ["(ntdll.dll+", "(kernelbase.dll+", "(kernel32.dll+"].iter().any(|m| d.contains(m))
+    };
+    let mut bp = gm.read_u64(ctx_addr + ctx::x(5) as u64).unwrap_or(0) & 0xffff_ffff;
+    for _ in 0..16 {
+        let (Ok(next), Ok(ret)) = (gm.read_u32(bp), gm.read_u32(bp + 4)) else { return 0 };
+        if !system(ret as u64) {
+            return ret as u64;
+        }
+        if (next as u64) <= bp {
+            return 0;
+        }
+        bp = next as u64;
+    }
+    0
+}
+static SYSCALLS: [std::sync::atomic::AtomicU64; 0x2000] = [const { std::sync::atomic::AtomicU64::new(0) }; 0x2000];
+
 /// Exceptions dispatched nested and escaped back (GEX_NT_STATS).
 pub(crate) static EXC_NESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static EXC_ESCAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -502,14 +630,14 @@ const EXC_MAX_DEPTH: usize = 8;
 /// frames to keep), and only when the syscall returns through a `ret`, which
 /// is how the dispatch gets back (`GEX_NT_EXC_NEST=0` turns it off).
 fn nest_exceptions(mem: &[u8], next_pc: u64) -> bool {
+    nest_on() && matches!(mem.get(next_pc as usize), Some(0xc3) | Some(0xc2))
+}
+
+/// Nested dispatch at all: with function bodies about, unless
+/// `GEX_NT_EXC_NEST=0`.
+fn nest_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) {
-        return false;
-    }
-    if super::nt_cgen::mode() == super::nt_cgen::Mode::Off {
-        return false;
-    }
-    matches!(mem.get(next_pc as usize), Some(0xc3) | Some(0xc2))
+    *ON.get_or_init(|| std::env::var("GEX_NT_EXC_NEST").as_deref() != Ok("0")) && super::nt_cgen::mode() != super::nt_cgen::Mode::Off
 }
 
 /// Has control left the innermost nested exception dispatch on this thread
@@ -527,7 +655,10 @@ pub(crate) fn exc_escape(caller: &mut Caller<'_, HostState>, target: u64) -> boo
     let mut gm = GuestMem::new(memory.bytes());
     let sp = gm.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0);
     let sp = if caller.data().nt.as_ref().is_some_and(|p| p.abi == nt::Abi::P32) { sp & 0xffff_ffff } else { sp };
-    if sp <= raise_sp {
+    // At or above the syscall's own stack: nothing the dispatch runs is
+    // there (its frame is below), so control is back with the frames it
+    // was entered from (an APC's NtContinue comes back to exactly it).
+    if sp < raise_sp {
         return false;
     }
     let _ = gm.write_u64(ctx_addr + ctx::PC as u64, target);
@@ -536,8 +667,9 @@ pub(crate) fn exc_escape(caller: &mut Caller<'_, HostState>, target: u64) -> boo
     true
 }
 
-/// Dispatch an exception without unwinding the thread's wasm frames
-/// (`NtRaiseException`, first chance): run `KiUserExceptionDispatcher`
+/// Dispatch an exception or a user APC without unwinding the thread's wasm
+/// frames (`NtRaiseException`, first chance; an alertable wait that delivers
+/// an APC): run `KiUserExceptionDispatcher` or `KiUserApcDispatcher`
 /// (`target`) in a nested loop on top of them, as a user-mode callback
 /// runs, until control goes back above the raise (`exc_escape`). Then the
 /// syscall returns, its `ret` taking the guest to where the dispatch
@@ -547,7 +679,7 @@ pub(crate) fn exc_escape(caller: &mut Caller<'_, HostState>, target: u64) -> boo
 /// code (`gex_resume`). A trap-out instead drops every frame, and the
 /// thread's outer functions (a game's main loop) run on the fallback from
 /// then on.
-fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target: u64, raise_sp: u64, next_pc: u64) -> Result<()> {
+fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target: u64, raise_sp: u64, next_pc: Option<u64>) -> Result<()> {
     let enter = super::any_enter(caller).ok_or_else(|| anyhow!("no module in this store exports `enter`"))?;
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
@@ -621,19 +753,30 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
     let mut gm = GuestMem::new(memory.bytes());
     let to_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
     let to_sp = gm.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & mask;
+    if p.cfg.trace {
+        gex_kernel::nt_log!(
+            "[nt:{:x}] {2} dispatched nested, back at {1} sp {to_sp:#x} (raised at sp {raise_sp:#x})",
+            p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid),
+            p.describe_addr(to_pc),
+            if target == p.ntdll.lock().unwrap().ki_user_apc_dispatcher { "APC" } else { "exception" },
+        );
+    }
+    // A fault: the faulting code goes on at the context's PC itself.
+    let Some(next_pc) = next_pc else {
+        return Ok(());
+    };
+    // Back at the syscall's own return (an APC's NtContinue, an exception
+    // continued at the raise): just return, with the context's registers.
+    if to_pc == next_pc && to_sp == raise_sp & mask {
+        let _ = gm.write_u64(ctx_addr + ctx::PC as u64, next_pc);
+        return Ok(());
+    }
     let pops = match memory.bytes().get(next_pc as usize) {
         Some(0xc2) => gm.read_u32(next_pc + 1).unwrap_or(0) as u64 & 0xffff,
         _ => 0,
     };
     let psize = if p32 { 4 } else { 8 };
     let sp = to_sp.wrapping_sub(psize + pops) & mask;
-    if p.cfg.trace {
-        gex_kernel::nt_log!(
-            "[nt:{:x}] exception dispatched nested, back at {} sp {to_sp:#x} (raised at sp {raise_sp:#x})",
-            p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid),
-            p.describe_addr(to_pc),
-        );
-    }
     let wrote = if p32 { gm.write_u32(sp, to_pc as u32) } else { gm.write_u64(sp, to_pc) };
     if wrote.is_err() {
         // No stack there: resume the old way.
@@ -646,6 +789,38 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
 }
 
 pub(crate) use gex_kernel::nt::Fault;
+
+/// [`fault`] from code that goes on after the import returns
+/// (`gex_cgen::RESUMABLE_PC`): the exception is dispatched nested
+/// (`raise_nested`), and the import returns with the state the handlers
+/// left (the caller continues at `ctx::PC` through its `gex_resume`), so
+/// the thread's wasm frames survive the fault as they do a raise.
+pub(crate) fn fault_at(caller: &mut Caller<'_, HostState>, f: Fault, pc: u64, resumable: bool) -> Result<()> {
+    if resumable && !matches!(f, Fault::X87) && nest_on() {
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        let ctx_addr = caller.data().thread.ctx_addr;
+        let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize);
+        let p = Arc::clone(caller.data().nt.as_ref().expect("an NT fault in a Linux process"));
+        let (code, rip, info) = f.exception(pc).expect("every fault but X87 is an exception");
+        let outcome = {
+            let state = caller.data_mut();
+            nt::hardware_exception(&p, &*state.kernel, memory.bytes(), ctx_addr, code, rip, &info)
+        };
+        return match outcome {
+            nt::Outcome::Resume(target) => {
+                let r = raise_nested(caller, &p, target, sp, None);
+                super::check_i386_high(&*caller, "a fault dispatched nested");
+                r
+            }
+            nt::Outcome::Exit(code) => {
+                caller.data_mut().exit = Some(Exit::Status(code as i32));
+                Err(StopExecution.into())
+            }
+            other => bail!("gex-nt: unexpected outcome {other:?} from exception dispatch"),
+        };
+    }
+    fault(caller, f, pc)
+}
 
 /// Deliver `fault` at `pc` to the guest as an NT exception, as Wine's signal
 /// handlers do. Returns the StopExecution that redirects the thread into
@@ -687,6 +862,21 @@ struct CallerHost<'a, 'b> {
 }
 
 impl nt::NtHost for CallerHost<'_, '_> {
+    // The yield park on the wasm memory's own wait queue, so the guest's
+    // `memory.atomic.notify` (the ConcRT provider's kicks) ends it too.
+    fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
+        match self.caller.data().memory.as_ref() {
+            Some(m) => m.shared().atomic_wait32(addr, expected, Some(timeout)).is_ok(),
+            None => false,
+        }
+    }
+
+    fn notify(&self, addr: u64) {
+        if let Some(m) = self.caller.data().memory.as_ref() {
+            let _ = m.shared().atomic_notify(addr, u32::MAX);
+        }
+    }
+
     fn run_callback(&mut self) -> std::result::Result<(), ()> {
         match nested_loop(self.caller, self.p) {
             Ok(()) => Ok(()),

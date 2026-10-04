@@ -18,8 +18,8 @@
 use crate::emit::{self, reg_name, Emitter, FnRegs};
 use anyhow::{bail, Result};
 use gex_abi::ctx;
-use gex_ir::func::{BlockId, Callee, Edge, FTerm, Form, Function, RegSet, Summary};
-use gex_ir::{Block, Expr, GuestReg, Stmt};
+use gex_ir::func::{BlockId, Callee, Edge, FBlock, FTerm, Form, Function, RegSet, Summary};
+use gex_ir::{Block, Expr, GuestReg, HostFunc, Stmt};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
@@ -77,18 +77,22 @@ pub fn leaf_name(entry: u64) -> String {
 
 /// Whether `f` may be copied into its callers' translation units (pewasm's
 /// opt_inline.cc): a leaf (no calls, no transfers out other than its
-/// returns) of at most `LEAF_STMTS` statements. pewasm's bound is 48 C
-/// statements; gex's lifted statements are about two per pewasm line.
+/// returns) of at most `LEAF_INSTS` guest instructions. pewasm bounds 48 C
+/// statements after its own optimisation, flags mostly gone; gex's lifted
+/// statements still hold every flag (a compare is about 30), so they are
+/// no measure: 0x72b390, 18 instructions with four compares, is 288. The
+/// flags go when the copy is inlined, the caller's `need` folding the
+/// return's flag store away.
 pub fn is_small_leaf(f: &Function) -> bool {
-    const LEAF_STMTS: usize = 96;
+    const LEAF_INSTS: usize = 32;
     let mut n = 0;
     for b in &f.blocks {
         match b.term {
             FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Return { .. } => {}
             _ => return false,
         }
-        n += b.stmts.len();
-        if n > LEAF_STMTS {
+        n += b.insts.len();
+        if n > LEAF_INSTS {
             return false;
         }
     }
@@ -352,8 +356,22 @@ impl FnUnit {
             return out;
         }
         for (i, b) in f.blocks.iter().enumerate() {
-            let FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } = &b.term else { continue };
-            if !known.contains(t) || trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
+            // A direct call to a function of this unit, or an indirect one
+            // devirtualised to one (`icall_hints`: its fallback writes the
+            // carried registers back and reloads them). A trap-free callee
+            // too: what it never touches need not be stored for it either
+            // (pewasm's A*(g)).
+            let (t, r) = match &b.term {
+                FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } => (t, r),
+                FTerm::Call { callee: Callee::Indirect(_), ret: Some(r), ret_pc } if devirt_carry() => {
+                    match self.icall_hints.get(ret_pc).filter(|k| known.contains(*k)) {
+                        Some(k) => (k, r),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if !known.contains(t) || (trapfree.contains_key(t) && !trapfree_carry()) || mutate("IGNOREUNWIND") {
                 continue;
             }
             let Some(sm) = sums.get(t) else { continue };
@@ -489,6 +507,9 @@ impl FnUnit {
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
         e.class32 = self.class32;
+        if self.ftab {
+            e.fault_exit = Some("goto gex_resume;");
+        }
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
@@ -555,9 +576,12 @@ impl FnUnit {
         let loops = if outline_loops() { outer_loops(f) } else { Vec::new() };
         for (k, lp) in loops.iter().enumerate() {
             self.stats.loops_outlined += 1;
-            let lname = loop_name(f.entry, k);
+            let lname = loop_name(f.entry, k, self.copying);
             let mut le = Emitter::new(&dummy, &owned);
             le.class32 = self.class32;
+            if self.ftab {
+                le.fault_exit = Some("return 0;");
+            }
             le.resize(f.n_values as usize);
             // Only the registers the loop itself touches are locals here:
             // everything else is already in the context (the body wrote
@@ -594,9 +618,7 @@ impl FnUnit {
                 if let Some(d) = ldirty.get(i) {
                     le.set_dirty(d);
                 }
-                for st in &bl.stmts {
-                    le.stmt(st)?;
-                }
+                block_stmts(&mut le, bl)?;
                 self.term(&mut le, f, i, known, sums, trapfree, &mut calls, Some(&scope), None)?;
                 le.line("}");
             }
@@ -614,10 +636,8 @@ impl FnUnit {
             if let Some(d) = dirty.get(i) {
                 e.set_dirty(d);
             }
-            for s in &b.stmts {
-                e.stmt(s)?;
-            }
-            let heads = Heads { loops: &loops, fname: f.entry, used: &used };
+            block_stmts(&mut e, b)?;
+            let heads = Heads { loops: &loops, fname: f.entry, copy: self.copying, used: &used };
             self.term(&mut e, f, i, known, sums, trapfree, &mut calls, None, Some(&heads))?;
             e.line("}");
         }
@@ -733,7 +753,7 @@ impl FnUnit {
                         e.line("  int lr;");
                         e.line(format!(
                             "  do lr = {}(ctx, depth + {}, need, ret, sp0); while (lr == LOOP_CHUNK);",
-                            loop_name(h.fname, k),
+                            loop_name(h.fname, k, h.copy),
                             self_weight
                         ));
                         if ftab {
@@ -897,7 +917,13 @@ impl FnUnit {
                             let n = sm.inputs.union(live[r.to.index()]).union(RegSet::of(&[sp_reg()]));
                             if trapfree.contains_key(t) || mutate("IGNOREUNWIND") {
                                 self.stats.calls_trapfree += 1;
-                                n
+                                match self.carry.get(&i) {
+                                    Some(c) => {
+                                        leave_wb = *c;
+                                        n.minus(leave_wb)
+                                    }
+                                    None => n,
+                                }
                             } else if let Some(c) = self.carry.get(&i) {
                                 self.stats.calls_minimal += 1;
                                 leave_wb = *c;
@@ -908,6 +934,14 @@ impl FnUnit {
                         }
                         None => RegSet::ALL,
                     },
+                    // Devirtualised (`carried`): the hinted callee keeps what
+                    // it never touches in locals; the fallback stores those
+                    // itself.
+                    (Callee::Indirect(_), Some(_)) if self.carry.contains_key(&i) => {
+                        leave_wb = self.carry[&i];
+                        let all = if flags_abi() { non_flags() } else { RegSet::ALL };
+                        all.minus(leave_wb)
+                    }
                     // No callee reads the flags it is entered with
                     // (`flags_abi`).
                     _ if flags_abi() => non_flags(),
@@ -940,6 +974,9 @@ impl FnUnit {
                         // call what the table has for it instead.
                         if trapfree.contains_key(t) {
                             e.line(format!("  if (__builtin_expect({}, 0)) {{", patched_test(*t)));
+                            // The carried registers too: whatever runs
+                            // instead may read them.
+                            e.mark_dirty(carried);
                             e.flush_keep();
                             ftab_call(e, &format!("0x{t:x}ull"), &format!("depth + {}", self.weight), need_back, &ret_arg, fail);
                             reload_all(e);
@@ -987,13 +1024,40 @@ impl FnUnit {
                                 };
                                 let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, k);
                                 e.line(format!("  {{ const uint64_t ft = {t};"));
-                                e.line(format!(
-                                    "    if (__builtin_expect(ft == 0x{k:x}ull{guard}, 1)) {{ if (!{callee_c}(ctx, {depth}, {need_back}, {ret_arg})) {fail} }}"
-                                ));
-                                e.line(format!(
-                                    "    else {{ GEX_C64({}u) = ft; if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need_back}, {ret_arg})) {fail} }} }}",
-                                    ctx::LAST_TARGET
-                                ));
+                                if carried.is_empty() {
+                                    e.line(format!(
+                                        "    if (__builtin_expect(ft == 0x{k:x}ull{guard}, 1)) {{ if (!{callee_c}(ctx, {depth}, {need_back}, {ret_arg})) {fail} }}"
+                                    ));
+                                    e.line(format!(
+                                        "    else {{ GEX_C64({}u) = ft; if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need_back}, {ret_arg})) {fail} }} }}",
+                                        ctx::LAST_TARGET
+                                    ));
+                                } else {
+                                    // The hinted callee never touches the
+                                    // carried registers: they stay in locals,
+                                    // and are stored only if it leaves. Any
+                                    // other target gets them stored first,
+                                    // and may change them: reloaded after.
+                                    e.line(format!("    if (__builtin_expect(ft == 0x{k:x}ull{guard}, 1)) {{"));
+                                    e.line(format!("    if (!{callee_c}(ctx, {depth}, {need_back}, {ret_arg})) {{"));
+                                    e.mark_dirty(carried);
+                                    e.flush_keep_live(leave_wb);
+                                    e.line(format!("      {fail}"));
+                                    e.line("    }");
+                                    e.line("    } else {");
+                                    e.flush_keep_live(leave_wb);
+                                    e.line(format!(
+                                        "    GEX_C64({}u) = ft; if (!GEX_FTAB(gex_ftab_idx(ft))(ctx, {depth}, {need_back}, {ret_arg})) {fail}",
+                                        ctx::LAST_TARGET
+                                    ));
+                                    let back: Vec<GuestReg> = e
+                                        .func_regs
+                                        .as_ref()
+                                        .map(|fr| fr.used.iter().copied().filter(|r| leave_wb.contains(*r)).collect())
+                                        .unwrap_or_default();
+                                    e.load_regs(&back);
+                                    e.line("    } }");
+                                }
                             }
                             None => ftab_call(e, &t, &depth, need_back, &ret_arg, fail),
                         }
@@ -1052,6 +1116,9 @@ impl FnUnit {
                     Callee::Direct(t) if known.contains(t) && live_writebacks() => {
                         sums.get(t).map(|sm| sm.preserved.minus(RegSet::of(&[sp_reg()])))
                     }
+                    // Devirtualised with carried registers: the hinted
+                    // callee kept them, the fallback reloaded them.
+                    Callee::Indirect(_) if !leave_wb.is_empty() => Some(leave_wb),
                     _ => None,
                 };
                 match (ret, preserved) {
@@ -1237,8 +1304,19 @@ impl FnUnit {
             FTerm::Illegal { raw, pc } => {
                 e.flush();
                 e.store_pc(&format!("0x{pc:x}ull"));
-                e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
-                e.line("__builtin_trap();");
+                match e.fault_exit {
+                    Some(exit) => {
+                        e.line(format!("gex_illegal(ctx, (int64_t)(0x{pc:x}ull | GEX_RESUMABLE_PC), (int32_t)0x{raw:x}u);"));
+                        e.line(exit);
+                        if scope.is_none() {
+                            resumed.set(true);
+                        }
+                    }
+                    None => {
+                        e.line(format!("gex_illegal(ctx, 0x{pc:x}ll, (int32_t)0x{raw:x}u);"));
+                        e.line("__builtin_trap();");
+                    }
+                }
             }
         }
         if resumed.get() {
@@ -1307,6 +1385,23 @@ fn ftab_call(e: &mut Emitter<'_>, t: &str, depth: &str, need: &str, ret: &str, f
 /// anyway, while making every block a join point with all registers
 /// reloaded nearly doubled the largest bodies (noita.exe's 0xdc14c0, 414 to
 /// 720 KB of wasm) and put them past Cranelift's limits.
+/// Emit a block's statements, telling the emitter where each resumable
+/// fault statement (`int3`'s `HostCall`) carries on.
+fn block_stmts(e: &mut Emitter<'_>, b: &FBlock) -> Result<()> {
+    for (k, s) in b.stmts.iter().enumerate() {
+        e.fault_next = match s {
+            Stmt::HostCall { func: HostFunc::Breakpoint | HostFunc::Illegal, .. } if e.fault_exit.is_some() => {
+                let pc = b.pcs[k];
+                Some(b.insts.iter().position(|&a| a == pc).and_then(|j| b.insts.get(j + 1).copied()).unwrap_or(b.end))
+            }
+            _ => None,
+        };
+        e.stmt(s)?;
+    }
+    e.fault_next = None;
+    Ok(())
+}
+
 fn resume_block(e: &mut Emitter<'_>, f: &Function) {
     if local_resume() {
         // Each call takes its own continuation (`gex_lc_*`). Anything else
@@ -1799,6 +1894,27 @@ pub fn minimal_writeback() -> bool {
     *ON.get_or_init(|| live_writebacks() && std::env::var("GEX_CGEN_WB").as_deref() != Ok("all"))
 }
 
+/// `minimal_writeback` at calls to trap-free callees as well: the live
+/// registers they never touch stay in locals across them instead of being
+/// stored before and trusted after. Off unless `GEX_CGEN_WB_TRAPFREE=1`:
+/// with both carries on (cg13, seed-pinned ABBA), Noita ran 0.92x: the
+/// carried registers stay dirty, so every later exit (cold breakpoints and
+/// leaves included) stores them and they stay live in locals across the
+/// function (noita.exe 0x70b200 1.53x, 0x70bdc0 1.58x slower per frame),
+/// while 0x724580's hot call, the one they were for, did not get faster.
+pub fn trapfree_carry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_CGEN_WB_TRAPFREE").as_deref() == Ok("1"))
+}
+
+/// `minimal_writeback` at devirtualised indirect calls, for the hinted
+/// callee; the fallback stores the carried registers and reloads them.
+/// Off unless `GEX_CGEN_WB_DEVIRT=1` (see `trapfree_carry`).
+pub fn devirt_carry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_CGEN_WB_DEVIRT").as_deref() == Ok("1"))
+}
+
 pub fn non_flags() -> RegSet {
     RegSet::ALL.minus(RegSet::of(FLAG_REGS))
 }
@@ -1900,14 +2016,23 @@ pub fn outline_loops() -> bool {
     }
 }
 
-fn loop_name(entry: u64, k: usize) -> String {
-    format!("l_{entry:x}_{k}")
+/// An outlined loop's function. A leaf copy's (`FnUnit::leaves`) are
+/// named apart: the original and its copy can share a translation unit,
+/// and loop functions are `static`.
+fn loop_name(entry: u64, k: usize, copy: bool) -> String {
+    if copy {
+        format!("ll_{entry:x}_{k}")
+    } else {
+        format!("l_{entry:x}_{k}")
+    }
 }
 
 /// The body's view of its outlined loops.
 pub(crate) struct Heads<'a> {
     loops: &'a [Loop],
     fname: u64,
+    /// Emitting a leaf copy (`loop_name`).
+    copy: bool,
     used: &'a [GuestReg],
 }
 
@@ -2034,4 +2159,82 @@ pub fn guest_entry_of(name: &str) -> Option<u64> {
         .or_else(|| name.strip_prefix("e_"))
         .or_else(|| name.strip_prefix("l_").map(|r| r.split('_').next().unwrap_or(r)))?;
     u64::from_str_radix(rest, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `0x1000`: a leaf with a loop (`x0 += 1` while below `x1`), then
+    /// `ret`; `0x2000` calls it. The leaf is copied into the caller's unit
+    /// (`FnUnit::leaves`), and with loop outlining on (the browser's guarded
+    /// flavor) both the leaf and its copy outline the loop: their loop
+    /// functions must be named apart (stream B: "redefinition of
+    /// 'l_419a70_0'" in tests/nt x64/cxx's unit).
+    const LEAF: &str = "func 0x1000 - entries [] form memory values 12
+b0 0x1000..0x1003 insts [1000]:
+  @1000 jump b1()
+b1 0x1003..0x1008 insts [1003,1005]:
+  @1003 v0 = read x1
+  @1003 v1 = read x0
+  @1003 v2 = i64 0x1
+  @1003 v3 = bin Add i64 v1 v2
+  @1003 write x0 v3
+  @1005 v4 = cmp LtU i64 v3 v0
+  @1005 br v4 b1() b2()
+b2 0x1008..0x1009 insts [1008]:
+  @1008 v5 = read x4
+  @1008 v6 = load B4 u i32 Relaxed v5 0
+  @1008 v7 = i64 0x4
+  @1008 v8 = bin Add i64 v5 v7
+  @1008 write x4 v8
+  @1008 v9 = extend u v6
+  @1008 return v9
+";
+    const CALLER: &str = "func 0x2000 - entries [] form memory values 12
+b0 0x2000..0x2005 insts [2000]:
+  @2000 v0 = read x4
+  @2000 v1 = i64 0x4
+  @2000 v2 = bin Sub i64 v0 v1
+  @2000 v3 = i32 0x2005
+  @2000 store B4 Relaxed v2 0 v3
+  @2000 write x4 v2
+  @2000 call 0x1000 ret 0x2005 -> b1()
+b1 0x2005..0x2006 insts [2005]:
+  @2005 v4 = read x4
+  @2005 v5 = load B4 u i32 Relaxed v4 0
+  @2005 v6 = i64 0x4
+  @2005 v7 = bin Add i64 v4 v6
+  @2005 write x4 v7
+  @2005 v8 = extend u v5
+  @2005 return v8
+";
+
+    #[test]
+    fn a_leaf_copy_names_its_outlined_loops_apart() {
+        let leaf = gex_ir::text::parse(LEAF).unwrap();
+        let caller = gex_ir::text::parse(CALLER).unwrap();
+        assert!(is_small_leaf(&leaf) && !is_small_leaf(&caller));
+        if !outline_loops() {
+            return;
+        }
+        let known: HashSet<u64> = [0x1000, 0x2000].into_iter().collect();
+        let mut unit = FnUnit::new();
+        unit.set_class32(true);
+        unit.ftab = true;
+        unit.leaves = std::sync::Arc::new([(0x1000, leaf.clone())].into_iter().collect());
+        unit.add(&leaf, &known, &HashMap::new(), &HashMap::new()).unwrap();
+        unit.add(&caller, &known, &HashMap::new(), &HashMap::new()).unwrap();
+        unit.add_leaf_copies(&known, &HashMap::new(), &HashMap::new()).unwrap();
+        let c = unit.source();
+        assert!(c.contains("fl_1000(ctx"), "the call goes to the copy:\n{c}");
+        assert!(c.contains("int l_1000_0(") && c.contains("int ll_1000_0("), "both outline the loop, apart:\n{c}");
+        // And clang takes it (a redefinition is an error).
+        let dir = std::env::temp_dir().join(format!("gex-cgen-leafloop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gex_abi.h"), crate::header::header()).unwrap();
+        std::fs::write(dir.join("u.c"), &c).unwrap();
+        crate::toolchain::compile_one(&dir, &dir.join("u.c"), &dir.join("u.o"), None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

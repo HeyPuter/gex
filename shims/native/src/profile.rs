@@ -329,10 +329,70 @@ pub fn note_pe(path: &str, base: u64, pe: &gex_ld::pe::PeImage) {
     let fid = register(&mut st, path, &bytes, "library", Some(path.to_string()));
     st.profile.note_path(&fid.id, path);
     let bias = base.wrapping_sub(pe.preferred_base);
+    if let Some(nt) = st.session.nt.as_mut() {
+        nt.images.push(gp::NtImage {
+            id: fid.id.clone(),
+            path: path.to_string(),
+            base,
+            preferred: pe.preferred_base,
+            size: pe.image_size as u64,
+        });
+    }
     PE_PLACED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((base, base + pe.image_size as u64, fid.id, bias));
+}
+
+/// A Windows program's run (gex-eject replays it): how the NT layer was set
+/// up. Called at boot, before any image maps.
+pub fn note_nt(setup: &crate::nt::NtSetup, gl: bool) {
+    let Some(rec) = recorder() else {
+        return;
+    };
+    let mut settings: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("GEX_NT_")).map(|(k, v)| format!("{k}={v}")).collect();
+    settings.sort();
+    let cfg = &setup.cfg;
+    let nt = gp::NtSession {
+        abi: match setup.abi {
+            gex_kernel::nt::Abi::P32 => "p32".into(),
+            gex_kernel::nt::Abi::P64 => "p64".into(),
+        },
+        prefix: cfg.prefix.clone(),
+        exe: setup.exe_path.clone(),
+        image_path: cfg.image_path.clone(),
+        args: setup.args.clone(),
+        env: cfg.env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        cwd: cfg.cwd.clone(),
+        settings,
+        gl,
+        images: Vec::new(),
+    };
+    rec.state.lock().unwrap_or_else(|e| e.into_inner()).session.nt = Some(nt);
+    gex_kernel::nt::file::set_file_hook(note_nt_file);
+}
+
+/// A path the NT layer opened, queried or read (`nt::file::set_file_hook`),
+/// recorded as a Linux open is.
+fn note_nt_file(a: &gex_kernel::nt::file::FileAccess<'_>) {
+    let Some(rec) = recorder() else {
+        return;
+    };
+    let mut st = rec.state.lock().unwrap_or_else(|e| e.into_inner());
+    let f = st.session.files.entry(a.path.to_string()).or_insert_with(|| FileEntry {
+        path: a.path.to_string(),
+        ..Default::default()
+    });
+    f.read |= a.read;
+    f.write |= a.write;
+    f.create |= a.create;
+    f.directory |= a.directory;
+    if a.ok {
+        f.ok += 1;
+    } else {
+        f.failed += 1;
+        f.errno = Some(2);
+    }
 }
 
 /// Code was just mapped: name it now, while the mapping is there (a later
@@ -583,6 +643,13 @@ fn read_cstr(gm: &gex_kernel::GuestMem<'_>, ptr: u64) -> Option<String> {
 
 /// Write the profile and the manifest.
 fn write(rec: &Recorder) -> Result<()> {
+    // One writer at a time, snapshot included: every thread folds its
+    // counts in after a dump is asked for and may write; two renames of one
+    // temporary file raced (the second found it gone, and the run ended on
+    // the error: Peggle under GEX_PROFILE_EVERY), and an older snapshot
+    // must not land after a newer one.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let (profile, session) = {
         let st = rec.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut session = st.session.clone();

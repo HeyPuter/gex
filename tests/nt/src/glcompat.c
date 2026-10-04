@@ -58,7 +58,9 @@ int main(void) {
     HWND w = CreateWindowExW(0, L"gex_glcompat", L"glcompat", WS_POPUP, 0, 0, 64, 64, 0, 0, wc.hInstance, 0);
     HDC dc = GetDC(w);
     PIXELFORMATDESCRIPTOR pfd = {sizeof pfd, 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 32};
-    SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd);
+    /* BOOL results come back through the unix call's return slot (the
+     * transport's Params::ret): a wrong slot reads as FALSE here. */
+    CHECK("SetPixelFormat returns TRUE", SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd) == TRUE);
     HGLRC gl = wglCreateContext(dc);
     CHECK("a context", gl && wglMakeCurrent(dc, gl));
     ShowWindow(w, SW_SHOW);
@@ -118,9 +120,14 @@ int main(void) {
     pglBeginQuery(0x8914 /* GL_SAMPLES_PASSED */, q);
     pglEndQuery(0x8914);
     CHECK("glIsQuery", pglIsQuery(q));
-    GLuint avail = 0;
+    /* GL_QUERY_RESULT waits for the result; only after it is
+     * GL_QUERY_RESULT_AVAILABLE guaranteed to be TRUE (asked right after
+     * glEndQuery, the host's driver may still answer FALSE: the old check's
+     * flake). Nothing was drawn, so no samples passed. */
+    GLuint result = 0xdead, avail = 0;
+    pglGetQueryObjectuiv(q, 0x8866 /* GL_QUERY_RESULT */, &result);
     pglGetQueryObjectuiv(q, 0x8867 /* GL_QUERY_RESULT_AVAILABLE */, &avail);
-    CHECK("a query's result", avail == 1);
+    CHECK("a query's result", result == 0 && avail == 1);
     GLsync_ f = pglFenceSync(0x9117, 0);
     GLenum ws = f ? pglClientWaitSync(f, 1, 1000000000ull) : 0;
     CHECK("a fence signals", ws == 0x911A || ws == 0x911C);
@@ -161,8 +168,9 @@ int main(void) {
 
 out:
     CHECK("no GL error", glGetError() == GL_NO_ERROR);
+    CHECK("SwapBuffers returns TRUE", SwapBuffers(dc) == TRUE);
     wglMakeCurrent(0, 0);
-    wglDeleteContext(gl);
+    CHECK("wglDeleteContext returns TRUE", wglDeleteContext(gl) == TRUE);
     printf("%d failures\n", failures);
     return failures;
 }

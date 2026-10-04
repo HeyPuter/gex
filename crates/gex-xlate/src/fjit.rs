@@ -120,7 +120,7 @@ impl Jit {
         if class32 != crate::arch::compat() {
             crate::set_compat(class32);
         }
-        let started = std::time::Instant::now();
+        let started = now_us();
         if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
             eprintln!("[fjit] translate {addr:#x}: bytes {:02x?}", &mem[addr as usize..addr as usize + 16]);
         }
@@ -211,7 +211,7 @@ impl Jit {
             }
         }
         let sums = summary::analyze_functions(&batch).map;
-        let recovered = started.elapsed();
+        let recovered = now_us().saturating_sub(started);
         let functions: Vec<Function> = order.iter().filter_map(|a| batch.remove(a)).collect();
         let n = functions.len();
         let builtins: Vec<gex_ir::Block> = order
@@ -260,8 +260,8 @@ impl Jit {
         };
         st.modules += 1;
         st.functions += n as u64;
-        st.recover_us += recovered.as_micros() as u64;
-        st.emit_us += (started.elapsed() - recovered).as_micros() as u64;
+        st.recover_us += recovered;
+        st.emit_us += now_us().saturating_sub(started).saturating_sub(recovered);
         st.bytes += out.as_ref().map_or(0, |w| w.len() as u64);
         if std::env::var_os("GEX_FJIT_STATS").is_some() && st.modules.is_power_of_two() {
             eprintln!("[fjit] {}", st.line());
@@ -357,3 +357,18 @@ impl State {
     }
 }
 
+
+/// Microseconds since the first call, for the translation statistics. 0 on
+/// wasm32-unknown-unknown, where `std::time::Instant` panics (the browser's
+/// function JIT); its stats then report no time.
+fn now_us() -> u64 {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    }
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        0
+    }
+}

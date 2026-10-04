@@ -40,7 +40,7 @@ use crate::futex::FutexTable;
 use crate::{GuestMem, Kernel};
 use gex_abi::ctx;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub use status as st;
@@ -456,6 +456,12 @@ pub struct Process {
     /// Threads `NtTerminateProcess(0)` told to stop; each exits at its next
     /// syscall.
     pub kill_list: Mutex<Vec<u32>>,
+    /// `kill_list`'s length: every syscall looks, and only this word unless
+    /// a thread was told to stop.
+    pub kill_pending: AtomicUsize,
+    /// Threads parked in a yield (`sync::guest_yield`), so a kick knows
+    /// whether to notify.
+    pub yield_parked: AtomicU32,
     /// The display mode, `user::sysparams::Mode` packed (ChangeDisplaySettings).
     pub display_mode: AtomicU64,
 }
@@ -463,7 +469,9 @@ pub struct Process {
 #[derive(Default)]
 pub struct Threads {
     pub by_tid: HashMap<u32, Arc<Thread>>,
-    pub by_ctx: HashMap<u64, Arc<Thread>>,
+    /// By context address. A B-tree: every syscall looks its thread up here,
+    /// and for a few dozen threads that beats hashing the key.
+    pub by_ctx: std::collections::BTreeMap<u64, Arc<Thread>>,
 }
 
 pub struct State {
@@ -547,7 +555,9 @@ impl Process {
             display_host: Mutex::new(None),
             presents: AtomicU64::new(0),
             kill_list: Mutex::new(Vec::new()),
-            display_mode: AtomicU64::new(user::sysparams::Mode::DEFAULT.pack()),
+            kill_pending: AtomicUsize::new(0),
+            yield_parked: AtomicU32::new(0),
+            display_mode: AtomicU64::new(user::sysparams::Mode::startup().pack()),
         }
     }
 
@@ -680,6 +690,17 @@ pub trait NtHost {
     /// the thread or the process is ending, or the run failed; the host has
     /// recorded why.
     fn run_callback(&mut self) -> Result<(), ()>;
+
+    /// Block while the guest word at `addr` holds `expected`, at most
+    /// `timeout`, woken by [`NtHost::notify`] or by the guest's own
+    /// `memory.atomic.notify` on that word (the yield park, `sync::YIELD_GEN`).
+    /// False when this host cannot park: the caller yields instead.
+    fn park(&self, _addr: u64, _expected: u32, _timeout: std::time::Duration) -> bool {
+        false
+    }
+
+    /// Wake every thread parked on the guest word at `addr` ([`NtHost::park`]).
+    fn notify(&self, _addr: u64) {}
 }
 
 /// A host that cannot run guest code (processor exceptions, tests).
@@ -909,17 +930,7 @@ pub fn syscall(
     host: &mut dyn NtHost,
 ) -> Outcome {
     let t = p.thread_by_ctx(ctx_addr);
-    if let Some(t) = &t {
-        t.in_kernel.store(true, Ordering::SeqCst);
-    }
-    let o = syscall_inner(p, kernel, data, ctx_addr, pc, host);
-    if let Some(t) = &t {
-        t.in_kernel.store(false, Ordering::SeqCst);
-        if matches!(o, Outcome::Continue | Outcome::Resume(_) | Outcome::CallbackReturn) {
-            thread::park_if_suspended(p, t);
-        }
-    }
-    o
+    syscall_on(p, t, kernel, data, ctx_addr, pc, host)
 }
 
 /// A safepoint in guest code (the host's countdown expired, registers
@@ -930,25 +941,62 @@ pub fn suspend_point(p: &Process, ctx_addr: u64) {
     }
 }
 
-fn syscall_inner(
+thread_local! {
+    static SYSCALLS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Syscalls this host thread has made (this one included): how a yield
+/// tells it follows another yield with nothing between.
+pub fn syscalls_here() -> u64 {
+    SYSCALLS_HERE.with(|n| n.get())
+}
+
+/// [`syscall`] for a caller that already holds the thread (`thread_by_ctx`
+/// takes the process's thread table lock, which every thread's every
+/// syscall then shares).
+pub fn syscall_on(
     p: &Arc<Process>,
+    t: Option<Arc<Thread>>,
     kernel: &dyn KernelCell,
     data: &mut [u8],
     ctx_addr: u64,
     pc: u64,
     host: &mut dyn NtHost,
 ) -> Outcome {
+    if let Some(t) = &t {
+        t.in_kernel.store(true, Ordering::SeqCst);
+    }
+    let o = syscall_inner(p, t.clone(), kernel, data, ctx_addr, pc, host);
+    if let Some(t) = &t {
+        t.in_kernel.store(false, Ordering::SeqCst);
+        if matches!(o, Outcome::Continue | Outcome::Resume(_) | Outcome::CallbackReturn) {
+            thread::park_if_suspended(p, t);
+        }
+    }
+    o
+}
+
+fn syscall_inner(
+    p: &Arc<Process>,
+    t: Option<Arc<Thread>>,
+    kernel: &dyn KernelCell,
+    data: &mut [u8],
+    ctx_addr: u64,
+    pc: u64,
+    host: &mut dyn NtHost,
+) -> Outcome {
+    SYSCALLS_HERE.with(|n| n.set(n.get().wrapping_add(1)));
     let abi = p.abi;
     let g = G::new(data, abi);
     let nr = g.u64(ctx_addr + ctx::x(0) as u64).unwrap_or(!0) as u32;
-    let Some(t) = p.thread_by_ctx(ctx_addr) else {
+    let Some(t) = t else {
         crate::nt_log!("gex-nt: syscall {nr:#x} from a thread the NT layer does not know (ctx {ctx_addr:#x})");
         return Outcome::Exit(st::INVALID_CID);
     };
     if p.terminating.load(Ordering::Acquire) {
         return Outcome::Exit(p.exit_code.load(Ordering::Acquire));
     }
-    if p.kill_list.lock().unwrap().contains(&t.tid) {
+    if p.kill_pending.load(Ordering::Acquire) != 0 && p.kill_list.lock().unwrap().contains(&t.tid) {
         let mut c = Call { p, t, kernel, g, nr, pc, outcome: None, ret64: None, host };
         thread::exit_thread(&mut c, p.exit_code.load(Ordering::Acquire));
         return Outcome::ThreadExit;
@@ -980,6 +1028,8 @@ fn syscall_inner(
             // NTSTATUS is 32 bits; the upper half of rax is zero, as after
             // Wine's `movl %eax` return. win32u calls return their own value.
             let v = c.ret64.unwrap_or(status as u64);
+            // An i386 result is 32 bits, zero-extended in the context.
+            let v = if abi == Abi::P32 { v & 0xffff_ffff } else { v };
             let _ = c.g.w64(ctx_addr + ctx::x(0) as u64, v);
             other.unwrap_or(Outcome::Continue)
         }

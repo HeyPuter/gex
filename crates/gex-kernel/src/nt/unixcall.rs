@@ -100,13 +100,28 @@ pub fn dispatch(c: &mut Call<'_>) -> R {
     if handle == NTDLL_HANDLE {
         return ntdll(c, code, args);
     }
-    let lib = c.p.unix.libs.lock().unwrap().get(&handle).cloned();
+    // Which library, without copying its name (opengl32's calls come here
+    // a hundred thousand times a second).
+    enum Lib {
+        Ws2,
+        Gl,
+        Crypt32,
+        Other(String),
+        Unknown,
+    }
+    let lib = match c.p.unix.libs.lock().unwrap().get(&handle) {
+        Some(n) if n == "ws2_32.dll" => Lib::Ws2,
+        Some(n) if n == "opengl32.dll" => Lib::Gl,
+        Some(n) if n == "crypt32.dll" => Lib::Crypt32,
+        Some(n) => Lib::Other(n.clone()),
+        None => Lib::Unknown,
+    };
     match lib {
-        Some(name) if name == "ws2_32.dll" => ws2_32(c, code, args),
-        Some(name) if name == "opengl32.dll" => super::opengl::call(c, code, args),
-        Some(name) if name == "crypt32.dll" => crypt32(c, code),
-        Some(name) => Err(c.unimplemented(&format!("{name} unix call {code}"))),
-        None => Err(c.unimplemented(&format!("unix call {code} on unknown handle {handle:#x}"))),
+        Lib::Gl => super::opengl::call(c, code, args),
+        Lib::Ws2 => ws2_32(c, code, args),
+        Lib::Crypt32 => crypt32(c, code),
+        Lib::Other(name) => Err(c.unimplemented(&format!("{name} unix call {code}"))),
+        Lib::Unknown => Err(c.unimplemented(&format!("unix call {code} on unknown handle {handle:#x}"))),
     }
 }
 

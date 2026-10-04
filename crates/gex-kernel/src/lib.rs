@@ -306,3 +306,37 @@ mod tests {
         assert!(b[..0x800].iter().chain(&b[0x1800..]).all(|&x| x == 7));
     }
 }
+
+/// Bumped (after the push, under the kernel lock) whenever code is mapped or
+/// retired (`Kernel::new_code`, `Kernel::retired_code`): a host checks this
+/// before taking the kernel lock to drain them, on every syscall.
+pub static CODE_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_code_change() {
+    CODE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The process is i386 (a 32-bit guest on x86): its GPRs live in 64-bit
+/// context slots whose high halves must stay zero, as a 32-bit write leaves
+/// them on hardware, so that compiled code may keep and store only the low
+/// 32 bits. Every host write of a GPR goes through [`gpr`].
+static COMPAT32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compat32(on: bool) {
+    COMPAT32.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn compat32() -> bool {
+    COMPAT32.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A GPR value as the host writes it into the context: zero-extended from 32
+/// bits for an i386 process (a negative errno included), as it is.
+#[inline]
+pub fn gpr(v: u64) -> u64 {
+    if compat32() {
+        v & 0xffff_ffff
+    } else {
+        v
+    }
+}

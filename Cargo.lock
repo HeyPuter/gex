@@ -412,13 +412,16 @@ version = "0.0.1"
 dependencies = [
  "gex-abi",
  "gex-cgen",
+ "gex-emit",
  "gex-kernel",
+ "gex-key",
  "gex-ld",
  "gex-wayland",
  "gex-xlate",
  "gex-xwm",
  "spinning_top",
  "talc",
+ "wasmparser",
 ]
 
 [[package]]
@@ -474,6 +477,7 @@ dependencies = [
  "gex-cgen",
  "gex-emit",
  "gex-ir",
+ "gex-kernel",
  "gex-ld",
  "gex-native",
  "gex-xlate",
@@ -640,6 +644,8 @@ dependencies = [
  "gex-mem",
  "gex-wayland",
  "gex-xlate",
+ "wasm-encoder",
+ "wasmparser",
  "wasmtime",
 ]
 

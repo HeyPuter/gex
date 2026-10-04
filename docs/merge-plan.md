@@ -766,6 +766,27 @@ one interface, fixed here so neither waits on the other.
   exit_group, and SEH unwinding past wasm frames.
 - Stream R measures EH against the chain on the Tier 0 corpus and picks per
   event. The decision is recorded here.
+- *As built (stream R, 2026-10-03): guest exceptions use neither.*
+  - NtRaiseException (ffa2cec9), user APCs from alertable waits (fb7dfd52)
+    and hardware faults in whole-image units run their dispatcher
+    **nested**, on top of the thread's wasm frames, instead of trapping
+    out.
+  - Hardware faults need `RESUMABLE_PC` in the fault import's pc: the unit
+    goes on at `ctx::PC` through its `gex_resume` when the import returns.
+  - Control coming back at or above the raise's stack ends the nested
+    loop. The guest then resumes there through the return-0 chain, and the
+    frame that owns the target continues in its own body:
+    - at a call continuation (`gex_lc_*`);
+    - anywhere else in its own code, by a tail call through the table at
+      that address (`gex_resume`'s interior entry).
+  - Trap-outs remain for exceptions dispatched from tier-1 and for a fault
+    in a unit without the bit.
+  - **Known region-entry case:** a handler that resumes *inside the
+    faulting function itself* at a non-call address (a VEH returning
+    EXCEPTION_CONTINUE_EXECUTION at the fault pc + n) is reached by that
+    interior tail call, so it runs on the fallback (tier-1's call-out). An
+    AOT-only eject has no tier-1 for it: that is a region entry
+    (§9.2 region tier).
 
 **Stream F, the function JIT** (`crates/gex-fjit`, new; branch `merge/fjit`):
 1. §9.4 step 2: GIR → wasm emitter directly, with no clang:
@@ -1042,3 +1063,34 @@ One general mechanism serves Windows and Linux guests on every tier.
 **Owner:** stream R. It builds the mechanism, then steps 1–4 on 32-bit PE
 first, since that's Noita. Steps 5 and 6 follow, once Noita's profile no
 longer shows libc.
+
+## 10. A native gex wasm target for any program (future, noted 2026-10-04)
+
+Stream W's Wine work (docs/wine-native.md §3.10, §4.1) created a general
+target. clang `--target=wasm32-unknown-linux-musl` plus the gex musl port
+(arch/wasm32, syscalls through `gex.syscall` on the i386 ABI) builds a PIC/PIE
+wasm module. gexc runs it from an ELF32 container (wasmprog.rs) as a normal
+process: exec, stack, auxv, brk, fds, sockets, fork in the syscall, and
+threads as Workers or instances.
+
+So any POSIX C/C++ program can be compiled for gex and run natively beside
+translated x86 programs. It shares the kernel, the VFS, sockets, the
+compositor and gex-gl. It can also go further:
+- **A native userland.** sh, coreutils, busybox, Xwayland and Mesa built
+  natively instead of translated. Half-Life's X display could come from a
+  native Xwayland in the same gex instance, avoiding the mixed-ISA problem
+  (stream U).
+- **Native libraries inside translated processes.** The same modules
+  dlopen'd by x86 programs, through §9.9 providers with generated adapters.
+  This generalises the hand-written providers and PUC Lua.
+- **Toolchain products.** A `gexcc` wrapper, a sysroot, and (later) the
+  wasm64 variant (memory64) for 64-bit programs.
+
+Gaps before it is general:
+- setjmp/longjmp and C++ exceptions need wasm EH;
+- signal delivery to native code;
+- dlopen for native .so;
+- a defined `wasm32` kernel personality (W1);
+- performance work on the syscall boundary.
+
+Not scheduled. Revisit after Wine W1–W3 have hardened the toolchain.

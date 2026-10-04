@@ -40,6 +40,10 @@ pub enum Mode {
     Default,
     /// `--cgen`: every program image (not Wine's) must have a unit.
     Require,
+    /// An ejected project (docs/eject-pe.md): every image, Wine's included,
+    /// has a unit built for its base ahead of time; nothing is ever built at
+    /// run time, and an image without one stops the run.
+    Aot,
 }
 
 static MODE: OnceLock<Mode> = OnceLock::new();
@@ -102,6 +106,9 @@ struct Pending {
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Set after a push to [`PENDING`]: every syscall drains, and looks here
+/// first rather than taking the lock.
+static HAS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ON: OnceLock<()> = OnceLock::new();
 /// One unit is placed at a time: slot assignment runs from a snapshot of the
 /// page table to the publish.
@@ -139,7 +146,7 @@ struct Provided {
 }
 
 fn provided(pe: &gex_ld::pe::PeImage, base: u64) -> Provided {
-    let providers = gex_cgen::provider::for_dll(&pe.exports.dll_name, !pe.is64);
+    let providers = gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data);
     let mut exports = HashMap::new();
     if !providers.is_empty() {
         for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
@@ -178,6 +185,33 @@ fn unit_key(image: &gex_ld::Image, pv: &Provided) -> String {
 /// Where [`icall_hints`] reads the image's profile.
 pub fn icall_path(image: &gex_ld::Image) -> Result<std::path::PathBuf> {
     Ok(cache_root()?.join("icall").join(format!("{}.txt", gex_key::image_identity(image).trim_start_matches("image:"))))
+}
+
+/// Say where the image's indirect-call profile was looked for and how many
+/// hints it gave (`gexc cgen-image`). A unit built without one has no
+/// devirtualised calls, so its hot virtual calls stay table calls that no
+/// engine inlines (the browser units of 2026-10-04 were all built so). When
+/// it is missing, each cache in `GEX_CGEN_ICALL_FROM` (colon-separated
+/// cache roots) is checked for the same identity's file, and one found is
+/// named, loudly.
+fn report_hints(image: &gex_ld::Image) {
+    let Ok(path) = icall_path(image) else { return };
+    if path.exists() {
+        eprintln!("[cgen] indirect-call hints: {} from {}", icall_hints(image).len(), path.display());
+        return;
+    }
+    eprintln!("[cgen] indirect-call hints: none (no {})", path.display());
+    let name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    for root in std::env::var("GEX_CGEN_ICALL_FROM").unwrap_or_default().split(':').filter(|r| !r.is_empty()) {
+        let other = std::path::Path::new(root).join("icall").join(&name);
+        if other.exists() {
+            eprintln!(
+                "[cgen] WARNING: building without the indirect-call profile at {}; copy it to {} for devirtualised calls",
+                other.display(),
+                path.display()
+            );
+        }
+    }
 }
 
 /// The image's indirect-call profile, `<cache>/icall/<image identity>.txt`:
@@ -219,6 +253,47 @@ pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: boo
     prepare_with(&image, &seeds, jobs, verbose, &pv)
 }
 
+/// [`prepare_pe`] with function starts of the caller's besides the image's
+/// own (gex-eject: entries a recorded session reached that recovery did not
+/// find). The unit has the same key: the caller owns the cache it builds
+/// into, and starts from a cache without this image's recovery.
+pub fn prepare_pe_seeded(pe: &gex_ld::pe::PeImage, base: u64, extra: &[u64], jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
+    let (image, mut seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    for &a in extra {
+        if !seeds.starts.iter().any(|&(s, _)| s == a) {
+            seeds.starts.push((a, gex_xlate::func::Source::Entry));
+        }
+    }
+    let pv = provided(pe, base);
+    prepare_with(&image, &seeds, jobs, verbose, &pv)
+}
+
+/// The recovery directory of a PE image at `base` (what [`prepare_pe`]
+/// caches), for a caller that must recover it again.
+pub fn recovery_dir(pe: &gex_ld::pe::PeImage, base: u64) -> Result<std::path::PathBuf> {
+    let (image, _) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    Ok(cache_root()?.join("recovery").join(recovery_key(&image)))
+}
+
+/// The directory under the unit cache that holds the unit for a PE image
+/// placed at `base` (with its providers and hints), built or not.
+pub fn unit_dir(pe: &gex_ld::pe::PeImage, base: u64) -> Result<std::path::PathBuf> {
+    let (image, _) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    let pv = provided(pe, base);
+    Ok(cache_root()?.join(unit_key(&image, &pv)))
+}
+
+/// Build every export provider for a PE image (`gex_cgen::provider`) into the
+/// unit cache, as mapping it would; their names.
+pub fn prepare_providers(pe: &gex_ld::pe::PeImage) -> Result<Vec<String>> {
+    let mut v = Vec::new();
+    for prov in gex_cgen::provider::for_image(&pe.exports.dll_name, !pe.is64, &pe.data) {
+        gex_cgen::provider::build(&prov, &cache_root()?)?;
+        v.push(prov.name.to_string());
+    }
+    Ok(v)
+}
+
 /// [`prepare_pe`] for any recovery input (no providers).
 pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
@@ -227,12 +302,18 @@ pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jo
 
 fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool, pv: &Provided) -> Result<std::path::PathBuf> {
     let (image, seeds) = (image, seeds);
+    if verbose {
+        report_hints(image);
+    }
     let key = unit_key(image, pv);
     let root = cache_root()?;
     let dir = root.join(&key);
     let out = dir.join("c.wasm");
     if out.exists() {
         return Ok(out);
+    }
+    if mode() == Mode::Aot {
+        bail!("no function-tier unit {key} in {} (the ejected project was not built for this image; run ./build.sh)", root.display());
     }
     let recovery = root.join("recovery").join(recovery_key(image));
     if !recovery.join("summaries").exists() {
@@ -257,7 +338,7 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
     let t0 = std::time::Instant::now();
     let work = dir.join("work");
     let byte = |a: u64| {
-        image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+        image.segments.iter().find_map(|s| s.byte(a))
     };
     let stubs: std::collections::HashSet<u64> = pv.stubs.iter().copied().collect();
     let hints = icall_hints(image);
@@ -298,11 +379,17 @@ pub(crate) fn enable(record: bool) -> Result<()> {
             base: m.base,
             pe: Arc::clone(m.pe),
         });
+        HAS_PENDING.store(true, std::sync::atomic::Ordering::Release);
     });
     Ok(())
 }
 
 fn take_pending() -> Vec<Pending> {
+    // A load first: every syscall of every thread comes here, and a swap
+    // would write the shared line each time.
+    if !HAS_PENDING.load(std::sync::atomic::Ordering::Relaxed) || !HAS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
     std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -399,6 +486,47 @@ pub(crate) fn on_retire(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
     }
 }
 
+/// Provided exports by guest address: a label (`kernel32.dll!OutputDebugStringA`),
+/// the first bytes of the library's own code there when the provider was
+/// bound, and whether a rewrite of them was reported.
+static PROVIDED: Mutex<Option<std::collections::BTreeMap<u64, (String, [u8; PROVIDED_BYTES], bool)>>> = Mutex::new(None);
+const PROVIDED_BYTES: usize = 8;
+
+fn provided_bytes(memory: &[u8], addr: u64) -> [u8; PROVIDED_BYTES] {
+    let mut b = [0; PROVIDED_BYTES];
+    if let Some(m) = memory.get(addr as usize..addr as usize + PROVIDED_BYTES) {
+        b.copy_from_slice(m);
+    }
+    b
+}
+
+fn note_provided(memory: &gex_mem::GuestMemory, addr: u64, label: String) {
+    let bytes = provided_bytes(memory.bytes(), addr);
+    PROVIDED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(addr, (label, bytes, false));
+}
+
+/// Report, once per export, a guest that rewrote the start of an export a
+/// provider serves (a Detours-style hook, a patch). The provider stays
+/// bound (`ftab::Shared::providers`), so the guest's new code there does
+/// not run; on Windows it would. `GEX_PROVIDER_SKIP=<export>` leaves the
+/// export to the library's code, hooks included.
+pub(crate) fn provided_rewrites(memory: &gex_mem::GuestMemory, ranges: &[(u64, u64)]) {
+    let memory = memory.bytes();
+    let mut guard = PROVIDED.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = guard.as_mut() else { return };
+    for &(start, end) in ranges {
+        for (&addr, (label, bytes, told)) in map.range_mut(start.saturating_sub(PROVIDED_BYTES as u64 - 1)..end) {
+            if !*told && provided_bytes(memory, addr) != *bytes {
+                *told = true;
+                let e = label.rsplit('!').next().unwrap_or(label);
+                eprintln!(
+                    "gex-nt: the guest rewrote provided export {label} at {addr:#x} (a hook?); the provider stays bound, so its new code does not run (GEX_PROVIDER_SKIP={e} runs the library's own code)"
+                );
+            }
+        }
+    }
+}
+
 /// Record a placed unit's pages as built, and clear their patched bits.
 fn note_pages(memory: &gex_mem::GuestMemory, pages: &[(u64, u64)]) {
     let memory = memory.bytes();
@@ -425,6 +553,13 @@ fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) 
         fdes: Vec::new(),
     };
     (image, seeds)
+}
+
+/// The NT trampoline page's unit, built into the cache (`gexc cgen-image
+/// --nt-trampolines`): for a host that cannot build it at boot, the browser.
+pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::PathBuf> {
+    let (image, seeds) = trampoline_input(class32);
+    prepare_image(&image, &seeds, jobs, true)
 }
 
 static TRAMPOLINES_DONE: OnceLock<()> = OnceLock::new();
@@ -532,7 +667,7 @@ fn place_or_build(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
     if let Some(pl) = place(p, memory)? {
         return Ok(Some(pl));
     }
-    if sync_build() && !is_wine(p) {
+    if sync_build() && !is_wine(p) && mode() != Mode::Aot {
         build_now(p)?;
         return place(p, memory);
     }
@@ -549,6 +684,23 @@ fn is_wine(p: &Pending) -> bool {
 /// no (`0`, or a list of file names that leaves it out), gets a unit built
 /// for the next run.
 fn missing(p: Pending) -> Result<()> {
+    if mode() == Mode::Aot {
+        bail!(
+            "gex-eject: {} was mapped at {:#x}, and the ejected project has no code built for it there \
+             (the recorded session never mapped it, or mapped it elsewhere). Record a session that loads it \
+             and re-eject",
+            p.path,
+            p.base
+        );
+    }
+    // Always said, and kept for GEX_NT_STATS: an image on tier-1 because its
+    // unit is missing (a base its unit was not built for, a stale key) is
+    // otherwise only visible as a lower AOT share.
+    let key = gex_xlate::func::pe_input(&p.pe, p.base)
+        .map(|(image, _)| unit_key(&image, &provided(&p.pe, p.base)))
+        .unwrap_or_else(|e| format!("(not placeable: {e})"));
+    eprintln!("gex-nt: warning: {} at {:#x}: no function-tier unit (key {key}); it runs on tier-1", p.path, p.base);
+    NO_UNIT.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{} at {:#x} (key {key})", p.path, p.base));
     if mode() == Mode::Require && !is_wine(&p) {
         bail!(
             "--cgen: {} has no function-tier unit for base {:#x}; build one with \
@@ -586,6 +738,16 @@ fn missing(p: Pending) -> Result<()> {
     Ok(())
 }
 
+/// Images mapped with no unit for their base, as `missing` reported them.
+static NO_UNIT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// GEX_NT_STATS's "no unit" line: every image running on tier-1 for want of
+/// a unit, or `None` when there are none.
+pub(crate) fn no_unit_line() -> Option<String> {
+    let v = NO_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+    (!v.is_empty()).then(|| format!("gex-nt: no unit ({}): {}", v.len(), v.join(" | ")))
+}
+
 /// Place, compile, publish and install, for a caller inside the guest
 /// (after an NT syscall that mapped an image).
 pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> {
@@ -616,7 +778,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
                 None => missing(p.clone())?,
             }
         }
-        install_providers(&p, &shared, &engine, &memory)?;
+        install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *caller)?;
         replay_registry(caller)?;
     }
@@ -653,7 +815,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
                 None => missing(p.clone())?,
             }
         }
-        install_providers(&p, &shared, &engine, &memory)?;
+        install_providers(&p, store.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *store)?;
         catch_up_table(store)?;
     }
@@ -662,7 +824,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
 
 /// Bind `p`'s export providers (`gex_cgen::provider`) at their exports'
 /// addresses, after its unit (whose bodies there are stubs into the table).
-fn install_providers(p: &Pending, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
+fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
     let pv = provided(&p.pe, p.base);
     for prov in &pv.providers {
         // Small, and built in a private directory then renamed into place:
@@ -675,8 +837,40 @@ fn install_providers(p: &Pending, shared: &Arc<Mutex<JitShared>>, engine: &Engin
         }
         let module = Module::from_file(engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
         crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-        crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        if prov.stateful {
+            // Its data in guest pages, as an ejected project's stateful
+            // providers have it (`libprov`); the stack comes per thread.
+            let wasm = std::fs::read(&path)?;
+            let (size, align) = crate::libprov::dylink_memory(&wasm)?;
+            let a = 1u64 << align;
+            let data = crate::libprov::alloc_top(state, (size as u64).max(16) + a, &format!("[provider {} data]", prov.name))?;
+            let data = (data + a - 1) & !(a - 1);
+            crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data as u32 })?;
+        } else {
+            crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+        }
+        let dll = p.path.rsplit(['/', '\\']).next().unwrap_or(&p.path);
+        for (_, e) in &prov.binds {
+            if let Some(&rva) = pv.exports.get(e) {
+                note_provided(memory, p.base + rva as u64, format!("{dll}!{e}"));
+            }
+        }
         eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
+    }
+    // Stateful providers (`libprov`: an ejected project's), after the
+    // built-in ones, so they win where both bind an export.
+    let libs = crate::libprov::for_dll(&p.pe.exports.dll_name);
+    if !libs.is_empty() {
+        let mut exports = HashMap::new();
+        for e in p.pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+            for n in &e.names {
+                exports.insert(n.clone(), e.rva);
+            }
+        }
+        for lp in libs {
+            let n = crate::libprov::install(lp, state, shared, engine, memory, &exports, p.base, p.pe.entry_rva)?;
+            eprintln!("gex-nt: provider {} for {}: {n} exports", lp.name, p.path);
+        }
     }
     Ok(())
 }

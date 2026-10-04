@@ -726,6 +726,10 @@ impl ModuleBuilder {
             for i in 0..gex_abi::DISPATCH_TABLES {
                 m.import_table(IMPORT_MODULE, exports::dispatch_table(i), 0);
             }
+            // And the dense block table after them (`crate::dense`).
+            if crate::dense::on() {
+                m.import_table(IMPORT_MODULE, crate::dense::TABLE_NAME, 0);
+            }
         }
 
         // The miss stub and `enter` are the first two local functions, so
@@ -786,6 +790,9 @@ impl ModuleBuilder {
             b.m.export(exports::MEMORY, ExportKind::Memory, 0);
             for i in 0..gex_abi::DISPATCH_TABLES {
                 b.m.export(exports::dispatch_table(i), ExportKind::Table, i as u32);
+            }
+            if crate::dense::on() {
+                b.m.export(crate::dense::TABLE_NAME, ExportKind::Table, crate::dense::TABLE_INDEX);
             }
         }
         b.m.export(exports::ENTER, ExportKind::Func, enter);
@@ -956,6 +963,7 @@ impl ModuleBuilder {
             }
         }
 
+        let mut dense_section: Option<Vec<u8>> = None;
         match self.linkage {
             Linkage::Own => {
                 self.m
@@ -1004,7 +1012,22 @@ impl ModuleBuilder {
                     // The image module's one segment covers the whole table,
                     // not a page, and is never demand filled.
                     guest_page: 0,
+                    padded: false,
                 });
+                // The dense block table, its entry 0 the miss stub as a slot
+                // nobody installed reads 0 (`crate::dense`).
+                if crate::dense::on() {
+                    self.m.set_table(1, gex_abi::DISPATCH_TABLE_MAX_SLOTS as u32);
+                    self.m.element(ElementSegment {
+                        table: crate::dense::TABLE_INDEX,
+                        offset: 0,
+                        page_base: 0,
+                        funcs: vec![self.miss_stub],
+                        passive: false,
+                        guest_page: 0,
+                        padded: false,
+                    });
+                }
             }
             Linkage::Shared => {
                 // The table is imported, and the module fills it itself with
@@ -1036,6 +1059,8 @@ impl ModuleBuilder {
                 // runtime unit, whose slots are written when it is instantiated.
                 let passive = self.demand_fill;
                 let _ = BIG_BLOCKS;
+                let mut dense_slots: Vec<u32> = Vec::new();
+                let mut dense_funcs: Vec<u32> = Vec::new();
                 for (page, mut blocks) in by_page {
                     let Some(entry) = self.page_table.lookup(page) else {
                         continue;
@@ -1068,6 +1093,15 @@ impl ModuleBuilder {
                     }
                     let blocks = merged;
                     let page_base = (entry & gex_abi::DISPATCH_SLOT_MASK) as u32;
+                    // A dense table's page: its blocks go to the module's one
+                    // segment on `blocks`, each listed with its slot.
+                    if crate::dense::table(table as usize) {
+                        for (addr, f) in &blocks {
+                            dense_slots.push(gex_abi::dispatch_entry(table as usize, slot(*addr) as u32));
+                            dense_funcs.push(*f);
+                        }
+                        continue;
+                    }
                     if passive {
                         // One `[first,last]` segment for a closure page, this
                         // module's miss stub in the gaps. Per-contiguous-run
@@ -1092,6 +1126,7 @@ impl ModuleBuilder {
                             funcs,
                             passive,
                             guest_page: page as u32,
+                            padded: false,
                         });
                     } else {
                         // A small runtime unit shares its page with a closure whose
@@ -1116,10 +1151,25 @@ impl ModuleBuilder {
                                 funcs,
                                 passive,
                                 guest_page: page as u32,
+                                padded: false,
                             });
                             i = j;
                         }
                     }
+                }
+                if !dense_funcs.is_empty() {
+                    // At base 0 until the host gives the module one
+                    // (`crate::dense::set_base`).
+                    self.m.element(ElementSegment {
+                        table: crate::dense::TABLE_INDEX,
+                        offset: 0,
+                        page_base: 0,
+                        funcs: dense_funcs,
+                        passive: false,
+                        guest_page: 0,
+                        padded: true,
+                    });
+                    dense_section = Some(crate::dense::Section { base: 0, entries: dense_slots }.encode());
                 }
             }
         }
@@ -1157,6 +1207,9 @@ impl ModuleBuilder {
         }
         let started = crate::par::Stopwatch::start();
         let mut custom = vec![(METADATA_SECTION, meta.encode())];
+        if let Some(d) = dense_section {
+            custom.push((crate::dense::SECTION, d));
+        }
         // `GEX_PERFMAP`: a name section, `b_<guest address>` per block, so
         // the host's perf map attributes tier-1 code to guest addresses.
         if std::env::var_os("GEX_PERFMAP").is_some() {
@@ -1335,6 +1388,10 @@ impl ModuleBuilder {
         f.br_table(&targets, n - 1);
         for k in (0..n).rev() {
             f.end();
+            if crate::dense::table(k as usize) {
+                crate::dense::emit_arm(&mut f, k as usize, 0, index, entry, self.block_ty);
+                continue;
+            }
             f.local_get(0); // ctx argument for the target block
             f.local_get(index);
             f.return_call_indirect(self.block_ty, k);

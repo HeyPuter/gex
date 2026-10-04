@@ -152,7 +152,7 @@ fn the_return_check_counts_what_ret_n_pops() {
     let prog = recover(&img, None, &RecoverOptions::default());
     let sums = gex_xlate::summary::analyze(&prog).map;
     let byte = |a: u64| {
-        img.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied())
+        img.segments.iter().find_map(|s| s.byte(a))
     };
     let funcs = gex_cgen::select(
         prog.functions.into_values().collect(),
@@ -266,4 +266,49 @@ fn a_guarded_vsyscall_is_the_syscall_it_makes() {
     assert_eq!(pg.calls, guards.calls);
     // Another object's id matches nothing.
     assert!(gex_xlate::summary::profile_guards(&prog, &profile, "sha256:other", 0).calls.is_empty());
+}
+
+/// Every block of every function, by the address its terminator is at.
+fn illegal_blocks(prog: &gex_xlate::func::Program) -> Vec<u64> {
+    prog.functions
+        .values()
+        .flat_map(|f| f.blocks.iter())
+        .filter(|b| matches!(b.term, FTerm::Illegal { .. }))
+        .map(|b| b.start)
+        .collect()
+}
+
+/// A PE section's trailing zero bytes are not stored (`PeImage::segments`),
+/// so an instruction that ends `.text` in a zero byte used to be cut short
+/// and lift as illegal: libb.dll's `ret $0xc` (`c2 0c 00`), and an import
+/// thunk `jmp *slot` last in `.text` once the image is rebased where the
+/// slot's address has a zero high byte (Noita's lua51.dll at 0xb70000:
+/// `ff 25 1c f0 bb 00`). liba.dll's thunk is followed by two `nop`s of
+/// padding; zeroed, it is that shape at base 0x10000 (slot 0x15030).
+#[test]
+fn an_instruction_ending_text_in_a_zero_byte_lifts_whole() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../gex-ld/tests/pe/bin/x86");
+    let libb = gex_ld::pe::parse(&std::fs::read(format!("{dir}/libb.dll")).unwrap()).unwrap();
+    let (img, extra) = gex_xlate::func::pe_input(&libb, libb.preferred_base).unwrap();
+    let prog = recover_pe(&img, &extra, &RecoverOptions::default());
+    assert!(illegal_blocks(&prog).is_empty(), "{:x?}", illegal_blocks(&prog));
+    let ret = libb.preferred_base + 0x1039;
+    let f = prog.functions.values().find(|f| f.blocks.iter().any(|b| b.term_pc == ret)).expect("the ret $0xc");
+    let b = f.blocks.iter().find(|b| b.term_pc == ret).unwrap();
+    assert!(matches!(b.term, FTerm::Return { .. }), "{}", gex_ir::text::print(f));
+
+    let mut bytes = std::fs::read(format!("{dir}/liba.dll")).unwrap();
+    // .text's raw data starts at file offset 0x400; the thunk is at +0x34.
+    assert_eq!(bytes[0x434..0x43c], [0xff, 0x25, 0x30, 0x50, 0x6c, 0x65, 0x90, 0x90]);
+    bytes[0x43a..0x43c].fill(0);
+    let liba = gex_ld::pe::parse(&bytes).unwrap();
+    let base = 0x10000;
+    let (img, extra) = gex_xlate::func::pe_input(&liba, base).unwrap();
+    let prog = recover_pe(&img, &extra, &RecoverOptions::default());
+    assert!(illegal_blocks(&prog).is_empty(), "{:x?}", illegal_blocks(&prog));
+    let thunk = &prog.functions[&(base + 0x1034)];
+    let text = gex_ir::text::print(thunk);
+    assert_eq!(thunk.blocks.len(), 1, "{text}");
+    assert!(matches!(thunk.blocks[0].term, FTerm::Unresolved { .. }), "{text}");
+    assert!(text.contains(&format!("{:#x}", base + 0x5030)), "the slot, rebased: {text}");
 }

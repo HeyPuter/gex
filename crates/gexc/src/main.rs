@@ -46,7 +46,8 @@ fn real_main() -> Result<ExitCode> {
     // builds and uses the guarded, browser flavor instead.
     // Only for what runs here: `gexc build` makes modules for the browser.
     let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c");
-    gex_cgen::image::set_unguarded(native && std::env::var("GEX_CGEN_GUARD").as_deref() != Ok("1"));
+    let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
+    gex_cgen::image::set_unguarded(native && !guard);
     match argv[1].as_str() {
         "run" => {
             // On a thread with a guest-sized stack: the first guest thread
@@ -138,12 +139,20 @@ usage:
                                    NT layer maps the image at that base. Run it
                                    with a memory cap: recovery of a large image
                                    is the peak
-  gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only]
+  gexc cgen-image --nt-trampolines32|--nt-trampolines64 [--jobs N]
+                                   the NT trampoline page's unit, which the
+                                   native host builds at boot; the browser
+                                   needs it built ahead (GEX_CGEN_GUARD=1)
+  gexc cgen-image --providers      every export provider's module, into
+                                   GEX_CGEN_CACHE (the browser cannot build them)
+  gexc cgen-prefix [PREFIX] [--set FILE] [--jobs N] [--layout-only] [--append]
                                    compile a staged Wine prefix's core DLLs
                                    (tools/nt-cgen-core.txt, or --set) for the
                                    function tier: writes PREFIX/gex-layout, the
                                    fixed base each one gets in every process,
                                    and builds each unit at that base.
+                                   --append keeps the existing layout's
+                                   bases and places only DLLs it lacks.
                                    tools/nt-stage-wine.sh runs it
   gexc hotset <elf|pe> --samples FILE [--pe-base HEX] [--budget N] -o OUT
                                    the function tier's hot set for an image:
@@ -618,6 +627,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         ra.opts.env = vec!["PATH=/usr/bin:/bin".into(), "HOME=/root".into()];
     }
 
+    // GEX_IMAGE_WASM=PATH: run the program image from a module `gexc build`
+    // wrote (the bytes a browser host runs) instead of translating it, so the
+    // same wasm can be timed under wasmtime and under V8. The module must be
+    // built with a shared memory, as the native guest memory is one.
+    if let Some(p) = std::env::var_os("GEX_IMAGE_WASM") {
+        let mut aot = gex_native::aot::Aot::new(format!("GEX_IMAGE_WASM={}", p.to_string_lossy()));
+        aot.images.insert(gex_native::aot::image_identity(&program.exe), p.into());
+        ra.opts.aot = Some(std::sync::Arc::new(aot));
+    }
     ra.opts.jit = ra.jit;
     if ra.opts.record.is_some() {
         gex_native::profile::set_exe_host_path(ra.path.clone().into());
@@ -678,6 +696,10 @@ fn cmd_seed(args: &[String]) -> Result<()> {
         i += 1;
     }
     let out = out.unwrap_or_else(|| "seed.wasm".to_string());
+    // The seed is the browser's image module: its `enter` dispatches
+    // dense-capable, and it defines the `blocks` table (gex_emit::dense; a
+    // table stays classic while the host leaves its map word zero).
+    gex_emit::dense::set(true);
     let module = gex_xlate::seed_module(shared_memory);
     std::fs::write(&out, &module.wasm).with_context(|| format!("writing {out}"))?;
     gex_native::validate_module(&module.wasm)
@@ -2107,6 +2129,7 @@ const CGEN_CORE: &str = include_str!("../../../tools/nt-cgen-core.txt");
 fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
     use gex_kernel::nt::section;
     let (mut prefix, mut set, mut jobs, mut layout_only) = (None, None, 4usize, false);
+    let mut append = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -2119,6 +2142,9 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
             }
             "--layout-only" => layout_only = true,
+            // Keep the prefix's layout: existing entries keep their bases
+            // (and so their units' keys), only DLLs it lacks get places.
+            "--append" => append = true,
             other => prefix = Some(other.to_string()),
         }
         i += 1;
@@ -2142,6 +2168,13 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
         .filter(|l| !l.is_empty())
         .collect();
     let t_all = std::time::Instant::now();
+    let existing = if append {
+        let text = std::fs::read_to_string(format!("{prefix}/{}", section::LAYOUT_FILE))
+            .with_context(|| format!("--append: {prefix} has no {}", section::LAYOUT_FILE))?;
+        section::parse_layout_entries(&text, &wine).map_err(|e| anyhow::anyhow!("--append: {prefix}/{}: {e}", section::LAYOUT_FILE))?
+    } else {
+        Vec::new()
+    };
     let mut layout = Vec::new();
     let mut todo = Vec::new();
     for dir in ["drive_c/windows/syswow64", "drive_c/windows/system32"] {
@@ -2170,7 +2203,12 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
             let own = prefs.get(&pe.preferred_base).copied().unwrap_or(0) == 1;
             images.push((rel, pe.preferred_base, pe.image_size as u64, sha, own));
         }
-        let planned = section::plan_layout(&images);
+        let planned = if append {
+            let mine: Vec<section::LayoutEntry> = existing.iter().filter(|e| e.0.starts_with(&format!("{dir}/"))).cloned().collect();
+            section::plan_layout_append(&mine, &images).map_err(|e| anyhow::anyhow!("--append: {e}"))?
+        } else {
+            section::plan_layout(&images)
+        };
         for (rel, b, _, _) in &planned {
             todo.push((format!("{prefix}/{rel}"), *b));
         }
@@ -2258,8 +2296,10 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
         Some(d) => d,
         None => gex_native::nt_cgen::cache_root()?.join("recovery").join(gex_native::nt_cgen::recovery_key(&image)),
     };
-    let read = |a: u64| image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied());
-    print!("{}", gex_cgen::image::function_c(&dir, at, &read)?);
+    let read = |a: u64| image.segments.iter().find_map(|s| s.byte(a));
+    // The image's indirect-call profile, as its unit build uses it.
+    let hints = gex_native::nt_cgen::icall_hints(&image);
+    print!("{}", gex_cgen::image::function_c(&dir, at, &read, &hints)?);
     Ok(())
 }
 
@@ -2278,11 +2318,29 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
                 i += 1;
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
             }
+            // The NT trampoline page (i386 with --nt-trampolines32): built
+            // at boot natively, ahead of time for the browser.
+            t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),
             other => path = Some(other.to_string()),
         }
         i += 1;
     }
     let path = path.context("expected a PE image")?;
+    if path == "--providers" {
+        let root = std::path::PathBuf::from(std::env::var("GEX_CGEN_CACHE").context("--providers needs GEX_CGEN_CACHE")?);
+        for p in gex_cgen::provider::all() {
+            let (out, _) = gex_cgen::provider::build(&p, &root)?;
+            eprintln!("provider {}: {}", p.name, out.display());
+        }
+        return Ok(());
+    }
+    if let Some(w) = path.strip_prefix("--nt-trampolines") {
+        let _lock = gex_native::nt_cgen::build_lock()?;
+        let t0 = std::time::Instant::now();
+        let out = gex_native::nt_cgen::prepare_trampolines(w == "32", jobs)?;
+        eprintln!("the NT trampolines ({w}-bit): {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
     let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     let base = pe_base.unwrap_or(pe.preferred_base);

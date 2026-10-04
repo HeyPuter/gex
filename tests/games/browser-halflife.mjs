@@ -104,6 +104,7 @@ async function main() {
     `tar=/gex/nt/${tar.split('/').pop()}${overlay}&exe=${exe}&cwd=/hl&gl=1&glbackend=wgpu&hostx=1`
       + (process.env.GEX_GLCAPTURE ? `&glcapture=${process.env.GEX_GLCAPTURE}` : '')
       + (process.env.GEX_MESA_ENV ? `&mesaenv=${encodeURIComponent(process.env.GEX_MESA_ENV)}` : '')
+      + (process.env.GEX_NT_PAGE_FLAGS ?? "")
       + `&size=800x600&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(args)}`,
     { width: 820, height: 700, shotDir },
   );

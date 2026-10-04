@@ -303,6 +303,7 @@ pub(crate) fn install_shared(
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.page_table.insert_entries(&meta.dir_entries);
             sh.registry.push(Arc::clone(&unit));
+            crate::REGISTRY_LEN.store(sh.registry.len(), std::sync::atomic::Ordering::Release);
         }
         super::install_unit(&mut *store, &unit)?;
         store.data_mut().jit.as_mut().unwrap().replayed += 1;
@@ -651,7 +652,7 @@ pub(crate) fn call(caller: &mut Caller<'_, HostState>, ctx_addr: i32, pc: u64, i
                 // A wasm32 `int` or pointer: zero-extended, which is what a
                 // pointer needs and all a caller of an `int` function reads.
                 Some(Val::I32(v)) => write_u64(data, base + ctx::x(0), *v as u32 as u64),
-                Some(Val::I64(v)) => write_u64(data, base + ctx::x(0), *v as u64),
+                Some(Val::I64(v)) => write_u64(data, base + ctx::x(0), gex_kernel::gpr(*v as u64)),
                 Some(Val::F32(v)) => {
                     write_u64(data, base + ctx::v(0), u64::from(*v));
                     write_u64(data, base + ctx::v(0) + 8, 0);

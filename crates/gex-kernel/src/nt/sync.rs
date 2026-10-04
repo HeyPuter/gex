@@ -148,6 +148,7 @@ impl SyncCore {
 pub fn wake_thread(c: &mut Call<'_>, t: &Thread) {
     let _ = c.g.w32(t.word, 1);
     c.p.futexes.wake(t.word, u32::MAX);
+    yield_kick(c);
 }
 
 fn wake_all(c: &mut Call<'_>, ts: Vec<Arc<Thread>>) {
@@ -294,7 +295,9 @@ pub fn wait_ex(
 }
 
 /// Sleep on `t`'s wait word while it reads 0, until woken or `timeout`.
-pub fn sleep_on_word(c: &Call<'_>, t: &Thread, timeout: Option<Duration>) {
+pub fn sleep_on_word(c: &mut Call<'_>, t: &Thread, timeout: Option<Duration>) {
+    // This thread is going idle: a yielder waiting for it to finish may go on.
+    yield_kick(c);
     let g = &c.g;
     let word = t.word;
     // A bounded slice even for "forever", so a process that is ending is
@@ -454,7 +457,7 @@ pub fn nt_delay_execution(c: &mut Call<'_>) -> R {
     let d = deadline(c, tp)?;
     let now = (c.p.clocks.mono_ns)();
     if d.is_some_and(|d| d <= now) {
-        std::thread::yield_now();
+        guest_yield(c);
         return Ok(st::SUCCESS);
     }
     let t = Arc::clone(&c.t);
@@ -478,9 +481,106 @@ pub fn nt_delay_execution(c: &mut Call<'_>) -> R {
 }
 
 /// `NtYieldExecution()`.
-pub fn nt_yield_execution(_c: &mut Call<'_>) -> R {
-    std::thread::yield_now();
+pub fn nt_yield_execution(c: &mut Call<'_>) -> R {
+    guest_yield(c);
     Ok(st::SUCCESS)
+}
+
+/// The yield park's generation word: in `KUSER_SHARED_DATA`'s page, past the
+/// structure (0x738 bytes), so every image and host finds it at one address.
+/// Bumped by everything another thread's yield loop may be waiting for
+/// (`yield_kick`): a thread blocking (going idle), a wake of a waiter, a
+/// thread ending. The ConcRT provider (gex-cgen/providers/msvcr120_concrt.c)
+/// bumps it the same way, with `memory.atomic.notify`, when its waits block
+/// and its wakes signal.
+pub const YIELD_GEN: u64 = super::USD + 0xff0;
+
+/// Something a yielding thread may be waiting for happened: bump
+/// [`YIELD_GEN`] and wake the threads parked on it.
+pub fn yield_kick(c: &mut Call<'_>) {
+    let g = c.g.u32(YIELD_GEN).unwrap_or(0);
+    let _ = c.g.w32(YIELD_GEN, g.wrapping_add(1));
+    if c.p.yield_parked.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        c.host.notify(YIELD_GEN);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Y {
+    Os,
+    Spin,
+    Sleep(u64),
+    Wake { park_us: u64, streak: u32 },
+}
+
+static YIELD_MODE: std::sync::OnceLock<Y> = std::sync::OnceLock::new();
+
+fn yield_mode(spec: Option<&str>) -> Y {
+    match spec {
+        Some("os") => Y::Os,
+        Some("spin") => Y::Spin,
+        Some(v) if v.starts_with("sleep:") => v[6..].parse().map(Y::Sleep).unwrap_or(Y::Os),
+        Some(v) if v.starts_with("wake:") => {
+            let mut it = v[5..].split(':');
+            let park_us = it.next().and_then(|x| x.parse().ok()).unwrap_or(50);
+            let streak = it.next().and_then(|x| x.parse().ok()).unwrap_or(2);
+            Y::Wake { park_us, streak }
+        }
+        _ => Y::Wake { park_us: 50, streak: 2 },
+    }
+}
+
+/// Set the yield policy (a `GEX_NT_YIELD` value) for a host whose process
+/// environment is not `std::env` (the browser's page settings). Before the
+/// first yield.
+pub fn set_yield_policy(spec: &str) {
+    let _ = YIELD_MODE.set(yield_mode(Some(spec)));
+}
+
+/// The guest's own yield (`SwitchToThread`, `Sleep(0)`).
+///
+/// Default (`GEX_NT_YIELD=wake[:PARK_US[:STREAK]]`, 50 and 2): a host
+/// `sched_yield`, as before -- until a thread yields more than STREAK times
+/// back to back (no other syscall between them; no clock is read, which in
+/// a browser Worker costs as much as a cheap syscall), i.e. it is spinning
+/// on work another thread does. Then each further yield parks on [`YIELD_GEN`]
+/// for at most PARK_US, and a [`yield_kick`] (another thread going idle,
+/// signalling, ending) ends the park at once. A spinner so gives its CPU to
+/// the threads it waits for, as a sleep would, without a sleep's fixed cost
+/// when what it waits for is already done (pewasm's host-generation wake).
+/// The bound keeps a loop waiting on something nothing kicks moving.
+///
+/// `GEX_NT_YIELD=os`: always `sched_yield` (which on Linux only lets another
+/// task on the same CPU's runqueue run). `spin`: nothing but a pause, as in
+/// pewasm, whose emscripten `sched_yield` yields to no one. `sleep:N`: a
+/// sleep of N µs.
+fn guest_yield(c: &mut Call<'_>) {
+    let m = *YIELD_MODE.get_or_init(|| yield_mode(std::env::var("GEX_NT_YIELD").ok().as_deref()));
+    match m {
+        Y::Os => std::thread::yield_now(),
+        Y::Spin => std::hint::spin_loop(),
+        Y::Sleep(us) => std::thread::sleep(Duration::from_micros(us)),
+        Y::Wake { park_us, streak } => {
+            thread_local! {
+                // (this thread's syscall count at its last yield, yields back to back)
+                static RUN: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+            }
+            let now = super::syscalls_here();
+            let (last, n) = RUN.with(|r| r.get());
+            let n = if now == last.wrapping_add(1) { n.saturating_add(1) } else { 0 };
+            let parked = n > streak && {
+                let g = c.g.u32(YIELD_GEN).unwrap_or(0);
+                c.p.yield_parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let ok = c.host.park(YIELD_GEN, g, Duration::from_micros(park_us));
+                c.p.yield_parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                ok
+            };
+            if !parked {
+                std::thread::yield_now();
+            }
+            RUN.with(|r| r.set((now, n)));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

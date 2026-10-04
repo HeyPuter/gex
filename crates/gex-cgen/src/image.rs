@@ -71,6 +71,7 @@ fn unit_inputs() -> String {
         .clone();
     // The flavor is part of the key: native and browser units never mix.
     let base = if unguarded() { format!("{base}:unguarded") } else { base };
+    let base = if narrow_stores() { base } else { format!("{base}:widest") };
     // So is the guest memory (docs/mem64.md): a wasm64 unit is a different
     // module. Nothing is added for wasm32, whose keys stay as they were.
     if gex_abi::mem64() {
@@ -78,6 +79,18 @@ fn unit_inputs() -> String {
     } else {
         base
     }
+}
+
+/// Store an i386 program's general-purpose registers to the low 32 bits of
+/// their 64-bit context slots, as pewasm's CpuState fields are 32-bit
+/// (3-4% of the wasm of Noita's large hot functions). Exact because every
+/// other writer of those slots zero-extends (efcb8bfc: the host's syscall
+/// results, signal frames, the NT layer's contexts; GEX_CHECK_I386_HIGH=1
+/// checks it), so the high half is always zero. `GEX_CGEN_NARROW_STORES=0`
+/// turns it off. In the unit key.
+pub fn narrow_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GEX_CGEN_NARROW_STORES").as_deref() != Ok("0"))
 }
 
 static UNGUARDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -301,7 +314,7 @@ fn read_recovery(dir: &Path) -> Result<Recovery> {
 /// The C a unit holds for the function at `entry`, from the cached recovery
 /// in `recovery` (`gexc cgen-c`): what to read when comparing one function's
 /// code with another backend's. `read` gives the image's bytes, for `ret N`.
-pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>) -> Result<String> {
+pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>, icall_hints: &HashMap<u64, u64>) -> Result<String> {
     let rec = read_recovery(recovery)?;
     let known: HashSet<u64> = rec.entries.iter().copied().collect();
     let mut gir = GirReader::open(recovery)?;
@@ -314,6 +327,7 @@ pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>)
         unit.ftab = true;
         unit.touched = rec.touched.clone();
         unit.guardfree = rec.guardfree.clone();
+        unit.icall_hints = std::sync::Arc::new(icall_hints.clone());
         unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
         unit.add(&f, &known, &rec.sums, &rec.trapfree)?;
         return Ok(unit.source());

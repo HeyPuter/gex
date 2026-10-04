@@ -141,6 +141,23 @@ pub struct Vm {
     /// (docs/mem64.md §3): private allocations that are not executable go
     /// there. `None` for every M32 process.
     pub high: Option<(u64, u64)>,
+    /// An exact layout's: nothing but its image ever takes a reserved range.
+    pub strict_reserved: bool,
+}
+
+/// The end of the user address space a fixed-address allocation or view
+/// may reach: `GUEST_LIMIT` (natively the guest owns the whole memory),
+/// lowered by a host that keeps its own data above the guest (the browser:
+/// 2 GiB, where its heap starts). Top-down and zero-bits allocation stop at
+/// `ALLOC_HIGH` regardless.
+static USER_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(gex_abi::GUEST_LIMIT);
+
+pub fn set_user_limit(limit: u64) {
+    USER_LIMIT.store(limit.min(gex_abi::GUEST_LIMIT), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn user_limit() -> u64 {
+    USER_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn align_up(v: u64, a: u64) -> u64 {
@@ -163,7 +180,7 @@ impl Vm {
 
     /// The highest address a region may end at, exclusive.
     pub fn limit(&self) -> u64 {
-        self.high.map_or(gex_abi::GUEST_LIMIT, |(_, hi)| hi)
+        self.high.map_or_else(user_limit, |(_, hi)| hi)
     }
 
     /// A free 64 KiB-aligned range of `size` bytes in the high arena, bottom-up
@@ -194,6 +211,9 @@ impl Vm {
         if !self.reserved.is_empty() {
             if let Some(b) = self.find_free_in(size, top_down, limit, true) {
                 return Some(b);
+            }
+            if self.strict_reserved {
+                return None;
             }
         }
         self.find_free_in(size, top_down, limit, false)
@@ -427,6 +447,7 @@ pub fn after_change(c: &mut Call<'_>, start: u64, end: u64, fresh: &[(u64, u64)]
     let mut k = c.kernel();
     if st.vm.mirror(&mut k.mem, start, end) {
         k.retired_code.push((start, end));
+        crate::note_code_change();
     }
     Ok(())
 }
@@ -698,6 +719,7 @@ pub fn nt_flush_instruction_cache(c: &mut Call<'_>) -> R {
         let start = addr & !(PAGE - 1);
         let end = align_up(addr + size, PAGE);
         c.kernel().retired_code.push((start, end));
+        crate::note_code_change();
     }
     Ok(st::SUCCESS)
 }

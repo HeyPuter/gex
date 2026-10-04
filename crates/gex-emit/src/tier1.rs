@@ -4916,6 +4916,10 @@ impl<'a> Emitter<'a> {
         self.f.br_table(&targets, n - 1);
         for k in (0..n).rev() {
             self.f.end();
+            if crate::dense::table(k as usize) {
+                crate::dense::emit_arm(&mut self.f, k as usize, self.ctx_local, index, entry, self.cx.block_ty);
+                continue;
+            }
             self.f.local_get(self.ctx_local);
             self.f.local_get(index);
             self.f.return_call_indirect(self.cx.block_ty, k);

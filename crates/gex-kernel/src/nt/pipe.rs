@@ -136,7 +136,7 @@ pub fn open_client(pipes: &Pipes, name: &str) -> R<Arc<dyn FileHandle>> {
 /// A synchronous read: data, or 0 once the writer has gone (end of file),
 /// waiting in between. Polls in short slices on the thread's wait word, so
 /// the process ending or an APC still gets through.
-pub fn read_blocking(c: &Call<'_>, h: &Arc<dyn FileHandle>, buf: &mut [u8]) -> R<usize> {
+pub fn read_blocking(c: &mut Call<'_>, h: &Arc<dyn FileHandle>, buf: &mut [u8]) -> R<usize> {
     let mut slice = Duration::from_micros(200);
     loop {
         match h.read_at(0, buf) {
@@ -147,14 +147,15 @@ pub fn read_blocking(c: &Call<'_>, h: &Arc<dyn FileHandle>, buf: &mut [u8]) -> R
         if c.p.terminating.load(Ordering::Relaxed) {
             return Err(Status(st::PIPE_BROKEN));
         }
-        super::sync::sleep_on_word(c, &c.t, Some(slice));
+        let t = std::sync::Arc::clone(&c.t);
+        super::sync::sleep_on_word(c, &t, Some(slice));
         slice = (slice * 2).min(Duration::from_millis(10));
     }
 }
 
 /// A synchronous write: all of `data`, waiting for room, or PIPE_BROKEN once
 /// the reader has gone.
-pub fn write_blocking(c: &Call<'_>, h: &Arc<dyn FileHandle>, data: &[u8]) -> R<usize> {
+pub fn write_blocking(c: &mut Call<'_>, h: &Arc<dyn FileHandle>, data: &[u8]) -> R<usize> {
     let mut done = 0;
     let mut slice = Duration::from_micros(200);
     while done < data.len() {
@@ -170,7 +171,8 @@ pub fn write_blocking(c: &Call<'_>, h: &Arc<dyn FileHandle>, data: &[u8]) -> R<u
         if c.p.terminating.load(Ordering::Relaxed) {
             return Err(Status(st::PIPE_BROKEN));
         }
-        super::sync::sleep_on_word(c, &c.t, Some(slice));
+        let t = std::sync::Arc::clone(&c.t);
+        super::sync::sleep_on_word(c, &t, Some(slice));
         slice = (slice * 2).min(Duration::from_millis(10));
     }
     Ok(done)

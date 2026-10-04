@@ -682,8 +682,8 @@ pub fn serve_cmpxchg16b(m: &mut GuestMem<'_>, ctx_addr: u64, addr: u64) {
         let _ = m.write_u64(addr, rbx);
         let _ = m.write_u64(addr + 8, rcx);
     } else {
-        let _ = m.write_u64(ctx_addr + ctx::x(0) as u64, lo);
-        let _ = m.write_u64(ctx_addr + ctx::x(2) as u64, hi);
+        let _ = m.write_u64(ctx_addr + ctx::x(0) as u64, crate::gpr(lo));
+        let _ = m.write_u64(ctx_addr + ctx::x(2) as u64, crate::gpr(hi));
     }
     LOCK.store(false, Ordering::Release);
     let _ = m.write(ctx_addr + ctx::ZF as u64, &[equal as u8]);
