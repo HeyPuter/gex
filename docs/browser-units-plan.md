@@ -150,6 +150,85 @@ merge/web9 @ this commit; merge/web9-fjit (worktree wt/web9f) = it + F's
   run the page with GEX_CGEN_CACHE/GEX_WINE_PREFIX pointing there
   (absolute paths: the bundle symlinks the prefix).
 
+### Design: unguarded units in the browser (stream B, 2026-10-04)
+
+**What the guard protects today: almost nothing.** A browser NT process
+shares one linear memory between the guest (below 2 GiB, `ALLOC_HIGH`
+0x7fff0000) and the shim (statics and stack at 0x0600_0000..0x0700_0000,
+`--global-base`; heap from `NT_HEAP_BASE` 0x8000_0000 up to the memory's
+maximum 0xffff0000).
+- Tier-1 guards at 2 GiB (`set_guard_limit(NT_HEAP_BASE)`, a runtime
+  value).
+- Units and providers guard at `GEX_GUEST_LIMIT`, a *compile-time*
+  constant from gex-abi: 0xffff0000, the memory's end. So a guarded unit's
+  wild access in 2..4 GiB lands in the shim's heap exactly as an unguarded
+  one would. The only accesses the guard changes are those at or past
+  0xffff0000, which trap anyway past the memory's maximum. In the browser
+  today, guarded and unguarded units behave the same; the guard is pure
+  cost (pewasm: MEMCHECK=0, worth about 1.2x by itself).
+- The shim's statics and stack (0x0600_0000..) are below 2 GiB, so every
+  tier can reach them. The NT VM keeps them unallocated, nothing more.
+
+**Step 0: unguarded browser units now (small, no layout change, no
+safety lost).**
+- The page picks the flavor: `cgen=2&unguarded=1` (default on, once A/B'd)
+  sets `gex_cgen::image::set_unguarded(true)` in the shim before the first
+  key, so the keys are the native `:unguarded` ones.
+- Build them with gexc **without** GEX_CGEN_GUARD=1, into another cache:
+  the same units as natively, at the page's bases.
+- A/B: guarded `target/bnoita3` against unguarded `target/bnoita3u`, paired
+  with pewasm, seed pinned.
+- Cost: about 2-3 h of clang (noita.exe plus the prefix) on 0,2,6,8 at
+  nice 19, a shim flag, a page flag. Native unguarded units for these
+  bases are what `gexc run --cgen` builds anyway, so a prefix with Noita's
+  layout may already be in `~/.cache/gex/cgen` (check the keys first).
+
+**Step 1: isolation without a guard, the biased guest (the real fix;
+large).** Guest address `a` of a 32-bit NT process lives at linear
+`a + 0x8000_0000`. The shim takes 0..2 GiB (runtime low area, dispatch
+directory, statics, stack and heap); the guest takes 2 GiB..4 GiB-64 KiB.
+- **The access:** `GEX_P(a)` becomes `(char *)(uintptr_t)(uint32_t)a +
+  0x80000000u`. clang folds the constant into the memarg offset (to verify
+  on the unit C: needs an `inbounds` GEP on a 32-bit base). The wasm
+  effective address is a 33-bit sum, so `a >= 0x7fff0000` traps past the
+  memory's end. That is the bounds check, free. A displacement of up to
+  0xffff rides along in the same memarg.
+- **Isolation:** no guest address names a shim byte. Better than today,
+  where every tier reaches the shim's statics.
+- **What changes:**
+  - gex-cgen: GEX_P and GA (providers), and the guest base goes into the
+    unit key as a flavor (natively 0, unchanged).
+  - gex-emit tier-1: the base in its memarg, for an NT i386 process only,
+    and the guard drops for i386.
+  - The shim: `guest_bytes()` starts at the base (GuestMem is already a
+    slice, so the kernel's accesses follow), the memmap, code fetch for
+    translation, and `NT_HEAP_BASE` and `--global-base` move below the
+    base.
+  - Every JS reader of guest pointers needs the base added:
+    gl-bridge.mjs, wl-bridge.mjs, host.mjs, worker.mjs, gex.mjs, and
+    web/src mesa-gl, gl, compositor-worker, dom-compositor.
+  - Thread contexts and the dispatch directory stay low; they are runtime
+    addresses, not guest ones. Linux processes and 64-bit guests keep
+    base 0 and the guard.
+- **Risks:** any host path that treats a guest pointer as a linear one
+  silently reads the shim's memory. A debug mode with the base at
+  0x4000_0000 (and the guest capped at 1 GiB) would make such a bug fault
+  or show garbage early.
+- **Estimate:** the emitter and header changes are small. The JS and shim
+  audit is most of the work, plus the gates and Noita, Peggle and
+  Half-Life in the page.
+
+**Rejected:**
+- *Mask (`a & 0x7fffffff`):* one AND per access, but isolation by silent
+  aliasing (a wild pointer corrupts guest memory instead of faulting).
+  Fallback only.
+- *Multi-memory (shim in its own memory):* Rust/LLVM cannot target it for
+  the shim's code, and every host accessor of guest memory would change.
+  Step 1 gets the same isolation inside one memory.
+
+Order: step 0 first (it is the performance, and it is as safe as today),
+then step 1 for isolation, after the coordinator agrees.
+
 ## Where the page is now
 
 Noita in headless Chromium, hardware WebGPU, full speed: about 4.2
