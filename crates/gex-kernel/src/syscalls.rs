@@ -486,6 +486,11 @@ pub struct Kernel {
     /// ones (see `crate::i386`). Set at exec from the image's class,
     /// inherited across fork.
     pub compat: bool,
+    /// Set by a syscall that may have made a descriptor readable or
+    /// writable for someone else (a write, a read that freed room, a close,
+    /// a signal); the host takes it after the call and wakes threads parked
+    /// on descriptors ([`Kernel::take_fd_activity`]).
+    pub fd_activity: bool,
     /// The i386 process entered through the non-rt `sigreturn` (119), whose
     /// frame is laid out differently from `rt_sigreturn`'s. Set at entry,
     /// consumed by `sigreturn`.
@@ -1096,6 +1101,7 @@ impl Kernel {
             armed_place: None,
             armed_pin: None,
             compat: false,
+            fd_activity: false,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1320,6 +1326,7 @@ impl Kernel {
             armed_place: None,
             armed_pin: None,
             compat: self.compat,
+            fd_activity: false,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1499,6 +1506,8 @@ impl Kernel {
         } else {
             raw
         };
+
+        self.fd_activity |= wakes_fd_waiters(n);
 
         // Returning from a handler restores a whole context, so it cannot go
         // through the normal "write x0 and continue" path.
@@ -2077,6 +2086,12 @@ impl Kernel {
     }
 
     /// Finish a syscall whose blocking half the host has now run.
+    /// Whether a syscall since the last call may have changed descriptor
+    /// readiness ([`Kernel::fd_activity`]), clearing it.
+    pub fn take_fd_activity(&mut self) -> bool {
+        std::mem::take(&mut self.fd_activity)
+    }
+
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
@@ -2172,6 +2187,14 @@ impl Kernel {
             nr::FSTAT => self.sys_fstat(m, a[0] as i32, a[1]),
             nr::NEWFSTATAT => self.sys_fstatat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::STATX => self.sys_statx(m, a[0] as i32, a[1], a[2], a[4]),
+            // F_GETLK and F_OFD_GETLK: nobody holds a lock (see
+            // `sys_fcntl`), so the answer is l_type = F_UNLCK, which is the
+            // first field in every `struct flock` layout (i386's flock and
+            // flock64, x86-64's, wasm32's).
+            nr::FCNTL if a[1] == 5 || a[1] == 36 => self.fds.get(a[0] as i32).and_then(|_| {
+                const F_UNLCK: u16 = 2;
+                m.write(a[2], &F_UNLCK.to_le_bytes()).map(|_| 0)
+            }),
             nr::FCNTL => self.sys_fcntl(a[0] as i32, a[1], a[2]),
             nr::IOCTL => self.sys_ioctl(m, a[0] as i32, a[1], a[2]),
             nr::FTRUNCATE => self
@@ -2320,7 +2343,12 @@ impl Kernel {
             // treat the socket as broken.
             nr::SETSOCKOPT => Ok(0),
             nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
-            nr::SHUTDOWN => self.fds.get(a[0] as i32).map(|_| 0),
+            // A unix socket's directions close as asked; any other socket
+            // (the proxied network, the global kernel's) just agrees.
+            nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
+                Ok(sock) => sock.shutdown_how(a[1]),
+                Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+            },
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends
             // and gives up if that fails.
@@ -3542,6 +3570,9 @@ impl Kernel {
         const F_SETFL: u64 = 4;
         const F_SETLK: u64 = 6;
         const F_SETLKW: u64 = 7;
+        // Open file description locks: the same story.
+        const F_OFD_SETLK: u64 = 37;
+        const F_OFD_SETLKW: u64 = 38;
         const F_ADD_SEALS: u64 = 1033;
         const F_GET_SEALS: u64 = 1034;
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -3573,7 +3604,7 @@ impl Kernel {
             }
             // Advisory locks always succeed: gex runs one process tree over
             // one namespace, so there is nobody to contend with.
-            F_SETLK | F_SETLKW => {
+            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
                 self.fds.get(fd)?;
                 Ok(0)
             }
@@ -4106,7 +4137,7 @@ impl Kernel {
 
     fn sys_mkdirat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
-        self.vfs.mkdir(&p, mode).map(|_| 0)
+        self.vfs.mkdir(&p, mode & !self.umask).map(|_| 0)
     }
 
     fn sys_unlinkat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
@@ -6110,6 +6141,44 @@ impl Kernel {
 /// This is deliberately a list of what does *not* need it rather than what
 /// does: forgetting to exclude a syscall costs a little speed, while
 /// forgetting to include one would serve a stale `/proc`.
+/// Whether canonical syscall `n` can change another thread's descriptor
+/// readiness (or signal state): what a host parking threads on descriptors
+/// must wake them for. Over-approximate (any read or write, of any file);
+/// futexes, clocks, memory and the like are left out because they are the
+/// hot calls and never make a descriptor ready.
+pub fn wakes_fd_waiters(n: u64) -> bool {
+    matches!(
+        n,
+        nr::WRITE
+            | nr::WRITEV
+            | nr::PWRITE64
+            | nr::READ
+            | nr::READV
+            | nr::PREAD64
+            | nr::SENDTO
+            | nr::SENDMSG
+            | nr::SENDMMSG
+            | nr::SENDFILE
+            | nr::RECVFROM
+            | nr::RECVMSG
+            | nr::RECVMMSG
+            | nr::CLOSE
+            | nr::CLOSE_RANGE
+            | nr::DUP3
+            | nr::SHUTDOWN
+            | nr::CONNECT
+            | nr::ACCEPT
+            | nr::ACCEPT4
+            | nr::LISTEN
+            | nr::EXIT
+            | nr::EXIT_GROUP
+            | nr::KILL
+            | nr::TKILL
+            | nr::TGKILL
+            | nr::TIMERFD_SETTIME
+    )
+}
+
 pub fn skips_proc_snapshot(n: u64) -> bool {
     matches!(
         n,
