@@ -1111,3 +1111,20 @@ profiles `scratchpad/fjit/peg-cgn*.prof`).
 **Engine.** wasmtime 27 (Cranelift 0.114) has no regalloc-algorithm
 setting; the only lever is an upgrade (wasmtime 49 / regalloc2 0.15 is in
 the cargo registry). Held by the coordinator until R's main-thread work.
+
+**Peggle coverage (4ef8049d).** wsock32, iphlpapi, dnsapi and nsi are in
+tools/nt-cgen-core.txt, appended to the staged layout (8 lines, none
+moved; sha256 541eac20...). --cgen, null display: 25.6, 25.5 fps (23.7,
+24.4 before). bass.dll stays on tier-1: it is packed (its first section
+has entropy 7.99, a writable-executable stub at the entry), so its code
+exists only after the stub runs, and it is linked at 0x10000000 like
+j2k-codec without DYNAMIC_BASE, so ntdll relocates it (to 0x3e80000) after
+the map, which is why no unit is looked up (`moved_static`). A unit would
+need the unpacked bytes, snapshotted after unpacking and keyed by their
+hash at the load address. It had no samples in gameplay, so it is not
+worth that. What tier-1 remains (1.6% of guest) is popcapgame1 functions
+recovered but not in the unit (0x52a1dd.., about 1.4%) and ddraw interiors.
+
+The wasmtime 49 A/B was cancelled: native gexc is the debugging tool, and
+the performance target is the browser page against pewasm in the page.
+Codegen changes are measured under V8 (node or the page) from here on.
