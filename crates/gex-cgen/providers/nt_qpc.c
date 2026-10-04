@@ -1,4 +1,4 @@
-/* PROVIDES ntdll.dll i386 native
+/* PROVIDES ntdll.dll i386
  *
  * RtlQueryPerformanceCounter without a syscall. Wine's i386 ntdll makes
  * NtQueryPerformanceCounter for each call (no TSC bypass in this build),

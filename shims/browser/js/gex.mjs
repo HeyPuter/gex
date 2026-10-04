@@ -2488,7 +2488,17 @@ export class Gex {
         // A stateful provider's is this Worker's (one C stack per thread).
         __stack_pointer: memBase ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
       },
-      gex: { ...this.#imports, lookup: st.lookup, ftab: st.ftab, ...(memBase ? this.#providerImports() : {}) },
+      gex: {
+        ...this.#imports, lookup: st.lookup, ftab: st.ftab,
+        // Built-in providers' host functions (gex-cgen/providers): nt_qpc's
+        // clock, crt_heap's pages.
+        ...(prov >= 0 ? {
+          // The shim's exports themselves: a wasm-to-wasm call, no JS.
+          nt_qpc: e.gex_nt_qpc,
+          provider_alloc_top: e.gex_provider_alloc_top,
+        } : {}),
+        ...(memBase ? this.#providerImports() : {}),
+      },
     });
     if (memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     const n = regsOf(0, 0) >>> 0;
@@ -2520,7 +2530,9 @@ export class Gex {
   #providerStack() {
     if (!this.#provStack) {
       const size = 1 << 20;
-      const base = this.#shim.exports.gex_provider_alloc(size) >>> 0;
+      // Top down unless an ejected project's providers are set (cgen.rs).
+      const e = this.#shim.exports;
+      const base = (e.gex_provider_stack ? e.gex_provider_stack(size) : e.gex_provider_alloc(size)) >>> 0;
       if (!base) throw new Error('gex-nt: no memory for a provider stack');
       this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
     }
@@ -2555,6 +2567,7 @@ export class Gex {
       provider_time: (which) => (which === 0 ? Date.now() / 1000 : performance.now() / 1000),
       provider_missing: (addr) => e.gex_provider_missing(addr),
       provider_alloc: (size) => e.gex_provider_alloc(size),
+      provider_alloc_top: (size) => e.gex_provider_alloc_top(size),
       provider_log: (ptr, len) => {
         console.error(new TextDecoder().decode(this.#bytes().slice(ptr >>> 0, (ptr >>> 0) + (len >>> 0))));
       },

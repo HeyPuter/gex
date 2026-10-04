@@ -48,9 +48,6 @@ fn real_main() -> Result<ExitCode> {
     let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c");
     let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
     gex_cgen::image::set_unguarded(native && !guard);
-    // The `native` providers too: a guarded build is for the browser's units,
-    // whose host has none of their imports.
-    gex_cgen::provider::set_native_host(native && !guard);
     match argv[1].as_str() {
         "run" => {
             // On a thread with a guest-sized stack: the first guest thread

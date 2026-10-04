@@ -1,4 +1,4 @@
-/* PROVIDES msvcr120.dll i386 stateful native nowine
+/* PROVIDES msvcr120.dll i386 stateful nowine
  *
  * The CRT heap as native wasm (docs/merge-plan.md §9.9.2 step 4): dlmalloc
  * (2.8.6, as pewasm's dlmalloc32.inc) in place of msvcr120's heap over
