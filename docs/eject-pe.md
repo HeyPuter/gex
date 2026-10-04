@@ -548,6 +548,64 @@ what pewasm runs.
 
 Each phase gets its own page ABBA, and stays only if it gains.
 
+### As built (G1-G3)
+
+- **G1:** `nt_cgen::prepare_group`, `gex_cgen::image::build_group_module`,
+  the native install (`install_placed`: members held, then the group), the
+  browser install (gex.mjs `#cgenGroup`, shim `gex_cgen_hold` /
+  `gex_cgen_group`: `groups/<key>` published as a unit with the members'
+  pages, then each member's providers and region entries), user/eject.json
+  `link_groups`. cxx.exe + ucrtbase on gex-rt: 24 IAT sites direct, same
+  output as the recording.
+- **G2** (`GEX_GROUP_PROVIDERS=1` at build): each member's stateless
+  providers compiled into the group as translation units of their own
+  (`provider::group_source`: no `GEX_PROVIDE` exports, a `gexg_<provider>_<fn>`
+  per bound function), the export addresses served by bodies of the group
+  that tail-call them (`FnUnit::add_provider_body`), and IAT calls to them
+  hinted. Stateful providers (crt_heap, Lua) stay modules of their own.
+- **G3** (`GEX_GROUP_LTO=1` at build): bitcode objects (`-flto=thin`, its own
+  object keys) and `wasm-ld --lto-O2 --thinlto-jobs`, with
+  `-switch-to-lookup=false` at link time.
+- Both switches are in the group's key.
+
+### Scoreboard: the ejected page against pewasm's page
+
+World fps from world-up+90 s to the end of a 330 s run, world seed pinned
+(1767225600) on both, 4x clock, hardware WebGPU in headless Chromium,
+cores 5,11 (builds on 0,2,6,8 throughout). pewasm is `port/browser.mjs`
+on stream B's build. Means of the legs; ratio against the pewasm legs of
+the same sequence.
+
+| date | change | ejected | pewasm | ratio |
+| --- | --- | --- | --- | --- |
+| 10-04 | guarded browser units (`p-noita12w`) | 39.2, 37.8 | 55.6, 59.5 | 0.67 |
+| 10-04 | unguarded cg14 units + yield `os` (`p-noita14y`) | 47.2, 51.0 | 58.8, 56.7 | 0.85 |
+| 10-04 | + wake-on-idle yield (hand port) | 62.7, 66.1 | 58.8, 56.7 | 1.11 |
+| 10-04 | integ merge: nt_qpc, crt_heap, concrt provider kick (`p-noita15`, G0) | 67.7, 66.3 | 58.8, 59.1 | 1.14 |
+| 10-04 | G1: noita.exe + msvcr120 + msvcp120 linked as one group | 67.3, 62.6 | 58.8, 59.1 | 1.10 (not kept) |
+
+Notes:
+- G1 is installed and correct on both runtimes (members held, the group
+  placed in 1.7 s, 111,811 entries, 149 MiB), but does not gain: the
+  devirtualised IAT calls are a compare and a direct call instead of a probe
+  and a `call_indirect`, and without inlining that is not where the time is.
+  `link_groups` stays opt-in.
+- In the G0 page, Noita's main thread (ctx 0x1000) spends about 2.0 s of
+  every 10 s in NT calls: NtDuplicateObject and NtClose at about 4,900 a
+  second each (about 20 us a call in the page), all from msvcp120's
+  `_Thrd_current` (native `GEX_NT_SYSCALL_SITES=1`). It duplicates the
+  current thread's handle, closes it at once, and returns the closed value
+  with the id. The `msvcp120_thrd` provider returns {0, id} without either.
+- The yield park is a real `memory.atomic.wait32`. Per 10 s (all threads):
+  about 17,700 parks woken by a kick (2.7 s in all), 5,900 timed out
+  (0.7 s); kernel kicks about 25, so the ConcRT provider's kicks do the
+  waking. guest_yield's time in a V8 profile is blocked time, not spin.
+- **Every edit to crates/gex-cgen re-keys every unit**
+  (`GEX_CGEN_UNIT_INPUTS` hashes all of its .rs and .h). Objects are cached
+  by C text, so a re-key costs emission and links (about 15 min for
+  noita.exe), but the native build and the shim must come from the same
+  gex-cgen tree, or the page misses units by key.
+
 ## 7. Phases
 
 | | what | gate |
