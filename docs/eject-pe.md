@@ -244,6 +244,25 @@ original function is untouched: the region is a second copy of its tail.
     the conservative set for exception resumes and can be cut later by
     profile.
 
+  **As built** (`nt_cgen::prepare_regions`; a module per image at
+  `<cache>/regions/<unit key>/`, outside the unit's key, installed after the
+  unit):
+  - the recorded entries the unit lacks (resumes, leaves), the recorded
+    indirect-call targets it lacks, and the user's seeds;
+  - **every call continuation of a function with a recorded continuation.**
+    Once one resume discards a function's frame, the rest of that function
+    runs from regions, whose frames the next resume discards in turn. The
+    recording saw only the first such entry, because tier-1 ran the rest.
+    The function is the unit's nearest entry at or below the PC (seh: 2
+    recorded, 52 built; cxx: 9 recorded, 38);
+  - **closed under direct calls and tail calls**: a callee the unit lacks
+    (code that recovery reaches only from a landing pad) is a region
+    function too (cxx: 9 more). In the recording, tier-1 called these
+    directly, so they never reached a lookup and were never logged.
+
+  One function per region PC: gex-cgen has no multi-entry functions, so a
+  function with n continuations costs about n/2 copies of itself.
+
 ### 3.4 The coverage report (build fails loudly)
 
 `build.sh` lists every address the session ran without AOT code (§1.3),
@@ -527,23 +546,20 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   recovery as seeds, but recovery does not make functions of them (they
   sit inside another function's loop). Waiting on R's nested faults and
   F's interior entries.
-- **State at the reboot (2026-10-03, WIP):** region entries (§3.3) are
-  implemented: `nt_cgen::prepare_regions` recovers a function entered at
-  each recorded interior PC (`func::recover_one`, the unit's entries as
-  strong starts), lowers it with gex-cgen's existing write_recovery and
-  build_c_module (no gex-cgen change), into `<cache>/regions/<unit key>/`;
-  `install_regions` publishes it after the unit. The eject build sends
-  every recorded entry the unit lacks (and indirect-call targets, user
-  seeds) there; units are no longer re-recovered with seeds, so they stay
-  F's. Not green yet: seh's region module holds 2 of its recorded PCs but
-  the run still stops at 0x401715 (seh.exe+0x1715, a call continuation)
-  -- next: check whether 0x401715 is in the region module's entries
-  (`build/units/regions/*/c.entries`), and if it is, why the lookup
-  misses it (install order, or the ftab map's newest-wins). cxx's build
-  failed in a kernelbase unit clang step (log
-  scratchpad/eject9/cxx-x86.build.log) -- rerun to see if it was load.
-  Then: cg12 (F), Noita on gex-rt at the new keys, cxx/seh retry. The
-  glcompat "a query's result" flake (2/5 on gexc and gex-rt) is for R.
+- **Region entries (§3.3), 2026-10-04:** `nt_cgen::prepare_regions`
+  recovers a function entered at each PC (`func::recover_one`, with the
+  unit's entries as strong starts) and lowers it with gex-cgen's existing
+  write_recovery and build_c_module (no gex-cgen change) into
+  `<cache>/regions/<unit key>/`; `install_regions` publishes it after the
+  unit. The units stay F's, unseeded. The set is the recorded entries,
+  plus every call continuation of their functions, closed under direct
+  calls (see §3.3). An AOT-only branch to non-executable memory now raises
+  the guest's access violation instead of stopping. **seh, seh traps, cxx
+  and apc pass ejected on gex-rt**, and so does the rest of tests/nt x86
+  (hello_args, sync, mtx, crtmem, tls, icall, user_win, gdi, exitproc,
+  input, display, window, lowmem, filemap, glcompat). jitcode, detour and
+  pagespan stop loudly, as designed. cxx's earlier kernelbase clang failure
+  was a SIGTERM from the session ending, not a build error.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
