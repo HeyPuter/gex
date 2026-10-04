@@ -579,6 +579,31 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
      small on Noita's big functions.
   4. Run on gex-rt (`PROJECT=... run-ejected.sh`), check 0 translations,
      then the fixed-seed pewasm pairing (step 3 of the plan), then E8.
+- **Noita on cg12 (2026-10-04):** recorded with F's complete cg12 units
+  (`noita/rec`, 420 s, noita.exe's unit 100,222 entries/128 MiB placed in
+  117 s, world at 293 s), ejected (`p-noita12`: 38 images, 58 files,
+  96 MB) and built reusing every unit by key. Region entries stay small:
+  none in noita.exe; sechost 2 recorded -> 7, combase 2 -> 6, lua51 82
+  (+7 by direct calls), 6 MB in all. On gex-rt: no translations, no
+  tier-1 blocks, world-up 20-29 s unloaded, resumes 10 (NtContinue into
+  ntdll, and the sechost/combase region entries), provider_try ~1.4 per
+  world frame, no throws.
+  - The first eject had no `runtime/gex-rt` (GEX_RT unset, gex-rt lives in
+    `target/x86-rt`), so run.sh fell back to gexc's AOT-only mode without a
+    word. Eject now refuses a Windows program's project without gex-rt
+    (bd65f052).
+  - One run of nine (on gexc AOT-only, under load) stalled in loading at
+    t=28 s, just before the three NtContinue resumes (presents 235,
+    provider_try 1762, resumes 7); the stats thread then blocked in the
+    60 s report. Six gex-rt runs (`hanghunt.sh`, watchdog with eu-stack)
+    did not reproduce it.
+  - **Neither fixed-time variable pins Noita's world.** "Setting random
+    seed" differs every run on pewasm (PEWASM_FIXED_TIME) and on gex,
+    also with the guest wall clock frozen. noita.exe 0x883540: the world
+    seed is the WORLD_SEED magic number (0x1206fe8) if set, else drawn from
+    the engine RNG, which is seeded at start-up through a config callback
+    (0xddcac0, the line's printer). The "fixed seed" pairings above were
+    random-seed pairings; pinning needs WORLD_SEED on both runtimes.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
