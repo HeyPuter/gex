@@ -193,18 +193,35 @@ three are Mono (MonoBleedingEdge), not IL2CPP. Run them in place from the
 Steam install, read-only; write prefixes, homes and logs elsewhere.
 
 State as of 2026-10-03: none reaches its menu on gex yet. Every one of them
-needs more address space than a wasm32 guest has (below).
+needs more address space than a wasm32 guest has (below), which `--mem64`
+now provides; Muck gets through engine start-up (GL device on the host GPU,
+Mono) and is loading its C# assemblies.
 
 ### Running
 
-- **Muck:** guest GL for x86-64 (`GEX_CC=gcc guest/gl/build.sh DIR`), an X
-  display (a private `Xvfb :N` on the host works natively), and
-  `gexc run --fjit --gl --wayland $XDG_RUNTIME_DIR/x --wayland-out DIR
-  --env LD_LIBRARY_PATH=DIR --env DISPLAY=:N --env HOME=... ./Muck.x86_64
-  -logFile LOG -screen-width 800 -screen-height 600 -screen-fullscreen 0`.
-  Unity 2019.4's SDL is X11-only (GLX through gex-gl's libGL).
+All three need a 64-bit guest memory: `gexc run --mem64` (docs/mem64.md), or
+nothing at all after the first run, which records the image when it runs out
+of address space.
+
+- **Muck** (natively): guest GL for x86-64 (`GEX_CC=gcc guest/gl/build.sh
+  DIR`) and an X display. gex has no host unix-socket passthrough natively,
+  so the guest reaches a private Xvfb over TCP through a loopback-only bridge
+  (an Xvfb listening on TCP itself would be open to the network):
+
+  ```
+  Xvfb :71 -screen 0 1280x720x24 &
+  socat TCP-LISTEN:6071,bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/tmp/.X11-unix/X71 &
+  GEX_FJIT_CACHE=1 gexc run --fjit --mem64 --gl --wayland $XDG_RUNTIME_DIR/x \
+    --wayland-out DIR --env LD_LIBRARY_PATH=GLDIR --env DISPLAY=localhost:71 \
+    --env HOME=... --env MONO_DEBUG=explicit-null-checks \
+    ./Muck.x86_64 -logFile LOG -screen-width 800 -screen-height 600 -screen-fullscreen 0
+  ```
+
+  Unity 2019.4's SDL is X11-only (GLX through gex-gl's libGL). Its window's
+  frames are presented by gex-gl on the host GPU and written to DIR
+  (`GEX_PPM_EVERY=N`, `GEX_FPS=1`).
 - **Hollow Knight / Rain World:** a staged prefix (`tools/nt-stage-wine.sh`),
-  `gexc run --fjit --wine-prefix P --gl --wayland-out DIR game.exe`.
+  `gexc run --fjit --mem64 --wine-prefix P --gl --wayland-out DIR game.exe`.
   Hollow Knight's build has no OpenGL renderer (`-force-glcore` fails with
   "OpenGL Core was not built"), so it needs D3D11 on wined3d. Rain World:
   `--env WINEDLLOVERRIDES=winhttp=b` keeps BepInEx's doorstop proxy
@@ -217,14 +234,28 @@ needs more address space than a wasm32 guest has (below).
   The general fix is low-page protection in gex: a fault on an access below
   the guest's floor, which other runtimes that rely on null faults (JVMs,
   .NET) need as well.
+- **Start-up time.** Under `--fjit` the first run spends almost all of its
+  time translating code it has not seen (Cranelift about 60%, recovery about
+  15%): Muck took over 15 minutes of wall time to reach Mono's assembly load,
+  which takes 0.1 s natively. `GEX_FJIT_CACHE=1` keeps compiled
+  translations on disk (about 150 KB each, about 1 GB for Muck's start-up)
+  so later runs load them; AOT units for UnityPlayer.so and libmonobdwgc are
+  the larger lever.
+- **What Unity needed from the kernel:** `sched_getparam` and friends (Mono
+  aborts when `pthread_getschedparam` fails), `/proc/stat`, and
+  priority-inheritance futexes (`FUTEX_LOCK_PI`/`UNLOCK_PI`; without them a
+  `PTHREAD_PRIO_INHERIT` mutex never woke its waiter and the player
+  deadlocked with every thread asleep). On Windows: crypt32's Unix side,
+  rsaenh's registration, `NtNotifyChangeKey`, `NtRenameKey`, in-process named
+  pipes (`CreatePipe`), `SystemSupportedProcessorArchitectures`.
 - **Steam.** Without a Steam client, Muck's Host Lobby does nothing (its
   game is a Steam lobby; there is no offline mode), so Muck's gameplay needs
   an x86-64 gex-steam with lobby and loopback P2P. Hollow Knight stops on its
   title screen natively without Steam; Rain World gets through EOS errors.
 - Knobs: `GEX_FPS=1` (presents per second), `GEX_PPM_EVERY=N`,
   `--wayland-out null`, `GEX_STRACE_STACK=N` (stack words at each syscall
-  under `--strace`), and `GEX_NT_TRACE` now logs each
-  NtAllocateVirtualMemory request.
+  under `--strace`), `GEX_NT_TRACE` (logs each NtAllocateVirtualMemory
+  request), `GEX_FJIT_CACHE=1`.
 
 ### Address space: why none fits in wasm32
 
