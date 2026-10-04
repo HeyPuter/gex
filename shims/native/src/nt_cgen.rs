@@ -283,6 +283,111 @@ fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(std::path::Pa
     Ok((path, gex_cgen::provider::slot_names(&wasm)?))
 }
 
+/// Region entries (docs/eject-pe.md §3.3): functions entered at interior
+/// addresses of an image -- a call continuation or a handler's resume point
+/// inside another function, where control can arrive once the frames that
+/// were running it are gone -- each running the rest of its code under the
+/// same `F_body` contract. Built ahead of time (an ejected project records
+/// which ones it needs) into a module of their own beside the image's unit,
+/// at `<cache>/regions/<unit key>/`, and installed after it; outside the
+/// unit's key, so the unit itself is unchanged.
+fn regions_dir(unit: &std::path::Path) -> Option<std::path::PathBuf> {
+    let key = unit.parent()?.file_name()?;
+    Some(cache_root().ok()?.join("regions").join(key))
+}
+
+/// Build the region module for the image at `base` (whose unit is `unit`):
+/// one function per address of `pcs` the unit has no entry for. Returns the
+/// addresses it could not make a function of. Rebuilt only when `pcs`
+/// change.
+#[cfg(feature = "translate")]
+pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Path, pcs: &[u64], jobs: usize) -> Result<Vec<u64>> {
+    use gex_xlate::func::{self as func, Code, RecoverOptions, Source};
+    let dir = regions_dir(unit).ok_or_else(|| anyhow!("no cache for region entries"))?;
+    let have: std::collections::HashSet<u64> = gex_cgen::image::read_entries(unit)?.into_iter().collect();
+    let pv = provided(pe, base);
+    let mut want: Vec<u64> = pcs.iter().copied().filter(|a| !have.contains(a) && pv.stubs.binary_search(a).is_err()).collect();
+    want.sort_unstable();
+    want.dedup();
+    let list = want.iter().map(|a| format!("{a:#x}\n")).collect::<String>();
+    if want.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Ok(Vec::new());
+    }
+    if std::fs::read_to_string(dir.join("pcs.txt")).ok().as_deref() == Some(list.as_str()) && dir.join("c.wasm").exists() {
+        let got: std::collections::HashSet<u64> = gex_cgen::image::read_entries(&dir.join("c.wasm"))?.into_iter().collect();
+        return Ok(want.into_iter().filter(|a| !got.contains(a)).collect());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let (image, seeds) = func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
+    let code = Code::with_elf(&image, None);
+    let (mut starts, _) = func::seeds(&code, None, false);
+    for &(a, src) in &seeds.starts {
+        if code.is_code(a) {
+            starts.entry(a).or_default().add(src);
+        }
+    }
+    // The unit's functions bound every region: reaching one is a call or a
+    // tail call into the unit, as in the function it continues.
+    for &e in &have {
+        starts.entry(e).or_default().add(Source::Call);
+    }
+    let noreturn = std::collections::BTreeSet::new();
+    let mut batch = std::collections::BTreeMap::new();
+    let mut failed = Vec::new();
+    for &pc in &want {
+        let mut st = starts.clone();
+        let f = func::recover_one(&code, pc, &mut st, &noreturn, &RecoverOptions::default());
+        match f.verify() {
+            Ok(()) => {
+                batch.insert(pc, f);
+            }
+            Err(e) => {
+                eprintln!("[regions] {pc:#x}: recovered malformed ({e})");
+                failed.push(pc);
+            }
+        }
+    }
+    let sums = gex_xlate::summary::analyze_functions(&batch).map;
+    let funcs = gex_cgen::select(batch.into_values().collect(), &HashMap::new(), &std::collections::HashSet::new())?;
+    let recovery = dir.join("recovery");
+    gex_cgen::image::write_recovery(&recovery, &funcs, &sums, image.class32)?;
+    let byte = |a: u64| image.segments.iter().find_map(|s| a.checked_sub(s.vaddr).and_then(|o| s.bytes.get(o as usize)).copied());
+    let out = dir.join("c.wasm");
+    gex_cgen::image::build_c_module(&recovery, &dir.join("work"), &cache_root()?.join("objects"), &out, jobs, &byte, &Default::default(), &HashMap::new())?;
+    let _ = std::fs::remove_dir_all(dir.join("work"));
+    std::fs::write(dir.join("pcs.txt"), &list)?;
+    let got: std::collections::HashSet<u64> = gex_cgen::image::read_entries(&out)?.into_iter().collect();
+    let more: Vec<u64> = want.iter().copied().filter(|a| !got.contains(a) && !failed.contains(a)).collect();
+    failed.extend(more);
+    Ok(failed)
+}
+
+/// The region module beside the unit at `unit`, if one was built.
+pub fn region_module(unit: &std::path::Path) -> Option<std::path::PathBuf> {
+    regions_dir(unit).map(|d| d.join("c.wasm")).filter(|p| p.exists())
+}
+
+/// Install `p`'s region module, if its build made one, after its unit.
+fn install_regions(
+    p: &Pending,
+    pl: &Placed,
+    shared: &Arc<Mutex<JitShared>>,
+    engine: &Engine,
+    cache: Option<&(std::path::PathBuf, String)>,
+    memory: &gex_mem::GuestMemory,
+) -> Result<()> {
+    let Some(dir) = regions_dir(&pl.path) else { return Ok(()) };
+    let path = dir.join("c.wasm");
+    let Ok(wasm) = std::fs::read(&path) else { return Ok(()) };
+    let entries = gex_cgen::image::read_entries(&path)?;
+    let module = compile(engine, cache, &path, &wasm).with_context(|| format!("compiling {}'s region entries", p.path))?;
+    crate::ftab::publish(shared, memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+    eprintln!("gex-nt: region entries for {}: {}", p.path, entries.iter().filter(|&&a| a != 0).count());
+    Ok(())
+}
+
 /// Build every export provider for a PE image (`gex_cgen::provider`) into the
 #[cfg(feature = "translate")]
 /// unit cache, as mapping it would; their names.
@@ -730,6 +835,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
                     note_pages(&memory, &pl.pages);
                     crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
                     report(&p, &pl, t0);
+                    install_regions(&p, &pl, &shared, &engine, cache.as_ref(), &memory)?;
                 }
                 None => missing(p.clone())?,
             }
@@ -767,6 +873,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
                     note_pages(&memory, &pl.pages);
                     crate::ftab::publish(&shared, &memory, module, &pl.entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
                     report(&p, &pl, t0);
+                    install_regions(&p, &pl, &shared, &engine, cache.as_ref(), &memory)?;
                 }
                 None => missing(p.clone())?,
             }

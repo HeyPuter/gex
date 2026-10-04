@@ -197,12 +197,15 @@ fn build(dir: &std::path::Path) -> Result<()> {
         for (path, base, entries, bytes, how) in &pe.units {
             eprintln!("  {path:<60} {base:#10x} {entries:>7} entries {:>7} KiB  {how}", bytes / 1024);
         }
+        for (path, n) in &pe.regions {
+            eprintln!("  region entries: {path}: {n}");
+        }
         if !pe.providers.is_empty() {
             eprintln!("  providers: {}", pe.providers.join(", "));
         }
         for (path, n, first) in &pe.uncovered {
             let f: Vec<String> = first.iter().map(|a| format!("{a:#x}")).collect();
-            eprintln!("  warning: {path}: {n} entries the session reached are not unit functions even with seeds (first: {})", f.join(" "));
+            eprintln!("  warning: {path}: {n} entries the session reached have no function or region entry (first: {})", f.join(" "));
         }
         eprintln!("{}: built ({} files in build/rootfs; no run-time translation)", dir.display(), r.rootfs_files);
         return Ok(());

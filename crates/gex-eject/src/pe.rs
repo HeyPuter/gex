@@ -108,6 +108,8 @@ fn images(nt: &NtSession) -> Vec<&gex_xlate::profile::NtImage> {
 pub struct PeReport {
     pub units: Vec<(String, u64, usize, u64, &'static str)>,
     pub providers: Vec<String>,
+    /// Region entries built, by image.
+    pub regions: Vec<(String, usize)>,
     /// Entries the session reached by a call that no unit has even after
     /// recovery was seeded with them, by image: (image, count, first few).
     pub uncovered: Vec<(String, usize, Vec<u64>)>,
@@ -234,21 +236,16 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", m.path))?;
         let key_dir = nt_cgen::unit_dir(&pe, m.base)?;
         let bias = m.base.wrapping_sub(m.preferred);
-        // Entries the session reached by an indirect call that the unit
-        // must have: function starts recovery may not find on its own (a
-        // thread start only an immediate names, a callback). Seeds of
-        // user/eject.json besides.
+        // Entries the session reached by an indirect call: function starts
+        // recovery may not find on its own (a thread start only an
+        // immediate names, a callback); seeds of user/eject.json besides.
+        // Those the unit lacks become region entries.
         let mut seeds: Vec<u64> = Vec::new();
         for op in profile.iter().flat_map(|pr| pr.objects.values()) {
             for site in op.indirect.values().filter(|s| s.call) {
                 seeds.extend(site.targets.keys().filter(|l| l.obj == m.id).map(|l| l.off.wrapping_add(bias)));
             }
         }
-        // Where code ran without a unit although the image had one (a resume
-        // into the middle of a function, a unit's leave): a narrow stopgap
-        // until such frames are kept (R's nested dispatch, merge plan §9).
-        let end = m.base + m.size;
-        seeds.extend(ntss.entries.iter().copied().filter(|&a| a >= m.base && a < end));
         let name = m.path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
         for s in &config.seeds {
             if let Some((img, off)) = s.split_once('+') {
@@ -258,15 +255,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
                 }
             }
         }
-        let stubs = nt_cgen::provider_stubs(&pe, m.base);
-        let missing_seeds = |entries: &[u64]| -> Vec<u64> {
-            let set: std::collections::HashSet<u64> = entries.iter().chain(stubs.iter()).copied().collect();
-            let mut v: Vec<u64> = seeds.iter().copied().filter(|a| !set.contains(a)).collect();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
-        let mut how = if key_dir.join("c.wasm").exists() {
+        let how = if key_dir.join("c.wasm").exists() {
             "present"
         } else if reuse(&key_dir, &sources)? {
             "reused"
@@ -274,20 +263,26 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             eprintln!("  building the unit for {} at {:#x} ...", m.path, m.base);
             "built"
         };
-        let mut p = nt_cgen::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
-        let extra = missing_seeds(&gex_cgen::image::read_entries(&p)?);
-        if !extra.is_empty() {
-            eprintln!("  {}: recovering again with {} entries the session reached ({:#x}...)", m.path, extra.len(), extra[0]);
-            let _ = std::fs::remove_dir_all(&key_dir);
-            let _ = std::fs::remove_dir_all(nt_cgen::recovery_dir(&pe, m.base)?);
-            p = nt_cgen::prepare_pe_seeded(&pe, m.base, &extra, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
-            how = "built with seeds";
-            let still = missing_seeds(&gex_cgen::image::read_entries(&p)?);
-            if !still.is_empty() {
-                report.uncovered.push((m.path.clone(), still.len(), still.iter().take(8).copied().collect()));
+        let p = nt_cgen::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
+        compile(&p)?;
+        // Where code ran without a unit although the image had one (a resume
+        // into the middle of a function, a unit's leave): region entries,
+        // a module of their own beside the unit (docs/eject-pe.md §3.3).
+        let end = m.base + m.size;
+        let mut interior: Vec<u64> = ntss.entries.iter().copied().filter(|&a| a >= m.base && a < end).collect();
+        // And the starts above that recovery did not find: the unit's key
+        // and contents stay those of the image alone.
+        interior.extend(seeds);
+        if !interior.is_empty() {
+            let failed = nt_cgen::prepare_regions(&pe, m.base, &p, &interior, jobs)?;
+            if let Some(r) = nt_cgen::region_module(&p) {
+                compile(&r)?;
+                report.regions.push((m.path.clone(), interior.len() - failed.len()));
+            }
+            if !failed.is_empty() {
+                report.uncovered.push((m.path.clone(), failed.len(), failed.iter().take(8).copied().collect()));
             }
         }
-        compile(&p)?;
         for name in nt_cgen::prepare_providers(&pe)? {
             if !report.providers.contains(&name) {
                 report.providers.push(name);

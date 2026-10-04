@@ -527,6 +527,23 @@ FMOD and Steam, which stay the guest's DLLs on gex's NT layer.
   recovery as seeds, but recovery does not make functions of them (they
   sit inside another function's loop). Waiting on R's nested faults and
   F's interior entries.
+- **State at the reboot (2026-10-03, WIP):** region entries (§3.3) are
+  implemented: `nt_cgen::prepare_regions` recovers a function entered at
+  each recorded interior PC (`func::recover_one`, the unit's entries as
+  strong starts), lowers it with gex-cgen's existing write_recovery and
+  build_c_module (no gex-cgen change), into `<cache>/regions/<unit key>/`;
+  `install_regions` publishes it after the unit. The eject build sends
+  every recorded entry the unit lacks (and indirect-call targets, user
+  seeds) there; units are no longer re-recovered with seeds, so they stay
+  F's. Not green yet: seh's region module holds 2 of its recorded PCs but
+  the run still stops at 0x401715 (seh.exe+0x1715, a call continuation)
+  -- next: check whether 0x401715 is in the region module's entries
+  (`build/units/regions/*/c.entries`), and if it is, why the lookup
+  misses it (install order, or the ftab map's newest-wins). cxx's build
+  failed in a kernelbase unit clang step (log
+  scratchpad/eject9/cxx-x86.build.log) -- rerun to see if it was load.
+  Then: cg12 (F), Noita on gex-rt at the new keys, cxx/seh retry. The
+  glcompat "a query's result" flake (2/5 on gexc and gex-rt) is for R.
 - Found: a unit of Noita's lua51.dll built at a rebased address (0xb70000)
   lowers the import thunk `jmp [IsProcessorFeaturePresent]` at +0x4e89a to
   `gex_illegal`, so its DllMain faults (also with --jit-fallback). The Lua
