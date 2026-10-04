@@ -498,7 +498,14 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
             if exc_escape(caller, target) {
                 return Err(StopExecution.into());
             }
-            if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(memory.bytes(), next_pc) {
+            // An exception raised, or a user APC delivered by an alertable
+            // wait: both run a dispatcher that ends in NtContinue.
+            // (Not NtContinue's own APC delivery: what it returns to is the
+            // context it loaded, not its caller.)
+            let apc = target == p.ntdll.lock().unwrap().ki_user_apc_dispatcher
+                && nr != nt::sysno::ntdll::NtContinue
+                && nr != nt::sysno::ntdll::NtContinueEx;
+            if (nr == nt::sysno::ntdll::NtRaiseException || apc) && nest_exceptions(memory.bytes(), next_pc) {
                 return raise_nested(caller, &p, target, raise_sp, next_pc);
             }
             let state = caller.data_mut();
@@ -613,7 +620,10 @@ pub(crate) fn exc_escape(caller: &mut Caller<'_, HostState>, target: u64) -> boo
     let mut gm = GuestMem::new(memory.bytes());
     let sp = gm.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0);
     let sp = if caller.data().nt.as_ref().is_some_and(|p| p.abi == nt::Abi::P32) { sp & 0xffff_ffff } else { sp };
-    if sp <= raise_sp {
+    // At or above the syscall's own stack: nothing the dispatch runs is
+    // there (its frame is below), so control is back with the frames it
+    // was entered from (an APC's NtContinue comes back to exactly it).
+    if sp < raise_sp {
         return false;
     }
     let _ = gm.write_u64(ctx_addr + ctx::PC as u64, target);
@@ -622,8 +632,9 @@ pub(crate) fn exc_escape(caller: &mut Caller<'_, HostState>, target: u64) -> boo
     true
 }
 
-/// Dispatch an exception without unwinding the thread's wasm frames
-/// (`NtRaiseException`, first chance): run `KiUserExceptionDispatcher`
+/// Dispatch an exception or a user APC without unwinding the thread's wasm
+/// frames (`NtRaiseException`, first chance; an alertable wait that delivers
+/// an APC): run `KiUserExceptionDispatcher` or `KiUserApcDispatcher`
 /// (`target`) in a nested loop on top of them, as a user-mode callback
 /// runs, until control goes back above the raise (`exc_escape`). Then the
 /// syscall returns, its `ret` taking the guest to where the dispatch
@@ -707,19 +718,26 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
     let mut gm = GuestMem::new(memory.bytes());
     let to_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
     let to_sp = gm.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & mask;
+    if p.cfg.trace {
+        gex_kernel::nt_log!(
+            "[nt:{:x}] {2} dispatched nested, back at {1} sp {to_sp:#x} (raised at sp {raise_sp:#x})",
+            p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid),
+            p.describe_addr(to_pc),
+            if target == p.ntdll.lock().unwrap().ki_user_apc_dispatcher { "APC" } else { "exception" },
+        );
+    }
+    // Back at the syscall's own return (an APC's NtContinue, an exception
+    // continued at the raise): just return, with the context's registers.
+    if to_pc == next_pc && to_sp == raise_sp & mask {
+        let _ = gm.write_u64(ctx_addr + ctx::PC as u64, next_pc);
+        return Ok(());
+    }
     let pops = match memory.bytes().get(next_pc as usize) {
         Some(0xc2) => gm.read_u32(next_pc + 1).unwrap_or(0) as u64 & 0xffff,
         _ => 0,
     };
     let psize = if p32 { 4 } else { 8 };
     let sp = to_sp.wrapping_sub(psize + pops) & mask;
-    if p.cfg.trace {
-        gex_kernel::nt_log!(
-            "[nt:{:x}] exception dispatched nested, back at {} sp {to_sp:#x} (raised at sp {raise_sp:#x})",
-            p.thread_by_ctx(ctx_addr).map_or(0, |t| t.tid),
-            p.describe_addr(to_pc),
-        );
-    }
     let wrote = if p32 { gm.write_u32(sp, to_pc as u32) } else { gm.write_u64(sp, to_pc) };
     if wrote.is_err() {
         // No stack there: resume the old way.
