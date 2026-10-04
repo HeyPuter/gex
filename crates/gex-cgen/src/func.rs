@@ -77,18 +77,22 @@ pub fn leaf_name(entry: u64) -> String {
 
 /// Whether `f` may be copied into its callers' translation units (pewasm's
 /// opt_inline.cc): a leaf (no calls, no transfers out other than its
-/// returns) of at most `LEAF_STMTS` statements. pewasm's bound is 48 C
-/// statements; gex's lifted statements are about two per pewasm line.
+/// returns) of at most `LEAF_INSTS` guest instructions. pewasm bounds 48 C
+/// statements after its own optimisation, flags mostly gone; gex's lifted
+/// statements still hold every flag (a compare is about 30), so they are
+/// no measure: 0x72b390, 18 instructions with four compares, is 288. The
+/// flags go when the copy is inlined, the caller's `need` folding the
+/// return's flag store away.
 pub fn is_small_leaf(f: &Function) -> bool {
-    const LEAF_STMTS: usize = 96;
+    const LEAF_INSTS: usize = 32;
     let mut n = 0;
     for b in &f.blocks {
         match b.term {
             FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Return { .. } => {}
             _ => return false,
         }
-        n += b.stmts.len();
-        if n > LEAF_STMTS {
+        n += b.insts.len();
+        if n > LEAF_INSTS {
             return false;
         }
     }
