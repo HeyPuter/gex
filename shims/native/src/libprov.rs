@@ -226,6 +226,13 @@ pub(crate) fn install(
             }
         }
     }
+    // A Linux library's constructors and destructors (`on_linux_maps`).
+    if let Some(k) = slots.iter().position(|s| s.as_deref() == Some("gexp__noop")) {
+        for a in std::mem::take(&mut *CTORS.lock().unwrap_or_else(|e| e.into_inner())) {
+            pairs.retain(|&(x, _)| x != a);
+            pairs.push((a, k as u32));
+        }
+    }
     // An address several names share is served by whichever is provided.
     pairs.sort_by_key(|&(a, k)| (a, k == missing));
     pairs.dedup_by_key(|&mut (a, _)| a);
@@ -497,6 +504,10 @@ pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_ke
             done.push((m.path.clone(), bias));
         }
         let (lo, hi) = (text.vaddr, text.vaddr + text.bytes.len() as u64);
+        // Its constructors and destructors: the guest's loader calls them,
+        // and none of the library's code may run (`gexp__noop`).
+        let mut ctors: Vec<u64> = image.init_array.clone();
+        ctors.extend(elf_fini(&bytes));
         let exports: std::collections::HashMap<String, u32> = image
             .dynsyms
             .iter()
@@ -509,6 +520,7 @@ pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_ke
         };
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         for lp in libs {
+            CTORS.lock().unwrap_or_else(|e| e.into_inner()).extend(ctors.iter().filter(|&&v| v >= lo && v < hi).map(|&v| v.wrapping_add(bias)));
             let n = install(lp, caller.data_mut(), &shared, &engine, &memory, &exports, bias, 0)?;
             if std::env::var_os("GEX_PROVIDER_TRACE").is_some() {
                 eprintln!("gex: provider {} for {} at {bias:#x}: {n} exports bound", lp.name, m.path);
@@ -694,4 +706,52 @@ fn store_word(mem: &mut [u8], addr: u64, v: u32) {
         b.copy_from_slice(&v.to_le_bytes());
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Constructor and destructor addresses of the library being installed
+/// (unbiased by `on_linux_maps`, biased here).
+static CTORS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// DT_FINI and FINI_ARRAY's entries (their file values, as gex_ld reads
+/// INIT_ARRAY's): unbiased addresses.
+fn elf_fini(bytes: &[u8]) -> Vec<u64> {
+    let u64at = |o: usize| bytes.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let u32at = |o: usize| bytes.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let u16at = |o: usize| bytes.get(o..o + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap()));
+    let mut out = Vec::new();
+    let (Some(phoff), Some(phentsize), Some(phnum)) = (u64at(0x20), u16at(0x36), u16at(0x38)) else { return out };
+    // vaddr -> file offset by the PT_LOAD segments
+    let mut loads = Vec::new();
+    let mut dynamic = None;
+    for i in 0..phnum as usize {
+        let ph = phoff as usize + i * phentsize as usize;
+        let (Some(ty), Some(off), Some(va), Some(fsz)) = (u32at(ph), u64at(ph + 8), u64at(ph + 16), u64at(ph + 32)) else { continue };
+        if ty == 1 {
+            loads.push((va, off, fsz));
+        }
+        if ty == 2 {
+            dynamic = Some((off, fsz));
+        }
+    }
+    let file_of = |va: u64| loads.iter().find(|&&(v, _, s)| va >= v && va < v + s).map(|&(v, o, _)| (va - v + o) as usize);
+    let Some((doff, dsz)) = dynamic else { return out };
+    let (mut fini_array, mut fini_arraysz) = (None, 0u64);
+    for i in 0..dsz / 16 {
+        let (Some(tag), Some(val)) = (u64at((doff + i * 16) as usize), u64at((doff + i * 16 + 8) as usize)) else { break };
+        match tag {
+            0 => break,
+            13 => out.push(val),          // DT_FINI
+            26 => fini_array = Some(val), // DT_FINI_ARRAY
+            28 => fini_arraysz = val,     // DT_FINI_ARRAYSZ
+            _ => {}
+        }
+    }
+    if let Some(fa) = fini_array {
+        for i in 0..fini_arraysz / 8 {
+            if let Some(v) = file_of(fa + i * 8).and_then(u64at) {
+                out.push(v);
+            }
+        }
+    }
+    out
 }

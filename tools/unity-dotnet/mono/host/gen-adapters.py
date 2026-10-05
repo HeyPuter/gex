@@ -127,7 +127,7 @@ def main():
             body = '\tGEXP_RET_U64(ctx, (uint64_t)(uintptr_t)%s);' % call
         else:
             body = '\tGEXP_RET_U64(ctx, (uint64_t)%s);' % call
-        print('GEXP_SYSV(gexp_%s)\n{\n\tgexp_enter(ctx);\n%s\n\treturn gexp_return(ctx, ret);\n}\n' % (name, body))
+        print('GEXP_SYSV(gexp_%s)\n{\n\tgexp_enter(ctx);\n\tGEXMONO_TRACE("%s");\n%s\n\treturn gexp_return(ctx, ret);\n}\n' % (name, name, body))
         names.append(name)
     print('__attribute__((used)) gexp_body_t const gexmono_generated_adapters[] = {')
     for n in names:

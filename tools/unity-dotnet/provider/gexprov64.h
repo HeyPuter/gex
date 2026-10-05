@@ -168,7 +168,10 @@ __attribute__((import_module("gex"), import_name("provider_throw"))) _Noreturn v
 /* Bound at every export the provider does not implement. */
 #define GEXP_LAST_TARGET 44 /* gex_abi::ctx::LAST_TARGET / 8 */
 #define GEXP_DEFINE_MISSING \
-	GEXP_SYSV(gexp__missing) { gexp_host_missing(GEXP_X(ctx, GEXP_LAST_TARGET)); __builtin_trap(); }
+	GEXP_SYSV(gexp__missing) { gexp_host_missing(GEXP_X(ctx, GEXP_LAST_TARGET)); __builtin_trap(); } \
+	/* Bound at the replaced library's constructors and destructors (DT_INIT, \
+	 * INIT_ARRAY, DT_FINI, FINI_ARRAY), which the guest's loader calls. */ \
+	GEXP_SYSV(gexp__noop) { return gexp_return(ctx, ret); }
 
 /* musl's clone starts a thread at the address the host bound to
  * __gex_thread_start; a provider's is not the program's AT_ENTRY + 16. */
@@ -179,6 +182,6 @@ __attribute__((import_module("gex"), import_name("provider_throw"))) _Noreturn v
 /* The element segment: every adapter, plus musl's thread entry. */
 int __gex_thread_start(int, int, int, long long);
 #define GEXP_TABLE(...) \
-	__attribute__((used)) gexp_body_t const gexp_table[] = { __VA_ARGS__, gexp__missing, (gexp_body_t)__gex_thread_start }
+	__attribute__((used)) gexp_body_t const gexp_table[] = { __VA_ARGS__, gexp__missing, gexp__noop, (gexp_body_t)__gex_thread_start }
 
 #endif

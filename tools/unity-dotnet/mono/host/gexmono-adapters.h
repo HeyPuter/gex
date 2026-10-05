@@ -28,3 +28,9 @@
 #include <mono/utils/mono-error.h>
 #include <mono/utils/mono-logger.h>
 #include <mono/utils/mono-publib.h>
+
+/* GEXMONO_TRACE=1: every embedding API call, with its first arguments, on
+ * stderr (gexmono-provider.c). */
+extern int gexmono_trace_on;
+void gexmono_trace (int ctx, const char *name);
+#define GEXMONO_TRACE(name) do { if (__builtin_expect (gexmono_trace_on, 0)) gexmono_trace (ctx, name); } while (0)

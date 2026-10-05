@@ -230,6 +230,17 @@ GEXP_SYSV(gexp_mono_raise_exception)
 	__builtin_trap ();
 }
 
+/* ---- tracing ---- */
+
+int gexmono_trace_on;
+
+void
+gexmono_trace (int ctx, const char *name)
+{
+	fprintf (stderr, "[gexmono] %s (%#llx, %#llx, %#llx)\n", name,
+		(unsigned long long)gexp_arg (ctx, 0), (unsigned long long)gexp_arg (ctx, 1), (unsigned long long)gexp_arg (ctx, 2));
+}
+
 /* ---- before mono_jit_init ---- */
 
 static void
@@ -241,6 +252,7 @@ preinit (void)
 	done = 1;
 	/* The fork's runtime wasm JIT: off until it emits wasm64 for gex. */
 	setenv ("MONO_WASM_JIT_AUTO", "0", 0);
+	gexmono_trace_on = getenv ("GEXMONO_TRACE") != NULL;
 	const char *dir = getenv ("GEXMONO_ASSEMBLIES");
 	static const char *keys [] = { "System.Globalization.Invariant", "APP_CONTEXT_BASE_DIRECTORY" };
 	const char *values [] = { "true", dir ? dir : "/" };

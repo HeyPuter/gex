@@ -274,6 +274,7 @@ Native gexc runs the same provider on wasmtime. It is for correctness only.
 |---|---|---|
 | P1 | The fork's Mono built for wasm64 with the interpreter; CoreLib from the same tree for linux-x64; System.Native for wasm64. **Done** (§9). | `mono_jit_init` + CoreLib load, run natively |
 | P2 | Stateful providers for x86-64: SysV adapters, M64, TLS, guest-thread creation, Linux shared objects; the Mono runtime packaged as one. **Done** (§10). | tests/unity-dotnet/prov64, tests/unity-dotnet/embed |
+| P3 | Calls in both directions, raises through guest frames, the Boehm-like GC with guest roots and stopped guest threads. **Done** (§11). | tests/unity-dotnet/embed |
 | P3 | `tests/unity-dotnet/embed.c`: a small x86-64 Linux program that dlopens a stub `libmonobdwgc-2.0.so` (exports only) and, like UnityPlayer, calls `mono_jit_init_version`, opens a test assembly, finds a class and method, registers an icall, calls `runtime_invoke`. The managed code calls the icall back, which raises; it also uses GC handles, strings, arrays and a GC with an object held only on the x86 stack. | it prints the same as the same program on host Mono |
 | P4 | Muck: the shim layer for the 272 names, the find-plugin callback, failed-lookup logging. | the player log reaches "Completed reload", then the menu, natively |
 | P5 | The browser: the provider in the browser shim, wasm EH for icall exits. | Muck's menu in Chromium. Then the AOT tier, and fps measured paired with Muck on x86 Mono (`GEX_UNITY_DOTNET=0`) |
@@ -443,3 +444,94 @@ Not yet:
   only);
 - the Win64 ABI and NT processes, where every syscall is an NT call, so the
   provider's libc needs an NT-side route.
+
+## 11. P3 as built (2026-10-04)
+
+- **Calls into guest code** (`provider/gexprov64.c`, `gexp_call_guest`):
+  - arguments go by the guest ABI, below the current guest RSP;
+  - the return address is in the provider's code region, so a return that
+    no function body predicted is still caught by gex's call-out;
+  - a dispatch loop runs until the guest returns there;
+  - `gexp_call_guest_catching` wraps the call in `gex.provider_try`.
+  `gexp_raise` unwinds back to that call and restores the guest's
+  registers. `mono_raise_exception` from guest code becomes the guest
+  call's pending exception.
+- **Mono's side** (`patches/0001-wasm64.patch`, `HOST_GEX`):
+  - a native function pointer outside the provider's own table slots is a
+    guest address;
+  - `ves_pinvoke_method` marshals guest calls by the signature (SysV
+    eightbyte classification, Win64 rules) and `do_icall` by its
+    pointer-sized form;
+  - every `dlopen` goes to the provider's fallback: System.Native linked
+    in, else the guest's own `dlopen`/`dlsym` (`gex.provider_guest_sym`),
+    `"__Internal"` included.
+- **Calls from guest code into managed code** (delegates,
+  `[UnmanagedCallersOnly]`) go through reverse slots: 3,840 guest
+  addresses in the code region, all bound to `gexp__reverse`, which runs
+  the native-to-managed wrapper on the interpreter
+  (`gex_interp_native_to_managed`).
+- **The GC behaves as Boehm did:**
+  - small objects go straight to the mark-sweep major heap, and
+    evacuation is off, so nothing moves and every collection is a full
+    mark;
+  - each thread's guest frames (context RSP to the end of its stack
+    mapping) and 16 guest registers are scanned conservatively;
+  - an attached thread runs guest code in a GC-safe region;
+  - stop-the-world also parks the guest's threads at their next safepoint
+    or syscall (`libprov::GuestStop`).
+- **libprov (mem64, additive)** gains these imports: `provider_abi`,
+  `provider_table_size`, `provider_guest_sym`, `provider_code_page`
+  (64 KiB: thread entry, return addresses, reverse slots),
+  `provider_thread_register`, `provider_park`,
+  `provider_stop_guest`/`provider_start_guest`, `provider_guest_stack_end`.
+- **Gate (coordgate on 49a5773b):**
+  - workspace tests pass (a64 452, x86 441);
+  - tests/nt 73/73 with `--no-cgen` and with `--cgen` (after the fix
+    passing `--mem64` to unit builds);
+  - x86-programs and glibc pass;
+  - lockstep agrees.
+
+  The browser NT step was stopped before it ran, because E was timing in
+  the browser. The browser shim now builds (the fjit `volatile` argument).
+
+## 12. P4 state and resume (2026-10-04, at the move)
+
+- `host/gexmono-unity.c` implements the rest of the API UnityPlayer looks
+  up:
+  - `mono_unity_*`;
+  - the legacy names;
+  - the `unity_mono_*` three;
+  - the guest-callback functions;
+  - Unity's find-plugin callback and dl fallback;
+  - the assembly search path, with `GEXMONO_ASSEMBLIES` (CoreLib plus
+    .NET 10's managed shared framework) ahead of Unity's Managed
+    directory.
+
+  MonoClass gains `unity_user_data`.
+- libprov binds a replaced Linux library's constructors and destructors
+  (DT_INIT/INIT_ARRAY/DT_FINI/FINI_ARRAY) to `gexp__noop`, so none of
+  `libmonobdwgc`'s code runs.
+- `GEXMONO_TRACE=1` logs every embedding API call with its first arguments.
+  It goes to stderr, which is the player log.
+- **Muck** (`tests/games/muck-dotnet.sh OUT RUNDIR`, batch mode, no
+  graphics, natively):
+  - it reaches "Begin MonoManager ReloadAssembly" and "Completed reload,
+    in 15.156 seconds": every game assembly loads on CoreLib and the
+    facades;
+  - it then aborts in `PersistentManager::PostReadActivationQueue` →
+    `MonoScript::Rebuild` → `AttributeScannerQuery::UpdateAttributeUsageInfo`;
+  - the trace ends `mono_custom_attrs_has_attr` → `mono_custom_attrs_get_attr`
+    → `mono_gc_wbarrier_set_field (0, …)` → `mono_field_get_offset (0)`;
+  - so the attribute object or a field lookup came back NULL, followed by
+    an assertion on a NULL class.
+- **Resume:**
+  1. Build: `tools/unity-dotnet/mono/build.sh OUT`, then
+     `tools/unity-dotnet/sysroot` via its `sysroot` step. musl comes from
+     `MUSL_SRC`, which defaults to `../musl-wasm64` beside the worktree
+     (remote `mw`, branch `gex-wasm64`).
+  2. Find which lookup returns NULL. Candidates: `get_attr` on an
+     attribute in UnityEngine.CoreModule, a field name Unity's Mono had
+     that .NET's types lack, or a type whose lookup resolves through a
+     facade's forwarders.
+  3. Then on to the menu with graphics (the old `muck.sh` path: in-guest
+     Xwayland on gex's compositor), and to Unity's own internal calls.

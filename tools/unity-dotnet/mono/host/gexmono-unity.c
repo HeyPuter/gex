@@ -34,7 +34,7 @@ guint32 gex_class_get_data_size (MonoClass *klass);
 #define A(i) gexp_arg (ctx, i)
 #define P(i) ((void *)(uintptr_t)A (i))
 #define U(name) GEXP_SYSV (gexp_##name)
-#define ENTER gexp_enter (ctx)
+#define ENTER do { gexp_enter (ctx); GEXMONO_TRACE (__func__ + 5); } while (0)
 #define RET(v) do { GEXP_RET_U64 (ctx, (uint64_t)(v)); return gexp_return (ctx, ret); } while (0)
 #define RETV return gexp_return (ctx, ret)
 
@@ -101,6 +101,10 @@ U(mono_unity_type_get_name_full_chunked)
 	}
 	RETV;
 }
+
+U(unity_mono_method_is_generic) { ENTER; RET (((MonoMethod *)P (0))->is_generic); }
+U(unity_mono_method_is_inflated) { ENTER; RET (((MonoMethod *)P (0))->is_inflated); }
+U(unity_mono_reflection_method_get_method) { ENTER; MonoReflectionMethod *m = P (0); RET (m ? m->method : NULL); }
 
 /* ---- custom attributes ---- */
 
@@ -363,5 +367,6 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
 	L(mono_trace_set_log_handler) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
+	L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0
 };
