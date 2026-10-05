@@ -820,3 +820,4 @@ export async function runProgram(
 }
 
 export { TerminalEnv };
+export { loadKernel as globalKernel };

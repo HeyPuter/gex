@@ -243,6 +243,8 @@ pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
   //   ?env=K=V,...  more environment (GEX_NT_STATS=1, ...)
   //   ?size=WxH     the compositor's size
   //   ?mesaenv=K=V  environment for Mesa (GEX_WGPU_TIMING=1, ...)
+  //   ?persist=0    start from the build's files: no saves restored or kept
+  //                 (the user profiles otherwise live on in IndexedDB)
   const q = new URLSearchParams(location.search);
   const out = document.getElementById('out');
   try {
@@ -261,6 +263,10 @@ pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
     });
     if (m.cwd && m.cwd !== '/') p.set('cwd', m.cwd);
     if (m.unguarded) p.set('unguarded', '1');
+    if (m.persist && q.get('persist') !== '0') {
+      p.set('persist', m.persist);
+      p.set('persistdb', `gex-eject:${m.exe}`);
+    }
     if (q.has('mesaenv')) p.set('mesaenv', q.get('mesaenv'));
     const argv = q.has('args') ? q.get('args').split(' ').filter((a) => a) : m.args;
     if (argv.length) p.set('argv', JSON.stringify(argv));
@@ -735,6 +741,10 @@ fn build_web(
         // The units' directory in the project, and their flavour.
         ("cgen", s(web.strip_prefix(dir).unwrap_or(&web).to_string_lossy())),
         ("unguarded", b(!guarded)),
+        // What the page keeps across loads (IndexedDB): the Windows user
+        // profiles, where a program's saves and settings go (AppData,
+        // Documents).
+        ("persist", s(format!("{}/drive_c/users", ntss.prefix.trim_end_matches('/')))),
     ]);
     std::fs::write(dir.join(WEB_NT_RUN), crate::json::write(&j))?;
     // The page's bundle: the rootfs as one tar (links followed), which the
