@@ -818,17 +818,24 @@ Not yet:
     Working-tree note: `dnc/src` has every patch staged (`git add -A`) so
     `git diff` shows only new edits (how 0003 was made). Run `git -C
     scratch/unity/dnc/src reset -q` before build.sh's `src` step.
-- **Resume (after the move; HEAD 1db5c816, `master` merged in):**
-  0. The coordgate on this branch still lacks its browser NT step (it was
-     stopped while E was timing), and nothing after 49a5773b has been
-     gated. Run it before the libprov changes go to master.
-  1. Build: `tools/unity-dotnet/mono/build.sh OUT`, then
-     `tools/unity-dotnet/sysroot` via its `sysroot` step. musl comes from
-     `MUSL_SRC`, which defaults to `../musl-wasm64` beside the worktree
-     (remote `mw`, branch `gex-wasm64`).
-  2. Find which lookup returns NULL. Candidates: `get_attr` on an
-     attribute in UnityEngine.CoreModule, a field name Unity's Mono had
-     that .NET's types lack, or a type whose lookup resolves through a
-     facade's forwarders.
-  3. Then on to the menu with graphics (the old `muck.sh` path: in-guest
-     Xwayland on gex's compositor), and to Unity's own internal calls.
+- **Resume (after the 2026-10-05 evening reboot; HEAD 8bfbae51, master
+  e3917bac merged):**
+  0. Gate head 8bfbae51 offered to the coordinator (the branch gate has
+     never run on anything after d69c1cd6/3718d0ca). Extra legs that prove
+     this stream's work, all checked green on 8bfbae51 on gooner:
+     `tests/unity-dotnet/embed/run.sh ~/gex-sandbox/scratch/unity/dnc
+     target/dbg-x86/release/gexc` (interpreter, --fjit, and since 8bfbae51
+     the wasm JIT at threshold 1, plus the GC-roots control);
+     `tests/unity-dotnet/prov64/run.sh
+     ~/gex-sandbox/scratch/unity/dnc/sysroot/sysroot GEXC` (note the doubled
+     `sysroot`); Muck batch with --fjit (`muck-dotnet.sh ... 600 --fjit`,
+     player.log reaches "Initializing packets"); HK batch (reaches its first
+     scene's scripts: "Couldn't find a UIManager"). Logs in
+     `scratch/unity/logs/`, runs `scratch/unity/runs/mk2`, `hk34`.
+  1. The fork clone `dnc/src` has a local commit `2a05cbbc5` (patch 0001)
+     on top of 6812ea26, so build.sh's `src` step fails ("local changes
+     would be overwritten"). The working tree was verified identical to
+     6812ea26 + patches/0001-0003 (tree hashes equal), so build with the
+     steps `sysroot runtime provider` (skip `src`).
+  2. Open: HK black frames (run `hk35`, gex-gl tallies), the worldmachine
+     --fjit `free()` bisection (the Hollow Knight item 6 above).
