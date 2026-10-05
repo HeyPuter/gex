@@ -68,4 +68,15 @@ rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a" $objs
 # The ICALL pass (wcc applies it to Wine's PE-side code, -D_WIN32).
 "$HERE/icall/build.sh" "$OUT/sysroot/lib"
+# binaryen, for wcc's asyncify of programs that fork (wasm-opt >= 117 for
+# exception handling): GEX_BINARYEN names an existing install.
+BINARYEN_VERSION=133
+if [ -n "${GEX_BINARYEN:-}" ]; then
+  ln -sfn "$(realpath "$GEX_BINARYEN")" "$OUT/sysroot/binaryen"
+elif [ ! -x "$OUT/sysroot/binaryen/bin/wasm-opt" ]; then
+  t=binaryen-version_$BINARYEN_VERSION
+  curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$OUT"
+  rm -rf "$OUT/sysroot/binaryen"
+  mv "$OUT/$t" "$OUT/sysroot/binaryen"
+fi
 echo "sysroot: $OUT/sysroot"

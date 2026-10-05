@@ -5,10 +5,9 @@
 #   tools/wine-wasm/build-busybox.sh OUT_DIR [VERSION]   (GEX_WASM_SYSROOT set)
 #
 # Downloads busybox VERSION (default 1.37.0) into OUT_DIR, configures it
-# with busybox.config (NOMMU: vfork, which the musl fork's wasm32 vfork
-# emulates -- the child runs on the parent's stack until it execs or exits,
-# which become a posix_spawn; LFS; hush; tail -N), builds with wcc. Prints
-# the binary's path.
+# with busybox.config (an MMU build: fork is real, wcc asyncifies the
+# program for it; LFS; hush; tail -N), builds with wcc. Prints the
+# binary's path.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 out=$(mkdir -p "$1" && cd "$1" && pwd)
