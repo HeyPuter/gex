@@ -524,7 +524,10 @@ Not yet:
     → `mono_gc_wbarrier_set_field (0, …)` → `mono_field_get_offset (0)`;
   - so the attribute object or a field lookup came back NULL, followed by
     an assertion on a NULL class.
-- **Resume:**
+- **Resume (after the move; HEAD 1db5c816, `master` merged in):**
+  0. The coordgate on this branch still lacks its browser NT step (it was
+     stopped while E was timing), and nothing after 49a5773b has been
+     gated. Run it before the libprov changes go to master.
   1. Build: `tools/unity-dotnet/mono/build.sh OUT`, then
      `tools/unity-dotnet/sysroot` via its `sysroot` step. musl comes from
      `MUSL_SRC`, which defaults to `../musl-wasm64` beside the worktree
