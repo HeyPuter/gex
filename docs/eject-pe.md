@@ -1029,6 +1029,53 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   world-up A/B, play-through p1-p8 (site27p, readback for screenshots, own
   browser profile `/tmp/gbench-e9play`), 35-minute soak.
 
+- **RESUME HERE (state at the reboot, 2026-10-05 ~18:10).** Branch
+  merge/eject9, worktree ~/gex-sandbox/wt/eject9; head = the commit adding
+  this paragraph (on bce25b8e). Master ffc51bcd is merged (it contains this
+  branch up to 1d5956bc and third_party/mesa = wink 5f5572e62ff with both of
+  my Mesa patches: build Mesa from third_party/mesa from now on, not from
+  `$S/gexroot`; the submodule is not checked out in this worktree yet, and
+  web/public/gex's Mesa is my equivalent build from `$S/mesa-ctl-out`).
+  `$S` = ~/gex-sandbox/scratch/eject9.
+  - Agreed order (coordinator/user): (1) boot hashing skip -- DONE
+    (13f4d6a9, measured: site26 world-up 30.0-31.6 s vs pewasm 30.2 s);
+    (2) direct present -- DONE in code (118a8c06), locally verified; (3) on
+    edger: fps ABBA vs pewasm and world-up A/B with direct present -- STARTED,
+    one leg done: site27 (direct) 62.1 world fps over 189 s, world-up 28 s
+    after the process start; pewasm 48.1 in the same sequence (the eject
+    1.29x faster than pewasm, 62.1 vs 48.1 world fps, one leg each: repeat);
+    (4) RE-VERIFY on that build: play-through, saves across reload, 35-min
+    soak -- NOT RUN; (5) send the head to the coordinator to gate; (6) the
+    user announces "eject replaces pewasm".
+  - To resume step 3-4: everything is packed and ready. Run on gooner
+    `nohup ~/gex-sandbox/scratch/bench/bench.sh -s $S/site27 -s $S/site27c
+    -s $S/site27p -s $S/play.mjs -s $S/play-edger2.sh -s $S/shots -s $S/c27
+    -s $S/soak-edger.sh -- bash $S/c27/queue.sh > $S/c27/queue.txt 2>&1 &`
+    (ABBA pew/site27/site27c/site27c/site27/pew; world-up x3 site27c vs
+    site27; play scripts `$S/shots/d27p1..8.json` on site27p with
+    present=readback so screenshots show the frame, own profile
+    /tmp/gbench-e9play removed first so saves start empty; then
+    `soak-edger.sh site27 soak27 2100`). Logs land on edger in
+    `$S/edger/` (L*-27, wab-*, d27p*.txt/.stats + shots/d27p*.png, soak27);
+    fetch with scp. Check in p1-p8: release notes -> menu -> New Game ->
+    world, walking, death and Game Over (killme mod), pause, Save & Quit, the
+    reload's restored files and "Continue" in p8. Coordinates in those
+    scripts are frame pixels (fx/fy) converted from the composited ones
+    (minus 4,56); if a click misses, compare the shots with the
+    old ones in `$S/edger/shots/p*.png`.
+  - Sites: site27 = direct present (bench), site27c = same with
+    `--no-direct` (control), site27p = non-bench with overlay-play (killme
+    mod) for the play-through; all from p-noita17 at master ffc51bcd's unit
+    keys, page27, the edger-trained shader blob `$S/c24/edger.wgsl`.
+  - Post-change checks already green on gooner at 118a8c06:
+    tests/nt/run-browser.sh 49/49; browser-gui x86, x86 --gl, x64, x64 --gl
+    ok, and x86 / x86 --gl with direct=1 ok.
+  - Open, lower priority: page-load variance (navigation -> process start
+    2.7-6.0 s); pointer lock is opt-in (`?pointerlock=1`) and untested on
+    hardware; the cursor-as-CSS path is untested with a game that sets a
+    cursor image (Noita hides it).
+  - Nothing of mine is running on gooner or edger.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
