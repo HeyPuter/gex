@@ -703,7 +703,7 @@ const waylandGears = {
     wrap.className = 'canvas-wrap';
     // The compositor's output: the whole desktop, and the only thing the user
     // sees. Every surface is drawn here -- windows with the frames the
-    // compositor draws, their menus, and the cursor -- by a WebGL2 context in
+    // compositor draws, their menus, and the cursor -- by a WebGPU device in
     // the compositor worker. `tabIndex` makes it able to take keyboard focus,
     // which a bare <canvas> cannot.
     const wlCanvas = document.createElement('canvas');
@@ -1621,7 +1621,7 @@ const compositor = {
     + 'copied twice. Nothing in the guest is a graphics driver. Every window is drawn from the '
     + 'guest\'s own memory: nothing copies a frame. The X11 clients share one X server and are '
     + 'cheap; a Qt or KDE toolkit translates 100 MB of its own code, so pick one of those at a '
-    + 'time. Two choices below: which compositor draws the windows -- one WebGL scene, or an element '
+    + 'time. Two choices below: which compositor draws the windows -- one WebGPU scene, or an element '
     + 'each with the frames in this page\'s HTML. Mesa runs on gex_wgpu, on WebGPU.',
   // The image has apt in it, so a session can install into itself -- which
   // needs a Wisp relay, set with `?wisp=` (see the Debian demo).
@@ -1639,7 +1639,7 @@ const compositor = {
     wrap.className = 'canvas-wrap';
     // Which compositor draws this session. Both are the same compositor
     // underneath -- the same surfaces, the same input, the same protocol in
-    // every guest -- and differ in where the pixels land: one WebGL scene that
+    // every guest -- and differ in where the pixels land: one WebGPU scene that
     // draws its own decorations, or an element per window with the frames in
     // this page's HTML. Chosen in the picker below, or with `?desktop=`.
     //
@@ -1698,7 +1698,7 @@ const compositor = {
       name: 'gex-desktop',
       current: mode,
       options: [
-        ['scene', 'one WebGL scene (decorations drawn by the compositor)'],
+        ['scene', 'one WebGPU scene (decorations drawn by the compositor)'],
         ['dom', 'an element each (decorations in this page\'s HTML)'],
       ],
       onpick: (value) => {
@@ -1706,7 +1706,7 @@ const compositor = {
         buildOutput();
         ctx.hint(value === 'dom'
           ? 'windows will be elements, with the frames in HTML'
-          : 'windows will be drawn in one WebGL scene');
+          : 'windows will be drawn in one WebGPU scene');
       },
     }));
     document.getElementById('terminal')?.before(wrap);

@@ -70,57 +70,13 @@ export class Compositor {
       const q = globalThis.location ? new URLSearchParams(location.search) : null;
       const mesaEnv = q?.get('mesaenv');
       const glCapture = q?.get('glcapture');
-      // Mesa presents straight to a canvas of its own over the output, where
-      // the GL window is, whenever that window is on top (the worker says
-      // where, `gl-rect`); otherwise its frame is uploaded into the scene as
-      // before. Uploading a WebGPU canvas into WebGL costs a GPU-synchronous
-      // texImage2D per frame -- a quarter of the compositor's time on a small
-      // GPU. `?glpresent=upload` keeps the old path.
-      const present = this.#glOverlay(q?.get('glpresent') !== 'upload');
+      // `?wgslcache=all|site|0`: which shader translations Mesa starts with
+      // (mesa-gl.js #loadWgslCache).
+      const wgslCache = q?.get('wgslcache');
       this.#worker.postMessage({ kind: 'gl', channel, ...opts, ...(mesaEnv ? { mesaEnv } : {}),
-        ...(glCapture ? { glCapture } : {}), ...(present ? { present } : {}) }, present ? [present] : []);
+        ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}) });
     });
   }
-
-  /** The canvas Mesa presents to directly (see `hostGl`): over the output,
-   *  hidden until the worker places it, and never in the way of input. */
-  #glOverlay(want) {
-    const out = this.#canvas;
-    if (!want || !out?.parentNode || typeof document === 'undefined' || !out.transferControlToOffscreen) return null;
-    const c = document.createElement('canvas');
-    c.id = 'gex-gl-present';
-    Object.assign(c.style, { position: 'absolute', pointerEvents: 'none', display: 'none', left: '0px', top: '0px' });
-    out.parentNode.insertBefore(c, out.nextSibling);
-    this.#overlay = c;
-    this.#worker.addEventListener('message', ({ data: m }) => {
-      if (m.kind !== 'gl-rect') return;
-      if (!m.visible) {
-        c.style.display = 'none';
-        out.style.cursor = '';
-        return;
-      }
-      // Output pixels to the page's: the output canvas may be scaled by CSS.
-      const r = out.getBoundingClientRect();
-      // Absolute against the nearest positioned ancestor, or the document.
-      const op = out.offsetParent;
-      const positioned = op && op !== document.body && getComputedStyle(op).position !== 'static';
-      const pr = positioned ? op.getBoundingClientRect() : { left: -scrollX, top: -scrollY };
-      const sx = r.width / Math.max(1, out.width);
-      const sy = r.height / Math.max(1, out.height);
-      Object.assign(c.style, {
-        display: 'block',
-        left: `${r.left - pr.left + m.x * sx}px`,
-        top: `${r.top - pr.top + m.y * sy}px`,
-        width: `${m.w * sx}px`,
-        height: `${m.h * sy}px`,
-      });
-      // The compositor's own cursor is under this canvas now: the browser's.
-      out.style.cursor = 'default';
-    });
-    return c.transferControlToOffscreen();
-  }
-
-  #overlay = null;
 
   async #start(canvas, channel, inputTarget) {
     const sameTarget = inputTarget === canvas;
@@ -157,15 +113,18 @@ export class Compositor {
       worker.addEventListener('message', onMessage);
     });
     worker.addEventListener('message', ({ data: m }) => {
-      if (m.kind === 'describe') {
-        this.#pending.get(m.id)?.(m.state);
+      if (m.kind === 'describe' || m.kind === 'wgsl-cache') {
+        this.#pending.get(m.id)?.(m.kind === 'describe' ? m.state : { blob: m.blob, stats: m.stats });
         this.#pending.delete(m.id);
       } else if (m.kind === 'error') {
         console.error('[compositor]', m.error);
       }
     });
+    // `?present=canvas|readback`: how the scene reaches the canvas (see
+    // presentMode in compositor-worker.js); by default, by the adapter.
+    const present = globalThis.location ? new URLSearchParams(location.search).get('present') : null;
     worker.postMessage(
-      { kind: 'init', canvas: offscreen, channel, stats: this.#stats },
+      { kind: 'init', canvas: offscreen, channel, stats: this.#stats, present },
       [offscreen],
     );
     await ready;
@@ -267,6 +226,15 @@ export class Compositor {
   }
 
   /** The scene as the compositor sees it: window titles, focus, upload path. */
+  /** Mesa's shader translation cache: { blob (ArrayBuffer), stats }. */
+  wgslCache() {
+    const id = this.#next++;
+    return new Promise((resolve) => {
+      this.#pending.set(id, resolve);
+      this.#worker.postMessage({ kind: 'wgsl-cache', id });
+    });
+  }
+
   describe() {
     const id = this.#next++;
     return new Promise((resolve) => {

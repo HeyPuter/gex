@@ -1040,12 +1040,15 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
         use gex_kernel::nt::{boot::tramp, TRAMPOLINES};
         let exports = gex_cgen::provider::trampoline_exports((tramp::UNIX_CALL_32 - TRAMPOLINES) as u32);
         for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
-            let (path, slots) = gex_cgen::provider::build(&prov, &cache_root()?)?;
+            // As every provider: built here only where there is a translator
+            // (gex-rt finds the project's), compiled through gex_cache (which
+            // gex-rt serves from its precompiled artifacts).
+            let (path, slots) = provider_module(&prov)?;
             let pairs = gex_cgen::provider::bindings(&prov, &slots, &exports, TRAMPOLINES, trace());
             if pairs.is_empty() {
                 continue;
             }
-            let module = Module::from_file(&engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
+            let module = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| gex_cache::compile(&engine, &b)).with_context(|| format!("compiling provider {}", prov.name))?;
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
             crate::ftab::publish_pairs(&shared, &memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
             eprintln!("gex-nt: provider {} for the NT trampolines: {} entries", prov.name, pairs.len());

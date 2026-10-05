@@ -414,6 +414,21 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "provider_alloc_top", |mut caller: Caller<'_, HostState>, size: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         Ok(alloc_top(caller.data_mut(), size as u32 as u64, "[provider heap]")? as i32)
     })()) })?;
+    // fork in a native wasm32 program (the musl fork's
+    // src/process/wasm32/__gex_fork.c, asyncified by wcc): asyncify's
+    // exports on the calling instance, and the fork point itself, which
+    // starts the unwind (normal state) or ends the rewind.
+    linker.func_wrap(IMPORT_MODULE, "asyncify", |mut caller: Caller<'_, HostState>, op: i32, arg: i32| -> wasmtime::Result<i32> {
+        crate::host(asyncify(&mut caller, op, arg))
+    })?;
+    linker.func_wrap(IMPORT_MODULE, "fork_point", |mut caller: Caller<'_, HostState>, rec: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
+        match asyncify(&mut caller, 0, 0)? {
+            0 => asyncify(&mut caller, 1, rec)?,
+            2 => asyncify(&mut caller, 4, 0)?,
+            s => bail!("gex.fork_point in asyncify state {s}"),
+        };
+        Ok(())
+    })()) })?;
     // Diagnostics: text a provider writes to its stderr.
     linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {
@@ -425,6 +440,37 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         Ok(())
     })()) })?;
     Ok(())
+}
+
+/// asyncify's export `op` on the calling instance: 0 `asyncify_get_state`
+/// (0 when the module is not asyncified), 1 `start_unwind(arg)`,
+/// 2 `stop_unwind`, 3 `start_rewind(arg)`, 4 `stop_rewind`.
+fn asyncify(caller: &mut Caller<'_, HostState>, op: i32, arg: i32) -> Result<i32> {
+    let name = match op {
+        0 => "asyncify_get_state",
+        1 => "asyncify_start_unwind",
+        2 => "asyncify_stop_unwind",
+        3 => "asyncify_start_rewind",
+        4 => "asyncify_stop_rewind",
+        _ => bail!("gex.asyncify: no operation {op}"),
+    };
+    let Some(wasmtime::Extern::Func(f)) = caller.get_export(name) else {
+        if op == 0 {
+            return Ok(0);
+        }
+        bail!("gex.asyncify: the program has no {name} (fork needs wcc's asyncify)");
+    };
+    Ok(match op {
+        0 => f.typed::<(), i32>(&*caller)?.call(&mut *caller, ())?,
+        1 | 3 => {
+            f.typed::<i32, ()>(&*caller)?.call(&mut *caller, arg)?;
+            0
+        }
+        _ => {
+            f.typed::<(), ()>(&*caller)?.call(&mut *caller, ())?;
+            0
+        }
+    })
 }
 
 /// [`register`] for a 64-bit guest memory: the same functions with i64

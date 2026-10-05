@@ -213,15 +213,21 @@ fn bind(install: u32, pairs: &[(u64, u32)]) {
     lock(&BINDS).push(Bind { regs, dirs, slots });
 }
 
-/// Provider module `number`'s bytes when it is Wine's PE module (in the
-/// shim's heap), else 0.
+/// Provider module `number`'s bytes when it is Wine's PE module or a
+/// wasm32 program (in the shim's heap), else 0.
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_wasm_ptr(number: u32) -> u32 {
+    if let Some((p, _)) = super::wasmprog::wasm(number) {
+        return p;
+    }
     lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.as_ptr() as u32)
 }
 
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_wasm_len(number: u32) -> u32 {
+    if let Some((_, n)) = super::wasmprog::wasm(number) {
+        return n;
+    }
     lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.len() as u32)
 }
 
