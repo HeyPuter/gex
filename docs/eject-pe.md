@@ -947,6 +947,21 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
     describe()'s readback move, no GL readbacks.
   - Edger queue `$S/c23/queue.sh` (log `$S/c23/queue.txt`): ABBA pew/site23/
     site22, world-up A/B site22/site23, trace tr23, readback shots.
+  - **Results (edger, site23 = the WebGPU compositor, site22 = before):**
+    ABBA pew 47.5 / site23 56.2 / site22 57.8 / site22 55.7 / site23 60.4 /
+    pew 46.3: site23 58.3 vs site22 56.8 vs pewasm 46.9 (**1.24x**); world-up
+    after navigation x3: site22 35.8, 36.7, 35.7 vs site23 35.7, 34.8, 38.0
+    (no change: the compositor was not on the start-up path). Trace tr23 (10
+    s in the world): no ReadPixels / CopyRenderingResults / WebGL events, the
+    only canvas is the compositor's WebGPU one (573 PushFrames, 180 ms). With
+    `?present=readback` on edger the world renders correctly (shots
+    `$S/c23/c23r-*.png`).
+- **Merged master b7fead07** (e1d6549b; F's gex-cgen change re-keys units).
+  master's f7704244 broke the gex-rt build (Module::from_file without a
+  translator in nt_cgen's trampoline providers); fixed in 904b1191.
+  Post-merge on gooner: tests/nt/run-browser.sh 49/49, browser-gui x86,
+  x86 --gl, x64 --gl ok. p-noita17 not yet relinked at the new keys (sites
+  up to site24w are on the old keys).
 - **Shader translation cache (ed9511a5 + Mesa patch
   `$S/mesa-patches/0002-*`, committed in `$S/gexroot/third_party/mesa`; built
   in `$S/mesa-ctl-out`, copied to web/public/gex):** Tint's SPIR-V -> WGSL
