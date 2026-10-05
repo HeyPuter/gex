@@ -1595,3 +1595,48 @@ tick), providers 1.0; the GL collect wait is gone (E's frame skip).
 Next candidates, each under a millisecond a frame: gex_dispatch_miss 0.4
 (tier-1 LuaJIT code), mono_ns 0.58, the client-state GL calls still in
 the layer (338 a frame), dlmalloc 0.3.
+
+### Stream F at the daemon restart (2026-10-05, afternoon; resume here)
+
+merge/fjit = 8dbc35bf (queued for the gate) + 129c5720 (`gexc cgen-c`
+emits the image's leaf copies, as the unit has them) + dbe79f05 (E's
+35578368 cherry-picked: thread start carries compiled modules). 129c5720
+touches gex-cgen, so units built before it have other keys.
+
+**Worker threads are the critical path now** (the main thread parks ~9.6
+ms/frame on them). Workers only, g1-on1 against pwprof1 (cmp.py, ms per
+world frame): gex 13.2/13.1 work per worker against pewasm 10.8/10.8.
+0x724580 1.03×, 0x70b110 0.95×, but 0x70b200 2.14×, 0x70bdc0 1.92×,
+0x70c6e0 1.56×, 0x863fd0 1.49×, plus provider memset 0.58 and gex-only
+0x864060/0x89c2d0/0x9a4210 (pewasm's unmapped pw#7960 etc. may be them).
+Compiled C (`scratch/fjit/c/`): the guarded flavor is 25-27% more wasm
+than the unguarded one for 0x70b200/0x70bdc0/0x70c6e0 (bounds guards:
+select + lt_u per access). 0x70b200 calls seven trivial virtual leaves
+(devirtualised, leaf copies): each call still stores six GPRs, reloads
+seven and v0 (a v128, F5), and an atomic GEX_PATCHED load.
+
+**N1 (unguarded units in the normal page) in progress.** The unguarded
+noita.exe built fine this time (no unit-925 failure). Caches on gooner:
+- `target/bm-hu` (GUARD=0): all 8 Noita images done; prefix stopped at
+  20/90 for the restart. Resume: `cd ~/gex-sandbox/scratch/fjit &&
+  GUARD=0 JOBS=12 ./build-bm.sh /home/claude/gex-sandbox/wt/fjit/target/bm-hu`
+  (cached images relink in seconds; the prefix continues from its objects).
+- `target/bm-hud`: bm-hu with `GEX_CGEN_WB_DEVIRT=1` in noita.exe (done;
+  link bm-hu's prefix unit dirs into it once bm-hu finishes).
+- `target/bm-h` (guarded, same tree): not started; objects and recovery
+  are there: `JOBS=12 ./build-bm.sh /home/claude/gex-sandbox/wt/fjit/target/bm-h`.
+- The shims in wt/fjit/web/public/gex are from 129c5720 (they match these
+  keys); rebuild them (`scratch/fjit/build-shims.sh`) after any merge.
+**Next:**
+1. Finish bm-hu and bm-h, link prefix dirs into bm-hud, sync
+   (`scratch/fjit/e/sync.sh bm-h bm-hu bm-hud`), then on edger:
+   `scratch/bench/bench.sh -- scratch/fjit/e/seq.sh n1 ~/gex-sandbox/wt/fjit 240 g=$T/bm-h u=$T/bm-hu%&cgen=2&unguarded=1 ud=$T/bm-hud%&cgen=2&unguarded=1`
+   (seq.sh arms: `TAG=CACHE[@ENV][%FLAGS]`). If unguarded wins, make
+   `unguarded=1` the page default (web/src/nt-page.js) and the browser
+   build scripts GUARD=0.
+2. Workers again (cmp.py on the n1 profiles): 0x70b200's call traffic
+   (trivial devirtualised leaves), then 0x70bdc0, 0x70c6e0.
+3. Smaller main-thread items (each under 1 ms/frame): client-state GL in
+   the fast path (array flags into guest memory), mono_ns clock reads
+   (QPC provider, syscall tick), tier-1 dispatch misses.
+Nothing running on gooner or edger for stream F.
