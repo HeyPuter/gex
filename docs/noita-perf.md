@@ -1391,8 +1391,11 @@ fl_70b110/fl_70b050 left (inlined). Native --cgen NT gate 60/60.
 **Item 4 (direct import binding): dropped** (coordinator). About 45k
 cross-image calls per world frame, all threads: an estimated 0.15-0.3 ms.
 
-**Resume:**
-1. The i3b ABBA (part 2), once the GPU is free:
+**Resume (stopped for the move):** the i3b Wine prefix units were not
+finished (the cgen-prefix build was stopped); rerun it first:
+`GEX_CGEN_CACHE=wt/fjit/target/bm/cgen GEX_CGEN_GUARD=1 scratchpad/fjit/gexc-i3b
+cgen-prefix wt/fjit/target/bm/prefix --append --jobs 4` (from Noita's dir).
+1. PENDING, never run: the i3b ABBA (part 2), once the GPU is free:
    `scratchpad/fjit/v8/abba.sh i3b wt/fjit-a wt/fjit wt/fjit/target/bm wt/fjit/target/bm`
    (A: wt/fjit-a = c4efc34a with main's shim plus the key fix; B: wt/fjit
    with `scratchpad/fjit/shim-i3b.wasm` in web/public/gex). bm holds both
