@@ -10,7 +10,10 @@
 # default ~/gex-sandbox/games-linux/Muck), GEXC, CORES (optional taskset
 # list), EXE (another Unity game's executable in MUCK, e.g. hollow_knight.x86_64),
 # UNITY_RELAUNCH=1 (run a PIE rebuild of that executable: unity-launcher.c; with it,
-# STEAM_APPID=N writes steam_appid.txt beside it), DOTNET_FW (the .NET 10 shared framework directory).
+# STEAM_APPID=N writes steam_appid.txt beside it), DOTNET_FW (the .NET 10 shared framework directory),
+# GUEST_LIBS=DIR (with UNITY_RELAUNCH: the launcher's interpreter is DIR's ld-linux-x86-64.so.2 and DIR
+# comes first in its inherited DT_RPATH: another distribution's glibc, e.g. worldmachine's, to
+# reproduce what only happens there).
 #
 # Default: batch mode, no graphics. GFX=GLDIR: with graphics, GL through
 # gex-gl (GLDIR holds guest/gl/build.sh's x86-64 build) and X from an
@@ -34,7 +37,9 @@ if [ -n "${UNITY_RELAUNCH:-}" ]; then
 	# The game's executable rebuilt PIE (unity-launcher.c) among links to its files.
 	G="$RUN/game"; mkdir -p "$G"
 	for f in "$MUCK"/*; do [ "$(basename "$f")" = "$EXE" ] || ln -sfn "$f" "$G/"; done
-	cc -O1 -fPIE -pie -o "$G/$EXE" "$HERE/unity-launcher.c" -L"$MUCK" -l:UnityPlayer.so -Wl,-rpath,'$ORIGIN'
+	LIBS=; [ -n "${GUEST_LIBS:-}" ] && LIBS=$(realpath "$GUEST_LIBS") && \
+		LIBS="-Wl,--allow-shlib-undefined -Wl,--disable-new-dtags -Wl,--dynamic-linker=$LIBS/ld-linux-x86-64.so.2 -Wl,-rpath,$LIBS"
+	cc -O1 -fPIE -pie -o "$G/$EXE" "$HERE/unity-launcher.c" -L"$MUCK" -l:UnityPlayer.so -Wl,-rpath,'$ORIGIN' $LIBS
 	# STEAM_APPID: Steamworks' development file, so a game started outside Steam runs instead of
 	# asking Steam to restart it.
 	[ -n "${STEAM_APPID:-}" ] && echo "$STEAM_APPID" > "$G/steam_appid.txt"
