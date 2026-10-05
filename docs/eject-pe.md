@@ -897,6 +897,85 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   helps every load after the first), the shader translation off the
   critical path, and world generation (F, codegen).
 
+- **State at the shutdown (2026-10-05).** Head is the WIP commit "WIP:
+  compositor on WebGPU" on merge/eject9. Last measured good page: site22
+  (d1ad650c; 1.18x fps, world-up 36.7 s vs pewasm 30.2 s). The WIP is
+  untested (syntax only); do not package it before step 1.
+  - Done in the WIP: web/src/gpu-device.js (one shared device:
+    `requestGexDevice`, and `textureCanvas()`, an OffscreenCanvas whose
+    'webgpu' context hands Mesa a texture on that device, so gex_gl_display
+    copies each displayed frame into a texture the compositor samples);
+    mesa-gl.js takes `options.gpu`; compositor-worker.js: Painter, TextCache,
+    cursor on WebGPU (one pipeline, dynamic-offset uniforms, bind group per
+    texture, scene texture copied to the canvas, `describe()` async via
+    `Painter.read`), wl_shm uploads with `queue.writeTexture` from guest
+    memory, GL windows drawn from `glFrame().tex`, the frame skip keeps
+    working (GL frames enter the signature by presented serial), the
+    overlay/direct-present path and the webgl2 retry removed in the worker.
+  - Resume:
+    1. Page side: delete `#glOverlay`/`gl-rect` handling and the `present`
+       transfer in web/src/compositor.js (the worker ignores them now);
+       remove dom-compositor.js's `getContext('webgl2')` loseContext line.
+    2. Build the page, rsync into p-noita17/runtime/web/page, pack a site
+       (`eject-site.mjs p-noita17 site23 --bench`, copy site22.zcache), run
+       locally with play.mjs: check the GL frame's orientation (flip uv if
+       upside down), the format (Mesa configures the canvas format; sampled
+       BGRA reads correctly), titles, cursor, `describe()`.
+    3. tests/nt browser-gui (uses describe) and a GL demo page.
+    4. edger: ABBA vs pewasm (site22 as the before), world-up A/B
+       (`wup-ab.sh`), and a Chrome trace (`trace-edger.sh`) to confirm no
+       readback and no second context.
+    5. Then world-up's remaining levers (above): persistent SPIR-V->WGSL
+       cache, shader translation off the critical path; world generation to
+       F via the coordinator.
+  - Nothing of mine is running on gooner or edger.
+
+- **After the restart (2026-10-05, gooner):** the WebGPU compositor is
+  finished (5d5eb91f): the page-side overlay (`gl-rect`, `?glpresent`) and
+  dom-compositor's WebGL2 call are gone. Found on the way: **on a software
+  adapter (SwiftShader: every headless run on gooner, and the gate) Chromium
+  149 has no shared-image backing for any WebGPU canvas**; the first
+  `getCurrentTexture` of any WebGPU canvas loses *every* device in the
+  renderer ("destroyed"), Mesa's included, and a probe cannot detect it
+  without that loss (`$S/wgt/probe.mjs`, two.html). So the compositor reads
+  the scene back into a 2D canvas when the adapter is the fallback/swiftshader
+  one, and copies it into a WebGPU canvas otherwise (`?present=canvas|
+  readback`). Mesa itself never touches a real canvas now (textureCanvas).
+  - Checked: site23 locally (SwiftShader) shows Noita upright, in colour,
+    titled, cursor drawn; tests/nt/browser-gui.mjs x86/x64 plain and --gl all
+    ok; tests/nt/run-browser.sh 49/49. On edger (canvas path): presents and
+    describe()'s readback move, no GL readbacks.
+  - Edger queue `$S/c23/queue.sh` (log `$S/c23/queue.txt`): ABBA pew/site23/
+    site22, world-up A/B site22/site23, trace tr23, readback shots.
+  - **Results (edger, site23 = the WebGPU compositor, site22 = before):**
+    ABBA pew 47.5 / site23 56.2 / site22 57.8 / site22 55.7 / site23 60.4 /
+    pew 46.3: site23 58.3 vs site22 56.8 vs pewasm 46.9 (**1.24x**); world-up
+    after navigation x3: site22 35.8, 36.7, 35.7 vs site23 35.7, 34.8, 38.0
+    (no change: the compositor was not on the start-up path). Trace tr23 (10
+    s in the world): no ReadPixels / CopyRenderingResults / WebGL events, the
+    only canvas is the compositor's WebGPU one (573 PushFrames, 180 ms). With
+    `?present=readback` on edger the world renders correctly (shots
+    `$S/c23/c23r-*.png`).
+- **Merged master b7fead07** (e1d6549b; F's gex-cgen change re-keys units).
+  master's f7704244 broke the gex-rt build (Module::from_file without a
+  translator in nt_cgen's trampoline providers); fixed in 904b1191.
+  Post-merge on gooner: tests/nt/run-browser.sh 49/49, browser-gui x86,
+  x86 --gl, x64 --gl ok. p-noita17 not yet relinked at the new keys (sites
+  up to site24w are on the old keys).
+- **Shader translation cache (ed9511a5 + Mesa patch
+  `$S/mesa-patches/0002-*`, committed in `$S/gexroot/third_party/mesa`; built
+  in `$S/mesa-ctl-out`, copied to web/public/gex):** Tint's SPIR-V -> WGSL
+  answers kept in Mesa (in-process: 507 hits of 563 by the menus, i.e. the
+  same SPIR-V is translated again and again), loadable from a blob shipped
+  with the site (`eject-site --wgsl-cache FILE`; recorded by play.mjs's
+  `{"do":"wgsl","file":F}` step) and from IndexedDB (`?wgslcache=all|site|0`;
+  bench runs use `site`). Blobs carry the Mesa build's identity and are
+  refused by any other build. Locally with the blob: 0 misses, compile 303 ->
+  11 ms. The Mesa patch has to reach mesa-wink (coordinator).
+  - Edger chain `$S/c24/chain.sh` (log `$S/c24/chain.txt`): trains on site24
+    (blob at `$S/c24/edger.wgsl`), packs site24w, then world-up A/B x3
+    site24/site24w and legs pew/site24w/site24/pew.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
