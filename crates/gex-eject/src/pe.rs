@@ -568,7 +568,7 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
     // The web build's units, when the project has a browser runtime.
     if dir.join(WEB_NT_DIR).join(WEB_NT_WASM[0]).exists() {
         let stateful: Vec<(String, PathBuf)> = config.providers.iter().map(|p| (p.library.clone(), provider_wasm(dir, p))).collect();
-        build_web(dir, &ntss, project, &units, &web_inputs, &stateful, class32, jobs, &mut report)?;
+        build_web(dir, &ntss, project, config.args.as_deref(), &units, &web_inputs, &stateful, class32, jobs, &mut report)?;
         std::env::set_var("GEX_CGEN_CACHE", &units);
     }
     let manifest = BuildManifest {
@@ -616,6 +616,8 @@ fn build_web(
     dir: &Path,
     ntss: &NtSession,
     project: &Project,
+    // user/eject.json's "args", over the recorded ones (as `eject run`).
+    args: Option<&[String]>,
     native: &Path,
     inputs: &[(String, u64, Vec<u8>, Vec<u64>)],
     stateful: &[(String, PathBuf)],
@@ -734,7 +736,7 @@ fn build_web(
         ("exe", s(&ntss.exe)),
         ("prefix", s(&ntss.prefix)),
         ("cwd", s(project.program.cwd.as_deref().unwrap_or("/"))),
-        ("args", strs(&ntss.args)),
+        ("args", strs(args.unwrap_or(&ntss.args))),
         ("env", strs(&ntss.env)),
         ("settings", strs(&settings)),
         ("gl", b(ntss.gl)),

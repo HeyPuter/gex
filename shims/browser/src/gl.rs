@@ -1,8 +1,8 @@
 //! The guest's graphics device in a browser: `/dev/gex-gl`.
 //!
 //! Same protocol as the native device (the guest's `libGLESv2.so.2` is one
-//! binary), executed here by the page's WebGL 2 (OpenGL ES 3.0). Page side is
-//! `web/src/gl.js`. The import carries an address into guest memory rather than
+//! binary), executed here by Mesa (gex_wgpu over WebGPU). Page side is
+//! `web/src/mesa-gl.js`. The import carries an address into guest memory rather than
 //! a copy, so a frame costs one call out of wasm however many GL calls it holds.
 
 use gex_kernel::errno::{Errno, SysResult};

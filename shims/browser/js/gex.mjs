@@ -2376,7 +2376,7 @@ export class Gex {
   }
 
   /**
-   * Give the guest a graphics device. `gl` is a `GlDevice` from web/src/gl.js.
+   * Give the guest a graphics device. `gl` is a `MesaGlDevice` from web/src/mesa-gl.js.
    * Off by default, like the network. Best set before `load`, since the device
    * node is made while the filesystem is built; a later call still works.
    */
@@ -2421,7 +2421,7 @@ export class Gex {
     if (mod) return mod;
     const tl = performance.now();
     got ??= this.#env.loadUnit?.(key) ?? null;
-    if (!got) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
+    if (!got?.wasm) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
     const t0 = performance.now();
     mod = got.wasm instanceof WebAssembly.Module ? got.wasm : new WebAssembly.Module(got.wasm);
     this.#compileMs += performance.now() - t0;

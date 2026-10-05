@@ -413,15 +413,11 @@ const gears = {
   blurb:
     'An ordinary OpenGL ES 2 program. It includes the standard headers and links against ' +
     'libEGL and libGLESv2 by their usual names -- and those libraries, inside the guest, are ' +
-    'marshallers: every call crosses to this page and runs on WebGL.',
+    'marshallers: every call crosses to this page and runs on Mesa (gex_wgpu) over WebGPU.',
   network: false,
 
   async enter(ctx) {
     const query = new URLSearchParams(location.search);
-    // The Mesa path: same guest, same wire protocol, but st/mesa and the
-    // gex_wgpu Gallium driver below the decoder instead of the page's WebGL.
-    const mesaWebGpu = query.get('webgpu') === 'mesa' || query.get('gl') === 'mesa';
-    const { GlDevice } = await import('./gl.js');
 
     // The canvas lives above the terminal while this demo is chosen, made here
     // rather than in the markup so nothing else has to know the demo exists.
@@ -434,13 +430,10 @@ const gears = {
     document.getElementById('terminal')?.before(wrap);
     ctx.onLeave(() => wrap.remove());
 
-    let gl;
-    if (mesaWebGpu) {
-      gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
-        canvas, mesaBackend(query, 'es', 'wgpu'));
-    } else {
-      gl = new GlDevice(canvas);
-    }
+    // st/mesa and the gex_wgpu Gallium driver below the decoder: the only
+    // browser GL backend (there is no WebGL path).
+    const gl = await (await import('./mesa-gl.js')).MesaGlDevice.create(
+      canvas, mesaBackend(query, 'es', 'wgpu'));
     if (!gl.ok) {
       ctx.term.writeln(ctx.ansi.red(gl.error || 'This browser has no usable GPU API.'));
       ctx.status('no GPU', 'bad');
@@ -569,7 +562,7 @@ const gears = {
     };
 
     ctx.actions([{ label: 'Run', primary: true, onClick: () => start(200) }]);
-    ctx.hint('every GL call crosses to this page and runs on WebGL');
+    ctx.hint('every GL call crosses to this page and runs on Mesa over WebGPU');
 
     // `?frames=N` starts it straight away, so a link can carry the demo.
     const asked = Number(new URLSearchParams(location.search).get('frames'));
@@ -1239,7 +1232,7 @@ const supertuxkart = {
   client: stkLaunch,
   intro: [
     'SuperTuxKart is running as an AArch64 X11 application inside this page:',
-    'Xwayland -> gex-wayland; OpenGL -> gex-gl -> Mesa in this page -> WebGL or WebGPU.',
+    'Xwayland -> gex-wayland; OpenGL -> gex-gl -> Mesa in this page -> WebGPU.',
   ],
   hint: 'SuperTuxKart and Xwayland rendering straight to WebGPU',
   actions: (start) => {
