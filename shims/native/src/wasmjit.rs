@@ -83,6 +83,13 @@ fn instantiate(
 ) -> Result<()> {
     crate::ftab::catch_up(&mut *caller)?;
     let wasm = bytes_of(caller, bytes, len)?;
+    // `GEX_WASMJIT_DUMP=DIR`: keep every module the JIT hands over.
+    if let Some(dir) = std::env::var_os("GEX_WASMJIT_DUMP") {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{n:05}.wasm")), &wasm);
+    }
     let engine = caller.data().jit.as_ref().map(|j| j.engine.clone()).ok_or_else(|| anyhow!("wasmjit: no engine"))?;
     let module = {
         let key = {
@@ -96,7 +103,17 @@ fn instantiate(
         match map.get(&key) {
             Some(m) => m.clone(),
             None => {
-                let m = Module::new(&engine, &wasm).map_err(|e| anyhow!("compile: {e:#}"))?;
+                let m = match Module::new(&engine, &wasm) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // `GEX_DUMP_BAD_WASM=DIR`: keep a module the engine refused, as for gex's own.
+                        if let Some(dir) = std::env::var_os("GEX_DUMP_BAD_WASM") {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("wasmjit-{key:016x}.wasm")), &wasm);
+                        }
+                        bail!("compile: {e:#}")
+                    }
+                };
                 map.insert(key, m.clone());
                 m
             }

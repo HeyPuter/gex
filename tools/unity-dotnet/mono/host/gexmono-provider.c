@@ -262,8 +262,18 @@ preinit (void)
 	if (getenv ("GEXMONO_WASM_JIT") && atoi (getenv ("GEXMONO_WASM_JIT")) > 0) {
 		static char *opts [] = { "--no-jiterpreter-traces-enabled", "--no-jiterpreter-interp-entry-enabled",
 			"--no-jiterpreter-jit-call-enabled" };
+		/* The wasm64 bring-up's feature set: the core tier only. Each of these is a fast path with pointer
+		 * arithmetic of its own; they come back one at a time as they are ported (docs/unity-dotnet.md P5). */
+		static const char *const off [] = {
+			"MONO_WASM_JIT_INLINE_ALLOC", "MONO_WASM_JIT_T2", "MONO_WASM_JIT_GUARDED_INLINE", "MONO_WASM_JIT_DELEGATE_DEVIRT",
+			"MONO_WASM_JIT_VCALL_MEMO", "MONO_WASM_JIT_IC_MID", "MONO_WASM_JIT_PRED_MID",
+			"MONO_WASM_JIT_LAZY_COLD", "MONO_WASM_JIT_FAST_TLS", "MONO_WASM_JIT_INLINE_COLD_THROW", "MONO_WASM_JIT_EH_REC",
+			"MONO_WASM_JIT_VCALL_VRET", "MONO_WASM_JIT_VCALL_WAYS", "MONO_WASM_JIT_VCALL_AOT_WAYS", "MONO_WASM_JIT_LAZY_NOGC",
+			"MONO_WASM_JIT_DIRECT_DEPS", "MONO_WASM_JIT_PROF_ORIGIN", "MONO_WASM_JIT_PROF_INLINEE",
+		};
+		for (size_t i = 0; i < sizeof off / sizeof off [0]; i++)
+			setenv (off [i], "0", 0);
 		setenv ("MONO_WASM_JIT_AUTO", "1", 0);
-		setenv ("MONO_WASM_JIT_INLINE_ALLOC", "0", 0);
 		mono_jit_parse_options (3, opts);
 		int n = getenv ("GEXMONO_WASM_JIT_SLOTS") ? atoi (getenv ("GEXMONO_WASM_JIT_SLOTS")) : 65536;
 		int64_t base = gexwj_host_reserve (n, 0);
