@@ -2376,7 +2376,7 @@ export class Gex {
   }
 
   /**
-   * Give the guest a graphics device. `gl` is a `GlDevice` from web/src/gl.js.
+   * Give the guest a graphics device. `gl` is a `MesaGlDevice` from web/src/mesa-gl.js.
    * Off by default, like the network. Best set before `load`, since the device
    * node is made while the filesystem is built; a later call still works.
    */

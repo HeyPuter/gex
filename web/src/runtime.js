@@ -467,7 +467,7 @@ export async function runProgram(
   // that never asked, and the guest's only symptom is an empty GL_VERSION
   // much later.
   console.warn(`[gex] runtime rings: gl=${!!gl} wl=${!!wl}`);
-  // The GPU: a `GlDevice` (web/src/gl.js) the guest drives through
+  // The GPU: a `MesaGlDevice` (web/src/mesa-gl.js) the guest drives through
   // libGLESv2/libEGL marshallers over a command ring. It needs a
   // SharedArrayBuffer bridge -- `gl_submit` is synchronous inside an
   // ioctl and the canvas is here, not in the Worker. Without this the `gl`
