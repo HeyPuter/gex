@@ -18,3 +18,4 @@
 100 stdcall -noname abi_noname(long)
 @ varargs abi_printf(str)
 @ varargs abi_words(long)
+@ cdecl abi_vprintf(str ptr)

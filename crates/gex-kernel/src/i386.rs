@@ -237,6 +237,7 @@ pub mod raw {
     pub const SHUTDOWN: u64 = 373;
     pub const MEMBARRIER: u64 = 375;
     pub const COPY_FILE_RANGE: u64 = 377;
+    pub const SPLICE: u64 = 313;
     pub const STATX: u64 = 383;
     pub const ARCH_PRCTL: u64 = 384;
     pub const RSEQ: u64 = 386;
@@ -713,6 +714,11 @@ pub fn translate(
             a[0] = sext(a[0]);
             a[2] = sext(a[2]);
             nr::COPY_FILE_RANGE
+        }
+        x::SPLICE => {
+            a[0] = sext(a[0]);
+            a[2] = sext(a[2]);
+            nr::SPLICE
         }
         x::FALLOCATE => {
             // fallocate(fd, mode, off_lo, off_hi, len_lo, len_hi)

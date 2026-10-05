@@ -1000,6 +1000,90 @@ plus `make -k`.
   bytes in system DLLs, self-modifying hooks. They are rare in this set and
   handled by rebinding on write (§3.3).
 
+### 5.1 Queued (user, 2026-10-05): the guest's Unix userland as native wasm
+
+After the current W2 items (user32/gdi32 native, `_vsnprintf_s`,
+NtWow64*64, `__control87_2`): native wasm32 builds of the guest's libc,
+coreutils and whatever other Unix libraries Wine's Unix side depends on, on
+the musl fork (`wt/musl-wasm`, `gex-wasm32`), the wasm32 personality
+(§3.11) and the closed-world dlopen registry (§3.12).
+
+Steps:
+1. **Survey** what actually runs: what Wine's Unix side (ntdll.so,
+   win32u.so and the other `*.so` unixlibs) links and dlopens (libc, libm,
+   libpthread, libdl/ld.so, and if built freetype, fontconfig, gnutls,
+   libpng, libz...), and what a prefix's scripts and wineserver exec (sh and
+   the coreutils `wineboot` and the staging scripts call). Record each with
+   who loads it and how (static link, `dlopen`, `execve`).
+2. **Order** (proposal, to be confirmed by the survey):
+   1. libc/libm/libpthread as musl (the sysroot already has them; what is
+      new is shipping them as the guest's, under the wasm32 personality);
+   2. Wine's Unix side itself (ntdll.so, win32u.so) as wasm32, against that
+      libc, with the unixlibs in the dlopen registry;
+   3. the dlopen'ed third-party libraries Wine needs at run time
+      (freetype first: fonts; then fontconfig, gnutls as games need them);
+   4. a shell (busybox's `sh` or dash) and the coreutils the scripts call
+      (busybox would cover most in one binary).
+3. Each lands with a test under tests/wasm32 (a program using it, natively
+   and in the browser).
+
+**Survey (2026-10-05, `gexc run --strace` on gooner; scratch/W/survey):**
+- **Windows programs (Wine on gex) use no Unix userland at all.** gex
+  replaces Wine's Unix side: NT system calls and the few unix calls
+  (`unixcall.rs`: ntdll's, ws2_32, opengl32, crypt32) are gex-kernel's Rust;
+  there is no ntdll.so, wineserver, ld.so or libc in a Wine run. A
+  `hello_args.exe` trace makes no Linux file system call outside the prefix.
+  What Wine would get from Unix libraries is either in gex already (sockets,
+  GL through gex-gl) or missing:
+  - **TrueType**: gex's GDI draws only the prefix's bitmap `.fon` fonts
+    (`nt/gdi/font.rs`); Wine uses **freetype** (and fontconfig to find
+    fonts). Candidate 1 for a native wasm library: freetype as a provider
+    behind gex's GDI text.
+  - **Crypto/TLS**: crypt32/bcrypt/secur32's unix calls answer
+    NOT_SUPPORTED (`unixcall.rs`); Wine uses **gnutls** (or a smaller TLS and
+    hash library would do for bcrypt).
+  - Audio (winepulse/winealsa), joysticks (winebus: SDL/udev), media
+    (gstreamer) are not wired in gex's NT layer yet; they are host
+    integrations more than libraries.
+- **Linux programs** (x86-64/i386 glibc ELF, e.g. Unity's Linux players)
+  load, from the host's (or the page bundle's) root:
+  - `ld-linux-x86-64.so.2`, `libc.so.6`, `libm.so.6`, `libdl`, `libpthread`,
+    `librt`, `libanl`, `libgcc_s` (every Unity/FNA player's NEEDED);
+  - by dlopen: `libGL`/`libEGL`/`libGLES*`, `libvulkan`, `libX11`,
+    `libXext`, `libXrandr`, `libXcursor`, `libXinerama`, `libXi`, `libXss`,
+    `libXxf86vm`, `libX11-xcb`, `libasound`, `libpulse-simple`, `libudev`
+    (strings of UnityPlayer.so); FNA bundles SDL2, FNA3D, FMOD.
+  - These are x86 code called by x86 code: "native wasm" for them means
+    **export providers for ELF images** (as gex-cgen's PE providers for
+    msvcrt: `crt_mem`, `crt_math`, `crt_heap`), not replacing the library
+    wholesale. gex-cgen's providers are PE-only today
+    (`provider::for_image`).
+- **Shell and coreutils** (`/bin/sh -c` with ls, sort, head, tr, cat, wc,
+  mkdir, cp, rm, date, uname, sed, grep, awk, find, xargs, env, id): dash
+  and GNU coreutils, each a dynamic glibc program, opening `libc.so.6` and
+  for some `libacl`, `libattr`, `libselinux`, `libpcre2-8`, plus
+  `/etc/ld.so.cache`, `/etc/localtime`, `/proc/filesystems`. Every one
+  is a full x86 translation per exec. Found on the way: `splice` (x86-64
+  275) had no canonical form, so `grep` from a pipe failed with ENOSYS
+  (a gex-kernel fix, next).
+
+**Proposed order** (revises step 2):
+1. **busybox** (sh + coreutils in one binary) built with `wcc` as a wasm32
+   program (§3.11 personality, musl): scripts' `sh`, `sed`, `grep`... run
+   natively instead of translated. Map `/bin/sh` and the coreutils names to
+   it in the guest root (natively by a gexc option, in the page's bundle).
+   Biggest win per effort: every script exec today translates dash/coreutils.
+2. **ELF export providers** for glibc's hot entry points (`memcpy`/`memset`/
+   `str*`, `malloc` family, libm), the PE providers' model on ELF images;
+   needs gex-cgen's provider binding by ELF symbol (gex-cgen re-keys units:
+   coordinate).
+3. **freetype** as a stateful provider behind gex's GDI (TrueType text in
+   Windows programs), built with `wcc` against the musl sysroot.
+4. **gnutls** (or a smaller crypto library) behind crypt32/bcrypt's unix
+   calls, when a game needs TLS or hashes.
+5. X11 client libraries stay as they are: the guest's X11 goes to the
+   integrated Xwayland.
+
 ## 6. Open decisions for the user
 
 1. **Go/no-go on W0.** The spikes answer the cost questions before the big
@@ -1086,8 +1170,19 @@ plus `make -k`.
     `$W/pfx-native` (3 DLLs), `$W/pfx-w32u` (9: + msvcrt, ucrtbase,
     vcruntime140, msvcp140, concrt140, win32u) and the x86 prefix.
   - `$W/noadapter.sh DLL` lists a DLL's function exports with no adapter.
-  - Open: `_vsnprintf_s`, the NtWow64*64 calls, guest FP control words
-    (`__control87_2` is a stub on wasm32), user32/gdi32 native.
+  - **user32 and gdi32 native (8157fa81, fork ed2d0f5375b/87f806ced36):**
+    tests/nt 77/77 on `$W/pfx-gui` (11 DLLs: the 9 above + gdi32, user32),
+    browser x86 23/23. winebuild now makes adapters from the .spec when the
+    objects lack the signature, for renamed `-import` exports (user32's
+    GetKeyState is win32u's NtUserGetKeyState), and for 64-bit parameters
+    spelled as two words (NtWow64*64); pelink thunks caller/definition
+    signature mismatches and stubs (trapping, listed) what nothing defines.
+    FP control words are the guest's (`_controlfp`, `__control87_2`...);
+    va_list printfs are relaid like varargs; `_vsnprintf_s` fixed.
+  - W's check prefixes: `$W/pfx-native` (3 DLLs), `$W/pfx-dev` (9),
+    `$W/pfx-gui` (11); `$W/pfx-w32u` is the coordinator's gate copy (do not
+    restage while a gate runs). `$W/check.sh` runs them all.
+  - Next: §5.1 (the guest's Unix userland as native wasm).
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
     merge/wine-wasm after its gate.
 - **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
