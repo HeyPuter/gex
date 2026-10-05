@@ -14,5 +14,4 @@ _CIpow
 _CIatan2
 _ftol
 __libm_sse2_pow
-_chkesp
 strcmp

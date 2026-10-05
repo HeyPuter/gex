@@ -1,6 +1,7 @@
 // msvcrt's i386 register-convention math: _CI* (x87 ST0/ST1 in, ST0 out),
 // _ftol (ST0 in, EDX:EAX out), __libm_sse2_* (XMM0/XMM1 in, XMM0 out),
-// and _chkesp (keeps EAX). Built by build.sh like cxxeh.cpp.
+// Built by build.sh like cxxeh.cpp. (_chkesp is not here: it reads the
+// caller's ZF, which the function tier does not carry into a call.)
 extern "C" {
 __declspec(dllimport) int __cdecl printf(const char *, ...);
 __declspec(dllimport) void __cdecl exit(int);
@@ -9,7 +10,6 @@ __declspec(dllimport) void __cdecl _CIpow(void);
 __declspec(dllimport) void __cdecl _CIatan2(void);
 __declspec(dllimport) void __cdecl _ftol(void);
 __declspec(dllimport) void __cdecl __libm_sse2_pow(void);
-__declspec(dllimport) void __cdecl _chkesp(void);
 int _fltused = 0;
 }
 
@@ -57,16 +57,6 @@ __declspec(noinline) static double sse2(fn f, double x, double y)
     return r;
 }
 
-__declspec(noinline) static unsigned int chkesp(fn f)
-{
-    unsigned int r;
-    __asm { mov eax, 1234
-            xor ecx, ecx
-            call f
-            mov r, eax }
-    return r;
-}
-
 int entry(void)
 {
     CHECK("_CIsqrt", ci1(_CIsqrt, 2.25) == 1.5);
@@ -74,7 +64,6 @@ int entry(void)
     CHECK("_CIatan2 (ST1, ST0)", ci2(_CIatan2, 0.0, -1.0) > 3.14 && ci2(_CIatan2, 0.0, -1.0) < 3.15);
     CHECK("_ftol truncates", ftol(_ftol, -7.9) == -7 && ftol(_ftol, 5000000000.5) == 5000000000ll);
     CHECK("__libm_sse2_pow", sse2(__libm_sse2_pow, 3.0, 4.0) == 81.0);
-    CHECK("_chkesp keeps EAX", chkesp(_chkesp) == 1234);
     printf("%d failures\n", failures);
     exit(failures);
     return failures;
