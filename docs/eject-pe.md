@@ -843,6 +843,23 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   `prof-edger.sh SITE TAG 1 60` (page-run now profiles Workers that start
   during the window too).
 
+- **Queued (user decision, after the start-up work): no WebGL in the
+  browser.** Port the Wayland compositor (web/src/compositor-worker.js, and
+  dom-compositor.js if still live) from WebGL2 to WebGPU on the GPUDevice
+  Mesa uses: GL windows become textures the compositor samples directly
+  (no cross-API copy, no second context, no webgl2 start-up retry, no
+  overlay canvas), wl_shm rows uploaded with queue.writeTexture from guest
+  memory; keep the frame-skip semantics (no present when nothing changed).
+  web/src/gl.js and the demos' WebGL path are being removed on master by
+  the coordinator.
+- **Start-up profile from the process start (site19, prof-gst):** every
+  guest thread's Worker spent 2.5-3.7 s in `loadFile` (synchronous
+  requests through the service worker) plus 0.5-1.5 s compiling modules:
+  `loadUnit` fetched each unit's c.wasm (131 MiB for noita.exe) only to
+  read its entries, though the Module came from a sibling. Fix 065139bb:
+  the bytes are fetched lazily, only by a Worker that compiles. A/B
+  site19/site20 queued (`$S/edger-wab3.txt`).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
