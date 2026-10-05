@@ -20,7 +20,7 @@
 #   em-runtime em-native em-smoke   P1's emscripten build and its node smoke test
 #
 # Needs clang/wasm-ld (22), llvm-ar, dotnet, git, ninja, cmake; /usr/lib/emsdk only for em-*.
-# Builds at nice 19 with at most 4 jobs (stream rules).
+# Builds at nice 19 with JOBS (default 12) jobs (stream rules).
 set -euo pipefail
 
 FORK=https://github.com/r58Playz/dotnet-runtime.git
@@ -33,6 +33,7 @@ OUT=$(realpath -m "$1"); shift
 STEPS=${*:-src sysroot runtime native corelib provider}
 MUSL_SRC=${MUSL_SRC:-$(realpath -m "$UD/../../../musl-wasm64")}
 RUN="nice -n 19"
+JOBS=${JOBS:-12}  # gooner rules: a heavy nice-19 build may use 12 jobs
 # CMake for dotnet/runtime wants llvm-strings, llvm-readelf, llvm-link: from the versioned LLVM if not on PATH.
 command -v llvm-strings >/dev/null || PATH=$PATH:/usr/lib/llvm-22/bin
 SR=$OUT/sysroot/sysroot
@@ -63,7 +64,7 @@ step_runtime() {
 		-DFEATURE_PERFTRACING_DISABLE_PERFTRACING_LISTEN_PORTS=1 -DFEATURE_PERFTRACING_DISABLE_DEFAULT_LISTEN_PORT=1 \
 		-DFEATURE_PERFTRACING_DISABLE_CONNECT_PORTS=1 -DWITH_OPTIM=OFF \
 		"$OUT/src/src/mono" > "$OUT/runtime-configure.log"
-	$RUN ninja -j4 > "$OUT/runtime-build.log"
+	$RUN ninja -j"$JOBS" > "$OUT/runtime-build.log"
 }
 
 step_native() {
@@ -73,7 +74,7 @@ step_native() {
 		-DCLR_CMAKE_TARGET_ARCH=wasm -DCLR_CMAKE_TARGET_OS=linux -DWITH_OPTIM=OFF -DGEX_NO_GLOBALIZATION_NATIVE=1 \
 		> "$OUT/native-configure.log"
 	cd "$OUT/objnative"
-	$RUN ninja -j4 System.Native/libSystem.Native.a > "$OUT/native-build.log"
+	$RUN ninja -j"$JOBS" System.Native/libSystem.Native.a > "$OUT/native-build.log"
 }
 
 step_corelib() {
@@ -100,13 +101,21 @@ step_provider() {
 	done
 	clang $WASM64_CFLAGS $INC -I"$N/libs/Common" -I"$OUT/objnative/Common" -I"$N/libs/System.Native" -I"$N" -I"$N/libs" \
 		-c "$N/libs/System.Native/entrypoints.c" -o entrypoints-System.Native.o
-	wasm-ld -mwasm64 --experimental-pic -pie --no-entry --shared-memory --import-memory --max-memory=17179869184 -o mono.wasm \
-		gexmono-provider.o gexmono-unity.o gexprov64.o gexprov64-table.o adapters.o m2n.o entrypoints-System.Native.o "$OUT/objnative/System.Native/libSystem.Native.a" \
-		"$L"/mini/libmonosgen-2.0.a "$L"/mini/libmono-ee-interp.a "$L"/mini/libmono-component-marshal-ilgen-static.a \
-		"$L"/mini/libmono-component-hot_reload-stub-static.a "$L"/mini/libmono-component-debugger-stub-static.a \
-		"$L"/mini/libmono-component-diagnostics_tracing-stub-static.a "$L"/mini/libmono-wasm-nosimd.a \
-		"$L"/minipal/minipal/libminipal.a "$OUT/obj/_deps/fetchzlibng-build/libz.a" \
-		-L"$SR/lib" -lc "$SR/lib/libclang_rt.builtins-wasm64.a"
+	link() {
+		wasm-ld -mwasm64 --experimental-pic -pie --no-entry --shared-memory --import-memory --max-memory=17179869184 -o mono.wasm \
+				gexmono-provider.o gexmono-unity.o gexprov64.o gexprov64-table.o adapters.o m2n.o entrypoints-System.Native.o "$OUT/objnative/System.Native/libSystem.Native.a" \
+				"$L"/mini/libmonosgen-2.0.a "$L"/mini/libmono-ee-interp.a "$L"/mini/libmono-component-marshal-ilgen-static.a \
+				"$L"/mini/libmono-component-hot_reload-stub-static.a "$L"/mini/libmono-component-debugger-stub-static.a \
+				"$L"/mini/libmono-component-diagnostics_tracing-stub-static.a "$L"/mini/libmono-wasm-nosimd.a \
+				"$L"/minipal/minipal/libminipal.a "$OUT/obj/_deps/fetchzlibng-build/libz.a" \
+				-L"$SR/lib" -lc "$SR/lib/libclang_rt.builtins-wasm64.a"
+	}
+	# Interp-to-native wrappers for every function type in the provider (gen-m2n.py): link, read
+	# the types, regenerate them, link again.
+	link
+	python3 "$HERE/host/gen-m2n.py" "$HERE/host/m2n-extra.txt" --types-from mono.wasm > m2n.c
+	clang $WASM64_CFLAGS $INC -Wno-unused-command-line-argument -c m2n.c -o m2n.o
+	link
 	echo "provider: $W/mono.wasm; $(tail -1 adapters.log | cut -d, -f1)"
 }
 
@@ -125,7 +134,7 @@ step_em-runtime() {
 		-DFEATURE_PERFTRACING_DISABLE_DEFAULT_LISTEN_PORT=1 \
 		"-DCMAKE_ASM_FLAGS=$F" "-DCMAKE_C_FLAGS=$F -D_GNU_SOURCE=1 -mnontrapping-fptoint" \
 		"-DCMAKE_CXX_FLAGS=$F -D_GNU_SOURCE=1 -mnontrapping-fptoint" "$OUT/src/src/mono" > "$OUT/em-runtime-configure.log"
-	$RUN ninja -j4 > "$OUT/em-runtime-build.log"
+	$RUN ninja -j"$JOBS" > "$OUT/em-runtime-build.log"
 }
 
 step_em-native() {
@@ -136,7 +145,7 @@ step_em-native() {
 		-DCLR_CMAKE_TARGET_OS=browser -DCLR_CMAKE_TARGET_ARCH=wasm -DCLR_CMAKE_HOST_ARCH=wasm -DMONO_WASM_MT=1 \
 		"-DCMAKE_C_FLAGS=$F" "-DCMAKE_CXX_FLAGS=$F" > "$OUT/em-native-configure.log"
 	cd "$OUT/objnative-em"
-	$RUN ninja -j4 System.Native/libSystem.Native.a > "$OUT/em-native-build.log"
+	$RUN ninja -j"$JOBS" System.Native/libSystem.Native.a > "$OUT/em-native-build.log"
 	local N="$OUT/src/src/native"
 	emcc $F -O2 -c "$N/libs/System.Native/entrypoints.c" -I"$N/libs/Common" -I"$OUT/objnative-em/Common" \
 		-I"$N/libs/System.Native" -I"$N" -I"$N/libs" -o "$OUT/objnative-em/entrypoints-System.Native.o"

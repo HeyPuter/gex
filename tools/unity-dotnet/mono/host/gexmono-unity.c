@@ -102,6 +102,54 @@ U(mono_unity_type_get_name_full_chunked)
 	RETV;
 }
 
+/* Unity's mscorlib is .NET Framework's reference source, whose private
+ * fields are m_name; .NET's CoreLib names most of the same fields _name.
+ * UnityPlayer reads a few of them by name (AttributeUsageAttribute's
+ * m_attributeTarget, m_inherited, m_allowMultiple). A miss on m_x retries
+ * _x, then the table; a final miss is logged. */
+static const char *const field_alias [][3] = {
+	{ NULL, NULL, NULL },
+};
+U(mono_class_get_field_from_name)
+{
+	ENTER;
+	MonoClass *k = P (0);
+	const char *name = P (1);
+	MonoClassField *f = mono_class_get_field_from_name (k, name);
+	if (!f && name && name [0] == 'm' && name [1] == '_') {
+		char *alt = g_strdup (name + 1);
+		f = mono_class_get_field_from_name (k, alt);
+		g_free (alt);
+	}
+	for (int i = 0; !f && name && field_alias [i][0]; i++)
+		if (!strcmp (name, field_alias [i][1]) && !strcmp (m_class_get_name (k), field_alias [i][0]))
+			f = mono_class_get_field_from_name (k, field_alias [i][2]);
+	if (!f && k)
+		fprintf (stderr, "[gexmono] no field %s.%s::%s\n", m_class_get_name_space (k), m_class_get_name (k), name ? name : "(null)");
+	RET (f);
+}
+
+/* mono_custom_attrs_from_field (klass, field): Mono finds the field's
+ * metadata row from its index in klass's field array, so klass must be the
+ * class that defines the field. UnityPlayer's serializer passes the class it
+ * is serializing, which for an inherited field is a subclass; use the
+ * field's own parent. */
+U(mono_custom_attrs_from_field)
+{
+	ENTER;
+	MonoClass *k = P (0);
+	MonoClassField *f = P (1);
+	MonoClass *parent = f ? m_field_get_parent (f) : NULL;
+	if (parent && parent != k) {
+		static int logged;
+		if (gexmono_trace_on || logged++ < 8)
+			fprintf (stderr, "[gexmono] custom_attrs_from_field: %s::%s is %s's, not %s's\n", m_class_get_name (parent),
+				mono_field_get_name (f), m_class_get_name (parent), k ? m_class_get_name (k) : "?");
+		k = parent;
+	}
+	RET (mono_custom_attrs_from_field (k, f));
+}
+
 U(unity_mono_method_is_generic) { ENTER; RET (((MonoMethod *)P (0))->is_generic); }
 U(unity_mono_method_is_inflated) { ENTER; RET (((MonoMethod *)P (0))->is_inflated); }
 U(unity_mono_reflection_method_get_method) { ENTER; MonoReflectionMethod *m = P (0); RET (m ? m->method : NULL); }
@@ -367,6 +415,6 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
 	L(mono_trace_set_log_handler) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
-	L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
+	L(mono_class_get_field_from_name) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0
 };
