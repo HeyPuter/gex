@@ -85,7 +85,8 @@ if relocatable:
     cmd = ['wasm-ld', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
     sys.exit(subprocess.call(cmd))
 if shared:
-    cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags
+    cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags + \
+        [lib + '/libclang_rt.builtins-wasm32.a']
     sys.exit(subprocess.call(cmd))
 wasm = out + '.wasm'
 cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
