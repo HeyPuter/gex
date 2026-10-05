@@ -142,4 +142,33 @@ malloc as a group, then libm, then whatever else the profile shows.
 
 ## 6. Measurements
 
-(filled in below as runs come in)
+**Warfork dedicated server, x86-64, 6 bots in deathmatch (gooner, native
+gexc `--record`, 2026-10-05).** The weight is block bytes times executions,
+a proxy for executed guest instructions. Steady state is the 1020 s run
+minus the 420 s run (`scratch/W/elf/tools/diff.py` and `share.py`;
+profiles in `scratch/W/elf/wf420`, `wf1020`):
+- **libc.so.6: 14.7% of guest work.**
+  - mem*: 7.6% (`__memmove_ssse3` 4.8%, `__memset_sse2_unaligned[_erms]`
+    2.8%).
+  - printf family: about 4.7% (`__vfprintf_internal` 2.7%,
+    `_IO_default_xsputn` 1.0%, `vsnprintf`, the `_IO` string-stream setup).
+  - malloc/free: about 1.5%.
+  - str*: about 0.7%.
+- **libm.so.6: 1.3%** (`__sincos_sse2` 0.8%, `__floorf_c` 0.4%, atan2
+  0.1%).
+- The rest is the game: AngelScript (libangelwrap) 36.9%, the server 30.2%,
+  the game module 16.6%.
+- glibc's IFUNCs pick the SSE2/SSSE3 variants under gex's CPUID (no AVX).
+- Load phase (the 420 s run alone): libc 17.4%, mostly time-zone code
+  (`__offtime`, `__tzfile_compute`: localtime per log line), mem*, and
+  malloc.
+- Muck (Unity, `-batchmode -nographics`, `--mem64`): no profile yet. The
+  run doesn't exit on SIGINT or SIGTERM, so `--record` writes nothing.
+  Loading took 175-205 s; it needs a clean exit or a periodic profile dump.
+
+Found on the way:
+- `select` on a stdin pipe was always "readable" natively, so Warfork's
+  server blocked in read after loading. Fixed on branch `fix/stdin-poll`
+  293345c4 (gex-kernel `STDIN_READY`, set by gexc).
+- A TCP `accept` (sv_http's listener) returns ENOTSOCK: gex-kernel has no
+  inet listeners (`sys_unix_accept` only).
