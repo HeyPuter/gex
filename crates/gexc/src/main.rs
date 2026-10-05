@@ -132,7 +132,7 @@ usage:
                                    and gets one built for the next run.
                                    --cgen: every program image must have one;
                                    --no-cgen: tier-1 only
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--mem64]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run --cgen`, which installs it when the
@@ -2344,6 +2344,9 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
                 i += 1;
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
             }
+            // A unit for a 64-bit guest memory (docs/mem64.md): another
+            // key, other code.
+            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
             t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),

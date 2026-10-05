@@ -623,14 +623,18 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     let max = std::env::var("GEX_CGEN_MEMORY_MAX").unwrap_or_else(|_| "12G".into());
     let base = format!("{:#x}", p.base);
-    let args = ["cgen-image", p.path.as_str(), "--pe-base", base.as_str()];
+    let mut args = vec!["cgen-image", p.path.as_str(), "--pe-base", base.as_str()];
+    // The unit this process looks up is for its own guest memory.
+    if gex_abi::mem64() {
+        args.push("--mem64");
+    }
     let capped = std::process::Command::new("systemd-run")
         .args(["--user", "--scope", "-q", "-p", &format!("MemoryMax={max}")])
         .arg("nice")
         .arg("-n")
         .arg("10")
         .arg(&exe)
-        .args(args)
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .process_group(0)
@@ -638,7 +642,7 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
     match capped {
         Ok(c) => Ok(c),
         Err(_) => Ok(std::process::Command::new(&exe)
-            .args(args)
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .process_group(0)
