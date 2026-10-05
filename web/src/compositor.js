@@ -70,8 +70,11 @@ export class Compositor {
       const q = globalThis.location ? new URLSearchParams(location.search) : null;
       const mesaEnv = q?.get('mesaenv');
       const glCapture = q?.get('glcapture');
+      // `?wgslcache=all|site|0`: which shader translations Mesa starts with
+      // (mesa-gl.js #loadWgslCache).
+      const wgslCache = q?.get('wgslcache');
       this.#worker.postMessage({ kind: 'gl', channel, ...opts, ...(mesaEnv ? { mesaEnv } : {}),
-        ...(glCapture ? { glCapture } : {}) });
+        ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}) });
     });
   }
 
@@ -110,8 +113,8 @@ export class Compositor {
       worker.addEventListener('message', onMessage);
     });
     worker.addEventListener('message', ({ data: m }) => {
-      if (m.kind === 'describe') {
-        this.#pending.get(m.id)?.(m.state);
+      if (m.kind === 'describe' || m.kind === 'wgsl-cache') {
+        this.#pending.get(m.id)?.(m.kind === 'describe' ? m.state : { blob: m.blob, stats: m.stats });
         this.#pending.delete(m.id);
       } else if (m.kind === 'error') {
         console.error('[compositor]', m.error);
@@ -223,6 +226,15 @@ export class Compositor {
   }
 
   /** The scene as the compositor sees it: window titles, focus, upload path. */
+  /** Mesa's shader translation cache: { blob (ArrayBuffer), stats }. */
+  wgslCache() {
+    const id = this.#next++;
+    return new Promise((resolve) => {
+      this.#pending.set(id, resolve);
+      this.#worker.postMessage({ kind: 'wgsl-cache', id });
+    });
+  }
+
   describe() {
     const id = this.#next++;
     return new Promise((resolve) => {

@@ -1254,6 +1254,7 @@ async function startGl(m, canvas) {
     api: m.api || 'core',
     env: m.mesaEnv,
     capture: m.glCapture,
+    wgslCache: m.wgslCache,
     gpu: await requestGexDevice(),
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
@@ -1311,6 +1312,10 @@ self.onmessage = ({ data: m }) => {
       comp?.pointerAxis(m.axis, m.value, m.time);
     } else if (m.kind === 'key') {
       comp?.key(m.code, m.pressed, m.mods, m.time);
+    } else if (m.kind === 'wgsl-cache') {
+      // The shader translation cache, for a training run to record.
+      const blob = glDevice?.wgslCache?.() ?? null;
+      postMessage({ kind: 'wgsl-cache', id: m.id, blob, stats: glDevice?.wgslStats?.() ?? null }, blob ? [blob] : []);
     } else if (m.kind === 'describe') {
       Promise.resolve(comp?.describe() ?? null).then((state) => postMessage({ kind: 'describe', id: m.id, state }));
     } else if (m.kind === 'stop') {

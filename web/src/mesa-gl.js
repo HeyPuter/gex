@@ -143,6 +143,23 @@ function quietReports(out) {
   };
 }
 
+/** One IndexedDB store of shader-cache blobs, by Mesa glue URL. */
+function wgslDb(op, key, value) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('gex-wgsl-cache', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('blobs');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('blobs', op === 'get' ? 'readonly' : 'readwrite');
+      const req = op === 'get' ? tx.objectStore('blobs').get(key) : tx.objectStore('blobs').put(value, key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => db.close();
+    };
+  });
+}
+
 export class MesaGlDevice {
   // The GPUAdapter and GPUDevice, held for the renderer's whole life and never
   // read again.
@@ -274,6 +291,9 @@ export class MesaGlDevice {
         out.#module._gex_gl_setenv(at);
         out.#module._free(at);
       }
+      // Shader translations from before (Tint's SPIR-V -> WGSL, most of a
+      // shader compile): the site's recorded set and this browser's own.
+      await out.#loadWgslCache(url, options.wgslCache ?? 'all');
       const rc = out.#module._gex_gl_init(canvas.width, canvas.height);
       if (rc !== 0) out.#failed = `Mesa/WebGPU initialization failed (${rc})`;
       out.#description = `Mesa st/mesa + gex_wgpu on WebGPU (${api})`;
@@ -282,6 +302,80 @@ export class MesaGlDevice {
       out.#failed = e?.message || String(e);
     }
     return out;
+  }
+
+  // -- the shader translation cache (gex_wgpu_tint.cpp) --------------------
+  //
+  // Blobs of SPIR-V -> WGSL answers, each refused by Mesa unless this very
+  // build made it. Two sources, both before the first compile: the site's
+  // recorded set (`gex-wgsl-cache.bin` beside the Mesa glue, packed by
+  // eject-site from a training run) and the browser's IndexedDB, to which
+  // new translations are saved every few seconds while they keep coming.
+  #wgslKey = null;
+  #wgslSaved = 0;
+
+  /** `mode`: 'all' (the site's and this browser's), 'site' (the site's
+   *  only, nothing kept: bench runs, whose profile outlives a run), '0'. */
+  async #loadWgslCache(url, mode) {
+    const m = this.#module;
+    if (!m._gex_wgsl_cache_load || mode === '0') return;
+    const glue = new URL(url, location.href);
+    this.#wgslKey = glue.href;
+    const load = (bytes, from) => {
+      if (!bytes?.byteLength) return;
+      const at = m._malloc(bytes.byteLength);
+      m.HEAPU8.set(new Uint8Array(bytes), at);
+      const n = m._gex_wgsl_cache_load(at, bytes.byteLength);
+      m._free(at);
+      console.log(`[mesa-gl] shader cache: ${n < 0 ? 'refused (another build)' : `${n} translations`} from ${from}`);
+    };
+    try {
+      const r = await fetch(new URL('gex-wgsl-cache.bin', glue));
+      if (r.ok) load(await r.arrayBuffer(), 'the site');
+    } catch { /* none shipped */ }
+    if (mode === 'site') {
+      this.#wgslKey = null;
+      return;
+    }
+    try {
+      load(await wgslDb('get', this.#wgslKey), 'this browser');
+    } catch { /* no IndexedDB here */ }
+    const timer = setInterval(() => this.#saveWgslCache(), 5000);
+    (globalThis.__gexWgslTimers ||= []).push(timer);
+  }
+
+  /** The whole cache as one blob (an ArrayBuffer), or null. */
+  wgslCache(onlyFresh = false) {
+    const m = this.#module;
+    if (!m?._gex_wgsl_cache_dump) return null;
+    const lenAt = m._malloc(4);
+    const at = m._gex_wgsl_cache_dump(onlyFresh ? 1 : 0, lenAt);
+    const len = new Uint32Array(m.HEAPU8.buffer, lenAt, 1)[0];
+    m._free(lenAt);
+    if (!at) return null;
+    const blob = m.HEAPU8.slice(at, at + len).buffer;
+    m._free(at);
+    return blob;
+  }
+
+  /** hits, misses, loaded, held. */
+  wgslStats() {
+    const m = this.#module;
+    if (!m?._gex_wgsl_cache_stats) return null;
+    const at = m._malloc(16);
+    m._gex_wgsl_cache_stats(at);
+    const [hits, misses, loaded, held] = new Uint32Array(m.HEAPU8.buffer, at, 4);
+    m._free(at);
+    return { hits, misses, loaded, held };
+  }
+
+  async #saveWgslCache() {
+    const st = this.wgslStats();
+    if (!this.#wgslKey || !st || st.misses === this.#wgslSaved) return;
+    this.#wgslSaved = st.misses;
+    try {
+      await wgslDb('put', this.#wgslKey, this.wgslCache());
+    } catch { /* best effort */ }
   }
 
   get ok() {
