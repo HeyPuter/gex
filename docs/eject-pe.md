@@ -831,6 +831,18 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   multi-threaded loading. Then the compositor items only if a profile
   puts the worker back on the critical path.
 
+- **Post-merge check (site19, master 5ab54ab2 merged, keys unchanged: 38
+  units present, 0 built; p-noita17's user/eject.json now has `"args": []`,
+  which the web build honours since this commit's sibling):** ABBA on edger
+  ejected 57.2, 58.6 vs pewasm 46.0, 45.0 = **1.27x**, world-up 49 s after
+  the process start. Multi-threaded loading is the project's setting
+  (user/eject.json `args`), not an eject-site default: eject-site is
+  generic, and `--args` stays the override.
+- Start-up profiles from the process start for both runtimes:
+  `$S/pw-prof-start.sh TAG AFTER SECS` (pewasm, F's browser-prof.mjs) and
+  `prof-edger.sh SITE TAG 1 60` (page-run now profiles Workers that start
+  during the window too).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
