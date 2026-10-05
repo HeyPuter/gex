@@ -642,13 +642,22 @@ Not yet:
        host imports (`mini-wasm-gex.h`; `shims/native/src/wasmjit.rs`);
        `GEXMONO_WASM_JIT=1` runs the whole pipeline (hotness, emit, host
        compile and per-store instantiate, interpreter fallback) and embed
-       stays correct. Next: the emitter's wasm64 output (memory64/table64
-       imports, i64 addresses and pointer locals, `sext_i4`/`zext_i4`,
-       pointer-typed returns and moves, `storei8_membase_imm`); methods
-       with EH regions refused until wasmtime's exceptions are wired (the
-       emitter uses legacy try/catch with the C++ tag). Then Muck's menu
-       natively with --fjit and the JIT, presents/s against
-       interpreter-only. Assessment (2026-10-05): about
+       stays correct. The emitter now emits wasm64 (2df82f93): memory64
+       and table64 imports, `WASM_PTR`/`P_*` ops for pointer-width values,
+       pointer-typed locals, consts, returns and call types, the scratch
+       block laid out for 8-byte pointers (`WJ_SCR`), long immediates
+       (`WJ_LIMM`), no negative memarg offsets (memory64 does not wrap).
+       The interpreter's vcall/PIC/AOT-vcall caches pack 32-bit pointers
+       into i64 words, so on 64-bit they are off and the inline PICs are
+       not emitted (each vcall goes through the resolve helper); a 64-bit
+       form of those caches is later work. embed with
+       `MONO_WASM_JIT_THRESHOLD=1`: 431 methods JITted, 0 invalid modules,
+       all results right (`scratch/unity/wj.sh [build] [THRESH]`). Methods
+       with EH regions are refused until wasmtime's exceptions are wired
+       (the emitter uses legacy try/catch with the C++ tag); localloc and
+       LMF methods are refused as on wasm32. Next: Muck natively with
+       --fjit and the JIT; speed measured on worldmachine (bench.sh) in a
+       managed-heavy scene against interpreter-only. Assessment (2026-10-05): about
        14,400 lines (`mini-wasm*.inc`, `mini-wasm.c`, `wasm-encoder.c`) on
        Mono's mini IR, with no wasm64 awareness. It is emscripten-bound:
        `EM_ASM` instantiation with `wasmTable`, a per-Worker publish
