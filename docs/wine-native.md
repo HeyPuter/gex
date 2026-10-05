@@ -1027,6 +1027,63 @@ Steps:
 3. Each lands with a test under tests/wasm32 (a program using it, natively
    and in the browser).
 
+**Survey (2026-10-05, `gexc run --strace` on gooner; scratch/W/survey):**
+- **Windows programs (Wine on gex) use no Unix userland at all.** gex
+  replaces Wine's Unix side: NT system calls and the few unix calls
+  (`unixcall.rs`: ntdll's, ws2_32, opengl32, crypt32) are gex-kernel's Rust;
+  there is no ntdll.so, wineserver, ld.so or libc in a Wine run. A
+  `hello_args.exe` trace makes no Linux file system call outside the prefix.
+  What Wine would get from Unix libraries is either in gex already (sockets,
+  GL through gex-gl) or missing:
+  - **TrueType**: gex's GDI draws only the prefix's bitmap `.fon` fonts
+    (`nt/gdi/font.rs`); Wine uses **freetype** (and fontconfig to find
+    fonts). Candidate 1 for a native wasm library: freetype as a provider
+    behind gex's GDI text.
+  - **Crypto/TLS**: crypt32/bcrypt/secur32's unix calls answer
+    NOT_SUPPORTED (`unixcall.rs`); Wine uses **gnutls** (or a smaller TLS and
+    hash library would do for bcrypt).
+  - Audio (winepulse/winealsa), joysticks (winebus: SDL/udev), media
+    (gstreamer) are not wired in gex's NT layer yet; they are host
+    integrations more than libraries.
+- **Linux programs** (x86-64/i386 glibc ELF, e.g. Unity's Linux players)
+  load, from the host's (or the page bundle's) root:
+  - `ld-linux-x86-64.so.2`, `libc.so.6`, `libm.so.6`, `libdl`, `libpthread`,
+    `librt`, `libanl`, `libgcc_s` (every Unity/FNA player's NEEDED);
+  - by dlopen: `libGL`/`libEGL`/`libGLES*`, `libvulkan`, `libX11`,
+    `libXext`, `libXrandr`, `libXcursor`, `libXinerama`, `libXi`, `libXss`,
+    `libXxf86vm`, `libX11-xcb`, `libasound`, `libpulse-simple`, `libudev`
+    (strings of UnityPlayer.so); FNA bundles SDL2, FNA3D, FMOD.
+  - These are x86 code called by x86 code: "native wasm" for them means
+    **export providers for ELF images** (as gex-cgen's PE providers for
+    msvcrt: `crt_mem`, `crt_math`, `crt_heap`), not replacing the library
+    wholesale. gex-cgen's providers are PE-only today
+    (`provider::for_image`).
+- **Shell and coreutils** (`/bin/sh -c` with ls, sort, head, tr, cat, wc,
+  mkdir, cp, rm, date, uname, sed, grep, awk, find, xargs, env, id): dash
+  and GNU coreutils, each a dynamic glibc program, opening `libc.so.6` and
+  for some `libacl`, `libattr`, `libselinux`, `libpcre2-8`, plus
+  `/etc/ld.so.cache`, `/etc/localtime`, `/proc/filesystems`. Every one
+  is a full x86 translation per exec. Found on the way: `splice` (x86-64
+  275) had no canonical form, so `grep` from a pipe failed with ENOSYS
+  (a gex-kernel fix, next).
+
+**Proposed order** (revises step 2):
+1. **busybox** (sh + coreutils in one binary) built with `wcc` as a wasm32
+   program (§3.11 personality, musl): scripts' `sh`, `sed`, `grep`... run
+   natively instead of translated. Map `/bin/sh` and the coreutils names to
+   it in the guest root (natively by a gexc option, in the page's bundle).
+   Biggest win per effort: every script exec today translates dash/coreutils.
+2. **ELF export providers** for glibc's hot entry points (`memcpy`/`memset`/
+   `str*`, `malloc` family, libm), the PE providers' model on ELF images;
+   needs gex-cgen's provider binding by ELF symbol (gex-cgen re-keys units:
+   coordinate).
+3. **freetype** as a stateful provider behind gex's GDI (TrueType text in
+   Windows programs), built with `wcc` against the musl sysroot.
+4. **gnutls** (or a smaller crypto library) behind crypt32/bcrypt's unix
+   calls, when a game needs TLS or hashes.
+5. X11 client libraries stay as they are: the guest's X11 goes to the
+   integrated Xwayland.
+
 ## 6. Open decisions for the user
 
 1. **Go/no-go on W0.** The spikes answer the cost questions before the big
