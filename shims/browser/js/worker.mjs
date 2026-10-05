@@ -426,6 +426,7 @@ async function handle(msg) {
   if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
   // Any sibling modules the host already had when this Worker started.
   for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
+  for (const [key, mod] of msg.preModules ?? []) gex.addSharedModule(key, mod);
   if (globalThis.GEX_SHARE_TRACE || msg.shareTrace) console.warn(`[share] ${msg.kind} start with ${(msg.sharedModules ?? []).length} shared modules (${(msg.sharedModules ?? []).filter(([k]) => String(k).startsWith('cgen:')).length} units)`);
 
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a

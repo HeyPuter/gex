@@ -83,6 +83,7 @@ walk(join(project, 'runtime/web/page'), (p, rel) => place(p, rel));
 const cgen = nt.cgen;
 const units = join(project, cgen);
 let unitBytes = 0;
+const preload = [];
 // Only this build's units: a unit cache keeps every key it ever built
 // (a re-keyed rebuild leaves the old ones). build/build.json names the
 // images' units; the NT trampolines' unit is not an image, and is kept when
@@ -108,7 +109,16 @@ walk(units, (p, rel) => {
   if (!want) return;
   unitBytes += statSync(p).size;
   place(p, join('project', cgen, rel));
+  // What the page compiles while the bundle downloads (nt.html ?preload=):
+  // module names as gex.mjs keys them.
+  const url = `/project/${cgen}/${rel}`;
+  if (name === 'c.wasm') preload.push([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, url]);
+  else if (top === 'providers') preload.push([`cgenfile:${rel}`, url]);
 });
+
+// Largest first: noita.exe's unit is most of the compile.
+preload.sort((a, b) => (files[b[1]]?.size ?? 0) - (files[a[1]]?.size ?? 0));
+writeFileSync(join(out, 'project', cgen, 'preload.json'), JSON.stringify(preload));
 
 // The bundle, without what --drop names, with --overlay DIR's files (guest
 // paths under DIR, as user/files) laid over it.
