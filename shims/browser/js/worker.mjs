@@ -348,9 +348,21 @@ async function handle(msg) {
     // with a synchronous request -- allowed in a Worker, and what lets the
     // nested callback loop install one too. Null when there is none.
     loadUnit(key) {
-      const wasm = this.loadFile(`${key}/c.wasm`);
-      const entries = wasm && this.loadFile(`${key}/c.entries`);
-      return wasm && entries ? { wasm, entries } : null;
+      // The entries now; the module's bytes only if this Worker compiles it
+      // (most get the Module from a sibling: see `Gex#cgenModule`). Fetching
+      // every unit's bytes in every thread's Worker, only to use a shared
+      // Module, cost each new guest thread seconds at start-up.
+      const entries = this.loadFile(`${key}/c.entries`);
+      if (!entries) return null;
+      const env = this;
+      let wasm;
+      return {
+        entries,
+        get wasm() {
+          wasm ??= env.loadFile(`${key}/c.wasm`);
+          return wasm;
+        },
+      };
     }
     // Any file of the unit cache by its relative path (an export
     // provider's module: `providers/<name>-<fingerprint>.wasm`), or null.

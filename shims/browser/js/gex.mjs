@@ -2421,7 +2421,7 @@ export class Gex {
     if (mod) return mod;
     const tl = performance.now();
     got ??= this.#env.loadUnit?.(key) ?? null;
-    if (!got) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
+    if (!got?.wasm) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
     const t0 = performance.now();
     mod = got.wasm instanceof WebAssembly.Module ? got.wasm : new WebAssembly.Module(got.wasm);
     this.#compileMs += performance.now() - t0;
