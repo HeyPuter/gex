@@ -1029,7 +1029,24 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   world-up A/B, play-through p1-p8 (site27p, readback for screenshots, own
   browser profile `/tmp/gbench-e9play`), 35-minute soak.
 
-- **RESUME HERE (state at the reboot, 2026-10-05 ~18:10).** Branch
+- **RESUME HERE (2026-10-05 evening, after the reboot).** Merged master
+  e3917bac (df028162; no gex-cgen change, unit keys kept). third_party/mesa
+  checked out in this worktree (wink 5f5572e62ff; cloned from
+  `scratch/coord/mesa-wink`, submodule url set locally to it) and built with
+  web/build-mesa-wasm.sh into `$S/mesa-wink-out`. Re-verification of this
+  head runs as `$S/c28/prep.sh` (page28, project p-noita18 = p-noita17 by
+  hardlinks with runtime/web refreshed, training site site28t) then
+  `$S/c28/chain.sh` (trains the shader blob on edger -> `$S/c28/edger.wgsl`,
+  since blobs are tied to the Mesa build; packs site28 / site28c
+  (--no-direct) / site28p (play, overlay-play); runs `$S/c28/queue.sh`:
+  ABBA pew/site28/site28c/site28c/site28/pew, world-up x3 site28c vs site28
+  plus pewasm x3 (wup-pewasm2.sh), play p1-p8 (`$S/shots/d28p*.json`),
+  soak28 2100 s). Chain log `$S/c28/chain.txt`. F's fdbb1d9e (pe.rs
+  `unguarded` passed explicitly) merges clean with this branch; Noita's
+  nt.json has unguarded=true, so it changes nothing for the ejected Noita.
+  The previous section (below) describes the c27 queue this replaces.
+
+- **Previous resume (state at the reboot, 2026-10-05 ~18:10).** Branch
   merge/eject9, worktree ~/gex-sandbox/wt/eject9; head = the commit adding
   this paragraph (on bce25b8e). Master ffc51bcd is merged (it contains this
   branch up to 1d5956bc and third_party/mesa = wink 5f5572e62ff with both of
