@@ -1416,17 +1416,21 @@ through scratch/bench/bench.sh, paired with pewasm on the same box.
   from worldmachine's wt/fjit (the one bm used); web/node_modules by `npm ci`.
 - Caches (nice 19, up to 12 jobs, cg14's icall hints; `GEX_CGEN_EXP` is not
   in the unit key, so arms are caches with the same keys):
-  `scratch/fjit/build-bm.sh wt/fjit/target/bm-c` (i3c, the default) and
-  `GEX_CGEN_EXP=NOSMALLCALLS|SMALLCALLSALL scratch/fjit/variant.sh wt/fjit/target/bm-c wt/fjit/target/bm-a2|bm-b2 <Noita's 8 images>`
-  (units hard-linked from bm-c, the named images rebuilt, bm-c's prefix and
-  Wine DLL units shared; then link bm-c's prefix unit dirs in). noita.exe's
-  unit: A 174 MB, C 175 MB, B 246 MB.
+  `scratch/fjit/build-bm.sh wt/fjit/target/bm-d` (merge/fjit 8a58deae: the
+  default, leaf copies only; on gooner and edger). A pricing arm:
+  `GEX_CGEN_EXP=... GEX_CGEN_MUTATE=... scratch/fjit/variant.sh wt/fjit/target/bm-d wt/fjit/target/NEW <Noita's images>`
+  (units hard-linked, the named images rebuilt, the prefix and Wine DLL
+  units shared; then link bm-d's prefix unit dirs into NEW, as done for i3c).
 - edger: `scratch/fjit/e/sync.sh bm-c bm-a2 bm-b2` (worktree without
   target/.git, caches without objects/recovery); runs:
   `scratch/bench/bench.sh -- scratch/fjit/e/seq.sh NAME ~/gex-sandbox/wt/fjit 240 a=CACHE c=CACHE ...`
   (pewasm, arms, pewasm, arms reversed, pewasm; 4C/8T; logs in
   scratch/fjit/e/ and scratch/bench/fjit-* on edger; gooner keeps the
   bench.sh output in scratch/fjit/e/*.out).
+- pewasm profile on edger: `scratch/fjit/e/pw-prof.sh TAG` (under bench.sh);
+  per-function table: `scratch/fjit/v8/cmp.py --pw FRAMES pw*.cpuprofile --gex FRAMES gex*.cpuprofile`
+  (FRAMES = world frames in each 30 s profile window; profiles copied to
+  scratch/fjit/prof/).
 - b2bb3c95 (provider key fix): its parent is in master; branch
   `fjit/keyfix` points at it for the gate.
 
@@ -1484,3 +1488,17 @@ reverted): `GEX_CGEN_EXP=SMALLCALLS` (loops only, noita.exe +0.6% wasm) or
 above i3b's (32-33), where both arms ran i3b's everywhere-copied Wine DLL
 units (prefix 356 MiB of wasm against 257 loop-only), with pewasm ~2% up
 too: suggestive, not shown.
+
+**Page profile on edger, gex i3c-a1 against pewasm pwprof1 (cmp.py, ms of
+work per world frame over 30 s, all threads; `scratch/fjit/prof/cmp-edger-a1.txt`):**
+guest code is level: gex 34.7 against pewasm 32.0 (0x724580 8.42 against
+8.32, 1.01×; 0x70b110 0.87×, 0x70b200 1.58×, 0x70bdc0 1.42×). The gap is
+outside guest code: total work 72.8 against 35.5.
+- The compositor worker: 16.1 ms per frame, 7.9 of it `texImage2D` in
+  `#uploadGlCanvas` (web/src/compositor-worker.js:827), the WebGPU canvas
+  copied into a WebGL texture every composited frame (a readback on edger's
+  P620), plus createView/beginRenderPass/submit. The main thread waits for
+  it ("GL previous frame" 1.3-1.4 s per 10 s, about 4.5 ms per frame).
+- The main game thread: 33.0 ms per frame against pewasm's busiest 13.8:
+  `guest_yield` 5.8, the gl-bridge's `#a` 5.2, mono_ns 1.7, NT syscalls.
+Both are E's/R's areas (E1, E2), not codegen.
