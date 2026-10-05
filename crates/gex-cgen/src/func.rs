@@ -2155,10 +2155,11 @@ pub fn leaf_copies() -> bool {
 
 /// Calls to small call-free leaves are inlined into the caller's GIR
 /// (`FnUnit::inline_leaf_calls`) in i386 units, instead of calling the
-/// leaf's copy: `GEX_CGEN_EXP=INLINELEAVES` (not in the unit key: use a
-/// private cache). Opt-in until the page measures it.
+/// leaf's copy. On by default (i1: faster in the page, docs/noita-perf.md);
+/// `GEX_CGEN_EXP=NOINLINELEAVES` turns it off (not in the unit key: use a
+/// private cache).
 pub fn inline_leaves() -> bool {
-    exp("INLINELEAVES")
+    !exp("NOINLINELEAVES")
 }
 
 /// Whether `leaf` can be inlined at a call (`FnUnit::inline_leaf_calls`): a
