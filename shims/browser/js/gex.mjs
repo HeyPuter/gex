@@ -2402,11 +2402,15 @@ export class Gex {
     const name = `cgen:${key}`;
     let mod = this.#sharedModules.get(name);
     if (mod) return mod;
+    const tl = performance.now();
     got ??= this.#env.loadUnit?.(key) ?? null;
     if (!got) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
     const t0 = performance.now();
     mod = got.wasm instanceof WebAssembly.Module ? got.wasm : new WebAssembly.Module(got.wasm);
     this.#compileMs += performance.now() - t0;
+    // Start-up's largest costs, one line per unit (a page loads about 40).
+    console.warn(`[unit] ${key.slice(0, 16)} ${((got.wasm.byteLength ?? 0) / 1048576).toFixed(1)} MiB: `
+      + `load ${Math.round(t0 - tl)} ms, compile ${Math.round(performance.now() - t0)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     this.#sharedModules.set(name, mod);
     this.#env.shareModule?.(name, mod);
     return mod;
