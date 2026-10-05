@@ -321,7 +321,9 @@ impl Wayland {
     /// kernel locates a buffer's pixels through its shared mappings; guest
     /// memory is where they are.
     pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
-        let due = self.due_input();
+        // Scripted input waits for a client that can take it (a seat and a surface).
+        let ready = self.inner.sessions.lock().unwrap().iter().any(|s| s.client.input_ready());
+        let due = if ready { self.due_input() } else { Vec::new() };
         let mut sessions = self.inner.sessions.lock().unwrap();
         let mut produced = Vec::new();
         sessions.retain_mut(|s| {
@@ -354,7 +356,8 @@ impl Wayland {
             if !due.is_empty() {
                 eprintln!("[gex] input: {}", s.client.describe_input());
             }
-            for &(ev, ms) in &due {
+            let take = s.client.input_ready();
+            for &(ev, ms) in due.iter().filter(|_| take) {
                 match ev {
                     Ev::Motion(x, y) => s.client.pointer_motion(x, y, ms),
                     Ev::Button(b, down) => s.client.pointer_button(b, down, ms),

@@ -2063,6 +2063,12 @@ impl Client {
         self.surfaces.get(&surface).map(|s| s.x11).unwrap_or(false)
     }
 
+    /// Whether input can be delivered: the client has a pointer and a
+    /// keyboard, and a surface to give them to.
+    pub fn input_ready(&self) -> bool {
+        self.pointer.is_some() && self.keyboard.is_some() && self.pointer_target.or(self.focus_surface).is_some()
+    }
+
     /// Where pointer input would go now, and the surfaces there are: for a
     /// host explaining scripted input (`GEX_WL_INPUT`).
     pub fn describe_input(&self) -> String {

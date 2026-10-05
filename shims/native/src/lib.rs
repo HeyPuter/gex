@@ -1684,6 +1684,15 @@ fn run_thread_loop(
                         if let Some(memory) = store.data().memory.clone() {
                             let at = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
                             eprintln!("gex: thread {} context pc {at:#x}", store.data().thread.tid);
+                            let maps = store.data_mut().with_kernel(|k| k.mem.proc_maps());
+                            for l in maps.lines() {
+                                let mut r = l.split(|c| c == '-' || c == ' ');
+                                let (Some(a), Some(b)) = (r.next(), r.next()) else { continue };
+                                let (Ok(a), Ok(b)) = (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16)) else { continue };
+                                if (a..b).contains(&at) {
+                                    eprintln!("gex: in {l}");
+                                }
+                            }
                         }
                     }
                     if action.handler == 0 {

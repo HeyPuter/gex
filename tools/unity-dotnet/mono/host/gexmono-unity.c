@@ -224,6 +224,26 @@ U(mono_thread_pop_appdomain_ref) { ENTER; RETV; }
 U(mono_thread_has_sufficient_execution_stack) { ENTER; RET (1); }
 U(mono_gchandle_is_in_domain) { ENTER; RET (1); }
 U(mono_gchandle_is_in_domain_v2) { ENTER; RET (1); }
+/* Unity 6 uses the v2 handle API with Unity's Mono encoding: a v2 handle is the GC's own handle value
+ * (slot << 3 | type + 1), which Unity's libmonobdwgc also returns from the v1 calls. Its scripting layer
+ * tests bit 0: set (normal and weak handles), a GC handle; clear, a pointer to an object reference.
+ * Upstream's handles are that value shifted left one bit (MONO_GC_HANDLE_FROM_UINT), always even, which
+ * Unity would dereference. So the v2 calls trade in the unshifted value. */
+MonoGCHandle mono_gchandle_new_internal (MonoObject *obj, gboolean pinned);
+MonoGCHandle mono_gchandle_new_weakref_internal (MonoObject *obj, gboolean track_resurrection);
+MonoObject *mono_gchandle_get_target_internal (MonoGCHandle gchandle);
+void mono_gchandle_free_internal (MonoGCHandle gchandle);
+#define UNITY_H(h) ((uintptr_t)(h) >> 1)
+#define GC_H(u) ((MonoGCHandle)((uintptr_t)(u) << 1))
+U(mono_gchandle_new_v2) { ENTER; RET (UNITY_H (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_new_weakref_v2) { ENTER; RET (UNITY_H (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_get_target_v2) { ENTER; RET ((uintptr_t)mono_gchandle_get_target_internal (GC_H (A (0)))); }
+U(mono_gchandle_free_v2) { ENTER; mono_gchandle_free_internal (GC_H (A (0))); RETV; }
+/* The v1 calls too, in the same encoding: Unity mixes them (a handle from one, freed or read by the other). */
+U(mono_gchandle_new) { ENTER; RET ((uint32_t)UNITY_H (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_new_weakref) { ENTER; RET ((uint32_t)UNITY_H (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_get_target) { ENTER; RET ((uintptr_t)mono_gchandle_get_target_internal (GC_H ((uint32_t)A (0)))); }
+U(mono_gchandle_free) { ENTER; mono_gchandle_free_internal (GC_H ((uint32_t)A (0))); RETV; }
 U(mono_pmip) { ENTER; RET (0); }
 U(mono_debug_lookup_source_location_by_il) { ENTER; RET (0); }
 
@@ -404,7 +424,7 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_runtime_unhandled_exception_policy_set) L(mono_threads_set_shutting_down)
 	L(mono_thread_suspend_all_other_threads) L(mono_thread_pool_cleanup) L(mono_thread_push_appdomain_ref)
 	L(mono_thread_pop_appdomain_ref) L(mono_thread_has_sufficient_execution_stack) L(mono_gchandle_is_in_domain)
-	L(mono_gchandle_is_in_domain_v2) L(mono_pmip) L(mono_debug_lookup_source_location_by_il)
+	L(mono_gchandle_is_in_domain_v2) L(mono_gchandle_new_v2) L(mono_gchandle_new_weakref_v2) L(mono_gchandle_get_target_v2) L(mono_gchandle_free_v2) L(mono_gchandle_new) L(mono_gchandle_new_weakref) L(mono_gchandle_get_target) L(mono_gchandle_free) L(mono_pmip) L(mono_debug_lookup_source_location_by_il)
 	L(mono_unity_gc_set_mode) L(mono_unity_gc_disable) L(mono_unity_gc_enable) L(mono_unity_gc_is_disabled)
 	L(mono_gc_is_incremental) L(mono_gc_set_incremental) L(mono_gc_collect_a_little) L(mono_gc_get_max_time_slice_ns)
 	L(mono_gc_set_max_time_slice_ns) L(mono_gc_start_incremental_collection) L(mono_gc_set_heap_validate_frequency)
