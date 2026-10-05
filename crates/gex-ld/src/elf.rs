@@ -236,6 +236,57 @@ impl DynSym {
     }
 }
 
+impl Image {
+    /// The defined, non-TLS dynamic symbols in `[lo, hi)` (unbiased) by every
+    /// name a binding may use: `name@@VER`, `name@VER`, and the bare `name`
+    /// for the default version (or an unversioned object), each with its
+    /// unbiased value and whether it is an IFUNC. For export providers
+    /// (docs/elf-providers.md).
+    pub fn exports_by_version(&self, lo: u64, hi: u64) -> std::collections::HashMap<String, (u64, bool)> {
+        let mut m = std::collections::HashMap::new();
+        for y in self.dynsyms.iter().filter(|y| !y.undefined && !y.tls && y.value >= lo && y.value < hi) {
+            let v = (y.value, y.ifunc);
+            m.insert(y.versioned_name(), v);
+            if y.version.is_none() || y.default_version {
+                m.insert(y.name.clone(), v);
+            }
+        }
+        m
+    }
+}
+
+/// An ELF file's GNU build-id (`NT_GNU_BUILD_ID` in a `PT_NOTE`), as
+/// lower-case hex.
+pub fn build_id(bytes: &[u8]) -> Option<String> {
+    let rd = |o: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(o..o.checked_add(n)?)?;
+        Some(b.iter().rev().fold(0u64, |a, &x| (a << 8) | x as u64))
+    };
+    if bytes.get(..4) != Some(&b"\x7fELF"[..]) || bytes.get(5) != Some(&1) {
+        return None;
+    }
+    let c64 = bytes.get(4) == Some(&2);
+    let (phoff, phentsize, phnum) = if c64 { (rd(0x20, 8)?, rd(0x36, 2)?, rd(0x38, 2)?) } else { (rd(0x1c, 4)?, rd(0x2a, 2)?, rd(0x2c, 2)?) };
+    for i in 0..phnum {
+        let ph = usize::try_from(phoff.checked_add(i * phentsize)?).ok()?;
+        if rd(ph, 4)? != 4 {
+            continue; // not PT_NOTE
+        }
+        let (off, size) = if c64 { (rd(ph + 8, 8)?, rd(ph + 32, 8)?) } else { (rd(ph + 4, 4)?, rd(ph + 16, 4)?) };
+        let (mut p, end) = (usize::try_from(off).ok()?, usize::try_from(off.checked_add(size)?).ok()?);
+        while p + 12 <= end {
+            let (namesz, descsz, ty) = (rd(p, 4)? as usize, rd(p + 4, 4)? as usize, rd(p + 8, 4)?);
+            let name = p + 12;
+            let desc = name + namesz.div_ceil(4) * 4;
+            if ty == 3 && bytes.get(name..name + namesz) == Some(&b"GNU\0"[..]) {
+                return Some(bytes.get(desc..desc + descsz)?.iter().map(|b| format!("{b:02x}")).collect());
+            }
+            p = desc + descsz.div_ceil(4) * 4;
+        }
+    }
+    None
+}
+
 /// An image holding only the numbers the auxiliary vector reports, for a
 /// process that is restored rather than loaded.
 pub fn headers_only(phdr_vaddr: u64, phentsize: u64, phnum: u64, entry: u64) -> Image {
