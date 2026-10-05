@@ -637,6 +637,7 @@ dependencies = [
  "gex-ld",
  "gex-native",
  "gex-xlate",
+ "wasmparser 0.219.2",
 ]
 
 [[package]]
@@ -803,6 +804,16 @@ dependencies = [
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
  "wasmtime",
+]
+
+[[package]]
+name = "gex-rt"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "gex-cgen",
+ "gex-eject",
+ "gex-native",
 ]
 
 [[package]]

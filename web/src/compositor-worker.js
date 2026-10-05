@@ -905,6 +905,25 @@ class Compositor {
     return out;
   }
 
+  #directKey = null;
+  #directRect = '';
+
+  /** Tell the page where the GL window is (or that it is not shown
+   *  directly), when that changed. */
+  #placeDirect(win) {
+    let m = { kind: 'gl-rect', visible: false };
+    if (win) {
+      const f = this.#frameOf(win);
+      const r = win.info?.glRect;
+      m = r ? { kind: 'gl-rect', visible: true, x: f.x + r.x, y: f.y + r.y, w: r.w, h: r.h }
+        : { kind: 'gl-rect', visible: true, x: f.x, y: f.y, w: win.width, h: win.height };
+    }
+    const key = JSON.stringify(m);
+    if (key === this.#directRect) return;
+    this.#directRect = key;
+    postMessage(m);
+  }
+
   frame() {
     const { byKey, blocks } = this.#reconcile();
     const gl = this.#gl;
@@ -919,11 +938,37 @@ class Compositor {
     if (this.#painter.begin(this.#outW, this.#outH) === false) return;
     gl.clearColor(...COL.desktop);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    // The GL window presents itself (glDirect) when it is the top toplevel
+    // with nothing over it: no popups, subsurfaces or floating windows.
+    this.#directKey = null;
+    if (glDirect) {
+      const tops = this.#order.filter((k) => this.#windows.get(k)?.role === ROLE_TOPLEVEL);
+      const top = tops[tops.length - 1];
+      const win = top && this.#windows.get(top);
+      if (win && glFrameFor(win)?.source && !this.#childrenOf(top).length && !this.#floating().length) {
+        this.#directKey = top;
+      }
+      this.#placeDirect(this.#directKey ? this.#windows.get(this.#directKey) : null);
+    }
     // Windows bottom to top, each with its popups and subsurfaces above it.
     for (const k of this.#order) {
       const win = this.#windows.get(k);
       if (!win || win.role !== ROLE_TOPLEVEL) continue;
       this.#drawDecoration(win, this.#focus === k);
+      if (k === this.#directKey) {
+        // Its GL pixels are on the page, over this; a frame for part of the
+        // window only still has the window's own pixels around it.
+        this.#glDraws++;
+        const t = win.info?.glRect && this.#textures.get(k);
+        if (t) {
+          const f = this.#frameOf(win);
+          this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
+            swizzle: 1,
+            opaque: win.info?.format === 1 ? 1 : 0,
+          });
+        }
+        continue;
+      }
       this.#drawSurface(k, win);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
@@ -1257,6 +1302,9 @@ let glServing = false;
 // and WebGPU is not WebGL.
 let glTarget = null;
 let glPresentCanvas = null;
+// Whether glTarget is on the page (the overlay `hostGl` made): then a GL
+// window on top needs no upload, only its place on the page (`gl-rect`).
+let glDirect = false;
 
 /** What the guest last said its frames belong to, or null. */
 function glAttachment() {
@@ -1320,7 +1368,8 @@ async function startGl(m, canvas) {
   // so gex_wgpu presents into one of its own and the frame reaches the scene
   // as an upload. One copy per frame, GPU-side -- the price of the API that
   // cannot share a texture with the one this compositor draws in.
-  glTarget = new OffscreenCanvas(16, 16);
+  glTarget = m.present ?? new OffscreenCanvas(16, 16);
+  glDirect = !!m.present;
   comp?.shareContext(false);
   // Emscripten looks a canvas up by selector, and a worker has no document.
   if (!globalThis.document) globalThis.document = { querySelector: () => glTarget };

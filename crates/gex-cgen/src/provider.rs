@@ -40,6 +40,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("debug_string", include_str!("../providers/debug_string.c")),
     ("crt_heap", include_str!("../providers/crt_heap.c")),
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
+    ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
 ];
 
 /// Files a stateful provider may `#include` (written beside it when built).
@@ -139,7 +140,13 @@ pub fn fingerprint(providers: &[Provider]) -> String {
         // Only a stateful provider sees them: the keys of every other
         // provider (and so of the units built around it) do not move.
         if p.stateful {
-            INCLUDES.hash(&mut h);
+            // As `INCLUDES.hash(h)` on a 64-bit host: a slice's length is a
+            // `usize`, so it is written as a u64 for the browser's (wasm32)
+            // key to match the units built natively.
+            h.write_u64(INCLUDES.len() as u64);
+            for i in INCLUDES {
+                i.hash(&mut h);
+            }
         }
     }
     format!("{:016x}", h.finish())
@@ -157,6 +164,38 @@ pub fn stubs(providers: &[Provider], exports: &HashMap<String, u32>, base: u64) 
     v.sort_unstable();
     v.dedup();
     v
+}
+
+/// The C symbol a link group calls for `p`'s function `f`
+/// ([`group_source`]).
+pub fn group_symbol(p: &Provider, f: &str) -> String {
+    format!("gexg_{}_{f}", p.name)
+}
+
+/// `p`'s source as one translation unit of a link group's module
+/// (docs/eject-pe.md §6a G2): no `GEX_PROVIDE` exports (the group's own
+/// bodies at the exports' addresses call in), and each bound function
+/// reachable from the group's units as [`group_symbol`].
+pub fn group_source(p: &Provider) -> String {
+    let mut s = format!(
+        "#include \"gex_abi.h\"\n#include \"provider.h\"\n#undef GEX_PROVIDE\n#define GEX_PROVIDE(fn, export)\n#line 1 \"{}.c\"\n{}\n",
+        p.name, p.text
+    );
+    let mut seen = std::collections::HashSet::new();
+    for (f, _) in &p.binds {
+        if seen.insert(f.as_str()) {
+            s.push_str(&format!(
+                "int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{ GEX_MUSTTAIL return {f}(ctx, depth, need, ret); }}\n",
+                group_symbol(p, f)
+            ));
+        }
+    }
+    s
+}
+
+/// The prelude a provider source compiles against (`provider.h`).
+pub fn prelude() -> &'static str {
+    PRELUDE
 }
 
 /// The provider's module, built once into `root/providers` (keyed by its

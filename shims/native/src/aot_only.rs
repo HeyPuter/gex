@@ -84,6 +84,18 @@ pub(crate) fn base_module() -> Vec<u8> {
     m.finish()
 }
 
+/// Compile the modules every AOT-only process makes at run time -- the
+/// function table's runtime module and the base module -- into the
+/// content-addressed precompiled directory (`gex_cache::precompiled_dir`), for
+/// a runtime without a compiler (gex-rt).
+#[cfg(feature = "compile")]
+pub fn precompile(dir: &std::path::Path) -> Result<()> {
+    let engine = crate::engine()?;
+    gex_cache::precompile(&engine, &gex_cgen::runtime::module(), dir)?;
+    gex_cache::precompile(&engine, &base_module(), dir)?;
+    Ok(())
+}
+
 /// Point `instance`'s (the base module's) `enter` at this store's `root`,
 /// making the store's function table first. Once per store, before the
 /// first `enter`.
@@ -125,6 +137,12 @@ pub(crate) fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32) -> Result<i
     // not a call into code, the frames below resume there.
     if nt::exc_escape(caller, target) {
         return Err(StopExecution.into());
+    }
+    // A branch to memory that is not executable is the guest's own fault
+    // (DEP: an access violation, ExceptionInformation[0] = 8), delivered as
+    // the translator's miss path delivers it. Not a gap in the build.
+    if caller.data().nt.is_some() && !caller.data_mut().with_kernel(|k| k.mem.check_access(target, 1, prot::EXEC)) {
+        return nt::fault(caller, nt::Fault::NotExecutable, target).map(|_| 0);
     }
     Err(missing(caller, target, "a call or jump"))
 }

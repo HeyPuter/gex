@@ -495,6 +495,14 @@ pub fn nt_yield_execution(c: &mut Call<'_>) -> R {
 /// and its wakes signal.
 pub const YIELD_GEN: u64 = super::USD + 0xff0;
 
+/// How many threads are parked on [`YIELD_GEN`], for code in the guest's
+/// memory that kicks it (the ConcRT provider): a notify with nobody parked
+/// is a host futex call for nothing (V8 takes a process-wide lock for each).
+/// A copy of the process's count, stored after each change; a stale value
+/// costs a park its remaining wait (at most the policy's PARK_US) or one
+/// notify for nothing.
+pub const YIELD_PARKED: u64 = super::USD + 0xff4;
+
 /// Something a yielding thread may be waiting for happened: bump
 /// [`YIELD_GEN`] and wake the threads parked on it.
 pub fn yield_kick(c: &mut Call<'_>) {
@@ -570,9 +578,11 @@ fn guest_yield(c: &mut Call<'_>) {
             let n = if now == last.wrapping_add(1) { n.saturating_add(1) } else { 0 };
             let parked = n > streak && {
                 let g = c.g.u32(YIELD_GEN).unwrap_or(0);
-                c.p.yield_parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let n = c.p.yield_parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let _ = c.g.w32(YIELD_PARKED, n);
                 let ok = c.host.park(YIELD_GEN, g, Duration::from_micros(park_us));
-                c.p.yield_parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let n = c.p.yield_parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
+                let _ = c.g.w32(YIELD_PARKED, n);
                 ok
             };
             if !parked {

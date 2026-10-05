@@ -77,6 +77,7 @@ mod stub {
     }
 
     pub(crate) fn tick() {}
+    pub(crate) fn serve_now() {}
 
     pub(crate) fn arena_ceiling() -> u64 {
         gex_abi::MMAP_TOP
@@ -132,6 +133,11 @@ mod imp {
         /// Worker until control goes back above the raise (`exc_escape`
         /// for depth `level`): 1, or 0 when it could not.
         fn exc_dispatch(ctx: i32, target: i64, level: i32) -> i32;
+        /// An AOT-only run (an ejected project's): serve what a syscall
+        /// left for JS -- the units of images just mapped, a thread just
+        /// created -- inside the call, so the guest's frames survive it
+        /// (leaving would resume at continuations no unit has entries for).
+        fn serve_in_place();
         /// Monotonic nanoseconds (`performance.now()`): the page's `now` is
         /// `Date.now()`, a millisecond clock that can step. An f64 (exact
         /// for 104 days): an i64 is a BigInt in JS, per call.
@@ -366,6 +372,8 @@ mod imp {
             FIXED_TIME.store(t, Ordering::Relaxed);
         }
         // An ejected project's stateful providers (docs/eject-pe.md §5.1).
+        crate::cgen::ENTRY_LOG.store(flag("GEX_NT_ENTRY_LOG"), Ordering::Relaxed);
+        crate::RESUME_LOG.store(flag("GEX_NT_RESUME_LOG"), Ordering::Relaxed);
         if let Some(v) = var("GEX_NT_STATEFUL") {
             crate::cgen::set_stateful(&v);
         }
@@ -613,6 +621,20 @@ mod imp {
                 EXC_ESCAPED.load(Ordering::Relaxed),
                 crate::fjit::counts()
             ));
+            // The yield park (GEX_NT_YIELD=wake): parks by how they ended
+            // (woken by a kick, the word had moved, timed out) and kicks by
+            // whether they woke anyone, since the last report.
+            let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
+            warn_line(&format!(
+                "gex-nt: yield parks woken={} ({} ms) moved={} timed_out={} ({} ms) kicks waking={} idle={}\n",
+                take(&YIELD_PARKS[0]),
+                take(&YIELD_PARK_NS[0]) / 1_000_000,
+                take(&YIELD_PARKS[1]),
+                take(&YIELD_PARKS[2]),
+                take(&YIELD_PARK_NS[2]) / 1_000_000,
+                take(&YIELD_KICKS[1]),
+                take(&YIELD_KICKS[0])
+            ));
             if GL_STATS.load(Ordering::Relaxed) {
                 warn_line(&format!("gex-nt: gl {}\n", nt::opengl::take_stats(p, 14)));
             }
@@ -652,6 +674,12 @@ mod imp {
         }
     }
 
+    /// Yield parks by result (`memory.atomic.wait32`: 0 woken, 1 not equal, 2
+    /// timed out) and kicks (`notify`) by whether they woke a waiter.
+    pub(crate) static YIELD_PARKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+    pub(crate) static YIELD_KICKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    /// And the time spent in them, by result.
+    pub(crate) static YIELD_PARK_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
     /// Exceptions dispatched nested and escaped back (the stats line).
     pub(crate) static EXC_NESTED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static EXC_ESCAPED: AtomicU64 = AtomicU64::new(0);
@@ -697,7 +725,10 @@ mod imp {
         let p32 = PROCESS.get().is_some_and(|p| p.abi == nt::Abi::P32);
         let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
         let sp = if p32 { sp & 0xffff_ffff } else { sp };
-        if sp <= raise_sp {
+        // At or above the syscall's own stack: control is back with the
+        // frames the dispatch was entered from (an APC's NtContinue comes
+        // back to exactly it), as natively (fb7dfd52).
+        if sp < raise_sp {
             return false;
         }
         let _ = gm.write_u64(c + ctx::PC as u64, target);
@@ -759,6 +790,13 @@ mod imp {
         let mut gm = GuestMem::new(guest_bytes());
         let to_pc = gm.read_u64(ctx_addr + ctx::PC as u64).unwrap_or(0);
         let to_sp = gm.read_u64(ctx_addr + ctx::SP as u64).unwrap_or(0) & mask;
+        // Back at the syscall's own return (an APC's NtContinue, an
+        // exception continued at the raise): just return, with the
+        // context's registers.
+        if to_pc == next_pc && to_sp == raise_sp & mask {
+            let _ = gm.write_u64(ctx_addr + ctx::PC as u64, next_pc);
+            return true;
+        }
         let pops = match guest_bytes().get(next_pc as usize) {
             Some(0xc2) => gm.read_u32(next_pc + 1).unwrap_or(0) as u64 & 0xffff,
             _ => 0,
@@ -791,14 +829,20 @@ mod imp {
         fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
             let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
             // SAFETY: an aligned guest word of the shared memory.
-            unsafe { crate::warch::memory_atomic_wait32(p, expected as i32, timeout.as_nanos() as i64) };
+            let t0 = mono_raw();
+            let r = unsafe { crate::warch::memory_atomic_wait32(p, expected as i32, timeout.as_nanos() as i64) };
+            if let Some(n) = YIELD_PARKS.get(r as usize) {
+                n.fetch_add(1, Ordering::Relaxed);
+                YIELD_PARK_NS[r as usize].fetch_add(mono_raw().saturating_sub(t0), Ordering::Relaxed);
+            }
             true
         }
 
         fn notify(&self, addr: u64) {
             let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
             // SAFETY: as above.
-            unsafe { crate::warch::memory_atomic_notify(p, u32::MAX) };
+            let woke = unsafe { crate::warch::memory_atomic_notify(p, u32::MAX) };
+            YIELD_KICKS[(woke > 0) as usize].fetch_add(1, Ordering::Relaxed);
         }
 
         fn run_callback(&mut self) -> Result<(), ()> {
@@ -911,21 +955,31 @@ mod imp {
         // date every 16th call and around waits, and the time split is
         // sampled likewise (Noita's main thread makes ~10^5 NtYieldExecution
         // a second).
-        let n = SYSCALL_N.with(|c| {
-            let n = c.get().wrapping_add(1);
-            c.set(n);
-            n
-        });
-        let sampled = n % SAMPLE == 0;
+        let nr = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32;
+        // A spin-yield loop makes hundreds of thousands of NtYieldExecution
+        // a second: those are counted apart and sampled far more rarely, so
+        // the clock reads of the sampling stay a small share of a spin.
+        let sampled = if nr == nt::sysno::ntdll::NtYieldExecution {
+            YIELD_N.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n % SAMPLE_YIELD == 0
+            })
+        } else {
+            SYSCALL_N.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n % SAMPLE == 0
+            })
+        };
         if sampled {
             tick();
+            if let Some((lo, bad, least)) = crate::stack_guard_check() {
+                warn_line(&format!(
+                    "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
+                ));
+            }
         }
-        if let Some((lo, bad, least)) = crate::stack_guard_check() {
-            warn_line(&format!(
-                "gex-nt: BUG: this Worker's shim stack overran its bottom at {lo:#x}: {bad} guard bytes overwritten (least headroom seen at an NT call: {least} bytes; ctx {ctx_addr:#x})\n"
-            ));
-        }
-        let nr = GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32;
         if TRACE_FOREIGN.load(Ordering::Relaxed) {
             crate::foreign_now("before", &nt::syscall_name(nr));
         }
@@ -942,7 +996,13 @@ mod imp {
         // long), everything else every SAMPLE-th call, counted SAMPLE times.
         let wait = is_wait(nr);
         let timed = sampled || (wait && nr != nt::sysno::ntdll::NtYieldExecution);
-        let scale = if timed && !sampled { 1 } else { SAMPLE };
+        let scale = if timed && !sampled {
+            1
+        } else if nr == nt::sysno::ntdll::NtYieldExecution {
+            SAMPLE_YIELD
+        } else {
+            SAMPLE
+        };
         let (t_in, gl_in, glw_in) = (
             if timed { mono_raw() } else { 0 },
             crate::gl::GL_NS.with(|g| g.get()),
@@ -1003,6 +1063,11 @@ mod imp {
                 // loads and installs it before the guest goes on, as the
                 // native host does after the same syscall.
                 if crate::cgen::drain() {
+                    if crate::aot() {
+                        // SAFETY: a host import without arguments.
+                        unsafe { serve_in_place() };
+                        return;
+                    }
                     set_resume(resume_pc());
                     set_resume_ctx(ctx_addr);
                     trap();
@@ -1020,7 +1085,14 @@ mod imp {
                 if nr == nt::sysno::ntdll::NtRaiseException && crate::tracing_exc() {
                     warn_line(&format!("[nt] NtRaiseException returning to {next_pc:#x} (byte {:#x}): nested {}\n", guest_bytes().get(next_pc as usize).copied().unwrap_or(0), nest_exceptions(next_pc)));
                 }
-                if nr == nt::sysno::ntdll::NtRaiseException && nest_exceptions(next_pc) && raise_nested(p, ctx_addr, target, raise_sp, next_pc) {
+                // An exception raised, or a user APC delivered by an
+                // alertable wait (not NtContinue's own delivery): both run a
+                // dispatcher that ends in NtContinue, nested (fb7dfd52's
+                // browser half).
+                let apc = target == p.ntdll.lock().unwrap().ki_user_apc_dispatcher
+                    && nr != nt::sysno::ntdll::NtContinue
+                    && nr != nt::sysno::ntdll::NtContinueEx;
+                if (nr == nt::sysno::ntdll::NtRaiseException || apc) && nest_exceptions(next_pc) && raise_nested(p, ctx_addr, target, raise_sp, next_pc) {
                     return;
                 }
                 set_resume(target);
@@ -1068,6 +1140,12 @@ mod imp {
                     }
                     stage_thread(gex_tid, child, start);
                 });
+                if crate::aot() {
+                    crate::cgen::drain();
+                    // SAFETY: a host import without arguments.
+                    unsafe { serve_in_place() };
+                    return;
+                }
                 set_resume(resume_pc());
                 set_resume_ctx(ctx_addr);
                 trap();
@@ -1179,9 +1257,12 @@ mod imp {
 
     /// Every how many NT syscalls a thread reads the clock (see `syscall`).
     const SAMPLE: u64 = 16;
+    /// Every how many NtYieldExecution (see `syscall`).
+    const SAMPLE_YIELD: u64 = 512;
 
     thread_local! {
         static SYSCALL_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static YIELD_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     /// Whether syscall `nr` waits (its time is a wait, not NT work): by
@@ -1341,6 +1422,13 @@ mod imp {
 
     /// End the process with NT exit code `code`. The low byte is what a
     /// parent sees, as natively.
+    /// An AOT-only run: JS serves units, catches this Worker up on the
+    /// function table and posts new threads, inside this call.
+    pub(crate) fn serve_now() {
+        // SAFETY: a host import without arguments.
+        unsafe { serve_in_place() };
+    }
+
     pub(crate) fn end_process(code: u32) -> ! {
         if crate::tracing_exc() {
             let (n, l) = crate::cgen::callouts();

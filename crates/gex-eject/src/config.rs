@@ -63,9 +63,25 @@ pub struct Replace {
     pub abi: Abi,
 }
 
+/// A stateful export provider (docs/eject-pe.md §5): a Windows library's
+/// exports served by a wasm module built from `dir` (its `build.sh`), such
+/// as the Lua provider an eject of a LuaJIT program sets up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provider {
+    /// The DLL, by file name (`lua51.dll`).
+    pub library: String,
+    /// Its sources, relative to the project, with a `build.sh OUT GEN`.
+    pub dir: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub replace: Vec<Replace>,
+    /// Windows programs: libraries replaced by stateful providers.
+    pub providers: Vec<Provider>,
+    /// Windows programs: function starts recovery must take, as
+    /// `image.dll+0xOFFSET` (the run names them when it misses one).
+    pub seeds: Vec<String>,
     pub coverage: Coverage,
     /// Arguments after `argv[0]` for a run that gives none (default: the
     /// recorded ones).
@@ -78,24 +94,47 @@ pub struct Config {
     /// every run of this build (default off; a run can ask with
     /// `--jit-fallback`).
     pub jit_fallback: bool,
+    /// Windows programs: link groups, each a list of image file names whose
+    /// functions are linked into one module with direct calls between them
+    /// (docs/eject-pe.md §6a).
+    pub link_groups: Vec<Vec<String>>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             replace: Vec::new(),
+            providers: Vec::new(),
+            seeds: Vec::new(),
             coverage: Coverage::Profile,
             args: None,
             all_syscalls: false,
             allow_syscalls: Vec::new(),
             jit_fallback: false,
+            link_groups: Vec::new(),
         }
     }
 }
 
 /// The file a new project starts with.
 pub fn template() -> String {
-    json::write(&obj(vec![
+    template_with(&[])
+}
+
+/// [`template`], with stateful providers set up.
+pub fn template_with(providers: &[Provider]) -> String {
+    let mut fields = template_fields();
+    if !providers.is_empty() {
+        fields.push((
+            "providers",
+            Json::Arr(providers.iter().map(|p| obj(vec![("library", json::s(&p.library)), ("dir", json::s(&p.dir))])).collect()),
+        ));
+    }
+    json::write(&obj(fields))
+}
+
+fn template_fields() -> Vec<(&'static str, Json)> {
+    vec![
         (
             "about",
             json::s(
@@ -114,7 +153,7 @@ pub fn template() -> String {
         ("syscalls", json::s("recorded")),
         ("allow_syscalls", Json::Arr(Vec::new())),
         ("jit_fallback", json::b(false)),
-    ]))
+    ]
 }
 
 impl Config {
@@ -125,7 +164,7 @@ impl Config {
             bail!("{what}: not a JSON object");
         };
         for (k, _) in kv {
-            if !matches!(k.as_str(), "about" | "replace" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback") {
+            if !matches!(k.as_str(), "about" | "replace" | "providers" | "seeds" | "coverage" | "args" | "syscalls" | "allow_syscalls" | "jit_fallback" | "link_groups") {
                 bail!("{what}: unknown setting \"{k}\"");
             }
         }
@@ -203,6 +242,14 @@ impl Config {
         } else if !matches!(v.get("replace"), None | Some(Json::Null)) {
             bail!("{what}: \"replace\" is not a list");
         }
+        if let Some(Json::Arr(list)) = v.get("providers") {
+            for (i, r) in list.iter().enumerate() {
+                let w = format!("{what}: providers[{i}]");
+                c.providers.push(Provider { library: str_field(r, "library", &w)?, dir: str_field(r, "dir", &w)? });
+            }
+        } else if !matches!(v.get("providers"), None | Some(Json::Null)) {
+            bail!("{what}: \"providers\" is not a list");
+        }
         c.coverage = match opt_str(&v, "coverage").as_deref() {
             None | Some("profile") => Coverage::Profile,
             Some("static") => Coverage::Static,
@@ -215,10 +262,25 @@ impl Config {
             Some(o) => bail!("{what}: syscalls \"{o}\" is not \"recorded\" or \"all\""),
         };
         c.allow_syscalls = json::str_list(&v, "allow_syscalls", what)?;
+        c.seeds = json::str_list(&v, "seeds", what)?;
         c.jit_fallback = match v.get("jit_fallback") {
             None | Some(Json::Null) => false,
             Some(Json::Bool(b)) => *b,
             Some(_) => bail!("{what}: jit_fallback is not true or false"),
+        };
+        c.link_groups = match v.get("link_groups") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Arr(gs)) => gs
+                .iter()
+                .map(|g| match g {
+                    Json::Arr(m) => m
+                        .iter()
+                        .map(|x| x.as_str().map(str::to_string).ok_or_else(|| anyhow!("{what}: a link group holds a non-string")))
+                        .collect::<Result<Vec<String>>>(),
+                    _ => bail!("{what}: \"link_groups\" holds a non-list"),
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => bail!("{what}: \"link_groups\" is not a list of lists"),
         };
         c.args = match v.get("args") {
             None | Some(Json::Null) => None,

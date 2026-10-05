@@ -1041,6 +1041,10 @@ pub struct NtSession {
     /// Every image mapped, in mapping order: `(object id, guest path, base,
     /// preferred base)`.
     pub images: Vec<NtImage>,
+    /// Addresses inside images that had function-tier units where code ran
+    /// without one: tier-1 entries after a unit left, resumes, fallback
+    /// calls. Code built ahead of time must have a function there.
+    pub entries: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1176,6 +1180,13 @@ impl Session {
                     m.size
                 );
             }
+            s.push_str("],\n\"entries\":[");
+            for (i, a) in nt.entries.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "{a}");
+            }
             s.push_str("]}");
         }
         s.push_str("}\n");
@@ -1256,6 +1267,7 @@ impl Session {
                 settings: strs("settings", nt),
                 gl: nt.get("gl").and_then(Json::as_bool).unwrap_or(false),
                 images,
+                entries: nt.get("entries").and_then(Json::as_arr).unwrap_or(&[]).iter().filter_map(Json::as_u64).collect(),
             });
         }
         for f in v.get("files").and_then(Json::as_arr).unwrap_or(&[]) {

@@ -1,7 +1,7 @@
 //! `gexc eject run <project>` (the project's `run.sh`): run the built program
 //! natively, from the project alone.
 
-use crate::build::{inputs_id, rootfs, BuildManifest};
+use crate::manifest::{inputs_id, rootfs, BuildManifest};
 use crate::config::Config;
 use crate::project::{rootfs_rel, Project};
 use anyhow::{anyhow, bail, Context, Result};

@@ -162,7 +162,7 @@ impl Aot {
         for p in &self.modules {
             let bytes = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
             out.push(
-                Module::new(engine, &bytes)
+                gex_cache::compile(engine, &bytes)
                     .with_context(|| format!("compiling replacement module {}", p.display()))?,
             );
         }
@@ -258,7 +258,7 @@ fn load_module(
                 .with_context(|| format!("compiling {}", path.display()))?
                 .module
         }
-        None => Module::new(engine, &wasm).with_context(|| format!("compiling {}", path.display()))?,
+        None => gex_cache::compile(engine, &wasm).with_context(|| format!("compiling {}", path.display()))?,
     };
     Ok((module, meta))
 }
@@ -374,7 +374,7 @@ impl ReplacementModule {
     /// importing a shared memory will not link to it (nor the reverse).
     pub fn inspect_for(wasm: &[u8], shared: bool) -> Result<ReplacementModule> {
     let engine = Engine::new(&engine_config()).context("creating a wasm engine")?;
-    let module = Module::new(&engine, wasm).context("not a valid wasm module for this runtime")?;
+    let module = gex_cache::compile(&engine, wasm).context("not a valid wasm module for this runtime")?;
     let mut imports_memory = false;
     for imp in module.imports() {
         match (imp.module(), imp.name(), imp.ty()) {

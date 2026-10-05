@@ -63,7 +63,7 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
     let pairs = [(entry, slot("__gex_start")?), (thread_entry, slot("__gex_thread_start")?)];
     let engine = store.engine().clone();
     let t0 = std::time::Instant::now();
-    let module = Module::new(&engine, &wasm).context("compiling the wasm32 program")?;
+    let module = gex_cache::compile(&engine, &wasm).context("compiling the wasm32 program")?;
     let shared = store
         .data()
         .jit

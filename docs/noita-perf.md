@@ -612,10 +612,34 @@ runs under the same load.
   `threadwork.py TAG` splits each thread's ms/frame into guest code,
   yield/spin and the rest. pewasm's BUSY counts its `_Yield` sleeps as
   waiting, so compare the real-work column with pewasm's t0/t1/t2.
-- **Fixed seed:** `GEX_NT_FIXED_TIME=1767225600` (54cb7124) is
-  PEWASM_FIXED_TIME's counterpart. Noita seeds its world from the date:
-  on cg10 two random-seed runs gave 58 and 38-50 world fps while pewasm
-  ran a steady 80 beside both.
+- **Fixed seed (corrected 2026-10-04, stream E): the fixed-time variables
+  do not fix the world.** `GEX_NT_FIXED_TIME=1767225600` (54cb7124) and
+  PEWASM_FIXED_TIME pin the date, but Noita does not seed its world from
+  it. noita.exe 0x883540: the world seed (stored at 0x1205004) is the
+  WORLD_SEED magic number if set, else drawn from the engine's RNG, seeded
+  at start-up. Every "fixed seed" run before this note had a random world
+  on both runtimes. The pin, the same on both:
+  - **`port/seedpin/`**: a mod (`mod.xml`, `init.lua` calling
+    `ModMagicNumbersFileAdd`, a `magic_numbers.xml` with WORLD_SEED written
+    per run) and the save's `mod_config.xml` enabling it. The game install
+    is never written. `NOITA_WORLD_SEED` picks the seed (default
+    1767225600; 0 = random).
+  - **pewasm:** `port/bench.cjs` (so also `port/tput.sh`) writes them into
+    its in-memory FS before start (`/mods/seedpin`,
+    `/locallow/Nolla_Games_Noita/save00`) and prints `world seed N`, read
+    from the game's memory.
+  - **gex, `gexc run`:** run noita.exe from a farm, the install as symlinks
+    plus the mod (`port/seedpin/pin.sh farm DIR`, once; unit keys are by
+    content, so the units still match), and after the run script deletes
+    the save, `pin.sh save <prefix>/drive_c/users/gex/AppData/LocalLow/Nolla_Games_Noita/save00`.
+  - **gex, an ejected project:** `pin.sh mod <rootfs>/<game dir>` and
+    `pin.sh save <rootfs>/<save00>` (run-ejected.sh does both).
+  - **Check:** `GEX_NT_PEEK=0x1205004` prints the world seed as `peek=`.
+    "Setting random seed: N" is the engine's start-up RNG, not the world,
+    and differs every run with or without the pin.
+  - Verified 2026-10-04: world seed 1767225600 on pewasm (two runs), on
+    the ejected project (two) and on `gexc run` from the farm (one);
+    without the pin, 731381664 (pewasm) and 775215642 (gex).
 - **Pairs:** pewasm runs right before and after each gex run, on the same
   cores. On this machine pewasm alone ranged from 40 to 92 world fps
   during the day, with load.
@@ -1312,3 +1336,52 @@ kill writes nothing) is `scratchpad/fjit/noitarec/rec/profile.json`.
 2. When the coordinator says wake-on-idle is in the page: `gex-page.sh`
    on bu (hinted) and `pw-page.sh`, then `cmp.py`; then TurboFan dumps of
    0x724580, 0x70b200, 0x70bdc0 if the workers still lag.
+
+### Stream F: the page re-profile on merge/main (2026-10-04, evening)
+
+merge/fjit = merge/main 95689ea9 + b2bb3c95 (the provider key fix below).
+
+**Hints for the DLLs.** `tools/icall-hints.py` on the tier-1 recording
+(`scratchpad/fjit/noitarec/rec/profile.json`) for lua51, msvcr120, msvcp120,
+SDL2, fmod, fmodstudio and Wine's ntdll, kernelbase, kernel32, opengl32,
+win32u, ucrtbase, user32 at their layout bases; installed in cgcache-cg14,
+bu and bm `icall/` (copies in `scratchpad/fjit/hints/`). Devirtualised:
+lua51 23, msvcr120 10, msvcp120 24, SDL2 7. The recording's in-image
+dominant targets cover ntdll 225M and msvcr120 218M calls; the rest of the
+indirect volume is cross-image (import calls: msvcr120 287M, kernelbase
+220M, opengl32 101M, msvcp120 65M), which hints cannot devirtualise.
+
+**Provider keys differed in the page.** `provider::fingerprint` hashed
+`INCLUDES` (a slice) with a usize length: 4 bytes in the shim, 8 natively.
+Every stateful provider (msvcr120_concrt, crt_heap) and every unit built
+around one had another key in the page: main's page stopped at msvcr120
+("build one natively first"). b2bb3c95 writes it as a u64; native keys do
+not move. The shim needs rebuilding with it.
+
+**bm** (`wt/fjit/target/bm`, `scratchpad/fjit/v8/build-bm.sh`, gexc of
+main): guarded browser units, carries off, every hint, staged layout
+appended. Page: wt/fjit with the fixed shim (web/public/gex = web9's,
+hard-linked, plus the new shared shim), cores 4,10, seed pinned, 4x.
+
+| run | world fps |
+|---|---|
+| pewasm pb1 (a unit build on other cores) | 57.4 |
+| gex gb2 (bm, wake-on-idle) | 53.6, AOT 98.7% |
+| pewasm pb2 | 64.4 |
+
+V8 profiles (`cmp.py`, ms of work per world frame, gb2 vs pb2):
+
+- Workers: gex 9.5-9.8 against 7.6. Guest code is at parity: 0x724580 with
+  0x70b110 and 0x70b050 is 8.39 against 8.37 (pewasm's TurboFan inlines both
+  callees; gex calls them). The other hot functions run 0.83-0.94 of
+  pewasm's time against pb1. The difference is the providers: cond_notify
+  0.9 per worker, plus dlfree and memset.
+- Main game thread: gex 29.6 against 10.6. It splits into guest units 12.3
+  (noita.exe 9.9, msvcr120 0.7, opengl32 0.65, ntdll 0.4), the shim 11.9
+  (`nt::sync::guest_yield` 7.1, syscall 0.8, GL call/cmd_with 0.9,
+  gex_dispatch_miss 0.4), providers 2.9 (cs_unlock_ 1.8, cond_notify 0.6)
+  and JS 2.1 (mono_ns 1.0).
+- Compositor: 11.9, against about 1.5 ms of GL JS in pewasm's page.
+- Total: 61 against 26 ms. Two cores are saturated, so preemption inflates
+  the main thread's per-function times (0x70b200 is 0.83 of pewasm's time on
+  the workers but 1.6 on the main thread).

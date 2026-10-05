@@ -284,6 +284,26 @@ fn read_format(r: &mut impl BufRead, what: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Several images' recoveries as one (a link group's): entries in member
+/// order, the maps merged. All members must be the same class.
+fn read_recoveries(dirs: &[&Path]) -> Result<Recovery> {
+    let mut it = dirs.iter();
+    let first = it.next().ok_or_else(|| anyhow!("a link group with no members"))?;
+    let mut rec = read_recovery(first)?;
+    for d in it {
+        let r = read_recovery(d)?;
+        if r.class32 != rec.class32 {
+            bail!("{}: a link group's members are of one class (i386 or x86-64)", d.display());
+        }
+        rec.entries.extend(r.entries);
+        rec.sums.extend(r.sums);
+        rec.trapfree.extend(r.trapfree);
+        rec.touched.extend(r.touched);
+        rec.guardfree.extend(r.guardfree);
+    }
+    Ok(rec)
+}
+
 fn read_recovery(dir: &Path) -> Result<Recovery> {
     let path = dir.join("summaries");
     let mut r = BufReader::new(std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?);
@@ -413,7 +433,36 @@ pub fn build_c_module(
     stubs: &HashSet<u64>,
     icall_hints: &HashMap<u64, u64>,
 ) -> Result<ImageStats> {
-    let rec = read_recovery(recovery)?;
+    build_group_module(&[recovery], work, objects, out, jobs, read, stubs, icall_hints, &GroupProviders::default())
+}
+
+/// Export providers compiled into a link group's module (docs/eject-pe.md
+/// §6a G2): their translation units (name, C), and the guest addresses
+/// they serve with the C symbol each one calls.
+#[derive(Default)]
+pub struct GroupProviders {
+    pub sources: Vec<(String, String)>,
+    pub bodies: HashMap<u64, String>,
+}
+
+/// [`build_c_module`] over several images' recoveries at once: one module
+/// holding every member's functions, whose calls between members are direct
+/// (a link group, docs/eject-pe.md §6a). The members' addresses must not
+/// overlap (images at fixed bases); `read`, `stubs` and `icall_hints` cover
+/// them all.
+#[allow(clippy::too_many_arguments)]
+pub fn build_group_module(
+    recoveries: &[&Path],
+    work: &Path,
+    objects: &Path,
+    out: &Path,
+    jobs: usize,
+    read: &(dyn Fn(u64) -> Option<u8> + Sync),
+    stubs: &HashSet<u64>,
+    icall_hints: &HashMap<u64, u64>,
+    providers: &GroupProviders,
+) -> Result<ImageStats> {
+    let rec = read_recoveries(recoveries)?;
     let hints = std::sync::Arc::new(icall_hints.clone());
     // A function clang compiles with a shadow-stack frame cannot be spliced:
     // it becomes a stub that leaves for tier-1 (`add_leave_stub`), its own
@@ -422,7 +471,7 @@ pub fn build_c_module(
     // Export providers' addresses start as stubs (`crate::provider`).
     let mut skip: HashSet<u64> = stubs.clone();
     loop {
-        let stats = emit_and_link(&rec, recovery, work, objects, out, jobs, &skip, read, &hints)?;
+        let stats = emit_and_link(&rec, recoveries, work, objects, out, jobs, &skip, read, &hints, providers)?;
         let cwasm = std::fs::read(out)?;
         let users = crate::splice::unspliceable_users(&cwasm)?;
         if users.is_empty() {
@@ -450,7 +499,7 @@ pub fn build_c_module(
 #[allow(clippy::too_many_arguments)]
 fn emit_and_link(
     rec: &Recovery,
-    recovery: &Path,
+    recoveries: &[&Path],
     work: &Path,
     objects: &Path,
     out: &Path,
@@ -458,6 +507,7 @@ fn emit_and_link(
     skip: &HashSet<u64>,
     read: &(dyn Fn(u64) -> Option<u8> + Sync),
     hints: &std::sync::Arc<HashMap<u64, u64>>,
+    providers: &GroupProviders,
 ) -> Result<ImageStats> {
     std::fs::create_dir_all(work)?;
     // The small leaves every unit may copy (`FnUnit::leaves`), and how
@@ -465,11 +515,13 @@ fn emit_and_link(
     let mut leaves = HashMap::new();
     let mut leaf_pops = HashMap::new();
     if func::leaf_copies() {
-        let mut gir = GirReader::open(recovery)?;
-        while let Some(f) = gir.next()? {
-            if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
-                leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
-                leaves.insert(f.entry, f);
+        for recovery in recoveries {
+            let mut gir = GirReader::open(recovery)?;
+            while let Some(f) = gir.next()? {
+                if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
+                    leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                    leaves.insert(f.entry, f);
+                }
             }
         }
     }
@@ -494,7 +546,10 @@ fn emit_and_link(
     let pch = toolchain::precompile_header(work)?;
     let known: HashSet<u64> = rec.entries.iter().copied().collect();
     // The entries a host installs (a stub has no `e_`/`ib_`).
-    let entries: Vec<u64> = rec.entries.iter().copied().filter(|a| !skip.contains(a)).collect();
+    // A provider compiled in serves its stubs' addresses with bodies of the
+    // module's own.
+    let served = |a: &u64| providers.bodies.contains_key(a);
+    let entries: Vec<u64> = rec.entries.iter().copied().filter(|a| !skip.contains(a) || served(a)).collect();
     let mut stats = ImageStats { functions: rec.entries.len(), ..Default::default() };
 
     // Units go to a bounded queue of `jobs` compilers: emission waits when it
@@ -535,11 +590,14 @@ fn emit_and_link(
             *unit = new_unit();
             Ok(())
         };
-        let mut gir = GirReader::open(recovery)?;
         let mut unit = new_unit();
         let mut k = 0usize;
+        for recovery in recoveries {
+        let mut gir = GirReader::open(recovery)?;
         while let Some(f) = gir.next()? {
-            if skip.contains(&f.entry) {
+            if let Some(sym) = providers.bodies.get(&f.entry) {
+                unit.add_provider_body(f.entry, sym);
+            } else if skip.contains(&f.entry) {
                 unit.add_leave_stub(f.entry);
             } else {
                 unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
@@ -554,8 +612,23 @@ fn emit_and_link(
                 break;
             }
         }
+        }
         if unit.len() > 0 {
             emit(&mut unit, k, &mut objs, &mut stats)?;
+        }
+        // The providers' own translation units, cached by their C as units are.
+        if !providers.sources.is_empty() {
+            std::fs::write(work.join("provider.h"), crate::provider::prelude())?;
+        }
+        for (name, text) in &providers.sources {
+            let key = hash128(&[text.as_bytes(), header_text.as_bytes(), crate::provider::prelude().as_bytes(), flags.as_bytes(), version.as_bytes()]);
+            let obj = objects.join(format!("{key}.o"));
+            if !obj.exists() {
+                let src = work.join(format!("prov_{name}.c"));
+                std::fs::write(&src, text)?;
+                toolchain::compile_one(work, &src, &obj, None).with_context(|| format!("compiling provider {name} into the group"))?;
+            }
+            objs.push(obj);
         }
         drop(tx);
         Ok(())

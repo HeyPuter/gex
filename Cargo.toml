@@ -27,6 +27,7 @@ members = [
     "crates/gex-gpu",
     "crates/gex-gl",
     "crates/gex-eject",
+    "crates/gex-rt",
     "crates/gexc",
     "shims/browser",
     "shims/hostwl",
@@ -46,7 +47,7 @@ repository = "https://github.com/puter/gex"
 [workspace.dependencies]
 gex-atomic = { path = "crates/gex-atomic" }
 gex-abi = { path = "crates/gex-abi" }
-gex-cache = { path = "crates/gex-cache" }
+gex-cache = { path = "crates/gex-cache", default-features = false }
 gex-key = { path = "crates/gex-key" }
 gex-mem = { path = "crates/gex-mem" }
 gex-wayland = { path = "crates/gex-wayland" }
@@ -68,8 +69,8 @@ gex-kmem = { path = "crates/gex-kmem" }
 gex-xlate = { path = "crates/gex-xlate" }
 gex-ld = { path = "crates/gex-ld" }
 gex-kernel = { path = "crates/gex-kernel" }
-gex-native = { path = "shims/native" }
-gex-eject = { path = "crates/gex-eject" }
+gex-native = { path = "shims/native", default-features = false }
+gex-eject = { path = "crates/gex-eject", default-features = false }
 
 [profile.release]
 opt-level = 3

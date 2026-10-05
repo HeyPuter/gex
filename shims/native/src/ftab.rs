@@ -40,15 +40,15 @@ pub(crate) struct Shared {
     /// Addresses handed to the background translator (`queue`), until a
     /// retirement covers them.
     queued: std::collections::HashSet<u64>,
+    /// Stateful providers' installs (`libprov`), by module: their data's
+    /// guest address.
+    pub stateful: HashMap<u32, crate::libprov::Extras>,
     /// Installs that are export providers (`publish_pairs`): native code in
     /// place of a library's, so a rewrite of the library's bytes there does
     /// not retire them (the bytes are not what runs). Noita's mod sandbox
     /// overwrites ~120 lua51.dll entry points; pewasm, whose lua51 is
     /// native too, ignores those writes the same way.
     pub providers: std::collections::HashSet<u32>,
-    /// Stateful providers' installs (`libprov`), by module: their data's
-    /// guest address.
-    pub stateful: HashMap<u32, crate::libprov::Extras>,
 }
 
 /// One store's half, inside [`Jit`].
@@ -62,6 +62,8 @@ pub(crate) struct Store {
     /// The stack pointer this thread's stateful providers share
     /// (`libprov::stack`), made at the first one's instantiation.
     pub provider_sp: Option<wasmtime::Global>,
+    /// The wasm exception tag of `gex.provider_throw` (wasm64 providers; [`crate::libprov::tag`]).
+    pub provider_tag: Option<wasmtime::Tag>,
     /// How far through the map's log this table is.
     replayed: usize,
 }
@@ -171,7 +173,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
         match &s.ftab.runtime {
             Some(m) => m.clone(),
             None => {
-                let m = Module::new(cx.as_context().engine(), gex_cgen::runtime::module())
+                let m = gex_cache::compile(cx.as_context().engine(), &gex_cgen::runtime::module())
                     .context("compiling the function table's runtime module")?;
                 crate::aot_share::note(&m, crate::aot_share::Kind::Runtime);
                 s.ftab.runtime = Some(m.clone());
@@ -225,7 +227,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_tag: None, replayed: 0 });
     Ok(())
 }
 
@@ -573,7 +575,12 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
                     drop(s);
                     let t = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|st| st.table);
                     let ty = t.and_then(|t| t.get(&mut *caller, f.idx as u64)).and_then(|r| r.as_func().flatten().map(|f| format!("{:?}", f.ty(&*caller))));
-                    eprintln!("[ftab] lookup {addr:#x} -> index {} (install {}, module {}, base {}, {:?}) holds {ty:?}", f.idx, f.install, inst.module, inst.base, inst.tier);
+                    // x86-64: the guest's return address, at [rsp] (register 4) on a call.
+                    let ctx_addr = caller.data().thread.ctx_addr as usize;
+                    let rd = |a: usize| memory.bytes().get(a..a + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+                    let rsp = rd(ctx_addr + gex_abi::ctx::X + 4 * 8);
+                    let ret = rd(rsp as usize);
+                    eprintln!("[ftab] lookup {addr:#x} -> index {} (install {}, module {}, base {}, {:?}) ret {ret:#x} holds {ty:?}", f.idx, f.install, inst.module, inst.base, inst.tier);
                     gex_kernel::ftab::fcache_write(memory.bytes(), addr, f.idx);
                     return Ok(f.idx as i32);
                 }
@@ -649,7 +656,8 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let v = k.mem.vmas();
         (
-            v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
+            // A library a stateful provider replaced is not code to translate (`libprov::replaced`).
+            v.iter().filter(|v| v.prot & prot::EXEC != 0 && !crate::libprov::replaced(v.start, v.end)).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
         )
@@ -677,6 +685,9 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
 /// replays). False when the translator declined or a retirement since the
 /// job was taken made it stale.
 fn run_job(j: &Job) -> Result<bool> {
+    if cfg!(not(feature = "translate")) {
+        return Ok(false);
+    }
     use std::sync::atomic::Ordering::Relaxed;
     let Some(tr) = gex_kernel::ftab::translator() else { return Ok(false) };
     let (sh, memory, addr) = (&j.sh, &j.memory, j.addr);
@@ -767,7 +778,7 @@ fn compile_translation(j: &Job, wasm: &[u8]) -> Result<Module> {
             let key = gex_cache::key(build, [b"fjit".as_slice(), wasm]);
             gex_cache::load_or_compile_at(&j.engine, &dir.join("fjit").join(format!("{key}.cwasm")), wasm)
         }
-        None => Module::new(&j.engine, wasm).map_err(anyhow::Error::from),
+        None => gex_cache::compile(&j.engine, wasm),
     }
 }
 
@@ -820,6 +831,9 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
         (true, true) => 4,
     };
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
+    if caller.data().nt.is_some() && crate::profile::active() {
+        crate::profile::note_nt_entry(target);
+    }
     if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {
         *stats::FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(target).or_default() += 1;
     }
@@ -892,6 +906,9 @@ impl gex_kernel::ftab::Translator for Forwarder {
 }
 
 pub(crate) fn selftest_init() {
+    if cfg!(not(feature = "translate")) {
+        return;
+    }
     if std::env::var_os("GEX_FTAB_SELFTEST").is_some() {
         gex_kernel::ftab::set_translator(Box::new(Forwarder));
     }
