@@ -742,6 +742,16 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   at the new keys (`$S/logs/build18.log`); the measurements above are on the
   previous keys (site17b/site17d).
 
+- **Resume (next):** (1) repack the site from p-noita17 at the 3718d0ca
+  keys (`node web/eject-site.mjs p-noita17 site18 --bench`; copy
+  site17d.zcache first) and re-run the ABBA (`legs-edger.sh N pew SITE SITE
+  pew` through bench.sh); (2) the remaining ~5%: the main thread still waits
+  on the previous frame (profile with `prof-edger.sh`), then the compositor
+  items (render pass per draw); (3) world-up like for like: one input
+  script for both runtimes (pewasm's frames 60/120/180 vs gex's
+  12/90/144/224), then the menu/loading stalls; (4) audio waits for the
+  coordinator's call.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
