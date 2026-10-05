@@ -150,6 +150,64 @@ index 8d5fba2b6..6cc1e1aad 100644
  #endif // !HOST_WASI
 +
 +#endif /* !HOST_GEX */
+diff --git a/src/mono/mono/metadata/class-accessors.c b/src/mono/mono/metadata/class-accessors.c
+index 1a89c07ce..5fbcd696a 100644
+--- a/src/mono/mono/metadata/class-accessors.c
++++ b/src/mono/mono/metadata/class-accessors.c
+@@ -717,3 +717,36 @@ mono_wasm_jit_class_vtable_off (void)
+ {
+ 	return (int) G_STRUCT_OFFSET (MonoClass, vtable);
+ }
++
++#ifdef HOST_GEX
++/* gex (noita-wasm docs/unity-dotnet.md): Unity's per-class pointer. */
++void *
++gex_class_get_userdata (MonoClass *klass)
++{
++	return klass->unity_user_data;
++}
++
++void
++gex_class_set_userdata (MonoClass *klass, void *userdata)
++{
++	klass->unity_user_data = userdata;
++}
++
++int
++gex_class_get_userdata_offset (void)
++{
++	return (int)offsetof (MonoClass, unity_user_data);
++}
++
++gboolean
++gex_class_is_inited (MonoClass *klass)
++{
++	return m_class_is_inited (klass);
++}
++
++guint32
++gex_class_get_data_size (MonoClass *klass)
++{
++	return mono_class_data_size (klass);
++}
++#endif
+diff --git a/src/mono/mono/metadata/class-private-definition.h b/src/mono/mono/metadata/class-private-definition.h
+index 005cd0593..d47afef76 100644
+--- a/src/mono/mono/metadata/class-private-definition.h
++++ b/src/mono/mono/metadata/class-private-definition.h
+@@ -130,6 +130,12 @@ struct _MonoClass {
+ 	MonoPropertyBag infrequent_data;
+ 
+ 	void *variant_search_table;
++
++#ifdef HOST_GEX
++	/* gex: Unity's per-class pointer (mono_class_get/set_userdata), which
++	 * UnityPlayer also reads at its offset (mono_class_get_userdata_offset). */
++	void *unity_user_data;
++#endif
+ };
+ 
+ struct _MonoClassDef {
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
 index 787ca8c2f..ed1afb5a7 100644
 --- a/src/mono/mono/metadata/sgen-mono.c

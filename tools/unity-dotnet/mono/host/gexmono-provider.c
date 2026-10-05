@@ -64,21 +64,54 @@ call2 (uint64_t fn, uint64_t a, uint64_t b)
 
 #define GUEST_RTLD_LAZY 1
 
+extern uint64_t gexmono_find_plugin, gexmono_dl_fallback [4];
+
+static uint64_t
+call4 (uint64_t fn, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+	gexp_call k = { 0 };
+	k.ireg [0] = a, k.ireg [1] = b, k.ireg [2] = c, k.ireg [3] = d;
+	k.nireg = 4;
+	gexp_call_guest (fn, &k);
+	return k.rax;
+}
+
+static void *
+guest_handle (uint64_t h, int unity)
+{
+	DlHandle *d = calloc (1, sizeof *d);
+	d->guest = h;
+	d->lib = unity ? "unity" : NULL;
+	return d;
+}
+
 static void *
 dl_load (const char *name, int flags, char **err, void *user_data)
 {
 	for (size_t i = 0; name && i < sizeof native_libs / sizeof native_libs [0]; i++)
 		if (!strcmp (name, native_libs [i].lib))
 			return (void *)&native_libs [i];
+	/* Unity's find-plugin callback names a plugin's path. */
+	const char *path = name;
+	if (name && gexmono_find_plugin) {
+		const char *p = (const char *)(uintptr_t)call2 (gexmono_find_plugin, (uint64_t)(uintptr_t)name, 0);
+		if (p)
+			path = p;
+	}
 	uint64_t open = guest_fn ("dlopen", &guest_dlopen);
-	if (!open)
-		return NULL;
-	uint64_t h = call2 (open, (uint64_t)(uintptr_t)name, GUEST_RTLD_LAZY);
-	if (!h)
-		return NULL;
-	DlHandle *d = calloc (1, sizeof *d);
-	d->guest = h;
-	return d;
+	if (open) {
+		uint64_t h = call2 (open, (uint64_t)(uintptr_t)path, GUEST_RTLD_LAZY);
+		if (h)
+			return guest_handle (h, 0);
+	}
+	/* Unity's own fallback: load (name, flags, &err, user_data). */
+	if (gexmono_dl_fallback [0] && name) {
+		char *e = NULL;
+		uint64_t h = call4 (gexmono_dl_fallback [0], (uint64_t)(uintptr_t)name, flags, (uint64_t)(uintptr_t)&e, gexmono_dl_fallback [3]);
+		if (h)
+			return guest_handle (h, 1);
+	}
+	return NULL;
 }
 
 static void *
@@ -86,10 +119,14 @@ dl_symbol (void *handle, const char *name, char **err, void *user_data)
 {
 	const DlHandle *d = handle;
 	const void *p = NULL;
-	if (d->resolve)
+	if (d->resolve) {
 		p = d->resolve (name);
-	else if (guest_fn ("dlsym", &guest_dlsym))
+	} else if (d->lib && gexmono_dl_fallback [1]) {
+		char *e = NULL;
+		p = (const void *)(uintptr_t)call4 (gexmono_dl_fallback [1], d->guest, (uint64_t)(uintptr_t)name, (uint64_t)(uintptr_t)&e, gexmono_dl_fallback [3]);
+	} else if (guest_fn ("dlsym", &guest_dlsym)) {
 		p = (const void *)(uintptr_t)call2 (guest_dlsym, d->guest, (uint64_t)(uintptr_t)name);
+	}
 	if (!p && err)
 		*err = strdup ("gexmono: symbol not found");
 	return (void *)p;
