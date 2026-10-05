@@ -294,6 +294,19 @@ impl std::error::Error for Throw {}
 /// [`install`]): musl's `clone` sets the child's PC to it.
 static THREAD_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The text of every library a stateful provider replaced, as mapped: code
+/// that never runs, so no tier translates it ([`replaced`]).
+static REPLACED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+fn replaced_add(lo: u64, hi: u64) {
+    REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((lo, hi));
+}
+
+/// Whether `[start, end)` overlaps a replaced library's text.
+pub(crate) fn replaced(start: u64, end: u64) -> bool {
+    REPLACED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(lo, hi)| start < hi && end > lo)
+}
+
 /// The host functions stateful providers import.
 pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     // A wasm64 provider's pointers and table indices are i64 (docs/unity-
@@ -520,6 +533,11 @@ pub(crate) fn on_linux_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_ke
             (Arc::clone(&jit.shared), jit.engine.clone())
         };
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        // None of the replaced library's code may run, so the function JIT must not translate it
+        // either: following a PLT's folded GOT load into it would publish the library's own code
+        // over the provider's bindings (Muck under --fjit then ran Boehm's GC_exclude_static_roots
+        // forever).
+        replaced_add(lo.wrapping_add(bias), hi.wrapping_add(bias));
         for lp in libs {
             CTORS.lock().unwrap_or_else(|e| e.into_inner()).extend(ctors.iter().filter(|&&v| v >= lo && v < hi).map(|&v| v.wrapping_add(bias)));
             let n = install(lp, caller.data_mut(), &shared, &engine, &memory, &exports, bias, 0)?;

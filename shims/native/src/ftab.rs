@@ -559,7 +559,12 @@ pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i3
                     drop(s);
                     let t = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).map(|st| st.table);
                     let ty = t.and_then(|t| t.get(&mut *caller, f.idx as u64)).and_then(|r| r.as_func().flatten().map(|f| format!("{:?}", f.ty(&*caller))));
-                    eprintln!("[ftab] lookup {addr:#x} -> index {} (install {}, module {}, base {}, {:?}) holds {ty:?}", f.idx, f.install, inst.module, inst.base, inst.tier);
+                    // x86-64: the guest's return address, at [rsp] (register 4) on a call.
+                    let ctx_addr = caller.data().thread.ctx_addr as usize;
+                    let rd = |a: usize| memory.bytes().get(a..a + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+                    let rsp = rd(ctx_addr + gex_abi::ctx::X + 4 * 8);
+                    let ret = rd(rsp as usize);
+                    eprintln!("[ftab] lookup {addr:#x} -> index {} (install {}, module {}, base {}, {:?}) ret {ret:#x} holds {ty:?}", f.idx, f.install, inst.module, inst.base, inst.tier);
                     gex_kernel::ftab::fcache_write(memory.bytes(), addr, f.idx);
                     return Ok(f.idx as i32);
                 }
@@ -635,7 +640,8 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let v = k.mem.vmas();
         (
-            v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
+            // A library a stateful provider replaced is not code to translate (`libprov::replaced`).
+            v.iter().filter(|v| v.prot & prot::EXEC != 0 && !crate::libprov::replaced(v.start, v.end)).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
         )
