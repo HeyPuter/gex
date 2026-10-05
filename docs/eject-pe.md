@@ -1007,6 +1007,28 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
     0x15c0000); `$S/wgmap.mjs` pairs per gex function given a named pewasm
     build.
 
+- **Boot items (13f4d6a9, edger):** site26 = known image keys
+  (GEX_NT_IDENTITIES from `gexc eject`), unit-cache files preloaded into
+  SharedArrayBuffers, and the trampolines' unit and nt_unixcall provider
+  packed (site25, packed before that fix, ran the trampolines on tier-1:
+  not measured). World-up after navigation x3: site24w 31.8, 32.8, 31.7 s vs
+  site26 31.6, 30.0, 30.8 s (site26 about 1.3 s faster); pewasm 30.2 s. World
+  fps: site26 60.9, 57.6 vs pewasm 49.0, 49.0 (site26 1.21x faster than
+  pewasm, 59.3 vs 49.0 world fps).
+- **Direct present (118a8c06; user decision 2026-10-05):** an ejected GL
+  program's single GL window is the output canvas (see the commit and
+  compositor-worker.js "direct present"); the compositor composites again
+  when a second toplevel, a popup or a non-GL window appears. eject-site
+  makes it the default for GL projects (`--no-direct`; `?direct=0`).
+  Locally (SwiftShader, readback): Noita's frame fitted to the viewport,
+  letterboxed; the browser-gui tests pass with and without `direct=1`
+  (glwindow reads its frames back, so it composites either way).
+  play.mjs steps take `fx`/`fy` (frame pixels) for direct present; the play
+  scripts converted: `$S/shots/d27p*.json`. Edger queue `$S/c27/queue.sh`
+  (log `$S/c27/queue.txt`): ABBA pew/site27/site27c (composited control),
+  world-up A/B, play-through p1-p8 (site27p, readback for screenshots, own
+  browser profile `/tmp/gbench-e9play`), 35-minute soak.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
