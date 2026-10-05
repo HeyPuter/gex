@@ -171,7 +171,7 @@ maximum 0xffff0000).
 
 **Step 0: unguarded browser units now (small, no layout change, no
 safety lost).**
-- The page picks the flavor: `cgen=2&unguarded=1` (default on, once A/B'd)
+- The page picks the flavor: `cgen=2` is unguarded by default since the n1 A/B (docs/noita-perf.md; `unguarded=0` for the guarded one)
   sets `gex_cgen::image::set_unguarded(true)` in the shim before the first
   key, so the keys are the native `:unguarded` ones.
 - Build them with gexc **without** GEX_CGEN_GUARD=1, into another cache:

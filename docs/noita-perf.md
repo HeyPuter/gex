@@ -1661,3 +1661,22 @@ Nothing running on gooner or edger for stream F.
 - NT suite with --cgen + INLINELEAVES (native): logs/nt-inl.txt.
 Next: n1 sequence (g vs u) once bm-h is done; then the i1 sequence
 (u2 vs ui) with shims rebuilt from d54095e5.
+
+**n1 on edger (guarded bm-h vs unguarded bm-hu, same tree 129c5720, one
+shim, seed pinned, 4C/8T; `seq-n1.out`):**
+
+| leg | world fps |
+|---|---|
+| pewasm p1 | (page busy, no world) |
+| guarded g1 | 43.9 |
+| unguarded u1 | 48.7 |
+| pewasm p2 | 44.5 |
+| unguarded u2 | 47.8 |
+| guarded g2 | 40.9 |
+| pewasm p3 | 47.2 |
+
+pewasm 45.9; guarded 42.4 (0.92x); **unguarded 48.25 (1.05x pewasm, +14%
+on guarded)**. So the page's `cgen=` now means the unguarded flavor
+(`unguarded=0` for the guarded one; the ejected page passes its flavor
+explicitly), and scratch/fjit/build-bm.sh builds GUARD=0 by default (N1
+done).
