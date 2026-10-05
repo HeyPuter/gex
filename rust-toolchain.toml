@@ -2,3 +2,5 @@
 # handling for native Wine's setjmp: docs/wine-native.md §4.2).
 [toolchain]
 channel = "1.96.0"
+# the browser shim (shims/browser) builds for wasm32-unknown-unknown
+targets = ["wasm32-unknown-unknown"]
