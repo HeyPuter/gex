@@ -837,5 +837,43 @@ Not yet:
      would be overwritten"). The working tree was verified identical to
      6812ea26 + patches/0001-0003 (tree hashes equal), so build with the
      steps `sysroot runtime provider` (skip `src`).
-  2. Open: HK black frames (run `hk35`, gex-gl tallies), the worldmachine
-     --fjit `free()` bisection (the Hollow Knight item 6 above).
+  2. **HK black frames (gooner, runs hk35-hk37, hk40):** not a GL
+     translation problem: Unity never presents. `GEX_GL_CAPTURE=FILE` (host
+     env) recordings (`scratch/unity/gltr.py FILE hist|frame N|draws`) of
+     hk36 and hk37 are byte-identical in size (70,337,112 bytes) and hold
+     no PRESENT, no draw, one CLEAR, no shader: the stream stops after a
+     TEX_STORAGE_2D during the first scene's load. `--strace` (hk37): the
+     render thread (guest tid 68, same ring as the main thread) made 4
+     submits and then waits in futex/clock_gettime, idle, while the main
+     thread keeps running scripts. So the player loop stops sending
+     frames. Suspects: (a) the window never gets focus or visibility in the
+     rootful in-guest Xwayland with no window manager, and HK (unlike
+     Muck) does not run in the background; hk40 (`GEX_WL_INPUT` pointer
+     moves into the window every 7 s) was to test this but died first, see
+     3; (b) the game logic: "Couldn't find a Game Manager" in both batch
+     and graphics runs. `GEXMONO_TRACE=1` (hk38) shows Unity's
+     FindObjectOfType loop testing every object against GameManager's class
+     with `mono_class_is_subclass_of` and finding none. A control on
+     Unity's own Mono (run `hkst`, no provider) is running to tell whether
+     that message is normal for this scene. Also seen: SDL "window backend
+     is (null)" and "Video subsystem has not been initialized" early on,
+     then a window at 800x600 anyway (same in hk31/hk32).
+  3. **--fjit memory corruption is intermittent, and not only on
+     worldmachine:** hk40 on gooner died at startup with `*** stack
+     smashing detected ***` (same flags as hk36, which ran). On worldmachine:
+     b9 (RANGE libc + small libs) GOOD; b10 (libc + above UnityPlayer) and
+     b11 (everything below 0x7d948000) stalled before player.log existed;
+     b12 (full --fjit, `GEX_DUMP_ABORT=1`) BAD, dump in
+     `scratch/unity/wm/res/b12-out.txt`: main thread during physics init,
+     return addresses UnityPlayer+0x8920af/+0x8900c0 (vaddr 0xf8c0af, Unity's
+     allocator after `pthread_getspecific`) -> libc free; b13 (SKIP the
+     allocator 0x7e8d0000-0x7e8de000) failed differently: thread 49
+     SIGSEGV at pc 0 after 4 min. On gooner, batch HK with RANGE=UnityPlayer
+     only (hkr1) and full --fjit (hkr0) both reach the first scene, so the
+     worldmachine "stalls" with partial ranges are not a deterministic
+     tier-1/fjit interplay bug. Conclusion so far: a nondeterministic
+     corruption under --fjit (canary, malloc chunk, a null call target),
+     more likely a race or a per-thread state slip (TLS/fs base?) than one
+     mistranslated function; range bisection cannot pin it. Next: repeat
+     identical runs to measure the failure rate, then look at thread
+     creation/fs-base and publication races in the function JIT.
