@@ -593,7 +593,10 @@ Not yet:
     web/public/gex/seed.x86.m64.shared.wasm PROG` runs gx64 ack/bits/branchy
     with the same output as the wasm32 shim.
   - **P5 plan, in order:**
-    1. Guest addresses to the global kernel are still `u32` (the `k_*`
+    1. **Done (06e6b95b):** `gex_kernel::PAddr`, u64 only in the wasm64
+       shim and the process64 kernel; the high arena is backed without
+       moving the heap's cursor; `tests/x86-programs/mem64-io.c` passes on
+       the wasm64 shim under node. Was: guest addresses to the global kernel were `u32` (the `k_*`
        imports, gex-kernel's remote pipe/unix/pty ops, `rf_*`). In M64
        a buffer above 4 GiB (the high arena) would be truncated. Widen them
        to a `PAddr` that is u64 in the wasm64 shim and the process64 kernel
@@ -608,8 +611,19 @@ Not yet:
        tests/unity-dotnet/embed in node.
     4. Muck in the page: the provider plus the BCL served as files,
        graphics through Mesa (wink) and the page's Xwayland (`hostx=1`).
-    5. The fork's wasm JIT on wasm64 (an i64-address emitter, modules
-       compiled through gex's JIT path).
+    5. The fork's wasm JIT on wasm64. Assessment (2026-10-05): about
+       14,400 lines (`mini-wasm*.inc`, `mini-wasm.c`, `wasm-encoder.c`) on
+       Mono's mini IR, with no wasm64 awareness. It is emscripten-bound:
+       `EM_ASM` instantiation with `wasmTable`, a per-Worker publish
+       protocol, and `setInterval` tier-up ticks. Port: (a) mini's wasm
+       arch with 8-byte pointers (`cpu-wasm.mdesc`, `mini-wasm.h`); (b) the
+       emitter's addresses as i64 and memory64/table64 imports; (c) publish
+       and instantiate through a gex host import (gex already compiles and
+       instantiates modules per thread natively and in the page), with
+       slots in the provider's table64; (d) EH and GC-root scanning
+       re-checked against provider frames. Estimate 5-8 agent-days. It runs
+       natively under gexc as well (wasmtime compiles the published
+       modules), so native runs get the same tier.
   - Unity's remaining internal calls as they show up; then Stardew/Celeste.
 - **Resume (after the move; HEAD 1db5c816, `master` merged in):**
   0. The coordgate on this branch still lacks its browser NT step (it was
