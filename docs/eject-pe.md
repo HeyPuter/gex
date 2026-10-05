@@ -685,6 +685,49 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   - Start-up marks for the world-up profile: `[nt-page] fetching/fetched/
     untarred/running at T` and one `[unit] KEY MiB: load, compile` line per
     unit (wall clock ms mod 1e7 on both).
+- **Results on edger (bench box, BENCH_CORES default, seed pinned, 4x clock,
+  world fps from world-up+90 s to 330 s; pewasm = run-pewasm-page.sh):**
+
+  | sequence | ejected page | pewasm | ratio |
+  | --- | --- | --- | --- |
+  | site17b (upload present), ABBA | 34.6, 33.8 | 44.4, 48.6 | 0.74 |
+  | site17d (direct present), ABBA | 45.3, 45.2 | 48.0, 47.7 | 0.95 |
+
+  - Profile (site17b): the compositor worker spent 27% of its time in
+    `texImage2D` (the WebGPU canvas uploaded into WebGL every composited
+    frame, GPU-synchronous on the P620) and Noita's main thread waited on
+    the previous frame for ~27% of each 10 s. On worldmachine's RX 6500 XT
+    the same wait was ~0.2%, which is why the old 1.31x does not carry over.
+  - Fix (7a3f88c0): Mesa presents straight into a page canvas laid over the
+    output where the GL window is, whenever that window is on top
+    (`gl-rect` messages place it); otherwise the old upload. `?glpresent=
+    upload` keeps the old path. +32% on edger.
+  - Headless screenshots do not show the overlay (nor the uploaded GL
+    frame); visual checks run with `GEX_NT_GL_READBACK=1`.
+- **Start-up (world-up):** units are not the cost (all 38 compiled and
+  installed within 7 s of the process start; noita.exe's 131 MiB compiles in
+  0.35 s, lazily). Process-time line on edger: first present 6 s; Noita's own
+  init on the main thread to ~28 s (guest 16.8 s, then 7 s of synchronous GL,
+  mostly the compositor busy uploading); menus; a second stall at the
+  loading screen; world at 57-65 s. The gex input script clicks at presented
+  frame 224 while pewasm's clicks at frame 180, so world-up is not like for
+  like; the measured frames-per-second during menus/loading are bounded by
+  the same compositor wait as above.
+- **Download (site17b/d):** 74.7 MB in all (units 261 MB -> 31.0 MB, rootfs
+  94 MB -> 30.8 MB, shim 45 -> 6.8, Mesa 26.6 -> 3.1, kernel 13.3 -> 1.9, page
+  JS 1 MB), against pewasm's 190 MB (which ships all of data/fonts, 165 MB;
+  the eject ships the files the session read).
+- **Packaging:** `node web/eject-site.mjs PROJECT OUT [--bench] [--overlay
+  DIR] [--drop PATH]`: zstd-19 files decoded and cached by sw.js (which also
+  isolates; sync XHR from Workers goes through it), a launcher with a
+  progress bar, `_headers`, `serve.mjs`, README. Without --bench the
+  scripted input and the 4x clock are dropped.
+- **Play-through (edger, site17p = --overlay overlay-play: a `killme` mod
+  that kills the player 900 frames after each spawn):** release notes, main
+  menu, New Game, mode select, world (seed 1767225600), walking, levitating,
+  shooting, death ("Game Over", cause 'killme'), stats screen, New Game
+  again into a new world, pause menu. Scripts `$S/shots/p1..p7.json`,
+  `$S/play-edger.sh`.
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
