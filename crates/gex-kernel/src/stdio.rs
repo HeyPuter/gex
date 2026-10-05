@@ -17,6 +17,14 @@ pub enum Stream {
     Err,
 }
 
+/// Whether the host's stdin has data or has hit end of file, without
+/// reading it. The kernel has no host-system calls of its own, so the
+/// embedder sets this (gexc: `poll` on fd 0). Unset, stdin is always
+/// "readable", which a `select` on an empty pipe gets wrong: the guest then
+/// blocks in `read` (Warfork's dedicated server, its console polled every
+/// frame, stopped dead after loading).
+pub static STDIN_READY: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+
 /// A standard stream, optionally reported as a terminal.
 #[derive(Debug)]
 pub struct StdStream {
@@ -32,6 +40,10 @@ impl StdStream {
 }
 
 impl FileHandle for StdStream {
+    fn poll_readable(&self) -> bool {
+        self.stream != Stream::In || STDIN_READY.get().is_none_or(|f| f())
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.stream != Stream::In {
             return Err(Errno::EBADF);
