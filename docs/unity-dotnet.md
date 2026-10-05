@@ -602,7 +602,12 @@ Not yet:
        to a `PAddr` that is u64 in the wasm64 shim and the process64 kernel
        and u32 otherwise (M32 unchanged). Test: an x86-64 program that
        reads a file and a pipe into a buffer above 4 GiB.
-    2. Dynamic glibc programs and the x86-programs corpus under `GEX_MEM64`.
+    2. The x86-programs corpus under node (`scratch/unity/w64/x86p-node.sh`,
+       `M64=1` for the wasm64 shim; its exit-status check is broken, output
+       only): the wasm64 shim passes 22 of 34, the wasm32 shim 21; every
+       wasm64 failure also fails on wasm32 (signals, threads, faults: the
+       browser shim's own gaps). Dynamic glibc under node not tried yet.
+       **Parked 2026-10-05: the user chose the wasm JIT first.**
     3. The Linux stateful provider in the browser: `libprov`'s mem64 side
        (SysV adapters' provider_abi/table_size/guest_sym/code_page, thread
        register/park/stop/start, guest stack end, reverse slots,
