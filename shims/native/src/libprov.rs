@@ -361,6 +361,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
 /// [`register`] for a 64-bit guest memory: the same functions with i64
 /// addresses, sizes and function-table indices (stream U, additive).
 fn register64(linker: &mut Linker<HostState>) -> Result<()> {
+    crate::wasmjit::register64(linker)?;
     linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i64, arg: i64| -> Result<i32> {
         let func = ftab::table_func(&mut caller, f as u32)?;
         let typed = func.typed::<i64, ()>(&caller).context("gex.provider_try: the function is not void(void *)")?;

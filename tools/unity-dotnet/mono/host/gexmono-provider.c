@@ -243,6 +243,10 @@ gexmono_trace (int ctx, const char *name)
 
 /* ---- before mono_jit_init ---- */
 
+__attribute__((import_module ("gex"), import_name ("provider_jit_reserve"))) int64_t gexwj_host_reserve (int64_t n, int64_t fill);
+void mono_jiterp_initialize_table (int type, int first_index, int last_index);
+
+
 static void
 preinit (void)
 {
@@ -250,8 +254,25 @@ preinit (void)
 	if (done)
 		return;
 	done = 1;
-	/* The fork's runtime wasm JIT: off until it emits wasm64 for gex. */
-	setenv ("MONO_WASM_JIT_AUTO", "0", 0);
+	/* The fork's runtime wasm JIT (docs/unity-dotnet.md P5): GEXMONO_WASM_JIT=1 while it is brought up on
+	 * wasm64. Its slots come from the jiterpreter's JIT_CALL table, which the browser's TypeScript sizes and
+	 * fills; here the host reserves the range in the process's function table (gex.provider_jit_reserve). The
+	 * rest of the jiterpreter (traces, interp_entry and jit_call wrappers) stays off. No inline TLAB
+	 * allocation: SGen runs Boehm-like under gex, without a nursery. */
+	if (getenv ("GEXMONO_WASM_JIT") && atoi (getenv ("GEXMONO_WASM_JIT")) > 0) {
+		static char *opts [] = { "--no-jiterpreter-traces-enabled", "--no-jiterpreter-interp-entry-enabled",
+			"--no-jiterpreter-jit-call-enabled" };
+		setenv ("MONO_WASM_JIT_AUTO", "1", 0);
+		setenv ("MONO_WASM_JIT_INLINE_ALLOC", "0", 0);
+		mono_jit_parse_options (3, opts);
+		int n = getenv ("GEXMONO_WASM_JIT_SLOTS") ? atoi (getenv ("GEXMONO_WASM_JIT_SLOTS")) : 65536;
+		int64_t base = gexwj_host_reserve (n, 0);
+		if (base > 0)
+			mono_jiterp_initialize_table (1 /* JITERPRETER_TABLE_JIT_CALL */, (int)base, (int)(base + n - 1));
+		else
+			fprintf (stderr, "[gexmono] no function-table slots for the wasm JIT\n");
+	} else
+		setenv ("MONO_WASM_JIT_AUTO", "0", 0);
 	gexmono_trace_on = getenv ("GEXMONO_TRACE") != NULL;
 	const char *dir = getenv ("GEXMONO_ASSEMBLIES");
 	static const char *keys [] = { "System.Globalization.Invariant", "APP_CONTEXT_BASE_DIRECTORY" };

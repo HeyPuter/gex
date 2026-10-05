@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 pub mod aot;
 pub mod aot_only;
 pub mod libprov;
+pub(crate) mod wasmjit;
 pub mod aot_share;
 pub mod gl;
 pub mod profile;
