@@ -2063,6 +2063,30 @@ impl Client {
         self.surfaces.get(&surface).map(|s| s.x11).unwrap_or(false)
     }
 
+    /// Where pointer input would go now, and the surfaces there are: for a
+    /// host explaining scripted input (`GEX_WL_INPUT`).
+    pub fn describe_input(&self) -> String {
+        let mut ids: Vec<_> = self.surfaces.keys().copied().collect();
+        ids.sort();
+        let list: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                let s = &self.surfaces[id];
+                format!("{id}:{:?}{}{}{}", s.role, if s.x11 { " x11" } else { "" },
+                    if s.committed_buffer.is_some() { " drawn" } else { "" },
+                    s.external.map(|(w, h)| format!(" ext {w}x{h}")).unwrap_or_default())
+            })
+            .collect();
+        format!(
+            "pointer {:?} on {:?}, target {:?}, focus {:?}; surfaces [{}]",
+            self.pointer.is_some(),
+            self.pointer_on,
+            self.pointer_target,
+            self.focus_surface,
+            list.join(", ")
+        )
+    }
+
     /// Move the pointer to a position on a particular surface, entering it (and
     /// leaving whatever it was on) if the surface changed.
     ///

@@ -340,6 +340,15 @@ set_assemblies_path (const char *unity_path)
 	g_string_free (s, TRUE);
 }
 
+/* Unity 6 maps DllImport names (mono_dllmap_insert), which .NET's Mono does not have: noted, and left
+ * to the find-plugin callback and dl fallback, which see the original name. */
+U(mono_dllmap_insert)
+{
+	ENTER;
+	fprintf (stderr, "[gexmono] dllmap %s%s%s -> %s%s%s (ignored)\n", P (1) ? (const char *)P (1) : "?", P (2) ? ":" : "",
+		P (2) ? (const char *)P (2) : "", P (3) ? (const char *)P (3) : "?", P (4) ? ":" : "", P (4) ? (const char *)P (4) : "");
+	RETV;
+}
 U(mono_set_dirs) { ENTER; set_assemblies_path (P (0)); RETV; }
 U(mono_set_assemblies_path) { ENTER; set_assemblies_path (P (0)); RETV; }
 U(mono_set_assemblies_path_null_separated)
@@ -413,7 +422,7 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_create) L(mono_profiler_enable_coverage) L(mono_profiler_set_coverage_filter_callback)
 	L(mono_profiler_get_coverage_data) L(mono_profiler_get_all_coverage_data) L(mono_profiler_reset_coverage)
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
-	L(mono_trace_set_log_handler) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
+	L(mono_trace_set_log_handler) L(mono_dllmap_insert) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
 	L(mono_class_get_field_from_name) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0

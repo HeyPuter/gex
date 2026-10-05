@@ -64,7 +64,7 @@ enum Ev {
 
 /// A script of input events at times (seconds) after the compositor's Nth
 /// frame (`frames N`, default 1: a game's first frame is often a splash long
-/// before its menu), delivered to the clients by [`Wayland::pump`] as they fall due:
+/// before its menu; 0: from the compositor's start), delivered to the clients by [`Wayland::pump`] as they fall due:
 /// what an automated game test needs to get past menus. One event per line,
 /// `#` comments:
 ///
@@ -144,7 +144,9 @@ impl Input {
             }
         }
         events.sort_by(|a, b| a.0.total_cmp(&b.0));
-        Ok(Input { events, next: 0, start: None, after, seen: 0 })
+        // `frames 0`: from the compositor's start.
+        let start = if after == 0 { Some(std::time::Instant::now()) } else { None };
+        Ok(Input { events, next: 0, start, after, seen: 0 })
     }
 }
 
@@ -348,6 +350,9 @@ impl Wayland {
                 if n < buf.len() {
                     break;
                 }
+            }
+            if !due.is_empty() {
+                eprintln!("[gex] input: {}", s.client.describe_input());
             }
             for &(ev, ms) in &due {
                 match ev {

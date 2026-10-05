@@ -1670,6 +1670,11 @@ fn run_thread_loop(
                     // GEX_TRACE_SEGV=1: where (with GEX_WASM_BACKTRACE=1, the wasm frames).
                     if std::env::var_os("GEX_TRACE_SEGV").is_some() {
                         eprintln!("gex: guest memory access out of bounds: {e:?}");
+                        // The context's PC is the last one stored: the faulting block's entry, or near it.
+                        if let Some(memory) = store.data().memory.clone() {
+                            let at = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+                            eprintln!("gex: thread {} context pc {at:#x}", store.data().thread.tid);
+                        }
                     }
                     if action.handler == 0 {
                         return Ok(Stopped::Exited(Exit::Signal {
