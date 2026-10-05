@@ -77,6 +77,8 @@
       cgenurl: `/project/${m.cgen}`,
       size: q.get('size') ?? m.size ?? fit,
       aot: '1',
+      // Compile the units while the bundle unpacks (eject-site's list).
+      preload: `/project/${m.cgen}/preload.json`,
     });
     if (m.cwd && m.cwd !== '/') p.set('cwd', m.cwd);
     if (m.unguarded) p.set('unguarded', '1');
