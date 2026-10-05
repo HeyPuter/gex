@@ -1324,6 +1324,15 @@ Steps:
     (§3.11.2) holds the setjmp runtime, dlopen registry, signal frames and
     vfork; sysroot `$W/sr-slim`, busybox `$W/bb-slim`; tests/wasm32 (new
     dlopen.c, vfork in fork.c), busybox.sh and run-browser.sh pass on it.
+    Wine tree rebuilt with it (`$W/wine-w32-slim`, same make -k failures as
+    wine-w32-fork) and staged as `$W/pfx-gui-slim`: nt 81/81 on it, on
+    pfx-gui and on x86; browser nt pfx-gui-slim 23/23; dll abi/shared ok.
+    Follow-up (browser shim): wait4 for a child in another Worker is not a
+    classified wait in the scheduler (it hands the stack back every turn),
+    so a long one prints "[gex] 1024 turns with nothing runnable" (fork.c's
+    vfork case; run-browser.sh now drops `[gex]` lines). Also pre-existing:
+    "pid 1 made a <syscall> after exiting" from a thread still parked in
+    pause() when its process exits.
     Next steps:
     1. gate of merge/wine-fork (coordinator).
     2. When it lands: fast-forward musl's gex-wasm32 to gex-wasm32-fork and
