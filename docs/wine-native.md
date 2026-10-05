@@ -668,6 +668,29 @@ Native Wine runs inside the guest thread, as Windows' DLLs do:
   copy (symbolic links) of the x86 prefix, without its layout pins. The
   other DLLs stay i386 code.
 
+### 3.16 Native Wine in the browser (W2, as built)
+
+- **Install** (`shims/browser/src/cgen/wasmdll.rs`): a skeleton is a
+  placed image's only provider (no byte check, no unit). Its publish
+  (`gex_wasmdll_publish`) reads Wine's PE module from the prefix through
+  the kernel's VFS at the first skeleton and publishes it as a stateful
+  provider (data top down from the NT allocator); later skeletons bind into
+  the same install (`FuncMap::bind`) and queue their bridges (`BINDS`), which
+  every Worker writes once (`#wasmdllCatchUp`, from every `#cgenCatchUp`).
+  The publishing Worker's install then writes ntdll's boot variables and
+  binds the entry thunks (`gex_wasmdll_installed`).
+- **Native system calls:** the module's `gex.syscall` import is JS's
+  (`#nativeSyscall`). The shim strips bit 61 and, for a native call, a
+  Resume writes the PC and returns (as natively). A trap the shim takes for
+  a unit to fetch or a thread to start resumes at the call's own stop
+  address: the wrapper serves it (catch-up, `#cgenServe`, `#drainThread`)
+  and returns into native code. Other traps (exit, thread exit, a
+  callback's return, a resume elsewhere) go on up.
+- Needs the units mode on (`--cgen-prefer` at least): the image-mapped hook
+  is only set then. Per-DLL modules (`.wasm`) are native only.
+- Not yet run: the page itself (Chrome), and threads that start inside
+  native code under load.
+
 ### 3.9 x64 programs (later)
 
 - **Memory:** needs wasm64, i.e. memory64 (stream U's work).
@@ -1010,6 +1033,12 @@ plus `make -k`.
 - **tests/nt with native ntdll, kernelbase, kernel32: 60/60** (38c4542b, fork
   a25afcc0bd4): x86/display needed entry thunks (§3.3), since builtin window
   classes' procedures are ntdll's `RtlRetrieveNtUserPfn` table.
+- **`--cgen` with native skeletons: 60/60** (`GEX_WINE_PREFIX=$W/pfx-native
+  tests/nt/cgen-prefix.sh`); skeletons get no unit (`nt_cgen::is_wasm_skeleton`).
+- **Browser (node) with native ntdll, kernelbase, kernel32: x86 23/23**
+  (`GEX_CGEN_CACHE=target/nt-test-cgen GEX_WINE_PREFIX=$W/pfx-native ARCHES=x86
+  tests/nt/run-browser.sh --cgen-prefer`; the cache supplies crt_mem/crt_math,
+  which a native run builds). See §3.16. Committed 7e02468b.
 - `$W/cycle.sh` rebuilds the three DLLs and restages `$W/pfx-native`;
   `$W/elemmap.py MODULE IDX...` names a table index's function.
 
@@ -1035,7 +1064,6 @@ plus `make -k`.
       callee's own page that its code then needed (msvc.exe).
     - `--cgen` with native skeletons is untested.
   - **Next:**
-    - `--cgen` with native skeletons; the browser;
     - the CRTs (msvcrt/ucrtbase: `DISPATCHER_CONTEXT`, `__ASM_VTABLE`);
     - win32u's system-call stubs (the same `wine/gex/syscall.h`);
     - varargs adapters;
