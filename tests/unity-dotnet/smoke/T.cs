@@ -33,6 +33,19 @@ public static class T {
   [DllImport("__Internal")] static extern double gex_mix(int a, double b, Vec3 v, long c, float f);
   [DllImport("__Internal")] static extern Vec3 gex_scale(Vec3 v, float k);
   [DllImport("__Internal")] static extern Big gex_big(long a, Big b, long c, long d, long e, long f, long g, long h);
+  // Guest code calling back into managed code through function pointers.
+  public delegate double Callback(int a, double b, Vec3 v);
+  static double OnCallback(int a, double b, Vec3 v) => a * 100 + b + v.x + v.y + v.z;
+  static Callback keep = OnCallback;
+  [UnmanagedCallersOnly] static int Unmanaged(int x, long y) => (int)(x * 3 + y);
+  [DllImport("__Internal")] static extern double gex_callback(IntPtr fn, int a, double b);
+  [DllImport("__Internal")] static extern unsafe int gex_unmanaged(delegate* unmanaged<int, long, int> fn, int x);
+  public static unsafe string Back() {
+    var p = Marshal.GetFunctionPointerForDelegate(keep);
+    var r = gex_callback(p, 7, 0.5);
+    var u = gex_unmanaged(&Unmanaged, 5);
+    return "callback " + r.ToString("F2") + "; unmanaged " + u;
+  }
   public static string Guest() {
     var s = "twice " + Twice(21) + "; concat " + Concat("guest ", "strings");
     var v = new Vec3 { x = 1, y = 2, z = 3 };

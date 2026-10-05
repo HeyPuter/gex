@@ -219,3 +219,58 @@ int gexp_is_guest_fn(uint64_t p)
 	}
 	return p - tbase >= tsize;
 }
+
+/* ---- reverse slots ---- */
+
+#define GEXP_REVERSE_FIRST 0x1000  /* shims/native libprov REVERSE_FIRST */
+#define GEXP_REVERSE_STRIDE 16
+#define GEXP_REVERSE_SLOTS ((0x10000 - GEXP_REVERSE_FIRST) / GEXP_REVERSE_STRIDE)
+
+static void *reverse_data[GEXP_REVERSE_SLOTS];
+static int reverse_next;
+
+uint64_t gexp_reverse_alloc(void *data)
+{
+	if (!code_page)
+		code_page = gexp_host_code_page();
+	int i = __atomic_fetch_add(&reverse_next, 1, __ATOMIC_SEQ_CST);
+	if (i >= GEXP_REVERSE_SLOTS)
+		return 0;
+	reverse_data[i] = data;
+	return code_page + GEXP_REVERSE_FIRST + (uint64_t)i * GEXP_REVERSE_STRIDE;
+}
+
+void *gexp_reverse_data(uint64_t addr)
+{
+	if (!code_page)
+		code_page = gexp_host_code_page();
+	uint64_t i = (addr - code_page - GEXP_REVERSE_FIRST) / GEXP_REVERSE_STRIDE;
+	return i < GEXP_REVERSE_SLOTS ? reverse_data[i] : 0;
+}
+
+void gexp_reverse_args(int ctx, gexp_call *c)
+{
+	static const unsigned char sysv[6] = { 7, 6, 2, 1, 8, 9 }, win[4] = { 1, 2, 8, 9 };
+	if (c->win64) {
+		for (int i = 0; i < 4; i++)
+			c->ireg[i] = GEXP_X(ctx, win[i]);
+		/* the fifth argument onwards: past the return address and the
+		 * 32-byte home area */
+		c->stack = (const uint64_t *)(uintptr_t)(GEXP_X(ctx, 4) + 8 + 32);
+	} else {
+		for (int i = 0; i < 6; i++)
+			c->ireg[i] = GEXP_X(ctx, sysv[i]);
+		c->stack = (const uint64_t *)(uintptr_t)(GEXP_X(ctx, 4) + 8);
+	}
+	for (int i = 0; i < 8; i++)
+		c->xmm[i] = *(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16 * i);
+}
+
+int gexp_reverse_return(int ctx, uint64_t ret, const gexp_call *c)
+{
+	GEXP_X(ctx, 0) = c->rax;
+	GEXP_X(ctx, 2) = c->rdx;
+	*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V) = c->xmm0;
+	*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16) = c->xmm1;
+	return gexp_return(ctx, ret);
+}

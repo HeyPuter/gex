@@ -136,6 +136,21 @@ int gexp_catching(void);
  * module's own (a table index in its slots). */
 int gexp_is_guest_fn(uint64_t p);
 
+/* ---- guest-callable addresses for the provider's own functions ----
+ * gexp_reverse_alloc(data) returns a guest address that guest code can call
+ * (a slot in the provider's code region, bound to its `gexp__reverse`
+ * body); gexp_reverse_data(addr) finds `data` again from inside that body
+ * (GEXP_X(ctx, GEXP_LAST_TARGET) on entry is the address). 0 when full. */
+uint64_t gexp_reverse_alloc(void *data);
+void *gexp_reverse_data(uint64_t addr);
+
+/* The arguments guest code passed to a reverse slot, gathered from its
+ * registers and stack by the guest ABI, into a gexp_call (stack = the first
+ * stack argument, in guest memory); results go back from its rax/rdx/xmm0/
+ * xmm1 by gexp_reverse_return. */
+void gexp_reverse_args(int ctx, gexp_call *c);
+int gexp_reverse_return(int ctx, uint64_t ret, const gexp_call *c);
+
 /* Host imports (shims/native libprov). */
 __attribute__((import_module("gex"), import_name("provider_missing"))) void gexp_host_missing(uint64_t addr);
 __attribute__((import_module("gex"), import_name("provider_log"))) void gexp_host_log(const void *p, uint64_t n);

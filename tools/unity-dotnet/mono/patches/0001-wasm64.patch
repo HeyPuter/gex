@@ -316,7 +316,7 @@ index 1687088b1..58267dce9 100644
  	}
  	for (int i = 0; i < sig->param_count; ++i) {
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
-index 31c606007..d0aa3491b 100644
+index 31c606007..14d5bdb52 100644
 --- a/src/mono/mono/mini/interp/interp.c
 +++ b/src/mono/mono/mini/interp/interp.c
 @@ -5148,6 +5148,285 @@ typedef struct {
@@ -649,6 +649,165 @@ index 31c606007..d0aa3491b 100644
  	switch (op) {
  	case MINT_ICALLSIG_V_V: {
  		typedef void (*T)(void);
+@@ -10384,6 +10693,158 @@ interp_entry_general (gpointer this_arg, gpointer res, gpointer *args, gpointer
+ 	interp_entry (&data);
+ }
+ 
++#ifdef HOST_GEX
++/*
++ * gex: guest code calling a managed function through a function pointer
++ * (a delegate's, an [UnmanagedCallersOnly] method's): the provider's reverse
++ * adapter hands over the guest's argument registers and stack, by the guest's
++ * ABI; the native-to-managed wrapper `imethod` (of native signature `sig`)
++ * runs on the interpreter, and its result goes back in rax/rdx/xmm0/xmm1.
++ */
++typedef struct {
++	int ni, nx, nstack;
++	GexGuestCall *c;
++} GexArgsIn;
++
++static guint64
++gex_take_int (GexArgsIn *a)
++{
++	if (a->c->win64) {
++		int pos = a->ni + a->nx;
++		a->ni++;
++		return pos < 4 ? a->c->ireg [pos] : a->c->stack [a->nstack++];
++	}
++	return a->ni < 6 ? a->c->ireg [a->ni++] : a->c->stack [a->nstack++];
++}
++
++static guint64
++gex_take_sse (GexArgsIn *a)
++{
++	if (a->c->win64) {
++		int pos = a->ni + a->nx;
++		a->nx++;
++		return pos < 4 ? a->c->xmm [pos] : a->c->stack [a->nstack++];
++	}
++	return a->nx < 8 ? a->c->xmm [a->nx++] : a->c->stack [a->nstack++];
++}
++
++/* The native signature of the native-to-managed wrapper an InterpMethod runs. */
++MonoMethodSignature *
++gex_interp_method_signature (gpointer imethod)
++{
++	return mono_method_signature_internal (((InterpMethod *)imethod)->method);
++}
++
++void
++gex_interp_native_to_managed (MonoMethodSignature *sig, gpointer imethod, GexGuestCall *c)
++{
++	GexArgsIn a = { 0, 0, 0, c };
++	int n = sig->param_count;
++	guint64 *vals = g_newa (guint64, n * 4 + 1);
++	gpointer *args = g_newa (gpointer, n + 1);
++	MonoType *ret = mini_get_underlying_type (sig->ret);
++	int ret_struct = !m_type_is_byref (sig->ret) && MONO_TYPE_ISSTRUCT (ret);
++	int ret_size = ret_struct ? gex_struct_size (ret, sig) : 0;
++	int ret_cls [2] = { GEX_NONE, GEX_NONE };
++	gpointer ret_mem = NULL;
++	if (ret_struct) {
++		int mem = c->win64 ? !(ret_size == 1 || ret_size == 2 || ret_size == 4 || ret_size == 8) : ret_size > 16;
++		if (mem)
++			ret_mem = (gpointer)(gsize)gex_take_int (&a);
++		else if (!c->win64)
++			gex_classify (mono_class_from_mono_type_internal (ret), 0, ret_cls);
++	}
++	g_assert (!sig->hasthis);
++	for (int i = 0; i < n; i++) {
++		guint64 *v = vals + 4 * i;
++		MonoType *t = sig->params [i];
++		args [i] = v;
++		if (m_type_is_byref (t)) {
++			v [0] = gex_take_int (&a);
++			continue;
++		}
++		t = mini_get_underlying_type (t);
++		if (t->type == MONO_TYPE_R4 || t->type == MONO_TYPE_R8) {
++			v [0] = gex_take_sse (&a);
++			continue;
++		}
++		if (MONO_TYPE_ISSTRUCT (t)) {
++			int size = gex_struct_size (t, sig);
++			if (c->win64) {
++				if (size == 1 || size == 2 || size == 4 || size == 8) {
++					v [0] = gex_take_int (&a);
++				} else {
++					args [i] = (gpointer)(gsize)gex_take_int (&a); /* by reference */
++				}
++				continue;
++			}
++			int n8 = (size + 7) / 8;
++			int cls [2] = { GEX_NONE, GEX_NONE };
++			if (size <= 16)
++				gex_classify (mono_class_from_mono_type_internal (t), 0, cls);
++			int nint = 0, nsse = 0;
++			for (int k = 0; k < n8 && size <= 16; k++)
++				cls [k] == GEX_SSE ? nsse++ : nint++;
++			if (size > 16 || a.ni + nint > 6 || a.nx + nsse > 8) {
++				args [i] = (gpointer)(c->stack + a.nstack); /* in memory, on the guest stack */
++				a.nstack += n8;
++				continue;
++			}
++			for (int k = 0; k < n8; k++)
++				v [k] = cls [k] == GEX_SSE ? gex_take_sse (&a) : gex_take_int (&a);
++			continue;
++		}
++		v [0] = gex_take_int (&a);
++	}
++	guint64 res [64];
++	memset (res, 0, 16);
++	gpointer resp = ret_mem ? ret_mem : (gpointer)res;
++	g_assert (ret_mem || ret_size <= (int)sizeof (res));
++	interp_entry_general (NULL, resp, args, imethod);
++	c->rax = c->rdx = c->xmm0 = c->xmm1 = 0;
++	if (MONO_TYPE_IS_VOID (sig->ret))
++		return;
++	if (ret_mem) {
++		c->rax = (guint64)(gsize)ret_mem;
++		return;
++	}
++	if (ret_struct) {
++		guint64 parts [2] = { 0, 0 };
++		memcpy (parts, res, ret_size);
++		if (c->win64) {
++			c->rax = parts [0];
++			return;
++		}
++		int ii = 0, ss = 0;
++		for (int k = 0; k < (ret_size + 7) / 8; k++) {
++			if (ret_cls [k] == GEX_SSE)
++				*(ss++ ? &c->xmm1 : &c->xmm0) = parts [k];
++			else
++				*(ii++ ? &c->rdx : &c->rax) = parts [k];
++		}
++		return;
++	}
++	if (ret->type == MONO_TYPE_R4) {
++		c->xmm0 = res [0] & 0xffffffffu;
++		return;
++	}
++	if (ret->type == MONO_TYPE_R8) {
++		c->xmm0 = res [0];
++		return;
++	}
++	/* res holds the value at its own size; widen as the guest's ABI allows */
++	switch (ret->type) {
++	case MONO_TYPE_I1: c->rax = (guint64)(gint64)*(gint8 *)res; break;
++	case MONO_TYPE_U1: case MONO_TYPE_BOOLEAN: c->rax = *(guint8 *)res; break;
++	case MONO_TYPE_I2: c->rax = (guint64)(gint64)*(gint16 *)res; break;
++	case MONO_TYPE_U2: case MONO_TYPE_CHAR: c->rax = *(guint16 *)res; break;
++	case MONO_TYPE_I4: c->rax = (guint64)(gint64)*(gint32 *)res; break;
++	case MONO_TYPE_U4: c->rax = *(guint32 *)res; break;
++	default: c->rax = res [0]; break;
++	}
++}
++#endif /* HOST_GEX */
++
+ #ifdef MONO_ARCH_HAVE_INTERP_ENTRY_TRAMPOLINE
+ 
+ // Do not inline in case order of frame addresses matters.
 diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
 index 3dea312b7..222536c07 100644
 --- a/src/mono/mono/mini/interp/jiterpreter.c

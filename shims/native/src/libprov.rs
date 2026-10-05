@@ -138,15 +138,22 @@ fn alloc_linux(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
         .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
-/// A page for a guest code address a provider binds (a thread entry): low,
-/// where code lives in a 64-bit guest memory (docs/mem64.md), and read-only.
+/// A provider's code region: its thread entry at 0, the return addresses
+/// its guest calls push in [0x100, 0x1000), reverse slots from
+/// `REVERSE_FIRST`, one per `REVERSE_STRIDE` bytes.
+const CODE_PAGE: u64 = 0x10000;
+const REVERSE_FIRST: u64 = 0x1000;
+const REVERSE_STRIDE: u64 = 16;
+
+/// The guest addresses a provider binds (its code region): low, where code
+/// lives in a 64-bit guest memory (docs/mem64.md), and read-only.
 fn alloc_code(state: &mut HostState, name: &str) -> Result<u64> {
     if state.nt.is_some() {
-        return alloc(state, 0x1000, name);
+        return alloc(state, CODE_PAGE, name);
     }
     use gex_kernel::mem::prot;
     state
-        .with_kernel(|k| k.mem.mmap_low(0, 0x1000, prot::READ, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
+        .with_kernel(|k| k.mem.mmap_low(0, CODE_PAGE, prot::READ, gex_kernel::mem::flags::PRIVATE | gex_kernel::mem::flags::ANONYMOUS, name))
         .map_err(|e| anyhow!("mapping {name}: errno {}", e.0))
 }
 
@@ -206,9 +213,18 @@ pub(crate) fn install(
     // that made the call.
     if let Some(k) = slots.iter().position(|s| s.as_deref() == Some("__gex_thread_start")) {
         // Below 4 GiB, like all code: the call cache keys on 32-bit targets.
-        let at = alloc_code(state, &format!("[provider {} thread entry]", p.name))?;
+        let at = alloc_code(state, &format!("[provider {} code]", p.name))?;
         pairs.push((at, k as u32));
         THREAD_ENTRY.store(at, std::sync::atomic::Ordering::Release);
+        // Its reverse slots (`gexp__reverse`): guest-callable addresses for
+        // function pointers the provider hands out (a managed delegate's),
+        // every one served by that body, which tells them apart by the
+        // address it was entered at.
+        if let Some(r) = slots.iter().position(|s| s.as_deref() == Some("gexp__reverse")) {
+            for a in (at + REVERSE_FIRST..at + CODE_PAGE).step_by(REVERSE_STRIDE as usize) {
+                pairs.push((a, r as u32));
+            }
+        }
     }
     // An address several names share is served by whichever is provided.
     pairs.sort_by_key(|&(a, k)| (a, k == missing));

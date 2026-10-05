@@ -140,6 +140,47 @@ gexp_hook_from_guest (void)
  * ours to call (the runtime's headers make the warning an error). */
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
+/* ---- managed functions guest code calls through a pointer ----
+ * A delegate's function pointer (Marshal.GetFunctionPointerForDelegate) or an
+ * [UnmanagedCallersOnly] method's: the interpreter asks for a native entry to
+ * its native-to-managed wrapper, and gets a reverse slot of the provider's
+ * code region; guest code calling it enters gexp__reverse, which runs the
+ * wrapper by the guest's ABI (interp.c gex_interp_native_to_managed). */
+
+typedef struct { void *addr; void *arg; } GexFtnDesc; /* MonoFtnDesc's head */
+typedef struct { MonoMethodSignature *sig; void *imethod; } GexReverse;
+MonoMethodSignature *gex_interp_method_signature (void *imethod);
+void gex_interp_native_to_managed (MonoMethodSignature *sig, void *imethod, gexp_call *c);
+extern int gex_guest_abi_win64;
+typedef void *(*MonoWasmGetNativeToInterpTramp) (MonoMethod *method, void *extra_arg);
+void mono_wasm_install_get_native_to_interp_tramp (MonoWasmGetNativeToInterpTramp cb);
+
+static void *
+native_to_interp (MonoMethod *method, void *extra_arg)
+{
+	GexFtnDesc *ftn = extra_arg;
+	if (ftn->arg == (void *)(intptr_t)-1)
+		return NULL; /* an AOT body: not on this build */
+	GexReverse *r = malloc (sizeof *r);
+	r->imethod = ftn->arg;
+	r->sig = gex_interp_method_signature (ftn->arg);
+	return (void *)(uintptr_t)gexp_reverse_alloc (r);
+}
+
+GEXP_SYSV(gexp__reverse)
+{
+	uint64_t self = GEXP_X (ctx, GEXP_LAST_TARGET);
+	gexp_enter (ctx);
+	GexReverse *r = gexp_reverse_data (self);
+	if (!r)
+		__builtin_trap ();
+	gexp_call c = { 0 };
+	c.win64 = gex_guest_abi_win64;
+	gexp_reverse_args (ctx, &c);
+	gex_interp_native_to_managed (r->sig, r->imethod, &c);
+	return gexp_reverse_return (ctx, ret, &c);
+}
+
 /* ---- raising a managed exception from guest code ---- */
 
 GEXP_SYSV(gexp_mono_raise_exception)
@@ -171,6 +212,7 @@ preinit (void)
 		mono_set_assemblies_path (dir);
 	mono_wasm_install_interp_to_native_callback (gex_mono_interp_to_native);
 	mono_dl_fallback_register (dl_load, dl_symbol, NULL, NULL);
+	mono_wasm_install_get_native_to_interp_tramp (native_to_interp);
 	mono_jit_set_aot_mode (MONO_AOT_MODE_INTERP_ONLY);
 	mono_icall_table_init ();
 	mono_ee_interp_init ("-jiterp");
@@ -217,4 +259,4 @@ mono_llvm_cpp_catch_exception (MonoLLVMInvokeCallback cb, void *arg, int *out_th
 GEXP_DEFINE_MISSING
 GEXP_DEFINE_THREAD_ENTRY
 extern gexp_body_t const gexmono_generated_adapters [];
-GEXP_TABLE(gexp_mono_jit_init, gexp_mono_jit_init_version, gexp_mono_raise_exception);
+GEXP_TABLE(gexp_mono_jit_init, gexp_mono_jit_init_version, gexp_mono_raise_exception, gexp__reverse);

@@ -88,6 +88,15 @@ __attribute__((visibility("default"))) Vec3 gex_scale (Vec3 v, float k)
 {
 	return (Vec3){ v.x * k, v.y * k, v.z * k };
 }
+typedef double (*Callback) (int, double, Vec3);
+__attribute__((visibility("default"))) double gex_callback (Callback fn, int a, double b)
+{
+	return fn (a, b, (Vec3){ 1, 2, 3 }) + fn (1, 0, (Vec3){ 0, 0, 0 });
+}
+__attribute__((visibility("default"))) int gex_unmanaged (int (*fn) (int, long), int x)
+{
+	return fn (x, 1000);
+}
 __attribute__((visibility("default"))) Big gex_big (long a, Big b, long c, long d, long e, long f, long g, long h)
 {
 	return (Big){ b.a + a, b.b + c + d, b.c + e + f + g + h, b.d * 2 };
@@ -140,6 +149,10 @@ main (int argc, char **argv)
 	P gr = mono_runtime_invoke (guest, NULL, NULL, &exc);
 	check ("Guest", exc);
 	printf ("Guest = %s\n", mono_string_to_utf8 (gr));
+	P back = mono_class_get_method_from_name (k, "Back", 0);
+	P br = mono_runtime_invoke (back, NULL, NULL, &exc);
+	check ("Back", exc);
+	printf ("Back = %s\n", mono_string_to_utf8 (br));
 	/* Objects held only in this frame (guest stack and registers) across
 	 * collections: the provider's GC scans the guest's frames. */
 	P make = mono_class_get_method_from_name (k, "Make", 1);
