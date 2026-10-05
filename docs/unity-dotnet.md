@@ -525,6 +525,11 @@ Not yet:
   - so the attribute object or a field lookup came back NULL, followed by
     an assertion on a NULL class.
 - **On gooner (2026-10-04, in progress):**
+  - Coordgate (BROWSER_NT=1, JOBS=6) on d69c1cd6, which is everything up
+    to the move: green. Workspace a64 452 and x86 441 pass; tests/nt 73/73
+    with `--no-cgen` and with cgen prefix units; x86-programs 69/69; glibc
+    passes; lockstep agrees; browser NT 49/0. Output is in
+    `scratch/unity/gate/`.
   - Paths: project `~/gex-sandbox`; build output (`OUT`) is
     `~/gex-sandbox/scratch/unity/dnc` (re-cloned; `dnc/src` is the fork at
     6812ea26 with `patches/` applied); musl from `wt/musl-wasm64`.
