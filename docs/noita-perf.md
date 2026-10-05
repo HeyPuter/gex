@@ -1433,9 +1433,10 @@ Paths: project ~/gex-sandbox, scratch ~/gex-sandbox/scratch/fjit (old
 `scratchpad/fjit`). No timing on gooner: every page number comes from edger
 through scratch/bench/bench.sh, paired with pewasm on the same box.
 
-- merge/fjit = master 5ab54ab2 (merged: E's eject9 with b2bb3c95, the
-  msvcp120_thrd provider and direct GL present) + the GL fast path
-  (f7704244) + the ZFCALLS knob (a26ef810). Assignment (coordinator,
+- merge/fjit = master 4aed5829 (E's eject9 with b2bb3c95, msvcp120_thrd,
+  direct GL present, the compositor frame skip 40013fbe) + the GL fast
+  path (f7704244) + park sampling (760796a1) + ZF at stack checks
+  (8590e5a8). Assignment (coordinator,
   2026-10-05): the main thread -- GL without the NT syscall, guest_yield,
   NT-call overheads -- and pricing ZF at calls (W's _chkesp).
 - gexc `wt/fjit/target/x86/release/gexc`; shim, kernel, seed in
@@ -1443,8 +1444,9 @@ through scratch/bench/bench.sh, paired with pewasm on the same box.
   from worldmachine's wt/fjit (the one bm used); web/node_modules by `npm ci`.
 - Caches (nice 19, up to 12 jobs, cg14's icall hints; `GEX_CGEN_EXP` is not
   in the unit key, so arms are caches with the same keys):
-  `scratch/fjit/build-bm.sh wt/fjit/target/bm-f` (merge/fjit a26ef810;
-  on gooner and edger once synced). A pricing arm:
+  `scratch/fjit/build-bm.sh wt/fjit/target/bm-g` (merge/fjit 6f5a538f =
+  master 4aed5829 + the GL fast path + the stack-check ZF; on gooner,
+  then synced to edger). A pricing arm:
   `GEX_CGEN_EXP=... GEX_CGEN_MUTATE=... scratch/fjit/variant.sh wt/fjit/target/bm-d wt/fjit/target/NEW <Noita's images>`
   (units hard-linked, the named images rebuilt, the prefix and Wine DLL
   units shared; then link bm-d's prefix unit dirs into NEW, as done for i3c).
@@ -1560,3 +1562,24 @@ fast path the main thread is (ms per world frame) park 8.9, guest 12.9,
 shim work 2.5, JS 3.0 (gl-bridge collect 1.3, mono_ns 0.9 -- of it 0.45
 the park's own timing, now sampled 1 in 16), providers 0.9. Workers 3/4
 are busy 43% (0x724580 family), idle in cond_wait the rest.
+
+**gl2 on edger (with E's compositor frame skip 40013fbe; arms off = fast
+path off, on, zf = on with `GEX_CGEN_EXP=ZFCALLS` in Noita's images):**
+
+| leg | world fps |
+|---|---|
+| pewasm p1 | 45.7 |
+| off1 | 42.9 |
+| on1 | 44.9 |
+| zf1 | 45.2 |
+| pewasm p2 | 44.9 |
+| zf2 | 43.3 |
+| on2 | 46.1 |
+| off2 | 44.0 |
+| pewasm p3 | 45.5 |
+
+pewasm 45.4; off 43.45 (0.96×), **on 45.5 (1.00×: the normal gexc page
+level with pewasm on edger)**, zf 44.25. The fast path is +4.7%. ZF at
+every unsummarised call costs 2.7% (and 2.5% of noita.exe's wasm), so the
+default writes ZF back only at MSVC's stack checks (`cmp esi, esp` right
+before the call, 8590e5a8; tests/nt zfcall); ZFCALLS stays for pricing.
