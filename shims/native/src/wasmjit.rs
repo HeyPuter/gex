@@ -103,7 +103,8 @@ fn instantiate(
         match map.get(&key) {
             Some(m) => m.clone(),
             None => {
-                let m = match Module::new(&engine, &wasm) {
+                // Through gex_cache, so gex-rt (which links no compiler) can load it.
+                let m = match gex_cache::compile(&engine, &wasm) {
                     Ok(m) => m,
                     Err(e) => {
                         // `GEX_DUMP_BAD_WASM=DIR`: keep a module the engine refused, as for gex's own.
@@ -320,7 +321,7 @@ pub(crate) fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             (Arc::clone(&jit.shared), jit.engine.clone())
         };
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-        let module = Module::new(&engine, placeholder_module(n as u32))?;
+        let module = gex_cache::compile(&engine, &placeholder_module(n as u32))?;
         let install = crate::ftab::publish_pairs(&shared, &memory, module, n as u32, &[], gex_kernel::ftab::Tier::Unit)?;
         let base = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.install(install).base;
         crate::ftab::catch_up(&mut caller)?;

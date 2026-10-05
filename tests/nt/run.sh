@@ -153,6 +153,14 @@ check pe-x64/uses 0 "229 [0-9A-F]{16} 11" "$fx/x64/uses.exe"
 check pe-x64/threads 0 "" "$fx/x64/threads.exe"
 check pe-x86/hello32 0 "Hello from x86 PE32!" "$fx/x86/hello32.exe"
 check pe-x86/msvc 9 "msvc" "$fx/x86/msvc.exe"
+# MSVC's i386 C++ exceptions and SEH through msvcrt (tests/nt/msvc/build.sh).
+check x86/msvc_cxxeh 0 "$allok" "$here/bin/x86/msvc_cxxeh.exe"
+# msvcrt's register-convention math (_CI*, _ftol, __libm_sse2_*) and _chkesp.
+check x86/msvc_x87 0 "$allok" "$here/bin/x86/msvc_x87.exe"
+# A C++ exception from msvcp140 caught by type, its what() through msvcp140's vtable.
+check x86/msvc_msvcp 0 "$allok" "$here/bin/x86/msvc_msvcp.exe"
+# ntdll's i386 compiler helpers (_alldiv, _allshl, _alldvrm...) and RtlUlongByteSwap.
+check x86/msvc_largeint 0 "$allok" "$here/bin/x86/msvc_largeint.exe"
 # (x86/uses.exe is left out: it crashes at exit on native Wine 11.15 too.)
 
 echo "$pass passed, $fail failed, $xfail expected failures"

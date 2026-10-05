@@ -7,7 +7,9 @@
 //! The session's `nt` section says how the NT layer was set up; the rootfs
 //! holds the images and the files the NT layer opened, at their guest paths.
 
-use crate::build::{copy_tree, verify_rootfs, BuildManifest, BuiltImage, BUILD_FILE};
+#[cfg(feature = "build")]
+use crate::build::{copy_tree, verify_rootfs};
+use crate::manifest::{BuildManifest, BuiltImage, BUILD_FILE};
 use crate::config::Config;
 use crate::project::{rootfs_rel, Project};
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,6 +18,59 @@ use gex_native::nt_cgen;
 use gex_native::{Exit, RunOptions};
 use gex_xlate::profile::{NtSession, Session};
 use std::path::{Path, PathBuf};
+
+#[cfg(feature = "build")]
+/// What a provider includes (gex-cgen's), for `gen/provider.h`.
+pub const PROVIDER_H: &str = include_str!("../../gex-cgen/providers/provider.h");
+
+#[cfg(feature = "build")]
+/// Whether the PE file at `path` is LuaJIT's lua51.dll (it exports
+/// `luaJIT_setmode`): its trace compiler writes x86 at run time, which an
+/// ejected project cannot run, so it gets the Lua provider.
+pub fn is_luajit(path: &Path) -> Result<bool> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    Ok(pe.exports.entries.iter().any(|e| e.names.iter().any(|n| n == "luaJIT_setmode")))
+}
+
+/// Where a configured provider's module goes.
+fn provider_wasm(dir: &Path, p: &crate::config::Provider) -> PathBuf {
+    dir.join("build/providers").join(p.library.to_ascii_lowercase().replace(".dll", ".wasm"))
+}
+
+#[cfg(feature = "build")]
+/// The imports a stateful provider may have.
+fn check_provider_imports(wasm: &[u8], what: &str) -> Result<()> {
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::ImportSection(r) = payload? {
+            for i in r {
+                let i = i?;
+                let ok = match i.module {
+                    "env" => matches!(i.name, "memory" | "__indirect_function_table" | "__stack_pointer" | "__memory_base" | "__table_base"),
+                    "gex" => i.name.starts_with("provider_"),
+                    _ => false,
+                };
+                if !ok {
+                    bail!("{what} imports {}.{}, which a provider cannot have (give it a definition)", i.module, i.name);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The project's stateful providers, as the runtime takes them.
+fn lib_providers(dir: &Path, config: &Config) -> Vec<gex_native::libprov::LibProvider> {
+    config
+        .providers
+        .iter()
+        .map(|p| gex_native::libprov::LibProvider {
+            name: p.library.clone(),
+            dlls: vec![p.library.to_ascii_lowercase()],
+            wasm: provider_wasm(dir, p),
+        })
+        .collect()
+}
 
 /// The recorded session of a project, when it was a Windows program's.
 pub fn nt_session(dir: &Path) -> Result<Option<NtSession>> {
@@ -53,12 +108,218 @@ fn images(nt: &NtSession) -> Vec<&gex_xlate::profile::NtImage> {
 pub struct PeReport {
     pub units: Vec<(String, u64, usize, u64, &'static str)>,
     pub providers: Vec<String>,
-    /// Addresses the session ran on tier-1 that no unit has an entry for,
-    /// by image: (image, count, first few).
+    /// Region entries built, by image.
+    pub regions: Vec<(String, usize)>,
+    /// Entries the session reached by a call that no unit has even after
+    /// recovery was seeded with them, by image: (image, count, first few).
     pub uncovered: Vec<(String, usize, Vec<u64>)>,
     pub rootfs_files: usize,
+    /// The web build's units (browser flavour), by image: (image, how), and
+    /// region entries made for it; empty without a browser runtime.
+    pub web_units: Vec<(String, &'static str)>,
+    /// Functions units were built without (left to tier-1: clang wanted a
+    /// shadow stack), by image.
+    pub left: Vec<(String, Vec<u64>)>,
+    /// Link groups built: (members, IAT call sites made direct, bytes).
+    pub groups: Vec<(String, usize, u64)>,
+    pub web_regions: usize,
 }
 
+/// Where a Windows program's browser runtime is vendored (`gexc eject
+/// --web-shim`): the x86 shared-memory shim, its kernel and seed, and the
+/// host JavaScript (`js/`).
+pub const WEB_NT_DIR: &str = "runtime/web/nt";
+/// The files of [`WEB_NT_DIR`] besides `js/`.
+pub const WEB_NT_WASM: [&str; 3] = ["gex_browser.x86.shared.wasm", "gex_kernel.x86.wasm", "seed.x86.shared.wasm"];
+/// The host JavaScript a Windows program's web run needs (shims/browser/js).
+pub const WEB_NT_JS: [(&str, &str); 7] = [
+    ("run-node.mjs", include_str!("../../../shims/browser/js/run-node.mjs")),
+    ("host.mjs", include_str!("../../../shims/browser/js/host.mjs")),
+    ("worker.mjs", include_str!("../../../shims/browser/js/worker.mjs")),
+    ("gex.mjs", include_str!("../../../shims/browser/js/gex.mjs")),
+    ("gl-bridge.mjs", include_str!("../../../shims/browser/js/gl-bridge.mjs")),
+    ("wl-bridge.mjs", include_str!("../../../shims/browser/js/wl-bridge.mjs")),
+    ("net-node.mjs", include_str!("../../../shims/browser/js/net-node.mjs")),
+];
+/// `run.mjs` of a Windows program's project: the web build under Node, on
+/// the browser runtime a page loads (run-node.mjs), AOT-only.
+pub const WEB_NT_RUN_MJS: &str = r#"#!/usr/bin/env node
+// Generated by `gexc eject`: run this Windows program's web build under Node,
+// on the browser runtime a page loads (runtime/web/nt), with no run-time
+// translation: the units in build/web/cgen are all the code there is.
+//
+//   ./run.mjs                  the recorded arguments
+//   ./run.mjs ARGS...          these instead
+//   ./run.mjs --jit-fallback [-- ARGS...]   translate what the build never saw
+//   ./run.mjs --record-entries [-- ARGS...] a training run: with the fallback,
+//        writing where the browser entered code the units have no entry for
+//        to user/web-entries.txt, which ./build.sh makes region entries of
+//
+// GEX_NT_* variables set now are passed to the NT layer (GEX_NT_STATS, ...).
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const web = join(here, 'runtime/web/nt');
+const runFile = join(here, 'build/web/nt.json');
+if (!existsSync(join(web, 'gex_browser.x86.shared.wasm'))) {
+  console.error('gex-eject: no browser runtime in runtime/web/nt (eject with --web-shim web/public/gex)');
+  process.exit(2);
+}
+if (!existsSync(runFile)) {
+  console.error('gex-eject: no web build (run ./build.sh)');
+  process.exit(2);
+}
+const m = JSON.parse(readFileSync(runFile, 'utf8'));
+let av = process.argv.slice(2);
+let jit = false;
+let record = false;
+if (av[0] === '--jit-fallback') { jit = true; av = av.slice(1); }
+if (av[0] === '--record-entries') { jit = record = true; av = av.slice(1); }
+if (av[0] === '--') av = av.slice(1);
+const args = av.length ? av : m.args;
+const rootfs = join(here, 'build/rootfs');
+const env = [`GEX_WINE_PREFIX=${m.prefix}`, ...m.settings, ...m.env];
+for (const [k, v] of Object.entries(process.env)) if (k.startsWith('GEX_NT_')) env.push(`${k}=${v}`);
+if (record) {
+  env.push('GEX_NT_ENTRY_LOG=1');
+  const file = join(here, 'user/web-entries.txt');
+  const seen = new Set(existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
+  const before = seen.size;
+  // The Workers' output reaches this process's stderr (Node pipes it
+  // there): taken out line by line.
+  const write = process.stderr.write.bind(process.stderr);
+  let partial = '';
+  process.stderr.write = (chunk, ...rest) => {
+    const lines = (partial + (typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())).split('\n');
+    partial = lines.pop();
+    const keep = [];
+    for (const l of lines) {
+      const m = l.match(/gex-nt: web entry (0x[0-9a-f]+)/);
+      if (m) seen.add(m[1]);
+      else keep.push(l + '\n');
+    }
+    return keep.length ? write(keep.join(''), ...rest) : true;
+  };
+  process.on('exit', () => {
+    writeFileSync(file, [...seen].sort().join('\n') + '\n');
+    write(`gex-eject: ${seen.size - before} new web entries (${seen.size} in all) in user/web-entries.txt; run ./build.sh\n`);
+  });
+}
+process.env.GEX_ARCH = 'x86';
+process.env.GEX_SHARED = '1';
+process.env.GEX_WEB_DIR = web;
+process.env.GEX_CGEN_CACHE = join(here, m.cgen ?? 'build/web/cgen');
+if (m.unguarded) process.env.GEX_CGEN_UNGUARDED = '1';
+process.argv = [
+  process.argv[0], join(web, 'js/run-node.mjs'),
+  '--cgen', ...(jit ? (record ? ['--aot'] : []) : ['--no-jit']),
+  '--dir', `/=${rootfs}`, '--argv0', m.exe, '--cwd', m.cwd,
+  ...env.flatMap((e) => ['--env', e]),
+  join(web, 'seed.x86.shared.wasm'), join(rootfs, m.exe), ...args,
+];
+await import(pathToFileURL(join(web, 'js/run-node.mjs')));
+"#;
+
+/// Where a Windows program's page is vendored (`gexc eject --web-page`).
+pub const WEB_NT_PAGE: &str = "runtime/web/page";
+
+/// `index.html` of a Windows program's project: opens the vendored page
+/// (nt.html) on this project's web build. Serve with serve.mjs.
+pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>gex-eject</title>
+<pre id="out">loading build/web/nt.json ...</pre>
+<script type="module">
+  // Generated by `gexc eject`: this Windows program's web build in the page
+  // (runtime/web/page/nt.html), with no run-time translation.
+  //   ?jit          the JIT fallback (translate what the build never saw)
+  //   ?record       a training run: the fallback, and each pc the browser
+  //                 entered unit code at without an entry printed to the
+  //                 console ("gex-nt: web entry"); keep them in
+  //                 user/web-entries.txt and run ./build.sh
+  //   ?args=a b     arguments instead of the recorded ones
+  //   ?env=K=V,...  more environment (GEX_NT_STATS=1, ...)
+  //   ?size=WxH     the compositor's size
+  //   ?mesaenv=K=V  environment for Mesa (GEX_WGPU_TIMING=1, ...)
+  //   ?persist=0    start from the build's files: no saves restored or kept
+  //                 (the user profiles otherwise live on in IndexedDB)
+  const q = new URLSearchParams(location.search);
+  const out = document.getElementById('out');
+  try {
+    const r = await fetch('/project/build/web/nt.json');
+    if (!r.ok) throw new Error('no build/web/nt.json: run ./build.sh');
+    const m = await r.json();
+    const env = [`GEX_WINE_PREFIX=${m.prefix}`, ...m.settings, ...m.env, ...(q.get('env') ? [q.get('env')] : [])];
+    if (q.has('record')) env.push('GEX_NT_ENTRY_LOG=1');
+    const p = new URLSearchParams({
+      tar: '/project/build/web/rootfs.tar',
+      exe: m.exe,
+      env: env.join(','),
+      cgen: '2',
+      cgenurl: `/project/${m.cgen ?? 'build/web/cgen'}`,
+      size: q.get('size') ?? '1320x800',
+    });
+    if (m.cwd && m.cwd !== '/') p.set('cwd', m.cwd);
+    if (m.unguarded) p.set('unguarded', '1');
+    if (m.persist && q.get('persist') !== '0') {
+      p.set('persist', m.persist);
+      p.set('persistdb', `gex-eject:${m.exe}`);
+    }
+    if (q.has('mesaenv')) p.set('mesaenv', q.get('mesaenv'));
+    const argv = q.has('args') ? q.get('args').split(' ').filter((a) => a) : m.args;
+    if (argv.length) p.set('argv', JSON.stringify(argv));
+    if (!q.has('jit') && !q.has('record')) p.set('aot', '1');
+    if (q.has('record')) p.set('aot', 'record');
+    if (m.gl) { p.set('gl', '1'); p.set('glbackend', 'wgpu'); }
+    location.replace(`/nt.html?${p}`);
+  } catch (e) {
+    out.textContent = e.message;
+  }
+</script>
+"#;
+
+/// `serve.mjs` of a Windows program's project: the page (runtime/web/page)
+/// at `/`, this project under `/project/`, cross-origin isolated.
+pub const WEB_NT_SERVE_MJS: &str = r#"#!/usr/bin/env node
+// Serve this ejected project's page with the headers gex's runtime needs
+// (cross-origin isolation, for SharedArrayBuffer). Generated by `gexc eject`.
+//   node serve.mjs [port]      then open http://localhost:PORT/
+import { createServer } from 'node:http';
+import { createReadStream, statSync } from 'node:fs';
+import { dirname, extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const page = join(here, 'runtime/web/page');
+const port = Number(process.argv[2] ?? 8000);
+const types = { '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.css': 'text/css',
+  '.json': 'application/json', '.wasm': 'application/wasm', '.tar': 'application/x-tar' };
+createServer((req, res) => {
+  const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname));
+  if (path.includes('..')) { res.writeHead(403).end(); return; }
+  const file = path === '/' ? join(here, 'index.html')
+    : path.startsWith('/project/') ? join(here, path.slice('/project/'.length))
+    : join(page, path);
+  let st;
+  try { st = statSync(file); } catch { st = null; }
+  if (!st?.isFile()) { res.writeHead(404).end(); return; }
+  res.writeHead(200, {
+    'Content-Type': types[extname(file)] ?? 'application/octet-stream',
+    'Content-Length': st.size,
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Embedder-Policy': 'require-corp',
+    'Cache-Control': 'no-cache',
+  });
+  createReadStream(file).pipe(res);
+}).listen(port, '127.0.0.1', () => console.log(`http://localhost:${port}/`));
+"#;
+
+/// What the web launcher reads: how to start the program (build/web/nt.json).
+pub const WEB_NT_RUN: &str = "build/web/nt.json";
+
+#[cfg(feature = "build")]
 /// Link `from` to `to` (a copy across file systems).
 fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
     if to.exists() {
@@ -70,6 +331,7 @@ fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "build")]
 /// Take a unit already built elsewhere (`GEX_EJECT_UNIT_CACHE`: units are
 /// keyed by content, so one with the same key is the same unit).
 fn reuse(key_dir: &Path, sources: &[PathBuf]) -> Result<bool> {
@@ -89,8 +351,8 @@ fn reuse(key_dir: &Path, sources: &[PathBuf]) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(feature = "build")]
 pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport> {
-    let _ = config;
     let ntss = nt_session(dir)?.ok_or_else(|| anyhow!("not a Windows program's project"))?;
     verify_rootfs(dir, project)?;
     let mut report = PeReport::default();
@@ -123,9 +385,28 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
     let units = units_dir(dir);
     std::fs::create_dir_all(&units)?;
     std::env::set_var("GEX_CGEN_CACHE", &units);
+    // What a runtime without a compiler (gex-rt) needs besides the units:
+    // every module an AOT-only process makes at run time, compiled here.
+    let pre = units.join("precompiled");
+    std::env::set_var("GEX_PRECOMPILED", &pre);
+    gex_native::aot_only::precompile(&pre)?;
     let sources: Vec<PathBuf> = std::env::var("GEX_EJECT_UNIT_CACHE")
         .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default();
+    // Indirect-call hints (`<cache>/icall/<image>.txt`, part of a unit's key)
+    // from the project (user/icall/) and from the caches units are reused
+    // from, so a reused unit built with hints is found by its key.
+    std::fs::create_dir_all(units.join("icall"))?;
+    for src in std::iter::once(dir.join("user")).chain(sources.iter().cloned()) {
+        if let Ok(rd) = std::fs::read_dir(src.join("icall")) {
+            for e in rd.flatten() {
+                let to = units.join("icall").join(e.file_name());
+                if !to.exists() {
+                    std::fs::copy(e.path(), &to)?;
+                }
+            }
+        }
+    }
     let jobs = std::env::var("JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
     let class32 = abi_of(&ntss)? == nt::Abi::P32;
     if class32 {
@@ -152,11 +433,33 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         .map(|t| gex_xlate::profile::Profile::from_json(&t).map_err(|e| anyhow!("session/profile.json: {e}")))
         .transpose()?;
     let mut images_out = Vec::new();
+    let mut web_inputs: Vec<(String, u64, Vec<u8>, Vec<u64>)> = Vec::new();
+    let web_entries = web_entries(dir);
     for m in images(&ntss) {
         let host = root.join(rootfs_rel(&m.path)?.strip_prefix("rootfs")?);
         let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", m.path))?;
         let key_dir = nt_cgen::unit_dir(&pe, m.base)?;
+        let bias = m.base.wrapping_sub(m.preferred);
+        // Entries the session reached by an indirect call: function starts
+        // recovery may not find on its own (a thread start only an
+        // immediate names, a callback); seeds of user/eject.json besides.
+        // Those the unit lacks become region entries.
+        let mut seeds: Vec<u64> = Vec::new();
+        for op in profile.iter().flat_map(|pr| pr.objects.values()) {
+            for site in op.indirect.values().filter(|s| s.call) {
+                seeds.extend(site.targets.keys().filter(|l| l.obj == m.id).map(|l| l.off.wrapping_add(bias)));
+            }
+        }
+        let name = m.path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+        for s in &config.seeds {
+            if let Some((img, off)) = s.split_once('+') {
+                if img.eq_ignore_ascii_case(&name) {
+                    let off = u64::from_str_radix(off.trim_start_matches("0x"), 16).map_err(|_| anyhow!("user/eject.json: seed {s:?}"))?;
+                    seeds.push(m.base + off);
+                }
+            }
+        }
         let how = if key_dir.join("c.wasm").exists() {
             "present"
         } else if reuse(&key_dir, &sources)? {
@@ -167,22 +470,35 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
         };
         let p = nt_cgen::prepare_pe(&pe, m.base, jobs, true).with_context(|| format!("building the unit for {}", m.path))?;
         compile(&p)?;
+        note_left(&pe, m.base, &p, &m.path, "", &mut report)?;
+        // Where code ran without a unit although the image had one (a resume
+        // into the middle of a function, a unit's leave): region entries,
+        // a module of their own beside the unit (docs/eject-pe.md §3.3).
+        let end = m.base + m.size;
+        let mut interior: Vec<u64> = ntss.entries.iter().copied().filter(|&a| a >= m.base && a < end).collect();
+        // And the starts above that recovery did not find: the unit's key
+        // and contents stay those of the image alone.
+        interior.extend(seeds);
+        // And where a training run of the web build entered (its units are
+        // these ones, unguarded): one region module for both runtimes.
+        interior.extend(web_entries.iter().copied().filter(|&a| a >= m.base && a < end));
+        web_inputs.push((m.path.clone(), m.base, bytes.clone(), interior.clone()));
+        if !interior.is_empty() {
+            let failed = nt_cgen::prepare_regions(&pe, m.base, &p, &interior, jobs)?;
+            if let Some(r) = nt_cgen::region_module(&p) {
+                compile(&r)?;
+                report.regions.push((m.path.clone(), interior.len() - failed.len()));
+            }
+            if !failed.is_empty() {
+                report.uncovered.push((m.path.clone(), failed.len(), failed.iter().take(8).copied().collect()));
+            }
+        }
         for name in nt_cgen::prepare_providers(&pe)? {
             if !report.providers.contains(&name) {
                 report.providers.push(name);
             }
         }
         let entries = gex_cgen::image::read_entries(&p)?;
-        // What the session ran on tier-1 in this image that the unit has no
-        // entry for.
-        if let Some(op) = profile.as_ref().and_then(|pr| pr.objects.get(&m.id)) {
-            let bias = m.base.wrapping_sub(m.preferred);
-            let set: std::collections::HashSet<u64> = entries.iter().copied().collect();
-            let miss: Vec<u64> = op.blocks.keys().map(|o| o.wrapping_add(bias)).filter(|a| !set.contains(a)).collect();
-            if !miss.is_empty() {
-                report.uncovered.push((m.path.clone(), miss.len(), miss.iter().take(8).copied().collect()));
-            }
-        }
         report.units.push((m.path.clone(), m.base, entries.len(), std::fs::metadata(&p)?.len(), how));
         images_out.push(BuiltImage {
             kind: "unit".into(),
@@ -195,14 +511,259 @@ pub fn build(dir: &Path, project: &Project, config: &Config) -> Result<PeReport>
             bytes: std::fs::metadata(&p)?.len(),
         });
     }
+    // Stateful providers, from their sources (Lua: PUC Lua and its binding).
+    for p in &config.providers {
+        let out = provider_wasm(dir, p);
+        std::fs::create_dir_all(out.parent().unwrap())?;
+        let script = dir.join(&p.dir).join("build.sh");
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .arg(&out)
+            .arg(dir.join("gen"))
+            .status()
+            .with_context(|| format!("running {}", script.display()))?;
+        if !status.success() {
+            bail!("building the provider for {} ({}) failed", p.library, script.display());
+        }
+        let wasm = std::fs::read(&out)?;
+        check_provider_imports(&wasm, &format!("the provider for {}", p.library))?;
+        // Its compiled form, named by its content as the runtime looks it
+        // up (`libprov::cwasm_path`): gex-rt has no compiler to make it.
+        // Older ones beside it are stale.
+        let cwasm = gex_native::libprov::cwasm_path(&out, &wasm);
+        if let (Some(d), Some(stem)) = (out.parent(), out.file_stem().and_then(|s| s.to_str())) {
+            for e in std::fs::read_dir(d)?.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with(&format!("{stem}.")) && n.ends_with(".cwasm") && e.path() != cwasm {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        gex_cache::load_or_compile_at(&engine, &cwasm, &wasm).with_context(|| format!("compiling the provider for {}", p.library))?;
+        report.providers.push(format!("{} ({} KiB, stateful)", p.library, wasm.len() / 1024));
+    }
+    // Link groups (docs/eject-pe.md §6a): members by file name, one module
+    // each, and the index a runtime reads to install them.
+    let mut index = String::new();
+    for names in &config.link_groups {
+        let mut parsed = Vec::new();
+        for n in names {
+            let m = images(&ntss)
+                .into_iter()
+                .find(|m| m.path.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case(n)))
+                .ok_or_else(|| anyhow!("user/eject.json: link group member {n} is not an image the session mapped"))?;
+            let host = root.join(rootfs_rel(&m.path)?.strip_prefix("rootfs")?);
+            let bytes = std::fs::read(&host).with_context(|| format!("reading {}", host.display()))?;
+            parsed.push((m.path.clone(), m.base, gex_ld::pe::parse(&bytes).map_err(|e| anyhow!("{}: {e}", m.path))?));
+        }
+        let members: Vec<nt_cgen::GroupMember<'_>> = parsed.iter().map(|(path, base, pe)| nt_cgen::GroupMember { path, pe, base: *base }).collect();
+        eprintln!("  building the link group {} ...", names.join(" + "));
+        let g = nt_cgen::prepare_group(&members, jobs).with_context(|| format!("building the link group {}", names.join(" + ")))?;
+        compile(&g.module)?;
+        index.push_str(&format!("{} {}\n", g.key, g.member_keys.join(" ")));
+        report.groups.push((names.join(" + "), g.iat_hints, std::fs::metadata(&g.module)?.len()));
+    }
+    std::fs::create_dir_all(units.join("groups"))?;
+    std::fs::write(units.join("groups/index.txt"), &index)?;
+    // The web build's units, when the project has a browser runtime.
+    if dir.join(WEB_NT_DIR).join(WEB_NT_WASM[0]).exists() {
+        let stateful: Vec<(String, PathBuf)> = config.providers.iter().map(|p| (p.library.clone(), provider_wasm(dir, p))).collect();
+        build_web(dir, &ntss, project, &units, &web_inputs, &stateful, class32, jobs, &mut report)?;
+        std::env::set_var("GEX_CGEN_CACHE", &units);
+    }
     let manifest = BuildManifest {
-        inputs: crate::build::inputs_id(dir, &[])?,
+        inputs: crate::manifest::inputs_id(dir, &[])?,
         images: images_out,
         replacements: Vec::new(),
         pins: Vec::new(),
     };
     std::fs::write(dir.join(BUILD_FILE), manifest.to_json()).with_context(|| format!("writing {BUILD_FILE}"))?;
     Ok(report)
+}
+
+#[cfg(feature = "build")]
+/// Where a training run of the web build (`./run.mjs --record-entries`,
+/// `index.html?record`) entered code the units have no entry for.
+fn web_entries(dir: &Path) -> Vec<u64> {
+    std::fs::read_to_string(dir.join("user/web-entries.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| u64::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+#[cfg(feature = "build")]
+/// Functions a unit was built without (gex-cgen left them to tier-1):
+/// uncovered in a project that runs with no translation.
+fn note_left(pe: &gex_ld::pe::PeImage, base: u64, unit: &Path, path: &str, what: &str, report: &mut PeReport) -> Result<()> {
+    let left = nt_cgen::left_out(pe, base, unit)?;
+    if !left.is_empty() {
+        report.left.push((format!("{path}{what}"), left));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "build")]
+/// The web build (docs/eject-pe.md §6): every image's unit in the browser's
+/// flavour (guarded: the browser's NT layer keeps host data above a guard
+/// limit), its region entries and providers, into `build/web/cgen` (the
+/// layout `GEX_CGEN_CACHE` has, which the shim reads), and how to start the
+/// program (`build/web/nt.json`). Units are reused from
+/// `GEX_EJECT_WEB_UNIT_CACHE` (a browser unit cache) by key. Nothing is
+/// compiled here: the browser compiles each module once per page.
+#[allow(clippy::too_many_arguments)]
+fn build_web(
+    dir: &Path,
+    ntss: &NtSession,
+    project: &Project,
+    native: &Path,
+    inputs: &[(String, u64, Vec<u8>, Vec<u64>)],
+    stateful: &[(String, PathBuf)],
+    class32: bool,
+    jobs: usize,
+    report: &mut PeReport,
+) -> Result<()> {
+    let web = dir.join("build/web/cgen");
+    let guarded_build = std::env::var("GEX_EJECT_WEB_GUARDED").as_deref() == Ok("1");
+    std::fs::create_dir_all(dir.join("build/web"))?;
+    if guarded_build {
+        std::fs::create_dir_all(&web)?;
+    }
+    // Recovery and C objects do not depend on the flavour (objects are keyed
+    // by their C): the native build's, shared.
+    for d in ["recovery", "objects"].into_iter().filter(|_| guarded_build) {
+        let to = web.join(d);
+        if std::fs::symlink_metadata(&to).is_err() {
+            std::fs::create_dir_all(native.join(d))?;
+            std::os::unix::fs::symlink(Path::new("../../units").join(d), &to)?;
+        }
+    }
+    if guarded_build {
+        std::fs::create_dir_all(web.join("icall"))?;
+    }
+    if let Ok(rd) = std::fs::read_dir(native.join("icall")).map(|r| r.filter(|_| guarded_build)) {
+        for e in rd.flatten() {
+            let to = web.join("icall").join(e.file_name());
+            if !to.exists() {
+                std::fs::copy(e.path(), &to)?;
+            }
+        }
+    }
+    let mut sources: Vec<PathBuf> = std::env::var("GEX_EJECT_WEB_UNIT_CACHE")
+        .map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default();
+    let web_entries = web_entries(dir);
+    // The unguarded flavour (stream B's step 0): the native units, by the
+    // same keys, so the web build adds nothing to compile. The browser's
+    // guard protects nothing its memory's end does not (docs/browser-units-
+    // plan.md). GEX_EJECT_WEB_GUARDED=1: the guarded flavour, built apart.
+    let guarded = std::env::var("GEX_EJECT_WEB_GUARDED").as_deref() == Ok("1");
+    let web = if guarded {
+        web
+    } else {
+        let _ = std::fs::remove_dir_all(&web);
+        sources.extend(std::env::var("GEX_EJECT_UNIT_CACHE").map(|v| v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from).collect::<Vec<_>>()).unwrap_or_default());
+        native.to_path_buf()
+    };
+    std::env::set_var("GEX_CGEN_CACHE", &web);
+    gex_cgen::image::set_unguarded(!guarded);
+    let r = (|| -> Result<()> {
+        {
+            let (image, _) = gex_kernel::nt::boot::trampoline_input(class32);
+            reuse(&web.join(gex_cgen::image::image_key(&image)), &sources)?;
+            let t = nt_cgen::prepare_trampolines(class32, jobs)?;
+            // The browser leaves the guest's code for a system call and
+            // resumes after it, inside the trampolines.
+            let failed = nt_cgen::prepare_trampoline_regions(class32, &t, jobs)?;
+            if !failed.is_empty() {
+                bail!("the trampoline page's resume points {failed:x?} have no region entry");
+            }
+            report.web_regions += gex_kernel::nt::boot::trampoline_resumes(class32).len();
+        }
+        for (path, base, bytes, interior) in inputs {
+            let pe = gex_ld::pe::parse(bytes).map_err(|e| anyhow!("{path}: {e}"))?;
+            let end = base + pe.image_size as u64;
+            let mut interior = interior.clone();
+            interior.extend(web_entries.iter().copied().filter(|a| a >= base && *a < end));
+            let interior = &interior;
+            let key_dir = nt_cgen::unit_dir(&pe, *base)?;
+            let how = if key_dir.join("c.wasm").exists() {
+                "present"
+            } else if reuse(&key_dir, &sources)? {
+                "reused"
+            } else {
+                eprintln!("  building the web unit for {path} at {base:#x} ...");
+                "built"
+            };
+            let p = nt_cgen::prepare_pe(&pe, *base, jobs, true).with_context(|| format!("building the web unit for {path}"))?;
+            note_left(&pe, *base, &p, path, " (web)", report)?;
+            if !interior.is_empty() {
+                let failed = nt_cgen::prepare_regions(&pe, *base, &p, interior, jobs)?;
+                if nt_cgen::region_module(&p).is_some() {
+                    report.web_regions += interior.len() - failed.len();
+                }
+            }
+            nt_cgen::prepare_providers(&pe)?;
+            report.web_units.push((path.clone(), how));
+        }
+        Ok(())
+    })();
+    gex_cgen::image::set_unguarded(true);
+    r?;
+    // How the launcher starts the program: the guest's paths as recorded.
+    let mut settings: Vec<String> = ntss
+        .settings
+        .iter()
+        .filter(|s| s.split_once('=').is_some_and(|(k, _)| replayed_setting(k)))
+        .cloned()
+        .collect();
+    // Stateful providers (Lua), the same modules as natively: the browser
+    // runtime finds them under the unit cache.
+    let mut spec = Vec::new();
+    for (lib, wasm) in stateful {
+        let rel = format!("stateful/{}", wasm.file_name().unwrap().to_string_lossy());
+        std::fs::create_dir_all(web.join("stateful"))?;
+        std::fs::copy(wasm, web.join(&rel)).with_context(|| format!("copying {}", wasm.display()))?;
+        spec.push(format!("{}={rel}", lib.to_ascii_lowercase()));
+    }
+    if !spec.is_empty() {
+        settings.push(format!("GEX_NT_STATEFUL={}", spec.join(",")));
+    }
+    use crate::json::{b, obj, s, strs};
+    let j = obj(vec![
+        ("exe", s(&ntss.exe)),
+        ("prefix", s(&ntss.prefix)),
+        ("cwd", s(project.program.cwd.as_deref().unwrap_or("/"))),
+        ("args", strs(&ntss.args)),
+        ("env", strs(&ntss.env)),
+        ("settings", strs(&settings)),
+        ("gl", b(ntss.gl)),
+        // The units' directory in the project, and their flavour.
+        ("cgen", s(web.strip_prefix(dir).unwrap_or(&web).to_string_lossy())),
+        ("unguarded", b(!guarded)),
+        // What the page keeps across loads (IndexedDB): the Windows user
+        // profiles, where a program's saves and settings go (AppData,
+        // Documents).
+        ("persist", s(format!("{}/drive_c/users", ntss.prefix.trim_end_matches('/')))),
+    ]);
+    std::fs::write(dir.join(WEB_NT_RUN), crate::json::write(&j))?;
+    // The page's bundle: the rootfs as one tar (links followed), which the
+    // page fetches into a SharedArrayBuffer.
+    if dir.join(WEB_NT_PAGE).is_dir() {
+        let tar = dir.join("build/web/rootfs.tar");
+        let status = std::process::Command::new("tar")
+            .arg("-C")
+            .arg(dir.join("build/rootfs"))
+            .arg("-chf")
+            .arg(&tar)
+            .arg(".")
+            .status()
+            .context("running tar")?;
+        if !status.success() {
+            bail!("tar of build/rootfs failed");
+        }
+    }
+    Ok(())
 }
 
 /// GEX_NT_* settings a run replays from the session unless set now: those
@@ -219,11 +780,11 @@ pub fn run(dir: &Path, flags: &crate::run::RunFlags) -> Result<Exit> {
     let ntss = nt_session(dir)?.ok_or_else(|| anyhow!("not a Windows program's project"))?;
     let project = Project::load(dir)?;
     let manifest = BuildManifest::load(dir)?;
-    if crate::build::inputs_id(dir, &[])? != manifest.inputs {
+    if crate::manifest::inputs_id(dir, &[])? != manifest.inputs {
         bail!("{} changed since it was built (gex-project.json or user/eject.json); run ./build.sh", dir.display());
     }
     let (config, _) = Config::load(dir)?;
-    let root = std::fs::canonicalize(crate::build::rootfs(dir)).with_context(|| format!("{} (run ./build.sh)", dir.display()))?;
+    let root = std::fs::canonicalize(crate::manifest::rootfs(dir)).with_context(|| format!("{} (run ./build.sh)", dir.display()))?;
     let units = std::fs::canonicalize(units_dir(dir))?;
     for s in &ntss.settings {
         if let Some((k, v)) = s.split_once('=') {
@@ -233,7 +794,9 @@ pub fn run(dir: &Path, flags: &crate::run::RunFlags) -> Result<Exit> {
         }
     }
     std::env::set_var("GEX_CGEN_CACHE", &units);
+    std::env::set_var("GEX_PRECOMPILED", units.join("precompiled"));
     std::env::set_var("GEX_NT_CGEN_BUILD", "0");
+    gex_native::libprov::set(lib_providers(dir, &config));
     let jit = flags.jit_fallback || config.jit_fallback;
     nt_cgen::set_mode(if jit { nt_cgen::Mode::Default } else { nt_cgen::Mode::Aot });
     let args: Vec<String> = match (&flags.args, &config.args) {

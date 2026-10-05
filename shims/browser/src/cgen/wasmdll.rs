@@ -1,0 +1,397 @@
+//! Native wasm32 Wine DLLs in the browser (docs/wine-native.md §3.14,
+//! §3.15): the native host's `wasmdll`, shared mode. Wine's PE side is one
+//! module (pelink.py) behind a skeleton per DLL (a `.wasmref` section names
+//! it). The first skeleton to map installs it as a stateful provider (its
+//! data from the NT allocator, `PROVIDER | number` in the function table);
+//! every later one binds its exports to slots of the same install
+//! (`FuncMap::bind`), whose tier-1 bridges every Worker writes as it
+//! catches up (`gex_wasmdll_binds_len` and friends, `BINDS`).
+//!
+//! The protocol with `gex.mjs` (`#cgenProviders`, `#wasmdllCatchUp`):
+//!   - a unit's provider `i` with `gex_cgen_provider_wasmdll(u, i)` set is
+//!     published by `gex_wasmdll_publish(u, i)`: a provider module number
+//!     (the first skeleton: JS catches up, which instantiates the module
+//!     from `gex_cgen_pmod_wasm_ptr/len`, then calls
+//!     `gex_cgen_pmod_installed` and `gex_wasmdll_installed`), or -2 (bound
+//!     into the install: only bridges to write);
+//!   - every Worker writes each `BINDS` entry's bridges once.
+//!   - The module's `gex.syscall` is JS's (`#nativeSyscall`), so a system
+//!     call from native code that traps to JS (a unit or thread to start)
+//!     is served there and returns, keeping the native frames below it.
+
+use super::*;
+use std::collections::HashMap;
+
+/// Wine's PE module, once its first skeleton mapped.
+struct WinePe {
+    /// Its provider module number (`PROVIDERS`).
+    number: u32,
+    /// Its function-table install.
+    install: u32,
+    /// Its data (`__memory_base`).
+    data: u64,
+    slots: HashMap<String, u32>,
+    /// `gexp_<export>` slots by export name, whichever DLL owns them (a
+    /// DLL's `-import` re-exports are served by the owner's adapter).
+    any_dll: HashMap<String, u32>,
+    /// Data symbols' offsets in its data (exported globals).
+    data_exports: HashMap<String, u32>,
+    /// Writes into its data that follow its initialisation (ntdll's boot
+    /// variables).
+    pending: Vec<(u64, Vec<u8>)>,
+    wasm: Vec<u8>,
+    installed: bool,
+}
+
+static WINE_PE: Mutex<Option<WinePe>> = Mutex::new(None);
+
+/// Bridges for addresses bound into the install after it was published.
+struct Bind {
+    regs: Vec<u32>,
+    dirs: Vec<(u64, u32)>,
+    slots: u64,
+}
+
+static BINDS: Mutex<Vec<Bind>> = Mutex::new(Vec::new());
+
+pub(super) fn is_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
+    pe.sections.iter().any(|s| s.name == ".wasmref")
+}
+
+/// Whether provider `i` of unit `u` is a native Wine DLL's skeleton.
+#[no_mangle]
+pub extern "C" fn gex_cgen_provider_wasmdll(u: u32, i: u32) -> i32 {
+    lock(&UNITS).get(u as usize).and_then(|x| x.providers.get(i as usize)).is_some_and(|p| p.skeleton.is_some()) as i32
+}
+
+/// Publish provider `i` of unit `u`, a skeleton: the module's number for
+/// the first (JS installs it), -2 when bound into the install, -1 on an
+/// error (said).
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_publish(u: u32, i: u32) -> i32 {
+    let (path, base, pe) = {
+        let units = lock(&UNITS);
+        let Some(x) = units.get(u as usize) else { return -1 };
+        let Some(pe) = x.providers.get(i as usize).and_then(|p| p.skeleton.clone()) else { return -1 };
+        (x.path.clone(), x.base, pe)
+    };
+    match publish(&path, base, &pe) {
+        Ok(n) => n,
+        Err(e) => {
+            crate::warn_line(&format!("gex-nt: {path}: native wasm32 DLL: {e}\n"));
+            crate::nt::end_process(0xc000_0135);
+        }
+    }
+}
+
+fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, String> {
+    let sec = pe.sections.iter().find(|s| s.name == ".wasmref").ok_or("no .wasmref")?;
+    let (module_name, dll, data_list) = wasmref(&crate::guest_bytes()[..], base, sec)?;
+    let mut g = lock(&WINE_PE);
+    let first = g.is_none();
+    if first {
+        let file = match path.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/{module_name}"),
+            None => module_name.clone(),
+        };
+        let wasm = crate::with_host(|h| gex_kernel::nt::file::read_guest_file(&h.kernel, &file)).map_err(|e| format!("reading Wine's PE module {file}: {e:?}"))?;
+        let (size, align) = dylink_memory(&wasm)?;
+        let a = 1u64 << align;
+        let data = provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?;
+        let data = (data + a - 1) & !(a - 1);
+        let names = gex_cgen::provider::slot_names(&wasm).map_err(|e| e.to_string())?;
+        let mut slots = HashMap::new();
+        let mut any_dll = HashMap::new();
+        for (k, n) in names.iter().enumerate() {
+            if let Some(n) = n {
+                if let Some((_, export)) = n.split_once("!gexp_") {
+                    any_dll.entry(export.to_string()).or_insert(k as u32);
+                }
+                slots.insert(n.clone(), k as u32);
+            }
+        }
+        for (name, target) in forwards(&wasm) {
+            if let Some((d, f)) = target.split_once('!') {
+                if let Some(&k) = slots.get(&format!("{d}!gexp_{f}")) {
+                    any_dll.entry(name).or_insert(k);
+                }
+            }
+        }
+        let data_exports = exported_offsets(&wasm)?;
+        let number = lock(&PROVIDERS).len() as u32;
+        *g = Some(WinePe { number, install: 0, data, slots, any_dll, data_exports, pending: Vec::new(), wasm, installed: false });
+    }
+    let wp = g.as_mut().expect("Wine's PE module");
+    let slot = |n: &str| wp.slots.get(n).copied();
+    let missing = slot(&format!("{dll}!gexp__missing"))
+        .or_else(|| wp.slots.iter().find(|(k, _)| k.ends_with("!gexp__missing")).map(|(_, v)| *v))
+        .ok_or("Wine's PE module has no gexp__missing")?;
+    let mut pairs = Vec::new();
+    for e in pe.exports.entries.iter().filter(|e| e.rva != 0 && e.forwarder.is_none()) {
+        let k = e
+            .names
+            .iter()
+            .find_map(|n| slot(&format!("{dll}!gexp_{n}")))
+            .or_else(|| slot(&format!("{dll}!gexp_#{}", e.ordinal)))
+            .or_else(|| e.names.iter().find_map(|n| wp.any_dll.get(n).copied()))
+            .unwrap_or(missing);
+        pairs.push((base + e.rva as u64, k));
+    }
+    if let (Some(k), true) = (slot(&format!("{dll}!gexp__entry")), pe.entry_rva != 0) {
+        pairs.push((base + pe.entry_rva as u64, k));
+    }
+    pairs.sort_unstable();
+    pairs.dedup_by_key(|&mut (a, _)| a);
+
+    // Data exports: the skeleton's export address table pointed at the
+    // module's data (32-bit RVAs wrap to any address).
+    let dir = pe.dirs.first().map(|d| d.0).unwrap_or(0);
+    if dir != 0 && !data_list.is_empty() {
+        let mut gm = GuestMem::new(crate::guest_bytes());
+        let functions = gm.read_u32(base + dir as u64 + 28).map_err(|_| "export directory outside memory")? as u64;
+        for (idx, link) in &data_list {
+            let Some(off) = wp.data_exports.get(&format!("{dll}!{link}")) else {
+                crate::warn_line(&format!("gex-nt: {path}: data export {link} is not in Wine's PE module\n"));
+                continue;
+            };
+            let target = (wp.data + *off as u64).wrapping_sub(base) as u32;
+            let _ = gm.write_u32(base + functions + 4 * *idx as u64, target);
+        }
+    }
+    // winecrt0's base of this DLL: the skeleton's (after the module's data
+    // initialisation: at its install for the first DLL, now for later ones)
+    if let Some(off) = wp.data_exports.get(&format!("{dll}!__gexw_image_base")) {
+        let at = wp.data + *off as u64;
+        if first {
+            wp.pending.push((at, (base as u32).to_le_bytes().to_vec()));
+        } else {
+            let _ = GuestMem::new(crate::guest_bytes()).write_u32(at, base as u32);
+        }
+    }
+    if dll == "ntdll.dll" {
+        for (name, bytes) in ntdll_variables() {
+            if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {
+                wp.pending.push((wp.data + *off as u64, bytes));
+            }
+        }
+    }
+
+    let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
+    crate::warn_line(&format!("gex-nt: native wasm32 module for {path}: {} entries\n", pairs.len()));
+    if first {
+        let len = gex_cgen::provider::slot_names(&wp.wasm).map_err(|e| e.to_string())?.len() as u32;
+        wp.install = ftab(|m| m.publish(len, PROVIDER | wp.number, Tier::Unit, &pairs));
+        clear(&addrs);
+        let (regs, dirs, slots) = bridges(&addrs);
+        lock(&PROVIDERS).push(ProviderModule { file: format!("wasmdll:{path}"), regs, dirs, slots, memory_base: wp.data as u32 });
+        Ok(wp.number as i32)
+    } else {
+        let install = wp.install;
+        drop(g);
+        bind(install, &pairs);
+        Ok(-2)
+    }
+}
+
+fn clear(addrs: &[u64]) {
+    let mem = crate::guest_bytes();
+    for &a in addrs {
+        gex_kernel::ftab::fcache_clear(mem, a);
+    }
+}
+
+/// Map `pairs` to slots of `install` and queue their bridges for every
+/// Worker.
+fn bind(install: u32, pairs: &[(u64, u32)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    ftab(|m| m.bind(install, pairs));
+    let addrs: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
+    clear(&addrs);
+    let (regs, dirs, slots) = bridges(&addrs);
+    lock(&BINDS).push(Bind { regs, dirs, slots });
+}
+
+/// Provider module `number`'s bytes when it is Wine's PE module (in the
+/// shim's heap), else 0.
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_wasm_ptr(number: u32) -> u32 {
+    lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.as_ptr() as u32)
+}
+
+#[no_mangle]
+pub extern "C" fn gex_cgen_pmod_wasm_len(number: u32) -> u32 {
+    lock(&WINE_PE).as_ref().filter(|w| w.number == number).map_or(0, |w| w.wasm.len() as u32)
+}
+
+/// The publishing Worker instantiated Wine's PE module (its data is
+/// initialised and relocated): ntdll's boot variables, then the entry
+/// thunks (once).
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_installed() {
+    let (install, data, entries, pending) = {
+        let mut g = lock(&WINE_PE);
+        let Some(wp) = g.as_mut() else { return };
+        let pending = std::mem::take(&mut wp.pending);
+        let first = !std::mem::replace(&mut wp.installed, true);
+        (wp.install, wp.data, first.then(|| wp.data_exports.get("__gexw_entries").copied()).flatten(), pending)
+    };
+    let mem = crate::guest_bytes();
+    for (at, bytes) in pending {
+        if let Some(dst) = mem.get_mut(at as usize..at as usize + bytes.len()) {
+            dst.copy_from_slice(&bytes);
+        }
+    }
+    let Some(off) = entries else { return };
+    // The ICALL pass's {function, thunk} pairs (table indices): each thunk
+    // at its function's index as a guest address.
+    let gm = GuestMem::new(crate::guest_bytes());
+    let at = data + off as u64;
+    let (start, stop) = (gm.read_u32(at).unwrap_or(0) as u64, gm.read_u32(at + 4).unwrap_or(0) as u64);
+    if start == 0 || stop <= start {
+        return;
+    }
+    let base = ftab(|m| m.install(install).base);
+    let mut pairs = Vec::new();
+    let mut a = start;
+    while a + 8 <= stop {
+        let (f, t) = (gm.read_u32(a).unwrap_or(0), gm.read_u32(a + 4).unwrap_or(0));
+        a += 8;
+        if f < base || t < base || f as u64 >= 0x3f0000 {
+            continue;
+        }
+        pairs.push((f as u64, t - base));
+    }
+    bind(install, &pairs);
+}
+
+/// How many late bindings there are: a Worker writes each one's bridges.
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_binds_len() -> u32 {
+    lock(&BINDS).len() as u32
+}
+
+/// Binding `i`'s bridges, `[table, slot]` flattened, as `gex_cgen_regs`.
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_bind_regs(i: u32, buf: u32, cap: u32) -> u32 {
+    let b = lock(&BINDS);
+    let Some(x) = b.get(i as usize) else { return 0 };
+    let n = x.regs.len().min(cap as usize);
+    put_u32s(&x.regs[..n], buf);
+    x.regs.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_bind_slots(i: u32) -> u32 {
+    lock(&BINDS).get(i as usize).map_or(0, |x| x.slots.min(u32::MAX as u64) as u32)
+}
+
+/// A Worker wrote binding `i`'s bridges: the directory for the pages it
+/// numbered (idempotent).
+#[no_mangle]
+pub extern "C" fn gex_wasmdll_bind_done(i: u32) {
+    let dirs = lock(&BINDS).get(i as usize).map(|x| x.dirs.clone()).unwrap_or_default();
+    write_dirs(dirs);
+}
+
+/// The skeleton's `.wasmref`: `GEXWREF1 module\0 dll\0 u32 count { u32
+/// index, name\0 }` (winebuild `--wasm-shared`).
+fn wasmref(mem: &[u8], base: u64, sec: &gex_ld::pe::Section) -> Result<(String, String, Vec<(u32, String)>), String> {
+    let at = (base + sec.rva as u64) as usize;
+    let raw = mem.get(at..at + sec.vsize as usize).ok_or(".wasmref outside memory")?;
+    if raw.get(..8) != Some(&b"GEXWREF1"[..]) {
+        return Err(".wasmref is not GEXWREF1".into());
+    }
+    let mut p = 8;
+    let cstr = |p: &mut usize| -> Result<String, String> {
+        let end = raw[*p..].iter().position(|&c| c == 0).ok_or(".wasmref truncated")? + *p;
+        let s = String::from_utf8_lossy(&raw[*p..end]).into_owned();
+        *p = end + 1;
+        Ok(s)
+    };
+    let u32_at = |p: &mut usize| -> Result<u32, String> {
+        let v = u32::from_le_bytes(raw.get(*p..*p + 4).ok_or(".wasmref truncated")?.try_into().unwrap());
+        *p += 4;
+        Ok(v)
+    };
+    let module = cstr(&mut p)?;
+    let dll = cstr(&mut p)?;
+    let count = u32_at(&mut p)?;
+    let mut data = Vec::new();
+    for _ in 0..count {
+        let idx = u32_at(&mut p)?;
+        data.push((idx, cstr(&mut p)?));
+    }
+    Ok((module, dll, data))
+}
+
+/// As natively (`wasmdll::ntdll_variables`): what gex-kernel's NT boot
+/// fills in ntdll, in a native ntdll's own data.
+fn ntdll_variables() -> [(&'static str, Vec<u8>); 3] {
+    use gex_kernel::nt::boot::tramp;
+    [
+        ("__wine_syscall_dispatcher", (tramp::SYSCALL_DISPATCHER_32 as u32).to_le_bytes().to_vec()),
+        ("__wine_unix_call_dispatcher", (tramp::UNIX_CALL_32 as u32).to_le_bytes().to_vec()),
+        ("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec()),
+    ]
+}
+
+/// pelink's `gexw.forwards` custom section: (export name, `dll!name`).
+fn forwards(wasm: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::CustomSection(c)) = payload {
+            if c.name() == "gexw.forwards" {
+                for line in String::from_utf8_lossy(c.data()).lines() {
+                    if let Some((a, b)) = line.split_once(' ') {
+                        out.push((a.to_string(), b.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Exported i32 globals with constant initialisers: a PIC module's data
+/// symbols, as offsets from `__memory_base`.
+fn exported_offsets(wasm: &[u8]) -> Result<HashMap<String, u32>, String> {
+    let e = |e: wasmparser::BinaryReaderError| e.to_string();
+    let mut imported_globals = 0u32;
+    let mut inits: Vec<Option<u32>> = Vec::new();
+    let mut out = HashMap::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload.map_err(e)? {
+            wasmparser::Payload::ImportSection(r) => {
+                for imp in r {
+                    if let wasmparser::TypeRef::Global(_) = imp.map_err(e)?.ty {
+                        imported_globals += 1;
+                    }
+                }
+            }
+            wasmparser::Payload::GlobalSection(r) => {
+                for g in r {
+                    let g = g.map_err(e)?;
+                    let mut ops = g.init_expr.get_operators_reader();
+                    inits.push(match ops.read().map_err(e)? {
+                        wasmparser::Operator::I32Const { value } => Some(value as u32),
+                        _ => None,
+                    });
+                }
+            }
+            wasmparser::Payload::ExportSection(r) => {
+                for x in r {
+                    let x = x.map_err(e)?;
+                    if x.kind == wasmparser::ExternalKind::Global && x.index >= imported_globals {
+                        if let Some(Some(v)) = inits.get((x.index - imported_globals) as usize) {
+                            out.insert(x.name.to_string(), *v);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}

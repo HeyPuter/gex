@@ -461,6 +461,9 @@ struct JitShared {
     /// A native wasm32 program (`wasmprog`): its native frames cannot be
     /// unwound and resumed, so a fork is made without leaving them.
     wasm_program: bool,
+    /// Wine's PE side as one wasm module (`wasmdll`, shared mode): installed
+    /// at the first skeleton that names it, bound DLL by DLL.
+    wine_pe: Option<Arc<wasmdll::WinePe>>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -668,6 +671,7 @@ pub fn engine() -> Result<Engine> {
     // allocation and peepholes, whose time dominates on a large program (half
     // a minute to compile SQLite vs under two seconds to translate).
     // `GEX_OPT_LEVEL` picks the trade.
+    #[cfg(feature = "compile")]
     config.cranelift_opt_level(match std::env::var("GEX_OPT_LEVEL").as_deref() {
         Ok("none") => wasmtime::OptLevel::None,
         Ok("speed_and_size") => wasmtime::OptLevel::SpeedAndSize,
@@ -740,6 +744,11 @@ fn run_program_with(
     // hit skips it and reports empty stats apart from the sidecar block count.
     let mut stats = Stats::default();
     let translate = || {
+        // Without the translator (gex-rt) only an ejected project's
+        // AOT-only process gets here, and it never calls this.
+        #[cfg(not(feature = "translate"))]
+        panic!("{} has no translator to translate the program image", env!("CARGO_PKG_NAME"));
+        #[allow(unreachable_code)]
         let (m, s) = gex_xlate::translate_image(image, xlate);
         if opts.verbose {
             eprintln!(
@@ -764,7 +773,7 @@ fn run_program_with(
     let (module, meta) = if opts.aot_only {
         // An ejected Windows program: no tier-1 module, only the root's
         // entry (`aot_only`).
-        (Module::new(&engine, aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
+        (gex_cache::compile(&engine, &aot_only::base_module()).context("compiling the AOT-only base module")?, Default::default())
     } else if let Some(aot) = &opts.aot {
         // An ejected project: the image was translated when it was built.
         let dir = use_cache.then(gex_cache::cache_dir).flatten();
@@ -798,7 +807,7 @@ fn run_program_with(
             stats = s;
             let meta = m.metadata();
             (
-                Module::new(&engine, &m.wasm).context("validating translated wasm")?,
+                gex_cache::compile(&engine, &m.wasm).context("validating translated wasm")?,
                 meta,
             )
         }
@@ -1066,6 +1075,7 @@ fn run_program_with(
                 provider: Default::default(),
                 ftab: Default::default(),
                 wasm_program: false,
+                wine_pe: None,
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -3564,6 +3574,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if op == gex_abi::cache_op::FTAB_TIER1 {
+                if std::env::var_os("GEX_WASM_TRACE").is_some() {
+                    let memory = caller.data().memory.clone();
+                    let c = caller.data().thread.ctx_addr;
+                    let sp = memory.map(|m| GuestMem::new(m.bytes()).read_u64(c + ctx::x(4) as u64).unwrap_or(0)).unwrap_or(0);
+                    let w: Vec<String> = caller.data().callouts.iter().map(|c| format!("{:#x}@{:#x}", c.ret, c.sp_want)).collect();
+                    eprintln!("gex: bridge hands {addr:#x} to tier-1 (sp {sp:#x}, call-outs [{}])", w.join(" "));
+                }
                 if let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
                     sh.translated.remove(&(addr as u64));
@@ -3668,7 +3685,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(co) = caller.data().callouts.last() {
                 let ctx_addr = caller.data().thread.ctx_addr;
                 let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
-                if sp > co.sp_want + CALLOUT_UNWOUND {
+                // Not at a function's own address under a native caller (the
+                // bridge's poll there): leaving would hand the function back
+                // with the PC its body left for, which the bridge takes as
+                // "nothing served it" and gives the address to tier-1. The
+                // entry about to run sees the guest left and leaves itself
+                // (gex_nr::NATIVE_LEFT).
+                let at_function = || {
+                    co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD
+                        && caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(pc as u64).is_some())
+                };
+                if sp > co.sp_want + co.unwound && !at_function() {
+                    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+                        eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {sp:#x}, want {:#x})", co.ret, co.sp_want);
+                    }
                     let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
                     caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
                     return Err(StopExecution.into());
@@ -3739,6 +3769,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    // No translator in this build (gex-rt): nothing is ever translated.
+    if cfg!(not(feature = "translate")) {
+        return Ok(false);
+    }
+    if caller.data().nt.is_some() && profile::active() {
+        profile::note_nt_entry(pc);
+    }
     // With runtime translation off, a miss is still worth catching up on --
     // another thread or a freshly mapped object may already have covered this
     // address -- but nothing new is translated for it. A miss that survives
@@ -3889,8 +3926,8 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             l.module
         }
-        None => Module::new(&engine, &translated_module.wasm)
-            .map_err(|e| keep_bad(anyhow::Error::from(e)))
+        None => gex_cache::compile(&engine, &translated_module.wasm)
+            .map_err(keep_bad)
             .context("validating runtime-translated wasm")?,
     };
     jit_stats::COMPILE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4248,6 +4285,10 @@ pub(crate) fn take_exit_sites(n: usize) -> Vec<(u64, u64, u64)> {
 struct Callout {
     ret: u64,
     sp_want: u64,
+    /// How far above `sp_want` a safepoint must find the stack pointer to
+    /// call the caller unwound: `CALLOUT_UNWOUND`, or `NATIVE_UNWOUND` for a
+    /// guest call from native Wine.
+    unwound: u64,
     /// `(slot, what the slot held)` while watched.
     slot: Option<(u64, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
@@ -4280,6 +4321,27 @@ const CALLOUT_MAX_DEPTH: usize = 32;
 /// return address; a deeper activation returning to the same address
 /// (recursion) is always below it.
 const CALLOUT_UNWOUND: u64 = 64 << 10;
+
+/// gex_nr::NATIVE_LEFT: whether the innermost call-out is a native caller's
+/// and the guest, at `sp`, is above its callee's frame: then it left that
+/// caller's frames. gexrt's mark is only a hint (its entry stack pointer
+/// goes stale when a trap skips an entry's restore).
+pub(crate) fn innermost_native_unwound(caller: &Caller<'_, HostState>, sp: u64) -> bool {
+    caller
+        .data()
+        .callouts
+        .last()
+        .is_some_and(|co| co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD && sp > co.sp_want + co.unwound)
+}
+
+/// The same for a guest call from native Wine (its return address is
+/// `tramp::NATIVE_RETURN_PAD`): the callee's frame is built just below the
+/// native caller's (gexrt `__gexw_guest_call`), so anything past its
+/// arguments is the native frames' and the guest has left them -- a catch
+/// block continuing in an outer frame. Its native callers then leave
+/// (gexrt's `run_until` drops them), instead of the guest running on
+/// nested inside them.
+const NATIVE_UNWOUND: u64 = 512;
 
 /// The table-0 slot dispatch reaches `pc` through, as the directory says now.
 fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<u64> {
@@ -4441,7 +4503,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
-    caller.data_mut().callouts.push(Callout { ret, sp_want, slot: None, live: false });
+    let unwound = if ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD { NATIVE_UNWOUND } else { CALLOUT_UNWOUND };
+    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
     let mut next: Option<wasmtime::Func> = None;
@@ -4687,7 +4750,7 @@ fn recompile_object(
     map: &gex_kernel::CodeMap,
     seeds: &[u64],
 ) -> Result<()> {
-    if caller.as_context().data().jit.is_none() {
+    if caller.as_context().data().jit.is_none() || cfg!(not(feature = "translate")) {
         return Ok(());
     }
     // The interpreter maps its own segments before it has a kernel to ask, so
@@ -4772,7 +4835,7 @@ fn recompile_object(
                     .context("compiling a statically recompiled object")?
                     .module
             }
-            None => Module::new(&engine, &translated.wasm)
+            None => gex_cache::compile(&engine, &translated.wasm)
                 .context("validating a statically recompiled object")?,
         };
         let unit = publish_unit(&shared, translated, module, translated.n_blocks)?;
@@ -4863,6 +4926,9 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
 /// Record a taken resume's cause (set with `resume_at`) and target, under
 /// GEX_NT_STATS; `taker` names the loop that took it when no cause was set.
 pub(crate) fn note_resume(state: &mut HostState, target: u64, taker: &str) {
+    if state.nt.is_some() && profile::active() {
+        profile::note_nt_entry(target);
+    }
     let cause = state.resume_cause.take();
     if crate::ftab::stats_on() {
         crate::ftab::stats::note_resume_cause(cause.unwrap_or_else(|| format!("untagged ({taker})")), target);

@@ -17,10 +17,10 @@ gex-ir.workspace = true
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-emit.workspace = true
-gex-native.workspace = true
+gex-native = { workspace = true, features = ["translate"] }
 gex-kernel.workspace = true
-gex-eject.workspace = true
-gex-cache.workspace = true
+gex-eject = { workspace = true, features = ["build"] }
+gex-cache = { workspace = true, features = ["compile"] }
 anyhow = "1"
 
 [features]

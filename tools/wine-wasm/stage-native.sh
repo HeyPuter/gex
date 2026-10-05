@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# A Wine prefix whose DLLs are native wasm32 (docs/wine-native.md §3.14,
+# §3.15): the staged x86 prefix, with the named DLLs replaced by
+# skeletons over one module of Wine's PE side (pelink.py), beside them in
+# syswow64.
+#
+#   tools/wine-wasm/stage-native.sh WINE_BUILD WINE_SRC OUT DLL...
+#
+# WINE_BUILD is a wasm32 build tree of the Wine fork (winegcc there leaves
+# each DLL's relocatable object and export list), WINE_SRC its source. The
+# rest of the prefix links to the x86 one (GEX_WINE_PREFIX, default
+# ~/.cache/gex/wine-11.15), so the DLLs not named stay i386 code. Its
+# layout pins are dropped: they are for the x86 DLLs. GEX_WASM_SYSROOT must
+# be set (tools/wine-wasm/build-sysroot.sh).
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+[ $# -ge 4 ] || { sed -n 2,14p "$0" >&2; exit 2; }
+build=$(cd "$1" && pwd) src=$(cd "$2" && pwd) out=$3
+shift 3
+x86=${GEX_WINE_PREFIX:-$HOME/.cache/gex/wine-11.15}
+[ -f "$x86/.wine-version" ] || { echo "no staged Wine prefix at $x86 (tools/nt-stage-wine.sh)" >&2; exit 2; }
+: "${GEX_WASM_SYSROOT:?set GEX_WASM_SYSROOT}"
+winebuild=${WINEBUILD:-$(grep -m1 -o '[^ ]*/tools/winebuild/winebuild' "$build/Makefile")}
+[ -x "$winebuild" ] || { echo "no winebuild (WINEBUILD=...)" >&2; exit 2; }
+
+rm -rf "$out"
+mkdir -p "$out"
+# symbolic links: the prefix may be on another file system
+cp -rs "$x86/." "$out/"
+rm -f "$out/gex-layout"
+sys=$out/drive_c/windows/syswow64
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/stage-native.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+TMPDIR=$tmp python3 "$here/pelink.py" "$build" "$src" "$tmp/winepe.wasm" "$@"
+cp "$tmp/winepe.wasm" "$sys/winepe.wasm"
+for dll in "$@"; do
+    name=${dll%.*}
+    dir=$build/dlls/$name
+    [ -d "$dir" ] || dir=$build/programs/$name
+    spec=$src/${dir#$build/}/$name.spec
+    rm -f "$sys/$dll"
+    # shellcheck disable=SC2046
+    "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" --dll --fake-module \
+        --wasm-shared winepe.wasm -E "$spec" -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
+done
+echo "$out: ${*} native ($(du -h "$sys/winepe.wasm" | cut -f1) module)"

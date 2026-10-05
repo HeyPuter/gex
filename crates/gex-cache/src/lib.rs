@@ -264,8 +264,8 @@ pub fn load_or_compile(
     }
 
     let (wasm, metadata) = build()?;
-    let module = Module::new(engine, &wasm).map_err(anyhow::Error::from).context("validating translated wasm")?;
-    if let Ok(serialized) = module.serialize().map_err(anyhow::Error::from) {
+    let module = compile(engine, &wasm).context("validating translated wasm")?;
+    if let Some(serialized) = serialize(&module) {
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
@@ -297,11 +297,80 @@ pub fn load_or_compile_at(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<M
             }
         }
     }
-    let m = Module::new(engine, wasm).map_err(anyhow::Error::from).context("validating the module")?;
-    if let (Ok(bytes), Some(dir)) = (m.serialize().map_err(anyhow::Error::from), path.parent()) {
+    let m = compile(engine, wasm).context("validating the module")?;
+    if let (Some(bytes), Some(dir)) = (serialize(&m), path.parent()) {
         store(dir, path, &bytes);
     }
     Ok(m)
+}
+
+/// A compiled module's artifact, when this build can write one.
+#[cfg(feature = "compile")]
+fn serialize(m: &Module) -> Option<Vec<u8>> {
+    m.serialize().ok()
+}
+
+#[cfg(not(feature = "compile"))]
+fn serialize(_m: &Module) -> Option<Vec<u8>> {
+    None
+}
+
+/// Where modules compiled ahead of time are kept by content
+/// (`GEX_PRECOMPILED`, an ejected project's): `<dir>/<sha256 of the wasm>.cwasm`.
+pub fn precompiled_dir() -> Option<PathBuf> {
+    std::env::var_os("GEX_PRECOMPILED").map(PathBuf::from)
+}
+
+fn content_name(wasm: &[u8]) -> String {
+    let mut h = sha256::Sha256::new();
+    h.update(wasm);
+    format!("{}.cwasm", sha256::hex(&h.finish()))
+}
+
+/// A module for `wasm`: compiled ahead of time and found by its content in
+/// [`precompiled_dir`], else compiled here. A runtime built without a
+/// compiler (no `compile` feature: an ejected project's) can only do the
+/// first, and says so when it cannot.
+pub fn compile(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    if let Some(dir) = precompiled_dir() {
+        if let Ok(bytes) = std::fs::read(dir.join(content_name(wasm))) {
+            // SAFETY: written by `precompile` with this runtime's engine
+            // configuration; `deserialize` rejects any other engine's.
+            if let Ok(m) = unsafe { Module::deserialize(engine, &bytes) } {
+                return Ok(m);
+            }
+        }
+    }
+    compile_here(engine, wasm)
+}
+
+#[cfg(feature = "compile")]
+fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    Module::new(engine, wasm).map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "compile"))]
+fn compile_here(_engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    anyhow::bail!(
+        "a {}-byte wasm module was not compiled ahead of time ({} in {}), and this runtime has no compiler",
+        wasm.len(),
+        content_name(wasm),
+        precompiled_dir().map(|d| d.display().to_string()).unwrap_or_else(|| "GEX_PRECOMPILED (unset)".into())
+    )
+}
+
+/// Compile `wasm` into `dir` by content, for a runtime without a compiler
+/// ([`compile`]).
+#[cfg(feature = "compile")]
+pub fn precompile(engine: &Engine, wasm: &[u8], dir: &Path) -> Result<()> {
+    let path = dir.join(content_name(wasm));
+    if path.exists() {
+        return Ok(());
+    }
+    let m = Module::new(engine, wasm).map_err(anyhow::Error::from)?;
+    std::fs::create_dir_all(dir)?;
+    store(dir, &path, &m.serialize().map_err(anyhow::Error::from)?);
+    Ok(())
 }
 
 /// Write an artifact, atomically enough that a concurrent reader never sees a

@@ -651,7 +651,12 @@ export async function runProgram(
       // `?cgen=1|2`: function-tier units (1 where one exists, 2 required for
       // a program image), read from the server's `/gex-cgen/` (a unit
       // cache, GEX_CGEN_CACHE's layout) with synchronous requests.
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: '/gex-cgen' } : undefined,
+      // `?cgenurl=` (an ejected project's build/web/cgen) instead.
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen' } : undefined,
+      // `?aot=1`: an ejected project's run, with no run-time translation (a
+      // miss stops the run, saying where).
+      jit: globalThis.GEX_NO_JIT ? false : undefined,
+      aot: globalThis.GEX_AOT ? true : undefined,
       denseDebug: !!globalThis.GEX_DENSE_DEBUG,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?forkskip=N`, in `extra` because the process that acts on it is a
@@ -815,3 +820,4 @@ export async function runProgram(
 }
 
 export { TerminalEnv };
+export { loadKernel as globalKernel };
