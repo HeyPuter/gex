@@ -897,6 +897,39 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   helps every load after the first), the shader translation off the
   critical path, and world generation (F, codegen).
 
+- **State at the shutdown (2026-10-05).** Head is the WIP commit "WIP:
+  compositor on WebGPU" on merge/eject9. Last measured good page: site22
+  (d1ad650c; 1.18x fps, world-up 36.7 s vs pewasm 30.2 s). The WIP is
+  untested (syntax only); do not package it before step 1.
+  - Done in the WIP: web/src/gpu-device.js (one shared device:
+    `requestGexDevice`, and `textureCanvas()`, an OffscreenCanvas whose
+    'webgpu' context hands Mesa a texture on that device, so gex_gl_display
+    copies each displayed frame into a texture the compositor samples);
+    mesa-gl.js takes `options.gpu`; compositor-worker.js: Painter, TextCache,
+    cursor on WebGPU (one pipeline, dynamic-offset uniforms, bind group per
+    texture, scene texture copied to the canvas, `describe()` async via
+    `Painter.read`), wl_shm uploads with `queue.writeTexture` from guest
+    memory, GL windows drawn from `glFrame().tex`, the frame skip keeps
+    working (GL frames enter the signature by presented serial), the
+    overlay/direct-present path and the webgl2 retry removed in the worker.
+  - Resume:
+    1. Page side: delete `#glOverlay`/`gl-rect` handling and the `present`
+       transfer in web/src/compositor.js (the worker ignores them now);
+       remove dom-compositor.js's `getContext('webgl2')` loseContext line.
+    2. Build the page, rsync into p-noita17/runtime/web/page, pack a site
+       (`eject-site.mjs p-noita17 site23 --bench`, copy site22.zcache), run
+       locally with play.mjs: check the GL frame's orientation (flip uv if
+       upside down), the format (Mesa configures the canvas format; sampled
+       BGRA reads correctly), titles, cursor, `describe()`.
+    3. tests/nt browser-gui (uses describe) and a GL demo page.
+    4. edger: ABBA vs pewasm (site22 as the before), world-up A/B
+       (`wup-ab.sh`), and a Chrome trace (`trace-edger.sh`) to confirm no
+       readback and no second context.
+    5. Then world-up's remaining levers (above): persistent SPIR-V->WGSL
+       cache, shader translation off the critical path; world generation to
+       F via the coordinator.
+  - Nothing of mine is running on gooner or edger.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).

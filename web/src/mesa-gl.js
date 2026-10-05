@@ -1,3 +1,4 @@
+import { requestGexDevice } from './gpu-device.js';
 // The guest's GL device, backed by Mesa's frontend and the gex_wgpu Gallium
 // driver on the browser's WebGPU.
 //
@@ -201,58 +202,10 @@ export class MesaGlDevice {
     const out = new MesaGlDevice();
     canvas.id = 'gex-gl';
     try {
-      if (!navigator.gpu) throw new Error('navigator.gpu unavailable');
-      // The first request can return null while Chromium's GPU process is
-      // still starting (seen on slower hosts); retry for up to ~5 s.
-      let adapter = null;
-      for (let i = 0; i < 20 && !adapter; i++) {
-        adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-        if (!adapter) await new Promise(r => setTimeout(r, 250));
-      }
-      if (!adapter) throw new Error('WebGPU adapter unavailable');
+      // The page's shared device (gpu-device.js): the compositor samples the
+      // frames this one draws, so it must be the same device.
+      const { adapter, device } = options.gpu ?? await requestGexDevice();
       out.#adapter = adapter;
-      const optional = ['texture-compression-bc', 'depth32float-stencil8',
-                        'rg11b10ufloat-renderable', 'depth-clip-control',
-                      'float32-filterable', 'float32-blendable',
-                        'clip-distances', 'dual-source-blending',
-                        'timestamp-query'];
-      // Each of these gates a GL extension st/mesa derives from format
-      // support: BC compression, ARB_depth_buffer_float, EXT_packed_float,
-    // and ARB_depth_clamp. clip-distances is not a format feature -- it is
-      // what lets a translated shader declare `enable clip_distances`, which
-      // is how gl_ClipDistance reaches WGSL at all.
-
-      // Absent ones are simply not requested; the driver asks the device what
-      // it actually got rather than assuming.
-      const requiredFeatures = optional.filter((f) => adapter.features.has(f));
-      // A device gets WebGPU's *default* limits unless it asks for more, and
-      // those defaults are well below what this adapter can do -- storage
-      // buffers in the vertex stage default to none at all. The driver reads
-      // the limits back from the device and sizes its caps from them, so
-      // anything not asked for here is capability the backend never sees.
-      //
-      // st/mesa needs 13 constant buffers per stage for
-      // ARB_uniform_buffer_object, which is GL 3.1; WebGPU guarantees only 12,
-      // so the driver backs the rest with storage buffers. Ask for everything
-      // up to what the driver is built for, clamped to the adapter --
-      // requesting above the adapter's maximum makes requestDevice reject.
-      const want = {
-        maxUniformBuffersPerShaderStage: 16,
-        maxStorageBuffersPerShaderStage: 16,
-        maxStorageBuffersInVertexStage: 16,
-        maxStorageBuffersInFragmentStage: 16,
-        // Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
-        // sample, so any wider attachment set fails on it -- GL 3.2 wants
-        // eight draw buffers of whatever format the application chose.
-        maxColorAttachmentBytesPerSample: 64,
-      };
-      const requiredLimits = {};
-      for (const [limit, wanted] of Object.entries(want)) {
-        const available = adapter.limits[limit];
-        if (typeof available === 'number' && available > 0)
-          requiredLimits[limit] = Math.min(available, wanted);
-      }
-      const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
       out.#device = device;
       countWebGpu();
       // And out of reach of the collector for as long as the page lives.
@@ -267,7 +220,6 @@ export class MesaGlDevice {
       // Not tidy. A GL device is created once or twice in a page's life, and
       // an object that outlives its owner is a cheaper mistake than a device
       // collected in the middle of a frame.
-      (globalThis.__gexWebGPU ||= []).push({ adapter, device, queue: device.queue });
       // Who destroyed it, if anyone does. `wgpuDeviceDestroy` from the wasm
       // side is this method in emdawnwebgpu, so a wrapper here names the
       // caller -- and a device that is destroyed stops doing anything without

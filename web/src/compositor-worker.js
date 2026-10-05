@@ -1,4 +1,5 @@
-// gex-wayland's output: a real compositor, in a worker, on one WebGL2 context.
+import { requestGexDevice, textureCanvas } from './gpu-device.js';
+// gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
 // arena (see `wl-bridge.mjs`); this reads them once a frame, uploads the rows
@@ -56,240 +57,203 @@ const COL = {
   shadow: [0, 0, 0, 0.35],
 };
 
-// -- GL ---------------------------------------------------------------------
+// -- WebGPU -------------------------------------------------------------------
+//
+// The scene is drawn with WebGPU on the device Mesa uses (gpu-device.js), so a
+// GL window's frame is a texture here like any other window's.
 
-const VERT = `#version 300 es
-// One unit quad, placed by a pixel rectangle. No vertex buffers: the corner
-// comes from gl_VertexID, so a draw is four bytes of uniform and a call.
-uniform vec4 uRect;      // x, y, w, h in output pixels
-uniform vec2 uOutput;    // output size in pixels
-uniform vec4 uTexRect;   // sub-rectangle of the texture to sample (0..1)
-out vec2 vUV;
-void main() {
-  vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
-  vec2 px = uRect.xy + corner * uRect.zw;
-  vec2 clip = vec2(px.x / uOutput.x * 2.0 - 1.0, 1.0 - px.y / uOutput.y * 2.0);
-  vUV = uTexRect.xy + corner * uTexRect.zw;
-  gl_Position = vec4(clip, 0.0, 1.0);
+const WGSL = /* wgsl */ `
+struct U {
+  rect: vec4f,      // x, y, w, h in output pixels
+  texRect: vec4f,   // sub-rectangle of the texture to sample (0..1)
+  color: vec4f,
+  output: vec2f,    // output size in pixels
+  mode: u32,        // 0 = texture, 1 = solid colour
+  swizzle: u32,     // 1 = the texture holds BGRA bytes (wl_shm)
+  opaque: u32,      // 1 = force alpha to 1 (XRGB has no alpha)
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var tex: texture_2d<f32>;
+struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+// One unit quad, placed by a pixel rectangle: the corner comes from the
+// vertex index, so a draw is a uniform slice and a call.
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+  let corner = vec2f(f32(i & 1u), f32((i >> 1u) & 1u));
+  let px = u.rect.xy + corner * u.rect.zw;
+  var o: V;
+  o.pos = vec4f(px.x / u.output.x * 2.0 - 1.0, 1.0 - px.y / u.output.y * 2.0, 0.0, 1.0);
+  o.uv = u.texRect.xy + corner * u.texRect.zw;
+  return o;
+}
+@fragment fn fs(v: V) -> @location(0) vec4f {
+  var c = textureSample(tex, samp, v.uv);
+  if (u.mode == 1u) { return u.color; }
+  if (u.swizzle == 1u) { c = c.bgra; }
+  if (u.opaque == 1u) { c.a = 1.0; }
+  return c;
 }`;
 
-const FRAG = `#version 300 es
-precision mediump float;
-uniform sampler2D uTex;
-uniform vec4 uColor;
-uniform int uMode;       // 0 = texture, 1 = solid colour
-uniform int uSwizzle;    // 1 = the texture is BGRA (wl_shm), 0 = RGBA
-uniform int uOpaque;     // 1 = force alpha to 1 (XRGB has no alpha)
-in vec2 vUV;
-out vec4 fragColor;
-void main() {
-  if (uMode == 1) {
-    fragColor = uColor;
-    return;
-  }
-  vec4 c = texture(uTex, vUV);
-  if (uSwizzle == 1) c = c.bgra;
-  if (uOpaque == 1) c.a = 1.0;
-  fragColor = c;
-}`;
+/** Bytes between two draws' uniforms: the minimum dynamic-offset alignment. */
+const SLOT = 256;
+const MAX_DRAWS = 1024;
 
-function compile(gl, type, src) {
-  const sh = gl.createShader(type);
-  gl.shaderSource(sh, src);
-  gl.compileShader(sh);
-  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-    throw new Error(`shader: ${gl.getShaderInfoLog(sh)}`);
-  }
-  return sh;
+/** A texture this compositor samples and writes: a window's pixels, a title. */
+function gpuTexture(device, w, h) {
+  return device.createTexture({
+    size: [Math.max(1, w), Math.max(1, h)],
+    format: 'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+  });
 }
 
 class Painter {
-  constructor(gl) {
-    this.gl = gl;
-    /** Whether another renderer draws in this context: then `begin` saves
-     *  its state and `end` puts it back. Nothing does today -- Mesa on
-     *  WebGPU presents into a canvas of its own. */
-    this.shared = false;
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
-    gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error(`link: ${gl.getProgramInfoLog(prog)}`);
+  constructor(device, context, format) {
+    this.device = device;
+    this.context = context;
+    this.format = format;
+    const module = device.createShaderModule({ code: WGSL });
+    this.layout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', hasDynamicOffset: true } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+      ],
+    });
+    const blend = { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' };
+    this.pipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.layout] }),
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint: 'fs', targets: [{ format, blend: { color: blend, alpha: blend } }] },
+      primitive: { topology: 'triangle-strip' },
+    });
+    // Linear and clamped, whatever the texture: the guest's GL frames are
+    // textures Mesa made, and sampling must not depend on their state.
+    this.sampler = device.createSampler({ minFilter: 'linear', magFilter: 'linear' });
+    this.uniforms = device.createBuffer({ size: SLOT * MAX_DRAWS, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.data = new ArrayBuffer(SLOT * MAX_DRAWS);
+    this.f32 = new Float32Array(this.data);
+    this.u32 = new Uint32Array(this.data);
+    this.white = gpuTexture(device, 1, 1);
+    device.queue.writeTexture({ texture: this.white }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1]);
+    this.groups = new WeakMap();
+    this.scene = null;
+  }
+
+  #group(tex) {
+    let g = this.groups.get(tex);
+    if (!g) {
+      g = this.device.createBindGroup({
+        layout: this.layout,
+        entries: [
+          { binding: 0, resource: { buffer: this.uniforms, size: 80 } },
+          { binding: 1, resource: this.sampler },
+          { binding: 2, resource: tex.createView() },
+        ],
+      });
+      this.groups.set(tex, g);
     }
-    this.prog = prog;
-    this.u = {
-      rect: gl.getUniformLocation(prog, 'uRect'),
-      output: gl.getUniformLocation(prog, 'uOutput'),
-      texRect: gl.getUniformLocation(prog, 'uTexRect'),
-      color: gl.getUniformLocation(prog, 'uColor'),
-      mode: gl.getUniformLocation(prog, 'uMode'),
-      swizzle: gl.getUniformLocation(prog, 'uSwizzle'),
-      opaque: gl.getUniformLocation(prog, 'uOpaque'),
-      tex: gl.getUniformLocation(prog, 'uTex'),
-    };
-    this.vao = gl.createVertexArray();
-    // A sampler, so what this draws does not depend on parameters set by
-    // whoever made the texture. The guest's own frames are textures Mesa
-    // created and left with the GL default filter -- mipmapped, with no
-    // mipmaps -- which samples as black and nothing says why. A sampler
-    // object overrides that for this unit without touching the texture, which
-    // matters because the texture is not ours.
-    this.sampler = gl.createSampler();
-    gl.samplerParameteri(this.sampler, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.samplerParameteri(this.sampler, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.samplerParameteri(this.sampler, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.samplerParameteri(this.sampler, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.useProgram(prog);
-    gl.uniform1i(this.u.tex, 0);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    return g;
   }
 
   begin(w, h) {
-    const gl = this.gl;
-    if (gl.isContextLost?.()) {
-      this.saved = null;
-      return false;
+    // The scene is drawn into a texture of its own and copied to the canvas:
+    // `describe` can read it back after the canvas texture has been presented.
+    if (!this.scene || this.scene.width !== w || this.scene.height !== h) {
+      this.scene?.destroy();
+      this.scene = this.device.createTexture({
+        size: [w, h],
+        format: this.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
     }
-    // Nobody else draws in this context (Mesa on WebGPU presents into a
-    // canvas of its own): nothing to save, and the
-    // fourteen queries below are each a synchronous round trip to the GPU
-    // process -- a tenth of this worker's time under Noita, on the thread
-    // that also runs Mesa. Set the state and draw.
-    if (!this.shared) {
-      this.saved = null;
-      this.#own(w, h);
-      return true;
-    }
-    // This context is shared: the guest's OpenGL runs in it too (see
-    // `startGl`). Two things follow, and both were learned the hard way.
-    //
-    // What it leaves behind -- a framebuffer, a scissor, a depth test -- is
-    // enough to make this draw nothing, or draw into something that is not
-    // the canvas. So the state this needs is set, not assumed.
-    //
-    // And what *this* leaves behind is just as bad the other way: the driver
-    // on the other side caches what it believes is bound and does not re-bind
-    // what it thinks is already right. Leaving framebuffer 0 bound sent the
-    // guest's next frame to the canvas instead of its own texture -- one
-    // frame drawn and then nothing, for ever. So `end` puts it all back.
-    this.saved = {
-      fb: gl.getParameter(gl.FRAMEBUFFER_BINDING),
-      program: gl.getParameter(gl.CURRENT_PROGRAM),
-      vao: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
-      unit: gl.getParameter(gl.ACTIVE_TEXTURE),
-      viewport: gl.getParameter(gl.VIEWPORT),
-      blend: gl.isEnabled(gl.BLEND),
-      scissor: gl.isEnabled(gl.SCISSOR_TEST),
-      depth: gl.isEnabled(gl.DEPTH_TEST),
-      stencil: gl.isEnabled(gl.STENCIL_TEST),
-      cull: gl.isEnabled(gl.CULL_FACE),
-      depthMask: gl.getParameter(gl.DEPTH_WRITEMASK),
-      colorMask: gl.getParameter(gl.COLOR_WRITEMASK),
-      blendSrc: gl.getParameter(gl.BLEND_SRC_ALPHA),
-      blendDst: gl.getParameter(gl.BLEND_DST_ALPHA),
-    };
-    gl.activeTexture(gl.TEXTURE0);
-    this.saved.tex0 = gl.getParameter(gl.TEXTURE_BINDING_2D);
-    this.saved.sampler = gl.getParameter(gl.SAMPLER_BINDING);
-    this.#own(w, h);
+    this.w = w;
+    this.h = h;
+    this.n = 0;
+    this.encoder = this.device.createCommandEncoder();
+    this.pass = this.encoder.beginRenderPass({
+      colorAttachments: [{ view: this.scene.createView(), loadOp: 'clear', storeOp: 'store',
+        clearValue: { r: COL.desktop[0], g: COL.desktop[1], b: COL.desktop[2], a: 1 } }],
+    });
+    this.pass.setPipeline(this.pipeline);
+    return true;
   }
 
-  /** The state this draws with, set rather than assumed. */
-  #own(w, h) {
-    const gl = this.gl;
-    gl.bindSampler(0, this.sampler);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.disable(gl.SCISSOR_TEST);
-    gl.disable(gl.DEPTH_TEST);
-    gl.disable(gl.STENCIL_TEST);
-    gl.disable(gl.CULL_FACE);
-    gl.colorMask(true, true, true, true);
-    gl.depthMask(false);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindVertexArray(this.vao);
-    gl.useProgram(this.prog);
-    gl.uniform1i(this.u.tex, 0);
-    gl.viewport(0, 0, w, h);
-    gl.uniform2f(this.u.output, w, h);
-  }
-
-  /** Put the context back the way the guest's driver believes it is. */
-  end() {
-    const gl = this.gl;
-    const s = this.saved;
-    if (!s) return;
-    this.saved = null;
-    // A context that has been lost answers every query with null. Restoring
-    // state from that throws, once per frame, and buries whatever actually
-    // went wrong -- so say what happened and stop.
-    if (!s.viewport || !s.colorMask) {
-      if (!this.lost) {
-        this.lost = true;
-        console.error('[compositor] the WebGL context was lost; the scene is not being drawn');
-      }
-      return;
-    }
-    gl.bindFramebuffer(gl.FRAMEBUFFER, s.fb);
-    gl.useProgram(s.program);
-    gl.bindVertexArray(s.vao);
-    gl.bindTexture(gl.TEXTURE_2D, s.tex0);
-    gl.bindSampler(0, s.sampler);
-    gl.activeTexture(s.unit);
-    gl.viewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
-    const set = (cap, on) => (on ? gl.enable(cap) : gl.disable(cap));
-    set(gl.BLEND, s.blend);
-    set(gl.SCISSOR_TEST, s.scissor);
-    set(gl.DEPTH_TEST, s.depth);
-    set(gl.STENCIL_TEST, s.stencil);
-    set(gl.CULL_FACE, s.cull);
-    gl.depthMask(s.depthMask);
-    gl.colorMask(s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
-    gl.blendFunc(s.blendSrc, s.blendDst);
+  #draw(x, y, w, h, tex, mode, color, swizzle, opaque, uv) {
+    if (this.n >= MAX_DRAWS) return;
+    const o = (this.n * SLOT) / 4;
+    const f = this.f32;
+    f[o] = x; f[o + 1] = y; f[o + 2] = w; f[o + 3] = h;
+    f[o + 4] = uv[0]; f[o + 5] = uv[1]; f[o + 6] = uv[2]; f[o + 7] = uv[3];
+    f[o + 8] = color[0]; f[o + 9] = color[1]; f[o + 10] = color[2]; f[o + 11] = color[3];
+    f[o + 12] = this.w; f[o + 13] = this.h;
+    this.u32[o + 14] = mode; this.u32[o + 15] = swizzle; this.u32[o + 16] = opaque;
+    this.pass.setBindGroup(0, this.#group(tex), [this.n * SLOT]);
+    this.pass.draw(4);
+    this.n++;
   }
 
   solid(x, y, w, h, color) {
-    const gl = this.gl;
-    gl.uniform1i(this.u.mode, 1);
-    gl.uniform4f(this.u.color, color[0], color[1], color[2], color[3]);
-    gl.uniform4f(this.u.rect, x, y, w, h);
-    gl.uniform4f(this.u.texRect, 0, 0, 1, 1);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    this.#draw(x, y, w, h, this.white, 1, color, 0, 0, [0, 0, 1, 1]);
   }
 
   textured(x, y, w, h, tex, { swizzle = 0, opaque = 0, uv = [0, 0, 1, 1] } = {}) {
-    const gl = this.gl;
-    gl.uniform1i(this.u.mode, 0);
-    gl.uniform1i(this.u.swizzle, swizzle);
-    gl.uniform1i(this.u.opaque, opaque);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.uniform4f(this.u.rect, x, y, w, h);
-    gl.uniform4f(this.u.texRect, uv[0], uv[1], uv[2], uv[3]);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (!tex) return;
+    this.#draw(x, y, w, h, tex, 0, [0, 0, 0, 0], swizzle, opaque, uv);
   }
+
+  end() {
+    this.pass.end();
+    if (this.n) this.device.queue.writeBuffer(this.uniforms, 0, this.data, 0, this.n * SLOT);
+    const out = this.context.getCurrentTexture();
+    this.encoder.copyTextureToTexture({ texture: this.scene }, { texture: out }, [this.w, this.h]);
+    this.device.queue.submit([this.encoder.finish()]);
+    this.pass = null;
+    this.encoder = null;
+  }
+
+  /** The last scene's pixels (`format` order), for tests. */
+  async read() {
+    if (!this.scene) return null;
+    const w = this.scene.width, h = this.scene.height;
+    const row = Math.ceil((w * 4) / 256) * 256;
+    const buf = this.device.createBuffer({ size: row * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: this.scene }, { buffer: buf, bytesPerRow: row }, [w, h]);
+    this.device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const src = new Uint8Array(buf.getMappedRange());
+    const px = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) px.set(src.subarray(y * row, y * row + w * 4), y * w * 4);
+    buf.unmap();
+    buf.destroy();
+    return { w, h, px };
+  }
+}
+
+/** A 2D canvas into a texture: titles, the fallback cursor. */
+function canvasTexture(device, cv) {
+  const tex = gpuTexture(device, cv.width, cv.height);
+  device.queue.copyExternalImageToTexture({ source: cv }, { texture: tex, premultipliedAlpha: false }, [cv.width, cv.height]);
+  return tex;
 }
 
 // -- text, for titlebars ----------------------------------------------------
 //
-// A titlebar needs a string drawn, and WebGL has no text. A 2D canvas does, so
-// each window's title becomes a small texture, remade only when the title
-// changes -- which for a running app is almost never.
+// A titlebar needs a string drawn. A 2D canvas draws it, and each window's
+// title becomes a small texture, remade only when the title changes -- which
+// for a running app is almost never.
 class TextCache {
-  #gl;
+  #device;
   #entries = new Map();
 
-  constructor(gl) {
-    this.#gl = gl;
+  constructor(device) {
+    this.#device = device;
   }
 
   get(text) {
     let e = this.#entries.get(text);
     if (e) return e;
-    const gl = this.#gl;
     const scale = 2; // drawn at 2x and minified, so the glyphs stay crisp
     const cv = new OffscreenCanvas(1, 1);
     let ctx = cv.getContext('2d');
@@ -302,19 +266,12 @@ class TextCache {
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'white';
     ctx.fillText(text, 0, cv.height / 2);
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    e = { tex, w: cv.width / scale, h: cv.height / scale };
+    e = { tex: canvasTexture(this.#device, cv), w: cv.width / scale, h: cv.height / scale };
     // A cache with no bound is a leak; titles change rarely and a session has
     // a handful of windows, so a small cap is plenty.
     if (this.#entries.size > 64) {
       for (const [k, v] of this.#entries) {
-        gl.deleteTexture(v.tex);
+        v.tex.destroy();
         this.#entries.delete(k);
         if (this.#entries.size <= 32) break;
       }
@@ -325,7 +282,7 @@ class TextCache {
 }
 
 /** The pointer image, drawn when no client has set one of its own. */
-function defaultCursor(gl) {
+function defaultCursor(device) {
   const s = 2;
   const cv = new OffscreenCanvas(12 * s, 19 * s);
   const ctx = cv.getContext('2d');
@@ -344,14 +301,7 @@ function defaultCursor(gl) {
   ctx.strokeStyle = 'black';
   ctx.lineWidth = 1;
   ctx.stroke();
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  return { tex, w: 12, h: 19 };
+  return { tex: canvasTexture(device, cv), w: 12, h: 19 };
 }
 
 // -- the compositor ---------------------------------------------------------
@@ -359,7 +309,7 @@ function defaultCursor(gl) {
 const key = (s) => `${s.token}:${s.client}:${s.surface}`;
 
 class Compositor {
-  #gl;
+  #device;
   #painter;
   #text;
   #cursorFallback;
@@ -374,8 +324,6 @@ class Compositor {
   #glSaid = '';
   #glSaidAt = 0;
   #glDraws = 0;
-  #probeFbo = null;
-  #glExtTex = null;
   #focus = null;
   #pointer = { x: 0, y: 0, over: null, buttons: 0 };
   #drag = null;
@@ -384,7 +332,7 @@ class Compositor {
   #frames = 0;
   #placed = 0;
   #stats = null;
-  /** A view onto guest memory can be refused by WebGL; then we stage a copy. */
+  /** A view onto guest memory can be refused by writeTexture; then we stage a copy. */
   #stagingOk = null;
   #staging = new Uint8Array(0);
   /** A short history of what the scene did, for when a picture is not enough. */
@@ -398,21 +346,20 @@ class Compositor {
    */
   #remembered = new Map();
 
-  constructor(canvas, channel, stats) {
+  /** `gpu`: the page's shared WebGPU device (gpu-device.js), Mesa's too. */
+  constructor(canvas, channel, stats, gpu) {
     this.#channel = channel;
     this.#stats = stats;
-    const gl = canvas.getContext('webgl2', {
-      alpha: false,
-      antialias: false,
-      depth: false,
-      preserveDrawingBuffer: true,
-    });
-    if (!gl) throw new Error('no webgl2 for the compositor');
-    this.#gl = gl;
+    const device = gpu.device;
+    const context = canvas.getContext('webgpu');
+    if (!context) throw new Error('no webgpu context for the compositor');
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format, alphaMode: 'opaque', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST });
+    this.#device = device;
     this.#canvas = canvas;
-    this.#painter = new Painter(gl);
-    this.#text = new TextCache(gl);
-    this.#cursorFallback = defaultCursor(gl);
+    this.#painter = new Painter(device, context, format);
+    this.#text = new TextCache(device);
+    this.#cursorFallback = defaultCursor(device);
     this.resize(canvas.width, canvas.height);
   }
 
@@ -539,7 +486,7 @@ class Compositor {
       if (live.has(k)) continue;
       const tex = this.#textures.get(k);
       if (tex) {
-        this.#gl.deleteTexture(tex.tex);
+        tex.tex.destroy();
         this.#textures.delete(k);
       }
       this.#note(`- ${k}`);
@@ -610,21 +557,13 @@ class Compositor {
   // -- uploads ------------------------------------------------------------
 
   #texture(k, w, h) {
-    const gl = this.#gl;
     let t = this.#textures.get(k);
     if (t && (t.w !== w || t.h !== h)) {
-      gl.deleteTexture(t.tex);
+      t.tex.destroy();
       t = null;
     }
     if (!t) {
-      const tex = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      t = { tex, w, h, serial: 0 };
+      t = { tex: gpuTexture(this.#device, w, h), w, h, serial: 0 };
       this.#textures.set(k, t);
     }
     return t;
@@ -634,8 +573,8 @@ class Compositor {
    * Upload what changed of one surface, reading the guest's memory in place.
    *
    * The rows are contiguous in the guest at `stride` bytes each, so a damage
-   * rectangle is uploaded as whole rows: `UNPACK_ROW_LENGTH` lets GL stride
-   * over the parts that did not change, and the sub-rectangle costs one call.
+   * rectangle is one writeTexture with the guest's stride as `bytesPerRow`,
+   * straight out of the guest's (shared) memory.
    */
   #upload(k, s) {
     // Nothing to read: `addr` names no buffer, which is the case for a window
@@ -646,7 +585,6 @@ class Compositor {
     // window can have both: a background the server painted, with the GL
     // frame drawn over it.
     if (!s.addr) return true;
-    const gl = this.#gl;
     const mem = this.#memoryOf(s.token);
     if (!mem) return false;
     const t = this.#texture(k, s.width, s.height);
@@ -665,7 +603,6 @@ class Compositor {
       t.serial = s.serial;
       return true;
     }
-    const rowWords = Math.floor(s.stride / 4);
     const start = s.addr + y * s.stride + x * 4;
     const need = (h - 1) * s.stride + w * 4;
     if (start + need > mem.length) {
@@ -675,12 +612,9 @@ class Compositor {
       this.#note(`! ${k} buffer at ${start}+${need} past ${mem.length}`);
       return false;
     }
-    gl.bindTexture(gl.TEXTURE_2D, t.tex);
-    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, rowWords);
     let view;
     if (this.#stagingOk === false) {
-      // WebGL refused a SharedArrayBuffer view, so one staging copy it is --
-      // still three fewer copies than the path this replaced.
+      // A SharedArrayBuffer view was refused, so one staging copy it is.
       if (this.#staging.length < need) this.#staging = new Uint8Array(need);
       this.#staging.set(mem.subarray(start, start + need));
       view = this.#staging.subarray(0, need);
@@ -688,18 +622,17 @@ class Compositor {
       view = mem.subarray(start, start + need);
     }
     try {
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, view);
+      this.#device.queue.writeTexture({ texture: t.tex, origin: { x, y } }, view,
+        { offset: 0, bytesPerRow: s.stride, rowsPerImage: h }, { width: w, height: h });
       if (this.#stagingOk === null) this.#stagingOk = true;
     } catch (e) {
       if (this.#stagingOk === null) {
         // Once, and then never again: fall back and redo this upload.
         this.#stagingOk = false;
-        gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
         return this.#upload(k, s);
       }
       throw e;
     }
-    gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
     t.serial = s.serial;
     return true;
   }
@@ -757,103 +690,29 @@ class Compositor {
 
   #drawSurface(k, win) {
     const f = this.#frameOf(win);
-    // A window whose pixels are the host's GL, not the guest's memory. The
-    // texture is already in this context, and upside down relative to
-    // everything else here: GL's origin is bottom-left.
+    // A window whose pixels are the host's GL, not the guest's memory: Mesa's
+    // frame, a texture on this device (gpu-device.js textureCanvas).
     const gl = this.#glSurface(win);
+    const t = this.#textures.get(k);
     // A frame for part of the window only (a Windows program's client area,
     // under a title bar and borders it drew itself): the window's own pixels
     // first, then the frame over its rectangle.
     const r = gl && win.info?.glRect;
-    if (r) {
-      const t = this.#textures.get(k);
-      if (t) {
-        this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
-          swizzle: 1,
-          opaque: win.info?.format === 1 ? 1 : 0,
-        });
-      }
-      this.#glDraws++;
-      if (gl.source) {
-        const tex = this.#uploadGlCanvas(gl);
-        if (tex) this.#painter.textured(f.x + r.x, f.y + r.y, r.w, r.h, tex, { opaque: 1 });
-      } else {
-        this.#painter.textured(f.x + r.x, f.y + r.y, r.w, r.h, gl.tex, { opaque: 1, uv: [0, 1, 1, -1] });
-      }
-      return;
-    }
     if (gl) {
       this.#glDraws++;
-      if (gl.source) {
-        // A canvas, not a texture: upload it and draw it like any other
-        // top-row-first image. See `glFrame`.
-        const tex = this.#uploadGlCanvas(gl);
-        if (tex) this.#painter.textured(f.x, f.y, win.width, win.height, tex, { opaque: 1 });
-        return;
+      if (r) {
+        if (t) this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, { swizzle: 1, opaque: win.info?.format === 1 ? 1 : 0 });
+        this.#painter.textured(f.x + r.x, f.y + r.y, r.w, r.h, gl.tex, { opaque: 1 });
+      } else {
+        this.#painter.textured(f.x, f.y, win.width, win.height, gl.tex, { opaque: 1 });
       }
-      // `uv` is an origin and a size, not two corners: flipping means starting
-      // at the top and walking down. Read as corners it samples one row of the
-      // frame across the whole window, which looks like vertical stripes in
-      // the right colours -- the gears, one scanline of them.
-      this.#painter.textured(f.x, f.y, win.width, win.height, gl.tex,
-                             { opaque: 1, uv: [0, 1, 1, -1] });
       return;
     }
-    const t = this.#textures.get(k);
     if (!t) return;
     this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
       swizzle: 1,
       opaque: win.info?.format === 1 ? 1 : 0,
     });
-  }
-
-  /** The WebGPU backend's frame, copied into a texture this context can draw.
-   *
-   * Every composited frame, because a canvas carries no serial of its own that
-   * says whether what is on it has changed. */
-  #uploadGlCanvas(frame) {
-    const gl = this.#gl;
-    try {
-      if (!this.#glExtTex) {
-        this.#glExtTex = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, this.#glExtTex);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      } else {
-        gl.bindTexture(gl.TEXTURE_2D, this.#glExtTex);
-      }
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame.source);
-      return this.#glExtTex;
-    } catch (e) {
-      this.#note(`gl canvas upload failed: ${e?.message || e}`);
-      return null;
-    }
-  }
-
-  /** What this context reads out of the guest's texture: the compositor's own
-   *  view of it, which is the only thing that says whether a black window is
-   *  a black frame or a texture this side cannot see. */
-  #glSample(f) {
-    if (!f?.tex) return 'none';
-    const gl = this.#gl;
-    try {
-      if (!this.#probeFbo) this.#probeFbo = gl.createFramebuffer();
-      const was = gl.getParameter(gl.FRAMEBUFFER_BINDING);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.#probeFbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, f.tex, 0);
-      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-      let px = new Uint8Array(4);
-      if (status === gl.FRAMEBUFFER_COMPLETE) {
-        gl.readPixels(Math.floor(f.w / 2), Math.floor(f.h / 2), 1, 1,
-                      gl.RGBA, gl.UNSIGNED_BYTE, px);
-      }
-      gl.bindFramebuffer(gl.FRAMEBUFFER, was);
-      return `${status.toString(16)} ${px[0]},${px[1]},${px[2]},${px[3]}`;
-    } catch (e) {
-      return `failed: ${e?.message || e}`;
-    }
   }
 
   /** The GL frame that belongs in this window, if one does.
@@ -883,12 +742,11 @@ class Compositor {
       this.#note(`gl attachment ${stamp}, frame ${f ? `${f.w}x${f.h} #${f.serial}` : 'none'}`
         + `, window ${win.token}:${win.surface} xid ${win.info?.xid ?? 0}`
         + `, drawn ${this.#glDraws}`
-        + `, sample ${this.#glSample(f)}`
         + `, device ${glDevice?.glState?.() ?? '?'}`);
     }
     // Per window, out of the device's list of them: see `glFrameFor`.
     const frame = glFrameFor(win);
-    return frame && (frame.tex || frame.source) ? frame : null;
+    return frame?.tex ? frame : null;
   }
 
   /** Children of a surface, in the order they should be drawn (above it). */
@@ -905,65 +763,34 @@ class Compositor {
     return out;
   }
 
-  #directKey = null;
-  #directRect = '';
   #lastSig = null;
   #skipped = 0;
 
-  /** What the output shows, as a string: equal strings, equal pixels. Null
-   *  when a GL frame is drawn into the scene (it changes every frame). */
+  /** What the output shows, as a string: equal strings, equal pixels (a GL
+   *  window's frame counted by its presented serial). */
   #signature() {
-    const parts = [this.#outW, this.#outH, this.#focus, this.#pointer.x, this.#pointer.y, this.#directKey, this.#order.join(',')];
+    const parts = [this.#outW, this.#outH, this.#focus, this.#pointer.x, this.#pointer.y, this.#order.join(',')];
     for (const [k, win] of this.#windows) {
-      if (k !== this.#directKey && glFrameFor(win)) return null;
       const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
       parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
-        f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.serial ?? '-', JSON.stringify(win.info?.glRect ?? null));
+        f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.serial ?? '-', JSON.stringify(win.info?.glRect ?? null),
+        glFrameFor(win)?.serial ?? '');
     }
     return parts.join('|');
   }
 
-  /** Tell the page where the GL window is (or that it is not shown
-   *  directly), when that changed. */
-  #placeDirect(win) {
-    let m = { kind: 'gl-rect', visible: false };
-    if (win) {
-      const f = this.#frameOf(win);
-      const r = win.info?.glRect;
-      m = r ? { kind: 'gl-rect', visible: true, x: f.x + r.x, y: f.y + r.y, w: r.w, h: r.h }
-        : { kind: 'gl-rect', visible: true, x: f.x, y: f.y, w: win.width, h: win.height };
-    }
-    const key = JSON.stringify(m);
-    if (key === this.#directRect) return;
-    this.#directRect = key;
-    postMessage(m);
-  }
-
   frame() {
     const { byKey, blocks } = this.#reconcile();
-    const gl = this.#gl;
     // Upload every surface whose content moved on.
     for (const [k, s] of byKey) {
       const t = this.#textures.get(k);
       if (t && t.serial === s.serial) continue;
       this.#upload(k, s);
     }
-    // The GL window presents itself (glDirect) when it is the top toplevel
-    // with nothing over it: no popups, subsurfaces or floating windows.
-    this.#directKey = null;
-    if (glDirect) {
-      const tops = this.#order.filter((k) => this.#windows.get(k)?.role === ROLE_TOPLEVEL);
-      const top = tops[tops.length - 1];
-      const win = top && this.#windows.get(top);
-      if (win && glFrameFor(win)?.source && !this.#childrenOf(top).length && !this.#floating().length) {
-        this.#directKey = top;
-      }
-      this.#placeDirect(this.#directKey ? this.#windows.get(this.#directKey) : null);
-    }
-    // Nothing on the output changed (the GL window, which changes every
-    // frame, presents itself): draw nothing, so the canvas pushes no new
-    // frame. A pushed WebGL frame is a full readback where the browser
-    // composites in software (headless), and wasted work everywhere else.
+    // Nothing on the output changed (no new GL frame either): draw nothing,
+    // so the canvas presents no new frame. A presented frame is a full
+    // readback where the browser composites in software (headless), and
+    // wasted work everywhere else.
     const sig = this.#signature();
     if (sig !== null && sig === this.#lastSig) {
       for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
@@ -977,27 +804,11 @@ class Compositor {
       this.#lastSig = null;
       return;
     }
-    gl.clearColor(...COL.desktop);
-    gl.clear(gl.COLOR_BUFFER_BIT);
     // Windows bottom to top, each with its popups and subsurfaces above it.
     for (const k of this.#order) {
       const win = this.#windows.get(k);
       if (!win || win.role !== ROLE_TOPLEVEL) continue;
       this.#drawDecoration(win, this.#focus === k);
-      if (k === this.#directKey) {
-        // Its GL pixels are on the page, over this; a frame for part of the
-        // window only still has the window's own pixels around it.
-        this.#glDraws++;
-        const t = win.info?.glRect && this.#textures.get(k);
-        if (t) {
-          const f = this.#frameOf(win);
-          this.#painter.textured(f.x, f.y, win.width, win.height, t.tex, {
-            swizzle: 1,
-            opaque: win.info?.format === 1 ? 1 : 0,
-          });
-        }
-        continue;
-      }
       this.#drawSurface(k, win);
       for (const ck of this.#childrenOf(k)) {
         const child = this.#windows.get(ck);
@@ -1030,8 +841,6 @@ class Compositor {
       const c = this.#cursorFallback;
       this.#painter.textured(this.#pointer.x, this.#pointer.y, c.w, c.h, c.tex);
     }
-    // The guest's driver shares this context and caches what it thinks is
-    // bound: leave it as it was found.
     this.#painter.end();
     for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
     this.#frames++;
@@ -1231,11 +1040,6 @@ class Compositor {
       win.surface);
   }
 
-  /** Whether the guest's GL draws in this compositor's own context. */
-  shareContext(on) {
-    this.#painter.shared = on;
-  }
-
   /**
    * What the harness and the demo UI read.
    *
@@ -1245,8 +1049,7 @@ class Compositor {
    * pipeline. Sampled every fourth pixel, because this is asked for once a
    * second at most and the answer only has to be nonzero.
    */
-  describe() {
-    const gl = this.#gl;
+  async describe() {
     const wins = [...this.#windows.values()].filter((w) => w.role === ROLE_TOPLEVEL);
     let lit = 0;
     let brightest = 0;
@@ -1255,10 +1058,8 @@ class Compositor {
     // pixels of a button going darker.
     let hash = 2166136261;
     try {
-      const w = this.#outW;
-      const h = this.#outH;
-      const px = new Uint8Array(w * h * 4);
-      gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      const r = await this.#painter.read();
+      const px = r?.px ?? new Uint8Array(0);
       // Above the desktop's own colour, so the background does not count as
       // something drawn.
       const floor = Math.round(COL.desktop[2] * 255) + 12;
@@ -1269,7 +1070,7 @@ class Compositor {
         hash = ((hash ^ v) * 16777619) >>> 0;
       }
     } catch {
-      /* a context that is not current yet answers nothing */
+      /* nothing drawn yet */
     }
     return {
       frames: this.#frames,
@@ -1327,13 +1128,10 @@ function loop() {
 let glDevice = null;
 let glChannel = null;
 let glServing = false;
-// Where Mesa presents: a canvas of its own, because a canvas has one context
-// and WebGPU is not WebGL.
+// Where Mesa presents: a canvas whose WebGPU context is a texture on the
+// shared device (gpu-device.js textureCanvas), which the scene samples.
 let glTarget = null;
-let glPresentCanvas = null;
-// Whether glTarget is on the page (the overlay `hostGl` made): then a GL
-// window on top needs no upload, only its place on the page (`gl-rect`).
-let glDirect = false;
+let glFrames = null;
 
 /** What the guest last said its frames belong to, or null. */
 function glAttachment() {
@@ -1383,23 +1181,20 @@ function glFrameFor(win) {
   return null;
 }
 
-/** The frame itself, or null if there is none: `source` is a canvas to upload
- * from (WebGPU drew it, and nothing else can touch that texture). */
+/** The frame itself, or null if there is none yet: `tex` is the texture
+ * Mesa's last displayed frame was copied into (gex_gl_display). */
 function glFrame() {
-  if (!glPresentCanvas) return null;
-  const w = glPresentCanvas.width, h = glPresentCanvas.height;
-  if (w < 2 || h < 2) return null;   // still at its placeholder size
-  return { source: glPresentCanvas, w, h, serial: glDevice?.presentedCount?.() ?? 0 };
+  const tex = glFrames?.texture();
+  if (!tex || tex.width < 2 || tex.height < 2) return null;   // still at its placeholder size
+  return { tex, w: tex.width, h: tex.height, serial: glDevice?.presentedCount?.() ?? 0 };
 }
 
 async function startGl(m, canvas) {
-  // A WebGPU context cannot be created on a canvas that already has WebGL's,
-  // so gex_wgpu presents into one of its own and the frame reaches the scene
-  // as an upload. One copy per frame, GPU-side -- the price of the API that
-  // cannot share a texture with the one this compositor draws in.
-  glTarget = m.present ?? new OffscreenCanvas(16, 16);
-  glDirect = !!m.present;
-  comp?.shareContext(false);
+  // Mesa presents into a canvas of its own whose 'webgpu' context is a
+  // texture on the compositor's device: its frames are drawn into the scene
+  // like any window's, with no copy between APIs.
+  glFrames = textureCanvas();
+  glTarget = glFrames.canvas;
   // Emscripten looks a canvas up by selector, and a worker has no document.
   if (!globalThis.document) globalThis.document = { querySelector: () => glTarget };
   const { MesaGlDevice } = await import('./mesa-gl.js');
@@ -1408,9 +1203,9 @@ async function startGl(m, canvas) {
     api: m.api || 'core',
     env: m.mesaEnv,
     capture: m.glCapture,
+    gpu: await requestGexDevice(),
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
-  glPresentCanvas = glTarget;
   glChannel = m.channel;
   postMessage({ kind: 'gl-ready', describe: glDevice.describe() });
   serveGlRing();
@@ -1432,25 +1227,13 @@ self.onmessage = ({ data: m }) => {
   try {
     if (m.kind === 'init') {
       canvas = m.canvas;
-      // Chromium can refuse a WebGL2 context while its GPU process is still
-      // starting (as navigator.gpu.requestAdapter answers null then): retry
-      // for a few seconds before calling the compositor broken.
-      const start = (tries) => {
-        try {
-          comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null);
-        } catch (e) {
-          if (tries > 0 && /no webgl2/.test(e?.message)) {
-            setTimeout(() => start(tries - 1), 250);
-            return;
-          }
-          postMessage({ kind: 'error', error: e?.stack || String(e) });
-          return;
-        }
+      // The compositor draws with WebGPU on the device Mesa will use.
+      requestGexDevice().then((gpu) => {
+        comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);
         running = true;
         requestAnimationFrame(loop);
         postMessage({ kind: 'ready' });
-      };
-      start(40);
+      }).catch((e) => postMessage({ kind: 'error', error: e?.stack || String(e) }));
     } else if (m.kind === 'gl') {
       // The guest's GL, hosted here for the reason above. Reported rather
       // than thrown: a session whose GL will not start should still show its
@@ -1477,7 +1260,7 @@ self.onmessage = ({ data: m }) => {
     } else if (m.kind === 'key') {
       comp?.key(m.code, m.pressed, m.mods, m.time);
     } else if (m.kind === 'describe') {
-      postMessage({ kind: 'describe', id: m.id, state: comp?.describe() ?? null });
+      Promise.resolve(comp?.describe() ?? null).then((state) => postMessage({ kind: 'describe', id: m.id, state }));
     } else if (m.kind === 'stop') {
       running = false;
     }
