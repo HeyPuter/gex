@@ -83,6 +83,13 @@ fn instantiate(
 ) -> Result<()> {
     crate::ftab::catch_up(&mut *caller)?;
     let wasm = bytes_of(caller, bytes, len)?;
+    // `GEX_WASMJIT_DUMP=DIR`: keep every module the JIT hands over.
+    if let Some(dir) = std::env::var_os("GEX_WASMJIT_DUMP") {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{n:05}.wasm")), &wasm);
+    }
     let engine = caller.data().jit.as_ref().map(|j| j.engine.clone()).ok_or_else(|| anyhow!("wasmjit: no engine"))?;
     let module = {
         let key = {
@@ -96,7 +103,17 @@ fn instantiate(
         match map.get(&key) {
             Some(m) => m.clone(),
             None => {
-                let m = Module::new(&engine, &wasm).map_err(|e| anyhow!("compile: {e:#}"))?;
+                let m = match Module::new(&engine, &wasm) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // `GEX_DUMP_BAD_WASM=DIR`: keep a module the engine refused, as for gex's own.
+                        if let Some(dir) = std::env::var_os("GEX_DUMP_BAD_WASM") {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("wasmjit-{key:016x}.wasm")), &wasm);
+                        }
+                        bail!("compile: {e:#}")
+                    }
+                };
                 map.insert(key, m.clone());
                 m
             }
@@ -131,6 +148,10 @@ fn instantiate(
                     _ => Val::I32(v as u32 as i32),
                 };
                 wasmtime::Global::new(&mut *caller, wasmtime::GlobalType::new(gt.content().clone(), gt.mutability()), val)?.into()
+            }
+            ("x", "e") => {
+                let mut cx = caller.as_context_mut();
+                crate::libprov::tag(&mut cx)?.into()
             }
             ("h", idx) => {
                 let i: u64 = idx.parse().map_err(|_| anyhow!("import h.{idx}: not a table index"))?;
@@ -260,6 +281,35 @@ pub(crate) fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             2 => {
                 let Some(f) = table_get(&mut caller, table, a) else { return Ok(-1) };
                 Ok(f.ty(&caller).params().len() as i64)
+            }
+            // SIG: table[a]'s function type, packed: bits 0..4 the parameter count, 5..7 the result (0 none,
+            // 1 i32, 2 i64, 3 f32, 4 f64), then 2 bits a parameter from bit 8 (0 i32, 1 i64, 2 f32, 3 f64);
+            // -1 if empty or not representable (more than 28 parameters, or another type).
+            3 => {
+                let Some(f) = table_get(&mut caller, table, a) else { return Ok(-1) };
+                let ty = f.ty(&caller);
+                let code = |v: &wasmtime::ValType| match v {
+                    wasmtime::ValType::I32 => Some(0i64),
+                    wasmtime::ValType::I64 => Some(1),
+                    wasmtime::ValType::F32 => Some(2),
+                    wasmtime::ValType::F64 => Some(3),
+                    _ => None,
+                };
+                let params: Vec<_> = ty.params().collect();
+                let results: Vec<_> = ty.results().collect();
+                if params.len() > 28 || results.len() > 1 {
+                    return Ok(-1);
+                }
+                let mut packed = params.len() as i64;
+                if let Some(r) = results.first() {
+                    let Some(c) = code(r) else { return Ok(-1) };
+                    packed |= (c + 1) << 5;
+                }
+                for (i, p) in params.iter().enumerate() {
+                    let Some(c) = code(p) else { return Ok(-1) };
+                    packed |= c << (8 + 2 * i);
+                }
+                Ok(packed)
             }
             _ => bail!("provider_jit_table: unknown op {op}"),
         }

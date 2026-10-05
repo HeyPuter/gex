@@ -661,6 +661,12 @@ pub fn engine() -> Result<Engine> {
         config.wasm_memory64(true);
         config.memory_reservation(gex_abi::LIMIT64);
     }
+    // `GEX_NO_SIGNAL_TRAPS=1` (debugging): explicit bounds checks, so a wild address in generated code traps
+    // with a backtrace instead of faulting outside every guard region (which the signal handler cannot
+    // attribute and the process dies of).
+    if std::env::var_os("GEX_NO_SIGNAL_TRAPS").is_some() {
+        config.signals_based_traps(false);
+    }
     // gex's output is already optimised; Cranelift only adds register
     // allocation and peepholes, whose time dominates on a large program (half
     // a minute to compile SQLite vs under two seconds to translate).

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef void *P;
 static P (*mono_jit_init_version) (const char *, const char *);
@@ -149,6 +150,21 @@ main (int argc, char **argv)
 	P gr = mono_runtime_invoke (guest, NULL, NULL, &exc);
 	check ("Guest", exc);
 	printf ("Guest = %s\n", mono_string_to_utf8 (gr));
+	P work = mono_class_get_method_from_name (k, "Work", 1);
+	int wn = getenv ("EMBED_WORK") ? atoi (getenv ("EMBED_WORK")) : 200;
+	void *wargs [1] = { &wn };
+	P wr = NULL;
+	/* EMBED_REPS: run it again, timing each (the first includes the JIT's compiles) */
+	for (int rep = 0, reps = getenv ("EMBED_REPS") ? atoi (getenv ("EMBED_REPS")) : 1; rep < reps; rep++) {
+		struct timespec w0, w1;
+		clock_gettime (CLOCK_MONOTONIC, &w0);
+		wr = mono_runtime_invoke (work, NULL, wargs, &exc);
+		clock_gettime (CLOCK_MONOTONIC, &w1);
+		check ("Work", exc);
+		if (getenv ("EMBED_WORK"))   /* a timing, for the bench box only */
+			fprintf (stderr, "Work time %.3f s\n", (w1.tv_sec - w0.tv_sec) + (w1.tv_nsec - w0.tv_nsec) / 1e9);
+	}
+	printf ("Work(%d) = %lld\n", wn, *(long long *)mono_object_unbox (wr));
 	P back = mono_class_get_method_from_name (k, "Back", 0);
 	P br = mono_runtime_invoke (back, NULL, NULL, &exc);
 	check ("Back", exc);

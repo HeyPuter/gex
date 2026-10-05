@@ -572,12 +572,32 @@ Not yet:
     its OpenGL 4.5 device and **Muck's main menu renders completely** (scene,
     grass, UI) with all game code on .NET Mono. Native only, so no speed
     numbers (cold translation; the browser is the target).
+  - **wasmtime 49 (2026-10-05):** master fd8be1d1 merged (3718d0ca);
+    wasmtime 27 dropped. The 64-bit provider imports follow master's error
+    port (`crate::host`), the memory64 reservation is
+    `Config::memory_reservation`. Gate on 3718d0ca (BROWSER_NT=1, JOBS=6):
+    a64 452, x86 441, tests/nt 73/73 both ways, x86-programs and glibc,
+    lockstep, browser NT 49/0; output in `scratch/unity/gate2/`. Muck batch
+    mode, embed and the mem64-* programs (with and without --fjit) pass.
+  - **The --fjit hang (c330a519):** under --fjit Muck spun at "Begin
+    MonoManager ReloadAssembly": the function JIT followed UnityPlayer's
+    PLT into libmonobdwgc and published Boehm's own code over the provider's
+    bindings (GC_exclude_static_roots looping on the provider's
+    GC_next_exclusion). libprov records replaced text; `ftab::job` skips it.
+    Reload now takes 6.9 s with --fjit. embed has a --fjit leg.
   - **Speed observations:** pass `--fjit` to `muck-dotnet.sh` (it forwards
     gexc flags) for any speed observation. Without it UnityPlayer runs on
     tier-1, and the provider is interpreter-only. x2 (no `--fjit`, llvmpipe,
     gooner at load ~40) presented 0.3-0.5 frames/s at the menu, against
     17-23 fps for Unity's own Mono with `--fjit --mem64` on worldmachine.
     Neither number is a measurement; the browser on the bench box is.
+    Coordinator's correction (2026-10-05): on worldmachine (RX 6500 XT,
+    idle) the same menu without --fjit, interpreter only, runs 31.5-32.1
+    presents/s (GL drain 6.1 ms, readback 1.55 ms): gooner's numbers are
+    llvmpipe under load and the menu is not managed-bound. JIT gains are
+    measured on worldmachine (`BENCH_HOST=worldmachine scratch/bench/bench.sh`,
+    staged layout in `~/src/noita-wasm/scratch/coord-wm` there) in gameplay
+    or a managed-heavy scene.
   - **P5 started: the browser shim for a 64-bit memory (docs/mem64.md step
     6), 36e98cd5.** `GEX_MEM64=1 shims/browser/build.sh` (x86) builds the
     shim for wasm64-unknown-unknown (nightly, build-std): a 16 GiB memory64.
@@ -616,7 +636,52 @@ Not yet:
        tests/unity-dotnet/embed in node.
     4. Muck in the page: the provider plus the BCL served as files,
        graphics through Mesa (wink) and the page's Xwayland (`hostx=1`).
-    5. The fork's wasm JIT on wasm64. Assessment (2026-10-05): about
+    5. **In progress (the user: JIT first):** the fork's wasm JIT on
+       wasm64. Done (0651b922): `patches/0002-wasm-jit-gex.patch` makes
+       the runtime half build for gex (`WJ_RUNTIME`), with the JS parts as
+       host imports (`mini-wasm-gex.h`; `shims/native/src/wasmjit.rs`);
+       `GEXMONO_WASM_JIT=1` runs the whole pipeline (hotness, emit, host
+       compile and per-store instantiate, interpreter fallback) and embed
+       stays correct. The emitter now emits wasm64 (2df82f93): memory64
+       and table64 imports, `WASM_PTR`/`P_*` ops for pointer-width values,
+       pointer-typed locals, consts, returns and call types, the scratch
+       block laid out for 8-byte pointers (`WJ_SCR`), long immediates
+       (`WJ_LIMM`), no negative memarg offsets (memory64 does not wrap).
+       The interpreter's shared vcall/AOT-vcall caches pack 32-bit
+       pointers into i64 words and stay off on 64-bit; the worker-local
+       vcall PIC has a 64-bit entry ({vtable, f-slot, hits, target}, 24
+       bytes, four ways unrolled in the emitter; 368d3d66), and the C-side
+       vcall memo is on. Methods with exception clauses are JITted
+       (eccc327e): under a wasm64 provider `gex.provider_throw` is a wasm
+       exception with a per-store tag (`(i32)` code) that
+       `gex.provider_try` takes as the pending exception, JIT modules import
+       it as `x.e`, and an EH method's dispatch sits in a `try_table` in
+       place of the fork's legacy try/catch (wasmtime and current browsers
+       have only the new form). Still refused: localloc, LMF wrappers,
+       ldaddr of an argument, reflection residuals (as on wasm32). embed
+       (`scratch/unity/wj.sh [build] [THRESH]`, `wjrun.sh`): every result
+       right at threshold 1 (513 methods JITted, `T.Guest` catching a throw
+       from a guest icall among them), 0 invalid modules.
+       Speed (worldmachine, embed `T.Work(20000)` steady state, third call;
+       `EMBED_WORK`/`EMBED_REPS`, `scratch/unity/wm/work.sh`): interpreter
+       0.795 s, JIT 0.475 s. By part: virtual calls 0.342 -> 0.086,
+       interface/generic 0.244 -> 0.050, arithmetic 0.166 -> 0.016, enum
+       0.068 -> 0.127, reflection 0.081 -> 0.123, dictionary and exceptions
+       even. The first call also pays the compiles (Cranelift, one module
+       per method): 1.39 s. Muck runs natively with --fjit and the JIT
+       (batch mode, 894 methods JITted, no crash; the NREs from
+       SteamNetworking happen interpreted too). For speed observations use
+       `muck-dotnet.sh ... --fjit` (and `--env GEXMONO_WASM_JIT=1`).
+       Muck's menu on worldmachine (RX 6500 XT, --fjit, 800x600, mean fps
+       of the second half of 6 min; `scratch/unity/wm/muck.sh`):
+       interpreter 45.9, JIT 44.4, i.e. no change; the menu is not
+       managed-bound. Gameplay is out of reach for now: Host Lobby goes
+       through Steam's lobby API, and synthetic clicks (xdotool inside the
+       guest, XTest) do not reach the game through rootless Xwayland (a
+       Settings click opened nothing); input would have to come through
+       gex's compositor. Next: the JIT's remaining residual kinds
+       (reflection, enum), the delegate PIC on 64-bit, compile cost, the
+       page. Assessment (2026-10-05): about
        14,400 lines (`mini-wasm*.inc`, `mini-wasm.c`, `wasm-encoder.c`) on
        Mono's mini IR, with no wasm64 awareness. It is emscripten-bound:
        `EM_ASM` instantiation with `wasmTable`, a per-Worker publish
