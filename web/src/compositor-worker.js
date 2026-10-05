@@ -1403,10 +1403,25 @@ self.onmessage = ({ data: m }) => {
   try {
     if (m.kind === 'init') {
       canvas = m.canvas;
-      comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null);
-      running = true;
-      requestAnimationFrame(loop);
-      postMessage({ kind: 'ready' });
+      // Chromium can refuse a WebGL2 context while its GPU process is still
+      // starting (as navigator.gpu.requestAdapter answers null then): retry
+      // for a few seconds before calling the compositor broken.
+      const start = (tries) => {
+        try {
+          comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null);
+        } catch (e) {
+          if (tries > 0 && /no webgl2/.test(e?.message)) {
+            setTimeout(() => start(tries - 1), 250);
+            return;
+          }
+          postMessage({ kind: 'error', error: e?.stack || String(e) });
+          return;
+        }
+        running = true;
+        requestAnimationFrame(loop);
+        postMessage({ kind: 'ready' });
+      };
+      start(40);
     } else if (m.kind === 'gl') {
       // The guest's GL, hosted here for the reason above. Reported rather
       // than thrown: a session whose GL will not start should still show its
