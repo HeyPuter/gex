@@ -83,9 +83,21 @@ walk(join(project, 'runtime/web/page'), (p, rel) => place(p, rel));
 const cgen = nt.cgen;
 const units = join(project, cgen);
 let unitBytes = 0;
+// Only this build's units: a unit cache keeps every key it ever built
+// (a re-keyed rebuild leaves the old ones). build/build.json names the
+// images' units; the NT trampolines' unit is not an image, and is kept when
+// it was linked by this build (no older than the oldest image unit).
+const built = JSON.parse(readFileSync(join(project, 'build/build.json'), 'utf8'));
+const ids = new Set(built.images.map((i) => i.identity).filter(Boolean));
+const since = Math.min(...[...ids].map((k) => statSync(join(units, k, 'c.wasm')).mtimeMs)) - 60000;
+const current = (key) => ids.has(key) || (existsSync(join(units, key, 'c.wasm')) && statSync(join(units, key, 'c.wasm')).mtimeMs >= since);
+let stale = 0;
 walk(units, (p, rel) => {
-  const top = rel.split('/')[0];
+  const parts = rel.split('/');
+  const top = parts[0];
   if (['objects', 'recovery', 'precompiled'].includes(top)) return;
+  const key = top === 'regions' ? parts[1] : parts.length === 2 && /^[0-9a-f]{64}/.test(top) ? top : null;
+  if (key && !current(key)) { stale++; return; }
   if (rel.includes('/recovery/')) return;
   const name = rel.split('/').pop();
   const want = name === 'c.wasm' || name === 'c.entries'
@@ -194,4 +206,4 @@ Content-Encoding. nginx:
   }
 `);
 function mb(n) { return (n / 1048576).toFixed(1); }
-console.log(`${out}: build ${build}; ${Object.keys(files).length} packed files, ${mb(total)} MB -> ${mb(ztotal)} MB, plus ${mb(small)} MB unpacked small files; units ${mb(unitBytes)} MB raw`);
+console.log(`${out}: build ${build}; ${stale} files of superseded units left out; ${Object.keys(files).length} packed files, ${mb(total)} MB -> ${mb(ztotal)} MB, plus ${mb(small)} MB unpacked small files; units ${mb(unitBytes)} MB raw`);
