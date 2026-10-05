@@ -280,6 +280,11 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         }
     }
     let (key, mut providers) = unit_key(image, pe, base);
+    // The trampoline page's providers (gex-cgen/providers/nt_unixcall.c),
+    // bound at its entries after its unit, as an image's at its exports.
+    if pe.is_none() && base == gex_kernel::nt::TRAMPOLINES && image.class32 {
+        providers.extend(trampoline_providers());
+    }
     if let Some(pe) = pe {
         let dll = pe.exports.dll_name.to_ascii_lowercase();
         for (_, file) in lock(&STATEFUL).iter().filter(|(d, _)| *d == dll) {
@@ -371,6 +376,23 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) 
         .filter(|p| !p.binds.is_empty())
         .collect();
     (key, provided)
+}
+
+/// The NT trampoline page's providers, as [`unit_key`] gives an image's.
+fn trampoline_providers() -> Vec<Provided> {
+    use gex_kernel::nt::{boot::tramp, TRAMPOLINES};
+    let exports = gex_cgen::provider::trampoline_exports((tramp::UNIX_CALL_32 - TRAMPOLINES) as u32);
+    gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true)
+        .iter()
+        .map(|p| Provided {
+            file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
+            binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), TRAMPOLINES + rva as u64))).collect(),
+            stateful: None,
+            data: p.stateful,
+            skeleton: None,
+        })
+        .filter(|p| !p.binds.is_empty())
+        .collect()
 }
 
 /// Where unit `u`'s indirect-call profile is in the unit cache
