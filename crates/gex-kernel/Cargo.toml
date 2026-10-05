@@ -20,3 +20,6 @@ gex-gl.workspace = true
 x86 = ["gex-abi/x86"]
 # Serve a 32-bit big-endian PowerPC guest (docs/ppc.md).
 ppc = ["gex-abi/ppc"]
+# The global kernel module serving processes with a 64-bit memory (the
+# wasm64 browser shim, docs/mem64.md step 6): `PAddr` is u64.
+process64 = []

@@ -237,6 +237,10 @@ if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
         echo "shims/browser: the wasm64 build FAILED"; exit 1
     fi
     cp "$M64OUT" "$PUB/gex_browser$INFIX.m64.shared.wasm"
+    if [ -f "$PUB/gex_kernel$INFIX.m64.wasm" ] \
+       && ! node shims/browser/js/check-kernel.mjs "$M64OUT" "$PUB/gex_kernel$INFIX.m64.wasm"; then
+        echo "shims/browser: the wasm64 shim and gex_kernel$INFIX.m64.wasm disagree (GEX_MEM64=1 shims/kernel/build.sh)"; exit 1
+    fi
     $GEXC seed --mem64 -o web/public/gex/seed$INFIX.m64.shared.wasm >/dev/null
     echo "shims/browser: $(stat -c%s "$M64OUT") bytes (wasm64, memory64), seed$INFIX.m64.shared.wasm"
 fi

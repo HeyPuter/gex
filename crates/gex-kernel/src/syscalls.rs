@@ -5582,7 +5582,7 @@ impl Kernel {
         // and `listen` is local to itself, and what the far end can see is
         // only whether the name answers.
         if let Some(r) = self.unix_remote {
-            let id = (r.bind)(path.as_ptr() as u32, path.len() as u32);
+            let id = (r.bind)(path.as_ptr() as crate::PAddr, path.len() as u32);
             if id < 0 {
                 return Err(Errno(-id));
             }
@@ -5624,7 +5624,7 @@ impl Kernel {
         // is in *this* process's table and never in the kernel's, so the
         // local path is still tried when the kernel does not know the name.
         if let Some(r) = self.unix_remote {
-            let id = (r.connect)(path.as_ptr() as u32, path.len() as u32);
+            let id = (r.connect)(path.as_ptr() as crate::PAddr, path.len() as u32);
             if id >= 0 {
                 let flags = self.fds.get(fd)?.flags();
                 let cloexec = self.fds.cloexec(fd).unwrap_or(false);

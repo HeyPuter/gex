@@ -18,13 +18,20 @@
 /// 0; the process memory is appended to the import section, landing at 1.
 pub const PROCESS_MEMORY: u32 = 1;
 
+/// An address in the process memory: 64-bit when it is a memory64
+/// (`process64`, docs/mem64.md step 6), as `gex_kernel::PAddr`.
+#[cfg(feature = "process64")]
+pub type PAddr = u64;
+#[cfg(not(feature = "process64"))]
+pub type PAddr = u32;
+
 /// How many 64 KiB pages the calling process's memory has.
 ///
 /// `memory.size` can name a memory index (unlike a load), so this is how the
 /// kernel tells a valid guest pointer from one off the end and answers `EFAULT`
 /// rather than trapping the Worker mid-syscall with the kernel lock held.
 #[inline]
-pub fn process_pages() -> u32 {
+pub fn process_pages() -> PAddr {
     #[cfg(not(feature = "process64"))]
     let n: u32;
     #[cfg(feature = "process64")]
@@ -36,15 +43,15 @@ pub fn process_pages() -> u32 {
             n = out(local) n,
         );
     }
-    n as u32
+    n
 }
 
 /// Whether `at..at+len` is inside the calling process's memory. Every `push`
 /// and `pull` should be guarded by this: `memory.copy` traps rather than
 /// returning, and a trap mid-syscall kills the Worker holding the kernel lock.
 #[inline]
-pub fn in_process(at: u32, len: u32) -> bool {
-    let end = match at.checked_add(len) {
+pub fn in_process(at: PAddr, len: u32) -> bool {
+    let end = match at.checked_add(len as PAddr) {
         Some(e) => e as u64,
         None => return false,
     };
@@ -59,11 +66,9 @@ pub fn in_process(at: u32, len: u32) -> bool {
 /// rather than corrupting anything if it is not, but a trap here unwinds a
 /// syscall that has already taken the kernel lock.
 #[inline]
-pub unsafe fn pull(dst: *mut u8, src: u32, len: u32) {
+pub unsafe fn pull(dst: *mut u8, src: PAddr, len: u32) {
     // A memory64 process memory takes an i64 address; the kernel's own (and
     // the length, the smaller of the two index types) stay i32.
-    #[cfg(feature = "process64")]
-    let src = src as u64;
     unsafe {
         core::arch::asm!(
             "local.get {dst}",
@@ -82,9 +87,7 @@ pub unsafe fn pull(dst: *mut u8, src: u32, len: u32) {
 /// # Safety
 /// As [`pull`], with the roles reversed.
 #[inline]
-pub unsafe fn push(dst: u32, src: *const u8, len: u32) {
-    #[cfg(feature = "process64")]
-    let dst = dst as u64;
+pub unsafe fn push(dst: PAddr, src: *const u8, len: u32) {
     unsafe {
         core::arch::asm!(
             "local.get {dst}",
@@ -104,7 +107,7 @@ pub unsafe fn push(dst: u32, src: *const u8, len: u32) {
 /// # Safety
 /// `at..at+8` must be in bounds of the process memory.
 #[inline]
-pub unsafe fn read_u64(at: u32) -> u64 {
+pub unsafe fn read_u64(at: PAddr) -> u64 {
     let mut buf = [0u8; 8];
     unsafe { pull(buf.as_mut_ptr(), at, 8) };
     u64::from_le_bytes(buf)
@@ -115,7 +118,7 @@ pub unsafe fn read_u64(at: u32) -> u64 {
 /// # Safety
 /// `at..at+8` must be in bounds of the process memory.
 #[inline]
-pub unsafe fn write_u64(at: u32, v: u64) {
+pub unsafe fn write_u64(at: PAddr, v: u64) {
     let buf = v.to_le_bytes();
     unsafe { push(at, buf.as_ptr(), 8) };
 }
@@ -129,7 +132,7 @@ pub unsafe fn write_u64(at: u32, v: u64) {
 /// `dst` must be valid for `len` bytes in the kernel's own memory. The process
 /// side is checked here.
 #[inline]
-pub unsafe fn pull_checked(dst: *mut u8, src: u32, len: u32) -> bool {
+pub unsafe fn pull_checked(dst: *mut u8, src: PAddr, len: u32) -> bool {
     if !in_process(src, len) {
         return false;
     }
@@ -142,7 +145,7 @@ pub unsafe fn pull_checked(dst: *mut u8, src: u32, len: u32) -> bool {
 /// # Safety
 /// `src` must be valid for `len` bytes in the kernel's own memory.
 #[inline]
-pub unsafe fn push_checked(dst: u32, src: *const u8, len: u32) -> bool {
+pub unsafe fn push_checked(dst: PAddr, src: *const u8, len: u32) -> bool {
     if !in_process(dst, len) {
         return false;
     }

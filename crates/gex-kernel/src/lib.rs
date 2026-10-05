@@ -11,6 +11,16 @@
 
 #![forbid(unsafe_code)]
 
+/// An address in the calling process's memory as it crosses between a
+/// process's shim and the global kernel module (the remote ops below and the
+/// browser's `k_*` imports). 64-bit where that memory is a memory64: the
+/// wasm64 browser shim and the kernel module built to serve it
+/// (docs/mem64.md step 6). Everywhere else 32-bit, as it always was.
+#[cfg(any(target_arch = "wasm64", feature = "process64"))]
+pub type PAddr = u64;
+#[cfg(not(any(target_arch = "wasm64", feature = "process64")))]
+pub type PAddr = u32;
+
 pub mod errno;
 pub mod eventfd;
 pub mod file;
