@@ -3371,7 +3371,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             if op == gex_abi::cache_op::FTAB_TIER1 {
                 if std::env::var_os("GEX_WASM_TRACE").is_some() {
-                    eprintln!("gex: bridge hands {addr:#x} to tier-1");
+                    let memory = caller.data().memory.clone();
+                    let c = caller.data().thread.ctx_addr;
+                    let sp = memory.map(|m| GuestMem::new(m.bytes()).read_u64(c + ctx::x(4) as u64).unwrap_or(0)).unwrap_or(0);
+                    let w: Vec<String> = caller.data().callouts.iter().map(|c| format!("{:#x}@{:#x}", c.ret, c.sp_want)).collect();
+                    eprintln!("gex: bridge hands {addr:#x} to tier-1 (sp {sp:#x}, call-outs [{}])", w.join(" "));
                 }
                 if let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -3477,7 +3481,20 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(co) = caller.data().callouts.last() {
                 let ctx_addr = caller.data().thread.ctx_addr;
                 let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
-                if sp > co.sp_want + co.unwound {
+                // Not at a function's own address under a native caller (the
+                // bridge's poll there): leaving would hand the function back
+                // with the PC its body left for, which the bridge takes as
+                // "nothing served it" and gives the address to tier-1. The
+                // entry about to run sees the guest left and leaves itself
+                // (gex_nr::NATIVE_LEFT).
+                let at_function = || {
+                    co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD
+                        && caller.data().jit.as_ref().is_some_and(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.get(pc as u64).is_some())
+                };
+                if sp > co.sp_want + co.unwound && !at_function() {
+                    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+                        eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {sp:#x}, want {:#x})", co.ret, co.sp_want);
+                    }
                     let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
                     caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
                     return Err(StopExecution.into());
@@ -4055,10 +4072,15 @@ const CALLOUT_MAX_DEPTH: usize = 32;
 const CALLOUT_UNWOUND: u64 = 64 << 10;
 
 /// gex_nr::NATIVE_LEFT: whether the innermost call-out is a native caller's
-/// (gexrt has seen the guest leave its frames: it entered native code at or
-/// above that caller's entry). Otherwise the mark was stale.
-pub(crate) fn innermost_callout_native(caller: &Caller<'_, HostState>) -> bool {
-    caller.data().callouts.last().is_some_and(|co| co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD)
+/// and the guest, at `sp`, is above its callee's frame: then it left that
+/// caller's frames. gexrt's mark is only a hint (its entry stack pointer
+/// goes stale when a trap skips an entry's restore).
+pub(crate) fn innermost_native_unwound(caller: &Caller<'_, HostState>, sp: u64) -> bool {
+    caller
+        .data()
+        .callouts
+        .last()
+        .is_some_and(|co| co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD && sp > co.sp_want + co.unwound)
 }
 
 /// The same for a guest call from native Wine (its return address is

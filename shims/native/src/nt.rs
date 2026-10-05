@@ -483,10 +483,13 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
         // which gexrt left in ctx::BALLAST), one level flatter. A stale mark
         // (no native call-out innermost) just goes on.
         let target = read_u64(memory.bytes(), (ctx_addr + ctx::BALLAST as u64) as usize);
+        let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize) & 0xffff_ffff;
+        let left = crate::innermost_native_unwound(caller, sp);
         if std::env::var_os("GEX_WASM_TRACE").is_some() {
-            eprintln!("gex: native left at {}: call-outs {}, innermost native {}", p.describe_addr(target), caller.data().callouts.len(), crate::innermost_callout_native(caller));
+            let w: Vec<String> = caller.data().callouts.iter().map(|c| format!("{:#x}@{:#x}", c.ret, c.sp_want)).collect();
+            eprintln!("gex: native left at {} (sp {sp:#x}): call-outs [{}], leaving {left}", p.describe_addr(target), w.join(" "));
         }
-        if crate::innermost_callout_native(caller) {
+        if left {
             let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::x(0) as u64, target);
             caller.data_mut().callout_signal = Some(crate::CalloutSignal::Abort);
             return Err(StopExecution.into());

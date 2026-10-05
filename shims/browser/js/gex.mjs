@@ -3695,7 +3695,8 @@ export class Gex {
           // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
-          if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD) return 0;
+          if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
+              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) return 0;
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
