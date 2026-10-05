@@ -158,6 +158,16 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             let _ = gm.write_u32(base + functions + 4 * *idx as u64, target);
         }
     }
+    // winecrt0's base of this DLL: the skeleton's (after the module's data
+    // initialisation: at its install for the first DLL, now for later ones)
+    if let Some(off) = wp.data_exports.get(&format!("{dll}!__gexw_image_base")) {
+        let at = wp.data + *off as u64;
+        if first {
+            wp.pending.push((at, (base as u32).to_le_bytes().to_vec()));
+        } else {
+            let _ = GuestMem::new(crate::guest_bytes()).write_u32(at, base as u32);
+        }
+    }
     if dll == "ntdll.dll" {
         for (name, bytes) in ntdll_variables() {
             if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {

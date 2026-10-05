@@ -1,3 +1,6 @@
 LIBRARY kernel32.dll
 EXPORTS
 RaiseException@16
+LoadLibraryA@4
+GetProcAddress@8
+GetModuleHandleA@4

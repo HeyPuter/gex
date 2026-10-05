@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "gexmono-adapters.h"
 
 void mono_icall_table_init (void);
@@ -247,6 +249,20 @@ __attribute__((import_module ("gex"), import_name ("provider_jit_reserve"))) int
 void mono_jiterp_initialize_table (int type, int first_index, int last_index);
 
 
+/* MONO_WASM_JIT_STATS_EVERY=S (with MONO_WASM_JIT_STATS=1): the JIT's counters every S seconds, which the
+ * browser reads from JS. */
+void mono_wasm_jit_dump_stats (void);
+static void *
+stats_thread (void *arg)
+{
+	for (;;) {
+		sleep ((unsigned) (intptr_t) arg);
+		mono_wasm_jit_dump_stats ();
+		fflush (stdout);
+	}
+	return NULL;
+}
+
 static void
 preinit (void)
 {
@@ -262,8 +278,21 @@ preinit (void)
 	if (getenv ("GEXMONO_WASM_JIT") && atoi (getenv ("GEXMONO_WASM_JIT")) > 0) {
 		static char *opts [] = { "--no-jiterpreter-traces-enabled", "--no-jiterpreter-interp-entry-enabled",
 			"--no-jiterpreter-jit-call-enabled" };
+		/* The wasm64 bring-up's feature set: the core tier only. Each of these is a fast path with pointer
+		 * arithmetic of its own; they come back one at a time as they are ported (docs/unity-dotnet.md P5). */
+		static const char *const off [] = {
+			"MONO_WASM_JIT_INLINE_ALLOC", "MONO_WASM_JIT_T2", "MONO_WASM_JIT_GUARDED_INLINE", "MONO_WASM_JIT_DELEGATE_DEVIRT",
+			"MONO_WASM_JIT_IC_MID", "MONO_WASM_JIT_PRED_MID",
+			"MONO_WASM_JIT_LAZY_COLD", "MONO_WASM_JIT_FAST_TLS", "MONO_WASM_JIT_INLINE_COLD_THROW", "MONO_WASM_JIT_EH_REC",
+			"MONO_WASM_JIT_VCALL_VRET", "MONO_WASM_JIT_VCALL_AOT_WAYS", "MONO_WASM_JIT_LAZY_NOGC",
+			"MONO_WASM_JIT_DIRECT_DEPS", "MONO_WASM_JIT_PROF_ORIGIN", "MONO_WASM_JIT_PROF_INLINEE",
+		};
+		for (size_t i = 0; i < sizeof off / sizeof off [0]; i++)
+			setenv (off [i], "0", 0);
 		setenv ("MONO_WASM_JIT_AUTO", "1", 0);
-		setenv ("MONO_WASM_JIT_INLINE_ALLOC", "0", 0);
+		/* the 64-bit worker-local vcall PIC (way loop unrolled): four receivers per site */
+		setenv ("MONO_WASM_JIT_VCALL_WAYS", "4", 0);
+		setenv ("MONO_WASM_JIT_VCALL_MEMO", "1", 0);
 		mono_jit_parse_options (3, opts);
 		int n = getenv ("GEXMONO_WASM_JIT_SLOTS") ? atoi (getenv ("GEXMONO_WASM_JIT_SLOTS")) : 65536;
 		int64_t base = gexwj_host_reserve (n, 0);
@@ -271,6 +300,10 @@ preinit (void)
 			mono_jiterp_initialize_table (1 /* JITERPRETER_TABLE_JIT_CALL */, (int)base, (int)(base + n - 1));
 		else
 			fprintf (stderr, "[gexmono] no function-table slots for the wasm JIT\n");
+		if (getenv ("MONO_WASM_JIT_STATS_EVERY") && atoi (getenv ("MONO_WASM_JIT_STATS_EVERY")) > 0) {
+			pthread_t t;
+			pthread_create (&t, NULL, stats_thread, (void *) (intptr_t) atoi (getenv ("MONO_WASM_JIT_STATS_EVERY")));
+		}
 	} else
 		setenv ("MONO_WASM_JIT_AUTO", "0", 0);
 	gexmono_trace_on = getenv ("GEXMONO_TRACE") != NULL;

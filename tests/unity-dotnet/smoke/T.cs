@@ -69,5 +69,42 @@ public static class T {
     }
     return n;
   }
+  // A managed-heavy workload for the wasm JIT (virtual and interface calls, generics, boxing,
+  // enums, reflection): the same checksum interpreted and JITted.
+  abstract class Shape { public abstract double Area (); public virtual int Sides => 0; }
+  sealed class Sq : Shape { public double S; public override double Area () => S * S; public override int Sides => 4; }
+  sealed class Ci : Shape { public double R; public override double Area () => 3.0 * R * R; }
+  class Tri : Shape { public double B, H; public override double Area () => B * H / 2; public override int Sides => 3; }
+  interface IStep { int Step (int x); }
+  struct Add3 : IStep { public int Step (int x) => x + 3; }
+  class Mul2 : IStep { public int Step (int x) => x * 2; }
+  struct Pt { public int X; public long Y; }
+  static int Run<TS> (TS s, int x) where TS : IStep => s.Step (x);
+  [MethodImpl(MethodImplOptions.NoInlining)]
+  static int Thrower (int r) { if (r % 30 == 0) throw new InvalidOperationException ("odd " + r); return 3; }
+  public static long Work (int n) {
+    long sum = 0;
+    var shapes = new List<Shape> ();
+    for (int i = 0; i < 64; i++)
+      shapes.Add (i % 3 == 0 ? new Sq { S = i } : i % 3 == 1 ? (Shape) new Ci { R = i } : new Tri { B = i, H = 2 });
+    IStep[] steps = { new Add3 (), new Mul2 () };
+    var d = new Dictionary<int, string> ();
+    var fx = typeof (Pt).GetField ("X");
+    for (int r = 0; r < n; r++) {
+      foreach (var sh in shapes) sum += (long) sh.Area () + sh.Sides;
+      for (int i = 0; i < 100; i++) sum += steps [i & 1].Step (i) + Run (new Add3 (), i);
+      var e = (DayOfWeek) Enum.ToObject (typeof (DayOfWeek), r % 7);
+      sum += e.ToString ().Length;
+      object boxed = new Pt { X = r, Y = 2L * r };
+      sum += (int) fx.GetValue (boxed);
+      d [r % 50] = r.ToString ();
+      sum += d [r % 50].Length;
+      if (r % 10 == 0) {
+        try { sum += Thrower (r); } catch (InvalidOperationException x) { sum += x.Message.Length; } finally { sum += 1; }
+        try { sum += int.Parse (r % 20 == 0 ? "x" : "12"); } catch (FormatException) { sum += 5; }
+      }
+    }
+    return sum;
+  }
   public static string Hello(string s) => "hello " + s + " from " + typeof(T).Assembly.GetName().Name + " ptr=" + IntPtr.Size;
 }

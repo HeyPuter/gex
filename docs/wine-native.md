@@ -1063,7 +1063,34 @@ plus `make -k`.
 - **master merged** (fd8be1d1, wasmtime49 landed; wt/wasmtime49 removed).
   `$W/check.sh` runs W's pre-gate checks: tests/nt both prefixes, tests/wasm32,
   browser NT both prefixes.
-- **CRTs (next):** native msvcrt needs an i386-semantics `except_wasm32.c`
+- **Native msvcrt and ucrtbase (merge/wine-crt 5e9b0618, fork f454cff22f8):**
+  tests/nt **61/61** with ntdll, kernelbase, kernel32, msvcrt and ucrtbase
+  native (`$W/pfx-crt`), including x86/msvc_cxxeh through native msvcrt.
+  - msvcrt's except_i386.c builds for wasm32 with gexrt doing its assembly
+    (wine/gex/runtime.h); vtables in C with a `.set`/`.hidden` alias;
+    thiscall calls into guest objects with ECX; vtbl wrappers in the
+    trampoline page (tramp::VTBL_WRAPPERS_32, re-keys the trampoline unit).
+  - minwindef.h had defined __stdcall empty on wasm32 (so entry thunks never
+    popped): now annotate("gex.stdcall"/"gex.thiscall"/"gex.fastcall").
+  - varargs adapters: the guest's stack is the va buffer; a printf (by name)
+    is relaid by its format (8-byte args 8-aligned).
+  - pelink: stubs for imports from i386 DLLs (LoadLibraryA/GetProcAddress
+    once, then a guest call); exports bound to the DLL that defines them.
+  - Since: msvcp140/concrt140/vcruntime140 native (vtables in assembly with
+    `.type`'d function references; thiscall methods always get entry
+    thunks); x87/SSE2 register-convention entry points (_CI*, _ftol,
+    __libm_sse2_*: gexrt's x87 pop and guest XMM access); `_chkesp` and
+    ntdll's `_allshl`/`_alldvrm`... as hand-written entries; win32u's
+    system-call stubs; winecrt0's image base from gex (`__gexw_image_base`,
+    a data export of every DLL that wasmdll writes). tests/nt 77/77 on
+    `$W/pfx-native` (3 DLLs), `$W/pfx-w32u` (9: + msvcrt, ucrtbase,
+    vcruntime140, msvcp140, concrt140, win32u) and the x86 prefix.
+  - `$W/noadapter.sh DLL` lists a DLL's function exports with no adapter.
+  - Open: `_vsnprintf_s`, the NtWow64*64 calls, guest FP control words
+    (`__control87_2` is a stub on wasm32), user32/gdi32 native.
+  - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
+    merge/wine-wasm after its gate.
+- **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
   (cxx_frame_handler, `_except_handler3/4`, `_setjmp`/`longjmp` on the guest
   context; catch blocks and filters as guest calls with EBP set,
   `continue_after_catch` as a guest-state load), CXX_USE_RVA off on wasm32,
