@@ -18,28 +18,45 @@ __attribute__((import_module("gex"), import_name("provider_stop_guest"))) void g
 __attribute__((import_module("gex"), import_name("provider_start_guest"))) void gexp_host_start_guest(void);
 __attribute__((import_module("gex"), import_name("provider_guest_stack_end"))) uint64_t gexp_host_guest_stack_end(uint64_t sp);
 
-/* A runtime's hooks at the crossing (a GC-safe region while in guest code). */
+/* A runtime's hooks at the crossing (a GC-safe region while in guest code).
+ * Entering from guest code and returning to it (an adapter: gexp_enter,
+ * gexp_return) are one pair; calling guest code and its return
+ * (gexp_call_guest) the other, whose cookie the caller keeps. A raise that
+ * abandons guest frames resets the entry pairs to a mark. */
 static void no_hook(void) {}
+static void *no_call_hook(void) { return 0; }
+static void no_call_return(void *cookie) {}
+static int no_mark(void) { return 0; }
+static void no_unwind(int mark) {}
 __attribute__((weak, alias("no_hook"))) void gexp_hook_to_guest(void);
 __attribute__((weak, alias("no_hook"))) void gexp_hook_from_guest(void);
+__attribute__((weak, alias("no_call_hook"))) void *gexp_hook_call_guest(void);
+__attribute__((weak, alias("no_call_return"))) void gexp_hook_call_return(void *cookie);
+__attribute__((weak, alias("no_mark"))) int gexp_hook_mark(void);
+__attribute__((weak, alias("no_unwind"))) void gexp_hook_unwind(int mark);
 
 void gexp_attach_thread(void)
 {
 	gexp_host_thread_register(&gexp_in_guest, &gexp_stop);
 }
 
+static void in_guest(int v)
+{
+	__atomic_store_n(&gexp_in_guest, v, __ATOMIC_SEQ_CST);
+	if (v && __atomic_load_n(&gexp_stop, __ATOMIC_SEQ_CST))
+		gexp_host_park();
+}
+
 void gexp_from_guest(void)
 {
-	__atomic_store_n(&gexp_in_guest, 0, __ATOMIC_SEQ_CST);
+	in_guest(0);
 	gexp_hook_from_guest();
 }
 
 void gexp_to_guest(void)
 {
 	gexp_hook_to_guest();
-	__atomic_store_n(&gexp_in_guest, 1, __ATOMIC_SEQ_CST);
-	if (__atomic_load_n(&gexp_stop, __ATOMIC_SEQ_CST))
-		gexp_host_park();
+	in_guest(1);
 }
 
 void gexp_stop_guest_threads(void)
@@ -119,7 +136,8 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	for (unsigned i = 0; i < c->nxmm && i < 8; i++)
 		*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16 * i) = c->xmm[i];
 	GEXP_X(ctx, 4) = sp;
-	gexp_to_guest();
+	void *cookie = gexp_hook_call_guest();
+	in_guest(1);
 	/* Run the guest until it returns to `ra`. A function body returns 1 when
 	 * its return went to the address its caller predicted; otherwise 0, with
 	 * PC where the guest continues (a longjmp inside the callee, a signal, a
@@ -139,7 +157,8 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	gexp_ctx = ctx;
 	gexp_depth = depth;
 	__gex_set_ctx((uint32_t)ctx);
-	gexp_from_guest();
+	in_guest(0);
+	gexp_hook_call_return(cookie);
 	GEXP_X(ctx, 4) = rsp0;
 	c->rax = GEXP_X(ctx, 0);
 	c->rdx = GEXP_X(ctx, 2);
@@ -177,6 +196,7 @@ int gexp_catching(void)
 uint64_t gexp_call_guest_catching(uint64_t fn, gexp_call *c)
 {
 	catching k = { catch_top, fn, c, 0, gexp_ctx, gexp_depth };
+	int mark = gexp_hook_mark();
 	for (int i = 0; i < 16; i++)
 		k.saved[i] = GEXP_X(k.ctx, i);
 	catch_top = &k;
@@ -191,6 +211,8 @@ uint64_t gexp_call_guest_catching(uint64_t fn, gexp_call *c)
 	gexp_ctx = k.ctx;
 	gexp_depth = k.depth;
 	__gex_set_ctx((uint32_t)k.ctx);
+	in_guest(0);
+	gexp_hook_unwind(mark);
 	if (code != GEXP_RAISE_CODE)
 		gexp_host_throw(code); /* someone else's: keep going */
 	return k.payload ? k.payload : 1;
