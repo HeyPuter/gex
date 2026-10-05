@@ -1289,8 +1289,29 @@ Steps:
     (musl `wt/musl-fork`, branch `gex-wasm32-fork` until gex-wasm32 takes
     it; sysroot `$W/sr-fork`, busybox `$W/bb-fork`, prefix
     `$W/pfx-gui-fork` built with that toolchain; `$W/check-fork.sh`).
-    Next: item 2 (ELF export providers: own branch, tell the coordinator
-    before gex-cgen re-keys).
+    **Resume (2026-10-05, parked for a restart):** merge/wine-fork (off
+    dbabed6b, which landed) has real fork natively and in the browser,
+    wasm32 programs in the browser, run-node `--busybox`, and the docs
+    (§3.11.1 design, §3.11.2 patch list). All new tests passed by hand:
+    tests/wasm32/run.sh (fork, signals, sjlj, threads), busybox.sh (both
+    cases), dll/run.sh + shared.sh, run-browser.sh (all four + busybox).
+    `$W/check-fork.sh wt/wine-fork` was interrupted after nt --no-cgen on
+    the x86 prefix, pfx-native and pfx-dev (77/77 each). Next steps:
+    1. rerun `$W/check-fork.sh ~/gex-sandbox/wt/wine-fork` to the end
+       (pfx-gui, pfx-gui-fork, cgen-prefix legs, browser nt incl.
+       pfx-gui-fork), fix anything, merge master, send the head to the
+       coordinator for a gate. The gate needs the sysroot built from
+       `wt/musl-fork` (`build-sysroot.sh OUT ~/gex-sandbox/wt/musl-fork`)
+       with binaryen (fetched, or GEX_BINARYEN) and busybox rebuilt with
+       build-busybox.sh (MMU config).
+    2. When it lands: fast-forward musl's gex-wasm32 to gex-wasm32-fork and
+       push.
+    3. musl patch reduction (the user's standing goal, §3.11.2): only two
+       shared-file lines remain (configure, epoll.h); look at whether the
+       SjLj runtime, dlopen registry and signal frames can live outside musl
+       (a gex wasm32 support library linked by wcc) without jank.
+    4. Then §5.1 item 2 (ELF export providers: own branch, tell the
+       coordinator before gex-cgen re-keys).
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
     merge/wine-wasm after its gate.
 - **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
