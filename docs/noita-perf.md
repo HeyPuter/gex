@@ -1733,3 +1733,19 @@ fast path, provider + layer).
    `cd wt/fjit; GEX_CGEN_CACHE=$PWD/target/nt-test-cgen-inl GEXC_RUN_FLAGS=--cgen tests/nt/run.sh $PWD/target/x86/release/gexc`
    and without GEXC_RUN_FLAGS; then main-thread items (mono_ns clock reads,
    tier-1 dispatch misses).
+
+### Stream F after the second reboot (2026-10-05 night; resume here; supersedes the above)
+
+- master e3917bac merged into merge/fjit (816c4a98; gex-cgen untouched by
+  master, so unit keys unchanged: bm-hu2/bm-hui still match).
+- Gating head for N1 (page default unguarded) without the inlining commit:
+  branch merge/fjit-ung (wt/fjit-ung) = master + 00806c66 (fdbb1d9e
+  re-applied, doc conflict resolved, commit message without bare ratios).
+- Client-state fast path (c2fa872b): tests/nt/src/glfast.c now checks
+  glEnable/DisableClientState on the fast path (a draw from client arrays
+  the layer only sees enabled through GL_FAST_ARRAYS, the colour array
+  off, the texture-coordinate array per client unit, 600k calls through
+  the ring). With a temporarily instrumented gexc: under --cgen 0 of the
+  600,006 client-state calls reached the layer (all in the provider);
+  under --no-cgen all 600,006 did. Both pass.
+- i1 (inlining A/B) running on edger: scratch/fjit/e/seq-i1.out.
