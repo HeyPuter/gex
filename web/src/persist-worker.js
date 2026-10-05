@@ -184,8 +184,18 @@ self.onmessage = (e) => {
     queue = queue.then(async () => {
       root = m.root.replace(/\/+$/, '');
       dbName = m.db;
-      mem = new WebAssembly.Memory({ initial: 1, maximum: 65535 });
-      const inst = await WebAssembly.instantiate(m.spec.module, { env: { memory: m.spec.memory, process: mem } });
+      // The process memory as the kernel build declares it: shared (the
+      // page's build) or not; a memory import's sharedness is part of its type.
+      let inst;
+      for (const shared of [true, false]) {
+        mem = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared });
+        try {
+          inst = await WebAssembly.instantiate(m.spec.module, { env: { memory: m.spec.memory, process: mem } });
+          break;
+        } catch (e) {
+          if (!shared) throw e;
+        }
+      }
       k = inst.exports;
       // The stack slot above every Worker's (PageTty's, which an ejected
       // program's page does not use: it has no terminal).

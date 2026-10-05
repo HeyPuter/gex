@@ -114,7 +114,10 @@ mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 
 // The launcher, the service worker and its decoder.
-const build = sha(JSON.stringify(files) + JSON.stringify(ntOut)).slice(0, 12);
+// The build: everything served, packed or not (a page-only change is a new build too).
+const smallHash = createHash('sha256');
+walk(out, (p, rel) => { smallHash.update(rel); smallHash.update(readFileSync(p)); });
+const build = sha(JSON.stringify(files) + JSON.stringify(ntOut) + smallHash.digest('hex')).slice(0, 12);
 writeFileSync(join(out, 'index.html'), readFileSync(join(here, 'eject-site/index.html'), 'utf8').replaceAll('@TITLE@', title));
 copyFileSync(join(here, 'eject-site/sw.js'), join(out, 'sw.js'));
 cpSync(join(here, 'eject-site/vendor'), join(out, 'vendor'), { recursive: true });
