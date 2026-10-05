@@ -86,6 +86,8 @@
     }
     if (m.args?.length) p.set('argv', JSON.stringify(m.args));
     if (m.gl) { p.set('gl', '1'); p.set('glbackend', 'wgpu'); }
+    // Diagnostics for the page itself, passed through.
+    for (const k of ['glpresent', 'mesaenv', 'trapstack']) if (q.has(k)) p.set(k, q.get(k));
     location.replace(`nt.html?${p}`);
   } catch (e) {
     fail(String(e?.message ?? e));
