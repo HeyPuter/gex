@@ -644,6 +644,51 @@ Notes:
   `p-noita15` (G1 group), `p-noita15g0`, `p-noita15m`, `p-noita16` (G1 +
   thrd), `p-noita16g0m`, `p-noita16lto` (partial).
 
+### State on gooner (2026-10-04, late; the pewasm-replacement block)
+
+First block on gooner (RESUME-ON-GOONER.md "E's first block"), before G3
+and the compositor. Paths: project root `~/gex-sandbox`, scratch
+`~/gex-sandbox/scratch/eject9` (`$S` below).
+
+- Step 0, rebuilt on gooner: `$S/build-native.sh` (gexc in target/x86,
+  gex-rt in target/x86-rt), `$S/bshim-gooner.sh` (shim, kernel, seed into
+  web/public/gex), Mesa: the batched-clear build copied from worldmachine
+  into `$S/mesa-out` (source with the patch committed, dbf66687, in
+  `$S/gexroot/third_party/mesa`; `$S/build-mesa.sh` rebuilds it), then
+  copied to web/public/gex; page `web/build-eject-page.sh $S/page17`
+  (needs `npm ci` in web/ once). `target/noita-prefix` = a copy of
+  `~/.cache/gex/wine-11.15` (the recording's DLL hashes match).
+- Project `$S/p-noita17`: `gexc eject noita/rec --out p-noita17 --web-shim
+  web/public/gex --web-page page17` (GEX_RT set), user/web-entries.txt from
+  p-noita16, seed pinned in user/files (pin.sh mod/save), no link groups
+  (G0), cg14 icall hints copied into build/units/icall, `JOBS=4 nice -n 19
+  ./build.sh` (log `$S/logs/build17.log`). After a page rebuild:
+  `rsync -a --delete $S/page17/ $S/p-noita17/runtime/web/page/`.
+- Checklist findings so far:
+  - **Audio: neither side has any.** FMOD's x86 DLL fails
+    `System::init` with FMOD_ERR_OUTPUT_INIT (51; Noita's logger.txt: "Error
+    initializing output device"): gex has no WASAPI device (mmdevapi is
+    never loaded), natively or in the page, so no bank is ever opened.
+    pewasm binds fmod/fmodstudio to `port/src/noita_fmod_silent.c` (an
+    interim binding with no output) and ships no banks. Real audio is a new
+    feature (an mmdevapi/WASAPI driver onto WebAudio, plus 1.2 GB of banks
+    to stream), for the coordinator to decide.
+  - **Saves did not persist** across page loads (the page's filesystem is
+    the global kernel's tmpfs). Added: `web/src/persist.js` (+
+    persist-worker.js, persist-db.js): `nt.html?persist=DIR&persistdb=NAME`
+    restores DIR from IndexedDB over the bundle, and a Worker snapshots DIR
+    out of the global kernel every 30 s, on hide and on pagehide (as
+    pewasm's IDBFS syncfs). The eject's nt.json says `persist` =
+    `<prefix>/drive_c/users`; index.html passes it unless `?persist=0`.
+    **Bench runs must pass `persist=0`** (page-run's Chromium profile
+    keeps IndexedDB between runs).
+  - Start-up marks for the world-up profile: `[nt-page] fetching/fetched/
+    untarred/running at T` and one `[unit] KEY MiB: load, compile` line per
+    unit (wall clock ms mod 1e7 on both).
+- Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
+  keys, holds, screenshots, evals, `persist` snapshots and reloads through
+  CDP input, as a person would).
+
 ## 7. Phases
 
 | | what | gate |
