@@ -695,6 +695,25 @@ Not yet:
        natively under gexc as well (wasmtime compiles the published
        modules), so native runs get the same tier.
   - Unity's remaining internal calls as they show up; then Stardew/Celeste.
+  - **Scripted input (2026-10-05):** `GEX_WL_INPUT=FILE` feeds the native
+    compositor timed `move`/`click`/`button`/`key`/`tap` events, timed from
+    its `frames N`th frame (`frames 0`: from its start), held until a client
+    has a seat and a surface. Checked end to end on worldmachine with
+    `tests/x11/xinput-echo.c` on the in-guest (rootful) Xwayland: motion, a
+    click and keys arrive. Muck's menu still ignores the clicks (unknown
+    why; Muck is set aside, see the coordinator's direction).
+  - **Hollow Knight (Unity 6000.0.61, linux-x64 Mono; 2026-10-05):** batch
+    mode loads the first scene natively with --fjit
+    (`muck-dotnet.sh` with `MUCK=<HK dir> EXE=hollow_knight.x86_64
+    UNITY_RELAUNCH=1 STEAM_APPID=367520`). Needed: a PIE rebuild of the
+    player's small main (`tests/games/unity-launcher.c`; Unity 6 links it at
+    0x200000, inside gex's reserved low region); `mono_dllmap_insert`
+    ignored; GC handles as the GC's raw values in runtime, CoreLib and
+    provider (Unity 6 tests a handle's bit 0 and its managed code calls
+    `GCHandle.FromIntPtr` on raw values); dead-handle reads tolerated; the
+    framework's x86-64 crypto and compression natives beside the BCL (HK's
+    localisation decrypts with AES). Next: HK with graphics on worldmachine,
+    keyboard script to gameplay, interpreter vs JIT.
 - **Resume (after the move; HEAD 1db5c816, `master` merged in):**
   0. The coordgate on this branch still lacks its browser NT step (it was
      stopped while E was timing), and nothing after 49a5773b has been

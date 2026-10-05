@@ -27,6 +27,9 @@ FW=${DOTNET_FW:-$(dirname "$(dotnet --list-runtimes | awk '/Microsoft.NETCore.Ap
 mkdir -p "$RUN/bcl" "$RUN/home"
 cp "$FW"/*.dll "$RUN/bcl/"
 cp "$OUT/lib/System.Private.CoreLib.dll" "$RUN/bcl/"
+# The framework's x86-64 natives that have no wasm64 build in the provider: P/Invokes to them go to
+# the guest (the provider's dl fallback), which loads them beside the BCL with the host's OpenSSL/zlib.
+cp "$FW"/libSystem.Security.Cryptography.Native.OpenSsl.so "$FW"/libSystem.IO.Compression.Native.so "$RUN/bcl/"
 if [ -n "${UNITY_RELAUNCH:-}" ]; then
 	# The game's executable rebuilt PIE (unity-launcher.c) among links to its files.
 	G="$RUN/game"; mkdir -p "$G"
