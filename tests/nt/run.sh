@@ -131,6 +131,11 @@ for arch in x64 x86; do
     check $arch/fixedbase-taken 0 "$allok" "$b/fixedbase.exe" taken
     # opengl32 through the generated transport (tools/gen_gl_compat.py).
     check_gl $arch/glcompat 0 "$allok" "$b/glcompat.exe"
+    # The GL calls the unix-call dispatcher's provider writes into the ring
+    # itself (i386; x64 makes them all through the layer).
+    check_gl $arch/glfast 0 "$allok" "$b/glfast.exe"
+    # A callee reading the ZF its caller set (MSVC's debug stack check).
+    check $arch/zfcall 0 "$allok" "$b/zfcall.exe"
     # A window that paints and runs a message loop (tests/nt/browser-gui.mjs shows it).
     check $arch/window 0 "shown${nl}bye" "$b/window.exe" 0
     # Code written, rewritten and reallocated at run time (a JIT).

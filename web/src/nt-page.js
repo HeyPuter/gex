@@ -72,6 +72,31 @@ async function fetchShared(url) {
   return out;
 }
 
+/** Compile the units a preload list names, a few at a time, streaming from
+ *  the network (or the service worker's cache); null if the list is gone. */
+async function preloadUnits(url) {
+  let list;
+  try {
+    list = await (await fetch(url)).json();
+  } catch {
+    return null;
+  }
+  const out = [];
+  let i = 0;
+  const one = async () => {
+    while (i < list.length) {
+      const [name, href] = list[i++];
+      try {
+        out.push([name, await WebAssembly.compileStreaming(fetch(href))]);
+      } catch (e) {
+        console.warn(`[nt-page] preload ${href}: ${e?.message ?? e}`);
+      }
+    }
+  };
+  await Promise.all([one(), one(), one(), one()]);
+  return out;
+}
+
 async function main() {
   // `?trapstack=1`: a trap's wasm frames, which name the shim function it
   // was in (runtime.js passes the switch to every Worker).
@@ -96,6 +121,9 @@ async function main() {
   canvas.style.height = `${h}px`;
   state.phase = 'fetching';
   mark('fetching');
+  // `preload=URL`: the units to compile while the bundle downloads (a JSON
+  // list of [module name, url]); every Worker then starts with them.
+  const preloading = q.get('preload') ? preloadUnits(q.get('preload')) : Promise.resolve(null);
   // `tar=a.tar,b.tar`: bundles laid over one another, later ones winning --
   // a small test program over a large cached bundle of its libraries.
   const trees = [];
@@ -142,6 +170,8 @@ async function main() {
   if (!env.some((e) => e.startsWith('GEX_WINE_PREFIX='))) env.push('GEX_WINE_PREFIX=/wine');
   if (!env.some((e) => e.startsWith('GEX_NT_STRICT='))) env.push('GEX_NT_STRICT=1');
   const gl = q.get('gl') === '1';
+  const preModules = await preloading;
+  if (preModules) mark(`compiled ${preModules.length} unit modules ahead`);
   state.phase = 'running';
   mark('running');
   if (persistDir) {
@@ -167,6 +197,7 @@ async function main() {
     wl: canvas,
     wlInput: canvas,
     hostX: q.get('hostx') === '1',
+    preModules,
   });
   state.status = status;
   state.phase = 'done';
