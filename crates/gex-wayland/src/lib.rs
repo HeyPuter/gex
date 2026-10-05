@@ -2157,10 +2157,17 @@ impl Client {
 
     /// Pointer moved to surface-local `(x, y)` in pixels.
     pub fn pointer_motion(&mut self, x: i32, y: i32, time: u32) {
-        let Some(ptr) = self.pointer else { return };
+        let Some(ptr) = self.pointer else {
+            trace_out("[wl] pointer motion before the client asked for a pointer");
+            return;
+        };
         // Before the enter, so the enter it may trigger carries this position.
         self.pointer_at = (x, y);
         if !self.ensure_pointer_enter() {
+            trace_out(&format!(
+                "[wl] pointer motion dropped: no surface to enter (target {:?}, focus {:?})",
+                self.pointer_target, self.focus_surface
+            ));
             return;
         }
         // motion(time, surface_x, surface_y)
