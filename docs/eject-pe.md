@@ -770,6 +770,67 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   after navigation on both (pewasm polled every 100 ms in the page; gex from
   the first `peek>0` stats line, `[world-up]` in page-run's output).
 
+- **Compositor worker, Chrome trace (`$S/trace-edger.sh`, page-run
+  `--trace`):** the 73% "native" was WebGL's
+  `GetResourceForPushFrame` -> `CopyRenderingResultsFromDrawingBufferToResource`
+  -> `ReadPixels`: headless Chromium composites in software, so every
+  frame the WebGL output canvas pushes is read back (2.9 s of 5 s), even
+  with the GL window presenting itself. The compositor now draws nothing
+  when the output has not changed (a signature of windows, textures,
+  pointer and focus; f68abb91's sibling commit), so no frame is pushed.
+  After it: the worker 52% busy, the GPU process 40%, no readbacks.
+  **ABBA (site18s): ejected 59.3, 55.7 vs pewasm 47.5, 45.4 = 1.24x**;
+  world-up 59 -> 49 s after the process start. (pewasm's page in the same
+  headless setting is measured the same way, so the pair stands; the
+  readback itself is a headless artifact that a GPU-composited browser
+  does not pay.)
+- **World-up, like for like (site18ir, pewasm's frame schedule):** pewasm
+  29.2-32.3 s after navigation, ejected 62.7-66.4 s (before the change
+  above). Timeline (process time): first present 6 s; Noita's init 6-26 s
+  (guest 16 s); menus 26-35 s (clicks at frames 60/120/180); loading
+  36-53 s (guest 8.3 of 10 s: world generation); 55-62 s mostly GL host
+  (5.6 s: shader translation); world 62 s. **The eject runs with
+  `-single_threaded_loading` (recorded) and pewasm does not**:
+  `eject-site.mjs --args ''` (site18m) runs AOT-only without it (no stops,
+  locally); its world-up A/B is `$S/wup-ab.sh`.
+- Mesa with pewasm's flags (SIMD + ThinLTO; meson release is already -O3):
+  `$S/build-mesa2.sh` with `GEX_MESA_CROSS2=$S/mesa-o3.ini` into
+  `$S/mesa-o3-out` (building).
+
+- **World-up A/B (edger, pewasm's click schedule, seconds after
+  navigation):** pewasm 29.2-32.3; ejected before the frame skip 62.7-66.4;
+  with it (site18is) 53.4-56.4; plus multi-threaded loading (site18m, no
+  `-single_threaded_loading`) 51.5-52.6 (and 51.7-57.2 against site18ir).
+  Multi-threaded loading runs AOT-only with no stops; worth keeping for a
+  shipped site (`--args ''`).
+  - Where the rest is (site18m, process time): first present 6 s; init
+    6-25 s, the main thread mostly blocked in the ConcRT condvar provider
+    (`cond_wait_`, 59% of 7-24 s) on the loader threads (4 threads, about 26 s
+    of guest time between them) and 24% in synchronous GL submits; menus
+    25-36 s; loading 36-52 s (one thread 10 of 10 s guest: world generation).
+    The loader and world-generation threads are guest code, so this is F's
+    side (codegen) unless a page profile shows otherwise; their Workers
+    start after the profiler attaches (`--profile` attaches at AT only).
+- **Merged master 5ab54ab2** (4da10a61; no gex-cgen change, keys kept).
+- **Mesa with SIMD + ThinLTO** (`$S/mesa-o3-out`, `$S/mesa-o3.ini`) against a
+  control from the same tree (`$S/mesa-ctl-out`; its replay matches the
+  copied worldmachine build in size): sites site18ctl / site18o3 (project
+  copies in `$S/p17v/`), ABBA queued (`$S/edger-mesa1.txt`).
+
+- **Mesa flags result (edger ABBA, 5 legs):** control 53.6, 56.8 vs SIMD +
+  ThinLTO 51.5, 56.9: no gain (noise); not adopted. pewasm 49.9 in the same
+  sequence (ejected 1.1x).
+- **The main-thread wait is gone:** after the frame skip, "GL previous
+  frame" is 1-3 ms per 10 s (was 2.3-2.7 s). Noita's main thread per 10 s:
+  guest 4.3-4.9 s, NT calls 2.1-2.2 s, waits 2.8-3.3 s, GL host 0.12 s. The
+  NT calls and GL submission are F's now; the compositor worker is no
+  longer on the critical path.
+- **Resume (E):** world-up (pewasm 30 s vs 52 s): profile the loader and
+  world-generation threads (attach the profiler before they start, e.g.
+  `--profile 2,40`), compare with pewasm's start-up; ship with
+  multi-threaded loading. Then the compositor items only if a profile
+  puts the worker back on the critical path.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
