@@ -1113,8 +1113,19 @@ Steps:
     `$W/pfx-native` (3 DLLs), `$W/pfx-w32u` (9: + msvcrt, ucrtbase,
     vcruntime140, msvcp140, concrt140, win32u) and the x86 prefix.
   - `$W/noadapter.sh DLL` lists a DLL's function exports with no adapter.
-  - Open: user32/gdi32 native (in progress: tests/nt 75/77 with them,
-    x86/input and x86/display crash), the NtWow64*64 calls. Then §5.1.
+  - **user32 and gdi32 native (8157fa81, fork ed2d0f5375b/87f806ced36):**
+    tests/nt 77/77 on `$W/pfx-gui` (11 DLLs: the 9 above + gdi32, user32),
+    browser x86 23/23. winebuild now makes adapters from the .spec when the
+    objects lack the signature, for renamed `-import` exports (user32's
+    GetKeyState is win32u's NtUserGetKeyState), and for 64-bit parameters
+    spelled as two words (NtWow64*64); pelink thunks caller/definition
+    signature mismatches and stubs (trapping, listed) what nothing defines.
+    FP control words are the guest's (`_controlfp`, `__control87_2`...);
+    va_list printfs are relaid like varargs; `_vsnprintf_s` fixed.
+  - W's check prefixes: `$W/pfx-native` (3 DLLs), `$W/pfx-dev` (9),
+    `$W/pfx-gui` (11); `$W/pfx-w32u` is the coordinator's gate copy (do not
+    restage while a gate runs). `$W/check.sh` runs them all.
+  - Next: §5.1 (the guest's Unix userland as native wasm).
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
     merge/wine-wasm after its gate.
 - **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
