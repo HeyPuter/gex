@@ -413,8 +413,81 @@ musl declares or converts:
   `CLONE_VM|CLONE_VFORK`) is a new process, a copy of the address space,
   starting at the same thread entry. The native shim makes it inside the
   syscall (the parent's wasm frames cannot be resumed elsewhere).
-- **Plain `fork()`** is unsupported (no stack to resume on).
+- **`fork()`** (and `vfork()`, which is `fork`) works by unwinding and
+  rewinding the wasm stack (§3.11.1).
 - **`execve`** of another wasm32 container works.
+
+#### 3.11.1 fork (2026-10-05)
+
+gex cannot copy a wasm call stack: its frames are the engine's, not
+linear memory. A program that links `fork` is instrumented after the
+link with binaryen's **asyncify** (`tools/wine-wasm/wcc`), which lets
+every function that can reach the `gex.fork_point` import save its locals
+and call position to a buffer in linear memory, return, and later be
+re-entered and resume from it. That is how WASIX forks. JSPI does not do
+it: it suspends one stack in place inside one instance and cannot
+duplicate it into another instance or Worker, and wasmtime has no
+equivalent.
+
+- **musl** (`src/process/wasm32/__gex_fork.c`; `arch/wasm32/syscall_arch.h`
+  sends `_Fork`'s constant `__syscall(SYS_fork)` there): every thread's
+  entry runs its function under a driver (`__gex_fork_run`, not
+  instrumented). `__gex_fork` maps a 1 MiB record (asyncify's `{cur, end}`
+  buffer, the C stack pointer) and calls `gex.fork_point`, where the host
+  starts the unwind; every frame up to the driver saves itself and
+  returns. The driver stops the unwind, notes its own function in the
+  record and makes the child with `clone(SIGCHLD)` (a new process: a copy
+  of the address space, record included) whose thread starts at the
+  thread entry and calls `__gex_fork_child`. Both start the rewind and
+  call the driver's function again; each frame restores itself and calls
+  its callee again down to `gex.fork_point`, where the host stops the
+  rewind. `fork` returns the pid in the parent and 0 in the child, the C
+  stack pointer as it was. Only the calling thread exists in the child.
+- **The host** (native `libprov.rs`, browser `#wasmprogImports`) gives the
+  program `gex.asyncify(op, arg)`, asyncify's exports on the calling
+  instance, and `gex.fork_point(rec)` (start unwind, or stop rewind). The
+  copy is the kernel's ordinary fork of a process; in the browser the
+  child's Worker installs the same module over the parent's data.
+- **wcc:** asyncify instruments only the functions `forkreach.py` finds can
+  reach `gex.fork_point` by a type-correct call graph (an indirect call of
+  type T reaches the table's functions of type T; any other traps), not
+  asyncify's default of everything that makes an indirect call. busybox:
+  403 KB uninstrumented, 638 KB with asyncify's own analysis, 540 KB with
+  the type-based one. asyncify cannot instrument `try_table` or tail calls,
+  so Unix-side code lowers setjmp onto the legacy exception instructions and
+  wcc translates them to the standard ones after (`--translate-to-exnref`),
+  and no wasm32 code uses tail calls (the libc is shared). A program that
+  never forks is not asyncified (only translated).
+- **Tests:** `tests/wasm32/fork.c` (fork without exec, separate memory;
+  from 20 frames deep through a function pointer, every frame's locals
+  intact; in a threaded program), busybox as an MMU build (hush forks for
+  subshells, pipelines and `$(...)`), natively (`run.sh`, `busybox.sh`) and
+  in the browser (`run-browser.sh`).
+
+#### 3.11.2 What the musl fork changes, and why
+
+The user would rather have no musl fork; it is kept to an architecture
+port. Everything below is a file of the `wasm32` arch (new files, which
+upstream musl's layout already provides for), except two one-line changes
+to shared files. `git diff 0784374d` (musl 1.2.5) in `wt/musl-wasm` is the
+whole of it.
+
+| where | what | why |
+|---|---|---|
+| `configure` (1 line) | `wasm32*) ARCH=wasm32` | the target triple names the arch |
+| `include/sys/epoll.h` (1 line) | `epoll_event` packed on wasm32 too | the i386 kernel's 12-byte layout; wasm32 would pad it to 16 |
+| `arch/wasm32/*` | types, the i386 syscall numbers, `syscall_arch.h` (syscalls through `gex.syscall(ctx)`, signal frames at the return, `SYS_fork` to `__gex_fork`), atomics, `kstat` | the port itself |
+| `crt/wasm32/crt1.c` | entry from gex's `__gex_start`; main under fork's driver; `_init` runs `__wasm_call_ctors` | a wasm module has no `_start` gex can use, no `.init_array` |
+| `src/internal/wasm32/gex_thread.s` | `__gex_start` / `__gex_thread_start` (F_body entries), per-thread globals, C stack pointer get/set, handler calls | wasm has no registers to keep these in |
+| `src/thread/wasm32/*` | `__clone` (thread entry, new process), the child's start, thread area, `__unmapself`, `syscall_cp` | wasm has no stack switching or `clone` asm |
+| `src/env/wasm32/*` | TLS (wasm-ld's `__tls_base`), `main(void)` fallback | wasm-ld's TLS model |
+| `src/process/wasm32/*` | fork (asyncify), vfork as fork | §3.11.1 |
+| `src/setjmp/wasm32/*`, `src/signal/wasm32/*` | the SjLj runtime clang's lowering calls (`__wasm_setjmp`, `__wasm_longjmp`, the tag); signal frames, restorers | wasm EH, the signal model above |
+| `src/ldso/wasm32/*` | `dlopen`/`dlsym` over the closed-world registry | §3.12 |
+
+Removed 2026-10-05: the vfork emulation (a `vfork` macro in `unistd.h`,
+`execve`/`_Exit` overrides) and the constructor call patched into
+`__libc_start_main`.
 
 **Signals, the one control-flow difference.** gex cannot interrupt wasm
 code or move its PC, so signals are delivered at syscall returns:
@@ -1073,35 +1146,35 @@ Steps:
    natively instead of translated. Map `/bin/sh` and the coreutils names to
    it in the guest root (natively by a gexc option, in the page's bundle).
    Biggest win per effort: every script exec today translates dash/coreutils.
-   **State (2026-10-05, merge/wine-unix):** busybox 1.37.0 builds with
-   `tools/wine-wasm/build-busybox.sh OUT` (config `busybox.config`: NOMMU,
-   LFS, hush as sh, ~50 applets incl. sed/grep/awk/find/xargs, fancy tail;
-   ~400 KB of wasm). `gexc run --busybox B ...` mounts B read-only at
+   **State (2026-10-05, merge/wine-fork):** busybox 1.37.0 builds with
+   `tools/wine-wasm/build-busybox.sh OUT` (config `busybox.config`: an MMU
+   build with real fork (§3.11.1), LFS, hush as sh, ~50 applets incl.
+   sed/grep/awk/find/xargs, fancy tail; 540 KB of wasm). `gexc run --busybox B ...` mounts B read-only at
    `/bin/<applet>` and `/usr/bin/<applet>` for every applet
    (`BUSYBOX_APPLETS`; `GEX_BUSYBOX_APPLETS` overrides) and runs B for a
    program named `/bin/sh` etc.; `RunOptions.exe` makes `/proc/self/exe`
-   busybox, which hush re-executes for `$(...)` and subshells.
+   busybox. In the browser, `run-node.mjs --busybox B` bundles B as
+   `/bin/busybox` hard-linked at the same names (`busybox.applets`, one
+   list for both).
    tests/wasm32/busybox.sh (needs `BUSYBOX`) compares pipelines, command
    substitution, redirections, externals and exit statuses with the host
    sh, and runs busybox under a translated x86-64 shell.
-   - **vfork** (musl fork, `src/process/wasm32/__gexw_vfork.c`): gex cannot
-     fork a wasm32 program, so `vfork()` is a setjmp macro (unistd.h); the
-     "child" runs on the parent's stack with fds, cwd, umask, signal mask
-     and actions snapshotted; its `execve` is a posix_spawn of that state
-     (clone(VM|VFORK) is a new process) and its `_exit` spawns
-     `/proc/self/exe` with `__GEXW_VFORK_EXIT=N` to exit with the status;
-     then the parent's state is restored and vfork returns the pid. A child
-     that does more than dup/close/chdir/signals before exec (hush's NOMMU
-     paths re-exec, so busybox does not) would leak its changes into the
-     parent's memory, as a real vfork would.
-   - musl's `__libc_start_main` now calls `__wasm_call_ctors` (constructors
-     never ran on wasm32 before).
+   - **fork** is real (§3.11.1); the earlier vfork emulation (a setjmp
+     macro, exec and _exit as posix_spawn) is gone.
+   - The program's constructors run (crt1's `_init` calls
+     `__wasm_call_ctors`; they never ran on wasm32 before).
    - Fixed on the way: a wasm32 child switched the host-wide translator
      compat (i386) mode, breaking an x86-64 parent after its wait
      (`wasmprog::is_wasm32`). A translated *i386* child of an x86-64 parent
      still has that limitation (documented in `run_program_with`).
-   - Not yet: the page bundle's `/bin/sh` mapping (browser `--busybox`),
-     and the prefix scripts' use of it.
+   - Browser: native wasm32 programs run in the browser runtime
+     (`shims/browser/src/cgen/wasmprog.rs`): their system calls never give
+     the stack back except to end the program's frames, so a blocking call
+     parks the Worker in place, and a thread or a child is staged and handed
+     to the host from the program's `gex.syscall`. A wait on the page itself
+     (its keyboard, the Worker's own network) is polled, since the frames
+     hold the Worker's event loop.
+   - Not yet: the prefix scripts' use of it.
 2. **ELF export providers** for glibc's hot entry points (`memcpy`/`memset`/
    `str*`, `malloc` family, libm), the PE providers' model on ELF images;
    needs gex-cgen's provider binding by ELF symbol (gex-cgen re-keys units:
@@ -1134,7 +1207,7 @@ Steps:
 | gex side (this plan, tools/wine-wasm, shim, tests) | `wt/wine`, branch `merge/wine-wasm` |
 | wasmtime 49 upgrade (rustc 1.96 pinned) | `wt/wasmtime49`, branch `merge/wasmtime49` |
 | Wine fork | `wt/wine-wasm`, branch `wasm32`, remote `mw` |
-| musl fork | `wt/musl-wasm`, branch `gex-wasm32`, remote `mw` |
+| musl fork | `wt/musl-wasm`, branch `gex-wasm32`, remote `mw`; patches: §3.11.2 |
 | Wine 11.15 reference | `wt/nt-wine-src` (read-only) |
 
 **Rebuilding the outputs** (`$W` = stream W's scratch directory):
@@ -1211,9 +1284,12 @@ Steps:
   - W's check prefixes: `$W/pfx-native` (3 DLLs), `$W/pfx-dev` (9),
     `$W/pfx-gui` (11); `$W/pfx-w32u` is the coordinator's gate copy (do not
     restage while a gate runs). `$W/check.sh` runs them all.
-  - §5.1 item 1 (busybox as /bin/sh, natively) on merge/wine-unix; next:
-    the browser mapping, then item 2 (ELF export providers: own branch,
-    tell the coordinator before gex-cgen re-keys).
+  - §5.1 item 1 (busybox as /bin/sh) natively on merge/wine-unix; real
+    fork (§3.11.1) and wasm32 programs in the browser on merge/wine-fork
+    (sysroot `$W/sr-fork`, busybox `$W/bb-fork`, prefix
+    `$W/pfx-gui-fork` built with that toolchain; `$W/check-fork.sh`).
+    Next: item 2 (ELF export providers: own branch, tell the coordinator
+    before gex-cgen re-keys).
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
     merge/wine-wasm after its gate.
 - **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
