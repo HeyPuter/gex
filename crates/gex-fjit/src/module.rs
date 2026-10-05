@@ -73,7 +73,7 @@ fn host_imports(m: &mut Module) -> Imports {
         dispatch: m.import_func(gex_cgen::splice::DISPATCH_MODULE, gex_cgen::splice::DISPATCH_NAME, block_ty),
         block_ty,
     };
-    m.import_memory(IMPORT_MODULE, exports::MEMORY, gex_abi::GUEST_MEM_INITIAL_PAGES, gex_abi::GUEST_MEM_PAGES, true);
+    m.import_guest_memory(IMPORT_MODULE, exports::MEMORY, gex_abi::GUEST_MEM_INITIAL_PAGES, gex_abi::GUEST_MEM_PAGES);
     out
 }
 
@@ -220,6 +220,7 @@ fn root_body(im: &Imports, entry: u64, body: u32) -> Vec<u8> {
     let dispatch = |f: &mut FuncBody| {
         if gex_abi::X86 {
             f.local_get(0);
+            f.addr_i32();
             f.i64_const(entry as i64);
             f.store(0x37, 3, ctx::LAST_SOURCE as u32);
         }
@@ -228,6 +229,7 @@ fn root_body(im: &Imports, entry: u64, body: u32) -> Vec<u8> {
     };
     if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
         f.local_get(0);
+        f.addr_i32();
         f.load(0x29, 3, ctx::LAST_TARGET as u32);
         f.i64_const(entry as i64);
         f.byte(0x52); // i64.ne
@@ -236,10 +238,12 @@ fn root_body(im: &Imports, entry: u64, body: u32) -> Vec<u8> {
         f.i64_const(entry as i64);
         f.i32_const(gex_abi::cache_op::SLOT_CONFLICT);
         f.local_get(0);
+        f.addr_i32();
         f.load(0x29, 3, ctx::LAST_TARGET as u32);
         f.call(im.cache_op);
         f.local_get(0);
         f.local_get(0);
+        f.addr_i32();
         f.load(0x29, 3, ctx::LAST_TARGET as u32);
         f.call(im.dispatch_miss);
         f.drop_();
@@ -255,15 +259,19 @@ fn root_body(im: &Imports, entry: u64, body: u32) -> Vec<u8> {
     f.call(body);
     f.if_void();
     f.local_get(0);
+    f.addr_i32();
     f.i64_const(-1);
     f.store(0x37, 3, ctx::PC as u32);
     f.end();
     f.local_get(0);
+    f.addr_i32();
     f.load(0x29, 3, ctx::PC as u32);
     f.local_set(tgt);
     // tier-1's safepoint countdown, then dispatch on the target.
     f.local_get(0);
+    f.addr_i32();
     f.local_get(0);
+    f.addr_i32();
     f.load(0x28, 2, ctx::SAFEPOINT_COUNTER as u32);
     f.i32_const(1);
     f.byte(0x6b); // i32.sub
@@ -278,6 +286,7 @@ fn root_body(im: &Imports, entry: u64, body: u32) -> Vec<u8> {
     f.call(im.safepoint);
     f.end();
     f.local_get(0);
+    f.addr_i32();
     f.local_get(tgt);
     f.store(0x37, 3, ctx::LAST_TARGET as u32);
     dispatch(&mut f);
@@ -470,17 +479,23 @@ pub fn build_runtime(
         imports.import(
             im,
             exports::MEMORY,
-            EntityType::Memory(MemoryType { minimum: 0, maximum: Some(65536), memory64: false, shared: true, page_size_log2: None }),
+            // A memory64 guest memory, and so a table64 `ftab` and an i64
+            // `__table_base`, as wasm64 units have (docs/mem64.md §4).
+            EntityType::Memory(if gex_abi::mem64() {
+                MemoryType { minimum: 0, maximum: Some(gex_abi::LIMIT64_PAGES), memory64: true, shared: true, page_size_log2: None }
+            } else {
+                MemoryType { minimum: 0, maximum: Some(65536), memory64: false, shared: true, page_size_log2: None }
+            }),
         );
         imports.import(
             im,
             gex_abi::ftab::TABLE,
-            EntityType::Table(TableType { element_type: RefType::FUNCREF, minimum: 0, maximum: None, table64: false, shared: false }),
+            EntityType::Table(TableType { element_type: RefType::FUNCREF, minimum: 0, maximum: None, table64: gex_abi::mem64(), shared: false }),
         );
         imports.import(
             gex_abi::ftab::PIC_MODULE,
             gex_abi::ftab::PIC_TABLE_BASE,
-            EntityType::Global(GlobalType { val_type: i32_, mutable: false, shared: false }),
+            EntityType::Global(GlobalType { val_type: if gex_abi::mem64() { i64_ } else { i32_ }, mutable: false, shared: false }),
         );
         m.section(&imports);
         let mut fsec = FunctionSection::new();

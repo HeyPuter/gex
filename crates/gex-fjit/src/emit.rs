@@ -211,12 +211,13 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         let pages = if cf::exp("NOPAGECHECK") { none } else { pages.get(&f.entry).map(|v| v.as_slice()).unwrap_or(none) };
         for &(page, gen) in pages {
             let fb = b.f();
-            fb.i32_const(0);
+            fb.addr_const(0);
             fb.load(0x28, 2, (gex_abi::PAGE_GEN + 4 * page) as u32); // i32.load
             fb.i32_const(gen as i32);
             fb.byte(0x47); // i32.ne
             fb.if_void();
             fb.local_get(0);
+            fb.addr_i32();
             fb.i64_const(f.entry as i64);
             fb.store(0x37, 3, ctx::LAST_TARGET as u32);
             fb.local_get(0);
@@ -227,6 +228,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
             // a later page changed, the entry's cache line still names this
             // function, and probing would come back here forever.
             fb.i32_const(gex_abi::ftab::RESOLVE as i32);
+            fb.ftab_index();
             fb.return_call_indirect(m.body_ty, *table);
             fb.end();
         }
@@ -533,7 +535,7 @@ struct Locals {
 /// Push the table index the probe cache holds for constant `t`
 /// (`gex_abi::fcache_entry`), 0 (resolve) on a miss. `e` is i64 scratch.
 fn probe_const(fb: &mut gex_emit::wasm::FuncBody, t: u64, e: u32) {
-    fb.i32_const(0);
+    fb.addr_const(0);
     fb.load(0x29, 3, gex_abi::fcache_entry(t) as u32); // i64.load
     fb.local_tee(e);
     fb.i64_const(32);
@@ -1056,6 +1058,7 @@ impl E<'_, '_> {
 
     fn store_pc_value(&mut self, v: Operand) {
         self.b.f().local_get(0);
+        self.b.f().addr_i32();
         self.b.push_operand(v);
         self.b.f().store(0x37, 3, ctx::PC as u32);
     }
@@ -1068,6 +1071,7 @@ impl E<'_, '_> {
         let Linkage::Runtime { table, .. } = self.m.linkage else { unreachable!("a probe outside the runtime linkage") };
         let e = self.locals.e64;
         self.b.f().local_get(0);
+        self.b.f().addr_i32();
         match t {
             Target::Const(a) => self.b.f().i64_const(a as i64),
             Target::Op(o) => self.b.push_operand(o),
@@ -1087,6 +1091,7 @@ impl E<'_, '_> {
                 fb.byte(0x76); // i32.shr_u
                 fb.i32_const(3);
                 fb.byte(0x74); // i32.shl
+                fb.addr_i32();
                 fb.load(0x29, 3, gex_abi::FCACHE as u32); // i64.load
                 fb.local_tee(e);
                 fb.i64_const(32);
@@ -1104,6 +1109,7 @@ impl E<'_, '_> {
         }
         let ty = self.m.body_ty;
         let fb = self.b.f();
+        fb.ftab_index();
         if tail {
             fb.return_call_indirect(ty, table);
         } else {
@@ -1149,7 +1155,7 @@ impl E<'_, '_> {
             return;
         }
         let one = |fb: &mut gex_emit::wasm::FuncBody, a: u64| {
-            fb.i32_const(0);
+            fb.addr_const(0);
             fb.load(0x2d, 0, (gex_abi::PATCHED_PAGES + (a >> 15)) as u32); // i32.load8_u
             fb.i32_const(((a >> 12) & 7) as i32);
             fb.byte(0x76); // i32.shr_u

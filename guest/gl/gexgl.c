@@ -2300,6 +2300,9 @@ struct gexgl_egl_surface {
     const struct gexgl_wl_egl_window *wl_window;
     /* The frame callback this surface has outstanding, if any. */
     void *wl_callback;
+    /* X only: swaps since the window's size was last asked (see
+       `gexgl_x11_follow_size`). */
+    unsigned x_swaps;
 };
 static struct gexgl_egl_surface egl_surfaces[GEXGL_MAX_SURFACES];
 static unsigned egl_next_surface_handle = 1;
@@ -2770,6 +2773,28 @@ static void gexgl_wl_follow_size(struct gexgl_egl_surface *s) {
     ioctl(gl_fd, GEXGL_SURFACE, args);
 }
 
+/* An X window's resize, followed at swap time as a real GLX driver does: SDL
+ * makes Unity's window at the desktop's size and resizes it after the context
+ * exists, and without this the host kept drawing at the first size. Asking
+ * the server costs a round trip, so it is asked on the first swaps and then
+ * every 30th. */
+static void gexgl_x11_follow_size(struct gexgl_egl_surface *s) {
+    if (!s || s->kind != GEXGL_SURFACE_X) return;
+    unsigned n = s->x_swaps++;
+    if (n > 8 && n % 30 != 0) return;
+    int w = 0, h = 0;
+    if (!gexgl_x11_window_size(s->native, &w, &h)) return;
+    if (w <= 0 || h <= 0 || (w == s->width && h == s->height)) return;
+    s->width = w;
+    s->height = h;
+    if (s == egl_surface) {
+        egl_surface_width = w;
+        egl_surface_height = h;
+    }
+    egl_surface_use(s);
+    CMD2(GEXGL_SURFACE_RESIZE, w, h);
+}
+
 static void gexgl_wl_commit(struct gexgl_egl_surface *s) {
     if (!s || !s->wl_proxy) return;
     void *wayland = dlopen("libwayland-client.so.0", RTLD_LAZY | RTLD_NOLOAD);
@@ -3008,6 +3033,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     // commit -- the commit is what carries the frame callback this client is
     // waiting for.
     gexgl_wl_follow_size(s);
+    gexgl_x11_follow_size(s);
     gexgl_wl_commit(s);
     CMD0(GEXGL_PRESENT);
     flush();

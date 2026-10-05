@@ -75,7 +75,7 @@ pub(crate) fn install(
     let module = Module::new(engine, &wasm).with_context(|| format!("compiling {path}'s wasm module"))?;
     crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
     let _ = state;
-    crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data as u32 })?;
+    crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data })?;
     Ok(Some(n))
 }
 
@@ -350,7 +350,7 @@ fn install_shared(
     let n = pairs.len();
     match first {
         Some((module, len)) => {
-            let install = crate::ftab::publish_stateful(shared, memory, module, len, &pairs, crate::libprov::Extras { memory_base: wp.data as u32 })?;
+            let install = crate::ftab::publish_stateful(shared, memory, module, len, &pairs, crate::libprov::Extras { memory_base: wp.data })?;
             let mut wp = Arc::try_unwrap(wp).ok().expect("WinePe not yet shared");
             wp.install = install;
             shared.lock().unwrap_or_else(|e| e.into_inner()).wine_pe = Some(Arc::new(wp));

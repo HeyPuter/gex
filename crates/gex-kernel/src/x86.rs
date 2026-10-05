@@ -114,6 +114,12 @@ pub mod raw {
     pub const PIPE: u64 = 22;
     pub const SELECT: u64 = 23;
     pub const SCHED_YIELD: u64 = 24;
+    pub const SCHED_SETPARAM: u64 = 142;
+    pub const SCHED_GETPARAM: u64 = 143;
+    pub const SCHED_SETSCHEDULER: u64 = 144;
+    pub const SCHED_GETSCHEDULER: u64 = 145;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 147;
     pub const MREMAP: u64 = 25;
     pub const MSYNC: u64 = 26;
     pub const MADVISE: u64 = 28;
@@ -354,6 +360,12 @@ pub fn translate(
             nr::PSELECT6
         }
         x::SCHED_YIELD => nr::SCHED_YIELD,
+        x::SCHED_SETPARAM => nr::SCHED_SETPARAM,
+        x::SCHED_GETPARAM => nr::SCHED_GETPARAM,
+        x::SCHED_SETSCHEDULER => nr::SCHED_SETSCHEDULER,
+        x::SCHED_GETSCHEDULER => nr::SCHED_GETSCHEDULER,
+        x::SCHED_GET_PRIORITY_MAX => nr::SCHED_GET_PRIORITY_MAX,
+        x::SCHED_GET_PRIORITY_MIN => nr::SCHED_GET_PRIORITY_MIN,
         x::MREMAP => nr::MREMAP,
         x::MSYNC => nr::MSYNC,
         x::MADVISE => nr::MADVISE,

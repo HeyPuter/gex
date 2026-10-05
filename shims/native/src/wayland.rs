@@ -45,6 +45,8 @@ struct Inner {
     /// Where to write each frame, and how many have been written.
     out: Mutex<Option<String>>,
     written: Mutex<u32>,
+    /// Presents counted for `GEX_FPS` (count since the last report, and when).
+    fps: Mutex<Option<(u32, std::time::Instant)>>,
     /// The GPU compositor, when one could be started. Optional: a machine with
     /// no graphics adapter still runs, compositing on the host instead.
     gpu: Mutex<Option<gex_gpu::Compositor>>,
@@ -104,9 +106,8 @@ impl Wayland {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
-        if self.skip_frame() {
-            return;
-        }
+        // Before the GPU read-back, so a skipped frame costs nothing.
+        let Some(path) = self.frame_path(&prefix) else { return };
         let mut gpu = self.inner.gpu.lock().unwrap();
         let (width, height, rgb) = if let Some(c) = gpu.as_mut() {
             match c.draw(frames).and_then(|()| c.read_back()) {
@@ -123,14 +124,36 @@ impl Wayland {
             let Some(frame) = frames.last() else { return };
             (frame.width, frame.height, gex_wayland::to_rgb(frame))
         };
-        let mut n = self.inner.written.lock().unwrap();
-        let path = format!("{prefix}-{:03}.ppm", *n);
-        *n += 1;
         let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
         out.extend_from_slice(&rgb);
         if let Err(e) = std::fs::write(&path, out) {
             eprintln!("gex: could not write {path}: {e}");
         }
+    }
+
+    /// Count a presented frame and say where to write it, if anywhere:
+    /// `GEX_PPM_EVERY=N` keeps every Nth ([`Self::skip_frame`]), and the
+    /// prefix `null` keeps none. `GEX_FPS=1` prints presents per second to
+    /// stderr, which is what a measurement script reads.
+    fn frame_path(&self, prefix: &str) -> Option<String> {
+        if std::env::var_os("GEX_FPS").is_some_and(|v| v != "0") {
+            let mut fps = self.inner.fps.lock().unwrap();
+            let (count, since) = fps.get_or_insert((0, std::time::Instant::now()));
+            *count += 1;
+            let dt = since.elapsed().as_secs_f64();
+            if dt >= 1.0 {
+                eprintln!("[gex] fps {:.1}", *count as f64 / dt);
+                *count = 0;
+                *since = std::time::Instant::now();
+            }
+        }
+        if prefix == "null" || self.skip_frame() {
+            return None;
+        }
+        let mut n = self.inner.written.lock().unwrap();
+        let path = format!("{prefix}-{:03}.ppm", *n);
+        *n += 1;
+        Some(path)
     }
 
     /// Write a frame drawn somewhere other than a client buffer (a GL
@@ -139,12 +162,7 @@ impl Wayland {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
-        if self.skip_frame() {
-            return;
-        }
-        let mut n = self.inner.written.lock().unwrap();
-        let path = format!("{prefix}-{:03}.ppm", *n);
-        *n += 1;
+        let Some(path) = self.frame_path(&prefix) else { return };
         let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
         out.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
         if let Err(e) = std::fs::write(&path, out) {

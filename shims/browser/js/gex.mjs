@@ -7,6 +7,16 @@
 // `gex_abi::GUEST_MEM_INITIAL_BYTES`.
 const GUEST_BYTES = 0xffff0000;
 
+// A 64-bit guest memory (docs/mem64.md step 6): the wasm64 shim and seed, a
+// memory64 of `gex_abi::LIMIT64` (16 GiB). The shim's own addresses (its
+// stack, data and the low runtime words) stay below 4 GiB either way; only
+// the memory's type and the i64 globals of a wasm64 module differ.
+// Read when used, not at import: a Worker learns it from its first message.
+const m64 = () => !!globalThis.GEX_MEM64;
+const LIMIT64_BYTES = 16 * 2 ** 30;
+/** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
+const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
+
 /**
  * Decode UTF-8 out of guest memory.
  *
@@ -597,7 +607,10 @@ export class Gex {
     // new one -- which is what a *thread* is: a second Worker on the same
     // memory, seeing the same guest and kernel. A new memory is a new process.
     this.#memory =
-      memory ?? new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: PAGES, shared });
+      memory ??
+      (m64()
+        ? new WebAssembly.Memory({ address: 'i64', initial: BigInt(INITIAL_PAGES), maximum: BigInt(LIMIT64_BYTES / 65536), shared })
+        : new WebAssembly.Memory({ initial: INITIAL_PAGES, maximum: PAGES, shared }));
     this.#kernelSpec = kernel;
   }
 
@@ -620,7 +633,7 @@ export class Gex {
       // low region -- Workers starting together get different ones.
       if (typeof this.#shim.exports.gex_worker_init?.call === 'function' && this.#memory.buffer instanceof SharedArrayBuffer) {
         const k = Atomics.add(new Int32Array(this.#memory.buffer), BOOT_STACK_COUNTER >> 2, 1) & 31;
-        this.#shim.exports.__stack_pointer.value = (SHIM_STACK_TOP - k * 0x40000) | 0;
+        this.#shim.exports.__stack_pointer.value = addrVal(SHIM_STACK_TOP - k * 0x40000);
       }
       const at = this.#shim.exports.gex_worker_init?.();
       this.#stackTop = at ? at | 0 : SHIM_STACK_TOP | 0;
@@ -638,7 +651,7 @@ export class Gex {
     if (end <= have) return;
     // A 64-bit memory counts its pages in BigInt, here as everywhere else.
     const pages = Math.ceil((end - have) / 65536);
-    this.#memory.grow(pages);
+    this.#memory.grow(m64() ? BigInt(pages) : pages);
     this.#u8 = null;
   }
 
@@ -949,7 +962,7 @@ export class Gex {
     // First, before any call into the shim: `gex_worker_init` gives this Worker
     // its thread-local block, and until it runs `__tls_base` is zero, so a shim
     // function touching a thread-local writes through a null base.
-    this.#shim.exports.__stack_pointer.value = this.#workerStack();
+    this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
     // An older shim loads but fails on the first call to something it lacks,
     // far from the mistake. Named here so the skew is a sentence, not a mystery.
     const required = [
@@ -982,7 +995,7 @@ export class Gex {
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     // wasm-ld puts the shim's stack at address zero (the guest's image); move
     // it into the shim's own region, above everything the guest maps.
-    this.#shim.exports.__stack_pointer.value = this.#workerStack();
+    this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
     // Carried into every fork child's Worker (see the fork record's `opts`), so
     // a debugging switch set for the run holds for the processes it spawns --
     // the block trace of a child that crashes is otherwise silent.
@@ -1401,7 +1414,7 @@ export class Gex {
     this.#u8 = null;
     // The stack pointer is a per-instance global, so every Worker has its own
     // and must be told where it goes.
-    this.#shim.exports.__stack_pointer.value = this.#workerStack();
+    this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
     // The devices this process has -- process-wide flags in shared memory, so
     // only a *process* sets them. A thread answering for itself would turn a
     // GPU or network off underneath the threads using it. Before the kernel is
@@ -3015,7 +3028,7 @@ export class Gex {
         // that restore the shim's shadow-stack global, leaking a few dozen
         // bytes each. Nothing is live below here, so reset it exactly -- left
         // alone it slid into the guest's stack and overwrote saved registers.
-        this.#shim.exports.__stack_pointer.value = this.#workerStack();
+        this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
         const e = this.#shim.exports;
         // A slot the shim wants written before the guest goes back to it: its
         // module is instantiated with passive segments, so the code is present
@@ -4033,6 +4046,9 @@ export class Gex {
       // the page (tests/nt's harness keeps them), synchronously, since the
       // Worker may be about to die. Best effort.
       if (bytes instanceof Uint8Array && err instanceof WebAssembly.CompileError) {
+        // Under Node, `GEX_DUMP_BAD_WASM=DIR` keeps it, as gexc does natively.
+        const dir = globalThis.process?.env?.GEX_DUMP_BAD_WASM;
+        if (dir) try { globalThis.process.getBuiltinModule('fs').writeFileSync(`${dir}/bad-${who}-${Date.now()}.wasm`, bytes); } catch {}
         try {
           const x = new XMLHttpRequest();
           x.open('POST', `/__gex_dump?name=${encodeURIComponent(who)}`, false);

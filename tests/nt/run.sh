@@ -44,7 +44,7 @@ check() {
     # A CRT's text-mode stdout writes CRLF, as on Windows; compared without
     # the CRs.
     # shellcheck disable=SC2086
-    out=$(cd "$(dirname "$1")" && timeout 120 "$gexc" run $flags "$@" 2>"$err"; echo "exit=$?")
+    out=$(cd "$(dirname "$1")" && timeout 120 "$gexc" run $flags ${extra:-} "$@" 2>"$err"; echo "exit=$?")
     code=${out##*exit=}
     out=${out%$'\n'exit=*}
     out=${out%exit=*}
@@ -101,6 +101,7 @@ for arch in x64 x86; do
     [ $arch = x64 ] && check $arch/lownull-cmpxchg16b 0 "$allok" "$b/lownull.exe" cmpxchg16b
     check $arch/lowmem 0 "$allok" "$b/lowmem.exe"
     check $arch/apc 0 "$allok" "$b/apc.exe"
+    check $arch/suspend 0 "$allok" "$b/suspend.exe"
     check $arch/tls 0 "$allok" "$b/tls.exe"
     check $arch/cxx 0 "$allok" "$b/cxx.exe"
     # Hot indirect calls (devirtualised under --cgen, with the profile above).
@@ -110,11 +111,23 @@ for arch in x64 x86; do
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
+    # crypt32 with gex's empty Unix side, and the registered RSA provider.
+    check $arch/crypt 0 "$allok" "$b/crypt.exe"
+    # Anonymous and named pipes within the process (CreatePipe).
+    check $arch/pipe 0 "$allok" "$b/pipe.exe"
+    # A 64-bit guest memory (docs/mem64.md): Unity's 12 GiB of reservations.
+    if [ $arch = x64 ]; then
+        extra=--mem64 check $arch/mem64 0 "$allok" "$b/mem64.exe"
+    fi
     # Display modes, D3DKMT, memory status, a section mapped twice, dialogs.
     check $arch/display 0 "$allok" "$b/display.exe"
     # An image without DYNAMIC_BASE: at its linked base, or relocated by ntdll
     # with its header as linked.
     check $arch/fixedbase 0 "$allok" "$b/fixedbase.exe"
+    # WINEDLLOVERRIDES: the winhttp.dll beside it, the builtin, none.
+    check $arch/loadorder-native 0 "$allok" "$b/loadorder.exe" native
+    extra="--env WINEDLLOVERRIDES=winhttp=b" check $arch/loadorder-builtin 0 "$allok" "$b/loadorder.exe" builtin
+    extra="--env WINEDLLOVERRIDES=winhttp=" check $arch/loadorder-disabled 0 "$allok" "$b/loadorder.exe" none
     check $arch/fixedbase-taken 0 "$allok" "$b/fixedbase.exe" taken
     # opengl32 through the generated transport (tools/gen_gl_compat.py).
     check_gl $arch/glcompat 0 "$allok" "$b/glcompat.exe"

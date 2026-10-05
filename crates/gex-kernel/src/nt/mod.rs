@@ -24,6 +24,7 @@ pub mod gdi;
 pub mod layout;
 pub mod object;
 pub mod opengl;
+pub mod pipe;
 pub mod reg;
 pub mod section;
 pub mod status;
@@ -369,6 +370,17 @@ pub struct Thread {
     pub sync_id: u64,
     /// Suspend count; a thread created suspended starts at 1.
     pub suspend: AtomicU32,
+    /// Whether the thread has started running (a thread created suspended
+    /// has not until its first resume).
+    pub started: AtomicBool,
+    /// Inside a syscall (and not in a user callback it made): its guest
+    /// registers are in its context, as they were at the syscall, so a
+    /// suspender may read them.
+    pub in_kernel: AtomicBool,
+    /// Stopped at a safepoint or a syscall's return because it is suspended.
+    pub parked: AtomicBool,
+    /// Where a suspended thread waits for its count to reach zero.
+    pub park: (Mutex<()>, std::sync::Condvar),
     /// Nesting depth of user-mode callbacks (`KeUserModeCallback`).
     pub callback_depth: AtomicU32,
     /// What the innermost callback returned (`NtCallbackReturn`'s status and
@@ -426,6 +438,8 @@ pub struct Process {
     /// The process's own sync id, signalled when it ends.
     pub sync_id: u64,
     pub unix: unixcall::Registry,
+    /// Named pipes served in this process (`pipe.rs`).
+    pub pipes: Arc<pipe::Pipes>,
     pub atoms: Mutex<sysinfo::Atoms>,
     /// Threads blocked on keyed events.
     pub keyed: Mutex<sync::Keyed>,
@@ -518,7 +532,12 @@ impl Process {
             futexes,
             st: Mutex::new(State {
                 handles: object::Handles::default(),
-                vm: vm::Vm::new(),
+                vm: vm::Vm {
+                    // A PE32+ process with a 64-bit guest memory has the high
+                    // arena (docs/mem64.md §3); a PE32 one cannot address it.
+                    high: (gex_abi::mem64() && abi == Abi::P64).then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
+                    ..vm::Vm::new()
+                },
                 images: Default::default(),
                 file_views: Default::default(),
                 shared_views: Default::default(),
@@ -535,6 +554,7 @@ impl Process {
             next_word: AtomicU32::new(0),
             sync_id: 1,
             unix: unixcall::Registry::default(),
+            pipes: Arc::default(),
             atoms: Mutex::new(Default::default()),
             keyed: Mutex::new(Default::default()),
             user: Mutex::new(user::User::new()),
@@ -906,6 +926,10 @@ pub fn hardware_exception(
 }
 
 /// Handle one syscall from an NT process. `data` is the whole guest memory.
+///
+/// While it runs the thread counts as stopped for a suspender
+/// (`Thread::in_kernel`); a thread suspended meanwhile parks before it
+/// returns to guest code.
 pub fn syscall(
     p: &Arc<Process>,
     kernel: &dyn KernelCell,
@@ -916,6 +940,14 @@ pub fn syscall(
 ) -> Outcome {
     let t = p.thread_by_ctx(ctx_addr);
     syscall_on(p, t, kernel, data, ctx_addr, pc, host)
+}
+
+/// A safepoint in guest code (the host's countdown expired, registers
+/// written back): park here while the thread is suspended.
+pub fn suspend_point(p: &Process, ctx_addr: u64) {
+    if let Some(t) = p.thread_by_ctx(ctx_addr) {
+        thread::park_if_suspended(p, &t);
+    }
 }
 
 thread_local! {
@@ -932,6 +964,28 @@ pub fn syscalls_here() -> u64 {
 /// takes the process's thread table lock, which every thread's every
 /// syscall then shares).
 pub fn syscall_on(
+    p: &Arc<Process>,
+    t: Option<Arc<Thread>>,
+    kernel: &dyn KernelCell,
+    data: &mut [u8],
+    ctx_addr: u64,
+    pc: u64,
+    host: &mut dyn NtHost,
+) -> Outcome {
+    if let Some(t) = &t {
+        t.in_kernel.store(true, Ordering::SeqCst);
+    }
+    let o = syscall_inner(p, t.clone(), kernel, data, ctx_addr, pc, host);
+    if let Some(t) = &t {
+        t.in_kernel.store(false, Ordering::SeqCst);
+        if matches!(o, Outcome::Continue | Outcome::Resume(_) | Outcome::CallbackReturn) {
+            thread::park_if_suspended(p, t);
+        }
+    }
+    o
+}
+
+fn syscall_inner(
     p: &Arc<Process>,
     t: Option<Arc<Thread>>,
     kernel: &dyn KernelCell,
@@ -1032,6 +1086,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtQueryVolumeInformationFile => file::nt_query_volume_information_file(c),
         n::NtQueryDirectoryFile => file::nt_query_directory_file(c),
         n::NtFsControlFile => file::nt_fs_control_file(c),
+        n::NtCreateNamedPipeFile => file::nt_create_named_pipe_file(c),
         n::NtDeviceIoControlFile => file::nt_device_io_control_file(c),
         n::NtFlushBuffersFile => file::nt_flush_buffers_file(c),
         // -- registry --------------------------------------------------------
@@ -1044,6 +1099,8 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtEnumerateValueKey => reg::nt_enumerate_value_key(c),
         n::NtQueryKey => reg::nt_query_key(c),
         n::NtDeleteValueKey => reg::nt_delete_value_key(c),
+        n::NtNotifyChangeKey => reg::nt_notify_change_key(c),
+        n::NtRenameKey => reg::nt_rename_key(c),
         // -- sync --------------------------------------------------------------
         n::NtCreateEvent => sync::nt_create_event(c),
         n::NtOpenEvent => sync::nt_open_event(c),
@@ -1083,6 +1140,7 @@ fn dispatch(c: &mut Call<'_>) -> R {
         n::NtTerminateThread => thread::nt_terminate_thread(c),
         n::NtTerminateProcess => thread::nt_terminate_process(c),
         n::NtResumeThread => thread::nt_resume_thread(c),
+        n::NtSuspendThread => thread::nt_suspend_thread(c),
         n::NtGetNextThread => thread::nt_get_next_thread(c),
         n::NtQueryInformationThread => thread::nt_query_information_thread(c),
         n::NtSetInformationThread => thread::nt_set_information_thread(c),

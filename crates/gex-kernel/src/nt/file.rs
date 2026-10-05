@@ -42,6 +42,8 @@ pub enum FileKind {
     Console,
     /// `\Device\Null` / `NUL`.
     Null,
+    /// One end of a named pipe (`pipe.rs`).
+    Pipe,
 }
 
 #[derive(Debug)]
@@ -93,6 +95,8 @@ pub enum Target {
     Null,
     /// A device or namespace gex does not provide.
     Unsupported(String),
+    /// `\??\pipe\<name>`: the name, lower-cased (`pipe\…`).
+    Pipe(String),
 }
 
 /// The guest path of drive `letter`'s root, if it exists.
@@ -122,11 +126,11 @@ pub fn nt_to_target(c: &Call<'_>, nt: &[u16]) -> R<Target> {
     if rl == "nul" {
         return Ok(Target::Null);
     }
-    // The named pipe namespace: no process serves a pipe (there are no
-    // services and no wineserver), so every pipe is absent, which is what a
-    // client of a stopped service sees.
-    if rl.starts_with("pipe\\") {
-        return Err(Status(st::OBJECT_NAME_NOT_FOUND));
+    // The named pipe namespace: only this process's own pipes exist (there
+    // are no services and no wineserver), so any other pipe is absent, which
+    // is what a client of a stopped service sees.
+    if let Some(name) = super::pipe::pipe_name(&rl) {
+        return Ok(Target::Pipe(name));
     }
     let b = rest.as_bytes();
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
@@ -310,6 +314,10 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
             // provided yet. Loud, because a program may depend on them.
             return Err(c.unimplemented(&format!("{} of the NT path {s:?}", c.name())));
         }
+        Target::Pipe(name) => {
+            let handle = super::pipe::open_client(&c.p.pipes, &name)?;
+            return Ok((Arc::new(pipe_file(handle, nt, options, access)), 1));
+        }
         Target::Path(p) => p,
     };
     let (resolved, exists) = match resolve_ci(c, &path) {
@@ -396,6 +404,46 @@ fn open_inner(c: &mut Call<'_>, nt: &[u16], access: u32, disposition: u32, optio
     Ok((Arc::new(f), info))
 }
 
+fn pipe_file(handle: Arc<dyn FileHandle>, nt: &[u16], options: u32, access: u32) -> NtFile {
+    NtFile {
+        handle,
+        path: String::new(),
+        nt_path: nt.to_vec(),
+        pos: AtomicU64::new(0),
+        options,
+        access,
+        is_dir: false,
+        kind: FileKind::Pipe,
+        delete_on_close: AtomicBool::new(false),
+        dir: Mutex::new(None),
+        notify: Mutex::new(None),
+        moved_to: Mutex::new(None),
+    }
+}
+
+/// `NtCreateNamedPipeFile(*handle, access, attr, iosb, sharing, disposition,
+/// options, type, read_mode, completion_mode, max_instances, in_quota,
+/// out_quota, timeout)`: the server end of a pipe in this process.
+pub fn nt_create_named_pipe_file(c: &mut Call<'_>) -> R {
+    let (hp, access, attr_p, iosb, options) = (c.a(0), c.a32(1), c.a(2), c.a(3), c.a32(6));
+    let a = c.g.obj_attr(attr_p)?.ok_or(Status(st::INVALID_PARAMETER))?;
+    let nt = full_nt_name(c, a.root, &a.name)?;
+    let name = match nt_to_target(c, &nt)? {
+        Target::Pipe(n) => n,
+        _ => return Err(Status(st::OBJECT_NAME_INVALID)),
+    };
+    let r = super::pipe::create_server(&c.p.pipes, name);
+    if c.p.cfg.trace {
+        crate::nt_log!("[nt:{:x}]   NtCreateNamedPipeFile {:?} -> {}", c.t.tid, wstr(&nt), if r.is_ok() { "ok" } else { "in use" });
+    }
+    let handle = r?;
+    let f = pipe_file(handle, &nt, options, access);
+    let h = c.p.st.lock().unwrap().handles.insert(Obj::File(Arc::new(f)), access);
+    c.g.wptr(hp, h as u64)?;
+    c.g.iosb(iosb, st::SUCCESS, 2)?; // FILE_CREATED
+    Ok(st::SUCCESS)
+}
+
 /// `NtCreateFile(*handle, access, attr, iosb, alloc_size, attributes, sharing,
 /// disposition, options, ea, ea_len)`.
 pub fn nt_create_file(c: &mut Call<'_>) -> R {
@@ -475,6 +523,19 @@ pub fn nt_read_file(c: &mut Call<'_>) -> R {
     }
     let n = match f.kind {
         FileKind::Null => 0,
+        FileKind::Pipe => {
+            if f.options & (opt::SYNCHRONOUS_IO_ALERT | opt::SYNCHRONOUS_IO_NONALERT) == 0 {
+                return Err(c.unimplemented("NtReadFile on an overlapped pipe"));
+            }
+            let mut tmp = vec![0u8; len];
+            let n = super::pipe::read_blocking(c, &f.handle, &mut tmp)?;
+            if n == 0 && len > 0 {
+                complete_io(c, event, apc, iosb, st::PIPE_BROKEN, 0)?;
+                return Err(Status(st::PIPE_BROKEN));
+            }
+            c.g.m.write(buf, &tmp[..n]).map_err(|_| Status(st::ACCESS_VIOLATION))?;
+            n
+        }
         FileKind::Console => {
             let slice = c.g.m.read_mut(buf, len).map_err(|_| Status(st::ACCESS_VIOLATION))?;
             f.handle.read_at(0, slice)? as usize
@@ -507,6 +568,12 @@ pub fn nt_write_file(c: &mut Call<'_>) -> R {
     let data = c.g.bytes(buf, len)?;
     let n = match f.kind {
         FileKind::Null => len,
+        FileKind::Pipe => {
+            if f.options & (opt::SYNCHRONOUS_IO_ALERT | opt::SYNCHRONOUS_IO_NONALERT) == 0 {
+                return Err(c.unimplemented("NtWriteFile on an overlapped pipe"));
+            }
+            super::pipe::write_blocking(c, &f.handle, &data)?
+        }
         FileKind::Console => write_all_stream(&f.handle, &data)?,
         FileKind::Disk => {
             let at = match offset {
@@ -874,6 +941,11 @@ fn stat_attr_inner(c: &mut Call<'_>, nt: &[u16]) -> R<(String, Metadata)> {
             Ok((path, md))
         }
         Target::Null => Ok((String::new(), console_md())),
+        // A pipe exists while its server end is open.
+        Target::Pipe(name) => match c.p.pipes.exists(&name) {
+            true => Ok((String::new(), console_md())),
+            false => Err(Status(st::OBJECT_NAME_NOT_FOUND)),
+        },
         Target::Unsupported(s) => Err(c.unimplemented(&format!("{} of the NT path {s:?}", c.name()))),
     }
 }
@@ -916,6 +988,7 @@ pub fn nt_query_volume_information_file(c: &mut Call<'_>) -> R {
                 FileKind::Disk => (7u32, 0u32), // FILE_DEVICE_DISK
                 FileKind::Console => (std_device_type(&f), 0),
                 FileKind::Null => (0x15, 0), // FILE_DEVICE_NULL
+                FileKind::Pipe => (0x11, 0), // FILE_DEVICE_NAMED_PIPE
             };
             c.g.w32(buf, ty)?;
             c.g.w32(buf + 4, ch)?;

@@ -179,7 +179,13 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
             }
         }
     };
-    let table = Table::new(cx.as_context_mut(), wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None), wasmtime::Ref::Func(None))?;
+    // A table64 beside a 64-bit guest memory, as wasm64 units import it.
+    let ftab_type = if gex_abi::mem64() {
+        wasmtime::TableType::new64(wasmtime::RefType::FUNCREF, 0, None)
+    } else {
+        wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 0, None)
+    };
+    let table = Table::new(cx.as_context_mut(), ftab_type, wasmtime::Ref::Func(None))?;
     let mut l = linker;
     l.allow_shadowing(true);
     l.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;
@@ -275,32 +281,38 @@ fn instantiate(
     };
     let mut l = linker;
     l.allow_shadowing(true);
-    let i32c = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, v: i32, m: wasmtime::Mutability| {
-        wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v))
+    // The PIC globals are pointer-sized: i64 for a wasm64 module beside a
+    // 64-bit guest memory (docs/mem64.md).
+    let i32c = |cx: &mut wasmtime::StoreContextMut<'_, HostState>, v: u64, m: wasmtime::Mutability| {
+        if gex_abi::mem64() {
+            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, m), Val::I64(v as i64))
+        } else {
+            wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I32, m), Val::I32(v as u32 as i32))
+        }
     };
     let mut c = cx.as_context_mut();
     l.define(&mut c, gex_abi::IMPORT_MODULE, exports::MEMORY, memory.shared().clone())?;
     l.define(&mut c, f::PIC_MODULE, "memory", memory.shared().clone())?;
     l.define(&mut c, gex_abi::IMPORT_MODULE, f::TABLE, table)?;
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE, table)?;
-    let g = i32c(&mut c, base as i32, wasmtime::Mutability::Const)?;
+    let g = i32c(&mut c, base as u64, wasmtime::Mutability::Const)?;
     l.define(&mut c, f::PIC_MODULE, f::PIC_TABLE_BASE, g)?;
     match stateful {
         // A stateful provider: its data where the host put it, and this
         // thread's own stack (`libprov`).
         Some(x) => {
-            let g = i32c(&mut c, x.memory_base as i32, wasmtime::Mutability::Const)?;
+            let g = i32c(&mut c, x.memory_base, wasmtime::Mutability::Const)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
             let sp = crate::libprov::stack(&mut c)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, sp)?;
         }
         None => {
-            let g = i32c(&mut c, 0, wasmtime::Mutability::Const)?;
+            let g = i32c(&mut c, 0u64, wasmtime::Mutability::Const)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_MEMORY_BASE, g)?;
             // A unit's functions never touch clang's shadow stack (those are
             // stubs), but a position-independent module imports its pointer
             // all the same.
-            let g = i32c(&mut c, 0, wasmtime::Mutability::Var)?;
+            let g = i32c(&mut c, 0u64, wasmtime::Mutability::Var)?;
             l.define(&mut c, f::PIC_MODULE, f::PIC_STACK_POINTER, g)?;
         }
     }
@@ -622,18 +634,24 @@ struct Job {
     addr: u64,
     exec: Vec<(u64, u64)>,
     ro: Vec<(u64, u64)>,
+    /// Writable-and-executable ranges (a JIT's code), which the function
+    /// JIT does not translate.
+    wx: Vec<(u64, u64)>,
     class32: bool,
     epoch: u64,
     queued_at: std::time::Instant,
+    /// The module cache (directory, build), when it is on.
+    cache: Option<(std::path::PathBuf, String)>,
 }
 
 fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Option<Job> {
     gex_kernel::ftab::translator()?;
-    let (exec, ro): (Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
+    let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let v = k.mem.vmas();
         (
             v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
+            v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
         )
     });
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
@@ -647,9 +665,11 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
         addr,
         exec,
         ro,
+        wx,
         class32: gex_abi::X86 && gex_xlate::arch::compat(),
         epoch,
         queued_at: std::time::Instant::now(),
+        cache: caller.data().jit.as_ref().and_then(|jit| jit.cache.clone()),
     })
 }
 
@@ -662,6 +682,7 @@ fn run_job(j: &Job) -> Result<bool> {
     let (sh, memory, addr) = (&j.sh, &j.memory, j.addr);
     let executable = |a: u64| j.exec.iter().any(|&(s, e)| a >= s && a < e);
     let read_only = |a: u64, n: u64| j.ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
+    let volatile = |a: u64| j.wx.iter().any(|&(s, e)| a >= s && a < e);
     let pages = Mutex::new(Vec::<(u64, u32)>::new());
     let pg = |page: u64| {
         let g = page_gen(sh, memory, page);
@@ -676,6 +697,7 @@ fn run_job(j: &Job) -> Result<bool> {
         addr,
         executable: &executable,
         read_only: &read_only,
+        volatile: &volatile,
         page_gen: &pg,
         class32: j.class32,
     };
@@ -688,7 +710,7 @@ fn run_job(j: &Job) -> Result<bool> {
         bail!("the translation for {addr:#x} does not hold it");
     }
     let t1 = std::time::Instant::now();
-    let module = Module::new(&j.engine, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
+    let module = compile_translation(j, &t.wasm).with_context(|| format!("compiling the translation for {addr:#x}"))?;
     let tc = t1.elapsed();
     stats::COMPILE_US.fetch_add(tc.as_micros() as u64, Relaxed);
     let checks = pages.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -731,6 +753,24 @@ fn queue(j: Job) {
 
 /// Translate `addr` on this thread, install what it makes into this store
 /// and say which index serves `addr`.
+/// Compile a run-time translation. With `GEX_FJIT_CACHE=1` (and the
+/// module cache on), the compiled module is kept on disk by the wasm it came
+/// from, so a program's next run loads instead of compiling: a large
+/// program's start-up under the function JIT is mostly Cranelift (Unity's:
+/// about 60% of its CPU). Off by default, since a large program leaves
+/// gigabytes of them.
+fn compile_translation(j: &Job, wasm: &[u8]) -> Result<Module> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("GEX_FJIT_CACHE").is_ok_and(|v| !v.is_empty() && v != "0"));
+    match j.cache.as_ref().filter(|_| on) {
+        Some((dir, build)) => {
+            let key = gex_cache::key(build, [b"fjit".as_slice(), wasm]);
+            gex_cache::load_or_compile_at(&j.engine, &dir.join("fjit").join(format!("{key}.cwasm")), wasm)
+        }
+        None => Module::new(&j.engine, wasm).map_err(anyhow::Error::from),
+    }
+}
+
 fn translate(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Result<Option<u32>> {
     let Some(j) = job(caller, sh, memory, addr) else { return Ok(None) };
     if !run_job(&j)? {

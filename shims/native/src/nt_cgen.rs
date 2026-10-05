@@ -633,14 +633,18 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     let max = std::env::var("GEX_CGEN_MEMORY_MAX").unwrap_or_else(|_| "12G".into());
     let base = format!("{:#x}", p.base);
-    let args = ["cgen-image", p.path.as_str(), "--pe-base", base.as_str()];
+    let mut args = vec!["cgen-image", p.path.as_str(), "--pe-base", base.as_str()];
+    // The unit this process looks up is for its own guest memory.
+    if gex_abi::mem64() {
+        args.push("--mem64");
+    }
     let capped = std::process::Command::new("systemd-run")
         .args(["--user", "--scope", "-q", "-p", &format!("MemoryMax={max}")])
         .arg("nice")
         .arg("-n")
         .arg("10")
         .arg(&exe)
-        .args(args)
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .process_group(0)
@@ -648,7 +652,7 @@ fn spawn_build(p: &Pending) -> Result<std::process::Child> {
     match capped {
         Ok(c) => Ok(c),
         Err(_) => Ok(std::process::Command::new(&exe)
-            .args(args)
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .process_group(0)
@@ -862,7 +866,7 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
             let a = 1u64 << align;
             let data = crate::libprov::alloc_top(state, (size as u64).max(16) + a, &format!("[provider {} data]", prov.name))?;
             let data = (data + a - 1) & !(a - 1);
-            crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data as u32 })?;
+            crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data })?;
         } else {
             crate::ftab::publish_pairs(shared, memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
         }

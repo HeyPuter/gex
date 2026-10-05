@@ -25,6 +25,7 @@
 //! hit when its low half is `t`, and index 0 otherwise.
 
 use gex_abi::{ctx, ftab};
+use wasm_encoder::Instruction;
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
     Instruction as I, MemArg, MemoryType, Module, RefType, TableType, TypeSection, ValType,
@@ -40,14 +41,52 @@ pub fn body_params() -> [ValType; 4] {
     [ValType::I32, ValType::I32, ValType::I32, ValType::I64]
 }
 
-/// The process's table, as a module imports it.
+/// The process's table, as a module imports it: a table64 in a process with
+/// a memory64 guest memory, as clang's wasm64 units import it
+/// (docs/mem64.md §4).
 pub fn ftab_type() -> TableType {
+    TableType { element_type: RefType::FUNCREF, minimum: 0, maximum: None, table64: gex_abi::mem64(), shared: false }
+}
+
+/// A tier-1 dispatch table, as a module imports it: 32-bit in every process.
+pub fn dispatch_table_type() -> TableType {
     TableType { element_type: RefType::FUNCREF, minimum: 0, maximum: None, table64: false, shared: false }
 }
 
 /// The shared guest memory, as a module imports it.
 pub fn memory_type() -> MemoryType {
-    MemoryType { minimum: 0, maximum: Some(65536), memory64: false, shared: true, page_size_log2: None }
+    if gex_abi::mem64() {
+        MemoryType { minimum: 0, maximum: Some(gex_abi::LIMIT64_PAGES), memory64: true, shared: true, page_size_log2: None }
+    } else {
+        MemoryType { minimum: 0, maximum: Some(65536), memory64: false, shared: true, page_size_log2: None }
+    }
+}
+
+/// `env.__table_base`'s type: i64 beside a table64 `ftab`, as wasm64 PIC
+/// modules (clang's units) import it.
+pub fn table_base_type() -> ValType {
+    if gex_abi::mem64() {
+        ValType::I64
+    } else {
+        ValType::I32
+    }
+}
+
+/// Make the i32 `ftab` index on the stack the table's index type.
+pub fn ftab_index(f: &mut Function) {
+    if gex_abi::mem64() {
+        f.instruction(&Instruction::I64ExtendI32U);
+    }
+}
+
+/// Push guest address 0 as the memory's index type (a base for an
+/// absolute offset).
+fn addr_zero(f: &mut Function) {
+    if gex_abi::mem64() {
+        f.instruction(&Instruction::I64Const(0));
+    } else {
+        f.instruction(&Instruction::I32Const(0));
+    }
 }
 
 /// Push the probe for the target in local `t` (i64): leaves the index on the
@@ -63,6 +102,7 @@ pub fn emit_probe(f: &mut Function, t: u32, e: u32) {
     f.instruction(&I::I32ShrU);
     f.instruction(&I::I32Const(3));
     f.instruction(&I::I32Shl);
+    crate::splice::widen_addr(f);
     f.instruction(&I::I64Load(m));
     f.instruction(&I::LocalTee(e));
     // hit ? e >> 32 : 0, where hit compares the whole target with the low
@@ -95,7 +135,7 @@ pub fn module() -> Vec<u8> {
     imports.import(gex_abi::IMPORT_MODULE, gex_abi::exports::MEMORY, EntityType::Memory(memory_type()));
     imports.import(gex_abi::IMPORT_MODULE, ftab::TABLE, EntityType::Table(ftab_type()));
     for i in 0..gex_abi::DISPATCH_TABLES {
-        imports.import(gex_abi::IMPORT_MODULE, gex_abi::exports::dispatch_table(i), EntityType::Table(ftab_type()));
+        imports.import(gex_abi::IMPORT_MODULE, gex_abi::exports::dispatch_table(i), EntityType::Table(dispatch_table_type()));
     }
     imports.import(gex_abi::IMPORT_MODULE, ftab::LOOKUP, EntityType::Function(1));
     imports.import(gex_abi::IMPORT_MODULE, gex_abi::imports::SAFEPOINT, EntityType::Function(2));
@@ -122,7 +162,9 @@ pub fn module() -> Vec<u8> {
     // ctx = local 0; the safepoint countdown, as tier-1's, polling at PC.
     let poll = |f: &mut Function, sc: u32| {
         f.instruction(&I::LocalGet(0));
+        crate::splice::widen_addr(f);
         f.instruction(&I::LocalGet(0));
+        crate::splice::widen_addr(f);
         f.instruction(&I::I32Load(ctxm(ctx::SAFEPOINT_COUNTER, 2)));
         f.instruction(&I::I32Const(1));
         f.instruction(&I::I32Sub);
@@ -134,6 +176,7 @@ pub fn module() -> Vec<u8> {
         f.instruction(&I::If(BlockType::Empty));
         f.instruction(&I::LocalGet(0));
         f.instruction(&I::LocalGet(0));
+        crate::splice::widen_addr(f);
         f.instruction(&I::I64Load(ctxm(ctx::PC, 3)));
         f.instruction(&I::Call(SAFEPOINT));
         f.instruction(&I::End);
@@ -142,12 +185,14 @@ pub fn module() -> Vec<u8> {
     let no_return = |f: &mut Function| {
         f.instruction(&I::If(BlockType::Empty));
         f.instruction(&I::LocalGet(0));
+        crate::splice::widen_addr(f);
         f.instruction(&I::I64Const(ftab::NO_RETURN as i64));
         f.instruction(&I::I64Store(ctxm(ctx::PC, 3)));
         f.instruction(&I::End);
     };
     // Call ftab[index on the stack] as a root: no caller to predict.
     let call_root = |f: &mut Function| {
+        ftab_index(f);
         f.instruction(&I::CallIndirect { type_index: 0, table_index: 0 });
     };
 
@@ -160,8 +205,10 @@ pub fn module() -> Vec<u8> {
     f.instruction(&I::LocalGet(3));
     f.instruction(&I::LocalGet(0));
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::I64Load(ctxm(ctx::LAST_TARGET, 3)));
     f.instruction(&I::Call(LOOKUP));
+    ftab_index(&mut f);
     f.instruction(&I::ReturnCallIndirect { type_index: 0, table_index: 0 });
     f.instruction(&I::End);
     code.function(&f);
@@ -170,9 +217,11 @@ pub fn module() -> Vec<u8> {
     let mut f = Function::new([(2, ValType::I64), (1, ValType::I32)]);
     f.instruction(&I::Loop(BlockType::Empty));
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::I64Load(ctxm(ctx::PC, 3)));
     f.instruction(&I::LocalSet(1));
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Store(ctxm(ctx::LAST_TARGET, 3)));
     f.instruction(&I::LocalGet(0));
@@ -191,6 +240,7 @@ pub fn module() -> Vec<u8> {
     // bridge(ctx). Locals: 1 t (i64), 2 e (i64), 3 idx (i32), 4 sc (i32).
     let mut f = Function::new([(2, ValType::I64), (2, ValType::I32)]);
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::I64Load(ctxm(ctx::LAST_TARGET, 3)));
     f.instruction(&I::LocalSet(1));
     emit_probe(&mut f, 1, 2);
@@ -223,8 +273,8 @@ pub fn module() -> Vec<u8> {
     // NEST_EXITS += 1 (a statistic, not atomic); every 4096th says where
     // it went once the function is back (`cache_op::NEST_EXIT_SAMPLE`).
     let abs = |off: u64| MemArg { offset: off, align: 3, memory_index: 0 };
-    f.instruction(&I::I32Const(0));
-    f.instruction(&I::I32Const(0));
+    addr_zero(&mut f);
+    addr_zero(&mut f);
     f.instruction(&I::I64Load(abs(gex_abi::NEST_EXITS)));
     f.instruction(&I::LocalTee(2));
     f.instruction(&I::I64Const(1));
@@ -246,12 +296,14 @@ pub fn module() -> Vec<u8> {
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I32Const(gex_abi::cache_op::NEST_EXIT_SAMPLE));
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::I64Load(ctxm(ctx::PC, 3)));
     f.instruction(&I::Call(CACHE_OP));
     f.instruction(&I::End);
     // Left for this very address, having run nothing: no body serves it
     // (index 1 behind a translation, say). Tier-1 takes the slot over.
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::I64Load(ctxm(ctx::PC, 3)));
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Eq);
@@ -266,6 +318,7 @@ pub fn module() -> Vec<u8> {
     f.instruction(&I::Call(DISPATCH_MISS));
     f.instruction(&I::Drop);
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Store(ctxm(ctx::LAST_TARGET, 3)));
     f.instruction(&I::LocalGet(0));
@@ -273,7 +326,9 @@ pub fn module() -> Vec<u8> {
     f.instruction(&I::End);
     poll(&mut f, 4);
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::LocalGet(0));
+    crate::splice::widen_addr(&mut f);
     f.instruction(&I::I64Load(ctxm(ctx::PC, 3)));
     f.instruction(&I::I64Store(ctxm(ctx::LAST_TARGET, 3)));
     f.instruction(&I::LocalGet(0));
@@ -306,7 +361,7 @@ pub fn forwarder_module(addrs: &[u64]) -> Vec<u8> {
     imports.import(
         ftab::PIC_MODULE,
         ftab::PIC_TABLE_BASE,
-        EntityType::Global(GlobalType { val_type: ValType::I32, mutable: false, shared: false }),
+        EntityType::Global(GlobalType { val_type: table_base_type(), mutable: false, shared: false }),
     );
     m.section(&imports);
     let mut funcs = FunctionSection::new();
@@ -322,12 +377,14 @@ pub fn forwarder_module(addrs: &[u64]) -> Vec<u8> {
     for &a in addrs {
         let mut f = Function::new([]);
         f.instruction(&I::LocalGet(0));
+        crate::splice::widen_addr(&mut f);
         f.instruction(&I::I64Const(a as i64));
         f.instruction(&I::I64Store(MemArg { offset: ctx::LAST_TARGET as u64, align: 3, memory_index: 0 }));
         for i in 0..4 {
             f.instruction(&I::LocalGet(i));
         }
         f.instruction(&I::I32Const(ftab::FALLBACK as i32));
+        ftab_index(&mut f);
         f.instruction(&I::ReturnCallIndirect { type_index: 0, table_index: 0 });
         f.instruction(&I::End);
         code.function(&f);

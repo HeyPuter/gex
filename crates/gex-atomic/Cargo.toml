@@ -1,0 +1,7 @@
+[package]
+name = "gex-atomic"
+version = "0.0.1"
+edition = "2021"
+description = "Atomic operations on a word of guest memory, for the kernel (which forbids unsafe)"
+
+[dependencies]

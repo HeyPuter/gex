@@ -227,16 +227,16 @@ pub struct Remote {
     pub open_end: extern "C" fn(id: i32, master: i32),
     /// Drop a descriptor. The last on an end is the other end's EOF/hangup.
     pub close_end: extern "C" fn(id: i32, master: i32),
-    pub read: extern "C" fn(id: i32, master: i32, at: u32, len: u32) -> i32,
-    pub write: extern "C" fn(id: i32, master: i32, at: u32, len: u32) -> i32,
+    pub read: extern "C" fn(id: i32, master: i32, at: crate::PAddr, len: u32) -> i32,
+    pub write: extern "C" fn(id: i32, master: i32, at: crate::PAddr, len: u32) -> i32,
     pub readable: extern "C" fn(id: i32, master: i32) -> i32,
     pub available: extern "C" fn(id: i32, master: i32) -> i32,
     pub ptn: extern "C" fn(id: i32) -> i32,
     pub get_lock: extern "C" fn(id: i32) -> i32,
     pub set_lock: extern "C" fn(id: i32, locked: i32),
     /// The shared terminal state, in the byte shapes the ioctls exchange.
-    pub get_termios: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
-    pub set_termios: extern "C" fn(id: i32, at: u32, len: u32, flush: i32) -> i32,
+    pub get_termios: extern "C" fn(id: i32, at: crate::PAddr, len: u32) -> i32,
+    pub set_termios: extern "C" fn(id: i32, at: crate::PAddr, len: u32, flush: i32) -> i32,
     pub winsize: extern "C" fn(id: i32) -> u64,
     /// Sets the window size and, when it changed, delivers `SIGWINCH` to the
     /// foreground group itself (only the global kernel can, being next to the
@@ -285,14 +285,14 @@ impl RemotePty {
 
 impl crate::vfs::FileHandle for RemotePty {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
-        match (self.remote.read)(self.id, self.m(), buf.as_mut_ptr() as u32, buf.len() as u32) {
+        match (self.remote.read)(self.id, self.m(), buf.as_mut_ptr() as crate::PAddr, buf.len() as u32) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
-        match (self.remote.write)(self.id, self.m(), buf.as_ptr() as u32, buf.len() as u32) {
+        match (self.remote.write)(self.id, self.m(), buf.as_ptr() as crate::PAddr, buf.len() as u32) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
@@ -412,13 +412,13 @@ impl RemotePty {
         match req {
             ioc::TCGETS => {
                 let mut buf = [0u8; 60];
-                (r.get_termios)(id, buf.as_mut_ptr() as u32, buf.len() as u32);
+                (r.get_termios)(id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32);
                 m.write(arg, &buf[..KERNEL_TERMIOS])?;
                 Ok(0)
             }
             ioc::TCGETS2 => {
                 let mut buf = [0u8; 60];
-                (r.get_termios)(id, buf.as_mut_ptr() as u32, buf.len() as u32);
+                (r.get_termios)(id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32);
                 let mut out = [0u8; KERNEL_TERMIOS + 8];
                 out[..KERNEL_TERMIOS].copy_from_slice(&buf[..KERNEL_TERMIOS]);
                 out[KERNEL_TERMIOS..KERNEL_TERMIOS + 4].copy_from_slice(&38400u32.to_le_bytes());
@@ -429,13 +429,13 @@ impl RemotePty {
             ioc::TCSETS | ioc::TCSETSW | ioc::TCSETSF => {
                 let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
                 let flush = (req == ioc::TCSETSF) as i32;
-                (r.set_termios)(id, src.as_ptr() as u32, src.len() as u32, flush);
+                (r.set_termios)(id, src.as_ptr() as crate::PAddr, src.len() as u32, flush);
                 Ok(0)
             }
             ioc::TCSETS2 | ioc::TCSETSW2 | ioc::TCSETSF2 => {
                 let src = m.read(arg, KERNEL_TERMIOS)?.to_vec();
                 let flush = (req == ioc::TCSETSF2) as i32;
-                (r.set_termios)(id, src.as_ptr() as u32, src.len() as u32, flush);
+                (r.set_termios)(id, src.as_ptr() as crate::PAddr, src.len() as u32, flush);
                 Ok(0)
             }
             ioc::TIOCGWINSZ => {

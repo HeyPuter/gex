@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 pub mod aot;
 pub mod aot_only;
 pub mod libprov;
+pub(crate) mod wasmjit;
 pub mod aot_share;
 pub mod gl;
 pub mod profile;
@@ -168,6 +169,9 @@ pub struct RunOptions {
     /// `aot`). With it, an image is never translated: its module comes from
     /// the project, or the run fails.
     pub aot: Option<Arc<aot::Aot>>,
+    /// The guest memory (docs/mem64.md): wasm32 unless this process needs
+    /// more address space.
+    pub mem: gex_abi::MemFlavor,
     /// Run ahead-of-time code only (`aot_only`): an ejected Windows
     /// program's runtime, with no tier-1 module and no run-time translator.
     pub aot_only: bool,
@@ -176,6 +180,7 @@ pub struct RunOptions {
 impl Default for RunOptions {
     fn default() -> Self {
         RunOptions {
+            mem: gex_abi::MemFlavor::M32,
             args: Vec::new(),
             env: Vec::new(),
             trace: false,
@@ -218,6 +223,9 @@ struct HostState {
     proc_state: Arc<Mutex<ProcState>>,
     /// Set when a host function decided the run must stop.
     exit: Option<Exit>,
+    /// Set with `exit` when only this thread ends (`exit` with others left),
+    /// not the process.
+    pub(crate) thread_only: bool,
     /// Set when a host function wants execution to continue elsewhere.
     resume_at: Option<u64>,
     /// Why `resume_at` was set (GEX_NT_STATS only; `note_resume`).
@@ -291,6 +299,10 @@ struct SpawnContext {
     stopping: Arc<std::sync::atomic::AtomicBool>,
     /// How many spawned threads have not yet noticed.
     running: Arc<std::sync::atomic::AtomicUsize>,
+    /// How the process ended when a thread other than the first ended it
+    /// (`exit_group`, a fatal signal, a gex failure): the first thread only
+    /// sees `stopping`, and reports this instead of its own way out.
+    ended: Arc<Mutex<Option<Exit>>>,
     engine: Engine,
     /// The image module, instantiated fresh in each thread's store.
     image_module: Module,
@@ -550,6 +562,23 @@ pub(crate) fn ppm_every() -> u32 {
     *EVERY.get_or_init(|| std::env::var("GEX_PPM_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(1))
 }
 
+/// The guest memory's type: 4 GiB of wasm32, or for a 64-bit guest memory
+/// (docs/mem64.md) all of `LIMIT64` at once, which natively is only a
+/// reservation, so the high arena never needs the memory to grow.
+pub fn guest_memory_type() -> wasmtime::MemoryType {
+    if gex_abi::mem64() {
+        wasmtime::MemoryTypeBuilder::new()
+            .memory64(true)
+            .shared(true)
+            .min(gex_abi::LIMIT64_PAGES)
+            .max(Some(gex_abi::LIMIT64_PAGES))
+            .build()
+            .expect("a memory64 type")
+    } else {
+        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32)
+    }
+}
+
 pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
@@ -562,6 +591,10 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
+    // A 64-bit guest memory (docs/mem64.md).
+    if gex_abi::mem64() {
+        config.wasm_memory64(true);
+    }
     let engine = Engine::new(&config).context("creating the wasm engine")?;
     Module::validate(&engine, wasm).map_err(anyhow::Error::from)
 }
@@ -621,6 +654,13 @@ pub fn engine() -> Result<Engine> {
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
+    // A 64-bit guest memory (docs/mem64.md): a shared memory is a static
+    // allocation, so the reservation has to hold all of it. Only then: a
+    // wasm32 process keeps the engine it always had.
+    if gex_abi::mem64() {
+        config.wasm_memory64(true);
+        config.memory_reservation(gex_abi::LIMIT64);
+    }
     // gex's output is already optimised; Cranelift only adds register
     // allocation and peepholes, whose time dominates on a large program (half
     // a minute to compile SQLite vs under two seconds to translate).
@@ -926,6 +966,7 @@ fn run_program_with(
             memory: None,
             proc_state,
             exit: None,
+            thread_only: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -965,7 +1006,7 @@ fn run_program_with(
     // each of them a private copy of the address space.
     let shared = wasmtime::SharedMemory::new(
         &engine,
-        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32),
+        guest_memory_type(),
     )
     .context("creating the guest's shared memory")?;
     linker.define(&mut store, IMPORT_MODULE, exports::MEMORY, shared.clone())?;
@@ -1095,6 +1136,7 @@ fn run_program_with(
         wayland: compositor.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ended: Arc::new(Mutex::new(None)),
         engine: engine.clone(),
         image_module: module.clone(),
         linker: base_linker,
@@ -1158,6 +1200,9 @@ fn run_program_with(
     let Stopped::Exited(exit) = stopped else {
         unreachable!()
     };
+    // Another thread may have ended the process (this one then only saw
+    // `stopping`).
+    let exit = spawn.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit);
 
     // The process is over. Every other thread must stop before the stores and
     // memory go away: set the stopping flag and wake anyone parked on a futex,
@@ -1309,10 +1354,66 @@ fn perform_block(
         } => {
             // The re-read has to happen under the queue's own lock, which is
             // what closes the race between checking the word and sleeping.
+            // In slices, so a signal for this thread ends the wait (Linux
+            // interrupts a futex wait to run a handler; glibc takes EINTR as
+            // a spurious wake). Mono's GC suspends threads that sit in
+            // condition-variable waits exactly this way.
             let mem = GuestMem::new(data);
-            table
-                .wait(uaddr, val, deadline, &|| mem.read_u32(uaddr).ok())
-                .map(|_| 0)
+            let start = std::time::Instant::now();
+            let slice = std::time::Duration::from_millis(20);
+            loop {
+                let left = match deadline {
+                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
+                    Some(d) => (d - start.elapsed()).min(slice),
+                    None => slice,
+                };
+                match table.wait(uaddr, val, Some(left), &|| mem.read_u32(uaddr).ok()) {
+                    Err(Errno::ETIMEDOUT) => {
+                        if deadline.is_some_and(|d| start.elapsed() >= d) {
+                            return Err(Errno::ETIMEDOUT);
+                        }
+                        if interrupted() {
+                            return Err(Errno::EINTR);
+                        }
+                    }
+                    r => return r.map(|_| 0),
+                }
+            }
+        }
+        BlockOp::FutexLockPi { table, uaddr, tid, deadline } => {
+            use gex_kernel::futex::pi;
+            let start = std::time::Instant::now();
+            loop {
+                let mem = GuestMem::new(&mut *data);
+                let v = gex_atomic::load_u32(mem.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                match v & pi::TID_MASK {
+                    // Free: take it. The waiters bit stays (set) because
+                    // others may still sleep on it, so the next unlock goes
+                    // through the kernel and wakes one.
+                    0 => {
+                        if gex_atomic::cas_u32(mem.bytes, uaddr, v, tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
+                            return Ok(0);
+                        }
+                        continue;
+                    }
+                    owner if owner == tid => return Err(Errno::EDEADLK),
+                    _ => {}
+                }
+                let want = v | pi::WAITERS;
+                if v != want && gex_atomic::cas_u32(mem.bytes, uaddr, v, want).ok_or(Errno::EFAULT)?.is_err() {
+                    continue;
+                }
+                let left = match deadline {
+                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
+                    Some(d) => d - start.elapsed(),
+                    None => std::time::Duration::from_millis(100),
+                };
+                // In slices: the owner's UNLOCK_PI wakes this, and the word
+                // is re-read either way.
+                let _ = table.wait(uaddr, want, Some(left.min(std::time::Duration::from_millis(100))), &|| {
+                    mem.read_u32(uaddr).ok()
+                });
+            }
         }
         BlockOp::Sleep(d) => {
             // In slices, so a signal ends it. A flat `sleep(d)` is why
@@ -1555,6 +1656,28 @@ fn run_thread_loop(
                         continue;
                     }
                 }
+                // A wild pointer in a Linux guest with no SIGSEGV handler:
+                // the process dies of SIGSEGV, as it would natively (the
+                // translated code cannot say which instruction faulted, so a
+                // handler, which would resume there, is not run; that case
+                // stays a gex error below).
+                if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds))
+                    && store.data().nt.is_none()
+                {
+                    let action = store.data_mut().with_kernel(|k| k.signals.action(signal::SIGSEGV as u32));
+                    // GEX_TRACE_SEGV=1: where (with GEX_WASM_BACKTRACE=1, the wasm frames).
+                    if std::env::var_os("GEX_TRACE_SEGV").is_some() {
+                        eprintln!("gex: guest memory access out of bounds: {e:?}");
+                    }
+                    if action.handler == 0 {
+                        return Ok(Stopped::Exited(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc: 0,
+                            detail: "guest memory access out of bounds".into(),
+                            internal: false,
+                        }));
+                    }
+                }
                 return Err(classify_trap(e, store));
             }
         }
@@ -1573,17 +1696,29 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
         .name(format!("gex-tid-{}", child.tid))
         .stack_size(guest_thread_stack())
         .spawn(move || {
-            if let Err(e) = run_guest_thread(Arc::clone(&cx), child) {
-                eprintln!("gexc: thread {} failed: {e:#}", child.tid);
-                // A thread that fails takes its process with it, as on
-                // Linux: otherwise the other threads sit in a futex
-                // forever and every descriptor it holds stays open.
-                stop_other_threads(&cx, false);
-                cx.kernel
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .fds
-                    .close_all();
+            match run_guest_thread(Arc::clone(&cx), child) {
+                Err(e) => {
+                    eprintln!("gexc: thread {} failed: {e:#}", child.tid);
+                    // A thread that fails takes its process with it, as on
+                    // Linux: otherwise the other threads sit in a futex
+                    // forever and every descriptor it holds stays open.
+                    end_process(&cx, Exit::Signal {
+                        signal: signal::SIGSEGV,
+                        pc: 0,
+                        detail: format!("thread {} failed: {e:#}", child.tid),
+                        internal: true,
+                    });
+                    cx.kernel
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .fds
+                        .close_all();
+                }
+                // `exit_group` or a fatal signal on this thread: the process
+                // ends with it, and the first thread, parked in a futex
+                // (`pthread_join`) or running, must hear how.
+                Ok(Some(exit)) => end_process(&cx, exit),
+                Ok(None) => {}
             }
             running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         })
@@ -1636,7 +1771,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
 
     let shared = wasmtime::SharedMemory::new(
         &cx.engine,
-        wasmtime::MemoryType::shared(GUEST_MEM_PAGES as u32, GUEST_MEM_PAGES as u32),
+        guest_memory_type(),
     )
     .context("creating the child's memory")?;
     let child_mem = gex_mem::GuestMemory::new(shared);
@@ -1693,6 +1828,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         wayland: cx.wayland.clone(),
         stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ended: Arc::new(Mutex::new(None)),
         engine: cx.engine.clone(),
         image_module: cx.image_module.clone(),
         linker: cx.linker.clone(),
@@ -1774,6 +1910,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
+            thread_only: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -1832,7 +1969,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
     match stopped {
         Stopped::Exited(exit) => {
             stop_other_threads(&cx, false);
-            Ok(exit)
+            Ok(cx.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit))
         }
         Stopped::Exec(req) => {
             // The child is usually the one that execs: this is the shell's
@@ -1882,15 +2019,27 @@ fn exec_program(
     let program = gex_ld::load_program(
         &bytes,
         gex_abi::PIE_BASE,
-        gex_abi::PIE_BASE + 0x1000_0000,
+        // Where `gexc run` and the browser put it: the kernel knows the
+        // loader by that address (its reservations for code stay below 4 GiB
+        // in a 64-bit memory).
+        gex_abi::INTERP_BASE,
         &|p| kernel.read_file(p),
     )
     .with_context(|| format!("execve: loading {}", req.path))?;
+    // What the translators knew of the old image is about addresses the new
+    // one holds now.
+    let mut xlate = xlate.clone();
+    xlate.intrinsics = gex_xlate::intrinsic::program_intrinsics(&program);
+    if let Some(t) = gex_kernel::ftab::translator() {
+        t.exec(&program, &bytes);
+    }
     // Descriptors marked close-on-exec go now; the rest survive, which is how
     // a shell hands a pipe to the command it starts.
     kernel.close_on_exec();
     // And the handlers, which are addresses in the image being replaced.
     kernel.signals.exec();
+    // Every other thread is gone; their signal state with them.
+    kernel.thread_signals.clear();
     // `/proc/self/exe` is the file just loaded, by its guest path -- not
     // argv[0], which for a busybox applet run through `$PATH` is a bare `wc`
     // (and glibc's `$ORIGIN` handling asserts on a relative link).
@@ -1907,7 +2056,7 @@ fn exec_program(
     run_program_with(
         &program,
         &opts,
-        xlate,
+        &xlate,
         Some(Inherited {
             kernel,
             proc_state,
@@ -1918,7 +2067,9 @@ fn exec_program(
 }
 
 /// A guest thread: its own store, its own instances, the same memory.
-fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
+/// Run one spawned thread to its end. `Some` when its end is the process's
+/// (`exit_group`, a fatal signal), not just its own.
+fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option<Exit>> {
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -1927,6 +2078,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
             memory: Some(cx.memory.clone()),
             proc_state: Arc::clone(&cx.proc_state),
             exit: None,
+            thread_only: false,
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
@@ -1994,11 +2146,27 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<()> {
         aot_only::bind_root(&mut store, &instance)?;
     }
     let stopped = run_thread_loop(&mut store, &instance, thread.ctx_addr, entry)?;
+    libprov::guest_stop().forget(thread.tid as u32);
     profile::harvest(&mut store)?;
-    if let Stopped::Exec(_) = stopped {
-        bail!("execve from a non-main thread is not supported");
+    match stopped {
+        Stopped::Exec(_) => bail!("execve from a non-main thread is not supported"),
+        // Stopped because another thread ended the process: that one says how.
+        Stopped::Exited(_) if cx.stopping.load(std::sync::atomic::Ordering::Acquire) => Ok(None),
+        Stopped::Exited(_) if store.data().thread_only => Ok(None),
+        Stopped::Exited(exit) => Ok(Some(exit)),
     }
-    Ok(())
+}
+
+/// A thread other than the first ended the process with `exit`: keep the
+/// first such end and stop every thread.
+fn end_process(cx: &SpawnContext, exit: Exit) {
+    {
+        let mut ended = cx.ended.lock().unwrap_or_else(|e| e.into_inner());
+        if ended.is_none() && !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            *ended = Some(exit);
+        }
+    }
+    stop_other_threads(cx, false);
 }
 
 /// Instantiate every registry entry into this store, outside a wasm frame.
@@ -2760,13 +2928,21 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // a process asleep in a wait loop issues no syscalls, so
                 // nothing else would ever arm `SIGALRM`.
                 let kernel_for_signals = Arc::clone(&caller.data().kernel);
+                // Signals for *this* thread: masks and thread-directed signals
+                // are per thread, and the kernel's loaded state may be another
+                // thread's by the time this asks.
+                let waiting_tid = caller.data().thread.tid;
                 let interrupted = move || {
                     kernel_for_signals
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .signal_pending()
+                        .signal_pending_for(waiting_tid)
                 };
+                // Blocked in the kernel counts as stopped for a provider's
+                // collection; the thread parks on its way out if one runs.
+                libprov::guest_stop().enter_kernel(waiting_tid as u32);
                 let r = perform_block(op, memory.bytes(), &service, &interrupted);
+                libprov::guest_stop().leave_kernel(waiting_tid as u32, memory.bytes());
                 let mut gm = GuestMem::new(memory.bytes());
                 caller
                     .data_mut()
@@ -2803,6 +2979,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .data_mut()
                 .with_kernel(|k| std::mem::take(&mut k.new_code));
             profile::note_mapped(caller.data_mut(), &mapped);
+            // A library a stateful provider replaces (stream U): bound before
+            // the loader can call into it.
+            libprov::on_linux_maps(&mut caller, &mapped)?;
             profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
@@ -2889,6 +3068,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 SyscallOutcome::ThreadExit => {
                     state.exit = Some(Exit::Status(0));
+                    state.thread_only = true;
                     Err(StopExecution.into())
                 }
                 SyscallOutcome::Killed { signal, core } => {
@@ -3035,6 +3215,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
             let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             if caller.data().nt.is_some() {
+                // What gex could not decode, or a deliberate trap: the bytes
+                // say which (the guest's handler may take it either way).
+                if let Some(m) = caller.data().memory.clone() {
+                    let gm = GuestMem::new(m.bytes());
+                    let bytes: Vec<String> = gm.read(pc as u64, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect()).unwrap_or_default();
+                    eprintln!("gex-nt: illegal instruction at {:#x}: {}", pc as u64, bytes.join(" "));
+                }
                 return nt::fault_at(&mut caller, nt::Fault::Illegal, pc as u64, resumable);
             }
             let pc = pc as u64;
@@ -3523,6 +3710,15 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 state.exit = Some(Exit::Status(0));
                 return Err(StopExecution.into());
             }
+            // An NT thread another has suspended (NtSuspendThread) stops
+            // here, its registers written back, until it is resumed.
+            if let Some(p) = state.nt.clone() {
+                gex_kernel::nt::suspend_point(&p, ctx_addr);
+            }
+            // A stateful provider's collection stops guest threads here.
+            if libprov::guest_stop().active() {
+                libprov::guest_stop().park_if_stopping(state.thread.tid as u32, gm.bytes, false);
+            }
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
@@ -3683,17 +3879,31 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // libc from scratch (eight seconds on `dpkg --version`).
     let cache = caller.data().jit.as_ref().and_then(|j| j.cache.clone());
     let t0 = std::time::Instant::now();
+    // `GEX_DUMP_BAD_WASM=DIR`: keep a translation the engine rejects, as
+    // DIR/PC.wasm, to take apart offline (wasm-tools validate/print).
+    let keep_bad = |e: anyhow::Error| -> anyhow::Error {
+        if let Some(dir) = std::env::var_os("GEX_DUMP_BAD_WASM") {
+            let path = std::path::Path::new(&dir).join(format!("{pc:x}.wasm"));
+            let _ = std::fs::create_dir_all(&dir);
+            if std::fs::write(&path, &translated_module.wasm).is_ok() {
+                return e.context(format!("the module is in {}", path.display()));
+            }
+        }
+        e
+    };
     let module = match cache {
         Some((dir, build)) => {
             let key = gex_cache::key(&build, [translated_module.wasm.as_slice()]);
             let wasm = translated_module.wasm.clone();
             let l = gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
+                .map_err(keep_bad)
                 .context("compiling runtime-translated wasm")?;
             let c = if l.hit { &jit_stats::CACHE_HITS } else { &jit_stats::CACHE_MISSES };
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             l.module
         }
         None => Module::new(&engine, &translated_module.wasm)
+            .map_err(|e| keep_bad(anyhow::Error::from(e)))
             .context("validating runtime-translated wasm")?,
     };
     jit_stats::COMPILE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -3707,13 +3917,30 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     replay_registry(caller)?;
 
     // If the address that faulted did not end up with code, resuming would
-    // fault again at the same place forever. Say so instead.
-    let covered = {
+    // fault again at the same place forever. Say so instead -- unless its
+    // page was retired while this translation was being made (another
+    // thread's block guard saw a JIT rewrite code there, or an munmap or
+    // mprotect): `publish_unit` then counts the block stale, and translating
+    // again from the current memory is the answer. Bounded, so a page that
+    // keeps changing under its translator still reports.
+    let (covered, retired) = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.translated.contains(&pc)
+        let page = pc / gex_abi::DISPATCH_PAGE;
+        (sh.translated.contains(&pc), sh.page_table.lookup(page) != translated_module.page_table.lookup(page))
     };
     if !covered {
-        bail!("translated blocks but none covered 0x{pc:x}");
+        thread_local! {
+            static RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        const MAX_RETRIES: u32 = 16;
+        if retired && RETRIES.with(|r| r.get()) < MAX_RETRIES {
+            jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            RETRIES.with(|r| r.set(r.get() + 1));
+            let again = translate_and_install(caller, pc);
+            RETRIES.with(|r| r.set(r.get() - 1));
+            return again;
+        }
+        bail!("translated blocks but none covered 0x{pc:x}{}", if retired { " (its page kept being retired)" } else { "" });
     }
     Ok(true)
 }

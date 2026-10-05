@@ -1072,20 +1072,20 @@ mod epoll_tests {
 #[derive(Clone, Copy)]
 pub struct Remote {
     /// Bind and listen in one. Returns a listener id or a negated errno.
-    pub bind: extern "C" fn(path: u32, path_len: u32) -> i32,
+    pub bind: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     /// Connect to a name. Returns this end's id, or a negated errno.
-    pub connect: extern "C" fn(path: u32, path_len: u32) -> i32,
+    pub connect: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     /// Take a waiting connection. Returns the server end's id, or -EAGAIN.
     pub accept: extern "C" fn(listener: i32) -> i32,
     pub pending: extern "C" fn(listener: i32) -> i32,
-    pub read: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
-    pub write: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
+    pub read: extern "C" fn(id: i32, at: crate::PAddr, len: u32) -> i32,
+    pub write: extern "C" fn(id: i32, at: crate::PAddr, len: u32) -> i32,
     pub readable: extern "C" fn(id: i32) -> i32,
     pub writable: extern "C" fn(id: i32) -> i32,
     pub available: extern "C" fn(id: i32) -> i32,
     pub close: extern "C" fn(id: i32),
     pub shutdown: extern "C" fn(id: i32),
-    pub exists: extern "C" fn(path: u32, path_len: u32) -> i32,
+    pub exists: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
 }
 
 /// One end of a socket in the global kernel.
@@ -1166,7 +1166,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
         if self.listening {
             return Err(Errno::ENOTCONN);
         }
-        match (self.remote.read)(self.id, buf.as_mut_ptr() as u32, buf.len() as u32) {
+        match (self.remote.read)(self.id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
@@ -1176,7 +1176,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
         if self.listening {
             return Err(Errno::ENOTCONN);
         }
-        match (self.remote.write)(self.id, buf.as_ptr() as u32, buf.len() as u32) {
+        match (self.remote.write)(self.id, buf.as_ptr() as crate::PAddr, buf.len() as u32) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
