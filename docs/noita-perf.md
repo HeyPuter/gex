@@ -1680,3 +1680,56 @@ fps: 5% faster than pewasm's 45.9 and 14% faster than guarded's 42.4**. So the p
 (`unguarded=0` for the guarded one; the ejected page passes its flavor
 explicitly), and scratch/fjit/build-bm.sh builds GUARD=0 by default (N1
 done).
+
+### Stream F at the 2026-10-05 evening reboot (resume here; supersedes the sections above)
+
+Branch merge/fjit (wt/fjit), master b7fead07 merged (ffa941cb). Commits since
+e845cb2c: d54095e5 leaf inlining (gex-cgen, opt-in INLINELEAVES: re-keys
+units, tell the coordinator before it lands), fdbb1d9e page default
+unguarded (N1 done, n1 table above), the WIP commit below (client-state GL
+fast path, provider + layer).
+
+**State of things:**
+- n1 done: unguarded units are 14% faster than guarded (48.25 vs 42.4 world
+  fps) and 5% faster than pewasm (45.9) on edger. The page's `cgen=` is now
+  unguarded; `unguarded=0` for guarded; scratch/fjit/build-bm.sh defaults to
+  GUARD=0.
+- Leaf inlining: NT suite --cgen with INLINELEAVES natively 81/81
+  (logs/nt-inl.txt). **Not yet measured in the page.** Caches on gooner and
+  edger, keyed for the current tree (gex-cgen = d54095e5's; noita.exe key
+  a2d761b1...): `target/bm-hu2` (unguarded, no exp) and `target/bm-hui`
+  (bm-hu2 + INLINELEAVES in Noita's 8 images; prefix symlinked to bm-hu2's).
+  Both synced to edger; edger's web/public/gex shims are from ffa941cb +
+  fdbb1d9e (match these keys). gooner's target/x86/release/gexc is HEAD's.
+  (target/x86-inl's gexc is stale: other keys. Delete it.)
+- Client-state GL fast path (WIP commit, provider .c and gex-kernel only, no
+  unit re-key): glEnable/DisableClientState go into the ring from the
+  nt_unixcall provider; the array flags live in a guest word GL_FAST_ARRAYS
+  (USD+0xfe8, bits = array index, bits 16..19 client texture) that the layer
+  reads back before draws (sync_arrays) and writes on its own path
+  (publish_arrays). gex-kernel's constants test passes; NT suite --cgen run
+  was cut off by the reboot. Needs: the NT suite (both modes), then a page
+  A/B (GEX_NT_GL_FAST=0 vs default is not enough: that turns off the whole
+  fast path).
+- Nothing running for stream F on gooner or edger.
+
+**Next commands:**
+1. i1 (inlining A/B, edger): `cd ~/gex-sandbox; T=/home/claude/gex-sandbox/wt/fjit/target;
+   scratch/bench/bench.sh -- scratch/fjit/e/seq.sh i1 /home/claude/gex-sandbox/wt/fjit 240 "u=$T/bm-hu2" "i=$T/bm-hui" > scratch/fjit/e/seq-i1.out 2>&1`
+   (if shims or gex-cgen changed since, rebuild shims with
+   scratch/fjit/build-shims.sh, relink both caches with
+   `GUARD=0 JOBS=12 scratch/fjit/build-bm.sh $T/bm-hu2 $T/bm-hu` and
+   `GUARD=0 JOBS=12 GEX_CGEN_EXP=INLINELEAVES scratch/fjit/variant.sh $T/bm-hu2 $T/bm-hui noita.exe lua51.dll msvcr120.dll SDL2.dll msvcp120.dll fmod.dll fmodstudio.dll steam_api.dll`
+   (rm -rf bm-hui first), check the noita.exe key matches the page's, then
+   `scratch/fjit/e/sync.sh bm-hu2 bm-hui`). Profiles land in
+   scratch/fjit/e/i1-*-shots on edger; per-function table with
+   scratch/fjit/v8/cmp.py against pwprof1 (FRAMES 987 for pwprof1; gex:
+   world fps x 30).
+2. If inlining wins: make it the default (drop the exp gate), tell the
+   coordinator (re-key). Then the cold-path growth (0x70bdc0's wasm is 41%
+   bigger, 33.5 vs 23.8 KB: fallbacks and ret-mismatch exits write back the
+   xmm registers).
+3. NT suite for the client-state commit:
+   `cd wt/fjit; GEX_CGEN_CACHE=$PWD/target/nt-test-cgen-inl GEXC_RUN_FLAGS=--cgen tests/nt/run.sh $PWD/target/x86/release/gexc`
+   and without GEXC_RUN_FLAGS; then main-thread items (mono_ns clock reads,
+   tier-1 dispatch misses).

@@ -53,6 +53,13 @@ pub const GL_FAST_RING: u64 = super::USD + 0xfe0;
 /// command or a submit) owns the ring until it stores the new tail.
 pub const GL_FAST_TAIL: u64 = super::USD + 0xfe4;
 pub const TAIL_BUSY: u32 = 1 << 31;
+/// The fixed-function client arrays' state, where the fast path's
+/// glEnableClientState/glDisableClientState change it: bit `i` is array
+/// `i` enabled (`VERTEX` .. `FOG`), bits 16..19 the client active texture
+/// unit. The layer's copy (`arrays[i].enabled`) is refreshed from it
+/// before a draw reads it ([`sync_arrays`]).
+pub const GL_FAST_ARRAYS: u64 = super::USD + 0xfe8;
+const ARRAYS_TEX_SHIFT: u32 = 16;
 
 /// Whether the fast path is offered: the host sets it from `GEX_NT_GL_FAST`
 /// (default on; `0` for A/B runs) before the program starts.
@@ -352,6 +359,7 @@ fn open_device(c: &mut Call<'_>) -> R<()> {
     // An empty ring, then (with the fast path) where it is: a provider
     // that reads the address sees a tail that belongs to it.
     c.g.w32(GL_FAST_TAIL, 0)?;
+    c.g.w32(GL_FAST_ARRAYS, 0)?;
     if fast_path() {
         c.g.w32(GL_FAST_RING, ring as u32)?;
     }
@@ -1072,6 +1080,7 @@ fn upload_scratch(c: &mut Call<'_>, scratch: u32, target: u32, data: &[u8]) -> R
 /// Client-memory arrays (fixed and generic) copied into buffers of ours for
 /// a draw reaching `vertices` vertices and `instances` instances.
 fn upload_arrays_instanced(c: &mut Call<'_>, vertices: usize, instances: usize) -> R<()> {
+    sync_arrays(c);
     let (arrays, attribs, bound) = {
         let s = c.p.gl.lock().unwrap();
         (s.arrays, s.attribs, s.array_buffer)
@@ -1117,8 +1126,32 @@ fn upload_arrays_instanced(c: &mut Call<'_>, vertices: usize, instances: usize) 
     Ok(())
 }
 
+/// The arrays' enabled flags as the fast path left them
+/// ([`GL_FAST_ARRAYS`]), into the layer's state.
+fn sync_arrays(c: &Call<'_>) {
+    let Ok(w) = c.g.u32(GL_FAST_ARRAYS) else { return };
+    let mut s = c.p.gl.lock().unwrap();
+    for (i, a) in s.arrays.iter_mut().enumerate().take(FOG + 1) {
+        a.enabled = w >> i & 1 != 0;
+    }
+}
+
+/// Write the layer's array flags and client texture to [`GL_FAST_ARRAYS`].
+fn publish_arrays(c: &mut Call<'_>) -> R<()> {
+    let w = {
+        let s = c.p.gl.lock().unwrap();
+        let mut w = (s.client_texture as u32) << ARRAYS_TEX_SHIFT;
+        for (i, a) in s.arrays.iter().enumerate().take(FOG + 1) {
+            w |= (a.enabled as u32) << i;
+        }
+        w
+    };
+    c.g.w32(GL_FAST_ARRAYS, w)
+}
+
 /// Whether any enabled array is in client memory.
 fn client_arrays(c: &Call<'_>) -> bool {
+    sync_arrays(c);
     let s = c.p.gl.lock().unwrap();
     s.arrays.iter().any(|a| a.enabled && a.buffer == 0 && a.pointer != 0)
         || s.attribs.iter().any(|a| a.enabled && a.buffer == 0 && a.pointer != 0)
@@ -1916,7 +1949,9 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             let Some(i) = array_index(c, cap) else {
                 return Err(c.unimplemented(&format!("{name}({cap:#x})")));
             };
+            sync_arrays(c);
             c.p.gl.lock().unwrap().arrays[i].enabled = on;
+            publish_arrays(c)?;
             cmd(c, if on { op::ENABLE_CLIENT_STATE } else { op::DISABLE_CLIENT_STATE }, &[cap], &[])?;
         }
         "glVertexPointer" => set_pointer(c, VERTEX, op::VERTEX_POINTER, p.i32(c, 1)?, p.u32(c, 2)?, p.i32(c, 3)?, p.ptr(c, 4)?)?,
@@ -1930,7 +1965,9 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             if unit >= ARRAYS - TEXCOORD {
                 return Err(c.unimplemented(&format!("texture unit {unit} for client arrays")));
             }
+            sync_arrays(c);
             c.p.gl.lock().unwrap().client_texture = unit;
+            publish_arrays(c)?;
             cmd(c, op::CLIENT_ACTIVE_TEXTURE, &[0x84c0 + unit as u32], &[])?;
         }
         "glDrawArrays" => {
@@ -2441,6 +2478,19 @@ mod tests {
         assert_eq!(def("GL_FAST_RING"), GL_FAST_RING);
         assert_eq!(def("GL_FAST_TAIL"), GL_FAST_TAIL);
         assert_eq!(def("TAIL_BUSY"), TAIL_BUSY as u64);
+        assert_eq!(def("GL_FAST_ARRAYS"), GL_FAST_ARRAYS);
+        assert_eq!(def("ARRAYS_TEX_SHIFT"), ARRAYS_TEX_SHIFT as u64);
+        for (name, i) in [("A_VERTEX", VERTEX), ("A_COLOR", COLOR), ("A_TEXCOORD", TEXCOORD), ("A_NORMAL", NORMAL), ("A_SECONDARY", SECONDARY), ("A_FOG", FOG)] {
+            assert_eq!(def(name), i as u64, "{name}");
+        }
+        assert_eq!(def("TEX_UNITS"), (ARRAYS - TEXCOORD) as u64);
+        for (f, o, name, op) in [
+            ("FN_glEnableClientState", "OP_ENABLE_CLIENT_STATE", "glEnableClientState", op::ENABLE_CLIENT_STATE),
+            ("FN_glDisableClientState", "OP_DISABLE_CLIENT_STATE", "glDisableClientState", op::DISABLE_CLIENT_STATE),
+        ] {
+            assert_eq!(table::FUNCS[def(f) as usize].0, name, "{f}");
+            assert_eq!(def(o), op as u64, "{o}");
+        }
         assert_eq!(def("RING_HEADER"), HEADER);
         assert!(src.contains("#define CMD_CAPACITY (8u << 20)") && CMD_CAPACITY == 8 << 20);
         assert_eq!(super::super::boot::tramp::UNIX_CALL_32, super::super::TRAMPOLINES + 0x60);
