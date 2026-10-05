@@ -16,7 +16,7 @@ SEED=$ROOT/web/public/gex/seed.x86.shared.wasm
 WORK=${WORK:-$(mktemp -d)}
 fail=0
 run() {
-    GEX_ARCH=x86 GEX_SHARED=1 timeout "${TMO:-300}" node "$ROOT/shims/browser/js/run-node.mjs" "$@" 2>/dev/null | grep -v '^\[host\]\|^\[gex\] fork -> \|^\[worker\] '
+    GEX_ARCH=x86 GEX_SHARED=1 timeout "${TMO:-300}" node "$ROOT/shims/browser/js/run-node.mjs" "$@" 2>/dev/null | grep -v '^\[host\]\|^\[gex\] \|^\[worker\] '
 }
 for src in "$HERE"/*.c; do
     name=$(basename "$src" .c)

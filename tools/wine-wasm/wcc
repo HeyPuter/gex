@@ -177,9 +177,13 @@ if shared:
         sys.exit(r)
     finish(out)
     sys.exit(0)
+# gex's support library (build-sysroot.sh, libgex/), before libc: its
+# dlopen, __dlsym and vfork replace libc's; the setjmp runtime and the
+# signal frames are only there.
+libgex = [lib + '/libgex.a'] if os.path.exists(lib + '/libgex.a') else []
 wasm = out + '.wasm'
 cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
-    ['-lc', lib + '/libclang_rt.builtins-wasm32.a']
+    libgex + ['-lc', lib + '/libclang_rt.builtins-wasm32.a']
 r = subprocess.call(cmd)
 if r:
     sys.exit(r)
