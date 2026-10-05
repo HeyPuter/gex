@@ -1640,3 +1640,24 @@ noita.exe built fine this time (no unit-925 failure). Caches on gooner:
    the fast path (array flags into guest memory), mono_ns clock reads
    (QPC provider, syscall tick), tier-1 dispatch misses.
 Nothing running on gooner or edger for stream F.
+
+### Stream F after the restart (2026-10-05 evening; resume here)
+
+- bm-hu finished (90 prefix units, 214 MiB). bm-hud turned out identical to
+  bm-hu (its variant compiled 0 units: GEX_CGEN_WB_DEVIRT never reached the
+  build), so the n1 sequence drops the `ud` arm.
+- bm-h (guarded) building: `scratch/fjit/chain-n1.sh` (logs/n1-bm-h.out).
+- **Leaf inlining (d54095e5, gex-cgen, opt-in `GEX_CGEN_EXP=INLINELEAVES`,
+  i386):** calls to small call-free leaves are inlined into the caller's
+  GIR (`FnUnit::inline_leaf_calls`) instead of calling the `fl_` copy,
+  which clang never inlined usefully: the copy reads its registers from
+  the context and clang cannot forward the caller's stores past guest
+  stores (one linear memory). 0x70b200's devirtualised getter calls are
+  now a compare, the patched-page byte and local moves. Cold growth:
+  0x70bdc0 +41% wasm (34 sites: fallback calls and the ret-mismatch
+  exits write back the xmm registers). gexc with it: target/x86-inl.
+  Its tree re-keys every unit: A/B needs both arms (bm-hu2 = no exp,
+  bm-hui = exp in Noita's images) and shims from d54095e5.
+- NT suite with --cgen + INLINELEAVES (native): logs/nt-inl.txt.
+Next: n1 sequence (g vs u) once bm-h is done; then the i1 sequence
+(u2 vs ui) with shims rebuilt from d54095e5.
