@@ -949,7 +949,7 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
     site22, world-up A/B site22/site23, trace tr23, readback shots.
   - **Results (edger, site23 = the WebGPU compositor, site22 = before):**
     ABBA pew 47.5 / site23 56.2 / site22 57.8 / site22 55.7 / site23 60.4 /
-    pew 46.3: site23 58.3 vs site22 56.8 vs pewasm 46.9 (**1.24x**); world-up
+    pew 46.3: site23 58.3 vs site22 56.8 vs pewasm 46.9 (**site23 1.24x faster than pewasm, 58.3 vs 46.9 world fps**); world-up
     after navigation x3: site22 35.8, 36.7, 35.7 vs site23 35.7, 34.8, 38.0
     (no change: the compositor was not on the start-up path). Trace tr23 (10
     s in the world): no ReadPixels / CopyRenderingResults / WebGL events, the
