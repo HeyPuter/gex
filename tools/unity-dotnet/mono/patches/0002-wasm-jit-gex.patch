@@ -1,3 +1,41 @@
+diff --git a/src/libraries/System.Private.CoreLib/src/System/Runtime/InteropServices/GCHandle.cs b/src/libraries/System.Private.CoreLib/src/System/Runtime/InteropServices/GCHandle.cs
+index 060143b50..eaed95671 100644
+--- a/src/libraries/System.Private.CoreLib/src/System/Runtime/InteropServices/GCHandle.cs
++++ b/src/libraries/System.Private.CoreLib/src/System/Runtime/InteropServices/GCHandle.cs
+@@ -46,11 +46,13 @@ private GCHandle(object? value, GCHandleType type)
+ 
+             IntPtr handle = InternalAlloc(value, type);
+ 
++#if !MONO
+             if (type == GCHandleType.Pinned)
+             {
+                 // Record if the handle is pinned.
+                 handle |= 1;
+             }
++#endif
+ 
+             _handle = handle;
+         }
+@@ -180,10 +182,19 @@ public static GCHandle FromIntPtr(IntPtr value)
+         public static bool operator !=(GCHandle a, GCHandle b) => a._handle != b._handle;
+ 
+         [MethodImpl(MethodImplOptions.AggressiveInlining)]
++#if MONO
++        // gex's Mono: handles are the GC's raw values, as Unity's native code passes them (gc-internals.h);
++        // the low three bits are the handle type + 1, so a pinned handle (type 3) ends in 4.
++        private static IntPtr GetHandleValue(IntPtr handle) => handle;
++
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        private static bool IsPinned(IntPtr handle) => (handle & 7) == 4;
++#else
+         private static IntPtr GetHandleValue(IntPtr handle) => new IntPtr(handle & ~1); // Remove Pin flag
+ 
+         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+         private static bool IsPinned(IntPtr handle) => (handle & 1) != 0; // Check Pin flag
++#endif
+ 
+         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+         private static void ThrowIfInvalid(IntPtr handle)
 diff --git a/src/mono/cmake/config.h.in b/src/mono/cmake/config.h.in
 index 7d2b81fc9..56a529ae6 100644
 --- a/src/mono/cmake/config.h.in
@@ -13,6 +51,24 @@ index 7d2b81fc9..56a529ae6 100644
 +#if defined(HOST_BROWSER) || defined(HOST_GEX)
 +#define WJ_RUNTIME 1
 +#endif
+diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
+index f0141675b..632d3eb4f 100644
+--- a/src/mono/mono/metadata/gc-internals.h
++++ b/src/mono/mono/metadata/gc-internals.h
+@@ -30,8 +30,11 @@
+  * are used to convert between the old int32 representation to a netcore compatible pointer
+  * representation.
+  */
+-#define MONO_GC_HANDLE_TO_UINT(ptr) ((guint32)((size_t)(ptr) >> 1))
+-#define MONO_GC_HANDLE_FROM_UINT(i) ((MonoGCHandle)((size_t)(i) << 1))
++/* gex: a handle is the GC's own value, unshifted, as in Unity's Mono, whose native and managed code (UnityPlayer
++ * and UnityEngine's GCHandle.FromIntPtr) pass the same raw values both ways. CoreLib's GCHandle is patched to
++ * match: no pin bit, a pinned handle is told by its type bits (the GC's type + 1 in the low three bits). */
++#define MONO_GC_HANDLE_TO_UINT(ptr) ((guint32)(size_t)(ptr))
++#define MONO_GC_HANDLE_FROM_UINT(i) ((MonoGCHandle)(size_t)(i))
+ /*
+  * Return a GC descriptor for an array containing N pointers to memory allocated
+  * by mono_gc_alloc_fixed ().
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
 index ed1afb5a7..45839cad6 100644
 --- a/src/mono/mono/metadata/sgen-mono.c

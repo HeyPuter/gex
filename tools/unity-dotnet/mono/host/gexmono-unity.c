@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include "gexmono-adapters.h"
 #include <mono/metadata/class-internals.h>
 #include <mono/metadata/object-internals.h>
@@ -224,6 +225,54 @@ U(mono_thread_pop_appdomain_ref) { ENTER; RETV; }
 U(mono_thread_has_sufficient_execution_stack) { ENTER; RET (1); }
 U(mono_gchandle_is_in_domain) { ENTER; RET (1); }
 U(mono_gchandle_is_in_domain_v2) { ENTER; RET (1); }
+/* Unity 6 uses the v2 handle API with Unity's Mono encoding: a v2 handle is the GC's own handle value
+ * (slot << 3 | type + 1), which Unity's libmonobdwgc also returns from the v1 calls. Its scripting layer
+ * tests bit 0: set (normal and weak handles), a GC handle; clear, a pointer to an object reference; and its
+ * managed code takes the same values (GCHandle.FromIntPtr). This tree's runtime and CoreLib use that raw
+ * value as the handle (gc-internals.h, GCHandle.cs), so v1 and v2 calls are the same functions here. */
+MonoGCHandle mono_gchandle_new_internal (MonoObject *obj, gboolean pinned);
+MonoGCHandle mono_gchandle_new_weakref_internal (MonoObject *obj, gboolean track_resurrection);
+MonoObject *mono_gchandle_get_target_internal (MonoGCHandle gchandle);
+void mono_gchandle_free_internal (MonoGCHandle gchandle);
+#define UNITY_H(h) ((uintptr_t)(h))
+#define GC_H(u) ((MonoGCHandle)(uintptr_t)(u))
+/* Unity reads handles after freeing them (Hollow Knight: get_target on a freed handle), which Unity's
+ * Boehm-backed Mono answers with NULL and SGen asserts on. So the handles given out are remembered, and a
+ * read or free of one that is not live is NULL / nothing. */
+static GHashTable *live_handles;
+static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t
+handle_out (MonoGCHandle h)
+{
+	uintptr_t u = UNITY_H (h);
+	pthread_mutex_lock (&live_lock);
+	if (!live_handles)
+		live_handles = g_hash_table_new (NULL, NULL);
+	g_hash_table_add (live_handles, (gpointer)u);
+	pthread_mutex_unlock (&live_lock);
+	if (gexmono_trace_on)
+		fprintf (stderr, "[gexmono] -> gchandle %#llx\n", (unsigned long long)u);
+	return u;
+}
+static gboolean
+handle_live (uintptr_t u, gboolean drop)
+{
+	pthread_mutex_lock (&live_lock);
+	gboolean live = live_handles && (drop ? g_hash_table_remove (live_handles, (gpointer)u) : g_hash_table_contains (live_handles, (gpointer)u));
+	pthread_mutex_unlock (&live_lock);
+	if (!live)
+		fprintf (stderr, "[gexmono] gchandle %#llx is not live (%s)\n", (unsigned long long)u, drop ? "free" : "get_target");
+	return live;
+}
+U(mono_gchandle_new_v2) { ENTER; RET (handle_out (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_new_weakref_v2) { ENTER; RET (handle_out (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_get_target_v2) { ENTER; RET (handle_live (A (0), FALSE) ? (uintptr_t)mono_gchandle_get_target_internal (GC_H (A (0))) : 0); }
+U(mono_gchandle_free_v2) { ENTER; if (handle_live (A (0), TRUE)) mono_gchandle_free_internal (GC_H (A (0))); RETV; }
+/* The v1 calls too, in the same encoding: Unity mixes them (a handle from one, freed or read by the other). */
+U(mono_gchandle_new) { ENTER; RET ((uint32_t)handle_out (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_new_weakref) { ENTER; RET ((uint32_t)handle_out (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_get_target) { ENTER; RET (handle_live ((uint32_t)A (0), FALSE) ? (uintptr_t)mono_gchandle_get_target_internal (GC_H ((uint32_t)A (0))) : 0); }
+U(mono_gchandle_free) { ENTER; if (handle_live ((uint32_t)A (0), TRUE)) mono_gchandle_free_internal (GC_H ((uint32_t)A (0))); RETV; }
 U(mono_pmip) { ENTER; RET (0); }
 U(mono_debug_lookup_source_location_by_il) { ENTER; RET (0); }
 
@@ -340,6 +389,15 @@ set_assemblies_path (const char *unity_path)
 	g_string_free (s, TRUE);
 }
 
+/* Unity 6 maps DllImport names (mono_dllmap_insert), which .NET's Mono does not have: noted, and left
+ * to the find-plugin callback and dl fallback, which see the original name. */
+U(mono_dllmap_insert)
+{
+	ENTER;
+	fprintf (stderr, "[gexmono] dllmap %s%s%s -> %s%s%s (ignored)\n", P (1) ? (const char *)P (1) : "?", P (2) ? ":" : "",
+		P (2) ? (const char *)P (2) : "", P (3) ? (const char *)P (3) : "?", P (4) ? ":" : "", P (4) ? (const char *)P (4) : "");
+	RETV;
+}
 U(mono_set_dirs) { ENTER; set_assemblies_path (P (0)); RETV; }
 U(mono_set_assemblies_path) { ENTER; set_assemblies_path (P (0)); RETV; }
 U(mono_set_assemblies_path_null_separated)
@@ -395,7 +453,7 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_runtime_unhandled_exception_policy_set) L(mono_threads_set_shutting_down)
 	L(mono_thread_suspend_all_other_threads) L(mono_thread_pool_cleanup) L(mono_thread_push_appdomain_ref)
 	L(mono_thread_pop_appdomain_ref) L(mono_thread_has_sufficient_execution_stack) L(mono_gchandle_is_in_domain)
-	L(mono_gchandle_is_in_domain_v2) L(mono_pmip) L(mono_debug_lookup_source_location_by_il)
+	L(mono_gchandle_is_in_domain_v2) L(mono_gchandle_new_v2) L(mono_gchandle_new_weakref_v2) L(mono_gchandle_get_target_v2) L(mono_gchandle_free_v2) L(mono_gchandle_new) L(mono_gchandle_new_weakref) L(mono_gchandle_get_target) L(mono_gchandle_free) L(mono_pmip) L(mono_debug_lookup_source_location_by_il)
 	L(mono_unity_gc_set_mode) L(mono_unity_gc_disable) L(mono_unity_gc_enable) L(mono_unity_gc_is_disabled)
 	L(mono_gc_is_incremental) L(mono_gc_set_incremental) L(mono_gc_collect_a_little) L(mono_gc_get_max_time_slice_ns)
 	L(mono_gc_set_max_time_slice_ns) L(mono_gc_start_incremental_collection) L(mono_gc_set_heap_validate_frequency)
@@ -413,7 +471,7 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_create) L(mono_profiler_enable_coverage) L(mono_profiler_set_coverage_filter_callback)
 	L(mono_profiler_get_coverage_data) L(mono_profiler_get_all_coverage_data) L(mono_profiler_reset_coverage)
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
-	L(mono_trace_set_log_handler) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
+	L(mono_trace_set_log_handler) L(mono_dllmap_insert) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
 	L(mono_class_get_field_from_name) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0
