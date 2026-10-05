@@ -3370,6 +3370,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if op == gex_abi::cache_op::FTAB_TIER1 {
+                if std::env::var_os("GEX_WASM_TRACE").is_some() {
+                    eprintln!("gex: bridge hands {addr:#x} to tier-1");
+                }
                 if let Some(shared) = caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
                     sh.translated.remove(&(addr as u64));
@@ -3474,7 +3477,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(co) = caller.data().callouts.last() {
                 let ctx_addr = caller.data().thread.ctx_addr;
                 let sp = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::x(sp_index()) as u64).unwrap_or(0);
-                if sp > co.sp_want + CALLOUT_UNWOUND {
+                if sp > co.sp_want + co.unwound {
                     let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, pc as u64);
                     caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
                     return Err(StopExecution.into());
@@ -4014,6 +4017,10 @@ pub(crate) fn take_exit_sites(n: usize) -> Vec<(u64, u64, u64)> {
 struct Callout {
     ret: u64,
     sp_want: u64,
+    /// How far above `sp_want` a safepoint must find the stack pointer to
+    /// call the caller unwound: `CALLOUT_UNWOUND`, or `NATIVE_UNWOUND` for a
+    /// guest call from native Wine.
+    unwound: u64,
     /// `(slot, what the slot held)` while watched.
     slot: Option<(u64, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
@@ -4046,6 +4053,22 @@ const CALLOUT_MAX_DEPTH: usize = 32;
 /// return address; a deeper activation returning to the same address
 /// (recursion) is always below it.
 const CALLOUT_UNWOUND: u64 = 64 << 10;
+
+/// gex_nr::NATIVE_LEFT: whether the innermost call-out is a native caller's
+/// (gexrt has seen the guest leave its frames: it entered native code at or
+/// above that caller's entry). Otherwise the mark was stale.
+pub(crate) fn innermost_callout_native(caller: &Caller<'_, HostState>) -> bool {
+    caller.data().callouts.last().is_some_and(|co| co.ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD)
+}
+
+/// The same for a guest call from native Wine (its return address is
+/// `tramp::NATIVE_RETURN_PAD`): the callee's frame is built just below the
+/// native caller's (gexrt `__gexw_guest_call`), so anything past its
+/// arguments is the native frames' and the guest has left them -- a catch
+/// block continuing in an outer frame. Its native callers then leave
+/// (gexrt's `run_until` drops them), instead of the guest running on
+/// nested inside them.
+const NATIVE_UNWOUND: u64 = 512;
 
 /// The table-0 slot dispatch reaches `pc` through, as the directory says now.
 fn dispatch_slot_of(memory: &gex_mem::GuestMemory, pc: u64) -> Option<u64> {
@@ -4207,7 +4230,8 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     CALLOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
-    caller.data_mut().callouts.push(Callout { ret, sp_want, slot: None, live: false });
+    let unwound = if ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD { NATIVE_UNWOUND } else { CALLOUT_UNWOUND };
+    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
     let mut next: Option<wasmtime::Func> = None;

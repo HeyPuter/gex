@@ -474,6 +474,25 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
+    if native && nr == nt::gex_nr::NATIVE_LEFT {
+        // gexrt saw the guest enter native code at or above the innermost
+        // native entry: it left that entry's frames earlier and runs nested
+        // inside them. The innermost call-out, if a native caller's, leaves
+        // (0); that caller drops its frames (gexrt's `run_until`), and the
+        // guest makes the call again from `jmp eax` (EAX: the function,
+        // which gexrt left in ctx::BALLAST), one level flatter. A stale mark
+        // (no native call-out innermost) just goes on.
+        let target = read_u64(memory.bytes(), (ctx_addr + ctx::BALLAST as u64) as usize);
+        if std::env::var_os("GEX_WASM_TRACE").is_some() {
+            eprintln!("gex: native left at {}: call-outs {}, innermost native {}", p.describe_addr(target), caller.data().callouts.len(), crate::innermost_callout_native(caller));
+        }
+        if crate::innermost_callout_native(caller) {
+            let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::x(0) as u64, target);
+            caller.data_mut().callout_signal = Some(crate::CalloutSignal::Abort);
+            return Err(StopExecution.into());
+        }
+        return Ok(());
+    }
     if crate::ftab::stats_on() {
         let i = if nr == nt::gex_nr::UNIX_CALL { UNIX_CALL_SLOT } else { nr as usize };
         if let Some(n) = SYSCALLS.get(i) {

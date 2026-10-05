@@ -1,0 +1,11 @@
+LIBRARY msvcrt.dll
+EXPORTS
+printf
+exit
+_setjmp3
+longjmp
+_CxxThrowException@8
+__CxxFrameHandler3
+_except_handler3
+_except_handler4_common
+__CxxLongjmpUnwind@4

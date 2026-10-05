@@ -50,6 +50,10 @@ const CTX_PC = 32 * 8;
 const CTX_SP = 4 * 8;
 /** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
 const CALLOUT_UNWOUND = 64n << 10n;
+/** gex-kernel `tramp::NATIVE_RETURN_PAD` and the native host's
+ *  `NATIVE_UNWOUND` (docs/wine-native.md §3.15). */
+const NATIVE_RETURN_PAD = 0x3ffff1n;
+const NATIVE_UNWOUND = 512n;
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -2718,6 +2722,11 @@ export class Gex {
       if (err?.gexHandoff || !e.gex_handoff()) throw err;
       err.gexHandoff = true;
       if (e.gex_exited?.()) throw err;
+      // gex_nr::NATIVE_LEFT: the call-out it is nested in decides.
+      if (e.gex_nt_native_left?.()) {
+        err.gexNativeLeft = true;
+        throw err;
+      }
       const stop = p & ~(1n << 61n);
       const next = BigInt.asUintN(64, BigInt(e.gex_resume_pc()));
       const rc = e.gex_resume_ctx() >>> 0;
@@ -3636,6 +3645,10 @@ export class Gex {
     const sp0 = e.__stack_pointer.value;
     const me = this.#callouts.length;
     const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length };
+    // A guest call from native Wine (its return is gex-kernel's
+    // NATIVE_RETURN_PAD): its native caller's frames are just above the
+    // callee's arguments (cgen.rs NATIVE_UNWOUND, as natively).
+    c.unwound = c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
     this.#callouts.push(c);
     this.#nest.push('callout');
     this.#calloutsMade++;
@@ -3679,6 +3692,10 @@ export class Gex {
           }
           const hit = e.gex_callout_hit();
           if (hit >= 0) return hit === me ? 1 : 0;
+          // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
+          // frames): a native caller's call-out leaves, at the context's PC
+          // (the entry the guest makes again); anything else carries on.
+          if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD) return 0;
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -3724,7 +3741,7 @@ export class Gex {
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves.
           const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
-          if (sp > c.spWant + CALLOUT_UNWOUND) {
+          if (sp > c.spWant + c.unwound) {
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
           }
