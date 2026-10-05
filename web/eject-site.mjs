@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // An ejected Windows program's web build as a static site, in one command:
 //
-//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--level N]
+//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--level N]
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
@@ -33,9 +33,9 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--level'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level'].includes(av[i - 1]));
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--level N]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--level N]');
   process.exit(2);
 }
 const level = opt('--level', '19');
@@ -98,12 +98,15 @@ walk(units, (p, rel) => {
   place(p, join('project', cgen, rel));
 });
 
-// The bundle, without what --drop names.
+// The bundle, without what --drop names, with --overlay DIR's files (guest
+// paths under DIR, as user/files) laid over it.
 const drops = opts('--drop');
+const overlays = opts('--overlay');
 let tar = join(project, 'build/web/rootfs.tar');
-if (drops.length) {
+if (drops.length || overlays.length) {
   tar = join(zcache, 'rootfs.tar');
   execFileSync('tar', ['-C', join(project, 'build/rootfs'), '-chf', tar, ...drops.map((d) => `--exclude=.${d}`), '.']);
+  for (const d of overlays) execFileSync('tar', ['-C', d, '-rhf', tar, '.']);
 }
 place(tar, 'project/build/web/rootfs.tar');
 
