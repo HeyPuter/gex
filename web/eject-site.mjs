@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // An ejected Windows program's web build as a static site, in one command:
 //
-//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args 'A B'] [--level N]
+//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args 'A B'] [--wgsl-cache FILE] [--level N]
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
@@ -33,9 +33,9 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args', '--wgsl-cache'].includes(av[i - 1]));
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--level N]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--wgsl-cache FILE] [--level N]');
   process.exit(2);
 }
 const level = opt('--level', '19');
@@ -75,6 +75,10 @@ function walk(dir, fn, base = dir) {
 
 // The page and the runtime.
 walk(join(project, 'runtime/web/page'), (p, rel) => place(p, rel));
+// --wgsl-cache FILE: Mesa's shader translations from a training run
+// (play.mjs's `wgsl` step), beside the Mesa glue, where mesa-gl.js looks.
+// Mesa refuses a blob another build of it made, so it goes stale with Mesa.
+if (opt('--wgsl-cache', null)) place(opt('--wgsl-cache', null), 'gex/gex-wgsl-cache.bin');
 
 // The units the browser loads: each unit's module and entries, region
 // entries, providers, stateful providers, indirect-call profiles (part of a
