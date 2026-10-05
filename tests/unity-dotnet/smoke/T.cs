@@ -80,6 +80,8 @@ public static class T {
   class Mul2 : IStep { public int Step (int x) => x * 2; }
   struct Pt { public int X; public long Y; }
   static int Run<TS> (TS s, int x) where TS : IStep => s.Step (x);
+  [MethodImpl(MethodImplOptions.NoInlining)]
+  static int Thrower (int r) { if (r % 30 == 0) throw new InvalidOperationException ("odd " + r); return 3; }
   public static long Work (int n) {
     long sum = 0;
     var shapes = new List<Shape> ();
@@ -97,6 +99,10 @@ public static class T {
       sum += (int) fx.GetValue (boxed);
       d [r % 50] = r.ToString ();
       sum += d [r % 50].Length;
+      if (r % 10 == 0) {
+        try { sum += Thrower (r); } catch (InvalidOperationException x) { sum += x.Message.Length; } finally { sum += 1; }
+        try { sum += int.Parse (r % 20 == 0 ? "x" : "12"); } catch (FormatException) { sum += 5; }
+      }
     }
     return sum;
   }

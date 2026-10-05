@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "gexmono-adapters.h"
 
 void mono_icall_table_init (void);
@@ -247,6 +249,20 @@ __attribute__((import_module ("gex"), import_name ("provider_jit_reserve"))) int
 void mono_jiterp_initialize_table (int type, int first_index, int last_index);
 
 
+/* MONO_WASM_JIT_STATS_EVERY=S (with MONO_WASM_JIT_STATS=1): the JIT's counters every S seconds, which the
+ * browser reads from JS. */
+void mono_wasm_jit_dump_stats (void);
+static void *
+stats_thread (void *arg)
+{
+	for (;;) {
+		sleep ((unsigned) (intptr_t) arg);
+		mono_wasm_jit_dump_stats ();
+		fflush (stdout);
+	}
+	return NULL;
+}
+
 static void
 preinit (void)
 {
@@ -281,6 +297,10 @@ preinit (void)
 			mono_jiterp_initialize_table (1 /* JITERPRETER_TABLE_JIT_CALL */, (int)base, (int)(base + n - 1));
 		else
 			fprintf (stderr, "[gexmono] no function-table slots for the wasm JIT\n");
+		if (getenv ("MONO_WASM_JIT_STATS_EVERY") && atoi (getenv ("MONO_WASM_JIT_STATS_EVERY")) > 0) {
+			pthread_t t;
+			pthread_create (&t, NULL, stats_thread, (void *) (intptr_t) atoi (getenv ("MONO_WASM_JIT_STATS_EVERY")));
+		}
 	} else
 		setenv ("MONO_WASM_JIT_AUTO", "0", 0);
 	gexmono_trace_on = getenv ("GEXMONO_TRACE") != NULL;

@@ -149,6 +149,10 @@ fn instantiate(
                 };
                 wasmtime::Global::new(&mut *caller, wasmtime::GlobalType::new(gt.content().clone(), gt.mutability()), val)?.into()
             }
+            ("x", "e") => {
+                let mut cx = caller.as_context_mut();
+                crate::libprov::tag(&mut cx)?.into()
+            }
             ("h", idx) => {
                 let i: u64 = idx.parse().map_err(|_| anyhow!("import h.{idx}: not a table index"))?;
                 table_get(caller, table, i).ok_or_else(|| anyhow!("import h.{i}: table slot holds no function"))?.into()

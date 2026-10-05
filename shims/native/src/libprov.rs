@@ -32,6 +32,7 @@
 use super::*;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use wasmtime::AsContextMut;
 
 /// One stateful provider.
 #[derive(Clone, Debug)]
@@ -119,6 +120,40 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
         s.provider_sp = Some(g.clone());
     }
     Ok(g)
+}
+
+/// This store's exception tag for `gex.provider_throw` under a wasm64
+/// provider: `(i32)`, the throw's code. A throw is a wasm exception, so code
+/// the provider publishes at run time (Mono's wasm JIT, whose modules import
+/// it as `x.e`) catches it with `try_table`; `gex.provider_try` takes it as
+/// the pending exception when nothing in between did.
+pub(crate) fn tag(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result<wasmtime::Tag> {
+    if let Some(t) = cx.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_tag.clone()) {
+        return Ok(t);
+    }
+    let ft = wasmtime::FuncType::new(cx.engine(), [wasmtime::ValType::I32], []);
+    let t = wasmtime::Tag::new(&mut *cx, &wasmtime::TagType::new(ft)).map_err(anyhow::Error::from)?;
+    if let Some(s) = cx.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
+        s.provider_tag = Some(t.clone());
+    }
+    Ok(t)
+}
+
+/// The code of the pending `gex.provider_throw` exception, taken off the
+/// store; None (and the exception left pending) for any other tag.
+fn take_throw(caller: &mut Caller<'_, HostState>) -> Result<Option<i32>> {
+    let mut cx = caller.as_context_mut();
+    let Some(exn) = cx.take_pending_exception() else { return Ok(None) };
+    let ours = tag(&mut cx)?;
+    let t = exn.tag(&mut cx).map_err(anyhow::Error::from)?;
+    if !wasmtime::Tag::eq(&t, &ours, &cx) {
+        let _ = cx.throw::<()>(exn);
+        return Ok(None);
+    }
+    match exn.field(&mut cx, 0).map_err(anyhow::Error::from)? {
+        Val::I32(c) => Ok(Some(c)),
+        v => bail!("gex.provider_throw exception with payload {v:?}"),
+    }
 }
 
 /// Guest pages from the NT allocator (a Windows process; there is no other
@@ -380,13 +415,27 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         let typed = func.typed::<i64, ()>(&caller).context("gex.provider_try: the function is not void(void *)")?;
         match typed.call(&mut caller, arg) {
             Ok(()) => Ok(0),
-            Err(e) => match e.downcast_ref::<Throw>() {
-                Some(t) => Ok(t.0),
-                None => Err(anyhow::Error::from(e)),
-            },
+            Err(e) => {
+                if let Some(c) = take_throw(&mut caller)? {
+                    return Ok(c);
+                }
+                match e.downcast_ref::<Throw>() {
+                    Some(t) => Ok(t.0),
+                    None => Err(anyhow::Error::from(e)),
+                }
+            }
         }
     })()) })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
+    // A wasm exception (see [`tag`]), returned as wasmtime's own error so it
+    // unwinds as one: through wasm frames to the nearest handler.
+    linker.func_wrap(IMPORT_MODULE, "provider_throw", |mut caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> {
+        let mut cx = caller.as_context_mut();
+        let t = crate::host(tag(&mut cx))?;
+        let ty = wasmtime::ExnType::from_tag_type(&t.ty(&cx))?;
+        let pre = wasmtime::ExnRefPre::new(&mut cx, ty);
+        let exn = wasmtime::ExnRef::new(&mut cx, &pre, &t, &[Val::I32(code)])?;
+        cx.throw(exn)
+    })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
     linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u64;
