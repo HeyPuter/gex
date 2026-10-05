@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
     p = fork();
     if (p == 0) {
-        execl("/proc/self/exe", argv[0], "again", (char *)0);
+        execl(argv[0], argv[0], "again", (char *)0);
         _exit(127);
     }
     waitpid(p, &st, 0);

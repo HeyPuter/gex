@@ -424,6 +424,7 @@ async function handle(msg) {
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
   if (msg.cgen?.mode) gex.useCgen(msg.cgen.mode);
+  if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();
   // Any sibling modules the host already had when this Worker started.
   for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
   for (const [key, mod] of msg.preModules ?? []) gex.addSharedModule(key, mod);
@@ -622,6 +623,7 @@ async function handle(msg) {
           fjit: msg.fjit ?? msg.opts?.fjit,
           fjitMax: msg.fjitMax ?? msg.opts?.fjitMax,
           fjitOnly: msg.fjitOnly ?? msg.opts?.fjitOnly,
+          providers: msg.providers ?? msg.opts?.providers,
           wantLibrary,
         },
       );

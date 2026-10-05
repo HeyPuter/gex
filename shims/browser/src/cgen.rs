@@ -35,6 +35,7 @@ use gex_kernel::GuestMem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod elfprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
 

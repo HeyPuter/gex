@@ -6587,7 +6587,20 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // directory entry is not published until its module installs, so every
     // branch still finds the miss stub; JS picks the queue up at the next miss.
     retire_unmapped_code();
-    recompile_objects();
+    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
+    // Libraries some of whose exports a provider serves (glibc's mem*,
+    // docs/elf-providers.md): JS binds them before the guest goes on, as the
+    // native host does after the same syscall.
+    let stop = if crate::cgen::elfprov::maps(&mapped) && stop == 0 {
+        with_host(|h| {
+            set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        1
+    } else {
+        stop
+    };
+    recompile_objects(mapped);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
     let stop = if stop == 3 && with_host(|h| h.kernel.wasm32) {
@@ -10714,6 +10727,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
+    // An address an ELF export provider holds whose slot lost its bridge.
+    if cgen::elfprov::rebridge(pc) {
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
@@ -11564,11 +11585,10 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
 /// candidates. Off unless the page asks. Bulk static recompilation (see
 /// `recompile_object`) is what `--recompile-objects` does natively; without it
 /// a page meets a library one dispatch miss at a time.
-fn recompile_objects() {
+fn recompile_objects(mapped: Vec<gex_kernel::CodeMap>) {
     if unsafe { RECOMPILE_OBJECTS } == 0 {
         return;
     }
-    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
     with_host(|h| {
         for m in mapped {
             h.jit.candidates.push((m, 0));
