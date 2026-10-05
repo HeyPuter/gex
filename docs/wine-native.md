@@ -349,14 +349,26 @@ call callee(args)
 
 - **Spike (b)** runs on the pass by default: demo.dll's callbacks, cdecl
   and stdcall, plus a double-returning callback with an int64 argument.
-- **Not yet handled:** native function pointers that escape to guest code
-  (COM vtables a native DLL hands the program, WNDPROCs) are table
-  indices, which x86 code cannot call. The plan is ARM64EC's entry thunks:
-  - gex's lookup of an address below 0x400000 routes it to an entry adapter
-    for that function's signature and convention;
-  - the convention comes from `WINAPI`/`__stdcall` declarations, which
-    clang drops on wasm32 and must be carried as an annotation;
-  - this is W2 work with the PE loader.
+- **Entry thunks (W2, as built):** native function pointers that escape to
+  guest code (COM vtables a native DLL hands the program, window procedures)
+  are table indices, which x86 code cannot call by themselves.
+  - On wasm32 `__stdcall` (so `WINAPI`, `CALLBACK`, `STDMETHODCALLTYPE`) is
+    `annotate("gex.stdcall")` (corecrt.h); clang ignores it on types and
+    keeps it on functions (`llvm.global.annotations`).
+  - The ICALL pass writes `__gexe.<fn>` for every function whose address
+    escapes (any use but a direct call or metadata): winebuild's adapter
+    shape, arguments by the wasm signature (i64/double 8 bytes, byval
+    structs by address, MSVC's struct returns: 1/2/4/8 bytes in EDX:EAX,
+    larger through the hidden pointer), popped if stdcall. Varargs
+    functions get none.
+  - `{function, thunk}` pairs go in the data section `gexw_entries` (pesym
+    restores the RETAIN flag `wasm-ld -r` drops); gexrt anchors the section
+    and exports its bounds as `__gexw_entries`.
+  - gexc (`wasmdll::bind_entry_thunks`, shared mode only) reads the
+    relocated pairs once the module's data is initialised and binds each
+    thunk at its function's table index as a guest address.
+  - Not covered: thiscall/fastcall functions (no annotation yet), and
+    per-DLL modules (§3.13).
 
 ### 3.11 The wasm32 ABI on gex-kernel (W1, 2026-10-04)
 
@@ -991,8 +1003,15 @@ plus `make -k`.
 - `$W/wine-tools`: only `make __tooldeps__` is needed (the full host Wine build is not).
 - `$W/build-w32.sh` configures and builds the wasm32 tree (`make -k -j4`, nice 19);
   `$W/browser-nt.sh [WORKTREE]` builds the x86 shims and runs tests/nt/run-browser.sh.
+- `$W/wine-tools/nls/locale.nls` must link to the fork's `nls/locale.nls`
+  (wrc/wmc read it from the tools tree; build-w32.sh makes the link).
 - **wt/wasmtime49** recreated (`git worktree add`), master merged (86734783):
-  browser NT **49/49**. Ready for the coordinator's gate.
+  browser NT **49/49**. Coordinator's full gate queued; don't touch the branch.
+- **tests/nt with native ntdll, kernelbase, kernel32: 60/60** (38c4542b, fork
+  a25afcc0bd4): x86/display needed entry thunks (§3.3), since builtin window
+  classes' procedures are ntdll's `RtlRetrieveNtUserPfn` table.
+- `$W/cycle.sh` rebuilds the three DLLs and restages `$W/pfx-native`;
+  `$W/elemmap.py MODULE IDX...` names a table index's function.
 
 **State (2026-10-04):**
 - **W0 and W1:** done (§4.1, §4.2).
@@ -1008,7 +1027,7 @@ plus `make -k`.
   - **tests/nt (`--no-cgen`, wasmtime 49) with native ntdll, kernelbase
     and kernel32** and the rest of Wine x86: 59 of 60 pass, including the
     W2 gate (hello, sync, tls, seh and seh-traps, apc, cxx), the x86 GUI
-    tests and pe-x86/msvc. x86/display fails (exit 5, not yet looked at).
+    tests and pe-x86/msvc. (x86/display: fixed on gooner, 60/60.)
     - The ICALL floor is 0x3f0000, gex-kernel's NT trampolines: native code
       calls the unix-call trampoline through the check.
     - A guest call from native code returns to a pad at 0x3ffff1 in the
@@ -1016,10 +1035,10 @@ plus `make -k`.
       callee's own page that its code then needed (msvc.exe).
     - `--cgen` with native skeletons is untested.
   - **Next:**
-    - x86/display; `--cgen` with native skeletons; the browser;
+    - `--cgen` with native skeletons; the browser;
     - the CRTs (msvcrt/ucrtbase: `DISPATCHER_CONTEXT`, `__ASM_VTABLE`);
     - win32u's system-call stubs (the same `wine/gex/syscall.h`);
     - varargs adapters;
-    - entry thunks for native function pointers given to the guest.
+    - entry thunks: thiscall/fastcall (msvcp vtables), per-DLL modules.
 - **Open:** the `relocate_once` workaround in wasmprog goes once E's
   29a2c2a1 is on main.
