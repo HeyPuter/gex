@@ -20,7 +20,7 @@
 #   em-runtime em-native em-smoke   P1's emscripten build and its node smoke test
 #
 # Needs clang/wasm-ld (22), llvm-ar, dotnet, git, ninja, cmake; /usr/lib/emsdk only for em-*.
-# Builds on cores 0,2,6,8 at nice 19 (stream rules).
+# Builds at nice 19 with at most 4 jobs (stream rules).
 set -euo pipefail
 
 FORK=https://github.com/r58Playz/dotnet-runtime.git
@@ -32,7 +32,9 @@ UD=$(cd "$HERE/.." && pwd)
 OUT=$(realpath -m "$1"); shift
 STEPS=${*:-src sysroot runtime native corelib provider}
 MUSL_SRC=${MUSL_SRC:-$(realpath -m "$UD/../../../musl-wasm64")}
-RUN="taskset -c 0,2,6,8 nice -n 19"
+RUN="nice -n 19"
+# CMake for dotnet/runtime wants llvm-strings, llvm-readelf, llvm-link: from the versioned LLVM if not on PATH.
+command -v llvm-strings >/dev/null || PATH=$PATH:/usr/lib/llvm-22/bin
 SR=$OUT/sysroot/sysroot
 TOOLCHAIN="-DCMAKE_TOOLCHAIN_FILE=$HERE/toolchain-gex-wasm64.cmake -DGEX_SYSROOT=$SR"
 mkdir -p "$OUT"
