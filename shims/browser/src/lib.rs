@@ -24,7 +24,12 @@
 // already because a module importing a shared memory has to be.
 #![cfg_attr(feature = "shared-memory", feature(stdarch_wasm_atomic_wait))]
 
+#[cfg(target_arch = "wasm32")]
 use core::arch::wasm32 as warch;
+// The memory64 build (docs/mem64.md step 6): an x86-64 guest with a 64-bit
+// memory, for the Unity games on .NET (docs/unity-dotnet.md P5).
+#[cfg(target_arch = "wasm64")]
+use core::arch::wasm64 as warch;
 
 use gex_abi::ctx;
 use gex_kernel::errno::{Errno, SysResult};

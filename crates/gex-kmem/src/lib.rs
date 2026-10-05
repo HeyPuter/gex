@@ -25,7 +25,10 @@ pub const PROCESS_MEMORY: u32 = 1;
 /// rather than trapping the Worker mid-syscall with the kernel lock held.
 #[inline]
 pub fn process_pages() -> u32 {
+    #[cfg(not(feature = "process64"))]
     let n: u32;
+    #[cfg(feature = "process64")]
+    let n: u64;
     unsafe {
         core::arch::asm!(
             "memory.size 1",
@@ -33,7 +36,7 @@ pub fn process_pages() -> u32 {
             n = out(local) n,
         );
     }
-    n
+    n as u32
 }
 
 /// Whether `at..at+len` is inside the calling process's memory. Every `push`
@@ -57,6 +60,10 @@ pub fn in_process(at: u32, len: u32) -> bool {
 /// syscall that has already taken the kernel lock.
 #[inline]
 pub unsafe fn pull(dst: *mut u8, src: u32, len: u32) {
+    // A memory64 process memory takes an i64 address; the kernel's own (and
+    // the length, the smaller of the two index types) stay i32.
+    #[cfg(feature = "process64")]
+    let src = src as u64;
     unsafe {
         core::arch::asm!(
             "local.get {dst}",
@@ -76,6 +83,8 @@ pub unsafe fn pull(dst: *mut u8, src: u32, len: u32) {
 /// As [`pull`], with the roles reversed.
 #[inline]
 pub unsafe fn push(dst: u32, src: *const u8, len: u32) {
+    #[cfg(feature = "process64")]
+    let dst = dst as u64;
     unsafe {
         core::arch::asm!(
             "local.get {dst}",

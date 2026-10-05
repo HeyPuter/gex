@@ -219,6 +219,28 @@ $GEXC seed -o web/public/gex/seed$INFIX.wasm --no-shared-memory >/dev/null
 $GEXC seed -o web/public/gex/seed$INFIX.shared.wasm >/dev/null
 echo "  seed: rebuilt from this emitter"
 
+# `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory (docs/mem64.md
+# step 6; the Unity games on .NET, docs/unity-dotnet.md P5), x86-64 guests
+# only. Same source, target wasm64-unknown-unknown (nightly, build-std),
+# shared memory only; its memory is a memory64 of LIMIT64 (16 GiB). The
+# layout below 4 GiB is the wasm32 one. Artefacts get `.m64` after the arch.
+if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
+    M64OUT=target/w64$TSUF/wasm64-unknown-unknown/release/gex_browser.wasm
+    LINK64=$(echo "$LINK" | sed "s/--max-memory=$GUEST_BYTES/--max-memory=$((16 << 30))/")
+    if RUSTFLAGS="$LINK64 \
+        -C link-arg=--shared-memory \
+        -C target-feature=+atomics,+bulk-memory,+mutable-globals \
+        -Zcrate-attr=feature(simd_wasm64)" \
+        cargo +nightly build -p gex-browser --target wasm64-unknown-unknown \
+          --release -Z build-std=std,panic_abort --features "shared-memory$EXTRA" \
+          --target-dir target/w64$TSUF 2>&1 | grep -E "^error" -A5; then
+        echo "shims/browser: the wasm64 build FAILED"; exit 1
+    fi
+    cp "$M64OUT" "$PUB/gex_browser$INFIX.m64.shared.wasm"
+    $GEXC seed --mem64 -o web/public/gex/seed$INFIX.m64.shared.wasm >/dev/null
+    echo "shims/browser: $(stat -c%s "$M64OUT") bytes (wasm64, memory64), seed$INFIX.m64.shared.wasm"
+fi
+
 # And the site, which is a copy of public/ and will otherwise keep serving
 # the shim that was here a moment ago.
 web/refresh-dist.sh

@@ -32,10 +32,13 @@ const [
   pages,
   shared = '1',
   maxPages = GUEST_MAX_PAGES,
+  // `64`: a memory64 (limits flag 0x04), for processes with a 64-bit guest
+  // memory (docs/mem64.md step 6).
+  index = '32',
 ] = process.argv.slice(2);
 if (!inPath || !outPath) {
   console.error(
-    'usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name] [min] [shared] [max]',
+    'usage: add-memory.mjs <in.wasm> <out.wasm> [module] [name] [min] [shared] [max] [32|64]',
   );
   process.exit(2);
 }
@@ -92,7 +95,7 @@ const str = (s) => [...enc(s.length), ...[...s].map((c) => c.charCodeAt(0))];
 const min = pages ? Number(pages) : GUEST_MIN_PAGES;
 const entry = [
   ...str(mod), ...str(name),
-  0x02, shared === '0' ? 0x01 : 0x03,
+  0x02, (shared === '0' ? 0x01 : 0x03) | (index === '64' ? 0x04 : 0),
   ...enc(min), ...enc(Number(maxPages)),
 ];
 

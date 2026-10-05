@@ -107,7 +107,7 @@ usage:
                                    through DT_NEEDED, each at the base a
                                    pinned run places it, writing one module
                                    per object and the layout beside them)
-  gexc seed   -o <out.wasm>        write a module that translates nothing, for
+  gexc seed   -o <out.wasm> [--mem64]  write a module that translates nothing, for
                                    a host that will translate at runtime and
                                    does not know the program in advance
   gexc closure <elf> --sysroot DIR
@@ -717,6 +717,8 @@ fn cmd_seed(args: &[String]) -> Result<()> {
                 out = Some(args.get(i).context("-o needs a path")?.clone());
             }
             "--no-shared-memory" => shared_memory = false,
+            // The seed for the wasm64 (memory64) browser shim.
+            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             other => bail!("unexpected argument {other}"),
         }
         i += 1;

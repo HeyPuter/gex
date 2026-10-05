@@ -109,7 +109,11 @@ impl<'a> GuestMem<'a> {
     fn limit(&self) -> usize {
         #[cfg(target_family = "wasm")]
         {
-            let live = (core::arch::wasm32::memory_size(0) as u64) << 16;
+            #[cfg(target_arch = "wasm32")]
+            let pages = core::arch::wasm32::memory_size(0);
+            #[cfg(target_arch = "wasm64")]
+            let pages = core::arch::wasm64::memory_size(0);
+            let live = (pages as u64) << 16;
             (live as usize).min(self.view().len())
         }
         #[cfg(not(target_family = "wasm"))]
