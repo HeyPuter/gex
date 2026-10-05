@@ -1063,7 +1063,25 @@ plus `make -k`.
 - **master merged** (fd8be1d1, wasmtime49 landed; wt/wasmtime49 removed).
   `$W/check.sh` runs W's pre-gate checks: tests/nt both prefixes, tests/wasm32,
   browser NT both prefixes.
-- **CRTs (next):** native msvcrt needs an i386-semantics `except_wasm32.c`
+- **Native msvcrt and ucrtbase (merge/wine-crt 5e9b0618, fork f454cff22f8):**
+  tests/nt **61/61** with ntdll, kernelbase, kernel32, msvcrt and ucrtbase
+  native (`$W/pfx-crt`), including x86/msvc_cxxeh through native msvcrt.
+  - msvcrt's except_i386.c builds for wasm32 with gexrt doing its assembly
+    (wine/gex/runtime.h); vtables in C with a `.set`/`.hidden` alias;
+    thiscall calls into guest objects with ECX; vtbl wrappers in the
+    trampoline page (tramp::VTBL_WRAPPERS_32, re-keys the trampoline unit).
+  - minwindef.h had defined __stdcall empty on wasm32 (so entry thunks never
+    popped): now annotate("gex.stdcall"/"gex.thiscall"/"gex.fastcall").
+  - varargs adapters: the guest's stack is the va buffer; a printf (by name)
+    is relaid by its format (8-byte args 8-aligned).
+  - pelink: stubs for imports from i386 DLLs (LoadLibraryA/GetProcAddress
+    once, then a guest call); exports bound to the DLL that defines them.
+  - Open: msvcp* (vtable functions need C declarations before the vtables;
+    __ASM_VTABLE with commas in exception.c), x87 entry points (_CIsqrt,
+    _ftol...: need ST0 adapters), `MSVCRT__adjust_fdiv` data export.
+  - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
+    merge/wine-wasm after its gate.
+- **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
   (cxx_frame_handler, `_except_handler3/4`, `_setjmp`/`longjmp` on the guest
   context; catch blocks and filters as guest calls with EBP set,
   `continue_after_catch` as a guest-state load), CXX_USE_RVA off on wasm32,
