@@ -15,6 +15,7 @@
 //! its counts in at its next safepoint or syscall; a thread blocked forever in
 //! the kernel contributes when it wakes or ends.
 
+use crate::WasmtimeContext;
 use crate::HostState;
 use anyhow::{anyhow, Context, Result};
 use gex_xlate::profile::{self as gp, FileEntry, ObjectEntry, Placements, Profile, Session};

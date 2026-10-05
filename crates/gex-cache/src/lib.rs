@@ -317,7 +317,7 @@ pub fn compile(engine: &Engine, wasm: &[u8]) -> Result<Module> {
 
 #[cfg(feature = "compile")]
 fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
-    Module::new(engine, wasm)
+    Module::new(engine, wasm).map_err(anyhow::Error::from)
 }
 
 #[cfg(not(feature = "compile"))]
@@ -338,9 +338,9 @@ pub fn precompile(engine: &Engine, wasm: &[u8], dir: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let m = Module::new(engine, wasm)?;
+    let m = Module::new(engine, wasm).map_err(anyhow::Error::from)?;
     std::fs::create_dir_all(dir)?;
-    store(dir, &path, &m.serialize()?);
+    store(dir, &path, &m.serialize().map_err(anyhow::Error::from)?);
     Ok(())
 }
 

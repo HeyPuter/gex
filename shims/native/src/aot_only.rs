@@ -116,14 +116,14 @@ pub(crate) fn override_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         IMPORT_MODULE,
         imports::DISPATCH_MISS,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<i32> { Err(missing(&mut caller, pc as u64, "a dispatch")) },
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { Err(missing(&mut caller, pc as u64, "a dispatch")) })()) },
     )?;
     // Leave: the root looks the target up, and stops the run if nothing
     // built ahead of time holds it.
     linker.func_wrap(
         IMPORT_MODULE,
         imports::CALL_OUT,
-        |_caller: Caller<'_, HostState>, _ctx: i32, _target: i64, _ret: i64, _sp: i64| -> Result<i32> { Ok(0) },
+        |_caller: Caller<'_, HostState>, _ctx: i32, _target: i64, _ret: i64, _sp: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { Ok(0) })()) },
     )?;
     Ok(())
 }

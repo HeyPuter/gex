@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow = "1"
 gex-key.workspace = true
-wasmtime = { version = "27", default-features = false, features = ["runtime", "std", "threads"] }
+wasmtime = { version = "49", default-features = false, features = ["runtime", "std", "threads", "gc", "gc-null", "anyhow"] }
 
 [features]
 default = ["compile"]
