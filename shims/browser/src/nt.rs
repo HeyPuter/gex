@@ -320,6 +320,9 @@ mod imp {
         nt::opengl::FAST.store(var("GEX_NT_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
         nt::opengl::FAST_CLIENT_STATE.store(var("GEX_NT_GL_FAST").as_deref() != Some("nocs"), Ordering::Relaxed);
         TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
+        if let Some(k) = var("GEX_NT_TICK_EVERY").and_then(|v| v.parse().ok()) {
+            TICK_EVERY.store(k, Ordering::Relaxed);
+        }
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
         }
@@ -627,6 +630,8 @@ mod imp {
             // (woken by a kick, the word had moved, timed out) and kicks by
             // whether they woke anyone, since the last report.
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
+            let m: Vec<String> = crate::MISSES.iter().map(|a| a.swap(0, Ordering::Relaxed).to_string()).collect();
+            warn_line(&format!("gex-nt: misses all/behind/returned/dense/fjit/knows/translate {}\n", m.join("/")));
             warn_line(&format!(
                 "gex-nt: yield parks woken={} ({} ms) moved={} timed_out={} ({} ms) kicks waking={} idle={}\n",
                 take(&YIELD_PARKS[0]),
@@ -660,9 +665,26 @@ mod imp {
     /// Bring `KUSER_SHARED_DATA`'s clocks up to date, at most once a
     /// millisecond. Natively a thread does this; here every NT syscall and
     /// every safepoint does, which is as often as anything can look.
+    /// Each thread reads the clock (a JS call) on one call in
+    /// [`TICK_EVERY`]: the reads were 0.2 ms of every world frame on
+    /// Noita's main thread and more on its workers (edger, cs1). The time
+    /// a guest sees there is then at most that many of a thread's
+    /// safepoints or syscalls old, well inside the 15.6 ms Windows
+    /// advances it by.
     pub(crate) fn tick() {
         static LAST: AtomicU64 = AtomicU64::new(0);
+        thread_local! {
+            static TICK_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
         let Some(p) = PROCESS.get() else { return };
+        let n = TICK_N.with(|c| {
+            let n = c.get();
+            c.set(n.wrapping_add(1));
+            n
+        });
+        if n % TICK_EVERY.load(Ordering::Relaxed).max(1) != 0 {
+            return;
+        }
         let now = mono();
         let last = LAST.load(Ordering::Relaxed);
         if now.wrapping_sub(last) < 1_000_000 && last != 0 {
@@ -675,6 +697,10 @@ mod imp {
             }
         }
     }
+
+    /// How many of a thread's [`tick`]s read the clock: one in this many
+    /// (`GEX_NT_TICK_EVERY`, default 8; 1 reads it on every one).
+    static TICK_EVERY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
 
     /// Yield parks by result (`memory.atomic.wait32`: 0 woken, 1 not equal, 2
     /// timed out) and kicks (`notify`) by whether they woke a waiter.

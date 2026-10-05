@@ -10571,6 +10571,15 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// retranslation livelock (S3 found natively that a page retired between a
 /// translation and its publish came back without its directory entry): say
 /// what dispatch sees there, once per pc, the 64th time.
+/// Dispatch misses by how `gex_dispatch_miss` dealt with them (the NT
+/// stats line): all, a unit catch-up, a call-out's return, a dense block
+/// to instantiate, the function JIT, a published unit pc, translated.
+pub(crate) static MISSES: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+fn miss_count(k: usize) {
+    MISSES[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn remiss(pc: u64) {
     let said = with_host(|h| {
         if !h.jit.translated.contains(&pc) {
@@ -10646,9 +10655,11 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
+    miss_count(0);
     // A function-tier unit another Worker published that this one has not
     // installed yet: the miss is a catch-up, done in JS, not a translation.
     if cgen::behind() {
+        miss_count(1);
         // AOT-only: catch up inside the call and dispatch again, keeping the
         // thread's frames (leaving would resume at continuations no unit
         // has entries for).
@@ -10670,6 +10681,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // The return a call-out of this Worker waits for, untranslated: that
     // call-out is done (cgen::returned; JS's nested loop ends it).
     if cgen::returned(pc, _ctx as u32 as u64) {
+        miss_count(2);
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
@@ -10680,6 +10692,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // Worker has not instantiated: JavaScript catches up, then the dispatch
     // is retried (`dense::missing`).
     if dense::missing(pc) {
+        miss_count(3);
         dense::want(pc);
         if in_place(_ctx, pc) {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
@@ -10705,6 +10718,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // A function serves it, or the function JIT makes one: tier-1 reaches
     // it through the bridge once this Worker has installed it.
     if fjit::serve(pc) {
+        miss_count(4);
         if in_place(_ctx, pc) {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
@@ -10774,11 +10788,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // wild `pc` makes a wild directory index, and a shim trap on that reads as
     // a runtime bug where the guest's own crash is the story.
     let wild = gex_abi::X86 && with_host(|h| {
-        !h.kernel
-            .mem
-            .vmas()
-            .iter()
-            .any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && pc >= v.start && pc < v.end)
+        !h.kernel.mem.vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
     });
     if wild && nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
@@ -10859,6 +10869,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             n
         });
         if n <= 3 {
+            miss_count(5);
             nt::serve_now();
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
@@ -10878,6 +10889,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
+    miss_count(6);
     // Past the fill and a closure library still claims this page: everything
     // looks right (pin took, module covers it, directory names it) yet the
     // block is lifted, so count how much the closure fails to save.
