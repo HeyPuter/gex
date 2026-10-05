@@ -4684,12 +4684,6 @@ fn retire_translations(
         }
     }
     ftab::on_retire(&mut sh, memory.bytes(), ranges);
-    // ELF providers' bindings in the ranges (the table keeps a unit tier's
-    // functions over a retirement; these go with their library).
-    for a in elfprov::on_retire(elfprov::key_of(&shared), ranges) {
-        gex_kernel::ftab::fcache_clear(memory.bytes(), a);
-        sh.ftab.map.retire(a);
-    }
     drop(sh);
     refresh_callouts(caller)?;
     if pages > 0 && std::env::var_os("GEX_VERBOSE_OBJECTS").is_some() {

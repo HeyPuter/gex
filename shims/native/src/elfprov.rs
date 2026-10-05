@@ -17,8 +17,14 @@
 //! A `GEX_GROUP` binds whole or not at all. Bound addresses are not code the
 //! function JIT may translate ([`provided`]), so a translation that follows
 //! a GOT slot into the library cannot publish the library's own code over
-//! them. When the library goes away (`munmap`, `execve`), its bindings are
-//! retired with it ([`on_retire`]).
+//! them.
+//!
+//! The bindings outlive an unmapping, as PE providers' do: the function
+//! table is shared by a process and the children it forks (and their
+//! `execve`s), so a child replacing its program must not take them from a
+//! parent still running the library, whose GOT holds resolver+1 addresses
+//! that only the bindings make code. Only another object mapped over a bound
+//! address takes it back ([`on_elf_maps`]).
 //!
 //! `GEX_PROVIDERS=0` turns this off (A/B runs), `GEX_PROVIDER_SKIP` leaves
 //! named exports to the guest, `GEX_PROVIDER_TRACE` lists the bindings.
@@ -26,28 +32,28 @@
 use crate::HostState;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
-
 use std::sync::{Arc, Mutex};
 use wasmtime::Caller;
 
-/// Addresses ELF providers hold, by process (the `JitShared` they are bound
-/// in, by address): what the function JIT leaves alone, and what a
-/// retirement unbinds.
-static BOUND: Mutex<Option<HashMap<usize, HashSet<u64>>>> = Mutex::new(None);
+/// One library's bindings: its path, its executable mapping, the addresses.
+struct Bound {
+    path: String,
+    start: u64,
+    addrs: Vec<u64>,
+}
+
+/// What ELF providers hold, by function table (the `JitShared` they are
+/// bound in, by address): what the function JIT leaves alone.
+static BOUND: Mutex<Option<HashMap<usize, Vec<Bound>>>> = Mutex::new(None);
 
 fn key(sh: &Arc<Mutex<crate::JitShared>>) -> usize {
     Arc::as_ptr(sh) as usize
 }
 
-/// [`key`] from inside the lock (`Mutex` is the `Arc`'s pointee).
-pub(crate) fn key_of(m: &Mutex<crate::JitShared>) -> usize {
-    m as *const _ as usize
-}
-
 /// The addresses ELF providers hold in this process, for a translation job.
 pub(crate) fn provided(sh: &Arc<Mutex<crate::JitShared>>) -> Arc<HashSet<u64>> {
     let g = BOUND.lock().unwrap_or_else(|e| e.into_inner());
-    Arc::new(g.as_ref().and_then(|m| m.get(&key(sh))).cloned().unwrap_or_default())
+    Arc::new(g.as_ref().and_then(|m| m.get(&key(sh))).map(|v| v.iter().flat_map(|b| b.addrs.iter().copied()).collect()).unwrap_or_default())
 }
 
 /// After a Linux syscall that mapped executable code: bind the providers of
@@ -58,6 +64,7 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
     }
     let trace = std::env::var_os("GEX_PROVIDER_TRACE").is_some();
     for m in mapped {
+        unbind_overlapped(caller, m, trace);
         let file = m.path.rsplit('/').next().unwrap_or(&m.path);
         // Cheap first: a name no provider has.
         let provs: Vec<gex_cgen::provider::Provider> = [false, true].iter().flat_map(|&c| gex_cgen::provider::for_dll(file, c)).collect();
@@ -90,10 +97,11 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
                 .filter_map(|(a, f)| slot(&f).map(|k| (a, k)))
                 .collect();
             {
-                // Already bound (a second executable mapping of the same object).
+                // Already bound: the same object again where it was (a child's
+                // `execve` of a program with the same libc, at the same place).
                 let g = BOUND.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(set) = g.as_ref().and_then(|b| b.get(&key(&shared))) {
-                    pairs.retain(|(a, _)| !set.contains(a));
+                if let Some(v) = g.as_ref().and_then(|b| b.get(&key(&shared))) {
+                    pairs.retain(|(a, _)| !v.iter().any(|b| b.addrs.contains(a)));
                 }
             }
             if pairs.is_empty() {
@@ -105,7 +113,11 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
                 .map_err(|e| anyhow!("compiling provider {}: {e:#}", p.name))?;
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
             crate::ftab::publish_pairs(&shared, &memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
-            BOUND.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(key(&shared)).or_default().extend(pairs.iter().map(|&(a, _)| a));
+            BOUND.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(key(&shared)).or_default().push(Bound {
+                path: m.path.clone(),
+                start: m.start,
+                addrs: pairs.iter().map(|&(a, _)| a).collect(),
+            });
             if trace {
                 eprintln!("gex: provider {} for {} at {bias:#x}: {} addresses bound", p.name, m.path, pairs.len());
             }
@@ -115,15 +127,43 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
     Ok(())
 }
 
-/// Code in `ranges` went away: the provider bindings in it go with it (the
-/// table keeps a unit's functions over a retirement; these are not the
-/// unit's to keep). Returns the addresses to retire.
-pub(crate) fn on_retire(process: usize, ranges: &[(u64, u64)]) -> Vec<u64> {
-    let mut g = BOUND.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(set) = g.as_mut().and_then(|b| b.get_mut(&process)) else { return Vec::new() };
-    let gone: Vec<u64> = set.iter().copied().filter(|&a| ranges.iter().any(|&(s, e)| a >= s && a < e)).collect();
-    for a in &gone {
-        set.remove(a);
+/// Another object mapped over addresses a library's providers hold: they are
+/// its code now, so the bindings there go (in every process sharing the
+/// table: two processes with different code at one address are beyond a
+/// shared function table, for PE units as for these).
+fn unbind_overlapped(caller: &mut Caller<'_, HostState>, m: &gex_kernel::CodeMap, trace: bool) {
+    let Some(jit) = caller.data().jit.as_ref() else { return };
+    let shared = Arc::clone(&jit.shared);
+    let gone: Vec<u64> = {
+        let mut g = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(v) = g.as_mut().and_then(|b| b.get_mut(&key(&shared))) else { return };
+        let mut gone = Vec::new();
+        v.retain_mut(|b| {
+            if b.path == m.path && b.start == m.start {
+                return true;
+            }
+            let before = b.addrs.len();
+            b.addrs.retain(|&a| {
+                let hit = a >= m.start && a < m.end;
+                if hit {
+                    gone.push(a);
+                }
+                !hit
+            });
+            if trace && b.addrs.len() != before {
+                eprintln!("gex: provider bindings of {} at {:#x}: {} taken back by {} mapped over them", b.path, b.start, before - b.addrs.len(), m.path);
+            }
+            !b.addrs.is_empty()
+        });
+        gone
+    };
+    if gone.is_empty() {
+        return;
     }
-    gone
+    let Some(memory) = caller.data().memory.clone() else { return };
+    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    for a in gone {
+        gex_kernel::ftab::fcache_clear(memory.bytes(), a);
+        sh.ftab.map.retire(a);
+    }
 }
