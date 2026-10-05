@@ -860,6 +860,25 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   the bytes are fetched lazily, only by a Worker that compiles. A/B
   site19/site20 queued (`$S/edger-wab3.txt`).
 
+- **Start-up: threads recompiled every unit (fixed, 35578368).** A
+  per-second timeline of the start-up profile (`$S/profline.mjs`,
+  `$S/profimg.mjs`) showed Noita's loader threads starting one after the
+  other, each busy ~3 s while the rest (main included) waited in the ConcRT
+  condvar provider: each new thread's Worker fetched and compiled all 39
+  units (352 `[unit]` lines in one run). host.mjs's thread start path
+  never sent the process's compiled modules (the `start` closure that did
+  is dead code). With them: 44 unit compiles per run. **World-up after
+  navigation (edger, A/B x3): site19 50.6-51.6 s -> site21 36.5-40.6 s**;
+  pewasm 30.2 s. ABBA (site21): ejected 56.8, 56.8 vs pewasm 48.3, 48.0 =
+  1.18x; world-up 35-36 s after the process start. The lazy c.wasm fetch
+  (065139bb) alone measured nothing; it matters now that threads have the
+  Modules (no bytes fetched at all).
+- pewasm's own start-up timeline (`$S/wup-pewasm2.sh`, timestamped
+  console): process ~4.3 s, first surface 4.7 s, its input frames 60/120/180
+  at 10.6/11.0/11.3 s, world 29.2 s: about 6 s of init and 18 s of world
+  generation. Ours before the fix: init ~20 s (the serial thread starts),
+  world generation ~16 s.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
