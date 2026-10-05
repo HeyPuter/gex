@@ -388,6 +388,7 @@ fn trampoline_providers() -> Vec<Provided> {
             binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), TRAMPOLINES + rva as u64))).collect(),
             stateful: None,
             data: p.stateful,
+            skeleton: None,
         })
         .filter(|p| !p.binds.is_empty())
         .collect()
