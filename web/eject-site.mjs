@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // An ejected Windows program's web build as a static site, in one command:
 //
-//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--level N]
+//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args 'A B'] [--level N]
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
@@ -33,9 +33,9 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args'].includes(av[i - 1]));
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--level N]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--level N]');
   process.exit(2);
 }
 const level = opt('--level', '19');
@@ -128,7 +128,9 @@ let settings = flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.
 // --input SCRIPT: GEX_NT_INPUT instead of the recorded one (a benchmark's
 // clicks, by presented frame, as pewasm's NOITA_INPUT).
 if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_NT_INPUT=')), `GEX_NT_INPUT=${opt('--input', null)}`];
-const ntOut = { ...nt, settings };
+// --args 'A B': the program's arguments instead of the recorded ones ('' for none).
+const args = av.includes('--args') ? opt('--args', '').split(' ').filter(Boolean) : nt.args;
+const ntOut = { ...nt, settings, args };
 mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 
