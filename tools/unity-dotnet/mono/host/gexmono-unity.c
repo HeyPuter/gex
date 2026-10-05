@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include "gexmono-adapters.h"
 #include <mono/metadata/class-internals.h>
 #include <mono/metadata/object-internals.h>
@@ -226,24 +227,52 @@ U(mono_gchandle_is_in_domain) { ENTER; RET (1); }
 U(mono_gchandle_is_in_domain_v2) { ENTER; RET (1); }
 /* Unity 6 uses the v2 handle API with Unity's Mono encoding: a v2 handle is the GC's own handle value
  * (slot << 3 | type + 1), which Unity's libmonobdwgc also returns from the v1 calls. Its scripting layer
- * tests bit 0: set (normal and weak handles), a GC handle; clear, a pointer to an object reference.
- * Upstream's handles are that value shifted left one bit (MONO_GC_HANDLE_FROM_UINT), always even, which
- * Unity would dereference. So the v2 calls trade in the unshifted value. */
+ * tests bit 0: set (normal and weak handles), a GC handle; clear, a pointer to an object reference; and its
+ * managed code takes the same values (GCHandle.FromIntPtr). This tree's runtime and CoreLib use that raw
+ * value as the handle (gc-internals.h, GCHandle.cs), so v1 and v2 calls are the same functions here. */
 MonoGCHandle mono_gchandle_new_internal (MonoObject *obj, gboolean pinned);
 MonoGCHandle mono_gchandle_new_weakref_internal (MonoObject *obj, gboolean track_resurrection);
 MonoObject *mono_gchandle_get_target_internal (MonoGCHandle gchandle);
 void mono_gchandle_free_internal (MonoGCHandle gchandle);
-#define UNITY_H(h) ((uintptr_t)(h) >> 1)
-#define GC_H(u) ((MonoGCHandle)((uintptr_t)(u) << 1))
-U(mono_gchandle_new_v2) { ENTER; RET (UNITY_H (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
-U(mono_gchandle_new_weakref_v2) { ENTER; RET (UNITY_H (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
-U(mono_gchandle_get_target_v2) { ENTER; RET ((uintptr_t)mono_gchandle_get_target_internal (GC_H (A (0)))); }
-U(mono_gchandle_free_v2) { ENTER; mono_gchandle_free_internal (GC_H (A (0))); RETV; }
+#define UNITY_H(h) ((uintptr_t)(h))
+#define GC_H(u) ((MonoGCHandle)(uintptr_t)(u))
+/* Unity reads handles after freeing them (Hollow Knight: get_target on a freed handle), which Unity's
+ * Boehm-backed Mono answers with NULL and SGen asserts on. So the handles given out are remembered, and a
+ * read or free of one that is not live is NULL / nothing. */
+static GHashTable *live_handles;
+static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t
+handle_out (MonoGCHandle h)
+{
+	uintptr_t u = UNITY_H (h);
+	pthread_mutex_lock (&live_lock);
+	if (!live_handles)
+		live_handles = g_hash_table_new (NULL, NULL);
+	g_hash_table_add (live_handles, (gpointer)u);
+	pthread_mutex_unlock (&live_lock);
+	if (gexmono_trace_on)
+		fprintf (stderr, "[gexmono] -> gchandle %#llx\n", (unsigned long long)u);
+	return u;
+}
+static gboolean
+handle_live (uintptr_t u, gboolean drop)
+{
+	pthread_mutex_lock (&live_lock);
+	gboolean live = live_handles && (drop ? g_hash_table_remove (live_handles, (gpointer)u) : g_hash_table_contains (live_handles, (gpointer)u));
+	pthread_mutex_unlock (&live_lock);
+	if (!live)
+		fprintf (stderr, "[gexmono] gchandle %#llx is not live (%s)\n", (unsigned long long)u, drop ? "free" : "get_target");
+	return live;
+}
+U(mono_gchandle_new_v2) { ENTER; RET (handle_out (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_new_weakref_v2) { ENTER; RET (handle_out (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_get_target_v2) { ENTER; RET (handle_live (A (0), FALSE) ? (uintptr_t)mono_gchandle_get_target_internal (GC_H (A (0))) : 0); }
+U(mono_gchandle_free_v2) { ENTER; if (handle_live (A (0), TRUE)) mono_gchandle_free_internal (GC_H (A (0))); RETV; }
 /* The v1 calls too, in the same encoding: Unity mixes them (a handle from one, freed or read by the other). */
-U(mono_gchandle_new) { ENTER; RET ((uint32_t)UNITY_H (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
-U(mono_gchandle_new_weakref) { ENTER; RET ((uint32_t)UNITY_H (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
-U(mono_gchandle_get_target) { ENTER; RET ((uintptr_t)mono_gchandle_get_target_internal (GC_H ((uint32_t)A (0)))); }
-U(mono_gchandle_free) { ENTER; mono_gchandle_free_internal (GC_H ((uint32_t)A (0))); RETV; }
+U(mono_gchandle_new) { ENTER; RET ((uint32_t)handle_out (mono_gchandle_new_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_new_weakref) { ENTER; RET ((uint32_t)handle_out (mono_gchandle_new_weakref_internal ((MonoObject *)P (0), (gboolean)A (1)))); }
+U(mono_gchandle_get_target) { ENTER; RET (handle_live ((uint32_t)A (0), FALSE) ? (uintptr_t)mono_gchandle_get_target_internal (GC_H ((uint32_t)A (0))) : 0); }
+U(mono_gchandle_free) { ENTER; if (handle_live ((uint32_t)A (0), TRUE)) mono_gchandle_free_internal (GC_H ((uint32_t)A (0))); RETV; }
 U(mono_pmip) { ENTER; RET (0); }
 U(mono_debug_lookup_source_location_by_il) { ENTER; RET (0); }
 

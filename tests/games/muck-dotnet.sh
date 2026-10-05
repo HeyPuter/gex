@@ -9,7 +9,8 @@
 # managed shared framework) is made in RUNDIR. Env: MUCK (the Linux install,
 # default ~/gex-sandbox/games-linux/Muck), GEXC, CORES (optional taskset
 # list), EXE (another Unity game's executable in MUCK, e.g. hollow_knight.x86_64),
-# UNITY_RELAUNCH=1 (run a PIE rebuild of that executable: unity-launcher.c), DOTNET_FW (the .NET 10 shared framework directory).
+# UNITY_RELAUNCH=1 (run a PIE rebuild of that executable: unity-launcher.c; with it,
+# STEAM_APPID=N writes steam_appid.txt beside it), DOTNET_FW (the .NET 10 shared framework directory).
 #
 # Default: batch mode, no graphics. GFX=GLDIR: with graphics, GL through
 # gex-gl (GLDIR holds guest/gl/build.sh's x86-64 build) and X from an
@@ -31,6 +32,9 @@ if [ -n "${UNITY_RELAUNCH:-}" ]; then
 	G="$RUN/game"; mkdir -p "$G"
 	for f in "$MUCK"/*; do [ "$(basename "$f")" = "$EXE" ] || ln -sfn "$f" "$G/"; done
 	cc -O1 -fPIE -pie -o "$G/$EXE" "$HERE/unity-launcher.c" -L"$MUCK" -l:UnityPlayer.so -Wl,-rpath,'$ORIGIN'
+	# STEAM_APPID: Steamworks' development file, so a game started outside Steam runs instead of
+	# asking Steam to restart it.
+	[ -n "${STEAM_APPID:-}" ] && echo "$STEAM_APPID" > "$G/steam_appid.txt"
 	MUCK=$G
 fi
 cd "$MUCK"
