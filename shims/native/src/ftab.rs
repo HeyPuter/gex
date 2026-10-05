@@ -671,6 +671,9 @@ fn bisect_allows(addr: u64) -> bool {
 
 fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Option<Job> {
     gex_kernel::ftab::translator()?;
+    if !bisect_allows(addr) {
+        return None;
+    }
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let v = k.mem.vmas();
         (
@@ -680,7 +683,7 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
             v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
         )
     });
-    if !exec.iter().any(|&(s, e)| addr >= s && addr < e) || !bisect_allows(addr) {
+    if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
         return None;
     }
     let epoch = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.epoch;

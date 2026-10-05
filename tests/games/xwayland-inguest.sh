@@ -12,4 +12,5 @@ while [ ! -S /tmp/.X11-unix/X$n ]; do
     sleep 1; i=$((i+1))
 done
 echo "[inguest] X :$n up after $i s"
-DISPLAY=:$n exec "$@"
+# The program uses X: a Wayland-capable one (Unity 6, SDL) would otherwise pick gex's compositor directly.
+DISPLAY=:$n exec env -u WAYLAND_DISPLAY "$@"

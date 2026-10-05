@@ -769,6 +769,52 @@ Not yet:
        it was seen on worldmachine only. `GEX_FJIT_RANGE`/`GEX_FJIT_SKIP`
        (hex `LO-HI,...`) restrict the function JIT by entry address for the
        bisection.
+    5. **Black frames with graphics (gooner, llvmpipe; hk31-hk32):** with
+       --fjit HK creates its GL 4.5 device, loads a second scene and the
+       compositor gets ~30 presents/s, but every captured frame
+       (`f-*.ppm`, 185 of them over 25 min) is all black. Not the Wayland
+       backend: `xwayland-inguest.sh` now unsets `WAYLAND_DISPLAY` for the
+       program (Unity 6 and SDL could otherwise pick gex's compositor), still
+       black. Unknown whether Unity draws nothing (shaders?) or the blit to
+       the window is lost. hk33 (`GEXGL_TRACE_GENERATED=1
+       GEXGL_SUBMIT_TRACE=1`, periodic tallies every 5000 submits in
+       out.txt) was stopped at the reboot before it got far: rerun it, map
+       opcodes with `guest/gl/gexgl.h`, and check for draws vs clears/blits.
+    6. **The --fjit `free(): invalid pointer` bisection (worldmachine only;
+       its glibc is Arch 2.44, gooner's Debian 2.36):** script
+       `scratch/unity/wm/fjtry.sh NAME SKIP [RANGE]` (run through
+       `BENCH_HOST=worldmachine scratch/bench/bench.sh -- bash
+       scratch/unity/wm/fjtry.sh ...`, give each a distinct `XNUM=`; prints
+       BAD/GOOD/NONE/STALL; it installs `wm/gexc.new` if present). Addresses
+       on worldmachine: libc 0x7d748000-0x7d948000, UnityPlayer
+       0x7e041000-0x7fe00000. Results: full --fjit BAD (hkw1, hkw2);
+       RANGE=libc only GOOD (b3, reached "Unloading 5"); RANGE=UnityPlayer
+       only, libc+UnityPlayer, SKIP=UnityPlayer, SKIP=libc: all stall
+       before the GL device (b1, b2, b4-b8; b7/b8 after the VMA-scan fix in
+       `job`). So something besides libc and UnityPlayer is involved, and
+       jitting a subset while other code stays on tier-1 stalls (itself
+       worth a look: a tier-1/fjit interplay bug). b9-b11 (libc + the small
+       libs 0x7d948000-0x7e041000; libc + above UnityPlayer; everything below
+       0x7d948000) were killed by the reboot: rerun them first.
+    7. Next after these: GEX_WL_INPUT keyboard script into gameplay, then
+       interpreter vs JIT on worldmachine (stage with `scratch/unity/wm`:
+       copy target/dbg-x86/release/gexc, dnc/provider/mono.wasm,
+       dnc/lib/System.Private.CoreLib.dll, tests/games/*.sh; HK lives in
+       `~/src/noita-wasm/games-linux/Hollow Knight` there), then the next
+       GAMES-CORPUS.md games.
+    **Build and run recipe (gooner):** `. scratch/env.sh`; gexc:
+    `cargo build --release -p gexc --features gexc/x86 --target-dir
+    target/dbg-x86`; provider: `tools/unity-dotnet/mono/build.sh
+    ~/gex-sandbox/scratch/unity/dnc sysroot runtime provider` (sysroot when
+    musl-wasm64 changed; it builds wt/musl-wasm64, branch gex-wasm64, pushed
+    to mw at 3f1c1f08); HK batch: `MUCK="$HOME/gex-sandbox/games-linux/Hollow
+    Knight" EXE=hollow_knight.x86_64 UNITY_RELAUNCH=1 STEAM_APPID=367520
+    GEXC=$PWD/target/dbg-x86/release/gexc sh tests/games/muck-dotnet.sh
+    ~/gex-sandbox/scratch/unity/dnc RUNDIR SECS [--fjit]`; add
+    `GFX=$HOME/gex-sandbox/scratch/unity/gl64 XNUM=N EVERY=300` for
+    graphics. Regression checks used: `tests/unity-dotnet/embed/run.sh
+    ~/gex-sandbox/scratch/unity/dnc target/dbg-x86/release/gexc` (PASS) and
+    Muck batch with --fjit (main loop runs).
     Working-tree note: `dnc/src` has every patch staged (`git add -A`) so
     `git diff` shows only new edits (how 0003 was made). Run `git -C
     scratch/unity/dnc/src reset -q` before build.sh's `src` step.
