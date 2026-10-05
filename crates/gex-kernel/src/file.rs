@@ -457,7 +457,7 @@ impl FileHandle for PipeEnd {
             file_type: FileType::Fifo,
             size: 0,
             mode: 0o600,
-            ino: 1,
+            ino: crate::vfs::anon_ino(Arc::as_ptr(&self.pipe) as *const u8),
             mtime: 0,
             nlink: 1,
             rdev: 0,

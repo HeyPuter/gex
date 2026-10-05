@@ -41,6 +41,7 @@ pub mod nr {
     pub const RENAMEAT2: u64 = 276;
     pub const SENDFILE: u64 = 71;
     pub const COPY_FILE_RANGE: u64 = 285;
+    pub const SPLICE: u64 = 76;
     pub const FTRUNCATE: u64 = 46;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
@@ -496,6 +497,10 @@ pub struct Kernel {
     /// descriptors, which only the kernel's table can place). Wine's protocol
     /// with wineserver is a blocking `recvmsg` for every reply.
     pub retry_recvmsg: Option<(i32, u64, u64)>,
+    /// A `splice`, `sendfile` or `copy_file_range` (number, arguments) from
+    /// an empty blocking pipe or socket, re-run once it is readable, as
+    /// `retry_recvmsg`.
+    pub retry_transfer: Option<(u64, [u64; 6])>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
     /// A 32-bit (i386) process: its code runs in compatibility mode, it
@@ -691,7 +696,7 @@ pub type ClockFn = fn() -> (u64, u32);
 fn raises_sigpipe(n: u64, a: &[u64; 6]) -> bool {
     const MSG_NOSIGNAL: u64 = 0x4000;
     match n {
-        nr::WRITE | nr::WRITEV | nr::PWRITE64 | nr::SENDFILE => true,
+        nr::WRITE | nr::WRITEV | nr::PWRITE64 | nr::SENDFILE | nr::SPLICE => true,
         nr::SENDTO => a[3] & MSG_NOSIGNAL == 0,
         nr::SENDMSG => a[2] & MSG_NOSIGNAL == 0,
         nr::SENDMMSG => a[3] & MSG_NOSIGNAL == 0,
@@ -1045,6 +1050,7 @@ pub struct PendingCall {
     pub retry_accept: Option<(i32, u64, u64, u64)>,
     pub write_blocked: bool,
     pub retry_recvmsg: Option<(i32, u64, u64)>,
+    pub retry_transfer: Option<(u64, [u64; 6])>,
     pub restore_sigmask: Option<u64>,
 }
 
@@ -1109,6 +1115,7 @@ impl Kernel {
             retry_accept: self.retry_accept.take(),
             write_blocked: std::mem::take(&mut self.write_blocked),
             retry_recvmsg: self.retry_recvmsg.take(),
+            retry_transfer: self.retry_transfer.take(),
             restore_sigmask: self.restore_sigmask.take(),
         };
         if call != PendingCall::default() {
@@ -1118,6 +1125,7 @@ impl Kernel {
         self.retry_accept = call.retry_accept;
         self.write_blocked = call.write_blocked;
         self.retry_recvmsg = call.retry_recvmsg;
+        self.retry_transfer = call.retry_transfer;
         self.restore_sigmask = call.restore_sigmask;
         let next = self
             .thread_signals
@@ -1130,18 +1138,20 @@ impl Kernel {
     /// Whether a signal is ready for thread `tid` (the host's wait loops ask
     /// for the thread that is waiting, which need not be the one whose state
     /// is loaded).
+    /// Whether a signal would end thread `tid`'s wait: one that does
+    /// something when delivered (a handler, or a default that is not
+    /// "ignore"), as the browser host asks (`would_deliver`). An ignored
+    /// SIGCHLD from a pipeline's writer exiting must not turn the reader's
+    /// blocking read or splice into EINTR, which Linux never does.
     pub fn signal_pending_for(&mut self, tid: i32) -> bool {
-        if tid == self.sig_tid {
-            return self.signal_pending();
-        }
         self.collect_signals();
         self.check_timers();
+        if tid == self.sig_tid {
+            return self.signals.would_deliver();
+        }
         match self.thread_signals.get(&tid) {
-            Some(t) => {
-                let ready = (self.signals.pending_raw_for(t) ) & !t.blocked;
-                ready != 0
-            }
-            None => self.signals.has_pending(),
+            Some(t) => t.would_deliver(&self.signals),
+            None => self.signals.would_deliver(),
         }
     }
 
@@ -1197,6 +1207,7 @@ impl Kernel {
             retry_accept: None,
             write_blocked: false,
             retry_recvmsg: None,
+            retry_transfer: None,
             restore_sigmask: None,
             started: 0,
             pins: std::collections::HashMap::new(),
@@ -1424,6 +1435,7 @@ impl Kernel {
             retry_accept: None,
             write_blocked: false,
             retry_recvmsg: None,
+            retry_transfer: None,
             restore_sigmask: None,
             // Nor its accumulated time: the child's clock starts now.
             started: self.now_nanos(),
@@ -2101,6 +2113,21 @@ impl Kernel {
                     len: a[2].min(1 << 24) as usize,
                 })
             }
+            // A transfer whose input is an empty blocking stream (`cat f |
+            // grep x`: GNU grep splices its stdin pipe) waits for it to be
+            // readable and then does the real transfer (`retry_transfer`).
+            nr::SPLICE | nr::SENDFILE | nr::COPY_FILE_RANGE => {
+                let (fd, off) = match n {
+                    nr::SENDFILE => (a[1] as i32, a[2]),
+                    _ => (a[0] as i32, a[1]),
+                };
+                let file = self.fds.get(fd).ok()?;
+                if off != 0 || !file.would_block() || file.handle.poll_readable() {
+                    return None;
+                }
+                self.retry_transfer = Some((n, a));
+                Some(BlockOp::AcceptWait { socket: Arc::clone(&file.handle) })
+            }
             nr::RECVMSG => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 // A non-blocking socket, one with data, or a call that asked
@@ -2276,6 +2303,10 @@ impl Kernel {
             Some((fd, msg, flags)) if r.is_ok() => self.sys_recvmsg(m, fd, msg, flags),
             _ => r,
         };
+        let r = match self.retry_transfer.take() {
+            Some((n, a)) if r.is_ok() => self.transfer_syscall(m, n, &a),
+            _ => r,
+        };
         // `rt_sigsuspend` waited with a mask of the caller's choosing. The
         // old mask goes back *after* the handler runs, which means the frame
         // has to carry it -- restoring it here instead would block the very
@@ -2337,10 +2368,7 @@ impl Kernel {
             nr::READV => self.sys_readv(m, a[0] as i32, a[1], a[2]),
             nr::PREAD64 => self.sys_pread(m, a[0] as i32, a[1], a[2], a[3]),
             nr::PWRITE64 => self.sys_pwrite(m, a[0] as i32, a[1], a[2], a[3]),
-            nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
-            nr::COPY_FILE_RANGE => {
-                self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32)
-            }
+            nr::SENDFILE | nr::COPY_FILE_RANGE | nr::SPLICE => self.transfer_syscall(m, n, &a),
             nr::OPENAT => self.sys_openat(m, a[0] as i32, a[1], a[2], a[3] as u32),
             nr::OPENAT2 => self.sys_openat2(m, a[0] as i32, a[1], a[2], a[3]),
             nr::CLOSE => self.sys_close(a[0] as i32),
@@ -3178,6 +3206,23 @@ impl Kernel {
             m.write_u64(off_out, o + copied)?;
         }
         Ok(copied)
+    }
+
+    /// sendfile, copy_file_range and splice, by number.
+    fn transfer_syscall(&mut self, m: &mut GuestMem<'_>, n: u64, a: &[u64; 6]) -> SysResult {
+        match n {
+            nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
+            nr::COPY_FILE_RANGE => self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
+            _ => self.sys_splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
+        }
+    }
+
+    /// `splice(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`: as
+    /// copy_file_range, with pipes allowed on either side (a pipe's offset
+    /// pointer must be null, which the transfer does not need to check: a
+    /// pipe has no `pread`). The SPLICE_F_* flags are hints.
+    fn sys_splice(&mut self, m: &mut GuestMem<'_>, fd_in: i32, off_in: u64, fd_out: i32, off_out: u64, len: u64) -> SysResult {
+        self.sys_copy_file_range(m, fd_in, off_in, fd_out, off_out, len, 0)
     }
 
     fn read_iovecs(
@@ -6435,6 +6480,7 @@ pub fn wakes_fd_waiters(n: u64) -> bool {
             | nr::SENDMSG
             | nr::SENDMMSG
             | nr::SENDFILE
+            | nr::SPLICE
             | nr::RECVFROM
             | nr::RECVMSG
             | nr::RECVMMSG
@@ -6545,6 +6591,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::PWRITE64 => "pwrite64",
         nr::SENDFILE => "sendfile",
         nr::COPY_FILE_RANGE => "copy_file_range",
+        nr::SPLICE => "splice",
         nr::PPOLL => "ppoll",
         nr::PSELECT6 => "pselect6",
         nr::UTIMENSAT => "utimensat",
