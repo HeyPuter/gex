@@ -210,14 +210,14 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     let fallback = if crate::aot_only::enabled() {
         wasmtime::Func::wrap(
             &mut c,
-            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, _ret: i64| -> Result<i32> {
+            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, _ret: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
                 crate::aot_only::fallback(&mut caller, ctx)
-            },
+            })()) },
         )
     } else {
         wasmtime::Func::wrap(
             &mut c,
-            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> Result<i32> { fallback(&mut caller, ctx, ret as u64) },
+            |mut caller: Caller<'_, HostState>, ctx: i32, _depth: i32, _need: i32, ret: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { fallback(&mut caller, ctx, ret as u64) })()) },
         )
     };
     let want = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.size() + HEADROOM;
@@ -753,7 +753,7 @@ fn compile_translation(j: &Job, wasm: &[u8]) -> Result<Module> {
             let key = gex_cache::key(build, [b"fjit".as_slice(), wasm]);
             gex_cache::load_or_compile_at(&j.engine, &dir.join("fjit").join(format!("{key}.cwasm")), wasm)
         }
-        None => Module::new(&j.engine, wasm),
+        None => Module::new(&j.engine, wasm).map_err(anyhow::Error::from),
     }
 }
 

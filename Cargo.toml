@@ -75,10 +75,10 @@ gex-eject = { path = "crates/gex-eject" }
 opt-level = 3
 debug = 1
 
-# wasmtime 27 with one change (third_party/wasmtime-27.0.0/src/runtime/store.rs,
+# wasmtime 49 with one change (third_party/wasmtime-49.0.2/src/runtime/store.rs,
 # `wasm_fault`): several instances claiming one shared memory is not an
 # assertion failure. Every module import of the guest's SharedMemory creates
 # such an instance, so without it a guest fault in a guard page panicked the
 # host instead of reaching the guest as SIGSEGV / an access violation.
 [patch.crates-io]
-wasmtime = { path = "third_party/wasmtime-27.0.0" }
+wasmtime = { path = "third_party/wasmtime-49.0.2" }

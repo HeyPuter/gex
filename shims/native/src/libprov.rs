@@ -302,18 +302,18 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     if gex_abi::mem64() {
         return register64(linker);
     }
-    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> Result<i32> {
+    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         let func = ftab::table_func(&mut caller, f as u32)?;
         let typed = func.typed::<i32, ()>(&caller).context("gex.provider_try: the function is not void(int)")?;
         match typed.call(&mut caller, arg) {
             Ok(()) => Ok(0),
             Err(e) => match e.downcast_ref::<Throw>() {
                 Some(t) => Ok(t.0),
-                None => Err(e),
+                None => Err(anyhow::Error::from(e)),
             },
         }
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> Result<()> { Err(Throw(code).into()) })?;
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
     // The NT process clock as NtQueryPerformanceCounter reads it (100 ns
     // units): the `nt_qpc` provider's.
     linker.func_wrap(IMPORT_MODULE, "nt_qpc", |caller: Caller<'_, HostState>| -> i64 {
@@ -329,7 +329,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             }
         }
     })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i32| -> Result<()> {
+    linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u32 as u64;
         let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
         let what = match caller.data().nt.as_ref() {
@@ -337,16 +337,16 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             None => format!("{addr:#x}"),
         };
         Err(crate::aot_only::stop(&mut caller, addr, &format!("gex-eject: the program called {name} ({what}), an export of a replaced library that its provider does not implement")))
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i32| -> Result<i32> {
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         Ok(alloc(caller.data_mut(), size as u32 as u64, "[provider heap]")? as i32)
-    })?;
+    })()) })?;
     // The same from the top down: a built-in provider's heap (`alloc_top`).
-    linker.func_wrap(IMPORT_MODULE, "provider_alloc_top", |mut caller: Caller<'_, HostState>, size: i32| -> Result<i32> {
+    linker.func_wrap(IMPORT_MODULE, "provider_alloc_top", |mut caller: Caller<'_, HostState>, size: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         Ok(alloc_top(caller.data_mut(), size as u32 as u64, "[provider heap]")? as i32)
-    })?;
+    })()) })?;
     // Diagnostics: text a provider writes to its stderr.
-    linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> Result<()> {
+    linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {
             if let Some(b) = m.bytes().get(ptr as u32 as usize..(ptr as u32 as usize).saturating_add(len as u32 as usize)) {
                 use std::io::Write;
@@ -354,7 +354,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             }
         }
         Ok(())
-    })?;
+    })()) })?;
     Ok(())
 }
 
@@ -362,20 +362,20 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
 /// addresses, sizes and function-table indices (stream U, additive).
 fn register64(linker: &mut Linker<HostState>) -> Result<()> {
     crate::wasmjit::register64(linker)?;
-    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i64, arg: i64| -> Result<i32> {
+    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i64, arg: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         let func = ftab::table_func(&mut caller, f as u32)?;
         let typed = func.typed::<i64, ()>(&caller).context("gex.provider_try: the function is not void(void *)")?;
         match typed.call(&mut caller, arg) {
             Ok(()) => Ok(0),
             Err(e) => match e.downcast_ref::<Throw>() {
                 Some(t) => Ok(t.0),
-                None => Err(e),
+                None => Err(anyhow::Error::from(e)),
             },
         }
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> Result<()> { Err(Throw(code).into()) })?;
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
     linker.func_wrap(IMPORT_MODULE, "provider_ctx", |caller: Caller<'_, HostState>| -> i32 { caller.data().thread.ctx_addr as i32 })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> Result<()> {
+    linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u64;
         let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
         let what = match caller.data().nt.as_ref() {
@@ -383,11 +383,11 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             None => format!("{addr:#x}"),
         };
         Err(crate::aot_only::stop(&mut caller, addr, &format!("gex: the program called {name} ({what}), an export of a replaced library that its provider does not implement")))
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i64| -> Result<i64> {
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i64| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
         Ok(alloc(caller.data_mut(), size as u64, "[provider heap]")? as i64)
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i64, len: i64| -> Result<()> {
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i64, len: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {
             if let Some(b) = m.bytes().get(ptr as usize..(ptr as usize).saturating_add(len as usize)) {
                 use std::io::Write;
@@ -395,10 +395,10 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             }
         }
         Ok(())
-    })?;
+    })()) })?;
     // This thread's provider C stack (`stack`): its lowest address; it is
     // `STACK` bytes. musl reports it as the thread's stack.
-    linker.func_wrap(IMPORT_MODULE, "provider_stack", |mut caller: Caller<'_, HostState>| -> Result<i64> {
+    linker.func_wrap(IMPORT_MODULE, "provider_stack", |mut caller: Caller<'_, HostState>| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
         use wasmtime::AsContextMut;
         let mut cx = caller.as_context_mut();
         let g = stack(&mut cx)?;
@@ -408,7 +408,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             _ => 0,
         };
         Ok((top + 16 - STACK) as i64)
-    })?;
+    })()) })?;
     // Constants of gex's ABI a provider calling guest code needs.
     linker.func_wrap(IMPORT_MODULE, "provider_abi", |_caller: Caller<'_, HostState>, which: i32| -> i64 {
         match which {
@@ -428,7 +428,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
     // The guest address of the function `name` exports from the first
     // mapped Linux object that defines it (as RTLD_DEFAULT would find it), or
     // 0: how a provider finds the guest's own dlopen/dlsym.
-    linker.func_wrap(IMPORT_MODULE, "provider_guest_sym", |mut caller: Caller<'_, HostState>, ptr: i64, len: i64| -> Result<i64> {
+    linker.func_wrap(IMPORT_MODULE, "provider_guest_sym", |mut caller: Caller<'_, HostState>, ptr: i64, len: i64| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
         let name = {
             let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
             let b = m.bytes();
@@ -436,7 +436,7 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             String::from_utf8_lossy(bytes).into_owned()
         };
         Ok(guest_sym(caller.data_mut(), &name).unwrap_or(0) as i64)
-    })?;
+    })()) })?;
     // Stopping the guest's threads around a provider runtime's collection
     // (`GuestStop`).
     linker.func_wrap(IMPORT_MODULE, "provider_thread_register", |caller: Caller<'_, HostState>, in_guest: i64, stop: i64| {
@@ -448,16 +448,16 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             guest_stop().park_if_stopping(caller.data().thread.tid as u32, m.bytes(), true);
         }
     })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_stop_guest", |caller: Caller<'_, HostState>| -> Result<()> {
+    linker.func_wrap(IMPORT_MODULE, "provider_stop_guest", |caller: Caller<'_, HostState>| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         guest_stop().stop(caller.data().thread.tid as u32, m.bytes());
         Ok(())
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_start_guest", |caller: Caller<'_, HostState>| -> Result<()> {
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_start_guest", |caller: Caller<'_, HostState>| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let m = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         guest_stop().start(m.bytes());
         Ok(())
-    })?;
+    })()) })?;
     // The end of the mapping holding guest stack pointer `sp` (a thread's
     // stack top, for scanning it).
     linker.func_wrap(IMPORT_MODULE, "provider_guest_stack_end", |mut caller: Caller<'_, HostState>, sp: i64| -> i64 {

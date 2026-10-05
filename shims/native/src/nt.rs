@@ -709,7 +709,7 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
         }
         let e = match r {
             Ok(()) => break Err(anyhow!("guest code returned out of exception dispatch")),
-            Err(e) => e,
+            Err(e) => anyhow::Error::from(e),
         };
         if let Some(sig) = caller.data_mut().callout_signal.take() {
             match sig {
@@ -722,12 +722,12 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
                 // out waits for: theirs, with these frames.
                 other => {
                     caller.data_mut().callout_signal = Some(other);
-                    break Err(e);
+                    break Err(anyhow::Error::from(e));
                 }
             }
         }
         if caller.data().exit.is_some() {
-            break Err(e);
+            break Err(anyhow::Error::from(e));
         }
         if let Some(at) = caller.data_mut().resume_at.take() {
             crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -742,7 +742,7 @@ fn raise_nested(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>, target
         }
         // Anything else (an NtCallbackReturn ending a callback further out,
         // a failure) is for the loops below.
-        break Err(e);
+        break Err(anyhow::Error::from(e));
     };
     caller.data_mut().exc_levels.truncate(me);
     result?;
@@ -920,7 +920,7 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
         }
         let e = match result {
             Ok(()) => bail!("guest code returned out of a user-mode callback"),
-            Err(e) => e,
+            Err(e) => anyhow::Error::from(e),
         };
         // A function-tier call-out further out watches a dispatch slot this
         // callback's code reached: something else that uses the slot runs
@@ -934,7 +934,7 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
                 }
                 other => {
                     caller.data_mut().callout_signal = Some(other);
-                    return Err(e);
+                    return Err(anyhow::Error::from(e));
                 }
             }
         }
@@ -955,6 +955,6 @@ fn nested_loop(caller: &mut Caller<'_, HostState>, p: &Arc<nt::Process>) -> Resu
             pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
             continue;
         }
-        return Err(e);
+        return Err(anyhow::Error::from(e));
     }
 }

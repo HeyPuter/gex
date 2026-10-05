@@ -28,7 +28,7 @@ anyhow = "1"
 # module with one function per guest basic block -- fifty thousand of them for
 # bash, half a million for Mesa -- which is close to the ideal shape for
 # compiling in parallel, and it was using one core out of twenty-four.
-wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "threads", "parallel-compilation"] }
+wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std", "threads", "gc", "gc-null", "anyhow", "parallel-compilation"] }
 
 [features]
 # Host an x86-64 guest. See `gex_abi::X86`.

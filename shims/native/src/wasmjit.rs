@@ -218,8 +218,7 @@ pub(crate) fn register64(linker: &mut Linker<HostState>) -> Result<()> {
          names: i64,
          n: i64,
          errbuf: i64,
-         errcap: i64|
-         -> Result<i32> {
+         errcap: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
             match instantiate(&mut caller, bytes, len, cnames, consts, nconsts, slots, names, n) {
                 Ok(()) => {
                     if trace() {
@@ -236,9 +235,9 @@ pub(crate) fn register64(linker: &mut Linker<HostState>) -> Result<()> {
                     Ok(0)
                 }
             }
-        },
+        })()) },
     )?;
-    linker.func_wrap(IMPORT_MODULE, "provider_jit_table", |mut caller: Caller<'_, HostState>, op: i32, a: i64, b: i64| -> Result<i64> {
+    linker.func_wrap(IMPORT_MODULE, "provider_jit_table", |mut caller: Caller<'_, HostState>, op: i32, a: i64, b: i64| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
         crate::ftab::catch_up(&mut caller)?;
         let table = table_of(&caller)?;
         let (a, b) = (a as u64, b as u64);
@@ -264,8 +263,8 @@ pub(crate) fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             }
             _ => bail!("provider_jit_table: unknown op {op}"),
         }
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_jit_reserve", |mut caller: Caller<'_, HostState>, n: i64, _fill: i64| -> Result<i64> {
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_jit_reserve", |mut caller: Caller<'_, HostState>, n: i64, _fill: i64| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
         let (shared, engine) = {
             let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("wasmjit: no function table"))?;
             (Arc::clone(&jit.shared), jit.engine.clone())
@@ -279,6 +278,6 @@ pub(crate) fn register64(linker: &mut Linker<HostState>) -> Result<()> {
             eprintln!("gex-wasmjit: reserved {n} table slots at {base}");
         }
         Ok(base as i64)
-    })?;
+    })()) })?;
     Ok(())
 }

@@ -264,8 +264,8 @@ pub fn load_or_compile(
     }
 
     let (wasm, metadata) = build()?;
-    let module = Module::new(engine, &wasm).context("validating translated wasm")?;
-    if let Ok(serialized) = module.serialize() {
+    let module = Module::new(engine, &wasm).map_err(anyhow::Error::from).context("validating translated wasm")?;
+    if let Ok(serialized) = module.serialize().map_err(anyhow::Error::from) {
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
@@ -297,8 +297,8 @@ pub fn load_or_compile_at(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<M
             }
         }
     }
-    let m = Module::new(engine, wasm).context("validating the module")?;
-    if let (Ok(bytes), Some(dir)) = (m.serialize(), path.parent()) {
+    let m = Module::new(engine, wasm).map_err(anyhow::Error::from).context("validating the module")?;
+    if let (Ok(bytes), Some(dir)) = (m.serialize().map_err(anyhow::Error::from), path.parent()) {
         store(dir, path, &bytes);
     }
     Ok(m)
