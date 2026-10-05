@@ -189,6 +189,16 @@ def link(dlls, out, gexrt, others=None):
                 if mod in owners:
                     continue  # its own: already resolved inside it
                 pick = next((o for o in imports if o in owners), owners[0])
+                # a caller declaring the function otherwise than its
+                # definition (an adapter from the .spec: user32's
+                # NotifyWinEvent is void, win32u's stub returns a word) goes
+                # through a thunk: wasm calls must match exactly
+                have, want = sigs[mod].get((name, 'undefined')), sigs[pick].get((name, 'defined'))
+                if have and want and have != want:
+                    thunk = f'{mod}.{name}'
+                    thunks.append((f'gexw-thunk!{thunk}', have, f'{pick}!{name}', want))
+                    f.write(f'{name} gexw-thunk {thunk}\n')
+                    continue
                 f.write(f'{name} {pick}\n')
             # names only forwarded (kernel32's EnterCriticalSection is
             # ntdll's RtlEnterCriticalSection, under kernel32.dll!EnterCriticalSection)
@@ -285,6 +295,31 @@ def link(dlls, out, gexrt, others=None):
     if os.environ.get('GEX_WASM_SYSROOT'):
         cmd.append(os.path.join(os.environ['GEX_WASM_SYSROOT'], 'lib', 'libclang_rt.builtins-wasm32.a'))
     subprocess.check_call(cmd)
+    # What nothing defines (an export whose code is i386 assembly, say): a
+    # stub that traps, so one gap does not keep the module from
+    # instantiating. Listed.
+    imported = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
+    missing = set(re.findall(r'func\[\d+\] sig=\d+ <[^>]*> <- env\.(\S+)', imported))
+    callers = {}
+    for mod in sigs:
+        for (n, k), v in sigs[mod].items():
+            if k == 'undefined' and n in missing:
+                callers.setdefault(n, v)
+    gaps = sorted(callers.items())
+    if gaps:
+        ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
+        src = os.path.join(tmp, 'gaps.c')
+        with open(src, 'w') as f:
+            for k, (n, sig) in enumerate(gaps):
+                r, ps = sig.split(':')
+                params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
+                f.write(f'{ctype[r]} x{k}({params}) __asm__("{n}");\n')
+                f.write(f'{ctype[r]} x{k}({params}) {{ __builtin_trap(); }}\n')
+        obj = os.path.join(tmp, 'gaps.o')
+        subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-c', '-o', obj, src])
+        cmd.insert(cmd.index(gexrt), obj)
+        subprocess.check_call(cmd)
+        print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
     # The forwards, for gex to bind a -import re-export of a forwarded name
     # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
     # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.

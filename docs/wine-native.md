@@ -1000,6 +1000,33 @@ plus `make -k`.
   bytes in system DLLs, self-modifying hooks. They are rare in this set and
   handled by rebinding on write (§3.3).
 
+### 5.1 Queued (user, 2026-10-05): the guest's Unix userland as native wasm
+
+After the current W2 items (user32/gdi32 native, `_vsnprintf_s`,
+NtWow64*64, `__control87_2`): native wasm32 builds of the guest's libc,
+coreutils and whatever other Unix libraries Wine's Unix side depends on, on
+the musl fork (`wt/musl-wasm`, `gex-wasm32`), the wasm32 personality
+(§3.11) and the closed-world dlopen registry (§3.12).
+
+Steps:
+1. **Survey** what actually runs: what Wine's Unix side (ntdll.so,
+   win32u.so and the other `*.so` unixlibs) links and dlopens (libc, libm,
+   libpthread, libdl/ld.so, and if built freetype, fontconfig, gnutls,
+   libpng, libz...), and what a prefix's scripts and wineserver exec (sh and
+   the coreutils `wineboot` and the staging scripts call). Record each with
+   who loads it and how (static link, `dlopen`, `execve`).
+2. **Order** (proposal, to be confirmed by the survey):
+   1. libc/libm/libpthread as musl (the sysroot already has them; what is
+      new is shipping them as the guest's, under the wasm32 personality);
+   2. Wine's Unix side itself (ntdll.so, win32u.so) as wasm32, against that
+      libc, with the unixlibs in the dlopen registry;
+   3. the dlopen'ed third-party libraries Wine needs at run time
+      (freetype first: fonts; then fontconfig, gnutls as games need them);
+   4. a shell (busybox's `sh` or dash) and the coreutils the scripts call
+      (busybox would cover most in one binary).
+3. Each lands with a test under tests/wasm32 (a program using it, natively
+   and in the browser).
+
 ## 6. Open decisions for the user
 
 1. **Go/no-go on W0.** The spikes answer the cost questions before the big
@@ -1086,8 +1113,8 @@ plus `make -k`.
     `$W/pfx-native` (3 DLLs), `$W/pfx-w32u` (9: + msvcrt, ucrtbase,
     vcruntime140, msvcp140, concrt140, win32u) and the x86 prefix.
   - `$W/noadapter.sh DLL` lists a DLL's function exports with no adapter.
-  - Open: `_vsnprintf_s`, the NtWow64*64 calls, guest FP control words
-    (`__control87_2` is a stub on wasm32), user32/gdi32 native.
+  - Open: user32/gdi32 native (in progress: tests/nt 75/77 with them,
+    x86/input and x86/display crash), the NtWow64*64 calls. Then §5.1.
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
     merge/wine-wasm after its gate.
 - **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`

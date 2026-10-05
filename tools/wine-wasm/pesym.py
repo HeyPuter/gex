@@ -310,7 +310,8 @@ def main():
                 return flags, nm
             if nm in exports or nm.startswith(KEEP_PREFIXES):
                 return flags, f'{dll}!{nm}'
-            return flags | WASM_SYM_BINDING_LOCAL, nm
+            # (the binding is a 2-bit field: a weak symbol made local is local)
+            return (flags & ~0x3) | WASM_SYM_BINDING_LOCAL, nm
     elif mode == 'imports':
         owner = {}
         for l in open(sys.argv[5]):
