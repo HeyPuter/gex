@@ -817,6 +817,20 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   copied worldmachine build in size): sites site18ctl / site18o3 (project
   copies in `$S/p17v/`), ABBA queued (`$S/edger-mesa1.txt`).
 
+- **Mesa flags result (edger ABBA, 5 legs):** control 53.6, 56.8 vs SIMD +
+  ThinLTO 51.5, 56.9: no gain (noise); not adopted. pewasm 49.9 in the same
+  sequence (ejected 1.1x).
+- **The main-thread wait is gone:** after the frame skip, "GL previous
+  frame" is 1-3 ms per 10 s (was 2.3-2.7 s). Noita's main thread per 10 s:
+  guest 4.3-4.9 s, NT calls 2.1-2.2 s, waits 2.8-3.3 s, GL host 0.12 s. The
+  NT calls and GL submission are F's now; the compositor worker is no
+  longer on the critical path.
+- **Resume (E):** world-up (pewasm 30 s vs 52 s): profile the loader and
+  world-generation threads (attach the profiler before they start, e.g.
+  `--profile 2,40`), compare with pewasm's start-up; ship with
+  multi-threaded loading. Then the compositor items only if a profile
+  puts the worker back on the critical path.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
