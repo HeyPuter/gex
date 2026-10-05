@@ -508,6 +508,14 @@ pub struct Kernel {
     /// a signal); the host takes it after the call and wakes threads parked
     /// on descriptors ([`Kernel::take_fd_activity`]).
     pub fd_activity: bool,
+    /// The wasm32 personality (docs/wine-native.md §3.11): a native wasm32
+    /// program on the i386 ABI. Everything is i386's except how control
+    /// moves: a signal frame or a `sigreturn` is left in the thread context
+    /// and the syscall returns normally ([`SyscallOutcome::Continue`]), for
+    /// the program's own syscall stub to run the handler or carry on -- a
+    /// wasm program's frames cannot be resumed at a new guest PC. Set by the
+    /// host for each program it starts; kept across fork, cleared by exec.
+    pub wasm32: bool,
     /// The i386 process entered through the non-rt `sigreturn` (119), whose
     /// frame is laid out differently from `rt_sigreturn`'s. Set at entry,
     /// consumed by `sigreturn`.
@@ -1201,6 +1209,7 @@ impl Kernel {
             armed_pin: None,
             compat: false,
             fd_activity: false,
+            wasm32: false,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1430,6 +1439,7 @@ impl Kernel {
             armed_pin: None,
             compat: self.compat,
             fd_activity: false,
+            wasm32: self.wasm32,
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
@@ -1625,6 +1635,10 @@ impl Kernel {
                             "[gex:{}.{}] rt_sigreturn -> 0x{pc:x}, blocked {:#x}",
                             self.pid, self.tid, self.signals.blocked
                         );
+                    }
+                    // The restored context is in ctx, PC included.
+                    if self.wasm32 {
+                        return SyscallOutcome::Continue;
                     }
                     SyscallOutcome::Resume(pc)
                 }
@@ -1909,6 +1923,8 @@ impl Kernel {
         // pending signal can be delivered precisely here.
         match self.deliver_pending(m) {
             Delivery::None => SyscallOutcome::Continue,
+            // The frame is in ctx (PC = the handler): the stub runs it.
+            Delivery::Resume(_) if self.wasm32 => SyscallOutcome::Continue,
             Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
             Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
         }
@@ -2294,6 +2310,7 @@ impl Kernel {
         }
         match delivery {
             Delivery::None => SyscallOutcome::Continue,
+            Delivery::Resume(_) if self.wasm32 => SyscallOutcome::Continue,
             Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
             Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
         }

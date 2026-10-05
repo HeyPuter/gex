@@ -30,10 +30,16 @@ int32_t gexw_exit_i_i(int32_t);
 
 #define GEXW_EXIT_STUB(fp) _Generic((fp), \
     int (*)(const void *, const void *): gexw_exit_i_pp, \
-    int (__stdcall *)(int): gexw_exit_i_i)
+    int (__stdcall *)(int): gexw_exit_i_i, \
+    double (*)(double, int64_t): gexw_exit_i_i)
 
+#ifdef GEXW_ICALL_PASS
+/* The pass (tools/wine-wasm/icall) rewrites every indirect call itself. */
+#define ICALL(fp) (fp)
+#else
 #define ICALL(fp) \
     ((uintptr_t)(fp) < GEXW_ICALL_LIMIT ? (fp) \
      : (gexw_set_icall_target((uint32_t)(uintptr_t)(fp)), (__typeof__(fp))GEXW_EXIT_STUB(fp)))
+#endif
 
 #endif

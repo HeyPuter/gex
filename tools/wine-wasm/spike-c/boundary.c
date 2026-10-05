@@ -208,3 +208,29 @@ void setup(void)
 	fcache_put(g_guest_addr, (int)(uintptr_t)guest_add);
 	fcache_put(g_adapter_addr, (int)(uintptr_t)adapter_native_add);
 }
+
+#ifdef GEXW_ICALL_PASS
+/* The same loop as bench_native_indirect, written plainly: the ICALL pass
+ * (tools/wine-wasm/icall) rewrites the call. Its exit stubs call these. */
+uint64_t __gexw_guest_call(uint32_t target, const uint32_t *w, uint32_t n)
+{
+    return (uint32_t)exit_ii(target, (int)w[0], (int)w[1]);
+}
+double __gexw_guest_call_fp(uint32_t target, const uint32_t *w, uint32_t n) { return 0; }
+
+int bench_native_pass(int n)
+{
+    ii_fn f = g_native_fp;
+    int s = 0;
+    _Pragma("clang loop unroll(disable)") for (int i = 0; i < n; i++) { s = f(i, s); __asm__ volatile("" ::: "memory"); f = g_native_fp; }
+    return s;
+}
+
+int bench_native_to_guest_pass(int n)
+{
+    ii_fn f = (ii_fn)(uintptr_t)g_guest_addr;
+    int s = 0;
+    _Pragma("clang loop unroll(disable)") for (int i = 0; i < n; i++) { s = f(i, s); __asm__ volatile("" ::: "memory"); f = (ii_fn)(uintptr_t)g_guest_addr; }
+    return s;
+}
+#endif

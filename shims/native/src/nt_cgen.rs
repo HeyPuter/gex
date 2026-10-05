@@ -861,6 +861,11 @@ fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitS
         }
         eprintln!("gex-nt: provider {} for {}: {} exports", prov.name, p.path, pairs.len());
     }
+    // A native wasm32 Wine DLL (stream W): its module, at its skeleton's
+    // exports (`wasmdll`).
+    if let Some(n) = crate::wasmdll::install(&p.pe, &p.path, p.base, state, shared, engine, memory)? {
+        eprintln!("gex-nt: native wasm32 module for {}: {n} entries", p.path);
+    }
     // Stateful providers (`libprov`: an ejected project's), after the
     // built-in ones, so they win where both bind an export.
     let libs = crate::libprov::for_dll(&p.pe.exports.dll_name);

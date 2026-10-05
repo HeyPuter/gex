@@ -1,7 +1,10 @@
-/* W0(a): ws2_32's Unix library (dlls/ws2_32/unixlib.c, compiled for wasm32
- * unchanged) driven through its __wine_unix_call_funcs table, as the PE
- * side's WS_CALL would: gethostname, getaddrinfo. Linked statically; the
+/* W0(a)/W1: ws2_32's Unix library (dlls/ws2_32/unixlib.c, compiled for
+ * wasm32 unchanged) driven through its __wine_unix_call_funcs table, as the
+ * PE side's WS_CALL would: gethostname, getaddrinfo. With -DUSE_DLOPEN the
+ * table is found the way ntdll.so finds it, dlopen("…/ws2_32.so") and
+ * dlsym, through the closed-world registry (tools/wine-wasm/dlreg.py). The
  * ntdll.so functions it imports are stubbed here. */
+#include <dlfcn.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,7 +18,12 @@
 #include "wine/unixlib.h"
 #include "ws2_32_private.h"
 
+#ifdef USE_DLOPEN
+static const unixlib_entry_t *unix_funcs;
+#define __wine_unix_call_funcs unix_funcs
+#else
 extern const unixlib_entry_t __wine_unix_call_funcs[];
+#endif
 
 /* ntdll.so */
 static TEB teb;
@@ -26,6 +34,13 @@ int __cdecl __wine_dbg_header(enum __wine_debug_class cls, struct __wine_debug_c
 
 int main(void)
 {
+#ifdef USE_DLOPEN
+    void *h = dlopen("/usr/lib/wine/i386-unix/ws2_32.so", RTLD_NOW);
+    __wine_unix_call_funcs = h ? dlsym(h, "__wine_unix_call_funcs") : 0;
+    printf("dlopen ws2_32.so: %s, __wine_unix_call_funcs %s\n", h ? "ok" : dlerror(), __wine_unix_call_funcs ? "found" : "missing");
+    printf("dlopen nope.so: %s\n", dlopen("nope.so", RTLD_NOW) ? "found?" : "not linked (ok)");
+    if (!__wine_unix_call_funcs) return 1;
+#endif
     char name[256];
     struct gethostname_params hp = { name, sizeof(name) };
     NTSTATUS st = __wine_unix_call_funcs[ws_unix_gethostname](&hp);
