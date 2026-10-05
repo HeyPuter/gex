@@ -234,6 +234,38 @@ class Painter {
     if (this.ctx2d) this.#show();
   }
 
+  /** Direct present: `tex` (a GL frame) is the whole output, `w` x `h`, drawn
+   *  straight into the canvas's texture (or, reading back, the scene). One
+   *  draw, no scene, no decorations, no cursor. */
+  directFrame(tex, w, h) {
+    this.w = w;
+    this.h = h;
+    this.n = 0;
+    this.encoder = this.device.createCommandEncoder();
+    let target;
+    if (this.context) {
+      target = this.context.getCurrentTexture();
+    } else {
+      if (!this.scene || this.scene.width !== w || this.scene.height !== h) {
+        this.scene?.destroy();
+        this.scene = this.device.createTexture({ size: [w, h], format: this.format,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      }
+      target = this.scene;
+    }
+    this.pass = this.encoder.beginRenderPass({
+      colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+    });
+    this.pass.setPipeline(this.pipeline);
+    this.textured(0, 0, w, h, tex, { opaque: 1 });
+    this.pass.end();
+    this.device.queue.writeBuffer(this.uniforms, 0, this.data, 0, this.n * SLOT);
+    this.device.queue.submit([this.encoder.finish()]);
+    this.pass = null;
+    this.encoder = null;
+    if (this.ctx2d) this.#show();
+  }
+
   /* The readback output (see `presentMode`): the scene read back and put
    * into a 2D canvas. One read in flight; a frame drawn meanwhile is read
    * when it finishes, so the last frame drawn is always the one shown. */
@@ -419,8 +451,8 @@ class Compositor {
   resize(w, h) {
     this.#outW = Math.max(1, w | 0);
     this.#outH = Math.max(1, h | 0);
-    if (this.#canvas.width !== this.#outW) this.#canvas.width = this.#outW;
-    if (this.#canvas.height !== this.#outH) this.#canvas.height = this.#outH;
+    if (!this.#direct && this.#canvas.width !== this.#outW) this.#canvas.width = this.#outW;
+    if (!this.#direct && this.#canvas.height !== this.#outH) this.#canvas.height = this.#outH;
     setOutputSize(this.#channel, this.#outW, this.#outH);
     // Every mapped toplevel is told the new size: a compositor that resizes its
     // output and says nothing leaves every window the wrong shape.
@@ -830,8 +862,117 @@ class Compositor {
     return parts.join('|');
   }
 
+  // -- direct present -------------------------------------------------------
+  //
+  // An ejected single-window GL program (`?direct=1`): while its one toplevel
+  // is a GL window and nothing else is on screen, the GL frame is the output
+  // canvas, at the frame's own size (the page fits it to the viewport), and
+  // the page's pointer coordinates are the frame's pixels. No scene, no
+  // decorations, no wl_shm uploads, no hit testing beyond mapping into that
+  // window. A second toplevel, a popup or a window without GL (a message box)
+  // brings the compositor back, at once, for as long as it is there.
+  #directWanted = false;
+  #direct = null; // { k, w, h, ox, oy } while presenting directly
+  #directSerial = -1;
+  #cursorSerial = -1;
+
+  setDirect(on) {
+    this.#directWanted = !!on;
+  }
+
+  #directTarget() {
+    if (!this.#directWanted) return null;
+    let top = null;
+    for (const [k, win] of this.#windows) {
+      if (win.role === ROLE_CURSOR) continue;
+      if (win.role !== ROLE_TOPLEVEL) return null; // a popup or subsurface: composite
+      if (top) return null;                         // a second toplevel: composite
+      top = [k, win];
+    }
+    if (!top) return null;
+    const [k, win] = top;
+    const gl = this.#glSurface(win);
+    if (!gl) return null;
+    const f = this.#frameOf(win);
+    const r = win.info?.glRect;
+    return { k, win, gl, w: gl.w, h: gl.h, ox: f.x + (r ? r.x : 0), oy: f.y + (r ? r.y : 0) };
+  }
+
+  #frameDirect(d, byKey, blocks) {
+    if (!this.#direct || this.#direct.w !== d.w || this.#direct.h !== d.h) {
+      this.#canvas.width = d.w;
+      this.#canvas.height = d.h;
+      this.#directSerial = -1;
+      this.#cursorSerial = -1;
+      postMessage({ kind: 'direct', w: d.w, h: d.h });
+      this.#note(`direct present ${d.w}x${d.h} (${d.k})`);
+    }
+    this.#direct = { k: d.k, w: d.w, h: d.h, ox: d.ox, oy: d.oy };
+    this.#directCursor(byKey);
+    for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    if (d.gl.serial === this.#directSerial) {
+      this.#skipped++;
+      return;
+    }
+    this.#directSerial = d.gl.serial;
+    this.#painter.directFrame(d.gl.tex, d.w, d.h);
+    this.#frames++;
+    if (this.#stats) {
+      Atomics.store(this.#stats, 0, this.#frames);
+      Atomics.store(this.#stats, 1, this.#windows.size);
+    }
+  }
+
+  #leaveDirect() {
+    this.#direct = null;
+    this.#canvas.width = this.#outW;
+    this.#canvas.height = this.#outH;
+    this.#lastSig = null;
+    postMessage({ kind: 'direct', w: 0, h: 0 });
+    this.#note('direct present off: compositing');
+  }
+
+  /* The client's cursor as the page's CSS cursor: none when it hid it (a
+   * game drawing its own), its image when it set one. Read from the guest's
+   * buffer when its serial moves. */
+  #directCursor(byKey) {
+    let found = null;
+    for (const [k, win] of this.#windows) if (win.role === ROLE_CURSOR) { found = [k, win]; break; }
+    if (!found) {
+      if (this.#cursorSerial !== 0) postMessage({ kind: 'cursor', css: 'none' });
+      this.#cursorSerial = 0;
+      return;
+    }
+    const [k, win] = found;
+    const s = byKey.get(k);
+    if (!s || !s.addr || s.serial === this.#cursorSerial) return;
+    this.#cursorSerial = s.serial;
+    const mem = this.#memoryOf(s.token);
+    if (!mem || s.width <= 0 || s.height <= 0 || s.width > 256 || s.height > 256) return;
+    const px = new Uint8ClampedArray(s.width * s.height * 4);
+    for (let y = 0; y < s.height; y++) {
+      for (let x = 0; x < s.width; x++) {
+        const i = s.addr + y * s.stride + x * 4;
+        const o = (y * s.width + x) * 4;
+        px[o] = mem[i + 2]; px[o + 1] = mem[i + 1]; px[o + 2] = mem[i]; px[o + 3] = win.info?.format === 1 ? 255 : mem[i + 3];
+      }
+    }
+    const cv = new OffscreenCanvas(s.width, s.height);
+    cv.getContext('2d').putImageData(new ImageData(px, s.width, s.height), 0, 0);
+    const hx = Math.max(0, win.relX | 0), hy = Math.max(0, win.relY | 0);
+    cv.convertToBlob().then((blob) => {
+      postMessage({ kind: 'cursor', css: `url(${URL.createObjectURL(blob)}) ${hx} ${hy}, default` });
+    }).catch(() => {});
+  }
+
   frame() {
     const { byKey, blocks } = this.#reconcile();
+    const d = this.#directTarget();
+    if (d) {
+      this.#frameDirect(d, byKey, blocks);
+      return;
+    }
+    if (this.#direct) this.#leaveDirect();
     // Upload every surface whose content moved on.
     for (const [k, s] of byKey) {
       const t = this.#textures.get(k);
@@ -991,6 +1132,11 @@ class Compositor {
   }
 
   pointerMove(x, y, time) {
+    // Direct present: the page's coordinates are the GL frame's pixels.
+    if (this.#direct) {
+      x = this.#direct.ox + Math.max(0, Math.min(this.#direct.w - 1, x));
+      y = this.#direct.oy + Math.max(0, Math.min(this.#direct.h - 1, y));
+    }
     this.#pointer.x = x;
     this.#pointer.y = y;
     if (this.#drag) {
@@ -1140,6 +1286,9 @@ class Compositor {
       brightest,
       hash,
       output: `${this.#outW}x${this.#outH}`,
+      // Direct present (`?direct=1`): the GL frame's size while it is the
+      // output (then `lit`/`hash` describe the last composited scene).
+      direct: this.#direct ? `${this.#direct.w}x${this.#direct.h}` : null,
       // The GL device's counters (submits, their time, readbacks): the
       // compositor side of a frame's cost.
       gl: glDevice?.glState?.() ?? null,
@@ -1283,6 +1432,7 @@ self.onmessage = ({ data: m }) => {
       // The compositor draws with WebGPU on the device Mesa will use.
       requestGexDevice().then((gpu) => {
         comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);
+        comp.setDirect(m.direct);
         running = true;
         requestAnimationFrame(loop);
         postMessage({ kind: 'ready' });

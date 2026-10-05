@@ -151,7 +151,9 @@ let settings = flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.
 if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_NT_INPUT=')), `GEX_NT_INPUT=${opt('--input', null)}`];
 // --args 'A B': the program's arguments instead of the recorded ones ('' for none).
 const args = av.includes('--args') ? opt('--args', '').split(' ').filter(Boolean) : nt.args;
-const ntOut = { ...nt, settings, args };
+// Direct present for a GL program (the page composites again whenever a
+// second window or one without GL appears); --no-direct: always composite.
+const ntOut = { ...nt, settings, args, direct: !!nt.gl && !flag('--no-direct') };
 mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 

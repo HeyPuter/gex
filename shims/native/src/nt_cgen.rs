@@ -1008,9 +1008,11 @@ pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::Path
     if class32 {
         for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
             let (path, _) = gex_cgen::provider::build(&prov, &cache_root()?)?;
+            #[cfg(feature = "translate")]
             if let Some(dir) = gex_cache::precompiled_dir() {
                 gex_cache::precompile(&crate::engine()?, &std::fs::read(&path)?, &dir)?;
             }
+            let _ = path;
         }
     }
     Ok(unit)
