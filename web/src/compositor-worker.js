@@ -107,6 +107,25 @@ function gpuTexture(device, w, h) {
   });
 }
 
+/**
+ * How the scene reaches the output canvas: 'canvas' (a WebGPU canvas
+ * context, the scene copied into it) or 'readback' (read back into a 2D
+ * canvas).
+ *
+ * Readback is for software WebGPU (SwiftShader, the fallback adapter), which is
+ * what headless test runs get: there Chromium has no shared-image backing for
+ * a WebGPU canvas, and the first `getCurrentTexture` of *any* WebGPU canvas
+ * loses every device in the renderer -- Mesa's included -- with "destroyed".
+ * It cannot be probed for without that loss, so it is decided by the adapter.
+ * `?present=canvas|readback` (the page's query, forwarded) overrides.
+ */
+let presentOverride = null;
+function presentMode(adapter) {
+  if (presentOverride === 'canvas' || presentOverride === 'readback') return presentOverride;
+  const info = adapter?.info ?? {};
+  return info.isFallbackAdapter || info.architecture === 'swiftshader' ? 'readback' : 'canvas';
+}
+
 class Painter {
   constructor(device, context, format) {
     this.device = device;
@@ -205,11 +224,37 @@ class Painter {
   end() {
     this.pass.end();
     if (this.n) this.device.queue.writeBuffer(this.uniforms, 0, this.data, 0, this.n * SLOT);
-    const out = this.context.getCurrentTexture();
-    this.encoder.copyTextureToTexture({ texture: this.scene }, { texture: out }, [this.w, this.h]);
+    if (this.context) {
+      const out = this.context.getCurrentTexture();
+      this.encoder.copyTextureToTexture({ texture: this.scene }, { texture: out }, [this.w, this.h]);
+    }
     this.device.queue.submit([this.encoder.finish()]);
     this.pass = null;
     this.encoder = null;
+    if (this.ctx2d) this.#show();
+  }
+
+  /* The readback output (see `presentMode`): the scene read back and put
+   * into a 2D canvas. One read in flight; a frame drawn meanwhile is read
+   * when it finishes, so the last frame drawn is always the one shown. */
+  #reading = false;
+  #again = false;
+
+  #show() {
+    if (this.#reading) {
+      this.#again = true;
+      return;
+    }
+    this.#reading = true;
+    this.#again = false;
+    this.read().then((r) => {
+      if (r && r.w === this.ctx2d.canvas.width && r.h === this.ctx2d.canvas.height) {
+        this.ctx2d.putImageData(new ImageData(new Uint8ClampedArray(r.px.buffer, 0, r.w * r.h * 4), r.w, r.h), 0, 0);
+      }
+    }).catch(() => {}).finally(() => {
+      this.#reading = false;
+      if (this.#again) this.#show();
+    });
   }
 
   /** The last scene's pixels (`format` order), for tests. */
@@ -351,13 +396,19 @@ class Compositor {
     this.#channel = channel;
     this.#stats = stats;
     const device = gpu.device;
-    const context = canvas.getContext('webgpu');
-    if (!context) throw new Error('no webgpu context for the compositor');
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    context.configure({ device, format, alphaMode: 'opaque', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST });
     this.#device = device;
     this.#canvas = canvas;
-    this.#painter = new Painter(device, context, format);
+    if (presentMode(gpu.adapter) === 'canvas') {
+      const context = canvas.getContext('webgpu');
+      if (!context) throw new Error('no webgpu context for the compositor');
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      context.configure({ device, format, alphaMode: 'opaque', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST });
+      this.#painter = new Painter(device, context, format);
+    } else {
+      // RGBA, so a read row is ImageData as it stands.
+      this.#painter = new Painter(device, null, 'rgba8unorm');
+      this.#painter.ctx2d = canvas.getContext('2d', { alpha: false });
+    }
     this.#text = new TextCache(device);
     this.#cursorFallback = defaultCursor(device);
     this.resize(canvas.width, canvas.height);
@@ -1227,6 +1278,7 @@ self.onmessage = ({ data: m }) => {
   try {
     if (m.kind === 'init') {
       canvas = m.canvas;
+      presentOverride = m.present ?? null;
       // The compositor draws with WebGPU on the device Mesa will use.
       requestGexDevice().then((gpu) => {
         comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);

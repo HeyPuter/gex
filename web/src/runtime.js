@@ -383,7 +383,7 @@ export async function runProgram(
     // gex_wgpu, straight onto WebGPU.
     glBackend = 'wgpu',
     // The compositor's output canvas. Its control is transferred to a worker
-    // that owns a WebGL2 context and draws the whole scene there: every
+    // that owns a WebGPU device and draws the whole scene there: every
     // window, its decorations, its menus, and the cursor.
     wl = null,
     // Kept for callers that used to route input to a different canvas from the
@@ -496,7 +496,7 @@ export async function runProgram(
   // The Wayland compositor. The protocol state machine runs in each guest
   // process (the Rust shim, next to the client's memory, which is the only
   // place that can read a wl_shm pool); the scene, the output and the input
-  // live in one worker that owns a WebGL2 context. What crosses between them is
+  // live in one worker that owns a WebGPU device. What crosses between them is
   // a shared arena of surface descriptors -- never a frame.
   let wlChannel = null;
   let compositor = null;

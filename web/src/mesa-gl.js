@@ -2,7 +2,7 @@ import { requestGexDevice } from './gpu-device.js';
 // The guest's GL device, backed by Mesa's frontend and the gex_wgpu Gallium
 // driver on the browser's WebGPU.
 //
-// Same role as `GlDevice` (WebGL 2): it is handed the
+// It is handed the
 // guest's command ring and executes it. What differs is everything below the
 // decoder -- here the ring goes to gex's wire decoder compiled against
 // st/mesa, so the GL semantics are Mesa's rather than hand-written.
