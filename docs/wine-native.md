@@ -628,6 +628,27 @@ Native Wine runs inside the guest thread, as Windows' DLLs do:
   until it comes back to the syscall's own state; the resume-type calls
   throw instead. Exit, thread exit and NtCallbackReturn still trap out
   (they end host loops).
+- **Guest code that leaves native frames** (W2, gooner). A guest handler
+  native code called may never return: an i386 catch block continues in an
+  outer frame (`continue_after_catch`), an `__except` resumes its function.
+  The guest then runs on nested inside the native frames (and the call-out
+  holding them), one level per exception, until the call-outs run out
+  (32) and the thread livelocks. Three pieces flatten it:
+  - gexrt's `run_until` drops the frames (throws `__gexw_unwind` to its
+    entry) when the guest stack pointer is at or above the one at the guest
+    call (native code's guest ESP is its entry's);
+  - an entry made at or above the innermost entry's stack pointer (gexrt
+    tracks it per thread, as a hint) issues `gex_nr::NATIVE_LEFT`: the host
+    leaves the innermost call-out if it is a native caller's (its return is
+    `tramp::NATIVE_RETURN_PAD`) and the guest is above its callee's frame
+    (`NATIVE_UNWOUND`, 512 bytes), and the guest calls the function again
+    from `tramp::JMP_EAX_32` (`jmp eax`; EAX is free at a call). Re-entering
+    at the function's own address would not do: a body leaving for its own
+    address has served nothing, and the bridge hands the address to tier-1.
+  - a safepoint leaves a native caller's call-out the same way, except at a
+    function's own address (the entry about to run does it).
+  tests/nt `x86/msvc_cxxeh` (clang-cl i386 C++ and SEH, built by
+  tests/nt/msvc/build.sh) throws 20000 times through x86 msvcrt.
 - **Exceptions.** A guest fault reaches `KiUserExceptionDispatcher` as
   before (a hand-written entry: no return address), whose
   `dispatch_exception` ends in NtContinue. An exception native code raises
@@ -1039,6 +1060,17 @@ plus `make -k`.
   (`GEX_CGEN_CACHE=target/nt-test-cgen GEX_WINE_PREFIX=$W/pfx-native ARCHES=x86
   tests/nt/run-browser.sh --cgen-prefer`; the cache supplies crt_mem/crt_math,
   which a native run builds). See §3.16. Committed 7e02468b.
+- **master merged** (fd8be1d1, wasmtime49 landed; wt/wasmtime49 removed).
+  `$W/check.sh` runs W's pre-gate checks: tests/nt both prefixes, tests/wasm32,
+  browser NT both prefixes.
+- **CRTs (next):** native msvcrt needs an i386-semantics `except_wasm32.c`
+  (cxx_frame_handler, `_except_handler3/4`, `_setjmp`/`longjmp` on the guest
+  context; catch blocks and filters as guest calls with EBP set,
+  `continue_after_catch` as a guest-state load), CXX_USE_RVA off on wasm32,
+  `__ASM_VTABLE` as C (`name_vtable_full` plus `.set name_vtable, +4`, tested),
+  `__thiscall` annotated for thiscall entry thunks, and CALL_VTBL_FUNC on
+  guest objects through small x86 `vtbl_wrapper_N` thunks (pop/pop ecx/push/
+  jmp [eax+off]) in RWX memory.
 - `$W/cycle.sh` rebuilds the three DLLs and restages `$W/pfx-native`;
   `$W/elemmap.py MODULE IDX...` names a table index's function.
 
