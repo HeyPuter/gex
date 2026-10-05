@@ -1361,3 +1361,41 @@ V8 profiles (`cmp.py`, ms of work per world frame, gb2 vs pb2):
 - Total: 61 against 26 ms. Two cores are saturated, so preemption inflates
   the main thread's per-function times (0x70b200 is 0.83 of pewasm's time on
   the workers but 1.6 on the main thread).
+
+### Stream F before the move (2026-10-04, night)
+
+merge/fjit = main eda8e8bd + b2bb3c95 (provider key fix, not in main yet)
++ 26e9f7bc, 857546ce, 0c8f9783, 916ed2c8.
+
+**Item 2, the notify skip (26e9f7bc): correct, no gain.** The yield park
+publishes its parked count at `YIELD_PARKED` (USD+0xff4); the ConcRT
+provider's kick notifies only when it is nonzero. tests/providers (Noita's
+CRT), browser NT sync/mtx 4/4 and mtx with Noita's CRT natively and in the
+browser runtime pass. Page ABBA (`v8/abba-i2.out`): baseline 51.5/40.9,
+change 50.7/50.6, pewasm 53.5/60.6/58.5. cond_notify and cs_unlock_ cost the
+same before and after: real wakes of waiting threads, which pewasm pays too
+(its ~159-byte notify function, 0.74 ms/frame).
+
+**Item 3, inlining 0x70b110/0x70b050 into 0x724580 (0c8f9783).** Their calls
+were direct already (devirtualised), but they are in the outlined loop
+l_724580_0 (26 KB of wasm), and V8's `--trace-wasm-inlining` (harness:
+`GEX_NT_CHROME_STDOUT=FILE GEX_NT_CHROME_FLAGS=--js-flags=--trace-wasm-inlining`)
+says "not enough inlining budget" for both (726 wire bytes each). pewasm
+gets them inlined by TurboFan, not in every run. Small functions with at
+most two returning calls now get unit-private copies like small leaves,
+`always_inline`, with leaf copies allowed inside them (0x4ac0d0). Without
+always_inline (the first attempt, `v8/abba-i3.out`) clang refused them and
+nothing changed: A 50.6/49.5, B 52.2/47.1. With it, noita.exe's unit has no
+fl_70b110/fl_70b050 left (inlined). Native --cgen NT gate 60/60.
+
+**Item 4 (direct import binding): dropped** (coordinator). About 45k
+cross-image calls per world frame, all threads: an estimated 0.15-0.3 ms.
+
+**Resume:**
+1. The i3b ABBA (part 2), once the GPU is free:
+   `scratchpad/fjit/v8/abba.sh i3b wt/fjit-a wt/fjit wt/fjit/target/bm wt/fjit/target/bm`
+   (A: wt/fjit-a = c4efc34a with main's shim plus the key fix; B: wt/fjit
+   with `scratchpad/fjit/shim-i3b.wasm` in web/public/gex). bm holds both
+   arms' units (keys differ). Check every leg's AOT line.
+2. If it gains, the per-function table (`cmp.py`) for 0x724580's family;
+   if not, the V8 trace again on the new units.
