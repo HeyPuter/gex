@@ -202,7 +202,13 @@ export class MesaGlDevice {
     canvas.id = 'gex-gl';
     try {
       if (!navigator.gpu) throw new Error('navigator.gpu unavailable');
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      // The first request can return null while Chromium's GPU process is
+      // still starting (seen on slower hosts); retry for up to ~5 s.
+      let adapter = null;
+      for (let i = 0; i < 20 && !adapter; i++) {
+        adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        if (!adapter) await new Promise(r => setTimeout(r, 250));
+      }
       if (!adapter) throw new Error('WebGPU adapter unavailable');
       out.#adapter = adapter;
       const optional = ['texture-compression-bc', 'depth32float-stencil8',
