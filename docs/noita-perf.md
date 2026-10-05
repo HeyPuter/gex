@@ -1433,21 +1433,25 @@ Paths: project ~/gex-sandbox, scratch ~/gex-sandbox/scratch/fjit (old
 `scratchpad/fjit`). No timing on gooner: every page number comes from edger
 through scratch/bench/bench.sh, paired with pewasm on the same box.
 
-- merge/fjit = master 3718d0ca (merged; U's mem64 gex-cgen changes leave
-  wasm32 C text alone, so objects were reused) + i3c (199954d4).
+- merge/fjit = master 5ab54ab2 (merged: E's eject9 with b2bb3c95, the
+  msvcp120_thrd provider and direct GL present) + the GL fast path
+  (f7704244) + the ZFCALLS knob (a26ef810). Assignment (coordinator,
+  2026-10-05): the main thread -- GL without the NT syscall, guest_yield,
+  NT-call overheads -- and pricing ZF at calls (W's _chkesp).
 - gexc `wt/fjit/target/x86/release/gexc`; shim, kernel, seed in
   wt/fjit/web/public/gex (`scratch/fjit/build-shims.sh`); Mesa replay copied
   from worldmachine's wt/fjit (the one bm used); web/node_modules by `npm ci`.
 - Caches (nice 19, up to 12 jobs, cg14's icall hints; `GEX_CGEN_EXP` is not
   in the unit key, so arms are caches with the same keys):
-  `scratch/fjit/build-bm.sh wt/fjit/target/bm-d` (merge/fjit 8a58deae: the
-  default, leaf copies only; on gooner and edger). A pricing arm:
+  `scratch/fjit/build-bm.sh wt/fjit/target/bm-f` (merge/fjit a26ef810;
+  on gooner and edger once synced). A pricing arm:
   `GEX_CGEN_EXP=... GEX_CGEN_MUTATE=... scratch/fjit/variant.sh wt/fjit/target/bm-d wt/fjit/target/NEW <Noita's images>`
   (units hard-linked, the named images rebuilt, the prefix and Wine DLL
   units shared; then link bm-d's prefix unit dirs into NEW, as done for i3c).
 - edger: `scratch/fjit/e/sync.sh bm-c bm-a2 bm-b2` (worktree without
   target/.git, caches without objects/recovery); runs:
-  `scratch/bench/bench.sh -- scratch/fjit/e/seq.sh NAME ~/gex-sandbox/wt/fjit 240 a=CACHE c=CACHE ...`
+  `scratch/bench/bench.sh -- scratch/fjit/e/seq.sh NAME ~/gex-sandbox/wt/fjit 240 a=CACHE[@ENV] c=CACHE ...`
+  (ENV: that arm's extra page env, e.g. `@GEX_NT_GL_FAST=0`)
   (pewasm, arms, pewasm, arms reversed, pewasm; 4C/8T; logs in
   scratch/fjit/e/ and scratch/bench/fjit-* on edger; gooner keeps the
   bench.sh output in scratch/fjit/e/*.out).
@@ -1526,3 +1530,21 @@ outside guest code: total work 72.8 against 35.5.
 - The main game thread: 33.0 ms per frame against pewasm's busiest 13.8:
   `guest_yield` 5.8, the gl-bridge's `#a` 5.2, mono_ns 1.7, NT syscalls.
 Both are E's/R's areas (E1, E2), not codegen.
+
+**Main thread, edger profile i3c-a1 (before E's direct present):** 31 s
+busy of 31: `guest_yield` 5.4 s and gl-bridge `#a` 4.9 s are waits (a
+parked yield; the previous frame's GL submit), not work. `gex_syscall` is
+17.1 s inclusive: unix-call dispatch 7.4 (of it the swap's wait 5.1), the
+yield 5.4, the syscall shell ~3.3 (imp::syscall 0.9, tick 0.8 of which
+mono_ns JS calls, syscall_on 0.5, with_host 0.4, wasm-to-js 0.4, cgen
+drain 0.3). NtDuplicateObject + NtClose cost 0.08 s in the layer. GL
+census (GEX_NT_GL_STATS): 3,880 calls a frame, glDisable 620,
+glActiveTexture 583, glUseProgram 557, glBindTexture 415, glEnable 411,
+glUniform1i 291, glUniform2f 284, glEnable/DisableClientState 169 each.
+
+**GL fast path (f7704244):** the provider `nt_unixcall` at the i386
+unix-call trampoline writes those seven (81% of calls) into the ring;
+the ring's tail is a guest word with a lock bit (USD+0xfe4), the address
+at USD+0xfe0; `GEX_NT_GL_FAST=0` turns it off at run time (A/B on one
+cache). tests/nt glfast; NT gate 75/75 with and without --cgen.
+Client-state calls stay in the layer (their array flags are layer state).
