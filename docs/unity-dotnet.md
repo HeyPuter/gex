@@ -591,6 +591,13 @@ Not yet:
     gooner at load ~40) presented 0.3-0.5 frames/s at the menu, against
     17-23 fps for Unity's own Mono with `--fjit --mem64` on worldmachine.
     Neither number is a measurement; the browser on the bench box is.
+    Coordinator's correction (2026-10-05): on worldmachine (RX 6500 XT,
+    idle) the same menu without --fjit, interpreter only, runs 31.5-32.1
+    presents/s (GL drain 6.1 ms, readback 1.55 ms): gooner's numbers are
+    llvmpipe under load and the menu is not managed-bound. JIT gains are
+    measured on worldmachine (`BENCH_HOST=worldmachine scratch/bench/bench.sh`,
+    staged layout in `~/src/noita-wasm/scratch/coord-wm` there) in gameplay
+    or a managed-heavy scene.
   - **P5 started: the browser shim for a 64-bit memory (docs/mem64.md step
     6), 36e98cd5.** `GEX_MEM64=1 shims/browser/build.sh` (x86) builds the
     shim for wasm64-unknown-unknown (nightly, build-std): a 16 GiB memory64.
