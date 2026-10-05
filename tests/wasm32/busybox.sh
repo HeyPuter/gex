@@ -1,8 +1,8 @@
 #!/bin/sh
 # A wasm32 busybox as the guest's /bin/sh and coreutils (`gexc run
-# --busybox`): a script with pipelines, command substitution, redirections,
-# externals and a failing command, against the same script under the
-# host's sh. BUSYBOX names the binary (tools/wine-wasm/build-busybox.sh);
+# --busybox`): a script with pipelines, command substitution, subshells,
+# redirections, externals and a failing command (hush forks for them),
+# against the same script under the host's sh. BUSYBOX names the binary (tools/wine-wasm/build-busybox.sh);
 # without it this is a skip.
 #
 #   tests/wasm32/busybox.sh GEXC
@@ -21,6 +21,10 @@ for i in 1 2 3; do echo $i; done | tail -1
 awk "{n++} END {print n}" in.txt
 false || echo "false failed"
 /nonexistent-command 2>/dev/null; echo "status $?"
+(cd / && pwd); x=1; (x=2; echo "sub $x"); echo "top $x"
+{ echo a; echo b; } | sort -r | tr "\n" " "; echo
+echo $(echo $(echo nested))
+f() { echo "in f $1"; }; f one | cat
 echo done'
 native=$(sh -c "$script" 2>&1)
 gex=$("$GEXC" run --busybox "$BUSYBOX" /bin/sh -c "$script" 2>&1)

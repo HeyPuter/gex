@@ -1,7 +1,7 @@
 // A desktop whose windows are elements.
 //
 // The other compositor (`compositor-worker.js`) draws the whole scene itself,
-// in one WebGL context, on one canvas: titlebars, borders, stacking, cursor
+// in one WebGPU scene, on one canvas: titlebars, borders, stacking, cursor
 // and all. This one draws none of that. Each window is a `<canvas>` handed to
 // the page, and everything around it -- the frame, the title, where it sits,
 // what happens when it is dragged -- is the page's HTML. Same compositor
@@ -11,7 +11,7 @@
 // What that buys is everything the DOM already does. Decorations are CSS and
 // can be anything; a window can be animated, transformed, put in a flexbox or
 // a grid; the browser composites, so an idle window costs nothing where the
-// WebGL scene redraws all of it every frame; and hit-testing is the browser's
+// WebGPU scene redraws all of it every frame; and hit-testing is the browser's
 // -- a `pointerdown` on a window's canvas arrives with `offsetX`/`offsetY`,
 // which is surface-local coordinates, exactly, including under a transform.
 //
@@ -33,7 +33,7 @@
 // # Pixels
 //
 // A surface is an address in a `SharedArrayBuffer`, which is the same thing
-// the WebGL compositor uploads with `texSubImage2D`. Here it goes into a 2D
+// the WebGPU compositor uploads with `queue.writeTexture`. Here it goes into a 2D
 // canvas, which costs a copy and a swizzle: shm is BGRA and `ImageData` is
 // RGBA, and `ImageData` refuses a shared buffer besides. Damage-bounded, so a
 // terminal's cursor blink copies a few hundred bytes.
@@ -190,7 +190,7 @@ class DomWindow {
   /** The 2D context, taken on first paint rather than at construction.
    *
    * A canvas gets one context and keeps it. A window whose pixels are the
-   * host's GL needs that one context to be WebGL or WebGPU, so taking a 2D
+   * host's GL needs that one context to be WebGPU, so taking a 2D
    * one up front would quietly make every GL window unpresentable. */
   #context() {
     if (!this.#ctx) this.#ctx = this.canvas.getContext('2d', { alpha: true });
@@ -419,7 +419,7 @@ export class DomDesktop {
     for (const win of this.#windows.values()) win.onclosed?.();
     this.#windows.clear();
     // The guest's OpenGL goes with it. Left running, a finished session keeps
-    // a Mesa module, a WebGL or WebGPU context and a thread waiting on a ring
+    // a Mesa module, a WebGPU context and a thread waiting on a ring
     // nobody writes to any more -- and the *next* session then asks the
     // browser for a second set of all of it, which is how a run that works
     // the first time throws the second.
@@ -431,17 +431,9 @@ export class DomDesktop {
     this.#glShown.clear();
     this.#glList = [];
     gl?.dispose?.();
-    // A context is not collected just because nothing refers to it, and a
-    // page holds a fixed number of them. Asking for it to be lost frees it
-    // now rather than whenever the browser gets round to it.
     const canvas = this.#glCanvas;
     this.#glCanvas = null;
-    if (canvas) {
-      try {
-        canvas.getContext('webgl2')?.getExtension('WEBGL_lose_context')?.loseContext();
-      } catch { /* a WebGPU canvas has no such context, and needs none */ }
-      canvas.remove();
-    }
+    canvas?.remove();
   }
 
   /** The surface records this desktop last read, as the compositor saw them.

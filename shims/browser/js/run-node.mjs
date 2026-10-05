@@ -7,6 +7,9 @@
 //     --file <guest>=<host>     bundle a host file into the guest's filesystem
 //     --dir <guest>=<host>      bundle a whole directory tree
 //     --extract <guest>=<host>  write a file back out when the program ends
+//     --busybox <host>          a wasm32 busybox as /bin/busybox, hard-linked
+//                               as /bin/<applet> and /usr/bin/<applet> for
+//                               tools/wine-wasm/busybox.applets
 //     --argv0 <name>            what the guest sees as argv[0]
 //     --cwd <dir>               the directory the guest starts in
 //     --env <KEY=VALUE>         an environment variable (repeatable); none
@@ -53,6 +56,9 @@ let cwd = null;
 const extract = [];
 let argv0 = null;
 const env = [];
+// Hard links (guest path -> the bundled file it names) and modes.
+const hard = {};
+const modes = {};
 let cgenMode = 0;
 let noJit = false;
 let aotRun = false;
@@ -129,6 +135,14 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--extract wants <guest>=<host>'); process.exit(2); }
       extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
+    } else if (av[i] === '--busybox') {
+      const host = av[++i] ?? '';
+      files['/bin/busybox'] = readFileSync(host);
+      modes['/bin/busybox'] = 0o755;
+      const list = readFileSync(new URL('../../../tools/wine-wasm/busybox.applets', import.meta.url), 'utf8');
+      for (const name of list.split('\n').filter(Boolean)) {
+        for (const dir of ['/bin', '/usr/bin']) hard[`${dir}/${name}`] = '/bin/busybox';
+      }
     } else if (av[i] === '--cwd') cwd = av[++i];
     else if (av[i] === '--env') env.push(av[++i] ?? '');
     else if (av[i] === '--strace') strace = true;
@@ -475,6 +489,8 @@ try {
       cwd,
       env: env.length ? env : undefined,
       dirs,
+      hard,
+      modes,
       // GEX_PINS names a layout written by `gexc build --closure`. Every
       // object in it is placed exactly where the build assumed, which is
       // what makes a module built against those addresses correct -- and it
