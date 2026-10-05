@@ -121,6 +121,13 @@ pub struct RunOptions {
     /// Host directory presented as the guest's root. Without one the guest
     /// sees the host filesystem directly.
     pub sysroot: Option<std::path::PathBuf>,
+    /// A native wasm32 busybox (docs/wine-native.md §5.1) presented as
+    /// `/bin/sh` and the common coreutils in `/bin` and `/usr/bin`, so a
+    /// script's shell and tools run natively instead of being translated.
+    pub busybox: Option<std::path::PathBuf>,
+    /// The program file when argv[0] does not name it (`--busybox` running
+    /// `/bin/sh`): what `/proc/self/exe` is, which hush re-executes.
+    pub exe: Option<String>,
     /// Who the guest thinks it is. `None` reports the host's own ids, which a
     /// passthrough filesystem needs for consistent stat/getuid answers.
     pub identity: Option<(u32, u32)>,
@@ -186,6 +193,8 @@ impl Default for RunOptions {
             trace: false,
             verbose: false,
             sysroot: None,
+            busybox: None,
+            exe: None,
             identity: None,
             sample: false,
             pins: std::collections::HashMap::new(),
@@ -848,8 +857,9 @@ fn run_program_with(
     // `/proc/self/exe` is the resolved program, not argv[0]: a shell that
     // re-executes itself relies on the difference.
     let exe_path = opts
-        .args
-        .first()
+        .exe
+        .as_ref()
+        .or(opts.args.first())
         .and_then(|a| std::fs::canonicalize(a).ok())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| opts.args.first().cloned().unwrap_or_default());
@@ -2198,6 +2208,15 @@ fn catch_up_table(store: &mut Store<HostState>) -> Result<()> {
     Ok(())
 }
 
+/// What `--busybox` presents (the applets tools/wine-wasm/busybox.config
+/// builds).
+pub const BUSYBOX_APPLETS: &[&str] = &[
+    "sh", "ash", "ls", "cat", "sort", "head", "tail", "tr", "wc", "mkdir", "cp", "mv", "rm", "rmdir", "date",
+    "uname", "sed", "grep", "egrep", "fgrep", "awk", "find", "xargs", "env", "id", "basename", "dirname", "echo",
+    "printf", "test", "[", "expr", "cut", "touch", "ln", "chmod", "pwd", "sleep", "true", "false", "readlink",
+    "realpath", "uniq", "tee", "stat", "dd", "seq", "yes", "printenv", "which",
+];
+
 /// Build the guest's namespace.
 ///
 /// The layout follows what a container presents: a root (the host, or a
@@ -2217,6 +2236,16 @@ fn mount_filesystems(
             kernel.vfs.mount("/", Arc::new(HostFs::new(root)));
         }
         None => kernel.vfs.mount("/", Arc::new(HostFs::new("/"))),
+    }
+    if let Some(bb) = &opts.busybox {
+        // Each name a file mount of the one binary: busybox picks its
+        // applet by argv[0]. GEX_BUSYBOX_APPLETS replaces the list.
+        let list = std::env::var("GEX_BUSYBOX_APPLETS").unwrap_or_else(|_| BUSYBOX_APPLETS.join(","));
+        for name in list.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            for dir in ["/bin", "/usr/bin"] {
+                kernel.vfs.mount(&format!("{dir}/{name}"), Arc::new(HostFs::read_only(bb)));
+            }
+        }
     }
     let mut devfs = DevFs::new();
     if opts.gl {
