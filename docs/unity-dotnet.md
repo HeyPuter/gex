@@ -558,8 +558,17 @@ Not yet:
     until the timeout. Steam is absent, so Facepunch's `SteamClient.Init`
     throws and `SteamPacketManager.Update` logs a NullReferenceException
     each frame, as it would on Unity's Mono without Steam.
-  - Next: graphics (the menu with in-guest Xwayland on gex's compositor),
-    then the browser.
+  - **With graphics (run `scratch/unity/runs/x2`, screenshot
+    `scratch/unity/screens/muck-dotnet-menu.png`):** `GFX=GLDIR
+    tests/games/muck-dotnet.sh` runs Xwayland inside the guest on gex's
+    compositor (`tests/games/xwayland-inguest.sh`; gooner's Xwayland 22.1
+    has no `-geometry`) with gex-gl for x86-64 (`GEX_CC=gcc guest/gl/build.sh
+    scratch/unity/gl64`; needs the opengl-registry submodule). Unity creates
+    its OpenGL 4.5 device and **Muck's main menu renders completely** (scene,
+    grass, UI) with all game code on .NET Mono. Native only, so no speed
+    numbers (cold translation; the browser is the target).
+  - Next: the browser (stream U step 6: the provider and the page), Unity's
+    remaining internal calls as they show up, then Stardew/Celeste.
 - **Resume (after the move; HEAD 1db5c816, `master` merged in):**
   0. The coordgate on this branch still lacks its browser NT step (it was
      stopped while E was timing), and nothing after 49a5773b has been
