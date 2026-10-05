@@ -1861,6 +1861,7 @@ export class Gex {
       child.brk ?? 0n,
     );
     if (child.compat) e.gex_set_compat?.(1);
+    if (child.wasm32) e.gex_wasmprog_adopt?.(BigInt(child.wasm32));
     // The parent's block numbering carries on in the child (its low region),
     // over slot maps of its own (`dense::child`).
     this.#dense = !!(child.opts ?? {}).dense && !!this.#guest.exports.blocks && !!e.gex_set_dense;
@@ -2106,6 +2107,9 @@ export class Gex {
     // has never filled. Catching up on the next trap raced the branch and
     // deadlocked; doing it here once makes the first run deterministic.
     await this.#catchUp();
+    // And the function table's installs (a wasm32 program's module, units):
+    // its entry is a bridge into one.
+    this.#cgenCatchUp();
     return { entry, ctx: Number(thread.ctx) };
   }
 
@@ -2123,6 +2127,8 @@ export class Gex {
       // A 32-bit process forks a 32-bit child; its Worker's shim must decode
       // in compatibility mode from the first block.
       compat: e.gex_compat?.() ?? 0,
+      // A wasm32 program's entry: the child installs the same module.
+      wasm32: e.gex_wasmprog_entry?.() ?? 0n,
       // Where the parent's heap had reached. Without the number the child's
       // kernel thinks it has no heap and grows one from zero, over its contexts.
       brk: e.gex_fork_brk?.() ?? 0n,
@@ -2499,6 +2505,8 @@ export class Gex {
     // Wine's PE module (native wasm32 Wine, cgen/wasmdll.rs): its bytes are
     // in the shim's heap, read from the prefix.
     const wasmdll = prov >= 0 && (e.gex_cgen_pmod_wasm_len?.(prov) >>> 0) > 0;
+    // A native wasm32 program (cgen/wasmprog.rs): its bytes come the same way.
+    const wasmprog = wasmdll && !!e.gex_cgen_pmod_wasmprog?.(prov);
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov),
         new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice())
@@ -2522,7 +2530,8 @@ export class Gex {
         // A unit's functions never use clang's shadow stack (those are stubs),
         // but a position-independent module imports its pointer all the same.
         // A stateful provider's is this Worker's (one C stack per thread).
-        __stack_pointer: memBase ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+        // A wasm32 program sets its own at each thread's entry.
+        __stack_pointer: memBase && !wasmprog ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
       },
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
@@ -2533,11 +2542,11 @@ export class Gex {
           nt_qpc: e.gex_nt_qpc,
           provider_alloc_top: e.gex_provider_alloc_top,
         } : {}),
-        ...(memBase ? this.#providerImports() : {}),
-        ...(wasmdll ? { syscall: this.#nativeSyscall } : {}),
+        ...(memBase && !wasmprog ? this.#providerImports() : {}),
+        ...(wasmprog ? this.#wasmprogImports(() => inst) : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     });
-    if (memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
+    if (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
     const n = regsOf(0, 0) >>> 0;
     const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
     let regs;
@@ -2758,6 +2767,53 @@ export class Gex {
     }
   }
 
+  /** What a native wasm32 program imports from `gex` (cgen/wasmprog.rs):
+   *  its system calls, which return unless the program's frames end (a
+   *  thread or a child they staged is handed to the host here), and fork's
+   *  asyncify operations on its own instance (the musl fork's
+   *  src/process/wasm32/__gex_fork.c). */
+  #wasmprogImports(inst) {
+    const e = this.#shim.exports;
+    const ops = ['asyncify_get_state', 'asyncify_start_unwind', 'asyncify_stop_unwind', 'asyncify_start_rewind', 'asyncify_stop_rewind'];
+    const asyncify = (op, arg) => {
+      const f = inst().exports[ops[op]];
+      if (!f) {
+        if (op === 0) return 0;
+        throw new Error(`gex.asyncify: the program has no ${ops[op]} (fork needs wcc's asyncify)`);
+      }
+      if (op === 0) return f();
+      if (op === 1 || op === 3) f(arg);
+      else f();
+      return 0;
+    };
+    return {
+      syscall: (ctx, pc) => {
+        e.gex_syscall(ctx, pc);
+        if (e.gex_wasmprog_staged()) {
+          this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+          this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+        }
+      },
+      asyncify,
+      fork_point: (rec) => {
+        const st = asyncify(0, 0);
+        if (st === 0) asyncify(1, rec);
+        else if (st === 2) asyncify(4, 0);
+        else throw new Error(`gex.fork_point in asyncify state ${st}`);
+      },
+    };
+  }
+
+  /** A native wasm32 program the shim staged (a load, an exec, a fork's
+   *  child): published and installed here before the guest runs. */
+  #wasmprogServe() {
+    const e = this.#shim.exports;
+    const n = e.gex_wasmprog_serve?.() ?? -1;
+    if (n < 0) return;
+    this.#cgenCatchUp();
+    e.gex_cgen_pmod_installed(n);
+  }
+
   /** Wine's PE module's `gex.syscall` (cgen/wasmdll.rs): a system call from
    *  native code (gexrt marks its pc, bit 61) that traps to JS -- a unit to
    *  install, a thread to start -- is served here and returns, so the native
@@ -2798,6 +2854,7 @@ export class Gex {
    *  its entry list does. */
   #cgenServe() {
     const e = this.#shim.exports;
+    this.#wasmprogServe();
     // A Worker with the function JIT on but no units of its own still
     // replays the function table's log.
     if (!this.#cgenMode && e.gex_fjit_on?.()) {

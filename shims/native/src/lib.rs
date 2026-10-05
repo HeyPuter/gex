@@ -2216,13 +2216,10 @@ fn catch_up_table(store: &mut Store<HostState>) -> Result<()> {
 }
 
 /// What `--busybox` presents (the applets tools/wine-wasm/busybox.config
-/// builds).
-pub const BUSYBOX_APPLETS: &[&str] = &[
-    "sh", "ash", "ls", "cat", "sort", "head", "tail", "tr", "wc", "mkdir", "cp", "mv", "rm", "rmdir", "date",
-    "uname", "sed", "grep", "egrep", "fgrep", "awk", "find", "xargs", "env", "id", "basename", "dirname", "echo",
-    "printf", "test", "[", "expr", "cut", "touch", "ln", "chmod", "pwd", "sleep", "true", "false", "readlink",
-    "realpath", "uniq", "tee", "stat", "dd", "seq", "yes", "printenv", "which",
-];
+/// builds; the list is tools/wine-wasm/busybox.applets, which the browser's
+/// run-node.mjs reads too).
+pub static BUSYBOX_APPLETS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| include_str!("../../../tools/wine-wasm/busybox.applets").lines().filter(|l| !l.is_empty()).collect());
 
 /// Build the guest's namespace.
 ///

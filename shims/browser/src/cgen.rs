@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod wasmdll;
+pub(crate) mod wasmprog;
 
 /// 0 off, 1 use a unit where one exists, 2 also refuse a program image
 /// without one (`--cgen`, as natively).
