@@ -69,6 +69,13 @@ fn fast_path() -> bool {
     FAST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether glEnable/DisableClientState take the fast path too: the host
+/// clears it for `GEX_NT_GL_FAST=nocs` (A/B runs). Off, the layer keeps an
+/// invalid client texture unit in [`GL_FAST_ARRAYS`], which the provider
+/// leaves to the layer.
+pub static FAST_CLIENT_STATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+const ARRAYS_NO_FAST: u32 = 15 << ARRAYS_TEX_SHIFT;
+
 /// Take the ring: its tail, with [`TAIL_BUSY`] set until [`ring_release`].
 /// A provider holds it for the few stores of one command; another thread of
 /// the layer for a command or a submit (a sync submit waits for the host).
@@ -359,7 +366,7 @@ fn open_device(c: &mut Call<'_>) -> R<()> {
     // An empty ring, then (with the fast path) where it is: a provider
     // that reads the address sees a tail that belongs to it.
     c.g.w32(GL_FAST_TAIL, 0)?;
-    c.g.w32(GL_FAST_ARRAYS, 0)?;
+    c.g.w32(GL_FAST_ARRAYS, arrays_off())?;
     if fast_path() {
         c.g.w32(GL_FAST_RING, ring as u32)?;
     }
@@ -1144,9 +1151,14 @@ fn publish_arrays(c: &mut Call<'_>) -> R<()> {
         for (i, a) in s.arrays.iter().enumerate().take(FOG + 1) {
             w |= (a.enabled as u32) << i;
         }
-        w
+        w | arrays_off()
     };
     c.g.w32(GL_FAST_ARRAYS, w)
+}
+
+/// [`ARRAYS_NO_FAST`] when the client-state fast path is off, else 0.
+fn arrays_off() -> u32 {
+    if FAST_CLIENT_STATE.load(std::sync::atomic::Ordering::Relaxed) { 0 } else { ARRAYS_NO_FAST }
 }
 
 /// Whether any enabled array is in client memory.
