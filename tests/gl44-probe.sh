@@ -20,7 +20,7 @@ ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 SOURCE="$ROOT/tests/integration/programs/gl44-$NAME-probe.c"
 [ -f "$SOURCE" ] || { echo "no such probe: $SOURCE" >&2; exit 2; }
 WORK=${GEX_PROBE_WORK:-${TMPDIR:-/tmp}/gex-gl44-$NAME}
-GUEST_CC=${GEX_CC:-/home/velzie/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}
+GUEST_CC=${GEX_CC:-$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}
 mkdir -p "$WORK" "$ROOT/web/public/fs" "$ROOT/web/dist/fs"
 
 ${CC:-cc} -O2 -Wall -Wextra -o "$WORK/mesa" "$SOURCE" -lEGL -lGL
