@@ -1289,27 +1289,30 @@ Steps:
     (musl `wt/musl-fork`, branch `gex-wasm32-fork` until gex-wasm32 takes
     it; sysroot `$W/sr-fork`, busybox `$W/bb-fork`, prefix
     `$W/pfx-gui-fork` built with that toolchain; `$W/check-fork.sh`).
-    **Resume (2026-10-05, parked for a restart):** merge/wine-fork (off
-    dbabed6b, which landed) has real fork natively and in the browser,
-    wasm32 programs in the browser, run-node `--busybox`, and the docs
-    (§3.11.1 design, §3.11.2 patch list). All new tests passed by hand:
-    tests/wasm32/run.sh (fork, signals, sjlj, threads), busybox.sh (both
-    cases), dll/run.sh + shared.sh, run-browser.sh (all four + busybox).
-    `$W/check-fork.sh wt/wine-fork` was interrupted after nt --no-cgen on
-    the x86 prefix, pfx-native and pfx-dev (77/77 each). Next steps:
-    1. rerun `$W/check-fork.sh ~/gex-sandbox/wt/wine-fork` to the end
-       (pfx-gui, pfx-gui-fork, cgen-prefix legs, browser nt incl.
-       pfx-gui-fork), fix anything, merge master, send the head to the
-       coordinator for a gate. The gate needs the sysroot built from
-       `wt/musl-fork` (`build-sysroot.sh OUT ~/gex-sandbox/wt/musl-fork`)
-       with binaryen (fetched, or GEX_BINARYEN) and busybox rebuilt with
-       build-busybox.sh (MMU config).
+    **Resume (2026-10-05, after the restart):** merge/wine-fork (off
+    dbabed6b) has real fork natively and in the browser, wasm32 programs in
+    the browser, run-node `--busybox`, and the docs (§3.11.1 design,
+    §3.11.2 patch list). `$W/check-fork.sh` ran to the end: nt --no-cgen
+    77/77 on x86, pfx-native, pfx-dev, pfx-gui, pfx-gui-fork; cgen-prefix
+    77/77 (x86, pfx-native); tests/wasm32 incl. fork and busybox; dll
+    abi/shared; browser nt x86 49/49, pfx-gui 23/23; wasm32 in the browser
+    (fork, signals, sjlj, threads, busybox). Fixed after the restart:
+    pelink translates legacy EH in winepe.wasm (winebuild's glue is
+    compiled as Unix-side code; pfx-gui-fork failed every x86 test), and
+    build-sysroot.sh reconfigures when the musl tree changes (`$W/sr-fork`
+    had been configured against wt/musl-wasm). **Gate artifacts:**
+    `$W/sr-gate` (fresh, from wt/musl-fork 155f77bf, binaryen 133) and
+    `$W/bb-gate` (busybox built with it); master's gate keeps
+    `$W/sysroot` and `$W/busybox`. Next steps:
+    1. gate (coordinator), then merge master again once F+E land.
     2. When it lands: fast-forward musl's gex-wasm32 to gex-wasm32-fork and
        push.
     3. musl patch reduction (the user's standing goal, §3.11.2): only two
        shared-file lines remain (configure, epoll.h); look at whether the
        SjLj runtime, dlopen registry and signal frames can live outside musl
-       (a gex wasm32 support library linked by wcc) without jank.
+       (a gex wasm32 support library linked by wcc) without jank. musl's
+       generic dlopen/__dlsym are weak stubs, so a library linked before
+       libc can replace them.
     4. Then §5.1 item 2 (ELF export providers: own branch, tell the
        coordinator before gex-cgen re-keys).
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
