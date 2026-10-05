@@ -60,11 +60,16 @@ pub fn body_name(entry: u64) -> String {
 /// What a call to `t` names: the unit-private copy when `t` is a small
 /// leaf (`FnUnit::leaves`), else its body. On the unit's fields, so it is
 /// callable while others are borrowed.
-fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, copies: &mut BTreeSet<u64>, stats: &mut FnStats, t: u64) -> String {
-    // Inside a copy, only a leaf's copy (no chains of calling copies): a
-    // small caller's copy keeps its own leaf callee inlinable, as the body
-    // it replaces had it (0x70b110's 0x4ac0d0).
-    if leaves.get(&t).is_some_and(|f| !copying || makes_no_calls(f)) {
+fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, in_loop: bool, copies: &mut BTreeSet<u64>, stats: &mut FnStats, t: u64) -> String {
+    // A small caller's copy only at a call in an outlined loop function
+    // (`in_loop`), where V8 runs out of inlining budget (0x724580's
+    // l_724580_0 calling 0x70b110); everywhere it grew noita.exe's unit by
+    // 42% (165 -> 234 MiB) for a gain only the loop showed
+    // (`GEX_CGEN_EXP=SMALLCALLSALL` restores that). Inside a copy, only a
+    // leaf's copy (no chains of calling copies): a small caller's copy keeps
+    // its own leaf callee inlinable, as the body it replaces had it
+    // (0x70b110's 0x4ac0d0).
+    if leaves.get(&t).is_some_and(|f| makes_no_calls(f) || (!copying && (in_loop || exp("SMALLCALLSALL")))) {
         copies.insert(t);
         stats.calls_leaf_copy += 1;
         leaf_name(t)
@@ -1013,7 +1018,7 @@ impl FnUnit {
                             reload_all(e);
                             e.line("  } else");
                         }
-                        let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, *t);
+                        let callee_c = callee_name(&self.leaves, self.copying, scope.is_some(), &mut self.leaf_copies, &mut self.stats, *t);
                         if leave_wb.is_empty() {
                             e.line(format!(
                                 "  if (!{callee_c}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
@@ -1053,7 +1058,7 @@ impl FnUnit {
                                 } else {
                                     String::new()
                                 };
-                                let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, k);
+                                let callee_c = callee_name(&self.leaves, self.copying, scope.is_some(), &mut self.leaf_copies, &mut self.stats, k);
                                 e.line(format!("  {{ const uint64_t ft = {t};"));
                                 if carried.is_empty() {
                                     e.line(format!(

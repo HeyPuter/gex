@@ -1402,3 +1402,58 @@ cgen-prefix wt/fjit/target/bm/prefix --append --jobs 4` (from Noita's dir).
    arms' units (keys differ). Check every leg's AOT line.
 2. If it gains, the per-function table (`cmp.py`) for 0x724580's family;
    if not, the V8 trace again on the new units.
+
+### Stream F on gooner (2026-10-04, late; resume here)
+
+Paths: project ~/gex-sandbox, scratch ~/gex-sandbox/scratch/fjit (old
+`scratchpad/fjit`). No timing on gooner: every page number comes from edger
+through scratch/bench/bench.sh, paired with pewasm on the same box.
+
+- gexc: `wt/fjit/target/x86/release/gexc` (merge/fjit 7b1c3580). Shim, kernel,
+  seed rebuilt into wt/fjit/web/public/gex; Mesa replay copied from
+  worldmachine's wt/fjit (the one bm used); web/node_modules by `npm ci`.
+  Master merged (d789dc9e: the requestAdapter retry edger needs).
+- Caches (one gexc, one shim; nice 19 builds may use up to 12 jobs now; `GEX_CGEN_EXP=NOSMALLCALLS` is not in the unit
+  key, so the A arm is a second cache with the same keys):
+  `scratch/fjit/build-bm.sh wt/fjit/target/bm-b` (0c8f9783 on), then
+  `GEX_CGEN_EXP=NOSMALLCALLS scratch/fjit/variant.sh wt/fjit/target/bm-b wt/fjit/target/bm-a <Noita's 8 images>`
+  (bm-b's units hard-linked, the named images rebuilt, bm-b's prefix and Wine
+  DLL units shared: the A arm reverts 0c8f9783 in Noita's own images only).
+  cg14's icall hints.
+- edger: `scratch/fjit/e/sync.sh bm-a bm-b` copies the worktree (no target/,
+  no .git) and the caches; then
+  `scratch/bench/bench.sh -- scratch/fjit/e/abba.sh i3b ~/gex-sandbox/wt/fjit ~/gex-sandbox/wt/fjit/target/bm-a ~/gex-sandbox/wt/fjit/target/bm-b`
+  (pewasm/A/B/pewasm/B/A/pewasm, BENCH_CORES default 4C/8T, logs in
+  scratch/fjit/e/ and scratch/bench/fjit-* on edger).
+- b2bb3c95 (provider key fix): its parent is in master; branch
+  `fjit/keyfix` points at it for the gate.
+
+**i3b page ABBA on edger (2026-10-05, 4C/8T, seed pinned, merge/fjit
+2dea8e82, one shim; A = `NOSMALLCALLS` in Noita's 8 images, B = 0c8f9783;
+Wine DLL units shared):**
+
+| leg | world fps |
+|---|---|
+| pewasm p1 | 45.7 |
+| A a1 | 32.1 (AOT 99.1%) |
+| B b1 | 34.4 (AOT 99.2%) |
+| pewasm p2 | 46.7 |
+| B b2 | 32.4 |
+| A a2 | 32.5 |
+| pewasm p3 | 47.6 |
+
+A 32.3, B 33.4 (+3%, inside the ±3% leg noise); gex is 0.69-0.72 of
+pewasm on edger (0.83 on worldmachine's 2 threads before the move). Worker
+self time of the 0x724580 family over the 30 s profile (f_724580 +
+l_724580_0 + 0x70b110 + 0x70b050 / fl_4ac0d0): A 22.4 and 20.1 s, B 21.1
+and 19.6 s, so 3-6% less in the loop the change was for. Not slower, as
+pewasm's non-leaf inlining was (1.4-1.7×), but noita.exe's unit grew from
+165 to 234 MiB of wasm (107k calls to copies against 24k). Hence i3c: small
+callers are copied only at calls inside an outlined loop function (the
+budget-starved case); `GEX_CGEN_EXP=SMALLCALLSALL` keeps i3b's everywhere.
+
+Also seen in the a1 profile: the compositor worker spends 23% of its time
+in `texImage2D` and 51% in "(program)" on edger's P620; the main thread's
+`guest_yield` is 20%, `#a` (gl-bridge) 11%. NtDuplicateObject/NtClose run at
+~2.6k/s each (msvcp120 `_Thrd_current`; E's msvcp120_thrd provider covers
+it in eject).
