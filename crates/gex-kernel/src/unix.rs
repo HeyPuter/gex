@@ -368,7 +368,7 @@ impl FileHandle for UnixSocket {
             file_type: FileType::Socket,
             size: 0,
             mode: 0o755,
-            ino: 1,
+            ino: crate::vfs::anon_ino(self as *const Self as *const u8),
             mtime: 0,
             nlink: 1,
             rdev: 0,

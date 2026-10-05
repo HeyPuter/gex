@@ -270,6 +270,7 @@ pub mod raw {
     pub const MEMFD_CREATE: u64 = 319;
     pub const MEMBARRIER: u64 = 324;
     pub const COPY_FILE_RANGE: u64 = 326;
+    pub const SPLICE: u64 = 275;
     pub const STATX: u64 = 332;
     pub const RSEQ: u64 = 334;
     pub const CLONE3: u64 = 435;
@@ -579,6 +580,7 @@ pub fn translate(
         x::MEMFD_CREATE => nr::MEMFD_CREATE,
         x::MEMBARRIER => nr::MEMBARRIER,
         x::COPY_FILE_RANGE => nr::COPY_FILE_RANGE,
+        x::SPLICE => nr::SPLICE,
         x::STATX => nr::STATX,
         x::RSEQ => nr::RSEQ,
         x::CLONE3 => nr::CLONE3,

@@ -1,3 +1,4 @@
+#include <stdarg.h>
 /* W1: an i386 program calling abi.dll (abi.c as a wasm module behind a
  * winebuild skeleton) through every kind of entry adapter. */
 #include <windows.h>
@@ -6,6 +7,17 @@
 typedef struct { int x, y; } pair;
 static int __cdecl cb(int x) { return x * 3; }
 static int WINAPI cb_std(int x, int y) { return x + y; }
+
+static int (__cdecl *vpv)(const char *, va_list);
+static int call_v(const char *fmt, ...)
+{
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = vpv(fmt, ap);
+    va_end(ap);
+    return r;
+}
 
 int main(void)
 {
@@ -54,6 +66,8 @@ int main(void)
     int (__cdecl *vw)(int, ...) = (void *)GetProcAddress(h, "abi_words");
     CHECK(vp && vp("%d %f %I64d %f", 1, 2.5, 3ll, 0.25) == 67);
     CHECK(vw && vw(4, 1, 2, 3, 4) == 1234);
+    vpv = (void *)GetProcAddress(h, "abi_vprintf");
+    CHECK(vpv && call_v("%d %f %I64d %f", 1, 2.5, 3ll, 0.25) == 67);
     printf(fails ? "FAILED\n" : "PASS\n");
     return fails;
 }
