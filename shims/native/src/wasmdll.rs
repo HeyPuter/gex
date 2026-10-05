@@ -113,13 +113,16 @@ pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::Gu
 /// The variables gex-kernel's NT boot fills in ntdll (Wine's unix side
 /// does it in `load_ntdll_functions`), by link name: in a native ntdll they
 /// are the module's, whose data the boot's writes went past (its skeleton
-/// points them all at one placeholder until the install).
-///
-/// Only the unixlib handle: a native ntdll makes its system calls and unix
-/// calls itself (its dispatcher variables keep their own values; the i386
-/// trampolines are guest code below the ICALL check's floor).
-fn ntdll_variables() -> [(&'static str, Vec<u8>); 1] {
-    [("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec())]
+/// points them all at one placeholder until the install). The dispatchers
+/// are the i386 trampolines, which guest code and native code (through the
+/// ICALL check, whose floor they sit at) both call.
+fn ntdll_variables() -> [(&'static str, Vec<u8>); 3] {
+    use gex_kernel::nt::boot::tramp;
+    [
+        ("__wine_syscall_dispatcher", (tramp::SYSCALL_DISPATCHER_32 as u32).to_le_bytes().to_vec()),
+        ("__wine_unix_call_dispatcher", (tramp::UNIX_CALL_32 as u32).to_le_bytes().to_vec()),
+        ("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec()),
+    ]
 }
 
 /// pelink's `gexw.forwards` custom section: (export name, `dll!name` it

@@ -4,10 +4,10 @@
 // Every indirect call becomes the select form measured in W0(c):
 //
 //   gexw_set_icall_target(p)
-//   callee = p < 0x400000 ? p : __gexw_exit.<sig>
+//   callee = p < 0x3f0000 ? p : __gexw_exit.<sig>
 //   call callee(args...)
 //
-// A function pointer below 0x400000 is a function-table index (native
+// A function pointer below 0x3f0000 (gex-kernel's NT trampolines) is a function-table index (native
 // code), called directly; anything else is a guest address. The exit stub,
 // one per wasm signature (linkonce_odr), lays the arguments out as i386
 // stack words and calls __gexw_guest_call / __gexw_guest_call_fp
@@ -28,7 +28,7 @@ using namespace llvm;
 
 namespace {
 
-constexpr uint64_t ICALL_LIMIT = 0x400000;
+constexpr uint64_t ICALL_LIMIT = 0x3f0000;
 
 std::string sigName(FunctionType *FT, const DataLayout &DL) {
   auto t = [&](Type *T) -> std::string {

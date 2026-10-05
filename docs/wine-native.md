@@ -997,14 +997,17 @@ plus `make -k`.
   - The runtime boundary is built (§3.15), and native ntdll, kernelbase
     and kernel32 link into one module with nothing unresolved.
   - **tests/nt (`--no-cgen`, wasmtime 49) with native ntdll, kernelbase
-    and kernel32** and the rest of Wine x86: 53 of 60 pass, including the
-    W2 gate (hello, sync, tls, seh and seh-traps, apc, cxx, mtx, crtmem,
-    icall, detour, jitcode, exitproc).
-    - Failing: x86 user_win, gdi, input, display, glcompat and window
-      ("USER32.dll failed to initialize"), and pe-x86/msvc (exit 1 for 9,
-      "a watched dispatch slot with nothing to run").
+    and kernel32** and the rest of Wine x86: 59 of 60 pass, including the
+    W2 gate (hello, sync, tls, seh and seh-traps, apc, cxx), the x86 GUI
+    tests and pe-x86/msvc. x86/display fails (exit 5, not yet looked at).
+    - The ICALL floor is 0x3f0000, gex-kernel's NT trampolines: native code
+      calls the unix-call trampoline through the check.
+    - A guest call from native code returns to a pad at 0x3ffff1 in the
+      trampoline page, not `target ^ 1`: tier-1 watched a slot in the
+      callee's own page that its code then needed (msvc.exe).
+    - `--cgen` with native skeletons is untested.
   - **Next:**
-    - those seven;
+    - x86/display; `--cgen` with native skeletons; the browser;
     - the CRTs (msvcrt/ucrtbase: `DISPATCHER_CONTEXT`, `__ASM_VTABLE`);
     - win32u's system-call stubs (the same `wine/gex/syscall.h`);
     - varargs adapters;
