@@ -1034,6 +1034,23 @@ fn install_trampolines(store: &mut Store<HostState>, class32: bool) -> Result<()
     };
     let module = compile(&engine, cache.as_ref(), &path, &cwasm)?;
     crate::ftab::publish(&shared, &memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+    // Its providers (gex-cgen/providers/nt_unixcall.c), after the unit, at
+    // the trampolines they replace.
+    if class32 {
+        use gex_kernel::nt::{boot::tramp, TRAMPOLINES};
+        let exports = gex_cgen::provider::trampoline_exports((tramp::UNIX_CALL_32 - TRAMPOLINES) as u32);
+        for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
+            let (path, slots) = gex_cgen::provider::build(&prov, &cache_root()?)?;
+            let pairs = gex_cgen::provider::bindings(&prov, &slots, &exports, TRAMPOLINES, trace());
+            if pairs.is_empty() {
+                continue;
+            }
+            let module = Module::from_file(&engine, &path).with_context(|| format!("compiling provider {}", prov.name))?;
+            crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
+            crate::ftab::publish_pairs(&shared, &memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+            eprintln!("gex-nt: provider {} for the NT trampolines: {} entries", prov.name, pairs.len());
+        }
+    }
     crate::ftab::catch_up(&mut *store)?;
     catch_up_table(store)?;
     if trace() {

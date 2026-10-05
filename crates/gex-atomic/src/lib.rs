@@ -39,6 +39,13 @@ pub fn load_u32(bytes: &mut [u8], off: u64) -> Option<u32> {
     Some(word(bytes, off)?.load(Ordering::SeqCst))
 }
 
+/// An atomic store (release, and every earlier store of this thread's with
+/// it: a lock word's release).
+pub fn store_u32(bytes: &mut [u8], off: u64, v: u32) -> Option<()> {
+    word(bytes, off)?.store(v, Ordering::SeqCst);
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

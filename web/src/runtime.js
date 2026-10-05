@@ -659,6 +659,8 @@ export async function runProgram(
       aot: globalThis.GEX_AOT ? true : undefined,
       denseDebug: !!globalThis.GEX_DENSE_DEBUG,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
+      // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
+      shareTrace: flag('sharetrace') ? 1 : undefined,
       // `?forkskip=N`, in `extra` because the process that acts on it is a
       // forked child, not the page's own.
       forkSkip: typeof globalThis.GEX_FORK_SKIP_MIB === 'number'

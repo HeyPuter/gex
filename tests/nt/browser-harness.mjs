@@ -217,7 +217,10 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     ...(process.env.GEX_NT_CHROME_FLAGS ? process.env.GEX_NT_CHROME_FLAGS.split(' ') : []),
     '--enable-logging=stderr', '--disable-hang-monitor', '--no-first-run', '--no-default-browser-check', '--remote-allow-origins=*',
     `--remote-debugging-port=${CHROME_PORT}`, `--user-data-dir=${join(STATE, 'profile')}`, 'about:blank',
-  ], { detached: true, stdio: ['ignore', 'ignore', openSync(join(STATE, 'chrome.log'), 'w')] });
+  ], { detached: true, stdio: ['ignore',
+    // V8's traces (GEX_NT_CHROME_FLAGS=--js-flags=--trace-wasm-inlining) print to stdout.
+    process.env.GEX_NT_CHROME_STDOUT ? openSync(process.env.GEX_NT_CHROME_STDOUT, 'w') : 'ignore',
+    openSync(join(STATE, 'chrome.log'), 'w')] });
   children.push(chrome);
   let ws = null;
   for (let i = 0; i < 80 && !ws; i++) {
