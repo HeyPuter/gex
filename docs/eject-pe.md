@@ -770,6 +770,33 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   after navigation on both (pewasm polled every 100 ms in the page; gex from
   the first `peek>0` stats line, `[world-up]` in page-run's output).
 
+- **Compositor worker, Chrome trace (`$S/trace-edger.sh`, page-run
+  `--trace`):** the 73% "native" was WebGL's
+  `GetResourceForPushFrame` -> `CopyRenderingResultsFromDrawingBufferToResource`
+  -> `ReadPixels`: headless Chromium composites in software, so every
+  frame the WebGL output canvas pushes is read back (2.9 s of 5 s), even
+  with the GL window presenting itself. The compositor now draws nothing
+  when the output has not changed (a signature of windows, textures,
+  pointer and focus; f68abb91's sibling commit), so no frame is pushed.
+  After it: the worker 52% busy, the GPU process 40%, no readbacks.
+  **ABBA (site18s): ejected 59.3, 55.7 vs pewasm 47.5, 45.4 = 1.24x**;
+  world-up 59 -> 49 s after the process start. (pewasm's page in the same
+  headless setting is measured the same way, so the pair stands; the
+  readback itself is a headless artifact that a GPU-composited browser
+  does not pay.)
+- **World-up, like for like (site18ir, pewasm's frame schedule):** pewasm
+  29.2-32.3 s after navigation, ejected 62.7-66.4 s (before the change
+  above). Timeline (process time): first present 6 s; Noita's init 6-26 s
+  (guest 16 s); menus 26-35 s (clicks at frames 60/120/180); loading
+  36-53 s (guest 8.3 of 10 s: world generation); 55-62 s mostly GL host
+  (5.6 s: shader translation); world 62 s. **The eject runs with
+  `-single_threaded_loading` (recorded) and pewasm does not**:
+  `eject-site.mjs --args ''` (site18m) runs AOT-only without it (no stops,
+  locally); its world-up A/B is `$S/wup-ab.sh`.
+- Mesa with pewasm's flags (SIMD + ThinLTO; meson release is already -O3):
+  `$S/build-mesa2.sh` with `GEX_MESA_CROSS2=$S/mesa-o3.ini` into
+  `$S/mesa-o3-out` (building).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
