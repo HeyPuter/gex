@@ -53,6 +53,13 @@ pub mod tramp {
     /// PC: a body that leaves for its own address has served nothing, and
     /// tier-1 would take its slot over.
     pub const JMP_EAX_32: u64 = TRAMPOLINES + 0x80;
+    /// Native Wine's virtual calls on guest C++ objects (msvcrt's
+    /// CALL_VTBL_FUNC, gexrt `__gexw_vtbl_target`), as i386 Wine's
+    /// `vtbl_wrapper_N`: the caller pushed `this` first; it goes to ECX and
+    /// the call to the vtable's entry `n`: `pop eax; pop ecx; push eax;
+    /// mov eax, [ecx]; jmp [eax + 4n]`. 64 of them, 16 bytes apart.
+    pub const VTBL_WRAPPERS_32: u64 = TRAMPOLINES + 0x100;
+    pub const VTBL_WRAPPERS: u64 = 64;
     /// The return address of a guest call from native Wine (gexrt's
     /// `GEXW_RETURN_PAD`, docs/wine-native.md §3.15): the page's last word,
     /// filler no code has. A call-out waiting for it is a native caller's,
@@ -79,6 +86,10 @@ pub fn trampoline_page() -> Vec<u8> {
         &[0xb8, n[0], n[1], n[2], n[3], 0xe8, 0x03, 0x00, 0x00, 0x00, 0xc2, 0x10, 0x00, 0xcd, 0x80, 0xc3],
     );
     put(&mut page, tramp::JMP_EAX_32, &[0xff, 0xe0]);
+    for n in 0..tramp::VTBL_WRAPPERS {
+        let d = (4 * n as u32).to_le_bytes();
+        put(&mut page, tramp::VTBL_WRAPPERS_32 + 16 * n, &[0x58, 0x59, 0x50, 0x8b, 0x01, 0xff, 0xa0, d[0], d[1], d[2], d[3]]);
+    }
     page
 }
 

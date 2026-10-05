@@ -9,9 +9,10 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 llvm-dlltool -m i386 -k -d "$here/msvcrt.def" -l "$tmp/msvcrt.lib"
 llvm-dlltool -m i386 -k -d "$here/kernel32.def" -l "$tmp/kernel32.lib"
+llvm-dlltool -m i386 -d "$here/ntdll.def" -l "$tmp/ntdll.lib"
 for src in "$here"/*.cpp; do
     n=$(basename "${src%.cpp}")
     clang-cl --target=i686-pc-windows-msvc /O1 /GS- /EHa /c "$src" /Fo"$tmp/$n.obj"
     lld-link /nodefaultlib /entry:entry /subsystem:console /dynamicbase /safeseh:no /Brepro \
-        "$tmp/$n.obj" "$tmp/msvcrt.lib" "$tmp/kernel32.lib" /out:"$here/../bin/x86/msvc_$n.exe"
+        "$tmp/$n.obj" "$tmp/msvcrt.lib" "$tmp/kernel32.lib" "$tmp/ntdll.lib" /out:"$here/../bin/x86/msvc_$n.exe"
 done

@@ -16,3 +16,5 @@
 @ stub abi_missing
 @ stdcall abi_forward() kernel32.GetTickCount
 100 stdcall -noname abi_noname(long)
+@ varargs abi_printf(str)
+@ varargs abi_words(long)
