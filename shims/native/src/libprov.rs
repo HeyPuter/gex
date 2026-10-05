@@ -239,18 +239,18 @@ impl std::error::Error for Throw {}
 
 /// The host functions stateful providers import.
 pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
-    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> Result<i32> {
+    linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         let func = ftab::table_func(&mut caller, f as u32)?;
         let typed = func.typed::<i32, ()>(&caller).context("gex.provider_try: the function is not void(int)")?;
         match typed.call(&mut caller, arg) {
             Ok(()) => Ok(0),
             Err(e) => match e.downcast_ref::<Throw>() {
                 Some(t) => Ok(t.0),
-                None => Err(e),
+                None => Err(anyhow::Error::from(e)),
             },
         }
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> Result<()> { Err(Throw(code).into()) })?;
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_throw", |_caller: Caller<'_, HostState>, code: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> { Err(Throw(code).into()) })()) })?;
     // The NT process clock as NtQueryPerformanceCounter reads it (100 ns
     // units): the `nt_qpc` provider's.
     linker.func_wrap(IMPORT_MODULE, "nt_qpc", |caller: Caller<'_, HostState>| -> i64 {
@@ -266,7 +266,7 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             }
         }
     })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i32| -> Result<()> {
+    linker.func_wrap(IMPORT_MODULE, "provider_missing", |mut caller: Caller<'_, HostState>, addr: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let addr = addr as u32 as u64;
         let name = MISSING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&addr).cloned()).unwrap_or_else(|| "?".into());
         let what = match caller.data().nt.as_ref() {
@@ -274,16 +274,16 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             None => format!("{addr:#x}"),
         };
         Err(crate::aot_only::stop(&mut caller, addr, &format!("gex-eject: the program called {name} ({what}), an export of a replaced library that its provider does not implement")))
-    })?;
-    linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i32| -> Result<i32> {
+    })()) })?;
+    linker.func_wrap(IMPORT_MODULE, "provider_alloc", |mut caller: Caller<'_, HostState>, size: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         Ok(alloc(caller.data_mut(), size as u32 as u64, "[provider heap]")? as i32)
-    })?;
+    })()) })?;
     // The same from the top down: a built-in provider's heap (`alloc_top`).
-    linker.func_wrap(IMPORT_MODULE, "provider_alloc_top", |mut caller: Caller<'_, HostState>, size: i32| -> Result<i32> {
+    linker.func_wrap(IMPORT_MODULE, "provider_alloc_top", |mut caller: Caller<'_, HostState>, size: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
         Ok(alloc_top(caller.data_mut(), size as u32 as u64, "[provider heap]")? as i32)
-    })?;
+    })()) })?;
     // Diagnostics: text a provider writes to its stderr.
-    linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> Result<()> {
+    linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {
             if let Some(b) = m.bytes().get(ptr as u32 as usize..(ptr as u32 as usize).saturating_add(len as u32 as usize)) {
                 use std::io::Write;
@@ -291,6 +291,6 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
             }
         }
         Ok(())
-    })?;
+    })()) })?;
     Ok(())
 }

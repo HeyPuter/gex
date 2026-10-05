@@ -28,6 +28,30 @@ pub mod wayland;
 
 use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Ref, Store, Table, Val};
 
+/// A host function's result for wasmtime 49 (its own error type): the
+/// anyhow error inside, which `downcast_ref` still finds (`StopExecution`).
+pub(crate) fn host<T>(r: anyhow::Result<T>) -> wasmtime::Result<T> {
+    r.map_err(wasmtime::Error::from_anyhow)
+}
+
+/// `anyhow::Context` for wasmtime's own error type (wasmtime 49's
+/// `wasmtime::Error` is not a `std::error::Error`, so anyhow's trait does
+/// not apply to it): the same `context`/`with_context`, giving an
+/// `anyhow::Error`.
+pub(crate) trait WasmtimeContext<T> {
+    fn context<C: std::fmt::Display + Send + Sync + 'static>(self, c: C) -> anyhow::Result<T>;
+    fn with_context<C: std::fmt::Display + Send + Sync + 'static, F: FnOnce() -> C>(self, f: F) -> anyhow::Result<T>;
+}
+
+impl<T> WasmtimeContext<T> for std::result::Result<T, wasmtime::Error> {
+    fn context<C: std::fmt::Display + Send + Sync + 'static>(self, c: C) -> anyhow::Result<T> {
+        self.map_err(|e| anyhow::Error::from(e).context(c))
+    }
+    fn with_context<C: std::fmt::Display + Send + Sync + 'static, F: FnOnce() -> C>(self, f: F) -> anyhow::Result<T> {
+        self.map_err(|e| anyhow::Error::from(e).context(f()))
+    }
+}
+
 /// How a guest run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
@@ -530,11 +554,16 @@ pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
     config.wasm_threads(true);
+    // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
+    config.shared_memory(true);
+    // Wasm exception handling: setjmp/longjmp in native Wine and wasm32
+    // programs (clang's SjLj lowering), docs/wine-native.md §4.2.
+    config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
     let engine = Engine::new(&config).context("creating the wasm engine")?;
-    Module::validate(&engine, wasm)
+    Module::validate(&engine, wasm).map_err(anyhow::Error::from)
 }
 
 pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
@@ -572,6 +601,8 @@ pub fn engine() -> Result<Engine> {
     // Deep guest call chains are wasm recursion (units call units): room for
     // them, on threads with stacks to match (`guest_thread_stack`).
     config.max_wasm_stack(wasm_stack_bytes());
+    // wasmtime 49 checks it against the async stack, used or not.
+    config.async_stack_size(wasm_stack_bytes() + (1 << 20));
     // Traps are control flow here (a call-out's return, a resume, a callback's
     // end, all StopExecution), hundreds a second in Noita, and each walked
     // and symbolised the whole wasm stack for a backtrace nothing reads
@@ -582,6 +613,11 @@ pub fn engine() -> Result<Engine> {
     // PLAN §2.4 depends on them.
     config.wasm_tail_call(true);
     config.wasm_threads(true);
+    // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
+    config.shared_memory(true);
+    // Wasm exception handling: setjmp/longjmp in native Wine and wasm32
+    // programs (clang's SjLj lowering), docs/wine-native.md §4.2.
+    config.wasm_exceptions(true);
     config.wasm_bulk_memory(true);
     // The profile counters are a second memory (`profile`).
     config.wasm_multi_memory(true);
@@ -1472,11 +1508,9 @@ fn run_thread_loop(
     store.data_mut().root_enter = Some(enter.clone());
     let mut pc = entry;
     loop {
-        let result = enter.call(
-            &mut *store,
-            &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)],
-            &mut [],
-        );
+        let result = enter
+            .call(&mut *store, &[Val::I32(ctx_addr as i32), Val::I64(pc as i64)], &mut [])
+            .map_err(anyhow::Error::from);
         if let Some(req) = store.data_mut().pending_fork.take() {
             fork_process(&*store, req)?;
         }
@@ -2630,7 +2664,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SYSCALL,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
             if caller.data().nt.is_some() {
                 let r = nt::syscall_import(&mut caller, pc as u64);
                 check_i386_high(&caller, "an NT syscall");
@@ -2870,27 +2904,27 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(StopExecution.into())
                 }
             }
-        },
+        })()) },
     )?;
 
     linker.func_wrap(
         m,
         gex_abi::ftab::LOOKUP,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, addr: i64| -> Result<i32> { ftab::lookup(&mut caller, addr as u64) },
+        |mut caller: Caller<'_, HostState>, _ctx: i32, addr: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> { ftab::lookup(&mut caller, addr as u64) })()) },
     )?;
 
     linker.func_wrap(
         m,
         imports::CALL_OUT,
-        |mut caller: Caller<'_, HostState>, ctx: i32, target: i64, ret: i64, sp_want: i64| -> Result<i32> {
+        |mut caller: Caller<'_, HostState>, ctx: i32, target: i64, ret: i64, sp_want: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
             call_out(&mut caller, ctx, target as u64, ret as u64, sp_want as u64)
-        },
+        })()) },
     )?;
 
     linker.func_wrap(
         m,
         imports::DISPATCH_MISS,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<i32> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
             let pc = pc as u64;
             // Returning from a signal handler with no `sa_restorer` lands
             // here: the trampoline address deliberately has no translation.
@@ -2991,13 +3025,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(StopExecution.into())
                 }
             }
-        },
+        })()) },
     )?;
 
     linker.func_wrap(
         m,
         imports::ILLEGAL,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, raw: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
             let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
             let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             if caller.data().nt.is_some() {
@@ -3046,13 +3080,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
             }
             Err(StopExecution.into())
-        },
+        })()) },
     )?;
 
     linker.func_wrap(
         m,
         imports::BREAKPOINT,
-        |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, imm: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
             let resumable = pc as u64 & gex_cgen::RESUMABLE_PC != 0;
             let pc = (pc as u64 & !gex_cgen::RESUMABLE_PC) as i64;
             // The diagnostic trace points dump the registers and carry on.
@@ -3159,7 +3193,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 internal: false,
             });
             Err(StopExecution.into())
-        },
+        })()) },
     )?;
 
     linker.func_wrap(
@@ -3188,7 +3222,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         m,
         imports::SYSREG_WRITE,
-        |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, reg: i32, v: i64| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, ctx: i32, pc: i64, reg: i32, v: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
             // A function an ejected project replaced (`Intrinsic::Replace`).
             if reg == gex_xlate::intrinsic::REPLACE_SYSREG {
                 return aot::call(&mut caller, ctx, pc as u64, v as u64);
@@ -3248,13 +3282,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 gex_kernel::x86::serve_x87(&mut gm, ctx as u32 as u64, v as u64);
             }
             Ok(())
-        },
+        })()) },
     )?;
 
     linker.func_wrap(
         m,
         imports::CACHE_OP,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, op: i32, addr: i64| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, op: i32, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
             if op == gex_abi::cache_op::DC_ZVA {
                 let memory = caller
                     .data()
@@ -3369,7 +3403,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 )?;
             }
             Ok(())
-        },
+        })()) },
     )?;
 
     // Fused multiply-add. The host has one; wasm does not, and a multiply
@@ -3401,7 +3435,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
          b_sig: i64,
          b_se: i32,
          cw: i32|
-         -> Result<i64> {
+         -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
             let (r, se, sw) = x87_op(op, a_sig as u64, a_se as u16, b_sig as u64, b_se as u16, cw as u16);
             let memory = caller
                 .data()
@@ -3413,13 +3447,13 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             data[at..at + 4].copy_from_slice(&se.to_le_bytes());
             data[at + 4..at + 8].copy_from_slice(&sw.to_le_bytes());
             Ok(r as i64)
-        },
+        })()) },
     )?;
 
     linker.func_wrap(
         m,
         imports::SAFEPOINT,
-        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> Result<()> {
+        |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
             if let Some(s) = caller.data().sampler.clone() {
                 s.sample(pc as u64);
             }
@@ -3489,7 +3523,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(StopExecution.into())
                 }
             }
-        },
+        })()) },
     )?;
 
     Ok(())
@@ -4031,7 +4065,7 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
     if let Some(f) = cx.as_context().data().watch_stub.clone() {
         return f;
     }
-    let f = wasmtime::Func::wrap(cx.as_context_mut(), |mut caller: Caller<'_, HostState>, ctx: i32| -> Result<()> {
+    let f = wasmtime::Func::wrap(cx.as_context_mut(), |mut caller: Caller<'_, HostState>, ctx: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
         let gm = GuestMem::new(memory.bytes());
         let c = ctx as u32 as u64;
@@ -4058,7 +4092,7 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
         let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
         state.callout_signal = Some(signal);
         Err(StopExecution.into())
-    });
+    })()) });
     cx.as_context_mut().data_mut().watch_stub = Some(f.clone());
     f
 }
@@ -4189,7 +4223,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         }
         let e = match r {
             Ok(()) => break Err(anyhow!("guest code returned out of a call-out")),
-            Err(e) => e,
+            Err(e) => anyhow::Error::from(e),
         };
         if let Some(sig) = caller.data_mut().callout_signal.take() {
             match sig {
@@ -4204,12 +4238,12 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
                 // loop, every wasm frame between with it.
                 sig @ CalloutSignal::Escape(_) => {
                     caller.data_mut().callout_signal = Some(sig);
-                    break Err(e);
+                    break Err(anyhow::Error::from(e));
                 }
             }
         }
         if caller.data().exit.is_some() {
-            break Err(e);
+            break Err(anyhow::Error::from(e));
         }
         if let Some(at) = caller.data_mut().resume_at.take() {
             crate::ftab::stats::RESUMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4224,7 +4258,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             pc = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
             continue;
         }
-        break Err(e);
+        break Err(anyhow::Error::from(e));
     };
     // Unwatch: put the slot back unless an install has written over it.
     if let Some(co) = caller.data_mut().callouts.pop() {
