@@ -198,6 +198,8 @@ run options:
   --verbose       report translation statistics
   --env K=V       add an environment variable (repeatable)
   --sysroot DIR   present DIR as the guest's root filesystem
+  --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
+                  coreutils in /bin and /usr/bin (GEX_BUSYBOX_APPLETS: the list)
   --pin FILE      place each object where FILE says, as written by
                   `gexc closure --pins`, and report where they landed
   --uid N[:M]     the uid (and gid) the guest sees; `--uid 0` is root, which
@@ -349,6 +351,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 i += 1;
                 let v = args.get(i).context("--sysroot needs a directory")?;
                 opts.sysroot = Some(v.into());
+            }
+            "--busybox" => {
+                i += 1;
+                let v = args.get(i).context("--busybox needs a wasm32 busybox")?;
+                opts.busybox = Some(std::fs::canonicalize(v).with_context(|| format!("--busybox {v}"))?);
             }
             // A layout written by `gexc closure --pins`: every object is placed
             // exactly where the file says, so a module built against those
@@ -605,6 +612,19 @@ fn learn_mem(ra: &RunArgs, bytes: &[u8], wide: bool) {
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
     prof::start();
     let mut ra = parse_run_args(args)?;
+    // `--busybox`: a program named as one of its applets (/bin/sh) is the
+    // busybox the guest sees there, as the guest's own exec would find it.
+    if let Some(bb) = &ra.opts.busybox {
+        let base = ra.path.rsplit('/').next().unwrap_or(&ra.path).to_string();
+        let applets = std::env::var("GEX_BUSYBOX_APPLETS").unwrap_or_else(|_| gex_native::BUSYBOX_APPLETS.join(","));
+        let under = ra.path.starts_with("/bin/") || ra.path.starts_with("/usr/bin/");
+        if under && applets.split(',').any(|a| a.trim() == base) {
+            // (argv[0] stays the applet's name: it is what busybox runs)
+            ra.argv0.get_or_insert_with(|| ra.path.clone());
+            ra.path = bb.to_string_lossy().into_owned();
+            ra.opts.exe = Some(ra.path.clone());
+        }
+    }
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
     if gex_ld::pe::is_pe(&bytes) {
         // A Windows program: Wine's PE DLLs on gex's NT layer.

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // An ejected Windows program's web build as a static site, in one command:
 //
-//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--level N]
+//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args 'A B'] [--level N]
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
@@ -33,9 +33,9 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input', '--args'].includes(av[i - 1]));
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--level N]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--args "A B"] [--level N]');
   process.exit(2);
 }
 const level = opt('--level', '19');
@@ -83,6 +83,7 @@ walk(join(project, 'runtime/web/page'), (p, rel) => place(p, rel));
 const cgen = nt.cgen;
 const units = join(project, cgen);
 let unitBytes = 0;
+const preload = [];
 // Only this build's units: a unit cache keeps every key it ever built
 // (a re-keyed rebuild leaves the old ones). build/build.json names the
 // images' units; the NT trampolines' unit is not an image, and is kept when
@@ -108,7 +109,16 @@ walk(units, (p, rel) => {
   if (!want) return;
   unitBytes += statSync(p).size;
   place(p, join('project', cgen, rel));
+  // What the page compiles while the bundle downloads (nt.html ?preload=):
+  // module names as gex.mjs keys them.
+  const url = `/project/${cgen}/${rel}`;
+  if (name === 'c.wasm') preload.push([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, url]);
+  else if (top === 'providers') preload.push([`cgenfile:${rel}`, url]);
 });
+
+// Largest first: noita.exe's unit is most of the compile.
+preload.sort((a, b) => (files[b[1]]?.size ?? 0) - (files[a[1]]?.size ?? 0));
+writeFileSync(join(out, 'project', cgen, 'preload.json'), JSON.stringify(preload));
 
 // The bundle, without what --drop names, with --overlay DIR's files (guest
 // paths under DIR, as user/files) laid over it.
@@ -128,7 +138,9 @@ let settings = flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.
 // --input SCRIPT: GEX_NT_INPUT instead of the recorded one (a benchmark's
 // clicks, by presented frame, as pewasm's NOITA_INPUT).
 if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_NT_INPUT=')), `GEX_NT_INPUT=${opt('--input', null)}`];
-const ntOut = { ...nt, settings };
+// --args 'A B': the program's arguments instead of the recorded ones ('' for none).
+const args = av.includes('--args') ? opt('--args', '').split(' ').filter(Boolean) : nt.args;
+const ntOut = { ...nt, settings, args };
 mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 

@@ -317,6 +317,7 @@ mod imp {
         GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
         GL_STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
         nt::opengl::STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
+        nt::opengl::FAST.store(var("GEX_NT_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
         TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
@@ -679,6 +680,10 @@ mod imp {
     pub(crate) static YIELD_PARKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
     pub(crate) static YIELD_KICKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
     /// And the time spent in them, by result.
+    thread_local! {
+        /// This thread's parks, for sampling their time.
+        static PARK_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
     pub(crate) static YIELD_PARK_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
     /// Exceptions dispatched nested and escaped back (the stats line).
     pub(crate) static EXC_NESTED: AtomicU64 = AtomicU64::new(0);
@@ -829,11 +834,22 @@ mod imp {
         fn park(&self, addr: u64, expected: u32, timeout: std::time::Duration) -> bool {
             let p = std::ptr::with_exposed_provenance_mut::<i32>(addr as usize);
             // SAFETY: an aligned guest word of the shared memory.
-            let t0 = mono_raw();
+            // Timed one park in SAMPLE, counted SAMPLE times: two clock
+            // reads (JS calls) per park were half a millisecond of every
+            // world frame on Noita's main thread (edger).
+            let n = PARK_N.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n
+            });
+            let timed = n % SAMPLE == 0;
+            let t0 = if timed { mono_raw() } else { 0 };
             let r = unsafe { crate::warch::memory_atomic_wait32(p, expected as i32, timeout.as_nanos() as i64) };
-            if let Some(n) = YIELD_PARKS.get(r as usize) {
-                n.fetch_add(1, Ordering::Relaxed);
-                YIELD_PARK_NS[r as usize].fetch_add(mono_raw().saturating_sub(t0), Ordering::Relaxed);
+            if let Some(k) = YIELD_PARKS.get(r as usize) {
+                k.fetch_add(1, Ordering::Relaxed);
+                if timed {
+                    YIELD_PARK_NS[r as usize].fetch_add(mono_raw().saturating_sub(t0) * SAMPLE, Ordering::Relaxed);
+                }
             }
             true
         }

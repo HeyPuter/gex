@@ -25,11 +25,9 @@ int abi_noname(int x) { return x + 100; }
 /* Varargs (winebuild's varargs adapters): a printf by name, whose format
  * names 8-byte arguments the adapter lays out again, and words. */
 #include <stdarg.h>
-int abi_printf(const char *fmt, ...)
+int abi_vprintf(const char *fmt, va_list ap)
 {
-    va_list ap;
     double sum = 0;
-    va_start(ap, fmt);
     for (; *fmt; fmt++)
     {
         if (*fmt != '%') continue;
@@ -38,8 +36,16 @@ int abi_printf(const char *fmt, ...)
         else if (*fmt == 'f') sum += va_arg(ap, double);
         else if (*fmt == 'd') sum += va_arg(ap, int);
     }
-    va_end(ap);
     return (int)(sum * 10);
+}
+int abi_printf(const char *fmt, ...)
+{
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = abi_vprintf(fmt, ap);
+    va_end(ap);
+    return r;
 }
 int abi_words(int n, ...)
 {

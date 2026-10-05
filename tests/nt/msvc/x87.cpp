@@ -10,6 +10,7 @@ __declspec(dllimport) void __cdecl _CIpow(void);
 __declspec(dllimport) void __cdecl _CIatan2(void);
 __declspec(dllimport) void __cdecl _ftol(void);
 __declspec(dllimport) void __cdecl __libm_sse2_pow(void);
+__declspec(dllimport) unsigned int __cdecl _controlfp(unsigned int, unsigned int);
 int _fltused = 0;
 }
 
@@ -64,6 +65,14 @@ int entry(void)
     CHECK("_CIatan2 (ST1, ST0)", ci2(_CIatan2, 0.0, -1.0) > 3.14 && ci2(_CIatan2, 0.0, -1.0) < 3.15);
     CHECK("_ftol truncates", ftol(_ftol, -7.9) == -7 && ftol(_ftol, 5000000000.5) == 5000000000ll);
     CHECK("__libm_sse2_pow", sse2(__libm_sse2_pow, 3.0, 4.0) == 81.0);
+    unsigned int old = _controlfp(0, 0);
+    _controlfp(0x00000100 /* _RC_DOWN */, 0x00000300 /* _MCW_RC */);
+    unsigned int now = _controlfp(0, 0);
+    unsigned short cw;
+    __asm { fnstcw cw }
+    _controlfp(old, 0x00000300);
+    CHECK("_controlfp sets the rounding mode (x87 control word)", (now & 0x300) == 0x100 && (cw & 0xc00) == 0x400);
+    CHECK("_controlfp reads it back after restoring", (_controlfp(0, 0) & 0x300) == (old & 0x300));
     printf("%d failures\n", failures);
     exit(failures);
     return failures;

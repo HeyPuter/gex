@@ -770,6 +770,133 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   after navigation on both (pewasm polled every 100 ms in the page; gex from
   the first `peek>0` stats line, `[world-up]` in page-run's output).
 
+- **Compositor worker, Chrome trace (`$S/trace-edger.sh`, page-run
+  `--trace`):** the 73% "native" was WebGL's
+  `GetResourceForPushFrame` -> `CopyRenderingResultsFromDrawingBufferToResource`
+  -> `ReadPixels`: headless Chromium composites in software, so every
+  frame the WebGL output canvas pushes is read back (2.9 s of 5 s), even
+  with the GL window presenting itself. The compositor now draws nothing
+  when the output has not changed (a signature of windows, textures,
+  pointer and focus; f68abb91's sibling commit), so no frame is pushed.
+  After it: the worker 52% busy, the GPU process 40%, no readbacks.
+  **ABBA (site18s): ejected 59.3, 55.7 vs pewasm 47.5, 45.4 = 1.24x**;
+  world-up 59 -> 49 s after the process start. (pewasm's page in the same
+  headless setting is measured the same way, so the pair stands; the
+  readback itself is a headless artifact that a GPU-composited browser
+  does not pay.)
+- **World-up, like for like (site18ir, pewasm's frame schedule):** pewasm
+  29.2-32.3 s after navigation, ejected 62.7-66.4 s (before the change
+  above). Timeline (process time): first present 6 s; Noita's init 6-26 s
+  (guest 16 s); menus 26-35 s (clicks at frames 60/120/180); loading
+  36-53 s (guest 8.3 of 10 s: world generation); 55-62 s mostly GL host
+  (5.6 s: shader translation); world 62 s. **The eject runs with
+  `-single_threaded_loading` (recorded) and pewasm does not**:
+  `eject-site.mjs --args ''` (site18m) runs AOT-only without it (no stops,
+  locally); its world-up A/B is `$S/wup-ab.sh`.
+- Mesa with pewasm's flags (SIMD + ThinLTO; meson release is already -O3):
+  `$S/build-mesa2.sh` with `GEX_MESA_CROSS2=$S/mesa-o3.ini` into
+  `$S/mesa-o3-out` (building).
+
+- **World-up A/B (edger, pewasm's click schedule, seconds after
+  navigation):** pewasm 29.2-32.3; ejected before the frame skip 62.7-66.4;
+  with it (site18is) 53.4-56.4; plus multi-threaded loading (site18m, no
+  `-single_threaded_loading`) 51.5-52.6 (and 51.7-57.2 against site18ir).
+  Multi-threaded loading runs AOT-only with no stops; worth keeping for a
+  shipped site (`--args ''`).
+  - Where the rest is (site18m, process time): first present 6 s; init
+    6-25 s, the main thread mostly blocked in the ConcRT condvar provider
+    (`cond_wait_`, 59% of 7-24 s) on the loader threads (4 threads, about 26 s
+    of guest time between them) and 24% in synchronous GL submits; menus
+    25-36 s; loading 36-52 s (one thread 10 of 10 s guest: world generation).
+    The loader and world-generation threads are guest code, so this is F's
+    side (codegen) unless a page profile shows otherwise; their Workers
+    start after the profiler attaches (`--profile` attaches at AT only).
+- **Merged master 5ab54ab2** (4da10a61; no gex-cgen change, keys kept).
+- **Mesa with SIMD + ThinLTO** (`$S/mesa-o3-out`, `$S/mesa-o3.ini`) against a
+  control from the same tree (`$S/mesa-ctl-out`; its replay matches the
+  copied worldmachine build in size): sites site18ctl / site18o3 (project
+  copies in `$S/p17v/`), ABBA queued (`$S/edger-mesa1.txt`).
+
+- **Mesa flags result (edger ABBA, 5 legs):** control 53.6, 56.8 vs SIMD +
+  ThinLTO 51.5, 56.9: no gain (noise); not adopted. pewasm 49.9 in the same
+  sequence (ejected 1.1x).
+- **The main-thread wait is gone:** after the frame skip, "GL previous
+  frame" is 1-3 ms per 10 s (was 2.3-2.7 s). Noita's main thread per 10 s:
+  guest 4.3-4.9 s, NT calls 2.1-2.2 s, waits 2.8-3.3 s, GL host 0.12 s. The
+  NT calls and GL submission are F's now; the compositor worker is no
+  longer on the critical path.
+- **Resume (E):** world-up (pewasm 30 s vs 52 s): profile the loader and
+  world-generation threads (attach the profiler before they start, e.g.
+  `--profile 2,40`), compare with pewasm's start-up; ship with
+  multi-threaded loading. Then the compositor items only if a profile
+  puts the worker back on the critical path.
+
+- **Post-merge check (site19, master 5ab54ab2 merged, keys unchanged: 38
+  units present, 0 built; p-noita17's user/eject.json now has `"args": []`,
+  which the web build honours since this commit's sibling):** ABBA on edger
+  ejected 57.2, 58.6 vs pewasm 46.0, 45.0 = **1.27x**, world-up 49 s after
+  the process start. Multi-threaded loading is the project's setting
+  (user/eject.json `args`), not an eject-site default: eject-site is
+  generic, and `--args` stays the override.
+- Start-up profiles from the process start for both runtimes:
+  `$S/pw-prof-start.sh TAG AFTER SECS` (pewasm, F's browser-prof.mjs) and
+  `prof-edger.sh SITE TAG 1 60` (page-run now profiles Workers that start
+  during the window too).
+
+- **Queued (user decision, after the start-up work): no WebGL in the
+  browser.** Port the Wayland compositor (web/src/compositor-worker.js, and
+  dom-compositor.js if still live) from WebGL2 to WebGPU on the GPUDevice
+  Mesa uses: GL windows become textures the compositor samples directly
+  (no cross-API copy, no second context, no webgl2 start-up retry, no
+  overlay canvas), wl_shm rows uploaded with queue.writeTexture from guest
+  memory; keep the frame-skip semantics (no present when nothing changed).
+  web/src/gl.js and the demos' WebGL path are being removed on master by
+  the coordinator.
+- **Start-up profile from the process start (site19, prof-gst):** every
+  guest thread's Worker spent 2.5-3.7 s in `loadFile` (synchronous
+  requests through the service worker) plus 0.5-1.5 s compiling modules:
+  `loadUnit` fetched each unit's c.wasm (131 MiB for noita.exe) only to
+  read its entries, though the Module came from a sibling. Fix 065139bb:
+  the bytes are fetched lazily, only by a Worker that compiles. A/B
+  site19/site20 queued (`$S/edger-wab3.txt`).
+
+- **Start-up: threads recompiled every unit (fixed, 35578368).** A
+  per-second timeline of the start-up profile (`$S/profline.mjs`,
+  `$S/profimg.mjs`) showed Noita's loader threads starting one after the
+  other, each busy ~3 s while the rest (main included) waited in the ConcRT
+  condvar provider: each new thread's Worker fetched and compiled all 39
+  units (352 `[unit]` lines in one run). host.mjs's thread start path
+  never sent the process's compiled modules (the `start` closure that did
+  is dead code). With them: 44 unit compiles per run. **World-up after
+  navigation (edger, A/B x3): site19 50.6-51.6 s -> site21 36.5-40.6 s**;
+  pewasm 30.2 s. ABBA (site21): ejected 56.8, 56.8 vs pewasm 48.3, 48.0 =
+  1.18x; world-up 35-36 s after the process start. The lazy c.wasm fetch
+  (065139bb) alone measured nothing; it matters now that threads have the
+  Modules (no bytes fetched at all).
+- pewasm's own start-up timeline (`$S/wup-pewasm2.sh`, timestamped
+  console): process ~4.3 s, first surface 4.7 s, its input frames 60/120/180
+  at 10.6/11.0/11.3 s, world 29.2 s: about 6 s of init and 18 s of world
+  generation. Ours before the fix: init ~20 s (the serial thread starts),
+  world generation ~16 s.
+
+- **Unit preload (a2… see log, eject page `?preload=`):** the page
+  compiles every unit with `compileStreaming` while the bundle downloads
+  and hands the Modules to every Worker (`preModules`); no Worker fetches
+  or compiles a unit (0 `[unit]` lines). World-up A/B x3: site21 37.5-38.5
+  s -> site22 35.6-38.8 s (mean 38.2 -> 36.7). pewasm 30.2 s.
+- **Where the remaining ~6.5 s is (site21, per-second timeline, process
+  time):** boot 0-5 s on the main thread (now mostly gone with the
+  preload: 40% loadFile, 10% compile; 17% gex_key sha256 remains);
+  shader translation in the compositor worker (Tint SPIR-V->WGSL) at
+  9-12 s and 40-43 s, during which Noita's main thread waits on GL
+  (~3 s each), so the menus run at ~40 fps where pewasm's run at ~170
+  (its clicks at frames 60/120/180 land within 0.7 s, ours within ~3 s);
+  world generation 19-40 s on one thread, guest code plus spin-yields
+  (~19k NtYieldExecution per 10 s; 0x1d80 guest 7.6-9.9 s of 10), against
+  ~18 s in pewasm. Levers: a persistent SPIR-V->WGSL cache (IndexedDB,
+  helps every load after the first), the shader translation off the
+  critical path, and world generation (F, codegen).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).

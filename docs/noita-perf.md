@@ -1385,3 +1385,258 @@ V8 profiles (`cmp.py`, ms of work per world frame, gb2 vs pb2):
 - Total: 61 against 26 ms. Two cores are saturated, so preemption inflates
   the main thread's per-function times (0x70b200 is 0.83 of pewasm's time on
   the workers but 1.6 on the main thread).
+
+### Stream F before the move (2026-10-04, night)
+
+merge/fjit = master 7c84c09d (trunk; merge/main is gone) + b2bb3c95 (provider key fix, not in master yet)
++ 26e9f7bc, 857546ce, 0c8f9783, 916ed2c8.
+
+**Item 2, the notify skip (26e9f7bc): correct, no gain.** The yield park
+publishes its parked count at `YIELD_PARKED` (USD+0xff4); the ConcRT
+provider's kick notifies only when it is nonzero. tests/providers (Noita's
+CRT), browser NT sync/mtx 4/4 and mtx with Noita's CRT natively and in the
+browser runtime pass. Page ABBA (`v8/abba-i2.out`): baseline 51.5/40.9,
+change 50.7/50.6, pewasm 53.5/60.6/58.5. cond_notify and cs_unlock_ cost the
+same before and after: real wakes of waiting threads, which pewasm pays too
+(its ~159-byte notify function, 0.74 ms/frame).
+
+**Item 3, inlining 0x70b110/0x70b050 into 0x724580 (0c8f9783).** Their calls
+were direct already (devirtualised), but they are in the outlined loop
+l_724580_0 (26 KB of wasm), and V8's `--trace-wasm-inlining` (harness:
+`GEX_NT_CHROME_STDOUT=FILE GEX_NT_CHROME_FLAGS=--js-flags=--trace-wasm-inlining`)
+says "not enough inlining budget" for both (726 wire bytes each). pewasm
+gets them inlined by TurboFan, not in every run. Small functions with at
+most two returning calls now get unit-private copies like small leaves,
+`always_inline`, with leaf copies allowed inside them (0x4ac0d0). Without
+always_inline (the first attempt, `v8/abba-i3.out`) clang refused them and
+nothing changed: A 50.6/49.5, B 52.2/47.1. With it, noita.exe's unit has no
+fl_70b110/fl_70b050 left (inlined). Native --cgen NT gate 60/60.
+
+**Item 4 (direct import binding): dropped** (coordinator). About 45k
+cross-image calls per world frame, all threads: an estimated 0.15-0.3 ms.
+
+**Resume (stopped for the move):** the i3b Wine prefix units were not
+finished (the cgen-prefix build was stopped); rerun it first:
+`GEX_CGEN_CACHE=wt/fjit/target/bm/cgen GEX_CGEN_GUARD=1 scratchpad/fjit/gexc-i3b
+cgen-prefix wt/fjit/target/bm/prefix --append --jobs 4` (from Noita's dir).
+1. PENDING, never run: the i3b ABBA (part 2), once the GPU is free:
+   `scratchpad/fjit/v8/abba.sh i3b wt/fjit-a wt/fjit wt/fjit/target/bm wt/fjit/target/bm`
+   (A: wt/fjit-a = c4efc34a with main's shim plus the key fix; B: wt/fjit
+   with `scratchpad/fjit/shim-i3b.wasm` in web/public/gex). bm holds both
+   arms' units (keys differ). Check every leg's AOT line.
+2. If it gains, the per-function table (`cmp.py`) for 0x724580's family;
+   if not, the V8 trace again on the new units.
+
+### Stream F on gooner (2026-10-04/05; resume here)
+
+Paths: project ~/gex-sandbox, scratch ~/gex-sandbox/scratch/fjit (old
+`scratchpad/fjit`). No timing on gooner: every page number comes from edger
+through scratch/bench/bench.sh, paired with pewasm on the same box.
+
+- merge/fjit = master 4aed5829 (E's eject9 with b2bb3c95, msvcp120_thrd,
+  direct GL present, the compositor frame skip 40013fbe) + the GL fast
+  path (f7704244) + park sampling (760796a1) + ZF at stack checks
+  (8590e5a8). Assignment (coordinator,
+  2026-10-05): the main thread -- GL without the NT syscall, guest_yield,
+  NT-call overheads -- and pricing ZF at calls (W's _chkesp).
+- gexc `wt/fjit/target/x86/release/gexc`; shim, kernel, seed in
+  wt/fjit/web/public/gex (`scratch/fjit/build-shims.sh`); Mesa replay copied
+  from worldmachine's wt/fjit (the one bm used); web/node_modules by `npm ci`.
+- Caches (nice 19, up to 12 jobs, cg14's icall hints; `GEX_CGEN_EXP` is not
+  in the unit key, so arms are caches with the same keys):
+  `scratch/fjit/build-bm.sh wt/fjit/target/bm-g` (merge/fjit 6f5a538f =
+  master 4aed5829 + the GL fast path + the stack-check ZF; on gooner,
+  then synced to edger). A pricing arm:
+  `GEX_CGEN_EXP=... GEX_CGEN_MUTATE=... scratch/fjit/variant.sh wt/fjit/target/bm-d wt/fjit/target/NEW <Noita's images>`
+  (units hard-linked, the named images rebuilt, the prefix and Wine DLL
+  units shared; then link bm-d's prefix unit dirs into NEW, as done for i3c).
+- edger: `scratch/fjit/e/sync.sh bm-c bm-a2 bm-b2` (worktree without
+  target/.git, caches without objects/recovery); runs:
+  `scratch/bench/bench.sh -- scratch/fjit/e/seq.sh NAME ~/gex-sandbox/wt/fjit 240 a=CACHE[@ENV] c=CACHE ...`
+  (ENV: that arm's extra page env, e.g. `@GEX_NT_GL_FAST=0`)
+  (pewasm, arms, pewasm, arms reversed, pewasm; 4C/8T; logs in
+  scratch/fjit/e/ and scratch/bench/fjit-* on edger; gooner keeps the
+  bench.sh output in scratch/fjit/e/*.out).
+- pewasm profile on edger: `scratch/fjit/e/pw-prof.sh TAG` (under bench.sh);
+  per-function table: `scratch/fjit/v8/cmp.py --pw FRAMES pw*.cpuprofile --gex FRAMES gex*.cpuprofile`
+  (FRAMES = world frames in each 30 s profile window; profiles copied to
+  scratch/fjit/prof/).
+- b2bb3c95 (provider key fix): its parent is in master; branch
+  `fjit/keyfix` points at it for the gate.
+
+**i3b page ABBA on edger (2026-10-05, 4C/8T, seed pinned, merge/fjit
+2dea8e82, one shim; A = `NOSMALLCALLS` in Noita's 8 images, B = 0c8f9783;
+Wine DLL units shared):**
+
+| leg | world fps |
+|---|---|
+| pewasm p1 | 45.7 |
+| A a1 | 32.1 (AOT 99.1%) |
+| B b1 | 34.4 (AOT 99.2%) |
+| pewasm p2 | 46.7 |
+| B b2 | 32.4 |
+| A a2 | 32.5 |
+| pewasm p3 | 47.6 |
+
+A 32.3, B 33.4 (+3%, inside the ±3% leg noise); gex is 0.69-0.72 of
+pewasm on edger (0.83 on worldmachine's 2 threads before the move). Worker
+self time of the 0x724580 family over the 30 s profile (f_724580 +
+l_724580_0 + 0x70b110 + 0x70b050 / fl_4ac0d0): A 22.4 and 20.1 s, B 21.1
+and 19.6 s, so 3-6% less in the loop the change was for. Not slower, as
+pewasm's non-leaf inlining was (1.4-1.7×), but noita.exe's unit grew from
+165 to 234 MiB of wasm (107k calls to copies against 24k). Hence i3c: small
+callers are copied only at calls inside an outlined loop function (the
+budget-starved case); `GEX_CGEN_EXP=SMALLCALLSALL` keeps i3b's everywhere.
+
+Also seen in the a1 profile: the compositor worker spends 23% of its time
+in `texImage2D` and 51% in "(program)" on edger's P620; the main thread's
+`guest_yield` is 20%, `#a` (gl-bridge) 11%. NtDuplicateObject/NtClose run at
+~2.6k/s each (msvcp120 `_Thrd_current`; E's msvcp120_thrd provider covers
+it in eject).
+
+**i3c page sequence on edger (2026-10-05, merge/fjit c696cd07 + i3c, one
+shim; A = no small-caller copies, C = copies at calls in outlined loops,
+B = everywhere; Noita's 8 images per arm, Wine DLL units from C):**
+
+| leg | world fps | 0x724580 family, worker self ms / 30 s |
+|---|---|---|
+| pewasm p1 | 46.7 | |
+| A a1 | 35.0 | 20,981 |
+| C c1 | 34.6 | 20,325 |
+| B b1 | 34.0 | 20,441 |
+| pewasm p2 | 47.7 | |
+| B b2 | 34.7 | 20,370 |
+| C c2 | 34.7 | 20,795 |
+| A a2 | 34.1 | 21,424 |
+| pewasm p3 | 48.6 | |
+
+A 34.55, C 34.65, B 34.35 against pewasm 47.7 (gex 0.72×). The copies take
+2-3% off their target loop and nothing measurable off the frame, so they
+are **off by default** (the rule for this change: win in the page or be
+reverted): `GEX_CGEN_EXP=SMALLCALLS` (loops only, noita.exe +0.6% wasm) or
+`SMALLCALLSALL` (everywhere, +42%) for pricing. Every gex arm here is ~5%
+above i3b's (32-33), where both arms ran i3b's everywhere-copied Wine DLL
+units (prefix 356 MiB of wasm against 257 loop-only), with pewasm ~2% up
+too: suggestive, not shown.
+
+**Page profile on edger, gex i3c-a1 against pewasm pwprof1 (cmp.py, ms of
+work per world frame over 30 s, all threads; `scratch/fjit/prof/cmp-edger-a1.txt`):**
+guest code is level: gex 34.7 against pewasm 32.0 (0x724580 8.42 against
+8.32, 1.01×; 0x70b110 0.87×, 0x70b200 1.58×, 0x70bdc0 1.42×). The gap is
+outside guest code: total work 72.8 against 35.5.
+- The compositor worker: 16.1 ms per frame, 7.9 of it `texImage2D` in
+  `#uploadGlCanvas` (web/src/compositor-worker.js:827), the WebGPU canvas
+  copied into a WebGL texture every composited frame (a readback on edger's
+  P620), plus createView/beginRenderPass/submit. The main thread waits for
+  it ("GL previous frame" 1.3-1.4 s per 10 s, about 4.5 ms per frame).
+- The main game thread: 33.0 ms per frame against pewasm's busiest 13.8:
+  `guest_yield` 5.8, the gl-bridge's `#a` 5.2, mono_ns 1.7, NT syscalls.
+Both are E's/R's areas (E1, E2), not codegen.
+
+**Main thread, edger profile i3c-a1 (before E's direct present):** 31 s
+busy of 31: `guest_yield` 5.4 s and gl-bridge `#a` 4.9 s are waits (a
+parked yield; the previous frame's GL submit), not work. `gex_syscall` is
+17.1 s inclusive: unix-call dispatch 7.4 (of it the swap's wait 5.1), the
+yield 5.4, the syscall shell ~3.3 (imp::syscall 0.9, tick 0.8 of which
+mono_ns JS calls, syscall_on 0.5, with_host 0.4, wasm-to-js 0.4, cgen
+drain 0.3). NtDuplicateObject + NtClose cost 0.08 s in the layer. GL
+census (GEX_NT_GL_STATS): 3,880 calls a frame, glDisable 620,
+glActiveTexture 583, glUseProgram 557, glBindTexture 415, glEnable 411,
+glUniform1i 291, glUniform2f 284, glEnable/DisableClientState 169 each.
+
+**GL fast path (f7704244):** the provider `nt_unixcall` at the i386
+unix-call trampoline writes those seven (81% of calls) into the ring;
+the ring's tail is a guest word with a lock bit (USD+0xfe4), the address
+at USD+0xfe0; `GEX_NT_GL_FAST=0` turns it off at run time (A/B on one
+cache). tests/nt glfast; NT gate 75/75 with and without --cgen.
+Client-state calls stay in the layer (their array flags are layer state).
+
+**gl1 on edger (merge/fjit dd7df4db + master 5ab54ab2, bm-f, one cache,
+arms by page env; before E's 40013fbe):** pewasm 45.9 / 46.5 / 45.4;
+fast path off 39.0, 37.0; on 41.9, 37.9 (38.0 against 39.9, +5%, legs
+drift ~5%). Main thread per 30 s profile: the unix-call path outside the
+swap went from 6.0 s (both off legs) to 1.9 s (both on legs), about
+3.6 ms a world frame; the time moved into the yield park (6.7/6.1 s ->
+10.6/10.1 s): the main thread now waits on its workers instead. With the
+fast path the main thread is (ms per world frame) park 8.9, guest 12.9,
+shim work 2.5, JS 3.0 (gl-bridge collect 1.3, mono_ns 0.9 -- of it 0.45
+the park's own timing, now sampled 1 in 16), providers 0.9. Workers 3/4
+are busy 43% (0x724580 family), idle in cond_wait the rest.
+
+**gl2 on edger (with E's compositor frame skip 40013fbe; arms off = fast
+path off, on, zf = on with `GEX_CGEN_EXP=ZFCALLS` in Noita's images):**
+
+| leg | world fps |
+|---|---|
+| pewasm p1 | 45.7 |
+| off1 | 42.9 |
+| on1 | 44.9 |
+| zf1 | 45.2 |
+| pewasm p2 | 44.9 |
+| zf2 | 43.3 |
+| on2 | 46.1 |
+| off2 | 44.0 |
+| pewasm p3 | 45.5 |
+
+pewasm 45.4; off 43.45 (0.96×), **on 45.5 (1.00×: the normal gexc page
+level with pewasm on edger)**, zf 44.25. The fast path is +4.7%. ZF at
+every unsummarised call costs 2.7% (and 2.5% of noita.exe's wasm), so the
+default writes ZF back only at MSVC's stack checks (`cmp esi, esp` right
+before the call, 8590e5a8; tests/nt zfcall); ZFCALLS stays for pricing.
+
+**g1 on edger (final tree 050023da, bm-g, master 4aed5829 inside):**
+pewasm 48.2 / 45.8 / 47.4 (47.1); fast path off 44.2, 38.7 (41.5); on
+43.3, 44.9 (44.1, 0.94× pewasm, +6% on off). Three sequences agree on the
+fast path (+5%, +4.7%, +6%). NT gate 81/81 with and without --cgen.
+Main thread with the fast path (ms per world frame, on1/on2): guest code
+15.2/14.6, the yield park (waiting on the workers) 9.8/9.5, shim work
+2.8, JS 1.4 (mono_ns 0.58: the QPC provider's clock and the syscall
+tick), providers 1.0; the GL collect wait is gone (E's frame skip).
+Next candidates, each under a millisecond a frame: gex_dispatch_miss 0.4
+(tier-1 LuaJIT code), mono_ns 0.58, the client-state GL calls still in
+the layer (338 a frame), dlmalloc 0.3.
+
+### Stream F at the daemon restart (2026-10-05, afternoon; resume here)
+
+merge/fjit = 8dbc35bf (queued for the gate) + 129c5720 (`gexc cgen-c`
+emits the image's leaf copies, as the unit has them) + dbe79f05 (E's
+35578368 cherry-picked: thread start carries compiled modules). 129c5720
+touches gex-cgen, so units built before it have other keys.
+
+**Worker threads are the critical path now** (the main thread parks ~9.6
+ms/frame on them). Workers only, g1-on1 against pwprof1 (cmp.py, ms per
+world frame): gex 13.2/13.1 work per worker against pewasm 10.8/10.8.
+0x724580 1.03×, 0x70b110 0.95×, but 0x70b200 2.14×, 0x70bdc0 1.92×,
+0x70c6e0 1.56×, 0x863fd0 1.49×, plus provider memset 0.58 and gex-only
+0x864060/0x89c2d0/0x9a4210 (pewasm's unmapped pw#7960 etc. may be them).
+Compiled C (`scratch/fjit/c/`): the guarded flavor is 25-27% more wasm
+than the unguarded one for 0x70b200/0x70bdc0/0x70c6e0 (bounds guards:
+select + lt_u per access). 0x70b200 calls seven trivial virtual leaves
+(devirtualised, leaf copies): each call still stores six GPRs, reloads
+seven and v0 (a v128, F5), and an atomic GEX_PATCHED load.
+
+**N1 (unguarded units in the normal page) in progress.** The unguarded
+noita.exe built fine this time (no unit-925 failure). Caches on gooner:
+- `target/bm-hu` (GUARD=0): all 8 Noita images done; prefix stopped at
+  20/90 for the restart. Resume: `cd ~/gex-sandbox/scratch/fjit &&
+  GUARD=0 JOBS=12 ./build-bm.sh /home/claude/gex-sandbox/wt/fjit/target/bm-hu`
+  (cached images relink in seconds; the prefix continues from its objects).
+- `target/bm-hud`: bm-hu with `GEX_CGEN_WB_DEVIRT=1` in noita.exe (done;
+  link bm-hu's prefix unit dirs into it once bm-hu finishes).
+- `target/bm-h` (guarded, same tree): not started; objects and recovery
+  are there: `JOBS=12 ./build-bm.sh /home/claude/gex-sandbox/wt/fjit/target/bm-h`.
+- The shims in wt/fjit/web/public/gex are from 129c5720 (they match these
+  keys); rebuild them (`scratch/fjit/build-shims.sh`) after any merge.
+**Next:**
+1. Finish bm-hu and bm-h, link prefix dirs into bm-hud, sync
+   (`scratch/fjit/e/sync.sh bm-h bm-hu bm-hud`), then on edger:
+   `scratch/bench/bench.sh -- scratch/fjit/e/seq.sh n1 ~/gex-sandbox/wt/fjit 240 g=$T/bm-h u=$T/bm-hu%&cgen=2&unguarded=1 ud=$T/bm-hud%&cgen=2&unguarded=1`
+   (seq.sh arms: `TAG=CACHE[@ENV][%FLAGS]`). If unguarded wins, make
+   `unguarded=1` the page default (web/src/nt-page.js) and the browser
+   build scripts GUARD=0.
+2. Workers again (cmp.py on the n1 profiles): 0x70b200's call traffic
+   (trivial devirtualised leaves), then 0x70bdc0, 0x70c6e0.
+3. Smaller main-thread items (each under 1 ms/frame): client-state GL in
+   the fast path (array flags into guest memory), mono_ns clock reads
+   (QPC provider, syscall tick), tier-1 dispatch misses.
+Nothing running on gooner or edger for stream F.

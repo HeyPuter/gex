@@ -41,6 +41,51 @@ const GEX_GL_SUBMIT: u64 = 0xc008_6701;
 /// waiting way.
 const GEX_GL_SUBMIT_ASYNC: u64 = 0xc008_6704;
 
+/// The ring's fast path (gex-cgen/providers/nt_unixcall.c): the unix-call
+/// dispatcher's provider writes the hottest GL commands into the ring
+/// itself, with no syscall. It needs the ring's address and its tail where
+/// guest code reads them: two words at the end of KUSER_SHARED_DATA's page,
+/// past the yield park's. [`GL_FAST_RING`] is 0 until the ring exists, and
+/// stays 0 with `GEX_NT_GL_FAST=0` (every call then takes the syscall).
+pub const GL_FAST_RING: u64 = super::USD + 0xfe0;
+/// The ring's tail: the bytes of commands queued. [`TAIL_BUSY`] is its
+/// lock: whoever sets it (the provider for one command, the layer for a
+/// command or a submit) owns the ring until it stores the new tail.
+pub const GL_FAST_TAIL: u64 = super::USD + 0xfe4;
+pub const TAIL_BUSY: u32 = 1 << 31;
+
+/// Whether the fast path is offered: the host sets it from `GEX_NT_GL_FAST`
+/// (default on; `0` for A/B runs) before the program starts.
+pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn fast_path() -> bool {
+    FAST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Take the ring: its tail, with [`TAIL_BUSY`] set until [`ring_release`].
+/// A provider holds it for the few stores of one command; another thread of
+/// the layer for a command or a submit (a sync submit waits for the host).
+fn ring_take(c: &mut Call<'_>) -> R<u32> {
+    let mut spins = 0u32;
+    loop {
+        let t = gex_atomic::load_u32(c.g.m.bytes, GL_FAST_TAIL).ok_or(Status(st::ACCESS_VIOLATION))?;
+        if t & TAIL_BUSY == 0 && gex_atomic::cas_u32(c.g.m.bytes, GL_FAST_TAIL, t, t | TAIL_BUSY) == Some(Ok(t)) {
+            return Ok(t);
+        }
+        spins += 1;
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Give the ring back with `tail` bytes queued.
+fn ring_release(c: &mut Call<'_>, tail: u32) {
+    let _ = gex_atomic::store_u32(c.g.m.bytes, GL_FAST_TAIL, tail);
+}
+
 /// A params struct: where each field of a unix call's arguments is, for the
 /// process's ABI.
 struct Params {
@@ -202,7 +247,6 @@ struct Ctx {
 
 pub struct State {
     ring: u64,
-    tail: u32,
     dev: Option<Arc<dyn FileHandle>>,
     host_made: bool,
     contexts: HashMap<u64, Ctx>,
@@ -254,7 +298,6 @@ impl Default for State {
     fn default() -> Self {
         State {
             ring: 0,
-            tail: 0,
             dev: None,
             host_made: false,
             contexts: HashMap::new(),
@@ -305,6 +348,12 @@ fn open_device(c: &mut Call<'_>) -> R<()> {
     let words = [proto::MAGIC, CMD_CAPACITY, 0, REPLY_CAPACITY, 0, 0, 0, proto::PROTOCOL_VERSION];
     for (i, w) in words.iter().enumerate() {
         c.g.w32(ring + 4 * i as u64, *w)?;
+    }
+    // An empty ring, then (with the fast path) where it is: a provider
+    // that reads the address sees a tail that belongs to it.
+    c.g.w32(GL_FAST_TAIL, 0)?;
+    if fast_path() {
+        c.g.w32(GL_FAST_RING, ring as u32)?;
     }
     s = c.p.gl.lock().unwrap();
     s.ring = ring;
@@ -366,28 +415,37 @@ fn cmd_with(c: &mut Call<'_>, opcode: u32, words: &[u32], tail: Tail<'_>) -> R<(
     if len as u32 > CMD_CAPACITY {
         return Err(c.unimplemented(&format!("a GL command of {len} bytes")));
     }
-    // The room, taken under one lock (a flush first when the ring is full).
-    let reserve = |c: &mut Call<'_>| {
-        let mut s = c.p.gl.lock().unwrap();
-        if s.tail as usize + len > CMD_CAPACITY as usize {
-            return None;
+    // The room: the ring taken (`ring_take`) and held while the command is
+    // written, a flush first when it is full.
+    let reserve = |c: &mut Call<'_>| -> R<Option<(u64, u32)>> {
+        let at = ring_take(c)?;
+        if at as usize + len > CMD_CAPACITY as usize {
+            ring_release(c, at);
+            return Ok(None);
         }
-        let at = s.tail;
-        s.tail += len as u32;
+        let mut s = c.p.gl.lock().unwrap();
         if STATS.load(std::sync::atomic::Ordering::Relaxed) {
             let who = s.serving;
             s.stats.entry(who).or_insert((0, 0, 0, 0)).3 += len as u64;
         }
-        Some((s.ring, at))
+        Ok(Some((s.ring, at)))
     };
-    let (ring, at) = match reserve(c) {
+    let (ring, at) = match reserve(c)? {
         Some(r) => r,
         None => {
             flush(c)?;
-            reserve(c).ok_or_else(|| c.unimplemented(&format!("a GL command of {len} bytes after a flush")))?
+            reserve(c)?.ok_or_else(|| c.unimplemented(&format!("a GL command of {len} bytes after a flush")))?
         }
     };
-    let base = ring + HEADER + at as u64;
+    let r = write_cmd(c, ring + HEADER + at as u64, opcode, words, tail, len);
+    ring_release(c, at + if r.is_ok() { len as u32 } else { 0 });
+    r
+}
+
+/// [`cmd_with`]'s writing, at `base` in the ring (taken).
+fn write_cmd(c: &mut Call<'_>, base: u64, opcode: u32, words: &[u32], tail: Tail<'_>, len: usize) -> R<()> {
+    let tail_len = tail.len();
+    let padded = tail_len.div_ceil(4) * 4;
     let head_len = 8 + 4 * words.len();
     // On the stack for all but the widest commands.
     let mut small = [0u8; 128];
@@ -427,25 +485,36 @@ fn cmd_with(c: &mut Call<'_>, opcode: u32, words: &[u32], tail: Tail<'_>) -> R<(
     Ok(())
 }
 
-/// Submit what is queued; the reply, if any, follows.
-fn flush(c: &mut Call<'_>) -> R<Vec<u8>> {
-    let (ring, tail, dev) = {
-        let s = c.p.gl.lock().unwrap();
-        (s.ring, s.tail, s.dev.clone())
-    };
-    let Some(dev) = dev else { return Ok(Vec::new()) };
-    if tail == 0 {
-        return Ok(Vec::new());
-    }
+/// The device's submit `req` of the ring (taken, `tail` bytes queued): the
+/// ioctl's result and its time.
+fn submit_taken(c: &mut Call<'_>, dev: &Arc<dyn FileHandle>, ring: u64, tail: u32, req: u64) -> R<(Option<crate::errno::SysResult>, u64)> {
     c.g.w32(ring + 8, tail)?;
     c.g.w32(ring + 16, 0)?;
     c.g.w32(ring + 20, 0)?;
     let t0 = (c.p.clocks.mono_ns)();
-    let r = dev.ioctl(&mut c.g.m, GEX_GL_SUBMIT, ring);
-    let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
+    let r = dev.ioctl(&mut c.g.m, req, ring);
+    Ok((r, (c.p.clocks.mono_ns)().saturating_sub(t0)))
+}
+
+/// Submit what is queued; the reply, if any, follows.
+fn flush(c: &mut Call<'_>) -> R<Vec<u8>> {
+    let (ring, dev) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.ring, s.dev.clone())
+    };
+    let Some(dev) = dev else { return Ok(Vec::new()) };
+    // The ring is held through the submit: nothing is queued behind it
+    // while the host reads it.
+    let tail = ring_take(c)?;
+    if tail == 0 {
+        ring_release(c, 0);
+        return Ok(Vec::new());
+    }
+    let r = submit_taken(c, &dev, ring, tail, GEX_GL_SUBMIT);
+    ring_release(c, 0);
+    let (r, dt) = r?;
     {
         let mut s = c.p.gl.lock().unwrap();
-        s.tail = 0;
         s.submits.0 += 1;
         s.submits.1 += dt;
         s.submits.2 += tail as u64;
@@ -466,27 +535,27 @@ fn flush(c: &mut Call<'_>) -> R<Vec<u8>> {
 /// Submit what is queued without waiting for it to run ([`GEX_GL_SUBMIT_ASYNC`]).
 /// A failure surfaces at the next submit, as that batch's.
 fn flush_async(c: &mut Call<'_>) -> R<()> {
-    let (ring, tail, dev) = {
+    let (ring, dev) = {
         let s = c.p.gl.lock().unwrap();
-        (s.ring, s.tail, s.dev.clone())
+        (s.ring, s.dev.clone())
     };
     let Some(dev) = dev else { return Ok(()) };
+    let tail = ring_take(c)?;
     if tail == 0 {
+        ring_release(c, 0);
         return Ok(());
     }
-    c.g.w32(ring + 8, tail)?;
-    c.g.w32(ring + 16, 0)?;
-    c.g.w32(ring + 20, 0)?;
-    let t0 = (c.p.clocks.mono_ns)();
-    let r = dev.ioctl(&mut c.g.m, GEX_GL_SUBMIT_ASYNC, ring);
-    if r.is_none() {
+    let r = submit_taken(c, &dev, ring, tail, GEX_GL_SUBMIT_ASYNC);
+    if matches!(r, Ok((None, _))) {
+        // A device without it: the batch is still queued.
+        ring_release(c, tail);
         flush(c)?;
         return Ok(());
     }
-    let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
+    ring_release(c, 0);
+    let (r, dt) = r?;
     {
         let mut s = c.p.gl.lock().unwrap();
-        s.tail = 0;
         s.submits.0 += 1;
         s.submits.1 += dt;
         s.submits.2 += tail as u64;
@@ -544,23 +613,21 @@ pub fn take_stats(p: &super::Process, n: usize) -> String {
 /// For a reply the size of a frame, which a host copy would allocate twice
 /// a frame.
 fn flush_in_place(c: &mut Call<'_>) -> R<(u64, usize)> {
-    let (ring, tail, dev) = {
+    let (ring, dev) = {
         let s = c.p.gl.lock().unwrap();
-        (s.ring, s.tail, s.dev.clone())
+        (s.ring, s.dev.clone())
     };
     let Some(dev) = dev else { return Ok((0, 0)) };
+    let tail = ring_take(c)?;
     if tail == 0 {
+        ring_release(c, 0);
         return Ok((0, 0));
     }
-    c.g.w32(ring + 8, tail)?;
-    c.g.w32(ring + 16, 0)?;
-    c.g.w32(ring + 20, 0)?;
-    let t0 = (c.p.clocks.mono_ns)();
-    let r = dev.ioctl(&mut c.g.m, GEX_GL_SUBMIT, ring);
-    let dt = (c.p.clocks.mono_ns)().saturating_sub(t0);
+    let r = submit_taken(c, &dev, ring, tail, GEX_GL_SUBMIT);
+    ring_release(c, 0);
+    let (r, dt) = r?;
     {
         let mut s = c.p.gl.lock().unwrap();
-        s.tail = 0;
         s.submits.0 += 1;
         s.submits.1 += dt;
         s.submits.2 += tail as u64;
@@ -2357,5 +2424,50 @@ mod tests {
         assert_eq!(p.ret(), 4);
         let p = Params { at: 0, offs: layout(sig, Abi::P64), n: sig.len(), sig };
         assert_eq!(&p.offs[..5], &[0, 8, 12, 16, 24]);
+    }
+
+    /// gex-cgen/providers/nt_unixcall.c writes the hottest GL commands into
+    /// the ring itself: its constants must be this layer's.
+    #[test]
+    fn nt_unixcall_provider_constants() {
+        let src = include_str!("../../../../gex-cgen/providers/nt_unixcall.c");
+        let def = |name: &str| -> u64 {
+            let l = src.lines().find(|l| l.starts_with(&format!("#define {name} "))).unwrap_or_else(|| panic!("no #define {name}"));
+            let v = l[format!("#define {name} ").len()..].split_whitespace().next().unwrap().trim_end_matches('u');
+            if let Some(h) = v.strip_prefix("0x") { u64::from_str_radix(h, 16).unwrap() } else { v.parse().unwrap() }
+        };
+        assert_eq!(def("TR"), super::super::TRAMPOLINES);
+        assert_eq!(def("UNIX_CALL_NR"), super::super::gex_nr::UNIX_CALL as u64);
+        assert_eq!(def("GL_FAST_RING"), GL_FAST_RING);
+        assert_eq!(def("GL_FAST_TAIL"), GL_FAST_TAIL);
+        assert_eq!(def("TAIL_BUSY"), TAIL_BUSY as u64);
+        assert_eq!(def("RING_HEADER"), HEADER);
+        assert!(src.contains("#define CMD_CAPACITY (8u << 20)") && CMD_CAPACITY == 8 << 20);
+        assert_eq!(super::super::boot::tramp::UNIX_CALL_32, super::super::TRAMPOLINES + 0x60);
+        // The trampoline's bytes the provider's slow path follows.
+        let page = super::super::boot::trampoline_page();
+        assert_eq!(&page[0x6a..0x70], &[0xc2, 0x10, 0x00, 0xcd, 0x80, 0xc3]);
+        for (f, o, name, op) in [
+            ("FN_glEnable", "OP_ENABLE", "glEnable", op::ENABLE),
+            ("FN_glDisable", "OP_DISABLE", "glDisable", op::DISABLE),
+            ("FN_glActiveTexture", "OP_ACTIVE_TEXTURE", "glActiveTexture", op::ACTIVE_TEXTURE),
+            ("FN_glUseProgram", "OP_USE_PROGRAM", "glUseProgram", op::USE_PROGRAM),
+            ("FN_glBindTexture", "OP_BIND_TEXTURE", "glBindTexture", op::BIND_TEXTURE),
+            ("FN_glUniform1i", "OP_UNIFORM_1I", "glUniform1i", op::UNIFORM_1I),
+            ("FN_glUniform2f", "OP_UNIFORM_2F", "glUniform2f", op::UNIFORM_2F),
+        ] {
+            let code = def(f) as usize;
+            assert_eq!(table::FUNCS[code].0, name, "{f}");
+            assert_eq!(def(o), op as u64, "{o}");
+            // The command it writes is the one `hot_one` writes.
+            assert!(hot(code as u32).is_some(), "{name} is not a hot call here");
+        }
+        // i386 params: the TEB pointer, then 4-byte fields.
+        for sig in ["pi", "pii", "piff"] {
+            let offs = layout(sig, Abi::P32);
+            for (i, o) in offs[..sig.len()].iter().enumerate() {
+                assert_eq!(*o, 4 * i as u64, "{sig}");
+            }
+        }
     }
 }

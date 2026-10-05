@@ -1,5 +1,5 @@
-// The guest's GL device, reached from a Worker. The WebGL `GlDevice`
-// (web/src/gl.js) is on the page -- it owns the canvas -- while the drawing
+// The guest's GL device, reached from a Worker. The `MesaGlDevice`
+// (web/src/mesa-gl.js) is on the page -- it owns the canvas -- while the drawing
 // guest is a Worker. `gl_submit` is a wasm import called synchronously from
 // inside an ioctl, so the
 // call crosses a `SharedArrayBuffer` with `Atomics.wait`: the Worker copies its
@@ -25,7 +25,7 @@ const IDLE = 0;
 const REQUEST = 1;
 const REPLY = 2;
 
-// Must match guest/gl/gexgl.c and web/src/gl.js.
+// Must match guest/gl/gexgl.c and web/src/gl-proto.js.
 const HEADER_BYTES = 32;
 const CMD_CAPACITY = 32 * 1024 * 1024;
 const REPLY_CAPACITY = 32 * 1024 * 1024;

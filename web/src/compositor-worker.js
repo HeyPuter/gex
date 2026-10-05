@@ -907,6 +907,21 @@ class Compositor {
 
   #directKey = null;
   #directRect = '';
+  #lastSig = null;
+  #skipped = 0;
+
+  /** What the output shows, as a string: equal strings, equal pixels. Null
+   *  when a GL frame is drawn into the scene (it changes every frame). */
+  #signature() {
+    const parts = [this.#outW, this.#outH, this.#focus, this.#pointer.x, this.#pointer.y, this.#directKey, this.#order.join(',')];
+    for (const [k, win] of this.#windows) {
+      if (k !== this.#directKey && glFrameFor(win)) return null;
+      const f = win.role === ROLE_TOPLEVEL ? this.#frameOf(win) : null;
+      parts.push(k, win.role, win.width, win.height, win.relX, win.relY, win.title, win.parent,
+        f ? `${f.x},${f.y},${f.frameW}` : '', this.#textures.get(k)?.serial ?? '-', JSON.stringify(win.info?.glRect ?? null));
+    }
+    return parts.join('|');
+  }
 
   /** Tell the page where the GL window is (or that it is not shown
    *  directly), when that changed. */
@@ -933,11 +948,6 @@ class Compositor {
       if (t && t.serial === s.serial) continue;
       this.#upload(k, s);
     }
-    // Nothing to draw into: see `Painter.begin`. The arena is still acked
-    // below on the next frame that works, so a restored context catches up.
-    if (this.#painter.begin(this.#outW, this.#outH) === false) return;
-    gl.clearColor(...COL.desktop);
-    gl.clear(gl.COLOR_BUFFER_BIT);
     // The GL window presents itself (glDirect) when it is the top toplevel
     // with nothing over it: no popups, subsurfaces or floating windows.
     this.#directKey = null;
@@ -950,6 +960,25 @@ class Compositor {
       }
       this.#placeDirect(this.#directKey ? this.#windows.get(this.#directKey) : null);
     }
+    // Nothing on the output changed (the GL window, which changes every
+    // frame, presents itself): draw nothing, so the canvas pushes no new
+    // frame. A pushed WebGL frame is a full readback where the browser
+    // composites in software (headless), and wasted work everywhere else.
+    const sig = this.#signature();
+    if (sig !== null && sig === this.#lastSig) {
+      for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+      this.#skipped++;
+      return;
+    }
+    this.#lastSig = sig;
+    // Nothing to draw into: see `Painter.begin`. The arena is still acked
+    // below on the next frame that works, so a restored context catches up.
+    if (this.#painter.begin(this.#outW, this.#outH) === false) {
+      this.#lastSig = null;
+      return;
+    }
+    gl.clearColor(...COL.desktop);
+    gl.clear(gl.COLOR_BUFFER_BIT);
     // Windows bottom to top, each with its popups and subsurfaces above it.
     for (const k of this.#order) {
       const win = this.#windows.get(k);
@@ -1403,10 +1432,25 @@ self.onmessage = ({ data: m }) => {
   try {
     if (m.kind === 'init') {
       canvas = m.canvas;
-      comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null);
-      running = true;
-      requestAnimationFrame(loop);
-      postMessage({ kind: 'ready' });
+      // Chromium can refuse a WebGL2 context while its GPU process is still
+      // starting (as navigator.gpu.requestAdapter answers null then): retry
+      // for a few seconds before calling the compositor broken.
+      const start = (tries) => {
+        try {
+          comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null);
+        } catch (e) {
+          if (tries > 0 && /no webgl2/.test(e?.message)) {
+            setTimeout(() => start(tries - 1), 250);
+            return;
+          }
+          postMessage({ kind: 'error', error: e?.stack || String(e) });
+          return;
+        }
+        running = true;
+        requestAnimationFrame(loop);
+        postMessage({ kind: 'ready' });
+      };
+      start(40);
     } else if (m.kind === 'gl') {
       // The guest's GL, hosted here for the reason above. Reported rather
       // than thrown: a session whose GL will not start should still show its

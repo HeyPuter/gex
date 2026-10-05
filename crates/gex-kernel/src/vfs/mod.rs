@@ -62,6 +62,15 @@ impl FileType {
     }
 }
 
+/// An inode number for an object no file system holds (a pipe, a socket,
+/// the host's stdio): unique among live objects, from the object's address,
+/// in a range no file system's inodes reach. Programs compare (dev, ino) to
+/// tell files apart -- GNU grep takes an output that matches /dev/null's for
+/// /dev/null and prints nothing -- so these must not all be 1.
+pub fn anon_ino(p: *const u8) -> u64 {
+    (1 << 62) | (p as usize as u64 >> 3)
+}
+
 /// Metadata about a path, independent of any open file.
 #[derive(Clone, Debug)]
 pub struct Metadata {

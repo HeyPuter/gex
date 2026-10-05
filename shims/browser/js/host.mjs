@@ -392,6 +392,15 @@ export class ProcessHost {
             shim: shimMod,
             guest: this.#guest,
             kernel: this.#kernel ?? undefined,
+            // A thread joins its process: every module the process's Workers
+            // have compiled so far, so it does not fetch and compile them all
+            // again (each Noita thread spent ~3 s doing that, one after the
+            // other, at start-up). The `start` closure above meant to send
+            // these, but this is the path that runs. A fork has its own memory
+            // and registry, so only threads (pid `proc:tid`).
+            ...(msg.kind === 'thread'
+              ? { sharedModules: [...(this.#moduleCache.get(String(pid).split(':')[0])?.entries() ?? [])] }
+              : {}),
           }, forkTransfer(msg.child));
           // Timed separately: the fork-to-adopt gap is 549ms and unaccounted --
           // this `postMessage` (the 15.4 MiB image copy) or the closure below.
@@ -436,6 +445,7 @@ export class ProcessHost {
         if (!cache) this.#moduleCache.set(proc, (cache = new Map()));
         if (typeof m.key === 'string' && !cache.has(m.key)) {
           cache.set(m.key, m.mod);
+          if (this.#extra?.shareTrace) console.warn(`[share] host cached ${m.key.slice(0, 30)} from ${pid} (${cache.size} for process ${proc})`);
           for (const [key, other] of this.#workers) {
             if (other !== w && String(key).split(':')[0] === proc) {
               other.postMessage({ kind: 'sharedModule', key: m.key, mod: m.mod });

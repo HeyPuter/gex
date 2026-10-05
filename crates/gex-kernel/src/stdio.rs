@@ -69,7 +69,7 @@ impl FileHandle for StdStream {
             file_type: FileType::CharDevice,
             size: 0,
             mode: 0o620,
-            ino: 1,
+            ino: crate::vfs::anon_ino(self as *const Self as *const u8),
             mtime: 0,
             nlink: 1,
             rdev: 0,

@@ -60,8 +60,17 @@ pub fn body_name(entry: u64) -> String {
 /// What a call to `t` names: the unit-private copy when `t` is a small
 /// leaf (`FnUnit::leaves`), else its body. On the unit's fields, so it is
 /// callable while others are borrowed.
-fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, copies: &mut BTreeSet<u64>, stats: &mut FnStats, t: u64) -> String {
-    if !copying && leaves.contains_key(&t) {
+fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, in_loop: bool, copies: &mut BTreeSet<u64>, stats: &mut FnStats, t: u64) -> String {
+    // A small caller's copy only at a call in an outlined loop function
+    // (`in_loop`), where V8 runs out of inlining budget (0x724580's
+    // l_724580_0 calling 0x70b110); everywhere it grew noita.exe's unit by
+    // 42% (165 -> 234 MiB) for a gain only the loop showed
+    // (`GEX_CGEN_EXP=SMALLCALLSALL` restores that; both are opt-in, see
+    // `is_small_copyable`). Inside a copy, only a
+    // leaf's copy (no chains of calling copies): a small caller's copy keeps
+    // its own leaf callee inlinable, as the body it replaces had it
+    // (0x70b110's 0x4ac0d0).
+    if leaves.get(&t).is_some_and(|f| makes_no_calls(f) || (!copying && (in_loop || exp("SMALLCALLSALL")))) {
         copies.insert(t);
         stats.calls_leaf_copy += 1;
         leaf_name(t)
@@ -83,12 +92,29 @@ pub fn leaf_name(entry: u64) -> String {
 /// no measure: 0x72b390, 18 instructions with four compares, is 288. The
 /// flags go when the copy is inlined, the caller's `need` folding the
 /// return's flag store away.
-pub fn is_small_leaf(f: &Function) -> bool {
+/// A function none of whose blocks ends in a call.
+fn makes_no_calls(f: &Function) -> bool {
+    !f.blocks.iter().any(|b| matches!(b.term, FTerm::Call { .. }))
+}
+
+pub fn is_small_copyable(f: &Function) -> bool {
     const LEAF_INSTS: usize = 32;
+    // Also a small function making at most two calls that return to it
+    // (noita.exe 0x70b110, 0x70b050: a load and a virtual call): V8 never
+    // inlines those into 0x724580's outlined loop (726 wire bytes each, and
+    // the loop's 26 KB leaves it no inlining budget), where pewasm's
+    // TurboFan does. Opt-in (`GEX_CGEN_EXP=SMALLCALLS`: at calls in
+    // outlined loops; `SMALLCALLSALL`: everywhere; not in the unit key): the
+    // page ABBAs on edger (docs/noita-perf.md, i3b/i3c) found 2-3% less
+    // time in 0x724580's family and no world-fps change beyond noise, so
+    // the default copies leaves only.
+    let calls_ok = exp("SMALLCALLS") || exp("SMALLCALLSALL");
     let mut n = 0;
+    let mut calls = 0;
     for b in &f.blocks {
         match b.term {
             FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Return { .. } => {}
+            FTerm::Call { ret: Some(_), .. } if calls_ok && calls < 2 => calls += 1,
             _ => return false,
         }
         n += b.insts.len();
@@ -156,6 +182,34 @@ pub fn ret_pops(functions: &[Function], class32: bool, read: &dyn Fn(u64) -> Opt
                         out.insert(b.term_pc, ptr + n);
                     }
                 }
+            }
+        }
+    }
+    out
+}
+
+/// The calls in `functions` that read the ZF their caller set: MSVC's
+/// stack checks, `cmp esi, esp` (3B F4 or 39 E6) right before `call
+/// __chkesp` / `call [__imp___chkesp]` / `call _RTC_CheckEsp`, whose `jne`
+/// reports a corrupt stack on a stale ZF (debug builds; stream W's games).
+/// No ABI passes anything in the flags otherwise (`flags_abi`). By the
+/// call's pc. Empty off x86.
+pub fn zf_calls(functions: &[Function], read: &dyn Fn(u64) -> Option<u8>) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    if !gex_abi::X86 {
+        return out;
+    }
+    for f in functions {
+        for b in &f.blocks {
+            if !matches!(b.term, FTerm::Call { .. }) || b.synthetic || b.insts.len() < 2 {
+                continue;
+            }
+            let prev = b.insts[b.insts.len() - 2];
+            if b.insts[b.insts.len() - 1] != b.term_pc || prev + 2 != b.term_pc {
+                continue;
+            }
+            if matches!((read(prev), read(prev + 1)), (Some(0x3b), Some(0xf4)) | (Some(0x39), Some(0xe6))) {
+                out.insert(b.term_pc);
             }
         }
     }
@@ -329,6 +383,9 @@ pub struct FnUnit {
     leaf_copies: BTreeSet<u64>,
     /// Emitting a copy: `static inline`, under `leaf_name`.
     copying: bool,
+    /// Calls that read the ZF their caller set ([`zf_calls`]), by the
+    /// call's pc. Whoever adds a function fills in its entries.
+    pub zf_calls: HashSet<u64>,
 }
 
 impl Default for FnUnit {
@@ -412,28 +469,36 @@ impl FnUnit {
             leaves: Default::default(),
             leaf_copies: BTreeSet::new(),
             copying: false,
+            zf_calls: HashSet::new(),
         }
     }
 
     /// The copies of small leaves this unit's calls named ([`callee_name`]),
     /// as `static inline` functions after its bodies.
     pub fn add_leaf_copies(&mut self, known: &HashSet<u64>, sums: &HashMap<u64, Summary>, trapfree: &HashMap<u64, u32>) -> Result<()> {
-        let want = std::mem::take(&mut self.leaf_copies);
         let leaves = std::sync::Arc::clone(&self.leaves);
         let saved = std::mem::take(&mut self.stats);
         self.copying = true;
         let mut r = Ok(());
-        for a in &want {
-            if let Some(f) = leaves.get(a) {
-                if let Err(err) = self.add(f, known, sums, trapfree) {
-                    r = Err(err);
-                    break;
+        // A worklist: a calling copy may want a leaf's copy (`callee_name`).
+        let mut done = BTreeSet::new();
+        'all: loop {
+            let pending: Vec<u64> = self.leaf_copies.difference(&done).copied().collect();
+            if pending.is_empty() {
+                break;
+            }
+            for a in pending {
+                done.insert(a);
+                if let Some(f) = leaves.get(&a) {
+                    if let Err(err) = self.add(f, known, sums, trapfree) {
+                        r = Err(err);
+                        break 'all;
+                    }
                 }
             }
         }
         self.copying = false;
         self.stats = saved;
-        self.leaf_copies = want;
         r
     }
 
@@ -532,7 +597,7 @@ impl FnUnit {
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
-        self.live = if live_writebacks() { live_in(f, sums) } else { vec![RegSet::ALL; f.blocks.len()] };
+        self.live = if live_writebacks() { live_in_with(f, sums, &self.zf_calls) } else { vec![RegSet::ALL; f.blocks.len()] };
         self.carry = if regs.clean_spills { self.carried(f, known, sums, trapfree) } else { HashMap::new() };
         let dirty = if regs.clean_spills { dirty_in(f, &self.carry) } else { Vec::new() };
         let used: Vec<GuestReg> = regs.used.iter().copied().collect();
@@ -545,7 +610,11 @@ impl FnUnit {
         let name = if self.copying { leaf_name(f.entry) } else { body_name(f.entry) };
         // The body's head, kept aside: its loop functions go first.
         let mut fhead = String::new();
-        let _ = writeln!(fhead, "{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
+        // A calling copy is too costly for clang's threshold at a call site
+        // of many (0x70b110 in 0x724580's loop): forced, as V8 would not
+        // inline it either.
+        let force = if self.copying && !makes_no_calls(f) { "__attribute__((always_inline)) " } else { "" };
+        let _ = writeln!(fhead, "{force}{}int {name}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{", self.storage());
         for r in &used {
             let _ = writeln!(fhead, "  {} {};", emit::reg_cty(*r, self.class32), reg_name(*r));
         }
@@ -673,6 +742,9 @@ impl FnUnit {
         // dispatches on `ctx::PC` itself; nor has a whole-image unit, whose
         // functions are reached through the function table.
         if self.copying {
+            // A copy that calls (`is_small_copyable`) needs its callees
+            // declared like any body here.
+            self.protos.extend(calls);
             return Ok(());
         }
         if self.ftab {
@@ -958,12 +1030,12 @@ impl FnUnit {
                     // itself.
                     (Callee::Indirect(_), Some(_)) if self.carry.contains_key(&i) => {
                         leave_wb = self.carry[&i];
-                        let all = if flags_abi() { non_flags() } else { RegSet::ALL };
+                        let all = if flags_abi() { call_reads(self.zf_calls.contains(&b.term_pc)) } else { RegSet::ALL };
                         all.minus(leave_wb)
                     }
                     // No callee reads the flags it is entered with
                     // (`flags_abi`).
-                    _ if flags_abi() => non_flags(),
+                    _ if flags_abi() => call_reads(self.zf_calls.contains(&b.term_pc)),
                     _ => RegSet::ALL,
                 };
                 // Dirty registers the callee never writes stay dirty across
@@ -1001,7 +1073,7 @@ impl FnUnit {
                             reload_all(e);
                             e.line("  } else");
                         }
-                        let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, *t);
+                        let callee_c = callee_name(&self.leaves, self.copying, scope.is_some(), &mut self.leaf_copies, &mut self.stats, *t);
                         if leave_wb.is_empty() {
                             e.line(format!(
                                 "  if (!{callee_c}(ctx, depth + {}, {need_back}, {ret_arg})) {fail}",
@@ -1041,7 +1113,7 @@ impl FnUnit {
                                 } else {
                                     String::new()
                                 };
-                                let callee_c = callee_name(&self.leaves, self.copying, &mut self.leaf_copies, &mut self.stats, k);
+                                let callee_c = callee_name(&self.leaves, self.copying, scope.is_some(), &mut self.leaf_copies, &mut self.stats, k);
                                 e.line(format!("  {{ const uint64_t ft = {t};"));
                                 if carried.is_empty() {
                                     e.line(format!(
@@ -1691,6 +1763,12 @@ pub fn live_writebacks() -> bool {
 /// `longjmp`s to an earlier call's continuation in the same frame; C and
 /// the ABIs leave them undefined there (docs/function-tier.md §5).
 pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
+    live_in_with(f, sums, &HashSet::new())
+}
+
+/// [`live_in`], with ZF read by the calls at `zf` (their `term_pc`s:
+/// [`zf_calls`]).
+pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64>) -> Vec<RegSet> {
     let n = f.blocks.len();
     let mut live = vec![RegSet::EMPTY; n];
     let order: Vec<usize> = f.rpo().iter().rev().map(|b| b.index()).collect();
@@ -1712,12 +1790,12 @@ pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
                     ..
                 } => match sums.get(t) {
                     Some(sm) => sm.inputs.union(live[r.to.index()]),
-                    None if flags_abi() => non_flags().union(live[r.to.index()]),
+                    None if flags_abi() => call_reads(zf.contains(&b.term_pc)).union(live[r.to.index()]),
                     None => RegSet::ALL,
                 },
                 // `flags_abi`: no callee reads the flags it is entered with.
                 FTerm::Call { ret, .. } if flags_abi() => {
-                    non_flags().union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
+                    call_reads(zf.contains(&b.term_pc)).union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
                 }
                 FTerm::TailCall { .. } if flags_abi() => non_flags(),
                 _ => RegSet::ALL,
@@ -1932,6 +2010,19 @@ pub fn trapfree_carry() -> bool {
 pub fn devirt_carry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GEX_CGEN_WB_DEVIRT").as_deref() == Ok("1"))
+}
+
+/// What a call to a callee without a summary (indirect, outside the unit,
+/// or unsummarised) reads of the caller's registers under `flags_abi`:
+/// everything but the flags, and ZF at a stack check (`zf`, [`zf_calls`]).
+/// `GEX_CGEN_EXP=ZFCALLS` gives every such call ZF (priced on edger at
+/// -2.7%, gl2 in docs/noita-perf.md).
+pub fn call_reads(zf: bool) -> RegSet {
+    if zf || exp("ZFCALLS") {
+        non_flags().union(RegSet::of(&[GuestReg::Z]))
+    } else {
+        non_flags()
+    }
 }
 
 pub fn non_flags() -> RegSet {
@@ -2233,7 +2324,9 @@ b1 0x2005..0x2006 insts [2005]:
     fn a_leaf_copy_names_its_outlined_loops_apart() {
         let leaf = gex_ir::text::parse(LEAF).unwrap();
         let caller = gex_ir::text::parse(CALLER).unwrap();
-        assert!(is_small_leaf(&leaf) && !is_small_leaf(&caller));
+        assert!(is_small_copyable(&leaf));
+        // One call that returns to it: copyable too with SMALLCALLS.
+        assert_eq!(is_small_copyable(&caller), exp("SMALLCALLS") || exp("SMALLCALLSALL"));
         if !outline_loops() {
             return;
         }

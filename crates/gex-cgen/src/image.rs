@@ -337,19 +337,39 @@ fn read_recovery(dir: &Path) -> Result<Recovery> {
 pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>, icall_hints: &HashMap<u64, u64>) -> Result<String> {
     let rec = read_recovery(recovery)?;
     let known: HashSet<u64> = rec.entries.iter().copied().collect();
+    // The image's small leaves, as a whole-image unit has them, so the C
+    // names their copies (and holds them) as the unit's does.
+    let mut leaves = HashMap::new();
+    let mut leaf_pops = HashMap::new();
+    let mut leaf_zf = HashSet::new();
+    if func::leaf_copies() {
+        let mut gir = GirReader::open(recovery)?;
+        while let Some(f) = gir.next()? {
+            if func::is_small_copyable(&f) {
+                leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                leaf_zf.extend(func::zf_calls(std::slice::from_ref(&f), read));
+                leaves.insert(f.entry, f);
+            }
+        }
+    }
     let mut gir = GirReader::open(recovery)?;
     while let Some(f) = gir.next()? {
         if f.entry != entry {
             continue;
         }
         let mut unit = FnUnit::new();
+        unit.leaves = std::sync::Arc::new(leaves);
+        unit.ret_pops = leaf_pops;
+        unit.zf_calls = leaf_zf;
         unit.set_class32(rec.class32);
         unit.ftab = true;
         unit.touched = rec.touched.clone();
         unit.guardfree = rec.guardfree.clone();
         unit.icall_hints = std::sync::Arc::new(icall_hints.clone());
         unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+        unit.zf_calls.extend(func::zf_calls(std::slice::from_ref(&f), read));
         unit.add(&f, &known, &rec.sums, &rec.trapfree)?;
+        unit.add_leaf_copies(&known, &rec.sums, &rec.trapfree)?;
         return Ok(unit.source());
     }
     bail!("no function at {entry:#x} in {}", recovery.display())
@@ -514,12 +534,14 @@ fn emit_and_link(
     // their returns pop. A stub's body is not its function's: no copy.
     let mut leaves = HashMap::new();
     let mut leaf_pops = HashMap::new();
+    let mut leaf_zf = std::collections::HashSet::new();
     if func::leaf_copies() {
         for recovery in recoveries {
             let mut gir = GirReader::open(recovery)?;
             while let Some(f) = gir.next()? {
-                if !skip.contains(&f.entry) && func::is_small_leaf(&f) {
+                if !skip.contains(&f.entry) && func::is_small_copyable(&f) {
                     leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                    leaf_zf.extend(func::zf_calls(std::slice::from_ref(&f), read));
                     leaves.insert(f.entry, f);
                 }
             }
@@ -535,6 +557,7 @@ fn emit_and_link(
         unit.icall_hints = std::sync::Arc::clone(hints);
         unit.leaves = std::sync::Arc::clone(&leaves);
         unit.ret_pops = leaf_pops.clone();
+        unit.zf_calls = leaf_zf.clone();
         unit
     };
     std::fs::create_dir_all(objects)?;
@@ -601,6 +624,7 @@ fn emit_and_link(
                 unit.add_leave_stub(f.entry);
             } else {
                 unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                unit.zf_calls.extend(func::zf_calls(std::slice::from_ref(&f), read));
                 unit.add(&f, &known, &rec.sums, &rec.trapfree)
                     .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
             }

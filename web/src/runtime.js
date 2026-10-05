@@ -440,6 +440,10 @@ export async function runProgram(
     // process of the same program starts at its own entry with every
     // relocation already applied.
     link = Number(globalThis.GEX_LINK ?? 0),
+    // Function-tier modules compiled ahead of the run (an ejected project's
+    // page compiles its units while the bundle downloads), as [name, Module]
+    // pairs every Worker takes instead of fetching and compiling its own.
+    preModules = null,
   },
 ) {
   const { shimBytes, seedBytes } = await loadRuntime();
@@ -463,7 +467,7 @@ export async function runProgram(
   // that never asked, and the guest's only symptom is an empty GL_VERSION
   // much later.
   console.warn(`[gex] runtime rings: gl=${!!gl} wl=${!!wl}`);
-  // The GPU: a `GlDevice` (web/src/gl.js) the guest drives through
+  // The GPU: a `MesaGlDevice` (web/src/mesa-gl.js) the guest drives through
   // libGLESv2/libEGL marshallers over a command ring. It needs a
   // SharedArrayBuffer bridge -- `gl_submit` is synchronous inside an
   // ioctl and the canvas is here, not in the Worker. Without this the `gl`
@@ -659,6 +663,9 @@ export async function runProgram(
       aot: globalThis.GEX_AOT ? true : undefined,
       denseDebug: !!globalThis.GEX_DENSE_DEBUG,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
+      // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
+      shareTrace: flag('sharetrace') ? 1 : undefined,
+      preModules: preModules ?? undefined,
       // `?forkskip=N`, in `extra` because the process that acts on it is a
       // forked child, not the page's own.
       forkSkip: typeof globalThis.GEX_FORK_SKIP_MIB === 'number'
