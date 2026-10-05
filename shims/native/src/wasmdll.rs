@@ -90,6 +90,34 @@ pub(crate) struct WinePe {
     /// DLL's `-import` re-exports are served by the owner's adapter.
     any_dll: std::collections::HashMap<String, u32>,
     data_exports: std::collections::HashMap<String, u32>,
+    /// Writes into the module's data that must follow its initialisation
+    /// (`apply_pending`, after the drain's catch-up instantiated it).
+    pending: Mutex<Vec<(u64, Vec<u8>)>>,
+}
+
+/// After an install's catch-up (the module instantiated, its data
+/// initialised): the writes that had to wait for it.
+pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) {
+    let Some(wp) = shared.lock().unwrap_or_else(|e| e.into_inner()).wine_pe.clone() else { return };
+    let writes = std::mem::take(&mut *wp.pending.lock().unwrap_or_else(|e| e.into_inner()));
+    for (at, bytes) in writes {
+        if let Some(dst) = memory.bytes().get_mut(at as usize..at as usize + bytes.len()) {
+            dst.copy_from_slice(&bytes);
+        }
+    }
+}
+
+/// The variables gex-kernel's NT boot fills in ntdll (Wine's unix side
+/// does it in `load_ntdll_functions`), by link name: in a native ntdll they
+/// are the module's, whose data the boot's writes went past (its skeleton
+/// points them all at one placeholder until the install).
+fn ntdll_variables() -> [(&'static str, Vec<u8>); 3] {
+    use gex_kernel::nt::boot::tramp;
+    [
+        ("__wine_syscall_dispatcher", (tramp::SYSCALL_DISPATCHER_32 as u32).to_le_bytes().to_vec()),
+        ("__wine_unix_call_dispatcher", (tramp::UNIX_CALL_32 as u32).to_le_bytes().to_vec()),
+        ("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec()),
+    ]
 }
 
 /// Exported i32 globals with constant initialisers: a PIC module's data
@@ -193,7 +221,7 @@ fn install_shared(
             let module = gex_cache::load_or_compile_at(engine, &crate::libprov::cwasm_path(&file, &wasm), &wasm)
                 .with_context(|| format!("compiling {}", file.display()))?;
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: exported_offsets(&wasm)? };
+            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: exported_offsets(&wasm)?, pending: Mutex::new(Vec::new()) };
             (Arc::new(wp), Some((module, names.len() as u32)))
         }
     };
@@ -232,6 +260,15 @@ fn install_shared(
             let target = (wp.data + *off as u64).wrapping_sub(base) as u32;
             let at = (base + functions + 4 * *idx as u64) as usize;
             memory.bytes()[at..at + 4].copy_from_slice(&target.to_le_bytes());
+        }
+    }
+
+    if dll == "ntdll.dll" {
+        let mut pending = wp.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, bytes) in ntdll_variables() {
+            if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {
+                pending.push((wp.data + *off as u64, bytes));
+            }
         }
     }
 

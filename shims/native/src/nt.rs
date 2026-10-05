@@ -452,8 +452,17 @@ fn dump_threads(p: &nt::Process, gm: &mut GuestMem<'_>) {
     }
 }
 
+/// A system call made by native Wine on wasm32 (gexrt's `__gexw_syscall`,
+/// docs/wine-native.md §3.15) carries this bit in its `pc`: a call that sends
+/// the thread elsewhere (an APC, an NtContinue) writes that state into the
+/// context and returns normally, as the program's native frames cannot be
+/// left and resumed; the caller runs it or unwinds itself.
+pub(crate) const NATIVE_SYSCALL: u64 = 1 << 61;
+
 /// The `syscall` import for an NT process.
 pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()> {
+    let native = pc & NATIVE_SYSCALL != 0;
+    let pc = pc & !NATIVE_SYSCALL;
     catch_up_in_caller(caller)?;
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let state = caller.data_mut();
@@ -518,6 +527,10 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let resume_pc = || read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     match outcome {
         nt::Outcome::Continue => Ok(()),
+        nt::Outcome::Resume(target) if native => {
+            let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, target);
+            Ok(())
+        }
         nt::Outcome::Resume(target) => {
             // NtContinue out of a nested dispatch (EXCEPTION_CONTINUE_EXECUTION,
             // a handler resuming its frame): back to where it was raised.

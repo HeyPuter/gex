@@ -780,6 +780,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
         }
         install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *caller)?;
+        crate::wasmdll::apply_pending(&shared, &memory);
         replay_registry(caller)?;
     }
     Ok(())
@@ -817,6 +818,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
         }
         install_providers(&p, store.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *store)?;
+        crate::wasmdll::apply_pending(&shared, &memory);
         catch_up_table(store)?;
     }
     Ok(())
