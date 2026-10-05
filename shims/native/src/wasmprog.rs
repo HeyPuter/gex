@@ -71,7 +71,20 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         .map(|j| Arc::clone(&j.shared))
         .ok_or_else(|| anyhow!("wasm32 program: the function table is off (--no-jit?)"))?;
     shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program = true;
+    // gex-kernel's wasm32 personality: signal frames and sigreturns stay in
+    // the context for the program's syscall stub.
+    store.data_mut().with_kernel(|k| k.wasm32 = true);
     crate::ftab::publish_stateful(&shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: mem_base as u32 })?;
+    // Instantiate it in this (the first) store now, and apply its data
+    // relocations here. libprov applies them once per data address for the
+    // whole host (`relocate_once`), which a program exec'd into a fresh
+    // address space -- the same module at the same address -- would skip.
+    // They are stores of fixed values, so applying them again is harmless.
+    crate::ftab::catch_up(&mut *store)?;
+    let inst = store.data().jit.as_ref().and_then(|j| j.instances.last().copied()).ok_or_else(|| anyhow!("wasm32 program: not instantiated"))?;
+    if let Ok(f) = inst.get_typed_func::<(), ()>(&mut *store, "__wasm_apply_data_relocs") {
+        f.call(&mut *store, ()).context("applying the wasm32 program's data relocations")?;
+    }
     if std::env::var_os("GEX_WASM_TRACE").is_some() {
         eprintln!(
             "gex: wasm32 program: {} KiB wasm, data at {mem_base:#x}, entry {entry:#x}, compiled in {:.2}s",

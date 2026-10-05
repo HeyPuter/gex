@@ -308,7 +308,10 @@ mod imp {
         }
         TRACE_FOREIGN.store(flag("GEX_NT_TRACE") || flag("GEX_NT_FOREIGN_TRACE"), Ordering::Relaxed);
         if flag("GEX_NT_ARENA_SELFTEST") {
-            warn_line(&format!("gex-nt: arena self-check: {}\n", crate::arena_selftest()));
+            // Through the guest's stderr, not the console: a Worker's console
+            // output can be lost when the run ends, and tests/nt reads this.
+            let line = format!("gex-nt: arena self-check: {}\n", crate::arena_selftest());
+            unsafe { crate::write(2, line.as_ptr() as u32, line.len() as u32) };
         }
         NO_RETIRE.store(flag("GEX_NT_NO_RETIRE"), Ordering::Relaxed);
         GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);

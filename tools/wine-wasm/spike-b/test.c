@@ -15,6 +15,9 @@ typedef void (__cdecl *sort_t)(int *, int, cmp_t);
 typedef int (WINAPI *apply_cb_t)(int);
 typedef int (WINAPI *apply_t)(apply_cb_t, int);
 typedef int (__cdecl *calls_t)(void);
+typedef double (__cdecl *fd_t)(double, int64_t);
+typedef double (__cdecl *sum_fd_t)(fd_t, int);
+static double __cdecl guest_fd(double x, int64_t k) { return x * 2 + (double)(k >> 33); }
 
 static int guest_cmp_calls;
 static int __cdecl guest_cmp(const void *a, const void *b)
@@ -41,6 +44,7 @@ int main(int argc, char **argv)
     sort_t sort = (sort_t)GetProcAddress(h, "demo_sort");
     apply_t apply = (apply_t)GetProcAddress(h, "demo_apply");
     cmp_t ncmp = (cmp_t)GetProcAddress(h, "demo_native_cmp");
+    sum_fd_t sum_fd = (sum_fd_t)GetProcAddress(h, "demo_sum_fd");
     calls_t calls = (calls_t)GetProcAddress(h, "demo_calls");
     printf("demo.dll at %p, demo_add at %p\n", (void *)h, (void *)add);
 
@@ -62,6 +66,8 @@ int main(int argc, char **argv)
     printf("demo_sort with demo_native_cmp's address: %d .. %d\n", a[0], a[7]); CHECK(a[0] == 1 && a[7] == 9);
     int r = apply(guest_triple, 7);
     printf("demo_apply(x86 stdcall callback, 7) = %d\n", r); CHECK(r == 42);
+    double fd = sum_fd(guest_fd, 4);
+    printf("demo_sum_fd(x86 double callback with an int64 argument, 4) = %g\n", fd); CHECK(fd == 20.0);
     printf("calls inside demo.dll: %d\n", calls());
 
     /* timings, natively under gexc (the browser numbers are W0(c)'s) */

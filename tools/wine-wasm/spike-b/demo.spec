@@ -6,3 +6,4 @@
 @ cdecl demo_scale(double long)
 @ cdecl demo_native_cmp(ptr ptr)
 @ cdecl demo_calls()
+@ cdecl demo_sum_fd(ptr long)

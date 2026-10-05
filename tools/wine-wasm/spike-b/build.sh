@@ -14,14 +14,23 @@ LD="wasm-ld --experimental-pic -shared --shared-memory --import-memory --max-mem
 # 1. the probe: the DLL's own code, for its exports' wasm signatures
 clang $F -I"$here" -c "$here/demo.c" -o "$OUT/demo.o"
 $LD --export-all --unresolved-symbols=import-dynamic "$OUT/demo.o" -o "$OUT/probe.wasm"
-# 2. adapters, exit stubs, skeleton source
+# 2. adapters and skeleton source. Callbacks: by default the ICALL pass
+#    (tools/wine-wasm/icall) rewrites demo.c's indirect calls and makes the
+#    exit stubs; MACRO=1 uses icall.h's hand-written form instead.
+if [ -n "${MACRO:-}" ]; then
+  EXITS="--exit i:pp --exit i:i" PASS=
+else
+  EXITS= PASS="-fpass-plugin=$OUT/icall/GexIcall.so -DGEXW_ICALL_PASS"
+  "$root/tools/wine-wasm/icall/build.sh" "$OUT/icall"
+fi
 python3 "$root/tools/wine-wasm/specgen.py" "$here/demo.spec" "$OUT/probe.wasm" "$OUT/demo" \
-  --source "$here/demo.c" --exit i:pp --exit i:i
+  --source "$here/demo.c" $EXITS
 # 3. the module: DLL code and adapters in one unit (the per-thread globals
 #    of icall.h are static to it), and the per-thread globals
-clang $F -I"$here" -I"$ABI" -I"$root/crates/gex-cgen/providers" -c "$OUT/demo.adapters.c" -o "$OUT/demo.adapters.o"
+clang $F $PASS -I"$here" -I"$ABI" -I"$root/crates/gex-cgen/providers" -c "$OUT/demo.adapters.c" -o "$OUT/demo.adapters.o"
+clang $F -I"$ABI" -I"$root/crates/gex-cgen/providers" -c "$root/tools/wine-wasm/gexw_rt.c" -o "$OUT/gexw_rt.o"
 clang --target=wasm32 -c "$root/tools/wine-wasm/gexw_globals.s" -o "$OUT/gexw_globals.o"
-$LD "$OUT/demo.adapters.o" "$OUT/gexw_globals.o" -o "$OUT/demo.wasm"
+$LD "$OUT/demo.adapters.o" "$OUT/gexw_rt.o" "$OUT/gexw_globals.o" -o "$OUT/demo.wasm"
 # 4. the PE skeleton and the test program
 i686-w64-mingw32-gcc -O2 -s -shared -nostdlib -Wl,--no-insert-timestamp -Wl,-e,_skel_entry \
   -o "$OUT/demo.dll" "$OUT/demo.skel.c" "$OUT/demo.def"
