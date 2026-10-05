@@ -583,6 +583,9 @@ the same sequence.
 | 10-04 | + wake-on-idle yield (hand port) | 62.7, 66.1 | 58.8, 56.7 | 1.11 |
 | 10-04 | integ merge: nt_qpc, crt_heap, concrt provider kick (`p-noita15`, G0) | 67.7, 66.3 | 58.8, 59.1 | 1.14 |
 | 10-04 | G1: noita.exe + msvcr120 + msvcp120 linked as one group | 67.3, 62.6 | 58.8, 59.1 | 1.10 (not kept) |
+| 10-04 | quiet window (load 5-9), 9 legs: G0 again (`p-noita15g0`) | 69.1, 69.9 | 52.3, 61.3, 57.3 | 1.22 |
+| 10-04 | + Mesa batched clears (`p-noita15m`) | 73.9, 73.7 | same | 1.29 |
+| 10-04 | + msvcp120_thrd, YIELD_PARKED kick (`p-noita16g0m`) | 74.5, 74.9 | same | 1.31 |
 
 Notes:
 - G1 is installed and correct on both runtimes (members held, the group
@@ -605,6 +608,41 @@ Notes:
   by C text, so a re-key costs emission and links (about 15 min for
   noita.exe), but the native build and the shim must come from the same
   gex-cgen tree, or the page misses units by key.
+
+### State at the move (2026-10-04, 21:25)
+
+- Branch merge/eject9 (gex `master` is trunk now; merge `master` for
+  updates). Everything committed; tests/nt eject gate after both main merges:
+  all 16 cases ok on gex-rt and the web build under Node, glcompat ok on
+  gex-rt (its web run needs the page: no GL device under Node, as before).
+- Best page configuration (1.31x pewasm, 9-leg sequence above):
+  `scratchpad/eject9/p-noita16g0m` = p-noita16's units without the group,
+  plus the batched-clear Mesa. Not kept: G1 (`link_groups`).
+- **The Mesa batched-clear change is not pushed and not in gex.** It lives
+  in `scratchpad/eject9/gexroot/third_party/mesa` (a plain repo made from
+  wink 9016782's tree, commit dbf6668), and as
+  `scratchpad/eject9/mesa-patches/0001-gex_wgpu-clears-recorded-into-the-pending-batch-not-.patch`.
+  Built with `scratchpad/eject9/build-mesa.sh` (eject9's
+  web/build-mesa-wasm.sh with GEX_MESA_SRC, the replay target only) into
+  `scratchpad/eject9/mesa-out`. Pushing it to mesa-wink `wink` needs the
+  user's approval (the coordinator asks).
+- Resume:
+  1. G3 (ThinLTO group): `p-noita16lto` was stopped mid-build (the
+     per-image units reuse p-noita16's by key; the group recompiles every
+     object as bitcode). Rerun its build.sh with `GEX_GROUP_LTO=1
+     GEX_EJECT_UNIT_CACHE=<p-noita16>/build/units`, then the page sequence
+     (`scratchpad/eject9/legs.sh N pew A B ... pew`, cores of the bench box).
+     G2 (`GEX_GROUP_PROVIDERS=1`) is built in code but not measured.
+  2. Compositor, next: Noita switches FBO almost every draw, so draw_vbo
+     begins a render pass per draw (15 of 84 us per draw,
+     `?mesaenv=GEX_WGPU_TIMING=1`); views (13 us) and setters (20 us) next.
+  3. Wanted from U's merge (memory64 providers): rebase libprov's
+     per-process relocate_once (29a2c2a1) and eject's cwasm_path naming onto
+     it.
+- Scripts: `scratchpad/eject9/{legs.sh, abba3.sh, page-run.mjs, ntweb.sh,
+  ntweb-rest.sh, ntgroup.sh, run-ejected.sh, bshim.sh}`; projects
+  `p-noita15` (G1 group), `p-noita15g0`, `p-noita15m`, `p-noita16` (G1 +
+  thrd), `p-noita16g0m`, `p-noita16lto` (partial).
 
 ## 7. Phases
 
