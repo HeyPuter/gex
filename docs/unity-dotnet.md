@@ -572,8 +572,39 @@ Not yet:
     its OpenGL 4.5 device and **Muck's main menu renders completely** (scene,
     grass, UI) with all game code on .NET Mono. Native only, so no speed
     numbers (cold translation; the browser is the target).
-  - Next: the browser (stream U step 6: the provider and the page), Unity's
-    remaining internal calls as they show up, then Stardew/Celeste.
+  - **P5 started: the browser shim for a 64-bit memory (docs/mem64.md step
+    6), 36e98cd5.** `GEX_MEM64=1 shims/browser/build.sh` (x86) builds the
+    shim for wasm64-unknown-unknown (nightly, build-std): a 16 GiB memory64.
+    Its JS-facing exports and imports have exactly the wasm32 shim's types
+    (checked with `scratch/unity/w64/sigs.py`), so the glue changes are
+    small: `GEX_MEM64` creates the memory64, grows it in BigInt pages and
+    sets the i64 `__stack_pointer`. `gexc seed --mem64`; gex-emit's dense
+    dispatch now addresses memory in its index type (wasm32 output
+    identical). The global kernel for these processes
+    (`GEX_MEM64=1 shims/kernel/build.sh`, `gex_kernel.x86.m64.wasm`) reaches
+    the process memory with i64 (`gex-kmem/process64`). Under node,
+    `GEX_MEM64=1 GEX_ARCH=x86 GEX_SHARED=1 run-node.mjs
+    web/public/gex/seed.x86.m64.shared.wasm PROG` runs gx64 ack/bits/branchy
+    with the same output as the wasm32 shim.
+  - **P5 plan, in order:**
+    1. Guest addresses to the global kernel are still `u32` (the `k_*`
+       imports, gex-kernel's remote pipe/unix/pty ops, `rf_*`). In M64
+       a buffer above 4 GiB (the high arena) would be truncated. Widen them
+       to a `PAddr` that is u64 in the wasm64 shim and the process64 kernel
+       and u32 otherwise (M32 unchanged). Test: an x86-64 program that
+       reads a file and a pipe into a buffer above 4 GiB.
+    2. Dynamic glibc programs and the x86-programs corpus under `GEX_MEM64`.
+    3. The Linux stateful provider in the browser: `libprov`'s mem64 side
+       (SysV adapters' provider_abi/table_size/guest_sym/code_page, thread
+       register/park/stop/start, guest stack end, reverse slots,
+       `on_linux_maps` for a replaced `.so`) next to the existing NT
+       stateful providers in cgen.rs and gex.mjs. Test:
+       tests/unity-dotnet/embed in node.
+    4. Muck in the page: the provider plus the BCL served as files,
+       graphics through Mesa (wink) and the page's Xwayland (`hostx=1`).
+    5. The fork's wasm JIT on wasm64 (an i64-address emitter, modules
+       compiled through gex's JIT path).
+  - Unity's remaining internal calls as they show up; then Stardew/Celeste.
 - **Resume (after the move; HEAD 1db5c816, `master` merged in):**
   0. The coordgate on this branch still lacks its browser NT step (it was
      stopped while E was timing), and nothing after 49a5773b has been
