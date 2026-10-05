@@ -1316,8 +1316,16 @@ Steps:
     had been configured against wt/musl-wasm). **Gate artifacts:**
     `$W/sr-gate` (fresh, from wt/musl-fork 155f77bf, binaryen 133) and
     `$W/bb-gate` (busybox built with it); master's gate keeps
-    `$W/sysroot` and `$W/busybox`. Next steps:
-    1. gate (coordinator), then merge master again once F+E land.
+    `$W/sysroot` and `$W/busybox`.
+    **Gating:** merge/wine-fork 414f43dc (master b7fead07 merged; check-fork
+    green: nt 81/81 on all five prefixes and both cgen-prefix legs).
+    **musl patch reduction in progress** on merge/wine-slim (wt/wine-slim)
+    + musl `gex-wasm32-slim` 93c5dfda (wt/musl-slim, pushed to mw): libgex
+    (§3.11.2) holds the setjmp runtime, dlopen registry, signal frames and
+    vfork; sysroot `$W/sr-slim`, busybox `$W/bb-slim`; tests/wasm32 (new
+    dlopen.c, vfork in fork.c), busybox.sh and run-browser.sh pass on it.
+    Next steps:
+    1. gate of merge/wine-fork (coordinator).
     2. When it lands: fast-forward musl's gex-wasm32 to gex-wasm32-fork and
        push.
     3. musl patch reduction (the user's standing goal, §3.11.2): only two
