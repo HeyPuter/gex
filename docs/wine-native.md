@@ -1,7 +1,6 @@
 # Wine as native wasm: plan (draft, 2026-10-03)
 
-Status: stream W, W0 in progress (2026-10-04). The toolchain is decided
-(§3.10); all three spikes have run (§4.1).
+Status: stream W. W0 done (§4.1); W1 toolchain built (§3.10–3.13, §4.2).
 
 ## 1. Why
 
@@ -314,13 +313,235 @@ native one. The case so far is `fcntl` locks: gex hands F_GETLK64 (12–14)
 through unmapped, so wasm32 uses 5/6/7 with the 64-bit `struct flock`.
 **Decided (coordinator, 2026-10-04): a `wasm32` personality in gex-kernel,
 in W1.** It is additive: a new personality whose structure layouts are
-defined to match musl's `arch/wasm32` (64-bit members 8-aligned, 64-bit
-`time_t`, `struct stat` as musl's own). The i386 paths stay unchanged, and
-tests cover both. Its ABI is written here when it is built (§3.11).
+defined to match musl's `arch/wasm32`. The i386 paths stay unchanged, and
+tests cover both. As built: §3.11.
 
-**The ICALL check (decided).** The LLVM pass emits the select form measured
-in W0(c): `idx = p < 0x400000 ? p : exit_stub[sig]`, the guest address
-in a per-thread wasm global, then one `call_indirect`.
+**The ICALL check (decided, built in W1).** `tools/wine-wasm/icall/GexIcall.cpp`
+is an LLVM pass plugin for the system clang (`-fpass-plugin=GexIcall.so`,
+run at the end of the optimisation pipeline, after inlining). Every
+non-variadic indirect call becomes:
+
+```
+gexw_set_icall_target(p)                        ; a wasm global (gexw_globals.s)
+callee = p < 0x400000 ? p : __gexw_exit.<sig>   ; select, no branch
+call callee(args)
+```
+
+- **The exit stubs** are one per wasm signature (plus `byval` layout),
+  `linkonce_odr` and hidden. A stub lays the arguments out as i386 stack
+  words: i64 and double take two, `byval` structs are copied in, narrow
+  integers are widened. It then calls `__gexw_guest_call` (EDX:EAX) or
+  `__gexw_guest_call_fp` (ST0, popped) in `tools/wine-wasm/gexw_rt.c`.
+  Those push the words and a return address, run the target through the
+  function table, and put ESP back, so one stub serves cdecl and stdcall
+  callees.
+- **Variadic indirect calls** are left alone and counted
+  (`GEXW_ICALL_STATS=1`).
+- **Cost in V8** (node 26.7, core 3, tools/wine-wasm/spike-c, 20M calls,
+  median of 5):
+
+  | | ns/call |
+  |---|---|
+  | plain `call_indirect` | 0.49 |
+  | the pass's output | 0.99 |
+  | W0(c)'s hand-written select form | 0.93 |
+  | native → guest through a pass stub | 6.7 |
+
+- **Spike (b)** runs on the pass by default: demo.dll's callbacks, cdecl
+  and stdcall, plus a double-returning callback with an int64 argument.
+- **Not yet handled:** native function pointers that escape to guest code
+  (COM vtables a native DLL hands the program, WNDPROCs) are table
+  indices, which x86 code cannot call. The plan is ARM64EC's entry thunks:
+  - gex's lookup of an address below 0x400000 routes it to an entry adapter
+    for that function's signature and convention;
+  - the convention comes from `WINAPI`/`__stdcall` declarations, which
+    clang drops on wasm32 and must be carried as an annotation;
+  - this is W2 work with the PE loader.
+
+### 3.11 The wasm32 ABI on gex-kernel (W1, 2026-10-04)
+
+A native wasm32 program (wasmprog, §3.10) is a gex process with
+`Kernel::compat` (the i386 ABI) and `Kernel::wasm32` set. The ABI is
+**i386 Linux's, with musl's `arch/wasm32` converting where wasm32's own
+layouts differ, and one difference in control flow**. The i386 paths are
+unchanged.
+
+**Calls.**
+- **Entry:** the thread writes the number to `eax` and the arguments to
+  `ebx, ecx, edx, esi, edi, ebp` in its gex context (8-byte slots, upper
+  half zero), sets `esp` to its C stack pointer less 256 (below
+  everything live), and calls `gex.syscall(ctx, 0)`.
+- **Result:** in `eax`, negative errno as on Linux.
+- **Numbers:** i386's (`asm/unistd_32.h`), including the time64 calls,
+  `statx`, `fcntl64` and the direct socket calls. 64-bit arguments are
+  split low/high as on i386.
+
+**Structures.** Everything the kernel reads or writes uses the i386 kernel
+layout. Where wasm32's C layout differs (it aligns 64-bit members to 8),
+musl declares or converts:
+
+| structure | kernel layout | in musl wasm32 |
+|---|---|---|
+| `stat64` (stat, fstat, fstatat64) | i386, 96 bytes, 64-bit fields 4-aligned | `struct kstat` with `aligned(4)` 64-bit members; `struct stat` is musl's own and converted. `statx` is tried first and is the same on both. |
+| `statfs64` | i386, 84 bytes | `struct statfs` packed to 84 |
+| `epoll_event` | 12 bytes, packed | packed, as on x86-64 |
+| `flock` (F_GETLK/F_SETLK/F_SETLKW = 5/6/7) | the canonical 64-bit layout (`l_start` at 8) | wasm32's natural `struct flock` is that layout. The kernel reads only `l_type`, at 0 in every layout, so i386's F_*LK64 (12–14, mapped since 7ab9dd35) works too. |
+| `sigaction` | i386 `k_sigaction`; the handler is a **function-table index** | musl's own conversion |
+| `timespec` / `timeval` | time64 calls only: two 64-bit words | `time_t` is 64-bit |
+| `msghdr`, `iovec`, `sockaddr`, `cmsghdr`, `dirent64`, `rlimit64`, `siginfo` | i386 | identical in wasm32 (ILP32) |
+
+**Threads and processes.**
+- **`clone` with `CLONE_THREAD`:** the child gets the parent's context
+  copied, with `esp` = the new stack. The parent sets `PC` to the image's
+  thread entry (`AT_ENTRY + 16`) for the call. The child's stack top holds
+  `(func, arg, thread pointer, fresh-TLS flag)`. `CLONE_SETTLS` is not
+  passed: the thread pointer and `__tls_base` are wasm globals the child's
+  entry sets (one module instance per thread).
+- **A `clone` without `CLONE_THREAD`** (posix_spawn's
+  `CLONE_VM|CLONE_VFORK`) is a new process, a copy of the address space,
+  starting at the same thread entry. The native shim makes it inside the
+  syscall (the parent's wasm frames cannot be resumed elsewhere).
+- **Plain `fork()`** is unsupported (no stack to resume on).
+- **`execve`** of another wasm32 container works.
+
+**Signals, the one control-flow difference.** gex cannot interrupt wasm
+code or move its PC, so signals are delivered at syscall returns:
+- The kernel builds the ordinary i386 frame in the context: `esp` = the
+  frame, `eax` = the signal, for an `SA_SIGINFO` frame `edx` = `&info` and
+  `ecx` = `&uc`, `PC` = the handler (a table index). The syscall then
+  **returns normally** (`SyscallOutcome::Continue`) instead of resuming at
+  the handler.
+- musl's stub sees `PC` changed, calls the handler on a C stack below the
+  frame, sets `esp` as the i386 restorer would (+4 rt, +8 legacy) and
+  issues `rt_sigreturn`/`sigreturn`.
+- `sigreturn` restores the interrupted context (the syscall's result
+  included) and also returns normally.
+- A signal sent while the program computes without syscalls waits for its
+  next syscall. Handlers that `longjmp` out need wasm EH (§3.4).
+
+**Tests:** `tests/wasm32/run.sh` (native output against gex):
+- `signals.c`: plain and SA_SIGINFO handlers, the mask during and after,
+  blocked-then-unblocked, a syscall's result surviving its handler;
+- `threads.c`: threads, thread-locals, mutexes, the heap, stat,
+  posix_spawn plus exec plus wait.
+
+The x86 and i386 paths are covered by x86-programs, lockstep and tests/nt
+as before.
+
+### 3.12 Unix libraries: a closed world, dlopen by registry (W1)
+
+Wine's Unix side loads libraries with `dlopen`: ntdll.so loads each PE
+module's unixlib (`ws2_32.so`, `opengl32.so`, …) and the drivers
+(`winewayland.drv.so`), then `dlsym`s `__wine_unix_call_funcs`. Under gex
+there is no run-time dynamic linking. **Every Unix library a build will use
+is linked into the program** (the eject model, pewasm's whole-program
+static build). musl's wasm32 `dlopen` looks the name up in a registry the
+link adds:
+
+- **Renaming:** each library is compiled with its exported symbols renamed
+  apart (`-D__wine_unix_call_funcs=ws2_32__wine_unix_call_funcs`). Wine's
+  unixlibs export only a handful of names; everything else in them is
+  `static`, and their calls into ntdll.so are ordinary symbols that resolve
+  at link time.
+- **The registry:** `tools/wine-wasm/dlreg.py` writes it, one entry per
+  `(library file name, symbol, renamed symbol, data|func)`.
+- **Lookup:** `dlopen` matches the file name in any directory (Wine asks
+  for `…/i386-unix/ws2_32.so`). `dlsym` searches one library, or all of
+  them for `RTLD_DEFAULT`/`dlopen(NULL)`. `dlclose` does nothing.
+- **Why:**
+  - nothing to instantiate per Worker at run time (§3.7's startup risk
+    goes away for the Unix side);
+  - direct calls and LTO across ntdll.so, win32u.so and the drivers;
+  - no shim support for side modules.
+
+  A run-time loader (side modules instantiated per thread, symbol binding
+  through the store's instances) stays possible if something needs it.
+- **Tested:** the ws2_32 harness finds `__wine_unix_call_funcs` through
+  `dlopen("/usr/lib/wine/i386-unix/ws2_32.so")`, and an unlinked library
+  fails with dlerror (`tools/wine-wasm/spike-a/ws2test.c -DUSE_DLOPEN`).
+
+### 3.13 The PE side's build (W1, as built)
+
+In the Wine fork (`wt/wine-wasm`, branch `wasm32`):
+- **`CPU_WASM32` in the tools** (`tools/tools.h`): i386's data layout, no
+  assembly.
+  - Spec entries marked `-arch=i386` are wasm32's too (it serves i386
+    programs). `-thiscall` and `-fastcall` are kept: they describe the
+    guest's calling convention.
+  - widl generates i386's stubs and format strings.
+  - Skeletons carry `IMAGE_FILE_MACHINE_I386`.
+- **Compiling:** with no PE cross-compiler, configure plans Wine's
+  "builtin ELF DLL" layout. On wasm32 that is the layout wanted: PE code
+  compiled by the host compiler (`wcc`, `-D_WIN32 -fshort-wchar
+  -fno-builtin`) into a module, plus a PE file per DLL (makedep's "fake
+  module").
+  - `wcc` applies the ICALL pass to PE-side code (`-D_WIN32`).
+  - `__TRY` uses clang's wasm SjLj lowering (`exception.h`, winecrt0's
+    `__wasm_setjmp`), which needs wasm exception handling: V8 has it,
+    wasmtime 27 does not.
+- **`winebuild --dll` (wasm32)** writes C, not assembly (`wasm32.c`):
+  - one entry adapter `gexp_<export>` per exported function. It matches
+    the `.spec`'s arguments one by one with the wasm signature of the C
+    function, read from the objects' linking sections:
+    - 8-byte arguments that the code takes as i32 are structs passed by
+      value, so the adapter passes the guest stack address;
+    - a leading hidden pointer with a void result is a small struct
+      return, which goes back in EDX:EAX;
+    - results go in EAX, EDX:EAX or ST0;
+    - stdcall pops its arguments; thiscall and fastcall read ECX/EDX;
+  - stubs call `__wine_spec_unimplemented_stub`;
+  - `gexp__entry` calls the DLL's entry point;
+  - the data exports go out as `--export-if-defined` link options (an
+    `.rsp` beside the object), so their module offsets are readable.
+- **Not adapted yet:** varargs exports (i386's 4-byte stack slots are not
+  wasm32's `va_list`) and ntdll's system-call exports (they become direct
+  calls into the Unix side, W2). Both bind to `gexp__missing`, which
+  names them when called.
+- **`winegcc`** links a position-independent module. Undefined symbols
+  stay imports (`--unresolved-symbols=import-dynamic`), and no libc is
+  linked. The import libraries are empty archives.
+- **`winebuild --fake-module --wasm-module M`** writes the PE skeleton
+  from the linked module (`spec32.c: output_wasm_skeleton`):
+  - `.text`: the entry point and one 4-byte `ud2; ud2` stub per exported
+    function;
+  - `.wasmdat`: the module's data (`__memory_base`); data exports point
+    at their offsets in it;
+  - `.edata`: the exports, forwarders included;
+  - `.wasm`: the module;
+  - `.rsrc`: the resources.
+
+  makedep builds it after the module.
+- **winecrt0 (`libs/winecrt0/wasm32.c`)** is linked into every DLL. It
+  holds:
+  - the adapters' helpers;
+  - `__gexw_guest_call` for the ICALL pass's exit stubs;
+  - the per-thread wasm globals;
+  - the SjLj runtime.
+
+  It uses gex's ABI headers, vendored as `include/wine/gex/`.
+- **In gexc (`shims/native/src/wasmdll.rs`):** when Wine's loader maps a
+  PE with a `.wasm` section, the module is installed as a stateful
+  provider. Its data is at `.wasmdat`, `gexp_<name>` binds at each export,
+  `gexp__entry` at the entry point, and `gexp__missing` at the rest.
+- **Tested:** `tests/wasm32/dll` builds a DLL through winebuild and wasm-ld
+  and calls it from a MinGW i386 program, on `--no-cgen` and `--fjit`. It
+  covers each adapter kind:
+  - stdcall and cdecl;
+  - int64 (EDX:EAX), and float and double (ST0);
+  - thiscall and fastcall;
+  - a struct by value and a struct return;
+  - void;
+  - cdecl and stdcall callbacks (through the ICALL pass);
+  - a data export, a forwarder and a stub.
+- **Open for W2:** imports between DLL modules. Each DLL's module imports
+  what other DLLs define, and gex instantiates a module when its DLL maps,
+  which can be before the DLLs it imports from. The proposed answer is the
+  closed world again:
+  - link the PE side as one module, every DLL's bitcode internalized to
+    its exports first (`llvm-link` + `-internalize`), so their private
+    symbols cannot collide;
+  - every cross-DLL call is then direct, with LTO across DLLs;
+  - per-DLL modules stay possible for a run-time-loaded DLL.
 
 ### 3.9 x64 programs (later)
 
@@ -500,6 +721,73 @@ these are per-call overheads:
 - **The adapters cost what a cross-image call costs today** (6.5 ns), and
   Wine-internal calls drop from that (calls between lifted Wine images)
   to 0.5–1.4 ns.
+
+### 4.2 W1 results (2026-10-04)
+
+**The toolchain** (§3.10–3.13), every piece built and tested:
+- the musl wasm32 port;
+- the wasm32 personality in gex-kernel;
+- closed-world dlopen;
+- the ICALL pass;
+- winebuild `CPU_WASM32` adapters and skeletons;
+- winegcc and makedep for wasm32;
+- winecrt0's wasm32 runtime;
+- `wasmdll` in gexc.
+
+**Tests:**
+- `tests/wasm32/run.sh`: signals, threads, posix_spawn (native against
+  gex);
+- `tests/wasm32/dll/run.sh`: every adapter kind through winebuild,
+  wasm-ld and the skeleton, from a MinGW i386 program, on `--no-cgen` and
+  `--fjit`;
+- the coordinator gate on each change to gex-kernel or the shims.
+
+**Wine builds for wasm32:** `configure --host=wasm32-unknown-linux-musl`
+plus `make -k`.
+- 741 of 852 PE modules link, each as a module plus skeleton, kernel32,
+  user32 and setupapi among them. All 741 were rebuilt with the final
+  toolchain.
+- Of the rest:
+  - 51 are Win16 (`.dll16`, `.exe16`, `.drv16`, `.vxd`), which wasm32 has
+    no use for.
+  - The Unix-backed drivers configure turned off (winex11, winemac,
+    wineandroid, winegstreamer, opencl, sane, gphoto2, wpcap, winscard,
+    capi2032) and wow64/xtajit64.
+  - **W2's core:**
+    - **ntdll:** signal_wasm32.c, the system-call path and `current_machine`;
+    - **win32u:** system-call stubs become direct calls;
+    - **the CRTs** (msvcrt and its versions, ucrtbase, msvcp*, concrt140,
+      vcruntime140_1): `DISPATCHER_CONTEXT` and C++ exception frames for
+      wasm32; vtables written in assembly (`__ASM_VTABLE`);
+    - **rpcrt4:** `ndr_stubless`'s generic call with stack arguments;
+    - **the rest:** winedbg, winevdm, ntoskrnl, w32skrnl, wow32.
+  - **W3:** winewayland.drv, icu, dmsynth.
+
+**Boundary costs in V8** (node 26.7, core 3), per call:
+- **x86 → native through a winebuild adapter** (`spike-c/adapter_bench.mjs`,
+  a unit's call sequence into `gexp_abi_add`, cross-module): 7.0 ns. A
+  hand-written adapter in one module is 6.0 ns; the first generated version
+  was 8.2 ns.
+- **The ICALL check:** 0.99 against 0.49 ns for a plain `call_indirect`
+  (§3.10).
+- **Native → x86 through a pass stub:** 6.7 ns.
+
+**Open, with what they need:**
+- **Native runs of code that uses setjmp (`__TRY`)** need wasm exception
+  handling, i.e. the wasmtime upgrade (§3.4). V8 runs it today. The SjLj
+  runtime and its tag are archive members of their own (winecrt0, musl),
+  so only modules that use setjmp carry exception handling: 38 of the 1,188
+  modules the build links.
+- **The longjmp tag:** each DLL module defines `__c_longjmp`, so a longjmp
+  between two DLL modules would not be caught. The single PE-side module
+  (§3.13, W2) removes that. A per-DLL build would need the tag imported
+  from one place.
+- **Cross-DLL imports** are wasm imports of each DLL's module; binding them
+  at instantiation is W2's single-module link.
+- **Varargs exports and ntdll's system calls** have no adapters yet; they
+  bind to `gexp__missing`.
+- **Native function pointers handed to guest code** (COM vtables,
+  WNDPROCs) need entry thunks, ARM64EC-style (§3.3).
 
 ## 5. Risks
 

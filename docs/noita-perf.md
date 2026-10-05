@@ -1364,7 +1364,7 @@ V8 profiles (`cmp.py`, ms of work per world frame, gb2 vs pb2):
 
 ### Stream F before the move (2026-10-04, night)
 
-merge/fjit = main eda8e8bd + b2bb3c95 (provider key fix, not in main yet)
+merge/fjit = master 7c84c09d (trunk; merge/main is gone) + b2bb3c95 (provider key fix, not in master yet)
 + 26e9f7bc, 857546ce, 0c8f9783, 916ed2c8.
 
 **Item 2, the notify skip (26e9f7bc): correct, no gain.** The yield park
