@@ -1076,9 +1076,18 @@ plus `make -k`.
     is relaid by its format (8-byte args 8-aligned).
   - pelink: stubs for imports from i386 DLLs (LoadLibraryA/GetProcAddress
     once, then a guest call); exports bound to the DLL that defines them.
-  - Open: msvcp* (vtable functions need C declarations before the vtables;
-    __ASM_VTABLE with commas in exception.c), x87 entry points (_CIsqrt,
-    _ftol...: need ST0 adapters), `MSVCRT__adjust_fdiv` data export.
+  - Since: msvcp140/concrt140/vcruntime140 native (vtables in assembly with
+    `.type`'d function references; thiscall methods always get entry
+    thunks); x87/SSE2 register-convention entry points (_CI*, _ftol,
+    __libm_sse2_*: gexrt's x87 pop and guest XMM access); `_chkesp` and
+    ntdll's `_allshl`/`_alldvrm`... as hand-written entries; win32u's
+    system-call stubs; winecrt0's image base from gex (`__gexw_image_base`,
+    a data export of every DLL that wasmdll writes). tests/nt 77/77 on
+    `$W/pfx-native` (3 DLLs), `$W/pfx-w32u` (9: + msvcrt, ucrtbase,
+    vcruntime140, msvcp140, concrt140, win32u) and the x86 prefix.
+  - `$W/noadapter.sh DLL` lists a DLL's function exports with no adapter.
+  - Open: `_vsnprintf_s`, the NtWow64*64 calls, guest FP control words
+    (`__control87_2` is a stub on wasm32), user32/gdi32 native.
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
     merge/wine-wasm after its gate.
 - **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
