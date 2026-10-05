@@ -76,6 +76,7 @@ pub const INVALID_IMAGE_NOT_MZ: u32 = 0xc000_012f;
 pub const DLL_NOT_FOUND: u32 = 0xc000_0135;
 pub const INVALID_ADDRESS: u32 = 0xc000_0141;
 pub const PIPE_BROKEN: u32 = 0xc000_014b;
+pub const PIPE_BUSY: u32 = 0xc000_00ae;
 pub const KEY_DELETED: u32 = 0xc000_017c;
 pub const NOT_FOUND: u32 = 0xc000_0225;
 pub const NO_CALLBACK_ACTIVE: u32 = 0xc000_0258;

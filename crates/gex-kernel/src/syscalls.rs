@@ -91,8 +91,14 @@ pub mod nr {
     pub const MOUNT: u64 = 40;
     pub const GETITIMER: u64 = 102;
     pub const SETITIMER: u64 = 103;
+    pub const SCHED_SETPARAM: u64 = 118;
+    pub const SCHED_SETSCHEDULER: u64 = 119;
+    pub const SCHED_GETSCHEDULER: u64 = 120;
+    pub const SCHED_GETPARAM: u64 = 121;
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 125;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 126;
     pub const SETPRIORITY: u64 = 140;
     pub const GETPRIORITY: u64 = 141;
     pub const GETCPU: u64 = 168;
@@ -293,6 +299,17 @@ pub enum BlockOp {
         parked: Option<crate::futex::Parked>,
     },
     Sleep(std::time::Duration),
+    /// `FUTEX_LOCK_PI(2)`: take the priority-inheritance lock at `uaddr` for
+    /// `tid`, waiting as long as it is held. The host loops: an atomic take
+    /// when the word is free (keeping the waiters bit, since others may
+    /// sleep), else set the waiters bit and wait on the word; `EDEADLK` for
+    /// a lock `tid` already owns; `ETIMEDOUT` at `deadline`.
+    FutexLockPi {
+        table: Arc<FutexTable>,
+        uaddr: u64,
+        tid: u32,
+        deadline: Option<std::time::Duration>,
+    },
     /// `rt_sigsuspend`: wait until a signal the caller can see arrives.
     ///
     /// The blocked mask has already been replaced with the one the caller
@@ -587,6 +604,20 @@ pub struct Kernel {
     /// this one has to ask, and can only ask once the reservation says how
     /// long the object is.
     pub armed_place: Option<String>,
+    /// Every thread's own signal state but the running one's, which is in
+    /// `signals` (`Signals::save_thread`/`load_thread`): masks, thread-directed
+    /// pending signals and alternate stacks are per thread, as on Linux.
+    pub thread_signals: std::collections::HashMap<i32, crate::signal::ThreadSignals>,
+    /// The thread whose part `signals` holds now.
+    pub sig_tid: i32,
+    /// Every other thread's half-finished blocking call (`PendingCall`),
+    /// swapped with `signals`: one thread's `rt_sigsuspend` must not hand
+    /// its mask to the next thread that finishes a futex wait (Mono's GC
+    /// left the main thread with SIGPWR blocked that way).
+    pub thread_calls: std::collections::HashMap<i32, PendingCall>,
+    /// The pc of the syscall being handled (docs/mem64.md: a mapping the
+    /// dynamic loader asks for stays below 4 GiB, since it will hold code).
+    pub syscall_pc: u64,
     /// Where each pinned object actually landed, for checking afterwards.
     ///
     /// A pin that silently does not take is the worst outcome available: the
@@ -1007,6 +1038,16 @@ pub struct ChildHandle {
     pub reaped: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A blocking call's state that waits in the kernel for the host to finish
+/// the wait (`finish_blocking`), kept per thread: see `Kernel::thread_calls`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PendingCall {
+    pub retry_accept: Option<(i32, u64, u64, u64)>,
+    pub write_blocked: bool,
+    pub retry_recvmsg: Option<(i32, u64, u64)>,
+    pub restore_sigmask: Option<u64>,
+}
+
 /// A thread the kernel has prepared and the host must start.
 #[derive(Clone, Copy, Debug)]
 pub struct SpawnRequest {
@@ -1048,6 +1089,60 @@ impl Kernel {
         self.ctx_addr = t.ctx_addr;
         self.tid = t.tid;
         self.clear_child_tid = t.clear_child_tid;
+        self.switch_signals(t.tid);
+    }
+
+    /// Make `tid`'s signal state the running one (see `thread_signals`).
+    fn switch_signals(&mut self, tid: i32) {
+        if tid == self.sig_tid {
+            return;
+        }
+        // A new kernel (and a forked child's) holds the state of the one
+        // thread it has, whatever its tid: the first thread in adopts it.
+        if self.sig_tid == 0 {
+            self.sig_tid = tid;
+            return;
+        }
+        let saved = self.signals.save_thread();
+        self.thread_signals.insert(self.sig_tid, saved);
+        let call = PendingCall {
+            retry_accept: self.retry_accept.take(),
+            write_blocked: std::mem::take(&mut self.write_blocked),
+            retry_recvmsg: self.retry_recvmsg.take(),
+            restore_sigmask: self.restore_sigmask.take(),
+        };
+        if call != PendingCall::default() {
+            self.thread_calls.insert(self.sig_tid, call);
+        }
+        let call = self.thread_calls.remove(&tid).unwrap_or_default();
+        self.retry_accept = call.retry_accept;
+        self.write_blocked = call.write_blocked;
+        self.retry_recvmsg = call.retry_recvmsg;
+        self.restore_sigmask = call.restore_sigmask;
+        let next = self
+            .thread_signals
+            .remove(&tid)
+            .unwrap_or_else(|| crate::signal::ThreadSignals::new_thread(self.signals.blocked));
+        self.signals.load_thread(next);
+        self.sig_tid = tid;
+    }
+
+    /// Whether a signal is ready for thread `tid` (the host's wait loops ask
+    /// for the thread that is waiting, which need not be the one whose state
+    /// is loaded).
+    pub fn signal_pending_for(&mut self, tid: i32) -> bool {
+        if tid == self.sig_tid {
+            return self.signal_pending();
+        }
+        self.collect_signals();
+        self.check_timers();
+        match self.thread_signals.get(&tid) {
+            Some(t) => {
+                let ready = (self.signals.pending_raw_for(t) ) & !t.blocked;
+                ready != 0
+            }
+            None => self.signals.has_pending(),
+        }
     }
 
     /// Copy back what the syscall changed about the calling thread.
@@ -1107,6 +1202,10 @@ impl Kernel {
             pins: std::collections::HashMap::new(),
             place: None,
             armed_place: None,
+            syscall_pc: 0,
+            thread_signals: std::collections::HashMap::new(),
+            thread_calls: std::collections::HashMap::new(),
+            sig_tid: 0,
             armed_pin: None,
             compat: false,
             fd_activity: false,
@@ -1333,6 +1432,10 @@ impl Kernel {
             // same library must be given the same address its parent was.
             place: self.place.clone(),
             armed_place: None,
+            syscall_pc: 0,
+            thread_signals: std::collections::HashMap::new(),
+            thread_calls: std::collections::HashMap::new(),
+            sig_tid: 0,
             armed_pin: None,
             compat: self.compat,
             fd_activity: false,
@@ -1426,6 +1529,8 @@ impl Kernel {
             m.write_u32(child_tid, tid as u32)?;
         }
         self.live_threads += 1;
+        // The new thread's signal state: its creator's mask, nothing pending.
+        self.thread_signals.insert(tid, crate::signal::ThreadSignals::new_thread(self.signals.blocked));
         Ok(SpawnRequest {
             ctx_addr: child,
             tid,
@@ -1455,6 +1560,7 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        self.syscall_pc = pc;
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
             .unwrap_or(!0);
@@ -1525,7 +1631,10 @@ impl Kernel {
             return match self.sigreturn(m) {
                 Ok(pc) => {
                     if self.trace {
-                        eprintln!("[gex:{}] rt_sigreturn -> 0x{pc:x}", self.pid);
+                        eprintln!(
+                            "[gex:{}.{}] rt_sigreturn -> 0x{pc:x}, blocked {:#x}",
+                            self.pid, self.tid, self.signals.blocked
+                        );
                     }
                     // The restored context is in ctx, PC included.
                     if self.wasm32 {
@@ -1701,6 +1810,10 @@ impl Kernel {
                 eprintln!("[gex:{}] exit({}) (thread {})", self.pid, a[0] as i32, self.tid);
             }
             self.thread_exit(m);
+            // Its signal state goes with it; the next thread to enter loads
+            // its own.
+            self.thread_signals.remove(&self.tid);
+            self.thread_calls.remove(&self.tid);
             return SyscallOutcome::ThreadExit;
         }
 
@@ -1719,7 +1832,7 @@ impl Kernel {
                         .collect();
                     eprintln!("[gex:{}] {} blocking on [{}]", self.pid, syscall_name(n), want.join(" "));
                 } else {
-                    eprintln!("[gex:{}] {} blocking", self.pid, syscall_name(n));
+                    eprintln!("[gex:{}.{}] {} blocking", self.pid, self.tid, syscall_name(n));
                 }
             }
             self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
@@ -1776,8 +1889,10 @@ impl Kernel {
         };
         if self.trace {
             eprintln!(
-                "[gex:{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
+                "[gex:{}{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
                 self.pid,
+                // The thread, when it is not the process's first.
+                if self.tid != self.pid { format!(".{}", self.tid) } else { String::new() },
                 syscall_name(n),
                 a[0],
                 a[1],
@@ -1785,6 +1900,22 @@ impl Kernel {
                 traced_path(m, n, a),
                 ret as i64
             );
+            // `GEX_STRACE_STACK=N`: the top N stack words too, which in a
+            // libc syscall wrapper start with the caller's return address --
+            // enough to tell who made a call without a debugger.
+            static STACK_WORDS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let words = *STACK_WORDS.get_or_init(|| {
+                std::env::var("GEX_STRACE_STACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            });
+            if words > 0 {
+                if let Ok(sp) = m.read_u64(self.ctx_addr + ctx::SP as u64) {
+                    let ws: Vec<String> = (0..words)
+                        .filter_map(|i| m.read_u64(sp + 8 * i).ok())
+                        .map(|w| format!("{w:#x}"))
+                        .collect();
+                    eprintln!("[gex:{}]   sp={sp:#x}: {}", self.pid, ws.join(" "));
+                }
+            }
         }
         let _ = set_result(m, self.ctx_addr, ret);
 
@@ -1990,6 +2121,29 @@ impl Kernel {
             nr::FUTEX => {
                 let operation =
                     (a[1] as u32) & !(futex::op::PRIVATE_FLAG | futex::op::CLOCK_REALTIME);
+                if operation == futex::op::LOCK_PI || operation == futex::op::LOCK_PI2 {
+                    let mapped = self.mem.vmas().iter().any(|v| a[0] >= v.start && a[0] + 4 <= v.end);
+                    if !mapped || a[0] % 4 != 0 {
+                        return None;
+                    }
+                    // An absolute time (CLOCK_REALTIME for LOCK_PI, the
+                    // monotonic clock for LOCK_PI2: one clock in gex).
+                    let deadline = if a[3] == 0 {
+                        None
+                    } else {
+                        let secs = m.read_u64(a[3]).ok()?;
+                        let nanos = m.read_u64(a[3] + 8).ok()?;
+                        let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
+                        let left = want.saturating_sub(self.now_nanos()).min(3600 * 1_000_000_000);
+                        Some(std::time::Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32))
+                    };
+                    return Some(BlockOp::FutexLockPi {
+                        table: Arc::clone(&self.futexes),
+                        uaddr: a[0],
+                        tid: self.tid as u32,
+                        deadline,
+                    });
+                }
                 if operation != futex::op::WAIT && operation != futex::op::WAIT_BITSET {
                     return None;
                 }
@@ -2146,8 +2300,9 @@ impl Kernel {
         }
         if self.trace {
             eprintln!(
-                "[gex:{}] after blocking: delivery {:?}, pending {:#x}, blocked {:#x}",
+                "[gex:{}.{}] after blocking: delivery {:?}, pending {:#x}, blocked {:#x}",
                 self.pid,
+                self.tid,
                 delivery,
                 self.signals.pending_raw(),
                 self.signals.blocked
@@ -2224,7 +2379,7 @@ impl Kernel {
             // ENOSYS, which sqlite reports as SQLITE_IOERR ("disk I/O error")
             // and refuses to write any file-backed database.
             nr::FSYNC | nr::FDATASYNC => self.fds.get(a[0] as i32).map(|_| 0),
-            nr::FACCESSAT | nr::FACCESSAT2 => self.sys_faccessat(m, a[0] as i32, a[1]),
+            nr::FACCESSAT | nr::FACCESSAT2 => self.sys_faccessat(m, a[0] as i32, a[1], a[2] as u32),
             nr::READLINKAT => self.sys_readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.sys_getcwd(m, a[0], a[1]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
@@ -2413,6 +2568,20 @@ impl Kernel {
                 std::thread::yield_now();
                 Ok(0)
             }
+            // Scheduling policy: every guest thread runs SCHED_OTHER at
+            // priority 0, which is what these report. Setting a normal policy
+            // is accepted; a real-time one is refused as for an unprivileged
+            // process. Mono treats a failed priority query as fatal.
+            nr::SCHED_GETSCHEDULER => Ok(0),
+            nr::SCHED_GETPARAM => self.sys_sched_getparam(m, a[1]),
+            nr::SCHED_SETPARAM => Ok(0),
+            nr::SCHED_SETSCHEDULER => match a[1] & 0xff {
+                1 | 2 => Err(Errno::EPERM),
+                0 | 3 | 5 => Ok(0),
+                _ => Err(Errno::EINVAL),
+            },
+            nr::SCHED_GET_PRIORITY_MAX => Ok(if matches!(a[0], 1 | 2) { 99 } else { 0 }),
+            nr::SCHED_GET_PRIORITY_MIN => Ok(if matches!(a[0], 1 | 2) { 1 } else { 0 }),
             // Scheduling niceness: we run every guest thread at the default
             // priority, so report nice 0 and accept any set as a no-op. The
             // raw getpriority ABI returns `20 - nice` (kept non-negative so a
@@ -2432,18 +2601,8 @@ impl Kernel {
             nr::RT_SIGPROCMASK => self.sys_rt_sigprocmask(m, a[0] as u32, a[1], a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(m, a[0]),
             nr::SIGALTSTACK => self.sys_sigaltstack(m, a[0], a[1]),
-            // `tkill` and `tgkill` address a thread, and every thread of a
-            // process shares this kernel, so they raise here directly.
-            nr::TKILL | nr::TGKILL => {
-                let signo = if n == nr::TKILL { a[1] } else { a[2] } as u32;
-                if signo > 0 {
-                    self.signals.raise_from(
-                        signo,
-                        crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid },
-                    );
-                }
-                Ok(0)
-            }
+            // `tkill` and `tgkill` address a thread: see `sys_tgkill`.
+            nr::TKILL | nr::TGKILL => self.sys_tgkill(n, a),
             // `kill` addresses a process, which may be any process on the
             // system. It goes through the table, which leaves the signal
             // pending for the target to collect at its next syscall.
@@ -2516,6 +2675,43 @@ impl Kernel {
                 Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
             }
             futex::op::WAKE | futex::op::WAKE_BITSET => Ok(self.futexes.wake(uaddr, val)),
+            // LOCK_PI reaches here only when `blocking_op` refused it: a
+            // word the process does not have, or misaligned.
+            futex::op::LOCK_PI | futex::op::LOCK_PI2 => {
+                Err(if uaddr % 4 != 0 { Errno::EINVAL } else { Errno::EFAULT })
+            }
+            // Release a PI lock this thread owns, and wake one waiter, which
+            // takes it in its own `FUTEX_LOCK_PI` loop.
+            futex::op::UNLOCK_PI => {
+                let tid = self.tid as u32;
+                loop {
+                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                    if v & futex::pi::TID_MASK != tid {
+                        return Err(Errno::EPERM);
+                    }
+                    if gex_atomic::cas_u32(m.bytes, uaddr, v, 0).ok_or(Errno::EFAULT)?.is_ok() {
+                        break;
+                    }
+                }
+                self.futexes.wake(uaddr, 1);
+                Ok(0)
+            }
+            futex::op::TRYLOCK_PI => {
+                let tid = self.tid as u32;
+                loop {
+                    let v = gex_atomic::load_u32(m.bytes, uaddr).ok_or(Errno::EFAULT)?;
+                    match v & futex::pi::TID_MASK {
+                        0 => {
+                            let new = tid | (v & futex::pi::WAITERS);
+                            if gex_atomic::cas_u32(m.bytes, uaddr, v, new).ok_or(Errno::EFAULT)?.is_ok() {
+                                return Ok(0);
+                            }
+                        }
+                        owner if owner == tid => return Err(Errno::EDEADLK),
+                        _ => return Err(Errno::EAGAIN),
+                    }
+                }
+            }
             // Requeue is an optimisation for condition variables; waking
             // everyone is correct, if less efficient.
             futex::op::REQUEUE | futex::op::CMP_REQUEUE => Ok(self.futexes.wake(uaddr, u32::MAX)),
@@ -2712,6 +2908,16 @@ impl Kernel {
         if !self.signals.has_pending() {
             return Delivery::None;
         }
+        if self.trace {
+            eprintln!(
+                "[gex:{}.{}] delivering signal {} (pending {:#x}, blocked {:#x})",
+                self.pid,
+                self.sig_tid,
+                self.signals.peek_deliverable().unwrap_or(0),
+                self.signals.pending_raw(),
+                self.signals.blocked
+            );
+        }
         signal::dispatch(&mut self.signals, m, self.ctx_addr, self.compat).unwrap_or(Delivery::None)
     }
 
@@ -2731,7 +2937,7 @@ impl Kernel {
         }
         for signo in 1..=64u32 {
             if inbox & (1u64 << (signo - 1)) != 0 {
-                self.signals.raise(signo);
+                self.signals.raise_shared(signo, None);
             }
         }
         self.note_kill_senders(inbox);
@@ -2749,8 +2955,9 @@ impl Kernel {
             // and worth saying out loud: a process that will not wake looks
             // exactly like one nobody signalled.
             eprintln!(
-                "[gex:{}] signal pending {:#x} but blocked {:#x}",
+                "[gex:{}.{}] signal pending {:#x} but blocked {:#x}",
                 self.pid,
+                self.sig_tid,
                 self.signals.pending_raw(),
                 self.signals.blocked
             );
@@ -4098,9 +4305,12 @@ impl Kernel {
         let _ = self.procs.kill_group(self.pid, g, signo);
     }
 
-    fn sys_faccessat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> SysResult {
+    fn sys_faccessat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
-        self.vfs.metadata(&p).map(|_| 0)
+        // A root guest (`--uid 0`) may read and write anything; execute
+        // still needs an execute bit, which the host checks.
+        let mode = if self.uid == 0 { mode & 1 } else { mode & 7 };
+        self.vfs.access(&p, mode).map(|_| 0)
     }
 
     fn sys_readlinkat(
@@ -4493,11 +4703,14 @@ impl Kernel {
                     interval: timer.interval,
                 })
             };
-            self.signals.raise(match which {
-                ITIMER_VIRTUAL => signal::sig::SIGVTALRM,
-                ITIMER_PROF => signal::sig::SIGPROF,
-                _ => signal::sig::SIGALRM,
-            });
+            self.signals.raise_shared(
+                match which {
+                    ITIMER_VIRTUAL => signal::sig::SIGVTALRM,
+                    ITIMER_PROF => signal::sig::SIGPROF,
+                    _ => signal::sig::SIGALRM,
+                },
+                None,
+            );
         }
     }
 
@@ -4510,6 +4723,43 @@ impl Kernel {
             m.write_u64(mask, 1)?;
         }
         Ok(8)
+    }
+
+    /// `tkill(tid, sig)` and `tgkill(tgid, tid, sig)`: a thread-directed
+    /// signal goes to that thread. Mono's GC stops the world with
+    /// `tgkill(SIGPWR)` to each thread, and raising it on the caller instead
+    /// left the target running and the GC waiting.
+    fn sys_tgkill(&mut self, n: u64, a: [u64; 6]) -> SysResult {
+        let (tgid, tid, signo) = if n == nr::TKILL {
+            (self.pid, a[0] as i32, a[1] as u32)
+        } else {
+            (a[0] as i32, a[1] as i32, a[2] as u32)
+        };
+        if signo > crate::signal::sig::MAX || tid <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        if tgid != self.pid {
+            // Another process's thread: its process, as `kill` does.
+            return self.procs.kill(self.pid, tgid, signo).map(|_| 0);
+        }
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: self.pid, uid: self.uid };
+        if tid == self.tid {
+            if signo > 0 {
+                self.signals.raise_from(signo, source);
+            }
+        } else {
+            let Some(t) = self.thread_signals.get_mut(&tid) else { return Err(Errno::ESRCH) };
+            if signo > 0 {
+                t.raise_from(signo, source);
+            }
+        }
+        Ok(0)
+    }
+
+    /// `sched_getparam(pid, *param)`: priority 0, the only one there is.
+    fn sys_sched_getparam(&mut self, m: &mut GuestMem<'_>, param: u64) -> SysResult {
+        m.write_u32(param, 0)?;
+        Ok(0)
     }
 
     /// `statfs`. One filesystem, large and mostly empty, which is what a
@@ -4742,7 +4992,16 @@ impl Kernel {
                 }
             }
         }
-        let start = self.mem.mmap(addr, len, prot_bits, flags, "")?;
+        // The dynamic loader's reservation for an object (glibc maps an
+        // over-aligned library into anonymous PROT_NONE memory) will hold
+        // code, so in a 64-bit memory it stays below 4 GiB with the code; the
+        // loader runs at INTERP_BASE (docs/mem64.md §3).
+        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
+        let start = if from_loader {
+            self.mem.mmap_low(addr, len, prot_bits, flags, "")?
+        } else {
+            self.mem.mmap(addr, len, prot_bits, flags, "")?
+        };
         if let Some((path, base)) = pinned {
             self.pin_landed.push((path, base, start));
         }
@@ -4765,7 +5024,7 @@ impl Kernel {
         while sent != 0 {
             let signo = sent.trailing_zeros() + 1;
             sent &= sent - 1;
-            self.signals.raise(signo);
+            self.signals.raise_shared(signo, None);
         }
         self.note_kill_senders(taken);
     }
@@ -4774,9 +5033,9 @@ impl Kernel {
     /// sent as from their sender (`SI_USER`, `si_pid`), not the kernel.
     fn note_kill_senders(&mut self, taken: u64) {
         for (signo, pid) in self.procs.take_kill_senders(self.pid, taken) {
-            self.signals.raise_from(
+            self.signals.raise_shared(
                 signo,
-                crate::signal::Source { code: crate::signal::SI_USER, pid, uid: self.uid },
+                Some(crate::signal::Source { code: crate::signal::SI_USER, pid, uid: self.uid }),
             );
         }
     }
@@ -5323,7 +5582,7 @@ impl Kernel {
         // and `listen` is local to itself, and what the far end can see is
         // only whether the name answers.
         if let Some(r) = self.unix_remote {
-            let id = (r.bind)(path.as_ptr() as u32, path.len() as u32);
+            let id = (r.bind)(path.as_ptr() as crate::PAddr, path.len() as u32);
             if id < 0 {
                 return Err(Errno(-id));
             }
@@ -5365,7 +5624,7 @@ impl Kernel {
         // is in *this* process's table and never in the kernel's, so the
         // local path is still tried when the kernel does not know the name.
         if let Some(r) = self.unix_remote {
-            let id = (r.connect)(path.as_ptr() as u32, path.len() as u32);
+            let id = (r.connect)(path.as_ptr() as crate::PAddr, path.len() as u32);
             if id >= 0 {
                 let flags = self.fds.get(fd)?.flags();
                 let cloexec = self.fds.cloexec(fd).unwrap_or(false);
@@ -6312,6 +6571,12 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::GETITIMER => "getitimer",
         nr::SCHED_GETAFFINITY => "sched_getaffinity",
         nr::SCHED_YIELD => "sched_yield",
+        nr::SCHED_SETPARAM => "sched_setparam",
+        nr::SCHED_SETSCHEDULER => "sched_setscheduler",
+        nr::SCHED_GETSCHEDULER => "sched_getscheduler",
+        nr::SCHED_GETPARAM => "sched_getparam",
+        nr::SCHED_GET_PRIORITY_MAX => "sched_get_priority_max",
+        nr::SCHED_GET_PRIORITY_MIN => "sched_get_priority_min",
         nr::SETPRIORITY => "setpriority",
         nr::GETPRIORITY => "getpriority",
         nr::GETCPU => "getcpu",

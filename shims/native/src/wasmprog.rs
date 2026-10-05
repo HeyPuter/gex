@@ -74,7 +74,7 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
     // gex-kernel's wasm32 personality: signal frames and sigreturns stay in
     // the context for the program's syscall stub.
     store.data_mut().with_kernel(|k| k.wasm32 = true);
-    crate::ftab::publish_stateful(&shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: mem_base as u32 })?;
+    crate::ftab::publish_stateful(&shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: mem_base })?;
     // Instantiate it in this (the first) store now, and apply its data
     // relocations here. libprov applies them once per data address for the
     // whole host (`relocate_once`), which a program exec'd into a fresh

@@ -636,7 +636,11 @@ impl<'a> Emitter<'a> {
         if !gex_abi::X86 || bytes == 1 || crate::func::mutate("aligned-atomics") {
             return aligned;
         }
-        let ea = format!("((uint32_t)(uintptr_t)({p}))");
+        let ea = if gex_abi::mem64() {
+            format!("((uint64_t)(uintptr_t)({p}))")
+        } else {
+            format!("((uint32_t)(uintptr_t)({p}))")
+        };
         let start = self.block.start;
         self.line(format!("if (__builtin_expect({ea} < GEX_GUEST_FLOOR, 0)) {{"));
         self.flush_keep();
@@ -694,6 +698,22 @@ impl<'a> Emitter<'a> {
     }
 
     fn address(&self, addr: Value, offset: i64) -> String {
+        // A memory64 guest memory (docs/mem64.md): the guest address as it
+        // stands, as tier-1 does; the engine's check traps past the end.
+        if gex_abi::mem64() {
+            if let Some(c) = self.value_const[addr.0 as usize] {
+                return format!("GEX_P(0x{:x}ull)", c.wrapping_add(offset as u64));
+            }
+            let a = self.v(addr);
+            let max_static: i64 = if gex_abi::X86 { 0xffff } else { u32::MAX as i64 };
+            return if offset == 0 {
+                format!("GEX_P({a})")
+            } else if (0..=max_static).contains(&offset) {
+                format!("(GEX_P({a}) + {offset}u)")
+            } else {
+                format!("GEX_P({a} + (uint64_t){offset}ll)")
+            };
+        }
         // An i386 base-plus-displacement address (`value_disp`): the
         // displacement rides on the guarded base, as tier-1's static offset
         // does. Only a sum past 2^32 (which the guest would wrap to low
@@ -742,6 +762,9 @@ impl<'a> Emitter<'a> {
 
     /// The guarded 32-bit address of a bulk operation's operand (no offset).
     fn bulk_address(&self, v: &str) -> String {
+        if gex_abi::mem64() {
+            return format!("(uint64_t)({v})");
+        }
         if no_guard() || self.unguarded() {
             format!("(uint32_t)({v})")
         } else {
@@ -863,10 +886,11 @@ impl<'a> Emitter<'a> {
                 let s = self.bulk_address(&self.v(*src));
                 let n = self.v(*len);
                 self.line("{");
-                self.line(format!("  uint32_t d = {d}, s = {s}; uint64_t n = {n}, room;"));
+                let (at, nc) = addr_c();
+                self.line(format!("  {at} d = {d}, s = {s}; uint64_t n = {n}, room;"));
                 self.clamp("d");
                 self.clamp("s");
-                self.line("  __builtin_memmove(GEX_P(d), GEX_P(s), (uint32_t)n);");
+                self.line(format!("  __builtin_memmove(GEX_P(d), GEX_P(s), ({nc})n);"));
                 self.line("}");
             }
             Stmt::MemFill { dst, val, len } => {
@@ -874,9 +898,10 @@ impl<'a> Emitter<'a> {
                 let v = self.v(*val);
                 let n = self.v(*len);
                 self.line("{");
-                self.line(format!("  uint32_t d = {d}; uint64_t n = {n}, room;"));
+                let (at, nc) = addr_c();
+                self.line(format!("  {at} d = {d}; uint64_t n = {n}, room;"));
                 self.clamp("d");
-                self.line(format!("  __builtin_memset(GEX_P(d), (int)(uint32_t){v}, (uint32_t)n);"));
+                self.line(format!("  __builtin_memset(GEX_P(d), (int)(uint32_t){v}, ({nc})n);"));
                 self.line("}");
             }
             Stmt::MemCmp { dst, a, b, len } => {
@@ -938,7 +963,12 @@ impl<'a> Emitter<'a> {
     }
 
     /// `tier1::clamp_len` for one base: `n = min(n, GUEST_LIMIT - base)`.
+    /// Nothing for a memory64 guest memory.
     fn clamp(&mut self, base: &str) {
+        // A memory64 guest memory needs none: an op past its end traps.
+        if gex_abi::mem64() {
+            return;
+        }
         self.line(format!(
             "  room = 0x{GUEST_LIMIT:x}ull - (uint64_t){base}; n = n < room ? n : room;"
         ));
@@ -993,7 +1023,16 @@ impl<'a> Emitter<'a> {
         self.line(format!(
             "  uint64_t lstep = {df} ? (uint64_t)-{bytes}ll : {bytes}ull;"
         ));
-        let g = |e: &str| if no_guard() { format!("(uint32_t)({e})") } else { format!("gex_g({e})") };
+        let g = |e: &str| {
+            if gex_abi::mem64() {
+                format!("(uint64_t)({e})")
+            } else if no_guard() {
+                format!("(uint32_t)({e})")
+            } else {
+                format!("gex_g({e})")
+            }
+        };
+        let (at, nc) = addr_c();
         if matches!(kind, StrKind::Movs | StrKind::Stos) {
             self.line(format!("  if (!{df} && lc != 0) {{"));
             match kind {
@@ -1002,13 +1041,13 @@ impl<'a> Emitter<'a> {
                         "    if ((ld <= ls) | (ld >= ls + lc * {bytes}ull)) {{"
                     ));
                     self.line(format!(
-                        "      uint32_t d = {}, s = {}; uint64_t n = lc * {bytes}ull, room;",
+                        "      {at} d = {}, s = {}; uint64_t n = lc * {bytes}ull, room;",
                         g("ld"),
                         g("ls")
                     ));
                     self.clamp("  d");
                     self.clamp("  s");
-                    self.line("      __builtin_memmove(GEX_P(d), GEX_P(s), (uint32_t)n);");
+                    self.line(format!("      __builtin_memmove(GEX_P(d), GEX_P(s), ({nc})n);"));
                 }
                 _ => {
                     if bytes > 1 {
@@ -1024,11 +1063,11 @@ impl<'a> Emitter<'a> {
                         self.line("    if (1) {");
                     }
                     self.line(format!(
-                        "      uint32_t d = {}; uint64_t n = lc * {bytes}ull, room;",
+                        "      {at} d = {}; uint64_t n = lc * {bytes}ull, room;",
                         g("ld")
                     ));
                     self.clamp("  d");
-                    self.line("      __builtin_memset(GEX_P(d), (int)(uint32_t)lv, (uint32_t)n);");
+                    self.line(format!("      __builtin_memset(GEX_P(d), (int)(uint32_t)lv, ({nc})n);"));
                 }
             }
             self.line(format!(
@@ -1867,3 +1906,12 @@ pub fn clobbers(s: &Stmt) -> bool {
     }
 }
 
+/// The C types of a bulk operation's addresses and length: 32-bit for a
+/// wasm32 guest memory, 64-bit for memory64 (docs/mem64.md).
+fn addr_c() -> (&'static str, &'static str) {
+    if gex_abi::mem64() {
+        ("uint64_t", "uint64_t")
+    } else {
+        ("uint32_t", "uint32_t")
+    }
+}

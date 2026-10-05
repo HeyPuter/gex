@@ -33,7 +33,8 @@ pub struct Jit {
     st: Mutex<State>,
     /// Entries tier-1 serves with a host builtin (`memcpy` and friends, by
     /// symbol): their functions are the builtin, as in tier-1.
-    intrinsics: HashMap<u64, Intrinsic>,
+    /// Replaced on `execve` ([`Jit::exec`]).
+    intrinsics: std::sync::RwLock<HashMap<u64, Intrinsic>>,
 }
 
 #[derive(Default)]
@@ -60,7 +61,22 @@ struct State {
 
 impl Jit {
     pub fn new(intrinsics: HashMap<u64, Intrinsic>) -> Jit {
-        Jit { intrinsics, ..Jit::default() }
+        Jit { intrinsics: std::sync::RwLock::new(intrinsics), ..Jit::default() }
+    }
+
+    /// The process replaced its program (`execve`): forget everything
+    /// learned of the old one -- its function starts, never-returning
+    /// functions, read-only ranges and builtins sit at addresses the new
+    /// image now holds (a PIE replacing a PIE lands at the same base) --
+    /// and start over from `image`.
+    pub fn exec(&self, intrinsics: HashMap<u64, Intrinsic>, image: &gex_ld::Image, elf: Option<&[u8]>) {
+        *self.intrinsics.write().unwrap_or_else(|e| e.into_inner()) = intrinsics;
+        {
+            let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+            let State { modules, functions, recover_us, emit_us, bytes, .. } = std::mem::take(&mut *st);
+            *st = State { modules, functions, recover_us, emit_us, bytes, ..State::default() };
+        }
+        self.add_image(image, elf);
     }
 
     /// What the loader knows of an image the program maps: its function
@@ -94,6 +110,7 @@ impl Jit {
         addr: u64,
         executable: &dyn Fn(u64) -> bool,
         read_only: &dyn Fn(u64, u64) -> bool,
+        volatile: &dyn Fn(u64) -> bool,
         page_gen: &dyn Fn(u64) -> u32,
         class32: bool,
     ) -> Option<Vec<u8>> {
@@ -107,6 +124,7 @@ impl Jit {
         if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
             eprintln!("[fjit] translate {addr:#x}: bytes {:02x?}", &mem[addr as usize..addr as usize + 16]);
         }
+        let intrinsics = self.intrinsics.read().unwrap_or_else(|e| e.into_inner());
         let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
         let readonly = st.readonly.clone();
         let ro = |a: u64, n: u64| readonly.iter().any(|&(lo, hi)| a >= lo && a.saturating_add(n) <= hi) || read_only(a, n);
@@ -134,7 +152,22 @@ impl Jit {
                 }
                 continue;
             }
-            if !self.intrinsics.contains_key(&a) {
+            // Code in writable-and-executable memory (a JIT's) may be
+            // rewritten with nothing to announce it: tier-1 checks each
+            // block's bytes there (`Block::guard`); a function checks only
+            // its pages' generations on entry, so it would run whatever a
+            // direct jump reached when it was translated -- in a JIT's
+            // fresh area, often bytes not yet written. It stays tier-1.
+            if f.blocks.iter().any(|b| !b.synthetic && (volatile(b.start) || volatile(b.end.max(b.start + 1) - 1))) {
+                if std::env::var_os("GEX_FJIT_STATS").is_some() {
+                    eprintln!("[fjit] {a:#x}: code in writable memory; left to the fallback");
+                }
+                if a == addr {
+                    return None;
+                }
+                continue;
+            }
+            if !intrinsics.contains_key(&a) {
                 for c in f.call_sites() {
                     match c.callee {
                         Callee::Direct(t) => work.push_back(t),
@@ -183,7 +216,7 @@ impl Jit {
         let n = functions.len();
         let builtins: Vec<gex_ir::Block> = order
             .iter()
-            .filter_map(|a| self.intrinsics.get(a).map(|&k| crate::intrinsic::block(*a, k)))
+            .filter_map(|a| intrinsics.get(a).map(|&k| crate::intrinsic::block(*a, k)))
             .collect();
         let pops = ret_pops(&functions, class32, &|a| mem.get(a as usize).copied());
         if let Ok(dir) = std::env::var("GEX_FJIT_DUMP") {

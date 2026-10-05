@@ -67,6 +67,37 @@ pub enum Intrinsic {
 /// run.
 pub const REPLACE_SYSREG: i32 = -200;
 
+/// The memcpy/memmove/memset/mempcpy definitions in `image`'s own text, by
+/// address (`Symbol::value` is already biased), for `Options::intrinsics`:
+/// a plain build and `gexc run` serve them with the host builtins, as closure
+/// builds and the browser's runtime translator do, so every path agrees on
+/// what those functions are.
+///
+/// Not for 32-bit (i386) images: `intrinsic::block` reads the 64-bit
+/// register arguments and pops an 8-byte return address, while i386 cdecl
+/// passes them on the stack.
+pub fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, Intrinsic> {
+    if image.class32 {
+        return Default::default();
+    }
+    let (tlo, thi) = image.text_range;
+    image
+        .symbols
+        .iter()
+        .filter(|s| !s.ifunc && s.value >= tlo && s.value < thi)
+        .filter_map(|s| recognise(&s.name).map(|k| (s.value, k)))
+        .collect()
+}
+
+/// [`image_intrinsics`] for a program: its executable and its dynamic linker.
+pub fn program_intrinsics(program: &gex_ld::Program) -> std::collections::HashMap<u64, Intrinsic> {
+    let mut m = image_intrinsics(&program.exe);
+    if let Some(i) = &program.interp {
+        m.extend(image_intrinsics(i));
+    }
+    m
+}
+
 /// The intrinsic a symbol names, if it names one. Matches both the public name
 /// and glibc's private `__memcpy_*` implementations, since on aarch64 the
 /// public name is an IFUNC and never appears as a `STT_FUNC` symbol.

@@ -28,15 +28,19 @@ fn prefix(ra: &RunArgs) -> Result<String> {
 /// The Windows environment: the variables Wine's prefix would give a
 /// program, then `--env` overrides. The Linux environment is not passed on
 /// (it means nothing to a Windows program), except `WINEDEBUG`, which Wine's
-/// PE DLLs read to decide what to trace.
+/// PE DLLs read to decide what to trace, and `WINEDLLOVERRIDES`, the load
+/// order the NT layer applies to image sections.
 fn environment(extra: &[String]) -> Vec<(String, String)> {
     let mut env = nt::boot::default_environment();
     let mut set = |k: &str, v: &str| match env.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(k)) {
         Some(e) => e.1 = v.to_string(),
         None => env.push((k.to_string(), v.to_string())),
     };
-    if let Ok(v) = std::env::var("WINEDEBUG") {
-        set("WINEDEBUG", &v);
+    // And the load order (DllOverrides), which Wine reads the same way.
+    for k in ["WINEDEBUG", "WINEDLLOVERRIDES"] {
+        if let Ok(v) = std::env::var(k) {
+            set(k, &v);
+        }
     }
     for e in extra {
         if let Some((k, v)) = e.split_once('=') {

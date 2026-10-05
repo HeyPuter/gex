@@ -344,12 +344,12 @@ pub struct Remote {
     /// How many writes have ever put bytes in. Negative when the pipe is gone.
     pub writes: extern "C" fn(id: i32) -> i32,
     /// The last message written, into the caller's memory. Returns its length.
-    pub last_message: extern "C" fn(id: i32, at: u32, cap: u32) -> i32,
+    pub last_message: extern "C" fn(id: i32, at: crate::PAddr, cap: u32) -> i32,
     /// Drop a descriptor. The last one on an end is what a reader sees as EOF.
     pub close_end: extern "C" fn(id: i32, write: i32),
     /// Read into, or write out of, an address in the caller's memory.
-    pub read: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
-    pub write: extern "C" fn(id: i32, at: u32, len: u32) -> i32,
+    pub read: extern "C" fn(id: i32, at: crate::PAddr, len: u32) -> i32,
+    pub write: extern "C" fn(id: i32, at: crate::PAddr, len: u32) -> i32,
     pub readable: extern "C" fn(id: i32) -> i32,
     pub writable: extern "C" fn(id: i32) -> i32,
     pub buffered: extern "C" fn(id: i32) -> i32,
@@ -385,7 +385,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         if self.write {
             return Err(Errno::EBADF);
         }
-        match (self.remote.read)(self.id, buf.as_mut_ptr() as u32, buf.len() as u32) {
+        match (self.remote.read)(self.id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
@@ -395,7 +395,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         if !self.write {
             return Err(Errno::EBADF);
         }
-        match (self.remote.write)(self.id, buf.as_ptr() as u32, buf.len() as u32) {
+        match (self.remote.write)(self.id, buf.as_ptr() as crate::PAddr, buf.len() as u32) {
             n if n >= 0 => Ok(n as u64),
             n => Err(Errno(-n)),
         }
@@ -463,7 +463,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         };
         let n = (self.remote.writes)(self.id);
         let mut buf = [0u8; 180];
-        let got = (self.remote.last_message)(self.id, buf.as_mut_ptr() as u32, buf.len() as u32);
+        let got = (self.remote.last_message)(self.id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32);
         let said = if got > 0 {
             format!(", last {:?}", String::from_utf8_lossy(&buf[..got as usize]))
         } else {

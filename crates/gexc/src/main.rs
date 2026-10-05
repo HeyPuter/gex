@@ -128,7 +128,7 @@ usage:
                                    through DT_NEEDED, each at the base a
                                    pinned run places it, writing one module
                                    per object and the layout beside them)
-  gexc seed   -o <out.wasm>        write a module that translates nothing, for
+  gexc seed   -o <out.wasm> [--mem64]  write a module that translates nothing, for
                                    a host that will translate at runtime and
                                    does not know the program in advance
   gexc closure <elf> --sysroot DIR
@@ -153,7 +153,7 @@ usage:
                                    and gets one built for the next run.
                                    --cgen: every program image must have one;
                                    --no-cgen: tier-1 only
-  gexc cgen-image <pe> [--pe-base HEX] [--jobs N]
+  gexc cgen-image <pe> [--pe-base HEX] [--jobs N] [--mem64]
                                    build a PE image's function-tier unit (the
                                    whole image, as C, compiled and cached) for
                                    `gexc run --cgen`, which installs it when the
@@ -282,6 +282,9 @@ struct RunArgs {
     /// `--no-cgen`: a Windows program runs on tier-1 only, prebuilt units or
     /// not (`gex_native::nt_cgen::Mode`).
     no_cgen: bool,
+    /// `--mem64` / `--mem32`: the guest memory, overriding the learned
+    /// record (docs/mem64.md §5). `None`: the record decides.
+    mem64: Option<bool>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs> {
@@ -297,6 +300,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut fjit = false;
     let mut fjit_image = false;
     let mut no_cgen = false;
+    let mut mem64 = None;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
     let mut i = 0;
@@ -376,6 +380,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--fjit-image" => fjit_image = true,
             "--no-cgen" => no_cgen = true,
             "--no-cache" => opts.cache = false,
+            "--mem64" => mem64 = Some(true),
+            "--mem32" => mem64 = Some(false),
             "--cwd" => {
                 i += 1;
                 let v = args.get(i).context("--cwd needs a directory")?;
@@ -441,6 +447,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
         jit: !no_jit,
         wine_prefix,
         no_cgen,
+        mem64,
     })
 }
 
@@ -518,36 +525,80 @@ fn build_pe_image(
     Ok(())
 }
 
-/// The memcpy/memmove/memset/mempcpy definitions in `image`'s own text, by
-/// address (`Symbol::value` is already biased), for `Options::intrinsics`:
-/// a plain build and `gexc run` serve them with the host builtins, as closure
-/// builds and the browser's runtime translator do, so every path agrees on
-/// what those functions are.
-///
-/// Not for 32-bit (i386) images: `intrinsic::block` reads the 64-bit
-/// register arguments and pops an 8-byte return address, while i386 cdecl
-/// passes them on the stack.
-fn image_intrinsics(image: &gex_ld::Image) -> std::collections::HashMap<u64, gex_xlate::Intrinsic> {
-    if image.class32 {
-        return Default::default();
-    }
-    let (tlo, thi) = image.text_range;
-    image
-        .symbols
-        .iter()
-        .filter(|s| !s.ifunc && s.value >= tlo && s.value < thi)
-        .filter_map(|s| gex_xlate::intrinsic::recognise(&s.name).map(|k| (s.value, k)))
-        .collect()
-}
-
 /// `gexc run --fjit`: the function JIT serves the function table's misses.
 struct FjitTranslator(gex_xlate::fjit::Jit);
 
 impl gex_kernel::ftab::Translator for FjitTranslator {
     fn translate(&self, req: &gex_kernel::ftab::Request<'_>) -> Option<gex_kernel::ftab::Translated> {
         self.0
-            .translate(req.mem, req.addr, req.executable, req.read_only, req.page_gen, req.class32)
+            .translate(req.mem, req.addr, req.executable, req.read_only, req.volatile, req.page_gen, req.class32)
             .map(|wasm| gex_kernel::ftab::Translated { wasm })
+    }
+
+    fn exec(&self, program: &gex_ld::Program, bytes: &[u8]) {
+        self.0.exec(gex_xlate::intrinsic::program_intrinsics(program), &program.exe, Some(bytes));
+    }
+}
+
+/// The guest memory for this run (docs/mem64.md §5): `--mem64`/`--mem32`,
+/// else what an earlier run of the same image learned. `wide` is whether
+/// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
+/// has a wasm32 memory.
+/// Native wasm libraries in place of guest ones, as stateful providers
+/// (`libprov`): `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` (stream W, docs/
+/// wine-native.md W0(b)) binds each module's `gexp_<export>` functions at
+/// that DLL's exports when it maps. A Linux shared object is named by its
+/// file name (`libmonobdwgc-2.0.so=mono.wasm`, docs/unity-dotnet.md).
+fn set_wasm_libs() -> Result<()> {
+    if let Ok(v) = std::env::var("GEX_WASM_DLLS") {
+        let libs = v
+            .split(',')
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                let (dll, wasm) = e.split_once('=').context("GEX_WASM_DLLS: want dll=module.wasm")?;
+                Ok(gex_native::libprov::LibProvider {
+                    name: dll.to_string(),
+                    dlls: vec![dll.to_ascii_lowercase()],
+                    wasm: std::path::PathBuf::from(wasm),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        gex_native::libprov::set(libs);
+    }
+    Ok(())
+}
+
+fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
+    if ra.mem64 == Some(true) && !wide {
+        bail!("--mem64: {} is a 32-bit program, which cannot address more than 4 GiB", ra.path);
+    }
+    let m64 = wide && ra.mem64.unwrap_or_else(|| gex_cache::mem64_recorded(bytes));
+    if m64 && ra.mem64.is_none() {
+        eprintln!("gex: {} runs with a 64-bit memory (an earlier run needed more than 4 GiB)", ra.path);
+    }
+    ra.opts.mem = if m64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 };
+    // Everything translated in this process targets it.
+    gex_abi::set_mem_flavor(ra.opts.mem);
+    Ok(())
+}
+
+/// After a 64-bit guest's wasm32 run: if it ran out of address space,
+/// record it so the next start has a 64-bit memory (docs/mem64.md §5).
+fn learn_mem(ra: &RunArgs, bytes: &[u8], wide: bool) {
+    if !wide || ra.opts.mem.is_64() || ra.mem64 == Some(false) {
+        return;
+    }
+    let short = gex_kernel::mem::ADDRESS_SPACE_SHORT.load(std::sync::atomic::Ordering::Relaxed);
+    if short == 0 {
+        return;
+    }
+    if let Some(p) = gex_cache::record_mem64(bytes, &ra.path, short) {
+        eprintln!(
+            "gex: {} needs more than 4 GiB of address space (a request for {short:#x} bytes did not fit); \
+             it runs with --mem64 from the next start ({})",
+            ra.path,
+            p.display()
+        );
     }
 }
 
@@ -573,26 +624,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         } else {
             Mode::Default
         });
-        // Native wasm DLLs (stream W, docs/wine-native.md W0(b)):
-        // `GEX_WASM_DLLS=demo.dll=demo.wasm[,...]` binds each module's
-        // `gexp_<export>` functions at that DLL's exports when it maps (a
-        // stateful provider, `libprov`).
-        if let Ok(v) = std::env::var("GEX_WASM_DLLS") {
-            let libs = v
-                .split(',')
-                .filter(|e| !e.is_empty())
-                .map(|e| {
-                    let (dll, wasm) = e.split_once('=').context("GEX_WASM_DLLS: want dll=module.wasm")?;
-                    Ok(gex_native::libprov::LibProvider {
-                        name: dll.to_string(),
-                        dlls: vec![dll.to_ascii_lowercase()],
-                        wasm: std::path::PathBuf::from(wasm),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            gex_native::libprov::set(libs);
-        }
+        let wide = gex_kernel::nt::boot::exe_abi(&bytes).is_some_and(|a| a == gex_kernel::nt::Abi::P64);
+        choose_mem(&mut ra, &bytes, wide)?;
+        set_wasm_libs()?;
         let exit = nt_run::run(&ra, &bytes)?;
+        learn_mem(&ra, &bytes, wide);
         if let Some(dir) = gex_native::profile::finish(&exit)? {
             if ra.opts.verbose {
                 eprintln!("[gex] profile and session manifest written to {}", dir.display());
@@ -611,10 +647,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         std::fs::read(host).ok()
     })
     .with_context(|| format!("loading {}", ra.path))?;
-    ra.xlate.intrinsics = image_intrinsics(&program.exe);
-    if let Some(i) = &program.interp {
-        ra.xlate.intrinsics.extend(image_intrinsics(i));
-    }
+    ra.xlate.intrinsics = gex_xlate::intrinsic::program_intrinsics(&program);
     if ra.xlate.no_blocks {
         let jit = gex_xlate::fjit::Jit::new(ra.xlate.intrinsics.clone());
         jit.add_image(&program.exe, Some(&bytes));
@@ -653,7 +686,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     if ra.opts.record.is_some() {
         gex_native::profile::set_exe_host_path(ra.path.clone().into());
     }
+    let wide = !program.compat();
+    choose_mem(&mut ra, &bytes, wide)?;
+    set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
+    learn_mem(&ra, &bytes, wide);
     if let Some(dir) = gex_native::profile::finish(&exit)? {
         if ra.opts.verbose {
             eprintln!("[gex] profile and session manifest written to {}", dir.display());
@@ -701,6 +738,8 @@ fn cmd_seed(args: &[String]) -> Result<()> {
                 out = Some(args.get(i).context("-o needs a path")?.clone());
             }
             "--no-shared-memory" => shared_memory = false,
+            // The seed for the wasm64 (memory64) browser shim.
+            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             other => bail!("unexpected argument {other}"),
         }
         i += 1;
@@ -779,6 +818,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             }
             "--no-shared-memory" => shared_memory = false,
             // Only for looking at a module that is known not to validate.
+            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             "--no-validate" => no_validate = true,
             // Translate the whole program: the executable and every DT_NEEDED
             // object, each at its pinned base. Without this a build translates
@@ -868,7 +908,7 @@ fn cmd_build(args: &[String]) -> Result<()> {
             shared_memory,
             cgen,
             fjit,
-            intrinsics: image_intrinsics(&image),
+            intrinsics: gex_xlate::intrinsic::image_intrinsics(&image),
             ..Options::default()
         },
     );
@@ -2327,6 +2367,9 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
                 i += 1;
                 jobs = args.get(i).context("--jobs needs a number")?.parse()?;
             }
+            // A unit for a 64-bit guest memory (docs/mem64.md): another
+            // key, other code.
+            "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             // The NT trampoline page (i386 with --nt-trampolines32): built
             // at boot natively, ahead of time for the browser.
             t @ ("--nt-trampolines32" | "--nt-trampolines64" | "--providers") => path = Some(t.to_string()),

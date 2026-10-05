@@ -167,7 +167,9 @@ fn write_basic_info(c: &mut Call<'_>, buf: u64, len: u64) -> R<u64> {
     c.g.w32(o!(MMHIGHESTPHYSICALPAGE), PHYS_PAGES as u32 - 1)?;
     c.g.w32(o!(ALLOCATIONGRANULARITY), 0x1_0000)?;
     c.g.wptr(o!(LOWESTUSERADDRESS), 0x1_0000)?;
-    c.g.wptr(o!(HIGHESTUSERADDRESS), HIGHEST_USER_ADDRESS)?;
+    // An M64 process's data reaches its high arena (docs/mem64.md).
+    let highest = c.p.st.lock().unwrap().vm.high.map_or(HIGHEST_USER_ADDRESS, |(_, hi)| hi - 1);
+    c.g.wptr(o!(HIGHESTUSERADDRESS), highest)?;
     c.g.wptr(o!(ACTIVEPROCESSORSAFFINITYMASK), (1u64 << PROCESSORS) - 1)?;
     c.g.w8(o!(NUMBEROFPROCESSORS), PROCESSORS as u8)?;
     Ok(size)
@@ -431,6 +433,45 @@ pub fn nt_query_system_information_ex(c: &mut Call<'_>) -> R {
             }
             let filter = c.g.u32(q)?;
             logical_processor_info_ex(c, filter, buf, len, ret)?;
+            Ok(st::SUCCESS)
+        }
+        // SystemSupportedProcessorArchitectures(2): the query is a process
+        // handle (0 for none). One DWORD per machine (Machine:16, KernelMode,
+        // UserMode, Native, Process, WoW64Container bits), then a zero one:
+        // x86-64 native, i386 in a WoW64 container, as an x86-64 Windows.
+        181 | 230 => {
+            if ql < c.g.psize() as u32 {
+                return Err(Status(st::INVALID_PARAMETER));
+            }
+            let process = c.g.ptr(q)?;
+            // Every handle a process can name here is itself (no others exist).
+            let mine = if process == 0 {
+                0
+            } else if c.p.abi == super::Abi::P64 {
+                0x8664
+            } else {
+                0x14c
+            };
+            const KERNEL: u32 = 1 << 16;
+            const USER: u32 = 1 << 17;
+            const NATIVE: u32 = 1 << 18;
+            const PROCESS: u32 = 1 << 19;
+            const WOW64: u32 = 1 << 20;
+            let entries = [
+                0x8664 | KERNEL | USER | NATIVE | if mine == 0x8664 { PROCESS } else { 0 },
+                0x14c | USER | WOW64 | if mine == 0x14c { PROCESS } else { 0 },
+                0,
+            ];
+            let need = 4 * entries.len() as u64;
+            if ret != 0 {
+                c.g.w32(ret, need as u32)?;
+            }
+            if len < need {
+                return Err(Status(st::BUFFER_TOO_SMALL));
+            }
+            for (i, e) in entries.iter().enumerate() {
+                c.g.w32(buf + 4 * i as u64, *e)?;
+            }
             Ok(st::SUCCESS)
         }
         _ => Err(c.unimplemented(&format!("NtQuerySystemInformationEx class {class}"))),

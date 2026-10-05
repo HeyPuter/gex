@@ -255,7 +255,7 @@ pub fn emit_arm(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32, s
 #[allow(clippy::too_many_arguments)]
 pub fn emit_arm_at(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32, scratch: u32, block_ty: u32, classic: u32, blocks: u32) {
     debug_assert!(k >= FIRST_TABLE);
-    f.i32_const(0);
+    f.addr_const(0);
     f.load(0x28, 2, (MAPS + 4 * (k - FIRST_TABLE) as u64) as u32); // i32.load
     f.local_tee(scratch);
     f.if_void();
@@ -265,6 +265,7 @@ pub fn emit_arm_at(f: &mut crate::wasm::FuncBody, k: usize, ctx: u32, index: u32
     f.i32_const(2);
     f.byte(0x74); // i32.shl
     f.byte(0x6a); // i32.add
+    f.addr_i32(); // the map is in the runtime's low memory
     f.load(0x28, 2, 0); // i32.load: the block's index in `blocks`
     f.return_call_indirect(block_ty, blocks);
     f.end();
@@ -287,6 +288,7 @@ pub fn dispatch_body(block_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
     let entry = f.add_local(ValType::I32);
     let index = f.add_local(ValType::I32);
     f.local_get(0);
+    f.addr_i32();
     f.load(0x29, 3, ctx::LAST_TARGET as u32);
     f.local_set(target);
     f.local_get(target);
@@ -297,6 +299,7 @@ pub fn dispatch_body(block_ty: u32, first: u32, blocks: u32) -> Vec<u8> {
     f.byte(0xa7); // i32.wrap_i64
     f.i32_const(4);
     f.byte(0x6c); // i32.mul
+    f.addr_i32();
     f.load(0x28, 2, DISPATCH_DIR as u32);
     f.i32_const(0);
     f.local_get(page);

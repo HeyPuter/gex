@@ -71,10 +71,13 @@ fn unit_inputs() -> String {
         .clone();
     // The flavor is part of the key: native and browser units never mix.
     let base = if unguarded() { format!("{base}:unguarded") } else { base };
-    if narrow_stores() {
-        base
+    let base = if narrow_stores() { base } else { format!("{base}:widest") };
+    // So is the guest memory (docs/mem64.md): a wasm64 unit is a different
+    // module. Nothing is added for wasm32, whose keys stay as they were.
+    if gex_abi::mem64() {
+        format!("{base}:mem64")
     } else {
-        format!("{base}:widest")
+        base
     }
 }
 

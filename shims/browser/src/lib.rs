@@ -24,7 +24,12 @@
 // already because a module importing a shared memory has to be.
 #![cfg_attr(feature = "shared-memory", feature(stdarch_wasm_atomic_wait))]
 
+#[cfg(target_arch = "wasm32")]
 use core::arch::wasm32 as warch;
+// The memory64 build (docs/mem64.md step 6): an x86-64 guest with a 64-bit
+// memory, for the Unity games on .NET (docs/unity-dotnet.md P5).
+#[cfg(target_arch = "wasm64")]
+use core::arch::wasm64 as warch;
 
 use gex_abi::ctx;
 use gex_kernel::errno::{Errno, SysResult};
@@ -250,27 +255,27 @@ extern "C" {
     // other side copies across with `memory.copy`, which is the only way it
     // can reach a memory it does not own. See `gex_kernel::vfs::remote` for
     // the two layouts that cross.
-    fn k_fs_open(path: u32, path_len: u32, flags: u64, mode: u32) -> i32;
+    fn k_fs_open(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32) -> i32;
     fn k_fs_close(handle: i32);
     fn k_fs_dup(handle: i32) -> i32;
-    fn k_fs_read(handle: i32, offset: u64, at: u32, len: u32) -> i32;
-    fn k_fs_write(handle: i32, offset: u64, at: u32, len: u32) -> i32;
-    fn k_fs_meta(handle: i32, at: u32) -> i32;
+    fn k_fs_read(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_fs_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_fs_meta(handle: i32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_truncate(handle: i32, len: u64) -> i32;
-    fn k_fs_read_dir(handle: i32, at: u32, cap: u32) -> i32;
-    fn k_fs_path_meta(path: u32, path_len: u32, at: u32) -> i32;
-    fn k_fs_read_link(path: u32, path_len: u32, at: u32, cap: u32) -> i32;
-    fn k_fs_unlink(path: u32, path_len: u32) -> i32;
-    fn k_fs_mkdir(path: u32, path_len: u32, mode: u32) -> i32;
-    fn k_fs_rmdir(path: u32, path_len: u32) -> i32;
-    fn k_fs_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
-    fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32;
-    fn k_fs_set_mtime(path: u32, path_len: u32, secs: i64) -> i32;
+    fn k_fs_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
+    fn k_fs_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32;
+    fn k_fs_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
+    fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
+    fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
+    fn k_fs_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
+    fn k_fs_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32;
     fn k_fs_touch(handle: i32, secs: i64) -> i32;
-    fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32;
-    fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32;
-    fn k_fs_mksocket(path: u32, path_len: u32) -> i32;
-    fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32;
+    fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
+    fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
     /// The system-wide map from a page of a mapped object to the dispatch slots
     /// its code was translated into; zero means nobody has. In the kernel so
     /// the second process to run `ls` finds what the first one translated.
@@ -280,17 +285,17 @@ extern "C" {
     /// Standard input, shared. Whoever has a keystroke writes it here and
     /// wakes a parked reader, rather than posting a message to a Worker that
     /// is asleep inside wasm and cannot receive one.
-    fn k_stdin_write(at: u32, len: u32) -> i32;
-    fn k_stdin_read(at: u32, len: u32) -> i32;
+    fn k_stdin_write(at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_stdin_read(at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_stdin_ready() -> i32;
     fn k_stdin_eof();
     /// The terminal: one `struct termios`, one size, one foreground process
     /// group and one line discipline, for every process at once. The page
     /// pushes keystrokes straight into it; these are the guest's half.
-    fn k_tty_get_termios(at: u32, len: u32) -> i32;
-    fn k_tty_set_termios(at: u32, len: u32) -> i32;
-    fn k_tty_get_locked(at: u32, len: u32) -> i32;
-    fn k_tty_set_locked(at: u32, len: u32) -> i32;
+    fn k_tty_get_termios(at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_tty_set_termios(at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_tty_get_locked(at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_tty_set_locked(at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_tty_winsize() -> u64;
     fn k_tty_set_winsize(packed: u64) -> i32;
     fn k_tty_fg() -> i32;
@@ -303,7 +308,7 @@ extern "C" {
     fn k_tty_set_bits(which: i32, on: i32);
     fn k_tty_flush(which: i32) -> i32;
     fn k_tty_queued() -> i32;
-    fn k_tty_push(at: u32, len: u32) -> i32;
+    fn k_tty_push(at: gex_kernel::PAddr, len: u32) -> i32;
     /// Slots nobody else will be given, and the mark that keeps runtime
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
@@ -313,7 +318,7 @@ extern "C" {
     fn k_slot_left() -> u64;
     /// Translated modules, once for the whole system: a dispatch table belongs
     /// to a module instance, so the module bytes themselves must be shareable.
-    fn k_mod_store(ptr: u32, len: u32, slots: u64, dirs_ptr: u32, dirs_len: u32) -> u32;
+    fn k_mod_store(ptr: gex_kernel::PAddr, len: u32, slots: u64, dirs_ptr: gex_kernel::PAddr, dirs_len: u32) -> u32;
     fn k_mod_claim(page: u64, key: u64, id: u32);
     fn k_mod_for(page: u64, key: u64, n: u32) -> u32;
     fn k_mod_claim_object(obj: u64, id: u32);
@@ -324,17 +329,17 @@ extern "C" {
     fn k_mod_slots(id: u32) -> u64;
     fn k_mod_len(id: u32) -> u32;
     fn k_mod_dirs_len(id: u32) -> u32;
-    fn k_mod_read(id: u32, out: u32, cap: u32) -> u32;
-    fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32;
+    fn k_mod_read(id: u32, out: gex_kernel::PAddr, cap: u32) -> u32;
+    fn k_mod_dirs_read(id: u32, out: gex_kernel::PAddr, cap: u32) -> u32;
     /// Has some process already filled the shared root? Only the first
     /// should: the rest would unpack the same rootfs over the top of it.
     fn k_place(key: u64, len: u64) -> u64;
     fn k_place_set(key: u64, base: u64, len: u64);
     /// The linked address space of a program, kept so the next process of it
     /// does not have to run the dynamic linker again.
-    fn k_snap_store(key: u64, ptr: u32, len: u32);
+    fn k_snap_store(key: u64, ptr: gex_kernel::PAddr, len: u32);
     fn k_snap_len(key: u64) -> u32;
-    fn k_snap_get(key: u64, at: u32, cap: u32) -> u32;
+    fn k_snap_get(key: u64, at: gex_kernel::PAddr, cap: u32) -> u32;
     fn k_fs_populated() -> i32;
     fn k_fs_populate_done();
 
@@ -346,11 +351,11 @@ extern "C" {
     fn k_pipe_ends(id: i32) -> i32;
     fn k_pipe_write_stats(id: i32) -> i32;
     fn k_pipe_writes(id: i32) -> i32;
-    fn k_pipe_last_message(id: i32, at: u32, cap: u32) -> i32;
+    fn k_pipe_last_message(id: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_pipe_close_end(id: i32, write: i32, pid: i32);
     fn k_pipe_forget(pid: i32) -> u32;
-    fn k_pipe_read(id: i32, at: u32, len: u32) -> i32;
-    fn k_pipe_write(id: i32, at: u32, len: u32) -> i32;
+    fn k_pipe_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_pipe_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_pipe_readable(id: i32) -> i32;
     fn k_pipe_writable(id: i32) -> i32;
     fn k_pipe_buffered(id: i32) -> i32;
@@ -363,8 +368,8 @@ extern "C" {
     fn k_pty_open_end(id: i32, master: i32, pid: i32);
     fn k_pty_close_end(id: i32, master: i32, pid: i32);
     fn k_pty_forget(pid: i32) -> u32;
-    fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32;
-    fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32;
+    fn k_pty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_pty_write(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_pty_readable(id: i32, master: i32) -> i32;
     fn k_pty_counts(id: i32) -> u32;
     fn k_pty_for_sid(sid: i32) -> i32;
@@ -374,8 +379,8 @@ extern "C" {
     fn k_pty_ptn(id: i32) -> i32;
     fn k_pty_get_lock(id: i32) -> i32;
     fn k_pty_set_lock(id: i32, locked: i32);
-    fn k_pty_get_termios(id: i32, at: u32, len: u32) -> i32;
-    fn k_pty_set_termios(id: i32, at: u32, len: u32, flush: i32) -> i32;
+    fn k_pty_get_termios(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_pty_set_termios(id: i32, at: gex_kernel::PAddr, len: u32, flush: i32) -> i32;
     fn k_pty_winsize(id: i32) -> u64;
     fn k_pty_set_winsize(id: i32, packed: u64) -> i32;
     fn k_pty_fg(id: i32) -> i32;
@@ -387,18 +392,18 @@ extern "C" {
     // Unix sockets. An X server binds a name and its client connects to it,
     // and with a Worker per process those are two memories -- so the name has
     // to be somewhere neither of them owns.
-    fn k_sock_bind(path: u32, path_len: u32) -> i32;
-    fn k_sock_connect(path: u32, path_len: u32) -> i32;
+    fn k_sock_bind(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_sock_connect(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_sock_accept(listener: i32) -> i32;
     fn k_sock_pending(listener: i32) -> i32;
-    fn k_sock_read(id: i32, at: u32, len: u32) -> i32;
-    fn k_sock_write(id: i32, at: u32, len: u32) -> i32;
+    fn k_sock_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_sock_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_sock_readable(id: i32) -> i32;
     fn k_sock_writable(id: i32) -> i32;
     fn k_sock_available(id: i32) -> i32;
     fn k_sock_close(id: i32);
     fn k_sock_shutdown(id: i32);
-    fn k_sock_exists(path: u32, path_len: u32) -> i32;
+    fn k_sock_exists(path: gex_kernel::PAddr, path_len: u32) -> i32;
 
 }
 
@@ -641,7 +646,7 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
     )))
 }
 
-extern "C" fn rf_open(path: u32, path_len: u32, flags: u64, mode: u32) -> i32 {
+extern "C" fn rf_open(path: gex_kernel::PAddr, path_len: u32, flags: u64, mode: u32) -> i32 {
     unsafe { k_fs_open(path, path_len, flags, mode) }
 }
 extern "C" fn rf_close(handle: i32) {
@@ -650,55 +655,55 @@ extern "C" fn rf_close(handle: i32) {
 extern "C" fn rf_dup(handle: i32) -> i32 {
     unsafe { k_fs_dup(handle) }
 }
-extern "C" fn rf_read(handle: i32, offset: u64, at: u32, len: u32) -> i32 {
+extern "C" fn rf_read(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_fs_read(handle, offset, at, len) }
 }
-extern "C" fn rf_write(handle: i32, offset: u64, at: u32, len: u32) -> i32 {
+extern "C" fn rf_write(handle: i32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_fs_write(handle, offset, at, len) }
 }
-extern "C" fn rf_meta(handle: i32, at: u32) -> i32 {
+extern "C" fn rf_meta(handle: i32, at: gex_kernel::PAddr) -> i32 {
     unsafe { k_fs_meta(handle, at) }
 }
 extern "C" fn rf_truncate(handle: i32, len: u64) -> i32 {
     unsafe { k_fs_truncate(handle, len) }
 }
-extern "C" fn rf_read_dir(handle: i32, at: u32, cap: u32) -> i32 {
+extern "C" fn rf_read_dir(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_fs_read_dir(handle, at, cap) }
 }
-extern "C" fn rf_path_meta(path: u32, path_len: u32, at: u32) -> i32 {
+extern "C" fn rf_path_meta(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr) -> i32 {
     unsafe { k_fs_path_meta(path, path_len, at) }
 }
-extern "C" fn rf_read_link(path: u32, path_len: u32, at: u32, cap: u32) -> i32 {
+extern "C" fn rf_read_link(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_fs_read_link(path, path_len, at, cap) }
 }
-extern "C" fn rf_unlink(path: u32, path_len: u32) -> i32 {
+extern "C" fn rf_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_unlink(path, path_len) }
 }
-extern "C" fn rf_mkdir(path: u32, path_len: u32, mode: u32) -> i32 {
+extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
     unsafe { k_fs_mkdir(path, path_len, mode) }
 }
-extern "C" fn rf_rmdir(path: u32, path_len: u32) -> i32 {
+extern "C" fn rf_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_rmdir(path, path_len) }
 }
-extern "C" fn rf_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
+extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32 {
     unsafe { k_fs_rename(from, from_len, to, to_len) }
 }
-extern "C" fn rf_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
-    unsafe { k_fs_chmod(path, path_len, mode) }
+extern "C" fn rf_chmod(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32 {
+    unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) }
 }
-extern "C" fn rf_set_mtime(path: u32, path_len: u32, secs: i64) -> i32 {
-    unsafe { k_fs_set_mtime(path, path_len, secs) }
+extern "C" fn rf_set_mtime(path: gex_kernel::PAddr, path_len: u32, secs: i64) -> i32 {
+    unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) }
 }
 extern "C" fn rf_touch(handle: i32, secs: i64) -> i32 {
     unsafe { k_fs_touch(handle, secs) }
 }
-extern "C" fn rf_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_symlink(target, target_len, path, path_len) }
 }
-extern "C" fn rf_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
+extern "C" fn rf_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32 {
     unsafe { k_fs_link(from, from_len, to, to_len) }
 }
-extern "C" fn rf_mksocket(path: u32, path_len: u32) -> i32 {
+extern "C" fn rf_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_fs_mksocket(path, path_len) }
 }
 
@@ -750,17 +755,17 @@ extern "C" fn rp_write_stats(id: i32) -> i32 {
 extern "C" fn rp_writes(id: i32) -> i32 {
     unsafe { k_pipe_writes(id) }
 }
-extern "C" fn rp_last_message(id: i32, at: u32, cap: u32) -> i32 {
+extern "C" fn rp_last_message(id: i32, at: gex_kernel::PAddr, cap: u32) -> i32 {
     unsafe { k_pipe_last_message(id, at, cap) }
 }
 extern "C" fn rp_close_end(id: i32, write: i32) {
     unsafe { k_pipe_close_end(id, write, my_pid()) }
     pipe_note("close", id, write);
 }
-extern "C" fn rp_read(id: i32, at: u32, len: u32) -> i32 {
+extern "C" fn rp_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_pipe_read(id, at, len) }
 }
-extern "C" fn rp_write(id: i32, at: u32, len: u32) -> i32 {
+extern "C" fn rp_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_pipe_write(id, at, len) }
 }
 extern "C" fn rp_readable(id: i32) -> i32 {
@@ -775,16 +780,16 @@ extern "C" fn rp_buffered(id: i32) -> i32 {
 
 // The terminal, which is one object for the whole system and not one per
 // process. See `gex_kernel::tty`.
-extern "C" fn rt_get_termios(at: u32, len: u32) -> i32 {
+extern "C" fn rt_get_termios(at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_tty_get_termios(at, len) }
 }
-extern "C" fn rt_set_termios(at: u32, len: u32) -> i32 {
+extern "C" fn rt_set_termios(at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_tty_set_termios(at, len) }
 }
-extern "C" fn rt_get_locked(at: u32, len: u32) -> i32 {
+extern "C" fn rt_get_locked(at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_tty_get_locked(at, len) }
 }
-extern "C" fn rt_set_locked(at: u32, len: u32) -> i32 {
+extern "C" fn rt_set_locked(at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_tty_set_locked(at, len) }
 }
 extern "C" fn rt_winsize() -> u64 {
@@ -823,7 +828,7 @@ extern "C" fn rt_flush(which: i32) -> i32 {
 extern "C" fn rt_queued() -> i32 {
     unsafe { k_tty_queued() }
 }
-extern "C" fn rt_push(at: u32, len: u32) -> i32 {
+extern "C" fn rt_push(at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_tty_push(at, len) }
 }
 
@@ -941,7 +946,7 @@ extern "C" fn rpty_close_end(id: i32, master: i32) {
     unsafe { k_pty_close_end(id, master, my_pid()) };
     pty_note("close", id, master, my_pid());
 }
-extern "C" fn rpty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
+extern "C" fn rpty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     let r = unsafe { k_pty_read(id, master, at, len) };
     // End of file on the master is how a terminal emulator learns its shell is
     // gone -- and if it is wrong, the emulator kills the session. Worth saying.
@@ -950,7 +955,7 @@ extern "C" fn rpty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
     }
     r
 }
-extern "C" fn rpty_write(id: i32, master: i32, at: u32, len: u32) -> i32 {
+extern "C" fn rpty_write(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_pty_write(id, master, at, len) }
 }
 extern "C" fn rpty_readable(id: i32, master: i32) -> i32 {
@@ -968,10 +973,10 @@ extern "C" fn rpty_get_lock(id: i32) -> i32 {
 extern "C" fn rpty_set_lock(id: i32, locked: i32) {
     unsafe { k_pty_set_lock(id, locked) }
 }
-extern "C" fn rpty_get_termios(id: i32, at: u32, len: u32) -> i32 {
+extern "C" fn rpty_get_termios(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_pty_get_termios(id, at, len) }
 }
-extern "C" fn rpty_set_termios(id: i32, at: u32, len: u32, flush: i32) -> i32 {
+extern "C" fn rpty_set_termios(id: i32, at: gex_kernel::PAddr, len: u32, flush: i32) -> i32 {
     unsafe { k_pty_set_termios(id, at, len, flush) }
 }
 extern "C" fn rpty_winsize(id: i32) -> u64 {
@@ -1033,10 +1038,10 @@ fn global_ptys() -> Option<gex_kernel::pty::Remote> {
     })
 }
 
-extern "C" fn rs_bind(path: u32, path_len: u32) -> i32 {
+extern "C" fn rs_bind(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_bind(path, path_len) }
 }
-extern "C" fn rs_connect(path: u32, path_len: u32) -> i32 {
+extern "C" fn rs_connect(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_connect(path, path_len) }
 }
 extern "C" fn rs_accept(listener: i32) -> i32 {
@@ -1045,10 +1050,10 @@ extern "C" fn rs_accept(listener: i32) -> i32 {
 extern "C" fn rs_pending(listener: i32) -> i32 {
     unsafe { k_sock_pending(listener) }
 }
-extern "C" fn rs_read(id: i32, at: u32, len: u32) -> i32 {
+extern "C" fn rs_read(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_sock_read(id, at, len) }
 }
-extern "C" fn rs_write(id: i32, at: u32, len: u32) -> i32 {
+extern "C" fn rs_write(id: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     unsafe { k_sock_write(id, at, len) }
 }
 extern "C" fn rs_readable(id: i32) -> i32 {
@@ -1066,7 +1071,7 @@ extern "C" fn rs_close(id: i32) {
 extern "C" fn rs_shutdown(id: i32) {
     unsafe { k_sock_shutdown(id) }
 }
-extern "C" fn rs_exists(path: u32, path_len: u32) -> i32 {
+extern "C" fn rs_exists(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     unsafe { k_sock_exists(path, path_len) }
 }
 
@@ -1199,7 +1204,7 @@ impl FileHandle for StdinQueue {
         // SAFETY: scalars, and the kernel refuses a range outside this
         // process's memory rather than writing it.
         if unsafe { k_present() } != 0 {
-            let n = unsafe { k_stdin_read(buf.as_mut_ptr() as u32, buf.len() as u32) };
+            let n = unsafe { k_stdin_read(buf.as_mut_ptr() as gex_kernel::PAddr, buf.len() as u32) };
             if n > 0 {
                 return Ok(n as u64);
             }
@@ -2186,6 +2191,20 @@ fn arena_take(len: u64) -> Option<u64> {
 /// stepped over as arena of its own (see `MemoryMap::grows_on_demand`), or
 /// `None` when the memory would not grow.
 fn arena_back(end: u64) -> Option<u64> {
+    // The high arena of a 64-bit memory (docs/mem64.md §3): the memory grows
+    // to cover it (V8 commits lazily), but the low arena's cursor -- which
+    // this module's heap also takes from, and whose addresses cross to JS as
+    // u32 -- stays below 4 GiB.
+    if end > gex_abi::HIGH_ARENA_BASE && gex_abi::mem64() {
+        if !grow_memory_to(end) {
+            return None;
+        }
+        let prev = HIGH_NEXT.fetch_max(end, std::sync::atomic::Ordering::Relaxed).max(gex_abi::HIGH_ARENA_BASE);
+        if end > prev {
+            memmap::claim(memmap::Kind::Guest, 0, prev, end, "guest mapping (high arena)");
+        }
+        return Some(prev);
+    }
     if !grow_memory_to(end) {
         return None;
     }
@@ -2195,6 +2214,9 @@ fn arena_back(end: u64) -> Option<u64> {
     }
     Some(prev)
 }
+
+/// How far the high arena has been backed (claimed in `memmap`).
+static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the kernel's memory map calls to claim a span of arena.
 ///
@@ -2609,7 +2631,12 @@ static mut HOST: Option<Host> = None;
 /// than failing cleanly. The guest gets everything below this line; the shim
 /// takes what is above through ordinary pointers. The guest's stack, its
 /// highest thing, is placed here rather than at `STACK_TOP`.
+#[cfg(target_arch = "wasm32")]
 const GUEST_LIMIT: u64 = 0x7fff_0000;
+/// A wasm64 shim's slice may span the whole memory64, high arena included
+/// (docs/mem64.md step 6).
+#[cfg(target_arch = "wasm64")]
+const GUEST_LIMIT: u64 = gex_abi::LIMIT64;
 
 /// The guest's memory, as a slice.
 ///
@@ -4045,14 +4072,14 @@ pub extern "C" fn gex_add_file_part(path: u32, path_len: u32, offset: u64, data:
         // SAFETY: scalars and pointers into this module's memory, which the
         // kernel copies from.
         unsafe {
-            let h = k_fs_open(path, path_len, 1 /* O_WRONLY */, 0o644);
+            let h = k_fs_open(gex_kernel::PAddr::from(path), path_len, 1 /* O_WRONLY */, 0o644);
             if h < 0 {
                 warn_line(&format!("gex_add_file_part: cannot reopen a staged file ({h})\n"));
                 return;
             }
             let mut done = 0u32;
             while done < data_len {
-                let n = k_fs_write(h, offset + done as u64, data + done, data_len - done);
+                let n = k_fs_write(h, offset + done as u64, gex_kernel::PAddr::from(data + done), data_len - done);
                 if n <= 0 {
                     warn_line("gex_add_file_part: a staged write failed\n");
                     break;
@@ -4090,7 +4117,7 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     // cost the rootfs's size in every process that mounted it.
     if unsafe { k_present() } != 0 {
         if unsafe { k_fs_populated() } == 0 {
-            unsafe { k_fs_add(path, path_len, data, data_len) };
+            unsafe { k_fs_add(gex_kernel::PAddr::from(path), path_len, gex_kernel::PAddr::from(data), data_len) };
         }
         return;
     }
@@ -4112,7 +4139,7 @@ pub extern "C" fn gex_add_hardlink(target: u32, target_len: u32, path: u32, path
     // SAFETY: scalars naming ranges of this module's memory, no borrow held.
     if unsafe { k_present() } != 0 {
         if unsafe { k_fs_populated() } == 0 {
-            return (unsafe { k_fs_link(target, target_len, path, path_len) } == 0) as i32;
+            return (unsafe { k_fs_link(gex_kernel::PAddr::from(target), target_len, gex_kernel::PAddr::from(path), path_len) } == 0) as i32;
         }
         return 1;
     }
@@ -4130,7 +4157,7 @@ pub extern "C" fn gex_set_mtime(path: u32, path_len: u32, secs: i64) {
     // SAFETY: scalars naming a range of this module's memory, no borrow held.
     if unsafe { k_present() } != 0 {
         if unsafe { k_fs_populated() } == 0 {
-            unsafe { k_fs_set_mtime(path, path_len, secs) };
+            unsafe { k_fs_set_mtime(gex_kernel::PAddr::from(path), path_len, secs) };
         }
         return;
     }
@@ -4148,7 +4175,7 @@ pub extern "C" fn gex_chmod(path: u32, path_len: u32, mode: u32) {
     // SAFETY: scalars naming a range of this module's memory, no borrow held.
     if unsafe { k_present() } != 0 {
         if unsafe { k_fs_populated() } == 0 {
-            unsafe { k_fs_chmod(path, path_len, mode) };
+            unsafe { k_fs_chmod(gex_kernel::PAddr::from(path), path_len, mode) };
         }
         return;
     }
@@ -4166,7 +4193,7 @@ pub extern "C" fn gex_add_dir(path: u32, path_len: u32) {
     // SAFETY: as `gex_add_file` -- scalars, no borrow held.
     if unsafe { k_present() } != 0 {
         if unsafe { k_fs_populated() } == 0 {
-            unsafe { k_fs_mkdir(path, path_len, 0o755) };
+            unsafe { k_fs_mkdir(gex_kernel::PAddr::from(path), path_len, 0o755) };
         }
         return;
     }
@@ -6049,7 +6076,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // the call.
                 if snapshots_shared() {
                     let n = blob.len().min(snapshot_share_cap()) as u32;
-                    unsafe { k_snap_store(key, blob.as_ptr() as u32, n) };
+                    unsafe { k_snap_store(key, blob.as_ptr() as gex_kernel::PAddr, n) };
                 }
                 link_state(3);
                 // Under tracing only: the per-process line already says
@@ -6406,6 +6433,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
+                    // Priority-inheritance locks are not served here yet: the
+                    // call finishes at once with ENOSYS, as before gex had them
+                    // (`finish_parked`). docs/mem64.md step 6 brings the page.
+                    gex_kernel::BlockOp::FutexLockPi { .. } => Waiting::Sleep(now_ns()),
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         // What the thing being waited on says about itself,
                         // at the moment of parking. A reader on a pipe whose
@@ -7551,6 +7582,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     h.kernel.close_on_exec();
     // Handlers are addresses in the image being replaced; see Signals::exec.
     h.kernel.signals.exec();
+    h.kernel.thread_signals.clear();
     // The old image goes, and not only from the memory map. `execve` reuses
     // the process's existing memory rather than getting a fresh address space,
     // so anything not deliberately cleared stays, and the next program maps its
@@ -8347,7 +8379,7 @@ fn snap_lookup(key: u64) -> Option<Vec<u8>> {
             return None;
         }
         let mut blob = vec![0u8; len as usize];
-        let got = k_snap_get(key, blob.as_mut_ptr() as u32, len);
+        let got = k_snap_get(key, blob.as_mut_ptr() as gex_kernel::PAddr, len);
         (got == len).then_some(blob)
     }
 }
@@ -8402,10 +8434,10 @@ fn share_module(wasm: &[u8], slots: u64, dirs: &[(u64, u32)]) -> u32 {
             raw.extend_from_slice(&base.to_le_bytes());
         }
         k_mod_store(
-            wasm.as_ptr() as u32,
+            wasm.as_ptr() as gex_kernel::PAddr,
             wasm.len() as u32,
             slots,
-            raw.as_ptr() as u32,
+            raw.as_ptr() as gex_kernel::PAddr,
             raw.len() as u32,
         )
     }
@@ -8513,12 +8545,12 @@ fn shared_modules_of_object(
             }
             took += len as u64;
             let mut wasm = vec![0u8; len];
-            if k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) as usize != len {
+            if k_mod_read(id, wasm.as_mut_ptr() as gex_kernel::PAddr, len as u32) as usize != len {
                 continue;
             }
             let dlen = k_mod_dirs_len(id) as usize;
             let mut raw = vec![0u8; dlen];
-            if dlen > 0 && k_mod_dirs_read(id, raw.as_mut_ptr() as u32, dlen as u32) as usize != dlen
+            if dlen > 0 && k_mod_dirs_read(id, raw.as_mut_ptr() as gex_kernel::PAddr, dlen as u32) as usize != dlen
             {
                 continue;
             }
@@ -8583,7 +8615,7 @@ fn backfill_registry(h: &mut Host) {
             continue;
         }
         let mut wasm = vec![0u8; len];
-        if unsafe { k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) } as usize != len {
+        if unsafe { k_mod_read(id, wasm.as_mut_ptr() as gex_kernel::PAddr, len as u32) } as usize != len {
             continue;
         }
         // As this process installed it: at its dense base, or not at all.
@@ -8685,12 +8717,12 @@ fn shared_module_at(
             return None;
         }
         let mut wasm = vec![0u8; len];
-        if k_mod_read(id, wasm.as_mut_ptr() as u32, len as u32) as usize != len {
+        if k_mod_read(id, wasm.as_mut_ptr() as gex_kernel::PAddr, len as u32) as usize != len {
             return None;
         }
         let dlen = k_mod_dirs_len(id) as usize;
         let mut raw = vec![0u8; dlen];
-        if dlen > 0 && k_mod_dirs_read(id, raw.as_mut_ptr() as u32, dlen as u32) as usize != dlen {
+        if dlen > 0 && k_mod_dirs_read(id, raw.as_mut_ptr() as gex_kernel::PAddr, dlen as u32) as usize != dlen {
             return None;
         }
         let dirs = raw
@@ -9486,6 +9518,7 @@ fn finish_parked(
             Err(Errno::ETIMEDOUT)
         }
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
+        gex_kernel::BlockOp::FutexLockPi { .. } => Err(Errno::ENOSYS),
         // The read the guest asked for happens now, into the buffer it named.
         // Doing it here rather than re-executing the instruction is what keeps
         // the guest's pc moving forward: a syscall that parks is finished by

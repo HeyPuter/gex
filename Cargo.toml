@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/gex-abi",
+    "crates/gex-atomic",
     "crates/gex-cache",
     "crates/gex-key",
     "crates/gex-mem",
@@ -44,6 +45,7 @@ license = "Apache-2.0"
 repository = "https://github.com/puter/gex"
 
 [workspace.dependencies]
+gex-atomic = { path = "crates/gex-atomic" }
 gex-abi = { path = "crates/gex-abi" }
 gex-cache = { path = "crates/gex-cache", default-features = false }
 gex-key = { path = "crates/gex-key" }

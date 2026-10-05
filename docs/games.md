@@ -1,4 +1,4 @@
-# Games on gex: Half-Life and Peggle Deluxe
+# Games on gex: Half-Life, Peggle Deluxe and Unity games
 
 Stream G of the pewasm to gex merge. The goal is to run both games in gex's JIT
 tier, first natively (`gexc`) and then in the browser (`web/nt.html`). Nothing
@@ -184,6 +184,174 @@ Open:
 2. The page's window has a caption, so a 1920x1080 client area does not fit
    a 1920x1080 page (scrollbars). Input is injected at client coordinates, so
    the script is not affected.
+
+## Unity games (stream U)
+
+Muck (Linux x86-64, Unity 2019.4.19f1), Hollow Knight (Windows x64,
+Unity 6000.0.61f1) and Rain World (Windows x64, Unity 2020.3.45f1). All
+three are Mono (MonoBleedingEdge), not IL2CPP. Run them in place from the
+Steam install, read-only; write prefixes, homes and logs elsewhere.
+
+State as of 2026-10-04: Muck reaches its main menu natively (`--fjit
+--mem64`, status below); Rain World and Hollow Knight have not been run
+since. Every one of them needs more address space than a wasm32 guest has
+(below), which `--mem64` provides.
+
+### Running
+
+All three need a 64-bit guest memory: `gexc run --mem64` (docs/mem64.md), or
+nothing at all after the first run, which records the image when it runs out
+of address space.
+
+- **Muck** (natively): guest GL for x86-64 (`GEX_CC=gcc guest/gl/build.sh
+  DIR`) and an X display: Xwayland run *inside the guest*, a client of gex's
+  own compositor (no Xvfb, no host socket bridge). A small script started
+  under gexc runs `Xwayland :N -geometry 800x600 -shm -ac -nolisten tcp`
+  with no `LD_LIBRARY_PATH` (gex-gl's libGL is not Xwayland's), waits for
+  `/tmp/.X11-unix/XN`, then `DISPLAY=:N exec`s the game (`-ac`: the socket
+  exists only in the guest's namespace):
+
+  ```
+  GEX_FJIT_CACHE=1 gexc run --fjit --mem64 --gl --wayland $XDG_RUNTIME_DIR/x \
+    --wayland-size 800x600 --wayland-out DIR --env LD_LIBRARY_PATH=GLDIR \
+    --env HOME=... --env MONO_DEBUG=explicit-null-checks \
+    /bin/sh inguest.sh 71 XWLOG ./Muck.x86_64 -logFile LOG \
+    -screen-width 800 -screen-height 600 -screen-fullscreen 0
+  ```
+
+  Xwayland's lock and socket node land in the host's /tmp; remove only your
+  display's afterwards. (A copy of the script: work/unity-resume/inguest.sh.)
+  Unity 2019.4's SDL is X11-only (GLX through gex-gl's libGL). Its window's
+  frames are presented by gex-gl on the host GPU and written to DIR
+  (`GEX_PPM_EVERY=N`, `GEX_FPS=1`).
+- **Hollow Knight / Rain World:** a staged prefix (`tools/nt-stage-wine.sh`),
+  `gexc run --fjit --mem64 --wine-prefix P --gl --wayland-out DIR game.exe`.
+  Hollow Knight's build has no OpenGL renderer (`-force-glcore` fails with
+  "OpenGL Core was not built"), so it needs D3D11 on wined3d. Rain World:
+  `--env WINEDLLOVERRIDES=winhttp=b` keeps BepInEx's doorstop proxy
+  (`winhttp.dll` in the game directory) from loading, without touching the
+  install.
+- **Mono's null checks.** Mono turns a fault on a null object reference into
+  NullReferenceException, and gex has no page protection in the low region,
+  so the fault does not happen. The run scripts set
+  `MONO_DEBUG=explicit-null-checks` (Mono configuration, not a game change).
+  The general fix is low-page protection in gex: a fault on an access below
+  the guest's floor, which other runtimes that rely on null faults (JVMs,
+  .NET) need as well.
+- **Start-up time.** Under `--fjit` the first run spends almost all of its
+  time translating code it has not seen (Cranelift about 60%, recovery about
+  15%): Muck took over 15 minutes of wall time to reach Mono's assembly load,
+  which takes 0.1 s natively. `GEX_FJIT_CACHE=1` keeps compiled
+  translations on disk (about 150 KB each, about 1 GB for Muck's start-up)
+  so later runs load them; AOT units for UnityPlayer.so and libmonobdwgc are
+  the larger lever.
+- **What Unity needed from the kernel:** `sched_getparam` and friends (Mono
+  aborts when `pthread_getschedparam` fails), `/proc/stat`, and
+  priority-inheritance futexes (`FUTEX_LOCK_PI`/`UNLOCK_PI`; without them a
+  `PTHREAD_PRIO_INHERIT` mutex never woke its waiter and the player
+  deadlocked with every thread asleep). On Windows: crypt32's Unix side,
+  rsaenh's registration, `NtNotifyChangeKey`, `NtRenameKey`, in-process named
+  pipes (`CreatePipe`), `SystemSupportedProcessorArchitectures`.
+- **Steam.** Without a Steam client, Muck's Host Lobby does nothing (its
+  game is a Steam lobby; there is no offline mode), so Muck's gameplay needs
+  an x86-64 gex-steam with lobby and loopback P2P. Hollow Knight stops on its
+  title screen natively without Steam; Rain World gets through EOS errors.
+- **Status (2026-10-04, later):** Muck reaches its main menu natively
+  under `--fjit --mem64` (Host Lobby, Join Lobby, Settings, Achievements,
+  About, Quit over the 3D island; work/games/screens/muck-menu-gex-fjit-mem64.png)
+  at 17-23 fps at 800x600 on two cores (cores 1,7; a GL capture was being
+  written, and there is no pewasm Unity run to pair it with). From a cold
+  translation cache the menu took about 100 minutes of wall time; most of
+  it is translation. What it took, each with a test: tier-1's self-modification
+  guard read code bytes at an i32 address in an M64 module; the function
+  JIT translated a JIT's writable-and-executable code without guards (it now
+  leaves it to tier-1); tier-1 failed a miss whose page another thread's
+  guard retired mid-translation (it now translates again); a worker
+  thread's `exit_group` or fatal error left the process hanging; and gex-gl's
+  `glMapBufferRange` shadow uploaded zeros over bytes not written or not
+  flushed. Muck logs a NullReferenceException after "Initializing packets."
+  (no Steam) and goes on.
+- **Slow menu frames look tiled.** While a frame takes seconds, Muck's
+  menu draws its scene tiled (8x11, later 23x30 copies). The GL capture shows
+  that this is Muck's own data: its full-screen quad's texcoords are
+  0.5 +/- 11.5 (and 15.3 vertically, 4:3), sampled with REPEAT, and `_MainTex_ST`
+  is (1,1,0,0). It looks like a per-frame zoom that is unstable at
+  Unity's 0.333 s maximum deltaTime, and the menu draws correctly once frames
+  are fast.
+- **Mono's code under the function JIT** now runs on tier-1, each block
+  checking its bytes on entry (`Block::guard`). This is correct, but managed
+  code gets no function-tier speed. What would recover it: a function-level
+  byte check for code in writable-and-executable pages, with direct
+  transfers into code not yet seen leaving through dispatch, or a store-side
+  check of a code-page bitmap.
+- **Rain World (2026-10-04, paused for a reboot):** run natively as
+  `rw.sh` in work/unity-resume/rw/ does (`--fjit --mem64 --wine-prefix P
+  --gl`, `--env WINEDLLOVERRIDES=winhttp=b`, 800x600, a copy of the staged
+  prefix and a hard-linked copy of F's scratchpad/fjit/cgcache-peg units).
+  Its build has **no OpenGL Core shaders** ("Forced GfxDevice 'OpenGL Core'
+  was not built from editor"), so it runs D3D11 on wined3d, as Hollow Knight
+  must: "Direct3D 11.0 [level 11.1]", Mono's reload completes (430-500 s
+  cold), Rewired's input initializes, the first scene loads ("UnloadTime")
+  and the window presents its first (black) frame. Fixed on the way, each
+  with a test in tests/nt: NtSuspendThread/NtGetContextThread for Boehm's
+  stop-the-world (it aborted with a message box), WINEDLLOVERRIDES (BepInEx's
+  winhttp.dll doorstop loaded regardless and MonoMod died), the display
+  configuration queries (Unity allocated 0xffffffff * 72 bytes), raw input,
+  display device names, per-monitor DPI; and a regression of mine (a
+  Windows worker thread's ExitThread ended the process).
+  **Where it stops:** run r7 died about 10 minutes after the scene load of
+  an unhandled illegal instruction in Mono's JIT code (0xa3ea00a, no
+  module). gexc now logs the bytes (`gex-nt: illegal instruction at`); run
+  r8 was stopped by the reboot before reaching that point (presents=1, 36
+  min in). **Resume:** rerun `rw.sh r9 7200 --fjit --mem64` (with
+  `RENDER=` and `CGDIR=.../cgpeg`; about 40 minutes cold), read the
+  illegal-instruction line, decode the bytes, fix the decoder or the
+  trap's handling. Still unimplemented and seen: NtCreateUserProcess (the
+  crash handler), NtSetInformationThread class 1000, NtUserSetWindowsHookEx,
+  secur32's Unix side.
+- Knobs: `GEX_FPS=1` (presents per second), `GEX_PPM_EVERY=N`,
+  `--wayland-out null`, `GEX_STRACE_STACK=N` (stack words at each syscall
+  under `--strace`), `GEX_NT_TRACE` (logs each NtAllocateVirtualMemory
+  request), `GEX_FJIT_CACHE=1`, `GEX_DUMP_BAD_WASM=DIR` (keep a translation the
+  engine rejects as DIR/PC.wasm).
+
+### Address space: why none fits in wasm32
+
+Unity's memory manager (`MemoryManager::VirtualAllocator`, named from Muck's
+`UnityPlayer_s.debug`) gives every allocator block its own 256 MiB-aligned
+slot and looks blocks up by `address >> 28`, so two blocks never share a
+slot whatever their size. Baselib reserves each one by mapping 512 MiB - 4 KiB
+`PROT_NONE` and trimming. A gex x86-64 guest has 2 GiB for mappings
+(`MMAP_TOP`, the dispatch directory's reach), and the NT allocator 2 GiB.
+
+Slots used, measured natively (Muck on Linux with an `mmap` backtrace shim,
+the Windows games under host Wine 11.15 with `WINEDEBUG=+virtual`):
+
+| game | slots at startup | what they are |
+|---|---|---|
+| Muck | 19 at the menu | 4 job temp allocators (ThreadsafeLinearAllocator), 1 bucket allocator, 1 main-thread temp (TLSAllocator), 9 dynamic-heap pools (main, per-thread, gfx, typetree, file system, ...), 4 large allocations (gfx command buffer, async upload queue, a texture, FMOD samples) |
+| Hollow Knight | 17 at the title screen | (no symbols; same Baselib pattern) |
+| Rain World | 16 after engine init | (no symbols; same pattern) |
+
+Every allocation larger than a heap block takes a slot of its own, so the
+count grows with what a level loads. Launch knobs tried:
+
+- Muck: `-job-worker-count 0/1`, `-force-gfx-st`, both together, even
+  `-nographics`: 19 every time. Unity 2019.4 has no `memorysetup-*` keys.
+- Hollow Knight (Unity 6 reads `-memorysetup-KEY VALUE` from the command
+  line; the `KEY=VALUE` form is ignored): every heap block size at 256 MiB
+  takes it from 17 to 13 at the first screen; 1 MiB blocks leave it at 17;
+  `-job-worker-count 1` leaves it at 17.
+- Rain World (2020.3): only `-job-worker-count`, no memorysetup keys.
+
+Raising `MMAP_TOP` does not get there: up to 3 GiB costs a larger directory
+(it must end below the non-PIE base 0x400000, which allows exactly 3 GiB) and,
+for Windows guests, moving the host-call slots and trampolines at
+0x30_0000-0x40_0000 that a larger directory runs into; past 3 GiB the
+directory has to leave the low region, and in the browser the NT shim's heap
+above 0x8000_0000 has to move. 3.75 GiB gives at most 14 slots, fewer once
+images, stacks and the 512 MiB transient reservation are placed. So all
+three need a 64-bit guest memory (docs/mem64.md).
 
 ## Tools that came out of this
 

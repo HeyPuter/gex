@@ -700,7 +700,12 @@ pub fn user_callback(c: &mut Call<'_>, id: u32, args: &[u8]) -> R<(u32, Vec<u8>)
     c.g.w64(cx + ctx::x(4) as u64, frame)?;
     c.g.w64(cx + ctx::PC as u64, entry)?;
     c.t.callback_depth.fetch_add(1, Ordering::AcqRel);
+    // Guest code runs in the callback: not stopped for a suspender, whose
+    // view of the registers would be this syscall's.
+    c.t.in_kernel.store(false, Ordering::SeqCst);
+    park_if_suspended(c.p, &c.t);
     let ran = c.host.run_callback();
+    c.t.in_kernel.store(true, Ordering::SeqCst);
     c.t.callback_depth.fetch_sub(1, Ordering::AcqRel);
     let result = c.t.callback_result.lock().unwrap().take();
     // The syscall resumes as it was, whatever the callback did.
@@ -831,6 +836,10 @@ pub fn create_thread_state(
         exit_code: Mutex::new(None),
         sync_id,
         suspend: AtomicU32::new(0),
+        started: AtomicBool::new(true),
+        in_kernel: AtomicBool::new(false),
+        parked: AtomicBool::new(false),
+        park: (Mutex::new(()), std::sync::Condvar::new()),
         callback_depth: AtomicU32::new(0),
         callback_result: Mutex::new(None),
     }))
@@ -980,6 +989,7 @@ pub fn nt_create_thread_ex(c: &mut Call<'_>) -> R {
     let h = c.p.st.lock().unwrap().handles.insert(Obj::Thread(Arc::clone(&t)), access);
     c.g.wptr(hp, h as u64)?;
     if flags & SUSPENDED != 0 {
+        t.started.store(false, Ordering::Release);
         t.suspend.store(1, Ordering::Release);
     } else {
         c.outcome = Some(Outcome::SpawnThread { ctx_addr: t.ctx_addr, gex_tid: t.gex_tid });
@@ -988,8 +998,8 @@ pub fn nt_create_thread_ex(c: &mut Call<'_>) -> R {
 }
 
 /// `NtResumeThread(handle, *prev_count)`. A thread created suspended is
-/// started when its count reaches zero; suspending a running thread is not
-/// supported.
+/// started when its count reaches zero; a running thread suspended by
+/// [`nt_suspend_thread`] goes on from where it parked.
 pub fn nt_resume_thread(c: &mut Call<'_>) -> R {
     let (h, prev_p) = (c.a32(0), c.a(1));
     let Obj::Thread(t) = object::resolve(c, h)? else {
@@ -997,13 +1007,76 @@ pub fn nt_resume_thread(c: &mut Call<'_>) -> R {
     };
     let prev = t
         .suspend
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)))
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)))
         .unwrap();
     if prev == 1 {
-        c.outcome = Some(Outcome::SpawnThread { ctx_addr: t.ctx_addr, gex_tid: t.gex_tid });
+        if t.started.swap(true, Ordering::AcqRel) {
+            let _g = t.park.0.lock().unwrap();
+            t.park.1.notify_all();
+        } else {
+            c.outcome = Some(Outcome::SpawnThread { ctx_addr: t.ctx_addr, gex_tid: t.gex_tid });
+        }
     }
     c.g.out32(prev_p, prev)?;
     Ok(st::SUCCESS)
+}
+
+/// `NtSuspendThread(handle, *prev_count)`. Windows stops the thread
+/// wherever it is; gex stops it at its next safepoint or syscall return,
+/// where its registers are in its context (a thread inside a syscall
+/// already counts as stopped). Returns once it is stopped, so that
+/// `NtGetContextThread` sees where it stopped (Mono's and Boehm's
+/// stop-the-world: SuspendThread, then GetThreadContext for the registers
+/// to scan).
+pub fn nt_suspend_thread(c: &mut Call<'_>) -> R {
+    let (h, prev_p) = (c.a32(0), c.a(1));
+    let t = get_thread(c, h)?;
+    if t.exit_code.lock().unwrap().is_some() {
+        return Err(Status(st::ACCESS_DENIED));
+    }
+    let prev = t.suspend.fetch_add(1, Ordering::SeqCst);
+    c.g.out32(prev_p, prev)?;
+    // The caller itself parks as this syscall returns (`syscall`).
+    if Arc::ptr_eq(&t, &c.t) || !t.started.load(Ordering::Acquire) {
+        return Ok(st::SUCCESS);
+    }
+    // The next back-edge goes to the host at once.
+    let _ = c.g.w32(t.ctx_addr + ctx::SAFEPOINT_COUNTER as u64, 0);
+    wait_stopped(c.p, &t);
+    Ok(st::SUCCESS)
+}
+
+/// Wait until suspended thread `t` is stopped where its registers are in
+/// its context: parked, inside a syscall, or gone.
+fn wait_stopped(p: &Process, t: &Thread) {
+    let mut spins = 0u32;
+    while t.suspend.load(Ordering::SeqCst) > 0
+        && !t.parked.load(Ordering::SeqCst)
+        && !t.in_kernel.load(Ordering::SeqCst)
+        && t.exit_code.lock().unwrap().is_none()
+        && !p.terminating.load(Ordering::Acquire)
+    {
+        spins += 1;
+        if spins < 64 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+}
+
+/// Park `t` (the calling thread) while it is suspended, at a point where its
+/// registers are in its context.
+pub fn park_if_suspended(p: &Process, t: &Thread) {
+    if t.suspend.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let mut g = t.park.0.lock().unwrap();
+    t.parked.store(true, Ordering::SeqCst);
+    while t.suspend.load(Ordering::SeqCst) > 0 && !p.terminating.load(Ordering::Acquire) {
+        g = t.park.1.wait_timeout(g, std::time::Duration::from_millis(20)).unwrap().0;
+    }
+    t.parked.store(false, Ordering::SeqCst);
 }
 
 /// End the calling thread with `code`.
@@ -1027,7 +1100,7 @@ pub fn nt_terminate_thread(c: &mut Call<'_>) -> R {
     let target = if h == 0 { Obj::Thread(Arc::clone(&c.t)) } else { object::resolve(c, h)? };
     let Obj::Thread(t) = target else { return Err(Status(st::OBJECT_TYPE_MISMATCH)) };
     if !Arc::ptr_eq(&t, &c.t) {
-        if t.suspend.load(Ordering::Acquire) > 0 {
+        if !t.started.load(Ordering::Acquire) {
             // Never started: just retire it.
             *t.exit_code.lock().unwrap() = Some(code);
             sync::signal_done(c, t.sync_id);
@@ -1082,9 +1155,15 @@ pub fn nt_terminate_process(c: &mut Call<'_>) -> R {
         for t in others {
             // Threads that never started just go; running ones stop at
             // their next syscall (see `syscall`).
-            if t.suspend.load(Ordering::Acquire) > 0 {
+            if !t.started.load(Ordering::Acquire) {
                 c.p.remove_thread(&t);
             } else {
+                // A suspended one must get to its next syscall to notice.
+                t.suspend.store(0, Ordering::SeqCst);
+                {
+                    let _g = t.park.0.lock().unwrap();
+                    t.park.1.notify_all();
+                }
                 t.apcs.lock().unwrap().clear();
                 c.p.kill_list.lock().unwrap().push(t.tid);
                 c.p.kill_pending.fetch_add(1, Ordering::Release);
@@ -1276,19 +1355,33 @@ pub fn nt_open_process(c: &mut Call<'_>) -> R {
 pub fn nt_get_context_thread(c: &mut Call<'_>) -> R {
     let (h, at) = (c.a32(0), c.a(1));
     let t = get_thread(c, h)?;
-    if !Arc::ptr_eq(&t, &c.t) {
-        return Err(c.unimplemented("NtGetContextThread on another thread"));
+    let own = Arc::ptr_eq(&t, &c.t);
+    // A running thread: Windows gives its registers of some recent moment,
+    // and so does gex -- the last ones it wrote back (its last safepoint or
+    // syscall). A suspended one: where it stopped.
+    if !own && t.suspend.load(Ordering::SeqCst) > 0 {
+        wait_stopped(c.p, &t);
     }
     let abi = c.p.abi;
-    let flags = c.g.u32(at)?;
+    // ContextFlags is at 0x30 in an x86-64 CONTEXT (after the six P*Home
+    // words), at 0 in an i386 one.
+    let flags = c.g.u32(at + match abi { Abi::P64 => amd64::CONTEXT_FLAGS, Abi::P32 => i386::CONTEXT_FLAGS })?;
     let size = context_size(abi);
     let tmp = {
-        // Capture into a scratch copy below the stack, then copy the parts
-        // asked for.
+        // Capture into a scratch copy below the caller's stack, then copy
+        // the parts asked for.
         let cx = c.t.ctx_addr;
         let sp = c.g.u64(cx + ctx::x(4) as u64)?;
         let scratch = (sp - 0x1000 - size) & !63;
-        save_after_syscall(c, scratch, st::SUCCESS)?;
+        if own {
+            save_after_syscall(c, scratch, st::SUCCESS)?;
+        } else {
+            // Stopped at a safepoint (its pc) or in a syscall (the pc it
+            // returns to): the context is where it will go on from.
+            let tc = t.ctx_addr;
+            let pc = c.g.u64(tc + ctx::PC as u64)?;
+            save_context(&mut c.g, tc, scratch, pc)?;
+        }
         c.g.bytes(scratch, size as usize)?
     };
     // (flag, [start, end) ranges) per ABI.

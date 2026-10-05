@@ -261,7 +261,7 @@ fn stdin() -> &'static Mutex<(std::collections::VecDeque<u8>, bool)> {
 
 /// Append what was typed, from the caller's process memory.
 #[no_mangle]
-pub extern "C" fn k_stdin_write(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_stdin_write(at: gex_kmem::PAddr, len: u32) -> i32 {
     let mut buf = vec![0u8; len as usize];
     // SAFETY: the same copy every pipe write makes, and `pull_checked`
     // refuses a range outside the process memory rather than reading it.
@@ -289,7 +289,7 @@ pub extern "C" fn k_stdin_ready() -> i32 {
 
 /// Take up to `len` bytes into the caller's process memory.
 #[no_mangle]
-pub extern "C" fn k_stdin_read(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_stdin_read(at: gex_kmem::PAddr, len: u32) -> i32 {
     let mut s = stdin().lock().unwrap_or_else(|e| e.into_inner());
     let n = (len as usize).min(s.0.len());
     if n == 0 {
@@ -334,7 +334,7 @@ fn fg_group() -> i32 {
 /// group is what could only be done here, next to the process table. Returns
 /// how many bytes of echo are queued, so the caller knows whether to drain.
 #[no_mangle]
-pub extern "C" fn k_tty_input(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_tty_input(at: gex_kmem::PAddr, len: u32) -> i32 {
     let mut buf = vec![0u8; len as usize];
     // SAFETY: the same copy `k_stdin_write` makes, and `pull_checked` refuses
     // a range outside the caller's memory rather than reading it.
@@ -369,7 +369,7 @@ pub extern "C" fn k_tty_input(at: u32, len: u32) -> i32 {
 
 /// Take what the terminal should display, into the caller's memory.
 #[no_mangle]
-pub extern "C" fn k_tty_echo(at: u32, cap: u32) -> i32 {
+pub extern "C" fn k_tty_echo(at: gex_kmem::PAddr, cap: u32) -> i32 {
     let mut q = echoed().lock().unwrap_or_else(|e| e.into_inner());
     let n = (cap as usize).min(q.len());
     if n == 0 {
@@ -382,7 +382,7 @@ pub extern "C" fn k_tty_echo(at: u32, cap: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_tty_get_termios(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_tty_get_termios(at: gex_kmem::PAddr, len: u32) -> i32 {
     let t = tty().termios();
     let n = (len as usize).min(t.len());
     unsafe { gex_kmem::push_checked(at, t.as_ptr(), n as u32) };
@@ -390,7 +390,7 @@ pub extern "C" fn k_tty_get_termios(at: u32, len: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_tty_set_termios(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_tty_set_termios(at: gex_kmem::PAddr, len: u32) -> i32 {
     let mut buf = vec![0u8; (len as usize).min(60)];
     let n = buf.len() as u32;
     unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, n) };
@@ -399,7 +399,7 @@ pub extern "C" fn k_tty_set_termios(at: u32, len: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_tty_get_locked(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_tty_get_locked(at: gex_kmem::PAddr, len: u32) -> i32 {
     let t = tty().locked_termios();
     let n = (len as usize).min(t.len());
     unsafe { gex_kmem::push_checked(at, t.as_ptr(), n as u32) };
@@ -407,7 +407,7 @@ pub extern "C" fn k_tty_get_locked(at: u32, len: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_tty_set_locked(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_tty_set_locked(at: gex_kmem::PAddr, len: u32) -> i32 {
     let mut buf = vec![0u8; (len as usize).min(60)];
     let n = buf.len() as u32;
     unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, n) };
@@ -532,7 +532,7 @@ pub extern "C" fn k_tty_queued() -> i32 {
 /// go through the discipline, because that is what "as though typed" means --
 /// a `\n` pushed this way completes a line.
 #[no_mangle]
-pub extern "C" fn k_tty_push(at: u32, len: u32) -> i32 {
+pub extern "C" fn k_tty_push(at: gex_kmem::PAddr, len: u32) -> i32 {
     k_tty_input(at, len)
 }
 
@@ -689,10 +689,10 @@ fn modules() -> &'static Mutex<ModStore> {
 /// memory, so the bytes must be pulled across rather than read directly.
 #[no_mangle]
 pub unsafe extern "C" fn k_mod_store(
-    ptr: u32,
+    ptr: gex_kmem::PAddr,
     len: u32,
     slots: u64,
-    dirs_ptr: u32,
+    dirs_ptr: gex_kmem::PAddr,
     dirs_len: u32,
 ) -> u32 {
     let mut m = modules().lock().unwrap_or_else(|e| e.into_inner());
@@ -855,7 +855,7 @@ pub extern "C" fn k_mod_dirs_len(id: u32) -> u32 {
 ///
 /// SAFETY: `out` and `cap` describe a range of the calling process's memory.
 #[no_mangle]
-pub unsafe extern "C" fn k_mod_read(id: u32, out: u32, cap: u32) -> u32 {
+pub unsafe extern "C" fn k_mod_read(id: u32, out: gex_kmem::PAddr, cap: u32) -> u32 {
     let m = modules().lock().unwrap_or_else(|e| e.into_inner());
     let Some(sm) = m.mods.get((id as usize).wrapping_sub(1)) else {
         return 0;
@@ -871,7 +871,7 @@ pub unsafe extern "C" fn k_mod_read(id: u32, out: u32, cap: u32) -> u32 {
 ///
 /// SAFETY: as above.
 #[no_mangle]
-pub unsafe extern "C" fn k_mod_dirs_read(id: u32, out: u32, cap: u32) -> u32 {
+pub unsafe extern "C" fn k_mod_dirs_read(id: u32, out: gex_kmem::PAddr, cap: u32) -> u32 {
     let m = modules().lock().unwrap_or_else(|e| e.into_inner());
     let Some(sm) = m.mods.get((id as usize).wrapping_sub(1)) else {
         return 0;
@@ -1004,7 +1004,7 @@ fn snaps() -> &'static Mutex<Snaps> {
 /// SAFETY: `ptr` names the calling process's memory, pulled across not read. See
 /// `k_mod_store`.
 #[no_mangle]
-pub unsafe extern "C" fn k_snap_store(key: u64, ptr: u32, len: u32) {
+pub unsafe extern "C" fn k_snap_store(key: u64, ptr: gex_kmem::PAddr, len: u32) {
     let mut s = snaps().lock().unwrap_or_else(|e| e.into_inner());
     if key == 0 || len == 0 || s.n == SNAP_MAX {
         return;
@@ -1043,7 +1043,7 @@ pub extern "C" fn k_snap_len(key: u64) -> u32 {
 /// Copy the linked image of `key` into the caller's memory. Returns how many
 /// bytes were written.
 #[no_mangle]
-pub unsafe extern "C" fn k_snap_get(key: u64, at: u32, cap: u32) -> u32 {
+pub unsafe extern "C" fn k_snap_get(key: u64, at: gex_kmem::PAddr, cap: u32) -> u32 {
     let s = snaps().lock().unwrap_or_else(|e| e.into_inner());
     let Some(&(_, off, len)) = s.at[..s.n].iter().find(|(k, _, _)| *k == key) else {
         return 0;
@@ -1370,7 +1370,7 @@ pub extern "C" fn k_pipe_new(pid: i32) -> i32 {
 /// The last message written to a pipe, into the caller's memory. A diagnostic;
 /// see `Pipe::last_message`.
 #[no_mangle]
-pub extern "C" fn k_pipe_last_message(id: i32, at: u32, cap: u32) -> i32 {
+pub extern "C" fn k_pipe_last_message(id: i32, at: gex_kmem::PAddr, cap: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -1 };
     let text = p.last_message();
     let n = text.len().min(cap as usize);
@@ -1428,7 +1428,7 @@ pub extern "C" fn k_pipe_close_end(id: i32, write: i32, pid: i32) {
 /// out first (this module cannot address the process's memory) -- which is what
 /// lets the two ends live in different address spaces. Returns bytes or -errno.
 #[no_mangle]
-pub extern "C" fn k_pipe_write(id: i32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_pipe_write(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 }; // EBADF
     let mut buf = vec![0u8; len as usize];
     unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
@@ -1440,7 +1440,7 @@ pub extern "C" fn k_pipe_write(id: i32, at: u32, len: u32) -> i32 {
 
 /// Read up to `len` bytes into the caller's memory. See [`k_pipe_write`].
 #[no_mangle]
-pub extern "C" fn k_pipe_read(id: i32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_pipe_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pipe_at(id) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     match p.read(&mut buf) {
@@ -1696,7 +1696,7 @@ fn last_slave_closer() -> &'static Mutex<BTreeMap<i32, i32>> {
 /// terminal input: the line discipline runs and `^C`-style signals reach the
 /// foreground group. On the slave it is program output. Returns bytes or -errno.
 #[no_mangle]
-pub extern "C" fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_pty_write(id: i32, master: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pty_at(id) else { return -9 }; // EBADF
     let mut buf = vec![0u8; len as usize];
     unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
@@ -1715,7 +1715,7 @@ pub extern "C" fn k_pty_write(id: i32, master: i32, at: u32, len: u32) -> i32 {
 
 /// Read up to `len` bytes from an end into the caller's memory.
 #[no_mangle]
-pub extern "C" fn k_pty_read(id: i32, master: i32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_pty_read(id: i32, master: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pty_at(id) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     let r = if master != 0 {
@@ -1786,7 +1786,7 @@ pub extern "C" fn k_pty_set_lock(id: i32, locked: i32) {
 }
 
 #[no_mangle]
-pub extern "C" fn k_pty_get_termios(id: i32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_pty_get_termios(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(p) = pty_at(id) else { return -1 };
     let t = p.tty.termios();
     let n = (len as usize).min(t.len());
@@ -1795,7 +1795,7 @@ pub extern "C" fn k_pty_get_termios(id: i32, at: u32, len: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_pty_set_termios(id: i32, at: u32, len: u32, flush: i32) -> i32 {
+pub extern "C" fn k_pty_set_termios(id: i32, at: gex_kmem::PAddr, len: u32, flush: i32) -> i32 {
     let Some(p) = pty_at(id) else { return -1 };
     let mut buf = vec![0u8; len as usize];
     unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
@@ -1877,7 +1877,7 @@ pub extern "C" fn k_pty_flush(id: i32, which: i32) {
 /// Copy `len` bytes of the calling process's memory in, and report their sum. A
 /// live check that the two-memory pull path works.
 #[no_mangle]
-pub extern "C" fn k_checksum(at: u32, len: u32) -> u32 {
+pub extern "C" fn k_checksum(at: gex_kmem::PAddr, len: u32) -> u32 {
     let n = (len as usize).min(4096);
     let buf = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
     unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, n as u32) };
@@ -1933,7 +1933,7 @@ fn handle_at(id: i32) -> Option<std::sync::Arc<dyn FileHandle>> {
 
 /// A path argument, copied out of the caller's memory (this module cannot
 /// dereference an address in it).
-fn path_of(at: u32, len: u32) -> String {
+fn path_of(at: gex_kmem::PAddr, len: u32) -> String {
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };
@@ -1962,7 +1962,7 @@ fn as_unit(r: Result<(), gex_kernel::errno::Errno>) -> i32 {
 
 /// Open a path, returning a handle id or a negated errno.
 #[no_mangle]
-pub extern "C" fn k_fs_open(path: u32, path_len: u32, flags: u64, mode: u32) -> i32 {
+pub extern "C" fn k_fs_open(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32) -> i32 {
     let p = path_of(path, path_len);
     match rootfs().open(&p, flags, mode) {
         Ok(h) => {
@@ -2019,7 +2019,7 @@ pub extern "C" fn k_fs_close(handle: i32) {
 
 /// Read into the caller's memory. Returns bytes read, or a negated errno.
 #[no_mangle]
-pub extern "C" fn k_fs_read(handle: i32, offset: u64, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_fs_read(handle: i32, offset: u64, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     match h.read_at(offset, &mut buf) {
@@ -2035,7 +2035,7 @@ pub extern "C" fn k_fs_read(handle: i32, offset: u64, at: u32, len: u32) -> i32 
 
 /// Write from the caller's memory.
 #[no_mangle]
-pub extern "C" fn k_fs_write(handle: i32, offset: u64, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_fs_write(handle: i32, offset: u64, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
@@ -2046,7 +2046,7 @@ pub extern "C" fn k_fs_write(handle: i32, offset: u64, at: u32, len: u32) -> i32
 
 /// This handle's metadata, as `remote::META_BYTES` bytes at `at`.
 #[no_mangle]
-pub extern "C" fn k_fs_meta(handle: i32, at: u32) -> i32 {
+pub extern "C" fn k_fs_meta(handle: i32, at: gex_kmem::PAddr) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
     match h.metadata() {
         Ok(m) => {
@@ -2066,7 +2066,7 @@ pub extern "C" fn k_fs_truncate(handle: i32, len: u64) -> i32 {
 
 /// A directory listing, or `-ERANGE` when `cap` will not hold it.
 #[no_mangle]
-pub extern "C" fn k_fs_read_dir(handle: i32, at: u32, cap: u32) -> i32 {
+pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i32 {
     let Some(h) = handle_at(handle) else { return -9 };
     match h.read_dir() {
         Ok(entries) => {
@@ -2086,7 +2086,7 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: u32, cap: u32) -> i32 {
 /// A path's metadata, without opening it -- which matters for a symlink and
 /// for anything an open would refuse.
 #[no_mangle]
-pub extern "C" fn k_fs_path_meta(path: u32, path_len: u32, at: u32) -> i32 {
+pub extern "C" fn k_fs_path_meta(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr) -> i32 {
     let p = path_of(path, path_len);
     match rootfs().metadata(&p) {
         Ok(m) => {
@@ -2099,7 +2099,7 @@ pub extern "C" fn k_fs_path_meta(path: u32, path_len: u32, at: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_read_link(path: u32, path_len: u32, at: u32, cap: u32) -> i32 {
+pub extern "C" fn k_fs_read_link(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr, cap: u32) -> i32 {
     let p = path_of(path, path_len);
     match rootfs().read_link(&p) {
         Ok(t) => {
@@ -2117,33 +2117,33 @@ pub extern "C" fn k_fs_read_link(path: u32, path_len: u32, at: u32, cap: u32) ->
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_unlink(path: u32, path_len: u32) -> i32 {
+pub extern "C" fn k_fs_unlink(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     as_unit(rootfs().unlink(&path_of(path, path_len)))
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_mkdir(path: u32, path_len: u32, mode: u32) -> i32 {
+pub extern "C" fn k_fs_mkdir(path: gex_kmem::PAddr, path_len: u32, mode: u32) -> i32 {
     as_unit(rootfs().mkdir(&path_of(path, path_len), mode))
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_rmdir(path: u32, path_len: u32) -> i32 {
+pub extern "C" fn k_fs_rmdir(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     as_unit(rootfs().rmdir(&path_of(path, path_len)))
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_rename(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
+pub extern "C" fn k_fs_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32) -> i32 {
     as_unit(rootfs().rename(&path_of(from, from_len), &path_of(to, to_len)))
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_chmod(path: u32, path_len: u32, mode: u32) -> i32 {
+pub extern "C" fn k_fs_chmod(path: gex_kmem::PAddr, path_len: u32, mode: u32) -> i32 {
     as_unit(rootfs().chmod(&path_of(path, path_len), mode))
 }
 
 /// A path's modification time: `utimensat`, or a bundle's file times.
 #[no_mangle]
-pub extern "C" fn k_fs_set_mtime(path: u32, path_len: u32, secs: i64) -> i32 {
+pub extern "C" fn k_fs_set_mtime(path: gex_kmem::PAddr, path_len: u32, secs: i64) -> i32 {
     as_unit(rootfs().set_mtime(&path_of(path, path_len), secs))
 }
 
@@ -2160,12 +2160,12 @@ pub extern "C" fn k_fs_touch(handle: i32, secs: i64) -> i32 {
 /// absolute-path target says, which would then resolve against the link's own
 /// directory and reach nothing).
 #[no_mangle]
-pub extern "C" fn k_fs_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+pub extern "C" fn k_fs_symlink(target: gex_kmem::PAddr, target_len: u32, path: gex_kmem::PAddr, path_len: u32) -> i32 {
     as_unit(rootfs().symlink(&path_of_raw(target, target_len), &path_of(path, path_len)))
 }
 
 #[no_mangle]
-pub extern "C" fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i32 {
+pub extern "C" fn k_fs_link(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32) -> i32 {
     as_unit(rootfs().link(&path_of(from, from_len), &path_of(to, to_len)))
 }
 
@@ -2173,7 +2173,7 @@ pub extern "C" fn k_fs_link(from: u32, from_len: u32, to: u32, to_len: u32) -> i
 /// to: Xvfb binds `/tmp/.X11-unix/X0` and its start script waits for that path
 /// to exist before running a client.
 #[no_mangle]
-pub extern "C" fn k_fs_mksocket(path: u32, path_len: u32) -> i32 {
+pub extern "C" fn k_fs_mksocket(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     rootfs().add_socket(&path_of(path, path_len));
     0
 }
@@ -2181,7 +2181,7 @@ pub extern "C" fn k_fs_mksocket(path: u32, path_len: u32) -> i32 {
 /// Put a file into the shared root before anything runs -- how a page's bundle
 /// gets in, once, rather than through one process only it could then see.
 #[no_mangle]
-pub extern "C" fn k_fs_add(path: u32, path_len: u32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_fs_add(path: gex_kmem::PAddr, path_len: u32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let p = path_of(path, path_len);
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
@@ -2256,7 +2256,7 @@ fn keep(s: std::sync::Arc<UnixSocket>) -> i32 {
 /// Bind and listen in one: a remote socket has no state between `bind` and
 /// `listen` worth modelling. Returns a listener id, or a negated errno.
 #[no_mangle]
-pub extern "C" fn k_sock_bind(path: u32, path_len: u32) -> i32 {
+pub extern "C" fn k_sock_bind(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     let p = path_of_raw(path, path_len);
     let s = std::sync::Arc::new(UnixSocket::new(true));
     if let Err(e) = s.bind(&p) {
@@ -2273,7 +2273,7 @@ pub extern "C" fn k_sock_bind(path: u32, path_len: u32) -> i32 {
 
 /// Connect to a name. Returns this end's id, or a negated errno.
 #[no_mangle]
-pub extern "C" fn k_sock_connect(path: u32, path_len: u32) -> i32 {
+pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     let p = path_of_raw(path, path_len);
     let s = std::sync::Arc::new(UnixSocket::new(true));
     match names().connect(&s, &p) {
@@ -2315,7 +2315,7 @@ pub extern "C" fn k_sock_pending(listener: i32) -> i32 {
 /// Read into the caller's memory. The bytes cross by `memory.copy`, which is
 /// what makes two ends in two address spaces possible at all.
 #[no_mangle]
-pub extern "C" fn k_sock_read(id: i32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_sock_read(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(s) = sock_at(id) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     match s.recv(&mut buf, 0, false) {
@@ -2330,7 +2330,7 @@ pub extern "C" fn k_sock_read(id: i32, at: u32, len: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn k_sock_write(id: i32, at: u32, len: u32) -> i32 {
+pub extern "C" fn k_sock_write(id: i32, at: gex_kmem::PAddr, len: u32) -> i32 {
     let Some(s) = sock_at(id) else { return -9 };
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
@@ -2385,14 +2385,14 @@ pub extern "C" fn k_sock_shutdown(id: i32) {
 /// Whether anything is listening on a name -- which is what a client that
 /// looks before it leaps is asking. Xlib does; Mesa does not.
 #[no_mangle]
-pub extern "C" fn k_sock_exists(path: u32, path_len: u32) -> i32 {
+pub extern "C" fn k_sock_exists(path: gex_kmem::PAddr, path_len: u32) -> i32 {
     names().exists(&path_of_raw(path, path_len)) as i32
 }
 
 /// A path exactly as the caller wrote it. A socket name is compared for
 /// equality, never looked up, so the leading slash must survive -- trimming one
 /// end's would make two different names.
-fn path_of_raw(at: u32, len: u32) -> String {
+fn path_of_raw(at: gex_kmem::PAddr, len: u32) -> String {
     let mut buf = vec![0u8; len as usize];
     if len > 0 {
         unsafe { gex_kmem::pull_checked(buf.as_mut_ptr(), at, len) };

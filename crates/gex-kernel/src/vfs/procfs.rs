@@ -134,6 +134,15 @@ impl ProcFs {
             .to_vec(),
             "version" => b"Linux version 6.1.0-gex (gex@puter) #1 SMP\n".to_vec(),
             "uptime" => b"1000.00 1000.00\n".to_vec(),
+            // One CPU (as sched_getaffinity says), idle, booted at a fixed
+            // time. Boehm's GC counts the cpu lines to size its markers.
+            "stat" => concat!(
+                "cpu  0 0 0 100000 0 0 0 0 0 0\n",
+                "cpu0 0 0 0 100000 0 0 0 0 0 0\n",
+                "intr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n",
+            )
+            .as_bytes()
+            .to_vec(),
             "filesystems" => b"nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\n\text4\n".to_vec(),
             "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
@@ -151,7 +160,7 @@ impl FileSystem for ProcFs {
             return Ok(Arc::new(Generated { data }));
         }
         let entries = match path.as_str() {
-            "" => vec!["self", "meminfo", "cpuinfo", "version", "uptime", "sys"],
+            "" => vec!["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "sys"],
             "self" => vec![
                 "maps", "cmdline", "environ", "stat", "status", "comm", "exe", "cwd", "fd",
             ],

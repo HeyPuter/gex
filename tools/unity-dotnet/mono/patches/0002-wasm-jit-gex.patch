@@ -1,0 +1,2494 @@
+diff --git a/src/mono/cmake/config.h.in b/src/mono/cmake/config.h.in
+index 7d2b81fc9..56a529ae6 100644
+--- a/src/mono/cmake/config.h.in
++++ b/src/mono/cmake/config.h.in
+@@ -761,3 +761,10 @@
+ #endif
+ 
+ #endif
++
++/* The runtime wasm JIT's runtime half (mini-wasm.c and its interp hooks):
++ * in the browser, and under gex (noita-wasm docs/unity-dotnet.md P5), where
++ * what the browser does in JS goes through gex host imports (mini-wasm-gex.h). */
++#if defined(HOST_BROWSER) || defined(HOST_GEX)
++#define WJ_RUNTIME 1
++#endif
+diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
+index ed1afb5a7..45839cad6 100644
+--- a/src/mono/mono/metadata/sgen-mono.c
++++ b/src/mono/mono/metadata/sgen-mono.c
+@@ -1932,7 +1932,7 @@ mono_gc_thread_attach (SgenThreadInfo *info)
+ 	return sgen_thread_attach (info);
+ }
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /*
+  * INLINE TLAB ALLOCATION FROM THE WASM JIT (R305). Emitted code bump-allocates from the current thread's TLAB
+  * the way the managed allocator wrapper does, minus the call -- see OP_WASM_JIT_ALLOC_FAST. It needs the CURRENT
+@@ -1994,7 +1994,7 @@ void
+ sgen_client_thread_attach (SgenThreadInfo* info)
+ {
+ 	mono_tls_set_sgen_thread_info (info);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	mono_wasm_sgen_tls_info = info;
+ #endif
+ 
+@@ -2031,7 +2031,7 @@ sgen_client_thread_detach_with_lock (SgenThreadInfo *p)
+ 	MonoNativeThreadId tid;
+ 
+ 	mono_tls_set_sgen_thread_info (NULL);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	mono_wasm_sgen_tls_info = NULL;
+ #endif
+ 
+diff --git a/src/mono/mono/metadata/threads.c b/src/mono/mono/metadata/threads.c
+index 6bb6ba948..5c9ccb387 100644
+--- a/src/mono/mono/metadata/threads.c
++++ b/src/mono/mono/metadata/threads.c
+@@ -192,7 +192,7 @@ static void threads_add_pending_joinable_runtime_thread (MonoThreadInfo *mono_th
+ static gboolean threads_wait_pending_joinable_threads (uint32_t timeout);
+ static gchar* thread_dump_dir = NULL;
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /*
+  * THE CURRENT MonoInternalThread, WHERE WASM-JITTED CODE CAN REACH IT (R317, plan M3). Every ThreadStatic access --
+  * IKVM's Thread.currentThread among them -- calls mono_tls_get_thread_extern, which with MONO_KEYWORD_THREAD off
+diff --git a/src/mono/mono/mini/interp/interp-internals.h b/src/mono/mono/mini/interp/interp-internals.h
+index 4fbf3fbd6..8f37723ad 100644
+--- a/src/mono/mono/mini/interp/interp-internals.h
++++ b/src/mono/mono/mini/interp/interp-internals.h
+@@ -318,7 +318,7 @@ struct InterpMethod {
+ 	// If set, this method is MulticastDelegate.Invoke
+ 	unsigned int is_invoke : 1;
+ 	unsigned int is_verbose : 1;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	unsigned int contains_traces : 1;
+ 	MonoBitSet *address_taken_bits;
+ #endif
+@@ -487,7 +487,7 @@ mono_mint_type (MonoType *type);
+ int
+ mono_interp_type_size (MonoType *type, int mt, int *align_p);
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 
+ /* Queue a same-descriptor wasm body generation. Mandatory IL replacements use this independently of the
+  * optional profile-driven re-emission knob. */
+diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
+index 14d5bdb52..50f518629 100644
+--- a/src/mono/mono/mini/interp/interp.c
++++ b/src/mono/mono/mini/interp/interp.c
+@@ -64,7 +64,7 @@
+ 
+ #include "interp.h"
+ #include "interp-internals.h"
+-/* MONO_WASM_JIT_FORWARD_RETIRED (mini-wasm.c, defined outside HOST_BROWSER): follow replaced_by, R314. Declared
++/* MONO_WASM_JIT_FORWARD_RETIRED (mini-wasm.c, defined outside WJ_RUNTIME): follow replaced_by, R314. Declared
+  * at file scope unguarded because the interpreter's own delegate caches use it in every build. */
+ extern int mono_wasm_jit_forward_retired;
+ extern int mono_wasm_jit_lean_try_invoke;   /* MONO_WASM_JIT_LEAN_TRY_INVOKE, R314/L2 */
+@@ -97,10 +97,16 @@ extern int mono_wasm_jit_t2;   /* MONO_WASM_JIT_T2, R316 */
+ 
+ #include "interp-pgo.h"
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #include "jiterpreter.h"
++#ifdef HOST_BROWSER
+ #include <emscripten.h>
++#else
++#include <mono/mini/mini-wasm-gex.h>
++#endif
++#ifdef HOST_BROWSER
+ #include <emscripten/stack.h>
++#endif
+ extern void stackRestore (uintptr_t sp);   /* compiler-rt (stack_ops.S): sets __stack_pointer; JIT frames live on the C stack */
+ 
+ /* Overflow-safe probe bounds for the JIT-boundary diagnostics (mirrors mini-wasm.c wj_probe_ok):
+@@ -532,9 +538,9 @@ mono_interp_peek_imethod (MonoMethod *method)
+ 	 *
+ 	 * NULL is the correct conservative answer for every caller: "no imethod" means "never prepared",
+ 	 * which is what an unresolvable callee should look like. */
+-#if HOST_BROWSER
+-	/* HOST_BROWSER-ONLY, and the guard is structural rather than stylistic: the probe lives in
+-	 * mini-wasm.c inside its `#ifdef HOST_BROWSER` region, and mini-wasm.c is linked into BOTH the
++#if WJ_RUNTIME
++	/* WJ_RUNTIME-ONLY, and the guard is structural rather than stylistic: the probe lives in
++	 * mini-wasm.c inside its `#ifdef WJ_RUNTIME` region, and mini-wasm.c is linked into BOTH the
+ 	 * runtime and the offline cross-compiler while interp.c is in both too -- so an unguarded call here
+ 	 * leaves `mono-aot-cross` with an undefined symbol. That is the exact failure CLAUDE.md records in
+ 	 * the other direction for MONO_WASM_JIT_DEVIRT_PROFILE, and `csyn.sh` cannot catch it: the symbol
+@@ -648,7 +654,7 @@ mono_interp_get_imethod (MonoMethod *method)
+ 	else
+ 		imethod = (InterpMethod*)m_method_alloc0 (method, sizeof (InterpMethod));
+ 	imethod->method = method;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	{
+ 		/* A live method at this address: clear any freed-method mark a recycled address still carries. */
+ 		extern void mono_wasm_jit_note_method_live (MonoMethod *method);
+@@ -762,7 +768,7 @@ interp_pop_lmf (MonoLMFExt *ext)
+ 	mono_pop_lmf (&ext->lmf);
+ }
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /* Global "a thread is compiling" flag. mono_wasm_force_compile -> mini_method_compile is the ONLY
+  * compilation in the interp-only runtime, and it is NOT safe to run concurrently here (the wasm
+  * emitter + cctor execution race on shared state -> corrupt module bytes, seen as
+@@ -1582,11 +1588,11 @@ wj_prof_record (InterpMethod *caller, MonoMethod *base, WjSiteKind kind, gpointe
+ static gboolean
+ wj_method_usable_profile (MonoMethod *m)
+ {
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	extern int mono_wasm_jit_method_usable (MonoMethod *m, int site);
+ 	return mono_wasm_jit_method_usable (m, WJ_BADMETH_SITE_PROFILE) != 0;
+ #else
+-	/* The guard lives in mini-wasm.c's HOST_BROWSER region and this file is also linked into
++	/* The guard lives in mini-wasm.c's WJ_RUNTIME region and this file is also linked into
+ 	 * mono-aot-cross; accept unconditionally there, where no wasm JIT runs. */
+ 	(void) m;
+ 	return TRUE;
+@@ -2295,12 +2301,12 @@ static WjReemitOverflow *wj_reemit_overflow_tail;
+ static void
+ wj_note_perm (MonoMethod *m)
+ {
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	extern void mono_wasm_jit_note_perm_unjittable (MonoMethod *method);
+ 	if (m)
+ 		mono_wasm_jit_note_perm_unjittable (m);
+ #else
+-	(void) m;   /* see wj_method_usable_profile: the set lives behind HOST_BROWSER */
++	(void) m;   /* see wj_method_usable_profile: the set lives behind WJ_RUNTIME */
+ #endif
+ }
+ 
+@@ -4482,9 +4488,9 @@ INTERP_BUILD_EXCEPTION_TYPE_FUNC_NAME(interp_get_exception, exception_type) (con
+ 	return ex; \
+ }
+ 
+-/* R302 cast-failure diagnostic, defined in mini-wasm-diagnostics.inc. That lives in mini-wasm.c's HOST_BROWSER
++/* R302 cast-failure diagnostic, defined in mini-wasm-diagnostics.inc. That lives in mini-wasm.c's WJ_RUNTIME
+  * region, which mono-aot-cross does not link although it links this file -- hence the guard at every call. */
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ void mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *klass, MonoMethod *method);
+ #define WJ_NOTE_CAST(site, obj, klass, method) mono_wasm_jit_note_invalid_cast ((site), (MonoObject *) (obj), (klass), (method))
+ #else
+@@ -5673,7 +5679,7 @@ interp_init_delegate (MonoDelegate *del, MonoDelegateTrampInfo **out_info, MonoE
+ 			imethod->del_info = mono_create_delegate_trampoline_info (del->object.vtable->klass, method, FALSE);
+ 			*out_info = imethod->del_info;
+ 		}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* PUBLISH the trampoline info on the delegate itself, so the wasm method-JIT's emitted dispatch
+ 		 * can reach the recipe cached on it (MonoDelegateTrampInfo.wasm_jit_recipe) in one load from
+ 		 * `this` instead of deriving a site id and probing a per-site array.
+@@ -6021,7 +6027,7 @@ typedef struct {
+ 	                   * writeback must use this LIFO-safe copy. Only meaningful when wj_entry_is_residual. */
+ } InterpEntryData;
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ #define WJ_SCRATCH_ARG_SLOTS 16
+ #define WJ_SCRATCH_RET_OFF 192   /* result slot; past the max args (WASM_FUNCTYPE_MAX_PARAMS*8 = 128) */
+ #define WJ_SCRATCH_VRET_OFF 232  /* hidden-vret: the CALLER's return-buffer address; the VT result is
+@@ -6080,7 +6086,7 @@ static MONO_NEVER_INLINE void do_jit_call (ThreadContext *context, stackval *ret
+ 
+ /* Main function for entering the interpreter from compiled code */
+ // Do not inline in case order of frame addresses matters.
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /*
+  * BRACKETING PROBE (MONO_WASM_JIT_LMF_PUBLISH_DIAG=1).
+  *
+@@ -6163,7 +6169,7 @@ interp_entry (InterpEntryData *data)
+ 		data->rmethod = (InterpMethod*)(gpointer)((gsize)data->rmethod & ~1);
+ 	}
+ 	rmethod = data->rmethod;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/* R293b: a native->managed entry that reached the GENERIC C boundary although this thread has the method's
+ 	 * JITted body live -- i.e. one an interp-entry trampoline could have forwarded. What a worker take-up must
+ 	 * not reintroduce; read it as `[wasm-jit reuse] slow_live=`. */
+@@ -6232,7 +6238,7 @@ interp_entry (InterpEntryData *data)
+ 	g_assert (context->stack_pointer < context->stack_end);
+ 
+ 	MONO_ENTER_GC_UNSAFE;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/* wasm-JIT residual FAST PATH (jit -> AOT): if this call IS the wasm-JITted method's residual entry
+ 	 * (res-keyed, see wj_entry_is_residual) and the callee has AOT code, call it NATIVELY via do_jit_call
+ 	 * instead of interpreting it. interp_entry has already copied the args onto the GC-scanned interp
+@@ -6384,7 +6390,7 @@ interp_entry (InterpEntryData *data)
+ 		// gsharedvt_in_sig wrapper returns the actual type. This check follows the logic in
+ 		// interp_create_method_pointer_llvmonly and interp_create_method_pointer so we do the
+ 		// return sign extension only when called from the interp_in wrapper.
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 		if (wj_entry_is_residual (data) && MONO_TYPE_IS_REFERENCE (type)) {
+ 			/* wasm-JIT residual ref return: plain store, NO write barrier — data->res IS the per-thread
+ 			 * scratch result slot here */
+@@ -6419,7 +6425,7 @@ interp_entry (InterpEntryData *data)
+ 	}
+ }
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /*
+  * mono_wasm_jit_vcall_i4:
+  *
+@@ -6746,7 +6752,7 @@ wj_argshape_ptr (guint8 shape, guint32 mask, MonoMethodSignature *sig, int i)
+ gpointer
+ mono_wasm_jit_scratch (void)
+ {
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/* This is what supplies `s.b` to every instantiation, on the instantiating thread -- so the TLAB slot is
+ 	 * filled before any module that reads it can run here. The value is a per-thread CONSTANT (the address of
+ 	 * a __thread), and it is safe across detach/re-attach: the variable itself tracks the current
+@@ -7133,7 +7139,7 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
+ 		: method == wasm_jit_pretransformed_method
+ 		? wasm_jit_pretransformed_imethod
+ 		: mono_interp_get_imethod (method);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* R314: a crossing whose callee is already JIT-live on this thread -- the boundary pool the retired-cache
+ 	 * counters do not explain. Stats only; the pool should shrink by the forwarded share when the knob is on. */
+ 	if (G_UNLIKELY (mono_wasm_jit_stats)) {
+@@ -7149,14 +7155,14 @@ wj_call_interp_inner (MonoMethod *method, guint8 *buf, InterpMethod *known_imeth
+ 	guint8 shape;
+ 	guint32 ptrmask;
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* DIAG (type-confusion source): a JITted caller spilled its args into `buf` before this residual call.
+ 	 * Using the callee SIGNATURE (so no 1A over-marking false positive), check every by-value REFERENCE arg
+ 	 * (and `this`): its spilled value must be NULL or a plausible heap pointer. A non-pointer there — e.g. the
+ 	 * -10 (0xfffffff6) that reached a (Biome[]) cast in Villager pathfinding — means the JIT put an int into a
+ 	 * reference slot. Log (rate-limited) the callee + arg index so the SOURCE method is named; non-fatal.
+ 	 *
+-	 * GATED ON OBJGUARD, and it shipped UNGATED (`#ifdef HOST_BROWSER` only) for the whole type-confusion
++	 * GATED ON OBJGUARD, and it shipped UNGATED (`#ifdef WJ_RUNTIME` only) for the whole type-confusion
+ 	 * hunt. Measured cost of that: MONO_TYPE_IS_REFERENCE is `mono_type_is_reference(t)`, a real CALL
+ 	 * (metadata.h), and it read 0.197%/0.287% of the client render thread with 98.6% of it arriving under
+ 	 * mono_wasm_jit_call_interp -- i.e. the diagnostic was directly visible in the in-game census, on a
+@@ -7383,7 +7389,7 @@ mono_wasm_jit_vcall_resolve (MonoObject *this_obj, MonoMethod *base_method)
+ 		mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
+ 		return NULL;
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{
+ 		extern int mono_wasm_jit_objguard;
+ 		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+@@ -8034,7 +8040,7 @@ mono_wasm_jit_vcall_resolve_fslot (MonoObject *this_obj, MonoMethod *base_method
+ 		mono_wasm_jit_throw ((MonoObject *) mono_get_exception_null_reference ());
+ 		return 0;
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{
+ 		extern int mono_wasm_jit_objguard;
+ 		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+@@ -9347,7 +9353,7 @@ wj_eh_restore_lmf (MonoMethod *method)
+ 	if (mono_get_lmf () == &is->ext.lmf)
+ 		return;
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	{
+ 		extern int mono_wasm_jit_lmf_publish_diag;
+ 		static int n;
+@@ -9905,7 +9911,7 @@ struct _JitCallInfo {
+ 	gint32 res_size;
+ 	int ret_mt;
+ 	gboolean no_wrapper;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	int hit_count;
+ 	WasmJitCallThunk jiterp_thunk;
+ #endif
+@@ -10002,7 +10008,7 @@ init_jit_call_info (InterpMethod *rmethod, MonoError *error)
+ 	rmethod->jit_call_info = cinfo;
+ }
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ EMSCRIPTEN_KEEPALIVE void
+ mono_jiterp_register_jit_call_thunk (void *cinfo, WasmJitCallThunk thunk) {
+ 	// Release-store the thunk pointer so threads that observe non-NULL also see the
+@@ -10012,7 +10018,7 @@ mono_jiterp_register_jit_call_thunk (void *cinfo, WasmJitCallThunk thunk) {
+ #endif
+ 
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /* do_jit_call's `&thrown` for the call in flight on this thread: mono_jiterp_placeholder_jit_call's
+  * legitimate-caller test. Set, never restored -- an unwind past it can only make a stray read as legitimate. */
+ static __thread gboolean *wj_djc_thrown;
+@@ -10068,14 +10074,14 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
+ 				// WASM EH is available or we are otherwise in a situation where we know
+ 				//  that the jiterpreter thunk was compiled with exception handling built-in
+ 				//  so we can just invoke it directly and errors will be handled
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 				wj_djc_thrown = &thrown;   /* the placeholder's legitimate caller (see mono_jiterp_placeholder_jit_call) */
+ #endif
+ 				thunk (ret_sp, sp, &ftndesc, &thrown);
+ 			} else {
+ 				// Call a special JS function that will invoke the compiled jiterpreter thunk
+ 				//  and trap errors for us to set the thrown flag
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 				wj_djc_thrown = &thrown;
+ #endif
+ 				mono_interp_invoke_wasm_jit_call_trampoline (
+@@ -10257,7 +10263,7 @@ epilogue:
+ 	}
+ }
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /* TRUE iff the method's raw wasm AOT body carries the trailing "extra" pointer arg (rgctx-or-dummy) that
+  * makes it uniformly callable through a funcptr. Direct port of needs_extra_arg() in mini-llvm.c (minus the
+  * EmitContext): on wasm, llvm_only AOT gives EVERY method that trailing arg so the caller/callee signatures
+@@ -10530,7 +10536,7 @@ init_arglist (InterpFrame *frame, MonoMethodSignature *sig, stackval *sp, char *
+  * this/static * ret/void * 16 arguments -> 64 functions.
+  */
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /*
+  * For the jiterpreter, we want to record a hit count for interp_entry wrappers that can
+  *  be jitted, but not for ones that can't. As a result we need to put this in its own
+@@ -11050,7 +11056,7 @@ no_llvmonly_interp_method_pointer (void)
+  *
+  *   Return an ftndesc for entering the interpreter and executing METHOD.
+  */
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /*
+  * An interp-entry trampoline's TrampolineInfo lives in the infoTable of the WORKER that created the method
+  * pointer, but the pointer (a process-wide table index) is called from every worker, whose tables hold the
+@@ -11152,7 +11158,7 @@ interp_create_method_pointer_llvmonly (MonoMethod *method, gboolean unbox, MonoE
+ 	}
+ 	g_assert (entry_func);
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	// FIXME: We don't support generating wasm trampolines for high arg counts yet
+ 	if (
+ 		(sig->param_count <= MAX_INTERP_ENTRY_ARGS) &&
+@@ -11452,7 +11458,7 @@ interp_create_method_pointer (MonoMethod *method, gboolean compile, MonoError *e
+ static void
+ interp_free_method (MonoMethod *method)
+ {
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/* Before anything is released: the wasm JIT retains raw MonoMethod * and must learn this one is dead
+ 	 * (mono_wasm_jit_note_method_freed, R290). Guarded -- this file also links into mono-aot-cross. */
+ 	{
+@@ -11467,7 +11473,7 @@ interp_free_method (MonoMethod *method)
+ 
+ 	InterpMethod *imethod = (InterpMethod*)mono_internal_hash_table_lookup (&jit_mm->interp_code_hash, method);
+ 	if (imethod) {
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 		mono_jiterp_free_method_data (method, imethod);
+ #endif
+ 
+@@ -11546,7 +11552,7 @@ mono_interp_isinst (MonoObject* object, MonoClass* klass)
+ {
+ 	ERROR_DECL (error);
+ 	gboolean isinst;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* DIAG (isinst OOB): an object reaching here from a JITted caller (mono_wasm_jit_call_interp, e.g. the
+ 	 * LandPathNodeMaker pathfinding chain) has been observed with a garbage vtable -> mono_object_class()'s
+ 	 * vtable->klass read OOBs ("memory access out of bounds"), and because this runs on a JSPI-suspended
+@@ -11904,7 +11910,7 @@ mono_interp_profiler_raise_tail_call (InterpFrame *frame, MonoMethod *new_method
+ 		mono_interp_profiler_raise (frame, mono_profiler_raise_method_samplepoint); \
+ 	}
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /*
+  * WASM_JIT_TRY_INVOKE: the interp->wasm-JIT dispatch block, shared by every interp call opcode that
+  * has resolved a concrete callee (MINT_CALL, MINT_CALLVIRT_FAST, MINT_CALL_DELEGATE, MINT_CALLI).
+@@ -12247,7 +12253,7 @@ main_loop:
+ 			gboolean is_multicast = del->method == NULL;
+ 			InterpMethod *del_imethod = (InterpMethod*)del->interp_invoke_impl;
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			/* Delegate-IC sizing data. The wasm JIT lays down MONO_WASM_JIT_VCALL_WAYS unrolled guard
+ 			 * chains at every Delegate.Invoke site, and until now had no way to know that a site only
+ 			 * ever sees one target: the emitted IC is empty on the first compile, and wj_prof_record
+@@ -12328,7 +12334,7 @@ main_loop:
+ 			}
+ 			ip += 6;
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			/* Delegate targets never reached the wasm-JIT dispatch: this opcode resolves the target and
+ 			 * jumps straight to jit_call (do_jit_call/interp), so a target with a published e-thunk ran
+ 			 * its interp copy forever (profile4: the hottest DynamicBinder/MemberName wrappers sat at
+@@ -12361,7 +12367,7 @@ main_loop:
+ 			}
+ 			ip += 4;
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			/* Same dispatch gap as MINT_CALL_DELEGATE: a calli target with a published e-thunk ran its
+ 			 * interp copy (jit_call has no wasm-JIT check). Args at call_args_offset are in the callee's
+ 			 * layout (this unboxed above when needed). */
+@@ -12431,7 +12437,7 @@ main_loop:
+ 
+ 			slot = (gint16)ip [4];
+ 			ip += 5;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			/* Speculative-devirt profile: capture the base method BEFORE the resolve overwrites cmethod,
+ 			 * then record base + receiver + the resolved override once we have it. Recording the
+ 			 * override matters — re-deriving it at emit time deadlocks (see WjProfSite.target). */
+@@ -12439,7 +12445,7 @@ main_loop:
+ #endif
+ 			// FIXME push/pop LMF
+ 			cmethod = get_virtual_method_fast (cmethod, this_arg->vtable, slot);
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			if (G_UNLIKELY (wj_prof_base != NULL))
+ 				wj_prof_record (frame->imethod, wj_prof_base, WJ_SITE_VIRTUAL, this_arg->vtable,
+ 					cmethod->method, FALSE);
+@@ -12450,7 +12456,7 @@ main_loop:
+ 				LOCAL_VAR (call_args_offset, gpointer) = unboxed;
+ 			}
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			/* Auto-JIT this resolved VIRTUAL target + invoke its wasm version if compiled, before the
+ 			 * do_jit_call/interp path — so hot virtual methods (the bulk of IKVM's hot calls) get JITted and
+ 			 * run in wasm too, not just direct (MINT_CALL) callees. On a non-wasm-JIT target, fall through to
+@@ -12514,7 +12520,7 @@ jit_call:
+ 			ip += 4;
+ #endif
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			/* If the callee was compiled by the runtime wasm JIT, invoke its entry thunk
+ 			 * e(args_ptr, ret_ptr) via the function-table slot instead of interpreting; the
+ 			 * thunk marshals args from the call-args stackvals and writes the result back. */
+@@ -12570,7 +12576,7 @@ interp_call:
+ 		}
+ 		MINT_IN_CASE(MINT_JIT_CALL) {
+ 			InterpMethod *rmethod = (InterpMethod*)frame->imethod->data_items [ip [3]];
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			/* MONO_WASM_JIT_OVER_AOT redirected MINT_JIT_CALL through the ordinary hotness/dispatch
+ 			 * block here, because transform.c replaces a statically-bound call with MINT_JIT_CALL when an
+ 			 * AOT body exists and that opcode bypassed wasm_jit_maybe_compile -- so merely relaxing the
+@@ -12591,7 +12597,7 @@ interp_call:
+ 			ip += 4;
+ 
+ 			MINT_IN_BREAK;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ jit_call_aot:
+ 			error_init_reuse (error);
+ 			/* ip was advanced above; cmethod/offsets retain the original call operands. */
+@@ -16163,7 +16169,7 @@ MINT_IN_CASE(MINT_BRTRUE_I8_SP) ZEROP_SP(gint64, !=); MINT_IN_BREAK;
+ 			MINT_IN_BREAK;
+ 		}
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		MINT_IN_CASE(MINT_TIER_NOP_JITERPRETER) {
+ 			ip += JITERPRETER_OPCODE_SIZE;
+ 			MINT_IN_BREAK;
+@@ -16354,7 +16360,7 @@ interp_parse_options (const char *options)
+ 				opt = INTERP_OPT_TIERING;
+ 			else if (strncmp (arg, "simd", 4) == 0)
+ 				opt = INTERP_OPT_SIMD;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			else if (strncmp (arg, "jiterp", 6) == 0)
+ 				opt = INTERP_OPT_JITERPRETER;
+ #endif
+@@ -17213,7 +17219,7 @@ mono_ee_interp_init (const char *opts)
+ #endif
+ }
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ EMSCRIPTEN_KEEPALIVE void
+ mono_jiterp_stackval_to_data (MonoType *type, stackval *val, void *data)
+ {
+@@ -17332,7 +17338,7 @@ mono_jiterp_interp_entry (void *res)
+ 
+ 	stackval *sp = (stackval*)header.context->stack_pointer;
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/*
+ 	 * MONO_WASM_JIT_AOT_ENTRY fast path.
+ 	 *
+@@ -17423,7 +17429,7 @@ mono_jiterp_interp_entry (void *res)
+ 	g_assert (header.context->stack_pointer < header.context->stack_end);
+ 
+ 	MONO_ENTER_GC_UNSAFE;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/* wasm-JIT e-slot redirect for the JITERPRETER's native->interp entry. This is the entry the
+ 	 * jiterpreter compiles for methods called from native/AOT/wasm-JITted code (the "interp_entries" in the
+ 	 * jiterp stats), and it is a SEPARATE path from interp_entry() — so a wasm-JITted target reached this way
+@@ -17614,7 +17620,7 @@ mono_jiterp_get_simd_intrinsic (int arity, int index)
+ EMSCRIPTEN_KEEPALIVE int
+ mono_jiterp_get_simd_opcode (int arity, int index)
+ {
+-#ifdef INTERP_ENABLE_SIMD
++#if defined(INTERP_ENABLE_SIMD) && defined(HOST_BROWSER)
+ 	switch (arity) {
+ 		case 1:
+ 			return interp_simd_p_p_wasm_opcode_table [index];
+@@ -17685,7 +17691,7 @@ EMSCRIPTEN_KEEPALIVE void
+ mono_jiterp_placeholder_jit_call (void *ret_sp, void *sp, void *ftndesc, gboolean *thrown)
+ {
+ 	// g_print ("mono_jiterp_placeholder_jit_call\n");
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/* Its one LEGITIMATE caller is do_jit_call on a thread with no thunk yet, which passes its own `&thrown`
+ 	 * and reads the 999 back. Anything else reached an e/f slot this thread never installed -- the R285 class,
+ 	 * made WORSE by R293's take-up reset, which turns a stale instance into this -- and the store below is then
+@@ -17694,7 +17700,11 @@ mono_jiterp_placeholder_jit_call (void *ret_sp, void *sp, void *ftndesc, gboolea
+ 		static int nprint;
+ 		mono_wasm_jit_counters [WJC_PLACEHOLDER_STRAY]++;
+ 		if (nprint++ < 8)
++#ifdef HOST_BROWSER
+ 			EM_ASM ({ console.log ("WASM_JIT_PLACEHOLDER_STRAY " + (new Error ()).stack); });
++#else
++			gexwj_log ("WASM_JIT_PLACEHOLDER_STRAY");
++#endif
+ 	}
+ #endif
+ 	*thrown = 999;
+diff --git a/src/mono/mono/mini/interp/interp.h b/src/mono/mono/mini/interp/interp.h
+index 0f3473ca8..d9988534a 100644
+--- a/src/mono/mono/mini/interp/interp.h
++++ b/src/mono/mono/mini/interp/interp.h
+@@ -38,13 +38,13 @@ enum {
+ 	INTERP_OPT_BBLOCKS = 8,
+ 	INTERP_OPT_TIERING = 16,
+ 	INTERP_OPT_SIMD = 32,
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	INTERP_OPT_JITERPRETER = 64,
+ #endif
+ 	INTERP_OPT_SSA = 128,
+ 	INTERP_OPT_PRECISE_GC = 256,
+ 	INTERP_OPT_DEFAULT = INTERP_OPT_INLINE | INTERP_OPT_CPROP | INTERP_OPT_SUPER_INSTRUCTIONS | INTERP_OPT_BBLOCKS | INTERP_OPT_TIERING | INTERP_OPT_SIMD | INTERP_OPT_SSA | INTERP_OPT_PRECISE_GC
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 		| INTERP_OPT_JITERPRETER
+ #endif
+ };
+diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
+index 222536c07..73b4677e3 100644
+--- a/src/mono/mono/mini/interp/jiterpreter.c
++++ b/src/mono/mono/mini/interp/jiterpreter.c
+@@ -10,10 +10,10 @@
+ 
+ void jiterp_preserve_module (void);
+ 
+-// NOTE: All code in this file needs to be guarded with HOST_BROWSER, since
++// NOTE: All code in this file needs to be guarded with WJ_RUNTIME, since
+ //  we don't run non-wasm tests for changes to this file!
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 
+ #if 0
+ #define jiterp_assert(b) g_assert(b)
+@@ -23,7 +23,11 @@ void jiterp_preserve_module (void);
+ 
+ #include <assert.h>
+ #include <stdatomic.h>
++#ifdef HOST_BROWSER
+ #include <emscripten.h>
++#else
++#include <mono/mini/mini-wasm-gex.h>
++#endif
+ 
+ #include <string.h>
+ #include <stdio.h>
+@@ -2177,11 +2181,11 @@ EMSCRIPTEN_KEEPALIVE
+ #else
+ int
+ mono_jiterp_is_enabled (void);
+-#endif // HOST_BROWSER
++#endif // WJ_RUNTIME
+ 
+ int
+ mono_jiterp_is_enabled (void) {
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	return mono_opt_jiterpreter_traces_enabled;
+ #else
+ 	return 0;
+diff --git a/src/mono/mono/mini/interp/jiterpreter.h b/src/mono/mono/mini/interp/jiterpreter.h
+index 955690eac..083fe2b2b 100644
+--- a/src/mono/mono/mini/interp/jiterpreter.h
++++ b/src/mono/mono/mini/interp/jiterpreter.h
+@@ -1,7 +1,7 @@
+ #ifndef __MONO_MINI_JITERPRETER_H__
+ #define __MONO_MINI_JITERPRETER_H__
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 
+ // Safe in MT because jiterp_thunk publication uses atomic release/acquire (see
+ //  mono_jiterp_register_jit_call_thunk and the matching load in do_jit_call).
+@@ -253,7 +253,7 @@ mono_jiterp_tlqueue_purge_all (gpointer item);
+ 
+ #endif // __MONO_MINI_INTERPRETER_INTERNALS_H__
+ 
+-#endif // HOST_BROWSER
++#endif // WJ_RUNTIME
+ 
+ int
+ mono_jiterp_is_enabled (void);
+diff --git a/src/mono/mono/mini/interp/mintops.def b/src/mono/mono/mini/interp/mintops.def
+index d8742cf4e..6c075b444 100644
+--- a/src/mono/mono/mini/interp/mintops.def
++++ b/src/mono/mono/mini/interp/mintops.def
+@@ -843,13 +843,13 @@ OPDEF(MINT_INTRINS_WIDEN_ASCII_TO_UTF16, "intrins_widen_ascii_to_utf16", 5, 1, 3
+ 
+ OPDEF(MINT_METADATA_UPDATE_LDFLDA, "metadata_update.ldflda", 5, 1, 1, MintOpTwoShorts)
+ 
+-// This ifdef is fine because genmintops.py is generating output for HOST_BROWSER
+-#ifdef HOST_BROWSER
++// This ifdef is fine because genmintops.py is generating output for WJ_RUNTIME
++#ifdef WJ_RUNTIME
+ OPDEF(MINT_TIER_PREPARE_JITERPRETER, "tier_prepare_jiterpreter", 4, 0, 0, MintOpShortAndInt)
+ OPDEF(MINT_TIER_NOP_JITERPRETER, "tier_nop_jiterpreter", 4, 0, 0, MintOpShortAndInt)
+ OPDEF(MINT_TIER_ENTER_JITERPRETER, "tier_enter_jiterpreter", 4, 0, 0, MintOpShortAndInt)
+ OPDEF(MINT_TIER_MONITOR_JITERPRETER, "tier_monitor_jiterpreter", 4, 0, 0, MintOpShortAndInt)
+-#endif // HOST_BROWSER
++#endif // WJ_RUNTIME
+ 
+ IROPDEF(MINT_NOP, "nop", 1, 0, 0, MintOpNoArgs)
+ IROPDEF(MINT_DEF, "def", 2, 1, 0, MintOpNoArgs)
+diff --git a/src/mono/mono/mini/interp/tiering.c b/src/mono/mono/mini/interp/tiering.c
+index 95f634a43..0360542ba 100644
+--- a/src/mono/mono/mini/interp/tiering.c
++++ b/src/mono/mono/mini/interp/tiering.c
+@@ -67,7 +67,7 @@ get_tier_up_imethod (InterpMethod *imethod)
+ 		 * method's call sites, not one tier's bytecode, and the whole point is to still have them when
+ 		 * the wasm JIT compiles later. Losing them here would reset the evidence exactly when a method
+ 		 * gets hot enough to matter. */
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 		/* R316j (MONO_WASM_JIT_PROF_SHARE): allocate the old generation's block now if it has none, so the generations
+ 		 * SHARE one profile instead of each growing its own after a NULL was copied. */
+ 		{
+@@ -349,12 +349,12 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
+ 		/* The ONE path that can falsify an entry in the backend's append-only perm-unjittable pointer
+ 		 * set. Probe it so "the set never goes stale" is measured rather than inherited from R252.
+ 		 *
+-		 * HOST_BROWSER-GUARDED, and structurally so: the probe lives in mini-wasm.c inside its
+-		 * `#ifdef HOST_BROWSER` region, while BOTH files are linked into the offline cross-compiler as
++		 * WJ_RUNTIME-GUARDED, and structurally so: the probe lives in mini-wasm.c inside its
++		 * `#ifdef WJ_RUNTIME` region, while BOTH files are linked into the offline cross-compiler as
+ 		 * well as the runtime -- so an unguarded call leaves mono-aot-cross with an undefined symbol.
+ 		 * csyn.sh CANNOT catch this (it compiles, it does not link) and it is the same failure interp.c
+ 		 * already documents at its own probe site. It cost a full build here. */
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 		{ extern void mono_wasm_jit_note_perm_cleared (MonoMethod *m); mono_wasm_jit_note_perm_cleared (old_imethod->method); }
+ #endif
+ 		new_imethod->wasm_jit_slot = 0;
+@@ -374,7 +374,7 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
+ 	new_imethod->wasm_jit_invoke_out = old_imethod->wasm_jit_invoke_out;
+ 	new_imethod->wasm_jit_self_resv_eslot = old_imethod->wasm_jit_self_resv_eslot;
+ 	new_imethod->wasm_jit_self_resv_fslot = old_imethod->wasm_jit_self_resv_fslot;
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	/* R316j (MONO_WASM_JIT_PROF_SHARE): allocate the old generation's block now if it has none, so the generations
+ 	 * SHARE one profile instead of each growing its own after a NULL was copied. */
+ 	{
+@@ -408,7 +408,7 @@ replace_method_body_locked (MonoMethod *target, MonoMethod *source)
+ 	patch_imethod_refs (old_imethod, new_imethod);
+ 
+ 	if (replace_live_generation && new_imethod->wasm_jit_desc > 0) {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		extern void mono_wasm_jit_bind_logical (int desc_id, MonoMethod *logical_method);
+ 		mono_wasm_jit_bind_logical (new_imethod->wasm_jit_desc, target);
+ 		mono_wasm_jit_request_reemit (new_imethod->wasm_jit_desc);
+diff --git a/src/mono/mono/mini/interp/transform.c b/src/mono/mono/mini/interp/transform.c
+index f35f8313e..d25f97db5 100644
+--- a/src/mono/mono/mini/interp/transform.c
++++ b/src/mono/mono/mini/interp/transform.c
+@@ -36,7 +36,7 @@
+ #include "tiering.h"
+ #include "interp-pgo.h"
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ #include "jiterpreter.h"
+ #endif
+ 
+@@ -10119,7 +10119,7 @@ mono_interp_transform_init (void)
+ #endif
+ }
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ /* runtime wasm JIT: the function-table slot of a callee's scalar method fn `f` (0 if the callee
+  * isn't JIT-compiled), so a JITted caller can lower a call to it as a call_indirect. */
+ /*
+@@ -10340,11 +10340,11 @@ mono_wasm_jit_callee_perm_unjittable (MonoMethod *method)
+ 	 * A miss still means "not permanently un-JITtable", exactly as before: a callee with no InterpMethod
+ 	 * has never been prepared, which is not `slot == -1'.
+ 	 */
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	extern int mono_wasm_jit_perm_unjittable_known (MonoMethod *m);
+ 	return mono_wasm_jit_perm_unjittable_known (method);
+ #else
+-	/* mini-wasm.c's HOST_BROWSER region owns the set, and this file is linked into mono-aot-cross too. */
++	/* mini-wasm.c's WJ_RUNTIME region owns the set, and this file is linked into mono-aot-cross too. */
+ 	(void) method;
+ 	return 0;
+ #endif
+@@ -10380,7 +10380,7 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
+ 		return_if_nok (error);
+ 	}
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 	{
+ 		/* wasm-jit bring-up (v3): drive the runtime wasm JIT emitter for the targeted method so it
+ 		 * compiles + instantiates + registers its function in the table. Validate-only for now
+@@ -10541,7 +10541,7 @@ mono_interp_transform_method (InterpMethod *imethod, ThreadContext *context, Mon
+ 	MONO_PROFILER_RAISE (jit_done, (method, imethod->jinfo));
+ }
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 
+ InterpInst*
+ mono_jiterp_insert_ins (TransformData *td, InterpInst *prev_ins, int opcode)
+diff --git a/src/mono/mono/mini/interp/transform.h b/src/mono/mono/mini/interp/transform.h
+index 41a01720e..108c9a7a4 100644
+--- a/src/mono/mono/mini/interp/transform.h
++++ b/src/mono/mono/mini/interp/transform.h
+@@ -466,7 +466,7 @@ mono_test_interp_generate_code (TransformData *td, MonoMethod *method, MonoMetho
+ void
+ mono_test_interp_method_compute_offsets (TransformData *td, InterpMethod *imethod, MonoMethodSignature *signature, MonoMethodHeader *header);
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ InterpInst*
+ mono_jiterp_insert_ins (TransformData *td, InterpInst *prev_ins, int opcode);
+ #endif
+diff --git a/src/mono/mono/mini/method-to-ir.c b/src/mono/mono/mini/method-to-ir.c
+index 1ee6b4071..9dce4a013 100644
+--- a/src/mono/mono/mini/method-to-ir.c
++++ b/src/mono/mono/mini/method-to-ir.c
+@@ -83,7 +83,7 @@
+ #include "mini-runtime.h"
+ #include "llvmonly-runtime.h"
+ #include "mono/utils/mono-tls-inline.h"
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #include "mini-wasm.h"
+ /* Guarded devirtualized inlining. Declared here rather than in a header because this is the only
+  * consumer outside the wasm emitter, and mono_wasm_jit_prof_predict deliberately takes the caller's
+@@ -364,8 +364,8 @@ wj_gi_note_refused (MonoMethod *m)
+ #endif
+ 
+ /* The R315 counters, usable from code compiled into both the runtime and mono-aot-cross (wj_gi_count lives in the
+- * HOST_BROWSER region above). */
+-#ifdef HOST_BROWSER
++ * WJ_RUNTIME region above). */
++#ifdef WJ_RUNTIME
+ #define wj_p3_count(C) wj_gi_count (C)
+ #else
+ #define wj_p3_count(C) do { } while (0)
+@@ -426,7 +426,7 @@ wj_inline_call_allowed (MonoCompile *cfg, MonoMethod *cmethod)
+ static gpointer
+ wj_inline_origin_imethod (MonoCompile *cfg, MonoMethod *cmethod)
+ {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	extern int mono_wasm_jit_prof_origin;
+ 	extern gpointer mono_interp_peek_imethod (MonoMethod *method);
+ 	if (COMPILE_WASM (cfg) && cfg->wasm_inline_allow_calls && mono_wasm_jit_prof_origin && cmethod)
+@@ -442,7 +442,7 @@ wj_inline_origin_imethod (MonoCompile *cfg, MonoMethod *cmethod)
+  * Tier-2 compiles are serialized by the broker's compile lock, so the slot claim does not race in practice; a lost
+  * race would only mislabel a diagnostic row. */
+ enum { WJ_T2R_SIZE, WJ_T2R_COST, WJ_T2R_ABORT, WJ_T2R_OTHER, WJ_T2R_N };
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #define WJ_T2R_SLOTS 2048
+ typedef struct {
+ 	MonoMethod *m;
+@@ -3897,7 +3897,7 @@ handle_alloc (MonoCompile *cfg, MonoClass *klass, gboolean for_box, int context_
+ 			return NULL;
+ 		}
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 		/* wasm JIT, R305: bump-allocate inline from the thread's TLAB (OP_WASM_JIT_ALLOC_FAST), and call the
+ 		 * allocator icall only when the op yields 0 -- TLAB exhausted, or the thread detached. This is the
+ 		 * managed allocator wrapper's fast path without the wrapper, which a JIT call cannot reach anyway (see
+@@ -4643,7 +4643,7 @@ wj_check_inlining_t2 (MonoCompile *cfg, MonoMethod *method)
+ 	cfg->wasm_t2r_noted = FALSE;
+ 	cfg->wasm_t2r_why = NULL;
+ 	ok = mono_method_check_inlining (cfg, method);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	if (!ok && !cfg->wasm_t2r_noted)
+ 		wj_t2_refuse (cfg, method, WJ_T2R_OTHER, 0, 0, cfg->wasm_t2r_why);
+ #endif
+@@ -4667,7 +4667,7 @@ wj_check_inlining_t2 (MonoCompile *cfg, MonoMethod *method)
+  * 1.205x stock, while MaxInlineSize=20 (mono's limit) is 1.132x -- so 13.2 of those 20.5 points need a
+  * limit above 20 and are unreachable while this function caps everything at 20.
+  */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /* MONO_WASM_JIT_INLINE_LEAF support: TRUE iff the IL makes no call and allocates nothing. Reads only the
+  * raw IL the header SUMMARY already located -- no locals signature is parsed, so nothing here can load a
+  * class (and through it reach IKVM's classloader) from inside a compile. Undecodable IL answers FALSE. */
+@@ -4846,7 +4846,7 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
+ 		limit = limit_override;
+ 
+ 	guint32 eff_size = header.code_size;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* R318: cold throw segments do not count -- only where their calls may stay (the per-compile policy); at tier 1
+ 	 * a call in the cold segment aborts the inline anyway, so discounting it there would only waste the attempt. */
+ 	{
+@@ -4861,7 +4861,7 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
+ #endif
+ 	if (eff_size >= GINT_TO_UINT32(limit) && !wj_aggr_inline (cfg, method)) {
+ 		gboolean leaf_ok = FALSE;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* MONO_WASM_JIT_INLINE_LEAF (R290): a larger limit, for the wasm JIT's ORDINARY inliner only
+ 		 * (limit_override is the guarded inliner's own cap), and only for callees whose IL makes no call.
+ 		 * R118 closed raising the global limit because an inlined callee drags its own call sites into the
+@@ -4924,7 +4924,7 @@ mono_method_check_inlining_limit (MonoCompile *cfg, MonoMethod *method, int limi
+ 				/* .cctors: too many apps depend on them */
+ 				/* running with a specific order... */
+ 				if (! vtable->initialized) {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 					/* R319: see MONO_WASM_JIT_INLINE_BFI (mini-wasm.c). Admitted WITHOUT running the cctor; a static
+ 					 * field access inside the inlinee still aborts the inline ("class init") or gets its own check. */
+ 					extern int mono_wasm_jit_inline_bfi;
+@@ -5851,7 +5851,7 @@ inline_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig,
+ 		cfg->headers_to_free = g_slist_prepend_mempool (cfg->mempool, cfg->headers_to_free, cheader);
+ 		return costs + 1;
+ 	} else {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* R316f: costs < 0 is an INLINE_FAILURE inside the inlinee, otherwise the cost cap refused it */
+ 		if (costs < 0)
+ 			wj_t2_refuse (cfg, cmethod, WJ_T2R_ABORT, 0, 0, cfg->wasm_inline_fail_msg);
+@@ -8107,7 +8107,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
+ 		gboolean push_res = TRUE;
+ 		gboolean skip_ret = FALSE;
+ 		gboolean tailcall_remove_ret = FALSE;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* Guarded devirtualized inlining (MONO_WASM_JIT_GUARDED_INLINE): the diamond opened at the
+ 		 * inline gate and closed at call_end. Per-opcode, like every other flag here, so a nested
+ 		 * site cannot inherit a stale one. */
+@@ -8987,7 +8987,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
+ 				CHECK_TYPELOAD (cmethod->klass);
+ 			}
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			/*
+ 			 * GUARDED DEVIRTUALIZED INLINING (MONO_WASM_JIT_GUARDED_INLINE).
+ 			 *
+@@ -9241,7 +9241,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
+ 					MONO_START_BB (cfg, gi_fallback_bb);
+ 				}
+ 			}
+-#endif /* HOST_BROWSER */
++#endif /* WJ_RUNTIME */
+ 
+ 			/* Inlining */
+ 			if ((cfg->opt & MONO_OPT_INLINE) && !inst_tailcall && !gshared_static_virtual &&
+@@ -9766,7 +9766,7 @@ call_end:
+ 				ins = mini_emit_method_call_full (cfg, cmethod, fsig, tailcall, sp, virtual_ ? sp [0] : NULL,
+ 												  imt_arg, vtable_arg);
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			/* CLOSE THE GUARDED-INLINE DIAMOND. Everything since MONO_START_BB (gi_fallback_bb) above
+ 			 * emitted the fallback arm -- the ordinary callvirt -- so join it with the inlined hot arm
+ 			 * here and hand the merged value on as `ins`, which is what push_res consumes. */
+@@ -10564,7 +10564,7 @@ calli_end:
+ 
+ 						if (!ins->inst_p0)
+ 							OUT_OF_MEMORY_FAILURE;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						/* wasm JIT: the string is a MOVABLE GC object; a backend-baked immediate of it
+ 						 * would dangle after a later GC. Capture it into the GC-tracked literal table NOW,
+ 						 * while the pointer is fresh (no GC since mono_ldstr_checked), and stash the stable
+@@ -11003,7 +11003,7 @@ calli_end:
+ 							MonoType *klass_type = m_class_get_byval_arg (klass);
+ 							MonoReflectionType* reflection_type = mono_type_get_object_checked (klass_type, cfg->error);
+ 							EMIT_NEW_PCONST (cfg, ins, reflection_type);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 							/* wasm JIT: capture the freshly-resolved movable reflection Type into the GC-tracked
+ 							 * literal table now; the emitter loads it from the stable slot (see the ldstr site). */
+ 							if (cfg->compile_wasm && ins->inst_p0) {
+@@ -12304,7 +12304,7 @@ field_access_end:
+ 						MonoReflectionType *rt = mono_type_get_object_checked ((MonoType *)handle, cfg->error);
+ 						CHECK_CFG_ERROR;
+ 						EMIT_NEW_PCONST (cfg, ins, rt);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						/* wasm JIT: capture the freshly-resolved movable reflection Type into the GC-tracked
+ 						 * literal table now; the emitter loads it from the stable slot (see the ldstr site). */
+ 						if (cfg->compile_wasm && ins->inst_p0) {
+diff --git a/src/mono/mono/mini/mini-runtime.c b/src/mono/mono/mini/mini-runtime.c
+index 1215d8952..41d3bc807 100644
+--- a/src/mono/mono/mini/mini-runtime.c
++++ b/src/mono/mono/mini/mini-runtime.c
+@@ -781,7 +781,7 @@ mono_get_lmf (void)
+ void
+ mono_set_lmf (MonoLMF *lmf)
+ {
+-#if defined (TARGET_WASM) && defined (HOST_BROWSER)
++#if defined (TARGET_WASM) && defined (WJ_RUNTIME)
+ 	/* Catch the publisher of an incomplete LMF head. exceptions-wasm.c's unwinder reads ->method (on wasm a
+ 	 * managed frame never has jit info, so there is no IP to resolve), and something publishes a head whose
+ 	 * body was never written: lmf_addr == 0 with ->method as stack residue. Checking here names the caller
+@@ -819,7 +819,7 @@ mono_set_jit_tls (MonoJitTlsData *jit_tls)
+ 		mono_thread_info_tls_set (info, TLS_KEY_JIT_TLS, jit_tls);
+ }
+ 
+-#if defined (TARGET_WASM) && defined (HOST_BROWSER)
++#if defined (TARGET_WASM) && defined (WJ_RUNTIME)
+ /* R353: this thread's LMF address as a real __thread, so emitted code can reach the LMF chain head without a
+  * pthread-key call: interp.c puts &mono_wasm_lmf_addr_mirror in the per-thread scratch (WJ_SCRATCH_LMFADDR_SLOT),
+  * exactly as R317 does for the current thread object. Kept in step with the pthread key at its only setter,
+@@ -839,7 +839,7 @@ mono_set_lmf_addr (MonoLMF **lmf_addr)
+ {
+ 	MonoThreadInfo *info;
+ 
+-#if defined (TARGET_WASM) && defined (HOST_BROWSER)
++#if defined (TARGET_WASM) && defined (WJ_RUNTIME)
+ 	/* Report where the CHAIN HEAD IS STORED, and what it currently holds.
+ 	 *
+ 	 * Bracketing showed the head is already a stale C-stack address on entry to interp_entry, and that the
+@@ -1008,7 +1008,7 @@ setup_jit_tls_data (gpointer stack_start, MonoAbortFunction abort_func)
+ 
+ 	jit_tls->lmf = lmf;
+ 
+-#if defined (TARGET_WASM) && defined (HOST_BROWSER)
++#if defined (TARGET_WASM) && defined (WJ_RUNTIME)
+ 	/* Record every root LMF handed out, so a later stale head can be matched against a PREVIOUS thread's
+ 	 * root rather than guessed at. The heap first_lmf is freed on detach and that case is already covered by
+ 	 * the freed-root ring (which found nothing); this covers the other direction -- a root that is still
+diff --git a/src/mono/mono/mini/mini-wasm-batching.inc b/src/mono/mono/mini/mini-wasm-batching.inc
+index f95cad5e1..e7d5287a9 100644
+--- a/src/mono/mono/mini/mini-wasm-batching.inc
++++ b/src/mono/mono/mini/mini-wasm-batching.inc
+@@ -1,4 +1,4 @@
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /* --- island module batching -----------------------------------------------------------------------
+  *
+  * Several methods emitted into ONE WebAssembly.Module instead of one module each. This is the single
+@@ -362,7 +362,7 @@ mono_wasm_jit_batch_bind (const int *desc_ids, const int *e_slots, const int *f_
+ 	bd->generation = (guint32) mono_atomic_inc_i32 (&wj_batch_generation);
+ 	for (i = 0; i < n; i++) {
+ 		WjRegEntry *re = wj_reg_at (desc_ids [i] - 1);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* batch_finish has already overwritten these slots on the compiling worker. Any previously
+ 		 * installed guard-free AOT adapter must stop entering them until admission below succeeds. */
+ 		if (re->logical_imethod)
+@@ -1119,4 +1119,4 @@ mono_wasm_jit_colocate_deps_now (int desc_id)
+ 
+ /* The MonoMethod captured as member i, so the driver can register the right slot pair against it. */
+ 
+-#endif /* HOST_BROWSER */
++#endif /* WJ_RUNTIME */
+diff --git a/src/mono/mono/mini/mini-wasm-diagnostics.inc b/src/mono/mono/mini/mini-wasm-diagnostics.inc
+index 03465e0d2..4d492cde8 100644
+--- a/src/mono/mono/mini/mini-wasm-diagnostics.inc
++++ b/src/mono/mono/mini/mini-wasm-diagnostics.inc
+@@ -183,7 +183,11 @@ mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *k
+ 	g_snprintf (line, sizeof (line), "[wasm-jit castfail] #%d site=%s obj=%p vtable=%p from=%s to=%s method=%s",
+ 		total, site, obj, vt, fbuf, tbuf, mname ? mname : "(see stack)");
+ 	g_free (mname);
++#ifdef HOST_BROWSER
+ 	EM_ASM ({ var l = Error.stackTraceLimit; Error.stackTraceLimit = 40; var s = (new Error ()).stack; Error.stackTraceLimit = l; console.log (UTF8ToString ($0) + " " + s); }, line);
++#else
++	gexwj_log (line);
++#endif
+ 	/* AFTER the line is out: isinst walks the object's class hierarchy, and if the object is stale that walk
+ 	 * can trap -- which must not take the line above with it. */
+ 	if (from && klass && wj_castfail_in_heap (from) && wj_castfail_in_heap (klass)) {
+@@ -191,7 +195,11 @@ mono_wasm_jit_note_invalid_cast (const char *site, MonoObject *obj, MonoClass *k
+ 		recheck = mono_object_isinst_checked (obj, klass, error) ? "isinst NOW SUCCEEDS -- the failed check was wrong" : "isinst fails -- the object is not a `to`: either a wrong object, or the cast names the wrong class (compare `to` with the method)";
+ 		mono_error_cleanup (error);
+ 		g_snprintf (line, sizeof (line), "[wasm-jit castfail] #%d recheck: %s", total, recheck);
++#ifdef HOST_BROWSER
+ 		EM_ASM ({ console.log (UTF8ToString ($0)); }, line);
++#else
++		gexwj_log (line);
++#endif
+ 	}
+ }
+ 
+@@ -629,7 +637,7 @@ mono_wasm_jit_dump_stats (void)
+ 	 * count above against indirect for whether the grouping retargeted anything. Both are per module
+ 	 * ASSEMBLED, so a re-framed member is counted again -- which is the point: it is how a re-frame is
+ 	 * shown to have changed a call's form rather than just rebuilt the same module. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{ extern int mono_wasm_jit_dump_dep_graph_knob; extern void mono_wasm_jit_dump_dep_graph (void);
+ 	  if (mono_wasm_jit_dump_dep_graph_knob) mono_wasm_jit_dump_dep_graph (); }
+ #endif
+@@ -954,7 +962,7 @@ mono_wasm_jit_dump_stats (void)
+ 			WJC_(WJC_PROF_ORIGIN_USED), WJC_(WJC_PROF_ORIGIN_FALLBACK),
+ 			mono_wasm_jit_t2, mono_wasm_jit_t2_threshold, mono_wasm_jit_t2_max, mono_wasm_jit_prof_origin);
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* ALL of them, not a top-N. The tail is 72%% of inlined sites, and a site count is not an execution
+ 	 * count -- a one-site callee can be white hot -- so a truncated list cannot answer the weighting
+ 	 * question it exists for. */
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index 65b707ead..86837dec2 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -151,7 +151,7 @@ wj_structured_outer_depth (int kind, int h, int l, int n, int from)
+ 
+ 
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /* R316b (MONO_WASM_JIT_PROF_ORIGIN): which record a profile read at this call site consults. A site IR'd inside an
+  * inlinee asks that inlinee's record first -- where the interpreter and its own tier-1 IC misses filed the site --
+  * and the compiled method's when that record has nothing for it. Counted per READ, not per site. */
+@@ -249,7 +249,7 @@ wj_t2u_census (MonoMethod *root, WjBody *b)
+ void
+ mono_wasm_emit_method (MonoCompile *cfg)
+ {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	if (mono_wasm_jit_verbose >= 2) { printf ("WASM_JIT_EMIT_ENTER %s opt=0x%x\n", cfg->method ? cfg->method->name : "?", (unsigned) cfg->opt); }
+ #endif
+ 	/* Compile-time accounting (Part 2): wj_gen_t0 = bytecode-GENERATION start (100ns ticks); wj_inst_ms =
+@@ -380,7 +380,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	MonoMethodSignature *fail_sig = NULL;
+ 	int fail_sig_arg = -2;
+ 	char *mname = mono_method_get_full_name (cfg->method);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* Self-recursive calls reserve a fresh immutable slot pair. Failed reservations are intentionally
+ 	 * orphaned: recycling is incompatible with baked f-slot identities and append-only descriptors. */
+ 	int wj_self_e_slot = 0, wj_self_f_slot = 0;
+@@ -394,7 +394,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	 * backend doesn't lower yet — unsupported EH/control-flow shapes and generic-shared methods
+ 	 * (rgctx access the non-llvmonly path doesn't handle). Unknown opcodes still bail individually
+ 	 * via the lowering switch's default case. */
+-#ifndef HOST_BROWSER
++#ifndef WJ_RUNTIME
+ 	/* EH ground-truth dump (MONO_WASM_JIT_DUMP_IR=<substr>): print clauses + per-bb region + opcode stream
+ 	 * for clause-bearing methods. OFFLINE-CROSS ONLY: mono_inst_name returns a string in the cross but an
+ 	 * int under the runtime's DISABLE_LOGGING, and the dump is only ever driven by the offline MONO_WASM_JIT_DUMP_IR
+@@ -423,7 +423,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	  }
+ 	  g_free (_df);
+ 	}
+-#endif /* !HOST_BROWSER (offline IR dump) */
++#endif /* !WJ_RUNTIME (offline IR dump) */
+ 	if (cfg->header && cfg->header->num_clauses > 0) {
+ 		{ guint _ci;   /* in-method EH clauses always propagate via C++/wasm-EH (cppeh is the only model) */
+ 		  /* Supported native wasm-EH clauses: catch (NONE), finally (FINALLY, including Java
+@@ -663,9 +663,9 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	 * in a wasm param). Anything unsupported bails the whole method (the prior behaviour for any
+ 	 * OP_LDADDR). There is no knob for the pass itself -- it always runs; MONO_WASM_JIT_LDADDR_VTYPE and
+ 	 * MONO_WASM_JIT_LDADDR_VTYPE_REF gate only which SHAPES it accepts.
+-	 * NB: NOT HOST_BROWSER-gated. This is a pure compile-time classification pass (it assigns addrslot
++	 * NB: NOT WJ_RUNTIME-gated. This is a pure compile-time classification pass (it assigns addrslot
+ 	 * offsets / decides which ldaddr shapes are supported); the addr-frame runtime helpers it feeds
+-	 * (the C-stack frame prologue, baked by the emit below) is HOST_BROWSER-gated separately. Un-gating it
++	 * (the C-stack frame prologue, baked by the emit below) is WJ_RUNTIME-gated separately. Un-gating it
+ 	 * lets the offline cross-compiler dump reach the REAL ldaddr gate (e.g. "ldaddr of vtype with refs")
+ 	 * instead of the spurious "ldaddr unsupported var" the emit hits when no slot was ever assigned. */
+ 	{
+@@ -1207,7 +1207,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	cnt [0] += 1;
+ 	eh_h_idx = nwparams + cnt [0];
+ 	cnt [0] += 1;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{
+ 		extern int mono_wasm_jit_eh_rec;
+ 		ehrec_on = eh_on && mono_wasm_jit_eh_rec;
+@@ -1304,7 +1304,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	 * constant-index call_indirect, and made every batching measurement taken before Round 105
+ 	 * "co-location MINUS all function imports". It cannot recur: there is no longer a count for a member
+ 	 * to be out of step with. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{
+ 		extern int mono_wasm_jit_storeguard, mono_wasm_jit_objguard;
+ 		if ((mono_wasm_jit_storeguard || mono_wasm_jit_objguard) && nextra < WJ_EXTRA_TYPES_MAX) {
+@@ -1317,7 +1317,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		}
+ 	}
+ #endif
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* Route every vreg that MIGHT hold a managed pointer to the GC-scanned ref shadow stack instead of a
+ 	 * (GC-invisible) wasm local: a reference held in a wasm local across a GC point (a residual interp call,
+ 	 * which can allocate and trigger a moving collection; a loop safepoint) would be moved/collected out
+@@ -1544,7 +1544,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 			 * STOREGUARD/OBJGUARD below, which is NOT a knob but a semantic requirement: those guards key
+ 			 * ref-ness off refslot, so eliding a slot would change what they check. */
+ 			gboolean slotlive_on = TRUE;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			{
+ 				extern int mono_wasm_jit_storeguard, mono_wasm_jit_objguard, mono_wasm_jit_guard_keep_slotlive;
+ 				/* MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE=1 keeps elision ON under the guards.
+@@ -1623,7 +1623,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				 * frame-free class. Otherwise, every instruction must be locally pure or a direct
+ 				 * call to an already-published no-GC method. */
+ 				method_nogc = cfg->header->num_clauses == 0;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				{
+ 					/* DOOMED blocks, for LAZY_COLD=2: backward reachability from the exit to a fixpoint. A bb
+ 					 * that ENDS IN A THROW never reaches the exit whatever its edges say -- method-to-ir links
+@@ -1978,7 +1978,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		/* C-stack frame size: ref slots first (4-byte), then the 8-aligned addr slots; whole frame
+ 		 * 16-aligned per the emscripten SP ABI. */
+ 		refbytes_al = (nrefslots * 4 + 7) & ~7;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* R353: in record mode an EH method's WjEhRec sits after the address slots, so every EH method now has a
+ 		 * frame. The prologue writes every field it uses and the zeroing below stops short of it. */
+ 		if (ehrec_on) {
+@@ -2065,7 +2065,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				if (hot_gcp_count == 0)
+ 					mono_wasm_jit_count (WJC_LAZY_DOOMED_HOT0);
+ 			}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			/* MONO_WASM_JIT_WATCH=<name substring>: every term of the lazy-frame gate, and per bb the doomed
+ 			 * flag, its out-edges, its last opcode and its published GC points. Field reads only. */
+ 			{
+@@ -2113,7 +2113,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 			MonoInst **defins = (MonoInst **) mono_mempool_alloc0 (cfg->mempool, sizeof (MonoInst *) * nvreg);
+ 			MonoBasicBlock *bbr; MonoInst *insr;
+ 			gsize memsz = 0;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			memsz = wj_memsz ();
+ #endif
+ 			for (bbr = cfg->bb_entry; bbr; bbr = bbr->next_bb)
+@@ -2159,7 +2159,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						 * through the PCONST precise root), the GC moves it -> the baked constant goes stale ->
+ 						 * wild deref = the corruptor. Flag it by probing whether the constant looks like a live
+ 						 * object (val -> vtable -> klass are all plausible in-memory pointers). */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						/* wj_probe_ok, NOT open-coded bounds math: `v + 8 <= memsz` wraps for v near 2^32
+ 						 * (a probed word holding e.g. int -8) and the probe's own deref becomes an OOB trap. */
+ 						gsize v = (gsize) d->inst_c0;
+@@ -2248,12 +2248,12 @@ mono_wasm_emit_method (MonoCompile *cfg)
+  * long opcodes). cppeh: the raise C++-throws and never returns (unreachable). `ldiv_rti` (the (i32)->void
+  * functype index) must be in scope. Both uses sit inside an `if` arm, so the ENSURE_REF_FRAME here costs
+  * the hot path nothing; see the shared throw blocks for why a raise needs a materialized frame. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #define LDIV_RAISE_FPTR ((gpointer) (intptr_t) mono_wasm_jit_raise_corlib)
+ #else
+ #define LDIV_RAISE_FPTR ((gpointer) (intptr_t) 0x7ff8)   /* offline dump: placeholder table index */
+ #endif
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /* Direct import rather than `i32.const <addr>; call_indirect` -- same reason as EMIT_REF_LEAVE: a constant
+  * index is not folded into a direct call by V8. raise_corlib is a C function in dotnet.native.wasm. */
+ #define LDIV_RAISE(EXC_ID) do { \
+@@ -2313,7 +2313,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		wasm_op (&body, WASM_OP_UNREACHABLE); \
+ 	} while (0)
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #define WJ_CONTINUE_UNWIND_ADDR ((gpointer) (intptr_t) mono_wasm_jit_continue_unwind)
+ #else
+ #define WJ_CONTINUE_UNWIND_ADDR ((gpointer) (intptr_t) 0x7ff8)   /* offline dump: placeholder table index */
+@@ -2334,7 +2334,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ #define EMIT_IC_DPIC_CAPVAL() do { if (mono_wasm_jit_ic_remat) { wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 6); \
+ 	wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 0); } \
+ 	else wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dpic_capval_idx); } while (0)
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /* R353 (MONO_WASM_JIT_EH_REC): the EH record's push and pop, inline. The record is at refbase + ehrec_off
+  * (interp.c's WjEhRec, offsets from mono_wasm_jit_ehrec_layout). The LMF address is re-derived from the scratch at
+  * each use -- s.b + WJ_SCRATCH_LMFADDR_SLOT holds the address of this thread's mirror -- so nothing new is live
+@@ -2441,7 +2441,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+  * a transitively no-GC/frame-free direct callee. Copy every write-through local only after reserving and
+  * zeroing the frame. The captured nonzero entry SP is also the active marker; later definitions use it
+  * to mirror conditionally in wasm_st. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #define ENSURE_REF_FRAME() do { if (lazy_ref_frame) { int _rf_i; \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+ 	wasm_op (&body, WASM_OP_I32_EQZ); \
+@@ -2472,7 +2472,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+  * locals contain the same pinned object addresses and no GC can observe them again until the next
+  * materialization/handoff. Pop the lazy frame and clear its active marker so a later poll can rebuild
+  * it. This is what keeps the overwhelmingly-common poll-not-requested path frame-free. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #define RELEASE_LAZY_REF_FRAME() do { if (lazy_ref_frame) { \
+ 	wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) spentry_idx); \
+ 	wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40); \
+@@ -2727,7 +2727,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) dispatch_idx);
+ 	}
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* C-STACK FRAME PROLOGUE. Reserve this method's ref+addr slots as a real frame on the emscripten
+ 	 * C stack (see the layout doc at the top of this file): capture entry_sp, drop the SP by the
+ 	 * 16-aligned frame size, zero the frame (GC must not scan garbage; .NET locals are zero-init),
+@@ -2922,7 +2922,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 		 * (interp->JIT boundary OR direct JIT->JIT f-slot call). method ptr baked; (i32)->void = eh_type_idx.
+ 		 * Popped at every exit by EMIT_REF_LEAVE + the rethrow paths. In record mode (R353) the push is inline and
+ 		 * the island call is not emitted at all. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		if (ehrec_on) {
+ 			EMIT_EHREC_PUSH ();
+ 			mono_wasm_jit_count (WJC_EHREC_EMITTED);
+@@ -3160,7 +3160,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 
+ 	i = 0;
+ 	int sl_ord = 0;   /* running ins ordinal, mirroring the SLOTLIVE walk exactly (same bb/ins iteration) */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* R371 census: each block's bytes are attributed at the NEXT block's start (and after the loop), so no `continue`
+ 	 * inside a block can skip the accounting. */
+ 	guint32 wj_cold_start = body.len, wj_cold_mark = body.len;
+@@ -3175,7 +3175,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb, ++i) {
+ 		int loop_depth = N - 1 - i;
+ 		gboolean terminated = FALSE;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		WJ_COLD_ACCOUNT ();
+ 		wj_cold_cls = wj_bb_cold_class (bb);
+ #endif
+@@ -3231,7 +3231,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 			wasm_op (&body, WASM_OP_END);
+ 		}
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* AOT-style in-method EH (milestone 2b): record this bb's IL offset into the active island il_state
+ 		 * (pushed at the interp->JIT boundary) so mono's exception pass-1 matches THIS method's enclosing
+ 		 * try and finds its catch as the NEAREST handler for a throwing AOT callee — stopping the walk here
+@@ -3331,7 +3331,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				if (lazy_ref_frame && !lazy_cold_frame && sl_kill_head [my_ord] >= 0)
+ 					wasm_op (&body, WASM_OP_END);
+ 			}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			if (wj_ins_is_effective_gcpoint (cfg, ins) &&
+ 			    !(lazy_ref_frame && ins->opcode == OP_GC_SAFE_POINT) &&
+ 			    !(lazy_cold_frame && wj_ins_is_raise (ins)) &&
+@@ -3383,7 +3383,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				 * the genuine exit: the catch landing pad's h<0 rethrow (leave_island + RETHROW) or the
+ 				 * normal-return EMIT_REF_LEAVE. Popping it here too would double-pop — removing the ENCLOSING
+ 				 * JITted EH caller's island (jit-order-dependent thread-kill / EH corruption). */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				{ extern void mono_wasm_jit_endfinally_rethrow (void); wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_endfinally_rethrow, eh_endcatch_ti); }
+ #else
+ 				wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff5, (guint32) eh_endcatch_ti);   /* ()->void */
+@@ -3407,13 +3407,13 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				for (_gk = 0; _gk < nextra; ++_gk) if (functype_eq (&extra_types [_gk], &_gt)) { _gti = ti_base + _gk; break; }
+ 				if (_gti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = _gt; _gti = ti_base + nextra++; }
+ 				uses_calls = TRUE;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_get_caught_exc, _gti);
+ #else
+ 				wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff4, (guint32) _gti);
+ #endif
+ 				if (!wasm_st (&body, &lc, ins->dreg)) { fail = "get_ex_obj dreg"; goto done; }
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_release_caught_exc, eh_endcatch_ti);
+ #else
+ 				wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff6, (guint32) eh_endcatch_ti);   /* ()->void */
+@@ -3496,7 +3496,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				break;
+ 			}
+ 			case OP_WASM_JIT_ALLOC_FAST: {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				/* Inline TLAB bump (handle_alloc in method-to-ir.c, R305) -- the managed allocator wrapper's fast
+ 				 * path without its call:
+ 				 *     a = *(s.b + WJ_SCRATCH_TLAB_SLOT)   address of this thread's mono_wasm_sgen_tls_info
+@@ -3576,7 +3576,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				 * This costs exactly what HEAD's bare `mono_polling_required` load cost; testing the two
+ 				 * conditions separately here cost two extra loads, an i32.ne and an i32.or on every loop
+ 				 * back-edge in the tier. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				{
+ 					WasmFuncType pt; int pti = -1, pk;
+ 					memset (&pt, 0, sizeof (pt)); pt.ret = WASM_VOID; pt.nparams = 0;
+@@ -3646,7 +3646,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				 * movable pointer. inst_c0/inst_p0 alias; a null STACK_OBJ and every non-object iconst fall
+ 				 * through to the plain immediate bake. */
+ 				if (ins->type == STACK_OBJ && ins->inst_p0) {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 					if (!ins->inst_p1) { fail = "managed pconst not interned"; goto done; }
+ 					wasm_i32_const (&body, (gint32) (intptr_t) ins->inst_p1);
+ #else
+@@ -4450,7 +4450,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				for (tk = 0; tk < nextra; ++tk) if (functype_eq (&extra_types [tk], &tt)) { tti = ti_base + tk; break; }
+ 				if (tti < 0) { if (nextra >= WJ_EXTRA_TYPES_MAX) { fail = "too many callee types"; goto done; } extra_types [nextra] = tt; tti = ti_base + nextra++; }
+ 				uses_calls = TRUE;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				/* OP_RETHROW preserves the original stack trace (mono_wasm_jit_rethrow); OP_THROW rebuilds it. */
+ 				if (ins->opcode == OP_RETHROW) {
+ 					extern void mono_wasm_jit_rethrow (MonoObject *exc); wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_rethrow, tti);
+@@ -4578,7 +4578,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				WasmFuncType ct;
+ 				WasmCallInfo cci;
+ 				int call_fslot, type_idx = -1, k, ai;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				gboolean late_fslot_block = FALSE;
+ #endif
+ 				/* A synchronized callee keeps its Monitor.Enter/Exit in a separate SYNCHRONIZED wrapper; the raw
+@@ -4596,7 +4596,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					extern MonoMethod *mono_marshal_get_synchronized_wrapper (MonoMethod *enter_method);
+ 					call_method = mono_marshal_get_synchronized_wrapper (call_method);
+ 				}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				/* Canonicalize the (uncached, per-compile-fresh) synchronized-inner wrapper to a stable
+ 				 * instance so its f-slot is found across re-emits — see wj_canonical_callee. MUST match the
+ 				 * pre-scan, which canonicalizes identically, so the recorded blocker == this f-slot key. */
+@@ -4610,7 +4610,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					 * icall wrapper (call->fptr = a wasm table index) with its signature +
+ 					 * captured args, so the cold path resolves the slot instead of trapping. */
+ 					gint32 ifptr;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 					/* R317 (MONO_WASM_JIT_FAST_TLS): the current MonoInternalThread without the call --
+ 					 *     *(*(s.b + WJ_SCRATCH_THREAD_SLOT))   this thread's mono_wasm_tls_thread (threads.c)
+ 					 * NULL while detached, as the pthread key reads. No call, so not a GC point: the call it
+@@ -4681,7 +4681,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					goto done;
+ 				}
+ 				ct = cci.ftype;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				if (call_method == cfg->method) {
+ 					extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+ 					/* SCC batch: the orchestrator reserved our slot on the imethod -> get_callee_fslot returns
+@@ -4719,7 +4719,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ #endif
+ 				if (call_fslot > 0) {
+ 					/* Callee is wasm-JITted: direct call_indirect through its f-slot (Phase 2). */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 					wj_result_add_direct_dep (&cfg->wasm_jit_result, call_fslot, wj_functype_hash (&ct), call_method);
+ 					if (cfg->wasm_jit_result.direct_deps_truncated) { fail = "too many direct dependencies"; goto done; }
+ #endif
+@@ -4757,7 +4757,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						} else if (!wasm_st (&body, &lc, ins->dreg)) { fail = "call dreg"; goto done; }
+ 					}
+ 				}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 				else {
+ 					/* INLINE DIRECT AOT CALL (Build 1, no EH): the callee has no f-slot but IS AOT-compiled.
+ 					 * Call its AOT code DIRECTLY with the native ABI — the jiterpreter directJitCalls/enableDirect
+@@ -5310,7 +5310,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						 * Native-AOT and permanently un-JITtable targets retain the ordinary PIC/AOT miss
+ 						 * routes. Registering a successful direct dependency makes the predicted target
+ 						 * available in every worker before this caller is admitted there. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						/* Census only: which population this site lands in. Delegate sites never reach the
+ 						 * gate below (`!is_delegate_invoke`), so they are counted here or they are invisible. */
+ 						if (is_delegate_invoke)
+@@ -5492,7 +5492,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						   * native ABI instead of the interp residual. Its off-arm sent every such call
+ 						   * through ~1,360 instructions of marshalling. Settled. */
+ 						  if (!slim_pred && !is_delegate_invoke && !vc_vret) {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 							extern gpointer mono_wasm_jit_alloc_aot_ic (void); aic = mono_wasm_jit_alloc_aot_ic ();
+ #else
+ 							aic = (gpointer) (intptr_t) 0x7fe0;
+@@ -5513,7 +5513,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 						}
+ 						/* Per-call-site N-way virtual IC plus miss metadata in shared memory. Delegate.Invoke
+ 						 * sites append a single-cast dispatch recipe used by the instance-aware helper. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						{ extern gpointer mono_wasm_jit_alloc_ic (int delegate_site, MonoMethod *caller, MonoMethod *base);
+ 						  vic = mono_wasm_jit_alloc_ic (is_delegate_invoke, cfg->method, call->method); }
+ #else
+@@ -5547,7 +5547,7 @@ vcall_nullchk_done:
+ 						 * shared InterpMethod load nor a slot-liveness bitmap test. Way zero remains straight-line;
+ 						 * the remaining ways use one compact loop and all hits share one typed call tail. */
+ 						{
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 							extern int mono_wasm_jit_imethod_fslot_off (void);
+ 							int fslot_off = mono_wasm_jit_imethod_fslot_off ();
+ 							extern guint32 mono_wasm_jit_vcall_pic_site_id (gpointer ic);
+@@ -5621,7 +5621,7 @@ vcall_nullchk_done:
+ 							 * MethodHandle invoke is a delegate invoke, so those stubs carry the unrolled
+ 							 * VCALL_WAYS-deep chain below and it dominates their emitted size. */
+ 							int ic_ways = mono_wasm_jit_vcall_ways;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 							/* MONO_WASM_JIT_IC_AUTOSIZE gated this and shipped 1: narrow a site's inline-cache
+ 							 * width to what the interpreter actually observed there, rather than using the
+ 							 * global VCALL_WAYS everywhere. The cold-scan loop it removes is a block, a
+@@ -5656,7 +5656,7 @@ vcall_nullchk_done:
+ 							 * from the profile's id_targets[], recorded by the OBSERVER -- resolving it here via
+ 							 * mono_class_get_virtual_method is the documented deadlock (class init -> IKVM
+ 							 * classloader -> synchronous cross-thread JS call under the compile lock). */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 							/* R206b: ARMS AT A POLYMORPHIC SITE.
+ 							 *
+ 							 * The first version hung this off a site that ALREADY had arm 1 and measured
+@@ -5771,7 +5771,7 @@ vcall_nullchk_done:
+ 								}
+ 								#undef WJ_ARM_OK
+ 							}
+-#endif /* HOST_BROWSER */
++#endif /* WJ_RUNTIME */
+ 							if (0 && pred_fslot > 0 && pred_vt && pred_target &&
+ 							    !is_delegate_invoke) {
+ 								extern gboolean mono_wasm_jit_prof_predict_alt (gpointer caller, MonoMethod *base,
+@@ -5934,7 +5934,7 @@ vcall_nullchk_done:
+ 							/* OBJGUARD (once, hoisted above the N ways): validate the receiver before any raw
+ 							 * this->vtable load. Otherwise a type-confused scalar/garbage receiver traps as a bare
+ 							 * wasm OOB before the C resolver can print anything. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 							if (G_UNLIKELY (lc.objguard && lc.check_ti >= 0)) {
+ 								extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+ 								if (!wasm_ld (&body, &lc, this_vr)) { fail = "ic this guard ld"; goto done; }
+@@ -6491,7 +6491,7 @@ vcall_nullchk_done:
+ 									if (mono_wasm_jit_vcall_aot_ways > 1) {
+ 										wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) aic_vtab_idx);
+ 										wasm_i32_const (&body, (gint32) (intptr_t) aic);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 										wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_vcall_aot_pic_lookup, vtdi);
+ #else
+ 										wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7fe2, (guint32) vtdi);
+@@ -6550,7 +6550,7 @@ vcall_cold_miss_emit:
+ 							/* Legacy per-caller cold miss lowering, retained for an env-var A/B. */
+ 							/* $scratch = imported s.b (see the direct-residual site above). HOT now that
+ 							 * vcall_shared_miss=0 makes per-site cold-miss lowering the active path. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						wasm_op (&body, WASM_OP_GLOBAL_GET); wasm_uleb (&body, 7);
+ #else
+ 						wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ffb, (guint32) vtsi);
+@@ -6563,14 +6563,14 @@ vcall_cold_miss_emit:
+ 						 * shadow stack (so a GC moves them safely; `this` is by value). Stash fslot at scratch+208. */
+ 						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);            /* store-addr base for fslot@208 */
+ 						if (!wasm_ld (&body, &lc, this_vr)) { fail = "vcall this ld"; goto done; }
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						wasm_i32_const (&body, (gint32) (intptr_t) call->method);
+ #else
+ 						wasm_i32_const (&body, 0x7ffd);
+ #endif
+ 						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);            /* 3rd arg: scratch */
+ 						wasm_i32_const (&body, (gint32) (intptr_t) vic);                           /* 4th arg: inline cache */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 						wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_vcall_resolve_fslot, vtrfi);
+ #else
+ 						wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ffa, (guint32) vtrfi); /* -> fslot */
+@@ -6623,7 +6623,7 @@ vcall_cold_miss_emit:
+ 									wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+ 									if (!wasm_ld (&body, &lc, this_vr)) { fail = "vcall aot this ld"; goto done; }
+ 									wasm_i32_const (&body, (gint32) (intptr_t) aic);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 									wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_vcall_aot_target, aotti);
+ #else
+ 									wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff9, (guint32) aotti);
+@@ -6785,10 +6785,10 @@ vcall_cold_miss_emit:
+ 							/* DIAG (WASM_JIT_BADREF_ARG caller attribution): bake THIS (calling) method at scratch+224
+ 							 * (mirrors the direct residual site; 224 is past ret(192)/target(200)/fslot(208)/aot(212,216)).
+ 							 * EMITTED ONLY UNDER OBJGUARD, like its twin above and like its reader in call_interp.
+-							 * The knob itself is HOST_BROWSER-only (it has no meaning in mono-aot-cross, which never
++							 * The knob itself is WJ_RUNTIME-only (it has no meaning in mono-aot-cross, which never
+ 							 * runs this tier), so the cross build simply never emits the store -- where it previously
+ 							 * emitted a 0x7ff8 placeholder that nothing has ever read. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 							if (G_UNLIKELY (mono_wasm_jit_objguard)) {
+ 								wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+ 								wasm_i32_const (&body, (gint32) (intptr_t) cfg->method);
+@@ -6803,7 +6803,7 @@ vcall_cold_miss_emit:
+ 							wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) scratch_idx);
+ 							wasm_op (&body, WASM_OP_I32_LOAD); wasm_memarg (&body, 2, 220);
+ 							wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, (guint8) WASM_I32);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_call_delegate);
+ 							wasm_op (&body, WASM_OP_ELSE);
+ 								wasm_i32_const (&body, (gint32) (intptr_t) mono_wasm_jit_call_interp);
+@@ -6942,7 +6942,7 @@ vcall_cold_miss_emit:
+ 		if (lcse && lcse_exit && i < N && lcse_exit [i])
+ 			*lcse_exit [i] = *lcse;
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	WJ_COLD_ACCOUNT ();
+ 	if (cfg->wasm_jit_tier >= 2)
+ 		mono_wasm_jit_counters [WJC_COLD_T2_BYTES_ALL] += body.len - wj_cold_start;
+@@ -6993,7 +6993,7 @@ vcall_cold_miss_emit:
+ 			wasm_op (&body, WASM_OP_END);   /* close throw[i]; br_if $throw_i lands here */
+ 			RAISE_ENSURE_REF_FRAME ();
+ 			wasm_i32_const (&body, eid);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			{ extern void mono_wasm_jit_raise_corlib (int exc_id); wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_raise_corlib, sti); }
+ #else
+ 			wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff8, (guint32) sti);
+@@ -7009,7 +7009,7 @@ vcall_cold_miss_emit:
+ 		 * $blk=h + br $outer to re-dispatch into the handler bb. */
+ 		wasm_op (&body, WASM_OP_CATCH); wasm_uleb (&body, 0);   /* tag 0 = x.e */
+ 		wasm_op_local (&body, WASM_OP_LOCAL_SET, (guint32) eh_exc_idx);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* R353: this frame is the one resuming, so its record is the current island (dispatch and
+ 		 * wj_eh_restore_lmf read cur_island_il_state in record mode; WJC_EHREC_DISPATCH_NOREC checks it). */
+ 		if (ehrec_on) {
+@@ -7022,7 +7022,7 @@ vcall_cold_miss_emit:
+ 		wasm_i32_const (&body, 0x7ff0);   /* offline: placeholder EH-table addr */
+ #endif
+ 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) dispatch_idx);   /* $blk = the throwing bb */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		{ extern int mono_wasm_jit_eh_dispatch (WasmEhTable *t, int blk); wj_emit_helper_call (&body, (gpointer) mono_wasm_jit_eh_dispatch, eh_dispatch_ti); }
+ #else
+ 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff1, (guint32) eh_dispatch_ti);
+@@ -7032,7 +7032,7 @@ vcall_cold_miss_emit:
+ 		wasm_op (&body, WASM_OP_I32_LT_S);
+ 		wasm_op (&body, WASM_OP_IF); wasm_u8 (&body, 0x40);     /* h < 0: no local handler */
+ 		/* the method escapes via rethrow -> pop its il_state island first */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		if (ehrec_on)
+ 			EMIT_EHREC_POP ();
+ 		else
+@@ -7044,12 +7044,12 @@ vcall_cold_miss_emit:
+ 		wasm_op (&body, WASM_OP_END);                          /* end if */
+ 		/* matched: claim+release the C++ exception (balance the cxa handler count), then dispatch. */
+ 		wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) eh_exc_idx);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		{ extern void mono_jiterp_begin_catch (void *e); wj_emit_helper_call (&body, (gpointer) mono_jiterp_begin_catch, eh_type_idx); }
+ #else
+ 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff2, (guint32) eh_type_idx);   /* (i32)->void */
+ #endif
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		{ extern void mono_jiterp_end_catch (void); wj_emit_helper_call (&body, (gpointer) mono_jiterp_end_catch, eh_endcatch_ti); }
+ #else
+ 		wj_emit_helper_call (&body, (gpointer) (intptr_t) 0x7ff3, (guint32) eh_endcatch_ti);   /* ()->void */
+@@ -7063,7 +7063,7 @@ vcall_cold_miss_emit:
+ 		 * catches (e.g. a finally that re-raises and is re-caught). Unconditional: an eh_on method always
+ 		 * captures refbase in the prologue (== entry_sp for an empty frame). leave_ti is registered for
+ 		 * eh_on. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		{
+ 			wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+ 			wasm_op (&body, WASM_OP_GLOBAL_SET); wasm_uleb (&body, 0);
+@@ -7191,11 +7191,11 @@ vcall_cold_miss_emit:
+ 			 * reservation, which means its pair is allocated below, after framing -- see wj_asm_reaches
+ 			 * for why a slot that does not exist yet is safe rather than unknown.
+ 			 *
+-			 * HOST_BROWSER only, and not merely because there is nothing to import offline: both of these
++			 * WJ_RUNTIME only, and not merely because there is nothing to import offline: both of these
+ 			 * live in the interpreter (transform.c), which mono-aot-cross does not link. csyn.sh compiles
+ 			 * this file for both targets and still cannot see that -- it is a LINK error, and it is the
+ 			 * one class of breakage a per-file check cannot catch. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			{ extern int mono_wasm_jit_self_reserved (MonoMethod *m, int *e_out, int *f_out);
+ 			  extern int mono_wasm_jit_get_callee_fslot (MonoMethod *m);
+ 			  int se = 0, sf = 0;
+@@ -7247,12 +7247,12 @@ vcall_cold_miss_emit:
+ 			 * would mean the emit-time recording was already complete and this is inert; a large number
+ 			 * is the size of the hole R285 found one instance of.
+ 			 */
+-			/* HOST_BROWSER-ONLY, and structurally so: wj_result_add_direct_dep lives inside
+-			 * mini-wasm-ir.inc's `#ifdef HOST_BROWSER` region, while this framing block also runs in the
++			/* WJ_RUNTIME-ONLY, and structurally so: wj_result_add_direct_dep lives inside
++			 * mini-wasm-ir.inc's `#ifdef WJ_RUNTIME` region, while this framing block also runs in the
+ 			 * offline cross-compiler dump path -- which has no admission and therefore no use for a
+ 			 * dependency set. An unguarded call here compiles in the browser database and fails the
+ 			 * cross LINK, the gap csyn.sh cannot see. */
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 			{
+ 				WjAsmDeps sdeps;
+ 				int di;
+@@ -7298,14 +7298,14 @@ vcall_cold_miss_emit:
+ 		wasm_buf_free (&out);   /* freed before `done:` on the normal path (below), so free it here */
+ 		goto done;
+ 	  } }
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{ extern int mono_wasm_jit_t2_unit;
+ 	  if (G_UNLIKELY (mono_wasm_jit_t2_unit == 2) && !fail && cfg->wasm_jit_tier >= 2 && wj_stored_body)
+ 		wj_t2u_census (cfg->method, wj_stored_body);
+ 	}
+ #endif
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{
+ 		/* Live single-method hex dump, selected by full-name substring (MONO_WASM_JIT_HEX_METHOD).
+ 		 *
+@@ -7353,7 +7353,7 @@ vcall_cold_miss_emit:
+ 				mono_wasm_jit_note_table_exhausted ();
+ 			}
+ 		  } }
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* Phase 5: a pool pair's stubs are of the functype the callers reserved it under. A body compiled to any
+ 		 * other type must not go in behind them; take a fresh pair and let the stubs route to the interpreter. */
+ 		{ WasmFuncType pft;
+@@ -7508,7 +7508,7 @@ done:
+ 	wj_body_free (wj_stored_body);   /* NULL once the registry has taken it */
+ 	wj_stored_body = NULL;
+ 	wasm_buf_free (&body);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #endif
+ 	if (G_UNLIKELY (mono_wasm_jit_stats) && wj_gen_t0) {
+ 		/* Compile-time accounting (Part 2): GENERATION = total emit time minus the JS instantiate
+@@ -7519,7 +7519,7 @@ done:
+ 		mono_wasm_jit_add (WJC_ELAPSED_INSTANTIATION, (gint64) (wj_inst_ms * 1000.0));
+ 		mono_wasm_jit_count (WJC_COMPILE_ATTEMPTS);
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* Retriable iff the bail was "callee not jitted" (an ordering/island issue that may resolve once the
+ 	 * callee JITs); EH clauses / unsupported opcodes / synchronized / byref are permanent. The auto-JIT
+ 	 * trigger reads this to pick a retry vs permanent slot state.
+diff --git a/src/mono/mono/mini/mini-wasm-gex.h b/src/mono/mono/mini/mini-wasm-gex.h
+new file mode 100644
+index 000000000..c0db27921
+--- /dev/null
++++ b/src/mono/mono/mini/mini-wasm-gex.h
+@@ -0,0 +1,73 @@
++/**
++ * \file
++ * The runtime wasm JIT under gex (noita-wasm docs/unity-dotnet.md P5): what
++ * the browser build gets from emscripten and from JS, here from the C library
++ * and from gex host imports (the provider's `gex.provider_jit_*`). Mono runs
++ * as a gex stateful provider: a wasm64 module with a 64-bit memory and a
++ * table64, instantiated once per guest thread; a JIT module is instantiated
++ * into each thread's store as the browser instantiates one per worker.
++ */
++#ifndef __MONO_MINI_WASM_GEX_H__
++#define __MONO_MINI_WASM_GEX_H__
++
++#include <stdint.h>
++#include <time.h>
++#include <stdio.h>
++
++#define EMSCRIPTEN_KEEPALIVE __attribute__((used))
++
++static inline double
++emscripten_get_now (void)
++{
++	struct timespec ts;
++	clock_gettime (CLOCK_MONOTONIC, &ts);
++	return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++
++/* ---- gex host imports (shims/native libprov.rs; later the page's gex.mjs) ---- */
++
++#define WJ_GEX_IMPORT(n) __attribute__((import_module ("gex"), import_name (n)))
++
++/* Compile `bytes` (cached process-wide by content) and instantiate it into
++ * THIS thread's store, as the browser's `new WebAssembly.Instance` on one
++ * worker. Its imports: m.h the guest memory, f.f this store's function table,
++ * s.p this thread's provider __stack_pointer, s.<consts_names[k]> = consts[k]
++ * (each as the global type the module declares), h.<index> = table[index].
++ * Then, for each k < n, table[slots[k]] = the export named by the k-th
++ * NUL-terminated string in `names`. 1, or 0 with the reason in errbuf. */
++WJ_GEX_IMPORT ("provider_jit_instantiate") int
++gexwj_host_instantiate (const void *bytes, uint64_t len, const char *consts_names, const uint64_t *consts, uint64_t nconsts,
++	const int64_t *slots, const char *names, uint64_t n, char *errbuf, uint64_t errcap);
++
++/* This store's table. GEXWJ_TABLE_REAL: 1 if this store installed a function
++ * at a (written again, which repairs an overwrite), 0 if it installed none. GEXWJ_TABLE_ALIAS: table[a] = table[b] (recorded as installed).
++ * GEXWJ_TABLE_ARITY: the parameter count of table[a]'s function, -1 if
++ * null. */
++/* The names of the s.* globals, in the order of the consts array. */
++#define GEXWJ_CONST_NAMES "l\0c\0v\0n\0d\0m\0b\0i\0g\0"
++
++#define GEXWJ_TABLE_REAL 0
++#define GEXWJ_TABLE_ALIAS 1
++#define GEXWJ_TABLE_ARITY 2
++WJ_GEX_IMPORT ("provider_jit_table") int64_t gexwj_host_table (int op, int64_t a, int64_t b);
++
++/* Reserve n slots of the process's function table, every store's filled
++ * with table[fill] (in this store): the first index, or 0. */
++WJ_GEX_IMPORT ("provider_jit_reserve") int64_t gexwj_host_reserve (int64_t n, int64_t fill);
++
++/* This thread's provider C stack (gexprov64.h): [lo, lo + 1 MiB). */
++WJ_GEX_IMPORT ("provider_stack") uint64_t gexwj_host_stack (void);
++#define GEXWJ_STACK_SIZE (1ul << 20)
++
++static inline uintptr_t emscripten_stack_get_end (void) { return (uintptr_t) gexwj_host_stack (); }
++static inline uintptr_t emscripten_stack_get_base (void) { return (uintptr_t) gexwj_host_stack () + GEXWJ_STACK_SIZE; }
++static inline uintptr_t __attribute__((noinline)) emscripten_stack_get_current (void) { volatile char here; return (uintptr_t) &here; }
++
++/* The browser's main-thread setInterval for the tier-2 / edge samplers: a
++ * plain thread calling mono_wasm_jit_edge_tick every `ms` (mini-wasm.c). */
++void gexwj_start_ticker (int ms);
++
++/* A JS stack trace in the browser; nothing to print here. */
++static inline void gexwj_log (const char *line) { fprintf (stderr, "%s\n", line); }
++
++#endif
+diff --git a/src/mono/mono/mini/mini-wasm-ir.inc b/src/mono/mono/mini/mini-wasm-ir.inc
+index 3477e4b02..7a0441b3c 100644
+--- a/src/mono/mono/mini/mini-wasm-ir.inc
++++ b/src/mono/mono/mini/mini-wasm-ir.inc
+@@ -872,7 +872,7 @@ static gboolean
+ wasm_addr_ld (WasmBuf *b, WjCtx *c, int vreg)
+ {
+ 	guint32 off = (guint32) c->addrslot [vreg];
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* STOREGUARD, LOAD SIDE -- the addr-frame counterpart of the kind-0 guard added to wasm_ld's refslot
+ 	 * branch. kind 1 was emitted only by wasm_addr_st, so an addr-frame READ through a bad addrbase was
+ 	 * unchecked. Direct emission, not wasm_guard_memaddr: that helper calls wasm_ld. */
+@@ -923,9 +923,9 @@ wasm_addr_st (WasmBuf *b, WjCtx *c, int vreg)
+ 	default: return FALSE;
+ 	}
+ 	wasm_op_local (b, WASM_OP_LOCAL_SET, (guint32) c->addr_tmp [g]);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	if (G_UNLIKELY (c->storeguard)) {
+-		/* check_store(addrbase + off, 1) before the store (STOREGUARD; arenas+helper are HOST_BROWSER) */
++		/* check_store(addrbase + off, 1) before the store (STOREGUARD; arenas+helper are WJ_RUNTIME) */
+ 		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+ 		wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->addrbase);
+ 		wasm_i32_const (b, (gint32) off);
+@@ -979,7 +979,7 @@ wasm_ld (WasmBuf *b, WjCtx *c, int vreg)
+ 			return TRUE;
+ 		}
+ 		/* reference vreg: load from the GC-scanned ref shadow stack */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* STOREGUARD, LOAD SIDE. kinds 0/1 were store-only, so a frame LOAD through a bad refbase was
+ 		 * the one piece of emitter memory traffic no guard covered -- and after R269 excluded a wild
+ 		 * membase base (OBJGUARD kind 2/3), a bad membase EFFECTIVE address (kind 4, which adds the
+@@ -1011,7 +1011,7 @@ wasm_ld (WasmBuf *b, WjCtx *c, int vreg)
+ static gboolean
+ wasm_guard_memaddr (WasmBuf *b, WjCtx *c, int base_vreg, gint32 offset)
+ {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	if (G_UNLIKELY (c->objguard && c->check_ti >= 0)) {
+ 		extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+ 		if (!wasm_ld (b, c, base_vreg))
+@@ -1053,9 +1053,9 @@ wasm_st (WasmBuf *b, WjCtx *c, int vreg)
+ 			wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->frame_active);
+ 			wasm_op (b, WASM_OP_IF); wasm_u8 (b, 0x40);
+ 		}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		if (G_UNLIKELY (c->storeguard)) {
+-			/* check_store(refbase + slot*4, 0) before the store (STOREGUARD; arenas+helper are HOST_BROWSER) */
++			/* check_store(refbase + slot*4, 0) before the store (STOREGUARD; arenas+helper are WJ_RUNTIME) */
+ 			extern void mono_wasm_jit_check_store (guint8 *addr, int kind);
+ 			wasm_op_local (b, WASM_OP_LOCAL_GET, (guint32) c->refbase);
+ 			wasm_i32_const (b, (gint32) (c->refslot [vreg] * 4));
+@@ -1133,7 +1133,7 @@ wj_fcmp_op (gboolean is_f32, int kind)
+ 	}
+ }
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ /* The synchronized-INNER wrapper (the dummy a MONO_WRAPPER_SYNCHRONIZED wrapper calls to reach the real
+  * body — see method-to-ir.c) is created FRESH on every IR build (mono_marshal_get_synchronized_inner_wrapper
+  * is uncached), so its MonoMethod — and thus its InterpMethod and wasm f-slot — changes on every compile.
+@@ -1704,7 +1704,7 @@ mono_wasm_get_call_info (MonoMethodSignature *sig, WasmCallInfo *ci)
+ #define WJ_ENTRY_LD_U16      7
+ #define WJ_ENTRY_LD_ASIS     8   /* the local already holds the value (this-reference, byref, pointer) */
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ EMSCRIPTEN_KEEPALIVE int
+ mono_wasm_jit_entry_sig (MonoMethod *method, guint8 *kinds, guint8 *vtypes, int max)
+ {
+@@ -2045,7 +2045,7 @@ wj_emit_ic_load64 (WasmBuf *b, guint32 off)
+  * runtime's linear memory (the emitter runs in the same process, same memory — just like the embedded C
+  * function-pointer constants). i64.atomic.rmw.add (0xfe 0x26, align 3) keeps the count correct when worker
+  * threads share the site; the returned old value is dropped. No-op unless profile_fast is set at emit time,
+- * so normal STATS runs pay nothing. Only called from HOST_BROWSER fast-path sites; G_GNUC_UNUSED for the
++ * so normal STATS runs pay nothing. Only called from WJ_RUNTIME fast-path sites; G_GNUC_UNUSED for the
+  * cross-compiler build (which never reaches those sites). */
+ 
+ static G_GNUC_UNUSED void
+@@ -2349,7 +2349,7 @@ wj_asm_intern_import (WasmFuncImport *himp, int *nhimp, int cap, guint32 table_i
+  */
+ #define WJ_REACH_MAX 512   /* descriptors visited before giving up; giving up means REACHABLE, i.e. no import */
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 
+ static __thread guint32 *wj_reach_stamp;   /* per registry index; == wj_reach_gen means "seen this walk" */
+ static __thread int     *wj_reach_stack;
+@@ -2576,7 +2576,7 @@ wj_asm_resolve_body (const WasmBuf *b, WasmRelocFix *fix, guint32 ti_base, int s
+ 			 * structure in a refactor that was supposed to change none. The kinds are the population
+ 			 * labels and the predicate is the behaviour -- keeping them separate is what makes this
+ 			 * arm's unification provably inert. */
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			/* A FIXED INDEX THAT IS A JIT SLOT (R291). These kinds are supposed to name C helpers and AOT
+ 			 * bodies, which need no admission -- so nothing declares them, and if the index is in fact a
+ 			 * JITted method's f-slot, admission can never install it and the first worker that reaches the
+@@ -2670,7 +2670,7 @@ wj_asm_policy_init (WjAsmPolicy *pol, gboolean local_calls)
+ 	pol->max_fimports = WJ_HELPER_IMPORT_CAP;
+ 	pol->names = mono_wasm_jit_names ? 1 : 0;
+ 	pol->local_calls = local_calls ? 1 : 0;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #endif
+ }
+ 
+diff --git a/src/mono/mono/mini/mini-wasm-lazy.inc b/src/mono/mono/mini/mini-wasm-lazy.inc
+index 81649d1e4..260d6abd2 100644
+--- a/src/mono/mono/mini/mini-wasm-lazy.inc
++++ b/src/mono/mono/mini/mini-wasm-lazy.inc
+@@ -30,7 +30,7 @@
+  */
+ 
+ /* A lazy pool slot? Answered for the non-browser build too, because wj_fslot_is_nogc compiles in both. */
+-#ifndef HOST_BROWSER
++#ifndef WJ_RUNTIME
+ static gboolean wj_lazy_is_pool_slot (int slot) { (void) slot; return FALSE; }
+ static gboolean wj_lazy_dep_needs_real (int slot) { (void) slot; return FALSE; }
+ #else
+@@ -111,6 +111,7 @@ wj_lazy_ensure_bank (int bank)
+ 	if (!b)
+ 		return FALSE;
+ 	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
++#ifdef HOST_BROWSER
+ 	ok = EM_ASM_INT ({
+ 		var p = $0 < 0 ? $0 + 4294967296 : $0;
+ 		try {
+@@ -133,6 +134,13 @@ wj_lazy_ensure_bank (int bank)
+ 			return 0;
+ 		}
+ 	}, (int) (intptr_t) b->bytes, b->len);
++#else
++	{
++		/* gex: a bank's active segments write its stubs into this store's table; its s.* other than p are 0. */
++		static const uint64_t zeros [9];
++		ok = gexwj_host_instantiate (b->bytes, (uint64_t) b->len, GEXWJ_CONST_NAMES, zeros, 9, NULL, "", 0, NULL, 0);
++	}
++#endif
+ 	WJ_JS_BLOCKING_END (__wj_cookie, __wj_sd, __wj_entered);
+ 	if (!ok) {
+ 		mono_wasm_jit_counters [WJC_LAZY_BANK_FAIL]++;
+@@ -161,6 +169,7 @@ wj_lazy_ensure_bank_of_slot (int slot)
+ static gboolean
+ wj_lazy_table_real (int slot)
+ {
++#ifdef HOST_BROWSER
+ 	int r = EM_ASM_INT ({
+ 		var m = Module.__wjSlotFn;
+ 		var fn = m && m.get ($0);
+@@ -168,6 +177,9 @@ wj_lazy_table_real (int slot)
+ 		if (wasmTable.get ($0) !== fn) { wasmTable.set ($0, fn); return 2; }
+ 		return 1;
+ 	}, slot);
++#else
++	int r = (int) gexwj_host_table (GEXWJ_TABLE_REAL, slot, 0);
++#endif
+ 	if (r == 2)
+ 		mono_wasm_jit_counters [WJC_LAZY_REPAIR]++;
+ 	return r != 0;
+@@ -455,11 +467,15 @@ mono_wasm_jit_lazy_bind (int slot)
+ 		re = d > 0 ? wj_reg_at (d - 1) : NULL;
+ 		if (re && (re->logical_method == ls->method || re->body_method == ls->method) &&
+ 		    re->f_sig_id == wj_functype_hash (&wj_lazy_banks [ls->bank - 1]->ft)) {
++#ifdef HOST_BROWSER
+ 			EM_ASM ({
+ 				var fn = wasmTable.get ($1);
+ 				wasmTable.set ($0, fn);
+ 				if (Module.__wjSlotFn) Module.__wjSlotFn.set ($0, fn);   /* so a worker take-up resets it (R293) */
+ 			}, slot, f);
++#else
++			gexwj_host_table (GEXWJ_TABLE_ALIAS, slot, f);
++#endif
+ 			mono_wasm_jit_counters [WJC_LAZY_BIND_ALIAS]++;
+ 			return f;
+ 		}
+@@ -519,4 +535,4 @@ mono_wasm_jit_lazy_interp (int slot, guint8 *buf)
+ 	return 0;
+ }
+ 
+-#endif /* HOST_BROWSER */
++#endif /* WJ_RUNTIME */
+diff --git a/src/mono/mono/mini/mini-wasm-publish.inc b/src/mono/mono/mini/mini-wasm-publish.inc
+index 8fdad331b..107b023e0 100644
+--- a/src/mono/mono/mini/mini-wasm-publish.inc
++++ b/src/mono/mono/mini/mini-wasm-publish.inc
+@@ -603,6 +603,7 @@ wj_edge_sample (void)
+ 	 * the JIT method whose entry this is, then its caller. V8 prints a wasm frame as
+ 	 * `at <module>.<function> (wasm://wasm/<module>-<hash>:wasm-function[N]:0xOFF)`; method names contain
+ 	 * " (" themselves, hence lastIndexOf. The limit is narrowed only around the capture. */
++#ifdef HOST_BROWSER
+ 	EM_ASM ({
+ 		var o = Error.stackTraceLimit;
+ 		Error.stackTraceLimit = 10;
+@@ -647,6 +648,9 @@ wj_edge_sample (void)
+ 		if (fr.length === 2 && fr [0][0] === 0)
+ 			Module._mono_wasm_jit_edge_record (fr [0][1], fr [1][0], fr [1][1]);
+ 	});
++#else
++	/* gex: no JS stack to sample; the edge sampler stays off */
++#endif
+ }
+ 
+ /* The ENTRY poll's helper (bb_entry's OP_GC_SAFE_POINT, under MONO_WASM_JIT_EDGE_SAMPLE only). */
+@@ -725,8 +729,12 @@ mono_wasm_jit_t2_start (void)
+ 	extern int mono_wasm_jit_t2, mono_wasm_jit_t2_sample_ms, mono_wasm_jit_edge_sample;
+ 	if (!mono_wasm_jit_t2 || mono_wasm_jit_edge_sample > 0)
+ 		return;
++#ifdef HOST_BROWSER
+ 	MAIN_THREAD_ASYNC_EM_ASM ({ setInterval (function () { Module._mono_wasm_jit_edge_tick (); }, $0); },
+ 		mono_wasm_jit_t2_sample_ms);
++#else
++	gexwj_start_ticker (mono_wasm_jit_t2_sample_ms);
++#endif
+ }
+ 
+ /* Main-thread timer body. */
+@@ -752,8 +760,12 @@ mono_wasm_jit_edge_start (void)
+ 	wj_edge_count = (volatile gint32 *) g_new0 (gint32, 1 << WJ_EDGE_BITS);
+ 	mono_memory_barrier ();
+ 	wj_edge_callee = (volatile gint32 *) g_new0 (gint32, 1 << WJ_EDGE_BITS);   /* last: it is the "ready" test */
++#ifdef HOST_BROWSER
+ 	MAIN_THREAD_ASYNC_EM_ASM ({ setInterval (function () { Module._mono_wasm_jit_edge_tick (); }, $0); },
+ 		mono_wasm_jit_edge_sample);
++#else
++	gexwj_start_ticker (mono_wasm_jit_edge_sample);
++#endif
+ }
+ 
+ /* The dump: totals and the heaviest edges with their names. Main thread; ints plus owned name copies only. */
+diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
+index f6777a63c..05b9b0b7f 100644
+--- a/src/mono/mono/mini/mini-wasm.c
++++ b/src/mono/mono/mini/mini-wasm.c
+@@ -15,7 +15,7 @@
+ #include <mono/utils/mono-time.h>
+ #include <mono/utils/mono-memory-model.h>   /* MONO_MEMORY_BARRIER_* for OP_MEMORY_BARRIER lowering */
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #ifndef DISABLE_THREADS
+ #include <mono/utils/mono-threads-wasm.h>
+ #endif
+@@ -29,8 +29,12 @@ static int mono_wasm_debug_level = 0;
+ #include "wasm-encoder.h"
+ #include <stdlib.h>
+ int mono_wasm_jit_get_callee_fslot (MonoMethod *m); /* interp/transform.c */
++#ifdef WJ_RUNTIME
+ #ifdef HOST_BROWSER
+ #include <emscripten.h>
++#else
++#include <mono/mini/mini-wasm-gex.h>
++#endif
+ int mono_jiterp_allocate_table_entry (int type); /* interp/jiterpreter.c */
+ gpointer mono_interp_get_imethod (MonoMethod *method); /* interp/interp.c; kept opaque in this emitter */
+ gboolean mono_wasm_jit_prof_predict (gpointer caller, MonoMethod *base, MonoVTable **out_vt,
+@@ -462,7 +466,7 @@ int mono_wasm_jit_colocate_bytes = 32768;
+  * dump alone gets the sign backwards -- see scratchpad/wj/partreach.py, which now reports both. */
+ /* MONO_WASM_JIT_DUMP_DEP_GRAPH: one-shot dump of the registry dependency graph for offline cycle analysis
+  * (scratchpad/wj/depcycles.py). Defined HERE, with the other knobs, rather than beside the dumper it gates:
+- * the dumper lives inside #ifdef HOST_BROWSER but mono_wasm_jit_dump_stats does not, so a definition down
++ * the dumper lives inside #ifdef WJ_RUNTIME but mono_wasm_jit_dump_stats does not, so a definition down
+  * there links in the browser build and leaves mono-aot-cross with an undefined symbol. csyn.sh compiles
+  * both databases but does not LINK either, so it cannot catch that. */
+ int mono_wasm_jit_dump_dep_graph_knob = 0;
+@@ -750,7 +754,7 @@ int mono_wasm_jit_vcall_aot_ways = 1; /* MONO_WASM_JIT_VCALL_AOT_WAYS: N-way inl
+  * (Minecraft plateau, 2026-08, 2 rounds): p90 -12.8%, mean frame -12.0%, fps +13.6%. Costs boot: classload
+  * +5.0%, resources +7.1% -- fewer ways means more misses while receivers are still being discovered. */
+ 
+-/* NB: compiled into BOTH the browser runtime and mono-aot-cross (no longer HOST_BROWSER-gated) so the
++/* NB: compiled into BOTH the browser runtime and mono-aot-cross (no longer WJ_RUNTIME-gated) so the
+  * OFFLINE cross-compiler dump path (mini.c COMPILE_WASM fork) reads MONO_WASM_JIT_VERBOSE/DUMP_IR/STATS +
+  * every lever from the env, exactly like the in-browser transform — that's what makes
+  * `mono-aot-cross --aot <dll>` with MONO_WASM_JIT_METHOD set a faithful offline emit/bail dumper.
+@@ -888,8 +892,8 @@ mono_wasm_jit_auto_init (void)
+ 	{ extern int mono_wasm_jit_entry_promote; const char *ep = g_getenv ("MONO_WASM_JIT_ENTRY_PROMOTE"); mono_wasm_jit_entry_promote = (ep && *ep) ? atoi (ep) : mono_wasm_jit_entry_promote; }      /* Lever A: 0=off */
+ 	{ extern int mono_wasm_jit_profile_fast; const char *pf = g_getenv ("MONO_WASM_JIT_PROFILE_FAST"); mono_wasm_jit_profile_fast = (pf && *pf && *pf != '0') ? 1 : 0; } /* emit fast-path volume counters, 0=off */
+ 	{ extern int mono_wasm_jit_promotion_drain; const char *pd = g_getenv ("MONO_WASM_JIT_PROMOTION_DRAIN"); mono_wasm_jit_promotion_drain = (pd && *pd && atoi (pd) > 0) ? atoi (pd) : mono_wasm_jit_promotion_drain; }
+-#ifdef HOST_BROWSER
+-	/* These three are DEBUG store/GC guards whose globals + runtime-check emission are HOST_BROWSER-only
++#ifdef WJ_RUNTIME
++	/* These three are DEBUG store/GC guards whose globals + runtime-check emission are WJ_RUNTIME-only
+ 	 * (they insert per-store checks that only do anything when the JITted code actually RUNS). The offline
+ 	 * cross-compiler dump never executes JITted code, so skip their env here — otherwise auto_init would
+ 	 * reference browser-only globals and fail to link into mono-aot-cross. */
+@@ -909,7 +913,7 @@ mono_wasm_jit_auto_init (void)
+ 	{ extern int mono_wasm_jit_refverify; const char *rv = g_getenv ("MONO_WASM_JIT_REFVERIFY"); mono_wasm_jit_refverify = (rv && *rv) ? atoi (rv) : 0; } /* 1=log, 2=assert classification-vs-structural-marking violations; default off */
+ 	{ extern int mono_wasm_jit_entry_adopt; const char *ea = g_getenv ("MONO_WASM_JIT_ENTRY_ADOPT"); if (ea && *ea) mono_wasm_jit_entry_adopt = *ea != '0'; }
+ 	{ extern int mono_wasm_jit_edge_sample; const char *es = g_getenv ("MONO_WASM_JIT_EDGE_SAMPLE"); if (es && *es) { int v = atoi (es); mono_wasm_jit_edge_sample = (v >= 0 && v <= 10000) ? v : 0; } }
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	{ extern void mono_wasm_jit_edge_start (void); mono_wasm_jit_edge_start (); }
+ 	{ extern void mono_wasm_jit_t2_start (void); mono_wasm_jit_t2_start (); }
+ #endif
+@@ -1105,7 +1109,7 @@ int mono_wasm_jit_frame_zero = 0;
+  * with its own generated call_indirect and has no way to read a wasm global, so it must either be given
+  * an imported global or be refused the direct-forward path -- which is a confound to name, not a free
+  * change. */
+-/* MONO_WASM_JIT_ENTRYCENSUS=1; the census state and reader live in the HOST_BROWSER section below, but
++/* MONO_WASM_JIT_ENTRYCENSUS=1; the census state and reader live in the WJ_RUNTIME section below, but
+  * this flag must be defined OUT here: mono_wasm_jit_auto_init reads it and mini-wasm.c is linked into
+  * mono-aot-cross as well as the runtime, so a browser-only definition is an undefined symbol at the
+  * cross-compiler link (same reason mono_wasm_jit_devirt_profile is defined here rather than interp.c). */
+@@ -1116,7 +1120,7 @@ int mono_wasm_jit_elidediag = 0;
+ 
+ /* MONO_WASM_JIT_LMF_PUBLISH_DIAG=1: make mono_set_lmf (mini-runtime.c) report any attempt to publish an LMF
+  * chain head whose lmf_addr is still 0 -- i.e. a push that never wrote the LMF body. Defined here, OUTSIDE
+- * HOST_BROWSER, for the same reason the other wasm-JIT flags are: mono-aot-cross links this file. */
++ * WJ_RUNTIME, for the same reason the other wasm-JIT flags are: mono-aot-cross links this file. */
+ int mono_wasm_jit_lmf_publish_diag = 0;
+ /* MONO_WASM_JIT_GUARD_KEEP_SLOTLIVE=1: do not silently disable SLOTLIVE when STOREGUARD/OBJGUARD is on,
+  * so the guards can actually be pointed at an elision-dependent corruption. Costs guard COVERAGE only
+@@ -1165,12 +1169,12 @@ int mono_wasm_jit_residual_mode = 0;   /* SHIPPED DEFAULT. Tuned on Minecraft 1.
+  * DEFAULT OFF. Diagnostic only -- see wj_stack_probe. Exists because two rounds of shaving stack arrays
+  * on a fault-count correlation established nothing, and one run of this settles it. */
+ int mono_wasm_jit_stackprobe = 0;
+-/* Defined here (not in the HOST_BROWSER block) because mono_wasm_emit_method references it in BOTH the
+- * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (HOST_BROWSER). */
+-#ifndef HOST_BROWSER
++/* Defined here (not in the WJ_RUNTIME block) because mono_wasm_emit_method references it in BOTH the
++ * runtime and the cross-compiler build; the env-init lives in mono_wasm_jit_auto_init (WJ_RUNTIME). */
++#ifndef WJ_RUNTIME
+ /* Cross-compiler (host != wasm) stub. mono_wasm_emit_method bakes &mono_wasm_jit_check_store into the
+  * OBJGUARD/STOREGUARD store paths (the STOREM/STOREMI macros), and that code is compiled in BOTH the
+- * runtime and the AOT cross build — but the real body (below, in the HOST_BROWSER block) uses wasm-only
++ * runtime and the AOT cross build — but the real body (below, in the WJ_RUNTIME block) uses wasm-only
+  * builtins (__builtin_wasm_memory_size), so it cannot compile for the x64 host. The cross-compiler never
+  * calls mono_wasm_emit_method (that runs only when cfg->compile_wasm, the runtime browser JIT), so a
+  * never-executed stub here just satisfies the link without perturbing the browser build. */
+@@ -1525,7 +1529,7 @@ mono_wasm_jit_llvmonly_enabled (void)
+ /* Phase 5 (mini-wasm-lazy.inc, included at the end of this file). The first two compile in both builds. */
+ static gboolean wj_lazy_is_pool_slot (int slot);
+ static gboolean wj_lazy_dep_needs_real (int slot);
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ static gboolean wj_lazy_dep_ok (int slot);
+ static void wj_lazy_ensure_bank_of_slot (int slot);
+ static gboolean wj_lazy_pool_ft (int slot, WasmFuncType *out);
+@@ -1534,7 +1538,7 @@ static int wj_lazy_reserve (MonoMethod *m, MonoMethodSignature *csig, gboolean r
+ static int wj_lazy_arm_fslot (MonoMethod *target, MonoMethod *self, const WasmFuncType *ftd);
+ #endif
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ #include "mini-wasm-diagnostics.inc"
+ /* Per-thread record of which function-table slots THIS thread actually instantiated (instantiate_local
+  * returned 1). The wasm function table is per-thread for dynamic entries, and the jiterpreter PREFILLS
+@@ -1714,6 +1718,7 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int
+ 	 * out_ms ($6, an 8-byte-aligned double*) receives the WebAssembly.Module+Instance compile time in ms
+ 	 * (Part 2 instantiation timing) — measured on both the success and CompileError paths; 0/NULL skips it. */
+ 	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
++#ifdef HOST_BROWSER
+ 	_ok = EM_ASM_INT ({
+ 		var p = $2 < 0 ? $2 + 4294967296 : $2;
+ 		var eb = $4 < 0 ? $4 + 4294967296 : $4;
+@@ -1815,6 +1820,21 @@ mono_wasm_jit_instantiate_local (int e_slot, int f_slot, const void *bytes, int
+ 	   (int) (intptr_t) mono_wasm_jit_delegate_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_delegate_pic_cap_addr (),
+ 	   (int) (intptr_t) mono_wasm_jit_scratch (),
+ 	   (int) (intptr_t) mono_wasm_jit_cur_island_il_state_addr ());
++#else
++	{
++		/* gex: the same imports and installs, through the host (mini-wasm-gex.h). */
++		const uint64_t consts [] = { (uintptr_t) &wj_slot_live, (uintptr_t) &wj_slot_live_cap,
++			(uintptr_t) mono_wasm_jit_vcall_pic_ptr_addr (), (uintptr_t) mono_wasm_jit_vcall_pic_cap_addr (),
++			(uintptr_t) mono_wasm_jit_delegate_pic_ptr_addr (), (uintptr_t) mono_wasm_jit_delegate_pic_cap_addr (),
++			(uintptr_t) mono_wasm_jit_scratch (), (uintptr_t) mono_wasm_jit_cur_island_il_state_addr (),
++			(uintptr_t) mono_wasm_jit_worker_action_addr () };
++		const int64_t slots [] = { e_slot, f_slot };
++		double t0 = emscripten_get_now ();
++		_ok = gexwj_host_instantiate (bytes, (uint64_t) len, GEXWJ_CONST_NAMES, consts, 9, slots, "e\0f\0",
++			(e_slot > 0 && f_slot > 0) ? 2 : 0, errbuf, (uint64_t) errcap);
++		if (out_ms) *out_ms = emscripten_get_now () - t0;
++	}
++#endif
+ 	WJ_JS_BLOCKING_END (__wj_cookie, __wj_sd, __wj_entered);
+ 	if (_ok && e_slot > 0 && f_slot > 0) {   /* R322: a validate-only call installed nothing */
+ 		/* Physical installation is not dispatch admission. A freshly compiled module can have unchecked
+@@ -1857,6 +1877,7 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
+ 		if (f_slots [i] > 0)
+ 			wj_lazy_ensure_bank_of_slot (f_slots [i]);   /* Phase 5: as in instantiate_local */
+ 	WJ_JS_BLOCKING_BEGIN (__wj_cookie, __wj_sd, __wj_entered);
++#ifdef HOST_BROWSER
+ 	_ok = EM_ASM_INT ({
+ 		var es = $0 < 0 ? $0 + 4294967296 : $0;
+ 		var fs = $1 < 0 ? $1 + 4294967296 : $1;
+@@ -1991,6 +2012,28 @@ mono_wasm_jit_instantiate_batch_local (const int *e_slots, const int *f_slots, i
+ 	   (int) (intptr_t) mono_wasm_jit_delegate_pic_ptr_addr (), (int) (intptr_t) mono_wasm_jit_delegate_pic_cap_addr (),
+ 	   (int) (intptr_t) mono_wasm_jit_scratch (),
+ 	   (int) (intptr_t) mono_wasm_jit_cur_island_il_state_addr ());
++#else
++	{
++		const uint64_t consts [] = { (uintptr_t) &wj_slot_live, (uintptr_t) &wj_slot_live_cap,
++			(uintptr_t) mono_wasm_jit_vcall_pic_ptr_addr (), (uintptr_t) mono_wasm_jit_vcall_pic_cap_addr (),
++			(uintptr_t) mono_wasm_jit_delegate_pic_ptr_addr (), (uintptr_t) mono_wasm_jit_delegate_pic_cap_addr (),
++			(uintptr_t) mono_wasm_jit_scratch (), (uintptr_t) mono_wasm_jit_cur_island_il_state_addr (),
++			(uintptr_t) mono_wasm_jit_worker_action_addr () };
++		int64_t *slots = g_new (int64_t, 2 * n);
++		GString *names = g_string_new ("");
++		double t0 = emscripten_get_now ();
++		for (i = 0; i < n; ++i) {
++			slots [2 * i] = e_slots [i];
++			slots [2 * i + 1] = f_slots [i];
++			g_string_append_printf (names, "e%d", i); g_string_append_c (names, 0);
++			g_string_append_printf (names, "f%d", i); g_string_append_c (names, 0);
++		}
++		_ok = gexwj_host_instantiate (bytes, (uint64_t) len, GEXWJ_CONST_NAMES, consts, 9, slots, names->str, 2 * n, errbuf, (uint64_t) errcap);
++		if (out_ms) *out_ms = emscripten_get_now () - t0;
++		g_free (slots);
++		g_string_free (names, TRUE);
++	}
++#endif
+ 	WJ_JS_BLOCKING_END (__wj_cookie, __wj_sd, __wj_entered);
+ 	if (_ok) {
+ 		for (i = 0; i < n; i++) {
+@@ -2711,7 +2754,7 @@ mono_wasm_jit_note_table_exhausted_quiet (void)
+  * Gated because it puts a load+test on the interp->JIT boundary, and anything that costs time inside a
+  * measured region is off by default here.
+  *
+- * The mono_wasm_jit_entry_census flag itself is defined near the other knobs, outside HOST_BROWSER.
++ * The mono_wasm_jit_entry_census flag itself is defined near the other knobs, outside WJ_RUNTIME.
+  */
+ #define WJ_CENSUS_SLOTS (1 << 18)   /* e-slots below this are deduplicated; above it each entry counts once */
+ 
+@@ -2765,7 +2808,7 @@ mono_wasm_jit_liveness (int field)
+ 	case 1: return mono_wasm_jit_thresh;
+ 	case 2: return wj_reg_n;
+ 	case 3: return wj_table_exhausted;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* Entries left in the JIT_CALL table. With field 2 this makes slot leakage directly measurable:
+ 	 * consumed = capacity - remaining, and a healthy run has consumed ~= 2 * registered (every method
+ 	 * takes an e and an f). A large excess means pairs were allocated and never published — which is
+@@ -2939,8 +2982,9 @@ int mono_wasm_jit_admit (int desc_id);
+ WJ_KEEPALIVE int
+ mono_wasm_jit_eslot_probe (int slot, int *out_len)
+ {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	int len = -1, r;
++#ifdef HOST_BROWSER
+ 	r = EM_ASM_INT ({
+ 		/* Same >2GB caveat as the instantiate paths: `>>` is ToInt32, so an out-param above 2 GB would
+ 		 * index HEAP32 negatively and the store would be a silent no-op, reporting arity -1 forever.
+@@ -2953,6 +2997,11 @@ mono_wasm_jit_eslot_probe (int slot, int *out_len)
+ 		if (Module.__wjSlotFn && Module.__wjSlotFn.has ($0) && Module.__wjSlotFn.get ($0) !== f) return 3;
+ 		return 1;
+ 	}, slot, &len);
++#else
++	r = (int) gexwj_host_table (GEXWJ_TABLE_ARITY, slot, 0);
++	len = r;
++	r = r < 0 ? 0 : (r == 2 ? 1 : 2);
++#endif
+ 	if (out_len) *out_len = len;
+ 	return r;
+ #else
+@@ -3850,7 +3899,7 @@ wj_make_callable (int desc_id)
+ 		if (G_UNLIKELY (mono_wasm_jit_stats)) mono_wasm_jit_count (WJC_ADMIT_PERMFAIL);
+ 		return 0;
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* Restore the guarded trampoline before the table underneath it changes; repatched per member below. */
+ 	if (desc_id < wj_desc_state_cap && wj_desc_generation [desc_id] != re->generation && re->logical_imethod)
+ 		mono_jiterp_wasm_jit_unpatch_interp_entry (re->logical_imethod);
+@@ -3979,7 +4028,7 @@ wj_make_callable (int desc_id)
+ 		/* wj_admit_install_only already recorded the generation it installed; leave it. Skipping the write
+ 		 * is correct HERE (unlike the old path above) precisely because the installer sets it. */
+ 		mono_wasm_jit_counters [WJC_SW_PUBLISHED]++;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		if (dre->logical_imethod)
+ 			mono_jiterp_wasm_jit_patch_interp_entry (dre->logical_imethod);
+ #endif
+@@ -4069,7 +4118,7 @@ wj_admit_impl (int desc_id)
+ 		return 1;
+ 	}
+ 	if (wj_desc_generation [desc_id] != re->generation) {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 		/* A generated AOT adapter is guard-free after admission. Restore its guarded wrapper before
+ 		 * replacing this worker's table slots with a newer batch generation, then repatch it below
+ 		 * only after the new dependency union has been admitted. */
+@@ -4413,7 +4462,7 @@ wj_admit_impl (int desc_id)
+ 			}
+ 			wj_desc_state [sibling] = 2;
+ 			wj_desc_generation [sibling] = batch->generation;
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			/* Patch EVERY sibling, not just the descriptor that triggered this admission.
+ 			 * mono_wasm_jit_batch_bind unpatches all n members before rebinding them (their e/f slots are
+ 			 * reused by the new generation), so repatching only the triggering member strands the other
+@@ -4428,7 +4477,7 @@ wj_admit_impl (int desc_id)
+ #endif
+ 		}
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	/* The native/AOT vtable entry initially points at a guarded interp-entry trampoline. Admission is
+ 	 * per worker, just like the function table, so this is the earliest point where THIS worker may
+ 	 * replace it with the generated guard-free pointer-ABI -> scalar-ABI adapter. If the adapter has
+@@ -4567,9 +4616,11 @@ mono_wasm_jit_admit (int desc_id)
+  * measured at 5.25% of the in-game window (R190). Publishing before every GC point would therefore be
+  * ~4x MORE traffic than today's 3 ops per framed method.
+  */
++#ifdef WJ_RUNTIME
+ #ifdef HOST_BROWSER
+ #include <emscripten/stack.h>
+ #endif
++#endif
+ 
+ /*
+  * Per-thread "addressable locals" frame stack (linear memory) for OP_LDADDR.
+@@ -4956,7 +5007,7 @@ int mono_wasm_jit_ptr_plausible (gpointer p);
+ int
+ mono_wasm_jit_ptr_plausible (gpointer p)
+ {
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	return wj_probe_ok ((gsize) (intptr_t) p, wj_memsz ()) ? 1 : 0;
+ #else
+ 	return p != NULL;
+@@ -5480,9 +5531,13 @@ mono_arch_get_delegate_invoke_impl (MonoMethodSignature *sig, gboolean has_targe
+ 	g_error ("mono_arch_get_delegate_invoke_impl");
+ }
+ 
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 
++#ifdef HOST_BROWSER
+ #include <emscripten.h>
++#else
++#include <mono/mini/mini-wasm-gex.h>
++#endif
+ 
+ //functions exported to be used by JS
+ G_BEGIN_DECLS
+@@ -5498,7 +5553,7 @@ extern void mono_target_thread_schedule_synchronization_context(MonoNativeThread
+ #endif // DISABLE_THREADS
+ G_END_DECLS
+ 
+-#endif // HOST_BROWSER
++#endif // WJ_RUNTIME
+ 
+ gpointer
+ mono_arch_get_this_arg_from_call (host_mgreg_t *regs, guint8 *code)
+@@ -5690,6 +5745,77 @@ mono_arch_patch_code_new (MonoCompile *cfg, guint8 *code, MonoJumpInfo *ji, gpoi
+ 	g_error ("mono_arch_patch_code_new");
+ }
+ 
++#ifdef HOST_GEX
++#include <pthread.h>
++#include <unistd.h>
++void mono_wasm_jit_edge_tick (void);
++static void *
++gexwj_ticker (void *arg)
++{
++	int ms = (int) (intptr_t) arg;
++	for (;;) {
++		usleep ((useconds_t) ms * 1000);
++		mono_wasm_jit_edge_tick ();
++	}
++	return NULL;
++}
++void
++gexwj_start_ticker (int ms)
++{
++	static gint32 started;
++	pthread_t t;
++	if (ms <= 0 || mono_atomic_cas_i32 (&started, 1, 0) != 0)
++		return;
++	pthread_create (&t, NULL, gexwj_ticker, (void *) (intptr_t) ms);
++}
++#endif
++
++#ifdef HOST_GEX
++/* What the browser implements in TypeScript (jiterpreter*.ts) or C++ (llvm-runtime.cpp). The jiterpreter
++ * itself (traces, interp_entry and jit_call wrappers) is off under gex; the wasm JIT's own paths do not
++ * need it, and these keep its callers linked. */
++gpointer mono_interp_tier_prepare_jiterpreter (void *frame, MonoMethod *method, const guint16 *ip, gint32 trace_index,
++	const guint16 *start_of_body, int size_of_body, int is_verbose, int preset_function_pointer);
++gpointer
++mono_interp_tier_prepare_jiterpreter (void *frame, MonoMethod *method, const guint16 *ip, gint32 trace_index,
++	const guint16 *start_of_body, int size_of_body, int is_verbose, int preset_function_pointer)
++{
++	return NULL;
++}
++void mono_wasm_free_method_data (MonoMethod *method, void *imethod, int trace_index);
++void mono_wasm_free_method_data (MonoMethod *method, void *imethod, int trace_index) { }
++void mono_interp_record_interp_entry (void *fn_ptr);
++void mono_interp_record_interp_entry (void *fn_ptr) { }
++gpointer mono_interp_jit_wasm_entry_trampoline (void *imethod, MonoMethod *method, int argument_count, MonoType *param_types,
++	int unbox, int has_this, int has_return, void *default_implementation);
++gpointer
++mono_interp_jit_wasm_entry_trampoline (void *imethod, MonoMethod *method, int argument_count, MonoType *param_types,
++	int unbox, int has_this, int has_return, void *default_implementation)
++{
++	return NULL;
++}
++void mono_interp_jit_wasm_jit_call_trampoline (MonoMethod *method, void *rmethod, void *cinfo, guint32 *arg_offsets, gboolean catch_exceptions);
++void mono_interp_jit_wasm_jit_call_trampoline (MonoMethod *method, void *rmethod, void *cinfo, guint32 *arg_offsets, gboolean catch_exceptions) { }
++void mono_interp_flush_jitcall_queue (void);
++void mono_interp_flush_jitcall_queue (void) { }
++typedef void (*GexWjCallThunk) (void *ret_sp, void *sp, void *ftndesc, gboolean *thrown);
++void mono_interp_invoke_wasm_jit_call_trampoline (GexWjCallThunk thunk, void *ret_sp, void *sp, void *ftndesc, gboolean *thrown);
++void
++mono_interp_invoke_wasm_jit_call_trampoline (GexWjCallThunk thunk, void *ret_sp, void *sp, void *ftndesc, gboolean *thrown)
++{
++	/* The browser catches a JS exception around the call; a gex provider's throws unwind through gex.provider_try. */
++	thunk (ret_sp, sp, ftndesc, thrown);
++}
++void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod);
++void mono_jiterp_wasm_jit_patch_interp_entry (void *imethod) { }
++void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod);
++void mono_jiterp_wasm_jit_unpatch_interp_entry (void *imethod) { }
++void mono_jiterp_begin_catch (void *exception_object);
++void mono_jiterp_begin_catch (void *exception_object) { g_error ("mono_jiterp_begin_catch: no C++ exceptions under gex"); }
++void mono_jiterp_end_catch (void);
++void mono_jiterp_end_catch (void) { g_error ("mono_jiterp_end_catch: no C++ exceptions under gex"); }
++#endif
++
+ #ifdef HOST_BROWSER
+ 
+ G_BEGIN_DECLS
+@@ -5773,11 +5899,13 @@ G_END_DECLS
+ void
+ mono_wasm_print_stack_trace (void)
+ {
++#ifdef HOST_BROWSER
+ 	EM_ASM(
+ 		   var err = new Error();
+ 		   console.log ("Stacktrace: \n");
+ 		   console.log (err.stack);
+ 		   );
++#endif
+ }
+ 
+ #endif // HOST_BROWSER
+diff --git a/src/mono/mono/mini/mini.c b/src/mono/mono/mini/mini.c
+index 0bc6021e0..d997d44e2 100644
+--- a/src/mono/mono/mini/mini.c
++++ b/src/mono/mono/mini/mini.c
+@@ -3555,7 +3555,7 @@ mini_method_compile (MonoMethod *method, guint32 opts, JitFlags flags, int parts
+ 					cfg->wasm_inline_depth_cap = mono_wasm_jit_inline_calls_depth;
+ 				}
+ 			}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 			/* R316 (plan Phase 4): a tier-2 recompile requested by the sampler (mono_wasm_jit_t2_sample). The
+ 			 * downgrade retry forces the ordinary policy, and marks nothing: the broker records the attempt. */
+ 			{
+@@ -4599,7 +4599,7 @@ mono_wasm_force_compile (MonoMethod *method, MonoWasmJitResult *out)
+ 			cfg->wasm_jit_result.t2_down_bail = down_bail;
+ 		}
+ 	}
+-#ifdef HOST_BROWSER
++#ifdef WJ_RUNTIME
+ 	if (downgraded) {
+ 		extern void mono_wasm_jit_note_inline_downgrade (gboolean ok);
+ 		mono_wasm_jit_note_inline_downgrade (cfg && cfg->wasm_jit_result.e_slot > 0);
+diff --git a/src/mono/mono/utils/options-def.h b/src/mono/mono/utils/options-def.h
+index 7ae1392ee..847f15617 100644
+--- a/src/mono/mono/utils/options-def.h
++++ b/src/mono/mono/utils/options-def.h
+@@ -60,7 +60,7 @@ DEFINE_BOOL_READONLY(readonly_flag, "readonly-flag", FALSE, "Example")
+ DEFINE_BOOL(wasm_exceptions, "wasm-exceptions", FALSE, "Enable codegen for WASM exceptions")
+ DEFINE_BOOL(aot_lazy_assembly_load, "aot-lazy-assembly-load", FALSE, "Load assemblies referenced by AOT images lazily")
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ DEFINE_BOOL(interp_pgo_recording, "interp-pgo-recording", FALSE, "Record interpreter tiering information for automatic PGO")
+ #else
+ DEFINE_BOOL(interp_pgo_recording, "interp-pgo-recording", FALSE, "Record interpreter tiering information for automatic PGO")
+@@ -69,7 +69,7 @@ DEFINE_BOOL(wasm_gc_safepoints, "wasm-gc-safepoints", FALSE, "Use GC safepoints
+ DEFINE_BOOL(interp_pgo_logging, "interp-pgo-logging", FALSE, "Log messages when interpreter PGO optimizes a method or updates its table")
+ DEFINE_BOOL(interp_codegen_timing, "interp-codegen-timing", FALSE, "Measure time spent generating interpreter code and log it periodically")
+ 
+-#if HOST_BROWSER
++#if WJ_RUNTIME
+ 
+ // traces_enabled controls whether the jiterpreter will JIT individual interpreter opcode traces
+ DEFINE_BOOL(jiterpreter_traces_enabled, "jiterpreter-traces-enabled", TRUE, "JIT interpreter opcode traces into WASM")
+@@ -164,7 +164,7 @@ DEFINE_INT(jiterpreter_table_size, "jiterpreter-table-size", 6 * 1024, "Size of
+ DEFINE_INT(jiterpreter_aot_table_size, "jiterpreter-aot-table-size", 3 * 1024, "Size of the jiterpreter AOT trampoline function tables")
+ DEFINE_INT(jiterpreter_max_module_size, "jiterpreter-max-module-size", 16384, "Size limit for jiterpreter generated WASM modules")
+ DEFINE_INT(jiterpreter_max_switch_size, "jiterpreter-max-switch-size", 128, "Jump table size limit for jiterpreter switch opcodes (0 to disable)")
+-#endif // HOST_BROWSER
++#endif // WJ_RUNTIME
+ 
+ #if defined(TARGET_WASM) || defined(TARGET_IOS)  || defined(TARGET_TVOS) || defined (TARGET_MACCAT)
+ DEFINE_BOOL_READONLY(experimental_gshared_mrgctx, "experimental-gshared-mrgctx", TRUE, "Use a mrgctx for all gshared methods")

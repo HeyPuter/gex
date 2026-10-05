@@ -75,6 +75,6 @@ pub(crate) fn install(
         .with_context(|| format!("compiling {path}'s wasm module"))?;
     crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
     let _ = state;
-    crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data as u32 })?;
+    crate::ftab::publish_stateful(shared, memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data })?;
     Ok(Some(n))
 }

@@ -184,6 +184,11 @@ pub struct Request<'a> {
     /// writable now: a jump table read from them is as fixed as one in an
     /// image's read-only segment (not tracked past a later `mprotect`).
     pub read_only: &'a dyn Fn(u64, u64) -> bool,
+    /// Whether an address is mapped writable and executable now (a JIT's
+    /// code area): its bytes may change with no flush to announce it, so
+    /// tier-1 guards each block there (`Block::guard`) and the function
+    /// JIT leaves it alone.
+    pub volatile: &'a dyn Fn(u64) -> bool,
     /// The value `gex_abi::PAGE_GEN` holds for a page (guest address /
     /// `DISPATCH_PAGE`) now, never 0: what the translation's page checks
     /// compare against. Asking numbers the page if it was not.
@@ -204,6 +209,10 @@ pub struct Translated {
 /// ([`gex_abi::ftab::FALLBACK`]: tier-1, until the region tier).
 pub trait Translator: Send + Sync {
     fn translate(&self, req: &Request<'_>) -> Option<Translated>;
+    /// The process `execve`d `program` (the file `bytes`): what was learned
+    /// of the image it replaced -- function starts, read-only ranges,
+    /// builtins by address -- describes addresses the new image now holds.
+    fn exec(&self, _program: &gex_ld::Program, _bytes: &[u8]) {}
 }
 
 static TRANSLATOR: std::sync::OnceLock<Box<dyn Translator>> = std::sync::OnceLock::new();
