@@ -24,6 +24,14 @@
 
 #define GEX_PROVIDER(name) int name(int ctx, int32_t depth, uint32_t need, uint64_t ret)
 
+/* Puts `fn` in the module's element segment without binding it to an export
+ * (the host finds it by name): an ELF provider's `gexp__ifunc`, below. */
+#define GEX_TABLE(fn) GEX_PROVIDE_(fn, __COUNTER__)
+/* Exports that bind together or not at all (`GEX_GROUP("malloc,free,...")`
+ * on a line of its own): two allocators over one heap are fatal. The host
+ * reads these lines from the source; in C it is nothing. */
+#define GEX_GROUP(exports)
+
 /* i386 registers in the context (64-bit slots, upper half zero). */
 #define R_EAX 0
 #define R_ECX 1
@@ -186,5 +194,61 @@ GEX_INLINE void gp_set_errno(int ctx, int32_t depth, uint32_t self, uint32_t cod
     }
 }
 #define GP_EDOM 33u
+
+/* ---- SysV x86-64: ELF providers (docs/elf-providers.md) ----
+ * A provider for a Linux library (first line `PROVIDES libc.so.6 x86_64`) binds
+ * exports by versioned name (`memcpy@@GLIBC_2.14`, or a bare name for the
+ * default version). Integer and pointer arguments come in rdi, rsi, rdx,
+ * rcx, r8, r9, then the stack above the return address; the result goes in
+ * rax (xmm0); the caller pops. */
+#define R_RAX 0
+#define R_RCX 1
+#define R_RDX 2
+#define R_RSP 4
+#define R_RSI 6
+#define R_RDI 7
+#define R_R8 8
+#define R_R9 9
+GEX_INLINE uint64_t gp64_reg(int ctx, unsigned r) { return GEX_C64(GEX_CTX_XN(r)); }
+GEX_INLINE void gp64_set(int ctx, unsigned r, uint64_t v) { GEX_C64(GEX_CTX_XN(r)) = v; }
+/* A guest pointer as a C pointer: tier-1's guard (an address past the guest
+ * memory traps rather than wrapping into it). */
+#define GP64_P(a) gex_gb((uint64_t)(a))
+#define GW64(a) (*(gex_u64 *)GP64_P(a))
+/* Integer argument `i` (0-based). (A switch, not a table: a provider module
+ * carries no data.) */
+GEX_INLINE uint64_t gp64_arg(int ctx, unsigned i) {
+    switch (i) {
+    case 0: return gp64_reg(ctx, R_RDI);
+    case 1: return gp64_reg(ctx, R_RSI);
+    case 2: return gp64_reg(ctx, R_RDX);
+    case 3: return gp64_reg(ctx, R_RCX);
+    case 4: return gp64_reg(ctx, R_R8);
+    case 5: return gp64_reg(ctx, R_R9);
+    default: return GW64(gp64_reg(ctx, R_RSP) + 8u + 8u * (i - 6u));
+    }
+}
+/* Return to the guest: pop the return address. */
+GEX_INLINE int gp64_return(int ctx, uint64_t ret) {
+    uint64_t sp = gp64_reg(ctx, R_RSP), ra = GW64(sp);
+    gp64_set(ctx, R_RSP, sp + 8u);
+    GEX_C64(GEX_CTX_PC) = ra;
+    return ra == ret;
+}
+GEX_INLINE int gp64_return_rax(int ctx, uint64_t ret, uint64_t rax) {
+    gp64_set(ctx, R_RAX, rax);
+    return gp64_return(ctx, ret);
+}
+/* An IFUNC's resolver (the symbol's address, which the dynamic linker calls
+ * for every relocation against it): the host binds this body there and the
+ * provided function one byte further on, the "implementation" this returns.
+ * Every PLT and GOT caller, and the library's own IRELATIVE slots, then land
+ * on the provider. A source with IFUNC exports says `GEX_ELF_IFUNC`. */
+#define GEX_ELF_IFUNC                                                            \
+    static GEX_PROVIDER(gexp__ifunc) {                                           \
+        (void)depth, (void)need;                                                 \
+        return gp64_return_rax(ctx, ret, (uint64_t)GP_SELF_PC() + 1u);           \
+    }                                                                            \
+    GEX_TABLE(gexp__ifunc)
 
 #endif

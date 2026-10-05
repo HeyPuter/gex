@@ -19,6 +19,15 @@
 //! * `nowine`: not for Wine's own build of the library (one whose DOS stub
 //!   says "Wine builtin DLL"), whose internals reach the same state by
 //!   other paths ([`for_image`]).
+//! * `buildid=<hex>[,<hex>...]` (ELF): only for those builds of the
+//!   library, for a provider that depends on a layout outside the library's
+//!   versioned ABI (docs/elf-providers.md §2).
+//!
+//! An ELF provider (`/* PROVIDES libc.so.6 x86_64`) names exports by
+//! versioned symbol (`memcpy@@GLIBC_2.14`; a bare name is the default
+//! version); the host binds an IFUNC's resolver to the source's
+//! `gexp__ifunc` (`GEX_ELF_IFUNC`). `GEX_GROUP("a,b,...")` lines name
+//! exports that bind together or not at all.
 //!
 //! `GEX_PROVIDERS=0` turns every provider off (A/B runs, lockstep);
 //! `GEX_PROVIDER_SKIP=<export>[,<export>...]` leaves those exports to the
@@ -42,6 +51,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
     ("nt_unixcall", include_str!("../providers/nt_unixcall.c")),
     ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
+    ("glibc_mem", include_str!("../providers/glibc_mem.c")),
 ];
 
 /// Files a stateful provider may `#include` (written beside it when built).
@@ -61,6 +71,11 @@ pub struct Provider {
     pub nowine: bool,
     /// (C function, export), in source order.
     pub binds: Vec<(String, String)>,
+    /// Exports that bind together or not at all (`GEX_GROUP`).
+    pub groups: Vec<Vec<String>>,
+    /// The library builds (ELF build-ids, lower-case hex) it is for; empty
+    /// for any (`buildid=` on the first line).
+    pub build_ids: Vec<String>,
 }
 
 /// Every provider gex carries (`gexc cgen-image --providers` builds them
@@ -82,13 +97,26 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
     }
     let stateful = w[4..].contains(&"stateful");
     let nowine = w[4..].contains(&"nowine");
+    let build_ids = w[4..]
+        .iter()
+        .filter_map(|x| x.strip_prefix("buildid="))
+        .flat_map(|x| x.split(','))
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_ascii_lowercase())
+        .collect();
     let class32 = match w[3] {
         "i386" => true,
         "x86_64" => false,
         a => bail!("provider {name}: unknown architecture {a}"),
     };
     let mut binds = Vec::new();
+    let mut groups = Vec::new();
     for l in text.lines() {
+        if let Some(rest) = l.trim().strip_prefix("GEX_GROUP(") {
+            let list = rest.trim().trim_end_matches(')').trim().trim_matches('"');
+            groups.push(list.split(',').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect());
+            continue;
+        }
         let Some(rest) = l.trim().strip_prefix("GEX_PROVIDE(") else { continue };
         let (f, e) = rest
             .split_once(',')
@@ -100,9 +128,11 @@ fn parse(name: &'static str, text: &'static str) -> Result<Provider> {
         bail!("provider {name} provides nothing");
     }
     let skip = std::env::var("GEX_PROVIDER_SKIP").unwrap_or_default();
-    binds.retain(|(_, e)| !skip.split(',').any(|s| s == e));
+    // A versioned export is skipped by its bare name too (`memcpy` skips
+    // `memcpy@@GLIBC_2.14`).
+    binds.retain(|(_, e)| !skip.split(',').any(|s| s == e || e.split('@').next() == Some(s)));
     let dlls = w[2].split(',').map(|d| d.to_ascii_lowercase()).collect();
-    Ok(Provider { name, text, dlls, class32, stateful, nowine, binds })
+    Ok(Provider { name, text, dlls, class32, stateful, nowine, binds, groups, build_ids })
 }
 
 /// The providers for library `dll` (its export directory's name, any case)
@@ -309,8 +339,68 @@ pub fn bindings(p: &Provider, slots: &[Option<String>], exports: &HashMap<String
     out
 }
 
+/// An ELF library's bindings for `p` (docs/elf-providers.md §2): (guest
+/// address, C function) for each export of `exports`
+/// (`gex_ld::elf::Image::exports_by_version`: name -> (unbiased value,
+/// IFUNC)) the source binds, the library loaded at `bias`. An IFUNC binds its
+/// resolver to `gexp__ifunc` and the resolver's address plus one, which that
+/// returns, to the function. A group binds whole or not at all. What is not
+/// bound is said under `verbose`.
+pub fn elf_bindings(p: &Provider, exports: &HashMap<String, (u64, bool)>, bias: u64, verbose: bool) -> Vec<(u64, String)> {
+    let ifunc = p.text.contains("GEX_ELF_IFUNC");
+    let mut by_export: HashMap<&str, Vec<(u64, String)>> = HashMap::new();
+    for (f, e) in &p.binds {
+        let Some(&(v, is_ifunc)) = exports.get(e) else {
+            if verbose {
+                eprintln!("[provider] {}: no export {e}", p.name);
+            }
+            continue;
+        };
+        let at = v.wrapping_add(bias);
+        let pairs = match (is_ifunc, ifunc) {
+            (false, _) => vec![(at, f.clone())],
+            (true, true) => vec![(at, "gexp__ifunc".to_string()), (at + 1, f.clone())],
+            (true, false) => {
+                if verbose {
+                    eprintln!("[provider] {}: {e} is an IFUNC and the source has no GEX_ELF_IFUNC", p.name);
+                }
+                continue;
+            }
+        };
+        by_export.entry(e.as_str()).or_default().extend(pairs);
+    }
+    for g in &p.groups {
+        if !g.iter().all(|e| by_export.contains_key(e.as_str())) {
+            if verbose {
+                eprintln!("[provider] {}: group {g:?} incomplete here; none of it bound", p.name);
+            }
+            for e in g {
+                by_export.remove(e.as_str());
+            }
+        }
+    }
+    let mut out: Vec<(u64, String)> = by_export.into_values().flatten().collect();
+    out.sort();
+    out.dedup_by_key(|(a, _)| *a);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn elf_bindings_ifunc_and_groups() {
+        let p = super::parse(
+            "t",
+            "/* PROVIDES libc.so.6 x86_64\nGEX_ELF_IFUNC\nGEX_GROUP(\"malloc,free\")\nGEX_PROVIDE(p_memcpy, \"memcpy\")\nGEX_PROVIDE(p_strlen, \"strlen\")\nGEX_PROVIDE(p_malloc, \"malloc\")\nGEX_PROVIDE(p_free, \"free\")\n",
+        )
+        .unwrap();
+        let ex: super::HashMap<String, (u64, bool)> =
+            [("memcpy".to_string(), (0x100, true)), ("strlen".to_string(), (0x200, false)), ("malloc".to_string(), (0x300, false))].into_iter().collect();
+        let b = super::elf_bindings(&p, &ex, 0x1000, false);
+        let want: Vec<(u64, String)> = vec![(0x1100, "gexp__ifunc".into()), (0x1101, "p_memcpy".into()), (0x1200, "p_strlen".into())];
+        assert_eq!(b, want, "free is missing, so the malloc group binds nothing");
+    }
+
     #[test]
     fn every_source_parses() {
         for (n, t) in super::SOURCES {
