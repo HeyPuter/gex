@@ -65,7 +65,8 @@ fn callee_name(leaves: &HashMap<u64, Function>, copying: bool, in_loop: bool, co
     // (`in_loop`), where V8 runs out of inlining budget (0x724580's
     // l_724580_0 calling 0x70b110); everywhere it grew noita.exe's unit by
     // 42% (165 -> 234 MiB) for a gain only the loop showed
-    // (`GEX_CGEN_EXP=SMALLCALLSALL` restores that). Inside a copy, only a
+    // (`GEX_CGEN_EXP=SMALLCALLSALL` restores that; both are opt-in, see
+    // `is_small_copyable`). Inside a copy, only a
     // leaf's copy (no chains of calling copies): a small caller's copy keeps
     // its own leaf callee inlinable, as the body it replaces had it
     // (0x70b110's 0x4ac0d0).
@@ -102,9 +103,12 @@ pub fn is_small_copyable(f: &Function) -> bool {
     // (noita.exe 0x70b110, 0x70b050: a load and a virtual call): V8 never
     // inlines those into 0x724580's outlined loop (726 wire bytes each, and
     // the loop's 26 KB leaves it no inlining budget), where pewasm's
-    // TurboFan does. `GEX_CGEN_EXP=NOSMALLCALLS` (not in the unit key)
-    // keeps copies to leaves.
-    let calls_ok = !exp("NOSMALLCALLS");
+    // TurboFan does. Opt-in (`GEX_CGEN_EXP=SMALLCALLS`: at calls in
+    // outlined loops; `SMALLCALLSALL`: everywhere; not in the unit key): the
+    // page ABBAs on edger (docs/noita-perf.md, i3b/i3c) found 2-3% less
+    // time in 0x724580's family and no world-fps change beyond noise, so
+    // the default copies leaves only.
+    let calls_ok = exp("SMALLCALLS") || exp("SMALLCALLSALL");
     let mut n = 0;
     let mut calls = 0;
     for b in &f.blocks {
@@ -2251,8 +2255,8 @@ b1 0x2005..0x2006 insts [2005]:
         let leaf = gex_ir::text::parse(LEAF).unwrap();
         let caller = gex_ir::text::parse(CALLER).unwrap();
         assert!(is_small_copyable(&leaf));
-        // One call that returns to it: copyable too (unless NOSMALLCALLS).
-        assert_eq!(is_small_copyable(&caller), !exp("NOSMALLCALLS"));
+        // One call that returns to it: copyable too with SMALLCALLS.
+        assert_eq!(is_small_copyable(&caller), exp("SMALLCALLS") || exp("SMALLCALLSALL"));
         if !outline_loops() {
             return;
         }

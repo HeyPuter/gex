@@ -1403,28 +1403,30 @@ cgen-prefix wt/fjit/target/bm/prefix --append --jobs 4` (from Noita's dir).
 2. If it gains, the per-function table (`cmp.py`) for 0x724580's family;
    if not, the V8 trace again on the new units.
 
-### Stream F on gooner (2026-10-04, late; resume here)
+### Stream F on gooner (2026-10-04/05; resume here)
 
 Paths: project ~/gex-sandbox, scratch ~/gex-sandbox/scratch/fjit (old
 `scratchpad/fjit`). No timing on gooner: every page number comes from edger
 through scratch/bench/bench.sh, paired with pewasm on the same box.
 
-- gexc: `wt/fjit/target/x86/release/gexc` (merge/fjit 7b1c3580). Shim, kernel,
-  seed rebuilt into wt/fjit/web/public/gex; Mesa replay copied from
-  worldmachine's wt/fjit (the one bm used); web/node_modules by `npm ci`.
-  Master merged (d789dc9e: the requestAdapter retry edger needs).
-- Caches (one gexc, one shim; nice 19 builds may use up to 12 jobs now; `GEX_CGEN_EXP=NOSMALLCALLS` is not in the unit
-  key, so the A arm is a second cache with the same keys):
-  `scratch/fjit/build-bm.sh wt/fjit/target/bm-b` (0c8f9783 on), then
-  `GEX_CGEN_EXP=NOSMALLCALLS scratch/fjit/variant.sh wt/fjit/target/bm-b wt/fjit/target/bm-a <Noita's 8 images>`
-  (bm-b's units hard-linked, the named images rebuilt, bm-b's prefix and Wine
-  DLL units shared: the A arm reverts 0c8f9783 in Noita's own images only).
-  cg14's icall hints.
-- edger: `scratch/fjit/e/sync.sh bm-a bm-b` copies the worktree (no target/,
-  no .git) and the caches; then
-  `scratch/bench/bench.sh -- scratch/fjit/e/abba.sh i3b ~/gex-sandbox/wt/fjit ~/gex-sandbox/wt/fjit/target/bm-a ~/gex-sandbox/wt/fjit/target/bm-b`
-  (pewasm/A/B/pewasm/B/A/pewasm, BENCH_CORES default 4C/8T, logs in
-  scratch/fjit/e/ and scratch/bench/fjit-* on edger).
+- merge/fjit = master 3718d0ca (merged; U's mem64 gex-cgen changes leave
+  wasm32 C text alone, so objects were reused) + i3c (199954d4).
+- gexc `wt/fjit/target/x86/release/gexc`; shim, kernel, seed in
+  wt/fjit/web/public/gex (`scratch/fjit/build-shims.sh`); Mesa replay copied
+  from worldmachine's wt/fjit (the one bm used); web/node_modules by `npm ci`.
+- Caches (nice 19, up to 12 jobs, cg14's icall hints; `GEX_CGEN_EXP` is not
+  in the unit key, so arms are caches with the same keys):
+  `scratch/fjit/build-bm.sh wt/fjit/target/bm-c` (i3c, the default) and
+  `GEX_CGEN_EXP=NOSMALLCALLS|SMALLCALLSALL scratch/fjit/variant.sh wt/fjit/target/bm-c wt/fjit/target/bm-a2|bm-b2 <Noita's 8 images>`
+  (units hard-linked from bm-c, the named images rebuilt, bm-c's prefix and
+  Wine DLL units shared; then link bm-c's prefix unit dirs in). noita.exe's
+  unit: A 174 MB, C 175 MB, B 246 MB.
+- edger: `scratch/fjit/e/sync.sh bm-c bm-a2 bm-b2` (worktree without
+  target/.git, caches without objects/recovery); runs:
+  `scratch/bench/bench.sh -- scratch/fjit/e/seq.sh NAME ~/gex-sandbox/wt/fjit 240 a=CACHE c=CACHE ...`
+  (pewasm, arms, pewasm, arms reversed, pewasm; 4C/8T; logs in
+  scratch/fjit/e/ and scratch/bench/fjit-* on edger; gooner keeps the
+  bench.sh output in scratch/fjit/e/*.out).
 - b2bb3c95 (provider key fix): its parent is in master; branch
   `fjit/keyfix` points at it for the gate.
 
@@ -1457,3 +1459,28 @@ in `texImage2D` and 51% in "(program)" on edger's P620; the main thread's
 `guest_yield` is 20%, `#a` (gl-bridge) 11%. NtDuplicateObject/NtClose run at
 ~2.6k/s each (msvcp120 `_Thrd_current`; E's msvcp120_thrd provider covers
 it in eject).
+
+**i3c page sequence on edger (2026-10-05, merge/fjit c696cd07 + i3c, one
+shim; A = no small-caller copies, C = copies at calls in outlined loops,
+B = everywhere; Noita's 8 images per arm, Wine DLL units from C):**
+
+| leg | world fps | 0x724580 family, worker self ms / 30 s |
+|---|---|---|
+| pewasm p1 | 46.7 | |
+| A a1 | 35.0 | 20,981 |
+| C c1 | 34.6 | 20,325 |
+| B b1 | 34.0 | 20,441 |
+| pewasm p2 | 47.7 | |
+| B b2 | 34.7 | 20,370 |
+| C c2 | 34.7 | 20,795 |
+| A a2 | 34.1 | 21,424 |
+| pewasm p3 | 48.6 | |
+
+A 34.55, C 34.65, B 34.35 against pewasm 47.7 (gex 0.72×). The copies take
+2-3% off their target loop and nothing measurable off the frame, so they
+are **off by default** (the rule for this change: win in the page or be
+reverted): `GEX_CGEN_EXP=SMALLCALLS` (loops only, noita.exe +0.6% wasm) or
+`SMALLCALLSALL` (everywhere, +42%) for pricing. Every gex arm here is ~5%
+above i3b's (32-33), where both arms ran i3b's everywhere-copied Wine DLL
+units (prefix 356 MiB of wasm against 257 loop-only), with pewasm ~2% up
+too: suggestive, not shown.
