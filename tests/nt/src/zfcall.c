@@ -13,13 +13,26 @@ __attribute__((noinline)) static int readzf(void) {
 }
 static int (*volatile fp)(void) = readzf;
 
-__attribute__((noinline)) static int equal(long a, long b) {
+/* As MSVC emits it around a call through a pointer in a debug build: esi
+ * holds esp from before the call, and `cmp esi, esp; call __chkesp`
+ * follows; here esi is off by `skew` bytes when it should not match. */
+__attribute__((noinline)) static int equal(long skew) {
     int (*f)(void) = fp;
     int r;
-    __asm__ volatile("cmp %2, %1\n\tcall *%3\n\tmov %%eax, %0"
-                     : "=r"(r)
-                     : "r"(a), "r"(b), "r"(f)
-                     : "eax", "ecx", "edx", "cc", "memory");
+#ifdef __i386__
+    __asm__ volatile("push %%esi\n\t"
+                     "mov %%esp, %%esi\n\t"
+                     "add %2, %%esi\n\t"
+                     "cmp %%esp, %%esi\n\t"
+                     "call *%1\n\t"
+                     "pop %%esi"
+                     : "=a"(r)
+                     : "r"(f), "r"(skew)
+                     : "ecx", "edx", "cc", "memory");
+#else
+    r = skew == 0;
+    (void)f;
+#endif
     return r;
 }
 
@@ -27,7 +40,7 @@ int main(int argc, char **argv) {
     (void)argv;
     int n = 0;
     for (int i = 0; i < 100000; i++) {
-        n += equal(i, i) + 2 * equal(i, i + argc);
+        n += equal(0) + 2 * equal(argc * 4);
     }
     CHECK("the callee sees the caller's ZF", n == 100000);
     printf("%d failures\n", failures);

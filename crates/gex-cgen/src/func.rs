@@ -188,6 +188,34 @@ pub fn ret_pops(functions: &[Function], class32: bool, read: &dyn Fn(u64) -> Opt
     out
 }
 
+/// The calls in `functions` that read the ZF their caller set: MSVC's
+/// stack checks, `cmp esi, esp` (3B F4 or 39 E6) right before `call
+/// __chkesp` / `call [__imp___chkesp]` / `call _RTC_CheckEsp`, whose `jne`
+/// reports a corrupt stack on a stale ZF (debug builds; stream W's games).
+/// No ABI passes anything in the flags otherwise (`flags_abi`). By the
+/// call's pc. Empty off x86.
+pub fn zf_calls(functions: &[Function], read: &dyn Fn(u64) -> Option<u8>) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    if !gex_abi::X86 {
+        return out;
+    }
+    for f in functions {
+        for b in &f.blocks {
+            if !matches!(b.term, FTerm::Call { .. }) || b.synthetic || b.insts.len() < 2 {
+                continue;
+            }
+            let prev = b.insts[b.insts.len() - 2];
+            if b.insts[b.insts.len() - 1] != b.term_pc || prev + 2 != b.term_pc {
+                continue;
+            }
+            if matches!((read(prev), read(prev + 1)), (Some(0x3b), Some(0xf4)) | (Some(0x39), Some(0xe6))) {
+                out.insert(b.term_pc);
+            }
+        }
+    }
+    out
+}
+
 /// The recursion-depth guard (`docs/function-tier.md` §7). `depth` is an
 /// estimate, in bytes, of the engine stack the C frames below this one in
 /// the nest use; a function whose own frame would take it past this budget
@@ -355,6 +383,9 @@ pub struct FnUnit {
     leaf_copies: BTreeSet<u64>,
     /// Emitting a copy: `static inline`, under `leaf_name`.
     copying: bool,
+    /// Calls that read the ZF their caller set ([`zf_calls`]), by the
+    /// call's pc. Whoever adds a function fills in its entries.
+    pub zf_calls: HashSet<u64>,
 }
 
 impl Default for FnUnit {
@@ -438,6 +469,7 @@ impl FnUnit {
             leaves: Default::default(),
             leaf_copies: BTreeSet::new(),
             copying: false,
+            zf_calls: HashSet::new(),
         }
     }
 
@@ -565,7 +597,7 @@ impl FnUnit {
         e.resize(f.n_values as usize);
         let mut regs = registers(f);
         regs.clean_spills = clean_spills();
-        self.live = if live_writebacks() { live_in(f, sums) } else { vec![RegSet::ALL; f.blocks.len()] };
+        self.live = if live_writebacks() { live_in_with(f, sums, &self.zf_calls) } else { vec![RegSet::ALL; f.blocks.len()] };
         self.carry = if regs.clean_spills { self.carried(f, known, sums, trapfree) } else { HashMap::new() };
         let dirty = if regs.clean_spills { dirty_in(f, &self.carry) } else { Vec::new() };
         let used: Vec<GuestReg> = regs.used.iter().copied().collect();
@@ -998,12 +1030,12 @@ impl FnUnit {
                     // itself.
                     (Callee::Indirect(_), Some(_)) if self.carry.contains_key(&i) => {
                         leave_wb = self.carry[&i];
-                        let all = if flags_abi() { call_reads() } else { RegSet::ALL };
+                        let all = if flags_abi() { call_reads(self.zf_calls.contains(&b.term_pc)) } else { RegSet::ALL };
                         all.minus(leave_wb)
                     }
                     // No callee reads the flags it is entered with
                     // (`flags_abi`).
-                    _ if flags_abi() => call_reads(),
+                    _ if flags_abi() => call_reads(self.zf_calls.contains(&b.term_pc)),
                     _ => RegSet::ALL,
                 };
                 // Dirty registers the callee never writes stay dirty across
@@ -1731,6 +1763,12 @@ pub fn live_writebacks() -> bool {
 /// `longjmp`s to an earlier call's continuation in the same frame; C and
 /// the ABIs leave them undefined there (docs/function-tier.md §5).
 pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
+    live_in_with(f, sums, &HashSet::new())
+}
+
+/// [`live_in`], with ZF read by the calls at `zf` (their `term_pc`s:
+/// [`zf_calls`]).
+pub fn live_in_with(f: &Function, sums: &HashMap<u64, Summary>, zf: &HashSet<u64>) -> Vec<RegSet> {
     let n = f.blocks.len();
     let mut live = vec![RegSet::EMPTY; n];
     let order: Vec<usize> = f.rpo().iter().rev().map(|b| b.index()).collect();
@@ -1752,12 +1790,12 @@ pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
                     ..
                 } => match sums.get(t) {
                     Some(sm) => sm.inputs.union(live[r.to.index()]),
-                    None if flags_abi() => call_reads().union(live[r.to.index()]),
+                    None if flags_abi() => call_reads(zf.contains(&b.term_pc)).union(live[r.to.index()]),
                     None => RegSet::ALL,
                 },
                 // `flags_abi`: no callee reads the flags it is entered with.
                 FTerm::Call { ret, .. } if flags_abi() => {
-                    call_reads().union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
+                    call_reads(zf.contains(&b.term_pc)).union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
                 }
                 FTerm::TailCall { .. } if flags_abi() => non_flags(),
                 _ => RegSet::ALL,
@@ -1976,12 +2014,11 @@ pub fn devirt_carry() -> bool {
 
 /// What a call to a callee without a summary (indirect, outside the unit,
 /// or unsummarised) reads of the caller's registers under `flags_abi`:
-/// everything but the flags, and ZF with `GEX_CGEN_EXP=ZFCALLS`. MSVC's
-/// stack checks read the ZF their caller set: `cmp esi, esp; call
-/// [__imp___chkesp]` (debug CRT builds), whose `jne` reports a bad stack
-/// when ZF is stale.
-pub fn call_reads() -> RegSet {
-    if exp("ZFCALLS") {
+/// everything but the flags, and ZF at a stack check (`zf`, [`zf_calls`]).
+/// `GEX_CGEN_EXP=ZFCALLS` gives every such call ZF (priced on edger at
+/// -2.7%, gl2 in docs/noita-perf.md).
+pub fn call_reads(zf: bool) -> RegSet {
+    if zf || exp("ZFCALLS") {
         non_flags().union(RegSet::of(&[GuestReg::Z]))
     } else {
         non_flags()

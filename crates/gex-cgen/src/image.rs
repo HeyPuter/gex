@@ -349,6 +349,7 @@ pub fn function_c(recovery: &Path, entry: u64, read: &dyn Fn(u64) -> Option<u8>,
         unit.guardfree = rec.guardfree.clone();
         unit.icall_hints = std::sync::Arc::new(icall_hints.clone());
         unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+        unit.zf_calls.extend(func::zf_calls(std::slice::from_ref(&f), read));
         unit.add(&f, &known, &rec.sums, &rec.trapfree)?;
         return Ok(unit.source());
     }
@@ -514,12 +515,14 @@ fn emit_and_link(
     // their returns pop. A stub's body is not its function's: no copy.
     let mut leaves = HashMap::new();
     let mut leaf_pops = HashMap::new();
+    let mut leaf_zf = std::collections::HashSet::new();
     if func::leaf_copies() {
         for recovery in recoveries {
             let mut gir = GirReader::open(recovery)?;
             while let Some(f) = gir.next()? {
                 if !skip.contains(&f.entry) && func::is_small_copyable(&f) {
                     leaf_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                    leaf_zf.extend(func::zf_calls(std::slice::from_ref(&f), read));
                     leaves.insert(f.entry, f);
                 }
             }
@@ -535,6 +538,7 @@ fn emit_and_link(
         unit.icall_hints = std::sync::Arc::clone(hints);
         unit.leaves = std::sync::Arc::clone(&leaves);
         unit.ret_pops = leaf_pops.clone();
+        unit.zf_calls = leaf_zf.clone();
         unit
     };
     std::fs::create_dir_all(objects)?;
@@ -601,6 +605,7 @@ fn emit_and_link(
                 unit.add_leave_stub(f.entry);
             } else {
                 unit.ret_pops.extend(func::ret_pops(std::slice::from_ref(&f), rec.class32, read));
+                unit.zf_calls.extend(func::zf_calls(std::slice::from_ref(&f), read));
                 unit.add(&f, &known, &rec.sums, &rec.trapfree)
                     .with_context(|| format!("emitting C for the function at {:#x}", f.entry))?;
             }
