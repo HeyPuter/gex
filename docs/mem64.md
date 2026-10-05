@@ -348,10 +348,10 @@ browser shim; the coordinator sequences them.
   path the corpus does not cover. No fps number yet: no frame after the
   first.
 - **Resume:** the scripts, gex-gl x86-64 build and the warm fjit cache
-  (6.4 GB) are copied to `/home/velzie/src/noita-wasm/work/unity-resume/`
+  (6.4 GB) are copied to the noita-wasm checkout's `work/unity-resume/`
   (`muck.sh`, `inguest.sh`, `gl64/`, `xdg/`; the scratch originals are under
-  /tmp/claude-1000/.../scratchpad/unity, paths inside the scripts point
-  there). Steps:
+  stream U's scratchpad (`scratchpad/unity`), and paths inside the scripts
+  point there). Steps:
   1. `wasm-tools print` / `validate` the saved module (cargo install
      wasm-tools if missing), find the instruction at offset ~1156 and the
      gex-emit M64 address helper that misses it; add the guest instruction
