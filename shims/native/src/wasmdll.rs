@@ -333,6 +333,11 @@ fn install_shared(
         }
     }
 
+    // winecrt0's base of this DLL (its unix calls, delay loads and version
+    // resources find the DLL by it): the skeleton's.
+    if let Some(off) = wp.data_exports.get(&format!("{dll}!__gexw_image_base")) {
+        wp.pending.lock().unwrap_or_else(|e| e.into_inner()).push((wp.data + *off as u64, (base as u32).to_le_bytes().to_vec()));
+    }
     if dll == "ntdll.dll" {
         let mut pending = wp.pending.lock().unwrap_or_else(|e| e.into_inner());
         for (name, bytes) in ntdll_variables() {
