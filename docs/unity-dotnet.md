@@ -738,6 +738,40 @@ Not yet:
        that never acknowledges, or the provider stop-the-world.
     Then the keyboard script to gameplay (`GEX_WL_INPUT`, works on X
     clients) and interpreter vs JIT on worldmachine.
+  - **Hollow Knight after the restart (gooner, 2026-10-05; runs
+    `scratch/unity/runs/hk20`-`hk30`, batch mode, no --fjit):**
+    1. **The hang is fixed.** The `GEX_WASM_BACKTRACE` dump put the main
+       thread in sgen's `unified_suspend_stop_world` restart loop (`g_usleep`):
+       one thread stayed "in a critical location" because its saved SP lay
+       outside its registered stack. `GEXMONO_TRACE_THREADS=1` (patch 0003)
+       and `GEX_PROVIDER_STACKS=1` showed that SP was on thread 70's provider
+       stack while the MonoThreadInfo was thread 28's: musl's
+       `__gex_provider_attach` gave attached threads no thread-specific data,
+       so every attached thread's `pthread_getspecific` read the words at
+       address 0 and Mono's thread-info key handed thread 70 thread 28's info
+       (musl-wasm64 3f1c1f08; that commit also makes a provider-created
+       thread report gex's stack). The stop-the-world now names such a thread
+       once (`gex STW: thread ... still critical`).
+    2. **Next crash fixed (6407a1ed):** "Cannot transition thread from
+       STATE_BLOCKING with DO_BLOCKING": Unity calls the embedding API
+       (`mono_gc_get_used_size`, `mono_runtime_invoke`) from guest code a
+       P/Invoke called, i.e. inside the interpreter's GC-safe region, and the
+       old one-stack crossing hooks left the thread Blocking. Now calls into
+       guest code and entries from it are separate pairs (gexprov64.c
+       `gexp_hook_call_guest`/`_call_return`, `gexp_hook_from_guest`/
+       `_to_guest`, `_mark`/`_unwind` for a raise through guest frames).
+    3. HK then unloads 153 assets (the GC that hung) and runs its first
+       scene's scripts (no UIManager in batch mode, TextMeshPro font
+       warnings). `provider_stack` now reports the stack's real base (it was
+       derived from the current SP).
+    4. The --fjit `free(): invalid pointer` did not reproduce on gooner
+       (hk21: --fjit with graphics, llvmpipe, reached the same unload hang);
+       it was seen on worldmachine only. `GEX_FJIT_RANGE`/`GEX_FJIT_SKIP`
+       (hex `LO-HI,...`) restrict the function JIT by entry address for the
+       bisection.
+    Working-tree note: `dnc/src` has every patch staged (`git add -A`) so
+    `git diff` shows only new edits (how 0003 was made). Run `git -C
+    scratch/unity/dnc/src reset -q` before build.sh's `src` step.
 - **Resume (after the move; HEAD 1db5c816, `master` merged in):**
   0. The coordgate on this branch still lacks its browser NT step (it was
      stopped while E was timing), and nothing after 49a5773b has been
