@@ -647,17 +647,41 @@ Not yet:
        pointer-typed locals, consts, returns and call types, the scratch
        block laid out for 8-byte pointers (`WJ_SCR`), long immediates
        (`WJ_LIMM`), no negative memarg offsets (memory64 does not wrap).
-       The interpreter's vcall/PIC/AOT-vcall caches pack 32-bit pointers
-       into i64 words, so on 64-bit they are off and the inline PICs are
-       not emitted (each vcall goes through the resolve helper); a 64-bit
-       form of those caches is later work. embed with
-       `MONO_WASM_JIT_THRESHOLD=1`: 431 methods JITted, 0 invalid modules,
-       all results right (`scratch/unity/wj.sh [build] [THRESH]`). Methods
-       with EH regions are refused until wasmtime's exceptions are wired
-       (the emitter uses legacy try/catch with the C++ tag); localloc and
-       LMF methods are refused as on wasm32. Next: Muck natively with
-       --fjit and the JIT; speed measured on worldmachine (bench.sh) in a
-       managed-heavy scene against interpreter-only. Assessment (2026-10-05): about
+       The interpreter's shared vcall/AOT-vcall caches pack 32-bit
+       pointers into i64 words and stay off on 64-bit; the worker-local
+       vcall PIC has a 64-bit entry ({vtable, f-slot, hits, target}, 24
+       bytes, four ways unrolled in the emitter; 368d3d66), and the C-side
+       vcall memo is on. Methods with exception clauses are JITted
+       (eccc327e): under a wasm64 provider `gex.provider_throw` is a wasm
+       exception with a per-store tag (`(i32)` code) that
+       `gex.provider_try` takes as the pending exception, JIT modules import
+       it as `x.e`, and an EH method's dispatch sits in a `try_table` in
+       place of the fork's legacy try/catch (wasmtime and current browsers
+       have only the new form). Still refused: localloc, LMF wrappers,
+       ldaddr of an argument, reflection residuals (as on wasm32). embed
+       (`scratch/unity/wj.sh [build] [THRESH]`, `wjrun.sh`): every result
+       right at threshold 1 (513 methods JITted, `T.Guest` catching a throw
+       from a guest icall among them), 0 invalid modules.
+       Speed (worldmachine, embed `T.Work(20000)` steady state, third call;
+       `EMBED_WORK`/`EMBED_REPS`, `scratch/unity/wm/work.sh`): interpreter
+       0.795 s, JIT 0.475 s. By part: virtual calls 0.342 -> 0.086,
+       interface/generic 0.244 -> 0.050, arithmetic 0.166 -> 0.016, enum
+       0.068 -> 0.127, reflection 0.081 -> 0.123, dictionary and exceptions
+       even. The first call also pays the compiles (Cranelift, one module
+       per method): 1.39 s. Muck runs natively with --fjit and the JIT
+       (batch mode, 894 methods JITted, no crash; the NREs from
+       SteamNetworking happen interpreted too). For speed observations use
+       `muck-dotnet.sh ... --fjit` (and `--env GEXMONO_WASM_JIT=1`).
+       Muck's menu on worldmachine (RX 6500 XT, --fjit, 800x600, mean fps
+       of the second half of 6 min; `scratch/unity/wm/muck.sh`):
+       interpreter 45.9, JIT 44.4, i.e. no change; the menu is not
+       managed-bound. Gameplay is out of reach for now: Host Lobby goes
+       through Steam's lobby API, and synthetic clicks (xdotool inside the
+       guest, XTest) do not reach the game through rootless Xwayland (a
+       Settings click opened nothing); input would have to come through
+       gex's compositor. Next: the JIT's remaining residual kinds
+       (reflection, enum), the delegate PIC on 64-bit, compile cost, the
+       page. Assessment (2026-10-05): about
        14,400 lines (`mini-wasm*.inc`, `mini-wasm.c`, `wasm-encoder.c`) on
        Mono's mini IR, with no wasm64 awareness. It is emscripten-bound:
        `EM_ASM` instantiation with `wasmTable`, a per-Worker publish
