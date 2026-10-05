@@ -298,6 +298,9 @@ pub struct FnStats {
     /// Calls that go to a unit-private copy of a small leaf
     /// (`FnUnit::leaves`).
     pub calls_leaf_copy: usize,
+    /// Calls whose small leaf callee was inlined into the caller's GIR
+    /// (`FnUnit::inline_leaf_calls`).
+    pub calls_inlined: usize,
     pub tail_known: usize,
     pub switches: usize,
     pub loops_outlined: usize,
@@ -317,6 +320,7 @@ impl FnStats {
         self.calls_minimal += o.calls_minimal;
         self.calls_devirt += o.calls_devirt;
         self.calls_leaf_copy += o.calls_leaf_copy;
+        self.calls_inlined += o.calls_inlined;
         self.tail_known += o.tail_known;
         self.switches += o.switches;
         self.loops_outlined += o.loops_outlined;
@@ -386,6 +390,16 @@ pub struct FnUnit {
     /// Calls that read the ZF their caller set ([`zf_calls`]), by the
     /// call's pc. Whoever adds a function fills in its entries.
     pub zf_calls: HashSet<u64>,
+    /// For the function being emitted (`inline_leaf_calls`): each block
+    /// an inlined call made (the leaf's copied blocks and the call's
+    /// fallback), mapped to the block of the call it replaced.
+    inlined: std::sync::Arc<HashMap<usize, usize>>,
+    /// For the function being emitted: the fallback calls of inlined
+    /// indirect calls (the target was not the hinted one), which are not
+    /// devirtualised again.
+    no_devirt: HashSet<usize>,
+    /// Inline calls to small call-free leaves (`inline_leaves`).
+    pub inline_leaves: bool,
 }
 
 impl Default for FnUnit {
@@ -420,7 +434,7 @@ impl FnUnit {
             // (pewasm's A*(g)).
             let (t, r) = match &b.term {
                 FTerm::Call { callee: Callee::Direct(t), ret: Some(r), .. } => (t, r),
-                FTerm::Call { callee: Callee::Indirect(_), ret: Some(r), ret_pc } if devirt_carry() => {
+                FTerm::Call { callee: Callee::Indirect(_), ret: Some(r), ret_pc } if devirt_carry() && !self.no_devirt.contains(&i) => {
                     match self.icall_hints.get(ret_pc).filter(|k| known.contains(*k)) {
                         Some(k) => (k, r),
                         None => continue,
@@ -470,6 +484,9 @@ impl FnUnit {
             leaf_copies: BTreeSet::new(),
             copying: false,
             zf_calls: HashSet::new(),
+            inlined: Default::default(),
+            no_devirt: HashSet::new(),
+            inline_leaves: inline_leaves(),
         }
     }
 
@@ -577,6 +594,138 @@ impl FnUnit {
         }
     }
 
+    /// `f` with its calls to small call-free leaves (`inlinable`) inlined in
+    /// its GIR: the call's block branches on "the leaf is the target (a
+    /// devirtualised indirect call's hint) and its code was not rewritten"
+    /// (`GEX_PATCHED`, as `patched_test`) to a copy of the leaf's blocks,
+    /// else to a synthetic block with the original call. The copy's `ret`
+    /// becomes a one-case switch: the return address the call pushed goes
+    /// on at the call's continuation, anything else through the function
+    /// table, as an unresolved jump would. The registers stay in the
+    /// caller's locals across the leaf: no write-back, no reload, no call.
+    ///
+    /// A leaf copy called through `fl_` (`callee_name`) is a separate C
+    /// function to clang: the caller writes back what the leaf reads, the
+    /// leaf what the caller reloads, and clang cannot forward any of it
+    /// past a guest store (both are linear memory to it). noita.exe's
+    /// worker functions call such leaves (0x70b200: seven virtual getters).
+    ///
+    /// The copies are synthetic blocks whose `start` is the call's
+    /// instruction, so the address heuristics (a back-edge polls) see them
+    /// as part of it; `inlined` maps them to the call's block. i386 only:
+    /// the fallback of an indirect call keeps its target in `MonAddr`,
+    /// which x86 code never names, a local that is never written back
+    /// (`emit::is_scratch`).
+    fn inline_leaf_calls(&mut self, f: &Function) -> Function {
+        use gex_ir::func::JumpTable;
+        use gex_ir::{BinOp, CmpOp, MemSz, Order, Ty, Value};
+        let mut g = f.clone();
+        let mut inlined = HashMap::new();
+        self.no_devirt.clear();
+        let n0 = f.blocks.len();
+        for i in 0..n0 {
+            let (callee, ret_pc, cont) = match &g.blocks[i].term {
+                FTerm::Call { callee, ret_pc, ret: Some(r) } => (*callee, *ret_pc, r.clone()),
+                _ => continue,
+            };
+            let (t, target) = match callee {
+                Callee::Direct(t) => (t, None),
+                Callee::Indirect(v) => match self.icall_hints.get(&ret_pc) {
+                    Some(&k) => (k, Some(v)),
+                    None => continue,
+                },
+            };
+            let leaves = std::sync::Arc::clone(&self.leaves);
+            let Some(leaf) = leaves.get(&t).filter(|l| inlinable(l)) else { continue };
+            self.stats.calls_inlined += 1;
+            let pc = g.blocks[i].term_pc;
+            let mut nv = g.n_values;
+            let mut def = |b: &mut FBlock, expr: Expr| {
+                let v = Value(nv);
+                nv += 1;
+                b.push(pc, Stmt::Def { dst: v, expr });
+                v
+            };
+            // `patched_test`: the page's bit, and the next page's when a
+            // 5-byte patch at the entry reaches into it.
+            let mut pages = vec![t];
+            if t % gex_abi::DISPATCH_PAGE > gex_abi::DISPATCH_PAGE - 5 {
+                pages.push(t + 5);
+            }
+            let cb = &mut g.blocks[i];
+            let mut patched = None;
+            for a in pages {
+                let at = def(cb, Expr::ConstI64(gex_abi::PATCHED_PAGES + (a >> 15)));
+                let byte = def(cb, Expr::Load { addr: at, offset: 0, sz: MemSz::B1, signed: false, ty: Ty::I32, order: Order::Relaxed });
+                let sh = def(cb, Expr::ConstI32(((a >> 12) & 7) as u32));
+                let bits = def(cb, Expr::Bin { op: BinOp::ShrU, ty: Ty::I32, a: byte, b: sh });
+                let one = def(cb, Expr::ConstI32(1));
+                let bit = def(cb, Expr::Bin { op: BinOp::And, ty: Ty::I32, a: bits, b: one });
+                patched = Some(match patched {
+                    None => bit,
+                    Some(p) => def(cb, Expr::Bin { op: BinOp::Or, ty: Ty::I32, a: p, b: bit }),
+                });
+            }
+            let patched = patched.expect("one page at least");
+            let zero = def(cb, Expr::ConstI32(0));
+            let mut cond = def(cb, Expr::Cmp { op: CmpOp::Eq, ty: Ty::I32, a: patched, b: zero });
+            if let Some(v) = target {
+                let k = def(cb, Expr::ConstI64(t));
+                let hit = def(cb, Expr::Cmp { op: CmpOp::Eq, ty: Ty::I64, a: v, b: k });
+                cond = def(cb, Expr::Bin { op: BinOp::And, ty: Ty::I32, a: hit, b: cond });
+                cb.push(pc, Stmt::WriteReg { reg: GuestReg::MonAddr, val: v });
+            }
+            // The fallback: the call as it was.
+            let fb = g.blocks.len();
+            let mut slow = FBlock::synthetic(pc, FTerm::Illegal { raw: 0, pc });
+            let callee = match target {
+                Some(_) => {
+                    let v = def(&mut slow, Expr::ReadReg(GuestReg::MonAddr));
+                    self.no_devirt.insert(fb);
+                    Callee::Indirect(v)
+                }
+                None => Callee::Direct(t),
+            };
+            slow.term = FTerm::Call { callee, ret_pc, ret: Some(cont.clone()) };
+            inlined.insert(fb, i);
+            g.blocks.push(slow);
+            // The leaf's blocks, its values renumbered after ours.
+            let base = g.blocks.len();
+            let off = nv;
+            for lb in &leaf.blocks {
+                let mut b = lb.clone();
+                b.synthetic = true;
+                b.start = pc;
+                for s in &mut b.stmts {
+                    gex_ir::func::for_each_def_mut(s, |v| v.0 += off);
+                    gex_ir::func::for_each_use_mut(s, |v| v.0 += off);
+                }
+                b.term.for_each_use_mut(|v| v.0 += off);
+                for e in b.term.edges_mut() {
+                    e.to = BlockId(e.to.0 + base as u32);
+                }
+                if let FTerm::Return { target } = b.term {
+                    b.term = FTerm::Switch {
+                        target,
+                        cases: vec![(ret_pc, cont.clone())],
+                        table: JumpTable { base: 0, entry_bytes: 4, count: 1, index: None, complete: false },
+                    };
+                }
+                inlined.insert(g.blocks.len(), i);
+                g.blocks.push(b);
+            }
+            nv += leaf.n_values;
+            g.n_values = nv;
+            g.blocks[i].term = FTerm::Branch {
+                cond,
+                taken: Edge::to(BlockId(base as u32)),
+                not_taken: Edge::to(BlockId(fb as u32)),
+            };
+        }
+        self.inlined = std::sync::Arc::new(inlined);
+        g
+    }
+
     pub fn add(
         &mut self,
         f: &Function,
@@ -587,6 +736,15 @@ impl FnUnit {
         if f.form != Form::Memory {
             bail!("function {:#x}: only memory form is supported", f.entry);
         }
+        let with_inlined;
+        let f = if !self.copying && self.ftab && gex_abi::X86 && self.class32 && self.inline_leaves && !self.leaves.is_empty() {
+            with_inlined = self.inline_leaf_calls(f);
+            &with_inlined
+        } else {
+            self.inlined = Default::default();
+            self.no_devirt.clear();
+            f
+        };
         let dummy = Block::new(f.entry);
         let owned = HashSet::new();
         let mut e = Emitter::new(&dummy, &owned);
@@ -733,7 +891,7 @@ impl FnUnit {
         // nothing goes there).
         self.resumes = false;
         if self.ftab {
-            resume_block(&mut e, f);
+            resume_block(&mut e, f, &self.inlined);
         }
         self.bodies.push_str(&e.take_output());
         self.bodies.push_str("}\n\n");
@@ -814,6 +972,7 @@ impl FnUnit {
         let ftab = self.ftab;
         let resumed = std::cell::Cell::new(false);
         let fail = if ftab && scope.is_none() { "goto gex_resume;" } else { "return 0;" };
+        let inlined = std::sync::Arc::clone(&self.inlined);
         let goto = |e: &mut Emitter<'_>, edge: &Edge| {
             if !edge.args.is_empty() {
                 unreachable!("memory form has no edge arguments");
@@ -921,7 +1080,16 @@ impl FnUnit {
                 }
                 e.line("}");
             }
-            if edge.to.index() <= i || to.start <= b.start {
+            // An inlined leaf's blocks (`inline_leaf_calls`) count as its
+            // call's: no barrier inside the copy (it has no loop) or on the
+            // way in, and on the way out one where the call's edge to its
+            // continuation would have one.
+            let backward = match (inlined.get(&i), inlined.contains_key(&edge.to.index())) {
+                (_, true) => false,
+                (Some(&c), false) => edge.to.index() <= c || to.start <= f.blocks[c].start,
+                (None, false) => edge.to.index() <= i || to.start <= b.start,
+            };
+            if backward {
                 backedge(e);
             }
             e.line(format!("goto L{};", edge.to.index()));
@@ -1100,7 +1268,7 @@ impl FnUnit {
                         self.stats.calls_indirect += 1;
                         let t = e.v(*v);
                         let depth = format!("depth + {}", self.weight);
-                        match self.icall_hints.get(ret_pc).copied().filter(|k| known.contains(k)) {
+                        match self.icall_hints.get(ret_pc).copied().filter(|k| known.contains(k) && !self.no_devirt.contains(&i)) {
                             Some(k) => {
                                 // pewasm's `if (x == K) sub_K(s); else
                                 // recomp_call_indirect(s, x)`. A trap-free K
@@ -1493,7 +1661,7 @@ fn block_stmts(e: &mut Emitter<'_>, b: &FBlock) -> Result<()> {
     Ok(())
 }
 
-fn resume_block(e: &mut Emitter<'_>, f: &Function) {
+fn resume_block(e: &mut Emitter<'_>, f: &Function, inlined: &HashMap<usize, usize>) {
     if local_resume() {
         // Each call takes its own continuation (`gex_lc_*`). Anything else
         // inside this function's code with the stack at or below this
@@ -1504,8 +1672,11 @@ fn resume_block(e: &mut Emitter<'_>, f: &Function) {
         // fallback's call-out, or a region) under this frame's own return
         // contract, so the frames further out keep running their bodies;
         // leaving would hand all of them to the fallback.
-        let lo = f.blocks.iter().map(|b| b.start).min().unwrap_or(f.entry);
-        let hi = f.blocks.iter().map(|b| b.end.max(b.start + 1)).max().unwrap_or(f.entry + 1);
+        // Not an inlined leaf's blocks (`inline_leaf_calls`): their code is
+        // the leaf's, elsewhere.
+        let own = || f.blocks.iter().enumerate().filter(|(i, _)| !inlined.contains_key(i)).map(|(_, b)| b);
+        let lo = own().map(|b| b.start).min().unwrap_or(f.entry);
+        let hi = own().map(|b| b.end.max(b.start + 1)).max().unwrap_or(f.entry + 1);
         e.line("gex_resume: {");
         e.line(format!("  const uint64_t rpc = GEX_C64({}u);", ctx::PC));
         e.line(format!(
@@ -1708,7 +1879,7 @@ pub fn dirty_in_from(f: &Function, root: usize, keep: &dyn Fn(usize) -> bool, ca
             let b = &f.blocks[id.index()];
             for s in &b.stmts {
                 match s {
-                    Stmt::WriteReg { reg, .. } => {
+                    Stmt::WriteReg { reg, .. } if !emit::is_scratch(*reg) => {
                         d.insert(*reg);
                     }
                     _ if emit::clobbers(s) => d.clear(),
@@ -1980,6 +2151,50 @@ pub fn guard_free(funcs: &[Function], sums: &HashMap<u64, Summary>) -> HashSet<u
 /// private cache).
 pub fn leaf_copies() -> bool {
     !exp("NOLEAFCOPY")
+}
+
+/// Calls to small call-free leaves are inlined into the caller's GIR
+/// (`FnUnit::inline_leaf_calls`) in i386 units, instead of calling the
+/// leaf's copy: `GEX_CGEN_EXP=INLINELEAVES` (not in the unit key: use a
+/// private cache). Opt-in until the page measures it.
+pub fn inline_leaves() -> bool {
+    exp("INLINELEAVES")
+}
+
+/// Whether `leaf` can be inlined at a call (`FnUnit::inline_leaf_calls`): a
+/// copyable leaf (`is_small_copyable`) that makes no calls, has no loop, and
+/// leaves only by `ret`.
+fn inlinable(leaf: &Function) -> bool {
+    if leaf.form != Form::Memory || !is_small_copyable(leaf) || !makes_no_calls(leaf) {
+        return false;
+    }
+    if !leaf.blocks.iter().all(|b| matches!(b.term, FTerm::Jump(_) | FTerm::Branch { .. } | FTerm::Return { .. })) {
+        return false;
+    }
+    // Acyclic: every block reachable from the entry is finished (DFS colours).
+    let n = leaf.blocks.len();
+    let mut state = vec![0u8; n];
+    let mut stack = vec![(0usize, 0usize)];
+    state[0] = 1;
+    while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+        let succs = leaf.blocks[b].succs();
+        if *k < succs.len() {
+            let s = succs[*k].index();
+            *k += 1;
+            match state[s] {
+                0 => {
+                    state[s] = 1;
+                    stack.push((s, 0));
+                }
+                1 => return false,
+                _ => {}
+            }
+        } else {
+            state[b] = 2;
+            stack.pop();
+        }
+    }
+    true
 }
 
 pub fn local_resume() -> bool {
@@ -2319,6 +2534,88 @@ b1 0x2005..0x2006 insts [2005]:
   @2005 v8 = extend u v5
   @2005 return v8
 ";
+
+    /// `0x3000`: a call-free leaf without a loop (`eax = [ecx + 20]`, `ret`).
+    const GETTER: &str = "func 0x3000 - entries [] form memory values 12
+b0 0x3000..0x3004 insts [3000,3003]:
+  @3000 v0 = read x1
+  @3000 v1 = load B4 u i32 Relaxed v0 20
+  @3000 v2 = extend u v1
+  @3000 write x0 v2
+  @3003 v3 = read x4
+  @3003 v4 = load B4 u i32 Relaxed v3 0
+  @3003 v5 = i64 0x4
+  @3003 v6 = bin Add i64 v3 v5
+  @3003 write x4 v6
+  @3003 v7 = extend u v4
+  @3003 return v7
+";
+    /// `0x4000` calls it directly, then through a pointer in `edx`, hinted
+    /// to 0x3000.
+    const GETTER_CALLER: &str = "func 0x4000 - entries [] form memory values 20
+b0 0x4000..0x4005 insts [4000]:
+  @4000 v0 = read x4
+  @4000 v1 = i64 0x4
+  @4000 v2 = bin Sub i64 v0 v1
+  @4000 v3 = i32 0x4005
+  @4000 store B4 Relaxed v2 0 v3
+  @4000 write x4 v2
+  @4000 call 0x3000 ret 0x4005 -> b1()
+b1 0x4005..0x4007 insts [4005]:
+  @4005 v4 = read x2
+  @4005 v5 = read x4
+  @4005 v6 = i64 0x4
+  @4005 v7 = bin Sub i64 v5 v6
+  @4005 v8 = i32 0x4007
+  @4005 store B4 Relaxed v7 0 v8
+  @4005 write x4 v7
+  @4005 call v4 ret 0x4007 -> b2()
+b2 0x4007..0x4008 insts [4007]:
+  @4007 v9 = read x4
+  @4007 v10 = load B4 u i32 Relaxed v9 0
+  @4007 v11 = i64 0x4
+  @4007 v12 = bin Add i64 v9 v11
+  @4007 write x4 v12
+  @4007 v13 = extend u v10
+  @4007 return v13
+";
+
+    #[test]
+    fn a_call_free_leaf_is_inlined_with_a_fallback() {
+        let leaf = gex_ir::text::parse(GETTER).unwrap();
+        let caller = gex_ir::text::parse(GETTER_CALLER).unwrap();
+        assert!(inlinable(&leaf));
+        assert!(!inlinable(&gex_ir::text::parse(LEAF).unwrap()), "a loop is not inlined");
+        if !gex_abi::X86 {
+            return; // i386 only
+        }
+        let known: HashSet<u64> = [0x3000, 0x4000].into_iter().collect();
+        let mut unit = FnUnit::new();
+        unit.set_class32(true);
+        unit.ftab = true;
+        unit.inline_leaves = true;
+        unit.leaves = std::sync::Arc::new([(0x3000, leaf.clone())].into_iter().collect());
+        unit.icall_hints = std::sync::Arc::new([(0x4007, 0x3000)].into_iter().collect());
+        unit.add(&leaf, &known, &HashMap::new(), &HashMap::new()).unwrap();
+        unit.add(&caller, &known, &HashMap::new(), &HashMap::new()).unwrap();
+        assert_eq!(unit.stats.calls_inlined, 2);
+        unit.add_leaf_copies(&known, &HashMap::new(), &HashMap::new()).unwrap();
+        let c = unit.source();
+        let body = &c[c.find("int f_4000(").unwrap()..];
+        // The fallbacks: the direct call, and the indirect one through the
+        // table (its target from MonAddr), not devirtualised again.
+        assert!(body.contains("r_monaddr"), "the indirect fallback keeps its target in MonAddr:\n{body}");
+        assert!(!body.contains("ft == 0x3000ull"), "the fallback is not devirtualised again:\n{body}");
+        // The copies' returns: on at the continuations.
+        assert!(body.contains("case 0x4005ull:") && body.contains("case 0x4007ull:"), "{body}");
+        assert!(body.contains("GEX_FTAB(gex_ftab_idx(ft))"), "{body}");
+        let dir = std::env::temp_dir().join(format!("gex-cgen-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gex_abi.h"), crate::header::header()).unwrap();
+        std::fs::write(dir.join("u.c"), &c).unwrap();
+        crate::toolchain::compile_one(&dir, &dir.join("u.c"), &dir.join("u.o"), None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_leaf_copy_names_its_outlined_loops_apart() {
