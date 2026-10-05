@@ -1548,3 +1548,15 @@ the ring's tail is a guest word with a lock bit (USD+0xfe4), the address
 at USD+0xfe0; `GEX_NT_GL_FAST=0` turns it off at run time (A/B on one
 cache). tests/nt glfast; NT gate 75/75 with and without --cgen.
 Client-state calls stay in the layer (their array flags are layer state).
+
+**gl1 on edger (merge/fjit dd7df4db + master 5ab54ab2, bm-f, one cache,
+arms by page env; before E's 40013fbe):** pewasm 45.9 / 46.5 / 45.4;
+fast path off 39.0, 37.0; on 41.9, 37.9 (38.0 against 39.9, +5%, legs
+drift ~5%). Main thread per 30 s profile: the unix-call path outside the
+swap went from 6.0 s (both off legs) to 1.9 s (both on legs), about
+3.6 ms a world frame; the time moved into the yield park (6.7/6.1 s ->
+10.6/10.1 s): the main thread now waits on its workers instead. With the
+fast path the main thread is (ms per world frame) park 8.9, guest 12.9,
+shim work 2.5, JS 3.0 (gl-bridge collect 1.3, mono_ns 0.9 -- of it 0.45
+the park's own timing, now sampled 1 in 16), providers 0.9. Workers 3/4
+are busy 43% (0x724580 family), idle in cond_wait the rest.
