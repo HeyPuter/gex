@@ -225,8 +225,12 @@ pub fn link_image(dir: &Path, objs: &[PathBuf], out: &Path) -> Result<()> {
     let mut cmd = Command::new(wasm_ld());
     cmd.args(["--experimental-pic", "-shared", "--no-entry", "--import-memory", "--shared-memory"])
         .args(ld_memory_flags())
-        .args(["--allow-undefined", "-O2"])
-        .arg(format!("@{}", rsp.display()))
+        .args(["--allow-undefined", "-O2"]);
+    if LTO.load(std::sync::atomic::Ordering::Relaxed) {
+        // Code generation happens here: the flags clang's own would have had.
+        cmd.args(["--lto-O2", "-mllvm", "-switch-to-lookup=false"]).arg(format!("--thinlto-jobs={}", jobs()));
+    }
+    cmd.arg(format!("@{}", rsp.display()))
         .arg("-o")
         .arg(out);
     run(&mut cmd, "wasm-ld")
@@ -267,7 +271,21 @@ pub fn link_with_table(dir: &Path, objs: &[PathBuf], exports: &[String], out: &P
 /// `GEX_CGEN_CFLAGS`: extra clang flags, for pricing code-generation choices
 /// (not part of any cache key: build with `--no-cache` when using it).
 fn extra_cflags() -> Vec<String> {
-    std::env::var("GEX_CGEN_CFLAGS")
+    let mut v: Vec<String> = std::env::var("GEX_CGEN_CFLAGS")
         .map(|v| v.split_whitespace().map(String::from).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if LTO.load(std::sync::atomic::Ordering::Relaxed) {
+        v.push("-flto=thin".to_string());
+    }
+    v
+}
+
+/// ThinLTO for what this process builds next (a link group's module,
+/// docs/eject-pe.md §6a G3): objects are bitcode (another object key, through
+/// [`cflags_key`]), and [`link_image`] optimises and generates code across
+/// them.
+static LTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_lto(on: bool) {
+    LTO.store(on, std::sync::atomic::Ordering::Relaxed);
 }

@@ -292,8 +292,13 @@ pub fn cwasm_path(wasm_path: &std::path::Path, wasm: &[u8]) -> PathBuf {
     wasm_path.with_file_name(format!("{stem}.{}.cwasm", &key[..16]))
 }
 
-/// Data whose relocations have been applied, by its guest address.
-static RELOCATED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Data whose relocations have been applied: the process (its linear
+/// memory's host address and its NT pid, so a later process whose memory
+/// lands at a freed one's address is still another) and the data's guest
+/// address. Per process, not host-wide: another process (fork and exec, a
+/// child process) places the same provider at the same base in a memory of
+/// its own.
+static RELOCATED: Mutex<Vec<(usize, u32, u64)>> = Mutex::new(Vec::new());
 
 /// After an instantiation: the module's data relocations (`__wasm_apply_
 /// data_relocs`: the absolute data and function addresses its initialised
@@ -302,16 +307,24 @@ static RELOCATED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// function has initialised the data itself, once, by then. Held under a
 /// lock, so a thread instantiating meanwhile waits for it.
 pub(crate) fn relocate_once(cx: &mut wasmtime::StoreContextMut<'_, HostState>, inst: &wasmtime::Instance, x: Extras) -> Result<()> {
+    let mem = cx.data().memory.as_ref().map_or(0, |m| m.bytes().as_ptr() as usize);
+    let pid = cx.data().nt.as_ref().map_or(0, |p| p.pid);
     let mut done = RELOCATED.lock().unwrap_or_else(|e| e.into_inner());
-    if done.contains(&x.memory_base) {
+    if done.contains(&(mem, pid, x.memory_base)) {
         return Ok(());
     }
     if let Ok(f) = inst.get_typed_func::<(), ()>(&mut *cx, "__wasm_apply_data_relocs") {
         f.call(&mut *cx, ()).context("applying a provider's data relocations")?;
     }
-    done.push(x.memory_base);
+    done.push((mem, pid, x.memory_base));
     Ok(())
 }
+
+/// `gex.provider_try` calls (a Lua protected call each: lua_pcall,
+/// lua_resume, lua_close's finalizers, the parser) and the throws they
+/// caught, for GEX_NT_STATS.
+pub static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A `gex.provider_throw` unwinding to its `gex.provider_try`.
 #[derive(Debug)]
@@ -351,12 +364,16 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         return register64(linker);
     }
     linker.func_wrap(IMPORT_MODULE, "provider_try", |mut caller: Caller<'_, HostState>, f: i32, arg: i32| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
+        TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let func = ftab::table_func(&mut caller, f as u32)?;
         let typed = func.typed::<i32, ()>(&caller).context("gex.provider_try: the function is not void(int)")?;
         match typed.call(&mut caller, arg) {
             Ok(()) => Ok(0),
             Err(e) => match e.downcast_ref::<Throw>() {
-                Some(t) => Ok(t.0),
+                Some(t) => {
+                    THROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(t.0)
+                }
                 None => Err(anyhow::Error::from(e)),
             },
         }

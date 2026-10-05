@@ -22,9 +22,15 @@
  * and when a wake signals a waiter. A host with no parked thread just sees
  * the word change. */
 #define YIELD_GEN 0x7ffe0ff0u
+/* How many threads are parked on it (gex_kernel::nt::sync::YIELD_PARKED): a
+ * notify with nobody parked is a host futex call for nothing, and kicks come
+ * with every notify and contended unlock. */
+#define YIELD_PARKED 0x7ffe0ff4u
 static void yield_kick(void) {
     __atomic_fetch_add(GA(YIELD_GEN), 1u, __ATOMIC_SEQ_CST);
-    gp_wake(YIELD_GEN, 0x7fffffffu);
+    if (__atomic_load_n(GA(YIELD_PARKED), __ATOMIC_SEQ_CST)) {
+        gp_wake(YIELD_GEN, 0x7fffffffu);
+    }
 }
 
 /* ---- critical_section: word 0 = owner (thread + 1), word 1 = waiters; not recursive ---- */

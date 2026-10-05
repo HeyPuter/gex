@@ -7051,9 +7051,23 @@ fn resume() -> Option<u64> {
     RESUME.with(|c| c.get())
 }
 
+#[track_caller]
 fn set_resume(v: u64) {
     RESUME.with(|c| c.set(Some(v)));
+    // GEX_NT_RESUME_LOG: each (call site, pc) a resume was set from, once:
+    // where the guest leaves wasm and comes back (an AOT-only run needs a
+    // unit or region entry at every such pc).
+    if RESUME_LOG.load(std::sync::atomic::Ordering::Relaxed) {
+        let at = std::panic::Location::caller();
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(u32, u64)>>> = std::sync::Mutex::new(None);
+        let fresh = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((at.line(), v));
+        if fresh {
+            warn_line(&format!("gex-nt: resume at {v:#x} from {}:{}\n", at.file(), at.line()));
+        }
+    }
 }
+
+pub(crate) static RESUME_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn set_resume_none() {
     RESUME.with(|c| c.set(None));
@@ -10567,6 +10581,13 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // A function-tier unit another Worker published that this one has not
     // installed yet: the miss is a catch-up, done in JS, not a translation.
     if cgen::behind() {
+        // AOT-only: catch up inside the call and dispatch again, keeping the
+        // thread's frames (leaving would resume at continuations no unit
+        // has entries for).
+        if aot() {
+            nt::serve_now();
+            return gex_emit::module::DISPATCH_MISS_REDISPATCH;
+        }
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
@@ -10751,6 +10772,27 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
             });
             trap();
+        }
+    }
+    // An ejected project's training run (`run.mjs --record-entries`): code
+    // inside an image with a unit, entered where the unit has no entry, is
+    // what the web build's region entries must cover.
+    crate::cgen::note_web_entry(pc as u64);
+    // AOT-only, a pc the function table has (published by another Worker
+    // after this one last caught up): catch up and dispatch again.
+    if aot() && cgen::knows(pc) {
+        thread_local! {
+            static AGAIN: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+        }
+        let n = AGAIN.with(|a| {
+            let (p, n) = a.get();
+            let n = if p == pc { n + 1 } else { 1 };
+            a.set((pc, n));
+            n
+        });
+        if n <= 3 {
+            nt::serve_now();
+            return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
     }
     // An ejected project without a JIT fallback (`gex_set_jit(0)`): nothing
@@ -11759,6 +11801,27 @@ static JIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 #[no_mangle]
 pub extern "C" fn gex_set_jit(on: i32) {
     JIT_ON.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether run-time translation is allowed (`gex_set_jit`).
+pub(crate) fn jit_on() -> bool {
+    JIT_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An ejected project's run (`gex_set_aot(1)`): what keeps the guest's
+/// frames as an AOT-only runtime must (units and threads served inside the
+/// call, a Worker catching up in place, a wild branch the guest's fault).
+/// On in its training run too, where translation is allowed, so what that
+/// run records is what the AOT-only run needs.
+static AOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_aot(on: i32) {
+    AOT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn aot() -> bool {
+    AOT.load(std::sync::atomic::Ordering::Relaxed) || !jit_on()
 }
 
 /// Whether library substitution is on. See `gex_set_intrinsics`.

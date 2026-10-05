@@ -49,6 +49,16 @@ struct Pending {
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+/// Whether `PENDING` may hold something (set after a push, cleared before a
+/// drain takes it).
+static ANY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How many units wait for their bytes (`WANTED`'s length), readable without
+/// its lock.
+static WANTED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn lock_free_wanted_empty() -> bool {
+    WANTED_N.load(Ordering::Acquire) == 0
+}
 
 /// A unit placed for an image: wanted until JS brings its bytes, then
 /// published.
@@ -181,6 +191,7 @@ pub extern "C" fn gex_cgen_set_mode(mode: u32) {
     if HOOK.set(()).is_ok() {
         gex_kernel::nt::section::set_image_mapped_hook(|m| {
             lock(&PENDING).push(Pending { path: m.path.to_string(), base: m.base, pe: Arc::clone(m.pe) });
+            ANY_PENDING.store(true, Ordering::Release);
         });
     }
 }
@@ -210,6 +221,11 @@ pub(crate) fn drain() -> bool {
     if !on() {
         return false;
     }
+    // Every syscall asks: an atomic load when nothing was mapped (no lock).
+    if !ANY_PENDING.load(Ordering::Acquire) && lock_free_wanted_empty() {
+        return false;
+    }
+    ANY_PENDING.store(false, Ordering::Release);
     let pending = std::mem::take(&mut *lock(&PENDING));
     // The NT trampoline page with the first images (the exe says the ABI),
     // as natively: every Wine DLL's unix calls and syscalls go through it.
@@ -303,7 +319,11 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
         slots: 0,
         providers,
     });
-    lock(&WANTED).push_back(units.len() - 1);
+    {
+        let mut w = lock(&WANTED);
+        w.push_back(units.len() - 1);
+        WANTED_N.store(w.len(), Ordering::Release);
+    }
 }
 
 /// The key of the unit for `image` (the native host's `nt_cgen::unit_key`:
@@ -452,6 +472,7 @@ pub extern "C" fn gex_cgen_path(u: u32, buf: u32, cap: u32) -> u32 {
 pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     let mut wanted = lock(&WANTED);
     wanted.retain(|&w| w != u as usize);
+    WANTED_N.store(wanted.len(), Ordering::Release);
     let units = lock(&UNITS);
     let Some(x) = units.get(u as usize) else { return 0 };
     if MODE.load(Ordering::Relaxed) == 2 && !x.wine {
@@ -510,9 +531,82 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
             }
         }
     }
-    lock(&WANTED).retain(|&w| w != u as usize);
+    {
+        let mut w = lock(&WANTED);
+        w.retain(|&x| x != u as usize);
+        WANTED_N.store(w.len(), Ordering::Release);
+    }
     lock(&PUBLISHED).push(u as usize);
     0
+}
+
+/// A region-entry module for placed unit `u` (docs/eject-pe.md §3.3): an
+/// entry of its own whose key is `regions/<u's key>`, which the loaders find
+/// at `<cache>/regions/<key>/` as natively. JS publishes it after the unit,
+/// when it has one. Returns its index, or -1.
+#[no_mangle]
+pub extern "C" fn gex_cgen_region(u: u32) -> i32 {
+    let mut units = lock(&UNITS);
+    let Some(x) = units.get(u as usize) else { return -1 };
+    let r = Unit {
+        identity: x.identity.clone(),
+        key_base: format!("regions/{}", x.key),
+        key: format!("regions/{}", x.key),
+        wine: true,
+        path: x.path.clone(),
+        base: x.base,
+        pages: Vec::new(),
+        regs: Vec::new(),
+        dirs: Vec::new(),
+        slots: 0,
+        providers: Vec::new(),
+    };
+    units.push(r);
+    (units.len() - 1) as i32
+}
+
+/// Unit `u` is a link group's member (docs/eject-pe.md §6a): not wanted on
+/// its own. JS publishes the group's module once every member is placed
+/// ([`gex_cgen_group`]); Wine maps an exe's static imports before any of
+/// their code runs, so no member runs before it.
+#[no_mangle]
+pub extern "C" fn gex_cgen_hold(u: u32) {
+    let mut w = lock(&WANTED);
+    w.retain(|&x| x != u as usize);
+    WANTED_N.store(w.len(), Ordering::Release);
+}
+
+/// A link group's module as a unit of its own: key `groups/<key>` (the
+/// `len` bytes at `key`), the pages of its `n` members (unit indices, u32s
+/// at `members`). JS publishes it as a unit; each member's providers and
+/// region entries follow. Returns its index, or -1.
+#[no_mangle]
+pub extern "C" fn gex_cgen_group(members: u32, n: u32, key: u32, len: u32) -> i32 {
+    let us: Vec<usize> = crate::shim_slice(members, 4 * n).chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize).collect();
+    let Ok(key) = std::str::from_utf8(crate::shim_slice(key, len)).map(|k| format!("groups/{k}")) else { return -1 };
+    let mut units = lock(&UNITS);
+    let mut pages = Vec::new();
+    let mut paths = Vec::new();
+    for &u in &us {
+        let Some(x) = units.get(u) else { return -1 };
+        pages.extend(x.pages.iter().copied());
+        paths.push(x.path.rsplit(['/', '\\']).next().unwrap_or("").to_string());
+    }
+    let base = us.first().and_then(|&u| units.get(u)).map_or(0, |x| x.base);
+    units.push(Unit {
+        identity: String::new(),
+        key_base: key.clone(),
+        key,
+        wine: false,
+        path: format!("the link group {}", paths.join(" + ")),
+        base,
+        pages,
+        regs: Vec::new(),
+        dirs: Vec::new(),
+        slots: 0,
+        providers: Vec::new(),
+    });
+    (units.len() - 1) as i32
 }
 
 /// The bridges that make `addrs` reachable from tier-1: each address's
@@ -810,6 +904,30 @@ pub extern "C" fn gex_provider_relocate(base: u32) -> i32 {
     1
 }
 
+/// GEX_NT_ENTRY_LOG: print each pc entered inside a unit's pages without an
+/// entry there, once (`gex-nt: web entry <pc>`), for an ejected project's
+/// training run.
+pub(crate) static ENTRY_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the function table has a function for `pc`.
+pub(crate) fn knows(pc: u64) -> bool {
+    ftab(|m| m.get(pc).is_some())
+}
+
+pub(crate) fn note_web_entry(pc: u64) {
+    if !ENTRY_LOG.load(Ordering::Relaxed) {
+        return;
+    }
+    let page = pc / gex_abi::DISPATCH_PAGE;
+    if !lock(&UNIT_PAGES).as_ref().is_some_and(|m| m.contains_key(&page)) {
+        return;
+    }
+    static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+    if lock(&SEEN).get_or_insert_with(Default::default).insert(pc) {
+        crate::warn_line(&format!("gex-nt: web entry {pc:#x}\n"));
+    }
+}
+
 /// `gex.provider_try` calls and the throws they caught (GEX_NT_STATS).
 pub(crate) static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static THROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -968,7 +1086,11 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
             !crate::fjit::current(f.install)
         } else {
             let page = addr / gex_abi::DISPATCH_PAGE;
-            mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0)
+            let patched = mem.get((gex_abi::PATCHED_PAGES + page / 8) as usize).is_some_and(|b| b & (1 << (page % 8)) != 0);
+            // A provider serves the export whatever its bytes became: Noita's
+            // mod sandbox rewrites lua51's entry points, which the Lua provider
+            // replaces (as natively, ftab.rs `current`).
+            patched && m.install(f.install).module < PROVIDER
         };
         if stale {
             m.retire(addr);
@@ -1004,6 +1126,49 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         crate::set_resume_none();
         crate::trap();
     }
+    // An ejected project's run (`gex_set_aot`, docs/eject-pe.md §3.1): no
+    // function body holds `t`. AOT-only (`gex_set_jit(0)`), nothing may
+    // translate it either.
+    if crate::aot() {
+        // A branch to memory nothing executable is mapped at: the guest's
+        // access violation, as natively (34c3e45b).
+        let wild = crate::with_host(|h| {
+            !h.kernel.mem.vmas().iter().any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && t >= v.start && t < v.end)
+        });
+        if wild {
+            crate::nt::fault(ctx, gex_kernel::nt::Fault::NotExecutable, t);
+        }
+        // Published by another Worker and not yet installed here: catch up,
+        // then call it, as the lookup would have (leaving would lose the
+        // frames that called here).
+        if let Some(idx) = ftab(|m| m.get(t).map(|f| f.idx)) {
+            crate::nt::serve_now();
+            CAUGHT_UP.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: a host import taking scalars; nothing here holds a lock.
+            return unsafe { ftab_call(idx as i32, ctx, _depth, _need, ret) };
+        }
+    }
+    if !crate::jit_on() {
+        let path = lock(&UNITS)
+            .iter()
+            .filter(|x| x.base <= t)
+            .max_by_key(|x| x.base)
+            .map(|x| format!("{} at {:#x}, +{:#x}", x.path, x.base, t - x.base))
+            .unwrap_or_else(|| "no image".into());
+        // Who branched there, and the stack (i386: a call's return address
+        // on top), to tell a lost return from an indirect branch.
+        let from = gm.read_u64(c + gex_abi::ctx::LAST_SOURCE as u64).unwrap_or(0);
+        let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0) & 0xffff_ffff;
+        let stack: Vec<String> = (0..8u64).map(|i| crate::nt::describe(gm.read_u32(sp + 4 * i).unwrap_or(0) as u64)).collect();
+        crate::warn_line(&format!(
+            "gex-eject: the guest reached {t:#x} ({path}), which no unit, region entry or provider holds, \
+             and this project runs without translation: record a session that reaches it and re-eject \
+             (from {}, ret {ret:#x}, sp {sp:#x} stack [{}])\n",
+            crate::nt::describe(from),
+            stack.join(" ")
+        ));
+        crate::nt::end_process(0xc000_001d);
+    }
     if ret as u64 == gex_abi::ftab::NO_RETURN || !CALLOUT_ON.load(Ordering::Relaxed) {
         return gex_abi::ftab::RET_LEFT;
     }
@@ -1037,7 +1202,13 @@ extern "C" {
     /// `ret` with the stack pointer at `sp_want` (or what a callee popped
     /// above it): 1; 0 when it cannot (`ctx::PC` says where the guest is).
     fn call_out(ctx: i32, target: i64, ret: i64, sp_want: i64) -> i32;
+    /// Call function-table entry `idx` as a function body (AOT-only: one
+    /// this Worker has just installed).
+    fn ftab_call(idx: i32, ctx: i32, depth: i32, need: i32, ret: i64) -> i32;
 }
+
+/// AOT-only fallbacks that found their target published and called it.
+pub(crate) static CAUGHT_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `gex_set_callout(0)` turns the call-out off (the fallback always leaves,
 /// as before it existed), for measuring.

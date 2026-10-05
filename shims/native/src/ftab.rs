@@ -40,15 +40,15 @@ pub(crate) struct Shared {
     /// Addresses handed to the background translator (`queue`), until a
     /// retirement covers them.
     queued: std::collections::HashSet<u64>,
+    /// Stateful providers' installs (`libprov`), by module: their data's
+    /// guest address.
+    pub stateful: HashMap<u32, crate::libprov::Extras>,
     /// Installs that are export providers (`publish_pairs`): native code in
     /// place of a library's, so a rewrite of the library's bytes there does
     /// not retire them (the bytes are not what runs). Noita's mod sandbox
     /// overwrites ~120 lua51.dll entry points; pewasm, whose lua51 is
     /// native too, ignores those writes the same way.
     pub providers: std::collections::HashSet<u32>,
-    /// Stateful providers' installs (`libprov`), by module: their data's
-    /// guest address.
-    pub stateful: HashMap<u32, crate::libprov::Extras>,
 }
 
 /// One store's half, inside [`Jit`].
@@ -173,7 +173,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
         match &s.ftab.runtime {
             Some(m) => m.clone(),
             None => {
-                let m = Module::new(cx.as_context().engine(), gex_cgen::runtime::module())
+                let m = gex_cache::compile(cx.as_context().engine(), &gex_cgen::runtime::module())
                     .context("compiling the function table's runtime module")?;
                 crate::aot_share::note(&m, crate::aot_share::Kind::Runtime);
                 s.ftab.runtime = Some(m.clone());
@@ -685,6 +685,9 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
 /// replays). False when the translator declined or a retirement since the
 /// job was taken made it stale.
 fn run_job(j: &Job) -> Result<bool> {
+    if cfg!(not(feature = "translate")) {
+        return Ok(false);
+    }
     use std::sync::atomic::Ordering::Relaxed;
     let Some(tr) = gex_kernel::ftab::translator() else { return Ok(false) };
     let (sh, memory, addr) = (&j.sh, &j.memory, j.addr);
@@ -775,7 +778,7 @@ fn compile_translation(j: &Job, wasm: &[u8]) -> Result<Module> {
             let key = gex_cache::key(build, [b"fjit".as_slice(), wasm]);
             gex_cache::load_or_compile_at(&j.engine, &dir.join("fjit").join(format!("{key}.cwasm")), wasm)
         }
-        None => Module::new(&j.engine, wasm).map_err(anyhow::Error::from),
+        None => gex_cache::compile(&j.engine, wasm),
     }
 }
 
@@ -828,6 +831,9 @@ fn fallback(caller: &mut Caller<'_, HostState>, ctx: i32, ret: u64) -> Result<i3
         (true, true) => 4,
     };
     let _ = GuestMem::new(memory.bytes()).write_u64(c + ctx::PC as u64, target);
+    if caller.data().nt.is_some() && crate::profile::active() {
+        crate::profile::note_nt_entry(target);
+    }
     if stats::FALLBACK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 1023 == 0 {
         *stats::FALLBACK_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(target).or_default() += 1;
     }
@@ -900,6 +906,9 @@ impl gex_kernel::ftab::Translator for Forwarder {
 }
 
 pub(crate) fn selftest_init() {
+    if cfg!(not(feature = "translate")) {
+        return;
+    }
     if std::env::var_os("GEX_FTAB_SELFTEST").is_some() {
         gex_kernel::ftab::set_translator(Box::new(Forwarder));
     }

@@ -217,6 +217,7 @@ fn eject_build_run_and_replace() {
         runtime: std::env::current_exe().unwrap(),
         runtime_build: None,
         web_shim: None,
+        web_page: None,
     };
     let (p, p2) = (tmp.join("p"), tmp.join("p2"));
     eject::eject(&tmp.join("rec"), &p, &opts).unwrap();

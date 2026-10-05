@@ -493,6 +493,25 @@ impl FnUnit {
         self.protos.insert(entry);
     }
 
+    /// A body for `entry` that an export provider compiled into the same
+    /// module serves (a link group's provider, docs/eject-pe.md §6a G2): a
+    /// tail call of the provider's C function `sym`, an F_body. In the
+    /// element segment as any body, so direct calls and the table reach it.
+    pub fn add_provider_body(&mut self, entry: u64, sym: &str) {
+        let st = self.storage();
+        let _ = writeln!(
+            self.bodies,
+            "int {sym}(int ctx, int32_t depth, uint32_t need, uint64_t ret);\n\
+             {st}int {}(int ctx, int32_t depth, uint32_t need, uint64_t ret) {{\n  \
+             GEX_MUSTTAIL return {sym}(ctx, depth, need, ret);\n}}\n",
+            body_name(entry)
+        );
+        self.protos.insert(entry);
+        if self.ftab {
+            self.defined.push(entry);
+        }
+    }
+
     pub fn add(
         &mut self,
         f: &Function,

@@ -368,9 +368,28 @@ pub fn note_nt(setup: &crate::nt::NtSetup, gl: bool) {
         settings,
         gl,
         images: Vec::new(),
+        entries: Vec::new(),
     };
     rec.state.lock().unwrap_or_else(|e| e.into_inner()).session.nt = Some(nt);
     gex_kernel::nt::file::set_file_hook(note_nt_file);
+}
+
+/// Code at `pc` ran without a unit although its image has one (a tier-1
+/// entry after a unit left, a resume, a fallback call): an ejected build
+/// needs a function there.
+pub fn note_nt_entry(pc: u64) {
+    let Some(rec) = recorder() else {
+        return;
+    };
+    if !crate::nt_cgen::unit_covers(pc) {
+        return;
+    }
+    let mut st = rec.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(nt) = st.session.nt.as_mut() {
+        if !nt.entries.contains(&pc) {
+            nt.entries.push(pc);
+        }
+    }
 }
 
 /// A path the NT layer opened, queried or read (`nt::file::set_file_hook`),
@@ -666,7 +685,10 @@ fn write(rec: &Recorder) -> Result<()> {
     // Write-then-rename, so a reader never sees half a file.
     for (name, text) in [("profile.json", profile), ("session.json", session)] {
         let path = rec.out.join(name);
-        let tmp = rec.out.join(format!(".{name}.tmp"));
+        // A name of this writer's own: two threads harvesting at once each
+        // write their own temporary, and the last rename wins.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = rec.out.join(format!(".{name}.{}.tmp", SEQ.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
     }

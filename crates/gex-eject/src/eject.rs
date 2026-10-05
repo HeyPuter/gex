@@ -42,6 +42,9 @@ pub struct EjectOptions {
     /// gex's browser shim (`gex_browser.wasm`, built from the same source for
     /// the same guest), for a project with a web build.
     pub web_shim: Option<PathBuf>,
+    /// A Windows program's page (web/build-eject-page.sh's output), for the
+    /// web build in a browser: vendored as runtime/web/page.
+    pub web_page: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -261,8 +264,17 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
             );
         }
         let src = host_path(sysroot, p);
-        let meta = std::fs::metadata(&src)
-            .with_context(|| format!("the session read {p}, and {} is gone", src.display()))?;
+        let meta = match std::fs::metadata(&src) {
+            Ok(m) => m,
+            // A Windows program's file made and removed during the session
+            // by a way the NT layer's open hook does not see as a create
+            // (a rename, a copy): its output.
+            Err(_) if nt.is_some() => {
+                outputs.push(p.clone());
+                continue;
+            }
+            Err(e) => return Err(anyhow!("the session read {p}, and {} is gone: {e}", src.display())),
+        };
         if meta.is_dir() {
             dirs.insert(p.clone());
             continue;
@@ -308,6 +320,28 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     if std::fs::hard_link(&o.runtime, &rt).is_err() {
         write_file(&rt, &runtime, true)?;
     }
+    // A Windows program's AOT-only runtime (gex-rt: no translator, no wasm
+    // compiler), from `GEX_RT` or beside this gexc.
+    if nt.is_some() {
+        let found = std::env::var_os("GEX_RT")
+            .map(PathBuf::from)
+            .or_else(|| o.runtime.parent().map(|d| d.join("gex-rt")))
+            .filter(|p| p.is_file());
+        // Without it run.sh's default would be gexc, which holds the
+        // translator (docs/eject-pe.md §0): refuse rather than ship that.
+        let Some(src) = found else {
+            bail!(
+                "no gex-rt for this Windows program's project: set GEX_RT to a gex-rt binary \
+                 (cargo build --release -p gex-rt --features x86 --target-dir target/x86-rt) \
+                 or put one beside {}",
+                o.runtime.display()
+            );
+        };
+        let dst = out.join("runtime/gex-rt");
+        if std::fs::hard_link(&src, &dst).is_err() {
+            write_file(&dst, &std::fs::read(&src)?, true)?;
+        }
+    }
 
     let project = Project {
         isa: session.isa.clone(),
@@ -351,7 +385,40 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     write_file(&out.join("serve.mjs"), crate::web::SERVE_MJS.as_bytes(), true)?;
     write_file(&out.join("runtime/web/eject.mjs"), crate::web::EJECT_MJS.as_bytes(), false)?;
     write_file(&out.join("runtime/web/gex.mjs"), crate::web::GEX_MJS.as_bytes(), false)?;
-    if let Some(shim) = &o.web_shim {
+    if let (Some(shim), true) = (&o.web_shim, nt.is_some()) {
+        // A Windows program runs on the shared-memory x86 shim with its
+        // kernel and seed (the browser's NT layer), named by their directory
+        // (web/public/gex) or any file in it.
+        let from = if shim.is_dir() { shim.clone() } else { shim.parent().map(Path::to_path_buf).unwrap_or_default() };
+        let to = out.join(crate::pe::WEB_NT_DIR);
+        for f in crate::pe::WEB_NT_WASM {
+            let src = from.join(f);
+            let b = std::fs::read(&src).with_context(|| {
+                format!("reading {} (a Windows program's web build needs the x86 shared-memory shim, kernel and seed: GEX_ARCH=x86 shims/browser/build.sh)", src.display())
+            })?;
+            write_file(&to.join(f), &b, false)?;
+        }
+        for (f, text) in crate::pe::WEB_NT_JS {
+            write_file(&to.join("js").join(f), text.as_bytes(), false)?;
+        }
+        write_file(&out.join("run.mjs"), crate::pe::WEB_NT_RUN_MJS.as_bytes(), true)?;
+        // The page, when given: index.html and serve.mjs run the web build
+        // in a browser (with OpenGL, on Mesa over WebGPU).
+        if let Some(page) = &o.web_page {
+            if !page.join("nt.html").is_file() {
+                bail!("{} has no nt.html (make it with web/build-eject-page.sh)", page.display());
+            }
+            let to = out.join(crate::pe::WEB_NT_PAGE);
+            if to.exists() {
+                std::fs::remove_dir_all(&to)?;
+            }
+            let mut n = 0;
+            crate::build::copy_tree(page, &to, &mut n)?;
+            write_file(&out.join("index.html"), crate::pe::WEB_NT_INDEX_HTML.as_bytes(), false)?;
+            write_file(&out.join("serve.mjs"), crate::pe::WEB_NT_SERVE_MJS.as_bytes(), true)?;
+        }
+        summary.web = true;
+    } else if let Some(shim) = &o.web_shim {
         let b = std::fs::read(shim).with_context(|| format!("reading {}", shim.display()))?;
         if b.get(..4) != Some(b"\0asm") {
             bail!("{} is not a wasm module", shim.display());
@@ -363,10 +430,33 @@ pub fn eject(record: &Path, out: &Path, o: &EjectOptions) -> Result<Summary> {
     // The function tier's view of gex-abi, which decompiled C includes.
     write_file(&out.join("gen/gex_abi.h"), gex_cgen::header::header().as_bytes(), false)?;
 
+    // A Windows program's stateful providers: LuaJIT's lua51.dll (which
+    // generates code at run time) is served by PUC Lua in wasm
+    // (docs/eject-pe.md §5).
+    let mut providers = Vec::new();
+    if nt.is_some() {
+        write_file(&out.join("gen/provider.h"), crate::pe::PROVIDER_H.as_bytes(), false)?;
+        for o in &project.objects {
+            let name = o.path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+            if name == "lua51.dll" && crate::pe::is_luajit(&out.join(rootfs_rel(&o.path)?))? {
+                providers.push(config::Provider { library: "lua51.dll".into(), dir: "user/lib/lua51".into() });
+            }
+        }
+    }
+
     // The user's part, once.
     let user = out.join("user");
     if !user.join("eject.json").exists() {
-        write_file(&user.join("eject.json"), config::template().as_bytes(), false)?;
+        write_file(&user.join("eject.json"), config::template_with(&providers).as_bytes(), false)?;
+    }
+    for p in &providers {
+        let lib = p.dir.rsplit('/').next().unwrap_or("");
+        if !out.join(&p.dir).exists() {
+            for (l, path, bytes, exec) in crate::libs::LIBS.iter().filter(|(l, ..)| *l == lib) {
+                let _ = l;
+                write_file(&out.join(&p.dir).join(path), bytes, *exec)?;
+            }
+        }
     }
     if !user.join("README").exists() {
         write_file(&user.join("README"), templates::USER_README.as_bytes(), false)?;

@@ -54,8 +54,10 @@ fn mono_ns() -> u64 {
 
 /// The guest's wall clock. `GEX_NT_FIXED_TIME=<unix seconds>` (the
 /// counterpart of PEWASM_FIXED_TIME) starts it at that instant and advances
-/// it with real time, so a program that seeds from the date (Noita's world)
-/// sees the same value every run: reproducible measurements.
+/// it with real time, so a program that reads the date sees the same day
+/// every run. It does not fix Noita's world: its seed comes from the
+/// engine's RNG, seeded at start-up, unless the WORLD_SEED magic number
+/// (0x1206fe8) is set; "Setting random seed" differs run to run on pewasm too.
 fn wall() -> (u64, u32) {
     static FIXED: OnceLock<Option<(u64, Instant)>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
@@ -316,7 +318,12 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
                     let nest_exits = GuestMem::new(memory.bytes()).read_u64(gex_abi::NEST_EXITS).unwrap_or(0);
                     let co = crate::CALLOUTS.load(std::sync::atomic::Ordering::Relaxed);
                     let coa = crate::CALLOUT_ABORTS.load(std::sync::atomic::Ordering::Relaxed);
-                    let cg = format!("cgen nest_exits={nest_exits} callouts={co} callout_aborts={coa} {}", crate::ftab::stats::line());
+                    let cg = format!(
+                        "cgen nest_exits={nest_exits} callouts={co} callout_aborts={coa} provider_try={} provider_throw={} {}",
+                        crate::libprov::TRIES.load(std::sync::atomic::Ordering::Relaxed),
+                        crate::libprov::THROWS.load(std::sync::atomic::Ordering::Relaxed),
+                        crate::ftab::stats::line()
+                    );
                     match value {
                         Some(v) => eprintln!("gex-nt: stats t={} presents={presents} peek={v} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
                         None => eprintln!("gex-nt: stats t={} presents={presents} layout_miss={} {cg} {}", start.elapsed().as_millis(), layout_misses(), crate::jit_stats::line()),
