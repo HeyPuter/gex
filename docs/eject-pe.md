@@ -976,6 +976,37 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
     (blob at `$S/c24/edger.wgsl`), packs site24w, then world-up A/B x3
     site24/site24w and legs pew/site24w/site24/pew.
 
+- **Shader cache results (edger):** world-up after navigation x3 site24 (new
+  Mesa, in-process cache only) 33.3, 32.7, 31.7 s vs site24w (plus the shipped
+  blob, `?wgslcache=site`) 34.0, 30.8, 32.9 s: no difference between the two.
+  Against site23 (35.7, 34.8, 38.0 s, the Mesa before) both are about 3 s
+  faster, so the gain is the in-process dedupe (the same SPIR-V translated
+  again and again), not the shipped blob; the blob cuts "GL host" on Noita's
+  main thread over the first 10 s from 2.2-2.3 s to 1.25-1.35 s, which does
+  not reach world-up. Menus present ~70 frames/s on both (vsync-paced
+  compositor). World fps, same sequence: site24w 58.6, site24 59.3, pewasm
+  47.4, 47.9 (the eject 1.24x faster than pewasm, 59.0 vs 47.7 world fps).
+- **World-up, where the gap is now (edger, process time unless said):**
+  - World generation is at parity: per-second busy timelines of both
+    runtimes' Workers (`$S/profline.mjs`, profiles `$S/wg/g24`, `$S/wg/pw24`)
+    put it at ~22 s on one thread for the eject (plus ~8 s of a second
+    thread) and ~21 s for pewasm (w12, plus ~6 s of w13); from the stats, the
+    eject's last scripted click to its first world frame is 15-16 s against
+    pewasm's ~18 s.
+  - The gap is before it: process start to the first present takes 4.0-4.7 s
+    (pewasm: first surface 0.4 s after its process), and navigation to the
+    process start 2.7-6.0 s (pewasm 4.3 s). Frames 1 -> 180 (the clicks) take
+    ~7-8 s on both. Boot profile queued (`prof-edger.sh site24w boot24 0 14`).
+  - Per-function pairing with pewasm is not possible from its shipped
+    app.wasm: no name section, and `out/noita/build-mesa/app.js.symbols` has
+    150856 entries against the binary's 89250 functions (it predates
+    wasm-opt), so its names are wrong (malloc never sampled,
+    `emscripten_wasm_worker_self_id` sampled). Address mapping between the
+    runtimes is otherwise known: pewasm rebases noita.exe to 0x10000 (gex
+    keeps 0x400000), msvcp120 0xf00000 (gex 0x16b0000), msvcr120 0xf80000 (gex
+    0x15c0000); `$S/wgmap.mjs` pairs per gex function given a named pewasm
+    build.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
