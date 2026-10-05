@@ -958,7 +958,7 @@ plus `make -k`.
 
 ## 7. State and how to resume (stream W)
 
-**Where things are** (all relative to `${NW_ROOT:-/home/velzie/src/noita-wasm}`):
+**Where things are** (all relative to `${NW_ROOT:-~/gex-sandbox}`; on gooner since 2026-10-04, `$W` = `~/gex-sandbox/scratch/W`):
 
 | what | where |
 |---|---|
@@ -984,6 +984,15 @@ plus `make -k`.
    `X.dll.so.r.o` and `.exports` beside it.
 4. A native prefix: `tools/wine-wasm/stage-native.sh $W/wine-w32
    <fork> $W/pfx-native ntdll.dll kernelbase.dll kernel32.dll`.
+
+**On gooner (2026-10-04 night):**
+- Sysroot rebuilt (`$W/sysroot`, emsdk's compiler-rt via env.sh's `GEX_CRT_SRC`;
+  9e3d7632 fixes the script for Debian's asm symlink and llvm-config-22).
+- `$W/wine-tools`: only `make __tooldeps__` is needed (the full host Wine build is not).
+- `$W/build-w32.sh` configures and builds the wasm32 tree (`make -k -j4`, nice 19);
+  `$W/browser-nt.sh [WORKTREE]` builds the x86 shims and runs tests/nt/run-browser.sh.
+- **wt/wasmtime49** recreated (`git worktree add`), master merged (86734783):
+  browser NT **49/49**. Ready for the coordinator's gate.
 
 **State (2026-10-04):**
 - **W0 and W1:** done (§4.1, §4.2).
