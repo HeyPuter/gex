@@ -159,6 +159,8 @@ check x86/msvc_cxxeh 0 "$allok" "$here/bin/x86/msvc_cxxeh.exe"
 check x86/msvc_x87 0 "$allok" "$here/bin/x86/msvc_x87.exe"
 # A C++ exception from msvcp140 caught by type, its what() through msvcp140's vtable.
 check x86/msvc_msvcp 0 "$allok" "$here/bin/x86/msvc_msvcp.exe"
+# ntdll's i386 compiler helpers (_alldiv, _allshl, _alldvrm...) and RtlUlongByteSwap.
+check x86/msvc_largeint 0 "$allok" "$here/bin/x86/msvc_largeint.exe"
 # (x86/uses.exe is left out: it crashes at exit on native Wine 11.15 too.)
 
 echo "$pass passed, $fail failed, $xfail expected failures"
