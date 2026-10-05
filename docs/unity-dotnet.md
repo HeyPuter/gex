@@ -572,6 +572,19 @@ Not yet:
     its OpenGL 4.5 device and **Muck's main menu renders completely** (scene,
     grass, UI) with all game code on .NET Mono. Native only, so no speed
     numbers (cold translation; the browser is the target).
+  - **wasmtime 49 (2026-10-05):** master fd8be1d1 merged (3718d0ca);
+    wasmtime 27 dropped. The 64-bit provider imports follow master's error
+    port (`crate::host`), the memory64 reservation is
+    `Config::memory_reservation`. Gate on 3718d0ca (BROWSER_NT=1, JOBS=6):
+    a64 452, x86 441, tests/nt 73/73 both ways, x86-programs and glibc,
+    lockstep, browser NT 49/0; output in `scratch/unity/gate2/`. Muck batch
+    mode, embed and the mem64-* programs (with and without --fjit) pass.
+  - **The --fjit hang (c330a519):** under --fjit Muck spun at "Begin
+    MonoManager ReloadAssembly": the function JIT followed UnityPlayer's
+    PLT into libmonobdwgc and published Boehm's own code over the provider's
+    bindings (GC_exclude_static_roots looping on the provider's
+    GC_next_exclusion). libprov records replaced text; `ftab::job` skips it.
+    Reload now takes 6.9 s with --fjit. embed has a --fjit leg.
   - **Speed observations:** pass `--fjit` to `muck-dotnet.sh` (it forwards
     gexc flags) for any speed observation. Without it UnityPlayer runs on
     tier-1, and the provider is interpreter-only. x2 (no `--fjit`, llvmpipe,
@@ -616,7 +629,19 @@ Not yet:
        tests/unity-dotnet/embed in node.
     4. Muck in the page: the provider plus the BCL served as files,
        graphics through Mesa (wink) and the page's Xwayland (`hostx=1`).
-    5. The fork's wasm JIT on wasm64. Assessment (2026-10-05): about
+    5. **In progress (the user: JIT first):** the fork's wasm JIT on
+       wasm64. Done (0651b922): `patches/0002-wasm-jit-gex.patch` makes
+       the runtime half build for gex (`WJ_RUNTIME`), with the JS parts as
+       host imports (`mini-wasm-gex.h`; `shims/native/src/wasmjit.rs`);
+       `GEXMONO_WASM_JIT=1` runs the whole pipeline (hotness, emit, host
+       compile and per-store instantiate, interpreter fallback) and embed
+       stays correct. Next: the emitter's wasm64 output (memory64/table64
+       imports, i64 addresses and pointer locals, `sext_i4`/`zext_i4`,
+       pointer-typed returns and moves, `storei8_membase_imm`); methods
+       with EH regions refused until wasmtime's exceptions are wired (the
+       emitter uses legacy try/catch with the C++ tag). Then Muck's menu
+       natively with --fjit and the JIT, presents/s against
+       interpreter-only. Assessment (2026-10-05): about
        14,400 lines (`mini-wasm*.inc`, `mini-wasm.c`, `wasm-encoder.c`) on
        Mono's mini IR, with no wasm64 awareness. It is emscripten-bound:
        `EM_ASM` instantiation with `wasmTable`, a per-Worker publish
