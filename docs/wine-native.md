@@ -627,19 +627,30 @@ Native Wine runs inside the guest thread, as Windows' DLLs do:
   KiUserApcDispatcher, RtlUserThreadStart (entry in EAX, argument in EBX),
   `_chkstk`/`_alloca_probe`. winebuild skips an export whose `gexp_` the
   objects already define.
-- **Boot's ntdll variables.** gex-kernel's boot writes
+- **ntdll's variables and its own base.** gex-kernel's boot writes
   `__wine_syscall_dispatcher`, `__wine_unix_call_dispatcher` and
   `__wine_unixlib_handle` through ntdll's export table, which in a shared
   skeleton points all data exports at one placeholder until the install.
-  wasmdll queues the three values for the module's own variables and
-  writes them after the drain's catch-up has instantiated the module (its
-  data initialisation would clear them).
+  A native ntdll needs only the handle: wasmdll queues it for the module's
+  variable and writes it after the drain's catch-up has instantiated the
+  module (its data initialisation would clear it). Unix calls go through
+  `__wine_unix_call_wasm32` (gex's private UNIX_CALL system call): the
+  i386 trampolines are guest code below the ICALL check's floor (0x400000),
+  so a native call through them would be taken for a table index. ntdll
+  finds its own image from the guest address `LdrInitializeThunk` was
+  entered at (its functions' addresses are table indices), and parses
+  `WINEDEBUG` itself when no Unix side has filled the options below the
+  PEB (Wine's default otherwise: err and fixme).
 - **Forwards across the one module.** `.exports` lists forwards; pelink
   binds a forwarded name to an alias the defining DLL gets
   (`kernel32.dll!HeapAlloc` for ntdll's `RtlAllocateHeap`), or to a
   generated thunk where the declarations differ (kernel32's void
   `EnterCriticalSection` against NTSTATUS `RtlEnterCriticalSection`): wasm
-  calls must match exactly. compiler-rt's builtins are linked in.
+  calls must match exactly. The resolved forwards also go into the module
+  as a custom section, `gexw.forwards`, so gex binds a `-import` re-export
+  of a forwarded name (kernel32's `HeapFree`, kernelbase's forward to
+  `RtlFreeHeap`) to the adapter it reaches. compiler-rt's builtins are
+  linked in.
 - **A native prefix:** `tools/wine-wasm/stage-native.sh BUILD SRC OUT DLL...`
   links the named DLLs into `winepe.wasm` and writes their skeletons into a
   copy (symbolic links) of the x86 prefix, without its layout pins. The
@@ -985,9 +996,15 @@ plus `make -k`.
   - The one-module PE side works (§3.14, tests/wasm32/dll/shared.sh).
   - The runtime boundary is built (§3.15), and native ntdll, kernelbase
     and kernel32 link into one module with nothing unresolved.
+  - **tests/nt (`--no-cgen`, wasmtime 49) with native ntdll, kernelbase
+    and kernel32** and the rest of Wine x86: 53 of 60 pass, including the
+    W2 gate (hello, sync, tls, seh and seh-traps, apc, cxx, mtx, crtmem,
+    icall, detour, jitcode, exitproc).
+    - Failing: x86 user_win, gdi, input, display, glcompat and window
+      ("USER32.dll failed to initialize"), and pe-x86/msvc (exit 1 for 9,
+      "a watched dispatch slot with nothing to run").
   - **Next:**
-    - run tests/nt `hello_args` on the native prefix with `--no-cgen`, then
-      sync, tls, seh, apc and cxx;
+    - those seven;
     - the CRTs (msvcrt/ucrtbase: `DISPATCHER_CONTEXT`, `__ASM_VTABLE`);
     - win32u's system-call stubs (the same `wine/gex/syscall.h`);
     - varargs adapters;

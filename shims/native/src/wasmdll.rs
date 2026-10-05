@@ -101,6 +101,9 @@ pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::Gu
     let Some(wp) = shared.lock().unwrap_or_else(|e| e.into_inner()).wine_pe.clone() else { return };
     let writes = std::mem::take(&mut *wp.pending.lock().unwrap_or_else(|e| e.into_inner()));
     for (at, bytes) in writes {
+        if std::env::var_os("GEX_WASM_TRACE").is_some() {
+            eprintln!("gex: wine PE: boot variable at {at:#x} <- {bytes:02x?}");
+        }
         if let Some(dst) = memory.bytes().get_mut(at as usize..at as usize + bytes.len()) {
             dst.copy_from_slice(&bytes);
         }
@@ -111,13 +114,30 @@ pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::Gu
 /// does it in `load_ntdll_functions`), by link name: in a native ntdll they
 /// are the module's, whose data the boot's writes went past (its skeleton
 /// points them all at one placeholder until the install).
-fn ntdll_variables() -> [(&'static str, Vec<u8>); 3] {
-    use gex_kernel::nt::boot::tramp;
-    [
-        ("__wine_syscall_dispatcher", (tramp::SYSCALL_DISPATCHER_32 as u32).to_le_bytes().to_vec()),
-        ("__wine_unix_call_dispatcher", (tramp::UNIX_CALL_32 as u32).to_le_bytes().to_vec()),
-        ("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec()),
-    ]
+///
+/// Only the unixlib handle: a native ntdll makes its system calls and unix
+/// calls itself (its dispatcher variables keep their own values; the i386
+/// trampolines are guest code below the ICALL check's floor).
+fn ntdll_variables() -> [(&'static str, Vec<u8>); 1] {
+    [("__wine_unixlib_handle", gex_kernel::nt::unixcall::NTDLL_HANDLE.to_le_bytes().to_vec())]
+}
+
+/// pelink's `gexw.forwards` custom section: (export name, `dll!name` it
+/// reaches).
+fn forwards(wasm: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let Ok(wasmparser::Payload::CustomSection(c)) = payload {
+            if c.name() == "gexw.forwards" {
+                for line in String::from_utf8_lossy(c.data()).lines() {
+                    if let Some((a, b)) = line.split_once(' ') {
+                        out.push((a.to_string(), b.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Exported i32 globals with constant initialisers: a PIC module's data
@@ -216,6 +236,15 @@ fn install_shared(
                         any_dll.entry(export.to_string()).or_insert(k as u32);
                     }
                     slots.insert(n.clone(), k as u32);
+                }
+            }
+            // Forwarded names (pelink's `gexw.forwards`): a re-export of one
+            // binds to the adapter of what the forward reaches.
+            for (name, target) in forwards(&wasm) {
+                if let Some((dll, fname)) = target.split_once('!') {
+                    if let Some(&k) = slots.get(&format!("{dll}!gexp_{fname}")) {
+                        any_dll.entry(name).or_insert(k);
+                    }
                 }
             }
             let module = gex_cache::load_or_compile_at(engine, &crate::libprov::cwasm_path(&file, &wasm), &wasm)

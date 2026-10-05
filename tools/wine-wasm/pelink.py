@@ -26,6 +26,21 @@ import tempfile
 here = os.path.dirname(os.path.realpath(__file__))
 
 
+def enc_leb(v):
+    out = bytearray()
+    while True:
+        x = v & 0x7f
+        v >>= 7
+        out.append(x | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def enc_name(s):
+    b = s.encode()
+    return enc_leb(len(b)) + b
+
+
 def makefile_var(path, var):
     try:
         text = open(path).read().replace('\\\n', ' ')
@@ -203,6 +218,20 @@ def link(dlls, out, gexrt):
     if os.environ.get('GEX_WASM_SYSROOT'):
         cmd.append(os.path.join(os.environ['GEX_WASM_SYSROOT'], 'lib', 'libclang_rt.builtins-wasm32.a'))
     subprocess.check_call(cmd)
+    # The forwards, for gex to bind a -import re-export of a forwarded name
+    # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
+    # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.
+    lines = []
+    for name, by in sorted(forwards.items()):
+        if name in exporters:
+            continue
+        hit = resolve_forward(next(iter(by.values())))
+        if hit:
+            lines.append(f'{name} {hit[0]}!{hit[1]}')
+    if lines:
+        payload = enc_name('gexw.forwards') + '\n'.join(lines).encode() + b'\n'
+        with open(out, 'ab') as f:
+            f.write(bytes([0]) + enc_leb(len(payload)) + payload)
     undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
     names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
                    '__stack_pointer', '__memory_base', '__table_base'})

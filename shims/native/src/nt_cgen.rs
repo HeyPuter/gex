@@ -828,7 +828,9 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
 /// addresses, after its unit (whose bodies there are stubs into the table).
 fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
     let pv = provided(&p.pe, p.base);
-    for prov in &pv.providers {
+    // A native wasm32 Wine DLL's exports are its own module's (below).
+    let native = p.pe.sections.iter().any(|s| s.name == ".wasmref" || s.name == ".wasm");
+    for prov in pv.providers.iter().filter(|_| !native) {
         // Small, and built in a private directory then renamed into place:
         // no need for the cache's build lock (which a unit build holds for
         // an hour).
