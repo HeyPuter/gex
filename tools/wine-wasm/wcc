@@ -31,6 +31,12 @@ args = sys.argv[1:]
 plugin = os.path.join(sysroot, 'lib', 'GexIcall.so')
 if '-D_WIN32' in args and os.path.exists(plugin) and not os.environ.get('GEX_WASM_NO_ICALL'):
     CC += ['-fpass-plugin=' + plugin]
+# Unix-side code (programs, their libraries) lowers setjmp onto the legacy
+# exception instructions: binaryen's asyncify (fork, below) can instrument
+# try/catch but not try_table. The link step translates the result to the
+# standard instructions (--translate-to-exnref), which is what gex runs.
+if '-D_WIN32' not in args:
+    CC = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a in CC]
 if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith(('-print-', '-dump'))
        for a in args) or not args:
     os.execvp(CC[0], CC + args)
@@ -87,14 +93,95 @@ if relocatable:
     # referenced): a DLL for pelink.py
     cmd = ['wasm-ld', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
     sys.exit(subprocess.call(cmd))
+
+def imports(path):
+    """(module, name) of every function import of the module at path."""
+    w = open(path, 'rb').read()
+    def leb(p):
+        r = sh = 0
+        while True:
+            x = w[p]; p += 1
+            r |= (x & 0x7f) << sh; sh += 7
+            if not x & 0x80:
+                return r, p
+    def name(p):
+        n, p = leb(p)
+        return w[p:p + n].decode(), p + n
+    out, p = [], 8
+    while p < len(w):
+        sid = w[p]; n, q = leb(p + 1); end = q + n
+        if sid == 2:
+            cnt, q = leb(q)
+            for _ in range(cnt):
+                m, q = name(q); f, q = name(q)
+                kind = w[q]; q += 1
+                if kind == 0:
+                    _, q = leb(q); out.append((m, f))
+                elif kind == 1:
+                    q += 1; fl, q = leb(q); _, q = leb(q)
+                    if fl & 1: _, q = leb(q)
+                elif kind == 2:
+                    fl, q = leb(q); _, q = leb(q)
+                    if fl & 1: _, q = leb(q)
+                elif kind == 3:
+                    q += 2
+                elif kind == 4:
+                    q += 1; _, q = leb(q)
+            break
+        p = end
+    return out
+
+
+# Functions above fork's driver (src/process/wasm32/__gex_fork.c in the musl
+# fork): the unwind for a fork stops at the driver, so they keep no state.
+FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_thread_c',
+              '__gex_fork_run', '__gex_fork_drive', '__gex_fork_child']
+
+
+def finish(path):
+    """binaryen over a linked module: asyncify when it can fork (it imports
+    gex.fork_point: every function that can reach it saves and restores its
+    frame), and the legacy exception instructions translated to the standard
+    ones. Names kept (-g): gex binds the entries by name."""
+    opt = os.environ.get('GEX_WASM_OPT') or os.path.join(sysroot, 'binaryen', 'bin', 'wasm-opt')
+    passes = []
+    if ('gex', 'fork_point') in imports(path):
+        passes += ['--asyncify', '--pass-arg=asyncify-imports@gex.fork_point']
+        # Only what can reach a fork by a type-correct call graph
+        # (forkreach.py); asyncify's own analysis takes every indirect call
+        # for a fork point, which is nearly every function.
+        dis = os.path.join(os.path.dirname(opt), 'wasm-dis')
+        reach = subprocess.run([sys.executable, os.path.join(here, 'forkreach.py'), dis, path, 'gex.fork_point'] + FORK_ROOTS,
+                               capture_output=True, text=True)
+        if reach.returncode == 0 and not os.environ.get('GEX_WCC_FORK_ALL'):
+            lst = os.path.join(tmp, 'onlylist')
+            open(lst, 'w').write(reach.stdout.strip().replace(',', '\n') + '\n')
+            passes += ['--pass-arg=asyncify-onlylist@@' + lst]
+        else:
+            passes += ['--pass-arg=asyncify-removelist@' + ','.join(FORK_ROOTS)]
+        passes += ['-O2']
+    passes += ['--translate-to-exnref']
+    feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
+             '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types']
+    # (DWARF dropped: binaryen cannot rewrite clang's version 5)
+    r = subprocess.call([opt, path, '-g', '--strip-dwarf'] + feats + passes + ['-o', path])
+    if r:
+        sys.exit('wcc: wasm-opt failed on ' + path)
+
+
 if shared:
     cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags + \
         [lib + '/libclang_rt.builtins-wasm32.a']
-    sys.exit(subprocess.call(cmd))
+    r = subprocess.call(cmd)
+    if r:
+        sys.exit(r)
+    finish(out)
+    sys.exit(0)
 wasm = out + '.wasm'
 cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \
     ['-lc', lib + '/libclang_rt.builtins-wasm32.a']
 r = subprocess.call(cmd)
 if r:
     sys.exit(r)
+finish(wasm)
 sys.exit(subprocess.call([sys.executable, os.path.join(here, 'wasm-elf.py'), wasm, out]))

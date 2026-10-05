@@ -3934,6 +3934,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         },
         None => program.entry(),
     };
+    // A native wasm32 program: published before it runs (cgen/wasmprog.rs).
+    cgen::wasmprog::stage(nt_abi.is_none().then_some(&program));
     set_host(Host {
         magic_head: HOST_MAGIC,
             kernel,
@@ -6391,6 +6393,12 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     h.jit.ever_threaded = true;
                 }
                 stage_thread(tid, ctx_addr, start);
+                if h.kernel.wasm32 {
+                    // A wasm32 program's frames cannot be left: the call
+                    // returns, and `#wasmprogSyscall` starts the thread.
+                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return 0;
+                }
                 // The stack goes back so the host can see the record and
                 // start the Worker, exactly as a `fork` does. The parent
                 // resumes where it was: `clone` returns the tid to it.
@@ -6509,6 +6517,17 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 child_stack,
                 tls,
             } => {
+                if h.kernel.wasm32 {
+                    // A wasm32 process clones at its thread entry (the
+                    // context's PC, as the musl fork's __clone leaves it);
+                    // the call returns, and `#wasmprogSyscall` hands the
+                    // child to the host.
+                    let start = gm.read_u64(kstate.ctx_addr + ctx::PC as u64).unwrap_or(0);
+                    do_fork(h, pid, pc as u64, child_stack, tls);
+                    FORK[1].store(start, std::sync::atomic::Ordering::Relaxed);
+                    WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return 0;
+                }
                 do_fork(h, pid, pc as u64, child_stack, tls);
                 // Give the stack back though the parent carries on: the child
                 // is a copy of this memory that must be taken now, when the
@@ -6571,7 +6590,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     recompile_objects();
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
-    let stop = if stop == 3 {
+    let stop = if stop == 3 && with_host(|h| h.kernel.wasm32) {
+        wasm32_wait(pc as u64)
+    } else if stop == 3 {
         // Ask first, wait second: most parked calls are already ready by now
         // (the pipe has room, the child has exited), and a readiness scan first
         // -- a call into the global kernel per shared handle -- cost more than
@@ -6714,6 +6735,50 @@ const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 // save or restore: `fork` asks the host for a Worker with a copy of the
 // parent's regions, `wait4`/`kill`/`exit` route through the kernel's table, and
 // each process is a Worker the engine schedules.
+
+/// A thread or a fork a wasm32 program's syscall staged without trapping
+/// (`gex_wasmprog_staged`).
+static WASM32_STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a wasm32 program's last syscall staged a thread or a child for
+/// the host (and forget it).
+#[no_mangle]
+pub extern "C" fn gex_wasmprog_staged() -> i32 {
+    WASM32_STAGED.swap(false, std::sync::atomic::Ordering::Relaxed) as i32
+}
+
+/// A wasm32 program's blocking call (cgen/wasmprog.rs): its frames cannot be
+/// given back to JS, so the Worker waits here until the call can finish, and
+/// the call returns. Anything else that ends the wait (the process gone)
+/// traps as usual.
+fn wasm32_wait(pc: u64) -> i32 {
+    let mut said = false;
+    loop {
+        let picked = schedule();
+        let here = with_host(|h| h.threads[cur()].kstate.ctx_addr);
+        if picked == 1 {
+            if resume() == Some(pc + gex_abi::SYSCALL_INST_BYTES) && resume_ctx().unwrap_or(here) == here {
+                set_resume_none();
+                set_resume_ctx_none();
+                return 0;
+            }
+            return picked;
+        }
+        if EXITED.load(std::sync::atomic::Ordering::Relaxed) || with_host(|h| matches!(h.threads[cur()].waiting, Waiting::Exited)) {
+            return picked;
+        }
+        if !said && with_host(|h| h.threads.iter().any(|t| wait_needs_page(t, &h.kernel))) {
+            // A wait on the page itself (its keyboard, the Worker's own
+            // network) needs this Worker's event loop, which a wasm32
+            // program's frames hold: it is polled here instead.
+            warn_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
+            said = true;
+        }
+        if gex_park(20) < 0 {
+            park_until_ready();
+        }
+    }
+}
 
 fn do_fork(h: &mut Host, pid: i32, pc: u64, child_stack: u64, tls: Option<u64>) {
     let ctx_addr = h.threads[cur()].kstate.ctx_addr;
@@ -7627,6 +7692,9 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         h.kernel.compat = p.compat();
         gex_xlate::set_compat(p.compat());
     }
+    // Set again when a wasm32 program is published (cgen/wasmprog.rs).
+    h.kernel.wasm32 = false;
+    cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads = 1;
     h.kernel.next_ctx_slot = 1;
     // Signal handlers do not survive an exec; the mask does.

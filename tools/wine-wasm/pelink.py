@@ -320,6 +320,18 @@ def link(dlls, out, gexrt, others=None):
         cmd.insert(cmd.index(gexrt), obj)
         subprocess.check_call(cmd)
         print(f'{out}: {len(gaps)} functions nothing defines, trapping: {" ".join(n for n, _ in gaps)}')
+    # wcc compiles code without -D_WIN32 as Unix-side code, whose setjmp
+    # lowers onto the legacy exception instructions (for asyncify); that
+    # includes winebuild's glue, where an adapter of msvcrt's _setjmp calls
+    # a function clang lowers as setjmp. gex runs the standard instructions
+    # only, so the module is translated, as wcc's own links are.
+    opt = os.path.join(os.environ.get('GEX_WASM_SYSROOT', ''), 'binaryen', 'bin', 'wasm-opt')
+    opt = os.environ.get('GEX_WASM_OPT') or opt
+    if os.path.exists(opt):
+        subprocess.check_call([opt, out, '-g', '--strip-dwarf', '--enable-threads', '--enable-bulk-memory',
+                               '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
+                               '--enable-exception-handling', '--enable-reference-types',
+                               '--translate-to-exnref', '-o', out])
     # The forwards, for gex to bind a -import re-export of a forwarded name
     # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
     # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.
