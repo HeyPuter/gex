@@ -728,6 +728,20 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   shooting, death ("Game Over", cause 'killme'), stats screen, New Game
   again into a new world, pause menu. Scripts `$S/shots/p1..p7.json`,
   `$S/play-edger.sh`.
+- **Saves across reloads (edger, p7/p8):** in the world, Escape, Save &
+  Quit (the process exits, status 29), a snapshot stored 46 files (850 KB)
+  of 62 under drive_c/users, the page reloaded and restored 62; the main
+  menu then offers Continue (and skips the release notes it had shown), and
+  Continue puts the player back where they had walked.
+- **35-minute soak (edger, bench settings):** no freeze (presents never
+  stall after world-up; the only stalls are loading screens before 96 s).
+  World fps falls over the run on both runtimes, so it is the game (an idle
+  player, a growing world), not gex: ejected 44.1, 41.3, 38.9, 37.3, 36.0,
+  32.3, 30.2 per 5 minutes; pewasm 43.6, 30.5, 23.0, 19.1, 16.9.
+- **Merged master 3718d0ca** (81a0ae2a; unit keys moved): p-noita17 relinked
+  at the new keys (`$S/logs/build18.log`); the measurements above are on the
+  previous keys (site17b/site17d).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
