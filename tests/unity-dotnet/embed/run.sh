@@ -22,7 +22,7 @@ cp "$FW/System.Runtime.dll" "$FW/System.Collections.dll" "$FW/System.Runtime.Int
 cd "$T"
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" | tee out.txt
-if ! { grep -q "^Compute(50) = 50002$" out.txt && grep -q "^Hello = hello gex from t ptr=8$" out.txt && grep -q "^Guest = twice 42; concat guest strings; mix 323.25; scale 2,4,6; big 11,25,52,3; caught from the guest$" out.txt && grep -q "^Back = callback 806.50; unmanaged 1015$" out.txt && grep -q "^held across collections: 64 of 64 intact$" out.txt && grep -q "^worker thread: 0 bad of 640$" out.txt && grep -q "^gc ok$" out.txt; }; then echo FAIL; exit 1; fi
+if ! { grep -q "^Compute(50) = 50002$" out.txt && grep -q "^Hello = hello gex from t ptr=8$" out.txt && grep -q "^Guest = twice 42; concat guest strings; mix 323.25; scale 2,4,6; big 11,25,52,3; caught from the guest$" out.txt && grep -q "^Back = callback 806.50; unmanaged 1015$" out.txt && grep -q "^Work(200) = 24982818$" out.txt && grep -q "^held across collections: 64 of 64 intact$" out.txt && grep -q "^worker thread: 0 bad of 640$" out.txt && grep -q "^gc ok$" out.txt; }; then echo FAIL; exit 1; fi
 # The same under the function JIT, which must leave the replaced library's own code alone: it once
 # followed the PLT into the stub ("x86 Mono stub ... called"), as it followed Muck's into Boehm's GC.
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --fjit \

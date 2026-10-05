@@ -1396,7 +1396,7 @@ index 03465e0d2..4d492cde8 100644
  	 * count -- a one-site callee can be white hot -- so a truncated list cannot answer the weighting
  	 * question it exists for. */
 diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
-index 65b707ead..e5a56f436 100644
+index 65b707ead..0267bf04f 100644
 --- a/src/mono/mono/mini/mini-wasm-emitter.inc
 +++ b/src/mono/mono/mini/mini-wasm-emitter.inc
 @@ -151,7 +151,7 @@ wj_structured_outer_depth (int kind, int h, int l, int n, int from)
@@ -2095,6 +2095,17 @@ index 65b707ead..e5a56f436 100644
  		/* AOT-style in-method EH (milestone 2b): record this bb's IL offset into the active island il_state
  		 * (pushed at the interp->JIT boundary) so mono's exception pass-1 matches THIS method's enclosing
  		 * try and finds its catch as the NEAREST handler for a throwing AOT callee — stopping the walk here
+@@ -3318,8 +3361,8 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 				while (kv >= 0) {
+ 					if (!lazy_cold_frame) {
+ 						wasm_op_local (&body, WASM_OP_LOCAL_GET, (guint32) refbase_idx);
+-						wasm_i32_const (&body, 0);
+-						wasm_op (&body, WASM_OP_I32_STORE); wasm_memarg (&body, 2, (guint32) (refslot [kv] * 4));
++						wasm_ptr_const (&body, 0);
++						wasm_op (&body, WASM_OP_P_STORE); wasm_memarg (&body, WJ_PAL, (guint32) (refslot [kv] * WJ_PSZ));
+ 					}
+ 					/* The pin is gone, so the value must not be reused past this point: LCSE's reuse
+ 					 * read is created here at emission and the liveness that decided this slot was dead
 @@ -3331,7 +3374,7 @@ mono_wasm_emit_method (MonoCompile *cfg)
  				if (lazy_ref_frame && !lazy_cold_frame && sl_kill_head [my_ord] >= 0)
  					wasm_op (&body, WASM_OP_END);

@@ -149,6 +149,12 @@ main (int argc, char **argv)
 	P gr = mono_runtime_invoke (guest, NULL, NULL, &exc);
 	check ("Guest", exc);
 	printf ("Guest = %s\n", mono_string_to_utf8 (gr));
+	P work = mono_class_get_method_from_name (k, "Work", 1);
+	int wn = getenv ("EMBED_WORK") ? atoi (getenv ("EMBED_WORK")) : 200;
+	void *wargs [1] = { &wn };
+	P wr = mono_runtime_invoke (work, NULL, wargs, &exc);
+	check ("Work", exc);
+	printf ("Work(%d) = %lld\n", wn, *(long long *)mono_object_unbox (wr));
 	P back = mono_class_get_method_from_name (k, "Back", 0);
 	P br = mono_runtime_invoke (back, NULL, NULL, &exc);
 	check ("Back", exc);
