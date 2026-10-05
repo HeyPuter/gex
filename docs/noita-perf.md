@@ -1069,10 +1069,34 @@ umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
   reached the layer, under --no-cgen all did). NT suite 81/81 with and
   without --cgen (logs/nt-cs-*.txt). c6d82c65 adds `GEX_NT_GL_FAST=nocs`
   (only the client-state calls back in the layer) for the page A/B.
-- cs1 (client-state A/B, edger): shims rebuilt from c6d82c65, bm-hui got
-  the new nt_unixcall provider (`cgen-image --providers`); arms c=bm-hui,
-  n=bm-hui@GEX_NT_GL_FAST=nocs; `scratch/fjit/e/seq-cs1.out`.
-- Next: cs1 result; then the inlining cold-path growth (fallbacks and
-  ret-mismatch exits write back the xmm registers: 0x70bdc0's wasm 41%
-  bigger), mono_ns (0.58 ms a frame: QPC provider clock, syscall tick),
-  tier-1 dispatch misses (0.4 ms).
+- **cs1 (client-state fast path A/B, edger)**: shims from c6d82c65, bm-hui
+  with the new nt_unixcall provider; seed pinned, 4 cores/8 threads;
+  `scratch/fjit/e/seq-cs1.out`. pewasm 46.2/48.0/49.7 (47.97); fast path on
+  (c) 62.6/61.6 (62.1); client state in the layer (n, `GEX_NT_GL_FAST=nocs`)
+  60.9/62.2 (61.55) world fps. On is 0.9% faster than nocs (62.1 vs 61.55),
+  inside the noise (n2 beat c2). Kept: it is correct and costs nothing.
+- master's merge/fjit-ung and merge/fjit-inl went into integ/2026-10-05g;
+  merge/fjit-inl is merged into merge/fjit (3c4a17ea: inlining on).
+- **Inlining's cold growth** (5563fda1): the 34 per-`ret` mismatch exits
+  were 70% of what inlining added to 0x70bdc0 (measured by replacing them
+  with a trap: 13,682 -> 10,725 wasm instructions). They now share one exit
+  per pop per function (reads the address back from the stack): 11,583
+  instructions, object 28,310 bytes (33,553 before, 23,830 without
+  inlining). The fallback calls are as the original calls were. Test:
+  tests/nt retskip (leaves that return past their call, `ret`/`ret 4`).
+  `GEX_CGEN_EXP=NOSHAREDRETEXITS` restores the old exits.
+- **mono_ns** (cs1 profile, all threads ~0.8 ms of clock calls per world
+  frame): two sources, `tick` on every safepoint and NT syscall (it read
+  the clock to rate-limit the USD update) and the guest's QPC (provider
+  `p_qpc`: f_ddc410 on two workers, f_9be020/f_9b9680 on two others).
+  545c12b6: a thread reads the clock on one tick in 8
+  (`GEX_NT_TICK_EVERY`, 1 = before). QPC left as it is (it has to be
+  precise; the arrow-function import is most of a call).
+- **Dispatch misses**: gex_dispatch_miss had 582 ms of *self* time in 30 s
+  on the main thread (0.31 ms per world frame), called from tier-1's run
+  loop. Its executable check scanned every VMA; 545c12b6 uses a binary
+  search (`MemoryMap::vma_at`) and adds miss counters to the NT stats line
+  (`gex-nt: misses all/behind/returned/dense/fjit/knows/translate`).
+- Next: s1 on edger (bm-s = this tree's units, built from bm-hui's
+  objects; arms s=bm-s, t=bm-s@GEX_NT_TICK_EVERY=1), the miss counts and
+  the profile's dispatch_miss/mono_ns after it.
