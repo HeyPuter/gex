@@ -879,6 +879,24 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   generation. Ours before the fix: init ~20 s (the serial thread starts),
   world generation ~16 s.
 
+- **Unit preload (a2… see log, eject page `?preload=`):** the page
+  compiles every unit with `compileStreaming` while the bundle downloads
+  and hands the Modules to every Worker (`preModules`); no Worker fetches
+  or compiles a unit (0 `[unit]` lines). World-up A/B x3: site21 37.5-38.5
+  s -> site22 35.6-38.8 s (mean 38.2 -> 36.7). pewasm 30.2 s.
+- **Where the remaining ~6.5 s is (site21, per-second timeline, process
+  time):** boot 0-5 s on the main thread (now mostly gone with the
+  preload: 40% loadFile, 10% compile; 17% gex_key sha256 remains);
+  shader translation in the compositor worker (Tint SPIR-V->WGSL) at
+  9-12 s and 40-43 s, during which Noita's main thread waits on GL
+  (~3 s each), so the menus run at ~40 fps where pewasm's run at ~170
+  (its clicks at frames 60/120/180 land within 0.7 s, ours within ~3 s);
+  world generation 19-40 s on one thread, guest code plus spin-yields
+  (~19k NtYieldExecution per 10 s; 0x1d80 guest 7.6-9.9 s of 10), against
+  ~18 s in pewasm. Levers: a persistent SPIR-V->WGSL cache (IndexedDB,
+  helps every load after the first), the shader translation off the
+  critical path, and world generation (F, codegen).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
