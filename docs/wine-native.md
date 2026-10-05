@@ -1286,7 +1286,8 @@ Steps:
     restage while a gate runs). `$W/check.sh` runs them all.
   - §5.1 item 1 (busybox as /bin/sh) natively on merge/wine-unix; real
     fork (§3.11.1) and wasm32 programs in the browser on merge/wine-fork
-    (sysroot `$W/sr-fork`, busybox `$W/bb-fork`, prefix
+    (musl `wt/musl-fork`, branch `gex-wasm32-fork` until gex-wasm32 takes
+    it; sysroot `$W/sr-fork`, busybox `$W/bb-fork`, prefix
     `$W/pfx-gui-fork` built with that toolchain; `$W/check-fork.sh`).
     Next: item 2 (ELF export providers: own branch, tell the coordinator
     before gex-cgen re-keys).
