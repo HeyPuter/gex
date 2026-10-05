@@ -908,11 +908,48 @@ mod imp {
         active() as i32
     }
 
+    /// gexrt's mark on a system call made by native Wine code (the native
+    /// host's `nt::NATIVE_SYSCALL`).
+    pub(crate) const NATIVE_SYSCALL: u64 = 1 << 61;
+
+    thread_local! {
+        /// The last trap was `gex_nr::NATIVE_LEFT`'s.
+        static NATIVE_LEFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether the last trap was a `gex_nr::NATIVE_LEFT` (and forget it).
+    #[no_mangle]
+    pub extern "C" fn gex_nt_native_left() -> i32 {
+        NATIVE_LEFT.with(|c| c.replace(false)) as i32
+    }
+
     /// The `syscall` import for an NT process. Returns when the guest carries
     /// straight on; anything else traps back to JS (the outer run loop, or a
     /// nested callback loop) with the resume address set.
     pub(crate) fn syscall(p: &Arc<nt::Process>, ctx: i32, pc: i64) {
         let ctx_addr = ctx as u32 as u64;
+        // From native Wine (gexrt's `__gexw_syscall`, docs/wine-native.md
+        // §3.15), as natively (`NATIVE_SYSCALL`): a call that sends the
+        // thread elsewhere writes that state and returns, as the native
+        // frames cannot be left and resumed. Its other traps (a unit to
+        // fetch, a thread to start) are served by the module's JS `syscall`
+        // import (gex.mjs `#nativeSyscall`), which returns to it.
+        let native = (pc as u64) & NATIVE_SYSCALL != 0;
+        let pc = ((pc as u64) & !NATIVE_SYSCALL) as i64;
+        if native && GuestMem::new(guest_bytes()).read_u64(ctx_addr + ctx::x(0) as u64).unwrap_or(0) as u32 == nt::gex_nr::NATIVE_LEFT {
+            // The guest re-enters native code from above the innermost
+            // native entry (gexrt): JS's call-out decides whether its caller
+            // is gone (`#nativeSyscall` passes this on, `gex_nt_native_left`).
+            // EAX: the function to call again from `jmp eax` (gexrt left it
+            // in ctx::BALLAST), whether or not the call-out leaves.
+            let mut gm = GuestMem::new(guest_bytes());
+            let target = gm.read_u64(ctx_addr + ctx::BALLAST as u64).unwrap_or(0);
+            let _ = gm.write_u64(ctx_addr + ctx::x(0) as u64, target);
+            NATIVE_LEFT.with(|c| c.set(true));
+            set_resume(pc as u64);
+            set_resume_ctx(ctx_addr);
+            trap();
+        }
         // A clock read (`performance.now()`) costs about a microsecond in a
         // Worker, as much as a cheap syscall: the clocks are brought up to
         // date every 16th call and around waits, and the time split is
@@ -1035,6 +1072,9 @@ mod imp {
                     set_resume_ctx(ctx_addr);
                     trap();
                 }
+            }
+            nt::Outcome::Resume(target) if native => {
+                let _ = GuestMem::new(guest_bytes()).write_u64(ctx_addr + ctx::PC as u64, target);
             }
             nt::Outcome::Resume(target) => {
                 // NtContinue out of a nested dispatch: back where it was raised.

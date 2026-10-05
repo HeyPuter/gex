@@ -459,8 +459,17 @@ fn dump_threads(p: &nt::Process, gm: &mut GuestMem<'_>) {
     }
 }
 
+/// A system call made by native Wine on wasm32 (gexrt's `__gexw_syscall`,
+/// docs/wine-native.md §3.15) carries this bit in its `pc`: a call that sends
+/// the thread elsewhere (an APC, an NtContinue) writes that state into the
+/// context and returns normally, as the program's native frames cannot be
+/// left and resumed; the caller runs it or unwinds itself.
+pub(crate) const NATIVE_SYSCALL: u64 = 1 << 61;
+
 /// The `syscall` import for an NT process.
 pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()> {
+    let native = pc & NATIVE_SYSCALL != 0;
+    let pc = pc & !NATIVE_SYSCALL;
     catch_up_in_caller(caller)?;
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let state = caller.data_mut();
@@ -472,6 +481,28 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let kernel = Arc::clone(&state.kernel);
     let ctx_addr = state.thread.ctx_addr;
     let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
+    if native && nr == nt::gex_nr::NATIVE_LEFT {
+        // gexrt saw the guest enter native code at or above the innermost
+        // native entry: it left that entry's frames earlier and runs nested
+        // inside them. The innermost call-out, if a native caller's, leaves
+        // (0); that caller drops its frames (gexrt's `run_until`), and the
+        // guest makes the call again from `jmp eax` (EAX: the function,
+        // which gexrt left in ctx::BALLAST), one level flatter. A stale mark
+        // (no native call-out innermost) just goes on.
+        let target = read_u64(memory.bytes(), (ctx_addr + ctx::BALLAST as u64) as usize);
+        let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize) & 0xffff_ffff;
+        let left = crate::innermost_native_unwound(caller, sp);
+        if std::env::var_os("GEX_WASM_TRACE").is_some() {
+            let w: Vec<String> = caller.data().callouts.iter().map(|c| format!("{:#x}@{:#x}", c.ret, c.sp_want)).collect();
+            eprintln!("gex: native left at {} (sp {sp:#x}): call-outs [{}], leaving {left}", p.describe_addr(target), w.join(" "));
+        }
+        if left {
+            let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::x(0) as u64, target);
+            caller.data_mut().callout_signal = Some(crate::CalloutSignal::Abort);
+            return Err(StopExecution.into());
+        }
+        return Ok(());
+    }
     if crate::ftab::stats_on() {
         let i = if nr == nt::gex_nr::UNIX_CALL { UNIX_CALL_SLOT } else { nr as usize };
         if let Some(n) = SYSCALLS.get(i) {
@@ -525,6 +556,10 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
     let resume_pc = || read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     match outcome {
         nt::Outcome::Continue => Ok(()),
+        nt::Outcome::Resume(target) if native => {
+            let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::PC as u64, target);
+            Ok(())
+        }
         nt::Outcome::Resume(target) => {
             // NtContinue out of a nested dispatch (EXCEPTION_CONTINUE_EXECUTION,
             // a handler resuming its frame): back to where it was raised.

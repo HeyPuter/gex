@@ -38,6 +38,7 @@ if any(a in ('-c', '-S', '-E', '-M', '-MM', '--version', '-v') or a.startswith((
 out = 'a.out'
 srcs, ld_in, ld_flags, cflags = [], [], [], []
 shared = False
+relocatable = False
 i = 0
 while i < len(args):
     a = args[i]
@@ -45,6 +46,8 @@ while i < len(args):
         out = args[i + 1]; i += 2; continue
     if a == '-shared':
         shared = True
+    elif a == '-r':
+        relocatable = True
     elif a.startswith('-Wl,'):
         ld_flags += [x for x in a[4:].split(',') if x]
     elif a.startswith('-l') or a.startswith('-L'):
@@ -76,8 +79,14 @@ for k, s in enumerate(srcs):
 lib = sysroot + '/lib'
 common = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory',
           '--max-memory=4294967296', '-L' + lib]
+if relocatable:
+    # one relocatable object of the inputs (an archive's members only as
+    # referenced): a DLL for pelink.py
+    cmd = ['wasm-ld', '-r', '-L' + lib, '-o', out] + objs + ld_in + [f for f in ld_flags if not f.startswith('--export')]
+    sys.exit(subprocess.call(cmd))
 if shared:
-    cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags
+    cmd = common + ['-shared', '--no-entry', '--export-dynamic', '-o', out] + objs + ld_in + ld_flags + \
+        [lib + '/libclang_rt.builtins-wasm32.a']
     sys.exit(subprocess.call(cmd))
 wasm = out + '.wasm'
 cmd = common + ['-pie', '--no-entry', '-o', wasm, lib + '/crt1.o'] + objs + ld_in + ld_flags + \

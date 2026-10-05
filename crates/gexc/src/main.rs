@@ -2276,6 +2276,12 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
     for (path, base) in &todo {
         let bytes = std::fs::read(path)?;
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        // A native wasm32 Wine DLL (tools/wine-wasm/stage-native.sh): laid
+        // out like the rest, but it has no x86 code to build a unit of.
+        if gex_native::nt_cgen::is_wasm_skeleton(&pe) {
+            eprintln!("cgen-prefix: {path}: native wasm32 skeleton; no unit");
+            continue;
+        }
         let t0 = std::time::Instant::now();
         let out = gex_native::nt_cgen::prepare_pe(&pe, *base, jobs, false)
             .with_context(|| format!("building the function tier for {path} at {base:#x}"))?;

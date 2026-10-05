@@ -60,6 +60,10 @@ const CTX_PC = 32 * 8;
 const CTX_SP = 4 * 8;
 /** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
 const CALLOUT_UNWOUND = 64n << 10n;
+/** gex-kernel `tramp::NATIVE_RETURN_PAD` and the native host's
+ *  `NATIVE_UNWOUND` (docs/wine-native.md §3.15). */
+const NATIVE_RETURN_PAD = 0x3ffff1n;
+const NATIVE_UNWOUND = 512n;
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -2492,7 +2496,13 @@ export class Gex {
     const prov = u >= 0x80000000 ? u - 0x80000000 : -1;
     // A function JIT translation (`FJIT | n`, fjit.rs): its bytes are the shim's.
     const jit = prov < 0 && u >= 0x40000000 ? u - 0x40000000 : -1;
-    const mod = prov >= 0
+    // Wine's PE module (native wasm32 Wine, cgen/wasmdll.rs): its bytes are
+    // in the shim's heap, read from the prefix.
+    const wasmdll = prov >= 0 && (e.gex_cgen_pmod_wasm_len?.(prov) >>> 0) > 0;
+    const mod = wasmdll
+      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov),
+        new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice())
+      : prov >= 0
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
       : jit >= 0 ? this.#fjitModule(jit)
       : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
@@ -2524,6 +2534,7 @@ export class Gex {
           provider_alloc_top: e.gex_provider_alloc_top,
         } : {}),
         ...(memBase ? this.#providerImports() : {}),
+        ...(wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     });
     if (memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
@@ -2621,6 +2632,16 @@ export class Gex {
     const e = this.#shim.exports;
     const n = e.gex_cgen_provider_count?.(u) >>> 0;
     for (let i = 0; i < n; i++) {
+      if (e.gex_cgen_provider_wasmdll?.(u, i)) {
+        const number = e.gex_wasmdll_publish(u, i);
+        this.#cgenCatchUp();
+        if (number >= 0) {
+          e.gex_cgen_pmod_installed(number);
+          e.gex_wasmdll_installed();
+        }
+        this.#wasmdllCatchUp();
+        continue;
+      }
       const file = this.#cgenStr((uu, b, c) => e.gex_cgen_provider_file(uu, i, b, c), u);
       const bytes = this.#env.loadFile?.(file) ?? null;
       if (!bytes) {
@@ -2691,7 +2712,10 @@ export class Gex {
     const len = e.gex_ftab_log_len() >>> 0;
     if (!len && !this.#cgen) return;
     const st = this.#cgenStore();
-    if (st.have >= len) return;
+    if (st.have >= len) {
+      this.#wasmdllCatchUp();
+      return;
+    }
     this.#cgenGrow();
     while (st.have < len) {
       const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
@@ -2701,7 +2725,73 @@ export class Gex {
       st.have++;
       e.gex_cgen_have(st.have);
     }
+    this.#wasmdllCatchUp();
   }
+
+  /** The bridges of exports bound into Wine's PE module after its install
+   *  (a later skeleton, the entry thunks: cgen/wasmdll.rs), each once. */
+  #wasmdllHave = 0;
+  #wasmdllCatchUp() {
+    const e = this.#shim.exports;
+    const len = (e.gex_wasmdll_binds_len?.() ?? 0) >>> 0;
+    if (this.#wasmdllHave >= len) return;
+    const blocks = this.#guest.exports.blocks;
+    while (this.#wasmdllHave < len) {
+      const i = this.#wasmdllHave;
+      const tables = this.#growTables(e.gex_wasmdll_bind_slots(i) >>> 0, 'cgen');
+      if (blocks) this.#growBlocks();
+      const n = e.gex_wasmdll_bind_regs(i, 0, 0) >>> 0;
+      const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
+      let regs;
+      try {
+        e.gex_wasmdll_bind_regs(i, buf, n);
+        regs = new Uint32Array(this.#memory.buffer.slice(buf, buf + 4 * n));
+      } finally {
+        e.gex_free?.(buf, 4 * Math.max(1, n));
+      }
+      const st = this.#cgenStore();
+      for (let j = 0; j + 1 < regs.length; j += 2) {
+        (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+      }
+      e.gex_wasmdll_bind_done(i);
+      this.#wasmdllHave++;
+    }
+  }
+
+  /** Wine's PE module's `gex.syscall` (cgen/wasmdll.rs): a system call from
+   *  native code (gexrt marks its pc, bit 61) that traps to JS -- a unit to
+   *  install, a thread to start -- is served here and returns, so the native
+   *  frames below it survive, as natively. Anything else (the process or
+   *  thread ending, a callback's return) goes on up. */
+  #nativeSyscall = (ctx, pc) => {
+    const e = this.#shim.exports;
+    const p = BigInt.asUintN(64, BigInt(pc));
+    if (!(p & (1n << 61n))) return e.gex_syscall(ctx, pc);
+    try {
+      return e.gex_syscall(ctx, pc);
+    } catch (err) {
+      if (err?.gexHandoff || !e.gex_handoff()) throw err;
+      err.gexHandoff = true;
+      if (e.gex_exited?.()) throw err;
+      // gex_nr::NATIVE_LEFT: the call-out it is nested in decides.
+      if (e.gex_nt_native_left?.()) {
+        err.gexNativeLeft = true;
+        throw err;
+      }
+      const stop = p & ~(1n << 61n);
+      const next = BigInt.asUintN(64, BigInt(e.gex_resume_pc()));
+      const rc = e.gex_resume_ctx() >>> 0;
+      if (next !== stop || (rc && rc !== (ctx >>> 0))) throw err;
+      if (e.gex_jit_pending_len() >>> 0) {
+        const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+        if (need) this.#growTables(need, 'call-out');
+      }
+      while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+      this.#catchUpSync();
+      this.#cgenServe();
+      this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+    }
+  };
 
   /** Load and publish the units the shim placed (images mapped since the last
    *  trap), then catch up. A unit's bytes never pass through the shim: only
@@ -3681,6 +3771,10 @@ export class Gex {
     const sp0 = e.__stack_pointer.value;
     const me = this.#callouts.length;
     const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length };
+    // A guest call from native Wine (its return is gex-kernel's
+    // NATIVE_RETURN_PAD): its native caller's frames are just above the
+    // callee's arguments (cgen.rs NATIVE_UNWOUND, as natively).
+    c.unwound = c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
     this.#callouts.push(c);
     this.#nest.push('callout');
     this.#calloutsMade++;
@@ -3724,6 +3818,11 @@ export class Gex {
           }
           const hit = e.gex_callout_hit();
           if (hit >= 0) return hit === me ? 1 : 0;
+          // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
+          // frames): a native caller's call-out leaves, at the context's PC
+          // (the entry the guest makes again); anything else carries on.
+          if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
+              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) return 0;
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -3769,7 +3868,7 @@ export class Gex {
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves.
           const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
-          if (sp > c.spWant + CALLOUT_UNWOUND) {
+          if (sp > c.spWant + c.unwound) {
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
           }

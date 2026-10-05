@@ -11,7 +11,7 @@ OUT=$1 WINE=$2 TOOLS=$3
 WCC=$root/tools/wine-wasm/wcc
 mkdir -p "$OUT"
 "$WCC" -O2 -D_WIN32 -fno-stack-protector -c "$here/abi.c" -o "$OUT/abi.o"
-"$WCC" -O2 -fno-stack-protector -I"$WINE/include" -c "$WINE/libs/winecrt0/wasm32.c" -o "$OUT/winecrt0_wasm32.o"
+"$WCC" -O2 -fno-stack-protector -I"$WINE/include" -c "$WINE/libs/gexrt/wasm32.c" -o "$OUT/winecrt0_wasm32.o"
 "$TOOLS/tools/winebuild/winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$WCC" \
     --dll -E "$here/abi.spec" -F abi.dll -o "$OUT/abi.spec.o" "$OUT/abi.o"
 "$WCC" -shared -o "$OUT/abi.dll.so" "$OUT/abi.spec.o" "$OUT/abi.o" "$OUT/winecrt0_wasm32.o" \
