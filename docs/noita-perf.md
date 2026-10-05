@@ -1654,7 +1654,7 @@ Nothing running on gooner or edger for stream F.
   the context and clang cannot forward the caller's stores past guest
   stores (one linear memory). 0x70b200's devirtualised getter calls are
   now a compare, the patched-page byte and local moves. Cold growth:
-  0x70bdc0 +41% wasm (34 sites: fallback calls and the ret-mismatch
+  0x70bdc0's wasm 41% bigger (33.5 vs 23.8 KB; 34 sites: fallback calls and the ret-mismatch
   exits write back the xmm registers). gexc with it: target/x86-inl.
   Its tree re-keys every unit: A/B needs both arms (bm-hu2 = no exp,
   bm-hui = exp in Noita's images) and shims from d54095e5.
@@ -1675,8 +1675,8 @@ shim, seed pinned, 4C/8T; `seq-n1.out`):**
 | guarded g2 | 40.9 |
 | pewasm p3 | 47.2 |
 
-pewasm 45.9; guarded 42.4 (0.92x); **unguarded 48.25 (1.05x pewasm, +14%
-on guarded)**. So the page's `cgen=` now means the unguarded flavor
+pewasm 45.9; guarded 42.4 (8% slower than pewasm); **unguarded 48.25 world
+fps: 5% faster than pewasm's 45.9 and 14% faster than guarded's 42.4**. So the page's `cgen=` now means the unguarded flavor
 (`unguarded=0` for the guarded one; the ejected page passes its flavor
 explicitly), and scratch/fjit/build-bm.sh builds GUARD=0 by default (N1
 done).
