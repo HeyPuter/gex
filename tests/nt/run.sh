@@ -144,6 +144,8 @@ check pe-x86/msvc 9 "msvc" "$fx/x86/msvc.exe"
 check x86/msvc_cxxeh 0 "$allok" "$here/bin/x86/msvc_cxxeh.exe"
 # msvcrt's register-convention math (_CI*, _ftol, __libm_sse2_*) and _chkesp.
 check x86/msvc_x87 0 "$allok" "$here/bin/x86/msvc_x87.exe"
+# A C++ exception from msvcp140 caught by type, its what() through msvcp140's vtable.
+check x86/msvc_msvcp 0 "$allok" "$here/bin/x86/msvc_msvcp.exe"
 # (x86/uses.exe is left out: it crashes at exit on native Wine 11.15 too.)
 
 echo "$pass passed, $fail failed, $xfail expected failures"

@@ -323,7 +323,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       if (F.isDeclaration() || F.hasFnAttribute("gexw-no-icall") || F.isIntrinsic()) continue;
       StringRef n = F.getName();
       if (n.starts_with("__gexw") || n.starts_with("__gexe.") || n.contains("gexp_")) continue;
-      if (escapes(F)) fs.push_back(&F);
+      // (a thiscall method may be referenced only from a vtable written in
+      // assembly, which the IR does not show: msvcrt's and msvcp's)
+      bool method = cv.count(&F) && cv[&F] == THISCALL && !F.hasLocalLinkage();
+      if (escapes(F) || method) fs.push_back(&F);
     }
     for (Function *F : fs)
       if (Function *T = entryThunk(M, *F, cv.count(F) ? cv[F] : CDECL))
