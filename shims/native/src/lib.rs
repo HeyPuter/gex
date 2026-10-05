@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 pub mod aot;
 pub mod aot_only;
 pub mod libprov;
+pub(crate) mod elfprov;
 pub(crate) mod wasmjit;
 pub mod aot_share;
 pub mod gl;
@@ -3027,6 +3028,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A library a stateful provider replaces (stream U): bound before
             // the loader can call into it.
             libprov::on_linux_maps(&mut caller, &mapped)?;
+            // Libraries some of whose exports a provider serves (glibc's
+            // mem*): bound before the dynamic linker relocates them.
+            elfprov::on_elf_maps(&mut caller, &mapped)?;
             profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {
@@ -4680,6 +4684,12 @@ fn retire_translations(
         }
     }
     ftab::on_retire(&mut sh, memory.bytes(), ranges);
+    // ELF providers' bindings in the ranges (the table keeps a unit tier's
+    // functions over a retirement; these go with their library).
+    for a in elfprov::on_retire(elfprov::key_of(&shared), ranges) {
+        gex_kernel::ftab::fcache_clear(memory.bytes(), a);
+        sh.ftab.map.retire(a);
+    }
     drop(sh);
     refresh_callouts(caller)?;
     if pages > 0 && std::env::var_os("GEX_VERBOSE_OBJECTS").is_some() {
