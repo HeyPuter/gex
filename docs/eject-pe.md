@@ -797,6 +797,26 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   `$S/build-mesa2.sh` with `GEX_MESA_CROSS2=$S/mesa-o3.ini` into
   `$S/mesa-o3-out` (building).
 
+- **World-up A/B (edger, pewasm's click schedule, seconds after
+  navigation):** pewasm 29.2-32.3; ejected before the frame skip 62.7-66.4;
+  with it (site18is) 53.4-56.4; plus multi-threaded loading (site18m, no
+  `-single_threaded_loading`) 51.5-52.6 (and 51.7-57.2 against site18ir).
+  Multi-threaded loading runs AOT-only with no stops; worth keeping for a
+  shipped site (`--args ''`).
+  - Where the rest is (site18m, process time): first present 6 s; init
+    6-25 s, the main thread mostly blocked in the ConcRT condvar provider
+    (`cond_wait_`, 59% of 7-24 s) on the loader threads (4 threads, about 26 s
+    of guest time between them) and 24% in synchronous GL submits; menus
+    25-36 s; loading 36-52 s (one thread 10 of 10 s guest: world generation).
+    The loader and world-generation threads are guest code, so this is F's
+    side (codegen) unless a page profile shows otherwise; their Workers
+    start after the profiler attaches (`--profile` attaches at AT only).
+- **Merged master 5ab54ab2** (4da10a61; no gex-cgen change, keys kept).
+- **Mesa with SIMD + ThinLTO** (`$S/mesa-o3-out`, `$S/mesa-o3.ini`) against a
+  control from the same tree (`$S/mesa-ctl-out`; its replay matches the
+  copied worldmachine build in size): sites site18ctl / site18o3 (project
+  copies in `$S/p17v/`), ABBA queued (`$S/edger-mesa1.txt`).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
