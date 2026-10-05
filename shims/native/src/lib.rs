@@ -831,6 +831,7 @@ fn run_program_with(
         std::sync::atomic::Ordering::Relaxed,
     );
     JIT_ON.store(opts.jit && !opts.aot_only, std::sync::atomic::Ordering::Relaxed);
+    std::sync::LazyLock::force(&DUMP_START);
     DUMP_ABORT.store(
         std::env::var_os("GEX_DUMP_ABORT").is_some(),
         std::sync::atomic::Ordering::Relaxed,
@@ -2432,6 +2433,10 @@ static JIT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// unwinds nothing, so the state must be captured at the syscall or it is gone
 /// (e.g. which function's canary failed, from the stack's return addresses).
 static DUMP_ABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DUMP_AT: std::sync::LazyLock<Option<f64>> =
+    std::sync::LazyLock::new(|| std::env::var("GEX_DUMP_AT").ok().and_then(|v| v.parse().ok()));
+static DUMP_START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+static DUMPED: std::sync::LazyLock<Mutex<std::collections::HashSet<i32>>> = std::sync::LazyLock::new(Default::default);
 
 /// A watch on a range of guest memory: `GEX_WATCH=<hex addr>[+<hex len>]`. A
 /// software watchpoint: every safepoint and syscall compares the bytes and
@@ -2518,7 +2523,7 @@ fn dump_guest(gm: &mut GuestMem<'_>, ctx_addr: u64, tid: i32, vmas: &[gex_kernel
         |gm: &mut GuestMem<'_>, off: usize| gm.read_u64(ctx_addr + off as u64).unwrap_or(0);
     let pc = read(gm, ctx::PC);
     let sp = read(gm, ctx::SP);
-    eprintln!("gex: guest abort in thread {tid}");
+    eprintln!("gex: guest state of thread {tid}");
     eprintln!("  pc  {pc:#018x}  {}", describe(pc));
     eprintln!("  sp  {sp:#018x}  {}", describe(sp));
     for row in 0..8 {
@@ -2913,15 +2918,38 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A guest that is about to kill itself is the last moment its
             // state means anything. `abort` unwinds nothing, so by the time
             // the process is gone there is no way to ask where it was.
+            // `GEX_DUMP_AT=SECONDS`: each thread's state once, at its first syscall after that long -- where a
+            // run that has stopped making progress is (a thread waiting in a loop of sleeps shows up; one
+            // blocked for good does not).
+            if let Some(at) = *DUMP_AT {
+                if DUMP_START.elapsed().as_secs_f64() >= at
+                    && DUMPED.lock().unwrap_or_else(|e| e.into_inner()).insert(state.thread.tid)
+                {
+                    let ctx_addr = state.thread.ctx_addr;
+                    let tid = state.thread.tid;
+                    let vmas = state.with_kernel(|k| k.mem.vmas().to_vec());
+                    eprintln!("gex: GEX_DUMP_AT: thread {tid} at syscall {nr}");
+                    dump_guest(&mut gm, ctx_addr, tid, &vmas);
+                }
+            }
             if DUMP_ABORT.load(std::sync::atomic::Ordering::Relaxed) {
-                let signo = match nr {
-                    gex_kernel::syscalls::nr::KILL | gex_kernel::syscalls::nr::TKILL => {
-                        gm.read_u64(state.thread.ctx_addr + ctx::x(1) as u64)
+                // x86-64 numbers and argument registers (rsi = x(6), rdx = x(2)) when the guest is x86-64.
+                let signo = if gex_abi::X86 {
+                    match gm.read_u64(state.thread.ctx_addr + ctx::x(0) as u64).unwrap_or(!0) {
+                        62 | 200 => gm.read_u64(state.thread.ctx_addr + ctx::x(6) as u64),
+                        234 => gm.read_u64(state.thread.ctx_addr + ctx::x(2) as u64),
+                        _ => Err(gex_kernel::Errno::EINVAL),
                     }
-                    gex_kernel::syscalls::nr::TGKILL => {
-                        gm.read_u64(state.thread.ctx_addr + ctx::x(2) as u64)
+                } else {
+                    match nr {
+                        gex_kernel::syscalls::nr::KILL | gex_kernel::syscalls::nr::TKILL => {
+                            gm.read_u64(state.thread.ctx_addr + ctx::x(1) as u64)
+                        }
+                        gex_kernel::syscalls::nr::TGKILL => {
+                            gm.read_u64(state.thread.ctx_addr + ctx::x(2) as u64)
+                        }
+                        _ => Err(gex_kernel::Errno::EINVAL),
                     }
-                    _ => Err(gex_kernel::Errno::EINVAL),
                 };
                 if signo == Ok(6) {
                     let ctx_addr = state.thread.ctx_addr;
