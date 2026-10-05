@@ -752,6 +752,24 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   12/90/144/224), then the menu/loading stalls; (4) audio waits for the
   coordinator's call.
 
+- **Merged master 65d5fdf8** (fbd45ce3); p-noita17 relinked (`build19.log`),
+  site18 packed from it (eject-site now packs only this build's units:
+  97fe6712). **ABBA on edger, site18:** ejected 41.9, 46.6 vs pewasm 46.1,
+  48.8 = 0.93x (one low leg).
+- **The main-thread wait (profile p3, site18):** "GL previous frame" is
+  still ~2.3 s per 10 s of Noita's main thread: a submit waiting for the
+  previous async GL batch to finish in the compositor worker. That worker
+  is 73% "(program)" (native time inside the WebGPU/Dawn calls, not JS or
+  Mesa), 25% JS/wasm, no readbacks (all maps write-only, 0 forced
+  submits). Next: a Chrome trace (gpu, devtools.timeline) of that thread to
+  see what the native time is (getCurrentTexture back-pressure on the P620,
+  i.e. GPU-bound, or wire flushes), then pewasm's Mesa flags (E2/E4).
+- **World-up, like for like:** `site18i` = site18 with pewasm's input
+  schedule (clicks at presented frames 60/120/180, gex's coordinates;
+  `eject-site.mjs --input`), and `$S/wup-legs.sh N SITE` measures world-up
+  after navigation on both (pewasm polled every 100 ms in the page; gex from
+  the first `peek>0` stats line, `[world-up]` in page-run's output).
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).

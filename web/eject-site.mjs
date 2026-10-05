@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // An ejected Windows program's web build as a static site, in one command:
 //
-//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--level N]
+//   node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--level N]
 //
 // PROJECT is a built project (`gexc eject ... --web-shim ... --web-page ...`,
 // then ./build.sh). OUT gets:
@@ -33,9 +33,9 @@ const av = process.argv.slice(2);
 const flag = (n) => av.includes(n);
 const opt = (n, d) => { const i = av.indexOf(n); return i >= 0 ? av[i + 1] : d; };
 const opts = (n) => av.flatMap((a, i) => (a === n ? [av[i + 1]] : []));
-const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level'].includes(av[i - 1]));
+const [project, out] = av.filter((a, i) => !a.startsWith('--') && !['--title', '--drop', '--overlay', '--level', '--input'].includes(av[i - 1]));
 if (!project || !out) {
-  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--level N]');
+  console.error('usage: node web/eject-site.mjs PROJECT OUT [--title T] [--bench] [--drop GUEST_PATH]... [--overlay DIR]... [--input SCRIPT] [--level N]');
   process.exit(2);
 }
 const level = opt('--level', '19');
@@ -124,7 +124,11 @@ place(tar, 'project/build/web/rootfs.tar');
 
 // How to start: the recorded settings, less the benchmark's.
 const bench = /^(GEX_NT_INPUT|GEX_NT_TIME_SCALE|GEX_NT_FIXED_TIME)=/;
-const ntOut = { ...nt, settings: flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.test(s)) };
+let settings = flag('--bench') ? nt.settings : nt.settings.filter((s) => !bench.test(s));
+// --input SCRIPT: GEX_NT_INPUT instead of the recorded one (a benchmark's
+// clicks, by presented frame, as pewasm's NOITA_INPUT).
+if (opt('--input', null)) settings = [...settings.filter((s) => !s.startsWith('GEX_NT_INPUT=')), `GEX_NT_INPUT=${opt('--input', null)}`];
+const ntOut = { ...nt, settings };
 mkdirSync(join(out, 'project/build/web'), { recursive: true });
 writeFileSync(join(out, 'project/build/web/nt.json'), JSON.stringify(ntOut, null, 2));
 
