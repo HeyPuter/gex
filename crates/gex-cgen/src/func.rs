@@ -998,12 +998,12 @@ impl FnUnit {
                     // itself.
                     (Callee::Indirect(_), Some(_)) if self.carry.contains_key(&i) => {
                         leave_wb = self.carry[&i];
-                        let all = if flags_abi() { non_flags() } else { RegSet::ALL };
+                        let all = if flags_abi() { call_reads() } else { RegSet::ALL };
                         all.minus(leave_wb)
                     }
                     // No callee reads the flags it is entered with
                     // (`flags_abi`).
-                    _ if flags_abi() => non_flags(),
+                    _ if flags_abi() => call_reads(),
                     _ => RegSet::ALL,
                 };
                 // Dirty registers the callee never writes stay dirty across
@@ -1752,12 +1752,12 @@ pub fn live_in(f: &Function, sums: &HashMap<u64, Summary>) -> Vec<RegSet> {
                     ..
                 } => match sums.get(t) {
                     Some(sm) => sm.inputs.union(live[r.to.index()]),
-                    None if flags_abi() => non_flags().union(live[r.to.index()]),
+                    None if flags_abi() => call_reads().union(live[r.to.index()]),
                     None => RegSet::ALL,
                 },
                 // `flags_abi`: no callee reads the flags it is entered with.
                 FTerm::Call { ret, .. } if flags_abi() => {
-                    non_flags().union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
+                    call_reads().union(ret.as_ref().map_or(RegSet::EMPTY, |r| live[r.to.index()]))
                 }
                 FTerm::TailCall { .. } if flags_abi() => non_flags(),
                 _ => RegSet::ALL,
@@ -1972,6 +1972,20 @@ pub fn trapfree_carry() -> bool {
 pub fn devirt_carry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("GEX_CGEN_WB_DEVIRT").as_deref() == Ok("1"))
+}
+
+/// What a call to a callee without a summary (indirect, outside the unit,
+/// or unsummarised) reads of the caller's registers under `flags_abi`:
+/// everything but the flags, and ZF with `GEX_CGEN_EXP=ZFCALLS`. MSVC's
+/// stack checks read the ZF their caller set: `cmp esi, esp; call
+/// [__imp___chkesp]` (debug CRT builds), whose `jne` reports a bad stack
+/// when ZF is stale.
+pub fn call_reads() -> RegSet {
+    if exp("ZFCALLS") {
+        non_flags().union(RegSet::of(&[GuestReg::Z]))
+    } else {
+        non_flags()
+    }
 }
 
 pub fn non_flags() -> RegSet {
