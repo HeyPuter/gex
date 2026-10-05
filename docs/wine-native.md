@@ -1073,6 +1073,35 @@ Steps:
    natively instead of translated. Map `/bin/sh` and the coreutils names to
    it in the guest root (natively by a gexc option, in the page's bundle).
    Biggest win per effort: every script exec today translates dash/coreutils.
+   **State (2026-10-05, merge/wine-unix):** busybox 1.37.0 builds with
+   `tools/wine-wasm/build-busybox.sh OUT` (config `busybox.config`: NOMMU,
+   LFS, hush as sh, ~50 applets incl. sed/grep/awk/find/xargs, fancy tail;
+   ~400 KB of wasm). `gexc run --busybox B ...` mounts B read-only at
+   `/bin/<applet>` and `/usr/bin/<applet>` for every applet
+   (`BUSYBOX_APPLETS`; `GEX_BUSYBOX_APPLETS` overrides) and runs B for a
+   program named `/bin/sh` etc.; `RunOptions.exe` makes `/proc/self/exe`
+   busybox, which hush re-executes for `$(...)` and subshells.
+   tests/wasm32/busybox.sh (needs `BUSYBOX`) compares pipelines, command
+   substitution, redirections, externals and exit statuses with the host
+   sh, and runs busybox under a translated x86-64 shell.
+   - **vfork** (musl fork, `src/process/wasm32/__gexw_vfork.c`): gex cannot
+     fork a wasm32 program, so `vfork()` is a setjmp macro (unistd.h); the
+     "child" runs on the parent's stack with fds, cwd, umask, signal mask
+     and actions snapshotted; its `execve` is a posix_spawn of that state
+     (clone(VM|VFORK) is a new process) and its `_exit` spawns
+     `/proc/self/exe` with `__GEXW_VFORK_EXIT=N` to exit with the status;
+     then the parent's state is restored and vfork returns the pid. A child
+     that does more than dup/close/chdir/signals before exec (hush's NOMMU
+     paths re-exec, so busybox does not) would leak its changes into the
+     parent's memory, as a real vfork would.
+   - musl's `__libc_start_main` now calls `__wasm_call_ctors` (constructors
+     never ran on wasm32 before).
+   - Fixed on the way: a wasm32 child switched the host-wide translator
+     compat (i386) mode, breaking an x86-64 parent after its wait
+     (`wasmprog::is_wasm32`). A translated *i386* child of an x86-64 parent
+     still has that limitation (documented in `run_program_with`).
+   - Not yet: the page bundle's `/bin/sh` mapping (browser `--busybox`),
+     and the prefix scripts' use of it.
 2. **ELF export providers** for glibc's hot entry points (`memcpy`/`memset`/
    `str*`, `malloc` family, libm), the PE providers' model on ELF images;
    needs gex-cgen's provider binding by ELF symbol (gex-cgen re-keys units:
@@ -1182,7 +1211,9 @@ Steps:
   - W's check prefixes: `$W/pfx-native` (3 DLLs), `$W/pfx-dev` (9),
     `$W/pfx-gui` (11); `$W/pfx-w32u` is the coordinator's gate copy (do not
     restage while a gate runs). `$W/check.sh` runs them all.
-  - Next: §5.1 (the guest's Unix userland as native wasm).
+  - §5.1 item 1 (busybox as /bin/sh, natively) on merge/wine-unix; next:
+    the browser mapping, then item 2 (ELF export providers: own branch,
+    tell the coordinator before gex-cgen re-keys).
   - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
     merge/wine-wasm after its gate.
 - **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
