@@ -2887,6 +2887,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?;
             // Profiling: count the call against its function (S6).
             profile::syscall_enter(&mut caller, &GuestMem::new(memory.bytes()), pc as u64);
+            let dump_bt = DUMP_AT.filter(|&at| DUMP_START.elapsed().as_secs_f64() >= at).and_then(|_| {
+                let tid = caller.data().thread.tid;
+                (!DUMPED.lock().unwrap_or_else(|e| e.into_inner()).contains(&tid))
+                    .then(|| format!("{:?}", wasmtime::WasmBacktrace::force_capture(&caller)))
+            });
             let data = memory.bytes();
             let state = caller.data_mut();
             // A thread that loops on a blocking syscall -- a condition
@@ -2930,6 +2935,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     let vmas = state.with_kernel(|k| k.mem.vmas().to_vec());
                     eprintln!("gex: GEX_DUMP_AT: thread {tid} at syscall {nr}");
                     dump_guest(&mut gm, ctx_addr, tid, &vmas);
+                    if let Some(bt) = &dump_bt {
+                        eprintln!("  wasm: {bt}");
+                    }
                 }
             }
             if DUMP_ABORT.load(std::sync::atomic::Ordering::Relaxed) {

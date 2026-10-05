@@ -712,8 +712,32 @@ Not yet:
     provider (Unity 6 tests a handle's bit 0 and its managed code calls
     `GCHandle.FromIntPtr` on raw values); dead-handle reads tolerated; the
     framework's x86-64 crypto and compression natives beside the BCL (HK's
-    localisation decrypts with AES). Next: HK with graphics on worldmachine,
-    keyboard script to gameplay, interpreter vs JIT.
+    localisation decrypts with AES). Also: guest signal handlers run at a
+    provider's syscalls (`__gex_signal_frames` in gexprov64.c).
+  - **Hollow Knight, parked 2026-10-05 (shutdown):** with graphics on
+    worldmachine (`scratch/unity/wm/muck.sh` with `GAMEDIR=<HK>
+    EXE=hollow_knight.x86_64 UNITY_RELAUNCH=1 STEAM_APPID=367520`; HK is
+    copied to `~/src/noita-wasm/games-linux/Hollow Knight` there) two
+    problems, after GL 4.6 comes up and physics initialises:
+    1. **With --fjit only:** `free(): invalid pointer` (deterministic), from
+       Unity's allocator's fallback `free` (UnityPlayer vaddr ~0xf8c0af, called
+       via 0xf8a0c0/0xf9559d). Not a `free` the program calls through the PLT
+       (an LD_PRELOAD watcher saw none), so glibc-internal or a corrupted
+       Unity block. Without --fjit it does not happen: a function-JIT
+       translation bug is the first suspect. Next: bisect with the fjit off
+       for UnityPlayer ranges, or `GEX_DUMP_ABORT=1` (now works for x86-64)
+       and map the frames.
+    2. **Without --fjit (and in batch mode with it):** a hang after
+       "Unloading 5 Unused Serialized files". `GEX_DUMP_AT=640` shows the
+       main thread inside the provider's `mono_gc_collect` (Unity's
+       UnloadUnusedAssets), sleeping in a loop (strace: only
+       clock_nanosleep); threads 47/48 in libc. Next: the same dump with the
+       wasm stacks (`GEX_DUMP_AT` now prints `WasmBacktrace` for each thread;
+       run with `GEX_WASM_BACKTRACE=1`) to see what the collection waits for
+       -- likely sgen's suspend of a thread attached to Mono (Unity has ~70)
+       that never acknowledges, or the provider stop-the-world.
+    Then the keyboard script to gameplay (`GEX_WL_INPUT`, works on X
+    clients) and interpreter vs JIT on worldmachine.
 - **Resume (after the move; HEAD 1db5c816, `master` merged in):**
   0. The coordgate on this branch still lacks its browser NT step (it was
      stopped while E was timing), and nothing after 49a5773b has been
