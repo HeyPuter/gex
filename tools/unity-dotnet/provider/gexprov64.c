@@ -274,3 +274,32 @@ int gexp_reverse_return(int ctx, uint64_t ret, const gexp_call *c)
 	*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16) = c->xmm1;
 	return gexp_return(ctx, ret);
 }
+
+/* ---- signals at a provider's syscalls ----
+ * A signal handled at a syscall's return (musl wasm64's syscall stub): gex-kernel has left an x86-64
+ * rt_sigframe on the guest stack, RSP at it (its first word the restorer's return address), the handler's
+ * arguments in rdi/rsi/rdx and PC at the handler, which is guest code. Run it by the guest ABI, then do
+ * what the restorer does (pop the return address, rt_sigreturn), which puts back the interrupted context,
+ * the syscall's result and PC included; the loop ends when PC is back where the stub was. Overrides musl's
+ * default, which stops. */
+#define X86_64_RT_SIGRETURN 15
+__attribute__((import_module("gex"), import_name("syscall"))) void gexp_host_syscall_ctx(int ctx, long long pc);
+
+void __gex_signal_frames(volatile unsigned long long *x, unsigned long long pc)
+{
+	/* A thread of the provider's own (not entered from guest code) has no gexp_ctx yet; this is its context. */
+	if (!gexp_ctx)
+		gexp_ctx = (int)(uintptr_t)x;
+	while (x[32] != pc) {
+		uint64_t handler = x[32], frame = x[4];
+		gexp_call c = { 0 };
+		c.ireg[0] = x[7]; /* signal */
+		c.ireg[1] = x[6]; /* &info */
+		c.ireg[2] = x[2]; /* &uc */
+		c.nireg = 3;
+		gexp_call_guest(handler, &c);
+		x[4] = frame + 8;
+		x[0] = X86_64_RT_SIGRETURN;
+		gexp_host_syscall_ctx((int)(uintptr_t)x, 0);
+	}
+}
