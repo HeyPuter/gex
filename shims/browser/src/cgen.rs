@@ -35,6 +35,8 @@ use gex_kernel::GuestMem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod wasmdll;
+
 /// 0 off, 1 use a unit where one exists, 2 also refuse a program image
 /// without one (`--cgen`, as natively).
 static MODE: AtomicU32 = AtomicU32::new(0);
@@ -90,6 +92,9 @@ struct Provided {
     /// PROVIDES line: crt_heap): bound like any built-in one, its data
     /// allocated as an ejected project's is, top down.
     data: bool,
+    /// A native wasm32 Wine DLL's skeleton (`wasmdll`): Wine's PE module is
+    /// its provider, installed at the first skeleton and bound at each.
+    skeleton: Option<Arc<gex_ld::pe::PeImage>>,
 }
 
 /// Stateful providers by library (lower case) and module file under the
@@ -236,7 +241,10 @@ pub(crate) fn drain() -> bool {
 fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Option<&gex_ld::pe::PeImage>) {
     let memory = crate::guest_bytes();
     let mut pages = Vec::new();
-    for seg in image.segments.iter().filter(|s| s.executable) {
+    // A native wasm32 Wine DLL's skeleton has no x86 code (no unit is ever
+    // built for it: its `ud2` stubs are bound to Wine's PE module).
+    let skeleton = pe.is_some_and(wasmdll::is_skeleton);
+    for seg in image.segments.iter().filter(|s| s.executable && !skeleton) {
         let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
         let live = memory.get(lo..lo + n);
         if let Some(i) = live.and_then(|live| (0..n).find(|&i| live[i] != seg.bytes[i])) {
@@ -265,8 +273,20 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
                 }
             }
             let entry = if pe.entry_rva != 0 { base + pe.entry_rva as u64 } else { 0 };
-            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false });
+            providers.push(Provided { file: file.clone(), binds: Vec::new(), stateful: Some((exports, entry)), data: false, skeleton: None });
         }
+    }
+    // A native wasm32 Wine DLL: its exports are Wine's PE module's, not the
+    // built-in providers' (as natively, `nt_cgen::install_providers`); the
+    // key keeps them, as natively.
+    if let Some(pe) = pe.filter(|pe| wasmdll::is_skeleton(pe)) {
+        providers = vec![Provided {
+            file: format!("wasmdll:{path}"),
+            binds: Vec::new(),
+            stateful: None,
+            data: false,
+            skeleton: Some(Arc::new(pe.clone())),
+        }];
     }
     let identity = gex_key::image_identity(image).trim_start_matches("image:").to_string();
     let mut units = lock(&UNITS);
@@ -325,6 +345,7 @@ fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) 
             binds: p.binds.iter().filter_map(|(f, e)| exports.get(e).map(|&rva| (f.clone(), base + rva as u64))).collect(),
             stateful: None,
             data: p.stateful,
+            skeleton: None,
         })
         .filter(|p| !p.binds.is_empty())
         .collect();

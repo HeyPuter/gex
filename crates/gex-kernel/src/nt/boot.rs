@@ -46,6 +46,20 @@ pub mod tramp {
     /// (two return addresses above the arguments):
     /// `mov eax, UNIX_CALL; call 1f; ret 16; 1: int 0x80; ret`.
     pub const UNIX_CALL_32: u64 = TRAMPOLINES + 0x60;
+    /// `jmp eax`: where native Wine (gexrt) sends the guest to call a
+    /// function again from the guest's side (an entry re-made after the
+    /// native frames it was nested in were dropped, gex_nr::NATIVE_LEFT),
+    /// the function's address in EAX. Not the function's own address as the
+    /// PC: a body that leaves for its own address has served nothing, and
+    /// tier-1 would take its slot over.
+    pub const JMP_EAX_32: u64 = TRAMPOLINES + 0x80;
+    /// The return address of a guest call from native Wine (gexrt's
+    /// `GEXW_RETURN_PAD`, docs/wine-native.md §3.15): the page's last word,
+    /// filler no code has. A call-out waiting for it is a native caller's,
+    /// whose frames lie just above the callee's stack: the stack pointer
+    /// rising past its arguments means the guest left them (a catch block
+    /// continuing in an outer frame).
+    pub const NATIVE_RETURN_PAD: u64 = crate::nt::TRAMPOLINES_END - 0xf;
 }
 
 pub fn trampoline_page() -> Vec<u8> {
@@ -64,6 +78,7 @@ pub fn trampoline_page() -> Vec<u8> {
         tramp::UNIX_CALL_32,
         &[0xb8, n[0], n[1], n[2], n[3], 0xe8, 0x03, 0x00, 0x00, 0x00, 0xc2, 0x10, 0x00, 0xcd, 0x80, 0xc3],
     );
+    put(&mut page, tramp::JMP_EAX_32, &[0xff, 0xe0]);
     page
 }
 

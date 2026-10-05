@@ -773,6 +773,11 @@ one interface, fixed here so neither waits on the other.
     out.
   - Hardware faults need `RESUMABLE_PC` in the fault import's pc: the unit
     goes on at `ctx::PC` through its `gex_resume` when the import returns.
+  - Bit 61 of the `syscall` import's pc (`NATIVE_SYSCALL`, distinct from
+    `RESUMABLE_PC`'s bit 62) marks an NT system call made by native Wine
+    code (docs/wine-native.md §3.15): a Resume writes `ctx::PC` and the
+    import returns normally, as native frames cannot be resumed. The
+    browser shim needs the same (W5).
   - Control coming back at or above the raise's stack ends the nested
     loop. The guest then resumes there through the return-0 chain, and the
     frame that owns the target continues in its own body:

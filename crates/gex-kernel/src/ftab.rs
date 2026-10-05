@@ -134,6 +134,26 @@ impl FuncMap {
         n
     }
 
+    /// Map more addresses to slots of install `install`: one module serving
+    /// several images (Wine's PE side as one module, docs/wine-native.md
+    /// §3.14, bound DLL by DLL as each maps). Nothing changes in any table
+    /// (the slots are filled already); an address already mapped is taken
+    /// over as by [`FuncMap::publish`].
+    pub fn bind(&mut self, install: u32, funcs: &[(u64, u32)]) {
+        let Install { base, len, .. } = self.installs[install as usize].clone();
+        for &(addr, off) in funcs {
+            if addr == 0 || off >= len {
+                continue;
+            }
+            if let Some(old) = self.by_addr.insert(addr, Func { idx: base + off, install }) {
+                if old.idx != base + off {
+                    self.log.push(Event::Retire(old.idx));
+                    self.retired += 1;
+                }
+            }
+        }
+    }
+
     /// Forget `addr`'s function: its index is pointed back at the resolve
     /// stub in every table (as each catches up) and a lookup translates the
     /// address again. Returns the retired index.

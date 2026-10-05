@@ -4,4 +4,5 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$1"
-clang++ -shared -fPIC -O2 $(llvm-config --cxxflags) "$here/GexIcall.cpp" -o "$1/GexIcall.so"
+LLVM_CONFIG=${LLVM_CONFIG:-$(command -v llvm-config || command -v llvm-config-22)}
+clang++ -shared -fPIC -O2 $($LLVM_CONFIG --cxxflags) "$here/GexIcall.cpp" -o "$1/GexIcall.so"

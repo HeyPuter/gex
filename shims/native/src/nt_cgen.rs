@@ -402,8 +402,18 @@ struct Placed {
     pages: Vec<(u64, u64)>,
 }
 
+/// A native wasm32 Wine DLL's skeleton (docs/wine-native.md §3.13, §3.14):
+/// no x86 code of its own (its exports' bytes are `ud2` stubs bound to the
+/// module), so no unit is wanted or built for it.
+pub fn is_wasm_skeleton(pe: &gex_ld::pe::PeImage) -> bool {
+    pe.sections.iter().any(|s| s.name == ".wasmref" || s.name == ".wasm")
+}
+
 /// A unit for `p`, if one was built, with the byte check.
 fn place(p: &Pending, memory: &[u8]) -> Result<Option<Placed>> {
+    if is_wasm_skeleton(&p.pe) {
+        return Ok(None);
+    }
     let (image, _) = gex_xlate::func::pe_input(&p.pe, p.base)
         .map_err(|e| anyhow!("{}: placing the image at {:#x}: {e}", p.path, p.base))?;
     let pv = provided(&p.pe, p.base);
@@ -688,6 +698,9 @@ fn is_wine(p: &Pending) -> bool {
 /// no (`0`, or a list of file names that leaves it out), gets a unit built
 /// for the next run.
 fn missing(p: Pending) -> Result<()> {
+    if is_wasm_skeleton(&p.pe) {
+        return Ok(());
+    }
     if mode() == Mode::Aot {
         bail!(
             "gex-eject: {} was mapped at {:#x}, and the ejected project has no code built for it there \
@@ -784,6 +797,7 @@ pub(crate) fn drain_in_caller(caller: &mut Caller<'_, HostState>) -> Result<()> 
         }
         install_providers(&p, caller.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *caller)?;
+        crate::wasmdll::apply_pending(&shared, &memory);
         replay_registry(caller)?;
     }
     Ok(())
@@ -821,6 +835,7 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
         }
         install_providers(&p, store.data_mut(), &shared, &engine, &memory)?;
         crate::ftab::catch_up(&mut *store)?;
+        crate::wasmdll::apply_pending(&shared, &memory);
         catch_up_table(store)?;
     }
     Ok(())
@@ -830,7 +845,9 @@ pub(crate) fn drain_in_store(store: &mut Store<HostState>) -> Result<()> {
 /// addresses, after its unit (whose bodies there are stubs into the table).
 fn install_providers(p: &Pending, state: &mut HostState, shared: &Arc<Mutex<JitShared>>, engine: &Engine, memory: &gex_mem::GuestMemory) -> Result<()> {
     let pv = provided(&p.pe, p.base);
-    for prov in &pv.providers {
+    // A native wasm32 Wine DLL's exports are its own module's (below).
+    let native = is_wasm_skeleton(&p.pe);
+    for prov in pv.providers.iter().filter(|_| !native) {
         // Small, and built in a private directory then renamed into place:
         // no need for the cache's build lock (which a unit build holds for
         // an hour).
