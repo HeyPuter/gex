@@ -930,6 +930,37 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
        F via the coordinator.
   - Nothing of mine is running on gooner or edger.
 
+- **After the restart (2026-10-05, gooner):** the WebGPU compositor is
+  finished (5d5eb91f): the page-side overlay (`gl-rect`, `?glpresent`) and
+  dom-compositor's WebGL2 call are gone. Found on the way: **on a software
+  adapter (SwiftShader: every headless run on gooner, and the gate) Chromium
+  149 has no shared-image backing for any WebGPU canvas**; the first
+  `getCurrentTexture` of any WebGPU canvas loses *every* device in the
+  renderer ("destroyed"), Mesa's included, and a probe cannot detect it
+  without that loss (`$S/wgt/probe.mjs`, two.html). So the compositor reads
+  the scene back into a 2D canvas when the adapter is the fallback/swiftshader
+  one, and copies it into a WebGPU canvas otherwise (`?present=canvas|
+  readback`). Mesa itself never touches a real canvas now (textureCanvas).
+  - Checked: site23 locally (SwiftShader) shows Noita upright, in colour,
+    titled, cursor drawn; tests/nt/browser-gui.mjs x86/x64 plain and --gl all
+    ok; tests/nt/run-browser.sh 49/49. On edger (canvas path): presents and
+    describe()'s readback move, no GL readbacks.
+  - Edger queue `$S/c23/queue.sh` (log `$S/c23/queue.txt`): ABBA pew/site23/
+    site22, world-up A/B site22/site23, trace tr23, readback shots.
+- **Shader translation cache (ed9511a5 + Mesa patch
+  `$S/mesa-patches/0002-*`, committed in `$S/gexroot/third_party/mesa`; built
+  in `$S/mesa-ctl-out`, copied to web/public/gex):** Tint's SPIR-V -> WGSL
+  answers kept in Mesa (in-process: 507 hits of 563 by the menus, i.e. the
+  same SPIR-V is translated again and again), loadable from a blob shipped
+  with the site (`eject-site --wgsl-cache FILE`; recorded by play.mjs's
+  `{"do":"wgsl","file":F}` step) and from IndexedDB (`?wgslcache=all|site|0`;
+  bench runs use `site`). Blobs carry the Mesa build's identity and are
+  refused by any other build. Locally with the blob: 0 misses, compile 303 ->
+  11 ms. The Mesa patch has to reach mesa-wink (coordinator).
+  - Edger chain `$S/c24/chain.sh` (log `$S/c24/chain.txt`): trains on site24
+    (blob at `$S/c24/edger.wgsl`), packs site24w, then world-up A/B x3
+    site24/site24w and legs pew/site24w/site24/pew.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
