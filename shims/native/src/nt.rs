@@ -556,7 +556,10 @@ pub(crate) fn syscall_import(caller: &mut Caller<'_, HostState>, pc: u64) -> Res
                 }
                 state.exit = Some(Exit::Status(p.exit_code.load(std::sync::atomic::Ordering::Acquire) as i32));
             } else {
+                // Only this thread ends (ExitThread, or killed by another's
+                // NtTerminateProcess(0)), not the process.
                 state.exit = Some(Exit::Status(0));
+                state.thread_only = true;
             }
             Err(StopExecution.into())
         }

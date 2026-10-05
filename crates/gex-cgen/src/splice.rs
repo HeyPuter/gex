@@ -614,6 +614,7 @@ fn call_known_function(body_ty: u32, first_body_table: u32) -> Function {
     f.instruction(&I::I32WrapI64);
     f.instruction(&I::I32Const(4));
     f.instruction(&I::I32Mul);
+    widen_addr(&mut f);
     f.instruction(&I::I32Load(m(gex_abi::DISPATCH_DIR, 2)));
     f.instruction(&I::LocalTee(5));
     f.instruction(&I::I32Const(gex_abi::DISPATCH_SLOT_BITS as i32));
@@ -640,11 +641,13 @@ fn call_known_function(body_ty: u32, first_body_table: u32) -> Function {
     f.instruction(&I::LocalGet(7));
     f.instruction(&I::I32Const(4));
     f.instruction(&I::I32Mul);
+    widen_addr(&mut f);
     f.instruction(&I::I32Load(m(gex_abi::BODY_LIMITS, 2)));
     f.instruction(&I::I32GeU);
     leave(&mut f);
     // ctx::PC = target (a body checks it: an x86 slot covers four bytes).
     f.instruction(&I::LocalGet(0));
+    widen_addr(&mut f);
     f.instruction(&I::LocalGet(1));
     f.instruction(&I::I64Store(m(ctx::PC as u64, 3)));
     // br_table over the body tables, as dispatch does over its tables.
@@ -687,6 +690,7 @@ pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
         memory_index: 0,
     };
     f.instruction(&I::LocalGet(0));
+    widen_addr(&mut f);
     f.instruction(&I::I64Load(m(ctx::LAST_TARGET as u64, 3)));
     f.instruction(&I::LocalSet(1));
     f.instruction(&I::LocalGet(1));
@@ -697,6 +701,7 @@ pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
     f.instruction(&I::I32WrapI64);
     f.instruction(&I::I32Const(4));
     f.instruction(&I::I32Mul);
+    widen_addr(&mut f);
     f.instruction(&I::I32Load(m(gex_abi::DISPATCH_DIR, 2)));
     f.instruction(&I::I32Const(0));
     f.instruction(&I::LocalGet(2));
@@ -748,6 +753,14 @@ pub(crate) fn dispatch_function_at(block_ty: u32, first: u32) -> Function {
     }
     f.instruction(&I::End);
     f
+}
+
+/// Make the i32 address on the stack the guest memory's index type: nothing
+/// for wasm32, a zero-extension for a memory64 guest memory (docs/mem64.md).
+pub(crate) fn widen_addr(f: &mut Function) {
+    if gex_abi::mem64() {
+        f.instruction(&Instruction::I64ExtendI32U);
+    }
 }
 
 fn names_wanted() -> bool {

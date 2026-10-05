@@ -645,10 +645,10 @@ impl Tty {
 #[derive(Clone, Copy)]
 pub struct Remote {
     /// Write the 60-byte structure to `at`.
-    pub get_termios: extern "C" fn(at: u32, len: u32) -> i32,
-    pub set_termios: extern "C" fn(at: u32, len: u32) -> i32,
-    pub get_locked: extern "C" fn(at: u32, len: u32) -> i32,
-    pub set_locked: extern "C" fn(at: u32, len: u32) -> i32,
+    pub get_termios: extern "C" fn(at: crate::PAddr, len: u32) -> i32,
+    pub set_termios: extern "C" fn(at: crate::PAddr, len: u32) -> i32,
+    pub get_locked: extern "C" fn(at: crate::PAddr, len: u32) -> i32,
+    pub set_locked: extern "C" fn(at: crate::PAddr, len: u32) -> i32,
     /// `rows << 48 | cols << 32 | xpixel << 16 | ypixel`.
     pub winsize: extern "C" fn() -> u64,
     /// Returns 1 if it changed, so the caller knows to raise `SIGWINCH`.
@@ -668,7 +668,7 @@ pub struct Remote {
     /// Bytes waiting to be read, for `FIONREAD`.
     pub queued: extern "C" fn() -> i32,
     /// Push bytes into the input queue as though typed, for `TIOCSTI`.
-    pub push: extern "C" fn(at: u32, len: u32) -> i32,
+    pub push: extern "C" fn(at: crate::PAddr, len: u32) -> i32,
 }
 
 /// The terminal, wherever it is: a local `Tty` with no global kernel, or the
@@ -708,7 +708,7 @@ impl TtyRef {
         match self.remote {
             Some(r) => {
                 let mut t = [0u8; 60];
-                (r.get_termios)(t.as_mut_ptr() as u32, 60);
+                (r.get_termios)(t.as_mut_ptr() as crate::PAddr, 60);
                 t
             }
             None => self.local.termios(),
@@ -718,7 +718,7 @@ impl TtyRef {
     pub fn set_termios(&self, src: &[u8]) {
         match self.remote {
             Some(r) => {
-                (r.set_termios)(src.as_ptr() as u32, src.len() as u32);
+                (r.set_termios)(src.as_ptr() as crate::PAddr, src.len() as u32);
             }
             None => self.local.set_termios(src),
         }
@@ -728,7 +728,7 @@ impl TtyRef {
         match self.remote {
             Some(r) => {
                 let mut t = [0u8; 60];
-                (r.get_locked)(t.as_mut_ptr() as u32, 60);
+                (r.get_locked)(t.as_mut_ptr() as crate::PAddr, 60);
                 t
             }
             None => self.local.locked_termios(),
@@ -738,7 +738,7 @@ impl TtyRef {
     pub fn set_locked_termios(&self, src: &[u8]) {
         match self.remote {
             Some(r) => {
-                (r.set_locked)(src.as_ptr() as u32, src.len() as u32);
+                (r.set_locked)(src.as_ptr() as crate::PAddr, src.len() as u32);
             }
             None => self.local.set_locked_termios(src),
         }
@@ -856,7 +856,7 @@ impl TtyRef {
     /// `TIOCSTI`: bytes into the input queue as though they had been typed.
     pub fn push(&self, bytes: &[u8]) -> i32 {
         match self.remote {
-            Some(r) => (r.push)(bytes.as_ptr() as u32, bytes.len() as u32),
+            Some(r) => (r.push)(bytes.as_ptr() as crate::PAddr, bytes.len() as u32),
             None => 0,
         }
     }

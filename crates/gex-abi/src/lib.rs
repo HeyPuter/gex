@@ -137,6 +137,71 @@ pub const GUEST_MEM_INITIAL_PAGES: u64 = GUEST_MEM_INITIAL_BYTES / WASM_PAGE;
 /// Highest guest address that can ever be valid.
 pub const GUEST_LIMIT: u64 = GUEST_MEM_BYTES;
 
+/// Which guest memory a process has (docs/mem64.md). `M32` is the default
+/// and every program that fits keeps it: a 4 GiB wasm32 memory with gex's
+/// bounds guard. `M64` is a 64-bit (memory64) memory of [`LIMIT64`] bytes for
+/// a 64-bit guest that needs more address space: the same layout below
+/// 4 GiB, and non-executable data in the high arena above it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MemFlavor {
+    #[default]
+    M32,
+    M64,
+}
+
+impl MemFlavor {
+    /// The highest address a guest of this flavour can use, exclusive.
+    pub const fn limit(self) -> u64 {
+        match self {
+            MemFlavor::M32 => GUEST_LIMIT,
+            MemFlavor::M64 => LIMIT64,
+        }
+    }
+
+    pub const fn is_64(self) -> bool {
+        matches!(self, MemFlavor::M64)
+    }
+}
+
+static MEM64: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set the guest memory every translation in this host process targets
+/// (docs/mem64.md §3). Natively a gexc process's guests share one flavour; a
+/// browser shim's is fixed by its build. Set before anything is translated.
+pub fn set_mem_flavor(f: MemFlavor) {
+    MEM64.store(f.is_64() || cfg!(target_arch = "wasm64"), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The guest memory translations target: [`MemFlavor::M32`] unless
+/// [`set_mem_flavor`] said otherwise, or this is a wasm64 build (whose own
+/// memory is the guest's, so it can only emit for a 64-bit one).
+pub fn mem_flavor() -> MemFlavor {
+    if cfg!(target_arch = "wasm64") || MEM64.load(core::sync::atomic::Ordering::Relaxed) {
+        MemFlavor::M64
+    } else {
+        MemFlavor::M32
+    }
+}
+
+/// `mem_flavor().is_64()`.
+pub fn mem64() -> bool {
+    mem_flavor().is_64()
+}
+
+/// The size of an [`MemFlavor::M64`] memory: 16 GiB, V8's memory64 cap
+/// (262144 pages), used natively too so that every module declares the same
+/// maximum and runs on either host.
+pub const LIMIT64: u64 = 16 << 30;
+
+/// Wasm pages in [`LIMIT64`].
+pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;
+
+/// The bottom of an M64 process's high arena: non-executable data (Linux
+/// `mmap` without `PROT_EXEC`, NT allocations without an executable
+/// protection) goes here, above everything a wasm32 process has, so code and
+/// every per-page runtime array keep their reach (docs/mem64.md §3).
+pub const HIGH_ARENA_BASE: u64 = 1 << 32;
+
 /// Address used for effective addresses that do not fit in 32 bits. Chosen so
 /// that even a 16-byte access starting here stays out of bounds.
 pub const POISON_ADDR: u32 = 0xFFFF_FFF0;

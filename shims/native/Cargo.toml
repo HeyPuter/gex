@@ -6,6 +6,7 @@ license.workspace = true
 description = "Native host for gex: wasmtime engine plus the kernel bindings"
 
 [dependencies]
+gex-atomic.workspace = true
 gex-abi.workspace = true
 gex-cache.workspace = true
 gex-key.workspace = true

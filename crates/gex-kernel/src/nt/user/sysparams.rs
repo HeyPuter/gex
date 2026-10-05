@@ -485,3 +485,178 @@ pub fn nt_user_change_display_settings(c: &mut Call<'_>) -> R64 {
     }
     Ok(SUCCESSFUL as u64)
 }
+
+/// `NtUserGetDisplayConfigBufferSizes(flags, *num_paths, *num_modes)`: one
+/// active path (the one monitor), a source and a target mode, and a desktop
+/// image mode with QDC_VIRTUAL_MODE_AWARE (Wine's win32u). A Win32 error.
+pub fn nt_user_get_display_config_buffer_sizes(c: &mut Call<'_>) -> R64 {
+    const INVALID_PARAMETER: u64 = 87;
+    let (flags, paths_p, modes_p) = (c.a32(0), c.a(1), c.a(2));
+    if paths_p == 0 || modes_p == 0 {
+        return Ok(INVALID_PARAMETER);
+    }
+    c.g.w32(paths_p, 0)?;
+    if !matches!(flags & 7, 1 | 2 | 4) || flags & !(7 | 0x10) != 0 {
+        return Ok(INVALID_PARAMETER);
+    }
+    c.g.w32(paths_p, 1)?;
+    c.g.w32(modes_p, if flags & 0x10 != 0 { 3 } else { 2 })?;
+    Ok(0)
+}
+
+/// `NtUserQueryDisplayConfig(flags, *num_paths, paths, *num_modes, modes,
+/// *topology)`: the one monitor at the current mode, laid out as Wine's
+/// win32u does (`DISPLAYCONFIG_PATH_INFO` 72 bytes, `_MODE_INFO` 64). A
+/// Win32 error.
+pub fn nt_user_query_display_config(c: &mut Call<'_>) -> R64 {
+    const INVALID_PARAMETER: u64 = 87;
+    const INSUFFICIENT_BUFFER: u64 = 122;
+    let (flags, np, paths, nm, modes, topo) = (c.a32(0), c.a(1), c.a(2), c.a(3), c.a(4), c.a(5));
+    if np == 0 || nm == 0 {
+        return Ok(INVALID_PARAMETER);
+    }
+    let (n_paths, n_modes) = (c.g.u32(np)?, c.g.u32(nm)?);
+    if n_paths == 0 || n_modes == 0 {
+        return Ok(INVALID_PARAMETER);
+    }
+    let retrieve = flags & 7;
+    if !matches!(retrieve, 1 | 2 | 4) || (retrieve == 4) != (topo != 0) || flags & !(7 | 0x10) != 0 {
+        return Ok(INVALID_PARAMETER);
+    }
+    if topo != 0 {
+        c.g.w32(topo, 1)?; // DISPLAYCONFIG_TOPOLOGY_INTERNAL
+    }
+    let virt = flags & 0x10 != 0;
+    if n_modes < if virt { 3 } else { 2 } {
+        return Ok(INSUFFICIENT_BUFFER);
+    }
+    let m = mode(c);
+    let (w, h, hz) = (m.width as u32, m.height as u32, 60u32);
+    let luid = crate::nt::gdi::d3dkmt::LUID;
+    let (source_id, target_id) = (0u32, 0u32);
+    // Modes: 0 source, 1 target, 2 desktop image (virtual-mode aware).
+    let mode_at = |i: u64| modes + 64 * i;
+    let header = |c: &mut Call<'_>, at: u64, kind: u32, id: u32| -> R<()> {
+        c.g.zero(at, 64)?;
+        c.g.w32(at, kind)?;
+        c.g.w32(at + 4, id)?;
+        c.g.w32(at + 8, luid)?;
+        c.g.w32(at + 12, 0)
+    };
+    let s = mode_at(0);
+    header(c, s, 1, source_id)?;
+    c.g.w32(s + 16, w)?;
+    c.g.w32(s + 20, h)?;
+    c.g.w32(s + 24, if matches!(m.bpp, 8 | 16 | 24 | 32) { m.bpp / 8 } else { 5 })?;
+    let t = mode_at(1);
+    header(c, t, 2, target_id)?;
+    c.g.w64(t + 16, hz as u64 * w as u64 * h as u64)?; // pixelRate
+    c.g.w32(t + 24, hz * w)?; // hSyncFreq
+    c.g.w32(t + 28, 1)?;
+    c.g.w32(t + 32, hz)?; // vSyncFreq
+    c.g.w32(t + 36, 1)?;
+    c.g.w32(t + 40, w)?; // activeSize
+    c.g.w32(t + 44, h)?;
+    let (tw, th) = if retrieve == 4 { (0, 0) } else { (w, h) };
+    c.g.w32(t + 48, tw)?; // totalSize
+    c.g.w32(t + 52, th)?;
+    c.g.w32(t + 56, 255)?; // D3DKMDT_VSS_OTHER
+    c.g.w32(t + 60, 1)?; // progressive
+    if virt {
+        let d = mode_at(2);
+        header(c, d, 3, target_id)?;
+        c.g.w32(d + 16, w)?; // PathSourceSize
+        c.g.w32(d + 20, h)?;
+        for at in [d + 24, d + 40] {
+            // DesktopImageRegion, DesktopImageClip
+            c.g.w32(at, 0)?;
+            c.g.w32(at + 4, 0)?;
+            c.g.w32(at + 8, w)?;
+            c.g.w32(at + 12, h)?;
+        }
+    }
+    // The path: source info (20 bytes), target info (48), flags.
+    let p = paths;
+    c.g.zero(p, 72)?;
+    c.g.w32(p, luid)?;
+    c.g.w32(p + 8, source_id)?;
+    // modeInfoIdx, or cloneGroupId:16 (invalid) | sourceModeInfoIdx:16.
+    c.g.w32(p + 12, if virt { 0xffff | (0 << 16) } else { 0 })?;
+    c.g.w32(p + 16, 1)?; // DISPLAYCONFIG_SOURCE_IN_USE
+    let ti = p + 20;
+    c.g.w32(ti, luid)?;
+    c.g.w32(ti + 8, target_id)?;
+    // modeInfoIdx, or desktopModeInfoIdx:16 | targetModeInfoIdx:16.
+    c.g.w32(ti + 12, if virt { 2 | (1 << 16) } else { 1 })?;
+    c.g.w32(ti + 16, 10)?; // DISPLAYPORT_EXTERNAL
+    c.g.w32(ti + 20, 1)?; // ROTATION_IDENTITY
+    c.g.w32(ti + 24, 1)?; // SCALING_IDENTITY
+    c.g.w32(ti + 28, hz)?;
+    c.g.w32(ti + 32, 1)?;
+    c.g.w32(ti + 36, 1)?; // progressive
+    c.g.w32(ti + 40, 1)?; // targetAvailable
+    c.g.w32(ti + 44, 1)?; // DISPLAYCONFIG_TARGET_IN_USE
+    c.g.w32(p + 68, 1 | if virt { 8 } else { 0 })?; // PATH_ACTIVE (| SUPPORT_VIRTUAL_MODE)
+    c.g.w32(np, 1)?;
+    c.g.w32(nm, if virt { 3 } else { 2 })?;
+    Ok(0)
+}
+
+/// `NtUserDisplayConfigGetDeviceInfo(packet)`: names for the one source,
+/// target and adapter of [`nt_user_query_display_config`] (an NTSTATUS).
+pub fn nt_user_display_config_get_device_info(c: &mut Call<'_>) -> R64 {
+    use crate::nt::st;
+    let p = c.a(0);
+    if p == 0 {
+        return Ok(st::UNSUCCESSFUL as u64);
+    }
+    let (kind, size) = (c.g.u32(p)?, c.g.u32(p + 4)?);
+    if size < 20 {
+        return Ok(st::UNSUCCESSFUL as u64);
+    }
+    let put = |c: &mut Call<'_>, at: u64, n: usize, s: &str| -> R<()> {
+        let mut w = crate::nt::to_w(s);
+        w.resize(n, 0);
+        c.g.write_wchars(at, &w)
+    };
+    match kind {
+        // DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME: viewGdiDeviceName[32].
+        1 => {
+            if size < 84 {
+                return Ok(st::INVALID_PARAMETER as u64);
+            }
+            put(c, p + 20, 32, "\\\\.\\DISPLAY1")?;
+        }
+        // _GET_TARGET_NAME: flags, outputTechnology, EDID ids, connector,
+        // monitorFriendlyDeviceName[64], monitorDevicePath[128].
+        2 => {
+            if size < 420 {
+                return Ok(st::INVALID_PARAMETER as u64);
+            }
+            c.g.zero(p + 20, 400)?;
+            c.g.w32(p + 24, 0x8000_0000)?; // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL
+            put(c, p + 36, 64, "Display1")?;
+            put(c, p + 164, 128, "\\\\?\\DISPLAY#Default_Monitor#4&17f0ff54&0&UID0#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}")?;
+        }
+        // _GET_ADAPTER_NAME: adapterDevicePath[128].
+        4 => {
+            if size < 276 {
+                return Ok(st::INVALID_PARAMETER as u64);
+            }
+            put(c, p + 20, 128, "\\\\?\\PCI#VEN_0000&DEV_0000&SUBSYS_00000000&REV_00#0&0&0&0#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}")?;
+        }
+        _ => return Ok(st::NOT_SUPPORTED as u64),
+    }
+    Ok(st::SUCCESS as u64)
+}
+
+/// `NtUserGetDpiForMonitor(monitor, type, *x, *y)`: 96, as the system DPI.
+pub fn nt_user_get_dpi_for_monitor(c: &mut Call<'_>) -> R64 {
+    let (x, y) = (c.a(2), c.a(3));
+    if x == 0 || y == 0 {
+        return Ok(0);
+    }
+    c.g.w32(x, 96)?;
+    c.g.w32(y, 96)?;
+    Ok(1)
+}

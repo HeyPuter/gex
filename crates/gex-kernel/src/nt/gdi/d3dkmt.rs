@@ -10,7 +10,7 @@ use super::R64;
 const ADAPTER: u32 = 0x4000_0001;
 const DEVICE: u32 = 0x4000_0002;
 /// The adapter's LUID, as GDI reports it.
-const LUID: u32 = 0x0000_6765;
+pub const LUID: u32 = 0x0000_6765;
 /// What `QueryVideoMemoryInfo` reports as the local segment's budget.
 const VIDEO_MEMORY: u64 = 1 << 30;
 

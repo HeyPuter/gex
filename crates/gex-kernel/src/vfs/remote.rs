@@ -25,34 +25,34 @@ use crate::vfs::{DirEntry, FileHandle, FileSystem, FileType, Metadata, SysResult
 #[derive(Clone, Copy)]
 pub struct Remote {
     /// Open, returning a handle id or a negated errno.
-    pub open: extern "C" fn(path: u32, path_len: u32, flags: u64, mode: u32) -> i32,
+    pub open: extern "C" fn(path: crate::PAddr, path_len: u32, flags: u64, mode: u32) -> i32,
     pub close: extern "C" fn(handle: i32),
     /// A second id for one open file, for a child to inherit. Returns the
     /// new id or a negated errno.
     pub dup: extern "C" fn(handle: i32) -> i32,
-    pub read: extern "C" fn(handle: i32, offset: u64, at: u32, len: u32) -> i32,
-    pub write: extern "C" fn(handle: i32, offset: u64, at: u32, len: u32) -> i32,
+    pub read: extern "C" fn(handle: i32, offset: u64, at: crate::PAddr, len: u32) -> i32,
+    pub write: extern "C" fn(handle: i32, offset: u64, at: crate::PAddr, len: u32) -> i32,
     /// Write this handle's metadata as [`META_BYTES`] bytes at `at`.
-    pub meta: extern "C" fn(handle: i32, at: u32) -> i32,
+    pub meta: extern "C" fn(handle: i32, at: crate::PAddr) -> i32,
     pub truncate: extern "C" fn(handle: i32, len: u64) -> i32,
     /// Write the directory listing at `at`, or `-ERANGE` if `cap` is short.
-    pub read_dir: extern "C" fn(handle: i32, at: u32, cap: u32) -> i32,
-    pub path_meta: extern "C" fn(path: u32, path_len: u32, at: u32) -> i32,
-    pub read_link: extern "C" fn(path: u32, path_len: u32, at: u32, cap: u32) -> i32,
-    pub unlink: extern "C" fn(path: u32, path_len: u32) -> i32,
-    pub mkdir: extern "C" fn(path: u32, path_len: u32, mode: u32) -> i32,
-    pub rmdir: extern "C" fn(path: u32, path_len: u32) -> i32,
-    pub rename: extern "C" fn(from: u32, from_len: u32, to: u32, to_len: u32) -> i32,
-    pub chmod: extern "C" fn(path: u32, path_len: u32, mode: u32) -> i32,
-    pub symlink: extern "C" fn(target: u32, target_len: u32, path: u32, path_len: u32) -> i32,
-    pub link: extern "C" fn(from: u32, from_len: u32, to: u32, to_len: u32) -> i32,
+    pub read_dir: extern "C" fn(handle: i32, at: crate::PAddr, cap: u32) -> i32,
+    pub path_meta: extern "C" fn(path: crate::PAddr, path_len: u32, at: crate::PAddr) -> i32,
+    pub read_link: extern "C" fn(path: crate::PAddr, path_len: u32, at: crate::PAddr, cap: u32) -> i32,
+    pub unlink: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
+    pub mkdir: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
+    pub rmdir: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
+    pub rename: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32) -> i32,
+    pub chmod: extern "C" fn(path: crate::PAddr, path_len: u32, mode: u32) -> i32,
+    pub symlink: extern "C" fn(target: crate::PAddr, target_len: u32, path: crate::PAddr, path_len: u32) -> i32,
+    pub link: extern "C" fn(from: crate::PAddr, from_len: u32, to: crate::PAddr, to_len: u32) -> i32,
     /// Put a socket node at a path.
     ///
     /// Not read -- only stat'd: Xvfb binds `/tmp/.X11-unix/X0` and its startup
     /// script waits for that path to exist before launching a client.
-    pub mksocket: extern "C" fn(path: u32, path_len: u32) -> i32,
+    pub mksocket: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,
     /// Set a path's modification time (`utimensat`, a bundle's file times).
-    pub set_mtime: extern "C" fn(path: u32, path_len: u32, secs: i64) -> i32,
+    pub set_mtime: extern "C" fn(path: crate::PAddr, path_len: u32, secs: i64) -> i32,
     /// Set an open file's modification time. The global kernel has no clock
     /// of its own, so a write's time is the writing process's: it stamps the
     /// file after each write.
@@ -163,8 +163,8 @@ fn ok(v: i32) -> Result<i32, Errno> {
 
 /// Where a path is staged for the other side to copy out. The address must be
 /// real in this process's memory and stay valid across the call.
-fn at(b: &[u8]) -> (u32, u32) {
-    (b.as_ptr() as u32, b.len() as u32)
+fn at(b: &[u8]) -> (crate::PAddr, u32) {
+    (b.as_ptr() as crate::PAddr, b.len() as u32)
 }
 
 /// A filesystem served by the global kernel.
@@ -209,7 +209,7 @@ impl FileSystem for RemoteFs {
         let p = path.as_bytes();
         let (a, n) = at(p);
         let mut buf = [0u8; META_BYTES];
-        ok((self.remote.path_meta)(a, n, buf.as_mut_ptr() as u32))?;
+        ok((self.remote.path_meta)(a, n, buf.as_mut_ptr() as crate::PAddr))?;
         Ok(decode_meta(&buf))
     }
 
@@ -222,7 +222,7 @@ impl FileSystem for RemoteFs {
         let got = ok((self.remote.read_link)(
             a,
             n,
-            buf.as_mut_ptr() as u32,
+            buf.as_mut_ptr() as crate::PAddr,
             buf.len() as u32,
         ))? as usize;
         Ok(String::from_utf8_lossy(&buf[..got]).into_owned())
@@ -311,7 +311,7 @@ impl FileHandle for RemoteHandle {
         let n = ok((self.remote.read)(
             self.id,
             offset,
-            buf.as_mut_ptr() as u32,
+            buf.as_mut_ptr() as crate::PAddr,
             buf.len() as u32,
         ))?;
         Ok(n as u64)
@@ -321,7 +321,7 @@ impl FileHandle for RemoteHandle {
         let n = ok((self.remote.write)(
             self.id,
             offset,
-            buf.as_ptr() as u32,
+            buf.as_ptr() as crate::PAddr,
             buf.len() as u32,
         ))?;
         if n > 0 {
@@ -336,7 +336,7 @@ impl FileHandle for RemoteHandle {
 
     fn metadata(&self) -> Result<Metadata, Errno> {
         let mut buf = [0u8; META_BYTES];
-        ok((self.remote.meta)(self.id, buf.as_mut_ptr() as u32))?;
+        ok((self.remote.meta)(self.id, buf.as_mut_ptr() as crate::PAddr))?;
         Ok(decode_meta(&buf))
     }
 
@@ -346,7 +346,7 @@ impl FileHandle for RemoteHandle {
         let mut cap = 4096;
         loop {
             let mut buf = vec![0u8; cap];
-            match (self.remote.read_dir)(self.id, buf.as_mut_ptr() as u32, cap as u32) {
+            match (self.remote.read_dir)(self.id, buf.as_mut_ptr() as crate::PAddr, cap as u32) {
                 n if n >= 0 => {
                     buf.truncate(n as usize);
                     return Ok(decode_dir(&buf));

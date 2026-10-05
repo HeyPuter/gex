@@ -27,7 +27,7 @@ pub fn connect(kernel: &Kernel) -> Option<Xwm> {
 fn open(kernel: &Kernel) -> Option<Arc<dyn FileHandle>> {
     for name in X_SOCKETS {
         if let Some(r) = kernel.unix_remote {
-            let id = (r.connect)(name.as_ptr() as u32, name.len() as u32);
+            let id = (r.connect)(name.as_ptr() as gex_kernel::PAddr, name.len() as u32);
             if id >= 0 {
                 unsafe {
                     crate::write_stderr(&format!(

@@ -11,6 +11,16 @@
 
 #![forbid(unsafe_code)]
 
+/// An address in the calling process's memory as it crosses between a
+/// process's shim and the global kernel module (the remote ops below and the
+/// browser's `k_*` imports). 64-bit where that memory is a memory64: the
+/// wasm64 browser shim and the kernel module built to serve it
+/// (docs/mem64.md step 6). Everywhere else 32-bit, as it always was.
+#[cfg(any(target_arch = "wasm64", feature = "process64"))]
+pub type PAddr = u64;
+#[cfg(not(any(target_arch = "wasm64", feature = "process64")))]
+pub type PAddr = u32;
+
 pub mod errno;
 pub mod eventfd;
 pub mod file;
@@ -109,7 +119,11 @@ impl<'a> GuestMem<'a> {
     fn limit(&self) -> usize {
         #[cfg(target_family = "wasm")]
         {
-            let live = (core::arch::wasm32::memory_size(0) as u64) << 16;
+            #[cfg(target_arch = "wasm32")]
+            let pages = core::arch::wasm32::memory_size(0);
+            #[cfg(target_arch = "wasm64")]
+            let pages = core::arch::wasm64::memory_size(0);
+            let live = (pages as u64) << 16;
             (live as usize).min(self.view().len())
         }
         #[cfg(not(target_family = "wasm"))]

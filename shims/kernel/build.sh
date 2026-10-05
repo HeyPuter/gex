@@ -80,6 +80,22 @@ RUSTFLAGS="-C link-arg=--import-memory \
 node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel$INFIX.wasm env process 1 1
 node tools/add-memory.mjs "$OUT" web/public/gex/gex_kernel$INFIX.plain.wasm env process 1 0
 
+# GEX_MEM64=1 (x86 only): also the kernel for processes with a 64-bit memory
+# (the wasm64 shim, docs/mem64.md step 6): its process memory is a memory64 of
+# 16 GiB, and gex-kmem addresses it with i64.
+if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEATURES" ]; then
+    RUSTFLAGS="-C link-arg=--import-memory \
+      -C link-arg=--shared-memory \
+      -C link-arg=--max-memory=4294967296 \
+      -C link-arg=--export-table \
+      -C link-arg=--export=__stack_pointer \
+      -C target-feature=+atomics,+bulk-memory,+mutable-globals" \
+      cargo +nightly build -p gex-kernel-wasm --target wasm32-unknown-unknown \
+        --release -Z build-std=std,panic_abort --target-dir $TDIR-m64 --features x86,process64
+    node tools/add-memory.mjs $TDIR-m64/wasm32-unknown-unknown/release/gex_kernel_wasm.wasm \
+      web/public/gex/gex_kernel$INFIX.m64.wasm env process 1 1 $(((16 << 30) / 65536)) 64
+fi
+
 # And the site, which is a copy of public/ and will otherwise keep serving
 # the module that was here a moment ago.
 web/refresh-dist.sh

@@ -24,6 +24,12 @@ import { ProcessHost } from './host.mjs';
 // (see shims/browser/build.sh), and `globalThis.GEX_ARCH` for the glue.
 const ARCH_INFIX = process.env.GEX_ARCH === 'x86' ? '.x86' : '';
 if (process.env.GEX_ARCH === 'x86') globalThis.GEX_ARCH = 'x86';
+// `GEX_MEM64=1` (with GEX_ARCH=x86 and GEX_SHARED=1): a 64-bit guest memory,
+// the `.m64` shim and seed built by `GEX_MEM64=1 shims/browser/build.sh`
+// (docs/mem64.md step 6).
+const MEM64 = !!process.env.GEX_MEM64;
+if (MEM64) globalThis.GEX_MEM64 = 1;
+const SHIM_INFIX = ARCH_INFIX + (MEM64 ? '.m64' : '');
 
 // The host runs on the main thread; give it the attach-trace flag too so
 // thread spawn/adopt timing is visible from the host side, not just the Worker.
@@ -149,7 +155,7 @@ function readStdin() {
 const SHARED = !!process.env.GEX_SHARED;
 const shimWasm = readFileSync(
   new URL(
-    SHARED ? `../../../web/public/gex/gex_browser${ARCH_INFIX}.shared.wasm`
+    SHARED ? `../../../web/public/gex/gex_browser${SHIM_INFIX}.shared.wasm`
            : `../../../web/public/gex/gex_browser${ARCH_INFIX}.wasm`,
     import.meta.url,
   ),
@@ -162,7 +168,7 @@ const shimWasm = readFileSync(
 let kernel = null;
 try {
   const path = new URL(
-    SHARED ? `../../../web/public/gex/gex_kernel${ARCH_INFIX}.wasm`
+    SHARED ? `../../../web/public/gex/gex_kernel${SHIM_INFIX}.wasm`
            : `../../../web/public/gex/gex_kernel${ARCH_INFIX}.plain.wasm`,
     import.meta.url,
   );
@@ -267,6 +273,7 @@ const host = new ProcessHost({
     // GEX_DENSE=0: classic per-slot dispatch tables (gex_emit::dense off).
     dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
     denseDebug: !!process.env.GEX_DENSE_DEBUG,
+    mem64: MEM64,
     calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,

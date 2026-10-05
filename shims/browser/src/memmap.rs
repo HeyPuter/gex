@@ -161,7 +161,7 @@ pub fn claim(kind: Kind, owner: u32, start: u64, end: u64, what: &'static str) {
                     other & 0xffff_ffff
                 ));
                 print_locked(n);
-                core::arch::wasm32::unreachable();
+                crate::warch::unreachable();
             }
         }
     }

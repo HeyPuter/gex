@@ -137,6 +137,10 @@ pub struct Vm {
     /// [`Vm::find_free`] avoids them while anything else fits, so a heap or
     /// another image does not take a core DLL's base before it loads.
     pub reserved: Vec<(u64, u64)>,
+    /// An M64 process's high arena, `[HIGH_ARENA_BASE, LIMIT64)`
+    /// (docs/mem64.md §3): private allocations that are not executable go
+    /// there. `None` for every M32 process.
+    pub high: Option<(u64, u64)>,
     /// An exact layout's: nothing but its image ever takes a reserved range.
     pub strict_reserved: bool,
 }
@@ -174,9 +178,30 @@ impl Vm {
         self.regions.range_mut(..=a).next_back().map(|(_, r)| r).filter(|r| a < r.end())
     }
 
+    /// The highest address a region may end at, exclusive.
+    pub fn limit(&self) -> u64 {
+        self.high.map_or_else(user_limit, |(_, hi)| hi)
+    }
+
+    /// A free 64 KiB-aligned range of `size` bytes in the high arena, bottom-up
+    /// first fit (the browser grows memory to the highest address used).
+    pub fn find_free_high(&self, size: u64) -> Option<u64> {
+        let (lo, hi) = self.high?;
+        let mut at = lo;
+        loop {
+            if at + size > hi {
+                return None;
+            }
+            match self.regions.range(..at + size).filter(|(_, r)| r.end() > at).map(|(_, r)| r.end()).max() {
+                None => return Some(at),
+                Some(e) => at = align_up(e, GRANULE),
+            }
+        }
+    }
+
     pub fn is_free(&self, start: u64, end: u64) -> bool {
         start >= PAGE
-            && end <= user_limit()
+            && end <= self.limit()
             && !self.regions.range(..end).any(|(_, r)| r.end() > start)
     }
 
@@ -332,7 +357,7 @@ impl Vm {
                 }
             }
             None => {
-                let next = self.regions.range(page..).next().map(|(&b, _)| b).unwrap_or(gex_abi::GUEST_LIMIT);
+                let next = self.regions.range(page..).next().map(|(&b, _)| b).unwrap_or(self.limit());
                 Mbi {
                     base: page,
                     alloc_base: 0,
@@ -439,7 +464,26 @@ fn zero_bits_limit(_c: &Call<'_>, zero_bits: u64) -> u64 {
 }
 
 /// Core of NtAllocateVirtualMemory(Ex).
+/// [`allocate_inner`], traced under `GEX_NT_TRACE`: what was asked (address,
+/// size, type, protection) and what was given, which is how a program's
+/// reservation pattern is read off a run.
 fn allocate(c: &mut Call<'_>, addr_p: u64, limit: u64, size_p: u64, typ: u32, prot: u32) -> R {
+    if !c.p.cfg.trace {
+        return allocate_inner(c, addr_p, limit, size_p, typ, prot);
+    }
+    let (want, size) = (c.g.ptr(addr_p).unwrap_or(0), c.g.ptr(size_p).unwrap_or(0));
+    let r = allocate_inner(c, addr_p, limit, size_p, typ, prot);
+    let got = if r.is_ok() { c.g.ptr(addr_p).unwrap_or(0) } else { 0 };
+    let got_size = if r.is_ok() { c.g.ptr(size_p).unwrap_or(0) } else { 0 };
+    crate::nt_log!(
+        "[nt:{:x}]   alloc want={want:#x} size={size:#x} type={typ:#x} prot={prot:#x} -> {} at {got:#x}+{got_size:#x}",
+        c.t.tid,
+        match &r { Ok(_) => "ok".to_string(), Err(e) => format!("{:#010x}", e.0) }
+    );
+    r
+}
+
+fn allocate_inner(c: &mut Call<'_>, addr_p: u64, limit: u64, size_p: u64, typ: u32, prot: u32) -> R {
     use mem_flags::*;
     let addr = c.g.ptr(addr_p)?;
     let size = c.g.ptr(size_p)?;
@@ -467,7 +511,22 @@ fn allocate(c: &mut Call<'_>, addr_p: u64, limit: u64, size_p: u64, typ: u32, pr
         // A new reservation.
         let (b, s) = if addr == 0 {
             let s = align_up(size, PAGE);
-            let b = stl.vm.find_free(align_up(s, GRANULE), top_down, limit).ok_or(Status(st::NO_MEMORY))?;
+            // Data in an M64 process goes high (docs/mem64.md §3): not
+            // executable, not top-down, no zero-bits limit. Low if it is full.
+            let high = if linux_prot(prot) & crate::mem::prot::EXEC == 0 && !top_down && limit == ALLOC_HIGH {
+                stl.vm.find_free_high(align_up(s, GRANULE))
+            } else {
+                None
+            };
+            let b = match high.or_else(|| stl.vm.find_free(align_up(s, GRANULE), top_down, limit)) {
+                Some(b) => b,
+                None => {
+                    if stl.vm.high.is_none() {
+                        crate::mem::note_address_space_short(s);
+                    }
+                    return Err(Status(st::NO_MEMORY));
+                }
+            };
             (b, s)
         } else {
             let b = addr & !(GRANULE - 1);
@@ -590,6 +649,12 @@ pub fn nt_protect_virtual_memory(c: &mut Call<'_>) -> R {
     let size = c.g.ptr(size_p)?;
     let start = addr & !(PAGE - 1);
     let end = align_up(addr + size.max(1), PAGE);
+    // Code in the high arena is beyond the dispatch directory's reach
+    // (docs/mem64.md §3): refused, loudly, until a sparse page table covers it.
+    if end > gex_abi::HIGH_ARENA_BASE && linux_prot(prot) & crate::mem::prot::EXEC != 0 {
+        crate::nt_log!("gex-nt: making {start:#x}..{end:#x} executable, above 4 GiB in a 64-bit memory: not supported yet (docs/mem64.md)");
+        return Err(Status(st::INVALID_PAGE_PROTECTION));
+    }
     let old = c.p.st.lock().unwrap().vm.protect(start, end, prot)?;
     after_change(c, start, end, &[])?;
     c.g.wptr(addr_p, start)?;
@@ -609,10 +674,13 @@ pub fn nt_query_virtual_memory(c: &mut Call<'_>) -> R {
             if len < size {
                 return Err(Status(st::INFO_LENGTH_MISMATCH));
             }
-            if addr >= user_limit() {
-                return Err(Status(st::INVALID_PARAMETER));
-            }
-            let m = c.p.st.lock().unwrap().vm.query(addr);
+            let m = {
+                let stl = c.p.st.lock().unwrap();
+                if addr >= stl.vm.limit() {
+                    return Err(Status(st::INVALID_PARAMETER));
+                }
+                stl.vm.query(addr)
+            };
             write_mbi(c, buf, &m)?;
             c.g.out_ptr(ret_p, size)?;
             Ok(st::SUCCESS)

@@ -1,0 +1,1275 @@
+diff --git a/eng/native/configurecompiler.cmake b/eng/native/configurecompiler.cmake
+index 95641492a..c62cee5e8 100644
+--- a/eng/native/configurecompiler.cmake
++++ b/eng/native/configurecompiler.cmake
+@@ -361,7 +361,12 @@ elseif (CLR_CMAKE_HOST_ARCH_S390X)
+   add_definitions(-DHOST_S390X -DHOST_64BIT -DBIGENDIAN)
+ elseif (CLR_CMAKE_HOST_ARCH_WASM)
+   set(ARCH_HOST_NAME wasm)
+-  add_definitions(-DHOST_WASM -DHOST_32BIT=1)
++  if (CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
++    # gex: wasm64 (noita-wasm docs/unity-dotnet.md)
++    add_definitions(-DHOST_WASM -DHOST_64BIT=1)
++  else()
++    add_definitions(-DHOST_WASM -DHOST_32BIT=1)
++  endif()
+ elseif (CLR_CMAKE_HOST_ARCH_MIPS64)
+   set(ARCH_HOST_NAME mips64)
+   add_definitions(-DHOST_MIPS64 -DHOST_64BIT=1)
+@@ -392,6 +397,8 @@ if (CLR_CMAKE_HOST_UNIX)
+       message("Detected Linux s390x")
+     elseif(CLR_CMAKE_HOST_UNIX_POWERPC64)
+       message("Detected Linux ppc64le")
++    elseif(CLR_CMAKE_HOST_UNIX_WASM)
++      message("Detected Linux wasm64 (gex)")
+     else()
+       clr_unknown_arch()
+     endif()
+@@ -523,7 +530,11 @@ elseif (CLR_CMAKE_TARGET_ARCH_WASM)
+     set(ARCH_TARGET_NAME wasm)
+     set(ARCH_SOURCES_DIR wasm)
+     add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_WASM>)
+-    add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_32BIT>)
++    if (CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
++        add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_64BIT>)
++    else()
++        add_compile_definitions($<$<NOT:$<BOOL:$<TARGET_PROPERTY:IGNORE_DEFAULT_TARGET_ARCH>>>:TARGET_32BIT>)
++    endif()
+ elseif (CLR_CMAKE_TARGET_ARCH_MIPS64)
+     set(ARCH_TARGET_NAME mips64)
+     set(ARCH_SOURCES_DIR mips64)
+diff --git a/eng/native/configureplatform.cmake b/eng/native/configureplatform.cmake
+index 0154f877e..87b21a777 100644
+--- a/eng/native/configureplatform.cmake
++++ b/eng/native/configureplatform.cmake
+@@ -66,6 +66,9 @@ if(CLR_CMAKE_HOST_OS STREQUAL linux)
+             set(CLR_CMAKE_HOST_UNIX_POWERPC64 1)
+         elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL mips64)
+             set(CLR_CMAKE_HOST_UNIX_MIPS64 1)
++        elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL wasm64)
++            # gex: wasm64 code in an x86-64 Linux guest (noita-wasm docs/unity-dotnet.md)
++            set(CLR_CMAKE_HOST_UNIX_WASM 1)
+         else()
+             clr_unknown_arch()
+         endif()
+@@ -287,6 +290,9 @@ elseif(CLR_CMAKE_HOST_WASI)
+ elseif(CLR_CMAKE_HOST_UNIX_MIPS64)
+     set(CLR_CMAKE_HOST_ARCH_MIPS64 1)
+     set(CLR_CMAKE_HOST_ARCH "mips64")
++elseif(CLR_CMAKE_HOST_UNIX_WASM)
++    set(CLR_CMAKE_HOST_ARCH_WASM 1)
++    set(CLR_CMAKE_HOST_ARCH "wasm")
+ elseif(WIN32)
+     # CLR_CMAKE_HOST_ARCH is passed in as param to cmake
+     if (CLR_CMAKE_HOST_ARCH STREQUAL x64)
+diff --git a/src/mono/CMakeLists.txt b/src/mono/CMakeLists.txt
+index 781cddbfd..b761e627e 100644
+--- a/src/mono/CMakeLists.txt
++++ b/src/mono/CMakeLists.txt
+@@ -405,6 +405,15 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "s390x")
+   set(HOST_S390X 1)
+ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm32")
+   set(HOST_WASM 1)
++elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "wasm64")
++  set(HOST_WASM 1)
++  set(HOST_WASM64 1)
++  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    # gex: a stateful provider inside an x86-64 Linux guest (noita-wasm docs/unity-dotnet.md):
++    # wasm code, but the OS is Linux (musl, x86-64 syscalls served by gex-kernel), with real
++    # threads, mmap and files. No JS, no emscripten.
++    set(HOST_GEX 1)
++  endif()
+ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "ppc64le")
+   set(HOST_POWERPC 1)
+   set(HOST_POWERPC64 1)
+@@ -486,6 +495,14 @@ elseif(TARGET_ARCH STREQUAL "wasm" OR TARGET_ARCH STREQUAL "wasm32")
+   set(MONO_ARCHITECTURE "\"wasm\"")
+   set(TARGET_SIZEOF_VOID_P 4)
+   set(SIZEOF_REGISTER 4)
++elseif(TARGET_ARCH STREQUAL "wasm64")
++  # gex: wasm with 64-bit pointers (memory64), sharing an x86-64 guest's memory.
++  set(TARGET_ARCH "wasm")
++  set(TARGET_WASM 1)
++  set(TARGET_WASM64 1)
++  set(MONO_ARCHITECTURE "\"wasm\"")
++  set(TARGET_SIZEOF_VOID_P 8)
++  set(SIZEOF_REGISTER 8)
+ elseif(TARGET_ARCH STREQUAL "ppc64le")
+   set(TARGET_POWERPC 1)
+   set(TARGET_POWERPC64 1)
+@@ -823,7 +840,7 @@ else()
+   set(NAME_DEV_RANDOM "\"/dev/random\"")
+ endif()
+ 
+-if(HOST_LINUX AND HAVE_SYS_MMAN_H AND HAVE_ELF_H AND HAVE_SYS_SYSCALL_H)
++if(HOST_LINUX AND NOT HOST_GEX AND HAVE_SYS_MMAN_H AND HAVE_ELF_H AND HAVE_SYS_SYSCALL_H)
+   set(ENABLE_JIT_DUMP 1)
+ endif()
+ 
+diff --git a/src/mono/cmake/config.h.in b/src/mono/cmake/config.h.in
+index b52242112..7d2b81fc9 100644
+--- a/src/mono/cmake/config.h.in
++++ b/src/mono/cmake/config.h.in
+@@ -498,6 +498,9 @@
+ /* ... */
+ #cmakedefine TARGET_WASM 1
+ 
++/* gex: wasm with 64-bit pointers */
++#cmakedefine TARGET_WASM64 1
++
+ /* ... */
+ #cmakedefine TARGET_WASI 1
+ 
+@@ -540,6 +543,12 @@
+ /* ... */
+ #cmakedefine HOST_WASM 1
+ 
++/* gex: wasm with 64-bit pointers */
++#cmakedefine HOST_WASM64 1
++
++/* gex: wasm64 in an x86-64 Linux guest */
++#cmakedefine HOST_GEX 1
++
+ /* ... */
+ #cmakedefine HOST_BROWSER 1
+ 
+diff --git a/src/mono/mono/component/mini-wasm-debugger.c b/src/mono/mono/component/mini-wasm-debugger.c
+index 8d5fba2b6..6cc1e1aad 100644
+--- a/src/mono/mono/component/mini-wasm-debugger.c
++++ b/src/mono/mono/component/mini-wasm-debugger.c
+@@ -1,4 +1,6 @@
+ #ifndef HOST_WASI
++#include <config.h>
++#if !defined(HOST_GEX) /* gex: no browser debugger (noita-wasm docs/unity-dotnet.md) */
+ #include <glib.h>
+ #include <mono/mini/mini.h>
+ #include <mono/mini/mini-runtime.h>
+@@ -485,3 +487,5 @@ mini_wasm_debugger_add_function_pointers (MonoComponentDebugger* fn_table)
+ }
+ 
+ #endif // !HOST_WASI
++
++#endif /* !HOST_GEX */
+diff --git a/src/mono/mono/metadata/class-accessors.c b/src/mono/mono/metadata/class-accessors.c
+index 1a89c07ce..5fbcd696a 100644
+--- a/src/mono/mono/metadata/class-accessors.c
++++ b/src/mono/mono/metadata/class-accessors.c
+@@ -717,3 +717,36 @@ mono_wasm_jit_class_vtable_off (void)
+ {
+ 	return (int) G_STRUCT_OFFSET (MonoClass, vtable);
+ }
++
++#ifdef HOST_GEX
++/* gex (noita-wasm docs/unity-dotnet.md): Unity's per-class pointer. */
++void *
++gex_class_get_userdata (MonoClass *klass)
++{
++	return klass->unity_user_data;
++}
++
++void
++gex_class_set_userdata (MonoClass *klass, void *userdata)
++{
++	klass->unity_user_data = userdata;
++}
++
++int
++gex_class_get_userdata_offset (void)
++{
++	return (int)offsetof (MonoClass, unity_user_data);
++}
++
++gboolean
++gex_class_is_inited (MonoClass *klass)
++{
++	return m_class_is_inited (klass);
++}
++
++guint32
++gex_class_get_data_size (MonoClass *klass)
++{
++	return mono_class_data_size (klass);
++}
++#endif
+diff --git a/src/mono/mono/metadata/class-private-definition.h b/src/mono/mono/metadata/class-private-definition.h
+index 005cd0593..d47afef76 100644
+--- a/src/mono/mono/metadata/class-private-definition.h
++++ b/src/mono/mono/metadata/class-private-definition.h
+@@ -130,6 +130,12 @@ struct _MonoClass {
+ 	MonoPropertyBag infrequent_data;
+ 
+ 	void *variant_search_table;
++
++#ifdef HOST_GEX
++	/* gex: Unity's per-class pointer (mono_class_get/set_userdata), which
++	 * UnityPlayer also reads at its offset (mono_class_get_userdata_offset). */
++	void *unity_user_data;
++#endif
+ };
+ 
+ struct _MonoClassDef {
+diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
+index 787ca8c2f..ed1afb5a7 100644
+--- a/src/mono/mono/metadata/sgen-mono.c
++++ b/src/mono/mono/metadata/sgen-mono.c
+@@ -2221,6 +2221,18 @@ sgen_client_scan_thread_data (void *start_nursery, void *end_nursery, gboolean p
+ 				}
+ 			}
+ 		}
++#ifdef HOST_GEX
++		/* gex: the guest's frames below this thread's way into the runtime
++		 * (UnityPlayer's locals) and its registers, conservatively, as Boehm
++		 * scanned them. Every other guest thread is stopped (sgen-stw.c). */
++		if (!precise && info->client_info.info.gex_ctx) {
++			guint64 *regs = (guint64 *)(gsize)info->client_info.info.gex_ctx;
++			guint64 rsp = regs [4] & ~(guint64)7;
++			sgen_conservatively_pin_objects_from ((void **)regs, (void **)(regs + 16), start_nursery, end_nursery, PIN_TYPE_STACK);
++			if (rsp && rsp < info->client_info.info.gex_stack_end)
++				sgen_conservatively_pin_objects_from ((void **)(gsize)rsp, (void **)(gsize)info->client_info.info.gex_stack_end, start_nursery, end_nursery, PIN_TYPE_STACK);
++		}
++#endif
+ 		if (gc_callbacks.interp_mark_func) {
+ 			PinHandleStackInteriorPtrData ud;
+ 			memset (&ud, 0, sizeof (ud));
+diff --git a/src/mono/mono/metadata/sgen-stw.c b/src/mono/mono/metadata/sgen-stw.c
+index daaafba2a..b7f15460e 100644
+--- a/src/mono/mono/metadata/sgen-stw.c
++++ b/src/mono/mono/metadata/sgen-stw.c
+@@ -93,6 +93,11 @@ update_current_thread_stack (void *start)
+ }
+ MONO_RESTORE_WARNING
+ 
++#ifdef HOST_GEX
++void gexp_stop_guest_threads (void);
++void gexp_start_guest_threads (void);
++#endif
++
+ static void
+ acquire_gc_locks (void)
+ {
+@@ -157,6 +162,11 @@ sgen_client_stop_world (int generation, gboolean serial_collection)
+ 	TV_GETTIME (stop_world_time);
+ 
+ 	unified_suspend_stop_world (MONO_THREAD_INFO_FLAGS_NO_GC, sgen_client_stop_world_thread_stopped_callback);
++#ifdef HOST_GEX
++	/* gex: threads running guest code are GC-safe to Mono but still run;
++	 * stop them at their next safepoint, as Boehm stopped them. */
++	gexp_stop_guest_threads ();
++#endif
+ 
+ 	SGEN_LOG (3, "world stopped");
+ 
+@@ -204,6 +214,9 @@ sgen_client_restart_world (int generation, gboolean serial_collection, gint64 *s
+ 
+ 	TV_GETTIME (start_handshake);
+ 
++#ifdef HOST_GEX
++	gexp_start_guest_threads ();
++#endif
+ 	unified_suspend_restart_world (MONO_THREAD_INFO_FLAGS_NO_GC, sgen_client_stop_world_thread_restarted_callback);
+ 
+ 	TV_GETTIME (end_sw);
+diff --git a/src/mono/mono/mini/CMakeLists.txt b/src/mono/mono/mini/CMakeLists.txt
+index 176bbbb4f..94a52d1b6 100644
+--- a/src/mono/mono/mini/CMakeLists.txt
++++ b/src/mono/mono/mini/CMakeLists.txt
+@@ -229,7 +229,7 @@ set(posix_sources
+ 
+ if(HOST_DARWIN)
+ set(os_sources "${darwin_sources};${posix_sources}")
+-elseif(HOST_LINUX OR HOST_SOLARIS OR HOST_FREEBSD OR HOST_HAIKU)
++elseif((HOST_LINUX AND NOT HOST_GEX) OR HOST_SOLARIS OR HOST_FREEBSD OR HOST_HAIKU)
+ set(os_sources "${posix_sources}")
+ elseif(HOST_WIN32)
+ set(os_sources "${windows_sources}")
+diff --git a/src/mono/mono/mini/aot-runtime-wasm.c b/src/mono/mono/mini/aot-runtime-wasm.c
+index 1687088b1..58267dce9 100644
+--- a/src/mono/mono/mini/aot-runtime-wasm.c
++++ b/src/mono/mono/mini/aot-runtime-wasm.c
+@@ -14,6 +14,14 @@
+ 
+ #ifdef HOST_WASM
+ 
++/* gex wasm64: 'P' is a pointer-sized value, which is i64 on wasm64 and i32 on wasm32. The cookie
++ * names the callee's wasm signature, so on wasm64 it is written 'L'. */
++#if SIZEOF_VOID_P == 8
++#define WASM_PTR_C 'L'
++#else
++#define WASM_PTR_C 'I'
++#endif
++
+ static char
+ type_to_c (MonoType *t, gboolean *is_byref_return)
+ {
+@@ -22,7 +30,7 @@ type_to_c (MonoType *t, gboolean *is_byref_return)
+ 	if (is_byref_return)
+ 		*is_byref_return = 0;
+ 	if (m_type_is_byref (t))
+-		return 'I';
++		return WASM_PTR_C;
+ 
+ handle_enum:
+ 	switch (t->type) {
+@@ -34,14 +42,17 @@ handle_enum:
+ 	case MONO_TYPE_U2:
+ 	case MONO_TYPE_I4:
+ 	case MONO_TYPE_U4:
++		return 'I';
+ 	case MONO_TYPE_I:
+ 	case MONO_TYPE_U:
+ 	case MONO_TYPE_PTR:
++	case MONO_TYPE_FNPTR:
++	case MONO_TYPE_ARRAY:
+ 	case MONO_TYPE_SZARRAY:
+ 	case MONO_TYPE_CLASS:
+ 	case MONO_TYPE_OBJECT:
+ 	case MONO_TYPE_STRING:
+-		return 'I';
++		return WASM_PTR_C;
+ 	case MONO_TYPE_R4:
+ 		return 'F';
+ 	case MONO_TYPE_R8:
+@@ -69,7 +80,7 @@ handle_enum:
+ 		if (is_byref_return)
+ 			*is_byref_return = 1;
+ 
+-		return 'I';
++		return WASM_PTR_C;
+ 	}
+ 	case MONO_TYPE_GENERICINST: {
+ 		// This previously erroneously used m_type_data_get_klass which isn't legal for genericinst, we have to use class_from_mono_type_internal
+@@ -84,7 +95,7 @@ handle_enum:
+ 			return 'S';
+ 		}
+ 
+-		return 'I';
++		return WASM_PTR_C;
+ 	}
+ 	default:
+ 		g_warning ("CANT TRANSLATE %s", mono_type_full_name (t));
+@@ -105,6 +116,10 @@ typedef union {
+ static gint64
+ get_long_arg (InterpMethodArguments *margs, int idx)
+ {
++#if SIZEOF_VOID_P == 8
++	/* an I8 takes one 64-bit slot (get_build_args_from_sig_info) */
++	return (gint64)(gssize)margs->iargs [idx];
++#endif
+ 	interp_pair p;
+ 	p.pair.lo = (gint32)(gssize)margs->iargs [idx];
+ 	p.pair.hi = (gint32)(gssize)margs->iargs [idx + 1];
+@@ -171,12 +186,12 @@ mono_wasm_get_interp_to_native_trampoline (MonoMethodSignature *sig)
+ 	if (is_byref_return) {
+ 		cookie[0] = 'V';
+ 		// return value address goes in arg0
+-		cookie[1] = 'I';
++		cookie[1] = WASM_PTR_C;
+ 		offset += 1;
+ 	}
+ 	if (sig->hasthis) {
+ 		// thisptr goes in arg0/arg1 depending on return type
+-		cookie [offset] = 'I';
++		cookie [offset] = WASM_PTR_C;
+ 		offset += 1;
+ 	}
+ 	for (int i = 0; i < sig->param_count; ++i) {
+diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
+index 31c606007..14d5bdb52 100644
+--- a/src/mono/mono/mini/interp/interp.c
++++ b/src/mono/mono/mini/interp/interp.c
+@@ -5148,6 +5148,285 @@ typedef struct {
+ } WasmPInvokeCacheData;
+ #endif
+ 
++#ifdef HOST_GEX
++/*
++ * gex (noita-wasm docs/unity-dotnet.md): a native function pointer may be a
++ * guest (x86-64) address -- an internal call the guest registered, a P/Invoke
++ * resolved in the guest, a function pointer the guest handed over. Such a call
++ * is made by the guest's calling convention, through the provider's guest-call
++ * primitive (tools/unity-dotnet/provider/gexprov64.c), whose layout this
++ * mirrors. A guest that raises a managed exception (mono_raise_exception) from
++ * inside abandons its frames back to here; the exception becomes pending.
++ */
++typedef struct {
++	guint64 ireg [6];
++	guint64 xmm [8];
++	unsigned nireg, nxmm;
++	const guint64 *stack;
++	unsigned nstack;
++	int win64;
++	guint64 rax, rdx, xmm0, xmm1;
++} GexGuestCall;
++
++int gexp_is_guest_fn (guint64 p);
++guint64 gexp_call_guest_catching (guint64 fn, GexGuestCall *c);
++/* The guest's convention: Win64 in an NT process (set by the provider). */
++int gex_guest_abi_win64;
++
++#define GEX_MAX_STACK_ARGS 64
++
++typedef struct {
++	GexGuestCall c;
++	guint64 stack [GEX_MAX_STACK_ARGS];
++	int ni, nx;
++} GexArgs;
++
++static void
++gex_push_stack (GexArgs *a, guint64 v)
++{
++	g_assert (a->c.nstack < GEX_MAX_STACK_ARGS);
++	a->stack [a->c.nstack++] = v;
++}
++
++static void
++gex_add_int (GexArgs *a, guint64 v)
++{
++	if (a->c.win64) {
++		int pos = a->ni + a->nx;
++		if (pos < 4)
++			a->c.ireg [pos] = v, a->c.nireg = pos + 1;
++		else
++			gex_push_stack (a, v);
++		a->ni++;
++		return;
++	}
++	if (a->ni < 6)
++		a->c.ireg [a->ni++] = v, a->c.nireg = a->ni;
++	else
++		gex_push_stack (a, v);
++}
++
++static void
++gex_add_sse (GexArgs *a, guint64 v)
++{
++	if (a->c.win64) {
++		int pos = a->ni + a->nx;
++		if (pos < 4) {
++			a->c.xmm [pos] = v;
++			if ((unsigned)pos + 1 > a->c.nxmm)
++				a->c.nxmm = pos + 1;
++		} else {
++			gex_push_stack (a, v);
++		}
++		a->nx++;
++		return;
++	}
++	if (a->nx < 8)
++		a->c.xmm [a->nx++] = v, a->c.nxmm = a->nx;
++	else
++		gex_push_stack (a, v);
++}
++
++enum { GEX_NONE, GEX_INT, GEX_SSE };
++
++/* SysV's classification of the eightbytes of a struct of at most 16 bytes. */
++static void
++gex_classify (MonoClass *klass, int base, int cls [2])
++{
++	gpointer iter = NULL;
++	MonoClassField *f;
++	mono_class_init_internal (klass);
++	while ((f = mono_class_get_fields_internal (klass, &iter))) {
++		if (f->type->attrs & FIELD_ATTRIBUTE_STATIC)
++			continue;
++		int off = base + m_field_get_offset (f) - MONO_ABI_SIZEOF (MonoObject);
++		MonoType *t = mini_get_underlying_type (f->type);
++		if (MONO_TYPE_ISSTRUCT (t)) {
++			gex_classify (mono_class_from_mono_type_internal (t), off, cls);
++			continue;
++		}
++		int k = off / 8;
++		if (k < 0 || k > 1)
++			continue;
++		if (t->type == MONO_TYPE_R4 || t->type == MONO_TYPE_R8) {
++			if (cls [k] == GEX_NONE)
++				cls [k] = GEX_SSE;
++		} else {
++			cls [k] = GEX_INT;
++		}
++	}
++}
++
++static int
++gex_struct_size (MonoType *t, MonoMethodSignature *sig)
++{
++	MonoClass *klass = mono_class_from_mono_type_internal (t);
++	if (sig->pinvoke && !sig->marshalling_disabled)
++		return mono_class_native_size (klass, NULL);
++	return mono_class_value_size (klass, NULL);
++}
++
++static void
++gex_add_struct (GexArgs *a, MonoType *t, MonoMethodSignature *sig, guint8 *data)
++{
++	int size = gex_struct_size (t, sig);
++	if (a->c.win64) {
++		if (size == 1 || size == 2 || size == 4 || size == 8) {
++			guint64 v = 0;
++			memcpy (&v, data, size);
++			gex_add_int (a, v);
++		} else {
++			/* By reference to a copy: the interpreter's slot is already one. */
++			gex_add_int (a, (guint64)(gsize)data);
++		}
++		return;
++	}
++	int n8 = (size + 7) / 8;
++	int cls [2] = { GEX_NONE, GEX_NONE };
++	if (size <= 16)
++		gex_classify (mono_class_from_mono_type_internal (t), 0, cls);
++	int nint = 0, nsse = 0;
++	for (int k = 0; k < n8 && size <= 16; k++)
++		cls [k] == GEX_SSE ? nsse++ : nint++;
++	if (size > 16 || a->ni + nint > 6 || a->nx + nsse > 8) {
++		for (int k = 0; k < n8; k++) {
++			guint64 v = 0;
++			memcpy (&v, data + 8 * k, MIN (8, size - 8 * k));
++			gex_push_stack (a, v);
++		}
++		return;
++	}
++	for (int k = 0; k < n8; k++) {
++		guint64 v = 0;
++		memcpy (&v, data + 8 * k, MIN (8, size - 8 * k));
++		if (cls [k] == GEX_SSE)
++			gex_add_sse (a, v);
++		else
++			gex_add_int (a, v);
++	}
++}
++
++static void
++gex_add_arg (GexArgs *a, MonoType *t, MonoMethodSignature *sig, stackval *sv)
++{
++	if (m_type_is_byref (t)) {
++		gex_add_int (a, (guint64)(gsize)sv->data.p);
++		return;
++	}
++	t = mini_get_underlying_type (t);
++	switch (t->type) {
++	case MONO_TYPE_R4: {
++		guint64 v = 0;
++		memcpy (&v, &sv->data.f_r4, 4);
++		gex_add_sse (a, v);
++		break;
++	}
++	case MONO_TYPE_R8: {
++		guint64 v;
++		memcpy (&v, &sv->data.f, 8);
++		gex_add_sse (a, v);
++		break;
++	}
++	case MONO_TYPE_I1: gex_add_int (a, (guint64)(gint64)(gint8)sv->data.i); break;
++	case MONO_TYPE_U1: case MONO_TYPE_BOOLEAN: gex_add_int (a, (guint8)sv->data.i); break;
++	case MONO_TYPE_I2: gex_add_int (a, (guint64)(gint64)(gint16)sv->data.i); break;
++	case MONO_TYPE_U2: case MONO_TYPE_CHAR: gex_add_int (a, (guint16)sv->data.i); break;
++	case MONO_TYPE_I4: gex_add_int (a, (guint64)(gint64)sv->data.i); break;
++	case MONO_TYPE_U4: gex_add_int (a, (guint32)sv->data.i); break;
++	case MONO_TYPE_VALUETYPE:
++	case MONO_TYPE_GENERICINST:
++	case MONO_TYPE_TYPEDBYREF:
++		if (MONO_TYPE_ISSTRUCT (t)) {
++			gex_add_struct (a, t, sig, (guint8 *)sv);
++			break;
++		}
++		/* fall through */
++	default:
++		gex_add_int (a, (guint64)sv->data.l);
++		break;
++	}
++}
++
++/* Call the guest function `addr` with the arguments the interpreter frame
++ * holds by `sig`, and store its result as the frame's return value. */
++static void
++gex_interp_call_guest (MonoMethodSignature *sig, gpointer addr, InterpFrame *frame)
++{
++	GexArgs a;
++	memset (&a, 0, sizeof (a));
++	a.c.win64 = gex_guest_abi_win64;
++	a.c.stack = a.stack;
++	MonoType *ret = mini_get_underlying_type (sig->ret);
++	int ret_struct = !m_type_is_byref (sig->ret) && MONO_TYPE_ISSTRUCT (ret);
++	int ret_size = ret_struct ? gex_struct_size (ret, sig) : 0;
++	int ret_cls [2] = { GEX_NONE, GEX_NONE };
++	int ret_mem = 0;
++	if (ret_struct) {
++		if (a.c.win64) {
++			ret_mem = !(ret_size == 1 || ret_size == 2 || ret_size == 4 || ret_size == 8);
++		} else {
++			ret_mem = ret_size > 16;
++			if (!ret_mem)
++				gex_classify (mono_class_from_mono_type_internal (ret), 0, ret_cls);
++		}
++		if (ret_mem)
++			gex_add_int (&a, (guint64)(gsize)frame->retval);
++	}
++	g_assert (!sig->hasthis);
++	for (int i = 0; i < sig->param_count; i++) {
++		stackval *sv = STACK_ADD_BYTES (frame->stack, get_arg_offset (frame->imethod, sig, i));
++		gex_add_arg (&a, sig->params [i], sig, sv);
++	}
++	guint64 raised = gexp_call_guest_catching ((guint64)(gsize)addr, &a.c);
++	if (raised) {
++		if (raised != 1)
++			mono_set_pending_exception ((MonoException *)(gsize)raised);
++		return;
++	}
++	if (MONO_TYPE_IS_VOID (sig->ret) || ret_mem)
++		return;
++	if (ret_struct) {
++		guint64 out [2];
++		int ii = 0, ss = 0;
++		guint64 ints [2] = { a.c.rax, a.c.rdx }, sses [2] = { a.c.xmm0, a.c.xmm1 };
++		for (int k = 0; k < (ret_size + 7) / 8; k++)
++			out [k] = (!a.c.win64 && ret_cls [k] == GEX_SSE) ? sses [ss++] : ints [ii++];
++		memcpy (frame->retval, out, ret_size);
++		return;
++	}
++	guint64 buf;
++	if (ret->type == MONO_TYPE_R4 || ret->type == MONO_TYPE_R8)
++		buf = a.c.xmm0;
++	else
++		buf = a.c.rax;
++	stackval_from_data (sig->ret, frame->retval, &buf, sig->pinvoke && !sig->marshalling_disabled);
++}
++
++/* An internal call (do_icall's signatures: pointer-sized arguments and
++ * result) to a guest function. */
++static void
++gex_icall_guest (MonoMethodSignature *sig, stackval *ret_sp, stackval *sp, gpointer ptr)
++{
++	GexArgs a;
++	memset (&a, 0, sizeof (a));
++	a.c.win64 = gex_guest_abi_win64;
++	a.c.stack = a.stack;
++	int n = sig->param_count + sig->hasthis;
++	for (int i = 0; i < n; i++)
++		gex_add_int (&a, (guint64)(gsize)sp [i].data.p);
++	guint64 raised = gexp_call_guest_catching ((guint64)(gsize)ptr, &a.c);
++	if (raised) {
++		if (raised != 1)
++			mono_set_pending_exception ((MonoException *)(gsize)raised);
++		return;
++	}
++	if (!MONO_TYPE_IS_VOID (sig->ret))
++		ret_sp->data.p = (gpointer)(gsize)a.c.rax;
++}
++#endif /* HOST_GEX */
++
++
++
+ /* MONO_NO_OPTIMIZATION is needed due to usage of INTERP_PUSH_LMF_WITH_CTX. */
+ #ifdef _MSC_VER
+ #pragma optimize ("", off)
+@@ -5177,6 +5456,27 @@ ves_pinvoke_method (
+ 
+ 	MONO_REQ_GC_UNSAFE_MODE;
+ 
++#ifdef HOST_GEX
++	if (gexp_is_guest_fn ((guint64)(gsize)addr)) {
++		if (save_last_error)
++			mono_marshal_clear_last_error ();
++		INTERP_PUSH_LMF_WITH_CTX (&frame, ext, exit_pinvoke);
++		if (*gc_transitions) {
++			MONO_STACKDATA (stack_data);
++			gc_safe_cookie = mono_threads_enter_gc_safe_region_internal (&stack_data);
++			gex_interp_call_guest (sig, (gpointer)addr, &frame);
++			mono_threads_exit_gc_safe_region_internal (gc_safe_cookie, &stack_data);
++			*gc_transitions = FALSE;
++		} else {
++			gex_interp_call_guest (sig, (gpointer)addr, &frame);
++		}
++		if (save_last_error)
++			mono_marshal_set_last_error ();
++		interp_pop_lmf (&ext);
++		goto exit_pinvoke;
++	}
++#endif
++
+ #ifdef HOST_WASM
+ 	/*
+ 	 * Use a per-signature entry function.
+@@ -9320,6 +9620,15 @@ do_icall (MonoMethodSignature *sig, MintICallSig op, stackval *ret_sp, stackval
+ 	if (save_last_error)
+ 		mono_marshal_clear_last_error ();
+ 
++#ifdef HOST_GEX
++	if (gexp_is_guest_fn ((guint64)(gsize)ptr)) {
++		gex_icall_guest (sig, ret_sp, sp, ptr);
++		if (save_last_error)
++			mono_marshal_set_last_error ();
++		return;
++	}
++#endif
++
+ 	switch (op) {
+ 	case MINT_ICALLSIG_V_V: {
+ 		typedef void (*T)(void);
+@@ -10384,6 +10693,158 @@ interp_entry_general (gpointer this_arg, gpointer res, gpointer *args, gpointer
+ 	interp_entry (&data);
+ }
+ 
++#ifdef HOST_GEX
++/*
++ * gex: guest code calling a managed function through a function pointer
++ * (a delegate's, an [UnmanagedCallersOnly] method's): the provider's reverse
++ * adapter hands over the guest's argument registers and stack, by the guest's
++ * ABI; the native-to-managed wrapper `imethod` (of native signature `sig`)
++ * runs on the interpreter, and its result goes back in rax/rdx/xmm0/xmm1.
++ */
++typedef struct {
++	int ni, nx, nstack;
++	GexGuestCall *c;
++} GexArgsIn;
++
++static guint64
++gex_take_int (GexArgsIn *a)
++{
++	if (a->c->win64) {
++		int pos = a->ni + a->nx;
++		a->ni++;
++		return pos < 4 ? a->c->ireg [pos] : a->c->stack [a->nstack++];
++	}
++	return a->ni < 6 ? a->c->ireg [a->ni++] : a->c->stack [a->nstack++];
++}
++
++static guint64
++gex_take_sse (GexArgsIn *a)
++{
++	if (a->c->win64) {
++		int pos = a->ni + a->nx;
++		a->nx++;
++		return pos < 4 ? a->c->xmm [pos] : a->c->stack [a->nstack++];
++	}
++	return a->nx < 8 ? a->c->xmm [a->nx++] : a->c->stack [a->nstack++];
++}
++
++/* The native signature of the native-to-managed wrapper an InterpMethod runs. */
++MonoMethodSignature *
++gex_interp_method_signature (gpointer imethod)
++{
++	return mono_method_signature_internal (((InterpMethod *)imethod)->method);
++}
++
++void
++gex_interp_native_to_managed (MonoMethodSignature *sig, gpointer imethod, GexGuestCall *c)
++{
++	GexArgsIn a = { 0, 0, 0, c };
++	int n = sig->param_count;
++	guint64 *vals = g_newa (guint64, n * 4 + 1);
++	gpointer *args = g_newa (gpointer, n + 1);
++	MonoType *ret = mini_get_underlying_type (sig->ret);
++	int ret_struct = !m_type_is_byref (sig->ret) && MONO_TYPE_ISSTRUCT (ret);
++	int ret_size = ret_struct ? gex_struct_size (ret, sig) : 0;
++	int ret_cls [2] = { GEX_NONE, GEX_NONE };
++	gpointer ret_mem = NULL;
++	if (ret_struct) {
++		int mem = c->win64 ? !(ret_size == 1 || ret_size == 2 || ret_size == 4 || ret_size == 8) : ret_size > 16;
++		if (mem)
++			ret_mem = (gpointer)(gsize)gex_take_int (&a);
++		else if (!c->win64)
++			gex_classify (mono_class_from_mono_type_internal (ret), 0, ret_cls);
++	}
++	g_assert (!sig->hasthis);
++	for (int i = 0; i < n; i++) {
++		guint64 *v = vals + 4 * i;
++		MonoType *t = sig->params [i];
++		args [i] = v;
++		if (m_type_is_byref (t)) {
++			v [0] = gex_take_int (&a);
++			continue;
++		}
++		t = mini_get_underlying_type (t);
++		if (t->type == MONO_TYPE_R4 || t->type == MONO_TYPE_R8) {
++			v [0] = gex_take_sse (&a);
++			continue;
++		}
++		if (MONO_TYPE_ISSTRUCT (t)) {
++			int size = gex_struct_size (t, sig);
++			if (c->win64) {
++				if (size == 1 || size == 2 || size == 4 || size == 8) {
++					v [0] = gex_take_int (&a);
++				} else {
++					args [i] = (gpointer)(gsize)gex_take_int (&a); /* by reference */
++				}
++				continue;
++			}
++			int n8 = (size + 7) / 8;
++			int cls [2] = { GEX_NONE, GEX_NONE };
++			if (size <= 16)
++				gex_classify (mono_class_from_mono_type_internal (t), 0, cls);
++			int nint = 0, nsse = 0;
++			for (int k = 0; k < n8 && size <= 16; k++)
++				cls [k] == GEX_SSE ? nsse++ : nint++;
++			if (size > 16 || a.ni + nint > 6 || a.nx + nsse > 8) {
++				args [i] = (gpointer)(c->stack + a.nstack); /* in memory, on the guest stack */
++				a.nstack += n8;
++				continue;
++			}
++			for (int k = 0; k < n8; k++)
++				v [k] = cls [k] == GEX_SSE ? gex_take_sse (&a) : gex_take_int (&a);
++			continue;
++		}
++		v [0] = gex_take_int (&a);
++	}
++	guint64 res [64];
++	memset (res, 0, 16);
++	gpointer resp = ret_mem ? ret_mem : (gpointer)res;
++	g_assert (ret_mem || ret_size <= (int)sizeof (res));
++	interp_entry_general (NULL, resp, args, imethod);
++	c->rax = c->rdx = c->xmm0 = c->xmm1 = 0;
++	if (MONO_TYPE_IS_VOID (sig->ret))
++		return;
++	if (ret_mem) {
++		c->rax = (guint64)(gsize)ret_mem;
++		return;
++	}
++	if (ret_struct) {
++		guint64 parts [2] = { 0, 0 };
++		memcpy (parts, res, ret_size);
++		if (c->win64) {
++			c->rax = parts [0];
++			return;
++		}
++		int ii = 0, ss = 0;
++		for (int k = 0; k < (ret_size + 7) / 8; k++) {
++			if (ret_cls [k] == GEX_SSE)
++				*(ss++ ? &c->xmm1 : &c->xmm0) = parts [k];
++			else
++				*(ii++ ? &c->rdx : &c->rax) = parts [k];
++		}
++		return;
++	}
++	if (ret->type == MONO_TYPE_R4) {
++		c->xmm0 = res [0] & 0xffffffffu;
++		return;
++	}
++	if (ret->type == MONO_TYPE_R8) {
++		c->xmm0 = res [0];
++		return;
++	}
++	/* res holds the value at its own size; widen as the guest's ABI allows */
++	switch (ret->type) {
++	case MONO_TYPE_I1: c->rax = (guint64)(gint64)*(gint8 *)res; break;
++	case MONO_TYPE_U1: case MONO_TYPE_BOOLEAN: c->rax = *(guint8 *)res; break;
++	case MONO_TYPE_I2: c->rax = (guint64)(gint64)*(gint16 *)res; break;
++	case MONO_TYPE_U2: case MONO_TYPE_CHAR: c->rax = *(guint16 *)res; break;
++	case MONO_TYPE_I4: c->rax = (guint64)(gint64)*(gint32 *)res; break;
++	case MONO_TYPE_U4: c->rax = *(guint32 *)res; break;
++	default: c->rax = res [0]; break;
++	}
++}
++#endif /* HOST_GEX */
++
+ #ifdef MONO_ARCH_HAVE_INTERP_ENTRY_TRAMPOLINE
+ 
+ // Do not inline in case order of frame addresses matters.
+diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
+index 3dea312b7..222536c07 100644
+--- a/src/mono/mono/mini/interp/jiterpreter.c
++++ b/src/mono/mono/mini/interp/jiterpreter.c
+@@ -1592,7 +1592,7 @@ atomically_set_value_once (gint32 *address, gint32 value) {
+ 	*address = value;
+ #else
+ 	gint32 expected = 0;
+-	static_assert (sizeof(atomic_int) == sizeof(address) && ATOMIC_INT_LOCK_FREE == 2, "");
++	static_assert (sizeof(atomic_int) == sizeof(*address) && ATOMIC_INT_LOCK_FREE == 2, "");
+ 	if (atomic_compare_exchange_strong ((atomic_int *)address, &expected, value))
+ 		return;
+ 	if (expected == value)
+@@ -1776,7 +1776,7 @@ mono_jiterp_increment_counter (volatile int *counter) {
+ 	*counter = result + 1;
+ 	return result;
+ #else
+-	static_assert (sizeof (atomic_int) == sizeof(counter) && ATOMIC_INT_LOCK_FREE == 2, "");
++	static_assert (sizeof (atomic_int) == sizeof(*counter) && ATOMIC_INT_LOCK_FREE == 2, "");
+ 	return atomic_fetch_add ((atomic_int *)counter, 1);
+ #endif
+ }
+diff --git a/src/mono/mono/mini/interp/transform.c b/src/mono/mono/mini/interp/transform.c
+index 98dfc77ca..f35f8313e 100644
+--- a/src/mono/mono/mini/interp/transform.c
++++ b/src/mono/mono/mini/interp/transform.c
+@@ -2867,6 +2867,22 @@ is_scalar_vtype (MonoType *type)
+ static gboolean
+ interp_type_as_ptr (MonoType *tp)
+ {
++#if defined(HOST_WASM) && SIZEOF_VOID_P == 8
++	/* gex wasm64: the fast icall path calls through a C type whose arguments are all gpointer (i64).
++	 * Only types whose wasm value type is i64 may take it; an int32 is i32 in the callee's signature. */
++	if (MONO_TYPE_IS_POINTER (tp) || MONO_TYPE_IS_REFERENCE (tp))
++		return TRUE;
++	switch (tp->type) {
++	case MONO_TYPE_I: case MONO_TYPE_U: case MONO_TYPE_I8: case MONO_TYPE_U8: case MONO_TYPE_FNPTR:
++		return TRUE;
++	case MONO_TYPE_VALUETYPE:
++		if (m_class_is_enumtype (m_type_data_get_klass_unchecked (tp)))
++			return interp_type_as_ptr (mono_class_enum_basetype_internal (m_type_data_get_klass_unchecked (tp)));
++		return is_scalar_vtype (tp);
++	default:
++		return FALSE;
++	}
++#endif
+ 	if (MONO_TYPE_IS_POINTER (tp))
+ 		return TRUE;
+ 	if (MONO_TYPE_IS_REFERENCE (tp))
+diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
+index eb3a8f55a..f6777a63c 100644
+--- a/src/mono/mono/mini/mini-wasm.c
++++ b/src/mono/mono/mini/mini-wasm.c
+@@ -5596,7 +5596,7 @@ mono_arch_context_get_int_reg_address (MonoContext *ctx, int reg)
+ 	return 0;
+ }
+ 
+-#if defined(HOST_BROWSER) || defined(HOST_WASI)
++#if defined(HOST_BROWSER) || defined(HOST_WASI) || defined(HOST_GEX)
+ 
+ void
+ mono_runtime_install_handlers (void)
+@@ -5611,7 +5611,7 @@ mono_init_native_crash_info (void)
+ 
+ #endif
+ 
+-#ifdef HOST_BROWSER
++#if defined(HOST_BROWSER) || defined(HOST_GEX)
+ 
+ void
+ mono_runtime_setup_stat_profiler (void)
+diff --git a/src/mono/mono/sgen/sgen-alloc.c b/src/mono/mono/sgen/sgen-alloc.c
+index 5afa90dda..b80eaa9c6 100644
+--- a/src/mono/mono/sgen/sgen-alloc.c
++++ b/src/mono/mono/sgen/sgen-alloc.c
+@@ -185,6 +185,14 @@ sgen_alloc_obj_nolock (GCVTable vtable, size_t size)
+ 		if (p) {
+ 			increment_thread_allocation_counter (size);
+ 		}
++#ifdef HOST_GEX
++	} else if (1) {
++		/* gex (noita-wasm docs/unity-dotnet.md): Boehm-like, as Unity's native
++		 * code expects -- nothing moves, every collection is a full mark, so a
++		 * raw object pointer or a store without a write barrier from guest
++		 * code stays valid. No nursery: straight into the major heap. */
++		return alloc_degraded (vtable, size, TRUE);
++#endif
+ 	} else {
+ 		/* tlab_next and tlab_temp_end are TLS vars so accessing them might be expensive */
+ 
+@@ -337,6 +345,10 @@ sgen_try_alloc_obj_nolock (GCVTable vtable, size_t size)
+ 	if (real_size > SGEN_MAX_SMALL_OBJ_SIZE)
+ 		return NULL;
+ 
++#ifdef HOST_GEX
++	return NULL; /* no nursery (sgen_alloc_obj_nolock) */
++#endif
++
+ 	if (G_UNLIKELY (size > sgen_tlab_size)) {
+ 		/* Allocate directly from the nursery */
+ 
+diff --git a/src/mono/mono/sgen/sgen-marksweep.c b/src/mono/mono/sgen/sgen-marksweep.c
+index c74ff69af..b1785d173 100644
+--- a/src/mono/mono/sgen/sgen-marksweep.c
++++ b/src/mono/mono/sgen/sgen-marksweep.c
+@@ -184,7 +184,12 @@ static int fast_block_obj_size_indexes [MS_NUM_FAST_BLOCK_OBJ_SIZE_INDEXES];
+ #define MS_BLOCK_TYPE_MAX	4
+ 
+ static gboolean *evacuate_block_obj_sizes;
++#ifdef HOST_GEX
++/* gex: nothing moves (Boehm-like, sgen-alloc.c) */
++static float evacuation_threshold = 0.0f;
++#else
+ static float evacuation_threshold = 0.666f;
++#endif
+ 
+ static gboolean lazy_sweep = TRUE;
+ 
+diff --git a/src/mono/mono/utils/CMakeLists.txt b/src/mono/mono/utils/CMakeLists.txt
+index 8c124a1aa..921e9e8c7 100644
+--- a/src/mono/mono/utils/CMakeLists.txt
++++ b/src/mono/mono/utils/CMakeLists.txt
+@@ -130,6 +130,7 @@ set(utils_common_sources
+     mono-threads-aix.c
+     mono-threads-wasm.h
+     mono-threads-wasm.c
++    mono-threads-gex.c
+     mono-threads-sunos.c
+     mono-threads.h
+     mono-threads-debug.h
+diff --git a/src/mono/mono/utils/mono-dl-posix.c b/src/mono/mono/utils/mono-dl-posix.c
+index 0da305efe..f2dfc86f0 100644
+--- a/src/mono/mono/utils/mono-dl-posix.c
++++ b/src/mono/mono/utils/mono-dl-posix.c
+@@ -15,7 +15,7 @@
+ #include <unistd.h>
+ #endif
+ 
+-#if defined(_POSIX_VERSION) && !defined (HOST_WASM)
++#if defined(_POSIX_VERSION) && (!defined (HOST_WASM) || defined (HOST_GEX))
+ 
+ #include "mono/utils/mono-dl.h"
+ #include "mono/utils/mono-path.h"
+diff --git a/src/mono/mono/utils/mono-dl-wasm.c b/src/mono/mono/utils/mono-dl-wasm.c
+index e601c3f96..f147abce5 100644
+--- a/src/mono/mono/utils/mono-dl-wasm.c
++++ b/src/mono/mono/utils/mono-dl-wasm.c
+@@ -2,7 +2,7 @@
+ #include <mono/utils/mono-compiler.h>
+ #include <mono/eglib/glib.h>
+ 
+-#if defined (HOST_WASM)
++#if defined (HOST_WASM) && !defined (HOST_GEX)
+ 
+ #include "mono/utils/mono-dl.h"
+ #include "mono/utils/mono-path.h"
+diff --git a/src/mono/mono/utils/mono-dl.c b/src/mono/mono/utils/mono-dl.c
+index cc4578b2c..9ab6821dd 100644
+--- a/src/mono/mono/utils/mono-dl.c
++++ b/src/mono/mono/utils/mono-dl.c
+@@ -135,7 +135,13 @@ mono_dl_open_full (const char *name, int mono_flags, int native_flags, MonoError
+ 	ERROR_DECL (load_error);
+ 
+ 	// No GC safe transition because this is called early in main.c
++#ifdef HOST_GEX
++	/* gex: native libraries are the guest's (or linked into the provider),
++	 * so every load goes to the fallback handlers the provider installs. */
++	lib = NULL;
++#else
+ 	lib = mono_dl_open_file (name, lflags, load_error);
++#endif
+ 
+ 	if (!lib && !is_ok (load_error) && mono_error_get_error_code (load_error) == MONO_ERROR_BAD_IMAGE) {
+ 		char *error_msg = mono_dl_current_error_string ();
+diff --git a/src/mono/mono/utils/mono-mmap-wasm.c b/src/mono/mono/utils/mono-mmap-wasm.c
+index b2ca24cd6..dd481e0dc 100644
+--- a/src/mono/mono/utils/mono-mmap-wasm.c
++++ b/src/mono/mono/utils/mono-mmap-wasm.c
+@@ -1,7 +1,7 @@
+ 
+ #include <config.h>
+ 
+-#ifdef HOST_WASM
++#if defined(HOST_WASM) && !defined(HOST_GEX)
+ 
+ #include <sys/types.h>
+ #if HAVE_SYS_STAT_H
+diff --git a/src/mono/mono/utils/mono-mmap.c b/src/mono/mono/utils/mono-mmap.c
+index 09af6f899..c96f1f40f 100644
+--- a/src/mono/mono/utils/mono-mmap.c
++++ b/src/mono/mono/utils/mono-mmap.c
+@@ -129,7 +129,7 @@ mono_mem_account_register_counters (void)
+ // Windows specific implementation in mono-mmap-windows.c
+ #define HAVE_VALLOC_ALIGNED
+ 
+-#elif defined(HOST_WASM)
++#elif defined(HOST_WASM) && !defined(HOST_GEX)
+ // WebAssembly implementation in mono-mmap-wasm.c
+ #define HAVE_VALLOC_ALIGNED
+ 
+@@ -376,7 +376,7 @@ mono_file_map_error (size_t length, int flags, int fd, guint64 offset, void **re
+ #ifdef HOST_WASM
+ 	if (length == 0)
+ 		/* emscripten throws an exception on 0 length */
+-		*error_message = g_stdrup_printf ("%s failed file:%s length:0x%" G_GSIZE_FORMAT "x offset:0x%" PRIu64 "X error:%s\n",
++		*error_message = g_strdup_printf ("%s failed file:%s length:0x%" G_GSIZE_FORMAT "x offset:0x%" PRIu64 "X error:%s\n",
+ 			__func__, filepath ? filepath : "", length, (guint64)offset, "mmaps of zero length are not permitted with emscripten");
+ 		return NULL;
+ #endif
+diff --git a/src/mono/mono/utils/mono-threads-gex.c b/src/mono/mono/utils/mono-threads-gex.c
+new file mode 100644
+index 000000000..0036d0da9
+--- /dev/null
++++ b/src/mono/mono/utils/mono-threads-gex.c
+@@ -0,0 +1,65 @@
++/**
++ * \file
++ * gex (noita-wasm docs/unity-dotnet.md): Mono as wasm64 inside an x86-64
++ * Linux guest. Threads are POSIX threads (mono-threads-posix.c, musl's
++ * pthreads over gex-kernel's clone and futex); suspension is cooperative
++ * only, as on every wasm host: no signal can interrupt wasm code.
++ */
++
++#include "config.h"
++
++#include <mono/utils/mono-threads.h>
++#include <mono/utils/mono-threads-coop.h>
++
++#if defined (USE_GEX_BACKEND)
++
++void
++mono_threads_suspend_init_signals (void)
++{
++}
++
++void
++mono_threads_suspend_init (void)
++{
++	g_assert (mono_threads_is_cooperative_suspension_enabled ());
++}
++
++/* From the provider (gexprov64.c): this guest thread's context and the end
++ * of its guest stack. */
++void gexp_thread_guest_info (guint64 *ctx, guint64 *stack_end);
++
++void
++mono_threads_suspend_register (MonoThreadInfo *info)
++{
++	gexp_thread_guest_info (&info->gex_ctx, &info->gex_stack_end);
++}
++
++void
++mono_threads_suspend_free (MonoThreadInfo *info)
++{
++}
++
++gboolean
++mono_threads_suspend_begin_async_suspend (MonoThreadInfo *info, gboolean interrupt_kernel)
++{
++	return TRUE;
++}
++
++gboolean
++mono_threads_suspend_check_suspend_result (MonoThreadInfo *info)
++{
++	return TRUE;
++}
++
++gboolean
++mono_threads_suspend_begin_async_resume (MonoThreadInfo *info)
++{
++	return TRUE;
++}
++
++void
++mono_threads_suspend_abort_syscall (MonoThreadInfo *info)
++{
++}
++
++#endif /* USE_GEX_BACKEND */
+diff --git a/src/mono/mono/utils/mono-threads-posix.c b/src/mono/mono/utils/mono-threads-posix.c
+index fa1899390..fda4bfa37 100644
+--- a/src/mono/mono/utils/mono-threads-posix.c
++++ b/src/mono/mono/utils/mono-threads-posix.c
+@@ -36,7 +36,7 @@
+ 
+ #include <errno.h>
+ 
+-#if defined(_POSIX_VERSION) && !defined (HOST_WASM)
++#if defined(_POSIX_VERSION) && (!defined (HOST_WASM) || defined (HOST_GEX))
+ 
+ #include <pthread.h>
+ 
+diff --git a/src/mono/mono/utils/mono-threads-wasm.S b/src/mono/mono/utils/mono-threads-wasm.S
+index 8752b03f1..186f92830 100644
+--- a/src/mono/mono/utils/mono-threads-wasm.S
++++ b/src/mono/mono/utils/mono-threads-wasm.S
+@@ -1,6 +1,23 @@
+ .globl get_wasm_stack_low
+ .globl get_wasm_stack_high
+ 
++#ifdef __wasm64__
++/* gex: wasm64 (memory64): addresses are i64 */
++get_wasm_stack_low:
++  .functype get_wasm_stack_low () -> (i64)
++  global.get __stack_low@GOT
++  // align up to 16 bytes
++  i64.const 0xF
++  i64.add
++  i64.const -0x10
++  i64.and
++  end_function
++
++get_wasm_stack_high:
++  .functype get_wasm_stack_high () -> (i64)
++  global.get __stack_high@GOT
++  end_function
++#else
+ get_wasm_stack_low:
+   .functype get_wasm_stack_low () -> (i32)
+   global.get __stack_low@GOT
+@@ -15,3 +32,4 @@ get_wasm_stack_high:
+   .functype get_wasm_stack_high () -> (i32)
+   global.get __stack_high@GOT
+   end_function
++#endif
+diff --git a/src/mono/mono/utils/mono-threads-wasm.h b/src/mono/mono/utils/mono-threads-wasm.h
+index 64fbd11a2..5f5597581 100644
+--- a/src/mono/mono/utils/mono-threads-wasm.h
++++ b/src/mono/mono/utils/mono-threads-wasm.h
+@@ -11,7 +11,7 @@
+ #include <glib.h>
+ #include <mono/utils/mono-threads.h>
+ 
+-#ifdef HOST_WASM
++#if defined(HOST_WASM) && !defined(HOST_GEX)
+ 
+ /*
+  * declared in mono-threads.h
+@@ -105,6 +105,6 @@ mono_threads_wasm_on_thread_unregistered (void);
+ void
+ mono_wasm_pthread_set_name (const char* thread_name);
+ 
+-#endif /* HOST_WASM*/
++#endif /* HOST_WASM && !HOST_GEX */
+ 
+ #endif /* __MONO_THREADS_WASM_H__ */
+diff --git a/src/mono/mono/utils/mono-threads.h b/src/mono/mono/utils/mono-threads.h
+index 44f2535fb..499b1f71f 100644
+--- a/src/mono/mono/utils/mono-threads.h
++++ b/src/mono/mono/utils/mono-threads.h
+@@ -128,7 +128,9 @@ and reduce the number of casts drastically.
+ /* If this is defined, use the signals backed on Mach. Debug only as signals can't be made usable on OSX. */
+ // #define USE_SIGNALS_ON_MACH
+ 
+-#ifdef HOST_WASM
++#if defined(HOST_GEX)
++#define USE_GEX_BACKEND
++#elif defined(HOST_WASM)
+ #define USE_WASM_BACKEND
+ #elif defined (_POSIX_VERSION)
+ #if defined (__MACH__) && !defined (USE_SIGNALS_ON_MACH)
+@@ -312,6 +314,14 @@ typedef struct _MonoThreadInfo {
+ 	 * TODO support multiple values by multiple tools
+ 	 */
+ 	void *tools_data;
++
++#ifdef HOST_GEX
++	/* gex: the guest thread's register context (its address) and the end of
++	 * its guest stack: conservative roots (sgen-mono.c). Set when the thread
++	 * registers (mono-threads-gex.c). */
++	guint64 gex_ctx;
++	guint64 gex_stack_end;
++#endif
+ } MonoThreadInfo;
+ 
+ typedef struct {
+@@ -893,7 +903,7 @@ mono_win32_abort_blocking_io_call (THREAD_INFO_TYPE *info);
+ 		if (GetLastError () != _last_error_restore_point) \
+ 			mono_SetLastError (_last_error_restore_point);
+ 
+-#elif defined(USE_WASM_BACKEND) || defined (USE_POSIX_BACKEND)
++#elif defined(USE_WASM_BACKEND) || defined (USE_POSIX_BACKEND) || defined (USE_GEX_BACKEND)
+ 
+ #define MONO_DEFINE_LAST_ERROR_RESTORE_POINT     \
+ 	int _last_errno_restore_point = errno;
+diff --git a/src/native/libs/CMakeLists.txt b/src/native/libs/CMakeLists.txt
+index cf8b2b47f..e11de6c65 100644
+--- a/src/native/libs/CMakeLists.txt
++++ b/src/native/libs/CMakeLists.txt
+@@ -146,10 +146,13 @@ if (CLR_CMAKE_TARGET_UNIX OR CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
+     endif ()
+ 
+     add_subdirectory(System.Native)
+-    add_subdirectory(System.Globalization.Native)
++    if (NOT GEX_NO_GLOBALIZATION_NATIVE)
++        # gex (noita-wasm docs/unity-dotnet.md) runs invariant globalization: no ICU.
++        add_subdirectory(System.Globalization.Native)
++    endif()
+ 
+-    if (CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI)
+-        # skip for now
++    if (CLR_CMAKE_TARGET_BROWSER OR CLR_CMAKE_TARGET_WASI OR GEX_NO_GLOBALIZATION_NATIVE)
++        # skip for now (gex: no Kerberos or OpenSSL in the provider either)
+     elseif (CLR_CMAKE_TARGET_APPLE)
+         if (NOT CLR_CMAKE_TARGET_TVOS) # no gssapi on tvOS, see https://developer.apple.com/documentation/gss
+             add_subdirectory(System.Net.Security.Native)

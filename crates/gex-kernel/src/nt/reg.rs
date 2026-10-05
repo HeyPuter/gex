@@ -30,9 +30,9 @@ pub struct Value {
 #[derive(Debug)]
 pub struct Key {
     /// The last path component, as created.
-    pub name: Vec<u16>,
-    /// The full path, `\Registry\Machine\…`.
-    pub path: String,
+    pub name: Mutex<Vec<u16>>,
+    /// The full path, `\Registry\Machine\…`. Both change on NtRenameKey.
+    pub path: Mutex<String>,
     pub class: Mutex<Vec<u16>>,
     pub children: Mutex<BTreeMap<String, Arc<Key>>>,
     pub values: Mutex<Vec<Value>>,
@@ -41,8 +41,8 @@ pub struct Key {
 impl Key {
     fn new(name: &str, path: String) -> Arc<Key> {
         Arc::new(Key {
-            name: to_w(name),
-            path,
+            name: Mutex::new(to_w(name)),
+            path: Mutex::new(path),
             class: Mutex::new(Vec::new()),
             children: Mutex::new(BTreeMap::new()),
             values: Mutex::new(Vec::new()),
@@ -58,7 +58,7 @@ impl Key {
         if let Some(k) = ch.get(&name.to_lowercase()) {
             return (Arc::clone(k), false);
         }
-        let k = Key::new(name, format!("{}\\{}", self.path, name));
+        let k = Key::new(name, format!("{}\\{}", self.path.lock().unwrap(), name));
         ch.insert(name.to_lowercase(), Arc::clone(&k));
         (k, true)
     }
@@ -136,6 +136,37 @@ impl Registry {
         cv.set_sz("ProductName", "Windows 10 Pro");
         cv.set_sz("CSDVersion", "");
         cv.set_sz("SystemRoot", "C:\\windows");
+        self.seed_crypto_providers();
+    }
+
+    /// rsaenh's registration (dlls/rsaenh/rsaenh.rgs), which a Wine prefix
+    /// gets from wineboot running `regsvr32 rsaenh.dll`. Without it
+    /// CryptAcquireContext finds no provider, and crypt32's root store,
+    /// which ignores that failure, releases an uninitialised handle.
+    fn seed_crypto_providers(&self) {
+        const BASE: &str = "Machine\\Software\\Microsoft\\Cryptography\\Defaults";
+        for (name, ty) in [
+            ("Microsoft Base Cryptographic Provider v1.0", 1),
+            ("Microsoft Enhanced Cryptographic Provider v1.0", 1),
+            ("Microsoft Enhanced RSA and AES Cryptographic Provider", 24),
+            ("Microsoft Enhanced RSA and AES Cryptographic Provider (Prototype)", 24),
+            ("Microsoft RSA SChannel Cryptographic Provider", 12),
+            ("Microsoft Strong Cryptographic Provider", 1),
+        ] {
+            let k = self.create(&format!("{BASE}\\Provider\\{name}"));
+            k.set_sz("Image Path", "C:\\windows\\system32\\rsaenh.dll");
+            k.set("Signature", types::BINARY, vec![0xde, 0xad, 0xbe, 0xef]);
+            k.set_dword("Type", ty);
+        }
+        for (ty, name, type_name) in [
+            ("001", "Microsoft Enhanced Cryptographic Provider v1.0", "RSA Full (Signature and Key Exchange)"),
+            ("012", "Microsoft RSA SChannel Cryptographic Provider", "RSA SChannel"),
+            ("024", "Microsoft Enhanced RSA and AES Cryptographic Provider", "RSA Full and AES"),
+        ] {
+            let k = self.create(&format!("{BASE}\\Provider Types\\Type {ty}"));
+            k.set_sz("Name", name);
+            k.set_sz("TypeName", type_name);
+        }
     }
 }
 
@@ -209,6 +240,61 @@ pub fn nt_open_key(c: &mut Call<'_>) -> R {
 pub fn nt_open_key_ex(c: &mut Call<'_>) -> R {
     let (hp, access, attr_p) = (c.a(0), c.a32(1), c.a(2));
     open_key(c, hp, access, attr_p)
+}
+
+/// `NtNotifyChangeKey(key, event, apc, apc_ctx, iosb, filter, subtree, buf,
+/// len, asynchronous)` (RegNotifyChangeKeyValue; crypt32 watches its root
+/// store this way). The registry has one writer, this process, and nothing
+/// reports its own writes back yet, so an asynchronous watch is armed and
+/// stays pending: its event is never set, as on Windows when nothing
+/// changes. A synchronous one would wait forever, which no caller wants.
+pub fn nt_notify_change_key(c: &mut Call<'_>) -> R {
+    let (h, asynchronous) = (c.a32(0), c.a32(9) & 0xff != 0);
+    get_key(c, h)?;
+    if !asynchronous {
+        return Err(c.unimplemented("NtNotifyChangeKey, synchronous"));
+    }
+    Ok(st::PENDING)
+}
+
+/// `NtRenameKey(key, UNICODE_STRING *new_name)`: renames the key within its
+/// parent; open handles keep referring to it. crypt32 builds its
+/// host-certificate key under a temporary name and renames it into place.
+pub fn nt_rename_key(c: &mut Call<'_>) -> R {
+    let (h, name_p) = (c.a32(0), c.a(1));
+    let k = get_key(c, h)?;
+    let new = c.g.ustr(name_p)?.ok_or(Status(st::INVALID_PARAMETER))?;
+    let new = wstr(&new);
+    if new.is_empty() || new.contains('\\') {
+        return Err(Status(st::INVALID_PARAMETER));
+    }
+    // The parent, found from the root by the key's own path.
+    let old_path = k.path.lock().unwrap().clone();
+    let (parent_path, old_name) = old_path.rsplit_once('\\').ok_or(Status(st::ACCESS_DENIED))?;
+    let mut parent = Arc::clone(&c.p.reg.root);
+    for comp in parent_path.split('\\').filter(|s| !s.is_empty()).skip(1) {
+        parent = parent.child(comp).ok_or(Status(st::KEY_DELETED))?;
+    }
+    let mut ch = parent.children.lock().unwrap();
+    if ch.contains_key(&new.to_lowercase()) {
+        return Err(Status(st::OBJECT_NAME_COLLISION));
+    }
+    let Some(me) = ch.remove(&old_name.to_lowercase()) else { return Err(Status(st::KEY_DELETED)) };
+    ch.insert(new.to_lowercase(), me);
+    drop(ch);
+    *k.name.lock().unwrap() = to_w(&new);
+    rename_paths(&k, format!("{parent_path}\\{new}"));
+    Ok(st::SUCCESS)
+}
+
+/// Give `k` the path `path`, and every key below it the path that follows.
+fn rename_paths(k: &Arc<Key>, path: String) {
+    let children: Vec<Arc<Key>> = k.children.lock().unwrap().values().cloned().collect();
+    for child in children {
+        let name = wstr(&child.name.lock().unwrap());
+        rename_paths(&child, format!("{path}\\{name}"));
+    }
+    *k.path.lock().unwrap() = path;
 }
 
 /// Write a `KEY_VALUE_*_INFORMATION`. Returns the status.
@@ -359,7 +445,7 @@ fn write_key_info(c: &mut Call<'_>, k: &Key, name: &[u16], class: u32, buf: u64,
             c.g.w32(buf + 12, if class_b > 0 { 44 } else { u32::MAX })?;
             c.g.w32(buf + 16, class_b as u32)?;
             c.g.w32(buf + 20, children.len() as u32)?;
-            c.g.w32(buf + 24, children.values().map(|k| k.name.len() * 2).max().unwrap_or(0) as u32)?;
+            c.g.w32(buf + 24, children.values().map(|k| k.name.lock().unwrap().len() * 2).max().unwrap_or(0) as u32)?;
             c.g.w32(buf + 28, children.values().map(|k| k.class.lock().unwrap().len() * 2).max().unwrap_or(0) as u32)?;
             c.g.w32(buf + 32, values.len() as u32)?;
             c.g.w32(buf + 36, values.iter().map(|v| v.name.len() * 2).max().unwrap_or(0) as u32)?;
@@ -372,7 +458,7 @@ fn write_key_info(c: &mut Call<'_>, k: &Key, name: &[u16], class: u32, buf: u64,
         }
         // KeyNameInformation: NameLength, Name (the full path).
         3 => {
-            let full = to_w(&k.path);
+            let full = to_w(&k.path.lock().unwrap());
             let total = 4 + full.len() as u64 * 2;
             c.g.out32(ret_p, total as u32)?;
             if len < 4 {
@@ -394,7 +480,7 @@ fn write_key_info(c: &mut Call<'_>, k: &Key, name: &[u16], class: u32, buf: u64,
             c.g.w64(buf, 0)?;
             c.g.w32(buf + 8, 0)?;
             c.g.w32(buf + 12, children.len() as u32)?;
-            c.g.w32(buf + 16, children.values().map(|k| k.name.len() * 2).max().unwrap_or(0) as u32)?;
+            c.g.w32(buf + 16, children.values().map(|k| k.name.lock().unwrap().len() * 2).max().unwrap_or(0) as u32)?;
             c.g.w32(buf + 20, values.len() as u32)?;
             c.g.w32(buf + 24, values.iter().map(|v| v.name.len() * 2).max().unwrap_or(0) as u32)?;
             c.g.w32(buf + 28, values.iter().map(|v| v.data.len()).max().unwrap_or(0) as u32)?;
@@ -412,7 +498,7 @@ pub fn nt_enumerate_key(c: &mut Call<'_>) -> R {
     let k = get_key(c, h)?;
     let child = k.children.lock().unwrap().values().nth(index as usize).cloned();
     let child = child.ok_or(Status(st::NO_MORE_ENTRIES))?;
-    let name = child.name.clone();
+    let name = child.name.lock().unwrap().clone();
     write_key_info(c, &child, &name, class, buf, len, ret)
 }
 
@@ -420,6 +506,6 @@ pub fn nt_enumerate_key(c: &mut Call<'_>) -> R {
 pub fn nt_query_key(c: &mut Call<'_>) -> R {
     let (h, class, buf, len, ret) = (c.a32(0), c.a32(1), c.a(2), c.a32(3) as u64, c.a(4));
     let k = get_key(c, h)?;
-    let name = k.name.clone();
+    let name = k.name.lock().unwrap().clone();
     write_key_info(c, &k, &name, class, buf, len, ret)
 }

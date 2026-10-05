@@ -144,12 +144,13 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
         return None;
     }
     let jit = JIT.get()?;
-    let (exec, ro): (Vec<(u64, u64)>, Vec<(u64, u64)>) = crate::with_host(|h| {
+    let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = crate::with_host(|h| {
         use gex_kernel::mem::prot;
         let v = h.kernel.mem.vmas();
         (
             v.iter().filter(|v| v.prot & prot::EXEC != 0).map(|v| (v.start, v.end)).collect(),
             v.iter().filter(|v| v.prot & prot::WRITE == 0 && v.prot & prot::READ != 0).map(|v| (v.start, v.end)).collect(),
+            v.iter().filter(|v| v.prot & prot::EXEC != 0 && v.prot & prot::WRITE != 0).map(|v| (v.start, v.end)).collect(),
         )
     });
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
@@ -157,6 +158,8 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     }
     let executable = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e);
     let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
+    // Writable-and-executable code (a JIT's) stays tier-1, as natively.
+    let volatile = |a: u64| wx.iter().any(|&(s, e)| a >= s && a < e);
     let fresh = std::cell::RefCell::new(Vec::new());
     let checks = std::cell::RefCell::new(Vec::<(u64, u32)>::new());
     let pg = |page: u64| {
@@ -169,7 +172,7 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     };
     let class32 = gex_abi::X86 && gex_xlate::arch::compat();
     trace(&format!("translate {addr:#x}"));
-    let Some(wasm) = jit.translate(crate::guest_bytes(), addr, &executable, &read_only, &pg, class32) else {
+    let Some(wasm) = jit.translate(crate::guest_bytes(), addr, &executable, &read_only, &volatile, &pg, class32) else {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         trace(&format!("declined {addr:#x}"));
         return None;

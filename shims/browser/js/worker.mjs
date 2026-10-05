@@ -395,6 +395,8 @@ async function handle(msg) {
   // default -- it is one line per phase per thread. See threads-worker note.
   if (msg.attachTrace) globalThis.GEX_ATTACH_TRACE = 1;
   if (msg.denseDebug) globalThis.GEX_DENSE_DEBUG = 1;
+  // A 64-bit guest memory (docs/mem64.md step 6): the wasm64 shim's process.
+  if (msg.mem64) globalThis.GEX_MEM64 = 1;
   if (msg.calloutTrace) globalThis.GEX_CALLOUT_TRACE = 1;
   if (msg.lazyThread) globalThis.GEX_LAZY_THREAD = 1;
   // `kernelStack` is this Worker's slice of the kernel's stack array. Absent for

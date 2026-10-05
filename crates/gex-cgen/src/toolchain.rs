@@ -35,6 +35,25 @@ pub const CFLAGS: &[&str] = &[
     "-Wno-unused-but-set-variable",
 ];
 
+/// [`CFLAGS`] for this process's guest memory: `--target=wasm64` for a
+/// memory64 one (docs/mem64.md), the flags as they are otherwise.
+pub fn cflags() -> Vec<&'static str> {
+    CFLAGS
+        .iter()
+        .map(|f| if *f == "--target=wasm32" && gex_abi::mem64() { "--target=wasm64" } else { *f })
+        .collect()
+}
+
+/// wasm-ld's memory flags: the wasm32 guest memory's maximum, or a memory64
+/// one of `LIMIT64` (`-mwasm64`).
+fn ld_memory_flags() -> Vec<String> {
+    if gex_abi::mem64() {
+        vec!["-mwasm64".into(), format!("--max-memory={}", gex_abi::LIMIT64)]
+    } else {
+        vec!["--max-memory=4294901760".into()]
+    }
+}
+
 /// What a whole-image unit adds (docs/merge-plan.md §9.8.1): it is linked
 /// position-independent, so its function pointers are indices into the
 /// process's function table from `__table_base`, and calls between its
@@ -118,7 +137,7 @@ pub fn clang_version() -> Result<String> {
 /// The flags every whole-image unit is compiled with, as one string, for
 /// cache keys.
 pub fn cflags_key() -> String {
-    let mut v: Vec<String> = CFLAGS.iter().chain(IMAGE_CFLAGS).map(|s| s.to_string()).collect();
+    let mut v: Vec<String> = cflags().into_iter().chain(IMAGE_CFLAGS.iter().copied()).map(|s| s.to_string()).collect();
     v.extend(extra_cflags());
     v.join(" ")
 }
@@ -127,7 +146,7 @@ pub fn cflags_key() -> String {
 pub fn precompile_header(dir: &Path) -> Result<PathBuf> {
     let pch = dir.join("gex_abi.h.pch");
     let mut cmd = Command::new(clang());
-    cmd.args(CFLAGS)
+    cmd.args(cflags())
         .args(IMAGE_CFLAGS)
         .args(extra_cflags())
         .arg("-x")
@@ -144,7 +163,7 @@ pub fn precompile_header(dir: &Path) -> Result<PathBuf> {
 pub fn compile_one(dir: &Path, src: &Path, obj: &Path, pch: Option<&Path>) -> Result<()> {
     let tmp = obj.with_extension(format!("o.tmp-{}", std::process::id()));
     let mut cmd = Command::new(clang());
-    cmd.args(CFLAGS).args(IMAGE_CFLAGS).args(extra_cflags()).arg("-I").arg(dir);
+    cmd.args(cflags()).args(IMAGE_CFLAGS).args(extra_cflags()).arg("-I").arg(dir);
     if let Some(p) = pch {
         cmd.arg("-include-pch").arg(p);
     }
@@ -167,7 +186,7 @@ pub fn compile_all(dir: &Path, sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
                     return;
                 }
                 let mut cmd = Command::new(clang());
-                cmd.args(CFLAGS)
+                cmd.args(cflags())
                     .args(extra_cflags())
                     .arg("-I")
                     .arg(dir)
@@ -204,7 +223,9 @@ pub fn link_image(dir: &Path, objs: &[PathBuf], out: &Path) -> Result<()> {
     }
     std::fs::write(&rsp, text)?;
     let mut cmd = Command::new(wasm_ld());
-    cmd.args(["--experimental-pic", "-shared", "--no-entry", "--import-memory", "--shared-memory", "--max-memory=4294901760", "--allow-undefined", "-O2"])
+    cmd.args(["--experimental-pic", "-shared", "--no-entry", "--import-memory", "--shared-memory"])
+        .args(ld_memory_flags())
+        .args(["--allow-undefined", "-O2"])
         .arg(format!("@{}", rsp.display()))
         .arg("-o")
         .arg(out);
@@ -233,10 +254,9 @@ pub fn link_with_table(dir: &Path, objs: &[PathBuf], exports: &[String], out: &P
         "--no-entry",
         "--import-memory",
         "--shared-memory",
-        "--max-memory=4294901760",
-        "--allow-undefined",
-        "-O2",
     ])
+    .args(ld_memory_flags())
+    .args(["--allow-undefined", "-O2"])
     .args(import_table.then_some("--import-table"))
     .arg(format!("@{}", rsp.display()))
     .arg("-o")
