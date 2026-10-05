@@ -1002,7 +1002,18 @@ fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) 
 /// --nt-trampolines`): for a host that cannot build it at boot, the browser.
 pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::PathBuf> {
     let (image, seeds) = trampoline_input(class32);
-    prepare_image(&image, &seeds, jobs, true)
+    let unit = prepare_image(&image, &seeds, jobs, true)?;
+    // Its providers (nt_unixcall, i386 only), which a runtime without a
+    // translator (gex-rt, the browser) finds in the cache and cannot build.
+    if class32 {
+        for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
+            let (path, _) = gex_cgen::provider::build(&prov, &cache_root()?)?;
+            if let Some(dir) = gex_cache::precompiled_dir() {
+                gex_cache::precompile(&crate::engine()?, &std::fs::read(&path)?, &dir)?;
+            }
+        }
+    }
+    Ok(unit)
 }
 
 static TRAMPOLINES_DONE: OnceLock<()> = OnceLock::new();

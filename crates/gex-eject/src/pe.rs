@@ -669,10 +669,17 @@ fn build_web(
     };
     std::env::set_var("GEX_CGEN_CACHE", &web);
     gex_cgen::image::set_unguarded(!guarded);
+    // Each web unit's image key and identity as the browser computes them
+    // (sha256 over every byte of every image: ~1 s of the page's start-up),
+    // so the browser can take them from here (GEX_NT_IDENTITIES).
+    let mut identities: Vec<String> = Vec::new();
+    // The NT trampolines' unit, which is no image's (for eject-site to pack).
+    let mut tramp_key = String::new();
     let r = (|| -> Result<()> {
         {
             let (image, _) = gex_kernel::nt::boot::trampoline_input(class32);
-            reuse(&web.join(gex_cgen::image::image_key(&image)), &sources)?;
+            tramp_key = gex_cgen::image::image_key(&image);
+            reuse(&web.join(&tramp_key), &sources)?;
             let t = nt_cgen::prepare_trampolines(class32, jobs)?;
             // The browser leaves the guest's code for a system call and
             // resumes after it, inside the trampolines.
@@ -689,6 +696,13 @@ fn build_web(
             interior.extend(web_entries.iter().copied().filter(|a| a >= base && *a < end));
             let interior = &interior;
             let key_dir = nt_cgen::unit_dir(&pe, *base)?;
+            if let Ok((image, _)) = gex_xlate::func::pe_input(&pe, *base) {
+                identities.push(format!(
+                    "{base:x}:{}:{}:{path}",
+                    gex_cgen::image::image_key(&image),
+                    gex_key::image_identity(&image).trim_start_matches("image:")
+                ));
+            }
             let how = if key_dir.join("c.wasm").exists() {
                 "present"
             } else if reuse(&key_dir, &sources)? {
@@ -731,6 +745,9 @@ fn build_web(
     if !spec.is_empty() {
         settings.push(format!("GEX_NT_STATEFUL={}", spec.join(",")));
     }
+    if !identities.is_empty() {
+        settings.push(format!("GEX_NT_IDENTITIES={}", identities.join(";")));
+    }
     use crate::json::{b, obj, s, strs};
     let j = obj(vec![
         ("exe", s(&ntss.exe)),
@@ -743,6 +760,7 @@ fn build_web(
         // The units' directory in the project, and their flavour.
         ("cgen", s(web.strip_prefix(dir).unwrap_or(&web).to_string_lossy())),
         ("unguarded", b(!guarded)),
+        ("trampolines", s(&tramp_key)),
         // What the page keeps across loads (IndexedDB): the Windows user
         // profiles, where a program's saves and settings go (AppData,
         // Documents).

@@ -143,6 +143,29 @@ static PROVIDERS: Mutex<Vec<ProviderModule>> = Mutex::new(Vec::new());
 /// it units (`UNITS`).
 const PROVIDER: u32 = 1 << 31;
 
+/// An ejected build's image keys and identities, by (base, path)
+/// (GEX_NT_IDENTITIES, written by `gexc eject`: `base:key:identity:path`
+/// joined by `;`). Taken instead of hashing every byte of every image at
+/// start-up (~1 s of the page's main thread); the mapped code is still
+/// compared with the image byte for byte below, and an image not listed is
+/// hashed as before.
+static KNOWN: Mutex<Option<std::collections::HashMap<(u64, String), (String, String)>>> = Mutex::new(None);
+
+pub(crate) fn set_identities(spec: &str) {
+    let mut m = std::collections::HashMap::new();
+    for item in spec.split(';') {
+        let mut f = item.splitn(4, ':');
+        let (Some(base), Some(key), Some(id), Some(path)) = (f.next(), f.next(), f.next(), f.next()) else { continue };
+        let Ok(base) = u64::from_str_radix(base, 16) else { continue };
+        m.insert((base, path.to_string()), (key.to_string(), id.to_string()));
+    }
+    *lock(&KNOWN) = Some(m);
+}
+
+fn known(base: u64, path: &str) -> Option<(String, String)> {
+    lock(&KNOWN).as_ref()?.get(&(base, path.to_string())).cloned()
+}
+
 static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
 /// Units waiting for their bytes, oldest first (indices into `UNITS`).
 static WANTED: Mutex<std::collections::VecDeque<usize>> = Mutex::new(std::collections::VecDeque::new());
@@ -278,7 +301,8 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             pages.push((page, page_hash(memory, page)));
         }
     }
-    let (key, mut providers) = unit_key(image, pe, base);
+    let known = known(base, path);
+    let (key, mut providers) = unit_key(image, pe, base, known.as_ref().map(|k| k.0.clone()));
     // The trampoline page's providers (gex-cgen/providers/nt_unixcall.c),
     // bound at its entries after its unit, as an image's at its exports.
     if pe.is_none() && base == gex_kernel::nt::TRAMPOLINES && image.class32 {
@@ -309,7 +333,10 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
             skeleton: Some(Arc::new(pe.clone())),
         }];
     }
-    let identity = gex_key::image_identity(image).trim_start_matches("image:").to_string();
+    let identity = match known {
+        Some((_, id)) => id,
+        None => gex_key::image_identity(image).trim_start_matches("image:").to_string(),
+    };
     let mut units = lock(&UNITS);
     units.push(Unit {
         identity,
@@ -335,9 +362,9 @@ fn place(image: &gex_ld::Image, path: &str, base: u64, optional: bool, pe: Optio
 /// the image's key, extended by its export providers' stubs and sources),
 /// and those providers. The indirect-call profile's part is added when JS
 /// has read `<cache>/icall/<identity>.txt` (`gex_cgen_set_icall`).
-fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64) -> (String, Vec<Provided>) {
+fn unit_key(image: &gex_ld::Image, pe: Option<&gex_ld::pe::PeImage>, base: u64, known: Option<String>) -> (String, Vec<Provided>) {
     use std::hash::{Hash, Hasher};
-    let mut key = gex_cgen::image::image_key(image);
+    let mut key = known.unwrap_or_else(|| gex_cgen::image::image_key(image));
     let Some(pe) = pe else { return (key, Vec::new()) };
     // As natively (`nt_cgen::provided`): Wine's own build of a DLL leaves out
     // the `nowine` providers.

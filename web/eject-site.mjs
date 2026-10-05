@@ -95,6 +95,9 @@ const preload = [];
 const built = JSON.parse(readFileSync(join(project, 'build/build.json'), 'utf8'));
 const ids = new Set(built.images.map((i) => i.identity).filter(Boolean));
 const since = Math.min(...[...ids].map((k) => statSync(join(units, k, 'c.wasm')).mtimeMs)) - 60000;
+// The NT trampolines' unit is no image's: nt.json names it (older builds
+// did not, and fall back to the age test).
+if (nt.trampolines) ids.add(nt.trampolines);
 const current = (key) => ids.has(key) || (existsSync(join(units, key, 'c.wasm')) && statSync(join(units, key, 'c.wasm')).mtimeMs >= since);
 let stale = 0;
 walk(units, (p, rel) => {
@@ -118,6 +121,10 @@ walk(units, (p, rel) => {
   const url = `/project/${cgen}/${rel}`;
   if (name === 'c.wasm') preload.push([`cgen:${rel.slice(0, -'/c.wasm'.length)}`, url]);
   else if (top === 'providers') preload.push([`cgenfile:${rel}`, url]);
+  // Every other file a Worker reads from the unit cache with a synchronous
+  // request (entries, providers, Lua, icall profiles, the groups' index):
+  // fetched by the page ahead and handed to every Worker.
+  if (name !== 'c.wasm') preload.push([`file:${rel}`, url]);
 });
 
 // Largest first: noita.exe's unit is most of the compile.
