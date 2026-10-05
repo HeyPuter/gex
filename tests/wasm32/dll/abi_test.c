@@ -50,6 +50,10 @@ int main(void)
     CHECK(GetProcAddress(h, "abi_missing") != NULL);
     int (WINAPI *noname)(int) = (void *)GetProcAddress(h, (LPCSTR)100);
     CHECK(noname && noname(5) == 105);
+    int (__cdecl *vp)(const char *, ...) = (void *)GetProcAddress(h, "abi_printf");
+    int (__cdecl *vw)(int, ...) = (void *)GetProcAddress(h, "abi_words");
+    CHECK(vp && vp("%d %f %I64d %f", 1, 2.5, 3ll, 0.25) == 67);
+    CHECK(vw && vw(4, 1, 2, 3, 4) == 1234);
     printf(fails ? "FAILED\n" : "PASS\n");
     return fails;
 }

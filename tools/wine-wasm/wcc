@@ -68,6 +68,8 @@ while i < len(args):
     i += 1
 
 tmp = tempfile.mkdtemp(prefix='wcc-')
+import atexit, shutil
+atexit.register(shutil.rmtree, tmp, True)
 objs = []
 for k, s in enumerate(srcs):
     o = os.path.join(tmp, '%d.o' % k)

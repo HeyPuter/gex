@@ -21,3 +21,32 @@ int abi_data = 1234;
 int abi_stub_called;
 void __wine_spec_unimplemented_stub(const char *module, const char *function) { abi_stub_called = 1; }
 int abi_noname(int x) { return x + 100; }
+
+/* Varargs (winebuild's varargs adapters): a printf by name, whose format
+ * names 8-byte arguments the adapter lays out again, and words. */
+#include <stdarg.h>
+int abi_printf(const char *fmt, ...)
+{
+    va_list ap;
+    double sum = 0;
+    va_start(ap, fmt);
+    for (; *fmt; fmt++)
+    {
+        if (*fmt != '%') continue;
+        fmt++;
+        if (fmt[0] == 'I' && fmt[1] == '6' && fmt[2] == '4') { fmt += 3; sum += va_arg(ap, long long); }
+        else if (*fmt == 'f') sum += va_arg(ap, double);
+        else if (*fmt == 'd') sum += va_arg(ap, int);
+    }
+    va_end(ap);
+    return (int)(sum * 10);
+}
+int abi_words(int n, ...)
+{
+    va_list ap;
+    int i, sum = 0;
+    va_start(ap, n);
+    for (i = 0; i < n; i++) sum = sum * 10 + va_arg(ap, int);
+    va_end(ap);
+    return sum;
+}

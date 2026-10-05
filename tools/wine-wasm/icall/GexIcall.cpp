@@ -34,6 +34,7 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <map>
 #include <set>
 #include <cstdlib>
 
@@ -171,9 +172,12 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return false;
   }
 
-  // Functions annotated "gex.stdcall" (llvm.global.annotations).
-  static std::set<Function *> stdcalls(Module &M) {
-    std::set<Function *> out;
+  // The i386 convention a native function has towards the guest, from its
+  // annotation (llvm.global.annotations): corecrt.h/minwindef.h's
+  // __stdcall, __thiscall, __fastcall on wasm32.
+  enum Conv { CDECL, STDCALL, THISCALL, FASTCALL };
+  static std::map<Function *, Conv> conventions(Module &M) {
+    std::map<Function *, Conv> out;
     GlobalVariable *A = M.getGlobalVariable("llvm.global.annotations");
     if (!A || !A->hasInitializer()) return out;
     auto *Arr = dyn_cast<ConstantArray>(A->getInitializer());
@@ -184,15 +188,20 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       auto *F = dyn_cast<Function>(S->getOperand(0)->stripPointerCasts());
       auto *Str = dyn_cast<GlobalVariable>(S->getOperand(1)->stripPointerCasts());
       if (!F || !Str || !Str->hasInitializer()) continue;
-      if (auto *CDA = dyn_cast<ConstantDataArray>(Str->getInitializer()))
-        if (CDA->isCString() && CDA->getAsCString() == "gex.stdcall") out.insert(F);
+      if (auto *CDA = dyn_cast<ConstantDataArray>(Str->getInitializer())) {
+        if (!CDA->isCString()) continue;
+        StringRef a = CDA->getAsCString();
+        if (a == "gex.stdcall") out.emplace(F, STDCALL);
+        else if (a == "gex.thiscall") out[F] = THISCALL;
+        else if (a == "gex.fastcall") out[F] = FASTCALL;
+      }
     }
     return out;
   }
 
   // The entry thunk of F (see the top), or null if its signature has no
   // i386 shape here.
-  Function *entryThunk(Module &M, Function &F, bool stdcall) {
+  Function *entryThunk(Module &M, Function &F, Conv conv) {
     LLVMContext &C = M.getContext();
     const DataLayout &DL = M.getDataLayout();
     Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C), *F32 = Type::getFloatTy(C),
@@ -233,8 +242,20 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       }
       first = 1;
     }
+    // thiscall: `this` in ECX; fastcall: the first two word-sized integer
+    // or pointer arguments in ECX and EDX. The rest are on the stack, and
+    // the callee pops them (as stdcall).
+    unsigned regs = 0, maxregs = conv == THISCALL ? 1 : conv == FASTCALL ? 2 : 0;
     for (unsigned i = first; i < FT->getNumParams(); i++) {
       Type *P = FT->getParamType(i);
+      if (regs < maxregs && !F.getParamByValType(i) &&
+          (P->isPointerTy() || (P->isIntegerTy() && P->getIntegerBitWidth() <= 32))) {
+        Value *A = B.CreateCall(helper("__gexw_reg", I32, {I32, I32}), {Ctx, B.getInt32(regs == 0 ? 1 : 2)});
+        args.push_back(P->isPointerTy() ? B.CreateIntToPtr(A, P) : B.CreateTrunc(A, P));
+        regs++;
+        continue;
+      }
+      regs = maxregs;  /* fastcall: past a stack argument, the rest are too */
       if (Type *BT = F.getParamByValType(i)) {
         Value *A = B.CreateCall(helper("__gexw_argptr", I32, {I32, I32}), {Ctx, B.getInt32(off)});
         args.push_back(B.CreateIntToPtr(A, Ptr));
@@ -261,7 +282,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
         return nullptr;
       }
     }
-    unsigned pop = stdcall ? off : 0;
+    unsigned pop = conv == CDECL ? 0 : off;
     Value *R = B.CreateCall(FT, &F, args);
     Type *RT = FT->getReturnType();
     Value *Out;
@@ -295,7 +316,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
   }
 
   unsigned entryThunks(Module &M) {
-    std::set<Function *> sc = stdcalls(M);
+    std::map<Function *, Conv> cv = conventions(M);
     std::vector<std::pair<Function *, Function *>> pairs;
     std::vector<Function *> fs;
     for (Function &F : M) {
@@ -305,7 +326,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       if (escapes(F)) fs.push_back(&F);
     }
     for (Function *F : fs)
-      if (Function *T = entryThunk(M, *F, sc.count(F)))
+      if (Function *T = entryThunk(M, *F, cv.count(F) ? cv[F] : CDECL))
         pairs.push_back({F, T});
     if (pairs.empty()) return 0;
     LLVMContext &C = M.getContext();

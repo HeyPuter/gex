@@ -89,10 +89,19 @@ def main():
             dlls.append((mod, ro, ex, imports))
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
-    link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'))
+    # every DLL the build has an export list for, native or not: what an
+    # import the linked DLLs leave undefined is found in (guest imports)
+    others = {}
+    for top in ('dlls',):
+        for d in sorted(os.listdir(os.path.join(build, top))):
+            mod = makefile_var(os.path.join(src, top, d, 'Makefile.in'), 'MODULE')
+            ex = os.path.join(build, top, d, mod[0] + '.so.exports') if mod else ''
+            if mod and os.path.exists(ex):
+                others[mod[0]] = ex
+    link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
 
-def link(dlls, out, gexrt):
+def link(dlls, out, gexrt, others=None):
 
     exporters = {}  # link name -> [dll, ...]
     forwards = {}  # export name -> {dll: 'TARGET.name'}
@@ -109,16 +118,26 @@ def link(dlls, out, gexrt):
             if len(parts) > 1 and parts[1] == 'data':
                 data.append(f'{mod}!{parts[0]}')
 
+    sigs = {}  # dll -> {(name, 'defined'|'undefined'): sig}
+    for mod, ro, ex, imports in dlls:
+        listing = subprocess.run([sys.executable, os.path.join(here, 'pesym.py'), 'sigs', ro],
+                                 capture_output=True, text=True, check=True).stdout
+        sigs[mod] = {(l.split()[0], l.split()[1]): l.split()[2] for l in listing.splitlines() if len(l.split()) == 3}
     def resolve_forward(fwd, depth=0):
         """(dll, name) a forward like NTDLL.RtlEnterCriticalSection reaches."""
         dll, _, name = fwd.partition('.')
         dll = dll.lower() + ('' if '.' in dll else '.dll')
         if name.startswith('#') or depth > 8:
             return None
-        if dll in exporters.get(name, []):
+        if dll in exporters.get(name, []) and (name, 'defined') in sigs.get(dll, {}):
             return dll, name
         nxt = forwards.get(name, {}).get(dll)
-        return resolve_forward(nxt, depth + 1) if nxt else None
+        if nxt:
+            return resolve_forward(nxt, depth + 1)
+        # a name the DLL exports but takes from another (kernel32's
+        # RtlSetLastWin32Error is ntdll's): whoever defines it
+        owner = next((d for d in exporters.get(name, []) if (name, 'defined') in sigs.get(d, {})), None)
+        return (owner, name) if owner else None
 
     # Forwards some DLL's code calls by name: the forwarding DLL's name for
     # the function, an alias the defining DLL gets (pesym.py dll ALIASES).
@@ -141,11 +160,6 @@ def link(dlls, out, gexrt):
     # than its definition (kernel32's void EnterCriticalSection is ntdll's
     # NTSTATUS RtlEnterCriticalSection) gets a thunk, not an alias: wasm
     # calls must match exactly.
-    sigs = {}  # dll -> {(name, 'defined'|'undefined'): sig}
-    for mod, ro, ex, imports in dlls:
-        listing = subprocess.run([sys.executable, os.path.join(here, 'pesym.py'), 'sigs', ro],
-                                 capture_output=True, text=True, check=True).stdout
-        sigs[mod] = {(l.split()[0], l.split()[1]): l.split()[2] for l in listing.splitlines() if len(l.split()) == 3}
     thunks = []
     for d in list(aliases):
         keep = []
@@ -169,6 +183,9 @@ def link(dlls, out, gexrt):
         mapfile = os.path.join(tmp, mod + '.map')
         with open(mapfile, 'w') as f:
             for name, owners in exporters.items():
+                # (a DLL may list an export its code takes from another DLL:
+                # kernel32's DebugBreak is kernelbase's)
+                owners = [o for o in owners if (name, 'defined') in sigs[o]] or owners
                 if mod in owners:
                     continue  # its own: already resolved inside it
                 pick = next((o for o in imports if o in owners), owners[0])
@@ -206,6 +223,54 @@ def link(dlls, out, gexrt):
         subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-c', '-o', obj, src])
         objs.append(obj)
 
+    # Imports from DLLs that stay i386 code (msvcrt's user32 and advapi32
+    # calls): a stub per name, which finds the export through kernel32
+    # (LoadLibraryA, GetProcAddress) once and calls it -- a guest address,
+    # so through the ICALL pass's exit stub, as a guest call. The stub's
+    # signature is its callers'.
+    native = {mod for mod, _, _, _ in dlls}
+    if others and 'kernel32.dll' in native:
+        undefined = {}  # name -> (sig, importing dll)
+        for mod, ro, ex, imports in dlls:
+            for (n, k), v in sigs[mod].items():
+                if k == 'undefined' and n not in exporters and n not in forward_owner and '!' not in n:
+                    undefined.setdefault(n, (v, mod, imports))
+        owner_of = {}
+        for omod, oex in others.items():
+            if omod in native:
+                continue
+            for line in open(oex):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ('func', 'forward'):
+                    owner_of.setdefault(parts[0], []).append(omod)
+        stubs = []
+        for n, (sig, mod, imports) in sorted(undefined.items()):
+            owners = owner_of.get(n)
+            if not owners:
+                continue
+            stubs.append((n, sig, next((o for o in imports if o in owners), owners[0])))
+        if stubs:
+            ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
+            src = os.path.join(tmp, 'guestimports.c')
+            with open(src, 'w') as f:
+                own = lambda n: next((d for d in ('kernelbase.dll', 'kernel32.dll') if d in exporters.get(n, [])), 'kernel32.dll')
+                f.write(f'void *gexw_LoadLibraryA(const char *) __asm__("{own("LoadLibraryA")}!LoadLibraryA");\n')
+                f.write(f'void *gexw_GetProcAddress(void *, const char *) __asm__("{own("GetProcAddress")}!GetProcAddress");\n')
+                for k, (n, sig, owner) in enumerate(stubs):
+                    r, ps = sig.split(':')
+                    params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
+                    types = ', '.join(ctype[c] for c in ps) or 'void'
+                    args = ', '.join(f'a{i}' for i in range(len(ps)))
+                    f.write(f'{ctype[r]} g{k}({params}) __asm__("{n}");\n')
+                    f.write(f'{ctype[r]} g{k}({params}) {{\n'
+                            f'    static void *p;\n'
+                            f'    if (!p) p = gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}");\n'
+                            f'    {"" if r == "v" else "return "}(({ctype[r]} (*)({types}))p)({args});\n}}\n')
+            obj = os.path.join(tmp, 'guestimports.o')
+            subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-D_WIN32', '-c', '-o', obj, src])
+            objs.append(obj)
+            print(f'{out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o in stubs}))})')
+
     rsp = os.path.join(tmp, 'exports.rsp')
     with open(rsp, 'w') as f:
         for d in data:
@@ -227,7 +292,9 @@ def link(dlls, out, gexrt):
     for name, by in sorted(forwards.items()):
         if name in exporters:
             continue
-        hit = resolve_forward(next(iter(by.values())))
+        # (the first forwarder that reaches a definition: kernel32's
+        # SetLastError names its own RtlSetLastWin32Error, which it imports)
+        hit = next((h for h in map(resolve_forward, by.values()) if h), None)
         if hit:
             lines.append(f'{name} {hit[0]}!{hit[1]}')
     if lines:
