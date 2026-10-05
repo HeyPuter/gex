@@ -1583,3 +1583,15 @@ level with pewasm on edger)**, zf 44.25. The fast path is +4.7%. ZF at
 every unsummarised call costs 2.7% (and 2.5% of noita.exe's wasm), so the
 default writes ZF back only at MSVC's stack checks (`cmp esi, esp` right
 before the call, 8590e5a8; tests/nt zfcall); ZFCALLS stays for pricing.
+
+**g1 on edger (final tree 050023da, bm-g, master 4aed5829 inside):**
+pewasm 48.2 / 45.8 / 47.4 (47.1); fast path off 44.2, 38.7 (41.5); on
+43.3, 44.9 (44.1, 0.94× pewasm, +6% on off). Three sequences agree on the
+fast path (+5%, +4.7%, +6%). NT gate 81/81 with and without --cgen.
+Main thread with the fast path (ms per world frame, on1/on2): guest code
+15.2/14.6, the yield park (waiting on the workers) 9.8/9.5, shim work
+2.8, JS 1.4 (mono_ns 0.58: the QPC provider's clock and the syscall
+tick), providers 1.0; the GL collect wait is gone (E's frame skip).
+Next candidates, each under a millisecond a frame: gex_dispatch_miss 0.4
+(tier-1 LuaJIT code), mono_ns 0.58, the client-state GL calls still in
+the layer (338 a frame), dlmalloc 0.3.
