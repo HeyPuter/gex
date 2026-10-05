@@ -481,9 +481,22 @@ whole of it.
 | `src/internal/wasm32/gex_thread.s` | `__gex_start` / `__gex_thread_start` (F_body entries), per-thread globals, C stack pointer get/set, handler calls | wasm has no registers to keep these in |
 | `src/thread/wasm32/*` | `__clone` (thread entry, new process), the child's start, thread area, `__unmapself`, `syscall_cp` | wasm has no stack switching or `clone` asm |
 | `src/env/wasm32/*` | TLS (wasm-ld's `__tls_base`), `main(void)` fallback | wasm-ld's TLS model |
-| `src/process/wasm32/*` | fork (asyncify), vfork as fork | §3.11.1 |
-| `src/setjmp/wasm32/*`, `src/signal/wasm32/*` | the SjLj runtime clang's lowering calls (`__wasm_setjmp`, `__wasm_longjmp`, the tag); signal frames, restorers | wasm EH, the signal model above |
-| `src/ldso/wasm32/*` | `dlopen`/`dlsym` over the closed-world registry | §3.12 |
+| `src/process/wasm32/__gex_fork.c` | fork (asyncify) | §3.11.1 |
+
+**Not in musl: gex's support library, libgex** (`tools/wine-wasm/libgex`,
+built into the sysroot's `lib/libgex.a` by build-sysroot.sh, linked by wcc
+before libc with every program; musl branch `gex-wasm32-slim`). What is
+gex's protocol rather than the libc's:
+
+| file | what | why it can live outside musl |
+|---|---|---|
+| `setjmp.c` | the SjLj runtime clang's lowering calls (`__wasm_setjmp`, `__wasm_setjmp_test`, `__wasm_longjmp`, the `__c_longjmp` tag), `setjmp`/`longjmp`/`sigsetjmp` | musl's generic setjmp.c, longjmp.c, sigsetjmp.c are empty; siglongjmp stays musl's |
+| `dl.c` | `dlopen`/`__dlsym`/`dlclose` over the closed-world registry (§3.12) | a static musl's dlopen and `__dlsym` are weak stubs; dlclose sits next to dlopen so libc's is never pulled; errors through musl's `__dl_seterr` |
+| `signal.c`, `signal_call.s` | `__gex_signal_frames` (below), `__gex_call_handler` | gex-kernel's frame protocol; musl's syscall stub only names it. `__restore`/`__restore_rt` are musl's generic no-ops (never called) |
+| `vfork.c` | vfork as fork | first in the link, so libc's (SYS_fork through `syscall()`, which does not reach the fork driver) is not used |
+
+(clang lowers only calls to `setjmp`: a `sigsetjmp` returns 0 once and a
+`siglongjmp` to it is an uncaught exception: a known gap, as before the move.)
 
 Removed 2026-10-05: the vfork emulation (a `vfork` macro in `unistd.h`,
 `execve`/`_Exit` overrides) and the constructor call patched into
