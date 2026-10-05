@@ -242,6 +242,7 @@ pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
   //   ?args=a b     arguments instead of the recorded ones
   //   ?env=K=V,...  more environment (GEX_NT_STATS=1, ...)
   //   ?size=WxH     the compositor's size
+  //   ?mesaenv=K=V  environment for Mesa (GEX_WGPU_TIMING=1, ...)
   const q = new URLSearchParams(location.search);
   const out = document.getElementById('out');
   try {
@@ -260,6 +261,7 @@ pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
     });
     if (m.cwd && m.cwd !== '/') p.set('cwd', m.cwd);
     if (m.unguarded) p.set('unguarded', '1');
+    if (q.has('mesaenv')) p.set('mesaenv', q.get('mesaenv'));
     const argv = q.has('args') ? q.get('args').split(' ').filter((a) => a) : m.args;
     if (argv.length) p.set('argv', JSON.stringify(argv));
     if (!q.has('jit') && !q.has('record')) p.set('aot', '1');
