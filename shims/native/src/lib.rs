@@ -707,9 +707,16 @@ fn run_program_with(
     // One setting per host process -- the native runner keeps one translator
     // for every guest process, so a mixed tree is not supported here (the
     // browser has a shim per process).
-    gex_xlate::set_compat(program.compat());
-    lockstep::set_compat(program.compat());
-    gex_kernel::set_compat32(program.compat() && gex_abi::X86);
+    //
+    // A native wasm32 program has no guest code to decode and leaves these
+    // alone: it is an i386 ELF (and its kernel speaks the i386 ABI, below),
+    // but an x86-64 shell that runs it goes on translating its own code
+    // after the wait.
+    if !wasmprog::is_wasm32(program) {
+        gex_xlate::set_compat(program.compat());
+        lockstep::set_compat(program.compat());
+        gex_kernel::set_compat32(program.compat() && gex_abi::X86);
+    }
     ftab::selftest_init();
 
     // A profile records where a previous run went, feeding `extra_entries` so

@@ -31,3 +31,13 @@ else
     printf '%s\n' "$native" > native.out; printf '%s\n' "$gex" > gex.out; diff native.out gex.out | head -20
     exit 1
 fi
+# An x86-64 shell (the host's, translated) running the wasm32 busybox and
+# going on afterwards: the child must not switch the translator to i386.
+mixed=$("$GEXC" run /bin/sh -c "$BUSYBOX echo hi | $BUSYBOX tr a-z A-Z; echo after" 2>&1)
+if [ "$mixed" = "$(printf 'HI\nafter')" ]; then
+    echo "ok   busybox under an x86-64 shell"
+else
+    echo "FAIL busybox under an x86-64 shell"; printf '%s\n' "$mixed" | tail -5
+    exit 1
+fi
+cd / && rm -rf "$WORK"

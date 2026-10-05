@@ -29,6 +29,18 @@ use super::*;
 
 pub const MAGIC: &[u8; 8] = b"GEXWASM\0";
 
+/// Whether `program` is a native wasm32 one (its header, from the image's
+/// segments, before anything is placed).
+pub(crate) fn is_wasm32(program: &Program) -> bool {
+    let at = program.exe.entry.wrapping_sub(0x40);
+    program.exe.segments.iter().any(|s| {
+        at >= s.vaddr && at + 8 <= s.vaddr + s.bytes.len() as u64 && {
+            let o = (at - s.vaddr) as usize;
+            &s.bytes[o..o + 8] == MAGIC
+        }
+    })
+}
+
 /// If the program just placed is a native wasm32 one, install its module
 /// in the function table at its entries. Returns whether it was.
 pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, program: &Program) -> Result<bool> {
