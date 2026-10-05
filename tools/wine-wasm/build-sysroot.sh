@@ -19,8 +19,9 @@ JOBS=${JOBS:-4}
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/sysroot/lib"
 
 cd "$OUT/musl-build"
-# reconfigure when the flags changed (configure bakes them in)
-if [ "$(cat .gex-flags 2>/dev/null)" != "$WASM_CFLAGS" ]; then
+# reconfigure when the flags or the musl tree changed (configure bakes
+# both in: the Makefile is a link into the source)
+if [ "$(cat .gex-flags 2>/dev/null)" != "$MUSL $WASM_CFLAGS" ]; then
   rm -f config.mak
   [ -f Makefile ] && make -s clean >/dev/null 2>&1 || true
 fi
@@ -28,7 +29,7 @@ if [ ! -f config.mak ]; then
   CC=clang CFLAGS="$WASM_CFLAGS" AR=llvm-ar RANLIB=llvm-ranlib \
     "$MUSL/configure" --target=wasm32-unknown-linux-musl --prefix="$OUT/sysroot" \
     --disable-shared --enable-static >/dev/null
-  printf '%s' "$WASM_CFLAGS" > .gex-flags
+  printf '%s' "$MUSL $WASM_CFLAGS" > .gex-flags
 fi
 # musl's makefile tracks no header dependencies: a changed header (the
 # wasm32 syscall stub is one) means rebuilding everything.
@@ -68,4 +69,15 @@ rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a" $objs
 # The ICALL pass (wcc applies it to Wine's PE-side code, -D_WIN32).
 "$HERE/icall/build.sh" "$OUT/sysroot/lib"
+# binaryen, for wcc's asyncify of programs that fork (wasm-opt >= 117 for
+# exception handling): GEX_BINARYEN names an existing install.
+BINARYEN_VERSION=133
+if [ -n "${GEX_BINARYEN:-}" ]; then
+  ln -sfn "$(realpath "$GEX_BINARYEN")" "$OUT/sysroot/binaryen"
+elif [ ! -x "$OUT/sysroot/binaryen/bin/wasm-opt" ]; then
+  t=binaryen-version_$BINARYEN_VERSION
+  curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$OUT"
+  rm -rf "$OUT/sysroot/binaryen"
+  mv "$OUT/$t" "$OUT/sysroot/binaryen"
+fi
 echo "sysroot: $OUT/sysroot"
