@@ -7,7 +7,7 @@
 > removed 2026-10-02 once wink had surpassed it). Mentions of virgl below are
 > history; don't use it as a reference.
 
-Workspace: `/home/velzie/src/gex2`
+Workspace: the gex checkout (originally `~/src/gex2`)
 
 Active goal: build a conformant OpenGL 4.4 to WebGPU path, then achieve stable real-browser 60 FPS in SuperTuxKart.
 

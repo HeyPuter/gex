@@ -13,7 +13,7 @@ mkdir -p "$WORK" "$ROOT/web/public/fs" "$ROOT/web/dist/fs"
 
 if [ -z "$GUEST_CC" ]; then
     for candidate in \
-        /home/velzie/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc \
+        $HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc \
         /usr/bin/aarch64-linux-musl-gcc \
         /usr/bin/aarch64-linux-gnu-gcc; do
         if [ -x "$candidate" ]; then

@@ -6,7 +6,7 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 SOURCE="$ROOT/tests/integration/programs/gl44-multi-draw-probe.c"
 WORK=${GEX_MULTI_DRAW_WORK:-${TMPDIR:-/tmp}/gex-gl44-multi-draw}
-GUEST_CC=${GEX_CC:-/home/velzie/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}
+GUEST_CC=${GEX_CC:-$HOME/toolchains/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc}
 mkdir -p "$WORK" "$ROOT/web/public/fs" "$ROOT/web/dist/fs"
 
 ${CC:-cc} -O2 -Wall -Wextra -o "$WORK/mesa" "$SOURCE" -lEGL -lGL
