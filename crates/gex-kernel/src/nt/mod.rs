@@ -460,10 +460,8 @@ pub struct Process {
     /// a thread was told to stop.
     pub kill_pending: AtomicUsize,
     /// Threads parked in a yield (`sync::guest_yield`), so a kick knows
-    /// whether to notify. Mirrored, under `yield_park_lock`, into the guest
-    /// word `sync::YIELD_PARKED` for the providers' kicks.
+    /// whether to notify.
     pub yield_parked: AtomicU32,
-    pub yield_park_lock: Mutex<()>,
     /// The display mode, `user::sysparams::Mode` packed (ChangeDisplaySettings).
     pub display_mode: AtomicU64,
 }
@@ -507,6 +505,14 @@ pub mod gex_nr {
     /// The x86-64 `__wine_syscall_dispatcher` was called, which Wine's
     /// x86-64 stubs never do while `USD.SystemCall` is 0.
     pub const BAD_DISPATCH: u32 = 0x7f00_0002;
+    /// From native Wine (gexrt, docs/wine-native.md §3.15): guest code
+    /// entered native code from above the innermost native entry's stack,
+    /// i.e. it left those native frames earlier (a catch block continuing
+    /// in an outer frame) and has been running nested inside them since.
+    /// The host abandons the innermost call-out (its native caller then
+    /// drops its frames), and the guest re-enters from the context's PC,
+    /// one level flatter. Handled by the hosts, never by the NT layer.
+    pub const NATIVE_LEFT: u32 = 0x7f00_0003;
 }
 
 impl Process {
@@ -559,7 +565,6 @@ impl Process {
             kill_list: Mutex::new(Vec::new()),
             kill_pending: AtomicUsize::new(0),
             yield_parked: AtomicU32::new(0),
-            yield_park_lock: Mutex::new(()),
             display_mode: AtomicU64::new(user::sysparams::Mode::startup().pack()),
         }
     }
@@ -783,6 +788,7 @@ pub fn syscall_name(nr: u32) -> String {
     match nr {
         gex_nr::UNIX_CALL => return "__wine_unix_call".into(),
         gex_nr::BAD_DISPATCH => return "__wine_syscall_dispatcher".into(),
+        gex_nr::NATIVE_LEFT => return "[native frames left]".into(),
         _ => {}
     }
     let (table, base, label) = if nr < 0x1000 {

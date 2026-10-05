@@ -11,10 +11,11 @@
 # once per thread.
 set -eu
 OUT=$(realpath -m "$1")
-MUSL=$(realpath "${2:-$(dirname "$0")/../../../musl-wasm}")
+HERE=$(dirname "$(realpath "$0")")
+MUSL=$(realpath "${2:-$HERE/../../../musl-wasm}")
 CRT=${GEX_CRT_SRC:-/usr/lib/emsdk/upstream/emscripten/system/lib/compiler-rt/lib/builtins}
 JOBS=${JOBS:-4}
-. "$(dirname "$0")/flags.sh"
+. "$HERE/flags.sh"
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/sysroot/lib"
 
 cd "$OUT/musl-build"
@@ -42,7 +43,7 @@ make -s -j"$JOBS" install-headers install-libs >/dev/null
 SR="$OUT/sysroot/include"
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
 cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -r /usr/include/asm "$SR/asm"
+cp -rL /usr/include/asm "$SR/asm"
 for h in $(grep -l __i386__ "$SR"/asm/*.h); do
   case $h in */swab.h) continue ;; esac
   sed -i -e 's/defined(__i386__)/(defined(__i386__) || defined(__wasm32__))/g' \
@@ -66,5 +67,5 @@ wait
 rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a" $objs
 # The ICALL pass (wcc applies it to Wine's PE-side code, -D_WIN32).
-"$(dirname "$0")/icall/build.sh" "$OUT/sysroot/lib"
+"$HERE/icall/build.sh" "$OUT/sysroot/lib"
 echo "sysroot: $OUT/sysroot"

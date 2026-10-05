@@ -60,6 +60,10 @@ const CTX_PC = 32 * 8;
 const CTX_SP = 4 * 8;
 /** cgen.rs `CALLOUT_UNWOUND`: 64 KiB. */
 const CALLOUT_UNWOUND = 64n << 10n;
+/** gex-kernel `tramp::NATIVE_RETURN_PAD` and the native host's
+ *  `NATIVE_UNWOUND` (docs/wine-native.md §3.15). */
+const NATIVE_RETURN_PAD = 0x3ffff1n;
+const NATIVE_UNWOUND = 512n;
 /**
  * `table.grow`, said out loud once a table passes a million entries: each
  * Worker's dispatch tables are V8 heap, and their size is the renderer's.
@@ -880,10 +884,19 @@ export class Gex {
         // runs nested until the guest returns to the function body that
         // called it.
         call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
+        // An AOT-only fallback whose target this Worker has just installed
+        // (cgen.rs `gex_ftab_fallback`): called as a function body.
+        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(idx >>> 0)(ctx, depth, need, ret),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
         exc_dispatch: (ctx, target, level) => this.#excDispatch(ctx >>> 0, target, level),
+        // An AOT-only run serves units and new threads inside the syscall
+        // (nt.rs `serve_in_place`), as the NT callback loop does.
+        serve_in_place: () => {
+          this.#cgenServe();
+          this.#drainThread().catch((err) => console.error(`[gex-nt] starting a thread: ${err.message ?? err}`));
+        },
         drain_output: () => this.#env.drainOutput?.(),
         // The network. Every one of these must return without waiting: there is
         // one wasm stack, and the guest thread is parked by the kernel, not JS.
@@ -2406,11 +2419,15 @@ export class Gex {
     const name = `cgen:${key}`;
     let mod = this.#sharedModules.get(name);
     if (mod) return mod;
+    const tl = performance.now();
     got ??= this.#env.loadUnit?.(key) ?? null;
     if (!got) throw new Error(`gex-cgen: unit ${key} was published but cannot be loaded here`);
     const t0 = performance.now();
     mod = got.wasm instanceof WebAssembly.Module ? got.wasm : new WebAssembly.Module(got.wasm);
     this.#compileMs += performance.now() - t0;
+    // Start-up's largest costs, one line per unit (a page loads about 40).
+    console.warn(`[unit] ${key.slice(0, 16)} ${((got.wasm.byteLength ?? 0) / 1048576).toFixed(1)} MiB: `
+      + `load ${Math.round(t0 - tl)} ms, compile ${Math.round(performance.now() - t0)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     this.#sharedModules.set(name, mod);
     this.#env.shareModule?.(name, mod);
     return mod;
@@ -2479,7 +2496,13 @@ export class Gex {
     const prov = u >= 0x80000000 ? u - 0x80000000 : -1;
     // A function JIT translation (`FJIT | n`, fjit.rs): its bytes are the shim's.
     const jit = prov < 0 && u >= 0x40000000 ? u - 0x40000000 : -1;
-    const mod = prov >= 0
+    // Wine's PE module (native wasm32 Wine, cgen/wasmdll.rs): its bytes are
+    // in the shim's heap, read from the prefix.
+    const wasmdll = prov >= 0 && (e.gex_cgen_pmod_wasm_len?.(prov) >>> 0) > 0;
+    const mod = wasmdll
+      ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov),
+        new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice())
+      : prov >= 0
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov))
       : jit >= 0 ? this.#fjitModule(jit)
       : this.#cgenModule(this.#cgenStr(e.gex_cgen_key, u));
@@ -2511,6 +2534,7 @@ export class Gex {
           provider_alloc_top: e.gex_provider_alloc_top,
         } : {}),
         ...(memBase ? this.#providerImports() : {}),
+        ...(wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     });
     if (memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
@@ -2608,6 +2632,16 @@ export class Gex {
     const e = this.#shim.exports;
     const n = e.gex_cgen_provider_count?.(u) >>> 0;
     for (let i = 0; i < n; i++) {
+      if (e.gex_cgen_provider_wasmdll?.(u, i)) {
+        const number = e.gex_wasmdll_publish(u, i);
+        this.#cgenCatchUp();
+        if (number >= 0) {
+          e.gex_cgen_pmod_installed(number);
+          e.gex_wasmdll_installed();
+        }
+        this.#wasmdllCatchUp();
+        continue;
+      }
       const file = this.#cgenStr((uu, b, c) => e.gex_cgen_provider_file(uu, i, b, c), u);
       const bytes = this.#env.loadFile?.(file) ?? null;
       if (!bytes) {
@@ -2624,6 +2658,31 @@ export class Gex {
       this.#cgenCatchUp();
       e.gex_cgen_pmod_installed(number);
     }
+  }
+
+  /** An ejected project's region entries for unit `u` (docs/eject-pe.md
+   *  §3.3): `<cache>/regions/<key>/`, published after the unit as a unit of
+   *  their own, when the build made them. */
+  #cgenRegions(u, path) {
+    const e = this.#shim.exports;
+    if (!e.gex_cgen_region) return;
+    const r = e.gex_cgen_region(u);
+    if (r < 0) return;
+    const key = this.#cgenStr(e.gex_cgen_key, r);
+    const got = this.#env.loadUnit?.(key) ?? null;
+    if (!got) return;
+    this.#cgenModule(key, got);
+    const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
+    const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
+    this.#bytes().set(ent, gp);
+    const res = e.gex_cgen_publish(r, gp, ent.byteLength / 8);
+    e.gex_free?.(gp, Math.max(8, ent.byteLength));
+    if (res < 0) throw new Error(`gex-cgen: publishing ${path}'s region entries failed`);
+    this.#cgenCatchUp();
+    e.gex_cgen_installed(r);
+    let n = 0;
+    for (let i = 0; i + 8 <= ent.byteLength; i += 8) if (ent[i] | ent[i + 1] | ent[i + 2] | ent[i + 3] | ent[i + 4] | ent[i + 5] | ent[i + 6] | ent[i + 7]) n++;
+    console.error(`gex-nt: region entries for ${path}: ${n}`);
   }
 
   /** Function JIT module `n` (fjit.rs), compiled once per process from the
@@ -2653,7 +2712,10 @@ export class Gex {
     const len = e.gex_ftab_log_len() >>> 0;
     if (!len && !this.#cgen) return;
     const st = this.#cgenStore();
-    if (st.have >= len) return;
+    if (st.have >= len) {
+      this.#wasmdllCatchUp();
+      return;
+    }
     this.#cgenGrow();
     while (st.have < len) {
       const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
@@ -2663,7 +2725,73 @@ export class Gex {
       st.have++;
       e.gex_cgen_have(st.have);
     }
+    this.#wasmdllCatchUp();
   }
+
+  /** The bridges of exports bound into Wine's PE module after its install
+   *  (a later skeleton, the entry thunks: cgen/wasmdll.rs), each once. */
+  #wasmdllHave = 0;
+  #wasmdllCatchUp() {
+    const e = this.#shim.exports;
+    const len = (e.gex_wasmdll_binds_len?.() ?? 0) >>> 0;
+    if (this.#wasmdllHave >= len) return;
+    const blocks = this.#guest.exports.blocks;
+    while (this.#wasmdllHave < len) {
+      const i = this.#wasmdllHave;
+      const tables = this.#growTables(e.gex_wasmdll_bind_slots(i) >>> 0, 'cgen');
+      if (blocks) this.#growBlocks();
+      const n = e.gex_wasmdll_bind_regs(i, 0, 0) >>> 0;
+      const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
+      let regs;
+      try {
+        e.gex_wasmdll_bind_regs(i, buf, n);
+        regs = new Uint32Array(this.#memory.buffer.slice(buf, buf + 4 * n));
+      } finally {
+        e.gex_free?.(buf, 4 * Math.max(1, n));
+      }
+      const st = this.#cgenStore();
+      for (let j = 0; j + 1 < regs.length; j += 2) {
+        (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+      }
+      e.gex_wasmdll_bind_done(i);
+      this.#wasmdllHave++;
+    }
+  }
+
+  /** Wine's PE module's `gex.syscall` (cgen/wasmdll.rs): a system call from
+   *  native code (gexrt marks its pc, bit 61) that traps to JS -- a unit to
+   *  install, a thread to start -- is served here and returns, so the native
+   *  frames below it survive, as natively. Anything else (the process or
+   *  thread ending, a callback's return) goes on up. */
+  #nativeSyscall = (ctx, pc) => {
+    const e = this.#shim.exports;
+    const p = BigInt.asUintN(64, BigInt(pc));
+    if (!(p & (1n << 61n))) return e.gex_syscall(ctx, pc);
+    try {
+      return e.gex_syscall(ctx, pc);
+    } catch (err) {
+      if (err?.gexHandoff || !e.gex_handoff()) throw err;
+      err.gexHandoff = true;
+      if (e.gex_exited?.()) throw err;
+      // gex_nr::NATIVE_LEFT: the call-out it is nested in decides.
+      if (e.gex_nt_native_left?.()) {
+        err.gexNativeLeft = true;
+        throw err;
+      }
+      const stop = p & ~(1n << 61n);
+      const next = BigInt.asUintN(64, BigInt(e.gex_resume_pc()));
+      const rc = e.gex_resume_ctx() >>> 0;
+      if (next !== stop || (rc && rc !== (ctx >>> 0))) throw err;
+      if (e.gex_jit_pending_len() >>> 0) {
+        const need = (e.gex_jit_pending_slots?.() ?? 0) >>> 0;
+        if (need) this.#growTables(need, 'call-out');
+      }
+      while (e.gex_jit_pending_len() >>> 0) this.#installTranslationSync();
+      this.#catchUpSync();
+      this.#cgenServe();
+      this.#drainThread().catch((err2) => console.error(`[gex] starting a thread: ${err2.message ?? err2}`));
+    }
+  };
 
   /** Load and publish the units the shim placed (images mapped since the last
    *  trap), then catch up. A unit's bytes never pass through the shim: only
@@ -2691,25 +2819,100 @@ export class Gex {
       }
       const key = this.#cgenStr(e.gex_cgen_key, u);
       const path = this.#cgenStr(e.gex_cgen_path, u);
-      const got = this.#env.loadUnit?.(key) ?? null;
-      if (!got) {
-        if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
-        this.#cgenProviders(u);
+      // A link group's member (docs/eject-pe.md §6a): held until every
+      // member is placed, then the group's module stands for them all.
+      const grp = e.gex_cgen_group ? this.#cgenGroupOf(key) : null;
+      if (grp) {
+        e.gex_cgen_hold(u);
+        grp.held.set(key, { u, path });
+        console.error(`gex-nt: ${path}: held for its link group`);
+        if (grp.held.size === grp.members.length) this.#cgenGroup(grp, t0);
         continue;
       }
-      this.#cgenModule(key, got);
-      const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
-      const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
-      this.#bytes().set(ent, gp);
-      const r = e.gex_cgen_publish(u, gp, ent.byteLength / 8);
-      e.gex_free?.(gp, Math.max(8, ent.byteLength));
-      if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
-      this.#cgenCatchUp();
-      e.gex_cgen_installed(u);
-      this.#cgenProviders(u);
-      console.error(`gex-nt: function tier for ${path}: ${ent.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+      this.#cgenUnit(u, key, path, t0);
     }
     this.#cgenCatchUp();
+  }
+
+  /** Load and publish unit `u` (`key`), then its providers and region
+   *  entries. */
+  #cgenUnit(u, key, path, t0) {
+    const e = this.#shim.exports;
+    const got = this.#env.loadUnit?.(key) ?? null;
+    if (!got) {
+      if (e.gex_cgen_missing(u)) throw new Error(`gex-cgen: --cgen: ${path} has no function-tier unit (${key})`);
+      this.#cgenProviders(u);
+      return;
+    }
+    this.#cgenPublish(u, key, path, got);
+    this.#cgenProviders(u);
+    console.error(`gex-nt: function tier for ${path}: ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    this.#cgenRegions(u, path);
+  }
+
+  /** Publish unit `u`'s module (`got`, under `key`) and install it here. */
+  #cgenPublish(u, key, path, got) {
+    const e = this.#shim.exports;
+    this.#cgenModule(key, got);
+    const ent = got.entries instanceof Uint8Array ? got.entries : new Uint8Array(got.entries);
+    const gp = e.gex_alloc(Math.max(8, ent.byteLength)) >>> 0;
+    this.#bytes().set(ent, gp);
+    const r = e.gex_cgen_publish(u, gp, ent.byteLength / 8);
+    e.gex_free?.(gp, Math.max(8, ent.byteLength));
+    if (r < 0) throw new Error(`gex-cgen: publishing ${path}'s unit failed`);
+    this.#cgenCatchUp();
+    e.gex_cgen_installed(u);
+  }
+
+  /** The unit cache's link groups (`groups/index.txt`: a group key, then its
+   *  members' unit keys, per line), by member key; read once. */
+  #cgenGroups = null;
+  #cgenGroupOf(key) {
+    if (!this.#cgenGroups) {
+      this.#cgenGroups = new Map();
+      const b = this.#env.loadFile?.('groups/index.txt') ?? null;
+      const text = b ? new TextDecoder().decode(b) : '';
+      for (const line of text.split('\n')) {
+        const [gkey, ...members] = line.trim().split(/\s+/);
+        if (!gkey || !members.length) continue;
+        const g = { key: gkey, members, held: new Map(), done: false };
+        for (const m of members) this.#cgenGroups.set(m, g);
+      }
+    }
+    const g = this.#cgenGroups.get(key);
+    return g && !g.done ? g : null;
+  }
+
+  /** Every member of `grp` is placed: publish the group's module in place
+   *  of their units (or, without one, each member's own), then each
+   *  member's providers and region entries. */
+  #cgenGroup(grp, t0) {
+    const e = this.#shim.exports;
+    grp.done = true;
+    const ms = grp.members.map((k) => ({ key: k, ...grp.held.get(k) }));
+    const got = this.#env.loadUnit?.(`groups/${grp.key}`) ?? null;
+    if (!got) {
+      console.error(`gex-nt: link group ${grp.key} is not in the unit cache; its members' own units`);
+      for (const m of ms) this.#cgenUnit(m.u, m.key, m.path, t0);
+      return;
+    }
+    const us = new Uint32Array(ms.map((m) => m.u));
+    const kb = new TextEncoder().encode(grp.key);
+    const up = e.gex_alloc(Math.max(8, us.byteLength)) >>> 0;
+    const kp = e.gex_alloc(Math.max(8, kb.byteLength)) >>> 0;
+    this.#bytes().set(new Uint8Array(us.buffer), up);
+    this.#bytes().set(kb, kp);
+    const g = e.gex_cgen_group(up, us.length, kp, kb.byteLength);
+    e.gex_free?.(up, Math.max(8, us.byteLength));
+    e.gex_free?.(kp, Math.max(8, kb.byteLength));
+    if (g < 0) throw new Error(`gex-cgen: link group ${grp.key}: no unit`);
+    const path = this.#cgenStr(e.gex_cgen_path, g);
+    this.#cgenPublish(g, `groups/${grp.key}`, path, got);
+    console.error(`gex-nt: ${path} (${grp.key}): ${got.entries.byteLength / 8} entries, placed in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+    for (const m of ms) {
+      this.#cgenProviders(m.u);
+      this.#cgenRegions(m.u, m.path);
+    }
   }
 
   useGl(gl) {
@@ -3568,6 +3771,10 @@ export class Gex {
     const sp0 = e.__stack_pointer.value;
     const me = this.#callouts.length;
     const c = { ret: BigInt.asUintN(64, ret), spWant: BigInt.asUintN(64, spWant), w: null, nestAt: this.#nest.length };
+    // A guest call from native Wine (its return is gex-kernel's
+    // NATIVE_RETURN_PAD): its native caller's frames are just above the
+    // callee's arguments (cgen.rs NATIVE_UNWOUND, as natively).
+    c.unwound = c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
     this.#callouts.push(c);
     this.#nest.push('callout');
     this.#calloutsMade++;
@@ -3611,6 +3818,11 @@ export class Gex {
           }
           const hit = e.gex_callout_hit();
           if (hit >= 0) return hit === me ? 1 : 0;
+          // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
+          // frames): a native caller's call-out leaves, at the context's PC
+          // (the entry the guest makes again); anything else carries on.
+          if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
+              && new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true) > c.spWant + c.unwound) return 0;
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -3656,7 +3868,7 @@ export class Gex {
           // The stack unwound past the caller (longjmp, an exception
           // handled further out): its frame is gone, so it leaves.
           const sp = new DataView(this.#memory.buffer).getBigUint64(ctx + CTX_SP, true);
-          if (sp > c.spWant + CALLOUT_UNWOUND) {
+          if (sp > c.spWant + c.unwound) {
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
           }

@@ -46,6 +46,40 @@ pub mod tramp {
     /// (two return addresses above the arguments):
     /// `mov eax, UNIX_CALL; call 1f; ret 16; 1: int 0x80; ret`.
     pub const UNIX_CALL_32: u64 = TRAMPOLINES + 0x60;
+    /// `jmp eax`: where native Wine (gexrt) sends the guest to call a
+    /// function again from the guest's side (an entry re-made after the
+    /// native frames it was nested in were dropped, gex_nr::NATIVE_LEFT),
+    /// the function's address in EAX. Not the function's own address as the
+    /// PC: a body that leaves for its own address has served nothing, and
+    /// tier-1 would take its slot over.
+    pub const JMP_EAX_32: u64 = TRAMPOLINES + 0x80;
+    /// Native Wine's virtual calls on guest C++ objects (msvcrt's
+    /// CALL_VTBL_FUNC, gexrt `__gexw_vtbl_target`), as i386 Wine's
+    /// `vtbl_wrapper_N`: the caller pushed `this` first; it goes to ECX and
+    /// the call to the vtable's entry `n`: `pop eax; pop ecx; push eax;
+    /// mov eax, [ecx]; jmp [eax + 4n]`. 64 of them, 16 bytes apart.
+    pub const VTBL_WRAPPERS_32: u64 = TRAMPOLINES + 0x100;
+    pub const VTBL_WRAPPERS: u64 = 64;
+    /// The return address of a guest call from native Wine (gexrt's
+    /// `GEXW_RETURN_PAD`, docs/wine-native.md §3.15): the page's last word,
+    /// filler no code has. A call-out waiting for it is a native caller's,
+    /// whose frames lie just above the callee's stack: the stack pointer
+    /// rising past its arguments means the guest left them (a catch block
+    /// continuing in an outer frame).
+    pub const NATIVE_RETURN_PAD: u64 = crate::nt::TRAMPOLINES_END - 0xf;
+}
+
+/// Where the trampoline page's code continues after its system call
+/// instructions (and the unix-call dispatcher's inner call): where a host
+/// that leaves the guest's code for a system call (the browser's) resumes
+/// it. The unit has no entries there; an ejected web build gives them
+/// region entries (docs/eject-pe.md §6).
+pub fn trampoline_resumes(class32: bool) -> Vec<u64> {
+    if class32 {
+        vec![tramp::SYSCALL_DISPATCHER_32 + 2, tramp::UNIX_CALL_32 + 10, tramp::UNIX_CALL_32 + 15]
+    } else {
+        vec![tramp::UNIX_CALL_64 + 10]
+    }
 }
 
 pub fn trampoline_page() -> Vec<u8> {
@@ -64,6 +98,11 @@ pub fn trampoline_page() -> Vec<u8> {
         tramp::UNIX_CALL_32,
         &[0xb8, n[0], n[1], n[2], n[3], 0xe8, 0x03, 0x00, 0x00, 0x00, 0xc2, 0x10, 0x00, 0xcd, 0x80, 0xc3],
     );
+    put(&mut page, tramp::JMP_EAX_32, &[0xff, 0xe0]);
+    for n in 0..tramp::VTBL_WRAPPERS {
+        let d = (4 * n as u32).to_le_bytes();
+        put(&mut page, tramp::VTBL_WRAPPERS_32 + 16 * n, &[0x58, 0x59, 0x50, 0x8b, 0x01, 0xff, 0xa0, d[0], d[1], d[2], d[3]]);
+    }
     page
 }
 

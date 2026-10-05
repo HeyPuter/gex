@@ -3,7 +3,7 @@
 # same cases as tests/nt/run.sh, each run by shims/browser/js/run-node.mjs --
 # the shim and glue a page loads, under Node -- with GEX_NT_STRICT=1.
 #
-#   tests/nt/run-browser.sh [--cgen]   (ONLY=<regex> picks cases, ARCHES="x64")
+#   tests/nt/run-browser.sh [--cgen|--cgen-prefer]   (ONLY=<regex> picks cases, ARCHES="x64")
 #
 # --cgen: with the function tier's units (run-node.mjs --cgen), required for
 # each program image and used for every Wine DLL that has one, from
@@ -15,7 +15,12 @@
 # (tools/nt-stage-wine.sh), bundled as /wine.
 set -u
 nodeflags=()
-[ "${1:-}" = --cgen ] && { nodeflags+=(--cgen); shift; }
+case "${1:-}" in
+    --cgen) nodeflags+=(--cgen); shift ;;
+    # units where found; also what installs a native wasm32 Wine prefix's
+    # module (tools/wine-wasm/stage-native.sh, GEX_WINE_PREFIX)
+    --cgen-prefer) nodeflags+=(--cgen-prefer); shift ;;
+esac
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 cd "$root"

@@ -312,7 +312,7 @@ impl UnixSocket {
     }
 
     pub fn shutdown(&self) {
-        self.shutdown_how(1);
+        let _ = self.shutdown_how(1);
     }
 
     /// `shutdown(2)`: 0 stops reading (the peer's writes then fail with

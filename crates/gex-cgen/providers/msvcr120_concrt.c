@@ -22,12 +22,9 @@
  * and when a wake signals a waiter. A host with no parked thread just sees
  * the word change. */
 #define YIELD_GEN 0x7ffe0ff0u
-/* How many threads are parked on it (gex_kernel::nt::sync::YIELD_PARKED):
- * with none, the kick skips memory.atomic.notify, which takes a global lock
- * in V8 even with nobody to wake (cond_notify and cs_unlock_ were 2-4 ms of
- * every world frame in the page). A parker publishes itself before it reads
- * the generation, and its wait compares the word, so a bump it missed ends
- * the wait anyway. */
+/* How many threads are parked on it (gex_kernel::nt::sync::YIELD_PARKED): a
+ * notify with nobody parked is a host futex call for nothing, and kicks come
+ * with every notify and contended unlock. */
 #define YIELD_PARKED 0x7ffe0ff4u
 static void yield_kick(void) {
     __atomic_fetch_add(GA(YIELD_GEN), 1u, __ATOMIC_SEQ_CST);

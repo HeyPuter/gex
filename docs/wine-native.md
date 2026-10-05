@@ -349,14 +349,26 @@ call callee(args)
 
 - **Spike (b)** runs on the pass by default: demo.dll's callbacks, cdecl
   and stdcall, plus a double-returning callback with an int64 argument.
-- **Not yet handled:** native function pointers that escape to guest code
-  (COM vtables a native DLL hands the program, WNDPROCs) are table
-  indices, which x86 code cannot call. The plan is ARM64EC's entry thunks:
-  - gex's lookup of an address below 0x400000 routes it to an entry adapter
-    for that function's signature and convention;
-  - the convention comes from `WINAPI`/`__stdcall` declarations, which
-    clang drops on wasm32 and must be carried as an annotation;
-  - this is W2 work with the PE loader.
+- **Entry thunks (W2, as built):** native function pointers that escape to
+  guest code (COM vtables a native DLL hands the program, window procedures)
+  are table indices, which x86 code cannot call by themselves.
+  - On wasm32 `__stdcall` (so `WINAPI`, `CALLBACK`, `STDMETHODCALLTYPE`) is
+    `annotate("gex.stdcall")` (corecrt.h); clang ignores it on types and
+    keeps it on functions (`llvm.global.annotations`).
+  - The ICALL pass writes `__gexe.<fn>` for every function whose address
+    escapes (any use but a direct call or metadata): winebuild's adapter
+    shape, arguments by the wasm signature (i64/double 8 bytes, byval
+    structs by address, MSVC's struct returns: 1/2/4/8 bytes in EDX:EAX,
+    larger through the hidden pointer), popped if stdcall. Varargs
+    functions get none.
+  - `{function, thunk}` pairs go in the data section `gexw_entries` (pesym
+    restores the RETAIN flag `wasm-ld -r` drops); gexrt anchors the section
+    and exports its bounds as `__gexw_entries`.
+  - gexc (`wasmdll::bind_entry_thunks`, shared mode only) reads the
+    relocated pairs once the module's data is initialised and binds each
+    thunk at its function's table index as a guest address.
+  - Not covered: thiscall/fastcall functions (no annotation yet), and
+    per-DLL modules (§3.13).
 
 ### 3.11 The wasm32 ABI on gex-kernel (W1, 2026-10-04)
 
@@ -533,7 +545,8 @@ In the Wine fork (`wt/wine-wasm`, branch `wasm32`):
   - void;
   - cdecl and stdcall callbacks (through the ICALL pass);
   - a data export, a forwarder and a stub.
-- **Open for W2:** imports between DLL modules. Each DLL's module imports
+- **Imports between DLL modules** (decided: §3.14 links the PE side as
+  one module). The original note: Each DLL's module imports
   what other DLLs define, and gex instantiates a module when its DLL maps,
   which can be before the DLLs it imports from. The proposed answer is the
   closed world again:
@@ -542,6 +555,162 @@ In the Wine fork (`wt/wine-wasm`, branch `wasm32`):
     symbols cannot collide;
   - every cross-DLL call is then direct, with LTO across DLLs;
   - per-DLL modules stay possible for a run-time-loaded DLL.
+
+### 3.14 Wine's PE side as one module (W2, as built)
+
+The alternative to per-DLL modules (§3.13, which stay possible): every DLL
+of the PE side linked into one wasm module, as an ejected program is
+linked. Cross-DLL calls are direct, and there is one copy of the runtime
+and one exception tag.
+- **Each DLL as one relocatable object.** winegcc (wasm32) also writes
+  `X.dll.so.r.o` (`wasm-ld -r` of the DLL's objects and static libraries)
+  and `X.dll.so.exports` (winebuild's list of the DLL's export link
+  names). The shared runtime moved out of winecrt0 into `libs/gexrt`,
+  which is linked once.
+- **`tools/wine-wasm/pesym.py`** rewrites the linking section's symbol
+  table of each DLL object:
+  - `dll`: the DLL's exports and spec glue become `DLL!name`; every other
+    defined symbol becomes local, so private names cannot collide and two
+    DLLs may export the same name.
+  - `imports`: each undefined symbol that another DLL exports becomes
+    `owner!name`, the owner being the first of the DLL's IMPORTS that
+    exports it, else any DLL.
+  - The stale name section that `wasm-ld -r` wrote is dropped, so the
+    final module's function names are the renamed symbols.
+- **`tools/wine-wasm/pelink.py`** runs both passes and links everything
+  with libgexrt into one PIC module. It works from a Wine build tree, or
+  from explicit `--dll NAME R.o EXPORTS [IMPORTS]` inputs. The DLLs' data
+  exports are exported as globals (their data offsets); what stays
+  undefined is listed beside the module.
+- **Skeletons:** `winebuild --fake-module --wasm-shared NAME` writes them
+  with no code or data of their own. A `.wasmref` section names the
+  module, the DLL and the DLL's data exports (export index, link name).
+- **In gexc** (`wasmdll`, shared mode):
+  - The first skeleton to map installs the module (its data from the NT
+    allocator); every later one binds its exports to the same install's
+    slots (`FuncMap::bind`, new and additive).
+  - `-import` re-exports are bound to the owner's adapter.
+  - Data exports are pointed at the module's data by rewriting the
+    skeleton's export address table entries (32-bit RVAs wrap to any
+    address).
+- **Tested:** `tests/wasm32/dll/shared.sh`. Three DLLs, two of which
+  export the same name and each define a private function of the same
+  name. One DLL calls another's export directly. A data export reads the
+  shared data. All of it from a MinGW i386 program.
+
+### 3.15 ntdll and the boundary at run time (W2, as built)
+
+Native Wine runs inside the guest thread, as Windows' DLLs do:
+- **One stack.** Every adapter enters through gexrt's `__gexw_entry`, which
+  moves the C stack pointer below the guest's ESP (by 64, aligned to 16).
+  SEH frames that native `__TRY` pushes, the TEB's stack limits and
+  `is_valid_frame` see one stack. The per-thread globals (context, depth,
+  the guest return address `__builtin_return_address` means on wasm32)
+  are put back on the way out.
+- **Calls into the guest** (`__gexw_guest_call`, the ICALL exit stubs) push
+  the arguments below the native stack and run gex's dispatch until their
+  own return address comes back (`target ^ 1`, watched as before). A
+  fastcall variant sets ECX/EDX (`BaseThreadInitThunk`).
+- **Loading a guest state** (NtContinue, NtContinueEx, NtSetContextThread,
+  RtlRestoreContext) throws `__gexw_unwind`: every native frame up to the
+  innermost `__gexw_entry` goes, and that entry returns 0, so gex carries
+  on from the context. A longjmp out of guest frames into a native
+  `setjmp` restores the guest ESP and depth the jump skipped (gexrt's SjLj
+  runtime keeps them in the buffer).
+- **System calls.** ntdll's stubs (`syscall_wasm32.c`, generated per
+  argument size from `wine/gex/syscall.h`) call `__gexw_syscall`, which
+  writes the words above two return addresses below the native stack (the
+  i386 stub shape gex-kernel's NT layer reads), sets EAX and calls
+  `gex.syscall` with bit 61 of the pc set (`NATIVE_SYSCALL`, next to
+  `RESUMABLE_PC`'s bit 62; merge-plan §9.8). Under that bit a Resume
+  writes PC and returns instead of trapping out. If the kernel redirected
+  the thread (an APC from an alertable wait), the stub runs it nested
+  until it comes back to the syscall's own state; the resume-type calls
+  throw instead. Exit, thread exit and NtCallbackReturn still trap out
+  (they end host loops).
+- **Guest code that leaves native frames** (W2, gooner). A guest handler
+  native code called may never return: an i386 catch block continues in an
+  outer frame (`continue_after_catch`), an `__except` resumes its function.
+  The guest then runs on nested inside the native frames (and the call-out
+  holding them), one level per exception, until the call-outs run out
+  (32) and the thread livelocks. Three pieces flatten it:
+  - gexrt's `run_until` drops the frames (throws `__gexw_unwind` to its
+    entry) when the guest stack pointer is at or above the one at the guest
+    call (native code's guest ESP is its entry's);
+  - an entry made at or above the innermost entry's stack pointer (gexrt
+    tracks it per thread, as a hint) issues `gex_nr::NATIVE_LEFT`: the host
+    leaves the innermost call-out if it is a native caller's (its return is
+    `tramp::NATIVE_RETURN_PAD`) and the guest is above its callee's frame
+    (`NATIVE_UNWOUND`, 512 bytes), and the guest calls the function again
+    from `tramp::JMP_EAX_32` (`jmp eax`; EAX is free at a call). Re-entering
+    at the function's own address would not do: a body leaving for its own
+    address has served nothing, and the bridge hands the address to tier-1.
+  - a safepoint leaves a native caller's call-out the same way, except at a
+    function's own address (the entry about to run does it).
+  tests/nt `x86/msvc_cxxeh` (clang-cl i386 C++ and SEH, built by
+  tests/nt/msvc/build.sh) throws 20000 times through x86 msvcrt.
+- **Exceptions.** A guest fault reaches `KiUserExceptionDispatcher` as
+  before (a hand-written entry: no return address), whose
+  `dispatch_exception` ends in NtContinue. An exception native code raises
+  (`RtlRaiseException`) is dispatched in place: continuing returns, unless
+  a handler moved Eip/Esp/Ebp. `RtlUnwind` calls the unwind handlers and
+  returns, which is where i386's NtContinue went. Captured contexts are the
+  guest's state at the innermost entry.
+- **Hand-written entries:** KiUserExceptionDispatcher,
+  KiUserApcDispatcher, RtlUserThreadStart (entry in EAX, argument in EBX),
+  `_chkstk`/`_alloca_probe`. winebuild skips an export whose `gexp_` the
+  objects already define.
+- **ntdll's variables and its own base.** gex-kernel's boot writes
+  `__wine_syscall_dispatcher`, `__wine_unix_call_dispatcher` and
+  `__wine_unixlib_handle` through ntdll's export table, which in a shared
+  skeleton points all data exports at one placeholder until the install.
+  A native ntdll needs only the handle: wasmdll queues it for the module's
+  variable and writes it after the drain's catch-up has instantiated the
+  module (its data initialisation would clear it). Unix calls go through
+  `__wine_unix_call_wasm32` (gex's private UNIX_CALL system call): the
+  i386 trampolines are guest code below the ICALL check's floor (0x400000),
+  so a native call through them would be taken for a table index. ntdll
+  finds its own image from the guest address `LdrInitializeThunk` was
+  entered at (its functions' addresses are table indices), and parses
+  `WINEDEBUG` itself when no Unix side has filled the options below the
+  PEB (Wine's default otherwise: err and fixme).
+- **Forwards across the one module.** `.exports` lists forwards; pelink
+  binds a forwarded name to an alias the defining DLL gets
+  (`kernel32.dll!HeapAlloc` for ntdll's `RtlAllocateHeap`), or to a
+  generated thunk where the declarations differ (kernel32's void
+  `EnterCriticalSection` against NTSTATUS `RtlEnterCriticalSection`): wasm
+  calls must match exactly. The resolved forwards also go into the module
+  as a custom section, `gexw.forwards`, so gex binds a `-import` re-export
+  of a forwarded name (kernel32's `HeapFree`, kernelbase's forward to
+  `RtlFreeHeap`) to the adapter it reaches. compiler-rt's builtins are
+  linked in.
+- **A native prefix:** `tools/wine-wasm/stage-native.sh BUILD SRC OUT DLL...`
+  links the named DLLs into `winepe.wasm` and writes their skeletons into a
+  copy (symbolic links) of the x86 prefix, without its layout pins. The
+  other DLLs stay i386 code.
+
+### 3.16 Native Wine in the browser (W2, as built)
+
+- **Install** (`shims/browser/src/cgen/wasmdll.rs`): a skeleton is a
+  placed image's only provider (no byte check, no unit). Its publish
+  (`gex_wasmdll_publish`) reads Wine's PE module from the prefix through
+  the kernel's VFS at the first skeleton and publishes it as a stateful
+  provider (data top down from the NT allocator); later skeletons bind into
+  the same install (`FuncMap::bind`) and queue their bridges (`BINDS`), which
+  every Worker writes once (`#wasmdllCatchUp`, from every `#cgenCatchUp`).
+  The publishing Worker's install then writes ntdll's boot variables and
+  binds the entry thunks (`gex_wasmdll_installed`).
+- **Native system calls:** the module's `gex.syscall` import is JS's
+  (`#nativeSyscall`). The shim strips bit 61 and, for a native call, a
+  Resume writes the PC and returns (as natively). A trap the shim takes for
+  a unit to fetch or a thread to start resumes at the call's own stop
+  address: the wrapper serves it (catch-up, `#cgenServe`, `#drainThread`)
+  and returns into native code. Other traps (exit, thread exit, a
+  callback's return, a resume elsewhere) go on up.
+- Needs the units mode on (`--cgen-prefer` at least): the image-mapped hook
+  is only set then. Per-DLL modules (`.wasm`) are native only.
+- Not yet run: the page itself (Chrome), and threads that start inside
+  native code under load.
 
 ### 3.9 x64 programs (later)
 
@@ -842,3 +1011,121 @@ plus `make -k`.
    worth: F's Wine units and the NT layer's per-library work get less
    valuable, while app-code AOT and the browser runtime keep their value.
 4. **Whether x64 programs (W7) matter before Unity.**
+
+## 7. State and how to resume (stream W)
+
+**Where things are** (all relative to `${NW_ROOT:-~/gex-sandbox}`; on gooner since 2026-10-04, `$W` = `~/gex-sandbox/scratch/W`):
+
+| what | where |
+|---|---|
+| gex side (this plan, tools/wine-wasm, shim, tests) | `wt/wine`, branch `merge/wine-wasm` |
+| wasmtime 49 upgrade (rustc 1.96 pinned) | `wt/wasmtime49`, branch `merge/wasmtime49` |
+| Wine fork | `wt/wine-wasm`, branch `wasm32`, remote `mw` |
+| musl fork | `wt/musl-wasm`, branch `gex-wasm32`, remote `mw` |
+| Wine 11.15 reference | `wt/nt-wine-src` (read-only) |
+
+**Rebuilding the outputs** (`$W` = stream W's scratch directory):
+1. Sysroot: `GEX_CRT_SRC=<llvm-project 22>/compiler-rt/lib/builtins
+   tools/wine-wasm/build-sysroot.sh $W` gives `$W/sysroot` (musl, UAPI
+   headers, compiler-rt builtins, the ICALL plugin). Export
+   `GEX_WASM_SYSROOT=$W/sysroot` for everything below.
+2. Wine's tools, a host build of the fork, in `$W/wine-tools`:
+   `<fork>/configure $OPTS && make -j4` (winebuild, winegcc and the other
+   tools are what the wasm32 tree uses), where `$OPTS` is
+   `--without-x --without-freetype --disable-tests --without-mingw --enable-archs= --without-gstreamer --without-pulse --without-alsa --without-cups --without-sane --without-gphoto --without-v4l2 --without-wayland --without-vulkan --without-opengl --without-dbus --without-krb5 --without-gssapi --without-netapi --without-pcap --without-usb --without-unwind --without-sdl --without-oss --without-udev --without-capi --without-inotify`.
+3. The wasm32 tree, in `$W/wine-w32`: `<fork>/configure
+   --host=wasm32-unknown-linux-musl --with-wine-tools=$W/wine-tools $OPTS
+   --without-gnutls --without-ffmpeg --without-fontconfig
+   CC=<wt/wine>/tools/wine-wasm/wcc`, then `make -k -j4`. Each DLL leaves
+   `X.dll.so.r.o` and `.exports` beside it.
+4. A native prefix: `tools/wine-wasm/stage-native.sh $W/wine-w32
+   <fork> $W/pfx-native ntdll.dll kernelbase.dll kernel32.dll`.
+
+**On gooner (2026-10-04 night):**
+- Sysroot rebuilt (`$W/sysroot`, emsdk's compiler-rt via env.sh's `GEX_CRT_SRC`;
+  9e3d7632 fixes the script for Debian's asm symlink and llvm-config-22).
+- `$W/wine-tools`: only `make __tooldeps__` is needed (the full host Wine build is not).
+- `$W/build-w32.sh` configures and builds the wasm32 tree (`make -k -j4`, nice 19);
+  `$W/browser-nt.sh [WORKTREE]` builds the x86 shims and runs tests/nt/run-browser.sh.
+- `$W/wine-tools/nls/locale.nls` must link to the fork's `nls/locale.nls`
+  (wrc/wmc read it from the tools tree; build-w32.sh makes the link).
+- **wt/wasmtime49** recreated (`git worktree add`), master merged (86734783):
+  browser NT **49/49**. Coordinator's full gate queued; don't touch the branch.
+- **tests/nt with native ntdll, kernelbase, kernel32: 60/60** (38c4542b, fork
+  a25afcc0bd4): x86/display needed entry thunks (§3.3), since builtin window
+  classes' procedures are ntdll's `RtlRetrieveNtUserPfn` table.
+- **`--cgen` with native skeletons: 60/60** (`GEX_WINE_PREFIX=$W/pfx-native
+  tests/nt/cgen-prefix.sh`); skeletons get no unit (`nt_cgen::is_wasm_skeleton`).
+- **Browser (node) with native ntdll, kernelbase, kernel32: x86 23/23**
+  (`GEX_CGEN_CACHE=target/nt-test-cgen GEX_WINE_PREFIX=$W/pfx-native ARCHES=x86
+  tests/nt/run-browser.sh --cgen-prefer`; the cache supplies crt_mem/crt_math,
+  which a native run builds). See §3.16. Committed 7e02468b.
+- **master merged** (fd8be1d1, wasmtime49 landed; wt/wasmtime49 removed).
+  `$W/check.sh` runs W's pre-gate checks: tests/nt both prefixes, tests/wasm32,
+  browser NT both prefixes.
+- **Native msvcrt and ucrtbase (merge/wine-crt 5e9b0618, fork f454cff22f8):**
+  tests/nt **61/61** with ntdll, kernelbase, kernel32, msvcrt and ucrtbase
+  native (`$W/pfx-crt`), including x86/msvc_cxxeh through native msvcrt.
+  - msvcrt's except_i386.c builds for wasm32 with gexrt doing its assembly
+    (wine/gex/runtime.h); vtables in C with a `.set`/`.hidden` alias;
+    thiscall calls into guest objects with ECX; vtbl wrappers in the
+    trampoline page (tramp::VTBL_WRAPPERS_32, re-keys the trampoline unit).
+  - minwindef.h had defined __stdcall empty on wasm32 (so entry thunks never
+    popped): now annotate("gex.stdcall"/"gex.thiscall"/"gex.fastcall").
+  - varargs adapters: the guest's stack is the va buffer; a printf (by name)
+    is relaid by its format (8-byte args 8-aligned).
+  - pelink: stubs for imports from i386 DLLs (LoadLibraryA/GetProcAddress
+    once, then a guest call); exports bound to the DLL that defines them.
+  - Since: msvcp140/concrt140/vcruntime140 native (vtables in assembly with
+    `.type`'d function references; thiscall methods always get entry
+    thunks); x87/SSE2 register-convention entry points (_CI*, _ftol,
+    __libm_sse2_*: gexrt's x87 pop and guest XMM access); `_chkesp` and
+    ntdll's `_allshl`/`_alldvrm`... as hand-written entries; win32u's
+    system-call stubs; winecrt0's image base from gex (`__gexw_image_base`,
+    a data export of every DLL that wasmdll writes). tests/nt 77/77 on
+    `$W/pfx-native` (3 DLLs), `$W/pfx-w32u` (9: + msvcrt, ucrtbase,
+    vcruntime140, msvcp140, concrt140, win32u) and the x86 prefix.
+  - `$W/noadapter.sh DLL` lists a DLL's function exports with no adapter.
+  - Open: `_vsnprintf_s`, the NtWow64*64 calls, guest FP control words
+    (`__control87_2` is a stub on wasm32), user32/gdi32 native.
+  - wine-w32's Makefile now uses wt/wine-crt's wcc (sed); merge into
+    merge/wine-wasm after its gate.
+- **CRTs (plan, kept for reference):** native msvcrt needs an i386-semantics `except_wasm32.c`
+  (cxx_frame_handler, `_except_handler3/4`, `_setjmp`/`longjmp` on the guest
+  context; catch blocks and filters as guest calls with EBP set,
+  `continue_after_catch` as a guest-state load), CXX_USE_RVA off on wasm32,
+  `__ASM_VTABLE` as C (`name_vtable_full` plus `.set name_vtable, +4`, tested),
+  `__thiscall` annotated for thiscall entry thunks, and CALL_VTBL_FUNC on
+  guest objects through small x86 `vtbl_wrapper_N` thunks (pop/pop ecx/push/
+  jmp [eax+off]) in RWX memory.
+- `$W/cycle.sh` rebuilds the three DLLs and restages `$W/pfx-native`;
+  `$W/elemmap.py MODULE IDX...` names a table index's function.
+
+**State (2026-10-04):**
+- **W0 and W1:** done (§4.1, §4.2).
+- **wasmtime 49:**
+  - The gate is green on a64, x86, nt (both modes), glibc, lockstep, ppc
+    and wasm32.
+  - The browser nt rerun is still to do; it needed the wasm32 target in the
+    toolchain (fixed).
+- **W2:**
+  - The one-module PE side works (§3.14, tests/wasm32/dll/shared.sh).
+  - The runtime boundary is built (§3.15), and native ntdll, kernelbase
+    and kernel32 link into one module with nothing unresolved.
+  - **tests/nt (`--no-cgen`, wasmtime 49) with native ntdll, kernelbase
+    and kernel32** and the rest of Wine x86: 59 of 60 pass, including the
+    W2 gate (hello, sync, tls, seh and seh-traps, apc, cxx), the x86 GUI
+    tests and pe-x86/msvc. (x86/display: fixed on gooner, 60/60.)
+    - The ICALL floor is 0x3f0000, gex-kernel's NT trampolines: native code
+      calls the unix-call trampoline through the check.
+    - A guest call from native code returns to a pad at 0x3ffff1 in the
+      trampoline page, not `target ^ 1`: tier-1 watched a slot in the
+      callee's own page that its code then needed (msvc.exe).
+    - `--cgen` with native skeletons is untested.
+  - **Next:**
+    - the CRTs (msvcrt/ucrtbase: `DISPATCHER_CONTEXT`, `__ASM_VTABLE`);
+    - win32u's system-call stubs (the same `wine/gex/syscall.h`);
+    - varargs adapters;
+    - entry thunks: thiscall/fastcall (msvcp vtables), per-DLL modules.
+- **Open:** the `relocate_once` workaround in wasmprog goes once E's
+  29a2c2a1 is on main.

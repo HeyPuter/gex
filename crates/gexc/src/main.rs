@@ -45,7 +45,10 @@ fn real_main() -> Result<ExitCode> {
     // function fully, so V8's missing OSR does not apply): `GEX_CGEN_GUARD=1`
     // builds and uses the guarded, browser flavor instead.
     // Only for what runs here: `gexc build` makes modules for the browser.
-    let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c");
+    // An ejected project's native build and run too (its units are the
+    // native flavor; the web build's are built apart).
+    let native = matches!(argv[1].as_str(), "run" | "cgen-image" | "cgen-prefix" | "cgen-c")
+        || (argv[1] == "eject" && matches!(argv.get(2).map(String::as_str), Some("build" | "run")));
     let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
     gex_cgen::image::set_unguarded(native && !guard);
     match argv[1].as_str() {
@@ -68,6 +71,24 @@ fn real_main() -> Result<ExitCode> {
         "closure" => cmd_closure(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "pe-info" => pe_info::cmd_pe_info(&argv[2..]).map(|_| ExitCode::SUCCESS),
         "profile" => cmd_profile(&argv[2..]).map(|_| ExitCode::SUCCESS),
+        // `eject run` runs the guest, as `run` does: on a thread with a
+        // guest-sized stack, under GEX_PROF when asked.
+        "eject" if argv.get(2).map(String::as_str) == Some("run") => {
+            prof::start();
+            let args = argv[2..].to_vec();
+            let r = std::thread::Builder::new()
+                .name("gex-main".into())
+                .stack_size(gex_native::guest_thread_stack())
+                .spawn(move || eject::cmd_eject(&args))
+                .expect("spawning the main guest thread")
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p));
+            prof::finish();
+            match r? {
+                Some(exit) => Ok(report_exit(&exit, false)),
+                None => Ok(ExitCode::SUCCESS),
+            }
+        }
         "eject" => match eject::cmd_eject(&argv[2..])? {
             Some(exit) => Ok(report_exit(&exit, false)),
             None => Ok(ExitCode::SUCCESS),
@@ -2255,6 +2276,12 @@ fn cmd_cgen_prefix(args: &[String]) -> Result<()> {
     for (path, base) in &todo {
         let bytes = std::fs::read(path)?;
         let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+        // A native wasm32 Wine DLL (tools/wine-wasm/stage-native.sh): laid
+        // out like the rest, but it has no x86 code to build a unit of.
+        if gex_native::nt_cgen::is_wasm_skeleton(&pe) {
+            eprintln!("cgen-prefix: {path}: native wasm32 skeleton; no unit");
+            continue;
+        }
         let t0 = std::time::Instant::now();
         let out = gex_native::nt_cgen::prepare_pe(&pe, *base, jobs, false)
             .with_context(|| format!("building the function tier for {path} at {base:#x}"))?;
