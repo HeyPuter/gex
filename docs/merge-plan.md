@@ -1099,3 +1099,36 @@ Gaps before it is general:
 - performance work on the syscall boundary.
 
 Not scheduled. Revisit after Wine W1–W3 have hardened the toolchain.
+
+### 10.1 Target: the whole libc native, linked into the program (decided 2026-10-05)
+
+The end goal for `gexcc` is full source compatibility with any Linux codebase,
+so it can build glibc itself. With that, translated (binary-only) Linux
+programs get **the whole libc (libc, libm, libpthread) as native wasm**, not a
+hand-picked set of hot functions:
+
+- **No new boundary cost.** A guest→native adapter call (~6.5 ns in V8, stream
+  W's spike (c)) costs the same as today's call between two translated images,
+  which translated glibc already pays. Native code behind the boundary is better
+  than lifted code (no flags, no x87, wasm SIMD for mem*/str*).
+- **Linked into the program's module.** Both sides are clang-built objects, so
+  the native libc joins the program's link group (§9.6): libc calls become
+  direct calls (~0.5 ns) that LTO can inline. This removes the one case where
+  the boundary would dominate (tiny, very frequent calls: strlen on short
+  strings, ctype, `__errno_location`).
+- **Fixed at compile time, free at run time:** guest-visible layouts (FILE,
+  pthread_*, stat64) and the TCB conventions guest code reads directly
+  (`%fs:0x28` canary, `%fs:0x30` pointer guard). wasm64 with SysV x86-64
+  layouts for x86-64 guests (as U's Mono provider), i386-layout wasm32 for i386.
+- **Unchanged either way:** callbacks into guest code (qsort comparators,
+  atexit, pthread_create, signal handlers) at ~7.4–8.3 ns each.
+- **The risk is compatibility, not speed:** one broken export breaks every Linux
+  program, so the replacement is gated on conformance (lockstep against the
+  translated glibc).
+
+**The bridge until gexcc builds glibc:** stream W's ELF export providers
+(merge/elf-prov): native mem*/str*, malloc and libm bound by soname, with
+glibc's IFUNC resolvers provided so every PLT/GOT caller lands on the native
+code. The binding mechanism is general (any export set of a soname, versioned
+symbols, IFUNCs), so the whole-libc provider later reuses it rather than
+replacing it.
