@@ -311,6 +311,7 @@ mod imp {
         GL_READBACK.store(flag("GEX_NT_GL_READBACK"), Ordering::Relaxed);
         GL_STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
         nt::opengl::STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
+        nt::opengl::FAST.store(var("GEX_NT_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
         TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);

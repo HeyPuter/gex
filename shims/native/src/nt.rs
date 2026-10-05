@@ -271,6 +271,7 @@ fn start_ticker(memory: gex_mem::GuestMemory, p: std::sync::Weak<nt::Process>, s
     // GEX_NT_GL_STATS=1: the program's GL by function, with the 60 s report.
     let gl_stats = std::env::var("GEX_NT_GL_STATS").as_deref() == Ok("1");
     nt::opengl::STATS.store(gl_stats, std::sync::atomic::Ordering::Relaxed);
+    nt::opengl::FAST.store(std::env::var("GEX_NT_GL_FAST").map_or(true, |v| v != "0"), std::sync::atomic::Ordering::Relaxed);
     let peek = std::env::var("GEX_NT_PEEK").ok().and_then(|v| {
         let (addr, deref) = match v.strip_suffix('*') {
             Some(a) => (a, true),

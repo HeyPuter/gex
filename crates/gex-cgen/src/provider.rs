@@ -40,6 +40,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("debug_string", include_str!("../providers/debug_string.c")),
     ("crt_heap", include_str!("../providers/crt_heap.c")),
     ("nt_qpc", include_str!("../providers/nt_qpc.c")),
+    ("nt_unixcall", include_str!("../providers/nt_unixcall.c")),
 ];
 
 /// Files a stateful provider may `#include` (written beside it when built).
@@ -115,6 +116,18 @@ pub fn for_dll(dll: &str, class32: bool) -> Vec<Provider> {
         .map(|(n, t)| parse(n, t).expect("a provider source gex carries is well formed"))
         .filter(|p| p.dlls.contains(&dll) && p.class32 == class32)
         .collect()
+}
+
+/// The library name the NT trampoline page has for providers
+/// (`/* PROVIDES [nt-trampolines] ...`): the page is no PE image, so its
+/// "exports" are the trampolines by name ([`trampoline_exports`]).
+pub const TRAMPOLINES_DLL: &str = "[nt-trampolines]";
+
+/// The NT trampoline page's entries providers may bind, by name, as offsets
+/// from the page (gex_kernel::nt::boot::tramp): the i386 unix-call
+/// dispatcher. `unix_call_32` is the page offset of `tramp::UNIX_CALL_32`.
+pub fn trampoline_exports(unix_call_32: u32) -> HashMap<String, u32> {
+    HashMap::from([("unix_call_32".to_string(), unix_call_32)])
 }
 
 /// [`for_dll`] for an image whose file is `data`: without the `nowine`
