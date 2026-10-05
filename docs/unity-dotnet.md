@@ -524,6 +524,42 @@ Not yet:
     → `mono_gc_wbarrier_set_field (0, …)` → `mono_field_get_offset (0)`;
   - so the attribute object or a field lookup came back NULL, followed by
     an assertion on a NULL class.
+- **On gooner (2026-10-04, in progress):**
+  - Paths: project `~/gex-sandbox`; build output (`OUT`) is
+    `~/gex-sandbox/scratch/unity/dnc` (re-cloned; `dnc/src` is the fork at
+    6812ea26 with `patches/` applied); musl from `wt/musl-wasm64`.
+  - Toolchain: .NET SDK 10.0.110 (runtime 10.0.10, the shared framework
+    the test copies) installed with dotnet-install.sh in `~/.dotnet`; put it
+    on `PATH`. CMake also needs `llvm-strings`/`llvm-readelf`/`llvm-link`,
+    which on gooner live only in `/usr/lib/llvm-22/bin` (build.sh appends it).
+  - No taskset on gooner: build.sh runs at nice 19 only; `muck-dotnet.sh`
+    pins only if `CORES` is set. Use the Linux build:
+    `MUCK=~/gex-sandbox/games-linux/Muck` (the Steam symlink points at the
+    Windows one).
+  - The NULL lookup: `AttributeScannerQuery::UpdateAttributeUsageInfo`
+    (UnityPlayer.so 0xaf3820) reads AttributeUsageAttribute's fields by
+    name, `m_attributeTarget`/`m_inherited`/`m_allowMultiple` (falling back
+    to Mono's old `valid_on`/`inherited`/`allow_multiple`). .NET's CoreLib
+    names them `_attributeTarget`/`_inherited`/`_allowMultiple`. Fix: a
+    hand-written `mono_class_get_field_from_name` in gexmono-unity.c that
+    retries `m_x` as `_x`, then an alias table, and logs
+    `[gexmono] no field ...` on a final miss.
+  - Next, `scripting_field_has_attribute` asserted in Mono's
+    `find_field_index`: UnityPlayer's serializer passes the class it is
+    serializing (`List`1`) with an element type's field. The hand-written
+    `mono_custom_attrs_from_field` uses the field's own parent.
+  - Next, `CANNOT HANDLE INTERP ICALL SIG LLLLLLLL`: the m2n wrappers now
+    cover every function type in the provider (build.sh links, reads the
+    type section with `gen-m2n.py --types-from`, regenerates, relinks;
+    1,895 wrappers).
+  - **Result (21dbdeab, run `scratch/unity/runs/g3`):** Muck loads its menu
+    scene in batch mode and runs the game's scripts on .NET Mono: save file
+    created, settings applied, "Initializing packets", then the main loop
+    until the timeout. Steam is absent, so Facepunch's `SteamClient.Init`
+    throws and `SteamPacketManager.Update` logs a NullReferenceException
+    each frame, as it would on Unity's Mono without Steam.
+  - Next: graphics (the menu with in-guest Xwayland on gex's compositor),
+    then the browser.
 - **Resume (after the move; HEAD 1db5c816, `master` merged in):**
   0. The coordgate on this branch still lacks its browser NT step (it was
      stopped while E was timing), and nothing after 49a5773b has been
