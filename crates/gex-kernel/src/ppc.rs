@@ -887,6 +887,7 @@ fn i386_number(n: u64) -> Option<u64> {
         p::MEMFD_CREATE => x::MEMFD_CREATE,
         p::MEMBARRIER => x::MEMBARRIER,
         p::COPY_FILE_RANGE => x::COPY_FILE_RANGE,
+        p::SPLICE => x::SPLICE,
         p::STATX => x::STATX,
         p::RSEQ => x::RSEQ,
         p::CLOCK_GETTIME64 => x::CLOCK_GETTIME64,

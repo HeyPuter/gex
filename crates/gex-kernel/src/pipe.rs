@@ -406,7 +406,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             file_type: crate::vfs::FileType::Fifo,
             size: 0,
             mode: 0o600,
-            ino: 0,
+            ino: crate::vfs::anon_ino((0x10000 + self.id as usize) as *const u8),
             mtime: 0,
             nlink: 1,
             rdev: 0,
