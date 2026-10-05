@@ -16,12 +16,25 @@
 //
 // Build: tools/wine-wasm/icall/build.sh. Use: clang -fpass-plugin=GexIcall.so.
 // Variadic indirect calls are left alone (counted; GEXW_ICALL_STATS=1).
+//
+// Entry thunks (the other direction, ARM64EC's name): a native function
+// whose address is taken may reach i386 code as a function-table index (a
+// window procedure in a class, a COM vtable). For each such function the
+// pass writes `__gexe.<name>`, an entry adapter like winebuild's (gex's
+// F_body through gexrt's __gexw_entry: the arguments from the guest stack,
+// the result in EAX, EDX:EAX or ST0, the arguments popped if the function
+// is stdcall, which corecrt.h marks with annotate("gex.stdcall")), and
+// records the pair { function, thunk } in the data section `gexw_entries`.
+// gex binds each thunk at its function's table index as a guest address,
+// so a guest call or jump to that index runs the native function.
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <set>
 #include <cstdlib>
 
 using namespace llvm;
@@ -126,9 +139,193 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return F;
   }
 
+  // Is F's address taken by anything other than calls and metadata?
+  static bool escapes(Function &F) {
+    for (const Use &U : F.uses()) {
+      const User *Us = U.getUser();
+      if (auto *CB = dyn_cast<CallBase>(Us))
+        if (CB->isCallee(&U)) continue;
+      if (auto *GV = dyn_cast<GlobalVariable>(Us))
+        if (GV->getSection() == "llvm.metadata") continue;
+      if (auto *CE = dyn_cast<Constant>(Us)) {
+        // annotation and used-list entries are constant structs/arrays
+        // reachable only from llvm.metadata globals
+        bool meta = true;
+        SmallVector<const User *, 8> work{CE};
+        while (!work.empty() && meta) {
+          const User *X = work.pop_back_val();
+          if (auto *G = dyn_cast<GlobalVariable>(X)) {
+            if (G->getSection() != "llvm.metadata" && G->getName() != "llvm.used" &&
+                G->getName() != "llvm.compiler.used")
+              meta = false;
+            continue;
+          }
+          if (!isa<Constant>(X)) { meta = false; break; }
+          if (X->use_empty()) continue;
+          for (const User *Y : X->users()) work.push_back(Y);
+        }
+        if (meta) continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // Functions annotated "gex.stdcall" (llvm.global.annotations).
+  static std::set<Function *> stdcalls(Module &M) {
+    std::set<Function *> out;
+    GlobalVariable *A = M.getGlobalVariable("llvm.global.annotations");
+    if (!A || !A->hasInitializer()) return out;
+    auto *Arr = dyn_cast<ConstantArray>(A->getInitializer());
+    if (!Arr) return out;
+    for (Value *Op : Arr->operands()) {
+      auto *S = dyn_cast<ConstantStruct>(Op);
+      if (!S || S->getNumOperands() < 2) continue;
+      auto *F = dyn_cast<Function>(S->getOperand(0)->stripPointerCasts());
+      auto *Str = dyn_cast<GlobalVariable>(S->getOperand(1)->stripPointerCasts());
+      if (!F || !Str || !Str->hasInitializer()) continue;
+      if (auto *CDA = dyn_cast<ConstantDataArray>(Str->getInitializer()))
+        if (CDA->isCString() && CDA->getAsCString() == "gex.stdcall") out.insert(F);
+    }
+    return out;
+  }
+
+  // The entry thunk of F (see the top), or null if its signature has no
+  // i386 shape here.
+  Function *entryThunk(Module &M, Function &F, bool stdcall) {
+    LLVMContext &C = M.getContext();
+    const DataLayout &DL = M.getDataLayout();
+    Type *I32 = Type::getInt32Ty(C), *I64 = Type::getInt64Ty(C), *F32 = Type::getFloatTy(C),
+         *F64 = Type::getDoubleTy(C);
+    Type *Ptr = PointerType::get(C, 0);
+    FunctionType *FT = F.getFunctionType();
+    if (FT->isVarArg()) return nullptr;
+    FunctionType *BodyT = FunctionType::get(I32, {I32, I32, I32, I64}, false);
+    std::string base = "__gexe." + F.getName().str();
+    Function *Body = Function::Create(BodyT, GlobalValue::InternalLinkage, base + ".body", M);
+    Body->addFnAttr("gexw-no-icall");
+    BasicBlock *BB = BasicBlock::Create(C, "entry", Body);
+    IRBuilder<> B(BB);
+    Value *Ctx = Body->getArg(0), *Ret = Body->getArg(3);
+    auto helper = [&](const char *n, Type *R, ArrayRef<Type *> P) {
+      return M.getOrInsertFunction(n, FunctionType::get(R, P, false));
+    };
+    unsigned off = 0, first = 0;
+    std::vector<Value *> args;
+    // A struct return: 1, 2, 4 or 8 bytes come back in EDX:EAX (MSVC's
+    // i386 rule); larger ones through the caller's hidden pointer, the
+    // first stack word, which is also the result.
+    Value *SRet = nullptr;
+    uint64_t sretSize = 0;
+    bool sretReg = false;
+    if (FT->getNumParams() && F.hasParamAttribute(0, Attribute::StructRet)) {
+      Type *ST = F.getParamStructRetType(0);
+      sretSize = DL.getTypeAllocSize(ST);
+      sretReg = sretSize == 1 || sretSize == 2 || sretSize == 4 || sretSize == 8;
+      if (sretReg) {
+        SRet = B.CreateAlloca(I64);
+        B.CreateStore(B.getInt64(0), SRet);
+        args.push_back(SRet);
+      } else {
+        SRet = B.CreateCall(helper("__gexw_arg32", I32, {I32, I32}), {Ctx, B.getInt32(0)});
+        args.push_back(B.CreateIntToPtr(SRet, Ptr));
+        off = 4;
+      }
+      first = 1;
+    }
+    for (unsigned i = first; i < FT->getNumParams(); i++) {
+      Type *P = FT->getParamType(i);
+      if (Type *BT = F.getParamByValType(i)) {
+        Value *A = B.CreateCall(helper("__gexw_argptr", I32, {I32, I32}), {Ctx, B.getInt32(off)});
+        args.push_back(B.CreateIntToPtr(A, Ptr));
+        off += (DL.getTypeAllocSize(BT) + 3) & ~3u;
+      } else if (P->isIntegerTy(64)) {
+        args.push_back(B.CreateCall(helper("__gexw_arg64", I64, {I32, I32}), {Ctx, B.getInt32(off)}));
+        off += 8;
+      } else if (P->isDoubleTy()) {
+        args.push_back(B.CreateCall(helper("__gexw_argf64", F64, {I32, I32}), {Ctx, B.getInt32(off)}));
+        off += 8;
+      } else if (P->isFloatTy()) {
+        args.push_back(B.CreateCall(helper("__gexw_argf32", F32, {I32, I32}), {Ctx, B.getInt32(off)}));
+        off += 4;
+      } else if (P->isPointerTy()) {
+        Value *A = B.CreateCall(helper("__gexw_arg32", I32, {I32, I32}), {Ctx, B.getInt32(off)});
+        args.push_back(B.CreateIntToPtr(A, P));
+        off += 4;
+      } else if (P->isIntegerTy() && P->getIntegerBitWidth() <= 32) {
+        Value *A = B.CreateCall(helper("__gexw_arg32", I32, {I32, I32}), {Ctx, B.getInt32(off)});
+        args.push_back(B.CreateTrunc(A, P));
+        off += 4;
+      } else {
+        Body->eraseFromParent();
+        return nullptr;
+      }
+    }
+    unsigned pop = stdcall ? off : 0;
+    Value *R = B.CreateCall(FT, &F, args);
+    Type *RT = FT->getReturnType();
+    Value *Out;
+    if (SRet && sretReg) {
+      Value *V = B.CreateLoad(I64, SRet);
+      Out = B.CreateCall(helper("__gexw_ret", I32, {I32, I64, I32, I64}), {Ctx, Ret, B.getInt32(pop), V});
+    } else if (SRet) {
+      Out = B.CreateCall(helper("__gexw_ret32", I32, {I32, I64, I32, I32}), {Ctx, Ret, B.getInt32(pop), SRet});
+    } else if (RT->isVoidTy()) {
+      Out = B.CreateCall(helper("__gexw_ret32", I32, {I32, I64, I32, I32}), {Ctx, Ret, B.getInt32(pop), B.getInt32(0)});
+    } else if (RT->isFloatTy() || RT->isDoubleTy()) {
+      Value *V = RT->isFloatTy() ? B.CreateFPExt(R, F64) : R;
+      Out = B.CreateCall(helper("__gexw_ret_fp", I32, {I32, I64, I32, F64}), {Ctx, Ret, B.getInt32(pop), V});
+    } else if (RT->isIntegerTy(64)) {
+      Out = B.CreateCall(helper("__gexw_ret", I32, {I32, I64, I32, I64}), {Ctx, Ret, B.getInt32(pop), R});
+    } else if (RT->isPointerTy() || (RT->isIntegerTy() && RT->getIntegerBitWidth() <= 32)) {
+      Value *V = RT->isPointerTy() ? B.CreatePtrToInt(R, I32) : B.CreateZExtOrTrunc(R, I32);
+      Out = B.CreateCall(helper("__gexw_ret32", I32, {I32, I64, I32, I32}), {Ctx, Ret, B.getInt32(pop), V});
+    } else {
+      Body->eraseFromParent();
+      return nullptr;
+    }
+    B.CreateRet(Out);
+
+    Function *T = Function::Create(BodyT, GlobalValue::InternalLinkage, base, M);
+    T->addFnAttr("gexw-no-icall");
+    IRBuilder<> TB(BasicBlock::Create(C, "entry", T));
+    FunctionCallee Entry = helper("__gexw_entry", I32, {I32, I32, I32, I64, Ptr});
+    TB.CreateRet(TB.CreateCall(Entry, {T->getArg(0), T->getArg(1), T->getArg(2), T->getArg(3), Body}));
+    return T;
+  }
+
+  unsigned entryThunks(Module &M) {
+    std::set<Function *> sc = stdcalls(M);
+    std::vector<std::pair<Function *, Function *>> pairs;
+    std::vector<Function *> fs;
+    for (Function &F : M) {
+      if (F.isDeclaration() || F.hasFnAttribute("gexw-no-icall") || F.isIntrinsic()) continue;
+      StringRef n = F.getName();
+      if (n.starts_with("__gexw") || n.starts_with("__gexe.") || n.contains("gexp_")) continue;
+      if (escapes(F)) fs.push_back(&F);
+    }
+    for (Function *F : fs)
+      if (Function *T = entryThunk(M, *F, sc.count(F)))
+        pairs.push_back({F, T});
+    if (pairs.empty()) return 0;
+    LLVMContext &C = M.getContext();
+    Type *Ptr = PointerType::get(C, 0);
+    StructType *PairT = StructType::get(Ptr, Ptr);
+    std::vector<Constant *> elems;
+    for (auto &[F, T] : pairs) elems.push_back(ConstantStruct::get(PairT, {F, T}));
+    ArrayType *AT = ArrayType::get(PairT, elems.size());
+    auto *G = new GlobalVariable(M, AT, true, GlobalValue::InternalLinkage, ConstantArray::get(AT, elems),
+                                 "__gexe.pairs");
+    G->setSection("gexw_entries");
+    G->setAlignment(Align(4));
+    appendToUsed(M, {G});
+    return pairs.size();
+  }
+
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     LLVMContext &C = M.getContext();
     Type *I32 = Type::getInt32Ty(C);
+    unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0 : entryThunks(M);
     FunctionType *SetT = FunctionType::get(Type::getVoidTy(C), {I32}, false);
     unsigned done = 0, varargs = 0;
     std::vector<CallBase *> sites;
@@ -156,8 +353,9 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       done++;
     }
     if (getenv("GEXW_ICALL_STATS"))
-      errs() << "gex icall: " << M.getName() << ": " << done << " sites, " << varargs << " variadic left alone\n";
-    return done ? PreservedAnalyses::none() : PreservedAnalyses::all();
+      errs() << "gex icall: " << M.getName() << ": " << done << " sites, " << varargs << " variadic left alone, "
+             << thunks << " entry thunks\n";
+    return done || thunks ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 

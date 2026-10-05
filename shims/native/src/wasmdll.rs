@@ -93,6 +93,8 @@ pub(crate) struct WinePe {
     /// Writes into the module's data that must follow its initialisation
     /// (`apply_pending`, after the drain's catch-up instantiated it).
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
+    /// The entry thunks are bound (`bind_entry_thunks`, once).
+    entries_bound: std::sync::atomic::AtomicBool,
 }
 
 /// After an install's catch-up (the module instantiated, its data
@@ -108,6 +110,42 @@ pub(crate) fn apply_pending(shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::Gu
             dst.copy_from_slice(&bytes);
         }
     }
+    if !wp.entries_bound.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if let Err(e) = bind_entry_thunks(&wp, shared, memory) {
+            eprintln!("gex-nt: Wine's PE module: entry thunks: {e:#}");
+        }
+    }
+}
+
+/// The ICALL pass's entry thunks (tools/wine-wasm/icall): native functions
+/// whose address may reach guest code, as a function-table index. gexrt's
+/// `__gexw_entries` bounds the `{ function, thunk }` pairs (table indices,
+/// relocated with the data); each thunk is bound at its function's index as
+/// a guest address, so i386 code calling or jumping there runs the native
+/// function through its adapter. Indices sit below the ICALL floor
+/// (0x3f0000), where native code takes a value for a table index anyway.
+fn bind_entry_thunks(wp: &WinePe, shared: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory) -> Result<()> {
+    let Some(&off) = wp.data_exports.get("__gexw_entries") else { return Ok(()) };
+    let at = wp.data + off as u64;
+    let (start, stop) = (memory_u32(memory, at)? as u64, memory_u32(memory, at + 4)? as u64);
+    if start == 0 || stop <= start {
+        return Ok(());
+    }
+    let base = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.install(wp.install).base;
+    let mut pairs = Vec::with_capacity(((stop - start) / 8) as usize);
+    let mut a = start;
+    while a + 8 <= stop {
+        let (f, t) = (memory_u32(memory, a)?, memory_u32(memory, a + 4)?);
+        a += 8;
+        if f < base || t < base || f as u64 >= 0x3f0000 {
+            continue;
+        }
+        pairs.push((f as u64, t - base));
+    }
+    if std::env::var_os("GEX_WASM_TRACE").is_some() {
+        eprintln!("gex: wine PE: {} entry thunks bound", pairs.len());
+    }
+    crate::ftab::bind_pairs(shared, memory, wp.install, &pairs)
 }
 
 /// The variables gex-kernel's NT boot fills in ntdll (Wine's unix side
@@ -253,7 +291,7 @@ fn install_shared(
             let module = gex_cache::load_or_compile_at(engine, &crate::libprov::cwasm_path(&file, &wasm), &wasm)
                 .with_context(|| format!("compiling {}", file.display()))?;
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: exported_offsets(&wasm)?, pending: Mutex::new(Vec::new()) };
+            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: exported_offsets(&wasm)?, pending: Mutex::new(Vec::new()), entries_bound: Default::default() };
             (Arc::new(wp), Some((module, names.len() as u32)))
         }
     };

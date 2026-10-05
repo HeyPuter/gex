@@ -33,6 +33,10 @@ WASM_SYM_EXPLICIT_NAME = 0x40
 SYMTAB = 8
 
 
+SEGMENT_INFO = 5
+WASM_SEG_FLAG_RETAIN = 4
+
+
 def leb(b, p):
     r = s = 0
     while True:
@@ -122,6 +126,20 @@ def rewrite(b, fix, aliases=()):
             sub = b[r]; r += 1
             sublen, r = leb(b, r)
             subend = r + sublen
+            if sub == SEGMENT_INFO:
+                # `wasm-ld -r` drops the RETAIN flag: put it back on the
+                # ICALL pass's entry-thunk pairs (`gexw_entries`), which
+                # nothing references but gex.
+                count, s = leb(b, r)
+                segs = enc(count)
+                for _ in range(count):
+                    nm, s = name(b, s)
+                    align, s = leb(b, s)
+                    flags, s = leb(b, s)
+                    if nm == 'gexw_entries':
+                        flags |= WASM_SEG_FLAG_RETAIN
+                    segs += enc_name(nm) + enc(align) + enc(flags)
+                body += bytes([sub]) + enc(len(segs)) + segs; r = subend; continue
             if sub != SYMTAB:
                 body += bytes([sub]) + enc(sublen) + b[r:subend]; r = subend; continue
             count, s = leb(b, r)
