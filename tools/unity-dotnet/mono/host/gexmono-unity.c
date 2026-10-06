@@ -464,9 +464,31 @@ lv_on (void)
 		on = lv_env ("GEXMONO_LIVENESS");
 	return on;
 }
+/* GEXMONO_LV_TRACE=1: each reported object and each root, as class and Unity instance ID
+ * (the int at +8 of the native object m_CachedPtr points to). */
+static int
+lv_trace (void)
+{
+	static int t = -1;
+	if (t < 0)
+		t = getenv ("GEXMONO_LV_TRACE") != NULL;
+	return t;
+}
+static int
+lv_iid (MonoObject *o)
+{
+	/* UnityEngine.Object's first field, m_CachedPtr, right after the header: no metadata
+	 * lookups here (the walk runs on Unity job threads Mono does not know). */
+	uint8_t *native = *(uint8_t **)((char *)o + MONO_ABI_SIZEOF (MonoObject));
+	return (uintptr_t)native > 0x10000 && (uintptr_t)native < ((uintptr_t)1 << 34) ? *(int *)(native + 8) : 0;
+}
 static void
 lv_flush (Liveness *s)
 {
+	if (lv_trace ())
+		for (guint32 i = 0; i < s->n; i++)
+			fprintf (stderr, "[gexmono] lv-report %p state %p %s.%s id %d\n", s->arr [i], s, m_class_get_name_space (mono_object_class (s->arr [i])),
+				m_class_get_name (mono_object_class (s->arr [i])), lv_iid (s->arr [i]));
 	static int off = -1;
 	if (off < 0)
 		off = lv_env ("GEXMONO_LV_OFF");
@@ -491,6 +513,7 @@ lv_free (Liveness *s)
  * callbacks once however many roots and states reach it (Unity sizes its
  * buffers by the number of objects). Reset when Unity stops the world for the
  * next pass. */
+static int lv_env (const char *name);
 static GHashTable *lv_pass_seen;
 static pthread_mutex_t lv_pass_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -508,6 +531,17 @@ lv_push (Liveness *s, MonoObject *o)
 {
 	if (!o)
 		return;
+	static int per_state = -1;
+	if (per_state < 0)
+		per_state = lv_env ("GEXMONO_LV_PERSTATE");
+	if (per_state) {
+		/* Diagnostic: each state keeps its own visited set, as before the per-pass one. */
+		if (g_hash_table_contains (s->seen, o))
+			return;
+		g_hash_table_add (s->seen, o);
+		g_ptr_array_add (s->stack, o);
+		return;
+	}
 	pthread_mutex_lock (&lv_pass_lock);
 	if (!lv_pass_seen)
 		lv_pass_seen = g_hash_table_new (NULL, NULL);
@@ -655,6 +689,9 @@ U(mono_unity_liveness_calculation_from_root)
 		 * roots are the managed wrappers Unity holds GC handles to; reporting them kept
 		 * every component alive whatever its GameObject's fate (a MonoBehaviour outlived
 		 * its unloaded GameObject and Object.name followed the dangling pointer). */
+		if (lv_trace ())
+			fprintf (stderr, "[gexmono] lv-root %p state %p %s.%s id %d\n", P (0), s, m_class_get_name_space (mono_object_class (P (0))),
+				m_class_get_name (mono_object_class (P (0))), lv_iid (P (0)));
 		lv_object_walk (s, (MonoObject *)P (0), FALSE);
 		lv_drain (s);
 	}

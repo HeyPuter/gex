@@ -1088,4 +1088,26 @@ Not yet:
      GameObject (does the managed walk reach the GameObject's wrapper there,
      e.g. through a GC handle root?); compare the reported set against the
      handle roots.
+  15. **Reported set vs roots (hk85-hk88, GEXMONO_LV_TRACE=1: each root and
+     each reported object as class + Unity instance ID, read from m_CachedPtr
+     at +0x10 without metadata calls, since the walk runs on Unity job threads
+     Mono does not know):** Unity passes 126 roots, all scene UI components
+     (Image, EventTrigger, MenuButton, Text, ...). The walk reports 223 objects,
+     among them `StandaloneLoadingSpinner` id 48966 (the spinner component);
+     its GameObject 48962 is not reported (no managed reference reaches a
+     GameObject wrapper), which is what Unity's own walk would do too. Per-state
+     visited sets (GEXMONO_LV_PERSTATE=1) change nothing (82 unloaded, same
+     crash). The reference run on the game's own libmonobdwgc (hkst4, tier-1,
+     batch) stalls after physics init for 2 h, as hkst3 did: no comparison.
+     **Leading hypothesis now:** Unity keeps a prefab referenced from a scene
+     script through its native dependency walk over the script's serialized
+     data (StartManager's `loadSpinnerPrefab` field), not through the managed
+     liveness walk. Without liveness the whole prefab is unloaded (the
+     original ArgumentNullException), so that native walk does not see the
+     field under the provider; with liveness only the component is marked and
+     Unity's mark function (0x12f1ef0) does not queue it for dependencies when
+     flag 0x8 is set. Next: watch whether Unity's GC reads StartManager's
+     managed fields (GEX_WATCH on the field inside the StartManager wrapper)
+     during MarkObjects, and what its serialization command list for
+     StartManager contains (the field's offset as Unity cached it).
 
