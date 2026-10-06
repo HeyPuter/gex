@@ -533,8 +533,12 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
 - Baba Is You's settings: matrix.txt's `seed=seed/baba@~/.local/share/Baba_Is_You`
   mounts a fresh copy of tests/games/seed/baba (fullscreen=0) there for each
   run; nothing reaches the real home. Scripted keys now reach it
-  (focus_fallback), but in 40 minutes it has not left its intro screen
-  (translation of its 9 MB executable under --lazy on a loaded gooner).
+  (focus_fallback). Under the JIT tier with --lazy it presented about 560
+  frames in 40 minutes; under --fjit (GEX_FJIT_CACHE=1) about 2,700 in 25
+  minutes on the first run and far more once cached. Even so it stays on
+  its intro screen whatever it is sent (pointer over the window, a click,
+  Enter, Space): the next question is what that screen waits for, not
+  speed.
 - Earlier, the page (browser-linux.mjs; own ports 5291/9431): Retrocycles' GL
   frames were attached to SDL 1.2's child window, which no compositor
   window has; they now name its top-level window. The run still shows
