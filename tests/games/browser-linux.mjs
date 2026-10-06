@@ -17,13 +17,20 @@
 // (gex-wgpu-replay.*) and web/public/gex/xwayland/ (web/build-xwayland-wasm.sh),
 // and GEX_GL_X64 (guest/gl/build.sh with GEX_CC=gcc).
 //
+// GEX_NT_VITE_PORT / GEX_NT_CHROME_PORT pick the ports (default 5291 and
+// 9431, not the harness's own defaults).
+//
 // Prints `ok` lines (first frame, the input script's start, gameplay) and the
 // frame rate over the last minute, with a screenshot every 30 s.
 
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, basename } from 'node:path';
-import { openPage, sleep, log, WEB, STATE } from '../nt/browser-harness.mjs';
+// Ports of its own (the harness reads these when it loads), so a games run
+// and a gate's browser legs on the defaults (5199, 9339) do not collide.
+process.env.GEX_NT_VITE_PORT ??= '5291';
+process.env.GEX_NT_CHROME_PORT ??= '9431';
+const { openPage, sleep, log, WEB, STATE } = await import('../nt/browser-harness.mjs');
 
 const argv = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -167,6 +174,10 @@ async function main() {
       await shot(`t${String(++shots).padStart(3, '0')}`);
       const rate = window.length > 1 ? (n - window[0][1]) / ((Date.now() - window[0][0]) / 1000) : 0;
       log(`${((Date.now() - t0) / 1000).toFixed(0)} s: presents ${n}, ${rate.toFixed(1)}/s over the last minute; ${(s?.out ?? '').slice(-160).replace(/\n/g, ' | ')}`);
+      // The compositor's own account: its windows, its notes (GL attachment
+      // per window, which says why a GL window stays black), lit pixels.
+      const d = await evaluate('globalThis.__gexCompositor?.describe()', true);
+      if (d) log(`compositor: frame ${d.frames}, ${d.windows} window(s), lit ${d.lit}; ${(d.list ?? []).join('; ')}; gl: ${(d.gl ?? '').slice(0, 160)}; notes: ${(d.log ?? []).slice(-3).join(' / ').slice(0, 600)}`);
     }
     await sleep(1000);
   }
