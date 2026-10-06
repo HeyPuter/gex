@@ -35,6 +35,7 @@ use gex_kernel::GuestMem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod elfprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
 
@@ -825,15 +826,23 @@ fn dylink_memory(wasm: &[u8]) -> Result<(u32, u32), String> {
 
 /// Guest pages from the NT allocator, for a stateful provider.
 fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
-    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
     crate::with_host(|h| gex_kernel::nt::boot::alloc_private(p, &mut h.kernel, size, name))
+}
+
+/// Guest pages in a Linux process (an ELF provider's data and stack): an
+/// anonymous private mapping, as natively (`libprov::alloc_linux`).
+fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
+    use gex_kernel::mem::{flags, prot};
+    let len = (size + 0xfff) & !0xfff;
+    crate::with_host(|h| h.kernel.mem.mmap(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
 /// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a
 /// built-in provider's data, heap and stack, which then do not move the DLLs
 /// the program maps after them.
 fn provider_alloc_top_bytes(size: u64, name: &str) -> Result<u64, String> {
-    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
     crate::with_host(|h| gex_kernel::nt::boot::alloc_private_top(p, &mut h.kernel, size, name))
 }
 
