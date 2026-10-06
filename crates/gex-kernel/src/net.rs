@@ -165,6 +165,124 @@ pub fn answer_dns(query: &[u8], resolver: &Resolver) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// -- loopback ---------------------------------------------------------------
+
+/// One direction of a loopback connection.
+#[derive(Debug, Default)]
+struct LoopBuf {
+    data: VecDeque<u8>,
+    /// The writing end closed: once drained, the reader sees end of file.
+    writer_gone: bool,
+    /// The reading end closed: a write is `EPIPE`.
+    reader_gone: bool,
+}
+
+/// One end of a TCP connection between two guest sockets on this machine
+/// (a guest connecting to a port another guest listens on): two byte
+/// queues, as a socketpair's.
+#[derive(Debug)]
+pub struct LoopEnd {
+    rx: Arc<Mutex<LoopBuf>>,
+    tx: Arc<Mutex<LoopBuf>>,
+}
+
+/// Far more than a guest leaves unread in practice; a writer past it gets a
+/// short count and waits, as on a full socket buffer.
+const LOOP_BUF_MAX: usize = 4 << 20;
+
+impl LoopEnd {
+    pub fn pair() -> (Arc<LoopEnd>, Arc<LoopEnd>) {
+        let (a, b) = (Arc::new(Mutex::new(LoopBuf::default())), Arc::new(Mutex::new(LoopBuf::default())));
+        (Arc::new(LoopEnd { rx: Arc::clone(&a), tx: Arc::clone(&b) }), Arc::new(LoopEnd { rx: b, tx: a }))
+    }
+}
+
+impl Transport for LoopEnd {
+    fn connect(&self, _host: &str, _port: u16) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn status(&self) -> Status {
+        if self.rx.lock().unwrap().writer_gone || self.tx.lock().unwrap().reader_gone {
+            Status::Closed
+        } else {
+            Status::Open
+        }
+    }
+    fn send(&self, data: &[u8]) -> Result<usize, Errno> {
+        let mut tx = self.tx.lock().unwrap();
+        if tx.reader_gone {
+            return Err(Errno::EPIPE);
+        }
+        let n = data.len().min(LOOP_BUF_MAX.saturating_sub(tx.data.len()));
+        if n == 0 && !data.is_empty() {
+            return Err(Errno::EAGAIN);
+        }
+        tx.data.extend(&data[..n]);
+        Ok(n)
+    }
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let mut rx = self.rx.lock().unwrap();
+        if rx.data.is_empty() {
+            return if rx.writer_gone { Ok(0) } else { Err(Errno::EAGAIN) };
+        }
+        let n = buf.len().min(rx.data.len());
+        for (d, s) in buf.iter_mut().zip(rx.data.drain(..n)) {
+            *d = s;
+        }
+        Ok(n)
+    }
+    fn has_data(&self) -> bool {
+        let rx = self.rx.lock().unwrap();
+        !rx.data.is_empty() || rx.writer_gone
+    }
+    fn available(&self) -> usize {
+        self.rx.lock().unwrap().data.len()
+    }
+    fn close(&self) {
+        self.tx.lock().unwrap().writer_gone = true;
+        self.rx.lock().unwrap().reader_gone = true;
+    }
+}
+
+/// The TCP ports guests on this machine listen on. Shared across `fork`, as
+/// the resolver is: a child connects to its parent's listener.
+#[derive(Debug, Default)]
+pub struct Ports {
+    listeners: Mutex<HashMap<u16, std::sync::Weak<Socket>>>,
+    next_ephemeral: AtomicU32,
+}
+
+impl Ports {
+    pub fn new() -> Ports {
+        Ports::default()
+    }
+
+    /// A port nothing listens on, from Linux's ephemeral range.
+    fn ephemeral(&self) -> u16 {
+        loop {
+            let n = self.next_ephemeral.fetch_add(1, Ordering::Relaxed);
+            let port = 32768 + (n % 28232) as u16;
+            if !self.listening(port) {
+                return port;
+            }
+        }
+    }
+
+    fn listening(&self, port: u16) -> bool {
+        self.listeners.lock().unwrap().get(&port).is_some_and(|w| w.strong_count() > 0)
+    }
+
+    fn listener(&self, port: u16) -> Option<Arc<Socket>> {
+        self.listeners.lock().unwrap().get(&port).and_then(|w| w.upgrade())
+    }
+}
+
+/// Whether an address is this machine: the loopback network, or the
+/// unspecified address, which Linux takes to mean it too.
+pub fn is_local(addr: u32) -> bool {
+    addr >> 24 == 127 || addr == 0
+}
+
 // -- sockets ----------------------------------------------------------------
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -186,10 +304,18 @@ pub struct Socket {
     /// Datagrams waiting to be read. Only the resolver puts anything here.
     dgrams: Mutex<VecDeque<Vec<u8>>>,
     nonblocking: AtomicBool,
+    /// The machine's listening ports.
+    ports: Arc<Ports>,
+    /// Where `bind` (or a loopback `connect`) put this end, for
+    /// `getsockname`; the port `listen` listens on.
+    local: Mutex<Option<(u32, u16)>>,
+    /// A listener's connections waiting for `accept`: the far end of each,
+    /// and the port it came from. `None` unless listening.
+    backlog: Mutex<Option<VecDeque<(Arc<dyn Transport>, u16)>>>,
 }
 
 impl Socket {
-    pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>) -> Socket {
+    pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>, ports: Arc<Ports>) -> Socket {
         Socket {
             kind,
             net,
@@ -198,7 +324,88 @@ impl Socket {
             peer: Mutex::new(None),
             dgrams: Mutex::new(VecDeque::new()),
             nonblocking: AtomicBool::new(false),
+            ports,
+            local: Mutex::new(None),
+            backlog: Mutex::new(None),
         }
+    }
+
+    /// `bind`: where this socket is. A port another listener holds is
+    /// `EADDRINUSE` (SO_REUSEADDR is not modelled: a listener that went away
+    /// frees its port at once).
+    pub fn bind(&self, addr: u32, port: u16) -> Result<(), Errno> {
+        if self.local.lock().unwrap().is_some() {
+            return Err(Errno::EINVAL);
+        }
+        if port != 0 && self.kind == Kind::Tcp && self.ports.listening(port) {
+            return Err(Errno::EADDRINUSE);
+        }
+        *self.local.lock().unwrap() = Some((addr, port));
+        Ok(())
+    }
+
+    /// Where this end is, for `getsockname`: 0.0.0.0:0 when unbound.
+    pub fn local(&self) -> (u32, u16) {
+        self.local.lock().unwrap().unwrap_or((0, 0))
+    }
+
+    /// `listen`: take the bound port (an ephemeral one if none), and
+    /// connections from this machine's guests.
+    pub fn listen(self: &Arc<Self>) -> Result<(), Errno> {
+        if self.kind != Kind::Tcp || self.transport.lock().unwrap().is_some() {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let mut backlog = self.backlog.lock().unwrap();
+        if backlog.is_some() {
+            return Ok(());
+        }
+        let (addr, mut port) = self.local();
+        let mut listeners = self.ports.listeners.lock().unwrap();
+        if port == 0 {
+            drop(listeners);
+            port = self.ports.ephemeral();
+            listeners = self.ports.listeners.lock().unwrap();
+        }
+        if listeners.get(&port).is_some_and(|w| w.strong_count() > 0) {
+            return Err(Errno::EADDRINUSE);
+        }
+        listeners.insert(port, Arc::downgrade(self));
+        *self.local.lock().unwrap() = Some((addr, port));
+        *backlog = Some(VecDeque::new());
+        Ok(())
+    }
+
+    pub fn is_listening(&self) -> bool {
+        self.backlog.lock().unwrap().is_some()
+    }
+
+    /// `accept`: the next waiting connection as a socket of its own, or
+    /// `EAGAIN`; `EINVAL` when not listening.
+    pub fn accept(&self) -> Result<Arc<Socket>, Errno> {
+        let (t, from) = match &mut *self.backlog.lock().unwrap() {
+            Some(q) => q.pop_front().ok_or(Errno::EAGAIN)?,
+            None => return Err(Errno::EINVAL),
+        };
+        let s = Socket::new(Kind::Tcp, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports));
+        *s.transport.lock().unwrap() = Some(t);
+        *s.peer.lock().unwrap() = Some((0x7f00_0001, from));
+        *s.local.lock().unwrap() = Some((0x7f00_0001, self.local().1));
+        Ok(Arc::new(s))
+    }
+
+    /// A connection to a port a guest on this machine listens on: both ends
+    /// made here, the far one queued for the listener's `accept`.
+    fn connect_local(&self, listener: &Socket, port: u16) -> Result<(), Errno> {
+        let (mine, theirs) = LoopEnd::pair();
+        let from = self.ports.ephemeral();
+        match &mut *listener.backlog.lock().unwrap() {
+            Some(q) => q.push_back((theirs, from)),
+            None => return Err(Errno::ECONNREFUSED),
+        }
+        *self.peer.lock().unwrap() = Some((0x7f00_0001, port));
+        *self.local.lock().unwrap() = Some((0x7f00_0001, from));
+        *self.transport.lock().unwrap() = Some(mine);
+        Ok(())
     }
 
     pub fn set_nonblocking(&self, on: bool) {
@@ -227,6 +434,14 @@ impl Socket {
                 Status::Refused => Err(Errno::ECONNREFUSED),
                 Status::Closed => Err(Errno::ECONNRESET),
             };
+        }
+        // A port a guest here listens on: connected at once, no network
+        // involved. (One nothing here listens on still goes out: the host
+        // may have a service on its own loopback.)
+        if self.kind == Kind::Tcp && is_local(addr) {
+            if let Some(listener) = self.ports.listener(port) {
+                return self.connect_local(&listener, port);
+            }
         }
         *self.peer.lock().unwrap() = Some((addr, port));
         if self.kind == Kind::Udp {
@@ -365,6 +580,10 @@ impl FileHandle for Socket {
         if self.kind == Kind::Udp {
             return !self.dgrams.lock().unwrap().is_empty();
         }
+        // A listener is readable when a connection waits.
+        if let Some(q) = &*self.backlog.lock().unwrap() {
+            return !q.is_empty();
+        }
         match &*self.transport.lock().unwrap() {
             // A connection that has failed or finished is readable: the
             // answer is an error or an end, and either way it is ready.
@@ -394,6 +613,18 @@ impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(t) = self.transport.lock().unwrap().take() {
             t.close();
+        }
+        // A listener gives its port back, and the connections nobody
+        // accepted see their peer gone.
+        if let Some(q) = self.backlog.lock().unwrap().take() {
+            let port = self.local.lock().unwrap().map_or(0, |l| l.1);
+            let mut listeners = self.ports.listeners.lock().unwrap();
+            if listeners.get(&port).is_some_and(|w| w.strong_count() == 0) {
+                listeners.remove(&port);
+            }
+            for (t, _) in q {
+                t.close();
+            }
         }
     }
 }

@@ -540,6 +540,8 @@ pub struct Kernel {
     /// Names the guest has resolved. Shared across `fork`, because a child
     /// connecting to an address its parent resolved must reach the same host.
     pub resolver: Arc<net::Resolver>,
+    /// The TCP ports guests listen on. Shared across `fork` like the resolver.
+    pub ports: Arc<net::Ports>,
     /// Sockets by handle address, so a descriptor can be got back to the
     /// concrete socket the network syscalls need.
     pub sockets: std::collections::HashMap<usize, Arc<net::Socket>>,
@@ -1230,6 +1232,7 @@ impl Kernel {
             umask: 0o022,
             net: None,
             resolver: Arc::new(net::Resolver::new()),
+            ports: Arc::new(net::Ports::new()),
             sockets: Default::default(),
             remote_sockets: Default::default(),
             epolls: Default::default(),
@@ -1461,6 +1464,7 @@ impl Kernel {
             umask: self.umask,
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
+            ports: Arc::clone(&self.ports),
             sockets: self.sockets.clone(),
             remote_sockets: self.remote_sockets.clone(),
             epolls: self.epolls.clone(),
@@ -2295,7 +2299,7 @@ impl Kernel {
         // new socket in.
         let r = match self.retry_accept.take() {
             Some((fd, addr, len, flags)) if r.is_ok() => {
-                self.sys_unix_accept(m, fd, addr, len, flags)
+                self.sys_accept(m, fd, addr, len, flags)
             }
             _ => r,
         };
@@ -2537,7 +2541,10 @@ impl Kernel {
             nr::GETPEERNAME => self.sys_getpeername(m, a[0] as i32, a[1], a[2]),
             // One interface, unnamed. A guest that asks where it is calling
             // from gets 0.0.0.0, which is what an unbound socket reports.
-            nr::GETSOCKNAME => self.sys_write_sockaddr(m, 0, 0, a[1], a[2]),
+            nr::GETSOCKNAME => {
+                let (ip, port) = self.socket_of(a[0] as i32).map(|s| s.local()).unwrap_or((0, 0));
+                self.sys_write_sockaddr(m, ip, port, a[1], a[2])
+            }
             // Nothing here has an option worth setting -- no timeouts, no
             // buffer sizes that mean anything -- and refusing makes libraries
             // treat the socket as broken.
@@ -2553,17 +2560,30 @@ impl Kernel {
             // it is a proxy, but a resolver binds its socket before it sends
             // and gives up if that fails.
             nr::BIND => match self.sys_unix_bind(m, a[0] as i32, a[1], a[2]) {
-                Err(Errno::ENOTSOCK) => self.fds.get(a[0] as i32).map(|_| 0),
+                Err(Errno::ENOTSOCK) => match self.socket_of(a[0] as i32) {
+                    // An internet socket remembers where it is (`listen`,
+                    // `getsockname`).
+                    Ok(sock) => m
+                        .read(a[1], (a[2] as usize).min(128))
+                        .and_then(|b| net::parse_sockaddr(b))
+                        .and_then(|(ip, port)| sock.bind(ip, port).map(|_| 0)),
+                    Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                },
                 other => other,
             },
             // A socket in the global kernel was bound and listening in one
             // call; there is nothing left for this to do but agree.
             nr::LISTEN => match self.remote_unix_of(a[0] as i32) {
                 Ok(_) => Ok(0),
-                Err(_) => self.unix_of(a[0] as i32).and_then(|s| s.listen()),
+                Err(_) => match self.unix_of(a[0] as i32) {
+                    Ok(s) => s.listen(),
+                    // A TCP listener, for guests on this machine.
+                    Err(Errno::ENOTSOCK) => self.socket_of(a[0] as i32).and_then(|s| s.listen()).map(|_| 0),
+                    Err(e) => Err(e),
+                },
             },
-            nr::ACCEPT => self.sys_unix_accept(m, a[0] as i32, a[1], a[2], 0),
-            nr::ACCEPT4 => self.sys_unix_accept(m, a[0] as i32, a[1], a[2], a[3]),
+            nr::ACCEPT => self.sys_accept(m, a[0] as i32, a[1], a[2], 0),
+            nr::ACCEPT4 => self.sys_accept(m, a[0] as i32, a[1], a[2], a[3]),
             nr::SOCKETPAIR => self.sys_socketpair(m, a[0], a[1], a[3]),
             nr::MEMFD_CREATE => self.sys_memfd_create(m, a[0], a[1]),
             nr::FLOCK => self.sys_flock(a[0] as i32, a[1]),
@@ -5229,7 +5249,7 @@ impl Kernel {
             SOCK_DGRAM => net::Kind::Udp,
             _ => return Err(Errno::EPROTONOSUPPORT),
         };
-        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver)));
+        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver), Arc::clone(&self.ports)));
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 {
             crate::fs::oflags::O_NONBLOCK
@@ -5348,6 +5368,10 @@ impl Kernel {
         // above that is another descriptor.
         if Arc::strong_count(&file) == 1 {
             self.file_locks.release(key);
+            // An internet socket's last descriptor: the socket goes (its
+            // connection closes, a listener gives its port back).
+            let handle = Arc::as_ptr(&file.handle) as *const () as usize;
+            self.sockets.remove(&handle);
             // Last descriptor to an O_TMPFILE: drop its name. If a `linkat` gave
             // it another (the atomic-write idiom), that name keeps the inode.
             if let Some(tp) = &file.unlink_on_close {
@@ -5687,6 +5711,32 @@ impl Kernel {
         }
         let names = Arc::clone(&self.socket_names);
         names.connect(&sock, &path)
+    }
+
+    /// `accept`: a unix listener's, else a TCP listener's (`net::Socket`).
+    fn sys_accept(&mut self, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
+        match self.sys_unix_accept(m, fd, addr, len_out, flags) {
+            Err(Errno::ENOTSOCK) => self.sys_inet_accept(m, fd, addr, len_out, flags),
+            other => other,
+        }
+    }
+
+    fn sys_inet_accept(&mut self, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
+        const SOCK_NONBLOCK: u64 = 0o4000;
+        const SOCK_CLOEXEC: u64 = 0o2000000;
+        let listener = self.socket_of(fd)?;
+        let sock = listener.accept()?;
+        let (ip, port) = sock.peer().unwrap_or((0, 0));
+        let nonblock = flags & SOCK_NONBLOCK != 0;
+        sock.set_nonblocking(nonblock);
+        let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
+        let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        let key = Arc::as_ptr(&handle) as *const () as usize;
+        let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
+        let new_fd = self.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
+        self.sockets.insert(key, sock);
+        self.sys_write_sockaddr(m, ip, port, addr, len_out)?;
+        Ok(new_fd)
     }
 
     fn sys_unix_accept(
