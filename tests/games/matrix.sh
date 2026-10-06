@@ -32,7 +32,8 @@
 # large files hard-linked, new each run unless --keep), GEX_GL_X64
 # (guest GL for x86-64 Linux games: GEX_CC=gcc guest/gl/build.sh DIR),
 # PPM_EVERY (default 10), WSIZE (Linux window size, default 1280x720),
-# LINUX_LIBS (more library directories for Linux games, e.g. SDL 1.2 and
+# GEX_STEAM_LINUX64 (gex-steam for x86-64 Linux games), LINUX_LIBS (more
+# library directories for Linux games, e.g. SDL 1.2 and
 # libpng12, which gooner lacks),
 # GEX_STEAM_WIN (gex-steam for Windows, guest/steam/build-win.sh OUT: its
 # steam_api.dll replaces the game's, so games run with no Steam client),
@@ -140,6 +141,12 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
               --env LD_LIBRARY_PATH="$gl64:$(dirname "$exe"):$ov/usr/lib${LINUX_LIBS:+:$LINUX_LIBS}"
               --env SDL_VIDEODRIVER=wayland --env SDL_AUDIODRIVER=dummy --env HOME="$state/home-$slug"
               --env XDG_RUNTIME_DIR="$state")
+        # gex-steam (guest/steam/build.sh OUT g++) in place of the game's
+        # libsteam_api.so when GEX_STEAM_LINUX64 is set.
+        if [ -n "${GEX_STEAM_LINUX64:-}" ] && [ -e "$(dirname "$exe")/libsteam_api.so" ]; then
+            mv "$(dirname "$exe")/libsteam_api.so" "$(dirname "$exe")/libsteam_api.so.orig"
+            cp "$GEX_STEAM_LINUX64/libsteam_api.so" "$(dirname "$exe")/libsteam_api.so"
+        fi
         # linux-x11: an X11-only program (SDL 1.2), on Xwayland run inside
         # the guest as a client of gex's compositor (no Xvfb).
         if [ "$kind" = linux-x11 ]; then
