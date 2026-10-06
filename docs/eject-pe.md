@@ -1029,7 +1029,37 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   world-up A/B, play-through p1-p8 (site27p, readback for screenshots, own
   browser profile `/tmp/gbench-e9play`), 35-minute soak.
 
-- **RESUME HERE (2026-10-05 evening, after the reboot).** Merged master
+- **RESUME HERE (parked 2026-10-05 ~21:00 for a reboot).** Head = the
+  commit adding this paragraph (on 74e84773; master e3917bac merged at
+  df028162). Nothing of mine is running on gooner or edger.
+  - c28 results so far (raw numbers below, under "Earlier resume"): ABBA
+    pewasm 45.9 / site28 62.9 / site28c 61.4 / 61.2 / site28 64.4 / pewasm
+    48.0 world fps. Direct present averages 63.65 world fps, 1.36x faster
+    than pewasm (46.95) and 4% faster than composited (61.3). World-up:
+    eject 30.7-31.9 s, level with pewasm's 30.7 and 31.3 s. Old p1-p8
+    play scripts no longer fit (see below). p7 saves: snapshot and reload
+    OK (`[persist]` synced 7 files, 21 in the snapshot; `restored` 21 after the reload).
+    Soak: stopped for the reboot at 562 s (of 2100). Up to there: world
+    58.2 fps after world-up 28 s, longest present stall 5 s.
+  - Still to run: `$S/c28/play2.sh` (play-throughs A and B, fresh profiles,
+    `until` step; sites site28p and site28q are packed), pewasm world-up
+    rerun (`wup-pewasm2.sh`, probe fixed), and a full 35-min soak
+    (`soak-edger.sh $S/site28 soak28 2100`). Queue them with
+    `scratch/bench/bench.sh -s` on the sites, play.mjs, c28, then the scripts
+    (see `$S/c28/chain.sh` for the sync list). Bench timeouts on gooner do not
+    stop the remote waiter: kill an orphaned `flock` on edger by PID.
+  - After integ/2026-10-05g lands (F's N1 + inlining re-key, W's wine-slim):
+    merge master; rebuild the shim (`$S/bshim-gooner.sh`) and gexc
+    (`$S/build-native.sh`); relink p-noita18's units from the object cache
+    (`JOBS=6 nice -n 19 ./build.sh` in a copy, with icall hints); refresh
+    runtime/web as `$S/c28/prep.sh` does; repack site/sitec/sitep/siteq (the
+    shader blob stays valid while Mesa is unchanged). Then the coordinator's
+    short recheck: one ABBA pair vs pewasm, one world-up, play A plus the
+    saves check (B). Then send the head to the coordinator to gate.
+  - Stale on edger, not mine to kill: a headless chromium (PID 2139751,
+    profile /tmp/gbench/noita-chrome-*, from a pewasm runner about 20 h ago, idle).
+
+- **Earlier resume (2026-10-05 evening, after the first reboot).** Merged master
   e3917bac (df028162; no gex-cgen change, unit keys kept). third_party/mesa
   checked out in this worktree (wink 5f5572e62ff; cloned from
   `scratch/coord/mesa-wink`, submodule url set locally to it) and built with
@@ -1045,6 +1075,26 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   `unguarded` passed explicitly) merges clean with this branch; Noita's
   nt.json has unguarded=true, so it changes nothing for the ejected Noita.
   The previous section (below) describes the c27 queue this replaces.
+  - **c28 results (edger, seed pinned, BENCH_CORES default):**
+    - ABBA, world fps from world-up+90 s (about 200 s each): pewasm 45.9,
+      site28 (direct) 62.9, site28c (composited) 61.4, site28c 61.2,
+      site28 64.4, pewasm 48.0. Direct present averages 63.65 world fps:
+      1.36x faster than pewasm (46.95) and 4% faster than the composited
+      control (61.3).
+    - World-up, seconds after navigation: site28 31.9, 30.9, 30.8;
+      site28c 31.8, 31.8, 30.7; pewasm 30.7, 31.3 (the third pewasm run
+      aborted: wup-pewasm2.sh's probe called `_noita_world_frame` before
+      the runtime had initialized; the probe now starts at 15 s, rerun queued).
+      The two are level.
+    - Play-through p1-p8 (old scripts): p1 reached the world, and the
+      killme mod's death and Game Over came before the script's walking steps.
+      The boot is now about 25 s faster, so the old timings no longer fit.
+      From p2 on, one shared profile meant Noita's "Autosave found ... Restore?"
+      dialog (the autosave persisted across page loads), which the old scripts don't click.
+      Replaced by `$S/c28/play2.sh`: A (site28p, killme) and B (site28q = no
+      overlay, for pause / Save & Quit / reload / Continue), each in a fresh
+      profile, with play.mjs's new `until` step (holds the script until the
+      world frame counter is nonzero).
 
 - **Previous resume (state at the reboot, 2026-10-05 ~18:10).** Branch
   merge/eject9, worktree ~/gex-sandbox/wt/eject9; head = the commit adding
