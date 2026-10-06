@@ -242,10 +242,13 @@ impl Section {
     pub fn executable(&self) -> bool {
         self.characteristics & SCN_MEM_EXECUTE != 0
     }
-    /// Bytes the section occupies from its RVA: the larger of its virtual and
-    /// raw sizes, which is what the section-overlap check has to use.
+    /// Bytes the section occupies from its RVA, which is what the
+    /// section-overlap and SizeOfImage checks use: what Windows maps
+    /// (`VirtualSize`, or the raw size when that is 0). Raw data past
+    /// `VirtualSize` is in the file only: Godot keeps its whole game (a
+    /// 700 MB `pck` section of VirtualSize 8) there.
     pub fn extent(&self) -> u32 {
-        self.vsize.max(self.raw_size)
+        self.mapped_size()
     }
     /// The size Windows maps: `VirtualSize`, or the raw size when that is 0.
     fn mapped_size(&self) -> u32 {
@@ -743,6 +746,13 @@ impl PeImage {
         }
     }
 
+    /// The bytes a section spans in the image: its mapped size up to the
+    /// section alignment. Raw data past that is in the file only.
+    fn mapped_span(&self, s: &Section) -> u32 {
+        let a = self.section_align.max(1) as u64;
+        (s.mapped_size() as u64).div_ceil(a).saturating_mul(a).min(u32::MAX as u64) as u32
+    }
+
     /// File offset of an RVA, if the file holds it (headers or a section's
     /// raw data).
     pub fn rva_to_offset(&self, rva: u32) -> Option<usize> {
@@ -750,7 +760,7 @@ impl PeImage {
             return Some(rva as usize).filter(|&o| o < self.data.len());
         }
         for s in &self.sections {
-            if rva >= s.rva && rva - s.rva < s.raw_size {
+            if rva >= s.rva && rva - s.rva < s.raw_size.min(self.mapped_span(s)) {
                 let off = s.raw_offset as usize + (rva - s.rva) as usize;
                 return Some(off).filter(|&o| o < self.data.len());
             }
@@ -1280,7 +1290,9 @@ impl PeImage {
             if s.raw_size == 0 || s.rva as usize >= img.len() {
                 continue;
             }
-            let n = (s.raw_size as usize).min(img.len() - s.rva as usize);
+            // Raw data beyond the mapped size (to its last page) is not
+            // part of the image.
+            let n = (s.raw_size.min(self.mapped_span(s)) as usize).min(img.len() - s.rva as usize);
             let src = &self.data[s.raw_offset as usize..s.raw_offset as usize + n];
             img[s.rva as usize..s.rva as usize + n].copy_from_slice(src);
         }

@@ -431,6 +431,34 @@ fn a_truncated_certificate_table_is_ignored() {
     assert_eq!(pe::parse(&bytes).unwrap_err().kind, PeErrorKind::Malformed);
 }
 
+/// Raw data past a section's VirtualSize is in the file, not the image:
+/// Godot appends its game as a `pck` section of VirtualSize 8 whose raw data
+/// runs far past SizeOfImage. Such an image loads, and the extra bytes are
+/// not mapped.
+#[test]
+fn raw_data_past_virtual_size_is_not_mapped() {
+    let mut bytes = std::fs::read(fixture("x86/hello32.exe")).unwrap();
+    let img = pe::parse(&bytes).unwrap();
+    // .data: nothing the loader reads lives there.
+    let last = img.sections.iter().position(|s| s.name == ".data").unwrap();
+    let s = &img.sections[last];
+    let opt_size = u16::from_le_bytes([bytes[img.opt_offset - 4], bytes[img.opt_offset - 3]]) as usize;
+    let hdr = img.opt_offset + opt_size + last * 40;
+    // Point the section's raw data at 1 MiB of 0xab appended to the
+    // file, keeping its VirtualSize.
+    let (vsize, rva) = (s.vsize.max(1), s.rva);
+    let off = bytes.len().div_ceil(0x200) * 0x200;
+    bytes.resize(off, 0);
+    bytes.extend(std::iter::repeat(0xab).take(1 << 20));
+    bytes[hdr + 8..hdr + 12].copy_from_slice(&vsize.to_le_bytes());
+    bytes[hdr + 16..hdr + 20].copy_from_slice(&(1u32 << 20).to_le_bytes());
+    bytes[hdr + 20..hdr + 24].copy_from_slice(&(off as u32).to_le_bytes());
+    let img = pe::parse(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    let mapped = img.map(img.preferred_base).unwrap();
+    assert_eq!(mapped.len(), img.image_size as usize);
+    assert_eq!(mapped[rva as usize], 0xab);
+}
+
 /// With no `.reloc`, an image moves only if it was linked `DYNAMIC_BASE`
 /// (linkers omit an empty `.reloc`); otherwise a needed move fails loudly.
 #[test]
