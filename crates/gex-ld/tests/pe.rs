@@ -399,16 +399,58 @@ fn unknown_relocation_types_fail_loudly() {
     assert!(e.to_string().contains("base relocation type 1 (HIGH)"), "{e}");
 }
 
-/// A managed image is refused by name.
-#[test]
-fn clr_images_fail_loudly() {
+/// Patch hello32.exe into a CLR image: a COR20 header in .data (file
+/// offset of .data + 0x40) with `flags`, `entry` and one vtable fixup of
+/// two 32-bit slots at .data + 0x180, and `xor eax, eax; ret` in .text's
+/// padding. Returns the bytes and .data's RVA.
+fn clr_image(flags: u32, entry: u32) -> (Vec<u8>, u32) {
     let mut bytes = std::fs::read(fixture("x86/hello32.exe")).unwrap();
     let img = pe::parse(&bytes).unwrap();
+    let data = img.sections.iter().find(|s| s.name == ".data").unwrap().clone();
+    let text = img.sections.iter().find(|s| s.name == ".text").unwrap().clone();
+    let (drva, doff) = (data.rva, data.raw_offset as usize);
+    let w32 = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let h = doff + 0x40;
+    w32(&mut bytes, h, 72);
+    w32(&mut bytes, h + 16, flags);
+    w32(&mut bytes, h + 20, entry);
+    w32(&mut bytes, h + 48, drva + 0x100);
+    w32(&mut bytes, h + 52, 8);
+    w32(&mut bytes, doff + 0x100, drva + 0x180);
+    bytes[doff + 0x104..doff + 0x108].copy_from_slice(&[2, 0, 9, 0]); // 2 slots, 32-bit
+    w32(&mut bytes, doff + 0x180, 0x0600_0001); // method tokens
+    w32(&mut bytes, doff + 0x184, 0x0600_0002);
+    let pad = text.raw_offset as usize + 0x1f0;
+    bytes[pad..pad + 3].copy_from_slice(&[0x33, 0xc0, 0xc3]);
     let dd = img.opt_offset + 96 + pe::dir::CLR * 8;
-    bytes[dd..dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
-    bytes[dd + 4..dd + 8].copy_from_slice(&0x48u32.to_le_bytes());
+    w32(&mut bytes, dd, drva + 0x40);
+    w32(&mut bytes, dd + 4, 72);
+    (bytes, drva)
+}
+
+/// An IL-only image is refused by name: it needs a CLR.
+#[test]
+fn clr_images_fail_loudly() {
+    let (bytes, _) = clr_image(1, 0x0600_0001);
     let e = pe::parse(&bytes).unwrap_err();
     assert!(e.to_string().contains(".NET/CLR"), "{e}");
+}
+
+/// A mixed-mode image (C++/CLI, Hades' BasecampBugReporter.Native.dll)
+/// loads as native code: its native entry point, no COM descriptor, and
+/// its managed entries returning 0.
+#[test]
+fn mixed_mode_images_load_as_native_code() {
+    let (bytes, drva) = clr_image(0x10, 0x100b);
+    let img = pe::parse(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    let m = img.map(img.preferred_base).unwrap();
+    let r32 = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+    assert_eq!(r32(img.opt_offset + 16), 0x100b, "the native entry point");
+    assert_eq!(r32(img.opt_offset + 96 + pe::dir::CLR * 8), 0, "no COM descriptor");
+    for slot in [drva + 0x180, drva + 0x184] {
+        let target = r32(slot as usize) as u64 - img.preferred_base;
+        assert_eq!(&m[target as usize..target as usize + 3], &[0x33, 0xc0, 0xc3]);
+    }
 }
 
 /// A certificate table past the end of the file (a signature cut off after

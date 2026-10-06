@@ -495,6 +495,9 @@ pub struct PeImage {
     pub pdata: Vec<RuntimeFunction>,
     /// The file's bytes.
     pub data: Vec<u8>,
+    /// A mixed-mode (C++/CLI) image's CLR side, which is not run: see
+    /// [`ClrMixed`].
+    pub clr: Option<ClrMixed>,
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +528,21 @@ pub fn is_pe(bytes: &[u8]) -> bool {
     }
     let off = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
     bytes.get(off..off + 4) == Some(b"PE\0\0")
+}
+
+const COMIMAGE_FLAGS_ILONLY: u32 = 0x1;
+const COMIMAGE_FLAGS_NATIVE_ENTRYPOINT: u32 = 0x10;
+
+/// A mixed-mode (C++/CLI) image loaded as native code, with no CLR: Hades'
+/// BasecampBugReporter.Native.dll, whose exports only call into managed
+/// code. Its managed entries return 0 ([`PeImage::map`]).
+#[derive(Clone, Debug)]
+pub struct ClrMixed {
+    /// The native entry point (`COMIMAGE_FLAGS_NATIVE_ENTRYPOINT`), run as
+    /// the DLL's entry point; none means no entry point.
+    pub native_entry: Option<u32>,
+    /// VTableFixups: (RVA, slot count, slot width).
+    pub fixups: Vec<(u32, u16, u8)>,
 }
 
 /// Parse a PE32 or PE32+ image.
@@ -688,9 +706,10 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         resources: Vec::new(),
         pdata: Vec::new(),
         data: d.to_vec(),
+        clr: None,
     };
     if pe.dir(dir::CLR).0 != 0 {
-        return Err(PeError::unsupported(".NET/CLR images (a COM descriptor directory)"));
+        pe.clr = Some(pe.parse_clr()?);
     }
     if entry_rva != 0 && !pe.sections.iter().any(|s| s.executable() && s.contains(entry_rva)) {
         return Err(PeError::malformed(format!(
@@ -751,6 +770,71 @@ impl PeImage {
     fn mapped_span(&self, s: &Section) -> u32 {
         let a = self.section_align.max(1) as u64;
         (s.mapped_size() as u64).div_ceil(a).saturating_mul(a).min(u32::MAX as u64) as u32
+    }
+
+    /// The CLR header of an image with a COM descriptor: an IL-only image is
+    /// refused (it needs a CLR); a mixed-mode one is kept as native code.
+    fn parse_clr(&self) -> Result<ClrMixed> {
+        let (rva, _) = self.dir(dir::CLR);
+        let h = self.bytes_at(rva, 72)?;
+        let r32 = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+        let flags = r32(16);
+        if flags & COMIMAGE_FLAGS_ILONLY != 0 {
+            return Err(PeError::unsupported(".NET/CLR images (IL only: a CLR is needed)"));
+        }
+        let native_entry = (flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT != 0).then(|| r32(20));
+        let (vrva, vsize) = (r32(48), r32(52));
+        let mut fixups = Vec::new();
+        if vrva != 0 && vsize != 0 {
+            let t = self.bytes_at(vrva, vsize)?;
+            for e in t.chunks_exact(8) {
+                let at = u32::from_le_bytes(e[0..4].try_into().unwrap());
+                let count = u16::from_le_bytes(e[4..6].try_into().unwrap());
+                let ty = u16::from_le_bytes(e[6..8].try_into().unwrap());
+                let width = if ty & 2 != 0 { 8 } else { 4 };
+                if !self.in_image(at, count as u32 * width) {
+                    return Err(PeError::malformed(format!("CLR vtable fixup at {at:#x} exceeds the image")));
+                }
+                fixups.push((at, count, width as u8));
+            }
+        }
+        Ok(ClrMixed { native_entry, fixups })
+    }
+
+    /// Make a mapped mixed-mode image a native one: its native entry point
+    /// (the CRT's DllMain) in place of the CLR's, no COM descriptor (so
+    /// ntdll does not hand it to mscoree), and every managed entry (the
+    /// vtable fixup slots that native code calls through) a function that
+    /// returns 0, found in the image's own code (`xor eax, eax; ret`).
+    fn unmanage(&self, img: &mut [u8], base: u64, clr: &ClrMixed) -> Result<()> {
+        let o = self.opt_offset;
+        img[o + 16..o + 20].copy_from_slice(&clr.native_entry.unwrap_or(0).to_le_bytes());
+        let dd = o + if self.is64 { 112 } else { 96 } + dir::CLR * 8;
+        img[dd..dd + 8].fill(0);
+        if clr.fixups.is_empty() {
+            return Ok(());
+        }
+        let stub = self
+            .sections
+            .iter()
+            .filter(|s| s.executable())
+            .find_map(|s| {
+                let (a, n) = (s.rva as usize, (s.raw_size.min(self.mapped_span(s)) as usize).min(img.len() - s.rva as usize));
+                img[a..a + n].windows(3).position(|w| matches!(w, [0x33 | 0x31, 0xc0, 0xc3])).map(|i| (a + i) as u64)
+            })
+            .ok_or_else(|| PeError::unsupported("a mixed-mode image with no `xor eax, eax; ret` to stand in for its managed code"))?;
+        let target = base + stub;
+        for &(at, count, width) in &clr.fixups {
+            for i in 0..count as usize {
+                let p = at as usize + i * width as usize;
+                if width == 8 {
+                    img[p..p + 8].copy_from_slice(&target.to_le_bytes());
+                } else {
+                    img[p..p + 4].copy_from_slice(&(target as u32).to_le_bytes());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// File offset of an RVA, if the file holds it (headers or a section's
@@ -1307,6 +1391,9 @@ impl PeImage {
                     img[at..at + 4].copy_from_slice(&v.to_le_bytes());
                 }
             }
+        }
+        if let Some(clr) = &self.clr {
+            self.unmanage(&mut img, base, clr)?;
         }
         let o = self.opt_offset;
         if self.is64 {
