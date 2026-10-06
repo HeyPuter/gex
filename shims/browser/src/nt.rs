@@ -320,6 +320,7 @@ mod imp {
         nt::opengl::FAST.store(var("GEX_NT_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
         nt::opengl::FAST_CLIENT_STATE.store(var("GEX_NT_GL_FAST").as_deref() != Some("nocs"), Ordering::Relaxed);
         TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
+        crate::cgen::TRAP_CALLOUTS.store(flag("GEX_NT_CALLOUT_TRAP"), Ordering::Relaxed);
         if let Some(k) = var("GEX_NT_TICK_EVERY").and_then(|v| v.parse().ok()) {
             TICK_EVERY.store(k, Ordering::Relaxed);
         }
@@ -672,11 +673,9 @@ mod imp {
     /// safepoints or syscalls old, well inside the 15.6 ms Windows
     /// advances it by.
     pub(crate) fn tick() {
-        static LAST: AtomicU64 = AtomicU64::new(0);
         thread_local! {
             static TICK_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
-        let Some(p) = PROCESS.get() else { return };
         let n = TICK_N.with(|c| {
             let n = c.get();
             c.set(n.wrapping_add(1));
@@ -685,6 +684,15 @@ mod imp {
         if n % TICK_EVERY.load(Ordering::Relaxed).max(1) != 0 {
             return;
         }
+        tick_now();
+    }
+
+    /// [`tick`] without the per-thread sampling: after a wait that slept,
+    /// whose caller reads the clocks next (GetTickCount after a timed
+    /// wait: tests/nt sync "timeout lasts").
+    pub(crate) fn tick_now() {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let Some(p) = PROCESS.get() else { return };
         let now = mono();
         let last = LAST.load(Ordering::Relaxed);
         if now.wrapping_sub(last) < 1_000_000 && last != 0 {
@@ -1073,7 +1081,7 @@ mod imp {
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
         if timed {
-            tick();
+            tick_now();
         }
         // Code that went away (an unmapped image, a protection change: LuaJIT
         // rewrites its machine code in place) loses its translations, as
