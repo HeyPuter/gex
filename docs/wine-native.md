@@ -883,9 +883,22 @@ unixlib ran through the dlopen registry (§3.12).
   one wasm32 program (`$W/link-w3.sh` → `$W/wine-w32-w3/dlls/ntdll/
   wine-w3`, container flag `--gex-guest-i386`: i386 translation in the
   process, no mapping above 0x7ffe0000). `wine --version` works; a run
-  starts wineserver (a wasm32 program, spawned) and talks to it, and gets
-  as far as wineboot. Next: the PE side (`gex.image_mapped` binds a native
-  DLL's skeleton when ntdll.so maps it), then hello.exe.
+  starts wineserver (a wasm32 program, spawned) and talks to it.
+- **hello_args.exe runs on Wine's own Unix side** (2026-10-06): PE ntdll,
+  kernel32, kernelbase and ucrtbase are the native wasm skeletons, bound by
+  `gex.image_mapped` when ntdll.so maps them (Wine's virtual.c tells gex
+  each image it maps); exit 42 and the expected output. What it took: the
+  install layout (`$W/w3dist`: `lib/wine/i386-unix/wine`,
+  `lib/wine/i386-windows` with the skeletons plus every other i386 builtin
+  of the master prefix as symlinks, since ntdll.so reads apisetschema.dll
+  there; `share/wine/nls`; `bin/wineserver`), the loader as its own
+  `wineloader`, and each thread's kernel stack top-down (gex's dispatch
+  directory takes 0x100000-0x300000, so bottom-up it landed on 0x400000,
+  the exe mapped elsewhere, and the loader fell back to start.exe).
+  Run: `gexc run --env WINEPREFIX=$W/pfx-w3 $W/w3dist/lib/wine/i386-unix/wine
+  X.exe` (`$W/gexc-w3` wraps that for tests/nt/run.sh; `GEX_W3_TRACE=1` in
+  gexc's own environment lists the bindings). wineboot.exe is not in the
+  master prefix, so every start warns "failed to start wineboot" (W3.2).
 
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
@@ -1370,12 +1383,17 @@ Heads:
   the browser, x86-programs 74, nt --no-cgen 81/81 on x86 and pfx-gui,
   cgen-prefix 81/81, wasm32 4/4 + busybox both, browser nt 49/49). Gate
   order (coordinator): integ-g, U's fjit fix, E's ejected page, then gate2
-  with F's final head (both re-key). Merge master into gate2 when integ-g
-  lands.
+  with F's final head (both re-key). integ-g landed (master c5620656);
+  **gate2 head 004538a9** (that master merged in) is green again
+  (`$W/gchk3.out`: the same counts, browser nt 49/49) and was sent to the
+  coordinator.
 - **W3** (the user's order: before W7): plan in §4.0. gex branch
   merge/w3 (wt/w3, off merge/elf-prov) with the W3.0 spike; Wine fork
   branch `wasm32-w3` (wt/wine-w3; build tree `$W/wine-w32-w3` via
-  `$W/build-w32-w3.sh [targets]`, sr-slim read only). The old merge/elf-prov-gate is deleted. To
+  `$W/build-w32-w3.sh [targets]`, sr-slim read only; loader link
+  `$W/link-w3.sh`, prefix and dll dir `$W/stage-w3.sh`). hello_args.exe
+  runs on Wine's own Unix side (§4.0, W3.1 progress); `$W/w3-nt.log` is
+  tests/nt through `$W/gexc-w3`. The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
