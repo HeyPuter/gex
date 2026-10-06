@@ -32,6 +32,8 @@
 # large files hard-linked, new each run unless --keep), GEX_GL_X64
 # (guest GL for x86-64 Linux games: GEX_CC=gcc guest/gl/build.sh DIR),
 # PPM_EVERY (default 10), WSIZE (Linux window size, default 1280x720),
+# LINUX_LIBS (more library directories for Linux games, e.g. SDL 1.2 and
+# libpng12, which gooner lacks),
 # GEX_STEAM_WIN (gex-steam for Windows, guest/steam/build-win.sh OUT: its
 # steam_api.dll replaces the game's, so games run with no Steam client),
 # GAME_ENV (space-separated K=V for the game's environment, e.g.
@@ -103,7 +105,7 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     [ -n "$only" ] && [[ $only != *",$slug,"* ]] && continue
     kind=$(trim "$kind") dir=$(trim "$dir") prog=$(trim "$prog") args=$(trim "$args")
     menu=$(trim "$menu") play=$(trim "$play") input=$(trim "$input") extra=$(trim "${extra:-}")
-    if [ "$kind" = linux ]; then gdir=$games_linux/$dir; else gdir=$games/$dir; fi
+    case $kind in linux*) gdir=$games_linux/$dir ;; *) gdir=$games/$dir ;; esac
     exe=$gdir/$prog
     g=$out/$slug
     rm -rf "$g"; mkdir -p "$g/frames"
@@ -130,13 +132,24 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     # shellcheck disable=SC2206
     run=("$gexc" run "${flags[@]}" $extra --gl --wayland-out "$g/frames/f")
     for e in ${GAME_ENV:-}; do run+=(--env "$e"); done
-    if [ "$kind" = linux ]; then
+    pre=()
+    if [[ $kind == linux* ]]; then
         [ -n "$gl64" ] || { echo "$slug: set GEX_GL_X64 (guest/gl/build.sh)" >&2; continue; }
         mkdir -p "$state/home-$slug"
         run+=(--wayland "$state/wl-$slug" --wayland-size "${WSIZE:-1280x720}"
-              --env LD_LIBRARY_PATH="$gl64:$(dirname "$exe"):$ov/usr/lib"
+              --env LD_LIBRARY_PATH="$gl64:$(dirname "$exe"):$ov/usr/lib${LINUX_LIBS:+:$LINUX_LIBS}"
               --env SDL_VIDEODRIVER=wayland --env SDL_AUDIODRIVER=dummy --env HOME="$state/home-$slug"
               --env XDG_RUNTIME_DIR="$state")
+        # linux-x11: an X11-only program (SDL 1.2), on Xwayland run inside
+        # the guest as a client of gex's compositor (no Xvfb).
+        if [ "$kind" = linux-x11 ]; then
+            run+=(--env SDL_VIDEODRIVER=x11)
+            xn=$(( 60 + $(printf %s "$slug" | cksum | cut -c1-2) % 30 ))
+            # Xwayland's lock and socket land in the host's /tmp: a stale
+            # pair from an earlier run would look like a running server.
+            rm -f "/tmp/.X$xn-lock" "/tmp/.X11-unix/X$xn"
+            pre=(/bin/sh "$here/xwayland-inguest.sh" "$xn" "$g/xwayland.log")
+        fi
     else
         # gex-steam's steam_api[64].dll in place of the game's when
         # GEX_STEAM_WIN is set; the original stays beside it as .orig, which
@@ -163,7 +176,7 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     # shellcheck disable=SC2206
     argv=($args)
     t0=$(date +%s)
-    (cd "$(dirname "$exe")" && exec env "${env[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "./$(basename "$exe")" "${argv[@]}") \
+    (cd "$(dirname "$exe")" && exec env "${env[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "./$(basename "$exe")" "${argv[@]}") \
         > "$g/log" 2>&1 &
     pid=$!
     first=
@@ -203,6 +216,8 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     else
         rm -rf "$g/frames"
     fi
+    [ -n "${xn:-}" ] && rm -f "/tmp/.X$xn-lock" "/tmp/.X11-unix/X$xn"
+    xn=
     reason=$(reason_of "$g/log")
     printf '%-18s %-6s %-9s %7s %6s %-10s %s\n' "$slug" "$arch" "$stage" "$frames" "$secs" "$end" "${reason:--}" | tee -a "$summary"
 done < "$here/matrix.txt"
