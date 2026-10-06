@@ -293,7 +293,8 @@ RUNTIME = ('__gexw_', 'gexw_', '__wasm_', '__c_longjmp', '__stack_pointer',
 
 
 def is_runtime(nm):
-    return nm is not None and (nm.startswith(RUNTIME) and not nm.startswith('__gexw_adapters_'))
+    # (each DLL's own: its adapters, and the base gex writes for winecrt0)
+    return nm is not None and (nm.startswith(RUNTIME) and not nm.startswith(('__gexw_adapters_', '__gexw_image_base')))
 
 
 def main():

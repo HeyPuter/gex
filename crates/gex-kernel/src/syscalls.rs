@@ -5060,10 +5060,12 @@ impl Kernel {
             // see the same pixels, not a zeroed copy. Not reference counted:
             // unmapping one alias unmaps both, and nothing here unmaps early.
             if flags & crate::mem::flags::SHARED != 0 {
+                // (or any part of one: a window into a mapping another
+                // view holds whole, as win32u maps the session's blocks)
                 if let Some(existing) = self.shared_maps.iter().find(|s| {
-                    Arc::ptr_eq(&s.file, &file) && s.offset == offset && s.len >= len_aligned
+                    Arc::ptr_eq(&s.file, &file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
                 }) {
-                    return Ok(existing.start);
+                    return Ok(existing.start + (offset - existing.offset));
                 }
             }
             // The path and offset travel with the mapping. Two processes
