@@ -6102,12 +6102,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // A syscall from a process that has already exited: `exit_process`
         // tears the descriptor table down, so later guest calls fail like bugs
         // elsewhere. This says whether the guest truly ran on.
+        // A syscall from a thread whose process has exited (another Worker
+        // ran `exit_group` while this one was parked, in `pause()` say): on
+        // Linux the thread would already be gone, so it goes now, without
+        // the call. `exit_process` has torn the descriptor table down; the
+        // call would only fail strangely.
         if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
-            warn_line(&format!(
-                "[gex] pid {} made a {} after exiting",
-                h.kernel.pid,
-                gex_kernel::syscalls::syscall_name(nr),
-            ));
+            if tracing() {
+                trace_line(&format!(
+                    "[gex] pid {} thread {} ends at its {} after the process exited\n",
+                    h.kernel.pid,
+                    kstate.tid,
+                    gex_kernel::syscalls::syscall_name(nr),
+                ));
+            }
+            set_resume_none();
+            h.threads[cur()].waiting = Waiting::Exited;
+            return 3;
         }
         let a0 = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
@@ -9455,8 +9466,10 @@ fn schedule() -> i32 {
             // Worker, exits), a futex (another Worker wakes it; one nothing
             // can wake is the deadlock caught above). A parent waiting out a
             // long child reported itself "idle" every power of two.
+            // (This Worker's thread: a Worker owns exactly one, and the
+            // others' entries are their own Workers' business.)
             let ends_by_itself = with_host(|h| {
-                h.threads.iter().all(|t| {
+                h.threads.get(cur()).is_none_or(|t| {
                     matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
                 })
             });
