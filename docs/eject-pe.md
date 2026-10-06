@@ -1199,6 +1199,32 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
 
 ## 8. Gaps and risks
 
+- **Paths the recording never reached (open, for whoever takes eject on
+  after stream E).** An ejected build runs only what its recording (plus
+  discovery and `user/web-entries.txt`) covered. Any other path stops the
+  run loudly, and not only new functions: a resume into a call
+  continuation after the C nest unwound (a blocking call, an APC, a host
+  round trip) needs a region entry for every frame still on the stack.
+  Noita's Continue after a reload was one (FMOD -> combase ->
+  sechost/rpcrt4 named-pipe connect); the play-through found it, and the
+  shim's stack scan (an unseen-code stop lists the stack's return
+  addresses) names a whole chain in one run. The fallback,
+  `"jit_fallback": true` in user/eject.json (`run.mjs/run.sh
+  --jit-fallback`), is off by default and needs a translator in the
+  runtime, which the shipped page does not have. Open follow-ups: a
+  coverage pass (a scripted training run through menus, save/load,
+  death/restart and options, with `run.mjs --record-entries`), and a
+  shipped-page fallback that can recover from a missed entry instead of
+  stopping (a tier-1 translator loaded on demand, or a region per call
+  continuation of every recorded function).
+- **Region entries and dispatch slots (fixed, ee112f0c).** A dispatch slot
+  covers four bytes on x86, and a region module is published after its
+  unit. A region entry sharing a slot with a unit function's entry took
+  the slot over, so calls to that function left the nest and their
+  returns landed on unentered continuations. More entries could break a
+  run that fewer entries ran. `regions_from` now leaves such entries out
+  and reports recorded ones. The NT trampoline page is exempt: the host
+  enters its resume points directly.
 - **Interior entries** (§3.2–3.3) are the main correctness risk. A resume
   at an address no region covers stops the run. The conservative region set
   (every call continuation in an SEH-framed function) may be large; it is
