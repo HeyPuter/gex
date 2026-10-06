@@ -147,6 +147,41 @@ U(mono_class_is_subclass_of)
 	RET (r);
 }
 
+/* mono_class_get_methods (klass, iter): with GEXMONO_TRACE_METHODS=1, a line for each
+ * finished pass over a class (its name, how many methods, how many passes so far):
+ * which class Unity scans over and over. */
+U(mono_class_get_methods)
+{
+	ENTER;
+	MonoClass *k = P (0);
+	gpointer *iter = P (1);
+	MonoMethod *m = mono_class_get_methods (k, iter);
+	static int on = -1;
+	if (on < 0)
+		on = getenv ("GEXMONO_TRACE_METHODS") ? atoi (getenv ("GEXMONO_TRACE_METHODS")) : 0;
+	if (on >= 2 && m) {
+		ERROR_DECL (err);
+		MonoMethodSignature *sig = mono_method_signature_checked (m, err);
+		fprintf (stderr, "[gexmono]   %s.%s::%s %p sig %p%s%s\n", m_class_get_name_space (k), m_class_get_name (k), m->name, m, sig,
+			is_ok (err) ? "" : " error ", is_ok (err) ? "" : mono_error_get_message (err));
+		mono_error_cleanup (err);
+	}
+	if (on && !m && k) {
+		static GHashTable *passes;
+		static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+		pthread_mutex_lock (&lock);
+		if (!passes)
+			passes = g_hash_table_new (NULL, NULL);
+		guint n = GPOINTER_TO_UINT (g_hash_table_lookup (passes, k)) + 1;
+		g_hash_table_insert (passes, k, GUINT_TO_POINTER (n));
+		pthread_mutex_unlock (&lock);
+		if (n <= 3 || (n & (n - 1)) == 0)
+			fprintf (stderr, "[gexmono] methods of %s.%s (%p, %d methods): pass %u\n", m_class_get_name_space (k),
+				m_class_get_name (k), k, mono_class_get_method_count (k), n);
+	}
+	RET (m);
+}
+
 /* mono_custom_attrs_from_field (klass, field): Mono finds the field's
  * metadata row from its index in klass's field array, so klass must be the
  * class that defines the field. UnityPlayer's serializer passes the class it
@@ -739,6 +774,6 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
 	L(mono_trace_set_log_handler) L(mono_dllmap_insert) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
-	L(mono_class_get_field_from_name) L(mono_class_is_subclass_of) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
+	L(mono_class_get_field_from_name) L(mono_class_is_subclass_of) L(mono_class_get_methods) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0
 };

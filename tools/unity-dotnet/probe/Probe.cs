@@ -35,9 +35,10 @@ public static class GexProbe
         updates++;
         float now = Time.realtimeSinceStartup;
         if (now < next) return;
-        next = now + 5f;
+        next = now + (Environment.GetEnvironmentVariable("GEXPROBE_EVERY") is string ev && float.TryParse(ev, out var evs) ? evs : 5f);
         try
         {
+            Console.Error.WriteLine($"[gexprobe] gc {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)} heap {GC.GetTotalMemory(false) >> 20} MB");
             Console.Error.WriteLine($"[gexprobe] real {now:F1} time {Time.time:F2} unscaled {Time.unscaledTime:F2} dt {Time.deltaTime:F4} scale {Time.timeScale} frame {Time.frameCount} ticks {updates}");
             var sm = GameObject.Find("StartManager");
             if (sm != null)

@@ -1022,4 +1022,30 @@ Not yet:
        Xinerama (scratchpad xinfo test), and SDL's X libraries load and connect.
        SDL_VIDEODRIVER=x11 / XDG_SESSION_TYPE=x11 change nothing. Next: why
        SDL video is not up when Unity first asks (strace in runs/hk65).
+  11. **SDL video fixed (e50a8cb5):** the strace (hk65) shows SDL_Init
+     (timer|video|joystick|haptic|gamecontroller) failing on libudev's monitor:
+     `socket(AF_NETLINK, ..., NETLINK_KOBJECT_UEVENT)` = EAFNOSUPPORT, after
+     which SDL undoes video too. gex-kernel now gives an inert netlink socket
+     (an empty eventfd). Unity then logs "The selected window backend is x11",
+     `Display.main` is 800x600, and the cameras render (hk69: 18,518
+     pre-renders, glDrawElementsBaseVertex with textures every frame). Frames
+     still look black because, with GEXMONO_LV_OFF=1 (needed to avoid the crash
+     below), the spinner is gone and the intro stays at LoadingIcon, where
+     every element is faded out (vertex alpha 0 in the trace).
+  12. **The Instantiate crash (liveness on), what is known:** it is not the
+     function JIT (hk68, tier-1 only, crashes too). It is not the GC lock. It
+     moves: Internal_CloneSingle (hk60/hk61), then after FsmState creation and
+     its method scan (hk70), then during field deserialization (hk71), or at
+     the first frame (hk72): memory corruption, not one bad read. With
+     `MONO_GC_DEBUG=disable-major` (hk73) it fails differently: "Unable to find
+     method BeginRenderExtraOverlays in [UnityEngine.UIModule.dll]
+     UnityEngine.Canvas", then an assertion in class.c:2272 (`type` NULL).
+     The serializer creates PlayMaker objects (Fsm, FsmState, FsmString x4096,
+     List<T> x8192, TMP_Glyph x8192: GEXMONO_TRACE_METHODS=1 lists classes it
+     scans, =2 every method with its signature) and stores managed references
+     into its own native buffers with mono_gc_wbarrier_set_field(NULL, ...).
+     Leads: references held only in Unity's native heap (invisible to sgen),
+     and Unity writing managed objects through Unity-Mono assumptions. Next:
+     MONO_GC_DEBUG=verify-before-collections / check-at-minor style heap
+     checks, and the class.c:2272 caller.
 
