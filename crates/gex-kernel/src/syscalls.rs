@@ -5249,7 +5249,7 @@ impl Kernel {
             SOCK_DGRAM => net::Kind::Udp,
             _ => return Err(Errno::EPROTONOSUPPORT),
         };
-        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver), Arc::clone(&self.ports)));
+        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver), Arc::clone(&self.ports), self.unix_remote));
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 {
             crate::fs::oflags::O_NONBLOCK

@@ -2371,7 +2371,14 @@ pub extern "C" fn k_sock_available(id: i32) -> i32 {
 pub extern "C" fn k_sock_close(id: i32) {
     let mut t = socks().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = t.get_mut(id as usize) {
-        *slot = None;
+        // A listener on an abstract name (a leading NUL) gives the name up
+        // as it closes, as on Linux; a path name stays until it is unlinked.
+        // (TCP ports between a page's processes are abstract names.)
+        if let Some(s) = slot.take() {
+            if let Some(p) = s.bound_path().filter(|p| p.starts_with('\0')) {
+                names().unbind_socket(&p, &s);
+            }
+        }
     }
 }
 

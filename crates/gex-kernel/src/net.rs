@@ -244,6 +244,55 @@ impl Transport for LoopEnd {
     }
 }
 
+/// One end of a TCP connection between guests in different processes of a
+/// page: a stream in the global kernel (`unix::Remote`), named by the port
+/// (`tcp_name`), each end an id there.
+pub struct RemoteEnd {
+    id: i32,
+    remote: crate::unix::Remote,
+}
+
+impl std::fmt::Debug for RemoteEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RemoteEnd({})", self.id)
+    }
+}
+
+impl Transport for RemoteEnd {
+    fn connect(&self, _host: &str, _port: u16) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn status(&self) -> Status {
+        Status::Open
+    }
+    fn send(&self, data: &[u8]) -> Result<usize, Errno> {
+        match (self.remote.write)(self.id, data.as_ptr() as crate::PAddr, data.len() as u32) {
+            n if n >= 0 => Ok(n as usize),
+            n => Err(Errno(-n)),
+        }
+    }
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        match (self.remote.read)(self.id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32) {
+            n if n >= 0 => Ok(n as usize),
+            n => Err(Errno(-n)),
+        }
+    }
+    fn has_data(&self) -> bool {
+        (self.remote.readable)(self.id) != 0
+    }
+    fn available(&self) -> usize {
+        (self.remote.available)(self.id).max(0) as usize
+    }
+    fn close(&self) {
+        (self.remote.close)(self.id);
+    }
+}
+
+/// The global kernel's name for a TCP port (abstract, so no file appears).
+fn tcp_name(port: u16) -> String {
+    format!("\0gex-tcp:{port}")
+}
+
 /// The TCP ports guests on this machine listen on. Shared across `fork`, as
 /// the resolver is: a child connects to its parent's listener.
 #[derive(Debug, Default)]
@@ -312,10 +361,16 @@ pub struct Socket {
     /// A listener's connections waiting for `accept`: the far end of each,
     /// and the port it came from. `None` unless listening.
     backlog: Mutex<Option<VecDeque<(Arc<dyn Transport>, u16)>>>,
+    /// The global kernel, when there is one (a page: a Worker per process).
+    /// Listeners and loopback connections live there, so a guest in another
+    /// process can reach them.
+    remote: Option<crate::unix::Remote>,
+    /// A listener's id in the global kernel.
+    remote_listener: Mutex<Option<i32>>,
 }
 
 impl Socket {
-    pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>, ports: Arc<Ports>) -> Socket {
+    pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>, ports: Arc<Ports>, remote: Option<crate::unix::Remote>) -> Socket {
         Socket {
             kind,
             net,
@@ -327,6 +382,8 @@ impl Socket {
             ports,
             local: Mutex::new(None),
             backlog: Mutex::new(None),
+            remote,
+            remote_listener: Mutex::new(None),
         }
     }
 
@@ -337,11 +394,21 @@ impl Socket {
         if self.local.lock().unwrap().is_some() {
             return Err(Errno::EINVAL);
         }
-        if port != 0 && self.kind == Kind::Tcp && self.ports.listening(port) {
+        // (In a page the global kernel answers at `listen`: its name table
+        // keeps a closed listener's name until the name is bound again.)
+        if port != 0 && self.kind == Kind::Tcp && self.remote.is_none() && self.ports.listening(port) {
             return Err(Errno::EADDRINUSE);
         }
         *self.local.lock().unwrap() = Some((addr, port));
         Ok(())
+    }
+
+    /// Whether a guest in any process of the page listens on `port`.
+    fn remote_taken(&self, port: u16) -> bool {
+        self.remote.is_some_and(|r| {
+            let n = tcp_name(port);
+            (r.exists)(n.as_ptr() as crate::PAddr, n.len() as u32) > 0
+        })
     }
 
     /// Where this end is, for `getsockname`: 0.0.0.0:0 when unbound.
@@ -360,6 +427,25 @@ impl Socket {
             return Ok(());
         }
         let (addr, mut port) = self.local();
+        if let Some(r) = self.remote {
+            // In the global kernel: bound and listening in one, as a unix
+            // socket there is.
+            if port == 0 {
+                port = self.ports.ephemeral();
+                while self.remote_taken(port) {
+                    port = self.ports.ephemeral();
+                }
+            }
+            let n = tcp_name(port);
+            let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32);
+            if id < 0 {
+                return Err(if -id == Errno::EADDRINUSE.0 || -id == 98 { Errno::EADDRINUSE } else { Errno(-id) });
+            }
+            *self.remote_listener.lock().unwrap() = Some(id);
+            *self.local.lock().unwrap() = Some((addr, port));
+            *backlog = Some(VecDeque::new());
+            return Ok(());
+        }
         let mut listeners = self.ports.listeners.lock().unwrap();
         if port == 0 {
             drop(listeners);
@@ -382,11 +468,19 @@ impl Socket {
     /// `accept`: the next waiting connection as a socket of its own, or
     /// `EAGAIN`; `EINVAL` when not listening.
     pub fn accept(&self) -> Result<Arc<Socket>, Errno> {
-        let (t, from) = match &mut *self.backlog.lock().unwrap() {
-            Some(q) => q.pop_front().ok_or(Errno::EAGAIN)?,
-            None => return Err(Errno::EINVAL),
+        let remote_listener = *self.remote_listener.lock().unwrap();
+        let (t, from): (Arc<dyn Transport>, u16) = match (remote_listener, self.remote) {
+            (Some(id), Some(r)) => match (r.accept)(id) {
+                // The far end's port is the other process's to know.
+                n if n >= 0 => (Arc::new(RemoteEnd { id: n, remote: r }), 0),
+                n => return Err(Errno(-n)),
+            },
+            _ => match &mut *self.backlog.lock().unwrap() {
+                Some(q) => q.pop_front().ok_or(Errno::EAGAIN)?,
+                None => return Err(Errno::EINVAL),
+            },
         };
-        let s = Socket::new(Kind::Tcp, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports));
+        let s = Socket::new(Kind::Tcp, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports), self.remote);
         *s.transport.lock().unwrap() = Some(t);
         *s.peer.lock().unwrap() = Some((0x7f00_0001, from));
         *s.local.lock().unwrap() = Some((0x7f00_0001, self.local().1));
@@ -439,7 +533,16 @@ impl Socket {
         // involved. (One nothing here listens on still goes out: the host
         // may have a service on its own loopback.)
         if self.kind == Kind::Tcp && is_local(addr) {
-            if let Some(listener) = self.ports.listener(port) {
+            if let Some(r) = self.remote {
+                let n = tcp_name(port);
+                let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32);
+                if id >= 0 {
+                    *self.peer.lock().unwrap() = Some((0x7f00_0001, port));
+                    *self.local.lock().unwrap() = Some((0x7f00_0001, self.ports.ephemeral()));
+                    *self.transport.lock().unwrap() = Some(Arc::new(RemoteEnd { id, remote: r }));
+                    return Ok(());
+                }
+            } else if let Some(listener) = self.ports.listener(port) {
                 return self.connect_local(&listener, port);
             }
         }
@@ -581,6 +684,9 @@ impl FileHandle for Socket {
             return !self.dgrams.lock().unwrap().is_empty();
         }
         // A listener is readable when a connection waits.
+        if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
+            return (r.pending)(id) != 0;
+        }
         if let Some(q) = &*self.backlog.lock().unwrap() {
             return !q.is_empty();
         }
@@ -613,6 +719,9 @@ impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(t) = self.transport.lock().unwrap().take() {
             t.close();
+        }
+        if let (Some(id), Some(r)) = (self.remote_listener.lock().unwrap().take(), self.remote) {
+            (r.close)(id);
         }
         // A listener gives its port back, and the connections nobody
         // accepted see their peer gone.
