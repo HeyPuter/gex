@@ -1723,6 +1723,14 @@ fn run_thread_loop(
                                         eprintln!("gex: x{r} {v:#x}: {}", words.join(" "));
                                     }
                                 }
+                                // GEX_TRACE_ADDRS=hex,hex,...: the same for chosen addresses.
+                                for a in std::env::var("GEX_TRACE_ADDRS").unwrap_or_default().split(',') {
+                                    let Ok(v) = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16) else { continue };
+                                    if (v as usize) + 64 <= bytes.len() {
+                                        let words: Vec<String> = (0..8).map(|i| format!("{:#x}", read_u64(bytes, v as usize + i * 8))).collect();
+                                        eprintln!("gex: {v:#x}: {}", words.join(" "));
+                                    }
+                                }
                             }
                             for l in maps.lines() {
                                 let mut r = l.split(|c| c == '-' || c == ' ');

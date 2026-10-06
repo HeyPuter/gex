@@ -1065,4 +1065,27 @@ Not yet:
      words at each register). Next: what 0x1103ed2e0 is (MonoDomain?) and who
      writes it into a native MonoBehaviour during Instantiate (watchpoint on
      that word: GEX_WATCH).
+  14. **The dangling pointer is a destroyed GameObject (runs hk79-hk84):**
+     0x1103ed2e0 is not a Mono address: `GEX_WATCH=0x1103ed2e0+0x40` shows a
+     `10GameObject` (instance ID 48962) created there by the loading thread
+     and later destroyed, and the memory reused for path strings and vertex
+     data. The MonoBehaviour (ID 48966, the loading spinner's
+     StandaloneLoadingSpinner) keeps pointing at it. `GEXMONO_LV_WATCH`
+     (provider: words at given addresses at each liveness world stop/start)
+     shows the GameObject alive through the liveness pass and destroyed by
+     the "Unloading 82 unused Assets" that follows: the walk reports the
+     component (reached from StartManager.loadSpinnerPrefab), Unity keeps it,
+     but not its GameObject. Unity's mark function (UnityPlayer 0x12f1ef0,
+     called per reported object by instance ID) sets the mark bit and queues
+     the object for dependency traversal only when flag 0x8 is clear, so a
+     reported asset may not pull its GameObject in by itself.
+     Changes made to match Unity's own unity-liveness.c (fetched from
+     Unity-Technologies/mono unity-main): from_root walks the root's references
+     without reporting the root; statics come from the ambient memory
+     manager's class_vtable_array (generic instances included, corlib
+     skipped). Neither changed the outcome (still 82 unloaded, same crash).
+     Next: what flag 0x8 means and how real Unity keeps a component's
+     GameObject (does the managed walk reach the GameObject's wrapper there,
+     e.g. through a GC handle root?); compare the reported set against the
+     handle roots.
 
