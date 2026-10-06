@@ -962,4 +962,25 @@ Not yet:
      glibc) were still loading under load ~160 when this was written.
      hk46 (focus from frame 0): 5,797 PRESENTs, still no draw/shader, same log
      as hk41: the intro does not advance; next on that.
+  8. **Checks on the fixed gexc (gooner, 2026-10-05 late):** x86-programs
+     72/72, glibc 2/2, tests/nt 81/81 with `--no-cgen` and 81/81 with cgen
+     prefix units; gs13/gs14 (worldmachine glibc, full --fjit, graphics) ran to
+     their 3000 s timeout in the first scene with no crash (4 of 4 crashed
+     before the fix).
+  9. **HK intro, why it does not advance: it is waiting for the language
+     choice.** `tools/unity-dotnet/probe/build.sh DATA_DIR OVERLAY` builds a
+     diagnostic assembly that Unity runs through RuntimeInitializeOnLoads.json,
+     and `muck-dotnet.sh OVERLAY=` (with UNITY_RELAUNCH) puts it in the run's
+     copy of the game. Run hk48 (batch): game time advances normally (time
+     scale 1, ~30 frames/s of game time, `Time.time` tracks real time),
+     first-chance exceptions are reported (the probe's self-test shows) and
+     none other is thrown, so nothing is swallowed. StartManager:
+     `CheckIsLanguageSet() = False`, `Platform.Current.ShowLanguageSelect =
+     True`, `confirmedLanguage = False`, Animator parameters all false: a fresh
+     HOME has no language saved, so the first-run language select waits for a
+     confirmation. Not a gex bug. Next: seed the language (Unity PlayerPrefs in
+     the run's HOME, or scripted input on the language screen), then the
+     graphics question that remains: with focus, Unity presents but draws
+     nothing, although both intro cameras are enabled and active (probe:
+     `Camera`, `AspectBorders`, 640x480).
 

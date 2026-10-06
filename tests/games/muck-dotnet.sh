@@ -13,7 +13,9 @@
 # STEAM_APPID=N writes steam_appid.txt beside it), DOTNET_FW (the .NET 10 shared framework directory),
 # GUEST_LIBS=DIR (with UNITY_RELAUNCH: the launcher's interpreter is DIR's ld-linux-x86-64.so.2 and DIR
 # comes first in its inherited DT_RPATH: another distribution's glibc, e.g. worldmachine's, to
-# reproduce what only happens there).
+# reproduce what only happens there), OVERLAY=DIR (with UNITY_RELAUNCH: DIR's files, by
+# path relative to the game directory, replace or join the game's in this run's copy; the
+# directories on their way become real directories of links, the game's own stay untouched).
 #
 # Default: batch mode, no graphics. GFX=GLDIR: with graphics, GL through
 # gex-gl (GLDIR holds guest/gl/build.sh's x86-64 build) and X from an
@@ -43,6 +45,23 @@ if [ -n "${UNITY_RELAUNCH:-}" ]; then
 	# STEAM_APPID: Steamworks' development file, so a game started outside Steam runs instead of
 	# asking Steam to restart it.
 	[ -n "${STEAM_APPID:-}" ] && echo "$STEAM_APPID" > "$G/steam_appid.txt"
+	if [ -n "${OVERLAY:-}" ]; then
+		( cd "$OVERLAY" && find . -type f ) | while read -r f; do
+			f=${f#./}; d=$G
+			rest=$(dirname "$f")
+			# Each directory on the way: a link to the game's becomes a directory of links.
+			while [ "$rest" != . ]; do
+				first=${rest%%/*}
+				if [ -L "$d/$first" ]; then
+					src=$(readlink -f "$d/$first"); rm "$d/$first"; mkdir "$d/$first"
+					for e in "$src"/* "$src"/.[!.]*; do [ -e "$e" ] && ln -s "$e" "$d/$first/"; done
+				fi
+				mkdir -p "$d/$first"; d=$d/$first
+				[ "$rest" = "$first" ] && rest=. || rest=${rest#*/}
+			done
+			rm -f "$G/$f"; cp "$OVERLAY/$f" "$G/$f"
+		done
+	fi
 	MUCK=$G
 fi
 cd "$MUCK"
