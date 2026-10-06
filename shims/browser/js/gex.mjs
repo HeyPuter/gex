@@ -2554,6 +2554,11 @@ export class Gex {
           // The shim's exports themselves: a wasm-to-wasm call, no JS.
           nt_qpc: e.gex_nt_qpc,
           provider_alloc_top: e.gex_provider_alloc_top,
+          // Wine's Unix side (W3.1): its system-call dispatcher and fault
+          // hook, process-wide in the shim (the page's delivery of faults
+          // is still to come).
+          unix_dispatcher: (op, idx) => e.gex_unix_dispatcher?.(op, idx) ?? 0,
+          fault_hook: (idx) => e.gex_fault_hook_set?.(idx),
         } : {}),
         ...(memBase && !wasmprog ? this.#providerImports() : {}),
         ...(wasmprog ? this.#wasmprogImports(() => inst) : wasmdll ? { syscall: this.#nativeSyscall } : {}),

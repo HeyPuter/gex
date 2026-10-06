@@ -4617,6 +4617,21 @@ pub(crate) fn set_fault_hook(state: &HostState, idx: u32) {
     v.push((key, idx));
 }
 
+/// Wine's Unix-side system-call dispatcher, by process (W3.1): op 0 sets
+/// it, op 1 returns it (0 for none).
+static UNIX_DISPATCHERS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+pub(crate) fn unix_dispatcher(state: &HostState, op: i32, idx: u32) -> u32 {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    let mut v = UNIX_DISPATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+    if op == 0 {
+        v.retain(|(k, _)| *k != key);
+        v.push((key, idx));
+        return 0;
+    }
+    v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d)
+}
+
 /// NTSTATUS codes the hook is given.
 pub(crate) mod fault_code {
     pub const ACCESS_VIOLATION: u32 = 0xc000_0005;

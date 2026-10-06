@@ -25,9 +25,15 @@ winebuild=${WINEBUILD:-$(grep -m1 -o '[^ ]*/tools/winebuild/winebuild' "$build/M
 
 rm -rf "$out"
 mkdir -p "$out"
-# symbolic links: the prefix may be on another file system
+# symbolic links: the prefix may be on another file system. Only for the
+# large, read-only parts (the DLLs and programs, fonts, NLS tables): every
+# other file is copied, so a run that writes one (the registry, win.ini,
+# INetCookies/index.dat) writes this prefix's copy, never the staged
+# prefix every other prefix links to.
 cp -rs "$x86/." "$out/"
 rm -f "$out/gex-layout"
+find "$out" -type l ! -iregex '.*\.\(dll\|exe\|drv\|sys\|ocx\|acm\|cpl\|ax\|tlb\|nls\|ttf\|ttc\|fon\|mui\|so\|wasm\|dll16\|exe16\|drv16\|vxd\)' -print0 |
+    while IFS= read -r -d '' f; do cp --remove-destination "$(readlink -f "$f")" "$f"; done
 sys=$out/drive_c/windows/syswow64
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/stage-native.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT

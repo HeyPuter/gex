@@ -429,6 +429,12 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         };
         Ok(())
     })()) })?;
+    // Wine's system-call dispatcher on its Unix side (W3.1): ntdll.so
+    // registers it (op 0), and the PE side's gexrt asks for it (op 1; 0
+    // while there is none, and the NT layer takes the call).
+    linker.func_wrap(IMPORT_MODULE, "unix_dispatcher", |caller: Caller<'_, HostState>, op: i32, idx: i32| -> i32 {
+        crate::unix_dispatcher(caller.data(), op, idx as u32) as i32
+    })?;
     // A native wasm32 program's guest fault hook (W3.1, `crate::FAULT_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "fault_hook", |caller: Caller<'_, HostState>, idx: i32| {
         crate::set_fault_hook(caller.data(), idx as u32);

@@ -862,6 +862,33 @@ unixlib ran through the dlopen registry (§3.12).
 | W3.6 sync | ntsync in gex-kernel (`/dev/ntsync` on the futex machinery), so waits never reach wineserver | job-heavy games (Noita) no slower than W2 | 2–3 d |
 | W3.7 page | the same in the page: wineserver's thread in a Worker, the Unix side's modules per Worker | Retrocycles, Katana ZERO and Undertale in the page | 3–5 d |
 
+**G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
+from tests/nt/src on merge/games2; today each stops in the NT layer):
+
+| repro | what it needs | W3 step |
+|---|---|---|
+| hooks.exe (Katana ZERO, Spelunky 2) | NtUserSetWindowsHookEx and hook calls | W3.3 (win32u.so) |
+| iocp.exe (Spelunky 2) | I/O completion ports | W3.1 (ntdll.so + wineserver) |
+| unixpath.exe (Dicey Dungeons) | `\??\unix\` paths | W3.1 (ntdll.so's file code) |
+| keyname.exe (Spelunky 2) | NtUserGetKeyNameText | W3.3 (win32u.so, the driver's keyboard layout) |
+| sysmisc.exe (OneShot) | NtSetThreadExecutionState, SystemParametersInfo 0x5d/0x5e/0x2000/0x2001, VirtualLock | W3.1 (ntdll.so) and W3.3 (win32u.so) |
+| com.exe (N++, OneShot, 5D Chess, Retrocycles) | DirectInput8, MMDevice, WIC, dsound classes registered | W3.2 (wineboot's registration) |
+| glbig.exe (Undertale, Retrocycles) | GL calls carrying over 8 MiB | W3.4 (opengl32.so, no ring) |
+| glcore.exe (5D Chess, Cruelty Squad) | 3.3 core-profile contexts | W3.4 (winewayland's EGL) |
+
+Also seen in G's games (no repro yet): audio drivers loaded by name and
+secur32's Unix side failing soft (W3.5); a synchronous NtNotifyChangeKey and
+NtAreMappedFilesTheSame (W3.1); NtSetContextThread on another thread
+(W3.1, wineserver); NtCreateUserProcess (W3.1, a crash handler's process).
+Momodora's missing glGetShaderSource/glGetAttachedShaders and wined3d draw
+errors are W3.4.
+
+**Prefixes are copy-on-write** (merge/w3): `stage-native.sh` links only the
+large read-only files (DLLs, programs, fonts, NLS) to the staged prefix and
+copies every other file, so a run that writes the registry, win.ini or
+INetCookies/index.dat writes its own copy. `$W/pfx-*` were fixed in place
+(2026-10-06).
+
 **W3.0 findings so far (2026-10-06, branch merge/w3, fork branch
 `wasm32-w3`):**
 - Every ntdll/unix object compiles for wasm32 (fork 436bf6eda79:
