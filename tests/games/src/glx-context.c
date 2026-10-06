@@ -50,6 +50,22 @@ int main(void) {
         if (want[i].mask == 4) CHECK(what, v && !strncmp(v, "OpenGL ES", 9));
         else if (want[i].mask == 1) CHECK(what, v && v[0] >= '3' && (mask & 1));
         else CHECK(what, v && v[0] >= '2' && strncmp(v, "OpenGL ES", 9) && !(mask & 1));
+        if (want[i].mask == 2) {
+            /* What Baba Is You requires by name, and the one command that
+               used to keep GL_ARB_shader_objects from being claimed. */
+            const char *e = (const char *)glGetString(GL_EXTENSIONS);
+            CHECK("compatibility: GL_ARB_shader_objects claimed", e && strstr(e, "GL_ARB_shader_objects"));
+            typedef unsigned (*create_t)(unsigned);
+            typedef void (*del_t)(unsigned);
+            typedef unsigned char (*is_t)(unsigned);
+            create_t cs = (create_t)glXGetProcAddressARB((const GLubyte *)"glCreateShaderObjectARB");
+            del_t del = (del_t)glXGetProcAddressARB((const GLubyte *)"glDeleteObjectARB");
+            is_t is_shader = (is_t)glXGetProcAddressARB((const GLubyte *)"glIsShader");
+            unsigned sh = cs ? cs(0x8B31) : 0;
+            int was = sh && is_shader && is_shader(sh);
+            if (del && sh) del(sh);
+            CHECK("glDeleteObjectARB deletes a shader", was && !is_shader(sh));
+        }
         glXMakeCurrent(d, None, NULL);
         glXDestroyContext(d, c);
     }

@@ -2,7 +2,7 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 714 claimable, 146 withheld for missing entry
+ * 715 claimable, 145 withheld for missing entry
  * points, out of the registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
@@ -158,6 +158,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_shader_group_vote",
     "GL_ARB_shader_image_load_store",
     "GL_ARB_shader_image_size",
+    "GL_ARB_shader_objects",
     "GL_ARB_shader_precision",
     "GL_ARB_shader_stencil_export",
     "GL_ARB_shader_storage_buffer_object",

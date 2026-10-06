@@ -693,6 +693,19 @@ void glLinkProgram(unsigned p) { CMD1(GEXGL_LINK_PROGRAM, p); }
 void glUseProgram(unsigned p) { CMD1(GEXGL_USE_PROGRAM, p); }
 void glDeleteProgram(unsigned p) { CMD1(GEXGL_DELETE_PROGRAM, p); }
 
+/* GL_ARB_shader_objects' one delete for both kinds of object. Shaders and
+   programs take their names from one counter here (take_name), so a name is
+   one or the other, and the host says which. Without it the extension was
+   withheld (gen_gl_extensions.py claims only what is exported), and Baba Is
+   You, which requires the extension by name, refused to start ("OpenGL
+   extension 'GL_ARB_shader_objects' not supported."). */
+unsigned char glIsProgram(unsigned program);
+void glDeleteObjectARB(unsigned obj) {
+    if (!obj) return;
+    if (glIsProgram(obj)) glDeleteProgram(obj);
+    else glDeleteShader(obj);
+}
+
 void glBindAttribLocation(unsigned program, unsigned index, const char *name) {
     if (!name) return;
     size_t len = strlen(name);
