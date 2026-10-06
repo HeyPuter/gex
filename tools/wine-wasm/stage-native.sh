@@ -46,8 +46,10 @@ for dll in "$@"; do
     [ -d "$dir" ] || dir=$build/programs/$name
     spec=$src/${dir#$build/}/$name.spec
     rm -f "$sys/$dll"
+    # a program has no .spec: an exe skeleton, its entry point the module's
+    if [ -f "$spec" ]; then kind=(--dll -E "$spec"); else kind=(--exe); fi
     # shellcheck disable=SC2046
-    "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" --dll --fake-module \
-        --wasm-shared winepe.wasm -E "$spec" -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
+    "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" "${kind[@]}" --fake-module \
+        --wasm-shared winepe.wasm -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
 done
 echo "$out: ${*} native ($(du -h "$sys/winepe.wasm" | cut -f1) module)"

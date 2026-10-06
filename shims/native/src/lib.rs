@@ -2942,6 +2942,17 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 check_i386_high(&caller, "an NT syscall");
                 return r;
             }
+            // A Unix call from guest code under Wine's own Unix side (W3).
+            if pc as u64 & nt::NATIVE_SYSCALL == 0 {
+                if let Some(memory) = caller.data().memory.clone() {
+                    let ctx_addr = caller.data().thread.ctx_addr;
+                    if read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32 == gex_kernel::nt::gex_nr::UNIX_CALL
+                        && guest_unix_call(&mut caller)?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
             // gexrt's NATIVE_LEFT under Wine's own Unix side (W3), which
             // has no NT layer to take it: as `nt::syscall_import` does, the
             // innermost native call-out the guest has left is abandoned.
@@ -4746,6 +4757,17 @@ static UNIX_DISPATCHERS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
 pub(crate) fn unix_dispatcher(state: &HostState, op: i32, idx: u32) -> u32 {
     let key = Arc::as_ptr(&state.kernel) as usize;
+    // ops 2 and 3: the same for the guest's Unix calls (the trampoline
+    // page's `UNIX_CALL_32`, i386 code calling `__wine_unix_call_dispatcher`)
+    if op >= 2 {
+        let mut v = GUEST_UNIX_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if op == 2 {
+            v.retain(|(k, _)| *k != key);
+            v.push((key, idx));
+            return 0;
+        }
+        return v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d);
+    }
     let mut v = UNIX_DISPATCHERS.lock().unwrap_or_else(|e| e.into_inner());
     if op == 0 {
         v.retain(|(k, _)| *k != key);
@@ -4753,6 +4775,39 @@ pub(crate) fn unix_dispatcher(state: &HostState, op: i32, idx: u32) -> u32 {
         return 0;
     }
     v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d)
+}
+
+/// Wine's handler for a Unix call from guest code (W3), by process.
+static GUEST_UNIX_CALLS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+/// A guest's Unix call (`int 0x80` with EAX = UNIX_CALL, from the
+/// trampoline page) in a process whose ntdll.so takes them: its handler
+/// runs below the guest's stack, and sets EAX. False when there is none.
+fn guest_unix_call(caller: &mut Caller<'_, HostState>) -> Result<bool> {
+    let hook = unix_dispatcher(caller.data(), 3, 0);
+    if hook == 0 {
+        return Ok(false);
+    }
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let f = crate::ftab::table_func(caller, hook)?;
+    let typed = f.typed::<i32, ()>(&*caller).context("the guest Unix-call hook is not void(int)")?;
+    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let saved = match &sp {
+        Some(g) if !gex_abi::mem64() => {
+            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            g.set(&mut *caller, Val::I32(((cur.min(esp).saturating_sub(256)) & !15) as u32 as i32))?;
+            Some(cur)
+        }
+        _ => None,
+    };
+    let r = typed.call(&mut *caller, ctx_addr as i32);
+    if let (Some(g), Some(cur)) = (&sp, saved) {
+        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+    }
+    r?;
+    Ok(true)
 }
 
 /// NTSTATUS codes the hook is given.
