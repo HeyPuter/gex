@@ -110,6 +110,9 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
     let name = format!("[provider stack, thread {tid}]");
     let base = if LIBS.get().map_or(true, |v| v.is_empty()) { alloc_top(cx.data_mut(), STACK, &name)? } else { alloc(cx.data_mut(), STACK, &name)? };
     let top = base + STACK - 16;
+    if std::env::var_os("GEX_PROVIDER_STACKS").is_some() {
+        eprintln!("gex: provider stack for thread {tid}: [{base:#x}, {:#x})", base + STACK);
+    }
     // Pointer-sized: i64 for a wasm64 provider beside a 64-bit guest memory.
     let g = if gex_abi::mem64() {
         wasmtime::Global::new(&mut *cx, wasmtime::GlobalType::new(wasmtime::ValType::I64, wasmtime::Mutability::Var), Val::I64(top as i64))?
@@ -118,6 +121,7 @@ pub(crate) fn stack(cx: &mut wasmtime::StoreContextMut<'_, HostState>) -> Result
     };
     if let Some(s) = cx.data_mut().jit.as_mut().and_then(|j| j.ftab.as_mut()) {
         s.provider_sp = Some(g.clone());
+        s.provider_stack_lo = base;
     }
     Ok(g)
 }
@@ -522,17 +526,14 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
         Ok(())
     })()) })?;
     // This thread's provider C stack (`stack`): its lowest address; it is
-    // `STACK` bytes. musl reports it as the thread's stack.
+    // `STACK` bytes. musl reports it as the thread's stack. (Not derived from
+    // the stack pointer's current value, which is below the top by whatever
+    // the thread has on its stack when it asks.)
     linker.func_wrap(IMPORT_MODULE, "provider_stack", |mut caller: Caller<'_, HostState>| -> wasmtime::Result<i64> { crate::host((|| -> anyhow::Result<i64> {
         use wasmtime::AsContextMut;
         let mut cx = caller.as_context_mut();
-        let g = stack(&mut cx)?;
-        let top = match g.get(&mut cx) {
-            Val::I64(v) => v as u64,
-            Val::I32(v) => v as u32 as u64,
-            _ => 0,
-        };
-        Ok((top + 16 - STACK) as i64)
+        stack(&mut cx)?;
+        Ok(cx.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).map_or(0, |s| s.provider_stack_lo) as i64)
     })()) })?;
     // Constants of gex's ABI a provider calling guest code needs.
     linker.func_wrap(IMPORT_MODULE, "provider_abi", |_caller: Caller<'_, HostState>, which: i32| -> i64 {

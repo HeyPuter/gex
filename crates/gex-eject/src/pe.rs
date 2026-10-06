@@ -262,7 +262,7 @@ pub const WEB_NT_INDEX_HTML: &str = r#"<!doctype html>
       size: q.get('size') ?? '1320x800',
     });
     if (m.cwd && m.cwd !== '/') p.set('cwd', m.cwd);
-    if (m.unguarded) p.set('unguarded', '1');
+    p.set('unguarded', m.unguarded ? '1' : '0');
     if (m.persist && q.get('persist') !== '0') {
       p.set('persist', m.persist);
       p.set('persistdb', `gex-eject:${m.exe}`);

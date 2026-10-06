@@ -1,9 +1,9 @@
 #!/bin/sh
 # Runs inside gex: Xwayland on gex's compositor, then the program on it.
 # usage: inguest.sh DISPLAYNUM LOG prog args...
-# Xwayland gets no LD_LIBRARY_PATH: the program's (gex-gl's libGL) is not its.
+# Xwayland gets no LD_LIBRARY_PATH or LD_PRELOAD: the program's (gex-gl's libGL, a diagnostic) are not its.
 n=$1; log=$2; shift 2
-env -u LD_LIBRARY_PATH Xwayland :$n -shm -ac -nolisten tcp > "$log" 2>&1 &
+env -u LD_LIBRARY_PATH -u LD_PRELOAD Xwayland :$n -shm -ac -nolisten tcp > "$log" 2>&1 &
 xw=$!
 i=0
 while [ ! -S /tmp/.X11-unix/X$n ]; do
@@ -12,4 +12,5 @@ while [ ! -S /tmp/.X11-unix/X$n ]; do
     sleep 1; i=$((i+1))
 done
 echo "[inguest] X :$n up after $i s"
-DISPLAY=:$n exec "$@"
+# The program uses X: a Wayland-capable one (Unity 6, SDL) would otherwise pick gex's compositor directly.
+DISPLAY=:$n exec env -u WAYLAND_DISPLAY "$@"
