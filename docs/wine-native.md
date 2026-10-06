@@ -1063,6 +1063,39 @@ unixlib ran through the dlopen registry (§3.12).
   the boot event. The suite's prefix stays without the native programs
   until then (`$W/w3-nt5.log`: 29 of 40, no change).
 
+**W3.3 progress (2026-10-06, win32u.so):**
+- win32u.so's Unix side is linked into the loader (`$W/link-w3.sh`:
+  the twelve names it shares with wineserver and ntdll.so renamed apart,
+  `__wine_unix_lib_init` in the dlopen registry); win32u's DllMain loads
+  it on wasm32 (its dispatcher check saw ntdll's variable), each native
+  DLL keeps its own `__gexw_image_base` (pesym had shared one, never
+  written: unix-call init asked for module 0). NtUser*/NtGdi* calls now
+  reach win32u.so.
+- The loader references no fork any more (the in-process server never
+  daemonizes), so it is not asyncify-instrumented: smaller, and nothing
+  can be left half rewound. A call-out's return is never watched in the
+  miss slots (gex: the trampoline page's pad, translated first).
+- **Blocked on the session's shared memory.** win32u reads windows,
+  classes, queues and the desktop from the session mapping the server
+  writes. Two cases:
+  1. *In the process:* Wine maps the section at an address of its own
+     choosing (a fixed `MAP_SHARED`), and one wasm memory cannot map the
+     server's pages there too. gex hands a non-fixed map the server's pages
+     (also a window inside them), and the server makes the session one
+     16 MiB block, but Wine's view code maps fixed. Fix in reach: win32u
+     (wasm32) takes the session's blocks from the in-process server's
+     mapping directly (same address space), no section view.
+  2. *The desktop process:* any window needs the desktop window, which
+     win32u gets by starting `explorer.exe /desktop` — a second Windows
+     process, i.e. §3.5's child-process gap, which it hits at once
+     (explorer's own RegisterClass fails on a stale session). Options:
+     (a) explorer's desktop as a thread of the application process (its
+     code is in the one PE-side module already; win32u would start
+     `manage_desktop` in a thread instead of the process); (b) a shared
+     mapping coherent across gex processes (natively, a host memfd mapped
+     into both linear memories; the browser has no equivalent short of
+     one memory for several processes). (a) works in the browser too.
+
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
 
