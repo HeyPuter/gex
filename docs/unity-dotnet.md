@@ -1048,4 +1048,21 @@ Not yet:
      and Unity writing managed objects through Unity-Mono assumptions. Next:
      MONO_GC_DEBUG=verify-before-collections / check-at-minor style heap
      checks, and the class.c:2272 caller.
+  13. **Gate head 55c3197f (2026-10-06):** liveness walk opt-in
+     (`GEXMONO_LIVENESS=1`; off = the old stubs), netlink socket, F's notes,
+     HOME_SEED/OVERLAY/xfocus/probe tooling. Legs on it with `scratch/unity/dnc`
+     rebuilt from it: embed PASS, prov64 PASS, fjit-procs ok/ok, Muck batch
+     --fjit reaches "Initializing packets", HK batch reaches "Unloading 153" and
+     its first scene's scripts.
+     **The crash with liveness on, more:** tier-1 block names (GEX_PERFMAP=1 +
+     GEX_WASM_BACKTRACE=1) put the fault in `UnityEngine.Object::GetName_Injected`
+     -> UnityPlayer 0x14ed6e0 (`Object::GetName`): `[this+0x20]` is taken as an
+     object with a vtable. `this` (0x1e009f510) has the vtable of
+     `13MonoBehaviour` (typeinfo via the R_X86_64_RELATIVE at vtable-8); +0x20 of
+     a Component is its GameObject pointer, and here it holds 0x1103ed2e0, an
+     address in the provider's/Mono's region, while other objects of the class
+     have 0 there and their name inline at +0x38 (GEX_TRACE_SEGV=2 dumps the
+     words at each register). Next: what 0x1103ed2e0 is (MonoDomain?) and who
+     writes it into a native MonoBehaviour during Instantiate (watchpoint on
+     that word: GEX_WATCH).
 
