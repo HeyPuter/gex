@@ -350,7 +350,8 @@ void sgen_gc_lock (void);
 void sgen_gc_unlock (void);
 static int lv_env (const char *name) { const char *v = getenv (name); return v && *v && strcmp (v, "0"); }
 static void lv_pass_reset (void);
-U(mono_unity_stop_gc_world) { ENTER; lv_pass_reset (); if (!gc_world_stopped && !lv_env ("GEXMONO_LV_NOLOCK")) { sgen_gc_lock (); gc_world_stopped = 1; } RETV; }
+static int lv_on (void);
+U(mono_unity_stop_gc_world) { ENTER; lv_pass_reset (); if (!gc_world_stopped && lv_on () && !lv_env ("GEXMONO_LV_NOLOCK")) { sgen_gc_lock (); gc_world_stopped = 1; } RETV; }
 U(mono_unity_start_gc_world) { ENTER; if (gc_world_stopped) { gc_world_stopped = 0; sgen_gc_unlock (); } RETV; }
 U(mono_unity_heap_validation_from_statics) { ENTER; RETV; }
 
@@ -403,6 +404,18 @@ lv_new (MonoClass *filter, guint32 max, uint64_t cb, uint64_t data)
 }
 
 static int lv_env (const char *name);
+/* The walk is opt-in (GEXMONO_LIVENESS=1) until the Instantiate crash it
+ * exposes in Hollow Knight is understood (docs/unity-dotnet.md §12); off, the
+ * provider reports nothing, as before. GEXMONO_LV_OFF=1 walks but reports
+ * nothing. */
+static int
+lv_on (void)
+{
+	static int on = -1;
+	if (on < 0)
+		on = lv_env ("GEXMONO_LIVENESS");
+	return on;
+}
 static void
 lv_flush (Liveness *s)
 {
@@ -598,7 +611,7 @@ U(mono_unity_liveness_calculation_from_root)
 {
 	ENTER;
 	Liveness *s = (Liveness *)P (1);
-	if (s) {
+	if (s && lv_on ()) {
 		lv_push (s, (MonoObject *)P (0));
 		lv_drain (s);
 	}
@@ -608,14 +621,14 @@ U(mono_unity_liveness_calculation_from_statics)
 {
 	ENTER;
 	Liveness *s = (Liveness *)P (0);
-	if (s) {
+	if (s && lv_on ()) {
 		mono_assembly_foreach (lv_assembly_statics, s);
 		lv_drain (s);
 	}
 	RETV;
 }
 U(mono_unity_liveness_start_gc_world) { ENTER; if (lv_world_stopped) { lv_world_stopped = 0; sgen_gc_unlock (); } RETV; }
-U(mono_unity_liveness_stop_gc_world) { ENTER; lv_pass_reset (); if (!lv_world_stopped) { sgen_gc_lock (); lv_world_stopped = 1; } RETV; }
+U(mono_unity_liveness_stop_gc_world) { ENTER; lv_pass_reset (); if (!lv_world_stopped && lv_on ()) { sgen_gc_lock (); lv_world_stopped = 1; } RETV; }
 U(mono_unity_managed_callstack) { ENTER; RET (0); }
 U(mono_unity_lock_dynamic_function_access_tables64) { ENTER; RETV; }
 U(mono_unity_unlock_dynamic_function_access_tables64) { ENTER; RETV; }
