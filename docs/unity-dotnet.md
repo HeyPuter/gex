@@ -1133,4 +1133,22 @@ Not yet:
      provider giving slots; tree `scratch/unity/dnc3`, not committed) runs
      Hollow Knight the same: 153 unloaded without the walk, 82 and the same
      crash with it.
+  17. **Workaround: HK reaches Menu_Title (6b119e15, 2026-10-06):** Unity's
+     dependency step gates both "component -> its GameObject" (MonoBehaviour
+     case) and "GameObject -> its components" (case at 0x12f31f2: the
+     {type, component} array at [go+0x20], count [go+0x30]) on flag 0x2, so
+     keeping only the GameObject moved the crash to a component of it (a
+     virtual call through a freed component, run hk95-hk97). The walk now
+     reports, for each reported UnityEngine.Component, its GameObject and that
+     GameObject's components, through stand-ins Unity's callback reads like
+     wrappers (it reads only m_CachedPtr at +0x10 and the native instance ID
+     at +8). With `GEXMONO_LIVENESS=1` (walk opt-in; `GEXMONO_LV_NOGO=1` drops
+     the workaround) HK batch (hk98): 69 assets unloaded at the intro, the
+     spinner instantiated, "Didn't need to wait for PlayerPrefs load",
+     Menu_Title becomes the active scene and loads (10,779 assets unloaded
+     after it, 36,129 objects). Next problem seen: HK's shared-data save uses
+     BinaryFormatter, which .NET 10 removed (PlatformNotSupportedException in
+     JsonSharedData.Save); saves will need the formatter (the unsupported
+     System.Runtime.Serialization.Formatters package, or a shim). Flag 0x2
+     itself is still unexplained.
 
