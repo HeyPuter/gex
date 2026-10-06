@@ -10900,7 +10900,11 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 }
             }
             let list: Vec<String> = cands.iter().map(|v| format!("{v:#x} ({})", object_off_at(h, *v))).collect();
-            warn_line(&format!("gex-eject: return addresses on the stack from esp {sp:#x} (web entry candidates): {}\n", list.join(" ")));
+            // In lines of 16: a page's console logger may cut long lines.
+            warn_line(&format!("gex-eject: {} return addresses on the stack from esp {sp:#x} (web entry candidates):\n", list.len()));
+            for chunk in list.chunks(16) {
+                warn_line(&format!("gex-eject:   {}\n", chunk.join(" ")));
+            }
             set_exit(h, 128 + 11);
         });
         trap();
