@@ -10271,6 +10271,10 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         }
         return;
     }
+    if op == gex_abi::cache_op::FTAB_TIER1 || op == gex_abi::cache_op::SLOT_CONFLICT {
+        // The dispatch miss that follows ignores its answer.
+        NO_LEAVE.with(|c| c.set(true));
+    }
     if op == gex_abi::cache_op::FTAB_TIER1 {
         // The bridge left for this very address having run nothing: tier-1
         // takes the slot over, and the function JIT serves it no more.
@@ -10571,6 +10575,13 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// retranslation livelock (S3 found natively that a page retired between a
 /// translation and its publish came back without its directory entry): say
 /// what dispatch sees there, once per pc, the 64th time.
+thread_local! {
+    /// Set by `cache_op` SLOT_CONFLICT / FTAB_TIER1, whose caller drops the
+    /// next dispatch miss's answer: that miss must not answer
+    /// `DISPATCH_MISS_LEAVE` (the caller would dispatch again, for ever).
+    static NO_LEAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Dispatch misses by how `gex_dispatch_miss` dealt with them (the NT
 /// stats line): all, a unit catch-up, a call-out's return, a dense block
 /// to instantiate, the function JIT, a published unit pc, translated.
@@ -10656,6 +10667,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
     miss_count(0);
+    // A miss a slot conflict or the bridge asks for (they drop the answer
+    // and dispatch again): never left by returning.
+    let no_leave = NO_LEAVE.with(|c| c.replace(false));
     // A function-tier unit another Worker published that this one has not
     // installed yet: the miss is a catch-up, done in JS, not a translation.
     if cgen::behind() {
@@ -10682,6 +10696,9 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // call-out is done (cgen::returned; JS's nested loop ends it).
     if cgen::returned(pc, _ctx as u32 as u64) {
         miss_count(2);
+        if !no_leave && cgen::may_leave() {
+            return gex_emit::module::DISPATCH_MISS_LEAVE;
+        }
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
