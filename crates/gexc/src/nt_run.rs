@@ -57,7 +57,14 @@ pub fn run(ra: &RunArgs, bytes: &[u8]) -> Result<Exit> {
     if ra.opts.sysroot.is_some() {
         bail!("--sysroot is not supported for Windows programs (the NT layer maps C: to the Wine prefix)");
     }
-    let abi = nt::boot::exe_abi(bytes).with_context(|| format!("{} is not an x86 or x86-64 PE program", ra.path))?;
+    let abi = match nt::boot::exe_abi(bytes) {
+        Some(abi) => abi,
+        // Say why: a PE the parser refuses is not the same as a non-PE file.
+        None => match gex_ld::pe::parse(bytes) {
+            Err(e) => bail!("{} does not load as a PE program: {e}", ra.path),
+            Ok(_) => bail!("{} is not an x86 or x86-64 PE program", ra.path),
+        },
+    };
     let prefix = prefix(ra)?;
     let exe_path = std::fs::canonicalize(&ra.path)?.to_string_lossy().into_owned();
     let cwd = match &ra.opts.cwd {
