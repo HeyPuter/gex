@@ -194,6 +194,11 @@ impl FuncMap {
 /// What the host asks a run-time translator (the function JIT, stream F)
 /// for when a lookup finds no function at an address.
 pub struct Request<'a> {
+    /// The guest process asking: what a translator learns of one process's
+    /// code must not be applied to another's (one native runner hosts a whole
+    /// process tree, whose images share addresses). Unique for the run; a
+    /// forked child shares its parent's until it `execve`s.
+    pub process: u64,
     /// Guest memory, as the guest sees it.
     pub mem: &'a [u8],
     /// The address looked up: a function entry, as far as the caller knows.
@@ -229,10 +234,13 @@ pub struct Translated {
 /// ([`gex_abi::ftab::FALLBACK`]: tier-1, until the region tier).
 pub trait Translator: Send + Sync {
     fn translate(&self, req: &Request<'_>) -> Option<Translated>;
-    /// The process `execve`d `program` (the file `bytes`): what was learned
-    /// of the image it replaced -- function starts, read-only ranges,
-    /// builtins by address -- describes addresses the new image now holds.
-    fn exec(&self, _program: &gex_ld::Program, _bytes: &[u8]) {}
+    /// Guest process `process` starts running `program` (the file `bytes`,
+    /// when known): a new process, or one that `execve`d. Whatever was
+    /// learned of `process`'s old image -- function starts, read-only
+    /// ranges, builtins by address -- describes addresses the new one holds.
+    fn image(&self, _process: u64, _program: &gex_ld::Program, _bytes: Option<&[u8]>) {}
+    /// Guest process `process` is gone (its last reference dropped).
+    fn forget(&self, _process: u64) {}
 }
 
 static TRANSLATOR: std::sync::OnceLock<Box<dyn Translator>> = std::sync::OnceLock::new();

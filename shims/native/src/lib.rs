@@ -1109,6 +1109,14 @@ fn run_program_with(
             limits: xlate.limits,
             ftab: None,
         });
+        // (An NT program's images are the NT layer's to describe: as before,
+        // the translator starts from nothing for it.)
+        if let Some(t) = gex_kernel::ftab::translator().filter(|_| nt_setup.is_none()) {
+            let process = store.data().jit.as_ref().map(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.process.0);
+            if let Some(process) = process {
+                t.image(process, program, xlate.image_elf.as_deref());
+            }
+        }
     }
     if !aot_shared.is_empty() {
         aot::install_shared(&mut store, aot_shared)?;
@@ -2079,9 +2087,10 @@ fn exec_program(
     // one holds now.
     let mut xlate = xlate.clone();
     xlate.intrinsics = gex_xlate::intrinsic::program_intrinsics(&program);
-    if let Some(t) = gex_kernel::ftab::translator() {
-        t.exec(&program, &bytes);
-    }
+    // The run-time translator hears of the new image when its process half
+    // is made (`Translator::image`, in `run_program_with`): a new identity,
+    // so nothing learned of the old image, or of another process, applies.
+    xlate.image_elf = Some(Arc::from(bytes.as_slice()));
     // Descriptors marked close-on-exec go now; the rest survive, which is how
     // a shell hands a pipe to the command it starts.
     kernel.close_on_exec();
