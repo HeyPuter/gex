@@ -4569,7 +4569,10 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
                 });
                 match old {
                     Some(f) => CalloutSignal::Bypass(f),
-                    None => bail!("a watched dispatch slot with nothing to run for {target:#x}"),
+                    None => bail!(
+                        "a watched dispatch slot with nothing to run for {target:#x} (slot {slot:?}, sp {sp:#x}; call-outs {:?})",
+                        state.callouts.iter().map(|co| (format!("{:#x}", co.ret), format!("{:#x}", co.sp_want), co.slot.as_ref().map(|s| s.0), co.live)).collect::<Vec<_>>()
+                    ),
                 }
             }
         };
@@ -4617,7 +4620,8 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
     let n = cx.as_context().data().callouts.len();
     for i in 0..n {
         let ret = cx.as_context().data().callouts[i].ret;
-        let want = dispatch_slot_of(&memory, ret).filter(|&s| s < size);
+        // (only a page with an entry of its own: the miss slots are shared)
+        let want = dispatch_slot_of(&memory, ret).filter(|&s| s < size && s >= gex_abi::MISS_SLOTS);
         let have = cx.as_context().data().callouts[i].slot.as_ref().map(|(s, _)| *s);
         if have.is_some() && have != want {
             // The return moved: put the old slot back, unless another
@@ -4892,6 +4896,21 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
     let unwound = if ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD { NATIVE_UNWOUND } else { CALLOUT_UNWOUND };
+    // A return address on a page with no directory entry of its own would
+    // be watched in the miss slots, which every untranslated page shares:
+    // translate it first (W3: the trampoline page's NATIVE_RETURN_PAD, which
+    // no unit covers without the NT layer). A call-out that never returns
+    // (ret 0: Wine's thread loop) is not watched at all (`refresh_callouts`).
+    if ret != 0 {
+        let page = ret / gex_abi::DISPATCH_PAGE;
+        let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(1);
+        if page < gex_abi::DISPATCH_MAX_PAGES && entry(&memory) == 0 {
+            translate_and_install(caller, ret)?;
+            if entry(&memory) == 0 && std::env::var_os("GEX_W3_TRACE").is_some() {
+                eprintln!("gex-w3: call-out return {ret:#x}: its page has still no dispatch entry");
+            }
+        }
+    }
     caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
