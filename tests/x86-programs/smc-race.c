@@ -29,7 +29,8 @@ static void spin(long us) {
 #define CHURN 20
 #endif
 
-static volatile uint64_t *fn;
+typedef uint64_t __attribute__((aligned(8))) u64a; /* i386: 8-byte atomic stores */
+static volatile u64a *fn;
 static atomic_int round_no, done_writing;
 
 static uint64_t code_for(int n) {
@@ -60,7 +61,7 @@ static void *writer(void *arg) {
 int main(void) {
     unsigned char *page = mmap(0, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) return 2;
-    fn = (volatile uint64_t *)(page + 0x100);
+    fn = (volatile u64a *)(page + 0x100);
     *fn = code_for(0);
     pthread_t w;
     pthread_create(&w, 0, writer, 0);
