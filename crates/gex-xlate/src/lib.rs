@@ -1446,6 +1446,15 @@ fn lift_one(
     }
     pass::optimize(&mut block);
     // Self-modifying code with no flush instruction to announce it.
+    // TEST(GEX_TEST_LIFT_DELAY_US): widen the window between decoding a
+    // JIT-code block and fixing its guard, for tests/x86-programs/smc-race.
+    if snapshot.is_some() {
+        static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let d = *DELAY.get_or_init(|| std::env::var("GEX_TEST_LIFT_DELAY_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        if d > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(d));
+        }
+    }
     if let Some(snap) = snapshot {
         let n = ((block.end as usize).max(addr as usize + 1) - addr as usize).min(snap.len());
         if n > 0 {
