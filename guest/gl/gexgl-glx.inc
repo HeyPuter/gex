@@ -59,6 +59,19 @@ static const int gexgl_glx_context_token = 0;
 
 static void *glx_current_display;
 static unsigned long glx_current_drawable;
+static void *glx_current_context;
+
+/* A context made by glXCreateContextAttribsARB: what it asked for, kept until
+ * glXMakeCurrent makes the host context. The host context is made there, not
+ * at creation, and making it went through eglCreateContext with no
+ * attributes, which put the version and profile back to EGL's defaults and
+ * eglBindAPI back to desktop GL: a 3.2 core or ES 2 request came up as the
+ * host's compatibility context. */
+#define GEXGL_GLX_ATTRIBS_MAGIC 0x67786174u
+struct gexgl_glx_attribs_context {
+    unsigned magic;
+    int es, major, minor, profile;
+};
 
 static void gexgl_glx_ensure_egl(void *dpy);
 
@@ -276,6 +289,13 @@ void *glXCreateContextAttribsARB(void *dpy, void *config, void *share,
        what it actually got through GL_VERSION -- and an explicit core request
        overrides the compatibility default above. */
     int wants_es = 0;
+    /* What this context asks for, from GLX's defaults (1.0, compatibility),
+       whatever a previous context left in the globals. */
+    if (!host_context_made) {
+        egl_context_major = 1;
+        egl_context_minor = 0;
+        egl_context_profile = 1;
+    }
     for (const int *a = attribs; a && *a != 0 && !host_context_made; a += 2) {
         switch (a[0]) {
         case 0x2091: egl_context_major = a[1]; break; /* MAJOR_VERSION_ARB */
@@ -302,7 +322,19 @@ void *glXCreateContextAttribsARB(void *dpy, void *config, void *share,
        GL because that is what reaching for GLX usually means, and only the
        profile mask can say otherwise. */
     if (wants_es) eglBindAPI(0x30A0u /* EGL_OPENGL_ES_API */);
-    return GEXGL_GLX_CONTEXT;
+    struct gexgl_glx_attribs_context *c = malloc(sizeof(*c));
+    if (!c) return GEXGL_GLX_CONTEXT;
+    c->magic = GEXGL_GLX_ATTRIBS_MAGIC;
+    c->es = wants_es;
+    c->major = egl_context_major;
+    c->minor = egl_context_minor;
+    c->profile = egl_context_profile;
+    return c;
+}
+
+static struct gexgl_glx_attribs_context *gexgl_glx_attribs_of(void *ctx) {
+    struct gexgl_glx_attribs_context *c = ctx;
+    return ctx && ctx != GEXGL_GLX_CONTEXT && c->magic == GEXGL_GLX_ATTRIBS_MAGIC ? c : NULL;
 }
 
 /* Destroying the context really destroys it, which is what makes an odd
@@ -315,8 +347,14 @@ void *glXCreateContextAttribsARB(void *dpy, void *config, void *share,
  * application ran on whatever the throwaway had asked for. Letting the host
  * drop it means the next creation is a real creation. */
 void glXDestroyContext(void *dpy, void *ctx) {
-    (void)dpy; (void)ctx;
+    (void)dpy;
+    struct gexgl_glx_attribs_context *c = gexgl_glx_attribs_of(ctx);
     eglDestroyContext(NULL, ctx);
+    if (ctx == glx_current_context) glx_current_context = NULL;
+    if (c) {
+        c->magic = 0;
+        free(c);
+    }
 }
 
 int glXMakeCurrent(void *dpy, unsigned long drawable, void *ctx) {
@@ -325,6 +363,7 @@ int glXMakeCurrent(void *dpy, unsigned long drawable, void *ctx) {
         eglMakeCurrent(dpy, NULL, NULL, NULL);
         glx_current_display = NULL;
         glx_current_drawable = 0;
+        glx_current_context = NULL;
         return 1;
     }
     /* The drawable is an X window id, which is exactly what
@@ -333,10 +372,21 @@ int glXMakeCurrent(void *dpy, unsigned long drawable, void *ctx) {
     void *config = NULL;
     void *surface = eglCreateWindowSurface(dpy, config,
                                            (void *)(uintptr_t)drawable, NULL);
-    void *context = egl_current_context ? egl_current_context
-                                        : eglCreateContext(dpy, config, NULL,
-                                                           NULL);
+    void *context = egl_current_context;
+    struct gexgl_glx_attribs_context *c = gexgl_glx_attribs_of(ctx);
+    if (!context && c) {
+        /* The host context as glXCreateContextAttribsARB asked for it. */
+        eglBindAPI(c->es ? 0x30A0u /* EGL_OPENGL_ES_API */ : 0x30A2u /* EGL_OPENGL_API */);
+        egl_context_major = c->major;
+        egl_context_minor = c->minor;
+        egl_context_profile = c->profile;
+        context_create();
+        context = (void *)3;
+    } else if (!context) {
+        context = eglCreateContext(dpy, config, NULL, NULL);
+    }
     if (!eglMakeCurrent(dpy, surface, surface, context)) return 0;
+    glx_current_context = ctx;
     glx_current_display = dpy;
     glx_current_drawable = drawable;
     return 1;
@@ -359,7 +409,7 @@ void glXSwapBuffers(void *dpy, unsigned long drawable) {
 }
 
 void *glXGetCurrentContext(void) {
-    return egl_current_context ? GEXGL_GLX_CONTEXT : NULL;
+    return egl_current_context ? (glx_current_context ? glx_current_context : GEXGL_GLX_CONTEXT) : NULL;
 }
 void *glXGetCurrentDisplay(void) { return glx_current_display; }
 unsigned long glXGetCurrentDrawable(void) { return glx_current_drawable; }

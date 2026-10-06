@@ -693,6 +693,19 @@ void glLinkProgram(unsigned p) { CMD1(GEXGL_LINK_PROGRAM, p); }
 void glUseProgram(unsigned p) { CMD1(GEXGL_USE_PROGRAM, p); }
 void glDeleteProgram(unsigned p) { CMD1(GEXGL_DELETE_PROGRAM, p); }
 
+/* GL_ARB_shader_objects' one delete for both kinds of object. Shaders and
+   programs take their names from one counter here (take_name), so a name is
+   one or the other, and the host says which. Without it the extension was
+   withheld (gen_gl_extensions.py claims only what is exported), and Baba Is
+   You, which requires the extension by name, refused to start ("OpenGL
+   extension 'GL_ARB_shader_objects' not supported."). */
+unsigned char glIsProgram(unsigned program);
+void glDeleteObjectARB(unsigned obj) {
+    if (!obj) return;
+    if (glIsProgram(obj)) glDeleteProgram(obj);
+    else glDeleteShader(obj);
+}
+
 void glBindAttribLocation(unsigned program, unsigned index, const char *name) {
     if (!name) return;
     size_t len = strlen(name);
@@ -1972,7 +1985,19 @@ void glGetIntegerv(unsigned pname, int *out) {
         return;
     }
     if (pname == 0x9126u) { /* GL_CONTEXT_PROFILE_MASK */
-        if (out) out[0] = egl_api == 0x30A2u ? 1 : 0; /* GL_CONTEXT_CORE_PROFILE_BIT */
+        /* What the host's context is: its version string says compatibility
+           when it is one (GL_CONTEXT_COMPATIBILITY_PROFILE_BIT, 2), and a
+           desktop context of 3.2 or later otherwise is core (1). ES has no
+           profiles. This answered core for every desktop context. */
+        int mask = 0;
+        if (egl_api == 0x30A2u) {
+            const char *v = (const char *)glGetString(0x1F02u);
+            int major = 0, minor = 0;
+            host_gl_version(&major, &minor);
+            if (v && strstr(v, "Compatibility")) mask = 2;
+            else if (major > 3 || (major == 3 && minor >= 2)) mask = 1;
+        }
+        if (out) out[0] = mask;
         return;
     }
     /* Sized from the pname before the request goes out, for two reasons.
@@ -2301,8 +2326,10 @@ struct gexgl_egl_surface {
     /* The frame callback this surface has outstanding, if any. */
     void *wl_callback;
     /* X only: swaps since the window's size was last asked (see
-       `gexgl_x11_follow_size`). */
+       `gexgl_x11_follow_size`), and the top-level window its frames are
+       attached to. */
     unsigned x_swaps;
+    unsigned long x_top;
 };
 static struct gexgl_egl_surface egl_surfaces[GEXGL_MAX_SURFACES];
 static unsigned egl_next_surface_handle = 1;
@@ -2671,6 +2698,37 @@ static int gexgl_x11_window_size(void *win, int *width, int *height) {
     return 1;
 }
 
+/* The top-level window an X drawable is in: itself, or the ancestor whose
+ * parent is the root.
+ *
+ * A compositor knows the windows the window manager manages, which are
+ * top-level; a program may draw GL into a child of one. SDL 1.2 does: its GL
+ * drawable is `SDL_Window`, a child of the `WMwindow` the window manager
+ * sees, so a frame attached to the child's id matched no window and the page
+ * showed black (Retrocycles). The frame belongs to the top-level window. */
+static unsigned long gexgl_x11_toplevel(void *win) {
+    void *display = gexgl_x11_client_display();
+    void *xlib = gexgl_x11_symbol_source();
+    unsigned long w = (unsigned long)(uintptr_t)win;
+    if (!display || !xlib) return w;
+    int (*query_tree)(void *, unsigned long, unsigned long *, unsigned long *,
+                      unsigned long **, unsigned *) = dlsym(xlib, "XQueryTree");
+    int (*xfree)(void *) = dlsym(xlib, "XFree");
+    void *(*set_error_handler)(void *) = dlsym(xlib, "XSetErrorHandler");
+    if (!query_tree || !xfree || !set_error_handler) return w;
+    void *previous = set_error_handler((void *)gexgl_x11_error);
+    for (int depth = 0; depth < 32; depth++) {
+        unsigned long root = 0, parent = 0, *children = NULL;
+        unsigned n = 0;
+        if (!query_tree(display, w, &root, &parent, &children, &n)) break;
+        if (children) xfree(children);
+        if (!parent || parent == root) break;
+        w = parent;
+    }
+    set_error_handler(previous);
+    return w;
+}
+
 /* libwayland-egl's window, so the `wl_surface` inside one can be found.
  *
  * The structure is libwayland-egl's ABI rather than ours, and its first field
@@ -2782,6 +2840,15 @@ static void gexgl_x11_follow_size(struct gexgl_egl_surface *s) {
     if (!s || s->kind != GEXGL_SURFACE_X) return;
     unsigned n = s->x_swaps++;
     if (n > 8 && n % 30 != 0) return;
+    /* Reparented since it was attached: SDL 1.2 going fullscreen moves its
+       GL window into an override-redirect window of the screen's size, which
+       is then the window on top. The frames follow it. */
+    unsigned long top = gexgl_x11_toplevel(s->native);
+    if (top && top != s->x_top) {
+        s->x_top = top;
+        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X, (unsigned)top,
+             (unsigned)getpid(), s->handle);
+    }
     int w = 0, h = 0;
     if (!gexgl_x11_window_size(s->native, &w, &h)) return;
     if (w <= 0 || h <= 0 || (w == s->width && h == s->height)) return;
@@ -2859,8 +2926,9 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
            is nowhere to put the pixels. The handle goes with it, which is
            what allows a second window at the same time -- the host keeps a
            drawable per handle. Attaching also makes it current. */
-        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X, s->id,
-             (unsigned)getpid(), s->handle);
+        s->x_top = gexgl_x11_toplevel(win);
+        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X,
+             (unsigned)s->x_top, (unsigned)getpid(), s->handle);
         egl_surface = s;
         egl_surface_width = w;
         egl_surface_height = h;
@@ -3001,7 +3069,11 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
     /* A safety net for callers that reach a current context without going
        through this library's eglCreateContext. The latch inside makes it a
        no-op once the host context exists. */
-    if (ctx) context_create();
+    /* Only when there is none: the latch counts a context per call, and
+       counting every make-current as a new context kept the host context
+       alive after its last eglDestroyContext (SDL's throwaway GLX context
+       then stood in for the one it really wanted). */
+    if (ctx && !host_context_made) context_create();
     egl_current_display = ctx ? dpy : NULL;
     egl_current_context = ctx;
     egl_current_draw = ctx ? draw : NULL;

@@ -125,6 +125,10 @@ pub struct RunOptions {
     /// `/bin/sh` and the common coreutils in `/bin` and `/usr/bin`, so a
     /// script's shell and tools run natively instead of being translated.
     pub busybox: Option<std::path::PathBuf>,
+    /// `--bind HOST=GUEST`: host files or directories mounted at guest paths
+    /// (over whatever is there), e.g. a caching `xkbcomp` over
+    /// `/usr/bin/xkbcomp` for a translated Xwayland.
+    pub binds: Vec<(std::path::PathBuf, String)>,
     /// The program file when argv[0] does not name it (`--busybox` running
     /// `/bin/sh`): what `/proc/self/exe` is, which hush re-executes.
     pub exe: Option<String>,
@@ -194,6 +198,7 @@ impl Default for RunOptions {
             verbose: false,
             sysroot: None,
             busybox: None,
+            binds: Vec::new(),
             exe: None,
             identity: None,
             sample: false,
@@ -2292,6 +2297,9 @@ fn mount_filesystems(
                 kernel.vfs.mount(&format!("{dir}/{name}"), Arc::new(HostFs::read_only(bb)));
             }
         }
+    }
+    for (host, guest) in &opts.binds {
+        kernel.vfs.mount(guest, Arc::new(HostFs::new(host)));
     }
     let mut devfs = DevFs::new();
     if opts.gl {
