@@ -1719,6 +1719,11 @@ fn run_thread_loop(
                                     eprintln!("gex: in {l}");
                                 }
                             }
+                            // And the registers and the return addresses on the stack, as GEX_DUMP_ABORT prints them.
+                            let vmas = store.data_mut().with_kernel(|k| k.mem.vmas().to_vec());
+                            let tid = store.data().thread.tid;
+                            let mut gm = GuestMem::new(memory.bytes());
+                            dump_guest(&mut gm, ctx_addr, tid, &vmas);
                         }
                     }
                     if action.handler == 0 {

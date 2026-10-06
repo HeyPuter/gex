@@ -15,12 +15,15 @@
 # comes first in its inherited DT_RPATH: another distribution's glibc, e.g. worldmachine's, to
 # reproduce what only happens there), OVERLAY=DIR (with UNITY_RELAUNCH: DIR's files, by
 # path relative to the game directory, replace or join the game's in this run's copy; the
-# directories on their way become real directories of links, the game's own stay untouched).
+# directories on their way become real directories of links, the game's own stay untouched),
+# HOME_SEED=DIR (copied into the run's HOME first: saved settings, e.g. Unity's prefs, so a
+# game skips its first-run screens).
 #
 # Default: batch mode, no graphics. GFX=GLDIR: with graphics, GL through
 # gex-gl (GLDIR holds guest/gl/build.sh's x86-64 build) and X from an
 # Xwayland run inside the guest on gex's compositor (xwayland-inguest.sh;
-# no Xvfb); frames go to RUNDIR/f-*.ppm every EVERY (30) frames.
+# no Xvfb); frames go to RUNDIR/f-*.ppm every EVERY (30) frames. The game window gets the
+# input focus from tests/games/xfocus.c (no window manager runs; NOFOCUS=1 leaves it out).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$(realpath "$1"); RUN=$(realpath -m "$2"); SECS=${3:-1800}
@@ -30,6 +33,7 @@ EXE=${EXE:-Muck.x86_64}
 GEXC=${GEXC:-$HERE/../../target/x86/release/gexc}
 FW=${DOTNET_FW:-$(dirname "$(dotnet --list-runtimes | awk '/Microsoft.NETCore.App 10\./ {v=$2; p=$3} END {gsub(/[\[\]]/, "", p); print p "/" v "/x"}')")}
 mkdir -p "$RUN/bcl" "$RUN/home"
+[ -n "${HOME_SEED:-}" ] && cp -a "$HOME_SEED/." "$RUN/home/"
 cp "$FW"/*.dll "$RUN/bcl/"
 cp "$OUT/lib/System.Private.CoreLib.dll" "$RUN/bcl/"
 # The framework's x86-64 natives that have no wasm64 build in the provider: P/Invokes to them go to
@@ -72,10 +76,14 @@ if [ -z "${GFX:-}" ]; then
 		./$EXE -batchmode -nographics -logFile "$RUN/player.log" > "$RUN/out.txt" 2>&1 || echo "exit $?"
 else
 	N=${XNUM:-71}
+	FOCUS=
+	if [ -z "${NOFOCUS:-}" ]; then
+		cc -O1 -o "$RUN/xfocus" "$HERE/xfocus.c" -lX11 && FOCUS="--env GEX_XFOCUS=$RUN/xfocus"
+	fi
 	[ -e /tmp/.X$N-lock ] && { echo "display :$N is taken (XNUM)"; exit 1; }
 	GEX_FPS=1 GEX_PPM_EVERY=${EVERY:-30} timeout -s KILL "$SECS" ${CORES:+taskset -c "$CORES"} \
 		"$GEXC" run --mem64 "$@" --gl --wayland "${XDG_RUNTIME_DIR:-/tmp}/muckwl-$$" --wayland-size 800x600 --wayland-out "$RUN/f" \
-		--env LD_LIBRARY_PATH="$(realpath "$GFX")" --env HOME="$RUN/home" --env GEXMONO_ASSEMBLIES="$RUN/bcl" \
+		--env LD_LIBRARY_PATH="$(realpath "$GFX")" --env HOME="$RUN/home" --env GEXMONO_ASSEMBLIES="$RUN/bcl" $FOCUS \
 		/bin/sh "$HERE/xwayland-inguest.sh" $N "$RUN/xwayland.log" \
 		./$EXE -logFile "$RUN/player.log" -screen-width 800 -screen-height 600 -screen-fullscreen 0 \
 		> "$RUN/out.txt" 2>&1 || echo "exit $?"

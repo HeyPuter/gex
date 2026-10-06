@@ -9,7 +9,7 @@ using UnityEngine.LowLevel;
 public static class GexProbe
 {
     static float next;
-    static int updates;
+    static int updates, preRenders, postRenders;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     static void Init()
@@ -19,6 +19,8 @@ public static class GexProbe
             Console.Error.WriteLine("[gexprobe] first-chance " + e.Exception.GetType().FullName + ": " + e.Exception.Message + "\n" + e.Exception.StackTrace);
         AppDomain.CurrentDomain.UnhandledException += (s, e) => Console.Error.WriteLine("[gexprobe] unhandled " + e.ExceptionObject);
         try { throw new InvalidOperationException("gexprobe self-test"); } catch (Exception) { Console.Error.WriteLine("[gexprobe] caught the self-test exception"); }
+        Camera.onPreRender += c => preRenders++;
+        Camera.onPostRender += c => postRenders++;
         var loop = PlayerLoop.GetCurrentPlayerLoop();
         var subs = loop.subSystemList;
         var n = new PlayerLoopSystem[subs.Length + 1];
@@ -55,6 +57,12 @@ public static class GexProbe
                         foreach (var f in t.GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public))
                             if (f.FieldType.IsPrimitive || f.FieldType == typeof(string) || f.FieldType.IsEnum)
                                 Console.Error.WriteLine($"[gexprobe]     {f.Name} = {f.GetValue(mb)}");
+                            else if (typeof(UnityEngine.Object).IsAssignableFrom(f.FieldType))
+                            {
+                                var v = f.GetValue(mb) as UnityEngine.Object;
+                                var all = Resources.FindObjectsOfTypeAll(f.FieldType);
+                                Console.Error.WriteLine($"[gexprobe]     {f.Name} : {f.FieldType.FullName} = {(ReferenceEquals(v, null) ? "null" : (v ? v.name : "destroyed"))}; loaded of that type: {all.Length}");
+                            }
                         var m = t.GetMethod("CheckIsLanguageSet");
                         if (m != null) Console.Error.WriteLine($"[gexprobe]     CheckIsLanguageSet() = {m.Invoke(mb, null)}");
                     }
@@ -67,7 +75,7 @@ public static class GexProbe
                 }
             }
             else Console.Error.WriteLine("[gexprobe] no StartManager");
-            Console.Error.WriteLine($"[gexprobe] cameras {Camera.allCamerasCount}");
+            Console.Error.WriteLine($"[gexprobe] cameras {Camera.allCamerasCount} prerender {preRenders} postrender {postRenders} focused {Application.isFocused} runInBackground {Application.runInBackground} screen {Screen.width}x{Screen.height} device {SystemInfo.graphicsDeviceType} scene {UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}");
             foreach (var c in Camera.allCameras)
                 Console.Error.WriteLine($"[gexprobe]   camera {c.name} enabled {c.enabled} active {c.isActiveAndEnabled} display {c.targetDisplay} rect {c.pixelRect} tex {(c.targetTexture ? c.targetTexture.name : "-")}");
         }
