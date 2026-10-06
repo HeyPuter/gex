@@ -10874,6 +10874,35 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                  re-eject, or build with the JIT fallback\n",
                 object_off_at(h, pc)
             ));
+            // A resume after the C nest unwound (a blocking call's
+            // continuation) needs region entries for every frame still on
+            // the guest stack, not only this one: name the likely ones
+            // (stack words just after a call instruction in an image) so a
+            // single run lists what user/web-entries.txt needs.
+            let gm = GuestMem::new(guest_bytes());
+            let sp = gm.read_u64(h.threads[cur()].kstate.ctx_addr + ctx::SP as u64).unwrap_or(0);
+            let mut cands = Vec::new();
+            for i in 0..4096u64 {
+                let Ok(v) = gm.read_u32(sp + 4 * i) else { break };
+                let v = v as u64;
+                let in_image = h.kernel.mem.vmas().iter().any(|m| m.code.is_some() && v >= m.start + 6 && v < m.end);
+                if !in_image || cands.contains(&v) {
+                    continue;
+                }
+                let Ok(b) = gm.read(v - 6, 6) else { continue };
+                // e8 rel32; ff /2 with modrm (reg, [reg], disp8, disp32 / abs).
+                let call = b[1] == 0xe8
+                    || (b[4] == 0xff && (b[5] & 0x38) == 0x10 && b[5] >> 6 != 1 && b[5] >> 6 != 2)
+                    || (b[3] == 0xff && (b[4] & 0x38) == 0x10 && b[4] >> 6 == 1)
+                    || (b[0] == 0xff && (b[1] & 0x38) == 0x10 && (b[1] >> 6 == 2 || b[1] & 0xc7 == 0x05));
+                if call {
+                    cands.push(v);
+                }
+            }
+            if !cands.is_empty() {
+                let list: Vec<String> = cands.iter().map(|v| format!("{v:#x} ({})", object_off_at(h, *v))).collect();
+                warn_line(&format!("gex-eject: return addresses on the stack (web entry candidates): {}\n", list.join(" ")));
+            }
             set_exit(h, 128 + 11);
         });
         trap();
