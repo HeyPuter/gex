@@ -458,6 +458,18 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         }
         Ok(())
     })()) })?;
+    // Code in `[addr, addr + len)` changed (W3: Wine's
+    // NtFlushInstructionCache): its translations are retired.
+    linker.func_wrap(IMPORT_MODULE, "code_changed", |mut caller: Caller<'_, HostState>, addr: i32, len: i32| {
+        let (addr, len) = (addr as u32 as u64, len as u32 as u64);
+        caller.data_mut().with_kernel(|k| {
+            let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
+            if end > start {
+                k.retired_code.push((start, end));
+            }
+        });
+        gex_kernel::note_code_change();
+    })?;
     // A native wasm32 program's signal hook (W3.1, `crate::SIGNAL_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "signal_hook", |caller: Caller<'_, HostState>, idx: i32| {
         crate::set_signal_hook(caller.data(), idx as u32);

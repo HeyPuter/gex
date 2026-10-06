@@ -3297,6 +3297,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             let esp = gm.read_u64(base + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff;
                             let st: Vec<String> = (0..6).map(|i| format!("{:#x}", gm.read_u32(esp + 4 * i).unwrap_or(0))).collect();
                             eprintln!("gex-w3: execute at {pc:#x} from block {src:#x}, esp {esp:#x} [{}]", st.join(" "));
+                            let bt = wasmtime::WasmBacktrace::force_capture(&caller);
+                            for fr in bt.frames().iter().take(24) {
+                                eprintln!("gex-w3:   {}", fr.func_name().unwrap_or("?"));
+                            }
                         }
                     }
                     if deliver_guest_fault_kind(&mut caller, fault_code::ACCESS_VIOLATION, pc, pc, 8)? {

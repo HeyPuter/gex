@@ -2522,7 +2522,9 @@ impl Kernel {
                 // unmapping does: `ld.so` applies RELRO by dropping write,
                 // but a JIT in the guest flips a page from executable back to
                 // writable precisely so it can put different code there.
-                if (a[2] as u32) & crate::mem::prot::EXEC == 0 {
+                // Making code writable is the other half (a patch, a
+                // detour), which x86 needs no cache flush to see.
+                if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
                     self.retire_code(a[0], a[1]);
                 }
                 self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0)
@@ -5010,6 +5012,11 @@ impl Kernel {
     fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let (addr, len, prot_bits, flags, fd, offset) =
             (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
+        // A fixed mapping over code replaces it, as an unmap would (Wine's
+        // VirtualFree decommits by mapping over the range).
+        if flags & mflags::FIXED != 0 {
+            self.retire_code(addr, len);
+        }
         if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
             // A private file mapping is an eager copy, which is exactly
             // correct and needs no page faults (PLAN §7.4).
@@ -5517,7 +5524,7 @@ impl Kernel {
     /// Only ranges that overlap an executable mapping are worth reporting:
     /// unmapping the heap or a data file happens constantly and has no
     /// translations behind it.
-    fn retire_code(&mut self, addr: u64, len: u64) {
+    pub fn retire_code(&mut self, addr: u64, len: u64) {
         let (start, end) = (
             crate::mem::page_align_down(addr),
             crate::mem::page_align_up(addr.saturating_add(len)),
