@@ -12,7 +12,8 @@
 # menu, gameplay: the presented frame at which the game shows its menu and
 #            its gameplay with the scripted input (`-` when not reached yet).
 #            matrix.sh reports the furthest stage whose frame was presented.
-# input:     a GEX_NT_INPUT script in tests/games/ (`-` for none).
+# input:     a script in tests/games/ (`-` for none): GEX_NT_INPUT's for
+#            Windows games, GEX_WL_INPUT's (*.wl) for Linux ones.
 #
 # Optional per-game gexc flags go after the input, as a ninth field.
 #
@@ -27,7 +28,7 @@ npp          |pe   |N++                                  |N++.exe               
 momodora     |pe   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |pe   |Retrocycles                          |Retrocycles.exe                     | |200|1000|retrocycles-input.txt
 baba-linux   |linux-x11|Baba Is You                      |bin64/Chowdren                      | |-|-|-|--lazy
-retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|-|-|retrocycles-input.txt
+retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|-|-|retrocycles-linux.wl
 
 # x64 Windows games: waiting for 64-bit native Wine (OneShot's game is
 # oneshot.exe, x64).

@@ -127,7 +127,11 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     find "$ov" -type f -size -256k -print0 | while IFS= read -r -d '' f; do cp -p "$f" "$f.gexcp" && mv "$f.gexcp" "$f"; done
     exe=$ov/$prog
     env=(GEX_PPM_EVERY=$every)
-    if [ "$input" != - ] && [ -n "$input" ]; then
+    if [ "$input" != - ] && [ -n "$input" ] && [[ $kind == linux* ]]; then
+        # Linux games: the compositor's scripted input (GEX_WL_INPUT, timed
+        # in seconds from a frame).
+        env+=("GEX_WL_INPUT=$here/$input")
+    elif [ "$input" != - ] && [ -n "$input" ]; then
         env+=("GEX_NT_INPUT=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$here/$input" | tr -d ' ' | paste -sd';')")
     fi
     # shellcheck disable=SC2206

@@ -471,6 +471,30 @@ LINUX_LIBS); Baba Is You gets past Steam (gex-steam Linux) and D-Bus
 autolaunch, creates its GL window, no frame yet. Input for Linux games
 needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
 
+### Linux builds: scripted input, Steam, X11 (2026-10-06)
+
+- Input: `GEX_WL_INPUT` (master), timed in seconds from the Nth frame;
+  matrix.sh passes a Linux game's input file (`*.wl`) as it.
+  tests/games/retrocycles-linux.wl takes Retrocycles through its language
+  menu and First Setup to the welcome screen. With `frames 1` the clock
+  started on Xwayland's first frame, long before the game's menu.
+- Steam: gex-steam for Linux (`guest/steam/build.sh OUT clang++ [-m32]`;
+  GCC 12 lacks `-nostdlib++`), swapped in by matrix.sh with
+  GEX_STEAM_LINUX64. Smoke test: tests/games/steam-smoke.sh (i386 and
+  x86-64, on the host).
+- X11: Baba Is You's static SDL2 has no Wayland, and SDL 1.2 has none, so
+  both run as `linux-x11` on Xwayland inside the guest. Xwayland runs
+  xkbcomp (translated) to compile its keymap, which takes minutes on a
+  loaded gooner; X clients wait for it.
+- Baba Is You (Chowdren) needed: gex-steam with an older stats interface
+  (STEAMUSERSTATS 012), no D-Bus autolaunch (libdbus ran dbus-launch, which
+  waited on the display), `--lazy` (eager translation of the 9 MB
+  executable is 216 MB of wasm). It creates its GL window and stops after
+  its renderer string, waiting on an X reply.
+- Retrocycles (Linux): gexc itself died of SIGSEGV once, after the welcome
+  screen's Enter (a host crash, not the guest's): being reproduced with a
+  core dump.
+
 ### Resume (stream G)
 
 Gate branch merge/games2-gate (PE loader fixes, gex-steam for Windows,
