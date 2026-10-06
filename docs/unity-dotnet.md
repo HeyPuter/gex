@@ -1151,4 +1151,9 @@ Not yet:
      JsonSharedData.Save); saves will need the formatter (the unsupported
      System.Runtime.Serialization.Formatters package, or a shim). Flag 0x2
      itself is still unexplained.
+     **With graphics (hk99, gooner llvmpipe, netlink fix + xfocus + seed +
+     walk):** the main menu renders (`scratch/unity/screens/hk-menu.png`:
+     title, particles, menu arrows); the menu item labels draw as black
+     boxes (text: TextMeshPro font warnings earlier in the log; next to look
+     at), cameras 5, ~50k renders.
 
