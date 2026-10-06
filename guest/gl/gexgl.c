@@ -2683,6 +2683,37 @@ static int gexgl_x11_window_size(void *win, int *width, int *height) {
     return 1;
 }
 
+/* The top-level window an X drawable is in: itself, or the ancestor whose
+ * parent is the root.
+ *
+ * A compositor knows the windows the window manager manages, which are
+ * top-level; a program may draw GL into a child of one. SDL 1.2 does: its GL
+ * drawable is `SDL_Window`, a child of the `WMwindow` the window manager
+ * sees, so a frame attached to the child's id matched no window and the page
+ * showed black (Retrocycles). The frame belongs to the top-level window. */
+static unsigned long gexgl_x11_toplevel(void *win) {
+    void *display = gexgl_x11_client_display();
+    void *xlib = gexgl_x11_symbol_source();
+    unsigned long w = (unsigned long)(uintptr_t)win;
+    if (!display || !xlib) return w;
+    int (*query_tree)(void *, unsigned long, unsigned long *, unsigned long *,
+                      unsigned long **, unsigned *) = dlsym(xlib, "XQueryTree");
+    int (*xfree)(void *) = dlsym(xlib, "XFree");
+    void *(*set_error_handler)(void *) = dlsym(xlib, "XSetErrorHandler");
+    if (!query_tree || !xfree || !set_error_handler) return w;
+    void *previous = set_error_handler((void *)gexgl_x11_error);
+    for (int depth = 0; depth < 32; depth++) {
+        unsigned long root = 0, parent = 0, *children = NULL;
+        unsigned n = 0;
+        if (!query_tree(display, w, &root, &parent, &children, &n)) break;
+        if (children) xfree(children);
+        if (!parent || parent == root) break;
+        w = parent;
+    }
+    set_error_handler(previous);
+    return w;
+}
+
 /* libwayland-egl's window, so the `wl_surface` inside one can be found.
  *
  * The structure is libwayland-egl's ABI rather than ours, and its first field
@@ -2871,8 +2902,8 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
            is nowhere to put the pixels. The handle goes with it, which is
            what allows a second window at the same time -- the host keeps a
            drawable per handle. Attaching also makes it current. */
-        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X, s->id,
-             (unsigned)getpid(), s->handle);
+        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X,
+             (unsigned)gexgl_x11_toplevel(win), (unsigned)getpid(), s->handle);
         egl_surface = s;
         egl_surface_width = w;
         egl_surface_height = h;
