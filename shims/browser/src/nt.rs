@@ -378,6 +378,9 @@ mod imp {
         if let Some(v) = var("GEX_NT_STATEFUL") {
             crate::cgen::set_stateful(&v);
         }
+        if let Some(v) = var("GEX_NT_IDENTITIES") {
+            crate::cgen::set_identities(&v);
+        }
         let prefix = var("GEX_WINE_PREFIX").unwrap_or_else(|| "/wine".into());
         let mut wenv = nt::boot::default_environment();
         let mut settings = Vec::new();

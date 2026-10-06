@@ -7,6 +7,91 @@ Stream E, 2026-10-03. This is the design; status is at the end. It extends
 that replaces pewasm: a standalone project that builds and runs natively,
 in Node and in the browser, at or above pewasm's world fps.
 
+## Hand-off (final state of stream E, 2026-10-06)
+
+Stream E stopped when merge/eject9 de2c3b4d landed (integ/2026-10-06e) and
+"gex eject replaces pewasm" was announced. This section is the state for
+whoever picks the eject up. The sections below it are the design and the
+log as they were written (`$S` = `~/gex-sandbox/scratch/eject9`).
+
+**What ships.** `gexc eject` records a Windows program under gex and turns
+it into a standalone project: AOT units for every image, providers (PUC
+Lua for lua51, CRT and ConcRT ones), region entries for interior resumes,
+and a web build. `web/eject-site.mjs PROJECT OUT` makes the static site
+(zstd-packed, `sw.js` for isolation and decoding, `_headers`, `serve.mjs`):
+about 75 MB to download, 450 MB unpacked. The page runs AOT-only (no JIT, no
+interpreter), presents GL frames directly (`?direct=1`, eject-site's
+default with GL; `--no-direct` for the composited path), and keeps saves in
+IndexedDB (`persist`).
+
+**Results** (edger, Quadro P620, WebGPU over Vulkan, BENCH_CORES default,
+world seed pinned at 1767225600; the eject's project `$S/p-noita19` at
+master 85eb233c-6f196998's unit keys):
+
+| | ejected Noita page | pewasm page |
+| --- | --- | --- |
+| world fps, ABBA (world-up+90 s to 330 s) | 65.6, 68.3 (mean 66.95) | 48.2, 49.0 (mean 48.6) |
+| world-up, seconds after navigation | 31.2, 30.9 | 31.3, 30.8 |
+| 35-min soak, world frames simulated | 102,440 (no freeze; longest present stall 5 s, before world-up) | 57,891 |
+| soak, last 5-min window vs first | 35.6 vs 56.2 world fps (63%) | 16.9 vs 46.7 (36%) |
+
+The soak rows are from the c28 build (site28, master e3917bac's keys, 2026-10-05); the others are from site30.
+
+The ejected page is 1.38x faster than pewasm (66.95 vs 48.6 world fps) and
+reaches the world as fast. Direct present is worth about 4% over the
+composited path (63.65 vs 61.3 world fps, c28). Both decline over a soak;
+the game's world grows and pewasm declines more.
+
+**Correctness checks that pass:** play-through A (menus, mode select,
+world, walking, levitating, shooting, death by the killme mod, Game Over,
+stats, New Game; `$S/c28/qA.json` on a site packed with
+`--overlay $S/overlay-play`); play-through B up to the reload (pause, Save &
+Quit with status 29, the IndexedDB snapshot, all 62 files under
+drive_c/users restored after the reload; `$S/c28/qB.json`); tests/nt
+ejected x86 seh, cxx and apc in gex-rt and in the web build under Node,
+AOT-only (`scratch/eject9/ntweb.sh <case> x86` with `TRAIN=1`);
+tests/nt/run-browser.sh 49/49; tests/nt/browser-gui.mjs x86 and x86 --gl,
+composited and direct (`GEX_NT_PAGE_FLAGS='&direct=1'`).
+
+**Known gap: Continue after a reload.** The reloaded game reaches the main
+menu with "Continue", but Continue stops before the world: FMOD's init on
+the restored save goes through combase/sechost/rpcrt4 (a named-pipe
+connect that blocks and unwinds), and the frames it resumes have no AOT
+entry. Adding those frames as web entries is the designed fix, but two of
+fmod's frames together make the boot stop: the open bug in §8, with its
+repro and the entry lists in tests/eject/noita-entries/. A new game, and
+everything else in a session, works.
+
+**Follow-ups, in priority order:**
+1. **The boot-stop bug** (§8 "OPEN BUG"): adding region entries must never
+   break a run. Repro: base46.txt boots; base46 + fmod 0x17e5afa +
+   0x17d8ea4 stops at msvcr120 0x15cf728 on edger. Fixing it unblocks
+   Continue (then add full50.txt's fmod frames and re-run play B).
+2. **A fallback for missed entries in the shipped page.** Any path the
+   recording never reached stops the run loudly; `jit_fallback` exists but
+   needs a translator the page does not ship. Options: a tier-1 translator
+   loaded on demand, or region entries for every call continuation of
+   every recorded function.
+3. **A coverage pass:** scripted training runs (`run.mjs --record-entries`
+   and the page's `?record`) through menus, options, save/load, death and
+   restart, mods, so `user/web-entries.txt` covers a whole session. The
+   shim's stop report (stack scan and EBP chain) names the frames a
+   missed resume needs.
+4. **Audio.** Neither side has any: FMOD's output fails without a WASAPI
+   device (mmdevapi onto WebAudio, plus streaming 1.2 GB of banks).
+5. **A headed browser and a second GPU vendor.** Every number above is
+   headless Chromium on one NVIDIA P620; worldmachine's RX 6500 XT
+   (BENCH_HOST=worldmachine) and a real window are untried for the eject.
+6. Smaller: page-load variance (2.7-6 s from navigation to process start);
+   pointer lock (`?pointerlock=1`) untested on hardware; the cursor-as-CSS
+   path untested with a game that sets a cursor image.
+
+**Reproducing the numbers:** `$S/c30/queue.sh` (ABBA, world-up, play A/B)
+through `scratch/bench/bench.sh` with the sites synced (see
+`$S/c28/chain.sh` for the sync list); `$S/soak-edger.sh SITE TAG 2100` and
+`$S/c28/pewsoak.sh` for the soaks. Rebuild a project after a master merge
+with `$S/c29/prep30.sh` (page, runtime refresh, build, pack).
+
 ## 0. The constraint, and what it means
 
 The user: "the default tier for eject does not ship a jit or interpreter at
@@ -949,7 +1034,7 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
     site22, world-up A/B site22/site23, trace tr23, readback shots.
   - **Results (edger, site23 = the WebGPU compositor, site22 = before):**
     ABBA pew 47.5 / site23 56.2 / site22 57.8 / site22 55.7 / site23 60.4 /
-    pew 46.3: site23 58.3 vs site22 56.8 vs pewasm 46.9 (**1.24x**); world-up
+    pew 46.3: site23 58.3 vs site22 56.8 vs pewasm 46.9 (**site23 1.24x faster than pewasm, 58.3 vs 46.9 world fps**); world-up
     after navigation x3: site22 35.8, 36.7, 35.7 vs site23 35.7, 34.8, 38.0
     (no change: the compositor was not on the start-up path). Trace tr23 (10
     s in the world): no ReadPixels / CopyRenderingResults / WebGL events, the
@@ -976,6 +1061,213 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
     (blob at `$S/c24/edger.wgsl`), packs site24w, then world-up A/B x3
     site24/site24w and legs pew/site24w/site24/pew.
 
+- **Shader cache results (edger):** world-up after navigation x3 site24 (new
+  Mesa, in-process cache only) 33.3, 32.7, 31.7 s vs site24w (plus the shipped
+  blob, `?wgslcache=site`) 34.0, 30.8, 32.9 s: no difference between the two.
+  Against site23 (35.7, 34.8, 38.0 s, the Mesa before) both are about 3 s
+  faster, so the gain is the in-process dedupe (the same SPIR-V translated
+  again and again), not the shipped blob; the blob cuts "GL host" on Noita's
+  main thread over the first 10 s from 2.2-2.3 s to 1.25-1.35 s, which does
+  not reach world-up. Menus present ~70 frames/s on both (vsync-paced
+  compositor). World fps, same sequence: site24w 58.6, site24 59.3, pewasm
+  47.4, 47.9 (the eject 1.24x faster than pewasm, 59.0 vs 47.7 world fps).
+- **World-up, where the gap is now (edger, process time unless said):**
+  - World generation is at parity: per-second busy timelines of both
+    runtimes' Workers (`$S/profline.mjs`, profiles `$S/wg/g24`, `$S/wg/pw24`)
+    put it at ~22 s on one thread for the eject (plus ~8 s of a second
+    thread) and ~21 s for pewasm (w12, plus ~6 s of w13); from the stats, the
+    eject's last scripted click to its first world frame is 15-16 s against
+    pewasm's ~18 s.
+  - The gap is before it: process start to the first present takes 4.0-4.7 s
+    (pewasm: first surface 0.4 s after its process), and navigation to the
+    process start 2.7-6.0 s (pewasm 4.3 s). Frames 1 -> 180 (the clicks) take
+    ~7-8 s on both. Boot profile queued (`prof-edger.sh site24w boot24 0 14`).
+  - Per-function pairing with pewasm is not possible from its shipped
+    app.wasm: no name section, and `out/noita/build-mesa/app.js.symbols` has
+    150856 entries against the binary's 89250 functions (it predates
+    wasm-opt), so its names are wrong (malloc never sampled,
+    `emscripten_wasm_worker_self_id` sampled). Address mapping between the
+    runtimes is otherwise known: pewasm rebases noita.exe to 0x10000 (gex
+    keeps 0x400000), msvcp120 0xf00000 (gex 0x16b0000), msvcr120 0xf80000 (gex
+    0x15c0000); `$S/wgmap.mjs` pairs per gex function given a named pewasm
+    build.
+
+- **Boot items (13f4d6a9, edger):** site26 = known image keys
+  (GEX_NT_IDENTITIES from `gexc eject`), unit-cache files preloaded into
+  SharedArrayBuffers, and the trampolines' unit and nt_unixcall provider
+  packed (site25, packed before that fix, ran the trampolines on tier-1:
+  not measured). World-up after navigation x3: site24w 31.8, 32.8, 31.7 s vs
+  site26 31.6, 30.0, 30.8 s (site26 about 1.3 s faster); pewasm 30.2 s. World
+  fps: site26 60.9, 57.6 vs pewasm 49.0, 49.0 (site26 1.21x faster than
+  pewasm, 59.3 vs 49.0 world fps).
+- **Direct present (118a8c06; user decision 2026-10-05):** an ejected GL
+  program's single GL window is the output canvas (see the commit and
+  compositor-worker.js "direct present"); the compositor composites again
+  when a second toplevel, a popup or a non-GL window appears. eject-site
+  makes it the default for GL projects (`--no-direct`; `?direct=0`).
+  Locally (SwiftShader, readback): Noita's frame fitted to the viewport,
+  letterboxed; the browser-gui tests pass with and without `direct=1`
+  (glwindow reads its frames back, so it composites either way).
+  play.mjs steps take `fx`/`fy` (frame pixels) for direct present; the play
+  scripts converted: `$S/shots/d27p*.json`. Edger queue `$S/c27/queue.sh`
+  (log `$S/c27/queue.txt`): ABBA pew/site27/site27c (composited control),
+  world-up A/B, play-through p1-p8 (site27p, readback for screenshots, own
+  browser profile `/tmp/gbench-e9play`), 35-minute soak.
+
+- **Final state: see "Hand-off" at the top of this file.** The entries
+  below are the log as it was kept.
+
+- **Earlier resume (parked 2026-10-05 ~21:00).** Head = the
+  commit adding this paragraph (on 74e84773; master e3917bac merged at
+  df028162). Nothing of mine is running on gooner or edger.
+  - c28 results so far (raw numbers below, under "Earlier resume"): ABBA
+    pewasm 45.9 / site28 62.9 / site28c 61.4 / 61.2 / site28 64.4 / pewasm
+    48.0 world fps. Direct present averages 63.65 world fps, 1.36x faster
+    than pewasm (46.95) and 4% faster than composited (61.3). World-up:
+    eject 30.7-31.9 s, level with pewasm's 30.7 and 31.3 s. Old p1-p8
+    play scripts no longer fit (see below). p7 saves: snapshot and reload
+    OK (`[persist]` synced 7 files, 21 in the snapshot; `restored` 21 after the reload).
+    Soak: stopped for the reboot at 562 s (of 2100). Up to there: world
+    58.2 fps after world-up 28 s, longest present stall 5 s.
+  - Still to run: `$S/c28/play2.sh` (play-throughs A and B, fresh profiles,
+    `until` step; sites site28p and site28q are packed), pewasm world-up
+    rerun (`wup-pewasm2.sh`, probe fixed), and a full 35-min soak
+    (`soak-edger.sh $S/site28 soak28 2100`). Queue them with
+    `scratch/bench/bench.sh -s` on the sites, play.mjs, c28, then the scripts
+    (see `$S/c28/chain.sh` for the sync list). Bench timeouts on gooner do not
+    stop the remote waiter: kill an orphaned `flock` on edger by PID.
+  - After integ/2026-10-05g lands (F's N1 + inlining re-key, W's wine-slim):
+    merge master; rebuild the shim (`$S/bshim-gooner.sh`) and gexc
+    (`$S/build-native.sh`); relink p-noita18's units from the object cache
+    (`JOBS=6 nice -n 19 ./build.sh` in a copy, with icall hints); refresh
+    runtime/web as `$S/c28/prep.sh` does; repack site/sitec/sitep/siteq (the
+    shader blob stays valid while Mesa is unchanged). Then the coordinator's
+    short recheck: one ABBA pair vs pewasm, one world-up, play A plus the
+    saves check (B). Then send the head to the coordinator to gate.
+  - **Resumed after the Claude Code restart (no reboot):** the c28 rest
+    (`$S/c28/rest.sh`: play2 A/B, pewasm world-up, 35-min soak) as one bench job.
+    - pewasm world-up reruns: 30.3, 30.8 s (with 30.7, 31.3 earlier).
+      Ejected 30.7-31.9 s. Level.
+    - Play A (site28p, killme): menus, mode select, world (the `until` step
+      waited 22 s for the first world frame), walking, levitating, shooting,
+      killme death, Game Over, stats screen, New Game -> mode select. OK.
+    - Play B (site28q): world, pause menu, Save & Quit (status 29), snapshot
+      of 62 files, reload, 62 restored. Then the page stayed black, and
+      5 s into the new process it stopped: `gex-eject: code at 0x78997f81
+      (rpcrt4.dll +0x46f81) was not translated` (status 139). It is the return continuation
+      of rpcrt4's named-pipe CreateFileW (GENERIC_READ|WRITE, then
+      ERROR_PIPE_BUSY check), resumed via dispatch after the call unwound:
+      a missing region entry the recording never reached. Fixed by the
+      eject's designed path: 0x78997f81 added to user/web-entries.txt in
+      `$S/p-noita18r` (rsync copy of p-noita18, build/units hardlinked; the
+      build only re-wrote lua51.wasm and groups/index.txt with identical
+      bytes), build.sh (rpcrt4 region entries 0 -> 1, no unit rebuilt),
+      site28r. B rerun on site28r queued (`$S/c28/playB2.sh`).
+      **Carry this web entry into the post-integ-g relink.**
+  - **35-min soaks, same script, seed and length (edger), world fps per 5 min
+    from world-up:** ejected site28 56.2 (28-327 s), 63.3, 57.3, 45.7, 41.0,
+    37.9, 35.6 (1893-2097 s); 102,440 world frames; longest present stall 5 s
+    (before world-up), no freeze. pewasm 46.7, 43.3, 30.8, 22.5, 19.2, 16.9
+    (1530-1830 s); 57,891 world frames. pewasm falls further (to 36% of its
+    first window against the eject's 63%), while the eject simulated 1.8x as many frames:
+    the decline is the game's world growing, not the ejected page.
+  - **Play B's Continue: the full stack.** With the stack scan (shim
+    dabbba27..e3398d6a: an unseen-code stop also lists the stack words that
+    follow a call instruction in an image, in lines of 16) the stop is
+    deterministic (same esp 0x141d688 each run). The chain is FMOD's
+    init on the reloaded game -> combase (CoCreateInstance) -> sechost/rpcrt4
+    -> the named-pipe connect that blocks and unwinds. Its 152 candidates
+    plus 0x7899c20b (the frame the first entry returned into) are in
+    `$S/c28/cands2.txt`; region entries cover each function's call
+    continuations (build.sh's `[regions] ... with the call continuations of
+    their functions`). Carried into p-noita19 (post-integ-g).
+  - Killed by PID on edger: the orphaned pewasm-runner Chromium 2139751
+    (ppid 1, idle 23 h, held no bench lock), as the coordinator asked.
+
+- **Earlier resume (2026-10-05 evening, after the first reboot).** Merged master
+  e3917bac (df028162; no gex-cgen change, unit keys kept). third_party/mesa
+  checked out in this worktree (wink 5f5572e62ff; cloned from
+  `scratch/coord/mesa-wink`, submodule url set locally to it) and built with
+  web/build-mesa-wasm.sh into `$S/mesa-wink-out`. Re-verification of this
+  head runs as `$S/c28/prep.sh` (page28, project p-noita18 = p-noita17 by
+  hardlinks with runtime/web refreshed, training site site28t) then
+  `$S/c28/chain.sh` (trains the shader blob on edger -> `$S/c28/edger.wgsl`,
+  since blobs are tied to the Mesa build; packs site28 / site28c
+  (--no-direct) / site28p (play, overlay-play); runs `$S/c28/queue.sh`:
+  ABBA pew/site28/site28c/site28c/site28/pew, world-up x3 site28c vs site28
+  plus pewasm x3 (wup-pewasm2.sh), play p1-p8 (`$S/shots/d28p*.json`),
+  soak28 2100 s). Chain log `$S/c28/chain.txt`. F's fdbb1d9e (pe.rs
+  `unguarded` passed explicitly) merges clean with this branch; Noita's
+  nt.json has unguarded=true, so it changes nothing for the ejected Noita.
+  The previous section (below) describes the c27 queue this replaces.
+  - **c28 results (edger, seed pinned, BENCH_CORES default):**
+    - ABBA, world fps from world-up+90 s (about 200 s each): pewasm 45.9,
+      site28 (direct) 62.9, site28c (composited) 61.4, site28c 61.2,
+      site28 64.4, pewasm 48.0. Direct present averages 63.65 world fps:
+      1.36x faster than pewasm (46.95) and 4% faster than the composited
+      control (61.3).
+    - World-up, seconds after navigation: site28 31.9, 30.9, 30.8;
+      site28c 31.8, 31.8, 30.7; pewasm 30.7, 31.3 (the third pewasm run
+      aborted: wup-pewasm2.sh's probe called `_noita_world_frame` before
+      the runtime had initialized; the probe now starts at 15 s, rerun queued).
+      The two are level.
+    - Play-through p1-p8 (old scripts): p1 reached the world, and the
+      killme mod's death and Game Over came before the script's walking steps.
+      The boot is now about 25 s faster, so the old timings no longer fit.
+      From p2 on, one shared profile meant Noita's "Autosave found ... Restore?"
+      dialog (the autosave persisted across page loads), which the old scripts don't click.
+      Replaced by `$S/c28/play2.sh`: A (site28p, killme) and B (site28q = no
+      overlay, for pause / Save & Quit / reload / Continue), each in a fresh
+      profile, with play.mjs's new `until` step (holds the script until the
+      world frame counter is nonzero).
+
+- **Previous resume (state at the reboot, 2026-10-05 ~18:10).** Branch
+  merge/eject9, worktree ~/gex-sandbox/wt/eject9; head = the commit adding
+  this paragraph (on bce25b8e). Master ffc51bcd is merged (it contains this
+  branch up to 1d5956bc and third_party/mesa = wink 5f5572e62ff with both of
+  my Mesa patches: build Mesa from third_party/mesa from now on, not from
+  `$S/gexroot`; the submodule is not checked out in this worktree yet, and
+  web/public/gex's Mesa is my equivalent build from `$S/mesa-ctl-out`).
+  `$S` = ~/gex-sandbox/scratch/eject9.
+  - Agreed order (coordinator/user): (1) boot hashing skip -- DONE
+    (13f4d6a9, measured: site26 world-up 30.0-31.6 s vs pewasm 30.2 s);
+    (2) direct present -- DONE in code (118a8c06), locally verified; (3) on
+    edger: fps ABBA vs pewasm and world-up A/B with direct present -- STARTED,
+    one leg done: site27 (direct) 62.1 world fps over 189 s, world-up 28 s
+    after the process start; pewasm 48.1 in the same sequence (the eject
+    1.29x faster than pewasm, 62.1 vs 48.1 world fps, one leg each: repeat);
+    (4) RE-VERIFY on that build: play-through, saves across reload, 35-min
+    soak -- NOT RUN; (5) send the head to the coordinator to gate; (6) the
+    user announces "eject replaces pewasm".
+  - To resume step 3-4: everything is packed and ready. Run on gooner
+    `nohup ~/gex-sandbox/scratch/bench/bench.sh -s $S/site27 -s $S/site27c
+    -s $S/site27p -s $S/play.mjs -s $S/play-edger2.sh -s $S/shots -s $S/c27
+    -s $S/soak-edger.sh -- bash $S/c27/queue.sh > $S/c27/queue.txt 2>&1 &`
+    (ABBA pew/site27/site27c/site27c/site27/pew; world-up x3 site27c vs
+    site27; play scripts `$S/shots/d27p1..8.json` on site27p with
+    present=readback so screenshots show the frame, own profile
+    /tmp/gbench-e9play removed first so saves start empty; then
+    `soak-edger.sh site27 soak27 2100`). Logs land on edger in
+    `$S/edger/` (L*-27, wab-*, d27p*.txt/.stats + shots/d27p*.png, soak27);
+    fetch with scp. Check in p1-p8: release notes -> menu -> New Game ->
+    world, walking, death and Game Over (killme mod), pause, Save & Quit, the
+    reload's restored files and "Continue" in p8. Coordinates in those
+    scripts are frame pixels (fx/fy) converted from the composited ones
+    (minus 4,56); if a click misses, compare the shots with the
+    old ones in `$S/edger/shots/p*.png`.
+  - Sites: site27 = direct present (bench), site27c = same with
+    `--no-direct` (control), site27p = non-bench with overlay-play (killme
+    mod) for the play-through; all from p-noita17 at master ffc51bcd's unit
+    keys, page27, the edger-trained shader blob `$S/c24/edger.wgsl`.
+  - Post-change checks already green on gooner at 118a8c06:
+    tests/nt/run-browser.sh 49/49; browser-gui x86, x86 --gl, x64, x64 --gl
+    ok, and x86 / x86 --gl with direct=1 ok.
+  - Open, lower priority: page-load variance (navigation -> process start
+    2.7-6.0 s); pointer lock is opt-in (`?pointerlock=1`) and untested on
+    hardware; the cursor-as-CSS path is untested with a game that sets a
+    cursor image (Noita hides it).
+  - Nothing of mine is running on gooner or edger.
+
 - Harness: `$S/play.mjs` = page-run.mjs + `--script FILE` (timed clicks,
   keys, holds, screenshots, evals, `persist` snapshots and reloads through
   CDP input, as a person would).
@@ -995,6 +1287,64 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
 
 ## 8. Gaps and risks
 
+- **Paths the recording never reached (open, for whoever takes eject on
+  after stream E).** An ejected build runs only what its recording (plus
+  discovery and `user/web-entries.txt`) covered. Any other path stops the
+  run loudly, and not only new functions: a resume into a call
+  continuation after the C nest unwound (a blocking call, an APC, a host
+  round trip) needs a region entry for every frame still on the stack.
+  Noita's Continue after a reload was one (FMOD -> combase ->
+  sechost/rpcrt4 named-pipe connect); the play-through found it, and the
+  shim's stack scan (an unseen-code stop lists the stack's return
+  addresses) names a whole chain in one run. The fallback,
+  `"jit_fallback": true` in user/eject.json (`run.mjs/run.sh
+  --jit-fallback`), is off by default and needs a translator in the
+  runtime, which the shipped page does not have. Open follow-ups: a
+  coverage pass (a scripted training run through menus, save/load,
+  death/restart and options, with `run.mjs --record-entries`), and a
+  shipped-page fallback that can recover from a missed entry instead of
+  stopping (a tier-1 translator loaded on demand, or a region per call
+  continuation of every recorded function).
+- **Training-run blind spots (fixed, 40f84c5a).** `run.mjs
+  --record-entries` missed browser-only resume points: a Worker's console
+  output under Node reaches the parent only when the Worker's event loop
+  turns, so its "web entry" lines (and an AOT-only run's stop message) were
+  lost at the end of a run, and the function JIT served some misses before
+  they were noted. Both now go through the guest's stderr, noted first.
+  seh.exe's int3 continuation (0x401d43, beside the entry 0x401d40 in one
+  4-byte dispatch slot, which is fine: calls, the root and the bridge all
+  resolve exact addresses) is recorded deterministically. A slot rule tried
+  on the way (ee112f0c) was wrong and is reverted (c1643d34).
+- **OPEN BUG: adding region entries can break the ejected boot.** Adding
+  web entries must only add AOT coverage, but some sets make Noita's
+  ejected page stop deterministically about 4.7 s into the process, before
+  the menus: `gex-eject: code at 0x15cf728 (msvcr120.dll +0xe728) was not
+  translated` (esp 0x141e69c). 0x15cf728 is the continuation after
+  `call *[GetLastError]` in msvcr120's 0x1000f720. Reproduce on master
+  6f196998's keys (p-noita19 relinked from the object cache, any run of
+  `$S/c31/q.sh`-style legs on edger):
+  - tests/eject/noita-entries/base46.txt (p-noita18's 13, rpcrt4 0x78997f81
+    0x7899c20b, and play B's live EBP chain): boots (site31, 64.5 world
+    fps).
+  - base46 plus any one of fmod 0x17e5afa, 0x17d2958, 0x17c91d5, 0x17d8ea4:
+    each boots (sitef1..4, peek 4153-4262 at 120 s).
+  - base46 plus 0x17e5afa and 0x17d8ea4 (fmod.dll, 192 region entries):
+    stops (siteg). base46 plus all four (full50.txt, site32): stops, twice
+    of twice. The 168-entry site29 set (site29-168.txt) stops the same way;
+    halves of it (by image) each boot.
+  - Ruled out by experiment: leaf inlining (F: the call site is a plain
+    ftab call), the nest depth budget (256 KiB control boots the same
+    way as 384), 4-byte dispatch-slot sharing (calls, root and bridge
+    resolve exact addresses; seh's slot-neighbour entry runs fine), and
+    region entries equal to unit entries (none in site32).
+  - Not yet known: why two region functions in fmod's region module change
+    what msvcr120's boot path does. Next step: reproduce outside the page
+    (native `gexc eject run` or `run.mjs` under Node, both blocked today
+    by GL-on-the-host and exit 2 respectively), or GEX_NT_RESUME_LOG plus
+    a wasm trace at the stop on edger.
+  This also blocks play B's Continue: the save, Save & Quit, the snapshot
+  and the 62-file restore work, but reaching the world after Continue
+  needs fmod's frames as entries, which this bug turns into a boot stop.
 - **Interior entries** (§3.2–3.3) are the main correctness risk. A resume
   at an address no region covers stops the run. The conservative region set
   (every call continuation in an SEH-framed function) may be large; it is

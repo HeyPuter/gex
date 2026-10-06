@@ -87,6 +87,16 @@ async function preloadUnits(url) {
     while (i < list.length) {
       const [name, href] = list[i++];
       try {
+        if (name.startsWith('file:')) {
+          // A small file of the unit cache (entries, a provider, a profile),
+          // which every Worker would otherwise fetch with a synchronous
+          // request: in a SharedArrayBuffer, so each Worker gets it uncopied.
+          const b = new Uint8Array(await (await fetch(href)).arrayBuffer());
+          const shared = new Uint8Array(new SharedArrayBuffer(b.byteLength));
+          shared.set(b);
+          out.push([name, shared]);
+          continue;
+        }
         out.push([name, await WebAssembly.compileStreaming(fetch(href))]);
       } catch (e) {
         console.warn(`[nt-page] preload ${href}: ${e?.message ?? e}`);
@@ -173,7 +183,7 @@ async function main() {
   if (!env.some((e) => e.startsWith('GEX_NT_STRICT='))) env.push('GEX_NT_STRICT=1');
   const gl = q.get('gl') === '1';
   const preModules = await preloading;
-  if (preModules) mark(`compiled ${preModules.length} unit modules ahead`);
+  if (preModules) mark(`compiled ${preModules.filter(([k]) => !k.startsWith('file:')).length} unit modules ahead, ${preModules.filter(([k]) => k.startsWith('file:')).length} files`);
   state.phase = 'running';
   mark('running');
   if (persistDir) {
