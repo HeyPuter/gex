@@ -3430,6 +3430,25 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
+                // A privileged instruction: log the bytes there now and the
+                // block that trapped, so a stale or misaligned translation
+                // (bytes that are no longer `hlt`/`in`/`out`/`int n`) shows.
+                if imm == gex_abi::imports::BRK_GENERAL_PROTECTION {
+                    if let Some(m) = caller.data().memory.clone() {
+                        let gm = GuestMem::new(m.bytes());
+                        let at = |a: u64| -> String { gm.read(a, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")).unwrap_or_default() };
+                        let c = ctx as u32 as u64;
+                        let src = gm.read_u64(c + ctx::LAST_SOURCE as u64).unwrap_or(0);
+                        let tgt = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
+                        eprintln!(
+                            "gex-nt: privileged instruction at {:#x}: {} (last source {src:#x}: {}; last target {tgt:#x}: {})",
+                            pc as u64,
+                            at(pc as u64),
+                            at(src),
+                            at(tgt)
+                        );
+                    }
+                }
                 return nt::fault_at(&mut caller, nt::Fault::from_brk(imm), pc as u64, resumable);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
