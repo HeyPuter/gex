@@ -50,6 +50,104 @@ struct Inner {
     /// The GPU compositor, when one could be started. Optional: a machine with
     /// no graphics adapter still runs, compositing on the host instead.
     gpu: Mutex<Option<gex_gpu::Compositor>>,
+    /// `GEX_WL_INPUT`: scripted input, timed from the first frame.
+    input: Mutex<Option<Input>>,
+}
+
+/// One scripted input event (`GEX_WL_INPUT`, [`Input::load`]).
+#[derive(Debug, Clone, Copy)]
+enum Ev {
+    Motion(i32, i32),
+    Button(u32, bool),
+    Key(u32, bool),
+}
+
+/// A script of input events at times (seconds) after the compositor's Nth
+/// frame (`frames N`, default 1: a game's first frame is often a splash long
+/// before its menu; 0: from the compositor's start), delivered to the clients by [`Wayland::pump`] as they fall due:
+/// what an automated game test needs to get past menus. One event per line,
+/// `#` comments:
+///
+/// ```text
+/// frames 300                 # time from the 300th frame
+/// 30    click 100 328        # motion, then BTN_LEFT down and (0.1 s later) up
+/// 31.5  move 400 300
+/// 32    button 272 1         # a Linux BTN_* code, 1 down / 0 up
+/// 40    tap enter            # key down, and up 0.1 s later
+/// 41    key z 1              # a key name or Linux KEY_* code, 1 down / 0 up
+/// ```
+///
+/// Coordinates are the focused surface's pixels.
+struct Input {
+    events: Vec<(f64, Ev, String)>,
+    next: usize,
+    start: Option<std::time::Instant>,
+    /// Frames to see before the clock starts, and how many have been.
+    after: u64,
+    seen: u64,
+}
+
+/// Linux `KEY_*` codes for the names a script may use (else a number).
+fn key_code(name: &str) -> Option<u32> {
+    let k = match name.to_ascii_lowercase().as_str() {
+        "esc" | "escape" => 1,
+        "1" => 2, "2" => 3, "3" => 4, "4" => 5, "5" => 6, "6" => 7, "7" => 8, "8" => 9, "9" => 10, "0" => 11,
+        "backspace" => 14, "tab" => 15,
+        "q" => 16, "w" => 17, "e" => 18, "r" => 19, "t" => 20, "y" => 21, "u" => 22, "i" => 23, "o" => 24, "p" => 25,
+        "enter" | "return" => 28, "ctrl" | "leftctrl" => 29,
+        "a" => 30, "s" => 31, "d" => 32, "f" => 33, "g" => 34, "h" => 35, "j" => 36, "k" => 37, "l" => 38,
+        "shift" | "leftshift" => 42,
+        "z" => 44, "x" => 45, "c" => 46, "v" => 47, "b" => 48, "n" => 49, "m" => 50,
+        "alt" | "leftalt" => 56, "space" => 57,
+        "f1" => 59, "f2" => 60, "f3" => 61, "f4" => 62, "f5" => 63,
+        "up" => 103, "left" => 105, "right" => 106, "down" => 108,
+        n => return n.parse().ok(),
+    };
+    Some(k)
+}
+
+impl Input {
+    fn load(path: &str) -> Result<Input, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut events = Vec::new();
+        let mut after = 1;
+        for (n, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let w: Vec<&str> = line.split_whitespace().collect();
+            let bad = || format!("{path}:{}: cannot read `{line}`", n + 1);
+            if w[0] == "frames" {
+                after = w.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                continue;
+            }
+            let t: f64 = w[0].parse().map_err(|_| bad())?;
+            let num = |i: usize| -> Result<i32, String> { w.get(i).and_then(|v| v.parse().ok()).ok_or_else(bad) };
+            let key = |i: usize| -> Result<u32, String> { w.get(i).and_then(|v| key_code(v)).ok_or_else(bad) };
+            let down = |i: usize| -> Result<bool, String> { Ok(num(i)? != 0) };
+            let l = line.to_string();
+            match w.get(1).copied() {
+                Some("move") => events.push((t, Ev::Motion(num(2)?, num(3)?), l)),
+                Some("click") => {
+                    events.push((t, Ev::Motion(num(2)?, num(3)?), l.clone()));
+                    events.push((t, Ev::Button(0x110, true), l.clone()));
+                    events.push((t + 0.1, Ev::Button(0x110, false), l));
+                }
+                Some("button") => events.push((t, Ev::Button(num(2)? as u32, down(3)?), l)),
+                Some("key") => events.push((t, Ev::Key(key(2)?, down(3)?), l)),
+                Some("tap") => {
+                    events.push((t, Ev::Key(key(2)?, true), l.clone()));
+                    events.push((t + 0.1, Ev::Key(key(2)?, false), l));
+                }
+                _ => return Err(bad()),
+            }
+        }
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // `frames 0`: from the compositor's start.
+        let start = if after == 0 { Some(std::time::Instant::now()) } else { None };
+        Ok(Input { events, next: 0, start, after, seen: 0 })
+    }
 }
 
 impl std::fmt::Debug for Wayland {
@@ -60,12 +158,51 @@ impl std::fmt::Debug for Wayland {
 
 impl Wayland {
     pub fn new(width: i32, height: i32) -> Wayland {
+        let input = match std::env::var("GEX_WL_INPUT") {
+            Ok(p) => match Input::load(&p) {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    eprintln!("[gex] GEX_WL_INPUT: {e}");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
         Wayland {
             inner: Arc::new(Inner {
                 size: Mutex::new((width, height)),
+                input: Mutex::new(input),
                 ..Default::default()
             }),
         }
+    }
+
+    /// A frame was shown (a client's commit, or GL's own present): the
+    /// input script's clock starts at its `frames N`th.
+    fn note_frame(&self) {
+        if let Some(inp) = self.inner.input.lock().unwrap().as_mut() {
+            inp.seen += 1;
+            if inp.seen >= inp.after && inp.start.is_none() {
+                eprintln!("[gex] input: the script's clock starts at frame {}", inp.seen);
+                inp.start = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// The scripted events now due (`GEX_WL_INPUT`), with their time in ms.
+    fn due_input(&self) -> Vec<(Ev, u32)> {
+        let mut g = self.inner.input.lock().unwrap();
+        let Some(inp) = g.as_mut() else { return Vec::new() };
+        let Some(start) = inp.start else { return Vec::new() };
+        let now = start.elapsed().as_secs_f64();
+        let mut due = Vec::new();
+        while inp.next < inp.events.len() && inp.events[inp.next].0 <= now {
+            let (t, ev, line) = &inp.events[inp.next];
+            eprintln!("[gex] input at {now:.1} s: {ev:?} ({line})");
+            due.push((*ev, (t * 1000.0) as u32));
+            inp.next += 1;
+        }
+        due
     }
 
     /// Composite on the GPU rather than handing single frames to the host.
@@ -159,6 +296,7 @@ impl Wayland {
     /// Write a frame drawn somewhere other than a client buffer (a GL
     /// client's host surface): RGBA rows, top first.
     pub fn present_external(&self, width: i32, height: i32, rgba: &[u8]) {
+        self.note_frame();
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
@@ -183,6 +321,9 @@ impl Wayland {
     /// kernel locates a buffer's pixels through its shared mappings; guest
     /// memory is where they are.
     pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
+        // Scripted input waits for a client that can take it (a seat and a surface).
+        let ready = self.inner.sessions.lock().unwrap().iter().any(|s| s.client.input_ready());
+        let due = if ready { self.due_input() } else { Vec::new() };
         let mut sessions = self.inner.sessions.lock().unwrap();
         let mut produced = Vec::new();
         sessions.retain_mut(|s| {
@@ -212,6 +353,17 @@ impl Wayland {
                     break;
                 }
             }
+            if !due.is_empty() {
+                eprintln!("[gex] input: {}", s.client.describe_input());
+            }
+            let take = s.client.input_ready();
+            for &(ev, ms) in due.iter().filter(|_| take) {
+                match ev {
+                    Ev::Motion(x, y) => s.client.pointer_motion(x, y, ms),
+                    Ev::Button(b, down) => s.client.pointer_button(b, down, ms),
+                    Ev::Key(k, down) => s.client.keyboard_key(k, down, ms),
+                }
+            }
             s.out.extend_from_slice(&s.client.take_outgoing());
             // A `wl_keyboard.keymap` event owes a descriptor for its `h`
             // argument: an in-memory file holding the keymap, staged on the
@@ -238,6 +390,7 @@ impl Wayland {
         });
         drop(sessions);
         if !produced.is_empty() {
+            self.note_frame();
             // One screen per batch of commits, not one per surface.
             self.save(&produced);
             self.inner.frames.lock().unwrap().extend(produced);

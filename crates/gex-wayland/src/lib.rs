@@ -2063,6 +2063,36 @@ impl Client {
         self.surfaces.get(&surface).map(|s| s.x11).unwrap_or(false)
     }
 
+    /// Whether input can be delivered: the client has a pointer and a
+    /// keyboard, and a surface to give them to.
+    pub fn input_ready(&self) -> bool {
+        self.pointer.is_some() && self.keyboard.is_some() && self.pointer_target.or(self.focus_surface).is_some()
+    }
+
+    /// Where pointer input would go now, and the surfaces there are: for a
+    /// host explaining scripted input (`GEX_WL_INPUT`).
+    pub fn describe_input(&self) -> String {
+        let mut ids: Vec<_> = self.surfaces.keys().copied().collect();
+        ids.sort();
+        let list: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                let s = &self.surfaces[id];
+                format!("{id}:{:?}{}{}{}", s.role, if s.x11 { " x11" } else { "" },
+                    if s.committed_buffer.is_some() { " drawn" } else { "" },
+                    s.external.map(|(w, h)| format!(" ext {w}x{h}")).unwrap_or_default())
+            })
+            .collect();
+        format!(
+            "pointer {:?} on {:?}, target {:?}, focus {:?}; surfaces [{}]",
+            self.pointer.is_some(),
+            self.pointer_on,
+            self.pointer_target,
+            self.focus_surface,
+            list.join(", ")
+        )
+    }
+
     /// Move the pointer to a position on a particular surface, entering it (and
     /// leaving whatever it was on) if the surface changed.
     ///
@@ -2157,10 +2187,17 @@ impl Client {
 
     /// Pointer moved to surface-local `(x, y)` in pixels.
     pub fn pointer_motion(&mut self, x: i32, y: i32, time: u32) {
-        let Some(ptr) = self.pointer else { return };
+        let Some(ptr) = self.pointer else {
+            trace_out("[wl] pointer motion before the client asked for a pointer");
+            return;
+        };
         // Before the enter, so the enter it may trigger carries this position.
         self.pointer_at = (x, y);
         if !self.ensure_pointer_enter() {
+            trace_out(&format!(
+                "[wl] pointer motion dropped: no surface to enter (target {:?}, focus {:?})",
+                self.pointer_target, self.focus_surface
+            ));
             return;
         }
         // motion(time, surface_x, surface_y)
