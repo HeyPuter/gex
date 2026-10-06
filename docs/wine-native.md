@@ -1239,8 +1239,11 @@ Heads:
   whose process exited ends at its next syscall (the pause() one);
   glibc_math (floor/ceil/trunc/round and float forms, bitwise);
   `gex_ld` reads 32-bit dynamic symbols.
-- Open: TCP loopback across browser processes (the port table is per
-  shim instance; needs the global kernel); UDP listeners; libm sin/cos
+- After gate2 (dev only, next landing): f9c5a9ec TCP between a page's
+  processes (listeners/loopback streams in the global kernel; abstract
+  names freed on close).
+- Open: UDP listeners; AF_INET sockets in a page without a network stack
+  (EAFNOSUPPORT, so loopback TCP needs GEX_NETWORK there); libm sin/cos
   (needs glibc's own bits); a paired page run of the providers on edger
   (E holds the lock).
 
