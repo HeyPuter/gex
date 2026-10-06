@@ -44,6 +44,9 @@ PROC(void, glGetProgramiv, (GLuint, GLenum, GLint *))
 PROC(void, glUniform4f, (GLint, float, float, float, float))
 PROC(GLint, glGetUniformLocation, (GLuint, const char *))
 PROC(void, glGetUniformfv, (GLuint, GLint, float *))
+PROC(void, glDeleteShader, (GLuint))
+PROC(void, glTexStorage2D, (GLenum, GLsizei, GLenum, GLsizei, GLsizei))
+PROC(void, glTextureView, (GLuint, GLenum, GLuint, GLenum, GLuint, GLuint, GLuint, GLuint))
 #define LOAD(name) p##name = (name##_t)wglGetProcAddress(#name)
 
 static LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) { return DefWindowProcW(w, m, wp, lp); }
@@ -95,6 +98,7 @@ int main(void) {
     LOAD(glEnableVertexAttribArray); LOAD(glCreateShader); LOAD(glShaderSource); LOAD(glCompileShader);
     LOAD(glCreateProgram); LOAD(glAttachShader); LOAD(glBindAttribLocation); LOAD(glLinkProgram);
     LOAD(glUseProgram); LOAD(glGetProgramiv); LOAD(glUniform4f); LOAD(glGetUniformLocation); LOAD(glGetUniformfv);
+    LOAD(glDeleteShader); LOAD(glTexStorage2D); LOAD(glTextureView);
     CHECK("GL 2.0 entry points", pglMapBuffer && pglVertexAttribPointer && pglGenQueries && pglCreateProgram);
     if (!pglMapBuffer || !pglVertexAttribPointer || !pglGenQueries || !pglCreateProgram) goto out;
 
@@ -165,6 +169,36 @@ int main(void) {
     glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
     CHECK("a client-array, client-index draw", px[0] < 16 && px[1] > 240);
     pglUseProgram(0);
+
+    /* A shader deleted while attached, compiled only afterwards (wined3d's
+     * order): GL keeps it until it is detached, so the program still links. */
+    GLuint v2 = pglCreateShader(0x8B31), f2 = pglCreateShader(0x8B30), prog2 = pglCreateProgram();
+    pglShaderSource(v2, 1, &vs, 0);
+    pglShaderSource(f2, 1, &fs, 0);
+    pglAttachShader(prog2, v2);
+    pglAttachShader(prog2, f2);
+    pglDeleteShader(v2);
+    pglDeleteShader(f2);
+    pglCompileShader(v2);
+    pglCompileShader(f2);
+    pglLinkProgram(prog2);
+    GLint linked2 = 0;
+    pglGetProgramiv(prog2, 0x8B82 /* GL_LINK_STATUS */, &linked2);
+    CHECK("a program links from shaders deleted while attached", linked2);
+
+    /* A texture view: its name has to be one GL generated and never bound
+     * (wined3d's D3D11 views). The guest names textures itself. */
+    if (pglTexStorage2D && pglTextureView) {
+        while (glGetError() != GL_NO_ERROR) {
+        }
+        GLuint t[2];
+        glGenTextures(2, t);
+        glBindTexture(GL_TEXTURE_2D, t[0]);
+        pglTexStorage2D(GL_TEXTURE_2D, 1, 0x8058 /* GL_RGBA8 */, 4, 4);
+        pglTextureView(t[1], GL_TEXTURE_2D, t[0], 0x8058, 0, 1, 0, 1);
+        CHECK("glTextureView on a generated name", glGetError() == GL_NO_ERROR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
 
 out:
     CHECK("no GL error", glGetError() == GL_NO_ERROR);

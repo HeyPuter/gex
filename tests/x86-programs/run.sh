@@ -31,7 +31,11 @@ for src in "$HERE"/*.c; do
         bin="$WORK/$name-$target"
         [ -x "$bin" ] || zig cc -target "$target" -O1 -static $extra -o "$bin" "$src" || { fail=1; continue; }
         native=$("$bin" 2>/dev/null); ns=$?
-        gex=$("$GEXC" run $flags "$bin" 2>/dev/null); gs=$?
+        # smc-race: the translator waits between decoding a JIT-code block
+        # and fixing its guard, so the writer's stores land in between.
+        envs=""
+        [ $name = smc-race ] && envs="GEX_TEST_LIFT_DELAY_US=300"
+        gex=$(env $envs "$GEXC" run $flags "$bin" 2>/dev/null); gs=$?
         if [ "$native" = "$gex" ] && [ $ns = $gs ]; then
             echo "ok   $name ($target, $tier, exit $ns)"
         else

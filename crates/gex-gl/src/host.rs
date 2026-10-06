@@ -170,6 +170,7 @@ mod ffi {
         );
 
         pub fn glGenTextures(n: GLsizei, textures: *mut GLuint);
+        pub fn glIsTexture(texture: GLuint) -> GLboolean;
         pub fn glDeleteTextures(n: GLsizei, textures: *const GLuint);
         pub fn glBindTexture(target: GLenum, texture: GLuint);
         pub fn glActiveTexture(unit: GLenum);
@@ -1102,9 +1103,14 @@ impl Gl {
                     }
                 }
                 op::DELETE_SHADER => {
+                    // GL keeps a deleted shader that is still attached to a
+                    // program, and its name stays usable until it is
+                    // detached: wined3d attaches, deletes, and only then
+                    // compiles (its format checks' "draw quad"). So the name
+                    // keeps its mapping; a new shader given the same name
+                    // replaces it.
                     if let Some(n) = a.u32() {
-                        if let Some(real) = self.names.shaders.remove(&n) {
-                            native::gexgl_native_name(0, n, 0);
+                        if let Some(&real) = self.names.shaders.get(&n) {
                             glDeleteShader(real);
                         }
                     }
@@ -1643,6 +1649,11 @@ impl Gl {
                 // compatibility profile) are decoded by the C++ shared with
                 // the browser's host.
                 _ => {
+                    // glTextureView (gl44 1422, compat 10871): its new name
+                    // must be one the host generated and never bound.
+                    if (opcode == 1422 || opcode == 10871) && body.len() >= 4 {
+                        reserve_texture_name(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
+                    }
                     let (mut out, mut len) = (std::ptr::null(), 0usize);
                     if native::gexgl_native_one(opcode, body.as_ptr(), body.len(), &mut out, &mut len) != 1 {
                         return false;
@@ -1654,6 +1665,33 @@ impl Gl {
             }
         }
         true
+    }
+}
+
+/// Make `name` a texture name the host's GL generated and has not bound, as
+/// glTextureView requires of its new texture (the guest picks texture names
+/// and GL otherwise meets them first at bind time, so a view's name was never
+/// valid and wined3d's views came out empty: Rain World drew nothing).
+/// Generated names are the lowest free ones, so generate until it comes up and
+/// give back the rest.
+unsafe fn reserve_texture_name(name: GLuint) {
+    if name == 0 || glIsTexture(name) != 0 {
+        return;
+    }
+    let mut spare = Vec::new();
+    for _ in 0..65536 {
+        let mut n: GLuint = 0;
+        glGenTextures(1, &mut n);
+        if n == name || n == 0 || n > name {
+            if n != name && n != 0 {
+                spare.push(n);
+            }
+            break;
+        }
+        spare.push(n);
+    }
+    if !spare.is_empty() {
+        glDeleteTextures(spare.len() as GLsizei, spare.as_ptr());
     }
 }
 
