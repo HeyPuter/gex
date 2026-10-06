@@ -1553,7 +1553,7 @@ Heads:
 - **W3** (the user's order: before W7): plan in §4.0. gex branch
   merge/w3 (wt/w3, off merge/elf-prov) with the W3.0 spike; Wine fork
   branch `wasm32-w3` (wt/wine-w3; build tree `$W/wine-w32-w3` via
-  `$W/build-w32-w3.sh [targets]`, sr-slim read only; loader link
+  `$W/build-w32-w3.sh [targets]`, sysroot **`$W/sr-w3`** for every W3 build (a hard-linked copy of sr-slim whose only change is the ICALL plugin with declaration thunks; sr-slim stays read only); loader link
   `$W/link-w3.sh`, prefix and dll dir `$W/stage-w3.sh`). hello_args.exe
   runs on Wine's own Unix side, wineserver in process; tests/nt i386 29
   of 40 (§4.0, W3.1 progress; `$W/w3-nt4.log`). W3.2 in progress
