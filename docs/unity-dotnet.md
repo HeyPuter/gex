@@ -943,4 +943,22 @@ Not yet:
        very few frames (11 FindObjectOfType<UIManager> in ~20 min) or time
        does not advance. hk46 (pointer in the window from the first frame,
        `runs/hk46/input.txt`, GL capture, 3600 s) is running.
+  7. **Root cause found for the --fjit corruption (763fc74c):** the function
+     JIT's learned state (builtins by address, function starts, noreturn,
+     translated entries) was global to the host process, and the native
+     runner hosts the whole guest process tree (sh, Xwayland, xkbcomp, the
+     game) with one translator. Builtins were replaced on every execve, so
+     another process's memcpy/memset addresses (by symbol, from its ld.so and
+     exe) were served as host builtins in the game's code. Fix: per-process
+     state keyed by a `Process` id in `ftab::Shared` (shared with a forked
+     child until execve), `Translator::image`/`forget`. Regression test
+     `tests/fjit-procs/run.sh GEXC` (fails on the old gexc: "after probe: 6";
+     passes now). Explains: graphics-only (batch has one process),
+     worldmachine-only BAD (different glibc layout from Debian's), intermittent
+     on gooner (hk40), and the partial-range "stalls" are separate (not yet
+     looked at). Confirmation: gs13/gs14 (worldmachine glibc, full --fjit,
+     graphics) on the fixed gexc are running; then worldmachine itself (fjtry
+     with the new gexc).
+     hk46 (focus from frame 0): 5,797 PRESENTs, still no draw/shader, same log
+     as hk41: the intro does not advance; next on that.
 
