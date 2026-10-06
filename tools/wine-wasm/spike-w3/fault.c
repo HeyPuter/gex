@@ -15,7 +15,7 @@ __attribute__((import_module("gex"), import_name("fault_hook"))) void gex_fault_
 static uint32_t recover;    /* x86: mov eax, 7; ret */
 static unsigned last_code, last_pc;
 
-static void hook(int ctx, unsigned code, unsigned addr)
+static void hook(int ctx, unsigned code, unsigned addr, unsigned kind)
 {
     (void)addr;
     last_code = code;

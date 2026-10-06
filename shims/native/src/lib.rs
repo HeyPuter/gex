@@ -1153,6 +1153,17 @@ fn run_program_with(
     if nt_setup.is_none() {
         if wasmprog::flags(program) & wasmprog::FLAG_GUEST_I386 != 0 {
             store.data_mut().with_kernel(|k| k.mem.set_mmap_top(0x7ffe_0000));
+            // The NT layer's trampoline page, which native Wine's gexrt
+            // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
+            // wrappers): the same bytes at the same address.
+            use gex_kernel::nt::{TRAMPOLINES, TRAMPOLINES_END};
+            let page = gex_kernel::nt::boot::trampoline_page();
+            if let Some(dst) = memory.bytes().get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
+                dst.copy_from_slice(&page);
+            }
+            store.data_mut().with_kernel(|k| {
+                k.mem.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]")
+            });
         }
         wasmprog::install(&mut store, &memory, program)?;
     }
@@ -2915,6 +2926,25 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 check_i386_high(&caller, "an NT syscall");
                 return r;
             }
+            // gexrt's NATIVE_LEFT under Wine's own Unix side (W3), which
+            // has no NT layer to take it: as `nt::syscall_import` does, the
+            // innermost native call-out the guest has left is abandoned.
+            if pc as u64 & nt::NATIVE_SYSCALL != 0 {
+                if let Some(memory) = caller.data().memory.clone() {
+                    let ctx_addr = caller.data().thread.ctx_addr;
+                    let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
+                    if nr == gex_kernel::nt::gex_nr::NATIVE_LEFT {
+                        let target = read_u64(memory.bytes(), (ctx_addr + ctx::BALLAST as u64) as usize);
+                        let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize) & 0xffff_ffff;
+                        if innermost_native_unwound(&caller, sp) {
+                            let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::x(0) as u64, target);
+                            caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
+                            return Err(StopExecution.into());
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             // An ejected project's runtime allows only the recorded calls.
             if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
                 return stop;
@@ -3256,6 +3286,21 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 Ok(false) => {
                     if caller.data().nt.is_some() {
                         return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
+                    }
+                    // The process's own fault hook (Wine's ntdll.so, W3):
+                    // an access violation, executing (DEP).
+                    if std::env::var_os("GEX_W3_TRACE").is_some() {
+                        if let Some(memory) = caller.data().memory.clone() {
+                            let gm = GuestMem::new(memory.bytes());
+                            let base = caller.data().thread.ctx_addr;
+                            let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
+                            let esp = gm.read_u64(base + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff;
+                            let st: Vec<String> = (0..6).map(|i| format!("{:#x}", gm.read_u32(esp + 4 * i).unwrap_or(0))).collect();
+                            eprintln!("gex-w3: execute at {pc:#x} from block {src:#x}, esp {esp:#x} [{}]", st.join(" "));
+                        }
+                    }
+                    if deliver_guest_fault_kind(&mut caller, fault_code::ACCESS_VIOLATION, pc, pc, 8)? {
+                        return Err(StopExecution.into());
                     }
                     // Code an ejected project was built without: say so,
                     // rather than let it read as the guest's own crash.
@@ -4650,6 +4695,12 @@ pub(crate) mod fault_code {
 /// Returns false when there is none. On true, `resume_at` holds where the
 /// guest goes on.
 pub(crate) fn deliver_guest_fault(caller: &mut Caller<'_, HostState>, code: u32, pc: u64, addr: u64) -> Result<bool> {
+    deliver_guest_fault_kind(caller, code, pc, addr, 0)
+}
+
+/// [`deliver_guest_fault`] with an access violation's kind (Windows'
+/// ExceptionInformation[0]: 0 read, 1 write, 8 execute).
+pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code: u32, pc: u64, addr: u64, kind: u32) -> Result<bool> {
     let Some(hook) = fault_hook_of(caller.data()) else { return Ok(false) };
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = caller.data().thread.ctx_addr;
@@ -4658,8 +4709,28 @@ pub(crate) fn deliver_guest_fault(caller: &mut Caller<'_, HostState>, code: u32,
         let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
     }
     let f = crate::ftab::table_func(caller, hook)?;
-    let typed = f.typed::<(i32, i32, i32), ()>(&*caller).context("gex.fault_hook: the hook is not void(int, unsigned, unsigned)")?;
-    typed.call(&mut *caller, (ctx_addr as i32, code as i32, addr as u32 as i32))?;
+    let typed = f.typed::<(i32, i32, i32, i32), ()>(&*caller).context("gex.fault_hook: the hook is not void(int, unsigned, unsigned, unsigned)")?;
+    // The hook's C frames go below the guest's stack pointer, as a signal
+    // frame does: the shared shadow stack pointer may be wherever a native
+    // call from the guest last left it, above the live guest stack. The
+    // red zone leaves the hook room to build the guest's exception frame
+    // under that stack pointer (i386's is under a KiB).
+    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let saved = match &sp {
+        Some(g) if !gex_abi::mem64() => {
+            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let new = (cur.min(esp).saturating_sub(4096)) & !15;
+            g.set(&mut *caller, Val::I32(new as u32 as i32))?;
+            Some(cur)
+        }
+        _ => None,
+    };
+    let r = typed.call(&mut *caller, (ctx_addr as i32, code as i32, addr as u32 as i32, kind as i32));
+    if let (Some(g), Some(cur)) = (&sp, saved) {
+        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+    }
+    r?;
     let next = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
     caller.data_mut().resume_cause = Some(format!("guest fault {code:#x}"));
     caller.data_mut().resume_at = Some(next);
