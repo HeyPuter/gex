@@ -819,7 +819,7 @@ Not yet:
     `git diff` shows only new edits (how 0003 was made). Run `git -C
     scratch/unity/dnc/src reset -q` before build.sh's `src` step.
 - **Resume (after the 2026-10-05 evening reboot; HEAD 8bfbae51, master
-  e3917bac merged):**
+  e3917bac merged; parked 2026-10-05 ~20:55 at the commit that adds this note (after 8c98f89b); state in items 4-5 of the HK list below):**
   0. Gate head 8bfbae51 offered to the coordinator (the branch gate has
      never run on anything after d69c1cd6/3718d0ca). Extra legs that prove
      this stream's work, all checked green on 8bfbae51 on gooner:
@@ -877,3 +877,110 @@ Not yet:
      mistranslated function; range bisection cannot pin it. Next: repeat
      identical runs to measure the failure rate, then look at thread
      creation/fs-base and publication races in the function JIT.
+  4. **Parked for the reboot (2026-10-05 ~20:55; head below).** Results since 3:
+     - **Repeat runs (`scratch/unity/rep.sh PREFIX N SECS`, batch HK --fjit,
+       gooner glibc): r1 8/8 OK.** Batch mode does not show the corruption.
+     - **Arch glibc on gooner reproduces a crash deterministically, in
+       graphics mode only:** `GUEST_LIBS=scratch/unity/archlibs` (worldmachine's
+       glibc 2.44 + libstdc++/libgcc_s; muck-dotnet.sh relinks the launcher with
+       that ld.so as interpreter, 8c98f89b). Batch hkA1 OK; graphics hkA2, gs3,
+       gs4, gs5 all exit 139 during startup (before player.log, while ld.so
+       loads SDL's X11 libs). gs5 with `--verbose`: `guest terminated by
+       signal 11 at pc=0x21c6: branch to 0x21c6 ... last indirect target 0x21c6
+       from block 0x4a0bbfe` (block 0x4a0bbfe is in ld.so, low region:
+       `mov rax,[rbp-0x60]; mov [r15],rax; ... ret`: a return to 0x21c6, i.e. a
+       corrupted return address/stack, stack 0x7cc94224 (libmd), 0x4a113ef).
+       gs4 has a full `--strace` (`runs/gs4/out.txt`). **Next: this is the
+       repro to chase** (same run without --fjit to confirm it is the function
+       JIT; then GEX_FJIT_RANGE on ld.so 0x4a00000-0x4a40000 vs libmd/libbsd).
+       Pass `--verbose` always: guest-signal deaths are otherwise silent.
+     - Native gooner glibc graphics: hk40 stack smashing at startup (1 of ~8
+       graphics runs); gs1/gs2 (GEX_TRACE_SEGV) were still loading when stopped.
+  5. **HK black frames, findings:**
+     - **Focus:** without pointer focus Unity never presents (hk36/hk37: 0
+       PRESENT). hk41 (`GEX_WL_INPUT` moves into the window every 7 s,
+       `runs/hk40/input.txt`): 11,148 PRESENTs, but every frame black, no draw,
+       no shader, one CLEAR in the whole trace. Fix for the harness: a default
+       pointer-in-window input script in GFX mode (to do).
+     - **No camera renders because the game never leaves Pre_Menu_Intro:**
+       `GEXMONO_TRACE_SUBCLASS=NAME` (provider built into `scratch/unity/dnc2`,
+       uncommitted-to-dnc copy with symlinks) shows FindObjectOfType<UIManager>
+       testing only Pre_Menu_Intro objects (StartManager, LogoLanguage, ...)
+       long after "Unloading 153": Menu_Title (level1, holds _GameManager,
+       _GameCameras, _UIManager per UnityPy) is never activated. Decompiled
+       StartManager.Start (ilspycmd in the session scratchpad; reinstall with
+       `dotnet tool install --tool-path X ilspycmd`) waits for the Animator to
+       reach "LoadingIcon", then for PlayerPrefs; neither "Waiting for
+       PlayerPrefs" nor "Didn't need to wait" is logged, so it is stuck at the
+       animator wait (probably culled/never updated since no camera renders,
+       and in batch mode never). "Couldn't find a Game Manager" in
+       Pre_Menu_Intro is expected (no GameManager there).
+     - Controls: stock Unity Mono under gex (hkst3) stalled after physics init
+       (47 log lines, 1 h). Native HK on gooner segfaults in batch mode
+       (strcasecmp(NULL,"x11") in PlayerMain: no video driver; gex survives it
+       because address 0 is readable).
+     - Next: why the intro Animator/camera does nothing (check the Camera's
+       enabled state and Animator culling via the trace; try `-force-...` or
+       pointer focus from frame 0), then the default focus input.
+  6. **After the Claude Code restart (2026-10-05 ~21:00; gooner load 90-180,
+     so every graphics run takes 25+ min to reach Unity's log):**
+     - **The Arch-glibc graphics crash is the function JIT's:** gs6 (same as
+       gs5, no --fjit) gets past the point where every --fjit run died (78 log
+       lines, physics init, killed by its 1500 s timeout). gs7 (`GEX_FJIT_RANGE`
+       = Arch ld.so 0x4a00000-0x4a40000 only) neither crashed nor reached
+       Unity's log in 1500 s (the partial-range stall, now seen on gooner
+       too). gs8 (`GEX_FJIT_SKIP` = that ld.so range, everything else jitted)
+       is running, 2400 s. The faulting block (gs5) is the epilogue of Arch
+       ld.so's `_dl_lookup_symbol_x` (file offset 0xbbfe: `*ref = sym; lea
+       rsp,[rbp-0x28]; pop x6; ret`), which returned to 0x21c6: its saved
+       return address or rbp was overwritten. Next: if gs8 passes, dump that
+       function's translation (`GEX_FJIT_KEEP`/`GEX_FJIT_DUMP` with
+       `GEX_FJIT_RANGE` around 0x4a0b000-0x4a0c000) and give F the GIR.
+     - Pre_Menu_Intro's settings (UnityPy): cameras `Camera` and
+       `AspectBorders` enabled (clear flags 1, full viewport, display 0);
+       StartManager's Animator culling 0 (always animate), update mode 0
+       (scaled time). So no culling explains it: either the player loop runs
+       very few frames (11 FindObjectOfType<UIManager> in ~20 min) or time
+       does not advance. hk46 (pointer in the window from the first frame,
+       `runs/hk46/input.txt`, GL capture, 3600 s) is running.
+  7. **Root cause found for the --fjit corruption (763fc74c):** the function
+     JIT's learned state (builtins by address, function starts, noreturn,
+     translated entries) was global to the host process, and the native
+     runner hosts the whole guest process tree (sh, Xwayland, xkbcomp, the
+     game) with one translator. Builtins were replaced on every execve, so
+     another process's memcpy/memset addresses (by symbol, from its ld.so and
+     exe) were served as host builtins in the game's code. Fix: per-process
+     state keyed by a `Process` id in `ftab::Shared` (shared with a forked
+     child until execve), `Translator::image`/`forget`. Regression test
+     `tests/fjit-procs/run.sh GEXC` (fails on the old gexc: "after probe: 6";
+     passes now). Explains: graphics-only (batch has one process),
+     worldmachine-only BAD (different glibc layout from Debian's), intermittent
+     on gooner (hk40), and the partial-range "stalls" are separate (not yet
+     looked at). **Confirmed on worldmachine:** b14 (fjtry, full --fjit,
+     graphics, the fixed gexc) GOOD (reached "Unloading 5"), where hkw1, hkw2
+     and b12 were BAD with the old one. gs13/gs14 on gooner (worldmachine
+     glibc) were still loading under load ~160 when this was written.
+     hk46 (focus from frame 0): 5,797 PRESENTs, still no draw/shader, same log
+     as hk41: the intro does not advance; next on that.
+  8. **Checks on the fixed gexc (gooner, 2026-10-05 late):** x86-programs
+     72/72, glibc 2/2, tests/nt 81/81 with `--no-cgen` and 81/81 with cgen
+     prefix units; gs13/gs14 (worldmachine glibc, full --fjit, graphics) ran to
+     their 3000 s timeout in the first scene with no crash (4 of 4 crashed
+     before the fix).
+  9. **HK intro, why it does not advance: it is waiting for the language
+     choice.** `tools/unity-dotnet/probe/build.sh DATA_DIR OVERLAY` builds a
+     diagnostic assembly that Unity runs through RuntimeInitializeOnLoads.json,
+     and `muck-dotnet.sh OVERLAY=` (with UNITY_RELAUNCH) puts it in the run's
+     copy of the game. Run hk48 (batch): game time advances normally (time
+     scale 1, ~30 frames/s of game time, `Time.time` tracks real time),
+     first-chance exceptions are reported (the probe's self-test shows) and
+     none other is thrown, so nothing is swallowed. StartManager:
+     `CheckIsLanguageSet() = False`, `Platform.Current.ShowLanguageSelect =
+     True`, `confirmedLanguage = False`, Animator parameters all false: a fresh
+     HOME has no language saved, so the first-run language select waits for a
+     confirmation. Not a gex bug. Next: seed the language (Unity PlayerPrefs in
+     the run's HOME, or scripted input on the language screen), then the
+     graphics question that remains: with focus, Unity presents but draws
+     nothing, although both intro cameras are enabled and active (probe:
+     `Camera`, `AspectBorders`, 640x480).
+

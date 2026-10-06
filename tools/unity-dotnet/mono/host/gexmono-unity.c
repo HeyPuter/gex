@@ -130,6 +130,23 @@ U(mono_class_get_field_from_name)
 	RET (f);
 }
 
+/* mono_class_is_subclass_of (klass, klassc, check_interfaces). GEXMONO_TRACE_SUBCLASS=NAME logs
+ * every test against a class called NAME (Unity's FindObjectOfType walks every object this way) with
+ * both classes' images, so a type loaded twice (two MonoClass for one name) shows. */
+U(mono_class_is_subclass_of)
+{
+	ENTER;
+	MonoClass *k = P (0), *c = P (1);
+	gboolean r = mono_class_is_subclass_of (k, c, (gboolean)A (2));
+	static const char *want; static int init;
+	if (!init) { want = getenv ("GEXMONO_TRACE_SUBCLASS"); init = 1; }
+	if (want && k && c && (!strcmp (m_class_get_name (c), want) || !strcmp (m_class_get_name (k), want)))
+		fprintf (stderr, "[gexmono] subclass %s.%s (%p, image %p %s) of %s.%s (%p, image %p %s) = %d\n",
+			m_class_get_name_space (k), m_class_get_name (k), k, m_class_get_image (k), m_class_get_image (k)->name,
+			m_class_get_name_space (c), m_class_get_name (c), c, m_class_get_image (c), m_class_get_image (c)->name, r);
+	RET (r);
+}
+
 /* mono_custom_attrs_from_field (klass, field): Mono finds the field's
  * metadata row from its index in klass's field array, so klass must be the
  * class that defines the field. UnityPlayer's serializer passes the class it
@@ -473,6 +490,6 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
 	L(mono_trace_set_log_handler) L(mono_dllmap_insert) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
-	L(mono_class_get_field_from_name) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
+	L(mono_class_get_field_from_name) L(mono_class_is_subclass_of) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0
 };
