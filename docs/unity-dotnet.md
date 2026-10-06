@@ -983,4 +983,86 @@ Not yet:
      graphics question that remains: with focus, Unity presents but draws
      nothing, although both intro cameras are enabled and active (probe:
      `Camera`, `AspectBorders`, 640x480).
+  10. **After the language screen (2026-10-06, runs hk49-hk65; dnc2 provider):**
+     - **Seed:** `HOME_SEED=tests/games/seeds/hollow-knight` (muck-dotnet.sh)
+       puts Unity PlayerPrefs with GameLangSet=1 in the run's HOME, in both
+       `unity3d/Team Cherry/Hollow Knight/prefs` and `unity3d/unknown/unknown/
+       prefs` (graphics start-up opens the latter before it knows the
+       product). The language select is skipped; the intro animator reaches
+       LoadingIcon.
+     - **Liveness was stubbed:** `mono_unity_liveness_*` reported nothing, so
+       Unity's UnloadUnusedAssets unloaded every asset only managed code held:
+       StartManager's `loadSpinnerPrefab` came back destroyed and
+       `Instantiate` threw ArgumentNullException, ending the intro coroutine.
+       Implemented (gexmono-unity.c): a walk over reference fields, arrays and
+       value-type fields from each root and from all loaded classes' statics,
+       reporting objects of Unity's filter class in batches, each object once
+       per pass across Unity's 24 states; `mono_unity_stop_gc_world` holds the
+       sgen GC lock. HK now unloads 82 assets instead of 153 and keeps the
+       prefab, **but then faults** in `UnityEngine.Object::Internal_CloneSingle_
+       Injected` (Instantiate of the spinner): a Unity native function reads a
+       wild pointer (GEX_TRACE_SEGV dump, named frames with GEX_CGEN_NAMES=1:
+       f_7e69d820 icall -> f_7ea6bd90 -> f_7ea6a590). Just before it, Unity
+       iterates one class's methods 182k times (mono_class_get_methods +
+       mono_method_signature, no other API calls): the serializer creating a
+       [Serializable] field's objects. Not the GC lock (GEXMONO_LV_NOLOCK=1
+       crashes too); with GEXMONO_LV_OFF=1 (walk, no reports) no crash. Next:
+       which class, and whether Unity reads MonoMethod/MonoMethodSignature
+       fields directly at Unity-Mono offsets there.
+     - **Focus:** `tests/games/xfocus.c` (muck-dotnet.sh builds it and
+       xwayland-inguest.sh runs it unless NOFOCUS=1) gives the largest top-level
+       window the X input focus: Application.isFocused becomes True.
+     - **Cameras never render on their own:** probe `prerender 0` for the
+       whole run while Unity presents ~30/s; `GEXPROBE_RENDER=1` (Camera.Render
+       by hand) works (prerender 1). The probe shows `Display.main` with
+       rendering and system size 0x0 (Screen is 800x600): Unity's display list
+       was built while SDL video was not initialized ("Error getting num native
+       displays: Video subsystem has not been initialized", "Desktop is 0 x 0").
+       The in-guest Xwayland has RandR (1 output, 1 monitor 800x600) and
+       Xinerama (scratchpad xinfo test), and SDL's X libraries load and connect.
+       SDL_VIDEODRIVER=x11 / XDG_SESSION_TYPE=x11 change nothing. Next: why
+       SDL video is not up when Unity first asks (strace in runs/hk65).
+  11. **SDL video fixed (e50a8cb5):** the strace (hk65) shows SDL_Init
+     (timer|video|joystick|haptic|gamecontroller) failing on libudev's monitor:
+     `socket(AF_NETLINK, ..., NETLINK_KOBJECT_UEVENT)` = EAFNOSUPPORT, after
+     which SDL undoes video too. gex-kernel now gives an inert netlink socket
+     (an empty eventfd). Unity then logs "The selected window backend is x11",
+     `Display.main` is 800x600, and the cameras render (hk69: 18,518
+     pre-renders, glDrawElementsBaseVertex with textures every frame). Frames
+     still look black because, with GEXMONO_LV_OFF=1 (needed to avoid the crash
+     below), the spinner is gone and the intro stays at LoadingIcon, where
+     every element is faded out (vertex alpha 0 in the trace).
+  12. **The Instantiate crash (liveness on), what is known:** it is not the
+     function JIT (hk68, tier-1 only, crashes too). It is not the GC lock. It
+     moves: Internal_CloneSingle (hk60/hk61), then after FsmState creation and
+     its method scan (hk70), then during field deserialization (hk71), or at
+     the first frame (hk72): memory corruption, not one bad read. With
+     `MONO_GC_DEBUG=disable-major` (hk73) it fails differently: "Unable to find
+     method BeginRenderExtraOverlays in [UnityEngine.UIModule.dll]
+     UnityEngine.Canvas", then an assertion in class.c:2272 (`type` NULL).
+     The serializer creates PlayMaker objects (Fsm, FsmState, FsmString x4096,
+     List<T> x8192, TMP_Glyph x8192: GEXMONO_TRACE_METHODS=1 lists classes it
+     scans, =2 every method with its signature) and stores managed references
+     into its own native buffers with mono_gc_wbarrier_set_field(NULL, ...).
+     Leads: references held only in Unity's native heap (invisible to sgen),
+     and Unity writing managed objects through Unity-Mono assumptions. Next:
+     MONO_GC_DEBUG=verify-before-collections / check-at-minor style heap
+     checks, and the class.c:2272 caller.
+  13. **Gate head 55c3197f (2026-10-06):** liveness walk opt-in
+     (`GEXMONO_LIVENESS=1`; off = the old stubs), netlink socket, F's notes,
+     HOME_SEED/OVERLAY/xfocus/probe tooling. Legs on it with `scratch/unity/dnc`
+     rebuilt from it: embed PASS, prov64 PASS, fjit-procs ok/ok, Muck batch
+     --fjit reaches "Initializing packets", HK batch reaches "Unloading 153" and
+     its first scene's scripts.
+     **The crash with liveness on, more:** tier-1 block names (GEX_PERFMAP=1 +
+     GEX_WASM_BACKTRACE=1) put the fault in `UnityEngine.Object::GetName_Injected`
+     -> UnityPlayer 0x14ed6e0 (`Object::GetName`): `[this+0x20]` is taken as an
+     object with a vtable. `this` (0x1e009f510) has the vtable of
+     `13MonoBehaviour` (typeinfo via the R_X86_64_RELATIVE at vtable-8); +0x20 of
+     a Component is its GameObject pointer, and here it holds 0x1103ed2e0, an
+     address in the provider's/Mono's region, while other objects of the class
+     have 0 there and their name inline at +0x38 (GEX_TRACE_SEGV=2 dumps the
+     words at each register). Next: what 0x1103ed2e0 is (MonoDomain?) and who
+     writes it into a native MonoBehaviour during Instantiate (watchpoint on
+     that word: GEX_WATCH).
 
