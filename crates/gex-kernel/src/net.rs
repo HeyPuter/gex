@@ -293,6 +293,26 @@ fn tcp_name(port: u16) -> String {
     format!("\0gex-tcp:{port}")
 }
 
+/// The global kernel's name for a UDP port. The global kernel has only
+/// streams, so datagrams between a page's processes travel framed over one
+/// stream per (sender, port): a 4-byte length and a 2-byte source port
+/// (little-endian), then the bytes.
+fn udp_name(port: u16) -> String {
+    format!("\0gex-udp:{port}")
+}
+
+/// A UDP socket's side of the global kernel (`Socket::udp_remote`).
+#[derive(Debug, Default)]
+struct UdpRemote {
+    /// The listener its port is bound as.
+    listener: Option<i32>,
+    /// Accepted streams from senders, each with the bytes read from it that
+    /// do not yet make a whole datagram.
+    inbound: Vec<(i32, Vec<u8>)>,
+    /// Streams to the ports this socket has sent to.
+    outbound: HashMap<u16, i32>,
+}
+
 /// The TCP ports guests on this machine listen on. Shared across `fork`, as
 /// the resolver is: a child connects to its parent's listener.
 #[derive(Debug, Default)]
@@ -388,6 +408,8 @@ pub struct Socket {
     remote: Option<crate::unix::Remote>,
     /// A listener's id in the global kernel.
     remote_listener: Mutex<Option<i32>>,
+    /// A UDP socket's streams in the global kernel.
+    udp_remote: Mutex<UdpRemote>,
 }
 
 impl Socket {
@@ -407,6 +429,7 @@ impl Socket {
             backlog: Mutex::new(None),
             remote,
             remote_listener: Mutex::new(None),
+            udp_remote: Mutex::new(UdpRemote::default()),
         }
     }
 
@@ -423,6 +446,27 @@ impl Socket {
     /// Give this UDP socket a port (`bind`, or the first send unbound),
     /// registered so guests here can send to it.
     fn udp_take(&self, addr: u32, mut port: u16) -> Result<(), Errno> {
+        // In a page: the port is a name in the global kernel, where every
+        // process sees it.
+        if let Some(r) = self.remote {
+            let fixed = port != 0;
+            for _ in 0..1000 {
+                if !fixed {
+                    port = self.ports.udp_ephemeral();
+                }
+                let n = udp_name(port);
+                let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32);
+                if id >= 0 {
+                    self.udp_remote.lock().unwrap().listener = Some(id);
+                    *self.local.lock().unwrap() = Some((addr, port));
+                    return Ok(());
+                }
+                if fixed || -id != Errno::EADDRINUSE.0 {
+                    return Err(Errno(-id));
+                }
+            }
+            return Err(Errno::EADDRINUSE);
+        }
         let mut udp = self.ports.udp.lock().unwrap();
         if port == 0 {
             drop(udp);
@@ -631,6 +675,34 @@ impl Socket {
     /// else to the resolver, which answers it and queues the reply.
     pub fn send_dgram(&self, data: &[u8]) -> SysResult {
         let to = self.peer();
+        if let (Some((_, port)), Some(r)) = (to.filter(|&(a, _)| is_local(a)), self.remote) {
+            if self.local.lock().unwrap().is_none() {
+                self.udp_take(0, 0)?;
+            }
+            if let Some(id) = self.udp_stream_to(r, port) {
+                let mut frame = Vec::with_capacity(6 + data.len());
+                frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&self.local().1.to_le_bytes());
+                frame.extend_from_slice(data);
+                let mut at = 0;
+                // A stream's buffer is far larger than a datagram; a full one
+                // (a receiver that stopped reading) drops it, as UDP may.
+                for _ in 0..64 {
+                    match (r.write)(id, frame[at..].as_ptr() as crate::PAddr, (frame.len() - at) as u32) {
+                        n if n > 0 => at += n as usize,
+                        _ => {}
+                    }
+                    if at == frame.len() {
+                        break;
+                    }
+                }
+                return Ok(data.len() as u64);
+            }
+            // Nothing bound there in any process: lost, as UDP is.
+            if answer_dns(data, &self.resolver).is_none() {
+                return Ok(data.len() as u64);
+            }
+        }
         if let Some((addr, port)) = to.filter(|&(a, _)| is_local(a)) {
             if let Some(dest) = self.ports.udp_at(port) {
                 if self.local.lock().unwrap().is_none() {
@@ -654,7 +726,66 @@ impl Socket {
         }
     }
 
+    /// The stream to UDP port `port` in the global kernel, opened once.
+    fn udp_stream_to(&self, r: crate::unix::Remote, port: u16) -> Option<i32> {
+        let mut u = self.udp_remote.lock().unwrap();
+        if let Some(&id) = u.outbound.get(&port) {
+            return Some(id);
+        }
+        let n = udp_name(port);
+        let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32);
+        (id >= 0).then(|| {
+            u.outbound.insert(port, id);
+            id
+        })
+    }
+
+    /// Take what senders in other processes wrote: accept new streams, read
+    /// each, and queue every whole datagram.
+    fn udp_pump(&self) {
+        let Some(r) = self.remote else { return };
+        let mut u = self.udp_remote.lock().unwrap();
+        let Some(l) = u.listener else { return };
+        while (r.pending)(l) != 0 {
+            let id = (r.accept)(l);
+            if id < 0 {
+                break;
+            }
+            u.inbound.push((id, Vec::new()));
+        }
+        let mut q = self.dgrams.lock().unwrap();
+        let mut chunk = [0u8; 4096];
+        let mut gone = Vec::new();
+        for (id, buf) in u.inbound.iter_mut() {
+            while (r.readable)(*id) != 0 {
+                let n = (r.read)(*id, chunk.as_mut_ptr() as crate::PAddr, chunk.len() as u32);
+                if n == 0 {
+                    // The sender closed (its socket or its process went).
+                    gone.push(*id);
+                }
+                if n <= 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n as usize]);
+            }
+            while buf.len() >= 6 {
+                let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if buf.len() < 6 + len {
+                    break;
+                }
+                let from = u16::from_le_bytes([buf[4], buf[5]]);
+                q.push_back((buf[6..6 + len].to_vec(), (0x7f00_0001, from)));
+                buf.drain(..6 + len);
+            }
+        }
+        for id in gone {
+            (r.close)(id);
+            u.inbound.retain(|(i, _)| *i != id);
+        }
+    }
+
     pub fn recv_dgram(&self, buf: &mut [u8]) -> SysResult {
+        self.udp_pump();
         match self.dgrams.lock().unwrap().pop_front() {
             Some((d, from)) => {
                 let n = buf.len().min(d.len());
@@ -731,6 +862,7 @@ impl FileHandle for Socket {
     /// to size its buffer.
     fn available(&self) -> Option<u64> {
         if self.kind == Kind::Udp {
+            self.udp_pump();
             return Some(
                 self.dgrams
                     .lock()
@@ -750,6 +882,7 @@ impl FileHandle for Socket {
 
     fn poll_readable(&self) -> bool {
         if self.kind == Kind::Udp {
+            self.udp_pump();
             return !self.dgrams.lock().unwrap().is_empty();
         }
         // A listener is readable when a connection waits.
@@ -791,6 +924,14 @@ impl Drop for Socket {
         }
         if let (Some(id), Some(r)) = (self.remote_listener.lock().unwrap().take(), self.remote) {
             (r.close)(id);
+        }
+        // A UDP socket's streams in the global kernel close (its name goes
+        // with the listener).
+        if let Some(r) = self.remote {
+            let u = std::mem::take(&mut *self.udp_remote.lock().unwrap());
+            for id in u.listener.into_iter().chain(u.inbound.into_iter().map(|(i, _)| i)).chain(u.outbound.into_values()) {
+                (r.close)(id);
+            }
         }
         // A UDP socket gives its port back.
         if self.kind == Kind::Udp {
