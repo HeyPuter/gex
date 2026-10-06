@@ -1242,7 +1242,10 @@ Heads:
 - After gate2 (dev only, next landing): f9c5a9ec TCP between a page's
   processes (listeners/loopback streams in the global kernel; abstract
   names freed on close).
-- Open: UDP listeners; AF_INET sockets in a page without a network stack
+- Also dev only: cb1431d0 UDP between guests (natively and within one
+  page process) and a blocking recvfrom that waits (it answered EAGAIN).
+- Open: UDP between a page's processes (the global kernel has only
+  streams); AF_INET sockets in a page without a network stack
   (EAFNOSUPPORT, so loopback TCP needs GEX_NETWORK there); libm sin/cos
   (needs glibc's own bits); a paired page run of the providers on edger
   (E holds the lock).
