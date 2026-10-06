@@ -340,6 +340,19 @@ fn trace_blocks() -> bool {
         || *ON.get_or_init(|| std::env::var_os("GEX_TRACE_BLOCKS").is_some())
 }
 
+/// `GEX_TRACE_RANGE=LO-HI` (hex): trace every block starting in the range
+/// (its translation, and each execution through `BRK_TRACE`).
+fn in_trace_range(pc: u64) -> bool {
+    static R: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let r = R.get_or_init(|| {
+        let v = std::env::var("GEX_TRACE_RANGE").ok()?;
+        let (a, b) = v.split_once('-')?;
+        let h = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        Some((h(a)?, h(b)?))
+    });
+    r.is_some_and(|(a, b)| pc >= a && pc < b)
+}
+
 fn trap_pc() -> u64 {
     static ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let e = *ENV.get_or_init(|| {
@@ -392,8 +405,18 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if is_trap_pc(block.start) {
         e.emit_trap_pc(block.start);
     }
-    if trace_blocks() {
+    if trace_blocks() || in_trace_range(block.start) {
         e.emit_trace_point(block.start);
+    }
+    if in_trace_range(block.start) {
+        eprintln!(
+            "[t1] translate {:#x}..{:#x} guard {} term {:?} bytes {}",
+            block.start,
+            block.end,
+            block.guard.as_ref().map_or(0, |g| g.len()),
+            block.term,
+            block.guard.as_ref().map_or(String::new(), |g| g.iter().take(64).map(|b| format!("{b:02x}")).collect::<String>())
+        );
     }
     if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
         e.emit_target_check(block.start);
@@ -431,8 +454,18 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     if is_trap_pc(block.start) {
         e.emit_trap_pc(block.start);
     }
-    if trace_blocks() {
+    if trace_blocks() || in_trace_range(block.start) {
         e.emit_trace_point(block.start);
+    }
+    if in_trace_range(block.start) {
+        eprintln!(
+            "[t1] translate {:#x}..{:#x} guard {} term {:?} bytes {}",
+            block.start,
+            block.end,
+            block.guard.as_ref().map_or(0, |g| g.len()),
+            block.term,
+            block.guard.as_ref().map_or(String::new(), |g| g.iter().take(64).map(|b| format!("{b:02x}")).collect::<String>())
+        );
     }
     if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
         e.emit_target_check(block.start);
