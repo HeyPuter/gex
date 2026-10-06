@@ -978,7 +978,11 @@ pub(crate) fn note_web_entry(pc: u64) {
     }
     static SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
     if lock(&SEEN).get_or_insert_with(Default::default).insert(pc) {
-        crate::warn_line(&format!("gex-nt: web entry {pc:#x}\n"));
+        // Through the guest's stderr, which run.mjs reads: a Worker's console
+        // output under Node reaches the parent only when the Worker's event
+        // loop turns, and a run that never yields loses it at the end.
+        let line = format!("gex-nt: web entry {pc:#x}\n");
+        unsafe { crate::write_stderr(&line) };
     }
 }
 
@@ -1152,6 +1156,13 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
         }
         Some(f.idx)
     });
+    // An ejected project's training run (`run.mjs --record-entries`): an
+    // address of a unit image no function holds, reached through the
+    // table (a return a nested dispatch rewrote, say), is a region entry
+    // the web build needs as much as a tier-1 dispatch miss is.
+    if hit.is_none() {
+        note_web_entry(addr);
+    }
     // Nothing serves it: the function JIT makes it, if it is on.
     let hit = hit.or_else(|| crate::fjit::translate(addr));
     let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);

@@ -10702,6 +10702,12 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
+    // An ejected project's training run: a pc of a unit image no function
+    // holds is a web entry, whether the function JIT (below) or tier-1 then
+    // runs it (the AOT-only run would stop here).
+    if !cgen::knows(pc) {
+        crate::cgen::note_web_entry(pc);
+    }
     // A function serves it, or the function JIT makes one: tier-1 reaches
     // it through the bridge once this Worker has installed it.
     if fjit::serve(pc) {
@@ -10868,12 +10874,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // here, saying so, rather than being lifted.
     if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
         with_host(|h| {
-            warn_line(&format!(
+            let stop = format!(
                 "gex-eject: code at {pc:#x} ({}) was not translated when this project was built: \
                  the recorded session never reached it. Record a session that reaches it and \
                  re-eject, or build with the JIT fallback\n",
                 object_off_at(h, pc)
-            ));
+            );
+            warn_line(&stop);
+            // And on the guest's stderr: under Node a Worker's console output
+            // can be lost when the run ends here.
+            unsafe { write_stderr(&stop) };
             // A resume after the C nest unwound (a blocking call's
             // continuation) needs region entries for every frame still on
             // the guest stack, not only this one: name the likely ones
@@ -10903,6 +10913,26 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             // In lines of 16: a page's console logger may cut long lines.
             warn_line(&format!("gex-eject: {} return addresses on the stack from esp {sp:#x} (web entry candidates):\n", list.len()));
             for chunk in list.chunks(16) {
+                warn_line(&format!("gex-eject:   {}\n", chunk.join(" ")));
+            }
+            // The frame-pointer chain: the frames really live (MSVC and
+            // Wine code keep EBP frames), unlike stale stack words. A frame
+            // without EBP is skipped over, not named; the scan above has it.
+            let mut ebp = gm.read_u64(h.threads[cur()].kstate.ctx_addr + ctx::x(5) as u64).unwrap_or(0) & 0xffff_ffff;
+            let mut chain = Vec::new();
+            for _ in 0..256 {
+                if ebp < sp || ebp & 3 != 0 || ebp - sp > 8 << 20 {
+                    break;
+                }
+                let (Ok(next), Ok(ra)) = (gm.read_u32(ebp), gm.read_u32(ebp + 4)) else { break };
+                chain.push(format!("{:#x} ({})", ra, object_off_at(h, ra as u64)));
+                if (next as u64) <= ebp {
+                    break;
+                }
+                ebp = next as u64;
+            }
+            warn_line(&format!("gex-eject: {} frames on the EBP chain (live web entry candidates):\n", chain.len()));
+            for chunk in chain.chunks(16) {
                 warn_line(&format!("gex-eject:   {}\n", chunk.join(" ")));
             }
             set_exit(h, 128 + 11);
