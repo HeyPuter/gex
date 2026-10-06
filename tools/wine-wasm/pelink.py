@@ -25,6 +25,7 @@ import tempfile
 
 here = os.path.dirname(os.path.realpath(__file__))
 EAGER = {}  # module -> the DLLs to load before it (pelink's main)
+SRC = None  # the Wine source tree (pelink's main)
 
 
 def enc_leb(v):
@@ -49,6 +50,22 @@ def makefile_var(path, var):
         return []
     m = re.search(rf'^{var}\s*=(.*)$', text, re.M)
     return m.group(1).split() if m else []
+
+
+def spec_stdcalls(spec):
+    """The names a .spec exports as stdcall."""
+    out = set()
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        parts = line.split('#', 1)[0].split()
+        if len(parts) >= 3 and parts[1] == 'stdcall':
+            rest = [t for t in parts[2:] if not t.startswith('-')]
+            if rest:
+                out.add(rest[0].split('(', 1)[0])
+    return out
 
 
 def spec_functions(spec):
@@ -89,6 +106,8 @@ def main():
                 sys.exit(f'unknown argument {args[i]}')
         return link(dlls, out, gexrt)
     build, src, out = sys.argv[1:4]
+    global SRC
+    SRC = src
     only = set(sys.argv[4:])
     dlls = []  # (dll file name, r.o, exports, imports)
     for top in ('dlls', 'programs'):
@@ -311,16 +330,31 @@ def link(dlls, out, gexrt, others=None):
                 own = lambda n: next((d for d in ('kernelbase.dll', 'kernel32.dll') if d in exporters.get(n, [])), 'kernel32.dll')
                 f.write(f'void *gexw_LoadLibraryA(const char *) __asm__("{own("LoadLibraryA")}!LoadLibraryA");\n')
                 f.write(f'void *gexw_GetProcAddress(void *, const char *) __asm__("{own("GetProcAddress")}!GetProcAddress");\n')
+                stdcalls = {}
                 for k, (n, sig, owner) in enumerate(stubs):
+                    if owner not in stdcalls:
+                        base = owner.rsplit('.', 1)[0]
+                        stdcalls[owner] = spec_stdcalls(os.path.join(SRC or '', 'dlls', base, base + '.spec')) if SRC else set()
+                    # a stdcall entry thunk (callee pops) for i386 callers
+                    # of the stub's table index (below)
+                    attr = '__attribute__((annotate("gex.stdcall"))) ' if n in stdcalls[owner] else ''
                     r, ps = sig.split(':')
                     params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
                     types = ', '.join(ctype[c] for c in ps) or 'void'
                     args = ', '.join(f'a{i}' for i in range(len(ps)))
-                    f.write(f'{ctype[r]} g{k}({params}) __asm__("{n}");\n')
-                    f.write(f'{ctype[r]} g{k}({params}) {{\n'
+                    f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{n}");\n')
+                    f.write(f'{attr}{ctype[r]} g{k}({params}) {{\n'
                             f'    static void *p;\n'
                             f'    if (!p) p = gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}");\n'
                             f'    {"" if r == "v" else "return "}(({ctype[r]} (*)({types}))p)({args});\n}}\n')
+                # Their addresses taken, so the ICALL pass gives each an entry
+                # thunk: a native module may hand one to i386 code as a
+                # function pointer (services.exe's RPC dispatch table holds
+                # rpcrt4's NdrServerCall2), which then calls its table index.
+                f.write('void *const __gexw_guestimport_refs[] __attribute__((used)) = {\n')
+                for k in range(len(stubs)):
+                    f.write(f'    (void *)g{k},\n')
+                f.write('};\n')
             obj = os.path.join(tmp, 'guestimports.o')
             subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-D_WIN32', '-c', '-o', obj, src])
             objs.append(obj)
