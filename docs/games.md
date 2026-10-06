@@ -561,6 +561,19 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
   - `--fjit` with GEX_FJIT_CACHE=1 caches Cranelift's output only; the
     analysis and wasm emission still run in every process. No tier-share
     line: Baba never exits on its own, and the counts print at exit.
+- Retrocycles in the page on edger's GPU (2026-10-06, one correctness run,
+  no timing): first frame, the input script, past present 6000 (gameplay)
+  and on to the script's arrow keys. The compositor's `lit` readback of
+  its own output changed with each scene (3,127 to 104,775 sampled pixels),
+  so the page drew the game; the harness's screenshots stayed black on the
+  real GPU (Chrome's screenshot misses the WebGPU canvas there; on gooner's
+  SwiftShader the same screenshots show the game). A readback-based
+  screenshot in browser-linux.mjs would fix the pictures.
+- Process start under native gexc: the module cache already covers runtime
+  translations (a second run of `sh -c cat` adds no entries), so wasmtime's
+  own cache would add nothing. Within one run, though, each new process's
+  translations come out as different wasm and miss: about 60 identical
+  short processes (scratch/G/hang/loop20.sh) left 1,008 new entries.
 - Earlier, the page (browser-linux.mjs; own ports 5291/9431): Retrocycles' GL
   frames were attached to SDL 1.2's child window, which no compositor
   window has; they now name its top-level window. The run still shows
