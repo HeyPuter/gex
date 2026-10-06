@@ -1011,6 +1011,52 @@ unixlib ran through the dlopen registry (§3.12).
     Windows does; the test (and the NT layer) expects WoW64 on x86-64;
   - win32u's Unix side (W3.3): user_win, gdi, input, display, gl*.
 
+**W3.2 progress (2026-10-06, native DLL dependencies, wineboot):**
+- **A native module's imports are loaded:** pelink writes each module's
+  load-time imports (Makefile IMPORTS plus makedep's default C runtime,
+  kernel32, ntdll) into `__gexw_module_imports`, and Wine's PE loader on
+  wasm32 loads those before a skeleton without an import table, as an
+  import table's would be (fork: ntdll/loader.c fixup_imports).
+- **Programs in the one module:** winegcc leaves a program's r.o and
+  export list, winebuild's entry adapter calls `mainCRTStartup(void)`,
+  gexrt defines the CRT table markers (`__xi_a`..), and crt_main calls
+  clang's `__main_argc_argv`/`__original_main` (a 3-parameter `main`
+  call trapped). `$W/relink-prog-w3.sh` relinks a program with the W3 host
+  tools (`$W/wine-tools-w3`); `W3_PROGRAMS="wineboot.exe services.exe
+  plugplay.exe conhost.exe winedevice.exe" $W/stage-w3.sh` stages them.
+- **Child processes by clone:** fork() is asyncify's unwind and rewind of
+  the whole wasm stack, which cannot cross gex's frames and the PE module
+  under a system call (the forking process went on half rewound, its next
+  indirect call trapping). spawn_process, fork_and_exec and
+  `__wine_unix_spawnvp` start children with `clone(CLONE_VFORK)` and exec.
+- **Unix calls:** wasm callers go straight to the native dispatcher
+  (gexrt recognises the trampoline address; `gex.unix_dispatcher` op 4/5),
+  i386 callers through the trampoline; stateful installs (the program,
+  the PE module) are providers, so relocating a skeleton or an mprotect
+  over it retires nothing.
+- **Threads:** RtlCreateUserThread wraps a native void entry (the
+  threadpool's), since every entry is called as LPTHREAD_START_ROUTINE.
+- **Registry:** the in-process wineserver saves the registry when the
+  process exits (exit_process asks it to flush; its periodic save never
+  came). `system.reg` and `user.reg` are written.
+- **pelink:** i386 owners from a .spec when a DLL's wasm32 build failed
+  (rpcrt4: wineboot's UuidCreate was an undefined, trapping function);
+  guest-import stubs get entry thunks (stdcall by the owner's .spec), as a
+  native module may hand one to i386 code (services' RPC dispatch table
+  holds rpcrt4's NdrServerCall2); the ICALL pass's annotation sections
+  are stripped before the final link (wasm-ld 22 crashed on services.exe
+  and plugplay.exe).
+- **Where it stands:** wineboot runs, starts services.exe and rundll32
+  (setupapi's wine.inf install), and the first RPC from the install to
+  services.exe faults in the server (ERROR_NOACCESS: an access violation
+  under rpcrt4's dispatch into services' server routine); the install
+  does not finish, so the registry has only what wineboot writes itself
+  and every start waits out the boot event (5 minutes). Next: that
+  dispatch (i386 rpcrt4 calling native server routines through MIDL's
+  tables), then the full wine.inf install and the registry it writes.
+  The suite's prefix stays without the native programs until then
+  (`$W/w3-nt5.log`: 29 of 40, no change).
+
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
 
@@ -1504,8 +1550,9 @@ Heads:
   `$W/build-w32-w3.sh [targets]`, sr-slim read only; loader link
   `$W/link-w3.sh`, prefix and dll dir `$W/stage-w3.sh`). hello_args.exe
   runs on Wine's own Unix side, wineserver in process; tests/nt i386 29
-  of 40 (§4.0, W3.1 progress; `$W/w3-nt4.log`). Next: W3.2, a native
-  module's imports (then wineboot and the registry). The old merge/elf-prov-gate is deleted. To
+  of 40 (§4.0, W3.1 progress; `$W/w3-nt4.log`). W3.2 in progress
+  (§4.0): native modules' imports load, wineboot runs and starts
+  services.exe; the wine.inf install's first RPC to services faults. The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
