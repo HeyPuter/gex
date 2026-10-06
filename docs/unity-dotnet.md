@@ -1110,4 +1110,27 @@ Not yet:
      managed fields (GEX_WATCH on the field inside the StartManager wrapper)
      during MarkObjects, and what its serialization command list for
      StartManager contains (the field's offset as Unity cached it).
+  16. **The serialized-field hypothesis is dead; the question is Unity's flag
+     0x2 (2026-10-06):** Unity's GC does not read a MonoBehaviour's managed
+     fields itself. Its per-object dependency step (UnityPlayer 0x12f3130,
+     a switch on the object's type) does, for a MonoBehaviour (case at
+     0x12f33b0): if the object's mapping entry has flag 0x2, mark its
+     GameObject (`[this+0x20]`, by instance ID); mark its script; then call
+     `mono_unity_liveness_calculation_from_root` (slot 0x263c8d0) on the
+     MonoBehaviour's managed object. So references held in script data are
+     found only by the provider's walk, which does report the spinner
+     component; and a component pulls its GameObject in only when flag 0x2 is
+     set on its entry, which for the spinner it is not. Where flag 0x2 comes
+     from is not found yet (the entries are not written by an `or $0x2`; the
+     candidate is the object's own bits word at +8, high half 0x0850002c for
+     this component, 0x0f70002c for its GameObject).
+     Also killed: GC-handle encoding. Unity's Mono gives a strong handle as a
+     pointer to a slot (bit 0 clear) and a weak one with bit 0 set
+     (Unity-Technologies/mono boehm-gc.c `handle_tag_weak`; UnityPlayer reads
+     the slot directly when bit 0 is clear), while the runtime's raw strong
+     handles end in 3. A build with Unity-style slots for the handles Unity
+     asks for (runtime patch to sgen-mono.c's free/get/set to accept slots,
+     provider giving slots; tree `scratch/unity/dnc3`, not committed) runs
+     Hollow Knight the same: 153 unloaded without the walk, 82 and the same
+     crash with it.
 
