@@ -1227,6 +1227,36 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   4-byte dispatch slot, which is fine: calls, the root and the bridge all
   resolve exact addresses) is recorded deterministically. A slot rule tried
   on the way (ee112f0c) was wrong and is reverted (c1643d34).
+- **OPEN BUG: adding region entries can break the ejected boot.** Adding
+  web entries must only add AOT coverage, but some sets make Noita's
+  ejected page stop deterministically about 4.7 s into the process, before
+  the menus: `gex-eject: code at 0x15cf728 (msvcr120.dll +0xe728) was not
+  translated` (esp 0x141e69c). 0x15cf728 is the continuation after
+  `call *[GetLastError]` in msvcr120's 0x1000f720. Reproduce on master
+  6f196998's keys (p-noita19 relinked from the object cache, any run of
+  `$S/c31/q.sh`-style legs on edger):
+  - tests/eject/noita-entries/base46.txt (p-noita18's 13, rpcrt4 0x78997f81
+    0x7899c20b, and play B's live EBP chain): boots (site31, 64.5 world
+    fps).
+  - base46 plus any one of fmod 0x17e5afa, 0x17d2958, 0x17c91d5, 0x17d8ea4:
+    each boots (sitef1..4, peek 4153-4262 at 120 s).
+  - base46 plus 0x17e5afa and 0x17d8ea4 (fmod.dll, 192 region entries):
+    stops (siteg). base46 plus all four (full50.txt, site32): stops, twice
+    of twice. The 168-entry site29 set (site29-168.txt) stops the same way;
+    halves of it (by image) each boot.
+  - Ruled out by experiment: leaf inlining (F: the call site is a plain
+    ftab call), the nest depth budget (256 KiB control boots the same
+    way as 384), 4-byte dispatch-slot sharing (calls, root and bridge
+    resolve exact addresses; seh's slot-neighbour entry runs fine), and
+    region entries equal to unit entries (none in site32).
+  - Not yet known: why two region functions in fmod's region module change
+    what msvcr120's boot path does. Next step: reproduce outside the page
+    (native `gexc eject run` or `run.mjs` under Node, both blocked today
+    by GL-on-the-host and exit 2 respectively), or GEX_NT_RESUME_LOG plus
+    a wasm trace at the stop on edger.
+  This also blocks play B's Continue: the save, Save & Quit, the snapshot
+  and the 62-file restore work, but reaching the world after Continue
+  needs fmod's frames as entries, which this bug turns into a boot stop.
 - **Interior entries** (§3.2–3.3) are the main correctness risk. A resume
   at an address no region covers stops the run. The conservative region set
   (every call continuation in an SEH-framed function) may be large; it is
