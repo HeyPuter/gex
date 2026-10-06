@@ -1056,8 +1056,28 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
     shader blob stays valid while Mesa is unchanged). Then the coordinator's
     short recheck: one ABBA pair vs pewasm, one world-up, play A plus the
     saves check (B). Then send the head to the coordinator to gate.
-  - Stale on edger, not mine to kill: a headless chromium (PID 2139751,
-    profile /tmp/gbench/noita-chrome-*, from a pewasm runner about 20 h ago, idle).
+  - **Resumed after the Claude Code restart (no reboot):** the c28 rest
+    (`$S/c28/rest.sh`: play2 A/B, pewasm world-up, 35-min soak) as one bench job.
+    - pewasm world-up reruns: 30.3, 30.8 s (with 30.7, 31.3 earlier).
+      Ejected 30.7-31.9 s. Level.
+    - Play A (site28p, killme): menus, mode select, world (the `until` step
+      waited 22 s for the first world frame), walking, levitating, shooting,
+      killme death, Game Over, stats screen, New Game -> mode select. OK.
+    - Play B (site28q): world, pause menu, Save & Quit (status 29), snapshot
+      of 62 files, reload, 62 restored. Then the page stayed black, and
+      5 s into the new process it stopped: `gex-eject: code at 0x78997f81
+      (rpcrt4.dll +0x46f81) was not translated` (status 139). It is the return continuation
+      of rpcrt4's named-pipe CreateFileW (GENERIC_READ|WRITE, then
+      ERROR_PIPE_BUSY check), resumed via dispatch after the call unwound:
+      a missing region entry the recording never reached. Fixed by the
+      eject's designed path: 0x78997f81 added to user/web-entries.txt in
+      `$S/p-noita18r` (rsync copy of p-noita18, build/units hardlinked; the
+      build only re-wrote lua51.wasm and groups/index.txt with identical
+      bytes), build.sh (rpcrt4 region entries 0 -> 1, no unit rebuilt),
+      site28r. B rerun on site28r queued (`$S/c28/playB2.sh`).
+      **Carry this web entry into the post-integ-g relink.**
+  - Killed by PID on edger: the orphaned pewasm-runner Chromium 2139751
+    (ppid 1, idle 23 h, held no bench lock), as the coordinator asked.
 
 - **Earlier resume (2026-10-05 evening, after the first reboot).** Merged master
   e3917bac (df028162; no gex-cgen change, unit keys kept). third_party/mesa
