@@ -4699,8 +4699,16 @@ impl Kernel {
             if from >= to {
                 continue;
             }
-            let bytes = m.read(from, (to - from) as usize)?;
-            map.file.pwrite(map.offset + (from - map.start), bytes)?;
+            // Only what the file holds: a shared mapping's page past the
+            // end of the file is not the file's (Linux never extends it).
+            let at = map.offset + (from - map.start);
+            let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
+            let n = (to - from).min(size.saturating_sub(at));
+            if n == 0 {
+                continue;
+            }
+            let bytes = m.read(from, n as usize)?;
+            map.file.pwrite(at, bytes)?;
         }
         Ok(())
     }
@@ -5016,6 +5024,12 @@ impl Kernel {
         // VirtualFree decommits by mapping over the range).
         if flags & mflags::FIXED != 0 {
             self.retire_code(addr, len);
+            // And a shared file mapping it replaces ends as an unmap ends
+            // it: written back, and no longer handed to the next mapper.
+            if self.shared_maps.iter().any(|s| s.start < addr + len && s.start + s.len > addr) {
+                self.flush_shared(m, addr, len)?;
+                self.shared_maps.retain(|s| s.start + s.len <= addr || s.start >= addr + len);
+            }
         }
         if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
             // A private file mapping is an eager copy, which is exactly
