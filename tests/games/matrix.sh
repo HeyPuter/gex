@@ -167,6 +167,8 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             # pair from an earlier run would look like a running server.
             rm -f "/tmp/.X$xn-lock" "/tmp/.X11-unix/X$xn"
             pre=(/bin/sh "$here/xwayland-inguest.sh" "$xn" "$g/xwayland.log")
+            # Xwayland's keymap compiles cached (xkbcomp-cache.sh).
+            run+=(--bind "$here/xkbcomp-cache.sh=/usr/bin/xkbcomp" --bind "/usr/bin/xkbcomp=/usr/bin/xkbcomp.real")
         fi
     else
         # gex-steam's steam_api[64].dll in place of the game's when

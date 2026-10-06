@@ -200,6 +200,7 @@ run options:
   --verbose       report translation statistics
   --env K=V       add an environment variable (repeatable)
   --sysroot DIR   present DIR as the guest's root filesystem
+  --bind H=G      mount host file or directory H at guest path G (repeatable)
   --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
                   coreutils in /bin and /usr/bin (GEX_BUSYBOX_APPLETS: the list)
   --pin FILE      place each object where FILE says, as written by
@@ -353,6 +354,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 i += 1;
                 let v = args.get(i).context("--sysroot needs a directory")?;
                 opts.sysroot = Some(v.into());
+            }
+            "--bind" => {
+                i += 1;
+                let v = args.get(i).context("--bind needs HOST=GUEST")?;
+                let (host, guest) = v.split_once('=').context("--bind wants HOST=GUEST")?;
+                anyhow::ensure!(guest.starts_with('/'), "--bind {v}: the guest path must be absolute");
+                let host = std::fs::canonicalize(host).with_context(|| format!("--bind {v}"))?;
+                opts.binds.push((host, guest.to_string()));
             }
             "--busybox" => {
                 i += 1;
