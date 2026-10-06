@@ -1334,7 +1334,19 @@ impl Gl {
                     else {
                         return true;
                     };
-                    glDrawElements(mode, count, ty, offset as usize as *const c_void);
+                    // { ..., client } then, for client-side indices (no
+                    // element array buffer bound in the guest), the indices
+                    // themselves: the guest's pointer means nothing here, and
+                    // passing it as an offset had the host's GL read its own
+                    // address space (Retrocycles' arena: SIGSEGV in Mesa).
+                    // Older guests send no fifth word.
+                    match a.u32() {
+                        Some(1) => {
+                            let Some(indices) = a.blob() else { return true };
+                            glDrawElements(mode, count, ty, indices.as_ptr() as *const c_void);
+                        }
+                        _ => glDrawElements(mode, count, ty, offset as usize as *const c_void),
+                    }
                 }
 
                 op::READ_PIXELS => {
@@ -1645,6 +1657,64 @@ mod tests {
         let v = u32::from_le_bytes(reply[*at..*at + 4].try_into().unwrap());
         *at += 4;
         v
+    }
+
+    /// glDrawElements with client-side indices: they travel with the
+    /// command (the guest's pointer, sent as the offset, must never reach
+    /// the host's GL: Retrocycles crashed Mesa that way).
+    #[test]
+    fn client_side_indices_come_with_the_draw() {
+        let mut gl = match Gl::new(64, 64) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        const GL_UNSIGNED_SHORT: u32 = 0x1403;
+        let verts: [f32; 6] = [-1.0, -1.0, 0.0, -1.0, -1.0, 1.0];
+        let bytes: Vec<u8> = verts.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let idx: Vec<u8> = [0u16, 1, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let vs = b"attribute vec2 pos;\nvoid main(){gl_Position=vec4(pos,0.0,1.0);}\n";
+        let fs = b"precision mediump float;\nvoid main(){gl_FragColor=vec4(0.0,1.0,0.0,1.0);}\n";
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::ES, 0, 0]);
+        b.cmd(op::VIEWPORT, &[0, 0, 64, 64]);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 1.0f32.to_bits(), 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::CREATE_SHADER, &[1, GL_VERTEX_SHADER]);
+        b.raw(op::SHADER_SOURCE, &[1, vs.len() as u32], vs);
+        b.cmd(op::COMPILE_SHADER, &[1]);
+        b.cmd(op::CREATE_SHADER, &[2, GL_FRAGMENT_SHADER]);
+        b.raw(op::SHADER_SOURCE, &[2, fs.len() as u32], fs);
+        b.cmd(op::COMPILE_SHADER, &[2]);
+        b.cmd(op::CREATE_PROGRAM, &[3]);
+        b.cmd(op::ATTACH_SHADER, &[3, 1]);
+        b.cmd(op::ATTACH_SHADER, &[3, 2]);
+        b.cmd(op::LINK_PROGRAM, &[3]);
+        b.cmd(op::USE_PROGRAM, &[3]);
+        b.cmd(op::GEN_BUFFERS, &[1, 7]);
+        b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 7]);
+        b.raw(op::BUFFER_DATA, &[GL_ARRAY_BUFFER, GL_STATIC_DRAW, bytes.len() as u32, 0, 1, bytes.len() as u32], &bytes);
+        b.cmd(op::ENABLE_VERTEX_ATTRIB_ARRAY, &[0]);
+        b.cmd(op::VERTEX_ATTRIB_POINTER, &[0, 2, GL_FLOAT, 0, 0, 0]);
+        // A guest pointer far outside anything the host maps, as the offset.
+        b.raw(op::DRAW_ELEMENTS, &[GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, 0xdead_0000, 1, idx.len() as u32], &idx);
+        b.cmd(op::FINISH, &[]);
+        b.cmd(op::READ_PIXELS, &[0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, 0, 1, 0]);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        for _ in 0..3 {
+            read_blob(r, &mut at); // vendor, renderer, version
+        }
+        let _finish = read_u32(r, &mut at);
+        let _offset = read_u32(r, &mut at);
+        let pixels = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(&pixels[(2 * 64 + 2) * 4..(2 * 64 + 2) * 4 + 4], &[0, 255, 0, 255], "the indexed triangle");
     }
 
     /// The whole path: bring up a context, compile the application's own
