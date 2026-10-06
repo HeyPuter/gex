@@ -983,4 +983,43 @@ Not yet:
      graphics question that remains: with focus, Unity presents but draws
      nothing, although both intro cameras are enabled and active (probe:
      `Camera`, `AspectBorders`, 640x480).
+  10. **After the language screen (2026-10-06, runs hk49-hk65; dnc2 provider):**
+     - **Seed:** `HOME_SEED=tests/games/seeds/hollow-knight` (muck-dotnet.sh)
+       puts Unity PlayerPrefs with GameLangSet=1 in the run's HOME, in both
+       `unity3d/Team Cherry/Hollow Knight/prefs` and `unity3d/unknown/unknown/
+       prefs` (graphics start-up opens the latter before it knows the
+       product). The language select is skipped; the intro animator reaches
+       LoadingIcon.
+     - **Liveness was stubbed:** `mono_unity_liveness_*` reported nothing, so
+       Unity's UnloadUnusedAssets unloaded every asset only managed code held:
+       StartManager's `loadSpinnerPrefab` came back destroyed and
+       `Instantiate` threw ArgumentNullException, ending the intro coroutine.
+       Implemented (gexmono-unity.c): a walk over reference fields, arrays and
+       value-type fields from each root and from all loaded classes' statics,
+       reporting objects of Unity's filter class in batches, each object once
+       per pass across Unity's 24 states; `mono_unity_stop_gc_world` holds the
+       sgen GC lock. HK now unloads 82 assets instead of 153 and keeps the
+       prefab, **but then faults** in `UnityEngine.Object::Internal_CloneSingle_
+       Injected` (Instantiate of the spinner): a Unity native function reads a
+       wild pointer (GEX_TRACE_SEGV dump, named frames with GEX_CGEN_NAMES=1:
+       f_7e69d820 icall -> f_7ea6bd90 -> f_7ea6a590). Just before it, Unity
+       iterates one class's methods 182k times (mono_class_get_methods +
+       mono_method_signature, no other API calls): the serializer creating a
+       [Serializable] field's objects. Not the GC lock (GEXMONO_LV_NOLOCK=1
+       crashes too); with GEXMONO_LV_OFF=1 (walk, no reports) no crash. Next:
+       which class, and whether Unity reads MonoMethod/MonoMethodSignature
+       fields directly at Unity-Mono offsets there.
+     - **Focus:** `tests/games/xfocus.c` (muck-dotnet.sh builds it and
+       xwayland-inguest.sh runs it unless NOFOCUS=1) gives the largest top-level
+       window the X input focus: Application.isFocused becomes True.
+     - **Cameras never render on their own:** probe `prerender 0` for the
+       whole run while Unity presents ~30/s; `GEXPROBE_RENDER=1` (Camera.Render
+       by hand) works (prerender 1). The probe shows `Display.main` with
+       rendering and system size 0x0 (Screen is 800x600): Unity's display list
+       was built while SDL video was not initialized ("Error getting num native
+       displays: Video subsystem has not been initialized", "Desktop is 0 x 0").
+       The in-guest Xwayland has RandR (1 output, 1 monitor 800x600) and
+       Xinerama (scratchpad xinfo test), and SDL's X libraries load and connect.
+       SDL_VIDEODRIVER=x11 / XDG_SESSION_TYPE=x11 change nothing. Next: why
+       SDL video is not up when Unity first asks (strace in runs/hk65).
 
