@@ -248,6 +248,7 @@ pub mod raw {
     pub const PSELECT6: u64 = 270;
     pub const PPOLL: u64 = 271;
     pub const SET_ROBUST_LIST: u64 = 273;
+    pub const UNSHARE: u64 = 272;
     pub const GET_ROBUST_LIST: u64 = 274;
     pub const UTIMENSAT: u64 = 280;
     pub const EPOLL_PWAIT: u64 = 281;
@@ -555,6 +556,7 @@ pub fn translate(
         x::PSELECT6 => nr::PSELECT6,
         x::PPOLL => nr::PPOLL,
         x::SET_ROBUST_LIST => nr::SET_ROBUST_LIST,
+        x::UNSHARE => nr::UNSHARE,
         x::GET_ROBUST_LIST => nr::GET_ROBUST_LIST,
         x::UTIMENSAT => nr::UTIMENSAT,
         x::EPOLL_PWAIT => nr::EPOLL_PWAIT,

@@ -46,6 +46,7 @@ pub mod nr {
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
     pub const FCHDIR: u64 = 50;
+    pub const UNSHARE: u64 = 97;
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
     pub const OPENAT: u64 = 56;
@@ -634,6 +635,10 @@ pub struct Kernel {
     pub pin_landed: Vec<(String, u64, u64)>,
     /// File mappings whose writes are meant to reach the file.
     pub shared_maps: Vec<SharedMap>,
+    /// The working directories of threads that left the process's
+    /// (`unshare(CLONE_FS)`), by context address: swapped into `vfs` for
+    /// the length of each of that thread's system calls.
+    pub thread_cwd: std::collections::HashMap<u64, String>,
     /// Executable mappings made since the host last looked.
     pub new_code: Vec<CodeMap>,
     /// Executable ranges *unmapped* since the host last looked.
@@ -1226,6 +1231,7 @@ impl Kernel {
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
+            thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
             next_tmpfile: 0,
@@ -1458,6 +1464,7 @@ impl Kernel {
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
+            thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
@@ -1576,6 +1583,23 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        // A thread with a working directory of its own (`unshare(CLONE_FS)`)
+        // has it in `vfs` while its call runs.
+        if self.thread_cwd.is_empty() {
+            return self.syscall_inner(m, pc);
+        }
+        let me = self.ctx_addr;
+        let Some(mut cwd) = self.thread_cwd.remove(&me) else {
+            return self.syscall_inner(m, pc);
+        };
+        std::mem::swap(&mut self.vfs.cwd, &mut cwd);
+        let out = self.syscall_inner(m, pc);
+        std::mem::swap(&mut self.vfs.cwd, &mut cwd);
+        self.thread_cwd.insert(me, cwd);
+        out
+    }
+
+    fn syscall_inner(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         self.syscall_pc = pc;
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
@@ -2429,6 +2453,19 @@ impl Kernel {
             nr::GETCWD => self.sys_getcwd(m, a[0], a[1]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
             nr::FCHDIR => self.sys_fchdir(a[0] as i32),
+            // Only a thread's own working directory (CLONE_FS) is unshared;
+            // a private descriptor table or namespace is not supported.
+            nr::UNSHARE => {
+                if a[0] & !0x200 != 0 {
+                    Err(Errno::EINVAL)
+                } else {
+                    if a[0] & 0x200 != 0 {
+                        let cwd = self.vfs.cwd.clone();
+                        self.thread_cwd.entry(self.ctx_addr).or_insert(cwd);
+                    }
+                    Ok(0)
+                }
+            }
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
             nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
@@ -6640,6 +6677,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FACCESSAT | nr::FACCESSAT2 => "faccessat",
         nr::CHDIR => "chdir",
         nr::FCHDIR => "fchdir",
+        nr::UNSHARE => "unshare",
         nr::FCHMOD => "fchmod",
         nr::FCHMODAT => "fchmodat",
         nr::OPENAT => "openat",

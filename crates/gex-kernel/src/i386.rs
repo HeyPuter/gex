@@ -173,6 +173,7 @@ pub mod raw {
     pub const SETGID: u64 = 214;
     pub const MADVISE: u64 = 219;
     pub const MLOCK: u64 = 150;
+    pub const UNSHARE: u64 = 310;
     pub const MUNLOCK: u64 = 151;
     pub const MLOCKALL: u64 = 152;
     pub const MUNLOCKALL: u64 = 153;
@@ -887,6 +888,7 @@ pub fn translate(
         }
         x::SET_TID_ADDRESS => nr::SET_TID_ADDRESS,
         x::SET_ROBUST_LIST => nr::SET_ROBUST_LIST,
+        x::UNSHARE => nr::UNSHARE,
         x::GET_ROBUST_LIST => nr::GET_ROBUST_LIST,
         x::RSEQ => nr::RSEQ,
         x::MEMBARRIER => nr::MEMBARRIER,
