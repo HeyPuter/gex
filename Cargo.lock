@@ -634,6 +634,7 @@ dependencies = [
  "gex-emit",
  "gex-ir",
  "gex-kernel",
+ "gex-key",
  "gex-ld",
  "gex-native",
  "gex-xlate",
