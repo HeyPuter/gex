@@ -381,6 +381,15 @@ fn trap_pc() -> u64 {
 /// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
     let mut e = Emitter::new(cx, block.start);
+    // First, before the page check: a block entered for a neighbour in its
+    // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
+    // The page check's stale path (and the guard's) dispatch to this block's
+    // own start, which for a neighbour's branch is the wrong address: a call
+    // to a JIT trampoline at E ran a stale block for E+2 there, mid-
+    // instruction (Rain World's crashes in Mono's trampolines).
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        e.emit_target_check(block.start);
+    }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
@@ -417,9 +426,6 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
             block.term,
             block.guard.as_ref().map_or(String::new(), |g| g.iter().take(64).map(|b| format!("{b:02x}")).collect::<String>())
         );
-    }
-    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
-        e.emit_target_check(block.start);
     }
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
@@ -430,6 +436,15 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
 
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx, block.start);
+    // First, before the page check: a block entered for a neighbour in its
+    // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
+    // The page check's stale path (and the guard's) dispatch to this block's
+    // own start, which for a neighbour's branch is the wrong address: a call
+    // to a JIT trampoline at E ran a stale block for E+2 there, mid-
+    // instruction (Rain World's crashes in Mono's trampolines).
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        e.emit_target_check(block.start);
+    }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
@@ -466,9 +481,6 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
             block.term,
             block.guard.as_ref().map_or(String::new(), |g| g.iter().take(64).map(|b| format!("{b:02x}")).collect::<String>())
         );
-    }
-    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
-        e.emit_target_check(block.start);
     }
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
