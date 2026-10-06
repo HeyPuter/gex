@@ -36,6 +36,8 @@ mkdir -p "$RUN/bcl" "$RUN/home"
 [ -n "${HOME_SEED:-}" ] && cp -a "$HOME_SEED/." "$RUN/home/"
 cp "$FW"/*.dll "$RUN/bcl/"
 cp "$OUT/lib/System.Private.CoreLib.dll" "$RUN/bcl/"
+# Out-of-band assemblies over the framework's (build.sh formatters: BinaryFormatter).
+[ -d "$OUT/lib-extra" ] && cp "$OUT"/lib-extra/*.dll "$RUN/bcl/"
 # The framework's x86-64 natives that have no wasm64 build in the provider: P/Invokes to them go to
 # the guest (the provider's dl fallback), which loads them beside the BCL with the host's OpenSSL/zlib.
 cp "$FW"/libSystem.Security.Cryptography.Native.OpenSsl.so "$FW"/libSystem.IO.Compression.Native.so "$RUN/bcl/"
