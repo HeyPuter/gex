@@ -8,7 +8,7 @@
 # directory: relative to GAMES (Windows builds, default ~/gex-sandbox/games)
 #            or GAMES_LINUX (Linux builds, default ~/gex-sandbox/games-linux).
 # program:   relative to the directory; the run's working directory is the
-#            program's own.
+#            program's own, or the game's with a leading @.
 # menu, gameplay: the presented frame at which the game shows its menu and
 #            its gameplay with the scripted input (`-` when not reached yet).
 #            matrix.sh reports the furthest stage whose frame was presented.
@@ -27,7 +27,7 @@ katana-zero  |pe   |Katana ZERO                          |Katana ZERO.exe       
 npp          |pe   |N++                                  |N++.exe                             | |-|-|-
 momodora     |pe   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |pe   |Retrocycles                          |Retrocycles.exe                     | |200|1000|retrocycles-input.txt
-baba-linux   |linux-x11|Baba Is You                      |bin64/Chowdren                      | |-|-|-|--lazy
+baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren                     | |-|-|-|--lazy
 retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|650|6000|retrocycles-linux.wl
 
 # x64 Windows games: waiting for 64-bit native Wine (OneShot's game is

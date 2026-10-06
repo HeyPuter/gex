@@ -106,6 +106,10 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     [ -n "$only" ] && [[ $only != *",$slug,"* ]] && continue
     kind=$(trim "$kind") dir=$(trim "$dir") prog=$(trim "$prog") args=$(trim "$args")
     menu=$(trim "$menu") play=$(trim "$play") input=$(trim "$input") extra=$(trim "${extra:-}")
+    # `@path`: run from the game's directory rather than the program's
+    # (Baba Is You's launcher does `cd $GAMEDIR; ./bin64/Chowdren`).
+    fromroot=0
+    case $prog in @*) prog=${prog#@} fromroot=1 ;; esac
     case $kind in linux*) gdir=$games_linux/$dir ;; *) gdir=$games/$dir ;; esac
     exe=$gdir/$prog
     g=$out/$slug
@@ -190,7 +194,8 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     # shellcheck disable=SC2206
     argv=($args)
     t0=$(date +%s)
-    (cd "$(dirname "$exe")" && exec env "${env[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "./$(basename "$exe")" "${argv[@]}") \
+    if [ $fromroot = 1 ]; then cwd=$ov rel=./$prog; else cwd=$(dirname "$exe") rel=./$(basename "$exe"); fi
+    (cd "$cwd" && exec env "${env[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
         > "$g/log" 2>&1 &
     pid=$!
     first=

@@ -1,0 +1,180 @@
+// A Linux game in headless Chromium (web/nt.html): the game's directory, its
+// extra libraries, gex's guest GL and the host files it opens bundled into
+// the page, its X11 window on the page's own X server (Xwayland as wasm,
+// `hostx=1`), its OpenGL through gex-gl onto Mesa's gex_wgpu driver over
+// WebGPU, and scripted keys from a GEX_WL_INPUT script (the same one the
+// native run uses, tests/games/*.wl), timed from the page's Nth GL present.
+//
+//   node tests/games/browser-linux.mjs --name NAME --dir GAME_DIR --exe REL
+//        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST]
+//        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
+//        [--gameplay N]
+//
+// --files lists host files the game opens, one per line (collected from a
+// native `gexc run --strace`; tests/games/retrocycles-linux-files.txt).
+// --gameplay N: report when the page has presented N GL frames.
+// Needs web/public/gex built (shims/browser/build.sh), Mesa's wasm
+// (gex-wgpu-replay.*) and web/public/gex/xwayland/ (web/build-xwayland-wasm.sh),
+// and GEX_GL_X64 (guest/gl/build.sh with GEX_CC=gcc).
+//
+// Prints `ok` lines (first frame, the input script's start, gameplay) and the
+// frame rate over the last minute, with a screenshot every 30 s.
+
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { dirname, join, basename } from 'node:path';
+import { openPage, sleep, log, WEB, STATE } from '../nt/browser-harness.mjs';
+
+const argv = process.argv.slice(2);
+const opt = (name, dflt) => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : dflt;
+};
+const name = opt('--name', 'game');
+const gameDir = opt('--dir', null);
+const exe = opt('--exe', null);
+const cwd = opt('--cwd', dirname(exe ?? '.'));
+const minutes = Number(opt('--minutes', 30));
+const shotDir = opt('--shot', null);
+const gameplay = Number(opt('--gameplay', 0));
+const [width, height] = opt('--size', '1280x720').split('x').map(Number);
+const GL = process.env.GEX_GL_X64;
+if (!gameDir || !exe || !GL) throw new Error('need --dir, --exe and GEX_GL_X64');
+
+/** The bundle: the game at /game, libraries under /gex, host files at
+ * their own paths (tar follows the links). Delete it to rebuild. */
+function bundle() {
+  const out = join(WEB, `public/gex/nt/${name}.tar`);
+  if (existsSync(out)) return out;
+  const stage = join(STATE, `stage-${name}`);
+  rmSync(stage, { recursive: true, force: true });
+  mkdirSync(join(stage, 'gex/libs'), { recursive: true });
+  mkdirSync(join(stage, 'home/g'), { recursive: true });
+  mkdirSync(join(stage, 'tmp'), { recursive: true });
+  symlinkSync(gameDir, join(stage, 'game'));
+  symlinkSync(GL, join(stage, 'gex/gl'));
+  const libs = (opt('--libs', '') || '').split(':').filter(Boolean);
+  libs.forEach((d, i) => symlinkSync(d, join(stage, `gex/libs/${i}`)));
+  const listed = opt('--files', null)
+    ? readFileSync(opt('--files'), 'utf8').split('\n').filter((l) => l && !l.startsWith('#'))
+    : [];
+  const files = ['/lib64/ld-linux-x86-64.so.2', ...listed].filter((f) => existsSync(f));
+  for (const f of files) {
+    const at = join(stage, f);
+    mkdirSync(dirname(at), { recursive: true });
+    if (!existsSync(at)) symlinkSync(f, at);
+  }
+  const top = ['game', 'gex', 'home', 'tmp', ...new Set(files.map((f) => f.split('/')[1]))];
+  mkdirSync(dirname(out), { recursive: true });
+  execFileSync('tar', ['-chf', out, '-C', stage, ...new Set(top)]);
+  log(`bundle ${out}: ${(statSync(out).size / 1048576).toFixed(0)} MiB`);
+  return out;
+}
+
+/** A GEX_WL_INPUT script: `frames N`, then `SECONDS tap|key NAME [1|0]`. */
+function script() {
+  const file = opt('--input', null);
+  if (!file) return { after: Infinity, events: [] };
+  let after = 1;
+  const events = [];
+  for (const raw of readFileSync(file, 'utf8').split('\n')) {
+    const w = raw.replace(/#.*/, '').trim().split(/\s+/).filter(Boolean);
+    if (!w.length) continue;
+    if (w[0] === 'frames') { after = Number(w[1]); continue; }
+    const t = Number(w[0]);
+    if (w[1] === 'tap') { events.push([t, w[2], 'keydown'], [t + 0.1, w[2], 'keyup']); }
+    else if (w[1] === 'key') events.push([t, w[2], w[3] === '1' ? 'keydown' : 'keyup']);
+  }
+  events.sort((a, b) => a[0] - b[0]);
+  return { after, events };
+}
+
+/** A script's key name as KeyboardEvent.code (what the compositor maps). */
+function code(k) {
+  const named = { enter: 'Enter', return: 'Enter', space: 'Space', esc: 'Escape', escape: 'Escape',
+    up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', tab: 'Tab',
+    shift: 'ShiftLeft', ctrl: 'ControlLeft', alt: 'AltLeft', backspace: 'Backspace' };
+  const l = k.toLowerCase();
+  if (named[l]) return named[l];
+  if (/^[a-z]$/.test(l)) return `Key${l.toUpperCase()}`;
+  if (/^[0-9]$/.test(l)) return `Digit${l}`;
+  if (/^f[0-9]+$/.test(l)) return l.toUpperCase();
+  throw new Error(`no key ${k}`);
+}
+
+async function main() {
+  for (const f of ['xwayland/Xwayland.mjs', 'gex-wgpu-replay.wasm']) {
+    if (!existsSync(join(WEB, 'public/gex', f))) throw new Error(`no web/public/gex/${f}`);
+  }
+  const tar = bundle();
+  const libs = (opt('--libs', '') || '').split(':').filter(Boolean).map((_, i) => `/gex/libs/${i}`);
+  const genv = [
+    `LD_LIBRARY_PATH=${['/gex/gl', ...libs, `/game/${dirname(exe)}`].join(':')}`,
+    'SDL_VIDEODRIVER=x11', 'SDL_AUDIODRIVER=dummy', 'XDG_RUNTIME_DIR=/tmp', 'DISPLAY=:0', 'HOME=/home/g',
+    'DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/gex-no-bus',
+  ].join(',');
+  const t0 = Date.now();
+  const { evaluate, state, shot, consoleLines } = await openPage(
+    `tar=/gex/nt/${basename(tar)}&exe=/game/${exe}&cwd=/game/${cwd}&gl=1&glbackend=wgpu&hostx=1`
+      + `&size=${width}x${height}&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(opt('--args', ''))}`,
+    { width: width + 20, height: height + 100, shotDir },
+  );
+  const presents = async () => {
+    const gl = (await evaluate('globalThis.__gexCompositor?.describe()', true))?.gl ?? '';
+    const m = /presented=(\d+)/.exec(gl);
+    // A describe() that timed out (a busy compositor) answers nothing: keep
+    // the last count rather than going back to zero.
+    if (m) last = Math.max(last, Number(m[1]));
+    return last;
+  };
+  let last = 0;
+  const key = (c, type) => evaluate(
+    `(() => { for (const t of document.querySelectorAll('canvas')) t.dispatchEvent(new KeyboardEvent(${JSON.stringify(type)}, { code: ${JSON.stringify(c)}, key: ${JSON.stringify(c)}, bubbles: true })); return 1; })()`, true);
+  const { after, events } = script();
+  let first = null, start = null, next = 0, playAt = null, shots = 0, nextShot = Date.now() + 30000;
+  const window = [];
+  const end = t0 + minutes * 60000;
+  while (Date.now() < end) {
+    const s = await state();
+    if (s?.phase === 'failed' || s?.phase === 'done') {
+      log(`output: ${(s.out ?? '').slice(-3000)}`);
+      throw new Error(`${name} stopped (${s.phase}, status ${s.status}) ${s.error ?? ''}`);
+    }
+    const threw = consoleLines.find((l) => /\[gex\] pid \d+:\d+ threw:|execute fault|\[harness\] the page crashed/.test(l));
+    if (threw) throw new Error(`a thread died: ${threw.slice(0, 600)}`);
+    const n = await presents();
+    window.push([Date.now(), n]);
+    while (window.length && window[0][0] < Date.now() - 60000) window.shift();
+    if (!first && n > 0) {
+      first = Date.now();
+      console.log(`ok   first frame ${((first - t0) / 1000).toFixed(0)} s after the page opened`);
+    }
+    if (!start && n >= after) {
+      start = Date.now();
+      console.log(`ok   input script starts at present ${n}`);
+    }
+    while (start && next < events.length && Date.now() - start >= events[next][0] * 1000) {
+      const [t, k, type] = events[next++];
+      await key(code(k), type);
+      log(`input at ${t} s: ${type} ${k} (present ${n})`);
+    }
+    if (gameplay && !playAt && n >= gameplay) {
+      playAt = Date.now();
+      console.log(`ok   gameplay (present ${n}) ${((playAt - t0) / 1000).toFixed(0)} s after the page opened`);
+    }
+    if (Date.now() >= nextShot) {
+      nextShot += 30000;
+      await shot(`t${String(++shots).padStart(3, '0')}`);
+      const rate = window.length > 1 ? (n - window[0][1]) / ((Date.now() - window[0][0]) / 1000) : 0;
+      log(`${((Date.now() - t0) / 1000).toFixed(0)} s: presents ${n}, ${rate.toFixed(1)}/s over the last minute; ${(s?.out ?? '').slice(-160).replace(/\n/g, ' | ')}`);
+    }
+    await sleep(1000);
+  }
+  if (shotDir) await shot('end');
+  if (gameplay && !playAt) throw new Error(`no gameplay after ${minutes} minutes`);
+}
+
+main().then(() => process.exit(0), (e) => {
+  console.log(`FAIL ${e.message}`);
+  process.exit(1);
+});
