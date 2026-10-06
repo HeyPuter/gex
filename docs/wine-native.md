@@ -1092,11 +1092,27 @@ unixlib ran through the dlopen registry (§3.12).
   its size). explorer's `ClipCursor`/`SetCursor` imports were trapping
   stubs: winebuild's export list now names a renamed `-import` export as a
   forward (user32's ClipCursor is win32u's NtUserClipCursor).
-- **No FreeType on wasm32 yet**, so no font can be realized:
-  `get_text_metr_size` left the metrics unset and every window's minimum
-  track size was stack garbage (SM_CYMINTRACK; a 640-wide window came out
-  4204 wide). Zeroed on wasm32 until FreeType is built for the sysroot
-  (needed for any GUI text anyway, W3.3's display driver).
+- **FreeType for wasm32** (pinned: **FreeType 2.13.3**,
+  `freetype-2.13.3.tar.xz`, sha256
+  `0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289`,
+  fetched from the SourceForge mirror, savannah being unreachable from
+  gooner): a static build with no zlib/png/bzip2/harfbuzz/brotli into a
+  directory of its own, `$W/ft/install` (`$W/ft/build-ft.sh`; not in the
+  sysroot, which shares files with sr-slim). `$W/link-w3.sh` compiles
+  win32u with `HAVE_FT2BUILD_H` and `SONAME_LIBFREETYPE` (no reconfigure),
+  links `libfreetype.a` and registers the 31 `FT_*` functions win32u
+  dlsym's under `libfreetype.so.6` in the dlopen registry. Wine's own
+  fonts (`fonts/*.ttf`) are staged in the data dir's `fonts/`
+  (`$W/stage-w3.sh`). Tahoma realizes (13 px: height 16, ascent 13).
+  Before it, no font could be realized and every window's minimum track
+  size was stack garbage (a 640-wide window came out 4204 wide); a
+  stopgap fork patch for that was reverted once FreeType was in.
+- Left in the i386 suite (`$W/w3-nt9.log`, 32 of 40, FreeType in):
+  `pipe` fails only its SystemSupportedProcessorArchitectures check,
+  which wants AMD64 first (the NT layer's x64 host); W3's Wine is
+  i386-only (§3.9), so that is an expectation to revisit with x64, not a
+  pipe bug. `crypt`: CryptAcquireContext finds no provider (rsaenh's
+  registration is wineboot's DefaultInstall, W3.2's open end).
 - The test prefix has the null graphics driver as a fixture
   (`$W/stage-w3.sh` writes `[Software\\Wine\\Drivers] "Graphics"="null"`)
   and stages explorer.exe as a native program (`W3_PROGRAMS=explorer.exe`).
@@ -1129,7 +1145,6 @@ what would let it go:
 | user callbacks return through gex's pad | gex watches call-out returns by dispatch slot | never (port) |
 | **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
 | **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
-| win32u `get_text_metr_size`: no metrics (zeroed, height -1) when no font is realized | no FreeType in the wasm32 build: the metrics were stack garbage | FreeType built for wasm32 |
 | winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
 
 **Future option for the last two (and the server's 16 MiB block)**, not
@@ -1639,8 +1654,8 @@ Heads:
   prefix `W3_PROGRAMS=explorer.exe $W/stage-w3.sh` (null-driver fixture).
   tests/nt i386 **32 of 40** (`$W/w3-nt8.log`; user_win and gdi pass; left:
   lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
-  glcompat/glfast (W3.4)). Next: FreeType for wasm32 (no font can be
-  realized), then the display driver. Wine fork head 832123e9660 (mw).
+  glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`). Next: the
+  display driver. Wine fork head 4e9cf004685 (mw).
   gate2 004538a9 is gating as integ/2026-10-06f (E's page landed, master
   a0bbb53c). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
