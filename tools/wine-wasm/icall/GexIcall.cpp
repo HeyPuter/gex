@@ -315,14 +315,40 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return T;
   }
 
+  // The pairs as a used, internal array in `section`.
+  static void emitPairs(Module &M, const std::vector<std::pair<Function *, Function *>> &pairs,
+                        const char *name, const char *section) {
+    if (pairs.empty()) return;
+    LLVMContext &C = M.getContext();
+    Type *Ptr = PointerType::get(C, 0);
+    StructType *PairT = StructType::get(Ptr, Ptr);
+    std::vector<Constant *> elems;
+    for (auto &[F, T] : pairs) elems.push_back(ConstantStruct::get(PairT, {F, T}));
+    ArrayType *AT = ArrayType::get(PairT, elems.size());
+    auto *G = new GlobalVariable(M, AT, true, GlobalValue::InternalLinkage, ConstantArray::get(AT, elems), name);
+    G->setSection(section);
+    G->setAlignment(Align(4));
+    appendToUsed(M, {G});
+  }
+
   unsigned entryThunks(Module &M) {
     std::map<Function *, Conv> cv = conventions(M);
-    std::vector<std::pair<Function *, Function *>> pairs;
-    std::vector<Function *> fs;
+    std::vector<std::pair<Function *, Function *>> pairs, decl_pairs;
+    std::vector<Function *> fs, decls;
     for (Function &F : M) {
-      if (F.isDeclaration() || F.hasFnAttribute("gexw-no-icall") || F.isIntrinsic()) continue;
+      if (F.hasFnAttribute("gexw-no-icall") || F.isIntrinsic()) continue;
       StringRef n = F.getName();
-      if (n.starts_with("__gexw") || n.starts_with("__gexe.") || n.contains("gexp_")) continue;
+      if (n.starts_with("__gexw") || n.starts_with("__gexe.") || n.contains("gexp_") || n.starts_with("llvm.")) continue;
+      if (F.isDeclaration()) {
+        // A function defined elsewhere whose address this object hands out
+        // (a table of server routines next to their definitions in another
+        // object, a function imported from another DLL): a thunk of its
+        // own, which gex binds only when no object defining the function
+        // gave one (`gexw_entries_decl`): the definition knows its
+        // convention, this object may not.
+        if (escapes(F)) decls.push_back(&F);
+        continue;
+      }
       // (a thiscall method may be referenced only from a vtable written in
       // assembly, which the IR does not show: msvcrt's and msvcp's)
       bool method = cv.count(&F) && cv[&F] == THISCALL && !F.hasLocalLinkage();
@@ -331,19 +357,12 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     for (Function *F : fs)
       if (Function *T = entryThunk(M, *F, cv.count(F) ? cv[F] : CDECL))
         pairs.push_back({F, T});
-    if (pairs.empty()) return 0;
-    LLVMContext &C = M.getContext();
-    Type *Ptr = PointerType::get(C, 0);
-    StructType *PairT = StructType::get(Ptr, Ptr);
-    std::vector<Constant *> elems;
-    for (auto &[F, T] : pairs) elems.push_back(ConstantStruct::get(PairT, {F, T}));
-    ArrayType *AT = ArrayType::get(PairT, elems.size());
-    auto *G = new GlobalVariable(M, AT, true, GlobalValue::InternalLinkage, ConstantArray::get(AT, elems),
-                                 "__gexe.pairs");
-    G->setSection("gexw_entries");
-    G->setAlignment(Align(4));
-    appendToUsed(M, {G});
-    return pairs.size();
+    for (Function *F : decls)
+      if (Function *T = entryThunk(M, *F, cv.count(F) ? cv[F] : CDECL))
+        decl_pairs.push_back({F, T});
+    emitPairs(M, pairs, "__gexe.pairs", "gexw_entries");
+    emitPairs(M, decl_pairs, "__gexe.declpairs", "gexw_entries_decl");
+    return pairs.size() + decl_pairs.size();
   }
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {

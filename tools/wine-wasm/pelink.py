@@ -387,6 +387,7 @@ def link(dlls, out, gexrt, others=None):
             f.write(f'--export-if-defined={d}\n')
         # gexrt's bounds of the entry-thunk pairs (gexw_entries)
         f.write('--export-if-defined=__gexw_entries\n')
+        f.write('--export-if-defined=__gexw_entries_decl\n')
     cmd = ['wasm-ld', '--experimental-pic', '-shared', '--shared-memory', '--import-memory',
            '--max-memory=4294967296', '--unresolved-symbols=import-dynamic', '-o', out,
            f'@{rsp}'] + objs + [gexrt]

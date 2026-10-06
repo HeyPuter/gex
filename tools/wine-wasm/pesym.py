@@ -136,7 +136,7 @@ def rewrite(b, fix, aliases=()):
                     nm, s = name(b, s)
                     align, s = leb(b, s)
                     flags, s = leb(b, s)
-                    if nm == 'gexw_entries':
+                    if nm in ('gexw_entries', 'gexw_entries_decl'):
                         flags |= WASM_SEG_FLAG_RETAIN
                     segs += enc_name(nm) + enc(align) + enc(flags)
                 body += bytes([sub]) + enc(len(segs)) + segs; r = subend; continue
