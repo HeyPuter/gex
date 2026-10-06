@@ -170,21 +170,45 @@ The plan does the same with **wasm32 as Wine's host architecture**:
 - **Native Unix libraries,** in priority order: ntdll.so, win32u.so,
   winewayland.drv, opengl32, ws2_32, crypt32, secur32, dnsapi, nsiproxy,
   winepulse/winealsa (audio, §6), then winevulkan.
-- **wineserver in-process (decided after W0(a), 2026-10-04).** wineserver
-  shares coherent `MAP_SHARED` memory with its clients: session objects,
+- **wineserver in-process, as a thread (chosen design; built in W3.1,
+  approved 2026-10-06).** wineserver shares coherent `MAP_SHARED` memory
+  with its clients: the user shared data (the clock), session objects,
   and since Wine 9 the queue and desktop state win32u reads directly. gex
   processes have separate linear memories, and in the browser separate
-  `WebAssembly.Memory`s cannot alias. So wineserver runs as a thread of the
-  Windows process: `clone(CLONE_VM)` without `CLONE_FILES`, i.e. the same
-  memory but its own fd table, its own module instance and its own data
-  region. Its protocol stays Wine's (the Unix socket, SCM_RIGHTS, the
-  request and reply pipes), so the server and ntdll.so are unmodified Wine.
-  - It needs gex-kernel to support a long-lived `CLONE_VM` process (shared
-    memory, separate fd table and pid).
-  - Several Windows processes in one session share one address space.
-    That fits i386 programs (2 GiB each at most) only with memory64; until
-    then, one Windows process per session, which covers the games.
-  - **Later:** a direct-call transport in place of the socket.
+  `WebAssembly.Memory`s cannot alias, so the server lives in the Windows
+  process: linked into the Wine loader (the server's objects compiled
+  with `server/wasm32_inproc.h`, which renames what both sides define and
+  makes its `main` and exits `wineserver_main`/`wineserver_exit`) and
+  started by ntdll.so's `start_server` as a **thread**. It has its own
+  working directory (`unshare(CLONE_FS)`), shares the process's
+  descriptors and memory, takes no SIGCHLD (the process's children are
+  ntdll.so's), and maps the user shared data at the client's 0x7ffe0000
+  (one wasm memory cannot map a page at two addresses; gex hands a second
+  `MAP_SHARED` of the same open file the first mapping's pages, so later
+  maps, the session's, simply share the server's address). Its protocol
+  stays Wine's (the Unix socket, SCM_RIGHTS, request and reply pipes): the
+  server and ntdll.so are otherwise unmodified Wine. No host-side process
+  machinery is involved, so it is the same in the browser.
+  - **Known gap: child Windows processes.** A second Windows process
+    (a launcher starting the game, a crash handler such as Unity's
+    UnityCrashHandler, an out-of-process RPC/COM server, a process a
+    program spawns) is a separate gex process: it connects to the first
+    process's server through the socket and works, but it cannot see the
+    server's shared memory. It reads a stale copy of what it mapped: the
+    clock in its user shared data does not move, and win32u's session
+    state (windows, queues, the desktop) is not shared with it. One
+    Windows process per session, which covers most games, but not
+    launcher-started ones.
+  - **What would lift it** (later, none planned yet): a `MAP_SHARED` that
+    stays coherent across gex processes. Natively, the host can map one
+    memfd into several linear memories at the same guest address (the
+    memories are host mappings). In the browser there is no aliasing
+    between `WebAssembly.Memory`s; the options are processes of one
+    session as threads of one memory (memory64 for several 2 GiB i386
+    address spaces), or copying the shared pages at synchronisation
+    points (server requests, waits) for the state that tolerates it (the
+    clock), which does not cover win32u's lock-free reads. A direct-call
+    transport in place of the socket is a separate, later optimisation.
 - **Sync through ntsync.** Wine 11 supports the ntsync driver
   (`dlls/ntdll/unix/sync.c`). gex-kernel implements `/dev/ntsync`, and its
   ioctls (semaphores, mutexes, events, wait-any/all) go to the kernel's
