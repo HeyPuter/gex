@@ -258,6 +258,7 @@ const EGL_CONTEXT_MAJOR_VERSION: EGLint = 0x3098;
 const EGL_CONTEXT_MINOR_VERSION: EGLint = 0x30FB;
 const EGL_CONTEXT_OPENGL_PROFILE_MASK: EGLint = 0x30FD;
 const EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT: EGLint = 0x2;
+const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: EGLint = 0x1;
 
 /// Desktop GL's fixed-function entry points, which libGLESv2 does not
 /// export: looked up through EGL once a desktop context exists.
@@ -447,6 +448,9 @@ pub struct Gl {
     current_on: Option<std::thread::ThreadId>,
     /// Fixed function, once the context is a desktop one.
     compat: Option<Compat>,
+    /// The desktop context's request (major, minor, compatibility), so a
+    /// later CONTEXT_CREATE asking for something else gets a new context.
+    desktop: Option<(u32, u32, bool)>,
     /// Read when the context is made; the answer never changes after.
     pub vendor: String,
     pub renderer: String,
@@ -588,6 +592,7 @@ impl Gl {
                 width,
                 height,
                 compat: None,
+                desktop: None,
                 vendor: gl_string(0x1F00),
                 renderer: gl_string(0x1F01),
                 version: gl_string(0x1F02),
@@ -630,7 +635,51 @@ impl Gl {
     /// `major` 0 asks for the highest version the host offers; a
     /// compatibility context of an older version is a valid answer to any
     /// request for 2.x or 3.0, so those are not passed on.
-    fn become_desktop(&mut self, major: u32, minor: u32) -> Result<(), String> {
+    /// Back to an OpenGL ES context (a guest that made a desktop one, threw
+    /// it away and asked for ES: SDL's GLX path).
+    fn become_es(&mut self, major: u32) -> Result<(), String> {
+        unsafe {
+            eglBindAPI(EGL_OPENGL_ES_API);
+            let attrs = [
+                EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE,
+            ];
+            let mut config: EGLConfig = std::ptr::null_mut();
+            let mut num = 0;
+            if eglChooseConfig(self.display, attrs.as_ptr(), &mut config, 1, &mut num) == 0 || num < 1 {
+                return Err("no OpenGL ES EGL config".into());
+            }
+            let ctx_attrs = [EGL_CONTEXT_CLIENT_VERSION, major.max(2) as EGLint, EGL_NONE];
+            let context = eglCreateContext(self.display, config, std::ptr::null_mut(), ctx_attrs.as_ptr());
+            if context.is_null() {
+                return Err(format!("no OpenGL ES context: {:#x}", eglGetError()));
+            }
+            let pb = [EGL_WIDTH, self.width, EGL_HEIGHT, self.height, EGL_NONE];
+            let surface = eglCreatePbufferSurface(self.display, config, pb.as_ptr());
+            if surface.is_null() || eglMakeCurrent(self.display, surface, surface, context) == 0 {
+                eglDestroyContext(self.display, context);
+                return Err(format!("no OpenGL ES pbuffer: {:#x}", eglGetError()));
+            }
+            eglDestroySurface(self.display, self.surface);
+            eglDestroyContext(self.display, self.context);
+            self.surface = surface;
+            self.context = context;
+            self.config = config;
+            self.names = Names::default();
+            self.pack_store = PixelStore::default();
+            self.unpack_store = PixelStore::default();
+            self.current_on = Some(std::thread::current().id());
+            self.compat = None;
+            self.desktop = None;
+            self.vendor = gl_string(0x1F00);
+            self.renderer = gl_string(0x1F01);
+            self.version = gl_string(0x1F02);
+        }
+        Ok(())
+    }
+
+    fn become_desktop(&mut self, major: u32, minor: u32, compat: bool) -> Result<(), String> {
         unsafe {
             if eglBindAPI(EGL_OPENGL_API) == 0 {
                 return Err(format!("no desktop OpenGL in EGL: {:#x}", eglGetError()));
@@ -660,9 +709,11 @@ impl Gl {
                 eglBindAPI(EGL_OPENGL_ES_API);
                 return Err("no desktop OpenGL EGL config".into());
             }
+            // Core only when asked for, from 3.2 (where profiles begin).
+            let core = !compat && (major > 3 || (major == 3 && minor >= 2));
             let mut ctx_attrs = vec![
                 EGL_CONTEXT_OPENGL_PROFILE_MASK,
-                EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
+                if core { EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT } else { EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT },
             ];
             if major > 3 || (major == 3 && minor > 0) {
                 ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MAJOR_VERSION, major as EGLint]);
@@ -694,6 +745,7 @@ impl Gl {
             self.unpack_store = PixelStore::default();
             self.current_on = Some(std::thread::current().id());
             self.compat = Compat::load();
+            self.desktop = Some((major, minor, !core));
             self.vendor = gl_string(0x1F00);
             self.renderer = gl_string(0x1F01);
             self.version = gl_string(0x1F02);
@@ -799,9 +851,19 @@ impl Gl {
                     else {
                         return true;
                     };
-                    if api == crate::proto::client_api::DESKTOP && self.compat.is_none() {
-                        if let Err(e) = self.become_desktop(major, minor) {
+                    // { api, major, minor, profile }: profile 1 is
+                    // compatibility (older guests send three words: the
+                    // compatibility profile, as before).
+                    let compat = a.u32().is_none_or(|p| p != 0);
+                    let core = !compat && (major > 3 || (major == 3 && minor >= 2));
+                    let changed = self.desktop.is_some_and(|(_, _, c)| c == core);
+                    if api == crate::proto::client_api::DESKTOP && (self.compat.is_none() || changed) {
+                        if let Err(e) = self.become_desktop(major, minor, compat) {
                             eprintln!("gex-gl: {e}; staying on OpenGL ES");
+                        }
+                    } else if api != crate::proto::client_api::DESKTOP && self.compat.is_some() {
+                        if let Err(e) = self.become_es(major) {
+                            eprintln!("gex-gl: {e}; staying on desktop OpenGL");
                         }
                     }
                     reply.blob(self.vendor.as_bytes());

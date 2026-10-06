@@ -1972,7 +1972,19 @@ void glGetIntegerv(unsigned pname, int *out) {
         return;
     }
     if (pname == 0x9126u) { /* GL_CONTEXT_PROFILE_MASK */
-        if (out) out[0] = egl_api == 0x30A2u ? 1 : 0; /* GL_CONTEXT_CORE_PROFILE_BIT */
+        /* What the host's context is: its version string says compatibility
+           when it is one (GL_CONTEXT_COMPATIBILITY_PROFILE_BIT, 2), and a
+           desktop context of 3.2 or later otherwise is core (1). ES has no
+           profiles. This answered core for every desktop context. */
+        int mask = 0;
+        if (egl_api == 0x30A2u) {
+            const char *v = (const char *)glGetString(0x1F02u);
+            int major = 0, minor = 0;
+            host_gl_version(&major, &minor);
+            if (v && strstr(v, "Compatibility")) mask = 2;
+            else if (major > 3 || (major == 3 && minor >= 2)) mask = 1;
+        }
+        if (out) out[0] = mask;
         return;
     }
     /* Sized from the pname before the request goes out, for two reasons.
@@ -3001,7 +3013,11 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
     /* A safety net for callers that reach a current context without going
        through this library's eglCreateContext. The latch inside makes it a
        no-op once the host context exists. */
-    if (ctx) context_create();
+    /* Only when there is none: the latch counts a context per call, and
+       counting every make-current as a new context kept the host context
+       alive after its last eglDestroyContext (SDL's throwaway GLX context
+       then stood in for the one it really wanted). */
+    if (ctx && !host_context_made) context_create();
     egl_current_display = ctx ? dpy : NULL;
     egl_current_context = ctx;
     egl_current_draw = ctx ? draw : NULL;
