@@ -429,7 +429,6 @@ U(mono_unity_free_captured_memory_snapshot) { ENTER; RETV; }
  * objects meanwhile. */
 typedef struct {
 	MonoClass *filter;
-	GPtrArray *fakes; /* stand-in wrappers for GameObjects (lv_keep_gameobject) */
 	guint32 max;
 	uint64_t cb, data;
 	void **arr;
@@ -449,21 +448,21 @@ lv_new (MonoClass *filter, guint32 max, uint64_t cb, uint64_t data)
 	s->arr = g_new0 (void *, s->max);
 	s->seen = g_hash_table_new (NULL, NULL);
 	s->stack = g_ptr_array_new ();
-	s->fakes = g_ptr_array_new ();
 	return s;
 }
 
 static int lv_env (const char *name);
-/* The walk is opt-in (GEXMONO_LIVENESS=1) until the Instantiate crash it
- * exposes in Hollow Knight is understood (docs/unity-dotnet.md §12); off, the
- * provider reports nothing, as before. GEXMONO_LV_OFF=1 walks but reports
- * nothing. */
+/* The walk is on by default; GEXMONO_LIVENESS=0 turns it off (the provider then reports
+ * nothing: Unity unloads every asset only script data holds). GEXMONO_LV_OFF=1 walks but
+ * reports nothing. */
 static int
 lv_on (void)
 {
 	static int on = -1;
-	if (on < 0)
-		on = lv_env ("GEXMONO_LIVENESS");
+	if (on < 0) {
+		const char *v = getenv ("GEXMONO_LIVENESS");
+		on = !v || !*v || strcmp (v, "0");
+	}
 	return on;
 }
 /* GEXMONO_LV_TRACE=1: each reported object and each root, as class and Unity instance ID
@@ -506,9 +505,6 @@ lv_free (Liveness *s)
 		return;
 	g_hash_table_destroy (s->seen);
 	g_ptr_array_free (s->stack, TRUE);
-	for (guint i = 0; i < s->fakes->len; i++)
-		g_free (g_ptr_array_index (s->fakes, i));
-	g_ptr_array_free (s->fakes, TRUE);
 	g_free (s->arr);
 	g_free (s);
 }
@@ -520,7 +516,6 @@ lv_free (Liveness *s)
  * next pass. */
 static int lv_env (const char *name);
 static GHashTable *lv_pass_seen;
-static GHashTable *lv_pass_go; /* GameObjects already reported this pass (lv_keep_gameobject) */
 static pthread_mutex_t lv_pass_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
@@ -529,8 +524,6 @@ lv_pass_reset (void)
 	pthread_mutex_lock (&lv_pass_lock);
 	if (lv_pass_seen)
 		g_hash_table_remove_all (lv_pass_seen);
-	if (lv_pass_go)
-		g_hash_table_remove_all (lv_pass_go);
 	pthread_mutex_unlock (&lv_pass_lock);
 }
 
@@ -613,16 +606,6 @@ lv_fields (Liveness *s, MonoClass *k, char *base, gboolean boxed)
 	}
 }
 
-/* Workaround, pending the real rule (docs/unity-dotnet.md §12 item 16-17): Unity's GC marks a
- * component's GameObject from the component only when the component's GC entry has a flag (0x2)
- * that a component kept alive through script data does not get here, so the GameObject was
- * unloaded under a live component (Hollow Knight's loading-spinner prefab). For each reported
- * UnityEngine.Component the walk also reports its GameObject, through a stand-in for a managed
- * wrapper: Unity's callback reads only the wrapper's m_CachedPtr (+0x10) and the native object's
- * instance ID (+8); a Component's native GameObject pointer is at +0x20.
- * GEXMONO_LV_NOGO=1 turns it off. */
-static MonoClass *lv_component_class;
-
 static void
 lv_report (Liveness *s, MonoObject *o)
 {
@@ -632,57 +615,11 @@ lv_report (Liveness *s, MonoObject *o)
 }
 
 static void
-lv_keep_gameobject (Liveness *s, MonoObject *o, MonoClass *k)
-{
-	static int off = -1;
-	if (off < 0)
-		off = lv_env ("GEXMONO_LV_NOGO");
-	if (off || !lv_component_class || !mono_class_is_subclass_of_internal (k, lv_component_class, FALSE))
-		return;
-	uint8_t *native = *(uint8_t **)((char *)o + MONO_ABI_SIZEOF (MonoObject));
-	if ((uintptr_t)native < 0x10000 || (uintptr_t)native >= ((uintptr_t)1 << 34))
-		return;
-	uint8_t *go = *(uint8_t **)(native + 0x20);
-	if ((uintptr_t)go < 0x10000 || (uintptr_t)go >= ((uintptr_t)1 << 34))
-		return;
-	pthread_mutex_lock (&lv_pass_lock);
-	if (!lv_pass_go)
-		lv_pass_go = g_hash_table_new (NULL, NULL);
-	gboolean seen = g_hash_table_contains (lv_pass_go, go);
-	if (!seen)
-		g_hash_table_add (lv_pass_go, go);
-	pthread_mutex_unlock (&lv_pass_lock);
-	if (seen)
-		return;
-	uintptr_t *fake = g_new0 (uintptr_t, 3);
-	fake [2] = (uintptr_t)go; /* where m_CachedPtr sits after the 16-byte header */
-	g_ptr_array_add (s->fakes, fake);
-	lv_report (s, (MonoObject *)fake);
-	/* And the GameObject's components (its component array: {type, component} pairs at
-	 * [go+0x20], count at [go+0x30]), which Unity does not pull in from the GameObject either. */
-	uintptr_t *comps = *(uintptr_t **)(go + 0x20);
-	uintptr_t count = *(uintptr_t *)(go + 0x30);
-	if ((uintptr_t)comps < 0x10000 || (uintptr_t)comps >= ((uintptr_t)1 << 34) || count > 256)
-		return;
-	for (uintptr_t i = 0; i < count; i++) {
-		uintptr_t comp = comps [2 * i + 1];
-		if (comp < 0x10000 || comp >= ((uintptr_t)1 << 34))
-			continue;
-		uintptr_t *f = g_new0 (uintptr_t, 3);
-		f [2] = comp;
-		g_ptr_array_add (s->fakes, f);
-		lv_report (s, (MonoObject *)f);
-	}
-}
-
-static void
 lv_object_walk (Liveness *s, MonoObject *o, gboolean report)
 {
 	MonoClass *k = mono_object_class (o);
-	if (report && s->filter && mono_class_is_subclass_of_internal (k, s->filter, FALSE)) {
+	if (report && s->filter && mono_class_is_subclass_of_internal (k, s->filter, FALSE))
 		lv_report (s, o);
-		lv_keep_gameobject (s, o, k);
-	}
 	if (m_class_get_rank (k)) {
 		MonoArray *a = (MonoArray *)o;
 		MonoClass *ek = m_class_get_element_class (k);
@@ -741,21 +678,30 @@ void sgen_gc_lock (void);
 void sgen_gc_unlock (void);
 static int lv_world_stopped;
 
-/* allocate_struct (filter, max_count, callback, userdata, reallocate): Unity 2021+. */
+/* Report what a from_root / from_statics call found before returning, as Unity's Mono does
+ * (unity-liveness.c filters and calls back at the end of each calculation): Unity marks the
+ * reported objects into its queue and drains it (their native dependencies: a Font's atlas
+ * texture and material, a component's GameObject...) before it calls liveness_finalize, so
+ * objects first reported from finalize were marked with none of their dependencies, which
+ * Unity then unloaded under them (Hollow Knight's menu labels drew from a font whose atlas
+ * texture had been unloaded and reloaded empty). GEXMONO_LV_LATE=1 restores the old
+ * flush-at-finalize behaviour, for comparison. */
 static void
-lv_resolve_component (MonoClass *filter)
+lv_flush_now (Liveness *s)
 {
-	if (lv_component_class || !filter)
-		return;
-	ERROR_DECL (err);
-	lv_component_class = mono_class_from_name_checked (m_class_get_image (filter), "UnityEngine", "Component", err);
-	mono_error_cleanup (err);
+	static int late = -1;
+	if (late < 0)
+		late = lv_env ("GEXMONO_LV_LATE");
+	if (!late)
+		lv_flush (s);
 }
-U(mono_unity_liveness_allocate_struct) { ENTER; lv_resolve_component ((MonoClass *)P (0)); RET (lv_new ((MonoClass *)P (0), (guint32)A (1), A (2), A (3))); }
+
+/* allocate_struct (filter, max_count, callback, userdata, reallocate): Unity 2021+. */
+U(mono_unity_liveness_allocate_struct) { ENTER; RET (lv_new ((MonoClass *)P (0), (guint32)A (1), A (2), A (3))); }
 U(mono_unity_liveness_free_struct) { ENTER; lv_free ((Liveness *)P (0)); RETV; }
 U(mono_unity_liveness_finalize) { ENTER; if (P (0)) lv_flush ((Liveness *)P (0)); RETV; }
 /* calculation_begin (filter, max_count, callback, userdata, world_start, world_stop): the older form. */
-U(mono_unity_liveness_calculation_begin) { ENTER; lv_pass_reset (); lv_resolve_component ((MonoClass *)P (0)); RET (lv_new ((MonoClass *)P (0), (guint32)A (1), A (2), A (3))); }
+U(mono_unity_liveness_calculation_begin) { ENTER; lv_pass_reset (); RET (lv_new ((MonoClass *)P (0), (guint32)A (1), A (2), A (3))); }
 U(mono_unity_liveness_calculation_end) { ENTER; if (P (0)) lv_flush ((Liveness *)P (0)); lv_free ((Liveness *)P (0)); RETV; }
 U(mono_unity_liveness_calculation_from_root)
 {
@@ -772,6 +718,7 @@ U(mono_unity_liveness_calculation_from_root)
 				m_class_get_name (mono_object_class (P (0))), lv_iid (P (0)));
 		lv_object_walk (s, (MonoObject *)P (0), FALSE);
 		lv_drain (s);
+		lv_flush_now (s);
 	}
 	RETV;
 }
@@ -796,6 +743,7 @@ U(mono_unity_liveness_calculation_from_statics)
 		}
 		g_ptr_array_free (vts, TRUE);
 		lv_drain (s);
+		lv_flush_now (s);
 	}
 	RETV;
 }

@@ -1049,7 +1049,7 @@ Not yet:
      MONO_GC_DEBUG=verify-before-collections / check-at-minor style heap
      checks, and the class.c:2272 caller.
   13. **Gate head 55c3197f (2026-10-06):** liveness walk opt-in
-     (`GEXMONO_LIVENESS=1`; off = the old stubs), netlink socket, F's notes,
+     (`GEXMONO_LIVENESS=1` then; on by default since item 18), netlink socket, F's notes,
      HOME_SEED/OVERLAY/xfocus/probe tooling. Legs on it with `scratch/unity/dnc`
      rebuilt from it: embed PASS, prov64 PASS, fjit-procs ok/ok, Muck batch
      --fjit reaches "Initializing packets", HK batch reaches "Unloading 153" and
@@ -1156,4 +1156,47 @@ Not yet:
      title, particles, menu arrows); the menu item labels draw as black
      boxes (text: TextMeshPro font warnings earlier in the log; next to look
      at), cameras 5, ~50k renders.
+  18. **Root cause of 12-17 and of the black labels: the walk reported too
+     late (2026-10-06, runs hk102-hk107).** Unity's GC driver (UnityPlayer
+     0x130d26b on) runs, per GC: the mark jobs, each draining its state's
+     queue (0x12f2e60; the queue is what the mark function 0x12f1ef0 pushes
+     an object's entry onto, unless the entry has flag 0x8), with
+     `from_root` called from the MonoBehaviour case and `from_statics` on
+     the main state; then, after every queue is drained,
+     `mono_unity_liveness_finalize` on each state (0x12f30a0); then
+     `free_struct`. The provider reported objects to Unity's callback only
+     when its buffer filled or at finalize, so most objects found by the walk
+     were marked after the last drain: marked, kept, but none of their native
+     dependencies followed. Unity's Mono reports at the end of each
+     `from_root`/`from_statics` call (unity-liveness.c), which the provider
+     now does too (`lv_flush_now`; `GEXMONO_LV_LATE=1` restores the old
+     behaviour for comparison).
+     This explains all of it: the spinner component kept without its
+     GameObject (items 14-17: its entry was never dequeued, so the
+     dependency step and its flag-0x2 test never ran for it; flag 0x2 is set
+     on nearly every entry, it was a red herring), and the black labels: a
+     dynamic Font kept by script data, its atlas texture (the Font's PPtrs at
+     native +0x30 material, +0x34 texture) unloaded and reloaded from disk as
+     the serialized 0x0 texture while the Font's glyph cache stayed, so glyph
+     updates went to a GL texture with no storage (the GL capture: texture
+     459 generated then only `TexSubImage2D`'d, `GetNativeTexturePtr` 458 on a
+     0x0 "Font Texture"; GexProbe `GEXPROBE_FONTS=1` shows each font's atlas).
+     Not a liveness victim of TextMeshPro (its font assets were alive, hk100)
+     nor a GL-path problem.
+     With the fix and **no workaround** (the stand-in GameObject reporting of
+     item 17 is removed) Hollow Knight passes the spinner Instantiate, reaches
+     Menu_Title with graphics, and the menu labels render
+     (`scratch/unity/screens/hk-menu-labels.png`, hk107). The walk is now on by
+     default (`GEXMONO_LIVENESS=0` turns it off).
+     How found: a diagnostic that read Unity's GC table from the callback's
+     userdata (Unity 6000.0 linux-x64: `[data+8]` = table, entries of 24
+     bytes {object, RTTI, flags} at table+0, buckets of 12 bytes {hash,
+     instance ID, entry index} at table+0x48, mask x4 at table+0x50; RTTI
+     +16 = class name) showed the marked Font with its texture and material
+     unmarked; reading the driver showed when finalize runs.
+     **BinaryFormatter:** `build.sh`'s `formatters` step (63c7f5da) restores
+     the out-of-band System.Runtime.Serialization.Formatters NuGet package
+     (10.0.*, its net8.0+ assembly) into `OUT/lib-extra`, which
+     `muck-dotnet.sh` copies over the framework's stub; HK's
+     `JsonSharedData.Save` no longer throws (hk102).
 
