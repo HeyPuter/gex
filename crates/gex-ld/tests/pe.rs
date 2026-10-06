@@ -399,16 +399,106 @@ fn unknown_relocation_types_fail_loudly() {
     assert!(e.to_string().contains("base relocation type 1 (HIGH)"), "{e}");
 }
 
-/// A managed image is refused by name.
-#[test]
-fn clr_images_fail_loudly() {
+/// Patch hello32.exe into a CLR image: a COR20 header in .data (file
+/// offset of .data + 0x40) with `flags`, `entry` and one vtable fixup of
+/// two 32-bit slots at .data + 0x180, and `xor eax, eax; ret` in .text's
+/// padding. Returns the bytes and .data's RVA.
+fn clr_image(flags: u32, entry: u32) -> (Vec<u8>, u32) {
     let mut bytes = std::fs::read(fixture("x86/hello32.exe")).unwrap();
     let img = pe::parse(&bytes).unwrap();
+    let data = img.sections.iter().find(|s| s.name == ".data").unwrap().clone();
+    let text = img.sections.iter().find(|s| s.name == ".text").unwrap().clone();
+    let (drva, doff) = (data.rva, data.raw_offset as usize);
+    let w32 = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let h = doff + 0x40;
+    w32(&mut bytes, h, 72);
+    w32(&mut bytes, h + 16, flags);
+    w32(&mut bytes, h + 20, entry);
+    w32(&mut bytes, h + 48, drva + 0x100);
+    w32(&mut bytes, h + 52, 8);
+    w32(&mut bytes, doff + 0x100, drva + 0x180);
+    bytes[doff + 0x104..doff + 0x108].copy_from_slice(&[2, 0, 9, 0]); // 2 slots, 32-bit
+    w32(&mut bytes, doff + 0x180, 0x0600_0001); // method tokens
+    w32(&mut bytes, doff + 0x184, 0x0600_0002);
+    let pad = text.raw_offset as usize + 0x1f0;
+    bytes[pad..pad + 3].copy_from_slice(&[0x33, 0xc0, 0xc3]);
     let dd = img.opt_offset + 96 + pe::dir::CLR * 8;
-    bytes[dd..dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
-    bytes[dd + 4..dd + 8].copy_from_slice(&0x48u32.to_le_bytes());
+    w32(&mut bytes, dd, drva + 0x40);
+    w32(&mut bytes, dd + 4, 72);
+    (bytes, drva)
+}
+
+/// An IL-only image is refused by name: it needs a CLR.
+#[test]
+fn clr_images_fail_loudly() {
+    let (bytes, _) = clr_image(1, 0x0600_0001);
     let e = pe::parse(&bytes).unwrap_err();
     assert!(e.to_string().contains(".NET/CLR"), "{e}");
+}
+
+/// A mixed-mode image (C++/CLI, Hades' BasecampBugReporter.Native.dll)
+/// loads as native code: its native entry point, no COM descriptor, and
+/// its managed entries returning 0.
+#[test]
+fn mixed_mode_images_load_as_native_code() {
+    let (bytes, drva) = clr_image(0x10, 0x100b);
+    let img = pe::parse(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    let m = img.map(img.preferred_base).unwrap();
+    let r32 = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+    assert_eq!(r32(img.opt_offset + 16), 0x100b, "the native entry point");
+    assert_eq!(r32(img.opt_offset + 96 + pe::dir::CLR * 8), 0, "no COM descriptor");
+    for slot in [drva + 0x180, drva + 0x184] {
+        let target = r32(slot as usize) as u64 - img.preferred_base;
+        assert_eq!(&m[target as usize..target as usize + 3], &[0x33, 0xc0, 0xc3]);
+    }
+}
+
+/// A certificate table past the end of the file (a signature cut off after
+/// signing, as in Undertale's executable) is ignored, as Windows' loader
+/// does: the table is never mapped.
+#[test]
+fn a_truncated_certificate_table_is_ignored() {
+    let mut bytes = std::fs::read(fixture("x86/hello32.exe")).unwrap();
+    let img = pe::parse(&bytes).unwrap();
+    let dd = img.opt_offset + 96 + pe::dir::SECURITY * 8;
+    let past_end = bytes.len() as u32 + 0x800;
+    bytes[dd..dd + 4].copy_from_slice(&past_end.to_le_bytes());
+    bytes[dd + 4..dd + 8].copy_from_slice(&0x13e0u32.to_le_bytes());
+    let img = pe::parse(&bytes).unwrap();
+    assert_eq!(img.dir(pe::dir::SECURITY), (0, 0));
+    // Any other directory past the image is still malformed.
+    let dd = img.opt_offset + 96 + pe::dir::EXPORT * 8;
+    bytes[dd..dd + 4].copy_from_slice(&(img.image_size + 0x1000).to_le_bytes());
+    bytes[dd + 4..dd + 8].copy_from_slice(&0x10u32.to_le_bytes());
+    assert_eq!(pe::parse(&bytes).unwrap_err().kind, PeErrorKind::Malformed);
+}
+
+/// Raw data past a section's VirtualSize is in the file, not the image:
+/// Godot appends its game as a `pck` section of VirtualSize 8 whose raw data
+/// runs far past SizeOfImage. Such an image loads, and the extra bytes are
+/// not mapped.
+#[test]
+fn raw_data_past_virtual_size_is_not_mapped() {
+    let mut bytes = std::fs::read(fixture("x86/hello32.exe")).unwrap();
+    let img = pe::parse(&bytes).unwrap();
+    // .data: nothing the loader reads lives there.
+    let last = img.sections.iter().position(|s| s.name == ".data").unwrap();
+    let s = &img.sections[last];
+    let opt_size = u16::from_le_bytes([bytes[img.opt_offset - 4], bytes[img.opt_offset - 3]]) as usize;
+    let hdr = img.opt_offset + opt_size + last * 40;
+    // Point the section's raw data at 1 MiB of 0xab appended to the
+    // file, keeping its VirtualSize.
+    let (vsize, rva) = (s.vsize.max(1), s.rva);
+    let off = bytes.len().div_ceil(0x200) * 0x200;
+    bytes.resize(off, 0);
+    bytes.extend(std::iter::repeat(0xab).take(1 << 20));
+    bytes[hdr + 8..hdr + 12].copy_from_slice(&vsize.to_le_bytes());
+    bytes[hdr + 16..hdr + 20].copy_from_slice(&(1u32 << 20).to_le_bytes());
+    bytes[hdr + 20..hdr + 24].copy_from_slice(&(off as u32).to_le_bytes());
+    let img = pe::parse(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    let mapped = img.map(img.preferred_base).unwrap();
+    assert_eq!(mapped.len(), img.image_size as usize);
+    assert_eq!(mapped[rva as usize], 0xab);
 }
 
 /// With no `.reloc`, an image moves only if it was linked `DYNAMIC_BASE`
