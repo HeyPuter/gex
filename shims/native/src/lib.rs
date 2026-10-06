@@ -1921,6 +1921,13 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // the kernel's encoding: handing it `code` and correcting the cell
             // afterwards let a parent parked in `wait4` read `exit 7` as a
             // death by signal 7 ("Bus error") in between.
+            // Its descriptors close before its parent can see it gone, as on
+            // Linux: a listening socket's port is free once `wait4` returns.
+            {
+                let mut k = cleanup.kernel.lock().unwrap_or_else(|e| e.into_inner());
+                k.fds.close_all();
+                k.sockets.clear();
+            }
             procs.exit(pid, wstatus);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
