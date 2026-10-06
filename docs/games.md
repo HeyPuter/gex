@@ -504,9 +504,32 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
   only its CEF uses X). Next: how the page shows a GL surface made for an X
   window (gexgl eglCreateWindowSurface with an X window id under hostx).
 - Baba Is You: from its game directory (`@bin64/Chowdren`) it finds its
-  assets; it still stops right after printing its renderer (the version
-  part of that line is empty) and, in one run, opened an SDL message box
-  (a forked child whose X font request failed, so the text is unknown).
+  assets. It requires six GL extensions by name and showed "OpenGL
+  extension 'GL_ARB_shader_objects' not supported." in an SDL message box
+  (a forked child whose X font request failed, so it only hung; the line
+  `Renderer: R - V - ` is meant to end empty). The guest GL withheld the
+  extension for one missing command, glDeleteObjectARB; with it Baba
+  renders its intro screens. Run fullscreen (its default), the frames are
+  cropped: SDL believes the window is the screen's size while the GL
+  drawable keeps the window's 854x480 (no X window manager in the guest to
+  carry the fullscreen request). It keeps its settings in
+  ~/.local/share/Baba_Is_You from getpwuid(), not $HOME.
+- Xwayland in the guest: `gexc run --bind` puts tests/games/xkbcomp-cache.sh
+  over /usr/bin/xkbcomp (matrix.sh does it for linux-x11 games), so the
+  keymap is compiled once (/tmp/gex-xkm-cache-UID) and later runs copy it.
+- GLX: contexts are what glXCreateContextAttribsARB asked for
+  (tests/games/glx-context.sh: 3.2 core, 2.1 compatibility, ES 2.0 after
+  SDL's throwaway context).
+- The page (browser-linux.mjs; own ports 5291/9431): Retrocycles' GL
+  frames were attached to SDL 1.2's child window, which no compositor
+  window has; they now name its top-level window. The run still shows
+  black: Mesa keeps drawing (about 25 draws a second under SwiftShader on
+  a loaded gooner, immediate-mode draws, each with its own buffer map),
+  the compositor worker that hosts Mesa repaints only a handful of frames
+  (its animation loop does not get a turn while the GL ring is served), and
+  after a screen change one batch takes over the bridge's 30 s limit. Next
+  steps: a real GPU (edger) to separate slowness from the compositor
+  starving, and letting the compositor repaint between GL batches.
 
 ### Resume (stream G)
 
