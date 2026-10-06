@@ -41,7 +41,7 @@ pub struct Jit {
 struct Learned {
     /// Entries tier-1 serves with a host builtin (`memcpy` and friends, by
     /// symbol): their functions are the builtin, as in tier-1.
-    intrinsics: HashMap<u64, Intrinsic>,
+    intrinsics: std::sync::Arc<HashMap<u64, Intrinsic>>,
     /// Every function start seen: a call or jump to one is a call or tail
     /// call, and bounds the functions around it.
     starts: BTreeMap<u64, StartInfo>,
@@ -57,8 +57,12 @@ struct Learned {
 
 #[derive(Default)]
 struct State {
-    /// By process ([`Jit::translate_in`]'s `process`; 0 for a runner with one).
+    /// By process ([`Jit::translate_in`]'s `process`; 0 for a runner with one
+    /// process per translator, as the browser shim is).
     procs: HashMap<u64, Learned>,
+    /// Processes [`Jit::forget`] dropped: a translation still in flight for
+    /// one must not bring its state back.
+    gone: HashSet<u64>,
     /// For `GEX_FJIT_STATS`: translations, functions, time in recovery and
     /// emission, module bytes.
     modules: u64,
@@ -71,7 +75,7 @@ struct State {
 impl Jit {
     pub fn new(intrinsics: HashMap<u64, Intrinsic>) -> Jit {
         let jit = Jit::default();
-        jit.st.lock().unwrap_or_else(|e| e.into_inner()).procs.entry(0).or_default().intrinsics = intrinsics;
+        jit.st.lock().unwrap_or_else(|e| e.into_inner()).procs.entry(0).or_default().intrinsics = std::sync::Arc::new(intrinsics);
         jit
     }
 
@@ -79,13 +83,15 @@ impl Jit {
     /// starts with what the loader knows of that image and nothing else --
     /// a new process, or an `execve` over an old one.
     pub fn image(&self, process: u64, intrinsics: HashMap<u64, Intrinsic>, image: &gex_ld::Image, elf: Option<&[u8]>) {
-        self.st.lock().unwrap_or_else(|e| e.into_inner()).procs.insert(process, Learned { intrinsics, ..Learned::default() });
+        self.st.lock().unwrap_or_else(|e| e.into_inner()).procs.insert(process, Learned { intrinsics: std::sync::Arc::new(intrinsics), ..Learned::default() });
         self.add_image_in(process, image, elf);
     }
 
     /// Process `process` is gone.
     pub fn forget(&self, process: u64) {
-        self.st.lock().unwrap_or_else(|e| e.into_inner()).procs.remove(&process);
+        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        st.procs.remove(&process);
+        st.gone.insert(process);
     }
 
     /// The process replaced its program (`execve`): forget everything
@@ -165,9 +171,11 @@ impl Jit {
             eprintln!("[fjit] translate {addr:#x}: bytes {:02x?}", &mem[addr as usize..addr as usize + 16]);
         }
         let mut guard = self.st.lock().unwrap_or_else(|e| e.into_inner());
-        let State { procs, modules, functions: n_functions, recover_us, emit_us, bytes } = &mut *guard;
-        let st = procs.entry(process).or_default();
-        let intrinsics = st.intrinsics.clone();
+        let State { procs, gone, modules, functions: n_functions, recover_us, emit_us, bytes } = &mut *guard;
+        // A process already gone (a late request): what it learns goes nowhere.
+        let mut scratch = Learned::default();
+        let st = if gone.contains(&process) { &mut scratch } else { procs.entry(process).or_default() };
+        let intrinsics = std::sync::Arc::clone(&st.intrinsics);
         let readonly = st.readonly.clone();
         let ro = |a: u64, n: u64| readonly.iter().any(|&(lo, hi)| a >= lo && a.saturating_add(n) <= hi) || read_only(a, n);
         let code = Code::memory(mem, executable, &ro);

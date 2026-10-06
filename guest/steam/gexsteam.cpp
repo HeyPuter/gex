@@ -91,6 +91,18 @@ static void *gex_find(const char *version) {
     if (!version) return 0;
 #define GEX_MATCH(cls, ver) if (!strcmp(version, ver)) return &inst_##cls;
     GEX_STEAM_INTERFACES(GEX_MATCH)
+    /* Another version of a known interface (Baba Is You asks for
+     * STEAMUSERSTATS_INTERFACE_VERSION012; this SDK has 013): the one this
+     * SDK has. Versions mostly append methods, and callers clean the stack
+     * on both i386 and x86-64, so the slots a game uses line up. */
+    size_t stem = strlen(version);
+    while (stem && version[stem - 1] >= '0' && version[stem - 1] <= '9') stem--;
+#define GEX_FAMILY(cls, ver) \
+    if (stem && strlen(ver) > stem && !strncmp(version, ver, stem) && ver[stem] >= '0' && ver[stem] <= '9') { \
+        if (getenv("GEX_STEAM_TRACE")) fprintf(stderr, "gex-steam: %s as %s\n", version, ver); \
+        return &inst_##cls; \
+    }
+    GEX_STEAM_INTERFACES(GEX_FAMILY)
     if (getenv("GEX_STEAM_TRACE")) fprintf(stderr, "gex-steam: no interface %s\n", version);
     if (!gex_steam_unknown_vtable[0])
         for (int i = 0; i < 512; i++) gex_steam_unknown_vtable[i] = (void *)gex_steam_zero;

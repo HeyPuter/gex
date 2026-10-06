@@ -1711,6 +1711,19 @@ fn run_thread_loop(
                             let at = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
                             eprintln!("gex: thread {} context pc {at:#x}", store.data().thread.tid);
                             let maps = store.data_mut().with_kernel(|k| k.mem.proc_maps());
+                            // GEX_TRACE_SEGV=2: the whole map, to place the registers.
+                            if std::env::var("GEX_TRACE_SEGV").as_deref() == Ok("2") {
+                                eprintln!("gex: guest maps:\n{maps}");
+                                // And the first words at each register that points into memory.
+                                let bytes = memory.bytes();
+                                for r in 0..16u64 {
+                                    let v = read_u64(bytes, (ctx_addr + ctx::x(r as u8) as u64) as usize);
+                                    if v >= 0x10000 && (v as usize) + 64 <= bytes.len() {
+                                        let words: Vec<String> = (0..8).map(|i| format!("{:#x}", read_u64(bytes, v as usize + i * 8))).collect();
+                                        eprintln!("gex: x{r} {v:#x}: {}", words.join(" "));
+                                    }
+                                }
+                            }
                             for l in maps.lines() {
                                 let mut r = l.split(|c| c == '-' || c == ' ');
                                 let (Some(a), Some(b)) = (r.next(), r.next()) else { continue };
@@ -1719,6 +1732,11 @@ fn run_thread_loop(
                                     eprintln!("gex: in {l}");
                                 }
                             }
+                            // And the registers and the return addresses on the stack, as GEX_DUMP_ABORT prints them.
+                            let vmas = store.data_mut().with_kernel(|k| k.mem.vmas().to_vec());
+                            let tid = store.data().thread.tid;
+                            let mut gm = GuestMem::new(memory.bytes());
+                            dump_guest(&mut gm, ctx_addr, tid, &vmas);
                         }
                     }
                     if action.handler == 0 {
