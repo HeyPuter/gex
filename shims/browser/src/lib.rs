@@ -6102,12 +6102,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // A syscall from a process that has already exited: `exit_process`
         // tears the descriptor table down, so later guest calls fail like bugs
         // elsewhere. This says whether the guest truly ran on.
+        // A syscall from a thread whose process has exited (another Worker
+        // ran `exit_group` while this one was parked, in `pause()` say): on
+        // Linux the thread would already be gone, so it goes now, without
+        // the call. `exit_process` has torn the descriptor table down; the
+        // call would only fail strangely.
         if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
-            warn_line(&format!(
-                "[gex] pid {} made a {} after exiting",
-                h.kernel.pid,
-                gex_kernel::syscalls::syscall_name(nr),
-            ));
+            if tracing() {
+                trace_line(&format!(
+                    "[gex] pid {} thread {} ends at its {} after the process exited\n",
+                    h.kernel.pid,
+                    kstate.tid,
+                    gex_kernel::syscalls::syscall_name(nr),
+                ));
+            }
+            set_resume_none();
+            h.threads[cur()].waiting = Waiting::Exited;
+            return 3;
         }
         let a0 = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
@@ -6587,7 +6598,20 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // directory entry is not published until its module installs, so every
     // branch still finds the miss stub; JS picks the queue up at the next miss.
     retire_unmapped_code();
-    recompile_objects();
+    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
+    // Libraries some of whose exports a provider serves (glibc's mem*,
+    // docs/elf-providers.md): JS binds them before the guest goes on, as the
+    // native host does after the same syscall.
+    let stop = if crate::cgen::elfprov::maps(&mapped) && stop == 0 {
+        with_host(|h| {
+            set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        1
+    } else {
+        stop
+    };
+    recompile_objects(mapped);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
     let stop = if stop == 3 && with_host(|h| h.kernel.wasm32) {
@@ -9436,9 +9460,22 @@ fn schedule() -> i32 {
             }
             // Nothing runnable and nothing above recognised the wait: going
             // round again would spin on unchanged state at full speed. So
-            // report once and hand the stack back -- yielding cannot be wrong
-            // when nothing can run.
-            report_idle(0);
+            // hand the stack back -- yielding cannot be wrong when nothing can
+            // run -- and report it, unless every wait is one that ends by
+            // itself: a sleep (the clock), a `wait4` (the child, in another
+            // Worker, exits), a futex (another Worker wakes it; one nothing
+            // can wake is the deadlock caught above). A parent waiting out a
+            // long child reported itself "idle" every power of two.
+            // (This Worker's thread: a Worker owns exactly one, and the
+            // others' entries are their own Workers' business.)
+            let ends_by_itself = with_host(|h| {
+                h.threads.get(cur()).is_none_or(|t| {
+                    matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
+                })
+            });
+            if !ends_by_itself {
+                report_idle(0);
+            }
             set_paused_to(2);
             return 2;
         };
@@ -10720,6 +10757,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
+    // An address an ELF export provider holds whose slot lost its bridge.
+    if cgen::elfprov::rebridge(pc) {
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
         // Before the translation: the question is which block the translator
@@ -11625,11 +11670,10 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
 /// candidates. Off unless the page asks. Bulk static recompilation (see
 /// `recompile_object`) is what `--recompile-objects` does natively; without it
 /// a page meets a library one dispatch miss at a time.
-fn recompile_objects() {
+fn recompile_objects(mapped: Vec<gex_kernel::CodeMap>) {
     if unsafe { RECOMPILE_OBJECTS } == 0 {
         return;
     }
-    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
     with_host(|h| {
         for m in mapped {
             h.jit.candidates.push((m, 0));

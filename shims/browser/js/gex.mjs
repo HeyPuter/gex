@@ -996,6 +996,7 @@ export class Gex {
     // And `useCgen`, before the process boots: the exe and ntdll are mapped
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+    if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
@@ -1432,6 +1433,11 @@ export class Gex {
       this.#shim.exports.gex_set_gl?.(this.#gl ? 1 : 0);
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+      // The unit cache and ELF export providers, as `load` gives a process its
+      // own: a forked child's table starts empty while its GOT holds what
+      // its parent's providers made code (cgen/elfprov.rs).
+      if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
+      if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
     // Narrate one page's directory writes, in every process. See #136.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     }
@@ -2400,6 +2406,13 @@ export class Gex {
   }
 
   #cgenMode = 0;
+  /** No ELF export providers (cgen/elfprov.rs): A/B runs, every process of
+   *  the run (a forked child's Worker is told too). Before the shim exists. */
+  noElfProviders() {
+    this.#noElfProviders = true;
+    this.#shim?.exports.gex_elfprov_off?.();
+  }
+  #noElfProviders = false;
   /** This Worker's half of the function table (docs/merge-plan.md §9.8.1):
    *  its `gex.ftab`, the runtime module's `resolve` and `bridge`, and how far
    *  through the table's log it is. Made at the first unit. */
@@ -2855,6 +2868,38 @@ export class Gex {
   #cgenServe() {
     const e = this.#shim.exports;
     this.#wasmprogServe();
+    // ELF libraries' export providers (cgen/elfprov.rs): provider-only units,
+    // bound before the guest goes on (and, in a forked child, before it
+    // first runs: its table starts empty while its GOT is its parent's).
+    if (e.gex_elfprov_wanted) {
+      let any = false;
+      for (let u = e.gex_elfprov_wanted(); u >= 0; u = e.gex_elfprov_wanted()) {
+        this.#cgenProviders(u);
+        any = true;
+      }
+      if (any) this.#cgenCatchUp();
+      // Slots of provided addresses that lost their bridge (a forked child
+      // instantiating a module it inherited): the bridge again.
+      const n = e.gex_elfprov_rebridge_len() >>> 0;
+      if (n) {
+        this.#cgenCatchUp();
+        const st = this.#cgenStore();
+        const buf = e.gex_alloc(4 * n) >>> 0;
+        let regs;
+        try {
+          const k = e.gex_elfprov_rebridge(buf, n) >>> 0;
+          regs = new Uint32Array(this.#memory.buffer.slice(buf, buf + 4 * k));
+        } finally {
+          e.gex_free?.(buf, 4 * n);
+        }
+        const tables = this.#growTables(e.gex_elfprov_rebridge_need() >>> 0, 'elfprov');
+        const blocks = this.#guest.exports.blocks;
+        if (blocks) this.#growBlocks();
+        for (let j = 0; j + 1 < regs.length; j += 2) {
+          (regs[j] === TABLE_NAMES.length ? blocks : tables[regs[j]]).set(regs[j + 1], st.bridge);
+        }
+      }
+    }
     // A Worker with the function JIT on but no units of its own still
     // replays the function table's log.
     if (!this.#cgenMode && e.gex_fjit_on?.()) {

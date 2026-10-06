@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 pub mod aot;
 pub mod aot_only;
 pub mod libprov;
+pub(crate) mod elfprov;
 pub(crate) mod wasmjit;
 pub mod aot_share;
 pub mod gl;
@@ -1966,6 +1967,13 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // the kernel's encoding: handing it `code` and correcting the cell
             // afterwards let a parent parked in `wait4` read `exit 7` as a
             // death by signal 7 ("Bus error") in between.
+            // Its descriptors close before its parent can see it gone, as on
+            // Linux: a listening socket's port is free once `wait4` returns.
+            {
+                let mut k = cleanup.kernel.lock().unwrap_or_else(|e| e.into_inner());
+                k.fds.close_all();
+                k.sockets.clear();
+            }
             procs.exit(pid, wstatus);
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
@@ -3112,6 +3120,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // A library a stateful provider replaces (stream U): bound before
             // the loader can call into it.
             libprov::on_linux_maps(&mut caller, &mapped)?;
+            // Libraries some of whose exports a provider serves (glibc's
+            // mem*): bound before the dynamic linker relocates them.
+            elfprov::on_elf_maps(&mut caller, &mapped)?;
             profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {

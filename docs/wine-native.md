@@ -1213,75 +1213,37 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
-**RESUME HERE (2026-10-05 evening, parked for a reboot).** Everything a
-fresh agent needs. `$W` = `~/gex-sandbox/scratch/W`. Run
-`. ~/gex-sandbox/scratch/env.sh` first.
+**RESUME HERE (2026-10-06, after a Claude Code restart).** `$W` =
+`~/gex-sandbox/scratch/W`. Run `. ~/gex-sandbox/scratch/env.sh` first.
+`gexc run` does not pass the host environment: `--env HOME=...`.
 
-Branches and heads:
-- **merge/wine-fork 414f43dc** (wt/wine-fork): real fork for wasm32
-  programs (asyncify), busybox forking, wasm32 programs in the browser,
-  the pelink EH fix, build-sysroot reconfigure, and master b7fead07 merged.
-  **The coordinator is gating it as integ e3917bac. Don't touch it.**
-  Its gate artifacts are sysroot `$W/sr-gate/sysroot` (from wt/musl-fork,
-  musl `gex-wasm32-fork` 155f77bf, binaryen 133) and busybox
-  `$W/bb-gate/busybox-1.37.0/busybox`. Master's gate keeps using
-  `$W/sysroot` and `$W/busybox/busybox-1.37.0/busybox`. Extra gate legs,
-  run in the worktree with `GEX_WASM_SYSROOT` set:
-  - `tests/wasm32/run.sh G`;
-  - `BUSYBOX=... tests/wasm32/busybox.sh G`;
-  - `GEX_WINE_PREFIX=$W/pfx-gui GEXC_RUN_FLAGS=--no-cgen tests/nt/run.sh G`;
-  - `BUSYBOX=... tests/wasm32/run-browser.sh` (needs `GEX_ARCH=x86
-    GEX_SHARED=1 shims/browser/build.sh`).
-  `$W/check-fork.sh WT` runs all of W's checks.
-- **When it lands:** fast-forward musl `gex-wasm32` to `gex-wasm32-fork`
-  (wt/musl-wasm) and push to mw.
-- **merge/wine-slim 8164f461** (wt/wine-slim, on top of wine-fork) plus musl
-  **gex-wasm32-slim 93c5dfda** (wt/musl-slim, pushed to mw): libgex
-  (`tools/wine-wasm/libgex`: setjmp runtime, dlopen registry, signal
-  frames, vfork) out of musl (§3.11.2). Sysroot `$W/sr-slim`, busybox
-  `$W/bb-slim`, Wine tree `$W/wine-w32-slim`, prefix `$W/pfx-gui-slim`.
-  All checked: nt 81/81 on x86, pfx-gui and pfx-gui-slim; browser nt
-  pfx-gui-slim 23/23; tests/wasm32 (incl. the new dlopen.c and vfork) and
-  busybox natively and in the browser. The coordinator recorded it to
-  gate after wine-fork. Then merge master into it and send the head.
-- **merge/elf-prov** (wt/elf-prov, on top of wine-slim). ELF export
-  providers; the design is `docs/elf-providers.md`. The user's target is
-  docs/merge-plan.md §10.1 on master: the **whole** libc (libc, libm,
-  libpthread) as native wasm built by gexcc and linked into the program's
-  link group. Providers are the bridge, so the binding must be general:
-  any export set of a soname, versioned symbols, IFUNC resolvers returning
-  provider stubs, groups (malloc family), data/TLS conventions (errno TLS,
-  %fs:0x28/0x30, FILE/ctype layouts), conformance against translated glibc
-  from the start. Done so far:
-  - the design;
-  - gex-ld versioned dynsyms (491a6f44);
-  - a profile of Warfork's server (§6 of that doc: libc 14.7% of guest
-    work, mem* 7.6%, printf family 4.7%, malloc 1.5%; libm 1.3%), reported
-    to the coordinator as the profile-first condition;
-  - commit e1521940, the stdin fix also on fix/stdin-poll.
-  Coordinator conditions:
-  1. Profile before building much (done for Warfork. Muck/Unity has no
-     profile yet: it doesn't exit on SIGINT/SIGTERM, so `--record` writes
-     nothing).
-  2. Every speed claim is a paired page run on a bench box
-     (scratch/bench/bench.sh).
-  3. The `provider.rs`/`provider.h` edit is ONE commit, and the
-     coordinator is told before it heads to master (it re-keys every unit).
-  Next:
-  - 32-bit dynsyms in gex-ld;
-  - the ELF binding hook beside libprov's `on_linux_maps`
-    (shims/native/src/libprov.rs) plus the browser shim;
-  - generated IFUNC resolvers;
-  - conformance tests in `tests/elf-prov/` (providers on vs
-    `GEX_PROVIDERS=0`);
-  - then mem* and the printf family per the profile.
-- **fix/stdin-poll 293345c4** (wt/stdin-poll, off master ffc51bcd): a
-  `select` on a stdin pipe was always readable natively. Not yet offered to
-  the coordinator for a gate. Offer it.
-- Open findings: gex-kernel has no TCP listeners (`accept` gives ENOTSOCK);
-  the browser scheduler doesn't classify a cross-Worker wait4 (the idle
-  message); "pid 1 made a <syscall> after exiting" from a thread parked in
-  pause().
+Heads:
+- master e3917bac. musl `gex-wasm32` = `gex-wasm32-fork` 155f77bf (mw);
+  `gex-wasm32-slim` 93c5dfda (mw); wine-wasm `wasm32` 87f806ced36 (mw).
+- merge/wine-slim 10e816c3 is in integ/2026-10-05g (gating). Leave
+  `$W/sr-slim`, `$W/bb-slim`, `$W/pfx-gui-slim`, `$W/sr-gate`,
+  `$W/bb-gate`, `$W/pfx-gui-fork` alone until the coordinator says done.
+- **merge/elf-prov** (wt/elf-prov): the development branch (all commits,
+  several gex-cgen ones).
+- **merge/elf-prov-gate** (wt/elf-prov-gate): the gate-ready shape of
+  elf-prov at 7d447eb8, on wine-slim 10e816c3 plus the stdin fix: ONE
+  gex-cgen commit (af98737d), then gex-ld, native, browser, gex-kernel TCP,
+  docs. `$W/check-elfprov-gate.sh` runs its pre-gate checks (output
+  `$W/gchk.out`). Not yet in it (on merge/elf-prov since): 11c3e8b6 32-bit
+  dynsyms (gex-ld), 5eaed62a glibc_math (gex-cgen: fold into the one
+  commit), 749f13cd/the idle fix (browser scheduler). Rebuild the gate
+  branch with them (same path split: `git checkout <dev head> -- <paths>`
+  per commit), rerun the checks, then merge master once integ-g lands and
+  send the head.
+- Since the last notes: the browser scheduler no longer reports "idle"
+  for a wait4/sleep/futex wait (a child in another Worker), and a thread
+  whose process exited ends at its next syscall (the pause() one);
+  glibc_math (floor/ceil/trunc/round and float forms, bitwise);
+  `gex_ld` reads 32-bit dynamic symbols.
+- Open: TCP loopback across browser processes (the port table is per
+  shim instance; needs the global kernel); UDP listeners; libm sin/cos
+  (needs glibc's own bits); a paired page run of the providers on edger
+  (E holds the lock).
 
 **Where things are** (all relative to `${NW_ROOT:-~/gex-sandbox}`; on gooner since 2026-10-04, `$W` = `~/gex-sandbox/scratch/W`):
 

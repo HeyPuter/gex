@@ -670,6 +670,8 @@ struct Job {
     /// Writable-and-executable ranges (a JIT's code), which the function
     /// JIT does not translate.
     wx: Vec<(u64, u64)>,
+    /// Addresses ELF providers hold (`elfprov`): not code to translate.
+    provided: Arc<std::collections::HashSet<u64>>,
     class32: bool,
     epoch: u64,
     queued_at: std::time::Instant,
@@ -723,6 +725,7 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
         exec,
         ro,
         wx,
+        provided: crate::elfprov::provided(sh),
         class32: gex_abi::X86 && gex_xlate::arch::compat(),
         epoch,
         queued_at: std::time::Instant::now(),
@@ -740,7 +743,7 @@ fn run_job(j: &Job) -> Result<bool> {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(tr) = gex_kernel::ftab::translator() else { return Ok(false) };
     let (sh, memory, addr) = (&j.sh, &j.memory, j.addr);
-    let executable = |a: u64| j.exec.iter().any(|&(s, e)| a >= s && a < e);
+    let executable = |a: u64| !j.provided.contains(&a) && j.exec.iter().any(|&(s, e)| a >= s && a < e);
     let read_only = |a: u64, n: u64| j.ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     let volatile = |a: u64| j.wx.iter().any(|&(s, e)| a >= s && a < e);
     let pages = Mutex::new(Vec::<(u64, u32)>::new());
