@@ -6102,12 +6102,23 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         // A syscall from a process that has already exited: `exit_process`
         // tears the descriptor table down, so later guest calls fail like bugs
         // elsewhere. This says whether the guest truly ran on.
+        // A syscall from a thread whose process has exited (another Worker
+        // ran `exit_group` while this one was parked, in `pause()` say): on
+        // Linux the thread would already be gone, so it goes now, without
+        // the call. `exit_process` has torn the descriptor table down; the
+        // call would only fail strangely.
         if EXITED.load(std::sync::atomic::Ordering::Relaxed) {
-            warn_line(&format!(
-                "[gex] pid {} made a {} after exiting",
-                h.kernel.pid,
-                gex_kernel::syscalls::syscall_name(nr),
-            ));
+            if tracing() {
+                trace_line(&format!(
+                    "[gex] pid {} thread {} ends at its {} after the process exited\n",
+                    h.kernel.pid,
+                    kstate.tid,
+                    gex_kernel::syscalls::syscall_name(nr),
+                ));
+            }
+            set_resume_none();
+            h.threads[cur()].waiting = Waiting::Exited;
+            return 3;
         }
         let a0 = gm.read_u64(kstate.ctx_addr + ctx::x(0) as u64).unwrap_or(0);
         let a1 = gm.read_u64(kstate.ctx_addr + ctx::x(1) as u64).unwrap_or(0);
@@ -6587,7 +6598,20 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // directory entry is not published until its module installs, so every
     // branch still finds the miss stub; JS picks the queue up at the next miss.
     retire_unmapped_code();
-    recompile_objects();
+    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
+    // Libraries some of whose exports a provider serves (glibc's mem*,
+    // docs/elf-providers.md): JS binds them before the guest goes on, as the
+    // native host does after the same syscall.
+    let stop = if crate::cgen::elfprov::maps(&mapped) && stop == 0 {
+        with_host(|h| {
+            set_resume(pc as u64 + gex_abi::SYSCALL_INST_BYTES);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        1
+    } else {
+        stop
+    };
+    recompile_objects(mapped);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
     let stop = if stop == 3 && with_host(|h| h.kernel.wasm32) {
@@ -9436,9 +9460,22 @@ fn schedule() -> i32 {
             }
             // Nothing runnable and nothing above recognised the wait: going
             // round again would spin on unchanged state at full speed. So
-            // report once and hand the stack back -- yielding cannot be wrong
-            // when nothing can run.
-            report_idle(0);
+            // hand the stack back -- yielding cannot be wrong when nothing can
+            // run -- and report it, unless every wait is one that ends by
+            // itself: a sleep (the clock), a `wait4` (the child, in another
+            // Worker, exits), a futex (another Worker wakes it; one nothing
+            // can wake is the deadlock caught above). A parent waiting out a
+            // long child reported itself "idle" every power of two.
+            // (This Worker's thread: a Worker owns exactly one, and the
+            // others' entries are their own Workers' business.)
+            let ends_by_itself = with_host(|h| {
+                h.threads.get(cur()).is_none_or(|t| {
+                    matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
+                })
+            });
+            if !ends_by_itself {
+                report_idle(0);
+            }
             set_paused_to(2);
             return 2;
         };
@@ -10271,6 +10308,10 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         }
         return;
     }
+    if op == gex_abi::cache_op::FTAB_TIER1 || op == gex_abi::cache_op::SLOT_CONFLICT {
+        // The dispatch miss that follows ignores its answer.
+        NO_LEAVE.with(|c| c.set(true));
+    }
     if op == gex_abi::cache_op::FTAB_TIER1 {
         // The bridge left for this very address having run nothing: tier-1
         // takes the slot over, and the function JIT serves it no more.
@@ -10571,6 +10612,22 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
 /// retranslation livelock (S3 found natively that a page retired between a
 /// translation and its publish came back without its directory entry): say
 /// what dispatch sees there, once per pc, the 64th time.
+thread_local! {
+    /// Set by `cache_op` SLOT_CONFLICT / FTAB_TIER1, whose caller drops the
+    /// next dispatch miss's answer: that miss must not answer
+    /// `DISPATCH_MISS_LEAVE` (the caller would dispatch again, for ever).
+    static NO_LEAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Dispatch misses by how `gex_dispatch_miss` dealt with them (the NT
+/// stats line): all, a unit catch-up, a call-out's return, a dense block
+/// to instantiate, the function JIT, a published unit pc, translated.
+pub(crate) static MISSES: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+fn miss_count(k: usize) {
+    MISSES[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn remiss(pc: u64) {
     let said = with_host(|h| {
         if !h.jit.translated.contains(&pc) {
@@ -10646,9 +10703,14 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let pc = pc as u64;
     LAST_MISS_PC.with(|c| c.set(pc));
     watch_mem("miss");
+    miss_count(0);
+    // A miss a slot conflict or the bridge asks for (they drop the answer
+    // and dispatch again): never left by returning.
+    let no_leave = NO_LEAVE.with(|c| c.replace(false));
     // A function-tier unit another Worker published that this one has not
     // installed yet: the miss is a catch-up, done in JS, not a translation.
     if cgen::behind() {
+        miss_count(1);
         // AOT-only: catch up inside the call and dispatch again, keeping the
         // thread's frames (leaving would resume at continuations no unit
         // has entries for).
@@ -10670,6 +10732,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // The return a call-out of this Worker waits for, untranslated: that
     // call-out is done (cgen::returned; JS's nested loop ends it).
     if cgen::returned(pc, _ctx as u32 as u64) {
+        miss_count(2);
+        if !no_leave && cgen::may_leave() {
+            return gex_emit::module::DISPATCH_MISS_LEAVE;
+        }
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
@@ -10680,6 +10746,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // Worker has not instantiated: JavaScript catches up, then the dispatch
     // is retried (`dense::missing`).
     if dense::missing(pc) {
+        miss_count(3);
         dense::want(pc);
         if in_place(_ctx, pc) {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
@@ -10711,9 +10778,18 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // A function serves it, or the function JIT makes one: tier-1 reaches
     // it through the bridge once this Worker has installed it.
     if fjit::serve(pc) {
+        miss_count(4);
         if in_place(_ctx, pc) {
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
+        with_host(|h| {
+            set_resume(pc);
+            set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
+        });
+        trap();
+    }
+    // An address an ELF export provider holds whose slot lost its bridge.
+    if cgen::elfprov::rebridge(pc) {
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
@@ -10780,11 +10856,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // wild `pc` makes a wild directory index, and a shim trap on that reads as
     // a runtime bug where the guest's own crash is the story.
     let wild = gex_abi::X86 && with_host(|h| {
-        !h.kernel
-            .mem
-            .vmas()
-            .iter()
-            .any(|v| v.prot & gex_kernel::mem::prot::EXEC != 0 && pc >= v.start && pc < v.end)
+        !h.kernel.mem.vma_at(pc).is_some_and(|v| v.prot & gex_kernel::mem::prot::EXEC != 0)
     });
     if wild && nt::active() {
         nt::fault(_ctx, gex_kernel::nt::Fault::NotExecutable, pc);
@@ -10865,6 +10937,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             n
         });
         if n <= 3 {
+            miss_count(5);
             nt::serve_now();
             return gex_emit::module::DISPATCH_MISS_REDISPATCH;
         }
@@ -10939,6 +11012,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
+    miss_count(6);
     // Past the fill and a closure library still claims this page: everything
     // looks right (pin took, module covers it, directory names it) yet the
     // block is lifted, so count how much the closure fails to save.
@@ -11625,11 +11699,10 @@ pub(crate) fn retire_code(h: &mut Host, ranges: &[(u64, u64)]) {
 /// candidates. Off unless the page asks. Bulk static recompilation (see
 /// `recompile_object`) is what `--recompile-objects` does natively; without it
 /// a page meets a library one dispatch miss at a time.
-fn recompile_objects() {
+fn recompile_objects(mapped: Vec<gex_kernel::CodeMap>) {
     if unsafe { RECOMPILE_OBJECTS } == 0 {
         return;
     }
-    let mapped = with_host(|h| std::mem::take(&mut h.kernel.new_code));
     with_host(|h| {
         for m in mapped {
             h.jit.candidates.push((m, 0));

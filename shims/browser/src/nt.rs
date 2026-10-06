@@ -318,7 +318,12 @@ mod imp {
         GL_STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
         nt::opengl::STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
         nt::opengl::FAST.store(var("GEX_NT_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
+        nt::opengl::FAST_CLIENT_STATE.store(var("GEX_NT_GL_FAST").as_deref() != Some("nocs"), Ordering::Relaxed);
         TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
+        crate::cgen::TRAP_CALLOUTS.store(flag("GEX_NT_CALLOUT_TRAP"), Ordering::Relaxed);
+        if let Some(k) = var("GEX_NT_TICK_EVERY").and_then(|v| v.parse().ok()) {
+            TICK_EVERY.store(k, Ordering::Relaxed);
+        }
         if let Some(n) = var("GEX_NT_BIG_ALLOC").and_then(|v| v.parse::<u64>().ok()) {
             crate::BIG_ALLOC.store(n, Ordering::Relaxed);
         }
@@ -629,6 +634,8 @@ mod imp {
             // (woken by a kick, the word had moved, timed out) and kicks by
             // whether they woke anyone, since the last report.
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, Ordering::Relaxed);
+            let m: Vec<String> = crate::MISSES.iter().map(|a| a.swap(0, Ordering::Relaxed).to_string()).collect();
+            warn_line(&format!("gex-nt: misses all/behind/returned/dense/fjit/knows/translate {}\n", m.join("/")));
             warn_line(&format!(
                 "gex-nt: yield parks woken={} ({} ms) moved={} timed_out={} ({} ms) kicks waking={} idle={}\n",
                 take(&YIELD_PARKS[0]),
@@ -662,7 +669,29 @@ mod imp {
     /// Bring `KUSER_SHARED_DATA`'s clocks up to date, at most once a
     /// millisecond. Natively a thread does this; here every NT syscall and
     /// every safepoint does, which is as often as anything can look.
+    /// Each thread can read the clock (a JS call) on only one call in
+    /// [`TICK_EVERY`] (`GEX_NT_TICK_EVERY`); the reads are 0.2 ms of every
+    /// world frame on Noita's main thread (cs1), but sampling them changed
+    /// nothing measurable (s1), so the default reads on every call.
     pub(crate) fn tick() {
+        thread_local! {
+            static TICK_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let n = TICK_N.with(|c| {
+            let n = c.get();
+            c.set(n.wrapping_add(1));
+            n
+        });
+        if n % TICK_EVERY.load(Ordering::Relaxed).max(1) != 0 {
+            return;
+        }
+        tick_now();
+    }
+
+    /// [`tick`] without the per-thread sampling: after a wait that slept,
+    /// whose caller reads the clocks next (GetTickCount after a timed
+    /// wait: tests/nt sync "timeout lasts").
+    pub(crate) fn tick_now() {
         static LAST: AtomicU64 = AtomicU64::new(0);
         let Some(p) = PROCESS.get() else { return };
         let now = mono();
@@ -677,6 +706,11 @@ mod imp {
             }
         }
     }
+
+    /// How many of a thread's [`tick`]s read the clock: one in this many
+    /// (`GEX_NT_TICK_EVERY`, default 1: every one). 8 measured no faster in
+    /// the page (s1, docs/noita-perf.md: 64.1 vs 64.05 world fps).
+    static TICK_EVERY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
     /// Yield parks by result (`memory.atomic.wait32`: 0 woken, 1 not equal, 2
     /// timed out) and kicks (`notify`) by whether they woke a waiter.
@@ -1049,7 +1083,7 @@ mod imp {
         // And after: a wait that slept leaves the clocks behind, and the
         // program reads them next without a syscall (GetTickCount).
         if timed {
-            tick();
+            tick_now();
         }
         // Code that went away (an unmapped image, a protection change: LuaJIT
         // rewrites its machine code in place) loses its translations, as

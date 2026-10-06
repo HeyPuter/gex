@@ -4,7 +4,8 @@
  * what ntdll's __wine_unix_call_dispatcher points at), with the hottest
  * OpenGL calls written straight into the GL command ring. Wine's PE
  * opengl32 makes one unix call per GL function; Noita makes about 3,900 a
- * frame, 81% of them the seven below, and each was a trip through the NT
+ * frame, 81% of them the seven below (and 9% glEnable/DisableClientState,
+ * which also set the array's bit at GL_FAST_ARRAYS), and each was a trip through the NT
  * layer (the syscall, the unix-call dispatch, opengl32's Unix side) to
  * append 12 to 16 bytes to the ring. Here they are those bytes: the same
  * command the layer writes for them (gex_kernel::nt::opengl's `hot_one`).
@@ -30,6 +31,18 @@
 #define GL_FAST_RING 0x7ffe0fe0u
 #define GL_FAST_TAIL 0x7ffe0fe4u
 #define TAIL_BUSY 0x80000000u
+/* The client arrays' flags (bit = array index) and, at ARRAYS_TEX_SHIFT,
+ * the client active texture unit: the layer's `arrays[i].enabled`, which
+ * it reads back before a draw. */
+#define GL_FAST_ARRAYS 0x7ffe0fe8u
+#define ARRAYS_TEX_SHIFT 16
+#define A_VERTEX 0
+#define A_COLOR 1
+#define A_TEXCOORD 2
+#define TEX_UNITS 8
+#define A_NORMAL 10
+#define A_SECONDARY 11
+#define A_FOG 12
 #define RING_HEADER 32u
 #define CMD_CAPACITY (8u << 20)
 /* opengl32's unixlib handle ((3 << 16) | 1, gex_kernel::nt::unixcall). */
@@ -45,6 +58,8 @@
 #define FN_glUniform1i 2524u
 #define FN_glUniform2f 2542u
 #define FN_glUseProgram 2645u
+#define FN_glEnableClientState 82u
+#define FN_glDisableClientState 73u
 #define OP_ENABLE 19u
 #define OP_DISABLE 20u
 #define OP_USE_PROGRAM 55u
@@ -52,6 +67,8 @@
 #define OP_UNIFORM_2F 66u
 #define OP_BIND_TEXTURE 98u
 #define OP_ACTIVE_TEXTURE 99u
+#define OP_ENABLE_CLIENT_STATE 185u
+#define OP_DISABLE_CLIENT_STATE 186u
 
 /* Append one command of `n` argument words (1 to 3) taken from the params
  * struct (after its TEB pointer). 1 when it is in the ring. */
@@ -78,6 +95,33 @@ GEX_INLINE int gl_put(uint32_t op, uint32_t params, uint32_t n) {
     return 1;
 }
 
+/* glEnableClientState/glDisableClientState: the array's bit in
+ * GL_FAST_ARRAYS, and the command, as the layer does both. -1 for an array
+ * the layer does not know (it reports it). */
+GEX_INLINE int array_bit(uint32_t cap, uint32_t w) {
+    switch (cap) {
+    case 0x8074u: return A_VERTEX;
+    case 0x8076u: return A_COLOR;
+    case 0x8078u: return A_TEXCOORD + (int)((w >> ARRAYS_TEX_SHIFT) & 15u);
+    case 0x8075u: return A_NORMAL;
+    case 0x845eu: return A_SECONDARY;
+    case 0x8457u: return A_FOG;
+    default: return -1;
+    }
+}
+GEX_INLINE int client_state(uint32_t params, int on) {
+    uint32_t w = GW(GL_FAST_ARRAYS);
+    int bit = array_bit(GW(params + 4u), w);
+    if (bit < 0 || ((w >> ARRAYS_TEX_SHIFT) & 15u) >= TEX_UNITS) {
+        return 0;
+    }
+    if (!gl_put(on ? OP_ENABLE_CLIENT_STATE : OP_DISABLE_CLIENT_STATE, params, 1)) {
+        return 0;
+    }
+    GW(GL_FAST_ARRAYS) = on ? (w | (1u << bit)) : (w & ~(1u << bit));
+    return 1;
+}
+
 static GEX_PROVIDER(p_unix_call) {
     (void)need;
     if (gp_arg(ctx, 0) == GL_HANDLE && gp_arg(ctx, 1) == 0) {
@@ -90,6 +134,12 @@ static GEX_PROVIDER(p_unix_call) {
         case FN_glBindTexture: op = OP_BIND_TEXTURE, n = 2; break;
         case FN_glUniform1i: op = OP_UNIFORM_1I, n = 2; break;
         case FN_glUniform2f: op = OP_UNIFORM_2F, n = 3; break;
+        case FN_glEnableClientState:
+        case FN_glDisableClientState:
+            if (params >= 0x10000u && client_state(params, code == FN_glEnableClientState)) {
+                return gp_return_eax(ctx, ret, 16, 0);
+            }
+            break;
         default: break;
         }
         if (n && params >= 0x10000u && gl_put(op, params, n)) {

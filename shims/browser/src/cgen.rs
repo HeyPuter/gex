@@ -35,6 +35,7 @@ use gex_kernel::GuestMem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod elfprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
 
@@ -856,15 +857,23 @@ fn dylink_memory(wasm: &[u8]) -> Result<(u32, u32), String> {
 
 /// Guest pages from the NT allocator, for a stateful provider.
 fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
-    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
     crate::with_host(|h| gex_kernel::nt::boot::alloc_private(p, &mut h.kernel, size, name))
+}
+
+/// Guest pages in a Linux process (an ELF provider's data and stack): an
+/// anonymous private mapping, as natively (`libprov::alloc_linux`).
+fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
+    use gex_kernel::mem::{flags, prot};
+    let len = (size + 0xfff) & !0xfff;
+    crate::with_host(|h| h.kernel.mem.mmap(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
 /// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a
 /// built-in provider's data, heap and stack, which then do not move the DLLs
 /// the program maps after them.
 fn provider_alloc_top_bytes(size: u64, name: &str) -> Result<u64, String> {
-    let p = crate::nt::process().ok_or_else(|| "a stateful provider outside a Windows process".to_string())?;
+    let Some(p) = crate::nt::process() else { return linux_alloc(size, name) };
     crate::with_host(|h| gex_kernel::nt::boot::alloc_private_top(p, &mut h.kernel, size, name))
 }
 
@@ -1309,7 +1318,35 @@ thread_local! {
     static CB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The call-out whose return a dispatch miss found (`returned`), or -1.
     static HIT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+    /// 1 + the call-out whose loop called `enter` last with nothing nested
+    /// since (`gex_callout_leave_ok`), or 0.
+    static LEAVE_OK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+/// JS's call-out loop `depth` is about to call `enter` (`depth + 1`), or
+/// another loop is (0): whether a miss at that call-out's return may leave
+/// by returning (`DISPATCH_MISS_LEAVE`) instead of trapping.
+#[no_mangle]
+pub extern "C" fn gex_callout_leave_ok(v: u32) {
+    LEAVE_OK.with(|c| c.set(v));
+}
+
+/// After `returned`: the call-out found is the innermost and its loop's
+/// `enter` is the innermost JS frame, so only tail calls lie between it and
+/// the miss and a return reaches it.
+pub(crate) fn may_leave() -> bool {
+    let hit = HIT.with(|h| h.get());
+    hit >= 0
+        && CALLOUTS.with(|c| c.borrow().len()) == hit as usize + 1
+        && LEAVE_OK.with(|c| c.get()) == hit as u32 + 1
+        && !exp_trap_callouts()
+}
+
+/// `GEX_NT_CALLOUT_TRAP=1`: call-outs leave by trapping, as before (A/B).
+fn exp_trap_callouts() -> bool {
+    TRAP_CALLOUTS.load(Ordering::Relaxed)
+}
+pub(crate) static TRAP_CALLOUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn sp_index() -> u8 {
     if gex_abi::X86 {

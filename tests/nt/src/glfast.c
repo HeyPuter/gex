@@ -1,6 +1,9 @@
 /* The GL calls the unix-call dispatcher's provider writes into the command
  * ring itself (gex-cgen/providers/nt_unixcall.c): glEnable, glDisable,
- * glActiveTexture, glUseProgram, glBindTexture, glUniform1i, glUniform2f.
+ * glActiveTexture, glUseProgram, glBindTexture, glUniform1i, glUniform2f,
+ * glEnableClientState, glDisableClientState (which also leave the arrays'
+ * flags where the layer reads them before a draw: client-memory arrays are
+ * uploaded only when the layer sees them enabled).
  * Each is checked by a query (which the NT layer answers after a submit),
  * interleaved with calls the layer encodes, and many enough of them to fill
  * the ring several times over. Needs `gexc run --gl`; meaningful with
@@ -13,6 +16,7 @@
 #define GL_TEXTURE0 0x84C0
 #define GL_ACTIVE_TEXTURE 0x84E0
 #define GL_CURRENT_PROGRAM 0x8B8D
+#define GL_TEXTURE1 0x84C1
 
 static int failures;
 #define CHECK(name, cond) do { int ok_ = (cond); printf("%s %s\n", ok_ ? "ok" : "FAIL", name); if (!ok_) failures++; } while (0)
@@ -31,6 +35,7 @@ PROC(void, glUniform1i, (GLint, GLint))
 PROC(void, glUniform2f, (GLint, float, float))
 PROC(void, glGetUniformfv, (GLuint, GLint, float *))
 PROC(void, glGetUniformiv, (GLuint, GLint, GLint *))
+PROC(void, glClientActiveTexture, (GLenum))
 #define LOAD(name) p##name = (name##_t)wglGetProcAddress(#name)
 
 static LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) { return DefWindowProcW(w, m, wp, lp); }
@@ -64,6 +69,7 @@ int main(void) {
     LOAD(glActiveTexture); LOAD(glCreateShader); LOAD(glShaderSource); LOAD(glCompileShader);
     LOAD(glCreateProgram); LOAD(glAttachShader); LOAD(glLinkProgram); LOAD(glUseProgram);
     LOAD(glGetUniformLocation); LOAD(glUniform1i); LOAD(glUniform2f); LOAD(glGetUniformfv); LOAD(glGetUniformiv);
+    LOAD(glClientActiveTexture);
     CHECK("GL 2.0 entry points", pglActiveTexture && pglUseProgram && pglUniform2f);
     if (!pglActiveTexture || !pglUseProgram || !pglUniform2f) return 1;
 
@@ -118,6 +124,54 @@ int main(void) {
     pglGetUniformiv(prog, s, &iv);
     CHECK("after the ring filled: the last of each", !glIsEnabled(GL_BLEND) && glIsEnabled(GL_DEPTH_TEST) &&
           b == (GLint)tex[1] && fv[0] == 999.0f && fv[1] == 2.0f && iv == 999);
+    /* Client arrays: enabled and disabled on the fast path, drawn from
+     * client memory by the layer (a red triangle over the window, then a
+     * white one once the colour array is off). */
+    pglUseProgram(0);
+    glDisable(GL_DEPTH_TEST);
+    glViewport(0, 0, 64, 64);
+    static const float tri[6] = {-1, -1, 3, -1, -1, 3};
+    static const unsigned char red[12] = {255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255};
+    for (int i = 0; i < 300000; i++) {
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+    }
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    CHECK("glEnableClientState", glIsEnabled(GL_VERTEX_ARRAY) && glIsEnabled(GL_COLOR_ARRAY));
+    glVertexPointer(2, GL_FLOAT, 0, tri);
+    glColorPointer(4, GL_UNSIGNED_BYTE, 0, red);
+    glClearColor(0, 0, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    unsigned char px[4] = {0, 0, 0, 0};
+    glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK("a draw from client arrays enabled on the fast path", px[0] == 255 && px[1] == 0 && px[2] == 0);
+    if (px[0] != 255 || px[1] || px[2]) printf("  pixel %d,%d,%d\n", px[0], px[1], px[2]);
+    glDisableClientState(GL_COLOR_ARRAY);
+    CHECK("glDisableClientState", glIsEnabled(GL_VERTEX_ARRAY) && !glIsEnabled(GL_COLOR_ARRAY));
+    glColor4f(1, 1, 1, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    CHECK("the colour array off", px[0] == 255 && px[1] == 255 && px[2] == 255);
+    if (px[1] != 255 || px[2] != 255) printf("  pixel %d,%d,%d\n", px[0], px[1], px[2]);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    /* The texture-coordinate array of the client active unit (which the
+     * layer sets, and the fast path reads back). */
+    if (pglClientActiveTexture) {
+        pglClientActiveTexture(GL_TEXTURE1);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        int on1 = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
+        pglClientActiveTexture(GL_TEXTURE0);
+        int on0 = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
+        pglClientActiveTexture(GL_TEXTURE1);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        int off1 = !glIsEnabled(GL_TEXTURE_COORD_ARRAY);
+        pglClientActiveTexture(GL_TEXTURE0);
+        CHECK("client texture units", on1 && !on0 && off1);
+    }
+
     GLenum err = glGetError();
     CHECK("no GL error", err == GL_NO_ERROR);
     if (err) printf("  error %#x; blend %d depth %d texture %d off %g,%g s %d\n", err, glIsEnabled(GL_BLEND), glIsEnabled(GL_DEPTH_TEST), b, fv[0], fv[1], iv);

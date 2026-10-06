@@ -310,7 +310,7 @@ pub fn provider_stubs(pe: &gex_ld::pe::PeImage, base: u64) -> Vec<u64> {
 /// A built-in provider's module and its slots: built here (clang) when
 /// missing, unless this runtime has no translator (gex-rt), which only finds
 /// the one its project's build made (`gex_cgen::provider::build`'s name).
-fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(std::path::PathBuf, Vec<Option<String>>)> {
+pub(crate) fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(std::path::PathBuf, Vec<Option<String>>)> {
     if cfg!(feature = "translate") {
         return gex_cgen::provider::build(prov, &cache_root()?);
     }
