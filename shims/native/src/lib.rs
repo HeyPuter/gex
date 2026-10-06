@@ -713,7 +713,7 @@ fn run_program_with(
     // alone: it is an i386 ELF (and its kernel speaks the i386 ABI, below),
     // but an x86-64 shell that runs it goes on translating its own code
     // after the wait.
-    if !wasmprog::is_wasm32(program) {
+    if !wasmprog::is_wasm32(program) || std::env::var_os("GEX_W3_COMPAT").is_some() {
         gex_xlate::set_compat(program.compat());
         lockstep::set_compat(program.compat());
         gex_kernel::set_compat32(program.compat() && gex_abi::X86);

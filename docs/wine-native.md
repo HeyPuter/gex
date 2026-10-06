@@ -862,6 +862,29 @@ unixlib ran through the dlopen registry (§3.12).
 | W3.6 sync | ntsync in gex-kernel (`/dev/ntsync` on the futex machinery), so waits never reach wineserver | job-heavy games (Noita) no slower than W2 | 2–3 d |
 | W3.7 page | the same in the page: wineserver's thread in a Worker, the Unix side's modules per Worker | Retrocycles, Katana ZERO and Undertale in the page | 3–5 d |
 
+**W3.0 findings so far (2026-10-06, branch merge/w3, fork branch
+`wasm32-w3`):**
+- Every ntdll/unix object compiles for wasm32 (fork 436bf6eda79:
+  `current_machine` is i386; CPUID is the x86 lifter's sysreg -100 on the
+  thread's context; XGETBV reports x87 and SSE only).
+- **A wasm32 program calls i386 code through the function table**
+  (`tools/wine-wasm/spike-w3/gc.c`: it maps `add` as x86 and calls it,
+  `add(40, 2) = 42`), once the process's translator decodes i386: a wasm32
+  program leaves the class alone today (an x86-64 parent keeps its own), so
+  the container needs a flag saying its guest code is i386
+  (`GEX_W3_COMPAT=1` stands in for it on merge/w3).
+- **Faults in that x86 code do not reach the program**
+  (`spike-w3/fault.c`): a guest access past the memory traps the whole wasm
+  stack, native frames included, and the run ends. Wine's model needs the
+  fault delivered to ntdll.so's SIGSEGV handler with the i386 state, the
+  guest resumed where the handler leaves the context, and the native frames
+  under the guest code kept. That is W3.1's core (a resumable fault for
+  guest memory accesses in a wasm32 process, delivered synchronously as a
+  signal; the W2 NT path dispatches only after the trap). Also: an access
+  to the low guest pages (a NULL dereference) does not fault under gex at
+  all (the contexts live there), on any path.
+- Option A (the wasm32 loader is the process) stands; B is not needed.
+
 **Total:** about 20–31 agent days, against the 5–8 W3 was given before
 W2 showed what stays on the NT layer. Order: W3.0 → W3.1 → W3.2 (closes
 Retrocycles' dsound) → W3.3 (Katana ZERO) → W3.4 (Retrocycles' GL) → W3.5
