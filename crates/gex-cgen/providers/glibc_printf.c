@@ -711,91 +711,6 @@ static int printf_core(struct out *f, uint64_t fmt, struct va *ap, struct fmtctx
 
 /* ---- the library's own functions, found by name ---- */
 
-/* The ELF image holding `addr`: the page-aligned "\x7fELF" at or below it
- * (64 MiB at most), 0 if none. */
-static uint64_t elf_base(uint64_t addr) {
-    for (uint64_t b = addr & ~0xfffull, n = 0; n < 16384 && b; b -= 0x1000, ++n) {
-        if (*(gex_u32 *)GP64_P(b) == 0x464c457fu) {
-            return b;
-        }
-    }
-    return 0;
-}
-
-/* The address of dynamic symbol `name` of the image at `base` (its
- * DT_SYMTAB, DT_STRTAB and DT_GNU_HASH's symbol count), or 0. */
-static uint64_t elf_sym(uint64_t base, const char *name) {
-    uint64_t ph = base + GW64(base + 0x20);
-    unsigned phn = *(gex_u16 *)GP64_P(base + 0x38);
-    uint64_t dyn = 0, vbias = 0;
-    int first = 1;
-    for (unsigned i = 0; i < phn; ++i, ph += 56) {
-        uint32_t type = *(gex_u32 *)GP64_P(ph);
-        if (type == 1 && first) {
-            vbias = base - (GW64(ph + 16) & ~0xfffull); /* the first PT_LOAD's place */
-            first = 0;
-        }
-        if (type == 2) {
-            dyn = GW64(ph + 16);
-        }
-    }
-    if (!dyn) {
-        return 0;
-    }
-    dyn += vbias;
-    uint64_t symtab = 0, strtab = 0, gnuhash = 0;
-    for (uint64_t d = dyn; GW64(d); d += 16) {
-        uint64_t tag = GW64(d), val = GW64(d + 8);
-        /* The dynamic linker relocates these in place; before it has,
-         * they are link-time addresses. */
-        if (val < base) {
-            val += vbias;
-        }
-        if (tag == 6) {
-            symtab = val;
-        } else if (tag == 5) {
-            strtab = val;
-        } else if (tag == 0x6ffffef5) {
-            gnuhash = val;
-        }
-    }
-    if (!symtab || !strtab || !gnuhash) {
-        return 0;
-    }
-    /* The symbol count: past the last bucket's chain. */
-    uint32_t nbuckets = *(gex_u32 *)GP64_P(gnuhash), symoffset = *(gex_u32 *)GP64_P(gnuhash + 4);
-    uint32_t bloom = *(gex_u32 *)GP64_P(gnuhash + 8);
-    uint64_t buckets = gnuhash + 16 + 8ull * bloom, chain = buckets + 4ull * nbuckets;
-    uint32_t last = 0;
-    for (uint32_t i = 0; i < nbuckets; ++i) {
-        last = MAX(last, *(gex_u32 *)GP64_P(buckets + 4ull * i));
-    }
-    uint32_t nsyms = last;
-    if (last >= symoffset) {
-        while (!(*(gex_u32 *)GP64_P(chain + 4ull * (nsyms - symoffset)) & 1)) {
-            nsyms++;
-        }
-        nsyms++;
-    }
-    for (uint32_t i = 0; i < nsyms; ++i) {
-        uint64_t sym = symtab + 24ull * i;
-        uint32_t n = *(gex_u32 *)GP64_P(sym);
-        uint64_t v = GW64(sym + 8);
-        if (!v) {
-            continue;
-        }
-        const char *q = name;
-        uint64_t k = strtab + n;
-        while (*q && CH(k) == (unsigned char)*q) {
-            ++q, ++k;
-        }
-        if (!*q && !CH(k)) {
-            return v + vbias;
-        }
-    }
-    return 0;
-}
-
 /* The library's functions this needs, found once (per process: the data is
  * the process's). */
 static uint64_t lib_base, f_vsnprintf_chk, f_vsprintf_chk, f_localeconv;
@@ -804,10 +719,10 @@ static void find(uint64_t self) {
     if (lib_base) {
         return;
     }
-    uint64_t b = elf_base(self);
-    f_vsnprintf_chk = b ? elf_sym(b, "__vsnprintf_chk") : 0;
-    f_vsprintf_chk = b ? elf_sym(b, "__vsprintf_chk") : 0;
-    f_localeconv = b ? elf_sym(b, "localeconv") : 0;
+    uint64_t b = gp64_elf_base(self);
+    f_vsnprintf_chk = b ? gp64_elf_sym(b, "__vsnprintf_chk") : 0;
+    f_vsprintf_chk = b ? gp64_elf_sym(b, "__vsprintf_chk") : 0;
+    f_localeconv = b ? gp64_elf_sym(b, "localeconv") : 0;
     lib_base = b ? b : 1;
 }
 

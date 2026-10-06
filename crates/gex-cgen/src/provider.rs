@@ -53,6 +53,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("msvcp120_thrd", include_str!("../providers/msvcp120_thrd.c")),
     ("glibc_mem", include_str!("../providers/glibc_mem.c")),
     ("glibc_printf", include_str!("../providers/glibc_printf.c")),
+    ("glibc_malloc", include_str!("../providers/glibc_malloc.c")),
 ];
 
 /// Files a stateful provider may `#include` (written beside it when built).

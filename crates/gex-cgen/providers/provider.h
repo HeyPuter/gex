@@ -271,6 +271,93 @@ GEX_INLINE uint64_t gp64_call6(int ctx, int32_t depth, uint64_t fn, uint64_t sp_
     gp64_set(ctx, R_RSP, rsp0);
     return gp64_reg(ctx, R_RAX);
 }
+#define GP64_MAX(a, b) ((a) > (b) ? (a) : (b))
+/* For a provider's slow paths, the library's own functions by name (a
+ * stateful provider: the names are data). The ELF image holding `addr`: the page-aligned "\x7fELF" at or below it
+ * (64 MiB at most), 0 if none. */
+GEX_INLINE uint64_t gp64_elf_base(uint64_t addr) {
+    for (uint64_t b = addr & ~0xfffull, n = 0; n < 16384 && b; b -= 0x1000, ++n) {
+        if (*(gex_u32 *)GP64_P(b) == 0x464c457fu) {
+            return b;
+        }
+    }
+    return 0;
+}
+
+/* The address of dynamic symbol `name` of the image at `base` (its
+ * DT_SYMTAB, DT_STRTAB and DT_GNU_HASH's symbol count), or 0. */
+GEX_INLINE uint64_t gp64_elf_sym(uint64_t base, const char *name) {
+    uint64_t ph = base + GW64(base + 0x20);
+    unsigned phn = *(gex_u16 *)GP64_P(base + 0x38);
+    uint64_t dyn = 0, vbias = 0;
+    int first = 1;
+    for (unsigned i = 0; i < phn; ++i, ph += 56) {
+        uint32_t type = *(gex_u32 *)GP64_P(ph);
+        if (type == 1 && first) {
+            vbias = base - (GW64(ph + 16) & ~0xfffull); /* the first PT_LOAD's place */
+            first = 0;
+        }
+        if (type == 2) {
+            dyn = GW64(ph + 16);
+        }
+    }
+    if (!dyn) {
+        return 0;
+    }
+    dyn += vbias;
+    uint64_t symtab = 0, strtab = 0, gnuhash = 0;
+    for (uint64_t d = dyn; GW64(d); d += 16) {
+        uint64_t tag = GW64(d), val = GW64(d + 8);
+        /* The dynamic linker relocates these in place; before it has,
+         * they are link-time addresses. */
+        if (val < base) {
+            val += vbias;
+        }
+        if (tag == 6) {
+            symtab = val;
+        } else if (tag == 5) {
+            strtab = val;
+        } else if (tag == 0x6ffffef5) {
+            gnuhash = val;
+        }
+    }
+    if (!symtab || !strtab || !gnuhash) {
+        return 0;
+    }
+    /* The symbol count: past the last bucket's chain. */
+    uint32_t nbuckets = *(gex_u32 *)GP64_P(gnuhash), symoffset = *(gex_u32 *)GP64_P(gnuhash + 4);
+    uint32_t bloom = *(gex_u32 *)GP64_P(gnuhash + 8);
+    uint64_t buckets = gnuhash + 16 + 8ull * bloom, chain = buckets + 4ull * nbuckets;
+    uint32_t last = 0;
+    for (uint32_t i = 0; i < nbuckets; ++i) {
+        last = GP64_MAX(last, *(gex_u32 *)GP64_P(buckets + 4ull * i));
+    }
+    uint32_t nsyms = last;
+    if (last >= symoffset) {
+        while (!(*(gex_u32 *)GP64_P(chain + 4ull * (nsyms - symoffset)) & 1)) {
+            nsyms++;
+        }
+        nsyms++;
+    }
+    for (uint32_t i = 0; i < nsyms; ++i) {
+        uint64_t sym = symtab + 24ull * i;
+        uint32_t n = *(gex_u32 *)GP64_P(sym);
+        uint64_t v = GW64(sym + 8);
+        if (!v) {
+            continue;
+        }
+        const char *q = name;
+        uint64_t k = strtab + n;
+        while (*q && (*(const unsigned char *)GP64_P(k)) == (unsigned char)*q) {
+            ++q, ++k;
+        }
+        if (!*q && !(*(const unsigned char *)GP64_P(k))) {
+            return v + vbias;
+        }
+    }
+    return 0;
+}
+
 /* An IFUNC's resolver (the symbol's address, which the dynamic linker calls
  * for every relocation against it): the host binds this body there and the
  * provided function one byte further on, the "implementation" this returns.
