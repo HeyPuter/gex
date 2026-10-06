@@ -1153,6 +1153,28 @@ umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
   integ/2026-10-05g (coordinator gating). wt/fjit-ung and wt/fjit-inl are
   done; their target dirs (fjit-inl/target) can go.
 
+### N1: unguarded units in the page by default (stream F, 2026-10-05)
+
+n1 on edger (guarded bm-h vs unguarded bm-hu, same tree 129c5720, one shim,
+seed pinned, 4 cores/8 threads; `scratch/fjit/e/seq-n1.out`):
+
+| leg | world fps |
+|---|---|
+| pewasm p1 | (page busy, no world) |
+| guarded g1 | 43.9 |
+| unguarded u1 | 48.7 |
+| pewasm p2 | 44.5 |
+| unguarded u2 | 47.8 |
+| guarded g2 | 40.9 |
+| pewasm p3 | 47.2 |
+
+Means: pewasm 45.9, guarded 42.4 (8% slower than pewasm), unguarded 48.25
+(5% faster than pewasm, 14% faster than guarded). So the page's `cgen=` now
+means the unguarded flavor (`unguarded=0` for the guarded one; the ejected
+page passes its flavor explicitly). A page run with `cgen=` needs the
+unguarded units (`gexc cgen-image` without `GEX_CGEN_GUARD=1`); a cache of
+guarded units needs `&unguarded=0`.
+
 ### Stream F final state (2026-10-06; stream F stopped here)
 
 Branch merge/fjit, master 2d9055f9 merged. Everything below is measured on

@@ -1,7 +1,8 @@
 /* fork without exec: parent and child both go on, each with its own memory;
  * fork from deep in a call chain reached through a function pointer (locals
  * of every frame survive in both);
- * fork in a threaded program (only the calling thread is in the child). */
+ * fork in a threaded program (only the calling thread is in the child);
+ * vfork whose child only _exits (vfork is fork on gex: libgex). */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,5 +82,10 @@ int main(void)
 		_exit(5);
 	}
 	printf("threaded parent, child exit %d\n", status_of(pid));
+
+	/* 4: vfork */
+	pid = vfork();
+	if (pid == 0) _exit(9);
+	printf("vfork child exit %d\n", status_of(pid));
 	return 0;
 }

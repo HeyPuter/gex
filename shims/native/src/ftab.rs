@@ -62,6 +62,8 @@ pub(crate) struct Store {
     /// The stack pointer this thread's stateful providers share
     /// (`libprov::stack`), made at the first one's instantiation.
     pub provider_sp: Option<wasmtime::Global>,
+    /// The lowest address of that stack (`libprov::STACK` bytes).
+    pub provider_stack_lo: u64,
     /// The wasm exception tag of `gex.provider_throw` (wasm64 providers; [`crate::libprov::tag`]).
     pub provider_tag: Option<wasmtime::Tag>,
     /// How far through the map's log this table is.
@@ -227,7 +229,7 @@ pub(crate) fn ensure(mut cx: impl AsContextMut<Data = HostState>) -> Result<()> 
     table.set(&mut c, gex_abi::ftab::FALLBACK as u64, wasmtime::Ref::Func(Some(fallback)))?;
     let jit = c.data_mut().jit.as_mut().unwrap();
     jit.instances.push(inst);
-    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_tag: None, replayed: 0 });
+    jit.ftab = Some(Store { table, resolve, bridge, root, provider_sp: None, provider_stack_lo: 0, provider_tag: None, replayed: 0 });
     Ok(())
 }
 
@@ -651,8 +653,27 @@ struct Job {
     cache: Option<(std::path::PathBuf, String)>,
 }
 
+/// `GEX_FJIT_RANGE=LO-HI[,LO-HI...]` (hex guest addresses): the function JIT
+/// takes only functions entered in those ranges; `GEX_FJIT_SKIP=` the same
+/// form, never those. For bisecting a translation bug down to one function.
+fn bisect_allows(addr: u64) -> bool {
+    type Ranges = Option<Vec<(u64, u64)>>;
+    fn parse(var: &str) -> Ranges {
+        let v = std::env::var(var).ok()?;
+        let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        Some(v.split(',').filter_map(|r| { let (a, b) = r.split_once('-')?; Some((hex(a)?, hex(b)?)) }).collect())
+    }
+    static R: std::sync::OnceLock<(Ranges, Ranges)> = std::sync::OnceLock::new();
+    let (only, skip) = R.get_or_init(|| (parse("GEX_FJIT_RANGE"), parse("GEX_FJIT_SKIP")));
+    let inr = |rs: &Vec<(u64, u64)>| rs.iter().any(|&(s, e)| addr >= s && addr < e);
+    only.as_ref().is_none_or(inr) && !skip.as_ref().is_some_and(inr)
+}
+
 fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Option<Job> {
     gex_kernel::ftab::translator()?;
+    if !bisect_allows(addr) {
+        return None;
+    }
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
         let v = k.mem.vmas();
         (
