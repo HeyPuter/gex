@@ -10885,7 +10885,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             for i in 0..4096u64 {
                 let Ok(v) = gm.read_u32(sp + 4 * i) else { break };
                 let v = v as u64;
-                let in_image = h.kernel.mem.vmas().iter().any(|m| m.code.is_some() && v >= m.start + 6 && v < m.end);
+                let in_image = h.kernel.mem.vmas().iter().any(|m| m.prot & gex_kernel::mem::prot::EXEC != 0 && !m.name.is_empty() && v >= m.start + 6 && v < m.end);
                 if !in_image || cands.contains(&v) {
                     continue;
                 }
@@ -10899,10 +10899,8 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     cands.push(v);
                 }
             }
-            if !cands.is_empty() {
-                let list: Vec<String> = cands.iter().map(|v| format!("{v:#x} ({})", object_off_at(h, *v))).collect();
-                warn_line(&format!("gex-eject: return addresses on the stack (web entry candidates): {}\n", list.join(" ")));
-            }
+            let list: Vec<String> = cands.iter().map(|v| format!("{v:#x} ({})", object_off_at(h, *v))).collect();
+            warn_line(&format!("gex-eject: return addresses on the stack from esp {sp:#x} (web entry candidates): {}\n", list.join(" ")));
             set_exit(h, 128 + 11);
         });
         trap();
