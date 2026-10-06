@@ -1225,16 +1225,15 @@ Heads:
   `$W/bb-gate`, `$W/pfx-gui-fork` alone until the coordinator says done.
 - **merge/elf-prov** (wt/elf-prov): the development branch (all commits,
   several gex-cgen ones).
-- **merge/elf-prov-gate** (wt/elf-prov-gate): the gate-ready shape of
-  elf-prov at 7d447eb8, on wine-slim 10e816c3 plus the stdin fix: ONE
-  gex-cgen commit (af98737d), then gex-ld, native, browser, gex-kernel TCP,
+- **merge/elf-prov-gate2** (wt/elf-prov-gate2, 02a3ab7a): the gate-ready shape of
+  elf-prov at d7b7f462, on wine-slim 10e816c3 plus the stdin fix: ONE
+  gex-cgen commit (ceb54180, incl. glibc_math), then gex-ld (incl. 32-bit
+  dynsyms), native, browser (incl. the scheduler fixes), gex-kernel TCP,
   docs. `$W/check-elfprov-gate.sh` runs its pre-gate checks (output
-  `$W/gchk.out`). Not yet in it (on merge/elf-prov since): 11c3e8b6 32-bit
-  dynsyms (gex-ld), 5eaed62a glibc_math (gex-cgen: fold into the one
-  commit), 749f13cd/the idle fix (browser scheduler). Rebuild the gate
-  branch with them (same path split: `git checkout <dev head> -- <paths>`
-  per commit), rerun the checks, then merge master once integ-g lands and
-  send the head.
+  `$W/gchk2.out` for gate2). The old merge/elf-prov-gate is deleted. To
+  rebuild after new dev commits: same path split (`git checkout <dev
+  head> -- <paths>` per commit), rerun the checks, merge master once
+  integ-g lands, send the head.
 - Since the last notes: the browser scheduler no longer reports "idle"
   for a wait4/sleep/futex wait (a child in another Worker), and a thread
   whose process exited ends at its next syscall (the pause() one);
