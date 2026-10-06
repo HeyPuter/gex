@@ -790,14 +790,12 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ty = vec![Ty::I64; n];
-        let last_use = compute_last_use(block);
+        let dying = dying_after(block);
         self.prof_entry(block);
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
-            for (v, &lu) in last_use.iter().enumerate() {
-                if lu == Some(i) {
-                    self.release(Value(v as u32));
-                }
+            for &v in &dying[i] {
+                self.release(Value(v));
             }
         }
         self.region_terminator(block);
@@ -866,7 +864,7 @@ impl<'a> Emitter<'a> {
         self.value_const = vec![None; n];
         self.value_ty = vec![Ty::I64; n];
 
-        let last_use = compute_last_use(block);
+        let dying = dying_after(block);
 
         // A block whose only successor is itself becomes a real wasm loop, so
         // its guest registers stay in locals across the back-edge. Sound only
@@ -890,10 +888,8 @@ impl<'a> Emitter<'a> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
             // Recycle locals whose values are dead after this statement.
-            for (v, &lu) in last_use.iter().enumerate() {
-                if lu == Some(i) {
-                    self.release(Value(v as u32));
-                }
+            for &v in &dying[i] {
+                self.release(Value(v));
             }
         }
         self.terminator(block);
@@ -4925,6 +4921,22 @@ impl<'a> Emitter<'a> {
             self.f.return_call_indirect(self.cx.block_ty, k);
         }
     }
+}
+
+/// For each statement, the values whose last use it is, in value order (the
+/// order the releases always ran in). Was a scan of every value after every
+/// statement: quadratic, and most of a Unity start-up's time in Mono's large
+/// JIT-generated blocks.
+fn dying_after(block: &Block) -> Vec<Vec<u32>> {
+    let mut out = vec![Vec::new(); block.stmts.len()];
+    for (v, lu) in compute_last_use(block).into_iter().enumerate() {
+        if let Some(i) = lu {
+            if let Some(d) = out.get_mut(i) {
+                d.push(v as u32);
+            }
+        }
+    }
+    out
 }
 
 /// Index of the last statement that reads each value, or `None` when the
