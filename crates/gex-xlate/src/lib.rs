@@ -1409,6 +1409,15 @@ fn lift_one(
     executable: &(dyn Fn(u64) -> bool + Sync),
     limits: BlockLimits,
 ) -> (Block, Option<u64>) {
+    // The guard's bytes are taken before the block is decoded: another
+    // thread may be writing this code (a JIT emitting a method or a
+    // trampoline next to code already running), and bytes read after the
+    // decode would vouch for a translation of the earlier ones.
+    let snapshot: Option<Vec<u8>> = is_volatile(addr).then(|| {
+        let lo = (addr as usize).min(memory.len());
+        let hi = lo.saturating_add(GUARD_MAX).min(memory.len());
+        memory[lo..hi].to_vec()
+    });
     let fetch = |pc: u64, buf: &mut arch::FetchBuf| fetch_code_bytes(memory, executable, pc, buf);
     let mut block = lift_block(fetch, addr, limits);
     let read = |a: u64, bytes: u32| -> Option<u64> {
@@ -1437,11 +1446,10 @@ fn lift_one(
     }
     pass::optimize(&mut block);
     // Self-modifying code with no flush instruction to announce it.
-    if is_volatile(addr) {
-        let lo = addr as usize;
-        let hi = (block.end as usize).max(lo + 1).min(lo + GUARD_MAX).min(memory.len());
-        if hi > lo {
-            block.guard = Some(memory[lo..hi].to_vec());
+    if let Some(snap) = snapshot {
+        let n = ((block.end as usize).max(addr as usize + 1) - addr as usize).min(snap.len());
+        if n > 0 {
+            block.guard = Some(snap[..n].to_vec());
         }
     }
     // x86-64 and PowerPC: folded on a scratch copy only, never in the
