@@ -76,6 +76,13 @@ public static class GexProbe
             }
             else Console.Error.WriteLine("[gexprobe] no StartManager");
             Console.Error.WriteLine($"[gexprobe] cameras {Camera.allCamerasCount} prerender {preRenders} postrender {postRenders} focused {Application.isFocused} runInBackground {Application.runInBackground} screen {Screen.width}x{Screen.height} device {SystemInfo.graphicsDeviceType} scene {UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}");
+            Console.Error.WriteLine($"[gexprobe] displays {Display.displays.Length} main active {Display.main.active} rendering {Display.main.renderingWidth}x{Display.main.renderingHeight} system {Display.main.systemWidth}x{Display.main.systemHeight} fullscreen {Screen.fullScreenMode} playing {Application.isPlaying} vsync {QualitySettings.vSyncCount} targetfps {Application.targetFrameRate}");
+            if (Environment.GetEnvironmentVariable("GEXPROBE_RENDER") == "1")
+                foreach (var c in Camera.allCameras)
+                {
+                    try { c.Render(); Console.Error.WriteLine($"[gexprobe]   rendered {c.name} by hand; prerender now {preRenders}"); }
+                    catch (Exception e) { Console.Error.WriteLine($"[gexprobe]   {c.name}.Render() threw {e.GetType().Name}: {e.Message}"); }
+                }
             foreach (var c in Camera.allCameras)
                 Console.Error.WriteLine($"[gexprobe]   camera {c.name} enabled {c.enabled} active {c.isActiveAndEnabled} display {c.targetDisplay} rect {c.pixelRect} tex {(c.targetTexture ? c.targetTexture.name : "-")}");
         }

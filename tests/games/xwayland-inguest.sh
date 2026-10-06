@@ -14,6 +14,6 @@ done
 echo "[inguest] X :$n up after $i s"
 # GEX_XFOCUS=PROGRAM (tests/games/xfocus.c): there is no window manager, so this gives the
 # game's window the input focus; without it SDL games believe they are in the background.
-[ -n "${GEX_XFOCUS:-}" ] && DISPLAY=:$n "$GEX_XFOCUS" 2>> "$log" &
+[ -n "${GEX_XFOCUS:-}" ] && DISPLAY=:$n "$GEX_XFOCUS" 2> "$log.xfocus" &
 # The program uses X: a Wayland-capable one (Unity 6, SDL) would otherwise pick gex's compositor directly.
 DISPLAY=:$n exec env -u WAYLAND_DISPLAY "$@"

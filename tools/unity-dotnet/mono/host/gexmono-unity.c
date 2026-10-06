@@ -314,7 +314,8 @@ static int gc_world_stopped;
 void sgen_gc_lock (void);
 void sgen_gc_unlock (void);
 static int lv_env (const char *name) { const char *v = getenv (name); return v && *v && strcmp (v, "0"); }
-U(mono_unity_stop_gc_world) { ENTER; if (!gc_world_stopped && !lv_env ("GEXMONO_LV_NOLOCK")) { sgen_gc_lock (); gc_world_stopped = 1; } RETV; }
+static void lv_pass_reset (void);
+U(mono_unity_stop_gc_world) { ENTER; lv_pass_reset (); if (!gc_world_stopped && !lv_env ("GEXMONO_LV_NOLOCK")) { sgen_gc_lock (); gc_world_stopped = 1; } RETV; }
 U(mono_unity_start_gc_world) { ENTER; if (gc_world_stopped) { gc_world_stopped = 0; sgen_gc_unlock (); } RETV; }
 U(mono_unity_heap_validation_from_statics) { ENTER; RETV; }
 
@@ -389,12 +390,37 @@ lv_free (Liveness *s)
 	g_free (s);
 }
 
+/* Objects already visited in this collection, by any state: Unity's own walk
+ * marks objects in their header for the whole pass, so each object reaches the
+ * callbacks once however many roots and states reach it (Unity sizes its
+ * buffers by the number of objects). Reset when Unity stops the world for the
+ * next pass. */
+static GHashTable *lv_pass_seen;
+static pthread_mutex_t lv_pass_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+lv_pass_reset (void)
+{
+	pthread_mutex_lock (&lv_pass_lock);
+	if (lv_pass_seen)
+		g_hash_table_remove_all (lv_pass_seen);
+	pthread_mutex_unlock (&lv_pass_lock);
+}
+
 static void
 lv_push (Liveness *s, MonoObject *o)
 {
-	if (!o || g_hash_table_contains (s->seen, o))
+	if (!o)
 		return;
-	g_hash_table_add (s->seen, o);
+	pthread_mutex_lock (&lv_pass_lock);
+	if (!lv_pass_seen)
+		lv_pass_seen = g_hash_table_new (NULL, NULL);
+	gboolean seen = g_hash_table_contains (lv_pass_seen, o);
+	if (!seen)
+		g_hash_table_add (lv_pass_seen, o);
+	pthread_mutex_unlock (&lv_pass_lock);
+	if (seen)
+		return;
 	g_ptr_array_add (s->stack, o);
 }
 
@@ -531,7 +557,7 @@ U(mono_unity_liveness_allocate_struct) { ENTER; RET (lv_new ((MonoClass *)P (0),
 U(mono_unity_liveness_free_struct) { ENTER; lv_free ((Liveness *)P (0)); RETV; }
 U(mono_unity_liveness_finalize) { ENTER; if (P (0)) lv_flush ((Liveness *)P (0)); RETV; }
 /* calculation_begin (filter, max_count, callback, userdata, world_start, world_stop): the older form. */
-U(mono_unity_liveness_calculation_begin) { ENTER; RET (lv_new ((MonoClass *)P (0), (guint32)A (1), A (2), A (3))); }
+U(mono_unity_liveness_calculation_begin) { ENTER; lv_pass_reset (); RET (lv_new ((MonoClass *)P (0), (guint32)A (1), A (2), A (3))); }
 U(mono_unity_liveness_calculation_end) { ENTER; if (P (0)) lv_flush ((Liveness *)P (0)); lv_free ((Liveness *)P (0)); RETV; }
 U(mono_unity_liveness_calculation_from_root)
 {
@@ -554,7 +580,7 @@ U(mono_unity_liveness_calculation_from_statics)
 	RETV;
 }
 U(mono_unity_liveness_start_gc_world) { ENTER; if (lv_world_stopped) { lv_world_stopped = 0; sgen_gc_unlock (); } RETV; }
-U(mono_unity_liveness_stop_gc_world) { ENTER; if (!lv_world_stopped) { sgen_gc_lock (); lv_world_stopped = 1; } RETV; }
+U(mono_unity_liveness_stop_gc_world) { ENTER; lv_pass_reset (); if (!lv_world_stopped) { sgen_gc_lock (); lv_world_stopped = 1; } RETV; }
 U(mono_unity_managed_callstack) { ENTER; RET (0); }
 U(mono_unity_lock_dynamic_function_access_tables64) { ENTER; RETV; }
 U(mono_unity_unlock_dynamic_function_access_tables64) { ENTER; RETV; }
