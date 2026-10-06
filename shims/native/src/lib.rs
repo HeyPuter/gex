@@ -3351,6 +3351,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     let gm = GuestMem::new(m.bytes());
                     let bytes: Vec<String> = gm.read(pc as u64, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect()).unwrap_or_default();
                     eprintln!("gex-nt: illegal instruction at {:#x}: {}", pc as u64, bytes.join(" "));
+                    fault_context(&gm, _ctx, pc as u64);
                 }
                 return nt::fault_at(&mut caller, nt::Fault::Illegal, pc as u64, resumable);
             }
@@ -3447,6 +3448,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                             at(src),
                             at(tgt)
                         );
+                        fault_context(&gm, ctx, pc as u64);
                     }
                 }
                 return nt::fault_at(&mut caller, nt::Fault::from_brk(imm), pc as u64, resumable);
@@ -3739,6 +3741,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             if op == gex_abi::cache_op::IC_INVALIDATE {
                 let addr = addr as u64;
+                if std::env::var_os("GEX_TRACE_GUARD").is_some() {
+                    eprintln!("[guard] {addr:#x} changed (block {:#x})", pc as u64);
+                }
                 let page = addr / gex_abi::DISPATCH_PAGE;
                 retire_translations(
                     &mut caller,
@@ -5102,4 +5107,17 @@ pub(crate) fn check_i386_high(cx: &impl wasmtime::AsContext<Data = HostState>, s
             eprintln!("gex: GEX_CHECK_I386_HIGH: x{i} = {v:#x} after {site} (pc {pc:#x})");
         }
     }
+}
+
+/// The bytes around a faulting pc and the top of the guest stack (NT
+/// faults; RW debugging of Mono JIT code).
+fn fault_context(gm: &GuestMem<'_>, ctx: i32, pc: u64) {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+    if let Ok(b) = gm.read(pc.saturating_sub(64), 96) {
+        eprintln!("gex-nt:   bytes {:#x}: {}", pc.saturating_sub(64), hex(&b));
+    }
+    let c = ctx as u32 as u64;
+    let sp = gm.read_u64(c + gex_abi::ctx::X as u64 + 4 * 8).unwrap_or(0);
+    let words: Vec<String> = (0..12).map(|i| format!("{:#x}", gm.read_u64(sp + 8 * i).unwrap_or(0))).collect();
+    eprintln!("gex-nt:   rsp {sp:#x}: {}", words.join(" "));
 }
