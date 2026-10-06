@@ -391,7 +391,13 @@ pub(crate) fn publish_stateful(
         let m = s.ftab.modules.len() as u32;
         s.ftab.stateful.insert(m, extras);
     }
-    publish_pairs(sh, memory, module, len, pairs, Tier::Unit)
+    let install = publish_pairs(sh, memory, module, len, pairs, Tier::Unit)?;
+    // Native code in place of the bytes at its addresses (a wasm32
+    // program's functions, Wine's PE module behind its skeletons): what the
+    // guest does to those bytes (relocating a skeleton, mprotect) retires
+    // nothing, as for an export provider.
+    sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.providers.insert(install);
+    Ok(install)
 }
 
 /// Bind more addresses to slots of an existing install (`FuncMap::bind`):

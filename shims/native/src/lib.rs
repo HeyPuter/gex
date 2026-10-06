@@ -4757,6 +4757,17 @@ static UNIX_DISPATCHERS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
 pub(crate) fn unix_dispatcher(state: &HostState, op: i32, idx: u32) -> u32 {
     let key = Arc::as_ptr(&state.kernel) as usize;
+    // ops 4 and 5: the Unix-call dispatcher itself, for wasm callers that
+    // reach the trampoline's address (gexrt calls it directly)
+    if op >= 4 {
+        let mut v = NATIVE_UNIX_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if op == 4 {
+            v.retain(|(k, _)| *k != key);
+            v.push((key, idx));
+            return 0;
+        }
+        return v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d);
+    }
     // ops 2 and 3: the same for the guest's Unix calls (the trampoline
     // page's `UNIX_CALL_32`, i386 code calling `__wine_unix_call_dispatcher`)
     if op >= 2 {
@@ -4776,6 +4787,9 @@ pub(crate) fn unix_dispatcher(state: &HostState, op: i32, idx: u32) -> u32 {
     }
     v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d)
 }
+
+/// Wine's `__wine_unix_call_dispatcher` (W3), by process.
+static NATIVE_UNIX_CALLS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
 /// Wine's handler for a Unix call from guest code (W3), by process.
 static GUEST_UNIX_CALLS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
