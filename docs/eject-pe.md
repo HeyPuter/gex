@@ -7,6 +7,91 @@ Stream E, 2026-10-03. This is the design; status is at the end. It extends
 that replaces pewasm: a standalone project that builds and runs natively,
 in Node and in the browser, at or above pewasm's world fps.
 
+## Hand-off (final state of stream E, 2026-10-06)
+
+Stream E stopped when merge/eject9 de2c3b4d landed (integ/2026-10-06e) and
+"gex eject replaces pewasm" was announced. This section is the state for
+whoever picks the eject up. The sections below it are the design and the
+log as they were written (`$S` = `~/gex-sandbox/scratch/eject9`).
+
+**What ships.** `gexc eject` records a Windows program under gex and turns
+it into a standalone project: AOT units for every image, providers (PUC
+Lua for lua51, CRT and ConcRT ones), region entries for interior resumes,
+and a web build. `web/eject-site.mjs PROJECT OUT` makes the static site
+(zstd-packed, `sw.js` for isolation and decoding, `_headers`, `serve.mjs`):
+about 75 MB to download, 450 MB unpacked. The page runs AOT-only (no JIT, no
+interpreter), presents GL frames directly (`?direct=1`, eject-site's
+default with GL; `--no-direct` for the composited path), and keeps saves in
+IndexedDB (`persist`).
+
+**Results** (edger, Quadro P620, WebGPU over Vulkan, BENCH_CORES default,
+world seed pinned at 1767225600; the eject's project `$S/p-noita19` at
+master 85eb233c-6f196998's unit keys):
+
+| | ejected Noita page | pewasm page |
+| --- | --- | --- |
+| world fps, ABBA (world-up+90 s to 330 s) | 65.6, 68.3 (mean 66.95) | 48.2, 49.0 (mean 48.6) |
+| world-up, seconds after navigation | 31.2, 30.9 | 31.3, 30.8 |
+| 35-min soak, world frames simulated | 102,440 (no freeze; longest present stall 5 s, before world-up) | 57,891 |
+| soak, last 5-min window vs first | 35.6 vs 56.2 world fps (63%) | 16.9 vs 46.7 (36%) |
+
+The soak rows are from the c28 build (site28, master e3917bac's keys, 2026-10-05); the others are from site30.
+
+The ejected page is 1.38x faster than pewasm (66.95 vs 48.6 world fps) and
+reaches the world as fast. Direct present is worth about 4% over the
+composited path (63.65 vs 61.3 world fps, c28). Both decline over a soak;
+the game's world grows and pewasm declines more.
+
+**Correctness checks that pass:** play-through A (menus, mode select,
+world, walking, levitating, shooting, death by the killme mod, Game Over,
+stats, New Game; `$S/c28/qA.json` on a site packed with
+`--overlay $S/overlay-play`); play-through B up to the reload (pause, Save &
+Quit with status 29, the IndexedDB snapshot, all 62 files under
+drive_c/users restored after the reload; `$S/c28/qB.json`); tests/nt
+ejected x86 seh, cxx and apc in gex-rt and in the web build under Node,
+AOT-only (`scratch/eject9/ntweb.sh <case> x86` with `TRAIN=1`);
+tests/nt/run-browser.sh 49/49; tests/nt/browser-gui.mjs x86 and x86 --gl,
+composited and direct (`GEX_NT_PAGE_FLAGS='&direct=1'`).
+
+**Known gap: Continue after a reload.** The reloaded game reaches the main
+menu with "Continue", but Continue stops before the world: FMOD's init on
+the restored save goes through combase/sechost/rpcrt4 (a named-pipe
+connect that blocks and unwinds), and the frames it resumes have no AOT
+entry. Adding those frames as web entries is the designed fix, but two of
+fmod's frames together make the boot stop: the open bug in §8, with its
+repro and the entry lists in tests/eject/noita-entries/. A new game, and
+everything else in a session, works.
+
+**Follow-ups, in priority order:**
+1. **The boot-stop bug** (§8 "OPEN BUG"): adding region entries must never
+   break a run. Repro: base46.txt boots; base46 + fmod 0x17e5afa +
+   0x17d8ea4 stops at msvcr120 0x15cf728 on edger. Fixing it unblocks
+   Continue (then add full50.txt's fmod frames and re-run play B).
+2. **A fallback for missed entries in the shipped page.** Any path the
+   recording never reached stops the run loudly; `jit_fallback` exists but
+   needs a translator the page does not ship. Options: a tier-1 translator
+   loaded on demand, or region entries for every call continuation of
+   every recorded function.
+3. **A coverage pass:** scripted training runs (`run.mjs --record-entries`
+   and the page's `?record`) through menus, options, save/load, death and
+   restart, mods, so `user/web-entries.txt` covers a whole session. The
+   shim's stop report (stack scan and EBP chain) names the frames a
+   missed resume needs.
+4. **Audio.** Neither side has any: FMOD's output fails without a WASAPI
+   device (mmdevapi onto WebAudio, plus streaming 1.2 GB of banks).
+5. **A headed browser and a second GPU vendor.** Every number above is
+   headless Chromium on one NVIDIA P620; worldmachine's RX 6500 XT
+   (BENCH_HOST=worldmachine) and a real window are untried for the eject.
+6. Smaller: page-load variance (2.7-6 s from navigation to process start);
+   pointer lock (`?pointerlock=1`) untested on hardware; the cursor-as-CSS
+   path untested with a game that sets a cursor image.
+
+**Reproducing the numbers:** `$S/c30/queue.sh` (ABBA, world-up, play A/B)
+through `scratch/bench/bench.sh` with the sites synced (see
+`$S/c28/chain.sh` for the sync list); `$S/soak-edger.sh SITE TAG 2100` and
+`$S/c28/pewsoak.sh` for the soaks. Rebuild a project after a master merge
+with `$S/c29/prep30.sh` (page, runtime refresh, build, pack).
+
 ## 0. The constraint, and what it means
 
 The user: "the default tier for eject does not ship a jit or interpreter at
@@ -1029,19 +1114,8 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   world-up A/B, play-through p1-p8 (site27p, readback for screenshots, own
   browser profile `/tmp/gbench-e9play`), 35-minute soak.
 
-- **RESUME HERE (2026-10-06).** merge/eject9 on master 6f196998; head =
-  the commit adding this paragraph. Project `$S/p-noita19` (integ-g keys,
-  web entries = tests/eject/noita-entries/base46.txt), sites site30 (bench),
-  site30p (killme), site31q (play). Results on these keys (edger, seed
-  pinned): ABBA pewasm 48.2 / eject 65.6 / eject 68.3 / pewasm 49.0 world
-  fps (eject 66.95 average, 1.38x faster than pewasm's 48.6); world-up
-  eject 31.2 and 30.9 s vs pewasm 31.3 s; play A passes; play B: Save &
-  Quit, snapshot and 62-file restore pass, Continue stops on fmod frames
-  (see the open bug in §8). ntweb seh/cxx/apc x86 with TRAIN=1 pass in rt
-  and web; tests/nt/run-browser.sh 49/49; browser-gui x86 and --gl, plain
-  and direct=1, pass. Soak (c28 keys): no freeze, declines less than
-  pewasm. Open for whoever continues: the §8 open bug (blocks Continue),
-  a coverage pass, a shipped-page fallback for missed entries, audio.
+- **Final state: see "Hand-off" at the top of this file.** The entries
+  below are the log as it was kept.
 
 - **Earlier resume (parked 2026-10-05 ~21:00).** Head = the
   commit adding this paragraph (on 74e84773; master e3917bac merged at
