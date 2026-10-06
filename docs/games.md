@@ -491,9 +491,22 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
   waited on the display), `--lazy` (eager translation of the 9 MB
   executable is 216 MB of wasm). It creates its GL window and stops after
   its renderer string, waiting on an X reply.
-- Retrocycles (Linux): gexc itself died of SIGSEGV once, after the welcome
-  screen's Enter (a host crash, not the guest's): being reproduced with a
-  core dump.
+- Retrocycles (Linux): **gameplay natively** (language menu, First Setup,
+  welcome, matches; tests/games/retrocycles-linux.wl, menu 650, gameplay
+  6000). gexc had died of SIGSEGV in the host's Mesa when the first match
+  started: the native GL host passed a glDrawElements' client-side index
+  pointer (guest memory) to the host's GL as an offset. Fixed in gex-gl's
+  native host (b7556e59, with a test).
+- In the page (tests/games/browser-linux.mjs, hostx=1): Retrocycles starts,
+  its X windows appear and Mesa draws (hundreds of thousands of draws), but
+  the canvas stays black: a GLX window's frames on an X11 window do not
+  reach the page's compositor yet (Half-Life's GL is on a Wayland surface;
+  only its CEF uses X). Next: how the page shows a GL surface made for an X
+  window (gexgl eglCreateWindowSurface with an X window id under hostx).
+- Baba Is You: from its game directory (`@bin64/Chowdren`) it finds its
+  assets; it still stops right after printing its renderer (the version
+  part of that line is empty) and, in one run, opened an SDL message box
+  (a forked child whose X font request failed, so the text is unknown).
 
 ### Resume (stream G)
 
