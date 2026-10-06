@@ -1247,6 +1247,11 @@ fn run_program_with(
     let Stopped::Exited(exit) = stopped else {
         unreachable!()
     };
+    // The first thread ended with `exit` while others run: the process goes
+    // on, as on Linux, until one of them ends it.
+    if store.data().thread_only {
+        wait_for_process_end(&spawn);
+    }
     // Another thread may have ended the process (this one then only saw
     // `stopping`).
     let exit = spawn.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit);
@@ -2036,6 +2041,9 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
     profile::harvest(&mut store)?;
     match stopped {
         Stopped::Exited(exit) => {
+            if store.data().thread_only {
+                wait_for_process_end(&cx);
+            }
             stop_other_threads(&cx, false);
             Ok(cx.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit))
         }
@@ -2222,6 +2230,14 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
         Stopped::Exited(_) if cx.stopping.load(std::sync::atomic::Ordering::Acquire) => Ok(None),
         Stopped::Exited(_) if store.data().thread_only => Ok(None),
         Stopped::Exited(exit) => Ok(Some(exit)),
+    }
+}
+
+/// Wait, after the first thread's `exit` (a thread exit, others running),
+/// until another thread ends the process.
+fn wait_for_process_end(cx: &SpawnContext) {
+    while !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
