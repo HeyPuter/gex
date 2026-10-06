@@ -899,6 +899,27 @@ unixlib ran through the dlopen registry (§3.12).
   X.exe` (`$W/gexc-w3` wraps that for tests/nt/run.sh; `GEX_W3_TRACE=1` in
   gexc's own environment lists the bindings). wineboot.exe is not in the
   master prefix, so every start warns "failed to start wineboot" (W3.2).
+- **tests/nt x86 on this path** (`$W/nt-run-x86.sh $W/gexc-w3`, log
+  `$W/w3-nt.log`): 20 of 45 pass (hello_args, mtx, crtmem, lowmem, apc,
+  tls, cxx, icall, fixedbase(-taken), loadorder-native/-disabled, zfcall,
+  window, pagespan, exitproc, hello32, msvc, msvc_x87, msvc_largeint),
+  after two fixes: a new thread's start function at pthread's type (wasm
+  traps a call through a pointer of another type) and i386 mlock as an
+  advisory no-op. G's repros: unixpath and iocp pass; sysmisc has only
+  the two SPI_GET checks left (user32/win32u, W3.3); hooks and keyname are
+  W3.3. Open, by cause:
+  - **wineserver's shared memory**: the tick count in KUSER_SHARED_DATA
+    (sync's "timeout lasts" and "timer fires"), and later win32u's
+    session shm. gex's `MAP_SHARED` is coherent only within a process, so
+    this is the in-process wineserver of §3.5 — the next W3.1 item.
+  - exceptions: seh (the top-level filter never runs), seh-traps,
+    msvc_cxxeh (hangs), msvc_msvcp, detour, jitcode;
+  - lownull-* (§5.0, low-page protection; not to be fixed here);
+  - sections and change notifications: filemap (a section's writes
+    reaching the file; built --without-inotify);
+  - win32u's Unix side (W3.3): user_win, gdi, input, display, gl*;
+  - suspend (hangs), pipe (SystemSupportedProcessorArchitectures),
+    crypt (a DLL's init fails), loadorder-builtin.
 
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
