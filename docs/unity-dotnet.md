@@ -1218,9 +1218,20 @@ Not yet:
      Still open: Hollow Knight's legacy Input sees pointer motion (GexProbe
      `GEXPROBE_INPUT=1`: mouse 400,257 after the scripted move) but no key
      and no button. Without xfocus (NOFOCUS=1) it is not focused at all.
-     Next: an LD_PRELOAD spy on the Xlib functions Unity's SDL dlsym's
-     (`scratch/unity/xspy`), to see whether its XNextEvent gets the
-     KeyPress and what XFilterEvent says.
+     An LD_PRELOAD spy on the Xlib functions Unity's SDL dlsym's
+     (`scratch/unity/xspy/xspy.c`; Unity sends its stderr to the player log)
+     shows the events do reach Unity: every scripted key arrives as a
+     KeyPress through XFilterEvent (-> 0, not swallowed) and
+     Xutf8LookupString (Return, z, Left, Right), Unity selects XI2
+     RawButtonPress/RawButtonRelease/RawMotion (mask 0x38000) on the root
+     for all master devices, and a scripted click arrives as XI2 raw
+     button 1 press and release (hk120). Yet GexProbe's legacy Input reports
+     no key and no button and the menu does not react; only the pointer
+     position (likely polled) works. So the loss is inside Unity, between
+     its X event handling and its input queue. Leading suspect: event
+     timestamps (Unity's input queue orders events by time; position by
+     polling would not care). Next: the X event `time` values against the
+     guest's CLOCK_MONOTONIC as Unity reads it.
      **Muck with the walk on by default:** batch, current gexc, --fjit:
      "Initializing packets" (mk8); without --fjit too (mk4). (mk1-mk3, mk6
      hung at ReloadAssembly: they ran the script's default
