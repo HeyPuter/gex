@@ -62,8 +62,14 @@ int main(void) {
     CHECK("the screen metrics follow", GetSystemMetrics(SM_CXSCREEN) == 800 && GetSystemMetrics(SM_CYSCREEN) == 600);
     DEVMODEA cur = {.dmSize = sizeof cur};
     CHECK("ENUM_CURRENT_SETTINGS is the new mode", EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &cur) && cur.dmPelsWidth == 800);
+    /* (Wine tells the desktop's thread with a notify message: a desktop
+     * in another thread, as explorer's, takes the size a moment later) */
     RECT dr;
-    GetWindowRect(GetDesktopWindow(), &dr);
+    for (int i = 0; i < 100; i++) {
+        GetWindowRect(GetDesktopWindow(), &dr);
+        if (dr.right == 800 && dr.bottom == 600) break;
+        Sleep(10);
+    }
     CHECK("the desktop window takes its size", dr.right == 800 && dr.bottom == 600);
     CHECK("restore", ChangeDisplaySettingsA(NULL, 0) == DISP_CHANGE_SUCCESSFUL);
     CHECK("the metrics are back", GetSystemMetrics(SM_CXSCREEN) == w0 && GetSystemMetrics(SM_CYSCREEN) == h0);

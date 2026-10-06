@@ -1075,26 +1075,34 @@ unixlib ran through the dlopen registry (§3.12).
   daemonizes), so it is not asyncify-instrumented: smaller, and nothing
   can be left half rewound. A call-out's return is never watched in the
   miss slots (gex: the trampoline page's pad, translated first).
-- **Blocked on the session's shared memory.** win32u reads windows,
-  classes, queues and the desktop from the session mapping the server
-  writes. Two cases:
-  1. *In the process:* Wine maps the section at an address of its own
-     choosing (a fixed `MAP_SHARED`), and one wasm memory cannot map the
-     server's pages there too. gex hands a non-fixed map the server's pages
-     (also a window inside them), and the server makes the session one
-     16 MiB block, but Wine's view code maps fixed. Fix in reach: win32u
-     (wasm32) takes the session's blocks from the in-process server's
-     mapping directly (same address space), no section view.
-  2. *The desktop process:* any window needs the desktop window, which
-     win32u gets by starting `explorer.exe /desktop` — a second Windows
-     process, i.e. §3.5's child-process gap, which it hits at once
-     (explorer's own RegisterClass fails on a stale session). Options:
-     (a) explorer's desktop as a thread of the application process (its
-     code is in the one PE-side module already; win32u would start
-     `manage_desktop` in a thread instead of the process); (b) a shared
-     mapping coherent across gex processes (natively, a host memfd mapped
-     into both linear memories; the browser has no equivalent short of
-     one memory for several processes). (a) works in the browser too.
+- **The session's shared memory, resolved with option (a)** (the user's
+  choice, 2026-10-06): win32u (wasm32) reads the session's blocks from the
+  in-process server's mapping (`wineserver_session_data`, one 16 MiB
+  block), and explorer's desktop runs as a thread of the application
+  (`gexp_desktop_thread`, which win32u's `get_desktop_window` starts once
+  per process). Both are in the inventory below.
+- **The desktop thread, made right:** it creates the desktop window
+  itself, as explorer does (it owns its WND: IsChild, the window tree and
+  messages to the desktop work). The thread is created suspended so the
+  starter knows it: its own `get_desktop_window` before the window exists
+  returns at once (it had waited out 10 s, after which the application
+  forced a desktop window of its own). Callers wait until explorer names
+  the shell window, just before its message loop (a WM_NULL was answered
+  in explorer's sent-message waits during set-up, before the desktop had
+  its size). explorer's `ClipCursor`/`SetCursor` imports were trapping
+  stubs: winebuild's export list now names a renamed `-import` export as a
+  forward (user32's ClipCursor is win32u's NtUserClipCursor).
+- **No FreeType on wasm32 yet**, so no font can be realized:
+  `get_text_metr_size` left the metrics unset and every window's minimum
+  track size was stack garbage (SM_CYMINTRACK; a 640-wide window came out
+  4204 wide). Zeroed on wasm32 until FreeType is built for the sysroot
+  (needed for any GUI text anyway, W3.3's display driver).
+- The test prefix has the null graphics driver as a fixture
+  (`$W/stage-w3.sh` writes `[Software\\Wine\\Drivers] "Graphics"="null"`)
+  and stages explorer.exe as a native program (`W3_PROGRAMS=explorer.exe`).
+- tests/nt `display`: the desktop takes a new mode's size from a notify
+  message (Wine's behaviour with explorer in another thread or process),
+  so the check polls for up to 1 s.
 
 #### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
 
@@ -1120,7 +1128,9 @@ what would let it go:
 | win32u DllMain always loads win32u.so | one module: the dispatcher variable is ntdll's | separate win32u module (no) |
 | user callbacks return through gex's pad | gex watches call-out returns by dispatch slot | never (port) |
 | **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
-| **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
+| **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
+| win32u `get_text_metr_size`: no metrics (zeroed, height -1) when no font is realized | no FreeType in the wasm32 build: the metrics were stack garbage | FreeType built for wasm32 |
+| winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
 
 **Future option for the last two (and the server's 16 MiB block)**, not
 built: a SharedArrayBuffer-backed extra memory (wasm multi-memory) holding
@@ -1623,10 +1633,16 @@ Heads:
   branch `wasm32-w3` (wt/wine-w3; build tree `$W/wine-w32-w3` via
   `$W/build-w32-w3.sh [targets]`, sysroot **`$W/sr-w3`** for every W3 build (a hard-linked copy of sr-slim whose only change is the ICALL plugin with declaration thunks; sr-slim stays read only); loader link
   `$W/link-w3.sh`, prefix and dll dir `$W/stage-w3.sh`). hello_args.exe
-  runs on Wine's own Unix side, wineserver in process; tests/nt i386 29
-  of 40 (§4.0, W3.1 progress; `$W/w3-nt4.log`). W3.2 in progress
-  (§4.0): native modules' imports load, wineboot runs and starts
-  services.exe; the wine.inf install's first RPC to services faults. The old merge/elf-prov-gate is deleted. To
+  runs on Wine's own Unix side, wineserver in process. **W3.3 in
+  progress** (§4.0): win32u.so linked in, the session read from the
+  in-process server, explorer's desktop as a thread (option (a)); test
+  prefix `W3_PROGRAMS=explorer.exe $W/stage-w3.sh` (null-driver fixture).
+  tests/nt i386 **32 of 40** (`$W/w3-nt8.log`; user_win and gdi pass; left:
+  lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
+  glcompat/glfast (W3.4)). Next: FreeType for wasm32 (no font can be
+  realized), then the display driver. Wine fork head 832123e9660 (mw).
+  gate2 004538a9 is gating as integ/2026-10-06f (E's page landed, master
+  a0bbb53c). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
