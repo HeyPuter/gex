@@ -1275,7 +1275,16 @@ Heads:
   gex-cgen commit (ceb54180, incl. glibc_math), then gex-ld (incl. 32-bit
   dynsyms), native, browser (incl. the scheduler fixes), gex-kernel TCP,
   docs. `$W/check-elfprov-gate.sh` runs its pre-gate checks (output
-  `$W/gchk2.out` for gate2). The old merge/elf-prov-gate is deleted. To
+  `$W/gchk2.out`): **all green on 02a3ab7a** (elf-prov 5/5 native and in
+  the browser, x86-programs 74, nt --no-cgen 81/81 on x86 and pfx-gui,
+  cgen-prefix 81/81, wasm32 4/4 + busybox both, browser nt 49/49). Gate
+  order (coordinator): integ-g, U's fjit fix, E's ejected page, then gate2
+  with F's final head (both re-key). Merge master into gate2 when integ-g
+  lands.
+- **W3** (the user's order: before W7): plan in §4.0. gex branch
+  merge/w3 (wt/w3, off merge/elf-prov) with the W3.0 spike; Wine fork
+  branch `wasm32-w3` (wt/wine-w3; build tree `$W/wine-w32-w3` via
+  `$W/build-w32-w3.sh [targets]`, sr-slim read only). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
