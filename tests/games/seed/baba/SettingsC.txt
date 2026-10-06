@@ -1,0 +1,9 @@
+[settings]
+controlinit=1
+grid=0
+editorcontrolinit=1
+delay=10
+fullscreen=0
+sound=100
+music=70
+init=1

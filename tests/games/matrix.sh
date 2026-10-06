@@ -139,7 +139,25 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
         env+=("GEX_NT_INPUT=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$here/$input" | tr -d ' ' | paste -sd';')")
     fi
     # shellcheck disable=SC2206
-    run=("$gexc" run "${flags[@]}" $extra --gl --wayland-out "$g/frames/f")
+    # `seed=DIR@GUEST` in the extra flags: a fresh copy of tests/games/DIR
+    # mounted at GUEST (`~` is the user's home), so a game that keeps state
+    # in a fixed place (Baba Is You's ~/.local/share/Baba_Is_You, found with
+    # getpwuid rather than $HOME) starts from known settings and never
+    # writes the real home.
+    gflags=()
+    nseed=0
+    for x in $extra; do
+        case $x in
+        seed=*@*)
+            src=${x#seed=}; src=${src%@*}; dst=${x#*@}
+            case $dst in "~"*) dst=$HOME${dst#"~"} ;; esac
+            sd=$state/seed-$slug/$nseed; nseed=$((nseed + 1))
+            rm -rf "$sd"; mkdir -p "$sd"; cp -r "$here/$src/." "$sd/"
+            gflags+=(--bind "$sd=$dst") ;;
+        *) gflags+=("$x") ;;
+        esac
+    done
+    run=("$gexc" run "${flags[@]}" "${gflags[@]}" --gl --wayland-out "$g/frames/f")
     for e in ${GAME_ENV:-}; do run+=(--env "$e"); done
     pre=()
     if [[ $kind == linux* ]]; then

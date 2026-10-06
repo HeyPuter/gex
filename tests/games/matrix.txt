@@ -15,7 +15,8 @@
 # input:     a script in tests/games/ (`-` for none): GEX_NT_INPUT's for
 #            Windows games, GEX_WL_INPUT's (*.wl) for Linux ones.
 #
-# Optional per-game gexc flags go after the input, as a ninth field.
+# Optional per-game gexc flags go after the input, as a ninth field;
+# `seed=DIR@GUEST` there mounts a fresh copy of tests/games/DIR at GUEST.
 #
 # Only games whose code is native (no .NET/Mono/XNA, no JVM). In scope
 # (2026-10-05): i386 Windows games on stream W's native Wine, and Linux
@@ -27,7 +28,7 @@ katana-zero  |pe   |Katana ZERO                          |Katana ZERO.exe       
 npp          |pe   |N++                                  |N++.exe                             | |-|-|-
 momodora     |pe   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |pe   |Retrocycles                          |Retrocycles.exe                     | |200|1000|retrocycles-input.txt
-baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren                     | |-|-|-|--lazy
+baba-linux   |linux-x11|Baba Is You                      |@bin64/Chowdren                     | |-|-|baba.wl|--lazy seed=seed/baba@~/.local/share/Baba_Is_You
 retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|650|6000|retrocycles-linux.wl
 
 # x64 Windows games: waiting for 64-bit native Wine (OneShot's game is
