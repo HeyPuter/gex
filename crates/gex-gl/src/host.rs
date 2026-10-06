@@ -1102,9 +1102,14 @@ impl Gl {
                     }
                 }
                 op::DELETE_SHADER => {
+                    // GL keeps a deleted shader that is still attached to a
+                    // program, and its name stays usable until it is
+                    // detached: wined3d attaches, deletes, and only then
+                    // compiles (its format checks' "draw quad"). So the name
+                    // keeps its mapping; a new shader given the same name
+                    // replaces it.
                     if let Some(n) = a.u32() {
-                        if let Some(real) = self.names.shaders.remove(&n) {
-                            native::gexgl_native_name(0, n, 0);
+                        if let Some(&real) = self.names.shaders.get(&n) {
                             glDeleteShader(real);
                         }
                     }
