@@ -1,0 +1,45 @@
+# The games smoke matrix (tests/games/matrix.sh; docs/games.md "Games
+# matrix"). One game per line, fields separated by `|`:
+#
+#   slug | kind | directory | program | arguments | menu | gameplay | input
+#
+# kind:      pe (a Windows program, run with --wine-prefix) or linux.
+# directory: relative to GAMES (Windows builds, default ~/gex-sandbox/games)
+#            or GAMES_LINUX (Linux builds, default ~/gex-sandbox/games-linux).
+# program:   relative to the directory; the run's working directory is the
+#            program's own.
+# menu, gameplay: the presented frame at which the game shows its menu and
+#            its gameplay with the scripted input (`-` when not reached yet).
+#            matrix.sh reports the furthest stage whose frame was presented.
+# input:     a GEX_NT_INPUT script in tests/games/ (`-` for none).
+#
+# Optional per-game gexc flags go after the input, as a ninth field.
+#
+# Only games whose code is native (no .NET/Mono/XNA, no JVM). In scope
+# (2026-10-05): i386 Windows games on stream W's native Wine, and Linux
+# builds. x64 Windows games wait for 64-bit native Wine; they are kept
+# below, commented out. Isaac (SteamStub DRM) and Antichamber (needs a CLR)
+# are left out.
+undertale    |pe   |Undertale                            |UNDERTALE.exe                       | |650|1500|undertale-input.txt
+katana-zero  |pe   |Katana ZERO                          |Katana ZERO.exe                     | |900|-|katana-zero-input.txt
+npp          |pe   |N++                                  |N++.exe                             | |-|-|-
+momodora     |pe   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
+retrocycles  |pe   |Retrocycles                          |Retrocycles.exe                     | |200|1000|retrocycles-input.txt
+baba-linux   |linux|Baba Is You                          |bin64/Chowdren                      | |-|-|-
+retrocycles-linux|linux|Retrocycles                      |usr/bin/Retrocycles                 | |-|-|-
+
+# x64 Windows games: waiting for 64-bit native Wine (OneShot's game is
+# oneshot.exe, x64).
+# oneshot      |pe   |OneShot                              |oneshot.exe                         | |-|-|-
+# hades-x86    |pe   |Hades                                |x86/Hades.exe                       | |-|-|-
+# deltarune    |pe   |DELTARUNE                            |DELTARUNE.exe                       | |-|-|-|--mem64
+# will-you-snail|pe  |Will You Snail                       |Will You Snail.exe                  | |-|-|-|--mem64
+# hyper-light  |pe   |Hyper Light Drifter                  |HyperLightDrifter.exe               | |-|-|-
+# dicey        |pe   |Dicey Dungeons                       |diceydungeons.exe                   | |-|-|-
+# geometry-dash|pe   |Geometry Dash                        |GeometryDash.exe                    | |90|-|geometry-dash-input.txt
+# 5d-chess     |pe   |5D Chess With Multiverse Time Travel |5dchesswithmultiversetimetravel.exe | |600|900|5d-chess-input.txt
+# mosa-lina    |pe   |Mosa Lina                            |Mosa Lina.exe                       | |-|-|-
+# spelunky2    |pe   |Spelunky 2                           |Spel2.exe                           | |-|-|-|--mem64
+# hades        |pe   |Hades                                |x64/Hades.exe                       | |-|-|-
+# cruelty-squad|pe   |Cruelty Squad                        |crueltysquad.exe                    | |-|-|-
+# buckshot     |pe   |Buckshot Roulette                    |Buckshot Roulette_windows/Buckshot Roulette.exe| |-|-|-

@@ -1,0 +1,13 @@
+# Retrocycles (Windows), from a profile-less start: the language menu
+# (American English), First Setup's Accept, the welcome screen, into the
+# first local game; then turns.
+# menu 200 (the language menu)
+400:key:0x0d
+600:key:0x0d
+750:key:0x0d
+900:key:0x0d
+# gameplay 1000 (a light-cycle match)
+1100:key:0x27
+1200:key:0x25
+1300:key:0x27
+1400:key:0x25
