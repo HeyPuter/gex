@@ -1228,7 +1228,7 @@ Not yet:
      button 1 press and release (hk120). Yet GexProbe's legacy Input reports
      no key and no button and the menu does not react; only the pointer
      position (likely polled) works. So the loss is inside Unity, between
-     its X event handling and its input queue. Leading suspect: event
+     its X event handling and its input queue. One candidate: event
      timestamps (Unity's input queue orders events by time; position by
      polling would not care). Next: the X event `time` values against the
      guest's CLOCK_MONOTONIC as Unity reads it.
