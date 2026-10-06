@@ -1076,6 +1076,23 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
       bytes), build.sh (rpcrt4 region entries 0 -> 1, no unit rebuilt),
       site28r. B rerun on site28r queued (`$S/c28/playB2.sh`).
       **Carry this web entry into the post-integ-g relink.**
+  - **35-min soaks, same script, seed and length (edger), world fps per 5 min
+    from world-up:** ejected site28 56.2 (28-327 s), 63.3, 57.3, 45.7, 41.0,
+    37.9, 35.6 (1893-2097 s); 102,440 world frames; longest present stall 5 s
+    (before world-up), no freeze. pewasm 46.7, 43.3, 30.8, 22.5, 19.2, 16.9
+    (1530-1830 s); 57,891 world frames. pewasm falls further (to 36% of its
+    first window against the eject's 63%), while the eject simulated 1.8x as many frames:
+    the decline is the game's world growing, not the ejected page.
+  - **Play B's Continue: the full stack.** With the stack scan (shim
+    dabbba27..e3398d6a: an unseen-code stop also lists the stack words that
+    follow a call instruction in an image, in lines of 16) the stop is
+    deterministic (same esp 0x141d688 each run). The chain is FMOD's
+    init on the reloaded game -> combase (CoCreateInstance) -> sechost/rpcrt4
+    -> the named-pipe connect that blocks and unwinds. Its 152 candidates
+    plus 0x7899c20b (the frame the first entry returned into) are in
+    `$S/c28/cands2.txt`; region entries cover each function's call
+    continuations (build.sh's `[regions] ... with the call continuations of
+    their functions`). Carried into p-noita19 (post-integ-g).
   - Killed by PID on edger: the orphaned pewasm-runner Chromium 2139751
     (ppid 1, idle 23 h, held no bench lock), as the coordinator asked.
 
