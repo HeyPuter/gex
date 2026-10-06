@@ -61,6 +61,9 @@ pub struct Options {
     /// behind them, so the translator emits that instead of lifting the
     /// function's own code. See [`intrinsic`].
     pub intrinsics: HashMap<u64, Intrinsic>,
+    /// The file the program was loaded from, for the function JIT's view of
+    /// its image (`.eh_frame` function starts): set per process.
+    pub image_elf: Option<std::sync::Arc<[u8]>>,
     /// Extra guest addresses to treat as block entry points.
     pub extra_entries: Vec<u64>,
     /// Scan data for values that look like code pointers.
@@ -139,6 +142,7 @@ impl Default for Options {
         Options {
             limits: BlockLimits::default(),
             intrinsics: HashMap::new(),
+            image_elf: None,
             extra_entries: Vec::new(),
             scan_pointers: true,
             // Off by default now that runtime translation covers the gaps;
