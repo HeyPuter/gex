@@ -1120,6 +1120,21 @@ unixlib ran through the dlopen registry (§3.12).
   message (Wine's behaviour with explorer in another thread or process),
   so the check polls for up to 1 s.
 
+**Display driver: winewayland.drv, not a small gex driver** (spike,
+2026-10-06). The two options, side by side:
+
+| | winewayland.drv + libwayland + libxkbcommon | a small gex driver |
+|---|---|---|
+| work | build three libraries for wasm32 (wayland 1.23.1 and libxkbcommon 1.7.0 fetched to `$W/wl`); libwayland's one libffi use (`ffi_call` for listener dispatch) replaced by a ~100-line wasm32 `ffi_call` outside any fork (every listener argument is an i32 on wasm32, so it dispatches on the count); link winewayland's Unix side like win32u's; keymap data on the guest side. About 2–3 d | a new Wine driver: window surfaces, input, keyboard layout, cursors, display modes, clipboard (winewayland is ~8000 lines for these) plus new gex host calls in both hosts. About 5–8 d |
+| fork patches | winewayland is upstream: expected a few `__wasm32__` build tweaks at most; libwayland/xkbcommon/ffi are dependencies, not forks | the whole driver is a fork addition, tracking upstream's driver interface (`user_driver_funcs`) at every rebase |
+| browser | the page already runs gex's compositor on the same wire protocol (`shims/browser/src/wl.rs`): nothing new | new host calls in the page and in the native host |
+| GL (W3.4) | gex-gl's EGL already presents to a `wl_surface` (`guest/gl/gexgl.c`: `wl_egl_window`, commit on swap): winewayland's EGL path needs nothing new | its own GL presentation path, new on both hosts |
+| jank | one more process-wide socket protocol, but the one every other guest uses | a gex-only driver no upstream test covers |
+
+winewayland wins on every axis that lasts: fewer fork patches (the driver
+is upstream), no new host interface, and GL presentation that already
+exists. The small driver is only cheaper in dependency count.
+
 #### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
 
 Every change is behind `__wasm32__` (or only built for it). What, why, and
