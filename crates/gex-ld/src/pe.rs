@@ -643,10 +643,18 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         }
         previous = end;
     }
-    for (i, &(rva, size)) in dirs.iter().enumerate() {
+    for (i, (rva, size)) in dirs.iter_mut().enumerate() {
         // The certificate table is addressed by file offset; the rest by RVA.
         let bound = if i == dir::SECURITY { d.len() as u64 } else { image_size as u64 };
-        if rva != 0 && (rva as u64 >= bound || size as u64 > bound - rva as u64) {
+        if *rva != 0 && (*rva as u64 >= bound || *size as u64 > bound - *rva as u64) {
+            // The certificate table is never mapped, and Windows' loader
+            // does not look at it. Shipped executables whose signature was
+            // cut off after signing (Undertale's) still point past the
+            // file's end: such an image has no certificate table.
+            if i == dir::SECURITY {
+                (*rva, *size) = (0, 0);
+                continue;
+            }
             return Err(PeError::malformed(format!("data directory {i} exceeds the image")));
         }
     }

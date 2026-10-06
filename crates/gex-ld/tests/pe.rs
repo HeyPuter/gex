@@ -411,6 +411,26 @@ fn clr_images_fail_loudly() {
     assert!(e.to_string().contains(".NET/CLR"), "{e}");
 }
 
+/// A certificate table past the end of the file (a signature cut off after
+/// signing, as in Undertale's executable) is ignored, as Windows' loader
+/// does: the table is never mapped.
+#[test]
+fn a_truncated_certificate_table_is_ignored() {
+    let mut bytes = std::fs::read(fixture("x86/hello32.exe")).unwrap();
+    let img = pe::parse(&bytes).unwrap();
+    let dd = img.opt_offset + 96 + pe::dir::SECURITY * 8;
+    let past_end = bytes.len() as u32 + 0x800;
+    bytes[dd..dd + 4].copy_from_slice(&past_end.to_le_bytes());
+    bytes[dd + 4..dd + 8].copy_from_slice(&0x13e0u32.to_le_bytes());
+    let img = pe::parse(&bytes).unwrap();
+    assert_eq!(img.dir(pe::dir::SECURITY), (0, 0));
+    // Any other directory past the image is still malformed.
+    let dd = img.opt_offset + 96 + pe::dir::EXPORT * 8;
+    bytes[dd..dd + 4].copy_from_slice(&(img.image_size + 0x1000).to_le_bytes());
+    bytes[dd + 4..dd + 8].copy_from_slice(&0x10u32.to_le_bytes());
+    assert_eq!(pe::parse(&bytes).unwrap_err().kind, PeErrorKind::Malformed);
+}
+
 /// With no `.reloc`, an image moves only if it was linked `DYNAMIC_BASE`
 /// (linkers omit an empty `.reloc`); otherwise a needed move fails loudly.
 #[test]
