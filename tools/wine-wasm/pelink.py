@@ -52,6 +52,15 @@ def makefile_var(path, var):
     return m.group(1).split() if m else []
 
 
+def spec_path(src, top, d, mod):
+    """A module's .spec: X.spec for X.dll, else the full name (ntoskrnl.exe.spec)."""
+    for name in (mod.rsplit('.', 1)[0] + '.spec', mod + '.spec'):
+        p = os.path.join(src, top, d, name)
+        if os.path.exists(p):
+            return p
+    return os.path.join(src, top, d, mod + '.spec')
+
+
 def spec_stdcalls(spec):
     """The names a .spec exports as stdcall."""
     out = set()
@@ -150,8 +159,7 @@ def main():
             elif mod:
                 # a DLL whose wasm32 build failed is still an i386 one in
                 # the prefix: its .spec names its functions
-                spec = os.path.join(src, top, d, mod[0].rsplit('.', 1)[0] + '.spec')
-                names = spec_functions(spec)
+                names = spec_functions(spec_path(src, top, d, mod[0]))
                 if names:
                     ex = os.path.join(spec_dir, mod[0] + '.exports')
                     with open(ex, 'w') as f:
@@ -333,8 +341,7 @@ def link(dlls, out, gexrt, others=None):
                 stdcalls = {}
                 for k, (n, sig, owner) in enumerate(stubs):
                     if owner not in stdcalls:
-                        base = owner.rsplit('.', 1)[0]
-                        stdcalls[owner] = spec_stdcalls(os.path.join(SRC or '', 'dlls', base, base + '.spec')) if SRC else set()
+                        stdcalls[owner] = spec_stdcalls(spec_path(SRC, 'dlls', owner, owner)) if SRC else set()
                     # a stdcall entry thunk (callee pops) for i386 callers
                     # of the stub's table index (below)
                     attr = '__attribute__((annotate("gex.stdcall"))) ' if n in stdcalls[owner] else ''
