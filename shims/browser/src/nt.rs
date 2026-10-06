@@ -666,12 +666,10 @@ mod imp {
     /// Bring `KUSER_SHARED_DATA`'s clocks up to date, at most once a
     /// millisecond. Natively a thread does this; here every NT syscall and
     /// every safepoint does, which is as often as anything can look.
-    /// Each thread reads the clock (a JS call) on one call in
-    /// [`TICK_EVERY`]: the reads were 0.2 ms of every world frame on
-    /// Noita's main thread and more on its workers (edger, cs1). The time
-    /// a guest sees there is then at most that many of a thread's
-    /// safepoints or syscalls old, well inside the 15.6 ms Windows
-    /// advances it by.
+    /// Each thread can read the clock (a JS call) on only one call in
+    /// [`TICK_EVERY`] (`GEX_NT_TICK_EVERY`); the reads are 0.2 ms of every
+    /// world frame on Noita's main thread (cs1), but sampling them changed
+    /// nothing measurable (s1), so the default reads on every call.
     pub(crate) fn tick() {
         thread_local! {
             static TICK_N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -707,8 +705,9 @@ mod imp {
     }
 
     /// How many of a thread's [`tick`]s read the clock: one in this many
-    /// (`GEX_NT_TICK_EVERY`, default 8; 1 reads it on every one).
-    static TICK_EVERY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
+    /// (`GEX_NT_TICK_EVERY`, default 1: every one). 8 measured no faster in
+    /// the page (s1, docs/noita-perf.md: 64.1 vs 64.05 world fps).
+    static TICK_EVERY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
     /// Yield parks by result (`memory.atomic.wait32`: 0 woken, 1 not equal, 2
     /// timed out) and kicks (`notify`) by whether they woke a waiter.
