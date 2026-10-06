@@ -968,6 +968,11 @@ pub(crate) fn knows(pc: u64) -> bool {
     ftab(|m| m.get(pc).is_some())
 }
 
+/// Whether this is an ejected project's training run (`GEX_NT_ENTRY_LOG`).
+pub(crate) fn entry_log() -> bool {
+    ENTRY_LOG.load(Ordering::Relaxed)
+}
+
 pub(crate) fn note_web_entry(pc: u64) {
     if !ENTRY_LOG.load(Ordering::Relaxed) {
         return;

@@ -10705,7 +10705,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // An ejected project's training run: a pc of a unit image no function
     // holds is a web entry, whether the function JIT (below) or tier-1 then
     // runs it (the AOT-only run would stop here).
-    if !cgen::knows(pc) {
+    if cgen::entry_log() && !cgen::knows(pc) {
         crate::cgen::note_web_entry(pc);
     }
     // A function serves it, or the function JIT makes one: tier-1 reaches
