@@ -83,7 +83,9 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
         let exports = image.exports_by_version(lo, hi);
         let id = gex_ld::elf::build_id(&bytes);
         let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
-        for p in provs.iter().filter(|p| p.class32 == image.class32) {
+        // A stateful provider is a wasm32 module with its data in the guest's
+        // memory: not under a 64-bit guest memory (docs/mem64.md).
+        for p in provs.iter().filter(|p| p.class32 == image.class32 && !(p.stateful && gex_abi::mem64())) {
             if !p.build_ids.is_empty() && !id.as_ref().is_some_and(|i| p.build_ids.contains(i)) {
                 if trace {
                     eprintln!("[provider] {}: not for this build of {} (build-id {id:?})", p.name, m.path);
@@ -112,7 +114,18 @@ pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kern
                 .and_then(|b| gex_cache::compile(&engine, &b))
                 .map_err(|e| anyhow!("compiling provider {}: {e:#}", p.name))?;
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-            crate::ftab::publish_pairs(&shared, &memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+            if p.stateful {
+                // Its data in guest pages (the stack comes per thread), as a
+                // stateful PE provider's (`nt_cgen::install_providers`).
+                let wasm = std::fs::read(&path)?;
+                let (size, align) = crate::libprov::dylink_memory(&wasm)?;
+                let a = 1u64 << align;
+                let data = crate::libprov::alloc_top(caller.data_mut(), (size as u64).max(16) + a, &format!("[provider {} data]", p.name))?;
+                let data = (data + a - 1) & !(a - 1);
+                crate::ftab::publish_stateful(&shared, &memory, module, slots.len() as u32, &pairs, crate::libprov::Extras { memory_base: data })?;
+            } else {
+                crate::ftab::publish_pairs(&shared, &memory, module, slots.len() as u32, &pairs, gex_kernel::ftab::Tier::Unit)?;
+            }
             BOUND.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(key(&shared)).or_default().push(Bound {
                 path: m.path.clone(),
                 start: m.start,

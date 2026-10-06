@@ -239,6 +239,38 @@ GEX_INLINE int gp64_return_rax(int ctx, uint64_t ret, uint64_t rax) {
     gp64_set(ctx, R_RAX, rax);
     return gp64_return(ctx, ret);
 }
+/* Call the guest function at `fn` (SysV x86-64) with up to six integer
+ * arguments from inside a provider, on the calling guest thread: below
+ * `sp_top` (the provider's own scratch on the guest stack stays above it),
+ * with a return address of its own (`fn ^ 1`, an address nothing else
+ * returns to), through the function table, until the guest returns there.
+ * The guest's RSP is as it was afterwards; the result is RAX. */
+GEX_INLINE uint64_t gp64_call6(int ctx, int32_t depth, uint64_t fn, uint64_t sp_top, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                               uint64_t a4, uint64_t a5) {
+    uint64_t rsp0 = gp64_reg(ctx, R_RSP), ra = fn ^ 1u;
+    uint64_t sp = ((sp_top - 128u) & ~15ull) - 8u;
+    GW64(sp) = ra;
+    gp64_set(ctx, R_RDI, a0);
+    gp64_set(ctx, R_RSI, a1);
+    gp64_set(ctx, R_RDX, a2);
+    gp64_set(ctx, R_RCX, a3);
+    gp64_set(ctx, R_R8, a4);
+    gp64_set(ctx, R_R9, a5);
+    gp64_set(ctx, R_RAX, 0); /* no vector arguments (varargs) */
+    gp64_set(ctx, R_RSP, sp);
+    for (uint64_t pc = fn;;) {
+        GEX_C64(GEX_CTX_LAST_TARGET) = pc;
+        if (GEX_FTAB(gex_ftab_idx(pc))(ctx, depth + 1, 0, ra)) {
+            break;
+        }
+        pc = GEX_C64(GEX_CTX_PC);
+        if (pc == ra) {
+            break;
+        }
+    }
+    gp64_set(ctx, R_RSP, rsp0);
+    return gp64_reg(ctx, R_RAX);
+}
 /* An IFUNC's resolver (the symbol's address, which the dynamic linker calls
  * for every relocation against it): the host binds this body there and the
  * provided function one byte further on, the "implementation" this returns.

@@ -103,7 +103,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         let id = gex_ld::elf::build_id(&bytes);
         let mut provided = Vec::new();
         let mut addrs = Vec::new();
-        for p in provs.iter().filter(|p| p.class32 == image.class32) {
+        for p in provs.iter().filter(|p| p.class32 == image.class32 && !(p.stateful && gex_abi::mem64())) {
             if !p.build_ids.is_empty() && !id.as_ref().is_some_and(|i| p.build_ids.contains(i)) {
                 continue;
             }
@@ -120,7 +120,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
                 file: format!("providers/{}-{}.wasm", p.name, gex_cgen::provider::fingerprint(std::slice::from_ref(p))),
                 binds,
                 stateful: None,
-                data: false,
+                data: p.stateful,
                 skeleton: None,
             });
         }
