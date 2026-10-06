@@ -28,7 +28,7 @@ npp          |pe   |N++                                  |N++.exe               
 momodora     |pe   |Momodora Reverie Under the Moonlight |MomodoraRUtM.exe                    | |-|-|-
 retrocycles  |pe   |Retrocycles                          |Retrocycles.exe                     | |200|1000|retrocycles-input.txt
 baba-linux   |linux-x11|Baba Is You                      |bin64/Chowdren                      | |-|-|-|--lazy
-retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|-|-|retrocycles-linux.wl
+retrocycles-linux|linux-x11|Retrocycles                  |usr/bin/Retrocycles                 |--datadir ../share/games/Retrocycles --configdir ../etc/games/Retrocycles --userdatadir ../../.Retrocycles|650|6000|retrocycles-linux.wl
 
 # x64 Windows games: waiting for 64-bit native Wine (OneShot's game is
 # oneshot.exe, x64).
