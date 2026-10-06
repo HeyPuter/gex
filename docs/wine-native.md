@@ -959,19 +959,57 @@ unixlib ran through the dlopen registry (§3.12).
   - a new thread's start function at pthread's type; i386 mlock as an
     advisory no-op.
 
+  **Then 29 of 40** (`$W/w3-nt4.log`, same day): suspend, msvc_msvcp,
+  detour, jitcode, exitproc and loadorder-builtin too, from:
+  - **signals:** SIGUSR1 (suspend), SIGQUIT (thread abort) and SIGINT
+    handlers as i386's. One arriving in guest code is taken at a gex
+    safepoint: gex-kernel builds i386's frame on the guest stack and gex
+    runs it through `gex.signal_hook` (libgex's frame runner; the handler
+    gets the frame's ucontext, the guest's state). One arriving in Unix
+    code is taken when a system call returns, with the syscall frame's
+    state. Threads unblock the server's signals before entering the
+    program.
+  - **the Unix side's stack and registers:** system calls from the PE
+    side run on the thread's own stack below its syscall frame (an
+    assembly switch), not on the guest stack just above the arguments
+    where callback and APC frames are written; a Unix call puts the
+    program's registers back after (every system call the Unix side makes
+    passes arguments in EBX..EBP of the same context: msvcp140 lost a
+    return address to it).
+  - **code changes:** a fixed mmap over code retires it (Wine decommits
+    by mapping over), making code writable retires it, and
+    `gex.code_changed` serves NtFlushInstructionCache.
+  - **thread exits:** the first thread's `exit` while others run no
+    longer ends the process (Linux semantics; ExitProcess on another
+    thread lost its exit code).
+  - **file mappings:** a shared mapping replaced by a fixed mmap ends as an
+    unmap (written back, no longer aliased), and write-back stops at the
+    file's end.
+  - **Unix libraries:** crypt32, ws2_32, msv1_0, dnsapi and nsiproxy's
+    Unix sides are linked in (`$W/link-w3.sh`, renamed apart, dlopen
+    registry, §3.12); i386 code reaches them through the trampoline page's
+    Unix-call entry, which gex hands to ntdll.so (`gex.unix_dispatcher` op
+    2). For now wasm callers take the same route (a guest round trip per
+    Unix call); a direct path for them needs a winepe rebuild.
+
   Open, by cause:
-  - **signals:** no SIGUSR1 handler yet (suspend hangs once a thread is
-    suspended): i386's usr1_handler over gex's signal frames, and the
-    other handlers (SIGQUIT for thread termination, SIGINT). Next.
-  - msvc_msvcp: msvcp140's what() and catch by type (an execute fault at
-    a bad address after LoadLibrary("msvcp140"); the NT layer passes it
-    with the same DLLs); detour, jitcode.
+  - **the registry (W3.2):** there is none until wineboot runs, and
+    crypt32 then spends minutes failing provider lookups (crypt). The
+    wasm wineboot.exe now links (programs in the one module: winegcc,
+    winebuild's program entry, the CRT table markers; stage-native stages
+    a program) and starts, but **a native module's dependencies are not
+    loaded**: skeletons have no import table, so the loader never loads
+    and initialises what the module calls (ucrtbase's heap is 0 in
+    wineboot), and calls to i386 DLLs (`owner!name` left by pelink) have
+    nothing to bind them without the NT layer. That is W3.2's first item:
+    skeletons that carry their module's imports (or gex loading them at
+    install), then wineboot, then the real system.reg.
   - lownull-* (§5.0, low-page protection; not to be fixed here);
-  - filemap (a section's writes reaching the file; change notifications:
-    built --without-inotify);
-  - win32u's Unix side (W3.3): user_win, gdi, input, display, gl*;
-  - pipe (SystemSupportedProcessorArchitectures), crypt (a DLL's init
-    fails), loadorder-builtin.
+  - filemap: change notifications (FindFirstChangeNotification) need
+    inotify in gex-kernel and Wine built with it;
+  - pipe: SystemSupportedProcessorArchitectures says i386, as 32-bit
+    Windows does; the test (and the NT layer) expects WoW64 on x86-64;
+  - win32u's Unix side (W3.3): user_win, gdi, input, display, gl*.
 
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
@@ -1465,9 +1503,9 @@ Heads:
   branch `wasm32-w3` (wt/wine-w3; build tree `$W/wine-w32-w3` via
   `$W/build-w32-w3.sh [targets]`, sr-slim read only; loader link
   `$W/link-w3.sh`, prefix and dll dir `$W/stage-w3.sh`). hello_args.exe
-  runs on Wine's own Unix side, wineserver in process; tests/nt i386 24
-  of 40 (§4.0, W3.1 progress; `$W/w3-nt2.log`). Next: signals (suspend),
-  msvc_msvcp. The old merge/elf-prov-gate is deleted. To
+  runs on Wine's own Unix side, wineserver in process; tests/nt i386 29
+  of 40 (§4.0, W3.1 progress; `$W/w3-nt4.log`). Next: W3.2, a native
+  module's imports (then wineboot and the registry). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
