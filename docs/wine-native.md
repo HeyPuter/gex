@@ -862,6 +862,31 @@ unixlib ran through the dlopen registry (§3.12).
 | W3.6 sync | ntsync in gex-kernel (`/dev/ntsync` on the futex machinery), so waits never reach wineserver | job-heavy games (Noita) no slower than W2 | 2–3 d |
 | W3.7 page | the same in the page: wineserver's thread in a Worker, the Unix side's modules per Worker | Retrocycles, Katana ZERO and Undertale in the page | 3–5 d |
 
+**W3.1 progress (2026-10-06, merge/w3 + fork `wasm32-w3`):**
+- **Fault delivery (done natively):** `gex.fault_hook(idx)`; a memory
+  access past the guest memory under a call-out, an illegal instruction,
+  int3, a divide error or a #GP in the program's code calls ntdll.so's
+  `__wine_gex_fault(ctx, code, addr)` with NTSTATUS codes, which sets up
+  KiUserExceptionDispatcher as i386's signal handlers do; the call-out
+  resumes there with the native frames kept (`spike-w3/fault.c`, all four
+  kinds). PC for a memory fault is the block's start.
+- **The dispatcher:** `ntdll/unix/signal_wasm32.c` (i386's frame, context
+  and dispatcher-stack code, with gex in place of signal contexts and
+  assembly): PE system calls arrive from gexrt (`__gexw_syscall`, which
+  asks `gex.unix_dispatcher`) in the i386 stub's stack shape, run the
+  service by table and argument bytes, and write the frame back; user
+  callbacks run KiUserCallbackDispatcher under `gex.call_out` until
+  NtCallbackReturn; threads start at LdrInitializeThunk (i386's
+  init_syscall_frame). Unix calls go straight through (one memory and
+  function table).
+- **The loader runs:** Wine's `loader/main.c` and ntdll's Unix side link as
+  one wasm32 program (`$W/link-w3.sh` → `$W/wine-w32-w3/dlls/ntdll/
+  wine-w3`, container flag `--gex-guest-i386`: i386 translation in the
+  process, no mapping above 0x7ffe0000). `wine --version` works; a run
+  starts wineserver (a wasm32 program, spawned) and talks to it, and gets
+  as far as wineboot. Next: the PE side (`gex.image_mapped` binds a native
+  DLL's skeleton when ntdll.so maps it), then hello.exe.
+
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
 
