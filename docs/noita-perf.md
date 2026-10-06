@@ -1097,6 +1097,36 @@ umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
   loop. Its executable check scanned every VMA; 545c12b6 uses a binary
   search (`MemoryMap::vma_at`) and adds miss counters to the NT stats line
   (`gex-nt: misses all/behind/returned/dense/fjit/knows/translate`).
+- **s1 (edger, seed pinned, 4 cores/8 threads; `scratch/fjit/e/seq-s1.out`)**,
+  this tree's units (bm-s: inlining + shared exits), shims from 545c12b6:
+  pewasm 43.9/46.5/49.1 (46.5); s (tick 1 in 8) 64.5/63.7 (64.1); t
+  (`GEX_NT_TICK_EVERY=1`, the old tick) 63.6/64.5 (64.05) world fps. The
+  tick change is neutral (0.1% faster, noise); both arms 38% faster than
+  pewasm (64.1 vs 46.5). (cs1's arm on the older tree: 62.1, other
+  session.)
+- **Dispatch misses, explained** (s1 counters): ~130 a second, every one a
+  call-out's return (`returned`); none translate. gex_dispatch_miss's self
+  time (0.29 ms per world frame on the main thread, unchanged by the VMA
+  search) is the trap that ends each call-out (V8's unwinding is booked to
+  the trapping frame): call_out is 0.65 ms per frame inclusive, the trap
+  0.29 of it.
+- **Call-outs leave by returning** (uncommitted when written; see git log):
+  `DISPATCH_MISS_LEAVE` (-2) from gex_dispatch_miss makes tier-1's miss
+  stub `return`, so `enter` returns to JS's #callOut, which reads
+  gex_callout_hit. Only when the hit is the innermost call-out and its
+  loop called `enter` with nothing nested since (JS sets
+  `gex_callout_leave_ok(me+1)` before enter, 0 in the other loops and on
+  leaving), and never for a miss whose caller drops the answer (cache_op
+  SLOT_CONFLICT / FTAB_TIER1 set NO_LEAVE first: bridge, tier-1 and cgen
+  target checks). `GEX_NT_CALLOUT_TRAP=1` traps as before (A/B arm).
+- **tick bug found**: with 545c12b6 the tick after a timed wait was
+  sampled too, so GetTickCount after a wait could be stale by the whole
+  wait (browser NT x64/sync "timeout lasts" failed). Fixed: `tick_now`
+  after waits, sampling only at safepoints and the sampled syscall path.
+- INLINECALLS (GEX_CGEN_EXP: inline small functions with up to two calls,
+  noita.exe 0x70b110/0x70b050 into 0x724580's loop) is a parked patch,
+  `scratch/fjit/inlinecalls.patch` (func.rs; re-keys units). C for
+  0x724580 grows 5% with it (812 vs 775 KB); unmeasured.
 - **Parked for the 2026-10-05 late-night reboot.** Head: see `git log -1`
   on merge/fjit (this doc commit, on top of c6bc9217). Unmeasured in the
   page: 5563fda1 (shared ret exits; size only, measured above), 545c12b6
