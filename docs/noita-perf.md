@@ -1034,7 +1034,7 @@ umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
    --configs cg` in full; a wasmtime upgrade A/B on regalloc (sand).
 4. Peggle (step 5 of the previous list), with the layout now appended.
 
-### Stream F after the second reboot (2026-10-05 night; resume here; supersedes the above)
+### Stream F after the second reboot (2026-10-05 night; working notes, see the final state below)
 
 - master e3917bac merged into merge/fjit (816c4a98; gex-cgen untouched by
   master, so unit keys unchanged: bm-hu2/bm-hui still match).
@@ -1152,3 +1152,55 @@ umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
 - Other heads: merge/fjit-ung 00806c66 and merge/fjit-inl f5ca966f are in
   integ/2026-10-05g (coordinator gating). wt/fjit-ung and wt/fjit-inl are
   done; their target dirs (fjit-inl/target) can go.
+
+### Stream F final state (2026-10-06; stream F stopped here)
+
+Branch merge/fjit, master 2d9055f9 merged. Everything below is measured on
+edger (Quadro P620, 4 cores/8 threads, seed pinned, pewasm paired in the
+same sequence, `scratch/fjit/e/seq-*.out`), world fps.
+
+**What landed in the branch, and the numbers that decided it:**
+
+| change | commit | A/B (world fps) | kept |
+|---|---|---|---|
+| page default: unguarded units (N1) | fdbb1d9e / 00806c66 | unguarded 48.25 vs guarded 42.4; pewasm 45.9 | yes (in integ-g) |
+| leaf-call inlining on by default | d54095e5, f5ca966f | i1: 61.45 vs 53.65 without (14.5% faster); pewasm 47.0 | yes (in integ-g) |
+| client-state GL calls in the ring | c2fa872b, b1fe3b3d, c6d82c65 | cs1: 62.1 vs 61.55 with `GEX_NT_GL_FAST=nocs` (0.9%, noise); pewasm 47.97 | yes (correct, free) |
+| inlined `ret` mismatches share one exit | 5563fda1 | size: noita.exe 0x70bdc0 11,583 vs 13,682 wasm instructions (15% smaller); not timed alone | yes (re-keys units) |
+| VMA lookup by binary search; miss counters | 545c12b6 | no effect on the miss cost (the misses never reached that check) | yes (harmless) |
+| tick reads the clock 1 in 8 | 545c12b6, 11cf9f1b | s1: 64.1 vs 64.05 (noise); pewasm 46.5 | default back to every read (269346a1), knob `GEX_NT_TICK_EVERY` |
+| a call-out leaves by returning, not trapping | f3acedb3 | co1: 64.05 vs 62.1 trapping (3.1% faster; 67.1/61.0 vs 63.8/60.4); pewasm 48.2 | yes (`GEX_NT_CALLOUT_TRAP=1` traps) |
+
+co1's profile: gex_dispatch_miss self time on the main thread went from
+0.29 to 0.001 ms per world frame.
+
+**Tests at the final head:** native NT suite with and without --cgen (new
+cases retskip and the client-state checks in glfast), browser NT suite
+49/49, crate tests of gex-cgen, gex-kernel and gex-emit.
+
+**Dropped / parked:** INLINECALLS (inline small functions with up to two
+calls: noita.exe 0x70b110/0x70b050 into 0x724580's loop), patch
+`scratch/fjit/inlinecalls.patch`, unmeasured; QPC clock calls left as they
+are (they must stay precise).
+
+**Remaining profile items, for later** (co1/s1 main thread, ms per world
+frame; the main thread works ~11.6 of ~16 ms, the workers ~6.7, the GL
+thread ~7.4):
+- mono_ns 0.28 (main) + ~0.05 per worker: QPC from the game (p_qpc) and
+  the tick; the arrow-function import is most of a call.
+- GuestMem::copy_within in the GL layer's cmd_with 0.16: the GL data copy
+  into the ring (texture/buffer uploads), inherent unless the host reads
+  guest memory directly.
+- serve_x87 0.10: msvcr120's x87 `_CIatan2` path at 64-bit precision
+  (fldcw 0x133f) runs on the soft f80; a provider would need bit-exact
+  results.
+- dlmalloc 0.22 and p_memset 0.53 (workers, f_722640): provider heap and
+  memset, mostly bandwidth.
+- WebGPU side on the GL thread: createView 0.43, beginRenderPass 0.40,
+  submit 0.66, writeBuffer 0.35 (each above pewasm's: 0.17, 0.15, 0.36,
+  0.23): view caching and pass merging in mesa-wink / the gl-bridge.
+- Guest code: noita.exe 0x724580 family on the workers (~4 ms of 6.7);
+  0x864060, 0x70b200/0x70bdc0/0x70b110 next.
+
+**Caches:** gooner and edger `wt/fjit/target/bm-s` (this tree's units,
+unguarded, inlining + shared exits); bm-hu2/bm-hui (older keys) can go.
