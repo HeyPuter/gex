@@ -138,40 +138,96 @@ dl_symbol (void *handle, const char *name, char **err, void *user_data)
  * A thread attached to the runtime runs guest code in GC Safe (blocking)
  * mode, so a collection does not wait for it to poll: gex stops it at its
  * next safepoint instead (sgen-stw.c, gexp_stop_guest_threads), and its
- * guest stack and registers are scanned conservatively (sgen-mono.c). Each
- * crossing into guest code pushes whether it entered the region. */
+ * guest stack and registers are scanned conservatively (sgen-mono.c).
+ *
+ * Calling guest code enters the region unless the thread is already in it
+ * (the interpreter's P/Invoke transition), and its return leaves only what
+ * the call entered. Entering from guest code makes the thread Running for
+ * the call's duration whatever state it was in -- guest code a P/Invoke
+ * called, calling the embedding API back (Unity does: mono_runtime_invoke,
+ * mono_gc_get_used_size), is in the interpreter's GC-safe region -- and the
+ * return to guest code puts it back; a thread that was Running in guest code
+ * (its first entry attached it) is left GC-safe. */
 
 #include <mono/utils/mono-threads.h>
 #include <mono/utils/mono-threads-api.h>
 
 #define GEXMONO_SAFE_MAX 256
-static __thread gpointer safe_cookie [GEXMONO_SAFE_MAX];
-static __thread int safe_depth;
+static __thread gpointer entry_cookie [GEXMONO_SAFE_MAX];
+static __thread int entry_depth;
 
-void
-gexp_hook_to_guest (void)
+void *
+gexp_hook_call_guest (void)
 {
-	gpointer cookie = NULL;
 	MonoThreadInfo *info = mono_thread_info_current_unchecked ();
 	if (info && mono_thread_info_current_state (info) == STATE_RUNNING) {
 		gpointer dummy;
-		cookie = mono_threads_enter_gc_safe_region_unbalanced (&dummy);
+		return mono_threads_enter_gc_safe_region_unbalanced (&dummy);
 	}
-	if (safe_depth < GEXMONO_SAFE_MAX)
-		safe_cookie [safe_depth] = cookie;
-	safe_depth++;
+	return NULL;
+}
+
+void
+gexp_hook_call_return (void *cookie)
+{
+	if (cookie) {
+		gpointer dummy;
+		mono_threads_exit_gc_safe_region_unbalanced (cookie, &dummy);
+	}
 }
 
 void
 gexp_hook_from_guest (void)
 {
-	if (!safe_depth)
-		return; /* the thread's first entry */
-	safe_depth--;
-	gpointer cookie = safe_depth < GEXMONO_SAFE_MAX ? safe_cookie [safe_depth] : NULL;
-	if (cookie) {
+	gpointer cookie = NULL;
+	MonoThreadInfo *info = mono_thread_info_current_unchecked ();
+	if (info && mono_thread_info_current_state (info) != STATE_RUNNING) {
 		gpointer dummy;
-		mono_threads_exit_gc_safe_region_unbalanced (cookie, &dummy);
+		cookie = mono_threads_enter_gc_unsafe_region_unbalanced (&dummy);
+	}
+	if (entry_depth < GEXMONO_SAFE_MAX)
+		entry_cookie [entry_depth] = cookie;
+	entry_depth++;
+}
+
+void
+gexp_hook_to_guest (void)
+{
+	gpointer cookie = NULL;
+	if (entry_depth > 0) {
+		entry_depth--;
+		cookie = entry_depth < GEXMONO_SAFE_MAX ? entry_cookie [entry_depth] : NULL;
+	}
+	gpointer dummy;
+	if (cookie) {
+		mono_threads_exit_gc_unsafe_region_unbalanced (cookie, &dummy);
+		return;
+	}
+	MonoThreadInfo *info = mono_thread_info_current_unchecked ();
+	if (info && mono_thread_info_current_state (info) == STATE_RUNNING)
+		mono_threads_enter_gc_safe_region_unbalanced (&dummy);
+}
+
+/* A raise that abandoned guest frames (gexp_call_guest_catching): the
+ * entries inside them never return, and the thread (Running: it raised) goes
+ * back to the state it called the guest in -- GC-safe when the interpreter's
+ * P/Invoke had entered the region, which it will leave itself. */
+int
+gexp_hook_mark (void)
+{
+	MonoThreadInfo *info = mono_thread_info_current_unchecked ();
+	int safe = info && mono_thread_info_current_state (info) != STATE_RUNNING;
+	return entry_depth * 2 + safe;
+}
+
+void
+gexp_hook_unwind (int mark)
+{
+	entry_depth = mark >> 1;
+	MonoThreadInfo *info = mono_thread_info_current_unchecked ();
+	if ((mark & 1) && info && mono_thread_info_current_state (info) == STATE_RUNNING) {
+		gpointer dummy;
+		mono_threads_enter_gc_safe_region_unbalanced (&dummy);
 	}
 }
 

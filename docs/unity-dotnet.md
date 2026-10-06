@@ -695,17 +695,185 @@ Not yet:
        natively under gexc as well (wasmtime compiles the published
        modules), so native runs get the same tier.
   - Unity's remaining internal calls as they show up; then Stardew/Celeste.
-- **Resume (after the move; HEAD 1db5c816, `master` merged in):**
-  0. The coordgate on this branch still lacks its browser NT step (it was
-     stopped while E was timing), and nothing after 49a5773b has been
-     gated. Run it before the libprov changes go to master.
-  1. Build: `tools/unity-dotnet/mono/build.sh OUT`, then
-     `tools/unity-dotnet/sysroot` via its `sysroot` step. musl comes from
-     `MUSL_SRC`, which defaults to `../musl-wasm64` beside the worktree
-     (remote `mw`, branch `gex-wasm64`).
-  2. Find which lookup returns NULL. Candidates: `get_attr` on an
-     attribute in UnityEngine.CoreModule, a field name Unity's Mono had
-     that .NET's types lack, or a type whose lookup resolves through a
-     facade's forwarders.
-  3. Then on to the menu with graphics (the old `muck.sh` path: in-guest
-     Xwayland on gex's compositor), and to Unity's own internal calls.
+  - **Scripted input (2026-10-05):** `GEX_WL_INPUT=FILE` feeds the native
+    compositor timed `move`/`click`/`button`/`key`/`tap` events, timed from
+    its `frames N`th frame (`frames 0`: from its start), held until a client
+    has a seat and a surface. Checked end to end on worldmachine with
+    `tests/x11/xinput-echo.c` on the in-guest (rootful) Xwayland: motion, a
+    click and keys arrive. Muck's menu still ignores the clicks (unknown
+    why; Muck is set aside, see the coordinator's direction).
+  - **Hollow Knight (Unity 6000.0.61, linux-x64 Mono; 2026-10-05):** batch
+    mode loads the first scene natively with --fjit
+    (`muck-dotnet.sh` with `MUCK=<HK dir> EXE=hollow_knight.x86_64
+    UNITY_RELAUNCH=1 STEAM_APPID=367520`). Needed: a PIE rebuild of the
+    player's small main (`tests/games/unity-launcher.c`; Unity 6 links it at
+    0x200000, inside gex's reserved low region); `mono_dllmap_insert`
+    ignored; GC handles as the GC's raw values in runtime, CoreLib and
+    provider (Unity 6 tests a handle's bit 0 and its managed code calls
+    `GCHandle.FromIntPtr` on raw values); dead-handle reads tolerated; the
+    framework's x86-64 crypto and compression natives beside the BCL (HK's
+    localisation decrypts with AES). Also: guest signal handlers run at a
+    provider's syscalls (`__gex_signal_frames` in gexprov64.c).
+  - **Hollow Knight, parked 2026-10-05 (shutdown):** with graphics on
+    worldmachine (`scratch/unity/wm/muck.sh` with `GAMEDIR=<HK>
+    EXE=hollow_knight.x86_64 UNITY_RELAUNCH=1 STEAM_APPID=367520`; HK is
+    copied to `~/src/noita-wasm/games-linux/Hollow Knight` there) two
+    problems, after GL 4.6 comes up and physics initialises:
+    1. **With --fjit only:** `free(): invalid pointer` (deterministic), from
+       Unity's allocator's fallback `free` (UnityPlayer vaddr ~0xf8c0af, called
+       via 0xf8a0c0/0xf9559d). Not a `free` the program calls through the PLT
+       (an LD_PRELOAD watcher saw none), so glibc-internal or a corrupted
+       Unity block. Without --fjit it does not happen: a function-JIT
+       translation bug is the first suspect. Next: bisect with the fjit off
+       for UnityPlayer ranges, or `GEX_DUMP_ABORT=1` (now works for x86-64)
+       and map the frames.
+    2. **Without --fjit (and in batch mode with it):** a hang after
+       "Unloading 5 Unused Serialized files". `GEX_DUMP_AT=640` shows the
+       main thread inside the provider's `mono_gc_collect` (Unity's
+       UnloadUnusedAssets), sleeping in a loop (strace: only
+       clock_nanosleep); threads 47/48 in libc. Next: the same dump with the
+       wasm stacks (`GEX_DUMP_AT` now prints `WasmBacktrace` for each thread;
+       run with `GEX_WASM_BACKTRACE=1`) to see what the collection waits for
+       -- likely sgen's suspend of a thread attached to Mono (Unity has ~70)
+       that never acknowledges, or the provider stop-the-world.
+    Then the keyboard script to gameplay (`GEX_WL_INPUT`, works on X
+    clients) and interpreter vs JIT on worldmachine.
+  - **Hollow Knight after the restart (gooner, 2026-10-05; runs
+    `scratch/unity/runs/hk20`-`hk30`, batch mode, no --fjit):**
+    1. **The hang is fixed.** The `GEX_WASM_BACKTRACE` dump put the main
+       thread in sgen's `unified_suspend_stop_world` restart loop (`g_usleep`):
+       one thread stayed "in a critical location" because its saved SP lay
+       outside its registered stack. `GEXMONO_TRACE_THREADS=1` (patch 0003)
+       and `GEX_PROVIDER_STACKS=1` showed that SP was on thread 70's provider
+       stack while the MonoThreadInfo was thread 28's: musl's
+       `__gex_provider_attach` gave attached threads no thread-specific data,
+       so every attached thread's `pthread_getspecific` read the words at
+       address 0 and Mono's thread-info key handed thread 70 thread 28's info
+       (musl-wasm64 3f1c1f08; that commit also makes a provider-created
+       thread report gex's stack). The stop-the-world now names such a thread
+       once (`gex STW: thread ... still critical`).
+    2. **Next crash fixed (6407a1ed):** "Cannot transition thread from
+       STATE_BLOCKING with DO_BLOCKING": Unity calls the embedding API
+       (`mono_gc_get_used_size`, `mono_runtime_invoke`) from guest code a
+       P/Invoke called, i.e. inside the interpreter's GC-safe region, and the
+       old one-stack crossing hooks left the thread Blocking. Now calls into
+       guest code and entries from it are separate pairs (gexprov64.c
+       `gexp_hook_call_guest`/`_call_return`, `gexp_hook_from_guest`/
+       `_to_guest`, `_mark`/`_unwind` for a raise through guest frames).
+    3. HK then unloads 153 assets (the GC that hung) and runs its first
+       scene's scripts (no UIManager in batch mode, TextMeshPro font
+       warnings). `provider_stack` now reports the stack's real base (it was
+       derived from the current SP).
+    4. The --fjit `free(): invalid pointer` did not reproduce on gooner
+       (hk21: --fjit with graphics, llvmpipe, reached the same unload hang);
+       it was seen on worldmachine only. `GEX_FJIT_RANGE`/`GEX_FJIT_SKIP`
+       (hex `LO-HI,...`) restrict the function JIT by entry address for the
+       bisection.
+    5. **Black frames with graphics (gooner, llvmpipe; hk31-hk32):** with
+       --fjit HK creates its GL 4.5 device, loads a second scene and the
+       compositor gets ~30 presents/s, but every captured frame
+       (`f-*.ppm`, 185 of them over 25 min) is all black. Not the Wayland
+       backend: `xwayland-inguest.sh` now unsets `WAYLAND_DISPLAY` for the
+       program (Unity 6 and SDL could otherwise pick gex's compositor), still
+       black. Unknown whether Unity draws nothing (shaders?) or the blit to
+       the window is lost. hk33 (`GEXGL_TRACE_GENERATED=1
+       GEXGL_SUBMIT_TRACE=1`, periodic tallies every 5000 submits in
+       out.txt) was stopped at the reboot before it got far: rerun it, map
+       opcodes with `guest/gl/gexgl.h`, and check for draws vs clears/blits.
+    6. **The --fjit `free(): invalid pointer` bisection (worldmachine only;
+       its glibc is Arch 2.44, gooner's Debian 2.36):** script
+       `scratch/unity/wm/fjtry.sh NAME SKIP [RANGE]` (run through
+       `BENCH_HOST=worldmachine scratch/bench/bench.sh -- bash
+       scratch/unity/wm/fjtry.sh ...`, give each a distinct `XNUM=`; prints
+       BAD/GOOD/NONE/STALL; it installs `wm/gexc.new` if present). Addresses
+       on worldmachine: libc 0x7d748000-0x7d948000, UnityPlayer
+       0x7e041000-0x7fe00000. Results: full --fjit BAD (hkw1, hkw2);
+       RANGE=libc only GOOD (b3, reached "Unloading 5"); RANGE=UnityPlayer
+       only, libc+UnityPlayer, SKIP=UnityPlayer, SKIP=libc: all stall
+       before the GL device (b1, b2, b4-b8; b7/b8 after the VMA-scan fix in
+       `job`). So something besides libc and UnityPlayer is involved, and
+       jitting a subset while other code stays on tier-1 stalls (itself
+       worth a look: a tier-1/fjit interplay bug). b9-b11 (libc + the small
+       libs 0x7d948000-0x7e041000; libc + above UnityPlayer; everything below
+       0x7d948000) were killed by the reboot: rerun them first.
+    7. Next after these: GEX_WL_INPUT keyboard script into gameplay, then
+       interpreter vs JIT on worldmachine (stage with `scratch/unity/wm`:
+       copy target/dbg-x86/release/gexc, dnc/provider/mono.wasm,
+       dnc/lib/System.Private.CoreLib.dll, tests/games/*.sh; HK lives in
+       `~/src/noita-wasm/games-linux/Hollow Knight` there), then the next
+       GAMES-CORPUS.md games.
+    **Build and run recipe (gooner):** `. scratch/env.sh`; gexc:
+    `cargo build --release -p gexc --features gexc/x86 --target-dir
+    target/dbg-x86`; provider: `tools/unity-dotnet/mono/build.sh
+    ~/gex-sandbox/scratch/unity/dnc sysroot runtime provider` (sysroot when
+    musl-wasm64 changed; it builds wt/musl-wasm64, branch gex-wasm64, pushed
+    to mw at 3f1c1f08); HK batch: `MUCK="$HOME/gex-sandbox/games-linux/Hollow
+    Knight" EXE=hollow_knight.x86_64 UNITY_RELAUNCH=1 STEAM_APPID=367520
+    GEXC=$PWD/target/dbg-x86/release/gexc sh tests/games/muck-dotnet.sh
+    ~/gex-sandbox/scratch/unity/dnc RUNDIR SECS [--fjit]`; add
+    `GFX=$HOME/gex-sandbox/scratch/unity/gl64 XNUM=N EVERY=300` for
+    graphics. Regression checks used: `tests/unity-dotnet/embed/run.sh
+    ~/gex-sandbox/scratch/unity/dnc target/dbg-x86/release/gexc` (PASS) and
+    Muck batch with --fjit (main loop runs).
+    Working-tree note: `dnc/src` has every patch staged (`git add -A`) so
+    `git diff` shows only new edits (how 0003 was made). Run `git -C
+    scratch/unity/dnc/src reset -q` before build.sh's `src` step.
+- **Resume (after the 2026-10-05 evening reboot; HEAD 8bfbae51, master
+  e3917bac merged):**
+  0. Gate head 8bfbae51 offered to the coordinator (the branch gate has
+     never run on anything after d69c1cd6/3718d0ca). Extra legs that prove
+     this stream's work, all checked green on 8bfbae51 on gooner:
+     `tests/unity-dotnet/embed/run.sh ~/gex-sandbox/scratch/unity/dnc
+     target/dbg-x86/release/gexc` (interpreter, --fjit, and since 8bfbae51
+     the wasm JIT at threshold 1, plus the GC-roots control);
+     `tests/unity-dotnet/prov64/run.sh
+     ~/gex-sandbox/scratch/unity/dnc/sysroot/sysroot GEXC` (note the doubled
+     `sysroot`); Muck batch with --fjit (`muck-dotnet.sh ... 600 --fjit`,
+     player.log reaches "Initializing packets"); HK batch (reaches its first
+     scene's scripts: "Couldn't find a UIManager"). Logs in
+     `scratch/unity/logs/`, runs `scratch/unity/runs/mk2`, `hk34`.
+  1. The fork clone `dnc/src` has a local commit `2a05cbbc5` (patch 0001)
+     on top of 6812ea26, so build.sh's `src` step fails ("local changes
+     would be overwritten"). The working tree was verified identical to
+     6812ea26 + patches/0001-0003 (tree hashes equal), so build with the
+     steps `sysroot runtime provider` (skip `src`).
+  2. **HK black frames (gooner, runs hk35-hk37, hk40):** not a GL
+     translation problem: Unity never presents. `GEX_GL_CAPTURE=FILE` (host
+     env) recordings (`scratch/unity/gltr.py FILE hist|frame N|draws`) of
+     hk36 and hk37 are byte-identical in size (70,337,112 bytes) and hold
+     no PRESENT, no draw, one CLEAR, no shader: the stream stops after a
+     TEX_STORAGE_2D during the first scene's load. `--strace` (hk37): the
+     render thread (guest tid 68, same ring as the main thread) made 4
+     submits and then waits in futex/clock_gettime, idle, while the main
+     thread keeps running scripts. So the player loop stops sending
+     frames. Suspects: (a) the window never gets focus or visibility in the
+     rootful in-guest Xwayland with no window manager, and HK (unlike
+     Muck) does not run in the background; hk40 (`GEX_WL_INPUT` pointer
+     moves into the window every 7 s) was to test this but died first, see
+     3; (b) the game logic: "Couldn't find a Game Manager" in both batch
+     and graphics runs. `GEXMONO_TRACE=1` (hk38) shows Unity's
+     FindObjectOfType loop testing every object against GameManager's class
+     with `mono_class_is_subclass_of` and finding none. A control on
+     Unity's own Mono (run `hkst`, no provider) is running to tell whether
+     that message is normal for this scene. Also seen: SDL "window backend
+     is (null)" and "Video subsystem has not been initialized" early on,
+     then a window at 800x600 anyway (same in hk31/hk32).
+  3. **--fjit memory corruption is intermittent, and not only on
+     worldmachine:** hk40 on gooner died at startup with `*** stack
+     smashing detected ***` (same flags as hk36, which ran). On worldmachine:
+     b9 (RANGE libc + small libs) GOOD; b10 (libc + above UnityPlayer) and
+     b11 (everything below 0x7d948000) stalled before player.log existed;
+     b12 (full --fjit, `GEX_DUMP_ABORT=1`) BAD, dump in
+     `scratch/unity/wm/res/b12-out.txt`: main thread during physics init,
+     return addresses UnityPlayer+0x8920af/+0x8900c0 (vaddr 0xf8c0af, Unity's
+     allocator after `pthread_getspecific`) -> libc free; b13 (SKIP the
+     allocator 0x7e8d0000-0x7e8de000) failed differently: thread 49
+     SIGSEGV at pc 0 after 4 min. On gooner, batch HK with RANGE=UnityPlayer
+     only (hkr1) and full --fjit (hkr0) both reach the first scene, so the
+     worldmachine "stalls" with partial ranges are not a deterministic
+     tier-1/fjit interplay bug. Conclusion so far: a nondeterministic
+     corruption under --fjit (canary, malloc chunk, a null call target),
+     more likely a race or a per-thread state slip (TLS/fs base?) than one
+     mistranslated function; range bisection cannot pin it. Next: repeat
+     identical runs to measure the failure rate, then look at thread
+     creation/fs-base and publication races in the function JIT.

@@ -510,8 +510,12 @@ pub extern "C" fn gex_cgen_missing(u: u32) -> i32 {
     // key) is silently not used otherwise.
     crate::warn_line(&format!(
         "gex-nt: image {} at base {:#x}: no function-tier unit (key {}), tier-1; build it with \
-         GEX_CGEN_GUARD=1 gexc cgen-image <image> --pe-base {:#x}\n",
-        x.path, x.base, x.key, x.base
+         {}gexc cgen-image <image> --pe-base {:#x}\n",
+        x.path,
+        x.base,
+        x.key,
+        if gex_cgen::image::unguarded() { "" } else { "GEX_CGEN_GUARD=1 " },
+        x.base
     ));
     0
 }
