@@ -49,6 +49,29 @@ pub(crate) struct Shared {
     /// overwrites ~120 lua51.dll entry points; pewasm, whose lua51 is
     /// native too, ignores those writes the same way.
     pub providers: std::collections::HashSet<u32>,
+    /// Which guest process this is, for the run-time translator
+    /// (`ftab::Request::process`): one per process image, shared with a
+    /// forked child until it `execve`s.
+    pub process: Process,
+}
+
+/// A guest process's identity for the run-time translator, unique for the
+/// run; the translator forgets the process when the last reference goes.
+pub(crate) struct Process(pub u64);
+
+impl Default for Process {
+    fn default() -> Process {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Process(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if let Some(t) = gex_kernel::ftab::translator() {
+            t.forget(self.0);
+        }
+    }
 }
 
 /// One store's half, inside [`Jit`].
@@ -637,6 +660,7 @@ pub(crate) fn background() -> bool {
 /// can do it: the mappings as they are now, and the retirement epoch they
 /// belong to.
 struct Job {
+    process: u64,
     sh: Arc<Mutex<JitShared>>,
     memory: gex_mem::GuestMemory,
     engine: wasmtime::Engine,
@@ -686,8 +710,12 @@ fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &
     if !exec.iter().any(|&(s, e)| addr >= s && addr < e) {
         return None;
     }
-    let epoch = sh.lock().unwrap_or_else(|e| e.into_inner()).ftab.epoch;
+    let (epoch, process) = {
+        let s = sh.lock().unwrap_or_else(|e| e.into_inner());
+        (s.ftab.epoch, s.ftab.process.0)
+    };
     Some(Job {
+        process,
         sh: Arc::clone(sh),
         memory: memory.clone(),
         engine: caller.engine().clone(),
@@ -725,6 +753,7 @@ fn run_job(j: &Job) -> Result<bool> {
         g
     };
     let req = gex_kernel::ftab::Request {
+        process: j.process,
         mem: memory.bytes(),
         addr,
         executable: &executable,
