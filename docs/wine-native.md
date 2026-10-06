@@ -1213,55 +1213,66 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
-**RESUME HERE (2026-10-05 night, after the reboot).** Everything a fresh
-agent needs. `$W` = `~/gex-sandbox/scratch/W`. Run
-`. ~/gex-sandbox/scratch/env.sh` first. Note: `gexc run` does not pass the
-host's environment; give the guest `HOME` with `--env HOME=...`.
+**RESUME HERE (2026-10-05 late night, parked for a reboot).** `$W` =
+`~/gex-sandbox/scratch/W`. Run `. ~/gex-sandbox/scratch/env.sh` first.
+`gexc run` does not pass the host environment: `--env HOME=...`.
 
-Branches and heads:
-- **merge/wine-fork landed** (master e3917bac). musl `gex-wasm32` was
-  fast-forwarded to `gex-wasm32-fork` 155f77bf and pushed to mw.
-- **fix/stdin-poll 293345c4**: gating (integ/2026-10-05f) with `$W/sr-gate`,
-  `$W/bb-gate`, `$W/pfx-gui-fork`. Don't modify those while it runs.
-- **merge/wine-slim 10e816c3** (wt/wine-slim; master e3917bac merged, a
-  clean merge: only web/, docs and nt_cgen's trampoline provider path
-  changed) plus musl **gex-wasm32-slim 93c5dfda** (wt/musl-slim, on mw):
-  libgex out of musl (§3.11.2). Artifacts: sysroot `$W/sr-slim`, busybox
-  `$W/bb-slim`, Wine tree `$W/wine-w32-slim`, prefix `$W/pfx-gui-slim`; they
-  need no rebuild after the merge (nothing in musl, libgex, wcc or the Wine
-  fork changed). Post-merge smoke (`$W/check-slim-smoke.sh`): tests/wasm32
-  4/4, busybox both, nt --no-cgen pfx-gui-slim 81/81. Offered to the
-  coordinator to gate.
-- **merge/elf-prov cf0e0fb6** (wt/elf-prov, on wine-slim 10e816c3). ELF
-  export providers; design `docs/elf-providers.md`; target merge-plan
-  §10.1 (the whole libc native via gexcc; providers are the bridge).
-  Done:
-  - design, gex-ld versioned dynsyms (491a6f44), Warfork profile (§6);
-  - **ba99e9ed: the ONE gex-cgen commit** (provider.h SysV helpers,
-    GEX_ELF_IFUNC, GEX_GROUP; provider.rs groups, buildid=, elf_bindings;
-    providers/glibc_mem.c). It re-keys every unit: tell the coordinator
-    before it heads to master;
-  - 14dcd7f3 gex-ld `Image::exports_by_version`, `elf::build_id`;
-  - cf0e0fb6 native host (`shims/native/src/elfprov.rs`): bound at map
-    time; IFUNC resolver -> `gexp__ifunc` returning resolver+1, which is
-    bound to the provided function; fjit leaves bound addresses alone;
-    retired with the library. `tests/elf-prov/run.sh G` ok on the default
-    tiers, `--fjit`, `--mem64`; Warfork server plays with them.
-  Coordinator conditions: profile first (done for Warfork); every speed
-  claim a paired page run on a bench box; the gex-cgen commit is one and
-  announced.
+Heads:
+- master e3917bac (wine-fork landed). musl `gex-wasm32` = `gex-wasm32-fork`
+  155f77bf, pushed to mw. No fork branch has unpushed commits.
+- fix/stdin-poll 293345c4: was gating as integ/2026-10-05f.
+- merge/wine-slim 10e816c3 (master merged; smoke green): merged by the
+  coordinator as integ/2026-10-05g with F's heads; gate legs use
+  `$W/sr-slim`, `$W/bb-slim`, `$W/pfx-gui-slim`. Don't modify those,
+  `$W/sr-gate`, `$W/bb-gate` or `$W/pfx-gui-fork` until the coordinator
+  says the gates are done.
+- **merge/elf-prov 277a8912** (wt/elf-prov, on wine-slim 10e816c3). Done:
+  - native ELF providers (`shims/native/src/elfprov.rs`): bound at map
+    time by versioned dynsym; IFUNC resolver -> `gexp__ifunc` returning
+    resolver+1, bound to the function; groups; build-ids; stateful
+    providers (data via an anonymous mapping, a stack per thread); the
+    fjit leaves bound addresses alone; bindings outlive unmapping (a
+    forked child shares the table), an object mapped over them takes them
+    back.
+  - **browser host done** (`shims/browser/src/cgen/elfprov.rs`, gex.mjs
+    `#cgenServe`): provider-only units served from the unit cache (needs
+    `--cgen-prefer`/a page cgen URL); a forked child binds what it
+    inherited before it runs; a provided address whose slot lost its
+    bridge is re-bridged on its miss (`gex_elfprov_rebridge`); the forked
+    child's shim gets the cgen mode at attach; `GEX_PROVIDERS=0` under
+    run-node switches them off in every Worker.
+  - providers: `glibc_mem` (mem*/str*), `glibc_printf` (snprintf,
+    vsnprintf, sprintf, vsprintf; the rest goes to glibc's
+    `__vsnprintf_chk`); `glibc_malloc` written and conformant but NOT
+    registered (no faster).
+  - tests: `tests/elf-prov/run.sh G` (native: fork, malloc, mem, printf
+    with 117353 lines, all ok) and `tests/elf-prov/run-browser.sh G` (needs
+    `GEX_ARCH=x86 GEX_SHARED=1 shims/browser/build.sh`; all ok). Under
+    `GEX_FJIT=1` the browser fork test hangs with providers off too (a
+    browser fjit + fork issue, not the providers').
+  - measured (run-node, worldmachine, 12 ABBA pairs; not a page run):
+    mem/str loop 1.86x faster with providers (87 against 162 ms), snprintf
+    loop 2.34x faster (339 against 792 ms), malloc loop no faster (177
+    against 175 ms). `$W/bench-mem/ab.sh` via scratch/bench/bench.sh.
+  - Warfork server plays natively with mem, printf and (then registered)
+    malloc providers.
+  - 277a8912: gex-kernel TCP listeners between guests (loopback connect,
+    accept, getsockname; `tests/x86-programs/tcp-loopback.c` matches
+    native x86-64; x86-programs suite and gex-kernel tests pass).
+  **Before elf-prov goes to gate:** the gex-cgen changes are spread over
+  ba99e9ed, 96228a99, 7fa963c4, 94255d28: squash them into ONE gex-cgen
+  commit on a clean branch (they re-key every unit), merge master first
+  (the coordinator schedules the re-key between E's series), and send the
+  head. Also rerun the nt/wasm32 checks (`$W/check-fork.sh`-style) since
+  nt_cgen.rs and the browser shim changed.
   Next:
-  - the browser host (shims/browser: a provider-only unit per ELF library
-    through `gex_cgen_provider_publish`, a JS loop beside `#cgenServe`, the
-    browser fjit's executable predicate), and a browser run of
-    tests/elf-prov;
-  - a paired page measurement (needs an x86-64 ELF workload in the page);
-  - then the printf family and malloc (as a GEX_GROUP) per the profile;
-    32-bit dynsyms in gex-ld for i386 glibc.
-- Open findings: gex-kernel has no TCP listeners (`accept` gives ENOTSOCK);
-  the browser scheduler doesn't classify a cross-Worker wait4 (the idle
-  message); "pid 1 made a <syscall> after exiting" from a thread parked in
-  pause().
+  - a paired page measurement on edger (E holds the lock for long runs);
+  - libm (`__sincos`, floorf) per the profile; 32-bit dynsyms for i386
+    glibc; FILE-based printf only with glibc's FILE layout by build-id;
+  - open items: the browser scheduler missing wait4 on a child in another
+    Worker; a thread in pause() making syscalls after process exit; TCP
+    loopback across browser processes (the table is per shim instance
+    there) and UDP listeners are not done.
 
 **Where things are** (all relative to `${NW_ROOT:-~/gex-sandbox}`; on gooner since 2026-10-04, `$W` = `~/gex-sandbox/scratch/W`):
 
