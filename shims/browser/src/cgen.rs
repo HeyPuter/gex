@@ -1318,7 +1318,35 @@ thread_local! {
     static CB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The call-out whose return a dispatch miss found (`returned`), or -1.
     static HIT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+    /// 1 + the call-out whose loop called `enter` last with nothing nested
+    /// since (`gex_callout_leave_ok`), or 0.
+    static LEAVE_OK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+/// JS's call-out loop `depth` is about to call `enter` (`depth + 1`), or
+/// another loop is (0): whether a miss at that call-out's return may leave
+/// by returning (`DISPATCH_MISS_LEAVE`) instead of trapping.
+#[no_mangle]
+pub extern "C" fn gex_callout_leave_ok(v: u32) {
+    LEAVE_OK.with(|c| c.set(v));
+}
+
+/// After `returned`: the call-out found is the innermost and its loop's
+/// `enter` is the innermost JS frame, so only tail calls lie between it and
+/// the miss and a return reaches it.
+pub(crate) fn may_leave() -> bool {
+    let hit = HIT.with(|h| h.get());
+    hit >= 0
+        && CALLOUTS.with(|c| c.borrow().len()) == hit as usize + 1
+        && LEAVE_OK.with(|c| c.get()) == hit as u32 + 1
+        && !exp_trap_callouts()
+}
+
+/// `GEX_NT_CALLOUT_TRAP=1`: call-outs leave by trapping, as before (A/B).
+fn exp_trap_callouts() -> bool {
+    TRAP_CALLOUTS.load(Ordering::Relaxed)
+}
+pub(crate) static TRAP_CALLOUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn sp_index() -> u8 {
     if gex_abi::X86 {

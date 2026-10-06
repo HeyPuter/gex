@@ -545,6 +545,13 @@ static NEXT_MODULE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// every unit's recovery.)
 pub const DISPATCH_MISS_REDISPATCH: i32 = -1;
 
+/// What `gex.dispatch_miss` returns for "leave: return out of the block
+/// chain to whoever called `enter`" (the host's call-out loop, when the
+/// guest reached the call-out's return address and nothing but tail calls
+/// lies between). A return instead of a trap: the trap's unwinding was
+/// most of what a call-out cost in the browser.
+pub const DISPATCH_MISS_LEAVE: i32 = -2;
+
 pub struct ModuleBuilder {
     m: Module,
     text_base: u64,
@@ -1297,6 +1304,12 @@ impl ModuleBuilder {
         f.addr_i32();
         f.load(0x29, 3, ctx::PC as u32);
         f.return_call_local(self.enter);
+        f.end();
+        f.local_get(r);
+        f.i32_const(DISPATCH_MISS_LEAVE);
+        f.byte(0x46); // i32.eq
+        f.if_void();
+        f.byte(0x0f); // return
         f.end();
         f.local_get(0); // ctx argument for the target
         f.local_get(r);

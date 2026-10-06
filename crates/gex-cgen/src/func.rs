@@ -621,6 +621,8 @@ impl FnUnit {
         use gex_ir::{BinOp, CmpOp, MemSz, Order, Ty, Value};
         let mut g = f.clone();
         let mut inlined = HashMap::new();
+        // The shared mismatch exits of inlined `ret`s, by how far they pop.
+        let mut mismatch: HashMap<u64, usize> = HashMap::new();
         self.no_devirt.clear();
         let n0 = f.blocks.len();
         for i in 0..n0 {
@@ -692,6 +694,7 @@ impl FnUnit {
             // The leaf's blocks, its values renumbered after ours.
             let base = g.blocks.len();
             let off = nv;
+            let mut rets = Vec::new();
             for lb in &leaf.blocks {
                 let mut b = lb.clone();
                 b.synthetic = true;
@@ -705,6 +708,7 @@ impl FnUnit {
                     e.to = BlockId(e.to.0 + base as u32);
                 }
                 if let FTerm::Return { target } = b.term {
+                    rets.push((g.blocks.len(), target, ret_delta(lb, &self.ret_pops)));
                     b.term = FTerm::Switch {
                         target,
                         cases: vec![(ret_pc, cont.clone())],
@@ -715,6 +719,44 @@ impl FnUnit {
                 g.blocks.push(b);
             }
             nv += leaf.n_values;
+            // A `ret` whose pop is known (`ret_delta`): its mismatch (the
+            // leaf rewrote its return address) goes to the function's one
+            // exit for that pop, which reads the address back from the
+            // stack, instead of a write-back and table call of its own
+            // (some 90 wasm instructions each: 70% of what inlining added
+            // to 0x70bdc0). Guest state only, so a loop function leaving
+            // for it loses nothing.
+            if shared_ret_exits() {
+                for (bi, target, delta) in rets {
+                    let Some(delta) = delta else { continue };
+                    let mm = *mismatch.entry(delta).or_insert_with(|| {
+                        let mut m = FBlock::synthetic(pc, FTerm::Illegal { raw: 0, pc });
+                        let mut d = |m: &mut FBlock, expr: Expr| {
+                            let v = Value(nv);
+                            nv += 1;
+                            m.push(pc, Stmt::Def { dst: v, expr });
+                            v
+                        };
+                        let sp = d(&mut m, Expr::ReadReg(sp_reg()));
+                        let k = d(&mut m, Expr::ConstI64(delta));
+                        let at = d(&mut m, Expr::Bin { op: BinOp::Sub, ty: Ty::I64, a: sp, b: k });
+                        let w = d(&mut m, Expr::Load { addr: at, offset: 0, sz: MemSz::B4, signed: false, ty: Ty::I32, order: Order::Relaxed });
+                        let t = d(&mut m, Expr::Extend { a: w, signed: false });
+                        m.term = FTerm::Unresolved { target: t };
+                        inlined.insert(g.blocks.len(), i);
+                        g.blocks.push(m);
+                        g.blocks.len() - 1
+                    });
+                    let b = &mut g.blocks[bi];
+                    let tpc = b.term_pc;
+                    let k = Value(nv);
+                    b.push(tpc, Stmt::Def { dst: k, expr: Expr::ConstI64(ret_pc) });
+                    let hit = Value(nv + 1);
+                    b.push(tpc, Stmt::Def { dst: hit, expr: Expr::Cmp { op: CmpOp::Eq, ty: Ty::I64, a: target, b: k } });
+                    nv += 2;
+                    b.term = FTerm::Branch { cond: hit, taken: cont.clone(), not_taken: Edge::to(BlockId(mm as u32)) };
+                }
+            }
             g.n_values = nv;
             g.blocks[i].term = FTerm::Branch {
                 cond,
@@ -2160,6 +2202,26 @@ pub fn leaf_copies() -> bool {
 /// private cache).
 pub fn inline_leaves() -> bool {
     !exp("NOINLINELEAVES")
+}
+
+/// How far an inlined leaf's `ret` (block `b`, a `Return`) moved SP past
+/// the return address it popped: 4 for a plain one-byte `ret`, `ret N`'s
+/// from `pops` (`ret_pops`); `None` when that is not known from the block
+/// alone (prefixes: `66 c3` pops two bytes), and its mismatch keeps an
+/// exit of its own.
+fn ret_delta(b: &FBlock, pops: &HashMap<u64, u64>) -> Option<u64> {
+    match (b.end.checked_sub(b.term_pc), pops.get(&b.term_pc)) {
+        (Some(1), None) => Some(4),
+        (Some(3), Some(&d)) => Some(d),
+        _ => None,
+    }
+}
+
+/// Whether inlined leaves' `ret` mismatches share one exit per pop
+/// (`inline_leaf_calls`); `GEX_CGEN_EXP=NOSHAREDRETEXITS` gives each its
+/// own (not in the unit key: use a private cache).
+fn shared_ret_exits() -> bool {
+    !exp("NOSHAREDRETEXITS")
 }
 
 /// Whether `leaf` can be inlined at a call (`FnUnit::inline_leaf_calls`): a

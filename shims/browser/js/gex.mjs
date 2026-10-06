@@ -3084,6 +3084,7 @@ export class Gex {
               'A trap gave the stack back without setting a resume address.',
           );
         }
+        this.#shim.exports.gex_callout_leave_ok?.(0);
         this.#guest.exports.enter(ctx, pc);
         // `enter` returning means the guest gave the stack back for good,
         // normally because the last process exited.
@@ -3699,8 +3700,10 @@ export class Gex {
         if (bypass) {
           const f = bypass;
           bypass = null;
+          this.#shim.exports.gex_callout_leave_ok?.(0);
           f(ctx);
         } else {
+          this.#shim.exports.gex_callout_leave_ok?.(0);
           this.#guest.exports.enter(ctx, pc);
         }
         console.error('[gex-nt] guest code returned out of a user-mode callback');
@@ -3892,10 +3895,16 @@ export class Gex {
           if (next) {
             const f = next;
             next = null;
+            e.gex_callout_leave_ok?.(me + 1);
             f(ctx);
           } else {
+            e.gex_callout_leave_ok?.(me + 1);
             this.#guest.exports.enter(ctx, pc);
           }
+          // A miss at a call-out's return with only tail calls since this
+          // `enter` returns instead of trapping (DISPATCH_MISS_LEAVE).
+          const hit = e.gex_callout_hit?.() ?? -1;
+          if (hit >= 0) return hit === me ? 1 : 0;
           console.error('[gex] guest code returned out of a call-out');
           return 0;
         } catch (err) {
@@ -3978,6 +3987,7 @@ export class Gex {
         }
       }
     } finally {
+      e.gex_callout_leave_ok?.(0);
       this.#unwatch(c);
       this.#callouts.pop();
       this.#nest.pop();
@@ -4012,8 +4022,10 @@ export class Gex {
           if (bypass) {
             const f = bypass;
             bypass = null;
+            this.#shim.exports.gex_callout_leave_ok?.(0);
             f(ctx);
           } else {
+            this.#shim.exports.gex_callout_leave_ok?.(0);
             this.#guest.exports.enter(ctx, pc);
           }
           console.error('[gex] guest code returned out of exception dispatch');
