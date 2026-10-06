@@ -1154,6 +1154,22 @@ plus `make -k`.
   bytes in system DLLs, self-modifying hooks. They are rare in this set and
   handled by rebinding on write (§3.3).
 
+### 5.0 Cross-cutting: low-page protection (open, for a later decision)
+
+A guest access to the lowest guest pages (a NULL dereference, `[0]`,
+`[eax+8]` with EAX = 0) does not fault under gex on any path: those pages
+hold gex's own state (thread contexts, the dispatch directory), and
+translated code reads and writes them like any memory. Linux and Windows
+both keep the first 64 KiB unmapped, and programs rely on the fault:
+Windows SEH `__try` around a possibly-NULL pointer, runtimes that turn an
+access violation into a NullReferenceException (Mono: stream U works around
+it with `MONO_DEBUG=explicit-null-checks`; .NET, the JVM), crash handlers.
+Found by W3.0's spike (`tools/wine-wasm/spike-w3/fault.c`). Options to
+decide between later: move gex's low state above the guest's range and
+guard the low pages in the translators' address check (a cost on every
+access without a static offset), or a guard only where a static base is
+zero. Not fixed for W3.
+
 ### 5.1 Queued (user, 2026-10-05): the guest's Unix userland as native wasm
 
 After the current W2 items (user32/gdi32 native, `_vsnprintf_s`,
