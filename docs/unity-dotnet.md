@@ -956,9 +956,10 @@ Not yet:
      passes now). Explains: graphics-only (batch has one process),
      worldmachine-only BAD (different glibc layout from Debian's), intermittent
      on gooner (hk40), and the partial-range "stalls" are separate (not yet
-     looked at). Confirmation: gs13/gs14 (worldmachine glibc, full --fjit,
-     graphics) on the fixed gexc are running; then worldmachine itself (fjtry
-     with the new gexc).
+     looked at). **Confirmed on worldmachine:** b14 (fjtry, full --fjit,
+     graphics, the fixed gexc) GOOD (reached "Unloading 5"), where hkw1, hkw2
+     and b12 were BAD with the old one. gs13/gs14 on gooner (worldmachine
+     glibc) were still loading under load ~160 when this was written.
      hk46 (focus from frame 0): 5,797 PRESENTs, still no draw/shader, same log
      as hk41: the intro does not advance; next on that.
 
