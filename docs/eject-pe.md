@@ -1029,7 +1029,21 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   world-up A/B, play-through p1-p8 (site27p, readback for screenshots, own
   browser profile `/tmp/gbench-e9play`), 35-minute soak.
 
-- **RESUME HERE (parked 2026-10-05 ~21:00 for a reboot).** Head = the
+- **RESUME HERE (2026-10-06).** merge/eject9 on master 6f196998; head =
+  the commit adding this paragraph. Project `$S/p-noita19` (integ-g keys,
+  web entries = tests/eject/noita-entries/base46.txt), sites site30 (bench),
+  site30p (killme), site31q (play). Results on these keys (edger, seed
+  pinned): ABBA pewasm 48.2 / eject 65.6 / eject 68.3 / pewasm 49.0 world
+  fps (eject 66.95 average, 1.38x faster than pewasm's 48.6); world-up
+  eject 31.2 and 30.9 s vs pewasm 31.3 s; play A passes; play B: Save &
+  Quit, snapshot and 62-file restore pass, Continue stops on fmod frames
+  (see the open bug in §8). ntweb seh/cxx/apc x86 with TRAIN=1 pass in rt
+  and web; tests/nt/run-browser.sh 49/49; browser-gui x86 and --gl, plain
+  and direct=1, pass. Soak (c28 keys): no freeze, declines less than
+  pewasm. Open for whoever continues: the §8 open bug (blocks Continue),
+  a coverage pass, a shipped-page fallback for missed entries, audio.
+
+- **Earlier resume (parked 2026-10-05 ~21:00).** Head = the
   commit adding this paragraph (on 74e84773; master e3917bac merged at
   df028162). Nothing of mine is running on gooner or edger.
   - c28 results so far (raw numbers below, under "Earlier resume"): ABBA
