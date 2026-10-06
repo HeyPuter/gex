@@ -258,6 +258,7 @@ const EGL_CONTEXT_MAJOR_VERSION: EGLint = 0x3098;
 const EGL_CONTEXT_MINOR_VERSION: EGLint = 0x30FB;
 const EGL_CONTEXT_OPENGL_PROFILE_MASK: EGLint = 0x30FD;
 const EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT: EGLint = 0x2;
+const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: EGLint = 0x1;
 
 /// Desktop GL's fixed-function entry points, which libGLESv2 does not
 /// export: looked up through EGL once a desktop context exists.
@@ -447,6 +448,9 @@ pub struct Gl {
     current_on: Option<std::thread::ThreadId>,
     /// Fixed function, once the context is a desktop one.
     compat: Option<Compat>,
+    /// The desktop context's request (major, minor, compatibility), so a
+    /// later CONTEXT_CREATE asking for something else gets a new context.
+    desktop: Option<(u32, u32, bool)>,
     /// Read when the context is made; the answer never changes after.
     pub vendor: String,
     pub renderer: String,
@@ -588,6 +592,7 @@ impl Gl {
                 width,
                 height,
                 compat: None,
+                desktop: None,
                 vendor: gl_string(0x1F00),
                 renderer: gl_string(0x1F01),
                 version: gl_string(0x1F02),
@@ -630,7 +635,51 @@ impl Gl {
     /// `major` 0 asks for the highest version the host offers; a
     /// compatibility context of an older version is a valid answer to any
     /// request for 2.x or 3.0, so those are not passed on.
-    fn become_desktop(&mut self, major: u32, minor: u32) -> Result<(), String> {
+    /// Back to an OpenGL ES context (a guest that made a desktop one, threw
+    /// it away and asked for ES: SDL's GLX path).
+    fn become_es(&mut self, major: u32) -> Result<(), String> {
+        unsafe {
+            eglBindAPI(EGL_OPENGL_ES_API);
+            let attrs = [
+                EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE,
+            ];
+            let mut config: EGLConfig = std::ptr::null_mut();
+            let mut num = 0;
+            if eglChooseConfig(self.display, attrs.as_ptr(), &mut config, 1, &mut num) == 0 || num < 1 {
+                return Err("no OpenGL ES EGL config".into());
+            }
+            let ctx_attrs = [EGL_CONTEXT_CLIENT_VERSION, major.max(2) as EGLint, EGL_NONE];
+            let context = eglCreateContext(self.display, config, std::ptr::null_mut(), ctx_attrs.as_ptr());
+            if context.is_null() {
+                return Err(format!("no OpenGL ES context: {:#x}", eglGetError()));
+            }
+            let pb = [EGL_WIDTH, self.width, EGL_HEIGHT, self.height, EGL_NONE];
+            let surface = eglCreatePbufferSurface(self.display, config, pb.as_ptr());
+            if surface.is_null() || eglMakeCurrent(self.display, surface, surface, context) == 0 {
+                eglDestroyContext(self.display, context);
+                return Err(format!("no OpenGL ES pbuffer: {:#x}", eglGetError()));
+            }
+            eglDestroySurface(self.display, self.surface);
+            eglDestroyContext(self.display, self.context);
+            self.surface = surface;
+            self.context = context;
+            self.config = config;
+            self.names = Names::default();
+            self.pack_store = PixelStore::default();
+            self.unpack_store = PixelStore::default();
+            self.current_on = Some(std::thread::current().id());
+            self.compat = None;
+            self.desktop = None;
+            self.vendor = gl_string(0x1F00);
+            self.renderer = gl_string(0x1F01);
+            self.version = gl_string(0x1F02);
+        }
+        Ok(())
+    }
+
+    fn become_desktop(&mut self, major: u32, minor: u32, compat: bool) -> Result<(), String> {
         unsafe {
             if eglBindAPI(EGL_OPENGL_API) == 0 {
                 return Err(format!("no desktop OpenGL in EGL: {:#x}", eglGetError()));
@@ -660,9 +709,11 @@ impl Gl {
                 eglBindAPI(EGL_OPENGL_ES_API);
                 return Err("no desktop OpenGL EGL config".into());
             }
+            // Core only when asked for, from 3.2 (where profiles begin).
+            let core = !compat && (major > 3 || (major == 3 && minor >= 2));
             let mut ctx_attrs = vec![
                 EGL_CONTEXT_OPENGL_PROFILE_MASK,
-                EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
+                if core { EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT } else { EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT },
             ];
             if major > 3 || (major == 3 && minor > 0) {
                 ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MAJOR_VERSION, major as EGLint]);
@@ -694,6 +745,7 @@ impl Gl {
             self.unpack_store = PixelStore::default();
             self.current_on = Some(std::thread::current().id());
             self.compat = Compat::load();
+            self.desktop = Some((major, minor, !core));
             self.vendor = gl_string(0x1F00);
             self.renderer = gl_string(0x1F01);
             self.version = gl_string(0x1F02);
@@ -799,9 +851,19 @@ impl Gl {
                     else {
                         return true;
                     };
-                    if api == crate::proto::client_api::DESKTOP && self.compat.is_none() {
-                        if let Err(e) = self.become_desktop(major, minor) {
+                    // { api, major, minor, profile }: profile 1 is
+                    // compatibility (older guests send three words: the
+                    // compatibility profile, as before).
+                    let compat = a.u32().is_none_or(|p| p != 0);
+                    let core = !compat && (major > 3 || (major == 3 && minor >= 2));
+                    let changed = self.desktop.is_some_and(|(_, _, c)| c == core);
+                    if api == crate::proto::client_api::DESKTOP && (self.compat.is_none() || changed) {
+                        if let Err(e) = self.become_desktop(major, minor, compat) {
                             eprintln!("gex-gl: {e}; staying on OpenGL ES");
+                        }
+                    } else if api != crate::proto::client_api::DESKTOP && self.compat.is_some() {
+                        if let Err(e) = self.become_es(major) {
+                            eprintln!("gex-gl: {e}; staying on desktop OpenGL");
                         }
                     }
                     reply.blob(self.vendor.as_bytes());
@@ -1334,7 +1396,19 @@ impl Gl {
                     else {
                         return true;
                     };
-                    glDrawElements(mode, count, ty, offset as usize as *const c_void);
+                    // { ..., client } then, for client-side indices (no
+                    // element array buffer bound in the guest), the indices
+                    // themselves: the guest's pointer means nothing here, and
+                    // passing it as an offset had the host's GL read its own
+                    // address space (Retrocycles' arena: SIGSEGV in Mesa).
+                    // Older guests send no fifth word.
+                    match a.u32() {
+                        Some(1) => {
+                            let Some(indices) = a.blob() else { return true };
+                            glDrawElements(mode, count, ty, indices.as_ptr() as *const c_void);
+                        }
+                        _ => glDrawElements(mode, count, ty, offset as usize as *const c_void),
+                    }
                 }
 
                 op::READ_PIXELS => {
@@ -1645,6 +1719,64 @@ mod tests {
         let v = u32::from_le_bytes(reply[*at..*at + 4].try_into().unwrap());
         *at += 4;
         v
+    }
+
+    /// glDrawElements with client-side indices: they travel with the
+    /// command (the guest's pointer, sent as the offset, must never reach
+    /// the host's GL: Retrocycles crashed Mesa that way).
+    #[test]
+    fn client_side_indices_come_with_the_draw() {
+        let mut gl = match Gl::new(64, 64) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        const GL_UNSIGNED_SHORT: u32 = 0x1403;
+        let verts: [f32; 6] = [-1.0, -1.0, 0.0, -1.0, -1.0, 1.0];
+        let bytes: Vec<u8> = verts.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let idx: Vec<u8> = [0u16, 1, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let vs = b"attribute vec2 pos;\nvoid main(){gl_Position=vec4(pos,0.0,1.0);}\n";
+        let fs = b"precision mediump float;\nvoid main(){gl_FragColor=vec4(0.0,1.0,0.0,1.0);}\n";
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::ES, 0, 0]);
+        b.cmd(op::VIEWPORT, &[0, 0, 64, 64]);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 1.0f32.to_bits(), 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::CREATE_SHADER, &[1, GL_VERTEX_SHADER]);
+        b.raw(op::SHADER_SOURCE, &[1, vs.len() as u32], vs);
+        b.cmd(op::COMPILE_SHADER, &[1]);
+        b.cmd(op::CREATE_SHADER, &[2, GL_FRAGMENT_SHADER]);
+        b.raw(op::SHADER_SOURCE, &[2, fs.len() as u32], fs);
+        b.cmd(op::COMPILE_SHADER, &[2]);
+        b.cmd(op::CREATE_PROGRAM, &[3]);
+        b.cmd(op::ATTACH_SHADER, &[3, 1]);
+        b.cmd(op::ATTACH_SHADER, &[3, 2]);
+        b.cmd(op::LINK_PROGRAM, &[3]);
+        b.cmd(op::USE_PROGRAM, &[3]);
+        b.cmd(op::GEN_BUFFERS, &[1, 7]);
+        b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 7]);
+        b.raw(op::BUFFER_DATA, &[GL_ARRAY_BUFFER, GL_STATIC_DRAW, bytes.len() as u32, 0, 1, bytes.len() as u32], &bytes);
+        b.cmd(op::ENABLE_VERTEX_ATTRIB_ARRAY, &[0]);
+        b.cmd(op::VERTEX_ATTRIB_POINTER, &[0, 2, GL_FLOAT, 0, 0, 0]);
+        // A guest pointer far outside anything the host maps, as the offset.
+        b.raw(op::DRAW_ELEMENTS, &[GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, 0xdead_0000, 1, idx.len() as u32], &idx);
+        b.cmd(op::FINISH, &[]);
+        b.cmd(op::READ_PIXELS, &[0, 0, 64, 64, GL_RGBA, GL_UNSIGNED_BYTE, 0, 1, 0]);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        for _ in 0..3 {
+            read_blob(r, &mut at); // vendor, renderer, version
+        }
+        let _finish = read_u32(r, &mut at);
+        let _offset = read_u32(r, &mut at);
+        let pixels = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(&pixels[(2 * 64 + 2) * 4..(2 * 64 + 2) * 4 + 4], &[0, 255, 0, 255], "the indexed triangle");
     }
 
     /// The whole path: bring up a context, compile the application's own

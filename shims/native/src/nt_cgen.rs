@@ -310,7 +310,7 @@ pub fn provider_stubs(pe: &gex_ld::pe::PeImage, base: u64) -> Vec<u64> {
 /// A built-in provider's module and its slots: built here (clang) when
 /// missing, unless this runtime has no translator (gex-rt), which only finds
 /// the one its project's build made (`gex_cgen::provider::build`'s name).
-fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(std::path::PathBuf, Vec<Option<String>>)> {
+pub(crate) fn provider_module(prov: &gex_cgen::provider::Provider) -> Result<(std::path::PathBuf, Vec<Option<String>>)> {
     if cfg!(feature = "translate") {
         return gex_cgen::provider::build(prov, &cache_root()?);
     }
@@ -1002,7 +1002,20 @@ fn trampoline_input(class32: bool) -> (gex_ld::Image, gex_xlate::func::PeSeeds) 
 /// --nt-trampolines`): for a host that cannot build it at boot, the browser.
 pub fn prepare_trampolines(class32: bool, jobs: usize) -> Result<std::path::PathBuf> {
     let (image, seeds) = trampoline_input(class32);
-    prepare_image(&image, &seeds, jobs, true)
+    let unit = prepare_image(&image, &seeds, jobs, true)?;
+    // Its providers (nt_unixcall, i386 only), which a runtime without a
+    // translator (gex-rt, the browser) finds in the cache and cannot build.
+    if class32 {
+        for prov in gex_cgen::provider::for_dll(gex_cgen::provider::TRAMPOLINES_DLL, true) {
+            let (path, _) = gex_cgen::provider::build(&prov, &cache_root()?)?;
+            #[cfg(feature = "translate")]
+            if let Some(dir) = gex_cache::precompiled_dir() {
+                gex_cache::precompile(&crate::engine()?, &std::fs::read(&path)?, &dir)?;
+            }
+            let _ = path;
+        }
+    }
+    Ok(unit)
 }
 
 static TRAMPOLINES_DONE: OnceLock<()> = OnceLock::new();

@@ -49,6 +49,9 @@ const DT_RUNPATH: i64 = 29;
 const DT_INIT_ARRAY: i64 = 25;
 const DT_INIT_ARRAYSZ: i64 = 27;
 const DT_INIT: i64 = 12;
+const DT_VERSYM: i64 = 0x6fff_fff0;
+const DT_VERDEF: i64 = 0x6fff_fffc;
+const DT_VERDEFNUM: i64 = 0x6fff_fffd;
 
 /// Relocation types, for whichever guest architecture this build targets.
 /// The loader only ever needs the handful below; the names are the generic
@@ -212,6 +215,76 @@ pub struct DynSym {
     /// `STT_TLS`: the value is an offset in the defining object's TLS block,
     /// not an address.
     pub tls: bool,
+    /// The version a defined symbol is exported under (`GLIBC_2.14` for
+    /// `memcpy@@GLIBC_2.14`), from `DT_VERSYM`/`DT_VERDEF`; `None` for an
+    /// unversioned object, an undefined symbol or the base version.
+    pub version: Option<String>,
+    /// Whether `version` is the symbol's default, what a link against the
+    /// library binds (`name@@V`), rather than an older one kept for old
+    /// binaries (`name@V`: glibc's memmove-like `memcpy@GLIBC_2.2.5`).
+    pub default_version: bool,
+}
+
+impl DynSym {
+    /// `name@@VERSION`, `name@VERSION` or `name`, as `nm -D` spells it.
+    pub fn versioned_name(&self) -> String {
+        match &self.version {
+            Some(v) if self.default_version => format!("{}@@{v}", self.name),
+            Some(v) => format!("{}@{v}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+impl Image {
+    /// The defined, non-TLS dynamic symbols in `[lo, hi)` (unbiased) by every
+    /// name a binding may use: `name@@VER`, `name@VER`, and the bare `name`
+    /// for the default version (or an unversioned object), each with its
+    /// unbiased value and whether it is an IFUNC. For export providers
+    /// (docs/elf-providers.md).
+    pub fn exports_by_version(&self, lo: u64, hi: u64) -> std::collections::HashMap<String, (u64, bool)> {
+        let mut m = std::collections::HashMap::new();
+        for y in self.dynsyms.iter().filter(|y| !y.undefined && !y.tls && y.value >= lo && y.value < hi) {
+            let v = (y.value, y.ifunc);
+            m.insert(y.versioned_name(), v);
+            if y.version.is_none() || y.default_version {
+                m.insert(y.name.clone(), v);
+            }
+        }
+        m
+    }
+}
+
+/// An ELF file's GNU build-id (`NT_GNU_BUILD_ID` in a `PT_NOTE`), as
+/// lower-case hex.
+pub fn build_id(bytes: &[u8]) -> Option<String> {
+    let rd = |o: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(o..o.checked_add(n)?)?;
+        Some(b.iter().rev().fold(0u64, |a, &x| (a << 8) | x as u64))
+    };
+    if bytes.get(..4) != Some(&b"\x7fELF"[..]) || bytes.get(5) != Some(&1) {
+        return None;
+    }
+    let c64 = bytes.get(4) == Some(&2);
+    let (phoff, phentsize, phnum) = if c64 { (rd(0x20, 8)?, rd(0x36, 2)?, rd(0x38, 2)?) } else { (rd(0x1c, 4)?, rd(0x2a, 2)?, rd(0x2c, 2)?) };
+    for i in 0..phnum {
+        let ph = usize::try_from(phoff.checked_add(i * phentsize)?).ok()?;
+        if rd(ph, 4)? != 4 {
+            continue; // not PT_NOTE
+        }
+        let (off, size) = if c64 { (rd(ph + 8, 8)?, rd(ph + 32, 8)?) } else { (rd(ph + 4, 4)?, rd(ph + 16, 4)?) };
+        let (mut p, end) = (usize::try_from(off).ok()?, usize::try_from(off.checked_add(size)?).ok()?);
+        while p + 12 <= end {
+            let (namesz, descsz, ty) = (rd(p, 4)? as usize, rd(p + 4, 4)? as usize, rd(p + 8, 4)?);
+            let name = p + 12;
+            let desc = name + namesz.div_ceil(4) * 4;
+            if ty == 3 && bytes.get(name..name + namesz) == Some(&b"GNU\0"[..]) {
+                return Some(bytes.get(desc..desc + descsz)?.iter().map(|b| format!("{b:02x}")).collect());
+            }
+            p = desc + descsz.div_ceil(4) * 4;
+        }
+    }
+    None
 }
 
 /// An image holding only the numbers the auxiliary vector reports, for a
@@ -545,6 +618,9 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         image.init_array = inits;
         read_needed(&mut image, dyn_vaddr, dyn_size);
     }
+    if let (Some((dyn_vaddr, dyn_size)), true) = (dynamic, class32) {
+        image.dynsyms = read_dynsyms32(&image, dyn_vaddr, dyn_size);
+    }
     // The dynamic section and the section tables are read in their 64-bit
     // layouts; a 32-bit image keeps only what its program headers say. Its
     // programs are static (or Wine's, whose PE loader is not ours), so no
@@ -615,18 +691,124 @@ fn read_needed(image: &mut Image, dyn_vaddr: u64, dyn_size: u64) {
     image.runpath = if runpath.is_empty() { rpath } else { runpath };
 }
 
+/// The dynamic symbol table at `symtab` (entries of `syment` bytes, names
+/// in `strtab`), with each defined symbol's version from `.gnu.version`
+/// (`versym`) and `.gnu.version_d` (`verdef`, `verdefnum` entries).
+#[allow(clippy::too_many_arguments)]
+fn read_dynsym_table(image: &Image, symtab: u64, strtab: u64, syment: u64, versym: Option<u64>, verdef: Option<u64>, verdefnum: u64, class32: bool) -> Vec<DynSym> {
+    // The version definitions (`.gnu.version_d`): index -> name. Each
+    // Elf_Verdef is {vd_version u16, vd_flags u16, vd_ndx u16, vd_cnt u16,
+    // vd_hash u32, vd_aux u32, vd_next u32}; its first Elf_Verdaux
+    // {vda_name u32, vda_next u32} names it.
+    let mut versions = std::collections::HashMap::new();
+    if let Some(mut at) = verdef {
+        for _ in 0..verdefnum.min(1 << 16) {
+            let (Some(ndx), Some(aux), Some(next)) =
+                (read_u16(image, at + 4), read_u32(image, at + 12), read_u32(image, at + 16))
+            else {
+                break;
+            };
+            if let Some(name) = read_u32(image, at + aux as u64) {
+                versions.insert(ndx, read_cstr(image, strtab + name as u64));
+            }
+            if next == 0 {
+                break;
+            }
+            at += next as u64;
+        }
+    }
+
+    // How many symbols there are is not written down anywhere: the table runs
+    // to the end of `.dynstr`, which conventionally follows it. Reading until
+    // the entry stops making sense is what every loader does.
+    const STT_GNU_IFUNC: u8 = 10;
+    const STT_TLS: u8 = 6;
+    const STB_WEAK: u8 = 2;
+    let mut syms = Vec::new();
+    let limit = if strtab > symtab { (strtab - symtab) / syment } else { 4096 };
+    for i in 0..limit {
+        let at = symtab + i * syment;
+        // Elf64_Sym {name u32, info u8, other u8, shndx u16, value u64,
+        // size u64}; Elf32_Sym {name u32, value u32, size u32, info u8,
+        // other u8, shndx u16}.
+        let (st_name, st_info, st_shndx, value, size) = if class32 {
+            let (Some(n), Some(v), Some(z), Some(i), Some(x)) =
+                (read_u32(image, at), read_u32(image, at + 4), read_u32(image, at + 8), read_u8(image, at + 12), read_u16(image, at + 14))
+            else {
+                break;
+            };
+            (n, i, x, v as u64, z as u64)
+        } else {
+            let (Some(n), Some(i), Some(x), Some(v), Some(z)) =
+                (read_u32(image, at), read_u8(image, at + 4), read_u16(image, at + 6), read_u64(image, at + 8), read_u64(image, at + 16))
+            else {
+                break;
+            };
+            (n, i, x, v, z)
+        };
+        let kind = st_info & 0xf;
+        // Its version: `.gnu.version` holds an index per symbol (bit 15:
+        // hidden, i.e. not the default); 0 and 1 are local and the base.
+        let (version, default_version) = match versym.and_then(|v| read_u16(image, v + i * 2)) {
+            Some(x) if st_shndx != 0 && (x & 0x7fff) > 1 => {
+                (versions.get(&(x & 0x7fff)).cloned(), x & 0x8000 == 0)
+            }
+            _ => (None, false),
+        };
+        syms.push(DynSym {
+            name: read_cstr(image, strtab + st_name as u64),
+            value,
+            size,
+            undefined: st_shndx == 0,
+            weak: (st_info >> 4) == STB_WEAK,
+            ifunc: kind == STT_GNU_IFUNC,
+            tls: kind == STT_TLS,
+            version,
+            default_version,
+        });
+    }
+    syms
+}
+
+/// [`read_dynamic`]'s symbol table for a 32-bit image (Elf32_Dyn entries):
+/// only the symbols, which is what export providers bind by; 32-bit images
+/// are not linked here.
+fn read_dynsyms32(image: &Image, dyn_vaddr: u64, dyn_size: u64) -> Vec<DynSym> {
+    let (mut symtab, mut strtab, mut syment) = (None, None, 16u64);
+    let (mut versym, mut verdef, mut verdefnum) = (None, None, 0u64);
+    for i in 0..dyn_size / 8 {
+        let at = dyn_vaddr + i * 8;
+        let (Some(tag), Some(val)) = (read_u32(image, at), read_u32(image, at + 4)) else {
+            break;
+        };
+        let val = val as u64;
+        match tag as i32 as i64 {
+            DT_NULL => break,
+            DT_SYMTAB => symtab = Some(val + image.bias),
+            DT_STRTAB => strtab = Some(val + image.bias),
+            DT_SYMENT => syment = val,
+            DT_VERSYM => versym = Some(val + image.bias),
+            DT_VERDEF => verdef = Some(val + image.bias),
+            DT_VERDEFNUM => verdefnum = val,
+            _ => {}
+        }
+    }
+    match (symtab, strtab) {
+        (Some(symtab), Some(strtab)) if syment != 0 => read_dynsym_table(image, symtab, strtab, syment, versym, verdef, verdefnum, true),
+        _ => Vec::new(),
+    }
+}
+
 /// Everything a linker needs out of the dynamic section: the symbol table,
 /// every relocation with its type and addend, and the initialisers.
 /// ([`read_named_relocs`] answers a narrower question for code discovery.)
 pub(crate) fn read_dynamic(image: &Image, dyn_vaddr: u64, dyn_size: u64)
     -> (Vec<DynSym>, Vec<Reloc>, Vec<u64>) {
-    const STT_GNU_IFUNC: u8 = 10;
-    const STT_TLS: u8 = 6;
-    const STB_WEAK: u8 = 2;
     let (mut rela, mut relasz, mut relaent) = (None, 0u64, 24u64);
     let (mut jmprel, mut pltrelsz) = (None, 0u64);
     let (mut symtab, mut strtab, mut syment) = (None, None, 24u64);
     let (mut init_array, mut init_arraysz, mut init) = (None, 0u64, None);
+    let (mut versym, mut verdef, mut verdefnum) = (None, None, 0u64);
     for i in 0..dyn_size / 16 {
         let at = dyn_vaddr + i * 16;
         let (Some(tag), Some(val)) = (read_u64(image, at), read_u64(image, at + 8)) else {
@@ -645,6 +827,9 @@ pub(crate) fn read_dynamic(image: &Image, dyn_vaddr: u64, dyn_size: u64)
             DT_INIT_ARRAY => init_array = Some(val + image.bias),
             DT_INIT_ARRAYSZ => init_arraysz = val,
             DT_INIT => init = Some(val + image.bias),
+            DT_VERSYM => versym = Some(val + image.bias),
+            DT_VERDEF => verdef = Some(val + image.bias),
+            DT_VERDEFNUM => verdefnum = val,
             _ => {}
         }
     }
@@ -655,32 +840,7 @@ pub(crate) fn read_dynamic(image: &Image, dyn_vaddr: u64, dyn_size: u64)
         return (Vec::new(), Vec::new(), Vec::new());
     }
 
-    // How many symbols there are is not written down anywhere: the table runs
-    // to the end of `.dynstr`, which conventionally follows it. Reading until
-    // the entry stops making sense is what every loader does.
-    let mut syms = Vec::new();
-    let limit = if strtab > symtab { (strtab - symtab) / syment } else { 4096 };
-    for i in 0..limit {
-        let at = symtab + i * syment;
-        let (Some(st_name), Some(st_info), Some(st_shndx)) =
-            (read_u32(image, at), read_u8(image, at + 4), read_u16(image, at + 6))
-        else {
-            break;
-        };
-        let (Some(value), Some(size)) = (read_u64(image, at + 8), read_u64(image, at + 16)) else {
-            break;
-        };
-        let kind = st_info & 0xf;
-        syms.push(DynSym {
-            name: read_cstr(image, strtab + st_name as u64),
-            value,
-            size,
-            undefined: st_shndx == 0,
-            weak: (st_info >> 4) == STB_WEAK,
-            ifunc: kind == STT_GNU_IFUNC,
-            tls: kind == STT_TLS,
-        });
-    }
+    let syms = read_dynsym_table(image, symtab, strtab, syment, versym, verdef, verdefnum, false);
 
     let mut relocs = Vec::new();
     for (table, size) in [(rela, relasz), (jmprel, pltrelsz)] {
@@ -1188,5 +1348,45 @@ mod tests {
         );
         assert!(load(&exec_at(gex_abi::DISPATCH_DIR_END - 0x1000), 0).is_err());
         assert!(load(&exec_at(gex_abi::EXEC_BASE), 0).is_ok());
+    }
+
+    /// glibc exports `memcpy` twice: the default `memcpy@@GLIBC_2.14` and
+    /// the memmove-like `memcpy@GLIBC_2.2.5` old binaries bound. Read from
+    /// the host's x86-64 libc when it has one.
+    #[test]
+    fn versioned_dynamic_symbols() {
+        let Ok(bytes) = std::fs::read("/lib/x86_64-linux-gnu/libc.so.6") else { return };
+        // An x86-64 image loads only in an x86 build.
+        if !gex_abi::X86 {
+            return;
+        }
+        let image = load(&bytes, 0).unwrap();
+        let memcpy: Vec<String> =
+            image.dynsyms.iter().filter(|y| y.name == "memcpy").map(DynSym::versioned_name).collect();
+        assert!(memcpy.contains(&"memcpy@@GLIBC_2.14".to_string()), "{memcpy:?}");
+        assert!(memcpy.contains(&"memcpy@GLIBC_2.2.5".to_string()), "{memcpy:?}");
+        let malloc = image.dynsyms.iter().find(|y| y.name == "malloc").unwrap();
+        assert_eq!(malloc.versioned_name(), "malloc@@GLIBC_2.2.5");
+        assert!(image.dynsyms.iter().any(|y| y.name == "strlen" && y.ifunc));
+    }
+
+    /// The same for an i386 libc (Elf32_Dyn and Elf32_Sym), when the host
+    /// has one: `fopen` has two versions there.
+    #[test]
+    fn versioned_dynamic_symbols_32() {
+        let Ok(bytes) = std::fs::read("/usr/lib/i386-linux-gnu/libc.so.6") else { return };
+        if !gex_abi::X86 {
+            return;
+        }
+        let image = load(&bytes, 0).unwrap();
+        assert!(image.class32);
+        let fopen: Vec<String> =
+            image.dynsyms.iter().filter(|y| y.name == "fopen").map(DynSym::versioned_name).collect();
+        assert!(fopen.contains(&"fopen@@GLIBC_2.1".to_string()), "{fopen:?}");
+        assert!(fopen.contains(&"fopen@GLIBC_2.0".to_string()), "{fopen:?}");
+        let malloc = image.dynsyms.iter().find(|y| y.name == "malloc").unwrap();
+        assert_eq!(malloc.versioned_name(), "malloc@@GLIBC_2.0");
+        assert!(malloc.value != 0 && malloc.size != 0);
+        assert!(image.dynsyms.iter().any(|y| y.name == "strlen" && y.ifunc));
     }
 }

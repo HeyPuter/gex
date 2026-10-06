@@ -113,7 +113,12 @@ export class Compositor {
       worker.addEventListener('message', onMessage);
     });
     worker.addEventListener('message', ({ data: m }) => {
-      if (m.kind === 'describe' || m.kind === 'wgsl-cache') {
+      if (m.kind === 'direct') {
+        this.#setDirect(m.w ? { w: m.w, h: m.h } : null);
+      } else if (m.kind === 'cursor') {
+        if (this.#direct) this.#canvas.style.cursor = m.css;
+        this.#cursorCss = m.css;
+      } else if (m.kind === 'describe' || m.kind === 'wgsl-cache') {
         this.#pending.get(m.id)?.(m.kind === 'describe' ? m.state : { blob: m.blob, stats: m.stats });
         this.#pending.delete(m.id);
       } else if (m.kind === 'error') {
@@ -122,9 +127,14 @@ export class Compositor {
     });
     // `?present=canvas|readback`: how the scene reaches the canvas (see
     // presentMode in compositor-worker.js); by default, by the adapter.
-    const present = globalThis.location ? new URLSearchParams(location.search).get('present') : null;
+    const pq = globalThis.location ? new URLSearchParams(location.search) : null;
+    const present = pq?.get('present') ?? null;
+    // `?direct=1`: direct present (compositor-worker.js): a single GL window
+    // is the canvas, fitted to the viewport; compositing only when needed.
+    const direct = pq?.get('direct') === '1';
+    this.#pointerLock = pq?.get('pointerlock') === '1';
     worker.postMessage(
-      { kind: 'init', canvas: offscreen, channel, stats: this.#stats, present },
+      { kind: 'init', canvas: offscreen, channel, stats: this.#stats, present, direct },
       [offscreen],
     );
     await ready;
@@ -132,7 +142,47 @@ export class Compositor {
   }
 
   /** Where a DOM event lands in output pixels. */
+  // -- direct present (page side) ----------------------------------------
+  #direct = null;
+  #savedStyle = null;
+  #cursorCss = 'none';
+  #pointerLock = false;
+  #locked = null; // the virtual pointer while the pointer is locked
+
+  /** The GL frame became the canvas (`d` = its size) or stopped being it.
+   *  Fitted to the viewport, letterboxed, centred. */
+  #setDirect(d) {
+    const c = this.#canvas;
+    if (d && !this.#direct) {
+      this.#savedStyle = c.getAttribute('style');
+      Object.assign(c.style, { width: '100vw', height: '100vh', objectFit: 'contain', background: '#000',
+        position: 'fixed', left: '0', top: '0', cursor: this.#cursorCss });
+    } else if (!d && this.#direct) {
+      if (this.#savedStyle === null) c.removeAttribute('style');
+      else c.setAttribute('style', this.#savedStyle);
+      if (document.pointerLockElement === c) document.exitPointerLock?.();
+    }
+    this.#direct = d;
+  }
+
   #at(e) {
+    if (this.#direct) {
+      const d = this.#direct;
+      if (this.#locked && document.pointerLockElement === this.#canvas) {
+        // Locked: a virtual pointer moved by the deltas, kept in the frame.
+        this.#locked.x = Math.max(0, Math.min(d.w - 1, this.#locked.x + (e.movementX || 0)));
+        this.#locked.y = Math.max(0, Math.min(d.h - 1, this.#locked.y + (e.movementY || 0)));
+        return { x: Math.round(this.#locked.x), y: Math.round(this.#locked.y) };
+      }
+      // object-fit: contain -- the frame's box inside the element's.
+      const r = this.#canvas.getBoundingClientRect();
+      const k = Math.min(r.width / d.w, r.height / d.h) || 1;
+      const left = r.left + (r.width - d.w * k) / 2;
+      const top = r.top + (r.height - d.h * k) / 2;
+      const p = { x: Math.round((e.clientX - left) / k), y: Math.round((e.clientY - top) / k) };
+      this.#locked = p;
+      return p;
+    }
     const r = this.#canvas.getBoundingClientRect();
     const sx = this.#canvas.width / Math.max(1, r.width);
     const sy = this.#canvas.height / Math.max(1, r.height);
@@ -158,6 +208,8 @@ export class Compositor {
     };
     const onDown = (e) => {
       target.focus?.();
+      // `?pointerlock=1` and direct present: the first click locks the pointer.
+      if (this.#direct && this.#pointerLock && document.pointerLockElement !== target) target.requestPointerLock?.();
       const button = BTN[e.button];
       if (button === undefined) return;
       const { x, y } = this.#at(e);
@@ -182,6 +234,13 @@ export class Compositor {
       e.preventDefault();
     };
     const onKey = (pressed) => (e) => {
+      // Alt+Enter (direct present): the canvas full screen, as games have it.
+      if (pressed && this.#direct && e.altKey && e.code === 'Enter') {
+        if (document.fullscreenElement) document.exitFullscreen?.();
+        else target.requestFullscreen?.();
+        e.preventDefault();
+        return;
+      }
       const code = EVDEV[e.code];
       if (code === undefined) return;
       post({ kind: 'key', code, pressed, mods: mods(e), time: now() });

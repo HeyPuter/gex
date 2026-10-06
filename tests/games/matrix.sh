@@ -106,6 +106,10 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     [ -n "$only" ] && [[ $only != *",$slug,"* ]] && continue
     kind=$(trim "$kind") dir=$(trim "$dir") prog=$(trim "$prog") args=$(trim "$args")
     menu=$(trim "$menu") play=$(trim "$play") input=$(trim "$input") extra=$(trim "${extra:-}")
+    # `@path`: run from the game's directory rather than the program's
+    # (Baba Is You's launcher does `cd $GAMEDIR; ./bin64/Chowdren`).
+    fromroot=0
+    case $prog in @*) prog=${prog#@} fromroot=1 ;; esac
     case $kind in linux*) gdir=$games_linux/$dir ;; *) gdir=$games/$dir ;; esac
     exe=$gdir/$prog
     g=$out/$slug
@@ -127,11 +131,33 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     find "$ov" -type f -size -256k -print0 | while IFS= read -r -d '' f; do cp -p "$f" "$f.gexcp" && mv "$f.gexcp" "$f"; done
     exe=$ov/$prog
     env=(GEX_PPM_EVERY=$every)
-    if [ "$input" != - ] && [ -n "$input" ]; then
+    if [ "$input" != - ] && [ -n "$input" ] && [[ $kind == linux* ]]; then
+        # Linux games: the compositor's scripted input (GEX_WL_INPUT, timed
+        # in seconds from a frame).
+        env+=("GEX_WL_INPUT=$here/$input")
+    elif [ "$input" != - ] && [ -n "$input" ]; then
         env+=("GEX_NT_INPUT=$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$here/$input" | tr -d ' ' | paste -sd';')")
     fi
     # shellcheck disable=SC2206
-    run=("$gexc" run "${flags[@]}" $extra --gl --wayland-out "$g/frames/f")
+    # `seed=DIR@GUEST` in the extra flags: a fresh copy of tests/games/DIR
+    # mounted at GUEST (`~` is the user's home), so a game that keeps state
+    # in a fixed place (Baba Is You's ~/.local/share/Baba_Is_You, found with
+    # getpwuid rather than $HOME) starts from known settings and never
+    # writes the real home.
+    gflags=()
+    nseed=0
+    for x in $extra; do
+        case $x in
+        seed=*@*)
+            src=${x#seed=}; src=${src%@*}; dst=${x#*@}
+            case $dst in "~"*) dst=$HOME${dst#"~"} ;; esac
+            sd=$state/seed-$slug/$nseed; nseed=$((nseed + 1))
+            rm -rf "$sd"; mkdir -p "$sd"; cp -r "$here/$src/." "$sd/"
+            gflags+=(--bind "$sd=$dst") ;;
+        *) gflags+=("$x") ;;
+        esac
+    done
+    run=("$gexc" run "${flags[@]}" "${gflags[@]}" --gl --wayland-out "$g/frames/f")
     for e in ${GAME_ENV:-}; do run+=(--env "$e"); done
     pre=()
     if [[ $kind == linux* ]]; then
@@ -159,6 +185,8 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             # pair from an earlier run would look like a running server.
             rm -f "/tmp/.X$xn-lock" "/tmp/.X11-unix/X$xn"
             pre=(/bin/sh "$here/xwayland-inguest.sh" "$xn" "$g/xwayland.log")
+            # Xwayland's keymap compiles cached (xkbcomp-cache.sh).
+            run+=(--bind "$here/xkbcomp-cache.sh=/usr/bin/xkbcomp" --bind "/usr/bin/xkbcomp=/usr/bin/xkbcomp.real")
         fi
     else
         # gex-steam's steam_api[64].dll in place of the game's when
@@ -186,7 +214,8 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
     # shellcheck disable=SC2206
     argv=($args)
     t0=$(date +%s)
-    (cd "$(dirname "$exe")" && exec env "${env[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "./$(basename "$exe")" "${argv[@]}") \
+    if [ $fromroot = 1 ]; then cwd=$ov rel=./$prog; else cwd=$(dirname "$exe") rel=./$(basename "$exe"); fi
+    (cd "$cwd" && exec env "${env[@]}" timeout -k 20 "$limit" nice -n 10 "${run[@]}" "${pre[@]}" "$rel" "${argv[@]}") \
         > "$g/log" 2>&1 &
     pid=$!
     first=

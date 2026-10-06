@@ -199,6 +199,13 @@ impl MemoryMap {
         self.generation
     }
 
+    /// The mapping holding `addr`, if any.
+    pub fn vma_at(&self, addr: u64) -> Option<&Vma> {
+        // Sorted by start and disjoint: the last one starting at or below.
+        let i = self.vmas.partition_point(|v| v.start <= addr);
+        self.vmas[..i].last().filter(|v| addr < v.end)
+    }
+
     pub fn vmas(&self) -> &[Vma] {
         &self.vmas
     }
@@ -1096,6 +1103,23 @@ mod tests {
         assert!(b < a, "expected top-down allocation, got {a:x} then {b:x}");
         assert!(a + 0x1000 <= MMAP_TOP);
         assert_eq!(a % PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn vma_at_finds_the_mapping_holding_an_address() {
+        let mut m = MemoryMap::new(0x40_1000);
+        let a = m.mmap(0, 0x4000, prot::READ, flags::ANONYMOUS, "x").unwrap();
+        m.unmap(a + 0x1000, 0x1000).unwrap();
+        for addr in [a, a + 0xfff, a + 0x2000, a + 0x3fff] {
+            assert_eq!(m.vma_at(addr).map(|v| v.name.as_str()), Some("x"), "{addr:#x}");
+        }
+        for addr in [a + 0x1000, a + 0x1fff, a + 0x4000, 0] {
+            assert!(m.vma_at(addr).is_none_or(|v| v.name != "x"), "{addr:#x}");
+        }
+        for addr in [0u64, 0x1000, a, a + 0x1800, a + 0x3000, MMAP_TOP - 1] {
+            let want = m.vmas().iter().find(|v| v.start <= addr && addr < v.end).map(|v| v.start);
+            assert_eq!(m.vma_at(addr).map(|v| v.start), want, "{addr:#x}");
+        }
     }
 
     #[test]

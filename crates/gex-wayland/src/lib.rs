@@ -2069,6 +2069,29 @@ impl Client {
 
     /// Whether input can be delivered: the client has a pointer and a
     /// keyboard, and a surface to give them to.
+    /// Give the keyboard to a window when none has it.
+    ///
+    /// Focus follows the last surface that committed a buffer, and a window
+    /// whose pixels are all the host's GL never commits one: an X11 GL game
+    /// (Baba Is You) drew for minutes and scripted keys had nowhere to go.
+    /// The newest toplevel -- an `xdg_toplevel`, or an X11 window -- takes
+    /// focus then.
+    pub fn focus_fallback(&mut self) {
+        if self.pointer_target.or(self.focus_surface).is_some() {
+            return;
+        }
+        let pick = self
+            .surfaces
+            .iter()
+            .filter(|(_, s)| s.x11 || matches!(s.role, Role::Toplevel))
+            .map(|(id, _)| *id)
+            .max();
+        if let Some(id) = pick {
+            self.focus_surface = Some(id);
+            self.ensure_keyboard_enter();
+        }
+    }
+
     pub fn input_ready(&self) -> bool {
         self.pointer.is_some() && self.keyboard.is_some() && self.pointer_target.or(self.focus_surface).is_some()
     }
@@ -2574,6 +2597,32 @@ mod tests {
         assert_eq!(r.uint(), Some(300), "time");
         assert_eq!(r.uint(), Some(30), "key");
         assert_eq!(r.uint(), Some(1), "pressed");
+    }
+
+    /// A window that never commits a buffer (its pixels are the host's GL)
+    /// gets the keyboard from `focus_fallback`, so scripted keys reach it.
+    #[test]
+    fn a_window_that_never_draws_gets_the_keyboard_by_default() {
+        let pool = no_pool();
+        let mut c = Client::new();
+        let mut go = |c: &mut Client, bytes: Vec<u8>| c.receive(&bytes, &[], &pool);
+        go(&mut c, Writer::new(1, 1).new_id(2).finish());
+        go(&mut c, Writer::new(2, 0).uint(1).string("wl_compositor").uint(4).new_id(3).finish());
+        go(&mut c, Writer::new(2, 0).uint(5).string("xdg_wm_base").uint(3).new_id(5).finish());
+        go(&mut c, Writer::new(3, 0).new_id(6).finish());
+        go(&mut c, Writer::new(5, 2).new_id(7).object(6).finish());
+        go(&mut c, Writer::new(7, 1).new_id(8).finish());
+        go(&mut c, Writer::new(2, 0).uint(3).string("wl_seat").uint(5).new_id(12).finish());
+        go(&mut c, Writer::new(12, 0).new_id(13).finish()); // get_pointer
+        go(&mut c, Writer::new(12, 1).new_id(14).finish()); // get_keyboard
+        let _ = c.take_outgoing();
+        assert!(!c.input_ready(), "no window has drawn, so none has focus");
+        c.focus_fallback();
+        assert!(c.input_ready(), "the toplevel takes focus");
+        c.keyboard_key(28, true, 10);
+        let msgs = messages(&c.take_outgoing());
+        assert!(msgs.iter().any(|(o, op, _)| *o == 14 && *op == 1), "keyboard enter");
+        assert!(msgs.iter().any(|(o, op, _)| *o == 14 && *op == 3), "the key");
     }
 
     #[test]

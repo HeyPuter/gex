@@ -136,6 +136,9 @@ for arch in x64 x86; do
     check_gl $arch/glfast 0 "$allok" "$b/glfast.exe"
     # A callee reading the ZF its caller set (MSVC's debug stack check).
     check $arch/zfcall 0 "$allok" "$b/zfcall.exe"
+    # Inlined leaves (gex-cgen inline_leaf_calls) that return elsewhere
+    # than their call's continuation: the copy's mismatch exit.
+    check $arch/retskip 0 "$allok" "$b/retskip.exe"
     # A window that paints and runs a message loop (tests/nt/browser-gui.mjs shows it).
     check $arch/window 0 "shown${nl}bye" "$b/window.exe" 0
     # Code written, rewritten and reallocated at run time (a JIT).

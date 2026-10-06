@@ -471,6 +471,85 @@ LINUX_LIBS); Baba Is You gets past Steam (gex-steam Linux) and D-Bus
 autolaunch, creates its GL window, no frame yet. Input for Linux games
 needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
 
+### Linux builds: scripted input, Steam, X11 (2026-10-06)
+
+- Input: `GEX_WL_INPUT` (master), timed in seconds from the Nth frame;
+  matrix.sh passes a Linux game's input file (`*.wl`) as it.
+  tests/games/retrocycles-linux.wl takes Retrocycles through its language
+  menu and First Setup to the welcome screen. With `frames 1` the clock
+  started on Xwayland's first frame, long before the game's menu.
+- Steam: gex-steam for Linux (`guest/steam/build.sh OUT clang++ [-m32]`;
+  GCC 12 lacks `-nostdlib++`), swapped in by matrix.sh with
+  GEX_STEAM_LINUX64. Smoke test: tests/games/steam-smoke.sh (i386 and
+  x86-64, on the host).
+- X11: Baba Is You's static SDL2 has no Wayland, and SDL 1.2 has none, so
+  both run as `linux-x11` on Xwayland inside the guest. Xwayland runs
+  xkbcomp (translated) to compile its keymap, which takes minutes on a
+  loaded gooner; X clients wait for it.
+- Baba Is You (Chowdren) needed: gex-steam with an older stats interface
+  (STEAMUSERSTATS 012), no D-Bus autolaunch (libdbus ran dbus-launch, which
+  waited on the display), `--lazy` (eager translation of the 9 MB
+  executable is 216 MB of wasm). It creates its GL window and stops after
+  its renderer string, waiting on an X reply.
+- Retrocycles (Linux): **gameplay natively** (language menu, First Setup,
+  welcome, matches; tests/games/retrocycles-linux.wl, menu 650, gameplay
+  6000). gexc had died of SIGSEGV in the host's Mesa when the first match
+  started: the native GL host passed a glDrawElements' client-side index
+  pointer (guest memory) to the host's GL as an offset. Fixed in gex-gl's
+  native host (b7556e59, with a test).
+- In the page (tests/games/browser-linux.mjs, hostx=1): Retrocycles starts,
+  its X windows appear and Mesa draws (hundreds of thousands of draws), but
+  the canvas stays black: a GLX window's frames on an X11 window do not
+  reach the page's compositor yet (Half-Life's GL is on a Wayland surface;
+  only its CEF uses X). Next: how the page shows a GL surface made for an X
+  window (gexgl eglCreateWindowSurface with an X window id under hostx).
+- Baba Is You: from its game directory (`@bin64/Chowdren`) it finds its
+  assets. It requires six GL extensions by name and showed "OpenGL
+  extension 'GL_ARB_shader_objects' not supported." in an SDL message box
+  (a forked child whose X font request failed, so it only hung; the line
+  `Renderer: R - V - ` is meant to end empty). The guest GL withheld the
+  extension for one missing command, glDeleteObjectARB; with it Baba
+  renders its intro screens. Run fullscreen (its default), the frames are
+  cropped: SDL believes the window is the screen's size while the GL
+  drawable keeps the window's 854x480 (no X window manager in the guest to
+  carry the fullscreen request). It keeps its settings in
+  ~/.local/share/Baba_Is_You from getpwuid(), not $HOME.
+- Xwayland in the guest: `gexc run --bind` puts tests/games/xkbcomp-cache.sh
+  over /usr/bin/xkbcomp (matrix.sh does it for linux-x11 games), so the
+  keymap is compiled once (/tmp/gex-xkm-cache-UID) and later runs copy it.
+- GLX: contexts are what glXCreateContextAttribsARB asked for
+  (tests/games/glx-context.sh: 3.2 core, 2.1 compatibility, ES 2.0 after
+  SDL's throwaway context).
+- The page, resolved (2026-10-06): Retrocycles renders in the page,
+  windowed and fullscreen (work/games/screens/retrocycles-linux-language-browser.png).
+  The black canvas was SDL 1.2's fullscreen: it maps an override-redirect
+  window over the screen and reparents its GL window into it, so the
+  unpainted window covered the one the frames were attached to. The guest
+  GL now attaches to the top-level window and follows reparenting
+  (tests/games/src/glx-quad.c shows it in the page). A correctness run on
+  edger's GPU (one run, no timing) showed the compositor repainting
+  normally, so there was no starvation; on gooner's SwiftShader the GL
+  bridge still times out after a screen change (a batch over 30 s).
+- Baba Is You's settings: matrix.txt's `seed=seed/baba@~/.local/share/Baba_Is_You`
+  mounts a fresh copy of tests/games/seed/baba (fullscreen=0) there for each
+  run; nothing reaches the real home. Scripted keys now reach it
+  (focus_fallback). Under the JIT tier with --lazy it presented about 560
+  frames in 40 minutes; under --fjit (GEX_FJIT_CACHE=1) about 2,700 in 25
+  minutes on the first run and far more once cached. Even so it stays on
+  its intro screen whatever it is sent (pointer over the window, a click,
+  Enter, Space): the next question is what that screen waits for, not
+  speed.
+- Earlier, the page (browser-linux.mjs; own ports 5291/9431): Retrocycles' GL
+  frames were attached to SDL 1.2's child window, which no compositor
+  window has; they now name its top-level window. The run still shows
+  black: Mesa keeps drawing (about 25 draws a second under SwiftShader on
+  a loaded gooner, immediate-mode draws, each with its own buffer map),
+  the compositor worker that hosts Mesa repaints only a handful of frames
+  (its animation loop does not get a turn while the GL ring is served), and
+  after a screen change one batch takes over the bridge's 30 s limit. Next
+  steps: a real GPU (edger) to separate slowness from the compositor
+  starving, and letting the compositor repaint between GL batches.
+
 ### Resume (stream G)
 
 Gate branch merge/games2-gate (PE loader fixes, gex-steam for Windows,
