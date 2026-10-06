@@ -78,9 +78,26 @@ public static class GexProbe
         }
     }
 
+    // GEXPROBE_INPUT=1: what the legacy Input API sees, every frame it changes: keys down
+    // (Input.inputString, anyKeyDown), mouse buttons, the pointer position.
+    static Vector3 lastMouse = new Vector3(-1, -1, 0);
+    static void InputLog()
+    {
+        if (Environment.GetEnvironmentVariable("GEXPROBE_INPUT") != "1") return;
+        var m = Input.mousePosition;
+        string b = "";
+        for (int i = 0; i < 3; i++) if (Input.GetMouseButtonDown(i)) b += $" down{i}";
+        foreach (KeyCode k in new[] { KeyCode.Return, KeyCode.Z, KeyCode.X, KeyCode.RightArrow, KeyCode.LeftArrow, KeyCode.UpArrow, KeyCode.DownArrow, KeyCode.Escape })
+            if (Input.GetKeyDown(k)) b += " key " + k;
+        if (b != "" || Input.anyKeyDown || Input.inputString.Length > 0 || (m - lastMouse).sqrMagnitude > 0.5f)
+            Console.Error.WriteLine($"[gexprobe] input frame {Time.frameCount} mouse {m.x:F0},{m.y:F0}{b} anyKeyDown {Input.anyKeyDown} string '{Input.inputString}'");
+        lastMouse = m;
+    }
+
     static void Tick()
     {
         updates++;
+        InputLog();
         float now = Time.realtimeSinceStartup;
         if (now < next) return;
         next = now + (Environment.GetEnvironmentVariable("GEXPROBE_EVERY") is string ev && float.TryParse(ev, out var evs) ? evs : 5f);
