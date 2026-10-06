@@ -2132,6 +2132,19 @@ impl Kernel {
                 self.retry_transfer = Some((n, a));
                 Some(BlockOp::AcceptWait { socket: Arc::clone(&file.handle) })
             }
+            // `recvfrom` (and `recv`) on an empty blocking socket waits for
+            // it to be readable, then reads under the lock, as `recvmsg`
+            // does (by `retry_transfer`). It had answered EAGAIN.
+            nr::RECVFROM => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if a[3] & Self::MSG_DONTWAIT != 0 || !file.would_block() {
+                    return None;
+                }
+                self.retry_transfer = Some((n, a));
+                Some(BlockOp::AcceptWait {
+                    socket: Arc::clone(&file.handle),
+                })
+            }
             nr::RECVMSG => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 // A non-blocking socket, one with data, or a call that asked
@@ -3232,6 +3245,9 @@ impl Kernel {
     fn transfer_syscall(&mut self, m: &mut GuestMem<'_>, n: u64, a: &[u64; 6]) -> SysResult {
         match n {
             nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
+            // A blocking `recvfrom`/`recv` that waited for a datagram or
+            // bytes (the classifier below).
+            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
             nr::COPY_FILE_RANGE => self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
             _ => self.sys_splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
         }
@@ -5250,6 +5266,7 @@ impl Kernel {
             _ => return Err(Errno::EPROTONOSUPPORT),
         };
         let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver), Arc::clone(&self.ports), self.unix_remote));
+        sock.set_self();
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 {
             crate::fs::oflags::O_NONBLOCK
@@ -5828,7 +5845,9 @@ impl Kernel {
         let n = self.fds.get(fd)?.read(&mut tmp)?;
         m.write(buf, &tmp[..n as usize])?;
         if addr != 0 {
-            let peer = self.socket_of(fd).ok().and_then(|s| s.peer());
+            // Where the datagram came from (a guest's port, the resolver),
+            // else the connected peer.
+            let peer = self.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
             let (ip, port) = peer.unwrap_or((0, 0));
             self.sys_write_sockaddr(m, ip, port, addr, addrlen)?;
         }

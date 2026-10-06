@@ -298,6 +298,8 @@ fn tcp_name(port: u16) -> String {
 #[derive(Debug, Default)]
 pub struct Ports {
     listeners: Mutex<HashMap<u16, std::sync::Weak<Socket>>>,
+    /// Bound UDP sockets, by port: where a datagram to the loopback goes.
+    udp: Mutex<HashMap<u16, std::sync::Weak<Socket>>>,
     next_ephemeral: AtomicU32,
 }
 
@@ -323,6 +325,20 @@ impl Ports {
 
     fn listener(&self, port: u16) -> Option<Arc<Socket>> {
         self.listeners.lock().unwrap().get(&port).and_then(|w| w.upgrade())
+    }
+
+    fn udp_at(&self, port: u16) -> Option<Arc<Socket>> {
+        self.udp.lock().unwrap().get(&port).and_then(|w| w.upgrade())
+    }
+
+    /// A UDP port nothing is bound to.
+    fn udp_ephemeral(&self) -> u16 {
+        loop {
+            let p = self.ephemeral();
+            if self.udp_at(p).is_none() {
+                return p;
+            }
+        }
     }
 }
 
@@ -350,8 +366,13 @@ pub struct Socket {
     transport: Mutex<Option<Arc<dyn Transport>>>,
     /// Where `connect` pointed, for `getpeername`.
     peer: Mutex<Option<(u32, u16)>>,
-    /// Datagrams waiting to be read. Only the resolver puts anything here.
-    dgrams: Mutex<VecDeque<Vec<u8>>>,
+    /// Datagrams waiting to be read, with where each came from: the
+    /// resolver's answers, and datagrams from guests on this machine.
+    dgrams: Mutex<VecDeque<(Vec<u8>, (u32, u16))>>,
+    /// Where the last datagram read came from, for `recvfrom`.
+    last_from: Mutex<Option<(u32, u16)>>,
+    /// This socket, for registering itself (a UDP port's table entry).
+    me: Mutex<std::sync::Weak<Socket>>,
     nonblocking: AtomicBool,
     /// The machine's listening ports.
     ports: Arc<Ports>,
@@ -378,6 +399,8 @@ impl Socket {
             transport: Mutex::new(None),
             peer: Mutex::new(None),
             dgrams: Mutex::new(VecDeque::new()),
+            last_from: Mutex::new(None),
+            me: Mutex::new(std::sync::Weak::new()),
             nonblocking: AtomicBool::new(false),
             ports,
             local: Mutex::new(None),
@@ -387,12 +410,42 @@ impl Socket {
         }
     }
 
+    /// Remember the `Arc` this socket lives in (made right after `new`).
+    pub fn set_self(self: &Arc<Self>) {
+        *self.me.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    /// Where the last datagram read came from.
+    pub fn last_from(&self) -> Option<(u32, u16)> {
+        *self.last_from.lock().unwrap()
+    }
+
+    /// Give this UDP socket a port (`bind`, or the first send unbound),
+    /// registered so guests here can send to it.
+    fn udp_take(&self, addr: u32, mut port: u16) -> Result<(), Errno> {
+        let mut udp = self.ports.udp.lock().unwrap();
+        if port == 0 {
+            drop(udp);
+            port = self.ports.udp_ephemeral();
+            udp = self.ports.udp.lock().unwrap();
+        }
+        if udp.get(&port).is_some_and(|w| w.strong_count() > 0) {
+            return Err(Errno::EADDRINUSE);
+        }
+        udp.insert(port, self.me.lock().unwrap().clone());
+        *self.local.lock().unwrap() = Some((addr, port));
+        Ok(())
+    }
+
     /// `bind`: where this socket is. A port another listener holds is
     /// `EADDRINUSE` (SO_REUSEADDR is not modelled: a listener that went away
     /// frees its port at once).
     pub fn bind(&self, addr: u32, port: u16) -> Result<(), Errno> {
         if self.local.lock().unwrap().is_some() {
             return Err(Errno::EINVAL);
+        }
+        if self.kind == Kind::Udp {
+            return self.udp_take(addr, port);
         }
         // (In a page the global kernel answers at `listen`: its name table
         // keeps a closed listener's name until the name is bound again.)
@@ -484,7 +537,9 @@ impl Socket {
         *s.transport.lock().unwrap() = Some(t);
         *s.peer.lock().unwrap() = Some((0x7f00_0001, from));
         *s.local.lock().unwrap() = Some((0x7f00_0001, self.local().1));
-        Ok(Arc::new(s))
+        let s = Arc::new(s);
+        s.set_self();
+        Ok(s)
     }
 
     /// A connection to a port a guest on this machine listens on: both ends
@@ -572,11 +627,24 @@ impl Socket {
         }
     }
 
-    /// A datagram to the resolver: answer it and queue the reply.
+    /// A datagram: to a guest on this machine bound to the port it is for,
+    /// else to the resolver, which answers it and queues the reply.
     pub fn send_dgram(&self, data: &[u8]) -> SysResult {
+        let to = self.peer();
+        if let Some((addr, port)) = to.filter(|&(a, _)| is_local(a)) {
+            if let Some(dest) = self.ports.udp_at(port) {
+                if self.local.lock().unwrap().is_none() {
+                    self.udp_take(0, 0)?;
+                }
+                let from = (0x7f00_0001, self.local().1);
+                let _ = addr;
+                dest.dgrams.lock().unwrap().push_back((data.to_vec(), from));
+                return Ok(data.len() as u64);
+            }
+        }
         match answer_dns(data, &self.resolver) {
             Some(reply) => {
-                self.dgrams.lock().unwrap().push_back(reply);
+                self.dgrams.lock().unwrap().push_back((reply, to.unwrap_or((0, 0))));
                 Ok(data.len() as u64)
             }
             // Not a question this can answer. Accepting it and never
@@ -588,9 +656,10 @@ impl Socket {
 
     pub fn recv_dgram(&self, buf: &mut [u8]) -> SysResult {
         match self.dgrams.lock().unwrap().pop_front() {
-            Some(d) => {
+            Some((d, from)) => {
                 let n = buf.len().min(d.len());
                 buf[..n].copy_from_slice(&d[..n]);
+                *self.last_from.lock().unwrap() = Some(from);
                 Ok(n as u64)
             }
             None => Err(Errno::EAGAIN),
@@ -667,7 +736,7 @@ impl FileHandle for Socket {
                     .lock()
                     .unwrap()
                     .front()
-                    .map_or(0, |d| d.len() as u64),
+                    .map_or(0, |d| d.0.len() as u64),
             );
         }
         Some(
@@ -722,6 +791,15 @@ impl Drop for Socket {
         }
         if let (Some(id), Some(r)) = (self.remote_listener.lock().unwrap().take(), self.remote) {
             (r.close)(id);
+        }
+        // A UDP socket gives its port back.
+        if self.kind == Kind::Udp {
+            if let Some((_, port)) = *self.local.lock().unwrap() {
+                let mut udp = self.ports.udp.lock().unwrap();
+                if udp.get(&port).is_some_and(|w| w.strong_count() == 0) {
+                    udp.remove(&port);
+                }
+            }
         }
         // A listener gives its port back, and the connections nobody
         // accepted see their peer gone.
