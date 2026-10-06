@@ -823,6 +823,51 @@ Native Wine runs inside the guest thread, as Windows' DLLs do:
 Today's path keeps working throughout. Programs switch per process
 (`--wine native`) until W6.
 
+### 4.0 W3 plan (2026-10-06, the user's order: W3 before W7)
+
+**Goal:** i386 Windows games on Wine's own Unix side, natively and in the
+page, with no NT layer: ntdll.so, wineserver, win32u.so, a display
+driver, opengl32 through gex-gl, and a real registry (`system.reg`,
+`user.reg`) written by `wineboot`. Today's native path (W2) is Wine's PE
+side as native wasm over gex-kernel's NT layer: every NT system call, the
+registry (synthesized), windows and hooks (the NT layer's win32u calls)
+and GL (the NT layer's command ring) are still the NT layer's, which is
+where G's findings come from.
+
+**Acceptance cases** (G runs them on copies of the W prefix and sends
+repros):
+1. **Retrocycles:** `CoCreateInstance(CLSID_DirectSound)` succeeds (the
+   class is registered by `wineboot`'s own registration), and GL texture
+   uploads over 8 MiB work (no command ring: opengl32.so calls gex-gl).
+2. **Katana ZERO:** `SetWindowsHookEx` (win32u.so's real hooks), then to
+   its menu by keyboard.
+3. **Undertale** to gameplay, as G's script drives it today.
+Plus the standing gates: tests/nt on the new path, W's checks.
+
+**What exists:** the Unix side nearly compiles for wasm32 already (W1's
+`make -k`): ntdll/unix fails only on `current_machine` and the CPU-feature
+helpers (`system.c`); wineserver ran in W0(a) as a wasm32 program; ws2_32's
+unixlib ran through the dlopen registry (§3.12).
+
+**Steps** (agent time):
+
+| step | work | done when | estimate |
+|---|---|---|---|
+| W3.0 process shape | Decide and spike how a Wine process runs: (A) the wasm32 `wine` loader is the process (a wasmprog) and runs x86 code through a gex `simulate(ctx)` import (Wine's BTCpu contract, as FEX/Box64), x86 faults reaching ntdll.so's handlers as signals to a wasm32 program; or (B) keep today's x86 NT boot and send the PE side's system calls to ntdll.so linked into the process, its Linux calls through the wasm32 ABI. A retires the NT boot itself; B reuses more of W2. Expected: A. | hello.exe's first NT call reaches ntdll.so on the chosen shape | 1–2 d |
+| W3.1 ntdll.so | `current_machine`, CPU features, `signal_wasm32.c` (Unix side: the syscall dispatcher as a direct call, contexts from gex's, user callbacks nested, APCs, exceptions from gex faults), `virtual.c` on gex-kernel's mmap (PE images mapped executable, so gex sees the code), threads (pthread plus a guest context), process start through Wine's loader; wineserver in process (`clone(CLONE_VM)` without `CLONE_FILES`, §3.5) | tests/nt hello, sync, tls, seh, apc, cxx on the new path (`--wine unix`) | 5–7 d |
+| W3.2 prefix and registry | `wineboot --init` natively: setupapi, rundll32, regsvr32 and the builtin DLLs' self-registration, writing `system.reg`/`user.reg` through wineserver | Retrocycles' dsound class registered; a prefix made from nothing | 1–2 d |
+| W3.3 windows and input | win32u.so plus a display driver: winewayland.drv to gex's compositor (libwayland-client and libxkbcommon built for wasm32), or a small gex driver if that is cheaper | tests/nt's GUI tests; Katana ZERO's hooks and menu | 4–6 d |
+| W3.4 GL | opengl32.so through winewayland's EGL to gex-gl (natively the host GL, in the page Mesa wink); wined3d native | Retrocycles' uploads over 8 MiB; Undertale's GL | 2–3 d |
+| W3.5 audio, sockets, crypto | a gex audio driver behind winmm/dsound (Web Audio in the page; first a null device so games start), ws2_32 and crypt32/secur32 unixlibs | Undertale to gameplay with sound | 2–3 d |
+| W3.6 sync | ntsync in gex-kernel (`/dev/ntsync` on the futex machinery), so waits never reach wineserver | job-heavy games (Noita) no slower than W2 | 2–3 d |
+| W3.7 page | the same in the page: wineserver's thread in a Worker, the Unix side's modules per Worker | Retrocycles, Katana ZERO and Undertale in the page | 3–5 d |
+
+**Total:** about 20–31 agent days, against the 5–8 W3 was given before
+W2 showed what stays on the NT layer. Order: W3.0 → W3.1 → W3.2 (closes
+Retrocycles' dsound) → W3.3 (Katana ZERO) → W3.4 (Retrocycles' GL) → W3.5
+(Undertale) → W3.6 → W3.7. Each step lands on its own (`--wine unix` is
+opt-in until W6 retires the NT layer).
+
 ### 4.1 W0 results
 
 **(a) wineserver and a Unix library on gex-kernel: works natively.**
