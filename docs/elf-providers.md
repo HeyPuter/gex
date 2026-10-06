@@ -1,6 +1,12 @@
 # ELF export providers (stream W, merge/elf-prov)
 
-Status: design, 2026-10-05. Nothing built yet. The goal is set by
+Status (2026-10-05 night): the binding is built natively
+(`shims/native/src/elfprov.rs`) and in the browser
+(`shims/browser/src/cgen/elfprov.rs`); glibc's mem*/str* (`glibc_mem.c`) and
+string printf family (`glibc_printf.c`) are provided; the heap
+(`glibc_malloc.c`) is written and conformant but not registered (no
+faster, §6). Conformance: `tests/elf-prov/run.sh` (native) and
+`run-browser.sh`. The goal is set by
 docs/merge-plan.md §10.1: translated Linux programs eventually get the
 **whole** libc (libc, libm, libpthread) as native wasm, built by gexcc and
 linked into the program's link group. Until gexcc can build glibc, ELF export
@@ -140,6 +146,27 @@ Linux program.
 The order is set by the measured share of guest work (§6): mem*/str*, then
 malloc as a group, then libm, then whatever else the profile shows.
 
+As built:
+- **IFUNCs** need no generated resolvers: the resolver's address is bound
+  to `gexp__ifunc` (`GEX_ELF_IFUNC`), which returns the resolver's address
+  plus one, and that address is bound to the provided function. Nothing is
+  written into guest memory.
+- **glibc_mem** (stateless): memcpy, memmove, mempcpy, memset, memcmp, bcmp,
+  __memcmpeq, memchr, strlen, strchr, strcmp. memcmp is compared by sign:
+  glibc's own variants disagree on its magnitude.
+- **glibc_printf** (stateful): snprintf, vsnprintf, sprintf, vsprintf, on
+  musl's printf core with exact double conversion; what it cannot match
+  (positional arguments, %m, wide, %a, %L, %#g, a non-"." decimal point,
+  errors) goes to the library's `__vsnprintf_chk`/`__vsprintf_chk`, found
+  by name in the mapped image. The `_chk` and FILE-based forms stay
+  translated.
+- **glibc_malloc** (stateful, a GEX_GROUP): conformant, not registered.
+- Bindings outlive an unmapping (a forked child shares the table, and its
+  parent's GOT holds resolver+1 addresses); an object mapped over them
+  takes them back. In the browser a forked child binds what it inherited
+  before it runs, and a provided address whose slot lost its bridge is
+  re-bridged on its miss.
+
 ## 6. Measurements
 
 **Warfork dedicated server, x86-64, 6 bots in deathmatch (gooner, native
@@ -165,6 +192,16 @@ profiles in `scratch/W/elf/wf420`, `wf1020`):
 - Muck (Unity, `-batchmode -nographics`, `--mem64`): no profile yet. The
   run doesn't exit on SIGINT or SIGTERM, so `--record` writes nothing.
   Loading took 175-205 s; it needs a clean exit or a periodic profile dump.
+
+**Microbenchmark, providers off against on** (`scratch/W/bench-mem/mb.c`
+under run-node, i.e. V8 as in a page, worldmachine, 12 ABBA pairs,
+medians, 2026-10-05; not a page run, and not a game):
+- mem*/str* loop: 1.86x faster with providers (87 against 162 ms);
+- snprintf loop: 2.34x faster (339 against 792 ms);
+- malloc/free loop: no faster (177 against 175 ms), so glibc_malloc stays
+  unregistered.
+If Warfork's libc share (§6) sped up alike, its guest work would drop by
+about 6% (an estimate from the profile, not a measurement).
 
 Found on the way:
 - `select` on a stdin pipe was always "readable" natively, so Warfork's
