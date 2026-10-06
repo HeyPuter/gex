@@ -86,9 +86,9 @@ pub(crate) fn install(
 /// install, where its data is, its slots by name and its data exports'
 /// offsets.
 pub(crate) struct WinePe {
-    install: u32,
+    pub(crate) install: u32,
     data: u64,
-    slots: std::collections::HashMap<String, u32>,
+    pub(crate) slots: std::collections::HashMap<String, u32>,
     /// `gexp_<export>` slots by export name, whichever DLL owns them: a
     /// DLL's `-import` re-exports are served by the owner's adapter.
     any_dll: std::collections::HashMap<String, u32>,

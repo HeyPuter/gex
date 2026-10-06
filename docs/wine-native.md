@@ -1096,6 +1096,41 @@ unixlib ran through the dlopen registry (§3.12).
      into both linear memories; the browser has no equivalent short of
      one memory for several processes). (a) works in the browser too.
 
+#### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
+
+Every change is behind `__wasm32__` (or only built for it). What, why, and
+what would let it go:
+
+| patch | why | dropped when |
+|---|---|---|
+| ntdll/unix `signal_wasm32.c` (new file) and `current_machine`/CPUID | the per-CPU port: gex in place of signal contexts and assembly | never (it is the port) |
+| ntdll.so's dir is the loader's; no re-exec; `wineloader` is itself | one closed-world program, no preloader | never |
+| `gex.image_mapped` from virtual.c | native DLL skeletons bound when ntdll.so maps them | gex learns image maps another way (unlikely) |
+| kernel stacks top-down | gex's dispatch directory sits under 0x400000 | gex moves its directory |
+| thread entry at pthread's type; SIGCHLD not taken by the server; no fork in the server | wasm traps on a mistyped indirect call; in-process server | never / with the in-process server |
+| wineserver as a thread (`server/wasm32_inproc.h`, `start_server`, `wineserver_exit`, `unshare(CLONE_FS)`), USD at 0x7ffe0000, one 16 MiB session block, registry flush at exit | §3.5: shared memory must be one memory | cross-process coherent shared memory (below) |
+| faults as i386 reports them; SIGUSR1/QUIT/INT handlers; unblock at thread start | signals and faults through gex hooks | never (port) |
+| Unix side on its own stack; Unix calls keep guest registers | wasm32 syscalls use the guest context's registers | never (port) |
+| NtFlushInstructionCache → `gex.code_changed` | gex translates code | never |
+| Unix calls from i386 code through the trampoline; wasm callers direct (gexrt) | one pointer serves both | never |
+| programs in the one module (winegcc r.o, winebuild exe entry, CRT table markers); crt_main/crt_wmain call clang's main | native programs | upstream wasm32 support (never) |
+| native modules' imports loaded (ntdll/loader.c `fixup_imports`) | skeletons have no import table | skeletons that carry real import tables (winebuild) |
+| child processes by clone, not fork | asyncify fork cannot cross gex's frames | never under W3 |
+| RtlCreateUserThread wraps a native void entry | every entry is called as LPTHREAD_START_ROUTINE | never |
+| win32u DllMain always loads win32u.so | one module: the dispatcher variable is ntdll's | separate win32u module (no) |
+| user callbacks return through gex's pad | gex watches call-out returns by dispatch slot | never (port) |
+| **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
+| **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
+
+**Future option for the last two (and the server's 16 MiB block)**, not
+built: a SharedArrayBuffer-backed extra memory (wasm multi-memory) holding
+the session objects, which Wine's Unix side reaches only through its
+shared-object read/write macros (`memory.copy` between memories). It would
+be coherent across processes natively and in the browser (every process
+imports the same extra memory), so explorer could run as its own process
+and win32u could map the session normally. Decided later, as a gex-wide
+question (it touches fork and more than Wine).
+
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
 

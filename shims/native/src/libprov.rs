@@ -470,6 +470,21 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         });
         gex_kernel::note_code_change();
     })?;
+    // The function-table index of a named function of Wine's PE module
+    // (W3.3: win32u.so starts explorer's desktop thread by
+    // `explorer.exe!gexp_desktop_thread`); 0 when there is none.
+    linker.func_wrap(IMPORT_MODULE, "wine_pe_slot", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+        let Some(m) = caller.data().memory.as_ref() else { return 0 };
+        let Some(b) = m.bytes().get(ptr as u32 as usize..(ptr as u32 as usize).saturating_add(len as u32 as usize)) else { return 0 };
+        let name = String::from_utf8_lossy(b).into_owned();
+        let Some(jit) = caller.data().jit.as_ref() else { return 0 };
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(wp) = sh.wine_pe.as_ref() else { return 0 };
+        match wp.slots.get(&name) {
+            Some(&k) => (sh.ftab.map.install(wp.install).base + k) as i32,
+            None => 0,
+        }
+    })?;
     // A native wasm32 program's signal hook (W3.1, `crate::SIGNAL_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "signal_hook", |caller: Caller<'_, HostState>, idx: i32| {
         crate::set_signal_hook(caller.data(), idx as u32);
