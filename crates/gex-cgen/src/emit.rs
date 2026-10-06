@@ -86,6 +86,13 @@ pub(crate) fn reg_cty(r: GuestReg, class32: bool) -> &'static str {
     }
 }
 
+/// A register x86 code never names, which function mode uses as a local
+/// only (`FnUnit::inline_leaf_calls` keeps an indirect call's target in it
+/// for the fallback): never dirty, so never written back.
+pub(crate) fn is_scratch(r: GuestReg) -> bool {
+    gex_abi::X86 && r == GuestReg::MonAddr
+}
+
 pub(crate) fn reg_name(r: GuestReg) -> String {
     match r {
         GuestReg::X(n) => format!("r_x{n}"),
@@ -366,7 +373,7 @@ impl<'a> Emitter<'a> {
     fn write_reg(&mut self, r: GuestReg, val: &str) {
         self.declared.insert(r, ());
         self.line(format!("{} = {val};", reg_name(r)));
-        self.regs.insert(r, true);
+        self.regs.insert(r, !is_scratch(r));
     }
 
     /// The registers currently dirty (differ from the context).

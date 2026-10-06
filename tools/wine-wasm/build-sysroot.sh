@@ -38,6 +38,20 @@ if [ -f lib/libc.a ] && [ -n "$(find "$MUSL/arch" "$MUSL/include" "$MUSL/src/int
 fi
 make -s -j"$JOBS" install-headers install-libs >/dev/null
 
+# libgex: what gex's wasm32 programs need beyond the libc and is gex's
+# protocol rather than musl's (docs/wine-native.md §3.11.2): the setjmp
+# runtime, dlopen over the linked registry, signal frames, vfork. wcc links
+# it before libc.
+mkdir -p "$OUT/libgex-build"
+gobjs=
+for f in "$HERE"/libgex/*.c "$HERE"/libgex/*.s; do
+  o="$OUT/libgex-build/$(basename "$f").o"
+  clang $WASM_CFLAGS --sysroot="$OUT/sysroot" -Wall -Wno-unused-command-line-argument -c "$f" -o "$o"
+  gobjs="$gobjs $o"
+done
+rm -f "$OUT/sysroot/lib/libgex.a"
+llvm-ar crs "$OUT/sysroot/lib/libgex.a" $gobjs
+
 # Linux UAPI headers (Wine's Unix side includes linux/*.h). asm/ is the
 # host's x86 set taken down its i386 branches: gex-kernel serves the i386
 # ABI. swab.h keeps its generic C (its i386 branch is inline asm).

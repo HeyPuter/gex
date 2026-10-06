@@ -51,6 +51,8 @@ fn real_main() -> Result<ExitCode> {
         || (argv[1] == "eject" && matches!(argv.get(2).map(String::as_str), Some("build" | "run")));
     let guard = std::env::var("GEX_CGEN_GUARD").as_deref() == Ok("1");
     gex_cgen::image::set_unguarded(native && !guard);
+    // The guest's `select`/`poll` on stdin asks the host's fd 0.
+    let _ = gex_kernel::stdio::STDIN_READY.set(stdin_ready);
     match argv[1].as_str() {
         "run" => {
             // On a thread with a guest-sized stack: the first guest thread
@@ -2435,4 +2437,13 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let out = gex_native::nt_cgen::prepare_pe(&pe, base, jobs, true)?;
     eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// Whether a read of the host's stdin would return now (data or end of
+/// file), for the guest's `select`/`poll` (gex_kernel::stdio::STDIN_READY).
+fn stdin_ready() -> bool {
+    let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd, no timeout.
+    let n = unsafe { libc::poll(&mut p, 1, 0) };
+    n != 0 && (n < 0 || p.revents != 0)
 }
