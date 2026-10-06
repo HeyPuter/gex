@@ -520,7 +520,22 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
 - GLX: contexts are what glXCreateContextAttribsARB asked for
   (tests/games/glx-context.sh: 3.2 core, 2.1 compatibility, ES 2.0 after
   SDL's throwaway context).
-- The page (browser-linux.mjs; own ports 5291/9431): Retrocycles' GL
+- The page, resolved (2026-10-06): Retrocycles renders in the page,
+  windowed and fullscreen (work/games/screens/retrocycles-linux-language-browser.png).
+  The black canvas was SDL 1.2's fullscreen: it maps an override-redirect
+  window over the screen and reparents its GL window into it, so the
+  unpainted window covered the one the frames were attached to. The guest
+  GL now attaches to the top-level window and follows reparenting
+  (tests/games/src/glx-quad.c shows it in the page). A correctness run on
+  edger's GPU (one run, no timing) showed the compositor repainting
+  normally, so there was no starvation; on gooner's SwiftShader the GL
+  bridge still times out after a screen change (a batch over 30 s).
+- Baba Is You's settings: matrix.txt's `seed=seed/baba@~/.local/share/Baba_Is_You`
+  mounts a fresh copy of tests/games/seed/baba (fullscreen=0) there for each
+  run; nothing reaches the real home. Scripted keys now reach it
+  (focus_fallback), but in 40 minutes it has not left its intro screen
+  (translation of its 9 MB executable under --lazy on a loaded gooner).
+- Earlier, the page (browser-linux.mjs; own ports 5291/9431): Retrocycles' GL
   frames were attached to SDL 1.2's child window, which no compositor
   window has; they now name its top-level window. The run still shows
   black: Mesa keeps drawing (about 25 draws a second under SwiftShader on
