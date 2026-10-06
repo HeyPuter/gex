@@ -1217,14 +1217,16 @@ and the compositor. Paths: project root `~/gex-sandbox`, scratch
   shipped-page fallback that can recover from a missed entry instead of
   stopping (a tier-1 translator loaded on demand, or a region per call
   continuation of every recorded function).
-- **Region entries and dispatch slots (fixed, ee112f0c).** A dispatch slot
-  covers four bytes on x86, and a region module is published after its
-  unit. A region entry sharing a slot with a unit function's entry took
-  the slot over, so calls to that function left the nest and their
-  returns landed on unentered continuations. More entries could break a
-  run that fewer entries ran. `regions_from` now leaves such entries out
-  and reports recorded ones. The NT trampoline page is exempt: the host
-  enters its resume points directly.
+- **Training-run blind spots (fixed, 40f84c5a).** `run.mjs
+  --record-entries` missed browser-only resume points: a Worker's console
+  output under Node reaches the parent only when the Worker's event loop
+  turns, so its "web entry" lines (and an AOT-only run's stop message) were
+  lost at the end of a run, and the function JIT served some misses before
+  they were noted. Both now go through the guest's stderr, noted first.
+  seh.exe's int3 continuation (0x401d43, beside the entry 0x401d40 in one
+  4-byte dispatch slot, which is fine: calls, the root and the bridge all
+  resolve exact addresses) is recorded deterministically. A slot rule tried
+  on the way (ee112f0c) was wrong and is reverted (c1643d34).
 - **Interior entries** (§3.2–3.3) are the main correctness risk. A resume
   at an address no region covers stops the run. The conservative region set
   (every call continuation in an SEH-framed function) may be large; it is
