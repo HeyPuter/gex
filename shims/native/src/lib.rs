@@ -3892,6 +3892,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
+                    if run_signal_frames(&mut caller, pc as u64)? {
+                        return Err(StopExecution.into());
+                    }
+                    let state = caller.data_mut();
                     state.resume_cause = Some("signal at safepoint".into());
                     state.resume_at = Some(target);
                     Err(StopExecution.into())
@@ -4665,6 +4669,55 @@ pub(crate) fn set_fault_hook(state: &HostState, idx: u32) {
     let mut v = FAULT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
     v.retain(|(k, _)| *k != key);
     v.push((key, idx));
+}
+
+/// A native wasm32 program's signal hook (W3.1), by process: the function
+/// that runs the signal frames gex-kernel leaves on the guest's stack
+/// (libgex's `__gex_signal_frames(ctx, pc)`, which calls the program's wasm
+/// handlers), for a signal that arrives while the thread runs guest code.
+static SIGNAL_HOOKS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+fn signal_hook_of(state: &HostState) -> Option<u32> {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    SIGNAL_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|&(_, h)| h)
+}
+
+pub(crate) fn set_signal_hook(state: &HostState, idx: u32) {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    let mut v = SIGNAL_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|(k, _)| *k != key);
+    v.push((key, idx));
+}
+
+/// Run the signal frame gex-kernel just built at a safepoint through the
+/// process's signal hook (its handlers are wasm functions, not guest code):
+/// the hook's C frames below the frame, the guest resumed where sigreturn
+/// put it. False when the process has no hook.
+fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Result<bool> {
+    let Some(hook) = signal_hook_of(caller.data()) else { return Ok(false) };
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let f = crate::ftab::table_func(caller, hook)?;
+    let typed = f.typed::<(i32, i32), ()>(&*caller).context("gex.signal_hook: the hook is not void(int, unsigned)")?;
+    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let saved = match &sp {
+        Some(g) if !gex_abi::mem64() => {
+            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            g.set(&mut *caller, Val::I32(((cur.min(esp).saturating_sub(256)) & !15) as u32 as i32))?;
+            Some(cur)
+        }
+        _ => None,
+    };
+    let r = typed.call(&mut *caller, (ctx_addr as i32, interrupted as u32 as i32));
+    if let (Some(g), Some(cur)) = (&sp, saved) {
+        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+    }
+    r?;
+    let next = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    caller.data_mut().resume_cause = Some("signal (wasm handler)".into());
+    caller.data_mut().resume_at = Some(next);
+    Ok(true)
 }
 
 /// Wine's Unix-side system-call dispatcher, by process (W3.1): op 0 sets

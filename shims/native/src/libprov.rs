@@ -458,6 +458,10 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         }
         Ok(())
     })()) })?;
+    // A native wasm32 program's signal hook (W3.1, `crate::SIGNAL_HOOKS`).
+    linker.func_wrap(IMPORT_MODULE, "signal_hook", |caller: Caller<'_, HostState>, idx: i32| {
+        crate::set_signal_hook(caller.data(), idx as u32);
+    })?;
     // A native wasm32 program's guest fault hook (W3.1, `crate::FAULT_HOOKS`).
     linker.func_wrap(IMPORT_MODULE, "fault_hook", |caller: Caller<'_, HostState>, idx: i32| {
         crate::set_fault_hook(caller.data(), idx as u32);

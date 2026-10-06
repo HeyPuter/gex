@@ -2559,6 +2559,7 @@ export class Gex {
           // is still to come).
           unix_dispatcher: (op, idx) => e.gex_unix_dispatcher?.(op, idx) ?? 0,
           fault_hook: (idx) => e.gex_fault_hook_set?.(idx),
+          signal_hook: (idx) => e.gex_signal_hook_set?.(idx),
         } : {}),
         ...(memBase && !wasmprog ? this.#providerImports() : {}),
         ...(wasmprog ? this.#wasmprogImports(() => inst) : wasmdll ? { syscall: this.#nativeSyscall } : {}),

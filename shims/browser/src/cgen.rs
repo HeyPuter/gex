@@ -1589,3 +1589,12 @@ static FAULT_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 pub extern "C" fn gex_fault_hook_set(idx: u32) {
     FAULT_HOOK.store(idx, Ordering::Relaxed);
 }
+
+/// A native wasm32 program's signal hook (W3.1). Recorded, as the fault
+/// hook is; the page does not run signal frames through it yet (W3.7).
+static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_signal_hook_set(idx: u32) {
+    SIGNAL_HOOK.store(idx, Ordering::Relaxed);
+}
