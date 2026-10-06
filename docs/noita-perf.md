@@ -1097,6 +1097,28 @@ umap, cxxstring; best: tree, cgoto, list (0.68-0.86).
   loop. Its executable check scanned every VMA; 545c12b6 uses a binary
   search (`MemoryMap::vma_at`) and adds miss counters to the NT stats line
   (`gex-nt: misses all/behind/returned/dense/fjit/knows/translate`).
-- Next: s1 on edger (bm-s = this tree's units, built from bm-hui's
-  objects; arms s=bm-s, t=bm-s@GEX_NT_TICK_EVERY=1), the miss counts and
-  the profile's dispatch_miss/mono_ns after it.
+- **Parked for the 2026-10-05 late-night reboot.** Head: see `git log -1`
+  on merge/fjit (this doc commit, on top of c6bc9217). Unmeasured in the
+  page: 5563fda1 (shared ret exits; size only, measured above), 545c12b6
+  (tick reads the clock 1 in 8; VMA binary search in a dispatch miss;
+  miss counters). NT suite 83/83 without --cgen; with --cgen 82 + fixedbase
+  failed only because gexc was replaced mid-run, rerun passed.
+- **s1: TO RERUN** (queued, never started; cancelled by PID for the
+  reboot). Caches on gooner and edger (synced): `target/bm-s` (this tree's
+  units, unguarded, inlining + shared exits; noita.exe unit
+  cf648aa3...-ie77f2dfea53061fa); edger's wt/fjit and web/public/gex shims
+  are from 545c12b6 (match bm-s). Command (from ~/gex-sandbox on gooner):
+  `T=/home/claude/gex-sandbox/wt/fjit/target; timeout 14400 scratch/bench/bench.sh -- scratch/fjit/e/seq.sh s1 /home/claude/gex-sandbox/wt/fjit 240 "s=$T/bm-s" "t=$T/bm-s@GEX_NT_TICK_EVERY=1" > scratch/fjit/e/seq-s1.out 2>&1`
+  (s = tick 1 in 8, t = old tick). If gex-cgen changes first, rebuild:
+  `GUARD=0 JOBS=12 scratch/fjit/build-bm.sh $T/bm-s $T/bm-hui`, shims
+  with scratch/fjit/build-shims.sh, then `scratch/fjit/e/sync.sh bm-s`.
+  Note: shims/browser/build.sh also rebuilds target/x86/release/gexc; don't
+  run it during an NT suite.
+- After s1: the `gex-nt: misses all/behind/returned/dense/fjit/knows/translate`
+  lines in scratch/fjit/e/s1-s1.log on edger, and the profiles'
+  gex_dispatch_miss / mono_ns (analysis scripts inline in this session:
+  per-file chain counts over cpuprofile parents) against cs1-c1
+  (scratch/fjit/prof/cs1-c1 on gooner).
+- Other heads: merge/fjit-ung 00806c66 and merge/fjit-inl f5ca966f are in
+  integ/2026-10-05g (coordinator gating). wt/fjit-ung and wt/fjit-inl are
+  done; their target dirs (fjit-inl/target) can go.
