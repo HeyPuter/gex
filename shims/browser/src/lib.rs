@@ -9449,9 +9449,20 @@ fn schedule() -> i32 {
             }
             // Nothing runnable and nothing above recognised the wait: going
             // round again would spin on unchanged state at full speed. So
-            // report once and hand the stack back -- yielding cannot be wrong
-            // when nothing can run.
-            report_idle(0);
+            // hand the stack back -- yielding cannot be wrong when nothing can
+            // run -- and report it, unless every wait is one that ends by
+            // itself: a sleep (the clock), a `wait4` (the child, in another
+            // Worker, exits), a futex (another Worker wakes it; one nothing
+            // can wake is the deadlock caught above). A parent waiting out a
+            // long child reported itself "idle" every power of two.
+            let ends_by_itself = with_host(|h| {
+                h.threads.iter().all(|t| {
+                    matches!(t.waiting, Waiting::Sleep(_) | Waiting::Child | Waiting::Futex { .. } | Waiting::Exited | Waiting::Elsewhere)
+                })
+            });
+            if !ends_by_itself {
+                report_idle(0);
+            }
             set_paused_to(2);
             return 2;
         };
