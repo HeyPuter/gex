@@ -18,7 +18,7 @@ mkdir -p "$work"
 fail=0
 for src in "$here"/*.c; do
     n=$(basename "$src" .c)
-    if ! ${CC:-gcc} -O1 -fno-builtin -o "$work/$n" "$src"; then
+    if ! ${CC:-gcc} -O1 -fno-builtin -o "$work/$n" "$src" -lm -pthread; then
         echo "FAIL $n (build)"
         fail=1
         continue

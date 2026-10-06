@@ -15,7 +15,7 @@ root=$(cd "$here/../.." && pwd)
 gexc=$(realpath "${1:?usage: tests/elf-prov/run-browser.sh GEXC}")
 work=$root/target/elf-prov-test
 libs=""
-for f in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6; do libs="$libs --file $f=$(realpath "$f")"; done
+for f in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libm.so.6; do libs="$libs --file $f=$(realpath "$f")"; done
 fail=0
 for src in "$here"/*.c; do
     n=$(basename "$src" .c)
