@@ -342,7 +342,7 @@ fn regions_dir(unit: &std::path::Path) -> Option<std::path::PathBuf> {
 pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Path, pcs: &[u64], jobs: usize) -> Result<Vec<u64>> {
     let pv = provided(pe, base);
     let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
-    regions_from(&image, &seeds.starts, &pv.stubs, base, unit, pcs, jobs)
+    regions_from(&image, &seeds.starts, &pv.stubs, base, unit, pcs, jobs, true)
 }
 
 /// The NT trampoline page's region entries (at its unit `unit`): where a
@@ -351,7 +351,7 @@ pub fn prepare_regions(pe: &gex_ld::pe::PeImage, base: u64, unit: &std::path::Pa
 pub fn prepare_trampoline_regions(class32: bool, unit: &std::path::Path, jobs: usize) -> Result<Vec<u64>> {
     let (image, seeds) = trampoline_input(class32);
     let pcs = gex_kernel::nt::boot::trampoline_resumes(class32);
-    regions_from(&image, &seeds.starts, &[], gex_kernel::nt::TRAMPOLINES, unit, &pcs, jobs)
+    regions_from(&image, &seeds.starts, &[], gex_kernel::nt::TRAMPOLINES, unit, &pcs, jobs, false)
 }
 
 #[cfg(feature = "translate")]
@@ -364,6 +364,7 @@ fn regions_from(
     unit: &std::path::Path,
     pcs: &[u64],
     jobs: usize,
+    keep_unit_slots: bool,
 ) -> Result<Vec<u64>> {
     use gex_xlate::func::{self as func, Code, RecoverOptions, Source};
     struct Pv<'a> {
@@ -375,8 +376,9 @@ fn regions_from(
     let mut want: Vec<u64> = pcs.iter().copied().filter(|a| !have.contains(a) && pv.stubs.binary_search(a).is_err()).collect();
     want.sort_unstable();
     want.dedup();
-    // v3: call continuations of the enclosing functions, and direct callees.
-    let list = String::from("v3\n") + &want.iter().map(|a| format!("{a:#x}\n")).collect::<String>();
+    // v3: call continuations of the enclosing functions, and direct callees;
+    // v4: none in a dispatch slot the unit (or an earlier region entry) has.
+    let list = String::from("v4\n") + &want.iter().map(|a| format!("{a:#x}\n")).collect::<String>();
     if want.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
         return Ok(Vec::new());
@@ -435,11 +437,36 @@ fn regions_from(
     want.extend(extra);
     want.sort_unstable();
     want.dedup();
+    // A dispatch slot covers 1 << DISPATCH_SHIFT bytes (four on x86), and a
+    // region module is published after its unit: a region entry in a slot
+    // that holds one of the unit's entries would take the slot over, so
+    // every call to that unit function would miss its checked body and
+    // leave the nest, and the return would land on a continuation without
+    // an entry. Such a region entry could never be dispatched to anyway
+    // (the slot names the unit's function), so it is left out (reported
+    // as failed if it was recorded), as is a second region entry in a slot
+    // another one already has. Not for the NT trampoline page
+    // (`keep_unit_slots` false): the host resumes it at its region entries,
+    // and its unit's entries next to them are entered only directly.
+    let slot = |a: u64| a >> gex_abi::DISPATCH_SHIFT;
+    let mut taken: std::collections::HashSet<u64> =
+        if keep_unit_slots { have.iter().map(|&a| slot(a)).collect() } else { Default::default() };
+    let mut clashing = Vec::new();
+    want.retain(|&a| {
+        let ok = taken.insert(slot(a));
+        if !ok {
+            clashing.push(a);
+        }
+        ok
+    });
+    if !clashing.is_empty() {
+        eprintln!("[regions] {base:#x}: {} left out, in a dispatch slot the unit or another region entry has: {clashing:x?}", clashing.len());
+    }
     if want.len() > n_recorded {
         eprintln!("[regions] {base:#x}: {n_recorded} recorded, {} with the call continuations of their functions", want.len());
     }
     let mut batch = std::collections::BTreeMap::new();
-    let mut failed = Vec::new();
+    let mut failed: Vec<u64> = clashing.iter().copied().filter(|a| pcs.contains(a)).collect();
     // Closed under direct calls and tail calls: a callee the unit lacks
     // (code recovery reached only from here, as from a landing pad) is a
     // region function too, or the first call to it would stop the run.
@@ -457,6 +484,12 @@ fn regions_from(
                         _ => continue,
                     };
                     if !have.contains(&t) && code.is_code(t) && pv.stubs.binary_search(&t).is_err() && seen.insert(t) {
+                        // A callee in a taken slot stays out of the module
+                        // (see above): the call reaches it through dispatch.
+                        if !taken.insert(slot(t)) {
+                            clashing.push(t);
+                            continue;
+                        }
                         queue.push_back(t);
                     }
                 }
