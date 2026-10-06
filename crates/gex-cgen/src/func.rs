@@ -2669,9 +2669,12 @@ b2 0x4007..0x4008 insts [4007]:
         // table (its target from MonAddr), not devirtualised again.
         assert!(body.contains("r_monaddr"), "the indirect fallback keeps its target in MonAddr:\n{body}");
         assert!(!body.contains("ft == 0x3000ull"), "the fallback is not devirtualised again:\n{body}");
-        // The copies' returns: on at the continuations.
-        assert!(body.contains("case 0x4005ull:") && body.contains("case 0x4007ull:"), "{body}");
-        assert!(body.contains("GEX_FTAB(gex_ftab_idx(ft))"), "{body}");
+        // The copies' returns: each compares the popped address with its own
+        // continuation and goes on there; anything else leaves through the
+        // shared exit, a table call on the popped address (5563fda1).
+        assert!(body.contains("== v") && body.contains("= 0x4005ull;") && body.contains("= 0x4007ull;"), "{body}");
+        assert!(body.contains("GEX_MUSTTAIL return GEX_FTAB(gex_ftab_idx(ft))(ctx, depth, need, ret);"), "{body}");
+        assert!(!body.contains("case 0x4005ull:"), "no per-ret switch any more:\n{body}");
         let dir = std::env::temp_dir().join(format!("gex-cgen-inline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("gex_abi.h"), crate::header::header()).unwrap();
