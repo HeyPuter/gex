@@ -2326,8 +2326,10 @@ struct gexgl_egl_surface {
     /* The frame callback this surface has outstanding, if any. */
     void *wl_callback;
     /* X only: swaps since the window's size was last asked (see
-       `gexgl_x11_follow_size`). */
+       `gexgl_x11_follow_size`), and the top-level window its frames are
+       attached to. */
     unsigned x_swaps;
+    unsigned long x_top;
 };
 static struct gexgl_egl_surface egl_surfaces[GEXGL_MAX_SURFACES];
 static unsigned egl_next_surface_handle = 1;
@@ -2838,6 +2840,15 @@ static void gexgl_x11_follow_size(struct gexgl_egl_surface *s) {
     if (!s || s->kind != GEXGL_SURFACE_X) return;
     unsigned n = s->x_swaps++;
     if (n > 8 && n % 30 != 0) return;
+    /* Reparented since it was attached: SDL 1.2 going fullscreen moves its
+       GL window into an override-redirect window of the screen's size, which
+       is then the window on top. The frames follow it. */
+    unsigned long top = gexgl_x11_toplevel(s->native);
+    if (top && top != s->x_top) {
+        s->x_top = top;
+        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X, (unsigned)top,
+             (unsigned)getpid(), s->handle);
+    }
     int w = 0, h = 0;
     if (!gexgl_x11_window_size(s->native, &w, &h)) return;
     if (w <= 0 || h <= 0 || (w == s->width && h == s->height)) return;
@@ -2915,8 +2926,9 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
            is nowhere to put the pixels. The handle goes with it, which is
            what allows a second window at the same time -- the host keeps a
            drawable per handle. Attaching also makes it current. */
+        s->x_top = gexgl_x11_toplevel(win);
         CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X,
-             (unsigned)gexgl_x11_toplevel(win), (unsigned)getpid(), s->handle);
+             (unsigned)s->x_top, (unsigned)getpid(), s->handle);
         egl_surface = s;
         egl_surface_width = w;
         egl_surface_height = h;
