@@ -429,6 +429,10 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         };
         Ok(())
     })()) })?;
+    // A native wasm32 program's guest fault hook (W3.1, `crate::FAULT_HOOKS`).
+    linker.func_wrap(IMPORT_MODULE, "fault_hook", |caller: Caller<'_, HostState>, idx: i32| {
+        crate::set_fault_hook(caller.data(), idx as u32);
+    })?;
     // Diagnostics: text a provider writes to its stderr.
     linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {

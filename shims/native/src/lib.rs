@@ -3332,6 +3332,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             let pc = pc as u64;
             let raw = raw as u32;
+            if deliver_guest_fault(&mut caller, fault_code::ILLEGAL_INSTRUCTION, pc, pc)? {
+                return Err(StopExecution.into());
+            }
             let memory = caller
                 .data()
                 .memory
@@ -3413,6 +3416,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // FPE_INTDIV at the dividing instruction.
             if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO || imm == gex_abi::imports::BRK_DIVIDE_OVERFLOW {
                 let pc = pc as u64;
+                let code = if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO { fault_code::INT_DIVIDE_BY_ZERO } else { fault_code::INT_OVERFLOW };
+                if deliver_guest_fault(&mut caller, code, pc, 0)? {
+                    return Err(StopExecution.into());
+                }
                 let memory = caller
                     .data()
                     .memory
@@ -3444,6 +3451,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // mode): SIGSEGV at the instruction.
             if imm == gex_abi::imports::BRK_GENERAL_PROTECTION {
                 let pc = pc as u64;
+                if deliver_guest_fault(&mut caller, fault_code::ACCESS_VIOLATION, pc, 0xffff_ffff)? {
+                    return Err(StopExecution.into());
+                }
                 let memory = caller
                     .data()
                     .memory
@@ -3477,6 +3487,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     detail: format!("unmasked x87 floating-point exception at 0x{pc:x}; gex does not deliver x87 exceptions"),
                     internal: true,
                 });
+                return Err(StopExecution.into());
+            }
+            // int3: the hook sees the address after it, as hardware leaves it.
+            if deliver_guest_fault(&mut caller, fault_code::BREAKPOINT, pc as u64 + 1, pc as u64)? {
                 return Err(StopExecution.into());
             }
             caller.data_mut().exit = Some(Exit::Signal {
@@ -4580,6 +4594,58 @@ pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::
         .or_else(|| caller.data().root_enter.clone())
 }
 
+/// Guest fault hooks, by process (its kernel's address): a native wasm32
+/// program that runs x86 code (Wine's ntdll.so, docs/wine-native.md §4.0
+/// W3.1) registers `void hook(int ctx, unsigned code, unsigned addr)`
+/// (`gex.fault_hook`), and a fault in its x86 code -- a memory access past
+/// the guest's memory, an illegal instruction, int3, a divide error -- is
+/// delivered to it instead of ending the process: the context holds the
+/// guest state with PC at the fault, the hook leaves the state to go on
+/// from (ntdll.so: KiUserExceptionDispatcher's), and the call-out the guest
+/// ran under resumes there, the native frames under it intact.
+static FAULT_HOOKS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+fn fault_hook_of(state: &HostState) -> Option<u32> {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    FAULT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|&(_, h)| h)
+}
+
+pub(crate) fn set_fault_hook(state: &HostState, idx: u32) {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    let mut v = FAULT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|(k, _)| *k != key);
+    v.push((key, idx));
+}
+
+/// NTSTATUS codes the hook is given.
+pub(crate) mod fault_code {
+    pub const ACCESS_VIOLATION: u32 = 0xc000_0005;
+    pub const ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+    pub const BREAKPOINT: u32 = 0x8000_0003;
+    pub const INT_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
+    pub const INT_OVERFLOW: u32 = 0xc000_0095;
+}
+
+/// Deliver a guest fault to the process's hook (see [`FAULT_HOOKS`]).
+/// Returns false when there is none. On true, `resume_at` holds where the
+/// guest goes on.
+pub(crate) fn deliver_guest_fault(caller: &mut Caller<'_, HostState>, code: u32, pc: u64, addr: u64) -> Result<bool> {
+    let Some(hook) = fault_hook_of(caller.data()) else { return Ok(false) };
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    {
+        let mut gm = GuestMem::new(memory.bytes());
+        let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
+    }
+    let f = crate::ftab::table_func(caller, hook)?;
+    let typed = f.typed::<(i32, i32, i32), ()>(&*caller).context("gex.fault_hook: the hook is not void(int, unsigned, unsigned)")?;
+    typed.call(&mut *caller, (ctx_addr as i32, code as i32, addr as u32 as i32))?;
+    let next = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    caller.data_mut().resume_cause = Some(format!("guest fault {code:#x}"));
+    caller.data_mut().resume_at = Some(next);
+    Ok(true)
+}
+
 /// `gex.call_out` (docs/function-tier.md §7.3): run the guest from `target`
 /// until it returns to `ret` with the stack pointer at `sp_want` (or what a
 /// callee popped above it), then let the C caller carry on (1); 0 when that
@@ -4643,6 +4709,18 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             refresh_callouts(&mut *caller)?;
             pc = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
             continue;
+        }
+        // A wild guest access under a process with a fault hook (W3.1):
+        // delivered, and the guest goes on where the hook says. The
+        // translated code cannot say which instruction faulted: PC is where
+        // the context last had it (the block's start, at best).
+        if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds)) {
+            let at = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
+            if deliver_guest_fault(caller, fault_code::ACCESS_VIOLATION, at, 0)? {
+                pc = caller.data_mut().resume_at.take().unwrap_or(at);
+                refresh_callouts(&mut *caller)?;
+                continue;
+            }
         }
         break Err(anyhow::Error::from(e));
     };
