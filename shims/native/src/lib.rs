@@ -713,7 +713,9 @@ fn run_program_with(
     // alone: it is an i386 ELF (and its kernel speaks the i386 ABI, below),
     // but an x86-64 shell that runs it goes on translating its own code
     // after the wait.
-    if !wasmprog::is_wasm32(program) || std::env::var_os("GEX_W3_COMPAT").is_some() {
+    // ...unless it hosts i386 code itself (Wine's loader, W3: the header's
+    // FLAG_GUEST_I386), which is then the process's to translate.
+    if !wasmprog::is_wasm32(program) || wasmprog::flags(program) & wasmprog::FLAG_GUEST_I386 != 0 {
         gex_xlate::set_compat(program.compat());
         lockstep::set_compat(program.compat());
         gex_kernel::set_compat32(program.compat() && gex_abi::X86);
@@ -1149,6 +1151,9 @@ fn run_program_with(
     // runs at the entry. After the directory above, which its bridges
     // overwrite.
     if nt_setup.is_none() {
+        if wasmprog::flags(program) & wasmprog::FLAG_GUEST_I386 != 0 {
+            store.data_mut().with_kernel(|k| k.mem.set_mmap_top(0x7ffe_0000));
+        }
         wasmprog::install(&mut store, &memory, program)?;
     }
 

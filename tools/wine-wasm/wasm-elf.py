@@ -56,7 +56,11 @@ def up(v, a):
 
 
 def main():
-    src, dst = sys.argv[1], sys.argv[2]
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    src, dst = args[0], args[1]
+    # --guest-i386: the program runs i386 code (Wine's loader, W3): gex
+    # translates i386 in its process and leaves Windows' addresses free.
+    flags = 1 if '--guest-i386' in sys.argv[1:] else 0
     w = open(src, 'rb').read()
     mem_size, mem_align = dylink_mem(w)
     ehsize, phsize, nph = 52, 32, 5
@@ -69,7 +73,7 @@ def main():
     data_va = up(code_va + PAGE, max(PAGE, 1 << mem_align))
     data_sz = up(max(mem_size, 16), PAGE)
 
-    hdr = b'GEXWASM\0' + struct.pack('<7I', 1, BASE + wasm_off, len(w), data_va, data_sz, entry, entry + 16)
+    hdr = b'GEXWASM\0' + struct.pack('<8I', 1, BASE + wasm_off, len(w), data_va, data_sz, entry, entry + 16, flags)
     text = hdr.ljust(0x40, b'\0') + b'\xf4' * 32
     text = text.ljust(PAGE, b'\xf4')
 

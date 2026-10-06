@@ -41,6 +41,28 @@ pub(crate) fn is_wasm32(program: &Program) -> bool {
     })
 }
 
+/// Header flag (offset 36): the program runs i386 code (Wine, W3), so the
+/// process translates i386 and leaves Windows' fixed addresses free.
+pub const FLAG_GUEST_I386: u32 = 1;
+
+/// The header's flags, 0 for a program without them (or not wasm32).
+pub(crate) fn flags(program: &Program) -> u32 {
+    let at = program.exe.entry.wrapping_sub(0x40);
+    program
+        .exe
+        .segments
+        .iter()
+        .find(|s| at >= s.vaddr && at + 40 <= s.vaddr + s.bytes.len() as u64)
+        .map(|s| {
+            let o = (at - s.vaddr) as usize;
+            if &s.bytes[o..o + 8] != MAGIC {
+                return 0;
+            }
+            u32::from_le_bytes(s.bytes[o + 36..o + 40].try_into().unwrap())
+        })
+        .unwrap_or(0)
+}
+
 /// If the program just placed is a native wasm32 one, install its module
 /// in the function table at its entries. Returns whether it was.
 pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemory, program: &Program) -> Result<bool> {
