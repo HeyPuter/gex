@@ -140,7 +140,10 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
         run+=(--wayland "$state/wl-$slug" --wayland-size "${WSIZE:-1280x720}"
               --env LD_LIBRARY_PATH="$gl64:$(dirname "$exe"):$ov/usr/lib${LINUX_LIBS:+:$LINUX_LIBS}"
               --env SDL_VIDEODRIVER=wayland --env SDL_AUDIODRIVER=dummy --env HOME="$state/home-$slug"
-              --env XDG_RUNTIME_DIR="$state")
+              --env XDG_RUNTIME_DIR="$state"
+              # No session bus: without one, libdbus autolaunches dbus-launch,
+              # which waits on the X display (Baba Is You never got past it).
+              --env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/gex-no-bus)
         # gex-steam (guest/steam/build.sh OUT g++) in place of the game's
         # libsteam_api.so when GEX_STEAM_LINUX64 is set.
         if [ -n "${GEX_STEAM_LINUX64:-}" ] && [ -e "$(dirname "$exe")/libsteam_api.so" ]; then

@@ -455,6 +455,22 @@ needs the same behaviour:
   another thread** (Mosa Lina's HashLink GC), **NtCreateUserProcess** for
   crash handlers (Cruelty Squad): seen, not done.
 
+### On native Wine (master c5620656 + this branch, prefix a copy of scratch/W/pfx-gui-slim), 2026-10-06
+
+| game | reached | stops on (repros for W in scratch/G/wrepro) |
+|---|---|---|
+| Undertale | **gameplay** (the Ruins), but the intro picture and the player's sprite are missing | 16 MiB texture uploads fail (glbig) |
+| Retrocycles | **gameplay** | 8 MiB uploads (glbig), dsound's MMDevice class (com) |
+| Momodora | 1300 black frames | uploads (glbig), wined3d draw-quad GL_INVALID_OPERATION, glGetShaderSource/glGetAttachedShaders |
+| Katana ZERO | no frame | NtUserSetWindowsHookEx (hooks) |
+| N++ | no frame | SDL_Init's DirectInput8 class (com) |
+
+Linux builds (no Wine): Retrocycles reaches its language menu on Xwayland
+inside the guest (SDL 1.2 and libpng12 from Debian packages in
+LINUX_LIBS); Baba Is You gets past Steam (gex-steam Linux) and D-Bus
+autolaunch, creates its GL window, no frame yet. Input for Linux games
+needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
+
 ### Resume (stream G)
 
 Gate branch merge/games2-gate (PE loader fixes, gex-steam for Windows,
