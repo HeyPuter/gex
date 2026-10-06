@@ -1199,4 +1199,32 @@ Not yet:
      (10.0.*, its net8.0+ assembly) into `OUT/lib-extra`, which
      `muck-dotnet.sh` copies over the framework's stub; HK's
      `JsonSharedData.Save` no longer throws (hk102).
+  19. **Scripted input to New Game (2026-10-06, runs hk109-hk118):** in
+     progress. Found and fixed so far:
+     - gex's compositor gave the keyboard to whichever surface last drew,
+       and Xwayland's cursor surface draws after its window, so every key
+       went to the cursor (`[gex] input: ... focus Some(12)` with 12 the
+       Cursor). Only toplevels and popups take it now (88b99006, with a
+       test).
+     - `tests/games/xfocus.c` focuses the top-level under the pointer (else
+       the largest) and with `XFOCUS_TREE=1` dumps the window tree with
+       event masks when it changes: Unity 6 maps its SDL window 0x800004
+       ('Hollow Knight', core masks incl. KeyPress) inside an
+       override-redirect 800x600 parent first, then reparents it to the
+       root; the focus ends on 0x800004 and Application.isFocused is true.
+     - Keys do reach X clients: `tests/x11/xinput-echo.c` gets KeyPress 36
+       for a scripted Enter, and a plain SDL2 2.26 program (dlsym'd libX11,
+       same in-guest Xwayland) gets SDL_KEYDOWN scancode 40 / sym 13.
+     Still open: Hollow Knight's legacy Input sees pointer motion (GexProbe
+     `GEXPROBE_INPUT=1`: mouse 400,257 after the scripted move) but no key
+     and no button. Without xfocus (NOFOCUS=1) it is not focused at all.
+     Next: an LD_PRELOAD spy on the Xlib functions Unity's SDL dlsym's
+     (`scratch/unity/xspy`), to see whether its XNextEvent gets the
+     KeyPress and what XFilterEvent says.
+     **Muck with the walk on by default:** batch, current gexc, --fjit:
+     "Initializing packets" (mk8); without --fjit too (mk4). (mk1-mk3, mk6
+     hung at ReloadAssembly: they ran the script's default
+     `target/x86/release/gexc`, an Oct 5 build from before the fjit
+     per-process fix, not a regression.) HK reaches Menu_Title with the
+     walk on by default in every run since hk109.
 
