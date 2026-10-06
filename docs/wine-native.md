@@ -1046,16 +1046,22 @@ unixlib ran through the dlopen registry (§3.12).
   holds rpcrt4's NdrServerCall2); the ICALL pass's annotation sections
   are stripped before the final link (wasm-ld 22 crashed on services.exe
   and plugplay.exe).
-- **Where it stands:** wineboot runs, starts services.exe and rundll32
-  (setupapi's wine.inf install), and the first RPC from the install to
-  services.exe faults in the server (ERROR_NOACCESS: an access violation
-  under rpcrt4's dispatch into services' server routine); the install
-  does not finish, so the registry has only what wineboot writes itself
-  and every start waits out the boot event (5 minutes). Next: that
-  dispatch (i386 rpcrt4 calling native server routines through MIDL's
-  tables), then the full wine.inf install and the registry it writes.
-  The suite's prefix stays without the native programs until then
-  (`$W/w3-nt5.log`: 29 of 40, no change).
+- **Entry thunks where a function is handed out but not defined:** widl's
+  server stubs (svcctl_s.c) list routines another object defines, so
+  i386 rpcrt4 called table indices with no thunk. The ICALL pass now
+  makes a thunk for an escaping declaration too (`gexw_entries_decl`,
+  bound only where no defining object gave one); the plugin is built into
+  `$W/sr-w3` (a hard-linked copy of sr-slim with the new GexIcall.so).
+  wmainCRTStartup calls `wmain(argc, argv)` on wasm32 (winedevice).
+- **Where it stands:** wineboot runs services.exe (RPC to it works),
+  winedevice.exe and plugplay.exe natively, and rundll32's wine.inf
+  `PreInstall` completes (services installed, registry written and saved
+  at exit). Then wineboot opens its "updating" dialog
+  (`show_wait_window`: CreateDialog) before `DefaultInstall`, which needs
+  win32u's Unix side: it does not come back, so the full install (and the
+  registry it writes) waits for **W3.3**, and every start still waits out
+  the boot event. The suite's prefix stays without the native programs
+  until then (`$W/w3-nt5.log`: 29 of 40, no change).
 
 **G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
 from tests/nt/src on merge/games2; today each stops in the NT layer):
