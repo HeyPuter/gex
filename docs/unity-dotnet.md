@@ -922,4 +922,25 @@ Not yet:
      - Next: why the intro Animator/camera does nothing (check the Camera's
        enabled state and Animator culling via the trace; try `-force-...` or
        pointer focus from frame 0), then the default focus input.
+  6. **After the Claude Code restart (2026-10-05 ~21:00; gooner load 90-180,
+     so every graphics run takes 25+ min to reach Unity's log):**
+     - **The Arch-glibc graphics crash is the function JIT's:** gs6 (same as
+       gs5, no --fjit) gets past the point where every --fjit run died (78 log
+       lines, physics init, killed by its 1500 s timeout). gs7 (`GEX_FJIT_RANGE`
+       = Arch ld.so 0x4a00000-0x4a40000 only) neither crashed nor reached
+       Unity's log in 1500 s (the partial-range stall, now seen on gooner
+       too). gs8 (`GEX_FJIT_SKIP` = that ld.so range, everything else jitted)
+       is running, 2400 s. The faulting block (gs5) is the epilogue of Arch
+       ld.so's `_dl_lookup_symbol_x` (file offset 0xbbfe: `*ref = sym; lea
+       rsp,[rbp-0x28]; pop x6; ret`), which returned to 0x21c6: its saved
+       return address or rbp was overwritten. Next: if gs8 passes, dump that
+       function's translation (`GEX_FJIT_KEEP`/`GEX_FJIT_DUMP` with
+       `GEX_FJIT_RANGE` around 0x4a0b000-0x4a0c000) and give F the GIR.
+     - Pre_Menu_Intro's settings (UnityPy): cameras `Camera` and
+       `AspectBorders` enabled (clear flags 1, full viewport, display 0);
+       StartManager's Animator culling 0 (always animate), update mode 0
+       (scaled time). So no culling explains it: either the player loop runs
+       very few frames (11 FindObjectOfType<UIManager> in ~20 min) or time
+       does not advance. hk46 (pointer in the window from the first frame,
+       `runs/hk46/input.txt`, GL capture, 3600 s) is running.
 
