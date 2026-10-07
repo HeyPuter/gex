@@ -199,6 +199,7 @@ run options:
   --strace        trace every syscall on stderr
   --verbose       report translation statistics
   --env K=V       add an environment variable (repeatable)
+  --host-env      start from gexc's own environment (default: PATH, HOME)
   --sysroot DIR   present DIR as the guest's root filesystem
   --bind H=G      mount host file or directory H at guest path G (repeatable)
   --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
@@ -308,6 +309,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
     let mut mem64 = None;
     let mut argv0: Option<String> = None;
     let mut wine_prefix: Option<String> = None;
+    let mut host_env = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -424,12 +426,27 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 let v = args.get(i).context("--env needs an argument")?;
                 opts.env.push(v.clone());
             }
+            "--host-env" => host_env = true,
             other if other.starts_with('-') => bail!("unknown option `{other}`"),
             other => path = Some(other.to_string()),
         }
         i += 1;
     }
     let path = path.context("expected a program to run")?;
+    // `--host-env`: the guest starts with gexc's own environment (a gexcc
+    // program's host launcher passes it on: tools/gexcc/hoststub.c), then
+    // the `--env` settings over it.
+    if host_env {
+        let set: std::collections::HashSet<String> =
+            opts.env.iter().filter_map(|e| e.split_once('=').map(|(k, _)| k.to_string())).collect();
+        let mut env: Vec<String> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .filter(|(k, _)| !set.contains(k))
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        env.append(&mut opts.env);
+        opts.env = env;
+    }
     // `GEX_PROFILE=1` is `--record $GEX_PROFILE_OUT`.
     if opts.record.is_none()
         && std::env::var("GEX_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0")
