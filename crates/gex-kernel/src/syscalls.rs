@@ -3160,9 +3160,25 @@ impl Kernel {
         if p.is_empty() {
             return Err(Errno::ENOENT);
         }
-        if p.starts_with('/') || dirfd == AT_FDCWD {
-            return Ok(self.vfs.absolute(&p));
+        let abs = if p.starts_with('/') || dirfd == AT_FDCWD {
+            self.vfs.absolute(&p)
+        } else {
+            self.at_dir_path(dirfd, &p)?
+        };
+        // A trailing slash names a directory: "file/" is ENOTDIR (the
+        // normalised path has lost the slash, so look now).
+        if p.len() > 1 && p.ends_with('/') {
+            if let Ok(md) = self.vfs.metadata(&abs) {
+                if md.file_type != crate::vfs::FileType::Directory {
+                    return Err(Errno::ENOTDIR);
+                }
+            }
         }
+        Ok(abs)
+    }
+
+    /// `p` relative to the directory open at `dirfd`.
+    fn at_dir_path(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
         // Relative to an open directory: its recorded path is the base. A
         // descriptor that is not a directory is ENOTDIR.
         let f = self.fds.get(dirfd)?;
@@ -3170,7 +3186,7 @@ impl Kernel {
             return Err(Errno::ENOTDIR);
         }
         let base = f.path.clone();
-        Ok(crate::vfs::normalize(&p, &base))
+        Ok(crate::vfs::normalize(p, &base))
     }
 
     // -- I/O -----------------------------------------------------------------
@@ -4552,9 +4568,7 @@ impl Kernel {
         new_fd: i32,
         new: u64,
     ) -> SysResult {
-        let from = self.at_path(m, old_fd, old)?;
-        let to = self.at_path(m, new_fd, new)?;
-        self.vfs.rename(&from, &to).map(|_| 0)
+        self.sys_renameat2(m, old_fd, old, new_fd, new, 0)
     }
 
     /// `renameat2`: `renameat` plus a flags word. The flags matter -- programs
@@ -4580,6 +4594,15 @@ impl Kernel {
     ) -> SysResult {
         const RENAME_NOREPLACE: u32 = 1;
         const RENAME_EXCHANGE: u32 = 2;
+        // "." or ".." as the last component of either name: EINVAL (the
+        // normalised paths would name the directory itself)
+        for ptr in [old, new] {
+            let raw = m.read_cstr(ptr, 4096)?;
+            let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
+            if matches!(last, Some(b".") | Some(b"..")) {
+                return Err(Errno::EINVAL);
+            }
+        }
         let from = self.at_path(m, old_fd, old)?;
         let to = self.at_path(m, new_fd, new)?;
         if flags & !RENAME_NOREPLACE != 0 {
