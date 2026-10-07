@@ -2538,7 +2538,22 @@ impl Kernel {
             // Ownership is not modelled: there is one user and the guest is
             // it. Refusing would be worse than accepting -- tar treats a
             // failed chown while unpacking as a failure to unpack.
-            nr::FCHOWN | nr::FCHOWNAT => Ok(0),
+            // Ownership is not kept, but the file must be there.
+            nr::FCHOWN => self.fds.get(a[0] as i32).map(|_| 0),
+            nr::FCHOWNAT => {
+                let empty = m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
+                if empty && a[4] & AT_EMPTY_PATH != 0 {
+                    self.fds.get(a[0] as i32).map(|_| 0)
+                } else {
+                    self.at_path(m, a[0] as i32, a[1]).and_then(|p| {
+                        if a[4] & AT_SYMLINK_NOFOLLOW != 0 {
+                            self.vfs.metadata_nofollow(&p).map(|_| 0)
+                        } else {
+                            self.vfs.metadata(&p).map(|_| 0)
+                        }
+                    })
+                }
+            }
 
             // -- memory ------------------------------------------------------
             nr::BRK => {
@@ -3635,6 +3650,12 @@ impl Kernel {
             // directory, which open does not create (EISDIR, as Linux).
             if flags & oflags::O_CREAT != 0 && Self::path_tail(m, path)?.0 && self.vfs.metadata(&p).is_err() {
                 return Err(Errno::EISDIR);
+            }
+            // O_NOFOLLOW on a symlink: ELOOP.
+            if flags & oflags::O_NOFOLLOW != 0
+                && self.vfs.metadata_nofollow(&p).is_ok_and(|md| md.file_type == FileType::Symlink)
+            {
+                return Err(Errno::ELOOP);
             }
             // A directory opens for reading only, whatever the filesystem.
             let acc = flags & oflags::ACCMODE;
