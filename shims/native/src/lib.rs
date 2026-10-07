@@ -1406,9 +1406,12 @@ fn perform_block(
             let start = std::time::Instant::now();
             let slice = std::time::Duration::from_millis(20);
             loop {
-                let left = match deadline {
-                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
-                    Some(d) => (d - start.elapsed()).min(slice),
+                // One reading of the clock: checking it and then subtracting a
+                // second, later reading overflowed when the deadline passed
+                // in between.
+                let left = match deadline.map(|d| d.checked_sub(start.elapsed())) {
+                    Some(None) | Some(Some(std::time::Duration::ZERO)) => return Err(Errno::ETIMEDOUT),
+                    Some(Some(left)) => left.min(slice),
                     None => slice,
                 };
                 match table.wait(uaddr, val, Some(left), &|| mem.read_u32(uaddr).ok()) {
@@ -1447,9 +1450,9 @@ fn perform_block(
                 if v != want && gex_atomic::cas_u32(mem.bytes, uaddr, v, want).ok_or(Errno::EFAULT)?.is_err() {
                     continue;
                 }
-                let left = match deadline {
-                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
-                    Some(d) => d - start.elapsed(),
+                let left = match deadline.map(|d| d.checked_sub(start.elapsed())) {
+                    Some(None) | Some(Some(std::time::Duration::ZERO)) => return Err(Errno::ETIMEDOUT),
+                    Some(Some(left)) => left,
                     None => std::time::Duration::from_millis(100),
                 };
                 // In slices: the owner's UNLOCK_PI wakes this, and the word
