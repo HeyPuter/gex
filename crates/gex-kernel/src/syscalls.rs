@@ -721,6 +721,38 @@ fn write_timeval(m: &mut GuestMem<'_>, at: u64, nanos: u128) -> Result<(), Errno
 }
 
 /// The clock of a host that has one.
+/// CLOCK_MONOTONIC and its kin (RAW 4, COARSE 6, BOOTTIME 7, BOOTTIME_ALARM 9).
+fn is_monotonic_clock(clk: u64) -> bool {
+    matches!(clk, 1 | 4 | 6 | 7 | 9)
+}
+
+/// Where the monotonic clocks start: the wall clock at the first reading,
+/// less [`MONOTONIC_START_SECS`]. One base for every guest process of this
+/// host process, as on a machine every process shares the boot time.
+static MONOTONIC_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The "uptime" the guest sees at its first monotonic reading.
+const MONOTONIC_START_SECS: u64 = 1000;
+
+/// A monotonic clock reading made from a wall clock reading: seconds since
+/// a shared boot instant, not since the epoch. Programs truncate monotonic
+/// milliseconds to 32 bits and compare them across processes -- X server
+/// event times are `(CARD32)` CLOCK_MONOTONIC milliseconds, and Unity
+/// compares them with its own clock -- which only works while the uptime
+/// is under 49.7 days, as it is on real machines; an epoch-based value
+/// (1.8e12 ms) never agrees with its own truncation.
+fn monotonic_from((secs, nanos): (u64, u32)) -> (u64, u32) {
+    use std::sync::atomic::Ordering;
+    let mut base = MONOTONIC_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        let want = secs.saturating_sub(MONOTONIC_START_SECS).max(1);
+        base = match MONOTONIC_BASE.compare_exchange(0, want, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => want,
+            Err(other) => other,
+        };
+    }
+    (secs.saturating_sub(base), nanos)
+}
+
 pub fn system_clock() -> (u64, u32) {
     #[cfg(not(target_family = "wasm"))]
     {
@@ -2157,15 +2189,17 @@ impl Kernel {
                     if !mapped || a[0] % 4 != 0 {
                         return None;
                     }
-                    // An absolute time (CLOCK_REALTIME for LOCK_PI, the
-                    // monotonic clock for LOCK_PI2: one clock in gex).
+                    // An absolute time: CLOCK_REALTIME for LOCK_PI, the
+                    // monotonic clock for LOCK_PI2 (unless FUTEX_CLOCK_REALTIME).
                     let deadline = if a[3] == 0 {
                         None
                     } else {
                         let secs = m.read_u64(a[3]).ok()?;
                         let nanos = m.read_u64(a[3] + 8).ok()?;
                         let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
-                        let left = want.saturating_sub(self.now_nanos()).min(3600 * 1_000_000_000);
+                        let monotonic = operation == futex::op::LOCK_PI2 && (a[1] as u32) & futex::op::CLOCK_REALTIME == 0;
+                        let now = if monotonic { self.clock_nanos(1) } else { self.now_nanos() };
+                        let left = want.saturating_sub(now).min(3600 * 1_000_000_000);
                         Some(std::time::Duration::new((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u32))
                     };
                     return Some(BlockOp::FutexLockPi {
@@ -2212,13 +2246,18 @@ impl Kernel {
                     let secs = m.read_u64(a[3]).ok()?;
                     let nanos = m.read_u64(a[3] + 8).ok()?;
                     let want = secs as u128 * 1_000_000_000 + (nanos % 1_000_000_000) as u128;
-                    // `FUTEX_WAIT_BITSET | CLOCK_REALTIME` names an absolute
-                    // moment; read as a relative length it is ~55 years.
-                    // Plain `FUTEX_WAIT` really is relative.
-                    let absolute = (a[1] as u32) & !futex::op::PRIVATE_FLAG
-                        == futex::op::WAIT_BITSET | futex::op::CLOCK_REALTIME;
-                    let left = if absolute {
-                        want.saturating_sub(self.now_nanos())
+                    // `FUTEX_WAIT_BITSET` names an absolute moment: on
+                    // CLOCK_REALTIME with `FUTEX_CLOCK_REALTIME`, else on
+                    // CLOCK_MONOTONIC (what pthread_cond_clockwait and C++'s
+                    // steady-clock waits use). Plain `FUTEX_WAIT` really is
+                    // relative.
+                    let left = if operation == futex::op::WAIT_BITSET {
+                        let now = if (a[1] as u32) & futex::op::CLOCK_REALTIME != 0 {
+                            self.now_nanos()
+                        } else {
+                            self.clock_nanos(1)
+                        };
+                        want.saturating_sub(now)
                     } else {
                         want
                     };
@@ -3582,8 +3621,12 @@ impl Kernel {
     }
 
     /// `timerfd_create`: a clock as a descriptor for an event loop to poll.
-    fn sys_timerfd_create(&mut self, _clockid: u64, flags: u64) -> SysResult {
-        let handle = Arc::new(crate::timerfd::TimerFd::new(self.clock));
+    fn sys_timerfd_create(&mut self, clockid: u64, flags: u64) -> SysResult {
+        let mut timer = crate::timerfd::TimerFd::new(self.clock);
+        if is_monotonic_clock(clockid) {
+            timer = timer.monotonic(monotonic_from);
+        }
+        let handle = Arc::new(timer);
         let cloexec = flags & oflags::O_CLOEXEC != 0;
         let file = OpenFile::new(
             handle,
@@ -6253,6 +6296,7 @@ impl Kernel {
                 let t = self.cpu_nanos();
                 ((t / 1_000_000_000) as u64, (t % 1_000_000_000) as u32)
             }
+            c if is_monotonic_clock(c) => monotonic_from((self.clock)()),
             _ => (self.clock)(),
         };
         m.write_u64(buf, secs)?;
@@ -6300,6 +6344,10 @@ impl Kernel {
         const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
         match clk {
             CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => self.cpu_nanos(),
+            c if is_monotonic_clock(c) => {
+                let (secs, nanos) = monotonic_from((self.clock)());
+                secs as u128 * 1_000_000_000 + nanos as u128
+            }
             _ => self.now_nanos(),
         }
     }
@@ -6817,6 +6865,27 @@ mod tests {
     /// absolute deadline (none if it has passed), EINVAL for a malformed
     /// request instead of a sleep.
     #[test]
+    fn the_monotonic_clock_counts_from_boot_not_the_epoch() {
+        let (mut mem, mut k) = setup();
+        let at = 0x2000u64;
+        let mut read = |k: &mut Kernel, mem: &mut Vec<u8>, clk: u64| {
+            let mut m = GuestMem::new(mem);
+            k.sys_clock_gettime(&mut m, clk, at).unwrap();
+            m.read_u64(at).unwrap()
+        };
+        let wall = read(&mut k, &mut mem, 0);
+        let mono = read(&mut k, &mut mem, 1);
+        // An uptime: milliseconds fit the 32 bits X server times have.
+        assert!(mono >= 1 && mono < 49 * 86400, "monotonic {mono}");
+        assert!(wall > 1_000_000_000, "realtime {wall}");
+        // BOOTTIME and COARSE agree with it.
+        for clk in [6, 7] {
+            let other = read(&mut k, &mut mem, clk);
+            assert!(other.abs_diff(mono) <= 1, "clock {clk}: {other} vs {mono}");
+        }
+    }
+
+    #[test]
     fn clock_nanosleep_honours_absolute_deadlines() {
         let (mut mem, mut k) = setup();
         let at = 0x2000u64;
@@ -6831,7 +6900,8 @@ mod tests {
             };
             (op, now)
         };
-        let now = k.now_nanos() as i64 / 1_000_000_000;
+        // The request names clock 1, CLOCK_MONOTONIC.
+        let now = k.clock_nanos(1) as i64 / 1_000_000_000;
         // Relative: slept as given.
         match ask(&mut k, &mut mem, 0, 0, 5_000_000) {
             (Some(BlockOp::Sleep(d)), _) => assert_eq!(d, std::time::Duration::from_millis(5)),
