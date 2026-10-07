@@ -1232,6 +1232,12 @@ Not yet:
      timestamps (Unity's input queue orders events by time; position by
      polling would not care). Next: the X event `time` values against the
      guest's CLOCK_MONOTONIC as Unity reads it.
+  20. **Head c3b6288a (master 132f73ed merged, 2026-10-06):** gexc rebuilt
+     (`target/dbg-x86`); `scratch/unity/dnc` rebuilt from e61b5a4b (provider
+     unchanged since; `lib-extra` holds the Formatters assembly). Legs, walk
+     on by default: embed PASS; Muck batch --fjit "Initializing packets"
+     (mk10); Hollow Knight with graphics --fjit, no probe: the main menu with
+     its labels (hk122 f-300); gex-wayland tests 36/36.
      **Muck with the walk on by default:** batch, current gexc, --fjit:
      "Initializing packets" (mk8); without --fjit too (mk4). (mk1-mk3, mk6
      hung at ReloadAssembly: they ran the script's default
