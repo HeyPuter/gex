@@ -1,0 +1,35 @@
+diff --git a/src/mono/mono/mini/mini-wasm-emitter.inc b/src/mono/mono/mini/mini-wasm-emitter.inc
+index 9919357ca..11bfda8b6 100644
+--- a/src/mono/mono/mini/mini-wasm-emitter.inc
++++ b/src/mono/mono/mini/mini-wasm-emitter.inc
+@@ -635,6 +635,15 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 			if (wj_ins_is_move (ins->opcode))
+ 				continue;
+ 			rt = wasm_valtype_of_opcode (ins->opcode);
++#if WJ_W64
++			/* A negative 32-bit constant is sign-extended in its 64-bit register (inst_c0 is the 64-bit value,
++			 * and mini-amd64 moves it as one), and mono relies on it: conv.i of a constant is folded away, so
++			 * `Unsafe.Add (ref p, -1)` reads the ICONST as a native int. As an i32 local, read by an i64 op,
++			 * it would be zero-extended (0xffffffff): SpanHelpers.ClearWithReferences wrote 32 GiB past its
++			 * span (Hollow Knight). Such a constant lives in an i64 local; 32-bit readers wrap it. */
++			if (ins->opcode == OP_ICONST && (gint64) ins->inst_c0 < 0 && !(ins->type == STACK_OBJ && ins->inst_p0))
++				rt = WASM_I64;
++#endif
+ 			if (!rt && (ins->opcode == OP_CALL || ins->opcode == OP_FCALL || ins->opcode == OP_LCALL || ins->opcode == OP_RCALL
+ 					|| ins->opcode == OP_CALL_REG || ins->opcode == OP_FCALL_REG || ins->opcode == OP_LCALL_REG || ins->opcode == OP_RCALL_REG
+ 					|| ins->opcode == OP_CALL_MEMBASE || ins->opcode == OP_FCALL_MEMBASE || ins->opcode == OP_LCALL_MEMBASE || ins->opcode == OP_RCALL_MEMBASE)) {
+@@ -3704,6 +3713,14 @@ mono_wasm_emit_method (MonoCompile *cfg)
+ 					if (!wasm_st_from (&body, &lc, ins->dreg, WASM_PTR)) { fail = "iconst"; goto done; }
+ 					break;
+ 				} else {
++#if WJ_W64
++					/* the 64-bit register's value (see "negative 32-bit constant" in the valtype pass) */
++					if (ins->dreg >= 0 && ins->dreg < lc.nvreg && lc.vt [ins->dreg] == WASM_I64) {
++						wasm_i64_const (&body, (gint64) ins->inst_c0);
++						if (!wasm_st (&body, &lc, ins->dreg)) { fail = "iconst"; goto done; }
++						break;
++					}
++#endif
+ 					wasm_i32_const (&body, (gint32) ins->inst_c0);
+ 				}
+ 				if (!wasm_st_from (&body, &lc, ins->dreg, WASM_I32)) { fail = "iconst"; goto done; }
