@@ -228,6 +228,21 @@ down (the system log showed about 45,000 processes a minute). Now:
   | expat | 2/2 | 6 | 22,438 |
   | libpng | 32/32 | 6 | 4,539 |
   | lua, sqlite | 1/1 each | one host gexc each | — |
+  | gawk | 654/654 ("ALL TESTS PASSED") | 6 | 8,090 |
+  | sed | 206/214 (gnulib counted right; first in-guest run, before the path and select fixes) | 6 | 176,577 |
+
+  After that run (strace counting is now opt-in, `COUNT=1`, because it
+  slowed tar's suite):
+  - grep and diffutils stopped compiling in cross mode (gnulib's sigsegv
+    guessed a sigaltstack): fixed by `share/gexcc/config.site`, the answers
+    the same checks gave natively on gex.
+  - The gnulib failures in sed's guest run were gex bugs: trailing slashes
+    and `.`/`..` in creating calls (test-mkdir, test-rename, test-link,
+    test-symlink, test-rmdir, test-fopen), select's EBADF/EINVAL and a pipe
+    write end reported readable (test-select, test-pselect). Fixed, each
+    with a test (pathcorners, selectcorners); also O_NOFOLLOW and chown on
+    missing files (fscorners).
+  - findutils: its suites need DejaGnu (`runtest`), absent on gooner.
 
 - **Slots** (`gexcc-exec`): at most `GEXCC_SLOTS` (4) host-started gexcc
   programs run at once per user. The rest wait on an flock. Guest execs take
@@ -235,8 +250,10 @@ down (the system log showed about 45,000 processes a minute). Now:
   slots, all 6 overlap without.
 - **Every run** is wrapped in `systemd-run --user --scope -p TasksMax=256
   -p MemoryMax=32G nice -n 19`, one suite at a time, `-j2`.
-- **Not converted yet** (refused without `HOSTRUN=1`): gawk, tar (autotest),
-  make and curl (perl runners), bash, mbedtls and fmt (ctest), perl, python3.
+- **Converted:** automake suites, gawk, tar (autotest), bash's run-* loop,
+  CTest suites (`ctest-guest.py` writes the suite as one guest script).
+  **Not yet** (refused without `HOSTRUN=1`): make and curl (perl test
+  runners: need a gexcc perl in the guest), perl, python3.
 
 ## 3. Gaps found, and what fixed them
 
