@@ -25,7 +25,7 @@ TRIPLE=wasm32-unknown-linux-musl
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/gexcc" "$PREFIX/share/gexcc" "$PREFIX/build"
 
 # the sysroot (musl, libgex, compiler-rt, UAPI headers, binaryen)
-"$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
+GEX_WASM_LEGACY_EH=1 "$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
 ln -sfn build/sysroot "$PREFIX/sysroot"
 mkdir -p "$PREFIX/sysroot/usr/include" "$PREFIX/sysroot/usr/lib/pkgconfig" "$PREFIX/sysroot/usr/share/pkgconfig"
 # the rest of the Linux UAPI headers (build-sysroot.sh copies linux/, asm/,
@@ -75,8 +75,17 @@ done
 for t in gexcc-ar gexcc-ranlib gexcc-nm; do
   printf '#!/bin/sh\nexec llvm-%s "$@"\n' "${t#gexcc-}" > "$B/$t"; chmod +x "$B/$t"
 done
-# ld: wasm-ld (libtool asks for it; relocatable links, `ld -r`, mostly)
-printf '#!/bin/sh\nexec wasm-ld "$@"\n' > "$B/$TRIPLE-ld"; chmod +x "$B/$TRIPLE-ld"
+# ld: wasm-ld (libtool asks for it; relocatable links, `ld -r`, mostly).
+# Its version says it is GNU-compatible, as ld.lld's does: libtool decides
+# from that whether it knows how to make shared libraries.
+cat > "$B/$TRIPLE-ld" <<'LDEOF'
+#!/bin/sh
+case "$1" in
+  -v|-V|--version) echo "$(wasm-ld --version | head -1) (compatible with GNU linkers)"; exit 0 ;;
+esac
+exec wasm-ld "$@"
+LDEOF
+chmod +x "$B/$TRIPLE-ld"
 # strip: a program is a container around a wasm module; nothing to strip
 # (the module's names are what gex binds by)
 cat > "$B/$TRIPLE-strip" <<'EOF'

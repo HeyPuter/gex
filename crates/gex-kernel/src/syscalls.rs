@@ -3570,6 +3570,13 @@ impl Kernel {
             if let Some(base) = self.pin_for(&p) {
                 self.armed_pin = Some((p.clone(), base));
             }
+            // A directory opens for reading only, whatever the filesystem.
+            let acc = flags & oflags::ACCMODE;
+            if (acc == oflags::O_WRONLY || acc == oflags::O_RDWR)
+                && self.vfs.metadata(&p).is_ok_and(|md| md.file_type == FileType::Directory)
+            {
+                return Err(Errno::EISDIR);
+            }
             let h = self.vfs.open(&p, flags, mode)?;
             // And arm a placement, for an object nobody pinned. Only for a
             // shared object: the executable's own base is fixed by the
