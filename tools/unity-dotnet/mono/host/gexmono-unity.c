@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 #include "gexmono-adapters.h"
 #include <mono/metadata/class-internals.h>
 #include <mono/metadata/object-internals.h>
@@ -202,6 +203,42 @@ U(mono_array_new)
 			P (1) ? m_class_get_name ((MonoClass *)P (1)) : "?", (unsigned long long)A (2), a);
 	RET (a);
 }
+/* mono_gc_get_used_size: Unity asks every frame. SGen's answer walks every object of the major
+ * heap (major_iterate_objects with a full sweep), and under gex every object lives there (the
+ * Boehm-like mode): it was half of Hollow Knight's main thread in its menu. Boehm's answer, which
+ * Unity was written against, is O(1). Here the walk runs again only after a collection, or when the
+ * last answer is older than 500 ms; GEXMONO_USED_SIZE_EXACT=1 walks on every call. */
+static int64_t used_size_cached;
+static int used_size_gcs = -1;
+static int64_t used_size_at_ms;
+static pthread_mutex_t used_size_lock = PTHREAD_MUTEX_INITIALIZER;
+U(mono_gc_get_used_size)
+{
+	ENTER;
+	static int exact = -1;
+	if (exact < 0)
+		exact = getenv ("GEXMONO_USED_SIZE_EXACT") && atoi (getenv ("GEXMONO_USED_SIZE_EXACT")) > 0;
+	if (exact)
+		RET (mono_gc_get_used_size ());
+	struct timespec ts;
+	clock_gettime (CLOCK_MONOTONIC, &ts);
+	int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	int gcs = mono_gc_collection_count (mono_gc_max_generation ());
+	pthread_mutex_lock (&used_size_lock);
+	int stale = gcs != used_size_gcs || now - used_size_at_ms >= 500;
+	int64_t v = used_size_cached;
+	pthread_mutex_unlock (&used_size_lock);
+	if (stale) {
+		v = mono_gc_get_used_size ();
+		pthread_mutex_lock (&used_size_lock);
+		used_size_cached = v;
+		used_size_gcs = gcs;
+		used_size_at_ms = now;
+		pthread_mutex_unlock (&used_size_lock);
+	}
+	RET (v);
+}
+
 U(mono_gc_wbarrier_set_field)
 {
 	ENTER;
@@ -1099,6 +1136,6 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
 	L(mono_trace_set_log_handler) L(mono_dllmap_insert) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
-	L(mono_class_get_field_from_name) L(mono_class_is_subclass_of) L(mono_class_get_methods) L(mono_array_new) L(mono_gc_wbarrier_set_field) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
+	L(mono_gc_get_used_size) L(mono_class_get_field_from_name) L(mono_class_is_subclass_of) L(mono_class_get_methods) L(mono_array_new) L(mono_gc_wbarrier_set_field) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0
 };
