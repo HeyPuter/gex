@@ -9,7 +9,10 @@
 //! module, the calls among them direct `call`s, summaries over the batch
 //! (callees outside it count as unknown). What recovery learns -- function
 //! starts, which functions never return, what is translated -- is kept for
-//! the next request.
+//! the next request, per guest process: the native runner keeps one
+//! translator for every process in the tree (a shell, Xwayland and the game
+//! it starts), whose images sit at the same addresses with different code, so
+//! what one process's code taught must never be applied to another's.
 
 use crate::func::{self, Code, RecoverOptions, StartInfo};
 use crate::intrinsic::Intrinsic;
@@ -31,14 +34,14 @@ fn batch_limit() -> usize {
 #[derive(Default)]
 pub struct Jit {
     st: Mutex<State>,
-    /// Entries tier-1 serves with a host builtin (`memcpy` and friends, by
-    /// symbol): their functions are the builtin, as in tier-1.
-    /// Replaced on `execve` ([`Jit::exec`]).
-    intrinsics: std::sync::RwLock<HashMap<u64, Intrinsic>>,
 }
 
+/// What recovery learned of one process's code ([`Jit::image`] starts it over).
 #[derive(Default)]
-struct State {
+struct Learned {
+    /// Entries tier-1 serves with a host builtin (`memcpy` and friends, by
+    /// symbol): their functions are the builtin, as in tier-1.
+    intrinsics: std::sync::Arc<HashMap<u64, Intrinsic>>,
     /// Every function start seen: a call or jump to one is a call or tail
     /// call, and bounds the functions around it.
     starts: BTreeMap<u64, StartInfo>,
@@ -50,6 +53,16 @@ struct State {
     /// tracked past `mprotect`: data the guest makes writable later counts
     /// as read-only still.)
     readonly: Vec<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct State {
+    /// By process ([`Jit::translate_in`]'s `process`; 0 for a runner with one
+    /// process per translator, as the browser shim is).
+    procs: HashMap<u64, Learned>,
+    /// Processes [`Jit::forget`] dropped: a translation still in flight for
+    /// one must not bring its state back.
+    gone: HashSet<u64>,
     /// For `GEX_FJIT_STATS`: translations, functions, time in recovery and
     /// emission, module bytes.
     modules: u64,
@@ -61,7 +74,24 @@ struct State {
 
 impl Jit {
     pub fn new(intrinsics: HashMap<u64, Intrinsic>) -> Jit {
-        Jit { intrinsics: std::sync::RwLock::new(intrinsics), ..Jit::default() }
+        let jit = Jit::default();
+        jit.st.lock().unwrap_or_else(|e| e.into_inner()).procs.entry(0).or_default().intrinsics = std::sync::Arc::new(intrinsics);
+        jit
+    }
+
+    /// Process `process` runs a new program (`image`, the file `elf`): it
+    /// starts with what the loader knows of that image and nothing else --
+    /// a new process, or an `execve` over an old one.
+    pub fn image(&self, process: u64, intrinsics: HashMap<u64, Intrinsic>, image: &gex_ld::Image, elf: Option<&[u8]>) {
+        self.st.lock().unwrap_or_else(|e| e.into_inner()).procs.insert(process, Learned { intrinsics: std::sync::Arc::new(intrinsics), ..Learned::default() });
+        self.add_image_in(process, image, elf);
+    }
+
+    /// Process `process` is gone.
+    pub fn forget(&self, process: u64) {
+        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        st.procs.remove(&process);
+        st.gone.insert(process);
     }
 
     /// The process replaced its program (`execve`): forget everything
@@ -70,13 +100,7 @@ impl Jit {
     /// image now holds (a PIE replacing a PIE lands at the same base) --
     /// and start over from `image`.
     pub fn exec(&self, intrinsics: HashMap<u64, Intrinsic>, image: &gex_ld::Image, elf: Option<&[u8]>) {
-        *self.intrinsics.write().unwrap_or_else(|e| e.into_inner()) = intrinsics;
-        {
-            let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
-            let State { modules, functions, recover_us, emit_us, bytes, .. } = std::mem::take(&mut *st);
-            *st = State { modules, functions, recover_us, emit_us, bytes, ..State::default() };
-        }
-        self.add_image(image, elf);
+        self.image(0, intrinsics, image, elf);
     }
 
     /// What the loader knows of an image the program maps: its function
@@ -84,9 +108,14 @@ impl Jit {
     /// file, for `.eh_frame` and ELF32 symbols), with their extents, which
     /// bound functions and computed-goto tables as they do ahead of time.
     pub fn add_image(&self, image: &gex_ld::Image, elf: Option<&[u8]>) {
+        self.add_image_in(0, image, elf);
+    }
+
+    fn add_image_in(&self, process: u64, image: &gex_ld::Image, elf: Option<&[u8]>) {
         let code = Code::with_elf(image, elf);
         let (starts, _) = func::seeds(&code, elf, false);
-        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let st = guard.procs.entry(process).or_default();
         for (a, info) in starts {
             if info.strong() {
                 st.starts.insert(a, info);
@@ -114,6 +143,23 @@ impl Jit {
         page_gen: &dyn Fn(u64) -> u32,
         class32: bool,
     ) -> Option<Vec<u8>> {
+        self.translate_in(0, mem, addr, executable, read_only, volatile, page_gen, class32)
+    }
+
+    /// [`Jit::translate`] for guest process `process`, whose learned state
+    /// ([`Jit::image`]) is its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn translate_in(
+        &self,
+        process: u64,
+        mem: &[u8],
+        addr: u64,
+        executable: &dyn Fn(u64) -> bool,
+        read_only: &dyn Fn(u64, u64) -> bool,
+        volatile: &dyn Fn(u64) -> bool,
+        page_gen: &dyn Fn(u64) -> u32,
+        class32: bool,
+    ) -> Option<Vec<u8>> {
         if gex_abi::PPC || (class32 && !gex_abi::X86) {
             return None;
         }
@@ -124,8 +170,12 @@ impl Jit {
         if std::env::var("GEX_FJIT_STATS").as_deref() == Ok("2") {
             eprintln!("[fjit] translate {addr:#x}: bytes {:02x?}", &mem[addr as usize..addr as usize + 16]);
         }
-        let intrinsics = self.intrinsics.read().unwrap_or_else(|e| e.into_inner());
-        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let State { procs, gone, modules, functions: n_functions, recover_us, emit_us, bytes } = &mut *guard;
+        // A process already gone (a late request): what it learns goes nowhere.
+        let mut scratch = Learned::default();
+        let st = if gone.contains(&process) { &mut scratch } else { procs.entry(process).or_default() };
+        let intrinsics = std::sync::Arc::clone(&st.intrinsics);
         let readonly = st.readonly.clone();
         let ro = |a: u64, n: u64| readonly.iter().any(|&(lo, hi)| a >= lo && a.saturating_add(n) <= hi) || read_only(a, n);
         let code = Code::memory(mem, executable, &ro);
@@ -141,7 +191,7 @@ impl Jit {
             if batch.contains_key(&a) || (a != addr && st.translated.contains(&a)) || !executable(a) {
                 continue;
             }
-            let State { starts, noreturn, .. } = &mut *st;
+            let Learned { starts, noreturn, .. } = &mut *st;
             let f = func::recover_one(&code, a, starts, noreturn, &opts);
             if let Err(e) = f.verify().and_then(|_| block_local(&f)) {
                 if std::env::var_os("GEX_FJIT_STATS").is_some() {
@@ -223,7 +273,7 @@ impl Jit {
             // The batch as GIR text (`gex_ir::text`), to replay offline.
             let _ = std::fs::create_dir_all(&dir);
             let text: String = functions.iter().map(gex_ir::text::print).collect::<Vec<_>>().join("\n");
-            let _ = std::fs::write(format!("{dir}/{addr:x}.gir"), text);
+            let _ = std::fs::write(format!("{dir}/p{process}-{addr:x}.gir"), text);
         }
         // A bug in the emitter costs the batch its translation, not the
         // process: the fallback runs it.
@@ -243,7 +293,7 @@ impl Jit {
                 st.translated.extend(entries);
                 if let Ok(dir) = std::env::var("GEX_FJIT_KEEP") {
                     let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::fs::write(format!("{dir}/{addr:x}.wasm"), &wasm);
+                    let _ = std::fs::write(format!("{dir}/p{process}-{addr:x}.wasm"), &wasm);
                 }
                 Some(wasm)
             }
@@ -258,13 +308,13 @@ impl Jit {
                 None
             }
         };
-        st.modules += 1;
-        st.functions += n as u64;
-        st.recover_us += recovered;
-        st.emit_us += now_us().saturating_sub(started).saturating_sub(recovered);
-        st.bytes += out.as_ref().map_or(0, |w| w.len() as u64);
-        if std::env::var_os("GEX_FJIT_STATS").is_some() && st.modules.is_power_of_two() {
-            eprintln!("[fjit] {}", st.line());
+        *modules += 1;
+        *n_functions += n as u64;
+        *recover_us += recovered;
+        *emit_us += now_us().saturating_sub(started).saturating_sub(recovered);
+        *bytes += out.as_ref().map_or(0, |w| w.len() as u64);
+        if std::env::var_os("GEX_FJIT_STATS").is_some() && modules.is_power_of_two() {
+            eprintln!("[fjit] {}", stats_line(*modules, *n_functions, *recover_us, *emit_us, *bytes));
         }
         out
     }
@@ -342,19 +392,20 @@ pub use gex_cgen::func::ret_pops;
 
 impl State {
     fn line(&self) -> String {
-        let n = self.functions.max(1);
-        format!(
-            "{} modules, {} functions; recovery {:.1} ms ({} us/function), emission {:.1} ms ({} us/function), {} wasm bytes ({}/function)",
-            self.modules,
-            self.functions,
-            self.recover_us as f64 / 1e3,
-            self.recover_us / n,
-            self.emit_us as f64 / 1e3,
-            self.emit_us / n,
-            self.bytes,
-            self.bytes / n
-        )
+        stats_line(self.modules, self.functions, self.recover_us, self.emit_us, self.bytes)
     }
+}
+
+fn stats_line(modules: u64, functions: u64, recover_us: u64, emit_us: u64, bytes: u64) -> String {
+    let n = functions.max(1);
+    format!(
+        "{modules} modules, {functions} functions; recovery {:.1} ms ({} us/function), emission {:.1} ms ({} us/function), {bytes} wasm bytes ({}/function)",
+        recover_us as f64 / 1e3,
+        recover_us / n,
+        emit_us as f64 / 1e3,
+        emit_us / n,
+        bytes / n
+    )
 }
 
 

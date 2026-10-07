@@ -1,0 +1,21 @@
+# Katana ZERO (1920x1080): past the autosave notice and the disclaimer
+# (Enter), the title menu (menu 900; clicks do not reach GameMaker's
+# menu, keys do): up to New Game, Enter, then Enter through what follows.
+300:key:0x0d
+500:key:0x0d
+950:key:0x26
+1000:key:0x0d
+1150:key:0x0d
+1250:key:0x0d
+1350:key:0x0d
+1450:key:0x0d
+1550:key:0x0d
+1650:key:0x0d
+1750:key:0x0d
+1850:key:0x0d
+1950:key:0x0d
+2050:key:0x0d
+2150:key:0x0d
+2250:key:0x0d
+2350:key:0x0d
+2450:key:0x0d

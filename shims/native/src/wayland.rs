@@ -321,7 +321,13 @@ impl Wayland {
     /// kernel locates a buffer's pixels through its shared mappings; guest
     /// memory is where they are.
     pub fn pump(&self, kernel: &Kernel, mem: &GuestMem<'_>) {
-        // Scripted input waits for a client that can take it (a seat and a surface).
+        // Scripted input waits for a client that can take it (a seat and a
+        // surface); a GL-only window gets the keyboard by default.
+        if self.inner.input.lock().unwrap().is_some() {
+            for s in self.inner.sessions.lock().unwrap().iter_mut() {
+                s.client.focus_fallback();
+            }
+        }
         let ready = self.inner.sessions.lock().unwrap().iter().any(|s| s.client.input_ready());
         let due = if ready { self.due_input() } else { Vec::new() };
         let mut sessions = self.inner.sessions.lock().unwrap();

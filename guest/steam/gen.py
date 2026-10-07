@@ -59,6 +59,14 @@ OVERRIDES = {
     'ISteamGameServer::BLoggedOn': ('', 'return true;'),
     'ISteamGameServer::BSecure': ('', 'return false;'),
     'ISteamGameServer::GetSteamID': ('', 'return gex_steam_id();'),
+    # Stats are there and empty: Baba Is You quits when its request fails.
+    'ISteamUserStats::RequestCurrentStats': ('', 'return true;'),
+    'ISteamUserStats::StoreStats': ('', 'return true;'),
+    'ISteamUserStats::SetAchievement': ('', 'return true;'),
+    'ISteamUserStats::ClearAchievement': ('', 'return true;'),
+    'ISteamUserStats::GetAchievement': ('const char *name, bool *got', '(void)name; if (got) *got = false; return true;'),
+    'ISteamRemoteStorage::IsCloudEnabledForAccount': ('', 'return false;'),
+    'ISteamRemoteStorage::IsCloudEnabledForApp': ('', 'return false;'),
 }
 
 # Aggregates returned by value: sizes for the i386 and x86-64 layouts.

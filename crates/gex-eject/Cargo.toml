@@ -15,6 +15,7 @@ gex-native.workspace = true
 gex-kernel.workspace = true
 gex-cgen.workspace = true
 gex-ir.workspace = true
+gex-key.workspace = true
 anyhow = "1"
 wasmparser = "0.219.2"
 

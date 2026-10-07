@@ -1711,9 +1711,9 @@ Heads:
   tests/nt i386 **32 of 40** (`$W/w3-nt8.log`; user_win and gdi pass; left:
   lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
   glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`); winewayland.drv draws on gex's
-  compositor (`$W/pfx-w3wl`). Next: output modes, keyboard, then W3.4 GL. Wine fork head 4e9cf004685 (mw).
-  gate2 004538a9 is gating as integ/2026-10-06f (E's page landed, master
-  a0bbb53c). The old merge/elf-prov-gate is deleted. To
+  compositor (`$W/pfx-w3wl`). Output modes (Wine's EmulateModeset) and VkKeyScan done; W3.4 GL in progress (opengl32 on gex-gl's EGL). Wine fork head 74de38ed1ba (mw).
+  **gate2 landed** (master 36f55bb6; merge/w3 has master 132f73ed merged
+  in). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.

@@ -269,6 +269,8 @@ async function handle(msg) {
   // says it has delivered (a shared counter it bumps per message).
   let outputSent = 0;
   const outputAck = msg.outputAck ? new Int32Array(msg.outputAck) : null;
+  // Unit-cache files the page fetched ahead (`file:<rel>` in preModules).
+  const preFiles = new Map((msg.preModules ?? []).filter(([k]) => k.startsWith('file:')).map(([k, v]) => [k.slice(5), v]));
   class WorkerEnv extends Env {
     /**
      * Wait until the host has delivered everything this Worker wrote: called
@@ -369,6 +371,9 @@ async function handle(msg) {
     loadFile(rel) {
       const c = msg.cgen;
       if (!c) return null;
+      // Fetched by the page ahead of time (an ejected page's preload list).
+      const pre = preFiles.get(rel);
+      if (pre) return pre.slice(); // an unshared copy: Module and TextDecoder refuse shared views
       try {
         if (c.root) {
           const fs = globalThis.process?.getBuiltinModule?.('node:fs');
@@ -427,7 +432,7 @@ async function handle(msg) {
   if ((msg.providers ?? msg.opts?.providers) === 0) gex.noElfProviders();
   // Any sibling modules the host already had when this Worker started.
   for (const [key, mod] of msg.sharedModules ?? []) gex.addSharedModule(key, mod);
-  for (const [key, mod] of msg.preModules ?? []) gex.addSharedModule(key, mod);
+  for (const [key, mod] of msg.preModules ?? []) if (!key.startsWith('file:')) gex.addSharedModule(key, mod);
   if (globalThis.GEX_SHARE_TRACE || msg.shareTrace) console.warn(`[share] ${msg.kind} start with ${(msg.sharedModules ?? []).length} shared modules (${(msg.sharedModules ?? []).filter(([k]) => String(k).startsWith('cgen:')).length} units)`);
 
   // The GL device (gles-gears): the page's GlDevice, reached over a ring in a

@@ -200,6 +200,7 @@ run options:
   --verbose       report translation statistics
   --env K=V       add an environment variable (repeatable)
   --sysroot DIR   present DIR as the guest's root filesystem
+  --bind H=G      mount host file or directory H at guest path G (repeatable)
   --busybox FILE  present FILE (a wasm32 busybox) as /bin/sh and the common
                   coreutils in /bin and /usr/bin (GEX_BUSYBOX_APPLETS: the list)
   --pin FILE      place each object where FILE says, as written by
@@ -353,6 +354,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
                 i += 1;
                 let v = args.get(i).context("--sysroot needs a directory")?;
                 opts.sysroot = Some(v.into());
+            }
+            "--bind" => {
+                i += 1;
+                let v = args.get(i).context("--bind needs HOST=GUEST")?;
+                let (host, guest) = v.split_once('=').context("--bind wants HOST=GUEST")?;
+                anyhow::ensure!(guest.starts_with('/'), "--bind {v}: the guest path must be absolute");
+                let host = std::fs::canonicalize(host).with_context(|| format!("--bind {v}"))?;
+                opts.binds.push((host, guest.to_string()));
             }
             "--busybox" => {
                 i += 1;
@@ -540,12 +549,16 @@ struct FjitTranslator(gex_xlate::fjit::Jit);
 impl gex_kernel::ftab::Translator for FjitTranslator {
     fn translate(&self, req: &gex_kernel::ftab::Request<'_>) -> Option<gex_kernel::ftab::Translated> {
         self.0
-            .translate(req.mem, req.addr, req.executable, req.read_only, req.volatile, req.page_gen, req.class32)
+            .translate_in(req.process, req.mem, req.addr, req.executable, req.read_only, req.volatile, req.page_gen, req.class32)
             .map(|wasm| gex_kernel::ftab::Translated { wasm })
     }
 
-    fn exec(&self, program: &gex_ld::Program, bytes: &[u8]) {
-        self.0.exec(gex_xlate::intrinsic::program_intrinsics(program), &program.exe, Some(bytes));
+    fn image(&self, process: u64, program: &gex_ld::Program, bytes: Option<&[u8]>) {
+        self.0.image(process, gex_xlate::intrinsic::program_intrinsics(program), &program.exe, bytes);
+    }
+
+    fn forget(&self, process: u64) {
+        self.0.forget(process);
     }
 }
 
@@ -671,9 +684,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     .with_context(|| format!("loading {}", ra.path))?;
     ra.xlate.intrinsics = gex_xlate::intrinsic::program_intrinsics(&program);
     if ra.xlate.no_blocks {
-        let jit = gex_xlate::fjit::Jit::new(ra.xlate.intrinsics.clone());
-        jit.add_image(&program.exe, Some(&bytes));
-        gex_kernel::ftab::set_translator(Box::new(FjitTranslator(jit)));
+        // The program's image is registered per process when it starts
+        // (`Translator::image`, from the native runner).
+        gex_kernel::ftab::set_translator(Box::new(FjitTranslator(gex_xlate::fjit::Jit::new(Default::default()))));
+        ra.xlate.image_elf = Some(std::sync::Arc::from(bytes.as_slice()));
     }
 
     // argv[0] is the path as invoked, then whatever followed. Under a sysroot

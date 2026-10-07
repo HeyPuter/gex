@@ -5288,7 +5288,7 @@ impl Kernel {
 
     // -- sockets ---------------------------------------------------------------
 
-    /// `socket`. Only AF_INET, and only the two kinds that matter: a stream,
+    /// `socket`. AF_UNIX, an inert AF_NETLINK (below), and AF_INET with only the two kinds that matter: a stream,
     /// which the host carries, and a datagram, which only ever goes to the
     /// resolver this kernel is.
     fn sys_socket(&mut self, domain: u64, ty: u64) -> SysResult {
@@ -5312,6 +5312,18 @@ impl Kernel {
             sock.set_nonblocking(nonblock);
             let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
             return self.install_unix(sock, flags, ty & SOCK_CLOEXEC != 0);
+        }
+        // AF_NETLINK, which libudev's device monitor opens (SDL's joystick
+        // and haptic start-up through it; a failure there made SDL_Init undo
+        // its video subsystem too, and Unity 6 then saw no display). There
+        // are no devices to announce, so the socket binds, takes its options
+        // and never has a message: an empty eventfd behind the descriptor.
+        const AF_NETLINK: u64 = 16;
+        if domain == AF_NETLINK {
+            let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::eventfd::EventFd::new(0, false));
+            let flags = if ty & SOCK_NONBLOCK != 0 { crate::fs::oflags::O_NONBLOCK } else { 0 };
+            let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
+            return self.fds.insert(file, ty & SOCK_CLOEXEC != 0);
         }
         let Some(net) = self.net.clone() else {
             return Err(Errno::EAFNOSUPPORT);

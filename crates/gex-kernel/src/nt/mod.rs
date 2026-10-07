@@ -885,10 +885,10 @@ pub fn hardware_exception(
         return Outcome::Exit(code);
     };
     let abi = p.abi;
-    if p.cfg.trace {
+    if p.cfg.trace || std::env::var_os("GEX_NT_TRACE_EXC").is_some() {
         let r = |o: usize| g.u64(ctx_addr + o as u64).unwrap_or(0);
         crate::nt_log!(
-            "[nt:{:x}] exception {code:#010x} at {} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
+            "[nt:{:x}] exception {code:#010x} {info:x?} at {} (sp {:#x}, last indirect branch {:#x} from block {:#x})",
             t.tid,
             p.describe_addr(rip),
             r(ctx::x(4)),

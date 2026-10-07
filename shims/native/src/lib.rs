@@ -126,6 +126,10 @@ pub struct RunOptions {
     /// `/bin/sh` and the common coreutils in `/bin` and `/usr/bin`, so a
     /// script's shell and tools run natively instead of being translated.
     pub busybox: Option<std::path::PathBuf>,
+    /// `--bind HOST=GUEST`: host files or directories mounted at guest paths
+    /// (over whatever is there), e.g. a caching `xkbcomp` over
+    /// `/usr/bin/xkbcomp` for a translated Xwayland.
+    pub binds: Vec<(std::path::PathBuf, String)>,
     /// The program file when argv[0] does not name it (`--busybox` running
     /// `/bin/sh`): what `/proc/self/exe` is, which hush re-executes.
     pub exe: Option<String>,
@@ -195,6 +199,7 @@ impl Default for RunOptions {
             verbose: false,
             sysroot: None,
             busybox: None,
+            binds: Vec::new(),
             exe: None,
             identity: None,
             sample: false,
@@ -1107,6 +1112,14 @@ fn run_program_with(
             limits: xlate.limits,
             ftab: None,
         });
+        // (An NT program's images are the NT layer's to describe: as before,
+        // the translator starts from nothing for it.)
+        if let Some(t) = gex_kernel::ftab::translator().filter(|_| nt_setup.is_none()) {
+            let process = store.data().jit.as_ref().map(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.process.0);
+            if let Some(process) = process {
+                t.image(process, program, xlate.image_elf.as_deref());
+            }
+        }
     }
     if !aot_shared.is_empty() {
         aot::install_shared(&mut store, aot_shared)?;
@@ -1725,6 +1738,19 @@ fn run_thread_loop(
                             let at = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
                             eprintln!("gex: thread {} context pc {at:#x}", store.data().thread.tid);
                             let maps = store.data_mut().with_kernel(|k| k.mem.proc_maps());
+                            // GEX_TRACE_SEGV=2: the whole map, to place the registers.
+                            if std::env::var("GEX_TRACE_SEGV").as_deref() == Ok("2") {
+                                eprintln!("gex: guest maps:\n{maps}");
+                                // And the first words at each register that points into memory.
+                                let bytes = memory.bytes();
+                                for r in 0..16u64 {
+                                    let v = read_u64(bytes, (ctx_addr + ctx::x(r as u8) as u64) as usize);
+                                    if v >= 0x10000 && (v as usize) + 64 <= bytes.len() {
+                                        let words: Vec<String> = (0..8).map(|i| format!("{:#x}", read_u64(bytes, v as usize + i * 8))).collect();
+                                        eprintln!("gex: x{r} {v:#x}: {}", words.join(" "));
+                                    }
+                                }
+                            }
                             for l in maps.lines() {
                                 let mut r = l.split(|c| c == '-' || c == ' ');
                                 let (Some(a), Some(b)) = (r.next(), r.next()) else { continue };
@@ -1733,6 +1759,11 @@ fn run_thread_loop(
                                     eprintln!("gex: in {l}");
                                 }
                             }
+                            // And the registers and the return addresses on the stack, as GEX_DUMP_ABORT prints them.
+                            let vmas = store.data_mut().with_kernel(|k| k.mem.vmas().to_vec());
+                            let tid = store.data().thread.tid;
+                            let mut gm = GuestMem::new(memory.bytes());
+                            dump_guest(&mut gm, ctx_addr, tid, &vmas);
                         }
                     }
                     if action.handler == 0 {
@@ -2106,9 +2137,10 @@ fn exec_program(
     // one holds now.
     let mut xlate = xlate.clone();
     xlate.intrinsics = gex_xlate::intrinsic::program_intrinsics(&program);
-    if let Some(t) = gex_kernel::ftab::translator() {
-        t.exec(&program, &bytes);
-    }
+    // The run-time translator hears of the new image when its process half
+    // is made (`Translator::image`, in `run_program_with`): a new identity,
+    // so nothing learned of the old image, or of another process, applies.
+    xlate.image_elf = Some(Arc::from(bytes.as_slice()));
     // Descriptors marked close-on-exec go now; the rest survive, which is how
     // a shell hands a pipe to the command it starts.
     kernel.close_on_exec();
@@ -2305,6 +2337,9 @@ fn mount_filesystems(
                 kernel.vfs.mount(&format!("{dir}/{name}"), Arc::new(HostFs::read_only(bb)));
             }
         }
+    }
+    for (host, guest) in &opts.binds {
+        kernel.vfs.mount(guest, Arc::new(HostFs::new(host)));
     }
     let mut devfs = DevFs::new();
     if opts.gl {
@@ -3408,6 +3443,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     let gm = GuestMem::new(m.bytes());
                     let bytes: Vec<String> = gm.read(pc as u64, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect()).unwrap_or_default();
                     eprintln!("gex-nt: illegal instruction at {:#x}: {}", pc as u64, bytes.join(" "));
+                    fault_context(&gm, _ctx, pc as u64);
                 }
                 return nt::fault_at(&mut caller, nt::Fault::Illegal, pc as u64, resumable);
             }
@@ -3472,11 +3508,26 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     let data = memory.bytes();
                     let c = ctx as u32 as usize;
                     let r = |i: u8| read_u64(data, c + ctx::x(i));
+                    if trace_ring_on() {
+                        let sp = r(4) as usize;
+                        let top = data.get(sp..sp + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+                        let e = [pc as u64, sp as u64, top, read_u64(data, c + ctx::LAST_TARGET), read_u64(data, c + ctx::LAST_SOURCE)];
+                        TRACE_RING.with(|t| {
+                            let mut t = t.borrow_mut();
+                            if t.len() >= 512 {
+                                t.pop_front();
+                            }
+                            t.push_back(e);
+                        });
+                        return Ok(());
+                    }
                     if gex_abi::X86 {
                         eprintln!(
-                            "[trace] pc={pc:#x} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} fl={:#x}",
-                            r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9), r(10), r(11), r(12), r(13), r(14), r(15),
-                            read_u64(data, c + ctx::NZCV)
+                            "[trace] pc={pc:#x} tid={} rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} fl={:#x} [rsp]={:#x} [rsp+8]={:#x} last={:#x}<-{:#x}",
+                            ctx, r(0), r(1), r(2), r(3), r(4), r(5), r(6), r(7), r(8), r(9), r(10), r(11), r(12), r(13), r(14), r(15),
+                            read_u64(data, c + ctx::NZCV),
+                            data.get(r(4) as usize..r(4) as usize + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap())), data.get(r(4) as usize + 8..r(4) as usize + 16).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap())),
+                            read_u64(data, c + ctx::LAST_TARGET), read_u64(data, c + ctx::LAST_SOURCE)
                         );
                     } else {
                         let regs: Vec<String> = (0..31u8).map(|i| format!("x{i}={:#x}", r(i))).collect();
@@ -3490,6 +3541,32 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return Ok(());
             }
             if caller.data().nt.is_some() {
+                // A privileged instruction: log the bytes there now and the
+                // block that trapped, so a stale or misaligned translation
+                // (bytes that are no longer `hlt`/`in`/`out`/`int n`) shows.
+                if trace_ring_on() && imm != gex_abi::imports::BRK_GENERAL_PROTECTION {
+                    if let Some(m) = caller.data().memory.clone() {
+                        eprintln!("gex-nt: fault {imm} at {:#x}", pc as u64);
+                        fault_context(&GuestMem::new(m.bytes()), ctx, pc as u64);
+                    }
+                }
+                if imm == gex_abi::imports::BRK_GENERAL_PROTECTION {
+                    if let Some(m) = caller.data().memory.clone() {
+                        let gm = GuestMem::new(m.bytes());
+                        let at = |a: u64| -> String { gm.read(a, 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")).unwrap_or_default() };
+                        let c = ctx as u32 as u64;
+                        let src = gm.read_u64(c + ctx::LAST_SOURCE as u64).unwrap_or(0);
+                        let tgt = gm.read_u64(c + ctx::LAST_TARGET as u64).unwrap_or(0);
+                        eprintln!(
+                            "gex-nt: privileged instruction at {:#x}: {} (last source {src:#x}: {}; last target {tgt:#x}: {})",
+                            pc as u64,
+                            at(pc as u64),
+                            at(src),
+                            at(tgt)
+                        );
+                        fault_context(&gm, ctx, pc as u64);
+                    }
+                }
                 return nt::fault_at(&mut caller, nt::Fault::from_brk(imm), pc as u64, resumable);
             }
             // A divide error (`Stmt::Trap`): x86 #DE. Linux reports a zero
@@ -3791,6 +3868,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             if op == gex_abi::cache_op::IC_INVALIDATE {
                 let addr = addr as u64;
+                if std::env::var_os("GEX_TRACE_GUARD").is_some() {
+                    eprintln!("[guard] {addr:#x} changed (block {:#x})", pc as u64);
+                }
                 let page = addr / gex_abi::DISPATCH_PAGE;
                 retire_translations(
                     &mut caller,
@@ -5389,4 +5469,40 @@ pub(crate) fn check_i386_high(cx: &impl wasmtime::AsContext<Data = HostState>, s
             eprintln!("gex: GEX_CHECK_I386_HIGH: x{i} = {v:#x} after {site} (pc {pc:#x})");
         }
     }
+}
+
+/// The bytes around a faulting pc and the top of the guest stack (NT
+/// faults; RW debugging of Mono JIT code).
+fn trace_ring_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_TRACE_RING").is_some())
+}
+
+thread_local! {
+    /// `GEX_TRACE_RING=1`: the last blocks this thread entered among those
+    /// traced (`GEX_TRACE_RANGE`): pc, rsp, [rsp], last target, last source.
+    static TRACE_RING: std::cell::RefCell<std::collections::VecDeque<[u64; 5]>> = Default::default();
+}
+
+fn fault_context(gm: &GuestMem<'_>, ctx: i32, pc: u64) {
+    TRACE_RING.with(|t| {
+        for e in t.borrow().iter() {
+            eprintln!("gex-nt:   ring pc {:#x} rsp {:#x} [rsp] {:#x} last {:#x}<-{:#x}", e[0], e[1], e[2], e[3], e[4]);
+        }
+    });
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+    if let Ok(b) = gm.read(pc.saturating_sub(64), 96) {
+        eprintln!("gex-nt:   bytes {:#x}: {}", pc.saturating_sub(64), hex(&b));
+    }
+    let c = ctx as u32 as u64;
+    let sp = gm.read_u64(c + gex_abi::ctx::X as u64 + 4 * 8).unwrap_or(0);
+    let words: Vec<String> = (0..12).map(|i| format!("{:#x}", gm.read_u64(sp + 8 * i).unwrap_or(0))).collect();
+    eprintln!("gex-nt:   rsp {sp:#x}: {}", words.join(" "));
+    let ret = gm.read_u64(sp).unwrap_or(0);
+    if let Ok(b) = gm.read(ret.saturating_sub(32), 40) {
+        eprintln!("gex-nt:   before [rsp] {:#x}: {}", ret.saturating_sub(32), hex(&b));
+    }
+    let names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+    let regs: Vec<String> = (0..16).map(|i| format!("{}={:#x}", names[i], gm.read_u64(c + gex_abi::ctx::X as u64 + 8 * i as u64).unwrap_or(0))).collect();
+    eprintln!("gex-nt:   regs {}", regs.join(" "));
 }
