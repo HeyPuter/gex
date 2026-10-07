@@ -70,8 +70,17 @@ pub fn start() {
                 let it = libc::itimerval { it_interval: tv, it_value: tv };
                 libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
             }
+            // `GEX_PROF_SHARE=1`: the AOT-share line (which tier the samples
+            // hit) every 10 s on stderr, for guests with no GEX_NT_STATS
+            // (Linux programs).
+            let share = std::env::var_os("GEX_PROF_SHARE").is_some_and(|v| v != "0");
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
+                if share {
+                    if let Some(l) = gex_native::aot_share::line() {
+                        eprintln!("[gex-prof] {l}");
+                    }
+                }
                 dump(&path);
             }
         });

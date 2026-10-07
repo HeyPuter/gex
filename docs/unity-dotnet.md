@@ -1232,6 +1232,27 @@ Not yet:
      timestamps (Unity's input queue orders events by time; position by
      polling would not care). Next: the X event `time` values against the
      guest's CLOCK_MONOTONIC as Unity reads it.
+  19b. **The dropped input was the monotonic clock (02b4f7f7, hk123-hk124):**
+     gex answered CLOCK_MONOTONIC with the wall clock (~1.8e12 ms). Xwayland
+     stamps events with `(CARD32)` monotonic milliseconds (the spy: event time
+     338241355 against Unity's monotonic 1791339769010), and Unity's input
+     layer compares event times with its own monotonic clock, so every key
+     and button was dropped while polled pointer positions worked. The
+     monotonic clocks now count from one boot instant per host process (the
+     first reading less 1000 s), and the absolute waits on them follow
+     (clock_nanosleep TIMER_ABSTIME, monotonic timerfd, FUTEX_LOCK_PI2,
+     FUTEX_WAIT_BITSET without FUTEX_CLOCK_REALTIME, which had been read as a
+     relative length capped at an hour). With it (hk124) the scripted Enter
+     opens Select Profile, the next one starts a new game and Hollow Knight
+     shows its first-run screen-scale page. The now-real futex deadlines
+     exposed a host race (check the deadline, then subtract a later
+     reading: "overflow when subtracting durations"), fixed in 4a4510fb.
+     GexProbe's legacy-Input log still shows no keys (Hollow Knight reads
+     input through InControl; the probe's view is not evidence either way).
+     Also checked: Unity's SDL keymap at init is complete (XDisplayKeycodes
+     8..255, XkbKeycodeToKeysym 9 -> Escape...), its window gets a normal
+     FocusIn, and it selects XI2 raw button/motion on the root and XI2
+     motion/touch on its window.
   20. **Head c3b6288a (master 132f73ed merged, 2026-10-06):** gexc rebuilt
      (`target/dbg-x86`); `scratch/unity/dnc` rebuilt from e61b5a4b (provider
      unchanged since; `lib-extra` holds the Formatters assembly). Legs, walk
@@ -1245,3 +1266,158 @@ Not yet:
      per-process fix, not a regression.) HK reaches Menu_Title with the
      walk on by default in every run since hk109.
 
+  21. **Speed on a bench box (2026-10-07, restarted stream U; head after
+     ba7d2dc7 = master 5a066f67 merged).** The user's concern: Hollow Knight's
+     start-up (~4.5 min to the first frame, ~12.7 min to the menu) and 5-15 fps,
+     all from gooner (loaded, llvmpipe). No game runs on gooner any more: games
+     run on edger (`scratch/bench/bench.sh`).
+     - **Harness:** `tests/games/unity-bench.sh hk|muck RUN SECS [gexc flags]`
+       wraps muck-dotnet.sh with graphics and writes `meta.txt`, `plog-t.txt`
+       (the player log with ms since start), out.txt with `[gex-gl] first
+       present` and `[gex-gl] presents/s` (`GEX_GL_FPS=1`, gex-gl host: the
+       game's own swaps, not compositor commits) and with `PROF=1` the
+       `[gex-prof] AOT x% of guest` line every 10 s (`GEX_PROF_SHARE=1`; new
+       kind `provider-jit` for the .NET wasm JIT's modules) and prof.txt.
+       `tests/games/unity-bench-sum.py RUN` prints the milestones and the menu
+       fps window. Run as `scratch/bench/bench.sh -s
+       /home/claude/gex-sandbox/wt/unity/tests/games -- env PROF=1 bash
+       wt/unity/tests/games/unity-bench.sh hk scratch/unity/eruns/NAME 1200
+       --fjit`.
+     - **edger staging** (same paths as gooner): `games-linux/{Hollow
+       Knight,Muck}`, `scratch/unity/dnc/{provider/mono.wasm,lib,lib-extra}`,
+       `scratch/unity/gl64`, `~/.dotnet/shared/Microsoft.NETCore.App/10.0.10`,
+       `scratch/unity/edger/gexc` (copy of `target/dbg-x86/release/gexc`),
+       `scratch/unity/edger/bin/Xwayland` (gooner's 22.1; edger has none; passed
+       as `--env XWAYLAND=`), `scratch/unity/edger/llvm-bin/{clang,wasm-ld}`
+       wrapping gooner's LLVM 22 copied to edger `~/toolchains/llvm-22` (+
+       `edger/llvm-libs`): gexc links provider modules with wasm-ld at run
+       time (`GEX_CLANG`/`GEX_WASM_LD`, set by unity-bench.sh).
+     - **edger fixes:** Xwayland aborted in NVIDIA's EGL (its swrast GLX opens
+       EGL through glvnd): xwayland-inguest.sh sets `XWAYLAND_NO_GLAMOR=1` and
+       `__EGL_VENDOR_LIBRARY_FILENAMES` to Mesa's.
+     - **Start-up is translation:** the first edger profile (first 2 min) is
+       Cranelift + gex_xlate recovery on the thread that missed (the fjit
+       translates synchronously), ~1-1.5 cores busy of 8.
+     - **ELF units (new, this commit):** `GEX_ELF_UNITS=UnityPlayer.so[,..|all]`
+       installs a function-tier unit for a Linux shared object at its mapped
+       bias (`nt_cgen::on_elf_maps`, after `elfprov` in the Linux map hook;
+       `CodeMap` now carries the file offset); a missing one is built in the
+       background for the next run (`GEX_ELF_UNITS_BUILD=0` stops that;
+       `gexc cgen-image --elf SO --base HEX --mem64 --jobs N` builds one by
+       hand). The object must land at the same base every run: `--pin FILE`
+       with a line `BASE SPAN UnityPlayer.so`.
+     - **Liveness walk (provider, this commit):** class shapes (reference
+       offsets per class, value types flattened, filter test cached) and a
+       lock-free generation-tagged visited set replace the per-object field
+       iteration and the mutex-guarded hash; `GEXMONO_LV_NOSHAPE=1` walks as
+       before for A/B.
+     - **First edger numbers (native, `--fjit`, 800x600, cores
+       2,4,6,8,14,16,18,20, PROF=1; UnityPlayer and every guest library on
+       the function JIT, the .NET side on the interpreter, no wasm JIT; runs
+       `scratch/unity/eruns/*`, summaries in `*.out`):**
+
+       | run | what | first present | menu ready | menu unload MarkObjects | menu fps (20-80 s after) |
+       |---|---|---|---|---|---|
+       | hk-e1 | cold | 472.5 s | 539.5 s | 17.8 s | 24.5 |
+       | hk-e2 | cold, `GEX_FJIT_CACHE=1` writing | 449.7 s | 518.4 s | 19.2 s | 23.5 |
+       | hk-e3 | warm `GEX_FJIT_CACHE=1` | 243.2 s | 301.4 s | 18.7 s | 24.3 |
+       | hk-e4 | warm, shape walk provider (`dnc-shape`) | 249.7 s | 294.2 s | 0.75 s | 24.0 |
+       | mk-e1 | Muck cold, cache on | 230.8 s | packets 316.4 s | - | 33.6 (last quarter 30.8) |
+
+       "Menu ready" is the post-Menu_Title unload. The player log's first line
+       comes 262 s (cold) / 117 s (warm) after the start: ld.so and
+       UnityPlayer's init are translated before Unity logs anything. In the
+       menu about half the CPU samples are the host (gex-gl, the NVIDIA
+       driver, the readback) and the guest half is almost all the fjit
+       (`[gex-prof]` lines). Same unload counts with the shape walk (49 and 66
+       assets), so it changes cost only: Menu_Title start to menu ready went
+       from 37.0 s (hk-e3) to 20.6 s (hk-e4).
+     - **Frames are wrong on edger's NVIDIA driver:** every frame HK presents
+       is black (GL-only PPMs, `GEX_PPM_GL_ONLY=1`), and Muck shows its
+       blurred sky with no UI, while the same build rendered both on llvmpipe
+       (gooner) and RX 6500 XT (worldmachine). gex-gl's own host tests pass on
+       edger. `GEX_GL_ERRORS=1` (gex-gl host: glGetError after every command,
+       per opcode) is the next look. The fps numbers above are for that
+       rendering.
+     - **Fixed (273b4635):** `GEX_GL_ERRORS=1` showed BIND_FRAMEBUFFER (and
+       FRAMEBUFFER_TEXTURE_2D) failing with INVALID_OPERATION every frame:
+       the host ran the guest's framebuffer names as they were, and
+       ARB_framebuffer_object (NVIDIA, unlike Mesa) refuses a name
+       GenFramebuffers did not return. Framebuffer and renderbuffer names are
+       now the host's (`gexgl_native_object`, binding queries mapped back).
+       hk-g2 (cold, new gexc, shape provider): no GL errors, the main menu
+       renders (`scratch/unity/screens/hk-menu-edger.png`), first present
+       448.3 s, menu ready 499.4 s, menu 24.4 presents/s. (The e1-e4/mk-e1
+       fps above were measured with the broken rendering.)
+     - **ELF unit for UnityPlayer.so:** built on gooner at base 0x7e041000
+       (`GEX_CGEN_CACHE=scratch/unity/units/cgen`, `gexc cgen-image --elf
+       ... --mem64 --jobs 12`, log `scratch/unity/units/build-up*.log`):
+       recovery 55,439 functions in 5,424 s (single-threaded, ~20 GB), then
+       the C compile; recovery and objects are cached, so a killed build
+       resumes at the compile. Pin for runs: `scratch/unity/edger/hk-pin.txt`
+       (`0x7e041000 0x2674000 UnityPlayer.so`); copy the cgen cache to edger
+       and run with `GEX_CGEN_CACHE=... GEX_ELF_UNITS=UnityPlayer.so
+       GEX_ELF_UNITS_BUILD=0` and gexc flag `--pin FILE`.
+     - After a Claude Code restart: background runs and builds die with it;
+       check `ps` on gooner and edger, rerun what was cut.
+     - **Baseline with correct rendering (edger, native, `--fjit`, shape
+       provider):**
+
+       | run | state | first present | menu ready | menu fps (20-80 s after) |
+       |---|---|---|---|---|
+       | hk-g2 | cold, readback every frame | 448.3 s | 499.4 s | 24.4 |
+       | hk-p1 | warm fjit cache, readback every frame | 244.6 s | 289.1 s | 24.4 |
+       | hk-r1 | warm, readback every 1800th (`GEX_GL_READBACK_EVERY`) | 239.6 s | 282.4 s | 26.4 (last quarter 25.8) |
+
+       Tiers in the menu (hk-p1 `[gex-prof]`): guest code is 99.5% fjit
+       (UnityPlayer and libraries), providers (the .NET runtime and
+       interpreter) 0.2-0.5%, no units, no .NET JIT; about half of all
+       samples are host. Steady-state profile (hk-p1, `GEX_PROF_START=340`):
+       the render thread (guest tid 68) spends 38% of its samples in the
+       host's sched_yield inside NVIDIA's driver (the per-frame readback's
+       GPU wait, hence `GEX_GL_READBACK_EVERY`) and ~15% in the driver.
+       Per-thread CPU over 20 s of the menu (hk-r1 `threads.txt`): main
+       thread 69% of a core, render thread 25%, tid 69 25%, the job workers
+       2-10% each; 2.15 cores in all. No thread is saturated, so the menu
+       frame is bound by waits between threads (the main thread waiting on
+       the render thread or job fences), not by one thread's code speed.
+     - **Muck with the NVIDIA fix (mk-g1, cold, readback every 1800th):** the
+       menu renders fully (`scratch/unity/screens/muck-menu-edger.png`),
+       first present 228.2 s, "Initializing packets" 314.2 s, menu 42.7
+       presents/s (last quarter 44.4). Threads: main 73% of a core, one
+       worker (tid 44) 49%, 2.06 cores in all.
+     - **The main thread's top cost was mono_gc_get_used_size:** the
+       steady-state profile of hk-p1's main thread (perf-map names) put
+       49.9% of its samples in SGen's `major_get_used_size`, which walks every
+       object of the major heap with a full sweep; Unity asks every frame and
+       under gex every object is in the major heap. The provider now answers
+       from a cache refreshed after a collection or every 500 ms
+       (`GEXMONO_USED_SIZE_EXACT=1` for the old behaviour; b0cf74ae). Note:
+       the `[gex-prof]` share line classified those samples as fjit ("jit"),
+       so its provider share is not trustworthy; use the per-thread
+       profiles with names.
+     - **Gate legs added:** gex-gl test
+       `a_desktop_context_takes_framebuffer_names_it_never_generated` (fails
+       before 273b4635 on edger's NVIDIA, passes after; passes on gooner
+       either way); embed's liveness check (301 leaves, each once, batched;
+       also under `GEXMONO_LV_NOSHAPE=1`).
+     - **Pitfall:** a wait loop like `while kill -0 $(pgrep -f "PATTERN")`
+       matches its own command line; wait on a known PID.
+     - **Pin lesson:** UnityPlayer.so (span 0x2674000) cannot be pinned at
+       0x7e041000 on edger: the range would cross 0x80000000 and the pin was
+       never taken (`[pin] ... never reserved`); unpinned it lands at
+       0x7d98a000 there (hk-a1). The unit is being rebuilt for 0x7d98a000
+       (`build-up4.log`; recovery is keyed by the placed image, so a new base
+       is a full rebuild, ~2.5 h on gooner) and the pin file now says
+       `0x7d98a000 0x2674000 UnityPlayer.so`.
+     - **mono_gc_get_used_size cache, measured:** hk-u1 (warm, readback
+       every 1800th) 28.4 presents/s against hk-r1's 26.4 (same gexc, same
+       state): 7% faster. Main thread 59.5% of a core (was 69%). Main-thread
+       profile after (hk-p2): `major_get_used_size` 5.6% (the 500 ms
+       refresh), `mono_interp_exec_method` 12.1% (managed code on the
+       interpreter), `wasm[0]::function[10]` 14.6%.
+     - **The .NET wasm JIT on Hollow Knight (hk-j1, `--env
+       GEXMONO_WASM_JIT=1`):** the host faults at 267 s, after the first
+       scene ("gexc: guest memory access out of bounds (SIGSEGV)
+       (pc≈0x0)"), before the menu. Not looked at yet; the interpreter
+       stays the default.

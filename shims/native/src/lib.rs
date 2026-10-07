@@ -1228,6 +1228,7 @@ fn run_program_with(
                         .interp
                         .clone()
                         .unwrap_or_else(|| "[interp]".to_string()),
+                    offset: 0,
                 };
                 // Empty seeds: scan the whole segment. The interpreter's
                 // functions are almost all local and exported nowhere, so its
@@ -3217,6 +3218,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // Libraries some of whose exports a provider serves (glibc's
             // mem*): bound before the dynamic linker relocates them.
             elfprov::on_elf_maps(&mut caller, &mapped)?;
+            // Function-tier units for listed shared objects (GEX_ELF_UNITS).
+            nt_cgen::on_elf_maps(&mut caller, &mapped)?;
             profile::poll(&mut caller)?;
             let want_objects = RECOMPILE_OBJECTS.load(std::sync::atomic::Ordering::Relaxed);
             for m in mapped.into_iter().filter(|_| want_objects) {

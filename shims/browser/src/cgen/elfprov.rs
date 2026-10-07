@@ -71,7 +71,7 @@ fn rescan_if_new() -> bool {
             .vmas()
             .iter()
             .filter(|v| v.prot & prot::EXEC != 0)
-            .filter_map(|v| v.code.as_ref().map(|(p, _)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone() }))
+            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
             .collect()
     });
     maps(&mapped)
