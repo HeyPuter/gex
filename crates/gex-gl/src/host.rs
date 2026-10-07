@@ -1504,12 +1504,26 @@ impl Gl {
                     reply.u32(glGetError());
                 }
 
-                // Framebuffers. As for buffers and textures the guest picks
-                // the names, which binding accepts.
-                op::GEN_FRAMEBUFFERS | op::GEN_RENDERBUFFERS => {}
-                op::DELETE_FRAMEBUFFERS | op::DELETE_RENDERBUFFERS => {
+                // Framebuffers and renderbuffers are named by the host: unlike
+                // buffers and textures, ARB_framebuffer_object refuses a name
+                // GenFramebuffers did not return (NVIDIA does, with
+                // INVALID_OPERATION, and every FBO bind failed: Hollow Knight
+                // drew black there; Mesa takes them). The decoder keeps the
+                // map (`gexgl_native_object`), so the generated cases and the
+                // binding queries see the guest's names.
+                op::GEN_FRAMEBUFFERS | op::GEN_RENDERBUFFERS => {
+                    let kind = if opcode == op::GEN_FRAMEBUFFERS { 2 } else { 3 };
                     let n = a.u32().unwrap_or(0);
-                    let names: Vec<GLuint> = (0..n).filter_map(|_| a.u32()).collect();
+                    for _ in 0..n {
+                        if let Some(g) = a.u32() {
+                            native::gexgl_native_object(kind, g, 0);
+                        }
+                    }
+                }
+                op::DELETE_FRAMEBUFFERS | op::DELETE_RENDERBUFFERS => {
+                    let kind = if opcode == op::DELETE_FRAMEBUFFERS { 2 } else { 3 };
+                    let n = a.u32().unwrap_or(0);
+                    let names: Vec<GLuint> = (0..n).filter_map(|_| a.u32()).map(|g| native::gexgl_native_object(kind, g, 1)).collect();
                     if opcode == op::DELETE_FRAMEBUFFERS {
                         glDeleteFramebuffers(names.len() as GLsizei, names.as_ptr());
                     } else {
@@ -1518,12 +1532,12 @@ impl Gl {
                 }
                 op::BIND_FRAMEBUFFER => {
                     if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
-                        glBindFramebuffer(t, n);
+                        glBindFramebuffer(t, native::gexgl_native_object(2, n, 0));
                     }
                 }
                 op::BIND_RENDERBUFFER => {
                     if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
-                        glBindRenderbuffer(t, n);
+                        glBindRenderbuffer(t, native::gexgl_native_object(3, n, 0));
                     }
                 }
                 op::CHECK_FRAMEBUFFER_STATUS => {
@@ -1542,7 +1556,7 @@ impl Gl {
                     let (Some(t), Some(att), Some(rt), Some(rb)) = (a.u32(), a.u32(), a.u32(), a.u32()) else {
                         return true;
                     };
-                    glFramebufferRenderbuffer(t, att, rt, rb);
+                    glFramebufferRenderbuffer(t, att, rt, native::gexgl_native_object(3, rb, 0));
                 }
                 op::RENDERBUFFER_STORAGE => {
                     let (Some(t), Some(f), Some(w), Some(h)) = (a.u32(), a.u32(), a.i32(), a.i32()) else {
@@ -1754,6 +1768,7 @@ mod native {
         pub fn gexgl_native_one(op: u32, body: *const u8, len: usize, reply: *mut *const u8, reply_len: *mut usize) -> i32;
         pub fn gexgl_native_pixel_store(pname: u32, param: i32);
         pub fn gexgl_native_name(kind: u32, guest: u32, host: u32);
+        pub fn gexgl_native_object(kind: u32, guest: u32, op: u32) -> u32;
     }
 }
 
