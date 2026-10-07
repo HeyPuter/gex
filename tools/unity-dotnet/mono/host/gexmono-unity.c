@@ -182,6 +182,37 @@ U(mono_class_get_methods)
 	RET (m);
 }
 
+/* GEXMONO_TRACE_ARRAYS=1: each mono_array_new with its class, length and result, and any
+ * mono_gc_wbarrier_set_field after which the slot does not hold the value (diagnostics for
+ * the Instantiate crash, docs/unity-dotnet.md §12). */
+static int trace_arrays = -1;
+static int
+arrays_on (void)
+{
+	if (trace_arrays < 0)
+		trace_arrays = getenv ("GEXMONO_TRACE_ARRAYS") != NULL;
+	return trace_arrays;
+}
+U(mono_array_new)
+{
+	ENTER;
+	MonoArray *a = mono_array_new ((MonoDomain *)P (0), (MonoClass *)P (1), (uintptr_t)A (2));
+	if (arrays_on ())
+		fprintf (stderr, "[gexmono] array_new %s.%s[%llu] = %p\n", P (1) ? m_class_get_name_space ((MonoClass *)P (1)) : "?",
+			P (1) ? m_class_get_name ((MonoClass *)P (1)) : "?", (unsigned long long)A (2), a);
+	RET (a);
+}
+U(mono_gc_wbarrier_set_field)
+{
+	ENTER;
+	void *slot = P (1);
+	MonoObject *v = P (2);
+	mono_gc_wbarrier_set_field ((MonoObject *)P (0), slot, v);
+	if (arrays_on () && *(MonoObject **)slot != v)
+		fprintf (stderr, "[gexmono] wbarrier: slot %p holds %p after storing %p\n", slot, *(MonoObject **)slot, v);
+	RETV;
+}
+
 /* mono_custom_attrs_from_field (klass, field): Mono finds the field's
  * metadata row from its index in klass's field array, so klass must be the
  * class that defines the field. UnityPlayer's serializer passes the class it
@@ -351,8 +382,25 @@ void sgen_gc_unlock (void);
 static int lv_env (const char *name) { const char *v = getenv (name); return v && *v && strcmp (v, "0"); }
 static void lv_pass_reset (void);
 static int lv_on (void);
-U(mono_unity_stop_gc_world) { ENTER; lv_pass_reset (); if (!gc_world_stopped && lv_on () && !lv_env ("GEXMONO_LV_NOLOCK")) { sgen_gc_lock (); gc_world_stopped = 1; } RETV; }
-U(mono_unity_start_gc_world) { ENTER; if (gc_world_stopped) { gc_world_stopped = 0; sgen_gc_unlock (); } RETV; }
+/* GEXMONO_LV_WATCH=addr,...: the first two words at each address, at every world stop and
+ * restart (which objects a liveness pass, or what happens between passes, changes). */
+static void
+lv_watch (const char *when)
+{
+	const char *w = getenv ("GEXMONO_LV_WATCH");
+	if (!w)
+		return;
+	char *dup = g_strdup (w), *save = NULL;
+	for (char *t = strtok_r (dup, ",", &save); t; t = strtok_r (NULL, ",", &save)) {
+		uint64_t *p = (uint64_t *)(uintptr_t)strtoull (t, NULL, 16);
+		if (p)
+			fprintf (stderr, "[gexmono] lv-watch %s %p: %#llx %#llx %#llx %#llx %#llx\n", when, p, (unsigned long long)p [0],
+				(unsigned long long)p [1], (unsigned long long)p [2], (unsigned long long)p [3], (unsigned long long)p [4]);
+	}
+	g_free (dup);
+}
+U(mono_unity_stop_gc_world) { ENTER; lv_watch ("stop"); lv_pass_reset (); if (!gc_world_stopped && lv_on () && !lv_env ("GEXMONO_LV_NOLOCK")) { sgen_gc_lock (); gc_world_stopped = 1; } RETV; }
+U(mono_unity_start_gc_world) { ENTER; lv_watch ("start"); if (gc_world_stopped) { gc_world_stopped = 0; sgen_gc_unlock (); } RETV; }
 U(mono_unity_heap_validation_from_statics) { ENTER; RETV; }
 
 /* ---- Unity's memory profiler: reports nothing ---- */
@@ -404,21 +452,44 @@ lv_new (MonoClass *filter, guint32 max, uint64_t cb, uint64_t data)
 }
 
 static int lv_env (const char *name);
-/* The walk is opt-in (GEXMONO_LIVENESS=1) until the Instantiate crash it
- * exposes in Hollow Knight is understood (docs/unity-dotnet.md §12); off, the
- * provider reports nothing, as before. GEXMONO_LV_OFF=1 walks but reports
- * nothing. */
+/* The walk is on by default; GEXMONO_LIVENESS=0 turns it off (the provider then reports
+ * nothing: Unity unloads every asset only script data holds). GEXMONO_LV_OFF=1 walks but
+ * reports nothing. */
 static int
 lv_on (void)
 {
 	static int on = -1;
-	if (on < 0)
-		on = lv_env ("GEXMONO_LIVENESS");
+	if (on < 0) {
+		const char *v = getenv ("GEXMONO_LIVENESS");
+		on = !v || !*v || strcmp (v, "0");
+	}
 	return on;
+}
+/* GEXMONO_LV_TRACE=1: each reported object and each root, as class and Unity instance ID
+ * (the int at +8 of the native object m_CachedPtr points to). */
+static int
+lv_trace (void)
+{
+	static int t = -1;
+	if (t < 0)
+		t = getenv ("GEXMONO_LV_TRACE") != NULL;
+	return t;
+}
+static int
+lv_iid (MonoObject *o)
+{
+	/* UnityEngine.Object's first field, m_CachedPtr, right after the header: no metadata
+	 * lookups here (the walk runs on Unity job threads Mono does not know). */
+	uint8_t *native = *(uint8_t **)((char *)o + MONO_ABI_SIZEOF (MonoObject));
+	return (uintptr_t)native > 0x10000 && (uintptr_t)native < ((uintptr_t)1 << 34) ? *(int *)(native + 8) : 0;
 }
 static void
 lv_flush (Liveness *s)
 {
+	if (lv_trace ())
+		for (guint32 i = 0; i < s->n; i++)
+			fprintf (stderr, "[gexmono] lv-report %p state %p %s.%s id %d\n", s->arr [i], s, m_class_get_name_space (mono_object_class (s->arr [i])),
+				m_class_get_name (mono_object_class (s->arr [i])), lv_iid (s->arr [i]));
 	static int off = -1;
 	if (off < 0)
 		off = lv_env ("GEXMONO_LV_OFF");
@@ -443,6 +514,7 @@ lv_free (Liveness *s)
  * callbacks once however many roots and states reach it (Unity sizes its
  * buffers by the number of objects). Reset when Unity stops the world for the
  * next pass. */
+static int lv_env (const char *name);
 static GHashTable *lv_pass_seen;
 static pthread_mutex_t lv_pass_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -460,6 +532,17 @@ lv_push (Liveness *s, MonoObject *o)
 {
 	if (!o)
 		return;
+	static int per_state = -1;
+	if (per_state < 0)
+		per_state = lv_env ("GEXMONO_LV_PERSTATE");
+	if (per_state) {
+		/* Diagnostic: each state keeps its own visited set, as before the per-pass one. */
+		if (g_hash_table_contains (s->seen, o))
+			return;
+		g_hash_table_add (s->seen, o);
+		g_ptr_array_add (s->stack, o);
+		return;
+	}
 	pthread_mutex_lock (&lv_pass_lock);
 	if (!lv_pass_seen)
 		lv_pass_seen = g_hash_table_new (NULL, NULL);
@@ -524,14 +607,19 @@ lv_fields (Liveness *s, MonoClass *k, char *base, gboolean boxed)
 }
 
 static void
-lv_object (Liveness *s, MonoObject *o)
+lv_report (Liveness *s, MonoObject *o)
+{
+	s->arr [s->n++] = o;
+	if (s->n >= s->max)
+		lv_flush (s);
+}
+
+static void
+lv_object_walk (Liveness *s, MonoObject *o, gboolean report)
 {
 	MonoClass *k = mono_object_class (o);
-	if (s->filter && mono_class_is_subclass_of_internal (k, s->filter, FALSE)) {
-		s->arr [s->n++] = o;
-		if (s->n >= s->max)
-			lv_flush (s);
-	}
+	if (report && s->filter && mono_class_is_subclass_of_internal (k, s->filter, FALSE))
+		lv_report (s, o);
 	if (m_class_get_rank (k)) {
 		MonoArray *a = (MonoArray *)o;
 		MonoClass *ek = m_class_get_element_class (k);
@@ -557,7 +645,7 @@ lv_drain (Liveness *s)
 	while (s->stack->len) {
 		MonoObject *o = (MonoObject *)g_ptr_array_index (s->stack, s->stack->len - 1);
 		g_ptr_array_set_size (s->stack, s->stack->len - 1);
-		lv_object (s, o);
+		lv_object_walk (s, o, TRUE);
 	}
 }
 
@@ -585,20 +673,28 @@ lv_class_statics (gpointer value, gpointer user_data)
 	}
 }
 
-static void
-lv_assembly_statics (gpointer assembly, gpointer user_data)
-{
-	MonoImage *image = mono_assembly_get_image_internal ((MonoAssembly *)assembly);
-	if (!image)
-		return;
-	mono_image_lock (image);
-	mono_internal_hash_table_apply (&image->class_cache, lv_class_statics, user_data);
-	mono_image_unlock (image);
-}
 
 void sgen_gc_lock (void);
 void sgen_gc_unlock (void);
 static int lv_world_stopped;
+
+/* Report what a from_root / from_statics call found before returning, as Unity's Mono does
+ * (unity-liveness.c filters and calls back at the end of each calculation): Unity marks the
+ * reported objects into its queue and drains it (their native dependencies: a Font's atlas
+ * texture and material, a component's GameObject...) before it calls liveness_finalize, so
+ * objects first reported from finalize were marked with none of their dependencies, which
+ * Unity then unloaded under them (Hollow Knight's menu labels drew from a font whose atlas
+ * texture had been unloaded and reloaded empty). GEXMONO_LV_LATE=1 restores the old
+ * flush-at-finalize behaviour, for comparison. */
+static void
+lv_flush_now (Liveness *s)
+{
+	static int late = -1;
+	if (late < 0)
+		late = lv_env ("GEXMONO_LV_LATE");
+	if (!late)
+		lv_flush (s);
+}
 
 /* allocate_struct (filter, max_count, callback, userdata, reallocate): Unity 2021+. */
 U(mono_unity_liveness_allocate_struct) { ENTER; RET (lv_new ((MonoClass *)P (0), (guint32)A (1), A (2), A (3))); }
@@ -611,9 +707,18 @@ U(mono_unity_liveness_calculation_from_root)
 {
 	ENTER;
 	Liveness *s = (Liveness *)P (1);
-	if (s && lv_on ()) {
-		lv_push (s, (MonoObject *)P (0));
+	if (s && lv_on () && P (0)) {
+		/* As Unity's from_root: the root's references are walked, the root itself is
+		 * neither marked nor reported (it is reported if another path reaches it). The
+		 * roots are the managed wrappers Unity holds GC handles to; reporting them kept
+		 * every component alive whatever its GameObject's fate (a MonoBehaviour outlived
+		 * its unloaded GameObject and Object.name followed the dangling pointer). */
+		if (lv_trace ())
+			fprintf (stderr, "[gexmono] lv-root %p state %p %s.%s id %d\n", P (0), s, m_class_get_name_space (mono_object_class (P (0))),
+				m_class_get_name (mono_object_class (P (0))), lv_iid (P (0)));
+		lv_object_walk (s, (MonoObject *)P (0), FALSE);
 		lv_drain (s);
+		lv_flush_now (s);
 	}
 	RETV;
 }
@@ -622,8 +727,23 @@ U(mono_unity_liveness_calculation_from_statics)
 	ENTER;
 	Liveness *s = (Liveness *)P (0);
 	if (s && lv_on ()) {
-		mono_assembly_foreach (lv_assembly_statics, s);
+		/* As Unity's from_statics: every class with a vtable (generic instances
+		 * included), corlib's skipped. */
+		MonoMemoryManager *mm = mono_mem_manager_get_ambient ();
+		mono_mem_manager_lock (mm);
+		GPtrArray *vts = g_ptr_array_new ();
+		for (guint i = 0; mm->class_vtable_array && i < mm->class_vtable_array->len; i++)
+			g_ptr_array_add (vts, g_ptr_array_index (mm->class_vtable_array, i));
+		mono_mem_manager_unlock (mm);
+		for (guint i = 0; i < vts->len; i++) {
+			MonoVTable *vt = (MonoVTable *)g_ptr_array_index (vts, i);
+			MonoClass *k = vt ? vt->klass : NULL;
+			if (k && m_class_get_image (k) != mono_defaults.corlib)
+				lv_class_statics (k, s);
+		}
+		g_ptr_array_free (vts, TRUE);
 		lv_drain (s);
+		lv_flush_now (s);
 	}
 	RETV;
 }
@@ -787,6 +907,6 @@ __attribute__((used)) gexp_body_t const gexmono_unity_adapters [] = {
 	L(mono_profiler_reset_all_coverage) L(mono_assembly_foreach) L(mono_stack_walk) L(mono_stack_walk_no_il)
 	L(mono_trace_set_log_handler) L(mono_dllmap_insert) L(mono_set_dirs) L(mono_set_assemblies_path) L(mono_set_assemblies_path_null_separated)
 	L(mono_set_find_plugin_callback) L(mono_dl_fallback_register)
-	L(mono_class_get_field_from_name) L(mono_class_is_subclass_of) L(mono_class_get_methods) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
+	L(mono_class_get_field_from_name) L(mono_class_is_subclass_of) L(mono_class_get_methods) L(mono_array_new) L(mono_gc_wbarrier_set_field) L(mono_custom_attrs_from_field) L(unity_mono_method_is_generic) L(unity_mono_method_is_inflated) L(unity_mono_reflection_method_get_method)
 	0
 };

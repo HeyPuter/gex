@@ -187,6 +187,12 @@ while IFS='|' read -r slug kind dir prog args menu play input extra; do
             pre=(/bin/sh "$here/xwayland-inguest.sh" "$xn" "$g/xwayland.log")
             # Xwayland's keymap compiles cached (xkbcomp-cache.sh).
             run+=(--bind "$here/xkbcomp-cache.sh=/usr/bin/xkbcomp" --bind "/usr/bin/xkbcomp=/usr/bin/xkbcomp.real")
+            # No window manager runs, so no window gets the X input focus
+            # and keys reach nothing: xfocus.c gives it to the largest
+            # top-level window (NOFOCUS=1 leaves it out).
+            if [ -z "${NOFOCUS:-}" ] && cc -O1 -o "$state/xfocus" "$here/xfocus.c" -lX11 2>/dev/null; then
+                run+=(--env GEX_XFOCUS="$state/xfocus")
+            fi
         fi
     else
         # gex-steam's steam_api[64].dll in place of the game's when

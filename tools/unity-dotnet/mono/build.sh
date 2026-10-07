@@ -14,6 +14,10 @@
 #             interpreter only, coop suspend -> OUT/obj
 #   native    libSystem.Native for the same target -> OUT/objnative
 #   corelib   System.Private.CoreLib (linux-x64 Mono flavour) -> OUT/lib
+#   formatters the out-of-band System.Runtime.Serialization.Formatters (NuGet, FORMATTERS_VERSION,
+#             default 10.0.*): BinaryFormatter, which the shared framework only stubs since .NET 9 and
+#             Unity games still use for saves -> OUT/lib-extra (tests/games/muck-dotnet.sh puts it in
+#             the BCL directory, over the framework's stub)
 #   provider  OUT/provider/mono.wasm: the runtime, System.Native, the adapters for every
 #             public mono_* function it defines (host/gen-adapters.py, SysV x86-64) and the glue
 #             (host/gexmono-provider.c), linked as a position-independent wasm64 module
@@ -30,7 +34,7 @@ COMMIT=6812ea26ff228b8f4c132a7bad0b6a24c5653c2e
 HERE=$(cd "$(dirname "$0")" && pwd)
 UD=$(cd "$HERE/.." && pwd)
 OUT=$(realpath -m "$1"); shift
-STEPS=${*:-src sysroot runtime native corelib provider}
+STEPS=${*:-src sysroot runtime native corelib formatters provider}
 MUSL_SRC=${MUSL_SRC:-$(realpath -m "$UD/../../../musl-wasm64")}
 RUN="nice -n 19"
 JOBS=${JOBS:-12}  # gooner rules: a heavy nice-19 build may use 12 jobs
@@ -75,6 +79,20 @@ step_native() {
 		> "$OUT/native-configure.log"
 	cd "$OUT/objnative"
 	$RUN ninja -j"$JOBS" System.Native/libSystem.Native.a > "$OUT/native-build.log"
+}
+
+step_formatters() {
+	local W="$OUT/formatters-restore"
+	rm -rf "$W"; mkdir -p "$W" "$OUT/lib-extra"
+	cat > "$W/f.csproj" <<P
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup><PackageReference Include="System.Runtime.Serialization.Formatters" Version="${FORMATTERS_VERSION:-10.0.*}" /></ItemGroup>
+</Project>
+P
+	dotnet restore "$W/f.csproj" --packages "$W/pkgs" > "$OUT/formatters.log"
+	cp "$(find "$W/pkgs/system.runtime.serialization.formatters" -path '*/lib/net[0-9]*/System.Runtime.Serialization.Formatters.dll' | sort -V | tail -1)" "$OUT/lib-extra/"
+	echo "formatters: $(ls "$OUT/lib-extra")"
 }
 
 step_corelib() {
