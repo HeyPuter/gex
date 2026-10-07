@@ -2169,15 +2169,23 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
         // --- mapping buffers: a copy in guest memory, written back
         "glMapBuffer" => {
             let (t, access) = (p.u32(c, 1)?, p.u32(c, 2)?);
-            // GL_READ_ONLY, GL_WRITE_ONLY, GL_READ_WRITE
-            let addr = map_buffer(c, t, 0, None, access != 0x88b9, access != 0x88b8, false)?;
+            // GL_READ_ONLY, GL_WRITE_ONLY, GL_READ_WRITE. Read back even
+            // for GL_WRITE_ONLY: unmap uploads the whole buffer, so the copy
+            // must hold what the application does not overwrite.
+            let addr = map_buffer(c, t, 0, None, true, access != 0x88b8, false)?;
             p.set_ptr(c, 3, addr)?;
         }
         "glMapBufferRange" => {
             let (t, off, len, access) = (p.u32(c, 1)?, p.isize(c, 2)?, p.isize(c, 3)?, p.u32(c, 4)?);
             // GL_MAP_READ_BIT, _WRITE_BIT, _INVALIDATE_RANGE_BIT,
             // _INVALIDATE_BUFFER_BIT, _FLUSH_EXPLICIT_BIT
-            let read = access & 1 != 0 && access & 0xc == 0;
+            // The copy starts from the buffer's bytes wherever the
+            // application may read them (GL_MAP_READ_BIT) or unmap uploads
+            // bytes it did not write: without INVALIDATE_RANGE/_BUFFER the
+            // range keeps its contents, and with FLUSH_EXPLICIT only the
+            // flushed ranges go back (as guest/gl/gexgl.c, a355a62e, and
+            // pewasm's host_wgl.c map_buffer).
+            let read = access & 1 != 0 || access & (0x4 | 0x8 | 0x10) == 0;
             let addr = map_buffer(c, t, off.max(0) as u64, Some(len.max(0) as u64), read, access & 2 != 0, access & 0x10 != 0)?;
             p.set_ptr(c, 5, addr)?;
         }
