@@ -1412,9 +1412,14 @@ impl Kernel {
         let compat = self.compat;
         let read_vec = |mut p: u64| -> Result<Vec<String>, Errno> {
             let mut out = Vec::new();
-            // A bound, because the vector is the guest's and its terminator
-            // may not be there.
-            for _ in 0..4096 {
+            // Linux's limits: one string up to MAX_ARG_STRLEN (32 pages),
+            // all of them together a quarter of the 8 MiB stack limit;
+            // past either, E2BIG. (A make recipe of several KiB, passed to
+            // sh -c, is ordinary: automake's test-suite.log rule.)
+            const MAX_ARG_STRLEN: usize = 32 * 4096;
+            const ARG_MAX: usize = 2 << 20;
+            let mut total = 0usize;
+            loop {
                 if p == 0 {
                     break;
                 }
@@ -1422,7 +1427,12 @@ impl Kernel {
                 if ptr == 0 {
                     break;
                 }
-                out.push(bytes_to_string(m.read_cstr(ptr, 4096)?)?);
+                let b = m.read_cstr(ptr, MAX_ARG_STRLEN).map_err(|e| if e == Errno::ENAMETOOLONG { Errno::E2BIG } else { e })?;
+                total += b.len() + 1 + if compat { 4 } else { 8 };
+                if total > ARG_MAX {
+                    return Err(Errno::E2BIG);
+                }
+                out.push(bytes_to_string(b)?);
                 p += if compat { 4 } else { 8 };
             }
             Ok(out)
