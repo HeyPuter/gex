@@ -1456,8 +1456,8 @@ Not yet:
        JIT; before the fix the JIT leg died there.
      - **Hollow Knight with the JIT (hk-j3, warm fjit cache, no unit, same
        gexc and provider as hk-u1 but the JIT fix):** reaches the menu and
-       renders it; first present 236.7 s → hk-j3's numbers: menu ready 300.8 s
-       (hk-u1, interpreter: 280.4 s), menu 28.8 presents/s, last quarter 30.2
+       renders it; first present 250.5 s (hk-u1, interpreter: 236.7 s), menu
+       ready 300.8 s (hk-u1: 280.4 s), menu 28.8 presents/s, last quarter 30.2
        (hk-u1: 28.4 and 28.6). The JIT's compiles cost ~20 s of start-up;
        the menu is not managed-bound (managed code was 12% of the main
        thread on the interpreter).
