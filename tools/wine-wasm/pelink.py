@@ -143,6 +143,12 @@ def main():
                 is_crt = lambda n: n.startswith(('msvcr', 'ucrt')) or n == 'crtdll'
                 crt = next((i for i in eager if is_crt(i)), None if is_crt(mod.split('.')[0]) else 'ucrtbase')
                 eager += [c for c in (crt, 'kernel32', 'ntdll') if c and c not in eager]
+            # and its delay imports, after them: a native module's calls are
+            # bound in the one module, so nothing would load a delay-loaded
+            # DLL on first call, and a DLL never loaded never ran its DllMain
+            # (wineboot's user32 and gdi32: win32u's syscall table missing,
+            # every NtUser call STATUS_INVALID_SYSTEM_SERVICE)
+            eager += [i.lstrip('-') for i in makefile_var(mk, 'DELAYIMPORTS') if i.lstrip('-') not in eager]
             EAGER[mod] = [i if '.' in i else i + '.dll' for i in eager]
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
