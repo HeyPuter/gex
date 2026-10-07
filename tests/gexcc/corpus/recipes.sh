@@ -9,9 +9,10 @@
 #   - `guest CMD` runs CMD under one gexc: busybox's sh and tools, the gexcc
 #     GNU make in $GUEST_BIN; every test process is a guest process.
 
-# suites converted to in-guest runs; the rest still run on the host and are
-# refused unless HOSTRUN=1 (and then only one at a time, in a resource scope)
-GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent"
+# suites safe to run: in the guest, or a handful of host gexc at most (lua,
+# sqlite, dash, less: one or two). The rest still start a host gexc per test
+# and are refused unless HOSTRUN=1 (then one at a time, in a resource scope).
+GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent lua sqlite dash less"
 
 # autotools, cross mode: configure runs nothing it builds
 at_configure() { ./configure --host=$T --build=x86_64-pc-linux-gnu --prefix=/usr "$@"; }

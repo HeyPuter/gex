@@ -194,20 +194,35 @@ Sources and their sha256: `tests/gexcc/corpus/sources.txt`.
 
 ### Test runs and the host (2026-10-07, after gooner's crash)
 
-Every run of a gexcc program on the host starts a whole gexc (wasmtime,
-large reservations, about 27 threads). A `make check` or a configure script
-runs thousands of them; with many suites and configures in parallel that
-was tens of thousands of gexc a minute, and gooner went down.
+Every gexcc program started on the host is a whole gexc (wasmtime, large
+reservations, about 27 threads). Configure try-runs and a host-side
+`make check` start thousands, and several suites in parallel took gooner
+down (the system log showed about 45,000 processes a minute). Now:
 
-The rules now:
-- **Test suites run inside one gexc:** `make check` runs in the guest (busybox
-  or gexcc-built sh, gexcc-built make), so its processes are guest
-  processes. A guest fork or exec stays inside the one host process: a
-  busybox pipeline loop showed 1 host process with 27 threads.
-- **configure does not try-run on the host:** pass `--build=x86_64-pc-linux-gnu`
-  (cross mode, cache values).
-- **Until then:** one suite at a time, at most `-j2`, inside
-  `systemd-run --user --scope -p TasksMax=256 -p MemoryMax=32G nice -n 19`.
+- **Suites run inside one gexc** (`tests/gexcc/corpus/recipes.sh`):
+  - configure runs in cross mode (`--build=x86_64-pc-linux-gnu`), so it runs
+    nothing it builds;
+  - the host builds the suite (`make check TESTS=`) without running it;
+  - `guest make -k check SHELL=/bin/sh` runs the suite in the guest, with the
+    gexcc-built GNU make (`$GEXCC_WORK/guest-bin`) and busybox's sh and tools.
+    Every test process is a guest process.
+- **Measured (xz 5.6.3, 19/19, in the guest):**
+  - 6 host execs: gexcc-exec's shell, its helpers and the one gexc;
+  - 92,037 host clones from that gexc's tree, about 120 a second over 13
+    minutes. These are threads, one per guest process: a guest fork plus
+    exec of `/bin/true` costs one host thread (50 execs: 77 clones against
+    27 for none).
+  - zlib's `make test`: 6 host execs.
+  - /proc/stat's machine-wide counter also counts those threads and other
+    users' processes (about 46 a second on an idle gooner).
+- **Slots** (`gexcc-exec`): at most `GEXCC_SLOTS` (4) host-started gexcc
+  programs run at once per user. The rest wait on an flock. Guest execs take
+  none. Tested by `tests/gexcc/slots/run.sh`: at most 2 at once with 2
+  slots, all 6 overlap without.
+- **Every run** is wrapped in `systemd-run --user --scope -p TasksMax=256
+  -p MemoryMax=32G nice -n 19`, one suite at a time, `-j2`.
+- **Not converted yet** (refused without `HOSTRUN=1`): gawk, tar (autotest),
+  make and curl (perl runners), bash, mbedtls and fmt (ctest), perl, python3.
 
 ## 3. Gaps found, and what fixed them
 
@@ -233,6 +248,7 @@ The rules now:
 | TCP shutdown did nothing; EPIPE on the open direction | gnulib test-select | Transport::shutdown, send_closed | tcphalfclose |
 | "link/" with lstat, dangling/looping links with a slash | gnulib test-lstat | at_path | pathcorners |
 | libtool made no shared library (ld -v not GNU-like) | xz | ld wrapper | xz |
+| execve arguments capped at 4096 bytes | automake's test-suite.log rule run in the guest | Linux's limits (128 KiB a string, 2 MiB in all, E2BIG) | longargs |
 | musl setjmp on try_table broke asyncify | coreutils timeout | GEX_WASM_LEGACY_EH libc | coreutils |
 
 Expected gaps not reached yet (merge-plan §10):

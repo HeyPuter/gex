@@ -1,6 +1,7 @@
 #!/bin/sh
-# gexcc-exec's machine-wide slots: 10 gexcc programs started at once from
-# the host (6, so 6 gexc stay under a 256-task scope), each holding for 3 s, may not run more than GEXCC_SLOTS (here
+# gexcc-exec's machine-wide slots: 6 gexcc programs started at once from
+# the host (6 gexc fit a 256-task scope), each holding for 3 s, may not
+# run more than GEXCC_SLOTS (here
 # 2, in a private slot directory) at a time; with the limit off (0), more
 # than 2 overlap, which shows the measurement sees overlaps. Run inside a
 # resource scope:
