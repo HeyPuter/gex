@@ -12,6 +12,7 @@
 #             "Initializing packets" and presents a non-black frame after it;
 #   hk        Hollow Knight reaches its menu (the unload after Menu_Title) and presents a
 #             non-black frame after it.
+# The game legs run with the .NET wasm JIT on (the default; JIT=0 for the interpreter only).
 # Each game leg keeps its summary and its last frame as PNG in OUT. Runs go through
 # scratch/bench/bench.sh (BENCH_HOST, edger by default), one at a time under its lock, with
 # tests/games/unity-bench.sh. Takes about 25 min with a warm GEX_FJIT_CACHE, 40 cold.
@@ -47,7 +48,7 @@ else echo "gex-gl: FAIL"; grep -E "FAILED|panicked" "$OUT/gex-gl.txt" | head -5;
 leg() { # NAME GAME SECS MARKER
 	local name=$1 game=$2 secs=$3 marker=$4 run=$HOME/gex-sandbox/scratch/unity/edger-gate/run-$HEAD-$1
 	"$B" -- env GEXC="$ST/gexc" DNC="$ST/dnc" GEX_FJIT_CACHE=1 EVERY=600 \
-		bash "$TREE/tests/games/unity-bench.sh" "$game" "$run" "$secs" --fjit > "$OUT/$name.txt" 2>&1
+		bash "$TREE/tests/games/unity-bench.sh" "$game" "$run" "$secs" --fjit --env GEXMONO_WASM_JIT="${JIT:-1}" > "$OUT/$name.txt" 2>&1
 	mkdir -p "$OUT/$name-frames"
 	rsync -a --include='f-*.ppm' --include=plog-t.txt --exclude='*' "${BENCH_HOST_SSH:-claude@edger}:$run/" "$OUT/$name-frames/"
 	python3 - "$OUT/$name-frames" "$OUT/$name.png" "$marker" "$OUT/$name.txt" <<-'EOF'
