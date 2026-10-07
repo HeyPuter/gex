@@ -87,6 +87,9 @@ pub struct MemoryMap {
     brk_cur: u64,
     /// Next address the top-down allocator will try.
     mmap_next: u64,
+    /// Where the top-down allocator starts over when the cursor runs out:
+    /// the holes `munmap` left above it (MMAP_TOP, or `set_mmap_top`).
+    mmap_ceiling: u64,
     /// How far up the arena has been claimed, and who to ask for more.
     ///
     /// A guest in a browser lives in a `WebAssembly.Memory` allocated up to its
@@ -157,6 +160,7 @@ impl MemoryMap {
             brk_start: page_align_up(brk_start),
             brk_cur: page_align_up(brk_start),
             mmap_next: MMAP_TOP,
+            mmap_ceiling: MMAP_TOP,
             arena: Vec::new(),
             take: None,
             back: None,
@@ -538,6 +542,7 @@ impl MemoryMap {
     /// KUSER_SHARED_DATA and the top of user space for itself).
     pub fn set_mmap_top(&mut self, top: u64) {
         self.mmap_next = self.mmap_next.min(page_align_down(top));
+        self.mmap_ceiling = self.mmap_ceiling.min(page_align_down(top));
     }
 
     /// Find and reserve a free range of `len` bytes. Top-down from [`MMAP_TOP`],
@@ -665,7 +670,17 @@ impl MemoryMap {
         }
 
         let mut candidate = self.mmap_next;
+        // The cursor only moves down; once it runs out, one more pass from
+        // the top finds what `munmap` freed above it (Linux searches the whole
+        // gap list each time: a program that maps and frees 1 GiB buffers in
+        // turn, as expat's tests do, must get the second one).
+        let mut wrapped = self.mmap_next >= self.mmap_ceiling;
         loop {
+            if !wrapped && (candidate < len || candidate - len < MMAP_BOTTOM) {
+                wrapped = true;
+                candidate = self.mmap_ceiling;
+                continue;
+            }
             if candidate < len || candidate - len < MMAP_BOTTOM {
                 if self.high.is_none() {
                     note_address_space_short(len);
@@ -1110,6 +1125,19 @@ mod tests {
         assert!(b < a, "expected top-down allocation, got {a:x} then {b:x}");
         assert!(a + 0x1000 <= MMAP_TOP);
         assert_eq!(a % PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn mmap_reuses_a_hole_above_the_cursor() {
+        // more than half the arena, mapped, a small mapping below it, then
+        // freed: the next big request fits only in the hole above the cursor
+        let mut m = MemoryMap::new(0x40_1000);
+        let big = page_align_down((MMAP_TOP - MMAP_BOTTOM) / 5 * 3);
+        let a = m.mmap(0, big, prot::READ, flags::ANONYMOUS, "a").unwrap();
+        m.mmap(0, 0x2000, prot::READ, flags::ANONYMOUS, "b").unwrap();
+        m.unmap(a, big).unwrap();
+        let c = m.mmap(0, big, prot::READ, flags::ANONYMOUS, "c").unwrap();
+        assert_eq!(c, a);
     }
 
     #[test]

@@ -1377,6 +1377,9 @@ impl Kernel {
     ) -> Result<(String, Vec<String>, Vec<String>), Errno> {
         let bytes_to_string = |b: Vec<u8>| String::from_utf8(b).map_err(|_| Errno::EINVAL);
         let path = bytes_to_string(m.read_cstr(a[0], 4096)?)?;
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
         // A 32-bit process hands over vectors of 32-bit pointers.
         let compat = self.compat;
         let read_vec = |mut p: u64| -> Result<Vec<String>, Errno> {
@@ -3122,6 +3125,11 @@ impl Kernel {
     fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
+        // An empty path names nothing (the AT_EMPTY_PATH forms check for it
+        // before they get here), as on Linux.
+        if p.is_empty() {
+            return Err(Errno::ENOENT);
+        }
         if p.starts_with('/') || dirfd == AT_FDCWD {
             return Ok(self.vfs.absolute(&p));
         }
@@ -4462,6 +4470,9 @@ impl Kernel {
     fn sys_chdir(&mut self, m: &GuestMem<'_>, path: u64) -> SysResult {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
+        if p.is_empty() {
+            return Err(Errno::ENOENT);
+        }
         self.vfs.set_cwd(&p).map(|_| 0)
     }
 
