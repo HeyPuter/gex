@@ -43,10 +43,14 @@ cp "$tmp/winepe.wasm" "$sys/winepe.wasm"
 for dll in "$@"; do
     name=${dll%.*}
     dir=$build/dlls/$name
+    [ -d "$dir" ] || dir=$build/dlls/$dll  # (winewayland.drv's directory keeps the extension)
     [ -d "$dir" ] || dir=$build/programs/$name
     spec=$src/${dir#$build/}/$name.spec
     rm -f "$sys/$dll"
     # a program has no .spec: an exe skeleton, its entry point the module's
+    # (a DLL with no .spec, a driver like winewayland.drv, exports nothing:
+    # an empty one, so its skeleton is still a DLL with DllMain as entry)
+    if [ ! -f "$spec" ] && [ "${dir#$build/dlls/}" != "$dir" ]; then spec=$tmp/$name.spec; : > "$spec"; fi
     if [ -f "$spec" ]; then kind=(--dll -E "$spec"); else kind=(--exe); fi
     # shellcheck disable=SC2046
     "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" "${kind[@]}" --fake-module \
