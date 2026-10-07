@@ -6,7 +6,22 @@ worktree `wt/glpath`, scratch `~/gex-sandbox/scratch/GL` (`$G` below).
 
 ## Resume
 
-- State: E2 diagnostic in progress (see "E2" below for what is measured).
+- State (2026-10-07 evening): E2 done; CLIENT_ARRAY (bdb682d9), the
+  decoder report fix and opt-in WebGPU counters (21baa051), E3 map rules
+  (bcc93e30) and five more fast-path GL calls (430acec7) committed on
+  merge/glpath. E4 (web/mesa-wasm-cross.ini: SIMD, ThinLTO, -O3 link) is in
+  the worktree, uncommitted: commit after a browser GL gate with a Mesa
+  built from it. Not yet measured: the normal gexc page (needs a unit cache
+  at merge/glpath's keys on edger), and 430acec7 on the page (the eject
+  project must rebuild the nt_unixcall provider and the trampolines' unit).
+- Live A/B harness for the ejected page: `$G/patch-site.mjs SITE PAGE OUT
+  LAUNCHER` swaps a site's page (shim, kernel, Mesa, JS) for one built by
+  web/build-eject-page.sh, keeping its units; the page must come from the
+  tree the site's units were built at (site30: wt/eject9 52bb4b96, or the
+  NT trampolines' unit misses). `wt/gl-e9` (branch glpath-e9) = 52bb4b96 +
+  this stream's commits; `bshim-e9.sh` builds its shim/kernel/seed/gexc.
+  `glegs.sh TAG LEG...` (pew | SITE[@ENV]) measures world fps and the
+  compositor's gex_gl_submit ms per frame.
 - Tools (all in `$G`, run on edger through `scratch/bench/bench.sh`; never on
   gooner):
   - `wgpu-count.js`: a WebGPU call counter (calls, ms inside, bytes) by
@@ -127,5 +142,41 @@ readback digest equal on both):
 
 The counts are now pewasm's live ones (15 passes, 16 views, 87 writeBuffer,
 no copies).
+
+### CLIENT_ARRAY, live (ejected page, site-gl2 = site30 + this stream's
+page; the old path by `GEX_NT_GL_CLIENT_ARRAYS=buffer` on the same site)
+
+| leg order | CLIENT_ARRAY | scratch buffers (old) | pewasm |
+| --- | --- | --- | --- |
+| j2: A, B, pew | 67.2 fps, 4.64 ms | 64.0 fps, 7.03 ms | 48.5 fps |
+| j4: pew, B, A | 65.2 fps, 4.99 ms | 65.8 fps, 6.88 ms | 49.4 fps |
+| mean | 66.2 fps, 4.82 ms | 64.9 fps, 6.96 ms | 48.95 fps |
+
+ms = the compositor's gex_gl_submit wall time per produced frame (world-up
++90 s to 330 s; one submit a frame). The compositor's time per frame falls
+by 31% (6.96 -> 4.82 ms); world fps moves by 2% (66.2 against 64.9),
+inside the legs' spread: as eject-pe.md found, the compositor worker is not
+the page's critical path (the main thread is). The ejected page with
+CLIENT_ARRAY is 1.35 times pewasm's world fps (66.2 against 48.95).
+
+### What still makes NT syscalls (GEX_NT_GL_STATS, site-gl2, per frame)
+
+623 GL calls a frame reach the layer (the eject9 tree has no client-state
+fast path, which master has: glEnable/DisableClientState are 284 of them
+there). The rest: glDrawArrays 47, glVertexPointer/glColorPointer/
+glTexCoordPointer 142 (pure layer state), glBlendFunc 39, glBindFramebuffer
+18, glUniform1f 14, glTexParameteri 12, glViewport 9, glBlendFuncSeparate 8,
+glTexSubImage2D 5, wglSwapBuffers 1. 430acec7 moves glBlendFunc,
+glBlendFuncSeparate, glViewport, glTexParameteri and glUniform1f to the
+fast path. The pointer calls need the layer's array state in guest memory
+(as GL_FAST_ARRAYS holds the enables) before the provider can take them.
+
+### After CLIENT_ARRAY (replay profile p3)
+
+About 5.5 ms of CPU a frame: writeTexture 0.85 ms (the five world-pixel
+uploads, 839 KiB; pewasm's page pays 0.52 ms for the same), native WebGPU
+time 1.1 ms, the rest spread thin over st/mesa and the driver. The largest
+named item left is the per-draw label formatting (about 0.23 ms a frame in
+the profile; not separable from noise by replay).
 
 ## Findings
