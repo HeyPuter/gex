@@ -136,7 +136,8 @@ test_bash() {
   for t in run-*; do
     [ "$t" = run-all ] && continue
     [ "$t" = run-minimal ] && continue
-    o=$(THIS_SH=$PWD/../bash PATH=$PWD:$PATH BUILD_DIR=$PWD/.. timeout 300 $PWD/../bash ./$t 2>&1)
+    o=$(THIS_SH=$PWD/../bash PATH=$PWD:$PATH BUILD_DIR=$PWD/.. BASH_TSTOUT=$PWD/../tstout.$t \
+        timeout 300 $PWD/../bash ./$t 2>&1)
     if [ -z "$(printf '%s' "$o" | grep -v '^warning:')" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "== $t"; printf '%s\n' "$o" | head -20; fi
   done
   echo "RESULT pass=$pass fail=$fail skip=0"
