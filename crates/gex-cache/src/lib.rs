@@ -344,6 +344,35 @@ pub fn compile(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     compile_here(engine, wasm)
 }
 
+/// [`compile`], keeping what it compiles: a native wasm32 program (a
+/// gexcc build) is a whole module compiled at every exec, seconds for a
+/// large one, so its compiled form goes in the cache by content
+/// (`cache_dir()/wasm32`). A cached module from another engine
+/// configuration or wasmtime version fails to deserialize and is
+/// recompiled over.
+pub fn compile_cached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    if precompiled_dir().is_some() {
+        return compile(engine, wasm);
+    }
+    let Some(dir) = cache_dir().map(|d| d.join("wasm32")) else {
+        return compile(engine, wasm);
+    };
+    let path = dir.join(content_name(wasm));
+    if let Ok(bytes) = std::fs::read(&path) {
+        // SAFETY: written below by this runtime with an engine of the same
+        // kind; `deserialize` checks the engine configuration and version.
+        if let Ok(m) = unsafe { Module::deserialize(engine, &bytes) } {
+            return Ok(m);
+        }
+    }
+    let m = compile_here(engine, wasm)?;
+    #[cfg(feature = "compile")]
+    if let Ok(bytes) = m.serialize() {
+        store(&dir, &path, &bytes);
+    }
+    Ok(m)
+}
+
 #[cfg(feature = "compile")]
 fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     Module::new(engine, wasm).map_err(anyhow::Error::from)
