@@ -1403,3 +1403,16 @@ Not yet:
        also under `GEXMONO_LV_NOSHAPE=1`).
      - **Pitfall:** a wait loop like `while kill -0 $(pgrep -f "PATTERN")`
        matches its own command line; wait on a known PID.
+     - **Pin lesson:** UnityPlayer.so (span 0x2674000) cannot be pinned at
+       0x7e041000 on edger: the range would cross 0x80000000 and the pin was
+       never taken (`[pin] ... never reserved`); unpinned it lands at
+       0x7d98a000 there (hk-a1). The unit is being rebuilt for 0x7d98a000
+       (`build-up4.log`; recovery is keyed by the placed image, so a new base
+       is a full rebuild, ~2.5 h on gooner) and the pin file now says
+       `0x7d98a000 0x2674000 UnityPlayer.so`.
+     - **mono_gc_get_used_size cache, measured:** hk-u1 (warm, readback
+       every 1800th) 28.4 presents/s against hk-r1's 26.4 (same gexc, same
+       state): 7% faster. Main thread 59.5% of a core (was 69%). Main-thread
+       profile after (hk-p2): `major_get_used_size` 5.6% (the 500 ms
+       refresh), `mono_interp_exec_method` 12.1% (managed code on the
+       interpreter), `wasm[0]::function[10]` 14.6%.
