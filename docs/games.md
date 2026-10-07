@@ -509,7 +509,7 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
   (a forked child whose X font request failed, so it only hung; the line
   `Renderer: R - V - ` is meant to end empty). The guest GL withheld the
   extension for one missing command, glDeleteObjectARB; with it Baba
-  renders its intro screens. Run fullscreen (its default), the frames are
+  renders. Run fullscreen (its default), the frames are
   cropped: SDL believes the window is the screen's size while the GL
   drawable keeps the window's 854x480 (no X window manager in the guest to
   carry the fullscreen request). It keeps its settings in
@@ -530,15 +530,50 @@ needs scripted Wayland input (GEX_WL_INPUT, on stream U's branch).
   edger's GPU (one run, no timing) showed the compositor repainting
   normally, so there was no starvation; on gooner's SwiftShader the GL
   bridge still times out after a screen change (a batch over 30 s).
-- Baba Is You's settings: matrix.txt's `seed=seed/baba@~/.local/share/Baba_Is_You`
-  mounts a fresh copy of tests/games/seed/baba (fullscreen=0) there for each
-  run; nothing reaches the real home. Scripted keys now reach it
-  (focus_fallback). Under the JIT tier with --lazy it presented about 560
-  frames in 40 minutes; under --fjit (GEX_FJIT_CACHE=1) about 2,700 in 25
-  minutes on the first run and far more once cached. Even so it stays on
-  its intro screen whatever it is sent (pointer over the window, a click,
-  Enter, Space): the next question is what that screen waits for, not
-  speed.
+- Baba Is You: **gameplay natively** (2026-10-06; tests/games/baba.wl,
+  gameplay 4000): through its credits screen into the first level, where
+  Baba walks right, pushes the rocks and wins; the world map follows.
+  matrix.txt's `seed=seed/baba@~/.local/share/Baba_Is_You` mounts a fresh
+  copy of tests/games/seed/baba (fullscreen=0) there for each run; nothing
+  reaches the real home. What it took:
+  - The "intro screen" is the credits screen (IGF, Nordic Game Jam, MP2),
+    and it waits for a click; then a fresh save loads ~3,900 sprite PNGs on
+    the main thread and goes straight into the first level (no title menu).
+  - Chowdren reads the mouse and keys as state once per game frame, so the
+    script's `click` and `tap` (press and release 0.1 s apart) fell inside
+    one slow frame and were missed. baba.wl holds every press for a second
+    or more (`button 272 1` / `key right 1` ... `0`).
+  - No key worked at first because the seed said `controlinit=1`, which
+    tells Baba its key bindings already exist; with none in the file it had
+    no bindings at all. The seed now leaves controlinit out, so Baba writes
+    its defaults.
+  - X focus is not the problem for Baba (SDL focuses its own window), but
+    matrix.sh now starts tests/games/xfocus.c (stream U's) for every
+    linux-x11 game, since some need it (NOFOCUS=1 leaves it out).
+  - Runs that "stuck" before any frame were Xwayland waiting on xkbcomp:
+    every process started under gex is translated afresh (a short one is
+    seconds of Cranelift; on a loaded gooner, minutes), and the xkbcomp
+    cache's cache hit was six processes (id, mkdir, cat, cmp, rm, cp). It
+    now uses shell builtins and one cp (tests/games/xkbcomp-cache-test.sh).
+  - A gexc thread panic, "overflow when subtracting durations", in a timed
+    futex wait on a loaded machine (two clock readings around the deadline):
+    fixed in gex-native's perform_block (82480885, test time_left_tests).
+  - `--fjit` with GEX_FJIT_CACHE=1 caches Cranelift's output only; the
+    analysis and wasm emission still run in every process. No tier-share
+    line: Baba never exits on its own, and the counts print at exit.
+- Retrocycles in the page on edger's GPU (2026-10-06, one correctness run,
+  no timing): first frame, the input script, past present 6000 (gameplay)
+  and on to the script's arrow keys. The compositor's `lit` readback of
+  its own output changed with each scene (3,127 to 104,775 sampled pixels),
+  so the page drew the game; the harness's screenshots stayed black on the
+  real GPU (Chrome's screenshot misses the WebGPU canvas there; on gooner's
+  SwiftShader the same screenshots show the game). A readback-based
+  screenshot in browser-linux.mjs would fix the pictures.
+- Process start under native gexc: the module cache already covers runtime
+  translations (a second run of `sh -c cat` adds no entries), so wasmtime's
+  own cache would add nothing. Within one run, though, each new process's
+  translations come out as different wasm and miss: about 60 identical
+  short processes (scratch/G/hang/loop20.sh) left 1,008 new entries.
 - Earlier, the page (browser-linux.mjs; own ports 5291/9431): Retrocycles' GL
   frames were attached to SDL 1.2's child window, which no compositor
   window has; they now name its top-level window. The run still shows
