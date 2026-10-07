@@ -1232,19 +1232,40 @@ patched instead. Scope, as found:
   real mapping. ~60 lines of hand-written change in win32u, server and
   protocol.def (128 with the generated protocol files). The process hosting
   the server keeps its direct read.
-- Tests: a child GUI process (`launch.exe user_win.exe`: CreateProcess,
-  wait) passes all 34 of user_win's checks in the child; wineboot's full
-  install with wineboot and rundll32 as children (below).
+- Two more fork patches came with it: a child process is a copy of the
+  first, in-process server state included, so `wineserver_session_data`
+  answers only in the process the session was created in (a child got a
+  frozen snapshot, and a seqlock caught odd spun for ever); and one
+  desktop thread per session (a named mutant): with children able to read
+  the session each started its own, and both waited for the other's shell
+  window.
+- Toolchain fixes found on the way (merge/w3-boot): pelink no longer makes
+  trapping stubs for clang's other `main` names (crt_main references
+  them weakly; services.exe and wineboot.exe called a trap), gex defines
+  them null in the PIC module; and a native module now loads its **delay
+  imports** at load time (wineboot delay-imports user32 and gdi32: nothing
+  loaded them, win32u's syscall table was missing in its process and
+  every NtUser call returned STATUS_INVALID_SYSTEM_SERVICE).
+- Tests: `tests/nt` **childgui** (user_win as a child: CreateProcess, wait;
+  `GEX_NT_CHILDREN=1`, native Wine only) passes all 34 checks in the child.
+  wineboot's full install as children (`launch.exe "wineboot.exe -u"`:
+  wineboot and its rundll32 children, PreInstall then DefaultInstall) runs
+  through PreInstall and into DefaultInstall (1.6 MB of registry written);
+  a grandchild (`control.exe appwiz.cpl install_mono`) trapped once on an
+  indirect-call type mismatch in a Unix call, not reproduced alone: being
+  chased. The registry-fixture idea is dropped.
 - Cost, on edger through bench.sh (native gexc; a Windows server call,
-  GetExitCodeThread, is 88 us there): in a child, IsWindow 99.6 us (0.39
-  us in the process hosting the server), GetAsyncKeyState 585 us (0.76 us:
+  GetExitCodeThread, is 74.5 us there): in a child, IsWindow 97.8 us (0.30
+  us in the process hosting the server), GetAsyncKeyState 572 us (0.76 us:
   it refreshes the queue and the desktop object, ~1 KiB each), a frame
   polling all 256 keys 157 ms (0.19 ms). The transport alone, as a
-  pipe-and-epoll round trip like a server request's: 24.8 us between
-  threads natively and 41.5 us in the browser runtime (Node,
-  `run-node.mjs`); between processes 14.0 us natively, 25.7 us in the
-  browser runtime. (Wine itself does not run in the page yet, so the page
-  figure is the transport's.)
+  pipe-and-epoll round trip like a server request's: 24.7 us between
+  threads natively and 45.7 us in the browser runtime (Node,
+  `run-node.mjs`: the page's shim and glue, Workers as worker_threads);
+  between processes 13.5 us natively, 27.8 us in the browser runtime.
+  (`$W/rtt/bench-rtt.sh`, `$W/rtt/bench3.txt`.) Not yet measured in a
+  Chromium page: W3 does not run in the page yet, and no page harness
+  runs a wasm32 program by itself.
 - Who would feel it: only a **child** process. A game started directly is
   the process hosting the server and reads directly. A game started by a
   launcher (launcher.exe → game.exe, `start /wait`) would be a child: per
