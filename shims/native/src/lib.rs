@@ -518,12 +518,19 @@ impl std::error::Error for StopExecution {}
 /// placed segments rather than the file, because that is what the translator
 /// reads.
 fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
+    // The program file goes in as bytes, not through `Debug`: formatting a
+    // multi-MiB file as a list of decimal numbers cost more than all the
+    // rest of an exec (a gexcc busybox: about 12 MB of text, twice, at every
+    // exec in a guest shell's loop).
+    let mut plain = xlate.clone();
+    let elf = plain.image_elf.take();
     let mut fields: Vec<Vec<u8>> = vec![
         image.bias.to_le_bytes().into(),
         image.entry.to_le_bytes().into(),
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
-        format!("{xlate:?}").into_bytes(),
+        format!("{plain:?}").into_bytes(),
+        elf.as_deref().map(|e| e.to_vec()).unwrap_or_default(),
         // The same bytes mean different instructions in 32-bit mode.
         vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
