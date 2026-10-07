@@ -101,10 +101,31 @@ pass: 142 uploads, 123 copies, 51 passes for 47 draws.
   of the replay's CPU per frame). Now opt-in, `?wgpustats=1`.
 - **Per-draw debug labels in the driver**: six snprintf per draw for WebGPU
   object labels (`gex_wgpu_draw_vbo_inner`, "draw %s/%s" and its group and
-  layout labels), about 0.3 ms a frame; mesa-wink change prepared (see below).
+  layout labels), about 0.3 ms a frame in the profile. Gated behind an env
+  variable and replayed (r5): 5.44 and 5.30 ms against 5.13 and 5.32 ms
+  without the change, i.e. inside the noise. Dropped; no mesa-wink change.
 - **Attachment views are made per render pass** (createView 78 a frame), and
   2-4 render pipelines are created every frame in the live page.
 - E4 (SIMD + ThinLTO) was measured by E on the page before: no gain (control
-  53.6, 56.8 vs 51.5, 56.9 world fps). Re-measured here by replay below.
+  53.6, 56.8 vs 51.5, 56.9 world fps). By replay of the CLIENT_ARRAY stream
+  (r4, 600 frames, two passes): release (gex's flags) 5.45 and 5.47 ms a
+  frame; with eject9's mesa-o3.ini (`-msimd128 -flto=thin`, link `-O3`,
+  which runs binaryen at link) 5.09 and 4.99 ms, 7% less; a further
+  `wasm-opt -O2` over that 5.28 and 5.04 ms (nothing more).
+
+### CLIENT_ARRAY, by replay
+
+The NT layer now sends client arrays as `op::CLIENT_ARRAY` (bdb682d9).
+`to-client-array.mjs` rewrites the recorded trace into what the new layer
+sends, and the replay (r3, 600 frames, two passes; the last frame's
+readback digest equal on both):
+
+| stream | ms per frame | passes | views | writeBuffer | copies | createBuffer |
+| --- | --- | --- | --- | --- | --- | --- |
+| as recorded (scratch buffers) | 8.17, 8.45 | 51 | 77 | 178 | 123 | 15 |
+| CLIENT_ARRAY | 5.32, 5.33 | 15 | 16 | 83 | 0 | 0 |
+
+The counts are now pewasm's live ones (15 passes, 16 views, 87 writeBuffer,
+no copies).
 
 ## Findings
