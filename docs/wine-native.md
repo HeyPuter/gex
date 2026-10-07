@@ -1204,6 +1204,58 @@ crypt (no provider registered), pipe (the x64 architecture check).
   build tree must not mix objects from before and after a plugin change.
 - **No Wine fork patch** for GL.
 
+**Child processes without the session's shared memory (2026-10-07).**
+The user's decision: no cross-process shared memory in gex-eject; Wine is
+patched instead. Scope, as found:
+- win32u reads the session in six places: the **user handle table**
+  (`get_user_entry*`, `is_valid_entry`: every HWND check, IsWindow,
+  GetWindowThreadProcessId, the handle-table walks), **window** objects
+  (`get_shared_window`: class, DPI, wndproc, GetWindowLong's extra bytes),
+  **class** objects (class.c: names, GetClassLong), the **desktop**
+  (`get_shared_desktop`: async key state, cursor position and clip, the
+  monitor serial), the **queue** (`get_shared_queue`: wake and changed
+  bits, hook counts) and the thread's **input** (`get_shared_input`:
+  foreground, active, focus, capture, caret, key state). user32 reads
+  none directly.
+- Wine 11.15 still has requests for part of it (get_key_state for one key,
+  get_queue_status, set_cursor's position and clip, get_window_info and
+  get_class_info for one offset, get_window_rectangles), but the forms
+  that returned the rest were cut when shared memory came in (9.0's
+  get_key_state returned the whole key array, get_thread_input the
+  foreground/focus/capture/caret handles, get_window_info the pid, tid and
+  atom). A fallback per site would re-add those replies across six files.
+- So one generic request instead: `read_session_data(offset, size)`
+  returns the bytes of the session mapping, and a child keeps a local copy
+  laid out like the mapping; each read sequence refreshes the bytes it is
+  about to read (a seqlock acquire: the object and up to 512 extra bytes; a
+  user entry), so the seqlock check that follows passes as it would on the
+  real mapping. ~60 lines of hand-written change in win32u, server and
+  protocol.def (128 with the generated protocol files). The process hosting
+  the server keeps its direct read.
+- Tests: a child GUI process (`launch.exe user_win.exe`: CreateProcess,
+  wait) passes all 34 of user_win's checks in the child; wineboot's full
+  install with wineboot and rundll32 as children (below).
+- Cost, on edger through bench.sh (native gexc; a Windows server call,
+  GetExitCodeThread, is 88 us there): in a child, IsWindow 99.6 us (0.39
+  us in the process hosting the server), GetAsyncKeyState 585 us (0.76 us:
+  it refreshes the queue and the desktop object, ~1 KiB each), a frame
+  polling all 256 keys 157 ms (0.19 ms). The transport alone, as a
+  pipe-and-epoll round trip like a server request's: 24.8 us between
+  threads natively and 41.5 us in the browser runtime (Node,
+  `run-node.mjs`); between processes 14.0 us natively, 25.7 us in the
+  browser runtime. (Wine itself does not run in the page yet, so the page
+  figure is the transport's.)
+- Who would feel it: only a **child** process. A game started directly is
+  the process hosting the server and reads directly. A game started by a
+  launcher (launcher.exe → game.exe, `start /wait`) would be a child: per
+  frame, GetAsyncKeyState over many keys (Unity's and SDL's input polling,
+  GameMaker's keyboard_check over the key range) costs ~0.6 ms a key, so a
+  full 256-key poll is unplayable (157 ms) and a few keys a frame is
+  ~2-5 ms; IsWindow/GetWindowLong on hot paths ~0.1 ms each. Next steps
+  if a launcher-started game needs it: refresh only the bytes a read uses
+  (the key byte, not the object), and cache the desktop key state per
+  keystate_serial.
+
 #### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
 
 Every change is behind `__wasm32__` (or only built for it). What, why, and
@@ -1229,6 +1281,7 @@ what would let it go:
 | user callbacks return through gex's pad | gex watches call-out returns by dispatch slot | never (port) |
 | **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
 | **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
+| **a child process reads the session through requests** (`read_session_data`, server/mapping.c; win32u keeps a local copy laid out as the mapping, refreshed per seqlock acquire and per user handle entry; the handle-table walk skips entries the process has no object for) | a child has its own wasm memory and cannot map the session the server thread writes (user 2026-10-07: gex-eject never ships cross-process shared memory) | never under that decision; the process hosting the server keeps its direct read |
 | winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
 | win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific): **not being upstreamed (user 2026-10-07)**: kept as a fork patch; the ungated patch stays in `docs/wine-upstream/0001-win32u-VkKeyScan-skip-SGCAPS-caps-row.patch` for reference |
 
