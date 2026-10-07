@@ -2107,7 +2107,7 @@ impl Kernel {
                     )
                 } else {
                     (
-                        self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?,
+                        self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3]).ok()?,
                         PollReport::Select {
                             nfds: a[0] as u32,
                             readfds: a[1],
@@ -4837,17 +4837,21 @@ impl Kernel {
         readfds: u64,
         writefds: u64,
         exceptfds: u64,
-    ) -> Option<Vec<PollFd>> {
+    ) -> Result<Vec<PollFd>, Errno> {
         const POLLIN: u16 = 0x001;
         const POLLOUT: u16 = 0x004;
+        if (nfds as i32) < 0 {
+            return Err(Errno::EINVAL);
+        }
         let nfds = nfds.min(1024);
         let mut want: std::collections::BTreeMap<i32, u16> = Default::default();
-        for (set, ev) in [(readfds, POLLIN), (writefds, POLLOUT)] {
+        // (exceptfds: watched for nothing, but its descriptors must be open)
+        for (set, ev) in [(readfds, POLLIN), (writefds, POLLOUT), (exceptfds, 0)] {
             if set == 0 {
                 continue;
             }
             for w in 0..(nfds as usize).div_ceil(64) {
-                let word = m.read_bits64(set + (w as u64) * 8).ok()?;
+                let word = m.read_bits64(set + (w as u64) * 8).map_err(|_| Errno::EFAULT)?;
                 if word == 0 {
                     continue;
                 }
@@ -4863,9 +4867,12 @@ impl Kernel {
             }
         }
         // An exceptional condition never happens here, so a descriptor named
-        // only in that set is watched for nothing and simply never fires.
-        let _ = exceptfds;
-        Some(
+        // only in that set is watched for nothing and simply never fires. A
+        // descriptor in any set that is not open is EBADF, as on Linux.
+        if want.keys().any(|&fd| self.fds.get(fd).is_err()) {
+            return Err(Errno::EBADF);
+        }
+        Ok(
             want.into_iter()
                 .map(|(fd, events)| {
                     let file = self.fds.get(fd).ok();
@@ -5113,9 +5120,7 @@ impl Kernel {
     /// `pselect6`, for the case where something is ready already. The waiting
     /// case is a [`BlockOp::Poll`], decided before this is reached.
     fn sys_pselect(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
-        let set = self
-            .collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])
-            .ok_or(Errno::EFAULT)?;
+        let set = self.collect_selectfds(m, a[0] as u32, a[1], a[2], a[3])?;
         poll_finish(
             &set,
             &PollReport::Select {

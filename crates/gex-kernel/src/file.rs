@@ -444,8 +444,10 @@ pub struct PipeEnd {
 impl FileHandle for PipeEnd {
     /// An empty pipe is not readable -- the trait default "yes" is right for a
     /// file and wrong here, and a `select` on it would spin ready/read-nothing.
+    /// A write end is never readable (select would report it ready for
+    /// reading when asked about both directions; Linux does not).
     fn poll_readable(&self) -> bool {
-        self.write || self.pipe.readable()
+        !self.write && self.pipe.readable()
     }
 
     fn available(&self) -> Option<u64> {

@@ -420,8 +420,9 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
 
     /// A pipe with nothing in it is not readable, whatever the default says.
     /// The default is "yes", which is right for a file and wrong here.
+    /// (A write end is never readable, as Linux.)
     fn poll_readable(&self) -> bool {
-        self.write || (self.remote.readable)(self.id) != 0
+        !self.write && (self.remote.readable)(self.id) != 0
     }
 
     fn poll_writable(&self) -> bool {
