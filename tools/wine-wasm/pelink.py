@@ -413,6 +413,15 @@ def link(dlls, out, gexrt, others=None):
         for (n, k), v in sigs[mod].items():
             if k == 'undefined' and n in missing:
                 callers.setdefault(n, v)
+    # Only weakly referenced (msvcrt's crt_main asks whether the program
+    # defined __main_argc_argv or __original_main): left undefined, so the
+    # reference stays null. A trapping stub would make it non-null, and a
+    # program with the other form of main would call the trap.
+    strong = set()
+    for mod, ro, ex, imports in dlls:
+        nm = subprocess.run(['llvm-nm', '--undefined-only', ro], capture_output=True, text=True).stdout
+        strong |= {l.split()[-1] for l in nm.splitlines() if l.split()[:1] == ['U']}
+    callers = {n: v for n, v in callers.items() if n in strong}
     gaps = sorted(callers.items())
     if gaps:
         ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}

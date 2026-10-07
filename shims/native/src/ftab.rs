@@ -344,6 +344,28 @@ fn instantiate(
         }
     }
     jit_stats::INSTALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // clang's three names for a C main (`main`, `__main_argc_argv`,
+    // `__original_main`): Wine's crt_main references all of them weakly and a
+    // program defines one. In a position-independent module the others stay
+    // imports, their address through `GOT.func`: null, as a static link
+    // leaves them, and the direct calls behind the null check a trap.
+    const MAIN_NAMES: [&str; 3] = ["main", "__main_argc_argv", "__original_main"];
+    for imp in module.imports() {
+        let (m, name) = (imp.module(), imp.name());
+        if !MAIN_NAMES.contains(&name) || l.get(&mut c, m, name).is_ok() {
+            continue;
+        }
+        if m == "GOT.func" {
+            let g = i32c(&mut c, 0u64, wasmtime::Mutability::Var)?;
+            l.define(&mut c, m, name, g)?;
+        } else if let (true, wasmtime::ExternType::Func(ft)) = (m == f::PIC_MODULE, imp.ty()) {
+            let label = name.to_string();
+            let func = wasmtime::Func::new(&mut c, ft, move |_, _, _| {
+                Err(wasmtime::Error::msg(format!("{label}: a main the program does not define was called")))
+            });
+            l.define(&mut c, m, name, func)?;
+        }
+    }
     let inst = l.instantiate(&mut c, module).context("instantiating a function-table module")?;
     if let Some(x) = stateful {
         crate::libprov::relocate_once(&mut c, &inst, x)?;
