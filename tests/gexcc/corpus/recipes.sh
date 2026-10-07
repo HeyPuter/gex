@@ -219,7 +219,7 @@ build_curl() {
 }
 test_curl() {
   # the suite's runner is perl (the host's): test programs and curl run under gexc
-  cd tests && timeout ${TMO:-5400} make -j$JOBS test-full TFLAGS="-j$JOBS -a -p" > ../t.out 2>&1; cd ..
+  timeout ${TMO:-5400} make test-full TFLAGS="-j$JOBS -a -p" > t.out 2>&1
   tail -15 t.out
   l=$(grep -E '^TESTDONE: [0-9]+ tests out of [0-9]+ reported OK' t.out | tail -1)
   ok=$(echo "$l" | awk '{print $2}'); tot=$(echo "$l" | awk '{print $6}')
@@ -262,7 +262,11 @@ test_vim() {
   echo "RESULT pass=$p fail=$f skip=0"
 }
 build_fmt() {
-  cmake -S . -B b -G Ninja -DCMAKE_TOOLCHAIN_FILE=$GEXCC_PREFIX/share/gexcc/toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DFMT_TEST=ON
+  # fmt 11.0.2's color.h uses std::copy without <algorithm>, which libc++ 22
+  # no longer brings in transitively (fixed upstream later); its tests
+  # specialize std::is_floating_point, which libc++ 22 rejects
+  cmake -S . -B b -G Ninja -DCMAKE_TOOLCHAIN_FILE=$GEXCC_PREFIX/share/gexcc/toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DFMT_TEST=ON \
+    -DCMAKE_CXX_FLAGS="-include algorithm -Wno-invalid-specialization"
   ninja -C b -j$JOBS
 }
 test_fmt() { (cd b && timeout ${TMO:-3600} ctest -j$JOBS --output-on-failure) > ct.out 2>&1; tail -30 ct.out; ctest_result ct.out; }
@@ -272,7 +276,7 @@ build_perl() {
   # are not picked up. Extensions static (no dlopen of side modules).
   sh Configure -des -Dcc=gexcc -Dld=gexcc -Dar=gexcc-ar -Dranlib=gexcc-ranlib -Dnm=gexcc-nm -Uusenm \
     -Dprefix=/usr -Uusedl -Dlibpth="$SYSROOT/lib $SYSROOT/usr/lib" -Dloclibpth= -Dlocincpth= -Dglibpth= \
-    -Dusrinc="$SYSROOT/include" -Doptimize=-O2 -Dman1dir=none -Dman3dir=none
+    -Dusrinc="$SYSROOT/include" -Doptimize=-O2 -Accflags=-D_GNU_SOURCE -Dman1dir=none -Dman3dir=none
   make -j$JOBS
 }
 test_perl() {

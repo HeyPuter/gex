@@ -13,14 +13,21 @@
 int main(void)
 {
 	struct stat st;
-	system("rm -rf pc.d pc.f; mkdir pc.d; touch pc.f");
+	system("rm -rf pc.d pc.f pc.l pc.dangling pc.loop; mkdir pc.d; touch pc.f");
 	T(stat("pc.f/", &st) == -1 && errno == ENOTDIR);
 	T(open("pc.f/", O_RDONLY) == -1 && errno == ENOTDIR);
 	T(stat("pc.d/", &st) == 0);
+	T(symlink("pc.d", "pc.l") == 0);
+	T(lstat("pc.l", &st) == 0 && S_ISLNK(st.st_mode));
+	T(lstat("pc.l/", &st) == 0 && S_ISDIR(st.st_mode));
+	T(symlink("pc.nosuch", "pc.dangling") == 0);
+	T(lstat("pc.dangling/", &st) == -1 && errno == ENOENT);
+	T(symlink("pc.loop", "pc.loop") == 0);
+	T(lstat("pc.loop/", &st) == -1 && errno == ELOOP);
 	T(rename("pc.f", "pc.d/.") == -1);
 	T(rename("pc.d/..", "pc.x") == -1);
 	T(realpath("pc.f/", NULL) == NULL && errno == ENOTDIR);
 	T(rename("pc.f", "pc.d/f") == 0);
-	system("rm -rf pc.d pc.f");
+	system("rm -rf pc.d pc.f pc.l pc.dangling pc.loop");
 	return 0;
 }

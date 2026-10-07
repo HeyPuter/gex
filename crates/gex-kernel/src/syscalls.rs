@@ -3171,10 +3171,27 @@ impl Kernel {
         // A trailing slash names a directory: "file/" is ENOTDIR (the
         // normalised path has lost the slash, so look now).
         if p.len() > 1 && p.ends_with('/') {
-            if let Ok(md) = self.vfs.metadata(&abs) {
+            let followed = self.vfs.metadata(&abs);
+            if let Ok(md) = followed.as_ref() {
                 if md.file_type != crate::vfs::FileType::Directory {
                     return Err(Errno::ENOTDIR);
                 }
+                // "link/" names the directory the link points to, even for
+                // lstat and the other calls that do not follow a last link
+                let mut cur = abs;
+                for _ in 0..40 {
+                    match self.vfs.read_link(&cur) {
+                        Ok(t) if t.starts_with('/') => cur = crate::vfs::normalize(&t, "/"),
+                        Ok(t) => cur = crate::vfs::normalize(&t, &crate::vfs::parent_of(&cur)),
+                        Err(_) => break,
+                    }
+                }
+                return Ok(cur);
+            }
+            // a dangling or looping link with a slash names nothing: the
+            // error following it gives (ENOENT, ELOOP)
+            if self.vfs.metadata_nofollow(&abs).is_ok() {
+                return Err(followed.err().unwrap_or(Errno::ENOENT));
             }
         }
         Ok(abs)
