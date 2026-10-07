@@ -658,6 +658,9 @@ pub struct Kernel {
     /// it replaced, and a build system that does not get one back concludes
     /// the mask was zero and re-runs itself.
     pub umask: u32,
+    /// `getrlimit`/`setrlimit` (prlimit64): soft and hard per resource.
+    /// RLIMIT_NOFILE's soft limit is the descriptor table's (`FdTable`).
+    pub rlimits: [[u64; 2]; RLIM_NLIMITS],
     /// The terminal: flags, size, foreground process group, and the line
     /// discipline behind them. See [`crate::tty`].
     ///
@@ -684,6 +687,30 @@ pub struct Itimer {
 }
 
 /// The three interval timers, in the order `which` names them.
+/// Resource limits (prlimit64): Linux's numbering and its defaults for a
+/// login process. RLIM_INFINITY is all ones.
+pub const RLIM_NLIMITS: usize = 16;
+pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_CORE: usize = 4;
+pub const RLIMIT_NOFILE: usize = 7;
+pub const RLIMIT_NPROC: usize = 6;
+pub const RLIMIT_MEMLOCK: usize = 8;
+pub const RLIMIT_SIGPENDING: usize = 11;
+pub const RLIMIT_MSGQUEUE: usize = 12;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+pub fn default_rlimits() -> [[u64; 2]; RLIM_NLIMITS] {
+    let mut l = [[RLIM_INFINITY; 2]; RLIM_NLIMITS];
+    l[RLIMIT_STACK] = [8 << 20, RLIM_INFINITY];
+    l[RLIMIT_CORE] = [0, RLIM_INFINITY];
+    l[RLIMIT_NOFILE] = [crate::file::NOFILE_SOFT as u64, crate::file::NOFILE_HARD as u64];
+    l[RLIMIT_NPROC] = [63_000, 63_000];
+    l[RLIMIT_MEMLOCK] = [8 << 20, 8 << 20];
+    l[RLIMIT_SIGPENDING] = [63_000, 63_000];
+    l[RLIMIT_MSGQUEUE] = [819_200, 819_200];
+    l
+}
+
 pub const ITIMER_REAL: usize = 0;
 pub const ITIMER_VIRTUAL: usize = 1;
 pub const ITIMER_PROF: usize = 2;
@@ -1236,6 +1263,7 @@ impl Kernel {
             retired_code: Vec::new(),
             next_tmpfile: 0,
             umask: 0o022,
+            rlimits: default_rlimits(),
             net: None,
             resolver: Arc::new(net::Resolver::new()),
             ports: Arc::new(net::Ports::new()),
@@ -1472,6 +1500,7 @@ impl Kernel {
             retired_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
             umask: self.umask,
+            rlimits: self.rlimits,
             net: self.net.clone(),
             resolver: Arc::clone(&self.resolver),
             ports: Arc::clone(&self.ports),
@@ -2603,7 +2632,8 @@ impl Kernel {
             // Nothing here has an option worth setting -- no timeouts, no
             // buffer sizes that mean anything -- and refusing makes libraries
             // treat the socket as broken.
-            nr::SETSOCKOPT => Ok(0),
+            // agreed to without effect, on a descriptor that exists
+            nr::SETSOCKOPT => self.fds.get(a[0] as i32).map(|_| 0),
             nr::GETSOCKOPT => self.sys_getsockopt(m, a[0] as i32, a[2], a[3]),
             // A unix socket's directions close as asked; any other socket
             // (the proxied network, the global kernel's) just agrees.
@@ -2696,7 +2726,7 @@ impl Kernel {
             nr::TIMES => self.sys_times(m, a[0]),
             nr::GETRUSAGE => self.sys_getrusage(m, a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
-            nr::PRLIMIT64 => self.sys_prlimit(m, a[2], a[3]),
+            nr::PRLIMIT64 => self.sys_prlimit(m, a[1], a[2], a[3]),
 
             // -- signals -----------------------------------------------------
             nr::RT_SIGACTION => self.sys_rt_sigaction(m, a[0] as u32, a[1], a[2]),
@@ -3133,8 +3163,13 @@ impl Kernel {
         if p.starts_with('/') || dirfd == AT_FDCWD {
             return Ok(self.vfs.absolute(&p));
         }
-        // Relative to an open directory: its recorded path is the base.
-        let base = self.fds.get(dirfd)?.path.clone();
+        // Relative to an open directory: its recorded path is the base. A
+        // descriptor that is not a directory is ENOTDIR.
+        let f = self.fds.get(dirfd)?;
+        if f.metadata().is_ok_and(|md| md.file_type != crate::vfs::FileType::Directory) {
+            return Err(Errno::ENOTDIR);
+        }
+        let base = f.path.clone();
         Ok(crate::vfs::normalize(&p, &base))
     }
 
@@ -3928,6 +3963,8 @@ impl Kernel {
         const F_ADD_SEALS: u64 = 1033;
         const F_GET_SEALS: u64 = 1034;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        // every command is on an open descriptor
+        self.fds.get(fd)?;
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let file = self.fds.get(fd)?;
@@ -6468,12 +6505,41 @@ impl Kernel {
         Ok(len as u64)
     }
 
-    fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, new: u64, old: u64) -> SysResult {
-        if old != 0 {
-            m.write_u64(old, 8 * 1024 * 1024)?;
-            m.write_u64(old + 8, u64::MAX)?;
+    /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
+    /// processes set only their own). Limits are recorded and reported;
+    /// RLIMIT_NOFILE is enforced by the descriptor table, the rest are not.
+    fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
+        let r = resource as usize;
+        if r >= RLIM_NLIMITS {
+            return Err(Errno::EINVAL);
         }
-        let _ = new;
+        if r == RLIMIT_NOFILE {
+            self.rlimits[r][0] = self.fds.limit() as u64;
+        }
+        let cur = self.rlimits[r];
+        let want = if new != 0 { Some([m.read_u64(new)?, m.read_u64(new + 8)?]) } else { None };
+        if let Some([soft, hard]) = want {
+            if soft > hard {
+                return Err(Errno::EINVAL);
+            }
+            // raising the hard limit takes privilege; NOFILE cannot pass
+            // what the table holds
+            if (hard > cur[1] && self.uid != 0)
+                || (r == RLIMIT_NOFILE && hard > crate::file::NOFILE_HARD as u64)
+            {
+                return Err(Errno::EPERM);
+            }
+        }
+        if old != 0 {
+            m.write_u64(old, cur[0])?;
+            m.write_u64(old + 8, cur[1])?;
+        }
+        if let Some(lim) = want {
+            self.rlimits[r] = lim;
+            if r == RLIMIT_NOFILE {
+                self.fds.set_limit(lim[0] as usize);
+            }
+        }
         Ok(0)
     }
 }
