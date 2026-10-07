@@ -166,6 +166,9 @@ impl OpenFile {
     }
 
     pub fn seek(&self, offset: i64, whence: u32) -> SysResult {
+        if let Some(r) = self.handle.seek(offset, whence) {
+            return r;
+        }
         if self.handle.is_stream() {
             return Err(Errno::ESPIPE);
         }

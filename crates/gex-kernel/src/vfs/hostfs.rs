@@ -72,7 +72,7 @@ fn file_type_of(md: &std::fs::Metadata) -> FileType {
     }
 }
 
-fn convert(md: &std::fs::Metadata) -> Metadata {
+pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
     Metadata {
         file_type: file_type_of(md),
         size: md.len(),

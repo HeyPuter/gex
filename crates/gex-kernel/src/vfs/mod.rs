@@ -158,6 +158,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn is_stream(&self) -> bool {
         false
     }
+    /// `lseek` on a handle that keeps its own offset (a standard stream
+    /// redirected from a host file: the offset is the host descriptor's).
+    /// `None`: the open-file description's offset, or `ESPIPE` for a stream.
+    fn seek(&self, _offset: i64, _whence: u32) -> Option<SysResult> {
+        None
+    }
     /// True when the file should behave like a terminal for `ioctl`.
     fn is_tty(&self) -> bool {
         false
