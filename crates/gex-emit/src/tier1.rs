@@ -340,6 +340,19 @@ fn trace_blocks() -> bool {
         || *ON.get_or_init(|| std::env::var_os("GEX_TRACE_BLOCKS").is_some())
 }
 
+/// `GEX_TRACE_RANGE=LO-HI` (hex): trace every block starting in the range
+/// (its translation, and each execution through `BRK_TRACE`).
+fn in_trace_range(pc: u64) -> bool {
+    static R: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let r = R.get_or_init(|| {
+        let v = std::env::var("GEX_TRACE_RANGE").ok()?;
+        let (a, b) = v.split_once('-')?;
+        let h = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        Some((h(a)?, h(b)?))
+    });
+    r.is_some_and(|(a, b)| pc >= a && pc < b)
+}
+
 fn trap_pc() -> u64 {
     static ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let e = *ENV.get_or_init(|| {
@@ -368,6 +381,15 @@ fn trap_pc() -> u64 {
 /// a patch cannot change a body's length.
 pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32>) {
     let mut e = Emitter::new(cx, block.start);
+    // First, before the page check: a block entered for a neighbour in its
+    // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
+    // The page check's stale path (and the guard's) dispatch to this block's
+    // own start, which for a neighbour's branch is the wrong address: a call
+    // to a JIT trampoline at E ran a stale block for E+2 there, mid-
+    // instruction (Rain World's crashes in Mono's trampolines).
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        e.emit_target_check(block.start);
+    }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
@@ -392,11 +414,18 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
     if is_trap_pc(block.start) {
         e.emit_trap_pc(block.start);
     }
-    if trace_blocks() {
+    if trace_blocks() || in_trace_range(block.start) {
         e.emit_trace_point(block.start);
     }
-    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
-        e.emit_target_check(block.start);
+    if in_trace_range(block.start) {
+        eprintln!(
+            "[t1] translate {:#x}..{:#x} guard {} term {:?} bytes {}",
+            block.start,
+            block.end,
+            block.guard.as_ref().map_or(0, |g| g.len()),
+            block.term,
+            block.guard.as_ref().map_or(String::new(), |g| g.iter().take(64).map(|b| format!("{b:02x}")).collect::<String>())
+        );
     }
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
@@ -407,6 +436,15 @@ pub fn compile_with_relocs(block: &Block, cx: &Context<'_>) -> (Vec<u8>, Vec<u32
 
 pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     let mut e = Emitter::new(cx, block.start);
+    // First, before the page check: a block entered for a neighbour in its
+    // dispatch slot (x86-64's 4-byte slots) must hand over to that address.
+    // The page check's stale path (and the guard's) dispatch to this block's
+    // own start, which for a neighbour's branch is the wrong address: a call
+    // to a JIT trampoline at E ran a stale block for E+2 there, mid-
+    // instruction (Rain World's crashes in Mono's trampolines).
+    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
+        e.emit_target_check(block.start);
+    }
     if let Some(bases) = cx.page_bases.filter(|_| page_check()) {
         let mut pages = checked_pages(bases, block.start, block.end);
         // A region carries its members: their pages too.
@@ -431,11 +469,18 @@ pub fn compile(block: &Block, cx: &Context<'_>) -> Vec<u8> {
     if is_trap_pc(block.start) {
         e.emit_trap_pc(block.start);
     }
-    if trace_blocks() {
+    if trace_blocks() || in_trace_range(block.start) {
         e.emit_trace_point(block.start);
     }
-    if gex_abi::DISPATCH_SHIFT > gex_abi::INST_ALIGN_SHIFT {
-        e.emit_target_check(block.start);
+    if in_trace_range(block.start) {
+        eprintln!(
+            "[t1] translate {:#x}..{:#x} guard {} term {:?} bytes {}",
+            block.start,
+            block.end,
+            block.guard.as_ref().map_or(0, |g| g.len()),
+            block.term,
+            block.guard.as_ref().map_or(String::new(), |g| g.iter().take(64).map(|b| format!("{b:02x}")).collect::<String>())
+        );
     }
     if let Some(g) = &block.guard {
         e.emit_guard(block.start, g);
@@ -790,14 +835,12 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ty = vec![Ty::I64; n];
-        let last_use = compute_last_use(block);
+        let dying = dying_after(block);
         self.prof_entry(block);
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
-            for (v, &lu) in last_use.iter().enumerate() {
-                if lu == Some(i) {
-                    self.release(Value(v as u32));
-                }
+            for &v in &dying[i] {
+                self.release(Value(v));
             }
         }
         self.region_terminator(block);
@@ -866,7 +909,7 @@ impl<'a> Emitter<'a> {
         self.value_const = vec![None; n];
         self.value_ty = vec![Ty::I64; n];
 
-        let last_use = compute_last_use(block);
+        let dying = dying_after(block);
 
         // A block whose only successor is itself becomes a real wasm loop, so
         // its guest registers stay in locals across the back-edge. Sound only
@@ -890,10 +933,8 @@ impl<'a> Emitter<'a> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             self.stmt(stmt, block);
             // Recycle locals whose values are dead after this statement.
-            for (v, &lu) in last_use.iter().enumerate() {
-                if lu == Some(i) {
-                    self.release(Value(v as u32));
-                }
+            for &v in &dying[i] {
+                self.release(Value(v));
             }
         }
         self.terminator(block);
@@ -4925,6 +4966,22 @@ impl<'a> Emitter<'a> {
             self.f.return_call_indirect(self.cx.block_ty, k);
         }
     }
+}
+
+/// For each statement, the values whose last use it is, in value order (the
+/// order the releases always ran in). Was a scan of every value after every
+/// statement: quadratic, and most of a Unity start-up's time in Mono's large
+/// JIT-generated blocks.
+fn dying_after(block: &Block) -> Vec<Vec<u32>> {
+    let mut out = vec![Vec::new(); block.stmts.len()];
+    for (v, lu) in compute_last_use(block).into_iter().enumerate() {
+        if let Some(i) = lu {
+            if let Some(d) = out.get_mut(i) {
+                d.push(v as u32);
+            }
+        }
+    }
+    out
 }
 
 /// Index of the last statement that reads each value, or `None` when the
