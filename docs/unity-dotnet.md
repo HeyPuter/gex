@@ -1266,3 +1266,48 @@ Not yet:
      per-process fix, not a regression.) HK reaches Menu_Title with the
      walk on by default in every run since hk109.
 
+  21. **Speed on a bench box (2026-10-07, restarted stream U; head after
+     ba7d2dc7 = master 5a066f67 merged).** The user's concern: Hollow Knight's
+     start-up (~4.5 min to the first frame, ~12.7 min to the menu) and 5-15 fps,
+     all from gooner (loaded, llvmpipe). No game runs on gooner any more: games
+     run on edger (`scratch/bench/bench.sh`).
+     - **Harness:** `tests/games/unity-bench.sh hk|muck RUN SECS [gexc flags]`
+       wraps muck-dotnet.sh with graphics and writes `meta.txt`, `plog-t.txt`
+       (the player log with ms since start), out.txt with `[gex-gl] first
+       present` and `[gex-gl] presents/s` (`GEX_GL_FPS=1`, gex-gl host: the
+       game's own swaps, not compositor commits) and with `PROF=1` the
+       `[gex-prof] AOT x% of guest` line every 10 s (`GEX_PROF_SHARE=1`; new
+       kind `provider-jit` for the .NET wasm JIT's modules) and prof.txt.
+       `tests/games/unity-bench-sum.py RUN` prints the milestones and the menu
+       fps window. Run as `scratch/bench/bench.sh -s
+       /home/claude/gex-sandbox/wt/unity/tests/games -- env PROF=1 bash
+       wt/unity/tests/games/unity-bench.sh hk scratch/unity/eruns/NAME 1200
+       --fjit`.
+     - **edger staging** (same paths as gooner): `games-linux/{Hollow
+       Knight,Muck}`, `scratch/unity/dnc/{provider/mono.wasm,lib,lib-extra}`,
+       `scratch/unity/gl64`, `~/.dotnet/shared/Microsoft.NETCore.App/10.0.10`,
+       `scratch/unity/edger/gexc` (copy of `target/dbg-x86/release/gexc`),
+       `scratch/unity/edger/bin/Xwayland` (gooner's 22.1; edger has none; passed
+       as `--env XWAYLAND=`), `scratch/unity/edger/llvm-bin/{clang,wasm-ld}`
+       wrapping gooner's LLVM 22 copied to edger `~/toolchains/llvm-22` (+
+       `edger/llvm-libs`): gexc links provider modules with wasm-ld at run
+       time (`GEX_CLANG`/`GEX_WASM_LD`, set by unity-bench.sh).
+     - **edger fixes:** Xwayland aborted in NVIDIA's EGL (its swrast GLX opens
+       EGL through glvnd): xwayland-inguest.sh sets `XWAYLAND_NO_GLAMOR=1` and
+       `__EGL_VENDOR_LIBRARY_FILENAMES` to Mesa's.
+     - **Start-up is translation:** the first edger profile (first 2 min) is
+       Cranelift + gex_xlate recovery on the thread that missed (the fjit
+       translates synchronously), ~1-1.5 cores busy of 8.
+     - **ELF units (new, this commit):** `GEX_ELF_UNITS=UnityPlayer.so[,..|all]`
+       installs a function-tier unit for a Linux shared object at its mapped
+       bias (`nt_cgen::on_elf_maps`, after `elfprov` in the Linux map hook;
+       `CodeMap` now carries the file offset); a missing one is built in the
+       background for the next run (`GEX_ELF_UNITS_BUILD=0` stops that;
+       `gexc cgen-image --elf SO --base HEX --mem64 --jobs N` builds one by
+       hand). The object must land at the same base every run: `--pin FILE`
+       with a line `BASE SPAN UnityPlayer.so`.
+     - **Liveness walk (provider, this commit):** class shapes (reference
+       offsets per class, value types flattened, filter test cached) and a
+       lock-free generation-tagged visited set replace the per-object field
+       iteration and the mutex-guarded hash; `GEXMONO_LV_NOSHAPE=1` walks as
+       before for A/B.
