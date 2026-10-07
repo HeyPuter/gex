@@ -2153,6 +2153,77 @@ mod tests {
         assert_eq!(pixel16(&px, 7, 7), (255, 0, 0, 255), "the clear went to the texture");
     }
 
+    /// A desktop 4.5 context with framebuffer and renderbuffer names the
+    /// host never generated (the guest picks them): ARB_framebuffer_object
+    /// refuses such a name in a bind (NVIDIA does; Mesa lets it through), so
+    /// the host generates its own and maps them. The bind, the attachment
+    /// and the clear work, no GL error is raised, and the binding queries
+    /// answer with the guest's names.
+    #[test]
+    fn a_desktop_context_takes_framebuffer_names_it_never_generated() {
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 4, 5]);
+        let (_, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        if !gl.is_desktop() {
+            eprintln!("skipping: the host has no desktop OpenGL");
+            return;
+        }
+        const GL_TEXTURE_2D: u32 = 0x0DE1;
+        const GL_FRAMEBUFFER: u32 = 0x8D40;
+        const GL_RENDERBUFFER: u32 = 0x8D41;
+        const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const GL_DEPTH_ATTACHMENT: u32 = 0x8D00;
+        const GL_DEPTH_COMPONENT24: u32 = 0x81A6;
+        const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+        const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+        const GL_RENDERBUFFER_BINDING: u32 = 0x8CA7;
+        let mut b = Batch::new();
+        b.cmd(op::GEN_TEXTURES, &[1, 905]);
+        b.cmd(op::BIND_TEXTURE, &[GL_TEXTURE_2D, 905]);
+        b.raw(op::TEX_IMAGE_2D, &[GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0, 0], &[]);
+        // 906 is generated first; 907 is bound without ever being generated.
+        b.cmd(op::GEN_FRAMEBUFFERS, &[1, 906]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 906]);
+        b.cmd(op::BIND_RENDERBUFFER, &[GL_RENDERBUFFER, 907]);
+        b.cmd(op::RENDERBUFFER_STORAGE, &[GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 16, 16]);
+        b.cmd(op::FRAMEBUFFER_RENDERBUFFER, &[GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 907]);
+        b.cmd(op::FRAMEBUFFER_TEXTURE_2D, &[GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 905, 0]);
+        b.cmd(op::CHECK_FRAMEBUFFER_STATUS, &[GL_FRAMEBUFFER]);
+        b.cmd(op::GET_INTEGERV, &[GL_FRAMEBUFFER_BINDING]);
+        b.cmd(op::GET_INTEGERV, &[GL_RENDERBUFFER_BINDING]);
+        b.cmd(op::VIEWPORT, &[0, 0, 16, 16]);
+        b.cmd(op::CLEAR_COLOR, &[0, 1.0f32.to_bits(), 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        read_back(&mut b);
+        b.cmd(op::GET_ERROR, &[]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 0]);
+        b.cmd(op::DELETE_FRAMEBUFFERS, &[1, 906]);
+        b.cmd(op::DELETE_RENDERBUFFERS, &[1, 907]);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        assert_eq!(read_u32(r, &mut at), GL_FRAMEBUFFER_COMPLETE);
+        let fb = read_blob(r, &mut at);
+        assert_eq!(u32::from_le_bytes(fb[0..4].try_into().unwrap()), 906, "the framebuffer binding, by the guest's name");
+        let rb = read_blob(r, &mut at);
+        assert_eq!(u32::from_le_bytes(rb[0..4].try_into().unwrap()), 907, "the renderbuffer binding, by the guest's name");
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "no GL error while drawing");
+        assert_eq!(read_u32(r, &mut at), 0, "no GL error deleting");
+        assert_eq!(pixel16(&px, 7, 7), (0, 255, 0, 255), "the clear went to the texture");
+    }
+
     /// Protocol 11: client arrays from a buffer, an orthographic projection
     /// and scaling, a loaded matrix, the current color and the alpha test.
     #[test]
