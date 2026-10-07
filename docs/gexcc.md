@@ -215,6 +215,20 @@ down (the system log showed about 45,000 processes a minute). Now:
   - zlib's `make test`: 6 host execs.
   - /proc/stat's machine-wide counter also counts those threads and other
     users' processes (about 46 a second on an idle gooner).
+- **In-guest results so far** (corpus3, one suite at a time; "host execs"
+  counts the run's host programs, "host clones" the gexc tree's threads):
+
+  | suite | tests | host execs | host clones |
+  |---|---|---|---|
+  | zlib | 3/3 | 6 | — |
+  | xz | 19/19 | 6 | 92,037 |
+  | bzip2 | 6/6 | 6 | 43 |
+  | jq | 28/29 (shtest: busybox `script` has no `-e`) | 6 | 8,203 |
+  | pcre2 | 1/3 (as before: ILP32 sizes, musl locales) | 6 | 11,027 |
+  | expat | 2/2 | 6 | 22,438 |
+  | libpng | 32/32 | 6 | 4,539 |
+  | lua, sqlite | 1/1 each | one host gexc each | — |
+
 - **Slots** (`gexcc-exec`): at most `GEXCC_SLOTS` (4) host-started gexcc
   programs run at once per user. The rest wait on an flock. Guest execs take
   none. Tested by `tests/gexcc/slots/run.sh`: at most 2 at once with 2
