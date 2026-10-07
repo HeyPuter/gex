@@ -54,6 +54,11 @@ struct Inner {
     input: Mutex<Option<Input>>,
 }
 
+fn keytrace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_WL_KEYTRACE").is_some())
+}
+
 /// One scripted input event (`GEX_WL_INPUT`, [`Input::load`]).
 #[derive(Debug, Clone, Copy)]
 enum Ev {
@@ -381,11 +386,20 @@ impl Wayland {
                 let file = OpenFile::new(handle, "anon:wl-keymap".into(), 0, true, false);
                 s.socket.stage_send(vec![file]);
             }
+            let pending = s.out.len() - s.sent;
+            let mut failed = None;
             while s.sent < s.out.len() {
                 match s.socket.send(&s.out[s.sent..]) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
                     Ok(n) => s.sent += n as usize,
                 }
+            }
+            if keytrace() && (failed.is_some() || s.sent < s.out.len() || !due.is_empty()) {
+                eprintln!("[wl-key] pump: {pending} bytes to send, {} left, error {failed:?}", s.out.len() - s.sent);
             }
             if s.sent == s.out.len() {
                 s.out.clear();
