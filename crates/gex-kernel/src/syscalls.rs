@@ -3865,6 +3865,12 @@ impl Kernel {
             blksize: 4096,
             blocks: (md.size as i64 + 511) / 512,
             mtime: md.mtime,
+            // A filesystem that keeps one time reports it for all three.
+            mtime_ns: md.times.mtime_ns,
+            atime: if md.times == Default::default() { md.mtime } else { md.times.atime },
+            atime_ns: md.times.atime_ns,
+            ctime: if md.times == Default::default() { md.mtime } else { md.times.ctime },
+            ctime_ns: md.times.ctime_ns,
             // What the node says, or for a character device that does not,
             // a pseudo-terminal's number (136:0).
             rdev: if md.rdev != 0 {
@@ -3925,10 +3931,16 @@ impl Kernel {
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
         put64(&mut out, 48, st.blocks as u64);
-        // atime, btime, ctime, mtime: 16 bytes each from offset 64. Only the
-        // seconds are known, and all four get the same one.
-        for at in [64usize, 80, 96, 112] {
-            put64(&mut out, at, st.mtime as u64);
+        // atime, btime, ctime, mtime: 16 bytes each from offset 64, seconds
+        // then nanoseconds; btime is reported as mtime.
+        for (at, (t, ns)) in [64usize, 80, 96, 112].into_iter().zip([
+            (st.atime, st.atime_ns),
+            (st.mtime, st.mtime_ns),
+            (st.ctime, st.ctime_ns),
+            (st.mtime, st.mtime_ns),
+        ]) {
+            put64(&mut out, at, t as u64);
+            put32(&mut out, at + 8, ns);
         }
         put32(&mut out, 128, (st.rdev >> 8) as u32);
         put32(&mut out, 132, (st.rdev & 0xff) as u32);
@@ -4629,25 +4641,29 @@ impl Kernel {
         const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
         const UTIME_NOW: u64 = (1 << 30) - 1;
         const UTIME_OMIT: u64 = (1 << 30) - 2;
-        // The modification time to set, if any.
-        let mtime = if times == 0 {
-            Some((self.clock)().0 as i64)
+        // The access and modification times to set (`None`: leave it).
+        let now = {
+            let (s, ns) = (self.clock)();
+            (s as i64, ns as u32)
+        };
+        let (atime, mtime) = if times == 0 {
+            (Some(now), Some(now))
         } else {
-            for t in [times, times + 16] {
+            let mut v = [None, None];
+            for (k, t) in [times, times + 16].into_iter().enumerate() {
                 let ns = m.read_u64(t + 8)?;
-                if ns >= 1_000_000_000 && ns != UTIME_NOW && ns != UTIME_OMIT {
-                    return Err(Errno::EINVAL);
-                }
+                v[k] = match ns {
+                    UTIME_OMIT => None,
+                    UTIME_NOW => Some(now),
+                    _ if ns >= 1_000_000_000 => return Err(Errno::EINVAL),
+                    _ => Some((m.read_u64(t)? as i64, ns as u32)),
+                };
             }
-            match m.read_u64(times + 24)? {
-                UTIME_OMIT => None,
-                UTIME_NOW => Some((self.clock)().0 as i64),
-                _ => Some(m.read_u64(times + 16)? as i64),
-            }
+            (v[0], v[1])
         };
         if path == 0 {
             // futimens: the "path" is really the open descriptor in `dirfd`.
-            self.fds.get(dirfd)?;
+            self.fds.get(dirfd)?.handle.set_times(atime, mtime)?;
             return Ok(0);
         }
         let p = self.at_path(m, dirfd, path)?;
@@ -4657,8 +4673,8 @@ impl Kernel {
         } else {
             self.vfs.metadata_nofollow(&p)?;
         }
-        if let Some(t) = mtime {
-            self.vfs.set_mtime(&p, t, follow)?;
+        if atime.is_some() || mtime.is_some() {
+            self.vfs.set_times(&p, atime, mtime, follow)?;
         }
         Ok(0)
     }

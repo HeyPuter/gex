@@ -52,6 +52,7 @@ impl FileHandle for Generated {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 }
@@ -202,6 +203,7 @@ impl FileSystem for ProcFs {
                 mtime: 0,
                 nlink: 1,
                 rdev: 0,
+                times: Default::default(),
             });
         }
         match path.as_str() {
@@ -214,6 +216,7 @@ impl FileSystem for ProcFs {
                 mtime: 0,
                 nlink: 1,
                 rdev: 0,
+                times: Default::default(),
             }),
             _ => Err(Errno::ENOENT),
         }

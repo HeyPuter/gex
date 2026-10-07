@@ -850,6 +850,7 @@ impl FileHandle for Socket {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 

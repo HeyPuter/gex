@@ -1228,6 +1228,7 @@ impl FileHandle for StdinQueue {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 
@@ -1367,6 +1368,7 @@ impl FileHandle for Tty {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 
@@ -1428,6 +1430,7 @@ impl FileHandle for Console {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 

@@ -52,9 +52,20 @@ pub struct Stat {
     pub blksize: i32,
     pub blocks: i64,
     pub mtime: i64,
+    pub mtime_ns: u32,
+    pub atime: i64,
+    pub atime_ns: u32,
+    pub ctime: i64,
+    pub ctime_ns: u32,
 }
 
 impl Stat {
+    /// (seconds, nanoseconds) of atime, mtime, ctime, in `struct stat`'s
+    /// order.
+    pub fn times(&self) -> [(i64, u32); 3] {
+        [(self.atime, self.atime_ns), (self.mtime, self.mtime_ns), (self.ctime, self.ctime_ns)]
+    }
+
     /// PowerPC's 32-bit `struct stat64` (104 bytes, big-endian): no padding
     /// after `st_dev`, a 64-bit `st_ino` second, 32-bit times.
     fn encode_ppc(&self) -> Vec<u8> {
@@ -70,8 +81,9 @@ impl Stat {
         b[48..56].copy_from_slice(&self.size.to_ge_bytes());
         b[56..60].copy_from_slice(&self.blksize.to_ge_bytes());
         b[64..72].copy_from_slice(&self.blocks.to_ge_bytes());
-        for off in [72usize, 80, 88] {
-            b[off..off + 4].copy_from_slice(&(self.mtime as u32).to_ge_bytes());
+        for (off, (t, ns)) in [72usize, 80, 88].into_iter().zip(self.times()) {
+            b[off..off + 4].copy_from_slice(&(t as u32).to_ge_bytes());
+            b[off + 4..off + 8].copy_from_slice(&ns.to_ge_bytes());
         }
         b
     }
@@ -101,8 +113,9 @@ impl Stat {
             b[44..52].copy_from_slice(&self.size.to_le_bytes());
             b[52..56].copy_from_slice(&(self.blksize as u32).to_le_bytes());
             b[56..64].copy_from_slice(&(self.blocks as u64).to_le_bytes());
-            for off in [64usize, 72, 80] {
-                b[off..off + 4].copy_from_slice(&(self.mtime as u32).to_le_bytes());
+            for (off, (t, ns)) in [64usize, 72, 80].into_iter().zip(self.times()) {
+                b[off..off + 4].copy_from_slice(&(t as u32).to_le_bytes());
+                b[off + 4..off + 8].copy_from_slice(&ns.to_le_bytes());
             }
             b[88..96].copy_from_slice(&self.ino.to_le_bytes());
             return b;
@@ -119,8 +132,9 @@ impl Stat {
             b[48..56].copy_from_slice(&self.size.to_le_bytes());
             b[56..64].copy_from_slice(&(self.blksize as i64).to_le_bytes());
             b[64..72].copy_from_slice(&self.blocks.to_le_bytes());
-            for off in [72usize, 88, 104] {
-                b[off..off + 8].copy_from_slice(&self.mtime.to_le_bytes());
+            for (off, (t, ns)) in [72usize, 88, 104].into_iter().zip(self.times()) {
+                b[off..off + 8].copy_from_slice(&t.to_le_bytes());
+                b[off + 8..off + 16].copy_from_slice(&(ns as u64).to_le_bytes());
             }
             return b;
         }
@@ -135,8 +149,9 @@ impl Stat {
         b[48..56].copy_from_slice(&self.size.to_le_bytes());
         b[56..60].copy_from_slice(&self.blksize.to_le_bytes());
         b[64..72].copy_from_slice(&self.blocks.to_le_bytes());
-        for off in [72usize, 88, 104] {
-            b[off..off + 8].copy_from_slice(&self.mtime.to_le_bytes());
+        for (off, (t, ns)) in [72usize, 88, 104].into_iter().zip(self.times()) {
+            b[off..off + 8].copy_from_slice(&t.to_le_bytes());
+            b[off + 8..off + 16].copy_from_slice(&(ns as u64).to_le_bytes());
         }
         b
     }

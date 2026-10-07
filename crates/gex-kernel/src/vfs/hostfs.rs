@@ -81,6 +81,13 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
         mtime: md.mtime(),
         nlink: md.nlink() as u32,
         rdev: 0,
+        times: super::Times {
+            mtime_ns: md.mtime_nsec() as u32,
+            atime: md.atime(),
+            atime_ns: md.atime_nsec() as u32,
+            ctime: md.ctime(),
+            ctime_ns: md.ctime_nsec() as u32,
+        },
     }
 }
 
@@ -92,7 +99,29 @@ struct HostHandle {
     stream: bool,
 }
 
+/// `(seconds, nanoseconds)` since the epoch as a host time.
+fn host_time((secs, ns): (i64, u32)) -> std::time::SystemTime {
+    let d = std::time::Duration::new(secs.unsigned_abs(), 0);
+    let t = if secs >= 0 { std::time::UNIX_EPOCH + d } else { std::time::UNIX_EPOCH - d };
+    t + std::time::Duration::from_nanos(ns as u64)
+}
+
+fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::FileTimes {
+    let mut t = std::fs::FileTimes::new();
+    if let Some(a) = atime {
+        t = t.set_accessed(host_time(a));
+    }
+    if let Some(m) = mtime {
+        t = t.set_modified(host_time(m));
+    }
+    t
+}
+
 impl FileHandle for HostHandle {
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        self.file.lock().unwrap().set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
+    }
+
     /// `ftruncate`. The trait default answers `EINVAL`; apt truncates a file to
     /// 0 before hashing a download and reported that as "Unable to truncate".
     fn truncate(&self, len: u64) -> Result<(), Errno> {
@@ -333,6 +362,14 @@ impl FileSystem for HostFs {
             std::fs::Permissions::from_mode((mode & 0o7777) | 0o600),
         )
         .map_err(|e| Errno::from_io(&e))
+    }
+
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        let f = std::fs::File::open(self.host_path(path)?).map_err(|e| Errno::from_io(&e))?;
+        f.set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
     }
 
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {

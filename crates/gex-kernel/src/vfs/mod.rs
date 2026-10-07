@@ -86,6 +86,19 @@ pub struct Metadata {
     /// Linux's `makedev` encoding. Zero where the node does not say; `stat`
     /// then reports a character device as a pseudo-terminal (136:0).
     pub rdev: u64,
+    /// The other times and the nanoseconds, where the filesystem keeps
+    /// them (the host's). All zero: every time is `mtime`, whole seconds.
+    pub times: Times,
+}
+
+/// `st_atim`, `st_ctim` and the nanoseconds of `st_mtim`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Times {
+    pub mtime_ns: u32,
+    pub atime: i64,
+    pub atime_ns: u32,
+    pub ctime: i64,
+    pub ctime_ns: u32,
 }
 
 impl Metadata {
@@ -98,6 +111,7 @@ impl Metadata {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         }
     }
     pub fn dir() -> Metadata {
@@ -109,6 +123,7 @@ impl Metadata {
             mtime: 0,
             nlink: 2,
             rdev: 0,
+            times: Default::default(),
         }
     }
 }
@@ -148,6 +163,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// onto something that keeps no times accepts it and does nothing.
     fn set_mtime(&self, _secs: i64) -> Result<(), Errno> {
         Ok(())
+    }
+    /// `futimens`: [`FileSystem::set_times`] on an open file.
+    fn set_times(&self, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let _ = atime;
+        match mtime {
+            Some((secs, _)) => self.set_mtime(secs),
+            None => Ok(()),
+        }
     }
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let _ = len;
@@ -331,6 +354,16 @@ pub trait FileSystem: Send + Sync {
         let _ = (path, secs);
         Ok(())
     }
+    /// `utimensat` with both times and nanoseconds (`None`: leave it). A
+    /// filesystem that keeps only whole-second modification times takes
+    /// what it can.
+    fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> Result<(), Errno> {
+        let _ = atime;
+        match mtime {
+            Some((secs, _)) => self.set_mtime(path, secs),
+            None => Ok(()),
+        }
+    }
 
     /// A second name for the same file. `EPERM` is what Linux says for a
     /// filesystem that has no hard links, which is the honest default.
@@ -484,6 +517,7 @@ impl Vfs {
                 mtime: 0,
                 nlink: 1,
                 rdev: 0,
+                times: Default::default(),
             });
         }
         fs.metadata(&rel)
@@ -527,6 +561,12 @@ impl Vfs {
     /// Set the modification time of `path`, following a final symlink when
     /// `follow` (as `utimensat` does without `AT_SYMLINK_NOFOLLOW`).
     pub fn set_mtime(&self, path: &str, secs: i64, follow: bool) -> Result<(), Errno> {
+        self.set_times(path, None, Some((secs, 0)), follow)
+    }
+
+    /// Set the access and modification times of `path` (`None`: leave it),
+    /// following a final symlink when `follow`.
+    pub fn set_times(&self, path: &str, atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>, follow: bool) -> Result<(), Errno> {
         let mut current = normalize(path, &self.cwd);
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
@@ -540,7 +580,7 @@ impl Vfs {
                 }
                 _ => {
                     fs.metadata(&rel)?;
-                    return fs.set_mtime(&rel, secs);
+                    return fs.set_times(&rel, atime, mtime);
                 }
             }
         }
