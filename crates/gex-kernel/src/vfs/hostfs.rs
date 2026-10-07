@@ -88,6 +88,8 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
 #[derive(Debug)]
 struct HostHandle {
     file: Mutex<File>,
+    /// Not a regular file (a FIFO, a socket, a device): no offset.
+    stream: bool,
 }
 
 impl FileHandle for HostHandle {
@@ -103,8 +105,10 @@ impl FileHandle for HostHandle {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| Errno::from_io(&e))?;
+        if !self.stream {
+            f.seek(SeekFrom::Start(offset))
+                .map_err(|e| Errno::from_io(&e))?;
+        }
         f.read(buf)
             .map(|n| n as u64)
             .map_err(|e| Errno::from_io(&e))
@@ -112,11 +116,17 @@ impl FileHandle for HostHandle {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
         let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(offset))
-            .map_err(|e| Errno::from_io(&e))?;
+        if !self.stream {
+            f.seek(SeekFrom::Start(offset))
+                .map_err(|e| Errno::from_io(&e))?;
+        }
         f.write(buf)
             .map(|n| n as u64)
             .map_err(|e| Errno::from_io(&e))
+    }
+
+    fn is_stream(&self) -> bool {
+        self.stream
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -204,9 +214,18 @@ impl FileSystem for HostFs {
         if flags & oflags::O_APPEND != 0 {
             opts.append(true);
         }
+        // O_NONBLOCK reaches the host: opening a host FIFO without a writer
+        // must not block (grep -D skip opens one so, to fstat and skip it).
+        // Linux's O_NONBLOCK on the host.
+        if flags & oflags::O_NONBLOCK != 0 {
+            opts.custom_flags(0o4000);
+        }
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
+        // A FIFO, socket or device has no offset: read and write it as is.
+        let stream = file.metadata().is_ok_and(|m| !m.is_file());
         Ok(Arc::new(HostHandle {
             file: Mutex::new(file),
+            stream,
         }))
     }
 
