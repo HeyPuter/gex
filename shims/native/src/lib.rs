@@ -1359,6 +1359,32 @@ fn store_limits() -> wasmtime::StoreLimits {
         .build()
 }
 
+/// How much of a timed wait's `deadline` is left once `elapsed` has gone by,
+/// or `None` when it is up. Read the clock once and pass it here: testing
+/// `start.elapsed() >= d` and then computing `d - start.elapsed()` reads it
+/// twice, and a thread descheduled between the two (a loaded machine) got a
+/// second reading past the deadline and panicked subtracting durations,
+/// taking the guest thread with it (Baba Is You's, on gooner).
+fn time_left(deadline: std::time::Duration, elapsed: std::time::Duration) -> Option<std::time::Duration> {
+    deadline.checked_sub(elapsed).filter(|d| !d.is_zero())
+}
+
+#[cfg(test)]
+mod time_left_tests {
+    use super::time_left;
+    use std::time::Duration;
+
+    #[test]
+    fn a_deadline_already_past_is_up_rather_than_a_panic() {
+        let ms = Duration::from_millis;
+        assert_eq!(time_left(ms(50), ms(20)), Some(ms(30)));
+        assert_eq!(time_left(ms(50), ms(50)), None);
+        // The case that panicked: the clock read past the deadline.
+        assert_eq!(time_left(ms(50), ms(51)), None);
+        assert_eq!(time_left(Duration::ZERO, ms(1)), None);
+    }
+}
+
 /// Run a syscall's blocking half outside the kernel lock.
 ///
 /// `service` runs on every turn so host devices keep working while the guest
@@ -1407,8 +1433,7 @@ fn perform_block(
             let slice = std::time::Duration::from_millis(20);
             loop {
                 let left = match deadline {
-                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
-                    Some(d) => (d - start.elapsed()).min(slice),
+                    Some(d) => time_left(d, start.elapsed()).ok_or(Errno::ETIMEDOUT)?.min(slice),
                     None => slice,
                 };
                 match table.wait(uaddr, val, Some(left), &|| mem.read_u32(uaddr).ok()) {
@@ -1448,8 +1473,7 @@ fn perform_block(
                     continue;
                 }
                 let left = match deadline {
-                    Some(d) if start.elapsed() >= d => return Err(Errno::ETIMEDOUT),
-                    Some(d) => d - start.elapsed(),
+                    Some(d) => time_left(d, start.elapsed()).ok_or(Errno::ETIMEDOUT)?,
                     None => std::time::Duration::from_millis(100),
                 };
                 // In slices: the owner's UNLOCK_PI wakes this, and the word
