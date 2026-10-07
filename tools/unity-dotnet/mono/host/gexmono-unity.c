@@ -515,7 +515,18 @@ lv_free (Liveness *s)
  * buffers by the number of objects). Reset when Unity stops the world for the
  * next pass. */
 static int lv_env (const char *name);
-static GHashTable *lv_pass_seen;
+/* The pass's visited set is an open-addressing table of 64-bit words, each the
+ * object pointer (below 2^40) tagged with the pass's generation in the top 24
+ * bits, filled with compare-and-swap: Unity's mark jobs walk from several
+ * threads at once, and the old mutex-guarded GHashTable cost a lock and a
+ * hash insert per reference. A reset is a generation bump, not a clear. An
+ * object whose probe run is full goes to the locked overflow set (every thread
+ * probes the same run for it, so it is never in both). */
+#define LV_SEEN_BITS 22
+#define LV_SEEN_PROBE 64
+static uint64_t *lv_seen_tab;
+static uint64_t lv_seen_gen = 1;
+static GHashTable *lv_pass_seen; /* the overflow */
 static pthread_mutex_t lv_pass_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
@@ -524,7 +535,57 @@ lv_pass_reset (void)
 	pthread_mutex_lock (&lv_pass_lock);
 	if (lv_pass_seen)
 		g_hash_table_remove_all (lv_pass_seen);
+	if (lv_seen_tab) {
+		uint64_t g = __atomic_load_n (&lv_seen_gen, __ATOMIC_RELAXED) + 1;
+		if (g >= (1u << 24)) {
+			memset (lv_seen_tab, 0, sizeof (uint64_t) << LV_SEEN_BITS);
+			g = 1;
+		}
+		__atomic_store_n (&lv_seen_gen, g, __ATOMIC_RELEASE);
+	}
 	pthread_mutex_unlock (&lv_pass_lock);
+}
+
+/* Whether `o` was already visited this pass; marks it visited. */
+static gboolean
+lv_seen_test_and_set (MonoObject *o)
+{
+	uint64_t *tab = __atomic_load_n (&lv_seen_tab, __ATOMIC_ACQUIRE);
+	if (!tab) {
+		pthread_mutex_lock (&lv_pass_lock);
+		if (!lv_seen_tab)
+			__atomic_store_n (&lv_seen_tab, (uint64_t *)g_malloc0 (sizeof (uint64_t) << LV_SEEN_BITS), __ATOMIC_RELEASE);
+		pthread_mutex_unlock (&lv_pass_lock);
+		tab = lv_seen_tab;
+	}
+	uint64_t p = (uint64_t)(uintptr_t)o;
+	if (p < ((uint64_t)1 << 40)) {
+		uint64_t gen = __atomic_load_n (&lv_seen_gen, __ATOMIC_ACQUIRE) << 40;
+		uint64_t want = gen | p;
+		uint64_t mask = ((uint64_t)1 << LV_SEEN_BITS) - 1;
+		uint64_t h = ((p >> 3) * 0x9E3779B97F4A7C15ull) >> (64 - LV_SEEN_BITS);
+		for (int i = 0; i < LV_SEEN_PROBE; i++) {
+			uint64_t *slot = &tab [(h + i) & mask];
+			uint64_t e = __atomic_load_n (slot, __ATOMIC_ACQUIRE);
+			for (;;) {
+				if (e == want)
+					return TRUE;
+				if ((e & ~(((uint64_t)1 << 40) - 1)) == gen)
+					break; /* this pass's entry for another object */
+				/* stale or empty: claim it */
+				if (__atomic_compare_exchange_n (slot, &e, want, FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+					return FALSE;
+			}
+		}
+	}
+	pthread_mutex_lock (&lv_pass_lock);
+	if (!lv_pass_seen)
+		lv_pass_seen = g_hash_table_new (NULL, NULL);
+	gboolean seen = g_hash_table_contains (lv_pass_seen, o);
+	if (!seen)
+		g_hash_table_add (lv_pass_seen, o);
+	pthread_mutex_unlock (&lv_pass_lock);
+	return seen;
 }
 
 static void
@@ -543,16 +604,121 @@ lv_push (Liveness *s, MonoObject *o)
 		g_ptr_array_add (s->stack, o);
 		return;
 	}
-	pthread_mutex_lock (&lv_pass_lock);
-	if (!lv_pass_seen)
-		lv_pass_seen = g_hash_table_new (NULL, NULL);
-	gboolean seen = g_hash_table_contains (lv_pass_seen, o);
-	if (!seen)
-		g_hash_table_add (lv_pass_seen, o);
-	pthread_mutex_unlock (&lv_pass_lock);
-	if (seen)
+	if (lv_seen_test_and_set (o))
 		return;
 	g_ptr_array_add (s->stack, o);
+}
+
+/* A class's shape for the walk: the offsets of every reference slot in an
+ * instance (boxed: from the object's start, parents included) or in an
+ * unboxed value of a value type (from the value's start), value-type fields
+ * flattened in. Built once per class from the field metadata the walk used to
+ * iterate for every object. Kept in a lock-free table keyed by the class
+ * pointer (bit 0 set for the unboxed shape); a full table means building it
+ * again each time (correct, slow). `subof` caches the filter test: the filter
+ * class with bit 0 set when the class is its subclass. GEXMONO_LV_NOSHAPE=1
+ * walks the fields as before, for comparison. */
+typedef struct {
+	uint64_t subof;
+	guint32 n;
+	gint32 offs [];
+} LvShape;
+
+static void
+lv_shape_collect (GArray *a, MonoClass *k, int at, gboolean boxed)
+{
+	for (MonoClass *c = k; c && m_class_has_references (c); c = m_class_get_parent (c)) {
+		gpointer iter = NULL;
+		MonoClassField *f;
+		while ((f = mono_class_get_fields_internal (c, &iter))) {
+			if (f->type->attrs & (FIELD_ATTRIBUTE_STATIC | FIELD_ATTRIBUTE_LITERAL))
+				continue;
+			MonoType *t = f->type;
+			if (m_type_is_byref (t))
+				continue;
+			gint32 off = at + m_field_get_offset (f) - (boxed ? 0 : (int)MONO_ABI_SIZEOF (MonoObject));
+			switch (t->type) {
+			case MONO_TYPE_CLASS:
+			case MONO_TYPE_OBJECT:
+			case MONO_TYPE_SZARRAY:
+			case MONO_TYPE_ARRAY:
+			case MONO_TYPE_STRING:
+				g_array_append_val (a, off);
+				break;
+			case MONO_TYPE_GENERICINST:
+				if (!mono_type_generic_inst_is_valuetype (t)) {
+					g_array_append_val (a, off);
+					break;
+				}
+				/* fall through */
+			case MONO_TYPE_VALUETYPE: {
+				MonoClass *vk = mono_class_from_mono_type_internal (t);
+				if (vk && m_class_has_references (vk) && !m_class_is_enumtype (vk))
+					lv_shape_collect (a, vk, off, FALSE);
+				break;
+			}
+			default:
+				break;
+			}
+		}
+		if (!boxed)
+			break;
+	}
+}
+
+#define LV_SHAPE_BITS 16
+static struct { uint64_t key; LvShape *shape; } lv_shapes [1 << LV_SHAPE_BITS];
+
+static LvShape *
+lv_shape (MonoClass *k, gboolean boxed)
+{
+	uint64_t key = (uint64_t)(uintptr_t)k | (boxed ? 0 : 1);
+	uint64_t mask = (1u << LV_SHAPE_BITS) - 1;
+	uint64_t h = ((key >> 3) * 0x9E3779B97F4A7C15ull) >> (64 - LV_SHAPE_BITS);
+	int claimed = -1;
+	for (int i = 0; i < 64; i++) {
+		uint64_t j = (h + i) & mask;
+		uint64_t e = __atomic_load_n (&lv_shapes [j].key, __ATOMIC_ACQUIRE);
+		if (e == key) {
+			LvShape *sh = __atomic_load_n (&lv_shapes [j].shape, __ATOMIC_ACQUIRE);
+			if (sh)
+				return sh;
+			break; /* being built by another thread: build our own copy */
+		}
+		if (!e) {
+			uint64_t zero = 0;
+			if (__atomic_compare_exchange_n (&lv_shapes [j].key, &zero, key, FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+				claimed = (int)j;
+				break;
+			}
+			if (zero == key) {
+				LvShape *sh = __atomic_load_n (&lv_shapes [j].shape, __ATOMIC_ACQUIRE);
+				if (sh)
+					return sh;
+				break;
+			}
+		}
+	}
+	GArray *a = g_array_new (FALSE, FALSE, sizeof (gint32));
+	lv_shape_collect (a, k, 0, boxed);
+	LvShape *sh = (LvShape *)g_malloc (sizeof (LvShape) + a->len * sizeof (gint32));
+	sh->subof = 0;
+	sh->n = a->len;
+	memcpy (sh->offs, a->data, a->len * sizeof (gint32));
+	g_array_free (a, TRUE);
+	if (claimed >= 0)
+		__atomic_store_n (&lv_shapes [claimed].shape, sh, __ATOMIC_RELEASE);
+	/* else: not cached; leaked per call, as rare as a full probe run (65,536 slots) */
+	return sh;
+}
+
+static int
+lv_noshape (void)
+{
+	static int v = -1;
+	if (v < 0)
+		v = lv_env ("GEXMONO_LV_NOSHAPE");
+	return v;
 }
 
 static void lv_fields (Liveness *s, MonoClass *k, char *base, gboolean boxed);
@@ -618,8 +784,19 @@ static void
 lv_object_walk (Liveness *s, MonoObject *o, gboolean report)
 {
 	MonoClass *k = mono_object_class (o);
-	if (report && s->filter && mono_class_is_subclass_of_internal (k, s->filter, FALSE))
-		lv_report (s, o);
+	if (lv_noshape ()) {
+		if (report && s->filter && mono_class_is_subclass_of_internal (k, s->filter, FALSE))
+			lv_report (s, o);
+	} else if (report && s->filter) {
+		LvShape *sh = lv_shape (k, TRUE);
+		uint64_t c = __atomic_load_n (&sh->subof, __ATOMIC_RELAXED);
+		if ((c & ~(uint64_t)1) != (uint64_t)(uintptr_t)s->filter) {
+			c = (uint64_t)(uintptr_t)s->filter | (mono_class_is_subclass_of_internal (k, s->filter, FALSE) ? 1 : 0);
+			__atomic_store_n (&sh->subof, c, __ATOMIC_RELAXED);
+		}
+		if (c & 1)
+			lv_report (s, o);
+	}
 	if (m_class_get_rank (k)) {
 		MonoArray *a = (MonoArray *)o;
 		MonoClass *ek = m_class_get_element_class (k);
@@ -629,14 +806,29 @@ lv_object_walk (Liveness *s, MonoObject *o, gboolean report)
 				lv_push (s, mono_array_get_internal (a, MonoObject *, i));
 		} else if (m_class_has_references (ek)) {
 			int es = mono_array_element_size (k);
-			for (uintptr_t i = 0; i < len; i++)
-				lv_fields (s, ek, mono_array_addr_with_size_internal (a, es, i), FALSE);
+			if (lv_noshape ()) {
+				for (uintptr_t i = 0; i < len; i++)
+					lv_fields (s, ek, mono_array_addr_with_size_internal (a, es, i), FALSE);
+			} else {
+				LvShape *sh = lv_shape (ek, FALSE);
+				for (uintptr_t i = 0; i < len; i++) {
+					char *e = mono_array_addr_with_size_internal (a, es, i);
+					for (guint32 j = 0; j < sh->n; j++)
+						lv_push (s, *(MonoObject **)(e + sh->offs [j]));
+				}
+			}
 		}
 		return;
 	}
 	if (k == mono_defaults.string_class)
 		return;
-	lv_fields (s, k, (char *)o, TRUE);
+	if (lv_noshape ()) {
+		lv_fields (s, k, (char *)o, TRUE);
+		return;
+	}
+	LvShape *sh = lv_shape (k, TRUE);
+	for (guint32 j = 0; j < sh->n; j++)
+		lv_push (s, *(MonoObject **)((char *)o + sh->offs [j]));
 }
 
 static void
