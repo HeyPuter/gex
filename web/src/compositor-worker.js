@@ -1404,6 +1404,7 @@ async function startGl(m, canvas) {
     env: m.mesaEnv,
     capture: m.glCapture,
     wgslCache: m.wgslCache,
+    wgpuStats: m.wgpuStats,
     gpu: await requestGexDevice(),
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
