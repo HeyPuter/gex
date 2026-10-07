@@ -12,7 +12,7 @@
 # suites safe to run: in the guest, or a handful of host gexc at most (lua,
 # sqlite, dash, less: one or two). The rest still start a host gexc per test
 # and are refused unless HOSTRUN=1 (then one at a time, in a resource scope).
-GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent lua sqlite dash less gawk tar"
+GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent lua sqlite dash less gawk tar mbedtls fmt bash"
 
 # autotools, cross mode: configure runs nothing it builds
 # (config.site: what the run-time checks found on gex itself)
@@ -181,17 +181,18 @@ test_make_host() {
 }
 build_bash() { export GEXCC_FPCAST=1; at_configure --without-bash-malloc --disable-nls --with-curses CFLAGS="-O2 -Wno-implicit-function-declaration"; make -j$JOBS; }
 test_bash() {
-  # bash's suite prints diffs; count the run-* scripts that print nothing
-  cd tests
-  pass=0; fail=0
-  for t in run-*; do
-    [ "$t" = run-all ] && continue
-    [ "$t" = run-minimal ] && continue
-    o=$(THIS_SH=$PWD/../bash PATH=$PWD:$PATH BUILD_DIR=$PWD/.. BASH_TSTOUT=$PWD/../tstout.$t \
-        timeout 300 $PWD/../bash ./$t 2>&1)
-    if [ -z "$(printf '%s' "$o" | grep -v '^warning:')" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "== $t"; printf '%s\n' "$o" | head -20; fi
-  done
-  echo "RESULT pass=$pass fail=$fail skip=0"
+  # bash's suite prints diffs; a run-* script that prints nothing passed.
+  # The loop runs in the guest: every bash it starts is a guest process.
+  cat > tests/.gexcc-bash.sh <<'SH'
+cd tests
+for t in run-*; do
+  [ "$t" = run-all ] && continue
+  [ "$t" = run-minimal ] && continue
+  o=$(THIS_SH=$PWD/../bash PATH=$PWD:$PATH BUILD_DIR=$PWD/.. BASH_TSTOUT=$PWD/../tstout.$t timeout 300 $PWD/../bash ./$t 2>&1)
+  if [ -z "$(printf '%s' "$o" | grep -v '^warning:')" ]; then echo "PASS: $t"; else echo "FAIL: $t"; printf '%s\n' "$o" | head -20; fi
+done
+SH
+  guest sh tests/.gexcc-bash.sh > check.out 2>&1; cat check.out; am_result check.out
 }
 build_dash() { at_configure; make -j$JOBS; }
 test_dash() {
@@ -252,9 +253,11 @@ build_mbedtls() {
   ninja -C b -j$JOBS
   cmake --install b
 }
-test_mbedtls() {
-  (cd b && timeout ${TMO:-3600} ctest -j$JOBS --output-on-failure) > ct.out 2>&1; tail -30 ct.out
-  ctest_result ct.out
+test_mbedtls() { ctest_guest b; }
+# a CTest suite in the guest (ctest-guest.py writes it as one script)
+ctest_guest() {
+  python3 "$HERE/ctest-guest.py" "$1" > .gexcc-ctest.sh || { echo "RESULT pass=0 fail=1 skip=0"; return; }
+  guest sh .gexcc-ctest.sh > ct.out 2>&1; grep -E '^(PASS|FAIL|SKIP):' ct.out | tail -40; am_result ct.out
 }
 # ctest's "N% tests passed, F tests failed out of T"
 ctest_result() {
@@ -320,7 +323,7 @@ build_fmt() {
     -DCMAKE_CXX_FLAGS="-include algorithm -Wno-invalid-specialization"
   ninja -C b -j$JOBS
 }
-test_fmt() { (cd b && timeout ${TMO:-3600} ctest -j$JOBS --output-on-failure) > ct.out 2>&1; tail -30 ct.out; ctest_result ct.out; }
+test_fmt() { ctest_guest b; }
 build_perl() {
   # Configure as a native build: its try programs run (under gexc). Library
   # and header searches only in the sysroot, so host libraries (gdbm, db)
