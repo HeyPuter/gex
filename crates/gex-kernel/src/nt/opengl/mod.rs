@@ -1470,6 +1470,11 @@ enum Hot {
     BindTexture,
     Uniform1i,
     Uniform2f,
+    BlendFunc,
+    BlendFuncSeparate,
+    Viewport,
+    TexParameteri,
+    Uniform1f,
 }
 
 fn hot(code: u32) -> Option<Hot> {
@@ -1485,6 +1490,11 @@ fn hot(code: u32) -> Option<Hot> {
                 "glBindTexture" => Some(Hot::BindTexture),
                 "glUniform1i" => Some(Hot::Uniform1i),
                 "glUniform2f" => Some(Hot::Uniform2f),
+                "glBlendFunc" => Some(Hot::BlendFunc),
+                "glBlendFuncSeparate" => Some(Hot::BlendFuncSeparate),
+                "glViewport" => Some(Hot::Viewport),
+                "glTexParameteri" => Some(Hot::TexParameteri),
+                "glUniform1f" => Some(Hot::Uniform1f),
                 _ => None,
             })
             .collect()
@@ -1501,6 +1511,13 @@ fn hot_one(c: &mut Call<'_>, h: Hot, p: &Params) -> R<()> {
         Hot::BindTexture => cmd(c, op::BIND_TEXTURE, &[p.u32(c, 1)?, p.u32(c, 2)?], &[]),
         Hot::Uniform1i => cmd(c, op::UNIFORM_1I, &[p.u32(c, 1)?, p.u32(c, 2)?], &[]),
         Hot::Uniform2f => cmd(c, op::UNIFORM_2F, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?], &[]),
+        Hot::BlendFunc => cmd(c, op::BLEND_FUNC, &[p.u32(c, 1)?, p.u32(c, 2)?], &[]),
+        Hot::BlendFuncSeparate => {
+            cmd(c, op::BLEND_FUNC_SEPARATE, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?, p.u32(c, 4)?], &[])
+        }
+        Hot::Viewport => cmd(c, op::VIEWPORT, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?, p.u32(c, 4)?], &[]),
+        Hot::TexParameteri => cmd(c, op::TEX_PARAMETER_I, &[p.u32(c, 1)?, p.u32(c, 2)?, p.u32(c, 3)?], &[]),
+        Hot::Uniform1f => cmd(c, op::UNIFORM_1F, &[p.u32(c, 1)?, p.u32(c, 2)?], &[]),
     }
 }
 
@@ -2569,6 +2586,11 @@ mod tests {
             ("FN_glBindTexture", "OP_BIND_TEXTURE", "glBindTexture", op::BIND_TEXTURE),
             ("FN_glUniform1i", "OP_UNIFORM_1I", "glUniform1i", op::UNIFORM_1I),
             ("FN_glUniform2f", "OP_UNIFORM_2F", "glUniform2f", op::UNIFORM_2F),
+            ("FN_glBlendFunc", "OP_BLEND_FUNC", "glBlendFunc", op::BLEND_FUNC),
+            ("FN_glBlendFuncSeparate", "OP_BLEND_FUNC_SEPARATE", "glBlendFuncSeparate", op::BLEND_FUNC_SEPARATE),
+            ("FN_glViewport", "OP_VIEWPORT", "glViewport", op::VIEWPORT),
+            ("FN_glTexParameteri", "OP_TEX_PARAMETER_I", "glTexParameteri", op::TEX_PARAMETER_I),
+            ("FN_glUniform1f", "OP_UNIFORM_1F", "glUniform1f", op::UNIFORM_1F),
         ] {
             let code = def(f) as usize;
             assert_eq!(table::FUNCS[code].0, name, "{f}");
@@ -2577,7 +2599,7 @@ mod tests {
             assert!(hot(code as u32).is_some(), "{name} is not a hot call here");
         }
         // i386 params: the TEB pointer, then 4-byte fields.
-        for sig in ["pi", "pii", "piff"] {
+        for sig in ["pi", "pii", "piff", "piiii", "pf", "pif"] {
             let offs = layout(sig, Abi::P32);
             for (i, o) in offs[..sig.len()].iter().enumerate() {
                 assert_eq!(*o, 4 * i as u64, "{sig}");

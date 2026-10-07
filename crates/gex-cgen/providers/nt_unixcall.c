@@ -58,6 +58,11 @@
 #define FN_glUniform1i 2524u
 #define FN_glUniform2f 2542u
 #define FN_glUseProgram 2645u
+#define FN_glBlendFunc 16u
+#define FN_glBlendFuncSeparate 463u
+#define FN_glViewport 344u
+#define FN_glTexParameteri 313u
+#define FN_glUniform1f 2520u
 #define FN_glEnableClientState 82u
 #define FN_glDisableClientState 73u
 #define OP_ENABLE 19u
@@ -65,12 +70,17 @@
 #define OP_USE_PROGRAM 55u
 #define OP_UNIFORM_1I 64u
 #define OP_UNIFORM_2F 66u
+#define OP_VIEWPORT 18u
+#define OP_BLEND_FUNC 21u
+#define OP_BLEND_FUNC_SEPARATE 37u
+#define OP_UNIFORM_1F 65u
+#define OP_TEX_PARAMETER_I 100u
 #define OP_BIND_TEXTURE 98u
 #define OP_ACTIVE_TEXTURE 99u
 #define OP_ENABLE_CLIENT_STATE 185u
 #define OP_DISABLE_CLIENT_STATE 186u
 
-/* Append one command of `n` argument words (1 to 3) taken from the params
+/* Append one command of `n` argument words (1 to 4) taken from the params
  * struct (after its TEB pointer). 1 when it is in the ring. */
 GEX_INLINE int gl_put(uint32_t op, uint32_t params, uint32_t n) {
     uint32_t ring = __atomic_load_n(GA(GL_FAST_RING), __ATOMIC_ACQUIRE);
@@ -134,6 +144,14 @@ static GEX_PROVIDER(p_unix_call) {
         case FN_glBindTexture: op = OP_BIND_TEXTURE, n = 2; break;
         case FN_glUniform1i: op = OP_UNIFORM_1I, n = 2; break;
         case FN_glUniform2f: op = OP_UNIFORM_2F, n = 3; break;
+        /* The next most frequent in Noita's frame after the seven above
+         * (GEX_NT_GL_STATS: 39, 8, 9, 12 and 14 a frame), all commands
+         * with no layer state, as the layer's `hot_one` writes them. */
+        case FN_glBlendFunc: op = OP_BLEND_FUNC, n = 2; break;
+        case FN_glBlendFuncSeparate: op = OP_BLEND_FUNC_SEPARATE, n = 4; break;
+        case FN_glViewport: op = OP_VIEWPORT, n = 4; break;
+        case FN_glTexParameteri: op = OP_TEX_PARAMETER_I, n = 3; break;
+        case FN_glUniform1f: op = OP_UNIFORM_1F, n = 2; break;
         case FN_glEnableClientState:
         case FN_glDisableClientState:
             if (params >= 0x10000u && client_state(params, code == FN_glEnableClientState)) {
