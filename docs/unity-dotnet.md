@@ -1360,3 +1360,24 @@ Not yet:
        GEX_ELF_UNITS_BUILD=0` and gexc flag `--pin FILE`.
      - After a Claude Code restart: background runs and builds die with it;
        check `ps` on gooner and edger, rerun what was cut.
+     - **Baseline with correct rendering (edger, native, `--fjit`, shape
+       provider):**
+
+       | run | state | first present | menu ready | menu fps (20-80 s after) |
+       |---|---|---|---|---|
+       | hk-g2 | cold, readback every frame | 448.3 s | 499.4 s | 24.4 |
+       | hk-p1 | warm fjit cache, readback every frame | 244.6 s | 289.1 s | 24.4 |
+       | hk-r1 | warm, readback every 1800th (`GEX_GL_READBACK_EVERY`) | 239.6 s | 282.4 s | 26.4 (last quarter 25.8) |
+
+       Tiers in the menu (hk-p1 `[gex-prof]`): guest code is 99.5% fjit
+       (UnityPlayer and libraries), providers (the .NET runtime and
+       interpreter) 0.2-0.5%, no units, no .NET JIT; about half of all
+       samples are host. Steady-state profile (hk-p1, `GEX_PROF_START=340`):
+       the render thread (guest tid 68) spends 38% of its samples in the
+       host's sched_yield inside NVIDIA's driver (the per-frame readback's
+       GPU wait, hence `GEX_GL_READBACK_EVERY`) and ~15% in the driver.
+       Per-thread CPU over 20 s of the menu (hk-r1 `threads.txt`): main
+       thread 69% of a core, render thread 25%, tid 69 25%, the job workers
+       2-10% each; 2.15 cores in all. No thread is saturated, so the menu
+       frame is bound by waits between threads (the main thread waiting on
+       the render thread or job fences), not by one thread's code speed.
