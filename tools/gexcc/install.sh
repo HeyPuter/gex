@@ -13,6 +13,8 @@
 # gex-wasm32-slim or a descendant). GEXC: the gexc a program's host launcher
 # runs (default: this tree's target/release/gexc if built, else `gexc` on
 # PATH at run time). GEX_BINARYEN: an existing binaryen install.
+# BUSYBOX_TAR: busybox 1.37.0's tarball, built as the guest's native
+# /bin/sh and coreutils. LLVM_SRC: an LLVM tree for libc++ (build-cxx.sh).
 set -eu
 PREFIX=$(realpath -m "$1")
 HERE=$(dirname "$(realpath "$0")")
@@ -26,6 +28,11 @@ mkdir -p "$PREFIX/bin" "$PREFIX/lib/gexcc" "$PREFIX/share/gexcc" "$PREFIX/build"
 "$WW/build-sysroot.sh" "$PREFIX/build" "$MUSL"
 ln -sfn build/sysroot "$PREFIX/sysroot"
 mkdir -p "$PREFIX/sysroot/usr/include" "$PREFIX/sysroot/usr/lib/pkgconfig" "$PREFIX/sysroot/usr/share/pkgconfig"
+# the rest of the Linux UAPI headers (build-sysroot.sh copies linux/, asm/,
+# asm-generic/): architecture-neutral, from the host's linux-libc-dev
+for d in mtd sound video xen misc rdma; do
+  [ -d "/usr/include/$d" ] && { rm -rf "$PREFIX/sysroot/include/$d"; cp -r "/usr/include/$d" "$PREFIX/sysroot/include/"; }
+done
 
 # the driver and its helpers
 L=$PREFIX/lib/gexcc
@@ -51,7 +58,10 @@ llvm-ar crs "$PREFIX/sysroot/lib/libgexcc.a" "$PREFIX"/build/rt/*.o
 echo 'typedef int gexcc_empty;' | clang $WASM_CFLAGS -x c -c - -o "$L/empty.o"
 GEXC=${GEXC:-}
 [ -z "$GEXC" ] && [ -x "$ROOT/target/release/gexc" ] && GEXC=$ROOT/target/release/gexc
-if [ -n "$GEXC" ]; then realpath "$GEXC" > "$L/runner"; else rm -f "$L/runner"; fi
+G=gexc
+[ -n "$GEXC" ] && G=$(realpath "$GEXC")
+# Containers run under gexcc-exec (below), which adds gexcc's defaults to gexc.
+echo "$PREFIX/bin/gexcc-exec" > "$L/runner"
 
 # tool names autotools (--host=$TRIPLE), CMake and Meson look for
 B=$PREFIX/bin
@@ -86,8 +96,25 @@ exec pkg-config --static "\$@"
 EOF
 chmod +x "$B/$TRIPLE-pkg-config"
 ln -sf "$TRIPLE-pkg-config" "$B/gexcc-pkg-config"
+# gexcc-exec: gexc for gexcc programs (the containers' host launcher runs
+# it). The native busybox is the guest's /bin/sh and coreutils, unless
+# GEXCC_BUSYBOX is set (empty: none; a path: that busybox). GEXCC_GEXC
+# picks another gexc.
+cat > "$B/gexcc-exec" <<EOF
+#!/bin/sh
+[ "\$1" = run ] && shift
+bb=\${GEXCC_BUSYBOX-$L/busybox}
+if [ -n "\$bb" ] && [ -f "\$bb" ]; then
+  if [ "\$bb" = "$L/busybox" ] && [ -z "\${GEX_BUSYBOX_APPLETS:-}" ] && [ -f "$L/busybox.applets" ]; then
+    GEX_BUSYBOX_APPLETS=\$(cat "$L/busybox.applets"); export GEX_BUSYBOX_APPLETS
+  fi
+  exec "\${GEXCC_GEXC:-$G}" run --busybox "\$bb" "\$@"
+fi
+exec "\${GEXCC_GEXC:-$G}" run "\$@"
+EOF
+chmod +x "$B/gexcc-exec"
 # `gexcc-run PROG ARGS`: what the container's launcher does, by hand
-R=$(cat "$L/runner" 2>/dev/null || echo gexc)
+R=$B/gexcc-exec
 cat > "$B/gexcc-run" <<EOF
 #!/bin/sh
 exec "\${GEXCC_RUNNER:-$R}" run --host-env "\$@"
@@ -144,4 +171,26 @@ cpu_family = 'wasm32'
 cpu = 'wasm32'
 endian = 'little'
 EOF
+
+# busybox (BUSYBOX_TAR: its 1.37.0 tarball), built with the driver just
+# installed: the native /bin/sh and coreutils gexcc programs see inside gex
+# (system(), popen, exec of sh, sleep, kill). A translated host shell takes
+# seconds per command.
+if [ -n "${BUSYBOX_TAR:-}" ]; then
+  BB=$PREFIX/build/busybox
+  rm -rf "$BB"; mkdir -p "$BB"
+  tar xjf "$BUSYBOX_TAR" -C "$BB" --strip-components=1
+  (cd "$BB" && make defconfig > /dev/null 2>&1 &&
+   sed -i -e 's/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' \
+          -e 's/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' \
+          -e 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config &&
+   PATH="$B:$PATH" make -j"${JOBS:-6}" CC=gexcc HOSTCC=gcc AR=llvm-ar STRIP=true SKIP_STRIP=y > build.log 2>&1) ||
+    { echo "busybox failed: $BB/build.log"; exit 1; }
+  cp "$BB/busybox" "$L/busybox"
+  GEXCC_BUSYBOX= "$B/gexcc-exec" run "$L/busybox" --list | tr '\n' ',' | sed 's/,$//' > "$L/busybox.applets"
+fi
 echo "gexcc: $B/gexcc (sysroot $PREFIX/sysroot, runner $R)"
+# C++ (LLVM_SRC: an LLVM source tree of clang's version)
+if [ -n "${LLVM_SRC:-}" ]; then
+  "$HERE/build-cxx.sh" "$PREFIX" "$LLVM_SRC"
+fi
