@@ -1741,8 +1741,12 @@ Heads:
   lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
   glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`); winewayland.drv draws on gex's
   compositor (`$W/pfx-w3wl`). Output modes (Wine's EmulateModeset) and VkKeyScan done; W3.4 GL: opengl32 on gex-gl through winewayland, glcompat and glfast pass (34 of 40 on `$W/pfx-w3wl`). Wine fork head 74de38ed1ba (mw).
-  **gate2 landed** (master 36f55bb6; merge/w3 has master 132f73ed merged
-  in). The old merge/elf-prov-gate is deleted. To
+  **gate2 landed** (master 36f55bb6), and w3-gate1 (wp_viewporter, master
+  1b4bd047, merged into merge/w3). **merge/w3 gate head** sent after
+  `$W/check-w3-gate.sh` (output `$W/w3chk.out`): crates green, elf-prov 5/5
+  native and in the browser, x86-programs 82, nt --no-cgen 83/83 on x86 and
+  pfx-gui, cgen-prefix 83/83, wasm32 4/4 + busybox both, browser nt 49/49,
+  W3 i386 32 of 40 (null driver) and 34 of 40 (Wayland + GL). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
