@@ -1217,9 +1217,13 @@ impl Client {
         }
         if let Some(frame) = produced {
             // The host that composites from copies has one window, and it is
-            // whichever last drew.
-            self.focus_surface = Some(surface);
-            self.ensure_keyboard_enter();
+            // whichever last drew -- of the windows: a cursor or a subsurface
+            // drawing must not take the keyboard (Xwayland's cursor surface
+            // did, and every scripted key went to it).
+            if matches!(state.role, Role::Toplevel | Role::Popup) {
+                self.focus_surface = Some(surface);
+                self.ensure_keyboard_enter();
+            }
             self.frames.push(frame);
         }
         // Frame callbacks belong to the commit that carried them. The argument
@@ -2941,6 +2945,25 @@ mod tests {
             .expect("the decoration was never configured");
         let mode = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
         assert_eq!(mode, 2, "the compositor draws the frames, so: server_side");
+    }
+
+    #[test]
+    fn a_cursor_drawing_does_not_take_the_keyboard() {
+        // Xwayland draws its cursor surface after its window; on a host that
+        // composites from copies, the keyboard stayed on the cursor and every
+        // key went nowhere.
+        let pool = Pool(vec![0u8; 16]);
+        let mut c = with_seat();
+        c.receive(&Writer::new(12, 0).new_id(13).finish(), &[], &pool); // get_pointer
+        c.receive(&Writer::new(12, 1).new_id(14).finish(), &[], &pool); // get_keyboard
+        assert_eq!(c.focus_surface, Some(6), "the window has the keyboard");
+        c.receive(&Writer::new(3, 0).new_id(20).finish(), &[], &pool); // a surface
+        c.receive(&Writer::new(9, 0).new_id(21).int(0).int(2).int(2).int(8).uint(1).finish(), &[], &pool);
+        c.receive(&Writer::new(13, 0).uint(1).object(20).int(0).int(0).finish(), &[], &pool); // set_cursor
+        c.receive(&Writer::new(20, 1).object(21).int(0).int(0).finish(), &[], &pool); // attach
+        c.receive(&Writer::new(20, 6).finish(), &[], &pool); // commit
+        assert!(c.failed.is_none(), "{:?}", c.failed);
+        assert_eq!(c.focus_surface, Some(6), "the cursor took the keyboard");
     }
 
     #[test]

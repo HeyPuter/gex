@@ -30,9 +30,74 @@ public static class GexProbe
         PlayerLoop.SetPlayerLoop(loop);
     }
 
+    static int inspected;
+
+    // GEXPROBE_INSPECT=Type, Assembly: the first objects of that type (up to 5, once per 4 ticks,
+    // 3 times): every UnityEngine.Object-typed field up its class chain, alive / destroyed / null,
+    // and how many objects of the field's type are loaded.
+    static void Inspect()
+    {
+        var tn = Environment.GetEnvironmentVariable("GEXPROBE_INSPECT");
+        if (string.IsNullOrEmpty(tn) || inspected >= 3) return;
+        if (updates % 4 != 0) return;
+        inspected++;
+        var t = Type.GetType(tn);
+        if (t == null) { Console.Error.WriteLine($"[gexprobe] inspect: no type {tn}"); return; }
+        var objs = Resources.FindObjectsOfTypeAll(t);
+        Console.Error.WriteLine($"[gexprobe] inspect {t.FullName}: {objs.Length} objects");
+        for (int i = 0; i < objs.Length && i < 5; i++)
+        {
+            var o = objs[i];
+            Console.Error.WriteLine($"[gexprobe]   {(o ? o.name : "destroyed")}");
+            for (var c = t; c != null && c != typeof(UnityEngine.Object); c = c.BaseType)
+                foreach (var f in c.GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly))
+                    if (typeof(UnityEngine.Object).IsAssignableFrom(f.FieldType))
+                    {
+                        var v = f.GetValue(o) as UnityEngine.Object;
+                        Console.Error.WriteLine($"[gexprobe]     {c.Name}.{f.Name} : {f.FieldType.Name} = {(ReferenceEquals(v, null) ? "null" : (v ? v.name : "DESTROYED"))}; loaded {Resources.FindObjectsOfTypeAll(f.FieldType).Length}");
+                    }
+        }
+    }
+
+    // GEXPROBE_FONTS=1: every tick, each loaded Font's material and atlas texture (alive, size,
+    // GL name from GetNativeTexturePtr), and every Font.textureRebuilt event.
+    static bool fontsHooked;
+    static void Fonts()
+    {
+        if (Environment.GetEnvironmentVariable("GEXPROBE_FONTS") != "1") return;
+        if (!fontsHooked)
+        {
+            fontsHooked = true;
+            Font.textureRebuilt += f => Console.Error.WriteLine($"[gexprobe] textureRebuilt {(f ? f.name : "destroyed")} frame {Time.frameCount}");
+        }
+        foreach (Font f in Resources.FindObjectsOfTypeAll(typeof(Font)))
+        {
+            var m = f.material; var tx = ReferenceEquals(m, null) || !m ? null : m.mainTexture;
+            string ts = ReferenceEquals(tx, null) ? "null" : !tx ? "DESTROYED" : $"{tx.name} {tx.width}x{tx.height} gl {tx.GetNativeTexturePtr()} id {tx.GetInstanceID()}";
+            Console.Error.WriteLine($"[gexprobe] font {f.name} dynamic {f.dynamic} material {(ReferenceEquals(m, null) ? "null" : m ? m.name : "DESTROYED")} tex {ts}");
+        }
+    }
+
+    // GEXPROBE_INPUT=1: what the legacy Input API sees, every frame it changes: keys down
+    // (Input.inputString, anyKeyDown), mouse buttons, the pointer position.
+    static Vector3 lastMouse = new Vector3(-1, -1, 0);
+    static void InputLog()
+    {
+        if (Environment.GetEnvironmentVariable("GEXPROBE_INPUT") != "1") return;
+        var m = Input.mousePosition;
+        string b = "";
+        for (int i = 0; i < 3; i++) if (Input.GetMouseButtonDown(i)) b += $" down{i}";
+        foreach (KeyCode k in new[] { KeyCode.Return, KeyCode.Z, KeyCode.X, KeyCode.RightArrow, KeyCode.LeftArrow, KeyCode.UpArrow, KeyCode.DownArrow, KeyCode.Escape })
+            if (Input.GetKeyDown(k)) b += " key " + k;
+        if (b != "" || Input.anyKeyDown || Input.inputString.Length > 0 || (m - lastMouse).sqrMagnitude > 0.5f)
+            Console.Error.WriteLine($"[gexprobe] input frame {Time.frameCount} mouse {m.x:F0},{m.y:F0}{b} anyKeyDown {Input.anyKeyDown} string '{Input.inputString}'");
+        lastMouse = m;
+    }
+
     static void Tick()
     {
         updates++;
+        InputLog();
         float now = Time.realtimeSinceStartup;
         if (now < next) return;
         next = now + (Environment.GetEnvironmentVariable("GEXPROBE_EVERY") is string ev && float.TryParse(ev, out var evs) ? evs : 5f);
@@ -77,6 +142,7 @@ public static class GexProbe
             }
             else Console.Error.WriteLine("[gexprobe] no StartManager");
             Console.Error.WriteLine($"[gexprobe] cameras {Camera.allCamerasCount} prerender {preRenders} postrender {postRenders} focused {Application.isFocused} runInBackground {Application.runInBackground} screen {Screen.width}x{Screen.height} device {SystemInfo.graphicsDeviceType} scene {UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}");
+            Inspect(); Fonts();
             Console.Error.WriteLine($"[gexprobe] displays {Display.displays.Length} main active {Display.main.active} rendering {Display.main.renderingWidth}x{Display.main.renderingHeight} system {Display.main.systemWidth}x{Display.main.systemHeight} fullscreen {Screen.fullScreenMode} playing {Application.isPlaying} vsync {QualitySettings.vSyncCount} targetfps {Application.targetFrameRate}");
             if (Environment.GetEnvironmentVariable("GEXPROBE_RENDER") == "1")
                 foreach (var c in Camera.allCameras)

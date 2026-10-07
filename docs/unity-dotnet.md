@@ -1049,7 +1049,7 @@ Not yet:
      MONO_GC_DEBUG=verify-before-collections / check-at-minor style heap
      checks, and the class.c:2272 caller.
   13. **Gate head 55c3197f (2026-10-06):** liveness walk opt-in
-     (`GEXMONO_LIVENESS=1`; off = the old stubs), netlink socket, F's notes,
+     (`GEXMONO_LIVENESS=1` then; on by default since item 18), netlink socket, F's notes,
      HOME_SEED/OVERLAY/xfocus/probe tooling. Legs on it with `scratch/unity/dnc`
      rebuilt from it: embed PASS, prov64 PASS, fjit-procs ok/ok, Muck batch
      --fjit reaches "Initializing packets", HK batch reaches "Unloading 153" and
@@ -1065,4 +1065,183 @@ Not yet:
      words at each register). Next: what 0x1103ed2e0 is (MonoDomain?) and who
      writes it into a native MonoBehaviour during Instantiate (watchpoint on
      that word: GEX_WATCH).
+  14. **The dangling pointer is a destroyed GameObject (runs hk79-hk84):**
+     0x1103ed2e0 is not a Mono address: `GEX_WATCH=0x1103ed2e0+0x40` shows a
+     `10GameObject` (instance ID 48962) created there by the loading thread
+     and later destroyed, and the memory reused for path strings and vertex
+     data. The MonoBehaviour (ID 48966, the loading spinner's
+     StandaloneLoadingSpinner) keeps pointing at it. `GEXMONO_LV_WATCH`
+     (provider: words at given addresses at each liveness world stop/start)
+     shows the GameObject alive through the liveness pass and destroyed by
+     the "Unloading 82 unused Assets" that follows: the walk reports the
+     component (reached from StartManager.loadSpinnerPrefab), Unity keeps it,
+     but not its GameObject. Unity's mark function (UnityPlayer 0x12f1ef0,
+     called per reported object by instance ID) sets the mark bit and queues
+     the object for dependency traversal only when flag 0x8 is clear, so a
+     reported asset may not pull its GameObject in by itself.
+     Changes made to match Unity's own unity-liveness.c (fetched from
+     Unity-Technologies/mono unity-main): from_root walks the root's references
+     without reporting the root; statics come from the ambient memory
+     manager's class_vtable_array (generic instances included, corlib
+     skipped). Neither changed the outcome (still 82 unloaded, same crash).
+     Next: what flag 0x8 means and how real Unity keeps a component's
+     GameObject (does the managed walk reach the GameObject's wrapper there,
+     e.g. through a GC handle root?); compare the reported set against the
+     handle roots.
+  15. **Reported set vs roots (hk85-hk88, GEXMONO_LV_TRACE=1: each root and
+     each reported object as class + Unity instance ID, read from m_CachedPtr
+     at +0x10 without metadata calls, since the walk runs on Unity job threads
+     Mono does not know):** Unity passes 126 roots, all scene UI components
+     (Image, EventTrigger, MenuButton, Text, ...). The walk reports 223 objects,
+     among them `StandaloneLoadingSpinner` id 48966 (the spinner component);
+     its GameObject 48962 is not reported (no managed reference reaches a
+     GameObject wrapper), which is what Unity's own walk would do too. Per-state
+     visited sets (GEXMONO_LV_PERSTATE=1) change nothing (82 unloaded, same
+     crash). The reference run on the game's own libmonobdwgc (hkst4, tier-1,
+     batch) stalls after physics init for 2 h, as hkst3 did: no comparison.
+     **Leading hypothesis now:** Unity keeps a prefab referenced from a scene
+     script through its native dependency walk over the script's serialized
+     data (StartManager's `loadSpinnerPrefab` field), not through the managed
+     liveness walk. Without liveness the whole prefab is unloaded (the
+     original ArgumentNullException), so that native walk does not see the
+     field under the provider; with liveness only the component is marked and
+     Unity's mark function (0x12f1ef0) does not queue it for dependencies when
+     flag 0x8 is set. Next: watch whether Unity's GC reads StartManager's
+     managed fields (GEX_WATCH on the field inside the StartManager wrapper)
+     during MarkObjects, and what its serialization command list for
+     StartManager contains (the field's offset as Unity cached it).
+  16. **The serialized-field hypothesis is dead; the question is Unity's flag
+     0x2 (2026-10-06):** Unity's GC does not read a MonoBehaviour's managed
+     fields itself. Its per-object dependency step (UnityPlayer 0x12f3130,
+     a switch on the object's type) does, for a MonoBehaviour (case at
+     0x12f33b0): if the object's mapping entry has flag 0x2, mark its
+     GameObject (`[this+0x20]`, by instance ID); mark its script; then call
+     `mono_unity_liveness_calculation_from_root` (slot 0x263c8d0) on the
+     MonoBehaviour's managed object. So references held in script data are
+     found only by the provider's walk, which does report the spinner
+     component; and a component pulls its GameObject in only when flag 0x2 is
+     set on its entry, which for the spinner it is not. Where flag 0x2 comes
+     from is not found yet (the entries are not written by an `or $0x2`; the
+     candidate is the object's own bits word at +8, high half 0x0850002c for
+     this component, 0x0f70002c for its GameObject).
+     Also killed: GC-handle encoding. Unity's Mono gives a strong handle as a
+     pointer to a slot (bit 0 clear) and a weak one with bit 0 set
+     (Unity-Technologies/mono boehm-gc.c `handle_tag_weak`; UnityPlayer reads
+     the slot directly when bit 0 is clear), while the runtime's raw strong
+     handles end in 3. A build with Unity-style slots for the handles Unity
+     asks for (runtime patch to sgen-mono.c's free/get/set to accept slots,
+     provider giving slots; tree `scratch/unity/dnc3`, not committed) runs
+     Hollow Knight the same: 153 unloaded without the walk, 82 and the same
+     crash with it.
+  17. **Workaround: HK reaches Menu_Title (6b119e15, 2026-10-06):** Unity's
+     dependency step gates both "component -> its GameObject" (MonoBehaviour
+     case) and "GameObject -> its components" (case at 0x12f31f2: the
+     {type, component} array at [go+0x20], count [go+0x30]) on flag 0x2, so
+     keeping only the GameObject moved the crash to a component of it (a
+     virtual call through a freed component, run hk95-hk97). The walk now
+     reports, for each reported UnityEngine.Component, its GameObject and that
+     GameObject's components, through stand-ins Unity's callback reads like
+     wrappers (it reads only m_CachedPtr at +0x10 and the native instance ID
+     at +8). With `GEXMONO_LIVENESS=1` (walk opt-in; `GEXMONO_LV_NOGO=1` drops
+     the workaround) HK batch (hk98): 69 assets unloaded at the intro, the
+     spinner instantiated, "Didn't need to wait for PlayerPrefs load",
+     Menu_Title becomes the active scene and loads (10,779 assets unloaded
+     after it, 36,129 objects). Next problem seen: HK's shared-data save uses
+     BinaryFormatter, which .NET 10 removed (PlatformNotSupportedException in
+     JsonSharedData.Save); saves will need the formatter (the unsupported
+     System.Runtime.Serialization.Formatters package, or a shim). Flag 0x2
+     itself is still unexplained.
+     **With graphics (hk99, gooner llvmpipe, netlink fix + xfocus + seed +
+     walk):** the main menu renders (`scratch/unity/screens/hk-menu.png`:
+     title, particles, menu arrows); the menu item labels draw as black
+     boxes (text: TextMeshPro font warnings earlier in the log; next to look
+     at), cameras 5, ~50k renders.
+  18. **Root cause of 12-17 and of the black labels: the walk reported too
+     late (2026-10-06, runs hk102-hk107).** Unity's GC driver (UnityPlayer
+     0x130d26b on) runs, per GC: the mark jobs, each draining its state's
+     queue (0x12f2e60; the queue is what the mark function 0x12f1ef0 pushes
+     an object's entry onto, unless the entry has flag 0x8), with
+     `from_root` called from the MonoBehaviour case and `from_statics` on
+     the main state; then, after every queue is drained,
+     `mono_unity_liveness_finalize` on each state (0x12f30a0); then
+     `free_struct`. The provider reported objects to Unity's callback only
+     when its buffer filled or at finalize, so most objects found by the walk
+     were marked after the last drain: marked, kept, but none of their native
+     dependencies followed. Unity's Mono reports at the end of each
+     `from_root`/`from_statics` call (unity-liveness.c), which the provider
+     now does too (`lv_flush_now`; `GEXMONO_LV_LATE=1` restores the old
+     behaviour for comparison).
+     This explains all of it: the spinner component kept without its
+     GameObject (items 14-17: its entry was never dequeued, so the
+     dependency step and its flag-0x2 test never ran for it; flag 0x2 is set
+     on nearly every entry, it was a red herring), and the black labels: a
+     dynamic Font kept by script data, its atlas texture (the Font's PPtrs at
+     native +0x30 material, +0x34 texture) unloaded and reloaded from disk as
+     the serialized 0x0 texture while the Font's glyph cache stayed, so glyph
+     updates went to a GL texture with no storage (the GL capture: texture
+     459 generated then only `TexSubImage2D`'d, `GetNativeTexturePtr` 458 on a
+     0x0 "Font Texture"; GexProbe `GEXPROBE_FONTS=1` shows each font's atlas).
+     Not a liveness victim of TextMeshPro (its font assets were alive, hk100)
+     nor a GL-path problem.
+     With the fix and **no workaround** (the stand-in GameObject reporting of
+     item 17 is removed) Hollow Knight passes the spinner Instantiate, reaches
+     Menu_Title with graphics, and the menu labels render
+     (`scratch/unity/screens/hk-menu-labels.png`, hk107). The walk is now on by
+     default (`GEXMONO_LIVENESS=0` turns it off).
+     How found: a diagnostic that read Unity's GC table from the callback's
+     userdata (Unity 6000.0 linux-x64: `[data+8]` = table, entries of 24
+     bytes {object, RTTI, flags} at table+0, buckets of 12 bytes {hash,
+     instance ID, entry index} at table+0x48, mask x4 at table+0x50; RTTI
+     +16 = class name) showed the marked Font with its texture and material
+     unmarked; reading the driver showed when finalize runs.
+     **BinaryFormatter:** `build.sh`'s `formatters` step (63c7f5da) restores
+     the out-of-band System.Runtime.Serialization.Formatters NuGet package
+     (10.0.*, its net8.0+ assembly) into `OUT/lib-extra`, which
+     `muck-dotnet.sh` copies over the framework's stub; HK's
+     `JsonSharedData.Save` no longer throws (hk102).
+  19. **Scripted input to New Game (2026-10-06, runs hk109-hk118):** in
+     progress. Found and fixed so far:
+     - gex's compositor gave the keyboard to whichever surface last drew,
+       and Xwayland's cursor surface draws after its window, so every key
+       went to the cursor (`[gex] input: ... focus Some(12)` with 12 the
+       Cursor). Only toplevels and popups take it now (88b99006, with a
+       test).
+     - `tests/games/xfocus.c` focuses the top-level under the pointer (else
+       the largest) and with `XFOCUS_TREE=1` dumps the window tree with
+       event masks when it changes: Unity 6 maps its SDL window 0x800004
+       ('Hollow Knight', core masks incl. KeyPress) inside an
+       override-redirect 800x600 parent first, then reparents it to the
+       root; the focus ends on 0x800004 and Application.isFocused is true.
+     - Keys do reach X clients: `tests/x11/xinput-echo.c` gets KeyPress 36
+       for a scripted Enter, and a plain SDL2 2.26 program (dlsym'd libX11,
+       same in-guest Xwayland) gets SDL_KEYDOWN scancode 40 / sym 13.
+     Still open: Hollow Knight's legacy Input sees pointer motion (GexProbe
+     `GEXPROBE_INPUT=1`: mouse 400,257 after the scripted move) but no key
+     and no button. Without xfocus (NOFOCUS=1) it is not focused at all.
+     An LD_PRELOAD spy on the Xlib functions Unity's SDL dlsym's
+     (`scratch/unity/xspy/xspy.c`; Unity sends its stderr to the player log)
+     shows the events do reach Unity: every scripted key arrives as a
+     KeyPress through XFilterEvent (-> 0, not swallowed) and
+     Xutf8LookupString (Return, z, Left, Right), Unity selects XI2
+     RawButtonPress/RawButtonRelease/RawMotion (mask 0x38000) on the root
+     for all master devices, and a scripted click arrives as XI2 raw
+     button 1 press and release (hk120). Yet GexProbe's legacy Input reports
+     no key and no button and the menu does not react; only the pointer
+     position (likely polled) works. So the loss is inside Unity, between
+     its X event handling and its input queue. One candidate: event
+     timestamps (Unity's input queue orders events by time; position by
+     polling would not care). Next: the X event `time` values against the
+     guest's CLOCK_MONOTONIC as Unity reads it.
+  20. **Head c3b6288a (master 132f73ed merged, 2026-10-06):** gexc rebuilt
+     (`target/dbg-x86`); `scratch/unity/dnc` rebuilt from e61b5a4b (provider
+     unchanged since; `lib-extra` holds the Formatters assembly). Legs, walk
+     on by default: embed PASS; Muck batch --fjit "Initializing packets"
+     (mk10); Hollow Knight with graphics --fjit, no probe: the main menu with
+     its labels (hk122 f-300); gex-wayland tests 36/36.
+     **Muck with the walk on by default:** batch, current gexc, --fjit:
+     "Initializing packets" (mk8); without --fjit too (mk4). (mk1-mk3, mk6
+     hung at ReloadAssembly: they ran the script's default
+     `target/x86/release/gexc`, an Oct 5 build from before the fjit
+     per-process fix, not a regression.) HK reaches Menu_Title with the
+     walk on by default in every run since hk109.
 
