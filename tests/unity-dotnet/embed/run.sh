@@ -20,7 +20,8 @@ FW=$(dirname "$(dotnet --list-runtimes | awk '/Microsoft.NETCore.App 10\./ {v=$2
 cp "$OUT/lib/System.Private.CoreLib.dll" "$T/lib/"
 cp "$FW/System.Runtime.dll" "$FW/System.Collections.dll" "$FW/System.Runtime.InteropServices.dll" "$T/lib/"
 cd "$T"
-GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 \
+# The interpreter only (the wasm JIT is on by default; GEXMONO_WASM_JIT=0).
+GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --env GEXMONO_WASM_JIT=0 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" | tee out.txt
 PATTERNS=("Compute(50) = 50002" "Hello = hello gex from t ptr=8"
 	"Guest = twice 42; concat guest strings; mix 323.25; scale 2,4,6; big 11,25,52,3; caught from the guest"
