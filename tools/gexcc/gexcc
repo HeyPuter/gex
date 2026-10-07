@@ -107,7 +107,10 @@ def expand_rsp(args):
     return out
 
 
-args = [a for a in expand_rsp(sys.argv[1:]) if a not in ('-fno-gex-poll', '-fgex-poll')]
+# Function pointer cast emulation (finish below): -fgex-fpcast-emu or
+# GEXCC_FPCAST=1, at link time.
+FPCAST = os.environ.get('GEXCC_FPCAST', '0') != '0' or '-fgex-fpcast-emu' in sys.argv[1:]
+args = [a for a in expand_rsp(sys.argv[1:]) if a not in ('-fno-gex-poll', '-fgex-poll', '-fgex-fpcast-emu')]
 
 # --- queries -------------------------------------------------------------
 if args == ['--print-sysroot'] or args == ['-print-sysroot']:
@@ -430,6 +433,21 @@ def imports(path):
 FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_thread_c',
               '__gex_fork_run', '__gex_fork_drive', '__gex_fork_child']
 opt = os.path.join(SYSROOT, 'binaryen', 'bin', 'wasm-opt')
+feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
+         '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types']
+if FPCAST:
+    # Calls through a function pointer of another type trap in wasm, where C
+    # on a real machine gets away with them (bash's unwind-protect cleanups,
+    # old K&R code). binaryen's --fpcast-emu makes every indirect call and
+    # every table entry one uniform signature. gex calls the two entries
+    # (__gex_start, __gex_thread_start) with their own signatures, so their
+    # table entries go back to the real functions afterwards.
+    r = run([opt, wasm, '-g', '--strip-dwarf'] + feats + ['--fpcast-emu', '-o', wasm])
+    if r:
+        die('wasm-opt --fpcast-emu failed')
+    r = run([sys.executable, os.path.join(LIBDIR, 'elemfix.py'), wasm, '__gex_start', '__gex_thread_start'])
+    if r:
+        die('elemfix.py failed after --fpcast-emu')
 passes = []
 if ('gex', 'fork_point') in imports(wasm):
     passes += ['--asyncify', '--pass-arg=asyncify-imports@gex.fork_point']
@@ -444,8 +462,6 @@ if ('gex', 'fork_point') in imports(wasm):
         passes += ['--pass-arg=asyncify-removelist@' + ','.join(FORK_ROOTS)]
     passes += ['-O2']
 passes += ['--translate-to-exnref']
-feats = ['--enable-threads', '--enable-bulk-memory', '--enable-mutable-globals', '--enable-sign-ext',
-         '--enable-nontrapping-float-to-int', '--enable-exception-handling', '--enable-reference-types']
 # names kept (-g): gex binds the entries by name. (DWARF dropped: binaryen
 # cannot rewrite clang's version 5.)
 r = run([opt, wasm, '-g', '--strip-dwarf'] + feats + passes + ['-o', wasm])

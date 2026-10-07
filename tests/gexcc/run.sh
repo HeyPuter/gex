@@ -17,7 +17,8 @@ for src in "$HERE"/*.c "$HERE"/*.cpp; do
         *) name=$(basename "$src" .c); hcc=cc; gcc_=gexcc ;;
     esac
     $hcc -O1 -w -o "$WORK/$name.native" "$src" -lpthread || { echo "FAIL $name: $hcc"; fail=1; continue; }
-    $gcc_ -O2 -w -o "$WORK/$name" "$src" || { echo "FAIL $name: $gcc_"; fail=1; continue; }
+    extra=; case $name in fpcast*) extra=-fgex-fpcast-emu ;; esac
+    $gcc_ -O2 -w $extra -o "$WORK/$name" "$src" || { echo "FAIL $name: $gcc_"; fail=1; continue; }
     if [ -f "$HERE/$name.sh" ]; then
         native=$(cd "$WORK" && sh "$HERE/$name.sh" "./$name.native" 2>&1); ns=$?
         gex=$(cd "$WORK" && sh "$HERE/$name.sh" "./$name" 2>&1); gs=$?

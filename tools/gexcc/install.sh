@@ -41,6 +41,7 @@ cp -r "$HERE/include" "$PREFIX/sysroot/include/gexcc"
 # the driver and its helpers
 L=$PREFIX/lib/gexcc
 cp "$HERE/gexcc" "$PREFIX/bin/gexcc"
+cp "$HERE/elemfix.py" "$PREFIX/lib/gexcc/"
 cp "$WW/flags.sh" "$WW/wasm-elf.py" "$WW/forkreach.py" "$L/"
 # the container's host launcher: flat i386 code
 clang --target=i386-linux-gnu -Os -fPIE -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables \

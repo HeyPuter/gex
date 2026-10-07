@@ -128,7 +128,7 @@ test_make() {
   f=$(grep -oE '[0-9]+ Tests? Failed' check.out | tail -1 | awk '{print $1}')
   echo "RESULT pass=$(( ${t:-0} - ${f:-0} )) fail=${f:-0} skip=0"
 }
-build_bash() { at_configure --without-bash-malloc --disable-nls --with-curses CFLAGS="-O2 -Wno-implicit-function-declaration"; make -j$JOBS; }
+build_bash() { export GEXCC_FPCAST=1; at_configure --without-bash-malloc --disable-nls --with-curses CFLAGS="-O2 -Wno-implicit-function-declaration"; make -j$JOBS; }
 test_bash() {
   # bash's suite prints diffs; count the run-* scripts that print nothing
   cd tests
