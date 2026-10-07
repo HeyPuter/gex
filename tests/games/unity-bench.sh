@@ -13,9 +13,9 @@
 #                the CPU samples hit) plus prof.txt for tools/prof-report.py.
 # Summarise with tests/games/unity-bench-sum.py RUN.
 #
-# Env: STAGE (default ~/gex-sandbox/scratch/unity: dnc/ with provider/mono.wasm and lib/, gl64/,
+# Env: DNC (the provider build, default STAGE/dnc), STAGE (default ~/gex-sandbox/scratch/unity: dnc/ with provider/mono.wasm and lib/, gl64/,
 # edger/bin/Xwayland and edger/llvm-bin when the box has none), GEXC (default STAGE/edger/gexc), CORES (taskset list,
-# default bench.sh's BENCH_CORES), PROF=1, EVERY (keep every Nth frame as PPM; default 1800),
+# default bench.sh's BENCH_CORES), PROF=1, EVERY (keep every Nth of the game's frames as PPM, GEX_PPM_GL_ONLY; default 1800),
 # XNUM (X display, default 77), and anything muck-dotnet.sh reads.
 set -u
 H=$(cd "$(dirname "$0")" && pwd)
@@ -28,7 +28,7 @@ case $GAME in
 	muck) export MUCK=$G/games-linux/Muck ;;
 	*) echo "GAME: hk or muck" >&2; exit 2 ;;
 esac
-export GEXC=${GEXC:-$S/edger/gexc} GFX=$S/gl64 XNUM=${XNUM:-77} EVERY=${EVERY:-1800} GEX_GL_FPS=1
+export GEXC=${GEXC:-$S/edger/gexc} GFX=$S/gl64 XNUM=${XNUM:-77} EVERY=${EVERY:-1800} GEX_GL_FPS=1 GEX_PPM_GL_ONLY=1
 [ -d "$HOME/.dotnet/shared/Microsoft.NETCore.App/10.0.10" ] && export DOTNET_FW=$HOME/.dotnet/shared/Microsoft.NETCore.App/10.0.10
 XW=()
 [ -x "$S/edger/bin/Xwayland" ] && ! command -v Xwayland > /dev/null && XW=(--env "XWAYLAND=$S/edger/bin/Xwayland")
@@ -49,7 +49,7 @@ setsid bash -c '
 	tail -n +1 -F "$1/player.log" 2> /dev/null | while IFS= read -r l; do echo "$(( $(date +%s%3N) - $2 )) $l"; done > "$1/plog-t.txt"
 ' _ "$RUN" "$t0" &
 stamper=$!
-bash "$H/muck-dotnet.sh" "$S/dnc" "$RUN" "$SECS" "$@" "${XW[@]}" > "$RUN/wrap.txt" 2>&1
+bash "$H/muck-dotnet.sh" "${DNC:-$S/dnc}" "$RUN" "$SECS" "$@" "${XW[@]}" > "$RUN/wrap.txt" 2>&1
 echo "end $(date +%s%3N) load $(cut -d' ' -f1-3 /proc/loadavg)" >> "$RUN/meta.txt"
 sleep 1
 kill -- -"$stamper" 2> /dev/null

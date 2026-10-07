@@ -248,6 +248,14 @@ impl Wayland {
         let Some(prefix) = self.inner.out.lock().unwrap().clone() else {
             return;
         };
+        // `GEX_PPM_GL_ONLY=1`: only gex-gl's presented frames are written
+        // (`present_external`), not client buffers -- with a GL game on
+        // Xwayland, the X window's own buffer is black and would take the
+        // GEX_PPM_EVERY turns.
+        static GL_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *GL_ONLY.get_or_init(|| std::env::var_os("GEX_PPM_GL_ONLY").is_some_and(|v| v != "0")) {
+            return;
+        }
         // Before the GPU read-back, so a skipped frame costs nothing.
         let Some(path) = self.frame_path(&prefix) else { return };
         let mut gpu = self.inner.gpu.lock().unwrap();

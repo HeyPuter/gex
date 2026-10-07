@@ -1311,3 +1311,31 @@ Not yet:
        lock-free generation-tagged visited set replace the per-object field
        iteration and the mutex-guarded hash; `GEXMONO_LV_NOSHAPE=1` walks as
        before for A/B.
+     - **First edger numbers (native, `--fjit`, 800x600, cores
+       2,4,6,8,14,16,18,20, PROF=1; UnityPlayer and every guest library on
+       the function JIT, the .NET side on the interpreter, no wasm JIT; runs
+       `scratch/unity/eruns/*`, summaries in `*.out`):**
+
+       | run | what | first present | menu ready | menu unload MarkObjects | menu fps (20-80 s after) |
+       |---|---|---|---|---|---|
+       | hk-e1 | cold | 472.5 s | 539.5 s | 17.8 s | 24.5 |
+       | hk-e2 | cold, `GEX_FJIT_CACHE=1` writing | 449.7 s | 518.4 s | 19.2 s | 23.5 |
+       | hk-e3 | warm `GEX_FJIT_CACHE=1` | 243.2 s | 301.4 s | 18.7 s | 24.3 |
+       | hk-e4 | warm, shape walk provider (`dnc-shape`) | 249.7 s | 294.2 s | 0.75 s | 24.0 |
+       | mk-e1 | Muck cold, cache on | 230.8 s | packets 316.4 s | - | 33.6 (last quarter 30.8) |
+
+       "Menu ready" is the post-Menu_Title unload. The player log's first line
+       comes 262 s (cold) / 117 s (warm) after the start: ld.so and
+       UnityPlayer's init are translated before Unity logs anything. In the
+       menu about half the CPU samples are the host (gex-gl, the NVIDIA
+       driver, the readback) and the guest half is almost all the fjit
+       (`[gex-prof]` lines). Same unload counts with the shape walk (49 and 66
+       assets), so it changes cost only: Menu_Title start to menu ready went
+       from 37.0 s (hk-e3) to 20.6 s (hk-e4).
+     - **Frames are wrong on edger's NVIDIA driver:** every frame HK presents
+       is black (GL-only PPMs, `GEX_PPM_GL_ONLY=1`), and Muck shows its
+       blurred sky with no UI, while the same build rendered both on llvmpipe
+       (gooner) and RX 6500 XT (worldmachine). gex-gl's own host tests pass on
+       edger. `GEX_GL_ERRORS=1` (gex-gl host: glGetError after every command,
+       per opcode) is the next look. The fps numbers above are for that
+       rendering.

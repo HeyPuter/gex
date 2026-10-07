@@ -464,6 +464,28 @@ pub struct Gl {
     pub presents: u64,
 }
 
+/// `GEX_GL_ERRORS=1` (diagnostic): `glGetError` after every command, and
+/// each opcode/error pair reported the first few times it happens. It takes
+/// the error a program would have read itself.
+fn gl_error_check(opcode: u32) {
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SEEN: Mutex<Option<std::collections::HashMap<(u32, u32), u32>>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("GEX_GL_ERRORS").is_some_and(|v| v != "0")) {
+        return;
+    }
+    let e = unsafe { glGetError() };
+    if e == 0 {
+        return;
+    }
+    let mut g = SEEN.lock().unwrap();
+    let n = g.get_or_insert_with(Default::default).entry((opcode, e)).or_insert(0);
+    *n += 1;
+    if *n <= 3 || n.is_power_of_two() {
+        eprintln!("[gex-gl] opcode {opcode} -> GL error {e:#x} ({} times)", *n);
+    }
+}
+
 /// `GEX_GL_FPS=1`: the program's own frame rate, counted at its PRESENTs
 /// (a compositor's commits also count other clients' surfaces, cursors and
 /// Xwayland's damage). Prints the first PRESENT's wall-clock time (Unix
@@ -860,6 +882,7 @@ impl Gl {
                     if !self.one(opcode, body, &mut reply) {
                         return (reply, error::BAD_OPCODE, index);
                     }
+                    gl_error_check(opcode);
                     index += 1;
                 }
             }
