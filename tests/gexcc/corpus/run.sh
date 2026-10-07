@@ -53,7 +53,7 @@ for name in "${names[@]}"; do
       if [ -n "$r" ]; then
         p=$(sed -n 's/.*pass=\([0-9]*\).*/\1/p' <<< "$r"); f=$(sed -n 's/.*fail=\([0-9]*\).*/\1/p' <<< "$r")
         s=$(sed -n 's/.*skip=\([0-9]*\).*/\1/p' <<< "$r")
-        tests="$p/$((p + f)) pass, $s skip, host execs $hx, host clones $hc, machine forks $hf"
+        tests="$p/$((p + f)) pass, $s skip, ${COUNT:+host execs $hx, host clones $hc, }machine forks $hf"
       else
         tests="no result"
       fi

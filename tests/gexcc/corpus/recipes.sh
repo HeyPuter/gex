@@ -15,9 +15,10 @@
 GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent lua sqlite dash less gawk tar"
 
 # autotools, cross mode: configure runs nothing it builds
-at_configure() { ./configure --host=$T --build=x86_64-pc-linux-gnu --prefix=/usr "$@"; }
+# (config.site: what the run-time checks found on gex itself)
+at_configure() { CONFIG_SITE=$GEXCC_PREFIX/share/gexcc/config.site ./configure --host=$T --build=x86_64-pc-linux-gnu --prefix=/usr "$@"; }
 # a shell command line in the guest, in this directory
-# `GUEST host-execs N`: host programs the guest run started (execve in the
+# With COUNT=1, `GUEST host-execs N`: host programs the guest run started (execve in the
 # gexc's process tree, counted by strace; gexc itself is 1), `GUEST
 # host-clones N`: threads and processes that tree made (clone, clone3), and
 # `GUEST machine-forks N`: processes created on the whole machine meanwhile
@@ -26,13 +27,14 @@ guest() {
   local p0 p1 r out
   out=$(mktemp)
   p0=$(awk '/^processes/{print $2}' /proc/stat)
-  timeout ${TMO:-3600} strace -f -qq --seccomp-bpf -e trace=execve,clone,clone3,fork,vfork -e signal=none -c -o "$out" \
-    gexcc-exec run --host-env --env PATH=$GUEST_BIN:/bin:/usr/bin --env SHELL=/bin/sh \
+  # (strace only with COUNT=1: it slows a long suite down)
+  ${COUNT:+strace -f -qq --seccomp-bpf -e trace=execve,clone,clone3,fork,vfork -e signal=none -c -o "$out"} \
+    timeout ${TMO:-3600} gexcc-exec run --host-env --env PATH=$GUEST_BIN:/bin:/usr/bin --env SHELL=/bin/sh \
     --cwd "$PWD" /bin/sh -c "$*"
   r=$?
   p1=$(awk '/^processes/{print $2}' /proc/stat)
-  echo "GUEST host-execs $(awk '$NF == "execve" {print $4}' "$out")" >&2
-  echo "GUEST host-clones $(awk '$NF ~ /^(clone|clone3|fork|vfork)$/ {n += $4} END {print n + 0}' "$out")" >&2
+  [ -n "${COUNT:-}" ] && echo "GUEST host-execs $(awk '$NF == "execve" {print $4}' "$out")" >&2
+  [ -n "${COUNT:-}" ] && echo "GUEST host-clones $(awk '$NF ~ /^(clone|clone3|fork|vfork)$/ {n += $4} END {print n + 0}' "$out")" >&2
   echo "GUEST machine-forks $((p1 - p0))" >&2
   rm -f "$out"
   return $r

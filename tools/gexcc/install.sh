@@ -124,6 +124,8 @@ chmod +x "$B/gexcc-run"
 # build-system files
 S=$PREFIX/share/gexcc
 cp /usr/share/misc/config.sub /usr/share/misc/config.guess "$S/" 2>/dev/null || true
+# answers for configure's run-time checks in cross mode (CONFIG_SITE)
+cp "$HERE/config.site" "$S/config.site"
 cat > "$S/toolchain.cmake" <<EOF
 # CMake toolchain file for gexcc: cmake -DCMAKE_TOOLCHAIN_FILE=$S/toolchain.cmake
 set(CMAKE_SYSTEM_NAME Linux)
