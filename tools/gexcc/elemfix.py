@@ -95,6 +95,7 @@ for sid, s0, b0, e in secs:
         q = r
     new = w[:s0] + bytes([9]) + enc(len(out)) + out + w[e:]
     open(path, 'wb').write(new)
-    print('elemfix: %d entries restored' % len(remap), file=sys.stderr)
+    if len(remap) != len(names):
+        print('elemfix: %d of %d entries restored' % (len(remap), len(names)), file=sys.stderr)
     sys.exit(0)
 sys.exit('elemfix: no element section')

@@ -151,15 +151,18 @@ Skips are the suite's own: locales, root, missing tools.
 | mbedtls | 3.6.2 | CMake (ctest) | ok | 129/130 | psa_crypto passes alone (1958/1958); failed once under `ctest -j3` |
 | gawk | 5.3.1 | autotools | ok | 654/654 ("ALL TESTS PASSED") | |
 | tar | 1.35 | autotools (autotest) | ok | 204/204, 40 skip | |
-| grep | 3.11 | autotools+gnulib | ok | 552/606, 100 skip | before the kernel fixes below; rerun pending |
-| sed | 4.9 | autotools+gnulib | ok | 204/214, 46 skip | before the fixes; rerun pending |
+| grep | 3.11 | autotools+gnulib | ok | 568/606, 100 skip | remaining: signal timing (exec latency), SIGSEGV catching, multibyte locales |
+| sed | 4.9 | autotools+gnulib | ok | 206/214, 46 skip | |
 | diffutils | 3.10 | autotools+gnulib | ok | 386/410, 70 skip | before the fixes; rerun pending |
 | findutils | 4.10.0 | autotools | ok | 2/2 | the find/xargs suites need DejaGnu (not on gooner) |
 | dash | 0.5.12 | autotools | ok | 1/1 | a script session against the host's sh |
 | less | 668 | autotools | ok | 1/1 | as a filter (no terminal) |
 | ncurses | 6.5 | autotools | ok | – | installed for less, bash, vim, tmux |
 | make | 4.4.1 | autotools | ok | rerun pending | first run used the translated host sh inside gex (60 s timeouts) |
-| bash | 5.2.37 | autotools | rerun pending | | first build used its bundled termcap (clang 22: implicit `write`) |
+| bash | 5.2.37 | autotools | ok | 10/83 before fpcast; rerun pending | needs `-fgex-fpcast-emu` (function pointer casts in unwind-protect); sigsetjmp fixed |
+| fmt | 11.0.2 | CMake (C++) | rerun pending | | libc++ 22 strictness: `-include algorithm -Wno-invalid-specialization` |
+| curl | 8.10.1 | autotools + mbedtls | ok | rerun pending | |
+| perl | 5.40.0 | Configure | rerun pending | | needs `-D_GNU_SOURCE` (musl hides eaccess) |
 | coreutils | 9.5 | autotools+gnulib | pending | | |
 
 Recurring gnulib failures not fixed yet:
@@ -189,6 +192,23 @@ Toolchain checks:
 
 Sources and their sha256: `tests/gexcc/corpus/sources.txt`.
 
+### Test runs and the host (2026-10-07, after gooner's crash)
+
+Every run of a gexcc program on the host starts a whole gexc (wasmtime,
+large reservations, about 27 threads). A `make check` or a configure script
+runs thousands of them; with many suites and configures in parallel that
+was tens of thousands of gexc a minute, and gooner went down.
+
+The rules now:
+- **Test suites run inside one gexc:** `make check` runs in the guest (busybox
+  or gexcc-built sh, gexcc-built make), so its processes are guest
+  processes. A guest fork or exec stays inside the one host process: a
+  busybox pipeline loop showed 1 host process with 27 threads.
+- **configure does not try-run on the host:** pass `--build=x86_64-pc-linux-gnu`
+  (cross mode, cache values).
+- **Until then:** one suite at a time, at most `-j2`, inside
+  `systemd-run --user --scope -p TasksMax=256 -p MemoryMax=32G nice -n 19`.
+
 ## 3. Gaps found, and what fixed them
 
 | gap | where it showed | fix | test |
@@ -208,6 +228,12 @@ Sources and their sha256: `tests/gexcc/corpus/sources.txt`.
 | every exec of a wasm32 program recompiled it (2.2–2.7 s for busybox) | background `sleep 1; kill` arrived too late (test-sigprocmask) | compiled modules cached by content (`~/.cache/gex/modules/wasm32`): 0.17 s | — |
 | a gexcc program's `sh`/`sleep`/`kill` ran the translated host tools | test-sigprocmask, dash script | busybox through gexcc-exec | — |
 | `-Wl,-rpath -Wl,DIR`; Meson's `-Wl,--version` | libtool relinks; Meson | driver | xz, Meson demo |
+| sigsetjmp/_setjmp not lowered (only `setjmp` is) | bash error recovery | include/setjmp.h wrapper + rt/sigsetjmp.c | sigjmp |
+| calls through mismatched function pointer types trap | bash unwind-protect | `-fgex-fpcast-emu` (binaryen fpcast-emu, entries restored by elemfix.py) | fpcast |
+| TCP shutdown did nothing; EPIPE on the open direction | gnulib test-select | Transport::shutdown, send_closed | tcphalfclose |
+| "link/" with lstat, dangling/looping links with a slash | gnulib test-lstat | at_path | pathcorners |
+| libtool made no shared library (ld -v not GNU-like) | xz | ld wrapper | xz |
+| musl setjmp on try_table broke asyncify | coreutils timeout | GEX_WASM_LEGACY_EH libc | coreutils |
 
 Expected gaps not reached yet (merge-plan §10):
 - dlopen of real side modules (W's registry is link-time);
@@ -266,6 +292,10 @@ Platform differences, not gex bugs, recorded so they are not chased:
   where pending signals are delivered and interval timers checked.
 - This works natively and in the browser. Its cost on the browser has not
   been measured yet (edger).
+
+**GexPoll's cost** (edger, browser runtime under node, lua 5.4.7 with and
+without polls, ABBA, 6 runs each): median total 1.91 s with polls against
+1.84 s without, about 4% slower, inside the run-to-run spread (1.52–2.25 s).
 
 **C++** (`build-cxx.sh`):
 - libc++/libc++abi/libunwind 22.1.8, static, with
