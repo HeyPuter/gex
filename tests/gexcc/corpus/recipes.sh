@@ -12,7 +12,7 @@
 # suites safe to run: in the guest, or a handful of host gexc at most (lua,
 # sqlite, dash, less: one or two). The rest still start a host gexc per test
 # and are refused unless HOSTRUN=1 (then one at a time, in a resource scope).
-GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent lua sqlite dash less"
+GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent lua sqlite dash less gawk tar"
 
 # autotools, cross mode: configure runs nothing it builds
 at_configure() { ./configure --host=$T --build=x86_64-pc-linux-gnu --prefix=/usr "$@"; }
@@ -111,7 +111,14 @@ SQL
 }
 
 build_jq() { at_configure --with-oniguruma=builtin --disable-docs --disable-maintainer-mode; make -j$JOBS; }
-test_jq() { am_check; }
+# jq's src/version.h depends on .remake-version-h, which only exists after
+# the version changed, so every make regenerates it and recompiles main.c;
+# the guest has no compiler, so the marker is made, older than version.h
+test_jq() {
+  make -j$JOBS check TESTS= > check-build.out 2>&1 || { tail -20 check-build.out; echo "RESULT pass=0 fail=1 skip=0"; return; }
+  touch -d 2000-01-01 .remake-version-h
+  guest make -k check SHELL=/bin/sh > check.out 2>&1; cat check.out; am_result check.out
+}
 
 build_pcre2() { at_configure --enable-pcre2-16 --enable-pcre2-32; make -j$JOBS; make install DESTDIR=$SYSROOT; }
 test_pcre2() { am_check; }
@@ -132,7 +139,7 @@ test_sed() { am_check; }
 build_gawk() { at_configure --disable-nls --without-readline; make -j$JOBS; }
 test_gawk() {
   # gawk's own runner: "ALL TESTS PASSED" or a list of failures
-  timeout ${TMO:-3600} make -k check > check.out 2>&1; cat check.out
+  guest make -k check SHELL=/bin/sh > check.out 2>&1; cat check.out
   if grep -q 'ALL TESTS PASSED' check.out; then
     n=$(ls test/*.ok 2>/dev/null | wc -l); echo "RESULT pass=$n fail=0 skip=0"
   else
@@ -147,7 +154,8 @@ test_findutils() { am_check; }
 build_tar() { FORCE_UNSAFE_CONFIGURE=1 at_configure --disable-nls; make -j$JOBS; }
 test_tar() {
   # autotest: "N tests were successful" / "ERROR: N tests were run, M failed"
-  timeout ${TMO:-3600} make -k check TESTSUITEFLAGS=-j$JOBS > check.out 2>&1; tail -30 check.out
+  make -j$JOBS check TESTSUITEFLAGS=--version > check-build.out 2>&1
+  guest make -k check SHELL=/bin/sh TESTSUITEFLAGS=-j$JOBS > check.out 2>&1; tail -30 check.out
   ok=$(grep -o '^[0-9]* tests* were successful' check.out | awk '{print $1}')
   if [ -n "$ok" ]; then sk=$(grep -o '[0-9]* tests* were skipped' check.out | awk '{print $1}'); echo "RESULT pass=$ok fail=0 skip=${sk:-0}"
   else
