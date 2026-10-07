@@ -1230,7 +1230,7 @@ what would let it go:
 | **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
 | **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
 | winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
-| win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific): upstream-ready, ungated, in `docs/wine-upstream/0001-win32u-VkKeyScan-skip-SGCAPS-caps-row.patch`, **not submitted** (needs the user's OK) |
+| win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific): **not being upstreamed (user 2026-10-07)**: kept as a fork patch; the ungated patch stays in `docs/wine-upstream/0001-win32u-VkKeyScan-skip-SGCAPS-caps-row.patch` for reference |
 
 **Future option for the last two (and the server's 16 MiB block)**, not
 built: a SharedArrayBuffer-backed extra memory (wasm multi-memory) holding
