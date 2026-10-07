@@ -18,7 +18,8 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 : "${GEXCC_PREFIX:?set GEXCC_PREFIX}" "${GEXCC_SRC:?set GEXCC_SRC}" "${GEXCC_WORK:?set GEXCC_WORK}"
 export PATH=$GEXCC_PREFIX/bin:$PATH
-export SYSROOT=$GEXCC_PREFIX/sysroot T=wasm32-unknown-linux-musl JOBS=${JOBS:-6}
+export SYSROOT=$GEXCC_PREFIX/sysroot T=wasm32-unknown-linux-musl JOBS=${JOBS:-2}
+export GUEST_BIN=$GEXCC_WORK/guest-bin
 mkdir -p "$GEXCC_WORK/logs"
 . "$HERE/recipes.sh"
 names=("$@")
@@ -39,13 +40,20 @@ for name in "${names[@]}"; do
   build=FAIL tests=-
   if [ -n "${TESTONLY:-}" ] || (cd "$dir" && set -e && "build_$name") > "$log.build.log" 2>&1; then
     build=ok
-    if declare -F "test_$name" > /dev/null; then
+    guest_suite=no; case " $GUEST_SUITES " in *" $name "*) guest_suite=yes ;; esac
+    if declare -F "test_$name" > /dev/null && [ $guest_suite = no ] && [ -z "${HOSTRUN:-}" ]; then
+      tests="not run (host-run suite; HOSTRUN=1)"
+    elif declare -F "test_$name" > /dev/null; then
+      [ -x "$GUEST_BIN/make" ] || [ -n "${HOSTRUN:-}" ] || { echo "no $GUEST_BIN/make: run.sh make first"; exit 2; }
       (cd "$dir" && "test_$name") > "$log.test.log" 2>&1
+      hx=$(awk '/^GUEST host-execs/{n+=$3} END{print n+0}' "$log.test.log")
+      hf=$(awk '/^GUEST machine-forks/{n+=$3} END{print n+0}' "$log.test.log")
+      hc=$(awk '/^GUEST host-clones/{n+=$3} END{print n+0}' "$log.test.log")
       r=$(grep -a '^RESULT ' "$log.test.log" | tail -1)
       if [ -n "$r" ]; then
         p=$(sed -n 's/.*pass=\([0-9]*\).*/\1/p' <<< "$r"); f=$(sed -n 's/.*fail=\([0-9]*\).*/\1/p' <<< "$r")
         s=$(sed -n 's/.*skip=\([0-9]*\).*/\1/p' <<< "$r")
-        tests="$p/$((p + f)) pass, $s skip"
+        tests="$p/$((p + f)) pass, $s skip, host execs $hx, host clones $hc, machine forks $hf"
       else
         tests="no result"
       fi

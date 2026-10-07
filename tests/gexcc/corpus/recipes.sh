@@ -1,15 +1,52 @@
 # Corpus recipes (run.sh). build_NAME runs in the unpacked tree with `set -e`;
 # test_NAME prints `RESULT pass=N fail=N skip=N`. Libraries other programs
 # use install into the sysroot (--prefix=/usr, DESTDIR=$SYSROOT).
+#
+# Test suites run INSIDE one gexc (guest), never as one host gexc per test
+# program (2026-10-07: thousands of host gexc took gooner down):
+#   - configure in cross mode (--build given): no test programs run on the host;
+#   - the host builds the suite's programs without running them;
+#   - `guest CMD` runs CMD under one gexc: busybox's sh and tools, the gexcc
+#     GNU make in $GUEST_BIN; every test process is a guest process.
 
-# autotools: configure for the gex host
-at_configure() { ./configure --host=$T --prefix=/usr "$@"; }
+# suites converted to in-guest runs; the rest still run on the host and are
+# refused unless HOSTRUN=1 (and then only one at a time, in a resource scope)
+GUEST_SUITES="zlib xz bzip2 jq pcre2 expat libpng coreutils grep sed diffutils findutils libevent"
+
+# autotools, cross mode: configure runs nothing it builds
+at_configure() { ./configure --host=$T --build=x86_64-pc-linux-gnu --prefix=/usr "$@"; }
+# a shell command line in the guest, in this directory
+# `GUEST host-execs N`: host programs the guest run started (execve in the
+# gexc's process tree, counted by strace; gexc itself is 1), `GUEST
+# host-clones N`: threads and processes that tree made (clone, clone3), and
+# `GUEST machine-forks N`: processes created on the whole machine meanwhile
+# (/proc/stat; includes other users').
+guest() {
+  local p0 p1 r out
+  out=$(mktemp)
+  p0=$(awk '/^processes/{print $2}' /proc/stat)
+  timeout ${TMO:-3600} strace -f -qq --seccomp-bpf -e trace=execve,clone,clone3,fork,vfork -e signal=none -c -o "$out" \
+    gexcc-exec run --host-env --env PATH=$GUEST_BIN:/bin:/usr/bin --env SHELL=/bin/sh \
+    --cwd "$PWD" /bin/sh -c "$*"
+  r=$?
+  p1=$(awk '/^processes/{print $2}' /proc/stat)
+  echo "GUEST host-execs $(awk '$NF == "execve" {print $4}' "$out")" >&2
+  echo "GUEST host-clones $(awk '$NF ~ /^(clone|clone3|fork|vfork)$/ {n += $4} END {print n + 0}' "$out")" >&2
+  echo "GUEST machine-forks $((p1 - p0))" >&2
+  rm -f "$out"
+  return $r
+}
+
 # automake's test-suite summary (# PASS: n ...) summed over every log
 am_result() {
   awk '/^# PASS:/{p+=$3} /^# FAIL:/{f+=$3} /^# ERROR:/{f+=$3} /^# XPASS:/{f+=$3} /^# SKIP:/{s+=$3} /^# XFAIL:/{x+=$3}
        END{printf "RESULT pass=%d fail=%d skip=%d\n", p+x, f, s}' "$@"
 }
-am_check() { timeout ${TMO:-3600} make -k -j$JOBS check "$@" > check.out 2>&1; cat check.out; am_result check.out; }
+# automake: the host builds the suite (TESTS empty runs nothing), the guest runs it
+am_check() {
+  make -j$JOBS check TESTS= XFAIL_TESTS= > check-build.out 2>&1 || { tail -20 check-build.out; echo "RESULT pass=0 fail=1 skip=0"; return; }
+  guest make -k check SHELL=/bin/sh "$@" > check.out 2>&1; cat check.out; am_result check.out
+}
 
 build_zlib() {
   CC=gexcc AR=gexcc-ar RANLIB=gexcc-ranlib CHOST=$T ./configure --prefix=/usr
@@ -17,7 +54,7 @@ build_zlib() {
   make install DESTDIR=$SYSROOT
 }
 test_zlib() {
-  make test 2>&1 | tee t.out
+  guest make test SHELL=/bin/sh 2>&1 | tee t.out
   n=$(grep -c 'test OK' t.out); echo "RESULT pass=$n fail=$((3 - n)) skip=0"
 }
 
@@ -29,7 +66,7 @@ build_bzip2() {
   make -j$JOBS CC=gexcc AR=gexcc-ar RANLIB=gexcc-ranlib bzip2 bzip2recover
 }
 test_bzip2() {
-  make check CC=gexcc AR=gexcc-ar RANLIB=gexcc-ranlib 2>&1 | tee t.out
+  guest make check SHELL=/bin/sh CC=true 2>&1 | tee t.out
   # six round trips (three compress, three decompress), each a cmp
   f=$(grep -c 'differ\|EOF on\|Error\|rror' t.out)
   echo "RESULT pass=$((6 - f)) fail=$f skip=0"
@@ -119,8 +156,9 @@ test_tar() {
     echo "RESULT pass=$((run - ${f:-0})) fail=${f:-0} skip=${sk:-0}"
   fi
 }
-build_make() { at_configure --disable-nls; make -j$JOBS; }
-test_make() {
+# GNU make for the guest (the in-guest test runs need it): $GUEST_BIN/make
+build_make() { at_configure --disable-nls; make -j$JOBS; mkdir -p "$GUEST_BIN"; cp make "$GUEST_BIN/make"; }
+test_make_host() {
   timeout ${TMO:-3600} make -k check > check.out 2>&1; tail -20 check.out
   l=$(grep -E '[0-9]+ Tests? in [0-9]+ Categor' check.out | tail -1)
   # "N Tests in M Categories Complete ... No Failures" or "x Tests Failed"
