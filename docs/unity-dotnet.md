@@ -1421,3 +1421,19 @@ Not yet:
        scene ("gexc: guest memory access out of bounds (SIGSEGV)
        (pc≈0x0)"), before the menu. Not looked at yet; the interpreter
        stays the default.
+     - **UnityPlayer.so unit, measured (2026-10-07):** built for 0x7d98a000
+       (key 0b00cd4b..., 55,438 entries, 165 MiB wasm; recovery 1,461 s on an
+       idle gooner, whole build 4,791 s). It lands there unpinned on edger
+       (the pin still reports "never reserved"; the unit is placed by the
+       natural base). hk-a3 is its first run (wasmtime compiles it: placed
+       in 83.2 s), hk-a4 the warm one (1.8 s). Paired with hk-u1 (warm fjit
+       cache, same provider and gexc, no unit):
+
+       | run | first present | menu ready | menu fps |
+       |---|---|---|---|
+       | hk-u1, no unit | 236.7 s | 280.4 s | 28.4 |
+       | hk-a4, unit | 197.6 s | 227.7 s | 29.7 (last quarter 30.7) |
+
+       So the unit brings the menu 52.7 s sooner (19%) and the menu 5% faster;
+       the frame is not bound by UnityPlayer's code speed. The first log line
+       still comes at ~106 s.
