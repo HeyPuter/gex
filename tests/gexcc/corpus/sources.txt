@@ -21,3 +21,15 @@ bash 5.2.37 https://mirrors.kernel.org/gnu/bash/bash-5.2.37.tar.gz 9599b22ecd1d5
 dash 0.5.12 http://gondor.apana.org.au/~herbert/dash/files/dash-0.5.12.tar.gz 6a474ac46e8b0b32916c4c60df694c82058d3297d8b385b74508030ca4a8f28a
 ncurses 6.5 https://mirrors.kernel.org/gnu/ncurses/ncurses-6.5.tar.gz 136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6
 less 668 https://www.greenwoodsoftware.com/less/less-668.tar.gz 2819f55564d86d542abbecafd82ff61e819a3eec967faa36cd3e68f1596a44b8
+perl 5.40.0 https://www.cpan.org/src/5.0/perl-5.40.0.tar.gz c740348f357396327a9795d3e8323bafd0fe8a5c7835fc1cbaba0cc8dfe7161f
+python3 3.12.7 https://www.python.org/ftp/python/3.12.7/Python-3.12.7.tar.xz 24887b92e2afd4a2ac602419ad4b596372f67ac9b077190f459aba390faf5550
+git 2.47.0 https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.47.0.tar.xz 1ce114da88704271b43e027c51e04d9399f8c88e9ef7542dae7aebae7d87bc4e
+mbedtls 3.6.2 https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.2/mbedtls-3.6.2.tar.bz2 8b54fb9bcf4d5a7078028e0520acddefb7900b3e66fec7f7175bb5b7d85ccdca
+curl 8.10.1 https://curl.se/download/curl-8.10.1.tar.xz 73a4b0e99596a09fa5924a4fb7e4b995a85fda0d18a2c02ab9cf134bebce04ee
+openssh 9.9p1 https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.9p1.tar.gz b343fbcdbff87f15b1986e6e15d6d4fc9a7d36066be6b7fb507087ba8f966c02
+vim 9.1.0800 https://github.com/vim/vim/archive/refs/tags/v9.1.0800.tar.gz 3bc15301f35addac9acde1da64da0976dbeafe1264e904c25a3cdc831e347303
+libevent 2.1.12 https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz 92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb
+tmux 3.5a https://github.com/tmux/tmux/releases/download/3.5a/tmux-3.5a.tar.gz 16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951
+fmt 11.0.2 https://github.com/fmtlib/fmt/releases/download/11.0.2/fmt-11.0.2.zip 40fc58bebcf38c759e11a7bd8fdc163507d2423ef5058bba7f26280c5b9c5465
+nginx 1.26.2 https://nginx.org/download/nginx-1.26.2.tar.gz 627fe086209bba80a2853a0add9d958d7ebbdffa1a8467a5784c9a6b4f03d738
+redis 7.4.1 https://download.redis.io/releases/redis-7.4.1.tar.gz bc34b878eb89421bbfca6fa78752343bf37af312a09eb0fae47c9575977dfaa2

@@ -30,7 +30,10 @@ for name in "${names[@]}"; do
   dir=$GEXCC_WORK/$name
   if [ -z "${KEEP:-}${TESTONLY:-}" ] || [ ! -d "$dir" ]; then
     rm -rf "$dir"; mkdir -p "$dir"
-    tar xf "$tarball" -C "$dir" --strip-components=1 || { echo "FAIL unpack $name"; continue; }
+    case $tarball in
+      *.zip) (cd "$dir" && unzip -q "$tarball" && d=$(ls) && mv "$d"/* "$d"/.[!.]* . 2>/dev/null; rmdir "$d") ;;
+      *) tar xf "$tarball" -C "$dir" --strip-components=1 ;;
+    esac || { echo "FAIL unpack $name"; continue; }
   fi
   log=$GEXCC_WORK/logs/$name
   build=FAIL tests=-

@@ -369,6 +369,14 @@ if not (nostdlib or nodefaultlibs):
     # gexcc's runtime: the loop safepoint (rt/poll.c)
     if os.path.exists(LIB + '/libgexcc.a'):
         libs.insert(0, LIB + '/libgexcc.a')
+# main(argc, argv, envp): see rt/main3.c
+if not nostartfiles and not nostdlib:
+    cand = objs + [x for x in ins if not x.startswith('-') and not is_archive(x)]
+    if cand:
+        nm = subprocess.run(['llvm-nm', '-j', '--defined-only', '--extern-only'] + cand,
+                            capture_output=True, text=True).stdout.split()
+        if 'main' in nm and '__main_argc_argv' not in nm and '__main_void' not in nm:
+            objs.append(os.path.join(LIBDIR, 'main3.o'))
 wasm = os.path.join(tmp, 'out.wasm')
 cmd = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory', '--max-memory=4294967296',
        '-pie', '--no-entry', '-o', wasm] + crt + objs + ins + ld_flags + libs
