@@ -1,6 +1,6 @@
 #!/bin/sh
-# gexcc programs checked against the host: each NAME.c is built with cc and
-# with gexcc, run (directly, or by NAME.sh given the binary), and the output
+# gexcc programs checked against the host: each NAME.c (NAME.cpp) is built
+# with cc (c++) and with gexcc (gexc++), run (directly, or by NAME.sh given the binary), and the output
 # and exit status must match. The gexcc build runs itself under gexc (the
 # container's host launcher).
 #
@@ -11,10 +11,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-$(mktemp -d)}
 command -v gexcc > /dev/null || { echo "gexcc not on PATH (tools/gexcc/install.sh)"; exit 2; }
 fail=0
-for src in "$HERE"/*.c; do
-    name=$(basename "$src" .c)
-    cc -O1 -o "$WORK/$name.native" "$src" -lpthread || { echo "FAIL $name: cc"; fail=1; continue; }
-    gexcc -O2 -o "$WORK/$name" "$src" || { echo "FAIL $name: gexcc"; fail=1; continue; }
+for src in "$HERE"/*.c "$HERE"/*.cpp; do
+    case $src in
+        *.cpp) name=$(basename "$src" .cpp); hcc=c++; gcc_=gexc++ ;;
+        *) name=$(basename "$src" .c); hcc=cc; gcc_=gexcc ;;
+    esac
+    $hcc -O1 -w -o "$WORK/$name.native" "$src" -lpthread || { echo "FAIL $name: $hcc"; fail=1; continue; }
+    $gcc_ -O2 -w -o "$WORK/$name" "$src" || { echo "FAIL $name: $gcc_"; fail=1; continue; }
     if [ -f "$HERE/$name.sh" ]; then
         native=$(cd "$WORK" && sh "$HERE/$name.sh" "./$name.native" 2>&1); ns=$?
         gex=$(cd "$WORK" && sh "$HERE/$name.sh" "./$name" 2>&1); gs=$?

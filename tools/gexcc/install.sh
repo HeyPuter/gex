@@ -37,8 +37,16 @@ clang --target=i386-linux-gnu -Os -fPIE -ffreestanding -fno-stack-protector -fno
 ld.lld -m elf_i386 -pie --no-dynamic-linker -T "$HERE/hoststub.ld" -o "$L/hoststub.elf" "$L/hoststub.o"
 llvm-objcopy -O binary "$L/hoststub.elf" "$L/hoststub.bin"
 rm -f "$L/hoststub.o" "$L/hoststub.elf"
-# an empty object: -shared's archives carry their deps in a copy of it
+# gexcc's runtime (rt/: the loop safepoint) and the GexPoll pass plugin
+"$HERE/poll/build.sh" "$L"
+mkdir -p "$PREFIX/build/rt"
 . "$WW/flags.sh"
+for f in "$HERE"/rt/*.c "$HERE"/rt/*.s; do
+  clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$f" -o "$PREFIX/build/rt/$(basename "$f").o"
+done
+rm -f "$PREFIX/sysroot/lib/libgexcc.a"
+llvm-ar crs "$PREFIX/sysroot/lib/libgexcc.a" "$PREFIX"/build/rt/*.o
+# an empty object: -shared's archives carry their deps in a copy of it
 echo 'typedef int gexcc_empty;' | clang $WASM_CFLAGS -x c -c - -o "$L/empty.o"
 GEXC=${GEXC:-}
 [ -z "$GEXC" ] && [ -x "$ROOT/target/release/gexc" ] && GEXC=$ROOT/target/release/gexc

@@ -70,15 +70,29 @@ FLAGS = read_flags()
 # try_table. The link translates them to the standard ones (finish()).
 BASE = [a.replace('-wasm-use-legacy-eh=false', '-wasm-use-legacy-eh=true') for a in FLAGS['WASM_CFLAGS'].split()]
 # C++: exceptions and RTTI are on unless asked off (libc++abi over wasm EH).
+# C++ exceptions on wasm EH: clang turns on the backend's lowering
+# (-wasm-enable-eh) only for emscripten; without it every catch is dropped.
+# C gets it too, for -fexceptions cleanups.
+BASE += ['-mllvm', '-wasm-enable-eh']
 if CXX:
-    BASE = [a for a in BASE if a != '-fno-exceptions']
+    BASE = [a for a in BASE if a != '-fno-exceptions'] + ['-fwasm-exceptions']
 # Where cross-built libraries install (--prefix=/usr DESTDIR=SYSROOT); the
-# libc's include/ is clang's own sysroot default (and include/c++/v1 for C++).
+# libc's include/ is clang's own sysroot default.
 INCS = []
 for d in ('usr/local/include', 'usr/include'):
     if os.path.isdir(os.path.join(SYSROOT, d)):
         INCS += ['-isystem', os.path.join(SYSROOT, d)]
+# libc++'s headers come before the C library's (its <math.h> wraps musl's),
+# unless asked not to (libc++'s own build, with its headers)
+if CXX and os.path.isdir(os.path.join(SYSROOT, 'include', 'c++', 'v1')) and \
+        not any(a in ('-nostdinc++', '-nostdinc') for a in sys.argv[1:]):
+    INCS = ['-isystem', os.path.join(SYSROOT, 'include', 'c++', 'v1')] + INCS
 CLANG = ['clang++' if CXX else 'clang'] + BASE + ['--sysroot=' + SYSROOT]
+# Loop safepoints (poll/GexPoll.cpp): signals reach code that never makes a
+# system call. GEXCC_POLL=0 or -fno-gex-poll leaves them out.
+POLL = os.environ.get('GEXCC_POLL', '1') != '0' and '-fno-gex-poll' not in sys.argv[1:]
+if POLL and os.path.exists(os.path.join(LIBDIR, 'GexPoll.so')):
+    CLANG += ['-fpass-plugin=' + os.path.join(LIBDIR, 'GexPoll.so')]
 CLANG_TAIL = INCS
 
 
@@ -93,7 +107,7 @@ def expand_rsp(args):
     return out
 
 
-args = expand_rsp(sys.argv[1:])
+args = [a for a in expand_rsp(sys.argv[1:]) if a not in ('-fno-gex-poll', '-fgex-poll')]
 
 # --- queries -------------------------------------------------------------
 if args == ['--print-sysroot'] or args == ['-print-sysroot']:
@@ -227,6 +241,9 @@ for k, (s, lang) in enumerate(srcs):
         sys.exit(r)
     objs.append(o)
 if not objs and not inputs:
+    # build systems ask the linker who it is (Meson: -Wl,--version)
+    if any(f in ('--version', '-v', '--help') for f in ld_flags):
+        os.execvp('wasm-ld', ['wasm-ld'] + [f for f in ld_flags if f in ('--version', '-v', '--help')][:1])
     die('no input files')
 if out is None:
     out = 'a.out'
@@ -349,6 +366,9 @@ if not (nostdlib or nodefaultlibs):
     # gex's support library first: its dlopen, __dlsym and vfork replace
     # libc's; the setjmp runtime and the signal frames are only there.
     libs += [LIB + '/libgex.a', LIB + '/libc.a', LIB + '/libclang_rt.builtins-wasm32.a']
+    # gexcc's runtime: the loop safepoint (rt/poll.c)
+    if os.path.exists(LIB + '/libgexcc.a'):
+        libs.insert(0, LIB + '/libgexcc.a')
 wasm = os.path.join(tmp, 'out.wasm')
 cmd = ['wasm-ld', '--experimental-pic', '--shared-memory', '--import-memory', '--max-memory=4294967296',
        '-pie', '--no-entry', '-o', wasm] + crt + objs + ins + ld_flags + libs
