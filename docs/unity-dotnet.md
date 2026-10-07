@@ -1437,3 +1437,60 @@ Not yet:
        So the unit brings the menu 52.7 s sooner (19%) and the menu 5% faster;
        the frame is not bound by UnityPlayer's code speed. The first log line
        still comes at ~106 s.
+  22. **The .NET wasm JIT is the default (user, 2026-10-07).** Normal runs use
+     the fork's wasm JIT; ejected builds will use .NET AOT. `GEXMONO_WASM_JIT=0`
+     runs the interpreter only (d4a9389d; embed keeps an interpreter-only leg;
+     `unity-edger-gate.sh` runs the game legs with the JIT, `JIT=0` for the
+     interpreter).
+     - **The Hollow Knight fault under the JIT (hk-j1/j2) was a sign
+       extension:** the JIT'd `SpanHelpers.ClearWithReferences` (from
+       `Array.Clear`) computed `Unsafe.Add(ref p, -1)` with the `-1` an
+       OP_ICONST in an i32 local, widened with `i64.extend_i32_u`: 0xffffffff
+       pointers, 32 GiB past the span. On a 64-bit mono target a 32-bit
+       constant's register holds the sign-extended 64-bit value
+       (`inst_c0`; mini-amd64 moves it as one) and mono folds `conv.i` of a
+       constant away relying on that. A negative OP_ICONST now gets an i64
+       local and `i64.const` (patch 0004, a1b2f22f). Repro and test: embed's
+       `Clears(300)` (Array.Clear/Span.Clear/List.Clear over reference, value
+       and mixed arrays) gives "clears 643296" on the interpreter and the
+       JIT; before the fix the JIT leg died there.
+     - **Hollow Knight with the JIT (hk-j3, warm fjit cache, no unit, same
+       gexc and provider as hk-u1 but the JIT fix):** reaches the menu and
+       renders it; first present 236.7 s → hk-j3's numbers: menu ready 300.8 s
+       (hk-u1, interpreter: 280.4 s), menu 28.8 presents/s, last quarter 30.2
+       (hk-u1: 28.4 and 28.6). The JIT's compiles cost ~20 s of start-up;
+       the menu is not managed-bound (managed code was 12% of the main
+       thread on the interpreter).
+  23. **Plan: .NET AOT for ejected builds (not started; estimate 10-15 agent
+     days).** The browser's own path is mono's LLVM AOT in llvm-only mode
+     (`mono-aot-cross` with Mono's LLVM, bitcode linked by emcc, the
+     interpreter as fallback for what AOT cannot see). For gex the pieces:
+     1. **A wasm64 cross compiler** (3-4 days): build `mono-aot-cross` from
+        the fork for host linux-x64 targeting our `wasm64` processor
+        (`TARGET_WASM`+`TARGET_WASM64`, 8-byte pointers), with the
+        cross offsets header for the target (offsets-tool against the gex
+        wasm64 sysroot and `HOST_GEX` config) and Mono's LLVM (the
+        Microsoft.NETCore.Runtime.Mono.LLVM.Sdk package) emitting
+        `wasm64-unknown-unknown` bitcode; mini-llvm's TARGET_WASM paths
+        checked for 32-bit pointer assumptions (`mtriple`, intptr types,
+        the llvm-only EH model).
+     2. **Linking into the provider** (2-3 days): compile the bitcode with
+        clang 22 `--target=wasm64` and our musl, link it into `mono.wasm`
+        (one stateful provider), register the AOT images at start-up (the
+        browser driver's `mono_aot_register_module` table), and run
+        `MONO_AOT_MODE_LLVMONLY_INTERP` so anything not AOT'd falls back to
+        the interpreter (generic instances AOT could not see, dynamic
+        methods).
+     3. **gex calling conventions** (2-4 days): AOT'd managed-to-native
+        wrappers must call guest addresses through the guest native call
+        (`ves_pinvoke_method`'s marshalling, icalls registered by UnityPlayer
+        at run time) rather than as wasm function pointers; native-to-managed
+        (reverse) thunks into AOT code; exceptions through guest frames
+        (`gexp_raise`) meeting llvm-only EH.
+     4. **Coverage and the session** (2-3 days): AOT CoreLib, the facades,
+        `UnityEngine.*` and the game's `Managed/*.dll` (the set recorded by
+        the session), with a coverage report of methods left to the
+        interpreter; measure Muck and Hollow Knight against the JIT.
+     Risks: Mono's LLVM wasm64 output (untested upstream), code size (tens of
+     MB for Hollow Knight), and AOT of the Unity-patched BCL behaviour we
+     depend on (GC handles, liveness) being in C, so unaffected.
