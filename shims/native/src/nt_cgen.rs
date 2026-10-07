@@ -250,7 +250,7 @@ pub fn icall_hints(image: &gex_ld::Image) -> HashMap<u64, u64> {
 pub fn prepare_pe(pe: &gex_ld::pe::PeImage, base: u64, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let (image, seeds) = gex_xlate::func::pe_input(pe, base).map_err(|e| anyhow!("placing the image at {base:#x}: {e}"))?;
     let pv = provided(pe, base);
-    prepare_with(&image, &seeds, jobs, verbose, &pv)
+    prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)
 }
 
 /// Functions recovery found in the image at `base` that its unit (`unit`,
@@ -283,7 +283,7 @@ pub fn prepare_pe_seeded(pe: &gex_ld::pe::PeImage, base: u64, extra: &[u64], job
         }
     }
     let pv = provided(pe, base);
-    prepare_with(&image, &seeds, jobs, verbose, &pv)
+    prepare_with(&image, &|| gex_xlate::func::recover_pe(&image, &seeds, &Default::default()), jobs, verbose, &pv)
 }
 
 /// The recovery directory of a PE image at `base` (what [`prepare_pe`]
@@ -725,11 +725,16 @@ pub fn prepare_group(members: &[GroupMember<'_>], jobs: usize) -> Result<GroupBu
 /// [`prepare_pe`] for any recovery input (no providers).
 pub fn prepare_image(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
     let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
-    prepare_with(image, seeds, jobs, verbose, &none)
+    prepare_with(image, &|| gex_xlate::func::recover_pe(image, seeds, &Default::default()), jobs, verbose, &none)
 }
 
-fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: usize, verbose: bool, pv: &Provided) -> Result<std::path::PathBuf> {
-    let (image, seeds) = (image, seeds);
+fn prepare_with(
+    image: &gex_ld::Image,
+    recover: &dyn Fn() -> gex_xlate::func::Program,
+    jobs: usize,
+    verbose: bool,
+    pv: &Provided,
+) -> Result<std::path::PathBuf> {
     if verbose {
         report_hints(image);
     }
@@ -746,7 +751,7 @@ fn prepare_with(image: &gex_ld::Image, seeds: &gex_xlate::func::PeSeeds, jobs: u
     let recovery = root.join("recovery").join(recovery_key(image));
     if !recovery.join("summaries").exists() {
         let t0 = std::time::Instant::now();
-        let prog = gex_xlate::func::recover_pe(image, seeds, &Default::default());
+        let prog = recover();
         let summaries = gex_xlate::summary::analyze(&prog).map;
         let n = prog.functions.len();
         let funcs = gex_cgen::select(
@@ -1464,4 +1469,172 @@ fn report(p: &Pending, pl: &Placed, t0: std::time::Instant) {
         pl.cwasm.len() >> 20,
         t0.elapsed().as_secs_f64()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Linux shared objects (stream U; docs/unity-dotnet.md §12)
+// ---------------------------------------------------------------------------
+//
+// A Linux program's libraries are mapped by ld.so out of guest code, so they
+// arrive through the runtime translator. `GEX_ELF_UNITS=name.so,...` (file
+// names, or `all`) gives each listed object its function-tier unit at the base
+// it was mapped at, as the NT layer's images get theirs: the whole object
+// recovered (`gex_xlate::func::recover`, with its `.eh_frame` and symbols), as
+// C, linked once (`gexc cgen-image --elf SO --base HEX`). A unit is keyed by
+// the object's relocated bytes at that base, so the object must land at the
+// same address every run (a `--pin` manifest line `BASE SPAN NAME` holds it
+// there). An object with no unit runs on the fjit/tier-1 and, unless
+// `GEX_ELF_UNITS_BUILD=0`, gets one built in the background for the next run.
+
+/// The ELF object `bytes` placed at load bias `base`, with its own RELATIVE
+/// relocations applied (code pointers in data, jump tables), as recovery sees it.
+pub fn elf_image(bytes: &[u8], base: u64) -> Result<gex_ld::Image> {
+    let mut image = gex_ld::elf::load(bytes, base).map_err(|e| anyhow!("loading the ELF object at {base:#x}: {e:?}"))?;
+    gex_ld::elf::apply_own_relative(&mut image);
+    Ok(image)
+}
+
+/// Build (or find) the unit for the ELF object `bytes` at `base`.
+pub fn prepare_elf(bytes: &[u8], base: u64, jobs: usize, verbose: bool) -> Result<std::path::PathBuf> {
+    let image = elf_image(bytes, base)?;
+    let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
+    prepare_with(&image, &|| gex_xlate::func::recover(&image, Some(bytes), &Default::default()), jobs, verbose, &none)
+}
+
+/// The load bias of an ELF object one of whose executable `PT_LOAD`s was
+/// mapped at `start` from file offset `offset`.
+fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
+    let rd = |o: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(o..o + n)?;
+        let mut v = [0u8; 8];
+        v[..n].copy_from_slice(b);
+        Some(u64::from_le_bytes(v))
+    };
+    if bytes.get(0..4)? != b"\x7fELF" || *bytes.get(4)? != 2 {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (rd(0x20, 8)? as usize, rd(0x36, 2)? as usize, rd(0x38, 2)? as usize);
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        let (ty, flags, off, vaddr) = (rd(ph, 4)?, rd(ph + 4, 4)?, rd(ph + 8, 8)?, rd(ph + 16, 8)?);
+        if ty == 1 && flags & 1 != 0 && off & !0xfff == offset {
+            return Some(start.wrapping_sub(vaddr & !0xfff));
+        }
+    }
+    None
+}
+
+fn elf_wanted(path: &str) -> bool {
+    static LIST: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("GEX_ELF_UNITS").ok().filter(|v| !v.is_empty() && v != "0").map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+    });
+    let Some(list) = list else { return false };
+    let name = path.rsplit('/').next().unwrap_or(path);
+    list.iter().any(|n| n == "all" || n == name)
+}
+
+/// Objects already looked at in this host process, by path and bias.
+static ELF_SEEN: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// After a syscall that mapped code: install the unit of each listed ELF
+/// object (`GEX_ELF_UNITS`), before ld.so runs any of it.
+pub(crate) fn on_elf_maps(caller: &mut Caller<'_, HostState>, mapped: &[gex_kernel::CodeMap]) -> Result<()> {
+    for m in mapped {
+        if !elf_wanted(&m.path) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&m.path) else {
+            eprintln!("gex-elf: {}: not readable on the host; no unit", m.path);
+            continue;
+        };
+        let Some(base) = elf_bias(&bytes, m.start, m.offset) else {
+            continue;
+        };
+        {
+            let mut seen = ELF_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.iter().any(|(p, b)| *p == m.path && *b == base) {
+                continue;
+            }
+            seen.push((m.path.clone(), base));
+        }
+        let t0 = std::time::Instant::now();
+        let image = elf_image(&bytes, base)?;
+        let none = Provided { providers: Vec::new(), exports: HashMap::new(), stubs: Vec::new() };
+        let key = unit_key(&image, &none);
+        let cwasm_path = cache_root()?.join(&key).join("c.wasm");
+        let Ok(cwasm) = std::fs::read(&cwasm_path) else {
+            eprintln!("gex-elf: no function-tier unit for {} at {base:#x} (key {key}); it runs on the runtime translator", m.path);
+            NO_UNIT.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{} at {base:#x} (key {key})", m.path));
+            if std::env::var("GEX_ELF_UNITS_BUILD").as_deref() != Ok("0") {
+                spawn_elf_build(&m.path, base);
+            }
+            continue;
+        };
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        // Only the executable segment this mapping holds is in memory yet; the
+        // rest (another PT_LOAD) is checked when its own mapping arrives... so
+        // compare what is there now and hash the pages of every executable segment.
+        let mut pages = Vec::new();
+        for seg in image.segments.iter().filter(|s| s.executable) {
+            let (lo, n) = (seg.vaddr as usize, seg.bytes.len());
+            let Some(live) = memory.bytes().get(lo..lo + n) else {
+                bail!("gex-elf: {}: {:#x}+{n:#x} is outside guest memory", m.path, seg.vaddr);
+            };
+            if seg.vaddr >= m.start && seg.vaddr + n as u64 <= m.end {
+                if let Some(i) = (0..n).find(|&i| live[i] != seg.bytes[i]) {
+                    eprintln!(
+                        "gex-elf: {}: the mapped code at {:#x} differs from the object its unit was built from; refusing the unit",
+                        m.path,
+                        seg.vaddr + i as u64
+                    );
+                    pages.clear();
+                    break;
+                }
+            }
+            for page in seg.vaddr / gex_abi::DISPATCH_PAGE..=(seg.vaddr + n as u64 - 1) / gex_abi::DISPATCH_PAGE {
+                pages.push((page, page_hash(memory.bytes(), page)));
+            }
+        }
+        if pages.is_empty() {
+            continue;
+        }
+        let entries = gex_cgen::image::read_entries(&cwasm_path)?;
+        let (shared, engine, cache) = {
+            let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+            (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
+        };
+        let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
+        let module = compile(&engine, cache.as_ref(), &cwasm_path, &cwasm).with_context(|| format!("compiling {}'s function tier", m.path))?;
+        note_pages(&memory, &pages);
+        crate::ftab::publish(&shared, &memory, module, &entries, gex_kernel::ftab::Tier::Unit, Vec::new())?;
+        crate::ftab::catch_up(&mut *caller)?;
+        replay_registry(caller)?;
+        eprintln!(
+            "gex-elf: function tier for {} at {base:#x}: {} entries, {} MiB wasm, placed in {:.1}s",
+            m.path,
+            entries.iter().filter(|&&a| a != 0).count(),
+            cwasm.len() >> 20,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+/// `gexc cgen-image --elf PATH --base BASE` in the background, for the next run.
+fn spawn_elf_build(path: &str, base: u64) {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = std::process::Command::new("nice");
+    cmd.arg("-n").arg("10").arg(&exe).args(["cgen-image", "--elf", path, "--base", &format!("{base:#x}")]);
+    if gex_abi::mem64() {
+        cmd.arg("--mem64");
+    }
+    if let Ok(j) = std::env::var("GEX_ELF_UNITS_JOBS") {
+        cmd.args(["--jobs", &j]);
+    }
+    match cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).process_group(0).spawn() {
+        Ok(_) => eprintln!("gex-elf: building the function tier for {path} at {base:#x} for the next run"),
+        Err(e) => eprintln!("gex-elf: could not start building the function tier for {path}: {e}"),
+    }
 }

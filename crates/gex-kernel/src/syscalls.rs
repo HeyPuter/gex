@@ -1024,6 +1024,9 @@ pub struct CodeMap {
     pub end: u64,
     /// The file it came from, for the trace.
     pub path: String,
+    /// The file offset mapped at `start` (where a shared object's load bias
+    /// is worked out from: the host's ELF units, nt_cgen::on_elf_maps).
+    pub offset: u64,
 }
 
 /// A `MAP_SHARED` file mapping, and where its bytes belong.
@@ -5140,6 +5143,7 @@ impl Kernel {
                     start,
                     end: start + len_aligned,
                     path: name.clone(),
+                    offset,
                 });
             }
             if flags & crate::mem::flags::SHARED != 0 {
