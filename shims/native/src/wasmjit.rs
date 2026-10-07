@@ -115,6 +115,7 @@ fn instantiate(
                         bail!("compile: {e:#}")
                     }
                 };
+                crate::aot_share::note(&m, crate::aot_share::Kind::Managed);
                 map.insert(key, m.clone());
                 m
             }

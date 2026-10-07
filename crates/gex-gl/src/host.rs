@@ -464,6 +464,35 @@ pub struct Gl {
     pub presents: u64,
 }
 
+/// `GEX_GL_FPS=1`: the program's own frame rate, counted at its PRESENTs
+/// (a compositor's commits also count other clients' surfaces, cursors and
+/// Xwayland's damage). Prints the first PRESENT's wall-clock time (Unix
+/// milliseconds, for time-to-first-frame against the run's start) and then,
+/// about once a second, the PRESENTs per second and the total.
+fn present_meter(total: u64) {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static METER: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("GEX_GL_FPS").is_some_and(|v| v != "0")) {
+        return;
+    }
+    let epoch = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let mut m = METER.lock().unwrap();
+    let Some((count, since)) = m.as_mut() else {
+        eprintln!("[gex-gl] first present at {} ms", epoch());
+        *m = Some((0, Instant::now()));
+        return;
+    };
+    *count += 1;
+    let dt = since.elapsed().as_secs_f64();
+    if dt >= 1.0 {
+        eprintln!("[gex-gl] presents/s {:.2} total {total} at {} ms", *count as f64 / dt, epoch());
+        *count = 0;
+        *since = Instant::now();
+    }
+}
+
 /// A presented frame: RGBA rows, top first.
 pub struct Frame {
     pub width: i32,
@@ -886,6 +915,7 @@ impl Gl {
                 op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
                 op::PRESENT => {
                     self.presents += 1;
+                    present_meter(self.presents);
                     if self.keep_frames {
                         let (w, h) = (self.width, self.height);
                         let mut px = vec![0u8; (w * h * 4) as usize];
