@@ -27,6 +27,17 @@ int main(void)
 	T(rename("pc.f", "pc.d/.") == -1);
 	T(rename("pc.d/..", "pc.x") == -1);
 	T(realpath("pc.f/", NULL) == NULL && errno == ENOTDIR);
+	T(mkdir("pc.d/.", 0755) == -1 && errno == EEXIST);
+	T(mkdir("pc.none/.", 0755) == -1 && errno == ENOENT);
+	T(mkdir("pc.dangling/", 0755) == -1 && errno == EEXIST);
+	T(rename("pc.d", "pc.dangling/") == -1 && errno == ENOTDIR);
+	T(rmdir("pc.d/.") == -1 && errno == EINVAL);
+	T(link("pc.f", "pc.d/.") == -1 && errno == EEXIST);
+	T(link("pc.f", "pc.new/") == -1 && errno == ENOENT);
+	T(symlink("nowhere", "pc.new/") == -1 && errno == ENOENT);
+	T(rename("pc.f", "pc.new/") == -1 && errno == ENOTDIR);
+	T(open("pc.new/", O_CREAT | O_WRONLY, 0644) == -1 && errno == EISDIR);
+	T(access("pc.new", F_OK) == -1);
 	T(rename("pc.f", "pc.d/f") == 0);
 	system("rm -rf pc.d pc.f pc.l pc.dangling pc.loop");
 	return 0;

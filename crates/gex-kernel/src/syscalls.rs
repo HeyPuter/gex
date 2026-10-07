@@ -3168,6 +3168,12 @@ impl Kernel {
     fn at_path(&self, m: &GuestMem<'_>, dirfd: i32, path: u64) -> Result<String, Errno> {
         let raw = m.read_cstr(path, 4096)?;
         let p = String::from_utf8(raw).map_err(|_| Errno::EINVAL)?;
+        self.at_path_str(dirfd, &p)
+    }
+
+    /// [`Self::at_path`] for a path already read.
+    fn at_path_str(&self, dirfd: i32, p: &str) -> Result<String, Errno> {
+        let p = p.to_string();
         // An empty path names nothing (the AT_EMPTY_PATH forms check for it
         // before they get here), as on Linux.
         if p.is_empty() {
@@ -3205,6 +3211,31 @@ impl Kernel {
             }
         }
         Ok(abs)
+    }
+
+    /// How the path at `ptr` ends, which normalising loses: with a slash
+    /// (`name/`), and whether its last component is `.` (1) or `..` (2).
+    fn path_tail(m: &GuestMem<'_>, ptr: u64) -> Result<(bool, u8), Errno> {
+        let raw = m.read_cstr(ptr, 4096)?;
+        let slash = raw.len() > 1 && raw.ends_with(b"/");
+        let last = raw.split(|&b| b == b'/').filter(|c| !c.is_empty()).next_back();
+        let dot = match last {
+            Some(b".") => 1,
+            Some(b"..") => 2,
+            _ => 0,
+        };
+        Ok((slash, dot))
+    }
+
+    /// A new non-directory name (link, symlink) that ends in a slash or in
+    /// `.`/`..` names a directory: EEXIST when something is there, else
+    /// ENOENT, as Linux answers.
+    fn new_name_check(&self, m: &GuestMem<'_>, ptr: u64, p: &str) -> Result<(), Errno> {
+        let (slash, dot) = Self::path_tail(m, ptr)?;
+        if slash || dot != 0 {
+            return Err(if self.vfs.metadata_nofollow(p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
+        }
+        Ok(())
     }
 
     /// `p` relative to the directory open at `dirfd`.
@@ -3600,6 +3631,11 @@ impl Kernel {
             if let Some(base) = self.pin_for(&p) {
                 self.armed_pin = Some((p.clone(), base));
             }
+            // O_CREAT of "name/" that is not there: a slash names a
+            // directory, which open does not create (EISDIR, as Linux).
+            if flags & oflags::O_CREAT != 0 && Self::path_tail(m, path)?.0 && self.vfs.metadata(&p).is_err() {
+                return Err(Errno::EISDIR);
+            }
             // A directory opens for reading only, whatever the filesystem.
             let acc = flags & oflags::ACCMODE;
             if (acc == oflags::O_WRONLY || acc == oflags::O_RDWR)
@@ -3709,6 +3745,7 @@ impl Kernel {
             from
         };
         let to = self.at_path(m, a[2] as i32, a[3])?;
+        self.new_name_check(m, a[3], &to)?;
         self.vfs.link(&from, &to).map(|_| 0)
     }
 
@@ -4596,13 +4633,33 @@ impl Kernel {
     }
 
     fn sys_mkdirat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
+        // "link/" where link dangles: the name is taken (EEXIST); resolving
+        // the slash would say ENOENT
+        if Self::path_tail(m, path)?.0 {
+            let raw = String::from_utf8(m.read_cstr(path, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let bare = self.at_path_str(dirfd, raw.trim_end_matches('/'))?;
+            if self.vfs.metadata_nofollow(&bare).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+        }
         let p = self.at_path(m, dirfd, path)?;
+        // "dir/." and "dir/.." exist if dir does, else ENOENT
+        if Self::path_tail(m, path)?.1 != 0 {
+            return Err(if self.vfs.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
+        }
         self.vfs.mkdir(&p, mode & !self.umask).map(|_| 0)
     }
 
     fn sys_unlinkat(&mut self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
+        let tail = Self::path_tail(m, path)?;
         let p = self.at_path(m, dirfd, path)?;
         if flags & AT_REMOVEDIR != 0 {
+            // rmdir("dir/.") is EINVAL, rmdir("dir/..") ENOTEMPTY
+            match tail.1 {
+                1 => return Err(Errno::EINVAL),
+                2 => return Err(Errno::ENOTEMPTY),
+                _ => {}
+            }
             self.vfs.rmdir(&p).map(|_| 0)
         } else {
             self.vfs.unlink(&p).map(|_| 0)
@@ -4653,7 +4710,22 @@ impl Kernel {
             }
         }
         let from = self.at_path(m, old_fd, old)?;
+        // "x" to "link/" where link is a symlink: the slash asks to follow
+        // it, and rename never replaces through a link (ENOTDIR, as GNU)
+        if Self::path_tail(m, new)?.0 {
+            let raw = String::from_utf8(m.read_cstr(new, 4096)?).map_err(|_| Errno::EINVAL)?;
+            let bare = self.at_path_str(new_fd, raw.trim_end_matches('/'))?;
+            if self.vfs.metadata_nofollow(&bare).is_ok_and(|md| md.file_type == FileType::Symlink) {
+                return Err(Errno::ENOTDIR);
+            }
+        }
         let to = self.at_path(m, new_fd, new)?;
+        // "file" to "name/": a slash names a directory, which a file is not
+        if Self::path_tail(m, new)?.0
+            && self.vfs.metadata_nofollow(&from).is_ok_and(|md| md.file_type != FileType::Directory)
+        {
+            return Err(Errno::ENOTDIR);
+        }
         if flags & !RENAME_NOREPLACE != 0 {
             // EXCHANGE, WHITEOUT, or any unknown bit: unsupported here.
             let _ = RENAME_EXCHANGE;
@@ -4728,6 +4800,7 @@ impl Kernel {
     ) -> SysResult {
         let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
         let p = self.at_path(m, newdirfd, path)?;
+        self.new_name_check(m, path, &p)?;
         self.vfs.symlink(&t, &p).map(|_| 0)
     }
 
