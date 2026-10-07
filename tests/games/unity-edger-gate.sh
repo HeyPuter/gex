@@ -49,7 +49,7 @@ leg() { # NAME GAME SECS MARKER
 	"$B" -- env GEXC="$ST/gexc" DNC="$ST/dnc" GEX_FJIT_CACHE=1 EVERY=600 \
 		bash "$TREE/tests/games/unity-bench.sh" "$game" "$run" "$secs" --fjit > "$OUT/$name.txt" 2>&1
 	mkdir -p "$OUT/$name-frames"
-	rsync -a "${BENCH_HOST_SSH:-claude@edger}:$run/f-*.ppm" "$run/plog-t.txt" "$OUT/$name-frames/" 2> /dev/null
+	rsync -a --include='f-*.ppm' --include=plog-t.txt --exclude='*' "${BENCH_HOST_SSH:-claude@edger}:$run/" "$OUT/$name-frames/"
 	python3 - "$OUT/$name-frames" "$OUT/$name.png" "$marker" "$OUT/$name.txt" <<-'EOF'
 	import glob, re, sys
 	from PIL import Image, ImageStat
