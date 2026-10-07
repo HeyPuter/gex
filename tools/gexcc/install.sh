@@ -110,22 +110,8 @@ exec pkg-config --static "\$@"
 EOF
 chmod +x "$B/$TRIPLE-pkg-config"
 ln -sf "$TRIPLE-pkg-config" "$B/gexcc-pkg-config"
-# gexcc-exec: gexc for gexcc programs (the containers' host launcher runs
-# it). The native busybox is the guest's /bin/sh and coreutils, unless
-# GEXCC_BUSYBOX is set (empty: none; a path: that busybox). GEXCC_GEXC
-# picks another gexc.
-cat > "$B/gexcc-exec" <<EOF
-#!/bin/sh
-[ "\$1" = run ] && shift
-bb=\${GEXCC_BUSYBOX-$L/busybox}
-if [ -n "\$bb" ] && [ -f "\$bb" ]; then
-  if [ "\$bb" = "$L/busybox" ] && [ -z "\${GEX_BUSYBOX_APPLETS:-}" ] && [ -f "$L/busybox.applets" ]; then
-    GEX_BUSYBOX_APPLETS=\$(cat "$L/busybox.applets"); export GEX_BUSYBOX_APPLETS
-  fi
-  exec "\${GEXCC_GEXC:-$G}" run --busybox "\$bb" "\$@"
-fi
-exec "\${GEXCC_GEXC:-$G}" run "\$@"
-EOF
+# gexcc-exec: gexc for gexcc programs, with machine-wide slots (gexcc-exec.in)
+sed -e "s|@GEXC@|$G|" -e "s|@LIBDIR@|$L|" "$HERE/gexcc-exec.in" > "$B/gexcc-exec"
 chmod +x "$B/gexcc-exec"
 # `gexcc-run PROG ARGS`: what the container's launcher does, by hand
 R=$B/gexcc-exec
