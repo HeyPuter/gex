@@ -1416,3 +1416,8 @@ Not yet:
        profile after (hk-p2): `major_get_used_size` 5.6% (the 500 ms
        refresh), `mono_interp_exec_method` 12.1% (managed code on the
        interpreter), `wasm[0]::function[10]` 14.6%.
+     - **The .NET wasm JIT on Hollow Knight (hk-j1, `--env
+       GEXMONO_WASM_JIT=1`):** the host faults at 267 s, after the first
+       scene ("gexc: guest memory access out of bounds (SIGSEGV)
+       (pc≈0x0)"), before the menu. Not looked at yet; the interpreter
+       stays the default.
