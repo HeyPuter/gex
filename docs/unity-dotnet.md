@@ -1339,3 +1339,24 @@ Not yet:
        edger. `GEX_GL_ERRORS=1` (gex-gl host: glGetError after every command,
        per opcode) is the next look. The fps numbers above are for that
        rendering.
+     - **Fixed (273b4635):** `GEX_GL_ERRORS=1` showed BIND_FRAMEBUFFER (and
+       FRAMEBUFFER_TEXTURE_2D) failing with INVALID_OPERATION every frame:
+       the host ran the guest's framebuffer names as they were, and
+       ARB_framebuffer_object (NVIDIA, unlike Mesa) refuses a name
+       GenFramebuffers did not return. Framebuffer and renderbuffer names are
+       now the host's (`gexgl_native_object`, binding queries mapped back).
+       hk-g2 (cold, new gexc, shape provider): no GL errors, the main menu
+       renders (`scratch/unity/screens/hk-menu-edger.png`), first present
+       448.3 s, menu ready 499.4 s, menu 24.4 presents/s. (The e1-e4/mk-e1
+       fps above were measured with the broken rendering.)
+     - **ELF unit for UnityPlayer.so:** built on gooner at base 0x7e041000
+       (`GEX_CGEN_CACHE=scratch/unity/units/cgen`, `gexc cgen-image --elf
+       ... --mem64 --jobs 12`, log `scratch/unity/units/build-up*.log`):
+       recovery 55,439 functions in 5,424 s (single-threaded, ~20 GB), then
+       the C compile; recovery and objects are cached, so a killed build
+       resumes at the compile. Pin for runs: `scratch/unity/edger/hk-pin.txt`
+       (`0x7e041000 0x2674000 UnityPlayer.so`); copy the cgen cache to edger
+       and run with `GEX_CGEN_CACHE=... GEX_ELF_UNITS=UnityPlayer.so
+       GEX_ELF_UNITS_BUILD=0` and gexc flag `--pin FILE`.
+     - After a Claude Code restart: background runs and builds die with it;
+       check `ps` on gooner and edger, rerun what was cut.
