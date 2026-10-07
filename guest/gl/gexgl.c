@@ -3187,7 +3187,18 @@ const char *eglQueryString(void *dpy, int name) {
     /* EGL requires "<major>.<minor> <vendor-specific>", and applications do
        parse the number off the front. */
     case 0x3054: return "1.5 gex";   /* EGL_VERSION */
-    case 0x3055: return "";          /* EGL_EXTENSIONS */
+    /* EGL_EXTENSIONS: of EGL_NO_DISPLAY, the client extensions; of a
+       display, its own. Each one claimed is true here: platform displays
+       and eglGetProcAddress for every entry point (core ones included) are
+       this file's; eglCreateContext takes the version and profile
+       attributes, ignores the no-error one, and needs no config (there is
+       one). Wine's win32u requires exactly these before it uses EGL. */
+    case 0x3055:
+        return dpy ? "EGL_KHR_create_context EGL_KHR_create_context_no_error "
+                     "EGL_KHR_no_config_context"
+                   : "EGL_EXT_client_extensions EGL_EXT_platform_base "
+                     "EGL_KHR_client_get_all_proc_addresses "
+                     "EGL_EXT_platform_wayland EGL_KHR_platform_wayland";
     case 0x308D: return "OpenGL OpenGL_ES"; /* EGL_CLIENT_APIS */
     default: return "";
     }
