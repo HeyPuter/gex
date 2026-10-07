@@ -2,13 +2,19 @@
 """Wrap a native wasm32 program (a PIE wasm module linked against gex's musl)
 in the ELF32 i386 container gexc runs (shims/native/src/wasmprog.rs).
 
-    wasm-elf.py IN.wasm OUT
+    wasm-elf.py IN.wasm OUT [--guest-i386] [--host-stub BLOB [--runner GEXC]]
 
 Segments:
   R    at BASE:          ELF header, program headers, then the wasm module
   R    next page:        the gex header (GEXWASM\\0 ...) and the two entries,
                          each 16 bytes of hlt (never run: gex binds the
                          module's __gex_start / __gex_thread_start there)
+                         With --host-stub (gexcc): the entry jumps to the
+                         blob at +0x60 (tools/gexcc/hoststub.c), which an
+                         x86 Linux host runs: it re-execs the file under
+                         gexc. No PT_GNU_STACK then, so the host maps the
+                         read-only page executable (IA-32 READ_IMPLIES_EXEC);
+                         gex goes by PF_X alone and runs none of it.
   R X  next page:        hlt (gex wants an executable segment)
   RW   next, aligned:    the module's data (dylink.0 mem_size), zero-filled;
                          __memory_base. brk starts above it.
@@ -56,14 +62,25 @@ def up(v, a):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    argl = sys.argv[1:]
+    stub, runner = None, ''
+    for opt in ('--host-stub', '--runner'):
+        if opt in argl:
+            k = argl.index(opt)
+            v = argl[k + 1]
+            del argl[k:k + 2]
+            if opt == '--host-stub':
+                stub = open(v, 'rb').read()
+            else:
+                runner = v
+    args = [a for a in argl if not a.startswith('--')]
     src, dst = args[0], args[1]
     # --guest-i386: the program runs i386 code (Wine's loader, W3): gex
     # translates i386 in its process and leaves Windows' addresses free.
     flags = 1 if '--guest-i386' in sys.argv[1:] else 0
     w = open(src, 'rb').read()
     mem_size, mem_align = dylink_mem(w)
-    ehsize, phsize, nph = 52, 32, 5
+    ehsize, phsize, nph = 52, 32, (4 if stub else 5)
     wasm_off = up(ehsize + phsize * nph, 16)
     r_end = wasm_off + len(w)
     text_off = up(r_end, PAGE)
@@ -75,6 +92,16 @@ def main():
 
     hdr = b'GEXWASM\0' + struct.pack('<8I', 1, BASE + wasm_off, len(w), data_va, data_sz, entry, entry + 16, flags)
     text = hdr.ljust(0x40, b'\0') + b'\xf4' * 32
+    if stub:
+        mark = stub.find(b'GEXCC-RUNNER')
+        assert mark >= 0, 'host stub without its runner slot'
+        rb = runner.encode()
+        assert len(rb) < 256, 'runner path too long'
+        stub = stub[:mark] + rb.ljust(256, b'\0') + stub[mark + 256:]
+        # entry: jmp rel32 to the stub at +0x60
+        text = text[:0x40] + b'\xe9' + struct.pack('<i', 0x60 - 0x45) + text[0x45:]
+        text = text[:0x60] + stub
+        assert len(text) <= PAGE, 'host stub too big'
     text = text.ljust(PAGE, b'\xf4')
 
     eh = b'\x7fELF' + bytes([1, 1, 1, 0]) + bytes(8)
@@ -91,8 +118,9 @@ def main():
     ph += struct.pack('<8I', 1, text_off + PAGE, code_va, code_va, PAGE, PAGE, 5, PAGE)
     # PT_LOAD RW: data (bss only)
     ph += struct.pack('<8I', 1, text_off + 2 * PAGE, data_va, data_va, 0, data_sz, 6, PAGE)
-    # PT_GNU_STACK RW
-    ph += struct.pack('<8I', 0x6474e551, 0, 0, 0, 0, 0, 6, 16)
+    if not stub:
+        # PT_GNU_STACK RW
+        ph += struct.pack('<8I', 0x6474e551, 0, 0, 0, 0, 0, 6, 16)
     out = (eh + ph).ljust(wasm_off, b'\0') + w
     out = out.ljust(text_off, b'\0') + text + b'\xf4' * PAGE
     open(dst, 'wb').write(out)
