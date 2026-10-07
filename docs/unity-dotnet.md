@@ -1232,6 +1232,27 @@ Not yet:
      timestamps (Unity's input queue orders events by time; position by
      polling would not care). Next: the X event `time` values against the
      guest's CLOCK_MONOTONIC as Unity reads it.
+  19b. **The dropped input was the monotonic clock (02b4f7f7, hk123-hk124):**
+     gex answered CLOCK_MONOTONIC with the wall clock (~1.8e12 ms). Xwayland
+     stamps events with `(CARD32)` monotonic milliseconds (the spy: event time
+     338241355 against Unity's monotonic 1791339769010), and Unity's input
+     layer compares event times with its own monotonic clock, so every key
+     and button was dropped while polled pointer positions worked. The
+     monotonic clocks now count from one boot instant per host process (the
+     first reading less 1000 s), and the absolute waits on them follow
+     (clock_nanosleep TIMER_ABSTIME, monotonic timerfd, FUTEX_LOCK_PI2,
+     FUTEX_WAIT_BITSET without FUTEX_CLOCK_REALTIME, which had been read as a
+     relative length capped at an hour). With it (hk124) the scripted Enter
+     opens Select Profile, the next one starts a new game and Hollow Knight
+     shows its first-run screen-scale page. The now-real futex deadlines
+     exposed a host race (check the deadline, then subtract a later
+     reading: "overflow when subtracting durations"), fixed in 4a4510fb.
+     GexProbe's legacy-Input log still shows no keys (Hollow Knight reads
+     input through InControl; the probe's view is not evidence either way).
+     Also checked: Unity's SDL keymap at init is complete (XDisplayKeycodes
+     8..255, XkbKeycodeToKeysym 9 -> Escape...), its window gets a normal
+     FocusIn, and it selects XI2 raw button/motion on the root and XI2
+     motion/touch on its window.
   20. **Head c3b6288a (master 132f73ed merged, 2026-10-06):** gexc rebuilt
      (`target/dbg-x86`); `scratch/unity/dnc` rebuilt from e61b5a4b (provider
      unchanged since; `lib-extra` holds the Formatters assembly). Legs, walk
