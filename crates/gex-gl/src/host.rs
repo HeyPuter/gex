@@ -464,6 +464,16 @@ pub struct Gl {
     pub presents: u64,
 }
 
+/// `GEX_GL_READBACK_EVERY=N`: read back (and hand on) only every Nth
+/// presented frame. A readback stalls the program's GL thread on the GPU
+/// each frame (NVIDIA spins in sched_yield); a measurement that keeps one
+/// frame in a thousand should not pay it on the others.
+fn readback_due(present: u64) -> bool {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let n = *EVERY.get_or_init(|| std::env::var("GEX_GL_READBACK_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1));
+    present % n == 1 % n
+}
+
 /// `GEX_GL_ERRORS=1` (diagnostic): `glGetError` after every command, and
 /// each opcode/error pair reported the first few times it happens. It takes
 /// the error a program would have read itself.
@@ -939,7 +949,7 @@ impl Gl {
                 op::PRESENT => {
                     self.presents += 1;
                     present_meter(self.presents);
-                    if self.keep_frames {
+                    if self.keep_frames && readback_due(self.presents) {
                         let (w, h) = (self.width, self.height);
                         let mut px = vec![0u8; (w * h * 4) as usize];
                         // The program's read framebuffer, pack buffer and
