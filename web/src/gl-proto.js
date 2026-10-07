@@ -195,6 +195,7 @@ export const op = {
     ALPHA_FUNC: 197,
     PUSH_ATTRIB: 198,
     POP_ATTRIB: 199,
+    CLIENT_ARRAY: 200,
 };
 
 export const MAGIC = 0x47584547;

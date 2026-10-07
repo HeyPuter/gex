@@ -1039,34 +1039,64 @@ fn pointer_op(name: &str) -> u32 {
     generated::POINTER_PLANS.binary_search_by(|e| e.0.cmp(name)).map(|i| generated::POINTER_PLANS[i].1).unwrap_or(0)
 }
 
-/// Send fixed array `i`'s pointer, as `offset` into the bound array buffer.
-fn send_array_pointer(c: &mut Call<'_>, i: usize, a: &Array, offset: u64) -> R<()> {
-    let [lo, hi] = proto::Batch::words64(offset);
+/// Fixed array `i`'s pointer command and its words before the pointer. A
+/// texture coordinate array's also needs its unit made the client active
+/// texture first ([`send_array_pointer`] does).
+fn array_pointer(i: usize, a: &Array) -> (u32, Vec<u32>) {
     let (size, ty, stride) = (a.size as u32, a.ty, a.stride as u32);
     match i {
-        VERTEX => cmd(c, op::VERTEX_POINTER, &[size, ty, stride, lo, hi], &[]),
-        COLOR => cmd(c, op::COLOR_POINTER, &[size, ty, stride, lo, hi], &[]),
-        NORMAL => cmd(c, pointer_op("glNormalPointer"), &[ty, stride, lo, hi], &[]),
-        SECONDARY => cmd(c, pointer_op("glSecondaryColorPointer"), &[size, ty, stride, lo, hi], &[]),
-        FOG => cmd(c, pointer_op("glFogCoordPointer"), &[ty, stride, lo, hi], &[]),
-        _ => {
-            cmd(c, op::CLIENT_ACTIVE_TEXTURE, &[0x84c0 + (i - TEXCOORD) as u32], &[])?;
-            cmd(c, op::TEX_COORD_POINTER, &[size, ty, stride, lo, hi], &[])
-        }
+        VERTEX => (op::VERTEX_POINTER, vec![size, ty, stride]),
+        COLOR => (op::COLOR_POINTER, vec![size, ty, stride]),
+        NORMAL => (pointer_op("glNormalPointer"), vec![ty, stride]),
+        SECONDARY => (pointer_op("glSecondaryColorPointer"), vec![size, ty, stride]),
+        FOG => (pointer_op("glFogCoordPointer"), vec![ty, stride]),
+        _ => (op::TEX_COORD_POINTER, vec![size, ty, stride]),
     }
+}
+
+/// Generic attribute `i`'s pointer command and its words before the pointer.
+fn attrib_pointer(i: usize, a: &Attrib) -> (u32, Vec<u32>) {
+    let (idx, size, ty, stride) = (i as u32, a.size as u32, a.ty, a.stride as u32);
+    match a.kind {
+        0 => (pointer_op("glVertexAttribPointer"), vec![idx, size, ty, a.normalized as u32, stride]),
+        1 => (pointer_op("glVertexAttribIPointer"), vec![idx, size, ty, stride]),
+        _ => (pointer_op("glVertexAttribLPointer"), vec![idx, size, ty, stride]),
+    }
+}
+
+/// Send fixed array `i`'s pointer, as `offset` into the bound array buffer.
+fn send_array_pointer(c: &mut Call<'_>, i: usize, a: &Array, offset: u64) -> R<()> {
+    let (opcode, mut words) = array_pointer(i, a);
+    if (TEXCOORD..ARRAYS).contains(&i) {
+        cmd(c, op::CLIENT_ACTIVE_TEXTURE, &[0x84c0 + (i - TEXCOORD) as u32], &[])?;
+    }
+    words.extend(proto::Batch::words64(offset));
+    cmd(c, opcode, &words, &[])
 }
 
 /// Send generic attribute `i`'s pointer, as `offset` into the bound array
 /// buffer.
 fn send_attrib_pointer(c: &mut Call<'_>, i: usize, a: &Attrib, offset: u64) -> R<()> {
-    let [lo, hi] = proto::Batch::words64(offset);
-    let (idx, size, ty, stride) = (i as u32, a.size as u32, a.ty, a.stride as u32);
-    match a.kind {
-        0 => cmd(c, pointer_op("glVertexAttribPointer"), &[idx, size, ty, a.normalized as u32, stride, lo, hi], &[]),
-        1 => cmd(c, pointer_op("glVertexAttribIPointer"), &[idx, size, ty, stride, lo, hi], &[]),
-        _ => cmd(c, pointer_op("glVertexAttribLPointer"), &[idx, size, ty, stride, lo, hi], &[]),
-    }
+    let (opcode, mut words) = attrib_pointer(i, a);
+    words.extend(proto::Batch::words64(offset));
+    cmd(c, opcode, &words, &[])
 }
+
+/// A client-memory array's bytes and its pointer command, as one
+/// `op::CLIENT_ARRAY`: the host keeps the bytes in slot `slot` and points GL
+/// at them. Replaces a scratch buffer of ours rewritten with glBufferData
+/// before every draw (`upload_scratch`), which a batched GL backend can only
+/// do as a staged copy that ends the render pass.
+fn send_client_array(c: &mut Call<'_>, slot: u32, opcode: u32, words: &[u32], data: &[u8]) -> R<()> {
+    let mut head = Vec::with_capacity(3 + words.len());
+    head.extend_from_slice(&[slot, opcode, words.len() as u32]);
+    head.extend_from_slice(words);
+    cmd_blob(c, op::CLIENT_ARRAY, &head, data)
+}
+
+/// Whether client arrays go as `op::CLIENT_ARRAY` (default) or through
+/// scratch buffers (`GEX_NT_GL_CLIENT_ARRAYS=buffer`, for A/B runs).
+pub static CLIENT_ARRAY_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Copy `bytes` of client memory at `pointer` into scratch buffer `*scratch`
 /// (made on first use), left bound to GL_ARRAY_BUFFER.
@@ -1093,6 +1123,7 @@ fn upload_arrays_instanced(c: &mut Call<'_>, vertices: usize, instances: usize) 
         (s.arrays, s.attribs, s.array_buffer)
     };
     const GL_ARRAY_BUFFER: u32 = 0x8892;
+    let by_op = CLIENT_ARRAY_OP.load(std::sync::atomic::Ordering::Relaxed);
     let mut rebound = false;
     for (i, a) in arrays.iter().enumerate() {
         if !a.enabled || a.buffer != 0 || a.pointer == 0 || vertices == 0 {
@@ -1104,9 +1135,17 @@ fn upload_arrays_instanced(c: &mut Call<'_>, vertices: usize, instances: usize) 
         }
         let stride = if a.stride > 0 { a.stride as usize } else { elem };
         let data = c.g.bytes(a.pointer, (vertices - 1) * stride + elem)?;
+        rebound = true;
+        if by_op {
+            if (TEXCOORD..ARRAYS).contains(&i) {
+                cmd(c, op::CLIENT_ACTIVE_TEXTURE, &[0x84c0 + (i - TEXCOORD) as u32], &[])?;
+            }
+            let (opcode, words) = array_pointer(i, a);
+            send_client_array(c, i as u32, opcode, &words, &data)?;
+            continue;
+        }
         let scratch = upload_scratch(c, a.scratch, GL_ARRAY_BUFFER, &data)?;
         c.p.gl.lock().unwrap().arrays[i].scratch = scratch;
-        rebound = true;
         send_array_pointer(c, i, a, 0)?;
     }
     for (i, a) in attribs.iter().enumerate() {
@@ -1120,9 +1159,14 @@ fn upload_arrays_instanced(c: &mut Call<'_>, vertices: usize, instances: usize) 
         let stride = if a.stride > 0 { a.stride as usize } else { elem };
         let count = if a.divisor == 0 { vertices } else { instances.div_ceil(a.divisor as usize).max(1) };
         let data = c.g.bytes(a.pointer, (count - 1) * stride + elem)?;
+        rebound = true;
+        if by_op {
+            let (opcode, words) = attrib_pointer(i, a);
+            send_client_array(c, 64 + i as u32, opcode, &words, &data)?;
+            continue;
+        }
         let scratch = upload_scratch(c, a.scratch, GL_ARRAY_BUFFER, &data)?;
         c.p.gl.lock().unwrap().attribs[i].scratch = scratch;
-        rebound = true;
         send_attrib_pointer(c, i, a, 0)?;
     }
     if rebound {
