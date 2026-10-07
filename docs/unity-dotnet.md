@@ -1381,3 +1381,25 @@ Not yet:
        2-10% each; 2.15 cores in all. No thread is saturated, so the menu
        frame is bound by waits between threads (the main thread waiting on
        the render thread or job fences), not by one thread's code speed.
+     - **Muck with the NVIDIA fix (mk-g1, cold, readback every 1800th):** the
+       menu renders fully (`scratch/unity/screens/muck-menu-edger.png`),
+       first present 228.2 s, "Initializing packets" 314.2 s, menu 42.7
+       presents/s (last quarter 44.4). Threads: main 73% of a core, one
+       worker (tid 44) 49%, 2.06 cores in all.
+     - **The main thread's top cost was mono_gc_get_used_size:** the
+       steady-state profile of hk-p1's main thread (perf-map names) put
+       49.9% of its samples in SGen's `major_get_used_size`, which walks every
+       object of the major heap with a full sweep; Unity asks every frame and
+       under gex every object is in the major heap. The provider now answers
+       from a cache refreshed after a collection or every 500 ms
+       (`GEXMONO_USED_SIZE_EXACT=1` for the old behaviour; b0cf74ae). Note:
+       the `[gex-prof]` share line classified those samples as fjit ("jit"),
+       so its provider share is not trustworthy; use the per-thread
+       profiles with names.
+     - **Gate legs added:** gex-gl test
+       `a_desktop_context_takes_framebuffer_names_it_never_generated` (fails
+       before 273b4635 on edger's NVIDIA, passes after; passes on gooner
+       either way); embed's liveness check (301 leaves, each once, batched;
+       also under `GEXMONO_LV_NOSHAPE=1`).
+     - **Pitfall:** a wait loop like `while kill -0 $(pgrep -f "PATTERN")`
+       matches its own command line; wait on a known PID.
