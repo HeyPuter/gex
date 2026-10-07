@@ -34,6 +34,10 @@ for d in mtd sound video xen misc rdma; do
   [ -d "/usr/include/$d" ] && { rm -rf "$PREFIX/sysroot/include/$d"; cp -r "/usr/include/$d" "$PREFIX/sysroot/include/"; }
 done
 
+# gexcc's wrapper headers (include/: setjmp.h), searched before the libc's
+rm -rf "$PREFIX/sysroot/include/gexcc"
+cp -r "$HERE/include" "$PREFIX/sysroot/include/gexcc"
+
 # the driver and its helpers
 L=$PREFIX/lib/gexcc
 cp "$HERE/gexcc" "$PREFIX/bin/gexcc"
@@ -49,7 +53,7 @@ rm -f "$L/hoststub.o" "$L/hoststub.elf"
 mkdir -p "$PREFIX/build/rt"
 . "$WW/flags.sh"
 clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$HERE/rt/main3.c" -o "$L/main3.o"
-for f in "$HERE"/rt/poll.c "$HERE"/rt/*.s; do
+for f in "$HERE"/rt/poll.c "$HERE"/rt/sigsetjmp.c "$HERE"/rt/*.s; do
   clang $WASM_CFLAGS --sysroot="$PREFIX/sysroot" -c "$f" -o "$PREFIX/build/rt/$(basename "$f").o"
 done
 rm -f "$PREFIX/sysroot/lib/libgexcc.a"
