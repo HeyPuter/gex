@@ -237,6 +237,11 @@ const GLOBALS: &[(&str, u32)] = &[
     // implemented it and decorates itself regardless -- the same thing it does
     // under KWin, so it is the right answer there too, not a gap here.
     ("zxdg_decoration_manager_v1", 1),
+    // Wine's Wayland driver will not start without it: every window gets a
+    // viewport, whose destination says the size the surface shows at.
+    // Recorded (`SurfaceState::viewport`), not yet scaled by: at scale 1 a
+    // destination is the buffer's own size.
+    ("wp_viewporter", 1),
 ];
 
 /// What an object id currently is.
@@ -263,6 +268,8 @@ enum Object {
     DataDeviceManager,
     Subcompositor,
     Subsurface { surface: u32 },
+    Viewporter,
+    Viewport { surface: u32 },
     DecorationManager,
     Decoration { surface: u32 },
     /// An object whose requests we accept and ignore (data devices/sources,
@@ -407,6 +414,9 @@ struct SurfaceState {
     pending_null: bool,
     /// Subsurfaces of this surface, in bottom-to-top order.
     children: Vec<u32>,
+    /// `wp_viewport.set_destination`: the size the surface is shown at, when
+    /// the client set one.
+    viewport: Option<(i32, i32)>,
 }
 
 /// Whether a surface's pixels are the host's. A free function because the
@@ -630,6 +640,8 @@ impl Client {
                     }
                 }
                 Object::Subcompositor => self.subcompositor(opcode, &mut r),
+                Object::Viewporter => self.viewporter(object, opcode, &mut r),
+                Object::Viewport { surface } => self.viewport(object, surface, opcode, &mut r),
                 // Data devices/sources and subsurfaces: none of their requests
                 // creates a child object, so just accept and ignore everything.
                 Object::Stub => true,
@@ -838,6 +850,9 @@ impl Client {
             }
             "wl_subcompositor" => {
                 self.objects.insert(id, Object::Subcompositor);
+            }
+            "wp_viewporter" => {
+                self.objects.insert(id, Object::Viewporter);
             }
             "zxdg_decoration_manager_v1" => {
                 self.objects.insert(id, Object::DecorationManager);
@@ -1678,6 +1693,51 @@ impl Client {
     }
 
     // -- wl_subcompositor / wl_subsurface -----------------------------------
+
+    /// `wp_viewporter`: destroy(0), get_viewport(1).
+    fn viewporter(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            0 => {
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            1 => {
+                let (Some(id), Some(surface)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                self.objects.insert(id, Object::Viewport { surface });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `wp_viewport`: destroy(0), set_source(1), set_destination(2). The
+    /// destination is recorded on the surface (-1, -1 unsets it).
+    fn viewport(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            0 => {
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.viewport = None;
+                }
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            1 => true,
+            2 => {
+                let (Some(w), Some(h)) = (r.int(), r.int()) else {
+                    return false;
+                };
+                if let Some(s) = self.surfaces.get_mut(&surface) {
+                    s.viewport = if w < 0 { None } else { Some((w, h)) };
+                }
+                true
+            }
+            _ => false,
+        }
+    }
 
     fn subcompositor(&mut self, opcode: u16, r: &mut Reader<'_>) -> bool {
         match opcode {
@@ -2919,6 +2979,24 @@ mod tests {
         assert_eq!(sub.role, Role::Subsurface);
         assert_eq!(sub.parent, 6);
         assert_eq!((sub.rel_x, sub.rel_y), (12, 7));
+    }
+
+    #[test]
+    fn a_viewport_records_its_destination() {
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(200, 100, 800);
+        // bind wp_viewporter (name 9), get_viewport for the window (6),
+        // set_destination, then destroy the viewport: Wine's driver does all
+        // three, and the connection must survive them.
+        c.receive(&Writer::new(2, 0).uint(9).string("wp_viewporter").uint(1).new_id(50).finish(), &[], &pool);
+        c.receive(&Writer::new(50, 1).new_id(51).object(6).finish(), &[], &pool);
+        c.receive(&Writer::new(51, 2).int(200).int(100).finish(), &[], &pool);
+        assert_eq!(c.surfaces.get(&6).and_then(|s| s.viewport), Some((200, 100)));
+        c.receive(&Writer::new(51, 2).int(-1).int(-1).finish(), &[], &pool);
+        assert_eq!(c.surfaces.get(&6).and_then(|s| s.viewport), None);
+        c.receive(&Writer::new(51, 0).finish(), &[], &pool);
+        assert!(!c.objects.contains_key(&51), "the viewport outlived its destroy");
+        assert!(c.scene().iter().any(|s| s.surface == 6), "the window went away");
     }
 
     #[test]
