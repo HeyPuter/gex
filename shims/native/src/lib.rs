@@ -2858,6 +2858,20 @@ impl gex_kernel::net::Transport for HostStream {
     fn close(&self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
+
+    fn shutdown(&self, how: u64) -> Result<(), gex_kernel::Errno> {
+        use std::net::Shutdown;
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else {
+            return Err(gex_kernel::Errno::ENOTCONN);
+        };
+        let h = match how {
+            0 => Shutdown::Read,
+            1 => Shutdown::Write,
+            _ => Shutdown::Both,
+        };
+        sock.shutdown(h).map_err(|e| gex_kernel::Errno::from_io(&e))
+    }
 }
 
 /// The host process's real user and group ids.

@@ -2639,7 +2639,10 @@ impl Kernel {
             // (the proxied network, the global kernel's) just agrees.
             nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
                 Ok(sock) => sock.shutdown_how(a[1]),
-                Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                Err(_) => match self.socket_of(a[0] as i32) {
+                    Ok(s) => s.shutdown(a[1]),
+                    Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                },
             },
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends

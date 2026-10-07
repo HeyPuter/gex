@@ -56,6 +56,19 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
         usize::from(self.has_data())
     }
     fn close(&self);
+    /// `shutdown(how)`: 0 reads, 1 writes, 2 both. A transport that cannot
+    /// half-close accepts it and does nothing.
+    fn shutdown(&self, how: u64) -> Result<(), Errno> {
+        let _ = how;
+        Ok(())
+    }
+    /// A write once `status` says Closed: `EPIPE`, unless the transport
+    /// knows better (only the reading side went away, as after the peer's
+    /// `shutdown(SHUT_WR)`).
+    fn send_closed(&self, data: &[u8]) -> Result<usize, Errno> {
+        let _ = data;
+        Err(Errno::EPIPE)
+    }
 }
 
 /// Where a host's connections come from.
@@ -173,8 +186,11 @@ struct LoopBuf {
     data: VecDeque<u8>,
     /// The writing end closed: once drained, the reader sees end of file.
     writer_gone: bool,
-    /// The reading end closed: a write is `EPIPE`.
+    /// The reading end closed: a write is `EPIPE` (after the first, which
+    /// Linux takes before the peer's reset arrives).
     reader_gone: bool,
+    /// A write after `reader_gone` was taken: the next is `EPIPE`.
+    reset: bool,
 }
 
 /// One end of a TCP connection between two guest sockets on this machine
@@ -211,6 +227,14 @@ impl Transport for LoopEnd {
     fn send(&self, data: &[u8]) -> Result<usize, Errno> {
         let mut tx = self.tx.lock().unwrap();
         if tx.reader_gone {
+            if !tx.reset {
+                tx.reset = true;
+                return Ok(data.len());
+            }
+            return Err(Errno::EPIPE);
+        }
+        if tx.writer_gone {
+            // this end shut down its writing
             return Err(Errno::EPIPE);
         }
         let n = data.len().min(LOOP_BUF_MAX.saturating_sub(tx.data.len()));
@@ -241,6 +265,17 @@ impl Transport for LoopEnd {
     fn close(&self) {
         self.tx.lock().unwrap().writer_gone = true;
         self.rx.lock().unwrap().reader_gone = true;
+    }
+    fn shutdown(&self, how: u64) -> Result<(), Errno> {
+        // SHUT_WR (or RDWR): the peer reads to end of file. SHUT_RD only
+        // changes this end's reads, which Linux does not tell the peer.
+        if how == 1 || how == 2 {
+            self.tx.lock().unwrap().writer_gone = true;
+        }
+        Ok(())
+    }
+    fn send_closed(&self, data: &[u8]) -> Result<usize, Errno> {
+        self.send(data)
     }
 }
 
@@ -664,6 +699,17 @@ impl Socket {
         Err(Errno::EINPROGRESS)
     }
 
+    /// `shutdown` on a connected stream.
+    pub fn shutdown(&self, how: u64) -> Result<u64, Errno> {
+        if how > 2 {
+            return Err(Errno::EINVAL);
+        }
+        match &*self.transport.lock().unwrap() {
+            Some(t) => t.shutdown(how).map(|_| 0),
+            None => Err(Errno::ENOTCONN),
+        }
+    }
+
     pub fn status(&self) -> Status {
         match &*self.transport.lock().unwrap() {
             Some(t) => t.status(),
@@ -833,7 +879,7 @@ impl FileHandle for Socket {
         };
         match t.status() {
             Status::Refused => Err(Errno::ECONNREFUSED),
-            Status::Closed => Err(Errno::EPIPE),
+            Status::Closed => t.send_closed(buf).map(|n| n as u64),
             // Still connecting: the bytes cannot go yet, and a caller that
             // waited for the connection would not be here.
             Status::Connecting => Err(Errno::EAGAIN),
