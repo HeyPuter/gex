@@ -7602,6 +7602,9 @@ fn exit_process(h: &mut Host, code: i32) -> i32 {
     // reader waits forever for an EOF nobody sends.
     h.kernel.fds = gex_kernel::file::FdTable::new();
     h.kernel.remote_sockets.clear();
+    // Internet sockets too: a listener (in the global kernel) is unbound and
+    // a connection closed when its last holder goes, as on Linux at exit.
+    h.kernel.sockets.clear();
     // And anything the table did not account for: a guest leaving by a trap
     // rather than `exit_group` never reaches the line above (see
     // `k_pipe_forget`).

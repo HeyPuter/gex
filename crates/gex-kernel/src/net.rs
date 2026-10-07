@@ -244,11 +244,82 @@ impl Transport for LoopEnd {
     }
 }
 
+/// One end of a TCP connection between guests in different processes of a
+/// page: a stream in the global kernel (`unix::Remote`), named by the port
+/// (`tcp_name`), each end an id there.
+pub struct RemoteEnd {
+    id: i32,
+    remote: crate::unix::Remote,
+}
+
+impl std::fmt::Debug for RemoteEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RemoteEnd({})", self.id)
+    }
+}
+
+impl Transport for RemoteEnd {
+    fn connect(&self, _host: &str, _port: u16) -> Result<(), Errno> {
+        Ok(())
+    }
+    fn status(&self) -> Status {
+        Status::Open
+    }
+    fn send(&self, data: &[u8]) -> Result<usize, Errno> {
+        match (self.remote.write)(self.id, data.as_ptr() as crate::PAddr, data.len() as u32) {
+            n if n >= 0 => Ok(n as usize),
+            n => Err(Errno(-n)),
+        }
+    }
+    fn recv(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        match (self.remote.read)(self.id, buf.as_mut_ptr() as crate::PAddr, buf.len() as u32) {
+            n if n >= 0 => Ok(n as usize),
+            n => Err(Errno(-n)),
+        }
+    }
+    fn has_data(&self) -> bool {
+        (self.remote.readable)(self.id) != 0
+    }
+    fn available(&self) -> usize {
+        (self.remote.available)(self.id).max(0) as usize
+    }
+    fn close(&self) {
+        (self.remote.close)(self.id);
+    }
+}
+
+/// The global kernel's name for a TCP port (abstract, so no file appears).
+fn tcp_name(port: u16) -> String {
+    format!("\0gex-tcp:{port}")
+}
+
+/// The global kernel's name for a UDP port. The global kernel has only
+/// streams, so datagrams between a page's processes travel framed over one
+/// stream per (sender, port): a 4-byte length and a 2-byte source port
+/// (little-endian), then the bytes.
+fn udp_name(port: u16) -> String {
+    format!("\0gex-udp:{port}")
+}
+
+/// A UDP socket's side of the global kernel (`Socket::udp_remote`).
+#[derive(Debug, Default)]
+struct UdpRemote {
+    /// The listener its port is bound as.
+    listener: Option<i32>,
+    /// Accepted streams from senders, each with the bytes read from it that
+    /// do not yet make a whole datagram.
+    inbound: Vec<(i32, Vec<u8>)>,
+    /// Streams to the ports this socket has sent to.
+    outbound: HashMap<u16, i32>,
+}
+
 /// The TCP ports guests on this machine listen on. Shared across `fork`, as
 /// the resolver is: a child connects to its parent's listener.
 #[derive(Debug, Default)]
 pub struct Ports {
     listeners: Mutex<HashMap<u16, std::sync::Weak<Socket>>>,
+    /// Bound UDP sockets, by port: where a datagram to the loopback goes.
+    udp: Mutex<HashMap<u16, std::sync::Weak<Socket>>>,
     next_ephemeral: AtomicU32,
 }
 
@@ -274,6 +345,20 @@ impl Ports {
 
     fn listener(&self, port: u16) -> Option<Arc<Socket>> {
         self.listeners.lock().unwrap().get(&port).and_then(|w| w.upgrade())
+    }
+
+    fn udp_at(&self, port: u16) -> Option<Arc<Socket>> {
+        self.udp.lock().unwrap().get(&port).and_then(|w| w.upgrade())
+    }
+
+    /// A UDP port nothing is bound to.
+    fn udp_ephemeral(&self) -> u16 {
+        loop {
+            let p = self.ephemeral();
+            if self.udp_at(p).is_none() {
+                return p;
+            }
+        }
     }
 }
 
@@ -301,8 +386,13 @@ pub struct Socket {
     transport: Mutex<Option<Arc<dyn Transport>>>,
     /// Where `connect` pointed, for `getpeername`.
     peer: Mutex<Option<(u32, u16)>>,
-    /// Datagrams waiting to be read. Only the resolver puts anything here.
-    dgrams: Mutex<VecDeque<Vec<u8>>>,
+    /// Datagrams waiting to be read, with where each came from: the
+    /// resolver's answers, and datagrams from guests on this machine.
+    dgrams: Mutex<VecDeque<(Vec<u8>, (u32, u16))>>,
+    /// Where the last datagram read came from, for `recvfrom`.
+    last_from: Mutex<Option<(u32, u16)>>,
+    /// This socket, for registering itself (a UDP port's table entry).
+    me: Mutex<std::sync::Weak<Socket>>,
     nonblocking: AtomicBool,
     /// The machine's listening ports.
     ports: Arc<Ports>,
@@ -312,10 +402,18 @@ pub struct Socket {
     /// A listener's connections waiting for `accept`: the far end of each,
     /// and the port it came from. `None` unless listening.
     backlog: Mutex<Option<VecDeque<(Arc<dyn Transport>, u16)>>>,
+    /// The global kernel, when there is one (a page: a Worker per process).
+    /// Listeners and loopback connections live there, so a guest in another
+    /// process can reach them.
+    remote: Option<crate::unix::Remote>,
+    /// A listener's id in the global kernel.
+    remote_listener: Mutex<Option<i32>>,
+    /// A UDP socket's streams in the global kernel.
+    udp_remote: Mutex<UdpRemote>,
 }
 
 impl Socket {
-    pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>, ports: Arc<Ports>) -> Socket {
+    pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>, ports: Arc<Ports>, remote: Option<crate::unix::Remote>) -> Socket {
         Socket {
             kind,
             net,
@@ -323,11 +421,64 @@ impl Socket {
             transport: Mutex::new(None),
             peer: Mutex::new(None),
             dgrams: Mutex::new(VecDeque::new()),
+            last_from: Mutex::new(None),
+            me: Mutex::new(std::sync::Weak::new()),
             nonblocking: AtomicBool::new(false),
             ports,
             local: Mutex::new(None),
             backlog: Mutex::new(None),
+            remote,
+            remote_listener: Mutex::new(None),
+            udp_remote: Mutex::new(UdpRemote::default()),
         }
+    }
+
+    /// Remember the `Arc` this socket lives in (made right after `new`).
+    pub fn set_self(self: &Arc<Self>) {
+        *self.me.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    /// Where the last datagram read came from.
+    pub fn last_from(&self) -> Option<(u32, u16)> {
+        *self.last_from.lock().unwrap()
+    }
+
+    /// Give this UDP socket a port (`bind`, or the first send unbound),
+    /// registered so guests here can send to it.
+    fn udp_take(&self, addr: u32, mut port: u16) -> Result<(), Errno> {
+        // In a page: the port is a name in the global kernel, where every
+        // process sees it.
+        if let Some(r) = self.remote {
+            let fixed = port != 0;
+            for _ in 0..1000 {
+                if !fixed {
+                    port = self.ports.udp_ephemeral();
+                }
+                let n = udp_name(port);
+                let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32);
+                if id >= 0 {
+                    self.udp_remote.lock().unwrap().listener = Some(id);
+                    *self.local.lock().unwrap() = Some((addr, port));
+                    return Ok(());
+                }
+                if fixed || -id != Errno::EADDRINUSE.0 {
+                    return Err(Errno(-id));
+                }
+            }
+            return Err(Errno::EADDRINUSE);
+        }
+        let mut udp = self.ports.udp.lock().unwrap();
+        if port == 0 {
+            drop(udp);
+            port = self.ports.udp_ephemeral();
+            udp = self.ports.udp.lock().unwrap();
+        }
+        if udp.get(&port).is_some_and(|w| w.strong_count() > 0) {
+            return Err(Errno::EADDRINUSE);
+        }
+        udp.insert(port, self.me.lock().unwrap().clone());
+        *self.local.lock().unwrap() = Some((addr, port));
+        Ok(())
     }
 
     /// `bind`: where this socket is. A port another listener holds is
@@ -337,11 +488,24 @@ impl Socket {
         if self.local.lock().unwrap().is_some() {
             return Err(Errno::EINVAL);
         }
-        if port != 0 && self.kind == Kind::Tcp && self.ports.listening(port) {
+        if self.kind == Kind::Udp {
+            return self.udp_take(addr, port);
+        }
+        // (In a page the global kernel answers at `listen`: its name table
+        // keeps a closed listener's name until the name is bound again.)
+        if port != 0 && self.kind == Kind::Tcp && self.remote.is_none() && self.ports.listening(port) {
             return Err(Errno::EADDRINUSE);
         }
         *self.local.lock().unwrap() = Some((addr, port));
         Ok(())
+    }
+
+    /// Whether a guest in any process of the page listens on `port`.
+    fn remote_taken(&self, port: u16) -> bool {
+        self.remote.is_some_and(|r| {
+            let n = tcp_name(port);
+            (r.exists)(n.as_ptr() as crate::PAddr, n.len() as u32) > 0
+        })
     }
 
     /// Where this end is, for `getsockname`: 0.0.0.0:0 when unbound.
@@ -360,6 +524,25 @@ impl Socket {
             return Ok(());
         }
         let (addr, mut port) = self.local();
+        if let Some(r) = self.remote {
+            // In the global kernel: bound and listening in one, as a unix
+            // socket there is.
+            if port == 0 {
+                port = self.ports.ephemeral();
+                while self.remote_taken(port) {
+                    port = self.ports.ephemeral();
+                }
+            }
+            let n = tcp_name(port);
+            let id = (r.bind)(n.as_ptr() as crate::PAddr, n.len() as u32);
+            if id < 0 {
+                return Err(if -id == Errno::EADDRINUSE.0 || -id == 98 { Errno::EADDRINUSE } else { Errno(-id) });
+            }
+            *self.remote_listener.lock().unwrap() = Some(id);
+            *self.local.lock().unwrap() = Some((addr, port));
+            *backlog = Some(VecDeque::new());
+            return Ok(());
+        }
         let mut listeners = self.ports.listeners.lock().unwrap();
         if port == 0 {
             drop(listeners);
@@ -382,15 +565,25 @@ impl Socket {
     /// `accept`: the next waiting connection as a socket of its own, or
     /// `EAGAIN`; `EINVAL` when not listening.
     pub fn accept(&self) -> Result<Arc<Socket>, Errno> {
-        let (t, from) = match &mut *self.backlog.lock().unwrap() {
-            Some(q) => q.pop_front().ok_or(Errno::EAGAIN)?,
-            None => return Err(Errno::EINVAL),
+        let remote_listener = *self.remote_listener.lock().unwrap();
+        let (t, from): (Arc<dyn Transport>, u16) = match (remote_listener, self.remote) {
+            (Some(id), Some(r)) => match (r.accept)(id) {
+                // The far end's port is the other process's to know.
+                n if n >= 0 => (Arc::new(RemoteEnd { id: n, remote: r }), 0),
+                n => return Err(Errno(-n)),
+            },
+            _ => match &mut *self.backlog.lock().unwrap() {
+                Some(q) => q.pop_front().ok_or(Errno::EAGAIN)?,
+                None => return Err(Errno::EINVAL),
+            },
         };
-        let s = Socket::new(Kind::Tcp, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports));
+        let s = Socket::new(Kind::Tcp, Arc::clone(&self.net), Arc::clone(&self.resolver), Arc::clone(&self.ports), self.remote);
         *s.transport.lock().unwrap() = Some(t);
         *s.peer.lock().unwrap() = Some((0x7f00_0001, from));
         *s.local.lock().unwrap() = Some((0x7f00_0001, self.local().1));
-        Ok(Arc::new(s))
+        let s = Arc::new(s);
+        s.set_self();
+        Ok(s)
     }
 
     /// A connection to a port a guest on this machine listens on: both ends
@@ -439,7 +632,16 @@ impl Socket {
         // involved. (One nothing here listens on still goes out: the host
         // may have a service on its own loopback.)
         if self.kind == Kind::Tcp && is_local(addr) {
-            if let Some(listener) = self.ports.listener(port) {
+            if let Some(r) = self.remote {
+                let n = tcp_name(port);
+                let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32);
+                if id >= 0 {
+                    *self.peer.lock().unwrap() = Some((0x7f00_0001, port));
+                    *self.local.lock().unwrap() = Some((0x7f00_0001, self.ports.ephemeral()));
+                    *self.transport.lock().unwrap() = Some(Arc::new(RemoteEnd { id, remote: r }));
+                    return Ok(());
+                }
+            } else if let Some(listener) = self.ports.listener(port) {
                 return self.connect_local(&listener, port);
             }
         }
@@ -469,11 +671,52 @@ impl Socket {
         }
     }
 
-    /// A datagram to the resolver: answer it and queue the reply.
+    /// A datagram: to a guest on this machine bound to the port it is for,
+    /// else to the resolver, which answers it and queues the reply.
     pub fn send_dgram(&self, data: &[u8]) -> SysResult {
+        let to = self.peer();
+        if let (Some((_, port)), Some(r)) = (to.filter(|&(a, _)| is_local(a)), self.remote) {
+            if self.local.lock().unwrap().is_none() {
+                self.udp_take(0, 0)?;
+            }
+            if let Some(id) = self.udp_stream_to(r, port) {
+                let mut frame = Vec::with_capacity(6 + data.len());
+                frame.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&self.local().1.to_le_bytes());
+                frame.extend_from_slice(data);
+                let mut at = 0;
+                // A stream's buffer is far larger than a datagram; a full one
+                // (a receiver that stopped reading) drops it, as UDP may.
+                for _ in 0..64 {
+                    match (r.write)(id, frame[at..].as_ptr() as crate::PAddr, (frame.len() - at) as u32) {
+                        n if n > 0 => at += n as usize,
+                        _ => {}
+                    }
+                    if at == frame.len() {
+                        break;
+                    }
+                }
+                return Ok(data.len() as u64);
+            }
+            // Nothing bound there in any process: lost, as UDP is.
+            if answer_dns(data, &self.resolver).is_none() {
+                return Ok(data.len() as u64);
+            }
+        }
+        if let Some((addr, port)) = to.filter(|&(a, _)| is_local(a)) {
+            if let Some(dest) = self.ports.udp_at(port) {
+                if self.local.lock().unwrap().is_none() {
+                    self.udp_take(0, 0)?;
+                }
+                let from = (0x7f00_0001, self.local().1);
+                let _ = addr;
+                dest.dgrams.lock().unwrap().push_back((data.to_vec(), from));
+                return Ok(data.len() as u64);
+            }
+        }
         match answer_dns(data, &self.resolver) {
             Some(reply) => {
-                self.dgrams.lock().unwrap().push_back(reply);
+                self.dgrams.lock().unwrap().push_back((reply, to.unwrap_or((0, 0))));
                 Ok(data.len() as u64)
             }
             // Not a question this can answer. Accepting it and never
@@ -483,11 +726,71 @@ impl Socket {
         }
     }
 
+    /// The stream to UDP port `port` in the global kernel, opened once.
+    fn udp_stream_to(&self, r: crate::unix::Remote, port: u16) -> Option<i32> {
+        let mut u = self.udp_remote.lock().unwrap();
+        if let Some(&id) = u.outbound.get(&port) {
+            return Some(id);
+        }
+        let n = udp_name(port);
+        let id = (r.connect)(n.as_ptr() as crate::PAddr, n.len() as u32);
+        (id >= 0).then(|| {
+            u.outbound.insert(port, id);
+            id
+        })
+    }
+
+    /// Take what senders in other processes wrote: accept new streams, read
+    /// each, and queue every whole datagram.
+    fn udp_pump(&self) {
+        let Some(r) = self.remote else { return };
+        let mut u = self.udp_remote.lock().unwrap();
+        let Some(l) = u.listener else { return };
+        while (r.pending)(l) != 0 {
+            let id = (r.accept)(l);
+            if id < 0 {
+                break;
+            }
+            u.inbound.push((id, Vec::new()));
+        }
+        let mut q = self.dgrams.lock().unwrap();
+        let mut chunk = [0u8; 4096];
+        let mut gone = Vec::new();
+        for (id, buf) in u.inbound.iter_mut() {
+            while (r.readable)(*id) != 0 {
+                let n = (r.read)(*id, chunk.as_mut_ptr() as crate::PAddr, chunk.len() as u32);
+                if n == 0 {
+                    // The sender closed (its socket or its process went).
+                    gone.push(*id);
+                }
+                if n <= 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n as usize]);
+            }
+            while buf.len() >= 6 {
+                let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if buf.len() < 6 + len {
+                    break;
+                }
+                let from = u16::from_le_bytes([buf[4], buf[5]]);
+                q.push_back((buf[6..6 + len].to_vec(), (0x7f00_0001, from)));
+                buf.drain(..6 + len);
+            }
+        }
+        for id in gone {
+            (r.close)(id);
+            u.inbound.retain(|(i, _)| *i != id);
+        }
+    }
+
     pub fn recv_dgram(&self, buf: &mut [u8]) -> SysResult {
+        self.udp_pump();
         match self.dgrams.lock().unwrap().pop_front() {
-            Some(d) => {
+            Some((d, from)) => {
                 let n = buf.len().min(d.len());
                 buf[..n].copy_from_slice(&d[..n]);
+                *self.last_from.lock().unwrap() = Some(from);
                 Ok(n as u64)
             }
             None => Err(Errno::EAGAIN),
@@ -559,12 +862,13 @@ impl FileHandle for Socket {
     /// to size its buffer.
     fn available(&self) -> Option<u64> {
         if self.kind == Kind::Udp {
+            self.udp_pump();
             return Some(
                 self.dgrams
                     .lock()
                     .unwrap()
                     .front()
-                    .map_or(0, |d| d.len() as u64),
+                    .map_or(0, |d| d.0.len() as u64),
             );
         }
         Some(
@@ -578,9 +882,13 @@ impl FileHandle for Socket {
 
     fn poll_readable(&self) -> bool {
         if self.kind == Kind::Udp {
+            self.udp_pump();
             return !self.dgrams.lock().unwrap().is_empty();
         }
         // A listener is readable when a connection waits.
+        if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
+            return (r.pending)(id) != 0;
+        }
         if let Some(q) = &*self.backlog.lock().unwrap() {
             return !q.is_empty();
         }
@@ -613,6 +921,26 @@ impl Drop for Socket {
     fn drop(&mut self) {
         if let Some(t) = self.transport.lock().unwrap().take() {
             t.close();
+        }
+        if let (Some(id), Some(r)) = (self.remote_listener.lock().unwrap().take(), self.remote) {
+            (r.close)(id);
+        }
+        // A UDP socket's streams in the global kernel close (its name goes
+        // with the listener).
+        if let Some(r) = self.remote {
+            let u = std::mem::take(&mut *self.udp_remote.lock().unwrap());
+            for id in u.listener.into_iter().chain(u.inbound.into_iter().map(|(i, _)| i)).chain(u.outbound.into_values()) {
+                (r.close)(id);
+            }
+        }
+        // A UDP socket gives its port back.
+        if self.kind == Kind::Udp {
+            if let Some((_, port)) = *self.local.lock().unwrap() {
+                let mut udp = self.ports.udp.lock().unwrap();
+                if udp.get(&port).is_some_and(|w| w.strong_count() == 0) {
+                    udp.remove(&port);
+                }
+            }
         }
         // A listener gives its port back, and the connections nobody
         // accepted see their peer gone.

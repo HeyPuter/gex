@@ -473,6 +473,12 @@ impl SocketNames {
         self.bound.lock().unwrap().retain(|(p, _)| p != path);
     }
 
+    /// Unbind `path` if it is `sock`'s (a socket closing gives up an abstract
+    /// name, not one something else bound since).
+    pub fn unbind_socket(&self, path: &str, sock: &Arc<UnixSocket>) {
+        self.bound.lock().unwrap().retain(|(p, s)| !(p == path && Arc::ptr_eq(s, sock)));
+    }
+
     /// Connect `client` to whatever is listening on `path`.
     pub fn connect(&self, client: &UnixSocket, path: &str) -> SysResult {
         if let Some(listener) = self
@@ -1069,7 +1075,7 @@ mod epoll_tests {
 /// own memory) per process, the two ends of a socket sit in two memories where
 /// the `Arc<Pipe>` above means nothing, so the socket lives in the shared
 /// kernel and each end is just an id; only the id and the bytes cross.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Remote {
     /// Bind and listen in one. Returns a listener id or a negated errno.
     pub bind: extern "C" fn(path: crate::PAddr, path_len: u32) -> i32,

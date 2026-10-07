@@ -429,6 +429,70 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
         };
         Ok(())
     })()) })?;
+    // Wine's system-call dispatcher on its Unix side (W3.1): ntdll.so
+    // registers it (op 0), and the PE side's gexrt asks for it (op 1; 0
+    // while there is none, and the NT layer takes the call).
+    linker.func_wrap(IMPORT_MODULE, "unix_dispatcher", |caller: Caller<'_, HostState>, op: i32, idx: i32| -> i32 {
+        crate::unix_dispatcher(caller.data(), op, idx as u32) as i32
+    })?;
+    // Wine's ntdll.so mapped a PE image (W3.1): a native DLL's skeleton gets
+    // Wine's PE module bound at its exports, as the NT layer's image map
+    // does (`wasmdll`). The image is named by the descriptor it was mapped
+    // from.
+    linker.func_wrap(IMPORT_MODULE, "image_mapped", |mut caller: Caller<'_, HostState>, base: i32, fd: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
+        let base = base as u32 as u64;
+        let Some(path) = caller.data_mut().with_kernel(|k| k.fds.get(fd).ok().map(|f| f.path.clone())) else { return Ok(()) };
+        let Some(bytes) = caller.data_mut().with_kernel(|k| k.read_file(&path)) else { return Ok(()) };
+        let Ok(pe) = gex_ld::pe::parse(&bytes) else { return Ok(()) };
+        let (shared, engine) = {
+            let Some(jit) = caller.data().jit.as_ref() else { return Ok(()) };
+            (Arc::clone(&jit.shared), jit.engine.clone())
+        };
+        let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        if let Some(n) = crate::wasmdll::install(&pe, &path, base, caller.data_mut(), &shared, &engine, &memory)? {
+            if std::env::var_os("GEX_W3_TRACE").is_some() {
+                eprintln!("gex-w3: native module for {path} at {base:#x}: {n} entries");
+            }
+            crate::ftab::catch_up(&mut caller)?;
+            crate::wasmdll::apply_pending(&shared, &memory);
+        }
+        Ok(())
+    })()) })?;
+    // Code in `[addr, addr + len)` changed (W3: Wine's
+    // NtFlushInstructionCache): its translations are retired.
+    linker.func_wrap(IMPORT_MODULE, "code_changed", |mut caller: Caller<'_, HostState>, addr: i32, len: i32| {
+        let (addr, len) = (addr as u32 as u64, len as u32 as u64);
+        caller.data_mut().with_kernel(|k| {
+            let (start, end) = (addr & !0xfff, (addr + len + 0xfff) & !0xfff);
+            if end > start {
+                k.retired_code.push((start, end));
+            }
+        });
+        gex_kernel::note_code_change();
+    })?;
+    // The function-table index of a named function of Wine's PE module
+    // (W3.3: win32u.so starts explorer's desktop thread by
+    // `explorer.exe!gexp_desktop_thread`); 0 when there is none.
+    linker.func_wrap(IMPORT_MODULE, "wine_pe_slot", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+        let Some(m) = caller.data().memory.as_ref() else { return 0 };
+        let Some(b) = m.bytes().get(ptr as u32 as usize..(ptr as u32 as usize).saturating_add(len as u32 as usize)) else { return 0 };
+        let name = String::from_utf8_lossy(b).into_owned();
+        let Some(jit) = caller.data().jit.as_ref() else { return 0 };
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(wp) = sh.wine_pe.as_ref() else { return 0 };
+        match wp.slots.get(&name) {
+            Some(&k) => (sh.ftab.map.install(wp.install).base + k) as i32,
+            None => 0,
+        }
+    })?;
+    // A native wasm32 program's signal hook (W3.1, `crate::SIGNAL_HOOKS`).
+    linker.func_wrap(IMPORT_MODULE, "signal_hook", |caller: Caller<'_, HostState>, idx: i32| {
+        crate::set_signal_hook(caller.data(), idx as u32);
+    })?;
+    // A native wasm32 program's guest fault hook (W3.1, `crate::FAULT_HOOKS`).
+    linker.func_wrap(IMPORT_MODULE, "fault_hook", |caller: Caller<'_, HostState>, idx: i32| {
+        crate::set_fault_hook(caller.data(), idx as u32);
+    })?;
     // Diagnostics: text a provider writes to its stderr.
     linker.func_wrap(IMPORT_MODULE, "provider_log", |caller: Caller<'_, HostState>, ptr: i32, len: i32| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
         if let Some(m) = caller.data().memory.as_ref() {

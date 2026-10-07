@@ -25,9 +25,15 @@ winebuild=${WINEBUILD:-$(grep -m1 -o '[^ ]*/tools/winebuild/winebuild' "$build/M
 
 rm -rf "$out"
 mkdir -p "$out"
-# symbolic links: the prefix may be on another file system
+# symbolic links: the prefix may be on another file system. Only for the
+# large, read-only parts (the DLLs and programs, fonts, NLS tables): every
+# other file is copied, so a run that writes one (the registry, win.ini,
+# INetCookies/index.dat) writes this prefix's copy, never the staged
+# prefix every other prefix links to.
 cp -rs "$x86/." "$out/"
 rm -f "$out/gex-layout"
+find "$out" -type l ! -iregex '.*\.\(dll\|exe\|drv\|sys\|ocx\|acm\|cpl\|ax\|tlb\|nls\|ttf\|ttc\|fon\|mui\|so\|wasm\|dll16\|exe16\|drv16\|vxd\)' -print0 |
+    while IFS= read -r -d '' f; do cp --remove-destination "$(readlink -f "$f")" "$f"; done
 sys=$out/drive_c/windows/syswow64
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/stage-native.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
@@ -37,11 +43,17 @@ cp "$tmp/winepe.wasm" "$sys/winepe.wasm"
 for dll in "$@"; do
     name=${dll%.*}
     dir=$build/dlls/$name
+    [ -d "$dir" ] || dir=$build/dlls/$dll  # (winewayland.drv's directory keeps the extension)
     [ -d "$dir" ] || dir=$build/programs/$name
     spec=$src/${dir#$build/}/$name.spec
     rm -f "$sys/$dll"
+    # a program has no .spec: an exe skeleton, its entry point the module's
+    # (a DLL with no .spec, a driver like winewayland.drv, exports nothing:
+    # an empty one, so its skeleton is still a DLL with DllMain as entry)
+    if [ ! -f "$spec" ] && [ "${dir#$build/dlls/}" != "$dir" ]; then spec=$tmp/$name.spec; : > "$spec"; fi
+    if [ -f "$spec" ]; then kind=(--dll -E "$spec"); else kind=(--exe); fi
     # shellcheck disable=SC2046
-    "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" --dll --fake-module \
-        --wasm-shared winepe.wasm -E "$spec" -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
+    "$winebuild" -w -b wasm32-unknown-linux-musl --cc-cmd="$here/wcc" "${kind[@]}" --fake-module \
+        --wasm-shared winepe.wasm -F "$dll" -o "$sys/$dll" $(ls "$dir"/*.res 2>/dev/null)
 done
 echo "$out: ${*} native ($(du -h "$sys/winepe.wasm" | cut -f1) module)"

@@ -172,6 +172,11 @@ pub mod raw {
     pub const SETUID: u64 = 213;
     pub const SETGID: u64 = 214;
     pub const MADVISE: u64 = 219;
+    pub const MLOCK: u64 = 150;
+    pub const UNSHARE: u64 = 310;
+    pub const MUNLOCK: u64 = 151;
+    pub const MLOCKALL: u64 = 152;
+    pub const MUNLOCKALL: u64 = 153;
     pub const GETDENTS64: u64 = 220;
     pub const FCNTL64: u64 = 221;
     pub const GETTID: u64 = 224;
@@ -824,6 +829,8 @@ pub fn translate(
         x::PRCTL => nr::PRCTL,
         x::ARCH_PRCTL => nr::ARCH_PRCTL,
         x::PERSONALITY => nr::NOOP_OK,
+        // Advisory, as for x86-64: memory is never paged out.
+        x::MLOCK | x::MUNLOCK | x::MLOCKALL | x::MUNLOCKALL => nr::NOOP_OK,
         x::UNAME => nr::UNAME,
         x::SYSINFO => nr::SYSINFO,
         x::GETRANDOM => nr::GETRANDOM,
@@ -881,6 +888,7 @@ pub fn translate(
         }
         x::SET_TID_ADDRESS => nr::SET_TID_ADDRESS,
         x::SET_ROBUST_LIST => nr::SET_ROBUST_LIST,
+        x::UNSHARE => nr::UNSHARE,
         x::GET_ROBUST_LIST => nr::GET_ROBUST_LIST,
         x::RSEQ => nr::RSEQ,
         x::MEMBARRIER => nr::MEMBARRIER,

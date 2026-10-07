@@ -2639,6 +2639,16 @@ unsigned eglGetConfigAttrib(void *dpy, void *config, int attr, int *value) {
         break;
     case 0x3040: /* EGL_RENDERABLE_TYPE */ *value = 0x0048; break; /* OpenGL | ES3 */
     case 0x3028: /* EGL_CONFIG_ID */ *value = 1; break;
+    /* The whole pixel, and the attributes whose zero is not "none": Wine's
+       win32u builds its pixel formats from these, and took a 0 buffer size
+       for a format no context could be made for (wglMakeCurrent(0, 0)
+       failed for want of its internal context) and a 0 transparency for an
+       unknown type. */
+    case 0x3020: /* EGL_BUFFER_SIZE */ *value = 32; break;
+    case 0x3034: /* EGL_TRANSPARENT_TYPE */ *value = 0x3038; break; /* EGL_NONE */
+    case 0x303F: /* EGL_COLOR_BUFFER_TYPE */ *value = 0x308E; break; /* EGL_RGB_BUFFER */
+    case 0x3042: /* EGL_CONFORMANT */ *value = 0x0048; break;
+    case 0x3027: /* EGL_CONFIG_CAVEAT */ *value = 0x3038; break; /* EGL_NONE */
     default: *value = 0; break;
     }
     return EGL_TRUE;
@@ -2866,7 +2876,11 @@ static void gexgl_wl_commit(struct gexgl_egl_surface *s) {
     if (!s || !s->wl_proxy) return;
     void *wayland = dlopen("libwayland-client.so.0", RTLD_LAZY | RTLD_NOLOAD);
     if (!wayland) return;
-    void (*marshal)(void *, unsigned) = dlsym(wayland, "wl_proxy_marshal");
+    /* Both are variadic, and called as such: a call through a fixed-argument
+       type works on native ABIs only by luck, and on wasm32 (Wine's
+       winewayland, W3) it is a type mismatch, since a variadic function
+       takes its extra arguments as one pointer. */
+    void (*marshal)(void *, unsigned, ...) = dlsym(wayland, "wl_proxy_marshal");
     if (!marshal) return;
 
     /* A frame callback, asked for before the commit that carries it.
@@ -2880,7 +2894,7 @@ static void gexgl_wl_commit(struct gexgl_egl_surface *s) {
      *
      * The previous one is destroyed rather than left: this happens every
      * frame, and a proxy per frame is a leak per frame. */
-    void *(*marshal_ctor)(void *, unsigned, const void *, void *) =
+    void *(*marshal_ctor)(void *, unsigned, const void *, ...) =
         dlsym(wayland, "wl_proxy_marshal_constructor");
     const void *callback_interface = dlsym(wayland, "wl_callback_interface");
     void (*proxy_destroy)(void *) = dlsym(wayland, "wl_proxy_destroy");
@@ -3259,7 +3273,18 @@ const char *eglQueryString(void *dpy, int name) {
     /* EGL requires "<major>.<minor> <vendor-specific>", and applications do
        parse the number off the front. */
     case 0x3054: return "1.5 gex";   /* EGL_VERSION */
-    case 0x3055: return "";          /* EGL_EXTENSIONS */
+    /* EGL_EXTENSIONS: of EGL_NO_DISPLAY, the client extensions; of a
+       display, its own. Each one claimed is true here: platform displays
+       and eglGetProcAddress for every entry point (core ones included) are
+       this file's; eglCreateContext takes the version and profile
+       attributes, ignores the no-error one, and needs no config (there is
+       one). Wine's win32u requires exactly these before it uses EGL. */
+    case 0x3055:
+        return dpy ? "EGL_KHR_create_context EGL_KHR_create_context_no_error "
+                     "EGL_KHR_no_config_context"
+                   : "EGL_EXT_client_extensions EGL_EXT_platform_base "
+                     "EGL_KHR_client_get_all_proc_addresses "
+                     "EGL_EXT_platform_wayland EGL_KHR_platform_wayland";
     case 0x308D: return "OpenGL OpenGL_ES"; /* EGL_CLIENT_APIS */
     default: return "";
     }

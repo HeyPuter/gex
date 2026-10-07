@@ -718,7 +718,9 @@ fn run_program_with(
     // alone: it is an i386 ELF (and its kernel speaks the i386 ABI, below),
     // but an x86-64 shell that runs it goes on translating its own code
     // after the wait.
-    if !wasmprog::is_wasm32(program) {
+    // ...unless it hosts i386 code itself (Wine's loader, W3: the header's
+    // FLAG_GUEST_I386), which is then the process's to translate.
+    if !wasmprog::is_wasm32(program) || wasmprog::flags(program) & wasmprog::FLAG_GUEST_I386 != 0 {
         gex_xlate::set_compat(program.compat());
         lockstep::set_compat(program.compat());
         gex_kernel::set_compat32(program.compat() && gex_abi::X86);
@@ -1162,6 +1164,20 @@ fn run_program_with(
     // runs at the entry. After the directory above, which its bridges
     // overwrite.
     if nt_setup.is_none() {
+        if wasmprog::flags(program) & wasmprog::FLAG_GUEST_I386 != 0 {
+            store.data_mut().with_kernel(|k| k.mem.set_mmap_top(0x7ffe_0000));
+            // The NT layer's trampoline page, which native Wine's gexrt
+            // sends the guest to (jmp eax after NATIVE_LEFT, the vtable
+            // wrappers): the same bytes at the same address.
+            use gex_kernel::nt::{TRAMPOLINES, TRAMPOLINES_END};
+            let page = gex_kernel::nt::boot::trampoline_page();
+            if let Some(dst) = memory.bytes().get_mut(TRAMPOLINES as usize..TRAMPOLINES_END as usize) {
+                dst.copy_from_slice(&page);
+            }
+            store.data_mut().with_kernel(|k| {
+                k.mem.insert(TRAMPOLINES, TRAMPOLINES_END, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::EXEC, "[nt-trampolines]")
+            });
+        }
         wasmprog::install(&mut store, &memory, program)?;
     }
 
@@ -1244,6 +1260,11 @@ fn run_program_with(
     let Stopped::Exited(exit) = stopped else {
         unreachable!()
     };
+    // The first thread ended with `exit` while others run: the process goes
+    // on, as on Linux, until one of them ends it.
+    if store.data().thread_only {
+        wait_for_process_end(&spawn);
+    }
     // Another thread may have ended the process (this one then only saw
     // `stopping`).
     let exit = spawn.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit);
@@ -2083,6 +2104,9 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
     profile::harvest(&mut store)?;
     match stopped {
         Stopped::Exited(exit) => {
+            if store.data().thread_only {
+                wait_for_process_end(&cx);
+            }
             stop_other_threads(&cx, false);
             Ok(cx.ended.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or(exit))
         }
@@ -2270,6 +2294,14 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
         Stopped::Exited(_) if cx.stopping.load(std::sync::atomic::Ordering::Acquire) => Ok(None),
         Stopped::Exited(_) if store.data().thread_only => Ok(None),
         Stopped::Exited(exit) => Ok(Some(exit)),
+    }
+}
+
+/// Wait, after the first thread's `exit` (a thread exit, others running),
+/// until another thread ends the process.
+fn wait_for_process_end(cx: &SpawnContext) {
+    while !cx.stopping.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -2977,6 +3009,36 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 check_i386_high(&caller, "an NT syscall");
                 return r;
             }
+            // A Unix call from guest code under Wine's own Unix side (W3).
+            if pc as u64 & nt::NATIVE_SYSCALL == 0 {
+                if let Some(memory) = caller.data().memory.clone() {
+                    let ctx_addr = caller.data().thread.ctx_addr;
+                    if read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32 == gex_kernel::nt::gex_nr::UNIX_CALL
+                        && guest_unix_call(&mut caller)?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            // gexrt's NATIVE_LEFT under Wine's own Unix side (W3), which
+            // has no NT layer to take it: as `nt::syscall_import` does, the
+            // innermost native call-out the guest has left is abandoned.
+            if pc as u64 & nt::NATIVE_SYSCALL != 0 {
+                if let Some(memory) = caller.data().memory.clone() {
+                    let ctx_addr = caller.data().thread.ctx_addr;
+                    let nr = read_u64(memory.bytes(), (ctx_addr + ctx::x(0) as u64) as usize) as u32;
+                    if nr == gex_kernel::nt::gex_nr::NATIVE_LEFT {
+                        let target = read_u64(memory.bytes(), (ctx_addr + ctx::BALLAST as u64) as usize);
+                        let sp = read_u64(memory.bytes(), (ctx_addr + ctx::x(4) as u64) as usize) & 0xffff_ffff;
+                        if innermost_native_unwound(&caller, sp) {
+                            let _ = GuestMem::new(memory.bytes()).write_u64(ctx_addr + ctx::x(0) as u64, target);
+                            caller.data_mut().callout_signal = Some(CalloutSignal::Abort);
+                            return Err(StopExecution.into());
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             // An ejected project's runtime allows only the recorded calls.
             if let Some(stop) = aot::check_syscall(&mut caller, pc as u64) {
                 return stop;
@@ -3319,6 +3381,25 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     if caller.data().nt.is_some() {
                         return nt::fault(&mut caller, nt::Fault::NotExecutable, pc).map(|_| 0);
                     }
+                    // The process's own fault hook (Wine's ntdll.so, W3):
+                    // an access violation, executing (DEP).
+                    if std::env::var_os("GEX_W3_TRACE").is_some() {
+                        if let Some(memory) = caller.data().memory.clone() {
+                            let gm = GuestMem::new(memory.bytes());
+                            let base = caller.data().thread.ctx_addr;
+                            let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
+                            let esp = gm.read_u64(base + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff;
+                            let st: Vec<String> = (0..6).map(|i| format!("{:#x}", gm.read_u32(esp + 4 * i).unwrap_or(0))).collect();
+                            eprintln!("gex-w3: execute at {pc:#x} from block {src:#x}, esp {esp:#x} [{}]", st.join(" "));
+                            let bt = wasmtime::WasmBacktrace::force_capture(&caller);
+                            for fr in bt.frames().iter().take(24) {
+                                eprintln!("gex-w3:   {}", fr.func_name().unwrap_or("?"));
+                            }
+                        }
+                    }
+                    if deliver_guest_fault_kind(&mut caller, fault_code::ACCESS_VIOLATION, pc, pc, 8)? {
+                        return Err(StopExecution.into());
+                    }
                     // Code an ejected project was built without: say so,
                     // rather than let it read as the guest's own crash.
                     if let Some(detail) = aot::unseen_code(&mut caller, pc) {
@@ -3400,6 +3481,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             }
             let pc = pc as u64;
             let raw = raw as u32;
+            if deliver_guest_fault(&mut caller, fault_code::ILLEGAL_INSTRUCTION, pc, pc)? {
+                return Err(StopExecution.into());
+            }
             let memory = caller
                 .data()
                 .memory
@@ -3522,6 +3606,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // FPE_INTDIV at the dividing instruction.
             if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO || imm == gex_abi::imports::BRK_DIVIDE_OVERFLOW {
                 let pc = pc as u64;
+                let code = if imm == gex_abi::imports::BRK_DIVIDE_BY_ZERO { fault_code::INT_DIVIDE_BY_ZERO } else { fault_code::INT_OVERFLOW };
+                if deliver_guest_fault(&mut caller, code, pc, 0)? {
+                    return Err(StopExecution.into());
+                }
                 let memory = caller
                     .data()
                     .memory
@@ -3553,6 +3641,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // mode): SIGSEGV at the instruction.
             if imm == gex_abi::imports::BRK_GENERAL_PROTECTION {
                 let pc = pc as u64;
+                if deliver_guest_fault(&mut caller, fault_code::ACCESS_VIOLATION, pc, 0xffff_ffff)? {
+                    return Err(StopExecution.into());
+                }
                 let memory = caller
                     .data()
                     .memory
@@ -3586,6 +3677,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     detail: format!("unmasked x87 floating-point exception at 0x{pc:x}; gex does not deliver x87 exceptions"),
                     internal: true,
                 });
+                return Err(StopExecution.into());
+            }
+            // int3: the hook sees the address after it, as hardware leaves it.
+            if deliver_guest_fault(&mut caller, fault_code::BREAKPOINT, pc as u64 + 1, pc as u64)? {
                 return Err(StopExecution.into());
             }
             caller.data_mut().exit = Some(Exit::Signal {
@@ -3940,6 +4035,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {
+                    if run_signal_frames(&mut caller, pc as u64)? {
+                        return Err(StopExecution.into());
+                    }
+                    let state = caller.data_mut();
                     state.resume_cause = Some("signal at safepoint".into());
                     state.resume_at = Some(target);
                     Err(StopExecution.into())
@@ -4582,7 +4681,10 @@ fn watch_stub(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> wasmtim
                 });
                 match old {
                     Some(f) => CalloutSignal::Bypass(f),
-                    None => bail!("a watched dispatch slot with nothing to run for {target:#x}"),
+                    None => bail!(
+                        "a watched dispatch slot with nothing to run for {target:#x} (slot {slot:?}, sp {sp:#x}; call-outs {:?})",
+                        state.callouts.iter().map(|co| (format!("{:#x}", co.ret), format!("{:#x}", co.sp_want), co.slot.as_ref().map(|s| s.0), co.live)).collect::<Vec<_>>()
+                    ),
                 }
             }
         };
@@ -4630,7 +4732,8 @@ fn refresh_callouts(cx: &mut impl wasmtime::AsContextMut<Data = HostState>) -> R
     let n = cx.as_context().data().callouts.len();
     for i in 0..n {
         let ret = cx.as_context().data().callouts[i].ret;
-        let want = dispatch_slot_of(&memory, ret).filter(|&s| s < size);
+        // (only a page with an entry of its own: the miss slots are shared)
+        let want = dispatch_slot_of(&memory, ret).filter(|&s| s < size && s >= gex_abi::MISS_SLOTS);
         let have = cx.as_context().data().callouts[i].slot.as_ref().map(|(s, _)| *s);
         if have.is_some() && have != want {
             // The return moved: put the old slot back, unless another
@@ -4692,6 +4795,206 @@ pub(crate) fn any_enter(caller: &mut Caller<'_, HostState>) -> Option<wasmtime::
         .or_else(|| caller.data().root_enter.clone())
 }
 
+/// Guest fault hooks, by process (its kernel's address): a native wasm32
+/// program that runs x86 code (Wine's ntdll.so, docs/wine-native.md §4.0
+/// W3.1) registers `void hook(int ctx, unsigned code, unsigned addr)`
+/// (`gex.fault_hook`), and a fault in its x86 code -- a memory access past
+/// the guest's memory, an illegal instruction, int3, a divide error -- is
+/// delivered to it instead of ending the process: the context holds the
+/// guest state with PC at the fault, the hook leaves the state to go on
+/// from (ntdll.so: KiUserExceptionDispatcher's), and the call-out the guest
+/// ran under resumes there, the native frames under it intact.
+static FAULT_HOOKS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+fn fault_hook_of(state: &HostState) -> Option<u32> {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    FAULT_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|&(_, h)| h)
+}
+
+pub(crate) fn set_fault_hook(state: &HostState, idx: u32) {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    let mut v = FAULT_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|(k, _)| *k != key);
+    v.push((key, idx));
+}
+
+/// A native wasm32 program's signal hook (W3.1), by process: the function
+/// that runs the signal frames gex-kernel leaves on the guest's stack
+/// (libgex's `__gex_signal_frames(ctx, pc)`, which calls the program's wasm
+/// handlers), for a signal that arrives while the thread runs guest code.
+static SIGNAL_HOOKS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+fn signal_hook_of(state: &HostState) -> Option<u32> {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    SIGNAL_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key).map(|&(_, h)| h)
+}
+
+pub(crate) fn set_signal_hook(state: &HostState, idx: u32) {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    let mut v = SIGNAL_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    v.retain(|(k, _)| *k != key);
+    v.push((key, idx));
+}
+
+/// Run the signal frame gex-kernel just built at a safepoint through the
+/// process's signal hook (its handlers are wasm functions, not guest code):
+/// the hook's C frames below the frame, the guest resumed where sigreturn
+/// put it. False when the process has no hook.
+fn run_signal_frames(caller: &mut Caller<'_, HostState>, interrupted: u64) -> Result<bool> {
+    let Some(hook) = signal_hook_of(caller.data()) else { return Ok(false) };
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let f = crate::ftab::table_func(caller, hook)?;
+    let typed = f.typed::<(i32, i32), ()>(&*caller).context("gex.signal_hook: the hook is not void(int, unsigned)")?;
+    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let saved = match &sp {
+        Some(g) if !gex_abi::mem64() => {
+            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            g.set(&mut *caller, Val::I32(((cur.min(esp).saturating_sub(256)) & !15) as u32 as i32))?;
+            Some(cur)
+        }
+        _ => None,
+    };
+    let r = typed.call(&mut *caller, (ctx_addr as i32, interrupted as u32 as i32));
+    if let (Some(g), Some(cur)) = (&sp, saved) {
+        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+    }
+    r?;
+    let next = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    caller.data_mut().resume_cause = Some("signal (wasm handler)".into());
+    caller.data_mut().resume_at = Some(next);
+    Ok(true)
+}
+
+/// Wine's Unix-side system-call dispatcher, by process (W3.1): op 0 sets
+/// it, op 1 returns it (0 for none).
+static UNIX_DISPATCHERS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+pub(crate) fn unix_dispatcher(state: &HostState, op: i32, idx: u32) -> u32 {
+    let key = Arc::as_ptr(&state.kernel) as usize;
+    // ops 4 and 5: the Unix-call dispatcher itself, for wasm callers that
+    // reach the trampoline's address (gexrt calls it directly)
+    if op >= 4 {
+        let mut v = NATIVE_UNIX_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if op == 4 {
+            v.retain(|(k, _)| *k != key);
+            v.push((key, idx));
+            return 0;
+        }
+        return v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d);
+    }
+    // ops 2 and 3: the same for the guest's Unix calls (the trampoline
+    // page's `UNIX_CALL_32`, i386 code calling `__wine_unix_call_dispatcher`)
+    if op >= 2 {
+        let mut v = GUEST_UNIX_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if op == 2 {
+            v.retain(|(k, _)| *k != key);
+            v.push((key, idx));
+            return 0;
+        }
+        return v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d);
+    }
+    let mut v = UNIX_DISPATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+    if op == 0 {
+        v.retain(|(k, _)| *k != key);
+        v.push((key, idx));
+        return 0;
+    }
+    v.iter().find(|(k, _)| *k == key).map_or(0, |&(_, d)| d)
+}
+
+/// Wine's `__wine_unix_call_dispatcher` (W3), by process.
+static NATIVE_UNIX_CALLS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+/// Wine's handler for a Unix call from guest code (W3), by process.
+static GUEST_UNIX_CALLS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+/// A guest's Unix call (`int 0x80` with EAX = UNIX_CALL, from the
+/// trampoline page) in a process whose ntdll.so takes them: its handler
+/// runs below the guest's stack, and sets EAX. False when there is none.
+fn guest_unix_call(caller: &mut Caller<'_, HostState>) -> Result<bool> {
+    let hook = unix_dispatcher(caller.data(), 3, 0);
+    if hook == 0 {
+        return Ok(false);
+    }
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    let f = crate::ftab::table_func(caller, hook)?;
+    let typed = f.typed::<i32, ()>(&*caller).context("the guest Unix-call hook is not void(int)")?;
+    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let saved = match &sp {
+        Some(g) if !gex_abi::mem64() => {
+            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            g.set(&mut *caller, Val::I32(((cur.min(esp).saturating_sub(256)) & !15) as u32 as i32))?;
+            Some(cur)
+        }
+        _ => None,
+    };
+    let r = typed.call(&mut *caller, ctx_addr as i32);
+    if let (Some(g), Some(cur)) = (&sp, saved) {
+        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+    }
+    r?;
+    Ok(true)
+}
+
+/// NTSTATUS codes the hook is given.
+pub(crate) mod fault_code {
+    pub const ACCESS_VIOLATION: u32 = 0xc000_0005;
+    pub const ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+    pub const BREAKPOINT: u32 = 0x8000_0003;
+    pub const INT_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
+    pub const INT_OVERFLOW: u32 = 0xc000_0095;
+}
+
+/// Deliver a guest fault to the process's hook (see [`FAULT_HOOKS`]).
+/// Returns false when there is none. On true, `resume_at` holds where the
+/// guest goes on.
+pub(crate) fn deliver_guest_fault(caller: &mut Caller<'_, HostState>, code: u32, pc: u64, addr: u64) -> Result<bool> {
+    deliver_guest_fault_kind(caller, code, pc, addr, 0)
+}
+
+/// [`deliver_guest_fault`] with an access violation's kind (Windows'
+/// ExceptionInformation[0]: 0 read, 1 write, 8 execute).
+pub(crate) fn deliver_guest_fault_kind(caller: &mut Caller<'_, HostState>, code: u32, pc: u64, addr: u64, kind: u32) -> Result<bool> {
+    let Some(hook) = fault_hook_of(caller.data()) else { return Ok(false) };
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let ctx_addr = caller.data().thread.ctx_addr;
+    {
+        let mut gm = GuestMem::new(memory.bytes());
+        let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
+    }
+    let f = crate::ftab::table_func(caller, hook)?;
+    let typed = f.typed::<(i32, i32, i32, i32), ()>(&*caller).context("gex.fault_hook: the hook is not void(int, unsigned, unsigned, unsigned)")?;
+    // The hook's C frames go below the guest's stack pointer, as a signal
+    // frame does: the shared shadow stack pointer may be wherever a native
+    // call from the guest last left it, above the live guest stack. The
+    // red zone leaves the hook room to build the guest's exception frame
+    // under that stack pointer (i386's is under a KiB).
+    let sp = caller.data().jit.as_ref().and_then(|j| j.ftab.as_ref()).and_then(|s| s.provider_sp.clone());
+    let saved = match &sp {
+        Some(g) if !gex_abi::mem64() => {
+            let cur = g.get(&mut *caller).i32().unwrap_or(0) as u32 as u64;
+            let esp = read_u64(memory.bytes(), (ctx_addr + ctx::X as u64 + 8 * 4) as usize) & 0xffff_ffff;
+            let new = (cur.min(esp).saturating_sub(4096)) & !15;
+            g.set(&mut *caller, Val::I32(new as u32 as i32))?;
+            Some(cur)
+        }
+        _ => None,
+    };
+    let r = typed.call(&mut *caller, (ctx_addr as i32, code as i32, addr as u32 as i32, kind as i32));
+    if let (Some(g), Some(cur)) = (&sp, saved) {
+        g.set(&mut *caller, Val::I32(cur as u32 as i32))?;
+    }
+    r?;
+    let next = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    caller.data_mut().resume_cause = Some(format!("guest fault {code:#x}"));
+    caller.data_mut().resume_at = Some(next);
+    Ok(true)
+}
+
 /// `gex.call_out` (docs/function-tier.md §7.3): run the guest from `target`
 /// until it returns to `ret` with the stack pointer at `sp_want` (or what a
 /// callee popped above it), then let the C caller carry on (1); 0 when that
@@ -4705,6 +5008,21 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
     let ctx_addr = ctx_i as u32 as u64;
     let unwound = if ret == gex_kernel::nt::boot::tramp::NATIVE_RETURN_PAD { NATIVE_UNWOUND } else { CALLOUT_UNWOUND };
+    // A return address on a page with no directory entry of its own would
+    // be watched in the miss slots, which every untranslated page shares:
+    // translate it first (W3: the trampoline page's NATIVE_RETURN_PAD, which
+    // no unit covers without the NT layer). A call-out that never returns
+    // (ret 0: Wine's thread loop) is not watched at all (`refresh_callouts`).
+    if ret != 0 {
+        let page = ret / gex_abi::DISPATCH_PAGE;
+        let entry = |m: &gex_mem::GuestMemory| GuestMem::new(m.bytes()).read_u32(gex_abi::DISPATCH_DIR + page * 4).unwrap_or(1);
+        if page < gex_abi::DISPATCH_MAX_PAGES && entry(&memory) == 0 {
+            translate_and_install(caller, ret)?;
+            if entry(&memory) == 0 && std::env::var_os("GEX_W3_TRACE").is_some() {
+                eprintln!("gex-w3: call-out return {ret:#x}: its page has still no dispatch entry");
+            }
+        }
+    }
     caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
@@ -4755,6 +5073,18 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
             refresh_callouts(&mut *caller)?;
             pc = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
             continue;
+        }
+        // A wild guest access under a process with a fault hook (W3.1):
+        // delivered, and the guest goes on where the hook says. The
+        // translated code cannot say which instruction faulted: PC is where
+        // the context last had it (the block's start, at best).
+        if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::MemoryOutOfBounds)) {
+            let at = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
+            if deliver_guest_fault(caller, fault_code::ACCESS_VIOLATION, at, 0)? {
+                pc = caller.data_mut().resume_at.take().unwrap_or(at);
+                refresh_callouts(&mut *caller)?;
+                continue;
+            }
         }
         break Err(anyhow::Error::from(e));
     };

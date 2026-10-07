@@ -533,6 +533,13 @@ impl MemoryMap {
         self.brk_grow(addr).0
     }
 
+    /// Hand out no mapping above `top` unless asked for there (a process
+    /// hosting Windows code, W3: Windows keeps 0x7ffe0000 for
+    /// KUSER_SHARED_DATA and the top of user space for itself).
+    pub fn set_mmap_top(&mut self, top: u64) {
+        self.mmap_next = self.mmap_next.min(page_align_down(top));
+    }
+
     /// Find and reserve a free range of `len` bytes. Top-down from [`MMAP_TOP`],
     /// matching Linux, so the heap and mappings grow apart.
     pub fn mmap(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str) -> SysResult {

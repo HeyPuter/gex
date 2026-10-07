@@ -45,6 +45,7 @@ out = 'a.out'
 srcs, ld_in, ld_flags, cflags = [], [], [], []
 shared = False
 relocatable = False
+guest_i386 = False
 i = 0
 while i < len(args):
     a = args[i]
@@ -56,7 +57,8 @@ while i < len(args):
         relocatable = True
     elif a.startswith('-Wl,'):
         # (lld needs no archive groups: it searches archives as needed)
-        ld_flags += [x for x in a[4:].split(',') if x and x not in ('--start-group', '--end-group', '--sort-common', '--sort-section', 'alignment', '--warn-common')]
+        ld_flags += [x for x in a[4:].split(',') if x and x not in ('--start-group', '--end-group', '--sort-common', '--sort-section', 'alignment', '--warn-common', '--gex-guest-i386')]
+        guest_i386 = guest_i386 or '--gex-guest-i386' in a[4:].split(',')
     elif a.startswith('-l') or a.startswith('-L'):
         if a in ('-l', '-L'):
             ld_in += [a + args[i + 1]]; i += 2; continue
@@ -188,4 +190,6 @@ r = subprocess.call(cmd)
 if r:
     sys.exit(r)
 finish(wasm)
-sys.exit(subprocess.call([sys.executable, os.path.join(here, 'wasm-elf.py'), wasm, out]))
+# -Wl,--gex-guest-i386 (taken out of the wasm-ld flags above): the container
+# says the program runs i386 code (Wine's loader).
+sys.exit(subprocess.call([sys.executable, os.path.join(here, 'wasm-elf.py'), wasm, out] + (['--guest-i386'] if guest_i386 else [])))

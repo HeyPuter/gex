@@ -24,6 +24,8 @@ import sys
 import tempfile
 
 here = os.path.dirname(os.path.realpath(__file__))
+EAGER = {}  # module -> the DLLs to load before it (pelink's main)
+SRC = None  # the Wine source tree (pelink's main)
 
 
 def enc_leb(v):
@@ -50,6 +52,50 @@ def makefile_var(path, var):
     return m.group(1).split() if m else []
 
 
+def spec_path(src, top, d, mod):
+    """A module's .spec: X.spec for X.dll, else the full name (ntoskrnl.exe.spec)."""
+    for name in (mod.rsplit('.', 1)[0] + '.spec', mod + '.spec'):
+        p = os.path.join(src, top, d, name)
+        if os.path.exists(p):
+            return p
+    return os.path.join(src, top, d, mod + '.spec')
+
+
+def spec_stdcalls(spec):
+    """The names a .spec exports as stdcall."""
+    out = set()
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        parts = line.split('#', 1)[0].split()
+        if len(parts) >= 3 and parts[1] == 'stdcall':
+            rest = [t for t in parts[2:] if not t.startswith('-')]
+            if rest:
+                out.add(rest[0].split('(', 1)[0])
+    return out
+
+
+def spec_functions(spec):
+    """The function names a .spec exports (its stdcall/cdecl/thiscall/
+    varargs entries; not data, stubs or extern)."""
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        line = line.split('#', 1)[0].strip()
+        parts = line.split()
+        if len(parts) < 3 or parts[1] not in ('stdcall', 'cdecl', 'thiscall', 'varargs', 'fastcall'):
+            continue
+        rest = [t for t in parts[2:] if not t.startswith('-')]
+        if rest:
+            out.append(rest[0].split('(', 1)[0])
+    return out
+
+
 def main():
     if sys.argv[1] == '--gexrt':
         # explicit inputs (tests)
@@ -69,6 +115,8 @@ def main():
                 sys.exit(f'unknown argument {args[i]}')
         return link(dlls, out, gexrt)
     build, src, out = sys.argv[1:4]
+    global SRC
+    SRC = src
     only = set(sys.argv[4:])
     dlls = []  # (dll file name, r.o, exports, imports)
     for top in ('dlls', 'programs'):
@@ -87,17 +135,36 @@ def main():
             imports = [i.lstrip('-') for i in makefile_var(mk, 'IMPORTS') + makefile_var(mk, 'DELAYIMPORTS')]
             imports = [i if '.' in i else i + '.dll' for i in imports]
             dlls.append((mod, ro, ex, imports))
+            # what the loader is to load before the module (makedep's
+            # direct imports and default ones: the C runtime, kernel32,
+            # ntdll), which a skeleton's empty import table cannot say
+            eager = [i.lstrip('-') for i in makefile_var(mk, 'IMPORTS')]
+            if '-nodefaultlibs' not in makefile_var(mk, 'EXTRADLLFLAGS'):
+                is_crt = lambda n: n.startswith(('msvcr', 'ucrt')) or n == 'crtdll'
+                crt = next((i for i in eager if is_crt(i)), None if is_crt(mod.split('.')[0]) else 'ucrtbase')
+                eager += [c for c in (crt, 'kernel32', 'ntdll') if c and c not in eager]
+            EAGER[mod] = [i if '.' in i else i + '.dll' for i in eager]
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
     # every DLL the build has an export list for, native or not: what an
     # import the linked DLLs leave undefined is found in (guest imports)
     others = {}
+    spec_dir = tempfile.mkdtemp(prefix='pelink-specs-')
     for top in ('dlls',):
         for d in sorted(os.listdir(os.path.join(build, top))):
             mod = makefile_var(os.path.join(src, top, d, 'Makefile.in'), 'MODULE')
             ex = os.path.join(build, top, d, mod[0] + '.so.exports') if mod else ''
             if mod and os.path.exists(ex):
                 others[mod[0]] = ex
+            elif mod:
+                # a DLL whose wasm32 build failed is still an i386 one in
+                # the prefix: its .spec names its functions
+                names = spec_functions(spec_path(src, top, d, mod[0]))
+                if names:
+                    ex = os.path.join(spec_dir, mod[0] + '.exports')
+                    with open(ex, 'w') as f:
+                        f.writelines(f'{n} func\n' for n in names)
+                    others[mod[0]] = ex
     link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
 
@@ -207,6 +274,11 @@ def link(dlls, out, gexrt, others=None):
                 f.write(f'{name} {pick}\n')
         bound = os.path.join(tmp, mod + '.o')
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'imports', local, bound, mod, mapfile])
+        # The ICALL pass's stdcall annotations are for the compiler only;
+        # wasm-ld 22 crashes relocating them when a function they name is
+        # not linked (services.exe, plugplay.exe).
+        subprocess.check_call(['llvm-objcopy', '--remove-section=llvm.func_attr.annotate.gex.stdcall',
+                               '--remove-section=reloc.llvm.func_attr.annotate.gex.stdcall', bound])
         objs.append(bound)
 
     if thunks:
@@ -266,20 +338,55 @@ def link(dlls, out, gexrt, others=None):
                 own = lambda n: next((d for d in ('kernelbase.dll', 'kernel32.dll') if d in exporters.get(n, [])), 'kernel32.dll')
                 f.write(f'void *gexw_LoadLibraryA(const char *) __asm__("{own("LoadLibraryA")}!LoadLibraryA");\n')
                 f.write(f'void *gexw_GetProcAddress(void *, const char *) __asm__("{own("GetProcAddress")}!GetProcAddress");\n')
+                stdcalls = {}
                 for k, (n, sig, owner) in enumerate(stubs):
+                    if owner not in stdcalls:
+                        stdcalls[owner] = spec_stdcalls(spec_path(SRC, 'dlls', owner, owner)) if SRC else set()
+                    # a stdcall entry thunk (callee pops) for i386 callers
+                    # of the stub's table index (below)
+                    attr = '__attribute__((annotate("gex.stdcall"))) ' if n in stdcalls[owner] else ''
                     r, ps = sig.split(':')
                     params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
                     types = ', '.join(ctype[c] for c in ps) or 'void'
                     args = ', '.join(f'a{i}' for i in range(len(ps)))
-                    f.write(f'{ctype[r]} g{k}({params}) __asm__("{n}");\n')
-                    f.write(f'{ctype[r]} g{k}({params}) {{\n'
+                    f.write(f'{attr}{ctype[r]} g{k}({params}) __asm__("{n}");\n')
+                    f.write(f'{attr}{ctype[r]} g{k}({params}) {{\n'
                             f'    static void *p;\n'
                             f'    if (!p) p = gexw_GetProcAddress(gexw_LoadLibraryA("{owner}"), "{n}");\n'
                             f'    {"" if r == "v" else "return "}(({ctype[r]} (*)({types}))p)({args});\n}}\n')
+                # Their addresses taken, so the ICALL pass gives each an entry
+                # thunk: a native module may hand one to i386 code as a
+                # function pointer (services.exe's RPC dispatch table holds
+                # rpcrt4's NdrServerCall2), which then calls its table index.
+                f.write('void *const __gexw_guestimport_refs[] __attribute__((used)) = {\n')
+                for k in range(len(stubs)):
+                    f.write(f'    (void *)g{k},\n')
+                f.write('};\n')
             obj = os.path.join(tmp, 'guestimports.o')
             subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-D_WIN32', '-c', '-o', obj, src])
             objs.append(obj)
             print(f'{out}: {len(stubs)} imports from i386 DLLs ({", ".join(sorted({o for _, _, o in stubs}))})')
+
+    # Each module's load-time imports for Wine's PE loader on wasm32
+    # (ntdll's fixup_imports asks __gexw_module_imports): only DLLs.
+    if EAGER:
+        known = {m for m, _, _, _ in dlls} | set(others or {})
+        src = os.path.join(tmp, 'moduleimports.c')
+        with open(src, 'w') as f:
+            f.write('static const char *const gexw_imports[] = {\n')
+            for mod in sorted(EAGER):
+                deps = [d for d in EAGER[mod] if d in known and d != mod]
+                f.write('    "%s", "%s",\n' % (mod, ''.join(d + '\\0' for d in deps)))
+            f.write('    0\n};\n')
+            f.write('const char *__gexw_module_imports(const unsigned short *name)\n{\n'
+                    '    for (int i = 0; gexw_imports[i]; i += 2) {\n'
+                    '        const char *a = gexw_imports[i]; const unsigned short *b = name;\n'
+                    '        while (*a && *b && (*a | 0x20) == ((*b < 128 ? *b : 0) | 0x20)) a++, b++;\n'
+                    '        if (!*a && !*b) return gexw_imports[i + 1];\n'
+                    '    }\n    return 0;\n}\n')
+        obj = os.path.join(tmp, 'moduleimports.o')
+        subprocess.check_call([os.path.join(here, 'wcc'), '-O2', '-D_WIN32', '-c', '-o', obj, src])
+        objs.append(obj)
 
     rsp = os.path.join(tmp, 'exports.rsp')
     with open(rsp, 'w') as f:
@@ -287,6 +394,7 @@ def link(dlls, out, gexrt, others=None):
             f.write(f'--export-if-defined={d}\n')
         # gexrt's bounds of the entry-thunk pairs (gexw_entries)
         f.write('--export-if-defined=__gexw_entries\n')
+        f.write('--export-if-defined=__gexw_entries_decl\n')
     cmd = ['wasm-ld', '--experimental-pic', '-shared', '--shared-memory', '--import-memory',
            '--max-memory=4294967296', '--unresolved-symbols=import-dynamic', '-o', out,
            f'@{rsp}'] + objs + [gexrt]

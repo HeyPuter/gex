@@ -136,7 +136,7 @@ def rewrite(b, fix, aliases=()):
                     nm, s = name(b, s)
                     align, s = leb(b, s)
                     flags, s = leb(b, s)
-                    if nm == 'gexw_entries':
+                    if nm in ('gexw_entries', 'gexw_entries_decl'):
                         flags |= WASM_SEG_FLAG_RETAIN
                     segs += enc_name(nm) + enc(align) + enc(flags)
                 body += bytes([sub]) + enc(len(segs)) + segs; r = subend; continue
@@ -293,7 +293,8 @@ RUNTIME = ('__gexw_', 'gexw_', '__wasm_', '__c_longjmp', '__stack_pointer',
 
 
 def is_runtime(nm):
-    return nm is not None and (nm.startswith(RUNTIME) and not nm.startswith('__gexw_adapters_'))
+    # (each DLL's own: its adapters, and the base gex writes for winecrt0)
+    return nm is not None and (nm.startswith(RUNTIME) and not nm.startswith(('__gexw_adapters_', '__gexw_image_base')))
 
 
 def main():

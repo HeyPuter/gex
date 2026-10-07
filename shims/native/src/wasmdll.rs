@@ -86,9 +86,9 @@ pub(crate) fn install(
 /// install, where its data is, its slots by name and its data exports'
 /// offsets.
 pub(crate) struct WinePe {
-    install: u32,
+    pub(crate) install: u32,
     data: u64,
-    slots: std::collections::HashMap<String, u32>,
+    pub(crate) slots: std::collections::HashMap<String, u32>,
     /// `gexp_<export>` slots by export name, whichever DLL owns them: a
     /// DLL's `-import` re-exports are served by the owner's adapter.
     any_dll: std::collections::HashMap<String, u32>,
@@ -135,15 +135,34 @@ fn bind_entry_thunks(wp: &WinePe, shared: &Arc<Mutex<JitShared>>, memory: &gex_m
         return Ok(());
     }
     let base = shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.map.install(wp.install).base;
-    let mut pairs = Vec::with_capacity(((stop - start) / 8) as usize);
-    let mut a = start;
-    while a + 8 <= stop {
-        let (f, t) = (memory_u32(memory, a)?, memory_u32(memory, a + 4)?);
-        a += 8;
-        if f < base || t < base || f as u64 >= 0x3f0000 {
-            continue;
+    let read = |start: u64, stop: u64| -> Result<Vec<(u64, u32)>> {
+        let mut out = Vec::with_capacity(((stop.saturating_sub(start)) / 8) as usize);
+        let mut a = start;
+        while a + 8 <= stop {
+            let (f, t) = (memory_u32(memory, a)?, memory_u32(memory, a + 4)?);
+            a += 8;
+            if f < base || t < base || f as u64 >= 0x3f0000 {
+                continue;
+            }
+            out.push((f as u64, t - base));
         }
-        pairs.push((f as u64, t - base));
+        Ok(out)
+    };
+    let mut pairs = read(start, stop)?;
+    // Thunks made where a function is handed out but not defined: only for
+    // functions no defining object gave one (it knows the convention).
+    if let Some(&off) = wp.data_exports.get("__gexw_entries_decl") {
+        let at = wp.data + off as u64;
+        let (s2, e2) = (memory_u32(memory, at)? as u64, memory_u32(memory, at + 4)? as u64);
+        if s2 != 0 && e2 > s2 {
+            let strong: std::collections::HashSet<u64> = pairs.iter().map(|&(f, _)| f).collect();
+            let mut seen = std::collections::HashSet::new();
+            for (f, t) in read(s2, e2)? {
+                if !strong.contains(&f) && seen.insert(f) {
+                    pairs.push((f, t));
+                }
+            }
+        }
     }
     if std::env::var_os("GEX_WASM_TRACE").is_some() {
         eprintln!("gex: wine PE: {} entry thunks bound", pairs.len());

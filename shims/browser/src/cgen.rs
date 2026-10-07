@@ -1638,3 +1638,34 @@ fn on_retire_pages(ranges: &[(u64, u64)]) {
         }
     }
 }
+
+/// Wine's Unix-side system-call dispatcher (W3.1, as the native
+/// `crate::unix_dispatcher`): op 0 sets it, op 1 returns it (0 for none).
+static UNIX_DISPATCHER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_unix_dispatcher(op: i32, idx: u32) -> u32 {
+    if op == 0 {
+        UNIX_DISPATCHER.store(idx, Ordering::Relaxed);
+        return 0;
+    }
+    UNIX_DISPATCHER.load(Ordering::Relaxed)
+}
+
+/// A native wasm32 program's guest fault hook (W3.1). Recorded; the page
+/// does not deliver faults to it yet (W3.7).
+static FAULT_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_fault_hook_set(idx: u32) {
+    FAULT_HOOK.store(idx, Ordering::Relaxed);
+}
+
+/// A native wasm32 program's signal hook (W3.1). Recorded, as the fault
+/// hook is; the page does not run signal frames through it yet (W3.7).
+static SIGNAL_HOOK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[no_mangle]
+pub extern "C" fn gex_signal_hook_set(idx: u32) {
+    SIGNAL_HOOK.store(idx, Ordering::Relaxed);
+}

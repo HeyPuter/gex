@@ -46,6 +46,7 @@ pub mod nr {
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
     pub const FCHDIR: u64 = 50;
+    pub const UNSHARE: u64 = 97;
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
     pub const OPENAT: u64 = 56;
@@ -634,6 +635,10 @@ pub struct Kernel {
     pub pin_landed: Vec<(String, u64, u64)>,
     /// File mappings whose writes are meant to reach the file.
     pub shared_maps: Vec<SharedMap>,
+    /// The working directories of threads that left the process's
+    /// (`unshare(CLONE_FS)`), by context address: swapped into `vfs` for
+    /// the length of each of that thread's system calls.
+    pub thread_cwd: std::collections::HashMap<u64, String>,
     /// Executable mappings made since the host last looked.
     pub new_code: Vec<CodeMap>,
     /// Executable ranges *unmapped* since the host last looked.
@@ -1258,6 +1263,7 @@ impl Kernel {
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
+            thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
             next_tmpfile: 0,
@@ -1490,6 +1496,7 @@ impl Kernel {
             sigreturn_legacy: false,
             pin_landed: Vec::new(),
             shared_maps: Vec::new(),
+            thread_cwd: std::collections::HashMap::new(),
             new_code: Vec::new(),
             retired_code: Vec::new(),
             next_tmpfile: self.next_tmpfile,
@@ -1608,6 +1615,23 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        // A thread with a working directory of its own (`unshare(CLONE_FS)`)
+        // has it in `vfs` while its call runs.
+        if self.thread_cwd.is_empty() {
+            return self.syscall_inner(m, pc);
+        }
+        let me = self.ctx_addr;
+        let Some(mut cwd) = self.thread_cwd.remove(&me) else {
+            return self.syscall_inner(m, pc);
+        };
+        std::mem::swap(&mut self.vfs.cwd, &mut cwd);
+        let out = self.syscall_inner(m, pc);
+        std::mem::swap(&mut self.vfs.cwd, &mut cwd);
+        self.thread_cwd.insert(me, cwd);
+        out
+    }
+
+    fn syscall_inner(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         self.syscall_pc = pc;
         let raw = m
             .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
@@ -2164,6 +2188,19 @@ impl Kernel {
                 self.retry_transfer = Some((n, a));
                 Some(BlockOp::AcceptWait { socket: Arc::clone(&file.handle) })
             }
+            // `recvfrom` (and `recv`) on an empty blocking socket waits for
+            // it to be readable, then reads under the lock, as `recvmsg`
+            // does (by `retry_transfer`). It had answered EAGAIN.
+            nr::RECVFROM => {
+                let file = self.fds.get(a[0] as i32).ok()?;
+                if a[3] & Self::MSG_DONTWAIT != 0 || !file.would_block() {
+                    return None;
+                }
+                self.retry_transfer = Some((n, a));
+                Some(BlockOp::AcceptWait {
+                    socket: Arc::clone(&file.handle),
+                })
+            }
             nr::RECVMSG => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 // A non-blocking socket, one with data, or a call that asked
@@ -2455,6 +2492,19 @@ impl Kernel {
             nr::GETCWD => self.sys_getcwd(m, a[0], a[1]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
             nr::FCHDIR => self.sys_fchdir(a[0] as i32),
+            // Only a thread's own working directory (CLONE_FS) is unshared;
+            // a private descriptor table or namespace is not supported.
+            nr::UNSHARE => {
+                if a[0] & !0x200 != 0 {
+                    Err(Errno::EINVAL)
+                } else {
+                    if a[0] & 0x200 != 0 {
+                        let cwd = self.vfs.cwd.clone();
+                        self.thread_cwd.entry(self.ctx_addr).or_insert(cwd);
+                    }
+                    Ok(0)
+                }
+            }
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
             nr::UNLINKAT => self.sys_unlinkat(m, a[0] as i32, a[1], a[2]),
             nr::RENAMEAT => self.sys_renameat(m, a[0] as i32, a[1], a[2] as i32, a[3]),
@@ -2511,7 +2561,9 @@ impl Kernel {
                 // unmapping does: `ld.so` applies RELRO by dropping write,
                 // but a JIT in the guest flips a page from executable back to
                 // writable precisely so it can put different code there.
-                if (a[2] as u32) & crate::mem::prot::EXEC == 0 {
+                // Making code writable is the other half (a patch, a
+                // detour), which x86 needs no cache flush to see.
+                if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
                     self.retire_code(a[0], a[1]);
                 }
                 self.mem.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0)
@@ -3271,6 +3323,9 @@ impl Kernel {
     fn transfer_syscall(&mut self, m: &mut GuestMem<'_>, n: u64, a: &[u64; 6]) -> SysResult {
         match n {
             nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
+            // A blocking `recvfrom`/`recv` that waited for a datagram or
+            // bytes (the classifier below).
+            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
             nr::COPY_FILE_RANGE => self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
             _ => self.sys_splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
         }
@@ -4687,8 +4742,16 @@ impl Kernel {
             if from >= to {
                 continue;
             }
-            let bytes = m.read(from, (to - from) as usize)?;
-            map.file.pwrite(map.offset + (from - map.start), bytes)?;
+            // Only what the file holds: a shared mapping's page past the
+            // end of the file is not the file's (Linux never extends it).
+            let at = map.offset + (from - map.start);
+            let size = map.file.metadata().map(|md| md.size).unwrap_or(u64::MAX);
+            let n = (to - from).min(size.saturating_sub(at));
+            if n == 0 {
+                continue;
+            }
+            let bytes = m.read(from, n as usize)?;
+            map.file.pwrite(at, bytes)?;
         }
         Ok(())
     }
@@ -5000,6 +5063,17 @@ impl Kernel {
     fn sys_mmap(&mut self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let (addr, len, prot_bits, flags, fd, offset) =
             (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
+        // A fixed mapping over code replaces it, as an unmap would (Wine's
+        // VirtualFree decommits by mapping over the range).
+        if flags & mflags::FIXED != 0 {
+            self.retire_code(addr, len);
+            // And a shared file mapping it replaces ends as an unmap ends
+            // it: written back, and no longer handed to the next mapper.
+            if self.shared_maps.iter().any(|s| s.start < addr + len && s.start + s.len > addr) {
+                self.flush_shared(m, addr, len)?;
+                self.shared_maps.retain(|s| s.start + s.len <= addr || s.start >= addr + len);
+            }
+        }
         if flags & mflags::ANONYMOUS == 0 && fd >= 0 {
             // A private file mapping is an eager copy, which is exactly
             // correct and needs no page faults (PLAN §7.4).
@@ -5029,10 +5103,12 @@ impl Kernel {
             // see the same pixels, not a zeroed copy. Not reference counted:
             // unmapping one alias unmaps both, and nothing here unmaps early.
             if flags & crate::mem::flags::SHARED != 0 {
+                // (or any part of one: a window into a mapping another
+                // view holds whole, as win32u maps the session's blocks)
                 if let Some(existing) = self.shared_maps.iter().find(|s| {
-                    Arc::ptr_eq(&s.file, &file) && s.offset == offset && s.len >= len_aligned
+                    Arc::ptr_eq(&s.file, &file) && s.offset <= offset && offset + len_aligned <= s.offset + s.len
                 }) {
-                    return Ok(existing.start);
+                    return Ok(existing.start + (offset - existing.offset));
                 }
             }
             // The path and offset travel with the mapping. Two processes
@@ -5304,7 +5380,8 @@ impl Kernel {
             SOCK_DGRAM => net::Kind::Udp,
             _ => return Err(Errno::EPROTONOSUPPORT),
         };
-        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver), Arc::clone(&self.ports)));
+        let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(&self.resolver), Arc::clone(&self.ports), self.unix_remote));
+        sock.set_self();
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 {
             crate::fs::oflags::O_NONBLOCK
@@ -5518,7 +5595,7 @@ impl Kernel {
     /// Only ranges that overlap an executable mapping are worth reporting:
     /// unmapping the heap or a data file happens constantly and has no
     /// translations behind it.
-    fn retire_code(&mut self, addr: u64, len: u64) {
+    pub fn retire_code(&mut self, addr: u64, len: u64) {
         let (start, end) = (
             crate::mem::page_align_down(addr),
             crate::mem::page_align_up(addr.saturating_add(len)),
@@ -5883,7 +5960,9 @@ impl Kernel {
         let n = self.fds.get(fd)?.read(&mut tmp)?;
         m.write(buf, &tmp[..n as usize])?;
         if addr != 0 {
-            let peer = self.socket_of(fd).ok().and_then(|s| s.peer());
+            // Where the datagram came from (a guest's port, the resolver),
+            // else the connected peer.
+            let peer = self.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
             let (ip, port) = peer.unwrap_or((0, 0));
             self.sys_write_sockaddr(m, ip, port, addr, addrlen)?;
         }
@@ -6681,6 +6760,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FACCESSAT | nr::FACCESSAT2 => "faccessat",
         nr::CHDIR => "chdir",
         nr::FCHDIR => "fchdir",
+        nr::UNSHARE => "unshare",
         nr::FCHMOD => "fchmod",
         nr::FCHMODAT => "fchmodat",
         nr::OPENAT => "openat",

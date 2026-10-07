@@ -170,21 +170,45 @@ The plan does the same with **wasm32 as Wine's host architecture**:
 - **Native Unix libraries,** in priority order: ntdll.so, win32u.so,
   winewayland.drv, opengl32, ws2_32, crypt32, secur32, dnsapi, nsiproxy,
   winepulse/winealsa (audio, §6), then winevulkan.
-- **wineserver in-process (decided after W0(a), 2026-10-04).** wineserver
-  shares coherent `MAP_SHARED` memory with its clients: session objects,
+- **wineserver in-process, as a thread (chosen design; built in W3.1,
+  approved 2026-10-06).** wineserver shares coherent `MAP_SHARED` memory
+  with its clients: the user shared data (the clock), session objects,
   and since Wine 9 the queue and desktop state win32u reads directly. gex
   processes have separate linear memories, and in the browser separate
-  `WebAssembly.Memory`s cannot alias. So wineserver runs as a thread of the
-  Windows process: `clone(CLONE_VM)` without `CLONE_FILES`, i.e. the same
-  memory but its own fd table, its own module instance and its own data
-  region. Its protocol stays Wine's (the Unix socket, SCM_RIGHTS, the
-  request and reply pipes), so the server and ntdll.so are unmodified Wine.
-  - It needs gex-kernel to support a long-lived `CLONE_VM` process (shared
-    memory, separate fd table and pid).
-  - Several Windows processes in one session share one address space.
-    That fits i386 programs (2 GiB each at most) only with memory64; until
-    then, one Windows process per session, which covers the games.
-  - **Later:** a direct-call transport in place of the socket.
+  `WebAssembly.Memory`s cannot alias, so the server lives in the Windows
+  process: linked into the Wine loader (the server's objects compiled
+  with `server/wasm32_inproc.h`, which renames what both sides define and
+  makes its `main` and exits `wineserver_main`/`wineserver_exit`) and
+  started by ntdll.so's `start_server` as a **thread**. It has its own
+  working directory (`unshare(CLONE_FS)`), shares the process's
+  descriptors and memory, takes no SIGCHLD (the process's children are
+  ntdll.so's), and maps the user shared data at the client's 0x7ffe0000
+  (one wasm memory cannot map a page at two addresses; gex hands a second
+  `MAP_SHARED` of the same open file the first mapping's pages, so later
+  maps, the session's, simply share the server's address). Its protocol
+  stays Wine's (the Unix socket, SCM_RIGHTS, request and reply pipes): the
+  server and ntdll.so are otherwise unmodified Wine. No host-side process
+  machinery is involved, so it is the same in the browser.
+  - **Known gap: child Windows processes.** A second Windows process
+    (a launcher starting the game, a crash handler such as Unity's
+    UnityCrashHandler, an out-of-process RPC/COM server, a process a
+    program spawns) is a separate gex process: it connects to the first
+    process's server through the socket and works, but it cannot see the
+    server's shared memory. It reads a stale copy of what it mapped: the
+    clock in its user shared data does not move, and win32u's session
+    state (windows, queues, the desktop) is not shared with it. One
+    Windows process per session, which covers most games, but not
+    launcher-started ones.
+  - **What would lift it** (later, none planned yet): a `MAP_SHARED` that
+    stays coherent across gex processes. Natively, the host can map one
+    memfd into several linear memories at the same guest address (the
+    memories are host mappings). In the browser there is no aliasing
+    between `WebAssembly.Memory`s; the options are processes of one
+    session as threads of one memory (memory64 for several 2 GiB i386
+    address spaces), or copying the shared pages at synchronisation
+    points (server requests, waits) for the state that tolerates it (the
+    clock), which does not cover win32u's lock-free reads. A direct-call
+    transport in place of the socket is a separate, later optimisation.
 - **Sync through ntsync.** Wine 11 supports the ntsync driver
   (`dlls/ntdll/unix/sync.c`). gex-kernel implements `/dev/ntsync`, and its
   ioctls (semaphores, mutexes, events, wait-any/all) go to the kernel's
@@ -823,6 +847,456 @@ Native Wine runs inside the guest thread, as Windows' DLLs do:
 Today's path keeps working throughout. Programs switch per process
 (`--wine native`) until W6.
 
+### 4.0 W3 plan (2026-10-06, the user's order: W3 before W7)
+
+**Goal:** i386 Windows games on Wine's own Unix side, natively and in the
+page, with no NT layer: ntdll.so, wineserver, win32u.so, a display
+driver, opengl32 through gex-gl, and a real registry (`system.reg`,
+`user.reg`) written by `wineboot`. Today's native path (W2) is Wine's PE
+side as native wasm over gex-kernel's NT layer: every NT system call, the
+registry (synthesized), windows and hooks (the NT layer's win32u calls)
+and GL (the NT layer's command ring) are still the NT layer's, which is
+where G's findings come from.
+
+**Acceptance cases** (G runs them on copies of the W prefix and sends
+repros):
+1. **Retrocycles:** `CoCreateInstance(CLSID_DirectSound)` succeeds (the
+   class is registered by `wineboot`'s own registration), and GL texture
+   uploads over 8 MiB work (no command ring: opengl32.so calls gex-gl).
+2. **Katana ZERO:** `SetWindowsHookEx` (win32u.so's real hooks), then to
+   its menu by keyboard.
+3. **Undertale** to gameplay, as G's script drives it today.
+Plus the standing gates: tests/nt on the new path, W's checks.
+
+**What exists:** the Unix side nearly compiles for wasm32 already (W1's
+`make -k`): ntdll/unix fails only on `current_machine` and the CPU-feature
+helpers (`system.c`); wineserver ran in W0(a) as a wasm32 program; ws2_32's
+unixlib ran through the dlopen registry (§3.12).
+
+**Steps** (agent time):
+
+| step | work | done when | estimate |
+|---|---|---|---|
+| W3.0 process shape | Decide and spike how a Wine process runs: (A) the wasm32 `wine` loader is the process (a wasmprog) and runs x86 code through a gex `simulate(ctx)` import (Wine's BTCpu contract, as FEX/Box64), x86 faults reaching ntdll.so's handlers as signals to a wasm32 program; or (B) keep today's x86 NT boot and send the PE side's system calls to ntdll.so linked into the process, its Linux calls through the wasm32 ABI. A retires the NT boot itself; B reuses more of W2. Expected: A. | hello.exe's first NT call reaches ntdll.so on the chosen shape | 1–2 d |
+| W3.1 ntdll.so | `current_machine`, CPU features, `signal_wasm32.c` (Unix side: the syscall dispatcher as a direct call, contexts from gex's, user callbacks nested, APCs, exceptions from gex faults), `virtual.c` on gex-kernel's mmap (PE images mapped executable, so gex sees the code), threads (pthread plus a guest context), process start through Wine's loader; wineserver in process (`clone(CLONE_VM)` without `CLONE_FILES`, §3.5) | tests/nt hello, sync, tls, seh, apc, cxx on the new path (`--wine unix`) | 5–7 d |
+| W3.2 prefix and registry | `wineboot --init` natively: setupapi, rundll32, regsvr32 and the builtin DLLs' self-registration, writing `system.reg`/`user.reg` through wineserver | Retrocycles' dsound class registered; a prefix made from nothing | 1–2 d |
+| W3.3 windows and input | win32u.so plus a display driver: winewayland.drv to gex's compositor (libwayland-client and libxkbcommon built for wasm32), or a small gex driver if that is cheaper | tests/nt's GUI tests; Katana ZERO's hooks and menu | 4–6 d |
+| W3.4 GL | opengl32.so through winewayland's EGL to gex-gl (natively the host GL, in the page Mesa wink); wined3d native | Retrocycles' uploads over 8 MiB; Undertale's GL | 2–3 d |
+| W3.5 audio, sockets, crypto | a gex audio driver behind winmm/dsound (Web Audio in the page; first a null device so games start), ws2_32 and crypt32/secur32 unixlibs | Undertale to gameplay with sound | 2–3 d |
+| W3.6 sync | ntsync in gex-kernel (`/dev/ntsync` on the futex machinery), so waits never reach wineserver | job-heavy games (Noita) no slower than W2 | 2–3 d |
+| W3.7 page | the same in the page: wineserver's thread in a Worker, the Unix side's modules per Worker | Retrocycles, Katana ZERO and Undertale in the page | 3–5 d |
+
+**W3.1 progress (2026-10-06, merge/w3 + fork `wasm32-w3`):**
+- **Fault delivery (done natively):** `gex.fault_hook(idx)`; a memory
+  access past the guest memory under a call-out, an illegal instruction,
+  int3, a divide error or a #GP in the program's code calls ntdll.so's
+  `__wine_gex_fault(ctx, code, addr)` with NTSTATUS codes, which sets up
+  KiUserExceptionDispatcher as i386's signal handlers do; the call-out
+  resumes there with the native frames kept (`spike-w3/fault.c`, all four
+  kinds). PC for a memory fault is the block's start.
+- **The dispatcher:** `ntdll/unix/signal_wasm32.c` (i386's frame, context
+  and dispatcher-stack code, with gex in place of signal contexts and
+  assembly): PE system calls arrive from gexrt (`__gexw_syscall`, which
+  asks `gex.unix_dispatcher`) in the i386 stub's stack shape, run the
+  service by table and argument bytes, and write the frame back; user
+  callbacks run KiUserCallbackDispatcher under `gex.call_out` until
+  NtCallbackReturn; threads start at LdrInitializeThunk (i386's
+  init_syscall_frame). Unix calls go straight through (one memory and
+  function table).
+- **The loader runs:** Wine's `loader/main.c` and ntdll's Unix side link as
+  one wasm32 program (`$W/link-w3.sh` → `$W/wine-w32-w3/dlls/ntdll/
+  wine-w3`, container flag `--gex-guest-i386`: i386 translation in the
+  process, no mapping above 0x7ffe0000). `wine --version` works; a run
+  starts wineserver (a wasm32 program, spawned) and talks to it.
+- **hello_args.exe runs on Wine's own Unix side** (2026-10-06): PE ntdll,
+  kernel32, kernelbase and ucrtbase are the native wasm skeletons, bound by
+  `gex.image_mapped` when ntdll.so maps them (Wine's virtual.c tells gex
+  each image it maps); exit 42 and the expected output. What it took: the
+  install layout (`$W/w3dist`: `lib/wine/i386-unix/wine`,
+  `lib/wine/i386-windows` with the skeletons plus every other i386 builtin
+  of the master prefix as symlinks, since ntdll.so reads apisetschema.dll
+  there; `share/wine/nls`; `bin/wineserver`), the loader as its own
+  `wineloader`, and each thread's kernel stack top-down (gex's dispatch
+  directory takes 0x100000-0x300000, so bottom-up it landed on 0x400000,
+  the exe mapped elsewhere, and the loader fell back to start.exe).
+  Run: `gexc run --env WINEPREFIX=$W/pfx-w3 $W/w3dist/lib/wine/i386-unix/wine
+  X.exe` (`$W/gexc-w3` wraps that for tests/nt/run.sh; `GEX_W3_TRACE=1` in
+  gexc's own environment lists the bindings). wineboot.exe is not in the
+  master prefix, so every start warns "failed to start wineboot" (W3.2).
+- **tests/nt i386 on this path** (`$W/nt-run-x86.sh $W/gexc-w3`, log
+  `$W/w3-nt2.log`; the pe-x64 cases in that run are W7's): **24 of 40**
+  (2026-10-06, up from 20): hello_args, sync, mtx, crtmem, lowmem, apc,
+  tls, cxx, icall, fixedbase(-taken), loadorder-native/-disabled, zfcall,
+  window, pagespan, exitproc, seh, seh-traps, hello32, msvc, msvc_cxxeh,
+  msvc_x87, msvc_largeint. G's repros: unixpath and iocp pass; sysmisc has
+  only the two SPI_GET checks left (W3.3); hooks and keyname are W3.3.
+  What it took, beyond the first run:
+  - **wineserver in process (§3.5, done):** linked into the loader and
+    started by `start_server` as a thread (fork: `server/wasm32_inproc.h`,
+    force-included into the server objects by `$W/link-w3.sh`, renames
+    the eight symbols both sides define and makes the server's `main` and
+    exits `wineserver_main`/`wineserver_exit`; the thread ends instead of
+    the process). It has its own working directory through
+    `unshare(CLONE_FS)` (new in gex-kernel: a thread's cwd swapped into
+    the VFS for its calls), shares the descriptors, takes no SIGCHLD (its
+    waitpid(-1) stole ntdll.so's children: a third of the starts hung),
+    and maps the user shared data at 0x7ffe0000, the client's address (a
+    wasm memory cannot map one page twice; gex hands a second `MAP_SHARED`
+    of the same file the first one's pages). The tick count now moves.
+    The nls directory is found beside the loader
+    (`lib/wine/share -> ../../share`, in `$W/stage-w3.sh`).
+  - **exceptions:** the fault hook's C frames go below the guest stack
+    pointer with a red zone (the shared shadow stack pointer could sit
+    above the live guest stack and the hook overwrote the SEH chain it
+    walked); an int3's address is its own; #GP at a privileged
+    instruction is EXCEPTION_PRIV_INSTRUCTION (i386's
+    `is_privileged_instr`); a branch to memory that is not executable is
+    an access violation with kind 8 (the hook got a fourth argument);
+    gexrt's NATIVE_LEFT is taken without the NT layer (a C++ catch through
+    wasm msvcrt nested a call-out per throw until the limit); the NT
+    layer's trampoline page (jmp eax, the vtable wrappers) is mapped at
+    0x3f0000 in a W3 process.
+  - a new thread's start function at pthread's type; i386 mlock as an
+    advisory no-op.
+
+  **Then 29 of 40** (`$W/w3-nt4.log`, same day): suspend, msvc_msvcp,
+  detour, jitcode, exitproc and loadorder-builtin too, from:
+  - **signals:** SIGUSR1 (suspend), SIGQUIT (thread abort) and SIGINT
+    handlers as i386's. One arriving in guest code is taken at a gex
+    safepoint: gex-kernel builds i386's frame on the guest stack and gex
+    runs it through `gex.signal_hook` (libgex's frame runner; the handler
+    gets the frame's ucontext, the guest's state). One arriving in Unix
+    code is taken when a system call returns, with the syscall frame's
+    state. Threads unblock the server's signals before entering the
+    program.
+  - **the Unix side's stack and registers:** system calls from the PE
+    side run on the thread's own stack below its syscall frame (an
+    assembly switch), not on the guest stack just above the arguments
+    where callback and APC frames are written; a Unix call puts the
+    program's registers back after (every system call the Unix side makes
+    passes arguments in EBX..EBP of the same context: msvcp140 lost a
+    return address to it).
+  - **code changes:** a fixed mmap over code retires it (Wine decommits
+    by mapping over), making code writable retires it, and
+    `gex.code_changed` serves NtFlushInstructionCache.
+  - **thread exits:** the first thread's `exit` while others run no
+    longer ends the process (Linux semantics; ExitProcess on another
+    thread lost its exit code).
+  - **file mappings:** a shared mapping replaced by a fixed mmap ends as an
+    unmap (written back, no longer aliased), and write-back stops at the
+    file's end.
+  - **Unix libraries:** crypt32, ws2_32, msv1_0, dnsapi and nsiproxy's
+    Unix sides are linked in (`$W/link-w3.sh`, renamed apart, dlopen
+    registry, §3.12); i386 code reaches them through the trampoline page's
+    Unix-call entry, which gex hands to ntdll.so (`gex.unix_dispatcher` op
+    2). For now wasm callers take the same route (a guest round trip per
+    Unix call); a direct path for them needs a winepe rebuild.
+
+  Open, by cause:
+  - **the registry (W3.2):** there is none until wineboot runs, and
+    crypt32 then spends minutes failing provider lookups (crypt). The
+    wasm wineboot.exe now links (programs in the one module: winegcc,
+    winebuild's program entry, the CRT table markers; stage-native stages
+    a program) and starts, but **a native module's dependencies are not
+    loaded**: skeletons have no import table, so the loader never loads
+    and initialises what the module calls (ucrtbase's heap is 0 in
+    wineboot), and calls to i386 DLLs (`owner!name` left by pelink) have
+    nothing to bind them without the NT layer. That is W3.2's first item:
+    skeletons that carry their module's imports (or gex loading them at
+    install), then wineboot, then the real system.reg.
+  - lownull-* (§5.0, low-page protection; not to be fixed here);
+  - filemap: change notifications (FindFirstChangeNotification) need
+    inotify in gex-kernel and Wine built with it;
+  - pipe: SystemSupportedProcessorArchitectures says i386, as 32-bit
+    Windows does; the test (and the NT layer) expects WoW64 on x86-64;
+  - win32u's Unix side (W3.3): user_win, gdi, input, display, gl*.
+
+**W3.2 progress (2026-10-06, native DLL dependencies, wineboot):**
+- **A native module's imports are loaded:** pelink writes each module's
+  load-time imports (Makefile IMPORTS plus makedep's default C runtime,
+  kernel32, ntdll) into `__gexw_module_imports`, and Wine's PE loader on
+  wasm32 loads those before a skeleton without an import table, as an
+  import table's would be (fork: ntdll/loader.c fixup_imports).
+- **Programs in the one module:** winegcc leaves a program's r.o and
+  export list, winebuild's entry adapter calls `mainCRTStartup(void)`,
+  gexrt defines the CRT table markers (`__xi_a`..), and crt_main calls
+  clang's `__main_argc_argv`/`__original_main` (a 3-parameter `main`
+  call trapped). `$W/relink-prog-w3.sh` relinks a program with the W3 host
+  tools (`$W/wine-tools-w3`); `W3_PROGRAMS="wineboot.exe services.exe
+  plugplay.exe conhost.exe winedevice.exe" $W/stage-w3.sh` stages them.
+- **Child processes by clone:** fork() is asyncify's unwind and rewind of
+  the whole wasm stack, which cannot cross gex's frames and the PE module
+  under a system call (the forking process went on half rewound, its next
+  indirect call trapping). spawn_process, fork_and_exec and
+  `__wine_unix_spawnvp` start children with `clone(CLONE_VFORK)` and exec.
+- **Unix calls:** wasm callers go straight to the native dispatcher
+  (gexrt recognises the trampoline address; `gex.unix_dispatcher` op 4/5),
+  i386 callers through the trampoline; stateful installs (the program,
+  the PE module) are providers, so relocating a skeleton or an mprotect
+  over it retires nothing.
+- **Threads:** RtlCreateUserThread wraps a native void entry (the
+  threadpool's), since every entry is called as LPTHREAD_START_ROUTINE.
+- **Registry:** the in-process wineserver saves the registry when the
+  process exits (exit_process asks it to flush; its periodic save never
+  came). `system.reg` and `user.reg` are written.
+- **pelink:** i386 owners from a .spec when a DLL's wasm32 build failed
+  (rpcrt4: wineboot's UuidCreate was an undefined, trapping function);
+  guest-import stubs get entry thunks (stdcall by the owner's .spec), as a
+  native module may hand one to i386 code (services' RPC dispatch table
+  holds rpcrt4's NdrServerCall2); the ICALL pass's annotation sections
+  are stripped before the final link (wasm-ld 22 crashed on services.exe
+  and plugplay.exe).
+- **Entry thunks where a function is handed out but not defined:** widl's
+  server stubs (svcctl_s.c) list routines another object defines, so
+  i386 rpcrt4 called table indices with no thunk. The ICALL pass now
+  makes a thunk for an escaping declaration too (`gexw_entries_decl`,
+  bound only where no defining object gave one); the plugin is built into
+  `$W/sr-w3` (a hard-linked copy of sr-slim with the new GexIcall.so).
+  wmainCRTStartup calls `wmain(argc, argv)` on wasm32 (winedevice).
+- **Where it stands:** wineboot runs services.exe (RPC to it works),
+  winedevice.exe and plugplay.exe natively, and rundll32's wine.inf
+  `PreInstall` completes (services installed, registry written and saved
+  at exit). Then wineboot opens its "updating" dialog
+  (`show_wait_window`: CreateDialog) before `DefaultInstall`, which needs
+  win32u's Unix side: it does not come back, so the full install (and the
+  registry it writes) waits for **W3.3**, and every start still waits out
+  the boot event. The suite's prefix stays without the native programs
+  until then (`$W/w3-nt5.log`: 29 of 40, no change).
+
+**W3.3 progress (2026-10-06, win32u.so):**
+- win32u.so's Unix side is linked into the loader (`$W/link-w3.sh`:
+  the twelve names it shares with wineserver and ntdll.so renamed apart,
+  `__wine_unix_lib_init` in the dlopen registry); win32u's DllMain loads
+  it on wasm32 (its dispatcher check saw ntdll's variable), each native
+  DLL keeps its own `__gexw_image_base` (pesym had shared one, never
+  written: unix-call init asked for module 0). NtUser*/NtGdi* calls now
+  reach win32u.so.
+- The loader references no fork any more (the in-process server never
+  daemonizes), so it is not asyncify-instrumented: smaller, and nothing
+  can be left half rewound. A call-out's return is never watched in the
+  miss slots (gex: the trampoline page's pad, translated first).
+- **The session's shared memory, resolved with option (a)** (the user's
+  choice, 2026-10-06): win32u (wasm32) reads the session's blocks from the
+  in-process server's mapping (`wineserver_session_data`, one 16 MiB
+  block), and explorer's desktop runs as a thread of the application
+  (`gexp_desktop_thread`, which win32u's `get_desktop_window` starts once
+  per process). Both are in the inventory below.
+- **The desktop thread, made right:** it creates the desktop window
+  itself, as explorer does (it owns its WND: IsChild, the window tree and
+  messages to the desktop work). The thread is created suspended so the
+  starter knows it: its own `get_desktop_window` before the window exists
+  returns at once (it had waited out 10 s, after which the application
+  forced a desktop window of its own). Callers wait until explorer names
+  the shell window, just before its message loop (a WM_NULL was answered
+  in explorer's sent-message waits during set-up, before the desktop had
+  its size). explorer's `ClipCursor`/`SetCursor` imports were trapping
+  stubs: winebuild's export list now names a renamed `-import` export as a
+  forward (user32's ClipCursor is win32u's NtUserClipCursor).
+- **FreeType for wasm32** (pinned: **FreeType 2.13.3**,
+  `freetype-2.13.3.tar.xz`, sha256
+  `0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289`,
+  fetched from the SourceForge mirror, savannah being unreachable from
+  gooner): a static build with no zlib/png/bzip2/harfbuzz/brotli into a
+  directory of its own, `$W/ft/install` (`$W/ft/build-ft.sh`; not in the
+  sysroot, which shares files with sr-slim). `$W/link-w3.sh` compiles
+  win32u with `HAVE_FT2BUILD_H` and `SONAME_LIBFREETYPE` (no reconfigure),
+  links `libfreetype.a` and registers the 31 `FT_*` functions win32u
+  dlsym's under `libfreetype.so.6` in the dlopen registry. Wine's own
+  fonts (`fonts/*.ttf`) are staged in the data dir's `fonts/`
+  (`$W/stage-w3.sh`). Tahoma realizes (13 px: height 16, ascent 13).
+  Before it, no font could be realized and every window's minimum track
+  size was stack garbage (a 640-wide window came out 4204 wide); a
+  stopgap fork patch for that was reverted once FreeType was in.
+- Left in the i386 suite (`$W/w3-nt9.log`, 32 of 40, FreeType in):
+  `pipe` fails only its SystemSupportedProcessorArchitectures check,
+  which wants AMD64 first (the NT layer's x64 host); W3's Wine is
+  i386-only (§3.9), so that is an expectation to revisit with x64, not a
+  pipe bug. `crypt`: CryptAcquireContext finds no provider (rsaenh's
+  registration is wineboot's DefaultInstall, W3.2's open end).
+- The test prefix has the null graphics driver as a fixture
+  (`$W/stage-w3.sh` writes `[Software\\Wine\\Drivers] "Graphics"="null"`)
+  and stages explorer.exe as a native program (`W3_PROGRAMS=explorer.exe`).
+- tests/nt `display`: the desktop takes a new mode's size from a notify
+  message (Wine's behaviour with explorer in another thread or process),
+  so the check polls for up to 1 s.
+
+**Display driver: winewayland.drv, not a small gex driver** (spike,
+2026-10-06). The two options, side by side:
+
+| | winewayland.drv + libwayland + libxkbcommon | a small gex driver |
+|---|---|---|
+| work | build three libraries for wasm32 (wayland 1.23.1 and libxkbcommon 1.7.0 fetched to `$W/wl`); libwayland's one libffi use (`ffi_call` for listener dispatch) replaced by a ~100-line wasm32 `ffi_call` outside any fork (every listener argument is an i32 on wasm32, so it dispatches on the count); link winewayland's Unix side like win32u's; keymap data on the guest side. About 2–3 d | a new Wine driver: window surfaces, input, keyboard layout, cursors, display modes, clipboard (winewayland is ~8000 lines for these) plus new gex host calls in both hosts. About 5–8 d |
+| fork patches | winewayland is upstream: expected a few `__wasm32__` build tweaks at most; libwayland/xkbcommon/ffi are dependencies, not forks | the whole driver is a fork addition, tracking upstream's driver interface (`user_driver_funcs`) at every rebase |
+| browser | the page already runs gex's compositor on the same wire protocol (`shims/browser/src/wl.rs`): nothing new | new host calls in the page and in the native host |
+| GL (W3.4) | gex-gl's EGL already presents to a `wl_surface` (`guest/gl/gexgl.c`: `wl_egl_window`, commit on swap): winewayland's EGL path needs nothing new | its own GL presentation path, new on both hosts |
+| jank | one more process-wide socket protocol, but the one every other guest uses | a gex-only driver no upstream test covers |
+
+winewayland wins on every axis that lasts: fewer fork patches (the driver
+is upstream), no new host interface, and GL presentation that already
+exists. The small driver is only cheaper in dependency count.
+
+**winewayland.drv running (2026-10-06):** a Win32 window painted with
+GDI (FillRect, TextOut through FreeType) shows on gex's compositor
+(`gexc run --wayland /tmp/wayland-0 --wayland-out ...`). What it took:
+- Dependencies, static wasm32, in `$W/wl/install` (`$W/wl/build-wl.sh`,
+  sha256-checked): **wayland 1.23.1** (`864fb2a8399e2d0ec39d56e9d9b753c093775beadc6022ce81f441929a81e5ed`,
+  sources compiled directly, scanner built for the host), **libxml2
+  2.12.9** (`59912db536ab56a3996489ea0299768c7bcffe57169f0235e7f962a91f483590`,
+  for xkbregistry, which winewayland requires), **libxkbcommon 1.7.0**
+  (`65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b247`,
+  meson 1.5.2 from a pip wheel). libffi is replaced by `$W/wl/ffi`
+  (`ffi_call` by argument count: every listener argument is an i32 on
+  wasm32). XKB data is the host's `/usr/share/X11/xkb`.
+- The W3 tree is configured with FreeType and Wayland (`$W/configure-w3.sh`:
+  sonames given for the static libraries; tools are `$W/wine-tools-w3`).
+  `$W/link-w3.sh` links winewayland's Unix side (`get_region_data`
+  renamed apart) and the libraries.
+- `tools/wine-wasm/stage-native.sh`: a DLL with no .spec (a driver) gets
+  an empty one, so its skeleton is a DLL whose DllMain runs (it was an
+  exe skeleton: the driver loaded but never initialised), and a `.drv`
+  directory keeps its extension.
+- gex-wayland: **wp_viewporter** (Wine's driver will not start without
+  it): viewports accepted, the destination recorded per surface.
+- **No Wine fork patch** for the driver itself.
+- The suite's prefix keeps the null driver (`$W/pfx-w3`, 32 of 40);
+  `W3_GRAPHICS=wayland W3_PROGRAMS="explorer.exe winewayland.drv"
+  $W/stage-w3.sh $W/pfx-w3wl` stages the Wayland one. On it user_win
+  (34), gdi (37) and input (20) pass, and display (20 of 24 at
+  `--wayland-size 1280x1024`) fails only where the null driver does.
+- **Display modes:** a Wayland client cannot set the output's mode, so
+  the Wayland prefix sets Wine's own `EmulateModeset=Y` (HKCU
+  `Software\\Wine\\X11 Driver`, the fixture in `$W/stage-w3.sh`): win32u
+  offers the standard sizes up to the output's and switches among them
+  itself. Modes above the output's are not offered, as on a monitor that
+  size (at the default 640x480 output, 800x600 is not on offer), so the
+  compositor needs no fake modes.
+- **VkKeyScan** returned letters with Shift swapped: winewayland makes
+  every letter an SGCAPS pair (Caps Lock row, then the normal row) and
+  win32u's `kbd_tables_wchar_to_vkey` matched the Caps Lock row. One
+  fork patch (inventory), an upstream bug fix to send.
+
+**W3.4 GL (2026-10-06): opengl32 on gex-gl through winewayland.** The
+i386 suite on the Wayland prefix (`--gl --wayland ... --wayland-size
+1280x1024`, `$W/w3-nt-wl1.log`) is **34 of 40**: glcompat (22) and glfast
+(16) pass; left are lownull x2 (§5.0), filemap and display (shared views),
+crypt (no provider registered), pipe (the x64 architecture check).
+- gex-gl's guest library (`guest/gl/gexgl.c`) is compiled for wasm32
+  (`$W/gl/build-gl.sh` → `$W/gl/gexgl.o`) and linked into the loader;
+  every function it defines is in the dlopen registry as `libEGL.so.1`
+  (win32u dlsym's two names and takes the rest from eglGetProcAddress,
+  which looks them up there), and the libwayland functions it finds by
+  dlopen are registered too. The tree is configured with OpenGL
+  (`$W/configure-w3.sh`: an `egl.pc` naming gex-gl, the host's Khronos
+  headers in `$W/gl/include`); `$W/link-w3.sh` links opengl32's Unix side.
+  `opengl32.dll` is staged native (`W3_PROGRAMS`).
+- gex-gl changes (merge/w3): `eglQueryString(EGL_EXTENSIONS)` lists what it
+  has (Wine requires the client get-all-proc-addresses and platform-base
+  extensions, and create-context, no-error and no-config on the display);
+  `eglGetConfigAttrib` answers buffer size, transparency (EGL_NONE),
+  colour buffer type, conformance and caveat (a zero buffer size left
+  win32u no format for its internal context: `wglMakeCurrent(0, 0)` and
+  `wglDeleteContext` failed); `wl_proxy_marshal` is called as the variadic
+  it is (a fixed-argument call is a type mismatch on wasm32).
+- Objects compiled before the ICALL plugin gained declaration thunks
+  (`$W/sr-w3`, 09:23 that day) lacked them: opengl32's extension table
+  handed i386 code a bare table index (`wglGetProcAddress("glFenceSync")`,
+  an execute fault at 0x84F8). Rebuilding every older object fixed it; a
+  build tree must not mix objects from before and after a plugin change.
+- **No Wine fork patch** for GL.
+
+#### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
+
+Every change is behind `__wasm32__` (or only built for it). What, why, and
+what would let it go:
+
+| patch | why | dropped when |
+|---|---|---|
+| ntdll/unix `signal_wasm32.c` (new file) and `current_machine`/CPUID | the per-CPU port: gex in place of signal contexts and assembly | never (it is the port) |
+| ntdll.so's dir is the loader's; no re-exec; `wineloader` is itself | one closed-world program, no preloader | never |
+| `gex.image_mapped` from virtual.c | native DLL skeletons bound when ntdll.so maps them | gex learns image maps another way (unlikely) |
+| kernel stacks top-down | gex's dispatch directory sits under 0x400000 | gex moves its directory |
+| thread entry at pthread's type; SIGCHLD not taken by the server; no fork in the server | wasm traps on a mistyped indirect call; in-process server | never / with the in-process server |
+| wineserver as a thread (`server/wasm32_inproc.h`, `start_server`, `wineserver_exit`, `unshare(CLONE_FS)`), USD at 0x7ffe0000, one 16 MiB session block, registry flush at exit | §3.5: shared memory must be one memory | cross-process coherent shared memory (below) |
+| faults as i386 reports them; SIGUSR1/QUIT/INT handlers; unblock at thread start | signals and faults through gex hooks | never (port) |
+| Unix side on its own stack; Unix calls keep guest registers | wasm32 syscalls use the guest context's registers | never (port) |
+| NtFlushInstructionCache → `gex.code_changed` | gex translates code | never |
+| Unix calls from i386 code through the trampoline; wasm callers direct (gexrt) | one pointer serves both | never |
+| programs in the one module (winegcc r.o, winebuild exe entry, CRT table markers); crt_main/crt_wmain call clang's main | native programs | upstream wasm32 support (never) |
+| native modules' imports loaded (ntdll/loader.c `fixup_imports`) | skeletons have no import table | skeletons that carry real import tables (winebuild) |
+| child processes by clone, not fork | asyncify fork cannot cross gex's frames | never under W3 |
+| RtlCreateUserThread wraps a native void entry | every entry is called as LPTHREAD_START_ROUTINE | never |
+| win32u DllMain always loads win32u.so | one module: the dispatcher variable is ntdll's | separate win32u module (no) |
+| user callbacks return through gex's pad | gex watches call-out returns by dispatch slot | never (port) |
+| **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
+| **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
+| winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
+| win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific): upstream-ready, ungated, in `docs/wine-upstream/0001-win32u-VkKeyScan-skip-SGCAPS-caps-row.patch`, **not submitted** (needs the user's OK) |
+
+**Future option for the last two (and the server's 16 MiB block)**, not
+built: a SharedArrayBuffer-backed extra memory (wasm multi-memory) holding
+the session objects, which Wine's Unix side reaches only through its
+shared-object read/write macros (`memory.copy` between memories). It would
+be coherent across processes natively and in the browser (every process
+imports the same extra memory), so explorer could run as its own process
+and win32u could map the session normally. Decided later, as a gex-wide
+question (it touches fork and more than Wine).
+
+**G's repros as acceptance tests** (`scratch/G/wrepro/`, i386 programs
+from tests/nt/src on merge/games2; today each stops in the NT layer):
+
+| repro | what it needs | W3 step |
+|---|---|---|
+| hooks.exe (Katana ZERO, Spelunky 2) | NtUserSetWindowsHookEx and hook calls | W3.3 (win32u.so) |
+| iocp.exe (Spelunky 2) | I/O completion ports | W3.1 (ntdll.so + wineserver) |
+| unixpath.exe (Dicey Dungeons) | `\??\unix\` paths | W3.1 (ntdll.so's file code) |
+| keyname.exe (Spelunky 2) | NtUserGetKeyNameText | W3.3 (win32u.so, the driver's keyboard layout) |
+| sysmisc.exe (OneShot) | NtSetThreadExecutionState, SystemParametersInfo 0x5d/0x5e/0x2000/0x2001, VirtualLock | W3.1 (ntdll.so) and W3.3 (win32u.so) |
+| com.exe (N++, OneShot, 5D Chess, Retrocycles) | DirectInput8, MMDevice, WIC, dsound classes registered | W3.2 (wineboot's registration) |
+| glbig.exe (Undertale, Retrocycles) | GL calls carrying over 8 MiB | W3.4 (opengl32.so, no ring) |
+| glcore.exe (5D Chess, Cruelty Squad) | 3.3 core-profile contexts | W3.4 (winewayland's EGL) |
+
+Also seen in G's games (no repro yet): audio drivers loaded by name and
+secur32's Unix side failing soft (W3.5); a synchronous NtNotifyChangeKey and
+NtAreMappedFilesTheSame (W3.1); NtSetContextThread on another thread
+(W3.1, wineserver); NtCreateUserProcess (W3.1, a crash handler's process).
+Momodora's missing glGetShaderSource/glGetAttachedShaders and wined3d draw
+errors are W3.4.
+
+**Prefixes are copy-on-write** (merge/w3): `stage-native.sh` links only the
+large read-only files (DLLs, programs, fonts, NLS) to the staged prefix and
+copies every other file, so a run that writes the registry, win.ini or
+INetCookies/index.dat writes its own copy. `$W/pfx-*` were fixed in place
+(2026-10-06).
+
+**W3.0 findings so far (2026-10-06, branch merge/w3, fork branch
+`wasm32-w3`):**
+- Every ntdll/unix object compiles for wasm32 (fork 436bf6eda79:
+  `current_machine` is i386; CPUID is the x86 lifter's sysreg -100 on the
+  thread's context; XGETBV reports x87 and SSE only).
+- **A wasm32 program calls i386 code through the function table**
+  (`tools/wine-wasm/spike-w3/gc.c`: it maps `add` as x86 and calls it,
+  `add(40, 2) = 42`), once the process's translator decodes i386: a wasm32
+  program leaves the class alone today (an x86-64 parent keeps its own), so
+  the container needs a flag saying its guest code is i386
+  (`GEX_W3_COMPAT=1` stands in for it on merge/w3).
+- **Faults in that x86 code do not reach the program**
+  (`spike-w3/fault.c`): a guest access past the memory traps the whole wasm
+  stack, native frames included, and the run ends. Wine's model needs the
+  fault delivered to ntdll.so's SIGSEGV handler with the i386 state, the
+  guest resumed where the handler leaves the context, and the native frames
+  under the guest code kept. That is W3.1's core (a resumable fault for
+  guest memory accesses in a wasm32 process, delivered synchronously as a
+  signal; the W2 NT path dispatches only after the trap). Also: an access
+  to the low guest pages (a NULL dereference) does not fault under gex at
+  all (the contexts live there), on any path.
+- Option A (the wasm32 loader is the process) stands; B is not needed.
+
+**Total:** about 20–31 agent days, against the 5–8 W3 was given before
+W2 showed what stays on the NT layer. Order: W3.0 → W3.1 → W3.2 (closes
+Retrocycles' dsound) → W3.3 (Katana ZERO) → W3.4 (Retrocycles' GL) → W3.5
+(Undertale) → W3.6 → W3.7. Each step lands on its own (`--wine unix` is
+opt-in until W6 retires the NT layer).
+
 ### 4.1 W0 results
 
 **(a) wineserver and a Unix library on gex-kernel: works natively.**
@@ -1086,6 +1560,22 @@ plus `make -k`.
   bytes in system DLLs, self-modifying hooks. They are rare in this set and
   handled by rebinding on write (§3.3).
 
+### 5.0 Cross-cutting: low-page protection (open, for a later decision)
+
+A guest access to the lowest guest pages (a NULL dereference, `[0]`,
+`[eax+8]` with EAX = 0) does not fault under gex on any path: those pages
+hold gex's own state (thread contexts, the dispatch directory), and
+translated code reads and writes them like any memory. Linux and Windows
+both keep the first 64 KiB unmapped, and programs rely on the fault:
+Windows SEH `__try` around a possibly-NULL pointer, runtimes that turn an
+access violation into a NullReferenceException (Mono: stream U works around
+it with `MONO_DEBUG=explicit-null-checks`; .NET, the JVM), crash handlers.
+Found by W3.0's spike (`tools/wine-wasm/spike-w3/fault.c`). Options to
+decide between later: move gex's low state above the guest's range and
+guard the low pages in the translators' address check (a cost on every
+access without a static offset), or a guard only where a static base is
+zero. Not fixed for W3.
+
 ### 5.1 Queued (user, 2026-10-05): the guest's Unix userland as native wasm
 
 After the current W2 items (user32/gdi32 native, `_vsnprintf_s`,
@@ -1225,23 +1715,54 @@ Heads:
   `$W/bb-gate`, `$W/pfx-gui-fork` alone until the coordinator says done.
 - **merge/elf-prov** (wt/elf-prov): the development branch (all commits,
   several gex-cgen ones).
-- **merge/elf-prov-gate** (wt/elf-prov-gate): the gate-ready shape of
-  elf-prov at 7d447eb8, on wine-slim 10e816c3 plus the stdin fix: ONE
-  gex-cgen commit (af98737d), then gex-ld, native, browser, gex-kernel TCP,
+- **merge/elf-prov-gate2** (wt/elf-prov-gate2, 02a3ab7a): the gate-ready shape of
+  elf-prov at d7b7f462, on wine-slim 10e816c3 plus the stdin fix: ONE
+  gex-cgen commit (ceb54180, incl. glibc_math), then gex-ld (incl. 32-bit
+  dynsyms), native, browser (incl. the scheduler fixes), gex-kernel TCP,
   docs. `$W/check-elfprov-gate.sh` runs its pre-gate checks (output
-  `$W/gchk.out`). Not yet in it (on merge/elf-prov since): 11c3e8b6 32-bit
-  dynsyms (gex-ld), 5eaed62a glibc_math (gex-cgen: fold into the one
-  commit), 749f13cd/the idle fix (browser scheduler). Rebuild the gate
-  branch with them (same path split: `git checkout <dev head> -- <paths>`
-  per commit), rerun the checks, then merge master once integ-g lands and
-  send the head.
+  `$W/gchk2.out`): **all green on 02a3ab7a** (elf-prov 5/5 native and in
+  the browser, x86-programs 74, nt --no-cgen 81/81 on x86 and pfx-gui,
+  cgen-prefix 81/81, wasm32 4/4 + busybox both, browser nt 49/49). Gate
+  order (coordinator): integ-g, U's fjit fix, E's ejected page, then gate2
+  with F's final head (both re-key). integ-g landed (master c5620656);
+  **gate2 head 004538a9** (that master merged in) is green again
+  (`$W/gchk3.out`: the same counts, browser nt 49/49) and was sent to the
+  coordinator.
+- **W3** (the user's order: before W7): plan in §4.0. gex branch
+  merge/w3 (wt/w3, off merge/elf-prov) with the W3.0 spike; Wine fork
+  branch `wasm32-w3` (wt/wine-w3; build tree `$W/wine-w32-w3` via
+  `$W/build-w32-w3.sh [targets]`, sysroot **`$W/sr-w3`** for every W3 build (a hard-linked copy of sr-slim whose only change is the ICALL plugin with declaration thunks; sr-slim stays read only); loader link
+  `$W/link-w3.sh`, prefix and dll dir `$W/stage-w3.sh`). hello_args.exe
+  runs on Wine's own Unix side, wineserver in process. **W3.3 in
+  progress** (§4.0): win32u.so linked in, the session read from the
+  in-process server, explorer's desktop as a thread (option (a)); test
+  prefix `W3_PROGRAMS=explorer.exe $W/stage-w3.sh` (null-driver fixture).
+  tests/nt i386 **32 of 40** (`$W/w3-nt8.log`; user_win and gdi pass; left:
+  lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
+  glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`); winewayland.drv draws on gex's
+  compositor (`$W/pfx-w3wl`). Output modes (Wine's EmulateModeset) and VkKeyScan done; W3.4 GL: opengl32 on gex-gl through winewayland, glcompat and glfast pass (34 of 40 on `$W/pfx-w3wl`). Wine fork head 74de38ed1ba (mw).
+  **gate2 landed** (master 36f55bb6), and w3-gate1 (wp_viewporter, master
+  1b4bd047, merged into merge/w3). **merge/w3 gate head** sent after
+  `$W/check-w3-gate.sh` (output `$W/w3chk.out`): crates green, elf-prov 5/5
+  native and in the browser, x86-programs 82, nt --no-cgen 83/83 on x86 and
+  pfx-gui, cgen-prefix 83/83, wasm32 4/4 + busybox both, browser nt 49/49,
+  W3 i386 32 of 40 (null driver) and 34 of 40 (Wayland + GL). The old merge/elf-prov-gate is deleted. To
+  rebuild after new dev commits: same path split (`git checkout <dev
+  head> -- <paths>` per commit), rerun the checks, merge master once
+  integ-g lands, send the head.
 - Since the last notes: the browser scheduler no longer reports "idle"
   for a wait4/sleep/futex wait (a child in another Worker), and a thread
   whose process exited ends at its next syscall (the pause() one);
   glibc_math (floor/ceil/trunc/round and float forms, bitwise);
   `gex_ld` reads 32-bit dynamic symbols.
-- Open: TCP loopback across browser processes (the port table is per
-  shim instance; needs the global kernel); UDP listeners; libm sin/cos
+- After gate2 (dev only, next landing): f9c5a9ec TCP between a page's
+  processes (listeners/loopback streams in the global kernel; abstract
+  names freed on close).
+- Also dev only: cb1431d0 UDP between guests (natively and within one
+  page process) and a blocking recvfrom that waits (it answered EAGAIN).
+- Open: UDP between a page's processes (the global kernel has only
+  streams); AF_INET sockets in a page without a network stack
+  (EAFNOSUPPORT, so loopback TCP needs GEX_NETWORK there); libm sin/cos
   (needs glibc's own bits); a paired page run of the providers on edger
   (E holds the lock).
 
