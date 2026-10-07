@@ -176,6 +176,12 @@ build_ncurses() {
     --with-default-terminfo-dir=/usr/share/terminfo --enable-pc-files --with-pkg-config-libdir=/usr/lib/pkgconfig
   make -j$JOBS
   make install DESTDIR=$SYSROOT
+  # the names configure scripts probe for (-ltinfo, -lncurses, -lcurses)
+  for l in tinfo ncurses curses; do ln -sf lib${l}w.a $SYSROOT/usr/lib/lib$l.a 2>/dev/null || true; done
+  ln -sf libncursesw.a $SYSROOT/usr/lib/libcurses.a
+  [ -e $SYSROOT/usr/include/curses.h ] || ln -sf ncursesw/curses.h $SYSROOT/usr/include/curses.h
+  [ -e $SYSROOT/usr/include/term.h ] || ln -sf ncursesw/term.h $SYSROOT/usr/include/term.h
+  [ -e $SYSROOT/usr/include/ncurses.h ] || ln -sf ncursesw/ncurses.h $SYSROOT/usr/include/ncurses.h
 }
 build_less() {
   CPPFLAGS="-I$SYSROOT/usr/include/ncursesw" at_configure --with-regex=posix
@@ -259,3 +265,34 @@ build_fmt() {
   ninja -C b -j$JOBS
 }
 test_fmt() { (cd b && timeout ${TMO:-3600} ctest -j$JOBS --output-on-failure) > ct.out 2>&1; tail -30 ct.out; ctest_result ct.out; }
+build_perl() {
+  # Configure as a native build: its try programs run (under gexc). Library
+  # and header searches only in the sysroot, so host libraries (gdbm, db)
+  # are not picked up. Extensions static (no dlopen of side modules).
+  sh Configure -des -Dcc=gexcc -Dld=gexcc -Dar=gexcc-ar -Dranlib=gexcc-ranlib -Dnm=gexcc-nm -Uusenm \
+    -Dprefix=/usr -Uusedl -Dlibpth="$SYSROOT/lib $SYSROOT/usr/lib" -Dloclibpth= -Dlocincpth= -Dglibpth= \
+    -Dusrinc="$SYSROOT/include" -Doptimize=-O2 -Dman1dir=none -Dman3dir=none
+  make -j$JOBS
+}
+test_perl() {
+  TEST_JOBS=$JOBS timeout ${TMO:-7200} make test_harness > t.out 2>&1; tail -40 t.out
+  files=$(sed -n 's/^Files=\([0-9]*\),.*/\1/p' t.out | tail -1)
+  f=$(sed -n 's/^Failed \([0-9]*\)\/[0-9]* test programs.*/\1/p' t.out | tail -1)
+  echo "RESULT pass=$(( ${files:-0} - ${f:-0} )) fail=${f:-0} skip=0"
+}
+build_python3() {
+  # a native-style configure (its checks run under gexc); extension modules
+  # static, as for wasm; libraries from the sysroot only
+  MODULE_BUILDTYPE=static PKG_CONFIG=$T-pkg-config CC=gexcc CXX=gexc++ AR=gexcc-ar RANLIB=gexcc-ranlib \
+    ./configure --prefix=/usr --disable-shared --without-ensurepip --disable-test-modules \
+      --with-pkg-config=yes ac_cv_file__dev_ptmx=yes ac_cv_file__dev_ptc=no
+  make -j$JOBS
+}
+test_python3() {
+  timeout ${TMO:-7200} ./python -m test -j$JOBS --timeout 600 > t.out 2>&1; tail -60 t.out
+  ok=$(sed -n 's/^\([0-9]*\) tests* OK\./\1/p' t.out | tail -1)
+  f=$(sed -n 's/^\([0-9]*\) tests* failed:/\1/p' t.out | tail -1)
+  e=$(sed -n 's/^\([0-9]*\) tests* failed again:/\1/p' t.out | tail -1)
+  sk=$(sed -n 's/^\([0-9]*\) tests* skipped:/\1/p' t.out | tail -1)
+  echo "RESULT pass=${ok:-0} fail=${f:-0} skip=${sk:-0}"
+}
