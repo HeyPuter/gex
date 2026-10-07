@@ -1157,13 +1157,23 @@ GDI (FillRect, TextOut through FreeType) shows on gex's compositor
   directory keeps its extension.
 - gex-wayland: **wp_viewporter** (Wine's driver will not start without
   it): viewports accepted, the destination recorded per surface.
-- **No Wine fork patch** for any of it.
+- **No Wine fork patch** for the driver itself.
 - The suite's prefix keeps the null driver (`$W/pfx-w3`, 32 of 40);
   `W3_GRAPHICS=wayland W3_PROGRAMS="explorer.exe winewayland.drv"
   $W/stage-w3.sh $W/pfx-w3wl` stages the Wayland one. On it user_win
-  (34) and gdi (37) pass; open: input's VkKeyScan, and display's mode
-  list (the compositor offers one wl_output mode, so 800x600 is not on
-  offer: more modes from gex-wayland next).
+  (34), gdi (37) and input (20) pass, and display (20 of 24 at
+  `--wayland-size 1280x1024`) fails only where the null driver does.
+- **Display modes:** a Wayland client cannot set the output's mode, so
+  the Wayland prefix sets Wine's own `EmulateModeset=Y` (HKCU
+  `Software\\Wine\\X11 Driver`, the fixture in `$W/stage-w3.sh`): win32u
+  offers the standard sizes up to the output's and switches among them
+  itself. Modes above the output's are not offered, as on a monitor that
+  size (at the default 640x480 output, 800x600 is not on offer), so the
+  compositor needs no fake modes.
+- **VkKeyScan** returned letters with Shift swapped: winewayland makes
+  every letter an SGCAPS pair (Caps Lock row, then the normal row) and
+  win32u's `kbd_tables_wchar_to_vkey` matched the Caps Lock row. One
+  fork patch (inventory), an upstream bug fix to send.
 
 #### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
 
@@ -1191,6 +1201,7 @@ what would let it go:
 | **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
 | **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
 | winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
+| win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific) |
 
 **Future option for the last two (and the server's 16 MiB block)**, not
 built: a SharedArrayBuffer-backed extra memory (wasm multi-memory) holding
