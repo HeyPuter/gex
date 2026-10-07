@@ -1135,6 +1135,36 @@ winewayland wins on every axis that lasts: fewer fork patches (the driver
 is upstream), no new host interface, and GL presentation that already
 exists. The small driver is only cheaper in dependency count.
 
+**winewayland.drv running (2026-10-06):** a Win32 window painted with
+GDI (FillRect, TextOut through FreeType) shows on gex's compositor
+(`gexc run --wayland /tmp/wayland-0 --wayland-out ...`). What it took:
+- Dependencies, static wasm32, in `$W/wl/install` (`$W/wl/build-wl.sh`,
+  sha256-checked): **wayland 1.23.1** (`864fb2a8399e2d0ec39d56e9d9b753c093775beadc6022ce81f441929a81e5ed`,
+  sources compiled directly, scanner built for the host), **libxml2
+  2.12.9** (`59912db536ab56a3996489ea0299768c7bcffe57169f0235e7f962a91f483590`,
+  for xkbregistry, which winewayland requires), **libxkbcommon 1.7.0**
+  (`65782f0a10a4b455af9c6baab7040e2f537520caa2ec2092805cdfd36863b247`,
+  meson 1.5.2 from a pip wheel). libffi is replaced by `$W/wl/ffi`
+  (`ffi_call` by argument count: every listener argument is an i32 on
+  wasm32). XKB data is the host's `/usr/share/X11/xkb`.
+- The W3 tree is configured with FreeType and Wayland (`$W/configure-w3.sh`:
+  sonames given for the static libraries; tools are `$W/wine-tools-w3`).
+  `$W/link-w3.sh` links winewayland's Unix side (`get_region_data`
+  renamed apart) and the libraries.
+- `tools/wine-wasm/stage-native.sh`: a DLL with no .spec (a driver) gets
+  an empty one, so its skeleton is a DLL whose DllMain runs (it was an
+  exe skeleton: the driver loaded but never initialised), and a `.drv`
+  directory keeps its extension.
+- gex-wayland: **wp_viewporter** (Wine's driver will not start without
+  it): viewports accepted, the destination recorded per surface.
+- **No Wine fork patch** for any of it.
+- The suite's prefix keeps the null driver (`$W/pfx-w3`, 32 of 40);
+  `W3_GRAPHICS=wayland W3_PROGRAMS="explorer.exe winewayland.drv"
+  $W/stage-w3.sh $W/pfx-w3wl` stages the Wayland one. On it user_win
+  (34) and gdi (37) pass; open: input's VkKeyScan, and display's mode
+  list (the compositor offers one wl_output mode, so 800x600 is not on
+  offer: more modes from gex-wayland next).
+
 #### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
 
 Every change is behind `__wasm32__` (or only built for it). What, why, and
@@ -1669,8 +1699,8 @@ Heads:
   prefix `W3_PROGRAMS=explorer.exe $W/stage-w3.sh` (null-driver fixture).
   tests/nt i386 **32 of 40** (`$W/w3-nt8.log`; user_win and gdi pass; left:
   lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
-  glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`). Next: the
-  display driver. Wine fork head 4e9cf004685 (mw).
+  glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`); winewayland.drv draws on gex's
+  compositor (`$W/pfx-w3wl`). Next: output modes, keyboard, then W3.4 GL. Wine fork head 4e9cf004685 (mw).
   gate2 004538a9 is gating as integ/2026-10-06f (E's page landed, master
   a0bbb53c). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
