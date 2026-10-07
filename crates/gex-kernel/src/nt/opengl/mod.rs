@@ -61,6 +61,20 @@ pub const TAIL_BUSY: u32 = 1 << 31;
 pub const GL_FAST_ARRAYS: u64 = super::USD + 0xfe8;
 const ARRAYS_TEX_SHIFT: u32 = 16;
 
+/// Where the fast path's array state is: the address of a block of words
+/// the layer allocates with the ring ([`FastState`]), 0 when there is none.
+/// The provider sets client-memory array pointers there and draws from it;
+/// the layer keeps it current and reads the pointers back before it uses
+/// them ([`sync_arrays`]).
+pub const GL_FAST_STATE: u64 = super::USD + 0xfec;
+/// The block's words: GL_ARRAY_BUFFER's binding, then whether any enabled
+/// generic attribute reads client memory (no fast draw then), then five per
+/// fixed array (`VERTEX` .. `FOG`): size, type, stride, pointer, buffer.
+pub const FS_ARRAY_BUFFER: u64 = 0;
+pub const FS_ATTRIB_CLIENT: u64 = 4;
+pub const FS_ARRAYS: u64 = 16;
+pub const FS_ARRAY_WORDS: u64 = 5;
+
 /// Whether the fast path is offered: the host sets it from `GEX_NT_GL_FAST`
 /// (default on; `0` for A/B runs) before the program starts.
 pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -261,6 +275,8 @@ struct Ctx {
 
 pub struct State {
     ring: u64,
+    /// The fast path's array state ([`GL_FAST_STATE`]), 0 without one.
+    fast_state: u64,
     dev: Option<Arc<dyn FileHandle>>,
     host_made: bool,
     contexts: HashMap<u64, Ctx>,
@@ -312,6 +328,7 @@ impl Default for State {
     fn default() -> Self {
         State {
             ring: 0,
+            fast_state: 0,
             dev: None,
             host_made: false,
             contexts: HashMap::new(),
@@ -367,12 +384,26 @@ fn open_device(c: &mut Call<'_>) -> R<()> {
     // that reads the address sees a tail that belongs to it.
     c.g.w32(GL_FAST_TAIL, 0)?;
     c.g.w32(GL_FAST_ARRAYS, arrays_off())?;
-    if fast_path() {
-        c.g.w32(GL_FAST_RING, ring as u32)?;
-    }
+    // The provider is i386's, and the block holds 32-bit pointers.
+    let fast_state = if fast_path() && c.p.abi == Abi::P32 {
+        super::sysinfo::alloc_private(c, 4096, "[gex-gl fast state]")?
+    } else {
+        0
+    };
     s = c.p.gl.lock().unwrap();
     s.ring = ring;
     s.dev = Some(dev);
+    s.fast_state = fast_state;
+    drop(s);
+    if fast_state != 0 {
+        publish_words(c)?;
+        for i in 0..FIXED_ARRAYS {
+            publish_array(c, i)?;
+        }
+        c.g.w32(GL_FAST_STATE, fast_state as u32)?;
+        c.g.w32(GL_FAST_RING, ring as u32)?;
+    }
+    s = c.p.gl.lock().unwrap();
     Ok(())
 }
 
@@ -1185,6 +1216,50 @@ fn sync_arrays(c: &Call<'_>) {
     for (i, a) in s.arrays.iter_mut().enumerate().take(FOG + 1) {
         a.enabled = w >> i & 1 != 0;
     }
+    // And the pointers the provider set (glVertexPointer and the others
+    // into client memory).
+    let st = s.fast_state;
+    if st != 0 {
+        for (i, a) in s.arrays.iter_mut().enumerate().take(FOG + 1) {
+            let at = st + FS_ARRAYS + 4 * FS_ARRAY_WORDS * i as u64;
+            let word = |k: u64| c.g.u32(at + 4 * k).unwrap_or(0);
+            a.size = word(0) as i32;
+            a.ty = word(1);
+            a.stride = word(2) as i32;
+            a.pointer = word(3) as u64;
+            a.buffer = word(4);
+        }
+    }
+}
+
+/// Fixed array `i` into the fast state, after the layer changed it.
+fn publish_array(c: &mut Call<'_>, i: usize) -> R<()> {
+    let (st, a) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.fast_state, s.arrays[i])
+    };
+    if st == 0 || i > FOG {
+        return Ok(());
+    }
+    let at = st + FS_ARRAYS + 4 * FS_ARRAY_WORDS * i as u64;
+    for (k, v) in [a.size as u32, a.ty, a.stride as u32, a.pointer as u32, a.buffer].into_iter().enumerate() {
+        c.g.w32(at + 4 * k as u64, v)?;
+    }
+    Ok(())
+}
+
+/// GL_ARRAY_BUFFER's binding and whether a generic attribute reads client
+/// memory, into the fast state.
+fn publish_words(c: &mut Call<'_>) -> R<()> {
+    let (st, ab, attrib_client) = {
+        let s = c.p.gl.lock().unwrap();
+        (s.fast_state, s.array_buffer, s.attribs.iter().any(|a| a.enabled && a.buffer == 0 && a.pointer != 0))
+    };
+    if st == 0 {
+        return Ok(());
+    }
+    c.g.w32(st + FS_ARRAY_BUFFER, ab)?;
+    c.g.w32(st + FS_ATTRIB_CLIENT, attrib_client as u32)
 }
 
 /// Write the layer's array flags and client texture to [`GL_FAST_ARRAYS`].
@@ -1377,6 +1452,7 @@ const GL44_GET_TEX_IMAGE: u32 = 1247;
 /// glNormalPointer, glFogCoordPointer, glSecondaryColorPointer: fixed array
 /// `i` with `size` components.
 fn set_typed_pointer(c: &mut Call<'_>, i: usize, size: i32, ty: u32, stride: i32, pointer: u64) -> R<()> {
+    sync_arrays(c);
     let a = {
         let mut s = c.p.gl.lock().unwrap();
         let buffer = s.array_buffer;
@@ -1388,6 +1464,7 @@ fn set_typed_pointer(c: &mut Call<'_>, i: usize, size: i32, ty: u32, stride: i32
         a.buffer = buffer;
         *a
     };
+    publish_array(c, i)?;
     if a.buffer != 0 {
         send_array_pointer(c, i, &a, pointer)?;
     }
@@ -1407,6 +1484,7 @@ fn array_index(c: &Call<'_>, cap: u32) -> Option<usize> {
 }
 
 fn set_pointer(c: &mut Call<'_>, i: usize, opcode: u32, size: i32, ty: u32, stride: i32, pointer: u64) -> R<()> {
+    sync_arrays(c);
     let buffer = c.p.gl.lock().unwrap().array_buffer;
     {
         let mut s = c.p.gl.lock().unwrap();
@@ -1417,6 +1495,7 @@ fn set_pointer(c: &mut Call<'_>, i: usize, opcode: u32, size: i32, ty: u32, stri
         a.pointer = pointer;
         a.buffer = buffer;
     }
+    publish_array(c, i)?;
     if buffer != 0 {
         let [lo, hi] = proto::Batch::words64(pointer);
         cmd(c, opcode, &[size as u32, ty, stride as u32, lo, hi], &[])?;
@@ -2078,6 +2157,7 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
                 a.kind = kind;
                 *a
             };
+            publish_words(c)?;
             if a.buffer != 0 {
                 send_attrib_pointer(c, index, &a, pointer)?;
             }
@@ -2088,6 +2168,7 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
             if let Some(a) = c.p.gl.lock().unwrap().attribs.get_mut(index as usize) {
                 a.enabled = on;
             }
+            publish_words(c)?;
             cmd(c, if on { op::ENABLE_VERTEX_ATTRIB_ARRAY } else { op::DISABLE_VERTEX_ATTRIB_ARRAY }, &[index], &[])?;
         }
         "glVertexAttribDivisor" => {
@@ -2328,6 +2409,9 @@ fn one(c: &mut Call<'_>, name: &str, p: &Params) -> R<()> {
                     _ => {}
                 }
                 s.bound.insert(t, b);
+            }
+            if t == 0x8892 {
+                publish_words(c)?;
             }
             cmd(c, op::BIND_BUFFER, &[t, b], &[])?;
         }
@@ -2571,6 +2655,21 @@ mod tests {
         ] {
             assert_eq!(table::FUNCS[def(f) as usize].0, name, "{f}");
             assert_eq!(def(o), op as u64, "{o}");
+        }
+        assert_eq!(def("GL_FAST_STATE"), GL_FAST_STATE);
+        for (name, v) in [("FS_ARRAY_BUFFER", FS_ARRAY_BUFFER), ("FS_ATTRIB_CLIENT", FS_ATTRIB_CLIENT), ("FS_ARRAYS", FS_ARRAYS), ("FS_ARRAY_WORDS", FS_ARRAY_WORDS)] {
+            assert_eq!(def(name), v, "{name}");
+        }
+        // The pointer calls and glDrawArrays the provider takes, and the
+        // commands it writes for them (as upload_arrays_instanced does).
+        for (f, name) in [("FN_glVertexPointer", "glVertexPointer"), ("FN_glColorPointer", "glColorPointer"), ("FN_glTexCoordPointer", "glTexCoordPointer"), ("FN_glDrawArrays", "glDrawArrays")] {
+            assert_eq!(table::FUNCS[def(f) as usize].0, name, "{f}");
+        }
+        for (o, op) in [("OP_BIND_BUFFER", op::BIND_BUFFER), ("OP_DRAW_ARRAYS", op::DRAW_ARRAYS), ("OP_VERTEX_POINTER", op::VERTEX_POINTER), ("OP_COLOR_POINTER", op::COLOR_POINTER), ("OP_TEX_COORD_POINTER", op::TEX_COORD_POINTER), ("OP_CLIENT_ACTIVE_TEXTURE", op::CLIENT_ACTIVE_TEXTURE), ("OP_CLIENT_ARRAY", op::CLIENT_ARRAY)] {
+            assert_eq!(def(o), op as u64, "{o}");
+        }
+        for sig in ["piiip"] {
+            assert!(layout(sig, Abi::P32)[..5].iter().enumerate().all(|(i, o)| *o == 4 * i as u64));
         }
         assert_eq!(def("RING_HEADER"), HEADER);
         assert!(src.contains("#define CMD_CAPACITY (8u << 20)") && CMD_CAPACITY == 8 << 20);
