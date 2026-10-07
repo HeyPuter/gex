@@ -1175,6 +1175,35 @@ GDI (FillRect, TextOut through FreeType) shows on gex's compositor
   win32u's `kbd_tables_wchar_to_vkey` matched the Caps Lock row. One
   fork patch (inventory), an upstream bug fix to send.
 
+**W3.4 GL (2026-10-06): opengl32 on gex-gl through winewayland.** The
+i386 suite on the Wayland prefix (`--gl --wayland ... --wayland-size
+1280x1024`, `$W/w3-nt-wl1.log`) is **34 of 40**: glcompat (22) and glfast
+(16) pass; left are lownull x2 (§5.0), filemap and display (shared views),
+crypt (no provider registered), pipe (the x64 architecture check).
+- gex-gl's guest library (`guest/gl/gexgl.c`) is compiled for wasm32
+  (`$W/gl/build-gl.sh` → `$W/gl/gexgl.o`) and linked into the loader;
+  every function it defines is in the dlopen registry as `libEGL.so.1`
+  (win32u dlsym's two names and takes the rest from eglGetProcAddress,
+  which looks them up there), and the libwayland functions it finds by
+  dlopen are registered too. The tree is configured with OpenGL
+  (`$W/configure-w3.sh`: an `egl.pc` naming gex-gl, the host's Khronos
+  headers in `$W/gl/include`); `$W/link-w3.sh` links opengl32's Unix side.
+  `opengl32.dll` is staged native (`W3_PROGRAMS`).
+- gex-gl changes (merge/w3): `eglQueryString(EGL_EXTENSIONS)` lists what it
+  has (Wine requires the client get-all-proc-addresses and platform-base
+  extensions, and create-context, no-error and no-config on the display);
+  `eglGetConfigAttrib` answers buffer size, transparency (EGL_NONE),
+  colour buffer type, conformance and caveat (a zero buffer size left
+  win32u no format for its internal context: `wglMakeCurrent(0, 0)` and
+  `wglDeleteContext` failed); `wl_proxy_marshal` is called as the variadic
+  it is (a fixed-argument call is a type mismatch on wasm32).
+- Objects compiled before the ICALL plugin gained declaration thunks
+  (`$W/sr-w3`, 09:23 that day) lacked them: opengl32's extension table
+  handed i386 code a bare table index (`wglGetProcAddress("glFenceSync")`,
+  an execute fault at 0x84F8). Rebuilding every older object fixed it; a
+  build tree must not mix objects from before and after a plugin change.
+- **No Wine fork patch** for GL.
+
 #### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
 
 Every change is behind `__wasm32__` (or only built for it). What, why, and
@@ -1711,7 +1740,7 @@ Heads:
   tests/nt i386 **32 of 40** (`$W/w3-nt8.log`; user_win and gdi pass; left:
   lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
   glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`); winewayland.drv draws on gex's
-  compositor (`$W/pfx-w3wl`). Output modes (Wine's EmulateModeset) and VkKeyScan done; W3.4 GL in progress (opengl32 on gex-gl's EGL). Wine fork head 74de38ed1ba (mw).
+  compositor (`$W/pfx-w3wl`). Output modes (Wine's EmulateModeset) and VkKeyScan done; W3.4 GL: opengl32 on gex-gl through winewayland, glcompat and glfast pass (34 of 40 on `$W/pfx-w3wl`). Wine fork head 74de38ed1ba (mw).
   **gate2 landed** (master 36f55bb6; merge/w3 has master 132f73ed merged
   in). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
