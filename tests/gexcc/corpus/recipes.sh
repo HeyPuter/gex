@@ -42,8 +42,10 @@ guest() {
 
 # automake's test-suite summary (# PASS: n ...) summed over every log
 am_result() {
-  awk '/^# PASS:/{p+=$3} /^# FAIL:/{f+=$3} /^# ERROR:/{f+=$3} /^# XPASS:/{f+=$3} /^# SKIP:/{s+=$3} /^# XFAIL:/{x+=$3}
-       END{printf "RESULT pass=%d fail=%d skip=%d\n", p+x, f, s}' "$@"
+  # the per-test lines (a directory whose test-suite.log rule failed prints
+  # no summary)
+  awk '/^PASS: /{p++} /^XFAIL: /{p++} /^FAIL: /{f++} /^ERROR: /{f++} /^XPASS: /{f++} /^SKIP: /{s++}
+       END{printf "RESULT pass=%d fail=%d skip=%d\n", p, f, s}' "$@"
 }
 # automake: the host builds the suite (TESTS empty runs nothing), the guest runs it
 am_check() {
