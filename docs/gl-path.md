@@ -282,3 +282,47 @@ the new path's mean is 9% above the old one's, but the legs spread over
 48-61 world fps, so that difference is not established. A proper ABBA
 needs longer legs without the profile and with the AOT check satisfied
 (keep a short profile window, or relax NOITA_MIN_AOT for such runs).
+
+## Unity in the page: the bind-group error, the grass, and synchronous submits (2026-10-08)
+
+**"Bind group layout ... does not match layout ... of bind group" (Muck's
+page blanks at 500-700 s).** gex_wgpu skips setBindGroup/setPipeline when
+the handle equals the one it last set on the open pass (`ctx->emitted`).
+emdawnwebgpu handles are heap addresses; a bind group evicted from the cache
+is released one draw later (a pipeline at once), and the next object made can
+get the same address, so the draw skipped binding it and ran with the old one,
+built for another program's layout. The epoch that used to reset
+`ctx->emitted` stopped moving on eviction (for the cache's hit rate).
+Fix: a release serial that resets it, mesa-wink 9f1da0fa on `gl/perf` (not
+pushed). Repro: the same driver with a 4-slot bind group cache, replaying
+Noita's trace: 2668 (wink 5f5572e6) and 2720 (+6d3a4cfd) validation errors
+from frame 1343, 0 with the fix; so 6d3a4cfd neither causes nor fixes it.
+Muck's natively captured menu (29,466 frames) replays clean at stock size.
+U's page run with the fix (mp18): 0 errors over 572 s, presents past 500 s.
+
+**The grass (dots instead of blades).** gex_wgpu emulates geometry shaders;
+what failed is the shader version: st/mesa caps GLSL at the GL version
+gex_wgpu earns (4.0), Unity writes `#version 410` for the grass's geometry
+stage (460 natively). 707e84b8 compiles such sources as 400 with the
+4.1-4.6 ARB extensions enabled (all of Muck's native 460 shaders then
+compile). U's page run (mp19) still shows dots; its log has a Tint
+rejection, "index 2147483648 out of bounds", in a fragment shader at menu
+start: a driver SPIR-V emission bug, being chased with the shader's hex.
+
+**Synchronous submits.** Muck's native menu: 10 submits a frame, 8 of them
+glGetIntegerv(GL_SAMPLES / GL_READ_BUFFER), 1 glGetTexParameteriv
+(GL_TEXTURE_IMMUTABLE_FORMAT), 1 the present. In the page each is a round
+trip to the compositor (U: render thread 48% in gl_submit). 85c3bb78 caches
+framebuffer state queries in the guest library (tests/gl-state-query-cache.sh;
+21 submits -> 12 in the probe); 7605de5c submits a swap at interval 0
+without waiting (GEX_GL_SUBMIT_ASYNC, already served by both hosts).
+Page numbers pending (U).
+
+**KLOCK and Noita.** In the ejected page's profile (site-gl3) KLock::take is
+30 ms of Noita's main thread's 20.9 s (0.14%) and 8 ms on a job worker:
+Noita's GL submits are asynchronous already (the NT layer's PRESENT batch),
+so U's KLOCK change cannot move it.
+
+Native note: with master's guest GL (and this branch's), Muck natively
+segfaults U's edger gexc (10-07) and shows no frame within 420 s with a
+current gexc; U's 10-04 gl64 works. Reported to U.
