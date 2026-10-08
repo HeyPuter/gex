@@ -1246,14 +1246,35 @@ patched instead. Scope, as found:
   imports** at load time (wineboot delay-imports user32 and gdi32: nothing
   loaded them, win32u's syscall table was missing in its process and
   every NtUser call returned STATUS_INVALID_SYSTEM_SERVICE).
+- More, found by the tests (fork, `wasm32-w3`): a child's seqlock wait
+  refreshes its copy (a copy caught mid-write would spin for ever); a Unix
+  call with no library handle returns STATUS_DLL_NOT_FOUND instead of
+  trapping (wineps.drv's DllMain failure path, during DefaultInstall).
 - Tests: `tests/nt` **childgui** (user_win as a child: CreateProcess, wait;
-  `GEX_NT_CHILDREN=1`, native Wine only) passes all 34 checks in the child.
-  wineboot's full install as children (`launch.exe "wineboot.exe -u"`:
-  wineboot and its rundll32 children, PreInstall then DefaultInstall) runs
-  through PreInstall and into DefaultInstall (1.6 MB of registry written);
-  a grandchild (`control.exe appwiz.cpl install_mono`) trapped once on an
-  indirect-call type mismatch in a Unix call, not reproduced alone: being
-  chased. The registry-fixture idea is dropped.
+  `GEX_NT_CHILDREN=1`, native Wine only) passes all 34 checks in the child,
+  5 runs of 5. The launcher calls GetDesktopWindow first, as a GUI
+  launcher has a desktop: the desktop thread then lives in the process
+  hosting the server.
+- **Known limit: a desktop hosted in a child** (a console launcher whose
+  first GUI is its child) is not reliable: about one run in three, a
+  thread of the child's desktop process (the display settings restorer)
+  holds the USER lock into a message callback (`user_check_not_lock`
+  asserts) and the child's first window hangs. Not yet understood.
+- wineboot's full install with its steps as children
+  (`$W/w3tests/install-as-children.sh`: the launcher runs `wineboot.exe
+  -u`, which runs rundll32 for PreInstall and DefaultInstall) **completes
+  the install**: the registry has the crypto providers (16 keys), and
+  tests/nt `crypt` passes on that prefix (6 of 6). wineboot itself then
+  never finishes: after the install, in a child, it spins in its
+  `create_known_dlls` (mapping every known DLL as an image; gex's function
+  table lookups take the CPU), so the test is judged by the registry, not
+  wineboot's exit. As the first process wineboot finishes. Being chased.
+- Also found: native wineboot's `fstat` of wine.inf returns a garbage
+  mtime (5242148), so `.update-timestamp` never matches and every first
+  process of a session reinstalls; the tests write `disable` there. An
+  i386 program's `_fstat` is right (Wine's msvcrt), so it is the wasm32
+  build's struct stat or ucrt path. To fix.
+- The registry-fixture idea is dropped.
 - Cost, on edger through bench.sh (native gexc; a Windows server call,
   GetExitCodeThread, is 74.5 us there): in a child, IsWindow 97.8 us (0.30
   us in the process hosting the server), GetAsyncKeyState 572 us (0.76 us:
@@ -1303,6 +1324,9 @@ what would let it go:
 | **win32u reads the session from the in-process server** (`wineserver_session_data`) | a wasm memory cannot map the server's pages twice | coherent shared memory (below) |
 | **explorer's desktop as a thread** (`gexp_desktop_thread`, win32u starts it once, suspended so it knows the thread, which does not wait for itself; callers wait for the shell window; no shell in that thread; returns, no ExitProcess) | a second Windows process cannot see the session (§3.5) | coherent shared memory across gex processes, so explorer can be its own process again |
 | **a child process reads the session through requests** (`read_session_data`, server/mapping.c; win32u keeps a local copy laid out as the mapping, refreshed per seqlock acquire and per user handle entry; the handle-table walk skips entries the process has no object for) | a child has its own wasm memory and cannot map the session the server thread writes (user 2026-10-07: gex-eject never ships cross-process shared memory) | never under that decision; the process hosting the server keeps its direct read |
+| `wineserver_session_data` answers only in the process the session was created in | a child process starts as a copy of the first, server state included: it read a frozen snapshot | with the request path (never, under the no-shared-memory decision) |
+| one desktop thread per session (a named mutant held by its host process); the wait for its shell window is 60 s | with children reading the session, each process started a desktop thread of its own | explorer as its own process (needs cross-process shared memory) |
+| ntdll's Unix-call dispatcher returns STATUS_DLL_NOT_FOUND for a null library handle | a DLL whose Unix library is not linked into the closed-world program still makes calls (wineps.drv's DllMain failure path) and trapped | every such Unix library linked in |
 | winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
 | win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific): **not being upstreamed (user 2026-10-07)**: kept as a fork patch; the ungated patch stays in `docs/wine-upstream/0001-win32u-VkKeyScan-skip-SGCAPS-caps-row.patch` for reference |
 
