@@ -2680,6 +2680,7 @@ export class Gex {
       : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
       : (b, c) => e.gex_cgen_regs(u, b, c);
     const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : jit >= 0 ? e.gex_fjit_slots(jit) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
+    const tInst = performance.now();
     const inst = new WebAssembly.Instance(mod, {
       env: {
         memory: this.#memory,
@@ -2740,6 +2741,9 @@ export class Gex {
     // The first Worker to install a JIT module writes the directory for the
     // pages it numbered (idempotent).
     if (jit >= 0) e.gex_fjit_installed(jit);
+    // What each Worker pays to install a unit (instantiation fills its slots).
+    const ms = performance.now() - tInst;
+    if (prov < 0 && jit < 0 && ms >= 20) console.warn(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
     return regs.length / 2;
   }
 

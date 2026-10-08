@@ -1666,8 +1666,36 @@ Not yet:
        0x7000000: 76,412 functions, 3,805 C units, 142 MiB wasm, 1,687 s to
        build on gooner; staged on edger in
        `scratch/unity/units/cgen-page`.
-     - Queued on edger: mp11 (`--fjit`, .NET JIT), mp12 (`--fjit`, .NET
-       interpreter via `PAGE_ENV=GEXMONO_WASM_JIT=0`), mp13 (`--fjit` plus
-       `--query 'cgen=1&elfunits=UnityPlayer.so'`, `GEX_CGEN_CACHE` set).
-       Results in `scratch/unity/page/NAME.log`, shots in
-       `scratch/unity/page/shots/NAME` (on edger).
+     - mp11 (`--fjit`) and mp13 (`--fjit`, unit) then died at ~160 s:
+       thread 0 returned into the provider's code page from libc after a
+       clock_nanosleep with no call-out open. A provider's guest call that
+       lands on a function JIT or unit body directly has no fallback
+       call-out, so the blocking syscall went back to the run loop and
+       abandoned the provider's frames. Fixed in 9bbb85ee:
+       `gex.provider_guest_call(+1/-1)` around `gexp_call_guest` (the
+       shim's export bound straight in; a no-op natively), counted in
+       `provider_callout_open`, and restored by `provider_try` on a raise.
+       The provider build is `scratch/unity/dnc-gc/provider/mono.wasm`
+       (PROVIDER_DIR; dnc is left alone for the gate). It is staged on
+       edger as `muck-bcl/mono.wasm`, with the old one at `mono.wasm.prev`.
+       embed passes natively and under node.
+     - **mp14 (edger Chromium, `--fjit` + the UnityPlayer unit via
+       `?cgen=1&elfunits=UnityPlayer.so`, .NET JIT):**
+       - The unit is placed in the page (76,412 entries, 1.7 s).
+       - First frame at 72 s.
+       - The menu holds at 20.0-20.4 presents/s from 180 s to 480 s. That
+         is 1.8x faster than mp8 (no fjit, no unit: 11.5/s) and 1.9x slower
+         than native mk-j1 (38.6/s).
+       - The readbacks (`shots/mp14/c005-c016.png`) show Muck's real main
+         menu: the scene, the buttons and the version text. The ground has
+         dotted-line artefacts.
+       - At about 500 s the same bind-group validation error (GL's) blanks
+         the window to black.
+       - The glibc_math and glibc_mem provider modules have to be in the
+         page's unit cache as well (copied from ~/.cache/gex/cgen/providers).
+     - Not run yet: the .NET interpreter in the page (`PAGE_ENV=GEXMONO_WASM_JIT=0`)
+       and `--fjit` without the unit. They were dropped to keep edger's lock
+       free for the integ/2026-10-08b gate.
+     - Per-Worker unit install time is now logged (`[unit] installed at
+       BASE in N ms`, when 20 ms or more): the measure for item 4, the
+       once-per-process slot install.
