@@ -1854,6 +1854,37 @@ Not yet:
        run; hb10 repeats it.
      - The page keeps the guest's output (`shots/NAME/out.txt`), and
        hk-page.sh passes `-logFile -`, so HK's player log is in it.
-     - The HK UnityPlayer unit for 0x11752000 is built and staged on
-       edger: 55,439 functions, 165 MiB wasm, key 81cfd177. hp6 is queued
-       to run with it.
+     - The HK UnityPlayer unit for 0x11752000 (55,439 functions, 165 MiB
+       wasm, key 81cfd177) is what hp7 ran with.
+     - **The fjit crash (hb6-hb21, strict `?fjitlibs=`).** Every run that
+       JIT-compiles libGL dies at 120-250 s, branching to the provider's
+       return address 0x13450100 (`code_page + 0x100`, depth 0). It shows up
+       on thread 24 (hb6/13/16/20) or thread 0 (hb21). hb10/17 instead had
+       thread 0's poll return to a heap address. `+libxcb,+libX11` (hb4) and
+       `+none.so` (hb3) reach the menu.
+       - Block 0x12c17e60 is UnityPlayer's `syscall@plt`. The diagnostic's
+         `.so +X` is relative to the text mapping, so UnityPlayer's base
+         there is 0x10752000. The caller is Unity's futex lock slow path at
+         +0xdf1ecd (FUTEX_WAIT_PRIVATE through `syscall()`).
+       - At the fault rax is still 0xca (futex, never answered), rcx is
+         after libc syscall()'s `syscall`, and rsp is syscall()'s entry rsp.
+         So the futex trapped out to wait, and the thread resumed at the
+         provider's ra instead of the saved pc (0x12ee34f9).
+       - Every provider guest call in the ring is 0x10d90 deeper than that
+         sp, every call-out is closed, and "provider guest call open" is
+         false.
+       - `provider_try` resets GUEST_CALLS on any exception, not only its
+         raise tag, and rethrows. So a wasm trap that unwound a provider's
+         frames would look exactly like this.
+       - hb21 (`+libGL.so.1` only; since 7e23c82a the rules also keep other
+         objects' callees out of a module) crashed the same way at 248 s. So
+         JIT'd libc is not needed for it.
+       - Diagnostics, f823644f: `[gex] a trap left through N provider guest
+         call(s)` (from provider_try, with the JS stack) and `... reached the
+         run loop with N open`. The wild-branch report now also lists the
+         Worker's last 16 set_resume calls (lib.rs line, pc).
+       - Running: hb23 (`+libGL.so.1` with these diagnostics), then hb22
+         (`+libc.so.6`): `scratch/unity/page/q14.sh`.
+     - **HK's start-up in the page (hp7, the unit):** first frame 55 s;
+       "Performing automatic level start" by 122 s; 18 presents/s by 152 s;
+       the menu is up at about 2.5 min (native gate: menu ready 406.5 s).
