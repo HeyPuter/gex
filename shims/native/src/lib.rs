@@ -1896,6 +1896,12 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let mut child = k.fork_kernel();
         child.pid = pid;
         child.tid = pid;
+        // Threads are numbered per process and the counter came from the
+        // parent: the child's Nth clone got tid == pid, its main thread's
+        // (pthread mutex owners, tgkill and the thread table then took one
+        // thread for the other). Clones number above the main tid, as the
+        // browser runtime's fork does (tests/wasm32/forktid.c).
+        child.next_tid = child.next_tid.max(pid + 1);
         (child, regions, store.as_context().data().thread.ctx_addr)
     };
 
