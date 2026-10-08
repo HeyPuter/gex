@@ -195,9 +195,11 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     // function is laid out flat there.
     // The block count alone missed some (mp9: Muck's UnityPlayer still
     // overflowed), so the nesting is bounded too (`nest_bound`).
-    let too_deep = cfg!(target_family = "wasm") && succs.len() > FLAT_ABOVE;
+    // `GEX_CGEN_EXP=WASMFLAT`: the same cuts natively, to test the browser's layouts there.
+    let browser = cfg!(target_family = "wasm") || cf::exp("WASMFLAT");
+    let too_deep = browser && succs.len() > FLAT_ABOVE;
     let fixed = (!too_deep).then(|| cfg::make_reducible(graph)).flatten();
-    let fixed = fixed.filter(|fx| !cfg!(target_family = "wasm") || nest_bound(&fx.shape) <= NEST_MAX);
+    let fixed = fixed.filter(|fx| !browser || nest_bound(&fx.shape) <= NEST_MAX);
     let mut layout = match fixed {
         Some(fx) => {
             if !fx.dispatch.is_empty() {
