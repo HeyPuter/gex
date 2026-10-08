@@ -1265,15 +1265,19 @@ patched instead. Scope, as found:
   -u`, which runs rundll32 for PreInstall and DefaultInstall) **completes
   the install**: the registry has the crypto providers (16 keys), and
   tests/nt `crypt` passes on that prefix (6 of 6). wineboot itself then
-  never finishes: after the install, in a child, it spins in its
-  `create_known_dlls` (mapping every known DLL as an image; gex's function
-  table lookups take the CPU), so the test is judged by the registry, not
-  wineboot's exit. As the first process wineboot finishes. Being chased.
-- Also found: native wineboot's `fstat` of wine.inf returns a garbage
-  mtime (5242148), so `.update-timestamp` never matches and every first
-  process of a session reinstalls; the tests write `disable` there. An
-  i386 program's `_fstat` is right (Wine's msvcrt), so it is the wasm32
-  build's struct stat or ucrt path. To fix.
+  does not finish in a child: after the install it calls into wininet
+  (`initialize_internet`), and wininet's code (wininet+0x1d594) calls
+  TlsGetValue millions of times, each through gex's function-table lookup
+  (the probe cache never holds it: 3.5 million lookups of one address,
+  `GEX_FTAB_TRACE=1`). InternetOpenW alone in a child works, so it is
+  that state of wineboot's process; not yet found. The test is judged by
+  the registry, not wineboot's exit. As the first process wineboot
+  finishes.
+- **Fixed: wineboot's garbage wine.inf mtime** (5242148, so every first
+  process reinstalled the prefix): pelink bound wineboot's `_wopen` to
+  ucrtbase and its `_fstat32` to msvcrt, two descriptor tables; a module's
+  calls now go to its own C runtime first. `.update-timestamp` now holds
+  wine.inf's real mtime.
 - The registry-fixture idea is dropped.
 - Cost, on edger through bench.sh (native gexc; a Windows server call,
   GetExitCodeThread, is 74.5 us there): in a child, IsWindow 97.8 us (0.30
