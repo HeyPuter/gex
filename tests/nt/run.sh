@@ -127,8 +127,9 @@ for arch in x64 x86; do
     # A child that dies in native code releases its parent.
     [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childtrap 0 "child gone" "$b/childtrap.exe"
     # A window made in a DllMain (the loader lock held) before the process
-    # has a desktop: under W3 the desktop process starts meanwhile.
-    check $arch/attachwin 0 "${allok}" "$b/attachwin.exe"
+    # has a desktop: under W3 the desktop process starts meanwhile. W3
+    # only (the NT layer lacks NtAreMappedFilesTheSame; it is legacy).
+    [ -n "${GEX_NT_W3:-}" ] && check $arch/attachwin 0 "${allok}" "$b/attachwin.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
