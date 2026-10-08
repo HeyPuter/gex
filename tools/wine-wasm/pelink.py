@@ -261,7 +261,11 @@ def link(dlls, out, gexrt, others=None):
                 owners = [o for o in owners if (name, 'defined') in sigs[o]] or owners
                 if mod in owners:
                     continue  # its own: already resolved inside it
-                pick = next((o for o in imports if o in owners), owners[0])
+                # (its own C runtime first, which its import list does not
+                # name: ucrtbase's _wopen and msvcrt's _fstat32 are two fd
+                # tables, and wineboot's fstat of a file it had just opened
+                # failed)
+                pick = next((o for o in EAGER.get(mod, []) + imports if o in owners), owners[0])
                 # a caller declaring the function otherwise than its
                 # definition (an adapter from the .spec: user32's
                 # NotifyWinEvent is void, win32u's stub returns a word) goes
