@@ -114,6 +114,8 @@ for arch in x64 x86; do
     # Audio out through winmm and mmdevapi: native Wine (W3) only, whose
     # OSS driver plays into gex's /dev/dsp. GEX_NT_W3=1 runs it.
     [ -n "${GEX_NT_W3:-}" ] && check $arch/audio 0 "${allok}" "$b/audio.exe"
+    # Winsock over loopback (TCP, UDP, select, WSAEventSelect): W3 only.
+    [ -n "${GEX_NT_W3:-}" ] && check $arch/sockets 0 "${allok}" "$b/sockets.exe"
     # The same as a child process (CreateProcess, waited for): native Wine
     # (W3) only, where a child reads the session through requests; the NT
     # layer has no child processes. GEX_NT_CHILDREN=1 runs it.

@@ -56,6 +56,15 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
         usize::from(self.has_data())
     }
     fn close(&self);
+    /// `shutdown(SHUT_WR)`: no more sends; the far end reads to its end.
+    /// A transport that cannot says nothing (the far end then sees the end
+    /// at `close`).
+    fn shutdown_write(&self) {}
+    /// `recv(MSG_PEEK)`: what `recv` would take, left queued.
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let _ = buf;
+        Err(Errno::EOPNOTSUPP)
+    }
 }
 
 /// Where a host's connections come from.
@@ -241,6 +250,20 @@ impl Transport for LoopEnd {
     fn close(&self) {
         self.tx.lock().unwrap().writer_gone = true;
         self.rx.lock().unwrap().reader_gone = true;
+    }
+    fn shutdown_write(&self) {
+        self.tx.lock().unwrap().writer_gone = true;
+    }
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let rx = self.rx.lock().unwrap();
+        if rx.data.is_empty() {
+            return if rx.writer_gone { Ok(0) } else { Err(Errno::EAGAIN) };
+        }
+        let n = buf.len().min(rx.data.len());
+        for (d, s) in buf.iter_mut().zip(rx.data.iter()) {
+            *d = *s;
+        }
+        Ok(n)
     }
 }
 
@@ -496,6 +519,16 @@ impl Socket {
         if port != 0 && self.kind == Kind::Tcp && self.remote.is_none() && self.ports.listening(port) {
             return Err(Errno::EADDRINUSE);
         }
+        // Port 0 is a port of the kernel's choosing, chosen now, as Linux
+        // does: a program reads it back with getsockname before listening
+        // (Wine's server does, for every bind), and connects to it.
+        let mut port = port;
+        if port == 0 {
+            port = self.ports.ephemeral();
+            while self.remote_taken(port) {
+                port = self.ports.ephemeral();
+            }
+        }
         *self.local.lock().unwrap() = Some((addr, port));
         Ok(())
     }
@@ -599,6 +632,23 @@ impl Socket {
         *self.local.lock().unwrap() = Some((0x7f00_0001, from));
         *self.transport.lock().unwrap() = Some(mine);
         Ok(())
+    }
+
+    /// `shutdown`: SHUT_WR and SHUT_RDWR end this side's sends (the far end
+    /// reads to its end); reading on is not refused.
+    pub fn shutdown(&self, how: u64) -> SysResult {
+        if how > 2 {
+            return Err(Errno::EINVAL);
+        }
+        match &*self.transport.lock().unwrap() {
+            Some(t) => {
+                if how != 0 {
+                    t.shutdown_write();
+                }
+                Ok(0)
+            }
+            None => Err(Errno::ENOTCONN),
+        }
     }
 
     pub fn set_nonblocking(&self, on: bool) {
@@ -794,6 +844,39 @@ impl Socket {
                 Ok(n as u64)
             }
             None => Err(Errno::EAGAIN),
+        }
+    }
+}
+
+impl Socket {
+    /// `recv` with `MSG_PEEK`: the bytes (or the next datagram) left queued
+    /// for the next read. Wine's server peeks a byte to tell a socket that
+    /// has data from one that was closed.
+    pub fn peek(&self, buf: &mut [u8]) -> SysResult {
+        if self.kind == Kind::Udp {
+            self.udp_pump();
+            return match self.dgrams.lock().unwrap().front() {
+                Some((d, from)) => {
+                    let n = buf.len().min(d.len());
+                    buf[..n].copy_from_slice(&d[..n]);
+                    *self.last_from.lock().unwrap() = Some(*from);
+                    Ok(n as u64)
+                }
+                None => Err(Errno::EAGAIN),
+            };
+        }
+        let t = self.transport.lock().unwrap();
+        let Some(t) = t.as_ref() else {
+            return Err(Errno::ENOTCONN);
+        };
+        match t.status() {
+            Status::Refused => Err(Errno::ECONNREFUSED),
+            Status::Closed => match t.peek(buf) {
+                Ok(n) => Ok(n as u64),
+                Err(Errno::EAGAIN) => Ok(0),
+                Err(e) => Err(e),
+            },
+            _ => t.peek(buf).map(|n| n as u64),
         }
     }
 }
@@ -1032,6 +1115,37 @@ mod tests {
         let mut q = query("example.com", 1);
         q.truncate(15);
         assert!(answer_dns(&q, &r).is_none());
+    }
+
+    /// No network: loopback between guests only.
+    #[derive(Debug)]
+    struct NoNet;
+    impl NetStack for NoNet {
+        fn tcp(&self) -> Result<Arc<dyn Transport>, Errno> {
+            Err(Errno::ENETUNREACH)
+        }
+    }
+
+    #[test]
+    fn a_tcp_bind_to_port_zero_gets_its_port_at_once() {
+        let (net, res, ports) = (Arc::new(NoNet) as Arc<dyn NetStack>, Arc::new(Resolver::new()), Arc::new(Ports::new()));
+        let l = Arc::new(Socket::new(Kind::Tcp, Arc::clone(&net), Arc::clone(&res), Arc::clone(&ports), None));
+        l.set_self();
+        l.bind(0x7f00_0001, 0).unwrap();
+        let port = l.local().1;
+        assert_ne!(port, 0, "getsockname after bind has the port");
+        l.listen().unwrap();
+        assert_eq!(l.local().1, port, "listen keeps it");
+        let c = Socket::new(Kind::Tcp, net, res, ports, None);
+        c.connect(0x7f00_0001, port).unwrap();
+        let s = l.accept().expect("a connection to it arrives");
+        assert_eq!(c.write_at(0, b"hi").unwrap(), 2);
+        let mut b = [0u8; 8];
+        assert_eq!(s.peek(&mut b[..1]).unwrap(), 1, "a peek sees the first byte");
+        assert_eq!(s.read_at(0, &mut b).unwrap(), 2, "and leaves it for the read");
+        assert_eq!(&b[..2], b"hi");
+        c.shutdown(1).unwrap();
+        assert_eq!(s.status(), Status::Closed, "and its shutdown reaches the far end");
     }
 
     #[test]

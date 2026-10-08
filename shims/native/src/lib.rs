@@ -2885,6 +2885,20 @@ impl gex_kernel::net::Transport for HostStream {
         sock.peek(&mut scratch).unwrap_or(0)
     }
 
+    fn peek(&self, buf: &mut [u8]) -> Result<usize, gex_kernel::Errno> {
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else { return Err(gex_kernel::Errno::ENOTCONN) };
+        match sock.peek(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(gex_kernel::Errno::EAGAIN),
+            Err(_) => Err(gex_kernel::Errno::ECONNRESET),
+        }
+    }
+    fn shutdown_write(&self) {
+        if let Some(sock) = self.sock.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+        }
+    }
     fn close(&self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
     }

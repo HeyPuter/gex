@@ -2627,7 +2627,7 @@ impl Kernel {
                 other => other,
             },
             nr::SENDTO => self.sys_sendto(m, a[0] as i32, a[1], a[2], a[4]),
-            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
+            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
             nr::SENDMSG => self.sys_sendmsg(m, a[0] as i32, a[1]),
             nr::RECVMSG => self.sys_recvmsg(m, a[0] as i32, a[1], a[2]),
             nr::SENDMMSG => self.sys_sendmmsg(m, a[0] as i32, a[1], a[2]),
@@ -2648,7 +2648,10 @@ impl Kernel {
             // (the proxied network, the global kernel's) just agrees.
             nr::SHUTDOWN => match self.unix_of(a[0] as i32) {
                 Ok(sock) => sock.shutdown_how(a[1]),
-                Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                Err(_) => match self.socket_of(a[0] as i32) {
+                    Ok(sock) => sock.shutdown(a[1]),
+                    Err(_) => self.fds.get(a[0] as i32).map(|_| 0),
+                },
             },
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends
@@ -3328,7 +3331,7 @@ impl Kernel {
             nr::SENDFILE => self.sys_sendfile(m, a[0] as i32, a[1] as i32, a[2], a[3]),
             // A blocking `recvfrom`/`recv` that waited for a datagram or
             // bytes (the classifier below).
-            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[4], a[5]),
+            nr::RECVFROM => self.sys_recvfrom(m, a[0] as i32, a[1], a[2], a[3], a[4], a[5]),
             nr::COPY_FILE_RANGE => self.sys_copy_file_range(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4], a[5] as u32),
             _ => self.sys_splice(m, a[0] as i32, a[1], a[2] as i32, a[3], a[4]),
         }
@@ -5966,12 +5969,16 @@ impl Kernel {
         fd: i32,
         buf: u64,
         len: u64,
+        flags: u64,
         addr: u64,
         addrlen: u64,
     ) -> SysResult {
         let len = (len as usize).min(1 << 22);
         let mut tmp = vec![0u8; len];
-        let n = self.fds.get(fd)?.read(&mut tmp)?;
+        let n = match self.socket_of(fd) {
+            Ok(sock) if flags & Self::MSG_PEEK != 0 => sock.peek(&mut tmp)?,
+            _ => self.fds.get(fd)?.read(&mut tmp)?,
+        };
         m.write(buf, &tmp[..n as usize])?;
         if addr != 0 {
             // Where the datagram came from (a guest's port, the resolver),
@@ -6284,6 +6291,10 @@ impl Kernel {
             let mut tmp = vec![0u8; len.min(1 << 22)];
             let n = match &unix_sock {
                 Some(sock) => sock.recv(&mut tmp, room, peek)?,
+                None if peek => match self.socket_of(fd) {
+                    Ok(sock) => sock.peek(&mut tmp)?,
+                    Err(_) => self.fds.get(fd)?.read(&mut tmp)?,
+                },
                 None => self.fds.get(fd)?.read(&mut tmp)?,
             };
             m.write(base, &tmp[..n as usize])?;
