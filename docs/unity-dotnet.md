@@ -1513,3 +1513,21 @@ Not yet:
      **Next:** the JIT's start-up cost (compile threshold, caching compiled
      JIT modules across runs like `GEX_FJIT_CACHE`), the main/render thread
      waits, then .NET AOT (item 23).
+  25. **JIT module cache and pins (2026-10-07, gexc 691acaa9):**
+     - Compiled .NET JIT modules are now kept on disk by their bytes
+       (`~/.cache/gex/modules/wasmjit`, `GEX_WASMJIT_CACHE=0` off). Hollow
+       Knight's start-up to the menu compiles 2,331 (46 MB) and a second run
+       finds all of them. Measured, warm fjit cache, JIT on: hk-c2 (cache)
+       first present 255.1 s, menu 312.5 s, 29.1 presents/s; hk-c3 (cache
+       off) 255.2 s, 306.2 s, 29.5. No difference: the compiles are not what
+       makes the JIT start-up slower than the interpreter's (hk-j3 250.5 s vs
+       hk-u1 236.7 s); the hotness counting and tier-up are the next suspect.
+       The cache stays (harmless, 46 MB).
+     - **`--pin` works when the range is valid:** a pin at 0x7a000000 placed
+       UnityPlayer.so there (hk-pt: "no function-tier unit ... at 0x7a000000",
+       as expected with no unit for that base). The first pin (0x7e041000)
+       failed because the object's span would cross 0x80000000, the top of
+       the region shared objects are placed in; the kernel then placed it
+       elsewhere without a word until the process exited. A pin that lands
+       elsewhere is now said when it happens (`[pin] PATH WANTED X GOT Y`).
+       Unit builds should pick a base with base+span below 0x80000000.
