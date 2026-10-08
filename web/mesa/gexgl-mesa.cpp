@@ -752,6 +752,86 @@ void report_version_gap() {
 
     const struct gl_extensions& e = mesa_context->ctx->Extensions;
     const unsigned have = mesa_context->ctx->Version;
+    /* Every requirement from GL 4.1 to 4.6 that is not met, not only the next
+     * rung's: what stands between this context and 4.6, in one list. The
+     * conditions are compute_version()'s (src/mesa/main/version.c). */
+    if (have >= 40) {
+        const struct gl_constants& c = mesa_context->ctx->Const;
+        struct need { unsigned version; const char* name; bool met; };
+        const need needs[] = {
+            {41, "MaxTextureSize >= 16384", c.MaxTextureSize >= 16384},
+            {41, "MaxRenderbufferSize >= 16384", c.MaxRenderbufferSize >= 16384},
+            {41, "MaxCubeTextureLevels >= 15", c.MaxCubeTextureLevels >= 15},
+            {41, "Max3DTextureLevels >= 12", c.Max3DTextureLevels >= 12},
+            {41, "MaxArrayTextureLayers >= 2048", c.MaxArrayTextureLayers >= 2048},
+            {41, "ARB_ES2_compatibility", (bool)e.ARB_ES2_compatibility},
+            {41, "ARB_shader_precision", (bool)e.ARB_shader_precision},
+            {41, "ARB_vertex_attrib_64bit", (bool)e.ARB_vertex_attrib_64bit},
+            {41, "ARB_viewport_array", (bool)e.ARB_viewport_array},
+            {42, "ARB_base_instance", (bool)e.ARB_base_instance},
+            {42, "ARB_conservative_depth", (bool)e.ARB_conservative_depth},
+            {42, "ARB_internalformat_query", (bool)e.ARB_internalformat_query},
+            {42, "ARB_shader_atomic_counters", (bool)e.ARB_shader_atomic_counters},
+            {42, "ARB_shader_image_load_store", (bool)e.ARB_shader_image_load_store},
+            {42, "ARB_shading_language_420pack", (bool)e.ARB_shading_language_420pack},
+            {42, "ARB_shading_language_packing", (bool)e.ARB_shading_language_packing},
+            {42, "ARB_texture_compression_bptc", (bool)e.ARB_texture_compression_bptc},
+            {42, "ARB_transform_feedback_instanced", (bool)e.ARB_transform_feedback_instanced},
+            {43, "vertex MaxUniformBlocks >= 14", c.Program[MESA_SHADER_VERTEX].MaxUniformBlocks >= 14},
+            {43, "ARB_ES3_compatibility", (bool)e.ARB_ES3_compatibility},
+            {43, "ARB_arrays_of_arrays", (bool)e.ARB_arrays_of_arrays},
+            {43, "ARB_compute_shader", (bool)e.ARB_compute_shader},
+            {43, "ARB_copy_image", (bool)e.ARB_copy_image},
+            {43, "ARB_explicit_uniform_location", (bool)e.ARB_explicit_uniform_location},
+            {43, "ARB_fragment_layer_viewport", (bool)e.ARB_fragment_layer_viewport},
+            {43, "ARB_framebuffer_no_attachments", (bool)e.ARB_framebuffer_no_attachments},
+            {43, "ARB_internalformat_query2", (bool)e.ARB_internalformat_query2},
+            {43, "ARB_robust_buffer_access_behavior", (bool)e.ARB_robust_buffer_access_behavior},
+            {43, "ARB_shader_image_size", (bool)e.ARB_shader_image_size},
+            {43, "ARB_shader_storage_buffer_object", (bool)e.ARB_shader_storage_buffer_object},
+            {43, "ARB_stencil_texturing", (bool)e.ARB_stencil_texturing},
+            {43, "ARB_texture_buffer_range", (bool)e.ARB_texture_buffer_range},
+            {43, "ARB_texture_query_levels", (bool)e.ARB_texture_query_levels},
+            {43, "ARB_texture_view", (bool)e.ARB_texture_view},
+            {44, "MaxVertexAttribStride >= 2048", c.MaxVertexAttribStride >= 2048},
+            {44, "ARB_buffer_storage", (bool)e.ARB_buffer_storage},
+            {44, "ARB_enhanced_layouts", (bool)e.ARB_enhanced_layouts},
+            {44, "ARB_query_buffer_object", (bool)e.ARB_query_buffer_object},
+            {44, "ARB_texture_mirror_clamp_to_edge", (bool)e.ARB_texture_mirror_clamp_to_edge},
+            {44, "ARB_texture_stencil8", (bool)e.ARB_texture_stencil8},
+            {44, "ARB_vertex_type_10f_11f_11f_rev", (bool)e.ARB_vertex_type_10f_11f_11f_rev},
+            {45, "ARB_ES3_1_compatibility", (bool)e.ARB_ES3_1_compatibility},
+            {45, "ARB_clip_control", (bool)e.ARB_clip_control},
+            {45, "ARB_conditional_render_inverted", (bool)e.ARB_conditional_render_inverted},
+            {45, "ARB_cull_distance", (bool)e.ARB_cull_distance},
+            {45, "ARB_derivative_control", (bool)e.ARB_derivative_control},
+            {45, "ARB_shader_texture_image_samples", (bool)e.ARB_shader_texture_image_samples},
+            {45, "NV_texture_barrier", (bool)e.NV_texture_barrier},
+            {46, "ARB_gl_spirv", (bool)e.ARB_gl_spirv},
+            {46, "ARB_spirv_extensions", (bool)e.ARB_spirv_extensions},
+            {46, "ARB_indirect_parameters", (bool)e.ARB_indirect_parameters},
+            {46, "ARB_polygon_offset_clamp", (bool)e.ARB_polygon_offset_clamp},
+            {46, "ARB_shader_atomic_counter_ops", (bool)e.ARB_shader_atomic_counter_ops},
+            {46, "ARB_shader_draw_parameters", (bool)e.ARB_shader_draw_parameters},
+            {46, "ARB_shader_group_vote", (bool)e.ARB_shader_group_vote},
+            {46, "ARB_texture_filter_anisotropic", (bool)e.ARB_texture_filter_anisotropic},
+            {46, "ARB_transform_feedback_overflow_query", (bool)e.ARB_transform_feedback_overflow_query},
+        };
+        for (const need& n : needs)
+            if (n.version > have && !n.met)
+                fprintf(stderr, "gex-wgpu: to 4.6: GL %u.%u wants %s\n",
+                        n.version / 10, n.version % 10, n.name);
+        fprintf(stderr, "gex-wgpu: to 4.6: constants MaxTextureSize %u "
+                "MaxRenderbufferSize %u MaxCubeTextureLevels %u "
+                "Max3DTextureLevels %u MaxArrayTextureLayers %u "
+                "vertex MaxUniformBlocks %u MaxVertexAttribStride %u "
+                "glsl_feature_level %u\n",
+                c.MaxTextureSize, c.MaxRenderbufferSize, c.MaxCubeTextureLevels,
+                c.Max3DTextureLevels, c.MaxArrayTextureLayers,
+                c.Program[MESA_SHADER_VERTEX].MaxUniformBlocks,
+                c.MaxVertexAttribStride,
+                mesa_frontend_screen.screen->caps.glsl_feature_level);
+    }
     /* The driver's advertised level, not ctx->Const.GLSLVersion: Mesa clamps
      * that down to match the GL version it settled on, so reading it back
      * would report the *consequence* of the version as if it were a cause. */

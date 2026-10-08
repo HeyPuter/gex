@@ -44,6 +44,21 @@ export function requestGexDevice() {
       maxStorageBuffersInVertexStage: 16,
       maxStorageBuffersInFragmentStage: 16,
       maxColorAttachmentBytesPerSample: 64,
+      // GL 4.1 wants 16384 texels a side and 2048 array layers
+      // (compute_version), and WebGPU's defaults are 8192 and 256: without
+      // asking, every context settled at 4.0 and GLSL 4.00, and Unity's
+      // #version 410 geometry stages (Muck's grass) failed to compile. GL
+      // 4.3's compute shaders want 1024 invocations a workgroup and 32 KiB
+      // of shared memory (WebGPU: 256 and 16 KiB). All clamped to the adapter.
+      maxTextureDimension1D: 16384,
+      maxTextureDimension2D: 16384,
+      maxTextureDimension3D: 2048,
+      maxTextureArrayLayers: 2048,
+      maxComputeInvocationsPerWorkgroup: 1024,
+      maxComputeWorkgroupSizeX: 1024,
+      maxComputeWorkgroupSizeY: 1024,
+      maxComputeWorkgroupSizeZ: 64,
+      maxComputeWorkgroupStorageSize: 32768,
     };
     const requiredLimits = {};
     for (const [limit, wanted] of Object.entries(want)) {
