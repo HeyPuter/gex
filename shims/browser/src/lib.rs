@@ -7188,9 +7188,22 @@ fn resume() -> Option<u64> {
     RESUME.with(|c| c.get())
 }
 
+thread_local! {
+    /// This Worker's last resumes set (the shim's line that set it, pc), for
+    /// the wild-branch report: who sent the guest where it went.
+    static RESUME_RING: std::cell::RefCell<Vec<(u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[track_caller]
 fn set_resume(v: u64) {
     RESUME.with(|c| c.set(Some(v)));
+    RESUME_RING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() == 16 {
+            r.remove(0);
+        }
+        r.push((std::panic::Location::caller().line(), v));
+    });
     // GEX_NT_RESUME_LOG: each (call site, pc) a resume was set from, once:
     // where the guest leaves wasm and comes back (an AOT-only run needs a
     // unit or region entry at every such pc).
@@ -11000,6 +11013,10 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     "[gex] last call-outs (target, return, sp wanted, depth, result, sp after): {:x?}; provider guest call open {}\n",
                     cgen::callouts_recent(),
                     cgen::libprov::guest_call_open()
+                ));
+                warn_line(&format!(
+                    "[gex] last resumes set (lib.rs line, pc): {:x?}\n",
+                    RESUME_RING.with(|r| r.borrow().iter().map(|&(l, v)| (l, v)).collect::<Vec<_>>())
                 ));
             }
             set_exit(h, 128 + 11);

@@ -2790,6 +2790,8 @@ export class Gex {
    *  exception, so code the provider publishes at run time (its JIT, which imports it)
    *  can catch it with `try_table`, and `provider_try` takes it when nothing did. */
   #provTag = null;
+  /** Traps seen unwinding provider guest calls (reported up to 16). */
+  #provLeaks = 0;
   #providerTag() {
     this.#provTag ??= new WebAssembly.Tag({ parameters: ['i32'] });
     return this.#provTag;
@@ -2810,8 +2812,16 @@ export class Gex {
           ftab.get(f)(arg);
           return 0;
         } catch (err) {
+          const open = e.gex_libprov_guest_calls();
           e.gex_libprov_guest_calls_set(calls);
           if (err instanceof WebAssembly.Exception && err.is(tag)) return err.getArg(tag, 0);
+          // Anything else that unwinds a provider's guest calls abandons
+          // frames the guest will return into (their return addresses stay
+          // on its stack): say which trap, where it resumes, and from where.
+          if (open > calls && (this.#provLeaks = (this.#provLeaks ?? 0) + 1) <= 16) {
+            console.error(`[gex] a trap left through ${open - calls} provider guest call(s): ${err?.message ?? err}; ` +
+              `resume ${BigInt.asUintN(64, BigInt(e.gex_resume_pc())).toString(16)}\n${err?.stack ?? ''}`);
+          }
           throw err;
         }
       },
@@ -3644,6 +3654,15 @@ export class Gex {
         // alone it slid into the guest's stack and overwrote saved registers.
         this.#shim.exports.__stack_pointer.value = addrVal(this.#workerStack());
         const e = this.#shim.exports;
+        // A trap that reached the run loop with a provider's guest call
+        // still open abandoned the provider's frames (see provider_try).
+        if ((e.gex_libprov_guest_calls?.() ?? 0) > 0) {
+          if ((this.#provLeaks = (this.#provLeaks ?? 0) + 1) <= 16) {
+            console.error(`[gex] a trap reached the run loop with ${e.gex_libprov_guest_calls()} provider guest call(s) open: ${err?.message ?? err}; ` +
+              `resume ${BigInt.asUintN(64, BigInt(e.gex_resume_pc())).toString(16)}\n${err?.stack ?? ''}`);
+          }
+          e.gex_libprov_guest_calls_set(0);
+        }
         // A slot the shim wants written before the guest goes back to it: its
         // module is instantiated with passive segments, so the code is present
         // and simply not in the table. Filling here costs one segment; at
