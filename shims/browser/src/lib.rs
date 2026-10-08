@@ -12390,24 +12390,24 @@ fn note_blocks(
     e.2 = e.2.max(a);
 }
 
-/// The short name of whatever object holds this address, for a counter. Takes
-/// the host it already has, since the caller is inside `with_host` and a second
-/// `RefCell` borrow would panic.
-/// Like `object_name_at` but with the `+offset` into the object, so a return
-/// address on a crash stack can be run through objdump to name the function.
-/// The file name of the object mapped at `a` ("" if none).
-pub(crate) fn object_file_at(a: u64) -> String {
+/// The object file at `a` (by file name) and `a`'s offset into its mapping.
+pub(crate) fn object_file_off(a: u64) -> (String, u64) {
     with_host(|h| {
         h.kernel
             .mem
             .vmas()
             .iter()
             .find(|v| a >= v.start && a < v.end)
-            .and_then(|v| v.code.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string()))
+            .map(|v| (v.code.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default(), a - v.start))
             .unwrap_or_default()
     })
 }
 
+/// The short name of whatever object holds this address, for a counter. Takes
+/// the host it already has, since the caller is inside `with_host` and a second
+/// `RefCell` borrow would panic.
+/// Like `object_name_at` but with the `+offset` into the object, so a return
+/// address on a crash stack can be run through objdump to name the function.
 fn object_off_at(h: &Host, a: u64) -> String {
     h.kernel
         .mem

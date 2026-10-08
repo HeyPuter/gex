@@ -121,6 +121,10 @@ async function main() {
   if (q.get('elfunits')) globalThis.GEX_ELF_UNITS = q.get('elfunits');
   // `?fjitlibs=+name,-name`: the function JIT only for (+) or not for (-) those objects (a bisection aid).
   if (q.get('fjitlibs')) globalThis.GEX_FJIT_LIBS = q.get('fjitlibs');
+  // `?pins=path@base+span,...` (hex): place those shared objects at fixed bases, as a
+  // closure's pins do, so a unit built for one base (`?elfunits=`) is used whatever
+  // else (the function JIT's heap, say) moved the arena first.
+  if (q.get('pins')) globalThis.GEX_PINS = q.get('pins');
   if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
   // cgen=1|2 (prefer|require units), in the unguarded flavor of i386 units

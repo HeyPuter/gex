@@ -136,7 +136,7 @@ fn page_gen(page: u64, fresh: &mut Vec<(u64, u32)>) -> u32 {
 /// Translate the function at `addr` and publish it (`gex.lookup`'s miss):
 /// its index in the function table, or `None` (the fallback runs it).
 pub(crate) fn translate(addr: u64) -> Option<u32> {
-    if !on() || is_tier1_only(addr) {
+    if !on() || is_tier1_only(addr) || !lib_wanted(addr) {
         return None;
     }
     let only = ONLY.load(Ordering::Relaxed);
@@ -243,8 +243,19 @@ pub(crate) fn serve(pc: u64) -> bool {
 }
 
 /// `+name,-name` (`?fjitlibs=`): the objects the JIT is limited to (any `+`)
-/// and kept from (`-`), by file name.
-static LIBS: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
+/// and kept from (`-`), by file name. `name@lo-hi` (hex) narrows a rule to
+/// the functions whose entry lies at those offsets into their mapping (the
+/// `name +0x..` a trap prints), for bisecting within an object. Checked at
+/// every translation, the table lookups' (`gex.lookup`) as well as tier-1's
+/// misses: JIT code calling through a pointer must not pull in objects the
+/// rules keep out.
+struct Rule {
+    include: bool,
+    name: String,
+    range: Option<(u64, u64)>,
+}
+
+static LIBS: Mutex<Vec<Rule>> = Mutex::new(Vec::new());
 
 #[no_mangle]
 pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
@@ -252,23 +263,30 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
     let mut v = lock(&LIBS);
     v.clear();
     for w in spec.split(',').map(str::trim).filter(|w| !w.is_empty()) {
-        match w.strip_prefix('-') {
-            Some(n) => v.push((false, n.to_string())),
-            None => v.push((true, w.trim_start_matches('+').to_string())),
-        }
+        let (include, w) = match w.strip_prefix('-') {
+            Some(n) => (false, n),
+            None => (true, w.trim_start_matches('+')),
+        };
+        let hex = |x: &str| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok();
+        let (name, range) = match w.split_once('@') {
+            Some((n, r)) => (n, r.split_once('-').and_then(|(lo, hi)| Some((hex(lo)?, hex(hi)?)))),
+            None => (w, None),
+        };
+        v.push(Rule { include, name: name.to_string(), range });
     }
 }
 
 fn lib_wanted(pc: u64) -> bool {
-    let rules = lock(&LIBS).clone();
+    let rules = lock(&LIBS);
     if rules.is_empty() {
         return true;
     }
-    let name = crate::object_file_at(pc);
-    if rules.iter().any(|(inc, n)| !inc && *n == name) {
+    let (name, off) = crate::object_file_off(pc);
+    let hit = |r: &Rule| r.name == name && r.range.is_none_or(|(lo, hi)| off >= lo && off < hi);
+    if rules.iter().any(|r| !r.include && hit(r)) {
         return false;
     }
-    !rules.iter().any(|(inc, _)| *inc) || rules.iter().any(|(inc, n)| *inc && *n == name)
+    !rules.iter().any(|r| r.include) || rules.iter().any(|r| r.include && hit(r))
 }
 
 /// JIT module `n`'s bytes.
