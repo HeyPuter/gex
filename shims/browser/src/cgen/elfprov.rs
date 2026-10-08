@@ -80,8 +80,12 @@ fn rescan_if_new() -> bool {
 /// After a syscall: bind the providers of each newly mapped object. Returns
 /// whether JS has providers to serve before the guest goes on.
 pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
+    // A replaced library (a stateful Linux provider, libprov.rs) is served the same way.
+    if let Some(u) = super::libprov::maps(mapped) {
+        lock(&QUEUE).push_back(u);
+    }
     if !on() {
-        return false;
+        return !lock(&QUEUE).is_empty();
     }
     if PID.load(Ordering::Acquire) == 0 {
         PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
@@ -191,7 +195,7 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
 #[no_mangle]
 pub extern "C" fn gex_elfprov_wanted() -> i32 {
     if !on() {
-        return -1;
+        return lock(&QUEUE).pop_front().map_or(-1, |u| u as i32);
     }
     rescan_if_new();
     lock(&QUEUE).pop_front().map_or(-1, |u| u as i32)

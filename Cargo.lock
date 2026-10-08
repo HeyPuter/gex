@@ -567,6 +567,7 @@ name = "gex-browser"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "gex-atomic",
  "gex-cgen",
  "gex-emit",
  "gex-kernel",
@@ -577,6 +578,7 @@ dependencies = [
  "gex-xwm",
  "spinning_top",
  "talc",
+ "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
 ]
 

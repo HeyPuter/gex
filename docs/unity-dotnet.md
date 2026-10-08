@@ -1437,3 +1437,213 @@ Not yet:
        So the unit brings the menu 52.7 s sooner (19%) and the menu 5% faster;
        the frame is not bound by UnityPlayer's code speed. The first log line
        still comes at ~106 s.
+  22. **The .NET wasm JIT is the default (user, 2026-10-07).** Normal runs use
+     the fork's wasm JIT; ejected builds will use .NET AOT. `GEXMONO_WASM_JIT=0`
+     runs the interpreter only (d4a9389d; embed keeps an interpreter-only leg;
+     `unity-edger-gate.sh` runs the game legs with the JIT, `JIT=0` for the
+     interpreter).
+     - **The Hollow Knight fault under the JIT (hk-j1/j2) was a sign
+       extension:** the JIT'd `SpanHelpers.ClearWithReferences` (from
+       `Array.Clear`) computed `Unsafe.Add(ref p, -1)` with the `-1` an
+       OP_ICONST in an i32 local, widened with `i64.extend_i32_u`: 0xffffffff
+       pointers, 32 GiB past the span. On a 64-bit mono target a 32-bit
+       constant's register holds the sign-extended 64-bit value
+       (`inst_c0`; mini-amd64 moves it as one) and mono folds `conv.i` of a
+       constant away relying on that. A negative OP_ICONST now gets an i64
+       local and `i64.const` (patch 0004, a1b2f22f). Repro and test: embed's
+       `Clears(300)` (Array.Clear/Span.Clear/List.Clear over reference, value
+       and mixed arrays) gives "clears 643296" on the interpreter and the
+       JIT; before the fix the JIT leg died there.
+     - **Hollow Knight with the JIT (hk-j3, warm fjit cache, no unit, same
+       gexc and provider as hk-u1 but the JIT fix):** reaches the menu and
+       renders it; first present 250.5 s (hk-u1, interpreter: 236.7 s), menu
+       ready 300.8 s (hk-u1: 280.4 s), menu 28.8 presents/s, last quarter 30.2
+       (hk-u1: 28.4 and 28.6). The JIT's compiles cost ~20 s of start-up;
+       the menu is not managed-bound (managed code was 12% of the main
+       thread on the interpreter).
+  23. **Plan: .NET AOT for ejected builds (not started; estimate 10-15 agent
+     days).** The browser's own path is mono's LLVM AOT in llvm-only mode
+     (`mono-aot-cross` with Mono's LLVM, bitcode linked by emcc, the
+     interpreter as fallback for what AOT cannot see). For gex the pieces:
+     1. **A wasm64 cross compiler** (3-4 days): build `mono-aot-cross` from
+        the fork for host linux-x64 targeting our `wasm64` processor
+        (`TARGET_WASM`+`TARGET_WASM64`, 8-byte pointers), with the
+        cross offsets header for the target (offsets-tool against the gex
+        wasm64 sysroot and `HOST_GEX` config) and Mono's LLVM (the
+        Microsoft.NETCore.Runtime.Mono.LLVM.Sdk package) emitting
+        `wasm64-unknown-unknown` bitcode; mini-llvm's TARGET_WASM paths
+        checked for 32-bit pointer assumptions (`mtriple`, intptr types,
+        the llvm-only EH model).
+     2. **Linking into the provider** (2-3 days): compile the bitcode with
+        clang 22 `--target=wasm64` and our musl, link it into `mono.wasm`
+        (one stateful provider), register the AOT images at start-up (the
+        browser driver's `mono_aot_register_module` table), and run
+        `MONO_AOT_MODE_LLVMONLY_INTERP` so anything not AOT'd falls back to
+        the interpreter (generic instances AOT could not see, dynamic
+        methods).
+     3. **gex calling conventions** (2-4 days): AOT'd managed-to-native
+        wrappers must call guest addresses through the guest native call
+        (`ves_pinvoke_method`'s marshalling, icalls registered by UnityPlayer
+        at run time) rather than as wasm function pointers; native-to-managed
+        (reverse) thunks into AOT code; exceptions through guest frames
+        (`gexp_raise`) meeting llvm-only EH.
+     4. **Coverage and the session** (2-3 days): AOT CoreLib, the facades,
+        `UnityEngine.*` and the game's `Managed/*.dll` (the set recorded by
+        the session), with a coverage report of methods left to the
+        interpreter; measure Muck and Hollow Knight against the JIT.
+     Risks: Mono's LLVM wasm64 output (untested upstream), code size (tens of
+     MB for Hollow Knight), and AOT of the Unity-patched BCL behaviour we
+     depend on (GC handles, liveness) being in C, so unaffected.
+  24. **Muck with and without the JIT (edger, warm fjit cache, provider
+     `dnc-jit` = d4a9389d's runtime with patch 0004, same gexc, no unit;
+     runs mk-i1 `GEXMONO_WASM_JIT=0`, mk-j1 `=1`):**
+
+     | run | first present | "Initializing packets" | menu fps (20-80 s after) | last quarter |
+     |---|---|---|---|---|
+     | mk-i1, interpreter | 151.6 s | 224.1 s | 43.0 | 43.5 |
+     | mk-j1, wasm JIT | 154.6 s | 231.1 s | 38.6 | 42.6 |
+
+     Both render the full menu, no faults. The JIT's window starts while it
+     is still compiling (per-second minimum 7.9), and settles 2% below the
+     interpreter: the menu is not managed-bound, and the JIT's compiles cost
+     7 s of start-up. Hollow Knight (item 22): 250.5 s vs 236.7 s first
+     present, 300.8 s vs 280.4 s menu, 30.2 vs 28.6 presents/s in the last
+     quarter. A managed-heavy scene (gameplay) is where the JIT has to pay;
+     the menus cannot show it.
+     **Next:** the JIT's start-up cost (compile threshold, caching compiled
+     JIT modules across runs like `GEX_FJIT_CACHE`), the main/render thread
+     waits, then .NET AOT (item 23).
+  25. **JIT module cache and pins (2026-10-07, gexc 691acaa9):**
+     - Compiled .NET JIT modules are now kept on disk by their bytes
+       (`~/.cache/gex/modules/wasmjit`, `GEX_WASMJIT_CACHE=0` off). Hollow
+       Knight's start-up to the menu compiles 2,331 (46 MB) and a second run
+       finds all of them. Measured, warm fjit cache, JIT on: hk-c2 (cache)
+       first present 255.1 s, menu 312.5 s, 29.1 presents/s; hk-c3 (cache
+       off) 255.2 s, 306.2 s, 29.5. No difference: the compiles are not what
+       makes the JIT start-up slower than the interpreter's (hk-j3 250.5 s vs
+       hk-u1 236.7 s); the hotness counting and tier-up are the next suspect.
+       The cache stays (harmless, 46 MB).
+     - **`--pin` works when the range is valid:** a pin at 0x7a000000 placed
+       UnityPlayer.so there (hk-pt: "no function-tier unit ... at 0x7a000000",
+       as expected with no unit for that base). The first pin (0x7e041000)
+       failed because the object's span would cross 0x80000000, the top of
+       the region shared objects are placed in; the kernel then placed it
+       elsewhere without a word until the process exited. A pin that lands
+       elsewhere is now said when it happens (`[pin] PATH WANTED X GOT Y`).
+       Unit builds should pick a base with base+span below 0x80000000.
+  26. **Thread waits, first look (hk-s1, `GEXGL_SUBMIT_TRACE=1`):** the GL
+     transport is not it. Hollow Knight's menu makes about one submit per
+     frame (the first 5,000 submits came over ~5,600 presents; 81% of them
+     follow PRESENT, the rest are glGet*-style replies), so the render thread
+     does not wait on GL round trips. Main thread 60% of a core plus render
+     thread 30% at 29 presents/s is a frame of ~34 ms of which the two
+     threads' work adds up to ~31 ms: Unity runs them close to serially
+     (the main thread waits for the previous frame's render before the next).
+     Faster code on either thread is what moves the frame; on the native
+     host that is the units (5%) and the provider. Since the browser is the
+     target and its costs differ (V8 instead of Cranelift, the page's GL),
+     the next frame-time work belongs in the page (P5).
+  27. **P5 plan: Unity in the page (2026-10-07; estimate 11-14 agent days).**
+     The browser is the only performance target. Native edger numbers stay
+     next to each page number (same game state, same provider). What exists:
+     the wasm64 browser shim and kernel (`GEX_MEM64=1 shims/browser/build.sh`,
+     node runs of small programs), the page's Linux game path for wasm32
+     (`tests/games/browser-linux.mjs`: hostx Xwayland as wasm, Mesa's gex_wgpu
+     over WebGPU), stateful NT providers in the page (wasm32), ELF export
+     providers in the page, the function JIT in the page. Steps:
+     - **B0, a 64-bit memory in the page (1-2 days):** `mem64=1` in the page
+       (wasm64 shim, seed and kernel; the glue's BigInt paths), checked with
+       `tests/x86-programs/mem64-io` and a dynamic glibc program, then a GL
+       game through browser-linux.mjs under mem64.
+     - **B1, stateful Linux providers in the page (3-4 days):** the page's
+       `on_linux_maps` (a replaced `.so` maps: its exports bound to the
+       provider, its constructors to `gexp__noop`), the wasm64 `provider_*`
+       imports in gex.mjs (try/throw on a per-store wasm EH tag, ctx, alloc,
+       log, stack, abi, table_size, guest_sym, thread register/park/stop/start
+       on shared-memory words, guest_stack_end, code page and thread entry,
+       reverse slots), musl's per-thread attach in each Worker. Test:
+       `tests/unity-dotnet/embed` in the page, interpreter.
+     - **B2, the .NET wasm JIT in the page (2 days):** the `wasmjit` host
+       imports in the page: slots reserved in the function table, each module
+       compiled once and instantiated in every Worker through the table log
+       (as the function JIT's are), its throw tag. Test: embed with the JIT at
+       threshold 1.
+     - **B3, Muck in the page (2-3 days):** the game, the BCL and the
+       provider served to the page, Xwayland and Mesa as for the Linux games;
+       time to first frame and menu fps on edger's Chromium, against native.
+     - **B4, ELF units in the page (2 days):** the page's cgen hook for a
+       Linux map (`GEX_ELF_UNITS`), units from the unit cache by the same key
+       (built natively, `c.wasm` for the page); Muck's UnityPlayer unit.
+     - **B5, Hollow Knight in the page:** its 4.9 GB of data served lazily.
+     Shared shim code (gex.mjs, cgen.rs, the kernel) goes to the coordinator
+     as gate heads early, step by step.
+  28. **P5 progress (2026-10-07):**
+     - **B0 done (d442cc57, 1e4ae9d7):** `?mem64=1` in the page (wasm64 shim,
+       seed and kernel; the host X server keeps the wasm32 kernel build);
+       `MAP_32BIT` in the kernel and the guest GL ring mapped with it (the
+       page's `gl_submit` takes 32-bit addresses); the function JIT in a
+       64-bit process (table64, i64 PIC globals; no std::time on wasm64);
+       `?fjit=1`. `tests/games/src/glx-context` passes in Chromium with
+       `?mem64=1&fjit=1`.
+     - **B1 done (182e7cfb, 171b7772):** stateful Linux providers in the page
+       (`shims/browser/src/cgen/libprov.rs`, `?wasmdlls=soname=path`): the
+       replaced library's exports bound to the module, installed as Wine's
+       PE module is; the wasm64 `provider_*` imports in gex.mjs (try/throw on
+       a per-Worker `WebAssembly.Tag`); its syscalls marked (bit 61) and
+       served like a wasm32 program's (threads staged, waits in place);
+       FUTEX_LOCK_PI in the page (retried outside the host lock); the
+       provider's stop-the-world (GuestStop) at safepoints and syscall
+       returns. `tests/unity-dotnet/embed` passes in Chromium.
+     - **B2 done (6fb2dcc4):** Mono's wasm JIT in the page (table range with
+       the placeholder, per-Worker instantiation, slot signatures parsed from
+       the provider module since JS has no type reflection). embed with the
+       JIT at threshold 1 passes under node (`run-node.mjs`, wasm64 shim) and
+       in Chromium.
+     - **How to run:** `scratch/unity/page/embed.sh NAME` (Chromium, gooner
+       is fine: not a game) and `scratch/unity/page/node-embed.sh LOG
+       [--env ...]` (node, faster, full wasm stacks with GEX_TRAP_STACK). Own
+       harness state and ports: `TMPDIR=scratch/unity/page/tmp
+       GEX_NT_CHROME_PORT=9531 GEX_NT_VITE_PORT=5391` (the default state dir
+       and ports are shared with other streams). Page assets copied into the
+       worktree's untracked `web/public/gex`: `xwayland/` (from wt/games2),
+       `gex-wgpu-replay.*` (from a gate tree); `web/node_modules` from `npm
+       install`. Guest GL: `scratch/unity/gl64-new` (with the MAP_32BIT ring).
+     - **Next: B3, Muck in the page on edger** (its opened-files list from a
+       native `--strace` run on edger, `scratch/unity/eruns/mk-st/files.txt`).
+  29. **What the ~200 s of start-up with the UnityPlayer unit is (hk-a5,
+     edger, warm, `PROF=1` over the first 240 s):** guest code is only ~7%
+     of the samples. The rest is the host: hash-map inserts and hashing
+     (~12%: the function map's publish/replay), `Table::set` and wasmtime's
+     funcref type checks (~7%: every thread's store installing the unit's
+     55,438 slots as it catches up; Hollow Knight has ~70 threads), the
+     function JIT still translating the other libraries (gex_xlate
+     summaries, regalloc, Cranelift; libc, libstdc++, the game's other .so),
+     and malloc. Levers: install a unit's slots once per process rather than
+     per store (a shared table, or lazy per-slot installs), units for the
+     remaining libraries (libc/libstdc++/libGL-side), and the per-thread
+     replay cost. The page has the same shape (each Worker instantiates
+     every unit), which matters more there.
+  30. **B3, Muck in the page, first run (2026-10-08, edger Chromium 153,
+     WebGPU on the P620; `scratch/unity/page/muck-page.sh NAME MINUTES`, run
+     through bench.sh; no function JIT, .NET interpreter; aa4b35e1):** Muck
+     boots on the .NET provider in the page, first frame 79 s after the page
+     opened, 11.5 presents/s from ~300 s to ~700 s (native edger, warm
+     caches, interpreter: first present 151.6 s, menu 43.0 presents/s).
+     Then a WebGPU validation error in Mesa's gex_wgpu stops drawing: "Bind
+     group layout [draw VS:GLSL19/FS:GLSL19 g0] ... does not match layout
+     [draw VS:GLSL4/FS:GLSL4 g0] of bind group [draw VS:GLSL20/FS:GLSL20 g0]"
+     (a bind group made against one program's layout, used with another's):
+     for the GL stream. The screenshots show only the harness's terminal
+     (the canvas is not in the shot); the compositor reported 118,580 lit
+     pixels while it drew.
+     What it took (this commit): guest code a provider called waits in place
+     and stages threads (a trap to the run loop had abandoned the provider's
+     frames, and the guest then returned into the provider's code page:
+     SIGSEGV); tier-1's syscall import starts staged threads in a provider's
+     process; provider call-outs nest up to 400; gex-fjit lays a function of
+     over 1,500 blocks out flat in the browser (its structured emission
+     overflowed a Worker's stack on UnityPlayer under `?fjit=1`, not retried
+     yet).
+     Staging on edger: `scratch/unity/page/muck-bcl` (the run's BCL + 
+     mono.wasm), `muck-files.txt` (host files from a native `--strace`), the
+     worktree synced to edger without `target/`.

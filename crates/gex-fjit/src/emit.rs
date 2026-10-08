@@ -137,6 +137,9 @@ fn flags() -> RegSet {
 
 /// Emit `f` (memory form, verified, `loops` = `outer_loops(f)` when
 /// outlining). `None` when a loop function's CFG is irreducible.
+/// Blocks above which a function is laid out flat in the browser (see `emit`).
+const FLAT_ABOVE: usize = 1500;
+
 pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -> Option<Emitted> {
     let n = f.blocks.len();
     // The body's graph: the blocks, then one handover node per outlined
@@ -151,7 +154,13 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
         succs.push(lp.exits.iter().copied().collect());
     }
     let graph = Graph { succs: succs.clone(), entry: 0 };
-    let mut layout = match cfg::make_reducible(graph) {
+    // In the browser the structured layout's emission recurses about as deep
+    // as the function's structure, on a Worker's stack (about 1 MB): a function
+    // of thousands of blocks (UnityPlayer has them) overflowed it
+    // ("Maximum call stack size exceeded" in `tree`/`within`/`node`). Such a
+    // function is laid out flat there.
+    let too_deep = cfg!(target_family = "wasm") && succs.len() > FLAT_ABOVE;
+    let mut layout = match (!too_deep).then(|| cfg::make_reducible(graph)).flatten() {
         Some(fx) => {
             if !fx.dispatch.is_empty() {
                 stats.irreducible += 1;
@@ -163,7 +172,7 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
             // branch setting the arm (tier-1's region form).
             stats.dropped += 1;
             if std::env::var_os("GEX_FJIT_STATS").is_some() {
-                eprintln!("[fjit] {:#x}{}: irreducible, laid out flat", f.entry, f.name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default());
+                eprintln!("[fjit] {:#x}{}: irreducible or too big, laid out flat", f.entry, f.name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default());
             }
             let graph = Graph { succs, entry: 0 };
             let mut arm = vec![u32::MAX; graph.succs.len()];

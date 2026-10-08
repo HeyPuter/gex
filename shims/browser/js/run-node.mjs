@@ -307,6 +307,8 @@ const host = new ProcessHost({
     dense: process.env.GEX_DENSE === '0' ? false : process.env.GEX_DENSE === '2' ? 2 : undefined,
     denseDebug: !!process.env.GEX_DENSE_DEBUG,
     mem64: MEM64,
+    // GEX_WASM_DLLS=soname=path,...: shared objects replaced by wasm64 providers (cgen/libprov.rs).
+    wasmDlls: process.env.GEX_WASM_DLLS || undefined,
     calloutTrace: !!process.env.GEX_CALLOUT_TRACE,
     inPlace: process.env.GEX_IN_PLACE === '0' ? 0 : undefined,
     excTrace: !!process.env.GEX_EXC_TRACE,

@@ -103,8 +103,17 @@ static int ring_open(void) {
         return -1;
     }
     size_t total = HEADER_BYTES + CMD_CAPACITY + REPLY_CAPACITY;
-    void *p = mmap(NULL, total, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* MAP_32BIT on x86-64: the host takes the ring's address as 32 bits (the
+       browser's gl_submit), and a process with a 64-bit memory would otherwise
+       get it above 4 GiB. */
+    void *p = MAP_FAILED;
+#if defined(__x86_64__) && defined(MAP_32BIT)
+    p = mmap(NULL, total, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+#endif
+    if (p == MAP_FAILED)
+        p = mmap(NULL, total, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         close(gl_fd);
         gl_fd = -1;

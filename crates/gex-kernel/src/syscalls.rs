@@ -5127,6 +5127,11 @@ impl Kernel {
                 Some((name.clone(), offset)),
             )?;
             if let Some((path, base)) = pinned {
+                // Said as it happens: the end-of-run report is lost when the
+                // process is killed (a game run ends at its timeout).
+                if base != start {
+                    eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+                }
                 self.pin_landed.push((path, base, start));
             }
             let mut tmp = vec![0u8; len as usize];
@@ -5185,12 +5190,17 @@ impl Kernel {
         // code, so in a 64-bit memory it stays below 4 GiB with the code; the
         // loader runs at INTERP_BASE (docs/mem64.md §3).
         let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.syscall_pc);
-        let start = if from_loader {
-            self.mem.mmap_low(addr, len, prot_bits, flags, "")?
+        let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
+            self.mem.mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
         } else {
             self.mem.mmap(addr, len, prot_bits, flags, "")?
         };
         if let Some((path, base)) = pinned {
+            // Said as it happens: the end-of-run report is lost when the
+            // process is killed (a game run ends at its timeout).
+            if base != start {
+                eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+            }
             self.pin_landed.push((path, base, start));
         }
         // Anonymous memory is defined to read as zero. Pages that already
