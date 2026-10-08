@@ -317,6 +317,49 @@ static int fbq_invalidates(uint32_t opcode) {
     }
 }
 
+/* Hand everything recorded so far to the host without waiting for it to
+   run: GEX_GL_SUBMIT_ASYNC (shims/native/src/gl.rs, shims/browser/src/gl.rs)
+   copies the batch and returns, and the next submit of either kind waits for
+   it. For a batch with nothing to answer -- a frame's last, when nothing is
+   paced on its reply. In the page a synchronous submit is a round trip to
+   the compositor's Worker, which is most of what Unity's render thread spent
+   its time on. A host without it refuses once, and every batch then goes
+   the waiting way. GEXGL_SYNC_PRESENT=1 never tries. */
+#define GEXGL_SUBMIT_ASYNC 0xc0086704u
+static int async_refused = -1;
+
+static void flush_async(void) {
+    if (!ring || ring->tail == 0) {
+        reply_at = 0;
+        return;
+    }
+    if (async_refused < 0) async_refused = getenv("GEXGL_SYNC_PRESENT") ? 1 : 0;
+    if (async_refused) {
+        flush();
+        return;
+    }
+    gexgl_note_submit();
+    if (ioctl(gl_fd, GEXGL_SUBMIT_ASYNC, ring) != 0) {
+        if (errno == ENOTTY || errno == EINVAL || errno == ENOSYS) {
+            /* Refused before anything ran (an older host): the batch is still
+               in the ring, so submit it the waiting way and stop trying. */
+            async_refused = 1;
+            flush();
+            return;
+        }
+        /* EIO: the batch was taken, and the one before it failed; that is
+           this call's report, as flush() makes one. */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "gexgl: an asynchronous batch failed on the host\n");
+        }
+    }
+    ring->tail = 0;
+    ring->reply_len = 0;
+    reply_at = 0;
+}
+
 /* Start a command. Returns where to write its arguments, having reserved
    room for them, or NULL if the batch is full -- in which case it is flushed
    and the caller tries again. */
@@ -3235,6 +3278,13 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     gexgl_x11_follow_size(s);
     gexgl_wl_commit(s);
     CMD0(GEXGL_PRESENT);
+    /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
+       off), so the frame goes without waiting for it. */
+    if (egl_swap_interval == 0) {
+        flush_async();
+        ++egl_swaps_issued;
+        return EGL_TRUE;
+    }
     flush();
     /* How many frames the page has actually shown. Zero from a decoder that
        predates this reply, which is why nothing below acts on zero. */

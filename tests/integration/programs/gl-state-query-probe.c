@@ -1,7 +1,8 @@
 /* Framebuffer state queries the guest library answers from its cache
  * (guest/gl/gexgl.c fbq_*): GL_SAMPLES and GL_READ_BUFFER across binding
  * changes, glReadBuffer, renderbuffer storage with samples, and a deleted
- * framebuffer whose name comes back. Prints SUMMARY cases=N passed=N failed=0;
+ * framebuffer whose name comes back; and swaps at interval 0, which the
+ * library submits without waiting. Prints SUMMARY cases=N passed=N failed=0;
  * runs on native Mesa too.
  *
  *   cc -o probe gl-state-query-probe.c -lEGL -lGL       (native reference)
@@ -82,6 +83,23 @@ int main(void) {
     glBindFramebuffer(GL_FRAMEBUFFER, again);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb[0]);
     expect("a new framebuffer: read buffer", GL_READ_BUFFER, GL_COLOR_ATTACHMENT0);
+
+    /* Swaps at interval 0, which the guest library submits without waiting
+     * (flush_async), interleaved with reads that must see each frame. */
+    eglSwapInterval(display, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    int frames_ok = 1;
+    for (int i = 0; i < 50; i++) {
+        glClearColor((float)(i & 1), 0.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        unsigned char px[4] = {7, 7, 7, 7};
+        glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        if (px[0] != ((i & 1) ? 255 : 0) || px[2] != 255) frames_ok = 0;
+        eglSwapBuffers(display, surface);
+    }
+    cases++;
+    passed += frames_ok;
+    printf("CASE swaps at interval 0 %s\n", frames_ok ? "PASS" : "FAIL");
 
     printf("SUMMARY cases=%d passed=%d failed=%d\n", cases, passed, cases - passed);
     return cases == passed ? 0 : 1;
