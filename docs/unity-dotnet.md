@@ -1739,3 +1739,29 @@ Not yet:
        sharedassets0.assets). The page draws only the GS's input points:
        gex_wgpu has no GS. Sent to GL. The sea at the horizon is missing
        too.
+  33. **Start-up and GL in the page (2026-10-08, edger, fjit plus the unit):**
+     - **The first frame is bimodal: about 71-75 s or about 110-119 s,
+       whether or not the KLOCK fix is in.** The A/B pair: mpA1 (fix
+       reverted) took 110 s; mpB1 (83548eac) took 71 s.
+       - With timestamped console lines (91cc32d8), mp19 shows a silent
+         37 s gap between 69.7 s and 106.7 s.
+       - Profiles over that window (`--profile 75,25`, mp21) show the main
+         thread parked. One Worker spends the time in UnityPlayer's FMOD
+         Vorbis decoder (decode_packed_entry_number, decode_map,
+         fmod_tremor_mdct_backward, FMOD::CodecVorbis::readInternal under
+         CodecFSB5): audio clips decoded on load.
+       - Why only some runs wait for it is not known yet. The cost is
+         unit-compiled guest code on one thread.
+     - **GL's bind-group fix** (mesa-wink 9f1da0fa, mods/gpe): in mp18,
+       presents keep going past 500 s with 0 validation errors.
+     - **GL's guest GL gl64q2** (frame-query cache, and an async present
+       at swap interval 0), in mp23 against mp19 (both with the gpv Mesa):
+       - 46.8-47.6 presents/s at the menu, against 24.2-25.3: about 1.9x
+         faster, and above native mk-j1's 38.6 (old guest GL).
+       - Submits per frame: 2.3 against 2.6.
+       - `muck-page.sh` takes `GL64=` for the guest GL.
+     - **The grass is still dots with the gpv Mesa.** Tint rejects 7
+       SPIR-V modules ("index 2147483648 out of bounds"). GL has the
+       verbose log (mp22).
+     - The guest GL from master (4f042637) segfaults Muck natively under
+       edger's older gexc (GL's report). To check against the gate's legs.
