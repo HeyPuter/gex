@@ -10986,6 +10986,11 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     cgen::provider_calls_recent()
                 ));
                 warn_line(&format!("[gex] last lookups (address, index): {:x?}\n", cgen::lookups_recent()));
+                warn_line(&format!(
+                    "[gex] last call-outs (target, return, sp wanted, depth, result, sp after): {:x?}; provider guest call open {}\n",
+                    cgen::callouts_recent(),
+                    cgen::libprov::guest_call_open()
+                ));
             }
             set_exit(h, 128 + 11);
         });

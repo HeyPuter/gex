@@ -210,7 +210,10 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     drop(modules);
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
     let idx = crate::cgen::index_of(addr);
-    trace(&format!("module {n}: {addr:#x} {} funcs, install {install}, index {idx:?}", funcs.len()));
+    if TRACE.load(Ordering::Relaxed) {
+        let names: Vec<String> = crate::with_host(|h| funcs.iter().map(|&a| format!("{a:#x} {}", crate::object_off_at(h, a))).collect());
+        trace(&format!("module {n}: {addr:#x} {} funcs, install {install}, index {idx:?}: {}", funcs.len(), names.join(", ")));
+    }
     idx
 }
 
