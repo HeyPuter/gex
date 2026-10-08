@@ -422,6 +422,15 @@ pub mod op {
     pub const PUSH_ATTRIB: u32 = 198;
     /// `{}` -- glPopAttrib.
     pub const POP_ATTRIB: u32 = 199;
+    /// A client-memory vertex array: `{ slot, op, n, n words, bytes }`.
+    /// The host keeps the bytes (one copy per `slot`, until that slot's next
+    /// CLIENT_ARRAY) and runs pointer command `op` with the `n` argument
+    /// words and the bytes' address as its pointer, with no
+    /// GL_ARRAY_BUFFER bound. How the NT layer passes glVertexPointer-style
+    /// client arrays: GL then uploads them the way it uploads any user
+    /// array, instead of the guest rewriting a buffer of its own before each
+    /// draw (which a batched backend has to stage and copy).
+    pub const CLIENT_ARRAY: u32 = 200;
 }
 
 /// Writes commands into a batch. For the host's tests: the guest half is C,

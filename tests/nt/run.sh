@@ -108,6 +108,10 @@ for arch in x64 x86; do
     check $arch/icall 0 "icall: 1284803844 -1238658015 2 3 4" "$b/icall.exe"
     # N4: USER without a display.
     check $arch/user_win 0 "$allok" "$b/user_win.exe"
+    # The same as a child process (CreateProcess, waited for): native Wine
+    # (W3) only, where a child reads the session through requests; the NT
+    # layer has no child processes. GEX_NT_CHILDREN=1 runs it.
+    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childgui 0 "${allok}${nl}child exit 0" "$b/childgui.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"

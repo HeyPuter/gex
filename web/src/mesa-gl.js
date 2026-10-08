@@ -63,9 +63,10 @@ async function loadGlue(url) {
 
 /** The driver's WebGPU calls by name: [calls, ms inside, bytes, ms waited]
  *  ("waited" is a promise's time to settle: mapAsync, onSubmittedWorkDone).
- *  Mesa's own wasm is a few percent of a frame; its cost is these calls, so
- *  they are counted always -- one performance.now pair per call -- and
- *  `glState` reports them per frame since it was last asked. */
+ *  `glState` reports them per frame since it was last asked. Only when asked
+ *  for (`?wgpustats=1`, the `wgpuStats` option): the wrapper is a
+ *  performance.now pair and a Map lookup on each of a few thousand calls a
+ *  frame, which was 2.5% of the GL worker's time in Noita's page. */
 const wgpuCalls = new Map();
 function countWebGpu() {
   if (countWebGpu.done || typeof GPUQueue === 'undefined') return;
@@ -124,6 +125,16 @@ function countWebGpu() {
  *  message to whatever is listening (DevTools, a harness over CDP), on the
  *  thread that runs Mesa: two thousand batches in a seven-minute Noita run.
  *  `?gltrace=1` keeps them all. */
+/** A page's `?NAME=1`. In a Worker `location` is the worker script's, so
+ *  the compositor passes its page's switches in as options instead. */
+function pageFlag(name) {
+  try {
+    return globalThis.document !== undefined && new URLSearchParams(location.search).get(name) === '1';
+  } catch {
+    return false;
+  }
+}
+
 function quietReports(out) {
   let all = false;
   try {
@@ -224,7 +235,7 @@ export class MesaGlDevice {
       const { adapter, device } = options.gpu ?? await requestGexDevice();
       out.#adapter = adapter;
       out.#device = device;
-      countWebGpu();
+      if (options.wgpuStats ?? pageFlag('wgpustats')) countWebGpu();
       // And out of reach of the collector for as long as the page lives.
       //
       // The fields above were supposed to be enough, and are not: the device
