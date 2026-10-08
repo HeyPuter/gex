@@ -112,6 +112,10 @@ for arch in x64 x86; do
     # (W3) only, where a child reads the session through requests; the NT
     # layer has no child processes. GEX_NT_CHILDREN=1 runs it.
     [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childgui 0 "${allok}${nl}child exit 0" "$b/childgui.exe"
+    # And from a console launcher: the child hosts the desktop.
+    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childcon 0 "${allok}${nl}child exit 0" "$b/childcon.exe"
+    # Children one after another, each a new address space.
+    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childloop 0 "0 of 8 children failed" "$b/childloop.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"

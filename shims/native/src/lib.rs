@@ -479,6 +479,10 @@ struct JitShared {
     /// Wine's PE side as one wasm module (`wasmdll`, shared mode): installed
     /// at the first skeleton that names it, bound DLL by DLL.
     wine_pe: Option<Arc<wasmdll::WinePe>>,
+    /// The stateful modules' data addresses whose relocations this address
+    /// space has had (`libprov::relocate_once`). With the process: a fork
+    /// shares it (its memory is a copy, relocated), an exec starts empty.
+    relocated: Arc<Mutex<std::collections::HashSet<u64>>>,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -1102,6 +1106,7 @@ fn run_program_with(
                 ftab: Default::default(),
                 wasm_program: false,
                 wine_pe: None,
+                relocated: Default::default(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
