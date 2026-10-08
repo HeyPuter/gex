@@ -578,6 +578,7 @@ dependencies = [
  "gex-xwm",
  "spinning_top",
  "talc",
+ "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
 ]
 
