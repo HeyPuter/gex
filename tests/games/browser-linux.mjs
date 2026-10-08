@@ -8,11 +8,14 @@
 //   node tests/games/browser-linux.mjs --name NAME --dir GAME_DIR --exe REL
 //        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST]
 //        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
-//        [--gameplay N]
+//        [--gameplay N] [--mem64] [--env K=V,K=V] [--end-on-exit]
 //
 // --files lists host files the game opens, one per line (collected from a
 // native `gexc run --strace`; tests/games/retrocycles-linux-files.txt).
 // --gameplay N: report when the page has presented N GL frames.
+// --mem64: a 64-bit guest memory (the wasm64 shim, `?mem64=1`; docs/unity-dotnet.md P5).
+// --env: more environment for the guest. --end-on-exit: a program that exits is a result
+// (its output and status are printed), not a failure.
 // Needs web/public/gex built (shims/browser/build.sh), Mesa's wasm
 // (gex-wgpu-replay.*) and web/public/gex/xwayland/ (web/build-xwayland-wasm.sh),
 // and GEX_GL_X64 (guest/gl/build.sh with GEX_CC=gcc).
@@ -119,10 +122,12 @@ async function main() {
     `LD_LIBRARY_PATH=${['/gex/gl', ...libs, `/game/${dirname(exe)}`].join(':')}`,
     'SDL_VIDEODRIVER=x11', 'SDL_AUDIODRIVER=dummy', 'XDG_RUNTIME_DIR=/tmp', 'DISPLAY=:0', 'HOME=/home/g',
     'DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/gex-no-bus',
+    ...(opt('--env', '') || '').split(/,(?=[A-Za-z_][A-Za-z0-9_]*=)/).filter(Boolean),
   ].join(',');
   const t0 = Date.now();
   const { evaluate, state, shot, consoleLines } = await openPage(
     `tar=/gex/nt/${basename(tar)}&exe=/game/${exe}&cwd=/game/${cwd}&gl=1&glbackend=wgpu&hostx=1`
+      + (argv.includes('--mem64') ? '&mem64=1' : '')
       + `&size=${width}x${height}&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(opt('--args', ''))}`,
     { width: width + 20, height: height + 100, shotDir },
   );
@@ -143,6 +148,10 @@ async function main() {
   const end = t0 + minutes * 60000;
   while (Date.now() < end) {
     const s = await state();
+    if (s?.phase === 'done' && argv.includes('--end-on-exit')) {
+      console.log(`exit ${s.status}\n${s.out ?? ''}`);
+      return;
+    }
     if (s?.phase === 'failed' || s?.phase === 'done') {
       log(`output: ${(s.out ?? '').slice(-3000)}`);
       throw new Error(`${name} stopped (${s.phase}, status ${s.status}) ${s.error ?? ''}`);
