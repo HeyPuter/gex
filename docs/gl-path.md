@@ -326,3 +326,29 @@ so U's KLOCK change cannot move it.
 Native note: with master's guest GL (and this branch's), Muck natively
 segfaults U's edger gexc (10-07) and shows no frame within 420 s with a
 current gexc; U's 10-04 gl64 works. Reported to U.
+
+## GL 4.6 in the page, native core contexts, Tint's negative zero (2026-10-08)
+
+- **Why the page's context was GL 4.0.** Every 4.1-4.6 extension is there;
+  what failed were constants, because the page's WebGPU device kept WebGPU's
+  default limits (8192 texels, 256 layers, 256 compute invocations, 16 KiB of
+  workgroup memory): GL 4.1 wants 16384/2048, GL 4.3 1024/32 KiB (the
+  decoder's report now lists every unmet requirement to 4.6). Asking for the
+  adapter's limits (e204fa1b) makes the context 4.6 -- and then Muck's 3D
+  scene drew black (U, mp26), so 32f58c4e backs the request out until that is
+  understood. 707e84b8's version fit covers 4.1-4.6 sources meanwhile.
+- **Native core contexts (c39706ba).** Since 6230d6f4 the native host gave a
+  core-profile request a core context, which refuses the guest library's own
+  object names: tests/gl-map-buffer.sh 0/3, native Muck drew nothing. The host
+  makes a compatibility context of the requested version; the guest reports
+  the profile asked for. E3 (bcc93e30) was not involved.
+- **Tint's negative zero.** Tint dedups scalar constants by value and
+  -0.0 == 0.0: Unity's fragment shader has vec2(-0.01, -0.0) and indexes a
+  34-entry uniform array with floatBitsToUint(0.0), which Tint folded to
+  0x80000000 and rejected (Muck's page, 5-7 programs). mesa-wink gl/perf
+  523362aa (on upstream wink 0dd84167) emits such constants through ntv's
+  unfoldable path. Upstream wink independently fixed the emitted-handle bug as
+  `handle_epoch` (same design as 9f1da0fa, which the rebase drops).
+- **Muck's page with the guest GL changes (U, mp23):** 46.8-47.6 presents/s
+  against 24.2-25.3 (mp19); the async present at swap interval 0 is nearly
+  all of it.
