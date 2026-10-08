@@ -235,6 +235,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   const { sessionId: page } = await browser.send('Target.attachToTarget', { targetId, flatten: true });
   const consoleLines = [];
   let printed = 0;
+  let keepRe = null;
   // Every Worker's console too: each guest thread is one.
   browser.on('Runtime.consoleAPICalled', (p, sid) => {
     const text = p.args.map((a) => a.value ?? a.description ?? '').join(' ');
@@ -246,7 +247,10 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     const wanted = p.type === 'error'
       ? !/^\[mesa-gl\] gex-gl: gl[A-Z]/.test(text)
       : p.type === 'warning' && /gex-nt|gex-wgpu|wine:|\[gex\]|panic|trap/i.test(text);
-    if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE) && printed++ < 20000) {
+    // GEX_NT_BROWSER_KEEP=REGEX: also any line it matches (Mesa's compile
+    // and link notes, say), without the verbose flood.
+    keepRe ??= process.env.GEX_NT_BROWSER_KEEP ? new RegExp(process.env.GEX_NT_BROWSER_KEEP) : false;
+    if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE || (keepRe && keepRe.test(text))) && printed++ < 20000) {
       log(`console[${sid?.slice(0, 6)} @${((Date.now() - T0) / 1000).toFixed(1)}s] ${text.slice(0, 4000)}`);
     }
   });
