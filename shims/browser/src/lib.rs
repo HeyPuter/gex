@@ -12395,6 +12395,19 @@ fn note_blocks(
 /// `RefCell` borrow would panic.
 /// Like `object_name_at` but with the `+offset` into the object, so a return
 /// address on a crash stack can be run through objdump to name the function.
+/// The file name of the object mapped at `a` ("" if none).
+pub(crate) fn object_file_at(a: u64) -> String {
+    with_host(|h| {
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .find(|v| a >= v.start && a < v.end)
+            .and_then(|v| v.code.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string()))
+            .unwrap_or_default()
+    })
+}
+
 fn object_off_at(h: &Host, a: u64) -> String {
     h.kernel
         .mem

@@ -233,13 +233,42 @@ fn named(mut wasm: Vec<u8>) -> Vec<u8> {
 /// make one)? Then its bridge reaches it once this Worker has installed
 /// what the table's log holds (the caller traps or installs in place).
 pub(crate) fn serve(pc: u64) -> bool {
-    if !on() || is_tier1_only(pc) {
+    if !on() || is_tier1_only(pc) || !lib_wanted(pc) {
         return false;
     }
     if crate::cgen::index_of(pc).is_some() {
         return false;
     }
     translate(pc).is_some()
+}
+
+/// `+name,-name` (`?fjitlibs=`): the objects the JIT is limited to (any `+`)
+/// and kept from (`-`), by file name.
+static LIBS: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
+
+#[no_mangle]
+pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
+    let spec = String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..ptr as usize + len as usize]).into_owned();
+    let mut v = lock(&LIBS);
+    v.clear();
+    for w in spec.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        match w.strip_prefix('-') {
+            Some(n) => v.push((false, n.to_string())),
+            None => v.push((true, w.trim_start_matches('+').to_string())),
+        }
+    }
+}
+
+fn lib_wanted(pc: u64) -> bool {
+    let rules = lock(&LIBS).clone();
+    if rules.is_empty() {
+        return true;
+    }
+    let name = crate::object_file_at(pc);
+    if rules.iter().any(|(inc, n)| !inc && *n == name) {
+        return false;
+    }
+    !rules.iter().any(|(inc, _)| *inc) || rules.iter().any(|(inc, n)| *inc && *n == name)
 }
 
 /// JIT module `n`'s bytes.

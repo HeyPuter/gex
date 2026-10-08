@@ -806,6 +806,8 @@ export class Gex {
   static wasmDlls = '';
   /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
   static elfUnits = '';
+  /** `+name,-name` (the page's `?fjitlibs=`): objects the function JIT is limited to or kept from. */
+  static fjitLibs = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -2534,6 +2536,13 @@ export class Gex {
    *  providers (cgen/libprov.rs). */
   #libprovConfig() {
     const e = this.#shim.exports;
+    if (Gex.fjitLibs && e.gex_fjit_libs) {
+      const b = new TextEncoder().encode(Gex.fjitLibs);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_fjit_libs(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
     if (Gex.elfUnits && e.gex_cgen_elf_units) {
       const b = new TextEncoder().encode(Gex.elfUnits);
       const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;

@@ -675,6 +675,8 @@ export async function runProgram(
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
       elfUnits: globalThis.GEX_ELF_UNITS || undefined,
+      // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
+      fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,
