@@ -1494,3 +1494,22 @@ Not yet:
      Risks: Mono's LLVM wasm64 output (untested upstream), code size (tens of
      MB for Hollow Knight), and AOT of the Unity-patched BCL behaviour we
      depend on (GC handles, liveness) being in C, so unaffected.
+  24. **Muck with and without the JIT (edger, warm fjit cache, provider
+     `dnc-jit` = d4a9389d's runtime with patch 0004, same gexc, no unit;
+     runs mk-i1 `GEXMONO_WASM_JIT=0`, mk-j1 `=1`):**
+
+     | run | first present | "Initializing packets" | menu fps (20-80 s after) | last quarter |
+     |---|---|---|---|---|
+     | mk-i1, interpreter | 151.6 s | 224.1 s | 43.0 | 43.5 |
+     | mk-j1, wasm JIT | 154.6 s | 231.1 s | 38.6 | 42.6 |
+
+     Both render the full menu, no faults. The JIT's window starts while it
+     is still compiling (per-second minimum 7.9), and settles 2% below the
+     interpreter: the menu is not managed-bound, and the JIT's compiles cost
+     7 s of start-up. Hollow Knight (item 22): 250.5 s vs 236.7 s first
+     present, 300.8 s vs 280.4 s menu, 30.2 vs 28.6 presents/s in the last
+     quarter. A managed-heavy scene (gameplay) is where the JIT has to pay;
+     the menus cannot show it.
+     **Next:** the JIT's start-up cost (compile threshold, caching compiled
+     JIT modules across runs like `GEX_FJIT_CACHE`), the main/render thread
+     waits, then .NET AOT (item 23).
