@@ -1883,8 +1883,27 @@ Not yet:
          call(s)` (from provider_try, with the JS stack) and `... reached the
          run loop with N open`. The wild-branch report now also lists the
          Worker's last 16 set_resume calls (lib.rs line, pc).
-       - Running: hb23 (`+libGL.so.1` with these diagnostics), then hb22
-         (`+libc.so.6`): `scratch/unity/page/q14.sh`.
+       - hb23 and hb24 (`+libGL.so.1,provcheck=1`) crashed the same way.
+         provcheck said every provider guest call ended at its slot + 8, and
+         the dump showed the "slot" at 0x57f4830 holding 0x12d7a280: no
+         `ret` read 0x13450100. hb22 (`+libc.so.6`) instead ran a libc
+         continuation (+0x8ea87, after `call *0x378(%r12)` into ld.so's
+         `_dl_catch_error`) with Unity's registers and called a heap address.
+       - **Cause: a stale resume (fixed in e2f06c87).** The dispatch miss
+         that recognises a call-out's return (`cgen::returned`) sets the
+         resume and traps when it cannot leave by returning, which is the
+         case with JIT bodies on the stack. `#callOut`'s catch returned on
+         `gex_callout_hit()` without reading the resume. The next time the
+         thread blocked with nothing else to run (`schedule()` returning 2;
+         here Unity's futex), the run loop took the stale resume. That was
+         the provider's ra 0x13450100 (hb21/23/24, the last resume in the
+         ring) or 0x12e63a87 (hb22). The catch now drops the resume when it
+         ends its own call-out.
+       - hb25 (`+libGL.so.1`, the fix): no crash; lit 59-60k from ~150 s;
+         the last readback (`shots/hb25/c013.png`) is the menu; 15.0
+         presents/s at 392 s (no unit). hb26 (the full function JIT) and hp8
+         (`--fjit` with the pinned unit, the target configuration) are
+         queued (`q16.sh`, `q17.sh`).
      - **HK's start-up in the page (hp7, the unit):** first frame 55 s;
        "Performing automatic level start" by 122 s; 18 presents/s by 152 s;
        the menu is up at about 2.5 min (native gate: menu ready 406.5 s).
