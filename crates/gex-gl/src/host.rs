@@ -2386,30 +2386,17 @@ mod tests {
         assert_eq!(pixel16(&px, 3, 8), (255, 0, 0, 255), "the client-array quad, scaled");
         assert_eq!(pixel16(&px, 9, 8), (0, 0, 0, 255), "nothing between");
         assert_eq!(pixel16(&px, 14, 8), (0, 255, 0, 255), "the immediate quad, moved by the loaded matrix");
-    }
 
-    /// CLIENT_ARRAY: client-memory arrays carried with their pointer
-    /// commands, drawn while the guest's own buffer stays bound.
-    #[test]
-    fn client_array_draws_from_the_bytes_it_carries() {
-        let mut gl = match Gl::new(16, 16) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skipping: no host GL ({e})");
-                return;
-            }
-        };
-        const GL_VERTEX_ARRAY: u32 = 0x8074;
-        const GL_COLOR_ARRAY: u32 = 0x8076;
-        const GL_QUADS: u32 = 0x0007;
-        let mut b = Batch::new();
-        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 2, 1]);
-        let _ = gl.run(b.bytes());
-        if !gl.is_desktop() {
-            eprintln!("skipping: the host has no desktop OpenGL");
-            return;
-        }
-        let f = |v: f32| v.to_bits();
+        // CLIENT_ARRAY: client-memory arrays carried with their pointer
+        // commands, drawn while the guest's own buffer stays bound. (In this
+        // test rather than one of its own: the host tests share the native
+        // decoder's name tables, so a further concurrent GL test races them.)
+        b = Batch::new();
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::MATRIX_MODE, &[GL_PROJECTION]);
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::MATRIX_MODE, &[GL_MODELVIEW]);
+        b.cmd(op::DISABLE, &[GL_ALPHA_TEST]);
         // The left half in clip space, red; then the right half, blue, from
         // the same slots: each CLIENT_ARRAY replaces its slot's bytes.
         let quad = |x0: f32, x1: f32| {
@@ -2421,7 +2408,6 @@ mod tests {
             v
         };
         let colour = |c: [u8; 4]| c.repeat(4);
-        let mut b = Batch::new();
         b.cmd(op::CLEAR_COLOR, &[0, 0, 0, f(1.0)]);
         b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
         b.cmd(op::GEN_BUFFERS, &[1, 9]);
