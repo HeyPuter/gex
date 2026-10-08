@@ -1699,3 +1699,31 @@ Not yet:
      - Per-Worker unit install time is now logged (`[unit] installed at
        BASE in N ms`, when 20 ms or more): the measure for item 4, the
        once-per-process slot install.
+  32. **Where the page's 20 fps goes (mp16, edger, 2026-10-08):**
+     - Setup: `--profile 240,20` (new in browser-linux.mjs) profiles the page
+       and all 27 Workers for 20 s at the menu, with fjit plus the unit.
+       The profiles are in `scratch/unity/page/shots/mp16/*.cpuprofile`.
+     - The page's main thread is 100% idle, and the compositor Worker 53%
+       idle (its busy part is createRenderPipeline, createBindGroup and
+       gex_wgpu draws).
+     - Guest Worker 3 (Muck's main thread) spends 39% of its time in
+       `KLock::take`: 18% from `gex_wake` → `schedule` after a park, the
+       rest from syscalls. Another 17% goes to `k_park_futex`. Guest code is
+       only a few percent.
+     - Worker 24 (the render thread) spends 45% in `gl_submit` (the page's
+       synchronous submit), and that call ran under KLOCK, inside the
+       ioctl in `gex_syscall`'s locked dispatch. 33% goes to parks.
+     - The ~22 idle Workers each spend 65% in `k_park_futex` and 34% in
+       `KLock::take` (from `schedule` on wake-up): a convoy behind the lock
+       held across GL submits.
+     - Fix (8842f365): the GL ioctl records the submit, and `gex_syscall`
+       runs it once the lock is released. The GLX page test passes. The
+       Muck measurement is pending.
+     - No `[unit]` lines reached the log: the harness keeps only console
+       errors from Workers, and those lines are `console.warn`. The
+       per-Worker install times need console.error (to do).
+     - The dotted grass is Muck's geometry-shader grass (GLSL 410,
+       `layout(points)` to `triangle_strip`, `max_vertices = 5`, in
+       sharedassets0.assets). The page draws only the GS's input points:
+       gex_wgpu has no GS. Sent to GL. The sea at the horizon is missing
+       too.

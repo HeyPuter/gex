@@ -2743,7 +2743,7 @@ export class Gex {
     if (jit >= 0) e.gex_fjit_installed(jit);
     // What each Worker pays to install a unit (instantiation fills its slots).
     const ms = performance.now() - tInst;
-    if (prov < 0 && jit < 0 && ms >= 20) console.warn(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
+    if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
     return regs.length / 2;
   }
 
