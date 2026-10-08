@@ -98,6 +98,10 @@ pub(crate) struct WinePe {
     pending: Mutex<Vec<(u64, Vec<u8>)>>,
     /// The entry thunks are bound (`bind_entry_thunks`, once).
     entries_bound: std::sync::atomic::AtomicBool,
+    /// The DLLs whose skeleton has been mapped: a later mapping of one (an
+    /// image view, LoadLibraryEx as an image resource) binds its exports
+    /// but writes none of the variables, which belong to the loaded DLL.
+    mapped: Mutex<std::collections::HashSet<String>>,
 }
 
 /// After an install's catch-up (the module instantiated, its data
@@ -313,7 +317,7 @@ fn install_shared(
             let module = gex_cache::load_or_compile_at(engine, &crate::libprov::cwasm_path(&file, &wasm), &wasm)
                 .with_context(|| format!("compiling {}", file.display()))?;
             crate::aot_share::note(&module, crate::aot_share::Kind::Provider);
-            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: exported_offsets(&wasm)?, pending: Mutex::new(Vec::new()), entries_bound: Default::default() };
+            let wp = WinePe { install: 0, data, slots, any_dll, data_exports: exported_offsets(&wasm)?, pending: Mutex::new(Vec::new()), entries_bound: Default::default(), mapped: Default::default() };
             (Arc::new(wp), Some((module, names.len() as u32)))
         }
     };
@@ -355,12 +359,19 @@ fn install_shared(
         }
     }
 
+    // The variables below are the loaded DLL's, written at its first
+    // mapping only. Written again at a later one (wineboot's install maps
+    // DLLs as image views), they pointed winecrt0 at the view, and under
+    // native Wine's own Unix side (W3) reset ntdll's __wine_unixlib_handle,
+    // which load_ntdll_functions had set, to gex-kernel's handle: every
+    // later Unix call of ntdll's went through a table at address 1.
+    let first_mapping = wp.mapped.lock().unwrap_or_else(|e| e.into_inner()).insert(dll.clone());
     // winecrt0's base of this DLL (its unix calls, delay loads and version
     // resources find the DLL by it): the skeleton's.
-    if let Some(off) = wp.data_exports.get(&format!("{dll}!__gexw_image_base")) {
+    if let (true, Some(off)) = (first_mapping, wp.data_exports.get(&format!("{dll}!__gexw_image_base"))) {
         wp.pending.lock().unwrap_or_else(|e| e.into_inner()).push((wp.data + *off as u64, (base as u32).to_le_bytes().to_vec()));
     }
-    if dll == "ntdll.dll" {
+    if first_mapping && dll == "ntdll.dll" {
         let mut pending = wp.pending.lock().unwrap_or_else(|e| e.into_inner());
         for (name, bytes) in ntdll_variables() {
             if let Some(off) = wp.data_exports.get(&format!("ntdll.dll!{name}")) {

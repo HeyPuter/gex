@@ -613,9 +613,28 @@ fn trace_lookups() -> bool {
 }
 
 /// `gex.lookup(ctx, addr)`.
+fn recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_FTAB_RECHECK").is_some())
+}
+static RECHECK_SEEN: std::sync::LazyLock<Mutex<HashMap<u64, u64>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub(crate) fn lookup(caller: &mut Caller<'_, HostState>, addr: u64) -> Result<i32> {
     use std::sync::atomic::Ordering::Relaxed;
     stats::LOOKUPS.fetch_add(1, Relaxed);
+    // GEX_FTAB_RECHECK=1: what the probe cache holds for an address looked
+    // up again (it was written last time): another address's entry is a
+    // collision, the same entry a probe that does not match it.
+    if recheck() {
+        if let Some(m) = caller.data().memory.clone() {
+            let at = gex_abi::fcache_entry(addr) as usize;
+            let v = m.bytes().get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+            let n = RECHECK_SEEN.lock().unwrap_or_else(|e| e.into_inner()).entry(addr).and_modify(|c| *c += 1).or_insert(1).clone();
+            if n > 1 && (n < 4 || n.is_power_of_two()) {
+                eprintln!("[ftab] relookup {addr:#x} #{n}: its cache entry holds addr {:#x} index {} (thread {}, pc {:#x})", v & 0xffff_ffff, v >> 32, caller.data().thread.tid, m.bytes().get(caller.data().thread.ctx_addr as usize + gex_abi::ctx::PC..).and_then(|b| b.get(..8)).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap())));
+            }
+        }
+    }
     catch_up(&mut *caller)?;
     let sh = shared(caller)?;
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
