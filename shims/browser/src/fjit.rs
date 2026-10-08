@@ -307,6 +307,10 @@ pub(crate) fn watch_check(pc: u64, at: &str) {
     if a == 0 {
         return;
     }
+    // Not before the memory reaches it (the slice spans the maximum).
+    if a + 8 > crate::warch::memory_size(0) as u64 * 65536 {
+        return;
+    }
     let mem = crate::guest_bytes();
     let Some(b) = mem.get(a as usize..a as usize + 8) else { return };
     let v = u64::from_le_bytes(b.try_into().unwrap());
