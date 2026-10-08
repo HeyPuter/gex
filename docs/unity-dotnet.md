@@ -1543,3 +1543,37 @@ Not yet:
      host that is the units (5%) and the provider. Since the browser is the
      target and its costs differ (V8 instead of Cranelift, the page's GL),
      the next frame-time work belongs in the page (P5).
+  27. **P5 plan: Unity in the page (2026-10-07; estimate 11-14 agent days).**
+     The browser is the only performance target. Native edger numbers stay
+     next to each page number (same game state, same provider). What exists:
+     the wasm64 browser shim and kernel (`GEX_MEM64=1 shims/browser/build.sh`,
+     node runs of small programs), the page's Linux game path for wasm32
+     (`tests/games/browser-linux.mjs`: hostx Xwayland as wasm, Mesa's gex_wgpu
+     over WebGPU), stateful NT providers in the page (wasm32), ELF export
+     providers in the page, the function JIT in the page. Steps:
+     - **B0, a 64-bit memory in the page (1-2 days):** `mem64=1` in the page
+       (wasm64 shim, seed and kernel; the glue's BigInt paths), checked with
+       `tests/x86-programs/mem64-io` and a dynamic glibc program, then a GL
+       game through browser-linux.mjs under mem64.
+     - **B1, stateful Linux providers in the page (3-4 days):** the page's
+       `on_linux_maps` (a replaced `.so` maps: its exports bound to the
+       provider, its constructors to `gexp__noop`), the wasm64 `provider_*`
+       imports in gex.mjs (try/throw on a per-store wasm EH tag, ctx, alloc,
+       log, stack, abi, table_size, guest_sym, thread register/park/stop/start
+       on shared-memory words, guest_stack_end, code page and thread entry,
+       reverse slots), musl's per-thread attach in each Worker. Test:
+       `tests/unity-dotnet/embed` in the page, interpreter.
+     - **B2, the .NET wasm JIT in the page (2 days):** the `wasmjit` host
+       imports in the page: slots reserved in the function table, each module
+       compiled once and instantiated in every Worker through the table log
+       (as the function JIT's are), its throw tag. Test: embed with the JIT at
+       threshold 1.
+     - **B3, Muck in the page (2-3 days):** the game, the BCL and the
+       provider served to the page, Xwayland and Mesa as for the Linux games;
+       time to first frame and menu fps on edger's Chromium, against native.
+     - **B4, ELF units in the page (2 days):** the page's cgen hook for a
+       Linux map (`GEX_ELF_UNITS`), units from the unit cache by the same key
+       (built natively, `c.wasm` for the page); Muck's UnityPlayer unit.
+     - **B5, Hollow Knight in the page:** its 4.9 GB of data served lazily.
+     Shared shim code (gex.mjs, cgen.rs, the kernel) goes to the coordinator
+     as gate heads early, step by step.
