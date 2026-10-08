@@ -4328,7 +4328,21 @@ export class Gex {
           e.__stack_pointer.value = sp0;
           const sig = this.#calloutSignal;
           this.#calloutSignal = null;
-          if (sig?.kind === 'return') return sig.i === me ? 1 : 0;
+          // A call-out ended here was the trap's whole business: the resume
+          // the miss path set at its return (`cgen::returned`) is spent, and
+          // left in place it is where the run loop next goes -- the next
+          // time this thread blocks with nothing else to run, it "resumed"
+          // at the provider's return address (HK under ?fjit, docs §12 34).
+          // (Only this one's: an outer call-out's hit returns through the
+          // frames between, which leave as before.)
+          const ended = (v) => {
+            if (v === 1) {
+              e.gex_resume_pc();
+              e.gex_resume_ctx();
+            }
+            return v;
+          };
+          if (sig?.kind === 'return') return ended(sig.i === me ? 1 : 0);
           if (sig?.kind === 'bypass') {
             if (!sig.f) throw new Error('gex: a watched dispatch entry with nothing to run');
             next = sig.f;
@@ -4345,7 +4359,7 @@ export class Gex {
             throw err;
           }
           const hit = e.gex_callout_hit();
-          if (hit >= 0) return hit === me ? 1 : 0;
+          if (hit >= 0) return ended(hit === me ? 1 : 0);
           // gex_nr::NATIVE_LEFT (gexrt saw the guest leave a native caller's
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
