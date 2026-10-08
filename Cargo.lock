@@ -567,6 +567,7 @@ name = "gex-browser"
 version = "0.0.1"
 dependencies = [
  "gex-abi",
+ "gex-atomic",
  "gex-cgen",
  "gex-emit",
  "gex-kernel",
