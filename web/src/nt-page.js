@@ -115,6 +115,8 @@ async function main() {
   if (q.get('mem64') === '1') globalThis.GEX_MEM64 = 1;
   // `?fjit=1`: the function JIT (gexc run --fjit's browser half, fjit.rs).
   if (q.get('fjit')) globalThis.GEX_FJIT = Number(q.get('fjit')) || 1;
+  // `?wasmdlls=soname=path,...`: shared objects replaced by wasm64 providers (cgen/libprov.rs).
+  if (q.get('wasmdlls')) globalThis.GEX_WASM_DLLS = q.get('wasmdlls');
   if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
   // cgen=1|2 (prefer|require units), in the unguarded flavor of i386 units

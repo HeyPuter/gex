@@ -5871,6 +5871,15 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if let Some(p) = nt::process() {
         return nt::syscall(p, ctx, pc);
     }
+    // A stateful provider's syscall (`PROVIDER_SYSCALL` set by the page's glue,
+    // cgen/libprov.rs): its wasm frames cannot be left, so it is served as a
+    // wasm32 program's is -- a blocking call waits here, a thread or a child
+    // is staged for the host -- and the call returns.
+    let pc = {
+        let provider = (pc as u64) & PROVIDER_SYSCALL != 0;
+        IN_PROVIDER.with(|c| c.set(provider));
+        ((pc as u64) & !PROVIDER_SYSCALL) as i64
+    };
     // Which syscall is running, so the allocator can name who was asking (wasm
     // has no backtrace). See `HEAP_BY_CALL`.
     {
@@ -6404,7 +6413,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     h.jit.ever_threaded = true;
                 }
                 stage_thread(tid, ctx_addr, start);
-                if h.kernel.wasm32 {
+                if frames_stay(h) {
                     // A wasm32 program's frames cannot be left: the call
                     // returns, and `#wasmprogSyscall` starts the thread.
                     WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -6452,10 +6461,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
-                    // Priority-inheritance locks are not served here yet: the
-                    // call finishes at once with ENOSYS, as before gex had them
-                    // (`finish_parked`). docs/mem64.md step 6 brings the page.
-                    gex_kernel::BlockOp::FutexLockPi { .. } => Waiting::Sleep(now_ns()),
+                    // A priority-inheritance lock: tried when the thread runs
+                    // again (`finish_parked`), and the syscall made again until
+                    // it is taken (`PI_RETRY`); a short sleep between tries.
+                    gex_kernel::BlockOp::FutexLockPi { .. } => Waiting::Sleep(now_ns() + 100_000),
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         // What the thing being waited on says about itself,
                         // at the moment of parking. A reader on a pipe whose
@@ -6528,7 +6537,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 child_stack,
                 tls,
             } => {
-                if h.kernel.wasm32 {
+                if frames_stay(h) {
                     // A wasm32 process clones at its thread entry (the
                     // context's PC, as the musl fork's __clone leaves it);
                     // the call returns, and `#wasmprogSyscall` hands the
@@ -6614,7 +6623,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     recompile_objects(mapped);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
-    let stop = if stop == 3 && with_host(|h| h.kernel.wasm32) {
+    let stop = if stop == 3 && with_host(|h| frames_stay(h)) {
         wasm32_wait(pc as u64)
     } else if stop == 3 {
         // Ask first, wait second: most parked calls are already ready by now
@@ -6736,6 +6745,14 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         };
         trace_line(&format!("[gex]   t{i} = {}{split}{clk}\n", x0 as i64));
     }
+    // A provider's priority-inheritance lock still held (`PI_RETRY` set the
+    // thread to make the call again): it has no instruction to go back to, so
+    // the call is made again here, outside the host lock.
+    if stop != 0 && IN_PROVIDER.with(|c| c.get()) && resume() == Some(pc as u64) {
+        set_resume_none();
+        set_resume_ctx_none();
+        return gex_syscall(ctx, (pc as u64 | PROVIDER_SYSCALL) as i64);
+    }
     if stop != 0 {
         trap();
     }
@@ -6759,6 +6776,21 @@ const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 // save or restore: `fork` asks the host for a Worker with a copy of the
 // parent's regions, `wait4`/`kill`/`exit` route through the kernel's table, and
 // each process is a Worker the engine schedules.
+
+/// The mark the page's glue puts on a stateful provider's syscalls (as gexrt's
+/// `NATIVE_SYSCALL` on native Wine's, `nt.rs`).
+const PROVIDER_SYSCALL: u64 = 1 << 61;
+
+thread_local! {
+    /// The syscall being served is a stateful provider's (see `gex_syscall`).
+    static IN_PROVIDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the syscall being served cannot leave its wasm frames: a wasm32
+/// program's, or a stateful provider's.
+fn frames_stay(h: &Host) -> bool {
+    h.kernel.wasm32 || IN_PROVIDER.with(|c| c.get())
+}
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
@@ -9518,6 +9550,12 @@ fn schedule() -> i32 {
                 let mut gm = GuestMem::new(guest_bytes());
                 h.kernel.enter_thread(&kstate);
                 let r = finish_parked(&op, timed_out, by_signal, &mut gm);
+                // A priority-inheritance lock still held: the syscall again,
+                // from its instruction (the registers are as the guest made the call).
+                if r == Err(PI_RETRY) {
+                    h.kernel.leave_thread(&mut h.threads[cur()].kstate);
+                    return Some((kstate.ctx_addr, pc - gex_abi::SYSCALL_INST_BYTES));
+                }
                 // A parked call's answer never reaches the syscall ring (the
                 // ring is written when the call is made), so an error here is
                 // otherwise invisible -- and glibc aborts over a bad futex one.
@@ -9594,6 +9632,10 @@ fn schedule() -> i32 {
 ///
 /// A woken futex returns zero and the guest re-checks its own condition, the
 /// same as on Linux, where a wake is never a promise about the word.
+/// `finish_parked`'s answer for a priority-inheritance lock still held: make
+/// the syscall again (never seen by the guest).
+const PI_RETRY: Errno = Errno(0x7fff);
+
 fn finish_parked(
     op: &gex_kernel::BlockOp,
     timed_out: bool,
@@ -9626,7 +9668,30 @@ fn finish_parked(
             Err(Errno::ETIMEDOUT)
         }
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
-        gex_kernel::BlockOp::FutexLockPi { .. } => Err(Errno::ENOSYS),
+        // Take the lock if it is free (the waiters bit stays set, so the
+        // next unlock goes through the kernel); else `PI_RETRY`: the caller
+        // makes the syscall again, which parks once more.
+        gex_kernel::BlockOp::FutexLockPi { uaddr, tid, .. } => {
+            use gex_kernel::futex::pi;
+            loop {
+                let v = gex_atomic::load_u32(gm.bytes, *uaddr).ok_or(Errno::EFAULT)?;
+                match v & pi::TID_MASK {
+                    0 => {
+                        if gex_atomic::cas_u32(gm.bytes, *uaddr, v, *tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
+                            return Ok(0);
+                        }
+                        continue;
+                    }
+                    owner if owner == *tid => return Err(Errno::EDEADLK),
+                    _ => {}
+                }
+                let want = v | pi::WAITERS;
+                if v != want && gex_atomic::cas_u32(gm.bytes, *uaddr, v, want).ok_or(Errno::EFAULT)?.is_err() {
+                    continue;
+                }
+                return Err(PI_RETRY);
+            }
+        }
         // The read the guest asked for happens now, into the buffer it named.
         // Doing it here rather than re-executing the instruction is what keeps
         // the guest's pc moving forward: a syscall that parks is finished by

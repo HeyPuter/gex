@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) mod elfprov;
+pub(crate) mod libprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
 
@@ -866,7 +867,8 @@ fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
 fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
     let len = (size + 0xfff) & !0xfff;
-    crate::with_host(|h| h.kernel.mem.mmap(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
+    // Below 4 GiB in a 64-bit memory too: the page hands these addresses around as 32 bits.
+    crate::with_host(|h| h.kernel.mem.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
 /// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a

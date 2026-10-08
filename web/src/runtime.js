@@ -671,6 +671,8 @@ export async function runProgram(
       mem64: globalThis.GEX_MEM64 ? 1 : undefined,
       // `?fjit=1`: the function JIT in every process.
       fjit: globalThis.GEX_FJIT || undefined,
+      // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
+      wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,

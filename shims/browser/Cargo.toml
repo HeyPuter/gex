@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 gex-abi.workspace = true
 gex-kernel.workspace = true
+gex-atomic.workspace = true
 gex-wayland.workspace = true
 gex-xwm.workspace = true
 gex-xlate = { workspace = true, features = ["fjit"] }

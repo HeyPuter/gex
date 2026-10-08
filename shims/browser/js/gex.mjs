@@ -688,6 +688,8 @@ export class Gex {
   /// writer of `DISPATCH_DIR` reports itself, naming the one that moves it.
   /// See #136.
   static watchDir = -1;
+  /** `soname=path,...` (the page's `?wasmdlls=`): libraries replaced by wasm64 providers. */
+  static wasmDlls = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -999,6 +1001,7 @@ export class Gex {
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
+    this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
@@ -1440,6 +1443,7 @@ export class Gex {
       // its parent's providers made code (cgen/elfprov.rs).
       if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
+      this.#libprovConfig();
     // Narrate one page's directory writes, in every process. See #136.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     }
@@ -2410,6 +2414,18 @@ export class Gex {
   #cgenMode = 0;
   /** No ELF export providers (cgen/elfprov.rs): A/B runs, every process of
    *  the run (a forked child's Worker is told too). Before the shim exists. */
+  /** `?wasmdlls=soname=path,...`: libraries this process replaces with wasm64
+   *  providers (cgen/libprov.rs). */
+  #libprovConfig() {
+    const e = this.#shim.exports;
+    if (!Gex.wasmDlls || !e.gex_libprov_config) return;
+    const b = new TextEncoder().encode(Gex.wasmDlls);
+    const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+    this.#bytes().set(b, p);
+    e.gex_libprov_config(p, b.length);
+    e.gex_free?.(p, Math.max(8, b.length));
+  }
+
   noElfProviders() {
     this.#noElfProviders = true;
     this.#shim?.exports.gex_elfprov_off?.();
@@ -2525,6 +2541,8 @@ export class Gex {
     const wasmdll = prov >= 0 && (e.gex_cgen_pmod_wasm_len?.(prov) >>> 0) > 0;
     // A native wasm32 program (cgen/wasmprog.rs): its bytes come the same way.
     const wasmprog = wasmdll && !!e.gex_cgen_pmod_wasmprog?.(prov);
+    // A replaced Linux library's wasm64 provider (cgen/libprov.rs): the 64-bit provider_* imports.
+    const libprov = wasmdll && !!e.gex_cgen_pmod_libprov?.(prov);
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov),
         new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice())
@@ -2550,7 +2568,7 @@ export class Gex {
         // but a position-independent module imports its pointer all the same.
         // A stateful provider's is this Worker's (one C stack per thread).
         // A wasm32 program sets its own at each thread's entry.
-        __stack_pointer: memBase && !wasmprog ? this.#providerStack() : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
+        __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack()) : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
       },
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
@@ -2569,8 +2587,8 @@ export class Gex {
           code_changed: (addr, len) => e.gex_code_changed?.(addr, len),
           wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(ptr, len) ?? 0,
         } : {}),
-        ...(memBase && !wasmprog ? this.#providerImports() : {}),
-        ...(wasmprog ? this.#wasmprogImports(() => inst) : wasmdll ? { syscall: this.#nativeSyscall } : {}),
+        ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
+        ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     });
     if (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
@@ -2610,6 +2628,71 @@ export class Gex {
       this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
     }
     return this.#provStack;
+  }
+
+  /** This Worker's stack for a wasm64 provider (i64 `__stack_pointer`), and its lowest address. */
+  #provStack64 = null;
+  #provStackLo = 0n;
+  #providerStack64() {
+    if (!this.#provStack64) {
+      const size = 1 << 20;
+      const e = this.#shim.exports;
+      const base = e.gex_provider_stack(size) >>> 0;
+      if (!base) throw new Error('gex: no memory for a provider stack');
+      this.#provStackLo = BigInt(base);
+      this.#provStack64 = new WebAssembly.Global({ value: 'i64', mutable: true }, BigInt(base + size - 16));
+    }
+    return this.#provStack64;
+  }
+
+  /** This Worker's exception tag for a wasm64 provider's `provider_throw`: a wasm
+   *  exception, so code the provider publishes at run time (its JIT, which imports it)
+   *  can catch it with `try_table`, and `provider_try` takes it when nothing did. */
+  #provTag = null;
+  #providerTag() {
+    this.#provTag ??= new WebAssembly.Tag({ parameters: ['i32'] });
+    return this.#provTag;
+  }
+
+  /** What a replaced Linux library's wasm64 provider imports from `gex` (the native
+   *  `libprov::register64`; docs/unity-dotnet.md P5 B1). Pointers and table indices
+   *  are i64 (BigInt). */
+  #providerImports64() {
+    const e = this.#shim.exports;
+    const ftab = this.#cgen.ftab;
+    const tag = this.#providerTag();
+    return {
+      provider_try: (f, arg) => {
+        try {
+          ftab.get(f)(arg);
+          return 0;
+        } catch (err) {
+          if (err instanceof WebAssembly.Exception && err.is(tag)) return err.getArg(tag, 0);
+          throw err;
+        }
+      },
+      provider_throw: (code) => {
+        throw new WebAssembly.Exception(tag, [code]);
+      },
+      provider_missing: (addr) => e.gex_libprov_missing(addr),
+      provider_thread_entry: () => e.gex_libprov_thread_entry(),
+      provider_code_page: () => e.gex_libprov_thread_entry(),
+      provider_stack: () => this.#provStackLo,
+      provider_guest_sym: (ptr, len) => e.gex_libprov_guest_sym(ptr, len),
+      provider_guest_stack_end: (sp) => e.gex_libprov_guest_stack_end(sp),
+      provider_abi: (which) => e.gex_libprov_abi(which),
+      provider_table_size: (base) => e.gex_libprov_table_size(base),
+      // Stopping the guest's threads around the runtime's collection: not yet in the page
+      // (each guest thread is a Worker; the stop needs the shim's safepoints).
+      provider_thread_register: () => {},
+      provider_park: () => {},
+      provider_stop_guest: () => {},
+      provider_start_guest: () => {},
+      // The runtime's wasm JIT: not yet in the page (B2); it runs interpreted.
+      provider_jit_reserve: () => 0n,
+      provider_jit_instantiate: () => -1,
+      provider_jit_table: () => 0n,
+    };
   }
 
   /** What a stateful provider imports from `gex` (the native `libprov`). */
@@ -2668,6 +2751,13 @@ export class Gex {
     const e = this.#shim.exports;
     const n = e.gex_cgen_provider_count?.(u) >>> 0;
     for (let i = 0; i < n; i++) {
+      // A replaced Linux library (cgen/libprov.rs): its wasm64 provider, installed as a module.
+      if (e.gex_cgen_provider_libprov?.(u, i)) {
+        const number = e.gex_libprov_publish(u, i);
+        this.#cgenCatchUp();
+        if (number >= 0) e.gex_cgen_pmod_installed(number);
+        continue;
+      }
       if (e.gex_cgen_provider_wasmdll?.(u, i)) {
         const number = e.gex_wasmdll_publish(u, i);
         this.#cgenCatchUp();
@@ -2846,6 +2936,18 @@ export class Gex {
    *  install, a thread to start -- is served here and returns, so the native
    *  frames below it survive, as natively. Anything else (the process or
    *  thread ending, a callback's return) goes on up. */
+  /** A wasm64 provider's `gex.syscall(ctx, pc)` (cgen/libprov.rs): marked, so the shim
+   *  serves it without leaving the provider's frames (a blocking call waits in place, a
+   *  thread is staged); the host then starts what it staged, and the call returns. */
+  #providerSyscall = (ctx, pc) => {
+    const e = this.#shim.exports;
+    e.gex_syscall(ctx, BigInt.asIntN(64, BigInt(pc) | (1n << 61n)));
+    if (e.gex_wasmprog_staged()) {
+      this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+      this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+    }
+  };
+
   #nativeSyscall = (ctx, pc) => {
     const e = this.#shim.exports;
     const p = BigInt.asUintN(64, BigInt(pc));

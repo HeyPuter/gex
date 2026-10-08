@@ -8,7 +8,7 @@
 //   node tests/games/browser-linux.mjs --name NAME --dir GAME_DIR --exe REL
 //        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST]
 //        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
-//        [--gameplay N] [--mem64] [--fjit] [--env K=V,K=V] [--end-on-exit]
+//        [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--env K=V,K=V] [--end-on-exit]
 //
 // --files lists host files the game opens, one per line (collected from a
 // native `gexc run --strace`; tests/games/retrocycles-linux-files.txt).
@@ -128,6 +128,7 @@ async function main() {
   const { evaluate, state, shot, consoleLines } = await openPage(
     `tar=/gex/nt/${basename(tar)}&exe=/game/${exe}&cwd=/game/${cwd}&gl=1&glbackend=wgpu&hostx=1`
       + (argv.includes('--mem64') ? '&mem64=1' : '') + (argv.includes('--fjit') ? '&fjit=1' : '')
+      + (opt('--wasmdlls', null) ? `&wasmdlls=${encodeURIComponent(opt('--wasmdlls'))}` : '')
       + `&size=${width}x${height}&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(opt('--args', ''))}`,
     { width: width + 20, height: height + 100, shotDir },
   );
