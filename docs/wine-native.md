@@ -1255,17 +1255,39 @@ patched instead. Scope, as found:
   5 runs of 5. The launcher calls GetDesktopWindow first, as a GUI
   launcher has a desktop: the desktop thread then lives in the process
   hosting the server.
-- **Known limit: a desktop hosted in a child** (a console launcher whose
-  first GUI is its child) is not reliable: about one run in three, a
-  thread of the child's desktop process (the display settings restorer)
-  holds the USER lock into a message callback (`user_check_not_lock`
-  asserts) and the child's first window hangs. Not yet understood.
+- **Fixed: a desktop hosted in a child** (a console launcher whose first
+  GUI is its child; it hung about one run in three: `user_check_not_lock`
+  asserting in the display settings restorer, a thread id of 0, a request
+  written to fd 0, a thread dying with the loader lock). gex numbered a
+  forked child's threads with its parent's counter while the child's main
+  thread takes tid = pid, so the child's Nth thread had the main thread's
+  tid: pthread mutexes record their owner by tid, and two threads held
+  win32u's USER lock and ntdll's locks at once. A child now numbers its
+  threads above its pid, as the browser runtime already did
+  (`tests/wasm32/forktid.c`). tests/nt **childcon** (the same child under
+  a console launcher) passes 10 runs of 10.
+- **Fixed, found by the install as children** (all gex, no fork patch):
+  - a child process whose memory landed where an exited one's had been
+    skipped the data relocations of Wine's PE module (recorded host-wide by
+    the memory's address, and W3 processes have no NT pid): ntdll's lists
+    held small offsets and function tables wrong indices. Recorded per
+    address space now; tests/nt **childloop** (eight children one after
+    another) failed at the ninth process, passes;
+  - every mapping of a native skeleton wrote that DLL's variables again: a
+    second mapping of ntdll as an image section (wineboot's install does
+    one) reset ntdll's Unix-call handle to gex-kernel's, and its next Unix
+    call trapped. Written at a DLL's first mapping only; tests/nt
+    **imageview**;
+  - an exec'd process that trapped kept its descriptors open, so the server
+    never saw it go and its parent waited for ever; tests/nt **childtrap**.
 - wineboot's full install with its steps as children
   (`$W/w3tests/install-as-children.sh`: the launcher runs `wineboot.exe
   -u`, which runs rundll32 for PreInstall and DefaultInstall) **completes
   the install**: the registry has the crypto providers (16 keys), and
   tests/nt `crypt` passes on that prefix (6 of 6), and **wineboot itself
-  now finishes in a child** ("Operation done").
+  finishes in a child**: the test now uses a console launcher (wineboot,
+  the child, hosts the desktop) and passes on wineboot's exit code 0 and
+  the registry.
 - **Fixed: gex's function-lookup loop** (crates/gex-kernel ftab.rs; it
   cost wherever an image view or stale lookup retired an address).
   wineboot stalled in wininet (wininet+0x1d594) with 3.5 million (later
