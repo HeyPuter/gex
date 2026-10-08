@@ -1801,3 +1801,25 @@ Not yet:
          applies the browser's flat-layout cuts natively, to test that.
      - HK's UnityPlayer maps at 0x11752000 in the page. A unit for that
        base is building on gooner (`scratch/unity/units/build-hk-page.log`).
+     - **Bisecting the HK fjit black screen** (`?fjitlibs=+name,-name`,
+       731faf46; `scratch/unity/page/hk-bis.sh NAME LIBS` gives the last
+       readback's mean brightness: the menu ~37-40, the failure 0):
+
+       | run | fjitlibs | result |
+       |---|---|---|
+       | hb1 | -UnityPlayer.so | black |
+       | hb2 | -UnityPlayer.so,-libc.so.6 | black |
+       | hb3 | +none.so (JIT on, no object) | menu |
+       | hb4 | +libxcb.so.1,+libX11.so.6 | pending |
+
+       So JIT-compiled code is involved, and it is outside UnityPlayer and
+       libc. hp1's crash (libxcb's input queue length -8, then a memcpy of
+       -8 bytes) points at the X libraries. Native HK with the browser's
+       layouts (`GEX_CGEN_EXP=WASMFLAT`, hk-wf1) is fine. Remaining
+       browser-only differences: V8 versus Cranelift compiling the same
+       wasm, and Workers.
+     - The page keeps the guest's output (`shots/NAME/out.txt`), and
+       hk-page.sh passes `-logFile -`, so HK's player log is in it.
+     - The HK UnityPlayer unit for 0x11752000 is built and staged on
+       edger: 55,439 functions, 165 MiB wasm, key 81cfd177. hp6 is queued
+       to run with it.
