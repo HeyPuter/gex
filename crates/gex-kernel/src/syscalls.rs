@@ -5127,6 +5127,11 @@ impl Kernel {
                 Some((name.clone(), offset)),
             )?;
             if let Some((path, base)) = pinned {
+                // Said as it happens: the end-of-run report is lost when the
+                // process is killed (a game run ends at its timeout).
+                if base != start {
+                    eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+                }
                 self.pin_landed.push((path, base, start));
             }
             let mut tmp = vec![0u8; len as usize];
@@ -5191,6 +5196,11 @@ impl Kernel {
             self.mem.mmap(addr, len, prot_bits, flags, "")?
         };
         if let Some((path, base)) = pinned {
+            // Said as it happens: the end-of-run report is lost when the
+            // process is killed (a game run ends at its timeout).
+            if base != start {
+                eprintln!("[pin] {path} WANTED {base:#x} GOT {start:#x}");
+            }
             self.pin_landed.push((path, base, start));
         }
         // Anonymous memory is defined to read as zero. Pages that already
