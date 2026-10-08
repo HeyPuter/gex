@@ -1775,3 +1775,29 @@ Not yet:
        verbose log (mp22).
      - The guest GL from master (4f042637) segfaults Muck natively under
        edger's older gexc (GL's report). To check against the gate's legs.
+  34. **Hollow Knight in the page (2026-10-08, edger):**
+     - **Staging:**
+       - `scratch/unity/page/hk-stage.py RUN OUT` builds `hk/game`: the
+         launcher, steam_appid.txt and links to the 115 game files a native
+         `--strace` run (hk-st) opened, 519 MiB in place of the whole
+         4.9 GB install. It also writes `hk/files.txt` (125 host files).
+       - `hk-page.sh NAME MINUTES` runs it, with `--home` set to
+         tests/games/seeds/hollow-knight. It reuses muck-bcl and
+         mono.wasm.
+     - **hp2 and hp3 crashed** at ~103 s (with the .NET JIT and with the
+       interpreter alike). A thread ran libmonobdwgc's own x86
+       `mono_unity_liveness_finalize`: the miss path re-bridged only ELF
+       export providers' addresses, not a replaced library's. Fixed in
+       be33e8a4.
+     - **hp4 (no fjit, .NET JIT, gl64q2):**
+       - First frame at 108 s; 100 presents at 185 s.
+       - The menu at 15.2-15.6 presents/s. The readback (`shots/hp4/c019.png`)
+         is HK's real main menu.
+       - Native hk-j3 was 28.8.
+     - **hp5 (`--fjit`):** 59-60 presents/s from 300 s, but every readback
+       after 60 s is black. hp1 (`--fjit` with elfunits) trapped earlier in
+       a glibc_mem memcpy of -8 bytes from libxcb.
+       - Suspect: the browser's function JIT. `GEX_CGEN_EXP=WASMFLAT`
+         applies the browser's flat-layout cuts natively, to test that.
+     - HK's UnityPlayer maps at 0x11752000 in the page. A unit for that
+       base is building on gooner (`scratch/unity/units/build-hk-page.log`).

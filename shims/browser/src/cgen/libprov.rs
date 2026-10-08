@@ -76,6 +76,23 @@ pub(crate) fn replaced(addr: u64) -> bool {
     lock(&REPLACED).iter().any(|&(lo, hi)| addr >= lo && addr < hi)
 }
 
+/// Whether `addr` is one a replaced library's provider is bound at (its
+/// pairs are sorted by address).
+pub(crate) fn bound(addr: u64) -> bool {
+    lock(&LIBS).iter().any(|l| l.pairs.binary_search_by_key(&addr, |&(a, _)| a).is_ok())
+}
+
+/// A dispatch miss in a replaced library's own text that no binding
+/// explains: its x86 code was never meant to run (said once per address).
+pub(crate) fn note_stray(pc: u64) {
+    static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let mut seen = lock(&SEEN);
+    if seen.len() < 64 && !seen.contains(&pc) {
+        seen.push(pc);
+        crate::warn_line(&format!("gex: the guest reached {pc:#x}, the replaced library's own code (not a bound export): tier-1 runs it\n"));
+    }
+}
+
 /// Guest pages below 4 GiB: a provider's data and code page (its data base
 /// and the guest addresses it binds are 32-bit numbers to the page).
 fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {

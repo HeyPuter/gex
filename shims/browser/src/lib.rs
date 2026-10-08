@@ -10878,13 +10878,17 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
-    // An address an ELF export provider holds whose slot lost its bridge.
+    // An address an ELF export provider (or a replaced library's provider)
+    // holds whose slot lost its bridge.
     if cgen::elfprov::rebridge(pc) {
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         });
         trap();
+    }
+    if cgen::libprov::replaced(pc) {
+        cgen::libprov::note_stray(pc);
     }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {

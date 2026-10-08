@@ -51,7 +51,7 @@ pub extern "C" fn gex_elfprov_off() {
 
 /// Whether an ELF provider holds `addr` (the function JIT leaves it alone).
 pub(crate) fn provided(addr: u64) -> bool {
-    lock(&BOUND).iter().any(|b| b.addrs.contains(&addr))
+    lock(&BOUND).iter().any(|b| b.addrs.contains(&addr)) || super::libprov::bound(addr)
 }
 
 /// A new process (a forked child): start over from what its kernel has
