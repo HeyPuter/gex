@@ -1577,3 +1577,36 @@ Not yet:
      - **B5, Hollow Knight in the page:** its 4.9 GB of data served lazily.
      Shared shim code (gex.mjs, cgen.rs, the kernel) goes to the coordinator
      as gate heads early, step by step.
+  28. **P5 progress (2026-10-07):**
+     - **B0 done (d442cc57, 1e4ae9d7):** `?mem64=1` in the page (wasm64 shim,
+       seed and kernel; the host X server keeps the wasm32 kernel build);
+       `MAP_32BIT` in the kernel and the guest GL ring mapped with it (the
+       page's `gl_submit` takes 32-bit addresses); the function JIT in a
+       64-bit process (table64, i64 PIC globals; no std::time on wasm64);
+       `?fjit=1`. `tests/games/src/glx-context` passes in Chromium with
+       `?mem64=1&fjit=1`.
+     - **B1 done (182e7cfb, 171b7772):** stateful Linux providers in the page
+       (`shims/browser/src/cgen/libprov.rs`, `?wasmdlls=soname=path`): the
+       replaced library's exports bound to the module, installed as Wine's
+       PE module is; the wasm64 `provider_*` imports in gex.mjs (try/throw on
+       a per-Worker `WebAssembly.Tag`); its syscalls marked (bit 61) and
+       served like a wasm32 program's (threads staged, waits in place);
+       FUTEX_LOCK_PI in the page (retried outside the host lock); the
+       provider's stop-the-world (GuestStop) at safepoints and syscall
+       returns. `tests/unity-dotnet/embed` passes in Chromium.
+     - **B2 done (6fb2dcc4):** Mono's wasm JIT in the page (table range with
+       the placeholder, per-Worker instantiation, slot signatures parsed from
+       the provider module since JS has no type reflection). embed with the
+       JIT at threshold 1 passes under node (`run-node.mjs`, wasm64 shim) and
+       in Chromium.
+     - **How to run:** `scratch/unity/page/embed.sh NAME` (Chromium, gooner
+       is fine: not a game) and `scratch/unity/page/node-embed.sh LOG
+       [--env ...]` (node, faster, full wasm stacks with GEX_TRAP_STACK). Own
+       harness state and ports: `TMPDIR=scratch/unity/page/tmp
+       GEX_NT_CHROME_PORT=9531 GEX_NT_VITE_PORT=5391` (the default state dir
+       and ports are shared with other streams). Page assets copied into the
+       worktree's untracked `web/public/gex`: `xwayland/` (from wt/games2),
+       `gex-wgpu-replay.*` (from a gate tree); `web/node_modules` from `npm
+       install`. Guest GL: `scratch/unity/gl64-new` (with the MAP_32BIT ring).
+     - **Next: B3, Muck in the page on edger** (its opened-files list from a
+       native `--strace` run on edger, `scratch/unity/eruns/mk-st/files.txt`).
