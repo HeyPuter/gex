@@ -7197,12 +7197,13 @@ thread_local! {
 #[track_caller]
 fn set_resume(v: u64) {
     RESUME.with(|c| c.set(Some(v)));
+    let line = std::panic::Location::caller().line();
     RESUME_RING.with(|r| {
         let mut r = r.borrow_mut();
         if r.len() == 16 {
             r.remove(0);
         }
-        r.push((std::panic::Location::caller().line(), v));
+        r.push((line, v));
     });
     // GEX_NT_RESUME_LOG: each (call site, pc) a resume was set from, once:
     // where the guest leaves wasm and comes back (an AOT-only run needs a

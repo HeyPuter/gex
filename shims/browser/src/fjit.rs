@@ -279,13 +279,15 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
             continue;
         }
         // `callout=0|2`, `inplace=0`, `callouttrap=1`: the A/B switches of
-        // the call-out and the in-place redispatch (bisection aids).
+        // the call-out and the in-place redispatch (bisection aids);
+        // `provcheck=1`: check each provider guest call ends at its return.
         if let Some((k, v)) = w.split_once('=') {
             let v: i32 = v.parse().unwrap_or(1);
             match k {
                 "callout" => crate::cgen::gex_set_callout(v),
                 "inplace" => crate::gex_set_in_place(v),
                 "callouttrap" => crate::cgen::TRAP_CALLOUTS.store(v != 0, Ordering::Relaxed),
+                "provcheck" => crate::cgen::libprov::PROV_CHECK.store(v != 0, Ordering::Relaxed),
                 _ => crate::warn_line(&format!("gex: ?fjitlibs: no switch {k}\n")),
             }
             continue;
