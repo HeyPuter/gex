@@ -6,7 +6,7 @@
 // native run uses, tests/games/*.wl), timed from the page's Nth GL present.
 //
 //   node tests/games/browser-linux.mjs --name NAME --dir GAME_DIR --exe REL
-//        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST]
+//        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST] [--home DIR]
 //        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
 //        [--profile AT,SECS[,MATCH]] [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--query K=V&...] [--env K=V,K=V] [--end-on-exit]
 //
@@ -26,7 +26,7 @@
 // Prints `ok` lines (first frame, the input script's start, gameplay) and the
 // frame rate over the last minute, with a screenshot every 30 s.
 
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { deflateSync, crc32 } from 'node:zlib';
 
@@ -91,6 +91,9 @@ function bundle() {
   rmSync(stage, { recursive: true, force: true });
   mkdirSync(join(stage, 'gex/libs'), { recursive: true });
   mkdirSync(join(stage, 'home/g'), { recursive: true });
+  // --home DIR: its entries in the guest's $HOME (saved settings, so a game skips first-run screens).
+  const home = opt('--home', null);
+  if (home) for (const e of readdirSync(home)) symlinkSync(join(home, e), join(stage, 'home/g', e));
   mkdirSync(join(stage, 'tmp'), { recursive: true });
   symlinkSync(gameDir, join(stage, 'game'));
   symlinkSync(GL, join(stage, 'gex/gl'));
