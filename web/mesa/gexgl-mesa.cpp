@@ -1620,6 +1620,60 @@ void gexgen_missing(const char* name) {
 
 #include "gl-compat-generated-decoders.inc"
 
+/* A desktop shader whose #version is above what this context compiles.
+ *
+ * st/mesa caps the GLSL version at the GL version the driver earns (4.00
+ * on gex_wgpu today), while applications ask for what their content was
+ * written for: Unity's HLSLcc emits "#version 410" for a geometry stage
+ * (Muck's grass) and up to "#version 460" where the host offers it. Refused,
+ * the program fails to link and the draw goes ahead with whatever program
+ * was bound -- a field of grass becomes its input points. Most of what
+ * 4.10-4.60 add to the language is also available as extensions this
+ * context has, so the source is compiled as the highest version it accepts
+ * with those enabled; anything it really uses that is missing still fails
+ * to compile, by name. GEXGL_NO_VERSION_FIT=1 keeps the source as sent. */
+std::string fit_glsl_version(std::string src) {
+    static int off = -1;
+    if (off < 0) off = getenv("GEXGL_NO_VERSION_FIT") ? 1 : 0;
+    if (off) return src;
+    size_t at = src.find_first_not_of(" \t\r\n");
+    if (at == std::string::npos || src.compare(at, 8, "#version") != 0) return src;
+    const size_t eol = src.find('\n', at);
+    const std::string line = src.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+    unsigned want = 0;
+    char profile[32] = "";
+    if (std::sscanf(line.c_str(), "#version %u %31s", &want, profile) < 1) return src;
+    if (std::strcmp(profile, "es") == 0 || want <= 400 || want > 460) return src;
+    const char* lang = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
+    unsigned major = 0, minor = 0;
+    if (!lang || std::sscanf(lang, "%u.%u", &major, &minor) != 2) return src;
+    const unsigned have = major * 100 + minor;
+    if (have >= want || have < 400) return src;
+    std::string head = "#version " + std::to_string(have);
+    if (profile[0]) head += std::string(" ") + profile;
+    head += "\n";
+    static const char* const extensions[] = {
+        "GL_ARB_separate_shader_objects", "GL_ARB_shading_language_420pack",
+        "GL_ARB_explicit_attrib_location", "GL_ARB_explicit_uniform_location",
+        "GL_ARB_gpu_shader5", "GL_ARB_texture_query_levels",
+        "GL_ARB_shader_image_load_store", "GL_ARB_arrays_of_arrays",
+        "GL_ARB_enhanced_layouts", "GL_ARB_shader_storage_buffer_object",
+        "GL_ARB_shader_bit_encoding", "GL_ARB_shading_language_packing",
+        "GL_ARB_texture_cube_map_array", "GL_ARB_texture_gather",
+        "GL_ARB_derivative_control", "GL_ARB_shader_texture_image_samples",
+        "GL_ARB_cull_distance", "GL_ARB_conservative_depth",
+        "GL_ARB_fragment_layer_viewport", "GL_ARB_viewport_array",
+    };
+    for (const char* e : extensions) head += std::string("#extension ") + e + " : enable\n";
+    /* The original line stays as a comment, so line numbers shift by the
+     * extension count and an error still shows what was asked for. */
+    head += "// " + line + "\n";
+    static unsigned said;
+    if (said++ < 4)
+        fprintf(stderr, "gexgl: \"%s\" compiled as GLSL %u with extensions\n", line.c_str(), have);
+    return src.substr(0, at) + head + (eol == std::string::npos ? std::string() : src.substr(eol + 1));
+}
+
 bool one(uint32_t op, Reader& a) {
     switch (op) {
     case CONTEXT_CREATE: {
@@ -1953,7 +2007,7 @@ bool one(uint32_t op, Reader& a) {
     }
     case CREATE_SHADER: { uint32_t g = a.u32(); shaders[g] = glCreateShader(a.u32()); break; }
     case SHADER_SOURCE: {
-        GLuint s = lookup(shaders, a.u32()); std::string src = a.string(); const char* p = src.c_str();
+        GLuint s = lookup(shaders, a.u32()); std::string src = fit_glsl_version(a.string()); const char* p = src.c_str();
         shader_source_heads[s] = src.substr(0, 512);
         glShaderSource(s, 1, &p, nullptr); break;
     }
