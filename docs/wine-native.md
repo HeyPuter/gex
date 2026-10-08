@@ -1880,7 +1880,7 @@ Heads:
   native and in the browser, x86-programs 82, nt --no-cgen 83/83 on x86 and
   pfx-gui, cgen-prefix 83/83, wasm32 4/4 + busybox both, browser nt 49/49,
   W3 i386 32 of 40 (null driver; 33 of 41 with childgui) and 34 of 40
-  (Wayland + GL); wineboot's install as children leaves the full registry. **merge/w3-boot** (wt/w3-boot, on master 4f042637): the function-lookup fix (gex-kernel ftab.rs), with which wineboot -u finishes as a child. The old merge/elf-prov-gate is deleted. To
+  (Wayland + GL); wineboot's install as children leaves the full registry. **merge/w3-boot** (wt/w3-boot, master 8c2c9a7d merged): the function-lookup fix (gex-kernel ftab.rs); child thread ids above the pid (the desktop-in-a-child hang); data relocations per address space; a DLL's variables at its first mapping only; an exec'd process that traps closes its descriptors. Checks (`$W/w3chk3.out`, on 6ec27387): crates green, elf-prov 5/5 native and in the browser, x86-programs 82, nt --no-cgen 85/85 on x86 and pfx-gui, cgen-prefix 85/85, wasm32 + forktid + busybox both, browser nt 49/49, W3 i386 37 of 50 (null driver, with children: childgui, childcon, childloop, childtrap, imageview pass) and 35 of 46 (Wayland + GL; the same known failures), install as children passes on wineboot's exit 0 (16 crypto keys). The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
