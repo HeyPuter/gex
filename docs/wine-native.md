@@ -1264,43 +1264,48 @@ patched instead. Scope, as found:
   (`$W/w3tests/install-as-children.sh`: the launcher runs `wineboot.exe
   -u`, which runs rundll32 for PreInstall and DefaultInstall) **completes
   the install**: the registry has the crypto providers (16 keys), and
-  tests/nt `crypt` passes on that prefix (6 of 6). wineboot itself then
-  does not finish in a child: after the install it calls into wininet
-  (`initialize_internet`), and wininet's code (wininet+0x1d594) calls
-  TlsGetValue millions of times, each through gex's function-table lookup
-  (the probe cache never holds it: 3.5 million lookups of one address,
-  `GEX_FTAB_TRACE=1`). InternetOpenW alone in a child works, so it is
-  that state of wineboot's process; not yet found. The test is judged by
-  the registry, not wineboot's exit. As the first process wineboot
-  finishes.
+  tests/nt `crypt` passes on that prefix (6 of 6), and **wineboot itself
+  now finishes in a child** ("Operation done").
+- **Fixed: gex's function-lookup loop** (crates/gex-kernel ftab.rs; it
+  cost wherever an image view or stale lookup retired an address).
+  wineboot stalled in wininet (wininet+0x1d594) with 3.5 million (later
+  268 million) lookups of TlsGetValue at one address. The WinePe module is
+  installed once and bound per image, so several addresses map to one
+  table index; retiring any one of them logged Retire for the index while
+  the map still answered it for the others. Each thread's table reset the
+  slot to the resolve stub, gex.lookup returned the same index, and the
+  stub ran again for ever. FuncMap now counts the addresses per index and
+  retires the index only with the last one (test
+  `a_shared_index_stays_while_another_address_maps_to_it`). With the fix,
+  TlsGetValue is looked up 3 times in the whole install
+  (`GEX_FTAB_RECHECK=1` prints each relookup).
 - **Fixed: wineboot's garbage wine.inf mtime** (5242148, so every first
   process reinstalled the prefix): pelink bound wineboot's `_wopen` to
   ucrtbase and its `_fstat32` to msvcrt, two descriptor tables; a module's
   calls now go to its own C runtime first. `.update-timestamp` now holds
   wine.inf's real mtime.
 - The registry-fixture idea is dropped.
-- Cost, on edger through bench.sh (native gexc; a Windows server call,
-  GetExitCodeThread, is 74.5 us there): in a child, IsWindow 97.8 us (0.30
-  us in the process hosting the server), GetAsyncKeyState 572 us (0.76 us:
-  it refreshes the queue and the desktop object, ~1 KiB each), a frame
-  polling all 256 keys 157 ms (0.19 ms). The transport alone, as a
-  pipe-and-epoll round trip like a server request's: 24.7 us between
-  threads natively and 45.7 us in the browser runtime (Node,
-  `run-node.mjs`: the page's shim and glue, Workers as worker_threads);
-  between processes 13.5 us natively, 27.8 us in the browser runtime.
-  (`$W/rtt/bench-rtt.sh`, `$W/rtt/bench3.txt`.) Not yet measured in a
-  Chromium page: W3 does not run in the page yet, and no page harness
-  runs a wasm32 program by itself.
-- Who would feel it: only a **child** process. A game started directly is
-  the process hosting the server and reads directly. A game started by a
-  launcher (launcher.exe → game.exe, `start /wait`) would be a child: per
-  frame, GetAsyncKeyState over many keys (Unity's and SDL's input polling,
-  GameMaker's keyboard_check over the key range) costs ~0.6 ms a key, so a
-  full 256-key poll is unplayable (157 ms) and a few keys a frame is
-  ~2-5 ms; IsWindow/GetWindowLong on hot paths ~0.1 ms each. Next steps
-  if a launcher-started game needs it: refresh only the bytes a read uses
-  (the key byte, not the object), and cache the desktop key state per
-  keystate_serial.
+- Cost, on edger through bench.sh (native gexc, `$W/rtt/bench4.txt`; a
+  Windows server call, GetExitCodeThread, is 29.53 us there). A child
+  refreshes only the bytes a read uses, and keeps its last 16 reads per
+  thread: a read is skipped while it is covered, younger than 1 ms and no
+  request other than read_session_data has gone to the server since
+  (`__wine_session_writes`, ntdll). In a child: IsWindow 1.02 us (0.28 us
+  in the process hosting the server; before the cache 97.8 us),
+  GetAsyncKeyState 5.13 us (0.79 us; was 572 us), a frame polling all 256
+  keys 1334.0 us (201.6 us; was 157 ms). GetForegroundWindow 28.16 us in a
+  child and 55.30 us in the host (a server request either way).
+  A child also keeps its own USD clocks (a private page and a 1 ms clock
+  thread): its copy of the USD had stopped clocks, and every message call
+  then sent set_queue_mask. The transport alone, as a pipe-and-epoll round
+  trip like a server request's: 20.46 us between threads natively and
+  40.30 us in the browser runtime (Node, `run-node.mjs`); between processes
+  14.09 us natively, 26.65 us in the browser runtime (`$W/rtt/bench-rtt.sh`).
+  Not yet measured in a Chromium page: W3 does not run in the page yet.
+- Who would feel it: only a **child** process (a game started by a
+  launcher). A game started directly is the process hosting the server
+  and reads directly. A full 256-key poll in a child is 1.3 ms a frame,
+  6.6 times slower than in the host (201.6 us) but playable.
 
 #### Fork-patch inventory (W3, branch `wasm32-w3` over `wasm32`)
 
@@ -1330,6 +1335,8 @@ what would let it go:
 | **a child process reads the session through requests** (`read_session_data`, server/mapping.c; win32u keeps a local copy laid out as the mapping, refreshed per seqlock acquire and per user handle entry; the handle-table walk skips entries the process has no object for) | a child has its own wasm memory and cannot map the session the server thread writes (user 2026-10-07: gex-eject never ships cross-process shared memory) | never under that decision; the process hosting the server keeps its direct read |
 | `wineserver_session_data` answers only in the process the session was created in | a child process starts as a copy of the first, server state included: it read a frozen snapshot | with the request path (never, under the no-shared-memory decision) |
 | one desktop thread per session (a named mutant held by its host process); the wait for its shell window is 60 s | with children reading the session, each process started a desktop thread of its own | explorer as its own process (needs cross-process shared memory) |
+| a child keeps its last 16 session reads per thread and skips a read covered, younger than 1 ms, with no other server request since (`__wine_session_writes`, ntdll server.c) | a request per read cost 0.1-0.6 ms a call | with the request path (never, under the no-shared-memory decision) |
+| a child process's USD is a private page kept by a 1 ms clock thread (ntdll virtual.c) | a child's copy of the USD had stopped clocks, and win32u then sent set_queue_mask every call | coherent shared memory (never, under that decision) |
 | ntdll's Unix-call dispatcher returns STATUS_DLL_NOT_FOUND for a null library handle | a DLL whose Unix library is not linked into the closed-world program still makes calls (wineps.drv's DllMain failure path) and trapped | every such Unix library linked in |
 | winebuild (wasm32 export list): a renamed `-import` export is a forward | pelink resolves a call by the export list (user32's ClipCursor is win32u's NtUserClipCursor) | never (tool side of the port) |
 | win32u `kbd_tables_wchar_to_vkey` skips an SGCAPS pair's Caps Lock row | VkKeyScan swapped Shift for letters under winewayland (every letter an SGCAPS pair) | the fix upstream (it is not wasm32-specific): **not being upstreamed (user 2026-10-07)**: kept as a fork patch; the ungated patch stays in `docs/wine-upstream/0001-win32u-VkKeyScan-skip-SGCAPS-caps-row.patch` for reference |
@@ -1842,7 +1849,7 @@ Heads:
   tests/nt i386 **32 of 40** (`$W/w3-nt8.log`; user_win and gdi pass; left:
   lownull x2 (§5.0), filemap and display (shared views), crypt, pipe,
   glcompat/glfast (W3.4)). FreeType 2.13.3 linked in (`$W/ft`); winewayland.drv draws on gex's
-  compositor (`$W/pfx-w3wl`). Output modes (Wine's EmulateModeset) and VkKeyScan done; W3.4 GL: opengl32 on gex-gl through winewayland, glcompat and glfast pass (34 of 40 on `$W/pfx-w3wl`). Wine fork head 74de38ed1ba (mw).
+  compositor (`$W/pfx-w3wl`). Output modes (Wine's EmulateModeset) and VkKeyScan done; W3.4 GL: opengl32 on gex-gl through winewayland, glcompat and glfast pass (34 of 40 on `$W/pfx-w3wl`). Wine fork head a39bcafaedd (mw; the child-session patches, the read cache and the child's USD clocks).
   **gate2 landed** (master 36f55bb6), and w3-gate1 (wp_viewporter, master
   1b4bd047, merged into merge/w3). **merge/w3 gate head** sent after
   `$W/check-w3-gate.sh` (output `$W/w3chk.out`; the child-session head on
@@ -1851,7 +1858,7 @@ Heads:
   native and in the browser, x86-programs 82, nt --no-cgen 83/83 on x86 and
   pfx-gui, cgen-prefix 83/83, wasm32 4/4 + busybox both, browser nt 49/49,
   W3 i386 32 of 40 (null driver; 33 of 41 with childgui) and 34 of 40
-  (Wayland + GL); wineboot's install as children leaves the full registry. The old merge/elf-prov-gate is deleted. To
+  (Wayland + GL); wineboot's install as children leaves the full registry. **merge/w3-boot** (wt/w3-boot, on master 4f042637): the function-lookup fix (gex-kernel ftab.rs), with which wineboot -u finishes as a child. The old merge/elf-prov-gate is deleted. To
   rebuild after new dev commits: same path split (`git checkout <dev
   head> -- <paths>` per commit), rerun the checks, merge master once
   integ-g lands, send the head.
