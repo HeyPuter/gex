@@ -1838,8 +1838,20 @@ Not yet:
        use, so its 16 MiB chunk moved every later mapping in hp1. hp6 is a
        no-unit run: first frame 108 s, 100 presents 183 s, menu 15.7-16.0
        presents/s (hp4: 108 s, 185 s, 15.2-15.6). 841b380b adds
-       `?pins=path@base+span` (the closure pins, `gex_pin_object`); hp7
-       pins `UnityPlayer.so@11752000+2674000`.
+       `?pins=path@base+span` (the closure pins, `gex_pin_object`).
+     - **hp7 (no fjit, the UnityPlayer unit pinned at 0x11752000,
+       `?cgen=1&elfunits=UnityPlayer.so&pins=UnityPlayer.so@11752000+2674000`):**
+       first frame 55 s (hp6 108 s), 100 presents at 100 s (hp6 183 s),
+       the menu at 24.5-27.6 presents/s from ~180 s (hp6 15.7-16.0), lit
+       from ~150 s; readback `shots/hp7/c017.png` is the real menu. Native
+       gexc on edger (integ/2026-10-08d gate leg): 30.59 presents/s, menu
+       ready at 406.5 s. So the page with the unit is about 14% slower
+       than native at the menu (26.3 vs 30.59) and reaches it sooner.
+       `hk-page.sh` runs want the pin whenever `elfunits` is given.
+     - hb6 (`+libGL.so.1`, strict) died at ~133 s: thread 24 in
+       UnityPlayer (+0x1dcbe60, tier-1) branched to 0x13450100, a mono.wasm
+       export with no bridge (SIGSEGV, status 139). Not seen in any other
+       run; hb10 repeats it.
      - The page keeps the guest's output (`shots/NAME/out.txt`), and
        hk-page.sh passes `-logFile -`, so HK's player log is in it.
      - The HK UnityPlayer unit for 0x11752000 is built and staged on
