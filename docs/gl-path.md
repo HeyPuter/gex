@@ -180,3 +180,85 @@ named item left is the per-draw label formatting (about 0.23 ms a frame in
 the profile; not separable from noise by replay).
 
 ## Findings
+
+## Unity's GL stream (Hollow Knight's menu, 2026-10-07 night)
+
+Captured natively on edger (`GEX_GL_CAPTURE` on U's harness:
+`tests/games/unity-bench.sh hk ... --fjit`, warm fjit cache; trace
+`out/hk-menu.gexgltr`, 587 MB, 3166 frames; the run's menu was 25.6
+presents/s with the capture on). Per frame over the last 300 (`ops.mjs`):
+
+- one submit (the frame's PRESENT; GEXGL_SUBMIT_TRACE agrees: 81% of
+  submits follow PRESENT), 999 commands, 78 KiB;
+- 45 draws (35 glDrawElementsBaseVertex, 10 glDrawElements), 47
+  glBindFramebuffer, 186 glBindBuffer, 160 glTexParameteri, 92
+  glBindTexture, 58 glUniform4fv;
+- 77 glBufferSubData, 58 KiB, all to GL_COPY_WRITE_BUFFER, 53 of them under
+  256 bytes (per-draw uniform blocks); 54 rewrite a buffer a draw of the
+  same frame already read, 14 at unaligned offsets (`subdata.mjs`).
+
+**Natively the GL stream is not what limits the menu.** The same trace
+replayed on edger's NVIDIA through gex-gl's host (`gl-replay-native`, the
+new `crates/gex-gl/examples/replay.rs` with per-opcode timing): 0.84 and
+1.03 ms a frame in `Gl::run`, of which glBindFramebuffer is 0.30-0.39 ms
+(47 binds) and the draws 0.15-0.20 ms; the whole 3166-frame trace replays in
+under 3 s. One round trip a frame. At 25-28 presents/s (35-40 ms a frame)
+that is a few percent: U's thread profile (main thread 59-69% of a core,
+render thread 25%, no thread saturated) is the place to look, not gex-gl.
+
+**In the browser (Mesa on WebGPU, the same trace, replay page) it is waste,
+and fixable in the driver.** Base (wink 5f5572e6 + E4 flags): 4.65 and 4.71
+ms of CPU a frame, with 23.5 queue submits, 42 render passes for 45 draws,
+12 createRenderPipeline, 66 views, 32 copyBufferToBuffer and 6
+copyTextureToTexture a frame. Causes found:
+
+1. Pipelines rebuilt every frame: the pipeline cache's entries were
+   invalidated by an epoch it shares with the bind group cache, which moves
+   on every deleted sampler view or sampler state (Unity deletes some every
+   frame).
+2. Unaligned glBufferSubData into a buffer the batch reads submitted the
+   batch (in-batch staging took whole words only).
+3. Feedback snapshots (a draw sampling its own attachment) went through
+   copy_texture_region, which submits the batch and then its own command
+   buffer: two submits each.
+4. Every rewrite of a uniform buffer the batch reads was staged and copied
+   in the batch, ending the render pass, although the bytes written are
+   never the bytes a pending draw reads.
+
+Each was tried as a mesa-wink commit and replayed (r=urep3, last 600
+frames, CPU ms of gex_gl_submit per frame, two passes in and reversed order;
+the last frame's readback digest equal for every build):
+
+| build | ms a frame | submits | pipelines | copies (buffer) |
+| --- | --- | --- | --- | --- |
+| base (5f5572e6 + E4) | 5.00, 4.72 | 23.5 | 12 | 32 |
+| + pipeline epoch | 4.42, 4.16 | 23.5 | 0 | 32 |
+| + unaligned staging | 5.34, 4.82 | 12 | 0 | 44 |
+| + snapshots in the batch | 5.39, 5.79 | 2 | 0 | 54 |
+| + read/write ranges | 5.30, 5.44 | 2 | 0 | 54 |
+
+Only the pipeline epoch pays: 12% less CPU a frame and no pipeline
+creation (which also costs Dawn's GPU-process time the CPU column does not
+show). Fewer submits bought by staging more copies is a loss here, and the
+range check never applied (Unity's rewrites hit buffers also bound as vertex
+or index data, which count as whole-buffer reads). Kept: `$G/mesa-wink`
+branch `gl/perf` = 6d3a4cfd only (not pushed; needs the user's approval);
+the other three are on `gl/experiments`.
+
+## Noita: E1 on the ejected page, the normal page, and what limits world fps
+
+**E1 (fast-path draws and pointers), ejected page** (site-gl4 = site-gl3 +
+F's client-state fast path + 6dd6b3fc; ABBA j7/j8): site-gl4 65.0, 65.1
+world fps against site-gl3 70.8, 65.6 and pewasm 48.0, 48.4. No measurable
+gain: the main thread is not bound by the remaining GL syscalls.
+
+**What limits world fps (ejected page, worker profiles 100-120 s, site-gl3,
+`out/prof-gl3`):** the compositor worker is 66% idle. Noita's main thread is
+fully busy, 37% of it parked in `guest_yield` (NtHost::park: waiting for its
+job threads), the rest guest code and NT calls (mono_ns clock reads 2.4%,
+dlmalloc 1.2%, syscall glue). The seven job workers each spend 55% in the
+ConcRT condvar provider (`cond_wait_`) and ~13% in f_724580 (the world
+simulation). So the frame is bound by the hand-off between the main thread
+and the simulation workers, not by GL and not by one thread's code: the
+next lever is the guest's own threading (F's side: wake latency of
+cond_wait/park, and the simulation's per-frame critical path).
