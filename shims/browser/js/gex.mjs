@@ -2791,10 +2791,13 @@ export class Gex {
     const tag = this.#providerTag();
     return {
       provider_try: (f, arg) => {
+        // The guest calls a raise unwinds are no longer open.
+        const calls = e.gex_libprov_guest_calls();
         try {
           ftab.get(f)(arg);
           return 0;
         } catch (err) {
+          e.gex_libprov_guest_calls_set(calls);
           if (err instanceof WebAssembly.Exception && err.is(tag)) return err.getArg(tag, 0);
           throw err;
         }
@@ -2802,6 +2805,8 @@ export class Gex {
       provider_throw: (code) => {
         throw new WebAssembly.Exception(tag, [code]);
       },
+      // The shim's export itself: a wasm-to-wasm call on every guest call.
+      provider_guest_call: e.gex_libprov_guest_call,
       provider_missing: (addr) => e.gex_libprov_missing(addr),
       provider_thread_entry: () => e.gex_libprov_thread_entry(),
       provider_code_page: () => e.gex_libprov_thread_entry(),

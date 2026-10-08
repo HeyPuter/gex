@@ -562,6 +562,36 @@ pub extern "C" fn gex_libprov_thread_register(in_guest: u64, stop: u64) {
 }
 
 /// `gex.provider_park()`.
+thread_local! {
+    /// The provider's guest calls open on this Worker (`gexp_call_guest`):
+    /// while any is, the guest code running has the provider's wasm frames
+    /// below it, whichever tier runs it (a function JIT or unit function is
+    /// called straight from the provider, with no call-out of the fallback's).
+    static GUEST_CALLS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// `gex.provider_guest_call(delta)`.
+#[no_mangle]
+pub extern "C" fn gex_libprov_guest_call(delta: i32) {
+    GUEST_CALLS.with(|c| c.set(c.get() + delta));
+}
+
+/// The count, which `provider_try` restores when a raise unwinds guest calls.
+#[no_mangle]
+pub extern "C" fn gex_libprov_guest_calls() -> i32 {
+    GUEST_CALLS.with(|c| c.get())
+}
+
+#[no_mangle]
+pub extern "C" fn gex_libprov_guest_calls_set(v: i32) {
+    GUEST_CALLS.with(|c| c.set(v));
+}
+
+/// Whether a provider's guest call is open on this Worker.
+pub(crate) fn guest_call_open() -> bool {
+    GUEST_CALLS.with(|c| c.get()) > 0
+}
+
 #[no_mangle]
 pub extern "C" fn gex_libprov_park() {
     park_if_stopping(this_tid(), true);
