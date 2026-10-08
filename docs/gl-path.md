@@ -33,6 +33,9 @@ push** (rebased onto upstream wink 0dd84167; nothing pushed):
   emdawn v20250822).
 - 9f1da0fa was dropped in the rebase, because upstream's `handle_epoch` is
   the same fix. The pre-rebase branch is `gl/perf-5f5572e`.
+- HK on the rebased tree is not slower (repeat: gpu 4.99 vs gpn 5.39 ms per
+  frame, inside the noise); see the push report under "mesa-wink gl/perf
+  rebased".
 - gex's pin (third_party/mesa) is still wink 5f5572e6. Moving it also needs
   web/build-mesa-wasm.sh on emdawnwebgpu v20250822 (wink/build.sh fetches it).
 
@@ -58,6 +61,11 @@ push** (rebased onto upstream wink 0dd84167; nothing pushed):
    (CLIENT_ARRAY: 55.5 vs 51.1 world fps on the old path, pewasm 47.2).
 4. Remaining E1: GL draw/pointer calls are on the fast path, but the page
    gain is below noise.
+5. *The 4-slot bind-group repro on the rebased tree* (`$G/urep5.sh`, mods
+   tinyu) timed out at 1200 s with no output. Rerun it the way trep2.sh ran
+   the earlier ones (full trace, `--query stream=1`, timeout 1500, no
+   maxframes) before moving gex's pin; expect 0 validation errors from
+   frame 1343 on.
 
 Tooling (unchanged):
 
@@ -422,6 +430,56 @@ current gexc; U's 10-04 gl64 works. Reported to U.
   - Noita world trace, CPU ms per frame over the last 600 frames: gpn 5.90
     and 4.78, gpu 5.04 and 5.20. No change outside the noise.
   - HK menu trace, same measure: gpn 5.03 (its second leg hung until the
-    timeout), gpu 6.24 and 6.61. That looks up to 25% slower, but the
-    readback pass points the other way (gpn 7.07, gpu 6.71 ms). Repeat it
-    before moving the pin: `urep4.sh`'s hk timing block.
+    timeout), gpu 6.24 and 6.61. That looked up to 25% slower, but the
+    readback pass pointed the other way (gpn 7.07, gpu 6.71 ms). The repeat
+    below (`hkbis.sh`) does not reproduce it.
+- **HK repeat and bisect (edger, `hkbis.sh`, out/hkbis.out).** HK menu
+  trace, 600 frames, median CPU ms per frame, legs ABBA-ordered
+  (gpn b0 b1 b2 b3 gpu gpu b3 b2 b1 b0 gpn); b0-b3 are plain upstream wink
+  (no gl/perf commits; + C++20, emdawn v20250822) at 5f5572e6, 686e897a,
+  2e94fadd, 066fbd73. All legs ok, 0 rejects, 0 validation errors.
+
+  | build | leg 1 | leg 2 | mean |
+  |---|---|---|---|
+  | gpn (gl/perf on 5f5572e6) | 5.165 | 5.605 | 5.39 |
+  | b0 upstream 5f5572e6 | 6.985 | 5.750 | 6.37 |
+  | b1 upstream 686e897a | 5.855 | 6.625 | 6.24 |
+  | b2 upstream 2e94fadd | 5.835 | 5.495 | 5.67 |
+  | b3 upstream 066fbd73 | 6.780 | 7.195 | 6.99 |
+  | gpu (gl/perf on 0dd84167) | 4.790 | 5.185 | 4.99 |
+
+  The rebased gl/perf is not slower on HK: gpu is 7% faster than gpn here
+  (4.99 vs 5.39 ms/frame), which is inside the noise (one build's two legs
+  differ by up to 1.2 ms, b0). The upstream points do not step in one
+  direction (5.67-6.99 ms), so no upstream commit is implicated; urep4's
+  6.24/6.61 gpu legs were noise. What the run does show: on either base,
+  gl/perf's own commits are cheaper than plain upstream (gpn 5.39 vs b0
+  6.37 ms, 1.0 ms less, same base; gpu 4.99 vs b3 6.99 ms), consistent with
+  the pipeline cache keeping its own epoch (062f46a0).
+- **urep5 (the 4-slot bind-group repro on the rebased tree, `urep5.sh`)
+  gave no result**: it held the bench lock 14:29-14:49, hit its 1200 s
+  timeout with `maxframes=2000`, and wrote nothing (empty out/urep5.out, no
+  log). The rebased tree's bind-group fix is upstream's `handle_epoch`, not
+  ours; the stock-size Noita and HK replays above show 0 validation errors,
+  but the small-cache repro has not been run on it (open item 5).
+
+### Push report (nothing pushed; awaiting the user)
+
+- **Upstream pulled into gl/perf:** all 78 commits of upstream wink
+  5f5572e6..0dd84167 (origin/wink is still 0dd84167 as of 2026-10-08).
+- **Conflicts:** one, gex_wgpu_screen.c: upstream's `handle_epoch` (resets
+  the emitted handles on release) met 6d3a4cfd's `pipeline_epoch` (keys the
+  pipeline cache). Both kept (062f46a0). 9f1da0fa dropped as a duplicate of
+  `handle_epoch`.
+- **What would be pushed:** new branch `gl/perf` on
+  MercuryWorkshop/mesa-wink (no gl/* branch exists there), head
+  602022460540b75b41d5e97f2c41207dbd79ce17, base wink
+  0dd84167fcd2b54c1d84e02ce2e246637ffc17ab, three commits, fast-forward
+  from wink (3 files, 29 insertions, 6 deletions):
+  - 062f46a0084306d9a2a6d5703c78c438a1864d9f gex_wgpu: the pipeline cache
+    keeps its own epoch, moved only by shader deletion;
+  - 523362aa82e79ab40a4e9c4a5ec720f198113fd9 zink/ntv: negative zero never
+    becomes a constant Tint can confuse with zero;
+  - 602022460540b75b41d5e97f2c41207dbd79ce17 gex-wasm: the replay and smoke
+    targets compile webgpu.cpp as C++20.
+- The pre-rebase branch `gl/perf-5f5572e` (bc42c2dd) stays local only.
