@@ -326,12 +326,12 @@ preinit (void)
 	if (done)
 		return;
 	done = 1;
-	/* The fork's runtime wasm JIT (docs/unity-dotnet.md P5): GEXMONO_WASM_JIT=1 while it is brought up on
-	 * wasm64. Its slots come from the jiterpreter's JIT_CALL table, which the browser's TypeScript sizes and
+	/* The fork's runtime wasm JIT (docs/unity-dotnet.md P5): on by default (user, 2026-10-07: normal runs
+	 * use the JIT, ejected builds .NET AOT); GEXMONO_WASM_JIT=0 runs the interpreter only. Its slots come from the jiterpreter's JIT_CALL table, which the browser's TypeScript sizes and
 	 * fills; here the host reserves the range in the process's function table (gex.provider_jit_reserve). The
 	 * rest of the jiterpreter (traces, interp_entry and jit_call wrappers) stays off. No inline TLAB
 	 * allocation: SGen runs Boehm-like under gex, without a nursery. */
-	if (getenv ("GEXMONO_WASM_JIT") && atoi (getenv ("GEXMONO_WASM_JIT")) > 0) {
+	if (!getenv ("GEXMONO_WASM_JIT") || atoi (getenv ("GEXMONO_WASM_JIT")) > 0) {
 		static char *opts [] = { "--no-jiterpreter-traces-enabled", "--no-jiterpreter-interp-entry-enabled",
 			"--no-jiterpreter-jit-call-enabled" };
 		/* The wasm64 bring-up's feature set: the core tier only. Each of these is a fast path with pointer

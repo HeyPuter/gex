@@ -1,0 +1,28 @@
+# Hollow Knight: main menu -> Start Game -> profile 1 (new) -> screen-scale page -> intro -> King's Pass.
+# Timed from the compositor's 300th frame (the menu is up by then on gooner). The game runs
+# at a few frames a second under gex here, so keys are held for 2 s and steps are 40 s apart.
+# The pointer is parked in a corner: where it hovers, the menu's selection follows.
+frames 300
+8    move 2 2
+12   key enter 1        # Start Game (selected by default)
+14   key enter 0
+50   key enter 1        # profile 1 (selected by default): new game
+52   key enter 0
+110  move 400 434       # screen-scale page: Done (keys did not reach it)
+112  click 400 434
+150  click 400 434      # brightness page: Done
+190  click 400 434      # (again, in case the page came up late)
+195  move 2 2
+230  key enter 1        # the intro cinematic: skip prompt
+232  key enter 0
+240  key enter 1        # confirm the skip
+242  key enter 0
+# King's Pass is playable from about 600 s on gooner (hk130).
+700  key right 1        # walk right
+730  key right 0
+735  key z 1            # jump
+737  key z 0
+745  key x 1            # attack
+746  key x 0
+760  key left 1         # walk back left
+780  key left 0

@@ -20,12 +20,14 @@ FW=$(dirname "$(dotnet --list-runtimes | awk '/Microsoft.NETCore.App 10\./ {v=$2
 cp "$OUT/lib/System.Private.CoreLib.dll" "$T/lib/"
 cp "$FW/System.Runtime.dll" "$FW/System.Collections.dll" "$FW/System.Runtime.InteropServices.dll" "$T/lib/"
 cd "$T"
-GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 \
+# The interpreter only (the wasm JIT is on by default; GEXMONO_WASM_JIT=0).
+GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --env GEXMONO_WASM_JIT=0 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" | tee out.txt
 PATTERNS=("Compute(50) = 50002" "Hello = hello gex from t ptr=8"
 	"Guest = twice 42; concat guest strings; mix 323.25; scale 2,4,6; big 11,25,52,3; caught from the guest"
 	"Back = callback 806.50; unmanaged 1015" "Work(200) = 24983091"
-	"held across collections: 64 of 64 intact" "worker thread: 0 bad of 640" "gc ok")
+	"held across collections: 64 of 64 intact" "worker thread: 0 bad of 640"
+	"clears 643296" "liveness: 301 leaves, 0 reported twice, batched" "gc ok")
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" out.txt || { echo "FAIL: no '$p'"; exit 1; }; done
 # The same under the function JIT, which must leave the replaced library's own code alone: it once
 # followed the PLT into the stub ("x86 Mono stub ... called"), as it followed Muck's into Boehm's GC.
@@ -38,6 +40,10 @@ GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 600 "$GEXC" 
 	--env GEXMONO_WASM_JIT=1 --env MONO_WASM_JIT_THRESHOLD=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > wasmjit.txt 2>&1 || true
 for p in "${PATTERNS[@]}"; do grep -a -q -x -F "$p" wasmjit.txt || { echo "FAIL (wasm JIT): no '$p'"; exit 1; }; done
+# The liveness walk as it was before the class shapes (field metadata per object): the same set.
+GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --env GEXMONO_LV_NOSHAPE=1 \
+	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > noshape.txt 2>&1 || true
+grep -a -q -x -F "liveness: 301 leaves, 0 reported twice, batched" noshape.txt || { echo "FAIL (GEXMONO_LV_NOSHAPE)"; exit 1; }
 # The control: without scanning the guest's frames, objects held only there die.
 GEX_WASM_DLLS=libmonobdwgc-2.0.so="$OUT/provider/mono.wasm" timeout 300 "$GEXC" run --mem64 --env GEXP_NO_GUEST_ROOTS=1 \
 	--env GEXMONO_ASSEMBLIES="$T/lib" ./embed ./libmonobdwgc-2.0.so "$T/asm/t.dll" > control.txt 2>&1 || true

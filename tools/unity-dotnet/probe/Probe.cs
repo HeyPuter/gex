@@ -6,6 +6,8 @@ using System;
 using UnityEngine;
 using UnityEngine.LowLevel;
 
+struct InputLogMarker { }
+
 public static class GexProbe
 {
     static float next;
@@ -26,6 +28,17 @@ public static class GexProbe
         var n = new PlayerLoopSystem[subs.Length + 1];
         Array.Copy(subs, n, subs.Length);
         n[subs.Length] = new PlayerLoopSystem { type = typeof(GexProbe), updateDelegate = Tick };
+        // The input log runs inside Update, where key-down flags are still set (they are
+        // cleared in PostLateUpdate.InputEndFrame, before a system at the end of the loop).
+        for (int i = 0; i < n.Length; i++)
+            if (n[i].type == typeof(UnityEngine.PlayerLoop.Update))
+            {
+                var u = n[i].subSystemList;
+                var nu = new PlayerLoopSystem[u.Length + 1];
+                Array.Copy(u, nu, u.Length);
+                nu[u.Length] = new PlayerLoopSystem { type = typeof(InputLogMarker), updateDelegate = InputLog };
+                n[i].subSystemList = nu;
+            }
         loop.subSystemList = n;
         PlayerLoop.SetPlayerLoop(loop);
     }
@@ -81,6 +94,8 @@ public static class GexProbe
     // GEXPROBE_INPUT=1: what the legacy Input API sees, every frame it changes: keys down
     // (Input.inputString, anyKeyDown), mouse buttons, the pointer position.
     static Vector3 lastMouse = new Vector3(-1, -1, 0);
+    static string lastHeld = "";
+    static readonly KeyCode[] AllKeys = (KeyCode[])Enum.GetValues(typeof(KeyCode));
     static void InputLog()
     {
         if (Environment.GetEnvironmentVariable("GEXPROBE_INPUT") != "1") return;
@@ -88,7 +103,14 @@ public static class GexProbe
         string b = "";
         for (int i = 0; i < 3; i++) if (Input.GetMouseButtonDown(i)) b += $" down{i}";
         foreach (KeyCode k in new[] { KeyCode.Return, KeyCode.Z, KeyCode.X, KeyCode.RightArrow, KeyCode.LeftArrow, KeyCode.UpArrow, KeyCode.DownArrow, KeyCode.Escape })
-            if (Input.GetKeyDown(k)) b += " key " + k;
+        {
+            if (Input.GetKeyDown(k)) b += " down " + k;
+            if (Input.GetKeyUp(k)) b += " up " + k;
+        }
+        var held = "";
+        foreach (KeyCode k in AllKeys)
+            if (Input.GetKey(k)) held += " " + k;
+        if (held != lastHeld) { b += " held [" + held.Trim() + "]"; lastHeld = held; }
         if (b != "" || Input.anyKeyDown || Input.inputString.Length > 0 || (m - lastMouse).sqrMagnitude > 0.5f)
             Console.Error.WriteLine($"[gexprobe] input frame {Time.frameCount} mouse {m.x:F0},{m.y:F0}{b} anyKeyDown {Input.anyKeyDown} string '{Input.inputString}'");
         lastMouse = m;
@@ -97,7 +119,6 @@ public static class GexProbe
     static void Tick()
     {
         updates++;
-        InputLog();
         float now = Time.realtimeSinceStartup;
         if (now < next) return;
         next = now + (Environment.GetEnvironmentVariable("GEXPROBE_EVERY") is string ev && float.TryParse(ev, out var evs) ? evs : 5f);

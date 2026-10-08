@@ -577,6 +577,15 @@ impl Client {
         self.send(w);
     }
 
+    /// `GEX_WL_KEYTRACE=1`: every keyboard object made or released, and every
+    /// enter, leave and key sent (a scripted key that a client never acts on).
+    fn keytrace(what: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("GEX_WL_KEYTRACE").is_some()) {
+            eprintln!("[wl-key] {what}");
+        }
+    }
+
     /// Whether to report every request and every refusal. A stalled client has
     /// usually asked for something it did not get; this is how Xwayland's
     /// requirements were found.
@@ -704,6 +713,7 @@ impl Client {
                 Object::Keyboard => {
                     // wl_keyboard's only request is release(0).
                     if opcode == 0 {
+                        Self::keytrace(&format!("release keyboard {object} (current {:?})", self.keyboard));
                         self.objects.remove(&object);
                         if self.keyboard == Some(object) {
                             self.keyboard = None;
@@ -1898,6 +1908,7 @@ impl Client {
             1 => {
                 let Some(id) = r.new_id() else { return false };
                 self.objects.insert(id, Object::Keyboard);
+                Self::keytrace(&format!("get_keyboard {id} (was {:?})", self.keyboard));
                 self.keyboard = Some(id);
                 // keymap(format = XKB_V1 (1), fd, size). The `h` fd argument
                 // occupies no word in the body -- it rides the socket's ancillary
@@ -2211,6 +2222,7 @@ impl Client {
                 return;
             };
             let serial = self.serial();
+            Self::keytrace(&format!("leave keyboard {kbd} surface {old}"));
             self.send(Writer::new(kbd, 2).uint(serial).object(old)); // leave
             return;
         }
@@ -2349,9 +2361,11 @@ impl Client {
         }
         if let Some(old) = self.keyboard_on.take() {
             let serial = self.serial();
+            Self::keytrace(&format!("leave keyboard {kbd} surface {old}"));
             self.send(Writer::new(kbd, 2).uint(serial).object(old)); // leave
         }
         let serial = self.serial();
+        Self::keytrace(&format!("enter keyboard {kbd} surface {surface}"));
         // enter(serial, surface, keys): no keys held.
         self.send(
             Writer::new(kbd, 1)
@@ -2391,6 +2405,7 @@ impl Client {
             return;
         }
         let serial = self.serial();
+        Self::keytrace(&format!("key {key} {} to keyboard {kbd} on {:?} serial {serial} time {time}", pressed as u32, self.keyboard_on));
         // key(serial, time, key, state): 1 pressed, 0 released.
         self.send(
             Writer::new(kbd, 3)
