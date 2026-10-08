@@ -1298,6 +1298,14 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
         c.len() - 1
     });
     CALLOUT_N.fetch_add(1, Ordering::Relaxed);
+    // Opened (result -1): one that never closes was abandoned by a throw.
+    CALLOUT_RING.with(|x| {
+        let mut x = x.borrow_mut();
+        if x.len() >= 24 {
+            x.remove(0);
+        }
+        x.push((t, ret as u64, want, depth as u32, -1, sp));
+    });
     // SAFETY: a host import taking scalars; nothing here holds a lock.
     let r = unsafe { call_out(ctx, t as i64, ret, want as i64) };
     CALLOUTS.with(|c| c.borrow_mut().truncate(depth));

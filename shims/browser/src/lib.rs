@@ -10967,6 +10967,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let stack: Vec<String> = (0..8)
                 .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
                 .collect();
+            // The stack around sp, named, and the registers (a bad return's frame).
+            let around: Vec<String> = (0..24u64)
+                .map(|i| {
+                    let a = sp.wrapping_sub(0x60).wrapping_add(i * 8);
+                    let v = gm.read_u64(a).unwrap_or(0);
+                    format!("{a:#x}={v:#x}{}", Some(object_off_at(h, v)).filter(|n| !n.is_empty()).map(|n| format!(" ({n})")).unwrap_or_default())
+                })
+                .collect();
+            let regs: Vec<String> = (0..16u8).map(|r| format!("r{r}={:#x}", gm.read_u64(c + ctx::x(r) as u64).unwrap_or(0))).collect();
+            warn_line(&format!("[gex] wild branch: stack {}; regs {}\n", around.join(", "), regs.join(" ")));
             warn_line(&format!(
                 "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}) from block {src:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
                 h.kernel.pid,
