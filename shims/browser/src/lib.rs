@@ -5880,6 +5880,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         IN_PROVIDER.with(|c| c.set(provider));
         ((pc as u64) & !PROVIDER_SYSCALL) as i64
     };
+    // A guest thread in a syscall counts as stopped for a provider's
+    // collection (cgen/libprov.rs); it parks on its way back if one runs.
+    let stop_tracked = !IN_PROVIDER.with(|c| c.get()) && cgen::libprov::any_registered();
+    let tracked_tid = if stop_tracked { with_host(|h| h.threads[cur()].kstate.tid) as u32 } else { 0 };
+    if stop_tracked {
+        cgen::libprov::syscall_enter(tracked_tid);
+    }
     // Which syscall is running, so the allocator can name who was asking (wasm
     // has no backtrace). See `HEAP_BY_CALL`.
     {
@@ -6748,6 +6755,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // A provider's priority-inheritance lock still held (`PI_RETRY` set the
     // thread to make the call again): it has no instruction to go back to, so
     // the call is made again here, outside the host lock.
+    if stop == 0 && stop_tracked {
+        cgen::libprov::guest_again(tracked_tid);
+    }
     if stop != 0 && IN_PROVIDER.with(|c| c.get()) && resume() == Some(pc as u64) {
         set_resume_none();
         set_resume_ctx_none();
@@ -10460,6 +10470,13 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
     // without a syscall: a loop that spins on them passes here.
     nt::tick();
+    // A stateful provider's collection stops guest threads here (its
+    // registers are in the context at a safepoint), and a thread that came
+    // back from a syscall through JS is running guest code again.
+    if cgen::libprov::any_registered() {
+        let tid = with_host(|h| h.threads[cur()].kstate.tid) as u32;
+        cgen::libprov::guest_again(tid);
+    }
     // A loop that has left an exception dispatched nested (nt::exc_escape).
     if nt::exc_escape(ctx, pc as u64) {
         set_resume_none();

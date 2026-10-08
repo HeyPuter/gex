@@ -2682,12 +2682,11 @@ export class Gex {
       provider_guest_stack_end: (sp) => e.gex_libprov_guest_stack_end(sp),
       provider_abi: (which) => e.gex_libprov_abi(which),
       provider_table_size: (base) => e.gex_libprov_table_size(base),
-      // Stopping the guest's threads around the runtime's collection: not yet in the page
-      // (each guest thread is a Worker; the stop needs the shim's safepoints).
-      provider_thread_register: () => {},
-      provider_park: () => {},
-      provider_stop_guest: () => {},
-      provider_start_guest: () => {},
+      // Stopping the guest's threads around the runtime's collection (cgen/libprov.rs).
+      provider_thread_register: (inGuest, stop) => e.gex_libprov_thread_register(inGuest, stop),
+      provider_park: () => e.gex_libprov_park(),
+      provider_stop_guest: () => e.gex_libprov_stop(),
+      provider_start_guest: () => e.gex_libprov_start(),
       // The runtime's wasm JIT: not yet in the page (B2); it runs interpreted.
       provider_jit_reserve: () => 0n,
       provider_jit_instantiate: () => -1,

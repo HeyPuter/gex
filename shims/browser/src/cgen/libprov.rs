@@ -362,3 +362,187 @@ fn elf_fini(bytes: &[u8]) -> Vec<u64> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Stopping the guest's threads for the provider's collector (native
+// `libprov::GuestStop`): each thread registers the provider's "in guest
+// code" word for it and the provider's stop flag; threads running guest code
+// stop at their next safepoint or syscall while a collection runs, a thread
+// inside a syscall counts as stopped. Every Worker shares these statics (the
+// shim's memory is the process's).
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct StopState {
+    threads: HashMap<u32, u64>,
+    stop_word: u64,
+    parked: std::collections::HashSet<u32>,
+    in_kernel: std::collections::HashSet<u32>,
+    stopper: Option<u32>,
+}
+
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Some thread registered (the syscall path's fast test).
+static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any thread of this process registered with a provider.
+pub(crate) fn any_registered() -> bool {
+    ANY.load(Ordering::Relaxed)
+}
+static STOP: Mutex<Option<StopState>> = Mutex::new(None);
+/// Bumped on every change a waiter could be waiting for (park, start).
+static STOP_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn stop_state<R>(f: impl FnOnce(&mut StopState) -> R) -> R {
+    f(lock(&STOP).get_or_insert_with(Default::default))
+}
+
+fn word(addr: u64) -> u32 {
+    let mem = crate::guest_bytes();
+    mem.get(addr as usize..addr as usize + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+
+fn store_word(addr: u64, v: u32) {
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if let Some(b) = crate::guest_bytes().get_mut(addr as usize..addr as usize + 4) {
+        b.copy_from_slice(&v.to_le_bytes());
+    }
+    std::sync::atomic::fence(Ordering::SeqCst);
+}
+
+fn bump() {
+    STOP_EPOCH.fetch_add(1, Ordering::SeqCst);
+    #[cfg(feature = "shared-memory")]
+    unsafe {
+        crate::warch::memory_atomic_notify(STOP_EPOCH.as_ptr() as *mut i32, u32::MAX);
+    }
+}
+
+/// Wait (at most `ns`) for the next bump after `seen`.
+fn wait_epoch(seen: u32, ns: i64) {
+    #[cfg(feature = "shared-memory")]
+    unsafe {
+        crate::warch::memory_atomic_wait32(STOP_EPOCH.as_ptr() as *mut i32, seen as i32, ns);
+    }
+    #[cfg(not(feature = "shared-memory"))]
+    let _ = (seen, ns);
+}
+
+fn this_tid() -> u32 {
+    crate::with_host(|h| h.threads[crate::cur()].kstate.tid) as u32
+}
+
+/// Whether a collection is stopping the guest's threads.
+pub(crate) fn stop_active() -> bool {
+    STOPPING.load(Ordering::Acquire)
+}
+
+/// At a safepoint or a syscall boundary in guest code (or from the
+/// provider, `forced`): park while a collection runs.
+pub(crate) fn park_if_stopping(tid: u32, forced: bool) {
+    if !STOPPING.load(Ordering::Acquire) {
+        return;
+    }
+    let parks = stop_state(|st| {
+        let Some(&w) = st.threads.get(&tid) else { return false };
+        if st.stopper == Some(tid) || (!forced && word(w) == 0) {
+            return false;
+        }
+        st.parked.insert(tid);
+        true
+    });
+    if !parks {
+        return;
+    }
+    bump();
+    while STOPPING.load(Ordering::Acquire) {
+        let seen = STOP_EPOCH.load(Ordering::SeqCst);
+        if !STOPPING.load(Ordering::Acquire) {
+            break;
+        }
+        wait_epoch(seen, 1_000_000);
+    }
+    stop_state(|st| st.parked.remove(&tid));
+}
+
+/// A syscall made from guest code: counts as stopped until it returns.
+pub(crate) fn syscall_enter(tid: u32) {
+    if lock(&STOP).as_ref().is_some_and(|st| st.threads.contains_key(&tid)) {
+        stop_state(|st| st.in_kernel.insert(tid));
+        bump();
+    }
+}
+
+/// Back to guest code (a syscall returned, or a safepoint): park if a
+/// collection is on.
+pub(crate) fn guest_again(tid: u32) {
+    let was = lock(&STOP).as_mut().is_some_and(|st| st.in_kernel.remove(&tid));
+    if was || STOPPING.load(Ordering::Acquire) {
+        park_if_stopping(tid, false);
+    }
+}
+
+/// `gex.provider_thread_register(in_guest, stop)`.
+#[no_mangle]
+pub extern "C" fn gex_libprov_thread_register(in_guest: u64, stop: u64) {
+    let tid = this_tid();
+    ANY.store(true, Ordering::Relaxed);
+    stop_state(|st| {
+        st.threads.insert(tid, in_guest);
+        st.stop_word = stop;
+    });
+}
+
+/// `gex.provider_park()`.
+#[no_mangle]
+pub extern "C" fn gex_libprov_park() {
+    park_if_stopping(this_tid(), true);
+}
+
+/// `gex.provider_stop_guest()`: stop every other registered thread that is
+/// in guest code (10 s at most, then on without the stragglers, said).
+#[no_mangle]
+pub extern "C" fn gex_libprov_stop() {
+    let me = this_tid();
+    let stop_word = stop_state(|st| {
+        st.stopper = Some(me);
+        st.stop_word
+    });
+    if stop_word != 0 {
+        store_word(stop_word, 1);
+    }
+    STOPPING.store(true, Ordering::SeqCst);
+    let deadline = crate::now_ns() + 10_000_000_000;
+    loop {
+        let seen = STOP_EPOCH.load(Ordering::SeqCst);
+        let waiting: Vec<u32> = stop_state(|st| {
+            st.threads
+                .iter()
+                .filter(|(&t, &w)| t != me && word(w) != 0 && !st.parked.contains(&t) && !st.in_kernel.contains(&t))
+                .map(|(&t, _)| t)
+                .collect()
+        });
+        if waiting.is_empty() {
+            return;
+        }
+        if crate::now_ns() > deadline {
+            crate::warn_line(&format!("gex: provider stop-the-world: threads {waiting:?} never reached a safepoint; going on without them\n"));
+            return;
+        }
+        wait_epoch(seen, 2_000_000);
+    }
+}
+
+/// `gex.provider_start_guest()`.
+#[no_mangle]
+pub extern "C" fn gex_libprov_start() {
+    let stop_word = stop_state(|st| {
+        st.stopper = None;
+        st.stop_word
+    });
+    if stop_word != 0 {
+        store_word(stop_word, 0);
+    }
+    STOPPING.store(false, Ordering::SeqCst);
+    bump();
+}
