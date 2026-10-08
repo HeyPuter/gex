@@ -465,6 +465,9 @@ pub struct Gl {
     /// `op::CLIENT_ARRAY`'s bytes by slot: GL keeps the pointer, so they
     /// stay until the slot's next one.
     client_arrays: std::collections::HashMap<u32, Vec<u8>>,
+    /// Per opcode: commands run and nanoseconds in them, when asked for
+    /// ([`Gl::time_ops`]; the replay tool's profile).
+    op_times: Option<std::collections::HashMap<u32, (u64, u64)>>,
 }
 
 /// `GEX_GL_READBACK_EVERY=N`: read back (and hand on) only every Nth
@@ -665,6 +668,7 @@ impl Gl {
                 frame: None,
                 presents: 0,
                 client_arrays: std::collections::HashMap::new(),
+                op_times: None,
             })
         }
     }
@@ -819,6 +823,19 @@ impl Gl {
         Ok(())
     }
 
+    /// Time every command by opcode from now on ([`Gl::take_op_times`]).
+    pub fn time_ops(&mut self, on: bool) {
+        self.op_times = on.then(std::collections::HashMap::new);
+    }
+
+    /// Commands and nanoseconds by opcode since the last call.
+    pub fn take_op_times(&mut self) -> Vec<(u32, u64, u64)> {
+        let Some(m) = self.op_times.as_mut() else { return Vec::new() };
+        let mut v: Vec<_> = m.drain().map(|(k, (c, n))| (k, c, n)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v
+    }
+
     /// Whether the context is a desktop one (fixed function available).
     pub fn is_desktop(&self) -> bool {
         self.compat.is_some()
@@ -893,7 +910,14 @@ impl Gl {
                 None => return (reply, error::NONE, index),
                 Some(Err(())) => return (reply, error::TRUNCATED, index),
                 Some(Ok((opcode, body))) => {
-                    if !self.one(opcode, body, &mut reply) {
+                    let t = self.op_times.is_some().then(std::time::Instant::now);
+                    let ok = self.one(opcode, body, &mut reply);
+                    if let (Some(t), Some(m)) = (t, self.op_times.as_mut()) {
+                        let e = m.entry(opcode).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += t.elapsed().as_nanos() as u64;
+                    }
+                    if !ok {
                         return (reply, error::BAD_OPCODE, index);
                     }
                     gl_error_check(opcode);
