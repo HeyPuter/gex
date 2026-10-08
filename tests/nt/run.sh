@@ -126,6 +126,9 @@ for arch in x64 x86; do
     [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childloop 0 "0 of 8 children failed" "$b/childloop.exe"
     # A child that dies in native code releases its parent.
     [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childtrap 0 "child gone" "$b/childtrap.exe"
+    # A window made in a DllMain (the loader lock held) before the process
+    # has a desktop: under W3 the desktop process starts meanwhile.
+    check $arch/attachwin 0 "${allok}" "$b/attachwin.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
