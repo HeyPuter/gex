@@ -10,12 +10,16 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-SEED=$ROOT/web/public/gex/seed.x86.shared.wasm
+# GEX_ARCH=aarch64: the AArch64 build's shim and seed (native wasm32
+# programs run on both guests' builds); default x86
+ARCH=${GEX_ARCH:-x86}
+case $ARCH in x86) INFIX=.x86 ;; *) INFIX= ;; esac
+SEED=$ROOT/web/public/gex/seed$INFIX.shared.wasm
 [ -f "$SEED" ] || { echo "no $SEED: GEX_ARCH=x86 GEX_SHARED=1 shims/browser/build.sh, gexc seed -o $SEED" >&2; exit 2; }
 WORK=${WORK:-$(mktemp -d)}
 fail=0
 run() {
-    GEX_ARCH=x86 GEX_SHARED=1 timeout "${TMO:-300}" node "$ROOT/shims/browser/js/run-node.mjs" "$@" 2>/dev/null | grep -v '^\[host\]\|^\[gex\] \|^\[worker\] \|^\[gex-console'
+    GEX_ARCH=$ARCH GEX_SHARED=1 timeout "${TMO:-300}" node "$ROOT/shims/browser/js/run-node.mjs" "$@" 2>/dev/null | grep -v '^\[host\]\|^\[gex\] \|^\[worker\] \|^\[gex-console'
 }
 for src in "$HERE"/*.c "$HERE"/*.cpp; do
     case $src in *.cpp) name=$(basename "$src" .cpp); hcc=c++; gcc_=gexc++ ;; *) name=$(basename "$src" .c); hcc=cc; gcc_=gexcc ;; esac
