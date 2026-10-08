@@ -1623,3 +1623,27 @@ Not yet:
      remaining libraries (libc/libstdc++/libGL-side), and the per-thread
      replay cost. The page has the same shape (each Worker instantiates
      every unit), which matters more there.
+  30. **B3, Muck in the page, first run (2026-10-08, edger Chromium 153,
+     WebGPU on the P620; `scratch/unity/page/muck-page.sh NAME MINUTES`, run
+     through bench.sh; no function JIT, .NET interpreter; aa4b35e1):** Muck
+     boots on the .NET provider in the page, first frame 79 s after the page
+     opened, 11.5 presents/s from ~300 s to ~700 s (native edger, warm
+     caches, interpreter: first present 151.6 s, menu 43.0 presents/s).
+     Then a WebGPU validation error in Mesa's gex_wgpu stops drawing: "Bind
+     group layout [draw VS:GLSL19/FS:GLSL19 g0] ... does not match layout
+     [draw VS:GLSL4/FS:GLSL4 g0] of bind group [draw VS:GLSL20/FS:GLSL20 g0]"
+     (a bind group made against one program's layout, used with another's):
+     for the GL stream. The screenshots show only the harness's terminal
+     (the canvas is not in the shot); the compositor reported 118,580 lit
+     pixels while it drew.
+     What it took (this commit): guest code a provider called waits in place
+     and stages threads (a trap to the run loop had abandoned the provider's
+     frames, and the guest then returned into the provider's code page:
+     SIGSEGV); tier-1's syscall import starts staged threads in a provider's
+     process; provider call-outs nest up to 400; gex-fjit lays a function of
+     over 1,500 blocks out flat in the browser (its structured emission
+     overflowed a Worker's stack on UnityPlayer under `?fjit=1`, not retried
+     yet).
+     Staging on edger: `scratch/unity/page/muck-bcl` (the run's BCL + 
+     mono.wasm), `muck-files.txt` (host files from a native `--strace`), the
+     worktree synced to edger without `target/`.
