@@ -93,7 +93,7 @@
     // `?direct=0` composites always.
     if (m.direct && q.get('direct') !== '0') p.set('direct', '1');
     // Diagnostics for the page itself, passed through.
-    for (const k of ['present', 'pointerlock', 'wgslcache', 'mesaenv', 'trapstack', 'sharetrace']) if (q.has(k)) p.set(k, q.get(k));
+    for (const k of ['present', 'pointerlock', 'wgslcache', 'mesaenv', 'trapstack', 'sharetrace', 'glcapture', 'wgpustats']) if (q.has(k)) p.set(k, q.get(k));
     location.replace(`nt.html?${p}`);
   } catch (e) {
     fail(String(e?.message ?? e));

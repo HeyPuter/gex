@@ -157,7 +157,7 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
         return None;
     }
     // An address an ELF provider holds is not code to translate (cgen::elfprov).
-    let executable = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e) && !crate::cgen::elfprov::provided(a);
+    let executable = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e) && !crate::cgen::elfprov::provided(a) && !crate::cgen::libprov::replaced(a);
     let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     // Writable-and-executable code (a JIT's) stays tier-1, as natively.
     let volatile = |a: u64| wx.iter().any(|&(s, e)| a >= s && a < e);

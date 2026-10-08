@@ -462,6 +462,12 @@ pub struct Gl {
     frame: Option<Frame>,
     /// PRESENTs so far.
     pub presents: u64,
+    /// `op::CLIENT_ARRAY`'s bytes by slot: GL keeps the pointer, so they
+    /// stay until the slot's next one.
+    client_arrays: std::collections::HashMap<u32, Vec<u8>>,
+    /// Per opcode: commands run and nanoseconds in them, when asked for
+    /// ([`Gl::time_ops`]; the replay tool's profile).
+    op_times: Option<std::collections::HashMap<u32, (u64, u64)>>,
 }
 
 /// `GEX_GL_READBACK_EVERY=N`: read back (and hand on) only every Nth
@@ -661,6 +667,8 @@ impl Gl {
                 keep_frames: false,
                 frame: None,
                 presents: 0,
+                client_arrays: std::collections::HashMap::new(),
+                op_times: None,
             })
         }
     }
@@ -815,6 +823,19 @@ impl Gl {
         Ok(())
     }
 
+    /// Time every command by opcode from now on ([`Gl::take_op_times`]).
+    pub fn time_ops(&mut self, on: bool) {
+        self.op_times = on.then(std::collections::HashMap::new);
+    }
+
+    /// Commands and nanoseconds by opcode since the last call.
+    pub fn take_op_times(&mut self) -> Vec<(u32, u64, u64)> {
+        let Some(m) = self.op_times.as_mut() else { return Vec::new() };
+        let mut v: Vec<_> = m.drain().map(|(k, (c, n))| (k, c, n)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v
+    }
+
     /// Whether the context is a desktop one (fixed function available).
     pub fn is_desktop(&self) -> bool {
         self.compat.is_some()
@@ -889,7 +910,14 @@ impl Gl {
                 None => return (reply, error::NONE, index),
                 Some(Err(())) => return (reply, error::TRUNCATED, index),
                 Some(Ok((opcode, body))) => {
-                    if !self.one(opcode, body, &mut reply) {
+                    let t = self.op_times.is_some().then(std::time::Instant::now);
+                    let ok = self.one(opcode, body, &mut reply);
+                    if let (Some(t), Some(m)) = (t, self.op_times.as_mut()) {
+                        let e = m.entry(opcode).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += t.elapsed().as_nanos() as u64;
+                    }
+                    if !ok {
                         return (reply, error::BAD_OPCODE, index);
                     }
                     gl_error_check(opcode);
@@ -1095,6 +1123,32 @@ impl Gl {
                     let n = a.u32().unwrap_or(0);
                     let names: Vec<GLuint> = (0..n).filter_map(|_| a.u32()).collect();
                     glDeleteTextures(names.len() as GLsizei, names.as_ptr());
+                }
+                op::CLIENT_ARRAY => {
+                    // { slot, op, n, n words, bytes }: run the pointer
+                    // command `op` with the bytes' address as its pointer and
+                    // no GL_ARRAY_BUFFER bound (proto.rs).
+                    let (Some(slot), Some(inner), Some(n)) = (a.u32(), a.u32(), a.u32()) else {
+                        return true;
+                    };
+                    if n > 8 || inner == op::CLIENT_ARRAY {
+                        return false;
+                    }
+                    let mut body = Vec::with_capacity(n as usize * 4 + 8);
+                    for _ in 0..n {
+                        let Some(w) = a.u32() else { return true };
+                        body.extend_from_slice(&w.to_le_bytes());
+                    }
+                    let Some(bytes) = a.blob() else { return true };
+                    let mem = self.client_arrays.entry(slot).or_default();
+                    mem.clear();
+                    mem.extend_from_slice(bytes);
+                    if mem.is_empty() {
+                        mem.push(0);
+                    }
+                    body.extend_from_slice(&(mem.as_ptr() as usize as u64).to_le_bytes());
+                    glBindBuffer(0x8892, 0); // GL_ARRAY_BUFFER
+                    return self.one(inner, &body, reply);
                 }
                 op::BIND_BUFFER => {
                     if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
@@ -2332,6 +2386,53 @@ mod tests {
         assert_eq!(pixel16(&px, 3, 8), (255, 0, 0, 255), "the client-array quad, scaled");
         assert_eq!(pixel16(&px, 9, 8), (0, 0, 0, 255), "nothing between");
         assert_eq!(pixel16(&px, 14, 8), (0, 255, 0, 255), "the immediate quad, moved by the loaded matrix");
+
+        // CLIENT_ARRAY: client-memory arrays carried with their pointer
+        // commands, drawn while the guest's own buffer stays bound. (In this
+        // test rather than one of its own: the host tests share the native
+        // decoder's name tables, so a further concurrent GL test races them.)
+        b = Batch::new();
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::MATRIX_MODE, &[GL_PROJECTION]);
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::MATRIX_MODE, &[GL_MODELVIEW]);
+        b.cmd(op::DISABLE, &[GL_ALPHA_TEST]);
+        // The left half in clip space, red; then the right half, blue, from
+        // the same slots: each CLIENT_ARRAY replaces its slot's bytes.
+        let quad = |x0: f32, x1: f32| {
+            let mut v = Vec::new();
+            for (x, y) in [(x0, -1.0f32), (x1, -1.0), (x1, 1.0), (x0, 1.0)] {
+                v.extend_from_slice(&x.to_le_bytes());
+                v.extend_from_slice(&y.to_le_bytes());
+            }
+            v
+        };
+        let colour = |c: [u8; 4]| c.repeat(4);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, f(1.0)]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::GEN_BUFFERS, &[1, 9]);
+        b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 9]);
+        b.cmd(op::ENABLE_CLIENT_STATE, &[GL_VERTEX_ARRAY]);
+        b.cmd(op::ENABLE_CLIENT_STATE, &[GL_COLOR_ARRAY]);
+        for (x0, x1, c) in [(-1.0, 0.0, [255, 0, 0, 255]), (0.0, 1.0, [0, 0, 255, 255])] {
+            let v = quad(x0, x1);
+            b.raw(op::CLIENT_ARRAY, &[0, op::VERTEX_POINTER, 3, 2, GL_FLOAT, 8, v.len() as u32], &v);
+            let c = colour(c);
+            b.raw(op::CLIENT_ARRAY, &[1, op::COLOR_POINTER, 3, 4, GL_UNSIGNED_BYTE, 4, c.len() as u32], &c);
+            b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 9]);
+            b.cmd(op::DRAW_ARRAYS, &[GL_QUADS, 0, 4]);
+        }
+        read_back(&mut b);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        let r = reply.bytes();
+        let mut at = 0;
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(pixel16(&px, 3, 8), (255, 0, 0, 255), "the first quad, from its own bytes");
+        assert_eq!(pixel16(&px, 12, 8), (0, 0, 255, 255), "the second, from the slots' new bytes");
     }
 
     /// Protocol 12's attribute stack, and the host's uniform vectors and

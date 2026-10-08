@@ -73,8 +73,12 @@ export class Compositor {
       // `?wgslcache=all|site|0`: which shader translations Mesa starts with
       // (mesa-gl.js #loadWgslCache).
       const wgslCache = q?.get('wgslcache');
+      // `?wgpustats=1`: count Mesa's WebGPU calls for the stats line
+      // (mesa-gl.js countWebGpu); off by default, it costs time.
+      const wgpuStats = q?.get('wgpustats') === '1';
       this.#worker.postMessage({ kind: 'gl', channel, ...opts, ...(mesaEnv ? { mesaEnv } : {}),
-        ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}) });
+        ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}),
+        ...(wgpuStats ? { wgpuStats } : {}) });
     });
   }
 
