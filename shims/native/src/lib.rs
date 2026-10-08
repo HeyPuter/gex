@@ -1934,7 +1934,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let mut gm = GuestMem::new(dst);
         let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if req.child_stack != 0 {
-            let _ = gm.write_u64(ctx_addr + ctx::SP as u64, req.child_stack);
+            let _ = gm.write_u64(ctx_addr + ctx::sp_slot(child_kernel.compat) as u64, req.child_stack);
         }
         if let Some(tls) = req.tls {
             // PowerPC's thread pointer is r2.
@@ -2978,7 +2978,8 @@ fn place_image(
     for i in 0..31u8 {
         write_u64(data, ctx_addr + ctx::x(i), 0);
     }
-    write_u64(data, ctx_addr + ctx::SP, layout.sp);
+    // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
+    write_u64(data, ctx_addr + ctx::sp_slot(program.compat()), layout.sp);
     write_u64(data, ctx_addr + ctx::PC, image.entry);
     data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());

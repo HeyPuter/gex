@@ -236,7 +236,24 @@ impl DynSym {
     }
 }
 
+/// The header a native wasm32 program's container carries 0x40 bytes below
+/// its entry (`tools/wine-wasm/wasm-elf.py`; shims' `wasmprog`).
+pub const WASM32_MAGIC: &[u8; 8] = b"GEXWASM\0";
+
 impl Image {
+    /// Whether this is a native wasm32 program's container: an i386 image
+    /// with [`WASM32_MAGIC`] 0x40 bytes below the entry.
+    pub fn is_wasm32(&self) -> bool {
+        let at = self.entry.wrapping_sub(0x40);
+        self.class32
+            && self.segments.iter().any(|s| {
+                at >= s.vaddr && at + 8 <= s.vaddr + s.bytes.len() as u64 && {
+                    let o = (at - s.vaddr) as usize;
+                    &s.bytes[o..o + 8] == WASM32_MAGIC
+                }
+            })
+    }
+
     /// The defined, non-TLS dynamic symbols in `[lo, hi)` (unbiased) by every
     /// name a binding may use: `name@@VER`, `name@VER`, and the bare `name`
     /// for the default version (or an unversioned object), each with its
@@ -437,12 +454,14 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
     if r.u8(5)? != order {
         return Err(LoadError::NotElf64Le);
     }
-    // A 32-bit i386 image is accepted on the x86-64 guest only: it runs in
-    // the same process model as everything else, in compatibility mode. The
-    // PowerPC guest is 32-bit only.
+    // A 32-bit i386 image runs in the same process model as everything
+    // else, on the i386 ABI: on the x86-64 guest any i386 program, in
+    // compatibility mode; on the AArch64 guest only a native wasm32 program
+    // (an i386 container around a wasm module, checked below), which has no
+    // i386 code to translate. The PowerPC guest is 32-bit only.
     let class32 = match r.u8(4)? {
         ELFCLASS64 if !gex_abi::PPC => false,
-        ELFCLASS32 if gex_abi::X86 || gex_abi::PPC => true,
+        ELFCLASS32 => true,
         _ => return Err(LoadError::NotElf64Le),
     };
     let e_type = r.u16(16)?;
@@ -608,6 +627,10 @@ pub fn load(data: &[u8], pie_base: u64) -> Result<Image, LoadError> {
         needed: Vec::new(),
         runpath: Vec::new(),
     };
+
+    if class32 && !gex_abi::X86 && !gex_abi::PPC && !image.is_wasm32() {
+        return Err(LoadError::NotAarch64);
+    }
 
     if let (Some((dyn_vaddr, dyn_size)), false) = (dynamic, class32) {
         apply_relative_relocations(&mut image, dyn_vaddr, dyn_size);

@@ -3912,7 +3912,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     for i in 0..31u8 {
         write_u64(data, c + ctx::x(i), 0);
     }
-    write_u64(data, c + ctx::SP, layout.sp);
+    // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
+    write_u64(data, c + ctx::sp_slot(program.compat()), layout.sp);
     write_u64(data, c + ctx::PC, program.entry());
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
@@ -7989,7 +7990,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // `sp` is the stack just built, not the recorded one: the two are the
     // same address by construction -- see `BLOB_RESERVE` -- and the argv on
     // it is this process's.
-    write_u64(data, c + ctx::SP, layout.sp);
+    let compat = program.as_ref().is_some_and(|p| p.compat());
+    write_u64(data, c + ctx::sp_slot(compat), layout.sp);
     let entry = match (&program, &restored) {
         (Some(p), _) => p.entry(),
         (None, Some(l)) => l.entry,
@@ -10070,6 +10072,21 @@ pub extern "C" fn gex_compat() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_set_compat(on: i32) {
     with_host(|h| h.kernel.compat = on != 0);
+    // An adopted child's stack (`gex_adopt_child`, before this) went to
+    // `ctx::SP`; an i386-ABI process's is `esp` (`ctx::sp_slot`), which on
+    // an AArch64 build is another slot (its i386-ABI processes are wasm32
+    // programs: posix_spawn's child starts on that stack).
+    if on != 0 && !gex_abi::X86 && !gex_abi::PPC {
+        with_host(|h| {
+            let mut gm = GuestMem::new(guest_bytes());
+            let c = h.kernel.ctx_addr;
+            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+            if sp != 0 {
+                let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
+                let _ = gm.write_u64(c + ctx::SP as u64, 0);
+            }
+        });
+    }
     gex_xlate::set_compat(on != 0);
 }
 

@@ -554,7 +554,7 @@ pub fn setup_frame(
     if gex_abi::PPC {
         return setup_frame_ppc(signals, m, ctx_addr, signal, fault_address);
     }
-    if gex_abi::X86 && compat {
+    if compat {
         return setup_frame_i386(signals, m, ctx_addr, signal, fault_address);
     }
     if gex_abi::X86 {
@@ -840,7 +840,7 @@ fn setup_frame_i386(
     fault_address: u64,
 ) -> Result<u64, Errno> {
     let action = signals.action(signal);
-    let sp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
+    let sp = m.read_u64(ctx_addr + ctx::sp_slot(true) as u64)? & 0xffff_ffff;
     let rt = action.flags & sa::SIGINFO != 0;
     signals.legacy_frame = !rt;
 
@@ -917,7 +917,10 @@ fn setup_frame_i386(
     m.write_u32(sc + iframe::SC_CR2, fault_address as u32)?;
 
     // The FP image: x87 control word, MXCSR and the eight xmm registers.
-    m.write_u32(fpstate, m.read_u32(ctx_addr + ctx::X87_CW as u64)? & 0xffff)?;
+    // (an AArch64 build's i386-ABI processes are wasm32 programs: no x87,
+    // and the context has no x87 area)
+    let cw = if gex_abi::X86 { m.read_u32(ctx_addr + ctx::X87_CW as u64)? & 0xffff } else { 0x37f };
+    m.write_u32(fpstate, cw)?;
     m.write_u32(fpstate + iframe::FP_MXCSR, m.read_u32(ctx_addr + ctx::MXCSR as u64)?)?;
     for n in 0..8u8 {
         for half in 0..2u64 {
@@ -944,7 +947,7 @@ fn setup_frame_i386(
         );
     }
     // esp = frame; eax = signo; for an rt frame edx = &info and ecx = &uc.
-    m.write_u64(ctx_addr + ctx::SP as u64, frame_addr)?;
+    m.write_u64(ctx_addr + ctx::sp_slot(true) as u64, frame_addr)?;
     m.write_u64(ctx_addr + ctx::x(0) as u64, signal as u64)?;
     if rt {
         m.write_u64(ctx_addr + ctx::x(2) as u64, frame_addr + iframe::RT_INFO)?;
@@ -966,7 +969,7 @@ fn sigreturn_i386(
     ctx_addr: u64,
     legacy: bool,
 ) -> Result<u64, Errno> {
-    let esp = m.read_u64(ctx_addr + ctx::SP as u64)? & 0xffff_ffff;
+    let esp = m.read_u64(ctx_addr + ctx::sp_slot(true) as u64)? & 0xffff_ffff;
     let (sc, mask) = if legacy {
         let frame_addr = esp - 8;
         let sc = frame_addr + iframe::SF_SC;
@@ -1064,7 +1067,7 @@ pub fn sigreturn(
     if gex_abi::PPC {
         return sigreturn_ppc(signals, m, ctx_addr);
     }
-    if gex_abi::X86 && compat {
+    if compat {
         // The frame's own kind decides; the entry number is a cross-check.
         let _ = legacy;
         let kind = signals.legacy_frame;

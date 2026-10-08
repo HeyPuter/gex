@@ -881,6 +881,9 @@ pub enum PollReport {
         max: u32,
         /// The opaque word to hand back for each descriptor.
         data: Vec<(i32, u64)>,
+        /// `struct epoll_event` packed in 12 bytes (x86-64's, and the i386
+        /// ABI's in any build), rather than 16.
+        packed: bool,
     },
     /// `select`'s three `fd_set`s. A zero address means the caller did not
     /// pass that set.
@@ -944,7 +947,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
             }
             Ok(ready)
         }
-        PollReport::Epoll { out, max, data } => {
+        PollReport::Epoll { out, max, data, packed } => {
             // Only the ready ones, each with the caller's own token, which is
             // the whole difference between this and `poll`.
             let mut n = 0u64;
@@ -965,7 +968,7 @@ pub fn poll_finish(fds: &[PollFd], report: &PollReport, m: &mut GuestMem<'_>) ->
                 // on x86-64 (the token at offset four), 16 on aarch64. Xvfb
                 // read its `data.ptr` from the wrong offset after every wait
                 // that had to block, and dereferenced the mask.
-                if gex_abi::X86 {
+                if *packed {
                     let at = out + n * 12;
                     m.write_u32(at, r as u32)?;
                     m.write_u64(at + 4, token)?;
@@ -1606,7 +1609,7 @@ impl Kernel {
             m.write_u64(child + off as u64, v)?;
         }
         set_result(m, child, 0)?;
-        m.write_u64(child + ctx::SP as u64, child_stack)?;
+        m.write_u64(child + ctx::sp_slot(self.compat) as u64, child_stack)?;
         m.write_u64(child + ctx::MON_SIZE as u64, 0)?;
         m.write_u64(child + ctx::TID as u64, tid as u64)?;
         if flags & clone_flags::SETTLS != 0 {
@@ -1678,8 +1681,11 @@ impl Kernel {
 
     fn syscall_inner(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         self.syscall_pc = pc;
+        // An i386-ABI process has its number in eax (`x(0)`) in every build:
+        // on an AArch64 build that is a native wasm32 program.
+        let nr_slot = if self.compat && !gex_abi::PPC { ctx::x(0) } else { ctx::SYSCALL_NR };
         let raw = m
-            .read_u64(self.ctx_addr + ctx::SYSCALL_NR as u64)
+            .read_u64(self.ctx_addr + nr_slot as u64)
             .unwrap_or(!0);
         let mut a: [u64; 6] = if self.compat && !gex_abi::PPC {
             let mut a = [0u64; 6];
@@ -1717,12 +1723,12 @@ impl Kernel {
             post = p;
             ppc_post = pp;
             n
-        } else if gex_abi::X86 && self.compat {
+        } else if self.compat {
             let (n, p) = crate::i386::translate(
                 raw & 0xffff_ffff,
                 &mut a,
                 m,
-                self.ctx_addr + ctx::SCRATCH as u64,
+                self.ctx_addr + ctx::COMPAT_SCRATCH as u64,
                 self.ctx_addr,
             );
             post = p;
@@ -1967,7 +1973,7 @@ impl Kernel {
         }
         // An x86-64 number with no mapping reaches `dispatch` as `UNKNOWN`;
         // record the guest's own number, which is the one worth looking up.
-        let outcome = if (gex_abi::X86 || gex_abi::PPC) && n == crate::x86::UNKNOWN {
+        let outcome = if (gex_abi::X86 || gex_abi::PPC || self.compat) && n == crate::x86::UNKNOWN {
             let before = self.unimplemented.len();
             let r = self.dispatch(m, n, a);
             if self.unimplemented.len() > before {
@@ -2130,6 +2136,7 @@ impl Kernel {
                         out: a[1],
                         max: a[2] as u32,
                         data: set.watches().iter().map(|w| (w.fd, w.data)).collect(),
+                        packed: gex_abi::X86 || self.compat,
                     },
                 })
             }
@@ -2480,11 +2487,11 @@ impl Kernel {
             // -- x86-64 legacy forms (see `crate::x86`) ----------------------------
             // Only `x86::translate` produces these numbers; an AArch64 guest
             // issuing one raw falls through to ENOSYS below.
-            nr::DUP2 if gex_abi::X86 || gex_abi::PPC => self.sys_dup2(a[0] as i32, a[1] as i32),
-            nr::TIME if gex_abi::X86 || gex_abi::PPC => self.sys_time(m, a[0]),
-            nr::ALARM if gex_abi::X86 || gex_abi::PPC => self.sys_alarm(m, a[0]),
+            nr::DUP2 if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_dup2(a[0] as i32, a[1] as i32),
+            nr::TIME if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_time(m, a[0]),
+            nr::ALARM if gex_abi::X86 || gex_abi::PPC || self.compat => self.sys_alarm(m, a[0]),
             nr::ARCH_PRCTL if gex_abi::X86 => self.sys_arch_prctl(m, a[0], a[1]),
-            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC => Ok(0),
+            nr::NOOP_OK if gex_abi::X86 || gex_abi::PPC || self.compat => Ok(0),
 
             // -- I/O ---------------------------------------------------------
             nr::WRITE => self.sys_write(m, a[0] as i32, a[1], a[2]),
@@ -5814,7 +5821,7 @@ impl Kernel {
         // `EPOLL_CTL_DEL` is allowed a null event pointer.
         let (events, data) = if event == 0 {
             (0, 0)
-        } else if gex_abi::X86 {
+        } else if gex_abi::X86 || self.compat {
             (m.read_u32(event)?, m.read_u64(event + 4)?)
         } else {
             (m.read_u32(event)?, m.read_u64(event + 8)?)
@@ -5915,7 +5922,7 @@ impl Kernel {
     ) -> SysResult {
         let n = ready.len().min(max as usize);
         for (i, (events, data)) in ready.iter().take(n).enumerate() {
-            if gex_abi::X86 {
+            if gex_abi::X86 || self.compat {
                 // Packed: 12 bytes, the token at offset four.
                 let at = out + i as u64 * 12;
                 m.write_u32(at, *events)?;
@@ -6547,7 +6554,7 @@ impl Kernel {
     /// previous timer had left. Both itimervals live in the thread's scratch
     /// area, since the call has none of its own.
     fn sys_alarm(&mut self, m: &mut GuestMem<'_>, secs: u64) -> SysResult {
-        let scratch = self.ctx_addr + ctx::SCRATCH as u64;
+        let scratch = self.ctx_addr + ctx::COMPAT_SCRATCH as u64;
         for off in 0..4 {
             m.write_u64(scratch + off * 8, 0)?;
         }
