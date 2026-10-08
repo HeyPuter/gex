@@ -22,6 +22,8 @@ export const STATE = join(process.env.TMPDIR || '/tmp', `gex-nt-browser-${proces
 mkdirSync(STATE, { recursive: true });
 
 export const log = (s) => process.stderr.write(`[nt-browser] ${s}\n`);
+/** When this harness started: console lines say how far in they came. */
+const T0 = Date.now();
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -245,7 +247,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
       ? !/^\[mesa-gl\] gex-gl: gl[A-Z]/.test(text)
       : p.type === 'warning' && /gex-nt|gex-wgpu|wine:|\[gex\]|panic|trap/i.test(text);
     if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE) && printed++ < 20000) {
-      log(`console[${sid?.slice(0, 6)}] ${text.slice(0, 4000)}`);
+      log(`console[${sid?.slice(0, 6)} @${((Date.now() - T0) / 1000).toFixed(1)}s] ${text.slice(0, 4000)}`);
     }
   });
   browser.on('Runtime.exceptionThrown', (p, sid) => log(`exception[${sid?.slice(0, 6)}] ${p.exceptionDetails?.exception?.description ?? p.exceptionDetails?.text}`));
