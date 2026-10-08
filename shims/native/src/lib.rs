@@ -1249,7 +1249,22 @@ fn run_program_with(
     if opts.aot_only {
         aot_only::bind_root(&mut store, &instance)?;
     }
-    let stopped = run_thread_loop(&mut store, &instance, ctx_addr, entry)?;
+    let stopped = match run_thread_loop(&mut store, &instance, ctx_addr, entry) {
+        Ok(s) => s,
+        Err(e) => {
+            // A process that dies takes its threads and descriptors with it,
+            // as `fork_process`'s failure path does for a forked one. That
+            // path cannot for an exec'd process: the kernel moved here. Left
+            // open, an exec'd child that trapped kept its end of every pipe
+            // and socket (native Wine's server connection: its parent waited
+            // for it for ever).
+            stop_other_threads(&spawn, false);
+            let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            k.fds.close_all();
+            k.sockets.clear();
+            return Err(e);
+        }
+    };
     profile::harvest(&mut store)?;
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);

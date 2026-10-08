@@ -119,6 +119,8 @@ for arch in x64 x86; do
     [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childcon 0 "${allok}${nl}child exit 0" "$b/childcon.exe"
     # Children one after another, each a new address space.
     [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childloop 0 "0 of 8 children failed" "$b/childloop.exe"
+    # A child that dies in native code releases its parent.
+    [ -n "${GEX_NT_CHILDREN:-}" ] && check $arch/childtrap 0 "child gone" "$b/childtrap.exe"
     check $arch/gdi 0 "$allok" "$b/gdi.exe"
     check $arch/input 0 "$allok" "$b/input.exe"
     check $arch/filemap 0 "$allok" "$b/filemap.exe"
