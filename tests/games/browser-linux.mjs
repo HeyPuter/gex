@@ -8,7 +8,7 @@
 //   node tests/games/browser-linux.mjs --name NAME --dir GAME_DIR --exe REL
 //        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST]
 //        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
-//        [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--query K=V&...] [--env K=V,K=V] [--end-on-exit]
+//        [--profile AT,SECS[,MATCH]] [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--query K=V&...] [--env K=V,K=V] [--end-on-exit]
 //
 // --files lists host files the game opens, one per line (collected from a
 // native `gexc run --strace`; tests/games/retrocycles-linux-files.txt).
@@ -49,7 +49,22 @@ import { dirname, join, basename } from 'node:path';
 // and a gate's browser legs on the defaults (5199, 9339) do not collide.
 process.env.GEX_NT_VITE_PORT ??= '5291';
 process.env.GEX_NT_CHROME_PORT ??= '9431';
-const { openPage, sleep, log, WEB, STATE } = await import('../nt/browser-harness.mjs');
+const { openPage, sleep, log, WEB, STATE, summariseProfile } = await import('../nt/browser-harness.mjs');
+
+/** A CPU profile's span, its time not idle, and its time in Atomics.wait (ms). */
+function profileBusy(profile) {
+  const byId = new Map(profile.nodes.map((x) => [x.id, x]));
+  const { samples = [], timeDeltas = [] } = profile;
+  let span = 0, idle = 0, wait = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const dt = (timeDeltas[i + 1] ?? 0) / 1000;
+    span += dt;
+    const f = byId.get(samples[i])?.callFrame?.functionName ?? '';
+    if (f === '(idle)' || f === '(program)') idle += dt;
+    else if (f === 'wait' || f === 'Atomics.wait' || f === 'waitAsync') wait += dt;
+  }
+  return { span, busy: span - idle - wait, wait };
+}
 
 const argv = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -141,7 +156,7 @@ async function main() {
     ...(opt('--env', '') || '').split(/,(?=[A-Za-z_][A-Za-z0-9_]*=)/).filter(Boolean),
   ].join(',');
   const t0 = Date.now();
-  const { evaluate, state, shot, consoleLines } = await openPage(
+  const { evaluate, state, shot, consoleLines, profile } = await openPage(
     `tar=/gex/nt/${basename(tar)}&exe=/game/${exe}&cwd=/game/${cwd}&gl=1&glbackend=wgpu&hostx=1`
       + (argv.includes('--mem64') ? '&mem64=1' : '') + (argv.includes('--fjit') ? '&fjit=1' : '')
       + (opt('--wasmdlls', null) ? `&wasmdlls=${encodeURIComponent(opt('--wasmdlls'))}` : '')
@@ -162,6 +177,8 @@ async function main() {
     `(() => { for (const t of document.querySelectorAll('canvas')) t.dispatchEvent(new KeyboardEvent(${JSON.stringify(type)}, { code: ${JSON.stringify(c)}, key: ${JSON.stringify(c)}, bubbles: true })); return 1; })()`, true);
   const { after, events } = script();
   let first = null, start = null, next = 0, playAt = null, shots = 0, nextShot = Date.now() + 30000;
+  const profSpec = opt('--profile', null) ? (([at = '300', secs = '20', match = '']) => ({ at: +at, secs: +secs, match }))(opt('--profile').split(',')) : null;
+  let profiled = false;
   const window = [];
   const end = t0 + minutes * 60000;
   while (Date.now() < end) {
@@ -195,6 +212,25 @@ async function main() {
     if (gameplay && !playAt && n >= gameplay) {
       playAt = Date.now();
       console.log(`ok   gameplay (present ${n}) ${((playAt - t0) / 1000).toFixed(0)} s after the page opened`);
+    }
+    // --profile AT,SECS[,MATCH]: CPU profiles of the page's main thread and
+    // every Worker whose script URL contains MATCH, AT s after the page
+    // opened, for SECS; each one's busy time (not idle, not in Atomics.wait)
+    // and its top functions, saved as .cpuprofile with --shot.
+    if (profSpec && !profiled && Date.now() - t0 >= profSpec.at * 1000) {
+      profiled = true;
+      const n0 = n;
+      const profs = await profile(profSpec.match, profSpec.secs * 1000, true);
+      const rows = [];
+      for (const [k, { url, profile: prof }] of profs.entries()) {
+        const file = `${url.split('/').pop().split('?')[0]}.${k}`;
+        const b = profileBusy(prof);
+        rows.push({ file, ...b });
+        if (shotDir) writeFileSync(join(shotDir, `${file}.cpuprofile`), JSON.stringify(prof));
+        if (b.busy >= 0.05 * b.span) log(`profile of ${file}:\n${summariseProfile(prof, 15)}`);
+      }
+      rows.sort((a, b) => b.busy - a.busy);
+      console.log(`ok   profile over ${profSpec.secs} s (${n - n0} presents): ` + rows.slice(0, 12).map((r) => `${r.file} busy ${(100 * r.busy / Math.max(r.span, 1)).toFixed(0)}% wait ${(100 * r.wait / Math.max(r.span, 1)).toFixed(0)}%`).join('; '));
     }
     if (Date.now() >= nextShot) {
       nextShot += 30000;
