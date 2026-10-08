@@ -1170,8 +1170,16 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
 /* The fixed-function arrays (glVertexPointer and friends), kept like the
    generic attributes above: a pointer with no GL_ARRAY_BUFFER bound is client
    memory, uploaded just before each draw. Index 0 is the vertex array, 1 the
-   colour array, 2 + n texture unit n's coordinates. */
-#define GEXGL_FF_ARRAYS 6
+   colour array, 2 + n texture unit n's coordinates, then the normal array
+   (glNormalPointer: the compat profile's planned opcode, which the host
+   decodes like the generated commands). Before the normal array was kept,
+   GL_NORMAL_ARRAY reached the host enabled with no pointer and the host's GL
+   read normals from address 0 (Retrocycles' display lists: SIGSEGV in the
+   host driver). */
+#define GEXGL_FF_TEX_UNITS 4
+#define GEXGL_FF_NORMAL (2 + GEXGL_FF_TEX_UNITS)
+#define GEXGL_FF_ARRAYS (GEXGL_FF_NORMAL + 1)
+#define GEXGL_NORMAL_POINTER_PLAN 10051 /* compat_plans.rs: "v w w P" */
 struct ff_array_state {
     int size;
     unsigned type;
@@ -1234,6 +1242,13 @@ static void gexgl_upload_client_arrays(size_t vertices, int instances) {
 
 static void ff_pointer_command(unsigned slot, const struct ff_array_state *a, uint64_t offset) {
     static const uint32_t ops[3] = { GEXGL_VERTEX_POINTER, GEXGL_COLOR_POINTER, GEXGL_TEX_COORD_POINTER };
+    if (slot == GEXGL_FF_NORMAL) {
+        uint32_t *p = begin(GEXGL_NORMAL_POINTER_PLAN, 4, 0);
+        if (!p) return;
+        p[0] = a->type; p[1] = (uint32_t)a->stride;
+        p[2] = (uint32_t)offset; p[3] = (uint32_t)(offset >> 32);
+        return;
+    }
     uint32_t *p = begin(ops[slot < 2 ? slot : 2], 5, 0);
     if (!p) return;
     p[0] = (uint32_t)a->size; p[1] = a->type; p[2] = (uint32_t)a->stride;
@@ -1260,7 +1275,7 @@ static void gexgl_upload_ff_arrays(size_t vertices) {
         }
         glBindBuffer(0x8892u, a->scratch);
         glBufferData(0x8892u, (long)bytes, a->pointer, 0x88E8u /* DYNAMIC_DRAW */);
-        if (i >= 2) CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, 0x84C0u + (i - 2));
+        if (i >= 2 && i < GEXGL_FF_NORMAL) CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, 0x84C0u + (i - 2));
         ff_pointer_command(i, a, 0);
     }
     CMD1(GEXGL_CLIENT_ACTIVE_TEXTURE, 0x84C0u + unit);
@@ -1271,8 +1286,9 @@ static struct ff_array_state *ff_slot_for(unsigned array) {
     switch (array) {
     case 0x8074u: return &ff_arrays[0]; /* GL_VERTEX_ARRAY */
     case 0x8076u: return &ff_arrays[1]; /* GL_COLOR_ARRAY */
+    case 0x8075u: return &ff_arrays[GEXGL_FF_NORMAL]; /* GL_NORMAL_ARRAY */
     case 0x8078u:                       /* GL_TEXTURE_COORD_ARRAY */
-        return client_active_texture < GEXGL_FF_ARRAYS - 2 ? &ff_arrays[2 + client_active_texture] : NULL;
+        return client_active_texture < GEXGL_FF_TEX_UNITS ? &ff_arrays[2 + client_active_texture] : NULL;
     default: return NULL;
     }
 }
@@ -1304,8 +1320,12 @@ void glColorPointer(int size, unsigned type, int stride, const void *pointer) {
     ff_record(1, size, type, stride, pointer);
 }
 void glTexCoordPointer(int size, unsigned type, int stride, const void *pointer) {
-    if (client_active_texture < GEXGL_FF_ARRAYS - 2)
+    if (client_active_texture < GEXGL_FF_TEX_UNITS)
         ff_record(2 + client_active_texture, size, type, stride, pointer);
+}
+/* Three components always; `size` is kept for the upload's element size. */
+void glNormalPointer(unsigned type, int stride, const void *pointer) {
+    ff_record(GEXGL_FF_NORMAL, 3, type, stride, pointer);
 }
 void glClientActiveTexture(unsigned unit) {
     client_active_texture = unit >= 0x84C0u ? unit - 0x84C0u : 0;
