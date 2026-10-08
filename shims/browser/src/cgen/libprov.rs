@@ -305,6 +305,13 @@ pub extern "C" fn gex_cgen_pmod_libprov(number: u32) -> i32 {
     lock(&LIBS).iter().any(|l| l.number == Some(number)) as i32
 }
 
+/// Whether `addr` is one of the return addresses a provider's guest calls push
+/// (its code page, `[entry + 0x100, entry + 0x1000)`).
+pub(crate) fn provider_return(addr: u64) -> bool {
+    let at = THREAD_ENTRY.load(Ordering::Relaxed);
+    at != 0 && addr >= at + 0x100 && addr < at + REVERSE_FIRST
+}
+
 /// `gex.provider_thread_entry()` / `provider_code_page()`.
 #[no_mangle]
 pub extern "C" fn gex_libprov_thread_entry() -> u64 {

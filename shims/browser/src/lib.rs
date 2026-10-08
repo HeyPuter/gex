@@ -6797,9 +6797,10 @@ thread_local! {
 }
 
 /// Whether the syscall being served cannot leave its wasm frames: a wasm32
-/// program's, or a stateful provider's.
+/// program's, a stateful provider's, or guest code a provider called (its
+/// frames are below the call-out).
 fn frames_stay(h: &Host) -> bool {
-    h.kernel.wasm32 || IN_PROVIDER.with(|c| c.get())
+    h.kernel.wasm32 || IN_PROVIDER.with(|c| c.get()) || cgen::provider_callout_open()
 }
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
@@ -10965,6 +10966,17 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 stack.join(", "),
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
             ));
+            // A return a call-out should have caught: the call-outs open, and
+            // the callback depth this Worker is at.
+            let open = cgen::callouts_open();
+            if !open.is_empty() || cgen::libprov::provider_return(pc) {
+                warn_line(&format!(
+                    "[gex] call-outs open: {:x?} (return, sp wanted, callback depth); sp now {sp:#x}; last provider guest calls (target, return, sp): {:x?}\n",
+                    open,
+                    cgen::provider_calls_recent()
+                ));
+                warn_line(&format!("[gex] last lookups (address, index): {:x?}\n", cgen::lookups_recent()));
+            }
             set_exit(h, 128 + 11);
         });
         trap();

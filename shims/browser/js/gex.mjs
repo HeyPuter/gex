@@ -1340,7 +1340,7 @@ export class Gex {
           opts.syscallGuard(ctx >>> 0, pc, this.#memory);
           return e.gex_syscall(ctx, pc);
         }
-        : e.gex_syscall,
+        : this.#guestSyscall(e),
       dispatch_miss: e.gex_dispatch_miss,
       illegal: e.gex_illegal,
       breakpoint: e.gex_breakpoint,
@@ -1564,7 +1564,7 @@ export class Gex {
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
-      syscall: e.gex_syscall,
+      syscall: this.#guestSyscall(e),
       dispatch_miss: e.gex_dispatch_miss,
       illegal: e.gex_illegal,
       breakpoint: e.gex_breakpoint,
@@ -3176,6 +3176,20 @@ export class Gex {
    *  install, a thread to start -- is served here and returns, so the native
    *  frames below it survive, as natively. Anything else (the process or
    *  thread ending, a callback's return) goes on up. */
+  /** Tier-1's `gex.syscall`: the shim's export itself, except in a process with a
+   *  stateful provider, where guest code a provider called (its frames below) stages a
+   *  thread or a child rather than trapping, and the host starts it here. */
+  #guestSyscall(e) {
+    if (!Gex.wasmDlls) return e.gex_syscall;
+    return (ctx, pc) => {
+      e.gex_syscall(ctx, pc);
+      if (e.gex_wasmprog_staged()) {
+        this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+        this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+      }
+    };
+  }
+
   /** A wasm64 provider's `gex.syscall(ctx, pc)` (cgen/libprov.rs): marked, so the shim
    *  serves it without leaving the provider's frames (a blocking call waits in place, a
    *  thread is staged); the host then starts what it staged, and the call returns. */
