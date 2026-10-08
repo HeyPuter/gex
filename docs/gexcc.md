@@ -182,7 +182,12 @@ Toolchain checks:
   library, ctest) and a Meson one (`dependency('zlib')`, `cc.run`,
   `library()`, `meson test`) both build and pass.
 
-**Browser** (shims/browser under Node, `tests/gexcc/run-browser.sh`):
+**Browser** (shims/browser under Node, `tests/gexcc/run-browser.sh`,
+`GEX_ARCH=aarch64` for the AArch64 build's shim):
+- 2026-10-08, both builds alike: 11 of 15 pass; longargs, pathcorners,
+  tcphalfclose and timestamps fail in the browser runtime only (they were
+  written after the last browser check; the browser filesystem and network
+  lack the fixes made natively). To fix.
 - hello, cxx (exceptions, threads), alarmloop (polls deliver SIGALRM, the
   default action kills the child), and three-argument main all match their
   native runs.
@@ -418,8 +423,14 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
 - No game runs on gooner; the corpus is fine here. No timing on gooner.
 - **Demo (§6), state 2026-10-08:**
   - Design: §6.1a (arm64 native from Debian, `musl-linux-wasm32` ours),
-    reported to the coordinator; waiting for the go-ahead before the big
-    builds (tier 2, gex item 1).
+    approved. Item 1 done (0366efa6, gate head given). Item 2 (aarch64
+    ELF providers, re-keys gex-cgen) goes on its own branch off
+    merge/gexcc; the coordinator schedules its landing with U. Item 3:
+    LP64-layout libraries lowered to wasm32 (no memory64).
+  - AArch64-only gexc for testing: `cargo build --release -p gexc
+    --target-dir target/a64`. Note: shims/browser/build.sh rebuilds
+    `target/release/gexc` without x86; rebuild it with `--features gexc/x86`
+    afterwards (gexcc-exec runs it).
   - Debian builder: `tools/gexcc/debian/` (debfetch.py, debsrc.py,
     build.sh, recipes.sh, packages.txt, binpkgs.txt, mkdebs.py). Toolchain
     for it: `~/gex-sandbox/scratch/CC/dtc` (its own sysroot; reinstall as
@@ -587,20 +598,45 @@ arm64 program uninstallable).
   arm64 program get it translated.
 
 **gex work this needs (expected):**
-1. **wasm32 programs in the aarch64 build** (blocking): today the wasm32
-   container path (ELF32, `EM_386`, the i386 syscall personality) exists
-   only in the x86 build; the aarch64 shim refuses it (`NotElf64Le`). The
-   kernel translates i386 numbering into its canonical (generic) one
-   already, so this is un-gating `gex_abi::X86 && compat` for wasm32
-   processes, ELF32 acceptance for wasm32 containers in gex-ld, and the
-   wasmprog ctx layout in an aarch64 build, natively and in the shim.
+1. **wasm32 programs in the aarch64 build: done** (0366efa6). gex-ld
+   accepts a wasm32 container (ELF32 i386 with the `GEXWASM` header) on
+   the AArch64 guest; the kernel keys the i386 ABI on the process
+   (`compat`) instead of the build; `ctx::sp_slot(compat)` (esp is `x(4)`
+   in every build) and `ctx::COMPAT_SCRATCH` (the vector registers of an
+   AArch64 context, which wasm32 programs never use) cover the two layout
+   differences. Checked on an AArch64-only gexc (tests/wasm32 5/5,
+   tests/gexcc 15/15, a wasm32 bash running Debian's arm64 xz, python3.13
+   and sqlite3, python's `os.system` running the wasm32 dash) and on the
+   aarch64 browser shim (tests/wasm32 5/5; tests/gexcc as on x86).
 2. **AAPCS64 ELF providers:** the existing ones are SysV x86-64 only. An
    aarch64 class (x0-x7, v0-v7, `TPIDR_EL0` TLS for errno) in gex-cgen's
    `provider.rs` re-keys every unit: one commit, landed when the
    coordinator schedules it.
-3. **LP64 native libraries** for whole-library providers: a wasm64
-   (memory64) gexcc variant (aarch64 Linux is LP64; `long double` is
-   128-bit on aarch64), measured against the 11.3% memory64 cost XP found.
+3. **arm64-ABI native libraries in the guest's own wasm32 memory** (user,
+   2026-10-08: no memory64 at run time). Whole-library providers for
+   arm64 programs need aarch64's LP64 data layout. Approach to evaluate:
+   - Compile with an LP64 layout matching AAPCS64: clang's wasm64 target
+     for the layout, plus `-funsigned-char`. A layout test compares
+     `sizeof`/`offsetof`/alignment of every exported struct against
+     `aarch64-linux-gnu`: `long double` (16-byte quad), `wchar_t`,
+     `__int128` alignment, bitfields.
+   - Lower to wasm32 before shipping (binaryen `--memory64-lowering`, or
+     the same lowering in gex-cgen): addresses are i64 in the IR and become
+     i32 at each access. Guest addresses stay under 4 GB, so this is safe
+     today.
+   - **The address step is one hook** (one helper or one pass), not an
+     assumption the library code relies on. If memory ever runs short, the
+     plan is the dual heap (a guard on loads and stores of high pointers
+     that routes them to a second 4 GB heap), never memory64, and that
+     guard replaces the hook without changing the approach.
+   - The real work is glibc's aarch64 ABI over musl: opaque type sizes
+     (`pthread_mutex_t`, `sigset_t`), `struct stat`/`dirent`, `jmp_buf`,
+     `FILE` and the `stdin`/`stdout` symbols, `__errno_location`, symbol
+     versions (`memcpy@GLIBC_2.17`), `va_list` adapters (aarch64's is a
+     struct), and callbacks into translated code through the provider
+     guest-call path.
+   - First, measure what the lowering's i64 address arithmetic costs in V8
+     on a small benchmark (edger, browser runtime).
 4. **fjit:** split or refuse functions over V8's size limit; a hotness
    threshold so short processes stay on tier-1.
 
