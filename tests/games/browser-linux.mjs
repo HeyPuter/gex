@@ -179,6 +179,7 @@ async function main() {
   let first = null, start = null, next = 0, playAt = null, shots = 0, nextShot = Date.now() + 30000;
   const profSpec = opt('--profile', null) ? (([at = '300', secs = '20', match = '']) => ({ at: +at, secs: +secs, match }))(opt('--profile').split(',')) : null;
   let profiled = false;
+  let hundredth = null;
   const window = [];
   const end = t0 + minutes * 60000;
   while (Date.now() < end) {
@@ -199,6 +200,12 @@ async function main() {
     if (!first && n > 0) {
       first = Date.now();
       console.log(`ok   first frame ${((first - t0) / 1000).toFixed(0)} s after the page opened`);
+    }
+    // A game may present a frame or two long before its first real one (Muck
+    // does in some runs only): the 100th present is the steadier start.
+    if (!hundredth && n >= 100) {
+      hundredth = Date.now();
+      console.log(`ok   100 presents ${((hundredth - t0) / 1000).toFixed(0)} s after the page opened`);
     }
     if (!start && n >= after) {
       start = Date.now();

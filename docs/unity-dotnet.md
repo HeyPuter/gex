@@ -1750,8 +1750,18 @@ Not yet:
          Vorbis decoder (decode_packed_entry_number, decode_map,
          fmod_tremor_mdct_backward, FMOD::CodecVorbis::readInternal under
          CodecFSB5): audio clips decoded on load.
-       - Why only some runs wait for it is not known yet. The cost is
-         unit-compiled guest code on one thread.
+       - **Resolved (mp24, mp25): no run waits longer; the "first frame"
+         metric is what is bimodal.** In the fast runs Unity presents 2
+         early frames (a 481-word clear/blit shader) at ~71-84 s, during
+         loading. In the slow runs it does not, and the first present is
+         the first real frame.
+       - The real frames start at the same time either way. Presents at
+         ~122 s: 60-72 (fast), 42-93 (slow). At ~153 s: 533-650 in both.
+         The ~37 s FMOD decode is loading time in both modes; profiling
+         30-70 s in each mode shows only the main thread busy
+         (translation), with no FMOD yet.
+       - browser-linux.mjs now also reports `ok   100 presents N s`, the
+         steadier start-up figure.
      - **GL's bind-group fix** (mesa-wink 9f1da0fa, mods/gpe): in mp18,
        presents keep going past 500 s with 0 validation errors.
      - **GL's guest GL gl64q2** (frame-query cache, and an async present
