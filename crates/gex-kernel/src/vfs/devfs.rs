@@ -91,11 +91,14 @@ impl FileHandle for DevHandle {
 pub struct DevFs {
     /// Nodes the host added, by name without a leading slash.
     extra: Vec<(String, Arc<dyn FileHandle>)>,
+    /// Nodes the host added whose every open is a handle of its own (an
+    /// audio device: each open is a stream with its own format and buffer).
+    per_open: Vec<(String, Arc<dyn Fn() -> Arc<dyn FileHandle> + Send + Sync>)>,
 }
 
 impl DevFs {
     pub fn new() -> DevFs {
-        DevFs { extra: Vec::new() }
+        DevFs { extra: Vec::new(), per_open: Vec::new() }
     }
 
     /// Add a device the host provides. The handle is shared, not cloned per
@@ -103,6 +106,19 @@ impl DevFs {
     pub fn add(&mut self, name: &str, handle: Arc<dyn FileHandle>) {
         self.extra.retain(|(n, _)| n != name);
         self.extra.push((name.to_string(), handle));
+    }
+
+    /// Add a device whose every open gets a new handle from `open`.
+    pub fn add_per_open(&mut self, name: &str, open: Arc<dyn Fn() -> Arc<dyn FileHandle> + Send + Sync>) {
+        self.per_open.retain(|(n, _)| n != name);
+        self.per_open.push((name.to_string(), open));
+    }
+
+    /// The OSS audio devices, `dsp` and `mixer` (`oss`: a null output).
+    pub fn add_oss(&mut self) {
+        use super::oss::{OssHandle, OssNode};
+        self.add_per_open("dsp", Arc::new(|| Arc::new(OssHandle::new(OssNode::Dsp)) as Arc<dyn FileHandle>));
+        self.add_per_open("mixer", Arc::new(|| Arc::new(OssHandle::new(OssNode::Mixer)) as Arc<dyn FileHandle>));
     }
 
     fn device_of(path: &str) -> Option<Device> {
@@ -131,9 +147,12 @@ impl FileSystem for DevFs {
         if let Some((_, handle)) = self.extra.iter().find(|(n, _)| n == path) {
             return Ok(Arc::clone(handle));
         }
+        if let Some((_, open)) = self.per_open.iter().find(|(n, _)| n == path) {
+            return Ok(open());
+        }
         if path.is_empty() {
             return Ok(Arc::new(DevDir {
-                extra: self.extra.iter().map(|(n, _)| n.clone()).collect(),
+                extra: self.extra.iter().map(|(n, _)| n.clone()).chain(self.per_open.iter().map(|(n, _)| n.clone())).collect(),
             }));
         }
         Err(Errno::ENOENT)
@@ -142,6 +161,9 @@ impl FileSystem for DevFs {
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         if path.is_empty() {
             return Ok(Metadata::dir());
+        }
+        if let Some((_, open)) = self.per_open.iter().find(|(n, _)| n == path) {
+            return open().metadata();
         }
         if let Some(device) = Self::device_of(path) {
             return Ok(Metadata {

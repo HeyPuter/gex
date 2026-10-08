@@ -111,6 +111,9 @@ for arch in x64 x86; do
     # A loaded DLL mapped again as an image section: the loaded one keeps
     # working (ntdll's Unix calls after the view).
     check $arch/imageview 0 "ok ntdll mapped twice as an image view" "$b/imageview.exe"
+    # Audio out through winmm and mmdevapi: native Wine (W3) only, whose
+    # OSS driver plays into gex's /dev/dsp. GEX_NT_W3=1 runs it.
+    [ -n "${GEX_NT_W3:-}" ] && check $arch/audio 0 "${allok}" "$b/audio.exe"
     # The same as a child process (CreateProcess, waited for): native Wine
     # (W3) only, where a child reads the session through requests; the NT
     # layer has no child processes. GEX_NT_CHILDREN=1 runs it.

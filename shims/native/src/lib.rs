@@ -2409,6 +2409,9 @@ fn mount_filesystems(
         let _ = crate::gl::DEVICE.set(Arc::clone(&dev));
         devfs.add("gex-gl", dev);
     }
+    // Audio (W3.5): OSS's /dev/dsp and /dev/mixer, a null output, for
+    // native Wine's wineoss.drv (and any OSS program).
+    devfs.add_oss();
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
