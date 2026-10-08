@@ -1610,3 +1610,16 @@ Not yet:
        install`. Guest GL: `scratch/unity/gl64-new` (with the MAP_32BIT ring).
      - **Next: B3, Muck in the page on edger** (its opened-files list from a
        native `--strace` run on edger, `scratch/unity/eruns/mk-st/files.txt`).
+  29. **What the ~200 s of start-up with the UnityPlayer unit is (hk-a5,
+     edger, warm, `PROF=1` over the first 240 s):** guest code is only ~7%
+     of the samples. The rest is the host: hash-map inserts and hashing
+     (~12%: the function map's publish/replay), `Table::set` and wasmtime's
+     funcref type checks (~7%: every thread's store installing the unit's
+     55,438 slots as it catches up; Hollow Knight has ~70 threads), the
+     function JIT still translating the other libraries (gex_xlate
+     summaries, regalloc, Cranelift; libc, libstdc++, the game's other .so),
+     and malloc. Levers: install a unit's slots once per process rather than
+     per store (a shared table, or lazy per-slot installs), units for the
+     remaining libraries (libc/libstdc++/libGL-side), and the per-thread
+     replay cost. The page has the same shape (each Worker instantiates
+     every unit), which matters more there.
