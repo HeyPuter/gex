@@ -3189,8 +3189,11 @@ impl Kernel {
     fn sys_read(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
         // Straight into the guest's memory, no intermediate buffer: the guest
         // picks the length and a copy would allocate that much on every call.
-        // Capped at 16 MiB.
-        let len = len.min(1 << 24) as usize;
+        // Capped as Linux caps it (MAX_RW_COUNT): a regular file gives every
+        // byte asked for below that, and programs rely on it (Wine maps a PE
+        // image's sections with one pread each; a 16 MiB cap left the rest of
+        // a 24 MiB .text zero).
+        let len = rw_len(m, buf, len);
         let dst = m.read_mut(buf, len)?;
         self.fds.get(fd)?.read(dst)
     }
@@ -3204,7 +3207,7 @@ impl Kernel {
         off: u64,
     ) -> SysResult {
         // As `sys_read`: the guest's buffer is the destination already.
-        let len = len.min(1 << 24) as usize;
+        let len = rw_len(m, buf, len);
         let dst = m.read_mut(buf, len)?;
         self.fds.get(fd)?.pread(off, dst)
     }
@@ -6928,6 +6931,18 @@ pub fn syscall_name(n: u64) -> &'static str {
     }
 }
 
+/// Linux's per-call limit on read and write sizes (`INT_MAX & PAGE_MASK`).
+const MAX_RW_COUNT: u64 = 0x7fff_f000;
+
+/// A read's length: at most MAX_RW_COUNT, and no further than the guest's
+/// memory goes from `buf` (Linux faults only on a page it touches, so a
+/// length past the end with a short file still reads; a `buf` outside the
+/// memory keeps its length and faults).
+fn rw_len(m: &GuestMem<'_>, buf: u64, len: u64) -> usize {
+    let room = (m.bytes.len() as u64).saturating_sub(buf);
+    (if room == 0 { len.min(MAX_RW_COUNT) } else { len.min(MAX_RW_COUNT).min(room) }) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7236,6 +7251,31 @@ mod tests {
         k.syscall(&mut m, 0);
         assert_eq!(ret(&m, k.ctx_addr), 7);
         assert_eq!(m.read(0x22000, 7).unwrap(), b"payload");
+    }
+
+    /// A regular file gives a read every byte asked for, past 16 MiB too
+    /// (Wine reads a PE section with one pread and trusts the count).
+    #[test]
+    fn a_large_pread_of_a_file_is_not_short() {
+        let mut buf = vec![0u8; 0x40000 + (40 << 20)];
+        let mut k = Kernel::new(0x1000, 0x10000, "/prog".into());
+        k.vfs.mount("/", Arc::new(TmpFs::new()));
+        let mut m = GuestMem::new(&mut buf);
+        put_str(&mut m, 0x20000, "/big");
+        set_args(&mut m, k.ctx_addr, nr::OPENAT, &[(-100i64) as u64, 0x20000, oflags::O_CREAT | oflags::O_RDWR, 0o644]);
+        k.syscall(&mut m, 0);
+        let fd = ret(&m, k.ctx_addr) as u64;
+        let n: u64 = 20 << 20;
+        let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8 + 1).collect();
+        m.write(0x40000, &data).unwrap();
+        set_args(&mut m, k.ctx_addr, nr::WRITE, &[fd, 0x40000, n]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), n as i64);
+        let dst = 0x40000 + (20 << 20);
+        set_args(&mut m, k.ctx_addr, nr::PREAD64, &[fd, dst, n, 0]);
+        k.syscall(&mut m, 0);
+        assert_eq!(ret(&m, k.ctx_addr), n as i64);
+        assert!(m.read(dst, n as usize).unwrap() == &data[..]);
     }
 
     #[test]
