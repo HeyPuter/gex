@@ -1834,6 +1834,41 @@ Steps:
 
 ## 7. State and how to resume (stream W)
 
+**RESUME HERE (2026-10-08 evening, after the reboot).** Branch
+**merge/w3-audio** (wt/w3-boot; master 7a4a62c8 merged): W3.5's OSS null
+audio device (/dev/dsp, /dev/mixer), inet socket fixes (port at bind,
+SHUT_WR, MSG_PEEK), tests/nt attachwin. Wine fork `wasm32-w3` 3710abbd462
+(mw): **explorer's desktop is its own process again** (child processes see
+the session through requests now); `WINEGEX_DESKTOP_THREAD=1` keeps the old
+desktop thread. Why: a DllMain that makes a window holds the loader lock,
+and the desktop thread needed that lock to start (Retrocycles and Katana
+ZERO hung, "loader_section wait timed out"). Fix in the same commit: the
+desktop process (explorer /desktop) does not start another explorer when its
+lazily loaded null driver asks for the desktop window (it did: a chain of
+seven explorers).
+- Dists: `$W/w3dist-a` (the current loader + every W3 program skeleton,
+  wineboot included: games), `$W/w3dist-s` (the current loader over the
+  suite's dll dir without wineboot.exe, so a test doesn't boot the prefix:
+  `W3_DIST=$W/w3dist-s $W/check-w3-gate.sh wt/w3-boot`, output
+  `$W/w3chk4.out`). `$W/w3dist` stays the merge/w3-boot gate's.
+- Games: `$W/gamekit` (gexc, dist -> w3dist-a, the installed prefix,
+  inputs), `gamekit/games.sh` runs Retrocycles, Undertale and Katana ZERO
+  on edger through bench.sh; results in edger's `$W/gameout/<slug>`
+  (summary, log, frames/, frames.txt: frame number and time, for fps).
+- **Pitfall: never stage a W3 prefix with symbolic links into a shared
+  prefix.** stage-native.sh links the DLLs into ~/.cache/gex/wine-11.15;
+  under W3, wineboot writes system32 with CREATE_ALWAYS, which follows the
+  link and overwrites the shared file, and wineserver deletes on close by
+  the realpath() of the name it opened (server/fd.c), so a DeleteFile on a
+  linked file deletes the shared target (2026-10-08: 4 DLLs overwritten and
+  22 programs deleted in gooner's default prefix; the coordinator restored
+  them from edger's). `$W/deref-pfx.sh PREFIX` replaces those links with
+  copies; stage-w3.sh calls it. Any symlinked prefix is unsafe under
+  native Wine. (gooner's and edger's default prefixes have no
+  drive_c/windows/Fonts though the manifest lists 56 fonts: never staged,
+  not from this.)
+
+
 **RESUME HERE (2026-10-06, after a Claude Code restart).** `$W` =
 `~/gex-sandbox/scratch/W`. Run `. ~/gex-sandbox/scratch/env.sh` first.
 `gexc run` does not pass the host environment: `--env HOME=...`.
