@@ -572,7 +572,9 @@ export async function runProgram(
       xwaylandUrl: new URL('/gex/xwayland/Xwayland.mjs', location.href).href,
       hostwlUrl: new URL('/gex/xwayland/gexhostwl.wasm', location.href).href,
       keymapUrl: new URL('/gex/xwayland/gex.xkm', location.href).href,
-      kernel: { module: kernel.module, memory: kernel.memory },
+      // The X server's own memory is a wasm32 one, so with `?mem64=1` it takes the
+      // wasm32 build of the kernel (same kernel memory, other process-memory type).
+      kernel: { module: m64Infix() ? await WebAssembly.compile(await fetchBytes(`/gex/gex_kernel${archInfix()}.wasm`)) : kernel.module, memory: kernel.memory },
       wlChannel,
       // A name in the scene arena that no guest pid can collide with: pids
       // count up from 1, and this is 'xwl1' as ASCII.
