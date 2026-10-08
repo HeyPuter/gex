@@ -16,6 +16,8 @@ const m64 = () => !!globalThis.GEX_MEM64;
 const LIMIT64_BYTES = 16 * 2 ** 30;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
+/** An index into the function table: a table64 (BigInt indices) beside a 64-bit memory. */
+const tIdx = (v) => (m64() ? BigInt(v) : v);
 
 /**
  * Decode UTF-8 out of guest memory.
@@ -886,7 +888,7 @@ export class Gex {
         call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
         // An AOT-only fallback whose target this Worker has just installed
         // (cgen.rs `gex_ftab_fallback`): called as a function body.
-        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(idx >>> 0)(ctx, depth, need, ret),
+        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -2466,7 +2468,9 @@ export class Gex {
       rm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_ftab_runtime_len() >>> 0)));
       this.#sharedModules.set('ftab-runtime', rm);
     }
-    const ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
+    // A table64 beside a 64-bit memory: every module of such a process (units, translations,
+    // providers) addresses its function table with i64.
+    const ftab = new WebAssembly.Table(m64() ? { element: 'anyfunc', address: 'i64', initial: 0n } : { element: 'anyfunc', initial: 0 });
     const lookup = (ctx, addr) => {
       if (e.gex_ftab_behind()) this.#cgenCatchUp();
       const idx = e.gex_ftab_lookup(ctx, addr);
@@ -2491,7 +2495,7 @@ export class Gex {
     const ri = new WebAssembly.Instance(rm, { gex });
     this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri] };
     this.#cgenGrow();
-    ftab.set(1, e.gex_ftab_fallback);
+    ftab.set(tIdx(1), e.gex_ftab_fallback);
     return this.#cgen;
   }
 
@@ -2501,7 +2505,8 @@ export class Gex {
   #cgenGrow() {
     const st = this.#cgen;
     const want = (this.#shim.exports.gex_ftab_size() >>> 0) + 65536;
-    if (st.ftab.length < want) st.ftab.grow(want - st.ftab.length, st.resolve);
+    const have = Number(st.ftab.length);
+    if (have < want) st.ftab.grow(tIdx(want - have), st.resolve);
   }
 
   /** Install unit `u` into this Worker: instantiate it with `__table_base` =
@@ -2538,13 +2543,14 @@ export class Gex {
       env: {
         memory: this.#memory,
         __indirect_function_table: st.ftab,
-        __table_base: new WebAssembly.Global({ value: 'i32', mutable: false }, base | 0),
-        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, memBase),
+        // i64 in a 64-bit memory's process (wasm64 PIC modules).
+        __table_base: new WebAssembly.Global({ value: m64() ? 'i64' : 'i32', mutable: false }, m64() ? BigInt(base >>> 0) : base | 0),
+        __memory_base: new WebAssembly.Global({ value: m64() ? 'i64' : 'i32', mutable: false }, m64() ? BigInt(memBase) : memBase),
         // A unit's functions never use clang's shadow stack (those are stubs),
         // but a position-independent module imports its pointer all the same.
         // A stateful provider's is this Worker's (one C stack per thread).
         // A wasm32 program sets its own at each thread's entry.
-        __stack_pointer: memBase && !wasmprog ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+        __stack_pointer: memBase && !wasmprog ? this.#providerStack() : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
       },
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
@@ -2616,7 +2622,7 @@ export class Gex {
       // a C longjmp).
       provider_try: (f, arg) => {
         try {
-          ftab.get(f >>> 0)(arg);
+          ftab.get(m64() ? BigInt(f) : f >>> 0)(arg);
           e.gex_provider_note(0);
           return 0;
         } catch (err) {
@@ -2751,7 +2757,7 @@ export class Gex {
       const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
       const kind = Number(ev >> 32n), v = Number(ev & 0xffffffffn);
       if (kind === 1) this.#cgenInstall(e.gex_ftab_install_unit(v) >>> 0, e.gex_ftab_install_base(v) >>> 0);
-      else if (kind === 2) st.ftab.set(v, st.resolve);
+      else if (kind === 2) st.ftab.set(tIdx(v), st.resolve);
       st.have++;
       e.gex_cgen_have(st.have);
     }

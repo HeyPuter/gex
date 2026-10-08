@@ -410,15 +410,15 @@ fn stats_line(modules: u64, functions: u64, recover_us: u64, emit_us: u64, bytes
 
 
 /// Microseconds since the first call, for the translation statistics. 0 on
-/// wasm32-unknown-unknown, where `std::time::Instant` panics (the browser's
+/// wasm32/wasm64-unknown-unknown, where `std::time::Instant` panics (the browser's
 /// function JIT); its stats then report no time.
 fn now_us() -> u64 {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     {
         static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
     }
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     {
         0
     }

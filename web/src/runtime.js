@@ -669,6 +669,8 @@ export async function runProgram(
       denseDebug: !!globalThis.GEX_DENSE_DEBUG,
       // `?mem64=1`: every Worker of the process builds or joins a 64-bit memory.
       mem64: globalThis.GEX_MEM64 ? 1 : undefined,
+      // `?fjit=1`: the function JIT in every process.
+      fjit: globalThis.GEX_FJIT || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,

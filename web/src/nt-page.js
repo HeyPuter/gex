@@ -113,6 +113,8 @@ async function main() {
   if (q.get('trapstack')) globalThis.GEX_TRAP_STACK = 1;
   // `?mem64=1`: a 64-bit guest memory (the wasm64 shim; docs/mem64.md step 6).
   if (q.get('mem64') === '1') globalThis.GEX_MEM64 = 1;
+  // `?fjit=1`: the function JIT (gexc run --fjit's browser half, fjit.rs).
+  if (q.get('fjit')) globalThis.GEX_FJIT = Number(q.get('fjit')) || 1;
   if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
   // cgen=1|2 (prefer|require units), in the unguarded flavor of i386 units
