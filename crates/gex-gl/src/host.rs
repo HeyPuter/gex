@@ -779,18 +779,31 @@ impl Gl {
                 eglBindAPI(EGL_OPENGL_ES_API);
                 return Err("no desktop OpenGL EGL config".into());
             }
-            // Core only when asked for, from 3.2 (where profiles begin).
-            let core = !compat && (major > 3 || (major == 3 && minor >= 2));
-            let mut ctx_attrs = vec![
-                EGL_CONTEXT_OPENGL_PROFILE_MASK,
-                if core { EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT } else { EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT },
-            ];
-            if major > 3 || (major == 3 && minor > 0) {
-                ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MAJOR_VERSION, major as EGLint]);
-                ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MINOR_VERSION, minor as EGLint]);
+            // A compatibility context even when the guest asks for core, and
+            // core only where the host has no compatibility context of that
+            // version. The guest names its own objects (the wire protocol lets
+            // it), and a core profile refuses to bind a buffer, texture or
+            // vertex array name glGen* did not return: every glBindBuffer of
+            // Muck's (a GL 4.x core client) failed with INVALID_OPERATION,
+            // and nothing drew. A compatibility profile is a superset of core
+            // for what a core client calls; the guest library answers
+            // GL_CONTEXT_PROFILE_MASK with what the client asked for.
+            let attrs_for = |core: bool| {
+                let mut a = vec![
+                    EGL_CONTEXT_OPENGL_PROFILE_MASK,
+                    if core { EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT } else { EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT },
+                ];
+                if major > 3 || (major == 3 && minor > 0) {
+                    a.extend_from_slice(&[EGL_CONTEXT_MAJOR_VERSION, major as EGLint]);
+                    a.extend_from_slice(&[EGL_CONTEXT_MINOR_VERSION, minor as EGLint]);
+                }
+                a.push(EGL_NONE);
+                a
+            };
+            let mut context = eglCreateContext(self.display, config, std::ptr::null_mut(), attrs_for(false).as_ptr());
+            if context.is_null() && (major > 3 || (major == 3 && minor >= 2)) {
+                context = eglCreateContext(self.display, config, std::ptr::null_mut(), attrs_for(true).as_ptr());
             }
-            ctx_attrs.push(EGL_NONE);
-            let context = eglCreateContext(self.display, config, std::ptr::null_mut(), ctx_attrs.as_ptr());
             if context.is_null() {
                 eglBindAPI(EGL_OPENGL_ES_API);
                 return Err(format!("no desktop OpenGL context: {:#x}", eglGetError()));
@@ -815,7 +828,7 @@ impl Gl {
             self.unpack_store = PixelStore::default();
             self.current_on = Some(std::thread::current().id());
             self.compat = Compat::load();
-            self.desktop = Some((major, minor, !core));
+            self.desktop = Some((major, minor, compat || !(major > 3 || (major == 3 && minor >= 2))));
             self.vendor = gl_string(0x1F00);
             self.renderer = gl_string(0x1F01);
             self.version = gl_string(0x1F02);
@@ -1861,6 +1874,15 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One host GL test at a time: they share the native decoder's name
+    /// tables (gexgl_native_name/gexgl_native_object, process-wide), so two
+    /// running in parallel mapped each other's framebuffer names and the
+    /// parallel workspace run flaked (3 runs in 15 on master ac269692).
+    fn gl_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
     use crate::proto::{client_api, op, Batch};
 
     // The handful of GL constants a test needs, spelled out rather than
@@ -1896,6 +1918,7 @@ mod tests {
     /// the host's GL: Retrocycles crashed Mesa that way).
     #[test]
     fn client_side_indices_come_with_the_draw() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(64, 64) {
             Ok(g) => g,
             Err(e) => {
@@ -1956,6 +1979,7 @@ mod tests {
     /// thread that made it, and `cargo test` runs threads in parallel.
     #[test]
     fn a_command_stream_draws_a_triangle_and_reads_it_back() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(64, 64) {
             Ok(g) => g,
             Err(e) => {
@@ -2059,6 +2083,7 @@ mod tests {
 
     #[test]
     fn a_shader_that_does_not_compile_says_why() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(16, 16) {
             Ok(g) => g,
             Err(_) => return,
@@ -2081,6 +2106,7 @@ mod tests {
 
     #[test]
     fn an_unknown_opcode_stops_the_batch_rather_than_being_skipped() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(16, 16) {
             Ok(g) => g,
             Err(_) => return,
@@ -2108,6 +2134,7 @@ mod tests {
     /// mode, the matrix stack and display lists all run.
     #[test]
     fn a_desktop_context_runs_fixed_function() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(16, 16) {
             Ok(g) => g,
             Err(e) => {
@@ -2170,6 +2197,7 @@ mod tests {
     /// guest chose.
     #[test]
     fn a_framebuffer_object_renders_to_a_texture() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(16, 16) {
             Ok(g) => g,
             Err(e) => {
@@ -2215,6 +2243,7 @@ mod tests {
     /// answer with the guest's names.
     #[test]
     fn a_desktop_context_takes_framebuffer_names_it_never_generated() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(16, 16) {
             Ok(g) => g,
             Err(e) => {
@@ -2282,6 +2311,7 @@ mod tests {
     /// and scaling, a loaded matrix, the current color and the alpha test.
     #[test]
     fn protocol_11_client_arrays_and_fixed_function_matrices() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(16, 16) {
             Ok(g) => g,
             Err(e) => {
@@ -2439,6 +2469,7 @@ mod tests {
     /// separate blend functions (opcodes that already existed).
     #[test]
     fn protocol_12_attribute_stack_and_uniform_vectors() {
+        let _serial = gl_lock();
         let mut gl = match Gl::new(16, 16) {
             Ok(g) => g,
             Err(e) => {
