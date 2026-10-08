@@ -114,6 +114,13 @@ addresses under `--mem64`.
   These re-key every unit, so they go in **one commit**, and the
   coordinator schedules its landing between E/F measurement series. New
   provider `.c` sources don't re-key anything.
+- **aarch64 (2026-10-08):** a source's first line names its architecture
+  (`i386`, `x86_64` or `aarch64`), and `provider::guest_arch` picks the
+  ones for the build's guest. `providers/aapcs64.inc` in front of an
+  x86-64 body makes its `gp64_` helpers mean AAPCS64 (x0-x7, x0/v0, x30):
+  `glibc_mem_a64` and `glibc_math_a64` are built that way (no x86
+  fingerprint moves). A later `GEX_PROVIDE` of an export replaces an
+  earlier one (aarch64's strcmp, `glibc_mem_a64.inc`).
 - Switches: `GEX_PROVIDERS=0` and `GEX_PROVIDER_SKIP`, as for PE.
   `GEX_PROVIDER_TRACE` lists the bindings.
 
