@@ -1531,3 +1531,15 @@ Not yet:
        elsewhere without a word until the process exited. A pin that lands
        elsewhere is now said when it happens (`[pin] PATH WANTED X GOT Y`).
        Unit builds should pick a base with base+span below 0x80000000.
+  26. **Thread waits, first look (hk-s1, `GEXGL_SUBMIT_TRACE=1`):** the GL
+     transport is not it. Hollow Knight's menu makes about one submit per
+     frame (the first 5,000 submits came over ~5,600 presents; 81% of them
+     follow PRESENT, the rest are glGet*-style replies), so the render thread
+     does not wait on GL round trips. Main thread 60% of a core plus render
+     thread 30% at 29 presents/s is a frame of ~34 ms of which the two
+     threads' work adds up to ~31 ms: Unity runs them close to serially
+     (the main thread waits for the previous frame's render before the next).
+     Faster code on either thread is what moves the frame; on the native
+     host that is the units (5%) and the provider. Since the browser is the
+     target and its costs differ (V8 instead of Cranelift, the page's GL),
+     the next frame-time work belongs in the page (P5).
