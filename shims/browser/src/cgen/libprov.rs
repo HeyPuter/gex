@@ -232,9 +232,70 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
 }
 
 /// The module bytes of provider module `number` when it is a replaced
-/// Linux library's (`gex_cgen_pmod_wasm_ptr`/`len`).
+/// Linux library's, or a JIT reservation's placeholder (`gex_cgen_pmod_wasm_ptr`/`len`).
 pub(crate) fn wasm(number: u32) -> Option<(u32, u32)> {
-    lock(&LIBS).iter().find(|l| l.number == Some(number)).map(|l| (l.wasm.as_ptr() as usize as u32, l.wasm.len() as u32))
+    if let Some(r) = lock(&LIBS).iter().find(|l| l.number == Some(number)).map(|l| (l.wasm.as_ptr() as usize as u32, l.wasm.len() as u32)) {
+        return Some(r);
+    }
+    lock(&RESERVES).iter().find(|(n, _)| *n == number).map(|(_, w)| (w.as_ptr() as usize as u32, w.len() as u32))
+}
+
+/// The JIT's reserved table ranges: (provider module number, placeholder module).
+static RESERVES: Mutex<Vec<(u32, Vec<u8>)>> = Mutex::new(Vec::new());
+
+/// `gex.provider_jit_reserve(n)` (docs/unity-dotnet.md P5 B2, the native
+/// `wasmjit`): a range of the process's function table for the provider's
+/// JIT, every Worker's filled with the JIT-call placeholder as it catches up.
+/// Returns the range's first index.
+#[no_mangle]
+pub extern "C" fn gex_libprov_jit_reserve(n: u64) -> u64 {
+    let wasm = placeholder_module(n as u32);
+    let number = lock(&PROVIDERS).len() as u32;
+    let install = ftab(|t| t.publish(n as u32, PROVIDER | number, Tier::Unit, &[]));
+    lock(&PROVIDERS).push(ProviderModule { file: "wasmjit:reserve".into(), regs: Vec::new(), dirs: Vec::new(), slots: 0, memory_base: 0 });
+    lock(&RESERVES).push((number, wasm));
+    ftab(|t| t.install(install).base) as u64
+}
+
+/// A module of `n` copies of the JIT-call placeholder (the browser's
+/// `mono_jiterp_placeholder_jit_call`, `(ret_sp, sp, ftndesc, thrown)`, which
+/// stores 999 through `thrown`: "not here yet"), filling the function table
+/// from `__table_base`, as the native host makes it.
+fn placeholder_module(n: u32) -> Vec<u8> {
+    use wasm_encoder::*;
+    let mut m = wasm_encoder::Module::new();
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I64; 4], []);
+    m.section(&types);
+    let mut imports = ImportSection::new();
+    imports.import(
+        gex_abi::ftab::PIC_MODULE,
+        "memory",
+        MemoryType { minimum: 0, maximum: Some(gex_abi::LIMIT64_PAGES), memory64: true, shared: true, page_size_log2: None },
+    );
+    imports.import(
+        gex_abi::ftab::PIC_MODULE,
+        gex_abi::ftab::PIC_TABLE,
+        TableType { element_type: RefType::FUNCREF, table64: true, minimum: 0, maximum: None, shared: false },
+    );
+    imports.import(gex_abi::ftab::PIC_MODULE, gex_abi::ftab::PIC_TABLE_BASE, GlobalType { val_type: ValType::I64, mutable: false, shared: false });
+    m.section(&imports);
+    let mut funcs = FunctionSection::new();
+    funcs.function(0);
+    m.section(&funcs);
+    let mut elems = ElementSection::new();
+    let idx: Vec<u32> = vec![0; n as usize];
+    elems.active(Some(0), &ConstExpr::global_get(0), Elements::Functions(idx.into()));
+    m.section(&elems);
+    let mut code = CodeSection::new();
+    let mut f = Function::new([]);
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I32Const(999));
+    f.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
+    f.instruction(&Instruction::End);
+    code.function(&f);
+    m.section(&code);
+    m.finish()
 }
 
 /// Whether provider module `number` is a replaced Linux library's: its
