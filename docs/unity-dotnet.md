@@ -1810,14 +1810,36 @@ Not yet:
        | hb1 | -UnityPlayer.so | black |
        | hb2 | -UnityPlayer.so,-libc.so.6 | black |
        | hb3 | +none.so (JIT on, no object) | menu |
-       | hb4 | +libxcb.so.1,+libX11.so.6 | pending |
+       | hb4 | +libxcb.so.1,+libX11.so.6 | menu (lit 59k from ~210 s; the last readback only black) |
 
-       So JIT-compiled code is involved, and it is outside UnityPlayer and
-       libc. hp1's crash (libxcb's input queue length -8, then a memcpy of
-       -8 bytes) points at the X libraries. Native HK with the browser's
-       layouts (`GEX_CGEN_EXP=WASMFLAT`, hk-wf1) is fine. Remaining
-       browser-only differences: V8 versus Cranelift compiling the same
-       wasm, and Workers.
+       The compositor's lit-pixel count (every 30 s in the log; ~5179 is
+       the title bar alone, ~59k the menu) separates two things the last
+       readback's brightness mixed up: hb1, hb2 and hp5 are never lit,
+       while hb4 draws the menu and only its final frame is dark. So the X
+       libraries are not the cause; hp1's libxcb crash (`_xcb_in_read_block`
+       copying `queue_len` = -8 bytes) stays open.
+       - **These rules leaked:** `?fjitlibs=` was checked only on tier-1
+         dispatch misses (`serve`), not on `gex.lookup` misses, so JIT code
+         calling through a pointer or a PLT slot translated any object
+         (hb1 and hb2 still JIT-compiled UnityPlayer and libc that way).
+         841b380b checks the rules at every translation and takes
+         `name@lo-hi` (hex offsets into the mapping, as traps print them).
+       - Next with the strict rules: hb6 `+libGL.so.1` (the guest GL;
+         rendering black while presents continue points at the GL stream),
+         hb7 `-libGL.so.1`. `hk-bis.sh` now prints the lit timeline too.
+       - Native xbig (`scratch/unity/xbn/run.sh`, big X replies across
+         many socket reads) passes with `--fjit`, `--fjit --mem64` and
+         `GEX_CGEN_EXP=WASMFLAT`; the page runs of it (xb1, xb2) never
+         printed (the old xbig printed only at the end; it now reports
+         progress).
+     - **hp6 (no fjit, `elfunits=UnityPlayer.so`) did not use the unit:**
+       UnityPlayer mapped at 0x10752000, not 0x11752000. The function
+       JIT's heap spans come from the arena cursor the guest's mappings
+       use, so its 16 MiB chunk moved every later mapping in hp1. hp6 is a
+       no-unit run: first frame 108 s, 100 presents 183 s, menu 15.7-16.0
+       presents/s (hp4: 108 s, 185 s, 15.2-15.6). 841b380b adds
+       `?pins=path@base+span` (the closure pins, `gex_pin_object`); hp7
+       pins `UnityPlayer.so@11752000+2674000`.
      - The page keeps the guest's output (`shots/NAME/out.txt`), and
        hk-page.sh passes `-logFile -`, so HK's player log is in it.
      - The HK UnityPlayer unit for 0x11752000 is built and staged on
