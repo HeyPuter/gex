@@ -6,14 +6,61 @@ worktree `wt/glpath`, scratch `~/gex-sandbox/scratch/GL` (`$G` below).
 
 ## Resume
 
-- State (2026-10-07 evening): E2 done; CLIENT_ARRAY (bdb682d9), the
-  decoder report fix and opt-in WebGPU counters (21baa051), E3 map rules
-  (bcc93e30) and five more fast-path GL calls (430acec7) committed on
-  merge/glpath. E4 (web/mesa-wasm-cross.ini: SIMD, ThinLTO, -O3 link) is in
-  the worktree, uncommitted: commit after a browser GL gate with a Mesa
-  built from it. Not yet measured: the normal gexc page (needs a unit cache
-  at merge/glpath's keys on edger), and 430acec7 on the page (the eject
-  project must rebuild the nt_unixcall provider and the trampolines' unit).
+Final state (2026-10-08). Stream GL is closed. It was meant to be transient,
+and this section is what a later stream needs to pick it up.
+
+**Landed on merge/glpath** (gate head 4955a441; for gex master):
+- E2 diagnosis, CLIENT_ARRAY (bdb682d9), the decoder report fix and opt-in
+  WebGPU counters (21baa051), E3 map rules (bcc93e30), five more fast-path
+  GL calls (430acec7), E4 cross file (c5e6dddb: SIMD, ThinLTO, -O3 link).
+- Host op timing and `crates/gex-gl/examples/replay.rs` (4fda5dd0).
+- The guest's framebuffer state-query cache (85c3bb78,
+  tests/gl-state-query-cache.sh).
+- Desktop `#version` 410-460 fitted to the context's GLSL (707e84b8, a
+  stopgap until the page's context is 4.6).
+- Async present at swap interval 0 (7605de5c).
+- The native host makes compatibility contexts for core requests
+  (c39706ba; fixes gl-map-buffer 0/3 and native Muck).
+- The decoder's full 4.1-4.6 requirement report (e204fa1b; its device-limits
+  request is backed out by 32f58c4e).
+- Serial host GL tests (7d7e45a8).
+
+**On mesa-wink `gl/perf` in `$G/mesa-wink`, awaiting the user's approval to
+push** (rebased onto upstream wink 0dd84167; nothing pushed):
+- 062f46a0 (was 6d3a4cfd): the pipeline cache's own epoch.
+- 523362aa: zink/ntv never lets Tint fold -0.0 into 0.0.
+- 60202246: the gex-wasm targets compile webgpu.cpp as C++20 (needed by
+  emdawn v20250822).
+- 9f1da0fa was dropped in the rebase, because upstream's `handle_epoch` is
+  the same fix. The pre-rebase branch is `gl/perf-5f5572e`.
+- gex's pin (third_party/mesa) is still wink 5f5572e6. Moving it also needs
+  web/build-mesa-wasm.sh on emdawnwebgpu v20250822 (wink/build.sh fetches it).
+
+**Open items:**
+1. *Device limits leave black silhouettes.* With the adapter's limits
+   (e204fa1b's web/src/gpu-device.js and mesa-wgpu-replay.html) the context
+   is GL 4.6, but Muck's 3D scene is black with a cyan sea (U mp26, and mp28
+   with the -0.0 fix: 0 Tint rejections, 30 presents/s against 47 at GL 4.0).
+   This is not rejected programs. Suspect Unity's 4.x lighting/shadow
+   variants (compute or image paths that only 4.3+ enables).
+   Resume:
+   - capture a GL 4.6 Muck trace (`?glcapture=`);
+   - replay it with `replay-run.mjs gpu TRACE --query readback=1`;
+   - bisect the shader variants with `shaders.mjs`;
+   - then re-apply e204fa1b's two web files.
+2. *Grass is still dots* at GL 4.0 after the -0.0 fix (U mp27; the sea is
+   back). Next: the geometry-shader emulation's output for the grass program
+   (its source is in the Muck trace; `shaders.mjs`). It may resolve with
+   item 1 at GL 4.1+, where Unity's 410 source compiles natively.
+3. *Noita's world fps* is bound by its job hand-off, not by GL: the main
+   thread is parked about 37% waiting on job threads, and KLock is 0.14%
+   (stream F's area). The page's GL submit is no longer the limit
+   (CLIENT_ARRAY: 55.5 vs 51.1 world fps on the old path, pewasm 47.2).
+4. Remaining E1: GL draw/pointer calls are on the fast path, but the page
+   gain is below noise.
+
+Tooling (unchanged):
+
 - Live A/B harness for the ejected page: `$G/patch-site.mjs SITE PAGE OUT
   LAUNCHER` swaps a site's page (shim, kernel, Mesa, JS) for one built by
   web/build-eject-page.sh, keeping its units; the page must come from the
@@ -352,3 +399,29 @@ current gexc; U's 10-04 gl64 works. Reported to U.
 - **Muck's page with the guest GL changes (U, mp23):** 46.8-47.6 presents/s
   against 24.2-25.3 (mp19); the async present at swap interval 0 is nearly
   all of it.
+
+## mesa-wink gl/perf rebased onto upstream wink 0dd84167 (2026-10-08)
+
+- **Rebase.** One conflict: gex_wgpu_screen.c, where upstream's
+  `handle_epoch` met gl/perf's pipeline epoch. Both are kept: upstream's
+  resets the emitted handles, and `pipeline_epoch` keys the pipeline cache.
+  9f1da0fa was dropped, because upstream's `handle_epoch` is the same fix.
+- **Build.** The rebased tree builds against emdawnwebgpu v20250822, the
+  first release with WGPUTextureFormat_R16Unorm. Its webgpu.cpp uses
+  std::span, so the gex-wasm targets need C++20 (60202246).
+- **Checks on the rebased build (mods/gpu):**
+  - browser-gui --gl, composited x86 and x64: 131 and 134 frames, 0 failures.
+  - browser-gui --gl with direct=1, x86 and x64: 198 and 197 frames,
+    0 failures.
+  - softpipe gl-replay on tests/gl-traces: gears 210 batches PASS,
+    program-setup 3 batches PASS.
+- **Hardware replays (edger, `urep4.sh`).** Before is gpn (gl/perf on wink
+  5f5572e6 with the -0.0 fix); after is gpu (rebased).
+  - Correctness: identical readback digests on both traces (Noita 92f095c5,
+    HK 9eece5c5), with 0 rejects and 0 validation errors in each.
+  - Noita world trace, CPU ms per frame over the last 600 frames: gpn 5.90
+    and 4.78, gpu 5.04 and 5.20. No change outside the noise.
+  - HK menu trace, same measure: gpn 5.03 (its second leg hung until the
+    timeout), gpu 6.24 and 6.61. That looks up to 25% slower, but the
+    readback pass points the other way (gpn 7.07, gpu 6.71 ms). Repeat it
+    before moving the pin: `urep4.sh`'s hk timing block.
