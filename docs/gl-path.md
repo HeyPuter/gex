@@ -262,3 +262,23 @@ simulation). So the frame is bound by the hand-off between the main thread
 and the simulation workers, not by GL and not by one thread's code: the
 next lever is the guest's own threading (F's side: wake latency of
 cond_wait/park, and the simulation's per-frame critical path).
+
+**The normal gexc page** (tests/nt/browser-noita.mjs through
+`$G/np/nplegs.sh`: wt/glpath at merge/glpath, units built at the branch's
+keys into target/bm-gl (`$G/build-bm.sh`, seeded from F's bm-s objects:
+all 3127 noita.exe objects reused), seed pinned, 4x clock; world fps from
+the stats lines, world-up+30 s to the end; legs n1/n2 ran 213 s with F's
+default worker profile at 60-90 s, n3/n4 only ~50 s because `PROF=none`
+trips browser-noita's AOT-share check, which then ends the run):
+
+| arm | n1 | n2 | n3 | n4 | mean |
+| --- | --- | --- | --- | --- | --- |
+| CLIENT_ARRAY (default) | 48.6 | 59.8 | 61.0 | 52.5 | 55.5 |
+| `GEX_NT_GL_CLIENT_ARRAYS=buffer` | 49.3 | 49.9 | 48.9 | 56.1 | 51.1 |
+| pewasm | 45.9 | 45.2 | 49.5 | 48.0 | 47.2 |
+
+The normal page is 1.18 times pewasm's world fps (55.5 against 47.2), and
+the new path's mean is 9% above the old one's, but the legs spread over
+48-61 world fps, so that difference is not established. A proper ABBA
+needs longer legs without the profile and with the AOT check satisfied
+(keep a short profile window, or relax NOITA_MIN_AOT for such runs).
