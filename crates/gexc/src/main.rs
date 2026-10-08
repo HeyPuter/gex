@@ -326,7 +326,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--profile" => opts.profile = true,
             "--wayland" => {
                 i += 1;
-                opts.wayland = Some(args.get(i).context("--wayland needs a path")?.clone());
+                // Lexically normal: the compositor's name is bound as given,
+                // and a client's connect resolves `.` and `..` first, so
+                // `dir/../wl` would never meet its bound name.
+                opts.wayland = Some(normal_path(args.get(i).context("--wayland needs a path")?));
             }
             "--wayland-size" => {
                 i += 1;
@@ -2467,4 +2470,34 @@ fn stdin_ready() -> bool {
     // SAFETY: one valid pollfd, no timeout.
     let n = unsafe { libc::poll(&mut p, 1, 0) };
     n != 0 && (n < 0 || p.revents != 0)
+}
+
+/// `path` with `.` components, repeated slashes and `name/..` pairs removed,
+/// without touching the file system (`..` above the root stays at the root).
+fn normal_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| *p != "..") => {
+                parts.pop();
+            }
+            ".." if path.starts_with('/') => {}
+            c => parts.push(c),
+        }
+    }
+    let joined = parts.join("/");
+    if path.starts_with('/') { format!("/{joined}") } else if joined.is_empty() { ".".into() } else { joined }
+}
+
+#[cfg(test)]
+mod normal_path_tests {
+    #[test]
+    fn dot_dot_and_dots_go() {
+        assert_eq!(super::normal_path("/a/b/../c/./wl"), "/a/c/wl");
+        assert_eq!(super::normal_path("/a//b/"), "/a/b");
+        assert_eq!(super::normal_path("/../x"), "/x");
+        assert_eq!(super::normal_path("a/../../wl"), "../wl");
+        assert_eq!(super::normal_path("wl"), "wl");
+    }
 }
