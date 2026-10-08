@@ -416,10 +416,310 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
     to mw.
   - Don't edit crates/gex-cgen without asking.
 - No game runs on gooner; the corpus is fine here. No timing on gooner.
-- **Next:**
+- **Demo (§6), state 2026-10-08:**
+  - Design: §6.1a (arm64 native from Debian, `musl-linux-wasm32` ours),
+    reported to the coordinator; waiting for the go-ahead before the big
+    builds (tier 2, gex item 1).
+  - Debian builder: `tools/gexcc/debian/` (debfetch.py, debsrc.py,
+    build.sh, recipes.sh, packages.txt, binpkgs.txt, mkdebs.py). Toolchain
+    for it: `~/gex-sandbox/scratch/CC/dtc` (its own sysroot; reinstall as
+    above with `dtc` as PREFIX). Work area `scratch/CC/debian`
+    (`src/`, `stage/`, `logs/`, `built.txt`, `pool/` = the .debs); Debian
+    downloads cached in `scratch/CC/deb` (dists/, pool/, src/).
+    ```sh
+    . ~/gex-sandbox/scratch/env.sh; export GEXCC_PREFIX=~/gex-sandbox/scratch/CC/dtc
+    systemd-run --user --scope -q -p TasksMax=4096 -p MemoryMax=32G nice -n 19 \
+      env JOBS=12 tools/gexcc/debian/build.sh tier1     # or source package names
+    ```
+  - Tier 1 builds completely (31 source packages, 28 binary packages,
+    7.8 MB of .debs, 43.4 MiB installed, 7.4 MB as tar.zst -19).
+  - The arm64/amd64 benchmark: `scratch/CC/archbench` (run.sh, roots,
+    edger results e2/e3).
+  - Next: rootfs assembly (dpkg status, Debian's `all` packages, /etc,
+    apt sources and pins), gex item 1 (wasm32 in the aarch64 build), the
+    page demo; then tier 2.
+- **Next (corpus):**
   1. Rerun the corpus clean.
   2. coreutils, bash, make.
   3. perl, python3 (recipes written), curl+mbedtls, libevent+tmux, vim,
      fmt (C++), openssh, git.
   4. The loopback TCP EPIPE/hang.
   5. Measure GexPoll's cost on edger.
+
+## 6. Demo: a native Debian rootfs (plan, 2026-10-08)
+
+Goal (user, 2026-10-08): a slim but usable Debian root filesystem whose
+userland is built from Debian's sources with gexcc into native wasm32
+programs (not translated x86 binaries), plus developer tools and GUI apps,
+booting in the browser page. Native gexc is for debugging; numbers come
+from edger (bench.sh).
+
+### 6.1 What "Debian" means here
+
+- **Release:** trixie (13.7 on 2026-09-12). `InRelease` verified with the
+  host's `debian-archive-keyring`, `Sources.xz` checked against it, every
+  `.dsc` against `Sources`, every tarball against its `.dsc`
+  (`tools/gexcc/debian/debsrc.py`; binaries: `debfetch.py`, same chain
+  through `Packages.xz`).
+- **Sources:** Debian source packages as Debian ships them:
+  `dpkg-source -x` unpacks the orig tarball and applies `debian/patches`.
+  Our changes on top are small patch files per package
+  (`tools/gexcc/debian/patches/PKG/*.patch`), applied after Debian's.
+- **Not `dpkg-buildpackage`:** `debian/rules` cross-builds through
+  `dpkg-architecture`, debhelper and build-profiles, none of which know a
+  wasm32 musl architecture. Each package gets a recipe
+  (`tools/gexcc/debian/recipes.sh`) that runs its own build system with
+  gexcc and the configure options `debian/rules` uses, minus what we lack
+  (selinux, audit, systemd; nls where it costs size).
+- **Binary packages:** each recipe installs into a staging tree; the staged
+  files are split into Debian's binary package names and written as real
+  `.deb`s with `dpkg-deb --build`. Control fields come from `debian/control`
+  and `debian/changelog`.
+
+### 6.1a Two architectures: arm64 from Debian, wasm32 from us (user, 2026-10-08)
+
+Requirements: apt is in the rootfs and works (`apt update`, `apt install X`
+against real Debian mirrors, through gex's network path); what apt
+downloads are Debian's **arm64** builds, run translated; our gexcc packages
+live in a separate repository that apt never overwrites.
+
+**Why arm64, measured** (edger, browser runtime under Node, Debian trixie's
+own arm64 and amd64 builds of the same versions, whole-process wall time,
+median of 3, ABBA; `scratch/CC/archbench`, 2026-10-08):
+
+| workload | fjit arm64 | fjit amd64 | tier-1 arm64 | tier-1 amd64 |
+|---|---|---|---|---|
+| `xz --version` (start-up) | 3.48 s | 9.28 s | 1.62 s | 1.77 s |
+| `xz -6` of 5.3 MB | 9.70 s | 16.10 s | 9.61 s | 12.15 s |
+| `gzip -6` of 5.3 MB | 3.00 s | 10.76 s | 2.42 s | 3.39 s |
+| python3.13, dict/sort/fib | 17.16 s | crash | 10.39 s | 13.84 s |
+| sqlite3, 100k rows | 12.52 s | 24.58 s | 10.84 s | 12.61 s |
+| lua5.4, fib/sort | 5.11 s | 10.69 s | 5.83 s | 7.82 s |
+
+- arm64 is faster than amd64 in every case: on tier-1 by 9-29% (e.g.
+  python 10.39 s against 13.84 s), with fjit by 1.6-3.6 times (gzip 3.00 s
+  against 10.76 s). The user's claim holds.
+- amd64 python3.13 under fjit crashes: one translated function (CPython's
+  eval loop) is 8,298,855 bytes, over V8's 7,654,321-byte function limit.
+  An fjit bug (sent to the coordinator).
+- For short command-line runs fjit is slower than tier-1 on both
+  architectures (arm64 `xz --version` 3.48 s against 1.62 s, python
+  17.16 s against 10.39 s): its compile cost is not repaid in a few
+  seconds. The shell demo runs translated programs on tier-1 unless a
+  program is known to be long-running.
+
+**dpkg's architectures.**
+- Native architecture **arm64**: apt fetches Debian's arm64 index and
+  packages as native, its dependency resolution unmodified. `dpkg
+  --print-architecture` says arm64. Until our own dpkg and apt are built,
+  dpkg, apt, perl-base, debconf and sqv are Debian's arm64 builds,
+  translated.
+- Foreign architecture **`musl-linux-wasm32`** (`dpkg --add-architecture`;
+  the name dpkg's tables give a musl wasm32 tuple) for every package we
+  build. Tested with the host's dpkg: accepted, and an arm64 package's
+  `Depends: coreutils (>= 9.7)` is satisfied by
+  `coreutils:musl-linux-wasm32`.
+
+**How arm64 packages' dependencies are satisfied.**
+- **Tools** (bash, coreutils, dash, grep, sed, tar, gzip, findutils,
+  diffutils, debianutils, mawk, hostname, ncurses-bin, util-linux,
+  bsdutils, bsdextrautils, sysvinit-utils, base-files, base-passwd, and
+  later perl, python3, git...) are ours, `Multi-Arch: foreign`, so they
+  satisfy any architecture's dependency by name. Version = Debian's +
+  `+gex1` (above that Debian revision and its `+debNuM` point updates).
+- **Libraries** (`Multi-Arch: same`: libc6, libzstd1, libtinfo6...): an
+  arm64 program's ld.so loads arm64 ELF objects, so these are Debian's
+  arm64 packages, installed by apt as usual. The dpkg database stays true.
+  Native code reaches them through gex's loader, not through dpkg (below).
+- **Essential:** `apt dist-upgrade` installs missing Essential packages of
+  the native architecture. Our repository carries every Essential tool by
+  name and the pins below stop the arm64 copies; simulated against the
+  real trixie arm64 index, `dist-upgrade` then pulls only libraries and the
+  arm64 system pieces the rootfs ships anyway (dpkg, apt, perl-base,
+  debconf, sqv, libc-bin, ca-certificates), and `apt install python3 git
+  vim` (128 packages) touches none of ours.
+
+**Pinning** (`/etc/apt/preferences.d/gex-native`):
+```
+Package: bash:arm64 coreutils:arm64 ... (every package name we ship)
+Pin: release *
+Pin-Priority: -1
+
+Package: *
+Pin: release o=gex
+Pin-Priority: 1001
+```
+Libraries are deliberately not pinned (pinning libc6:arm64 makes every
+arm64 program uninstallable).
+
+**Repositories** (`/etc/apt/sources.list.d/`):
+- `debian.sources`: `Types: deb`, `URIs: http://deb.debian.org/debian`
+  (https once the guest's TLS is checked), `Suites: trixie
+  trixie-updates`, plus `trixie-security`, `Architectures: arm64`,
+  `Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg`.
+- `gex.sources`: our repository, `Architectures: musl-linux-wasm32`,
+  Origin `gex`, Suite `trixie`, signed by a gex archive key
+  (`/usr/share/keyrings/gex-archive-keyring.gpg`; `trusted=yes` only for
+  local test builds). Layout: `dists/trixie/{InRelease,Release}`,
+  `dists/trixie/main/binary-musl-linux-wasm32/Packages.xz`,
+  `pool/main/<initial>/<srcpkg>/*.deb`. In the rootfs it is a `file:`
+  repository at `/var/lib/gex-apt`; the page serves the same tree beside
+  the rootfs, so packages not preinstalled (tier 2 extras) can be fetched
+  on `apt install` once the page exposes its own origin to the guest
+  (a host name the page's network layer answers with `fetch()` instead of
+  Wisp).
+
+**The loader path for translated programs.**
+- An arm64 program execs as today: gex maps it and Debian's
+  `ld-linux-aarch64.so.1` (translated), which maps Debian's arm64
+  `libc.so.6`, `libz.so.1`, ...
+- When an object maps, gex's ELF-provider hook (docs/elf-providers.md)
+  binds native code over its exports, by soname and versioned symbol:
+  first glibc's mem*/str*, printf family and libm, as the x86-64 providers
+  do now; later whole libraries (zlib, zstd, lzma, sqlite, pcre2, expat:
+  pure-C ABIs) built by gexcc for an LP64 layout; finally the whole libc
+  (merge-plan §10.1). Unbound exports keep running translated, so this
+  degrades to correct.
+- The providers ship as a package of ours (`gex-providers`, files under
+  `/usr/lib/gex/providers/`), so they are versioned with the rootfs.
+- Our native programs link musl statically and need no loader. A
+  translated program that execs `/bin/sh` gets our dash; ours that exec an
+  arm64 program get it translated.
+
+**gex work this needs (expected):**
+1. **wasm32 programs in the aarch64 build** (blocking): today the wasm32
+   container path (ELF32, `EM_386`, the i386 syscall personality) exists
+   only in the x86 build; the aarch64 shim refuses it (`NotElf64Le`). The
+   kernel translates i386 numbering into its canonical (generic) one
+   already, so this is un-gating `gex_abi::X86 && compat` for wasm32
+   processes, ELF32 acceptance for wasm32 containers in gex-ld, and the
+   wasmprog ctx layout in an aarch64 build, natively and in the shim.
+2. **AAPCS64 ELF providers:** the existing ones are SysV x86-64 only. An
+   aarch64 class (x0-x7, v0-v7, `TPIDR_EL0` TLS for errno) in gex-cgen's
+   `provider.rs` re-keys every unit: one commit, landed when the
+   coordinator schedules it.
+3. **LP64 native libraries** for whole-library providers: a wasm64
+   (memory64) gexcc variant (aarch64 Linux is LP64; `long double` is
+   128-bit on aarch64), measured against the 11.3% memory64 cost XP found.
+4. **fjit:** split or refuse functions over V8's size limit; a hotness
+   threshold so short processes stay on tier-1.
+
+**Network.** Wisp, already in gex: the page's `WispNetwork`
+(web/src/net.js), the kernel's socket shapes and its own DNS answers
+(crates/gex-kernel/src/net.rs: a private address per name, mapped back to
+the name when the guest connects, so apt's getaddrinfo works over a
+TCP-only proxy). The demo's default endpoint is `wss://anura.pro/`
+(user's), overridable with `?wisp=`. https goes through the guest's own TLS
+(apt's OpenSSL). Test loops never use the public endpoint: natively gexc
+has real sockets, and repeated runs go to a local HTTP mirror of the
+cached trixie subset (`scratch/CC/deb`) instead of deb.debian.org.
+
+### 6.2 Packages, in tiers
+
+Tier 1, the shell (first milestone):
+bash, dash, coreutils (single binary, symlinks), mawk (Debian's Essential awk), sysvinit-utils,
+util-linux (the basics:
+`more`, `column`, `kill`, `getopt`, `script`, `cal`, `hexdump`, `lsblk`
+not), grep, sed, gawk, findutils, diffutils, tar, gzip, xz-utils, bzip2,
+less, ncurses (libs + `tput`, `clear`, `reset`), procps (`ps`, `top`,
+`free`, `uptime`, `pgrep`, `kill`), debianutils (`which`, `run-parts`,
+`tempfile`), hostname, nano, vim (vim-tiny-sized `vim` with the Debian
+runtime trimmed), file (+ libmagic), base-files, base-passwd,
+sensible-utils, ncurses-base, tzdata (trimmed). Libraries: zlib, libbz2,
+liblzma, libzstd, libmd, readline, pcre2, libacl/libattr where needed.
+Help: `--help` everywhere; `man` (man-db + groff + libpipeline + gdbm) is
+tier 2 since groff is C++ and large.
+
+Tier 2, developer tools:
+git (local clone/commit/log/diff; `git-remote-http` needs curl), python3.13
+(stdlib trimmed: no test/, idlelib, tkinter, ensurepip), perl 5.40
+(perl-base + perl-modules), make, sqlite3, lua5.4, jq, tree, patch, bc, ed,
+strace-free: `gdb` not. tmux (libevent, ptys), htop (needs /proc), man-db,
+dpkg itself (in the guest: `dpkg -l`, `dpkg -S`), apt if its dependency set
+(OpenSSL, xxhash, lz4, zstd, gcrypt-free in 3.0) builds; curl + OpenSSL or
+mbedtls (network over Wisp in the page). A C compiler in the guest: tcc
+targeting i386 (its output then runs translated) is the cheap option;
+clang/wasm-ld as wasm32 programs (gexcc in the guest) the impressive one,
+about 80-100 MB of wasm, decided after measuring.
+
+Tier 3, GUI (gex's Wayland compositor; Xwayland for X11, never Xvfb):
+- Wayland: foot (wayland, libxkbcommon, pixman, fcft, freetype, fontconfig,
+  tllist, utf8proc), wayland-utils; fonts-dejavu-core.
+- SDL2 (Wayland backend; software rendering, GLES through gex-gl's EGL):
+  chocolate-doom with freedoom (SDL2_mixer, SDL2_net), maybe another small
+  game.
+- X11 under Xwayland (`hostx=1` in the page): libX11, libxcb, Xt, Xaw, Xmu,
+  Xext, Xrender; xterm, x11-apps (xeyes, xclock), xcalc.
+- GTK 3 (glib, cairo, pango, harfbuzz, fribidi, gdk-pixbuf, epoxy, atk)
+  only if tiers 1-3 above are done: it is the biggest dependency graph.
+
+Not attempted: ripgrep (Rust has no wasm32 Linux musl target; would need
+`-Zbuild-std` and a custom target), systemd, anything needing kernel
+modules or real devices.
+
+### 6.3 Build layout
+
+- `tools/gexcc/debian/`:
+  - `debsrc.sh SRCPKG...`: fetch (deb.debian.org pool, cached in
+    `$GEXCC_DEB/src`), verify, `dpkg-source -x`, our patches.
+  - `recipes.sh`: `build_SRCPKG` per source package (like the corpus
+    recipes), installing into `$STAGE/SRCPKG`; libraries also into the
+    gexcc sysroot so later packages link them.
+  - `split.py`: staging tree to binary packages to `.deb`
+    (`dpkg-deb --build --root-owner-group`), `Architecture:
+    musl-linux-wasm32`.
+  - `rootfs.sh TIER`: fetch the `all` debs, unpack everything, write the
+    dpkg database and `/etc`, trim (docs, locales, man pages kept for
+    shipped commands only), and write `rootfs.tar` plus `rootfs.tar.zst`.
+  - `packages.txt`: the tiers above, one source package per line with its
+    binary packages.
+- Builds run in `systemd-run --user --scope -p TasksMax=4096 -p
+  MemoryMax=32G nice -n 19`, configure in cross mode (§2: runs nothing it
+  builds). Checks run inside one gexc (`guest`).
+- Reproducible: Debian versions pinned in `packages.txt` (a newer point
+  release changes the pin explicitly), our patches in the tree, one
+  command per tier (`tools/gexcc/debian/build.sh TIER OUT`).
+
+### 6.4 The page
+
+A new demo, `native-debian` ("Debian, native wasm"), on the aarch64 page
+(arm64 programs translated beside our wasm32 ones: needs §6.1a item 1;
+until then the shell tier is tried on the x86 page, where wasm32 programs
+already run): fetch `rootfs.tar.zst`
+(decoded with zstddec), boot `/bin/bash -l` as pid 1 with `TERM`, `PATH`,
+`HOME=/root`, uid 0. The GUI apps reuse the wayland demo's compositor
+canvas and `hostx=1`; a launcher (`gex-apps` menu in the shell, and page
+buttons) starts them. `?cmd=` runs one command for tests.
+
+Size budget (zstd, transferred): tier 1 at most 15 MB, tier 1+2 at most
+45 MB, everything at most 80 MB. If the whole-tar load is too slow, split
+into a base tar and per-package tars fetched when first opened (the
+kernel's demand-fill hook).
+
+Startup (edger, bench.sh, Chrome headless): page open to bash prompt; the
+first exec of each program pays a WebAssembly compile (bash about 1 MB,
+python about 6 MB of wasm); measured, then cut with a compiled-module
+cache shared across Workers (exists) and, if needed, ahead-of-page
+compilation of the hot set while the rootfs downloads.
+
+### 6.5 Expected gex gaps
+
+- See §6.1a for the arm64 items (wasm32 in the aarch64 build, AAPCS64
+  providers, LP64 libraries, fjit).
+- Browser: exec/fork churn of a login shell (bash's startup forks for
+  `$(...)` in Debian's `/etc/bash.bashrc` and profile.d); module compile
+  per distinct program; the 2 GiB arena per process (python, git fine).
+- ptys and job control for tmux, htop, vim, nano (`/dev/ptmx`, `TIOCSCTTY`,
+  `SIGWINCH` from the page's terminal size).
+- `/proc` coverage for procps/htop (`/proc/PID/stat`, `statm`, `status`,
+  `/proc/meminfo`, `/proc/stat`, `/proc/uptime`, `/proc/loadavg`).
+- `getpwnam` etc. through musl reading `/etc/passwd` (fine);
+  locales: musl's C.UTF-8 only.
+- dlopen: python extension modules and perl XS are linked in statically
+  (Setup.local / static_ext); gexcc's shared-library archives make the
+  rest link.
+- GUI: wl_shm + xdg-shell clients against gex-wayland; fcft/fontconfig
+  file access; SDL2's Wayland backend; X11 clients' unix socket to the
+  page's Xwayland.
+- Program sizes: every program links libc statically; coreutils as one
+  binary keeps that once.
