@@ -117,6 +117,8 @@ async function main() {
   if (q.get('fjit')) globalThis.GEX_FJIT = Number(q.get('fjit')) || 1;
   // `?wasmdlls=soname=path,...`: shared objects replaced by wasm64 providers (cgen/libprov.rs).
   if (q.get('wasmdlls')) globalThis.GEX_WASM_DLLS = q.get('wasmdlls');
+  // `?elfunits=name,...`: shared objects that get function-tier units (with `?cgen=1`).
+  if (q.get('elfunits')) globalThis.GEX_ELF_UNITS = q.get('elfunits');
   if (q.get('dense') === '0') globalThis.GEX_DENSE = 0;
   if (q.get('dense') === '2') globalThis.GEX_DENSE = 2;
   // cgen=1|2 (prefer|require units), in the unguarded flavor of i386 units

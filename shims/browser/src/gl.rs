@@ -67,6 +67,36 @@ thread_local! {
     /// The part of that spent waiting for the previous, unwaited batch
     /// (`GEX_GL_SUBMIT_ASYNC`) to finish: the page says, `gex_gl_note_wait_ns`.
     pub(crate) static GL_WAIT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// A submit the ioctl took but left for after the kernel's lock
+    /// (`submit_pending`): (ring address, unwaited).
+    static PENDING: std::cell::Cell<Option<(u32, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Set by `gex_syscall` around its locked dispatch, which calls
+    /// `submit_pending` after: only there is a submit left for later.
+    pub(crate) static DEFER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn submit_now(ring: u32, unwaited: bool) -> i32 {
+    let t0 = crate::now_ns();
+    let r = if unwaited { unsafe { gl_submit_async(ring) } } else { unsafe { gl_submit(ring) } };
+    GL_NS.with(|g| g.set(g.get() + crate::now_ns().saturating_sub(t0)));
+    r
+}
+
+/// The submit the GL device's ioctl took, done now that the kernel's lock
+/// is released (`gex_syscall`): a synchronous submit waits for the page to
+/// run the batch, and under the lock every other thread's syscall waited
+/// with it (Muck's main thread spent 39% of its time on KLOCK while the
+/// render thread submitted, mp16). On failure the call's result becomes
+/// -EIO in `ctx`'s rax.
+pub(crate) fn submit_pending(ctx_addr: u64) {
+    let Some((ring, unwaited)) = PENDING.with(|p| p.take()) else { return };
+    if submit_now(ring, unwaited) < 0 {
+        let mut m = GuestMem::new(crate::guest_bytes());
+        let _ = m.write_u64(ctx_addr + gex_abi::ctx::x(0) as u64, (-(Errno::EIO.0 as i64)) as u64);
+    }
 }
 
 /// From the page's GL bridge: how long a submit waited for the batch before
@@ -121,13 +151,16 @@ impl FileHandle for GlDevice {
                 if m.read(arg, 32).is_err() {
                     return Some(Err(Errno::EFAULT));
                 }
-                let t0 = crate::now_ns();
-                let r = if request & 0xffff_ffff == GEX_GL_SUBMIT_ASYNC {
-                    unsafe { gl_submit_async(arg as u32) }
-                } else {
-                    unsafe { gl_submit(arg as u32) }
-                };
-                GL_NS.with(|g| g.set(g.get() + crate::now_ns().saturating_sub(t0)));
+                let unwaited = request & 0xffff_ffff == GEX_GL_SUBMIT_ASYNC;
+                // One left over (a path that did not finish it): now, in order.
+                if let Some((ring, u)) = PENDING.with(|p| p.take()) {
+                    submit_now(ring, u);
+                }
+                if DEFER.with(|d| d.get()) {
+                    PENDING.with(|p| p.set(Some((arg as u32, unwaited))));
+                    return Some(Ok(0));
+                }
+                let r = submit_now(arg as u32, unwaited);
                 Some(if r < 0 { Err(Errno::EIO) } else { Ok(0) })
             }
             GEX_GL_LIMITS => Some(m.write_u32(arg, MAX_BATCH).map(|()| 0)),

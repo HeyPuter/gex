@@ -804,6 +804,8 @@ export class Gex {
   static watchDir = -1;
   /** `soname=path,...` (the page's `?wasmdlls=`): libraries replaced by wasm64 providers. */
   static wasmDlls = '';
+  /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
+  static elfUnits = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -2532,6 +2534,13 @@ export class Gex {
    *  providers (cgen/libprov.rs). */
   #libprovConfig() {
     const e = this.#shim.exports;
+    if (Gex.elfUnits && e.gex_cgen_elf_units) {
+      const b = new TextEncoder().encode(Gex.elfUnits);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_cgen_elf_units(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
     if (!Gex.wasmDlls || !e.gex_libprov_config) return;
     const b = new TextEncoder().encode(Gex.wasmDlls);
     const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
@@ -2671,6 +2680,7 @@ export class Gex {
       : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
       : (b, c) => e.gex_cgen_regs(u, b, c);
     const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : jit >= 0 ? e.gex_fjit_slots(jit) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
+    const tInst = performance.now();
     const inst = new WebAssembly.Instance(mod, {
       env: {
         memory: this.#memory,
@@ -2731,6 +2741,9 @@ export class Gex {
     // The first Worker to install a JIT module writes the directory for the
     // pages it numbered (idempotent).
     if (jit >= 0) e.gex_fjit_installed(jit);
+    // What each Worker pays to install a unit (instantiation fills its slots).
+    const ms = performance.now() - tInst;
+    if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
     return regs.length / 2;
   }
 
@@ -2782,10 +2795,13 @@ export class Gex {
     const tag = this.#providerTag();
     return {
       provider_try: (f, arg) => {
+        // The guest calls a raise unwinds are no longer open.
+        const calls = e.gex_libprov_guest_calls();
         try {
           ftab.get(f)(arg);
           return 0;
         } catch (err) {
+          e.gex_libprov_guest_calls_set(calls);
           if (err instanceof WebAssembly.Exception && err.is(tag)) return err.getArg(tag, 0);
           throw err;
         }
@@ -2793,6 +2809,8 @@ export class Gex {
       provider_throw: (code) => {
         throw new WebAssembly.Exception(tag, [code]);
       },
+      // The shim's export itself: a wasm-to-wasm call on every guest call.
+      provider_guest_call: e.gex_libprov_guest_call,
       provider_missing: (addr) => e.gex_libprov_missing(addr),
       provider_thread_entry: () => e.gex_libprov_thread_entry(),
       provider_code_page: () => e.gex_libprov_thread_entry(),

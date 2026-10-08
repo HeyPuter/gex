@@ -635,6 +635,9 @@ fn register64(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "provider_thread_register", |caller: Caller<'_, HostState>, in_guest: i64, stop: i64| {
         guest_stop().register(caller.data().thread.tid as u32, in_guest as u64, stop as u64);
     })?;
+    // A provider's guest call begins or ends: natively a blocking call waits
+    // in place anyway (the browser keeps the count: cgen/libprov.rs).
+    linker.func_wrap(IMPORT_MODULE, "provider_guest_call", |_caller: Caller<'_, HostState>, _delta: i32| {})?;
     linker.func_wrap(IMPORT_MODULE, "provider_park", |caller: Caller<'_, HostState>| {
         let mem = caller.data().memory.clone();
         if let Some(m) = mem {

@@ -22,6 +22,8 @@ export const STATE = join(process.env.TMPDIR || '/tmp', `gex-nt-browser-${proces
 mkdirSync(STATE, { recursive: true });
 
 export const log = (s) => process.stderr.write(`[nt-browser] ${s}\n`);
+/** When this harness started: console lines say how far in they came. */
+const T0 = Date.now();
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -245,7 +247,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
       ? !/^\[mesa-gl\] gex-gl: gl[A-Z]/.test(text)
       : p.type === 'warning' && /gex-nt|gex-wgpu|wine:|\[gex\]|panic|trap/i.test(text);
     if ((wanted || process.env.GEX_NT_BROWSER_VERBOSE) && printed++ < 20000) {
-      log(`console[${sid?.slice(0, 6)}] ${text.slice(0, 4000)}`);
+      log(`console[${sid?.slice(0, 6)} @${((Date.now() - T0) / 1000).toFixed(1)}s] ${text.slice(0, 4000)}`);
     }
   });
   browser.on('Runtime.exceptionThrown', (p, sid) => log(`exception[${sid?.slice(0, 6)}] ${p.exceptionDetails?.exception?.description ?? p.exceptionDetails?.text}`));
@@ -312,8 +314,9 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   await browser.send('Page.navigate', { url }, page);
   // A CPU profile of each Worker whose script URL contains `match`, over
   // `ms`: [{ url, profile }] (Chrome's .cpuprofile shape).
-  const profile = async (match, ms) => {
-    const sids = [...targets].filter(([, u]) => u.includes(match)).map(([s]) => s);
+  // `withPage`: the page's own (main) thread too, first, as url 'page'.
+  const profile = async (match, ms, withPage = false) => {
+    const sids = [...(withPage ? [page] : []), ...[...targets].filter(([, u]) => u.includes(match)).map(([s]) => s)];
     for (const s of sids) {
       await browser.send('Profiler.enable', {}, s);
       await browser.send('Profiler.setSamplingInterval', { interval: 250 }, s);
@@ -323,7 +326,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     const out = [];
     for (const s of sids) {
       const { profile } = await browser.send('Profiler.stop', {}, s);
-      out.push({ url: targets.get(s), profile });
+      out.push({ url: s === page ? 'page' : targets.get(s), profile });
     }
     return out;
   };

@@ -6050,6 +6050,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // warm process. The per-number census above stays behind the heartbeat.
     let began = now_ns();
     SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A GL submit is taken under the lock and done after it (gl.rs).
+    gl::DEFER.with(|d| d.set(true));
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -6590,6 +6592,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     });
+    gl::DEFER.with(|d| d.set(false));
+    gl::submit_pending(ctx as u32 as u64);
     {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);

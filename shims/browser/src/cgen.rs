@@ -1430,7 +1430,7 @@ thread_local! {
 /// code running now has the provider's wasm frames below it, which a trap to
 /// JS's run loop would abandon.
 pub(crate) fn provider_callout_open() -> bool {
-    CALLOUTS.with(|c| c.borrow().iter().any(|&(r, _, _)| libprov::provider_return(r)))
+    libprov::guest_call_open() || CALLOUTS.with(|c| c.borrow().iter().any(|&(r, _, _)| libprov::provider_return(r)))
 }
 
 /// [`LOOKUP_RING`], for a diagnostic.

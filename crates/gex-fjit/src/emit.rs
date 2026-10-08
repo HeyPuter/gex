@@ -140,6 +140,40 @@ fn flags() -> RegSet {
 /// Blocks above which a function is laid out flat in the browser (see `emit`).
 const FLAT_ABOVE: usize = 1500;
 
+/// Nesting (`nest_bound`) above which a function is laid out flat in the
+/// browser: each level is a `tree`/`within`/`node` frame on the Worker's
+/// stack, a few hundred bytes to a few KB each.
+const NEST_MAX: usize = 200;
+
+/// An upper bound on the structured emission's recursion depth: `tree(x)`
+/// nests one `within` per merge child, and `x`'s code goes on into its
+/// dominator-tree children (inline or after a merge's block).
+fn nest_bound(s: &cfg::Shape) -> usize {
+    let n = s.idom.len();
+    let mut d = vec![0usize; n];
+    // The deepest non-merge dominator-tree child (emitted inline from `node`).
+    let mut inline = vec![0usize; n];
+    let mut top = 0;
+    for &x in s.rpo.iter().rev() {
+        let ys = &s.merge_children[x];
+        let k = ys.len();
+        // `within` nests once per merge child; `tree(ys[i])` runs at
+        // `k - 1 - i` of them, `node(x)` under all `k`.
+        let mut v = k + 1 + inline[x];
+        for (i, &y) in ys.iter().enumerate() {
+            v = v.max(k - i + d[y]);
+        }
+        d[x] = 1 + v;
+        let p = s.idom[x];
+        if p == x || p >= n {
+            top = top.max(d[x]);
+        } else if !s.merge[x] {
+            inline[p] = inline[p].max(d[x]);
+        }
+    }
+    top.max(d.iter().copied().max().unwrap_or(0))
+}
+
 pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -> Option<Emitted> {
     let n = f.blocks.len();
     // The body's graph: the blocks, then one handover node per outlined
@@ -159,8 +193,12 @@ pub fn emit(m: &ModuleCx<'_>, f: &Function, loops: &[Loop], stats: &mut Stats) -
     // of thousands of blocks (UnityPlayer has them) overflowed it
     // ("Maximum call stack size exceeded" in `tree`/`within`/`node`). Such a
     // function is laid out flat there.
+    // The block count alone missed some (mp9: Muck's UnityPlayer still
+    // overflowed), so the nesting is bounded too (`nest_bound`).
     let too_deep = cfg!(target_family = "wasm") && succs.len() > FLAT_ABOVE;
-    let mut layout = match (!too_deep).then(|| cfg::make_reducible(graph)).flatten() {
+    let fixed = (!too_deep).then(|| cfg::make_reducible(graph)).flatten();
+    let fixed = fixed.filter(|fx| !cfg!(target_family = "wasm") || nest_bound(&fx.shape) <= NEST_MAX);
+    let mut layout = match fixed {
         Some(fx) => {
             if !fx.dispatch.is_empty() {
                 stats.irreducible += 1;
