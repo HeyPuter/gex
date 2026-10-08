@@ -1625,10 +1625,12 @@ Not yet:
      every unit), which matters more there.
   30. **B3, Muck in the page, first run (2026-10-08, edger Chromium 153,
      WebGPU on the P620; `scratch/unity/page/muck-page.sh NAME MINUTES`, run
-     through bench.sh; no function JIT, .NET interpreter; aa4b35e1):** Muck
+     through bench.sh; no function JIT, the .NET wasm JIT (on by default in
+     mono.wasm; this item first said interpreter, wrongly); aa4b35e1):** Muck
      boots on the .NET provider in the page, first frame 79 s after the page
      opened, 11.5 presents/s from ~300 s to ~700 s (native edger, warm
-     caches, interpreter: first present 151.6 s, menu 43.0 presents/s).
+     caches, .NET JIT, mk-j1: first present 154.6 s, menu 38.6 presents/s;
+     so the page is about 3.4x slower in presents/s than native).
      Then a WebGPU validation error in Mesa's gex_wgpu stops drawing: "Bind
      group layout [draw VS:GLSL19/FS:GLSL19 g0] ... does not match layout
      [draw VS:GLSL4/FS:GLSL4 g0] of bind group [draw VS:GLSL20/FS:GLSL20 g0]"
@@ -1647,3 +1649,25 @@ Not yet:
      Staging on edger: `scratch/unity/page/muck-bcl` (the run's BCL + 
      mono.wasm), `muck-files.txt` (host files from a native `--strace`), the
      worktree synced to edger without `target/`.
+  31. **Visual check, fjit retry, B4 (2026-10-08, ff0456a2):**
+     - The compositor reads its output back (`Compositor.readout()`,
+       `readoutBase64()`); `browser-linux.mjs` writes it as `cNNN.png`
+       next to each 30 s screenshot. mp9's show the empty desktop with the
+       cursor (it never presented: below).
+     - mp9 (`--fjit`) overflowed a Worker's stack in gex-fjit's emitter
+       again: the 1,500-block cut misses deeply nested functions. Now the
+       structured layout is also refused in the browser when `nest_bound`
+       (an upper bound on the `tree`/`within`/`node` recursion over the
+       dominator tree) exceeds 200; such functions are laid out flat.
+     - B4: `?elfunits=SO,...` (with `?cgen=1`) places the natively built
+       unit of a listed ELF object at the bias it maps at
+       (`libprov::elf_unit_maps`, keyed as natively; served from
+       `GEX_CGEN_CACHE` at `/gex-cgen/`). Muck's UnityPlayer unit at
+       0x7000000: 76,412 functions, 3,805 C units, 142 MiB wasm, 1,687 s to
+       build on gooner; staged on edger in
+       `scratch/unity/units/cgen-page`.
+     - Queued on edger: mp11 (`--fjit`, .NET JIT), mp12 (`--fjit`, .NET
+       interpreter via `PAGE_ENV=GEXMONO_WASM_JIT=0`), mp13 (`--fjit` plus
+       `--query 'cgen=1&elfunits=UnityPlayer.so'`, `GEX_CGEN_CACHE` set).
+       Results in `scratch/unity/page/NAME.log`, shots in
+       `scratch/unity/page/shots/NAME` (on edger).
