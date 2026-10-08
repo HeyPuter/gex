@@ -224,6 +224,12 @@ main (int argc, char **argv)
 	}
 	pthread_join (t, NULL);
 	printf ("worker thread: %d bad of 640\n", worker_bad);
+	P clears = mono_class_get_method_from_name (k, "Clears", 1);
+	int cn = 300;
+	void *clargs [1] = { &cn };
+	P clr = mono_runtime_invoke (clears, NULL, clargs, &exc);
+	check ("Clears", exc);
+	printf ("%s\n", mono_string_to_utf8 (clr));
 	/* The liveness walk Unity's UnloadUnusedAssets runs: every Leaf reachable from the root,
 	 * each reported once, in batches of at most 16. */
 	P lvg = mono_class_get_method_from_name (k, "LvGraph", 1);
