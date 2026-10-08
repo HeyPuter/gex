@@ -84,8 +84,10 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
     if let Some(u) = super::libprov::maps(mapped) {
         lock(&QUEUE).push_back(u);
     }
+    // Function-tier units for listed shared objects (libprov.rs, B4).
+    let unit = super::libprov::elf_unit_maps(mapped);
     if !on() {
-        return !lock(&QUEUE).is_empty();
+        return unit || !lock(&QUEUE).is_empty();
     }
     if PID.load(Ordering::Acquire) == 0 {
         PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
@@ -153,7 +155,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         };
         lock(&QUEUE).push_back(u);
     }
-    !lock(&QUEUE).is_empty()
+    unit || !lock(&QUEUE).is_empty()
 }
 
 /// Whether install `i` is an export provider's module.

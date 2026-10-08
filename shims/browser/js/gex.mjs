@@ -804,6 +804,8 @@ export class Gex {
   static watchDir = -1;
   /** `soname=path,...` (the page's `?wasmdlls=`): libraries replaced by wasm64 providers. */
   static wasmDlls = '';
+  /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
+  static elfUnits = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -2532,6 +2534,13 @@ export class Gex {
    *  providers (cgen/libprov.rs). */
   #libprovConfig() {
     const e = this.#shim.exports;
+    if (Gex.elfUnits && e.gex_cgen_elf_units) {
+      const b = new TextEncoder().encode(Gex.elfUnits);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_cgen_elf_units(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
     if (!Gex.wasmDlls || !e.gex_libprov_config) return;
     const b = new TextEncoder().encode(Gex.wasmDlls);
     const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;

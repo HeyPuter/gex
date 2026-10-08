@@ -8,7 +8,7 @@
 //   node tests/games/browser-linux.mjs --name NAME --dir GAME_DIR --exe REL
 //        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST]
 //        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
-//        [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--env K=V,K=V] [--end-on-exit]
+//        [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--query K=V&...] [--env K=V,K=V] [--end-on-exit]
 //
 // --files lists host files the game opens, one per line (collected from a
 // native `gexc run --strace`; tests/games/retrocycles-linux-files.txt).
@@ -26,8 +26,24 @@
 // Prints `ok` lines (first frame, the input script's start, gameplay) and the
 // frame rate over the last minute, with a screenshot every 30 s.
 
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { deflateSync, crc32 } from 'node:zlib';
+
+/** RGBA rows (top first) as a PNG. */
+function encodePng(w, h, px) {
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td) >>> 0);
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 6;
+  const raw = Buffer.alloc((w * 4 + 1) * h);
+  for (let y = 0; y < h; y++) px.copy(raw, y * (w * 4 + 1) + 1, y * w * 4, (y + 1) * w * 4);
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
 import { dirname, join, basename } from 'node:path';
 // Ports of its own (the harness reads these when it loads), so a games run
 // and a gate's browser legs on the defaults (5199, 9339) do not collide.
@@ -129,6 +145,7 @@ async function main() {
     `tar=/gex/nt/${basename(tar)}&exe=/game/${exe}&cwd=/game/${cwd}&gl=1&glbackend=wgpu&hostx=1`
       + (argv.includes('--mem64') ? '&mem64=1' : '') + (argv.includes('--fjit') ? '&fjit=1' : '')
       + (opt('--wasmdlls', null) ? `&wasmdlls=${encodeURIComponent(opt('--wasmdlls'))}` : '')
+      + (opt('--query', null) ? `&${opt('--query')}` : '')
       + `&size=${width}x${height}&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(opt('--args', ''))}`,
     { width: width + 20, height: height + 100, shotDir },
   );
@@ -182,6 +199,13 @@ async function main() {
     if (Date.now() >= nextShot) {
       nextShot += 30000;
       await shot(`t${String(++shots).padStart(3, '0')}`);
+      // The compositor's own output, read back (the page screenshot can miss the canvas).
+      if (shotDir) {
+        const r = await evaluate('globalThis.__gexCompositor?.readoutBase64()', true);
+        if (r?.b64) {
+          writeFileSync(join(shotDir, `c${String(shots).padStart(3, '0')}.png`), encodePng(r.w, r.h, Buffer.from(r.b64, 'base64')));
+        }
+      }
       const rate = window.length > 1 ? (n - window[0][1]) / ((Date.now() - window[0][0]) / 1000) : 0;
       log(`${((Date.now() - t0) / 1000).toFixed(0)} s: presents ${n}, ${rate.toFixed(1)}/s over the last minute; ${(s?.out ?? '').slice(-160).replace(/\n/g, ' | ')}`);
       // The compositor's own account: its windows, its notes (GL attachment
