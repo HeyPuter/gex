@@ -779,18 +779,31 @@ impl Gl {
                 eglBindAPI(EGL_OPENGL_ES_API);
                 return Err("no desktop OpenGL EGL config".into());
             }
-            // Core only when asked for, from 3.2 (where profiles begin).
-            let core = !compat && (major > 3 || (major == 3 && minor >= 2));
-            let mut ctx_attrs = vec![
-                EGL_CONTEXT_OPENGL_PROFILE_MASK,
-                if core { EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT } else { EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT },
-            ];
-            if major > 3 || (major == 3 && minor > 0) {
-                ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MAJOR_VERSION, major as EGLint]);
-                ctx_attrs.extend_from_slice(&[EGL_CONTEXT_MINOR_VERSION, minor as EGLint]);
+            // A compatibility context even when the guest asks for core, and
+            // core only where the host has no compatibility context of that
+            // version. The guest names its own objects (the wire protocol lets
+            // it), and a core profile refuses to bind a buffer, texture or
+            // vertex array name glGen* did not return: every glBindBuffer of
+            // Muck's (a GL 4.x core client) failed with INVALID_OPERATION,
+            // and nothing drew. A compatibility profile is a superset of core
+            // for what a core client calls; the guest library answers
+            // GL_CONTEXT_PROFILE_MASK with what the client asked for.
+            let attrs_for = |core: bool| {
+                let mut a = vec![
+                    EGL_CONTEXT_OPENGL_PROFILE_MASK,
+                    if core { EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT } else { EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT },
+                ];
+                if major > 3 || (major == 3 && minor > 0) {
+                    a.extend_from_slice(&[EGL_CONTEXT_MAJOR_VERSION, major as EGLint]);
+                    a.extend_from_slice(&[EGL_CONTEXT_MINOR_VERSION, minor as EGLint]);
+                }
+                a.push(EGL_NONE);
+                a
+            };
+            let mut context = eglCreateContext(self.display, config, std::ptr::null_mut(), attrs_for(false).as_ptr());
+            if context.is_null() && (major > 3 || (major == 3 && minor >= 2)) {
+                context = eglCreateContext(self.display, config, std::ptr::null_mut(), attrs_for(true).as_ptr());
             }
-            ctx_attrs.push(EGL_NONE);
-            let context = eglCreateContext(self.display, config, std::ptr::null_mut(), ctx_attrs.as_ptr());
             if context.is_null() {
                 eglBindAPI(EGL_OPENGL_ES_API);
                 return Err(format!("no desktop OpenGL context: {:#x}", eglGetError()));
@@ -815,7 +828,7 @@ impl Gl {
             self.unpack_store = PixelStore::default();
             self.current_on = Some(std::thread::current().id());
             self.compat = Compat::load();
-            self.desktop = Some((major, minor, !core));
+            self.desktop = Some((major, minor, compat || !(major > 3 || (major == 3 && minor >= 2))));
             self.vendor = gl_string(0x1F00);
             self.renderer = gl_string(0x1F01);
             self.version = gl_string(0x1F02);

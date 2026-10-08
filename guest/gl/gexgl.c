@@ -2117,6 +2117,8 @@ static void host_gl_version(int *major, int *minor) {
 }
 
 static size_t gexgl_state_query_components(unsigned pname);
+/* Defined with the EGL context state below: what the client asked for. */
+static int egl_context_major, egl_context_minor, egl_context_profile;
 
 void glGetIntegerv(unsigned pname, int *out) {
     if (pname == 0x821Bu || pname == 0x821Cu) { /* GL_MAJOR/MINOR_VERSION */
@@ -2139,12 +2141,19 @@ void glGetIntegerv(unsigned pname, int *out) {
            when it is one (GL_CONTEXT_COMPATIBILITY_PROFILE_BIT, 2), and a
            desktop context of 3.2 or later otherwise is core (1). ES has no
            profiles. This answered core for every desktop context. */
+        /* What the client asked for, when it asked for core: the native
+           host gives it a compatibility context regardless (crates/gex-gl
+           become_desktop: a core one refuses the guest's own object names),
+           and its version string would say so. */
         int mask = 0;
         if (egl_api == 0x30A2u) {
             const char *v = (const char *)glGetString(0x1F02u);
             int major = 0, minor = 0;
             host_gl_version(&major, &minor);
-            if (v && strstr(v, "Compatibility")) mask = 2;
+            const int asked_core = egl_context_profile == 0 &&
+                (egl_context_major > 3 || (egl_context_major == 3 && egl_context_minor >= 2));
+            if (asked_core) mask = 1;
+            else if (v && strstr(v, "Compatibility")) mask = 2;
             else if (major > 3 || (major == 3 && minor >= 2)) mask = 1;
         }
         if (out) out[0] = mask;
