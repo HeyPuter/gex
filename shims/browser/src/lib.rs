@@ -5874,6 +5874,22 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     if let Some(p) = nt::process() {
         return nt::syscall(p, ctx, pc);
     }
+    // A stateful provider's syscall (`PROVIDER_SYSCALL` set by the page's glue,
+    // cgen/libprov.rs): its wasm frames cannot be left, so it is served as a
+    // wasm32 program's is -- a blocking call waits here, a thread or a child
+    // is staged for the host -- and the call returns.
+    let pc = {
+        let provider = (pc as u64) & PROVIDER_SYSCALL != 0;
+        IN_PROVIDER.with(|c| c.set(provider));
+        ((pc as u64) & !PROVIDER_SYSCALL) as i64
+    };
+    // A guest thread in a syscall counts as stopped for a provider's
+    // collection (cgen/libprov.rs); it parks on its way back if one runs.
+    let stop_tracked = !IN_PROVIDER.with(|c| c.get()) && cgen::libprov::any_registered();
+    let tracked_tid = if stop_tracked { with_host(|h| h.threads[cur()].kstate.tid) as u32 } else { 0 };
+    if stop_tracked {
+        cgen::libprov::syscall_enter(tracked_tid);
+    }
     // Which syscall is running, so the allocator can name who was asking (wasm
     // has no backtrace). See `HEAP_BY_CALL`.
     {
@@ -6037,6 +6053,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     // warm process. The per-number census above stays behind the heartbeat.
     let began = now_ns();
     SYS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A GL submit is taken under the lock and done after it (gl.rs).
+    gl::DEFER.with(|d| d.set(true));
     let stop = with_host(|h| {
         let mut gm = GuestMem::new(guest_bytes());
         let kstate = h.threads[cur()].kstate.clone();
@@ -6407,7 +6425,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     h.jit.ever_threaded = true;
                 }
                 stage_thread(tid, ctx_addr, start);
-                if h.kernel.wasm32 {
+                if frames_stay(h) {
                     // A wasm32 program's frames cannot be left: the call
                     // returns, and `#wasmprogSyscall` starts the thread.
                     WASM32_STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -6455,10 +6473,10 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                         deadline: deadline.map(|d| now_ns() + d.as_nanos() as u64),
                     },
                     gex_kernel::BlockOp::Sleep(d) => Waiting::Sleep(now_ns() + d.as_nanos() as u64),
-                    // Priority-inheritance locks are not served here yet: the
-                    // call finishes at once with ENOSYS, as before gex had them
-                    // (`finish_parked`). docs/mem64.md step 6 brings the page.
-                    gex_kernel::BlockOp::FutexLockPi { .. } => Waiting::Sleep(now_ns()),
+                    // A priority-inheritance lock: tried when the thread runs
+                    // again (`finish_parked`), and the syscall made again until
+                    // it is taken (`PI_RETRY`); a short sleep between tries.
+                    gex_kernel::BlockOp::FutexLockPi { .. } => Waiting::Sleep(now_ns() + 100_000),
                     gex_kernel::BlockOp::ReadStream { handle, .. } => {
                         // What the thing being waited on says about itself,
                         // at the moment of parking. A reader on a pipe whose
@@ -6531,7 +6549,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 child_stack,
                 tls,
             } => {
-                if h.kernel.wasm32 {
+                if frames_stay(h) {
                     // A wasm32 process clones at its thread entry (the
                     // context's PC, as the musl fork's __clone leaves it);
                     // the call returns, and `#wasmprogSyscall` hands the
@@ -6577,6 +6595,8 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             }
         }
     });
+    gl::DEFER.with(|d| d.set(false));
+    gl::submit_pending(ctx as u32 as u64);
     {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
@@ -6617,7 +6637,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
     recompile_objects(mapped);
     // 3 means the running thread gave up the wasm stack: pick another, waiting
     // first if it is waiting on another Worker (see `park_until_ready`).
-    let stop = if stop == 3 && with_host(|h| h.kernel.wasm32) {
+    let stop = if stop == 3 && with_host(|h| frames_stay(h)) {
         wasm32_wait(pc as u64)
     } else if stop == 3 {
         // Ask first, wait second: most parked calls are already ready by now
@@ -6739,6 +6759,17 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         };
         trace_line(&format!("[gex]   t{i} = {}{split}{clk}\n", x0 as i64));
     }
+    // A provider's priority-inheritance lock still held (`PI_RETRY` set the
+    // thread to make the call again): it has no instruction to go back to, so
+    // the call is made again here, outside the host lock.
+    if stop == 0 && stop_tracked {
+        cgen::libprov::guest_again(tracked_tid);
+    }
+    if stop != 0 && IN_PROVIDER.with(|c| c.get()) && resume() == Some(pc as u64) {
+        set_resume_none();
+        set_resume_ctx_none();
+        return gex_syscall(ctx, (pc as u64 | PROVIDER_SYSCALL) as i64);
+    }
     if stop != 0 {
         trap();
     }
@@ -6762,6 +6793,22 @@ const LOW_END: u64 = gex_abi::DISPATCH_DIR + gex_abi::DISPATCH_MAX_PAGES * 4;
 // save or restore: `fork` asks the host for a Worker with a copy of the
 // parent's regions, `wait4`/`kill`/`exit` route through the kernel's table, and
 // each process is a Worker the engine schedules.
+
+/// The mark the page's glue puts on a stateful provider's syscalls (as gexrt's
+/// `NATIVE_SYSCALL` on native Wine's, `nt.rs`).
+const PROVIDER_SYSCALL: u64 = 1 << 61;
+
+thread_local! {
+    /// The syscall being served is a stateful provider's (see `gex_syscall`).
+    static IN_PROVIDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the syscall being served cannot leave its wasm frames: a wasm32
+/// program's, a stateful provider's, or guest code a provider called (its
+/// frames are below the call-out).
+fn frames_stay(h: &Host) -> bool {
+    h.kernel.wasm32 || IN_PROVIDER.with(|c| c.get()) || cgen::provider_callout_open()
+}
 
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
@@ -9521,6 +9568,12 @@ fn schedule() -> i32 {
                 let mut gm = GuestMem::new(guest_bytes());
                 h.kernel.enter_thread(&kstate);
                 let r = finish_parked(&op, timed_out, by_signal, &mut gm);
+                // A priority-inheritance lock still held: the syscall again,
+                // from its instruction (the registers are as the guest made the call).
+                if r == Err(PI_RETRY) {
+                    h.kernel.leave_thread(&mut h.threads[cur()].kstate);
+                    return Some((kstate.ctx_addr, pc - gex_abi::SYSCALL_INST_BYTES));
+                }
                 // A parked call's answer never reaches the syscall ring (the
                 // ring is written when the call is made), so an error here is
                 // otherwise invisible -- and glibc aborts over a bad futex one.
@@ -9597,6 +9650,10 @@ fn schedule() -> i32 {
 ///
 /// A woken futex returns zero and the guest re-checks its own condition, the
 /// same as on Linux, where a wake is never a promise about the word.
+/// `finish_parked`'s answer for a priority-inheritance lock still held: make
+/// the syscall again (never seen by the guest).
+const PI_RETRY: Errno = Errno(0x7fff);
+
 fn finish_parked(
     op: &gex_kernel::BlockOp,
     timed_out: bool,
@@ -9629,7 +9686,30 @@ fn finish_parked(
             Err(Errno::ETIMEDOUT)
         }
         gex_kernel::BlockOp::FutexWait { .. } | gex_kernel::BlockOp::Sleep(_) => Ok(0),
-        gex_kernel::BlockOp::FutexLockPi { .. } => Err(Errno::ENOSYS),
+        // Take the lock if it is free (the waiters bit stays set, so the
+        // next unlock goes through the kernel); else `PI_RETRY`: the caller
+        // makes the syscall again, which parks once more.
+        gex_kernel::BlockOp::FutexLockPi { uaddr, tid, .. } => {
+            use gex_kernel::futex::pi;
+            loop {
+                let v = gex_atomic::load_u32(gm.bytes, *uaddr).ok_or(Errno::EFAULT)?;
+                match v & pi::TID_MASK {
+                    0 => {
+                        if gex_atomic::cas_u32(gm.bytes, *uaddr, v, *tid | pi::WAITERS).ok_or(Errno::EFAULT)?.is_ok() {
+                            return Ok(0);
+                        }
+                        continue;
+                    }
+                    owner if owner == *tid => return Err(Errno::EDEADLK),
+                    _ => {}
+                }
+                let want = v | pi::WAITERS;
+                if v != want && gex_atomic::cas_u32(gm.bytes, *uaddr, v, want).ok_or(Errno::EFAULT)?.is_err() {
+                    continue;
+                }
+                return Err(PI_RETRY);
+            }
+        }
         // The read the guest asked for happens now, into the buffer it named.
         // Doing it here rather than re-executing the instruction is what keeps
         // the guest's pc moving forward: a syscall that parks is finished by
@@ -10398,6 +10478,13 @@ pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
     // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
     // without a syscall: a loop that spins on them passes here.
     nt::tick();
+    // A stateful provider's collection stops guest threads here (its
+    // registers are in the context at a safepoint), and a thread that came
+    // back from a syscall through JS is running guest code again.
+    if cgen::libprov::any_registered() {
+        let tid = with_host(|h| h.threads[cur()].kstate.tid) as u32;
+        cgen::libprov::guest_again(tid);
+    }
     // A loop that has left an exception dispatched nested (nt::exc_escape).
     if nt::exc_escape(ctx, pc as u64) {
         set_resume_none();
@@ -10794,13 +10881,17 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         });
         trap();
     }
-    // An address an ELF export provider holds whose slot lost its bridge.
+    // An address an ELF export provider (or a replaced library's provider)
+    // holds whose slot lost its bridge.
     if cgen::elfprov::rebridge(pc) {
         with_host(|h| {
             set_resume(pc);
             set_resume_ctx(h.threads[cur()].kstate.ctx_addr);
         });
         trap();
+    }
+    if cgen::libprov::replaced(pc) {
+        cgen::libprov::note_stray(pc);
     }
     remiss(pc);
     if tracing() || unsafe { TRACE_MISSES } {
@@ -10886,6 +10977,17 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                 stack.join(", "),
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed),
             ));
+            // A return a call-out should have caught: the call-outs open, and
+            // the callback depth this Worker is at.
+            let open = cgen::callouts_open();
+            if !open.is_empty() || cgen::libprov::provider_return(pc) {
+                warn_line(&format!(
+                    "[gex] call-outs open: {:x?} (return, sp wanted, callback depth); sp now {sp:#x}; last provider guest calls (target, return, sp): {:x?}\n",
+                    open,
+                    cgen::provider_calls_recent()
+                ));
+                warn_line(&format!("[gex] last lookups (address, index): {:x?}\n", cgen::lookups_recent()));
+            }
             set_exit(h, 128 + 11);
         });
         trap();

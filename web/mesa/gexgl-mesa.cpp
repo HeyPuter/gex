@@ -172,6 +172,9 @@ enum Op : uint32_t {
     ALPHA_FUNC = 197,
     /* Protocol 12: the attribute stack. */
     PUSH_ATTRIB = 198, POP_ATTRIB = 199,
+    /* A client-memory vertex array's bytes with its pointer command; see
+     * crates/gex-gl/src/proto.rs. */
+    CLIENT_ARRAY = 200,
 };
 
 struct Reader {
@@ -208,6 +211,10 @@ struct Reader {
 };
 
 std::vector<uint8_t> reply;
+/* CLIENT_ARRAY's bytes, one copy per array slot. GL keeps the pointer, so the
+ * bytes stay until the slot's next CLIENT_ARRAY replaces them -- which the
+ * guest sends before every draw that reads a client array. */
+std::unordered_map<uint32_t, std::vector<uint8_t>> client_arrays;
 std::unordered_map<uint32_t, GLuint> buffers, textures, shaders, programs;
 /* The head of each shader's source, kept only so a failed compile can show
  * what it was handed. A GLSL error names a line and column and nothing else,
@@ -1341,7 +1348,10 @@ bool display_backend() {
          * against how many were declined. A frame presents either way, so this
          * is what distinguishes "drawing nothing" from "not started". */
         static unsigned frames;
-        if ((frames++ % 600) == 0)
+        /* Braced: the report below was once outside the `if` by mistake, so
+         * its ten formatted stderr lines (and the page's console plumbing
+         * for each) ran on every displayed frame. */
+        if ((frames++ % 600) == 0) {
             fprintf(stderr,
                     "gex-wgpu: frame %u -- issued %u, declined %u "
                     "(constant %u, texture %u, vertex %u; last: %s)\n",
@@ -1351,6 +1361,7 @@ bool display_backend() {
                     gex_wgpu_declined_last_why ? gex_wgpu_declined_last_why
                                                : "-");
             gex_wgpu_report_draw_targets();
+        }
     }
     GEX_PRESENT_MARK(copy_begin);
     WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
@@ -2485,6 +2496,35 @@ bool one(uint32_t op, Reader& a) {
         break;
     }
     case CLIENT_ACTIVE_TEXTURE: glClientActiveTexture(a.u32()); break;
+    /* { slot, op, n, n words, bytes }: a client-memory array, as pewasm's
+     * GL takes them -- a pointer into memory, which st/mesa uploads with its
+     * stream uploader. The guest used to copy each one into a buffer of its
+     * own with glBufferData before every draw, and a buffer the pending batch
+     * already reads cannot be rewritten in place: every such upload became a
+     * staged copy that split the render pass (Noita: 142 a frame, 52 passes
+     * for 47 draws). `op` is the pointer command (glVertexPointer's,
+     * glVertexAttribPointer's, ...) and the words are its arguments before
+     * the pointer, which becomes the bytes' address here; it runs with no
+     * GL_ARRAY_BUFFER bound, and the guest rebinds its own afterwards. */
+    case CLIENT_ARRAY: {
+        const uint32_t slot = a.u32(), inner = a.u32(), n = a.u32();
+        if (!a.ok || n > 8 || inner == CLIENT_ARRAY) return false;
+        uint32_t words[8];
+        for (uint32_t i = 0; i < n; ++i) words[i] = a.u32();
+        uint32_t len = 0;
+        const uint8_t* bytes = a.blob(len);
+        if (!a.ok) return false;
+        std::vector<uint8_t>& mem = client_arrays[slot];
+        mem.assign(bytes, bytes + len);
+        if (mem.empty()) mem.push_back(0);
+        uint8_t body[8 * 4 + 8];
+        std::memcpy(body, words, n * 4);
+        const uint64_t at = reinterpret_cast<uintptr_t>(mem.data());
+        std::memcpy(body + n * 4, &at, 8);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        Reader r{body, body + n * 4 + 8};
+        return one(inner, r);
+    }
     case ORTHO: {
         const GLdouble l = a.f64(), r = a.f64(), b = a.f64();
         const GLdouble t = a.f64(), n = a.f64(), f = a.f64();

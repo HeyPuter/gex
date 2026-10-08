@@ -1,7 +1,9 @@
 /* The GL calls the unix-call dispatcher's provider writes into the command
  * ring itself (gex-cgen/providers/nt_unixcall.c): glEnable, glDisable,
  * glActiveTexture, glUseProgram, glBindTexture, glUniform1i, glUniform2f,
- * glEnableClientState, glDisableClientState (which also leave the arrays'
+ * glBlendFunc, glBlendFuncSeparate, glViewport, glTexParameteri,
+ * glUniform1f, glEnableClientState, glDisableClientState, glVertexPointer,
+ * glColorPointer, glTexCoordPointer (into client memory) and glDrawArrays (which also leave the arrays'
  * flags where the layer reads them before a draw: client-memory arrays are
  * uploaded only when the layer sees them enabled).
  * Each is checked by a query (which the NT layer answers after a submit),
@@ -33,9 +35,14 @@ PROC(void, glUseProgram, (GLuint))
 PROC(GLint, glGetUniformLocation, (GLuint, const char *))
 PROC(void, glUniform1i, (GLint, GLint))
 PROC(void, glUniform2f, (GLint, float, float))
+PROC(void, glUniform1f, (GLint, float))
+PROC(void, glBlendFuncSeparate, (GLenum, GLenum, GLenum, GLenum))
 PROC(void, glGetUniformfv, (GLuint, GLint, float *))
 PROC(void, glGetUniformiv, (GLuint, GLint, GLint *))
 PROC(void, glClientActiveTexture, (GLenum))
+PROC(void, glGenBuffers, (GLsizei, GLuint *))
+PROC(void, glBindBuffer, (GLenum, GLuint))
+PROC(void, glBufferData, (GLenum, ptrdiff_t, const void *, GLenum))
 #define LOAD(name) p##name = (name##_t)wglGetProcAddress(#name)
 
 static LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) { return DefWindowProcW(w, m, wp, lp); }
@@ -68,8 +75,8 @@ int main(void) {
 
     LOAD(glActiveTexture); LOAD(glCreateShader); LOAD(glShaderSource); LOAD(glCompileShader);
     LOAD(glCreateProgram); LOAD(glAttachShader); LOAD(glLinkProgram); LOAD(glUseProgram);
-    LOAD(glGetUniformLocation); LOAD(glUniform1i); LOAD(glUniform2f); LOAD(glGetUniformfv); LOAD(glGetUniformiv);
-    LOAD(glClientActiveTexture);
+    LOAD(glGetUniformLocation); LOAD(glUniform1i); LOAD(glUniform2f); LOAD(glUniform1f); LOAD(glBlendFuncSeparate); LOAD(glGetUniformfv); LOAD(glGetUniformiv);
+    LOAD(glClientActiveTexture); LOAD(glGenBuffers); LOAD(glBindBuffer); LOAD(glBufferData);
     CHECK("GL 2.0 entry points", pglActiveTexture && pglUseProgram && pglUniform2f);
     if (!pglActiveTexture || !pglUseProgram || !pglUniform2f) return 1;
 
@@ -80,7 +87,7 @@ int main(void) {
     pglActiveTexture(GL_TEXTURE0);
 
     const char *vs = "#version 110\nvoid main() { gl_Position = vec4(0.0, 0.0, 0.0, 1.0); }";
-    const char *fs = "#version 110\nuniform vec2 off; uniform int k; void main() { gl_FragColor = vec4(off, float(k), 1.0); }";
+    const char *fs = "#version 110\nuniform vec2 off; uniform int k; uniform float a; void main() { gl_FragColor = vec4(off, float(k), a); }";
     GLuint v = pglCreateShader(0x8B31), fr = pglCreateShader(0x8B30), prog = pglCreateProgram();
     pglShaderSource(v, 1, &vs, 0);
     pglShaderSource(fr, 1, &fs, 0);
@@ -104,6 +111,36 @@ int main(void) {
     pglGetUniformiv(prog, s, &iv);
     CHECK("glUniform2f", fv[0] == 0.25f && fv[1] == -1.5f);
     CHECK("glUniform1i", iv == 5);
+    if (pglUniform1f) {
+        GLint a = pglGetUniformLocation(prog, "a");
+        float av = 0;
+        pglUniform1f(a, 0.75f);
+        pglGetUniformfv(prog, a, &av);
+        CHECK("glUniform1f", av == 0.75f);
+    }
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    GLint bs = 0, bd = 0;
+    glGetIntegerv(GL_BLEND_SRC, &bs);
+    glGetIntegerv(GL_BLEND_DST, &bd);
+    CHECK("glBlendFunc", bs == GL_SRC_ALPHA && bd == GL_ONE_MINUS_SRC_ALPHA);
+    if (pglBlendFuncSeparate) {
+        GLint v4[4] = {0, 0, 0, 0};
+        pglBlendFuncSeparate(GL_ONE, GL_ZERO, GL_DST_ALPHA, GL_ONE);
+        glGetIntegerv(0x80C9, &v4[0]); /* GL_BLEND_SRC_RGB */
+        glGetIntegerv(0x80C8, &v4[1]); /* GL_BLEND_DST_RGB */
+        glGetIntegerv(0x80CB, &v4[2]); /* GL_BLEND_SRC_ALPHA */
+        glGetIntegerv(0x80CA, &v4[3]); /* GL_BLEND_DST_ALPHA */
+        CHECK("glBlendFuncSeparate", v4[0] == GL_ONE && v4[1] == GL_ZERO && v4[2] == GL_DST_ALPHA && v4[3] == GL_ONE);
+    }
+    glViewport(3, 5, 40, 30);
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    CHECK("glViewport", vp[0] == 3 && vp[1] == 5 && vp[2] == 40 && vp[3] == 30);
+    glBindTexture(GL_TEXTURE_2D, tex[0]);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    GLint mf = 0;
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mf);
+    CHECK("glTexParameteri", mf == GL_NEAREST);
 
     /* Two million fast calls (some 26 MB of commands: the ring fills and is
      * submitted three times), with layer-encoded calls among them, ending in
@@ -156,6 +193,27 @@ int main(void) {
     glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
     CHECK("the colour array off", px[0] == 255 && px[1] == 255 && px[2] == 255);
     if (px[1] != 255 || px[2] != 255) printf("  pixel %d,%d,%d\n", px[0], px[1], px[2]);
+    /* Vertices from a buffer (the pointer set while it is bound: the layer's
+     * command) and colours from client memory (set on the fast path once
+     * it is unbound): the fast draw uploads only the client one. */
+    if (pglGenBuffers && pglBindBuffer && pglBufferData) {
+        static const unsigned char green[12] = {0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255};
+        GLuint vbo = 0;
+        pglGenBuffers(1, &vbo);
+        pglBindBuffer(0x8892, vbo);
+        pglBufferData(0x8892, sizeof tri, tri, 0x88E4);
+        glVertexPointer(2, GL_FLOAT, 0, 0);
+        pglBindBuffer(0x8892, 0);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glColorPointer(4, GL_UNSIGNED_BYTE, 0, green);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        CHECK("vertices from a buffer, colours from client memory", px[0] == 0 && px[1] == 255 && px[2] == 0);
+        if (px[0] || px[1] != 255 || px[2]) printf("  pixel %d,%d,%d\n", px[0], px[1], px[2]);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glVertexPointer(2, GL_FLOAT, 0, tri);
+    }
     glDisableClientState(GL_VERTEX_ARRAY);
     /* The texture-coordinate array of the client active unit (which the
      * layer sets, and the fast path reads back). */

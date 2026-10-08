@@ -1237,6 +1237,15 @@ class Compositor {
       win.surface);
   }
 
+  /** The output as it was last composited: `{ w, h, px }` (RGBA, top row first). */
+  async readout() {
+    try {
+      return await this.#painter.read();
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * What the harness and the demo UI read.
    *
@@ -1404,6 +1413,7 @@ async function startGl(m, canvas) {
     env: m.mesaEnv,
     capture: m.glCapture,
     wgslCache: m.wgslCache,
+    wgpuStats: m.wgpuStats,
     gpu: await requestGexDevice(),
   });
   if (!glDevice.ok) throw new Error(glDevice.error || 'the GL device would not start');
@@ -1466,6 +1476,9 @@ self.onmessage = ({ data: m }) => {
       // The shader translation cache, for a training run to record.
       const blob = glDevice?.wgslCache?.() ?? null;
       postMessage({ kind: 'wgsl-cache', id: m.id, blob, stats: glDevice?.wgslStats?.() ?? null }, blob ? [blob] : []);
+    } else if (m.kind === 'readout') {
+      // The composited output, read back (RGBA rows, top first): what a test saves as a picture.
+      Promise.resolve(comp?.readout?.() ?? null).then((r) => postMessage({ kind: 'readout', id: m.id, state: r }, r ? [r.px.buffer] : []));
     } else if (m.kind === 'describe') {
       Promise.resolve(comp?.describe() ?? null).then((state) => postMessage({ kind: 'describe', id: m.id, state }));
     } else if (m.kind === 'stop') {

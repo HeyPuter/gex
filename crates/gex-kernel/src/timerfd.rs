@@ -35,6 +35,10 @@ struct State {
 /// A `timerfd` object.
 pub struct TimerFd {
     clock: ClockFn,
+    /// For a CLOCK_MONOTONIC (or BOOTTIME) timer: how a reading of `clock`
+    /// becomes that clock's, so an absolute `it_value` means what the guest
+    /// read from `clock_gettime` on the same clock.
+    map: Option<fn((u64, u32)) -> (u64, u32)>,
     state: Mutex<State>,
 }
 
@@ -48,12 +52,23 @@ impl TimerFd {
     pub fn new(clock: ClockFn) -> TimerFd {
         TimerFd {
             clock,
+            map: None,
             state: Mutex::new(State::default()),
         }
     }
 
+    /// The same timer on a clock derived from `clock` by `map`.
+    pub fn monotonic(mut self, map: fn((u64, u32)) -> (u64, u32)) -> TimerFd {
+        self.map = Some(map);
+        self
+    }
+
     fn now_ns(&self) -> u64 {
-        let (secs, nanos) = (self.clock)();
+        let read = (self.clock)();
+        let (secs, nanos) = match self.map {
+            Some(map) => map(read),
+            None => read,
+        };
         secs.saturating_mul(1_000_000_000).saturating_add(nanos as u64)
     }
 

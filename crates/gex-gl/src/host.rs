@@ -462,6 +462,73 @@ pub struct Gl {
     frame: Option<Frame>,
     /// PRESENTs so far.
     pub presents: u64,
+    /// `op::CLIENT_ARRAY`'s bytes by slot: GL keeps the pointer, so they
+    /// stay until the slot's next one.
+    client_arrays: std::collections::HashMap<u32, Vec<u8>>,
+    /// Per opcode: commands run and nanoseconds in them, when asked for
+    /// ([`Gl::time_ops`]; the replay tool's profile).
+    op_times: Option<std::collections::HashMap<u32, (u64, u64)>>,
+}
+
+/// `GEX_GL_READBACK_EVERY=N`: read back (and hand on) only every Nth
+/// presented frame. A readback stalls the program's GL thread on the GPU
+/// each frame (NVIDIA spins in sched_yield); a measurement that keeps one
+/// frame in a thousand should not pay it on the others.
+fn readback_due(present: u64) -> bool {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let n = *EVERY.get_or_init(|| std::env::var("GEX_GL_READBACK_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1));
+    present % n == 1 % n
+}
+
+/// `GEX_GL_ERRORS=1` (diagnostic): `glGetError` after every command, and
+/// each opcode/error pair reported the first few times it happens. It takes
+/// the error a program would have read itself.
+fn gl_error_check(opcode: u32) {
+    use std::sync::{Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SEEN: Mutex<Option<std::collections::HashMap<(u32, u32), u32>>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("GEX_GL_ERRORS").is_some_and(|v| v != "0")) {
+        return;
+    }
+    let e = unsafe { glGetError() };
+    if e == 0 {
+        return;
+    }
+    let mut g = SEEN.lock().unwrap();
+    let n = g.get_or_insert_with(Default::default).entry((opcode, e)).or_insert(0);
+    *n += 1;
+    if *n <= 3 || n.is_power_of_two() {
+        eprintln!("[gex-gl] opcode {opcode} -> GL error {e:#x} ({} times)", *n);
+    }
+}
+
+/// `GEX_GL_FPS=1`: the program's own frame rate, counted at its PRESENTs
+/// (a compositor's commits also count other clients' surfaces, cursors and
+/// Xwayland's damage). Prints the first PRESENT's wall-clock time (Unix
+/// milliseconds, for time-to-first-frame against the run's start) and then,
+/// about once a second, the PRESENTs per second and the total.
+fn present_meter(total: u64) {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    static ON: OnceLock<bool> = OnceLock::new();
+    static METER: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("GEX_GL_FPS").is_some_and(|v| v != "0")) {
+        return;
+    }
+    let epoch = || SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let mut m = METER.lock().unwrap();
+    let Some((count, since)) = m.as_mut() else {
+        eprintln!("[gex-gl] first present at {} ms", epoch());
+        *m = Some((0, Instant::now()));
+        return;
+    };
+    *count += 1;
+    let dt = since.elapsed().as_secs_f64();
+    if dt >= 1.0 {
+        eprintln!("[gex-gl] presents/s {:.2} total {total} at {} ms", *count as f64 / dt, epoch());
+        *count = 0;
+        *since = Instant::now();
+    }
 }
 
 /// A presented frame: RGBA rows, top first.
@@ -600,6 +667,8 @@ impl Gl {
                 keep_frames: false,
                 frame: None,
                 presents: 0,
+                client_arrays: std::collections::HashMap::new(),
+                op_times: None,
             })
         }
     }
@@ -754,6 +823,19 @@ impl Gl {
         Ok(())
     }
 
+    /// Time every command by opcode from now on ([`Gl::take_op_times`]).
+    pub fn time_ops(&mut self, on: bool) {
+        self.op_times = on.then(std::collections::HashMap::new);
+    }
+
+    /// Commands and nanoseconds by opcode since the last call.
+    pub fn take_op_times(&mut self) -> Vec<(u32, u64, u64)> {
+        let Some(m) = self.op_times.as_mut() else { return Vec::new() };
+        let mut v: Vec<_> = m.drain().map(|(k, (c, n))| (k, c, n)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v
+    }
+
     /// Whether the context is a desktop one (fixed function available).
     pub fn is_desktop(&self) -> bool {
         self.compat.is_some()
@@ -828,9 +910,17 @@ impl Gl {
                 None => return (reply, error::NONE, index),
                 Some(Err(())) => return (reply, error::TRUNCATED, index),
                 Some(Ok((opcode, body))) => {
-                    if !self.one(opcode, body, &mut reply) {
+                    let t = self.op_times.is_some().then(std::time::Instant::now);
+                    let ok = self.one(opcode, body, &mut reply);
+                    if let (Some(t), Some(m)) = (t, self.op_times.as_mut()) {
+                        let e = m.entry(opcode).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 += t.elapsed().as_nanos() as u64;
+                    }
+                    if !ok {
                         return (reply, error::BAD_OPCODE, index);
                     }
+                    gl_error_check(opcode);
                     index += 1;
                 }
             }
@@ -886,7 +976,8 @@ impl Gl {
                 op::SURFACE_ATTACH | op::SURFACE_CURRENT | op::SURFACE_DETACH | op::CONTEXT_DESTROY => {}
                 op::PRESENT => {
                     self.presents += 1;
-                    if self.keep_frames {
+                    present_meter(self.presents);
+                    if self.keep_frames && readback_due(self.presents) {
                         let (w, h) = (self.width, self.height);
                         let mut px = vec![0u8; (w * h * 4) as usize];
                         // The program's read framebuffer, pack buffer and
@@ -1032,6 +1123,32 @@ impl Gl {
                     let n = a.u32().unwrap_or(0);
                     let names: Vec<GLuint> = (0..n).filter_map(|_| a.u32()).collect();
                     glDeleteTextures(names.len() as GLsizei, names.as_ptr());
+                }
+                op::CLIENT_ARRAY => {
+                    // { slot, op, n, n words, bytes }: run the pointer
+                    // command `op` with the bytes' address as its pointer and
+                    // no GL_ARRAY_BUFFER bound (proto.rs).
+                    let (Some(slot), Some(inner), Some(n)) = (a.u32(), a.u32(), a.u32()) else {
+                        return true;
+                    };
+                    if n > 8 || inner == op::CLIENT_ARRAY {
+                        return false;
+                    }
+                    let mut body = Vec::with_capacity(n as usize * 4 + 8);
+                    for _ in 0..n {
+                        let Some(w) = a.u32() else { return true };
+                        body.extend_from_slice(&w.to_le_bytes());
+                    }
+                    let Some(bytes) = a.blob() else { return true };
+                    let mem = self.client_arrays.entry(slot).or_default();
+                    mem.clear();
+                    mem.extend_from_slice(bytes);
+                    if mem.is_empty() {
+                        mem.push(0);
+                    }
+                    body.extend_from_slice(&(mem.as_ptr() as usize as u64).to_le_bytes());
+                    glBindBuffer(0x8892, 0); // GL_ARRAY_BUFFER
+                    return self.one(inner, &body, reply);
                 }
                 op::BIND_BUFFER => {
                     if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
@@ -1451,12 +1568,26 @@ impl Gl {
                     reply.u32(glGetError());
                 }
 
-                // Framebuffers. As for buffers and textures the guest picks
-                // the names, which binding accepts.
-                op::GEN_FRAMEBUFFERS | op::GEN_RENDERBUFFERS => {}
-                op::DELETE_FRAMEBUFFERS | op::DELETE_RENDERBUFFERS => {
+                // Framebuffers and renderbuffers are named by the host: unlike
+                // buffers and textures, ARB_framebuffer_object refuses a name
+                // GenFramebuffers did not return (NVIDIA does, with
+                // INVALID_OPERATION, and every FBO bind failed: Hollow Knight
+                // drew black there; Mesa takes them). The decoder keeps the
+                // map (`gexgl_native_object`), so the generated cases and the
+                // binding queries see the guest's names.
+                op::GEN_FRAMEBUFFERS | op::GEN_RENDERBUFFERS => {
+                    let kind = if opcode == op::GEN_FRAMEBUFFERS { 2 } else { 3 };
                     let n = a.u32().unwrap_or(0);
-                    let names: Vec<GLuint> = (0..n).filter_map(|_| a.u32()).collect();
+                    for _ in 0..n {
+                        if let Some(g) = a.u32() {
+                            native::gexgl_native_object(kind, g, 0);
+                        }
+                    }
+                }
+                op::DELETE_FRAMEBUFFERS | op::DELETE_RENDERBUFFERS => {
+                    let kind = if opcode == op::DELETE_FRAMEBUFFERS { 2 } else { 3 };
+                    let n = a.u32().unwrap_or(0);
+                    let names: Vec<GLuint> = (0..n).filter_map(|_| a.u32()).map(|g| native::gexgl_native_object(kind, g, 1)).collect();
                     if opcode == op::DELETE_FRAMEBUFFERS {
                         glDeleteFramebuffers(names.len() as GLsizei, names.as_ptr());
                     } else {
@@ -1465,12 +1596,12 @@ impl Gl {
                 }
                 op::BIND_FRAMEBUFFER => {
                     if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
-                        glBindFramebuffer(t, n);
+                        glBindFramebuffer(t, native::gexgl_native_object(2, n, 0));
                     }
                 }
                 op::BIND_RENDERBUFFER => {
                     if let (Some(t), Some(n)) = (a.u32(), a.u32()) {
-                        glBindRenderbuffer(t, n);
+                        glBindRenderbuffer(t, native::gexgl_native_object(3, n, 0));
                     }
                 }
                 op::CHECK_FRAMEBUFFER_STATUS => {
@@ -1489,7 +1620,7 @@ impl Gl {
                     let (Some(t), Some(att), Some(rt), Some(rb)) = (a.u32(), a.u32(), a.u32(), a.u32()) else {
                         return true;
                     };
-                    glFramebufferRenderbuffer(t, att, rt, rb);
+                    glFramebufferRenderbuffer(t, att, rt, native::gexgl_native_object(3, rb, 0));
                 }
                 op::RENDERBUFFER_STORAGE => {
                     let (Some(t), Some(f), Some(w), Some(h)) = (a.u32(), a.u32(), a.i32(), a.i32()) else {
@@ -1701,6 +1832,7 @@ mod native {
         pub fn gexgl_native_one(op: u32, body: *const u8, len: usize, reply: *mut *const u8, reply_len: *mut usize) -> i32;
         pub fn gexgl_native_pixel_store(pname: u32, param: i32);
         pub fn gexgl_native_name(kind: u32, guest: u32, host: u32);
+        pub fn gexgl_native_object(kind: u32, guest: u32, op: u32) -> u32;
     }
 }
 
@@ -2075,6 +2207,77 @@ mod tests {
         assert_eq!(pixel16(&px, 7, 7), (255, 0, 0, 255), "the clear went to the texture");
     }
 
+    /// A desktop 4.5 context with framebuffer and renderbuffer names the
+    /// host never generated (the guest picks them): ARB_framebuffer_object
+    /// refuses such a name in a bind (NVIDIA does; Mesa lets it through), so
+    /// the host generates its own and maps them. The bind, the attachment
+    /// and the clear work, no GL error is raised, and the binding queries
+    /// answer with the guest's names.
+    #[test]
+    fn a_desktop_context_takes_framebuffer_names_it_never_generated() {
+        let mut gl = match Gl::new(16, 16) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipping: no host GL ({e})");
+                return;
+            }
+        };
+        let mut b = Batch::new();
+        b.cmd(op::CONTEXT_CREATE, &[client_api::DESKTOP, 4, 5]);
+        let (_, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        if !gl.is_desktop() {
+            eprintln!("skipping: the host has no desktop OpenGL");
+            return;
+        }
+        const GL_TEXTURE_2D: u32 = 0x0DE1;
+        const GL_FRAMEBUFFER: u32 = 0x8D40;
+        const GL_RENDERBUFFER: u32 = 0x8D41;
+        const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const GL_DEPTH_ATTACHMENT: u32 = 0x8D00;
+        const GL_DEPTH_COMPONENT24: u32 = 0x81A6;
+        const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+        const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
+        const GL_RENDERBUFFER_BINDING: u32 = 0x8CA7;
+        let mut b = Batch::new();
+        b.cmd(op::GEN_TEXTURES, &[1, 905]);
+        b.cmd(op::BIND_TEXTURE, &[GL_TEXTURE_2D, 905]);
+        b.raw(op::TEX_IMAGE_2D, &[GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0, 0, 0, 0], &[]);
+        // 906 is generated first; 907 is bound without ever being generated.
+        b.cmd(op::GEN_FRAMEBUFFERS, &[1, 906]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 906]);
+        b.cmd(op::BIND_RENDERBUFFER, &[GL_RENDERBUFFER, 907]);
+        b.cmd(op::RENDERBUFFER_STORAGE, &[GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 16, 16]);
+        b.cmd(op::FRAMEBUFFER_RENDERBUFFER, &[GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 907]);
+        b.cmd(op::FRAMEBUFFER_TEXTURE_2D, &[GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 905, 0]);
+        b.cmd(op::CHECK_FRAMEBUFFER_STATUS, &[GL_FRAMEBUFFER]);
+        b.cmd(op::GET_INTEGERV, &[GL_FRAMEBUFFER_BINDING]);
+        b.cmd(op::GET_INTEGERV, &[GL_RENDERBUFFER_BINDING]);
+        b.cmd(op::VIEWPORT, &[0, 0, 16, 16]);
+        b.cmd(op::CLEAR_COLOR, &[0, 1.0f32.to_bits(), 0, 1.0f32.to_bits()]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        read_back(&mut b);
+        b.cmd(op::GET_ERROR, &[]);
+        b.cmd(op::BIND_FRAMEBUFFER, &[GL_FRAMEBUFFER, 0]);
+        b.cmd(op::DELETE_FRAMEBUFFERS, &[1, 906]);
+        b.cmd(op::DELETE_RENDERBUFFERS, &[1, 907]);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE);
+        let r = reply.bytes();
+        let mut at = 0;
+        assert_eq!(read_u32(r, &mut at), GL_FRAMEBUFFER_COMPLETE);
+        let fb = read_blob(r, &mut at);
+        assert_eq!(u32::from_le_bytes(fb[0..4].try_into().unwrap()), 906, "the framebuffer binding, by the guest's name");
+        let rb = read_blob(r, &mut at);
+        assert_eq!(u32::from_le_bytes(rb[0..4].try_into().unwrap()), 907, "the renderbuffer binding, by the guest's name");
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "no GL error while drawing");
+        assert_eq!(read_u32(r, &mut at), 0, "no GL error deleting");
+        assert_eq!(pixel16(&px, 7, 7), (0, 255, 0, 255), "the clear went to the texture");
+    }
+
     /// Protocol 11: client arrays from a buffer, an orthographic projection
     /// and scaling, a loaded matrix, the current color and the alpha test.
     #[test]
@@ -2183,6 +2386,53 @@ mod tests {
         assert_eq!(pixel16(&px, 3, 8), (255, 0, 0, 255), "the client-array quad, scaled");
         assert_eq!(pixel16(&px, 9, 8), (0, 0, 0, 255), "nothing between");
         assert_eq!(pixel16(&px, 14, 8), (0, 255, 0, 255), "the immediate quad, moved by the loaded matrix");
+
+        // CLIENT_ARRAY: client-memory arrays carried with their pointer
+        // commands, drawn while the guest's own buffer stays bound. (In this
+        // test rather than one of its own: the host tests share the native
+        // decoder's name tables, so a further concurrent GL test races them.)
+        b = Batch::new();
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::MATRIX_MODE, &[GL_PROJECTION]);
+        b.cmd(op::LOAD_IDENTITY, &[]);
+        b.cmd(op::MATRIX_MODE, &[GL_MODELVIEW]);
+        b.cmd(op::DISABLE, &[GL_ALPHA_TEST]);
+        // The left half in clip space, red; then the right half, blue, from
+        // the same slots: each CLIENT_ARRAY replaces its slot's bytes.
+        let quad = |x0: f32, x1: f32| {
+            let mut v = Vec::new();
+            for (x, y) in [(x0, -1.0f32), (x1, -1.0), (x1, 1.0), (x0, 1.0)] {
+                v.extend_from_slice(&x.to_le_bytes());
+                v.extend_from_slice(&y.to_le_bytes());
+            }
+            v
+        };
+        let colour = |c: [u8; 4]| c.repeat(4);
+        b.cmd(op::CLEAR_COLOR, &[0, 0, 0, f(1.0)]);
+        b.cmd(op::CLEAR, &[GL_COLOR_BUFFER_BIT]);
+        b.cmd(op::GEN_BUFFERS, &[1, 9]);
+        b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 9]);
+        b.cmd(op::ENABLE_CLIENT_STATE, &[GL_VERTEX_ARRAY]);
+        b.cmd(op::ENABLE_CLIENT_STATE, &[GL_COLOR_ARRAY]);
+        for (x0, x1, c) in [(-1.0, 0.0, [255, 0, 0, 255]), (0.0, 1.0, [0, 0, 255, 255])] {
+            let v = quad(x0, x1);
+            b.raw(op::CLIENT_ARRAY, &[0, op::VERTEX_POINTER, 3, 2, GL_FLOAT, 8, v.len() as u32], &v);
+            let c = colour(c);
+            b.raw(op::CLIENT_ARRAY, &[1, op::COLOR_POINTER, 3, 4, GL_UNSIGNED_BYTE, 4, c.len() as u32], &c);
+            b.cmd(op::BIND_BUFFER, &[GL_ARRAY_BUFFER, 9]);
+            b.cmd(op::DRAW_ARRAYS, &[GL_QUADS, 0, 4]);
+        }
+        read_back(&mut b);
+        b.cmd(op::GET_ERROR, &[]);
+        let (reply, status, _) = gl.run(b.bytes());
+        assert_eq!(status, error::NONE, "every command was understood");
+        let r = reply.bytes();
+        let mut at = 0;
+        let _offset = read_u32(r, &mut at);
+        let px = read_blob(r, &mut at);
+        assert_eq!(read_u32(r, &mut at), 0, "GL reported no error");
+        assert_eq!(pixel16(&px, 3, 8), (255, 0, 0, 255), "the first quad, from its own bytes");
+        assert_eq!(pixel16(&px, 12, 8), (0, 0, 255, 255), "the second, from the slots' new bytes");
     }
 
     /// Protocol 12's attribute stack, and the host's uniform vectors and

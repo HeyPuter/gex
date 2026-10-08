@@ -319,6 +319,7 @@ mod imp {
         nt::opengl::STATS.store(flag("GEX_NT_GL_STATS"), Ordering::Relaxed);
         nt::opengl::FAST.store(var("GEX_NT_GL_FAST").as_deref() != Some("0"), Ordering::Relaxed);
         nt::opengl::FAST_CLIENT_STATE.store(var("GEX_NT_GL_FAST").as_deref() != Some("nocs"), Ordering::Relaxed);
+        nt::opengl::CLIENT_ARRAY_OP.store(var("GEX_NT_GL_CLIENT_ARRAYS").as_deref() != Some("buffer"), Ordering::Relaxed);
         TRAP_PRINT.store(flag("GEX_NT_TRAP_PRINT"), Ordering::Relaxed);
         crate::cgen::TRAP_CALLOUTS.store(flag("GEX_NT_CALLOUT_TRAP"), Ordering::Relaxed);
         if let Some(k) = var("GEX_NT_TICK_EVERY").and_then(|v| v.parse().ok()) {

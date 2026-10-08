@@ -91,6 +91,13 @@ fn instantiate(
         let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{n:05}.wasm")), &wasm);
     }
     let engine = caller.data().jit.as_ref().map(|j| j.engine.clone()).ok_or_else(|| anyhow!("wasmjit: no engine"))?;
+    // The module cache's directory and this build's name: compiled JIT modules are kept on disk by
+    // their bytes, so the next run of the same program loads them instead of compiling
+    // (`GEX_WASMJIT_CACHE=0` turns it off; Hollow Knight's start-up compiles thousands).
+    let disk = caller.data().jit.as_ref().and_then(|j| j.cache.clone()).filter(|_| {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GEX_WASMJIT_CACHE").map_or(true, |v| v != "0"))
+    });
     let module = {
         let key = {
             use std::hash::{Hash, Hasher};
@@ -104,7 +111,14 @@ fn instantiate(
             Some(m) => m.clone(),
             None => {
                 // Through gex_cache, so gex-rt (which links no compiler) can load it.
-                let m = match gex_cache::compile(&engine, &wasm) {
+                let compiled = match &disk {
+                    Some((dir, build)) => {
+                        let k = gex_cache::key(build, [b"wasmjit".as_slice(), &wasm]);
+                        gex_cache::load_or_compile_at(&engine, &dir.join("wasmjit").join(format!("{k}.cwasm")), &wasm)
+                    }
+                    None => gex_cache::compile(&engine, &wasm),
+                };
+                let m = match compiled {
                     Ok(m) => m,
                     Err(e) => {
                         // `GEX_DUMP_BAD_WASM=DIR`: keep a module the engine refused, as for gex's own.
@@ -115,6 +129,7 @@ fn instantiate(
                         bail!("compile: {e:#}")
                     }
                 };
+                crate::aot_share::note(&m, crate::aot_share::Kind::Managed);
                 map.insert(key, m.clone());
                 m
             }

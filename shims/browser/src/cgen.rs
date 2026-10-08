@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) mod elfprov;
+pub(crate) mod libprov;
 mod wasmdll;
 pub(crate) mod wasmprog;
 
@@ -866,7 +867,8 @@ fn provider_alloc_bytes(size: u64, name: &str) -> Result<u64, String> {
 fn linux_alloc(size: u64, name: &str) -> Result<u64, String> {
     use gex_kernel::mem::{flags, prot};
     let len = (size + 0xfff) & !0xfff;
-    crate::with_host(|h| h.kernel.mem.mmap(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
+    // Below 4 GiB in a 64-bit memory too: the page hands these addresses around as 32 bits.
+    crate::with_host(|h| h.kernel.mem.mmap_low(0, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
 /// [`provider_alloc_bytes`] from the top down (`boot::alloc_private_top`): a
@@ -1181,6 +1183,15 @@ pub extern "C" fn gex_ftab_lookup(_ctx: i32, addr: i64) -> i32 {
     let hit = hit.or_else(|| crate::fjit::translate(addr));
     let idx = hit.unwrap_or(gex_abi::ftab::FALLBACK);
     gex_kernel::ftab::fcache_write(mem, addr, idx);
+    if libprov::any_registered() {
+        LOOKUP_RING.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.len() >= 16 {
+                r.remove(0);
+            }
+            r.push((addr, idx));
+        });
+    }
     idx as i32
 }
 
@@ -1251,7 +1262,28 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     if ret as u64 == gex_abi::ftab::NO_RETURN || !CALLOUT_ON.load(Ordering::Relaxed) {
         return gex_abi::ftab::RET_LEFT;
     }
-    if CALLOUTS.with(|c| c.borrow().len()) >= CALLOUT_MAX_DEPTH {
+    if libprov::provider_return(ret as u64) {
+        let sp = gm.read_u64(c + gex_abi::ctx::x(sp_index()) as u64).unwrap_or(0);
+        PROV_RING.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.len() >= 16 {
+                r.remove(0);
+            }
+            r.push((t, ret as u64, sp));
+        });
+    }
+    if PROV_TRACE.load(Ordering::Relaxed) && libprov::provider_return(ret as u64) {
+        crate::warn_line(&format!("[gex] provider guest call to {t:#x} (call-outs open {})\n", CALLOUTS.with(|c| c.borrow().len())));
+    }
+    // A stateful provider's guest call (its return address in the provider's
+    // code page) cannot be left: its frames would be lost. Those nest as deep
+    // as the program's calls between guest and provider do (Unity: icall ->
+    // runtime_invoke -> icall ...).
+    let limit = if libprov::provider_return(ret as u64) { CALLOUT_MAX_DEPTH_PROVIDER } else { CALLOUT_MAX_DEPTH };
+    if CALLOUTS.with(|c| c.borrow().len()) >= limit {
+        if limit == CALLOUT_MAX_DEPTH_PROVIDER {
+            crate::warn_line(&format!("gex: a provider's guest calls nest deeper than {limit}\n"));
+        }
         return gex_abi::ftab::RET_LEFT;
     }
     // The stack once the guest has returned: the caller's, past the return
@@ -1271,6 +1303,10 @@ pub extern "C" fn gex_ftab_fallback(ctx: i32, _depth: i32, _need: i32, ret: i64)
     CALLOUTS.with(|c| c.borrow_mut().truncate(depth));
     if r == gex_abi::ftab::RET_LEFT {
         CALLOUT_LEFT.fetch_add(1, Ordering::Relaxed);
+        if libprov::provider_return(ret as u64) {
+            let pc = GuestMem::new(crate::guest_bytes()).read_u64(c + gex_abi::ctx::PC as u64).unwrap_or(0);
+            crate::warn_line(&format!("[gex] a provider's guest call-out to {t:#x} was left (the guest is at {pc:#x})\n"));
+        }
     }
     r
 }
@@ -1296,11 +1332,17 @@ static CALLOUT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 #[no_mangle]
 pub extern "C" fn gex_set_callout(on: i32) {
     CALLOUT_ON.store(on != 0, Ordering::Relaxed);
+    PROV_TRACE.store(on == 2, Ordering::Relaxed);
 }
 
 /// Call-outs nested deeper than this leave instead: each holds a shim frame
 /// and a JS one.
 const CALLOUT_MAX_DEPTH: usize = 32;
+/// `gex_set_callout(2)`: say every stateful provider's guest call.
+static PROV_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The same for a stateful provider's guest calls, which cannot leave.
+const CALLOUT_MAX_DEPTH_PROVIDER: usize = 400;
 
 /// How far above a call-out's `sp_want` its return may come back (what a
 /// stdcall callee pops, or a function frame resumed inside), and past which
@@ -1375,6 +1417,35 @@ pub(crate) fn returned(pc: u64, ctx: u64) -> bool {
         }
         None => false,
     }
+}
+
+thread_local! {
+    /// The last function-table lookups of this Worker (address, index), in a provider's process.
+    static LOOKUP_RING: std::cell::RefCell<Vec<(u64, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The last stateful-provider guest calls that reached the fallback: (target, return, sp).
+    static PROV_RING: std::cell::RefCell<Vec<(u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether a stateful provider's guest call is open on this Worker: the guest
+/// code running now has the provider's wasm frames below it, which a trap to
+/// JS's run loop would abandon.
+pub(crate) fn provider_callout_open() -> bool {
+    libprov::guest_call_open() || CALLOUTS.with(|c| c.borrow().iter().any(|&(r, _, _)| libprov::provider_return(r)))
+}
+
+/// [`LOOKUP_RING`], for a diagnostic.
+pub(crate) fn lookups_recent() -> Vec<(u64, u32)> {
+    LOOKUP_RING.with(|r| r.borrow().clone())
+}
+
+/// [`PROV_RING`], for a diagnostic.
+pub(crate) fn provider_calls_recent() -> Vec<(u64, u64, u64)> {
+    PROV_RING.with(|r| r.borrow().clone())
+}
+
+/// The call-outs this Worker has open, for a diagnostic: (return, sp wanted, callback depth).
+pub(crate) fn callouts_open() -> Vec<(u64, u64, u32)> {
+    CALLOUTS.with(|c| c.borrow().clone())
 }
 
 /// A call-out at depth `depth` (and every deeper one) was left by an

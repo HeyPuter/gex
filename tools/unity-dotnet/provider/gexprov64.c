@@ -14,6 +14,10 @@ static __thread volatile int gexp_in_guest;
 static volatile int gexp_stop;
 __attribute__((import_module("gex"), import_name("provider_thread_register"))) void gexp_host_thread_register(volatile int *in_guest, volatile int *stop);
 __attribute__((import_module("gex"), import_name("provider_park"))) void gexp_host_park(void);
+/* A guest call by the provider begins (+1) or ends (-1) on this thread: in the
+ * browser, guest code with the provider's frames below it must not leave them
+ * for the run loop (a blocking syscall waits in place), whatever tier runs it. */
+__attribute__((import_module("gex"), import_name("provider_guest_call"))) void gexp_host_guest_call(int delta);
 __attribute__((import_module("gex"), import_name("provider_stop_guest"))) void gexp_host_stop_guest(void);
 __attribute__((import_module("gex"), import_name("provider_start_guest"))) void gexp_host_start_guest(void);
 __attribute__((import_module("gex"), import_name("provider_guest_stack_end"))) uint64_t gexp_host_guest_stack_end(uint64_t sp);
@@ -137,6 +141,7 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 		*(volatile uint64_t *)((uintptr_t)(uint32_t)ctx + GEXP_CTX_V + 16 * i) = c->xmm[i];
 	GEXP_X(ctx, 4) = sp;
 	void *cookie = gexp_hook_call_guest();
+	gexp_host_guest_call(1);
 	in_guest(1);
 	/* Run the guest until it returns to `ra`. A function body returns 1 when
 	 * its return went to the address its caller predicted; otherwise 0, with
@@ -158,6 +163,7 @@ void gexp_call_guest(uint64_t fn, gexp_call *c)
 	gexp_depth = depth;
 	__gex_set_ctx((uint32_t)ctx);
 	in_guest(0);
+	gexp_host_guest_call(-1);
 	gexp_hook_call_return(cookie);
 	GEXP_X(ctx, 4) = rsp0;
 	c->rax = GEXP_X(ctx, 0);

@@ -73,8 +73,12 @@ export class Compositor {
       // `?wgslcache=all|site|0`: which shader translations Mesa starts with
       // (mesa-gl.js #loadWgslCache).
       const wgslCache = q?.get('wgslcache');
+      // `?wgpustats=1`: count Mesa's WebGPU calls for the stats line
+      // (mesa-gl.js countWebGpu); off by default, it costs time.
+      const wgpuStats = q?.get('wgpustats') === '1';
       this.#worker.postMessage({ kind: 'gl', channel, ...opts, ...(mesaEnv ? { mesaEnv } : {}),
-        ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}) });
+        ...(glCapture ? { glCapture } : {}), ...(wgslCache ? { wgslCache } : {}),
+        ...(wgpuStats ? { wgpuStats } : {}) });
     });
   }
 
@@ -118,8 +122,8 @@ export class Compositor {
       } else if (m.kind === 'cursor') {
         if (this.#direct) this.#canvas.style.cursor = m.css;
         this.#cursorCss = m.css;
-      } else if (m.kind === 'describe' || m.kind === 'wgsl-cache') {
-        this.#pending.get(m.id)?.(m.kind === 'describe' ? m.state : { blob: m.blob, stats: m.stats });
+      } else if (m.kind === 'describe' || m.kind === 'wgsl-cache' || m.kind === 'readout') {
+        this.#pending.get(m.id)?.(m.kind === 'wgsl-cache' ? { blob: m.blob, stats: m.stats } : m.state);
         this.#pending.delete(m.id);
       } else if (m.kind === 'error') {
         console.error('[compositor]', m.error);
@@ -292,6 +296,28 @@ export class Compositor {
       this.#pending.set(id, resolve);
       this.#worker.postMessage({ kind: 'wgsl-cache', id });
     });
+  }
+
+  /** The composited output read back: `{ w, h, px }` (RGBA, top row first), or null. */
+  readout() {
+    const id = this.#next++;
+    return new Promise((resolve) => {
+      this.#pending.set(id, resolve);
+      this.#worker.postMessage({ kind: 'readout', id });
+      setTimeout(() => {
+        if (this.#pending.delete(id)) resolve(null);
+      }, 5000);
+    });
+  }
+
+  /** The output read back as base64 RGBA, for a harness: `{ w, h, b64 }` or null. */
+  async readoutBase64() {
+    const r = await this.readout();
+    if (!r) return null;
+    let s = '';
+    const px = r.px;
+    for (let i = 0; i < px.length; i += 0x8000) s += String.fromCharCode.apply(null, px.subarray(i, i + 0x8000));
+    return { w: r.w, h: r.h, b64: btoa(s) };
   }
 
   describe() {

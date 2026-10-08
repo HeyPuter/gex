@@ -143,6 +143,12 @@ def main():
                 is_crt = lambda n: n.startswith(('msvcr', 'ucrt')) or n == 'crtdll'
                 crt = next((i for i in eager if is_crt(i)), None if is_crt(mod.split('.')[0]) else 'ucrtbase')
                 eager += [c for c in (crt, 'kernel32', 'ntdll') if c and c not in eager]
+            # and its delay imports, after them: a native module's calls are
+            # bound in the one module, so nothing would load a delay-loaded
+            # DLL on first call, and a DLL never loaded never ran its DllMain
+            # (wineboot's user32 and gdi32: win32u's syscall table missing,
+            # every NtUser call STATUS_INVALID_SYSTEM_SERVICE)
+            eager += [i.lstrip('-') for i in makefile_var(mk, 'DELAYIMPORTS') if i.lstrip('-') not in eager]
             EAGER[mod] = [i if '.' in i else i + '.dll' for i in eager]
     if not dlls:
         sys.exit('no DLL objects found (build with winegcc for wasm32)')
@@ -255,7 +261,11 @@ def link(dlls, out, gexrt, others=None):
                 owners = [o for o in owners if (name, 'defined') in sigs[o]] or owners
                 if mod in owners:
                     continue  # its own: already resolved inside it
-                pick = next((o for o in imports if o in owners), owners[0])
+                # (its own C runtime first, which its import list does not
+                # name: ucrtbase's _wopen and msvcrt's _fstat32 are two fd
+                # tables, and wineboot's fstat of a file it had just opened
+                # failed)
+                pick = next((o for o in EAGER.get(mod, []) + imports if o in owners), owners[0])
                 # a caller declaring the function otherwise than its
                 # definition (an adapter from the .spec: user32's
                 # NotifyWinEvent is void, win32u's stub returns a word) goes
@@ -413,6 +423,15 @@ def link(dlls, out, gexrt, others=None):
         for (n, k), v in sigs[mod].items():
             if k == 'undefined' and n in missing:
                 callers.setdefault(n, v)
+    # Only weakly referenced (msvcrt's crt_main asks whether the program
+    # defined __main_argc_argv or __original_main): left undefined, so the
+    # reference stays null. A trapping stub would make it non-null, and a
+    # program with the other form of main would call the trap.
+    strong = set()
+    for mod, ro, ex, imports in dlls:
+        nm = subprocess.run(['llvm-nm', '--undefined-only', ro], capture_output=True, text=True).stdout
+        strong |= {l.split()[-1] for l in nm.splitlines() if l.split()[:1] == ['U']}
+    callers = {n: v for n, v in callers.items() if n in strong}
     gaps = sorted(callers.items())
     if gaps:
         ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}

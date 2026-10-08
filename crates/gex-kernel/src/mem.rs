@@ -32,6 +32,10 @@ pub mod flags {
     pub const FIXED_NOREPLACE: u64 = 0x100000;
     pub const ANONYMOUS: u64 = 0x20;
     pub const NORESERVE: u64 = 0x4000;
+    /// x86-64's `MAP_32BIT`: below 2 GiB. In an M64 process it keeps an
+    /// anonymous mapping out of the high arena (the guest GL library's command
+    /// ring, whose address the browser host takes as 32 bits).
+    pub const MAP_32BIT: u64 = 0x40;
     pub const STACK: u64 = 0x20000;
 }
 

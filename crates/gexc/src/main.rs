@@ -2413,11 +2413,15 @@ fn cmd_cgen_c(args: &[String]) -> Result<()> {
 
 fn cmd_cgen_image(args: &[String]) -> Result<()> {
     let (mut path, mut pe_base) = (None, None);
+    let mut elf = false;
     let mut jobs = 4usize;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--pe-base" => {
+            // `--elf SO --base HEX`: a Linux shared object's unit at the load
+            // bias it is mapped with (nt_cgen::on_elf_maps, GEX_ELF_UNITS).
+            "--elf" => elf = true,
+            "--pe-base" | "--base" => {
                 i += 1;
                 let v = args.get(i).context("--pe-base needs an address")?;
                 pe_base = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16)?);
@@ -2453,6 +2457,14 @@ fn cmd_cgen_image(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let bytes = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
+    if elf {
+        let base = pe_base.context("--elf needs --base")?;
+        let _lock = gex_native::nt_cgen::build_lock()?;
+        let t0 = std::time::Instant::now();
+        let out = gex_native::nt_cgen::prepare_elf(&bytes, base, jobs, true)?;
+        eprintln!("{path} at {base:#x}: {} ({:.1}s)", out.display(), t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let pe = gex_ld::pe::parse(&bytes).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
     let base = pe_base.unwrap_or(pe.preferred_base);
     // One build at a time per cache, across processes: a recovery's peak is

@@ -16,6 +16,122 @@ const m64 = () => !!globalThis.GEX_MEM64;
 const LIMIT64_BYTES = 16 * 2 ** 30;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (v) => (m64() ? BigInt(v >>> 0) : v | 0);
+/** The global imports of a wasm module, as `module.name` -> WebAssembly.Global descriptor
+ *  (JS cannot ask a Module for its imports' types). */
+function importedGlobals(bytes) {
+  const out = new Map();
+  let p = 8;
+  const leb = () => {
+    let r = 0, sh = 0, b;
+    do { b = bytes[p++]; r |= (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
+    return r;
+  };
+  const str = () => { const n = leb(); const s = new TextDecoder().decode(bytes.subarray(p, p + n)); p += n; return s; };
+  while (p < bytes.length) {
+    const id = bytes[p++];
+    const size = leb();
+    const end = p + size;
+    if (id === 2) {
+      const count = leb();
+      for (let i = 0; i < count; i++) {
+        const m = str(), n = str(), kind = bytes[p++];
+        if (kind === 0) leb();
+        else if (kind === 1) { p++; const f = leb(); leb(); if (f & 1) leb(); }
+        else if (kind === 2) { const f = leb(); leb(); if (f & 1) leb(); }
+        else if (kind === 3) {
+          const t = bytes[p++], mut = bytes[p++];
+          out.set(`${m}.${n}`, { value: { 0x7f: 'i32', 0x7e: 'i64', 0x7d: 'f32', 0x7c: 'f64' }[t] ?? 'i64', mutable: !!(mut & 1) });
+        } else if (kind === 4) { p++; leb(); }
+      }
+      return out;
+    }
+    p = end;
+  }
+  return out;
+}
+
+/** For each element of a PIC module's (first active) element segment, its function's type
+ *  packed as the provider's JIT asks for it (`provider_jit_table` SIG, the native `wasmjit`):
+ *  bits 0..4 the parameter count, 5..7 the result (0 none, 1 i32, 2 i64, 3 f32, 4 f64), then two
+ *  bits per parameter from bit 8 (0 i32, 1 i64, 2 f32, 3 f64); -1 when not representable. */
+function elementSignatures(bytes) {
+  let p = 8;
+  const leb = () => {
+    let r = 0, sh = 0, b;
+    do { b = bytes[p++]; r += (b & 0x7f) * 2 ** sh; sh += 7; } while (b & 0x80);
+    return r;
+  };
+  const skipStr = () => { const n = leb(); p += n; };
+  const vcode = { 0x7f: 0, 0x7e: 1, 0x7d: 2, 0x7c: 3 };
+  const types = [];
+  let importedFuncs = 0;
+  const funcTypes = [];
+  let elems = null;
+  while (p < bytes.length) {
+    const id = bytes[p++];
+    const size = leb();
+    const end = p + size;
+    if (id === 1) {
+      const n = leb();
+      for (let i = 0; i < n; i++) {
+        if (bytes[p] === 0x4e || bytes[p] === 0x4f || bytes[p] === 0x50) { types.push(-1); p = end; break; } // rec/sub: not ours
+        p++; // 0x60
+        const np = leb();
+        let packed = np > 28 ? -1 : np, ok = np <= 28;
+        for (let k = 0; k < np; k++) {
+          const c = vcode[bytes[p++]];
+          if (c === undefined) ok = false; else if (ok) packed += c * 2 ** (8 + 2 * k);
+        }
+        const nr = leb();
+        if (nr > 1) ok = false;
+        for (let k = 0; k < nr; k++) {
+          const c = vcode[bytes[p++]];
+          if (c === undefined) ok = false; else if (ok) packed += (c + 1) * 32;
+        }
+        types.push(ok ? packed : -1);
+      }
+    } else if (id === 2) {
+      const n = leb();
+      for (let i = 0; i < n; i++) {
+        skipStr(); skipStr();
+        const kind = bytes[p++];
+        if (kind === 0) { leb(); importedFuncs++; funcTypes.push(-2); }
+        else if (kind === 1) { p++; const f = leb(); leb(); if (f & 1) leb(); }
+        else if (kind === 2) { const f = leb(); leb(); if (f & 1) leb(); }
+        else if (kind === 3) { p += 2; }
+        else if (kind === 4) { p++; leb(); }
+      }
+    } else if (id === 3) {
+      const n = leb();
+      for (let i = 0; i < n; i++) funcTypes.push(leb());
+    } else if (id === 9 && !elems) {
+      const n = leb();
+      for (let i = 0; i < n && !elems; i++) {
+        const flags = leb();
+        if (flags === 0 || flags === 2) {
+          if (flags === 2) leb();
+          while (bytes[p] !== 0x0b) p++; // the offset expression
+          p++;
+          if (flags === 2) p++; // elemkind
+          const m = leb();
+          elems = [];
+          for (let k = 0; k < m; k++) elems.push(leb());
+        } else {
+          p = end; // other forms: not what a PIC module writes
+        }
+      }
+    }
+    p = end;
+  }
+  // Imported functions' types are not known here (their entries are -2 above): -1.
+  return (elems ?? []).map((fi) => {
+    const ti = funcTypes[fi];
+    return ti === undefined || ti < 0 ? -1 : (types[ti] ?? -1);
+  });
+}
+
+/** An index into the function table: a table64 (BigInt indices) beside a 64-bit memory. */
+const tIdx = (v) => (m64() ? BigInt(v) : v);
 
 /**
  * Decode UTF-8 out of guest memory.
@@ -686,6 +802,10 @@ export class Gex {
   /// writer of `DISPATCH_DIR` reports itself, naming the one that moves it.
   /// See #136.
   static watchDir = -1;
+  /** `soname=path,...` (the page's `?wasmdlls=`): libraries replaced by wasm64 providers. */
+  static wasmDlls = '';
+  /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
+  static elfUnits = '';
   static #whySlot = 0;
 
   #bytes() {
@@ -886,7 +1006,7 @@ export class Gex {
         call_out: (ctx, target, ret, spWant) => this.#callOut(ctx >>> 0, target, ret, spWant),
         // An AOT-only fallback whose target this Worker has just installed
         // (cgen.rs `gex_ftab_fallback`): called as a function body.
-        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(idx >>> 0)(ctx, depth, need, ret),
+        ftab_call: (idx, ctx, depth, need, ret) => this.#cgen.ftab.get(tIdx(idx >>> 0))(ctx, depth, need, ret),
         // A dispatch miss installs in place (lib.rs `in_place`).
         jit_install: (_ctx) => this.#jitInstall(),
         // An exception dispatched nested (nt.rs `raise_nested`).
@@ -997,6 +1117,7 @@ export class Gex {
     // there, and their units are looked up then.
     if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
     if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
+    this.#libprovConfig();
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
@@ -1221,7 +1342,7 @@ export class Gex {
           opts.syscallGuard(ctx >>> 0, pc, this.#memory);
           return e.gex_syscall(ctx, pc);
         }
-        : e.gex_syscall,
+        : this.#guestSyscall(e),
       dispatch_miss: e.gex_dispatch_miss,
       illegal: e.gex_illegal,
       breakpoint: e.gex_breakpoint,
@@ -1438,13 +1559,14 @@ export class Gex {
       // its parent's providers made code (cgen/elfprov.rs).
       if (this.#cgenMode) this.#shim.exports.gex_cgen_set_mode?.(this.#cgenMode);
       if (this.#noElfProviders) this.#shim.exports.gex_elfprov_off?.();
+      this.#libprovConfig();
     // Narrate one page's directory writes, in every process. See #136.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     }
     const e = this.#shim.exports;
     this.#imports = {
       memory: this.#memory,
-      syscall: e.gex_syscall,
+      syscall: this.#guestSyscall(e),
       dispatch_miss: e.gex_dispatch_miss,
       illegal: e.gex_illegal,
       breakpoint: e.gex_breakpoint,
@@ -2408,6 +2530,25 @@ export class Gex {
   #cgenMode = 0;
   /** No ELF export providers (cgen/elfprov.rs): A/B runs, every process of
    *  the run (a forked child's Worker is told too). Before the shim exists. */
+  /** `?wasmdlls=soname=path,...`: libraries this process replaces with wasm64
+   *  providers (cgen/libprov.rs). */
+  #libprovConfig() {
+    const e = this.#shim.exports;
+    if (Gex.elfUnits && e.gex_cgen_elf_units) {
+      const b = new TextEncoder().encode(Gex.elfUnits);
+      const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+      this.#bytes().set(b, p);
+      e.gex_cgen_elf_units(p, b.length);
+      e.gex_free?.(p, Math.max(8, b.length));
+    }
+    if (!Gex.wasmDlls || !e.gex_libprov_config) return;
+    const b = new TextEncoder().encode(Gex.wasmDlls);
+    const p = e.gex_alloc(Math.max(8, b.length)) >>> 0;
+    this.#bytes().set(b, p);
+    e.gex_libprov_config(p, b.length);
+    e.gex_free?.(p, Math.max(8, b.length));
+  }
+
   noElfProviders() {
     this.#noElfProviders = true;
     this.#shim?.exports.gex_elfprov_off?.();
@@ -2466,7 +2607,9 @@ export class Gex {
       rm = new WebAssembly.Module(this.#bytes().slice(ptr, ptr + (e.gex_ftab_runtime_len() >>> 0)));
       this.#sharedModules.set('ftab-runtime', rm);
     }
-    const ftab = new WebAssembly.Table({ element: 'anyfunc', initial: 0 });
+    // A table64 beside a 64-bit memory: every module of such a process (units, translations,
+    // providers) addresses its function table with i64.
+    const ftab = new WebAssembly.Table(m64() ? { element: 'anyfunc', address: 'i64', initial: 0n } : { element: 'anyfunc', initial: 0 });
     const lookup = (ctx, addr) => {
       if (e.gex_ftab_behind()) this.#cgenCatchUp();
       const idx = e.gex_ftab_lookup(ctx, addr);
@@ -2491,7 +2634,7 @@ export class Gex {
     const ri = new WebAssembly.Instance(rm, { gex });
     this.#cgen = { ftab, resolve: ri.exports.resolve, bridge: ri.exports.bridge, lookup, have: 0, instances: [ri] };
     this.#cgenGrow();
-    ftab.set(1, e.gex_ftab_fallback);
+    ftab.set(tIdx(1), e.gex_ftab_fallback);
     return this.#cgen;
   }
 
@@ -2501,7 +2644,8 @@ export class Gex {
   #cgenGrow() {
     const st = this.#cgen;
     const want = (this.#shim.exports.gex_ftab_size() >>> 0) + 65536;
-    if (st.ftab.length < want) st.ftab.grow(want - st.ftab.length, st.resolve);
+    const have = Number(st.ftab.length);
+    if (have < want) st.ftab.grow(tIdx(want - have), st.resolve);
   }
 
   /** Install unit `u` into this Worker: instantiate it with `__table_base` =
@@ -2520,6 +2664,8 @@ export class Gex {
     const wasmdll = prov >= 0 && (e.gex_cgen_pmod_wasm_len?.(prov) >>> 0) > 0;
     // A native wasm32 program (cgen/wasmprog.rs): its bytes come the same way.
     const wasmprog = wasmdll && !!e.gex_cgen_pmod_wasmprog?.(prov);
+    // A replaced Linux library's wasm64 provider (cgen/libprov.rs): the 64-bit provider_* imports.
+    const libprov = wasmdll && !!e.gex_cgen_pmod_libprov?.(prov);
     const mod = wasmdll
       ? this.#cgenFileModule(this.#cgenStr(e.gex_cgen_pmod_file, prov),
         new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0).slice())
@@ -2534,17 +2680,19 @@ export class Gex {
       : jit >= 0 ? (b, c) => e.gex_fjit_regs(jit, b, c)
       : (b, c) => e.gex_cgen_regs(u, b, c);
     const tables = this.#growTables((prov >= 0 ? e.gex_cgen_pmod_slots(prov) : jit >= 0 ? e.gex_fjit_slots(jit) : e.gex_cgen_slots(u)) >>> 0, 'cgen');
+    const tInst = performance.now();
     const inst = new WebAssembly.Instance(mod, {
       env: {
         memory: this.#memory,
         __indirect_function_table: st.ftab,
-        __table_base: new WebAssembly.Global({ value: 'i32', mutable: false }, base | 0),
-        __memory_base: new WebAssembly.Global({ value: 'i32', mutable: false }, memBase),
+        // i64 in a 64-bit memory's process (wasm64 PIC modules).
+        __table_base: new WebAssembly.Global({ value: m64() ? 'i64' : 'i32', mutable: false }, m64() ? BigInt(base >>> 0) : base | 0),
+        __memory_base: new WebAssembly.Global({ value: m64() ? 'i64' : 'i32', mutable: false }, m64() ? BigInt(memBase) : memBase),
         // A unit's functions never use clang's shadow stack (those are stubs),
         // but a position-independent module imports its pointer all the same.
         // A stateful provider's is this Worker's (one C stack per thread).
         // A wasm32 program sets its own at each thread's entry.
-        __stack_pointer: memBase && !wasmprog ? this.#providerStack() : new WebAssembly.Global({ value: 'i32', mutable: true }, 0),
+        __stack_pointer: memBase && !wasmprog ? (libprov ? this.#providerStack64() : this.#providerStack()) : new WebAssembly.Global(m64() ? { value: 'i64', mutable: true } : { value: 'i32', mutable: true }, m64() ? 0n : 0),
       },
       gex: {
         ...this.#imports, lookup: st.lookup, ftab: st.ftab,
@@ -2563,11 +2711,16 @@ export class Gex {
           code_changed: (addr, len) => e.gex_code_changed?.(addr, len),
           wine_pe_slot: (ptr, len) => e.gex_wine_pe_slot?.(ptr, len) ?? 0,
         } : {}),
-        ...(memBase && !wasmprog ? this.#providerImports() : {}),
-        ...(wasmprog ? this.#wasmprogImports(() => inst) : wasmdll ? { syscall: this.#nativeSyscall } : {}),
+        ...(memBase && !wasmprog ? (libprov ? this.#providerImports64() : this.#providerImports()) : {}),
+        ...(wasmprog ? this.#wasmprogImports(() => inst) : libprov ? { syscall: this.#providerSyscall } : wasmdll ? { syscall: this.#nativeSyscall } : {}),
       },
     });
     if (wasmprog ? e.gex_wasmprog_relocate(prov) : memBase && e.gex_provider_relocate(memBase)) inst.exports.__wasm_apply_data_relocs?.();
+    // A wasm64 provider's slots' function types, for its JIT's `provider_jit_table` SIG.
+    if (libprov && !this.#provSigs.some((x) => x.base === base)) {
+      const bytes = new Uint8Array(this.#memory.buffer, e.gex_cgen_pmod_wasm_ptr(prov) >>> 0, e.gex_cgen_pmod_wasm_len(prov) >>> 0);
+      this.#provSigs.push({ base, sigs: elementSignatures(bytes) });
+    }
     const n = regsOf(0, 0) >>> 0;
     const buf = e.gex_alloc(4 * Math.max(1, n)) >>> 0;
     let regs;
@@ -2588,6 +2741,9 @@ export class Gex {
     // The first Worker to install a JIT module writes the directory for the
     // pages it numbered (idempotent).
     if (jit >= 0) e.gex_fjit_installed(jit);
+    // What each Worker pays to install a unit (instantiation fills its slots).
+    const ms = performance.now() - tInst;
+    if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${regs.length / 2} bridges)`);
     return regs.length / 2;
   }
 
@@ -2606,6 +2762,197 @@ export class Gex {
     return this.#provStack;
   }
 
+  /** This Worker's stack for a wasm64 provider (i64 `__stack_pointer`), and its lowest address. */
+  #provStack64 = null;
+  #provStackLo = 0n;
+  #providerStack64() {
+    if (!this.#provStack64) {
+      const size = 1 << 20;
+      const e = this.#shim.exports;
+      const base = e.gex_provider_stack(size) >>> 0;
+      if (!base) throw new Error('gex: no memory for a provider stack');
+      this.#provStackLo = BigInt(base);
+      this.#provStack64 = new WebAssembly.Global({ value: 'i64', mutable: true }, BigInt(base + size - 16));
+    }
+    return this.#provStack64;
+  }
+
+  /** This Worker's exception tag for a wasm64 provider's `provider_throw`: a wasm
+   *  exception, so code the provider publishes at run time (its JIT, which imports it)
+   *  can catch it with `try_table`, and `provider_try` takes it when nothing did. */
+  #provTag = null;
+  #providerTag() {
+    this.#provTag ??= new WebAssembly.Tag({ parameters: ['i32'] });
+    return this.#provTag;
+  }
+
+  /** What a replaced Linux library's wasm64 provider imports from `gex` (the native
+   *  `libprov::register64`; docs/unity-dotnet.md P5 B1). Pointers and table indices
+   *  are i64 (BigInt). */
+  #providerImports64() {
+    const e = this.#shim.exports;
+    const ftab = this.#cgen.ftab;
+    const tag = this.#providerTag();
+    return {
+      provider_try: (f, arg) => {
+        // The guest calls a raise unwinds are no longer open.
+        const calls = e.gex_libprov_guest_calls();
+        try {
+          ftab.get(f)(arg);
+          return 0;
+        } catch (err) {
+          e.gex_libprov_guest_calls_set(calls);
+          if (err instanceof WebAssembly.Exception && err.is(tag)) return err.getArg(tag, 0);
+          throw err;
+        }
+      },
+      provider_throw: (code) => {
+        throw new WebAssembly.Exception(tag, [code]);
+      },
+      // The shim's export itself: a wasm-to-wasm call on every guest call.
+      provider_guest_call: e.gex_libprov_guest_call,
+      provider_missing: (addr) => e.gex_libprov_missing(addr),
+      provider_thread_entry: () => e.gex_libprov_thread_entry(),
+      provider_code_page: () => e.gex_libprov_thread_entry(),
+      provider_stack: () => this.#provStackLo,
+      provider_guest_sym: (ptr, len) => e.gex_libprov_guest_sym(ptr, len),
+      provider_guest_stack_end: (sp) => e.gex_libprov_guest_stack_end(sp),
+      provider_abi: (which) => e.gex_libprov_abi(which),
+      provider_table_size: (base) => e.gex_libprov_table_size(base),
+      // Stopping the guest's threads around the runtime's collection (cgen/libprov.rs).
+      provider_thread_register: (inGuest, stop) => e.gex_libprov_thread_register(inGuest, stop),
+      provider_park: () => e.gex_libprov_park(),
+      provider_stop_guest: () => e.gex_libprov_stop(),
+      provider_start_guest: () => e.gex_libprov_start(),
+      // The runtime's wasm JIT (the native `wasmjit`): a range of the process's function
+      // table, and each method's module compiled once per process and instantiated in every
+      // Worker that runs it.
+      provider_jit_reserve: (n) => {
+        const base = e.gex_libprov_jit_reserve(BigInt(n));
+        this.#cgenCatchUp();
+        return base;
+      },
+      provider_jit_instantiate: (...a) => this.#jitInstantiate(...a),
+      provider_jit_table: (op, a, b) => {
+        a = BigInt(a);
+        if (op === 0) {
+          const f = this.#jitInstalled.get(a);
+          if (!f) return 0n;
+          ftab.set(a, f);
+          return 1n;
+        }
+        if (op === 1) {
+          const f = ftab.get(BigInt(b));
+          if (!f) throw new Error(`wasmjit: alias of an empty slot ${b}`);
+          ftab.set(a, f);
+          this.#jitInstalled.set(a, f);
+          return 0n;
+        }
+        if (op === 2) {
+          const f = ftab.get(a);
+          return f ? BigInt(f.length) : -1n;
+        }
+        // SIG: from the provider module's own types (JS cannot ask a function for them).
+        for (const { base, sigs } of this.#provSigs) {
+          const k = Number(a) - base;
+          if (k >= 0 && k < sigs.length) return BigInt(sigs[k]);
+        }
+        return -1n;
+      },
+    };
+  }
+
+  /** Wasm64 providers' table ranges and their slots' packed function types. */
+  #provSigs = [];
+
+  /** The functions this Worker's JIT instantiations installed, by table slot. */
+  #jitInstalled = new Map();
+
+  /** `gex.provider_jit_instantiate(bytes, len, cnames, consts, nconsts, slots, names, n,
+   *  errbuf, errcap)`: compile (once per process, by content) and instantiate a JIT module in
+   *  this Worker, installing its named exports at table slots. 1, or 0 with the reason in
+   *  errbuf. */
+  #jitInstantiate(bytes, len, cnames, consts, nconsts, slots, names, n, errbuf, errcap) {
+    const mem = new Uint8Array(this.#memory.buffer);
+    const N = Number;
+    try {
+      const wasm = mem.slice(N(bytes), N(bytes) + N(len));
+      let h = 0x811c9dc5;
+      for (let i = 0; i < wasm.length; i++) h = Math.imul(h ^ wasm[i], 16777619) >>> 0;
+      const name = `wasmjit:${wasm.length}:${h.toString(16)}`;
+      let mod = this.#sharedModules.get(name);
+      if (!mod) {
+        mod = new WebAssembly.Module(wasm);
+        this.#sharedModules.set(name, mod);
+        this.#env.shareModule?.(name, mod);
+      }
+      const dv = new DataView(this.#memory.buffer);
+      const cv = new Map();
+      if (N(nconsts) > 0) {
+        const nb = mem.slice(N(cnames), N(cnames) + 256);
+        let at = 0;
+        for (let k = 0; k < N(nconsts); k++) {
+          let end = at;
+          while (end < nb.length && nb[end] !== 0) end++;
+          cv.set(new TextDecoder().decode(nb.subarray(at, end)), dv.getBigUint64(N(consts) + 8 * k, true));
+          at = end + 1;
+        }
+      }
+      const globals = importedGlobals(wasm);
+      const ftab = this.#cgen.ftab;
+      const imports = { m: { h: this.#memory }, f: { f: ftab }, s: {}, x: { e: this.#providerTag() }, h: {} };
+      for (const imp of WebAssembly.Module.imports(mod)) {
+        if (imp.module === 's') {
+          if (imp.name === 'p') {
+            imports.s.p = this.#providerStack64();
+            continue;
+          }
+          const v = cv.get(imp.name);
+          if (v === undefined) throw new Error(`no value for import s.${imp.name}`);
+          const g = globals.get(`s.${imp.name}`) ?? { value: 'i64', mutable: false };
+          imports.s[imp.name] = new WebAssembly.Global(g, g.value === 'i64' ? BigInt.asIntN(64, v) : Number(BigInt.asIntN(32, v)));
+        } else if (imp.module === 'h') {
+          const f = ftab.get(BigInt(imp.name));
+          if (!f) throw new Error(`import h.${imp.name}: table slot holds no function`);
+          imports.h[imp.name] = f;
+        }
+      }
+      const inst = new WebAssembly.Instance(mod, imports);
+      const k = N(n);
+      if (k > 0) {
+        const nb = mem.slice(N(names), N(names) + 64 * k);
+        const list = [];
+        let at = 0;
+        for (let i = 0; i < k; i++) {
+          let end = at;
+          while (end < nb.length && nb[end] !== 0) end++;
+          list.push(new TextDecoder().decode(nb.subarray(at, end)));
+          at = end + 1;
+        }
+        const todo = list.map((nm, i) => {
+          const f = inst.exports[nm];
+          if (typeof f !== 'function') throw new Error(`no export ${nm}`);
+          return [dv.getBigUint64(N(slots) + 8 * i, true), f];
+        });
+        for (const [slot, f] of todo) {
+          ftab.set(slot, f);
+          this.#jitInstalled.set(slot, f);
+        }
+      }
+      this.#jitInstances.push(inst);
+      return 1;
+    } catch (err) {
+      const cap = N(errcap);
+      if (N(errbuf) && cap > 0) {
+        const b = new TextEncoder().encode(String(err?.message ?? err)).subarray(0, cap - 1);
+        mem.set(b, N(errbuf));
+        mem[N(errbuf) + b.length] = 0;
+      }
+      return 0;
+    }
+  }
+  #jitInstances = [];
+
   /** What a stateful provider imports from `gex` (the native `libprov`). */
   #providerImports() {
     const e = this.#shim.exports;
@@ -2616,7 +2963,7 @@ export class Gex {
       // a C longjmp).
       provider_try: (f, arg) => {
         try {
-          ftab.get(f >>> 0)(arg);
+          ftab.get(m64() ? BigInt(f) : f >>> 0)(arg);
           e.gex_provider_note(0);
           return 0;
         } catch (err) {
@@ -2662,6 +3009,13 @@ export class Gex {
     const e = this.#shim.exports;
     const n = e.gex_cgen_provider_count?.(u) >>> 0;
     for (let i = 0; i < n; i++) {
+      // A replaced Linux library (cgen/libprov.rs): its wasm64 provider, installed as a module.
+      if (e.gex_cgen_provider_libprov?.(u, i)) {
+        const number = e.gex_libprov_publish(u, i);
+        this.#cgenCatchUp();
+        if (number >= 0) e.gex_cgen_pmod_installed(number);
+        continue;
+      }
       if (e.gex_cgen_provider_wasmdll?.(u, i)) {
         const number = e.gex_wasmdll_publish(u, i);
         this.#cgenCatchUp();
@@ -2751,7 +3105,7 @@ export class Gex {
       const ev = BigInt.asUintN(64, BigInt(e.gex_ftab_event(st.have)));
       const kind = Number(ev >> 32n), v = Number(ev & 0xffffffffn);
       if (kind === 1) this.#cgenInstall(e.gex_ftab_install_unit(v) >>> 0, e.gex_ftab_install_base(v) >>> 0);
-      else if (kind === 2) st.ftab.set(v, st.resolve);
+      else if (kind === 2) st.ftab.set(tIdx(v), st.resolve);
       st.have++;
       e.gex_cgen_have(st.have);
     }
@@ -2840,6 +3194,32 @@ export class Gex {
    *  install, a thread to start -- is served here and returns, so the native
    *  frames below it survive, as natively. Anything else (the process or
    *  thread ending, a callback's return) goes on up. */
+  /** Tier-1's `gex.syscall`: the shim's export itself, except in a process with a
+   *  stateful provider, where guest code a provider called (its frames below) stages a
+   *  thread or a child rather than trapping, and the host starts it here. */
+  #guestSyscall(e) {
+    if (!Gex.wasmDlls) return e.gex_syscall;
+    return (ctx, pc) => {
+      e.gex_syscall(ctx, pc);
+      if (e.gex_wasmprog_staged()) {
+        this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+        this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+      }
+    };
+  }
+
+  /** A wasm64 provider's `gex.syscall(ctx, pc)` (cgen/libprov.rs): marked, so the shim
+   *  serves it without leaving the provider's frames (a blocking call waits in place, a
+   *  thread is staged); the host then starts what it staged, and the call returns. */
+  #providerSyscall = (ctx, pc) => {
+    const e = this.#shim.exports;
+    e.gex_syscall(ctx, BigInt.asIntN(64, BigInt(pc) | (1n << 61n)));
+    if (e.gex_wasmprog_staged()) {
+      this.#drainFork().catch((err) => console.error(`[gex] starting a process: ${err.message ?? err}`));
+      this.#drainThread().catch((err) => console.error(`[gex] starting a thread: ${err.message ?? err}`));
+    }
+  };
+
   #nativeSyscall = (ctx, pc) => {
     const e = this.#shim.exports;
     const p = BigInt.asUintN(64, BigInt(pc));
@@ -3060,7 +3440,7 @@ export class Gex {
     // stack trace per trap that nothing here reads -- hundreds of thousands of
     // them for a program with contended locks.
     const limit = Error.stackTraceLimit;
-    if (!globalThis.__gexKeepTrace) Error.stackTraceLimit = 0;
+    if (!globalThis.__gexKeepTrace && !globalThis.GEX_TRAP_STACK) Error.stackTraceLimit = 0;
     try {
       return await this.#runLoop(entry, startCtx);
     } finally {
@@ -3245,7 +3625,8 @@ export class Gex {
           throw new Error(
             `the gex runtime trapped inside the shim (${err.message}${at}${lr}${nr}` +
               `${code}${heap}${where}). That is a crash in the runtime, not a guest exit; ` +
-              'anything printed above is all the guest managed to do first.',
+              'anything printed above is all the guest managed to do first.'
+              + (globalThis.GEX_TRAP_STACK ? `\n${err.stack ?? ''}` : ''),
           );
         }
         // A trap abandons the engine's frames without running the epilogues

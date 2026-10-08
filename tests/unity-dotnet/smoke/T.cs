@@ -7,7 +7,46 @@ using System.Runtime.InteropServices;
 public struct Vec3 { public float x, y, z; }
 [StructLayout(LayoutKind.Sequential)]
 public struct Big { public long a, b, c; public double d; }
+// The liveness walk's graph (mono_unity_liveness_*, embed.c): every Leaf reachable from an
+// LvRoot through fields, arrays, value-type fields and arrays of structs, a list, cycles.
+public class Leaf { public int id; public object next; }
+public class SubLeaf : Leaf { }
+public struct Pair { public object a; public int x; public Leaf b; }
+public class LvRoot { public object[] arr; public Pair p; public Pair[] pairs; public List<Leaf> list; public LvRoot self; public string s; }
 public static class T {
+  // 3n+1 distinct Leafs: n in arr (half SubLeaf, each .next the following one, a cycle), one in
+  // p.b, n in pairs[i].b (pairs[i].a repeats arr[i]), n in list.
+  // Array.Clear and Span.Clear over reference, value and mixed element types, many offsets
+  // (Hollow Knight's first wasm-JIT fault was in SpanHelpers.ClearWithReferences under Array.Clear).
+  public struct Mixed { public object o; public long v; }
+  public static string Clears(int n) {
+    long sum = 0;
+    for (int len = 1; len <= n; len += 7) {
+      var a = new object[len]; for (int i = 0; i < len; i++) a[i] = i;
+      int from = len / 3, cnt = len - from - len / 4;
+      Array.Clear(a, from, cnt);
+      for (int i = 0; i < len; i++) if (a[i] == null) sum += i + 1;
+      var b = new int[len]; for (int i = 0; i < len; i++) b[i] = i + 1;
+      Array.Clear(b, from, cnt);
+      for (int i = 0; i < len; i++) sum += b[i];
+      var c = new Mixed[len]; for (int i = 0; i < len; i++) c[i] = new Mixed { o = "s", v = i };
+      Array.Clear(c, from, cnt);
+      for (int i = 0; i < len; i++) if (c[i].o == null) sum += 3 * c[i].v + 1;
+      var l = new List<string>(); for (int i = 0; i < len; i++) l.Add("x"); l.Clear(); sum += l.Count;
+      new Span<object>(a).Slice(len / 2).Clear();
+      for (int i = 0; i < len; i++) if (a[i] == null) sum += 1;
+    }
+    return "clears " + sum;
+  }
+  public static object LvGraph(int n) {
+    var r = new LvRoot { arr = new object[n], pairs = new Pair[n], list = new List<Leaf>(), s = "not a leaf" };
+    for (int i = 0; i < n; i++) r.arr[i] = i % 2 == 0 ? new SubLeaf { id = i } : new Leaf { id = i };
+    for (int i = 0; i < n; i++) ((Leaf)r.arr[i]).next = r.arr[(i + 1) % n];
+    r.p = new Pair { a = "x", x = 1, b = new Leaf { id = -1 } };
+    for (int i = 0; i < n; i++) { r.pairs[i] = new Pair { a = r.arr[i], x = i, b = new Leaf { id = 1000 + i } }; r.list.Add(new Leaf { id = 2000 + i }); }
+    r.self = r;
+    return r;
+  }
   [MethodImpl(MethodImplOptions.InternalCall)] static extern int Native(int x);
   public static int Run(int n) {
     var l = new List<string>();

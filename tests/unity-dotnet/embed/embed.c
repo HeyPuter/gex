@@ -30,6 +30,28 @@ static void (*mono_raise_exception) (P);
 static P (*mono_get_exception_argument) (const char *, const char *);
 static P (*mono_get_root_domain) (void);
 static P (*mono_thread_attach) (P);
+static P (*mono_unity_liveness_allocate_struct) (P, unsigned, void (*) (void **, int, void *), void *, P);
+static void (*mono_unity_liveness_stop_gc_world) (void);
+static void (*mono_unity_liveness_start_gc_world) (void);
+static void (*mono_unity_liveness_calculation_from_root) (P, P);
+static void (*mono_unity_liveness_finalize) (P);
+static void (*mono_unity_liveness_free_struct) (P);
+
+/* Unity's liveness callback: the objects of the filter class the walk reached, in batches. */
+static P lv_seen [4096];
+static int lv_n, lv_dup, lv_calls;
+static void
+lv_cb (void **objs, int count, void *ud)
+{
+	(void)ud;
+	lv_calls++;
+	for (int i = 0; i < count; i++) {
+		for (int j = 0; j < lv_n; j++)
+			if (lv_seen [j] == objs [i]) { lv_dup++; goto next; }
+		if (lv_n < 4096) lv_seen [lv_n++] = objs [i];
+	next:;
+	}
+}
 
 /* A thread of the program's own (as Unity's job workers are): attached,
  * calling into managed code, holding the objects it gets only in its frame
@@ -125,6 +147,8 @@ main (int argc, char **argv)
 	SYM (mono_string_new); SYM (mono_string_to_utf8); SYM (mono_object_unbox); SYM (mono_object_to_string);
 	SYM (mono_gc_collect); SYM (mono_gc_max_generation); SYM (mono_class_get_name);
 	SYM (mono_add_internal_call); SYM (mono_raise_exception); SYM (mono_get_exception_argument); SYM (mono_get_root_domain); SYM (mono_thread_attach);
+	SYM (mono_unity_liveness_allocate_struct); SYM (mono_unity_liveness_stop_gc_world); SYM (mono_unity_liveness_start_gc_world);
+	SYM (mono_unity_liveness_calculation_from_root); SYM (mono_unity_liveness_finalize); SYM (mono_unity_liveness_free_struct);
 	P dom = mono_jit_init_version ("embed", NULL);
 	printf ("init: %s\n", dom ? "ok" : "failed");
 	P a = mono_domain_assembly_open (dom, argv [2]);
@@ -200,6 +224,27 @@ main (int argc, char **argv)
 	}
 	pthread_join (t, NULL);
 	printf ("worker thread: %d bad of 640\n", worker_bad);
+	P clears = mono_class_get_method_from_name (k, "Clears", 1);
+	int cn = 300;
+	void *clargs [1] = { &cn };
+	P clr = mono_runtime_invoke (clears, NULL, clargs, &exc);
+	check ("Clears", exc);
+	printf ("%s\n", mono_string_to_utf8 (clr));
+	/* The liveness walk Unity's UnloadUnusedAssets runs: every Leaf reachable from the root,
+	 * each reported once, in batches of at most 16. */
+	P lvg = mono_class_get_method_from_name (k, "LvGraph", 1);
+	int ln = 100;
+	void *largs [1] = { &ln };
+	P root = mono_runtime_invoke (lvg, NULL, largs, &exc);
+	check ("LvGraph", exc);
+	P leaf = mono_class_from_name (mono_assembly_get_image (a), "", "Leaf");
+	mono_unity_liveness_stop_gc_world ();
+	P st = mono_unity_liveness_allocate_struct (leaf, 16, lv_cb, NULL, NULL);
+	mono_unity_liveness_calculation_from_root (root, st);
+	mono_unity_liveness_finalize (st);
+	mono_unity_liveness_free_struct (st);
+	mono_unity_liveness_start_gc_world ();
+	printf ("liveness: %d leaves, %d reported twice, %s\n", lv_n, lv_dup, lv_calls >= 19 ? "batched" : "not batched");
 	mono_gc_collect (mono_gc_max_generation ());
 	printf ("gc ok\n");
 	return 0;

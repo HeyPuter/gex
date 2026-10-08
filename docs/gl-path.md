@@ -1,0 +1,284 @@
+# The browser GL path: cost against pewasm's (stream GL)
+
+Stream GL closes the GL/compositor cost gap between gex's browser page and
+pewasm's (OPTIMIZATION-BACKLOG.md E1-E4, E10, W1). Branch `merge/glpath`,
+worktree `wt/glpath`, scratch `~/gex-sandbox/scratch/GL` (`$G` below).
+
+## Resume
+
+- State (2026-10-07 evening): E2 done; CLIENT_ARRAY (bdb682d9), the
+  decoder report fix and opt-in WebGPU counters (21baa051), E3 map rules
+  (bcc93e30) and five more fast-path GL calls (430acec7) committed on
+  merge/glpath. E4 (web/mesa-wasm-cross.ini: SIMD, ThinLTO, -O3 link) is in
+  the worktree, uncommitted: commit after a browser GL gate with a Mesa
+  built from it. Not yet measured: the normal gexc page (needs a unit cache
+  at merge/glpath's keys on edger), and 430acec7 on the page (the eject
+  project must rebuild the nt_unixcall provider and the trampolines' unit).
+- Live A/B harness for the ejected page: `$G/patch-site.mjs SITE PAGE OUT
+  LAUNCHER` swaps a site's page (shim, kernel, Mesa, JS) for one built by
+  web/build-eject-page.sh, keeping its units; the page must come from the
+  tree the site's units were built at (site30: wt/eject9 52bb4b96, or the
+  NT trampolines' unit misses). `wt/gl-e9` (branch glpath-e9) = 52bb4b96 +
+  this stream's commits; `bshim-e9.sh` builds its shim/kernel/seed/gexc.
+  `glegs.sh TAG LEG...` (pew | SITE[@ENV]) measures world fps and the
+  compositor's gex_gl_submit ms per frame.
+- Tools (all in `$G`, run on edger through `scratch/bench/bench.sh`; never on
+  gooner):
+  - `wgpu-count.js`: a WebGPU call counter (calls, ms inside, bytes) by
+    prototype wrapping. Injected into pewasm's page (`run-pw-count.sh TAG
+    SECS`, a copy of `port/browser.mjs` with `--inject`) and prepended to the
+    Mesa worker's module in an eject site copy (`site32c`).
+  - `gl-run.mjs`: eject9's page-run.mjs plus `--every N` (counter snapshots
+    from the compositor worker with the world frame) and `--capture A,FILE`
+    (freezes the worker's `?glcapture=` recording A s after world-up and
+    pulls it over CDP in 8 MiB chunks).
+  - `pwcount.py LOG [SPAN]`: WebGPU calls per world frame from either log.
+  - `replay/index.html` + `replay-run.mjs MODS TRACE`: replays a trace
+    through Mesa builds in `$G/mods/NAME/` on hardware WebGPU, timing every
+    submit; prints CPU ms per frame and WebGPU calls per frame over the last N
+    frames; `--profile` writes a V8 CPU profile of the measured window.
+  - `ops.mjs TRACE [N]`: opcode histogram per frame.
+  - `bm.sh NAME ROOT [CROSS2]`: builds gex-wgpu-replay from
+    `ROOT/third_party/mesa` (a worktree of `$G/mesa-wink`) into
+    `$G/mesa-NAME`. Roots: `roots/cur` (wink 5f5572e6, gex's pin) and
+    `roots/pw` (wink 1f16bf09, pewasm's).
+  - `prof/top.py`, `prof/callers.py`: V8 profile summaries.
+- mesa-wink changes are prepared as commits in `$G/mesa-wink` (a blobless
+  clone, origin GitHub) and never pushed without the user's approval.
+
+## E2: where the compositor's time goes (2026-10-07)
+
+All numbers from edger (Quadro P620, WebGPU over Vulkan, headless Chromium
+153, BENCH_CORES default, world seed 1767225600, 4x clock).
+
+### Live counts, per world frame (WebGPU calls)
+
+pewasm's page (`out/pwc1.log`, 4641 world frames over 100 s, 46.3 world fps)
+against the ejected page (site30 + counter, `out/cap1.txt`, 7026 world frames
+over 100 s, 70.1 world fps). Calls per world frame, and ms of JS inside them:
+
+| call | pewasm | gex (eject) |
+| --- | --- | --- |
+| beginRenderPass | 15.0 (0.16 ms) | 52.0 (0.55 ms) |
+| createView | 16.0 (0.16 ms) | 78.0 (0.53 ms) |
+| writeBuffer | 87.0 (0.21 ms, 19 KiB) | 179.3 (0.39 ms, 21 KiB) |
+| copyBufferToBuffer | 0 | 123.3 (0.13 ms) |
+| createBuffer | 0 | 15.0 (0.08 ms) |
+| createRenderPipeline | 0 | 4.0 (0.16 ms) |
+| setBindGroup | 64 | 108 |
+| setViewport / setScissorRect | 9 / 9 | 45 / 45 |
+| draw + drawIndexed | 12 + 35 | 12.9 + 35.1 |
+| queue submit | 14.0 | 2.7 |
+| writeTexture | 5.0 (839 KiB) | 5.0 (841 KiB) |
+| all calls, JS ms | 1.85 | 3.13 |
+
+The draws are the same (47 a frame). Everything around them is two to five
+times as much in gex.
+
+### The trace
+
+`gl-run.mjs --capture` took the ejected page's GL stream to 30 s after
+world-up: 1.59 GB, 3403 batches, 2777 frames (`out/noita-world.gexgltr` on
+edger and gooner). Per world frame (last 300): one batch, 3321 commands,
+901 KiB, of which 839 KiB is five glTexSubImage2D (the world's pixels). 47
+glDrawArrays, 18 glBindFramebuffer, and **142 glBufferData of 17 KiB in all:
+the NT layer's copies of Noita's client-side vertex arrays** (three arrays a
+draw, `upload_scratch`). No buffer maps, no glBufferStorage (so E3 and
+pewasm's `-GL_ARB_buffer_storage` cannot matter for Noita's frame).
+
+### Replays of the same trace (`replay-run.mjs`, last 600 frames, CPU ms of
+`gex_gl_submit` per frame, counters off; two passes, in and reversed order)
+
+| Mesa build | ms per frame | passes | copies | submits |
+| --- | --- | --- | --- | --- |
+| site30's (wink 5f5572e6, as shipped) | 8.90, 9.08 | 51 | 123 | 2 |
+| wink 5f5572e6 + the decoder fix below | 8.87, 9.01 | 51 | 123 | 2 |
+| pewasm's pin (wink 1f16bf09), same flags | 33.9, 34.3 | 51 | 0 | 49 |
+
+So pewasm's older driver is *slower* on gex's stream (34 against 9 ms a frame: it
+submits on every rewrite of a buffer the batch reads). The gap is not Mesa's
+version or build: it is **the stream**. pewasm passes client arrays to Mesa
+as pointers (st/mesa uploads them through its stream uploader into fresh
+ranges); gex rewrites one scratch buffer per array with glBufferData before
+every draw, and since the pending batch already reads that buffer the driver
+stages each rewrite and copies it inside the batch, which ends the render
+pass: 142 uploads, 123 copies, 51 passes for 47 draws.
+
+### Smaller findings
+
+- **The decoder printed ten report lines every frame**
+  (`web/mesa/gexgl-mesa.cpp` display_backend: `gex_wgpu_report_draw_targets()`
+  sat outside its `if (frames % 600 == 0)` for want of braces): about
+  0.2 ms a frame of vsnprintf, stdio and console plumbing (display 0.27 ->
+  0.09 ms in the replay). Fixed.
+- **The WebGPU call counter in mesa-gl.js ran always**: a performance.now
+  pair per call, 2.5% of the compositor worker in F's co1 profile (and 13%
+  of the replay's CPU per frame). Now opt-in, `?wgpustats=1`.
+- **Per-draw debug labels in the driver**: six snprintf per draw for WebGPU
+  object labels (`gex_wgpu_draw_vbo_inner`, "draw %s/%s" and its group and
+  layout labels), about 0.3 ms a frame in the profile. Gated behind an env
+  variable and replayed (r5): 5.44 and 5.30 ms against 5.13 and 5.32 ms
+  without the change, i.e. inside the noise. Dropped; no mesa-wink change.
+- **Attachment views are made per render pass** (createView 78 a frame), and
+  2-4 render pipelines are created every frame in the live page.
+- E4 (SIMD + ThinLTO) was measured by E on the page before: no gain (control
+  53.6, 56.8 vs 51.5, 56.9 world fps). By replay of the CLIENT_ARRAY stream
+  (r4, 600 frames, two passes): release (gex's flags) 5.45 and 5.47 ms a
+  frame; with eject9's mesa-o3.ini (`-msimd128 -flto=thin`, link `-O3`,
+  which runs binaryen at link) 5.09 and 4.99 ms, 7% less; a further
+  `wasm-opt -O2` over that 5.28 and 5.04 ms (nothing more).
+
+### CLIENT_ARRAY, by replay
+
+The NT layer now sends client arrays as `op::CLIENT_ARRAY` (bdb682d9).
+`to-client-array.mjs` rewrites the recorded trace into what the new layer
+sends, and the replay (r3, 600 frames, two passes; the last frame's
+readback digest equal on both):
+
+| stream | ms per frame | passes | views | writeBuffer | copies | createBuffer |
+| --- | --- | --- | --- | --- | --- | --- |
+| as recorded (scratch buffers) | 8.17, 8.45 | 51 | 77 | 178 | 123 | 15 |
+| CLIENT_ARRAY | 5.32, 5.33 | 15 | 16 | 83 | 0 | 0 |
+
+The counts are now pewasm's live ones (15 passes, 16 views, 87 writeBuffer,
+no copies).
+
+### CLIENT_ARRAY, live (ejected page, site-gl2 = site30 + this stream's
+page; the old path by `GEX_NT_GL_CLIENT_ARRAYS=buffer` on the same site)
+
+| leg order | CLIENT_ARRAY | scratch buffers (old) | pewasm |
+| --- | --- | --- | --- |
+| j2: A, B, pew | 67.2 fps, 4.64 ms | 64.0 fps, 7.03 ms | 48.5 fps |
+| j4: pew, B, A | 65.2 fps, 4.99 ms | 65.8 fps, 6.88 ms | 49.4 fps |
+| mean | 66.2 fps, 4.82 ms | 64.9 fps, 6.96 ms | 48.95 fps |
+
+ms = the compositor's gex_gl_submit wall time per produced frame (world-up
++90 s to 330 s; one submit a frame). The compositor's time per frame falls
+by 31% (6.96 -> 4.82 ms); world fps moves by 2% (66.2 against 64.9),
+inside the legs' spread: as eject-pe.md found, the compositor worker is not
+the page's critical path (the main thread is). The ejected page with
+CLIENT_ARRAY is 1.35 times pewasm's world fps (66.2 against 48.95).
+
+### What still makes NT syscalls (GEX_NT_GL_STATS, site-gl2, per frame)
+
+623 GL calls a frame reach the layer (the eject9 tree has no client-state
+fast path, which master has: glEnable/DisableClientState are 284 of them
+there). The rest: glDrawArrays 47, glVertexPointer/glColorPointer/
+glTexCoordPointer 142 (pure layer state), glBlendFunc 39, glBindFramebuffer
+18, glUniform1f 14, glTexParameteri 12, glViewport 9, glBlendFuncSeparate 8,
+glTexSubImage2D 5, wglSwapBuffers 1. 430acec7 moves glBlendFunc,
+glBlendFuncSeparate, glViewport, glTexParameteri and glUniform1f to the
+fast path. The pointer calls need the layer's array state in guest memory
+(as GL_FAST_ARRAYS holds the enables) before the provider can take them.
+
+### After CLIENT_ARRAY (replay profile p3)
+
+About 5.5 ms of CPU a frame: writeTexture 0.85 ms (the five world-pixel
+uploads, 839 KiB; pewasm's page pays 0.52 ms for the same), native WebGPU
+time 1.1 ms, the rest spread thin over st/mesa and the driver. The largest
+named item left is the per-draw label formatting (about 0.23 ms a frame in
+the profile; not separable from noise by replay).
+
+## Findings
+
+## Unity's GL stream (Hollow Knight's menu, 2026-10-07 night)
+
+Captured natively on edger (`GEX_GL_CAPTURE` on U's harness:
+`tests/games/unity-bench.sh hk ... --fjit`, warm fjit cache; trace
+`out/hk-menu.gexgltr`, 587 MB, 3166 frames; the run's menu was 25.6
+presents/s with the capture on). Per frame over the last 300 (`ops.mjs`):
+
+- one submit (the frame's PRESENT; GEXGL_SUBMIT_TRACE agrees: 81% of
+  submits follow PRESENT), 999 commands, 78 KiB;
+- 45 draws (35 glDrawElementsBaseVertex, 10 glDrawElements), 47
+  glBindFramebuffer, 186 glBindBuffer, 160 glTexParameteri, 92
+  glBindTexture, 58 glUniform4fv;
+- 77 glBufferSubData, 58 KiB, all to GL_COPY_WRITE_BUFFER, 53 of them under
+  256 bytes (per-draw uniform blocks); 54 rewrite a buffer a draw of the
+  same frame already read, 14 at unaligned offsets (`subdata.mjs`).
+
+**Natively the GL stream is not what limits the menu.** The same trace
+replayed on edger's NVIDIA through gex-gl's host (`gl-replay-native`, the
+new `crates/gex-gl/examples/replay.rs` with per-opcode timing): 0.84 and
+1.03 ms a frame in `Gl::run`, of which glBindFramebuffer is 0.30-0.39 ms
+(47 binds) and the draws 0.15-0.20 ms; the whole 3166-frame trace replays in
+under 3 s. One round trip a frame. At 25-28 presents/s (35-40 ms a frame)
+that is a few percent: U's thread profile (main thread 59-69% of a core,
+render thread 25%, no thread saturated) is the place to look, not gex-gl.
+
+**In the browser (Mesa on WebGPU, the same trace, replay page) it is waste,
+and fixable in the driver.** Base (wink 5f5572e6 + E4 flags): 4.65 and 4.71
+ms of CPU a frame, with 23.5 queue submits, 42 render passes for 45 draws,
+12 createRenderPipeline, 66 views, 32 copyBufferToBuffer and 6
+copyTextureToTexture a frame. Causes found:
+
+1. Pipelines rebuilt every frame: the pipeline cache's entries were
+   invalidated by an epoch it shares with the bind group cache, which moves
+   on every deleted sampler view or sampler state (Unity deletes some every
+   frame).
+2. Unaligned glBufferSubData into a buffer the batch reads submitted the
+   batch (in-batch staging took whole words only).
+3. Feedback snapshots (a draw sampling its own attachment) went through
+   copy_texture_region, which submits the batch and then its own command
+   buffer: two submits each.
+4. Every rewrite of a uniform buffer the batch reads was staged and copied
+   in the batch, ending the render pass, although the bytes written are
+   never the bytes a pending draw reads.
+
+Each was tried as a mesa-wink commit and replayed (r=urep3, last 600
+frames, CPU ms of gex_gl_submit per frame, two passes in and reversed order;
+the last frame's readback digest equal for every build):
+
+| build | ms a frame | submits | pipelines | copies (buffer) |
+| --- | --- | --- | --- | --- |
+| base (5f5572e6 + E4) | 5.00, 4.72 | 23.5 | 12 | 32 |
+| + pipeline epoch | 4.42, 4.16 | 23.5 | 0 | 32 |
+| + unaligned staging | 5.34, 4.82 | 12 | 0 | 44 |
+| + snapshots in the batch | 5.39, 5.79 | 2 | 0 | 54 |
+| + read/write ranges | 5.30, 5.44 | 2 | 0 | 54 |
+
+Only the pipeline epoch pays: 12% less CPU a frame and no pipeline
+creation (which also costs Dawn's GPU-process time the CPU column does not
+show). Fewer submits bought by staging more copies is a loss here, and the
+range check never applied (Unity's rewrites hit buffers also bound as vertex
+or index data, which count as whole-buffer reads). Kept: `$G/mesa-wink`
+branch `gl/perf` = 6d3a4cfd only (not pushed; needs the user's approval);
+the other three are on `gl/experiments`.
+
+## Noita: E1 on the ejected page, the normal page, and what limits world fps
+
+**E1 (fast-path draws and pointers), ejected page** (site-gl4 = site-gl3 +
+F's client-state fast path + 6dd6b3fc; ABBA j7/j8): site-gl4 65.0, 65.1
+world fps against site-gl3 70.8, 65.6 and pewasm 48.0, 48.4. No measurable
+gain: the main thread is not bound by the remaining GL syscalls.
+
+**What limits world fps (ejected page, worker profiles 100-120 s, site-gl3,
+`out/prof-gl3`):** the compositor worker is 66% idle. Noita's main thread is
+fully busy, 37% of it parked in `guest_yield` (NtHost::park: waiting for its
+job threads), the rest guest code and NT calls (mono_ns clock reads 2.4%,
+dlmalloc 1.2%, syscall glue). The seven job workers each spend 55% in the
+ConcRT condvar provider (`cond_wait_`) and ~13% in f_724580 (the world
+simulation). So the frame is bound by the hand-off between the main thread
+and the simulation workers, not by GL and not by one thread's code: the
+next lever is the guest's own threading (F's side: wake latency of
+cond_wait/park, and the simulation's per-frame critical path).
+
+**The normal gexc page** (tests/nt/browser-noita.mjs through
+`$G/np/nplegs.sh`: wt/glpath at merge/glpath, units built at the branch's
+keys into target/bm-gl (`$G/build-bm.sh`, seeded from F's bm-s objects:
+all 3127 noita.exe objects reused), seed pinned, 4x clock; world fps from
+the stats lines, world-up+30 s to the end; legs n1/n2 ran 213 s with F's
+default worker profile at 60-90 s, n3/n4 only ~50 s because `PROF=none`
+trips browser-noita's AOT-share check, which then ends the run):
+
+| arm | n1 | n2 | n3 | n4 | mean |
+| --- | --- | --- | --- | --- | --- |
+| CLIENT_ARRAY (default) | 48.6 | 59.8 | 61.0 | 52.5 | 55.5 |
+| `GEX_NT_GL_CLIENT_ARRAYS=buffer` | 49.3 | 49.9 | 48.9 | 56.1 | 51.1 |
+| pewasm | 45.9 | 45.2 | 49.5 | 48.0 | 47.2 |
+
+The normal page is 1.18 times pewasm's world fps (55.5 against 47.2), and
+the new path's mean is 9% above the old one's, but the legs spread over
+48-61 world fps, so that difference is not established. A proper ABBA
+needs longer legs without the profile and with the AOT check satisfied
+(keep a short profile window, or relax NOITA_MIN_AOT for such runs).

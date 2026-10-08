@@ -51,7 +51,7 @@ pub extern "C" fn gex_elfprov_off() {
 
 /// Whether an ELF provider holds `addr` (the function JIT leaves it alone).
 pub(crate) fn provided(addr: u64) -> bool {
-    lock(&BOUND).iter().any(|b| b.addrs.contains(&addr))
+    lock(&BOUND).iter().any(|b| b.addrs.contains(&addr)) || super::libprov::bound(addr)
 }
 
 /// A new process (a forked child): start over from what its kernel has
@@ -71,7 +71,7 @@ fn rescan_if_new() -> bool {
             .vmas()
             .iter()
             .filter(|v| v.prot & prot::EXEC != 0)
-            .filter_map(|v| v.code.as_ref().map(|(p, _)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone() }))
+            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
             .collect()
     });
     maps(&mapped)
@@ -80,8 +80,14 @@ fn rescan_if_new() -> bool {
 /// After a syscall: bind the providers of each newly mapped object. Returns
 /// whether JS has providers to serve before the guest goes on.
 pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
+    // A replaced library (a stateful Linux provider, libprov.rs) is served the same way.
+    if let Some(u) = super::libprov::maps(mapped) {
+        lock(&QUEUE).push_back(u);
+    }
+    // Function-tier units for listed shared objects (libprov.rs, B4).
+    let unit = super::libprov::elf_unit_maps(mapped);
     if !on() {
-        return false;
+        return unit || !lock(&QUEUE).is_empty();
     }
     if PID.load(Ordering::Acquire) == 0 {
         PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
@@ -149,7 +155,7 @@ pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> bool {
         };
         lock(&QUEUE).push_back(u);
     }
-    !lock(&QUEUE).is_empty()
+    unit || !lock(&QUEUE).is_empty()
 }
 
 /// Whether install `i` is an export provider's module.
@@ -191,7 +197,7 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
 #[no_mangle]
 pub extern "C" fn gex_elfprov_wanted() -> i32 {
     if !on() {
-        return -1;
+        return lock(&QUEUE).pop_front().map_or(-1, |u| u as i32);
     }
     rescan_if_new();
     lock(&QUEUE).pop_front().map_or(-1, |u| u as i32)

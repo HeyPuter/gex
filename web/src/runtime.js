@@ -38,9 +38,12 @@ export function multiarch() {
 export function elfMachine() {
   return guestArch() === 'x86' ? 0x3e : 0xb7;
 }
-const SHIM_URL = () => `/gex/gex_browser${archInfix()}.shared.wasm`;
-const SEED_URL = () => `/gex/seed${archInfix()}.shared.wasm`;
-const KERNEL_URL = () => `/gex/gex_kernel${archInfix()}.wasm`;
+// `?mem64=1` (globalThis.GEX_MEM64): a 64-bit guest memory (docs/mem64.md step 6) -- the wasm64
+// shim and seed and the kernel that reaches a process's memory with i64 (`.m64`, x86 only).
+const m64Infix = () => (globalThis.GEX_MEM64 && guestArch() === 'x86' ? '.m64' : '');
+const SHIM_URL = () => `/gex/gex_browser${archInfix()}${m64Infix()}.shared.wasm`;
+const SEED_URL = () => `/gex/seed${archInfix()}${m64Infix()}.shared.wasm`;
+const KERNEL_URL = () => `/gex/gex_kernel${archInfix()}${m64Infix()}.wasm`;
 
 let shimBytes = null;
 let seedBytes = null;
@@ -569,7 +572,9 @@ export async function runProgram(
       xwaylandUrl: new URL('/gex/xwayland/Xwayland.mjs', location.href).href,
       hostwlUrl: new URL('/gex/xwayland/gexhostwl.wasm', location.href).href,
       keymapUrl: new URL('/gex/xwayland/gex.xkm', location.href).href,
-      kernel: { module: kernel.module, memory: kernel.memory },
+      // The X server's own memory is a wasm32 one, so with `?mem64=1` it takes the
+      // wasm32 build of the kernel (same kernel memory, other process-memory type).
+      kernel: { module: m64Infix() ? await WebAssembly.compile(await fetchBytes(`/gex/gex_kernel${archInfix()}.wasm`)) : kernel.module, memory: kernel.memory },
       wlChannel,
       // A name in the scene arena that no guest pid can collide with: pids
       // count up from 1, and this is 'xwl1' as ASCII.
@@ -662,6 +667,14 @@ export async function runProgram(
       jit: globalThis.GEX_NO_JIT ? false : undefined,
       aot: globalThis.GEX_AOT ? true : undefined,
       denseDebug: !!globalThis.GEX_DENSE_DEBUG,
+      // `?mem64=1`: every Worker of the process builds or joins a 64-bit memory.
+      mem64: globalThis.GEX_MEM64 ? 1 : undefined,
+      // `?fjit=1`: the function JIT in every process.
+      fjit: globalThis.GEX_FJIT || undefined,
+      // `?wasmdlls=soname=path,...`: libraries replaced by wasm64 providers (cgen/libprov.rs).
+      wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
+      // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
+      elfUnits: globalThis.GEX_ELF_UNITS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,

@@ -104,7 +104,7 @@ step_corelib() {
 
 step_provider() {
 	. "$UD/sysroot/flags.sh"
-	local P="$OUT/src/src/native/public" N="$OUT/src/src/native" L="$OUT/obj/mono" W="$OUT/provider"
+	local P="$OUT/src/src/native/public" N="$OUT/src/src/native" L="$OUT/obj/mono" W="${PROVIDER_DIR:-$OUT/provider}"
 	mkdir -p "$W"; cd "$W"
 	local INC="-nostdinc -isystem $SR/include -isystem $(clang -print-resource-dir)/include -I$P -I$OUT/src/src/mono -I$UD/provider -I$HERE/host -I$OUT/obj -I$OUT/src/src/mono/mono/eglib -I$OUT/obj/mono/eglib -I$OUT/src/src/native"
 	llvm-nm --defined-only -j "$L"/mini/libmonosgen-2.0.a "$L"/mini/libmono-ee-interp.a "$L"/mini/libmono-component-*-stub-static.a \

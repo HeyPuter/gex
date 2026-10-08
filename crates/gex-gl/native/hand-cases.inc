@@ -320,6 +320,11 @@
         /* Room for what GL writes even where the table says less. */
         std::vector<GLint> values(std::max<size_t>(n, 16));
         if (n) glGetIntegerv(pname, values.data());
+        /* The host's framebuffer and renderbuffer names, as the guest's. */
+        if (pname == GL_DRAW_FRAMEBUFFER_BINDING || pname == GL_READ_FRAMEBUFFER_BINDING)
+            values[0] = (GLint)external_name(framebuffers, (GLuint)values[0]);
+        if (pname == GL_RENDERBUFFER_BINDING)
+            values[0] = (GLint)external_name(renderbuffers, (GLuint)values[0]);
         put_blob(values.data(), n * sizeof(values[0]));
         break;
     }
