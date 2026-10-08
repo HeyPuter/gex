@@ -562,6 +562,36 @@ pub extern "C" fn gex_libprov_thread_register(in_guest: u64, stop: u64) {
 }
 
 /// `gex.provider_park()`.
+thread_local! {
+    /// The provider's guest calls open on this Worker (`gexp_call_guest`):
+    /// while any is, the guest code running has the provider's wasm frames
+    /// below it, whichever tier runs it (a function JIT or unit function is
+    /// called straight from the provider, with no call-out of the fallback's).
+    static GUEST_CALLS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// `gex.provider_guest_call(delta)`.
+#[no_mangle]
+pub extern "C" fn gex_libprov_guest_call(delta: i32) {
+    GUEST_CALLS.with(|c| c.set(c.get() + delta));
+}
+
+/// The count, which `provider_try` restores when a raise unwinds guest calls.
+#[no_mangle]
+pub extern "C" fn gex_libprov_guest_calls() -> i32 {
+    GUEST_CALLS.with(|c| c.get())
+}
+
+#[no_mangle]
+pub extern "C" fn gex_libprov_guest_calls_set(v: i32) {
+    GUEST_CALLS.with(|c| c.set(v));
+}
+
+/// Whether a provider's guest call is open on this Worker.
+pub(crate) fn guest_call_open() -> bool {
+    GUEST_CALLS.with(|c| c.get()) > 0
+}
+
 #[no_mangle]
 pub extern "C" fn gex_libprov_park() {
     park_if_stopping(this_tid(), true);
@@ -613,4 +643,88 @@ pub extern "C" fn gex_libprov_start() {
     }
     STOPPING.store(false, Ordering::SeqCst);
     bump();
+}
+
+// ---------------------------------------------------------------------------
+// Function-tier units for Linux shared objects in the page (P5 B4; the native
+// host's `nt_cgen::on_elf_maps`): an object named in `?elfunits=` gets the
+// unit built natively for it at the bias it maps at (`gexc cgen-image --elf
+// SO --base HEX --mem64`), found in the unit cache by the same key.
+// ---------------------------------------------------------------------------
+
+/// The objects that get units (file names, or `all`).
+static ELF_UNITS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Objects placed already in this process: (path, bias).
+static ELF_PLACED: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+/// `name,name,...` (the page's `?elfunits=`), before the program starts.
+#[no_mangle]
+pub extern "C" fn gex_cgen_elf_units(ptr: u32, len: u32) {
+    let spec = String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..ptr as usize + len as usize]).into_owned();
+    let mut v = lock(&ELF_UNITS);
+    for n in spec.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        if !v.iter().any(|x| x == n) {
+            v.push(n.to_string());
+        }
+    }
+}
+
+/// The load bias of an ELF object one of whose executable `PT_LOAD`s was
+/// mapped at `start` from file offset `offset`.
+fn elf_bias(bytes: &[u8], start: u64, offset: u64) -> Option<u64> {
+    let rd = |o: usize, n: usize| -> Option<u64> {
+        let b = bytes.get(o..o + n)?;
+        let mut v = [0u8; 8];
+        v[..n].copy_from_slice(b);
+        Some(u64::from_le_bytes(v))
+    };
+    if bytes.get(0..4)? != b"\x7fELF" || *bytes.get(4)? != 2 {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (rd(0x20, 8)? as usize, rd(0x36, 2)? as usize, rd(0x38, 2)? as usize);
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        let (ty, flags, off, vaddr) = (rd(ph, 4)?, rd(ph + 4, 4)?, rd(ph + 8, 8)?, rd(ph + 16, 8)?);
+        if ty == 1 && flags & 1 != 0 && off & !0xfff == offset {
+            return Some(start.wrapping_sub(vaddr & !0xfff));
+        }
+    }
+    None
+}
+
+/// After a syscall that mapped code: want the unit of each listed object.
+/// Returns whether one is now wanted.
+pub(crate) fn elf_unit_maps(mapped: &[gex_kernel::CodeMap]) -> bool {
+    let list = lock(&ELF_UNITS).clone();
+    if list.is_empty() || !super::on() {
+        return false;
+    }
+    let mut any = false;
+    for m in mapped {
+        let file = m.path.rsplit('/').next().unwrap_or(&m.path);
+        if !list.iter().any(|n| n == "all" || n == file) {
+            continue;
+        }
+        let Some(bytes) = crate::with_host(|h| h.kernel.read_file(&m.path)) else { continue };
+        let Some(base) = elf_bias(&bytes, m.start, m.offset) else { continue };
+        {
+            let mut placed = lock(&ELF_PLACED);
+            if placed.iter().any(|(p, b)| *p == m.path && *b == base) {
+                continue;
+            }
+            placed.push((m.path.clone(), base));
+        }
+        let mut image = match gex_ld::elf::load(&bytes, base) {
+            Ok(i) => i,
+            Err(e) => {
+                crate::warn_line(&format!("gex-cgen: {}: {e:?}; no unit\n", m.path));
+                continue;
+            }
+        };
+        gex_ld::elf::apply_own_relative(&mut image);
+        crate::warn_line(&format!("gex-cgen: {} at {base:#x}: wanting its unit\n", m.path));
+        super::place(&image, &m.path, base, true, None);
+        any = true;
+    }
+    any
 }

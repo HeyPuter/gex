@@ -1625,10 +1625,12 @@ Not yet:
      every unit), which matters more there.
   30. **B3, Muck in the page, first run (2026-10-08, edger Chromium 153,
      WebGPU on the P620; `scratch/unity/page/muck-page.sh NAME MINUTES`, run
-     through bench.sh; no function JIT, .NET interpreter; aa4b35e1):** Muck
+     through bench.sh; no function JIT, the .NET wasm JIT (on by default in
+     mono.wasm; this item first said interpreter, wrongly); aa4b35e1):** Muck
      boots on the .NET provider in the page, first frame 79 s after the page
      opened, 11.5 presents/s from ~300 s to ~700 s (native edger, warm
-     caches, interpreter: first present 151.6 s, menu 43.0 presents/s).
+     caches, .NET JIT, mk-j1: first present 154.6 s, menu 38.6 presents/s;
+     so the page is about 3.4x slower in presents/s than native).
      Then a WebGPU validation error in Mesa's gex_wgpu stops drawing: "Bind
      group layout [draw VS:GLSL19/FS:GLSL19 g0] ... does not match layout
      [draw VS:GLSL4/FS:GLSL4 g0] of bind group [draw VS:GLSL20/FS:GLSL20 g0]"
@@ -1647,3 +1649,81 @@ Not yet:
      Staging on edger: `scratch/unity/page/muck-bcl` (the run's BCL + 
      mono.wasm), `muck-files.txt` (host files from a native `--strace`), the
      worktree synced to edger without `target/`.
+  31. **Visual check, fjit retry, B4 (2026-10-08, ff0456a2):**
+     - The compositor reads its output back (`Compositor.readout()`,
+       `readoutBase64()`); `browser-linux.mjs` writes it as `cNNN.png`
+       next to each 30 s screenshot. mp9's show the empty desktop with the
+       cursor (it never presented: below).
+     - mp9 (`--fjit`) overflowed a Worker's stack in gex-fjit's emitter
+       again: the 1,500-block cut misses deeply nested functions. Now the
+       structured layout is also refused in the browser when `nest_bound`
+       (an upper bound on the `tree`/`within`/`node` recursion over the
+       dominator tree) exceeds 200; such functions are laid out flat.
+     - B4: `?elfunits=SO,...` (with `?cgen=1`) places the natively built
+       unit of a listed ELF object at the bias it maps at
+       (`libprov::elf_unit_maps`, keyed as natively; served from
+       `GEX_CGEN_CACHE` at `/gex-cgen/`). Muck's UnityPlayer unit at
+       0x7000000: 76,412 functions, 3,805 C units, 142 MiB wasm, 1,687 s to
+       build on gooner; staged on edger in
+       `scratch/unity/units/cgen-page`.
+     - mp11 (`--fjit`) and mp13 (`--fjit`, unit) then died at ~160 s:
+       thread 0 returned into the provider's code page from libc after a
+       clock_nanosleep with no call-out open. A provider's guest call that
+       lands on a function JIT or unit body directly has no fallback
+       call-out, so the blocking syscall went back to the run loop and
+       abandoned the provider's frames. Fixed in 9bbb85ee:
+       `gex.provider_guest_call(+1/-1)` around `gexp_call_guest` (the
+       shim's export bound straight in; a no-op natively), counted in
+       `provider_callout_open`, and restored by `provider_try` on a raise.
+       The provider build is `scratch/unity/dnc-gc/provider/mono.wasm`
+       (PROVIDER_DIR; dnc is left alone for the gate). It is staged on
+       edger as `muck-bcl/mono.wasm`, with the old one at `mono.wasm.prev`.
+       embed passes natively and under node.
+     - **mp14 (edger Chromium, `--fjit` + the UnityPlayer unit via
+       `?cgen=1&elfunits=UnityPlayer.so`, .NET JIT):**
+       - The unit is placed in the page (76,412 entries, 1.7 s).
+       - First frame at 72 s.
+       - The menu holds at 20.0-20.4 presents/s from 180 s to 480 s. That
+         is 1.8x faster than mp8 (no fjit, no unit: 11.5/s) and 1.9x slower
+         than native mk-j1 (38.6/s).
+       - The readbacks (`shots/mp14/c005-c016.png`) show Muck's real main
+         menu: the scene, the buttons and the version text. The ground has
+         dotted-line artefacts.
+       - At about 500 s the same bind-group validation error (GL's) blanks
+         the window to black.
+       - The glibc_math and glibc_mem provider modules have to be in the
+         page's unit cache as well (copied from ~/.cache/gex/cgen/providers).
+     - Not run yet: the .NET interpreter in the page (`PAGE_ENV=GEXMONO_WASM_JIT=0`)
+       and `--fjit` without the unit. They were dropped to keep edger's lock
+       free for the integ/2026-10-08b gate.
+     - Per-Worker unit install time is now logged (`[unit] installed at
+       BASE in N ms`, when 20 ms or more): the measure for item 4, the
+       once-per-process slot install.
+  32. **Where the page's 20 fps goes (mp16, edger, 2026-10-08):**
+     - Setup: `--profile 240,20` (new in browser-linux.mjs) profiles the page
+       and all 27 Workers for 20 s at the menu, with fjit plus the unit.
+       The profiles are in `scratch/unity/page/shots/mp16/*.cpuprofile`.
+     - The page's main thread is 100% idle, and the compositor Worker 53%
+       idle (its busy part is createRenderPipeline, createBindGroup and
+       gex_wgpu draws).
+     - Guest Worker 3 (Muck's main thread) spends 39% of its time in
+       `KLock::take`: 18% from `gex_wake` → `schedule` after a park, the
+       rest from syscalls. Another 17% goes to `k_park_futex`. Guest code is
+       only a few percent.
+     - Worker 24 (the render thread) spends 45% in `gl_submit` (the page's
+       synchronous submit), and that call ran under KLOCK, inside the
+       ioctl in `gex_syscall`'s locked dispatch. 33% goes to parks.
+     - The ~22 idle Workers each spend 65% in `k_park_futex` and 34% in
+       `KLock::take` (from `schedule` on wake-up): a convoy behind the lock
+       held across GL submits.
+     - Fix (8842f365): the GL ioctl records the submit, and `gex_syscall`
+       runs it once the lock is released. The GLX page test passes. The
+       Muck measurement is pending.
+     - No `[unit]` lines reached the log: the harness keeps only console
+       errors from Workers, and those lines are `console.warn`. The
+       per-Worker install times need console.error (to do).
+     - The dotted grass is Muck's geometry-shader grass (GLSL 410,
+       `layout(points)` to `triangle_strip`, `max_vertices = 5`, in
+       sharedassets0.assets). The page draws only the GS's input points:
+       gex_wgpu has no GS. Sent to GL. The sea at the horizon is missing
+       too.

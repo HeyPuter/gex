@@ -312,8 +312,9 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
   await browser.send('Page.navigate', { url }, page);
   // A CPU profile of each Worker whose script URL contains `match`, over
   // `ms`: [{ url, profile }] (Chrome's .cpuprofile shape).
-  const profile = async (match, ms) => {
-    const sids = [...targets].filter(([, u]) => u.includes(match)).map(([s]) => s);
+  // `withPage`: the page's own (main) thread too, first, as url 'page'.
+  const profile = async (match, ms, withPage = false) => {
+    const sids = [...(withPage ? [page] : []), ...[...targets].filter(([, u]) => u.includes(match)).map(([s]) => s)];
     for (const s of sids) {
       await browser.send('Profiler.enable', {}, s);
       await browser.send('Profiler.setSamplingInterval', { interval: 250 }, s);
@@ -323,7 +324,7 @@ export async function openPage(query, { width = 1280, height = 900, shotDir = nu
     const out = [];
     for (const s of sids) {
       const { profile } = await browser.send('Profiler.stop', {}, s);
-      out.push({ url: targets.get(s), profile });
+      out.push({ url: s === page ? 'page' : targets.get(s), profile });
     }
     return out;
   };
