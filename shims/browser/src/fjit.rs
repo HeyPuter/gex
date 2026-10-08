@@ -263,6 +263,26 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
     let mut v = lock(&LIBS);
     v.clear();
     for w in spec.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        // `watch=0xADDR` (a debugging aid riding on the same query): say when
+        // the u64 there changes, at syscalls and safepoints (`watch_check`).
+        if let Some(a) = w.strip_prefix("watch=") {
+            if let Ok(a) = u64::from_str_radix(a.trim_start_matches("0x"), 16) {
+                WATCH.store(a, Ordering::Relaxed);
+            }
+            continue;
+        }
+        // `callout=0|2`, `inplace=0`, `callouttrap=1`: the A/B switches of
+        // the call-out and the in-place redispatch (bisection aids).
+        if let Some((k, v)) = w.split_once('=') {
+            let v: i32 = v.parse().unwrap_or(1);
+            match k {
+                "callout" => crate::cgen::gex_set_callout(v),
+                "inplace" => crate::gex_set_in_place(v),
+                "callouttrap" => crate::cgen::TRAP_CALLOUTS.store(v != 0, Ordering::Relaxed),
+                _ => crate::warn_line(&format!("gex: ?fjitlibs: no switch {k}\n")),
+            }
+            continue;
+        }
         let (include, w) = match w.strip_prefix('-') {
             Some(n) => (false, n),
             None => (true, w.trim_start_matches('+')),
@@ -273,6 +293,30 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
             None => (w, None),
         };
         v.push(Rule { include, name: name.to_string(), range });
+    }
+}
+
+static WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WATCH_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static WATCH_SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `?fjitlibs=watch=0xADDR`: the u64 at ADDR changed since the last look
+/// (any thread's): say where this thread is (`at`: syscall or safepoint).
+pub(crate) fn watch_check(pc: u64, at: &str) {
+    let a = WATCH.load(Ordering::Relaxed);
+    if a == 0 {
+        return;
+    }
+    let mem = crate::guest_bytes();
+    let Some(b) = mem.get(a as usize..a as usize + 8) else { return };
+    let v = u64::from_le_bytes(b.try_into().unwrap());
+    let last = WATCH_LAST.swap(v, Ordering::Relaxed);
+    if last != v && WATCH_SAID.fetch_add(1, Ordering::Relaxed) < 64 {
+        let (thread, whose, vwhose) = crate::with_host(|h| (crate::cur(), crate::object_off_at(h, pc), crate::object_off_at(h, v)));
+        crate::warn_line(&format!(
+            "[watch] {a:#x}: {last:#x} -> {v:#x} ({vwhose}), seen by thread {thread} at {at} pc {pc:#x} ({whose}), {} JIT modules\n",
+            lock(&MODULES).len()
+        ));
     }
 }
 

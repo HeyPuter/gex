@@ -5880,6 +5880,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         IN_PROVIDER.with(|c| c.set(provider));
         ((pc as u64) & !PROVIDER_SYSCALL) as i64
     };
+    fjit::watch_check(pc as u64, "syscall");
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
     let stop_tracked = !IN_PROVIDER.with(|c| c.get()) && cgen::libprov::any_registered();
@@ -10472,6 +10473,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
 /// preemption is the engine's job now; see the end of this function.)
 #[no_mangle]
 pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
+    fjit::watch_check(pc as u64, "safepoint");
     // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
     // without a syscall: a loop that spins on them passes here.
     nt::tick();
@@ -12408,7 +12410,7 @@ pub(crate) fn object_file_off(a: u64) -> (String, u64) {
 /// `RefCell` borrow would panic.
 /// Like `object_name_at` but with the `+offset` into the object, so a return
 /// address on a crash stack can be run through objdump to name the function.
-fn object_off_at(h: &Host, a: u64) -> String {
+pub(crate) fn object_off_at(h: &Host, a: u64) -> String {
     h.kernel
         .mem
         .vmas()
