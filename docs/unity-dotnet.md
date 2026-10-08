@@ -1717,8 +1717,20 @@ Not yet:
        `KLock::take` (from `schedule` on wake-up): a convoy behind the lock
        held across GL submits.
      - Fix (8842f365): the GL ioctl records the submit, and `gex_syscall`
-       runs it once the lock is released. The GLX page test passes. The
-       Muck measurement is pending.
+       runs it once the lock is released. The GLX page test passes.
+     - **mp17 (the same setup with the fix):**
+       - The menu runs at 21.2-21.6 presents/s, against 20.0-20.8 in mp16:
+         about 5% faster.
+       - Time in `KLock::take` drops to 1% on the main thread and 0% on the
+         idle Workers.
+       - The limit is now the GL round trip. The main thread parks 52% of
+         its time waiting on the render thread. The render thread spends
+         48% in the synchronous `gl_submit` (about 2.5 submits per frame)
+         and 28% parked. The compositor Worker is 50% idle. This went to GL.
+       - The first frame came at 110 s (72 s in mp16). Not explained yet.
+     - **Unit install per Worker (item 4):** 36-45 ms for the 76k-slot unit,
+       24 installs in mp17, so about 1 s in all. Installing it once per
+       process is not worth it in the page.
      - No `[unit]` lines reached the log: the harness keeps only console
        errors from Workers, and those lines are `console.warn`. The
        per-Worker install times need console.error (to do).
