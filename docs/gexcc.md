@@ -1374,3 +1374,8 @@ could be the next item-3 library: 96% of sqlite3's instructions.
 **Recommendation:** not A for now. B only per measured hot function. Make
 libsqlite3 the next item-3 library, and keep the LP64 libc as the inside
 of such libraries.
+
+**Decision (user, 2026-10-09): libraries, not libc.** libc.so.6 is not
+replaced. Whole hot libraries become item-3 providers on the LP64 libc
+(libsqlite3 next), and per-function libc providers are added only where a
+profile shows a hot spot.
