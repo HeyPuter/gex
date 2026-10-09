@@ -2320,3 +2320,48 @@ Not yet:
     `mono_interp_transform_method` (`mono_runtime_class_init_full`), and
     `generate` itself is 1.64 s. The JIT does not remove it: methods are
     still transformed at tier 0 first.
+- **Where the JIT run's time goes (hg10: hg8 with `MONO_WASM_JIT_STATS=1`, counters every 60 s, and a
+  20 s profile at 520 s).**
+  - Delegates are not the cause, and neither is patch 0005.
+    - A delegate built by JIT code now goes through `interp_delegate_ctor` with an `InterpMethod*`,
+      exactly like one the interpreter builds.
+    - Emitted code has 93 delegate sites, and `call_delegate` exits to the interpreter 601 times in the
+      whole run.
+  - The JIT calls back into the interpreter far more often than the interpreter calls into it. In King's
+    Pass, `residual` (JIT to interpreter) grows by ~67k/s and `invoked` (interpreter to JIT) by ~18k/s.
+    - 2,954 methods are registered.
+    - Of 58,493 callee sites in emitted code, 30,488 are "untried": the callee was never compiled.
+  - The threshold is 500, tuned upstream on Minecraft/IKVM. Re-emission is off; the counters say it
+    could reach a further 52.1% of callee sites.
+  - The profile is not representative: the game made 0 presents during the window.
+  - hg11 (threshold 100) and hg12 (threshold 100 plus `MONO_WASM_JIT_REEMIT=1`) test both knobs.
+- **Upstream review (r58Playz wasm-jspi-jit-10.0.3, 6812ea26..2f86e2c9: 21 commits, +8.4k lines).**
+  - The new work is Minecraft tuning:
+    - B4 hot-set modules
+    - S2 profile-guided inlining
+    - C1 compact virtual sites
+    - tier-2 caps
+    - J1 eager list
+  - Unchanged: the tier-1 threshold, re-emission and the call_interp handoff.
+  - Applying 0001-0005 to the tip gives 15 small conflict hunks in 5 files.
+  - The real rebase cost is auditing the new emitters for wasm64.
+  - Upstream's CLAUDE.md records an open module-corruption bug.
+  - Patch 0006 takes only a0f2c7b9c (compute_reachable as a worklist), which applies cleanly. The
+    rebase decision is with the user.
+- **Pins in the page.**
+  - Pinned at their old arena bases, the pins did not hold:
+    - hp28: 8 of 16 landed.
+      - 4 slid because the arena had already given part of their span away.
+      - 4 loaded unpinned; all 4 were dlopened while other threads run.
+    - hp29: 9 were misplaced. The shim's own heap takes from the same arena cursor and grew earlier.
+  - 62b38fc2: `MemoryMap::reserve`, and pins armed per thread.
+  - 046bec02: the system libraries are pinned in the placement window (0x7000000-0xb000000), with
+    their units rebuilt there (`units/build-libs-m6.sh`).
+  - hp30 (shim-m6, window pins, ld.so unit):
+    - Every pin landed, and every unit was found.
+    - The game then hung before its first present. GL was set up: 361 submits, then nothing.
+    - The Mesa libGL unit (`/gex/gl/libGL.so.1`) was placed for the first time in this run; earlier
+      runs' libGL unit was built from the system libGL and never matched. That makes it the suspect.
+    - hp31 repeats hp30 without it.
+  - ld.so's unit works in the page: hp29 placed it at 7.7 s with 357 entries. First frame was at 43 s,
+    and the menu ran at 42.1 presents/s.
