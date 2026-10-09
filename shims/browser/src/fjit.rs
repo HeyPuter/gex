@@ -64,6 +64,30 @@ static CHECKS: Mutex<Option<HashMap<u32, Vec<(u64, u32)>>>> = Mutex::new(None);
 static TIER1_ONLY: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
 
 static TRANSLATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Translations, functions and wasm bytes by object (`?fjitlibs=byobj=1`
+/// prints them every 256 translations): what the JIT spends start-up on.
+static BY_OBJECT: Mutex<Option<std::collections::BTreeMap<String, (u64, u64, u64)>>> = Mutex::new(None);
+static BY_OBJECT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_object(addr: u64, funcs: usize, bytes: usize) {
+    if !BY_OBJECT_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let (name, _) = crate::object_file_off(addr);
+    let mut g = lock(&BY_OBJECT);
+    let m = g.get_or_insert_with(Default::default);
+    let e = m.entry(name).or_default();
+    e.0 += 1;
+    e.1 += funcs as u64;
+    e.2 += bytes as u64;
+    let total: u64 = m.values().map(|e| e.0).sum();
+    if total % 256 == 0 {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| b.1 .2.cmp(&a.1 .2));
+        let list: Vec<String> = v.iter().take(12).map(|(n, e)| format!("{n} {}/{}/{}K", e.0, e.1, e.2 / 1024)).collect();
+        crate::warn_line(&format!("[fjit] {total} translations by object (translations/functions/wasm): {}\n", list.join(", ")));
+    }
+}
 static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -187,6 +211,7 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    note_object(addr, funcs.len(), wasm.len());
     let wasm = named(wasm);
     // Held until the module is in the list: a Worker replaying the
     // function table's log (`gex_fjit_ptr`, `gex_fjit_regs`) waits for it
@@ -280,7 +305,8 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
         }
         // `callout=0|2`, `inplace=0`, `callouttrap=1`: the A/B switches of
         // the call-out and the in-place redispatch (bisection aids);
-        // `provcheck=1`: check each provider guest call ends at its return.
+        // `provcheck=1`: check each provider guest call ends at its return;
+        // `byobj=1`: count translations by object (`note_object`).
         if let Some((k, v)) = w.split_once('=') {
             let v: i32 = v.parse().unwrap_or(1);
             match k {
@@ -288,6 +314,7 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
                 "inplace" => crate::gex_set_in_place(v),
                 "callouttrap" => crate::cgen::TRAP_CALLOUTS.store(v != 0, Ordering::Relaxed),
                 "provcheck" => crate::cgen::libprov::PROV_CHECK.store(v != 0, Ordering::Relaxed),
+                "byobj" => BY_OBJECT_ON.store(v != 0, Ordering::Relaxed),
                 _ => crate::warn_line(&format!("gex: ?fjitlibs: no switch {k}\n")),
             }
             continue;
