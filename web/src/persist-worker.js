@@ -8,6 +8,7 @@
 // Message out: { synced: id, wrote, removed, files, bytes } or { error }.
 
 import { openDb, txDone } from './persist-db.js';
+import { lazyFetch } from '../../shims/browser/js/lazy-fetch.mjs';
 
 const SCRATCH = 0x1000; // where paths and buffers go in this worker's process memory
 const CHUNK = 1 << 20;
@@ -190,7 +191,7 @@ self.onmessage = (e) => {
       for (const shared of [true, false]) {
         mem = new WebAssembly.Memory({ initial: 1, maximum: 65535, shared });
         try {
-          inst = await WebAssembly.instantiate(m.spec.module, { env: { memory: m.spec.memory, process: mem } });
+          inst = await WebAssembly.instantiate(m.spec.module, { env: { memory: m.spec.memory, process: mem, lazy_fetch: lazyFetch(m.spec.memory) } });
           break;
         } catch (e) {
           if (!shared) throw e;

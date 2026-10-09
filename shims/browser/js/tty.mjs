@@ -12,6 +12,7 @@
 //
 // Without a `SharedArrayBuffer` there is no global kernel: `open` answers null
 // and the caller keeps its own line discipline.
+import { lazyFetch } from './lazy-fetch.mjs';
 
 /// Where the page writes bytes for the kernel to copy out of. The kernel
 /// imports the calling process's memory and addresses it with `memory.copy`;
@@ -43,7 +44,7 @@ export class PageTty {
     let inst;
     try {
       inst = await WebAssembly.instantiate(mod, {
-        env: { memory: spec.memory, process: scratch },
+        env: { memory: spec.memory, process: scratch, lazy_fetch: lazyFetch(spec.memory) },
       });
     } catch (e) {
       // A module that will not take a plain process memory is the shared build,

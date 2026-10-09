@@ -30,6 +30,9 @@ fn note_capacity(before: usize, after: usize) {
 #[derive(Debug, Default)]
 pub struct FileNode {
     data: Mutex<Vec<u8>>,
+    /// Contents fetched on demand (`TmpFs::add_lazy`); `None` once the file
+    /// is an ordinary one (never, or since a write made it one).
+    lazy: Mutex<Option<Lazy>>,
     ino: u64,
     /// Modification time, in seconds. On the node, not the name, so it follows
     /// a rename or a link and an open descriptor's `fstat` sees it -- `gzip`
@@ -41,12 +44,109 @@ impl FileNode {
     fn new(data: Vec<u8>, ino: u64) -> FileNode {
         FileNode {
             data: Mutex::new(data),
+            lazy: Mutex::new(None),
             ino,
             mtime: AtomicI64::new(now()),
         }
     }
     fn touch(&self) {
         self.mtime.store(now(), Ordering::Relaxed);
+    }
+
+    /// The size, lazy or not.
+    fn size(&self) -> u64 {
+        if let Some(l) = self.lazy.lock().unwrap().as_ref() {
+            return l.size;
+        }
+        self.data.lock().unwrap().len() as u64
+    }
+
+    /// Make a lazy file an ordinary one (all of it fetched), before a write
+    /// or a truncation changes it.
+    fn materialize(&self) -> Result<(), Errno> {
+        let mut lazy = self.lazy.lock().unwrap();
+        let Some(l) = lazy.as_mut() else { return Ok(()) };
+        let mut all = vec![0u8; l.size as usize];
+        l.read(0, &mut all)?;
+        let mut data = self.data.lock().unwrap();
+        let was = data.capacity();
+        *data = all;
+        note_capacity(was, data.capacity());
+        TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+        *lazy = None;
+        Ok(())
+    }
+}
+
+/// How a lazy file's bytes are fetched: `(url, offset, into)`, true when
+/// all of `into` was filled. Installed by the host (the browser's global
+/// kernel: a synchronous ranged request from the Worker that reads).
+pub type LazyFetch = fn(&str, u64, &mut [u8]) -> bool;
+static LAZY_FETCH: std::sync::OnceLock<LazyFetch> = std::sync::OnceLock::new();
+
+/// Set how lazy files are fetched (the first call wins).
+pub fn set_lazy_fetch(f: LazyFetch) {
+    let _ = LAZY_FETCH.set(f);
+}
+
+/// Lazy files are fetched and kept in pieces this big.
+const LAZY_CHUNK: u64 = 1 << 20;
+
+/// A file whose bytes live elsewhere (a URL) and arrive a chunk at a time,
+/// as they are read: a game's gigabytes of data served to a page.
+#[derive(Debug)]
+struct Lazy {
+    url: String,
+    size: u64,
+    chunks: std::collections::HashMap<u64, Box<[u8]>>,
+    held: u64,
+}
+
+impl Lazy {
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<u64, Errno> {
+        if offset >= self.size || buf.is_empty() {
+            return Ok(0);
+        }
+        let end = (offset + buf.len() as u64).min(self.size);
+        let (first, last) = (offset / LAZY_CHUNK, (end - 1) / LAZY_CHUNK);
+        // Missing chunks in runs, one request a run.
+        let mut c = first;
+        while c <= last {
+            if self.chunks.contains_key(&c) {
+                c += 1;
+                continue;
+            }
+            let mut stop = c;
+            while stop < last && !self.chunks.contains_key(&(stop + 1)) {
+                stop += 1;
+            }
+            let lo = c * LAZY_CHUNK;
+            let hi = ((stop + 1) * LAZY_CHUNK).min(self.size);
+            let mut run = vec![0u8; (hi - lo) as usize];
+            let fetch = LAZY_FETCH.get().ok_or(Errno::EIO)?;
+            if !fetch(&self.url, lo, &mut run) {
+                return Err(Errno::EIO);
+            }
+            for k in c..=stop {
+                let a = ((k - c) * LAZY_CHUNK) as usize;
+                let b = (a + LAZY_CHUNK as usize).min(run.len());
+                self.chunks.insert(k, run[a..b].to_vec().into_boxed_slice());
+                self.held += (b - a) as u64;
+                TMPFS_BYTES.fetch_add((b - a) as u64, core::sync::atomic::Ordering::Relaxed);
+            }
+            c = stop + 1;
+        }
+        let mut at = offset;
+        while at < end {
+            let k = at / LAZY_CHUNK;
+            let chunk = &self.chunks[&k];
+            let from = (at - k * LAZY_CHUNK) as usize;
+            let n = ((end - at) as usize).min(chunk.len() - from);
+            let o = (at - offset) as usize;
+            buf[o..o + n].copy_from_slice(&chunk[from..from + n]);
+            at += n as u64;
+        }
+        Ok(end - offset)
     }
 }
 
@@ -121,6 +221,24 @@ impl TmpFs {
             path,
             Node::File(Arc::new(FileNode::new(contents, ino))),
         );
+    }
+
+    /// A file of `size` bytes whose contents are fetched from `url` as they
+    /// are read (`set_lazy_fetch`). A path already present is left alone:
+    /// a bundled copy wins.
+    pub fn add_lazy(&self, path: &str, size: u64, url: &str) {
+        let path = path.trim_start_matches('/').to_string();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nodes.contains_key(&path) {
+            return;
+        }
+        Self::ensure_parents(&mut inner, &path);
+        let ino = inner.next_ino;
+        inner.next_ino += 1;
+        inner.inos.insert(path.clone(), ino);
+        let f = FileNode::new(Vec::new(), ino);
+        *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0 });
+        inner.nodes.insert(path, Node::File(Arc::new(f)));
     }
 
     pub fn add_dir(&self, path: &str) {
@@ -225,6 +343,9 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EISDIR);
         };
+        if let Some(l) = file.lazy.lock().unwrap().as_mut() {
+            return l.read(offset, buf);
+        }
         let data = file.data.lock().unwrap();
         let start = (offset as usize).min(data.len());
         let n = buf.len().min(data.len() - start);
@@ -236,6 +357,7 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EISDIR);
         };
+        file.materialize()?;
         let mut data = file.data.lock().unwrap();
         let start = offset as usize;
         if start + buf.len() > data.len() {
@@ -254,7 +376,7 @@ impl FileHandle for TmpHandle {
         if let Some(file) = &self.file {
             return Ok(Metadata {
                 file_type: FileType::Regular,
-                size: file.data.lock().unwrap().len() as u64,
+                size: file.size(),
                 mode: 0o644,
                 ino: file.ino,
                 mtime: file.mtime.load(Ordering::Relaxed),
@@ -268,7 +390,7 @@ impl FileHandle for TmpHandle {
         match inner.nodes.get(&self.path) {
             Some(Node::File(f)) => Ok(Metadata {
                 file_type: FileType::Regular,
-                size: f.data.lock().unwrap().len() as u64,
+                size: f.size(),
                 mode: inner.modes.get(&self.path).copied().unwrap_or(0o644),
                 ino,
                 mtime: f.mtime.load(Ordering::Relaxed),
@@ -366,6 +488,7 @@ impl FileHandle for TmpHandle {
         let Some(file) = &self.file else {
             return Err(Errno::EINVAL);
         };
+        file.materialize()?;
         {
             let mut data = file.data.lock().unwrap();
             let was = data.capacity();
@@ -389,6 +512,9 @@ impl FileSystem for TmpFs {
                     }
                     if flags & oflags::O_TRUNC != 0 {
                         if let Some(Node::File(f)) = inner.nodes.get(&path) {
+                            if let Some(l) = f.lazy.lock().unwrap().take() {
+                                TMPFS_BYTES.fetch_sub(l.held, core::sync::atomic::Ordering::Relaxed);
+                            }
                             {
                                 let mut data = f.data.lock().unwrap();
                                 let was = data.capacity();
@@ -755,5 +881,46 @@ mod tests {
         fs.symlink("real", "link").unwrap();
         assert_eq!(fs.read_link("link").unwrap(), "real");
         assert_eq!(fs.read_link("real").err(), Some(Errno::EINVAL));
+    }
+}
+
+#[cfg(test)]
+mod lazy_tests {
+    use super::*;
+
+    /// Byte `i` of every lazy file here is `i % 251`.
+    fn fake(url: &str, offset: u64, into: &mut [u8]) -> bool {
+        assert_eq!(url, "/data/f");
+        for (k, b) in into.iter_mut().enumerate() {
+            *b = ((offset + k as u64) % 251) as u8;
+        }
+        true
+    }
+
+    #[test]
+    fn lazy_reads_fetch_what_they_touch() {
+        set_lazy_fetch(fake);
+        let fs = TmpFs::new();
+        let size = 3 * LAZY_CHUNK + 123;
+        fs.add_lazy("/d/f", size, "/data/f");
+        let h = fs.open("d/f", 0, 0).unwrap();
+        assert_eq!(h.metadata().unwrap().size, size);
+        let mut buf = vec![0u8; 5000];
+        let at = LAZY_CHUNK - 2000;
+        assert_eq!(h.read_at(at, &mut buf).unwrap(), 5000);
+        assert!(buf.iter().enumerate().all(|(k, &b)| b == ((at + k as u64) % 251) as u8));
+        let mut tail = vec![0u8; 1000];
+        assert_eq!(h.read_at(size - 100, &mut tail).unwrap(), 100);
+        assert_eq!(tail[99], ((size - 1) % 251) as u8);
+        // A write makes it an ordinary file with all its bytes.
+        h.write_at(0, b"xy").unwrap();
+        let mut two = [0u8; 4];
+        h.read_at(0, &mut two).unwrap();
+        assert_eq!(&two, &[b'x', b'y', 2, 3]);
+        assert_eq!(h.metadata().unwrap().size, size);
+        // A bundled file of the same name wins.
+        fs.add_file("/e/g", b"abc".to_vec());
+        fs.add_lazy("/e/g", 99, "/data/f");
+        assert_eq!(fs.open("e/g", 0, 0).unwrap().metadata().unwrap().size, 3);
     }
 }

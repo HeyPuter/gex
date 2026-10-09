@@ -276,6 +276,7 @@ extern "C" {
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
     fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
+    fn k_fs_add_lazy(path: gex_kernel::PAddr, path_len: u32, url: gex_kernel::PAddr, url_len: u32, size: u64) -> i32;
     /// The system-wide map from a page of a mapped object to the dispatch slots
     /// its code was translated into; zero means nobody has. In the kernel so
     /// the second process to run `ls` finds what the first one translated.
@@ -4128,6 +4129,22 @@ pub extern "C" fn gex_add_file(path: u32, path_len: u32, data: u32, data_len: u3
     // exist yet -- `gex_load` builds it.
     let bytes = shim_slice(data, data_len).to_vec();
     FILES.0.borrow_mut().push((name.to_string(), bytes));
+}
+
+/// A file the guest reads from `url` (same origin) a megabyte at a time, as
+/// it reads (`TmpFs::add_lazy` in the global kernel): data too big to
+/// bundle. Only with a global kernel; a path the bundle has is left alone.
+#[no_mangle]
+pub extern "C" fn gex_add_lazy(path: u32, path_len: u32, url: u32, url_len: u32, size: u64) {
+    // SAFETY: scalars naming ranges of this module's memory, which the
+    // kernel copies from.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            unsafe { k_fs_add_lazy(gex_kernel::PAddr::from(path), path_len, gex_kernel::PAddr::from(url), url_len, size) };
+        }
+        return;
+    }
+    warn_line("gex_add_lazy: no global kernel; a lazy file is left out\n");
 }
 
 /// A bundled hard link: `path` becomes another name for the already-added
