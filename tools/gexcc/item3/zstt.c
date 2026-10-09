@@ -11,7 +11,8 @@
  *                   finished and checked in both processes; and the struct
  *                   by value calls (ZSTD_getCParams, ZSTD_cParam_getBounds,
  *                   ZSTD_createCCtx_advanced). One JSON line each.
- *   zstt checkd     and ZDICT_trainFromBuffer, a dictionary's round trip */
+ *   zstt checkd     and ZDICT_trainFromBuffer, a dictionary's round trip
+ *   zstt checkm     and compression with 4 workers (ZSTD_c_nbWorkers) */
 #define ZSTD_STATIC_LINKING_ONLY
 #include "zstd.h"
 #define ZDICT_STATIC_LINKING_ONLY
@@ -148,6 +149,28 @@ static int dictcheck(void)
 	return bad;
 }
 
+/* Workers: the library's own threads. Same frame contents as one thread
+ * would make? Not byte for byte (jobs split the input), so the check is the
+ * round trip. */
+static int mtcheck(void)
+{
+	ZSTD_CCtx *c = ZSTD_createCCtx();
+	size_t r = ZSTD_CCtx_setParameter(c, ZSTD_c_nbWorkers, 4);
+	int bad = ZSTD_isError(r);
+	size_t clen = 0;
+	if (!bad) {
+		ZSTD_CCtx_setParameter(c, ZSTD_c_compressionLevel, 3);
+		ZSTD_CCtx_setParameter(c, ZSTD_c_jobSize, 512 << 10);
+		clen = ZSTD_compress2(c, dst, sizeof dst, src, N);
+		bad = ZSTD_isError(clen) || ZSTD_decompress(back, N, dst, clen) != N || !eq(src, back, N);
+	}
+	ZSTD_freeCCtx(c);
+	put("{\"workers\":4,\"set\":"); putu(ZSTD_isError(r) ? 0 : 1); put(",\"clen\":"); putu(clen);
+	put(",\"ok\":"); put(bad ? "false" : "true"); put("}\n");
+	flush();
+	return bad;
+}
+
 void cmain(long *sp)
 {
 	const char *variant = sp[0] > 1 ? (const char *)sp[2] : "zstt";
@@ -162,7 +185,7 @@ void cmain(long *sp)
 	}
 	if (variant[0] == 'c' && variant[1] == 'h' && variant[2] == 'e' && variant[3] == 'c' && variant[4] == 'k') {
 		/* checkd: the dictionary builder too */
-		int bad = structs() | check(1) | check(0) | (variant[5] == 'd' ? dictcheck() : 0);
+		int bad = structs() | check(1) | check(0) | (variant[5] == 'd' ? dictcheck() : 0) | (variant[5] == 'm' ? mtcheck() : 0);
 		sys6(94, bad, 0, 0, 0, 0, 0);
 	}
 	double tc[5], tu[5];

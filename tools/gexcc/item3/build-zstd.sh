@@ -3,10 +3,10 @@
 # libzstd.so.1 under an aarch64 program, as build.sh does zlib (gen.py's
 # adapters, rt.c, the lowering), and its test program zstt.
 #
-# Single-threaded: built without ZSTD_MULTITHREAD (Debian's has it), so
-# ZSTD_c_nbWorkers > 0 is refused as an unsupported parameter. No legacy
-# formats. The dictionary builder (ZDICT_*) needs the LP64 libc
-# (A64_SYSROOT, lib.sh); without it they are bound to gexp__missing.
+# No legacy formats. With the LP64 libc (A64_SYSROOT, lib.sh) it is built
+# as Debian's is, with ZSTD_MULTITHREAD (workers are the provider's own
+# threads) and the dictionary builder; without it, single-threaded
+# (ZSTD_c_nbWorkers > 0 is refused) and ZDICT_* are bound to gexp__missing.
 #
 #   build-zstd.sh OUT   (GEXCC_PREFIX; A64_SYSROOT; DEBIAN_ROOT for zstt)
 set -eu
@@ -31,6 +31,12 @@ open(p, "w").write(s)
 PY
 objs=()
 if [ -n "${A64_SYSROOT:-}" ]; then
+  # with the libc: threads, as Debian's (the provider's own, through musl's clone)
+  CF="$CF -DZSTD_MULTITHREAD"
+  for f in common/threading compress/zstdmt_compress; do
+    o=$O/zstd/$(echo $f | tr / _).o; objs+=("$o")
+    clang $CF -I"$L" -I"$L/common" -c "$L/$f.c" -o "$o" &
+  done
   python3 "$H/gen.py" zstd - "$L/zstd.h" "$L/zdict.h" "$L/zstd_errors.h" > "$O/zstd/adapters.c"
   for f in dictBuilder/cover dictBuilder/divsufsort dictBuilder/fastcover dictBuilder/zdict; do
     o=$O/zstd/$(echo $f | tr / _).o; objs+=("$o")

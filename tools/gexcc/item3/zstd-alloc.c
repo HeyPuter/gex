@@ -16,7 +16,9 @@ void gexp_zstd_free(ZSTD_customMem m, void *p)
 	a64_call_guest((uint64_t)(uintptr_t)m.customFree, 2, a);
 }
 
+#ifndef ZSTD_MULTITHREAD
 /* Built without ZSTD_MULTITHREAD: no pool (ZSTD_CCtx_refThreadPool then
  * has nothing to use, as with nbWorkers 0). */
 ZSTD_threadPool *ZSTD_createThreadPool(size_t numThreads) { (void)numThreads; return 0; }
 void ZSTD_freeThreadPool(ZSTD_threadPool *pool) { (void)pool; }
+#endif
