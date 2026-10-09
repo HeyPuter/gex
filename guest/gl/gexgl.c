@@ -1178,8 +1178,13 @@ static void gexgl_record_attrib(unsigned index, int size, unsigned type,
    host driver). */
 #define GEXGL_FF_TEX_UNITS 4
 #define GEXGL_FF_NORMAL (2 + GEXGL_FF_TEX_UNITS)
-#define GEXGL_FF_ARRAYS (GEXGL_FF_NORMAL + 1)
-#define GEXGL_NORMAL_POINTER_PLAN 10051 /* compat_plans.rs: "v w w P" */
+#define GEXGL_FF_SECONDARY (GEXGL_FF_NORMAL + 1)
+#define GEXGL_FF_FOG (GEXGL_FF_SECONDARY + 1)
+#define GEXGL_FF_ARRAYS (GEXGL_FF_FOG + 1)
+/* compat_plans.rs: the planned opcodes, as the hosts decode them. */
+#define GEXGL_NORMAL_POINTER_PLAN 10051          /* "v w w P" */
+#define GEXGL_SECONDARY_COLOR_POINTER_PLAN 10560 /* "v w w w P" */
+#define GEXGL_FOG_COORD_POINTER_PLAN 8915        /* "v w w P" */
 struct ff_array_state {
     int size;
     unsigned type;
@@ -1242,14 +1247,17 @@ static void gexgl_upload_client_arrays(size_t vertices, int instances) {
 
 static void ff_pointer_command(unsigned slot, const struct ff_array_state *a, uint64_t offset) {
     static const uint32_t ops[3] = { GEXGL_VERTEX_POINTER, GEXGL_COLOR_POINTER, GEXGL_TEX_COORD_POINTER };
-    if (slot == GEXGL_FF_NORMAL) {
-        uint32_t *p = begin(GEXGL_NORMAL_POINTER_PLAN, 4, 0);
+    /* The normal and fog coordinate arrays have no size on the wire. */
+    if (slot == GEXGL_FF_NORMAL || slot == GEXGL_FF_FOG) {
+        uint32_t *p = begin(slot == GEXGL_FF_NORMAL ? GEXGL_NORMAL_POINTER_PLAN
+                                                    : GEXGL_FOG_COORD_POINTER_PLAN, 4, 0);
         if (!p) return;
         p[0] = a->type; p[1] = (uint32_t)a->stride;
         p[2] = (uint32_t)offset; p[3] = (uint32_t)(offset >> 32);
         return;
     }
-    uint32_t *p = begin(ops[slot < 2 ? slot : 2], 5, 0);
+    uint32_t *p = begin(slot == GEXGL_FF_SECONDARY ? GEXGL_SECONDARY_COLOR_POINTER_PLAN
+                                                   : ops[slot < 2 ? slot : 2], 5, 0);
     if (!p) return;
     p[0] = (uint32_t)a->size; p[1] = a->type; p[2] = (uint32_t)a->stride;
     p[3] = (uint32_t)offset; p[4] = (uint32_t)(offset >> 32);
@@ -1286,7 +1294,9 @@ static struct ff_array_state *ff_slot_for(unsigned array) {
     switch (array) {
     case 0x8074u: return &ff_arrays[0]; /* GL_VERTEX_ARRAY */
     case 0x8076u: return &ff_arrays[1]; /* GL_COLOR_ARRAY */
-    case 0x8075u: return &ff_arrays[GEXGL_FF_NORMAL]; /* GL_NORMAL_ARRAY */
+    case 0x8075u: return &ff_arrays[GEXGL_FF_NORMAL];    /* GL_NORMAL_ARRAY */
+    case 0x845Eu: return &ff_arrays[GEXGL_FF_SECONDARY]; /* GL_SECONDARY_COLOR_ARRAY */
+    case 0x8457u: return &ff_arrays[GEXGL_FF_FOG];       /* GL_FOG_COORD_ARRAY */
     case 0x8078u:                       /* GL_TEXTURE_COORD_ARRAY */
         return client_active_texture < GEXGL_FF_TEX_UNITS ? &ff_arrays[2 + client_active_texture] : NULL;
     default: return NULL;
@@ -1326,6 +1336,17 @@ void glTexCoordPointer(int size, unsigned type, int stride, const void *pointer)
 /* Three components always; `size` is kept for the upload's element size. */
 void glNormalPointer(unsigned type, int stride, const void *pointer) {
     ff_record(GEXGL_FF_NORMAL, 3, type, stride, pointer);
+}
+/* The secondary colour and fog coordinate arrays likewise (GL 1.4; the EXT
+   spellings are gl-aliases-generated.inc's). Missing, they kept
+   GL_EXT_secondary_color unclaimed, and wined3d, which assumes it on GL 1.4,
+   called a null glSecondaryColorPointerEXT in its caps probe (Undertale,
+   Katana ZERO). */
+void glSecondaryColorPointer(int size, unsigned type, int stride, const void *pointer) {
+    ff_record(GEXGL_FF_SECONDARY, size, type, stride, pointer);
+}
+void glFogCoordPointer(unsigned type, int stride, const void *pointer) {
+    ff_record(GEXGL_FF_FOG, 1, type, stride, pointer);
 }
 void glClientActiveTexture(unsigned unit) {
     client_active_texture = unit >= 0x84C0u ? unit - 0x84C0u : 0;
