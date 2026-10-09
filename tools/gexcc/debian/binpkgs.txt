@@ -51,3 +51,19 @@ libassuan -             *
 libksba   -             *
 npth      -             *
 gnupg2    gpgv          *
+# gui: libraries static in the sysroot; fontconfig (its tools and /etc/fonts)
+# and foot as packages, with Debian's fonts and keyboard data
+wayland   -             *
+wayland-protocols -     *
+libxkbcommon -          *
+pixman    -             *
+freetype  -             *
+utf8proc  -             *
+tllist    -             *
+fcft      -             *
+fontconfig -            usr/lib/* usr/include/*
+fontconfig fontconfig   *
+depends   fontconfig    fonts-dejavu-core
+foot      foot          *
+depends   foot          xkb-data
+depends   foot          fontconfig

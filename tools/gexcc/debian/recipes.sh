@@ -648,3 +648,101 @@ build_gnupg2() {
   make -j$JOBS -C g10 gpgv
   mkdir -p $DEST/usr/bin; cp g10/gpgv $DEST/usr/bin/
 }
+
+# -- gui: Wayland clients (docs/gexcc.md §6.2 tier 3) -------------------------
+
+export PATH=$PATH:$HOME/.local/bin
+# meson cross setup into build/, static, with the host's own tools (a host
+# wayland-scanner) found through the build machine's pkg-config path
+ms_setup() {
+  meson setup build --cross-file $GEXCC_PREFIX/share/gexcc/meson-cross.ini \
+    --prefix=/usr --libdir=lib --sysconfdir=/etc --localstatedir=/var --buildtype=release \
+    -Ddefault_library=static -Dbuild.pkg_config_path=$GEXCC_DEB/host/lib/pkgconfig "$@"
+}
+ms_install() { python3 "$HERE/meson-install.py" -C build --no-rebuild "$@"; }
+ms_both() { DESTDIR=$DEST ms_install; DESTDIR=$SYSROOT ms_install; }
+
+# wayland-scanner for the build machine (protocol code is generated at build time)
+host_wayland_scanner() {
+  [ -x $GEXCC_DEB/host/bin/wayland-scanner ] && return
+  meson setup hostbuild --prefix=$GEXCC_DEB/host --libdir=lib -Dlibraries=false -Dscanner=true \
+    -Dtests=false -Ddocumentation=false -Ddtd_validation=false
+  meson install -C hostbuild
+}
+
+build_wayland() {
+  host_wayland_scanner
+  ms_setup -Dscanner=false -Dtests=false -Ddocumentation=false -Ddtd_validation=false
+  meson compile -C build
+  ms_both
+}
+
+build_wayland_protocols() {
+  ms_setup -Dtests=false
+  meson compile -C build
+  ms_both
+  # headers and XML only: the sysroot is where they are used
+  rm -rf $DEST; mkdir -p $DEST
+}
+
+build_libxkbcommon() {
+  ms_setup -Denable-tools=false -Denable-x11=false -Denable-docs=false -Denable-wayland=false \
+    -Denable-xkbregistry=false -Denable-bash-completion=false \
+    -Dxkb-config-root=/usr/share/X11/xkb -Dx-locale-root=/usr/share/X11/locale
+  meson compile -C build
+  ms_both
+}
+
+build_pixman() {
+  ms_setup -Dloongson-mmi=disabled -Dmmx=disabled -Dsse2=disabled -Dssse3=disabled -Dvmx=disabled \
+    -Darm-simd=disabled -Dneon=disabled -Da64-neon=disabled -Dmips-dspr2=disabled -Drvv=disabled \
+    -Dgnu-inline-asm=disabled -Dopenmp=disabled -Dtimers=false -Dgtk=disabled -Dlibpng=disabled \
+    -Dtests=disabled -Ddemos=disabled
+  meson compile -C build
+  ms_both
+}
+
+build_freetype() {
+  ms_setup -Dbrotli=disabled -Dbzip2=disabled -Dharfbuzz=disabled -Dpng=disabled -Dzlib=system -Dtests=disabled
+  meson compile -C build
+  ms_both
+}
+
+build_fontconfig() {
+  ms_setup -Ddoc=disabled -Dnls=disabled -Dtests=disabled -Dtools=enabled -Dcache-build=disabled \
+    -Dcache-dir=/var/cache/fontconfig
+  meson compile -C build
+  ms_both
+}
+
+build_utf8proc() {
+  make -j$JOBS CC=gexcc AR=gexcc-ar libutf8proc.a
+  for d in $DEST $SYSROOT; do
+    install -Dm644 libutf8proc.a $d/usr/lib/libutf8proc.a
+    install -Dm644 utf8proc.h $d/usr/include/utf8proc.h
+    mkdir -p $d/usr/lib/pkgconfig
+    sed -e 's|PREFIX|/usr|; s|LIBDIR|lib|; s|INCLUDEDIR|include|' -e "s|VERSION|${PWD##*/utf8proc-}|; s|-[0-9]*$||" \
+      libutf8proc.pc.in > $d/usr/lib/pkgconfig/libutf8proc.pc
+  done
+  rm -rf $DEST; mkdir -p $DEST
+}
+
+build_tllist() {
+  ms_setup
+  ms_both
+  rm -rf $DEST; mkdir -p $DEST
+}
+
+build_fcft() {
+  ms_setup -Ddocs=disabled -Dgrapheme-shaping=disabled -Drun-shaping=disabled -Dtest-text-shaping=false \
+    -Dexamples=false -Dsvg-backend=nanosvg
+  meson compile -C build
+  ms_both
+}
+
+build_foot() {
+  ms_setup -Ddocs=disabled -Dgrapheme-clustering=disabled -Dtests=false -Dterminfo=enabled \
+    -Dutmp-backend=none -Dime=true -Dthemes=true -Dwerror=false -Dc_args=-Wno-c2y-extensions
+  meson compile -C build
+  DESTDIR=$DEST ms_install
+}
