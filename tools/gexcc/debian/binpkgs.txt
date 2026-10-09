@@ -84,7 +84,44 @@ libsdl2-mixer -         *
 chocolate-doom chocolate-doom usr/bin/chocolate-doom usr/bin/chocolate-doom-setup usr/share/applications/org.chocolate_doom.Doom* usr/share/icons/* usr/share/metainfo/org.chocolate_doom.Doom*
 chocolate-doom -        *
 depends   chocolate-doom freedoom
-# perl: built and working (XS extensions static), not shipped yet: Debian's
-# arm64 perl-base stays until ours provides perlapi-5.40.1 and the layout
-# Debian's arm64 Perl packages expect
+# gtk: the libraries static in the sysroot; GTK 3's demos as Debian's
+# gtk-3-examples, its data (settings schemas, compiled here; themes, emoji)
+# as libgtk-3-common. Icons: Debian's adwaita-icon-theme, whose SVGs need
+# librsvg's loader (not built: Rust), so only its PNGs show.
+libpng1.6 -             *
+fribidi   -             *
+glib2.0   -             *
+harfbuzz  -             *
+cairo     -             *
+pango1.0  -             *
+gdk-pixbuf -            *
+at-spi2-core -          *
+libglvnd  -             *
+libepoxy  -             *
+gtk+3.0   gtk-update-icon-cache usr/bin/gtk-update-icon-cache
+gtk+3.0   gtk-3-examples usr/bin/gtk3-widget-factory usr/bin/gtk3-demo usr/share/applications/* usr/share/icons/*
+gtk+3.0   libgtk-3-common usr/share/glib-2.0/schemas/* usr/share/gtk-3.0/* usr/share/themes/* etc/gtk-3.0/*
+gtk+3.0   -             *
+depends   gtk-3-examples libgtk-3-common, adwaita-icon-theme, hicolor-icon-theme, fontconfig, xkb-data
+# perl (XS extensions static, no dynamic loading): labelled arm64 like dpkg,
+# so ours is the perl-base, perl-modules-5.40, libperl5.40 and perl that
+# Debian's arm64 packages depend on, split as Debian splits them: perl-base
+# has Debian's perl-base modules (perl-base.list), perl-modules-5.40 the
+# rest of privlib, libperl5.40 the rest of archlib, perl the tools. No
+# perlapi-5.40.1: an arm64 XS module could not load into a wasm32 perl, so
+# packages built against that API stay uninstallable instead of failing at
+# `use`. Pure-Perl packages (/usr/share/perl5, vendorlib) work.
+perl      -             usr/share/perl/5.40/pod/* *.pod usr/local/* usr/bin/perlbug usr/bin/perlthanks
+perl      perl-base     usr/bin/perl usr/bin/perl5.40.1 @perl-base.list
+perl      perl-modules-5.40 usr/share/perl/*
+perl      libperl5.40   usr/lib/wasm32-linux-musl/*
+perl      perl          usr/bin/*
 perl      -             *
+arch      perl-base     arm64
+arch      perl-modules-5.40 arm64
+arch      libperl5.40   arm64
+arch      perl          arm64
+multiarch perl          allowed
+depends   perl-modules-5.40 perl-base (= ${binary:Version})
+depends   libperl5.40   perl-base (= ${binary:Version})
+depends   perl          perl-base (= ${binary:Version}), perl-modules-5.40 (= ${binary:Version}), libperl5.40 (= ${binary:Version})
