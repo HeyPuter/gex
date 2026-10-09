@@ -31,6 +31,9 @@ lua5.4    lua5.4        *
 lz4       lz4           *
 mpdecimal -             *
 python3.13 python3.13   *
+# ours is the whole interpreter: what Debian splits it into (python3's
+# version is its metapackage's, 3.13.5-1)
+provides python3.13 python3 (= 3.13.5-1), python3-minimal (= 3.13.5-1), libpython3-stdlib (= 3.13.5-1), python3.13-minimal (= ${binary:Version}), libpython3.13-minimal (= ${binary:Version}), libpython3.13-stdlib (= ${binary:Version})
 openssl   openssl       *
 curl      curl          *
 git       -             usr/lib/git-core/git-http-push usr/lib/git-core/git-imap-send usr/lib/git-core/git-http-fetch usr/lib/git-core/git-daemon usr/lib/git-core/git-http-backend usr/lib/git-core/scalar usr/bin/scalar usr/lib/git-core/git-shell usr/bin/git-shell
