@@ -6603,7 +6603,10 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            if self.compat && !gex_abi::PPC { "i686" } else { gex_abi::ARCH_NAME },
+            // An i386 process on the x86 build; a wasm32 program on the
+            // AArch64 build is part of an aarch64 system (its dpkg and
+            // config.guess should agree with the arm64 programs beside it).
+            if self.compat && gex_abi::X86 { "i686" } else { gex_abi::ARCH_NAME },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
@@ -6701,18 +6704,28 @@ impl Kernel {
     /// on Linux, and a return value on the same scale.
     fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         let ticks = (self.cpu_nanos() / 10_000_000) as u64;
-        if buf != 0 {
+        if buf != 0 && self.compat {
+            // i386: four 32-bit clock_t
+            m.zero(buf, 16)?;
+            m.write_u32(buf, ticks as u32)?;
+        } else if buf != 0 {
             m.zero(buf, 32)?;
             m.write_u64(buf, ticks)?;
         }
-        Ok(ticks)
+        Ok(if self.compat { ticks as u32 as u64 } else { ticks })
     }
 
     /// `getrusage`. Only the two times are filled in; the page-fault and
     /// context-switch counters stay zero, which is what a program that asks
     /// for them under emulation should expect to see.
     fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        if buf != 0 {
+        if buf != 0 && self.compat {
+            // i386: 32-bit timevals and longs (72 bytes)
+            let ns = self.cpu_nanos();
+            m.zero(buf, 72)?;
+            m.write_u32(buf, (ns / 1_000_000_000) as u32)?;
+            m.write_u32(buf + 4, (ns % 1_000_000_000 / 1000) as u32)?;
+        } else if buf != 0 {
             m.zero(buf, 144)?;
             write_timeval(m, buf, self.cpu_nanos())?;
         }
