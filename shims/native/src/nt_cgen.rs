@@ -889,7 +889,7 @@ fn prepared(p: &Pending) -> Result<Arc<Prepared>> {
     let (image, _) = gex_xlate::func::pe_input(&p.pe, p.base)
         .map_err(|e| anyhow!("{}: placing the image at {:#x}: {e}", p.path, p.base))?;
     let pv = provided(&p.pe, p.base);
-    let cwasm_path = cache_root()?.join(unit_key(&image, &pv)).join("c.wasm");
+    let cwasm_path = cache_root()?.join(remembered_unit_key(&id, &image, &pv)?).join("c.wasm");
     let segs = image.segments.iter().filter(|s| s.executable).map(|s| (s.vaddr, s.bytes.clone())).collect();
     let unit = read_unit(&cwasm_path, &pv.stubs)?;
     let pr = Arc::new(Prepared { segs, path: cwasm_path, stubs: pv.stubs, unit });
@@ -899,6 +899,37 @@ fn prepared(p: &Pending) -> Result<Arc<Prepared>> {
     }
     m.push((id, Arc::clone(&pr)));
     Ok(pr)
+}
+
+/// [`unit_key`], remembered on disk across runs (`<cache>/w3keys`) by the
+/// file's path, base, length and SipHash (`id`), this gexc binary and the
+/// indirect-call profiles' directory: the key is two SHA-256s of the
+/// relocated image, a third of wineboot's host CPU in a session boot.
+fn remembered_unit_key(id: &(String, u64, usize, u64), image: &gex_ld::Image, pv: &Provided) -> Result<String> {
+    use std::hash::{Hash, Hasher};
+    let root = cache_root()?;
+    let stamp = |p: &std::path::Path| {
+        std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos())))
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "gex-w3-key 1".hash(&mut h);
+    id.hash(&mut h);
+    std::env::current_exe().ok().and_then(|e| stamp(&e)).hash(&mut h);
+    stamp(&root.join("icall")).hash(&mut h);
+    let memo = root.join("w3keys").join(format!("{:016x}", h.finish()));
+    if let Ok(k) = std::fs::read_to_string(&memo) {
+        if !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Ok(k);
+        }
+    }
+    let k = unit_key(image, pv);
+    if std::fs::create_dir_all(root.join("w3keys")).is_ok() {
+        let tmp = memo.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, &k).is_ok() {
+            let _ = std::fs::rename(&tmp, &memo);
+        }
+    }
+    Ok(k)
 }
 
 /// The unit at `path` (`.../c.wasm`), if it is there: its bytes and its
