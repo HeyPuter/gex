@@ -5205,6 +5205,19 @@ impl Kernel {
         put(&mut out, 48, 1 << 17); // f_ffree
         put(&mut out, 72, 255); // f_namelen
         put(&mut out, 80, 4096); // f_frsize
+        if self.compat {
+            // i386's statfs64 (and musl's wasm32 `struct statfs`): 32-bit
+            // f_type, f_bsize, f_namelen, f_frsize, 64-bit counts
+            let mut c = [0u8; 84];
+            let w32 = |o: &mut [u8; 84], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            w32(&mut c, 0, 0x0102_1994);
+            w32(&mut c, 4, 4096);
+            c[8..48].copy_from_slice(&out[16..56]); // blocks, bfree, bavail, files, ffree
+            w32(&mut c, 56, 255);
+            w32(&mut c, 60, 4096);
+            m.write(buf, &c)?;
+            return Ok(0);
+        }
         m.write(buf, &out)?;
         Ok(0)
     }
@@ -6559,23 +6572,24 @@ impl Kernel {
                 break;
             }
         }
-        let is_unix = unix_sock.is_some();
+        // Who sent it, as recvfrom says: musl's resolver drops a reply whose
+        // msg_name is not one of its nameservers. A unix peer has no name.
+        let name = self.msg_rd(m, msg, 0)?;
+        let namelen_at = msg + if self.compat { 4 } else { 8 };
+        if name != 0 {
+            if unix_sock.is_some() {
+                m.write_u32(namelen_at, 0)?;
+            } else {
+                let peer = self.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
+                let (ip, port) = peer.unwrap_or((0, 0));
+                self.sys_write_sockaddr(m, ip, port, name, namelen_at)?;
+            }
+        }
         let received = unix_sock.map(|s| s.take_received()).unwrap_or_default();
         let written = self.write_scm_rights(m, control, controllen, received)?;
         self.msg_wr(m, msg, 5, written)?;
-        // Where the datagram came from, as `recvfrom` says it. musl's
-        // resolver (1.2.4 on) reads its answers with `recvmsg` and drops any
-        // whose source is not a nameserver it asked: with the name left
-        // unwritten every answer was dropped, and each `getaddrinfo` waited
-        // out the resolver's 5 s timeout and failed.
-        let name = self.msg_rd(m, msg, 0)?;
-        if name != 0 && !is_unix {
-            if let Ok(sock) = self.socket_of(fd) {
-                let (ip, port) = sock.last_from().or_else(|| sock.peer()).unwrap_or((0, 0));
-                let namelen = msg + if self.compat { 4 } else { 8 };
-                self.sys_write_sockaddr(m, ip, port, name, namelen)?;
-            }
-        }
+        // msg_flags (int): nothing truncated
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, 0)?;
         Ok(total)
     }
 

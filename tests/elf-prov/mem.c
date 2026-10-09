@@ -111,6 +111,16 @@ int main(void) {
                 y[i] = (char)0xf0;
                 mix((unsigned)strcmp(x, y));
                 mix((unsigned)strcmp(y, x));
+                /* Low bits only (aarch64 glibc's result is then not the
+                 * bytes' difference), at another mutual alignment too. */
+                y[i] = 'b';
+                mix((unsigned)strcmp(x, y));
+                mix((unsigned)strcmp(y, x));
+                if (i > 0) {
+                    mix((unsigned)strcmp(x + 1, y + 1));
+                    mix((unsigned)strcmp(x + i, y + 1));
+                    mix((unsigned)strcmp(y + 1, x + i));
+                }
                 y[i] = 'a';
             }
             if (len > 0) {

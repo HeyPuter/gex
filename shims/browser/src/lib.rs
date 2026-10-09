@@ -569,7 +569,15 @@ fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
     if signo == 0 || signo == 28 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
         return;
     }
-    warn_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
+    let line = format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n");
+    // SIGINT, SIGKILL and SIGTERM to another process are a parent ending a
+    // child on purpose (apt stops each of its methods with SIGINT): noted,
+    // not warned. A hangup stays a warning; that is a session coming apart.
+    if matches!(signo, 2 | 9 | 15) && caller != target {
+        trace_line(&line);
+    } else {
+        warn_line(&line);
+    }
 }
 
 extern "C" fn r_kill(caller: i32, target: i32, signo: u32) -> i32 {
@@ -922,8 +930,9 @@ fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
         return;
     }
     let counts = unsafe { k_pty_counts(id) };
+    // A note (console.warn), not an error: nothing is wrong when it is said.
     warn_line(&format!(
-        "[pty] pid {pid} {what}s the {} of pty {id}: {} master(s), {} slave(s) now\n",
+        "[gex-note] [pty] pid {pid} {what} the {} of pty {id}: {} master(s), {} slave(s) now\n",
         if master != 0 { "master" } else { "slave" },
         counts >> 16,
         counts & 0xffff
@@ -932,21 +941,21 @@ fn pty_note(what: &str, id: i32, master: i32, pid: i32) {
 
 extern "C" fn rpty_open_master() -> i32 {
     let r = unsafe { k_pty_open_master(my_pid()) };
-    pty_note("open", r >> 16, 1, my_pid());
+    pty_note("opens", r >> 16, 1, my_pid());
     r
 }
 extern "C" fn rpty_open_slave(ptn: i32) -> i32 {
     let r = unsafe { k_pty_open_slave(ptn, my_pid()) };
-    pty_note("open", ptn, 0, my_pid());
+    pty_note("opens", ptn, 0, my_pid());
     r
 }
 extern "C" fn rpty_open_end(id: i32, master: i32) {
     unsafe { k_pty_open_end(id, master, my_pid()) };
-    pty_note("inherit", id, master, my_pid());
+    pty_note("inherits", id, master, my_pid());
 }
 extern "C" fn rpty_close_end(id: i32, master: i32) {
     unsafe { k_pty_close_end(id, master, my_pid()) };
-    pty_note("close", id, master, my_pid());
+    pty_note("closes", id, master, my_pid());
 }
 extern "C" fn rpty_read(id: i32, master: i32, at: gex_kernel::PAddr, len: u32) -> i32 {
     let r = unsafe { k_pty_read(id, master, at, len) };
@@ -1912,6 +1921,18 @@ pub extern "C" fn gex_dump_threads() {
     });
 }
 
+/// Whether the thread whose context is at `ctx` has exited: a Worker whose
+/// own thread ended while the process goes on (a wasm32 program's worker
+/// thread, joined) is done, not stuck.
+#[no_mangle]
+pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
+    with_host(|h| {
+        h.threads
+            .iter()
+            .any(|t| t.kstate.ctx_addr == ctx as u64 && matches!(t.waiting, Waiting::Exited)) as i32
+    })
+}
+
 /// How many of an object's stored units one dispatch miss may take, merged
 /// into a single module. See the use site in the miss path.
 static PER_MISS_N: std::sync::atomic::AtomicUsize =
@@ -2271,25 +2292,29 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
         // The first few, and only well above a chunk: this is a real event worth
         // a line, not a stream. A run that made one of these per miss printed
         // two hundred of them and drowned everything else in the console.
+        use core::fmt::Write as _;
+        struct Buf([u8; 192], usize);
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let room = self.0.len() - self.1;
+                let n = s.len().min(room);
+                self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
+                self.1 += n;
+                Ok(())
+            }
+        }
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // Said once the span is in hand: a large single allocation that
+        // succeeds is legitimate (apt maps its 42 MiB package list), so it is
+        // a note; one the arena cannot serve is an error.
+        let mut said = None;
         if _layout.size() as u64 > 2 * CHUNK
             && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4
         {
-            use core::fmt::Write as _;
-            struct Buf([u8; 160], usize);
-            impl core::fmt::Write for Buf {
-                fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                    let room = self.0.len() - self.1;
-                    let n = s.len().min(room);
-                    self.0[self.1..self.1 + n].copy_from_slice(&s.as_bytes()[..n]);
-                    self.1 += n;
-                    Ok(())
-                }
-            }
-            let mut b = Buf([0; 160], 0);
+            let mut b = Buf([0; 192], 0);
             let _ = write!(
                 b,
-                "[gex:{}] a single {} MiB allocation takes a span of its own from \
+                "[gex-note] [gex:{}] a single {} MiB allocation takes a span of its own from \
                  the arena, which never gives one back (in {}, syscall {}, \
                  {} refills so far)\n",
                 my_pid(),
@@ -2298,8 +2323,7 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
                 LAST_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) as i32,
                 HEAP_REFILLS.load(std::sync::atomic::Ordering::Relaxed),
             );
-            // SAFETY: `warn` reads the bytes and keeps none of them.
-            unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+            said = Some(b);
         }
         arena_note(1, len);
         // Count of refills, plus the biggest single layout that forced one --
@@ -2348,7 +2372,21 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
                 );
             }
         }
-        let base = arena_take(len).ok_or(())? as *mut u8;
+        let Some(base) = arena_take(len) else {
+            if let Some(mut b) = said {
+                // Not a note any more: the arena could not serve it. Drop the
+                // `[gex-note] ` prefix (11 bytes) so it reaches console.error.
+                let _ = write!(b, "  ... and the arena could not serve it\n");
+                // SAFETY: `warn` reads the bytes and keeps none of them.
+                unsafe { warn(b.0.as_ptr().add(11) as u32, (b.1 - 11) as u32) };
+            }
+            return Err(());
+        };
+        let base = base as *mut u8;
+        if let Some(b) = said {
+            // SAFETY: as above.
+            unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+        }
         memmap::claim(memmap::Kind::Heap, 0, base as u64, base as u64 + len, if BIG { "heap span (big)" } else { "heap span" });
         // Extend the last span when this one abuts it, rather than claiming a
         // separate one: talc cannot serve a request larger than any single span
@@ -5777,6 +5815,25 @@ pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
     n as u32
 }
 
+/// The running program's argv, space-separated and capped, for the
+/// per-process line (which program a cost belongs to).
+#[no_mangle]
+pub extern "C" fn gex_cmdline(out: u32, max: u32) -> u32 {
+    let text = with_host(|h| {
+        let mut t = h.kernel.argv.join(" ");
+        if t.is_empty() {
+            t = h.kernel.exe_path.clone();
+        }
+        t
+    });
+    let mut n = text.len().min(max as usize);
+    while n > 0 && !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
+    n as u32
+}
+
 /// Nanoseconds spent inside syscalls, and how many there were. Always kept.
 static SYS_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SYS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -6366,11 +6423,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // Who sent it, if the global kernel knows: "killed by signal 1"
                 // is true of a hangup, a terminal's line discipline and any
                 // guest's `kill`, and they are not the same bug.
+                let mut sent = None;
                 let from = if unsafe { k_present() } != 0 {
                     let v = unsafe { k_last_kill() };
                     let caller = (v >> 40) as i32;
                     let target = ((v >> 8) & 0xffff_ffff) as i32;
                     let signo = (v & 0xff) as u32;
+                    sent = Some((caller, target, signo));
                     format!(
                         " (signal #{}: {signo} from pid {caller} to {target})",
                         unsafe { k_last_kill_seq() }
@@ -6378,6 +6437,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 } else {
                     String::new()
                 };
+                // Ended on purpose by another process (SIGINT, SIGKILL or
+                // SIGTERM it sent this one): one quiet line, not the report.
+                // apt ends every method this way after a clean run.
+                let pid = h.kernel.pid;
+                if matches!(sent, Some((caller, target, signo))
+                    if signo == signal as u32 && matches!(signo, 2 | 9 | 15)
+                        && caller != pid && (target == pid || target == -pid || target == 0))
+                {
+                    trace_line(&format!("[gex] pid {pid} ended by signal {signal}{from}\n"));
+                } else {
                 warn_line(&format!(
                     "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
                      last calls:{}\n  address space:{}\n  futexes:{}",
@@ -6406,6 +6475,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     mem_recent(),
                     ftx_recent(),
                 ));
+                }
                 exit_process(h, -(signal as i32))
             }
             SyscallOutcome::SpawnThread {

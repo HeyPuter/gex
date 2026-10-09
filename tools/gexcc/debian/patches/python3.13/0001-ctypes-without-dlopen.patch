@@ -1,0 +1,19 @@
+ctypes without dlopen: a static wasm32 python has no handle for itself, so
+import ctypes failed at pythonapi. Keep the module importable.
+
+--- a/Lib/ctypes/__init__.py	2026-10-09 05:38:42.395624558 -0400
++++ b/Lib/ctypes/__init__.py	2026-10-09 05:38:42.422624611 -0400
+@@ -482,7 +482,12 @@
+ elif _sys.platform == "cygwin":
+     pythonapi = PyDLL("libpython%d.%d.dll" % _sys.version_info[:2])
+ else:
+-    pythonapi = PyDLL(None)
++    # A program with no dynamic loader (a static wasm32 build) has no handle
++    # for itself: ctypes' types and buffers still work, a library does not.
++    try:
++        pythonapi = PyDLL(None)
++    except OSError:
++        pythonapi = None
+ 
+ 
+ if _os.name == "nt":

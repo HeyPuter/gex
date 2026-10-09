@@ -498,6 +498,17 @@ export async function runProgram(
     }
   }
 
+  // The network: the page's Wisp connection, which every Worker calls across
+  // shared memory. A WebSocket in the guest's own Worker delivers on that
+  // Worker's event loop, which a wasm32 program waiting in a syscall never
+  // gives back.
+  let netChannel = null;
+  if (network && globalThis.crossOriginIsolated) {
+    const { makeNetChannel, serveNet } = await import('@gex/net-bridge.mjs');
+    netChannel = makeNetChannel();
+    if (netChannel) serveNet(network, netChannel);
+  }
+
   // The Wayland compositor. The protocol state machine runs in each guest
   // process (the Rust shim, next to the client's memory, which is the only
   // place that can read a wl_shm pool); the scene, the output and the input
@@ -639,7 +650,10 @@ export async function runProgram(
       // The Wayland ring's shared buffers, so a Worker that binds the
       // compositor can carry its frames to the page's canvas. Like glChannel.
       wlChannel: wlChannel ?? undefined,
-      wispUrl: network?.url ?? undefined,
+      // The page's network, served to every Worker over shared memory
+      // (net-bridge.mjs); `wispUrl` only where the page cannot serve it.
+      netChannel: netChannel ?? undefined,
+      wispUrl: netChannel ? undefined : network?.url ?? undefined,
       // Only when there is no shared terminal to hold the size. With one this
       // must not be sent: it is captured at `runProgram` time and every Worker
       // writes it on startup, so a process forked after a resize would reset the
