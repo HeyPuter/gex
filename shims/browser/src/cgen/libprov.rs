@@ -76,6 +76,16 @@ pub(crate) fn replaced(addr: u64) -> bool {
     lock(&REPLACED).iter().any(|&(lo, hi)| addr >= lo && addr < hi)
 }
 
+/// The addresses replaced libraries' providers are bound at.
+pub(crate) fn bound_addrs() -> Vec<u64> {
+    lock(&LIBS).iter().flat_map(|l| l.pairs.iter().map(|p| p.0)).collect()
+}
+
+/// The ranges of replaced libraries' own text.
+pub(crate) fn replaced_ranges() -> Vec<(u64, u64)> {
+    lock(&REPLACED).clone()
+}
+
 /// Whether `addr` is one a replaced library's provider is bound at (its
 /// pairs are sorted by address).
 pub(crate) fn bound(addr: u64) -> bool {
@@ -587,10 +597,51 @@ thread_local! {
     static GUEST_CALLS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
+/// `?fjitlibs=provcheck=1`: [`gex_libprov_guest_call`] checks that each
+/// provider guest call ends with the guest's stack just past the return
+/// address the call pushed (its SP when the call opens), and says when not.
+pub(crate) static PROV_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// The open guest calls' return-address slots, for [`PROV_CHECK`].
+    static PROV_SLOTS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// `gex.provider_guest_call(delta)`.
 #[no_mangle]
 pub extern "C" fn gex_libprov_guest_call(delta: i32) {
     GUEST_CALLS.with(|c| c.set(c.get() + delta));
+    if PROV_CHECK.load(Ordering::Relaxed) {
+        prov_check(delta);
+    }
+}
+
+fn prov_check(delta: i32) {
+    let ctx = crate::with_host(|h| h.threads[crate::cur()].kstate.ctx_addr);
+    let gm = crate::GuestMem::new(crate::guest_bytes());
+    let reg = |o: usize| gm.read_u64(ctx + o as u64).unwrap_or(0);
+    let sp = reg(gex_abi::ctx::x(4));
+    if delta > 0 {
+        PROV_SLOTS.with(|s| s.borrow_mut().push(sp));
+        return;
+    }
+    let Some(slot) = PROV_SLOTS.with(|s| s.borrow_mut().pop()) else { return };
+    if sp == slot + 8 {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    crate::warn_line(&format!(
+        "[gex] provcheck: a provider guest call ended with sp {sp:#x}, but its return address was at {slot:#x} ([slot] now {:#x}); \
+         pc {:#x}, last target {:#x}, {} more open; last call-outs {:x?}\n",
+        gm.read_u64(slot).unwrap_or(0),
+        reg(gex_abi::ctx::PC),
+        reg(gex_abi::ctx::LAST_TARGET),
+        PROV_SLOTS.with(|s| s.borrow().len()),
+        crate::cgen::callouts_recent().iter().rev().take(6).collect::<Vec<_>>(),
+    ));
 }
 
 /// The count, which `provider_try` restores when a raise unwinds guest calls.
@@ -602,6 +653,7 @@ pub extern "C" fn gex_libprov_guest_calls() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_libprov_guest_calls_set(v: i32) {
     GUEST_CALLS.with(|c| c.set(v));
+    PROV_SLOTS.with(|s| s.borrow_mut().truncate(v.max(0) as usize));
 }
 
 /// Whether a provider's guest call is open on this Worker.

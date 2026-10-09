@@ -691,6 +691,8 @@ export async function runProgram(
       wasmDlls: globalThis.GEX_WASM_DLLS || undefined,
       // `?elfunits=name,...`: shared objects that get function-tier units (cgen/libprov.rs).
       elfUnits: globalThis.GEX_ELF_UNITS || undefined,
+      // `?fjitlibs=+name,-name` (fjit.rs `gex_fjit_libs`).
+      fjitLibs: globalThis.GEX_FJIT_LIBS || undefined,
       traceMisses: !!globalThis.GEX_TRACE_MISSES,
       // `?sharetrace=1`: say how compiled modules are shared between a process's Workers.
       shareTrace: flag('sharetrace') ? 1 : undefined,
@@ -815,7 +817,7 @@ export async function runProgram(
       // out an address inside a pinned object and the image lands somewhere
       // its own translated code does not expect.
       opts: {
-        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, env, pins: closure?.pins,
+        cwd, tty, uid, recompileObjects, heartbeat, link, dirs, modes, hard, symlinks, env, pins: pinsFrom(closure?.pins, globalThis.GEX_PINS),
         // `?strace=1`, and every child inherits it: see `#opts` in gex.mjs.
         strace: globalThis.GEX_STRACE ? 1 : undefined,
         // `?stracepid=N`: narrate that one process, which is affordable.
@@ -857,3 +859,15 @@ export async function runProgram(
 
 export { TerminalEnv };
 export { loadKernel as globalKernel };
+
+/** A closure's pins plus the page's `?pins=path@base+span,...` (hex; the query wins). */
+function pinsFrom(closurePins, spec) {
+  if (!spec) return closurePins;
+  const out = { ...(closurePins ?? {}) };
+  for (const w of spec.split(',').map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(.+)@(?:0x)?([0-9a-f]+)(?:\+(?:0x)?([0-9a-f]+))?$/i.exec(w);
+    if (!m) { console.error(`[gex] ?pins: cannot read ${w}`); continue; }
+    out[m[1]] = { base: Number.parseInt(m[2], 16), span: m[3] ? Number.parseInt(m[3], 16) : 0 };
+  }
+  return out;
+}

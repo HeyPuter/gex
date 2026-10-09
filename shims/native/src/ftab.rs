@@ -742,9 +742,45 @@ fn bisect_allows(addr: u64) -> bool {
     only.as_ref().is_none_or(inr) && !skip.as_ref().is_some_and(inr)
 }
 
+/// `GEX_FJIT_LIBS=+name,-name` (file names, as the page's `?fjitlibs=`):
+/// the objects the function JIT is limited to (any `+`) and kept from (`-`).
+fn libs_allow(caller: &mut Caller<'_, HostState>, addr: u64) -> bool {
+    static RULES: std::sync::OnceLock<Vec<(bool, String)>> = std::sync::OnceLock::new();
+    let rules = RULES.get_or_init(|| {
+        std::env::var("GEX_FJIT_LIBS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(|w| match w.strip_prefix('-') {
+                Some(n) => (false, n.to_string()),
+                None => (true, w.trim_start_matches('+').to_string()),
+            })
+            .collect()
+    });
+    if rules.is_empty() {
+        return true;
+    }
+    let name = caller.data_mut().with_kernel(|k| {
+        k.mem
+            .vmas()
+            .iter()
+            .find(|v| addr >= v.start && addr < v.end)
+            .and_then(|v| v.code.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string()))
+            .unwrap_or_default()
+    });
+    if rules.iter().any(|(inc, n)| !inc && *n == name) {
+        return false;
+    }
+    !rules.iter().any(|(inc, _)| *inc) || rules.iter().any(|(inc, n)| *inc && *n == name)
+}
+
 fn job(caller: &mut Caller<'_, HostState>, sh: &Arc<Mutex<JitShared>>, memory: &gex_mem::GuestMemory, addr: u64) -> Option<Job> {
     gex_kernel::ftab::translator()?;
     if !bisect_allows(addr) {
+        return None;
+    }
+    if !libs_allow(caller, addr) {
         return None;
     }
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = caller.data_mut().with_kernel(|k| {
@@ -968,6 +1004,9 @@ pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots
 /// sending callers there first.
 pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u64)]) {
     sh.ftab.epoch += 1;
+    if let Some(t) = gex_kernel::ftab::translator() {
+        t.retire(sh.ftab.process.0, ranges);
+    }
     sh.ftab.queued.retain(|&a| !ranges.iter().any(|&(s, e)| a >= s && a < e));
     for &(start, end) in ranges {
         let hit: Vec<(u64, gex_kernel::ftab::Func)> = sh.ftab.map.range(start, end).collect();

@@ -5959,6 +5959,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
         IN_PROVIDER.with(|c| c.set(provider));
         ((pc as u64) & !PROVIDER_SYSCALL) as i64
     };
+    fjit::watch_check(pc as u64, "syscall");
     // A guest thread in a syscall counts as stopped for a provider's
     // collection (cgen/libprov.rs); it parks on its way back if one runs.
     let stop_tracked = !IN_PROVIDER.with(|c| c.get()) && cgen::libprov::any_registered();
@@ -7279,9 +7280,23 @@ fn resume() -> Option<u64> {
     RESUME.with(|c| c.get())
 }
 
+thread_local! {
+    /// This Worker's last resumes set (the shim's line that set it, pc), for
+    /// the wild-branch report: who sent the guest where it went.
+    static RESUME_RING: std::cell::RefCell<Vec<(u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[track_caller]
 fn set_resume(v: u64) {
     RESUME.with(|c| c.set(Some(v)));
+    let line = std::panic::Location::caller().line();
+    RESUME_RING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() == 16 {
+            r.remove(0);
+        }
+        r.push((line, v));
+    });
     // GEX_NT_RESUME_LOG: each (call site, pc) a resume was set from, once:
     // where the guest leaves wasm and comes back (an AOT-only run needs a
     // unit or region entry at every such pc).
@@ -10590,6 +10605,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
 /// preemption is the engine's job now; see the end of this function.)
 #[no_mangle]
 pub extern "C" fn gex_safepoint(ctx: i32, pc: i64) {
+    fjit::watch_check(pc as u64, "safepoint");
     // A Windows process's clocks in KUSER_SHARED_DATA, which a guest polls
     // without a syscall: a loop that spins on them passes here.
     nt::tick();
@@ -11086,6 +11102,16 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let stack: Vec<String> = (0..8)
                 .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
                 .collect();
+            // The stack around sp, named, and the registers (a bad return's frame).
+            let around: Vec<String> = (0..24u64)
+                .map(|i| {
+                    let a = sp.wrapping_sub(0x60).wrapping_add(i * 8);
+                    let v = gm.read_u64(a).unwrap_or(0);
+                    format!("{a:#x}={v:#x}{}", Some(object_off_at(h, v)).filter(|n| !n.is_empty()).map(|n| format!(" ({n})")).unwrap_or_default())
+                })
+                .collect();
+            let regs: Vec<String> = (0..16u8).map(|r| format!("r{r}={:#x}", gm.read_u64(c + ctx::x(r) as u64).unwrap_or(0))).collect();
+            warn_line(&format!("[gex] wild branch: stack {}; regs {}\n", around.join(", "), regs.join(" ")));
             warn_line(&format!(
                 "[gex] pid {} thread {} branched to {pc:#x}, which is not executable guest memory (SIGSEGV); last indirect target {last:#x} ({}) from block {src:#x} ({}), sp={sp:#x} stack=[{}], last syscall {}\n",
                 h.kernel.pid,
@@ -11105,6 +11131,15 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     cgen::provider_calls_recent()
                 ));
                 warn_line(&format!("[gex] last lookups (address, index): {:x?}\n", cgen::lookups_recent()));
+                warn_line(&format!(
+                    "[gex] last call-outs (target, return, sp wanted, depth, result, sp after): {:x?}; provider guest call open {}\n",
+                    cgen::callouts_recent(),
+                    cgen::libprov::guest_call_open()
+                ));
+                warn_line(&format!(
+                    "[gex] last resumes set (lib.rs line, pc): {:x?}\n",
+                    RESUME_RING.with(|r| r.borrow().iter().map(|&(l, v)| (l, v)).collect::<Vec<_>>())
+                ));
             }
             set_exit(h, 128 + 11);
         });
@@ -11893,6 +11928,7 @@ fn retire_unmapped_code() {
         let retired = std::mem::take(&mut h.kernel.retired_code);
         if !retired.is_empty() {
             crate::cgen::on_retire(&retired);
+            crate::fjit::on_retire(&retired);
             retire_code(h, &retired);
         }
     });
@@ -12511,12 +12547,30 @@ fn note_blocks(
     e.2 = e.2.max(a);
 }
 
+/// The object file at `a` (by file name) and `a`'s offset into its mapping.
+pub(crate) fn object_file_off(a: u64) -> (String, u64) {
+    with_host(|h| {
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .find(|v| a >= v.start && a < v.end)
+            .map(|v| (v.code.as_ref().map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string()).unwrap_or_default(), a - v.start))
+            .unwrap_or_default()
+    })
+}
+
+/// [`object_off_at`], taking the host itself.
+pub(crate) fn object_off_str(a: u64) -> String {
+    with_host(|h| object_off_at(h, a))
+}
+
 /// The short name of whatever object holds this address, for a counter. Takes
 /// the host it already has, since the caller is inside `with_host` and a second
 /// `RefCell` borrow would panic.
 /// Like `object_name_at` but with the `+offset` into the object, so a return
 /// address on a crash stack can be run through objdump to name the function.
-fn object_off_at(h: &Host, a: u64) -> String {
+pub(crate) fn object_off_at(h: &Host, a: u64) -> String {
     h.kernel
         .mem
         .vmas()

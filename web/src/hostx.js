@@ -419,6 +419,15 @@ export class HostX {
         }
       },
 
+      /** Room to write: a guest's socket in the kernel fills (256 KiB); the
+       *  compositor's queues never do. */
+      writable(fd) {
+        const ep = self.#fds.get(fd);
+        if (!ep) return -1;
+        if (ep.kind === 'kernel') return self.#k.k_sock_writable(ep.id) ? 1 : 0;
+        return 1;
+      },
+
       send(fd, buf, len, fds, nfds) {
         const ep = self.#fds.get(fd);
         if (!ep) return -EBADF;
@@ -515,7 +524,7 @@ export class HostX {
     const wrapped = {};
     let left = this.#trace;
     for (const [name, fn] of Object.entries(raw)) {
-      if (name === 'tick' || name === 'wait' || name === 'readable') {
+      if (name === 'tick' || name === 'wait' || name === 'readable' || name === 'writable') {
         wrapped[name] = fn;
         continue;
       }

@@ -3,8 +3,10 @@
 //!
 //! * `GEX_CGEN_RECOVERY_INPUTS`: what decides an image's recovery (its GIR
 //!   and summaries) -- the IR, the lifters and decoders, gex-xlate's recovery
-//!   (everything in it but the runtime translator's `lib.rs` and the
-//!   profile and validation code), gex-abi, and gex-ld (placing the image);
+//!   (everything in it but the runtime translator's `lib.rs` and
+//!   `fjit.rs` -- the function JIT drives recovery at run time, a unit
+//!   never calls it -- and the profile and validation code), gex-abi, and
+//!   gex-ld (placing the image);
 //! * `GEX_CGEN_UNIT_INPUTS`: what decides the C and the module from a
 //!   recovery -- this crate (and its runtime). What the C takes from gex-abi
 //!   is hashed at run time (`image::abi_fingerprint`: the header and every
@@ -55,7 +57,7 @@ fn main() {
         rec.extend(src(c));
     }
     rec.extend(src("gex-xlate").into_iter().filter(|p| {
-        !matches!(p.file_name().and_then(|n| n.to_str()), Some("lib.rs" | "profile.rs" | "validate.rs"))
+        !matches!(p.file_name().and_then(|n| n.to_str()), Some("lib.rs" | "profile.rs" | "validate.rs" | "fjit.rs"))
     }));
     // gex-abi is not hashed here: what the C takes from it is the generated
     // header and the values `image::abi_fingerprint` lists, which the unit

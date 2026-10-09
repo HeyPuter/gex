@@ -20,7 +20,26 @@ else
 fi
 OUT=${1:-$DEFAULT_OUT}
 BUILD=$OUT/build
-EMDAWN=${GEX_EMDAWN_DIR:-$($ROOT/web/fetch-emdawnwebgpu.sh)}
+# emdawnwebgpu: a Mesa checkout that pins its own (the wink branch:
+# wink/lib/emdawn.sh, a release matched to its Tint and patched by
+# wink/tools/patch-emdawnwebgpu.py) supplies it; else gex's own fetch.
+if [ -z "${GEX_EMDAWN_DIR:-}" ] && [ -f "$MESA/wink/lib/emdawn.sh" ]; then
+    WINK_CACHE=${GEX_MESA_WINK_CACHE:-${TMPDIR:-/tmp}/gex-mesa-wink-cache}
+    EMSDK_ROOT=$(CDPATH='' cd -- "$(dirname "$(command -v emcc)")/../.." && pwd)
+    emdawn_log=$(WINK_ALLOW_ANY_EMSDK=1 bash "$MESA/wink/build.sh" --variant=mt --until=emdawn \
+        --cache="$WINK_CACHE" --build-dir="$WINK_CACHE/build" --emsdk="$EMSDK_ROOT" 2>&1) || {
+        echo "$emdawn_log" | tail -20 >&2
+        exit 1
+    }
+    EMDAWN=$(echo "$emdawn_log" | sed -n 's/^\[emdawn\] \(ready\|cached\) at //p' | tail -1)
+    [ -f "$EMDAWN/webgpu/include/webgpu/webgpu.h" ] || {
+        echo "$emdawn_log" | tail -20 >&2
+        echo "no emdawnwebgpu from wink/build.sh" >&2
+        exit 1
+    }
+else
+    EMDAWN=${GEX_EMDAWN_DIR:-$($ROOT/web/fetch-emdawnwebgpu.sh)}
+fi
 TINT_OUT=${GEX_MESA_TINT:-${TMPDIR:-/tmp}/gex-mesa-wasm/mesa-tint-pthread}
 TINT_TMP=${GEX_MESA_TINT_TMP:-${TMPDIR:-/tmp}/gex-mesa-tint-build}
 
