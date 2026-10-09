@@ -75,6 +75,40 @@ static BY_OBJECT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 static DUMP_MOD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static DUMP_OBJ: Mutex<Option<(String, u64)>> = Mutex::new(None);
+/// `?fjitlibs=scanconst=ADDR`: say which translations mention guest address
+/// ADDR as an `i64.const` (a call or jump to it, or a pc it stores), and
+/// every translation asked for at ADDR: who made a mid-function address a
+/// function start.
+static SCAN_CONST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn scan_const(root: u64, funcs: &[u64], wasm: &[u8]) {
+    let want = SCAN_CONST.load(Ordering::Relaxed);
+    if want == 0 {
+        return;
+    }
+    // `i64.const` (0x42) and its signed LEB128.
+    let mut pat = vec![0x42u8];
+    let mut v = want as i64;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        let done = (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0);
+        pat.push(if done { b } else { b | 0x80 });
+        if done {
+            break;
+        }
+    }
+    let hits = wasm.windows(pat.len()).filter(|w| *w == &pat[..]).count();
+    if hits > 0 {
+        let list: Vec<String> = funcs.iter().take(24).map(|a| format!("{a:x}")).collect();
+        crate::warn_line(&format!(
+            "[fjitscan] {want:#x} x{hits} in the module of root {root:#x} ({}), {} functions: {}\n",
+            crate::object_off_str(root),
+            funcs.len(),
+            list.join(",")
+        ));
+    }
+}
 
 fn dump_module(root: u64, funcs: &[u64], wasm: &[u8]) {
     let mut want = DUMP_MOD.load(Ordering::Relaxed);
@@ -295,6 +329,14 @@ fn mid_function(addr: u64) -> bool {
 /// Translate the function at `addr` and publish it (`gex.lookup`'s miss):
 /// its index in the function table, or `None` (the fallback runs it).
 pub(crate) fn translate(addr: u64) -> Option<u32> {
+    let r = translate_root(addr);
+    if addr != 0 && addr == SCAN_CONST.load(Ordering::Relaxed) {
+        crate::warn_line(&format!("[fjitscan] translation asked at {addr:#x}: {r:?}\n"));
+    }
+    r
+}
+
+fn translate_root(addr: u64) -> Option<u32> {
     if !on() || is_tier1_only(addr) || !lib_wanted(addr) {
         return None;
     }
@@ -365,6 +407,7 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     }
     note_object(addr, funcs.len(), wasm.len());
     dump_module(addr, &funcs, &wasm);
+    scan_const(addr, &funcs, &wasm);
     let wasm = named(wasm);
     // Held until the module is in the list: a Worker replaying the
     // function table's log (`gex_fjit_ptr`, `gex_fjit_regs`) waits for it
@@ -460,6 +503,12 @@ pub extern "C" fn gex_fjit_libs(ptr: u32, len: u32) {
         // the call-out and the in-place redispatch (bisection aids);
         // `provcheck=1`: check each provider guest call ends at its return;
         // `byobj=1`: count translations by object (`note_object`).
+        if let Some(a) = w.strip_prefix("scanconst=") {
+            if let Ok(a) = u64::from_str_radix(a.trim_start_matches("0x"), 16) {
+                SCAN_CONST.store(a, Ordering::Relaxed);
+            }
+            continue;
+        }
         if let Some(a) = w.strip_prefix("dumpmod=") {
             // `dumpmod=OBJ@OFF`: by the object's name and the hex offset from
             // its text mapping (as `object_off_at` prints), for a layout

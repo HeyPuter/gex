@@ -12438,6 +12438,11 @@ pub(crate) fn object_file_off(a: u64) -> (String, u64) {
     })
 }
 
+/// [`object_off_at`], taking the host itself.
+pub(crate) fn object_off_str(a: u64) -> String {
+    with_host(|h| object_off_at(h, a))
+}
+
 /// The short name of whatever object holds this address, for a counter. Takes
 /// the host it already has, since the caller is inside `with_host` and a second
 /// `RefCell` borrow would panic.
