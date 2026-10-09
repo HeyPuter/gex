@@ -9,7 +9,7 @@
 //        [--cwd REL] [--args ARGS] [--libs DIR:DIR] [--files LIST] [--home DIR]
 //        [--input SCRIPT.wl] [--size WxH] [--minutes N] [--shot DIR]
 //        [--profile AT,SECS[,MATCH]] [--gameplay N] [--mem64] [--fjit] [--wasmdlls SO=PATH] [--query K=V&...] [--env K=V,K=V] [--end-on-exit]
-//        [--lazy DIR]
+//        [--lazy DIR] [--pins FILE]
 //
 // --files lists host files the game opens, one per line (collected from a
 // native `gexc run --strace`; tests/games/retrocycles-linux-files.txt).
@@ -18,6 +18,9 @@
 // --lazy DIR: every file under DIR the bundle lacks, at /game/REL, read from the
 // page's server as the game reads it (a megabyte at a time; `?lazy=`), not bundled.
 // The input script's `move X Y` / `click X Y` are in the game window's pixels.
+// --pins FILE: load addresses for libraries, `BASE SPAN PATH` per line (hex; `gexc run --pin`'s
+// format), added to the query's `pins=`: units built for those bases (`elfunits=`) then keep
+// applying when an unrelated change moves where the loader would have put them.
 // --env: more environment for the guest. --end-on-exit: a program that exits is a result
 // (its output and status are printed), not a failure.
 // Needs web/public/gex built (shims/browser/build.sh), Mesa's wasm
@@ -119,6 +122,22 @@ function bundle() {
   return out;
 }
 
+/** --query plus --pins FILE (`BASE SPAN PATH` lines) merged into its `pins=`. */
+function query() {
+  const q = new URLSearchParams(opt('--query', '') || '');
+  const file = opt('--pins', null);
+  if (file) {
+    const more = readFileSync(file, 'utf8').split('\n').map((l) => l.replace(/#.*/, '').trim()).filter(Boolean).map((l) => {
+      const [base, span, path] = l.split(/\s+/);
+      if (!path) throw new Error(`--pins ${file}: cannot read '${l}'`);
+      return `${path}@${base.replace(/^0x/, '')}+${span.replace(/^0x/, '')}`;
+    });
+    q.set('pins', [q.get('pins'), ...more].filter(Boolean).join(','));
+  }
+  const s = q.toString();
+  return s ? `&${s}` : '';
+}
+
 /** --lazy DIR: served at /gex/lazy/NAME/ (a link), listed in /gex/nt/NAME.lazy.json. */
 function lazyManifest() {
   const dir = opt('--lazy', null);
@@ -192,7 +211,7 @@ async function main() {
     `tar=/gex/nt/${basename(tar)}&exe=/game/${exe}&cwd=/game/${cwd}&gl=1&glbackend=wgpu&hostx=1`
       + (argv.includes('--mem64') ? '&mem64=1' : '') + (argv.includes('--fjit') ? '&fjit=1' : '')
       + (opt('--wasmdlls', null) ? `&wasmdlls=${encodeURIComponent(opt('--wasmdlls'))}` : '')
-      + (opt('--query', null) ? `&${opt('--query')}` : '')
+      + query()
       + (lazy ? `&lazy=${encodeURIComponent(lazy)}` : '')
       + `&size=${width}x${height}&trapstack=1&env=${encodeURIComponent(genv)}&args=${encodeURIComponent(opt('--args', ''))}`,
     { width: width + 20, height: height + 100, shotDir },
