@@ -434,6 +434,21 @@ build_lz4() {
   for n in unlz4 lz4cat; do ln -sf lz4 $DEST/usr/bin/$n; done
 }
 
+build_libffi() {
+  # Our wasm32 backend (libffi-wasm32/): Debian's src/wasm32 is emscripten's,
+  # which calls through JavaScript. Static, into the sysroot only.
+  [ -x configure ] || autoreconf -fi
+  cp "$HERE/libffi-wasm32/ffi.c" src/wasm32/ffi.c
+  python3 -I "$HERE/libffi-wasm32/gen.py" > src/wasm32/tramp.inc
+  # closures.c's allocator is for machines with executable memory
+  sed -i 's/^#ifndef __EMSCRIPTEN__$/#if !defined(__EMSCRIPTEN__) \&\& !defined(__wasm__)/' src/closures.c
+  at_configure --disable-shared --enable-static --disable-docs --disable-multi-os-directory \
+    --disable-exec-static-tramp --disable-raw-api
+  make -j$JOBS
+  both install; nola
+  rm -rf $DEST; mkdir -p $DEST
+}
+
 build_mpdecimal() {
   at_configure --disable-shared --enable-static --disable-cxx
   make -j$JOBS
