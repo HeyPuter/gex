@@ -752,6 +752,86 @@ void report_version_gap() {
 
     const struct gl_extensions& e = mesa_context->ctx->Extensions;
     const unsigned have = mesa_context->ctx->Version;
+    /* Every requirement from GL 4.1 to 4.6 that is not met, not only the next
+     * rung's: what stands between this context and 4.6, in one list. The
+     * conditions are compute_version()'s (src/mesa/main/version.c). */
+    if (have >= 40) {
+        const struct gl_constants& c = mesa_context->ctx->Const;
+        struct need { unsigned version; const char* name; bool met; };
+        const need needs[] = {
+            {41, "MaxTextureSize >= 16384", c.MaxTextureSize >= 16384},
+            {41, "MaxRenderbufferSize >= 16384", c.MaxRenderbufferSize >= 16384},
+            {41, "MaxCubeTextureLevels >= 15", c.MaxCubeTextureLevels >= 15},
+            {41, "Max3DTextureLevels >= 12", c.Max3DTextureLevels >= 12},
+            {41, "MaxArrayTextureLayers >= 2048", c.MaxArrayTextureLayers >= 2048},
+            {41, "ARB_ES2_compatibility", (bool)e.ARB_ES2_compatibility},
+            {41, "ARB_shader_precision", (bool)e.ARB_shader_precision},
+            {41, "ARB_vertex_attrib_64bit", (bool)e.ARB_vertex_attrib_64bit},
+            {41, "ARB_viewport_array", (bool)e.ARB_viewport_array},
+            {42, "ARB_base_instance", (bool)e.ARB_base_instance},
+            {42, "ARB_conservative_depth", (bool)e.ARB_conservative_depth},
+            {42, "ARB_internalformat_query", (bool)e.ARB_internalformat_query},
+            {42, "ARB_shader_atomic_counters", (bool)e.ARB_shader_atomic_counters},
+            {42, "ARB_shader_image_load_store", (bool)e.ARB_shader_image_load_store},
+            {42, "ARB_shading_language_420pack", (bool)e.ARB_shading_language_420pack},
+            {42, "ARB_shading_language_packing", (bool)e.ARB_shading_language_packing},
+            {42, "ARB_texture_compression_bptc", (bool)e.ARB_texture_compression_bptc},
+            {42, "ARB_transform_feedback_instanced", (bool)e.ARB_transform_feedback_instanced},
+            {43, "vertex MaxUniformBlocks >= 14", c.Program[MESA_SHADER_VERTEX].MaxUniformBlocks >= 14},
+            {43, "ARB_ES3_compatibility", (bool)e.ARB_ES3_compatibility},
+            {43, "ARB_arrays_of_arrays", (bool)e.ARB_arrays_of_arrays},
+            {43, "ARB_compute_shader", (bool)e.ARB_compute_shader},
+            {43, "ARB_copy_image", (bool)e.ARB_copy_image},
+            {43, "ARB_explicit_uniform_location", (bool)e.ARB_explicit_uniform_location},
+            {43, "ARB_fragment_layer_viewport", (bool)e.ARB_fragment_layer_viewport},
+            {43, "ARB_framebuffer_no_attachments", (bool)e.ARB_framebuffer_no_attachments},
+            {43, "ARB_internalformat_query2", (bool)e.ARB_internalformat_query2},
+            {43, "ARB_robust_buffer_access_behavior", (bool)e.ARB_robust_buffer_access_behavior},
+            {43, "ARB_shader_image_size", (bool)e.ARB_shader_image_size},
+            {43, "ARB_shader_storage_buffer_object", (bool)e.ARB_shader_storage_buffer_object},
+            {43, "ARB_stencil_texturing", (bool)e.ARB_stencil_texturing},
+            {43, "ARB_texture_buffer_range", (bool)e.ARB_texture_buffer_range},
+            {43, "ARB_texture_query_levels", (bool)e.ARB_texture_query_levels},
+            {43, "ARB_texture_view", (bool)e.ARB_texture_view},
+            {44, "MaxVertexAttribStride >= 2048", c.MaxVertexAttribStride >= 2048},
+            {44, "ARB_buffer_storage", (bool)e.ARB_buffer_storage},
+            {44, "ARB_enhanced_layouts", (bool)e.ARB_enhanced_layouts},
+            {44, "ARB_query_buffer_object", (bool)e.ARB_query_buffer_object},
+            {44, "ARB_texture_mirror_clamp_to_edge", (bool)e.ARB_texture_mirror_clamp_to_edge},
+            {44, "ARB_texture_stencil8", (bool)e.ARB_texture_stencil8},
+            {44, "ARB_vertex_type_10f_11f_11f_rev", (bool)e.ARB_vertex_type_10f_11f_11f_rev},
+            {45, "ARB_ES3_1_compatibility", (bool)e.ARB_ES3_1_compatibility},
+            {45, "ARB_clip_control", (bool)e.ARB_clip_control},
+            {45, "ARB_conditional_render_inverted", (bool)e.ARB_conditional_render_inverted},
+            {45, "ARB_cull_distance", (bool)e.ARB_cull_distance},
+            {45, "ARB_derivative_control", (bool)e.ARB_derivative_control},
+            {45, "ARB_shader_texture_image_samples", (bool)e.ARB_shader_texture_image_samples},
+            {45, "NV_texture_barrier", (bool)e.NV_texture_barrier},
+            {46, "ARB_gl_spirv", (bool)e.ARB_gl_spirv},
+            {46, "ARB_spirv_extensions", (bool)e.ARB_spirv_extensions},
+            {46, "ARB_indirect_parameters", (bool)e.ARB_indirect_parameters},
+            {46, "ARB_polygon_offset_clamp", (bool)e.ARB_polygon_offset_clamp},
+            {46, "ARB_shader_atomic_counter_ops", (bool)e.ARB_shader_atomic_counter_ops},
+            {46, "ARB_shader_draw_parameters", (bool)e.ARB_shader_draw_parameters},
+            {46, "ARB_shader_group_vote", (bool)e.ARB_shader_group_vote},
+            {46, "ARB_texture_filter_anisotropic", (bool)e.ARB_texture_filter_anisotropic},
+            {46, "ARB_transform_feedback_overflow_query", (bool)e.ARB_transform_feedback_overflow_query},
+        };
+        for (const need& n : needs)
+            if (n.version > have && !n.met)
+                fprintf(stderr, "gex-wgpu: to 4.6: GL %u.%u wants %s\n",
+                        n.version / 10, n.version % 10, n.name);
+        fprintf(stderr, "gex-wgpu: to 4.6: constants MaxTextureSize %u "
+                "MaxRenderbufferSize %u MaxCubeTextureLevels %u "
+                "Max3DTextureLevels %u MaxArrayTextureLayers %u "
+                "vertex MaxUniformBlocks %u MaxVertexAttribStride %u "
+                "glsl_feature_level %u\n",
+                c.MaxTextureSize, c.MaxRenderbufferSize, c.MaxCubeTextureLevels,
+                c.Max3DTextureLevels, c.MaxArrayTextureLayers,
+                c.Program[MESA_SHADER_VERTEX].MaxUniformBlocks,
+                c.MaxVertexAttribStride,
+                mesa_frontend_screen.screen->caps.glsl_feature_level);
+    }
     /* The driver's advertised level, not ctx->Const.GLSLVersion: Mesa clamps
      * that down to match the GL version it settled on, so reading it back
      * would report the *consequence* of the version as if it were a cause. */
@@ -1620,6 +1700,60 @@ void gexgen_missing(const char* name) {
 
 #include "gl-compat-generated-decoders.inc"
 
+/* A desktop shader whose #version is above what this context compiles.
+ *
+ * st/mesa caps the GLSL version at the GL version the driver earns (4.00
+ * on gex_wgpu today), while applications ask for what their content was
+ * written for: Unity's HLSLcc emits "#version 410" for a geometry stage
+ * (Muck's grass) and up to "#version 460" where the host offers it. Refused,
+ * the program fails to link and the draw goes ahead with whatever program
+ * was bound -- a field of grass becomes its input points. Most of what
+ * 4.10-4.60 add to the language is also available as extensions this
+ * context has, so the source is compiled as the highest version it accepts
+ * with those enabled; anything it really uses that is missing still fails
+ * to compile, by name. GEXGL_NO_VERSION_FIT=1 keeps the source as sent. */
+std::string fit_glsl_version(std::string src) {
+    static int off = -1;
+    if (off < 0) off = getenv("GEXGL_NO_VERSION_FIT") ? 1 : 0;
+    if (off) return src;
+    size_t at = src.find_first_not_of(" \t\r\n");
+    if (at == std::string::npos || src.compare(at, 8, "#version") != 0) return src;
+    const size_t eol = src.find('\n', at);
+    const std::string line = src.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+    unsigned want = 0;
+    char profile[32] = "";
+    if (std::sscanf(line.c_str(), "#version %u %31s", &want, profile) < 1) return src;
+    if (std::strcmp(profile, "es") == 0 || want <= 400 || want > 460) return src;
+    const char* lang = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
+    unsigned major = 0, minor = 0;
+    if (!lang || std::sscanf(lang, "%u.%u", &major, &minor) != 2) return src;
+    const unsigned have = major * 100 + minor;
+    if (have >= want || have < 400) return src;
+    std::string head = "#version " + std::to_string(have);
+    if (profile[0]) head += std::string(" ") + profile;
+    head += "\n";
+    static const char* const extensions[] = {
+        "GL_ARB_separate_shader_objects", "GL_ARB_shading_language_420pack",
+        "GL_ARB_explicit_attrib_location", "GL_ARB_explicit_uniform_location",
+        "GL_ARB_gpu_shader5", "GL_ARB_texture_query_levels",
+        "GL_ARB_shader_image_load_store", "GL_ARB_arrays_of_arrays",
+        "GL_ARB_enhanced_layouts", "GL_ARB_shader_storage_buffer_object",
+        "GL_ARB_shader_bit_encoding", "GL_ARB_shading_language_packing",
+        "GL_ARB_texture_cube_map_array", "GL_ARB_texture_gather",
+        "GL_ARB_derivative_control", "GL_ARB_shader_texture_image_samples",
+        "GL_ARB_cull_distance", "GL_ARB_conservative_depth",
+        "GL_ARB_fragment_layer_viewport", "GL_ARB_viewport_array",
+    };
+    for (const char* e : extensions) head += std::string("#extension ") + e + " : enable\n";
+    /* The original line stays as a comment, so line numbers shift by the
+     * extension count and an error still shows what was asked for. */
+    head += "// " + line + "\n";
+    static unsigned said;
+    if (said++ < 4)
+        fprintf(stderr, "gexgl: \"%s\" compiled as GLSL %u with extensions\n", line.c_str(), have);
+    return src.substr(0, at) + head + (eol == std::string::npos ? std::string() : src.substr(eol + 1));
+}
+
 bool one(uint32_t op, Reader& a) {
     switch (op) {
     case CONTEXT_CREATE: {
@@ -1953,7 +2087,7 @@ bool one(uint32_t op, Reader& a) {
     }
     case CREATE_SHADER: { uint32_t g = a.u32(); shaders[g] = glCreateShader(a.u32()); break; }
     case SHADER_SOURCE: {
-        GLuint s = lookup(shaders, a.u32()); std::string src = a.string(); const char* p = src.c_str();
+        GLuint s = lookup(shaders, a.u32()); std::string src = fit_glsl_version(a.string()); const char* p = src.c_str();
         shader_source_heads[s] = src.substr(0, 512);
         glShaderSource(s, 1, &p, nullptr); break;
     }

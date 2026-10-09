@@ -228,6 +228,138 @@ static void flush(void) {
     reply_at = 0;
 }
 
+/* Framebuffer state queries answered here.
+ *
+ * Unity asks glGetIntegerv(GL_SAMPLES) and glGetIntegerv(GL_READ_BUFFER)
+ * four times each a frame (Muck's menu), and every query is a submit: the
+ * batch so far runs and the guest waits for it. In the page that is a round
+ * trip to the compositor's Worker each, and Muck's render thread spent
+ * nearly half its time in them. The answers depend only on which
+ * framebuffers are bound and on their attachments and read/draw buffers, so
+ * the first answer for a binding is kept until a command that could change
+ * it goes into the ring (fbq_invalidates) or the context changes. Which
+ * framebuffers are bound is tracked from glBindFramebuffer; a binding made
+ * any other way stops the caching until GL_FRAMEBUFFER is bound again.
+ * GEXGL_NO_QUERY_CACHE=1 asks the host every time. */
+struct fbq_entry {
+    unsigned pname, draw, read;
+    int value;
+};
+static struct fbq_entry fbq_cache[16];
+static unsigned fbq_count;
+static unsigned fbq_draw, fbq_read;
+static int fbq_known;
+
+static void fbq_forget(void) { fbq_count = 0; }
+
+static int fbq_cacheable(unsigned pname) {
+    static int off = -1;
+    if (off < 0) off = getenv("GEXGL_NO_QUERY_CACHE") ? 1 : 0;
+    if (off) return 0;
+    switch (pname) {
+    case 0x80A9u: /* GL_SAMPLES */
+    case 0x80A8u: /* GL_SAMPLE_BUFFERS */
+    case 0x0C02u: /* GL_READ_BUFFER */
+    case 0x0C01u: /* GL_DRAW_BUFFER */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int fbq_lookup(unsigned pname, int *out) {
+    if (!fbq_known) return 0;
+    for (unsigned i = 0; i < fbq_count; ++i)
+        if (fbq_cache[i].pname == pname && fbq_cache[i].draw == fbq_draw &&
+            fbq_cache[i].read == fbq_read) {
+            *out = fbq_cache[i].value;
+            return 1;
+        }
+    return 0;
+}
+
+static void fbq_store(unsigned pname, int value) {
+    if (!fbq_known) return;
+    if (fbq_count == sizeof(fbq_cache) / sizeof(fbq_cache[0])) fbq_count = 0;
+    fbq_cache[fbq_count++] = (struct fbq_entry){pname, fbq_draw, fbq_read, value};
+}
+
+/* Commands after which a cached answer may be wrong: attachments, buffer
+ * storage that can change a sample count, read and draw buffer selection,
+ * deletions (a name can come back as another object), and bindings made
+ * other than through glBindFramebuffer below. The numbers are the wire
+ * opcodes (crates/gex-gl/src/proto.rs, and the generated GL 4.4 and
+ * compatibility transports). */
+static int fbq_invalidates(uint32_t opcode) {
+    switch (opcode) {
+    case 97: case 104: case 107: case 109: case 111: case 114: case 119: case 120:
+    case 1132: case 1158: case 1160: case 1161: case 1163: case 1374: case 1378:
+    case 1405: case 1407: case 1416: case 1418: case 1422:
+    case 8211: case 8751: case 8752: case 8753: case 8754: case 8953: case 8954:
+    case 8959: case 8960: case 8962: case 8963: case 8964: case 8969: case 8970:
+    case 8971: case 8972: case 8973: case 8975: case 8979: case 8980: case 8982:
+    case 8983: case 8984: case 8985: case 8986: case 8987: case 8989: case 8991:
+    case 9960: case 9991: case 9992: case 9993: case 9994: case 9995: case 9996:
+    case 9997: case 10001: case 10002: case 10003: case 10004: case 10005:
+    case 10006: case 10007: case 10008: case 10009: case 10022: case 10023:
+    case 10024: case 10025: case 10026: case 10027: case 10412: case 10437:
+    case 10438: case 10439: case 10442: case 10443: case 10444: case 10763:
+    case 10764: case 10767: case 10768: case 10788: case 10793: case 10796:
+    case 10802: case 10804: case 10825: case 10826: case 10828: case 10829:
+    case 10848: case 10853: case 10854: case 10857: case 10858: case 10861:
+    case 10863: case 10871:
+        return 1;
+    case 8260: case 8261: /* glBindFramebuffer(EXT) through the generated transport */
+        fbq_known = 0;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Hand everything recorded so far to the host without waiting for it to
+   run: GEX_GL_SUBMIT_ASYNC (shims/native/src/gl.rs, shims/browser/src/gl.rs)
+   copies the batch and returns, and the next submit of either kind waits for
+   it. For a batch with nothing to answer -- a frame's last, when nothing is
+   paced on its reply. In the page a synchronous submit is a round trip to
+   the compositor's Worker, which is most of what Unity's render thread spent
+   its time on. A host without it refuses once, and every batch then goes
+   the waiting way. GEXGL_SYNC_PRESENT=1 never tries. */
+#define GEXGL_SUBMIT_ASYNC 0xc0086704u
+static int async_refused = -1;
+
+static void flush_async(void) {
+    if (!ring || ring->tail == 0) {
+        reply_at = 0;
+        return;
+    }
+    if (async_refused < 0) async_refused = getenv("GEXGL_SYNC_PRESENT") ? 1 : 0;
+    if (async_refused) {
+        flush();
+        return;
+    }
+    gexgl_note_submit();
+    if (ioctl(gl_fd, GEXGL_SUBMIT_ASYNC, ring) != 0) {
+        if (errno == ENOTTY || errno == EINVAL || errno == ENOSYS) {
+            /* Refused before anything ran (an older host): the batch is still
+               in the ring, so submit it the waiting way and stop trying. */
+            async_refused = 1;
+            flush();
+            return;
+        }
+        /* EIO: the batch was taken, and the one before it failed; that is
+           this call's report, as flush() makes one. */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "gexgl: an asynchronous batch failed on the host\n");
+        }
+    }
+    ring->tail = 0;
+    ring->reply_len = 0;
+    reply_at = 0;
+}
+
 /* Start a command. Returns where to write its arguments, having reserved
    room for them, or NULL if the batch is full -- in which case it is flushed
    and the caller tries again. */
@@ -248,6 +380,7 @@ static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
             return NULL; /* one command larger than the whole buffer */
         }
     }
+    if ((fbq_count || fbq_known) && fbq_invalidates(opcode)) fbq_forget();
     uint32_t *at = (uint32_t *)(cmds + ring->tail);
     at[0] = opcode;
     at[1] = (uint32_t)len;
@@ -1542,6 +1675,14 @@ GEN_OBJECTS(glGenRenderbuffers, GEXGL_GEN_RENDERBUFFERS)
 DELETE_OBJECTS(glDeleteRenderbuffers, GEXGL_DELETE_RENDERBUFFERS)
 void glBindFramebuffer(unsigned target, unsigned name) {
     CMD2(GEXGL_BIND_FRAMEBUFFER, target, name);
+    if (target == 0x8D40u) { /* GL_FRAMEBUFFER: both */
+        fbq_draw = fbq_read = name;
+        fbq_known = 1;
+    } else if (target == 0x8CA9u) { /* GL_DRAW_FRAMEBUFFER */
+        fbq_draw = name;
+    } else if (target == 0x8CA8u) { /* GL_READ_FRAMEBUFFER */
+        fbq_read = name;
+    }
 }
 void glBindRenderbuffer(unsigned target, unsigned name) { CMD2(GEXGL_BIND_RENDERBUFFER, target, name); }
 unsigned glCheckFramebufferStatus(unsigned target) {
@@ -2017,6 +2158,8 @@ static void host_gl_version(int *major, int *minor) {
 }
 
 static size_t gexgl_state_query_components(unsigned pname);
+/* Defined with the EGL context state below: what the client asked for. */
+static int egl_context_major, egl_context_minor, egl_context_profile;
 
 void glGetIntegerv(unsigned pname, int *out) {
     if (pname == 0x821Bu || pname == 0x821Cu) { /* GL_MAJOR/MINOR_VERSION */
@@ -2039,12 +2182,19 @@ void glGetIntegerv(unsigned pname, int *out) {
            when it is one (GL_CONTEXT_COMPATIBILITY_PROFILE_BIT, 2), and a
            desktop context of 3.2 or later otherwise is core (1). ES has no
            profiles. This answered core for every desktop context. */
+        /* What the client asked for, when it asked for core: the native
+           host gives it a compatibility context regardless (crates/gex-gl
+           become_desktop: a core one refuses the guest's own object names),
+           and its version string would say so. */
         int mask = 0;
         if (egl_api == 0x30A2u) {
             const char *v = (const char *)glGetString(0x1F02u);
             int major = 0, minor = 0;
             host_gl_version(&major, &minor);
-            if (v && strstr(v, "Compatibility")) mask = 2;
+            const int asked_core = egl_context_profile == 0 &&
+                (egl_context_major > 3 || (egl_context_major == 3 && egl_context_minor >= 2));
+            if (asked_core) mask = 1;
+            else if (v && strstr(v, "Compatibility")) mask = 2;
             else if (major > 3 || (major == 3 && minor >= 2)) mask = 1;
         }
         if (out) out[0] = mask;
@@ -2056,13 +2206,17 @@ void glGetIntegerv(unsigned pname, int *out) {
      * its own reply back as this one's; and copying whatever the host sent
      * writes past the caller's array whenever the two disagree, which is an
      * out-of-bounds write into guest memory rather than a wrong value. */
+    const int cacheable = fbq_cacheable(pname);
+    if (cacheable && out && fbq_lookup(pname, out)) return;
     const size_t expected = gexgl_state_query_components(pname) * sizeof(*out);
     CMD1(GEXGL_GET_INTEGERV, pname);
     flush();
     uint32_t bytes = 0;
     const uint8_t *values = reply_blob(&bytes);
-    if (out && values && expected && bytes == expected)
+    if (out && values && expected && bytes == expected) {
         memcpy(out, values, expected);
+        if (cacheable && expected == sizeof(*out)) fbq_store(pname, out[0]);
+    }
 }
 
 static size_t gexgl_state_query_components(unsigned pname) {
@@ -3129,6 +3283,8 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
 }
 
 unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
+    fbq_forget();
+    fbq_known = 0;
     if (!egl_ready) return EGL_FALSE;
     /* A safety net for callers that reach a current context without going
        through this library's eglCreateContext. The latch inside makes it a
@@ -3172,6 +3328,13 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     gexgl_x11_follow_size(s);
     gexgl_wl_commit(s);
     CMD0(GEXGL_PRESENT);
+    /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
+       off), so the frame goes without waiting for it. */
+    if (egl_swap_interval == 0) {
+        flush_async();
+        ++egl_swaps_issued;
+        return EGL_TRUE;
+    }
     flush();
     /* How many frames the page has actually shown. Zero from a decoder that
        predates this reply, which is why nothing below acts on zero. */

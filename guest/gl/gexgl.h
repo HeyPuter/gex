@@ -198,7 +198,7 @@
 #define GEXGL_ALPHA_FUNC 197
 #define GEXGL_PUSH_ATTRIB 198
 #define GEXGL_POP_ATTRIB 199
-#define GEXGL_CLIENT_ARRAY 200 /* the NT layer's; see proto.rs */
+#define GEXGL_CLIENT_ARRAY 200
 
 #define GEXGL_SURFACE_WAYLAND 0
 #define GEXGL_SURFACE_X 1
