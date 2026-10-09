@@ -32,6 +32,21 @@ const DEMOS = {
   // Prompt patterns taken from a real run: xterm's `innerText` drops the
   // trailing space, so a pattern anchored on "$ " never matches.
   busybox: { want: /~ \$/ },
+  // The Debian rootfs built from source (docs/gexcc.md §6): bash -l as root.
+  'native-debian': { want: /:~#/ },
+  // First and second runs of a few programs, each timed in the guest: the
+  // first pays the program's compile, the second what is left.
+  'native-debian-cmd': {
+    demo: 'native-debian',
+    cmd:
+      't(){ s=$(date +%s%N); "$@" > /dev/null 2>&1; r=$?; e=$(date +%s%N); echo "T $* rc=$r $(( (e-s)/1000000 ))ms"; }; '
+      + 't true; t ls /; t ls /; t perl -e 1; t perl -e 1; '
+      + 't dpkg -l; t dpkg -l; t apt-cache policy coreutils; t apt-cache policy coreutils; '
+      + 'echo nd=done',
+    // Guest lines only: the page's echo of the command wraps, and holds
+    // `nd=done` too.
+    want: /T apt-cache policy coreutils rc=0 \d+ms[\s\S]*T apt-cache policy coreutils rc=0 \d+ms/,
+  },
   debian: { want: /[#$]/ },
   // A command in the Debian rootfs, judged by a marker the command prints, not
   // by `debian`'s `/[#$]/` prompt (which matches the page's echo of the command
@@ -551,6 +566,8 @@ for (const id of list) {
     };
   });
 
+  // Wall time from launching the browser, for `ok` lines (startup numbers).
+  const t0 = Date.now();
   const child = spawn(
     CHROME,
     [
@@ -611,7 +628,7 @@ for (const id of list) {
         console.log(`     | ${line}`);
       }
     }
-    console.log(`ok   site-${id}`);
+    console.log(`ok   site-${id} (${Date.now() - t0} ms from browser launch)`);
   } else {
     failures++;
     // The tail of the terminal, not just its last line: what a demo printed on

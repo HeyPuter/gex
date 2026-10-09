@@ -564,7 +564,9 @@ extern "C" fn r_has_children(ppid: i32) -> i32 {
 fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SAID: AtomicU32 = AtomicU32::new(0);
-    if signo == 0 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
+    // SIGWINCH (28 on every guest) changes nothing: bash -l sends it to its
+    // own group on start.
+    if signo == 0 || signo == 28 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
         return;
     }
     warn_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
@@ -4152,6 +4154,22 @@ pub extern "C" fn gex_add_hardlink(target: u32, target_len: u32, path: u32, path
     0
 }
 
+/// A bundled symbolic link: `path` names `target` (text, resolved when the
+/// guest follows it), as in the bundle. A rootfs whose links became copies
+/// carries a single-binary coreutils once per command name. Returns 1 when
+/// made; 0 tells the caller to add a copy instead (no global kernel).
+#[no_mangle]
+pub extern "C" fn gex_add_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+    // SAFETY: scalars naming ranges of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            return (unsafe { k_fs_symlink(gex_kernel::PAddr::from(target), target_len, gex_kernel::PAddr::from(path), path_len) } == 0) as i32;
+        }
+        return 1;
+    }
+    0
+}
+
 /// A bundled file's modification time, as the host's filesystem had it, so a
 /// program that records one (`gzip`, `make`, `tar`) sees what it would
 /// natively. Like `gex_chmod`.
@@ -6846,7 +6864,7 @@ fn wasm32_wait(pc: u64) -> i32 {
             // A wait on the page itself (its keyboard, the Worker's own
             // network) needs this Worker's event loop, which a wasm32
             // program's frames hold: it is polled here instead.
-            warn_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
+            trace_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
             said = true;
         }
         if gex_park(20) < 0 {
@@ -10389,8 +10407,18 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // A block failed its page check (gex-emit `emit_page_check`):
         // translate its address again if its module still provides it.
         let start = _pc as u64;
+        // The same stale block asking twice in a row: the catch-up below did
+        // not move this Worker's directory off it, so the newer translation
+        // it waits for is never coming here (seen in an exec'd aarch64
+        // program's `_dl_fini`, which re-entered the block from JavaScript
+        // for ever). Translating it again is always correct, only slower.
+        let repeat = STALE_LAST.with(|c| {
+            let same = c.get() == (start, addr as u64);
+            c.set((start, addr as u64));
+            same
+        });
         let again = with_host(|h| {
-            let again = h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
+            let again = repeat || h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
             if again {
                 h.jit.translated.remove(&start);
                 h.jit.provider.remove(&start);
@@ -10727,6 +10755,9 @@ thread_local! {
     /// next dispatch miss's answer: that miss must not answer
     /// `DISPATCH_MISS_LEAVE` (the caller would dispatch again, for ever).
     static NO_LEAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last `PAGE_STALE` (block, module), to tell a stale block that
+    /// keeps coming back from one met once. See `gex_cache_op`.
+    static STALE_LAST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Dispatch misses by how `gex_dispatch_miss` dealt with them (the NT

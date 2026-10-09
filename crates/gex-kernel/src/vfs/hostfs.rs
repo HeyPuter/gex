@@ -368,7 +368,14 @@ impl FileSystem for HostFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        let f = std::fs::File::open(self.host_path(path)?).map_err(|e| Errno::from_io(&e))?;
+        let host = self.host_path(path)?;
+        // A symlink's own times (`utimensat` with AT_SYMLINK_NOFOLLOW: dpkg
+        // stamps every link it unpacks, before its target exists): std opens
+        // only what a link names, so this leaves the link's times as they are.
+        if std::fs::symlink_metadata(&host).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Ok(());
+        }
+        let f = std::fs::File::open(host).map_err(|e| Errno::from_io(&e))?;
         f.set_times(file_times(atime, mtime)).map_err(|e| Errno::from_io(&e))
     }
 

@@ -423,32 +423,41 @@ without polls, ABBA, 6 runs each): median total 1.91 s with polls against
 - No game runs on gooner; the corpus is fine here. No timing on gooner.
 - **Demo (§6), state 2026-10-08:**
   - Design: §6.1a (arm64 native from Debian, `musl-linux-wasm32` ours),
-    approved. Item 1 done (0366efa6, gate head given). Item 2 (aarch64
-    ELF providers) is ready on `merge/gexcc-a64prov` (no x86 re-key); the
-    coordinator schedules its landing. Item 3:
-    LP64-layout libraries lowered to wasm32 (no memory64).
+    approved. Item 1 done (gated as integ/2026-10-08f). Item 2 (aarch64
+    ELF providers) on this branch, `merge/gexcc-a64prov`, no
+    x86 re-key; the coordinator schedules its landing with U. Item 3
+    (LP64-layout libraries lowered to wasm32, no memory64) not started:
+    measure the lowering's cost in V8 on edger first.
   - AArch64-only gexc for testing: `cargo build --release -p gexc
-    --target-dir target/a64`. Note: shims/browser/build.sh rebuilds
-    `target/release/gexc` without x86; rebuild it with `--features gexc/x86`
-    afterwards (gexcc-exec runs it).
-  - Debian builder: `tools/gexcc/debian/` (debfetch.py, debsrc.py,
-    build.sh, recipes.sh, packages.txt, binpkgs.txt, mkdebs.py). Toolchain
-    for it: `~/gex-sandbox/scratch/CC/dtc` (its own sysroot; reinstall as
-    above with `dtc` as PREFIX). Work area `scratch/CC/debian`
-    (`src/`, `stage/`, `logs/`, `built.txt`, `pool/` = the .debs); Debian
-    downloads cached in `scratch/CC/deb` (dists/, pool/, src/).
-    ```sh
-    . ~/gex-sandbox/scratch/env.sh; export GEXCC_PREFIX=~/gex-sandbox/scratch/CC/dtc
-    systemd-run --user --scope -q -p TasksMax=4096 -p MemoryMax=32G nice -n 19 \
-      env JOBS=12 tools/gexcc/debian/build.sh tier1     # or source package names
-    ```
-  - Tier 1 builds completely (31 source packages, 28 binary packages,
-    7.8 MB of .debs, 43.4 MiB installed, 7.4 MB as tar.zst -19).
-  - The arm64/amd64 benchmark: `scratch/CC/archbench` (run.sh, roots,
-    edger results e2/e3).
-  - Next: rootfs assembly (dpkg status, Debian's `all` packages, /etc,
-    apt sources and pins), gex item 1 (wasm32 in the aarch64 build), the
-    page demo; then tier 2.
+    --target-dir target/a64`. shims/browser/build.sh rebuilds
+    `target/release/gexc` without x86; rebuild it with `--features
+    gexc/x86` afterwards (gexcc-exec runs it).
+  - Debian builder: `tools/gexcc/debian/` (§6.3). Toolchain
+    `~/gex-sandbox/scratch/CC/dtc`; work area `scratch/CC/debian`
+    (`src/`, `stage/`, `logs/`, `built.txt`, `pool/`); Debian downloads
+    cached in `scratch/CC/deb`. Whole thing: `web/build-native-debian.sh`
+    with `GEXCC_PREFIX=~/gex-sandbox/scratch/CC/dtc`, in the build scope.
+  - Tier 1 rootfs: 44 Debian arm64 packages + 27 of ours, 91.5 MiB
+    unpacked, 20.4 MB as tar.zst.
+  - Works (gooner, correctness only): natively (`gexc run --uid 0:0
+    --sysroot TREE`) and in the browser runtime under Node
+    (`run-node.mjs --tar`, `GEX_UID=0`, `GEX_NETWORK=1`): bash, the tools,
+    dpkg (`--audit` clean), `apt-get update` against deb.debian.org
+    (signatures checked), `apt-get install jq` (arm64 jq, libjq1,
+    libonig5 translated) and jq runs; the pins keep ours over
+    `coreutils:arm64`. Test trees in `scratch/CC/rootfs` (`tree` fresh,
+    `native-cache.tar`: lists and jq's .debs, for `apt-get install
+    --no-download` without the network).
+  - Unverified: update and install in one browser-runtime session went
+    past 900 s once on gooner (each alone passes).
+  - Page startup, edger (bench.sh, headless Chromium, 8 threads,
+    `web/test/site.mjs native-debian`): browser launch to the
+    `root@gex:~#` prompt 5.4-5.6 s (5578, 5408, 5395 ms; 20.4 MB rootfs
+    from localhost). In the guest (`native-debian-cmd`, each figure
+    includes two `date` forks, about 0.5 s): `ls /` 1054 then 1041 ms,
+    `perl -e 1` 3234 then 2204 ms, `dpkg -l` 2658 then 2684 ms,
+    `apt-cache policy coreutils` 11504 then 7415 ms.
+  - Next: tier 2; GUI; item 3.
 - **Next (corpus):**
   1. Rerun the corpus clean.
   2. coreutils, bash, make.
@@ -715,48 +724,56 @@ modules or real devices.
 
 ### 6.3 Build layout
 
-- `tools/gexcc/debian/`:
-  - `debsrc.sh SRCPKG...`: fetch (deb.debian.org pool, cached in
-    `$GEXCC_DEB/src`), verify, `dpkg-source -x`, our patches.
-  - `recipes.sh`: `build_SRCPKG` per source package (like the corpus
-    recipes), installing into `$STAGE/SRCPKG`; libraries also into the
-    gexcc sysroot so later packages link them.
-  - `split.py`: staging tree to binary packages to `.deb`
-    (`dpkg-deb --build --root-owner-group`), `Architecture:
-    musl-linux-wasm32`.
-  - `rootfs.sh TIER`: fetch the `all` debs, unpack everything, write the
-    dpkg database and `/etc`, trim (docs, locales, man pages kept for
-    shipped commands only), and write `rootfs.tar` plus `rootfs.tar.zst`.
-  - `packages.txt`: the tiers above, one source package per line with its
-    binary packages.
+- `tools/gexcc/debian/` (state 2026-10-08):
+  - `debsrc.py`: verified source fetch, `dpkg-source -x`, our patches
+    (`patches/SRCPKG/`). `debfetch.py`: verified binaries and their
+    closure.
+  - `build.sh TIER|SRCPKG...` with `recipes.sh` (`build_SRCPKG`, installing
+    into `$GEXCC_DEB/stage/SRCPKG`; libraries also into the toolchain's
+    sysroot); `packages.txt` pins the versions and tiers.
+  - `mkdebs.py`: staging tree to binary packages (`binpkgs.txt`: the split
+    and `depends` lines), `Architecture: musl-linux-wasm32`, version
+    `+gex1`, Provides/Conflicts/Breaks/Replaces from `debian/control`.
+  - `mkrootfs.py`: Debian's arm64 closure (apt, dpkg, perl-base, debconf,
+    ca-certificates, base-files, ...) plus our packages standing in for
+    Debian's tools by name; every .deb unpacked under a merged /usr, no
+    maintainer scripts; dpkg's status/info (multiarch layout) written from
+    the packages; what the scripts would do (accounts, /etc/shells,
+    alternatives, CA bundle); apt sources, our `file:` repository at
+    /var/lib/gex-apt, the pins; Debian's minimized-image path excludes
+    (written to /etc/dpkg/dpkg.cfg.d/excludes too).
+- `web/build-native-debian.sh [TIER...]`: all of the above, then
+  `web/public/rootfs/native-debian.tar.zst`. One command, cached.
 - Builds run in `systemd-run --user --scope -p TasksMax=4096 -p
   MemoryMax=32G nice -n 19`, configure in cross mode (§2: runs nothing it
-  builds). Checks run inside one gexc (`guest`).
-- Reproducible: Debian versions pinned in `packages.txt` (a newer point
-  release changes the pin explicitly), our patches in the tree, one
-  command per tier (`tools/gexcc/debian/build.sh TIER OUT`).
+  builds).
+- Reproducible: Debian versions pinned in `packages.txt`, our patches in
+  the tree.
 
 ### 6.4 The page
 
-A new demo, `native-debian` ("Debian, native wasm"), on the aarch64 page
-(arm64 programs translated beside our wasm32 ones: needs §6.1a item 1;
-until then the shell tier is tried on the x86 page, where wasm32 programs
-already run): fetch `rootfs.tar.zst`
-(decoded with zstddec), boot `/bin/bash -l` as pid 1 with `TERM`, `PATH`,
-`HOME=/root`, uid 0. The GUI apps reuse the wayland demo's compositor
-canvas and `hostx=1`; a launcher (`gex-apps` menu in the shell, and page
-buttons) starts them. `?cmd=` runs one command for tests.
+Demo `native-debian` ("Debian, built from source to wasm") on the aarch64
+page (web/src/demos.js): fetches `/rootfs/native-debian.tar.zst`
+(`?rootfs=` overrides; decoded with the vendored zstddec), bundles it with
+its symbolic links as links (`gex_add_symlink`), and boots `/bin/bash -l`
+(`-l -i`) as pid 1 with uid 0, `HOME=/root`, `TERM`, `PATH`. Network: Wisp,
+default `wss://anura.pro/`, `?wisp=URL` overrides (`?wisp=` empty: none).
+Translated programs run on tier 1 (`?fjit=1` turns the function JIT on).
+`?cmd=` runs one command for tests. Under Node the same runtime runs the
+tar with `run-node.mjs --tar FILE` (`GEX_UID=0`, `GEX_NETWORK=1` for real
+sockets instead of Wisp); there apt updates from Debian and installs
+arm64 packages (§5).
 
 Size budget (zstd, transferred): tier 1 at most 15 MB, tier 1+2 at most
-45 MB, everything at most 80 MB. If the whole-tar load is too slow, split
-into a base tar and per-package tars fetched when first opened (the
-kernel's demand-fill hook).
+45 MB, everything at most 80 MB. Tier 1 today: 20.4 MB (Debian's arm64
+system pieces are most of it: libc6, perl-base, libssl, apt, dpkg).
+If the whole-tar load is too slow, split into a base tar and per-package
+tars fetched when first opened (the kernel's demand-fill hook).
 
-Startup (edger, bench.sh, Chrome headless): page open to bash prompt; the
-first exec of each program pays a WebAssembly compile (bash about 1 MB,
-python about 6 MB of wasm); measured, then cut with a compiled-module
-cache shared across Workers (exists) and, if needed, ahead-of-page
-compilation of the hot set while the rootfs downloads.
+Startup (edger, bench.sh): page open to bash prompt; the first exec of
+each program pays a WebAssembly compile; measured, then cut with a
+compiled-module cache shared across Workers (exists) and, if needed,
+ahead-of-page compilation of the hot set while the rootfs downloads.
 
 ### 6.5 Expected gex gaps
 

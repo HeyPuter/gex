@@ -425,7 +425,58 @@ impl Vfs {
     /// Longest prefix wins, so a `/proc` mount shadows the root mount for
     /// everything beneath it.
     fn resolve<'a>(&'a self, path: &str) -> Result<(&'a Arc<dyn FileSystem>, String), Errno> {
-        let abs = normalize(path, &self.cwd);
+        let abs = self.through_dir_links(normalize(path, &self.cwd))?;
+        self.mount_of(abs)
+    }
+
+    /// `abs` with every symlink among its directories followed (not the
+    /// final component: each caller decides about that). A filesystem here
+    /// is a map of whole paths, so `/bin/sh` under a merged /usr (`/bin ->
+    /// usr/bin`) names nothing until the `/bin` link is followed. Only the
+    /// root filesystem's links: /proc and /dev resolve their own names.
+    fn through_dir_links(&self, mut abs: String) -> Result<String, Errno> {
+        'again: for _ in 0..40 {
+            let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+            let mut prefix = String::new();
+            for (i, c) in comps.iter().enumerate().take(comps.len().saturating_sub(1)) {
+                prefix.push('/');
+                prefix.push_str(c);
+                let (at, fs) = self.mount_at(&prefix)?;
+                if at != "/" {
+                    break;
+                }
+                if let Ok(target) = fs.read_link(prefix.trim_start_matches('/')) {
+                    let base = if target.starts_with('/') {
+                        normalize(&target, "/")
+                    } else {
+                        normalize(&target, &parent_of(&prefix))
+                    };
+                    abs = normalize(&comps[i + 1..].join("/"), &base);
+                    continue 'again;
+                }
+            }
+            return Ok(abs);
+        }
+        Err(Errno::ELOOP)
+    }
+
+    /// The mount holding absolute path `abs`, and where it is mounted.
+    fn mount_at<'a>(&'a self, abs: &str) -> Result<(&'a str, &'a Arc<dyn FileSystem>), Errno> {
+        let mut best: Option<(&String, &Arc<dyn FileSystem>)> = None;
+        for (at, fs) in &self.mounts {
+            let matches = if at == "/" {
+                true
+            } else {
+                abs == *at || abs.starts_with(&format!("{at}/"))
+            };
+            if matches && best.map(|(b, _)| at.len() > b.len()).unwrap_or(true) {
+                best = Some((at, fs));
+            }
+        }
+        best.map(|(at, fs)| (at.as_str(), fs)).ok_or(Errno::ENOENT)
+    }
+
+    fn mount_of<'a>(&'a self, abs: String) -> Result<(&'a Arc<dyn FileSystem>, String), Errno> {
         let mut best: Option<(&String, &Arc<dyn FileSystem>)> = None;
         for (at, fs) in &self.mounts {
             let matches = if at == "/" {
@@ -578,7 +629,11 @@ impl Vfs {
                         normalize(&target, &parent_of(&current))
                     };
                 }
-                _ => {
+                // The link itself (AT_SYMLINK_NOFOLLOW), whether or not
+                // what it names exists yet: dpkg stamps each link it unpacks
+                // as `NAME.dpkg-new`, before its target has that name.
+                Ok(_) => return fs.set_times(&rel, atime, mtime),
+                Err(_) => {
                     fs.metadata(&rel)?;
                     return fs.set_times(&rel, atime, mtime);
                 }
@@ -738,6 +793,26 @@ mod tests {
         // A path that merely starts with the same letters is not inside it.
         let (_, rel) = vfs.resolve("/procession").unwrap();
         assert_eq!(rel, "procession");
+    }
+
+    #[test]
+    fn directory_symlinks_are_followed() {
+        // A merged /usr: /bin -> usr/bin, /lib -> /usr/lib (absolute).
+        let mut vfs = Vfs::new();
+        let root = Arc::new(TmpFs::new());
+        root.add_file("usr/bin/dash", b"sh".to_vec());
+        root.add_file("usr/lib/ld.so", b"ld".to_vec());
+        vfs.mount("/", root);
+        vfs.symlink("usr/bin", "/bin").unwrap();
+        vfs.symlink("/usr/lib", "/lib").unwrap();
+        vfs.symlink("dash", "/usr/bin/sh").unwrap();
+        assert_eq!(vfs.resolve("/bin/dash").unwrap().1, "usr/bin/dash");
+        assert_eq!(vfs.resolve("/lib/ld.so").unwrap().1, "usr/lib/ld.so");
+        // The final component is left to the caller.
+        assert_eq!(vfs.resolve("/bin").unwrap().1, "bin");
+        assert_eq!(vfs.read_link("/bin/sh").unwrap(), "dash");
+        assert!(vfs.metadata("/bin/sh").is_ok());
+        assert!(vfs.metadata("/bin/../lib/ld.so").is_ok());
     }
 
     #[test]

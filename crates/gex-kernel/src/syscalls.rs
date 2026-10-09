@@ -2682,7 +2682,7 @@ impl Kernel {
             nr::UMOUNT2 => self.sys_umount(m, a[0]),
 
             // -- sockets -----------------------------------------------------
-            nr::SOCKET => self.sys_socket(a[0], a[1]),
+            nr::SOCKET => self.sys_socket(a[0], a[1], a[2]),
             // A unix socket and an internet socket are different concrete
             // types behind the same descriptor, so which `connect` this is
             // depends on what the descriptor turned out to be.
@@ -5578,7 +5578,7 @@ impl Kernel {
     /// `socket`. AF_UNIX, an inert AF_NETLINK (below), and AF_INET with only the two kinds that matter: a stream,
     /// which the host carries, and a datagram, which only ever goes to the
     /// resolver this kernel is.
-    fn sys_socket(&mut self, domain: u64, ty: u64) -> SysResult {
+    fn sys_socket(&mut self, domain: u64, ty: u64, protocol: u64) -> SysResult {
         const AF_UNIX: u64 = 1;
         const AF_INET: u64 = 2;
         const SOCK_STREAM: u64 = 1;
@@ -5605,7 +5605,16 @@ impl Kernel {
         // its video subsystem too, and Unity 6 then saw no display). There
         // are no devices to announce, so the socket binds, takes its options
         // and never has a message: an empty eventfd behind the descriptor.
+        // Only NETLINK_KOBJECT_UEVENT: glibc's getaddrinfo (AI_ADDRCONFIG)
+        // asks NETLINK_ROUTE for the addresses, and an eventfd answers its
+        // request with the 8-byte counter its own send wrote, which glibc
+        // aborts on (apt's http method). Without a route socket it assumes
+        // IPv4 and IPv6 are there.
         const AF_NETLINK: u64 = 16;
+        const NETLINK_KOBJECT_UEVENT: u64 = 15;
+        if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
+            return Err(Errno::EAFNOSUPPORT);
+        }
         if domain == AF_NETLINK {
             let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::eventfd::EventFd::new(0, false));
             let flags = if ty & SOCK_NONBLOCK != 0 { crate::fs::oflags::O_NONBLOCK } else { 0 };
@@ -6594,7 +6603,10 @@ impl Kernel {
             "gex",
             "6.1.0-gex",
             "#1 SMP gex",
-            if self.compat && !gex_abi::PPC { "i686" } else { gex_abi::ARCH_NAME },
+            // An i386 process on the x86 build; a wasm32 program on the
+            // AArch64 build is part of an aarch64 system (its dpkg and
+            // config.guess should agree with the arm64 programs beside it).
+            if self.compat && gex_abi::X86 { "i686" } else { gex_abi::ARCH_NAME },
             "(none)",
         ];
         let mut out = vec![0u8; 65 * 6];
@@ -6692,18 +6704,28 @@ impl Kernel {
     /// on Linux, and a return value on the same scale.
     fn sys_times(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
         let ticks = (self.cpu_nanos() / 10_000_000) as u64;
-        if buf != 0 {
+        if buf != 0 && self.compat {
+            // i386: four 32-bit clock_t
+            m.zero(buf, 16)?;
+            m.write_u32(buf, ticks as u32)?;
+        } else if buf != 0 {
             m.zero(buf, 32)?;
             m.write_u64(buf, ticks)?;
         }
-        Ok(ticks)
+        Ok(if self.compat { ticks as u32 as u64 } else { ticks })
     }
 
     /// `getrusage`. Only the two times are filled in; the page-fault and
     /// context-switch counters stay zero, which is what a program that asks
     /// for them under emulation should expect to see.
     fn sys_getrusage(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        if buf != 0 {
+        if buf != 0 && self.compat {
+            // i386: 32-bit timevals and longs (72 bytes)
+            let ns = self.cpu_nanos();
+            m.zero(buf, 72)?;
+            m.write_u32(buf, (ns / 1_000_000_000) as u32)?;
+            m.write_u32(buf + 4, (ns % 1_000_000_000 / 1000) as u32)?;
+        } else if buf != 0 {
             m.zero(buf, 144)?;
             write_timeval(m, buf, self.cpu_nanos())?;
         }

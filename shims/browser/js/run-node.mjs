@@ -7,6 +7,9 @@
 //     --file <guest>=<host>     bundle a host file into the guest's filesystem
 //     --dir <guest>=<host>      bundle a whole directory tree
 //     --extract <guest>=<host>  write a file back out when the program ends
+//     --tar <host.tar>          a root filesystem tar (web/src/tar.js, as the
+//                               page unpacks one): files, modes, empty
+//                               directories, hard and symbolic links
 //     --busybox <host>          a wasm32 busybox as /bin/busybox, hard-linked
 //                               as /bin/<applet> and /usr/bin/<applet> for
 //                               tools/wine-wasm/busybox.applets
@@ -63,6 +66,8 @@ let cgenMode = 0;
 let noJit = false;
 let aotRun = false;
 const dirs = [];
+// Symbolic links, path -> target text (`--tar`).
+const symlinks = {};
 const rest = [];
 {
   const av = process.argv.slice(2);
@@ -135,6 +140,15 @@ const rest = [];
       const eq = spec.indexOf('=');
       if (eq <= 0) { console.error('--extract wants <guest>=<host>'); process.exit(2); }
       extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
+    } else if (av[i] === '--tar') {
+      const { untar } = await import('../../../web/src/tar.js');
+      const buf = readFileSync(av[++i] ?? '');
+      const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+      Object.assign(files, tree.files);
+      Object.assign(modes, tree.modes ?? {});
+      Object.assign(hard, tree.hard ?? {});
+      Object.assign(symlinks, tree.links ?? {});
+      dirs.push(...(tree.dirs ?? []));
     } else if (av[i] === '--busybox') {
       const host = av[++i] ?? '';
       files['/bin/busybox'] = readFileSync(host);
@@ -476,6 +490,8 @@ try {
     args,
     opts: {
       strace,
+      // GEX_STRACE_PID=N: narrate that one process (a forked child too).
+      stracePid: process.env.GEX_STRACE_PID ? Number(process.env.GEX_STRACE_PID) : undefined,
       mtimes,
       // The debugging switches, in the run's own options as well as the boot
       // message: `opts` is what a fork record carries to a child's Worker.
@@ -487,13 +503,15 @@ try {
       intrinsicMask: process.env.GEX_INTRINSIC_MASK ? Number(process.env.GEX_INTRINSIC_MASK) : undefined,
       // The suite compares this run against QEMU on the same machine, and QEMU
       // reports the real user.
-      uid: process.getuid?.(),
-      gid: process.getgid?.(),
+      // GEX_UID=0 runs the guest as root (a rootfs's dpkg wants it).
+      uid: process.env.GEX_UID !== undefined ? Number(process.env.GEX_UID) : process.getuid?.(),
+      gid: process.env.GEX_UID !== undefined ? Number(process.env.GEX_UID) : process.getgid?.(),
       stdin: readStdin(),
       cwd,
       env: env.length ? env : undefined,
       dirs,
       hard,
+      symlinks,
       modes,
       // GEX_PINS names a layout written by `gexc build --closure`. Every
       // object in it is placed exactly where the build assumed, which is
