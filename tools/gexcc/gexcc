@@ -446,8 +446,20 @@ if FPCAST:
     # every table entry one uniform signature. gex calls the two entries
     # (__gex_start, __gex_thread_start) with their own signatures, so their
     # table entries go back to the real functions afterwards.
-    r = run([opt, wasm, '-g', '--strip-dwarf'] + feats + ['--fpcast-emu', '-o', wasm])
-    if r:
+    # every indirect call passes binaryen's maximum number of parameters
+    # (16 by default); a program with a wider function (GTK's marshallers
+    # take 19) asks for the width it needs
+    cmd = [opt, wasm, '-g', '--strip-dwarf'] + feats + ['--fpcast-emu', '-o', wasm]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    # (binaryen names one function's need at a time: raise until it passes)
+    for _ in range(64):
+        m = re.findall(r'max-func-params needs to be at least (\d+)', p.stderr + p.stdout)
+        if not (p.returncode and m):
+            break
+        p = subprocess.run(cmd[:-2] + ['--pass-arg=max-func-params@' + str(max(map(int, m)) + 4), '-o', wasm],
+                           capture_output=True, text=True)
+    if p.returncode:
+        sys.stderr.write(p.stderr)
         die('wasm-opt --fpcast-emu failed')
     r = run([sys.executable, os.path.join(LIBDIR, 'elemfix.py'), wasm, '__gex_start', '__gex_thread_start'])
     if r:
