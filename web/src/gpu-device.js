@@ -44,6 +44,10 @@ export function requestGexDevice() {
       maxStorageBuffersInVertexStage: 16,
       maxStorageBuffersInFragmentStage: 16,
       maxColorAttachmentBytesPerSample: 64,
+      // Not yet: asking for GL 4.1's texture limits (16384 texels, 2048
+      // layers) and GL 4.3's compute ones makes the context GL 4.6, and then
+      // Unity's 4.x shader variants draw Muck's 3D scene black (U, mp26).
+      // Back once that is fixed; see docs/gl-path.md.
     };
     // `?gllimits=41|43` (GEX_GL_LIMITS, set by the compositor worker): GL 4.1
     // wants 16384 texels a side and 2048 array layers, GL 4.3's compute
