@@ -50,6 +50,9 @@ $OPT $O/lp64-64.wasm --enable-threads --enable-bulk-memory --enable-mutable-glob
 # (V8's memory64)
 $OPT $O/lp64-64.wasm $WF --enable-memory64 --memory64-lowering -o $O/lp64-noopt.wasm
 $OPT $O/static.wasm $WF -O2 -o $O/static-opt.wasm
+# lp64-pre: -O2 on the wasm64 module first (while addresses are still
+# addresses), then lowered, then -O2 again
+$OPT $O/lp64-64.wasm $WF --enable-memory64 -O2 --memory64-lowering -O2 -o $O/lp64-pre.wasm
 cp $O/lp64-64.wasm $O/w64.wasm
 wasm-ld $LDC --global-base=1048576 --export=bench_run -o $O/size64.wasm $O/o32z/*.o
 # the kernels as a native aarch64 Linux program, run translated by gex

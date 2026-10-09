@@ -9,7 +9,7 @@ const sets = {
   static: [['static.wasm', 'static']], pie: [['pie.wasm']], 'pie-dv': [['pie-dv.wasm']], 'pie-opt': [['pie-opt.wasm']],
   'asyncify-all': [['asyncify-all.wasm']], 'asyncify-ind': [['asyncify-ind.wasm']], lp64: [['lp64.wasm', 'static']],
   split: [['libc.so.wasm'], ['split.wasm']], lib: [['libk.so.wasm'], ['lib.wasm']],
-  'static-opt': [['static-opt.wasm', 'static']], 'lp64-noopt': [['lp64-noopt.wasm', 'static']],
+  'static-opt': [['static-opt.wasm', 'static']], 'lp64-noopt': [['lp64-noopt.wasm', 'static']], 'lp64-pre': [['lp64-pre.wasm', 'static']],
   size64: [['size64.wasm', 'static']], w64: [['w64.wasm', 'static']],
 };
 const entry = variant === 'lib' ? 'run' : 'bench_run';
