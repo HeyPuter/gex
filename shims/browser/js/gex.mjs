@@ -3113,7 +3113,12 @@ export class Gex {
       if (e.gex_cgen_provider_libprov?.(u, i)) {
         const number = e.gex_libprov_publish(u, i);
         this.#cgenCatchUp();
-        if (number >= 0) e.gex_cgen_pmod_installed(number);
+        if (number >= 0) {
+          e.gex_cgen_pmod_installed(number);
+          // its GexA64Icall entry thunks, bound as guest addresses
+          e.gex_libprov_installed?.(number);
+          this.#wasmdllCatchUp();
+        }
         continue;
       }
       if (e.gex_cgen_provider_wasmdll?.(u, i)) {

@@ -41,6 +41,10 @@ struct LinuxProv {
     data: u64,
     /// Its provider module number once published.
     number: Option<u32>,
+    /// Its function-table install, once published.
+    install: u32,
+    /// Whether its entry thunks are bound (`gex_libprov_installed`).
+    bound: bool,
 }
 
 static LIBS: Mutex<Vec<LinuxProv>> = Mutex::new(Vec::new());
@@ -293,7 +297,7 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
     crate::warn_line(&format!("gex: {} replaced by {wasm_path}: {} addresses bound, data at {data:#x}\n", m.path, pairs.len()));
     let index = {
         let mut libs = lock(&LIBS);
-        libs.push(LinuxProv { path: m.path.clone(), wasm, pairs, data, number: None });
+        libs.push(LinuxProv { path: m.path.clone(), wasm, pairs, data, number: None, install: 0, bound: false });
         libs.len() - 1
     };
     let u = {
@@ -345,7 +349,7 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
         }
     };
     let number = lock(&PROVIDERS).len() as u32;
-    ftab(|t| t.publish(len, PROVIDER | number, Tier::Unit, &l.pairs));
+    l.install = ftab(|t| t.publish(len, PROVIDER | number, Tier::Unit, &l.pairs));
     let addrs: Vec<u64> = l.pairs.iter().map(|&(a, _)| a).collect();
     let mem = crate::guest_bytes();
     for &a in &addrs {
@@ -355,6 +359,48 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
     lock(&PROVIDERS).push(ProviderModule { file: format!("libprov:{}", l.path), regs, dirs, slots, memory_base: l.data as u32 });
     l.number = Some(number);
     number as i32
+}
+
+/// The publishing Worker instantiated provider module `number` (its data is
+/// relocated): when it is a replaced library's, bind the entry thunks of its
+/// GexA64Icall pass (item3/a64icall): `__gexa_entries` is the bounds of its
+/// {function, thunk} pairs (i64 table indices), and each thunk is bound at
+/// its function's index as a guest address, so the guest's call through a
+/// function pointer the library gave it (a vfs method) runs the function.
+/// Once a process.
+#[no_mangle]
+pub extern "C" fn gex_libprov_installed(number: u32) {
+    let (install, data, off, path) = {
+        let mut libs = lock(&LIBS);
+        let Some(l) = libs.iter_mut().find(|l| l.number == Some(number)) else { return };
+        if std::mem::replace(&mut l.bound, true) {
+            return;
+        }
+        let Ok(exports) = super::wasmdll::exported_offsets(&l.wasm) else { return };
+        let Some(&off) = exports.get("__gexa_entries") else { return };
+        (l.install, l.data, off, l.path.clone())
+    };
+    let gm = GuestMem::new(crate::guest_bytes());
+    let at = data + off as u64;
+    let (start, stop) = (gm.read_u64(at).unwrap_or(0), gm.read_u64(at + 8).unwrap_or(0));
+    if start == 0 || stop <= start {
+        return;
+    }
+    let base = ftab(|m| m.install(install).base) as u64;
+    let code = THREAD_ENTRY.load(Ordering::Relaxed);
+    let mut pairs = Vec::new();
+    let mut a = start;
+    while a + 16 <= stop {
+        let (f, t) = (gm.read_u64(a).unwrap_or(0), gm.read_u64(a + 8).unwrap_or(0));
+        a += 16;
+        // (an index the code page's addresses also are would be ambiguous)
+        if f < base || t < base || f >= 0x3f0000 || (code != 0 && f >= code && f < code + CODE_PAGE) {
+            continue;
+        }
+        pairs.push((f, (t - base) as u32));
+    }
+    crate::warn_line(&format!("gex: {path}: {} entry thunks bound\n", pairs.len()));
+    super::wasmdll::bind(install, &pairs);
 }
 
 /// The module bytes of provider module `number` when it is a replaced
