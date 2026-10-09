@@ -564,7 +564,9 @@ extern "C" fn r_has_children(ppid: i32) -> i32 {
 fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SAID: AtomicU32 = AtomicU32::new(0);
-    if signo == 0 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
+    // SIGWINCH (28 on every guest) changes nothing: bash -l sends it to its
+    // own group on start.
+    if signo == 0 || signo == 28 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
         return;
     }
     warn_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
@@ -6862,7 +6864,7 @@ fn wasm32_wait(pc: u64) -> i32 {
             // A wait on the page itself (its keyboard, the Worker's own
             // network) needs this Worker's event loop, which a wasm32
             // program's frames hold: it is polled here instead.
-            warn_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
+            trace_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
             said = true;
         }
         if gex_park(20) < 0 {
