@@ -626,6 +626,9 @@ pub struct Kernel {
     /// The pc of the syscall being handled (docs/mem64.md: a mapping the
     /// dynamic loader asks for stays below 4 GiB, since it will hold code).
     pub syscall_pc: u64,
+    /// The canonical number of the syscall being handled (for the host's
+    /// `GEX_SYS_WAITS`, which sees only the guest's own numbering).
+    pub syscall_nr: u64,
     /// Where each pinned object actually landed, for checking afterwards.
     ///
     /// A pin that silently does not take is the worst outcome available: the
@@ -1256,6 +1259,7 @@ impl Kernel {
             place: None,
             armed_place: None,
             syscall_pc: 0,
+            syscall_nr: 0,
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
@@ -1489,6 +1493,7 @@ impl Kernel {
             place: self.place.clone(),
             armed_place: None,
             syscall_pc: 0,
+            syscall_nr: 0,
             thread_signals: std::collections::HashMap::new(),
             thread_calls: std::collections::HashMap::new(),
             sig_tid: 0,
@@ -1699,6 +1704,7 @@ impl Kernel {
         };
 
         self.fd_activity |= wakes_fd_waiters(n);
+        self.syscall_nr = n;
 
         // Returning from a handler restores a whole context, so it cannot go
         // through the normal "write x0 and continue" path.

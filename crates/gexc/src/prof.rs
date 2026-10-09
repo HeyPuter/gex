@@ -11,10 +11,11 @@
 //! (tools/prof-report.py).
 //!
 //! Each sample also records the thread it hit, and every thread with at
-//! least 5% of the samples gets a profile of its own beside the file,
-//! `<stem>-<thread name>-<tid>.<ext>` (and its `.maps`), in the same format:
-//! what the main thread, the critical path of a game's frame, spends its
-//! time on.
+//! least `GEX_PROF_MIN_PCT` (default 5) percent of the samples gets a
+//! profile of its own beside the file, `<stem>-<thread name>-<tid>.<ext>`
+//! (and its `.maps`), in the same format: what the main thread, the
+//! critical path of a game's frame, spends its time on. Every thread's
+//! total is in `<stem>.threads`.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -113,19 +114,28 @@ fn dump(path: &std::path::Path) {
         *by_tid.entry(t.load(Ordering::Relaxed)).or_default().entry(pc).or_default() += 1;
     }
     write_one(path, &hist, maps.as_deref());
-    // Threads with at least 5% of the samples, each on its own.
+    // Threads with at least GEX_PROF_MIN_PCT (default 5) percent of the
+    // samples, each on its own; every thread's total in `<stem>.threads`
+    // (`tid comm samples`, most first), so the time spread over many small
+    // threads (compile workers, guest threads) is still attributable.
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = path.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "prof".into());
+    let min_pct = std::env::var("GEX_PROF_MIN_PCT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
+    let mut totals = Vec::new();
     for (tid, h) in by_tid {
         let k: u64 = h.values().sum();
-        if tid == 0 || k * 20 < n as u64 {
-            continue;
-        }
         let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
             .map(|c| c.trim().replace(['/', ' ', ':'], "_"))
             .unwrap_or_else(|_| "gone".into());
+        totals.push((k, tid, comm.clone()));
+        if tid == 0 || k * 100 < n as u64 * min_pct {
+            continue;
+        }
         write_one(&path.with_file_name(format!("{stem}-{comm}-{tid}.{ext}")), &h, maps.as_deref());
     }
+    totals.sort_by(|a, b| b.cmp(a));
+    let list: String = totals.iter().map(|(k, t, c)| format!("{t} {c} {k}\n")).collect();
+    let _ = std::fs::write(path.with_extension("threads"), list);
 }
 
 /// One histogram as a profile file (`pid`, `samples`, `pc count`), with
