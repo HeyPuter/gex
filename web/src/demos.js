@@ -411,7 +411,8 @@ const nativeDebian = {
     "Debian trixie whose tools (bash, coreutils, grep, sed, vim...) are built from Debian's own " +
     'sources with gexcc into native wasm32 programs, dpkg and apt included; `apt install` ' +
     'fetches Debian\'s arm64 packages over Wisp and runs them translated. `?gui=1` adds a ' +
-    'Wayland screen for foot and the other GUI programs.',
+    'screen (Wayland, and X through the page\'s X server) for foot, Chocolate Doom and the ' +
+    'other GUI programs.',
   network: true,
 
   async enter(ctx) {
@@ -494,11 +495,14 @@ async function bootNativeDebian(ctx) {
         'TERM=xterm-256color',
         'DEBIAN_FRONTEND=noninteractive',
         'LANG=C.UTF-8',
-        ...(screen ? ['XDG_RUNTIME_DIR=/tmp', 'WAYLAND_DISPLAY=wayland-0'] : []),
+        ...(screen ? ['XDG_RUNTIME_DIR=/tmp', 'WAYLAND_DISPLAY=wayland-0', 'DISPLAY=:0'] : []),
       ],
       args: cmd ? ['/bin/bash', '/cmd.sh'] : ['/bin/bash', '-l', '-i'],
       wl: screen ?? undefined,
       wlInput: screen ?? undefined,
+      // X clients (SDL programs...) reach the page's X server, which draws
+      // into the same compositor; `?hostx=0` leaves it out.
+      hostX: !!screen && q.get('hostx') !== '0',
       cwd: '/root',
       tty: true,
       network,
