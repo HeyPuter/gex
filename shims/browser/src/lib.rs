@@ -11944,11 +11944,34 @@ fn retire_unmapped_code() {
     with_host(|h| {
         let retired = std::mem::take(&mut h.kernel.retired_code);
         if !retired.is_empty() {
-            crate::cgen::on_retire(&retired);
+            crate::cgen::on_retire(&retired, &gone_code(h, &retired));
             crate::fjit::on_retire(&retired);
             retire_code(h, &retired);
         }
     });
+}
+
+/// The pages of `ranges` no longer mapped executable (an unmapped object,
+/// code made non-executable), merged into ranges: `cgen::on_retire` drops
+/// the units there whatever the bytes are.
+pub(crate) fn gone_code(h: &Host, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    use gex_kernel::mem::prot;
+    let page = gex_abi::DISPATCH_PAGE;
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(start, end) in ranges {
+        let mut a = start / page * page;
+        while a < end {
+            let exec = h.kernel.mem.vma_at(a).is_some_and(|v| v.prot & prot::EXEC != 0);
+            if !exec {
+                match out.last_mut() {
+                    Some(last) if last.1 == a => last.1 = a + page,
+                    _ => out.push((a, a + page)),
+                }
+            }
+            a += page;
+        }
+    }
+    out
 }
 
 /// Forget every translation in `ranges` (see `retire_unmapped_code`). The
