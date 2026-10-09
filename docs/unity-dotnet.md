@@ -1972,3 +1972,74 @@ Not yet:
        5179; "WebGPU validation: Bind group layout ..."), so it needs both.
        mp26's black scene was at GL 4.6 (the compute limits too); 4.1's
        texture limits alone do not cause it.
+     - **The black screen bisect, continued (3-minute runs, X = the 14 X
+       libraries, judged by the player log's window backend):**
+
+       | run | fjitlibs | backend |
+       |---|---|---|
+       | hb35 | X + libstdc++ | x11 |
+       | hb36 | X + the GL libraries | x11 |
+       | hb37 | X + audio/system | (null) |
+       | hb39 | X + libbsd, libz, liblzma and the other small ones | x11 |
+       | hb40 | X + audio, dbus, systemd, udev, steam | (null) |
+       | hb43 | X + dbus, systemd, udev | (null) |
+       | hb44 | X + libsteam_api | x11 |
+       | hb45 | X + libdbus-1 | **(null)** |
+       | hb46 | X + libsystemd | x11 |
+       | hb47 | X + libudev | x11 |
+
+       So the X libraries JIT-compiled with libdbus. `LD_DEBUG` (hb41 fails,
+       hb42 passes): after `SDL_X11_LoadSymbols` the failing run unloads
+       the X libraries at once (`X11_CreateDevice` failed) and has opened
+       one X connection, the passing run two. libdbus does not touch X: it
+       only changes which functions land in which batch, so this looks like
+       the same libxcb miscompile as hp8's crash. hs1/hs2 (`?strace=1`, X +
+       libdbus and X + steam) record the syscalls around the connect.
+     - **hp8's libxcb crash, bisected inside libxcb** (the unit + fjit;
+       `name@lo-hi` excludes an offset range of the object's text):
+
+       | run | fjitlibs | result |
+       |---|---|---|
+       | hu3 | +xcb,+X11 | pass |
+       | hu4 | +xcb,+libc | pass |
+       | hu11 | +xcb,+ld.so | pass |
+       | hu12 | +xcb,+libc,+ld.so | pass |
+       | hu6 | everything, xcb 0-9f00 excluded | pass |
+       | hu7 | everything, xcb 9f00-14000 excluded | crash |
+       | hu8 | everything, only xcb 3120-32a0 (`_xcb_in_read_block`) excluded | pass |
+       | hu9 | everything, xcb 0-3120 (the PLT, `xcb_connect_to_fd`'s callers) excluded | pass |
+       | hu13 | everything, `watch=` on `queue_len` (c+0x1074) | queue_len stays 0 to the crash |
+
+       It is deterministic (~30-34 s, libxcb +0x316f). At the crash the
+       registers hold `memmove(queue, queue+8, -8)` with done = 8 while
+       `queue_len` is 0: the `min(queue_len, len)` select came out wrong in
+       the page's code, not a race (the iolock theory above is wrong;
+       lockpoll agrees). The offline harness (`scratch/unity/fjitrepro`:
+       libxcb alone, and with libc and the glibc_mem providers, eager and
+       lazy binding) emits a correct select, so it depends on the page's
+       batch: PLT stubs inlined into it (`gex-fjit` inline.rs) or a callee
+       summary. `?fjitlibs=dumpmod=ADDR` (fjit.rs) dumps the module whose
+       batch root is ADDR as base64 `[fjitdump]` lines; hu14
+       (`dumpmod=1a79d120`) captures the crashing module.
+     - **Start-up in the page (unit + fjit, `-libxcb.so.1`):** ht1
+       (`?attachtrace=1`): thread Workers attach ~0.1 s after their post, and
+       posts are ~0.25 s apart, so spawning threads costs little. ht2 (a
+       Chrome profile of the main Worker, 70-120 s): 64% (33 of 52 s) in
+       `fjit::translate`: recovery 27.6 s (discover/recover_one 16.8, lift
+       10), analyze 6.4, jump tables 4.4, emit 5.5, build_runtime 5.7, and
+       7 s in `lib_wanted`/`object_file_off` (only with `?fjitlibs=` rules).
+       ht3 (`byobj=1`, counts by object up to the menu,
+       translations/functions/wasm): UnityPlayer.so 750 / 3,667 / 36 MB
+       although the unit serves it, then libasound 7.9 MB, libc 4.7 MB,
+       libcrypto 3.5 MB, libX11 2.1 MB; first frame 125 s. A miss in
+       UnityPlayer (a function the unit lacks) pulled up to 63 of the unit's
+       own functions into its batch. 1cf4e76f keeps callees the unit serves
+       out of the batch (`cgen::index_of`).
+- **Resume (2026-10-09, HEAD 1cf4e76f; merge/unity has master 41917e73):**
+  hu14 (dumpmod, on the shim before 1cf4e76f) waits in edger's bench
+  queue; then sync the 1cf4e76f shim (copy in `scratch/unity/shim-served/`)
+  and run HK unit + fjit (`-libxcb.so.1,byobj=1`) for start-up against
+  ht3. Decode hu14's module, find the bad select in `_xcb_in_read_block`,
+  fix it, then recheck hb26 (full fjit, no unit) and hp8 (full fjit + unit).
+  Muck's grass needs the mods/gpu Mesa and `?gllimits=41` (not default yet;
+  GL to decide).
