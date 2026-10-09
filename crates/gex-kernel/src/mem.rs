@@ -122,6 +122,10 @@ pub struct MemoryMap {
     /// there. `None` for every M32 process, whose map behaves exactly as it
     /// always has.
     high: Option<(u64, u64)>,
+    /// Spans pinned objects own (`Kernel::pins`): the arena hands none of
+    /// their addresses to anything else, so a pinned library finds its base
+    /// free whenever it is loaded. Only an address hint lands there.
+    reserved: Vec<(u64, u64)>,
 }
 
 /// Bytes an M32 process asked for and could not be given for lack of address
@@ -171,6 +175,7 @@ impl MemoryMap {
             // Every process of a host with a 64-bit guest memory has the
             // high arena (docs/mem64.md §3).
             high: gex_abi::mem64().then_some((gex_abi::HIGH_ARENA_BASE, gex_abi::LIMIT64)),
+            reserved: Vec::new(),
         }
     }
 
@@ -648,29 +653,20 @@ impl MemoryMap {
         // address in use stays low: a `munmap` hole is reused before the arena
         // -- and the memory behind it -- gets bigger.
         if self.take.is_some() {
-            let chunks = self.arena.clone();
-            for (lo, hi) in chunks {
-                let mut candidate = page_align_up(lo);
-                while candidate + len <= hi {
-                    if self.is_free(candidate, candidate + len) {
-                        self.insert_from(candidate, candidate + len, prot, name, origin);
-                        return Ok(candidate);
-                    }
-                    match self
-                        .vmas
-                        .iter()
-                        .filter(|v| v.start < candidate + len && v.end > candidate)
-                        .map(|v| v.end)
-                        .max()
-                    {
-                        Some(end) => candidate = page_align_up(end),
-                        None => break,
-                    }
+            // A fresh chunk may run into a reserved span; it is arena all the
+            // same, so look again (each pass extends the arena past the last).
+            for _ in 0..8 {
+                if let Some(start) = self.first_fit(len) {
+                    self.insert_from(start, start + len, prot, name, origin);
+                    return Ok(start);
+                }
+                let start = self.extend_arena(len)?;
+                if self.reserved_overlap(start, start + len).is_none() {
+                    self.insert_from(start, start + len, prot, name, origin);
+                    return Ok(start);
                 }
             }
-            let start = self.extend_arena(len)?;
-            self.insert_from(start, start + len, prot, name, origin);
-            return Ok(start);
+            return Err(Errno::ENOMEM);
         }
 
         let mut candidate = self.mmap_next;
@@ -757,6 +753,38 @@ impl MemoryMap {
         let dst = self.mmap(0, new_len, v.prot, 0, &v.name)?;
         self.unmap(addr, old_len)?;
         Ok((dst, true))
+    }
+
+    /// Keep `[lo, hi)` for the object pinned there (`reserved`).
+    pub fn reserve(&mut self, lo: u64, hi: u64) {
+        if lo < hi {
+            self.reserved.push((page_align_down(lo), page_align_up(hi)));
+        }
+    }
+
+    /// The end of the furthest reserved span overlapping `[start, end)`.
+    fn reserved_overlap(&self, start: u64, end: u64) -> Option<u64> {
+        self.reserved.iter().filter(|&&(s, e)| s < end && start < e).map(|&(_, e)| e).max()
+    }
+
+    /// The lowest free, unreserved `len` bytes inside the arena.
+    fn first_fit(&self, len: u64) -> Option<u64> {
+        for &(lo, hi) in &self.arena {
+            let mut candidate = page_align_up(lo);
+            while candidate + len <= hi {
+                let taken = self
+                    .vmas
+                    .iter()
+                    .filter(|v| v.start < candidate + len && v.end > candidate)
+                    .map(|v| v.end)
+                    .max();
+                match taken.max(self.reserved_overlap(candidate, candidate + len)) {
+                    None => return Some(candidate),
+                    Some(end) => candidate = page_align_up(end),
+                }
+            }
+        }
+        None
     }
 
     fn is_free(&self, start: u64, end: u64) -> bool {
@@ -887,6 +915,37 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pinned object's span (`reserve`) is never handed to an unhinted
+    /// mapping, inside the arena already claimed or in a chunk claimed later,
+    /// and the pinned object still gets its base by asking for it.
+    #[test]
+    fn reserved_spans_wait_for_their_object() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x2000_0000);
+        fn take(len: u64) -> u64 {
+            NEXT.fetch_add(len, std::sync::atomic::Ordering::SeqCst)
+        }
+        fn back(end: u64) -> Option<u64> {
+            Some(NEXT.fetch_max(end, std::sync::atomic::Ordering::SeqCst))
+        }
+        let mut m = MemoryMap::new(0x40_1000);
+        m.grows_on_demand(take, back);
+        // One span inside the first chunk, one well past it.
+        m.reserve(0x2000_4000, 0x2001_0000);
+        m.reserve(0x2100_0000, 0x2140_0000);
+        let mut got = Vec::new();
+        for _ in 0..64 {
+            let a = m.mmap(0, 0x10_0000, prot::READ, flags::PRIVATE | flags::ANONYMOUS, "x").unwrap();
+            got.push(a);
+        }
+        for &a in &got {
+            let e = a + 0x10_0000;
+            assert!(!(a < 0x2001_0000 && 0x2000_4000 < e), "{a:#x} is inside the first reserved span");
+            assert!(!(a < 0x2140_0000 && 0x2100_0000 < e), "{a:#x} is inside the second reserved span");
+        }
+        assert_eq!(m.mmap(0x2000_4000, 0xc000, prot::READ, flags::PRIVATE | flags::ANONYMOUS, "pinned").unwrap(), 0x2000_4000);
+        assert_eq!(m.mmap(0x2100_0000, 0x40_0000, prot::READ, flags::PRIVATE | flags::ANONYMOUS, "pinned").unwrap(), 0x2100_0000);
+    }
 
     /// glibc's heap pattern must not leak the arena a claim at a time.
     ///
