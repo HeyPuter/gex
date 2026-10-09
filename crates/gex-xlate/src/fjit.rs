@@ -87,6 +87,29 @@ impl Jit {
         self.add_image_in(process, image, elf);
     }
 
+    /// Process `process` unmapped or reprotected the code in `ranges`:
+    /// what was learned there (function starts, never-returning functions,
+    /// functions translated, read-only ranges) described the code that was
+    /// there, and a `dlclose` and a later `dlopen` put another library at
+    /// the same addresses. Kept, the old library's starts split the new
+    /// one's functions where it had none: HK's SDL loads libdbus, unloads
+    /// it, and maps libxcb over it; a libdbus start ended libxcb's
+    /// `_xcb_in_read_block` before its `cmovle` as a tail call, flags dead,
+    /// and it read the X setup reply out of an empty queue.
+    pub fn retire(&self, process: u64, ranges: &[(u64, u64)]) {
+        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(l) = st.procs.get_mut(&process) else { return };
+        for &(lo, hi) in ranges.iter().filter(|r| r.1 > r.0) {
+            let gone: Vec<u64> = l.starts.range(lo..hi).map(|(&a, _)| a).collect();
+            for a in gone {
+                l.starts.remove(&a);
+            }
+            l.noreturn.retain(|&a| a < lo || a >= hi);
+            l.translated.retain(|&a| a < lo || a >= hi);
+            l.readonly.retain(|&(s, e)| e <= lo || s >= hi);
+        }
+    }
+
     /// Process `process` is gone.
     pub fn forget(&self, process: u64) {
         let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
@@ -160,6 +183,28 @@ impl Jit {
         page_gen: &dyn Fn(u64) -> u32,
         class32: bool,
     ) -> Option<Vec<u8>> {
+        self.translate_skipping(process, mem, addr, executable, &|_| false, read_only, volatile, page_gen, class32)
+    }
+
+    /// [`Jit::translate_in`], leaving out of the batch the callees `skip`
+    /// names (served by another tier: the call reaches them through the
+    /// table). `skip` bounds the batch only, never instruction fetch: a
+    /// function another tier serves can have an entry in the middle of the
+    /// one being recovered, and fetch taking its bytes for non-code decodes
+    /// them as illegal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn translate_skipping(
+        &self,
+        process: u64,
+        mem: &[u8],
+        addr: u64,
+        executable: &dyn Fn(u64) -> bool,
+        skip: &dyn Fn(u64) -> bool,
+        read_only: &dyn Fn(u64, u64) -> bool,
+        volatile: &dyn Fn(u64) -> bool,
+        page_gen: &dyn Fn(u64) -> u32,
+        class32: bool,
+    ) -> Option<Vec<u8>> {
         if gex_abi::PPC || (class32 && !gex_abi::X86) {
             return None;
         }
@@ -188,11 +233,31 @@ impl Jit {
             if batch.len() >= limit {
                 break;
             }
-            if batch.contains_key(&a) || (a != addr && st.translated.contains(&a)) || !executable(a) {
+            if batch.contains_key(&a) || (a != addr && (st.translated.contains(&a) || skip(a))) || !executable(a) {
                 continue;
             }
             let Learned { starts, noreturn, .. } = &mut *st;
+            // Recovery records `a` as a function start for good, which bounds
+            // every function recovered after it: a later recovery of the
+            // function around `a` ends there as at a tail call, with the
+            // flags dead. A root the table missed at can be the middle of a
+            // function (a return or a signal's resume through dispatch, a
+            // computed goto's label, a guessed slot target), so `a` stays a
+            // start only if something already made it one (a call, the
+            // image's symbols). The page's JIT, with no images to seed it,
+            // split libxcb's `_xcb_in_read_block` before a `cmovle` this way.
+            let before = starts.get(&a).cloned();
             let f = func::recover_one(&code, a, starts, noreturn, &opts);
+            if !before.as_ref().is_some_and(|b| b.strong()) {
+                match before {
+                    Some(b) => {
+                        starts.insert(a, b);
+                    }
+                    None => {
+                        starts.remove(&a);
+                    }
+                }
+            }
             if let Err(e) = f.verify().and_then(|_| block_local(&f)) {
                 if std::env::var_os("GEX_FJIT_STATS").is_some() {
                     eprintln!("[fjit] {a:#x}: recovered malformed ({e}); left to the fallback");

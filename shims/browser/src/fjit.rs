@@ -16,7 +16,7 @@
 //! run on worker threads (`GEX_FJIT_BACKGROUND`); here it is always inline.
 
 use gex_kernel::GuestMem;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -326,48 +326,17 @@ fn mid_function(addr: u64) -> bool {
     mid
 }
 
-/// What the JIT learns (function starts, functions translated, functions
-/// that never return) is kept under this key, which moves on whenever code
-/// is unmapped: it describes addresses, and a `dlclose` and a later
-/// `dlopen` put another library at them. HK's SDL loads libdbus, unloads it,
-/// and maps libxcb over the same range; with libdbus's starts kept, libxcb's
-/// `_xcb_in_read_block` ended at the address of a libdbus function (+0x30, the
-/// `cmovle` of `min(queue_len, len)`) as at a tail call, flags dead, and
-/// read the setup reply out of an empty queue: X11 video init failed, the
-/// black screen (hb26, hb45; hs5 `scanconst=` showed the start was
-/// libdbus's), and with the unit, a memmove of -8 bytes (hp8).
-static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The 4 KiB pages holding a root or a function translated this epoch: the
-/// starts the JIT learned lie in them (a batch's callees in other objects
-/// are its members too), so code unmapped elsewhere leaves them be. ALSA
-/// loads and unloads its plugins over and over at start-up (six of hb50's
-/// ten epochs), and each forgetting cost a re-translation of everything
-/// called after it (libasound: 27 MiB of wasm by HK's menu in hp11).
-static TOUCHED: Mutex<Option<BTreeSet<u64>>> = Mutex::new(None);
-
-fn touch(a: u64) {
-    lock(&TOUCHED).get_or_insert_with(Default::default).insert(a >> 12);
-}
-
 /// Code in `ranges` was unmapped or reprotected (`retire_unmapped_code`):
-/// start learning afresh, if this epoch learned anything there.
+/// what the JIT learned there goes (`Jit::retire`). HK's SDL loads libdbus,
+/// unloads it, and maps libxcb over the same range; with libdbus's starts
+/// kept, libxcb's `_xcb_in_read_block` ended at a libdbus function's address
+/// (+0x30, the `cmovle` of `min(queue_len, len)`) as at a tail call, flags
+/// dead, and read the setup reply out of an empty queue: X11 video init
+/// failed, the black screen (hb26, hb45; `scanconst=` in hs5 showed the
+/// start was libdbus's), and with the unit, a memmove of -8 bytes (hp8).
 pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
-    {
-        let mut t = lock(&TOUCHED);
-        let set = t.get_or_insert_with(Default::default);
-        if !ranges.iter().any(|&(s, e)| e > s && set.range(s >> 12..=(e - 1) >> 12).next().is_some()) {
-            return;
-        }
-        set.clear();
-    }
-    let old = EPOCH.fetch_add(1, Ordering::AcqRel);
     if let Some(jit) = JIT.get() {
-        jit.forget(old);
-        if old < 16 || (old + 1).is_power_of_two() {
-            let r: Vec<String> = ranges.iter().take(4).map(|&(s, e)| format!("{s:#x}-{e:#x}")).collect();
-            crate::warn_line(&format!("[fjit] code unmapped ({}): learning afresh, epoch {}\n", r.join(" "), old + 1));
-        }
+        jit.retire(0, ranges);
     }
 }
 
@@ -408,28 +377,26 @@ fn translate_root(addr: u64) -> Option<u32> {
     // An address an ELF provider holds is not code to translate (cgen::elfprov).
     // With `?fjitlibs=` rules, callees outside them are not brought in either.
     let rules = !lock(&LIBS).is_empty();
-    // A callee a unit already serves is not brought into the batch: the call
-    // reaches it through the table. Without this, a miss in UnityPlayer (a
-    // function its unit lacks) re-translated up to 63 of the unit's own
-    // functions with it -- 3,667 functions and 36 MiB of wasm by HK's menu
-    // (ht3), JIT code shadowing clang's. Only the unit tier: `executable` is
-    // also what instruction fetch asks of every byte, and the JIT publishes
-    // resume points inside functions, so counting its own entries made it
-    // decode `cmovle` in libxcb's `_xcb_in_read_block` as illegal (hu15).
-    // (That entry was a function of libdbus, unloaded since: the epoch now
-    // forgets those. A current JIT function's entry counts again: after a
-    // forgetting the JIT no longer knows what it made, and re-translated
-    // libasound into 28 MiB of wasm by the menu, hp12. Fetch meeting one
-    // inside another function would need an entry in the middle of a
-    // function, which misses no longer make, `mid_function`.)
+    // A callee a unit or the JIT already serves is not brought into the
+    // batch: the call reaches it through the table. Without this, a miss in
+    // UnityPlayer (a function its unit lacks) re-translated up to 63 of the
+    // unit's own functions with it -- 3,667 functions and 36 MiB of wasm by
+    // HK's menu (ht3), JIT code shadowing clang's -- and libasound's served
+    // callees went into every batch (28 MiB of wasm by the menu, hp12).
+    // `skip` bounds the batch only. Asked of instruction fetch (as part of
+    // `executable`), an entry inside the function being recovered -- a
+    // resume point, or a root the JIT took inside a function and, since
+    // misses no longer make starts, does not stop recovery at -- read as
+    // non-code and decoded as illegal: `cmovle` in libxcb's
+    // `_xcb_in_read_block` (hu15), and SIGILL at HK's start-up without the
+    // unit (hb52).
     let served_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
-    let served = |a: u64| a != addr && *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::unit_serves(a) || crate::cgen::jit_serves(a));
+    let served = |a: u64| *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::unit_serves(a) || crate::cgen::jit_serves(a));
     let executable = |a: u64| {
         exec.iter().any(|&(s, e)| a >= s && a < e)
             && !crate::cgen::elfprov::provided(a)
             && !crate::cgen::libprov::replaced(a)
             && (!rules || lib_wanted(a))
-            && !served(a)
     };
     let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     // Writable-and-executable code (a JIT's) stays tier-1, as natively.
@@ -446,11 +413,7 @@ fn translate_root(addr: u64) -> Option<u32> {
     };
     let class32 = gex_abi::X86 && gex_xlate::arch::compat();
     trace(&format!("translate {addr:#x}"));
-    let epoch = EPOCH.load(Ordering::Acquire);
-    // What this epoch learns about (the root, even if it fails: recovery
-    // records it as a start first).
-    touch(addr);
-    let Some(wasm) = jit.translate_in(epoch, crate::guest_bytes(), addr, &executable, &read_only, &volatile, &pg, class32) else {
+    let Some(wasm) = jit.translate_skipping(0, crate::guest_bytes(), addr, &executable, &served, &read_only, &volatile, &pg, class32) else {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         trace(&format!("declined {addr:#x}"));
         return None;
@@ -459,9 +422,6 @@ fn translate_root(addr: u64) -> Option<u32> {
     if !funcs.contains(&addr) {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         return None;
-    }
-    for &f in &funcs {
-        touch(f);
     }
     note_object(addr, funcs.len(), wasm.len());
     dump_module(addr, &funcs, &wasm);

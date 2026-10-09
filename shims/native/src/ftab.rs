@@ -1004,6 +1004,9 @@ pub(crate) fn install_bridges(mut cx: impl AsContextMut<Data = HostState>, slots
 /// sending callers there first.
 pub(crate) fn on_retire(sh: &mut JitShared, memory: &mut [u8], ranges: &[(u64, u64)]) {
     sh.ftab.epoch += 1;
+    if let Some(t) = gex_kernel::ftab::translator() {
+        t.retire(sh.ftab.process.0, ranges);
+    }
     sh.ftab.queued.retain(|&a| !ranges.iter().any(|&(s, e)| a >= s && a < e));
     for &(start, end) in ranges {
         let hit: Vec<(u64, gex_kernel::ftab::Func)> = sh.ftab.map.range(start, end).collect();

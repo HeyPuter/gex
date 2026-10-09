@@ -560,6 +560,10 @@ impl gex_kernel::ftab::Translator for FjitTranslator {
     fn forget(&self, process: u64) {
         self.0.forget(process);
     }
+
+    fn retire(&self, process: u64, ranges: &[(u64, u64)]) {
+        self.0.retire(process, ranges);
+    }
 }
 
 /// The guest memory for this run (docs/mem64.md §5): `--mem64`/`--mem32`,
