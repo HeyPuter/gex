@@ -2682,7 +2682,7 @@ impl Kernel {
             nr::UMOUNT2 => self.sys_umount(m, a[0]),
 
             // -- sockets -----------------------------------------------------
-            nr::SOCKET => self.sys_socket(a[0], a[1]),
+            nr::SOCKET => self.sys_socket(a[0], a[1], a[2]),
             // A unix socket and an internet socket are different concrete
             // types behind the same descriptor, so which `connect` this is
             // depends on what the descriptor turned out to be.
@@ -5578,7 +5578,7 @@ impl Kernel {
     /// `socket`. AF_UNIX, an inert AF_NETLINK (below), and AF_INET with only the two kinds that matter: a stream,
     /// which the host carries, and a datagram, which only ever goes to the
     /// resolver this kernel is.
-    fn sys_socket(&mut self, domain: u64, ty: u64) -> SysResult {
+    fn sys_socket(&mut self, domain: u64, ty: u64, protocol: u64) -> SysResult {
         const AF_UNIX: u64 = 1;
         const AF_INET: u64 = 2;
         const SOCK_STREAM: u64 = 1;
@@ -5605,7 +5605,16 @@ impl Kernel {
         // its video subsystem too, and Unity 6 then saw no display). There
         // are no devices to announce, so the socket binds, takes its options
         // and never has a message: an empty eventfd behind the descriptor.
+        // Only NETLINK_KOBJECT_UEVENT: glibc's getaddrinfo (AI_ADDRCONFIG)
+        // asks NETLINK_ROUTE for the addresses, and an eventfd answers its
+        // request with the 8-byte counter its own send wrote, which glibc
+        // aborts on (apt's http method). Without a route socket it assumes
+        // IPv4 and IPv6 are there.
         const AF_NETLINK: u64 = 16;
+        const NETLINK_KOBJECT_UEVENT: u64 = 15;
+        if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
+            return Err(Errno::EAFNOSUPPORT);
+        }
         if domain == AF_NETLINK {
             let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::eventfd::EventFd::new(0, false));
             let flags = if ty & SOCK_NONBLOCK != 0 { crate::fs::oflags::O_NONBLOCK } else { 0 };
