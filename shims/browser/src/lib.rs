@@ -10405,8 +10405,18 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // A block failed its page check (gex-emit `emit_page_check`):
         // translate its address again if its module still provides it.
         let start = _pc as u64;
+        // The same stale block asking twice in a row: the catch-up below did
+        // not move this Worker's directory off it, so the newer translation
+        // it waits for is never coming here (seen in an exec'd aarch64
+        // program's `_dl_fini`, which re-entered the block from JavaScript
+        // for ever). Translating it again is always correct, only slower.
+        let repeat = STALE_LAST.with(|c| {
+            let same = c.get() == (start, addr as u64);
+            c.set((start, addr as u64));
+            same
+        });
         let again = with_host(|h| {
-            let again = h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
+            let again = repeat || h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
             if again {
                 h.jit.translated.remove(&start);
                 h.jit.provider.remove(&start);
@@ -10743,6 +10753,9 @@ thread_local! {
     /// next dispatch miss's answer: that miss must not answer
     /// `DISPATCH_MISS_LEAVE` (the caller would dispatch again, for ever).
     static NO_LEAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last `PAGE_STALE` (block, module), to tell a stale block that
+    /// keeps coming back from one met once. See `gex_cache_op`.
+    static STALE_LAST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Dispatch misses by how `gex_dispatch_miss` dealt with them (the NT
