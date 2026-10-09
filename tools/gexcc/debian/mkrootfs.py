@@ -268,7 +268,16 @@ def configure(root, ours, native_pkgs):
       f'Types: deb\nURIs: file:/var/lib/gex-apt\nSuites: {SUITE}\nComponents: main\n'
       f'Architectures: {OURS_ARCH} {NATIVE}\nTrusted: yes\n')
     # (dpkg and apt of ours are labelled arm64: o=gex's 1001 keeps them)
-    names = sorted({c['Package'] for _, c in ours if c['Architecture'] == OURS_ARCH})
+    names = {c['Package'] for _, c in ours if c['Architecture'] == OURS_ARCH}
+    # and what they stand in for (python3.13 provides python3 and
+    # python3-minimal): Debian's packages of those names would overwrite
+    # ours' files, so a request for one gets ours
+    for _, c in ours:
+        if c['Architecture'] == OURS_ARCH:
+            for item in c.get('Provides', '').split(','):
+                if item.strip():
+                    names.add(item.strip().split(' ')[0])
+    names = sorted(names)
     w('etc/apt/preferences.d/gex-native',
       '# Our native tools (musl-linux-wasm32) are never replaced by Debian\'s\n'
       '# arm64 builds; libraries are not pinned (docs/gexcc.md §6.1a).\n'

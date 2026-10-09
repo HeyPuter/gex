@@ -25,7 +25,7 @@ DROP = ['usr/include/*', 'usr/lib/*.a', 'usr/lib/pkgconfig/*', 'usr/share/pkgcon
         'usr/share/aclocal/*', 'usr/share/info/*', 'usr/lib/*.la', 'usr/share/man/man3/*']
 SUFFIX = '+gex1'
 # binpkgs.txt lines that are not splits
-KINDS = ('depends', 'predepends', 'arch')
+KINDS = ('depends', 'predepends', 'arch', 'breaks', 'provides', 'conflicts', 'replaces', 'multiarch')
 
 
 def control_stanzas(path):
@@ -54,7 +54,15 @@ def split_rules(srcpkg):
     for line in open(os.path.join(HERE, 'binpkgs.txt')):
         f = line.split()
         if f and not f[0].startswith('#') and f[0] == srcpkg and f[0] not in KINDS:
-            rules.append((f[1], f[2:]))
+            # `@NAME`: the globs in NAME (next to binpkgs.txt), one per line
+            globs = []
+            for g in f[2:]:
+                if g.startswith('@'):
+                    globs += [x.strip() for x in open(os.path.join(HERE, g[1:]))
+                              if x.strip() and not x.startswith('#')]
+                else:
+                    globs.append(g)
+            rules.append((f[1], globs))
     return rules or [(srcpkg, ['*'])]
 
 
@@ -110,6 +118,7 @@ def main():
         # (docs/gexcc.md §6.1a): `arch dpkg arm64`
         arch = field('arch', b) or ARCH
         with tempfile.TemporaryDirectory() as t:
+            linked = {}
             for rel in rels:
                 s, d = os.path.join(a.stage, rel), os.path.join(t, rel)
                 os.makedirs(os.path.dirname(d), exist_ok=True)
@@ -117,10 +126,16 @@ def main():
                     os.makedirs(d, exist_ok=True)
                 elif os.path.islink(s):
                     os.symlink(os.readlink(s), d)
+                elif (os.stat(s).st_dev, os.stat(s).st_ino) in linked:
+                    # a hard link stays one (perl and perl5.40.1)
+                    os.link(linked[(os.stat(s).st_dev, os.stat(s).st_ino)], d)
                 else:
                     shutil.copy2(s, d)
+                    if os.stat(s).st_nlink > 1:
+                        linked[(os.stat(s).st_dev, os.stat(s).st_ino)] = d
             size = sum(os.path.getsize(os.path.join(t, r)) for r in rels
-                       if os.path.isfile(os.path.join(t, r)) and not os.path.islink(os.path.join(t, r))) // 1024
+                       if os.path.isfile(os.path.join(t, r)) and not os.path.islink(os.path.join(t, r))
+                       and (os.stat(os.path.join(t, r)).st_nlink == 1 or os.path.join(t, r) in linked.values())) // 1024
             os.makedirs(os.path.join(t, 'DEBIAN'))
             md5 = []
             for rel in sorted(rels):
@@ -136,20 +151,28 @@ def main():
             for k in ('Essential', 'Section', 'Priority'):
                 if k in st or k in source:
                     ctl.append(f'{k}: {st.get(k, source.get(k))}')
+            # A wasm32 tool must be foreign to meet an arm64 package's plain
+            # dependency; one labelled arm64 (perl: `multiarch perl allowed`,
+            # for Debian's `perl:any`) may say otherwise.
             ma = st.get('Multi-Arch', 'foreign')
-            ctl.append(f'Multi-Arch: {"foreign" if ma in ("foreign", "allowed", "no") else ma}')
+            ma = field('multiarch', b) or ("foreign" if ma in ("foreign", "allowed", "no") else ma)
+            ctl.append(f'Multi-Arch: {ma}')
             # relations from debian/control, without the substitution
             # variables dh would have filled (library dependencies, which a
             # static program does not have)
+            # plus binpkgs.txt's own (`provides perl-base perl-modules-5.40 (=
+            # ${binary:Version})`): what our build of a package stands in for
             for k in ('Provides', 'Conflicts', 'Breaks', 'Replaces'):
                 v = ', '.join(x.strip() for x in st.get(k, '').replace('\n', ' ').split(',')
                               if x.strip() and '${' not in x)
+                extra = field(k.lower(), b).replace('${binary:Version}', version)
+                v = ', '.join(x for x in (v, extra) if x)
                 if v:
                     ctl.append(f'{k}: {v}')
             if field('predepends', b):
                 ctl.append(f"Pre-Depends: {field('predepends', b)}")
             if depends(b):
-                ctl.append(f'Depends: {depends(b)}')
+                ctl.append(f"Depends: {depends(b).replace('${binary:Version}', version)}")
             if 'Homepage' in source:
                 ctl.append(f'Homepage: {source["Homepage"]}')
             desc = st.get('Description', f'{b} (native wasm32 build)')

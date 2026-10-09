@@ -11898,7 +11898,7 @@ pub extern "C" fn gex_dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             let c = h.threads[cur()].kstate.ctx_addr;
             let r = |i: u8| gm.read_u64(c + ctx::x(i) as u64).unwrap_or(0);
             trace_line(&format!(
-                "gex: pid {} thread {} ctx {c:#x} sp={:#x} x30={:#x} x0={:#x} x1={:#x}\n",
+                "gex: pid {} thread {} ctx {c:#x} miss at {pc:#x} sp={:#x} x30={:#x} x0={:#x} x1={:#x}\n",
                 h.kernel.pid,
                 cur(),
                 gm.read_u64(c + ctx::SP as u64).unwrap_or(0),

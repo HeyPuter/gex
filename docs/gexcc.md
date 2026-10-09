@@ -895,3 +895,585 @@ ahead-of-page compilation of the hot set while the rootfs downloads.
   page's Xwayland.
 - Program sizes: every program links libc statically; coreutils as one
   binary keeps that once.
+
+## 7. Shared libraries: wasm32 programs, and wasm32 libraries under arm64 programs (design, 2026-10-09)
+
+Two requests from the user, designed together because both load native
+wasm32 code as a library into a process at run time:
+
+1. **gexcc programs with real shared libraries**: side modules sharing the
+   program's memory and function table, loaded at exec from `DT_NEEDED`
+   and later with `dlopen`, instead of every program linking its own libc
+   and libraries. For smaller images, one compile of each library per page
+   instead of one per program, and less memory per process. Static linking
+   stays available (and the default until the shared path is proven).
+2. **Item 3: arm64 programs loading gexcc-built wasm32 libraries**: whole
+   libraries (zlib, zstd, then libc) built with aarch64's LP64 layout,
+   lowered to wasm32 addressing, bound in place of Debian's arm64 objects.
+
+### 7.1 What exists
+
+- **Programs are already position-independent.** gexcc links every
+  program `wasm-ld --experimental-pic -pie --shared-memory
+  --import-memory`: a PIE main module in emscripten's terms, importing
+  `__memory_base`, `__table_base`, `__stack_pointer`, the memory and the
+  function table, with a `dylink.0` section. Its objects are `-fPIC`
+  (`flags.sh`). So the shared-library cost below is not "PIC against
+  static": that cost is already paid.
+- **But with hidden visibility.** clang's wasm targets default to
+  `-fvisibility=hidden`, so gexcc's objects (and the sysroot's libc.a)
+  export nothing: a side module linked from them is empty. A shared build
+  needs `-fvisibility=default` (what emscripten passes for side modules).
+- **Loading.** A wasm32 program is installed as a stateful provider
+  (`cgen/wasmprog.rs`, native `wasmprog.rs`): its module occupies a range
+  of the process's function table (`gex-kernel` `ftab`: a base per module,
+  indices never reused, every thread's table replays one log) and its data
+  sits at the container's `__memory_base` (a fixed address chosen at link
+  time). Each Worker/store instantiates it; JS supplies `env` and `gex`.
+- **Fork.** asyncify (§4): every function that can reach `gex.fork_point`
+  is instrumented (an onlylist from `forkreach.py`, a whole-program call
+  graph). The child re-instantiates the module over the copied memory at
+  the parent's table base (bdd34eb3).
+- **Side modules exist already for Wine and for ejected projects**:
+  `wasmdll.rs` (Wine's PE side as one wasm module behind PE skeletons),
+  `libprov.rs` (stateful providers: `-shared` PIC modules with their own
+  data, stack and heap, for a translated program's DLL or ELF library,
+  including wasm64 ones for x86-64 libraries). They parse `dylink.0`
+  (`libprov::dylink_memory`) and bind exports into the function table.
+  What none of them do is resolve one wasm module's imports against
+  another's exports (GOT, cross-module calls) or `DT_NEEDED`.
+- **Compiled modules** are shared between a process's threads and passed
+  to its forks (`host.mjs` `#moduleCache`, keyed by provider file name).
+  A new process (every `execve`) compiles its program again; nothing
+  survives the page.
+- `dlopen` is libgex's registry (`__gex_dl_libs`, Wine's closed world):
+  `dlopen(NULL)` + `dlsym` on the program's own functions do not work,
+  which is what stops GTK's `GtkBuilder` signal connection today.
+
+### 7.2 Choice of ABI
+
+**Emscripten-style side modules (`dylink.0`), not an ABI of our own.**
+LLVM writes them (`wasm-ld --experimental-pic -shared`), binaryen
+understands them, and the shapes gex already parses are these:
+
+- a library is `libfoo.so.N`, a wasm module (in the same ELF32 container
+  as programs, `GEXWASM` header version 2 marking a library, so `file`,
+  dpkg and the kernel treat it as an object of ours) with `dylink.0`:
+  memory size/alignment, table size/alignment, `NEEDED` sonames,
+  `RUNTIME_PATH`, export/import symbol flags (TLS, weak);
+- data references between modules go through `GOT.mem.<sym>` imported
+  mutable i32 globals, function pointers through `GOT.func.<sym>` (a table
+  index); calls between modules are plain function imports (`env.<sym>`),
+  which V8 and wasmtime call directly, wasm to wasm, without JS;
+- `__memory_base`/`__table_base` per module, one `__stack_pointer` per
+  thread shared by all modules, `__indirect_function_table` and the memory
+  shared.
+
+What we add (as emscripten adds its own on top):
+- **The loader is gex's, not JS's.** Symbol resolution, placement and
+  relocation are a crate shared by both shims (`gex-dylink`): the browser
+  shim runs it in its own wasm, JS only does `new WebAssembly.Instance`
+  from a plan (module, imports by name → (instance, export)). Same order
+  natively in wasmtime. One implementation, tested natively.
+- **ELF semantics where emscripten has none:** load order and lookup scope
+  as `ld.so` (the program, then `NEEDED` breadth-first, then `dlopen`ed
+  with `RTLD_GLOBAL`); search path `RUNPATH`, `LD_LIBRARY_PATH`,
+  `/usr/lib/wasm32-linux-musl`, `/lib/wasm32-linux-musl` (the multiarch
+  directory our packages already own; Debian's arm64 objects stay in
+  `aarch64-linux-gnu`); weak undefined resolves to 0 (fixes the GTK
+  `GOT.func::__lsan_ignore_object` failure class without patches);
+  `dlopen(NULL)`/`dlsym(RTLD_DEFAULT)` see every export of the global
+  scope, the program's included when it is linked `-rdynamic`.
+- **No symbol interposition into a library's own calls.** A call inside
+  a side module to its own default-visibility function is a direct wasm
+  call; a program defining `malloc` replaces it for the program and for
+  modules loaded after it, not inside libc. Documented limit (no package
+  in the image interposes libc today).
+- `dlclose` keeps the module (as musl does).
+
+### 7.3 Measured: codegen cost in V8 (edger, node 26, one core)
+
+Harness `tools/gexcc/bench-codegen` (build.sh with ZLIB_SRC, ZSTD_SRC and GEXCC_PREFIX set; run.sh on edger under bench.sh): zlib 1.3.1
+(compress2 + uncompress of 4 MiB at level 6), zstd 1.5.7 (level 3, both
+ways), binary trees (malloc/free and pointer chasing) and a strings
+kernel (strdup, qsort with a comparator, strlen, strchr), over a small
+libc (size-class malloc, bulk-memory memcpy). Each variant in a fresh
+node, warm-up run then median of 5, 5 rounds in rotating order; table
+values are the median of the rounds' medians, in ms.
+
+| variant | what | zlib | zstd | trees | strings | wasm bytes |
+|---|---|---|---|---|---|---|
+| static | `-fno-PIC`, absolute addresses | 283.5 | 34.1 | 26.0 | 43.9 | 478,507 |
+| pie | gexcc today (`-fPIC`, hidden, `-pie`) | 284.7 | 35.0 | 27.1 | 43.0 | 483,388 |
+| pie-dv | the same, `-fvisibility=default` | 285.7 | 34.3 | 26.3 | 44.3 | 483,413 |
+| split | libc a side module, the rest a PIE importing it | 285.6 | 34.5 | 26.5 | 47.7 | 485,815 |
+| lib | kernels and libc in a side module (a shared library) | 285.0 | 34.6 | 26.4 | 43.9 | 578,870 |
+| lp64 | wasm64 (LP64) lowered to wasm32 (`--memory64-lowering`) | 321.4 | 31.1 | 28.9 | 45.5 | 486,193 |
+| pie-opt | pie through `wasm-opt -O2` | 240.7 | 34.2 | 26.6 | 42.2 | 440,564 |
+| asyncify-ind | pie-opt, instrumented where an indirect call is reachable | 241.4 | 34.2 | 26.3 | 46.0 | 466,120 |
+| asyncify-all | pie-opt, every function instrumented | 245.7 | 37.4 | 34.9 | 49.8 | 600,482 |
+
+(Two full runs agreed within 2-3%: the first, without the asyncify-ind
+row, gave static 282.7/33.8/25.1/42.9 and pie 283.3/34.5/26.2/43.2.)
+
+How to read it:
+- **PIC is not where the cost is.** pie against static: zlib 0.4% slower
+  (284.7 vs 283.5 ms), zstd 3% slower (35.0 vs 34.1), trees 4% slower
+  (27.1 vs 26.0), strings 2% faster (43.0 vs 43.9): within a few percent,
+  and gexcc pays it already. Default visibility changes nothing (pie-dv).
+- **Calls across modules cost where a program makes many small libc
+  calls:** split against pie is the same for zlib, zstd and trees, and 11%
+  slower for strings (47.7 vs 43.0 ms: strdup/strlen/strchr/free per
+  string, every one an import call into libc's instance). Code inside a
+  library is as fast as in a program (lib against pie: all within 2%),
+  though its module is 20% larger (578,870 vs 483,388 bytes: exports and
+  GOT accesses for every default-visibility symbol).
+- **LP64 lowered to wasm32 costs 7-13% on pointer-heavy code**: lp64
+  against static, zlib 13% slower (321.4 vs 283.5 ms), trees 11% slower
+  (28.9 vs 26.0), strings 4% slower (45.5 vs 43.9), and zstd 9% *faster*
+  (31.1 vs 34.1: its 64-bit arithmetic on `size_t` matches the wasm64
+  build's natural width). For item 3 that is acceptable against running
+  the same library translated (several times slower).
+- **asyncify:** instrumenting only what can reach an indirect call (what a
+  shared library built without knowing its callers must do) costs
+  nothing measurable on zlib, zstd and trees and 9% on strings (46.0 vs
+  42.2 ms, the qsort comparator's callers) against the same binaryen -O2
+  build. Instrumenting everything costs 2-31% (trees 34.9 vs 26.6 ms). So
+  libraries take the indirect-call rule, never "everything".
+- **Unplanned finding: binaryen -O2 makes zlib 16% faster** (pie-opt
+  240.7 vs pie 284.7 ms), other kernels unchanged. gexcc runs `wasm-opt
+  -O2` only on programs that fork (asyncify). Running it on every program
+  is a separate, cheap change to evaluate on real programs.
+- Compile time (V8, synchronous `new WebAssembly.Module`, Liftoff) was
+  3.5-4.6 ms for every variant of these ~0.5 MB modules: not a
+  differentiator here; the page-wide cache (§7.7) is about not repeating
+  it per process for 2-30 MB programs.
+
+### 7.4 How libc is shared
+
+- `libc.so` = musl + libgex (dlopen, vfork, the setjmp runtime, signal
+  frames) + libgexcc (loop safepoints), built `-fPIC -fvisibility=default`.
+  Linked whole it is 761 KB of wasm (3898 functions; `scratch/CC/dl/out2`,
+  musl's `pthread_cancel.lo` left out: its `__cp_*` labels are assembly
+  markers wasm does not have). compiler-rt's builtins stay static in each
+  module, as libgcc does.
+- `crt1.o`, `main3.o` stay in the program. The program's `__gex_start`
+  and `__gex_thread_start` move to libc (the entries gex calls), so they
+  are found by export, not by the program's table.
+- libc++/libc++abi/libunwind become `libc++.so.1`; the wasm exception
+  tags (`__cpp_exception`, and `__c_longjmp` for setjmp) are defined once,
+  in libc.so and libc++.so, and imported by everything else, so a throw
+  or longjmp crosses modules.
+- **TLS** per module: each module with TLS has its own `__tls_base`
+  global and `__wasm_init_tls`. libc keeps musl's list of TLS modules
+  (`libc.tls_head`), which the loader fills before `__gex_start` (size,
+  alignment, the module's `__wasm_init_tls` as a table index); a thread's
+  TLS area holds every module's block, and `__gex_thread_c` initialises
+  each. A module `dlopen`ed later gets its blocks on each thread's next
+  catch-up (§7.6).
+- **Static stays.** `gexcc -static` (and the default until the shared
+  path passes the suites) links today's way. `-shared` stops writing an
+  archive and writes a side module when `GEXCC_SHARED=1`; `-lfoo` then
+  prefers `libfoo.so` (as ld does) unless `-static`.
+
+### 7.5 Fork, exec and the function table
+
+- **Layout per process (the link map):** for each loaded module, its
+  file's content hash, `__memory_base` (data allocated from the guest's
+  address space with mmap by the loader, like `ld.so`) and
+  `__table_base` (a range from the process's `ftab`). The program keeps
+  its container's fixed data address.
+- **Fork** copies memory, so every module's data and every function
+  pointer in it is valid in the child if the child has every module at
+  the same table base. The fork record (today: entry and one base,
+  bdd34eb3) becomes the whole link map, `dlopen`ed modules included; the
+  child instantiates them in order with `publish_at` (no data
+  relocations, no constructors: the data is the parent's) and sets each
+  module's `__tls_base` to the forking thread's value (exported as
+  `__gex_tls_base`, a setter the loader calls: a mutable global's value
+  cannot be passed in at instantiation).
+- **asyncify across modules:** every module is instrumented with binaryen's
+  `asyncify-relocatable` (its state and data pointer become imported
+  globals, one pair per thread shared by all modules), so an unwind
+  passes through frames of any module and the rewind replays them.
+  Which functions are instrumented:
+  - in a library: those that can reach `gex.fork_point` through its own
+    calls, those that can reach an import that is itself marked
+    "may fork" by the providing library, and those that can reach an
+    indirect call (a callback that might fork). Each library records its
+    exports' answers in a custom section (`gex.forkreach`: exports that
+    may fork; exports that may call back);
+  - in a program: `forkreach.py` as today, with the libraries' sections
+    standing in for their code: an import may fork if the library says
+    so, or if it may call back and the program has an address-taken
+    function that may fork.
+  The cost of the library rule is the `asyncify-ind` row above.
+- **exec** replaces the image as today; the new program's modules take new
+  table ranges (indices are never reused), its libraries new data.
+- **Threads:** each Worker instantiates every module of the link map
+  (they replay the `ftab` log already), with the thread's one
+  `__stack_pointer` global for all of them.
+
+### 7.6 dlopen
+
+- libgex's `dlopen` asks the host (`gex.dlopen(path, flags)`): the loader
+  maps the module and its `NEEDED`, resolves, publishes the installs in
+  the `ftab` log, runs data relocations and constructors in the calling
+  thread, and returns a handle; `dlsym` looks names up in the loader's
+  symbol table (functions get a table slot on first `dlsym`, as
+  `GOT.func` does).
+- **Other threads** must not call into the new module before they
+  instantiate it: a `call_indirect` to the resolve stub with another
+  signature traps rather than resolving. So `dlopen` returns only after
+  every thread of the process has caught up with the log: threads catch
+  up at their next system call or loop safepoint (gexcc's GexPoll), and
+  `dlopen` waits on that, as `membarrier` would.
+- `dlopen` of a library that is already linked statically into the
+  program (python's extension modules today) still finds it in the
+  registry first, so nothing that works today changes.
+
+### 7.7 Compile once per page
+
+- Every module (program or library) is keyed by its content hash
+  (sha-256 of the wasm), not its path: today's key (`wasmprog:<path>`)
+  goes stale when apt replaces a file.
+- The page keeps one map hash → `WebAssembly.Module` for all processes
+  (host.mjs's per-process `#moduleCache` becomes page-wide for these
+  keys) and hands modules to new Workers by reference. A second process
+  running the same program, or any program using the same library, does
+  not compile it again. This helps static programs too (bash exec'd by
+  every `$(...)`), so it lands first, before shared libraries.
+- **Across visits:** a module compiled from `WebAssembly.compileStreaming`
+  of a same-origin URL gets V8's code cache (the optimised code is kept
+  with the HTTP cache entry). The dist ships the image's libraries and
+  hot programs as `wasm/<sha256>.wasm` beside the rootfs; the loader
+  compiles from that URL when the hash matches, and from the bytes in
+  the rootfs otherwise. Same for the providers of §7.9.
+
+### 7.8 Item 3: wasm32 libraries under arm64 programs
+
+- **Layout:** compile the library for aarch64's LP64 layout with clang's
+  `wasm64` target (`long`, pointers, `size_t` 64-bit) plus
+  `-funsigned-char`, and check every exported struct against
+  `aarch64-linux-gnu` (`sizeof`/`offsetof`/alignment; `long double` is
+  16 bytes, `__int128`, `wchar_t`, bitfields) with a layout test.
+- **Addressing:** lower memory64 to the guest's 32-bit memory before
+  shipping (`wasm-opt --memory64-lowering`: every address is an i64 in
+  the code, wrapped to i32 at each access). The one place an address
+  becomes a memory index is that wrap, so the dual heap (a check on high
+  pointers routing them to a second heap) later replaces the lowering
+  pass's wrap and nothing else. Measured cost: the `lp64` row of §7.3.
+- **Loading** is the same `gex-dylink` loader, from the other side: a
+  Debian arm64 object (`libz.so.1`) maps as today; the ELF-provider hook
+  (docs/elf-providers.md) finds a matching wasm library (by soname and
+  version, in `/usr/lib/gex/aarch64/`, packaged as `gex-providers`),
+  loads it with its data from the guest's mmap, and binds each export at
+  the arm64 export's address in the function table, through the AAPCS64
+  adapter of provider.rs (x0-x7, v0-v7; `TPIDR_EL0` for errno). The
+  library's own imports resolve to an **LP64 libc**: first a few
+  functions (malloc/free/memcpy/abort for zlib and zstd, served by the
+  provider heap), later musl built LP64 and lowered the same way, with
+  glibc's aarch64 ABI on top (`struct stat`, `FILE`, `jmp_buf`,
+  `pthread_*_t` sizes, symbol versions, `va_list` as aarch64's struct).
+  Callbacks into translated code go through the provider guest-call path.
+- **Order:** the V8 cost (§7.3, done), zlib end to end under a
+  translated arm64 program (python3.13's zlib module, or `gzip` from
+  Debian), then libzstd, then libc.
+
+### 7.9 Per-function providers in the demo (today)
+
+The existing aarch64 export providers (glibc mem*/str*, printf family,
+malloc, libm: gex-cgen `providers/`) bind only through a function-tier
+unit cache, which the page reaches only with `?cgen=1` and a server for
+`/gex-cgen/`; the static dist has neither, so the demo's translated
+programs run glibc translated. Plan: ship the provider modules in the
+dist (`gex/providers/<name>-<fingerprint>.wasm`, the unit cache's layout,
+preloaded like an ejected page's list) and bind them without units;
+measure apt, python3.13 and sqlite3 in the page with and without.
+
+### 7.10 Order of work
+
+1. Page-wide compiled-module cache keyed by content (§7.7): helps today's
+   static programs.
+2. Providers in the demo (§7.9), measured.
+3. `gex-dylink` loader natively (wasmtime): `NEEDED`, GOT, TLS, fork link
+   map, `dlopen`/`dlsym` (GTK's builder needs the program's own symbols);
+   libc.so; tests/gexcc built shared and static, both passing.
+4. The same in the browser shim; the page's code cache from the dist.
+5. Debian packages shared: libc, libc++, then the large ones (glib/GTK,
+   openssl, python's libpython, ncurses, readline); image sizes and page
+   start-up measured against static.
+6. Item 3: zlib under an arm64 program, then zstd, then LP64 libc.
+
+### 7.11 As built (natively, 2026-10-09)
+
+Step 3 of §7.10 is in: `crates/gex-dylink` (the shared half),
+`shims/native/src/dylink.rs` (the native loader), gexcc's `GEXCC_SHARED=1`,
+musl's `__gex_dsos` registry (our clone's `gex-wasm32-cc` branch).
+tests/gexcc/run.sh passes with `GEXCC_SHARED=1` (every program against
+libc.so) and without. Where it differs from the design above, or adds to it:
+
+- **A library is a plain wasm module** (`\0asm`), not an ELF container:
+  wasm-ld links against it directly, which build systems need. Programs
+  keep their container.
+- **NEEDED is the soname.** wasm-ld records the file name a library was
+  given; gexcc hands it each library as a link named by its soname (the
+  name section's module name, from `-Wl,-soname`), so a program linked
+  against `libfoo.so` (the -dev symlink) needs `libfoo.so.1`.
+- **Self-binding.** wasm-ld calls every weak definition of a shared
+  library through an import of itself, `-Bsymbolic` or not (musl's weak
+  aliases: `malloc`, `lseek`; every C++ inline function). `gex-dylink
+  selfbind` rewrites those into direct calls at build time: the design's
+  "no interposition into a library's own calls" made literal. One case
+  needed care: musl's `__libc_start_main` now calls the `_init` crt1 hands
+  it (in libc.so its own `_init` is libc's dummy).
+- **Function pointers**: every exported function has a slot in its
+  module's range (element positions, then the rest by name), so
+  `GOT.func.f`, `dlsym` and the module's own `&f` agree.
+- **libc.so** (`tools/gexcc/shared/mklibc.sh`, run by install.sh): musl,
+  libgex and libgexcc but the loop safepoint, built by gexcc itself; 800 KB.
+  `libc_nonshared.a` holds what stays in the program (`__main_argc_argv`).
+  The safepoint counter is every module's own (a wasm global cannot be
+  linked through a .so's symbols; libgexcc.a is linked into each module,
+  its symbols hidden). setjmp's tag `__c_longjmp` is imported from libc by
+  every module, so a longjmp crosses modules.
+- **TLS**: a module's `_Thread_local` data works (its block is laid out by
+  libc from the registry); a TLS variable *exported* to another module does
+  not link (wasm-ld has no TLS GOT): export an accessor. A `dlopen`ed
+  library with TLS is refused for now.
+- **Fork summary (`gex.forkreach`)**, the format the page loader also
+  reads: a custom section, UTF-8 text, first line `gex.forkreach 1`, then
+  one export name per line, each an export that may unwind for a fork.
+  gexcc computes it with forkreach.py over the module: reaching
+  `gex.fork_point`, any `env` import the providing library's summary lists
+  (or whose provider is unknown), or any indirect call. Two calls are taken
+  not to reach: libgex's signal-handler call and `pthread_exit`'s cleanup
+  (forking from a signal handler that interrupted a libc call, or from a
+  cancellation cleanup, is unsupported in a shared program). libc.so's
+  summary lists 312 of its exports: stdio (FILE's function pointers),
+  qsort/bsearch, exit, pthread_once, fork; not malloc, the string
+  functions, read/write. Instrumentation is binaryen's
+  `asyncify-relocatable` on the reaching functions (its two globals are the
+  store's, shared by its modules).
+- **dlopen/dlsym**: libgex's dl.c asks the loader (`gex.dlopen`,
+  `gex.dlsym`) after its static registry; handles are 0xfff00000 and up.
+  `dlsym(RTLD_DEFAULT or dlopen(NULL), name)` sees every module's exports,
+  the program's when linked `-rdynamic`, static programs included. Another
+  thread sees a `dlopen`ed module when it next catches up with the function
+  table's log (not yet forced at `dlopen`).
+- **fpcast**: a static `-fgex-fpcast-emu -rdynamic` program (GTK's demos)
+  exports a thunk of each exported function (`__fpcast$name`, `gex-dylink
+  fpcast-prep/-post` around binaryen's pass) and function pointers to its
+  exports are the thunks, so GtkBuilder's handlers found by `dlsym` are
+  called through the uniform signature. Shared and fpcast do not mix yet:
+  every module of a process, libc included, would need the pass with one
+  parameter count.
+- Not yet: the browser shim (`gex.dlopen` answers "not yet" there), C++
+  across modules (libc++ is linked statically into each), shared Debian
+  packages.
+
+### 7.12 Replacing libc.so.6 itself: design, against a narrower step (2026-10-09)
+
+Item 3 now has an LP64 libc *inside* its libraries (musl's `wasm64a64`
+arch, tools/gexcc/item3/sysroot.sh): zlib, zstd (with its worker threads
+and dictionary builder) link it, and nothing of it is visible to the
+guest. The next step §7.8 names is libc.so.6 itself, glibc's, under a
+translated program. What that requires, what a narrower step would do
+instead, and what each buys.
+
+**Where python3 and sqlite3 spend time in libc today.** `gexc run --record`
+(exact block counts, natively; instruction counts are block sizes times
+entries, so these are shares of guest instructions, not of time):
+
+| workload (archbench) | libc.so.6 share | what it is |
+|---|---|---|
+| python3.13 py.py | 0.49% (3.5M of 707M) | pthread_self (500k calls), malloc/free, strerror_r, wcs* |
+| sqlite3 sq.sql | 4.1% (44M of 1090M) | memcpy/memcmp/memset (the page already serves these as intrinsics), malloc/free, pthread_mutex_lock/trylock/unlock |
+
+The program's own code is 95.9% (sqlite) to 99.5% (python): neither is
+libc-bound, so neither replacement moves these two by more than a few
+percent. Programs that would gain are stdio- and formatting-heavy
+(apt/dpkg's text processing, `sort`, `grep` with locales), not these.
+
+**A. Replace libc.so.6 whole** (an LP64 wasm provider bound at every
+export, as libz.so.1 is now). What the guest and its loader see of a libc
+has to stay glibc's, because translated code (the program, every other
+library, ld.so) is compiled against it:
+
+- *Symbol versions.* ~2,900 versioned exports (`memcpy@GLIBC_2.17`,
+  `pthread_cond_wait@@GLIBC_2.17` and its older twins). Binding is by
+  address (libprov), so each version's address gets the right adapter;
+  where two versions differ in behaviour, two adapters.
+- *Data the guest reads directly.* `stdin/stdout/stderr` are glibc
+  `FILE *` that translated code passes to `putc_unlocked`-style macros
+  and reads fields of (`_IO_read_ptr`/`_IO_write_ptr`), `errno` through
+  `__errno_location`, `environ`, `__libc_single_threaded`, `optarg/optind`,
+  `h_errno`, the `ctype` tables behind `__ctype_b_loc` (the guest indexes
+  them inline), `timezone/daylight/tzname`. All of these must be glibc's
+  layout in guest memory, kept current by the wasm side.
+- *TLS and the thread pointer.* glibc's `struct pthread` lives at
+  `TPIDR_EL0` with the stack guard and pointer guard at fixed offsets that
+  translated code reads inline (`-fstack-protector`: `__stack_chk_guard`
+  is a global on aarch64, but `setjmp`'s pointer mangling and the dynamic
+  TLS (`__tls_get_addr`, the DTV) are ld.so's and libc's together).
+  `pthread_t` is the TP-relative struct address; `pthread_mutex_t`,
+  `pthread_cond_t`, `pthread_attr_t`, `sem_t` are caller-allocated with
+  glibc's sizes (mutex 48 bytes, cond 48, attr 64) and static initializers
+  baked into translated code. Our implementation must use those layouts
+  (or keep a side table keyed by address).
+- *ld.so.* glibc's ld.so and libc.so.6 are one unit: `_rtld_global`,
+  `_dl_*` hooks, `__libc_early_init`, `dl_iterate_phdr`, `dlopen`
+  (`libdl` is in libc since 2.34) share private structures. Either ld.so
+  stays translated and our libc implements its private interface
+  (GLIBC_PRIVATE exports: dozens, undocumented, version-specific), or ld.so
+  is replaced too, which means our own loader for translated ELF objects
+  (gex-ld has the parts: relocation, symbol lookup, TLS) inside the guest.
+- *Signals.* Handlers are translated code; `sigaction`'s `SA_RESTORER`,
+  `ucontext_t` (aarch64 `mcontext` with the FP/SIMD record) must be the
+  kernel's. Delivery at a wasm libc's syscall works now (rtmusl.c runs the
+  handler as a guest call and sigreturns); a signal while wasm code runs
+  long (a big `qsort`) waits for the next syscall.
+- *setjmp/longjmp crossing.* A translated `longjmp` over wasm frames (a
+  `qsort` comparator, a `bsearch`, `pthread_once`, `atexit` handlers
+  that longjmp) must unwind the wasm stack: the provider's `provider_try`
+  / exception tag path (Unity's) handles throws through provider frames;
+  `jmp_buf` itself is glibc's 22-word aarch64 layout with mangled SP/LR.
+- *fork.* Done for a provider's heap and state (be9eba23); with all of
+  libc in wasm, `fork`'s atfork handlers and the stdio locks are ours.
+- *Locale and iconv.* glibc's locale archive format, `LC_*` categories
+  and gconv modules (dlopen'd .so's, translated) would be ours or
+  re-implemented over musl's much smaller set; programs expecting glibc
+  collation would see differences.
+
+Size: weeks of agent time, mostly in the glibc-compat layer, with a long
+tail of programs that depend on a glibc detail; and the gain on the two
+measured workloads is at most their 0.5% and 4%.
+
+**B. The narrower step: more libc exports as per-function providers**
+(docs/elf-providers.md: bound by address, the rest of glibc stays
+translated and owns its state). What exists: mem*/str* (served as
+intrinsics or `glibc_mem_a64.inc`), printf's formatting core
+(`glibc_printf.c`, x86_64), libm, and a malloc family (`glibc_malloc.c`,
+which measured no faster than translated ptmalloc: 177 vs 175 ms for 400k
+pairs, so it is not registered). Candidates by the profile above:
+`pthread_mutex_*` (sqlite: 3.4M calls; the uncontended path is a CAS that
+tier 1 translates well already), `pthread_self` (python: 500k, already
+two instructions), `strtod`/`printf` family and `qsort` for text tools.
+Each is a few hundred lines with the stateless/stateful rules elf-providers
+already has, and each is measured alone. Gain: a few percent at most on
+python3/sqlite3; more on formatting-heavy tools.
+
+**C. What actually moves these workloads** is the program's own code: the
+function JIT and AOT tiers on python3.13 (99.5%) and libsqlite3 (95.9%),
+and whole libraries as wasm providers where a library is the hot part
+(item 3's zlib under python3.13: compress 1.73x faster than translated,
+306 vs 530 ms; zstd level 3 at tier 1: 3.6x faster than translated, 23 vs
+82 ms; edger, medians of an ABBA set). libsqlite3 itself is a pure-C ABI like zlib's and
+could be the next item-3 library: 96% of sqlite3's instructions.
+
+**Recommendation:** not A for now. B only per measured hot function. Make
+libsqlite3 the next item-3 library, and keep the LP64 libc as the inside
+of such libraries.
+
+**Decision (user, 2026-10-09): libraries, not libc.** libc.so.6 is not
+replaced. Whole hot libraries become item-3 providers on the LP64 libc
+(libsqlite3 next), and per-function libc providers are added only where a
+profile shows a hot spot.
+
+### 7.13 libsqlite3: function pointers across the boundary (2026-10-09)
+
+`tools/gexcc/item3/build-sqlite.sh` builds Debian's libsqlite3 (3.46.1, the
+amalgamation with debian/rules's options and what its configure adds: FTS3/4/5,
+RTREE, JSON, SESSION, threadsafe) on the LP64 libc. It replaces
+libsqlite3.so.0 under Debian's arm64 sqlite3 shell, bound by soname from
+`/usr/lib/gex/aarch64/libsqlite3.so.0.wasm`. 284 exports have adapters
+(everything the build defines). Unlike zlib's and zstd's API, sqlite's has
+callbacks in both directions, plus doubles and varargs:
+
+- **Exits** (the library calls the guest). sqlite stores and calls the
+  caller's function pointers: sqlite3_exec's callback, the methods of a
+  virtual table module (the shell's generate_series), application SQL
+  functions (the shell's ieee754, decimal, sha3), destructors, and a
+  registered vfs. The pass `item3/a64icall/GexA64Icall.cpp` is the arm64
+  counterpart of Wine's ICALL pass, and every indirect call goes through it:
+  `__a64_set_icall_target(p); callee = p < 0x3f0000 ? p : __a64x.<sig>`.
+  A table index (the library's own function) is called directly. A guest
+  address goes to an exit stub, one per signature, that lays the arguments
+  out as AAPCS64 does and calls `a64_call_guest_regs`:
+  - integers and pointers go in x0-x7, floating point in v0-v7, and the
+    rest in 8-byte stack slots below the guest's SP;
+  - the guest's x30 and SP are restored afterwards.
+  In sqlite3.c that is 5187 call sites. 23 are left alone (byval or
+  variadic: only the library's own functions are called through those).
+- **Entries** (the guest calls the library's function pointers). Examples
+  are the methods of `sqlite3_vfs_find("unix")`, which the shell's
+  appendvfs calls, and the io methods of a file it opened. Every
+  address-taken function gets an F_body entry thunk: it reads the AAPCS64
+  arguments, calls the function, and returns in x0 or v0. That is 895 in
+  sqlite3.c. Their {function, thunk} pairs go in the data section
+  `gexa_entries` (exported bounds `__gexa_entries`, `gexa.c`). After the
+  install, the shell (`gex_libprov_installed`) binds each thunk at its
+  function's table index as a guest address, through wasmdll's late
+  binding. Table indices are below 0x3f0000, and guest code is above it.
+- **Varargs.** sqlite3_mprintf, sqlite3_config, sqlite3_db_config and the
+  other variadic exports, plus the va_list ones (sqlite3_vmprintf, which
+  the shell calls with its own va_list), go through `gexva.h`. It is
+  force-included and turns sqlite's `va_list` into a two-kind struct:
+  - kind 0 is wasm's own varargs, for the library's calls among its own
+    functions;
+  - kind 1 is an AAPCS64 va_list (`__stack`, `__gr_top`, `__vr_top` and
+    the offsets), read as aarch64 code would read it.
+
+  A variadic export's adapter announces the guest's call by name
+  (`gexva_pending`). The export's `va_start` takes the announcement when
+  `__func__` matches, and snapshots x0-x7 and v0-v7 from the context. A
+  va_list argument is the guest's own struct (passed by reference, being
+  over 16 bytes).
+- **Doubles** are v registers both ways (`a64_varg_double`, `a64_ret_v`).
+- **compiler-rt's tf2 comparisons** (`__lttf2`...) are typed `long` for
+  every LP64 target but aarch64, while clang's wasm64 calls expect `int`.
+  The signature mismatch became a trap stub in the link, so sysroot.sh now
+  builds them from a patched copy.
+
+Checked: the shell's output is identical, translated against the provider,
+on sq.sql and on a callback-heavy script (cb.sql). That script covers
+generate_series, ieee754/decimal, sha3_query (a guest function that calls
+back into prepare/step), box mode, `.schema`, FTS5, `.dbinfo`, `.stats`,
+and a file database (the unix vfs, locks, journal). The only difference is
+`.stats`'s memory lines, by 8 bytes: Debian's build sizes allocations with
+glibc's malloc_usable_size.
+
+Measured (edger, run-sqlite.sh: the browser runtime under node, one ABBA
+set, medians of two runs; sq.sql makes 100k rows, an index, a LIKE scan and
+a GROUP BY). The time is the statements' summed real time from sqlite's
+timer:
+
+| tier | translated | provider | provider vs translated | wall, translated vs provider |
+|---|---|---|---|---|
+| tier 1 (the page's default) | 7712 ms | 666.5 ms | 11.6x faster | 10288 vs 2627 ms |
+| function JIT | 13201 ms | 1309.5 ms | 10.1x faster | 18872 vs 5741 ms |
+
+The output is the same in every run. The function JIT is slower than tier 1
+here in both modes (13.2 vs 7.7 s translated, 1.31 vs 0.67 s provider),
+which is open.
+
+**Fork across a provider.** A fork's child installs each inherited provider
+at its parent's table base (`publish_at`; the base is kept at offset 8 of
+the provider's code page, which the child inherits). The data the child
+copied holds the parent's function pointers: zlib's `zalloc = zcalloc` in an
+open stream, and sqlite's methods. Before this, a program exec'd from a
+shell got a different base in its child, so zlib's own allocator looked like
+a guest function.
+
+**In the image.** `tools/gexcc/item3/mkdeb.sh` builds the three providers
+into the package `gex-providers-arm64` (/usr/lib/gex/aarch64/*.wasm).
+web/build-native-debian.sh (and scratch/CC/mkgui.sh) put it in the pool, so
+the native-debian images carry it, and an arm64 program that maps one of
+the libraries (apt's libz and libzstd) gets the provider by default.
+
+**Gate leg:** `tests/gexcc/item3/run.sh GEXC`. It builds the providers, zt
+and zstt, then runs every check twice, translated and with the providers,
+each time in one guest process tree under a wasm32 dash: zt check/checkgz,
+zstt check/checkd/checkm, and sqlite3 on sq.sql and cb.sql. It passes when
+19 checks say ok in both modes, all three libraries are replaced in the
+provider run only, and the sqlite3 output matches.

@@ -805,6 +805,78 @@ build_chocolate_doom() {
   rm -rf $DEST/usr/share/man $DEST/usr/share/doc
 }
 
+# -- gtk: GTK 3 on Wayland (static) -----------------------------------------
+
+# a library: meson, everything static, installed into the sysroot only
+ms_lib() { ms_setup "$@"; meson compile -C build; DESTDIR=$SYSROOT ms_install; }
+
+build_libpng1_6() { at_lib --disable-tests --disable-tools; rm -rf $DEST; mkdir -p $DEST; }
+build_fribidi() { ms_lib -Ddocs=false -Dbin=false -Dtests=false; }
+build_glib2_0() {
+  # no gobject-introspection, no SELinux/xattr/libmount, no translations
+  ms_lib -Dselinux=disabled -Dxattr=false -Dlibmount=disabled -Dman-pages=disabled -Dsysprof=disabled \
+    -Ddocumentation=false -Dtests=false -Dnls=disabled -Dlibelf=disabled -Dintrospection=disabled \
+    -Ddtrace=disabled -Dsystemtap=disabled
+}
+build_harfbuzz() {
+  ms_lib -Dglib=enabled -Dgobject=disabled -Dcairo=disabled -Dchafa=disabled -Dicu=disabled \
+    -Dgraphite=disabled -Dgraphite2=disabled -Dfreetype=enabled -Dwasm=disabled -Dtests=disabled \
+    -Dintrospection=disabled -Ddocs=disabled -Dutilities=disabled -Dbenchmark=disabled
+}
+build_cairo() {
+  ms_lib -Dxcb=disabled -Dxlib=disabled -Dxlib-xcb=disabled -Dquartz=disabled -Ddwrite=disabled \
+    -Dfontconfig=enabled -Dfreetype=enabled -Dpng=enabled -Dzlib=enabled -Dglib=enabled -Dtests=disabled \
+    -Dlzo=disabled -Dgtk2-utils=disabled -Dspectre=disabled -Dsymbol-lookup=disabled -Dgtk_doc=false
+}
+build_pango1_0() {
+  ms_lib -Ddocumentation=false -Dman-pages=false -Dintrospection=disabled -Dbuild-testsuite=false \
+    -Dbuild-examples=false -Dfontconfig=enabled -Dsysprof=disabled -Dlibthai=disabled -Dcairo=enabled \
+    -Dxft=disabled -Dfreetype=enabled
+}
+build_gdk_pixbuf() {
+  # the loaders linked in (no modules to dlopen)
+  ms_lib -Dpng=enabled -Djpeg=disabled -Dtiff=disabled -Dgif=enabled -Dothers=enabled \
+    -Dbuiltin_loaders=all -Dgtk_doc=false -Ddocs=false -Dintrospection=disabled -Dman=false \
+    -Dtests=false -Dinstalled_tests=false -Dgio_sniffing=false -Dc_link_args='-lpng16 -lz'
+  # (a built-in loader's libpng is not among the static library's
+  # dependencies: say so in its .pc for what links it)
+  sed -i 's/^Requires.private: *\(.*\)/Requires.private: libpng16, \1/' $SYSROOT/usr/lib/pkgconfig/gdk-pixbuf-2.0.pc
+  grep -q '^Requires.private:' $SYSROOT/usr/lib/pkgconfig/gdk-pixbuf-2.0.pc ||
+    echo 'Requires.private: libpng16' >> $SYSROOT/usr/lib/pkgconfig/gdk-pixbuf-2.0.pc
+}
+build_at_spi2_core() {
+  # ATK only (GTK 3 needs its API; the AT-SPI bridge is X11's)
+  ms_lib -Datk_only=true -Ddocs=false -Dintrospection=disabled -Dx11=disabled -Duse_systemd=false
+}
+build_libglvnd() {
+  # the Khronos EGL headers only (epoxy's EGL dispatch includes them); no
+  # libEGL: wasm32 programs have no GL driver to dispatch to yet
+  for h in EGL/egl.h EGL/eglext.h EGL/eglplatform.h KHR/khrplatform.h; do
+    install -Dm644 include/$h $SYSROOT/usr/include/$h
+  done
+}
+build_libepoxy() {
+  # EGL dispatch built (GDK's Wayland backend includes it); nothing loads a
+  # GL library here, so asking for a context fails at run time
+  ms_lib -Dglx=no -Degl=yes -Dx11=false -Dtests=false -Ddocs=false; }
+build_gtk_3_0() {
+  # Wayland only, input methods linked in; the demos are the programs
+  # GObject's class and instance init functions are called with more
+  # arguments than G_DEFINE_TYPE's take (and signal handlers likewise): wasm
+  # traps on such a call, so the programs link with cast emulation
+  export GEXCC_FPCAST=1
+  # (its own protocol code: find_program, the build machine's scanner)
+  export PATH=$GEXCC_DEB/host/bin:$PATH
+  ms_setup -Dx11_backend=false -Dwayland_backend=true -Dbroadway_backend=false -Dxinerama=no \
+    -Dcloudproviders=false -Dprofiler=false -Dtracker3=false -Dprint_backends=file -Dcolord=no \
+    -Dgtk_doc=false -Dman=false -Dintrospection=false -Ddemos=true -Dexamples=false -Dtests=false \
+    -Dinstalled_tests=false -Dbuiltin_immodules=yes
+  meson compile -C build
+  ms_both
+  # the settings schemas, compiled as libglib2.0's trigger would
+  glib-compile-schemas $DEST/usr/share/glib-2.0/schemas
+}
+
 # -- tier 2: perl -------------------------------------------------------------
 
 build_perl() {

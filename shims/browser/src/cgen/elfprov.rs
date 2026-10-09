@@ -40,7 +40,7 @@ static PID: AtomicI32 = AtomicI32::new(0);
 static OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn on() -> bool {
-    super::on() && gex_cgen::provider::enabled() && !OFF.load(Ordering::Relaxed)
+    super::providers_on() && gex_cgen::provider::enabled() && !OFF.load(Ordering::Relaxed)
 }
 
 /// No ELF export providers in this process (A/B runs): before it maps any.
@@ -204,10 +204,14 @@ fn unbind_overlapped(m: &gex_kernel::CodeMap, trace: bool) {
 /// it inherited.
 #[no_mangle]
 pub extern "C" fn gex_elfprov_wanted() -> i32 {
-    if !on() {
-        return lock(&QUEUE).pop_front().map_or(-1, |u| u as i32);
+    if on() {
+        rescan_if_new();
     }
-    rescan_if_new();
+    // Replaced libraries too, with providers on or off (after the rescan,
+    // which starts the queue over).
+    if let Some(u) = super::libprov::rescan_if_new() {
+        lock(&QUEUE).push_back(u);
+    }
     lock(&QUEUE).pop_front().map_or(-1, |u| u as i32)
 }
 

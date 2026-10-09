@@ -23,6 +23,7 @@ pub mod profile;
 pub mod nt;
 pub mod nt_cgen;
 pub mod wasmprog;
+pub(crate) mod dylink;
 pub mod wasmdll;
 mod ready;
 mod sys_waits;

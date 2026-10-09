@@ -18,8 +18,14 @@ SEED=$ROOT/web/public/gex/seed$INFIX.shared.wasm
 [ -f "$SEED" ] || { echo "no $SEED: GEX_ARCH=x86 GEX_SHARED=1 shims/browser/build.sh, gexc seed -o $SEED" >&2; exit 2; }
 WORK=${WORK:-$(mktemp -d)}
 fail=0
+# GEXCC_SHARED=1: the programs link against libc.so, which the guest gets
+# where gex's loader looks
+LIBC=
+if [ "${GEXCC_SHARED:-0}" = 1 ]; then
+    LIBC="--file /usr/lib/wasm32-linux-musl/libc.so=$(dirname "$(command -v gexcc)")/../sysroot/lib/libc.so"
+fi
 run() {
-    GEX_ARCH=$ARCH GEX_SHARED=1 timeout "${TMO:-300}" node "$ROOT/shims/browser/js/run-node.mjs" "$@" 2>/dev/null | grep -v '^\[host\]\|^\[gex\] \|^\[worker\] \|^\[gex-console'
+    GEX_ARCH=$ARCH GEX_SHARED=1 timeout "${TMO:-300}" node "$ROOT/shims/browser/js/run-node.mjs" $LIBC "$@" 2>/dev/null | grep -v '^\[host\]\|^\[gex\] \|^\[worker\] \|^\[gex-console'
 }
 for src in "$HERE"/*.c "$HERE"/*.cpp; do
     case $src in *.cpp) name=$(basename "$src" .cpp); hcc=c++; gcc_=gexc++ ;; *) name=$(basename "$src" .c); hcc=cc; gcc_=gexcc ;; esac

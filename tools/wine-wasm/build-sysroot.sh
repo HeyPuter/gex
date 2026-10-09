@@ -23,6 +23,9 @@ JOBS=${JOBS:-4}
 if [ -n "${GEX_WASM_LEGACY_EH:-}" ]; then
   WASM_CFLAGS=$(printf '%s' "$WASM_CFLAGS" | sed 's/-wasm-use-legacy-eh=false/-wasm-use-legacy-eh=true/')
 fi
+# GEX_WASM_EXTRA_CFLAGS (gexcc: -fvisibility=default, so the same objects
+# make libc.so, docs/gexcc.md §7.4): appended to every compile here.
+WASM_CFLAGS="$WASM_CFLAGS${GEX_WASM_EXTRA_CFLAGS:+ $GEX_WASM_EXTRA_CFLAGS}"
 mkdir -p "$OUT/musl-build" "$OUT/crt-build" "$OUT/sysroot/lib"
 
 cd "$OUT/musl-build"

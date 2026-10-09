@@ -83,3 +83,15 @@ libsdl2        2.32.4+dfsg-1                  gui
 libsdl2-net    2.2.0+dfsg-3                   gui
 libsdl2-mixer  2.8.1+dfsg-2                   gui
 chocolate-doom 3.1.0-1                        gui
+# gtk: GTK 3 on Wayland (static; gtk3-widget-factory and gtk3-demo)
+libpng1.6      1.6.48-1+deb13u5               gtk
+fribidi        1.0.16-1                       gtk
+glib2.0        2.84.4-3~deb13u5               gtk
+harfbuzz       10.2.0-1+deb13u1               gtk
+cairo          1.18.4-1                       gtk
+pango1.0       1.56.3-1                       gtk
+gdk-pixbuf     2.42.12+dfsg-4+deb13u1         gtk
+at-spi2-core   2.56.2-1+deb13u2               gtk
+libglvnd       1.7.0-1                        gtk
+libepoxy       1.5.10-2                       gtk
+gtk+3.0        3.24.49-3                      gtk

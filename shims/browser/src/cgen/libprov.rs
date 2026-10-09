@@ -9,6 +9,11 @@
 //! low guest memory, its bytes in the shim's heap for every Worker to
 //! instantiate (`gex.mjs` `#cgenInstall`, with the wasm64 `provider_*` imports).
 //!
+//! A library nothing names is replaced all the same when the guest's
+//! filesystem has a provider installed for its soname, under
+//! `/usr/lib/gex/<arch>/<soname>.wasm` (`libz.so.1.wasm` for an arm64
+//! program's `libz.so.1`); `noauto` in the list turns that off.
+//!
 //! The protocol with `gex.mjs` (`#cgenProviders`):
 //!   - a unit's provider `i` with `gex_cgen_provider_libprov(u, i)` set is
 //!     published by `gex_libprov_publish(u, i)`, which returns its provider
@@ -36,7 +41,24 @@ struct LinuxProv {
     data: u64,
     /// Its provider module number once published.
     number: Option<u32>,
+    /// Its function-table install, once published.
+    install: u32,
+    /// Whether its entry thunks are bound (`gex_libprov_installed`).
+    bound: bool,
+    /// Its code page (0 without one), where its table base is kept for a
+    /// fork's child ([`BASE_AT`]).
+    code: u64,
+    /// In a fork's child: the parent's table base, which the copied data's
+    /// function pointers (zlib's `zalloc = zcalloc`, sqlite's methods) hold.
+    want_base: Option<u32>,
 }
+
+/// Where in a provider's code page its table base is kept (`"GEXB"`, then
+/// the base): the code page is the child's copy, as its data is. The first
+/// 0x100 bytes are never a bound address that runs (the thread entry is at
+/// offset 0 only).
+const BASE_AT: u64 = 8;
+const BASE_MAGIC: u32 = u32::from_le_bytes(*b"GEXB");
 
 static LIBS: Mutex<Vec<LinuxProv>> = Mutex::new(Vec::new());
 
@@ -62,13 +84,56 @@ pub extern "C" fn gex_libprov_config(ptr: u32, len: u32) {
     let spec = String::from_utf8_lossy(&crate::guest_bytes()[ptr as usize..ptr as usize + len as usize]).into_owned();
     let mut v = lock(&DLLS);
     for item in spec.split(',') {
-        if let Some((so, path)) = item.split_once('=') {
+        if item.trim() == "noauto" {
+            AUTO.store(false, Ordering::Relaxed);
+        } else if let Some((so, path)) = item.split_once('=') {
             let pair = (so.trim().to_string(), path.trim().to_string());
             if !v.contains(&pair) {
                 v.push(pair);
             }
         }
     }
+}
+
+/// Whether a library nothing names is replaced by the provider installed
+/// for its soname (`noauto` in the list turns it off).
+static AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Where the guest's filesystem holds providers: `<dir>/<arch>/<soname>.wasm`
+/// (`/usr/lib/gex/aarch64/libz.so.1.wasm`), the arch the ELF machine's.
+pub(crate) const PROVIDER_DIR: &str = "/usr/lib/gex";
+
+/// Sonames already looked for under [`PROVIDER_DIR`], and what was found.
+static AUTO_SEEN: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
+
+/// The provider installed for the library mapped from `path` (file name
+/// `file`), if there is one: an ELF shared object whose machine has a
+/// directory under [`PROVIDER_DIR`] holding `<file>.wasm`.
+fn installed(path: &str, file: &str) -> Option<String> {
+    if !AUTO.load(Ordering::Relaxed) || !file.contains(".so") {
+        return None;
+    }
+    let key = format!("{path}\0{file}");
+    if let Some((_, r)) = lock(&AUTO_SEEN).iter().find(|(k, _)| *k == key) {
+        return r.clone();
+    }
+    let found = crate::with_host(|h| {
+        let mut ehdr = [0u8; 20];
+        if h.kernel.read_file_at(path, 0, &mut ehdr) != Some(20) || ehdr[..4] != *b"\x7fELF" {
+            return None;
+        }
+        let arch = match u16::from_le_bytes([ehdr[18], ehdr[19]]) {
+            183 => "aarch64",
+            62 => "x86_64",
+            3 => "i386",
+            _ => return None,
+        };
+        let wasm = format!("{PROVIDER_DIR}/{arch}/{file}.wasm");
+        let mut magic = [0u8; 4];
+        (h.kernel.read_file_at(&wasm, 0, &mut magic) == Some(4) && magic == *b"\0asm").then_some(wasm)
+    });
+    lock(&AUTO_SEEN).push((key, found.clone()));
+    found
 }
 
 /// Whether `addr` is in a replaced library's text.
@@ -111,19 +176,62 @@ fn alloc_low(size: u64, prot: u32, name: &str) -> Result<u64, String> {
     crate::with_host(|h| h.kernel.mem.mmap_low(0, len, prot, flags::PRIVATE | flags::ANONYMOUS, name)).map_err(|e| format!("mapping {name}: errno {}", e.0))
 }
 
+/// A forked child's copy of the mapping [`alloc_low`] made in its parent
+/// (by name): the provider's data, heap and code page are the child's as
+/// the rest of its memory is.
+fn inherited(name: &str) -> Option<u64> {
+    crate::with_host(|h| h.kernel.mem.vmas().iter().find(|v| v.name == name).map(|v| v.start))
+}
+
+/// The process the state above is for: a forked child's shim starts with
+/// none of it (or its parent's copy), while its memory holds the parent's
+/// replaced libraries, their providers' data and heap, and the guest's
+/// pointers into them.
+static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Before a Worker's guest first runs (`gex_elfprov_wanted`): in a new
+/// process, the replaced libraries it inherited are bound again, over the
+/// data and code page its parent made (a child must not start a provider
+/// over: an open `z_stream` points into its heap). Returns a unit to serve.
+pub(crate) fn rescan_if_new() -> Option<usize> {
+    let pid = crate::with_host(|h| h.kernel.pid);
+    let was = PID.swap(pid, Ordering::AcqRel);
+    if was == pid || (lock(&DLLS).is_empty() && !AUTO.load(Ordering::Relaxed)) {
+        return None;
+    }
+    lock(&LIBS).clear();
+    lock(&REPLACED).clear();
+    THREAD_ENTRY.store(0, Ordering::Release);
+    let mapped: Vec<gex_kernel::CodeMap> = crate::with_host(|h| {
+        use gex_kernel::mem::prot;
+        h.kernel
+            .mem
+            .vmas()
+            .iter()
+            .filter(|v| v.prot & prot::EXEC != 0)
+            .filter_map(|v| v.code.as_ref().map(|(p, off)| gex_kernel::CodeMap { start: v.start, end: v.end, path: p.clone(), offset: *off }))
+            .collect()
+    });
+    maps(&mapped)
+}
+
 /// After a syscall that mapped code: a replaced library becomes a unit with
 /// one provider for JS to serve (`elfprov`'s queue). Returns whether one was
 /// queued.
 pub(crate) fn maps(mapped: &[gex_kernel::CodeMap]) -> Option<usize> {
     let dlls = lock(&DLLS).clone();
-    if dlls.is_empty() {
+    if dlls.is_empty() && !AUTO.load(Ordering::Relaxed) {
         return None;
+    }
+    if PID.load(Ordering::Acquire) == 0 {
+        PID.store(crate::with_host(|h| h.kernel.pid), Ordering::Release);
     }
     let mut queued = None;
     for m in mapped {
         let file = m.path.rsplit('/').next().unwrap_or(&m.path);
-        let Some((_, wasm_path)) = dlls.iter().find(|(so, _)| so == file) else { continue };
-        match prepare(m, wasm_path) {
+        let named = dlls.iter().find(|(so, _)| so == file).map(|(_, w)| w.clone());
+        let Some(wasm_path) = named.or_else(|| installed(&m.path, file)) else { continue };
+        match prepare(m, &wasm_path) {
             Ok(Some(u)) => queued = Some(u),
             Ok(None) => {}
             Err(e) => {
@@ -166,8 +274,21 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
             }
         }
     }
+    let mut code = 0;
+    let mut want_base = None;
     if let Some(k) = slot("__gex_thread_start") {
-        let at = alloc_low(CODE_PAGE, gex_kernel::mem::prot::READ, &format!("[provider {file} code]", file = wasm_path))?;
+        let name = format!("[provider {wasm_path} code]");
+        let at = match inherited(&name) {
+            Some(a) => {
+                let gm = GuestMem::new(crate::guest_bytes());
+                if gm.read_u32(a + BASE_AT).ok() == Some(BASE_MAGIC) {
+                    want_base = gm.read_u32(a + BASE_AT + 4).ok();
+                }
+                a
+            }
+            None => alloc_low(CODE_PAGE, gex_kernel::mem::prot::READ, &name)?,
+        };
+        code = at;
         pairs.push((at, k));
         THREAD_ENTRY.store(at, Ordering::Release);
         if let Some(r) = slot("gexp__reverse") {
@@ -189,12 +310,16 @@ fn prepare(m: &gex_kernel::CodeMap, wasm_path: &str) -> Result<Option<usize>, St
     lock(&MISSING).get_or_insert_with(Default::default).extend(unprovided);
     let (size, align) = dylink_memory(&wasm)?;
     let a = 1u64 << align;
-    let data = alloc_low((size as u64).max(16) + a, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE, &format!("[provider {wasm_path} data]"))?;
+    let name = format!("[provider {wasm_path} data]");
+    let data = match inherited(&name) {
+        Some(d) => d,
+        None => alloc_low((size as u64).max(16) + a, gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE, &name)?,
+    };
     let data = (data + a - 1) & !(a - 1);
     crate::warn_line(&format!("gex: {} replaced by {wasm_path}: {} addresses bound, data at {data:#x}\n", m.path, pairs.len()));
     let index = {
         let mut libs = lock(&LIBS);
-        libs.push(LinuxProv { path: m.path.clone(), wasm, pairs, data, number: None });
+        libs.push(LinuxProv { path: m.path.clone(), wasm, pairs, data, number: None, install: 0, bound: false, code, want_base });
         libs.len() - 1
     };
     let u = {
@@ -246,7 +371,22 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
         }
     };
     let number = lock(&PROVIDERS).len() as u32;
-    ftab(|t| t.publish(len, PROVIDER | number, Tier::Unit, &l.pairs));
+    l.install = ftab(|t| match l.want_base {
+        Some(base) => {
+            let (n, ok) = t.publish_at(base, len, PROVIDER | number, Tier::Unit, &l.pairs);
+            if !ok {
+                crate::warn_line(&format!("gex: {}: fork child: table base {base} is taken, its function pointers will be wrong\n", l.path));
+            }
+            n
+        }
+        None => t.publish(len, PROVIDER | number, Tier::Unit, &l.pairs),
+    });
+    if l.code != 0 {
+        let base = ftab(|t| t.install(l.install).base);
+        let mut gm = GuestMem::new(crate::guest_bytes());
+        let _ = gm.write_u32(l.code + BASE_AT, BASE_MAGIC);
+        let _ = gm.write_u32(l.code + BASE_AT + 4, base);
+    }
     let addrs: Vec<u64> = l.pairs.iter().map(|&(a, _)| a).collect();
     let mem = crate::guest_bytes();
     for &a in &addrs {
@@ -256,6 +396,48 @@ pub extern "C" fn gex_libprov_publish(u: u32, i: u32) -> i32 {
     lock(&PROVIDERS).push(ProviderModule { file: format!("libprov:{}", l.path), regs, dirs, slots, memory_base: l.data as u32 });
     l.number = Some(number);
     number as i32
+}
+
+/// The publishing Worker instantiated provider module `number` (its data is
+/// relocated): when it is a replaced library's, bind the entry thunks of its
+/// GexA64Icall pass (item3/a64icall): `__gexa_entries` is the bounds of its
+/// {function, thunk} pairs (i64 table indices), and each thunk is bound at
+/// its function's index as a guest address, so the guest's call through a
+/// function pointer the library gave it (a vfs method) runs the function.
+/// Once a process.
+#[no_mangle]
+pub extern "C" fn gex_libprov_installed(number: u32) {
+    let (install, data, off, path) = {
+        let mut libs = lock(&LIBS);
+        let Some(l) = libs.iter_mut().find(|l| l.number == Some(number)) else { return };
+        if std::mem::replace(&mut l.bound, true) {
+            return;
+        }
+        let Ok(exports) = super::wasmdll::exported_offsets(&l.wasm) else { return };
+        let Some(&off) = exports.get("__gexa_entries") else { return };
+        (l.install, l.data, off, l.path.clone())
+    };
+    let gm = GuestMem::new(crate::guest_bytes());
+    let at = data + off as u64;
+    let (start, stop) = (gm.read_u64(at).unwrap_or(0), gm.read_u64(at + 8).unwrap_or(0));
+    if start == 0 || stop <= start {
+        return;
+    }
+    let base = ftab(|m| m.install(install).base) as u64;
+    let code = THREAD_ENTRY.load(Ordering::Relaxed);
+    let mut pairs = Vec::new();
+    let mut a = start;
+    while a + 16 <= stop {
+        let (f, t) = (gm.read_u64(a).unwrap_or(0), gm.read_u64(a + 8).unwrap_or(0));
+        a += 16;
+        // (an index the code page's addresses also are would be ambiguous)
+        if f < base || t < base || f >= 0x3f0000 || (code != 0 && f >= code && f < code + CODE_PAGE) {
+            continue;
+        }
+        pairs.push((f, (t - base) as u32));
+    }
+    crate::warn_line(&format!("gex: {path}: {} entry thunks bound\n", pairs.len()));
+    super::wasmdll::bind(install, &pairs);
 }
 
 /// The module bytes of provider module `number` when it is a replaced
