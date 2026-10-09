@@ -569,6 +569,7 @@ dependencies = [
  "gex-abi",
  "gex-atomic",
  "gex-cgen",
+ "gex-dylink",
  "gex-emit",
  "gex-kernel",
  "gex-key",
