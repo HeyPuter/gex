@@ -87,8 +87,10 @@ def main():
     rules = split_rules(a.srcpkg)
     owned = {b: [] for b, _ in rules}
     for root, dirs, files in os.walk(a.stage):
-        for n in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
-            rel = os.path.relpath(os.path.join(root, n), a.stage)
+        # (an empty directory is part of a package too: python's lib-dynload)
+        empty = [] if (files or dirs or root == a.stage) else ['']
+        for n in files + [d for d in dirs if os.path.islink(os.path.join(root, d))] + empty:
+            rel = os.path.relpath(os.path.join(root, n) if n else root, a.stage)
             if any(fnmatch.fnmatch(rel, g) for g in DROP):
                 continue
             for b, globs in rules:
@@ -111,17 +113,19 @@ def main():
             for rel in rels:
                 s, d = os.path.join(a.stage, rel), os.path.join(t, rel)
                 os.makedirs(os.path.dirname(d), exist_ok=True)
-                if os.path.islink(s):
+                if os.path.isdir(s) and not os.path.islink(s):
+                    os.makedirs(d, exist_ok=True)
+                elif os.path.islink(s):
                     os.symlink(os.readlink(s), d)
                 else:
                     shutil.copy2(s, d)
             size = sum(os.path.getsize(os.path.join(t, r)) for r in rels
-                       if not os.path.islink(os.path.join(t, r))) // 1024
+                       if os.path.isfile(os.path.join(t, r)) and not os.path.islink(os.path.join(t, r))) // 1024
             os.makedirs(os.path.join(t, 'DEBIAN'))
             md5 = []
             for rel in sorted(rels):
                 p = os.path.join(t, rel)
-                if not os.path.islink(p):
+                if os.path.isfile(p) and not os.path.islink(p):
                     md5.append(f'{hashlib.md5(open(p, "rb").read()).hexdigest()}  {rel}')
             open(os.path.join(t, 'DEBIAN', 'md5sums'), 'w').write('\n'.join(md5) + '\n')
             ctl = [f'Package: {b}', f'Source: {a.srcpkg}' + (f' ({a.version})' if a.version else ''),
