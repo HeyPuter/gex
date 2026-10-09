@@ -987,7 +987,20 @@ pub fn translate(
         // multiplexes calls glibc no longer makes through it.
         x::RECVMMSG | x::SOCKETCALL => UNKNOWN,
         x::REBOOT => nr::REBOOT,
-        x::STATFS | x::FSTATFS | x::STATFS64 | x::FSTATFS64 => UNKNOWN,
+        // statfs64(path, size, buf) / fstatfs64(fd, size, buf): the 64-bit
+        // layout (musl's `struct statfs`), written in its 32-bit form under
+        // `compat` (apt checks for room before it downloads). The old
+        // statfs/fstatfs with 32-bit counts are not made by musl.
+        x::STATFS64 => {
+            a[1] = a[2];
+            nr::STATFS
+        }
+        x::FSTATFS64 => {
+            a[0] = sext(a[0]);
+            a[1] = a[2];
+            nr::FSTATFS
+        }
+        x::STATFS | x::FSTATFS => UNKNOWN,
         x::TRUNCATE | x::TRUNCATE64 | x::GETDENTS => UNKNOWN,
         _ => UNKNOWN,
     };
