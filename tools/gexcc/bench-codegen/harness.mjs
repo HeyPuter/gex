@@ -9,6 +9,8 @@ const sets = {
   static: [['static.wasm', 'static']], pie: [['pie.wasm']], 'pie-dv': [['pie-dv.wasm']], 'pie-opt': [['pie-opt.wasm']],
   'asyncify-all': [['asyncify-all.wasm']], 'asyncify-ind': [['asyncify-ind.wasm']], lp64: [['lp64.wasm', 'static']],
   split: [['libc.so.wasm'], ['split.wasm']], lib: [['libk.so.wasm'], ['lib.wasm']],
+  'static-opt': [['static-opt.wasm', 'static']], 'lp64-noopt': [['lp64-noopt.wasm', 'static']],
+  size64: [['size64.wasm', 'static']], w64: [['w64.wasm', 'static']],
 };
 const entry = variant === 'lib' ? 'run' : 'bench_run';
 
@@ -32,7 +34,10 @@ function dylink(bytes) {
   return null;
 }
 
-const memory = new WebAssembly.Memory({ initial: 1024, maximum: 65536, shared: true });
+// w64: wasm64 unlowered, on a 64-bit memory (V8's memory64)
+const memory = variant === 'w64'
+  ? new WebAssembly.Memory({ initial: 1024n, maximum: 65536n, shared: true, address: 'i64' })
+  : new WebAssembly.Memory({ initial: 1024, maximum: 65536, shared: true });
 const table = new WebAssembly.Table({ initial: 16, element: 'anyfunc' });
 const sp = new WebAssembly.Global({ value: 'i32', mutable: true }, 0x200000); // stack below 2 MiB
 let memNext = 0x400000;

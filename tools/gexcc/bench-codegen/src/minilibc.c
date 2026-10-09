@@ -28,9 +28,16 @@ static void *more(size_t n)
 {
 	if (brk_cur + n > brk_end) {
 		size_t want = (n + 0xffff + (1 << 20)) & ~(size_t)0xffff;
+#ifdef __wasm__
 		size_t old = __builtin_wasm_memory_grow(0, want >> 16);
 		if (old == (size_t)-1) return 0;
 		char *p = (char *)(old << 16);
+#else
+		/* a native build (a64main.c): anonymous pages */
+		extern void *bench_pages(size_t);
+		char *p = bench_pages(want);
+		if (!p) return 0;
+#endif
 		if (p != brk_end) brk_cur = p;
 		brk_end = p + want;
 	}
@@ -56,9 +63,27 @@ void free(void *p)
 	*(void **)p = freelist[c];
 	freelist[c] = p;
 }
+#ifdef __wasm__
+/* memory.copy and memory.fill */
 void *memcpy(void *d, const void *s, size_t n) { __builtin_memcpy(d, s, n); return d; }
 void *memmove(void *d, const void *s, size_t n) { __builtin_memmove(d, s, n); return d; }
 void *memset(void *d, int c, size_t n) { __builtin_memset(d, c, n); return d; }
+#else
+void *memcpy(void *, const void *, size_t);
+void *memset(void *, int, size_t);
+/* natively the builtins are calls to these very functions: memcpy and
+ * memset are musl's aarch64 assembly (src/a64/), as a Debian arm64 libc's
+ * are; memmove is a plain loop (built with -fno-builtin, so it stays one) */
+void *memmove(void *d, const void *s, size_t n)
+{
+	unsigned char *dd = d; const unsigned char *ss = s;
+	if (dd == ss || n == 0) return d;
+	if (dd + n <= ss || ss + n <= dd) return memcpy(d, s, n);
+	if (dd < ss) for (size_t i = 0; i < n; i++) dd[i] = ss[i];
+	else for (size_t i = n; i--;) dd[i] = ss[i];
+	return d;
+}
+#endif
 void *calloc(size_t a, size_t b) { void *p = malloc(a * b); if (p) memset(p, 0, a * b); return p; }
 void *realloc(void *p, size_t n)
 {

@@ -20,11 +20,15 @@ objs() { # TARGET PICFLAG OUTDIR
   clang --target=$t $FE $CF $pic -c $S/kernels.c -o $od/kernels.o
   clang --target=$t $FE $CF $pic -c $S/minilibc.c -o $od/minilibc.o
 }
+WF="--enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext --enable-nontrapping-float-to-int"
 LDC="--import-memory --shared-memory --max-memory=4294967296 --no-entry"
 objs wasm32 -fno-PIC $O/o32s
 objs wasm32 "-fPIC -fvisibility=default" $O/o32p
 objs wasm32 -fPIC $O/o32h
 objs wasm64 -fno-PIC $O/o64s
+# wasm32 with LP64's 64-bit size_t and ptrdiff_t (pointers stay 32-bit): the
+# i64 arithmetic of the lp64 build without its wider pointers and addresses
+objs wasm32 "-fno-PIC -include $S/size64.h" $O/o32z
 K="$O/o32s/z_*.o $O/o32s/zs_*.o $O/o32s/kernels.o"
 wasm-ld $LDC --global-base=1048576 --export=bench_run -o $O/static.wasm $O/o32s/*.o
 # pie: gexcc today (hidden visibility); pie-dv: the same objects a shared library build makes
@@ -41,6 +45,25 @@ wasm-ld $LDC --experimental-pic -pie --export=run --unresolved-symbols=import-dy
 # lp64: wasm64 static, lowered to a wasm32 memory
 wasm-ld -mwasm64 $LDC --global-base=1048576 --export=bench_run -o $O/lp64-64.wasm $O/o64s/*.o
 $OPT $O/lp64-64.wasm --enable-threads --enable-bulk-memory --enable-mutable-globals --enable-sign-ext --enable-nontrapping-float-to-int --enable-memory64 --memory64-lowering -O2 -o $O/lp64.wasm
+# the same lowering without binaryen's -O2 (static has none), the static
+# build through -O2 (lp64's fair baseline), and wasm64 left unlowered
+# (V8's memory64)
+$OPT $O/lp64-64.wasm $WF --enable-memory64 --memory64-lowering -o $O/lp64-noopt.wasm
+$OPT $O/static.wasm $WF -O2 -o $O/static-opt.wasm
+cp $O/lp64-64.wasm $O/w64.wasm
+wasm-ld $LDC --global-base=1048576 --export=bench_run -o $O/size64.wasm $O/o32z/*.o
+# the kernels as a native aarch64 Linux program, run translated by gex
+# (run.sh: tier 1 and the function JIT, in the browser shim under node)
+A64="--target=aarch64-linux-gnu -O2 -ffreestanding -nostdinc -isystem $(clang -print-resource-dir)/include -isystem $S/inc -fno-builtin-malloc -DZSTD_DISABLE_ASM -DZSTD_NO_INTRINSICS -DXXH_NAMESPACE=ZSTD_ -DDEBUGLEVEL=0 -I$Z -I$ZS -I$ZS/common -w"
+mkdir -p $O/a64
+for f in $ZF; do clang $A64 -c $Z/$f.c -o $O/a64/z_$f.o & done; wait
+for f in $ZSF; do clang $A64 -c $ZS/$f -o $O/a64/zs_$(echo $f | tr / _).o & done; wait
+for f in kernels a64main; do clang $A64 -c $S/$f.c -o $O/a64/$f.o; done
+clang $A64 -fno-builtin -c $S/minilibc.c -o $O/a64/minilibc.o
+for f in memcpy memset; do clang --target=aarch64-linux-gnu -c $S/a64/$f.S -o $O/a64/$f.o; done
+# separate-code: gex wants the text segment on pages of its own (lld packs
+# it after rodata on a shared page by default, which gex then misses)
+ld.lld -static -z separate-code -e _start --image-base=0x400000 -o $O/kernels.a64 $O/a64/*.o
 # asyncify-ind: every function that can reach an indirect call instrumented
 # (a shared library built without knowing its callers' callbacks);
 # asyncify-all: every function
