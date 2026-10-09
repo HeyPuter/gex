@@ -564,7 +564,9 @@ extern "C" fn r_has_children(ppid: i32) -> i32 {
 fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SAID: AtomicU32 = AtomicU32::new(0);
-    if signo == 0 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
+    // SIGWINCH (28 on every guest) changes nothing: bash -l sends it to its
+    // own group on start.
+    if signo == 0 || signo == 28 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
         return;
     }
     warn_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
@@ -1228,6 +1230,7 @@ impl FileHandle for StdinQueue {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 
@@ -1367,6 +1370,7 @@ impl FileHandle for Tty {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 
@@ -1428,6 +1432,7 @@ impl FileHandle for Console {
             mtime: 0,
             nlink: 1,
             rdev: 0,
+            times: Default::default(),
         })
     }
 
@@ -3909,7 +3914,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     for i in 0..31u8 {
         write_u64(data, c + ctx::x(i), 0);
     }
-    write_u64(data, c + ctx::SP, layout.sp);
+    // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
+    write_u64(data, c + ctx::sp_slot(program.compat()), layout.sp);
     write_u64(data, c + ctx::PC, program.entry());
     data[c + ctx::SAFEPOINT_COUNTER..c + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&1024i32.to_le_bytes());
@@ -4142,6 +4148,22 @@ pub extern "C" fn gex_add_hardlink(target: u32, target_len: u32, path: u32, path
     if unsafe { k_present() } != 0 {
         if unsafe { k_fs_populated() } == 0 {
             return (unsafe { k_fs_link(gex_kernel::PAddr::from(target), target_len, gex_kernel::PAddr::from(path), path_len) } == 0) as i32;
+        }
+        return 1;
+    }
+    0
+}
+
+/// A bundled symbolic link: `path` names `target` (text, resolved when the
+/// guest follows it), as in the bundle. A rootfs whose links became copies
+/// carries a single-binary coreutils once per command name. Returns 1 when
+/// made; 0 tells the caller to add a copy instead (no global kernel).
+#[no_mangle]
+pub extern "C" fn gex_add_symlink(target: u32, target_len: u32, path: u32, path_len: u32) -> i32 {
+    // SAFETY: scalars naming ranges of this module's memory, no borrow held.
+    if unsafe { k_present() } != 0 {
+        if unsafe { k_fs_populated() } == 0 {
+            return (unsafe { k_fs_symlink(gex_kernel::PAddr::from(target), target_len, gex_kernel::PAddr::from(path), path_len) } == 0) as i32;
         }
         return 1;
     }
@@ -6842,7 +6864,7 @@ fn wasm32_wait(pc: u64) -> i32 {
             // A wait on the page itself (its keyboard, the Worker's own
             // network) needs this Worker's event loop, which a wasm32
             // program's frames hold: it is polled here instead.
-            warn_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
+            trace_line("gex: a wasm32 program waits on the page (stdin or the network): polled\n");
             said = true;
         }
         if gex_park(20) < 0 {
@@ -7986,7 +8008,8 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // `sp` is the stack just built, not the recorded one: the two are the
     // same address by construction -- see `BLOB_RESERVE` -- and the argv on
     // it is this process's.
-    write_u64(data, c + ctx::SP, layout.sp);
+    let compat = program.as_ref().is_some_and(|p| p.compat());
+    write_u64(data, c + ctx::sp_slot(compat), layout.sp);
     let entry = match (&program, &restored) {
         (Some(p), _) => p.entry(),
         (None, Some(l)) => l.entry,
@@ -10067,6 +10090,21 @@ pub extern "C" fn gex_compat() -> i32 {
 #[no_mangle]
 pub extern "C" fn gex_set_compat(on: i32) {
     with_host(|h| h.kernel.compat = on != 0);
+    // An adopted child's stack (`gex_adopt_child`, before this) went to
+    // `ctx::SP`; an i386-ABI process's is `esp` (`ctx::sp_slot`), which on
+    // an AArch64 build is another slot (its i386-ABI processes are wasm32
+    // programs: posix_spawn's child starts on that stack).
+    if on != 0 && !gex_abi::X86 && !gex_abi::PPC {
+        with_host(|h| {
+            let mut gm = GuestMem::new(guest_bytes());
+            let c = h.kernel.ctx_addr;
+            let sp = gm.read_u64(c + ctx::SP as u64).unwrap_or(0);
+            if sp != 0 {
+                let _ = gm.write_u64(c + ctx::sp_slot(true) as u64, sp);
+                let _ = gm.write_u64(c + ctx::SP as u64, 0);
+            }
+        });
+    }
     gex_xlate::set_compat(on != 0);
 }
 
@@ -10369,8 +10407,18 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // A block failed its page check (gex-emit `emit_page_check`):
         // translate its address again if its module still provides it.
         let start = _pc as u64;
+        // The same stale block asking twice in a row: the catch-up below did
+        // not move this Worker's directory off it, so the newer translation
+        // it waits for is never coming here (seen in an exec'd aarch64
+        // program's `_dl_fini`, which re-entered the block from JavaScript
+        // for ever). Translating it again is always correct, only slower.
+        let repeat = STALE_LAST.with(|c| {
+            let same = c.get() == (start, addr as u64);
+            c.set((start, addr as u64));
+            same
+        });
         let again = with_host(|h| {
-            let again = h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
+            let again = repeat || h.jit.provider.get(&start).map_or(true, |&m| m == addr as u64);
             if again {
                 h.jit.translated.remove(&start);
                 h.jit.provider.remove(&start);
@@ -10707,6 +10755,9 @@ thread_local! {
     /// next dispatch miss's answer: that miss must not answer
     /// `DISPATCH_MISS_LEAVE` (the caller would dispatch again, for ever).
     static NO_LEAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last `PAGE_STALE` (block, module), to tell a stale block that
+    /// keeps coming back from one met once. See `gex_cache_op`.
+    static STALE_LAST: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Dispatch misses by how `gex_dispatch_miss` dealt with them (the NT

@@ -522,12 +522,19 @@ impl std::error::Error for StopExecution {}
 /// placed segments rather than the file, because that is what the translator
 /// reads.
 fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
+    // The program file goes in as bytes, not through `Debug`: formatting a
+    // multi-MiB file as a list of decimal numbers cost more than all the
+    // rest of an exec (a gexcc busybox: about 12 MB of text, twice, at every
+    // exec in a guest shell's loop).
+    let mut plain = xlate.clone();
+    let elf = plain.image_elf.take();
     let mut fields: Vec<Vec<u8>> = vec![
         image.bias.to_le_bytes().into(),
         image.entry.to_le_bytes().into(),
         image.text_range.0.to_le_bytes().into(),
         image.text_range.1.to_le_bytes().into(),
-        format!("{xlate:?}").into_bytes(),
+        format!("{plain:?}").into_bytes(),
+        elf.as_deref().map(|e| e.to_vec()).unwrap_or_default(),
         // The same bytes mean different instructions in 32-bit mode.
         vec![image.class32 as u8],
         // Symbols steer discovery, so two images with the same code but
@@ -1953,7 +1960,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let mut gm = GuestMem::new(dst);
         let _ = gex_kernel::syscalls::set_result(&mut gm, ctx_addr, 0);
         if req.child_stack != 0 {
-            let _ = gm.write_u64(ctx_addr + ctx::SP as u64, req.child_stack);
+            let _ = gm.write_u64(ctx_addr + ctx::sp_slot(child_kernel.compat) as u64, req.child_stack);
         }
         if let Some(tls) = req.tls {
             // PowerPC's thread pointer is r2.
@@ -2885,6 +2892,20 @@ impl gex_kernel::net::Transport for HostStream {
     fn close(&self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
+
+    fn shutdown(&self, how: u64) -> Result<(), gex_kernel::Errno> {
+        use std::net::Shutdown;
+        let guard = self.sock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sock) = guard.as_ref() else {
+            return Err(gex_kernel::Errno::ENOTCONN);
+        };
+        let h = match how {
+            0 => Shutdown::Read,
+            1 => Shutdown::Write,
+            _ => Shutdown::Both,
+        };
+        sock.shutdown(h).map_err(|e| gex_kernel::Errno::from_io(&e))
+    }
 }
 
 /// The host process's real user and group ids.
@@ -2983,7 +3004,8 @@ fn place_image(
     for i in 0..31u8 {
         write_u64(data, ctx_addr + ctx::x(i), 0);
     }
-    write_u64(data, ctx_addr + ctx::SP, layout.sp);
+    // (an i386-ABI process's is `esp` in every build: `ctx::sp_slot`)
+    write_u64(data, ctx_addr + ctx::sp_slot(program.compat()), layout.sp);
     write_u64(data, ctx_addr + ctx::PC, image.entry);
     data[ctx_addr + ctx::SAFEPOINT_COUNTER..ctx_addr + ctx::SAFEPOINT_COUNTER + 4]
         .copy_from_slice(&SAFEPOINT_INTERVAL.to_le_bytes());
