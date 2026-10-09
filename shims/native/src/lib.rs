@@ -2902,11 +2902,6 @@ impl gex_kernel::net::Transport for HostStream {
             Err(_) => Err(gex_kernel::Errno::ECONNRESET),
         }
     }
-    fn shutdown_write(&self) {
-        if let Some(sock) = self.sock.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            let _ = sock.shutdown(std::net::Shutdown::Write);
-        }
-    }
     fn close(&self) {
         let _ = self.sock.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
