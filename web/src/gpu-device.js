@@ -45,6 +45,21 @@ export function requestGexDevice() {
       maxStorageBuffersInFragmentStage: 16,
       maxColorAttachmentBytesPerSample: 64,
     };
+    // `?gllimits=41|43` (GEX_GL_LIMITS, set by the compositor worker): GL 4.1
+    // wants 16384 texels a side and 2048 array layers, GL 4.3's compute
+    // shaders 1024 invocations a workgroup and 32 KiB of shared memory;
+    // WebGPU's defaults (8192, 256; 256, 16 KiB) keep the context at GL 4.0.
+    // Unity drops shaders whose target the context is below (Muck's grass
+    // geometry shader: "Shader Unsupported ... All passes removed").
+    const glLimits = Number(globalThis.GEX_GL_LIMITS) || 0;
+    if (glLimits >= 41) {
+      Object.assign(want, { maxTextureDimension1D: 16384, maxTextureDimension2D: 16384,
+        maxTextureDimension3D: 2048, maxTextureArrayLayers: 2048 });
+    }
+    if (glLimits >= 43) {
+      Object.assign(want, { maxComputeInvocationsPerWorkgroup: 1024, maxComputeWorkgroupSizeX: 1024,
+        maxComputeWorkgroupSizeY: 1024, maxComputeWorkgroupSizeZ: 64, maxComputeWorkgroupStorageSize: 32768 });
+    }
     const requiredLimits = {};
     for (const [limit, wanted] of Object.entries(want)) {
       const available = adapter.limits[limit];

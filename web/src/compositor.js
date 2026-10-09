@@ -137,8 +137,12 @@ export class Compositor {
     // is the canvas, fitted to the viewport; compositing only when needed.
     const direct = pq?.get('direct') === '1';
     this.#pointerLock = pq?.get('pointerlock') === '1';
+    // `?gllimits=41|43`: the device asks for GL 4.1's texture limits (and
+    // 4.3's compute ones), raising the GL version Mesa's context earns
+    // (gpu-device.js). Off by default: at 4.6 Muck's 3D scene drew black.
+    const glLimits = Number(pq?.get('gllimits')) || 0;
     worker.postMessage(
-      { kind: 'init', canvas: offscreen, channel, stats: this.#stats, present, direct },
+      { kind: 'init', canvas: offscreen, channel, stats: this.#stats, present, direct, glLimits },
       [offscreen],
     );
     await ready;

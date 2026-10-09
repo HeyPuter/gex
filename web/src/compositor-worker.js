@@ -1440,6 +1440,7 @@ self.onmessage = ({ data: m }) => {
       canvas = m.canvas;
       presentOverride = m.present ?? null;
       // The compositor draws with WebGPU on the device Mesa will use.
+      if (m.glLimits) globalThis.GEX_GL_LIMITS = m.glLimits;
       requestGexDevice().then((gpu) => {
         comp = new Compositor(m.canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);
         comp.setDirect(m.direct);
