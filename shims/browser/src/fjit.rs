@@ -212,8 +212,19 @@ pub(crate) fn translate(addr: u64) -> Option<u32> {
     // An address an ELF provider holds is not code to translate (cgen::elfprov).
     // With `?fjitlibs=` rules, callees outside them are not brought in either.
     let rules = !lock(&LIBS).is_empty();
+    // A callee some unit (or an earlier translation) already serves is not
+    // brought into the batch: the call reaches it through the table. Without
+    // this, a miss in UnityPlayer (a function its unit lacks) re-translated up
+    // to 63 of the unit's own functions with it -- 3,667 functions and 36 MiB
+    // of wasm by HK's menu (ht3), JIT code shadowing clang's.
+    let served_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
+    let served = |a: u64| a != addr && *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::index_of(a).is_some());
     let executable = |a: u64| {
-        exec.iter().any(|&(s, e)| a >= s && a < e) && !crate::cgen::elfprov::provided(a) && !crate::cgen::libprov::replaced(a) && (!rules || lib_wanted(a))
+        exec.iter().any(|&(s, e)| a >= s && a < e)
+            && !crate::cgen::elfprov::provided(a)
+            && !crate::cgen::libprov::replaced(a)
+            && (!rules || lib_wanted(a))
+            && !served(a)
     };
     let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     // Writable-and-executable code (a JIT's) stays tier-1, as natively.
