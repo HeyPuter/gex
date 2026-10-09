@@ -20,3 +20,14 @@ sysvinit  sysvinit-utils *
 file      file          *
 depends file libmagic-mgc
 depends vim vim-common
+libonig   -             *
+libevent  -             *
+expat     -             *
+make-dfsg make          *
+lua5.4    lua5.4        *
+lz4       lz4           *
+mpdecimal -             *
+python3.13 python3.13   *
+openssl   openssl       *
+curl      curl          *
+git       git           *
