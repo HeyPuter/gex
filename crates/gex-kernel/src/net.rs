@@ -349,9 +349,13 @@ impl Transport for RemoteEnd {
     fn close(&self) {
         (self.remote.close)(self.id);
     }
-    /// The global kernel's shutdown is SHUT_WR's: the far end reads to its end.
-    fn shutdown_write(&self) {
-        (self.remote.shutdown)(self.id);
+    /// The global kernel's shutdown is SHUT_WR's: the far end reads to its
+    /// end. SHUT_RD only changes this end, which the far end is not told.
+    fn shutdown(&self, how: u64) -> Result<(), Errno> {
+        if how == 1 || how == 2 {
+            (self.remote.shutdown)(self.id);
+        }
+        Ok(())
     }
 }
 
