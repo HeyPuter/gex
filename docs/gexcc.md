@@ -1379,3 +1379,101 @@ of such libraries.
 replaced. Whole hot libraries become item-3 providers on the LP64 libc
 (libsqlite3 next), and per-function libc providers are added only where a
 profile shows a hot spot.
+
+### 7.13 libsqlite3: function pointers across the boundary (2026-10-09)
+
+`tools/gexcc/item3/build-sqlite.sh` builds Debian's libsqlite3 (3.46.1, the
+amalgamation with debian/rules's options and what its configure adds: FTS3/4/5,
+RTREE, JSON, SESSION, threadsafe) on the LP64 libc. It replaces
+libsqlite3.so.0 under Debian's arm64 sqlite3 shell, bound by soname from
+`/usr/lib/gex/aarch64/libsqlite3.so.0.wasm`. 284 exports have adapters
+(everything the build defines). Unlike zlib's and zstd's API, sqlite's has
+callbacks in both directions, plus doubles and varargs:
+
+- **Exits** (the library calls the guest). sqlite stores and calls the
+  caller's function pointers: sqlite3_exec's callback, the methods of a
+  virtual table module (the shell's generate_series), application SQL
+  functions (the shell's ieee754, decimal, sha3), destructors, and a
+  registered vfs. The pass `item3/a64icall/GexA64Icall.cpp` is the arm64
+  counterpart of Wine's ICALL pass, and every indirect call goes through it:
+  `__a64_set_icall_target(p); callee = p < 0x3f0000 ? p : __a64x.<sig>`.
+  A table index (the library's own function) is called directly. A guest
+  address goes to an exit stub, one per signature, that lays the arguments
+  out as AAPCS64 does and calls `a64_call_guest_regs`:
+  - integers and pointers go in x0-x7, floating point in v0-v7, and the
+    rest in 8-byte stack slots below the guest's SP;
+  - the guest's x30 and SP are restored afterwards.
+  In sqlite3.c that is 5187 call sites. 23 are left alone (byval or
+  variadic: only the library's own functions are called through those).
+- **Entries** (the guest calls the library's function pointers). Examples
+  are the methods of `sqlite3_vfs_find("unix")`, which the shell's
+  appendvfs calls, and the io methods of a file it opened. Every
+  address-taken function gets an F_body entry thunk: it reads the AAPCS64
+  arguments, calls the function, and returns in x0 or v0. That is 895 in
+  sqlite3.c. Their {function, thunk} pairs go in the data section
+  `gexa_entries` (exported bounds `__gexa_entries`, `gexa.c`). After the
+  install, the shell (`gex_libprov_installed`) binds each thunk at its
+  function's table index as a guest address, through wasmdll's late
+  binding. Table indices are below 0x3f0000, and guest code is above it.
+- **Varargs.** sqlite3_mprintf, sqlite3_config, sqlite3_db_config and the
+  other variadic exports, plus the va_list ones (sqlite3_vmprintf, which
+  the shell calls with its own va_list), go through `gexva.h`. It is
+  force-included and turns sqlite's `va_list` into a two-kind struct:
+  - kind 0 is wasm's own varargs, for the library's calls among its own
+    functions;
+  - kind 1 is an AAPCS64 va_list (`__stack`, `__gr_top`, `__vr_top` and
+    the offsets), read as aarch64 code would read it.
+
+  A variadic export's adapter announces the guest's call by name
+  (`gexva_pending`). The export's `va_start` takes the announcement when
+  `__func__` matches, and snapshots x0-x7 and v0-v7 from the context. A
+  va_list argument is the guest's own struct (passed by reference, being
+  over 16 bytes).
+- **Doubles** are v registers both ways (`a64_varg_double`, `a64_ret_v`).
+- **compiler-rt's tf2 comparisons** (`__lttf2`...) are typed `long` for
+  every LP64 target but aarch64, while clang's wasm64 calls expect `int`.
+  The signature mismatch became a trap stub in the link, so sysroot.sh now
+  builds them from a patched copy.
+
+Checked: the shell's output is identical, translated against the provider,
+on sq.sql and on a callback-heavy script (cb.sql). That script covers
+generate_series, ieee754/decimal, sha3_query (a guest function that calls
+back into prepare/step), box mode, `.schema`, FTS5, `.dbinfo`, `.stats`,
+and a file database (the unix vfs, locks, journal). The only difference is
+`.stats`'s memory lines, by 8 bytes: Debian's build sizes allocations with
+glibc's malloc_usable_size.
+
+Measured (edger, run-sqlite.sh: the browser runtime under node, one ABBA
+set, medians of two runs; sq.sql makes 100k rows, an index, a LIKE scan and
+a GROUP BY). The time is the statements' summed real time from sqlite's
+timer:
+
+| tier | translated | provider | provider vs translated | wall, translated vs provider |
+|---|---|---|---|---|
+| tier 1 (the page's default) | 7712 ms | 666.5 ms | 11.6x faster | 10288 vs 2627 ms |
+| function JIT | 13201 ms | 1309.5 ms | 10.1x faster | 18872 vs 5741 ms |
+
+The output is the same in every run. The function JIT is slower than tier 1
+here in both modes (13.2 vs 7.7 s translated, 1.31 vs 0.67 s provider),
+which is open.
+
+**Fork across a provider.** A fork's child installs each inherited provider
+at its parent's table base (`publish_at`; the base is kept at offset 8 of
+the provider's code page, which the child inherits). The data the child
+copied holds the parent's function pointers: zlib's `zalloc = zcalloc` in an
+open stream, and sqlite's methods. Before this, a program exec'd from a
+shell got a different base in its child, so zlib's own allocator looked like
+a guest function.
+
+**In the image.** `tools/gexcc/item3/mkdeb.sh` builds the three providers
+into the package `gex-providers-arm64` (/usr/lib/gex/aarch64/*.wasm).
+web/build-native-debian.sh (and scratch/CC/mkgui.sh) put it in the pool, so
+the native-debian images carry it, and an arm64 program that maps one of
+the libraries (apt's libz and libzstd) gets the provider by default.
+
+**Gate leg:** `tests/gexcc/item3/run.sh GEXC`. It builds the providers, zt
+and zstt, then runs every check twice, translated and with the providers,
+each time in one guest process tree under a wasm32 dash: zt check/checkgz,
+zstt check/checkd/checkm, and sqlite3 on sq.sql and cb.sql. It passes when
+19 checks say ok in both modes, all three libraries are replaced in the
+provider run only, and the sqlite3 output matches.
