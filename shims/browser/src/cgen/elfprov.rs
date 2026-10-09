@@ -49,6 +49,14 @@ pub extern "C" fn gex_elfprov_off() {
     OFF.store(true, Ordering::Relaxed);
 }
 
+/// Every address `provided` holds, at once (the function JIT asks of each
+/// byte it fetches; three locks a byte cost HK's start-up 2.3 s, hp14).
+pub(crate) fn provided_set() -> std::collections::HashSet<u64> {
+    let mut s: std::collections::HashSet<u64> = lock(&BOUND).iter().flat_map(|b| b.addrs.iter().copied()).collect();
+    s.extend(super::libprov::bound_addrs());
+    s
+}
+
 /// Whether an ELF provider holds `addr` (the function JIT leaves it alone).
 pub(crate) fn provided(addr: u64) -> bool {
     lock(&BOUND).iter().any(|b| b.addrs.contains(&addr)) || super::libprov::bound(addr)

@@ -76,6 +76,16 @@ pub(crate) fn replaced(addr: u64) -> bool {
     lock(&REPLACED).iter().any(|&(lo, hi)| addr >= lo && addr < hi)
 }
 
+/// The addresses replaced libraries' providers are bound at.
+pub(crate) fn bound_addrs() -> Vec<u64> {
+    lock(&LIBS).iter().flat_map(|l| l.pairs.iter().map(|p| p.0)).collect()
+}
+
+/// The ranges of replaced libraries' own text.
+pub(crate) fn replaced_ranges() -> Vec<(u64, u64)> {
+    lock(&REPLACED).clone()
+}
+
 /// Whether `addr` is one a replaced library's provider is bound at (its
 /// pairs are sorted by address).
 pub(crate) fn bound(addr: u64) -> bool {

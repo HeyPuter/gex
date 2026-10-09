@@ -130,18 +130,21 @@ impl Jit {
     /// starts (symbols, `.eh_frame`, init arrays, relocations; `elf` is the
     /// file, for `.eh_frame` and ELF32 symbols), with their extents, which
     /// bound functions and computed-goto tables as they do ahead of time.
-    pub fn add_image(&self, image: &gex_ld::Image, elf: Option<&[u8]>) {
-        self.add_image_in(0, image, elf);
+    /// Returns how many function starts it knows of the image.
+    pub fn add_image(&self, image: &gex_ld::Image, elf: Option<&[u8]>) -> usize {
+        self.add_image_in(0, image, elf)
     }
 
-    fn add_image_in(&self, process: u64, image: &gex_ld::Image, elf: Option<&[u8]>) {
+    fn add_image_in(&self, process: u64, image: &gex_ld::Image, elf: Option<&[u8]>) -> usize {
         let code = Code::with_elf(image, elf);
         let (starts, _) = func::seeds(&code, elf, false);
         let mut guard = self.st.lock().unwrap_or_else(|e| e.into_inner());
         let st = guard.procs.entry(process).or_default();
+        let mut n = 0;
         for (a, info) in starts {
             if info.strong() {
                 st.starts.insert(a, info);
+                n += 1;
             }
         }
         st.readonly.extend(
@@ -151,6 +154,7 @@ impl Jit {
                 .filter(|s| !s.writable)
                 .map(|s| (s.vaddr, s.vaddr + s.bytes.len() as u64)),
         );
+        n
     }
 
     /// A module for the function at `addr` (see the module documentation),

@@ -338,6 +338,53 @@ pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
     if let Some(jit) = JIT.get() {
         jit.retire(0, ranges);
     }
+    lock(&SEEDED).retain(|&(_, lo, hi)| !ranges.iter().any(|&(s, e)| s < hi && lo < e));
+}
+
+/// The objects whose function starts the JIT has (`seed_mapped`): path and
+/// the address range of their `PT_LOAD`s, dropped when code there retires.
+static SEEDED: Mutex<Vec<(String, u64, u64)>> = Mutex::new(Vec::new());
+
+/// Give the JIT the function starts of every mapped object it lacks (its
+/// symbols, `.eh_frame`, init arrays and relocations, `Jit::add_image`),
+/// as natively ahead of time. Without them recovery knows only the starts
+/// calls name, and follows a tail jump into the function it reaches: each
+/// of libasound's exported wrappers carried a copy of the function it
+/// jumps to. Offline, translating each of libasound's 1,698 exports in
+/// turn made 57.2 MiB of wasm in 16.4 s without its starts and 9.7 MiB in
+/// 7.1 s with them (one function per module: 49.7 MiB and 14.1 s against
+/// 3.2 MiB and 1.7 s); HK's menu had 20 MiB of libasound wasm (hp13).
+fn seed_mapped(jit: &gex_xlate::fjit::Jit) {
+    let maps: Vec<(u64, String, u64)> = crate::with_host(|h| {
+        use gex_kernel::mem::prot;
+        h.kernel.mem.vmas().iter().filter(|v| v.prot & prot::EXEC != 0).filter_map(|v| v.code.clone().map(|(p, o)| (v.start, p, o))).collect()
+    });
+    for (start, path, off) in maps {
+        if lock(&SEEDED).iter().any(|(p, lo, hi)| *p == path && start >= *lo && start < *hi) {
+            continue;
+        }
+        let bytes = crate::with_host(|h| h.kernel.read_file(&path)).unwrap_or_default();
+        let lds = loads(&bytes);
+        // The vma's file offset gives its vaddr in the file, hence the bias.
+        let Some(bias) = lds.iter().find(|&&(o, _, n)| off >= o && off < o + n.max(1)).map(|&(o, v, _)| start.wrapping_sub(v + (off - o))) else {
+            lock(&SEEDED).push((path, start, start + 1));
+            continue;
+        };
+        let lo = lds.iter().map(|l| l.1).min().unwrap_or(0).wrapping_add(bias) & !0xfff;
+        let hi = lds.iter().map(|l| l.1 + l.2).max().unwrap_or(0).wrapping_add(bias);
+        let n = match gex_ld::elf::load(&bytes, bias) {
+            Ok(mut image) => {
+                gex_ld::elf::apply_own_relative(&mut image);
+                jit.add_image(&image, Some(&bytes))
+            }
+            Err(_) => 0,
+        };
+        if BY_OBJECT_ON.load(Ordering::Relaxed) {
+            let name = path.rsplit('/').next().unwrap_or(&path);
+            crate::warn_line(&format!("[fjit] starts of {name} at {bias:#x}: {n}\n"));
+        }
+        lock(&SEEDED).push((path, lo, hi.max(lo + 1)));
+    }
 }
 
 /// Translate the function at `addr` and publish it (`gex.lookup`'s miss):
@@ -359,6 +406,7 @@ fn translate_root(addr: u64) -> Option<u32> {
         return None;
     }
     let jit = JIT.get()?;
+    seed_mapped(jit);
     let (exec, ro, wx): (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<(u64, u64)>) = crate::with_host(|h| {
         use gex_kernel::mem::prot;
         let v = h.kernel.mem.vmas();
@@ -392,11 +440,17 @@ fn translate_root(addr: u64) -> Option<u32> {
     // unit (hb52).
     let served_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
     let served = |a: u64| *served_memo.borrow_mut().entry(a).or_insert_with(|| crate::cgen::unit_serves(a) || crate::cgen::jit_serves(a));
+    // Asked of every byte fetched: the providers' addresses and replaced
+    // ranges taken once, and the range checks kept by 4 KiB page (exec,
+    // replaced and object ranges are pages; `?fjitlibs=` ranges are not).
+    let provided = crate::cgen::elfprov::provided_set();
+    let replaced = crate::cgen::libprov::replaced_ranges();
+    let page_memo = std::cell::RefCell::new(std::collections::HashMap::<u64, bool>::new());
+    let ranged = rules && lock(&LIBS).iter().any(|r| r.range.is_some());
     let executable = |a: u64| {
-        exec.iter().any(|&(s, e)| a >= s && a < e)
-            && !crate::cgen::elfprov::provided(a)
-            && !crate::cgen::libprov::replaced(a)
-            && (!rules || lib_wanted(a))
+        let page_ok = |a: u64| exec.iter().any(|&(s, e)| a >= s && a < e) && !replaced.iter().any(|&(lo, hi)| a >= lo && a < hi) && (!rules || lib_wanted(a));
+        let ok = if ranged { page_ok(a) } else { *page_memo.borrow_mut().entry(a >> 12).or_insert_with(|| page_ok(a)) };
+        ok && !provided.contains(&a)
     };
     let read_only = |a: u64, n: u64| ro.iter().any(|&(s, e)| a >= s && a.saturating_add(n) <= e);
     // Writable-and-executable code (a JIT's) stays tier-1, as natively.
