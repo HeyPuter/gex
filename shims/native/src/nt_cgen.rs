@@ -1638,3 +1638,101 @@ fn spawn_elf_build(path: &str, base: u64) {
         Err(e) => eprintln!("gex-elf: could not start building the function tier for {path}: {e}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wine's own PE loader (stream W, W3; docs/wine-native.md §3.17)
+// ---------------------------------------------------------------------------
+//
+// Under W3 Wine's ntdll.so maps every image itself and tells gex
+// (`gex.image_mapped`, after its relocations); there is no NT layer and no
+// section hook. Its i386 DLLs (ole32, rpcrt4, advapi32, combase, the
+// programs...) were tier-1, and tier-1's units are not reusable across
+// processes (each holds the page-table bases and the "already translated"
+// set of the process that made it), so every Wine process recompiled
+// megabytes of them: about 30 s of compile wall time per session boot.
+// An image with a unit built for its bytes at its base (`gexc cgen-image
+// PATH --pe-base BASE`) gets it here, as the NT layer's images do, and its
+// compiled code comes from the module cache in every later process.
+// `GEX_W3_UNITS=0` turns this off; `GEX_W3_UNITS_BUILD=1` builds a missing
+// unit in the background for the next run (off by default: Wine's DLLs get
+// theirs at staging, `$W/cgen-w3.sh`).
+
+/// The unit for an i386 image Wine's PE loader mapped at `base`, installed
+/// if one was built. Never fatal: an image whose mapped code differs from
+/// its unit's (or with none) stays on tier-1.
+pub(crate) fn w3_image(caller: &mut Caller<'_, HostState>, path: &str, base: u64, pe: gex_ld::pe::PeImage) -> Result<()> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("GEX_W3_UNITS").as_deref() != Ok("0")) || mode() == Mode::Off || is_wasm_skeleton(&pe) {
+        return Ok(());
+    }
+    let p = Pending { path: path.to_string(), base, pe: Arc::new(pe) };
+    w3_place(caller, p, true)
+}
+
+/// Images [`w3_image`] left for their first miss, by the process (its
+/// `JitShared`) that mapped them.
+static W3_DEFERRED: Mutex<Vec<(usize, Pending)>> = Mutex::new(Vec::new());
+
+/// A tier-1 miss at `pc`: if it is inside an image [`w3_image`] deferred,
+/// place that image's unit now.
+pub(crate) fn w3_miss(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<()> {
+    let p = {
+        let mut d = W3_DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+        if d.is_empty() {
+            return Ok(());
+        }
+        let owner = caller.data().jit.as_ref().map(|j| Arc::as_ptr(&j.shared) as usize).unwrap_or(0);
+        let Some(i) = d.iter().position(|(o, p)| *o == owner && pc >= p.base && pc < p.base + p.pe.image_size as u64) else {
+            return Ok(());
+        };
+        d.swap_remove(i).1
+    };
+    w3_place(caller, p, false)
+}
+
+/// Place `p`'s unit. `at_map`: Wine has only just mapped it, and an image
+/// it must move is relocated later (ntdll's PE side, `perform_relocations`),
+/// so a mismatch then defers it to its first miss rather than refusing it.
+fn w3_place(caller: &mut Caller<'_, HostState>, p: Pending, at_map: bool) -> Result<()> {
+    let (path, base) = (p.path.clone(), p.base);
+    let t0 = std::time::Instant::now();
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let placed = match place(&p, memory.bytes()) {
+        Ok(pl) => pl,
+        Err(_) if at_map => {
+            let owner = caller.data().jit.as_ref().map(|j| Arc::as_ptr(&j.shared) as usize).unwrap_or(0);
+            W3_DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((owner, p));
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("gex-w3: {e:#}; it runs on tier-1");
+            return Ok(());
+        }
+    };
+    let Some(pl) = placed else {
+        if trace() || std::env::var_os("GEX_W3_TRACE").is_some() {
+            let key = gex_xlate::func::pe_input(&p.pe, base)
+                .map(|(image, _)| unit_key(&image, &provided(&p.pe, base)))
+                .unwrap_or_else(|e| format!("(not placeable: {e})"));
+            eprintln!("gex-w3: {path} at {base:#x}: no function-tier unit (key {key}), tier-1");
+        }
+        if std::env::var("GEX_W3_UNITS_BUILD").as_deref() == Ok("1") {
+            match spawn_build(&p) {
+                Ok(child) => drop(child),
+                Err(e) => eprintln!("gex-w3: could not start building the function tier for {path}: {e}"),
+            }
+        }
+        return Ok(());
+    };
+    let (shared, engine, cache) = {
+        let jit = caller.data().jit.as_ref().ok_or_else(|| anyhow!("runtime translation is not set up"))?;
+        (Arc::clone(&jit.shared), jit.engine.clone(), jit.cache.clone())
+    };
+    {
+        let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
+        install_placed(&p, pl, &shared, &engine, cache.as_ref(), &memory, t0)?;
+    }
+    crate::ftab::catch_up(&mut *caller)?;
+    replay_registry(caller)?;
+    Ok(())
+}

@@ -4158,6 +4158,9 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         return Ok(true);
     }
 
+    // W3: an image Wine relocated gets its function-tier unit at its first
+    // miss (`nt_cgen::w3_image`).
+    nt_cgen::w3_miss(caller, pc)?;
     // A function the table holds, or the run-time translator can make,
     // serves this address: tier-1 reaches it through the bridge.
     if ftab::serve(caller, pc)? {
