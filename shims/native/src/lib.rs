@@ -3293,7 +3293,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 lockstep::log_result(&GuestMem::new(memory.bytes()), ctx_addr, tid);
             }
             if let Some(t0) = sys_t0 {
-                sys_waits::record(caller.data().thread.tid, sys_nr, t0.elapsed());
+                sys_waits::record(caller.data().thread.tid, sys_nr, t0);
             }
             check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();
