@@ -11807,6 +11807,7 @@ fn retire_unmapped_code() {
         let retired = std::mem::take(&mut h.kernel.retired_code);
         if !retired.is_empty() {
             crate::cgen::on_retire(&retired);
+            crate::fjit::on_retire(&retired);
             retire_code(h, &retired);
         }
     });

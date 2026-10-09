@@ -326,6 +326,34 @@ fn mid_function(addr: u64) -> bool {
     mid
 }
 
+/// What the JIT learns (function starts, functions translated, functions
+/// that never return) is kept under this key, which moves on whenever code
+/// is unmapped: it describes addresses, and a `dlclose` and a later
+/// `dlopen` put another library at them. HK's SDL loads libdbus, unloads it,
+/// and maps libxcb over the same range; with libdbus's starts kept, libxcb's
+/// `_xcb_in_read_block` ended at the address of a libdbus function (+0x30, the
+/// `cmovle` of `min(queue_len, len)`) as at a tail call, flags dead, and
+/// read the setup reply out of an empty queue: X11 video init failed, the
+/// black screen (hb26, hb45; hs5 `scanconst=` showed the start was
+/// libdbus's), and with the unit, a memmove of -8 bytes (hp8).
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Code in `ranges` was unmapped or reprotected (`retire_unmapped_code`):
+/// start learning afresh.
+pub(crate) fn on_retire(ranges: &[(u64, u64)]) {
+    if ranges.iter().all(|&(s, e)| e <= s) {
+        return;
+    }
+    let old = EPOCH.fetch_add(1, Ordering::AcqRel);
+    if let Some(jit) = JIT.get() {
+        jit.forget(old);
+        if old < 16 || (old + 1).is_power_of_two() {
+            let r: Vec<String> = ranges.iter().take(4).map(|&(s, e)| format!("{s:#x}-{e:#x}")).collect();
+            crate::warn_line(&format!("[fjit] code unmapped ({}): learning afresh, epoch {}\n", r.join(" "), old + 1));
+        }
+    }
+}
+
 /// Translate the function at `addr` and publish it (`gex.lookup`'s miss):
 /// its index in the function table, or `None` (the fallback runs it).
 pub(crate) fn translate(addr: u64) -> Option<u32> {
@@ -395,7 +423,8 @@ fn translate_root(addr: u64) -> Option<u32> {
     };
     let class32 = gex_abi::X86 && gex_xlate::arch::compat();
     trace(&format!("translate {addr:#x}"));
-    let Some(wasm) = jit.translate(crate::guest_bytes(), addr, &executable, &read_only, &volatile, &pg, class32) else {
+    let epoch = EPOCH.load(Ordering::Acquire);
+    let Some(wasm) = jit.translate_in(epoch, crate::guest_bytes(), addr, &executable, &read_only, &volatile, &pg, class32) else {
         DECLINED.fetch_add(1, Ordering::Relaxed);
         trace(&format!("declined {addr:#x}"));
         return None;
