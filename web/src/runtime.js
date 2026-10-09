@@ -677,7 +677,12 @@ export async function runProgram(
       // a program image), read from the server's `/gex-cgen/` (a unit
       // cache, GEX_CGEN_CACHE's layout) with synchronous requests.
       // `?cgenurl=` (an ejected project's build/web/cgen) instead.
-      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen' } : undefined,
+      // Otherwise the export providers the dist carries (gex/cgen/providers/,
+      // docs/gexcc.md §7.9), with no units; `?providers=0` runs glibc's
+      // own code translated instead.
+      cgen: globalThis.GEX_CGEN ? { mode: globalThis.GEX_CGEN, url: globalThis.GEX_CGEN_URL ?? '/gex-cgen' }
+        : flag('providers') === '0' ? undefined
+        : { mode: 8, url: '/gex/cgen' },
       // `?aot=1`: an ejected project's run, with no run-time translation (a
       // miss stops the run, saying where).
       jit: globalThis.GEX_NO_JIT ? false : undefined,
