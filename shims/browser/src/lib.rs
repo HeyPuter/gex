@@ -5777,6 +5777,25 @@ pub extern "C" fn gex_recent_syscalls(out: u32, max: u32) -> u32 {
     n as u32
 }
 
+/// The running program's argv, space-separated and capped, for the
+/// per-process line (which program a cost belongs to).
+#[no_mangle]
+pub extern "C" fn gex_cmdline(out: u32, max: u32) -> u32 {
+    let text = with_host(|h| {
+        let mut t = h.kernel.argv.join(" ");
+        if t.is_empty() {
+            t = h.kernel.exe_path.clone();
+        }
+        t
+    });
+    let mut n = text.len().min(max as usize);
+    while n > 0 && !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
+    n as u32
+}
+
 /// Nanoseconds spent inside syscalls, and how many there were. Always kept.
 static SYS_TOTAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SYS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

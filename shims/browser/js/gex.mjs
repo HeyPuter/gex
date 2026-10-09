@@ -886,6 +886,17 @@ export class Gex {
       })() : null,
     };
   }
+  /// The program's argv as the shim has it (after any `execve`).
+  get cmdline() {
+    const e = this.#shim?.exports;
+    if (!e?.gex_cmdline) return '';
+    const max = 160;
+    const p = e.gex_alloc(max) >>> 0;
+    const n = e.gex_cmdline(p, max) >>> 0;
+    const s = utf8(this.#bytes().subarray(p, p + n));
+    e.gex_free?.(p, max);
+    return s;
+  }
   /// Which objects this process lifted blocks from, `name=count` separated.
   get blocksByObject() {
     const e = this.#shim?.exports;
