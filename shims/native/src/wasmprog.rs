@@ -86,6 +86,12 @@ pub(crate) fn install(store: &mut Store<HostState>, memory: &gex_mem::GuestMemor
         .get(wasm_at as usize..(wasm_at + wasm_len) as usize)
         .ok_or_else(|| anyhow!("wasm32 program: module outside memory"))?
         .to_vec();
+    // A program linked against shared libraries (docs/gexcc.md §7).
+    if let Some(info) = crate::dylink::wanted(&wasm) {
+        let path = store.data_mut().with_kernel(|k| k.exe_path.clone());
+        crate::dylink::install_program(store, memory, &path, wasm, info, mem_base, entry, thread_entry)?;
+        return Ok(true);
+    }
     let slots = gex_cgen::provider::slot_names(&wasm)?;
     let slot = |name: &str| -> Result<u32> {
         slots
