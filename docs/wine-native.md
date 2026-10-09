@@ -1867,6 +1867,37 @@ seven explorers).
   native Wine. (gooner's and edger's default prefixes have no
   drive_c/windows/Fonts though the manifest lists 56 fonts: never staged,
   not from this.)
+- **Gate artifacts for merge/w3-boot** (frozen, nothing shared with the
+  other runs): `$W/gate-w3boot/run.sh TREE GEXC [stage]` stages its own
+  prefixes (pfx-w3 null driver, pfx-w3wl Graphics=wayland) and dists
+  (w3dist-null, w3dist-wl: copies of `$W/w3dist`, the 03:37 loader),
+  generates nt-run-x86.sh from TREE's tests/nt/run.sh, and runs the null,
+  Wayland+GL and install-as-children legs (its own install prefix, dist and
+  log under gate-w3boot). The Wayland leg needs no compositor running:
+  `gexc run --wayland PATH` serves its own at that guest path. On
+  integ/2026-10-08e's gexc: null 37 of 51, Wayland+GL 36 of 47 (w3chk3:
+  37 of 50, 34 of 46). x86/childloop times out at 120 s under load
+  (gooner's load average 21; 3 runs: 1 pass, 2 timeouts, the same with
+  merge/w3-audio's gexc): `gate-w3boot/childloop.sh`.
+- **Guest GL (2026-10-08 night):** the loaders linked `$W/gl/gexgl.o` from
+  10-06 (wt/w3's gexgl.c); `$W/gl/build-gl.sh` now compiles
+  `${GL_TREE:-wt/w3-boot}`'s. 7ef0f203 adds glNormalPointer (the host had
+  GL_NORMAL_ARRAY enabled with no pointer: Retrocycles' host SIGSEGV at
+  gameplay start, core analysed on gooner from edger's,
+  `$W/core/`; the GL capture decoder is `$W/core/capdec`). Loader with it:
+  `$W/w3dist-n` (gamekit/dist points there).
+- Undertale and Katana ZERO (both GameMaker, d3d9 over wined3d) called
+  address 0 in wined3d's caps probe: match_allows_spec_alpha calls
+  glSecondaryColorPointerEXT, which wined3d assumes on GL 1.4, and the guest
+  library had no secondary colour (or fog coordinate) array, so the
+  extension was withheld and wglGetProcAddress returned NULL. 47f830a4
+  adds both (loader `$W/w3dist-n`, 20:22). Found with `gamekit/dbg-ut6.sh`
+  (WINEDEBUG trace+d3d) and `gamekit/glprobe` (glprobe2.exe lists the
+  extension functions wglGetProcAddress cannot resolve).
+- Retrocycles on w3dist-n (edger, 2026-10-08 20:0x): menus, then gameplay
+  for the rest of the 420 s run, no crash; composited 10-12 fps in the
+  menus and 1-6 fps in gameplay (the game's own counter: 1). Frames:
+  `$W/shots/r7`.
 
 
 **RESUME HERE (2026-10-06, after a Claude Code restart).** `$W` =
