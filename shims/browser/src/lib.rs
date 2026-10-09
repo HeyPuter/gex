@@ -2520,6 +2520,16 @@ struct Jit {
     /// joining Worker instantiates these into its own tables to catch up. Order
     /// matters: each module's page assignments seed the next's.
     registry: Vec<Vec<u8>>,
+    /// Per registry entry: where its bytes are in the process's JS-side module
+    /// store (`Gex#moduleStore`) as `(offset, len)`, or `None` when they are in
+    /// `registry` itself. An entry kept there holds no bytes in this module's
+    /// heap: the registry grew without bound in a long fjit run (980 MiB of
+    /// Muck's 1670 MiB heap at the 2 GiB arena's OOM).
+    registry_ext: Vec<Option<(u64, u32)>>,
+    /// The bytes of the last modules kept in the JS-side store, still alive:
+    /// a sibling Worker that read the pending queue's front just before this
+    /// one popped it is copying them out (`gex_jit_pending_refresh`).
+    store_grace: std::collections::VecDeque<Vec<u8>>,
     /// Per registry module, a hash of each 256-byte chunk as it was pushed,
     /// so a stray write into the bytes can be found (`verify_registry`).
     registry_sums: Vec<Vec<u64>>,
@@ -4000,6 +4010,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
             provider: Default::default(),
             coverage_snap: Vec::new(),
                 registry: Vec::new(),
+                registry_ext: Vec::new(),
+                store_grace: std::collections::VecDeque::new(),
                 registry_sums: Vec::new(),
                 registry_dense: Vec::new(),
                 ever_threaded: false,
@@ -7688,6 +7700,8 @@ pub extern "C" fn gex_adopt_child(
             provider: Default::default(),
             coverage_snap: Vec::new(),
             registry: Vec::new(),
+            registry_ext: Vec::new(),
+            store_grace: std::collections::VecDeque::new(),
             registry_sums: Vec::new(),
             registry_dense: Vec::new(),
             ever_threaded: false,
@@ -8883,6 +8897,7 @@ fn backfill_registry(h: &mut Host) {
         REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
         h.jit.registry_sums.push(chunk_sums(&wasm));
         h.jit.registry.push(wasm);
+        h.jit.registry_ext.push(None);
     }
 }
 
@@ -13094,7 +13109,25 @@ pub extern "C" fn gex_jit_installed() {
         // Shrunk before keeping: `encode_with_custom` starts each module at a
         // 1 MiB capacity, and a batch averages ~26 KB, so a retained module
         // held a megabyte for twenty-six kilobytes.
+        let ext = NEXT_EXTERNAL.with(|n| n.take());
         if h.jit.ever_threaded {
+            // Already in the JS-side store, and the same module (a sibling can
+            // take the front of the shared queue between this Worker's read and
+            // this pop, so the note is checked against what was popped): keep
+            // only where it is.
+            if let Some((off, len, _)) = ext.filter(|&(_, len, key)| len as usize == done.wasm.len() && key == content_key(&done.wasm)) {
+                EXTERNAL_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+                h.jit.registry_sums.push(Vec::new());
+                h.jit.registry.push(Vec::new());
+                h.jit.registry_ext.push(Some((off, len)));
+                h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
+                h.jit.store_grace.push_back(done.wasm);
+                if h.jit.store_grace.len() > STORE_GRACE {
+                    h.jit.store_grace.pop_front();
+                }
+                publish_pending(h);
+                return;
+            }
             let mut wasm = done.wasm;
             wasm.shrink_to_fit();
             // Counted for the arena report (which cannot borrow the host,
@@ -13103,6 +13136,7 @@ pub extern "C" fn gex_jit_installed() {
             REGISTRY_BYTES.fetch_add(wasm.len() as u64, std::sync::atomic::Ordering::Relaxed);
             h.jit.registry_sums.push(chunk_sums(&wasm));
             h.jit.registry.push(wasm);
+            h.jit.registry_ext.push(None);
             h.jit.registry_dense.push(done.dense.as_ref().map_or((0, 0), |d| (d.base, d.entries.len() as u32)));
         }
         publish_pending(h);
@@ -13356,6 +13390,73 @@ fn publish_pending(h: &Host) {
     });
 }
 
+thread_local! {
+    /// The JS-side store slot (`offset, len, content key`) of the module this
+    /// Worker is about to report installed: `gex_jit_note_external`.
+    static NEXT_EXTERNAL: std::cell::Cell<Option<(u64, u32, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// How many popped modules' bytes stay alive after going to the JS-side store.
+/// A Worker's view of the queue (`gex_jit_pending_ptr`) is refreshed right
+/// before it copies the bytes out, so only a pop in that instant can free them
+/// under it, and it would take this many more pops to reuse the memory.
+const STORE_GRACE: usize = 256;
+
+/// Make this Worker's view of the pending queue (`gex_jit_pending_*`) the
+/// queue's front now. The view is set only by this Worker's own pushes and
+/// pops, so it may name a module a sibling installed long ago.
+#[no_mangle]
+pub extern "C" fn gex_jit_pending_refresh() {
+    with_host(|h| publish_pending(h));
+}
+
+/// Bytes of registry entries kept in the JS-side store instead of this heap.
+static EXTERNAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `moduleContentKey` in gex.mjs, as one u64 (`a` high, `b` low): what a
+/// module's store slot is checked against.
+fn content_key(bytes: &[u8]) -> u64 {
+    let mut a: u32 = 0x811c_9dc5;
+    let mut b: u32 = 0x9e37_79b9;
+    for (i, &x) in bytes.iter().enumerate() {
+        a = (a ^ x as u32).wrapping_mul(0x0100_0193);
+        b = (b ^ (x as u32).wrapping_add(i as u32)).wrapping_mul(0x85eb_ca6b);
+        b ^= b >> 13;
+    }
+    ((a as u64) << 32) | b as u64
+}
+
+/// Whether the next `gex_jit_installed` keeps its module for joining Workers
+/// (this process has threaded): only then is a JS-side store slot worth
+/// writing.
+#[no_mangle]
+pub extern "C" fn gex_jit_keeps() -> u32 {
+    with_host(|h| h.jit.ever_threaded as u32)
+}
+
+/// The module this Worker installs next is at `off` in the process's JS-side
+/// module store, `len` bytes, with content key `key_hi:key_lo`
+/// (`moduleContentKey`). `gex_jit_installed` then keeps the place, not the
+/// bytes, if the module it pops matches.
+#[no_mangle]
+pub extern "C" fn gex_jit_note_external(off: u64, len: u32, key_hi: u32, key_lo: u32) {
+    NEXT_EXTERNAL.with(|n| n.set(Some((off, len, ((key_hi as u64) << 32) | key_lo as u64))));
+}
+
+/// Where registry module `i` is in the JS-side store, plus one; 0 when its
+/// bytes are in this module's memory (`gex_module_ptr`).
+#[no_mangle]
+pub extern "C" fn gex_module_ext(i: u32) -> u64 {
+    with_host(|h| h.jit.registry_ext.get(i as usize).copied().flatten().map_or(0, |(off, _)| off + 1))
+}
+
+/// MiB of registry modules kept in the JS-side store (1) and in this heap (0).
+#[no_mangle]
+pub extern "C" fn gex_registry_mib(external: u32) -> u32 {
+    let b = if external != 0 { &EXTERNAL_BYTES } else { &REGISTRY_BYTES };
+    (b.load(std::sync::atomic::Ordering::Relaxed) >> 20) as u32
+}
+
 /// How many translated modules this process has, for a Worker catching up.
 #[no_mangle]
 pub extern "C" fn gex_module_count() -> u32 {
@@ -13387,7 +13488,10 @@ pub extern "C" fn gex_jit_slots_total() -> u32 {
 /// How long module `i` is.
 #[no_mangle]
 pub extern "C" fn gex_module_len(i: u32) -> u32 {
-    with_host(|h| h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32))
+    with_host(|h| match h.jit.registry_ext.get(i as usize).copied().flatten() {
+        Some((_, len)) => len,
+        None => h.jit.registry.get(i as usize).map_or(0, |m| m.len() as u32),
+    })
 }
 
 /// A direct-mapped table of back-edge counts, keyed by guest pc.
