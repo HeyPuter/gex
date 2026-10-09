@@ -569,7 +569,15 @@ fn signal_note(what: &str, caller: i32, target: i32, signo: u32) {
     if signo == 0 || signo == 28 || SAID.fetch_add(1, Ordering::Relaxed) >= 24 {
         return;
     }
-    warn_line(&format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n"));
+    let line = format!("[sig] pid {caller} sends signal {signo} to {what} {target}\n");
+    // SIGINT, SIGKILL and SIGTERM to another process are a parent ending a
+    // child on purpose (apt stops each of its methods with SIGINT): noted,
+    // not warned. A hangup stays a warning; that is a session coming apart.
+    if matches!(signo, 2 | 9 | 15) && caller != target {
+        trace_line(&line);
+    } else {
+        warn_line(&line);
+    }
 }
 
 extern "C" fn r_kill(caller: i32, target: i32, signo: u32) -> i32 {
@@ -6397,11 +6405,13 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 // Who sent it, if the global kernel knows: "killed by signal 1"
                 // is true of a hangup, a terminal's line discipline and any
                 // guest's `kill`, and they are not the same bug.
+                let mut sent = None;
                 let from = if unsafe { k_present() } != 0 {
                     let v = unsafe { k_last_kill() };
                     let caller = (v >> 40) as i32;
                     let target = ((v >> 8) & 0xffff_ffff) as i32;
                     let signo = (v & 0xff) as u32;
+                    sent = Some((caller, target, signo));
                     format!(
                         " (signal #{}: {signo} from pid {caller} to {target})",
                         unsafe { k_last_kill_seq() }
@@ -6409,6 +6419,16 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                 } else {
                     String::new()
                 };
+                // Ended on purpose by another process (SIGINT, SIGKILL or
+                // SIGTERM it sent this one): one quiet line, not the report.
+                // apt ends every method this way after a clean run.
+                let pid = h.kernel.pid;
+                if matches!(sent, Some((caller, target, signo))
+                    if signo == signal as u32 && matches!(signo, 2 | 9 | 15)
+                        && caller != pid && (target == pid || target == -pid || target == 0))
+                {
+                    trace_line(&format!("[gex] pid {pid} ended by signal {signal}{from}\n"));
+                } else {
                 warn_line(&format!(
                     "[gex] pid {} killed by signal {}{from} at pc={at:#x}\n  stderr: {}\n  threads:{}\n  \
                      last calls:{}\n  address space:{}\n  futexes:{}",
@@ -6437,6 +6457,7 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
                     mem_recent(),
                     ftx_recent(),
                 ));
+                }
                 exit_process(h, -(signal as i32))
             }
             SyscallOutcome::SpawnThread {
