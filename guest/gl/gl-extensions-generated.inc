@@ -2,7 +2,7 @@
  *
  * Extensions the guest may repeat from the host: every command the
  * Khronos registry says they require is exported by this library.
- * 717 claimable, 143 withheld for missing entry
+ * 710 claimable, 150 withheld for missing entry
  * points, out of the registry's whole extension set. A host
  * extension absent from this table is not advertised to the guest,
  * which is why adding a driver capability can need a rebuild here.
@@ -106,7 +106,6 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_ARB_explicit_uniform_location",
     "GL_ARB_fragment_coord_conventions",
     "GL_ARB_fragment_layer_viewport",
-    "GL_ARB_fragment_program_shadow",
     "GL_ARB_fragment_shader",
     "GL_ARB_fragment_shader_interlock",
     "GL_ARB_framebuffer_no_attachments",
@@ -499,9 +498,7 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_NV_fog_distance",
     "GL_NV_fragment_coverage_to_color",
     "GL_NV_fragment_program",
-    "GL_NV_fragment_program2",
     "GL_NV_fragment_program4",
-    "GL_NV_fragment_program_option",
     "GL_NV_fragment_shader_barycentric",
     "GL_NV_fragment_shader_interlock",
     "GL_NV_framebuffer_blit",
@@ -583,10 +580,6 @@ static const char *const gexgl_claimable_extensions[] = {
     "GL_NV_uniform_buffer_unified_memory",
     "GL_NV_vertex_array_range2",
     "GL_NV_vertex_attrib_integer_64bit",
-    "GL_NV_vertex_program1_1",
-    "GL_NV_vertex_program2",
-    "GL_NV_vertex_program2_option",
-    "GL_NV_vertex_program3",
     "GL_NV_vertex_program4",
     "GL_NV_viewport_array2",
     "GL_NV_viewport_swizzle",
